@@ -73,6 +73,7 @@ use crate::models::rope_schedule::FactoredRope;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_buffers::wave_empty_ticketed;
 use candle::quantized::cuda::to_dynamic;
+use candle::quantized::decode_rows::DecodeRows;
 use candle_nn::kv_cache::{
     begin_wave, cover_wave_transient, KvCache, LayerPhase, WavePlan, WaveWidth,
 };
@@ -538,10 +539,12 @@ impl Qwen4ExpBatched {
         // the trunk's are. A draft head only ever runs behind a decode step —
         // there is no prefill/prompt traffic through one — so all `n` rows are
         // decode-attributed.
-        let parts = head
-            .block
-            .moe
-            .forward_parts(acts, DType::F32, n, Some(&ffn_wave))?;
+        let parts = head.block.moe.forward_parts(
+            acts,
+            DType::F32,
+            &DecodeRows::prefix(n),
+            Some(&ffn_wave),
+        )?;
         let routed = parts.routed.reshape((n, n_embd))?;
         hc_combine_gated(&mut res, &routed, &parts.shared, &inject2)?;
         drop(routed);

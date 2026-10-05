@@ -131,6 +131,9 @@
 mod boundary;
 mod cache;
 pub(crate) mod compute;
+/// Copy-engine promotions, issued off the pipeline thread.
+#[cfg(feature = "cuda")]
+mod copier;
 #[cfg(feature = "cuda")]
 mod dispatch;
 #[cfg(test)]
@@ -173,6 +176,9 @@ pub mod slot_integrity;
 mod slot_image;
 #[cfg(feature = "cuda")]
 mod stager;
+/// Which invocation of each row the device has begun — the reclaim key.
+#[cfg(feature = "cuda")]
+mod started;
 #[cfg(feature = "cuda")]
 mod startup;
 mod transition;

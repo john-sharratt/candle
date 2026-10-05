@@ -93,6 +93,7 @@ extern "C" {
         t: *const c_void,
         f: *const c_void,
         out: *mut c_void,
+        stream: *mut c_void,
     );
 }
 

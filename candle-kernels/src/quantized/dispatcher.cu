@@ -419,13 +419,14 @@ struct kernel_set_t {
 // grid_layout parameter controls grid dimension ordering (for compute_grid only)
 // The kernel itself has grid_layout as a compile-time template parameter
 // smem_size: shared memory bytes to allocate (0 for register-only kernels)
-inline void launch_kernel(
-    void* kernel_fn, 
+inline cudaError_t launch_kernel(
+    void* kernel_fn,
     int batch_tile,
     const void* vx, const void* vy, void* dst,
     int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int batch_size,
     int grid_layout,
-    size_t smem_size = 0
+    size_t smem_size,
+    cudaStream_t stream
 ) {
     dim3 grid = compute_grid(nrows_x, batch_size, batch_tile, grid_layout);
     dim3 block(WARP_SIZE, 4, 1);  // 32 threads/warp × 4 warps = 128 threads
@@ -442,17 +443,18 @@ inline void launch_kernel(
         (void*)&nrows_dst, (void*)&batch_size
     };
     
-    cudaLaunchKernel(kernel_fn, grid, block, args, smem_size, nullptr);
+    return cudaLaunchKernel(kernel_fn, grid, block, args, smem_size, stream);
 }
 
 // Launch an iterator kernel (internal batch loop, L2 weight reuse)
 // Grid: (row_blocks, batch_tiles) where each block processes BATCHES_PER_BLOCK batches
 // For s2_iter4: BATCHES_PER_BLOCK = 8, so batch_tiles = ceil(total_batches / 8)
-inline void launch_kernel_iter(
+inline cudaError_t launch_kernel_iter(
     void* kernel_fn, 
     int batches_per_block,  // BATCH_TILE * NUM_ITERS (e.g., 8 for s2_iter4)
     const void* vx, const void* vy, void* dst,
-    int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int total_batches
+    int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int total_batches,
+    cudaStream_t stream
 ) {
     // Grid: row blocks × batch tiles
     int row_blocks = (nrows_x + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
@@ -465,8 +467,8 @@ inline void launch_kernel_iter(
         (void*)&ncols_x, (void*)&nrows_x, (void*)&nrows_y, 
         (void*)&nrows_dst, (void*)&total_batches
     };
-    
-    cudaLaunchKernel(kernel_fn, grid, block, args, 0, nullptr);
+
+    return cudaLaunchKernel(kernel_fn, grid, block, args, 0, stream);
 }
 
 // TC kernel row tile size (4 warps × 8 rows/warp = 32 rows per block)
@@ -475,11 +477,12 @@ constexpr int TC_ROWS_PER_BLOCK = 32;
 // Launch a tensor core kernel with grid.y batch tiling (single launch for all batches)
 // Grid: (row_blocks, batch_tiles) where each block processes BATCH_TILE=16 batches
 // batch_size is passed to kernel for bounds checking (last tile may be partial)
-inline void launch_kernel_tc(
+inline cudaError_t launch_kernel_tc(
     void* kernel_fn, 
     int batch_tile,  // BATCH_TILE (16 for s16_tc)
     const void* vx, const void* vy, void* dst,
-    int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int batch_size
+    int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int batch_size,
+    cudaStream_t stream
 ) {
     // Grid: row blocks × batch tiles
     // TC kernel uses N_TILE=32 (4 warps × 8 rows), not ROWS_PER_BLOCK=16
@@ -493,8 +496,8 @@ inline void launch_kernel_tc(
         (void*)&ncols_x, (void*)&nrows_x, (void*)&nrows_y, 
         (void*)&nrows_dst, (void*)&batch_size
     };
-    
-    cudaLaunchKernel(kernel_fn, grid, block, args, 0, nullptr);
+
+    return cudaLaunchKernel(kernel_fn, grid, block, args, 0, stream);
 }
 
 // =============================================================================
@@ -515,11 +518,12 @@ inline void launch_kernel_tc(
 //   has_remainder: batch_size % 16 != 0 — picks tc16_r over tc16_0; the
 //     kernel derives R itself from batch_size
 //   batch_size: total batches to process
-inline void launch_tc16(
+inline cudaError_t launch_tc16(
     const kernel_set_t& kset,
     bool has_remainder,
     const void* vx, const void* vy, void* dst,
-    int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int batch_size
+    int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int batch_size,
+    cudaStream_t stream
 ) {
     void* kernel_fn = has_remainder ? kset.tc16_r : kset.tc16_0;
 
@@ -545,7 +549,7 @@ inline void launch_tc16(
         (void*)&cfg.row_groups  // For z-decode: row_group = z % row_groups
     };
 
-    cudaLaunchKernel(kernel_fn, cfg.grid, block, args, 0, nullptr);
+    return cudaLaunchKernel(kernel_fn, cfg.grid, block, args, 0, stream);
 }
 
 // Launch TC32 kernel with HIERARCHICAL GRID for L1/L2 cache optimization
@@ -568,11 +572,12 @@ inline void launch_tc16(
 // The kernel decodes: row_group = z % num_row_groups, batch_group = z / num_row_groups
 // =============================================================================
 
-inline void launch_tc32(
+inline cudaError_t launch_tc32(
     const kernel_set_t& kset,
     bool has_remainder,  // batch_size % 16 != 0 — picks tc32_r over tc32_0
     const void* vx, const void* vy, void* dst,
-    int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int batch_size
+    int ncols_x, int nrows_x, int nrows_y, int nrows_dst, int batch_size,
+    cudaStream_t stream
 ) {
     void* kernel_fn = has_remainder ? kset.tc32_r : kset.tc32_0;
 
@@ -601,8 +606,8 @@ inline void launch_tc32(
         (void*)&nrows_dst, (void*)&batch_size,
         (void*)&cfg.row_groups  // For z-decode: row_group = z % row_groups
     };
-    
-    cudaLaunchKernel(kernel_fn, cfg.grid, block, args, 0, nullptr);
+
+    return cudaLaunchKernel(kernel_fn, cfg.grid, block, args, 0, stream);
 }
 
 
@@ -612,42 +617,43 @@ inline void launch_tc32(
 // Launches a GEMV kernel based on kernel_type_t from dispatch_table.cuh
 // TC kernels (tc16, tc32) are handled by separate launch functions
 
-inline void launch_kernel_by_type(
+inline cudaError_t launch_kernel_by_type(
     const kernel_set_t& kset,
     kernel_type_t kt,
     int batches,
     const void* vx, const void* vy, void* dst,
-    int ncols_x, int nrows_x, int nrows_y, int nrows_dst
+    int ncols_x, int nrows_x, int nrows_y, int nrows_dst,
+    cudaStream_t stream
 ) {
     // Simple sN kernels (DRAM-friendly, N batches per block)
     switch (kt) {
-        case K_S1: launch_kernel(kset.s1, 1, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST); return;
-        case K_S2: launch_kernel(kset.s2, 2, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST); return;
-        case K_S3: launch_kernel(kset.s3, 3, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST); return;
-        case K_S4: launch_kernel(kset.s4, 4, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST); return;
-        case K_S5: launch_kernel(kset.s5, 5, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST); return;
-        case K_S6: launch_kernel(kset.s6, 6, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST); return;
-        case K_S7: launch_kernel(kset.s7, 7, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST); return;
-        case K_S8: launch_kernel(kset.s8, 8, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST); return;
-        
+        case K_S1: return launch_kernel(kset.s1, 1, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST, 0, stream);
+        case K_S2: return launch_kernel(kset.s2, 2, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST, 0, stream);
+        case K_S3: return launch_kernel(kset.s3, 3, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST, 0, stream);
+        case K_S4: return launch_kernel(kset.s4, 4, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST, 0, stream);
+        case K_S5: return launch_kernel(kset.s5, 5, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST, 0, stream);
+        case K_S6: return launch_kernel(kset.s6, 6, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST, 0, stream);
+        case K_S7: return launch_kernel(kset.s7, 7, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST, 0, stream);
+        case K_S8: return launch_kernel(kset.s8, 8, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, GRID_LAYOUT_ROW_FAST, 0, stream);
+
         // Iter kernels (L2-friendly, high occupancy with internal loop)
-        case K_S2_ITER2: launch_kernel_iter(kset.s2_iter2, 4, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches); return;
-        case K_S2_ITER3: launch_kernel_iter(kset.s2_iter3, 6, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches); return;
-        case K_S2_ITER4: launch_kernel_iter(kset.s2_iter4, 8, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches); return;
-        case K_S2_ITER5: launch_kernel_iter(kset.s2_iter5, 10, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches); return;
-        case K_S2_ITER6: launch_kernel_iter(kset.s2_iter6, 12, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches); return;
-        case K_S2_ITER7: launch_kernel_iter(kset.s2_iter7, 14, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches); return;
-        case K_S2_ITER8: launch_kernel_iter(kset.s2_iter8, 16, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches); return;
-        
-        case K_S3_ITER3: launch_kernel_iter(kset.s3_iter3, 9, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches); return;
-        
+        case K_S2_ITER2: return launch_kernel_iter(kset.s2_iter2, 4, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, stream);
+        case K_S2_ITER3: return launch_kernel_iter(kset.s2_iter3, 6, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, stream);
+        case K_S2_ITER4: return launch_kernel_iter(kset.s2_iter4, 8, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, stream);
+        case K_S2_ITER5: return launch_kernel_iter(kset.s2_iter5, 10, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, stream);
+        case K_S2_ITER6: return launch_kernel_iter(kset.s2_iter6, 12, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, stream);
+        case K_S2_ITER7: return launch_kernel_iter(kset.s2_iter7, 14, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, stream);
+        case K_S2_ITER8: return launch_kernel_iter(kset.s2_iter8, 16, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, stream);
+
+        case K_S3_ITER3: return launch_kernel_iter(kset.s3_iter3, 9, vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batches, stream);
+
         // Note: TC kernels (K_TC16_*, K_TC32_*) are launched
         // via launch_tc16() and launch_tc32() in the TC path,
         // not through this function. They shouldn't appear here.
-        
+
         case K_NONE:
         default:
-            return;
+            return cudaSuccess;
     }
 }
 
@@ -859,7 +865,8 @@ extern "C" int run_dense_int8_splitk(
     int32_t sum_norm,
     int32_t splits,
     float* ws,
-    unsigned int* counters
+    unsigned int* counters,
+    void* stream
 ) {
     if (out_dtype < 0 || out_dtype > 2) {
         return QMM_BAD_OUT_DTYPE;
@@ -884,7 +891,9 @@ extern "C" int run_dense_int8_splitk(
         (void*)&ncols_x, (void*)&nrows_x, (void*)&total_batch,
         (void*)&dst_stride, (void*)&sum_norm, (void*)&ws, (void*)&counters,
     };
-    cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
+    if (cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
+        return QMM_LAUNCH_FAILED;
+    }
     return QMM_OK;
 }
 
@@ -906,7 +915,8 @@ extern "C" int run_dense_int8_silu_q8ko_f32(
     int32_t nrows_x,      // N
     int32_t total_batch,  // M
     int32_t sum_norm,
-    int32_t mode2
+    int32_t mode2,
+    void* stream
 ) {
     // K whole tiles inside each row; N whole 32-row tiles.
     if (ncols_x <= 0 || ncols_x % 128 != 0 || proj_stride < ncols_x || nrows_x % 32 != 0) {
@@ -926,8 +936,10 @@ extern "C" int run_dense_int8_silu_q8ko_f32(
         (void*)&ncols_x, (void*)&nrows_x, (void*)&total_batch,
         (void*)&dst_stride, (void*)&sum_norm,
     };
-    cudaLaunchKernel(mode2 ? (void*)q8_ko_int8_f32_dense_silu_m2 : (void*)q8_ko_int8_f32_dense_silu,
-                     grid, block, args, 0, nullptr);
+    if (cudaLaunchKernel(mode2 ? (void*)q8_ko_int8_f32_dense_silu_m2 : (void*)q8_ko_int8_f32_dense_silu,
+                         grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
+        return QMM_LAUNCH_FAILED;
+    }
     return QMM_OK;
 }
 
@@ -946,9 +958,11 @@ extern "C" int run_quantized_matmul(
     int32_t force_mode2,  // int8 dense tiling: 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32 reuse). Rust decides.
     int32_t out_dtype,    // int8 dense store width: 0 = F16, 1 = BF16, 2 = F32. FP path ignores it
                           // (there the output dtype is the activation dtype).
-    int32_t sum_norm      // q8a128 Σx convention (`SumScale::as_code()`); the int8 dense path
+    int32_t sum_norm,     // q8a128 Σx convention (`SumScale::as_code()`); the int8 dense path
                           // only — the FP kernels below read no q8a128 header.
+    void* stream_arg      // the stream every launch below is issued on
 ) {
+    cudaStream_t stream = (cudaStream_t)stream_arg;
     // Lookup table for kernel sets: [qtype][ytype][use_tc]
     // ytype: 0=F16, 1=BF16, 2=F32
     // use_tc: 0 = CUDA cores, 1 = tensor cores (for s64)
@@ -1058,7 +1072,9 @@ extern "C" int run_quantized_matmul(
             (void*)&ncols_x, (void*)&nrows_x, (void*)&total_batch,
             (void*)&y_stride, (void*)&dst_stride, (void*)&sum_norm,
         };
-        cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
+        if (cudaLaunchKernel(kfn, grid, block, args, 0, stream) != cudaSuccess) {
+            return QMM_LAUNCH_FAILED;
+        }
         return QMM_OK;
     }
 
@@ -1117,10 +1133,6 @@ extern "C" int run_quantized_matmul(
     // - DRAM-bound weights: Use greedy s8+sN (more weight reuse per launch)
     bool use_l2_path = (weight_bytes < l2_threshold);
     
-    // Variables for potential future L2 policy use (currently disabled)
-    cudaStream_t stream = nullptr;  // Using default stream
-    (void)stream;  // Suppress unused warning
-    
     // =========================================================================
     // SEGMENT LOOP: dispatch each segment (expert) independently
     // =========================================================================
@@ -1146,12 +1158,16 @@ extern "C" int run_quantized_matmul(
         dispatch_plan_t plan = get_dispatch_plan(remaining, use_l2_path, use_tc);
         
         if (is_tc32_kernel(plan.tc_kernel) && plan.tc_batch > 0) {
-            launch_tc32(kset, plan.tc_kernel == K_TC32_R, vx, vy_slice, dst_slice,
-                       ncols_x, nrows_x, nrows_y, nrows_dst, plan.tc_batch);
+            if (launch_tc32(kset, plan.tc_kernel == K_TC32_R, vx, vy_slice, dst_slice,
+                            ncols_x, nrows_x, nrows_y, nrows_dst, plan.tc_batch, stream) != cudaSuccess) {
+                return QMM_LAUNCH_FAILED;
+            }
             remaining = 0;
         } else if (is_tc16_kernel(plan.tc_kernel) && plan.tc_batch > 0) {
-            launch_tc16(kset, plan.tc_kernel == K_TC16_R, vx, vy_slice, dst_slice,
-                       ncols_x, nrows_x, nrows_y, nrows_dst, plan.tc_batch);
+            if (launch_tc16(kset, plan.tc_kernel == K_TC16_R, vx, vy_slice, dst_slice,
+                            ncols_x, nrows_x, nrows_y, nrows_dst, plan.tc_batch, stream) != cudaSuccess) {
+                return QMM_LAUNCH_FAILED;
+            }
             remaining = 0;
         }
         
@@ -1164,8 +1180,10 @@ extern "C" int run_quantized_matmul(
         // k1
         if (plan.k1 != K_NONE && plan.b1 > 0 && remaining > 0) {
             int actual_b1 = (plan.b1 <= remaining) ? plan.b1 : remaining;
-            launch_kernel_by_type(kset, plan.k1, actual_b1, vx, vy_slice, dst_slice,
-                                 ncols_x, nrows_x, nrows_y, nrows_dst);
+            if (launch_kernel_by_type(kset, plan.k1, actual_b1, vx, vy_slice, dst_slice,
+                                      ncols_x, nrows_x, nrows_y, nrows_dst, stream) != cudaSuccess) {
+                return QMM_LAUNCH_FAILED;
+            }
             remaining -= actual_b1;
             vy_slice = static_cast<const char*>(vy_slice) + actual_b1 * nrows_y * y_elem_size;
             dst_slice = static_cast<char*>(dst_slice) + actual_b1 * nrows_dst * dst_elem_size;
@@ -1174,8 +1192,10 @@ extern "C" int run_quantized_matmul(
         // k2
         if (plan.k2 != K_NONE && plan.b2 > 0 && remaining > 0) {
             int actual_b2 = (plan.b2 <= remaining) ? plan.b2 : remaining;
-            launch_kernel_by_type(kset, plan.k2, actual_b2, vx, vy_slice, dst_slice,
-                                 ncols_x, nrows_x, nrows_y, nrows_dst);
+            if (launch_kernel_by_type(kset, plan.k2, actual_b2, vx, vy_slice, dst_slice,
+                                      ncols_x, nrows_x, nrows_y, nrows_dst, stream) != cudaSuccess) {
+                return QMM_LAUNCH_FAILED;
+            }
             remaining -= actual_b2;
             vy_slice = static_cast<const char*>(vy_slice) + actual_b2 * nrows_y * y_elem_size;
             dst_slice = static_cast<char*>(dst_slice) + actual_b2 * nrows_dst * dst_elem_size;
@@ -1184,8 +1204,10 @@ extern "C" int run_quantized_matmul(
         // k3 (L2 path 3-kernel cases)
         if (plan.k3 != K_NONE && plan.b3 > 0 && remaining > 0) {
             int actual_b3 = (plan.b3 <= remaining) ? plan.b3 : remaining;
-            launch_kernel_by_type(kset, plan.k3, actual_b3, vx, vy_slice, dst_slice,
-                                 ncols_x, nrows_x, nrows_y, nrows_dst);
+            if (launch_kernel_by_type(kset, plan.k3, actual_b3, vx, vy_slice, dst_slice,
+                                      ncols_x, nrows_x, nrows_y, nrows_dst, stream) != cudaSuccess) {
+                return QMM_LAUNCH_FAILED;
+            }
             remaining -= actual_b3;
             vy_slice = static_cast<const char*>(vy_slice) + actual_b3 * nrows_y * y_elem_size;
             dst_slice = static_cast<char*>(dst_slice) + actual_b3 * nrows_dst * dst_elem_size;
@@ -1196,8 +1218,10 @@ extern "C" int run_quantized_matmul(
         // =================================================================
         while (remaining >= 8) {
             int bulk = (remaining / 8) * 8;
-            launch_kernel(kset.s8, 8, vx, vy_slice, dst_slice,
-                         ncols_x, nrows_x, nrows_y, nrows_dst, bulk, GRID_LAYOUT_ROW_FAST);
+            if (launch_kernel(kset.s8, 8, vx, vy_slice, dst_slice,
+                              ncols_x, nrows_x, nrows_y, nrows_dst, bulk, GRID_LAYOUT_ROW_FAST, 0, stream) != cudaSuccess) {
+                return QMM_LAUNCH_FAILED;
+            }
             remaining -= bulk;
             vy_slice = static_cast<const char*>(vy_slice) + bulk * nrows_y * y_elem_size;
             dst_slice = static_cast<char*>(dst_slice) + bulk * nrows_dst * dst_elem_size;
@@ -1210,8 +1234,10 @@ extern "C" int run_quantized_matmul(
             void* remainder_kernels[] = {
                 nullptr, kset.s1, kset.s2, kset.s3, kset.s4, kset.s5, kset.s6, kset.s7
             };
-            launch_kernel(remainder_kernels[remaining], remaining, vx, vy_slice, dst_slice,
-                         ncols_x, nrows_x, nrows_y, nrows_dst, remaining, GRID_LAYOUT_ROW_FAST);
+            if (launch_kernel(remainder_kernels[remaining], remaining, vx, vy_slice, dst_slice,
+                              ncols_x, nrows_x, nrows_y, nrows_dst, remaining, GRID_LAYOUT_ROW_FAST, 0, stream) != cudaSuccess) {
+                return QMM_LAUNCH_FAILED;
+            }
         }
         
         batch_offset += seg_batch;
@@ -1411,7 +1437,9 @@ static void* grouped_kernels_int8[21] = {
 /// - dst:          stacked output [total_batch, N]
 ///
 /// ncols_x = K, nrows_x = N, y_stride = K, dst_stride = N.
-extern "C" void run_grouped_quantized_matmul(
+///
+/// Returns a QMM_* status. No tiles is QMM_OK: there is nothing to compute.
+extern "C" int run_grouped_quantized_matmul(
     const void* weight_ptrs,
     const void* tile_expert,
     const void* tile_b_start,
@@ -1436,14 +1464,20 @@ extern "C" void run_grouped_quantized_matmul(
     void* stream)
 {
     int kernel_row = qtype_to_matmul_kernel_index(qtype);
-    if (kernel_row < 0 || ytype < 0 || ytype > 3 || num_tiles <= 0) {
-        return;
+    if (kernel_row < 0) {
+        return QMM_BAD_QTYPE;
+    }
+    if (ytype < 0 || ytype > 3) {
+        return QMM_BAD_YTYPE;
+    }
+    if (num_tiles <= 0) {
+        return QMM_OK;
     }
     // KO byte-permuted formats (rows >= 14) have INT8 grouped kernels only; the FP
     // `grouped_kernels` table is sized to the 14 base formats. Reject a misrouted
     // FP (ytype != 3) call on a KO row before indexing out of bounds.
     if (ytype != 3 && kernel_row >= 14) {
-        return;
+        return QMM_BAD_QTYPE;
     }
     // Activation input selected by `ytype`, same 10-arg launch ABI either way:
     //   0/1/2 (F16/BF16/F32) → FP activations → FP16-MMA grouped kernel.
@@ -1460,13 +1494,13 @@ extern "C" void run_grouped_quantized_matmul(
             case 2: kfn = grouped_kernels_int8[kernel_row]; break;
             case 4: kfn = grouped_kernels_int8_m4[kernel_row]; break;
             case 8: kfn = grouped_kernels_int8_m8[kernel_row]; break;
-            default: return;
+            default: return QMM_BAD_TILE_MODE;
         }
     } else {
         kfn = grouped_kernels[kernel_row][ytype];
     }
     if (kfn == nullptr) {
-        return;
+        return QMM_NO_KERNEL;
     }
 
     const int row_tiles = (nrows_x + 31) / 32;  // N_TILE = 32
@@ -1496,7 +1530,9 @@ extern "C" void run_grouped_quantized_matmul(
             (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
             (void*)&row_fast_v, (void*)&sum_norm, (void*)&live_v,
         };
-        cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream);
+        if (cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
+            return QMM_LAUNCH_FAILED;
+        }
     } else {
         void* args[] = {
             (void*)&weight_ptrs, (void*)&tile_expert, (void*)&tile_b_start, (void*)&tile_b_cnt,
@@ -1504,8 +1540,11 @@ extern "C" void run_grouped_quantized_matmul(
             (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
             (void*)&row_fast,
         };
-        cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream);
+        if (cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
+            return QMM_LAUNCH_FAILED;
+        }
     }
+    return QMM_OK;
 }
 
 // =============================================================================

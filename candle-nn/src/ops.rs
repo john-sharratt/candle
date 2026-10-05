@@ -155,6 +155,7 @@ impl candle::CustomOp1 for Sigmoid {
                             info_ptr,
                             src_ptr as *const std::ffi::c_void,
                             out_ptr as *mut std::ffi::c_void,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -462,6 +463,7 @@ impl candle::CustomOp1 for SoftmaxLastDim {
                             dst_ptr as *mut std::ffi::c_void,
                             n_rows,
                             n_cols,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -702,6 +704,7 @@ impl candle::CustomOp2 for RmsNorm {
                             n_rows,
                             n_cols,
                             self.eps,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -973,6 +976,7 @@ impl candle::CustomOp2 for SiluMul {
                             gate_ptr as *const std::ffi::c_void,
                             up_ptr as *const std::ffi::c_void,
                             dst_ptr as *mut std::ffi::c_void,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -1191,6 +1195,7 @@ impl candle::CustomOp3 for LayerNorm {
                             n_rows,
                             n_cols,
                             self.eps,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }

@@ -61,6 +61,7 @@
 //! embedding axis, this file's last axis. [`MtpInput`]'s test pins it.
 
 use candle::cuda_backend::Backing;
+use candle::quantized::decode_rows::DecodeRows;
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 
@@ -353,7 +354,9 @@ impl MtpHead {
         // trunk attention layer.
         // Layer index 0: the headers describe the head's KV layer and nothing
         // else, so its stride-indexed slot is the buffer's first.
-        forward_layer_batched_mixed(&layer, &mut groups, &mut xt, x.dtype(), 0)?;
+        // Every row a draft head sees is a decode row.
+        let decode = DecodeRows::prefix(rows);
+        forward_layer_batched_mixed(&layer, &mut groups, &mut xt, x.dtype(), 0, &decode)?;
         let out = xt.to_tensor().reshape((rows, hidden_dim))?;
         self.head_norm.forward_with_ticket(&out, root)
     }

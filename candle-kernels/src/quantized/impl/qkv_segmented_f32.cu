@@ -237,7 +237,9 @@ extern "C" int run_qkv_segmented_matmul(
     int ncols_x, int total_n_tiles, int total_batch, int dst_stride, int mode2, int out_dtype,
     // The shared activation operand's `SumScale::as_code()`. One operand feeds
     // every segment, so it is per-launch.
-    int sum_norm) {
+    int sum_norm,
+    // The stream the launch is issued on.
+    void* stream) {
     if (out_dtype < 0 || out_dtype > 2) {
         return QMM_BAD_OUT_DTYPE;
     }
@@ -313,6 +315,8 @@ extern "C" int run_qkv_segmented_matmul(
     void* args[] = {(void*)&s0,      (void*)&s1,         (void*)&s2,       (void*)&num_segs,
                     (void*)&act,      (void*)&dst,        (void*)&ncols_x,  (void*)&total_batch,
                     (void*)&y_stride, (void*)&dst_stride, (void*)&sum_norm};
-    cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
+    if (cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
+        return QMM_LAUNCH_FAILED;
+    }
     return QMM_OK;
 }

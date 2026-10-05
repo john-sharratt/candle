@@ -75,6 +75,9 @@ impl InfoRing {
         if let Some(t) = self.tables.get(info) {
             return Ok(t.clone());
         }
+        // A miss uploads (and may rewind over words recorded launches read),
+        // so it runs eagerly behind everything recorded so far.
+        let _eager = dev.pause_capture()?;
         let capacity = self.buf.as_ref().map(|b| b.len());
         let wraps = capacity.is_some_and(|cap| self.used + info.len() > cap);
         let held = wraps && self.tables.values().any(|t| Arc::strong_count(t) > 1);
@@ -93,7 +96,7 @@ impl InfoRing {
             }
         };
         let buf = self.buf.as_ref().expect("placed above");
-        let stream = dev.cuda_stream();
+        let stream = dev.compute_stream();
         let (base, _guard) = buf.device_ptr(&stream);
         let addr = base + (at * std::mem::size_of::<usize>()) as u64;
         // SAFETY: `[at, at + len)` lies inside `buf`, and the entry's anchor

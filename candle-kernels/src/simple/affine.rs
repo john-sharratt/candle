@@ -153,6 +153,7 @@ extern "C" {
         out: *mut c_void,
         mul: f64,
         add: f64,
+        stream: *mut c_void,
     );
 }
 

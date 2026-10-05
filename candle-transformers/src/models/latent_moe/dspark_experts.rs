@@ -219,6 +219,7 @@ impl DsparkStreamingMoe {
             fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
             moe_bucketize, silu_mul_q8a128, to_dynamic, DynamicActs, GROUPED_GEMM_TILE_W,
         };
+        use candle::quantized::decode_rows::DecodeRows;
         use candle::quantized::{Int8Mode, SumScale};
         let (b, s, dim) = x.dims3()?;
         let t_tok = b * s;
@@ -248,7 +249,14 @@ impl DsparkStreamingMoe {
                 .map_err(|_| candle::Error::Msg("dspark bucketize workspace poisoned".into()))?;
             // Routing indices → device tile tables (gather lists, grouped-GEMM tiles, scatter
             // segments) in one launch, no GPU→CPU round-trip.
-            moe_bucketize(&indices, ne, GROUPED_GEMM_TILE_W, &mut ws, None, t_tok)?;
+            moe_bucketize(
+                &indices,
+                ne,
+                GROUPED_GEMM_TILE_W,
+                &mut ws,
+                None,
+                &DecodeRows::prefix(t_tok),
+            )?;
             let launch_tiles = a_ub.min(a_ub.div_ceil(GROUPED_GEMM_TILE_W) + ne);
             let stacked =
                 fused_moe_gather_q8a128(&op, &ws.tok_ids, a_ub, &self.cuda_dev, Backing::Owned)?;

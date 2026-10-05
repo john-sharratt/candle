@@ -16,6 +16,7 @@ use candle_core::quantized::cuda::{
     grouped_qmatmul_dev_q8a128, moe_bucketize, to_dynamic, BucketizeLive, DynamicActs,
     MoeBucketizeWorkspace, MoeLive,
 };
+use candle_core::quantized::decode_rows::DecodeRows;
 use candle_core::quantized::{GgmlDType, Int8Mode, SumScale};
 use candle_core::{DType, Device, Result, Tensor};
 
@@ -83,9 +84,18 @@ fn an_aborted_cold_wait_traps_and_the_next_sync_reports_it() -> Result<()> {
         row: 0,
         promo: None,
         remote_dst: 0,
+        started_rows: 0,
+        ticket: 0,
     };
     drop((_g1, _g2, _g3, _g4, _g5, _g6));
-    moe_bucketize(&t, n_experts, 32, &mut ws, Some(&blive), n_tokens)?;
+    moe_bucketize(
+        &t,
+        n_experts,
+        32,
+        &mut ws,
+        Some(&blive),
+        &DecodeRows::prefix(n_tokens),
+    )?;
     let live = MoeLive {
         abort: abort_d,
         live_row: table_d,

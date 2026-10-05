@@ -9,6 +9,7 @@
 
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{DynamicActs, Q8a128Operand};
+use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
@@ -383,18 +384,17 @@ pub trait BatchedAttentionLayer {
     ///
     /// `'w` bounds the FFN's transients: the activations come from
     /// [`Self::ffn_norm`], and the MoE combine target is taken from the wave.
-    /// `decode_tokens` is the count of leading rows (of this call's combined
-    /// buffer) that are decode-attributed. Only an MoE implementation reads it,
-    /// to weight expert-cache residency scoring — a decode row's reuse of a
-    /// given expert is near-certain step to step, a prefill row's is close to
-    /// zero, so the two must not bid for slots on equal footing. A dense FFN
-    /// ignores it.
+    /// `decode` names the rows (of this call's combined buffer) that are
+    /// decode-attributed. Only an MoE implementation reads it, to weight
+    /// expert-cache residency scoring — a decode row's reuse of a given expert
+    /// is near-certain step to step, a prefill row's is close to zero, so the
+    /// two must not bid for slots on equal footing. A dense FFN ignores it.
     fn ffn_residual<'w>(
         &self,
         x: &mut Tensor,
         acts: DynamicActs<'w>,
         work_dtype: DType,
-        decode_tokens: usize,
+        decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<()>;
 
@@ -492,12 +492,16 @@ pub struct WaveAttnGroup<'a, 'c> {
 /// and it is the "one expert load per layer serves decode + prefill + glue
 /// together" amortisation. A single group (`groups.len() == 1`) is the ordinary
 /// homogeneous forward: attention over the whole buffer with no slicing.
+///
+/// `decode` names the buffer's decode-attributed rows, for the MoE's residency
+/// scoring ([`BatchedAttentionLayer::ffn_residual`]).
 pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     layer: &L,
     groups: &mut [WaveAttnGroup<'_, '_>],
     x: &mut TensorCat,
     act_dtype: DType,
     layer_idx: usize,
+    decode: &DecodeRows,
 ) -> Result<()> {
     let orig_dtype = x.dtype();
 
@@ -613,23 +617,13 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     };
     #[cfg(not(feature = "cuda"))]
     let ffn_wave: Option<()> = None;
-    // Decode rows (plus any single-token prefills folded into the decode
-    // group) sit first in the combined buffer — see `WaveAttnGroup::rows`'s
-    // accumulation above. `take_while` rather than an unconditional filter+sum
-    // so a future group order that broke that contiguity would undercount
-    // rather than silently attribute a later prefill group's rows to decode.
-    let decode_tokens: usize = groups
-        .iter()
-        .take_while(|g| g.decode_layout)
-        .map(|g| g.rows)
-        .sum();
     let t_ffn_host = profile_now();
     let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode(), ffn_wave.as_ref())?;
     layer.ffn_residual(
         x.as_cat_tensor_mut(),
         acts,
         mlp_dtype,
-        decode_tokens,
+        decode,
         ffn_wave.as_ref(),
     )?;
     pipeline_record("layer:ffn_host", t_ffn_host);

@@ -296,22 +296,15 @@ pub(crate) fn wave_from_vec_ticketed<D: CudaDType + candle::WithDType, S: Into<S
         WaveCarve::Closed => return Tensor::from_vec(data, shape, device),
         WaveCarve::Exhausted => return Err(exhausted(ticket, bytes)),
     };
-    let stream = cuda.cuda_stream();
-    // SAFETY: `ptr` addresses `bytes` the resolver just carved from the ticket's
-    // arena and nothing else holds that range in this generation. The copy is
-    // issued on the device's own stream, and the call returns only once `data`
-    // has been staged out of the pageable `Vec` (see the doc above), so the
-    // `Vec` may drop when this returns.
-    unsafe {
-        candle::cuda_backend::cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-            ptr,
-            data.as_ptr() as *const std::ffi::c_void,
-            bytes,
-            stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| candle::Error::Msg(format!("uploading a wave table: {e}")))?;
-    }
+    // `ptr` addresses `bytes` the resolver just carved from the ticket's arena
+    // and nothing else holds that range in this generation. The upload is
+    // ordered behind everything issued before it — recorded into a wave
+    // capture's segment, or queued on the compute stream — and returns once
+    // `data` has been staged, so the `Vec` may drop when this returns.
+    //
+    // SAFETY: `data` is `bytes` of plain device-representable values.
+    let raw = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) };
+    cuda.upload_raw(ptr, raw)?;
     // SAFETY: as above. The lease frees nothing on drop, so the range's only
     // reclaim is the generation's reset.
     unsafe { Tensor::from_leased_cuda_ptr(ptr, D::DTYPE, shape, device, LeaseOrigin::Wave(ticket)) }
@@ -341,7 +334,7 @@ pub(crate) fn upload_into<D: CudaDType + candle::WithDType>(
     let Device::Cuda(cuda) = dst.device() else {
         candle::bail!("upload_into: the buffer must be on CUDA");
     };
-    let stream = cuda.cuda_stream();
+    let stream = cuda.compute_stream();
     let (storage, layout) = dst.storage_and_layout();
     let candle::Storage::Cuda(c) = &*storage else {
         candle::bail!("upload_into: the buffer must be on CUDA");
@@ -349,19 +342,15 @@ pub(crate) fn upload_into<D: CudaDType + candle::WithDType>(
     let slice = c.as_cuda_slice::<D>()?;
     let (base, _guard) = slice.device_ptr(&stream);
     let at = base + (layout.start_offset() * std::mem::size_of::<D>()) as u64;
-    // SAFETY: `at` addresses `data.len()` elements of `dst`'s own storage (the
-    // length and contiguity are checked above), and the copy is issued on the
-    // stream every reader of `dst` is ordered on.
-    unsafe {
-        candle::cuda_backend::cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-            at,
-            data.as_ptr() as *const std::ffi::c_void,
-            std::mem::size_of_val(data),
-            stream.cu_stream(),
-        )
-        .result()
-        .map_err(|e| candle::Error::Msg(format!("upload_into: {e}")))?;
-    }
+    // `at` addresses `data.len()` elements of `dst`'s own storage (the length
+    // and contiguity are checked above); the upload is ordered behind every
+    // reader of `dst` issued before it — see `wave_from_vec_ticketed`.
+    //
+    // SAFETY: `data` is plain device-representable values.
+    let raw = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+    };
+    cuda.upload_raw(at, raw)?;
     Ok(())
 }
 

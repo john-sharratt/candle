@@ -64,6 +64,7 @@ use super::head_rows::select_head_rows;
 use super::lazy_rope::LazyRope;
 use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
+use super::residency_rows::residency_decode_rows;
 use super::rope_schedule::{RopeRungs, RopeSchedule};
 use super::rope_tables::CisPrecomputations;
 use super::tensor_cat::TensorCat;
@@ -1073,6 +1074,11 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &glue_pm,
         );
 
+        // The rows the routed experts' residency scores as decode: the decode
+        // rows and each prompt's last row (`residency_rows`; this lineage has
+        // no verify segments).
+        let decode_like =
+            residency_decode_rows(n_decode, pre_q.iter().map(|&rows| (0, rows)), |_| false);
         for layer_idx in layer_start..layer_end {
             let mut cache_refs: Vec<&mut KvCache> = contexts
                 .iter_mut()
@@ -1119,6 +1125,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 &mut x,
                 embed_dtype,
                 layer_idx,
+                &decode_like,
             )?;
         }
 

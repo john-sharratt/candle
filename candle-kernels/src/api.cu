@@ -267,149 +267,161 @@ extern "C" {
 void run_affine_f32(
     const float* inp, float* out,
     size_t numel, size_t num_dims, const size_t* info,
-    float mul, float add
+    float mul, float add,
+    void* stream
 ) {
-    affine_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out, mul, add);
+    affine_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out, mul, add);
 }
 
 void run_affine_f64(
     const double* inp, double* out,
     size_t numel, size_t num_dims, const size_t* info,
-    double mul, double add
+    double mul, double add,
+    void* stream
 ) {
-    affine_f64<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out, mul, add);
+    affine_f64<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out, mul, add);
 }
 
 void run_affine_f16(
     const void* inp, void* out,
     size_t numel, size_t num_dims, const size_t* info,
-    float mul, float add
+    float mul, float add,
+    void* stream
 ) {
     __half h_mul = __float2half(mul);
     __half h_add = __float2half(add);
-    affine_f16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, (const __half*)inp, (__half*)out, h_mul, h_add);
+    affine_f16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const __half*)inp, (__half*)out, h_mul, h_add);
 }
 
 void run_affine_bf16(
     const void* inp, void* out,
     size_t numel, size_t num_dims, const size_t* info,
-    float mul, float add
+    float mul, float add,
+    void* stream
 ) {
     __nv_bfloat16 h_mul = __float2bfloat16(mul);
     __nv_bfloat16 h_add = __float2bfloat16(add);
-    affine_bf16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_bfloat16*)out, h_mul, h_add);
+    affine_bf16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_bfloat16*)out, h_mul, h_add);
 }
 
 void run_affine_u8(
     const uint8_t* inp, uint8_t* out,
     size_t numel, size_t num_dims, const size_t* info,
-    uint8_t mul, uint8_t add
+    uint8_t mul, uint8_t add,
+    void* stream
 ) {
-    affine_u8<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out, mul, add);
+    affine_u8<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out, mul, add);
 }
 
 void run_affine_u32(
     const uint32_t* inp, uint32_t* out,
     size_t numel, size_t num_dims, const size_t* info,
-    uint32_t mul, uint32_t add
+    uint32_t mul, uint32_t add,
+    void* stream
 ) {
-    affine_u32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out, mul, add);
+    affine_u32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out, mul, add);
 }
 
 void run_affine_i16(
     const int16_t* inp, int16_t* out,
     size_t numel, size_t num_dims, const size_t* info,
-    int16_t mul, int16_t add
+    int16_t mul, int16_t add,
+    void* stream
 ) {
-    affine_i16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out, mul, add);
+    affine_i16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out, mul, add);
 }
 
 void run_affine_i32(
     const int32_t* inp, int32_t* out,
     size_t numel, size_t num_dims, const size_t* info,
-    int32_t mul, int32_t add
+    int32_t mul, int32_t add,
+    void* stream
 ) {
-    affine_i32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out, mul, add);
+    affine_i32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out, mul, add);
 }
 
 void run_affine_i64(
     const int64_t* inp, int64_t* out,
     size_t numel, size_t num_dims, const size_t* info,
-    int64_t mul, int64_t add
+    int64_t mul, int64_t add,
+    void* stream
 ) {
-    affine_i64<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out, mul, add);
+    affine_i64<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out, mul, add);
 }
 
 // --- Fill wrappers ---
-void run_fill_f32(float* buf, float value, size_t numel) {
-    fill_f32<<<grid_size(numel), BLOCK_SIZE>>>(buf, value, numel);
+void run_fill_f32(float* buf, float value, size_t numel, void* stream) {
+    fill_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(buf, value, numel);
 }
 
-void run_fill_f64(double* buf, double value, size_t numel) {
-    fill_f64<<<grid_size(numel), BLOCK_SIZE>>>(buf, value, numel);
+void run_fill_f64(double* buf, double value, size_t numel, void* stream) {
+    fill_f64<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(buf, value, numel);
 }
 
-void run_fill_f16(void* buf, float value, size_t numel) {
+void run_fill_f16(void* buf, float value, size_t numel, void* stream) {
     __half h_val = __float2half(value);
-    fill_f16<<<grid_size(numel), BLOCK_SIZE>>>((__half*)buf, h_val, numel);
+    fill_f16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>((__half*)buf, h_val, numel);
 }
 
-void run_fill_bf16(void* buf, float value, size_t numel) {
+void run_fill_bf16(void* buf, float value, size_t numel, void* stream) {
     __nv_bfloat16 h_val = __float2bfloat16(value);
-    fill_bf16<<<grid_size(numel), BLOCK_SIZE>>>((__nv_bfloat16*)buf, h_val, numel);
+    fill_bf16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>((__nv_bfloat16*)buf, h_val, numel);
 }
 
-void run_fill_u8(uint8_t* buf, uint8_t value, size_t numel) {
-    fill_u8<<<grid_size(numel), BLOCK_SIZE>>>(buf, value, numel);
+void run_fill_u8(uint8_t* buf, uint8_t value, size_t numel, void* stream) {
+    fill_u8<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(buf, value, numel);
 }
 
-void run_fill_u32(uint32_t* buf, uint32_t value, size_t numel) {
-    fill_u32<<<grid_size(numel), BLOCK_SIZE>>>(buf, value, numel);
+void run_fill_u32(uint32_t* buf, uint32_t value, size_t numel, void* stream) {
+    fill_u32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(buf, value, numel);
 }
 
-void run_fill_i64(int64_t* buf, int64_t value, size_t numel) {
-    fill_i64<<<grid_size(numel), BLOCK_SIZE>>>(buf, value, numel);
+void run_fill_i64(int64_t* buf, int64_t value, size_t numel, void* stream) {
+    fill_i64<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(buf, value, numel);
 }
 
 // --- Binary operation wrappers ---
 void run_binary_f32(
     const float* lhs, const float* rhs, float* out,
     size_t numel, size_t num_dims, const size_t* dims_and_strides,
-    int op  // 0=add, 1=mul, 2=div, 3=sub, 4=min, 5=max
+    int op,  // 0=add, 1=mul, 2=div, 3=sub, 4=min, 5=max
+    void* stream
 ) {
     switch (op) {
-        case 0: badd_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
-        case 1: bmul_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
-        case 2: bdiv_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
-        case 3: bsub_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
-        case 4: bminimum_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
-        case 5: bmaximum_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
+        case 0: badd_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
+        case 1: bmul_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
+        case 2: bdiv_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
+        case 3: bsub_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
+        case 4: bminimum_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
+        case 5: bmaximum_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, lhs, rhs, out); break;
     }
 }
 
 void run_binary_f16(
     const void* lhs, const void* rhs, void* out,
     size_t numel, size_t num_dims, const size_t* dims_and_strides,
-    int op
+    int op,
+    void* stream
 ) {
     switch (op) {
-        case 0: badd_f16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __half*)lhs, (const __half*)rhs, (__half*)out); break;
-        case 1: bmul_f16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __half*)lhs, (const __half*)rhs, (__half*)out); break;
-        case 2: bdiv_f16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __half*)lhs, (const __half*)rhs, (__half*)out); break;
-        case 3: bsub_f16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __half*)lhs, (const __half*)rhs, (__half*)out); break;
+        case 0: badd_f16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __half*)lhs, (const __half*)rhs, (__half*)out); break;
+        case 1: bmul_f16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __half*)lhs, (const __half*)rhs, (__half*)out); break;
+        case 2: bdiv_f16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __half*)lhs, (const __half*)rhs, (__half*)out); break;
+        case 3: bsub_f16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __half*)lhs, (const __half*)rhs, (__half*)out); break;
     }
 }
 
 void run_binary_bf16(
     const void* lhs, const void* rhs, void* out,
     size_t numel, size_t num_dims, const size_t* dims_and_strides,
-    int op
+    int op,
+    void* stream
 ) {
     switch (op) {
-        case 0: badd_bf16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __nv_bfloat16*)lhs, (const __nv_bfloat16*)rhs, (__nv_bfloat16*)out); break;
-        case 1: bmul_bf16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __nv_bfloat16*)lhs, (const __nv_bfloat16*)rhs, (__nv_bfloat16*)out); break;
-        case 2: bdiv_bf16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __nv_bfloat16*)lhs, (const __nv_bfloat16*)rhs, (__nv_bfloat16*)out); break;
-        case 3: bsub_bf16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __nv_bfloat16*)lhs, (const __nv_bfloat16*)rhs, (__nv_bfloat16*)out); break;
+        case 0: badd_bf16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __nv_bfloat16*)lhs, (const __nv_bfloat16*)rhs, (__nv_bfloat16*)out); break;
+        case 1: bmul_bf16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __nv_bfloat16*)lhs, (const __nv_bfloat16*)rhs, (__nv_bfloat16*)out); break;
+        case 2: bdiv_bf16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __nv_bfloat16*)lhs, (const __nv_bfloat16*)rhs, (__nv_bfloat16*)out); break;
+        case 3: bsub_bf16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __nv_bfloat16*)lhs, (const __nv_bfloat16*)rhs, (__nv_bfloat16*)out); break;
     }
 }
 
@@ -417,21 +429,22 @@ void run_binary_bf16(
 void run_unary_f32(
     const float* inp, float* out,
     size_t numel, size_t num_dims, const size_t* info,
-    int op  // 0=copy, 1=neg, 2=exp, 3=log, 4=sin, 5=cos, 6=tanh, 7=sqrt, 8=gelu, 9=relu, 10=silu, 11=sigmoid
+    int op,  // 0=copy, 1=neg, 2=exp, 3=log, 4=sin, 5=cos, 6=tanh, 7=sqrt, 8=gelu, 9=relu, 10=silu, 11=sigmoid
+    void* stream
 ) {
     switch (op) {
-        case 0: ucopy_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 1: uneg_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 2: uexp_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 3: ulog_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 4: usin_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 5: ucos_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 6: utanh_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 7: usqrt_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 8: ugelu_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 9: urelu_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 10: usilu_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
-        case 11: usigmoid_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, out); break;
+        case 0: ucopy_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 1: uneg_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 2: uexp_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 3: ulog_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 4: usin_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 5: ucos_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 6: utanh_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 7: usqrt_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 8: ugelu_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 9: urelu_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 10: usilu_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
+        case 11: usigmoid_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, out); break;
     }
 }
 
@@ -439,101 +452,109 @@ void run_unary_f32(
 void run_reduce_sum_f32(
     const float* src, float* dst,
     size_t src_numel, size_t el_per_block,
-    size_t num_dims, const size_t* info
+    size_t num_dims, const size_t* info,
+    void* stream
 ) {
     int num_blocks = (src_numel + el_per_block - 1) / el_per_block;
-    fast_sum_f32<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_block, num_dims, info, src, dst);
+    fast_sum_f32<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_block, num_dims, info, src, dst);
 }
 
 void run_reduce_max_f32(
     const float* src, float* dst,
     size_t src_numel, size_t el_per_block,
-    size_t num_dims, const size_t* info
+    size_t num_dims, const size_t* info,
+    void* stream
 ) {
     int num_blocks = (src_numel + el_per_block - 1) / el_per_block;
-    fast_max_f32<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_block, num_dims, info, src, dst);
+    fast_max_f32<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_block, num_dims, info, src, dst);
 }
 
 void run_reduce_argmax_f32(
     const float* src, uint32_t* dst,
     size_t src_numel, size_t el_per_block,
-    size_t num_dims, const size_t* info
+    size_t num_dims, const size_t* info,
+    void* stream
 ) {
     int num_blocks = (src_numel + el_per_block - 1) / el_per_block;
-    fast_argmax_f32<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_block, num_dims, info, src, dst);
+    fast_argmax_f32<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_block, num_dims, info, src, dst);
 }
 
-void run_softmax_f32(const float* src, float* dst, int ncols, int nrows) {
-    softmax_f32<<<nrows, BLOCK_SIZE>>>(src, dst, ncols, nrows);
+void run_softmax_f32(const float* src, float* dst, int ncols, int nrows, void* stream) {
+    softmax_f32<<<nrows, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src, dst, ncols, nrows);
 }
 
 // --- Where (ternary) wrappers ---
 void run_where_u8_f32(
     const uint8_t* ids, const float* t, const float* f, float* out,
-    size_t numel, size_t num_dims, const size_t* info
+    size_t numel, size_t num_dims, const size_t* info,
+    void* stream
 ) {
-    where_u8_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, ids, t, f, out);
+    where_u8_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, ids, t, f, out);
 }
 
 // --- Index select wrapper ---
 void run_index_select_u32_f32(
     const uint32_t* ids, const float* inp, float* out,
     size_t numel, size_t num_dims, const size_t* info,
-    size_t left_size, size_t src_dim_size, size_t ids_dim_size, size_t right_size
+    size_t left_size, size_t src_dim_size, size_t ids_dim_size, size_t right_size,
+    void* stream
 ) {
-    is_u32_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, ids, inp, out, left_size, src_dim_size, ids_dim_size, right_size);
+    is_u32_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, ids, inp, out, left_size, src_dim_size, ids_dim_size, right_size);
 }
 
 // --- Gather wrapper ---
 void run_gather_u32_f32(
     const uint32_t* ids, const float* inp, float* out,
-    size_t numel, size_t left_size, size_t src_dim_size, size_t ids_dim_size, size_t right_size
+    size_t numel, size_t left_size, size_t src_dim_size, size_t ids_dim_size, size_t right_size,
+    void* stream
 ) {
-    gather_u32_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, ids, inp, out, left_size, src_dim_size, ids_dim_size, right_size);
+    gather_u32_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, ids, inp, out, left_size, src_dim_size, ids_dim_size, right_size);
 }
 
 // --- Index add wrapper ---
 void run_index_add_u32_f32(
     const uint32_t* ids, const float* inp, float* out,
-    size_t ids_dim_size, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size
+    size_t ids_dim_size, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size,
+    void* stream
 ) {
     size_t numel = left_size * right_size;
-    ia_u32_f32<<<grid_size(numel), BLOCK_SIZE>>>(ids, ids_dim_size, inp, out, left_size, src_dim_size, dst_dim_size, right_size);
+    ia_u32_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(ids, ids_dim_size, inp, out, left_size, src_dim_size, dst_dim_size, right_size);
 }
 
 // --- Scatter add wrapper ---
 void run_scatter_add_u32_f32(
     const uint32_t* ids, const float* inp, float* out,
-    size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size
+    size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size,
+    void* stream
 ) {
     size_t numel = left_size * right_size;
-    sa_u32_f32<<<grid_size(numel), BLOCK_SIZE>>>(ids, inp, out, left_size, src_dim_size, dst_dim_size, right_size);
+    sa_u32_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(ids, inp, out, left_size, src_dim_size, dst_dim_size, right_size);
 }
 
 // --- Sort wrappers ---
-void run_argsort_asc_f32(const float* src, uint32_t* dst, size_t nrows, size_t ncols, size_t ncols_pad) {
-    asort_asc_f32<<<nrows, BLOCK_SIZE>>>(src, dst, nrows, ncols, ncols_pad);
+void run_argsort_asc_f32(const float* src, uint32_t* dst, size_t nrows, size_t ncols, size_t ncols_pad, void* stream) {
+    asort_asc_f32<<<nrows, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src, dst, nrows, ncols, ncols_pad);
 }
 
-void run_argsort_desc_f32(const float* src, uint32_t* dst, size_t nrows, size_t ncols, size_t ncols_pad) {
-    asort_desc_f32<<<nrows, BLOCK_SIZE>>>(src, dst, nrows, ncols, ncols_pad);
+void run_argsort_desc_f32(const float* src, uint32_t* dst, size_t nrows, size_t ncols, size_t ncols_pad, void* stream) {
+    asort_desc_f32<<<nrows, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src, dst, nrows, ncols, ncols_pad);
 }
 
 // --- Cast wrappers ---
-void run_cast_f32_f16(const float* inp, void* out, size_t numel, size_t num_dims, const size_t* info) {
-    cast_f32_f16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, (__half*)out);
+void run_cast_f32_f16(const float* inp, void* out, size_t numel, size_t num_dims, const size_t* info, void* stream) {
+    cast_f32_f16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, (__half*)out);
 }
 
-void run_cast_f16_f32(const void* inp, float* out, size_t numel, size_t num_dims, const size_t* info) {
-    cast_f16_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, (const __half*)inp, out);
+void run_cast_f16_f32(const void* inp, float* out, size_t numel, size_t num_dims, const size_t* info, void* stream) {
+    cast_f16_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const __half*)inp, out);
 }
 
-void run_cast_f32_bf16(const float* inp, void* out, size_t numel, size_t num_dims, const size_t* info) {
-    cast_f32_bf16<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, inp, (__nv_bfloat16*)out);
+void run_cast_f32_bf16(const float* inp, void* out, size_t numel, size_t num_dims, const size_t* info, void* stream) {
+    cast_f32_bf16<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, inp, (__nv_bfloat16*)out);
 }
 
-void run_cast_bf16_f32(const void* inp, float* out, size_t numel, size_t num_dims, const size_t* info) {
-    cast_bf16_f32<<<grid_size(numel), BLOCK_SIZE>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, out);
+void run_cast_bf16_f32(const void* inp, float* out, size_t numel, size_t num_dims, const size_t* info, void* stream) {
+    cast_bf16_f32<<<grid_size(numel), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, out);
 }
 
 // NOTE: run_quantize_q8_1 and run_dequantize_mul_mat_vec are defined in quantized_dispatcher.cu
@@ -541,9 +562,10 @@ void run_cast_bf16_f32(const void* inp, float* out, size_t numel, size_t num_dim
 // --- Multinomial wrapper ---
 void run_multinomial_f32(
     const float* logits, uint32_t* output, float* workspace,
-    uint32_t vocab_size, uint32_t top_k, float top_p, float temperature, uint64_t seed
+    uint32_t vocab_size, uint32_t top_k, float top_p, float temperature, uint64_t seed,
+    void* stream
 ) {
-    optimized_multinomial_f32<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(
+    optimized_multinomial_f32<<<1, BLOCK_SIZE, BLOCK_SIZE * sizeof(float), (cudaStream_t)stream>>>(
         logits, output, workspace, vocab_size, top_k, top_p, temperature, seed
     );
 }
@@ -977,17 +999,17 @@ extern "C" __global__ void deterministic_scatter_f32(float*, const float*, const
 // Binary arithmetic dispatcher
 // op: 0=add, 1=div, 2=mul, 3=sub, 4=minimum, 5=maximum
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16, 7=f8_e4m3
-extern "C" void run_binary_arith_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* lhs, const void* rhs, void* out) {
+extern "C" void run_binary_arith_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* lhs, const void* rhs, void* out, void* stream) {
     int grid = grid_size(numel);
     
     #define DISPATCH_ARITH(DTYPE, CTYPE) \
         switch (op) { \
-            case 0: badd_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
-            case 1: bdiv_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
-            case 2: bmul_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
-            case 3: bsub_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
-            case 4: bminimum_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
-            case 5: bmaximum_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
+            case 0: badd_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
+            case 1: bdiv_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
+            case 2: bmul_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
+            case 3: bsub_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
+            case 4: bminimum_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
+            case 5: bmaximum_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, (CTYPE*)out); break; \
         }
 
     switch (dtype) {
@@ -1006,17 +1028,17 @@ extern "C" void run_binary_arith_op(int32_t op, int32_t dtype, size_t numel, siz
 // Binary comparison dispatcher
 // op: 0=eq, 1=ne, 2=lt, 3=le, 4=gt, 5=ge
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16, 7=f8_e4m3
-extern "C" void run_binary_cmp_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* lhs, const void* rhs, uint8_t* out) {
+extern "C" void run_binary_cmp_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* lhs, const void* rhs, uint8_t* out, void* stream) {
     int grid = grid_size(numel);
     
     #define DISPATCH_CMP(DTYPE, CTYPE) \
         switch (op) { \
-            case 0: eq_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
-            case 1: ne_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
-            case 2: lt_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
-            case 3: le_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
-            case 4: gt_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
-            case 5: ge_##DTYPE<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
+            case 0: eq_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
+            case 1: ne_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
+            case 2: lt_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
+            case 3: le_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
+            case 4: gt_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
+            case 5: ge_##DTYPE<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const CTYPE*)lhs, (const CTYPE*)rhs, out); break; \
         }
 
     switch (dtype) {
@@ -1036,27 +1058,27 @@ extern "C" void run_binary_cmp_op(int32_t op, int32_t dtype, size_t numel, size_
 // op: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16, 7=f8_e4m3
 // NOTE: lhs must be contiguous (we write back to it)
-extern "C" void run_binary_inplace_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, void* lhs, const void* rhs) {
+extern "C" void run_binary_inplace_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, void* lhs, const void* rhs, void* stream) {
     int grid = grid_size(numel);
     
     // For float types, dispatch min/max separately (different naming)
     #define DISPATCH_INPLACE_FLOAT(DTYPE, CTYPE) \
         switch (op) { \
-            case 0: badd_##DTYPE##_inplace<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
-            case 1: bsub_##DTYPE##_inplace<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
-            case 2: bmul_##DTYPE##_inplace<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
-            case 3: bdiv_##DTYPE##_inplace<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
-            case 4: bmin_##DTYPE##_inplace<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
-            case 5: bmax_##DTYPE##_inplace<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
+            case 0: badd_##DTYPE##_inplace<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
+            case 1: bsub_##DTYPE##_inplace<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
+            case 2: bmul_##DTYPE##_inplace<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
+            case 3: bdiv_##DTYPE##_inplace<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
+            case 4: bmin_##DTYPE##_inplace<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
+            case 5: bmax_##DTYPE##_inplace<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
         }
     
     // For integer types (no min/max)
     #define DISPATCH_INPLACE_INT(DTYPE, CTYPE) \
         switch (op) { \
-            case 0: badd_##DTYPE##_inplace<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
-            case 1: bsub_##DTYPE##_inplace<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
-            case 2: bmul_##DTYPE##_inplace<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
-            case 3: bdiv_##DTYPE##_inplace<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
+            case 0: badd_##DTYPE##_inplace<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
+            case 1: bsub_##DTYPE##_inplace<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
+            case 2: bmul_##DTYPE##_inplace<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
+            case 3: bdiv_##DTYPE##_inplace<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (CTYPE*)lhs, (const CTYPE*)rhs); break; \
         }
 
     switch (dtype) {
@@ -1076,22 +1098,22 @@ extern "C" void run_binary_inplace_op(int32_t op, int32_t dtype, size_t numel, s
 // Parametric unary dispatcher (elu, powf)
 // op: 0=elu, 1=powf
 // dtype: 0=f32, 1=f64, 2=f16, 3=bf16
-void run_unary_param_op(int32_t op, int32_t dtype, float param, size_t numel, size_t num_dims, const size_t* info, const void* inp, void* out) {
+void run_unary_param_op(int32_t op, int32_t dtype, float param, size_t numel, size_t num_dims, const size_t* info, const void* inp, void* out, void* stream) {
     int grid = grid_size(numel);
     
     if (op == 0) { // elu
         switch (dtype) {
-            case 0: uelu_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, param, (const float*)inp, (float*)out); break;
-            case 1: uelu_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (double)param, (const double*)inp, (double*)out); break;
-            case 2: uelu_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, __float2half(param), (const __half*)inp, (__half*)out); break;
-            case 3: uelu_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, __float2bfloat16(param), (const __nv_bfloat16*)inp, (__nv_bfloat16*)out); break;
+            case 0: uelu_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, param, (const float*)inp, (float*)out); break;
+            case 1: uelu_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (double)param, (const double*)inp, (double*)out); break;
+            case 2: uelu_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, __float2half(param), (const __half*)inp, (__half*)out); break;
+            case 3: uelu_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, __float2bfloat16(param), (const __nv_bfloat16*)inp, (__nv_bfloat16*)out); break;
         }
     } else if (op == 1) { // powf
         switch (dtype) {
-            case 0: upowf_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, param, (const float*)inp, (float*)out); break;
-            case 1: upowf_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (double)param, (const double*)inp, (double*)out); break;
-            case 2: upowf_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, __float2half(param), (const __half*)inp, (__half*)out); break;
-            case 3: upowf_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, __float2bfloat16(param), (const __nv_bfloat16*)inp, (__nv_bfloat16*)out); break;
+            case 0: upowf_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, param, (const float*)inp, (float*)out); break;
+            case 1: upowf_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (double)param, (const double*)inp, (double*)out); break;
+            case 2: upowf_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, __float2half(param), (const __half*)inp, (__half*)out); break;
+            case 3: upowf_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, __float2bfloat16(param), (const __nv_bfloat16*)inp, (__nv_bfloat16*)out); break;
         }
     }
 }
@@ -1099,38 +1121,38 @@ void run_unary_param_op(int32_t op, int32_t dtype, float param, size_t numel, si
 // Where (ternary) dispatcher
 // cond_dtype: 0=i64, 1=u32, 2=u8
 // data_dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16
-void run_where(int32_t cond_dtype, int32_t data_dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* cond, const void* t, const void* f, void* out) {
+void run_where(int32_t cond_dtype, int32_t data_dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* cond, const void* t, const void* f, void* out, void* stream) {
     int grid = grid_size(numel);
     
     if (cond_dtype == 0) { // i64
         switch (data_dtype) {
-            case 0: where_i64_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const float*)t, (const float*)f, (float*)out); break;
-            case 1: where_i64_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const double*)t, (const double*)f, (double*)out); break;
-            case 2: where_i64_u8<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const uint8_t*)t, (const uint8_t*)f, (uint8_t*)out); break;
-            case 3: where_i64_u32<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const uint32_t*)t, (const uint32_t*)f, (uint32_t*)out); break;
-            case 4: where_i64_i64<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const int64_t*)t, (const int64_t*)f, (int64_t*)out); break;
-            case 5: where_i64_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const __half*)t, (const __half*)f, (__half*)out); break;
-            case 6: where_i64_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const __nv_bfloat16*)t, (const __nv_bfloat16*)f, (__nv_bfloat16*)out); break;
+            case 0: where_i64_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const float*)t, (const float*)f, (float*)out); break;
+            case 1: where_i64_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const double*)t, (const double*)f, (double*)out); break;
+            case 2: where_i64_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const uint8_t*)t, (const uint8_t*)f, (uint8_t*)out); break;
+            case 3: where_i64_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const uint32_t*)t, (const uint32_t*)f, (uint32_t*)out); break;
+            case 4: where_i64_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const int64_t*)t, (const int64_t*)f, (int64_t*)out); break;
+            case 5: where_i64_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const __half*)t, (const __half*)f, (__half*)out); break;
+            case 6: where_i64_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const int64_t*)cond, (const __nv_bfloat16*)t, (const __nv_bfloat16*)f, (__nv_bfloat16*)out); break;
         }
     } else if (cond_dtype == 1) { // u32
         switch (data_dtype) {
-            case 0: where_u32_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const float*)t, (const float*)f, (float*)out); break;
-            case 1: where_u32_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const double*)t, (const double*)f, (double*)out); break;
-            case 2: where_u32_u8<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const uint8_t*)t, (const uint8_t*)f, (uint8_t*)out); break;
-            case 3: where_u32_u32<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const uint32_t*)t, (const uint32_t*)f, (uint32_t*)out); break;
-            case 4: where_u32_i64<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const int64_t*)t, (const int64_t*)f, (int64_t*)out); break;
-            case 5: where_u32_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const __half*)t, (const __half*)f, (__half*)out); break;
-            case 6: where_u32_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const __nv_bfloat16*)t, (const __nv_bfloat16*)f, (__nv_bfloat16*)out); break;
+            case 0: where_u32_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const float*)t, (const float*)f, (float*)out); break;
+            case 1: where_u32_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const double*)t, (const double*)f, (double*)out); break;
+            case 2: where_u32_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const uint8_t*)t, (const uint8_t*)f, (uint8_t*)out); break;
+            case 3: where_u32_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const uint32_t*)t, (const uint32_t*)f, (uint32_t*)out); break;
+            case 4: where_u32_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const int64_t*)t, (const int64_t*)f, (int64_t*)out); break;
+            case 5: where_u32_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const __half*)t, (const __half*)f, (__half*)out); break;
+            case 6: where_u32_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint32_t*)cond, (const __nv_bfloat16*)t, (const __nv_bfloat16*)f, (__nv_bfloat16*)out); break;
         }
     } else if (cond_dtype == 2) { // u8
         switch (data_dtype) {
-            case 0: where_u8_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const float*)t, (const float*)f, (float*)out); break;
-            case 1: where_u8_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const double*)t, (const double*)f, (double*)out); break;
-            case 2: where_u8_u8<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const uint8_t*)t, (const uint8_t*)f, (uint8_t*)out); break;
-            case 3: where_u8_u32<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const uint32_t*)t, (const uint32_t*)f, (uint32_t*)out); break;
-            case 4: where_u8_i64<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const int64_t*)t, (const int64_t*)f, (int64_t*)out); break;
-            case 5: where_u8_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const __half*)t, (const __half*)f, (__half*)out); break;
-            case 6: where_u8_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const __nv_bfloat16*)t, (const __nv_bfloat16*)f, (__nv_bfloat16*)out); break;
+            case 0: where_u8_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const float*)t, (const float*)f, (float*)out); break;
+            case 1: where_u8_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const double*)t, (const double*)f, (double*)out); break;
+            case 2: where_u8_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const uint8_t*)t, (const uint8_t*)f, (uint8_t*)out); break;
+            case 3: where_u8_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const uint32_t*)t, (const uint32_t*)f, (uint32_t*)out); break;
+            case 4: where_u8_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const int64_t*)t, (const int64_t*)f, (int64_t*)out); break;
+            case 5: where_u8_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const __half*)t, (const __half*)f, (__half*)out); break;
+            case 6: where_u8_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const uint8_t*)cond, (const __nv_bfloat16*)t, (const __nv_bfloat16*)f, (__nv_bfloat16*)out); break;
         }
     }
 }
@@ -1140,45 +1162,45 @@ void run_where(int32_t cond_dtype, int32_t data_dtype, size_t numel, size_t num_
 // REDUCE_SMEM_SIZE: Shared memory for block reductions (512 bytes is enough for 32 warps * 16 bytes)
 constexpr int REDUCE_SMEM_SIZE = 512;
 
-void run_fast_reduce_op(int32_t op, int32_t dtype, size_t src_numel, size_t el_per_reduce, size_t num_dims, const size_t* info, const void* src, void* dst) {
+void run_fast_reduce_op(int32_t op, int32_t dtype, size_t src_numel, size_t el_per_reduce, size_t num_dims, const size_t* info, const void* src, void* dst, void* stream) {
     int num_blocks = (src_numel + el_per_reduce - 1) / el_per_reduce;
     if (op == 0) { // Sum
         switch (dtype) {
-            case 0: fast_sum_f32<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const float*)src, (float*)dst); break;
-            case 1: fast_sum_f64<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const double*)src, (double*)dst); break;
-            case 2: fast_sum_f16<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __half*)src, (__half*)dst); break;
-            case 3: fast_sum_bf16<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst); break;
-            case 4: fast_sum_u32<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const uint32_t*)src, (uint32_t*)dst); break;
-            case 5: fast_sum_i64<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const int64_t*)src, (int64_t*)dst); break;
-            case 6: fast_sum_u8<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const uint8_t*)src, (uint8_t*)dst); break;
+            case 0: fast_sum_f32<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const float*)src, (float*)dst); break;
+            case 1: fast_sum_f64<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const double*)src, (double*)dst); break;
+            case 2: fast_sum_f16<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __half*)src, (__half*)dst); break;
+            case 3: fast_sum_bf16<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst); break;
+            case 4: fast_sum_u32<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const uint32_t*)src, (uint32_t*)dst); break;
+            case 5: fast_sum_i64<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const int64_t*)src, (int64_t*)dst); break;
+            case 6: fast_sum_u8<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const uint8_t*)src, (uint8_t*)dst); break;
 #if __CUDA_ARCH__ >= 890 || !defined(__CUDA_ARCH__)
-            case 7: fast_sum_f8_e4m3<<<num_blocks, BLOCK_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst); break;
+            case 7: fast_sum_f8_e4m3<<<num_blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst); break;
 #endif
         }
     } else if (op == 1) { // Min
         switch (dtype) {
-            case 0: fast_min_f32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const float*)src, (float*)dst); break;
-            case 1: fast_min_f64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const double*)src, (double*)dst); break;
-            case 2: fast_min_f16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __half*)src, (__half*)dst); break;
-            case 3: fast_min_bf16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst); break;
-            case 4: fast_min_u32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const uint32_t*)src, (uint32_t*)dst); break;
-            case 5: fast_min_i64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const int64_t*)src, (int64_t*)dst); break;
-            case 6: fast_min_u8<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const uint8_t*)src, (uint8_t*)dst); break;
+            case 0: fast_min_f32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const float*)src, (float*)dst); break;
+            case 1: fast_min_f64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const double*)src, (double*)dst); break;
+            case 2: fast_min_f16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __half*)src, (__half*)dst); break;
+            case 3: fast_min_bf16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst); break;
+            case 4: fast_min_u32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const uint32_t*)src, (uint32_t*)dst); break;
+            case 5: fast_min_i64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const int64_t*)src, (int64_t*)dst); break;
+            case 6: fast_min_u8<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const uint8_t*)src, (uint8_t*)dst); break;
 #if __CUDA_ARCH__ >= 890 || !defined(__CUDA_ARCH__)
-            case 7: fast_min_f8_e4m3<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst); break;
+            case 7: fast_min_f8_e4m3<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst); break;
 #endif
         }
     } else if (op == 2) { // Max
         switch (dtype) {
-            case 0: fast_max_f32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const float*)src, (float*)dst); break;
-            case 1: fast_max_f64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const double*)src, (double*)dst); break;
-            case 2: fast_max_f16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __half*)src, (__half*)dst); break;
-            case 3: fast_max_bf16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst); break;
-            case 4: fast_max_u32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const uint32_t*)src, (uint32_t*)dst); break;
-            case 5: fast_max_i64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const int64_t*)src, (int64_t*)dst); break;
-            case 6: fast_max_u8<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const uint8_t*)src, (uint8_t*)dst); break;
+            case 0: fast_max_f32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const float*)src, (float*)dst); break;
+            case 1: fast_max_f64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const double*)src, (double*)dst); break;
+            case 2: fast_max_f16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __half*)src, (__half*)dst); break;
+            case 3: fast_max_bf16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst); break;
+            case 4: fast_max_u32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const uint32_t*)src, (uint32_t*)dst); break;
+            case 5: fast_max_i64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const int64_t*)src, (int64_t*)dst); break;
+            case 6: fast_max_u8<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const uint8_t*)src, (uint8_t*)dst); break;
 #if __CUDA_ARCH__ >= 890 || !defined(__CUDA_ARCH__)
-            case 7: fast_max_f8_e4m3<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst); break;
+            case 7: fast_max_f8_e4m3<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst); break;
 #endif
         }
     }
@@ -1186,32 +1208,32 @@ void run_fast_reduce_op(int32_t op, int32_t dtype, size_t src_numel, size_t el_p
 
 // op: 0=argmin, 1=argmax
 // dtype: 0=f32, 1=f64, 2=f16, 3=bf16, 4=u32, 5=i64, 6=u8, 7=f8_e4m3
-void run_fast_arg_reduce_op(int32_t op, int32_t dtype, size_t src_numel, size_t el_per_reduce, size_t num_dims, const size_t* info, const void* src, uint32_t* dst) {
+void run_fast_arg_reduce_op(int32_t op, int32_t dtype, size_t src_numel, size_t el_per_reduce, size_t num_dims, const size_t* info, const void* src, uint32_t* dst, void* stream) {
     int num_blocks = (src_numel + el_per_reduce - 1) / el_per_reduce;
     if (op == 0) { // ArgMin
         switch (dtype) {
-            case 0: fast_argmin_f32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const float*)src, dst); break;
-            case 1: fast_argmin_f64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const double*)src, dst); break;
-            case 2: fast_argmin_f16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __half*)src, dst); break;
-            case 3: fast_argmin_bf16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_bfloat16*)src, dst); break;
-            case 4: fast_argmin_u32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const uint32_t*)src, dst); break;
-            case 5: fast_argmin_i64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const int64_t*)src, dst); break;
-            case 6: fast_argmin_u8<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const uint8_t*)src, dst); break;
+            case 0: fast_argmin_f32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const float*)src, dst); break;
+            case 1: fast_argmin_f64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const double*)src, dst); break;
+            case 2: fast_argmin_f16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __half*)src, dst); break;
+            case 3: fast_argmin_bf16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_bfloat16*)src, dst); break;
+            case 4: fast_argmin_u32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const uint32_t*)src, dst); break;
+            case 5: fast_argmin_i64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const int64_t*)src, dst); break;
+            case 6: fast_argmin_u8<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const uint8_t*)src, dst); break;
 #if __CUDA_ARCH__ >= 890 || !defined(__CUDA_ARCH__)
-            case 7: fast_argmin_f8_e4m3<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_fp8_e4m3*)src, dst); break;
+            case 7: fast_argmin_f8_e4m3<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_fp8_e4m3*)src, dst); break;
 #endif
         }
     } else if (op == 1) { // ArgMax
         switch (dtype) {
-            case 0: fast_argmax_f32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const float*)src, dst); break;
-            case 1: fast_argmax_f64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const double*)src, dst); break;
-            case 2: fast_argmax_f16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __half*)src, dst); break;
-            case 3: fast_argmax_bf16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_bfloat16*)src, dst); break;
-            case 4: fast_argmax_u32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const uint32_t*)src, dst); break;
-            case 5: fast_argmax_i64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const int64_t*)src, dst); break;
-            case 6: fast_argmax_u8<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const uint8_t*)src, dst); break;
+            case 0: fast_argmax_f32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const float*)src, dst); break;
+            case 1: fast_argmax_f64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const double*)src, dst); break;
+            case 2: fast_argmax_f16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __half*)src, dst); break;
+            case 3: fast_argmax_bf16<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_bfloat16*)src, dst); break;
+            case 4: fast_argmax_u32<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const uint32_t*)src, dst); break;
+            case 5: fast_argmax_i64<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const int64_t*)src, dst); break;
+            case 6: fast_argmax_u8<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const uint8_t*)src, dst); break;
 #if __CUDA_ARCH__ >= 890 || !defined(__CUDA_ARCH__)
-            case 7: fast_argmax_f8_e4m3<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_fp8_e4m3*)src, dst); break;
+            case 7: fast_argmax_f8_e4m3<<<num_blocks, BLOCK_SIZE, REDUCE_SMEM_SIZE, (cudaStream_t)stream>>>(src_numel, el_per_reduce, num_dims, info, (const __nv_fp8_e4m3*)src, dst); break;
 #endif
         }
     }
@@ -1220,38 +1242,38 @@ void run_fast_arg_reduce_op(int32_t op, int32_t dtype, size_t src_numel, size_t 
 // Index select dispatcher
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16
 // ids_dtype: 0=i16, 1=i32, 2=i64, 3=u32, 4=u8
-void run_index_select(int32_t ids_dtype, int32_t dtype, size_t numel, size_t num_dims, const size_t* info, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t ids_dim_size, size_t right_size) {
+void run_index_select(int32_t ids_dtype, int32_t dtype, size_t numel, size_t num_dims, const size_t* info, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t ids_dim_size, size_t right_size, void* stream) {
     int grid = grid_size(numel);
     
     if (ids_dtype == 2) { // i64
         switch (dtype) {
-            case 0: is_i64_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const int64_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 1: is_i64_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const int64_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 2: is_i64_u8<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const int64_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 3: is_i64_u32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const int64_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 4: is_i64_i64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const int64_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 5: is_i64_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const int64_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 6: is_i64_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const int64_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 0: is_i64_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const int64_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 1: is_i64_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const int64_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 2: is_i64_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const int64_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 3: is_i64_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const int64_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 4: is_i64_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const int64_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 5: is_i64_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const int64_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 6: is_i64_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const int64_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
         }
     } else if (ids_dtype == 3) { // u32
         switch (dtype) {
-            case 0: is_u32_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint32_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 1: is_u32_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint32_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 2: is_u32_u8<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint32_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 3: is_u32_u32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint32_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 4: is_u32_i64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint32_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 5: is_u32_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint32_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 6: is_u32_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint32_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 0: is_u32_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint32_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 1: is_u32_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint32_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 2: is_u32_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint32_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 3: is_u32_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint32_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 4: is_u32_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint32_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 5: is_u32_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint32_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 6: is_u32_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint32_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
         }
     } else if (ids_dtype == 4) { // u8
         switch (dtype) {
-            case 0: is_u8_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint8_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 1: is_u8_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint8_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 2: is_u8_u8<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint8_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 3: is_u8_u32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint8_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 4: is_u8_i64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint8_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 5: is_u8_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint8_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 6: is_u8_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint8_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 0: is_u8_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint8_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 1: is_u8_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint8_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 2: is_u8_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint8_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 3: is_u8_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint8_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 4: is_u8_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint8_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 5: is_u8_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint8_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 6: is_u8_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint8_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
         }
     }
 }
@@ -1259,38 +1281,38 @@ void run_index_select(int32_t ids_dtype, int32_t dtype, size_t numel, size_t num
 // Gather dispatcher  
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16
 // ids_dtype: 0=i16, 1=i32, 2=i64, 3=u32, 4=u8
-void run_gather(int32_t ids_dtype, int32_t dtype, size_t numel, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t ids_dim_size, size_t right_size) {
+void run_gather(int32_t ids_dtype, int32_t dtype, size_t numel, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t ids_dim_size, size_t right_size, void* stream) {
     int grid = grid_size(numel);
     
     if (ids_dtype == 2) { // i64
         switch (dtype) {
-            case 0: gather_i64_f32<<<grid, BLOCK_SIZE>>>(numel, (const int64_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 1: gather_i64_f64<<<grid, BLOCK_SIZE>>>(numel, (const int64_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 2: gather_i64_u8<<<grid, BLOCK_SIZE>>>(numel, (const int64_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 3: gather_i64_u32<<<grid, BLOCK_SIZE>>>(numel, (const int64_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 4: gather_i64_i64<<<grid, BLOCK_SIZE>>>(numel, (const int64_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 5: gather_i64_f16<<<grid, BLOCK_SIZE>>>(numel, (const int64_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 6: gather_i64_bf16<<<grid, BLOCK_SIZE>>>(numel, (const int64_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 0: gather_i64_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const int64_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 1: gather_i64_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const int64_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 2: gather_i64_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const int64_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 3: gather_i64_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const int64_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 4: gather_i64_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const int64_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 5: gather_i64_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const int64_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 6: gather_i64_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const int64_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
         }
     } else if (ids_dtype == 3) { // u32
         switch (dtype) {
-            case 0: gather_u32_f32<<<grid, BLOCK_SIZE>>>(numel, (const uint32_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 1: gather_u32_f64<<<grid, BLOCK_SIZE>>>(numel, (const uint32_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 2: gather_u32_u8<<<grid, BLOCK_SIZE>>>(numel, (const uint32_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 3: gather_u32_u32<<<grid, BLOCK_SIZE>>>(numel, (const uint32_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 4: gather_u32_i64<<<grid, BLOCK_SIZE>>>(numel, (const uint32_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 5: gather_u32_f16<<<grid, BLOCK_SIZE>>>(numel, (const uint32_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 6: gather_u32_bf16<<<grid, BLOCK_SIZE>>>(numel, (const uint32_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 0: gather_u32_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint32_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 1: gather_u32_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint32_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 2: gather_u32_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint32_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 3: gather_u32_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint32_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 4: gather_u32_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint32_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 5: gather_u32_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint32_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 6: gather_u32_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint32_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
         }
     } else if (ids_dtype == 4) { // u8
         switch (dtype) {
-            case 0: gather_u8_f32<<<grid, BLOCK_SIZE>>>(numel, (const uint8_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 1: gather_u8_f64<<<grid, BLOCK_SIZE>>>(numel, (const uint8_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 2: gather_u8_u8<<<grid, BLOCK_SIZE>>>(numel, (const uint8_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 3: gather_u8_u32<<<grid, BLOCK_SIZE>>>(numel, (const uint8_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 4: gather_u8_i64<<<grid, BLOCK_SIZE>>>(numel, (const uint8_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 5: gather_u8_f16<<<grid, BLOCK_SIZE>>>(numel, (const uint8_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
-            case 6: gather_u8_bf16<<<grid, BLOCK_SIZE>>>(numel, (const uint8_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 0: gather_u8_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint8_t*)ids, (const float*)src, (float*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 1: gather_u8_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint8_t*)ids, (const double*)src, (double*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 2: gather_u8_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint8_t*)ids, (const uint8_t*)src, (uint8_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 3: gather_u8_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint8_t*)ids, (const uint32_t*)src, (uint32_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 4: gather_u8_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint8_t*)ids, (const int64_t*)src, (int64_t*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 5: gather_u8_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint8_t*)ids, (const __half*)src, (__half*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
+            case 6: gather_u8_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, (const uint8_t*)ids, (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, left_size, src_dim_size, ids_dim_size, right_size); break;
         }
     }
 }
@@ -1320,10 +1342,10 @@ void run_gather(int32_t ids_dtype, int32_t dtype, size_t numel, const void* ids,
     }
 
 // Index add dispatcher
-int32_t run_index_add(int32_t ids_dtype, int32_t dtype, const void* ids, size_t ids_dim_size, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size) {
+int32_t run_index_add(int32_t ids_dtype, int32_t dtype, const void* ids, size_t ids_dim_size, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size, void* stream) {
     size_t numel = left_size * right_size;
     int grid = grid_size(numel);
-#define IA_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE>>>((const I*)ids, ids_dim_size, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
+#define IA_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const I*)ids, ids_dim_size, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
     if (ids_dtype == 2) {
         SCATTER_FAMILY_SWITCH(IA_LAUNCH, ia_i64, int64_t)
         SCATTER_FAMILY_F8(IA_LAUNCH, ia_i64, int64_t)
@@ -1339,10 +1361,10 @@ int32_t run_index_add(int32_t ids_dtype, int32_t dtype, const void* ids, size_t 
 }
 
 // Scatter dispatcher
-int32_t run_scatter(int32_t ids_dtype, int32_t dtype, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size) {
+int32_t run_scatter(int32_t ids_dtype, int32_t dtype, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size, void* stream) {
     size_t numel = left_size * right_size;
     int grid = grid_size(numel);
-#define S_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE>>>((const I*)ids, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
+#define S_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const I*)ids, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
     if (ids_dtype == 2) {
         SCATTER_FAMILY_SWITCH(S_LAUNCH, s_i64, int64_t)
     } else if (ids_dtype == 3) {
@@ -1355,10 +1377,10 @@ int32_t run_scatter(int32_t ids_dtype, int32_t dtype, const void* ids, const voi
 }
 
 // Scatter add dispatcher
-int32_t run_scatter_add(int32_t ids_dtype, int32_t dtype, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size) {
+int32_t run_scatter_add(int32_t ids_dtype, int32_t dtype, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size, void* stream) {
     size_t numel = left_size * right_size;
     int grid = grid_size(numel);
-#define SA_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE>>>((const I*)ids, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
+#define SA_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const I*)ids, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
     if (ids_dtype == 2) {
         SCATTER_FAMILY_SWITCH(SA_LAUNCH, sa_i64, int64_t)
         SCATTER_FAMILY_F8(SA_LAUNCH, sa_i64, int64_t)
@@ -1383,29 +1405,29 @@ int32_t run_scatter_add(int32_t ids_dtype, int32_t dtype, const void* ids, const
 // op: 0=copy, 1=neg, 2=recip, 3=exp, 4=log, 5=sin, 6=cos, 7=tanh, 8=erf, 9=ceil, 10=floor, 
 //     11=round, 12=normcdf, 13=abs, 14=sqr, 15=sqrt, 16=gelu, 17=gelu_erf, 18=relu, 19=silu, 20=sign, 21=sigmoid
 // dtype: 0=f32, 1=f64, 2=f16, 3=bf16, 4=f8_e4m3, 5=u8, 6=u32, 7=i64 (only for copy)
-void run_unary_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* info, const void* inp, void* out) {
+void run_unary_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* info, const void* inp, void* out, void* stream) {
     int grid = grid_size(numel);
     
     // Handle copy operation separately as it supports more dtypes
     if (op == 0) { // copy
         switch (dtype) {
-            case 0: ucopy_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const float*)inp, (float*)out); break;
-            case 1: ucopy_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const double*)inp, (double*)out); break;
-            case 2: ucopy_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const __half*)inp, (__half*)out); break;
-            case 3: ucopy_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_bfloat16*)out); break;
-            case 4: ucopy_f8_e4m3<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (__nv_fp8_e4m3*)out); break;
-            case 5: ucopy_u8<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint8_t*)inp, (uint8_t*)out); break;
-            case 6: ucopy_u32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const uint32_t*)inp, (uint32_t*)out); break;
-            case 7: ucopy_i64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const int64_t*)inp, (int64_t*)out); break;
+            case 0: ucopy_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const float*)inp, (float*)out); break;
+            case 1: ucopy_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const double*)inp, (double*)out); break;
+            case 2: ucopy_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const __half*)inp, (__half*)out); break;
+            case 3: ucopy_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_bfloat16*)out); break;
+            case 4: ucopy_f8_e4m3<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (__nv_fp8_e4m3*)out); break;
+            case 5: ucopy_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint8_t*)inp, (uint8_t*)out); break;
+            case 6: ucopy_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const uint32_t*)inp, (uint32_t*)out); break;
+            case 7: ucopy_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const int64_t*)inp, (int64_t*)out); break;
         }
         return;
     }
     
     // For all other unary ops, only float types are supported
-    #define DISPATCH_UNARY_F32(NAME) NAME##_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const float*)inp, (float*)out)
-    #define DISPATCH_UNARY_F64(NAME) NAME##_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const double*)inp, (double*)out)
-    #define DISPATCH_UNARY_F16(NAME) NAME##_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const __half*)inp, (__half*)out)
-    #define DISPATCH_UNARY_BF16(NAME) NAME##_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_bfloat16*)out)
+    #define DISPATCH_UNARY_F32(NAME) NAME##_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const float*)inp, (float*)out)
+    #define DISPATCH_UNARY_F64(NAME) NAME##_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const double*)inp, (double*)out)
+    #define DISPATCH_UNARY_F16(NAME) NAME##_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const __half*)inp, (__half*)out)
+    #define DISPATCH_UNARY_BF16(NAME) NAME##_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_bfloat16*)out)
     
     #define DISPATCH_UNARY_ALL(NAME) \
         switch (dtype) { \
@@ -1449,21 +1471,21 @@ void run_unary_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, cons
 // Fused SiLU-Mul dispatcher
 // dtype: 0=f32, 1=f16, 2=bf16, 3=f8_e4m3
 // Computes: out[i] = silu(gate[i]) * up[i]
-void run_fused_silu_mul(int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* gate, const void* up, void* out) {
+void run_fused_silu_mul(int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* gate, const void* up, void* out, void* stream) {
     int grid = grid_size(numel);
 
     switch (dtype) {
         case 0: // f32
-            fused_silu_mul_f32_vec4<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const float*)gate, (const float*)up, (float*)out);
+            fused_silu_mul_f32_vec4<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const float*)gate, (const float*)up, (float*)out);
             break;
         case 1: // f16
-            fused_silu_mul_f16_vec2<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __half*)gate, (const __half*)up, (__half*)out);
+            fused_silu_mul_f16_vec2<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __half*)gate, (const __half*)up, (__half*)out);
             break;
         case 2: // bf16
-            fused_silu_mul_bf16_vec2<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __nv_bfloat16*)gate, (const __nv_bfloat16*)up, (__nv_bfloat16*)out);
+            fused_silu_mul_bf16_vec2<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __nv_bfloat16*)gate, (const __nv_bfloat16*)up, (__nv_bfloat16*)out);
             break;
         case 3: // f8_e4m3
-            fused_silu_mul_f8_e4m3_vec4<<<grid, BLOCK_SIZE>>>(numel, num_dims, dims_and_strides, (const __nv_fp8_e4m3*)gate, (const __nv_fp8_e4m3*)up, (__nv_fp8_e4m3*)out);
+            fused_silu_mul_f8_e4m3_vec4<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, dims_and_strides, (const __nv_fp8_e4m3*)gate, (const __nv_fp8_e4m3*)up, (__nv_fp8_e4m3*)out);
             break;
     }
 }
@@ -1476,7 +1498,7 @@ extern "C" __global__ void silu_mul_q8a128_bf16(const __nv_bfloat16*, const __nv
 // `sum_norm` is `SumScale::as_code()` — the Σx convention these blocks are
 // written in, which the matmul reading them must be launched with.
 // `row_stride`: elements between consecutive rows of `gate`/`up` — `cols` when dense.
-void run_silu_mul_q8a128_op(int32_t dtype, const void* gate, const void* up, void* out, int rows, int cols, int sum_norm, int row_stride) {
+void run_silu_mul_q8a128_op(int32_t dtype, const void* gate, const void* up, void* out, int rows, int cols, int sum_norm, int row_stride, cudaStream_t stream) {
     long long total_tiles = ((long long)rows * cols) / 128;
     if (total_tiles <= 0) return;
     const int threads = 256;
@@ -1486,13 +1508,13 @@ void run_silu_mul_q8a128_op(int32_t dtype, const void* gate, const void* up, voi
     dim3 grid((unsigned)blocks, 1, 1), block(threads, 1, 1);
     switch (dtype) {
         case 0: // f32
-            silu_mul_q8a128_f32<<<grid, block>>>((const float*)gate, (const float*)up, out, rows, cols, sum_norm, row_stride);
+            silu_mul_q8a128_f32<<<grid, block, 0, stream>>>((const float*)gate, (const float*)up, out, rows, cols, sum_norm, row_stride);
             break;
         case 1: // f16
-            silu_mul_q8a128_f16<<<grid, block>>>((const __half*)gate, (const __half*)up, out, rows, cols, sum_norm, row_stride);
+            silu_mul_q8a128_f16<<<grid, block, 0, stream>>>((const __half*)gate, (const __half*)up, out, rows, cols, sum_norm, row_stride);
             break;
         case 2: // bf16
-            silu_mul_q8a128_bf16<<<grid, block>>>((const __nv_bfloat16*)gate, (const __nv_bfloat16*)up, out, rows, cols, sum_norm, row_stride);
+            silu_mul_q8a128_bf16<<<grid, block, 0, stream>>>((const __nv_bfloat16*)gate, (const __nv_bfloat16*)up, out, rows, cols, sum_norm, row_stride);
             break;
     }
 }
@@ -1504,24 +1526,24 @@ void run_silu_mul_q8a128_op(int32_t dtype, const void* gate, const void* up, voi
 
 void run_moe_gather(int32_t dtype, void* out, const void* xs,
                     const uint32_t* token_ids,
-                    size_t total_rows, size_t hidden_dim) {
+                    size_t total_rows, size_t hidden_dim, cudaStream_t stream) {
     if (total_rows == 0) return;
     dim3 grid(total_rows, grid_size(hidden_dim));
     switch (dtype) {
         case 0: // f32
-            moe_gather_f32<<<grid, BLOCK_SIZE>>>((float*)out, (const float*)xs, token_ids, total_rows, hidden_dim);
+            moe_gather_f32<<<grid, BLOCK_SIZE, 0, stream>>>((float*)out, (const float*)xs, token_ids, total_rows, hidden_dim);
             break;
         case 1: // f16
-            moe_gather_f16<<<grid, BLOCK_SIZE>>>((__half*)out, (const __half*)xs, token_ids, total_rows, hidden_dim);
+            moe_gather_f16<<<grid, BLOCK_SIZE, 0, stream>>>((__half*)out, (const __half*)xs, token_ids, total_rows, hidden_dim);
             break;
         case 2: // bf16
-            moe_gather_bf16<<<grid, BLOCK_SIZE>>>((__nv_bfloat16*)out, (const __nv_bfloat16*)xs, token_ids, total_rows, hidden_dim);
+            moe_gather_bf16<<<grid, BLOCK_SIZE, 0, stream>>>((__nv_bfloat16*)out, (const __nv_bfloat16*)xs, token_ids, total_rows, hidden_dim);
             break;
         case 3: { // q8a128 tile gather; hidden_dim = 128-element tiles per row
             // One warp per output tile, 8 warps a block, grid-strided.
             const size_t tiles = total_rows * hidden_dim;
             const unsigned blocks = (unsigned)((tiles + 7) / 8);
-            moe_gather_q8a128_tiles<<<blocks > 0 ? blocks : 1, 256>>>(
+            moe_gather_q8a128_tiles<<<blocks > 0 ? blocks : 1, 256, 0, stream>>>(
                 (uint8_t*)out, (const uint8_t*)xs, token_ids, total_rows, hidden_dim);
             break;
         }
@@ -1533,7 +1555,7 @@ void run_moe_gather(int32_t dtype, void* out, const void* xs,
 // (f32), both [num_tokens, k] in descending-logit order. `norm_topk` selects renormalized
 // top-k softmax (1) vs plain full-softmax weights (0).
 void run_moe_route(int32_t dtype, const void* logits, uint32_t* out_idx, float* out_weights,
-                   int num_tokens, int n_experts, int k, int norm_topk) {
+                   int num_tokens, int n_experts, int k, int norm_topk, cudaStream_t stream) {
     if (num_tokens == 0) return;
     // One warp per token; 256-thread blocks pack 8 warps (= 8 tokens) each.
     const int tpb = 256;
@@ -1544,16 +1566,16 @@ void run_moe_route(int32_t dtype, const void* logits, uint32_t* out_idx, float* 
     const bool wide = n_experts > 256;
     switch (dtype) {
         case 0: // f32
-            if (wide) moe_route_f32_x512<<<blocks, tpb>>>((const float*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-            else      moe_route_f32<<<blocks, tpb>>>((const float*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            if (wide) moe_route_f32_x512<<<blocks, tpb, 0, stream>>>((const float*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            else      moe_route_f32<<<blocks, tpb, 0, stream>>>((const float*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
             break;
         case 1: // f16
-            if (wide) moe_route_f16_x512<<<blocks, tpb>>>((const __half*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-            else      moe_route_f16<<<blocks, tpb>>>((const __half*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            if (wide) moe_route_f16_x512<<<blocks, tpb, 0, stream>>>((const __half*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            else      moe_route_f16<<<blocks, tpb, 0, stream>>>((const __half*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
             break;
         case 2: // bf16
-            if (wide) moe_route_bf16_x512<<<blocks, tpb>>>((const __nv_bfloat16*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-            else      moe_route_bf16<<<blocks, tpb>>>((const __nv_bfloat16*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            if (wide) moe_route_bf16_x512<<<blocks, tpb, 0, stream>>>((const __nv_bfloat16*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            else      moe_route_bf16<<<blocks, tpb, 0, stream>>>((const __nv_bfloat16*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
             break;
     }
 }
@@ -1566,22 +1588,22 @@ void run_deterministic_scatter(int32_t dtype, void* ys, const void* down_out,
                                const float* weights_flat,
                                const uint32_t* reordered_weight_ids,
                                const int* token_starts,
-                               int num_tokens, int hidden) {
+                               int num_tokens, int hidden, cudaStream_t stream) {
     if (num_tokens == 0) return;
     dim3 grid(num_tokens, grid_size(hidden));
     switch (dtype) {
         case 0: // f32
-            deterministic_scatter_f32<<<grid, BLOCK_SIZE>>>(
+            deterministic_scatter_f32<<<grid, BLOCK_SIZE, 0, stream>>>(
                 (float*)ys, (const float*)down_out,
                 perm, weights_flat, reordered_weight_ids, token_starts, num_tokens, hidden);
             break;
         case 1: // f16
-            deterministic_scatter_f16<<<grid, BLOCK_SIZE>>>(
+            deterministic_scatter_f16<<<grid, BLOCK_SIZE, 0, stream>>>(
                 (__half*)ys, (const __half*)down_out,
                 perm, weights_flat, reordered_weight_ids, token_starts, num_tokens, hidden);
             break;
         case 2: // bf16
-            deterministic_scatter_bf16<<<grid, BLOCK_SIZE>>>(
+            deterministic_scatter_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(
                 (__nv_bfloat16*)ys, (const __nv_bfloat16*)down_out,
                 perm, weights_flat, reordered_weight_ids, token_starts, num_tokens, hidden);
             break;

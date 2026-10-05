@@ -97,6 +97,8 @@ extern "C" {
     /// - `src`: Source tensor
     /// - `dst`: Destination tensor (same type as src)
     ///
+    /// - `stream`: the stream the launch is issued on
+    ///
     /// Note: F8E4M3 (7) does not support sum operation due to lack of atomicAdd
     pub fn run_fast_reduce_op(
         op: i32,
@@ -107,6 +109,7 @@ extern "C" {
         info: *const usize,
         src: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
 
     // =========================================================================
@@ -123,6 +126,7 @@ extern "C" {
     /// - `info`: Pointer to dims and strides array
     /// - `src`: Source tensor
     /// - `dst`: Destination tensor (always u32 indices)
+    /// - `stream`: the stream the launch is issued on
     pub fn run_fast_arg_reduce_op(
         op: i32,
         dtype: i32,
@@ -132,6 +136,7 @@ extern "C" {
         info: *const usize,
         src: *const c_void,
         dst: *mut u32,
+        stream: *mut c_void,
     );
 
     // =========================================================================
@@ -147,6 +152,7 @@ extern "C" {
     /// - `info`: Pointer to dims, strides, sum_dims_l, sum_dims_s
     /// - `inp`: Input tensor
     /// - `out`: Output tensor
+    /// - `stream`: the stream the launch is issued on
     pub fn run_sum_op(
         dtype: i32,
         numel: usize,
@@ -155,6 +161,7 @@ extern "C" {
         info: *const usize,
         inp: *const c_void,
         out: *mut c_void,
+        stream: *mut c_void,
     );
 
     // =========================================================================
@@ -168,12 +175,14 @@ extern "C" {
     /// - `dst`: Destination tensor
     /// - `n_rows`: Number of rows (batch dimension)
     /// - `n_cols`: Number of columns (softmax dimension size)
+    /// - `stream`: the stream the launch is issued on
     pub fn run_softmax_op(
         dtype: i32,
         src: *const c_void,
         dst: *mut c_void,
         n_rows: i32,
         n_cols: i32,
+        stream: *mut c_void,
     );
 
     // =========================================================================
@@ -189,6 +198,8 @@ extern "C" {
     /// - `n_rows`: Number of rows (batch dimension)
     /// - `n_cols`: Number of columns (normalization dimension size)
     /// - `eps`: Epsilon for numerical stability
+    /// - `stream`: the stream the launch is issued on — the device's compute
+    ///   stream, or a capture stream when it is being recorded into a graph
     pub fn run_rmsnorm_op(
         dtype: i32,
         src: *const c_void,
@@ -197,6 +208,7 @@ extern "C" {
         n_rows: i32,
         n_cols: i32,
         eps: f32,
+        stream: *mut c_void,
     );
 
     /// Fused RMSNorm → q8a128: normalizes each row and writes the q8a128 activation
@@ -221,6 +233,8 @@ extern "C" {
         // The Σx convention these q8a128 blocks are written in
         // (`SumScale::as_code()`): 0 raw, 1 Σx/amax.
         sum_norm: i32,
+        // The stream the launch is issued on.
+        stream: *mut c_void,
     );
 
     // =========================================================================
@@ -237,6 +251,7 @@ extern "C" {
     /// - `n_rows`: Number of rows (batch dimension)
     /// - `n_cols`: Number of columns (normalization dimension size)
     /// - `eps`: Epsilon for numerical stability
+    /// - `stream`: the stream the launch is issued on
     pub fn run_layernorm_op(
         dtype: i32,
         src: *const c_void,
@@ -246,6 +261,7 @@ extern "C" {
         n_rows: i32,
         n_cols: i32,
         eps: f32,
+        stream: *mut c_void,
     );
 
     // =========================================================================
@@ -263,6 +279,7 @@ extern "C" {
     /// - `bh`: Batch * heads
     /// - `td`: Tokens * dimension
     /// - `stride_b`: Stride for batch dimension (0 for no batch handling)
+    /// - `stream`: the stream the launch is issued on
     pub fn run_rope_i_op(
         dtype: i32,
         src: *const c_void,
@@ -272,6 +289,7 @@ extern "C" {
         bh: u32,
         td: u32,
         stride_b: u32,
+        stream: *mut c_void,
     );
 
     /// Dispatches to the appropriate rope (non-interleaved) kernel.
@@ -286,6 +304,7 @@ extern "C" {
     /// - `td`: Tokens * dimension
     /// - `d`: Dimension
     /// - `stride_b`: Stride for batch dimension (0 for no batch handling)
+    /// - `stream`: the stream the launch is issued on
     pub fn run_rope_op(
         dtype: i32,
         src: *const c_void,
@@ -296,6 +315,7 @@ extern "C" {
         td: u32,
         d: u32,
         stride_b: u32,
+        stream: *mut c_void,
     );
 
     /// Dispatches to the appropriate rope_thd (t, h, d layout) kernel.
@@ -311,6 +331,7 @@ extern "C" {
     /// - `h`: Heads
     /// - `d`: Dimension
     /// - `stride_b`: Stride for batch dimension (0 for no batch handling)
+    /// - `stream`: the stream the launch is issued on
     pub fn run_rope_thd_op(
         dtype: i32,
         src: *const c_void,
@@ -322,6 +343,7 @@ extern "C" {
         h: u32,
         d: u32,
         stride_b: u32,
+        stream: *mut c_void,
     );
 }
 

@@ -55,7 +55,10 @@ struct RingState {
 pub struct TableRing {
     host_base: *mut u8,
     dev_base: u64,
+    /// The compute stream every reader of a table runs on — never the capture
+    /// stream, even when the ring is made while a wave records.
     stream: Arc<CudaStream>,
+    device: CudaDevice,
     state: Mutex<RingState>,
 }
 
@@ -92,7 +95,8 @@ impl TableRing {
         Ok(Self {
             host_base: host_ptr as *mut u8,
             dev_base: dev_ptr,
-            stream: dev.cuda_stream(),
+            stream: dev.compute_stream(),
+            device: dev.clone(),
             state: Mutex::new(RingState {
                 offset: 0,
                 half: 0,
@@ -118,7 +122,10 @@ impl TableRing {
         let mut st = self.state.lock().unwrap();
         if st.offset + len > HALF {
             // Leaving this half: fence every launch that read it, then enter
-            // the other half once its own last fence has drained.
+            // the other half once its own last fence has drained. Inside a
+            // wave capture some of those launches are recorded and not yet
+            // issued, so they are issued first — the fence must follow them.
+            let _eager = self.device.pause_capture()?;
             let ev = self.stream.record_event(None).w()?;
             let leaving = st.half;
             st.fences[leaving] = Some(ev);

@@ -3168,7 +3168,7 @@ __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, FusedOccupancy<HB>::min_bl
 // those statistics, the per-head K and V activations, and the candidate
 // format set, and writes the full set of per-head selection outputs.
 //
-// Both passes run sequentially on the same default stream. There is no
+// Both passes run sequentially on the caller's stream. There is no
 // concurrency benefit from launching them on separate streams because
 // pass 2 has a hard data dependency on every output of pass 1.
 //
@@ -3311,7 +3311,7 @@ extern "C" void run_select_kv_format_palette4_paged(
 // the block's bytes (encode into shared memory, decode each element back) and
 // through `lane_roundtrip_for_fmt`. The search uses the register path wherever
 // `lane_roundtrip` has it, on the guarantee that the two agree bit for bit; the
-// test that calls this asserts it. One warp per block, default stream.
+// test that calls this asserts it. One warp per block, on the caller's stream.
 // `recon_lane` gets the bytes path's value for a format without a register path.
 
 __global__ void select_roundtrip_parity_kernel(
@@ -3354,10 +3354,11 @@ extern "C" void run_select_roundtrip_parity(
     int num_blocks,
     float outer,
     int fmt,
-    int is_k)
+    int is_k,
+    void* stream)
 {
     if (num_blocks <= 0) return;
-    select_roundtrip_parity_kernel<<<num_blocks, FUSED_WARP_SIZE>>>(
+    select_roundtrip_parity_kernel<<<num_blocks, FUSED_WARP_SIZE, 0, (cudaStream_t)stream>>>(
         (const float*)src, (float*)recon_bytes, (float*)recon_lane,
         num_blocks, outer, fmt, is_k);
 }
@@ -3499,7 +3500,8 @@ extern "C" void run_sample_quant_errors_paged(
     int num_chunks,
     int n_kv_head,
     int head_dim,
-    int arena_chunks
+    int arena_chunks,
+    void* stream
 ) {
     if (num_chunks == 0 || n_kv_head == 0 || head_dim == 0 || num_candidates == 0) return;
 
@@ -3507,7 +3509,7 @@ extern "C" void run_sample_quant_errors_paged(
     const int threads_per_block = warps_per_block * 32;
     dim3 grid((unsigned int)n_kv_head, (unsigned int)num_candidates, (unsigned int)head_dim);
 
-    sample_quant_errors_paged<<<grid, threads_per_block>>>(
+    sample_quant_errors_paged<<<grid, threads_per_block, 0, (cudaStream_t)stream>>>(
         per_head_table_raw,
         head_gids,
         candidates,
@@ -3669,7 +3671,8 @@ extern "C" void run_sample_quant_errors_kv_paged(
     int num_chunks,
     int n_kv_head,
     int head_dim,
-    int arena_chunks
+    int arena_chunks,
+    void* stream
 ) {
     if (num_chunks == 0 || n_kv_head == 0 || head_dim == 0 || num_candidates == 0) return;
 
@@ -3677,7 +3680,7 @@ extern "C" void run_sample_quant_errors_kv_paged(
     const int threads_per_block = warps_per_block * 32;
     dim3 grid((unsigned int)n_kv_head, (unsigned int)num_candidates, (unsigned int)head_dim);
 
-    sample_quant_errors_kv_paged<<<grid, threads_per_block>>>(
+    sample_quant_errors_kv_paged<<<grid, threads_per_block, 0, (cudaStream_t)stream>>>(
         per_head_table_raw,
         head_gids,
         candidates,
@@ -3793,11 +3796,12 @@ extern "C" void run_select_winners_kv_paged(
     int n_cells,
     int n_quant,
     int n_kv_head,
-    int head_dim
+    int head_dim,
+    void* stream
 ) {
     if (n_cells == 0) return;
     const int grid = (n_cells + SELECT_WINNER_THREADS - 1) / SELECT_WINNER_THREADS;
-    select_winners_kv_paged<<<grid, SELECT_WINNER_THREADS>>>(
+    select_winners_kv_paged<<<grid, SELECT_WINNER_THREADS, 0, (cudaStream_t)stream>>>(
         k_errors, v_errors,
         k_thresholds, v_thresholds,
         k_winners, v_winners,
@@ -3914,12 +3918,13 @@ extern "C" void run_summarize_winners_side_paged(
     int n_dim,
     int n_quant,
     int chunk_size,
-    float pal_overhead
+    float pal_overhead,
+    void* stream
 ) {
     if (n_bh == 0 || n_thresholds == 0) return;
     dim3 grid((n_bh + SUMMARIZE_WINNER_THREADS - 1) / SUMMARIZE_WINNER_THREADS,
               n_thresholds);
-    summarize_winners_side_paged<<<grid, SUMMARIZE_WINNER_THREADS>>>(
+    summarize_winners_side_paged<<<grid, SUMMARIZE_WINNER_THREADS, 0, (cudaStream_t)stream>>>(
         winners, cand_bpe, out,
         n_thresholds, n_cells, n_bh, n_dim, n_quant, chunk_size, pal_overhead
     );
@@ -4002,15 +4007,16 @@ extern "C" void run_reduce_chunk_format(
     int num_k_candidates,
     int num_v_candidates,
     int blocks_per_chunk,
-    int num_chunks
+    int num_chunks,
+    void* stream
 ) {
     if (num_chunks == 0) return;
     const int threads = 256;
     const int grid = (num_chunks + threads - 1) / threads;
-    reduce_chunk_format<<<grid, threads>>>(
+    reduce_chunk_format<<<grid, threads, 0, (cudaStream_t)stream>>>(
         k_block_tags, k_chunk_tags, k_candidates, num_k_candidates,
         blocks_per_chunk, num_chunks);
-    reduce_chunk_format<<<grid, threads>>>(
+    reduce_chunk_format<<<grid, threads, 0, (cudaStream_t)stream>>>(
         v_block_tags, v_chunk_tags, v_candidates, num_v_candidates,
         blocks_per_chunk, num_chunks);
 }
@@ -4089,16 +4095,17 @@ extern "C" void run_reduce_head_format(
     int num_v_candidates,
     int blocks_per_head,
     int n_kv_head,
-    int num_chunks
+    int num_chunks,
+    void* stream
 ) {
     if (num_chunks == 0) return;
     const int total = num_chunks * n_kv_head;
     const int threads = 256;
     const int grid = (total + threads - 1) / threads;
-    reduce_head_format<<<grid, threads>>>(
+    reduce_head_format<<<grid, threads, 0, (cudaStream_t)stream>>>(
         k_block_tags, k_head_tags, k_candidates, num_k_candidates,
         blocks_per_head, n_kv_head, num_chunks);
-    reduce_head_format<<<grid, threads>>>(
+    reduce_head_format<<<grid, threads, 0, (cudaStream_t)stream>>>(
         v_block_tags, v_head_tags, v_candidates, num_v_candidates,
         blocks_per_head, n_kv_head, num_chunks);
 }
@@ -4162,16 +4169,17 @@ extern "C" void run_reduce_head_stats_format(
     int* v_effective_block_tags,
     int blocks_per_head,
     int n_kv_head,
-    int num_chunks
+    int num_chunks,
+    void* stream
 ) {
     if (num_chunks == 0) return;
     const int total = num_chunks * n_kv_head;
     const int threads = 256;
     const int grid = (total + threads - 1) / threads;
-    reduce_head_stats_format<<<grid, threads>>>(
+    reduce_head_stats_format<<<grid, threads, 0, (cudaStream_t)stream>>>(
         k_block_tags, k_head_tags, k_effective_block_tags,
         blocks_per_head, n_kv_head, num_chunks);
-    reduce_head_stats_format<<<grid, threads>>>(
+    reduce_head_stats_format<<<grid, threads, 0, (cudaStream_t)stream>>>(
         v_block_tags, v_head_tags, v_effective_block_tags,
         blocks_per_head, n_kv_head, num_chunks);
 }

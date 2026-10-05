@@ -50,6 +50,7 @@ extern "C" {
     /// - `value_f32`: Value as f32 (used for f32/f16/bf16 operations)
     /// - `value_f64`: Value as f64 (used for f64 operations)
     /// - `stride`: Stride between elements (only used by add operation currently)
+    /// - `stream`: the stream the launch is issued on
     ///
     /// # Notes
     /// - For f16/bf16, `value_f32` is converted to the appropriate type internally
@@ -65,6 +66,7 @@ extern "C" {
         value_f32: f32,
         value_f64: f64,
         stride: usize,
+        stream: *mut c_void,
     );
 
     /// Dispatches to the sub_at_indices_with_values kernel.
@@ -82,12 +84,14 @@ extern "C" {
     ///   - For f64: values is `*const f64`
     ///   - For f16/bf16: values is `*const f32` (converted internally)
     /// - `num_indices`: Number of indices
+    /// - `stream`: the stream the launch is issued on
     pub fn run_sub_at_indices_with_values(
         dtype: i32,
         data: *mut c_void,
         indices: *const u32,
         values: *const c_void,
         num_indices: usize,
+        stream: *mut c_void,
     );
 }
 
@@ -125,7 +129,8 @@ impl ScatterValue for f64 {
     }
 }
 
-/// Safe wrapper for scatter operations
+/// Safe wrapper for scatter operations. Every launch is issued on the `stream`
+/// the caller passes.
 pub struct ScatterDispatcher;
 
 impl ScatterDispatcher {
@@ -135,6 +140,7 @@ impl ScatterDispatcher {
     /// - `data` must be a valid pointer to a tensor of the specified dtype
     /// - `indices` must point to `num_indices` valid u32 values
     /// - All indices must be valid positions in the data tensor
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn scatter_op<V: ScatterValue>(
         op: ScatterOp,
         dtype: ScatterDType,
@@ -143,6 +149,7 @@ impl ScatterDispatcher {
         num_indices: usize,
         value: V,
         stride: usize,
+        stream: *mut c_void,
     ) {
         run_scatter_op_at_indices(
             op as i32,
@@ -153,6 +160,7 @@ impl ScatterDispatcher {
             value.as_f32(),
             value.as_f64(),
             stride,
+            stream,
         )
     }
 
@@ -164,6 +172,7 @@ impl ScatterDispatcher {
         num_indices: usize,
         value: V,
         stride: usize,
+        stream: *mut c_void,
     ) {
         Self::scatter_op(
             ScatterOp::Add,
@@ -173,6 +182,7 @@ impl ScatterDispatcher {
             num_indices,
             value,
             stride,
+            stream,
         )
     }
 
@@ -183,8 +193,18 @@ impl ScatterDispatcher {
         indices: *const u32,
         num_indices: usize,
         value: V,
+        stream: *mut c_void,
     ) {
-        Self::scatter_op(ScatterOp::Sub, dtype, data, indices, num_indices, value, 1)
+        Self::scatter_op(
+            ScatterOp::Sub,
+            dtype,
+            data,
+            indices,
+            num_indices,
+            value,
+            1,
+            stream,
+        )
     }
 
     /// Perform scatter mul operation
@@ -194,8 +214,18 @@ impl ScatterDispatcher {
         indices: *const u32,
         num_indices: usize,
         value: V,
+        stream: *mut c_void,
     ) {
-        Self::scatter_op(ScatterOp::Mul, dtype, data, indices, num_indices, value, 1)
+        Self::scatter_op(
+            ScatterOp::Mul,
+            dtype,
+            data,
+            indices,
+            num_indices,
+            value,
+            1,
+            stream,
+        )
     }
 
     /// Perform scatter div operation
@@ -205,8 +235,18 @@ impl ScatterDispatcher {
         indices: *const u32,
         num_indices: usize,
         value: V,
+        stream: *mut c_void,
     ) {
-        Self::scatter_op(ScatterOp::Div, dtype, data, indices, num_indices, value, 1)
+        Self::scatter_op(
+            ScatterOp::Div,
+            dtype,
+            data,
+            indices,
+            num_indices,
+            value,
+            1,
+            stream,
+        )
     }
 
     /// Perform sub at indices with per-element values
@@ -220,8 +260,9 @@ impl ScatterDispatcher {
         indices: *const u32,
         values: *const c_void,
         num_indices: usize,
+        stream: *mut c_void,
     ) {
-        run_sub_at_indices_with_values(dtype as i32, data, indices, values, num_indices)
+        run_sub_at_indices_with_values(dtype as i32, data, indices, values, num_indices, stream)
     }
 }
 

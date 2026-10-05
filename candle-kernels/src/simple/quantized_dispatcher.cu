@@ -248,8 +248,10 @@ extern "C" void run_quantize_q8_1(
     const float* src,
     void* dst,
     int32_t elem_count,
-    int32_t ky
+    int32_t ky,
+    void* stream
 ) {
+    cudaStream_t s = (cudaStream_t)stream;
     int kx = elem_count;
     int kx_padded = pad(kx, MATRIX_ROW_PADDING);
     int num_blocks = ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE);
@@ -257,7 +259,7 @@ extern "C" void run_quantize_q8_1(
     dim3 grid(num_blocks, ky, 1);
     dim3 block(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
 
-    quantize_q8_1<<<grid, block>>>(src, dst, kx, kx_padded);
+    quantize_q8_1<<<grid, block, 0, s>>>(src, dst, kx, kx_padded);
 }
 
 
@@ -269,7 +271,7 @@ extern "C" void run_quantize_q8_1(
 // dtype: 0=F16, 1=BF16, 2=F32 (YType ordering).
 extern "C" void run_quantize_q8a128(
     const void* act, void* out, int32_t rows, int32_t cols, int32_t dtype,
-    int32_t sum_norm)
+    int32_t sum_norm, void* stream)
 {
     // One warp per 128-tile; 8 warps/block, grid-strided over all tiles.
     const int total_tiles = (int)(((int64_t)rows * cols) / 128);
@@ -277,29 +279,31 @@ extern "C" void run_quantize_q8a128(
     const int grid = (total_tiles + 7) / 8;
     dim3 grid_dim(grid > 0 ? grid : 1, 1, 1);
     dim3 block(block_dim, 1, 1);
+    cudaStream_t s = (cudaStream_t)stream;
     switch (dtype) {
-        case 0: quantize_q8a128_kernel<half><<<grid_dim, block>>>(
+        case 0: quantize_q8a128_kernel<half><<<grid_dim, block, 0, s>>>(
             (const half*)act, (block_q8a128*)out, rows, cols, sum_norm); break;
-        case 1: quantize_q8a128_kernel<__nv_bfloat16><<<grid_dim, block>>>(
+        case 1: quantize_q8a128_kernel<__nv_bfloat16><<<grid_dim, block, 0, s>>>(
             (const __nv_bfloat16*)act, (block_q8a128*)out, rows, cols, sum_norm); break;
-        case 2: quantize_q8a128_kernel<float><<<grid_dim, block>>>(
+        case 2: quantize_q8a128_kernel<float><<<grid_dim, block, 0, s>>>(
             (const float*)act, (block_q8a128*)out, rows, cols, sum_norm); break;
     }
 }
 
 extern "C" void run_dequantize_q8a128(
-    const void* in, void* out, int32_t rows, int32_t cols, int32_t dtype)
+    const void* in, void* out, int32_t rows, int32_t cols, int32_t dtype, void* stream)
 {
+    cudaStream_t s = (cudaStream_t)stream;
     const int total_tiles = (int)(((int64_t)rows * cols) / 128);
     const int grid = (total_tiles + 7) / 8;
     dim3 grid_dim(grid > 0 ? grid : 1, 1, 1);
     dim3 block(256, 1, 1);  // 8 warps, grid-strided
     switch (dtype) {
-        case 0: dequantize_q8a128_kernel<half><<<grid_dim, block>>>(
+        case 0: dequantize_q8a128_kernel<half><<<grid_dim, block, 0, s>>>(
             (const block_q8a128*)in, (half*)out, rows, cols); break;
-        case 1: dequantize_q8a128_kernel<__nv_bfloat16><<<grid_dim, block>>>(
+        case 1: dequantize_q8a128_kernel<__nv_bfloat16><<<grid_dim, block, 0, s>>>(
             (const block_q8a128*)in, (__nv_bfloat16*)out, rows, cols); break;
-        case 2: dequantize_q8a128_kernel<float><<<grid_dim, block>>>(
+        case 2: dequantize_q8a128_kernel<float><<<grid_dim, block, 0, s>>>(
             (const block_q8a128*)in, (float*)out, rows, cols); break;
     }
 }
@@ -308,20 +312,21 @@ extern "C" void run_dequantize_q8a128(
 // chunks. qtype = QTYPE_Q{4,5,6,8}_KO. One warp per 1024-weight chunk (8 rows × 128 K),
 // 8 warps/block, grid-strided. nrows must be a multiple of 8, ncols a multiple of 128.
 extern "C" void run_quantize_ko(
-    const float* w, void* out, int32_t nrows, int32_t ncols, int32_t qtype)
+    const float* w, void* out, int32_t nrows, int32_t ncols, int32_t qtype, void* stream)
 {
+    cudaStream_t s = (cudaStream_t)stream;
     const int total_chunks = (nrows / 8) * (ncols / 128);
     const int grid = (total_chunks + 7) / 8;
     dim3 grid_dim(grid > 0 ? grid : 1, 1, 1);
     dim3 block(256, 1, 1);
     uint8_t* ob = (uint8_t*)out;
     switch (qtype) {
-        case QTYPE_Q4_KO: quantize_ko_affine_kernel<15, 0, 0><<<grid_dim, block>>>(w, ob, nrows, ncols); break;
-        case QTYPE_Q5_KO: quantize_ko_affine_kernel<31, 0, 128><<<grid_dim, block>>>(w, ob, nrows, ncols); break;
-        case QTYPE_Q6_KO: quantize_ko_affine_kernel<63, 256, 0><<<grid_dim, block>>>(w, ob, nrows, ncols); break;
-        case QTYPE_Q8_KO: quantize_q8_ko_kernel<<<grid_dim, block>>>(w, ob, nrows, ncols); break;
-        case QTYPE_Q2_KO: quantize_q2_ko_kernel<<<grid_dim, block>>>(w, ob, nrows, ncols); break;
-        case QTYPE_Q3_KO: quantize_q3_ko_kernel<<<grid_dim, block>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q4_KO: quantize_ko_affine_kernel<15, 0, 0><<<grid_dim, block, 0, s>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q5_KO: quantize_ko_affine_kernel<31, 0, 128><<<grid_dim, block, 0, s>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q6_KO: quantize_ko_affine_kernel<63, 256, 0><<<grid_dim, block, 0, s>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q8_KO: quantize_q8_ko_kernel<<<grid_dim, block, 0, s>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q2_KO: quantize_q2_ko_kernel<<<grid_dim, block, 0, s>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q3_KO: quantize_q3_ko_kernel<<<grid_dim, block, 0, s>>>(w, ob, nrows, ncols); break;
         // NOTE: deliberately no QTYPE_MXFP4_KO arm — MXFP4 repacks by an exact host-side
         // byte permutation (ko_quant::mxfp4_native_to_ko_gpu_chunk), never a requant.
         default: return; // Invalid qtype — callers must not reach here
@@ -329,20 +334,21 @@ extern "C" void run_quantize_ko(
 }
 
 extern "C" void run_dequantize_ko(
-    const void* in, float* out, int32_t nrows, int32_t ncols, int32_t qtype)
+    const void* in, float* out, int32_t nrows, int32_t ncols, int32_t qtype, void* stream)
 {
+    cudaStream_t s = (cudaStream_t)stream;
     const int total_chunks = (nrows / 8) * (ncols / 128);
     const int grid = (total_chunks + 7) / 8;
     dim3 grid_dim(grid > 0 ? grid : 1, 1, 1);
     dim3 block(256, 1, 1);
     const uint8_t* ib = (const uint8_t*)in;
     switch (qtype) {
-        case QTYPE_Q4_KO: dequantize_ko_affine_kernel<0, 0><<<grid_dim, block>>>(ib, out, nrows, ncols); break;
-        case QTYPE_Q5_KO: dequantize_ko_affine_kernel<0, 128><<<grid_dim, block>>>(ib, out, nrows, ncols); break;
-        case QTYPE_Q6_KO: dequantize_ko_affine_kernel<256, 0><<<grid_dim, block>>>(ib, out, nrows, ncols); break;
-        case QTYPE_Q8_KO: dequantize_q8_ko_kernel<<<grid_dim, block>>>(ib, out, nrows, ncols); break;
-        case QTYPE_Q2_KO: dequantize_q2_ko_kernel<<<grid_dim, block>>>(ib, out, nrows, ncols); break;
-        case QTYPE_Q3_KO: dequantize_q3_ko_kernel<<<grid_dim, block>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q4_KO: dequantize_ko_affine_kernel<0, 0><<<grid_dim, block, 0, s>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q5_KO: dequantize_ko_affine_kernel<0, 128><<<grid_dim, block, 0, s>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q6_KO: dequantize_ko_affine_kernel<256, 0><<<grid_dim, block, 0, s>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q8_KO: dequantize_q8_ko_kernel<<<grid_dim, block, 0, s>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q2_KO: dequantize_q2_ko_kernel<<<grid_dim, block, 0, s>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q3_KO: dequantize_q3_ko_kernel<<<grid_dim, block, 0, s>>>(ib, out, nrows, ncols); break;
         default: return; // Invalid qtype — callers must not reach here
     }
 }
@@ -359,8 +365,10 @@ extern "C" void run_quantize_block(
     const float* src,
     void* dst,
     int32_t elem_count,
-    int32_t qtype
+    int32_t qtype,
+    void* stream
 ) {
+    cudaStream_t s = (cudaStream_t)stream;
     // q8a128: q8 activation, packed into q8a1024 flat-grouped blocks (8 × 128-tiles
     // per 1152B super-block, qs de-interleaved from the per-32 ds; see blocks.cuh).
     // One warp per 128-tile, 8 warps/block grid-strided — different from the generic
@@ -376,7 +384,7 @@ extern "C" void run_quantize_block(
         // `Q8a128Operand::sum_scale`. Pinning it here rather than plumbing a
         // flag keeps the two entries byte-identical, which
         // `unified_block_quantize_matches_typed_q8a128` asserts.
-        quantize_q8a128_kernel<float><<<dim3(grid > 0 ? grid : 1, 1, 1), dim3(256, 1, 1)>>>(
+        quantize_q8a128_kernel<float><<<dim3(grid > 0 ? grid : 1, 1, 1), dim3(256, 1, 1), 0, s>>>(
             src, (block_q8a128*)dst, 1, ntile * QK8A128, /*sum_norm=*/0);
         return;
     }
@@ -439,58 +447,58 @@ extern "C" void run_quantize_block(
 
     switch (qtype) {
         case QTYPE_Q4_0:
-            quantize_tensor_q4_0<<<grid, block_dim>>>(src, (block_q4_0*)dst, num_blocks);
+            quantize_tensor_q4_0<<<grid, block_dim, 0, s>>>(src, (block_q4_0*)dst, num_blocks);
             break;
         case QTYPE_Q4_1:
-            quantize_tensor_q4_1<<<grid, block_dim>>>(src, (block_q4_1*)dst, num_blocks);
+            quantize_tensor_q4_1<<<grid, block_dim, 0, s>>>(src, (block_q4_1*)dst, num_blocks);
             break;
         case QTYPE_Q5_0:
-            quantize_tensor_q5_0<<<grid, block_dim>>>(src, (block_q5_0*)dst, num_blocks);
+            quantize_tensor_q5_0<<<grid, block_dim, 0, s>>>(src, (block_q5_0*)dst, num_blocks);
             break;
         case QTYPE_Q5_1:
-            quantize_tensor_q5_1<<<grid, block_dim>>>(src, (block_q5_1*)dst, num_blocks);
+            quantize_tensor_q5_1<<<grid, block_dim, 0, s>>>(src, (block_q5_1*)dst, num_blocks);
             break;
         case QTYPE_Q8_0:
-            quantize_tensor_q8_0<<<grid, block_dim>>>(src, (block_q8_0*)dst, num_blocks);
+            quantize_tensor_q8_0<<<grid, block_dim, 0, s>>>(src, (block_q8_0*)dst, num_blocks);
             break;
         case QTYPE_Q2_K:
-            quantize_tensor_q2_K<<<grid, block_dim>>>(src, (block_q2_K*)dst, num_blocks);
+            quantize_tensor_q2_K<<<grid, block_dim, 0, s>>>(src, (block_q2_K*)dst, num_blocks);
             break;
         case QTYPE_Q3_K:
-            quantize_tensor_q3_K<<<grid, block_dim>>>(src, (block_q3_K*)dst, num_blocks);
+            quantize_tensor_q3_K<<<grid, block_dim, 0, s>>>(src, (block_q3_K*)dst, num_blocks);
             break;
         case QTYPE_Q4_K:
-            quantize_tensor_q4_K<<<grid, block_dim>>>(src, (block_q4_K*)dst, num_blocks);
+            quantize_tensor_q4_K<<<grid, block_dim, 0, s>>>(src, (block_q4_K*)dst, num_blocks);
             break;
         case QTYPE_Q5_K:
-            quantize_tensor_q5_K<<<grid, block_dim>>>(src, (block_q5_K*)dst, num_blocks);
+            quantize_tensor_q5_K<<<grid, block_dim, 0, s>>>(src, (block_q5_K*)dst, num_blocks);
             break;
         case QTYPE_Q6_K:
-            quantize_tensor_q6_K<<<grid, block_dim>>>(src, (block_q6_K*)dst, num_blocks);
+            quantize_tensor_q6_K<<<grid, block_dim, 0, s>>>(src, (block_q6_K*)dst, num_blocks);
             break;
         case QTYPE_Q8_1:
-            quantize_tensor_q8_1<<<grid, block_dim>>>(src, (block_q8_1*)dst, num_blocks);
+            quantize_tensor_q8_1<<<grid, block_dim, 0, s>>>(src, (block_q8_1*)dst, num_blocks);
             break;
         case QTYPE_Q4_KS:
-            quantize_tensor_q4_ks<<<grid, block_dim>>>(src, (block_q4_ks*)dst, num_blocks);
+            quantize_tensor_q4_ks<<<grid, block_dim, 0, s>>>(src, (block_q4_ks*)dst, num_blocks);
             break;
         case QTYPE_Q8_KS:
-            quantize_tensor_q8_ks<<<grid, block_dim>>>(src, (block_q8_ks*)dst, num_blocks);
+            quantize_tensor_q8_ks<<<grid, block_dim, 0, s>>>(src, (block_q8_ks*)dst, num_blocks);
             break;
         case QTYPE_Q2_0:
-            quantize_tensor_q2_0<<<grid, block_dim>>>(src, (block_q2_0*)dst, num_blocks);
+            quantize_tensor_q2_0<<<grid, block_dim, 0, s>>>(src, (block_q2_0*)dst, num_blocks);
             break;
         case QTYPE_Q3_0:
-            quantize_tensor_q3_0<<<grid, block_dim>>>(src, (block_q3_0*)dst, num_blocks);
+            quantize_tensor_q3_0<<<grid, block_dim, 0, s>>>(src, (block_q3_0*)dst, num_blocks);
             break;
         case QTYPE_Q8_K:
-            quantize_tensor_q8_K<<<grid, block_dim>>>(src, (block_q8_K*)dst, num_blocks);
+            quantize_tensor_q8_K<<<grid, block_dim, 0, s>>>(src, (block_q8_K*)dst, num_blocks);
             break;
         case QTYPE_QAWQ:
-            quantize_tensor_q_awq<<<grid, block_dim>>>(src, dst, num_blocks);
+            quantize_tensor_q_awq<<<grid, block_dim, 0, s>>>(src, dst, num_blocks);
             break;
         case QTYPE_QAWQ_G64:
-            quantize_tensor_q_awq_g64<<<grid, block_dim>>>(src, dst, num_blocks);
+            quantize_tensor_q_awq_g64<<<grid, block_dim, 0, s>>>(src, dst, num_blocks);
             break;
     }
 }
@@ -508,18 +516,20 @@ extern "C" void run_dequantize_mxfp4(
     const void* src,
     void* dst,
     int32_t elem_count,
-    int32_t out_dtype
+    int32_t out_dtype,
+    void* stream
 ) {
+    cudaStream_t s = (cudaStream_t)stream;
     int num_blocks = (elem_count + 255) / 256;
     if (num_blocks < 1) num_blocks = 1;
     dim3 grid(num_blocks, 1, 1), block(32, 1, 1);
     int nb32 = elem_count / 32;
     if (out_dtype == 0)
-        dequantize_block_mxfp4_f32<<<grid, block>>>(src, (float*)dst, nb32);
+        dequantize_block_mxfp4_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
     else if (out_dtype == 1)
-        dequantize_block_mxfp4_f16<<<grid, block>>>(src, (__half*)dst, nb32);
+        dequantize_block_mxfp4_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
     else
-        dequantize_block_mxfp4_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+        dequantize_block_mxfp4_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
 }
 
 extern "C" void run_dequantize_block(
@@ -527,8 +537,10 @@ extern "C" void run_dequantize_block(
     void* dst,
     int32_t elem_count,
     int32_t qtype,
-    int32_t out_dtype
+    int32_t out_dtype,
+    void* stream
 ) {
+    cudaStream_t s = (cudaStream_t)stream;
     // q8a128: q8 activation in q8a1024 flat-grouped blocks. out_dtype here is the
     // unified ordering 0=F32, 1=F16, 2=BF16 (NB: the typed run_dequantize_q8a128 uses
     // the YType ordering 0=F16,1=BF16,2=F32 instead). One warp per 128-tile.
@@ -538,11 +550,11 @@ extern "C" void run_dequantize_block(
         const dim3 g(grid > 0 ? grid : 1, 1, 1), b(256, 1, 1);  // 8 warps, grid-strided
         const int cols = ntile * QK8A128;
         if (out_dtype == 0)
-            dequantize_q8a128_kernel<float><<<g, b>>>((const block_q8a128*)src, (float*)dst, 1, cols);
+            dequantize_q8a128_kernel<float><<<g, b, 0, s>>>((const block_q8a128*)src, (float*)dst, 1, cols);
         else if (out_dtype == 1)
-            dequantize_q8a128_kernel<half><<<g, b>>>((const block_q8a128*)src, (half*)dst, 1, cols);
+            dequantize_q8a128_kernel<half><<<g, b, 0, s>>>((const block_q8a128*)src, (half*)dst, 1, cols);
         else
-            dequantize_q8a128_kernel<__nv_bfloat16><<<g, b>>>((const block_q8a128*)src, (__nv_bfloat16*)dst, 1, cols);
+            dequantize_q8a128_kernel<__nv_bfloat16><<<g, b, 0, s>>>((const block_q8a128*)src, (__nv_bfloat16*)dst, 1, cols);
         return;
     }
 
@@ -584,105 +596,105 @@ extern "C" void run_dequantize_block(
     switch (qtype) {
         // Basic quants (with k parameter)
         case QTYPE_Q4_0:
-            if (out_dtype == 0) dequantize_block_q4_0_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_q4_0_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_q4_0_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_q4_0_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_q4_0_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_q4_0_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
         case QTYPE_Q4_1:
-            if (out_dtype == 0) dequantize_block_q4_1_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_q4_1_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_q4_1_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_q4_1_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_q4_1_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_q4_1_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
         case QTYPE_Q5_0:
-            if (out_dtype == 0) dequantize_block_q5_0_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_q5_0_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_q5_0_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_q5_0_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_q5_0_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_q5_0_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
         case QTYPE_Q5_1:
-            if (out_dtype == 0) dequantize_block_q5_1_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_q5_1_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_q5_1_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_q5_1_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_q5_1_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_q5_1_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
         case QTYPE_Q8_0:
-            if (out_dtype == 0) dequantize_block_q8_0_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_q8_0_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_q8_0_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_q8_0_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_q8_0_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_q8_0_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
 
         // K-quants (no k parameter)
         case QTYPE_Q2_K:
-            if (out_dtype == 0) dequantize_block_q2_K_f32<<<grid, block>>>(src, (float*)dst);
-            else if (out_dtype == 1) dequantize_block_q2_K_f16<<<grid, block>>>(src, (__half*)dst);
-            else dequantize_block_q2_K_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst);
+            if (out_dtype == 0) dequantize_block_q2_K_f32<<<grid, block, 0, s>>>(src, (float*)dst);
+            else if (out_dtype == 1) dequantize_block_q2_K_f16<<<grid, block, 0, s>>>(src, (__half*)dst);
+            else dequantize_block_q2_K_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst);
             break;
         case QTYPE_Q3_K:
-            if (out_dtype == 0) dequantize_block_q3_K_f32<<<grid, block>>>(src, (float*)dst);
-            else if (out_dtype == 1) dequantize_block_q3_K_f16<<<grid, block>>>(src, (__half*)dst);
-            else dequantize_block_q3_K_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst);
+            if (out_dtype == 0) dequantize_block_q3_K_f32<<<grid, block, 0, s>>>(src, (float*)dst);
+            else if (out_dtype == 1) dequantize_block_q3_K_f16<<<grid, block, 0, s>>>(src, (__half*)dst);
+            else dequantize_block_q3_K_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst);
             break;
         case QTYPE_Q4_K:
-            if (out_dtype == 0) dequantize_block_q4_K_f32<<<grid, block>>>(src, (float*)dst);
-            else if (out_dtype == 1) dequantize_block_q4_K_f16<<<grid, block>>>(src, (__half*)dst);
-            else dequantize_block_q4_K_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst);
+            if (out_dtype == 0) dequantize_block_q4_K_f32<<<grid, block, 0, s>>>(src, (float*)dst);
+            else if (out_dtype == 1) dequantize_block_q4_K_f16<<<grid, block, 0, s>>>(src, (__half*)dst);
+            else dequantize_block_q4_K_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst);
             break;
         case QTYPE_Q5_K:
-            if (out_dtype == 0) dequantize_block_q5_K_f32<<<grid, block>>>(src, (float*)dst);
-            else if (out_dtype == 1) dequantize_block_q5_K_f16<<<grid, block>>>(src, (__half*)dst);
-            else dequantize_block_q5_K_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst);
+            if (out_dtype == 0) dequantize_block_q5_K_f32<<<grid, block, 0, s>>>(src, (float*)dst);
+            else if (out_dtype == 1) dequantize_block_q5_K_f16<<<grid, block, 0, s>>>(src, (__half*)dst);
+            else dequantize_block_q5_K_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst);
             break;
         case QTYPE_Q6_K:
-            if (out_dtype == 0) dequantize_block_q6_K_f32<<<grid, block>>>(src, (float*)dst);
-            else if (out_dtype == 1) dequantize_block_q6_K_f16<<<grid, block>>>(src, (__half*)dst);
-            else dequantize_block_q6_K_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst);
+            if (out_dtype == 0) dequantize_block_q6_K_f32<<<grid, block, 0, s>>>(src, (float*)dst);
+            else if (out_dtype == 1) dequantize_block_q6_K_f16<<<grid, block, 0, s>>>(src, (__half*)dst);
+            else dequantize_block_q6_K_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst);
             break;
         case QTYPE_Q8_1:
-            if (out_dtype == 0) dequantize_block_q8_1_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_q8_1_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_q8_1_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_q8_1_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_q8_1_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_q8_1_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
         case QTYPE_Q4_KS:
-            if (out_dtype == 0) dequantize_block_q4_ks_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_q4_ks_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_q4_ks_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_q4_ks_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_q4_ks_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_q4_ks_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
         case QTYPE_Q8_KS:
-            if (out_dtype == 0) dequantize_block_q8_ks_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_q8_ks_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_q8_ks_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_q8_ks_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_q8_ks_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_q8_ks_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
         case QTYPE_Q2_0:
-            if (out_dtype == 0) dequantize_block_q2_0_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_q2_0_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_q2_0_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_q2_0_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_q2_0_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_q2_0_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
         case QTYPE_Q3_0:
-            if (out_dtype == 0) dequantize_block_q3_0_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_q3_0_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_q3_0_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_q3_0_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_q3_0_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_q3_0_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
         case QTYPE_R16: // R16 (extract K from block_r16::d[])
-            if (out_dtype == 0) dequantize_block_r16_f32<<<grid, block>>>(src, (float*)dst, nb32);
-            else if (out_dtype == 1) dequantize_block_r16_f16<<<grid, block>>>(src, (__half*)dst, nb32);
-            else dequantize_block_r16_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst, nb32);
+            if (out_dtype == 0) dequantize_block_r16_f32<<<grid, block, 0, s>>>(src, (float*)dst, nb32);
+            else if (out_dtype == 1) dequantize_block_r16_f16<<<grid, block, 0, s>>>(src, (__half*)dst, nb32);
+            else dequantize_block_r16_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst, nb32);
             break;
 
         // Q8_K (K-quant 8-bit, 256 elements per block)
         case QTYPE_Q8_K:
-            if (out_dtype == 0) dequantize_block_q8_K_f32<<<grid, block>>>(src, (float*)dst);
-            else if (out_dtype == 1) dequantize_block_q8_K_f16<<<grid, block>>>(src, (__half*)dst);
-            else dequantize_block_q8_K_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst);
+            if (out_dtype == 0) dequantize_block_q8_K_f32<<<grid, block, 0, s>>>(src, (float*)dst);
+            else if (out_dtype == 1) dequantize_block_q8_K_f16<<<grid, block, 0, s>>>(src, (__half*)dst);
+            else dequantize_block_q8_K_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst);
             break;
 
         // K/128 AWQ types (no k parameter, 128 elements per block)
         case QTYPE_QAWQ:
-            if (out_dtype == 0) dequantize_block_q_awq_f32<<<grid, block>>>(src, (float*)dst);
-            else if (out_dtype == 1) dequantize_block_q_awq_f16<<<grid, block>>>(src, (__half*)dst);
-            else dequantize_block_q_awq_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst);
+            if (out_dtype == 0) dequantize_block_q_awq_f32<<<grid, block, 0, s>>>(src, (float*)dst);
+            else if (out_dtype == 1) dequantize_block_q_awq_f16<<<grid, block, 0, s>>>(src, (__half*)dst);
+            else dequantize_block_q_awq_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst);
             break;
         case QTYPE_QAWQ_G64:
-            if (out_dtype == 0) dequantize_block_q_awq_g64_f32<<<grid, block>>>(src, (float*)dst);
-            else if (out_dtype == 1) dequantize_block_q_awq_g64_f16<<<grid, block>>>(src, (__half*)dst);
-            else dequantize_block_q_awq_g64_bf16<<<grid, block>>>(src, (__nv_bfloat16*)dst);
+            if (out_dtype == 0) dequantize_block_q_awq_g64_f32<<<grid, block, 0, s>>>(src, (float*)dst);
+            else if (out_dtype == 1) dequantize_block_q_awq_g64_f16<<<grid, block, 0, s>>>(src, (__half*)dst);
+            else dequantize_block_q_awq_g64_bf16<<<grid, block, 0, s>>>(src, (__nv_bfloat16*)dst);
             break;
     }
 }
@@ -698,26 +710,28 @@ extern "C" void run_dequantize_mul_mat_vec(
     float* dst,
     int32_t ncols,
     int32_t nrows,
-    int32_t qtype
+    int32_t qtype,
+    void* stream
 ) {
+    cudaStream_t s = (cudaStream_t)stream;
     int block_num_y = ceil_div(nrows, GGML_CUDA_MMV_Y);
 
     dim3 grid(block_num_y, 1, 1);
     dim3 block(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
 
     switch (qtype) {
-        case QTYPE_Q4_0: dequantize_mul_mat_vec_q4_0_cuda<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_Q4_1: dequantize_mul_mat_vec_q4_1_cuda<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_Q5_0: dequantize_mul_mat_vec_q5_0_cuda<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_Q5_1: dequantize_mul_mat_vec_q5_1_cuda<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_Q8_0: dequantize_mul_mat_vec_q8_0_cuda<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_Q2_K: dequantize_mul_mat_vec_q2_k<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_Q3_K: dequantize_mul_mat_vec_q3_k<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_Q4_K: dequantize_mul_mat_vec_q4_k<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_Q5_K: dequantize_mul_mat_vec_q5_k<<<grid, block>>>(vx, y, dst, ncols); break;  // q5_k has different signature
-        case QTYPE_Q6_K: dequantize_mul_mat_vec_q6_k<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_Q8_1: dequantize_mul_mat_vec_q8_1_cuda<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
-        case QTYPE_Q8_K: dequantize_mul_mat_vec_q8_k<<<grid, block>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q4_0: dequantize_mul_mat_vec_q4_0_cuda<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q4_1: dequantize_mul_mat_vec_q4_1_cuda<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q5_0: dequantize_mul_mat_vec_q5_0_cuda<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q5_1: dequantize_mul_mat_vec_q5_1_cuda<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q8_0: dequantize_mul_mat_vec_q8_0_cuda<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q2_K: dequantize_mul_mat_vec_q2_k<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q3_K: dequantize_mul_mat_vec_q3_k<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q4_K: dequantize_mul_mat_vec_q4_k<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q5_K: dequantize_mul_mat_vec_q5_k<<<grid, block, 0, s>>>(vx, y, dst, ncols); break;  // q5_k has different signature
+        case QTYPE_Q6_K: dequantize_mul_mat_vec_q6_k<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q8_1: dequantize_mul_mat_vec_q8_1_cuda<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
+        case QTYPE_Q8_K: dequantize_mul_mat_vec_q8_k<<<grid, block, 0, s>>>(vx, y, dst, ncols, nrows); break;
     }
 }
 
@@ -736,8 +750,10 @@ extern "C" void run_mul_mat_vec_q8_1(
     int32_t nrows_y,
     int32_t nrows_dst,
     int32_t b_size,
-    int32_t qtype
+    int32_t qtype,
+    void* stream
 ) {
+    cudaStream_t s = (cudaStream_t)stream;
     // Compute grid/block dimensions based on batch size
     int nblocks, nwarps;
     switch (b_size) {
@@ -763,14 +779,14 @@ extern "C" void run_mul_mat_vec_q8_1(
     // Macro to dispatch based on batch size
     #define DISPATCH_BSIZE(qname) \
         switch (b_size) { \
-            case 1: mul_mat_vec_##qname##_q8_1_cuda1<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
-            case 2: mul_mat_vec_##qname##_q8_1_cuda2<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
-            case 3: mul_mat_vec_##qname##_q8_1_cuda3<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
-            case 4: mul_mat_vec_##qname##_q8_1_cuda4<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
-            case 5: mul_mat_vec_##qname##_q8_1_cuda5<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
-            case 6: mul_mat_vec_##qname##_q8_1_cuda6<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
-            case 7: mul_mat_vec_##qname##_q8_1_cuda7<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
-            case 8: mul_mat_vec_##qname##_q8_1_cuda8<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
+            case 1: mul_mat_vec_##qname##_q8_1_cuda1<<<grid, block, 0, s>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
+            case 2: mul_mat_vec_##qname##_q8_1_cuda2<<<grid, block, 0, s>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
+            case 3: mul_mat_vec_##qname##_q8_1_cuda3<<<grid, block, 0, s>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
+            case 4: mul_mat_vec_##qname##_q8_1_cuda4<<<grid, block, 0, s>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
+            case 5: mul_mat_vec_##qname##_q8_1_cuda5<<<grid, block, 0, s>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
+            case 6: mul_mat_vec_##qname##_q8_1_cuda6<<<grid, block, 0, s>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
+            case 7: mul_mat_vec_##qname##_q8_1_cuda7<<<grid, block, 0, s>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
+            case 8: mul_mat_vec_##qname##_q8_1_cuda8<<<grid, block, 0, s>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst); break; \
         }
     
     switch (qtype) {
@@ -805,8 +821,10 @@ extern "C" void run_mul_mat(
     int32_t ncols_y,
     int32_t nrows_y,
     int32_t nrows_dst,
-    int32_t qtype
+    int32_t qtype,
+    void* stream
 ) {
+    cudaStream_t s = (cudaStream_t)stream;
     // Get MMQ tile sizes based on quant type
     int mmq_x, mmq_y;
     switch (qtype) {
@@ -853,9 +871,9 @@ extern "C" void run_mul_mat(
 
     #define DISPATCH_MMQ(qname) \
         if (narrow) { \
-            mul_mat_##qname##_x16<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); \
+            mul_mat_##qname##_x16<<<grid, block, 0, s>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); \
         } else { \
-            mul_mat_##qname<<<grid, block>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); \
+            mul_mat_##qname<<<grid, block, 0, s>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst); \
         }
 
     switch (qtype) {
@@ -925,17 +943,18 @@ __global__ void q0_v_decode_oracle_kernel(
 
 extern "C" void run_q0_v_decode_oracle(
     const void* src, void* via_dispatch, void* via_i8_elem, void* via_quad, void* via_header,
-    int num_blocks, int is_k, float scale)
+    int num_blocks, int is_k, float scale, void* stream)
 {
     if (num_blocks <= 0) return;
+    cudaStream_t s = (cudaStream_t)stream;
     const int threads = 256;
     const int blocks = (num_blocks * 8 + threads - 1) / threads;
     if (is_k) {
-        q0_v_decode_oracle_kernel<true><<<blocks, threads>>>(
+        q0_v_decode_oracle_kernel<true><<<blocks, threads, 0, s>>>(
             (const block_q0_v*)src, (float*)via_dispatch, (float*)via_i8_elem,
             (float*)via_quad, (float*)via_header, num_blocks, scale);
     } else {
-        q0_v_decode_oracle_kernel<false><<<blocks, threads>>>(
+        q0_v_decode_oracle_kernel<false><<<blocks, threads, 0, s>>>(
             (const block_q0_v*)src, (float*)via_dispatch, (float*)via_i8_elem,
             (float*)via_quad, (float*)via_header, num_blocks, scale);
     }
@@ -955,16 +974,17 @@ __global__ void q0_v_encode_oracle_kernel(
     quantize_blocks_q0_v<IS_K, 1>(src, dst, num_blocks);
 }
 
-extern "C" void run_q0_v_encode_oracle(const void* src, void* dst, int num_blocks, int is_k)
+extern "C" void run_q0_v_encode_oracle(const void* src, void* dst, int num_blocks, int is_k, void* stream)
 {
     if (num_blocks <= 0) return;
+    cudaStream_t s = (cudaStream_t)stream;
     const int threads = 256;
     const int blocks = (num_blocks + threads / 32 - 1) / (threads / 32);
     if (is_k) {
-        q0_v_encode_oracle_kernel<true><<<blocks, threads>>>(
+        q0_v_encode_oracle_kernel<true><<<blocks, threads, 0, s>>>(
             (const float*)src, (block_q0_v*)dst, num_blocks);
     } else {
-        q0_v_encode_oracle_kernel<false><<<blocks, threads>>>(
+        q0_v_encode_oracle_kernel<false><<<blocks, threads, 0, s>>>(
             (const float*)src, (block_q0_v*)dst, num_blocks);
     }
 }
@@ -992,16 +1012,17 @@ __global__ void kv_decode_oracle_kernel(
 }
 
 extern "C" void run_kv_decode_oracle(
-    const void* src, void* dst, int num_blocks, int block_bytes, int fmt, int is_k)
+    const void* src, void* dst, int num_blocks, int block_bytes, int fmt, int is_k, void* stream)
 {
     if (num_blocks <= 0) return;
+    cudaStream_t s = (cudaStream_t)stream;
     const int threads = 256;
     const int blocks = (num_blocks * 32 + threads - 1) / threads;
     if (is_k) {
-        kv_decode_oracle_kernel<true><<<blocks, threads>>>(
+        kv_decode_oracle_kernel<true><<<blocks, threads, 0, s>>>(
             (const char*)src, (float*)dst, num_blocks, block_bytes, fmt);
     } else {
-        kv_decode_oracle_kernel<false><<<blocks, threads>>>(
+        kv_decode_oracle_kernel<false><<<blocks, threads, 0, s>>>(
             (const char*)src, (float*)dst, num_blocks, block_bytes, fmt);
     }
 }
@@ -1017,16 +1038,17 @@ __global__ void kv_encode_oracle_kernel(
 }
 
 extern "C" void run_kv_encode_oracle(
-    const void* src, void* dst, int num_blocks, int block_bytes, int fmt, int is_k)
+    const void* src, void* dst, int num_blocks, int block_bytes, int fmt, int is_k, void* stream)
 {
     if (num_blocks <= 0) return;
+    cudaStream_t s = (cudaStream_t)stream;
     const int threads = 256;
     const int blocks = (num_blocks + threads / 32 - 1) / (threads / 32);
     if (is_k) {
-        kv_encode_oracle_kernel<true><<<blocks, threads>>>(
+        kv_encode_oracle_kernel<true><<<blocks, threads, 0, s>>>(
             (const float*)src, (char*)dst, num_blocks, block_bytes, fmt);
     } else {
-        kv_encode_oracle_kernel<false><<<blocks, threads>>>(
+        kv_encode_oracle_kernel<false><<<blocks, threads, 0, s>>>(
             (const float*)src, (char*)dst, num_blocks, block_bytes, fmt);
     }
 }
@@ -1093,16 +1115,17 @@ extern "C" __global__ void roundtrip_q0_v_v_kernel(
 }
 
 extern "C" void run_roundtrip_q0_v(
-    const void* src, void* recon, int num_blocks, float outer, int is_k)
+    const void* src, void* recon, int num_blocks, float outer, int is_k, void* stream)
 {
     if (num_blocks <= 0) return;
+    cudaStream_t s = (cudaStream_t)stream;
     const int threads = 32;
     const int blocks = num_blocks;
     if (is_k) {
-        roundtrip_q0_v_k_kernel<<<blocks, threads>>>(
+        roundtrip_q0_v_k_kernel<<<blocks, threads, 0, s>>>(
             (const float*)src, (float*)recon, num_blocks, outer);
     } else {
-        roundtrip_q0_v_v_kernel<<<blocks, threads>>>(
+        roundtrip_q0_v_v_kernel<<<blocks, threads, 0, s>>>(
             (const float*)src, (float*)recon, num_blocks, outer);
     }
 }
@@ -1173,12 +1196,14 @@ extern "C" void run_roundtrip_q0_v_runtime(
     const void* scale_table_bits,          // [32]      u16
     const void* centroid_table_bits_flat,  // [32][8]   u16
     const void* peak_curve_indices,        // [256]     u8
-    const void* peak_bin_offsets)          // [33]      u16
+    const void* peak_bin_offsets,          // [33]      u16
+    void*       stream)
 {
     if (num_blocks <= 0) return;
+    cudaStream_t s = (cudaStream_t)stream;
     const int threads = 32;
     const int blocks = num_blocks;
-    roundtrip_q0_v_runtime_kernel<<<blocks, threads>>>(
+    roundtrip_q0_v_runtime_kernel<<<blocks, threads, 0, s>>>(
         (const float*)src, (float*)recon, num_blocks, outer,
         (const int8_t*)curve_table_flat,
         (const uint16_t*)scale_table_bits,

@@ -76,6 +76,7 @@ pub mod display;
 mod dtype;
 pub mod dummy_cuda_backend;
 mod dummy_metal_backend;
+pub mod eager;
 pub mod error;
 pub mod fletcher;
 pub mod forbidden_alloc;

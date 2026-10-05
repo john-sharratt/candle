@@ -86,7 +86,13 @@ extern "C" {
     /// - `buf`: Buffer to fill
     /// - `value_bits`: Value as bits
     /// - `numel`: Number of elements
-    pub fn run_fill_op(dtype: i32, buf: *mut c_void, value_bits: u64, numel: usize);
+    pub fn run_fill_op(
+        dtype: i32,
+        buf: *mut c_void,
+        value_bits: u64,
+        numel: usize,
+        stream: *mut c_void,
+    );
 
     /// Dispatches to the appropriate arange (integer iota) kernel.
     ///
@@ -100,6 +106,7 @@ extern "C" {
         start_bits: u64,
         step_bits: u64,
         numel: usize,
+        stream: *mut c_void,
     );
 
     /// Dispatches to the appropriate copy2d kernel.
@@ -122,6 +129,7 @@ extern "C" {
         d2: u32,
         src_s: u32,
         dst_s: u32,
+        stream: *mut c_void,
     );
 
     /// Dispatches to the appropriate const_set kernel.
@@ -142,6 +150,7 @@ extern "C" {
         info: *const usize,
         value_bits: u64,
         out: *mut c_void,
+        stream: *mut c_void,
     );
 }
 

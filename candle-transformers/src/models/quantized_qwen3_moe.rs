@@ -41,6 +41,7 @@ use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{moe_route, to_dynamic, DynamicActs};
+use candle::quantized::decode_rows::DecodeRows;
 #[cfg(feature = "cuda")]
 use candle::quantized::get_vram_info;
 use candle::quantized::{gguf_file, Int8Mode, QTensor, SumScale};
@@ -201,7 +202,7 @@ impl SparseMoeBlock {
         &self,
         acts: DynamicActs<'w>,
         out_dtype: DType,
-        decode_tokens: usize,
+        decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
         let (b_size, seq_len, hidden_dim) = match &acts {
@@ -259,7 +260,7 @@ impl SparseMoeBlock {
             &top_k_weights,
             &top_k_indices,
             self.moe_layer_idx,
-            decode_tokens,
+            decode,
             out_dtype,
             wave,
         )?;
@@ -484,7 +485,7 @@ impl BatchedAttentionLayer for LayerWeights {
         x: &mut Tensor,
         acts: DynamicActs<'w>,
         work_dtype: DType,
-        decode_tokens: usize,
+        decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<()> {
         let out_dtype = x.dtype();
@@ -499,7 +500,7 @@ impl BatchedAttentionLayer for LayerWeights {
                 // router logits and the device dispatch share that one dtype —
                 // so this path narrows on return. Giving the combine its own
                 // store width is the same change one level down.
-                let mut out = m.forward_dynamic(acts, work_dtype, decode_tokens, wave)?;
+                let mut out = m.forward_dynamic(acts, work_dtype, decode, wave)?;
                 out.to_dtype_mut(out_dtype)?;
                 out
             }

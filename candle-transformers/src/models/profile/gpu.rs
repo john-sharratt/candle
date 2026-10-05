@@ -20,6 +20,8 @@
 
 #[cfg(all(feature = "profile", feature = "cuda"))]
 use super::pipeline::pipeline_record_duration;
+#[cfg(all(feature = "profile", feature = "cuda"))]
+use candle::cuda_backend::CudaDevice;
 
 /// A named GPU span, bracketed by two enqueued CUDA events.
 ///
@@ -35,7 +37,9 @@ struct GpuSpanInner {
     name: &'static str,
     /// Index of the borrowed event pair in the pool's `lent` slot list.
     slot: usize,
-    stream: std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
+    /// The stop is recorded on the device's launch stream as it is at the
+    /// close — a span may open while recording and close after a pause.
+    device: CudaDevice,
 }
 
 #[cfg(all(feature = "profile", feature = "cuda"))]
@@ -79,6 +83,32 @@ mod gpu_pool {
     /// profiling build no matter where the caller chooses to drain.
     pub(super) const HIGH_WATER: usize = 4096;
 
+    /// Record `event` into `stream`. On a stream recording a wave capture the
+    /// record is made an external event-record node, so it fires each time the
+    /// graph executes — the span then times the replay, as it times an eager
+    /// launch — instead of an event private to the capture, which a later
+    /// query could not read.
+    pub(super) fn record(event: &CudaEvent, stream: &Arc<CudaStream>) -> bool {
+        let mut status = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        // SAFETY: a live stream of this context.
+        let queried = unsafe { sys::cuStreamIsCapturing(stream.cu_stream(), &mut status) };
+        if queried == sys::CUresult::CUDA_SUCCESS
+            && status == sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+        {
+            // SAFETY: a live event and a live stream of the same context.
+            let recorded = unsafe {
+                sys::cuEventRecordWithFlags(
+                    event.cu_event(),
+                    stream.cu_stream(),
+                    sys::CUevent_record_flags_enum::CU_EVENT_RECORD_EXTERNAL as u32,
+                )
+            };
+            recorded == sys::CUresult::CUDA_SUCCESS
+        } else {
+            event.record(stream).is_ok()
+        }
+    }
+
     /// Number of pairs recorded but not yet harvested.
     pub(super) fn pending_len() -> usize {
         POOL.with(|p| p.borrow().pending.len())
@@ -107,7 +137,7 @@ mod gpu_pool {
                     Pair { start, stop }
                 }
             };
-            if pair.start.record(stream).is_err() {
+            if !record(&pair.start, stream) {
                 p.free.push(pair);
                 return None;
             }
@@ -127,7 +157,7 @@ mod gpu_pool {
             let Some(pair) = p.lent.get_mut(slot).and_then(Option::take) else {
                 return;
             };
-            if pair.stop.record(stream).is_err() {
+            if !record(&pair.stop, stream) {
                 p.free.push(pair);
                 return;
             }
@@ -157,13 +187,23 @@ pub fn gpu_span(name: &'static str, device: &candle::Device) -> GpuSpan {
     // one that keeps a profiling build's overhead proportional to the work
     // rather than to how far behind the queue has drifted.
     if gpu_pool::pending_len() >= gpu_pool::HIGH_WATER {
-        drain_inner(false);
-        if gpu_pool::pending_len() >= gpu_pool::HIGH_WATER {
-            drain_inner(true);
+        // Eager: some pending spans may belong to a segment this thread is
+        // recording, and a query of an event recorded into an open capture
+        // invalidates it. Pausing launches the segment first, so every event
+        // queried here is a real recording. A pause that fails leaves the
+        // segment open, so the drain waits for the next span.
+        if let Ok(_eager) = dev.pause_capture() {
+            drain_inner(false);
+            if gpu_pool::pending_len() >= gpu_pool::HIGH_WATER {
+                drain_inner(true);
+            }
         }
     }
-    let stream = dev.cuda_stream();
-    let inner = gpu_pool::open(&stream).map(|slot| GpuSpanInner { name, slot, stream });
+    let inner = gpu_pool::open(&dev.cuda_stream()).map(|slot| GpuSpanInner {
+        name,
+        slot,
+        device: dev.clone(),
+    });
     GpuSpan { inner }
 }
 
@@ -223,7 +263,7 @@ impl Drop for GpuSpan {
     #[inline(always)]
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
-            gpu_pool::close(inner.name, inner.slot, &inner.stream);
+            gpu_pool::close(inner.name, inner.slot, &inner.device.cuda_stream());
         }
     }
 }

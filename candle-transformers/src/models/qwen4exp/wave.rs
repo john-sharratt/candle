@@ -81,10 +81,11 @@ use crate::models::lazy_rope::LazyRope;
 use crate::models::operand_guard::expect_dense_view;
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
-use crate::models::profile::span;
+use crate::models::profile::{span, ProfileSnapshot};
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows, VerifyStash};
+use crate::models::residency_rows::residency_decode_rows;
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 
@@ -2236,6 +2237,12 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         self.model.experts.reset_expert_stats();
     }
 
+    /// The expert pipeline thread's spans — where its time goes serving each
+    /// routed layer, which decides how far behind the GPU it runs.
+    fn snapshot_profiles(&self) -> ProfileSnapshot {
+        self.model.experts.snapshot_profiles()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_wave(
         &self,
@@ -3096,6 +3103,26 @@ impl Qwen4ExpBatched {
         #[cfg(feature = "tensor-assert")]
         use candle::tensor_assert::site;
 
+        // The rows the routed experts' residency scores as decode: the decode
+        // rows, the verify segments and each prompt's last row
+        // (`residency_rows`).
+        // From the capture this sweep already holds — `self.verify` is
+        // write-locked for the whole sweep.
+        let verify_seqs: HashSet<usize> = cap_map
+            .as_ref()
+            .map(|c| c.seqs.keys().copied().collect())
+            .unwrap_or_default();
+        let decode_like = residency_decode_rows(
+            n_decode,
+            seq_ids[n_decode..]
+                .iter()
+                .copied()
+                .zip(pre_q.iter().copied()),
+            |s| verify_seqs.contains(&s),
+        );
+
+        dev.record_launches()?;
+
         for li in layer_start..layer_end {
             let layer = &m.layers[li];
 
@@ -3564,7 +3591,7 @@ impl Qwen4ExpBatched {
             // rather than by three launches of its own.
             let parts = layer
                 .moe
-                .forward_parts(acts, DType::F32, n_decode, moe_wave)?;
+                .forward_parts(acts, DType::F32, &decode_like, moe_wave)?;
             let routed = parts.routed.reshape((total_rows, n_embd))?;
             g_moe.end();
             #[cfg(feature = "tensor-assert")]

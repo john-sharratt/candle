@@ -69,6 +69,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "../arena_table.cuh"
+#include "../grow_scratch.cuh"
 #include "../paged-decode/slot_types.cuh"
 #include "../convert/convert_all.cuh"
 #include "../mma/mma_wrappers.cuh"
@@ -1051,29 +1052,17 @@ inline void launch_paged_prefill_int8(
     }
 
     // Persistent grow-on-demand partial pool (same idiom as the decode
-    // split-KV pool: single-stream, freed only on growth).
+    // split-KV pool: single-stream, grown with `grow_scratch`, which is safe
+    // while the thread records a graph and keeps the block it replaces).
     float* partials = nullptr;
     if (num_splits > 1) {
-        static float* s_pool = nullptr;
-        static size_t s_pool_elems = 0;
-        size_t need = (size_t)total_q * (size_t)n_head * (size_t)num_splits * (HEAD_DIM + 2);
-        if (need > s_pool_elems) {
-            if (s_pool != nullptr) {
-                // Drain the stream before freeing: cudaFree is not
-                // stream-ordered, and an earlier split launch on this stream
-                // may still be writing the old pool. Growth is rare (a new
-                // high-water total_q), so the sync cost is amortized away.
-                cudaStreamSynchronize(stream);
-                cudaFree(s_pool);
-            }
-            if (cudaMalloc(&s_pool, need * sizeof(float)) != cudaSuccess) {
-                s_pool = nullptr;
-                s_pool_elems = 0;
-            } else {
-                s_pool_elems = need;
-            }
+        static void* s_pool = nullptr;
+        static size_t s_pool_bytes = 0;
+        size_t need = (size_t)total_q * (size_t)n_head * (size_t)num_splits * (HEAD_DIM + 2)
+                      * sizeof(float);
+        if (grow_scratch(&s_pool, &s_pool_bytes, need) == cudaSuccess) {
+            partials = (float*)s_pool;
         }
-        partials = s_pool;
         if (partials == nullptr) num_splits = 1; // OOM fallback: direct store
     }
 

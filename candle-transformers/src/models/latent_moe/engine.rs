@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
+use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::{get_vram_info, gguf_file, Int8Mode, MmapRegistration, SumScale};
 use candle::{DType, Device, Result, Tensor, D};
 use memmap2::MmapOptions;
@@ -542,7 +543,7 @@ impl Engine {
             &weights,
             &indices,
             layer.moe_layer_idx,
-            nt,
+            &DecodeRows::prefix(nt),
             DType::F32,
             None,
         )?; // [nt, dim] F32

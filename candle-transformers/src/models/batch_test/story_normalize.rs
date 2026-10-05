@@ -49,12 +49,14 @@ fn flush(out: &mut String, word: &mut String) {
 fn neutral(word: &str) -> String {
     let straight = word.replace('\u{2019}', "'");
     let mapped = match straight.as_str() {
-        "his" | "her" => "[his/her]",
-        "His" | "Her" => "[His/Her]",
+        // One placeholder for all three: "her" is the feminine of both the
+        // possessive "his" and the object "him", and which one it stands for
+        // is grammar, not spelling. The price is that a masculine session
+        // writing "him" for "his" (or the reverse) is not caught here.
+        "his" | "him" | "her" => "[his/him/her]",
+        "His" | "Him" | "Her" => "[His/Him/Her]",
         "he" | "she" => "[he/she]",
         "He" | "She" => "[He/She]",
-        "him" => "[him/her]",
-        "Him" => "[Him/Her]",
         "wife" | "husband" => "[wife/husband]",
         // The model may expand or contract these equivalently.
         "he'd" | "she'd" => "[he/she] had",
@@ -94,7 +96,7 @@ mod tests {
     fn contractions_expand_before_they_neutralise() {
         assert_eq!(
             normalize_story("She'd left his tools; he\u{2019}d not."),
-            "[He/She] had left [his/her] tools; [he/she] had not."
+            "[He/She] had left [his/him/her] tools; [he/she] had not."
         );
     }
 
@@ -102,8 +104,22 @@ mod tests {
     fn spouses_and_object_pronouns_neutralise_at_punctuation() {
         assert_eq!(
             normalize_story("Her husband, \"him\"; His wife."),
-            "[His/Her] [wife/husband], \"[him/her]\"; [His/Her] [wife/husband]."
+            "[His/Him/Her] [wife/husband], \"[his/him/her]\"; [His/Him/Her] [wife/husband]."
         );
+    }
+
+    /// "her" is the feminine of both "him" and "his", so a female rewrite of
+    /// either compares equal to the original. Measured: at 256 generated
+    /// tokens a female session correctly wrote "pinned her to the seat" for
+    /// "pinned him to the seat", and a separate placeholder for "him" failed it.
+    #[test]
+    fn her_matches_both_him_and_his() {
+        assert_eq!(
+            normalize_story("pinned her to the seat, kissing her forehead"),
+            normalize_story("pinned him to the seat, kissing his forehead")
+        );
+        assert_eq!(normalize_story("Her"), normalize_story("Him"));
+        assert_eq!(normalize_story("Her"), normalize_story("His"));
     }
 
     /// Only whole words: a pronoun inside another word is left alone, and so

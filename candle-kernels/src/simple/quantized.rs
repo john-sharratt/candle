@@ -1460,7 +1460,14 @@ extern "C" {
     /// Quantize f32 to Q8_1 (legacy interface with ky rows)
     ///
     /// Handles grid/block dimensions internally based on elem_count.
-    pub fn run_quantize_q8_1(src: *const f32, dst: *mut c_void, elem_count: c_int, ky: c_int);
+    /// `stream` is the stream the launch is issued on.
+    pub fn run_quantize_q8_1(
+        src: *const f32,
+        dst: *mut c_void,
+        elem_count: c_int,
+        ky: c_int,
+        stream: *mut c_void,
+    );
 
     /// Quantize act[rows][cols] (dtype 0=F16,1=BF16,2=F32) → block_q8a128
     /// [rows][cols/128] (the contiguous q8 activation block, 144 B each).
@@ -1468,6 +1475,8 @@ extern "C" {
     /// `sum_norm` is `SumScale::as_code()`: 0 stores the raw per-128 Σx, 1
     /// stores Σx/amax. The matmul must be launched with the same choice, which
     /// is why it rides on `Q8a128Operand` rather than being decided per call.
+    /// `stream` is the stream the launch is issued on — the device's compute
+    /// stream, or a capture stream when it is being recorded into a graph.
     pub fn run_quantize_q8a128(
         act: *const c_void,
         out: *mut c_void,
@@ -1475,16 +1484,18 @@ extern "C" {
         cols: c_int,
         dtype: c_int,
         sum_norm: c_int,
+        stream: *mut c_void,
     );
 
     /// Dequantize block_q8a128[rows][cols/128] → out[rows][cols]
-    /// (dtype 0=F16,1=BF16,2=F32).
+    /// (dtype 0=F16,1=BF16,2=F32). `stream` is the stream the launch is issued on.
     pub fn run_dequantize_q8a128(
         inp: *const c_void,
         out: *mut c_void,
         rows: c_int,
         cols: c_int,
         dtype: c_int,
+        stream: *mut c_void,
     );
 
     /// Quantize f32 weights `[nrows × ncols]` (row-major) → the lane-major per-128 KO
@@ -1496,6 +1507,7 @@ extern "C" {
         nrows: c_int,
         ncols: c_int,
         qtype: c_int,
+        stream: *mut c_void,
     );
 
     /// Dequantize a lane-major KO chunk tensor → f32 `[nrows × ncols]` (row-major).
@@ -1506,6 +1518,7 @@ extern "C" {
         nrows: c_int,
         ncols: c_int,
         qtype: c_int,
+        stream: *mut c_void,
     );
 
     /// Quantize f32 to any supported quantized format
@@ -1517,7 +1530,14 @@ extern "C" {
     /// The destination buffer must be large enough to hold the quantized data.
     /// Number of quantized blocks = ceil(elem_count / block_size) where block_size
     /// depends on qtype (32 for standard, 256 for K-quants, 128/64 for AWQ).
-    pub fn run_quantize_block(src: *const f32, dst: *mut c_void, elem_count: c_int, qtype: c_int);
+    /// `stream` is the stream the launch is issued on.
+    pub fn run_quantize_block(
+        src: *const f32,
+        dst: *mut c_void,
+        elem_count: c_int,
+        qtype: c_int,
+        stream: *mut c_void,
+    );
 
     /// Quantize f32 with transpose from [H, T, D] to [H, D, T] layout
     ///
@@ -1555,6 +1575,7 @@ extern "C" {
         chunk_size: c_int,
         head_dim: c_int,
         qtype: c_int,
+        stream: *mut c_void,
     );
 
     /// Batched fused transpose + quantize with multi-dtype support.
@@ -1585,6 +1606,7 @@ extern "C" {
         head_dim: c_int,
         qtype: c_int,
         src_dtype: c_int,
+        stream: *mut c_void,
     );
 
     /// Fused paged format selection + palette-4 grouping kernel.
@@ -1647,6 +1669,7 @@ extern "C" {
         n_kv_head: c_int,
         head_dim: c_int,
         arena_chunks: c_int,
+        stream: *mut c_void,
     );
 
     /// Fused KV sampled-error kernel.
@@ -1672,6 +1695,7 @@ extern "C" {
         n_kv_head: c_int,
         head_dim: c_int,
         arena_chunks: c_int,
+        stream: *mut c_void,
     );
 
     /// GPU winner selection kernel — takes K and V error surfaces already on device
@@ -1695,6 +1719,7 @@ extern "C" {
         n_quant: c_int,
         n_kv_head: c_int,
         head_dim: c_int,
+        stream: *mut c_void,
     );
 
     /// Per-chunk worst-case reduction of per-block format tags.
@@ -1725,6 +1750,7 @@ extern "C" {
         num_v_candidates: c_int,
         blocks_per_chunk: c_int,
         num_chunks: c_int,
+        stream: *mut c_void,
     );
 
     /// Per-head worst-case reduction: reduces per-block format tags to
@@ -1743,6 +1769,7 @@ extern "C" {
         blocks_per_head: c_int,
         n_kv_head: c_int,
         num_chunks: c_int,
+        stream: *mut c_void,
     );
 
     /// Per-head reduction that also expands the effective block tags after
@@ -1757,6 +1784,7 @@ extern "C" {
         blocks_per_head: c_int,
         n_kv_head: c_int,
         num_chunks: c_int,
+        stream: *mut c_void,
     );
 
     /// Dequantize a block to f32/f16/bf16
@@ -1770,6 +1798,7 @@ extern "C" {
         elem_count: c_int,
         qtype: c_int,
         out_dtype: c_int,
+        stream: *mut c_void,
     );
 
     /// Standalone MXFP4 (OCP FP4) dequantize. `out_dtype`: 0=F32, 1=F16, 2=BF16. Kept
@@ -1779,6 +1808,7 @@ extern "C" {
         dst: *mut c_void,
         elem_count: c_int,
         out_dtype: c_int,
+        stream: *mut c_void,
     );
 
     /// Q0_V decode oracle — decodes every element of `num_blocks` Q0_V blocks
@@ -1797,6 +1827,7 @@ extern "C" {
         num_blocks: c_int,
         is_k: c_int,
         scale: f32,
+        stream: *mut c_void,
     );
 
     /// Q0_V encode oracle — encodes `num_blocks` 32-element f32 blocks (already
@@ -1807,6 +1838,7 @@ extern "C" {
         dst: *mut c_void,
         num_blocks: c_int,
         is_k: c_int,
+        stream: *mut c_void,
     );
 
     /// KV block decode oracle — decodes every element of `num_blocks` blocks
@@ -1820,6 +1852,7 @@ extern "C" {
         block_bytes: c_int,
         fmt: c_int,
         is_k: c_int,
+        stream: *mut c_void,
     );
 
     /// KV block encode oracle — encodes `num_blocks` 32-element f32 blocks in
@@ -1832,6 +1865,7 @@ extern "C" {
         block_bytes: c_int,
         fmt: c_int,
         is_k: c_int,
+        stream: *mut c_void,
     );
 
     /// Q0_V round-trip test entrypoint — quantizes then dequantizes each
@@ -1849,6 +1883,7 @@ extern "C" {
         num_blocks: c_int,
         outer: f32,
         is_k: c_int,
+        stream: *mut c_void,
     );
 
     /// Q0_V runtime-table round-trip — same encoder/decoder pair as the
@@ -1869,6 +1904,7 @@ extern "C" {
         centroid_table_bits_flat: *const c_void,
         peak_curve_indices: *const c_void,
         peak_bin_offsets: *const c_void,
+        stream: *mut c_void,
     );
 
     /// Dequantize and multiply with vector (legacy path)
@@ -1882,6 +1918,7 @@ extern "C" {
         ncols: c_int,
         nrows: c_int,
         qtype: c_int,
+        stream: *mut c_void,
     );
 
     /// Matrix-vector multiply via Q8_1 quantization (batched)
@@ -1899,6 +1936,7 @@ extern "C" {
         nrows_dst: c_int,
         b_size: c_int,
         qtype: c_int,
+        stream: *mut c_void,
     );
 
     /// Full matrix multiply (tensor core / MMQ)
@@ -1915,6 +1953,7 @@ extern "C" {
         nrows_y: c_int,
         nrows_dst: c_int,
         qtype: c_int,
+        stream: *mut c_void,
     );
 
     /// Palette4 KV-cache format conversion kernel.
@@ -1971,6 +2010,7 @@ extern "C" {
         n_quant: c_int,
         chunk_size: c_int,
         pal_overhead: f32,
+        stream: *mut c_void,
     );
 }
 

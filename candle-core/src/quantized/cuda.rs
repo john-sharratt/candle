@@ -4,6 +4,7 @@
 // which is the opposite of what makes these auditable against the `.cu`.
 #![allow(clippy::too_many_arguments)]
 
+use super::decode_rows::DecodeRows;
 use super::{GgmlDType, Int8Mode, QStorage, SumScale};
 use crate::backend::{BackendDevice, BackendStorage};
 
@@ -18,7 +19,7 @@ use crate::{CudaDevice, CudaStorage, DType, Layout, Result, Shape, Storage};
 use half::{bf16, f16};
 
 use crate::cuda_backend::WrapErr;
-use cudarc::driver::{CudaSlice, CudaView, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, CudaStream, CudaView, DevicePtr, DevicePtrMut};
 
 // Import the FFI dispatcher functions
 use candle_kernels::simple::quantized::{
@@ -524,6 +525,7 @@ fn quantize_q8_1(
             dst_ptr as *mut std::ffi::c_void,
             elem_count as i32,
             ky as i32,
+            stream.cu_stream() as *mut std::ffi::c_void,
         );
     }
     Ok(())
@@ -558,6 +560,7 @@ pub fn quantize_to_dtype(
             dst_ptr as *mut std::ffi::c_void,
             elem_count as i32,
             qtype as i32,
+            stream.cu_stream() as *mut std::ffi::c_void,
         );
     }
     Ok(())
@@ -635,6 +638,7 @@ pub fn quantize_transposed_to_dtype(
             chunk_size as i32,
             head_dim as i32,
             qtype as i32,
+            stream.cu_stream() as *mut std::ffi::c_void,
         );
     }
     Ok(())
@@ -741,6 +745,7 @@ pub unsafe fn quantize_transposed_batched_to_dtype(
         chunk_size as i32,
         head_dim as i32,
         qtype as i32,
+        stream.cu_stream() as *mut std::ffi::c_void,
     );
     Ok(())
 }
@@ -879,6 +884,7 @@ pub unsafe fn quantize_transposed_batched_typed(
         head_dim as i32,
         qtype as i32,
         src_dtype_code,
+        stream.cu_stream() as *mut std::ffi::c_void,
     );
     Ok(())
 }
@@ -1718,6 +1724,7 @@ pub fn reduce_head_format_stats(
                 blocks_per_head as i32,
                 n_kv_head as i32,
                 num_chunks as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -1847,6 +1854,7 @@ pub fn sample_quant_errors_paged(
                 n_kv_head as i32,
                 head_dim as i32,
                 arena_chunks as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -1921,6 +1929,7 @@ pub fn sample_quant_errors_kv_paged(
                 n_kv_head as i32,
                 head_dim as i32,
                 arena_chunks as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -1988,6 +1997,7 @@ pub fn sample_quant_errors_kv_paged_staged(
                 n_kv_head as i32,
                 head_dim as i32,
                 arena_chunks as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -2066,6 +2076,7 @@ pub fn select_kv_winners_paged(
                 n_quant as i32,
                 n_kv_head as i32,
                 head_dim as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -2132,6 +2143,7 @@ pub fn select_kv_winners_paged_staged(
                 n_quant as i32,
                 n_kv_head as i32,
                 head_dim as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -2200,6 +2212,9 @@ pub fn select_and_summarize_kv_winners_paged_staged(
     dtoh_stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     pinned_dst: &mut [f32],
 ) -> Result<cudarc::driver::CudaEvent> {
+    // A cross-stream fence and a readback: eager, behind everything this
+    // thread has recorded, so the compute-done event covers it.
+    let _eager = dev.pause_capture()?;
     let n_sums = (n_k_thresholds + n_v_thresholds) * 3;
     let n_cells = n_chunks
         .checked_mul(n_kv_head)
@@ -2247,6 +2262,7 @@ pub fn select_and_summarize_kv_winners_paged_staged(
                 n_quant as i32,
                 n_kv_head as i32,
                 head_dim as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
 
             // 2. Summarize K winners → kv_sums[0 .. n_k_thresholds*3].
@@ -2262,6 +2278,7 @@ pub fn select_and_summarize_kv_winners_paged_staged(
                 n_quant as i32,
                 chunk_size as i32,
                 pal_overhead,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
 
             // 3. Summarize V winners → kv_sums[n_k_thresholds*3 ..].
@@ -2277,6 +2294,7 @@ pub fn select_and_summarize_kv_winners_paged_staged(
                 n_quant as i32,
                 chunk_size as i32,
                 pal_overhead,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
 
@@ -2541,12 +2559,15 @@ fn require_block_dequant_kernel(dtype: GgmlDType) -> Result<()> {
     Ok(())
 }
 
+/// Every launch is issued on `stream`.
 fn dequantize_f32_into(
     data_ptr: u64,
     dtype: GgmlDType,
     elem_count: usize,
     dst_ptr: u64,
+    stream: &CudaStream,
 ) -> Result<()> {
+    let launch_stream = stream.cu_stream() as *mut std::ffi::c_void;
     /// Which routine turns this source into f32.
     enum Widen {
         /// A block format with a `QType` slot — the ordinary dequant kernel.
@@ -2598,6 +2619,7 @@ fn dequantize_f32_into(
                     dst as *mut std::ffi::c_void,
                     n as i32,
                     0,
+                    launch_stream,
                 );
             },
             Widen::Block(q) => unsafe {
@@ -2607,6 +2629,7 @@ fn dequantize_f32_into(
                     n as i32,
                     q,
                     DequantOutDType::F32 as i32,
+                    launch_stream,
                 );
             },
             // `num_dims = 0` / `info = null`: the band is contiguous by construction, so the
@@ -2618,6 +2641,7 @@ fn dequantize_f32_into(
                     n,
                     0,
                     std::ptr::null(),
+                    launch_stream,
                 );
             },
             Widen::Float(GgmlDType::BF16) => unsafe {
@@ -2627,14 +2651,16 @@ fn dequantize_f32_into(
                     n,
                     0,
                     std::ptr::null(),
+                    launch_stream,
                 );
             },
             // Already f32: the "widen" is a copy, and the driver does it without a kernel.
-            // Not folded into the cast dispatcher, which has no identity arm.
+            // Not folded into the cast dispatcher, which has no identity arm. Async on
+            // `stream`, ordered with the bands around it like every other arm.
             Widen::Float(_) => {
                 let bytes = n * std::mem::size_of::<f32>();
                 unsafe {
-                    cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes)
+                    cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, stream.cu_stream())
                         .map_err(crate::Error::wrap)?;
                 }
             }
@@ -2655,7 +2681,7 @@ fn dequantize_f32(
         let stream = dev.cuda_stream();
         let (src_ptr, _src_guard) = data.inner.device_ptr(&stream);
         let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
-        dequantize_f32_into(src_ptr, dtype, elem_count, dst_ptr)?;
+        dequantize_f32_into(src_ptr, dtype, elem_count, dst_ptr, &stream)?;
     }
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
@@ -2678,6 +2704,7 @@ fn dequantize_f16(
                     dst_ptr as *mut std::ffi::c_void,
                     elem_count as i32,
                     1,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -2697,6 +2724,7 @@ fn dequantize_f16(
                 elem_count as i32,
                 qtype as i32,
                 DequantOutDType::F16 as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -2722,6 +2750,7 @@ fn dequantize_bf16(
                     dst_ptr as *mut std::ffi::c_void,
                     elem_count as i32,
                     2,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -2741,6 +2770,7 @@ fn dequantize_bf16(
                 elem_count as i32,
                 qtype as i32,
                 DequantOutDType::BF16 as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -2777,6 +2807,7 @@ fn dequantize_mul_mat_vec(
                 ncols as i32,
                 nrows as i32,
                 qtype as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -2850,6 +2881,7 @@ fn mul_mat_vec_via_q8_1(
                     nrows as i32,
                     chunk as i32,
                     qtype as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
             off += chunk;
@@ -2911,6 +2943,7 @@ fn mul_mat_via_q8_1(
                 k_padded as i32,
                 x_rows as i32,
                 qtype as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
         Ok(())
@@ -3040,6 +3073,7 @@ fn dense_qmatmul_float(
                         // sum_norm: likewise not consulted. This is the FLOAT
                         // activation path; there is no q8a128 header to interpret.
                         SumScale::Raw.as_code(),
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     )
                 };
                 check_matmul_status(status, "dense_qmatmul_float")?;
@@ -3498,6 +3532,7 @@ impl QCudaStorage {
                 (dst_ptr as *mut u8).add(byte_offset) as *mut std::ffi::c_void,
                 elem_count as i32,
                 qtype as i32,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
 
@@ -3644,6 +3679,7 @@ impl QCudaStorage {
                 head_dim as i32,
                 qtype as i32,
                 src_dtype_code,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
 
@@ -3712,6 +3748,7 @@ impl QCudaStorage {
                         elem_count as i32,
                         qtype as i32,
                         DequantOutDType::F16 as i32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -3724,6 +3761,7 @@ impl QCudaStorage {
                         elem_count as i32,
                         qtype as i32,
                         DequantOutDType::BF16 as i32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -3736,6 +3774,7 @@ impl QCudaStorage {
                         elem_count as i32,
                         qtype as i32,
                         DequantOutDType::F32 as i32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -4373,6 +4412,7 @@ impl QCudaStorage {
                     self.dtype,
                     rows * ncols,
                     fp,
+                    &stream,
                 )?;
             }
             {
@@ -4385,6 +4425,7 @@ impl QCudaStorage {
                         rows as i32,
                         ncols as i32,
                         qtype,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -4565,7 +4606,7 @@ pub fn repack_ko_from_host(
         // SAFETY: the caller's contract — at least `bytes` of live, un-aliased device memory
         // outliving the storage.
         Some((ptr, origin)) => (
-            unsafe { device.cuda_stream().upgrade_device_ptr::<u8>(ptr, bytes) },
+            unsafe { device.compute_stream().upgrade_device_ptr::<u8>(ptr, bytes) },
             Backing::Lease(origin),
         ),
         // SAFETY: filled by the loop below.
@@ -4596,7 +4637,7 @@ pub fn repack_ko_from_host(
         {
             let (sp, _sg) = stage.device_ptr(&stream);
             let (fp, _fg) = f32_band.device_ptr_mut(&stream);
-            dequantize_f32_into(sp, src_dtype, rows * ncols, fp)?;
+            dequantize_f32_into(sp, src_dtype, rows * ncols, fp, &stream)?;
         }
         {
             let (fp, _fg) = f32_band.device_ptr(&stream);
@@ -4608,6 +4649,7 @@ pub fn repack_ko_from_host(
                     rows as i32,
                     ncols as i32,
                     qtype,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -4872,7 +4914,9 @@ pub unsafe fn view_repacked(
     if extent < bytes {
         crate::bail!("view_repacked: extent {extent} is shorter than the {bytes}-byte payload");
     }
-    let inner = device.cuda_stream().upgrade_device_ptr::<u8>(ptr, extent);
+    let inner = device
+        .compute_stream()
+        .upgrade_device_ptr::<u8>(ptr, extent);
     Ok(QStorage::Cuda(QCudaStorage {
         data: std::mem::ManuallyDrop::new(PaddedCudaSlice { inner, len: bytes }),
         device: device.clone(),
@@ -5233,7 +5277,7 @@ fn grouped_matmul_gemx_impl<'w>(
                     }
                 };
                 let (y_ptr, _y_guard) = y_view.device_ptr(&stream);
-                ring.with_table(&packed, |base| {
+                let status = ring.with_table(&packed, |base| {
                     let wptr_ptr = base;
                     let te_ptr = base + off_te as u64;
                     let tbs_ptr = base + off_tbs as u64;
@@ -5262,9 +5306,10 @@ fn grouped_matmul_gemx_impl<'w>(
                             // Host-built tables over resident weights: no wait.
                             std::ptr::null(),
                             stream.cu_stream() as *mut std::ffi::c_void,
-                        );
+                        )
                     }
                 })?;
+                check_matmul_status(status, "grouped_matmul_gemx")?;
             }};
         }
 
@@ -5746,6 +5791,7 @@ impl<'w> Q8a128Operand<'w> {
                     self.rows as i32,
                     self.cols as i32,
                     dtype_code,
+                    device.cuda_stream().cu_stream() as *mut std::ffi::c_void,
                 );
             }
             Ok(())
@@ -5960,6 +6006,7 @@ pub fn quantize_acts_q8a128<'w>(
             cols as i32,
             dtype,
             sum_scale.as_code(),
+            device.cuda_stream().cu_stream() as *mut std::ffi::c_void,
         );
     }
     Ok(q8a128_from_out(
@@ -6105,6 +6152,7 @@ pub fn rms_norm_q8a128<'w>(
                         cols as i32,
                         eps,
                         sum_scale.as_code(),
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }};
@@ -6238,6 +6286,7 @@ pub fn silu_mul_q8a128<'w>(
                         cols as i32,
                         sum_scale.as_code(),
                         g_stride as i32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }};
@@ -6321,6 +6370,7 @@ pub fn quantize_ko_weights(
                 nrows as i32,
                 ncols as i32,
                 qtype,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -6349,6 +6399,7 @@ pub fn dequant_ko_weights(
                 nrows as i32,
                 ncols as i32,
                 qtype,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -6374,6 +6425,7 @@ pub fn dequantize_q8a128(
                 rows as i32,
                 cols as i32,
                 2, // F32 output
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -6559,7 +6611,7 @@ pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
         }
         // The kernel reads the descriptor blob IN PLACE from the device-mapped
         // pinned table ring — no per-launch H2D copy, no device allocation.
-        table_ring(device)?.with_table(&packed, |base| {
+        let status = table_ring(device)?.with_table(&packed, |base| {
             let wptr_ptr = base;
             let te_ptr = base + off_te as u64;
             let tbs_ptr = base + off_tbs as u64;
@@ -6586,9 +6638,10 @@ pub(crate) fn grouped_matmul_gemx_q8a128_with_mode<'w>(
                     // Host-built tables over resident weights: no wait.
                     std::ptr::null(),
                     device.cuda_stream().cu_stream() as *mut std::ffi::c_void,
-                );
+                )
             }
         })?;
+        check_matmul_status(status, "grouped_matmul_gemx_q8a128")?;
     }
 
     let out_shape: Shape = vec![total_batch, nrows].into();
@@ -6779,7 +6832,7 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
         let row_fast = grouped_grid_row_fast(total_batch * ncols, device) as i32;
         let live_ptr = live.map_or(std::ptr::null(), |l| l as *const MoeLive);
         op.with_device_ptr(device, |act_ptr| {
-            unsafe {
+            let status = unsafe {
                 run_grouped_quantized_matmul(
                     wp as *const std::ffi::c_void,
                     te as *const std::ffi::c_void,
@@ -6801,9 +6854,9 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
                     op.sum_scale.as_code(),
                     live_ptr,
                     stream.cu_stream() as *mut std::ffi::c_void,
-                );
-            }
-            Ok(())
+                )
+            };
+            check_matmul_status(status, "grouped_matmul_gemx_dynamic")
         })?;
     }
 
@@ -6915,6 +6968,7 @@ pub(crate) fn qkv_segmented_matmul<'w>(
                 // One shared operand feeds all three segments, so its convention
                 // is the launch's.
                 op.sum_scale.as_code(),
+                device.cuda_stream().cu_stream() as *mut std::ffi::c_void,
             )
         };
         check_matmul_status(status, "qkv_segmented_matmul")
@@ -6981,6 +7035,7 @@ pub(crate) fn q8a128_dense_matmul<'w>(
                 out_code,             // store width
                 // The operand's own Σx convention — the bytes say how to read them.
                 op.sum_scale.as_code(),
+                device.cuda_stream().cu_stream() as *mut std::ffi::c_void,
             )
         };
         check_matmul_status(status, "q8a128_dense_matmul")
@@ -7169,6 +7224,7 @@ pub fn fused_moe_gather(
                         ids_ptr as *const u32,
                         total_rows,
                         hidden_dim,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -7259,6 +7315,7 @@ pub fn moe_route<'w>(
                     n_experts as i32,
                     k as i32,
                     norm_topk as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }};
@@ -7326,6 +7383,7 @@ pub fn fused_moe_gather_q8a128<'w>(
                     ids_ptr as *const u32,
                     total_rows,
                     tiles_per_row,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
             Ok(())
@@ -7434,6 +7492,7 @@ pub fn fused_deterministic_scatter(
                     ts_ptr as *const i32,
                     num_tokens as i32,
                     hidden_dim as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }};
@@ -7513,6 +7572,10 @@ impl MoeBucketizeWorkspace {
     /// Grow (never shrink) to cover `n_tokens × k`.
     fn ensure(&mut self, device: &CudaDevice, n_tokens: usize, k: usize) -> Result<()> {
         if n_tokens * k > self.cap_assign || n_tokens + 1 > self.cap_starts {
+            // Eager for the whole swap: the old tables are freed here, behind
+            // every launch that read them — including any this thread has
+            // recorded and not yet issued.
+            let _eager = device.pause_capture()?;
             *self = Self::new(device, n_tokens, k)?;
         }
         Ok(())
@@ -7535,18 +7598,21 @@ impl MoeBucketizeWorkspace {
 ///   cold) experts' tiles come first and are listed, and the routing summary is
 ///   written. `None` treats every expert as in VRAM (plain
 ///   ascending tile order, no summary, no list).
-/// - `decode_tokens` — tokens `[0, decode_tokens)` are decode rows.
+/// - `decode` — the tokens scored as decode rows ([`DecodeRows`]).
 pub fn moe_bucketize(
     indices: &LiveTensor<'_>,
     n_experts: usize,
     tile_w: usize,
     ws: &mut MoeBucketizeWorkspace,
     live: Option<&BucketizeLive>,
-    decode_tokens: usize,
+    decode: &DecodeRows,
 ) -> Result<()> {
     use crate::cuda_backend::CudaStorageSlice;
 
-    use candle_kernels::simple::moe_bucketize::{MAX_EXPERTS, MAX_TOPK};
+    use candle_kernels::simple::moe_bucketize::{
+        BUCKETIZE_EARLIER_FAILURE, BUCKETIZE_LAUNCHED, BUCKETIZE_REFUSED, MAX_EXPERTS, MAX_TOPK,
+    };
+    let (decode_lo, decode_hi) = decode.ranges();
 
     let (n_tokens, k) = indices.dims2()?;
     // These bounds mirror the launcher's own guards (via the shared constants),
@@ -7613,7 +7679,7 @@ pub fn moe_bucketize(
     let (hd, _g9) = ws.header.device_ptr(&stream);
     let (iv, _g10) = ws.inv.device_ptr(&stream);
     let (sc, _g11) = ws.scan.device_ptr(&stream);
-    unsafe {
+    let status = unsafe {
         candle_kernels::simple::moe_bucketize::run_moe_bucketize(
             idp as *const std::ffi::c_void,
             n_tokens as i32,
@@ -7638,7 +7704,9 @@ pub fn moe_bucketize(
             live.map_or(0, |l| l.pinned[0].1),
             live.map_or(0, |l| l.pinned[1].0),
             live.map_or(0, |l| l.pinned[1].1),
-            decode_tokens.min(i32::MAX as usize) as i32,
+            decode_lo.as_ptr(),
+            decode_hi.as_ptr(),
+            decode_lo.len() as i32,
             live.map_or(0, |l| l.summary) as *mut std::ffi::c_void,
             live.map_or(0, |l| l.summary_seq),
             live.map_or(0, |l| l.remote) as *mut std::ffi::c_void,
@@ -7649,12 +7717,26 @@ pub fn moe_bucketize(
             promo.map_or(0, |p| p.tail) as *const std::ffi::c_void,
             promo.map_or(0, |p| p.cap),
             promo.map_or(0, |p| p.marks) as *mut std::ffi::c_void,
+            promo.map_or(0, |p| p.reserve) as *const std::ffi::c_void,
             live.map_or(0, |l| l.row),
             live.map_or(0, |l| l.remote_dst) as *mut std::ffi::c_void,
+            live.map_or(0, |l| l.started_rows) as *mut std::ffi::c_void,
+            live.map_or(0, |l| l.ticket),
             stream.cu_stream() as *mut std::ffi::c_void,
-        );
+        )
+    };
+    match status {
+        BUCKETIZE_LAUNCHED => Ok(()),
+        BUCKETIZE_REFUSED => crate::bail!(
+            "moe_bucketize: the launcher refused its arguments — the workspace still holds \
+             the previous layer's tables"
+        ),
+        BUCKETIZE_EARLIER_FAILURE => crate::bail!(
+            "moe_bucketize: an earlier launch on this thread failed, so a kernel before this \
+             layer's bucketize did not run (the launcher logged the error)"
+        ),
+        other => crate::bail!("moe_bucketize: the kernel launch failed (status {other})"),
     }
-    Ok(())
 }
 
 /// One routed layer's live-table inputs and outputs for [`moe_bucketize`].
@@ -7688,6 +7770,12 @@ pub struct BucketizeLive {
     pub promo: Option<PromoRing>,
     /// `u64[n_experts]` promotion slot per remote expert (0 = none).
     pub remote_dst: u64,
+    /// `u64[rows]` started words (mapped), or 0: the kernel stores `ticket`
+    /// into `started_rows[row]`, behind a system fence, before it reads any
+    /// live entry — the host's reclaim rule keys slot reuse on it.
+    pub started_rows: u64,
+    /// This invocation's ticket.
+    pub ticket: u64,
 }
 
 /// The promotion ring `moe_bucketize` takes slots from — device addresses into
@@ -7696,7 +7784,11 @@ pub struct BucketizeLive {
 /// (`u32`), records `summary_seq << 32 | row << 16 | expert` in `log` (`u64`)
 /// at the same index, and advances `head`. `marks` (`u32[rows][n_experts]`) is
 /// set by the kernel for each expert it gives a slot and cleared by the host
-/// once the promotion lands; a marked expert is not given another.
+/// once the promotion lands; a marked expert is not given another. `reserve`
+/// is the address of a `u32`: the stock kept for decode-scored experts, so a
+/// prompt-only expert takes a slot only while more than that value is stocked
+/// (a value of 0 lets it take any). A null address means a prompt-only expert
+/// never takes one.
 #[derive(Debug, Clone, Copy)]
 pub struct PromoRing {
     pub slots: u64,
@@ -7705,6 +7797,7 @@ pub struct PromoRing {
     pub tail: u64,
     pub cap: u32,
     pub marks: u64,
+    pub reserve: u64,
 }
 
 #[cfg(test)]

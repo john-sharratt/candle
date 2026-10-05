@@ -30,6 +30,7 @@
 
 use std::cell::RefCell;
 
+use candle::quantized::decode_rows::DecodeRows;
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
@@ -1190,6 +1191,14 @@ fn sweep_layers(
     // already formed, and the search belongs upstream of `layer_start`.
     x.as_cat_tensor().assert("qwen35.sweep_in");
 
+    // The rows the routed experts' residency scores as decode.
+    let decode_like = DecodeRows::prefix(n_decode);
+
+    // Everything above — admission, the tier, the tables, the embedding — ran
+    // eagerly. The layers and the head are recorded as a chain of graphs
+    // (`docs/decode_graphs.md`), cut where a layer meets the host.
+    dev.record_launches()?;
+
     for li in layer_start..layer_end {
         // The residual ENTERING this layer — the first checkpoint of the layer,
         // so it fires before anything inside can. Reaching layer N's body means
@@ -1266,7 +1275,14 @@ fn sweep_layers(
                 // `layer_idx` names the KV layer, not the trunk layer: it is
                 // what the per-layer arena bookkeeping inside the mixed
                 // dispatch indexes by, and that bookkeeping is per cache.
-                forward_layer_batched_mixed(&layer, &mut wave_groups, &mut x, embed_dtype, kv)?;
+                forward_layer_batched_mixed(
+                    &layer,
+                    &mut wave_groups,
+                    &mut x,
+                    embed_dtype,
+                    kv,
+                    &decode_like,
+                )?;
                 // The attention arm's mixer output, which had no site of its
                 // own — only the DeltaNet arm was covered, so an attention
                 // layer could only ever be blamed at `layer_out`, after its FFN
@@ -1373,7 +1389,14 @@ fn sweep_layers(
                     &[],
                     capture_dev,
                 )?;
-                quantized_delta_net_ffn(&layer, &mut x, embed_dtype, orig, layer_lora, n_decode)?;
+                quantized_delta_net_ffn(
+                    &layer,
+                    &mut x,
+                    embed_dtype,
+                    orig,
+                    layer_lora,
+                    &decode_like,
+                )?;
             }
         }
         // The layer's result. Reaching this on a bad value means the mixer's
@@ -1390,10 +1413,11 @@ fn sweep_layers(
         crate::models::nan_capture::watch_layer(capture_dev, li);
         // This layer's compute is issued, so the copy stream can overlap the
         // next layers' transfers with it rather than serialising in front of
-        // them. Safe to evict from here: `issue` orders every copy behind an
-        // event recorded on the compute stream, so a slot whose GEMMs are still
-        // running cannot be overwritten under them. A resident store returns
-        // without touching anything.
+        // them. Safe to evict from here: a load launches the recording segment
+        // and orders every copy behind an event recorded on the compute stream
+        // after it, so a slot whose GEMMs are still running cannot be
+        // overwritten under them. A resident store, or a plan with nothing to
+        // load, returns without touching anything.
         //
         // **After the checkpoints, not before.** They read `x`, not the layer,
         // but the prefetch may evict the slot `layer` borrows — so releasing it

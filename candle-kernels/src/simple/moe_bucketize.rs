@@ -16,6 +16,19 @@ use std::ffi::c_void;
 pub const MAX_EXPERTS: usize = 512;
 /// Kernel bound on top-k width (`k`), mirrored from `MAX_TOPK` in the `.cu`.
 pub const MAX_TOPK: usize = 32;
+/// Kernel bound on the decode-scored token ranges, mirrored from
+/// `MAX_DECODE_RANGES` in the `.cu`.
+pub const MAX_DECODE_RANGES: usize = 32;
+
+/// [`run_moe_bucketize`] launched the kernel.
+pub const BUCKETIZE_LAUNCHED: i32 = 0;
+/// [`run_moe_bucketize`]'s argument guards refused the call; nothing was written.
+pub const BUCKETIZE_REFUSED: i32 = 1;
+/// The launch itself returned an error.
+pub const BUCKETIZE_LAUNCH_FAILED: i32 = 2;
+/// An earlier launch on the calling thread had left an error pending; nothing
+/// was launched.
+pub const BUCKETIZE_EARLIER_FAILURE: i32 = 3;
 
 extern "C" {
     #[allow(clippy::too_many_arguments)]
@@ -49,8 +62,13 @@ extern "C" {
         pinned0_hi: u64,
         pinned1_lo: u64,
         pinned1_hi: u64,
-        // Tokens `[0, decode_tokens)` are decode rows (the summary's decode bit).
-        decode_tokens: i32,
+        // Tokens inside one of the `decode_ranges` ranges `[decode_lo[i],
+        // decode_hi[i])` are decode-scored (the summary's decode bit). Host
+        // pointers, read by the launcher into the launch parameters; at most
+        // `MAX_DECODE_RANGES`.
+        decode_lo: *const u32,
+        decode_hi: *const u32,
+        decode_ranges: i32,
         // `u32[n_experts + 1]` routing summary, or null; `summary_seq` is
         // stored in its last word after every count is visible system-wide.
         summary: *mut c_void,
@@ -70,10 +88,15 @@ extern "C" {
         // `u32[rows][n_experts]` in-flight promotion marks (mapped), with the
         // ring.
         promo_marks: *mut c_void,
+        // Mapped `u32`, with the ring: a prompt-only expert takes a slot only
+        // while more than this is stocked; null = never.
+        promo_reserve: *const c_void,
         // This layer's row, recorded in the log.
         row: i32,
         // `u64[n_experts]` promotion slot per remote expert (0 = none), or null.
         remote_dst: *mut c_void,
+        started_rows: *mut c_void,
+        ticket: u64,
         stream: *mut c_void,
-    );
+    ) -> i32;
 }

@@ -1,8 +1,10 @@
 //! FFI bindings for add_at_indices CUDA kernels
 //!
 //! These kernels atomically add a value to tensor elements at specified indices.
-//! The host-side dispatcher functions handle CUDA kernel launch configuration.
+//! The host-side dispatcher functions handle CUDA kernel launch configuration,
+//! and each launches on the `stream` its caller passes.
 
+use core::ffi::c_void;
 use half::{bf16, f16};
 
 extern "C" {
@@ -25,6 +27,7 @@ extern "C" {
         num_indices: usize,
         value: f32,
         stride: usize,
+        stream: *mut c_void,
     );
 
     /// Atomically add a value to f16 tensor elements at specified indices
@@ -46,6 +49,7 @@ extern "C" {
         num_indices: usize,
         value: f16,
         stride: usize,
+        stream: *mut c_void,
     );
 
     /// Atomically add a value to bf16 tensor elements at specified indices
@@ -67,6 +71,7 @@ extern "C" {
         num_indices: usize,
         value: bf16,
         stride: usize,
+        stream: *mut c_void,
     );
 
     /// Atomically add a value to f64 tensor elements at specified indices
@@ -88,5 +93,6 @@ extern "C" {
         num_indices: usize,
         value: f64,
         stride: usize,
+        stream: *mut c_void,
     );
 }

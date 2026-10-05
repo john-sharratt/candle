@@ -328,8 +328,14 @@ mod tests {
         // engine serves this checkpoint at, `Int8Mode::auto` — `Precision` on an
         // int8-MMA card. The gate benchmarks what a daemon runs.
         let int8mode = Int8Mode::auto(&device);
-        let params = TestParams::new(10, &tokenizer_json()?, Dialect::qwen35())
+        // 256 tokens: the decode rate measured after the expert working set
+        // has recovered from the prefill in front of it, not the pivot between
+        // the two (see the Flash-Next gate, which measured the same effect).
+        // The top rungs, C9 and C10, stay at 64 — the length their thresholds
+        // are calibrated at (`TestParams::top_rung_token_count`).
+        let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
             .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_top_rung_tokens(64)
             .with_suppress_thinking(true)
             .with_print_outputs(true)
             .with_int8mode(int8mode)

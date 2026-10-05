@@ -21,6 +21,7 @@ mod fast_exp_cuda {
             inp: *const c_void,
             out: *mut c_void,
             numel: usize,
+            stream: *mut c_void,
         );
 
         fn run_fast_activation_batch(
@@ -29,6 +30,7 @@ mod fast_exp_cuda {
             inp: *const c_void,
             out: *mut c_void,
             numel: usize,
+            stream: *mut c_void,
         );
     }
 
@@ -315,6 +317,7 @@ mod fast_exp_cuda {
                     input_ptr,
                     output_ptr,
                     numel,
+                    stream.cu_stream() as *mut c_void,
                 );
             }
         }
@@ -393,6 +396,7 @@ mod fast_exp_cuda {
                     input_ptr,
                     output_ptr,
                     numel,
+                    stream.cu_stream() as *mut c_void,
                 );
             }
         }
@@ -594,6 +598,7 @@ mod fast_exp_cuda {
                     input_ptr,
                     output_ptr,
                     numel,
+                    stream.cu_stream() as *mut c_void,
                 );
             }
         }
@@ -685,6 +690,7 @@ mod fast_exp_cuda {
                     input_ptr,
                     output_ptr,
                     numel,
+                    stream.cu_stream() as *mut c_void,
                 );
             }
         }

@@ -594,6 +594,15 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     // gap between this and the caller's own forward span is where a per-row copy
     // off the wave arena hid 76% of a 128-slot decode step.
     let g_sweep = gpu_span("wv:sweep", dev);
+    // The sweep runs as a chain of graphs (`docs/decode_graphs.md`): its
+    // launches are recorded and handed to the driver one segment at a time,
+    // each segment ending where the forward meets the device eagerly — the MoE
+    // host protocol, an upload, a readback. A failed sweep drops the capture,
+    // discarding the segment it was recording; the rollback below runs eagerly.
+    let capture = match dev {
+        Device::Cuda(cuda) => Some(cuda.begin_wave_capture()?),
+        _ => None,
+    };
     let wave = model.sweep(
         session,
         WaveGroups {
@@ -611,6 +620,10 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
             act_dtype,
         },
     );
+    let wave = match (wave, capture) {
+        (Ok(v), Some(capture)) => capture.finish().map(|()| v),
+        (wave, _) => wave,
+    };
     g_sweep.end();
     // **A failed wave leaves no trace.** The layer sweep advances each layer's
     // usage as that layer completes, so an error anywhere in it — and the relief

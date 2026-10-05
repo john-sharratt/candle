@@ -46,6 +46,8 @@ use super::warm_tier::WarmTier;
 use crate::models::profile::ProfileSnapshot;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::Q8a128Operand;
+#[cfg(feature = "cuda")]
+use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::Int8Mode;
 #[cfg(feature = "cuda")]
 use candle::{DType, LiveTensor};
@@ -907,7 +909,7 @@ impl ExpertCache {
             all_resident,
             promo,
             stats.clone(),
-        );
+        )?;
         let pipeline_dead = Arc::new(AtomicBool::new(false));
         let tx = spawn_pipeline_thread(state, pipeline_dead.clone());
 
@@ -941,8 +943,8 @@ impl ExpertCache {
     /// `acts` is the layer's q8a128 activation `[n_tokens, hidden]`; `weights`
     /// and `indices` are the router's `[n_tokens, k]` output (f32, u32), still
     /// on the device. Returns the routed sum `[n_tokens, hidden]` at
-    /// `out_dtype`. Tokens `[0, decode_tokens)` are decode rows, which the
-    /// residency scoring weights apart from prefill rows.
+    /// `out_dtype`. The tokens in `decode` are decode rows, which the residency
+    /// scoring weights apart from prompt rows.
     ///
     /// Never waits on the host: the layer is enqueued, its routing is handed to
     /// the pipeline thread and the stager, and the call returns. The GPU waits
@@ -956,7 +958,7 @@ impl ExpertCache {
         weights: &LiveTensor<'_>,
         indices: &LiveTensor<'_>,
         row: usize,
-        decode_tokens: usize,
+        decode: &DecodeRows,
         out_dtype: DType,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
@@ -967,7 +969,7 @@ impl ExpertCache {
             weights,
             indices,
             row,
-            decode_tokens,
+            decode,
             out_dtype,
             wave,
         )

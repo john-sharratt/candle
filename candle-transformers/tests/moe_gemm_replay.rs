@@ -213,7 +213,7 @@ fn analyse_operand(
     let stream = cu.cuda_stream();
     let (sp, _sg) = src.device_ptr(&stream);
     let (dp, _dg) = dst.device_ptr(&stream);
-    dequantize_flat_into(sp, dp, n, QTYPE_Q8A128V);
+    dequantize_flat_into(sp, dp, n, QTYPE_Q8A128V, &stream);
     stream.synchronize().map_err(candle::Error::wrap)?;
     let vals = cu.memcpy_dtov(&dst).map_err(candle::Error::wrap)?;
 
@@ -317,7 +317,7 @@ fn scan_all_experts(r: &Replay, cu: &candle::cuda_backend::CudaDevice) -> Result
         };
         let src = cu.memcpy_stod(&bytes).map_err(candle::Error::wrap)?;
         let (sp, _sg) = src.device_ptr(&stream);
-        candle::tensor_assert::scratch::dequantize_into(sp, dp, &shape, w_dtype)?;
+        candle::tensor_assert::scratch::dequantize_into(sp, dp, &shape, w_dtype, &stream)?;
         stream.synchronize().map_err(candle::Error::wrap)?;
         let v = cu.memcpy_dtov(&dst).map_err(candle::Error::wrap)?;
         let bad = v.iter().any(|x| !x.is_finite());
@@ -499,7 +499,7 @@ fn analyse_tiles(
             let stream = cu.cuda_stream();
             let (sp, _sg) = src.device_ptr(&stream);
             let (dp, _dg) = dst.device_ptr(&stream);
-            candle::tensor_assert::scratch::dequantize_into(sp, dp, &shape, w_dtype)?;
+            candle::tensor_assert::scratch::dequantize_into(sp, dp, &shape, w_dtype, &stream)?;
             stream.synchronize().map_err(candle::Error::wrap)?;
             let v = cu.memcpy_dtov(&dst).map_err(candle::Error::wrap)?;
             let nan = v.iter().filter(|x| x.is_nan()).count();

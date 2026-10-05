@@ -48,9 +48,10 @@ fn registry() -> &'static Mutex<HashMap<usize, Arc<SplitKScratch>>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The registry key of a device handle's stream.
+/// The registry key of a device handle's stream — its compute stream, which a
+/// launch recorded into a wave capture also executes on.
 fn stream_key(device: &CudaDevice) -> usize {
-    Arc::as_ptr(&device.cuda_stream()) as usize
+    Arc::as_ptr(&device.compute_stream()) as usize
 }
 
 /// This device stream's scratch, which [`ensure_split_k_scratch`] created when a KO matmul was
@@ -159,6 +160,7 @@ pub(crate) fn q8a128_dense_matmul_split_k<'w>(
                 splits as i32,
                 ws_ptr as *mut f32,
                 ctr_ptr as *mut u32,
+                stream.cu_stream() as *mut c_void,
             )
         };
         check_matmul_status(status, "q8a128 split-K matmul")

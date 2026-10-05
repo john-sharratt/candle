@@ -293,7 +293,7 @@ fn try_assert_device_quant(
     }
     let stream = device.cuda_stream();
     scratch::with_f32_scratch(device, elem_count, |scratch_ptr| {
-        scratch::dequantize_flat_into(ptr, scratch_ptr, elem_count, qtype);
+        scratch::dequantize_flat_into(ptr, scratch_ptr, elem_count, qtype, &stream);
         slots::with_slots(device, |sl| {
             let slot = sl.slot_ptr(slot_idx, &stream);
             let seq = sl.seq_ptr(&stream);
@@ -324,8 +324,9 @@ fn try_assert_device_quant(
 /// view distinguishes them. Dequant stages through a per-device grow-to-fit
 /// scratch (see [`scratch`]) rather than allocating per call.
 ///
-/// Runs the dequant kernels on the default stream, so this belongs at load time
-/// or an epoch boundary, not inside a wave. Prefer
+/// Runs the dequant kernels on the device's launch stream into a shared scratch
+/// buffer that may grow, so this belongs at load time or an epoch boundary, not
+/// inside a wave. Prefer
 /// [`LiveQTensor::assert_once`].
 pub fn assert_qtensor(q: &LiveQTensor<'_>, name: &str) {
     if let Err(e) = try_assert_qtensor(q, name) {
@@ -363,7 +364,7 @@ fn try_assert_qtensor(q: &LiveQTensor<'_>, name: &str) -> Result<()> {
 
     scratch::with_f32_scratch(&dev, elem_count, |scratch_ptr| {
         let src = cuda.data_ptr();
-        scratch::dequantize_into(src, scratch_ptr, q.shape(), dtype)?;
+        scratch::dequantize_into(src, scratch_ptr, q.shape(), dtype, &stream)?;
         slots::with_slots(&dev, |sl| {
             let slot = sl.slot_ptr(slot_idx, &stream);
             let seq = sl.seq_ptr(&stream);

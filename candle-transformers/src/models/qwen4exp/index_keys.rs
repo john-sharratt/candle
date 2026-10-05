@@ -24,7 +24,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use candle::cuda_backend::cudarc::driver::result::memcpy_htod_async;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{claim_arena_slots, relocate_tensor, ArenaSlot, SlotTenant};
 
@@ -243,11 +242,14 @@ pub(super) fn write_host(dst: &Tensor, vals: &[f32]) -> Result<()> {
     }
     match dst.device() {
         Device::Cuda(cuda) => {
-            // SAFETY: `dst` is a live, dense F32 buffer of at least `vals.len()`
-            // elements. From pageable memory the driver has staged the bytes
-            // before this returns, so `vals` may go.
-            unsafe { memcpy_htod_async(tensor_ptr(dst)?, vals, cuda.cuda_stream().cu_stream()) }
-                .map_err(|e| candle::Error::Msg(format!("qsa index upload: {e}")))
+            // `dst` is a live, dense F32 buffer of at least `vals.len()`
+            // elements; the upload returns once `vals` is staged, so it may go.
+            //
+            // SAFETY: `vals` is plain f32s.
+            let raw = unsafe {
+                std::slice::from_raw_parts(vals.as_ptr() as *const u8, std::mem::size_of_val(vals))
+            };
+            cuda.upload_raw(tensor_ptr(dst)?, raw)
         }
         dev => {
             let (_, d) = dst.dims2()?;

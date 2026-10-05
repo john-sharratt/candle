@@ -90,6 +90,14 @@ pub struct PipelineStats {
     /// Routed layers the pipeline thread has processed — one per MoE layer per
     /// forward.
     pub routed_messages: usize,
+    /// Invocations the device had begun past the one being served, summed over
+    /// routed layers: over `routed_messages`, how far the pipeline thread trails
+    /// the GPU. Its ring stock reaches only the invocations that begin after it.
+    pub pipeline_lag: u64,
+    /// Ring slots bucketize gave remote experts, as collected from its log.
+    pub ring_taken: usize,
+    /// Misses bucketize had no ring slot for — the copy engine's to promote.
+    pub ring_unslotted: usize,
     /// **Live** VRAM bytes held by resident expert slots — `occupied_slots ×
     /// slot_size`. Unlike the counters above (monotonic tallies), this is a
     /// gauge: it rises as experts load into VRAM and falls as they stream out
@@ -166,6 +174,9 @@ impl PipelineStats {
             s.predicted_total = 0;
             s.late_loads = 0;
             s.routed_messages = 0;
+            s.pipeline_lag = 0;
+            s.ring_taken = 0;
+            s.ring_unslotted = 0;
         }
     }
 

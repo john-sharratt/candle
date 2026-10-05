@@ -97,6 +97,8 @@ pub mod span_geometry;
 /// stashes, gallery pages, QSA index pages. The bookkeeping is host arithmetic and
 /// tested anywhere; the pool that claims regions is CUDA-only.
 pub mod tenant_arena;
+/// The chunked cache's core types: sealed sequences and chunks, and their
+/// per-chunk metadata.
 mod types;
 // Instrumentation for the bump arenas' high-water marks: its only caller is
 // `bump_arena`, so it shares that module's gating.

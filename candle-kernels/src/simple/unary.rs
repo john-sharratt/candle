@@ -102,6 +102,7 @@ extern "C" {
         info: *const usize,
         inp: *const c_void,
         out: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatches to the appropriate parametric unary kernel (elu, powf).
@@ -127,6 +128,7 @@ extern "C" {
         info: *const usize,
         inp: *const c_void,
         out: *mut c_void,
+        stream: *mut c_void,
     );
 }
 

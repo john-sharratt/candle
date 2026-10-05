@@ -20,6 +20,7 @@
 //! call takes ownership last.
 
 use candle::quantized::cuda::DynamicActs;
+use candle::quantized::decode_rows::DecodeRows;
 use candle::{DType, LiveTensor, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
 use candle_nn::ops::sigmoid;
@@ -129,14 +130,12 @@ impl Qwen35MoeBlock {
         &self,
         acts: DynamicActs<'w>,
         out_dtype: DType,
-        decode_tokens: usize,
+        decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<MoeParts<'w>> {
         // Shared expert first — see the module note on ownership.
         let shared = shared_expert_parts(&self.shared, &self.shared_gate, &acts, out_dtype)?;
-        let routed = self
-            .routed
-            .forward_dynamic(acts, out_dtype, decode_tokens, wave)?;
+        let routed = self.routed.forward_dynamic(acts, out_dtype, decode, wave)?;
         Ok(MoeParts { routed, shared })
     }
 
@@ -153,11 +152,10 @@ impl Qwen35MoeBlock {
         x: &mut Tensor,
         acts: DynamicActs<'w>,
         work_dtype: DType,
-        decode_tokens: usize,
+        decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<()> {
-        let MoeParts { routed, shared } =
-            self.forward_parts(acts, work_dtype, decode_tokens, wave)?;
+        let MoeParts { routed, shared } = self.forward_parts(acts, work_dtype, decode, wave)?;
         // The values the layer's output is made of, checked where they are
         // still separable — the routed sum, the shared expert and its gate apart,
         // then the residual they land in. Bad on an input names the addend; bad

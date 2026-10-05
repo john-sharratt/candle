@@ -139,14 +139,15 @@ extern "C" void add_at_indices_f32(
     const uint32_t* indices,
     const size_t num_indices,
     const float value,
-    const size_t stride
+    const size_t stride,
+    void* stream
 ) {
     if (num_indices == 0) return;
     
     const int block_size = BLOCK_SIZE;
     const int num_blocks = (num_indices + block_size - 1) / block_size;
     
-    add_at_indices_f32_kernel<<<num_blocks, block_size>>>(
+    add_at_indices_f32_kernel<<<num_blocks, block_size, 0, (cudaStream_t)stream>>>(
         data, indices, num_indices, value, stride
     );
 }
@@ -156,14 +157,15 @@ extern "C" void add_at_indices_f16(
     const uint32_t* indices,
     const size_t num_indices,
     const half value,
-    const size_t stride
+    const size_t stride,
+    void* stream
 ) {
     if (num_indices == 0) return;
     
     const int block_size = BLOCK_SIZE;
     const int num_blocks = (num_indices + block_size - 1) / block_size;
     
-    add_at_indices_f16_kernel<<<num_blocks, block_size>>>(
+    add_at_indices_f16_kernel<<<num_blocks, block_size, 0, (cudaStream_t)stream>>>(
         data, indices, num_indices, value, stride
     );
 }
@@ -173,14 +175,15 @@ extern "C" void add_at_indices_bf16(
     const uint32_t* indices,
     const size_t num_indices,
     const __nv_bfloat16 value,
-    const size_t stride
+    const size_t stride,
+    void* stream
 ) {
     if (num_indices == 0) return;
     
     const int block_size = BLOCK_SIZE;
     const int num_blocks = (num_indices + block_size - 1) / block_size;
     
-    add_at_indices_bf16_kernel<<<num_blocks, block_size>>>(
+    add_at_indices_bf16_kernel<<<num_blocks, block_size, 0, (cudaStream_t)stream>>>(
         data, indices, num_indices, value, stride
     );
 }
@@ -190,14 +193,15 @@ extern "C" void add_at_indices_f64(
     const uint32_t* indices,
     const size_t num_indices,
     const double value,
-    const size_t stride
+    const size_t stride,
+    void* stream
 ) {
     if (num_indices == 0) return;
     
     const int block_size = BLOCK_SIZE;
     const int num_blocks = (num_indices + block_size - 1) / block_size;
     
-    add_at_indices_f64_kernel<<<num_blocks, block_size>>>(
+    add_at_indices_f64_kernel<<<num_blocks, block_size, 0, (cudaStream_t)stream>>>(
         data, indices, num_indices, value, stride
     );
 }

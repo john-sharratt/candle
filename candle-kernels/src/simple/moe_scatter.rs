@@ -3,6 +3,10 @@
 //! These are batched operations that process ALL experts in a single kernel
 //! launch, replacing multiple Tensor ops (index_select, broadcast_mul,
 //! index_add) with one fused kernel.
+//!
+//! Every launcher takes the `cudaStream_t` it launches on: the device's compute
+//! stream for an eager launch, a capture stream when the launch is being
+//! recorded into a graph (`docs/decode_graphs.md` §0.3).
 
 use std::ffi::c_void;
 
@@ -32,6 +36,7 @@ extern "C" {
         token_ids: *const u32,
         total_rows: usize,
         hidden_dim: usize,
+        stream: *mut c_void,
     );
 
     /// Fused router: softmax + top-k select + (optional) renormalize, one thread per token.
@@ -54,6 +59,7 @@ extern "C" {
         n_experts: i32,
         k: i32,
         norm_topk: i32,
+        stream: *mut c_void,
     );
 
     /// Deterministic scatter: sequential per-token reduce, no atomicAdd.
@@ -83,5 +89,6 @@ extern "C" {
         token_starts: *const i32,
         num_tokens: i32,
         hidden: i32,
+        stream: *mut c_void,
     );
 }

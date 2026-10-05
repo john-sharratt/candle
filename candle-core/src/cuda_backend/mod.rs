@@ -123,6 +123,7 @@ use std::sync::Arc;
 pub mod cudnn;
 mod device;
 mod error;
+pub mod graph;
 mod info_ring;
 pub mod staged;
 mod utils;
@@ -469,6 +470,7 @@ fn run_affine_ffi(
                         out_ptr as *mut std::ffi::c_void,
                         mul,
                         add,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -556,6 +558,7 @@ fn run_unary_param_ffi(
                         info_ptr,
                         src_ptr as *const std::ffi::c_void,
                         out_ptr as *mut std::ffi::c_void,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -784,6 +787,7 @@ impl Map1Any for FastReduce<'_> {
                         ds_ptr as *const usize,
                         src_ptr as *const std::ffi::c_void,
                         out_ptr as *mut u32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -813,6 +817,7 @@ impl Map1Any for FastReduce<'_> {
                         ds_ptr as *const usize,
                         src_ptr as *const std::ffi::c_void,
                         out_ptr as *mut std::ffi::c_void,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -989,6 +994,7 @@ impl<U: UnaryOpT> Map1 for U {
                             info_ptr,
                             src_ptr as *const std::ffi::c_void,
                             out_ptr as *mut std::ffi::c_void,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -1082,6 +1088,7 @@ impl Map1 for IndexSelect<'_> {
                             src_dim_size,
                             ids_dim_size,
                             right_size,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                     ptr
@@ -1103,6 +1110,7 @@ impl Map1 for IndexSelect<'_> {
                             src_dim_size,
                             ids_dim_size,
                             right_size,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                     ptr
@@ -1124,6 +1132,7 @@ impl Map1 for IndexSelect<'_> {
                             src_dim_size,
                             ids_dim_size,
                             right_size,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                     ptr
@@ -1202,6 +1211,7 @@ impl Map1 for Gather<'_> {
                             src_dim_sz,
                             ids_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -1220,6 +1230,7 @@ impl Map1 for Gather<'_> {
                             src_dim_sz,
                             ids_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -1238,6 +1249,7 @@ impl Map1 for Gather<'_> {
                             src_dim_sz,
                             ids_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -1317,6 +1329,7 @@ impl Map2InPlace for IndexAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         )
                     }
                 }
@@ -1335,6 +1348,7 @@ impl Map2InPlace for IndexAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         )
                     }
                 }
@@ -1353,6 +1367,7 @@ impl Map2InPlace for IndexAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         )
                     }
                 }
@@ -1443,6 +1458,7 @@ impl Map2InPlace for Scatter<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         )
                     }
                 }
@@ -1460,6 +1476,7 @@ impl Map2InPlace for Scatter<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         )
                     }
                 }
@@ -1477,6 +1494,7 @@ impl Map2InPlace for Scatter<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         )
                     }
                 }
@@ -1555,6 +1573,7 @@ impl Map2InPlace for ScatterAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         )
                     }
                 }
@@ -1572,6 +1591,7 @@ impl Map2InPlace for ScatterAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         )
                     }
                 }
@@ -1589,6 +1609,7 @@ impl Map2InPlace for ScatterAdd<'_> {
                             src_dim_sz,
                             dst_dim_sz,
                             right_sz,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         )
                     }
                 }
@@ -2168,6 +2189,7 @@ impl Map2 for WhereCond<'_> {
                             t_ptr as *const std::ffi::c_void,
                             f_ptr as *const std::ffi::c_void,
                             out_ptr as *mut std::ffi::c_void,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -2185,6 +2207,7 @@ impl Map2 for WhereCond<'_> {
                             t_ptr as *const std::ffi::c_void,
                             f_ptr as *const std::ffi::c_void,
                             out_ptr as *mut std::ffi::c_void,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -2202,6 +2225,7 @@ impl Map2 for WhereCond<'_> {
                             t_ptr as *const std::ffi::c_void,
                             f_ptr as *const std::ffi::c_void,
                             out_ptr as *mut std::ffi::c_void,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -2316,6 +2340,7 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
                             lhs_ptr as *const std::ffi::c_void,
                             rhs_ptr as *const std::ffi::c_void,
                             out_ptr as *mut std::ffi::c_void,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -2405,6 +2430,7 @@ impl Map2Any for Cmp {
                     lhs_ptr as *const std::ffi::c_void,
                     rhs_ptr as *const std::ffi::c_void,
                     out_ptr as *mut u8,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -2526,7 +2552,14 @@ impl Drop for CudaStorage {
         // state which side it falls on here, instead of silently inheriting the
         // free path and releasing memory the storage does not own.
         match self.backing {
-            Backing::Owned => return,
+            Backing::Owned => {
+                // A free is refused while this thread records a wave, and the
+                // memory may still be read by a recorded launch: it is freed
+                // once that launch has been issued.
+                let slice = std::mem::replace(&mut self.slice, CudaStorageSlice::Moved);
+                self.device.retire(slice);
+                return;
+            }
             Backing::Lease(_) => {}
         }
         std::mem::replace(&mut self.slice, CudaStorageSlice::Moved).leak_view();
@@ -2551,7 +2584,7 @@ impl CudaStorage {
         device: &CudaDevice,
         origin: LeaseOrigin,
     ) -> Result<Self> {
-        let stream = device.cuda_stream();
+        let stream = device.compute_stream();
         let slice = match dtype {
             DType::U8 => CudaStorageSlice::U8(stream.upgrade_device_ptr::<u8>(ptr, len)),
             DType::U32 => CudaStorageSlice::U32(stream.upgrade_device_ptr::<u32>(ptr, len)),
@@ -2659,7 +2692,7 @@ macro_rules! cuda_dtype {
                 device: CudaDevice,
                 origin: LeaseOrigin,
             ) -> CudaStorage {
-                let slice = device.cuda_stream().upgrade_device_ptr::<Self>(ptr, len);
+                let slice = device.compute_stream().upgrade_device_ptr::<Self>(ptr, len);
                 CudaStorage {
                     slice: CudaStorageSlice::$dtype(slice),
                     device,
@@ -2731,7 +2764,9 @@ pub unsafe fn alloc_inheriting<T: DeviceRepr>(
         // stream-ordered pool never allocated — so the driver rejects it and
         // nothing is freed. That is what makes the window between here and
         // the caller stamping `Backing::Lease` harmless.
-        let slice = dev.cuda_stream().upgrade_device_ptr::<T>(ptr, elem_count);
+        let slice = dev
+            .compute_stream()
+            .upgrade_device_ptr::<T>(ptr, elem_count);
         let ticket = ticket.expect("a carved range implies a ticket");
         return Ok((slice, Backing::Lease(LeaseOrigin::Wave(ticket))));
     }
@@ -2919,6 +2954,7 @@ impl CudaStorage {
                         num_indices,
                         value,
                         1usize,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -2934,6 +2970,7 @@ impl CudaStorage {
                         num_indices,
                         value_f16,
                         1usize,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -2949,6 +2986,7 @@ impl CudaStorage {
                         num_indices,
                         value_bf16,
                         1usize,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -2963,6 +3001,7 @@ impl CudaStorage {
                         num_indices,
                         value as f64,
                         1usize,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
             }
@@ -3015,6 +3054,7 @@ impl CudaStorage {
                 value,
                 value as f64,
                 1, // stride
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
 
@@ -3090,6 +3130,7 @@ impl CudaStorage {
                 indices_ptr as *const u32,
                 values_ptr,
                 num_indices,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
 
@@ -3185,6 +3226,7 @@ impl CudaStorage {
                 value,
                 value as f64,
                 1, // stride
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
 
@@ -3232,6 +3274,7 @@ impl CudaStorage {
                 value,
                 value as f64,
                 1, // stride
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
 
@@ -3356,7 +3399,13 @@ impl CudaStorage {
         let buf_ptr = self.slice.device_ptr_mut(&stream)?;
 
         unsafe {
-            kernels::simple::cast::run_cast_mut(src_dtype_i32, dst_dtype_i32, elem_count, buf_ptr);
+            kernels::simple::cast::run_cast_mut(
+                src_dtype_i32,
+                dst_dtype_i32,
+                elem_count,
+                buf_ptr,
+                stream.cu_stream() as *mut std::ffi::c_void,
+            );
         }
 
         // Now we need to "reinterpret" the slice as the new dtype.
@@ -3547,6 +3596,8 @@ impl CudaStorage {
     {
         use cudarc::driver::DeviceSlice;
 
+        // A readback must see everything recorded before it.
+        let _eager = self.device.pause_capture()?;
         match &self.slice {
             CudaStorageSlice::U8(slice) if T::DTYPE == DType::U8 => {
                 // Create a slice of just one element
@@ -3856,6 +3907,7 @@ impl BackendStorage for CudaStorage {
                 info_ptr,
                 value_bits,
                 out_ptr as *mut std::ffi::c_void,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
         Ok(())
@@ -3937,6 +3989,7 @@ impl BackendStorage for CudaStorage {
                                 info_ptr,
                                 inp_ptr as *const std::ffi::c_void,
                                 out_ptr as *mut std::ffi::c_void,
+                                stream.cu_stream() as *mut std::ffi::c_void,
                             );
                         }
                     }
@@ -4342,6 +4395,7 @@ impl BackendStorage for CudaStorage {
                     info_ptr,
                     lhs_ptr_offset,
                     rhs_ptr,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -4350,6 +4404,8 @@ impl BackendStorage for CudaStorage {
     }
 
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
+        // A readback must see everything recorded before it.
+        let _eager = self.device.pause_capture()?;
         match &self.slice {
             CudaStorageSlice::U8(slice) => {
                 let cpu_storage = slice.stream().memcpy_dtov(slice).w()?;
@@ -5023,7 +5079,7 @@ impl BackendStorage for CudaStorage {
                     && (rhs_l.start_offset() * 2).is_multiple_of(16);
                 unsafe {
                     gemm_strided_batched_bf16(
-                        &self.device.blas,
+                        self.device.cublas()?,
                         cfg,
                         rhs,
                         lhs,
@@ -5046,7 +5102,7 @@ impl BackendStorage for CudaStorage {
                     && (rhs_l.start_offset() * 2).is_multiple_of(16);
                 unsafe {
                     gemm_strided_batched_f16(
-                        &self.device.blas,
+                        self.device.cublas()?,
                         cfg,
                         rhs,
                         lhs,
@@ -5069,7 +5125,7 @@ impl BackendStorage for CudaStorage {
                     && (rhs_l.start_offset() * 4).is_multiple_of(16);
                 unsafe {
                     gemm_strided_batched_f32(
-                        &self.device.blas,
+                        self.device.cublas()?,
                         cfg,
                         rhs,
                         lhs,
@@ -5089,7 +5145,7 @@ impl BackendStorage for CudaStorage {
                 out_backing = resolved;
                 unsafe {
                     self.device
-                        .blas
+                        .cublas()?
                         .gemm_strided_batched(cfg, rhs, lhs, &mut out)
                 }
                 .w()?;
@@ -5149,6 +5205,7 @@ impl BackendStorage for CudaStorage {
                         d2,
                         src_s,
                         dst_s,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
                 Ok(())
@@ -5167,6 +5224,7 @@ impl BackendStorage for CudaStorage {
                         d2,
                         src_s,
                         dst_s,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
                 Ok(())
@@ -5185,6 +5243,7 @@ impl BackendStorage for CudaStorage {
                         d2,
                         src_s,
                         dst_s,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
                 Ok(())
@@ -5203,6 +5262,7 @@ impl BackendStorage for CudaStorage {
                         d2,
                         src_s,
                         dst_s,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
                 Ok(())
@@ -5221,6 +5281,7 @@ impl BackendStorage for CudaStorage {
                         d2,
                         src_s,
                         dst_s,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
                 Ok(())
@@ -5239,6 +5300,7 @@ impl BackendStorage for CudaStorage {
                         d2,
                         src_s,
                         dst_s,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
                 Ok(())
@@ -5257,6 +5319,7 @@ impl BackendStorage for CudaStorage {
                         d2,
                         src_s,
                         dst_s,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
                 Ok(())
@@ -5275,6 +5338,7 @@ impl BackendStorage for CudaStorage {
                         d2,
                         src_s,
                         dst_s,
+                        stream.cu_stream() as *mut std::ffi::c_void,
                     );
                 }
                 Ok(())
@@ -5320,6 +5384,7 @@ impl BackendStorage for CudaStorage {
                             info_ptr as *const usize,
                             src_ptr as *const std::ffi::c_void,
                             dst_ptr as *mut std::ffi::c_void,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }

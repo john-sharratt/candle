@@ -34,6 +34,7 @@
 
 #include "../fast_exp.cuh"
 #include "../arena_table.cuh"
+#include "../grow_scratch.cuh"
 #include "../simple/warp_reduce.cuh"
 #include "../convert/convert_all.cuh"
 #include "../blocks.cuh"
@@ -2166,46 +2167,25 @@ inline int fused_attn_sm_count() {
     return sm;
 }
 
-// Grow-on-demand device scratch for split-KV partials. Persistent (never freed),
-// reused across launches; allocation happens on the first split launch / on a
-// grow, never in the steady-state timed path. Single-stream decode only (the
-// pool is process-global, not per-stream).
+// Grow-on-demand device scratch for split-KV partials, reused across launches
+// and grown with `grow_scratch` (safe while the thread records a graph; the
+// replaced block is kept, not freed). Single-stream decode only (the pool is
+// process-global, not per-stream).
 inline void fused_attn_partial_pool(
-    int64_t rows, int splits, int head_dim, float** acc_out, float** ml_out,
-    cudaStream_t stream
+    int64_t rows, int splits, int head_dim, float** acc_out, float** ml_out
 ) {
-    static float* g_acc = nullptr;
-    static float* g_ml  = nullptr;
-    static int64_t g_cap_acc = 0;  // capacity in floats
-    static int64_t g_cap_ml  = 0;
-    int64_t need_acc = rows * splits * head_dim;
-    int64_t need_ml  = rows * splits * 2;
-    if (need_acc > g_cap_acc) {
-        if (g_acc) {
-            // Drain the stream before freeing: cudaFree is not stream-ordered,
-            // and an earlier split launch on this stream may still be writing
-            // the old pool. Growth is rare (a new high-water row count), so
-            // the sync cost is amortized away.
-            cudaStreamSynchronize(stream);
-            cudaFree(g_acc);
-        }
-        if (cudaMalloc(&g_acc, (size_t)need_acc * sizeof(float)) != cudaSuccess) {
-            g_acc = nullptr; g_cap_acc = 0; *acc_out = nullptr; *ml_out = nullptr; return;
-        }
-        g_cap_acc = need_acc;
+    static void* g_acc = nullptr;
+    static void* g_ml  = nullptr;
+    static size_t g_cap_acc = 0;  // capacity in bytes
+    static size_t g_cap_ml  = 0;
+    size_t need_acc = (size_t)(rows * splits * head_dim) * sizeof(float);
+    size_t need_ml  = (size_t)(rows * splits * 2) * sizeof(float);
+    if (grow_scratch(&g_acc, &g_cap_acc, need_acc) != cudaSuccess ||
+        grow_scratch(&g_ml, &g_cap_ml, need_ml) != cudaSuccess) {
+        *acc_out = nullptr; *ml_out = nullptr; return;
     }
-    if (need_ml > g_cap_ml) {
-        if (g_ml) {
-            cudaStreamSynchronize(stream);
-            cudaFree(g_ml);
-        }
-        if (cudaMalloc(&g_ml, (size_t)need_ml * sizeof(float)) != cudaSuccess) {
-            g_ml = nullptr; g_cap_ml = 0; *acc_out = nullptr; *ml_out = nullptr; return;
-        }
-        g_cap_ml = need_ml;
-    }
-    *acc_out = g_acc;
-    *ml_out  = g_ml;
+    *acc_out = (float*)g_acc;
+    *ml_out  = (float*)g_ml;
 }
 
 // Returns 0 on success, 1 when the split-KV partial pool could not be
@@ -2312,7 +2292,7 @@ int launch_int8_decode_attn(
             float* pa = nullptr;
             float* pm = nullptr;
             fused_attn_partial_pool((int64_t)num_active_slots * n_q_head, splits,
-                                    HEAD_DIM, &pa, &pm, stream);
+                                    HEAD_DIM, &pa, &pm);
             if (pa == nullptr || pm == nullptr) {
                 return 1;
             }
@@ -2385,7 +2365,7 @@ int launch_int8_decode_attn(
         float* pm = nullptr;
         if (need_pool) {
             fused_attn_partial_pool((int64_t)num_active_slots * n_q_head, partials_per_row,
-                                    HEAD_DIM, &pa, &pm, stream);
+                                    HEAD_DIM, &pa, &pm);
             if (pa == nullptr || pm == nullptr) {
                 return 1;
             }

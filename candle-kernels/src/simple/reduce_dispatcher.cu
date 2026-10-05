@@ -30,12 +30,6 @@ using fast_arg_reduce_fn_t = void (*)(
     const void* src, uint32_t* dst
 );
 
-// Signature type for sum op (with atomicAdd)
-using sum_fn_t = void (*)(
-    size_t numel, size_t num_dims, size_t num_sum_dims,
-    const size_t* info, const void* inp, void* out
-);
-
 // Signature type for softmax
 using softmax_fn_t = void (*)(
     const void* src, void* dst, int n_cols
@@ -133,11 +127,11 @@ extern "C" void fast_argmax_f8_e4m3(size_t, size_t, size_t, const size_t*, const
 // =============================================================================
 // SUM kernels (with atomicAdd)
 // =============================================================================
-extern "C" void sum_f32(size_t, size_t, size_t, const size_t*, const float*, float*);
-extern "C" void sum_f64(size_t, size_t, size_t, const size_t*, const double*, double*);
-extern "C" void sum_u32(size_t, size_t, size_t, const size_t*, const uint32_t*, uint32_t*);
-extern "C" void sum_f16(size_t, size_t, size_t, const size_t*, const void*, void*);
-extern "C" void sum_bf16(size_t, size_t, size_t, const size_t*, const void*, void*);
+extern "C" __global__ void sum_f32(size_t, size_t, size_t, const size_t*, const float*, float*);
+extern "C" __global__ void sum_f64(size_t, size_t, size_t, const size_t*, const double*, double*);
+extern "C" __global__ void sum_u32(size_t, size_t, size_t, const size_t*, const uint32_t*, uint32_t*);
+extern "C" __global__ void sum_f16(size_t, size_t, size_t, const size_t*, const void*, void*);
+extern "C" __global__ void sum_bf16(size_t, size_t, size_t, const size_t*, const void*, void*);
 
 // =============================================================================
 // SOFTMAX kernels
@@ -223,21 +217,26 @@ extern "C" void run_sum_op(
     size_t num_sum_dims,
     const size_t* info,
     const void* inp,
-    void* out
+    void* out,
+    void* stream
 ) {
-    static sum_fn_t kernels[NUM_SUM_DTYPES] = {
-        (sum_fn_t)sum_f32,
-        (sum_fn_t)sum_f64,
-        (sum_fn_t)sum_f16,
-        (sum_fn_t)sum_bf16,
-        (sum_fn_t)sum_u32,
-    };
+    // An empty sum has nothing to write — and a zero-sized grid is a launch
+    // error that would otherwise surface at whatever op checks next.
+    if (numel == 0) {
+        return;
+    }
+    // The sum kernels stride over the grid, so any grid covers every element;
+    // one thread per element up to 1024-thread blocks.
+    const int block_dim = 1024;
+    const int grid_dim = (int)((numel + block_dim - 1) / block_dim);
+    cudaStream_t s = (cudaStream_t)stream;
 
-    if (dtype >= 0 && dtype < NUM_SUM_DTYPES) {
-        sum_fn_t fn = kernels[dtype];
-        if (fn != nullptr) {
-            fn(numel, num_dims, num_sum_dims, info, inp, out);
-        }
+    switch (dtype) {
+        case 0: sum_f32<<<grid_dim, block_dim, 0, s>>>(numel, num_dims, num_sum_dims, info, (const float*)inp, (float*)out); break;
+        case 1: sum_f64<<<grid_dim, block_dim, 0, s>>>(numel, num_dims, num_sum_dims, info, (const double*)inp, (double*)out); break;
+        case 2: sum_f16<<<grid_dim, block_dim, 0, s>>>(numel, num_dims, num_sum_dims, info, inp, out); break;
+        case 3: sum_bf16<<<grid_dim, block_dim, 0, s>>>(numel, num_dims, num_sum_dims, info, inp, out); break;
+        case 4: sum_u32<<<grid_dim, block_dim, 0, s>>>(numel, num_dims, num_sum_dims, info, (const uint32_t*)inp, (uint32_t*)out); break;
     }
 }
 
@@ -249,27 +248,29 @@ extern "C" void run_softmax_op(
     const void* src,
     void* dst,
     int n_rows,
-    int n_cols
+    int n_cols,
+    void* stream
 ) {
     // Launch configuration: one block per row, 32 threads per block
     dim3 grid(n_rows, 1, 1);
     dim3 block(1, 32, 1);
-    
+    cudaStream_t s = (cudaStream_t)stream;
+
     switch (dtype) {
         case 0: // F32
-            softmax_f32<<<grid, block>>>((const float*)src, (float*)dst, n_cols);
+            softmax_f32<<<grid, block, 0, s>>>((const float*)src, (float*)dst, n_cols);
             break;
         case 1: // F64
-            softmax_f64<<<grid, block>>>((const double*)src, (double*)dst, n_cols);
+            softmax_f64<<<grid, block, 0, s>>>((const double*)src, (double*)dst, n_cols);
             break;
         case 2: // F16
-            softmax_f16<<<grid, block>>>((const __half*)src, (__half*)dst, n_cols);
+            softmax_f16<<<grid, block, 0, s>>>((const __half*)src, (__half*)dst, n_cols);
             break;
         case 3: // BF16
-            softmax_bf16<<<grid, block>>>((const __nv_bfloat16*)src, (__nv_bfloat16*)dst, n_cols);
+            softmax_bf16<<<grid, block, 0, s>>>((const __nv_bfloat16*)src, (__nv_bfloat16*)dst, n_cols);
             break;
         case 4: // F8E4M3
-            softmax_f8_e4m3<<<grid, block>>>((const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst, n_cols);
+            softmax_f8_e4m3<<<grid, block, 0, s>>>((const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst, n_cols);
             break;
     }
 }
@@ -288,7 +289,8 @@ extern "C" void run_rmsnorm_op(
     const void* alpha,
     int n_rows,
     int n_cols,
-    float eps
+    float eps,
+    void* stream
 ) {
     // Launch configuration: one block per row
     // Cap block size to 1024 (CUDA max) - kernel handles striding over columns
@@ -297,26 +299,27 @@ extern "C" void run_rmsnorm_op(
     if (block_size < 32) block_size = 32;
     dim3 grid(n_rows, 1, 1);
     dim3 block(block_size, 1, 1);
-    
+    cudaStream_t s = (cudaStream_t)stream;
+
     // Calculate shared memory size for x_cache
     // Only allocate if ncols fits in cache, otherwise 0
     size_t shared_mem_size = (n_cols <= MAX_CACHED_COLS) ? (n_cols * sizeof(float)) : 0;
-    
+
     switch (dtype) {
         case 0: // F32
-            rmsnorm_f32<<<grid, block, shared_mem_size>>>((const float*)src, (float*)dst, (const float*)alpha, n_cols, block_size, eps);
+            rmsnorm_f32<<<grid, block, shared_mem_size, s>>>((const float*)src, (float*)dst, (const float*)alpha, n_cols, block_size, eps);
             break;
         case 1: // F64
-            rmsnorm_f64<<<grid, block, shared_mem_size>>>((const double*)src, (double*)dst, (const double*)alpha, n_cols, block_size, eps);
+            rmsnorm_f64<<<grid, block, shared_mem_size, s>>>((const double*)src, (double*)dst, (const double*)alpha, n_cols, block_size, eps);
             break;
         case 2: // F16
-            rmsnorm_f16<<<grid, block, shared_mem_size>>>((const __half*)src, (__half*)dst, (const __half*)alpha, n_cols, block_size, eps);
+            rmsnorm_f16<<<grid, block, shared_mem_size, s>>>((const __half*)src, (__half*)dst, (const __half*)alpha, n_cols, block_size, eps);
             break;
         case 3: // BF16
-            rmsnorm_bf16<<<grid, block, shared_mem_size>>>((const __nv_bfloat16*)src, (__nv_bfloat16*)dst, (const __nv_bfloat16*)alpha, n_cols, block_size, eps);
+            rmsnorm_bf16<<<grid, block, shared_mem_size, s>>>((const __nv_bfloat16*)src, (__nv_bfloat16*)dst, (const __nv_bfloat16*)alpha, n_cols, block_size, eps);
             break;
         case 4: // F8E4M3
-            rmsnorm_f8_e4m3<<<grid, block, shared_mem_size>>>((const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst, (const __nv_fp8_e4m3*)alpha, n_cols, block_size, eps);
+            rmsnorm_f8_e4m3<<<grid, block, shared_mem_size, s>>>((const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst, (const __nv_fp8_e4m3*)alpha, n_cols, block_size, eps);
             break;
     }
 }
@@ -336,7 +339,8 @@ extern "C" void run_rmsnorm_q8a128_op(
     int n_rows,
     int n_cols,
     float eps,
-    int sum_norm   // q8a128 Σx convention (`SumScale::as_code()`)
+    int sum_norm,  // q8a128 Σx convention (`SumScale::as_code()`)
+    void* stream
 ) {
     int cap = n_cols < 1024 ? n_cols : 1024;
     int block_size = 32;
@@ -344,16 +348,17 @@ extern "C" void run_rmsnorm_q8a128_op(
     dim3 grid(n_rows, 1, 1);
     dim3 block(block_size, 1, 1);
     size_t shared_mem_size = (size_t)n_cols * sizeof(float);
+    cudaStream_t s = (cudaStream_t)stream;
 
     switch (dtype) {
         case 0: // F32
-            rmsnorm_q8a128_f32<<<grid, block, shared_mem_size>>>((const float*)src, out, (const float*)alpha, n_cols, block_size, eps, sum_norm);
+            rmsnorm_q8a128_f32<<<grid, block, shared_mem_size, s>>>((const float*)src, out, (const float*)alpha, n_cols, block_size, eps, sum_norm);
             break;
         case 2: // F16
-            rmsnorm_q8a128_f16<<<grid, block, shared_mem_size>>>((const __half*)src, out, (const __half*)alpha, n_cols, block_size, eps, sum_norm);
+            rmsnorm_q8a128_f16<<<grid, block, shared_mem_size, s>>>((const __half*)src, out, (const __half*)alpha, n_cols, block_size, eps, sum_norm);
             break;
         case 3: // BF16
-            rmsnorm_q8a128_bf16<<<grid, block, shared_mem_size>>>((const __nv_bfloat16*)src, out, (const __nv_bfloat16*)alpha, n_cols, block_size, eps, sum_norm);
+            rmsnorm_q8a128_bf16<<<grid, block, shared_mem_size, s>>>((const __nv_bfloat16*)src, out, (const __nv_bfloat16*)alpha, n_cols, block_size, eps, sum_norm);
             break;
     }
 }
@@ -369,7 +374,8 @@ extern "C" void run_layernorm_op(
     const void* beta,
     int n_rows,
     int n_cols,
-    float eps
+    float eps,
+    void* stream
 ) {
     // Launch configuration: one block per row
     // Cap block size to 1024 (CUDA max) - kernel handles striding over columns
@@ -378,22 +384,23 @@ extern "C" void run_layernorm_op(
     if (block_size < 32) block_size = 32;
     dim3 grid(n_rows, 1, 1);
     dim3 block(block_size, 1, 1);
-    
+    cudaStream_t s = (cudaStream_t)stream;
+
     switch (dtype) {
         case 0: // F32
-            layernorm_f32<<<grid, block>>>((const float*)src, (float*)dst, (const float*)alpha, (const float*)beta, n_cols, block_size, eps);
+            layernorm_f32<<<grid, block, 0, s>>>((const float*)src, (float*)dst, (const float*)alpha, (const float*)beta, n_cols, block_size, eps);
             break;
         case 1: // F64
-            layernorm_f64<<<grid, block>>>((const double*)src, (double*)dst, (const double*)alpha, (const double*)beta, n_cols, block_size, eps);
+            layernorm_f64<<<grid, block, 0, s>>>((const double*)src, (double*)dst, (const double*)alpha, (const double*)beta, n_cols, block_size, eps);
             break;
         case 2: // F16
-            layernorm_f16<<<grid, block>>>((const __half*)src, (__half*)dst, (const __half*)alpha, (const __half*)beta, n_cols, block_size, eps);
+            layernorm_f16<<<grid, block, 0, s>>>((const __half*)src, (__half*)dst, (const __half*)alpha, (const __half*)beta, n_cols, block_size, eps);
             break;
         case 3: // BF16
-            layernorm_bf16<<<grid, block>>>((const __nv_bfloat16*)src, (__nv_bfloat16*)dst, (const __nv_bfloat16*)alpha, (const __nv_bfloat16*)beta, n_cols, block_size, eps);
+            layernorm_bf16<<<grid, block, 0, s>>>((const __nv_bfloat16*)src, (__nv_bfloat16*)dst, (const __nv_bfloat16*)alpha, (const __nv_bfloat16*)beta, n_cols, block_size, eps);
             break;
         case 4: // F8E4M3
-            layernorm_f8_e4m3<<<grid, block>>>((const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst, (const __nv_fp8_e4m3*)alpha, (const __nv_fp8_e4m3*)beta, n_cols, block_size, eps);
+            layernorm_f8_e4m3<<<grid, block, 0, s>>>((const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst, (const __nv_fp8_e4m3*)alpha, (const __nv_fp8_e4m3*)beta, n_cols, block_size, eps);
             break;
     }
 }
@@ -409,7 +416,8 @@ extern "C" void run_rope_i_op(
     void* dst,
     uint32_t bh,
     uint32_t td,
-    uint32_t stride_b
+    uint32_t stride_b,
+    void* stream
 ) {
     // Kernel needs bh * td / 2 total threads
     // (the kernel uses blockIdx.x * blockDim.x + threadIdx.x as idx,
@@ -417,22 +425,23 @@ extern "C" void run_rope_i_op(
     const uint32_t total_threads = (bh * td) / 2;
     const int block_dim = 256;
     const int grid_dim = (total_threads + block_dim - 1) / block_dim;
-    
+    cudaStream_t s = (cudaStream_t)stream;
+
     switch (dtype) {
         case 0: // F32
-            rope_i_f32<<<grid_dim, block_dim>>>((const float*)src, (const float*)cos, (const float*)sin, (float*)dst, bh, td, stride_b);
+            rope_i_f32<<<grid_dim, block_dim, 0, s>>>((const float*)src, (const float*)cos, (const float*)sin, (float*)dst, bh, td, stride_b);
             break;
         case 1: // F64
-            rope_i_f64<<<grid_dim, block_dim>>>((const double*)src, (const double*)cos, (const double*)sin, (double*)dst, bh, td, stride_b);
+            rope_i_f64<<<grid_dim, block_dim, 0, s>>>((const double*)src, (const double*)cos, (const double*)sin, (double*)dst, bh, td, stride_b);
             break;
         case 2: // F16
-            rope_i_f16<<<grid_dim, block_dim>>>((const __half*)src, (const __half*)cos, (const __half*)sin, (__half*)dst, bh, td, stride_b);
+            rope_i_f16<<<grid_dim, block_dim, 0, s>>>((const __half*)src, (const __half*)cos, (const __half*)sin, (__half*)dst, bh, td, stride_b);
             break;
         case 3: // BF16
-            rope_i_bf16<<<grid_dim, block_dim>>>((const __nv_bfloat16*)src, (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin, (__nv_bfloat16*)dst, bh, td, stride_b);
+            rope_i_bf16<<<grid_dim, block_dim, 0, s>>>((const __nv_bfloat16*)src, (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin, (__nv_bfloat16*)dst, bh, td, stride_b);
             break;
         case 4: // F8E4M3
-            rope_i_f8_e4m3<<<grid_dim, block_dim>>>((const __nv_fp8_e4m3*)src, (const __nv_fp8_e4m3*)cos, (const __nv_fp8_e4m3*)sin, (__nv_fp8_e4m3*)dst, bh, td, stride_b);
+            rope_i_f8_e4m3<<<grid_dim, block_dim, 0, s>>>((const __nv_fp8_e4m3*)src, (const __nv_fp8_e4m3*)cos, (const __nv_fp8_e4m3*)sin, (__nv_fp8_e4m3*)dst, bh, td, stride_b);
             break;
     }
 }
@@ -449,7 +458,8 @@ extern "C" void run_rope_op(
     uint32_t bh,
     uint32_t td,
     uint32_t d,
-    uint32_t stride_b
+    uint32_t stride_b,
+    void* stream
 ) {
     // Kernel needs bh * td / 2 total threads
     // (the kernel uses blockIdx.x * blockDim.x + threadIdx.x as idx,
@@ -457,22 +467,23 @@ extern "C" void run_rope_op(
     const uint32_t total_threads = (bh * td) / 2;
     const int block_dim = 256;
     const int grid_dim = (total_threads + block_dim - 1) / block_dim;
-    
+    cudaStream_t s = (cudaStream_t)stream;
+
     switch (dtype) {
         case 0: // F32
-            rope_f32<<<grid_dim, block_dim>>>((const float*)src, (const float*)cos, (const float*)sin, (float*)dst, bh, td, d, stride_b);
+            rope_f32<<<grid_dim, block_dim, 0, s>>>((const float*)src, (const float*)cos, (const float*)sin, (float*)dst, bh, td, d, stride_b);
             break;
         case 1: // F64
-            rope_f64<<<grid_dim, block_dim>>>((const double*)src, (const double*)cos, (const double*)sin, (double*)dst, bh, td, d, stride_b);
+            rope_f64<<<grid_dim, block_dim, 0, s>>>((const double*)src, (const double*)cos, (const double*)sin, (double*)dst, bh, td, d, stride_b);
             break;
         case 2: // F16
-            rope_f16<<<grid_dim, block_dim>>>((const __half*)src, (const __half*)cos, (const __half*)sin, (__half*)dst, bh, td, d, stride_b);
+            rope_f16<<<grid_dim, block_dim, 0, s>>>((const __half*)src, (const __half*)cos, (const __half*)sin, (__half*)dst, bh, td, d, stride_b);
             break;
         case 3: // BF16
-            rope_bf16<<<grid_dim, block_dim>>>((const __nv_bfloat16*)src, (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin, (__nv_bfloat16*)dst, bh, td, d, stride_b);
+            rope_bf16<<<grid_dim, block_dim, 0, s>>>((const __nv_bfloat16*)src, (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin, (__nv_bfloat16*)dst, bh, td, d, stride_b);
             break;
         case 4: // F8E4M3
-            rope_f8_e4m3<<<grid_dim, block_dim>>>((const __nv_fp8_e4m3*)src, (const __nv_fp8_e4m3*)cos, (const __nv_fp8_e4m3*)sin, (__nv_fp8_e4m3*)dst, bh, td, d, stride_b);
+            rope_f8_e4m3<<<grid_dim, block_dim, 0, s>>>((const __nv_fp8_e4m3*)src, (const __nv_fp8_e4m3*)cos, (const __nv_fp8_e4m3*)sin, (__nv_fp8_e4m3*)dst, bh, td, d, stride_b);
             break;
     }
 }
@@ -490,28 +501,30 @@ extern "C" void run_rope_thd_op(
     uint32_t t,
     uint32_t h,
     uint32_t d,
-    uint32_t stride_b
+    uint32_t stride_b,
+    void* stream
 ) {
     // Compute grid/block dimensions
     const uint32_t el_count = b * t * h * d;
     const int block_dim = 256;
     const int grid_dim = (el_count + block_dim - 1) / block_dim;
-    
+    cudaStream_t s = (cudaStream_t)stream;
+
     switch (dtype) {
         case 0: // F32
-            rope_thd_f32<<<grid_dim, block_dim>>>((const float*)src, (const float*)cos, (const float*)sin, (float*)dst, b, t, h, d, stride_b);
+            rope_thd_f32<<<grid_dim, block_dim, 0, s>>>((const float*)src, (const float*)cos, (const float*)sin, (float*)dst, b, t, h, d, stride_b);
             break;
         case 1: // F64
-            rope_thd_f64<<<grid_dim, block_dim>>>((const double*)src, (const double*)cos, (const double*)sin, (double*)dst, b, t, h, d, stride_b);
+            rope_thd_f64<<<grid_dim, block_dim, 0, s>>>((const double*)src, (const double*)cos, (const double*)sin, (double*)dst, b, t, h, d, stride_b);
             break;
         case 2: // F16
-            rope_thd_f16<<<grid_dim, block_dim>>>((const __half*)src, (const __half*)cos, (const __half*)sin, (__half*)dst, b, t, h, d, stride_b);
+            rope_thd_f16<<<grid_dim, block_dim, 0, s>>>((const __half*)src, (const __half*)cos, (const __half*)sin, (__half*)dst, b, t, h, d, stride_b);
             break;
         case 3: // BF16
-            rope_thd_bf16<<<grid_dim, block_dim>>>((const __nv_bfloat16*)src, (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin, (__nv_bfloat16*)dst, b, t, h, d, stride_b);
+            rope_thd_bf16<<<grid_dim, block_dim, 0, s>>>((const __nv_bfloat16*)src, (const __nv_bfloat16*)cos, (const __nv_bfloat16*)sin, (__nv_bfloat16*)dst, b, t, h, d, stride_b);
             break;
         case 4: // F8E4M3
-            rope_thd_f8_e4m3<<<grid_dim, block_dim>>>((const __nv_fp8_e4m3*)src, (const __nv_fp8_e4m3*)cos, (const __nv_fp8_e4m3*)sin, (__nv_fp8_e4m3*)dst, b, t, h, d, stride_b);
+            rope_thd_f8_e4m3<<<grid_dim, block_dim, 0, s>>>((const __nv_fp8_e4m3*)src, (const __nv_fp8_e4m3*)cos, (const __nv_fp8_e4m3*)sin, (__nv_fp8_e4m3*)dst, b, t, h, d, stride_b);
             break;
     }
 }

@@ -29,16 +29,18 @@ use super::live_table::{LiveTable, Proj};
 use super::promo::PromotionRing;
 use super::reclaim::ReclaimClock;
 use super::stager::StagerMsg;
+use super::started::StartedRows;
 use super::types::{PipelineMessage, RoutedLayer};
 use crate::models::batched_inference::MAX_PREFILL_TOKENS;
 use crate::models::profile::{gpu_span, profile_now};
 use crate::models::wave_buffers::{wave_empty, wave_root};
 use candle::cuda_backend::CudaDevice;
 use candle::quantized::cuda::{
-    fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,
-    grouped_int8_n_sub, moe_bucketize, silu_mul_q8a128, BucketizeLive, MoeBucketizeWorkspace,
-    MoeLive, Q8a128Operand,
+    fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_int8_n_sub,
+    grouped_qmatmul_dev_q8a128, moe_bucketize, silu_mul_q8a128, BucketizeLive,
+    MoeBucketizeWorkspace, MoeLive, Q8a128Operand,
 };
+use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::SumScale;
 use candle::{DType, Device, LiveTensor, Result};
 use candle_nn::kv_cache::WaveGeneration;
@@ -321,6 +323,20 @@ struct ForwardSide {
 /// part, and the pad.
 pub(crate) type PinnedRanges = [(u64, u64); 2];
 
+/// One invocation's host-side reservation, made by [`Dispatch::before`] and
+/// consumed by [`Dispatch::record`]: its sequence number, the summary-ring slot
+/// its bucketize writes, and its MoE row. The stager and the pipeline thread
+/// have been told to expect it, so it must be recorded — dropping it leaves
+/// both waiting on a summary word that never comes. Not `Copy`: `record` takes
+/// it by value, so it is recorded once.
+#[derive(Debug)]
+#[must_use = "a reserved invocation must be recorded: the pipeline thread and the stager wait on its summary word"]
+pub(crate) struct Reserved {
+    seq: u64,
+    slot: usize,
+    row: usize,
+}
+
 /// Everything the device-side expert forward needs that the host threads do
 /// not own.
 pub(crate) struct Dispatch {
@@ -387,7 +403,7 @@ impl Dispatch {
         let n_experts = table.n_experts();
         let ring = Arc::new(SummaryRing::new(n_experts)?);
         let abort = Arc::new(AbortWord::new()?);
-        let clock = Arc::new(ReclaimClock::new(table.n_rows()));
+        let clock = Arc::new(ReclaimClock::new(StartedRows::mapped(table.n_rows())?));
         // Sized here for the widest wave the engine composes — its prefill
         // ceiling, and as many decode and verify rows again — so the forward
         // never grows it. One workspace serves every layer: each layer's
@@ -505,9 +521,18 @@ impl Dispatch {
     ///
     /// `acts` is the layer's q8a128 activation `[n_tokens, hidden]`; `weights`
     /// and `indices` the router's `[n_tokens, k]` output (f32, u32). Returns the
-    /// routed sum `[n_tokens, hidden]` at `out_dtype`. Tokens
-    /// `[0, decode_tokens)` are decode rows, which the residency scoring
-    /// weights differently.
+    /// routed sum `[n_tokens, hidden]` at `out_dtype`. The tokens in `decode`
+    /// are decode rows, which the residency scoring weights differently.
+    ///
+    /// Three parts, in this order: [`Self::before`] (the host protocol — number
+    /// the invocation, hold its summary-ring slot, enqueue its reclaim ticket,
+    /// tell the stager and the pipeline thread), [`Self::record`] (the launches
+    /// and nothing else) and [`Self::after`] (flush the submission). The
+    /// messages go out before the launches because neither receiver assumes the
+    /// summary word is published yet: the pipeline thread waits on the ring slot
+    /// and the stager polls it. That split is what lets the launches be recorded
+    /// into a graph and replayed between an unchanged `before` and `after`
+    /// (`docs/decode_graphs.md` §4.5).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward<'w>(
         &self,
@@ -517,7 +542,83 @@ impl Dispatch {
         weights: &LiveTensor<'_>,
         indices: &LiveTensor<'_>,
         row: usize,
-        decode_tokens: usize,
+        decode: &DecodeRows,
+        out_dtype: DType,
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
+        let Device::Cuda(cuda_dev) = indices.device() else {
+            candle::bail!("expert dispatch: expected a CUDA device")
+        };
+        let (num_tokens, _) = indices.dims2()?;
+        let reserved = self.before(tx, stager, row, num_tokens)?;
+        let ys = self.record(reserved, acts, weights, indices, decode, out_dtype, wave)?;
+        self.after(cuda_dev)?;
+        Ok(ys)
+    }
+
+    /// The host protocol ahead of one invocation's launches: its sequence
+    /// number, its summary-ring slot held free of the previous tenant, and the
+    /// `Routed` messages to the stager and the pipeline thread. The reclaim
+    /// rule's key is not set here: bucketize stores the ticket into its row's
+    /// started word when the device begins it (`started.rs`). What is set is
+    /// the row's enqueued ticket, which marks it upcoming until the device
+    /// begins it — a victim preference, not a key (`ReclaimClock::upcoming`).
+    fn before(
+        &self,
+        tx: &mpsc::SyncSender<PipelineMessage>,
+        stager: &mpsc::Sender<StagerMsg>,
+        row: usize,
+        num_tokens: usize,
+    ) -> Result<Reserved> {
+        let (seq, pass) = self.begin_invocation(row)?;
+        let ticket = seq + 1;
+        let slot = (seq % SUMMARY_RING as u64) as usize;
+        self.hold_for_ring(ticket)?;
+        self.clock.enqueued(row, ticket);
+
+        let t = profile_now();
+        let word = summary_word(seq);
+        stager
+            .send(StagerMsg::Routed {
+                row,
+                slot,
+                summary_word: word,
+                ticket,
+            })
+            .map_err(|_| candle::Error::Msg("expert stager died — channel closed".into()))?;
+        tx.send(PipelineMessage::Routed(RoutedLayer {
+            row,
+            pass,
+            slot,
+            summary_word: word,
+            ticket,
+            prefill_width: num_tokens > PREFILL_LAUNCH_TOKENS,
+            submitted_at: profile_now(),
+        }))
+        .map_err(|_| candle::Error::Msg("expert pipeline thread died — channel closed".into()))?;
+        crate::models::profile::pipeline_record("moe:route_handoff", t);
+        Ok(Reserved { seq, slot, row })
+    }
+
+    /// Submit what [`Self::record`] queued. Both host threads wait on the
+    /// summary word bucketize writes, and nothing on the forward thread
+    /// synchronizes, so on WDDM nothing else would flush it. Inside a wave
+    /// capture this is where a segment ends: the recorded launches, bucketize
+    /// among them, are launched as one graph before the query.
+    fn after(&self, device: &CudaDevice) -> Result<()> {
+        device.flush_launches()
+    }
+
+    /// The launches of one reserved invocation, and nothing else: bucketize,
+    /// gather, the three grouped GEMMs, the SwiGLU and the scatter.
+    #[allow(clippy::too_many_arguments)]
+    fn record<'w>(
+        &self,
+        reserved: Reserved,
+        acts: Q8a128Operand<'w>,
+        weights: &LiveTensor<'_>,
+        indices: &LiveTensor<'_>,
+        decode: &DecodeRows,
         out_dtype: DType,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
@@ -525,6 +626,7 @@ impl Dispatch {
         let Device::Cuda(cuda_dev) = &device else {
             candle::bail!("expert dispatch: expected a CUDA device")
         };
+        let Reserved { seq, slot, row } = reserved;
         let (num_tokens, k) = indices.dims2()?;
         let hidden_dim = acts.cols;
         let table = &*self.table;
@@ -549,14 +651,6 @@ impl Dispatch {
         let compute = cuda_dev.cuda_stream();
         let weights_flat = weights.flatten_all()?.contiguous()?;
 
-        let (seq, pass) = self.begin_invocation(row)?;
-        let ticket = seq + 1;
-        let slot = (seq % SUMMARY_RING as u64) as usize;
-        self.hold_for_ring(ticket)?;
-        // Before bucketize can read the row: what the reclaim rule keys on.
-        self.clock.enqueue(row, ticket);
-
-        let t = profile_now();
         let mut ws = self
             .workspace
             .lock()
@@ -583,38 +677,12 @@ impl Dispatch {
                 row: row as i32,
                 promo: self.promo.as_ref().map(|p| p.ring()),
                 remote_dst,
+                started_rows: self.clock.started_ptr(),
+                ticket: seq + 1,
             }),
-            decode_tokens,
+            decode,
         )?;
         g.end();
-
-        // ── Hand-off: both host threads poll the summary word. Make WDDM
-        // submit the bucketize they wait on — nothing on this thread
-        // synchronizes, so nothing else would. ──
-        // SAFETY: a query on the device's compute stream.
-        unsafe {
-            let _ = sys::cuStreamQuery(compute.cu_stream());
-        }
-        let word = summary_word(seq);
-        stager
-            .send(StagerMsg::Routed {
-                row,
-                slot,
-                summary_word: word,
-                ticket,
-            })
-            .map_err(|_| candle::Error::Msg("expert stager died — channel closed".into()))?;
-        tx.send(PipelineMessage::Routed(RoutedLayer {
-            row,
-            pass,
-            slot,
-            summary_word: word,
-            ticket,
-            prefill_width: num_tokens > PREFILL_LAUNCH_TOKENS,
-            submitted_at: profile_now(),
-        }))
-        .map_err(|_| candle::Error::Msg("expert pipeline thread died — channel closed".into()))?;
-        crate::models::profile::pipeline_record("moe:route_handoff", t);
 
         // ── The expert chain ──
         let a_ub = num_tokens * k;

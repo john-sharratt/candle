@@ -42,11 +42,13 @@ enum ScatterDType {
 // Note: add_at_indices has stride parameter, others don't
 // We normalize by adding stride to all operations in the dispatcher
 
-// add_at_indices variants (from add_at_indices.cu)
-extern "C" __global__ void add_at_indices_f32(float*, const uint32_t*, size_t, float, size_t);
-extern "C" __global__ void add_at_indices_f64(double*, const uint32_t*, size_t, double, size_t);
-extern "C" __global__ void add_at_indices_f16(__half*, const uint32_t*, size_t, __half, size_t);
-extern "C" __global__ void add_at_indices_bf16(__nv_bfloat16*, const uint32_t*, size_t, __nv_bfloat16, size_t);
+// add_at_indices variants (from add_at_indices.cu). These are host launchers
+// that size their own grid, not kernels, so they are called directly with the
+// stream rather than launched.
+extern "C" void add_at_indices_f32(float*, const uint32_t*, size_t, float, size_t, void*);
+extern "C" void add_at_indices_f64(double*, const uint32_t*, size_t, double, size_t, void*);
+extern "C" void add_at_indices_f16(__half*, const uint32_t*, size_t, __half, size_t, void*);
+extern "C" void add_at_indices_bf16(__nv_bfloat16*, const uint32_t*, size_t, __nv_bfloat16, size_t, void*);
 
 // sub_at_indices variants (from sub_at_indices.cu) - no stride parameter
 extern "C" __global__ void sub_at_indices_f32(float*, const uint32_t*, size_t, float);
@@ -83,6 +85,7 @@ extern "C" __global__ void div_at_indices_bf16(__nv_bfloat16*, const uint32_t*, 
 /// @param value_f32 Value as f32 (used for f32/f16/bf16)
 /// @param value_f64 Value as f64 (used for f64)
 /// @param stride   Stride between elements (only used by add operation)
+/// @param stream   Stream the launch is issued on
 extern "C" void run_scatter_op_at_indices(
     int op,
     int dtype,
@@ -91,7 +94,8 @@ extern "C" void run_scatter_op_at_indices(
     size_t num_indices,
     float value_f32,
     double value_f64,
-    size_t stride
+    size_t stride,
+    void* stream
 ) {
     if (num_indices == 0) return;
     
@@ -102,23 +106,23 @@ extern "C" void run_scatter_op_at_indices(
         case SCATTER_ADD:
             switch (dtype) {
                 case SCATTER_F32:
-                    add_at_indices_f32<<<blocks, threads>>>(
-                        (float*)data, indices, num_indices, value_f32, stride);
+                    add_at_indices_f32(
+                        (float*)data, indices, num_indices, value_f32, stride, stream);
                     break;
                 case SCATTER_F64:
-                    add_at_indices_f64<<<blocks, threads>>>(
-                        (double*)data, indices, num_indices, value_f64, stride);
+                    add_at_indices_f64(
+                        (double*)data, indices, num_indices, value_f64, stride, stream);
                     break;
                 case SCATTER_F16: {
                     __half value_f16 = __float2half(value_f32);
-                    add_at_indices_f16<<<blocks, threads>>>(
-                        (__half*)data, indices, num_indices, value_f16, stride);
+                    add_at_indices_f16(
+                        (__half*)data, indices, num_indices, value_f16, stride, stream);
                     break;
                 }
                 case SCATTER_BF16: {
                     __nv_bfloat16 value_bf16 = __float2bfloat16(value_f32);
-                    add_at_indices_bf16<<<blocks, threads>>>(
-                        (__nv_bfloat16*)data, indices, num_indices, value_bf16, stride);
+                    add_at_indices_bf16(
+                        (__nv_bfloat16*)data, indices, num_indices, value_bf16, stride, stream);
                     break;
                 }
             }
@@ -127,19 +131,19 @@ extern "C" void run_scatter_op_at_indices(
         case SCATTER_SUB:
             switch (dtype) {
                 case SCATTER_F32:
-                    sub_at_indices_f32<<<blocks, threads>>>(
+                    sub_at_indices_f32<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (float*)data, indices, num_indices, value_f32);
                     break;
                 case SCATTER_F64:
-                    sub_at_indices_f64<<<blocks, threads>>>(
+                    sub_at_indices_f64<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (double*)data, indices, num_indices, value_f64);
                     break;
                 case SCATTER_F16:
-                    sub_at_indices_f16<<<blocks, threads>>>(
+                    sub_at_indices_f16<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (__half*)data, indices, num_indices, value_f32);
                     break;
                 case SCATTER_BF16:
-                    sub_at_indices_bf16<<<blocks, threads>>>(
+                    sub_at_indices_bf16<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (__nv_bfloat16*)data, indices, num_indices, value_f32);
                     break;
             }
@@ -148,19 +152,19 @@ extern "C" void run_scatter_op_at_indices(
         case SCATTER_MUL:
             switch (dtype) {
                 case SCATTER_F32:
-                    mul_at_indices_f32<<<blocks, threads>>>(
+                    mul_at_indices_f32<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (float*)data, indices, num_indices, value_f32);
                     break;
                 case SCATTER_F64:
-                    mul_at_indices_f64<<<blocks, threads>>>(
+                    mul_at_indices_f64<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (double*)data, indices, num_indices, value_f64);
                     break;
                 case SCATTER_F16:
-                    mul_at_indices_f16<<<blocks, threads>>>(
+                    mul_at_indices_f16<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (__half*)data, indices, num_indices, value_f32);
                     break;
                 case SCATTER_BF16:
-                    mul_at_indices_bf16<<<blocks, threads>>>(
+                    mul_at_indices_bf16<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (__nv_bfloat16*)data, indices, num_indices, value_f32);
                     break;
             }
@@ -169,19 +173,19 @@ extern "C" void run_scatter_op_at_indices(
         case SCATTER_DIV:
             switch (dtype) {
                 case SCATTER_F32:
-                    div_at_indices_f32<<<blocks, threads>>>(
+                    div_at_indices_f32<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (float*)data, indices, num_indices, value_f32);
                     break;
                 case SCATTER_F64:
-                    div_at_indices_f64<<<blocks, threads>>>(
+                    div_at_indices_f64<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (double*)data, indices, num_indices, value_f64);
                     break;
                 case SCATTER_F16:
-                    div_at_indices_f16<<<blocks, threads>>>(
+                    div_at_indices_f16<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (__half*)data, indices, num_indices, value_f32);
                     break;
                 case SCATTER_BF16:
-                    div_at_indices_bf16<<<blocks, threads>>>(
+                    div_at_indices_bf16<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                         (__nv_bfloat16*)data, indices, num_indices, value_f32);
                     break;
             }
@@ -207,12 +211,14 @@ extern "C" __global__ void sub_at_indices_with_values_bf16(__nv_bfloat16*, const
 /// @param indices  Pointer to indices array (u32)
 /// @param values   Pointer to values array (f32 for f16/bf16, native type for f32/f64)
 /// @param num_indices Number of indices
+/// @param stream   Stream the launch is issued on
 extern "C" void run_sub_at_indices_with_values(
     int dtype,
     void* data,
     const uint32_t* indices,
     const void* values,
-    size_t num_indices
+    size_t num_indices,
+    void* stream
 ) {
     if (num_indices == 0) return;
     
@@ -221,21 +227,21 @@ extern "C" void run_sub_at_indices_with_values(
     
     switch (dtype) {
         case SCATTER_F32:
-            sub_at_indices_with_values_f32<<<blocks, threads>>>(
+            sub_at_indices_with_values_f32<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                 (float*)data, indices, (const float*)values, num_indices);
             break;
         case SCATTER_F64:
-            sub_at_indices_with_values_f64<<<blocks, threads>>>(
+            sub_at_indices_with_values_f64<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                 (double*)data, indices, (const double*)values, num_indices);
             break;
         case SCATTER_F16:
             // f16 kernel expects float values array (converts internally)
-            sub_at_indices_with_values_f16<<<blocks, threads>>>(
+            sub_at_indices_with_values_f16<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                 (__half*)data, indices, (const float*)values, num_indices);
             break;
         case SCATTER_BF16:
             // bf16 kernel expects float values array (converts internally)
-            sub_at_indices_with_values_bf16<<<blocks, threads>>>(
+            sub_at_indices_with_values_bf16<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                 (__nv_bfloat16*)data, indices, (const float*)values, num_indices);
             break;
     }
