@@ -3429,7 +3429,10 @@ impl CudaStorage {
         let previous = std::mem::replace(&mut self.slice, fresh);
         match self.backing {
             Backing::Lease(_) => previous.leak_view(),
-            Backing::Owned => drop(previous),
+            // Retired, not dropped: the cast and the copy just issued read it,
+            // and while this thread records a wave they have not run yet — a
+            // free now would queue ahead of them.
+            Backing::Owned => self.device.retire(previous),
         }
         self.backing = fresh_backing;
         // The fresh buffer is not the anchored memory, so this storage no longer has
@@ -3514,14 +3517,26 @@ impl CudaStorage {
         // The retyped buffer holds the same values this storage already holds,
         // so it belongs wherever this storage does.
         let inherit = self.backing;
+        // The copy is queued on the launch stream, behind the in-place cast
+        // that produced its bytes. A synchronous copy runs on the legacy stream
+        // at once — ahead of that cast while this thread records a wave, so it
+        // read the bytes before they were cast. The stream is taken after the
+        // allocation, which may end the recording segment.
         macro_rules! alloc_and_copy {
             ($ty:ty, $wrapper:path) => {{
                 use cudarc::driver::DevicePtrMut;
                 let (mut dst, dst_backing) =
                     unsafe { alloc_inheriting::<$ty>(dev, elem_count, inherit)? };
-                let (dst_ptr, _) = dst.device_ptr_mut(&stream);
+                let launch = dev.cuda_stream();
+                let (dst_ptr, _) = dst.device_ptr_mut(&launch);
                 unsafe {
-                    cudarc::driver::result::memcpy_dtod_sync(dst_ptr, src_ptr, byte_count).w()?;
+                    cudarc::driver::result::memcpy_dtod_async(
+                        dst_ptr,
+                        src_ptr,
+                        byte_count,
+                        launch.cu_stream(),
+                    )
+                    .w()?;
                 }
                 Ok(($wrapper(dst), dst_backing))
             }};

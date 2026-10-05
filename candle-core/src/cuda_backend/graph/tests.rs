@@ -789,6 +789,39 @@ fn a_dropped_session_leaves_the_stream_usable() -> Result<()> {
     Ok(())
 }
 
+/// An in-place cast inside a recording wave keeps the buffer it replaces until
+/// the segment that reads it has been launched: memory allocated after it, and
+/// written in the same segment, must not land on the bytes the cast still has
+/// to read.
+#[test]
+fn an_in_place_cast_while_recording_reads_back_what_it_reads_eagerly() -> Result<()> {
+    use crate::{DType, Tensor};
+    let _wave = wave_lock();
+    let device = crate::Device::new_cuda(0)?;
+    let crate::Device::Cuda(dev) = &device else {
+        unreachable!("asked for a CUDA device")
+    };
+    let cast = |device: &crate::Device| -> Result<Vec<f32>> {
+        let mut t = (Tensor::arange(0f32, N as f32, device)? * 0.25)?;
+        t.to_dtype_mut(DType::F16)?;
+        // Same size as the buffer the cast gave up, written before the cast's
+        // result is read.
+        let other = (Tensor::ones(N, DType::F32, device)? * 7.0)?;
+        let back = t.to_dtype(DType::F32)?;
+        drop(other);
+        back.to_vec1::<f32>()
+    };
+    let eager = cast(&device)?;
+    for wave in 0..4 {
+        let capture = dev.begin_wave_capture()?;
+        dev.record_launches()?;
+        let recorded = cast(&device);
+        capture.finish()?;
+        assert_eq!(recorded?, eager, "wave {wave}");
+    }
+    Ok(())
+}
+
 /// Sets its flag when dropped — a stand-in for device memory being freed.
 struct Freed(Arc<AtomicBool>);
 

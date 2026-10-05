@@ -353,12 +353,49 @@ pipeline thread was serving.
 
 ### 3.3 Other models
 
-Every other model runs through `drive_wave` with a held wave capture and no mark, so it
-records nothing; the changes it sees are the stream-taking launchers, the cuBLAS workspace and
-the eager-section bookkeeping, all no-ops outside a recording, and — for the MoE models —
-the expert-pipeline changes of §3.2. On the final code the Qwen2, Qwen3.5-0.8B, Llama-3.2-3B,
-Qwen3-8B, Qwen3-30B-A3B and Qwen3.5-35B-A3B gates pass with every row validated; Qwen3-30B-A3B
-decodes at or above its previous rates on every row.
+The Qwen3.5 lineage (0.8B, 9B, Qwen3.8-27B, 3.5-35B and the three Qwen3.6 gates) records
+through `qwen35::forward::sweep_layers`. Qwen2, both Llamas, Qwen3-8B and Qwen3-30B-A3B share
+one uniform sweep, `BatchedInference::forward_wave_contexts`, which marks recording before its
+layer loop in the same place. Every gate of both groups passes with every validated session
+green.
+
+**A segment per layer.** That sweep's layers meet the host nowhere, so recorded whole it ran
+as one segment a wave, and the GPU sat idle until the host had recorded every layer where eager
+launches had it start on the first: decode fell 5–9% under eager. It hands each layer to the
+device as it is recorded (`Device::flush_launches`). A layer that ends its own segment —
+Qwen3-30B-A3B's MoE, whose host protocol flushes the segment holding its bucketize
+(`BatchedAttentionLayer::ends_a_segment`) — gets no second cut, which cost that model 3–6%.
+
+**An in-place cast that read ahead of itself.** `to_dtype_mut` — the MoE's BF16→F16 narrowing
+on Qwen3-30B-A3B's F16 and quantized-KV rows — copied its result into the retyped buffer with a
+synchronous legacy-stream copy, which ran at once, before the recorded cast; and freed the
+buffer it replaced at once, before the segment reading it. Every such row failed validation.
+The copy is queued on the launch stream and the old buffer retired
+(`an_in_place_cast_while_recording_reads_back_what_it_reads_eagerly`).
+
+RTX 3090, decode t/s, eager (2026-10-06 sweep) → recorded:
+
+| model | row | eager → graphs | Δ |
+|---|---|---:|---:|
+| Qwen2-0.5B | F32 ×1 | 257.2 → 485.2 | +89% |
+| | F16 ×4 | 1,098.8 → 1,482.3 | +35% |
+| | BF16 ×60 | 6,268.0 → 6,468.1 | +3% |
+| Llama-3.2-3B | F16 ×1 | 165.2 → 178.5 | +8% |
+| | BF16 ×4 | 514.2 → 545.9 | +6% |
+| | C8 ×10 | 750.5 → 775.6 | +3% |
+| Llama-2-7B | BF16 ×1 | 110.1 → 112.5 | +2% |
+| | BF16 ×48 | 945.6 → 938.1 | −1% |
+| | Q8_0 ×32 | 621.8 → 599.5 | −4% |
+| Qwen3-8B | BF16 ×1 | 78.4 → 81.7 | +4% |
+| | C8 ×10 | 361.4 → 380.8 | +5% |
+| Qwen3-30B-A3B | Q8_0 ×20 | 344.7 → 388.8 | +13% |
+| | C0 ×2 | 93.5 → 105.3 | +13% |
+| | BF16 ×10 | 351.3 → 363.9 | +4% |
+
+Prefill is within run-to-run spread of eager on every row but Qwen2's single-sequence rows
+(+18–23%). Llama-2-7B's widest rows are the one place recording does not pay: 32–48 sequences
+make a layer long enough on the GPU that recording it ahead buys little, and the per-segment
+cost is left over.
 
 ---
 

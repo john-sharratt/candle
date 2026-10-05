@@ -49,4 +49,15 @@ impl Device {
             _ => Ok(()),
         }
     }
+
+    /// Hand what this thread has recorded to the device now, so it starts
+    /// executing while the rest of the forward records. Does nothing on
+    /// another device or on a thread with no wave capture open.
+    pub fn flush_launches(&self) -> Result<()> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Device::Cuda(d) => d.flush_launches(),
+            _ => Ok(()),
+        }
+    }
 }

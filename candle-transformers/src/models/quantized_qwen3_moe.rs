@@ -396,6 +396,10 @@ impl BatchedAttentionLayer for LayerWeights {
         &self.self_attn.o_proj
     }
 
+    fn ends_a_segment(&self) -> bool {
+        matches!(self.ffn, FeedForward::MoE(_))
+    }
+
     // ── Producer-fused (q8a128) overrides for the batched paged path ──
     // `int8mode` + `output_projection` (B2) come from the trait defaults (o_proj-driven);
     // only the model-specific producers (ln1/ln2 fusion, q/k-norm qkv, MoE ffn) are overridden.

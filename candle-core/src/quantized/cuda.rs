@@ -3453,7 +3453,9 @@ impl QCudaStorage {
         if matches!(self.backing, Backing::Lease(_)) {
             old.inner.leak();
         } else {
-            drop(old);
+            // Retired, not dropped: a launch recorded before this call may
+            // still read the old buffer.
+            self.device.retire(old);
         }
         self.data = std::mem::ManuallyDrop::new(PaddedCudaSlice {
             inner,
