@@ -1,9 +1,11 @@
-//! Per-slot projection assembler — full rebuild of the slot's prefix
-//! K/V on every call.
+//! Per-slot projection assembler — rebuilds the slot's prefix K/V for each
+//! projection, keeping whatever leading run of it the slot already holds.
 //!
-//! Snapshots the slot's writer tail, truncates to zero, then walks the
-//! [`assemble_pieces`] output in logical order, building the slot's chunk list
-//! IN PLACE:
+//! Snapshots the slot's writer tail, cuts the slot back to the end of the
+//! longest run of pieces it already holds exactly as this projection would
+//! build them ([`super::piece_identity`]; nothing, when the first piece
+//! differs), then walks the rest of the [`assemble_pieces`] output in logical
+//! order, building the slot's chunk list IN PLACE:
 //!
 //! - `Section` / `Turn` — resolve the substrate entry's per-layer sealed K/V and
 //!   Arc-clone it onto the slot.
@@ -19,9 +21,11 @@
 //! walker logical_pos`) guards it. The in-flight user message is deferred to
 //! prefill after the gaps are filled; the writer tail is re-attached at the end.
 //!
-//! The prefix is re-derived from scratch every projection — there is no
-//! cross-projection memoisation, so the assembled K/V always reflects the
-//! exact segment sequence the resolver selected this call.
+//! A kept piece is kept only when its chained identity — the piece and every
+//! piece before it — matches what the slot's last complete assembly placed, so
+//! the assembled K/V always reflects the exact segment sequence the resolver
+//! selected this call. Glue islands are cached separately, keyed by the same
+//! prefix identity.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -43,7 +47,9 @@ use crate::projection::{
     ContentResolver, Conversation, GroupId, MaterializedPiece, ProjectionSegment, ProjectionTarget,
     Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex, TurnKey,
 };
-use crate::scheduler::piece_identity::{chained_identities, kept_prefix, piece_label, PieceReads};
+use crate::scheduler::piece_identity::{
+    chained_identities, fit_kept_prefix, kept_prefix, piece_label, PieceReads,
+};
 use crate::scheduler::profile;
 use crate::scheduler::projection_identity::section_content_stamp;
 use crate::sequence_handle::SequenceId;
@@ -123,6 +129,23 @@ impl PlacedPiece {
             pos_after: (blocks_after * 32) as u32,
             prefix_h: DefaultHasher::new(),
         }
+    }
+}
+
+/// Where the system prompt ends in a slot `placed` describes: the position
+/// after the leading run of sections and the glue between them, `0` when the
+/// projection opens on anything else.
+///
+/// `placed[j]` records `pieces[j]` for every piece before the deferred user
+/// message, which the leading run never reaches.
+fn prompt_end_of(pieces: &[AssembledPiece], placed: &[PlacedPiece]) -> u32 {
+    let lead = pieces
+        .iter()
+        .take_while(|p| matches!(p, AssembledPiece::Section(_) | AssembledPiece::Glue(_)))
+        .count();
+    match lead {
+        0 => 0,
+        n => placed[n - 1].pos_after,
     }
 }
 
@@ -930,7 +953,27 @@ pub(super) fn apply_segments_build(
         .take_while(|p| p.blocks_after <= slot_blocks)
         .map(|p| p.identity)
         .collect();
-    let keep = kept_prefix(&placed_ids, &identities, &pieces);
+    // The run must also end where the model can cut its per-position state:
+    // that state may be grouped more coarsely than the pieces (one index page
+    // over a whole injected prefix), and a cut inside a group is refused.
+    let placed_ends: Vec<u32> = state.placed_pieces.iter().map(|p| p.pos_after).collect();
+    let keep = fit_kept_prefix(
+        &placed_ends,
+        kept_prefix(&placed_ids, &identities, &pieces),
+        |pos| ctx.model.positional_cut_floor(parent_id.0, pos),
+    )
+    .map_err(ConversationError::Model)?;
+    // Every piece this rebuild projects, in order — the context the turn reads,
+    // turn by turn (`timeline:index`). What a "the model answered about the
+    // wrong file" report needs first: whether the turn it should have attended
+    // to was in front of it at all.
+    tracing::debug!(
+        target: "candle_conversation::scheduler::reproject",
+        slot = parent_id.0,
+        timeline = ctx.slot_target.map_or(0, |t| t.timeline.raw()),
+        pieces = %pieces.iter().map(piece_label).collect::<Vec<_>>().join(" "),
+        "apply_segments: projected pieces"
+    );
     // Where the prefix stopped matching, and what stands there now — the one
     // fact that says why a rebuild cost what it did.
     tracing::debug!(
@@ -1227,6 +1270,14 @@ pub(super) fn apply_segments_build(
             "apply_segments: injected sealed K/V but pushed no index page at all"
         );
     }
+
+    // Where the system prompt ends, for a model whose selection treats it apart
+    // (a stratified QSA selection ranks it in every window). Read from the
+    // placement records before an incomplete assembly clears them.
+    let prompt_end = prompt_end_of(&pieces, &state.placed_pieces);
+    ctx.model
+        .set_selection_prompt(parent_id.0, prompt_end as usize)
+        .map_err(ConversationError::Model)?;
 
     let complete = walker.skipped_turns == 0 && walker.skipped_sections == 0;
     // A slot missing a piece its list names does not hold what the list
@@ -2826,6 +2877,41 @@ mod tests {
         // A projection of only live-prefilled glue attends no sealed KV.
         let none = working_set_from_segments(&[generated_seg("g", 0, &[1])]);
         assert!(none.sections.is_empty() && none.turns.is_empty());
+    }
+
+    /// The system prompt is the leading run of sections and the glue between
+    /// them, and ends where the slot stood after the last of them — not at the
+    /// first section, and not past a turn.
+    #[test]
+    fn the_prompt_ends_after_the_leading_sections_and_their_glue() {
+        let placed_at = |ends: &[u32]| -> Vec<PlacedPiece> {
+            ends.iter()
+                .map(|&pos_after| PlacedPiece {
+                    identity: 1,
+                    blocks_after: 0,
+                    pos_after,
+                    prefix_h: DefaultHasher::new(),
+                })
+                .collect()
+        };
+        let pieces = assemble_pieces(&[
+            generated_seg("a", 0, &[1, 2]),
+            section_seg(7),
+            generated_seg("b", 0, &[3]),
+            section_seg(8),
+            turn_seg(1, 2, 3),
+            section_seg(9),
+            ProjectionSegment::NewUserMessage {
+                tokens: Arc::new(vec![9, 9]),
+            },
+        ]);
+        assert_eq!(
+            prompt_end_of(&pieces, &placed_at(&[2, 900, 901, 4100, 4300, 4500])),
+            4100
+        );
+        // A projection that opens on a turn holds no prompt.
+        let opens_on_a_turn = assemble_pieces(&[turn_seg(1, 2, 3), section_seg(9)]);
+        assert_eq!(prompt_end_of(&opens_on_a_turn, &placed_at(&[200, 400])), 0);
     }
 
     /// **A sealed turn emits alone, and consecutive turns share no island.**

@@ -4528,6 +4528,16 @@ pub trait ManagedBatchedModel {
         Ok(())
     }
 
+    /// `seq`'s first `tokens` positions hold the conversation's system prompt.
+    ///
+    /// For a model whose attention selects a subset of the context, the prompt
+    /// is a span its selection can treat apart from the rest — a stratified QSA
+    /// selection ranks it in every window (`docs/qsa_stratified_selection.md`).
+    /// A model that attends every position has nothing to do with it.
+    fn set_selection_prompt(&self, _seq: usize, _tokens: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// How many sequences this model currently holds recurrent memory for.
     ///
     /// The leak gauge for [`Self::release_sequence`]. Slot ids are recycled pool
@@ -4645,11 +4655,24 @@ pub trait ManagedBatchedModel {
         Ok(())
     }
 
+    /// The largest position at or before `tokens` that `seq`'s per-position
+    /// state can be cut back to with [`Self::truncate_positional_state`].
+    ///
+    /// Per-position state may be grouped more coarsely than the pieces a
+    /// rebuild keeps — a page covering a slot's whole injected prefix — so a
+    /// rebuild asks this before choosing where to cut, and keeps less when its
+    /// piece boundary falls inside a group. `tokens` itself for a model with no
+    /// such state.
+    fn positional_cut_floor(&self, _seq: usize, tokens: usize) -> Result<usize> {
+        Ok(tokens)
+    }
+
     /// Cut `seq`'s per-position state back to its first `tokens` positions —
     /// paired with truncating the sequence's K/V to the piece boundary there, so
     /// a rebuild keeps the prefix it shares with the last one and re-injects only
-    /// what follows. `tokens` is always a boundary between injected pieces. No-op
-    /// for a model with no such state.
+    /// what follows. `tokens` is always a boundary between injected pieces that
+    /// [`Self::positional_cut_floor`] accepts. No-op for a model with no such
+    /// state.
     fn truncate_positional_state(&self, _seq: usize, _tokens: usize) -> Result<()> {
         Ok(())
     }

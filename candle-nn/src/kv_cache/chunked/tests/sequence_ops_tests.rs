@@ -1909,6 +1909,80 @@ mod tests {
                 CHUNK_SIZE + partial_tokens
             );
         }
+
+        /// **A view rebuilt from nothing restores none of its carve-time writer.**
+        ///
+        /// A view is carved with one fresh empty chunk past the borrow so its
+        /// first write has somewhere unshared to land. A rebuild that keeps
+        /// nothing of the parent snapshots the writer tail, truncates to zero,
+        /// re-places everything and restores the tail. The carve-time chunk holds
+        /// no token the view forwarded, so the snapshot is empty and the restore
+        /// leaves the rebuilt slot as it is — restoring it put a stale empty chunk
+        /// past the rebuilt writer region, and the decode read a write slice for
+        /// it that no commit had described (`ws_len <= CHUNK_SIZE` assert).
+        ///
+        /// A tail that holds tokens — a decode in flight — is still restored.
+        #[test]
+        fn test_rebuilt_view_restores_only_a_tail_that_holds_tokens() {
+            const CHUNK_SIZE: usize = 32;
+            let (n_kv_head, head_dim) = (4usize, 32usize);
+            let parent_tokens = CHUNK_SIZE + 8;
+            let backing =
+                ChunkedKvBacking::new(4, n_kv_head, head_dim, DType::BF16, &Device::Cpu, 256)
+                    .unwrap();
+            let parent = backing.alloc_sequence().unwrap();
+            backing.ensure_for_offset(parent, 0, parent_tokens).unwrap();
+            let k = Tensor::zeros(
+                (1, n_kv_head, parent_tokens, head_dim),
+                DType::BF16,
+                &Device::Cpu,
+            )
+            .unwrap();
+            backing.write_contiguous(parent, 0, &k, &k).unwrap();
+            backing.set_len(parent, parent_tokens);
+            let chunk_count = |slot: usize| {
+                let state = backing.state.read().unwrap();
+                state.sequences[slot].as_ref().unwrap().chunks_slice().len()
+            };
+
+            // Carved and rebuilt before anything was written: nothing to restore.
+            let view = backing.alloc_sequence().unwrap();
+            backing
+                .create_view_sequence(view, parent, &[(0, 2)])
+                .unwrap();
+            assert_eq!(chunk_count(view), 3, "two borrowed + the carve-time writer");
+            let tail = backing.split_off_writer_tail(view).unwrap();
+            assert_eq!(tail.len(), 1, "the carve-time writer is the whole tail");
+            assert!(tail.is_empty(), "it holds no token the view forwarded");
+            backing.truncate_sequence_to_blocks(view, 0).unwrap();
+            backing.extend_writer_tail(view, tail).unwrap();
+            assert_eq!(chunk_count(view), 0, "the rebuild is left as it placed it");
+
+            // Carved, written into, then rebuilt: the written tail comes back.
+            let view = backing.alloc_sequence().unwrap();
+            let (_, borrowed_tokens) = backing
+                .create_view_sequence(view, parent, &[(0, 2)])
+                .unwrap();
+            backing.ensure_for_offset(view, borrowed_tokens, 5).unwrap();
+            let k5 = Tensor::zeros((1, n_kv_head, 5, head_dim), DType::BF16, &Device::Cpu).unwrap();
+            backing
+                .write_contiguous(view, borrowed_tokens, &k5, &k5)
+                .unwrap();
+            backing.set_len(view, borrowed_tokens + 5);
+            let tail = backing.split_off_writer_tail(view).unwrap();
+            assert!(!tail.is_empty(), "five forwarded tokens are a tail");
+            backing.truncate_sequence_to_blocks(view, 0).unwrap();
+            backing.extend_writer_tail(view, tail).unwrap();
+            let state = backing.state.read().unwrap();
+            let usages: Vec<u32> = state.sequences[view]
+                .as_ref()
+                .unwrap()
+                .chunks_slice()
+                .iter()
+                .map(|c| c.usage)
+                .collect();
+            assert_eq!(usages, [5], "the written tail is restored, tokens and all");
+        }
     }
 
     // ==================== CPU↔GPU sealed-sequence primitives =================

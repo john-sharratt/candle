@@ -1451,10 +1451,11 @@ pub fn run_with_sink<R: ContentResolver>(
                 //
                 // `group_turns` has already masked the candidates to the target
                 // timeline for an append-only target, so "every candidate" is
-                // exactly "this conversation's own turns" — 2-4 for a repo_map
-                // folder, one prior turn for a forked code_read scope. Phase-1
-                // selection is unbounded by design (see the module header): the
-                // flexbox pass below still trims to `layer.window`.
+                // exactly "this conversation's own turns", its fork lineage
+                // first — 2-4 for a repo_map folder, every page read so far for
+                // a code_read file. Neither is trimmed by the flexbox pass
+                // below: the lineage is inviolate and the own turns are the
+                // conversation itself.
                 //
                 // Dialogue retrieving this same content is untouched — the target
                 // is then the dialogue layer, not an append-only one, so this arm
@@ -1950,16 +1951,28 @@ pub fn run_with_sink<R: ContentResolver>(
             let group_budget = group_budgets[gi];
             let tc = |key: TurnKey| exchange_token_count(resolver, &gs.members, key);
 
-            let selected_indices = if gs.schema.is_belief_driven() || gs.ingest_self {
+            let selected_indices: Vec<TurnKey> = if gs.ingest_self {
+                // An ingest conversation's own group is its lineage and its own
+                // turns, and neither is the budget's to trim. The lineage is
+                // inviolate wherever it appears (`apply_selection`'s rule; it is
+                // bounded by `Substrate::INHERITED_CHAIN_TOKEN_CAP`, not by the
+                // window), and the own turns are the conversation itself — its
+                // request and every page it has read since, bounded by its own
+                // read rounds. Trimmed by score, both lost to a tie: the own
+                // turns carry no belief yet and sort last by key, so a file
+                // conversation answered its final turn without its own request
+                // and summarised the priming chain's last document instead.
+                let mut kept = gs.selected.clone();
+                kept.sort_by_key(|(idx, _)| *idx);
+                kept.into_iter().map(|(idx, _)| idx).collect()
+            } else if gs.schema.is_belief_driven() {
                 // Belief already decided the surviving set (RelLeak + the rule's
                 // budget); the bounded pass must ONLY trim to the token budget,
                 // not re-apply the rule's `score_threshold` to the post-leak
                 // belief scores — a selected turn whose leaked score fell below
                 // the threshold would otherwise be silently dropped here,
                 // diverging from the belief decision. Trim low-score-first, then
-                // restore turn order for emission. An ingest conversation's own
-                // group selected every turn itself, whatever rule it declares,
-                // so it is only trimmed too.
+                // restore turn order for emission.
                 let mut kept = gs.selected.clone();
                 trim_to_budget_low_score_first(&mut kept, group_budget, &tc);
                 kept.sort_by_key(|(idx, _)| *idx);

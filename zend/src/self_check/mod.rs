@@ -2,11 +2,12 @@
 //!
 //! A boot step, run once the substrate is loaded and the sections are rebuilt,
 //! and before anything ingests. Each conversation in the dialogue and the
-//! `repo_map` / `code_reading` layers is read back through a fork of its
-//! layer's base and asked the four [`questions::QUESTIONS`]; one that answers
-//! no to any of them is corrupt, and is tombstoned. With `--dry-run` nothing
-//! is tombstoned and every verdict is reported, so the questions can be judged
-//! before they are trusted with a deletion.
+//! `repo_map` / `code_reading` layers is written out as a record
+//! ([`transcript`]) and the model is asked the questions for its
+//! [`questions::Subject`] about that record; one that answers no to any of them
+//! is corrupt, and is tombstoned. With `--dry-run` nothing is tombstoned and
+//! every verdict is reported, so the questions can be judged before they are
+//! trusted with a deletion.
 //!
 //! An ingest conversation tombstoned here is read again by the ingest that
 //! follows — its content key is gone with it. A dialogue tombstoned here is
@@ -15,12 +16,13 @@
 mod ask;
 mod candidates;
 mod questions;
+mod transcript;
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use candle_conversation::projection::{LayerId, TimelineId};
-use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
+use candle_conversation::projection::LayerId;
+use candle_conversation::{ConversationEngine, SequenceConfig, UnsealedAsker};
 use futures::stream::{self, StreamExt};
 
 use crate::config::SelfCheck;
@@ -29,10 +31,10 @@ use ask::Asker;
 use candidates::{select, Candidate, Entry};
 use questions::Findings;
 
-/// Conversations asked at once. Each holds four ephemeral forks while its
+/// Conversations asked at once. Each holds up to four ephemeral forks while its
 /// questions decode, so this bounds the scheduler's extra slots at four times
 /// it; wide enough for the waves to batch, narrow enough to leave the card to
-/// the projections.
+/// the prefills.
 const CONVERSATIONS_IN_FLIGHT: usize = 8;
 
 /// What a run found.
@@ -41,21 +43,23 @@ pub struct Report {
     pub checked: usize,
     pub corrupt: usize,
     pub tombstoned: usize,
-    /// Conversations whose questions could not be put — a fork or a decode
-    /// failed. Never tombstoned: nothing was learned about them.
+    /// Conversations whose questions could not be put — a turn failed, or a
+    /// reply did not open on an answer. Never tombstoned: nothing was learned
+    /// about them.
     pub unanswered: usize,
 }
 
-/// Ask every checkable conversation and act on the answers as `mode` says.
+/// Ask about every checkable conversation in `layers` and act on the answers as
+/// `mode` says.
 ///
-/// `fork` opens a reader on a stored timeline: a fork of `layer`'s base onto
-/// that timeline, which projects its history and writes nothing until a turn
-/// is sealed on it (none is). `layers` are the layers `fork` can serve.
+/// `base` puts the questions: an asker on a conversation with no history of its
+/// own (the dialogue base), so each question's record is the only
+/// conversation in view.
 pub fn run(
     engine: &Mutex<ConversationEngine>,
     config: &SequenceConfig,
     layers: &HashSet<LayerId>,
-    fork: &dyn Fn(LayerId, TimelineId) -> anyhow::Result<Sequence>,
+    base: UnsealedAsker,
     mode: SelfCheck,
     progress: &LoadProgress,
 ) -> anyhow::Result<Report> {
@@ -73,7 +77,7 @@ pub fn run(
                 metadata: e.conversation_metadata(timeline).unwrap_or_default(),
             })
             .collect();
-        (Asker::new(&e, config)?, select(entries, layers))
+        (Asker::new(&e, config, base)?, select(entries, layers))
     };
     let total = candidates.len() as u64;
     tracing::info!(
@@ -93,10 +97,8 @@ pub fn run(
             .map(|c| {
                 let asker = &asker;
                 async move {
-                    let findings = match fork(c.layer, c.timeline) {
-                        Ok(conversation) => asker.check(&conversation).await,
-                        Err(e) => Err(e),
-                    };
+                    let record = transcript::render(&engine.lock().unwrap().turn_texts(c.timeline));
+                    let findings = asker.check(&c.subject, &record).await;
                     (c, findings)
                 }
             })
@@ -150,11 +152,13 @@ fn act_on_corrupt(
     mode: SelfCheck,
 ) -> bool {
     let failed = findings.failed();
+    let reasons = findings.reasons();
     if !matches!(mode, SelfCheck::Tombstone) {
         tracing::warn!(
             timeline = c.timeline.raw(),
             conversation = %c.label,
             failed = %failed,
+            reasons = %reasons,
             "self-check: CORRUPT (dry run — left in place)",
         );
         return false;
@@ -165,6 +169,7 @@ fn act_on_corrupt(
                 timeline = c.timeline.raw(),
                 conversation = %c.label,
                 failed = %failed,
+                reasons = %reasons,
                 "self-check: CORRUPT — tombstoned",
             );
             true

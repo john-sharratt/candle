@@ -48,13 +48,15 @@ use super::coverage::coverage_disagreements;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
 use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
-use super::indexer::{compact_index_caches, select_layer, IndexCache, IndexSnapshot};
+use super::indexer::{
+    compact_index_caches, select_layer, selection_stride, IndexCache, IndexSnapshot,
+};
 use super::paged_index;
 use super::paged_index::SealedIndex;
 use super::ple::{PleSpan, PleState};
 use super::ple_fused::ple_apply_spans_fused;
 use super::qsa::IndexerWeights;
-use super::qsa_select::budget_fits_kernel;
+use super::qsa_select::{budget_fits_kernel, Strata, StrataTokens};
 use super::resident_page::{PageRegistry, PieceKey, ResidentPage};
 use super::select_bytes::select_layer_bytes;
 use super::spec::SpecCapture;
@@ -257,13 +259,105 @@ impl Qwen4ExpBatched {
             MAX_KEEP,
         )
         .map_err(candle::Error::Msg)?;
+        // A strata set before the budget was checked against the old one.
+        let strata = self.model.cfg.indexer.strata;
+        if strata != Strata::WHOLE {
+            self.check_strata(top_k, self.selecting_ratio()?, &strata)?;
+        }
         self.model.cfg.indexer.top_k = top_k;
+        Ok(())
+    }
+
+    /// The one compression ratio every selecting layer shares — what a strata
+    /// stated in positions is converted at.
+    fn selecting_ratio(&self) -> Result<usize> {
+        let mut ratios: Vec<usize> = self
+            .attention_ratios()
+            .into_iter()
+            .filter(|&r| r > 0)
+            .collect();
+        ratios.sort_unstable();
+        ratios.dedup();
+        match ratios.as_slice() {
+            &[ratio] => Ok(ratio),
+            _ => candle::bail!(
+                "qwen4exp: a stratified selection needs one compression ratio across the \
+                 selecting layers, found {ratios:?}"
+            ),
+        }
+    }
+
+    /// Whether the selection kernel can run `strata` under a budget of `top_k`
+    /// at every depth the RoPE schedule reaches.
+    ///
+    /// A budget at or past that reach never selects, so any strata runs. Below
+    /// it, the deepest row is checked with one window more than `reach / ratio`
+    /// candidates cut into: a sequence assembled from sealed pages has a short
+    /// block at every page boundary, so its candidates can outnumber
+    /// `reach / ratio`, and the headroom covers every count of boundaries
+    /// narrower than a window.
+    fn check_strata(&self, top_k: usize, ratio: usize, strata: &Strata) -> Result<()> {
+        let reach = self.rope.select().reach();
+        if top_k >= reach {
+            return Ok(());
+        }
+        selection_stride(ratio, top_k, reach / ratio + strata.window_blocks, strata)?;
         Ok(())
     }
 
     /// The budget [`Self::set_selection_budget`] is currently at.
     pub fn selection_budget(&self) -> usize {
         self.model.cfg.indexer.top_k
+    }
+
+    /// How the QSA selection divides a query's candidates before ranking them
+    /// (`docs/qsa_stratified_selection.md`), stated in positions. A window of
+    /// `0` and no recent span is the checkpoint's selection, the default.
+    ///
+    /// The positions become blocks at the selecting layers' compression ratio,
+    /// which must be one ratio: a window of positions is a different number of
+    /// blocks at each, and the indexer carries one strata. Checked against the
+    /// selection kernel at the deepest position the RoPE schedule reaches,
+    /// under the current budget ([`Self::check_strata`]): a strata whose windows
+    /// would gather more entries than the kernel holds is refused here, at load,
+    /// not at the depth that first reaches it.
+    pub fn set_selection_strata(&mut self, tokens: StrataTokens) -> Result<()> {
+        let ratio = self.selecting_ratio()?;
+        let strata = tokens.blocks(ratio);
+        self.check_strata(self.model.cfg.indexer.top_k, ratio, &strata)?;
+        self.model.cfg.indexer.strata = strata;
+        Ok(())
+    }
+
+    /// The strata [`Self::set_selection_strata`] is currently at.
+    pub fn selection_strata(&self) -> Strata {
+        self.model.cfg.indexer.strata
+    }
+
+    /// Declare that `seq`'s first `tokens` positions hold the conversation's
+    /// system prompt — the span a stratified selection ranks in every window.
+    ///
+    /// Recorded on every one of the sequence's index caches, creating them if
+    /// the sequence has not run a wave yet, so the declaration travels with the
+    /// index through a fork, a move or a truncate.
+    pub fn set_selection_prompt(&self, seq: usize, tokens: usize) -> Result<()> {
+        let cfg = &self.model.cfg;
+        let mut idx = self
+            .index
+            .write()
+            .map_err(|_| candle::Error::Msg("index lock poisoned".into()))?;
+        let caches = match idx.entry(seq) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(
+                (0..cfg.kv_layers().total())
+                    .map(|_| IndexCache::new(cfg.indexer.head_dim, &self.model.device))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+        };
+        for cache in caches.iter_mut() {
+            cache.set_prompt_end(tokens);
+        }
+        Ok(())
     }
 
     /// Whether `seq` carries any of the recurrent classes yet.
@@ -455,6 +549,22 @@ impl Qwen4ExpBatched {
             retired.insert(seq, dropped);
         }
         Ok(())
+    }
+
+    /// The largest position at or before `tokens` that every one of `seq`'s
+    /// index caches can be cut back to (see [`IndexCache::cut_floor`]).
+    pub fn positional_cut_floor(&self, seq: usize, tokens: usize) -> Result<usize> {
+        let map = self
+            .index
+            .read()
+            .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+        Ok(map.get(&seq).map_or(tokens, |caches| {
+            caches
+                .iter()
+                .map(|c| c.cut_floor(tokens))
+                .min()
+                .unwrap_or(tokens)
+        }))
     }
 
     /// Cut `seq`'s index back to `tokens` — the slot's K/V was truncated to a
@@ -1349,7 +1459,12 @@ impl Qwen4ExpBatched {
                     .any(|(c, ratio)| ratio > 0 && c.page_row_span() > 0);
             for (cache, ratio) in caches.iter_mut().zip(self.attention_ratios()) {
                 if starting_over {
+                    // The prompt end is a declaration about what this slot is
+                    // about to hold (`set_selection_prompt`), made before its
+                    // first wave, so the sequence-start reset keeps it.
+                    let prompt_end = cache.prompt_end();
                     cache.reset();
+                    cache.set_prompt_end(prompt_end);
                 }
                 if ratio > 0 {
                     cache.ensure_capacity(tokens, ratio)?;
@@ -1827,6 +1942,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Qwen4ExpBatched::reset_positional_state(self, seq)
     }
 
+    fn positional_cut_floor(&self, seq: usize, tokens: usize) -> Result<usize> {
+        Qwen4ExpBatched::positional_cut_floor(self, seq, tokens)
+    }
+
     fn truncate_positional_state(&self, seq: usize, tokens: usize) -> Result<()> {
         Qwen4ExpBatched::truncate_positional_state(self, seq, tokens)
     }
@@ -2091,6 +2210,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     fn set_rope_min_factor(&mut self, min: f32) -> Result<()> {
         Qwen4ExpBatched::set_rope_min_factor(self, min)
+    }
+
+    fn set_selection_prompt(&self, seq: usize, tokens: usize) -> Result<()> {
+        Qwen4ExpBatched::set_selection_prompt(self, seq, tokens)
     }
 
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {

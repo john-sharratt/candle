@@ -39,6 +39,7 @@ use candle_transformers::models::qwen4exp::indexer::{
     append_wave, AppendSpan, IndexCache, TailRoute, PAGE_BLOCKS as KEY_PAGE_BLOCKS,
 };
 use candle_transformers::models::qwen4exp::qsa::IndexerWeights;
+use candle_transformers::models::qwen4exp::qsa_select::Strata;
 use candle_transformers::models::qwen4exp::resident_page::ResidentPage;
 use candle_transformers::models::rope_schedule::{
     plain_inv_freq, FactoredRope, RopeRungs, RopeSchedule, Rung, ROPE_REACH,
@@ -662,6 +663,7 @@ fn both_tail_routes_match_the_oracle() -> Result<()> {
         n_heads: H,
         head_dim: D,
         top_k: 2048,
+        strata: Strata::WHOLE,
     };
     let w = IndexerWeights {
         q_proj: Tensor::zeros((H * D, 8), DType::F32, &dev)?,
@@ -855,6 +857,7 @@ fn bench_tail_routes() -> Result<()> {
         n_heads: H,
         head_dim: D,
         top_k: 2048,
+        strata: Strata::WHOLE,
     };
     let w = IndexerWeights {
         q_proj: Tensor::zeros((H * D, 8), DType::F32, &dev)?,

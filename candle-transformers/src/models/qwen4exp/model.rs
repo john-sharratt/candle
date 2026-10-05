@@ -427,6 +427,7 @@ mod tests {
     use candle::Device;
 
     use super::super::config::{HcConfig, IndexerConfig, PleConfig};
+    use super::super::qsa_select::Strata;
 
     fn dev() -> Device {
         Device::Cpu
@@ -506,6 +507,7 @@ mod tests {
             head_dim: 4,
             // Tiny budget so a modest context engages real selection.
             top_k: 4,
+            strata: Strata::WHOLE,
         };
         let ple_cfg = PleConfig {
             layer: 1,

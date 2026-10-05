@@ -44,6 +44,7 @@ use candle_transformers::models::delta_net::mix::SeqSpan;
 use candle_transformers::models::qwen4exp::config::IndexerConfig;
 use candle_transformers::models::qwen4exp::indexer::{select_layer, IndexCache};
 use candle_transformers::models::qwen4exp::qsa::IndexerWeights;
+use candle_transformers::models::qwen4exp::qsa_select::Strata;
 use candle_transformers::models::rope_schedule::{plain_inv_freq, FactoredRope};
 
 /// The released geometry (`the_published_geometry_parses`): 4 indexer heads of
@@ -89,6 +90,7 @@ fn idx_cfg() -> IndexerConfig {
         n_heads: N_HEADS,
         head_dim: HEAD_DIM,
         top_k: TOP_K,
+        strata: Strata::WHOLE,
     }
 }
 

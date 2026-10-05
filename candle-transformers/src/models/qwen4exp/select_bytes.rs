@@ -15,10 +15,10 @@
 use std::collections::HashMap;
 
 use candle::Result;
+use candle_kernels::simple::qsa_topk::SPLIT_KEYS;
 
 use super::config::IndexerConfig;
-use super::indexer::{selection_engages, IndexCache};
-use super::qsa_select::max_entries;
+use super::indexer::{selection_engages, selection_stride, widest_candidates, IndexCache};
 use crate::models::delta_net::SeqSpan;
 
 /// The bump alignment every carve starts on.
@@ -54,8 +54,17 @@ pub fn select_layer_bytes(
         return Ok(bytes);
     }
 
-    // The selection table.
-    bytes += a(rows * max_entries(cfg.top_k, ratio) * 4) + a(rows * 4);
+    // The selection table — its rows as wide as the deepest row's stratified
+    // selection can be, through the same sizing the table itself uses.
+    let stride = selection_stride(
+        ratio,
+        cfg.top_k,
+        widest_candidates(spans, offsets, idx_map, kv, ratio),
+        &cfg.strata,
+    )?;
+    bytes += a(rows * stride * 4) + a(rows * 4);
+    // The selection kernel's split scratch, a fixed size.
+    bytes += a(SPLIT_KEYS * 8);
     // The queries: the projection, the norm's chain (the square, the mean, the
     // epsilon, the root, the divide, the gain), the rotation's position and
     // rung tables, and the rotated rows.
@@ -80,8 +89,9 @@ pub fn select_layer_bytes(
         prefixes += cache.page_prefixes().len();
     }
     bytes += a(rows * widest * 4);
-    // The selection kernel's packed row metadata.
-    bytes += a(3 * rows * 4);
+    // The selection kernel's packed row metadata: candidates, position, tail
+    // and prompt span.
+    bytes += a(4 * rows * 4);
     // The page layout the attention walks, when any sequence holds a prefix.
     if needs_pages {
         // A sequence without a cache contributes the degenerate two-word layout.

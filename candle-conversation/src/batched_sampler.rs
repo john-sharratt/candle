@@ -89,21 +89,27 @@ struct SeqDials {
     typical_draft: i32,
     typical_eps: f32,
     typical_delta: f32,
+    /// The row of the logits block this entry samples. A dispatch whose other
+    /// rows are resolved on the host (a grammar allow-list) hands the kernel
+    /// the whole block and names each kernel row's source here, rather than
+    /// gathering the kernel rows into a compacted copy first — a copy that, on
+    /// a wave's head span, would claim a block of logits the wave never priced.
+    logits_row: i32,
 }
 
 // The kernel reads this struct as a flat run of 4-byte words (all fields are
 // f32/i32), one per row of the batch, and casts back to the identically-laid-out
 // CUDA `SeqDials`. If the size or field count drifts from the CUDA side the
-// kernel reads a row at the wrong stride, so pin it: 24 fields × 4 bytes.
-const _: () = assert!(std::mem::size_of::<SeqDials>() == 96);
+// kernel reads a row at the wrong stride, so pin it: 25 fields × 4 bytes.
+const _: () = assert!(std::mem::size_of::<SeqDials>() == 100);
 
 impl SeqDials {
     /// Read one row's dials from its config, resolving the same Option/gate logic
     /// the scalar path applies (DRY defaults, the dynamic-EOS gate, the
     /// segment-close-active gate) so a per-row wave behaves identically to a
-    /// uniform one row-for-row. The row tests no draft until
-    /// [`Self::with_draft`] gives it one.
-    fn from_config(c: &SamplingConfig) -> Self {
+    /// uniform one row-for-row. The row samples `logits_row` of the dispatch's
+    /// logits block, and tests no draft until [`Self::with_draft`] gives it one.
+    fn from_config(c: &SamplingConfig, logits_row: usize) -> Self {
         let (dry_multiplier, dry_base, dry_allowed_length, dry_range) = match &c.dry {
             Some(d) => (d.multiplier, d.base, d.allowed_length, d.range),
             None => (0.0, 1.75, 2, 0),
@@ -157,6 +163,7 @@ impl SeqDials {
             typical_draft: -1,
             typical_eps: 0.0,
             typical_delta: 0.0,
+            logits_row: logits_row as i32,
         }
     }
 
@@ -888,24 +895,18 @@ impl BatchedSampler {
         // `configs[i]` directly (the segment-close budget and EOS failsafes in
         // the post-kernel loop), never row 0.
         if !kernel_idx.is_empty() {
-            // Gather just the kernel rows — unless they ARE the whole batch, in
-            // which case skip the copy and run the kernel over every row.
-            let kernel_logits = if kernel_idx.len() == batch_size {
-                logits2d.clone()
-            } else {
-                let idx = Tensor::from_vec(
-                    kernel_idx.iter().map(|&i| i as u32).collect::<Vec<_>>(),
-                    kernel_idx.len(),
-                    &self.device,
-                )?;
-                logits2d.index_select(&idx, 0)?
-            };
+            // The kernel reads its rows out of the whole block in place, each
+            // named by its index (`SeqDials::logits_row`). No compacted copy of
+            // the kernel rows is made: the block sits on the wave's head span,
+            // and a copy would claim a second block of logits there that the
+            // wave never priced.
             let kernel_verify = verify.map(|(drafts, typical)| {
                 let rows: Vec<Option<u32>> = kernel_idx.iter().map(|&i| drafts[i]).collect();
                 (rows, typical)
             });
             let tokens = self.sample_full_vocab(
-                &kernel_logits,
+                &logits2d,
+                &kernel_idx,
                 &mut kernel_states,
                 &kernel_configs,
                 kernel_verify.as_ref().map(|(r, t)| (r.as_slice(), *t)),
@@ -963,17 +964,27 @@ impl BatchedSampler {
     }
 
     /// Dispatch the unconstrained (full-vocab) rows to the device sampler.
+    /// `rows[i]` is the row of the `[batch, vocab]` block `logits` that
+    /// `states[i]` samples.
     fn sample_full_vocab(
         &self,
         logits: &Tensor,
+        rows: &[usize],
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
         verify: Option<(&[Option<u32>], TypicalAcceptance)>,
     ) -> candle::Result<Vec<u32>> {
+        if rows.len() != states.len() {
+            candle::bail!(
+                "sample_full_vocab: {} rows for {} sampling states",
+                rows.len(),
+                states.len()
+            );
+        }
         if matches!(self.device, Device::Cuda(_)) {
-            self.sample_batch_cuda(logits, states, configs, verify)
+            self.sample_batch_cuda(logits, rows, states, configs, verify)
         } else {
-            self.sample_batch_cpu(logits, states, configs, verify)
+            self.sample_batch_cpu(logits, rows, states, configs, verify)
         }
     }
 
@@ -1158,6 +1169,7 @@ impl BatchedSampler {
     fn sample_batch_cpu(
         &self,
         logits: &Tensor,
+        rows: &[usize],
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
         verify: Option<(&[Option<u32>], TypicalAcceptance)>,
@@ -1166,12 +1178,8 @@ impl BatchedSampler {
         let mut results = Vec::with_capacity(batch_size);
 
         for (i, (state, &config)) in states.iter_mut().zip(configs.iter()).enumerate() {
-            // Extract logits for this sequence
-            let seq_logits = if logits.dims().len() == 2 {
-                logits.i(i)?
-            } else {
-                logits.clone()
-            };
+            // This sequence's row of the block.
+            let seq_logits = logits.i(rows[i])?;
 
             // Apply this row's banned tokens (a small deny-list, e.g. a few EOS
             // ids) by setting just those values to `-inf`.  Cheap on CPU — only the
@@ -1267,6 +1275,7 @@ impl BatchedSampler {
     fn sample_batch_cuda(
         &self,
         logits: &Tensor,
+        logits_rows: &[usize],
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
         verify: Option<(&[Option<u32>], TypicalAcceptance)>,
@@ -1439,7 +1448,7 @@ impl BatchedSampler {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let dials = SeqDials::from_config(c);
+                let dials = SeqDials::from_config(c, logits_rows[i]);
                 match verify {
                     Some((drafts, typical)) => dials.with_draft(drafts[i], typical),
                     None => dials,
@@ -2184,8 +2193,13 @@ mod tests {
         narrator.segment_close_boost = 0.0;
         narrator.segment_close_token_id = -1;
 
-        let d = SeqDials::from_config(&deliberating);
-        let n = SeqDials::from_config(&narrator);
+        let d = SeqDials::from_config(&deliberating, 0);
+        let n = SeqDials::from_config(&narrator, 3);
+        assert_eq!(
+            (d.logits_row, n.logits_row),
+            (0, 3),
+            "each names its own row"
+        );
 
         assert_eq!(
             d.segment_close_token_id, 90,
@@ -2211,7 +2225,7 @@ mod tests {
         let mut c = SamplingConfig::argmax();
         c.segment_close_boost = 5.0;
         c.segment_close_token_id = -1; // boost set, but no token to boost
-        let d = SeqDials::from_config(&c);
+        let d = SeqDials::from_config(&c, 0);
         assert_eq!(d.segment_close_token_id, -1);
         assert_eq!(
             d.segment_close_boost, 0.0,
@@ -2984,6 +2998,44 @@ mod tests {
                 .expect("sample");
             assert_eq!(tokens, vec![20, 50, 40], "{device:?}");
             assert_eq!((s0.rng_offset, s2.rng_offset), (1, 1), "{device:?}");
+        }
+    }
+
+    /// **The kernel reads each free row in place, from its own row.** Rows 0
+    /// and 2 are free and row 1 is constrained, so the kernel samples two rows
+    /// out of a three-row block without a compacted copy of them: row 0 must
+    /// come from row 0 (peak 70) and row 2 from row 2 (peak 90), not from the
+    /// first two rows of the block (which would give 70 and row 1's peak, 60).
+    /// Every row peaks at a different token so a misread row cannot pass.
+    #[test]
+    fn free_rows_beside_a_constrained_one_sample_their_own_logits() {
+        let free = SamplingConfig::argmax();
+        let constrained = SamplingConfig::argmax().with_stencil(vec![10, 20]);
+        for device in devices() {
+            let sampler = BatchedSampler::new(
+                device.clone(),
+                VOCAB_SIZE,
+                VOCAB_SIZE,
+                MAX_RECENT,
+                vec![EOS_TOKEN].into(),
+                None,
+            );
+            let (mut s0, mut s1, mut s2) = (make_state(), make_state(), make_state());
+            let logits = logits_from_rows(&[
+                &[(70, 100.0)],
+                &[(60, 100.0), (20, 5.0), (10, 1.0)],
+                &[(90, 100.0)],
+            ])
+            .to_device(&device)
+            .expect("logits");
+            let tokens = sampler
+                .sample_batch(
+                    &logits,
+                    &mut [&mut s0, &mut s1, &mut s2],
+                    &[&free, &constrained, &free],
+                )
+                .expect("sample");
+            assert_eq!(tokens, vec![70, 20, 90], "{device:?}");
         }
     }
 

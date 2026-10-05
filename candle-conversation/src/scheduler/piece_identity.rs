@@ -71,6 +71,35 @@ pub(super) fn kept_prefix(placed: &[u64], identities: &[u64], pieces: &[Assemble
         .count()
 }
 
+/// Shrink a kept run of `keep` pieces until the position it ends at is one the
+/// model can cut its per-position state back to.
+///
+/// `pos_after[i]` is where placed piece `i` ends, and `floor(pos)` is the
+/// largest position at or before `pos` the model accepts as a cut. The model
+/// may group its state more coarsely than the pieces — one index page over a
+/// slot's whole injected prefix — and a run that ends inside such a group keeps
+/// only the pieces that end at or before the group's start. Each round keeps
+/// strictly fewer pieces, so the walk ends; at worst it keeps none and the
+/// rebuild re-injects everything.
+pub(super) fn fit_kept_prefix<E>(
+    pos_after: &[u32],
+    mut keep: usize,
+    floor: impl Fn(usize) -> Result<usize, E>,
+) -> Result<usize, E> {
+    while keep > 0 {
+        let end = pos_after[keep - 1] as usize;
+        let cut = floor(end)?;
+        if cut == end {
+            break;
+        }
+        keep = pos_after[..keep]
+            .iter()
+            .take_while(|&&p| p as usize <= cut)
+            .count();
+    }
+    Ok(keep)
+}
+
 /// A piece as a log names it: its kind and what identifies it.
 pub(super) fn piece_label(piece: &AssembledPiece) -> String {
     let tl = |t: &Option<TimelineId>| t.map_or(0, |t| t.raw());
@@ -236,6 +265,63 @@ mod tests {
         let windowed = ids_with(&pieces, &|_, _| false);
         assert_eq!(whole[0], windowed[0]);
         assert_ne!(whole[1], windowed[1]);
+    }
+
+    /// Positions a model can cut at, given its groups as `[start, end)` ranges:
+    /// the start of the group a position falls inside, else the position.
+    fn floor_in(groups: &'static [(usize, usize)]) -> impl Fn(usize) -> Result<usize, ()> {
+        move |pos| {
+            Ok(groups
+                .iter()
+                .find(|&&(start, end)| start < pos && pos < end)
+                .map_or(pos, |&(start, _)| start))
+        }
+    }
+
+    /// The case that failed live: a dialogue base whose whole injected prefix
+    /// is one page, 0..1338, and a question whose projection first differs
+    /// after the 3-token opening. The run cannot end at 3, so nothing is kept.
+    #[test]
+    fn a_run_ending_inside_a_page_keeps_nothing_before_it() {
+        let ends = [3, 120, 1338, 1400];
+        assert_eq!(fit_kept_prefix(&ends, 1, floor_in(&[(0, 1338)])), Ok(0));
+    }
+
+    #[test]
+    fn a_run_ending_on_a_page_boundary_is_kept_whole() {
+        let ends = [3, 120, 1338, 1400];
+        assert_eq!(fit_kept_prefix(&ends, 3, floor_in(&[(0, 1338)])), Ok(3));
+        assert_eq!(fit_kept_prefix(&ends, 4, floor_in(&[(0, 1338)])), Ok(4));
+        assert_eq!(fit_kept_prefix(&ends, 2, floor_in(&[])), Ok(2));
+        assert_eq!(fit_kept_prefix(&ends, 0, floor_in(&[(0, 1338)])), Ok(0));
+    }
+
+    /// The floor lands on a position that ends no piece, so the run steps back
+    /// to the last piece before it — which may itself sit inside an earlier
+    /// group and step back again.
+    #[test]
+    fn a_run_steps_back_until_its_end_is_a_cut_the_model_accepts() {
+        let ends = [10, 40, 70, 100];
+        // Groups 0..50 and 50..100: an end at 70 floors to 50, which ends no
+        // piece; the last piece before it ends at 40, inside 0..50, so the run
+        // steps back again, to nothing.
+        assert_eq!(
+            fit_kept_prefix(&ends, 3, floor_in(&[(0, 50), (50, 100)])),
+            Ok(0)
+        );
+        // With groups 0..40 and 40..100 the second step lands on 40 exactly.
+        assert_eq!(
+            fit_kept_prefix(&ends, 3, floor_in(&[(0, 40), (40, 100)])),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn a_failing_floor_is_returned() {
+        assert_eq!(
+            fit_kept_prefix(&[5], 1, |_| Err("lock poisoned")),
+            Err("lock poisoned")
+        );
     }
 
     #[test]

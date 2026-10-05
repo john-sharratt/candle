@@ -147,12 +147,14 @@ pub fn qsa_selection_mask(
     // Per query token: the shared selection (`qsa_select`), expanded into this
     // row's additive mask. A row too short for the budget attends everything
     // visible — the same identity the whole-segment early return above takes,
-    // reached per row because a segment may straddle the threshold.
+    // reached per row because a segment may straddle the threshold. The
+    // reference forwards its whole sequence itself, so nothing ahead of it is a
+    // system prompt placed by a projection: no prompt span.
     let mut mask = vec![f32::NEG_INFINITY; t * total];
     let mut entries: Vec<u32> = Vec::new();
     for (i, row) in scores.iter().enumerate() {
         let qpos = past + i;
-        match selection_entries(row, qpos, r, cfg.top_k, &mut entries) {
+        match selection_entries(row, qpos, r, cfg.top_k, &cfg.strata, 0, &mut entries) {
             RowSelection::Dense => {
                 for j in 0..=qpos {
                     mask[i * total + j] = 0.0;
@@ -174,6 +176,7 @@ pub fn qsa_selection_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::qwen4exp::qsa_select::Strata;
     use candle::Device;
 
     fn dev() -> Device {
@@ -218,6 +221,7 @@ mod tests {
             n_heads: 2,
             head_dim: 8,
             top_k: 8,
+            strata: Strata::WHOLE,
         };
         let w = tiny(6, &cfg, &dev);
         let rope = RopeTables::new(4, 1e6, 64, &dev).unwrap();
@@ -236,6 +240,7 @@ mod tests {
             n_heads: 2,
             head_dim: 8,
             top_k: 4,
+            strata: Strata::WHOLE,
         };
         let r = 4usize;
         let width = cfg.top_k + r - 1; // 7
@@ -292,6 +297,7 @@ mod tests {
             n_heads: 2,
             head_dim: 8,
             top_k: 8,
+            strata: Strata::WHOLE,
         };
         let r = 4usize;
         let w = tiny(6, &cfg, &dev);
@@ -338,6 +344,7 @@ mod tests {
             n_heads: 2,
             head_dim: 8,
             top_k: 4,
+            strata: Strata::WHOLE,
         };
         let r = 4usize;
         let w = tiny(6, &cfg, &dev);

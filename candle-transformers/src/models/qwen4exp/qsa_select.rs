@@ -28,6 +28,14 @@
 //! by ascending cell index, so ranking cells and ranking blocks give the same
 //! set — see [`selection_entries`]'s implementation note.
 //!
+//! # Stratified selection
+//!
+//! The candidates may be cut into windows ([`Strata`]), each ranking its own
+//! blocks — plus the system prompt's and, as candidates, the recent span's —
+//! and spending the whole budget on them; the query attends the union. One
+//! window over every candidate is the selection above, exactly
+//! (`docs/qsa_stratified_selection.md`).
+//!
 //! # The packing
 //!
 //! One entry is one **run of cells at the bottom of a block**, which is all
@@ -35,6 +43,8 @@
 //! block. A whole block is `cells == ratio`. The two-bit cell field is why
 //! [`MAX_RATIO`] is 4 — the released checkpoint's `indexer_compress_ratio`,
 //! and the widest the packing admits without a second word per entry.
+
+use std::collections::BTreeMap;
 
 /// Bits of an entry reserved for the cell count.
 const CELL_BITS: u32 = 2;
@@ -164,12 +174,157 @@ pub enum RowSelection {
     Entries(usize),
 }
 
-/// Build one query's selection, ascending by block, into `out`.
+/// How a query's candidate blocks are divided before they are ranked — the
+/// stratified selection (`docs/qsa_stratified_selection.md`).
+///
+/// The candidates are cut into windows of `window_blocks` blocks walking
+/// forward from block 0, and **each window spends the whole budget on its own
+/// blocks**: a block competes only with the blocks of its window, plus the two
+/// spans every window also ranks — the conversation's system prompt and, as a
+/// candidate, the recent span nearest the query. The attended set is the union
+/// of every window's choice, the forced recent span, and the query's own tail.
+///
+/// Why: the budget is a fixed count, so the share of a deep context it can
+/// reach shrinks with depth — 512 of ~73,700 blocks at 294K tokens. A short
+/// turn of the conversation then has to outrank every near-duplicate in the
+/// whole context to be seen at all. A window bounds the competition to what the
+/// checkpoint was trained to choose among.
+///
+/// [`Strata::WHOLE`] — one window spanning every candidate, no recent span — is
+/// exactly the checkpoint's selection, not an approximation of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Strata {
+    /// Candidate blocks per window, counted from block 0. `0` is one window
+    /// spanning every candidate.
+    pub window_blocks: usize,
+    /// How many of the candidate blocks nearest the query form the recent span.
+    pub recent_blocks: usize,
+    /// How the recent span enters the selection.
+    pub recent: Recent,
+}
+
+/// How the recent span enters a stratified selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recent {
+    /// Ranked in every window beside that window's own blocks — more chances to
+    /// be chosen, and still chosen only on score.
+    Candidate,
+    /// Attended whole, and left out of every window's ranking.
+    Forced,
+}
+
+impl Strata {
+    /// One window over every candidate and no recent span: the checkpoint's
+    /// selection.
+    pub const WHOLE: Self = Self {
+        window_blocks: 0,
+        recent_blocks: 0,
+        recent: Recent::Candidate,
+    };
+
+    /// Blocks per window over `cand` candidates.
+    pub fn window_width(&self, cand: usize) -> usize {
+        if self.window_blocks == 0 {
+            cand.max(1)
+        } else {
+            self.window_blocks
+        }
+    }
+
+    /// Windows `cand` candidates are cut into — at least one.
+    pub fn windows(&self, cand: usize) -> usize {
+        cand.div_ceil(self.window_width(cand)).max(1)
+    }
+
+    /// Blocks attended outside every window's ranking.
+    pub fn forced(&self, cand: usize) -> usize {
+        match self.recent {
+            Recent::Forced => self.recent_blocks.min(cand),
+            Recent::Candidate => 0,
+        }
+    }
+}
+
+/// A [`Strata`] in positions — how a caller states it, before the model's
+/// compression ratio turns it into blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrataTokens {
+    /// Positions per window; `0` is one window spanning every candidate.
+    pub window: usize,
+    /// Positions nearest the query that form the recent span.
+    pub recent: usize,
+    /// How the recent span enters the selection.
+    pub mode: Recent,
+}
+
+impl StrataTokens {
+    /// The strata in blocks of `ratio` positions. A window or span that does
+    /// not divide into whole blocks rounds up, so it never covers less than was
+    /// asked for.
+    pub fn blocks(&self, ratio: usize) -> Strata {
+        Strata {
+            window_blocks: self.window.div_ceil(ratio),
+            recent_blocks: self.recent.div_ceil(ratio),
+            recent: self.mode,
+        }
+    }
+}
+
+/// The most entries one query's selection can hold under `strata` over `cand`
+/// candidate blocks — what a selection table's row stride is sized from.
+///
+/// Each window keeps at most [`max_keep`] blocks, the forced span adds its own,
+/// and no row can name more blocks than it has candidates; the tail takes one
+/// more. Under [`Strata::WHOLE`] with at least [`max_keep`] candidates this is
+/// [`max_entries`] — the checkpoint's row, unchanged.
+pub fn max_entries_for(top_k: usize, ratio: usize, cand: usize, strata: &Strata) -> usize {
+    let blocks = strata.windows(cand) * max_keep(top_k, ratio) + strata.forced(cand);
+    blocks.min(cand) + 1
+}
+
+/// The most entries one query's windows choose before the union reduces
+/// repeats — what the selection kernel's sort buffer is sized from.
+///
+/// [`max_entries_for`] bounds what survives the union. Before it, a block
+/// chosen by several windows (a prompt block, or a recent candidate) appears
+/// once per window that chose it, so the count is bounded by the sum of every
+/// window's keep, not by the row's candidates. The forced span and the tail sit
+/// above every window and never enter the sort.
+pub fn max_gathered_for(top_k: usize, ratio: usize, cand: usize, strata: &Strata) -> usize {
+    strata.windows(cand) * max_keep(top_k, ratio)
+}
+
+/// The candidate blocks window `w` ranks, ascending: its own blocks, the
+/// prompt's, and — as candidates — the recent span's, less the forced span.
+fn window_pool(strata: &Strata, cand: usize, prompt_blocks: usize, w: usize) -> Vec<u32> {
+    let width = strata.window_width(cand);
+    let (lo, hi) = (w * width, ((w + 1) * width).min(cand));
+    let forced_lo = cand - strata.forced(cand);
+    let recent_lo = cand - strata.recent_blocks.min(cand);
+    let prompt = prompt_blocks.min(cand);
+    let recent = match strata.recent {
+        Recent::Candidate => recent_lo..cand,
+        Recent::Forced => cand..cand,
+    };
+    let mut pool: Vec<u32> = (lo..hi)
+        .chain(0..prompt)
+        .chain(recent)
+        .filter(|&b| b < forced_lo)
+        .map(|b| b as u32)
+        .collect();
+    pool.sort_unstable();
+    pool.dedup();
+    pool
+}
+
+/// Build one query's selection under `strata`, ascending by block, into `out`.
 ///
 /// `scores[b]` is block `b`'s indexer score; only blocks below the query's
 /// tail are read, so `scores` may be shorter than the sequence's block count
-/// as long as it covers `((qpos+1)/ratio·ratio)/ratio` entries. `out` is
-/// cleared first and grows to at most [`max_entries`].
+/// as long as it covers `((qpos+1)/ratio·ratio)/ratio` entries.
+/// `prompt_blocks` is how many leading blocks hold the conversation's system
+/// prompt — ranked in every window. `out` is cleared first and grows to at most
+/// [`max_entries_for`].
 ///
 /// # Implementation note — why ranking blocks is ranking cells
 ///
@@ -180,11 +335,17 @@ pub enum RowSelection {
 /// each block expanded in place. Cutting the cell ranking at the budget cuts
 /// the block ranking at `budget/ratio` whole blocks plus the low
 /// `budget mod ratio` cells of the next.
+///
+/// Each window makes that cut over its own pool. A block two windows both
+/// choose — a prompt block, or a recent one ranked as a candidate — is attended
+/// once, at the wider of the two cuts.
 pub fn selection_entries(
     scores: &[f32],
     qpos: usize,
     ratio: usize,
     top_k: usize,
+    strata: &Strata,
+    prompt_blocks: usize,
     out: &mut Vec<u32>,
 ) -> RowSelection {
     debug_assert!((1..=MAX_RATIO).contains(&ratio));
@@ -204,34 +365,48 @@ pub fn selection_entries(
     let full = budget / ratio;
     let rem = budget % ratio;
 
-    // Rank the candidates by (score desc, block asc). The cut needs the first
-    // `full + 1` in that order, so a partial sort of the prefix is enough.
-    let mut order: Vec<u32> = (0..n_cand as u32).collect();
-    let keep = (full + usize::from(rem > 0)).min(n_cand);
     let by_rank = |a: &u32, b: &u32| {
         let (sa, sb) = (scores[*a as usize], scores[*b as usize]);
         sb.partial_cmp(&sa)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.cmp(b))
     };
-    if keep < n_cand {
-        order.select_nth_unstable_by(keep, by_rank);
-        order.truncate(keep + 1);
-    }
-    order.sort_unstable_by(by_rank);
-
-    for &b in order.iter().take(full) {
-        out.push(pack_entry(b as usize, ratio));
-    }
-    if rem > 0 {
-        if let Some(&b) = order.get(full) {
-            out.push(pack_entry(b as usize, rem));
+    // Cells attended per chosen block; a block chosen by several windows keeps
+    // its widest cut.
+    let mut cells: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut choose = |b: u32, n: usize| {
+        cells.entry(b).and_modify(|c| *c = (*c).max(n)).or_insert(n);
+    };
+    for w in 0..strata.windows(n_cand) {
+        // Rank the window's pool by (score desc, block asc). The cut needs the
+        // first `full + 1` in that order, so a partial sort of the prefix is
+        // enough.
+        let mut order = window_pool(strata, n_cand, prompt_blocks, w);
+        let n_pool = order.len();
+        let keep = (full + usize::from(rem > 0)).min(n_pool);
+        if keep < n_pool {
+            order.select_nth_unstable_by(keep, by_rank);
+            order.truncate(keep + 1);
+        }
+        order.sort_unstable_by(by_rank);
+        for &b in order.iter().take(full) {
+            choose(b, ratio);
+        }
+        if rem > 0 {
+            if let Some(&b) = order.get(full) {
+                choose(b, rem);
+            }
         }
     }
-    if n_tail > 0 {
-        out.push(pack_entry(tail_start / ratio, n_tail));
+    for b in n_cand - strata.forced(n_cand)..n_cand {
+        choose(b as u32, ratio);
     }
-    out.sort_unstable();
+
+    // Ascending already: the chosen blocks are all below the tail's block.
+    out.extend(cells.iter().map(|(&b, &n)| pack_entry(b as usize, n)));
+    if n_tail > 0 {
+        out.push(pack_entry(n_cand, n_tail));
+    }
     RowSelection::Entries(out.len())
 }
 
@@ -277,7 +452,7 @@ mod tests {
                     let scores: Vec<f32> = (0..n_blocks).map(|b| (n_blocks - b) as f32).collect();
                     let mut out = Vec::new();
                     if let RowSelection::Entries(n) =
-                        selection_entries(&scores, qpos, ratio, top_k, &mut out)
+                        selection_entries(&scores, qpos, ratio, top_k, &Strata::WHOLE, 0, &mut out)
                     {
                         assert_eq!(n, out.len());
                         assert!(
@@ -312,7 +487,7 @@ mod tests {
         let scores: Vec<f32> = (0..n_blocks).map(|b| (n_blocks - b) as f32).collect();
         let mut out = Vec::new();
         // qpos 4096 ⇒ visible 4097, tail_start 4096, n_tail 1.
-        let sel = selection_entries(&scores, 4096, 4, 2047, &mut out);
+        let sel = selection_entries(&scores, 4096, 4, 2047, &Strata::WHOLE, 0, &mut out);
         assert_eq!(sel, RowSelection::Entries(514));
         assert!(out.len() <= max_entries(2047, 4));
     }
@@ -386,7 +561,7 @@ mod tests {
         let scores = lcg_scores(64, 11);
         let mut out = Vec::new();
         for qpos in 11..64 {
-            let sel = selection_entries(&scores, qpos, ratio, top_k, &mut out);
+            let sel = selection_entries(&scores, qpos, ratio, top_k, &Strata::WHOLE, 0, &mut out);
             let want = reference_cells(&scores, qpos, ratio, top_k);
             match sel {
                 RowSelection::Dense => {
@@ -408,7 +583,8 @@ mod tests {
             let scores = lcg_scores(64, 23 + ratio as u64);
             let mut out = Vec::new();
             for qpos in 0..64 {
-                let sel = selection_entries(&scores, qpos, ratio, top_k, &mut out);
+                let sel =
+                    selection_entries(&scores, qpos, ratio, top_k, &Strata::WHOLE, 0, &mut out);
                 let want = reference_cells(&scores, qpos, ratio, top_k);
                 match sel {
                     RowSelection::Dense => {
@@ -431,7 +607,7 @@ mod tests {
         let mut out = Vec::new();
         let qpos = 50; // tail = 48..=50, budget = 11 − 3 = 8 cells = 2 blocks
         assert_eq!(
-            selection_entries(&scores, qpos, ratio, top_k, &mut out),
+            selection_entries(&scores, qpos, ratio, top_k, &Strata::WHOLE, 0, &mut out),
             RowSelection::Entries(3)
         );
         assert_eq!(
@@ -447,10 +623,18 @@ mod tests {
         let scores = lcg_scores(2048, 7);
         let mut out = Vec::new();
         assert_eq!(
-            selection_entries(&scores, width - 1, ratio, top_k, &mut out),
+            selection_entries(
+                &scores,
+                width - 1,
+                ratio,
+                top_k,
+                &Strata::WHOLE,
+                0,
+                &mut out
+            ),
             RowSelection::Dense
         );
-        let sel = selection_entries(&scores, width, ratio, top_k, &mut out);
+        let sel = selection_entries(&scores, width, ratio, top_k, &Strata::WHOLE, 0, &mut out);
         let RowSelection::Entries(n) = sel else {
             panic!("position {width} must engage selection");
         };
@@ -465,7 +649,8 @@ mod tests {
         let scores = lcg_scores(64, 31);
         let mut out = Vec::new();
         for qpos in [13usize, 22, 47, 63] {
-            let RowSelection::Entries(_) = selection_entries(&scores, qpos, ratio, top_k, &mut out)
+            let RowSelection::Entries(_) =
+                selection_entries(&scores, qpos, ratio, top_k, &Strata::WHOLE, 0, &mut out)
             else {
                 continue;
             };
@@ -511,5 +696,236 @@ mod tests {
         // At or past the context nothing selects, however wide.
         assert_eq!(budget_fits_kernel(context, &ratios, context, 768), Ok(()));
         assert_eq!(budget_fits_kernel(1 << 20, &ratios, context, 768), Ok(()));
+    }
+
+    // —— Stratified selection ————————————————————————————————————————————————
+    //
+    // One geometry throughout: ratio 4, top_k 8 (width 11), a query at 63 —
+    // visible 64, no tail, 16 candidate blocks, a budget of 11 cells = 2 whole
+    // blocks and the low 3 cells of a third, spent once per window.
+
+    const R: usize = 4;
+    const K: usize = 8;
+    const Q: usize = 63;
+
+    /// Window 0 (blocks 0–7) outscores window 1 (blocks 8–15) everywhere.
+    const SKEWED: [f32; 16] = [
+        9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 1.5, 0.5, 1.7, 0.2, 0.9, 1.1, 0.3,
+    ];
+
+    fn strata(window_blocks: usize, recent_blocks: usize, recent: Recent) -> Strata {
+        Strata {
+            window_blocks,
+            recent_blocks,
+            recent,
+        }
+    }
+
+    fn select(scores: &[f32], strata: &Strata, prompt_blocks: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        let sel = selection_entries(scores, Q, R, K, strata, prompt_blocks, &mut out);
+        assert_eq!(sel, RowSelection::Entries(out.len()));
+        out
+    }
+
+    fn entries(blocks: &[(usize, usize)]) -> Vec<u32> {
+        blocks.iter().map(|&(b, c)| pack_entry(b, c)).collect()
+    }
+
+    /// The whole-context cut takes the top of the skew and nothing from the
+    /// lower window; two windows each spend the full budget on their own.
+    #[test]
+    fn each_window_spends_the_whole_budget_on_its_own_blocks() {
+        assert_eq!(
+            select(&SKEWED, &Strata::WHOLE, 0),
+            entries(&[(0, 4), (1, 4), (2, 3)])
+        );
+        assert_eq!(
+            select(&SKEWED, &strata(8, 0, Recent::Candidate), 0),
+            entries(&[(0, 4), (1, 4), (2, 3), (9, 4), (11, 4), (14, 3)])
+        );
+    }
+
+    /// The prompt is ranked in every window: block 0 tops window 1 as well,
+    /// and is attended once.
+    #[test]
+    fn the_prompt_competes_in_every_window_and_is_attended_once() {
+        assert_eq!(
+            select(&SKEWED, &strata(8, 0, Recent::Candidate), 1),
+            entries(&[(0, 4), (1, 4), (2, 3), (9, 3), (11, 4)])
+        );
+    }
+
+    /// A recent candidate is ranked beside window 0's blocks too, and wins a
+    /// seat there that it would also have won in its own window.
+    #[test]
+    fn a_recent_candidate_is_ranked_in_every_window() {
+        let mut scores = SKEWED;
+        scores[15] = 8.5;
+        assert_eq!(
+            select(&scores, &Strata::WHOLE, 0),
+            entries(&[(0, 4), (1, 3), (15, 4)])
+        );
+        assert_eq!(
+            select(&scores, &strata(8, 2, Recent::Candidate), 0),
+            entries(&[(0, 4), (1, 3), (9, 3), (11, 4), (15, 4)])
+        );
+    }
+
+    /// Forced recent blocks are attended whole however they score, and no
+    /// window spends budget on them: window 1 ranks only blocks 8–13.
+    #[test]
+    fn a_forced_recent_span_is_attended_whole_and_ranked_nowhere() {
+        assert_eq!(
+            select(&SKEWED, &strata(8, 2, Recent::Forced), 0),
+            entries(&[
+                (0, 4),
+                (1, 4),
+                (2, 3),
+                (8, 3),
+                (9, 4),
+                (11, 4),
+                (14, 4),
+                (15, 4)
+            ])
+        );
+        // One window, forced: the span is still added and still unranked.
+        assert_eq!(
+            select(&SKEWED, &strata(0, 2, Recent::Forced), 0),
+            entries(&[(0, 4), (1, 4), (2, 3), (14, 4), (15, 4)])
+        );
+    }
+
+    /// Block 14 is the third pick of its own window — a partial cut — and the
+    /// first of window 0's; attended once, it keeps the whole block.
+    #[test]
+    fn a_block_whole_in_one_window_and_partial_in_another_stays_whole() {
+        let scores: [f32; 16] = [
+            1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 9.0, 8.0, 0.1, 0.1, 0.1, 0.1, 7.0, 0.2,
+        ];
+        assert_eq!(
+            select(&scores, &strata(8, 2, Recent::Candidate), 0),
+            entries(&[(0, 4), (1, 3), (8, 4), (9, 4), (14, 4)])
+        );
+    }
+
+    /// A window as wide as the candidates, or wider, is one window — the
+    /// checkpoint's selection, with or without a prompt and a recent candidate
+    /// span, both of which it already ranks.
+    #[test]
+    fn one_window_is_the_checkpoints_selection() {
+        let mut out = Vec::new();
+        let mut want = Vec::new();
+        for seed in 0..32u64 {
+            let scores = lcg_scores(64, 0x5157 + seed);
+            for qpos in 11..256usize {
+                let n_cand = (qpos + 1) / R;
+                selection_entries(&scores, qpos, R, K, &Strata::WHOLE, 0, &mut want);
+                for (window, prompt, recent) in [(n_cand, 0, 0), (n_cand + 7, 3, 5), (0, 9, 64)] {
+                    let s = strata(window, recent, Recent::Candidate);
+                    selection_entries(&scores, qpos, R, K, &s, prompt, &mut out);
+                    assert_eq!(out, want, "seed {seed} qpos {qpos} window {window}");
+                }
+            }
+        }
+    }
+
+    /// [`max_entries_for`] bounds every stratified row, for every geometry,
+    /// window, span and mode tried — the row stride is sized from it.
+    #[test]
+    fn the_stratified_entry_bound_holds() {
+        let mut out = Vec::new();
+        for ratio in 1..=MAX_RATIO {
+            for top_k in [1usize, 3, 8, 13] {
+                let width = selected_width(top_k, ratio);
+                for qpos in width..width + 160 {
+                    let n_cand = (qpos + 1) / ratio;
+                    let scores = lcg_scores(n_cand.max(1), (qpos * 7 + top_k) as u64);
+                    for window in [0usize, 1, 3, 8] {
+                        for recent_blocks in [0usize, 2, 9] {
+                            for recent in [Recent::Candidate, Recent::Forced] {
+                                for prompt in [0usize, 2, 20] {
+                                    let s = strata(window, recent_blocks, recent);
+                                    let sel = selection_entries(
+                                        &scores, qpos, ratio, top_k, &s, prompt, &mut out,
+                                    );
+                                    let RowSelection::Entries(n) = sel else {
+                                        continue;
+                                    };
+                                    let bound = max_entries_for(top_k, ratio, n_cand, &s);
+                                    assert!(
+                                        n <= bound,
+                                        "ratio {ratio} top_k {top_k} qpos {qpos} {s:?} prompt \
+                                         {prompt}: {n} entries against {bound}"
+                                    );
+                                    assert!(
+                                        out.windows(2)
+                                            .all(|w| entry_block(w[0]) < entry_block(w[1])),
+                                        "entries must be strictly ascending by block"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The row the daemon sizes for at 294,912 tokens (73,728 candidate
+    /// blocks): the checkpoint's 514, and the stratified rows at 128K-token
+    /// windows (32,768 blocks — three windows) with an 8,192-token recent span.
+    #[test]
+    fn the_strides_at_depth() {
+        let cand = 73_728;
+        assert_eq!(max_entries_for(2048, 4, cand, &Strata::WHOLE), 514);
+        assert_eq!(
+            max_entries_for(2048, 4, cand, &strata(32_768, 2048, Recent::Candidate)),
+            3 * 513 + 1
+        );
+        assert_eq!(
+            max_entries_for(2048, 4, cand, &strata(32_768, 2048, Recent::Forced)),
+            3 * 513 + 2048 + 1
+        );
+    }
+
+    /// The kernel's union buffer at the same depth, and at 1M tokens (262,144
+    /// blocks — eight windows), where repeats are counted before the union
+    /// removes them. Both round up well inside the kernel's 16,384.
+    #[test]
+    fn the_gathered_bounds_at_depth() {
+        let forced = strata(32_768, 2048, Recent::Forced);
+        assert_eq!(max_gathered_for(2048, 4, 73_728, &Strata::WHOLE), 513);
+        assert_eq!(max_gathered_for(2048, 4, 73_728, &forced), 3 * 513);
+        assert_eq!(max_gathered_for(2048, 4, 262_144, &forced), 8 * 513);
+        // A tiny row whose windows all rank the same prompt gathers past its
+        // candidates; the union is what brings it back under them.
+        let narrow = strata(2, 0, Recent::Candidate);
+        assert_eq!(max_gathered_for(8, 4, 6, &narrow), 3 * 3);
+        assert_eq!(max_entries_for(8, 4, 6, &narrow), 6 + 1);
+    }
+
+    /// Positions become blocks at the ratio, rounding up so a window or span
+    /// never covers less than was asked for; a zero window stays zero.
+    #[test]
+    fn strata_tokens_become_blocks_at_the_ratio() {
+        let deployed = StrataTokens {
+            window: 131_072,
+            recent: 8192,
+            mode: Recent::Forced,
+        };
+        assert_eq!(deployed.blocks(4), strata(32_768, 2048, Recent::Forced));
+        let ragged = StrataTokens {
+            window: 10,
+            recent: 5,
+            mode: Recent::Candidate,
+        };
+        assert_eq!(ragged.blocks(4), strata(3, 2, Recent::Candidate));
+        let whole = StrataTokens {
+            window: 0,
+            recent: 0,
+            mode: Recent::Candidate,
+        };
+        assert_eq!(whole.blocks(4), Strata::WHOLE);
     }
 }
