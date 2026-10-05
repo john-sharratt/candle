@@ -3,7 +3,9 @@
 //! This module provides `Cache` for single-tensor caches and `KvCache` for
 //! paired key-value caches, supporting both contiguous and chunked backing.
 
-use super::chunked::{ChunkPin, ChunkedKvBacking, CompressionPolicy, CHUNK_SIZE, GID_STRIDE};
+use super::chunked::{
+    ChunkPin, ChunkedKvBacking, CompressionPolicy, DecodeGpuChunkSyncStats, CHUNK_SIZE, GID_STRIDE,
+};
 use ahash::HashMap;
 use candle::quantized::GgmlDType;
 use candle::{DType, Result, Tensor};
@@ -11,8 +13,14 @@ use std::sync::Arc;
 
 /// What a slot-state sync hands back per slot: the serialised slice array's
 /// `(slices_ptr, n_slices, write_slice)`, the pins keeping the chunks it
-/// references alive, and whether any slot was re-serialised.
-pub type SlotStateSync = (Vec<(u64, u32, u32)>, Vec<Arc<Vec<ChunkPin>>>, bool);
+/// references alive, and how each slot was brought up to date — rebuilt in
+/// full, resynced in its writer region, or served as it stood — with the time
+/// each kind took.
+pub type SlotStateSync = (
+    Vec<(u64, u32, u32)>,
+    Vec<Arc<Vec<ChunkPin>>>,
+    DecodeGpuChunkSyncStats,
+);
 
 /// Internal chunked cache wrapper for a single sequence slot.
 #[derive(Debug, Clone)]
@@ -1056,7 +1064,7 @@ impl KvCache {
             )
         }
         let Some(first) = caches.first() else {
-            return Ok((Vec::new(), Vec::new(), false));
+            return Ok((Vec::new(), Vec::new(), DecodeGpuChunkSyncStats::default()));
         };
         let backing = match &first.k.storage {
             CacheStorage::Chunked(c) => c.backing.clone(),
@@ -1070,7 +1078,7 @@ impl KvCache {
             entries.push((batch_idx, offset));
         }
         let (slots, pins, stats) = backing.sync_decode_gpu_chunks(&entries, arena_info)?;
-        Ok((slots, pins, stats.rebuilds > 0))
+        Ok((slots, pins, stats))
     }
 
     /// Prime the persistent decode slot-state buffers after prefill.

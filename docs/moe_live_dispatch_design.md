@@ -1307,7 +1307,7 @@ What it does not change, and so does not regress:
   stream wait, a DtoH, plus one query in place of the synchronize). Run-ahead
   hides them for as long as the host enqueues a layer faster than the GPU
   executes one. Where it does not, the bound is launch overhead — the existing
-  question `docs/deepseek/deepseek_decode_cuda_graphs.md` addresses. It is
+  question `docs/decode_graphs.md` addresses. It is
   neither caused nor worsened by this design.
 
 ## 7. Deadlock freedom
@@ -1416,7 +1416,7 @@ with it on or off; the device fork's refusal under capture (`:286`) goes.
 ## 11. WDDM
 
 All three dev machines run WDDM (`docs/performance.md:215-224`), which batches
-submissions and drains at sync points (`docs/deepseek/deepseek_decode_cuda_graphs.md:34-38`).
+submissions and drains at sync points (`docs/decode_graphs.md` §1).
 Today the per-layer synchronize is such a point; this design removes it. So the
 two hand-offs flush explicitly with a non-blocking query: the forward thread
 after enqueuing the summary copy (§5.1 step 3), the pipeline thread after
@@ -1781,11 +1781,9 @@ code §12 deletes go with that code and are not repeated.
 - **`docs/deepseek/deepseek_hot_path_invariants.md`** (authoritative per
   CLAUDE.md) — lines 243-247, 258-260, 276-281, and the invariant 3/4 tables at
   348, 349, 360: the routing readback is no longer sanctioned-and-load-bearing.
-- **`docs/deepseek/deepseek_decode_cuda_graphs.md`** — §2 lines 66-81, §3 94,
-  §4 118-120, §5.2 169-176, §5.4 226, §6 270-274, §7 289-290: its segment A / B
-  split is built on the readback and the pipeline round trip. With both gone the
-  whole MoE layer is one capturable segment, which is good news for that design
-  and needs saying in it.
+- **`docs/decode_graphs.md`** — rewritten for every model with the readback and
+  the pipeline round trip gone: the whole MoE layer is one capturable region, with the
+  dispatch host protocol run per layer between graph launches (§4.5).
 - **`docs/deepseek/deepseek_decode_launch_overhead.md:147-163`** — "why the
   readback cannot simply be removed". The rest of the doc is a measurement
   record (B), including the −8% lesson §5.1 answers.

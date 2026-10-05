@@ -51,6 +51,7 @@ use candle::Result;
 use candle_nn::kv_cache::KvCache;
 
 use super::kv_cache_utils::SequenceContext;
+use crate::models::profile::{pipeline_record, profile_now};
 
 /// Claim the KV every prefill row in this wave will write, across
 /// `layer_start..layer_end`.
@@ -88,18 +89,22 @@ pub(crate) fn admit_wave_kv(
         // offset, so a failure that is swallowed truncates some layers and not
         // others and leaves the sequence with per-layer token windows. Failing
         // the wave is the recoverable outcome; the divergence is not.
+        let t_truncate = profile_now();
         for (cache, &offset) in caches.iter_mut().zip(offsets.iter()) {
             cache.truncate_to_offset(offset)?;
         }
+        pipeline_record("admit:truncate", t_truncate);
 
         // Prefill only, from here down. A sequence starting at zero is cleared
         // outright rather than truncated — the truncation above leaves an empty
         // chunk list, this drops the sequence's slot state with it.
+        let t_reset = profile_now();
         for (cache, &offset) in caches[..n_prefill].iter_mut().zip(offsets.iter()) {
             if offset == 0 {
                 cache.reset();
             }
         }
+        pipeline_record("admit:reset", t_reset);
 
         // Each sequence's own token count, never the batch maximum: an
         // over-allocated tail chunk on a shorter sequence desyncs its decode
@@ -130,6 +135,7 @@ pub(crate) fn admit_wave_kv(
         // that changes is which side of the forward the claim falls on, which
         // is the whole point — outside it, a pool with no ground can still be
         // relieved.
+        let t_ensure = profile_now();
         for (i, &add) in q_lens[..n_prefill].iter().enumerate() {
             KvCache::ensure_chunked_capacity_batch(
                 &mut caches[i..i + 1],
@@ -137,6 +143,7 @@ pub(crate) fn admit_wave_kv(
                 add + 1,
             )?;
         }
+        pipeline_record("admit:ensure", t_ensure);
     }
     Ok(())
 }

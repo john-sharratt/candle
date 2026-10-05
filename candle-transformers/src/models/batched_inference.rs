@@ -1315,9 +1315,11 @@ impl BatchedInferenceSession {
                 generation,
                 &snapshot_mask,
             )?;
-            slot_reuse_time += sync_stats.reuse_time;
+            // A resync is a reuse that first patched the writer region, so decode
+            // reads it as one.
+            slot_reuse_time += sync_stats.reuse_time + sync_stats.resync_time;
             slot_rebuild_time += sync_stats.rebuild_time;
-            saw_slot_reuse |= sync_stats.reuses > 0;
+            saw_slot_reuse |= sync_stats.reuses + sync_stats.resyncs > 0;
             saw_slot_rebuild |= sync_stats.rebuilds > 0;
 
             // Append this layer's headers (one `SlotHeader` per sequence; the

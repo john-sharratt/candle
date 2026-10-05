@@ -547,7 +547,7 @@ fn a_boundary_moved_after_a_commit_does_not_shrink_the_resync() {
     let info = backing.resolve_arena_info().unwrap();
     let (ptrs, _, stats) = backing.sync_decode_gpu_chunks(&[(seq, 34)], &info).unwrap();
     assert_eq!(
-        (stats.rebuilds, stats.reuses),
+        (stats.rebuilds, stats.resyncs),
         (0, 1),
         "the sync rebuilt the buffer, so the resync under test never ran"
     );

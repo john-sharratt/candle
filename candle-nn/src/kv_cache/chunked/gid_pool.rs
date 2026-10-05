@@ -707,6 +707,15 @@ struct ArenaPool {
     /// Bit `i` set ⇒ arena `i` has ≥1 free slot. `allocate_any` finds the
     /// lowest such arena via find-first-set instead of walking every arena.
     capacity: Arc<CapacityBitmap>,
+    /// Every arena below this index has no never-used tail left, so it can host
+    /// no run of any length — its high-water mark never retreats. A run claim
+    /// starts here instead of at the lowest arena, which keeps lowest-first
+    /// placement while skipping the exhausted prefix: that prefix is every arena
+    /// a wide prefill has already filled, and a chunk makes 2·n_kv_head run
+    /// claims, so walking it each time made a claim's cost grow with the arenas
+    /// in the pool. Lowered when an arena registers below it (a recycled index
+    /// is a fresh arena with a whole tail); only moved under the `tables` lock.
+    run_floor: AtomicUsize,
 }
 
 impl ArenaPool {
@@ -727,6 +736,7 @@ impl ArenaPool {
             arena_chunks,
             alloc_gate: Mutex::new(()),
             capacity: Arc::new(CapacityBitmap::new()),
+            run_floor: AtomicUsize::new(0),
         }
     }
 
@@ -742,6 +752,8 @@ impl ArenaPool {
         {
             let mut tables = self.tables.write().unwrap();
             tables.insert(arena_idx, Arc::clone(&table));
+            // A fresh arena has its whole tail: runs may land at or above it.
+            self.run_floor.fetch_min(arena_idx, Ordering::Relaxed);
         }
         self.total_arenas.fetch_add(1, Ordering::Relaxed);
         // A fresh arena is all free — mark it available. Ordered after the
@@ -762,20 +774,28 @@ impl ArenaPool {
         let _gate = self.alloc_gate.lock().unwrap();
         let stride = GID_STRIDE;
         let tables = self.tables.read().unwrap();
-        let mut indices: Vec<usize> = tables.keys().copied().collect();
-        indices.sort_unstable();
-        for arena_idx in indices {
-            let table = &tables[&arena_idx];
-            if !table.run_fits(len) {
-                continue;
-            }
-            if let Some(first) = table.try_claim_run(len) {
-                if table.is_full() {
-                    self.capacity.clear(arena_idx);
+        let floor = self.run_floor.load(Ordering::Relaxed);
+        // The exhausted prefix grows as the walk passes arenas with no tail at
+        // all; it stops growing at the first arena that still has some.
+        let mut next_floor = floor;
+        let mut prefix_exhausted = true;
+        for (&arena_idx, table) in tables.range(floor..) {
+            if table.run_fits(len) {
+                if let Some(first) = table.try_claim_run(len) {
+                    if table.is_full() {
+                        self.capacity.clear(arena_idx);
+                    }
+                    self.run_floor.store(next_floor, Ordering::Relaxed);
+                    return Some(((arena_idx * stride + first) as i64, Arc::clone(table)));
                 }
-                return Some(((arena_idx * stride + first) as i64, Arc::clone(table)));
+            }
+            if prefix_exhausted && !table.run_fits(1) {
+                next_floor = arena_idx + 1;
+            } else {
+                prefix_exhausted = false;
             }
         }
+        self.run_floor.store(next_floor, Ordering::Relaxed);
         None
     }
 
@@ -1349,7 +1369,8 @@ impl ChunkGidPool {
             return false;
         };
         let tables = pool.tables.read().unwrap();
-        tables.values().any(|t| t.run_fits(len))
+        let floor = pool.run_floor.load(Ordering::Relaxed);
+        tables.range(floor..).any(|(_, t)| t.run_fits(len))
     }
 
     /// [`Self::allocate_run_for`] against one specific arena index — see
@@ -1865,6 +1886,64 @@ mod tests {
 
         // Unknown arena index: None, never a panic.
         assert!(pool.allocate_run_for_in(key, 9999, 1).is_none());
+    }
+
+    /// Runs go to the lowest arena that still has a tail, and the arenas whose
+    /// tails are gone are passed over — the placement the walk always gave, now
+    /// without visiting every exhausted arena on every claim.
+    #[test]
+    fn a_run_lands_in_the_lowest_arena_with_a_tail() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let cap = test_arena_chunks();
+        let a = pool.register_arena(key);
+        let b = pool.register_arena(key);
+        let c = pool.register_arena(key);
+
+        // Arena `a` loses its whole tail; `b` all but two slots.
+        let fill_a = pool.allocate_run_for(key, cap).unwrap();
+        assert!(fill_a.iter().all(|g| g.arena_idx() == a));
+        let fill_b = pool.allocate_run_for(key, cap - 2).unwrap();
+        assert!(fill_b.iter().all(|g| g.arena_idx() == b));
+
+        // The two that remain in `b` are taken before `c` is touched.
+        let r1 = pool.allocate_run_for(key, 2).unwrap();
+        assert!(r1.iter().all(|g| g.arena_idx() == b));
+        let r2 = pool.allocate_run_for(key, 2).unwrap();
+        assert!(r2.iter().all(|g| g.arena_idx() == c));
+
+        // A new arena registered above does not displace `c`.
+        pool.register_arena(key);
+        let r3 = pool.allocate_run_for(key, 2).unwrap();
+        assert!(r3.iter().all(|g| g.arena_idx() == c));
+    }
+
+    /// An arena that registers below the point the walk has passed is a fresh
+    /// arena with a whole tail, and it is preferred again — lowest-first
+    /// placement is what compaction packs against, and recycled indices are how
+    /// a low arena comes back.
+    #[test]
+    fn a_recycled_low_arena_is_preferred_again_after_the_walk_has_passed_it() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let cap = test_arena_chunks();
+        let a = pool.register_arena(key);
+        let b = pool.register_arena(key);
+
+        let fill_a = pool.allocate_run_for(key, cap).unwrap();
+        let in_b = pool.allocate_run_for(key, 2).unwrap();
+        assert!(in_b.iter().all(|g| g.arena_idx() == b));
+
+        // `a` empties and its index is recycled by the next registration.
+        drop(fill_a);
+        assert_eq!(pool.next_tombstone(key), Some(a));
+        assert_eq!(pool.register_arena(key), a);
+
+        let run = pool.allocate_run_for(key, 2).unwrap();
+        assert!(
+            run.iter().all(|g| g.arena_idx() == a),
+            "the recycled arena below the exhausted prefix has the lowest tail"
+        );
     }
 
     /// An empty arena is always reclaimed, however full the rest of the pool is.

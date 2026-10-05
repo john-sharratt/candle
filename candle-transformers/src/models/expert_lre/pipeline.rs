@@ -918,6 +918,17 @@ impl PipelineState {
         }
     }
 
+    /// Return every retired slot to the zone — before a boundary move, with the
+    /// device synchronized. A retired slot waits on a ticket the host has not
+    /// yet observed; once the device is idle its readers are done whatever was
+    /// observed, and a slot left on the list past a retraction names ground the
+    /// per-slot tables no longer cover.
+    pub(crate) fn release_retired(&mut self) {
+        for slot in self.retired.drain_all() {
+            self.inner.put_free(slot);
+        }
+    }
+
     /// Wait out every promotion copy and land it — before a boundary move,
     /// which relocates and drops slots.
     pub(crate) fn finish_promotions(&mut self) -> Result<()> {
