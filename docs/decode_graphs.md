@@ -1,14 +1,16 @@
 # Decode CUDA graphs — one capture layer for every model
 
-Scope: the decode forward of every batched model in this repository, at up to **four
-sessions**, one token per row. A model-agnostic capture layer sits in the one place all
-models are driven (`drive_wave`). Each model marks its launch-dense regions; the capture
-layer opens one **wave chain** per eligible forward (§12.12), a scope whose links are graph
-links (a region captured lazily, keyed on the row count, and replayed on the compute
-stream) and host gaps (Rust logic that cannot break the graph invariants). Regions with no
-host protocol between them fuse into one graph; the MoE host protocol is where a chain
-cuts. Waves outside that scope (more than four rows, prefill, glue, verify windows) run
-the same code eagerly.
+Scope: the decode forward of every batched model in this repository, one token per row,
+with CUDA graphs at up to **four sessions**. A model-agnostic capture layer sits in the one
+place all models are driven (`drive_wave`). Each model writes its decode layers as
+regions; the capture layer opens one **wave chain** (§12.12) for every decode-only forward,
+a scope whose links are regions and host gaps (Rust logic that cannot break the graph
+invariants). At four rows or fewer each region is a graph link (captured lazily, keyed on
+the row count, and replayed on the compute stream); above four the same links launch
+immediately, with no capture. Regions with no host protocol between them fuse into one
+graph; the MoE host protocol is where a chain cuts. Waves that are not decode-only
+(prefill, glue, verify windows) run the model's existing mixed forward, built from the
+same typed ops (§12.10).
 
 The mechanism is taken from Strata (`strata`, v0.1.26), whose sources were read for this
 design (§1). The model survey (§2) and the blockers (§3) come from reading each model's
@@ -126,12 +128,19 @@ chain.run(&mut RegionLink::new(layer, DenseLayer::new(w), &mut NoHost), &staged,
 A region is a type implementing `Region` (§12.4), whose single `record` method holds the
 model's existing kernel launches and is generic over the launch mode. `drive_wave` opens one
 **wave chain** (§12.12) for the whole forward: a scope that holds the wave's memory and the
-lazily filled graph slots, and in which graph links and host gaps alternate. When the wave
-is not eligible there is no chain and the same region runs eagerly, so there is one code
-path per model and no flag. When it is eligible, the first sight of
-`(layer or span, region kind, R, placement epoch, variant)` (the link's `LinkKey` plus the
-chain's `R` and epoch) records the region under capture and fills its slot; every later
-sight launches the stored executable. The model supplies nothing else:
+lazily filled graph slots, and in which links and host gaps alternate.
+
+**One decode path.** Every decode-only wave runs the regions, whatever its row count, so
+the region bodies are *the* decode composition of each model, not a second one beside the
+eager forward: they are exercised by every decode wave and by every sweep gate at every
+rung of its ladder. The row count decides only how a link is issued. At `R ≤ 4` the first
+sight of `(layer or span, region kind, R, placement epoch, variant)` (the link's `LinkKey`
+plus the chain's `R` and epoch) records the region under capture and fills its slot, and
+every later sight launches the stored executable. Above four there is no slot: the link's
+`record` runs on a `Chained` recorder (§12.3), the same mode a refused slot uses, inside
+the same host protocol window. Waves that are not decode-only have no chain and run the
+model's mixed forward, which calls the same ops in `Eager` mode, so each kernel still has
+one wrapper. No flag chooses among these: the verdict does. The model supplies nothing else:
 no second implementation, and no trait method that exists only to opt out. The traits,
 types and module layout that make misuse a **compile error** are in §12.
 
@@ -140,8 +149,16 @@ types and module layout that make misuse a **compile error** are in §12.
 `drive_wave` decides once per wave, right after assembling `[decode | prefill | glue]`
 (`wave_driver.rs:513`): every row has `q_len == 1` after the one-token-prefill fold, there
 is no prefill, glue or verify member, the sweep covers the full layer range
-(`kv_layer_range`, `:138`), the row count `R ≤ 4`, and the model's own preconditions hold
-(§3.2). The context carries the answer; a model never recomputes it.
+(`kv_layer_range`, `:138`), and the model's own preconditions hold (§3.2). Such a wave
+gets a chain. The row count then decides only whether its links capture: `R ≤ 4` carries
+a `GraphRows`, and above four it does not (§12.5). The context carries the answer; a model
+never recomputes it.
+
+A model that fails a precondition for structural reasons (weights that stream on this
+card, an activation dtype other than BF16/F16, the unfused DeltaNet route) runs its mixed
+forward for decode too, and the stats line says why. That is decided by the model and the
+card at load, not per wave, so it is a property of a configuration, never a path that
+alternates with the regions.
 
 ### 3.2 Per-model preconditions
 
@@ -166,17 +183,17 @@ Checked by the model when it builds a region, reported in the stats line when th
 | **Layer** | a whole dense layer: attention half and FFN half | llama, qwen2, qwen3, and the attention layers of `qwen35` / `qwen38` |
 | **Mixer+FFN** | a DeltaNet layer and its FFN | `qwen35`, `qwen38`, `qwen35_moe`, `qwen36_moe`, Flash-Next |
 | **FFN** | the FFN half alone, after an eager mixer | Flash-Next attention layers, DeepSeek |
-| **MoE** | an FFN region that contains an MoE invocation; the host runs the dispatch protocol around it (§4.5) | all MoE models |
+| **MoE** (not a kind of its own) | a Layer, Mixer+FFN or FFN region whose FFN is an MoE invocation, wrapped in a `MoeLink`; the host runs the dispatch protocol around it (§4.5) | all MoE models |
 | **Head** | `final_norm`, `lm_head` (and `hc_mix(out_hc)` for Flash-Next); output F32 logits at a fixed address | every model |
 
 Kinds compose: a dense Layer region has no host protocol, so adjacent ones fuse into one
-graph link; an MoE layer's region is two links, `[AttnRouterLink (NoHost), MoeLink (MoeProtocol)]` (§12.4), and the
-`MoeLink`'s host protocol runs in `before` / `after` inside `WaveChain::run`, so it cuts
-the chain there.
+graph link; an MoE layer is one `MoeLink` (§12.4) whose host protocol runs in `before` /
+`after` inside `WaveChain::run`, so it cuts the chain there. The router output and the
+normed hidden state stay inside that one graph, so nothing but the residual crosses a link.
 
 ---
 
-## 4. Capture layer (in `candle-core`, model-independent)
+## 4. Capture layer (model-independent)
 
 ### 4.1 Key and cap
 
@@ -187,7 +204,9 @@ and kept. Decode rows are one token each, so `R` equals the session count and th
 would still route to experts and fill tiles). `R` fixes every launch scalar a region
 passes (dispatch `launch_tiles`, `tile_w`, `n_sub`, `workers`, `a_ub`; the paged kernel's
 `num_splits`, a function of active slots × KV heads and the SM count; DeltaNet
-`table.n`), so they are captured.
+`table.n`), so they are captured. Above the cap the same links run `Chained`, computing
+those scalars from the wave's `Rows` on every launch exactly as the eager kernels do
+today; no slot, key or executable exists for them.
 
 ### 4.2 Stream
 
@@ -227,9 +246,10 @@ during a capture, before anything depends on it.
 ### 4.3 Allocation: the wave tier, bound by lifetime and a placement epoch
 
 A replayed graph uses the addresses it was captured with. The wave transient tier is a
-bump allocator over per-phase spans. The wave chain opens the phase generations once
-(`begin_wave(Attention / Ffn)`, `batched_layer.rs:530,606`, §12.12) and each region or
-gap starts from the span start through a region mark, so a region's allocations land at
+bump allocator over three per-phase spans (`LayerPhase::{Attention, Ffn, Forward}`,
+`wave_plan.rs:378`). The wave chain opens the phase generations once
+(`begin_wave`, `bump_arena.rs:1545`; `batched_layer.rs:530,606`, §12.12) and each region or
+gap starts each phase it uses from the span start through a region mark, so a region's allocations land at
 **span base plus a deterministic offset**. That makes tier memory graph-safe on two
 conditions, and each is enforced differently:
 
@@ -244,9 +264,12 @@ conditions, and each is enforced differently:
    recaptures. It is a counter, not a geometry comparison, for the reason hot-path
    invariant 7 gives (a boundary can move and come back reading the same).
 
-The layer halves alternate per layer, so the half is a function of the layer and already
-in the key. The residual stream and the final logits cross layers and so cannot be tier
-memory: they live in persistent fixed buffers, and the caller reads the logits before the
+Each op allocates in its own phase's span (attention-half ops in `Attention`, FFN ops in
+`Ffn`, the head in `Forward`), and the mark rewinds every span a link used, so the offsets
+are a function of the link alone. The `Forward` span today also holds per-forward setup
+that every layer reads (decode metadata, position ids, RoPE tables); inside a chain that
+would cross links, so it is staged as `Table`s instead (§4.4). The residual stream and the
+final logits cross layers and so cannot be tier memory: they live in persistent fixed buffers, and the caller reads the logits before the
 next forward starts. This keeps the existing wave-tensor kernel wrappers (which already
 take `LiveTensor<'w>`) usable unchanged, and needs no second allocation per `R`.
 
@@ -259,7 +282,7 @@ to the driver pool (`wave_buffers.rs:334-407`), default `Tensor::empty` / `zeros
 `from_vec` (stream-ordered `cuMemAllocAsync` would become a graph memory node), pageable
 host-to-device copies, `stream.synchronize()` and any `cudaMalloc`. The context counts them
 and asserts; `forbidden_alloc` is the detector to build on. The bump arena is never dropped
-during a graph chain: the wave chain (§12.12) opens both phase generations before its first
+during a graph chain: the wave chain (§12.12) opens all three phase generations before its first
 link and holds them until its last launch has been enqueued, so the fence a generation drop
 performs (`bump_arena.rs:660-672`) cannot land inside a capture. A drop observed during
 capture is a capture failure like the others. Each region and gap reuses its phase's span
@@ -267,7 +290,10 @@ from the span start through a region mark that rewinds the cursor without a fenc
 so the addresses stay "span base plus a deterministic offset" and the tier needs one
 region's peak per phase, not the sum over layers.
 
-Pre-grown before the first capture, for `R = 4`: the MoE bucketize workspace
+Grown before the chain opens, for the wave's `R` and never below `R = 4` (growth allocates
+and can synchronise, so it never happens inside a scope, captured or `Chained`; it is
+monotonic, so it happens once per new high-water mark, and `invalidate_where` recaptures
+the graphs that bake the grown buffer): the MoE bucketize workspace
 (`ensure()` reallocates on growth, `cuda.rs:7518`), split-K scratch, and the paged decode
 kernel's global split-KV partial pool (`cudaMalloc`, `cudaStreamSynchronize`, `cudaFree`
 on growth, `int8_decode_kernel.cuh:2157-2209`). Every kernel in a region is loaded by a
@@ -282,6 +308,9 @@ no pageable or host-pointer copy is captured). The block is a small ring coverin
 run-ahead, so one is not rewritten before its copy has executed. Contents:
 
 - slot headers and metadata (`build_decode_metadata`), already one build per forward;
+- any other per-forward buffer that every layer reads and that today lives in the
+  `Forward` phase (gathered position ids, RoPE tables): a region mark would rewind it
+  under a later link, so it is a `Table`;
 - hybrids: the DeltaNet `build_wave_table`, moved from a pool allocation to its fixed
   address and rewritten each wave (state-half swaps at `commit_wave` change which
   buffers it points to);
@@ -339,7 +368,7 @@ the kernels read, never in a kernel argument. What survives capture unchanged:
 - **The pipeline and stager threads** use their own non-blocking copy stream and
   `cuStreamQuery`, and a capture is stream-scoped (§4.2), so it leaves them alone.
 - **Boundary moves** (`request_kv_ground`, `set_weight_floor`, `reclaim_spare_ground`)
-  refuse while a wave generation is open and the chain holds both for the scope, so they
+  refuse while a wave generation is open and the chain holds them all for the scope, so they
   run outside it and the placement epoch is stable inside.
 
 What does not work in a chain as written, and the fix for each:
@@ -455,8 +484,8 @@ candidate after the decode regions. Verify blocks, DSpark and prefill are never 
    driver calls are already routine there).
 2. `CaptureCtx::scope` in `drive_wave` and the `WaveChain` it lends (§12.12): `Link` and
    `RegionLink` (§12.4), the keyed cache with lazy slots, the per-op `LAUNCHES` node-count
-   check, the eligibility predicate (§3.1), `Chained` fallback for
-   refused slots, `Known` / `Variant` (§12.13) and the anti-trait bans (§12.11).
+   check, the eligibility predicate (§3.1), `Chained` issue for refused slots and for
+   waves above four rows, `Known` / `Variant` (§12.13) and the anti-trait bans (§12.11).
 3. The tier placement epoch, the region mark (a fence-free cursor rewind to span start),
    generation holding for the chain's lifetime, the pool-free capture constructor and the
    no-foreign-allocation assertion (§4.3).
@@ -508,20 +537,24 @@ it. The cap of four is the working value; the measurement sets the real one per 
 ## 9. Acceptance
 
 1. **Token equality.** For every region and every `R` from 1 to 4, the graph wave's
-   accepted tokens equal the eager wave's, and both equal plain greedy single-token
-   decode, in the model's `test_parallel_batched_forwarding` gate across its modes (BF16,
-   Q8_0, C0 to C10 where present). The run crosses the cap in both directions.
+   accepted tokens equal the same wave run uncaptured (every link `Chained`, built by the
+   test through the graph module's test constructor), and both equal plain greedy
+   single-token decode, in the model's `test_parallel_batched_forwarding` gate across its
+   modes (BF16, Q8_0, C0 to C10 where present). Above four, where every decode wave runs
+   `Chained`, the gate's existing ladder is the check, unchanged. The run crosses the cap
+   in both directions.
 2. **No host interaction in a replay.** A trace of one forward shows the staging copy, then
    per link only the model's own host protocol, one `cudaGraphLaunch` and, for MoE
-   layers, one `cuStreamQuery`; the only stream fence is the single one at scope exit,
-   and the logits are read after it.
+   layers, one `cuStreamQuery`; the only stream fence is the single one at scope exit
+   (plus one per counted chain break), and the logits are read after it.
 3. **No allocation.** A capture asserts zero foreign allocations; a replay allocates
    nothing.
-4. **Rewind.** After a rejected window, recurrent state, the PLE window and the QSA index
-   cache equal the eager path's, bit for bit.
+4. **Rewind.** After a rejected verify window (run by the mixed forward), the next decode
+   wave reads recurrent state, the PLE window and the QSA index cache equal to the
+   uncaptured run's, bit for bit.
 5. **Boundary moves.** A forced concession or tier move between waves leaves every graph
-   valid and the next wave's tokens equal the eager path's. A forced workspace growth
-   recaptures the affected graphs.
+   valid and the next wave's tokens equal the uncaptured run's. A forced workspace growth
+   (a wave above the previous high-water `R`) recaptures the affected graphs.
 6. **A failed capture strands nothing.** An injected capture failure at layer *k* runs that
    region on a `Chained` recorder, completes the forward, leaves `PassState.reserved`
    equal to `observed`, and does not retry until the epoch moves.
@@ -564,6 +597,12 @@ it. The cap of four is the working value; the measurement sets the real one per 
 - **Fork needs a non-blocking side stream**, and its overlap benefit depends on the
   prototype proof (§4.2).
 - **Launch-bound or not**, per model (§8).
+- **The regions carry decode at every row count.** Above four rows the regions replace
+  each model's decode composition, not just add graphs below it, so a region that is
+  slower than today's decode path (a missing fusion, a launch the old path skipped)
+  regresses the high-batch rungs that set the published aggregate numbers. Each model's
+  sweep gate is compared rung for rung against the previous run before its regions land,
+  and the launch-count test pins the op sequence at `R = 64`.
 - **Run-ahead of the staging ring** against the dispatch ring.
 
 ---
@@ -598,7 +637,7 @@ different types, and an op's signature says which it takes), **a closed set of t
 ops** that own their output allocation (§12.10), **typestate** (eager versus capturing is
 a type parameter, and an operand bound that is loose when eager and strict when
 capturing), **branded lifetimes** (activations cannot outlive a capture), **newtypes with
-private constructors** (`Rows`, `Resid`, `GraphWave`), **a type parameter for the
+private constructors** (`GraphRows`, `Resid`, `DecodeWave`), **a type parameter for the
 activation dtype**, **associated types** (a region's host protocol is part of its type),
 **exhaustive matches** (a new layer kind breaks the build until it is planned), **RAII**
 (capture and reservations release on drop), **an exclusive stream borrow** (a capture owns
@@ -611,38 +650,54 @@ deprecation note, §12.11).
 
 ### 12.1 Module layout (one concern per file)
 
+The split follows the crates the pieces depend on. The wave tier, its epoch and the
+region mark live with the bump arena in `candle-nn`. The wave buffers, the MoE dispatch
+and `drive_wave` live in `candle-transformers`, so the framework that composes them lives
+there too. Only the raw driver calls go in `candle-core`.
+
 ```
-candle-core/src/cuda_backend/graph/        model-independent; ALL the unsafe lives here
+candle-core/src/cuda_backend/graph/        driver layer; ALL the unsafe lives here
   mod.rs        re-exports
   stream.rs     ComputeStream (the null stream), CaptureStream (created non-blocking stream)
   session.rs    CaptureSession (RAII, holds &mut CaptureStream), begin_capture on CaptureStream only
-  exec.rs       GraphExec (owns the instantiated graph; launches into ComputeStream only)
-  epoch.rs      TierEpoch (monotonic placement counter)
-  role.rs       Act<'c, A>, Resid<A>, Table<T>, Weight<'w, W>, GraphAddr, ActDtype (sealed)
-  recorder.rs   Recorder<'c, A, M>, Mode, Eager, Capturing, Operand<M>
-  op.rs         Op<A>, Fixed<T>, Scratch, LaunchDims; one file per op family beside it
+  exec.rs       GraphExec<'m> (owns the instantiated graph; launches into ComputeStream only)
+  beacon.rs     Beacon (mapped host word) and its one-thread store kernel (§12.13)
+  error.rs      GraphError
+candle-nn/src/kv_cache/chunked/            beside bump_arena.rs and wave_plan.rs
+  tier_epoch.rs TierEpoch (monotonic placement counter, §4.3)
+  region_mark.rs RegionMark (fence-free cursor rewind to span start, §12.12)
+candle-transformers/src/models/graph/      #![forbid(unsafe_code)]
+  mod.rs        re-exports; constructors and raw pointers are pub(in crate::models::graph)
+  rows.rs       Rows (any count ≥ 1), GraphRows (1 to 4, the capture cap)
+  role.rs       Act<'c, A>, Lease<'c, T>, Resid<A>, Table<T>, Weight<'m, W>, GraphAddr, ActDtype (sealed)
+  recorder.rs   Recorder<'c, A, M>, Mode, Eager, Chained, Capturing, Live, Operand<M>
+  op.rs         Op<A>, Fixed<T>, Scratch, LaunchDims; one file per op family under op/
   guard.rs      AllocGuard (runtime backstop, §12.7)
   banned.rs     NotInGraph anti-trait and the ban! table (§12.11)
-  chain.rs      WaveChain<'w, A> (run, graph, gap), Gap, RegionMark, GraphSlot (§12.12)
-  link.rs       Link<A>, LinkKey, LinkCtx, Concurrent (§12.4)
-  known.rs      Known<T>, Variant (§12.13)
-  fork.rs       fork/join lanes and event tokens (§12.13)
-  notify.rs     Beacon, notify (§12.13)
-  pending.rs    PendingWave, event-deferred scope exit (§12.13)
-  error.rs      GraphError
-candle-transformers/src/models/graph/      model-facing; #![forbid(unsafe_code)]
-  mod.rs        re-exports
-  rows.rs       Rows
   region.rs     Region, RegionKind, RegionKey, RegionLink, NoHost
   host.rs       RegionHost, Reserved
-  moe.rs        MoeProtocol, MoeBuffers, MoeLink, AttnRouterLink (§12.4)
+  link.rs       Link<A>, LinkKey, LinkCtx, Concurrent (§12.4)
+  moe.rs        MoeProtocol, MoeBuffers, PreMoe, MoeLink (§12.4)
   plan.rs       GraphPlan, LayerPlan, EagerReason
-  verdict.rs    GraphVerdict, GraphWave, Ineligible, decide()
+  verdict.rs    WaveVerdict, DecodeWave, Ineligible, decide()
   staging.rs    StagingRing, StagedWave (the Table<T>s a region may read)
-  cache.rs      GraphCache<E>
+  cache.rs      GraphCache<E>, GraphSlot
   ctx.rs        CaptureCtx (scope(), stats())
-  fuse.rs       Fuse<(R1, R2, ..)>, NoHost-only region composition (§12.12)
+  chain.rs      WaveChain<'w, A> (run, graph, gap), Gap (§12.12)
+  fuse.rs       Fuse<(R1, R2, ..)>, FuseAll<R>, NoHost-only region composition (§12.12)
+  known.rs      Known<T>, Variant (§12.13)
+  fork.rs       fork/join lanes and event tokens (§12.13)
+  pending.rs    PendingWave, event-deferred scope exit (§12.13)
 ```
+
+Because the framework and the models share a crate, `pub(crate)` would let model code reach
+the constructors and `dptr()`. They are `pub(in crate::models::graph)` instead, so a model
+module (a sibling of `graph`) sees only the public surface.
+
+Two lifetimes recur and are kept apart: **`'m`** is the borrow of the model's pinned
+weights (`Weight<'m, W>`, `GraphExec<'m>`, the long-lived cache), and **`'w`** is one wave's
+scope (`WaveChain<'w, A>`, the tier generations). A captured executable outlives the wave
+that captured it, so it carries `'m`, never `'w`.
 
 ### 12.2 What the compiler enforces
 
@@ -650,16 +705,16 @@ candle-transformers/src/models/graph/      model-facing; #![forbid(unsafe_code)]
 |---|---|
 | Capturing the null stream | `CaptureSession::begin` takes `&mut CaptureStream`. `ComputeStream` has no capture method, and `CaptureStream` is constructible only as a created non-null stream. |
 | Launching a graph on the wrong stream | `GraphExec::launch` takes `&ComputeStream`. |
-| More than four rows | the only way to a `GraphWave` is `decide`, which holds a `Rows`; `Rows`'s constructor is the cap and its field is private. |
-| Forging or mismatching a graph key | `RegionKey` is built inside `WaveChain::run` from the link's `LinkKey`, the wave's own `Rows` and the chain's placement epoch; a model never constructs one. |
-| Sync, readback, pageable copy or pool allocation inside a region | `Region::record` is generic over `M: Mode`. Those operations are methods of `Recorder<'c, A, Eager>` only, so inside the generic body they are not in scope (E0599). |
-| A region allocating at all | a region has no allocator. Each op allocates its own output, from the wave tier, through a `pub(crate)` method that returns `Act<'c, A>`, a leased tier tensor with no pool-backed variant. |
+| Capturing more than four rows | a capture needs a `GraphRows`, whose constructor is the cap (1 to 4) and whose field is private; only `decide` builds one, inside a `DecodeWave`. `Rows` itself is any count of at least one. |
+| Forging or mismatching a graph key | `RegionKey` is built inside `WaveChain::run` from the link's `LinkKey`, the wave's own `GraphRows` and the chain's placement epoch; a model never constructs one. |
+| Sync, readback, pageable copy or pool allocation inside a region | `Region::record` is generic over `M: Mode`. Those operations are inherent methods of `Recorder<'c, A, Eager>` only, so inside the generic body the name resolves to the `NotInGraph` tombstone and fails with its note (§12.11). |
+| A region allocating at all | a region has no allocator. Each op allocates its own output, from the wave tier, through a constructor private to `models::graph` that returns `Act<'c, A>`, a leased tier tensor with no pool-backed variant. |
 | An activation escaping its capture (stale address next replay) | `Act<'c, A>` is invariant in `'c`, and `'c` is higher-ranked in the call that opens the capture, so it cannot be returned or stored. The only things that outlive a region are the `Resid<A>` buffers written through an op. |
 | Reading per-wave data from a pool or tier address | per-wave data is a `Table<T>`, which only `StagingRing` can construct and which a region receives through `StagedWave`. |
 | Allocating a tensor outside and bringing it into a graph (pool tensor, `Tensor::zeros`, a tensor stored in the region struct or captured by a closure) | an op's operands are typed roles, and in a capturing recorder `Operand<Capturing>` is implemented only by those roles (§12.3, §12.3a). `Tensor` implements `Operand<Eager>` only, and there is no conversion from `Tensor`, so in the generic region body a `Tensor` operand does not type-check. |
 | Passing a weight where an activation belongs, or the reverse | roles are distinct types and each op's `In` names the role of every operand. |
 | Activation dtype disagreeing between producer and consumer (the BF16/F32 capture-buffer class of bug) | `Act<'c, A>` and `Resid<A>` carry the activation dtype as a type parameter; an op takes and returns the same `A`. A mismatch is a type error, and a model whose dtype is neither BF16 nor F16 is `Ineligible::DtypeMismatch` before any region runs. |
-| Baking a weight address that later moves (streaming, reload, eviction) | `Weight<'w, W>` borrows the weight store for `'w` and `GraphExec<'w>` carries the same lifetime, so anything that moves weights needs `&mut` and cannot compile while a graph exists. Streaming models cannot produce a `Weight` at all. |
+| Baking a weight address that later moves (streaming, reload, eviction) | `Weight<'m, W>` borrows the weight store for `'m` and `GraphExec<'m>` carries the same lifetime, so anything that moves weights needs `&mut` and cannot compile while a graph exists. Streaming models cannot produce a `Weight` at all. |
 | A per-wave host value baked as a kernel scalar or grid | op `In` admits scalars only as `Fixed<T>`, built from constants, config or `Rows`; `grid` takes only `Rows`. |
 | An MoE region run without its host protocol, or a stateless region run with one | `Link::Host` is an associated type; a link owns its `&mut Host`, which is `NoHost` (zero-sized) for stateless regions, and `WaveChain::run` is the only caller of `before`. |
 | Reserving a dispatch slot and never launching or completing it | `RegionHost::before` returns `#[must_use] Reserved<H>`; the only consumer is `WaveChain::run`, which passes it to `after`. |
@@ -667,7 +722,7 @@ candle-transformers/src/models/graph/      model-facing; #![forbid(unsafe_code)]
 | Launching on the capture stream, or beginning a second capture on it, while a capture is open | `CaptureSession` holds `&mut CaptureStream` for its whole life and every `Recorder<Capturing>` is derived from it, so no other code can name the stream, on any thread. |
 | Adding a layer kind and forgetting to say whether it graphs | `GraphPlan::plan` matches the model's own layer-kind enum exhaustively (the same device the `Arch` trait uses for tensor names). |
 | Calling an operation that breaks a hot-path invariant (`to_dtype`, `contiguous`, `cat`, `slice_set`, `zeros`, a readback, a raw address) | the call resolves to a tombstone method of the `NotInGraph` anti-trait, whose `#[deprecated]` note states the invariant, why, and the prescribed alternative; the model-facing modules `#![forbid(deprecated)]`, so it is an error with that text (§12.11). |
-| A model touching raw driver handles | `#![forbid(unsafe_code)]` on the model-facing module; the `unsafe` driver calls exist only in `candle-core::cuda_backend::graph`. |
+| A model touching raw driver handles or addresses | the `unsafe` driver calls exist only in `candle-core::cuda_backend::graph`, `models::graph` is `#![forbid(unsafe_code)]`, and `dptr()` is `pub(in crate::models::graph)`, so a model module cannot name it. |
 
 Each row is a `compile_fail` doctest (§12.8), so the guarantee is itself tested.
 
@@ -714,17 +769,20 @@ op compiles twice (monomorphised) with no runtime branch.
 
 A captured graph bakes every device address its kernels touch. So the question is not
 "can a region allocate" but "which addresses can a region name". Exactly four roles are
-stable across replays, each its own type, and they are the only operands a region can
-hand to an op:
+stable across replays (tier memory, persistent buffers, staged tables, pinned weights),
+each its own type, and they are the only operands a region can hand to an op. Tier memory
+has two spellings: `Act` for the activation dtype and `Lease` for any other element type,
+with the same `'c` brand and the same rules:
 
 ```rust
 pub trait ActDtype: sealed::Sealed {}          // Bf16, F16; the activation dtype of a graph
-pub trait GraphAddr: sealed::Sealed { fn dptr(&self) -> DevicePtr; }   // dptr is pub(crate)
+pub trait GraphAddr: sealed::Sealed { fn dptr(&self) -> DevicePtr; }   // dptr is pub(in crate::models::graph)
 
 pub struct Act<'c, A: ActDtype>   { /* leased wave-tier memory of this region's generation (§4.3) */ }
+pub struct Lease<'c, T>           { /* the same tier lease for a non-activation element type (router weights, ids) */ }
 pub struct Resid<A: ActDtype>     { /* persistent buffer: the residual stream, the logits */ }
 pub struct Table<T>               { /* staged per-wave device table, fixed address, from StagingRing */ }
-pub struct Weight<'w, W>          { /* weights proven non-moving for 'w */ }
+pub struct Weight<'m, W>          { /* weights proven non-moving for 'm */ }
 // each implements GraphAddr; Tensor, CudaStorage and any pool-backed (Owned) type do not
 ```
 
@@ -738,7 +796,7 @@ pub struct Weight<'w, W>          { /* weights proven non-moving for 'w */ }
   `wave_from_vec_ticketed` fall back to the pool when a ticket's generation has closed
   (`wave_buffers.rs:334-407`). That is a correct answer outside a capture and a hidden
   cost or a stale baked address inside one. A region has no allocator; each op carves its
-  output through a `pub(crate)` constructor that returns a leased tensor or an error, with
+  output through a constructor private to `models::graph` that returns a leased tensor or an error, with
   no fallback, and per-wave tables are staged outside the graphs. A kernel that still
   allocates through a ticketed variant is not an op yet, so a region cannot call it.
 - **Outside tensors cannot enter.** Op operands are roles, `Tensor` implements
@@ -750,18 +808,19 @@ pub struct Weight<'w, W>          { /* weights proven non-moving for 'w */ }
   capture) and `Table` only by `StagingRing`. Data reaches them by an async copy outside
   the graph, never by aliasing an existing tensor.
 - **Weights are the legitimate outside allocation, so they get a proof, not a loophole.**
-  `Weight::pin(&'w WeightStore)` returns `Option`, `None` for any store that streams or can
-  relocate (Qwen3.8 27B trunk, expert tiers). A graph for a model with no `Weight` is
-  `Ineligible::Streaming` before any region runs.
-- **Lifetimes make "stable" a borrow, not a convention.** `GraphExec<'w>` and every
-  `Weight<'w, _>` carry the same `'w`. Reloading, evicting, growing or moving weights
+  `Weight::pin(&'m WeightStore)` returns `Option`, `None` for any store that streams or can
+  relocate (Qwen3.8 27B trunk, expert tiers). A model whose dense weights cannot be pinned is
+  `Ineligible::Streaming` before any region runs. Routed experts never need a `Weight`:
+  the MoE GEMMs read the per-invocation snapshot the bucketize writes (§4.5).
+- **Lifetimes make "stable" a borrow, not a convention.** `GraphExec<'m>` and every
+  `Weight<'m, _>` carry the same `'m`. Reloading, evicting, growing or moving weights
   requires `&mut WeightStore`, which the borrow checker refuses while any graph exists.
   The cache must be dropped first, which is exactly the invalidation we want.
 - **`Act<'c, A>` cannot outlive its capture** (invariant, higher-ranked `'c`), so a tier
   address cannot be smuggled to a later launch or another R's graph.
-- **The raw pointer is unreachable.** `dptr()` is `pub(crate)` in `candle-core`, and the
-  model-facing module is `#![forbid(unsafe_code)]`, so a model cannot extract an address
-  from a `Tensor` and rebuild one of the four roles around it.
+- **The raw pointer is unreachable.** `dptr()` and every role constructor are
+  `pub(in crate::models::graph)`, so a model module cannot extract an address from a
+  `Tensor` and rebuild one of the four roles around it.
 
 What this does not stop: a region body that calls a legacy `Tensor` function directly
 instead of an op. That function can read an outside tensor, and a read allocates nothing,
@@ -775,7 +834,7 @@ function. The end state is that region code cannot name a `Tensor` at all.
 
 ```rust
 pub trait Region<A: ActDtype> {
-    const KIND: RegionKind;                 // Layer | MixerFfn | Ffn | MoeFfn | Head
+    const KIND: RegionKind;                 // Layer | MixerFfn | Ffn | Head; MoE is a MoeLink around one of them
     type Host: RegionHost;                  // NoHost for stateless regions
     type Io<'a>;                            // the Resid<A> buffers it reads and writes
 
@@ -826,9 +885,9 @@ pub struct RegionLink<'h, R: Region<A>, A: ActDtype> { layer: usize, region: R, 
 first, `before`, launch or `Chained` run, `after`, the node-count check); `chain.graph` is
 `run(RegionLink::new(..))`. The launch count the check compares against is not declared
 on the link: the recorder sums each op's `Op::LAUNCHES` while `record` runs, so the
-expectation cannot drift from the body. A model's plan returns its layer as links, for
-example, for a MoE layer, `[AttnRouterLink (NoHost), MoeLink (MoeProtocol)]`, and every
-MoE model uses the same `MoeLink`.
+expectation cannot drift from the body. A model's plan returns its layers as links: a dense
+layer is a `RegionLink`, and an MoE layer is one `MoeLink` (Host = `MoeProtocol`), which
+every MoE model shares.
 
 **The MoE protocol is one component.** `MoeProtocol` owns what the dispatch owns today:
 the summary ring, the abort word, the `ReclaimClock`, the pass state, the two senders, and
@@ -850,16 +909,36 @@ every slot that bakes them. It implements `RegionHost`:
   cannot sit in a fork lane or beside another MoE link, which would share `snap`,
   `counters` and `scratch`. The rule is a trait bound, not a runtime check.
 
-`MoeLink` records the router-fed launches only: bucketize, gather, gate, up, silu, down,
-scatter. `StagedWave` gains `seq_base`, staged outside the chain with the other per-wave
-values. Where a MoE layer is cut into more graphs than two, each cut is a link; the
-`Routed` send stays in `MoeProtocol::before` of the link that contains the bucketize, so
-the stager is waiting before that graph runs, and no cut may separate the bucketize from
-the GEMMs that read its tables unless the host between them is a gap.
+**The MoE link is one graph per layer.** The model supplies the part of the layer before
+the routed experts, and `MoeLink` appends the routed launches to the same recording:
+
+```rust
+pub trait PreMoe<A: ActDtype> {
+    /// Mixer or attention half, FFN norm, router, and the shared expert if the model has
+    /// one; returns what the routed experts read. Adds into the residual it is handed.
+    fn record<'c, M: Mode>(&self, rec: &mut Recorder<'c, A, M>, staged: &StagedWave<'_>,
+                           x: &mut Resid<A>) -> Result<RouterOut<'c, A>>;
+}
+pub struct RouterOut<'c, A: ActDtype> { pub h: Act<'c, A>, pub weights: Lease<'c, f32>, pub ids: Lease<'c, u32> }
+pub struct MoeLink<'h, P: PreMoe<A>, A: ActDtype> { layer: usize, pre: P, moe: &'h mut MoeProtocol, _a: PhantomData<A> }
+```
+
+`MoeLink::record` runs `pre.record`, then bucketize, gather, gate, up, silu, down and the
+scatter into the residual. The router output and the normed hidden state are `Act`s of the
+one link, so nothing but the residual crosses into the next link and the region mark
+cannot rewind them early. The protocol needs the CPU *between* layers, not inside one: the
+messages are sent before the graph launches (receipt assumes nothing, §4.5) and the query
+follows it, so splitting the attention half into its own graph would add a launch per
+layer and buy nothing, since it has no `NoHost` neighbour to fuse with. `StagedWave` gains
+`seq_base`, staged outside the chain with the other per-wave values. A model that needs a
+host step inside a MoE layer cuts it into more links; the `Routed` send stays in
+`MoeProtocol::before` of the link that contains the bucketize, and router outputs that
+cross that cut go through `MoeBuffers`' `Fixed` buffers, never an `Act`.
 
 **The plan.** The per-model plan is a trait with an exhaustive match, so a new layer kind
 cannot be added without deciding. It names the region kinds of a layer; the model's link
-constructors turn them into links (a MoE layer's kinds become the two links above):
+constructors turn them into links (a MoE layer's kind becomes one `MoeLink` around the
+model's `PreMoe`):
 
 ```rust
 pub enum LayerPlan { Regions(&'static [RegionKind]), Eager(EagerReason) }
@@ -873,9 +952,9 @@ pub trait GraphPlan { type LayerKind: Copy; fn plan(kind: Self::LayerKind) -> La
 ```rust
 impl CaptureCtx {
     // opens the wave chain; the scope, its links and `graph` / `gap` are specified in §12.12
-    pub fn scope<A: ActDtype, T>(&mut self, wave: GraphWave,
+    pub fn scope<A: ActDtype, T>(&mut self, wave: DecodeWave,
         f: impl for<'w> FnOnce(&mut WaveChain<'w, A>) -> Result<T>) -> Result<T>;
-    pub fn stats(&self) -> GraphStats;     // captured, replayed, eager by reason, failures, chain breaks
+    pub fn stats(&self) -> GraphStats;     // captured, replayed, chained above the cap, eager by reason, failures, chain breaks
 }
 pub struct GraphCache<E> { /* HashMap<RegionKey, E> + recency, bounded */ }
 impl<E> GraphCache<E> {
@@ -883,12 +962,14 @@ impl<E> GraphCache<E> {
     pub fn insert(&mut self, k: RegionKey, e: E) -> Option<E>;     // evicts the least recent R
     pub fn invalidate_where(&mut self, pred: impl Fn(&RegionKey) -> bool);
 }
-pub enum GraphVerdict { Eager(Ineligible), Graph(GraphWave) }      // GraphWave { rows: Rows } is private-field
-pub fn decide(shape: &WaveShape) -> GraphVerdict;                   // pure
+pub enum WaveVerdict { Eager(Ineligible), Decode(DecodeWave) }      // Eager: the mixed forward
+pub struct DecodeWave { rows: Rows, capture: Option<GraphRows> }    // private fields; capture is Some iff rows ≤ 4
+pub fn decide(shape: &WaveShape) -> WaveVerdict;                    // pure
 ```
 
 `CaptureCtx` owns a long-lived `GraphCache<GraphSlot>` whose slots (`Empty`, `Ready`,
-`Refused`) the chain fills lazily; the unit tests use `GraphCache<u32>`. Eviction is per
+`Refused`) the chain fills lazily; the unit tests use `GraphCache<u32>`. A `DecodeWave`
+whose `capture` is `None` never touches the cache: its chain runs every link `Chained`. Eviction is per
 `R`, and `invalidate_where` recaptures the MoE graphs when the workspace grows. The
 `RegionKey` also carries the placement epoch and the variant (§4.1).
 
@@ -897,7 +978,7 @@ pub fn decide(shape: &WaveShape) -> GraphVerdict;                   // pure
 A dense model: one region type, run per layer.
 
 ```rust
-struct DenseLayer<'w, A> { w: &'w LayerWeights<'w>, _a: PhantomData<A> }   // w: Weight<'w, _> fields
+struct DenseLayer<'m, A> { w: &'m LayerWeights<'m>, _a: PhantomData<A> }   // w: Weight<'m, _> fields
 impl<A: ActDtype> Region<A> for DenseLayer<'_, A> {
     const KIND: RegionKind = RegionKind::Layer;
     type Host = NoHost;
@@ -923,12 +1004,12 @@ The body reads as the layer and contains no allocation, no dtype, no stream and 
 address. Swapping two operands, passing a weight where an activation belongs, or using an
 F16 residual with a BF16 op is a type error.
 
-An MoE layer is two links, the second owning the shared `MoeProtocol` (§12.4); every MoE
-model writes the same lines:
+An MoE layer is one link owning the shared `MoeProtocol` (§12.4). The model writes only its
+`PreMoe` (attention or DeltaNet mixer, norm, router, shared expert); every MoE model writes
+the same line:
 
 ```rust
-chain.run(&mut AttnRouterLink::new(layer, w), &staged, &mut x)?;               // NoHost
-chain.run(&mut MoeLink::new(layer, w, &mut self.moe), &staged, &mut x)?;       // Host = MoeProtocol
+chain.run(&mut MoeLink::new(layer, DenseAttnPre::new(w), &mut self.moe), &staged, &mut x)?;   // Host = MoeProtocol
 ```
 
 A model's section that is not a region (Flash-Next's QSA attention half) is a `gap` in the
@@ -969,17 +1050,19 @@ test (§12.10).
 ### 12.8 Tests (written with the code)
 
 Compile-time: one `compile_fail` doctest per row of §12.2: capturing a `ComputeStream`;
-`Rows` from 5; calling `synchronize` / `read_back` inside a generic `record`; returning an
+`GraphRows` from 5; calling `synchronize` / `read_back` inside a generic `record`; returning an
 `Act` from a capture; building a `Resid` or `Table` from a `Tensor`; passing a `Tensor`
 operand to an op from a generic region body (and the same call compiling from eager code);
 passing a weight where an activation belongs; an F16 `Resid` into a BF16 op; a per-wave
 host value as a `Fixed` scalar; running an MoE link with `NoHost`; a `MoeLink` inside a `fork` lane (`MoeProtocol` is not
 `Concurrent`); using the `CaptureStream` while a `CaptureSession` borrows it; a `GraphPlan` match missing a variant. Pure, raw
-expected values, no GPU: `Rows::new` accepts 1 to 4 and rejects 0 and 5; `decide` for each
-`Ineligible` variant against a hand-built `WaveShape`; `GraphCache` insert, hit,
+expected values, no GPU: `GraphRows::new` accepts 1 to 4 and rejects 0 and 5, and `Rows::new`
+rejects only 0; `decide` for each `Ineligible` variant against a hand-built `WaveShape`, and
+for decode-only shapes of 4 and 5 rows (`capture` is `Some` and `None`); a chain over a
+`DecodeWave` without `GraphRows` runs every link `Chained` and touches no slot; `GraphCache` insert, hit,
 least-recently-used eviction by `R`, and `invalidate_where`; the tier epoch bumps on every
 re-place and plan raise, so a graph keyed on a stale epoch is not replayed; each op's
-`grid` and `scratch` for `Rows` 1 to 4; the cursor starts at span start in each region and
+`grid` and `scratch` for `Rows` 1 to 4, 16 and 64; the cursor starts at span start in each region and
 rejects an over-allocation. GPU, `--features cuda`: a captured region's output equals the
 eager output bit for bit; an injected foreign allocation fails `finish`; an op whose launcher skips its launch fails
 capture with `MissingLaunch { op }` and never reaches a replay; the recorder's `LAUNCHES`
@@ -993,9 +1076,10 @@ against surrounding null-stream work (the §4.2 assumption, stated as a test); a
 model, every region captures once with zero foreign allocations. The anti-trait (§12.11)
 has one UI test per banned name: the real call shape inside a generic region body must fail
 with the entry's own note (pinned stderr), and a pure test checks every table entry has an
-invariant, a reason and an `INSTEAD:` clause. A launch-count test captures each region at
-`R = 1` and `R = 4` and requires the same op sequence, which is how invariant 5 (a per-row
-loop) is caught.
+invariant, a reason and an `INSTEAD:` clause. A launch-count test records each region at
+`R = 1`, `R = 4` (captured) and `R = 64` (`Chained`, counted by the recorder) and requires
+the same op sequence, which is how invariant 5 (a per-row loop) is caught at both ends of
+the range.
 
 ### 12.9 Vendor-neutral naming and the backend seam
 
@@ -1032,7 +1116,7 @@ stream or an address.
 
 ```rust
 pub trait Op<A: ActDtype> {
-    type In<'a, 'c>;                  // a tuple of typed roles: &Act<'c,A>, &Weight<'w,W>, &Table<T>, &mut Resid<A>, Fixed<T>
+    type In<'a, 'c>;                  // a tuple of typed roles: &Act<'c,A>, &Weight<'m,W>, &Table<T>, &mut Resid<A>, Fixed<T>
     type Out<'c>;                     // Act<'c, A>, or () for an op that writes a Resid in place
     const NAME: &'static str;         // counters and the capture report
     const LAUNCHES: usize;            // kernel nodes one launch adds; the recorder sums them per link
@@ -1048,7 +1132,7 @@ An op's signature is its documentation and its contract. For example `RmsNorm` t
 activation or residual and a weight and returns an activation of the same `A`;
 `PagedDecode` takes an activation, a slot-header `Table` and returns an activation;
 `OProjResidual` takes an activation and a weight and adds into a `&mut Resid<A>`. The op
-allocates its output through the recorder's `pub(crate)` constructor, so there is no
+allocates its output through the recorder's tier constructor (private to `models::graph`), so there is no
 allocation in a region and the fallback arms of §12.3a are unreachable from it.
 
 The call surface also carries these, which the recorder alone did not:
@@ -1060,11 +1144,12 @@ The call surface also carries these, which the recorder alone did not:
 | 1b: validate, do not convert | activation dtype is a type; weight dtype and layout are checked once at capture with `expect_dtype`. Capture happens once per key and replay costs nothing, so this check is free on the hot path. |
 | 2: no allocate-and-copy for layout | `contiguous`, `cat`, `slice_set` are not ops and are banned by name (§12.11). A consumer that needs a layout becomes an op that reads it. |
 | 6: no zeroing | `Out` declares `Uninit` or `Zeroed`; `Zeroed` exists only on accumulator ops, so a blanket `zeros` is not expressible. |
-| Pre-grown workspaces (§4.3) | `scratch` is collected by the plan step before the first capture, so MoE bucketize, split-K and the split-KV partial pool are sized for `R = 4` in one place, not discovered as capture failures. |
+| Pre-grown workspaces (§4.3) | `scratch` is collected by the plan step before the chain opens, so MoE bucketize, split-K and the split-KV partial pool are sized for the wave's `R` (never below 4) in one place, not discovered as capture failures or as an allocation inside a scope. |
 | Pre-warmed kernels | the op owns its kernel handle, so loading it before capture is part of construction. |
 
-**Where types stop.** Shapes and strides are not typed. Rows are a dynamic value of at
-most four, held as `Rows`; everything else is a model constant, checked at capture. The
+**Where types stop.** Shapes and strides are not typed. Rows are a dynamic value held as
+`Rows`, of at most four when a capture holds them as `GraphRows`; everything else is a
+model constant, checked at capture. The
 type-level budget goes to what is structural: role, mode, frozen scalars and activation
 dtype.
 
@@ -1101,7 +1186,7 @@ model-facing modules are `#![forbid(deprecated)]` (`forbid`, not `deny`, so a re
 cannot add an `#[allow(deprecated)]`). Calling one is a compile error that prints the note.
 
 ```rust
-// candle-core::cuda_backend::graph::banned, re-exported from models::graph::prelude
+// models::graph::banned, re-exported from models::graph::prelude
 pub trait NotInGraph {
     #[deprecated(note = "BANNED IN GRAPHS (invariant 2: no allocate-and-copy): contiguous() \
         allocates and copies the whole tensor on every replay. INSTEAD: make the consumer read \
@@ -1112,8 +1197,9 @@ pub trait NotInGraph {
 }
 impl<'c, A: ActDtype, M: Mode> NotInGraph for Recorder<'c, A, M> {}
 impl<'c, A: ActDtype>          NotInGraph for Act<'c, A>        {}
+impl<'c, T>                    NotInGraph for Lease<'c, T>      {}
 impl<A: ActDtype>              NotInGraph for Resid<A>          {}
-impl<'w, W>                    NotInGraph for Weight<'w, W>     {}
+impl<'m, W>                    NotInGraph for Weight<'m, W>     {}
 impl<T>                        NotInGraph for Table<T>          {}
 
 #[must_use] pub struct Banned(());   // implements no Operand and no role: the result goes nowhere
@@ -1153,20 +1239,20 @@ How it composes with the rest:
 | `contiguous`, `force_contiguous` | 2 | Allocate-and-copy to materialise a layout the consumer should read as it is. | Teach the consuming op to read offset and stride, or a descriptor table (2b); or have the producing op write the layout directly. |
 | `Tensor::cat`, `stack`, `slice_set` | 2, 2b | One copy launch per argument, plus an allocation, to pack rows a kernel could read in place. | Producers write into their slice of one `Act` or `Resid` (the op takes an output offset as a `Fixed`), or the consumer takes a descriptor table of `{ptr, offset, stride, len}` per row. |
 | `to_owned_tensor`, `copy`, `clone` of a tier tensor | 2 | Allocates and copies, and the copy is a pool tensor that is not a graph role. | Do not own anything inside a region. Take ownership after the replay, outside the region, from the `Resid` the graph wrote. |
-| `to_vec*`, `to_scalar`, `to_device(Cpu)`, `read_back` | 3 | A GPU-to-CPU transfer and an implicit wait. Only MoE routing and embedding ids are sanctioned, and neither is in a region. | Routing readback is the host protocol: `RegionHost::before` and `after` at the region boundary. Everything else stays on the device as an op. To read logits, do it eagerly after the launch. |
+| `to_vec*`, `to_scalar`, `to_device(Cpu)`, `read_back` | 3 | A GPU-to-CPU transfer and an implicit wait. The only readback the decode path has is the embedding ids, read before the chain opens; MoE routing is not read back at all (§2, §4.5). | Keep it on the device as an op. Host work that must sit between launches is a `RegionHost` protocol at the link boundary or a gap, and neither reads device data. To read logits, do it after the scope exits. |
 | `synchronize`, `stream.synchronize()`, `device.synchronize()`, event waits | 3, 7 | Illegal in capture, and a host wait drains the pipeline the graph exists to keep full. | Ordering is stream order. Anything that needs the host's result is a region boundary (the MoE protocol), not a wait inside a region. |
 | host sort, dedup, union, remap, or building a descriptor table inside a region | 4 | Host compute over per-token data, baked at capture so it is stale on replay. | Build the table at staging (§4.4) into a `Table<T>` through `StagingRing`, or write a kernel op that builds it on the device. |
 | `Tensor::from_vec`, `from_slice`, `Tensor::new`, `wave_from_vec*`, pageable `cuMemcpyHtoD` | 4, 7 | A pageable host-to-device copy and a baked source address. | Per-wave host data is staged outside the region as a `Table<T>` and read through `StagedWave`. Constants are `Fixed<T>`. |
 | `zeros`, `zeros_like`, `ones`, `full`, a `memset` on a buffer a kernel overwrites | 6 | A second full-width memset over bytes the kernel is about to write. | Ops allocate `Uninit` outputs. If the buffer is genuinely read before written (atomic accumulator, scatter base, ragged padding), that op declares `Zeroed` output. |
 | `Tensor::empty`, `alloc_uninit` on a device, `wave_empty*`, `wave_empty_ticketed`, `cudaMalloc`, `cuMemAllocAsync`, any allocator that can fall back to the pool | 7, §4.3 | A graph memory node, or a pool address that may move or be reused: the allocation fallback hides bottlenecks and breaks replay. | A region has no allocator. The op allocates its own output through the recorder's tier constructor, which returns a leased tier tensor or an error. |
-| `as_ptr`, `device_ptr`, `cu_device_ptr`, a cached per-expert slot address | 7 | A raw address survives a boundary move and silently names another tenant's data. | Roles expose no pointer. Pinned weights are `Weight<'w, W>`; experts reach kernels only through the per-wave device table staged by the MoE protocol. |
-| lazy kernel or module load, library handle creation, workspace growth | 7, §4.3 | An implicit synchronisation and a driver allocation during capture. | Construct the op before the first capture: it owns its kernel handle and reports `scratch(rows)`, which is pre-grown for `R = 4`. |
+| `as_ptr`, `device_ptr`, `cu_device_ptr`, a cached per-expert slot address | 7 | A raw address survives a boundary move and silently names another tenant's data. | Roles expose no pointer. Pinned weights are `Weight<'m, W>`; routed experts reach kernels only through the per-invocation snapshot the bucketize writes on the device (§4.5). |
+| lazy kernel or module load, library handle creation, workspace growth | 7, §4.3 | An implicit synchronisation and a driver allocation inside a scope. | Construct the op before the first chain: it owns its kernel handle and reports `scratch(rows)`, which is grown for the wave's `R` before the chain opens. |
 | `Tensor::assert`, `check_now`, `SlotIntegrity` checks (`tensor-assert` builds) | harness | The fencing checks suppress the races they hunt, and a baked stats slot runs on every replay. | Assert on the `Resid` outputs eagerly after the replay, outside the region. |
 
 **What a type cannot ban.**
 
 - **Per-row loops (invariant 5).** A `for row in 0..rec.rows()` around legal ops is legal
-  Rust. The launch-count test captures every region at `R = 1` and `R = 4` and requires the
+  Rust. The launch-count test records every region at `R = 1`, `4` and `64` and requires the
   same op sequence, so a loop that scales the launch count fails in CI.
 - **A free `Tensor::zeros(..)` that is never used as an operand.** Dead allocation inside a
   region is caught by `AllocGuard` at capture (§12.7), not by the type system. A blanket
@@ -1186,12 +1272,15 @@ runtime cost, since tombstones are never called in a correct build. Requires
 A forward is one **chain**: an ordered run of **links**, each either a **graph link** (a
 region replayed from a captured executable) or a **gap** (host logic, with optional
 immediately launched ops). `drive_wave` opens the chain once, after `decide()` returned a
-`GraphWave`, and everything the chain needs lives and dies with that scope.
+`DecodeWave`, and everything the chain needs lives and dies with that scope. When the wave
+has no `GraphRows` (more than four rows) a graph link is issued `Chained`, exactly as a
+refused slot is, so the chain, its host protocol, its memory and its bans are the same at
+every row count.
 
 ```rust
 impl CaptureCtx {
     /// `'w` is higher-ranked, like std::thread::scope: nothing leased inside can leave.
-    pub fn scope<A: ActDtype, T>(&mut self, wave: GraphWave,
+    pub fn scope<A: ActDtype, T>(&mut self, wave: DecodeWave,
         f: impl for<'w> FnOnce(&mut WaveChain<'w, A>) -> Result<T>) -> Result<T>;
 }
 
@@ -1210,25 +1299,27 @@ impl<'w, A: ActDtype> WaveChain<'w, A> {
 pub struct Gap<'g, 'w, A: ActDtype> { /* rec: Recorder<'g, A, Chained>, rows, host-only helpers */ }
 ```
 
-**What the scope owns.** The two phase generations (Attention and Ffn, which `begin_wave`
-allows to coexist) opened before the first link and dropped once, at scope exit; a borrow
-of the long-lived `GraphCache` whose slots it fills lazily; the placement epoch it read at
+**What the scope owns.** The three phase generations (`Attention`, `Ffn` and `Forward`,
+which `begin_wave` allows to coexist) opened before the first link and dropped once, at
+scope exit; a borrow of the long-lived `GraphCache<GraphSlot<'m>>` whose slots it fills
+lazily and which outlives the scope; the placement epoch it read at
 open; the compute stream and the capture stream; and the link log for the report. Scope exit
 is the only fence of the wave: the outermost generation drop synchronises the stream
 (`bump_arena.rs:660-672`) before the cursor resets, and the caller reads the logits
 `Resid` after it. No link contains a wait, so the CPU runs ahead of the GPU the whole way
 through, which is what lets the host protocol and the graph launches overlap.
 
-**Lazy graphs.** Each `(layer, kind, R, epoch)` key has a slot with three states:
+**Lazy graphs.** Each `(layer or span, kind, R, epoch, variant)` key has a slot with three states:
 
 ```
-Empty --first use--> capture on the capture stream, instantiate --> Ready(GraphExec<'w>)
+Empty --first use--> capture on the capture stream, instantiate --> Ready(GraphExec<'m>)
 Empty --capture or instantiate error--> Refused(error, epoch)   // reported, run Chained until the epoch moves
+Ready --launch error--> Refused(error, epoch)                   // this wave's link runs Chained inside the same window
 ```
 
 A `Ready` slot launches on the compute stream. A `Refused` slot runs the region's `record`
 on a `Chained` recorder, so a failed capture keeps the chain unbroken and keeps every ban.
-Nothing is built before the first eligible wave, and the first wave per `(R, epoch)` pays
+Nothing is built before the first decode wave of at most four rows, and the first wave per `(R, epoch)` pays
 the captures; later waves only replay. The key includes the epoch, so a re-placed tier
 retires the old slots instead of replaying them (§4.3). Whether instantiating a graph while
 earlier graphs are still queued stalls the host, or allocates in a way that serialises, is
@@ -1252,7 +1343,7 @@ set by its mode:
 | Mode | Launches | May launch | Used by |
 |---|---|---|---|
 | `Capturing` | recorded | graph-safe ops, stable-role operands only | a graph slot's first sight |
-| `Chained` | immediately | the same ops and operands; plus ops that order a host effect (`Live`: a pinned upload into a `Table`) | gaps, and a refused slot |
+| `Chained` | immediately | the same ops and operands; plus ops that order a host effect (`Live`: a pinned upload into a `Table`) | gaps, a refused slot, and every link of a wave above four rows |
 | `Eager` | immediately | anything, including legacy `Tensor` calls, syncs and readbacks | everything outside a chain |
 
 `Chained` has no `synchronize`, no `read_back` and no `Tensor` operand, so the
@@ -1270,13 +1361,19 @@ model's loop. Adjacent regions with `Host = NoHost` fuse into one graph:
 ```rust
 pub struct Fuse<T>(T);
 impl<A: ActDtype, R1: Region<A, Host = NoHost>, R2: Region<A, Host = NoHost>> Region<A> for Fuse<(R1, R2)> { .. }
-// tuples up to the model's span length; a region with a host protocol does not satisfy the bound
+// small tuples for a heterogeneous span; a region with a host protocol does not satisfy the bound
+pub struct FuseAll<'s, R>(&'s [R]);
+impl<A: ActDtype, R: Region<A, Host = NoHost>> Region<A> for FuseAll<'_, R> { .. }
+// a homogeneous or enum-typed run of layers: a dense trunk, or a hybrid's layers through a
+// per-model enum region whose `record` matches the layer kind
 ```
 
-A dense model's whole trunk and head is one link (the Strata whole-window graph, per `R`).
-An MoE model has two graph links per layer, the second with `MoeProtocol` around it,
-because the dispatch protocol needs the CPU between layers (§4.5), so its cut points are
-exactly the host protocols and nowhere else. A `MoeLink` is never fused with another MoE
+`Fuse` takes a region mark between members, so a fused span needs one member's peak per
+phase, not the sum; nothing but the residual crosses a member boundary, for the same reason
+it cannot cross a link. A dense model's whole trunk and head is one link (the Strata
+whole-window graph, per `R`), keyed by its span. An MoE model has one graph link per
+layer, with `MoeProtocol` around it, because the dispatch protocol needs the CPU between
+layers (§4.5), so its cut points are exactly the host protocols and nowhere else. A `MoeLink` is never fused with another MoE
 link: a worker's 1.5 s spin limit is per kernel on WDDM, and the MoE buffers are shared. A hot spot that needs more than the layer split (for
 example, an attention half followed by the next layer's norm) is a new fused region type,
 written once and keyed like any other. `GraphPlan` returns the link list from the layer
@@ -1286,7 +1383,7 @@ kinds with an exhaustive match, as in §12.4, and no flag chooses the granularit
 
 | Mistake | Why it does not compile |
 |---|---|
-| Using the chain, an `Act`, or a `GraphExec` after the scope | `scope`'s `'w` is higher-ranked; none of them can be returned or stored. |
+| Using the chain, a `Gap` or an `Act` after the scope | `scope`'s `'w` is higher-ranked; none of them can be returned or stored. (A `GraphExec<'m>` deliberately outlives the scope in the cache; it holds no tier address that the epoch does not key.) |
 | Nesting a `graph` or a scope inside a gap | `Gap` holds no handle to the chain. |
 | Fusing a region that needs the host between layers | `Fuse` requires `Host = NoHost` on every member. |
 | A MoE link in a fork lane, or beside another MoE link | `MoeProtocol` is not `Concurrent`, and `fork` accepts only `Host: Concurrent` links. |
@@ -1317,7 +1414,7 @@ to the host without asking the device. Nothing in this section adds a host wait.
 
 ```rust
 pub struct Known<T>(T);   // a host-known value; the field is private
-// constructors (all pub(crate) except Known::constant):
+// constructors (all pub(in crate::models::graph) except Known::constant):
 //   Rows::known(), the layer kind, model config, WaveChain::epoch(),
 //   StagedWave::known_*  (metadata the host recorded when it wrote the staged tables:
 //   which rows are active, a length bucket, a window class)
@@ -1408,7 +1505,7 @@ never inside a region, because a baked value would repeat on every replay.
 **Pipelining across waves.**
 
 ```rust
-pub fn scope_pending<A, T>(&mut self, wave: GraphWave, f: …) -> Result<PendingWave<T>>;
+pub fn scope_pending<A, T>(&mut self, wave: DecodeWave, f: …) -> Result<PendingWave<T>>;
 #[must_use] pub struct PendingWave<T> { /* end event, result, deferred generation release */ }
 impl<T> PendingWave<T> { pub fn resolve(self) -> Result<T>; }   // the one host wait; Drop does it too
 ```
