@@ -51,7 +51,7 @@ use super::index_keys::{
 };
 use super::qsa::{rms_norm_last, IndexerWeights};
 use super::qsa_select::{
-    max_entries_for, max_gathered_for, max_keep, selected_width, Recent, Strata, MAX_RATIO,
+    max_entries_for, max_gathered_for, max_keep, selected_width, Strata, MAX_RATIO,
 };
 use super::resident_page::ResidentPage;
 use super::spec::SpecCapture;
@@ -59,6 +59,7 @@ use crate::models::delta_net::mix::SeqSpan;
 use crate::models::delta_net::RecurrentCompaction;
 use crate::models::operand_guard::expect_dense;
 use crate::models::qsa_selection::QsaSelection;
+use crate::models::selection_strata::Recent;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 use candle::wave_provenance::WaveTicket;
 #[cfg(feature = "cuda")]

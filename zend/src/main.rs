@@ -197,20 +197,20 @@ struct Cli {
     #[arg(long, value_name = "N")]
     qsa_selection_budget: Option<usize>,
 
-    /// Run the QSA selection stratified (Qwen3.8-Flash-Next,
-    /// `docs/qsa_stratified_selection.md`): cut the context into windows of
-    /// this many positions, walking forward from the start, and let each spend
-    /// the whole selection budget on its own blocks plus the system prompt's.
-    /// `0` (or leaving it out) is one window over everything — the checkpoint's
-    /// own selection.
-    #[arg(long, value_name = "POSITIONS")]
-    qsa_window: Option<usize>,
+    /// How a selecting attention divides the context
+    /// (`docs/qsa_stratified_selection.md`): windows of this many positions,
+    /// walking forward from the start, each spending the whole selection
+    /// budget on its own blocks plus the system prompt's. `0` with
+    /// `--qsa-recent 0` is one window over everything — the checkpoint's own
+    /// selection. A model whose attention reads every position ignores it.
+    #[arg(long, value_name = "POSITIONS", default_value_t = StrataTokens::DEFAULT.window)]
+    qsa_window: usize,
 
     /// The span of this many positions nearest the query that a stratified
     /// selection treats apart: ranked in every window, or attended whole —
     /// see `--qsa-recent-mode`.
-    #[arg(long, value_name = "POSITIONS")]
-    qsa_recent: Option<usize>,
+    #[arg(long, value_name = "POSITIONS", default_value_t = StrataTokens::DEFAULT.recent)]
+    qsa_recent: usize,
 
     /// How the `--qsa-recent` span enters the selection: `candidate` ranks it
     /// in every window beside that window's own blocks; `forced` attends it
@@ -277,16 +277,13 @@ fn parse_recent_mode(mode: &str) -> Result<Recent, String> {
     }
 }
 
-/// The stratified selection the `--qsa-*` flags describe — `None` when they
-/// describe the checkpoint's own: one window over everything and no recent
-/// span.
-fn qsa_strata(window: Option<usize>, recent: Option<usize>, mode: Recent) -> Option<StrataTokens> {
-    let (window, recent) = (window.unwrap_or(0), recent.unwrap_or(0));
-    (window > 0 || recent > 0).then_some(StrataTokens {
-        window,
-        recent,
-        mode,
-    })
+/// The stratified selection the `--qsa-*` flags describe.
+fn qsa_strata(cli: &Cli) -> StrataTokens {
+    StrataTokens {
+        window: cli.qsa_window,
+        recent: cli.qsa_recent,
+        mode: cli.qsa_recent_mode,
+    }
 }
 
 /// Bind the listener, retrying briefly on failure — a self-heal relaunch
@@ -572,7 +569,7 @@ async fn main() -> anyhow::Result<()> {
             ModelChoice::Preset(Box::new(m))
         }),
         qsa_selection_budget: cli.qsa_selection_budget,
-        qsa_strata: qsa_strata(cli.qsa_window, cli.qsa_recent, cli.qsa_recent_mode),
+        qsa_strata: qsa_strata(&cli),
         summarize: cli.summarize,
         roles: access::roles(),
         gateways,
@@ -790,40 +787,37 @@ mod cli_tests {
         assert!(Cli::try_parse_from(["zend", "--max-depth", "0"]).is_err());
     }
 
-    /// The `--qsa-*` flags describe a stratified selection only when they ask
-    /// for a window or a recent span; on their own defaults they are the
-    /// checkpoint's selection and the builder is handed nothing.
+    /// With no `--qsa-*` flags zend runs the measured default — 128K windows
+    /// and an 8K recent candidate; `0` and `0` is the checkpoint's own
+    /// selection, and each flag replaces its own part.
     #[test]
-    fn the_qsa_flags_build_a_strata_only_when_they_stratify() {
-        let strata = |args: &[&str]| {
-            let cli = Cli::try_parse_from(args).unwrap();
-            qsa_strata(cli.qsa_window, cli.qsa_recent, cli.qsa_recent_mode)
-        };
-        assert_eq!(strata(&["zend"]), None);
-        assert_eq!(strata(&["zend", "--qsa-window", "0"]), None);
+    fn the_qsa_flags_default_to_the_measured_strata() {
+        let strata = |args: &[&str]| qsa_strata(&Cli::try_parse_from(args).unwrap());
         assert_eq!(
-            strata(&["zend", "--qsa-window", "131072", "--qsa-recent", "8192"]),
-            Some(StrataTokens {
+            strata(&["zend"]),
+            StrataTokens {
                 window: 131_072,
                 recent: 8192,
                 mode: Recent::Candidate,
-            })
+            }
+        );
+        assert_eq!(
+            strata(&["zend", "--qsa-window", "0", "--qsa-recent", "0"]),
+            StrataTokens::WHOLE
         );
         assert_eq!(
             strata(&[
                 "zend",
                 "--qsa-window",
-                "131072",
-                "--qsa-recent",
-                "8192",
+                "65536",
                 "--qsa-recent-mode",
                 "forced"
             ]),
-            Some(StrataTokens {
-                window: 131_072,
+            StrataTokens {
+                window: 65_536,
                 recent: 8192,
                 mode: Recent::Forced,
-            })
+            }
         );
         assert!(Cli::try_parse_from(["zend", "--qsa-recent-mode", "sometimes"]).is_err());
     }

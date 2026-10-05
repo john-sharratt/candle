@@ -46,6 +46,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::models::selection_strata::{Recent, StrataTokens};
+
 /// Bits of an entry reserved for the cell count.
 const CELL_BITS: u32 = 2;
 /// The largest compression ratio the entry packing expresses.
@@ -203,16 +205,6 @@ pub struct Strata {
     pub recent: Recent,
 }
 
-/// How the recent span enters a stratified selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Recent {
-    /// Ranked in every window beside that window's own blocks — more chances to
-    /// be chosen, and still chosen only on score.
-    Candidate,
-    /// Attended whole, and left out of every window's ranking.
-    Forced,
-}
-
 impl Strata {
     /// One window over every candidate and no recent span: the checkpoint's
     /// selection.
@@ -221,6 +213,17 @@ impl Strata {
         recent_blocks: 0,
         recent: Recent::Candidate,
     };
+
+    /// `tokens`, a strata stated in positions, in blocks of `ratio` positions.
+    /// A window or span that does not divide into whole blocks rounds up, so it
+    /// never covers less than was asked for.
+    pub fn from_tokens(tokens: StrataTokens, ratio: usize) -> Self {
+        Self {
+            window_blocks: tokens.window.div_ceil(ratio),
+            recent_blocks: tokens.recent.div_ceil(ratio),
+            recent: tokens.mode,
+        }
+    }
 
     /// Blocks per window over `cand` candidates.
     pub fn window_width(&self, cand: usize) -> usize {
@@ -241,31 +244,6 @@ impl Strata {
         match self.recent {
             Recent::Forced => self.recent_blocks.min(cand),
             Recent::Candidate => 0,
-        }
-    }
-}
-
-/// A [`Strata`] in positions — how a caller states it, before the model's
-/// compression ratio turns it into blocks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StrataTokens {
-    /// Positions per window; `0` is one window spanning every candidate.
-    pub window: usize,
-    /// Positions nearest the query that form the recent span.
-    pub recent: usize,
-    /// How the recent span enters the selection.
-    pub mode: Recent,
-}
-
-impl StrataTokens {
-    /// The strata in blocks of `ratio` positions. A window or span that does
-    /// not divide into whole blocks rounds up, so it never covers less than was
-    /// asked for.
-    pub fn blocks(&self, ratio: usize) -> Strata {
-        Strata {
-            window_blocks: self.window.div_ceil(ratio),
-            recent_blocks: self.recent.div_ceil(ratio),
-            recent: self.mode,
         }
     }
 }
@@ -914,18 +892,23 @@ mod tests {
             recent: 8192,
             mode: Recent::Forced,
         };
-        assert_eq!(deployed.blocks(4), strata(32_768, 2048, Recent::Forced));
+        assert_eq!(
+            Strata::from_tokens(deployed, 4),
+            strata(32_768, 2048, Recent::Forced)
+        );
+        assert_eq!(
+            Strata::from_tokens(StrataTokens::DEFAULT, 4),
+            strata(32_768, 2048, Recent::Candidate)
+        );
         let ragged = StrataTokens {
             window: 10,
             recent: 5,
             mode: Recent::Candidate,
         };
-        assert_eq!(ragged.blocks(4), strata(3, 2, Recent::Candidate));
-        let whole = StrataTokens {
-            window: 0,
-            recent: 0,
-            mode: Recent::Candidate,
-        };
-        assert_eq!(whole.blocks(4), Strata::WHOLE);
+        assert_eq!(
+            Strata::from_tokens(ragged, 4),
+            strata(3, 2, Recent::Candidate)
+        );
+        assert_eq!(Strata::from_tokens(StrataTokens::WHOLE, 4), Strata::WHOLE);
     }
 }

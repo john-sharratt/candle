@@ -56,7 +56,7 @@ use super::paged_index::SealedIndex;
 use super::ple::{PleSpan, PleState};
 use super::ple_fused::ple_apply_spans_fused;
 use super::qsa::IndexerWeights;
-use super::qsa_select::{budget_fits_kernel, Strata, StrataTokens};
+use super::qsa_select::{budget_fits_kernel, Strata};
 use super::resident_page::{PageRegistry, PieceKey, ResidentPage};
 use super::select_bytes::select_layer_bytes;
 use super::spec::SpecCapture;
@@ -88,6 +88,7 @@ use crate::models::qsa_selection::QsaSelection;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows, VerifyStash};
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
+use crate::models::selection_strata::StrataTokens;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 
 use super::rope::flash_next_schedule;
@@ -311,8 +312,10 @@ impl Qwen4ExpBatched {
     }
 
     /// How the QSA selection divides a query's candidates before ranking them
-    /// (`docs/qsa_stratified_selection.md`), stated in positions. A window of
-    /// `0` and no recent span is the checkpoint's selection, the default.
+    /// (`docs/qsa_stratified_selection.md`), stated in positions. The model
+    /// loads at [`StrataTokens::WHOLE`], the checkpoint's own selection; an
+    /// engine sets its own on top ([`StrataTokens::DEFAULT`] unless told
+    /// otherwise).
     ///
     /// The positions become blocks at the selecting layers' compression ratio,
     /// which must be one ratio: a window of positions is a different number of
@@ -323,7 +326,7 @@ impl Qwen4ExpBatched {
     /// not at the depth that first reaches it.
     pub fn set_selection_strata(&mut self, tokens: StrataTokens) -> Result<()> {
         let ratio = self.selecting_ratio()?;
-        let strata = tokens.blocks(ratio);
+        let strata = Strata::from_tokens(tokens, ratio);
         self.check_strata(self.model.cfg.indexer.top_k, ratio, &strata)?;
         self.model.cfg.indexer.strata = strata;
         Ok(())
@@ -2214,6 +2217,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     fn set_selection_prompt(&self, seq: usize, tokens: usize) -> Result<()> {
         Qwen4ExpBatched::set_selection_prompt(self, seq, tokens)
+    }
+
+    fn set_selection_strata(&mut self, strata: StrataTokens) -> Result<()> {
+        Qwen4ExpBatched::set_selection_strata(self, strata)
     }
 
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {

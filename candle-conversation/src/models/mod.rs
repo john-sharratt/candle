@@ -66,8 +66,8 @@ use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use candle::quantized::GgmlDType;
 use candle::DType;
-pub use candle_transformers::models::qwen4exp::qsa_select::{Recent, StrataTokens};
 pub use candle_transformers::models::rope_schedule::RopePreset;
+pub use candle_transformers::models::selection_strata::{Recent, StrataTokens};
 use std::path::Path;
 
 // ────────────────────────────────────────────────────────────────────────────

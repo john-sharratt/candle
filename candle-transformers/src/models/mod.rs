@@ -218,6 +218,7 @@ pub mod rwkv_v5;
 pub mod rwkv_v6;
 pub mod segformer;
 pub mod segment_anything;
+pub mod selection_strata;
 pub mod siglip;
 pub mod slot_header;
 pub mod slot_state;

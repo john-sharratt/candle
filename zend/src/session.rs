@@ -1015,7 +1015,7 @@ impl InferenceState {
         self_check: SelfCheck,
         read_only_substrate: bool,
         qsa_selection_budget: Option<usize>,
-        qsa_strata: Option<StrataTokens>,
+        qsa_strata: StrataTokens,
         summarize: bool,
         progress: Arc<LoadProgress>,
     ) -> anyhow::Result<Option<Arc<Self>>> {

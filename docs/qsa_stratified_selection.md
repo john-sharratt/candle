@@ -43,9 +43,32 @@ prompt is ranked in every window, so it competes everywhere. In Candidate mode
 the recent span gets as many chances as there are windows, and is still chosen
 only on score. In Forced mode it is always attended.
 
-**One window over every candidate with no recent span (`Strata::WHOLE`, the
-default) is exactly the checkpoint's selection.** This is not an approximation:
-the oracle, the kernel and the gates all take that path unchanged.
+**One window over every candidate with no recent span (`Strata::WHOLE`) is
+exactly the checkpoint's selection.** This is not an approximation: the
+oracle, the kernel and the gates all take that path unchanged.
+
+## The default
+
+Every engine runs `StrataTokens::DEFAULT` unless told otherwise: 128K-position
+windows and an 8K recent span, in Candidate mode. It is the setting measured to
+recall at a 294–394K production prompt, at about +15% decode
+(`docs/results/qsa_stratified_selection_2026-10-06.md`). Forced mode recalled
+too, but confused its reasoning after a tool call, at +93% decode.
+
+The setting belongs to the engine, not to one architecture.
+`StrataTokens` lives in `candle-transformers/src/models/selection_strata.rs`.
+`ModelBuilder` hands it to every model it loads through
+`ManagedBatchedModel::set_selection_strata`. A selecting model turns it into
+blocks at its own ratio and checks it against its kernel. A model whose
+attention reads every position has no candidates to divide, and takes it as
+nothing.
+
+Below one window's depth the default selects exactly what `WHOLE` does, because
+the prompt and the recent span are then inside the only window. The model
+itself still loads at `WHOLE`, so the forward gates, which drive the model
+without an engine, measure the checkpoint's own selection.
+
+`--qsa-window 0 --qsa-recent 0` runs the checkpoint's selection under zend.
 
 Cost: `windows × 513` blocks attended instead of 513. At 294K with 128K windows
 that is 3 × 513, plus 2,048 forced blocks in Forced mode. That is about 6.2K
@@ -56,14 +79,15 @@ cells in Candidate mode and 14.4K cells in Forced mode, against a dense read of
 
 | Piece | File |
 |---|---|
-| `Strata`, `Recent`, `StrataTokens`, the oracle `selection_entries`, bounds `max_entries_for` / `max_gathered_for` | `candle-transformers/src/models/qwen4exp/qsa_select.rs` |
+| `Strata` (and `Strata::from_tokens`), the oracle `selection_entries`, bounds `max_entries_for` / `max_gathered_for` | `candle-transformers/src/models/qwen4exp/qsa_select.rs` |
 | The kernel (single pass, plus the split segment/merge pair) | `candle-kernels/src/simple/qsa_topk.cu` |
 | `SelectionTable`, `selection_stride`, `IndexCache::{set_prompt_end, prompt_blocks}` | `candle-transformers/src/models/qwen4exp/indexer.rs` |
 | `Qwen4ExpBatched::{set_selection_strata, set_selection_prompt}` | `candle-transformers/src/models/qwen4exp/wave.rs` |
-| `ManagedBatchedModel::set_selection_prompt` (no-op for every other model) | `candle-transformers/src/models/batched_inference.rs` |
+| `ManagedBatchedModel::{set_selection_prompt, set_selection_strata}` (no-ops for every other model) | `candle-transformers/src/models/batched_inference.rs` |
 | `ModelBuilder::qsa_strata` | `candle-conversation/src/models/builder.rs` |
 | The prompt span is declared after each projection walk, from the leading run of sections and glue (`prompt_end_of`) | `candle-conversation/src/scheduler/projection_assembler.rs` |
-| `--qsa-window`, `--qsa-recent`, `--qsa-recent-mode` | `zend/src/main.rs` |
+| `--qsa-window`, `--qsa-recent`, `--qsa-recent-mode` (default `StrataTokens::DEFAULT`) | `zend/src/main.rs` |
+| `StrataTokens`, `Recent`, `StrataTokens::{DEFAULT, WHOLE}` | `candle-transformers/src/models/selection_strata.rs` |
 
 The strata is stated in positions (`StrataTokens`) and turned into blocks at
 the selecting layers' compression ratio, which must be a single ratio. It is

@@ -86,13 +86,14 @@ pub struct DaemonConfig {
     /// judged against. Refused at load for a model whose attention does not
     /// select, and for a budget the selection kernel cannot run.
     pub qsa_selection_budget: Option<usize>,
-    /// `--qsa-window`, `--qsa-recent`, `--qsa-recent-mode`: run the QSA
-    /// selection stratified (`ModelBuilder::qsa_strata`,
-    /// `docs/qsa_stratified_selection.md`) — the candidates cut into windows of
-    /// `window` positions that each spend the whole budget, with the system
-    /// prompt and the `recent` positions nearest the query ranked in, or forced
-    /// into, every one. `None` keeps the checkpoint's single ranking.
-    pub qsa_strata: Option<StrataTokens>,
+    /// `--qsa-window`, `--qsa-recent`, `--qsa-recent-mode`: how a selecting
+    /// attention divides its candidates (`ModelBuilder::qsa_strata`,
+    /// `docs/qsa_stratified_selection.md`) — windows of `window` positions that
+    /// each spend the whole budget, with the system prompt and the `recent`
+    /// positions nearest the query ranked in, or forced into, every one.
+    /// [`StrataTokens::DEFAULT`] unless the flags say otherwise;
+    /// [`StrataTokens::WHOLE`] is the checkpoint's single ranking.
+    pub qsa_strata: StrataTokens,
     /// `--summarize`: let conversations launch background tree summaries.
     /// Off by default — every conversation the daemon opens is built from a
     /// config with every summarization trigger disabled
@@ -136,7 +137,7 @@ impl DaemonConfig {
             read_only_substrate: false,
             model: ModelChoice::default(),
             qsa_selection_budget: None,
-            qsa_strata: None,
+            qsa_strata: StrataTokens::DEFAULT,
             summarize: false,
             roles: Roles::default(),
             gateways: Gateways::default(),

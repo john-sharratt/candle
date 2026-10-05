@@ -31,6 +31,7 @@ use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::RecurrentCompaction;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::rope_schedule::RungSelect;
+use crate::models::selection_strata::StrataTokens;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 use crate::models::window_residuals::WindowResiduals;
 use candle::quantized::pinned_staging::Generation;
@@ -4535,6 +4536,17 @@ pub trait ManagedBatchedModel {
     /// selection ranks it in every window (`docs/qsa_stratified_selection.md`).
     /// A model that attends every position has nothing to do with it.
     fn set_selection_prompt(&self, _seq: usize, _tokens: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// How the model's selection divides a query's candidates before ranking
+    /// them, stated in positions ([`StrataTokens`]).
+    ///
+    /// A model whose attention selects turns it into its own blocks and checks
+    /// it against its selection kernel, refusing one the kernel could not run
+    /// at the deepest position the model reaches. A model that attends every
+    /// position has no candidates to divide.
+    fn set_selection_strata(&mut self, _strata: StrataTokens) -> Result<()> {
         Ok(())
     }
 

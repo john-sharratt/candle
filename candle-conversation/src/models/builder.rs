@@ -20,7 +20,7 @@ use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_model::{BatchedInference, BatchedModelCore};
 use candle_transformers::models::qwen35::TensorOverride;
-use candle_transformers::models::qwen4exp::qsa_select::StrataTokens;
+use candle_transformers::models::selection_strata::StrataTokens;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -176,10 +176,9 @@ pub struct ModelBuilder {
     /// selects. `None` runs the checkpoint's own. See
     /// [`ModelBuilder::qsa_selection_budget`].
     qsa_selection_budget: Option<usize>,
-    /// How the QSA selection divides a query's candidates, for an architecture
-    /// whose attention selects. `None` runs the checkpoint's one ranking. See
-    /// [`ModelBuilder::qsa_strata`].
-    qsa_strata: Option<StrataTokens>,
+    /// How a selecting attention divides a query's candidates.
+    /// [`StrataTokens::DEFAULT`] unless set. See [`ModelBuilder::qsa_strata`].
+    qsa_strata: StrataTokens,
     /// The lowest progressive-YaRN factor any sequence runs at. `None` lets a
     /// sequence inside the trained window run the trained RoPE. See
     /// [`ModelBuilder::min_rope_factor`].
@@ -216,7 +215,7 @@ impl ModelBuilder {
             prefill_pass_tokens: None,
             loras: Vec::new(),
             qsa_selection_budget: None,
-            qsa_strata: None,
+            qsa_strata: StrataTokens::DEFAULT,
             min_rope_factor: None,
             spec,
         }
@@ -372,18 +371,18 @@ impl ModelBuilder {
         self
     }
 
-    /// Run the QSA selection stratified (`docs/qsa_stratified_selection.md`):
-    /// the candidates cut into windows that each spend the whole budget, with
-    /// the system prompt and the recent span ranked in, or forced into, every
-    /// one, all stated in positions. `None` keeps the checkpoint's single
-    /// ranking over every candidate, as does a window of `0` with no recent
-    /// span.
+    /// How a selecting attention divides a query's candidates
+    /// (`docs/qsa_stratified_selection.md`): cut into windows that each spend
+    /// the whole budget, with the system prompt and the recent span ranked in,
+    /// or forced into, every one, all stated in positions.
     ///
-    /// Refused at load, like [`Self::qsa_selection_budget`], for an
-    /// architecture whose attention does not select, and for a strata whose
-    /// windows the selection kernel could not hold at the deepest position the
-    /// model reaches.
-    pub fn qsa_strata(mut self, strata: Option<StrataTokens>) -> Self {
+    /// [`StrataTokens::DEFAULT`] unless set; [`StrataTokens::WHOLE`] is the
+    /// checkpoint's single ranking over every candidate. Handed to every model
+    /// through `ManagedBatchedModel::set_selection_strata`, after its budget:
+    /// a model whose attention attends every position has nothing to divide,
+    /// and a selecting one refuses a strata whose windows its kernel could not
+    /// hold at the deepest position it reaches.
+    pub fn qsa_strata(mut self, strata: StrataTokens) -> Self {
         self.qsa_strata = strata;
         self
     }
@@ -1014,6 +1013,17 @@ impl ModelBuilder {
     ) -> crate::Result<LoadedModel> {
         let int8_mode = self.int8_mode(device, model_path);
         let mut model = self.load_arch(model_path, device, int8_mode, progress)?;
+        // After `load_arch` has applied the budget: a selecting model checks
+        // the strata against its kernel under the budget it will run with.
+        model
+            .set_selection_strata(self.qsa_strata)
+            .map_err(ConversationError::Model)?;
+        tracing::info!(
+            window = self.qsa_strata.window,
+            recent = self.qsa_strata.recent,
+            mode = ?self.qsa_strata.mode,
+            "selection strata (a model whose attention reads every position ignores it)"
+        );
         if let Some(min) = self.min_rope_factor {
             model
                 .set_rope_min_factor(min)
@@ -1060,15 +1070,6 @@ impl ModelBuilder {
                     "{:?} has no QSA selection, so a selection budget of {positions} \
                      position(s) would change nothing",
                     self.spec.arch
-                )));
-            }
-        }
-        if let Some(strata) = self.qsa_strata {
-            if !matches!(self.spec.arch, ModelArch::Qwen4Exp) {
-                return Err(ConversationError::Other(format!(
-                    "{:?} has no QSA selection, so a stratified selection ({} positions a \
-                     window, {} recent) would change nothing",
-                    self.spec.arch, strata.window, strata.recent
                 )));
             }
         }
@@ -1162,13 +1163,6 @@ impl ModelBuilder {
                 if let Some(positions) = self.qsa_selection_budget {
                     model
                         .set_selection_budget(positions)
-                        .map_err(ConversationError::Model)?;
-                }
-                // After the budget: the strata is checked against the kernel
-                // under the budget it will run with.
-                if let Some(strata) = self.qsa_strata {
-                    model
-                        .set_selection_strata(strata)
                         .map_err(ConversationError::Model)?;
                 }
                 Ok(Box::new(model))
@@ -2208,26 +2202,25 @@ mod selection_budget_tests {
         );
     }
 
-    /// The same refusal for a stratified selection: a model whose attention
-    /// does not select would load, ignore the windows, and report a recall run
-    /// that never stratified anything.
+    /// **Every model is built with the stratified selection unless told
+    /// otherwise** — the setting is the engine's, not one architecture's, and a
+    /// caller replaces it whole.
     #[test]
-    fn a_stratified_selection_is_refused_for_a_model_without_qsa() {
-        use candle_transformers::models::qwen4exp::qsa_select::{Recent, StrataTokens};
-        let err = Model::Qwen35_0_8B_Q8
+    fn every_model_builds_with_the_default_strata_unless_told_otherwise() {
+        use candle_transformers::models::selection_strata::{Recent, StrataTokens};
+        for model in [Model::Qwen35_0_8B_Q8, Model::Qwen3_30B_A3B_Q4] {
+            assert_eq!(
+                model.builder().qsa_strata,
+                StrataTokens {
+                    window: 131_072,
+                    recent: 8192,
+                    mode: Recent::Candidate,
+                }
+            );
+        }
+        let whole = Model::Qwen35_0_8B_Q8
             .builder()
-            .qsa_strata(Some(StrataTokens {
-                window: 131_072,
-                recent: 8192,
-                mode: Recent::Forced,
-            }))
-            .load_model(Path::new("never-read.gguf"), &Device::Cpu, None)
-            .err()
-            .expect("a model whose attention does not select must refuse a strata");
-        assert_eq!(
-            err.to_string(),
-            "Qwen35Dense has no QSA selection, so a stratified selection (131072 positions a \
-             window, 8192 recent) would change nothing"
-        );
+            .qsa_strata(StrataTokens::WHOLE);
+        assert_eq!(whole.qsa_strata, StrataTokens::WHOLE);
     }
 }

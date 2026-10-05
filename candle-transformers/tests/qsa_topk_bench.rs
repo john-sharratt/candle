@@ -27,7 +27,8 @@ use std::time::Instant;
 
 use candle::{Device, Result, Tensor};
 use candle_transformers::models::qwen4exp::indexer::SelectionTable;
-use candle_transformers::models::qwen4exp::qsa_select::{Recent, Strata};
+use candle_transformers::models::qwen4exp::qsa_select::Strata;
+use candle_transformers::models::selection_strata::Recent;
 
 const RATIO: usize = 4;
 const TOP_K: usize = 2048;
