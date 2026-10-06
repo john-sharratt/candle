@@ -23,10 +23,14 @@
 //! one, CI included. The build script writes an empty document instead, and an
 //! empty document overrides nothing.
 //!
-//! `cargo:rerun-if-changed` is set on the real path, so editing the override
-//! rebuilds. Note that cargo compares *mtimes*: restoring a file with a
-//! preserved timestamp (a `mv` back, some archive extractions) can look older
-//! than the last build and be missed — `touch models.override.yaml` forces it.
+//! `cargo:rerun-if-changed` is set on the real path while it exists, so editing
+//! or deleting the override rebuilds. It is not set while the file is absent:
+//! cargo counts a missing watched path as stale on every invocation, which
+//! rebuilt this crate on every `cargo` command. A newly created override is
+//! therefore picked up by touching `candle-transformers/build.rs`. Note that
+//! cargo compares *mtimes*: restoring a file with a preserved timestamp (a `mv`
+//! back, some archive extractions) can look older than the last build and be
+//! missed — `touch models.override.yaml` forces it.
 //!
 //! # Two sections, because there are two kinds of coordinate
 //!

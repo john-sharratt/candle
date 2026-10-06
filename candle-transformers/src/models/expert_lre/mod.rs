@@ -174,6 +174,9 @@ mod residency;
 pub mod slot_integrity;
 #[cfg(feature = "cuda")]
 mod slot_image;
+/// The slot-tenancy tags bucketize's owner check reads.
+#[cfg(feature = "tensor-assert")]
+mod slot_owners;
 #[cfg(feature = "cuda")]
 mod stager;
 /// Which invocation of each row the device has begun — the reclaim key.
@@ -184,7 +187,7 @@ mod startup;
 mod transition;
 mod types;
 #[cfg(feature = "cuda")]
-mod warm_tier;
+pub(crate) mod warm_tier;
 mod weight_plan;
 
 // Re-exports — the public API of this module.

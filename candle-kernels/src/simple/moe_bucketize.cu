@@ -62,7 +62,7 @@
 // of the layer's gate, up and down launches — are zeroed here.
 //
 // PROMOTION: each remote expert a decode-scored token routed, in list order,
-// takes the next free VRAM slot image from the promotion ring while it has one
+// takes the next VRAM slot image the promotion ring offers while it has one
 // (`remote_dst[i]`, else 0). A prompt-only expert takes one only while the ring
 // holds more than its `reserve` (a mapped word the host sets; a null address
 // means never). Where the zone has room for prompts the host sets it to 0 and a
@@ -71,13 +71,45 @@
 // is decode's and a prompt — which sweeps the table about once — is served by
 // the workers' copies instead of evicting decode's working set. Only the brief
 // window after the target shrinks, before the host trims the surplus, lets a
-// prompt-only expert through there. The ring's log records
-// `summary_seq << 32 | row << 16 | expert` for each slot taken.
-// The expert's mark (`promo_marks[row][expert]`) is set with it and cleared by
-// the host when the promotion lands; a marked expert is not given a second
-// slot by a later invocation that finds it still remote. The grouped GEMMs'
-// workers write every slice they copy into that slot too, so once the layer is
-// done the expert is whole in VRAM and the host points its entry there.
+// prompt-only expert through there.
+//
+// A PROMPT-ONLY expert takes only an EMPTY offer — a prompt fills the zone's
+// holes and never evicts. When the next offer holds a victim, it stays in its
+// workers' scratch.
+//
+// A SWEEP claims nothing: when the experts whose claims would evict — the
+// decode-scored ones — outnumber the mapped `sweep` word (the stock the host
+// keeps for the layers ahead), the launch is a prompt passing over the table,
+// and every miss stays in its workers' scratch. Decided per launch, before the
+// first claim, so a launch either claims as its misses come or not at all.
+//
+// An offered slot is either EMPTY (`promo_victims[i] == PROMO_EMPTY`) or still
+// holds a resident expert, its VICTIM, named by its index `row' · n_experts +
+// e'` in the gate plane. A victim stays resident and hittable until a miss
+// claims its slot; claiming it is the eviction:
+//   * a victim of THIS row that this launch routes is SKIPPED — one of this
+//     launch's tiles reads that slot. Its index is logged with the expert
+//     `PROMO_SKIP` and the host takes the offer back; the miss tries the next.
+//   * otherwise the victim's three live entries are retargeted to its pinned
+//     copy (`promo_retarget[i]`: gate, up, down) — up and down, then gate —
+//     before this launch's workers write a byte into the slot. Every launch
+//     enqueued earlier has completed in stream order, and every later one reads
+//     the entries fresh in its own bucketize, so no tile ever reads the slot
+//     under the victim's name again. No fence per claim: nothing reads a VRAM
+//     victim's entry concurrently, and the host sees the claim only through
+//     `head`, published behind a system fence.
+// The ring's log records `summary_seq << 32 | row << 16 | expert` for each slot
+// taken. The expert's mark (`promo_marks[row][expert]`) is set with it and
+// cleared by the host when the promotion lands; a marked expert is not given a
+// second slot by a later invocation that finds it still remote. The grouped
+// GEMMs' workers write every slice they copy into that slot, so once the layer
+// is done the expert is whole in VRAM and the host points its entry there.
+//
+// OWNER CHECK (`slot_owner`, optional): the zone's slots, each tagged with the
+// expert last installed there as `(row + 1) << 16 | expert`. Every VRAM entry
+// snapshotted for a GEMM is checked against its slot's tag, and a mismatch —
+// a tile about to read one expert's weights under another's name — traps,
+// naming the slot. Null skips the check.
 //
 // The ROUTING SUMMARY (`summary`, optional) is what the host learns about the
 // layer: `count | pinned << 29 | cold << 30 | decode << 31` per expert, where
@@ -125,6 +157,10 @@ struct DecodeRanges {
 #define CLS_VRAM 0
 #define CLS_PINNED 1
 #define CLS_COLD 2
+// A promotion offer with no resident expert behind it.
+#define PROMO_EMPTY 0xFFFFFFFFFFFFFFFFull
+// The expert a skipped victim's log entry names.
+#define PROMO_SKIP 0xFFFFu
 
 extern "C" __global__ void moe_bucketize_kernel(
     const uint32_t* __restrict__ topk_ids, // [n_tokens * k] row-major
@@ -177,6 +213,19 @@ extern "C" __global__ void moe_bucketize_kernel(
     // Mapped `u32`: the stock kept for decode-scored experts — a prompt-only
     // expert takes a slot only while more than this is stocked. Null = never.
     const uint32_t* promo_reserve,
+    // Mapped `u32`: a launch with more claiming experts than this is a sweep
+    // and claims nothing.
+    const uint32_t* promo_sweep,
+    // Mapped `[cap]`: the victim behind each offer (`row' · n_experts + e'`), or
+    // PROMO_EMPTY; and `[cap][3]` the entries a claimed victim is retargeted to.
+    const uint64_t* promo_victims,
+    const uint64_t* promo_retarget,
+    // Mapped `u32[zone_slots]` slot tags, or null: the owner check. Slot `s`
+    // spans `[zone_end - (s + 1) · zone_slot_bytes, zone_end - s · zone_slot_bytes)`.
+    const uint32_t* slot_owner,
+    const uint64_t zone_end,
+    const uint64_t zone_slot_bytes,
+    const uint32_t zone_slots,
     const int32_t row,                   // this layer's row, for the log
     uint64_t* __restrict__ remote_dst,   // [n_experts] promotion slot per remote expert, or null
     // `[rows]` started words (mapped), or null: `ticket` is stored into
@@ -279,6 +328,18 @@ extern "C" __global__ void moe_bucketize_kernel(
             } else if ((pg >= pinned0_lo && pg < pinned0_hi) || (pg >= pinned1_lo && pg < pinned1_hi)) {
                 cls = CLS_PINNED;
             }
+            if (slot_owner != nullptr && cls == CLS_VRAM && pg < zone_end &&
+                pg >= zone_end - (uint64_t)zone_slots * zone_slot_bytes) {
+                const uint32_t s = (uint32_t)((zone_end - 1ull - pg) / zone_slot_bytes);
+                const uint32_t want = ((uint32_t)(row + 1) << 16) | (uint32_t)e;
+                const uint32_t got = ((const volatile uint32_t*)slot_owner)[s];
+                if (got != want) {
+                    printf("moe_bucketize: row %d expert %d reads slot %u, whose tenant is "
+                           "row %d expert %u\n",
+                           row, e, s, (int)(got >> 16) - 1, got & 0xffffu);
+                    __trap();
+                }
+            }
             sh_cls[e] = cls;
             snap[e] = pg;
             snap[n_experts + e] = pu;
@@ -308,15 +369,33 @@ extern "C" __global__ void moe_bucketize_kernel(
         uint32_t head = 0;
         uint32_t tail = 0;
         uint32_t reserve = 0xffffffffu;
+        // Whether this launch claims at all: not a sweep.
+        bool claim = false;
         if (promo_slots != nullptr) {
             head = *(volatile const uint32_t*)promo_head;
             tail = *(volatile const uint32_t*)promo_tail;
             if (promo_reserve != nullptr) {
                 reserve = *(volatile const uint32_t*)promo_reserve;
             }
+            const uint32_t sweep = *(volatile const uint32_t*)promo_sweep;
             // The slots the host published before its tail store.
             __threadfence_system();
+            // The experts whose claims would evict: the decode-scored ones. A
+            // prompt-only expert takes only an empty offer, so it evicts
+            // nothing and decides nothing — counting it would let a zone's
+            // holes turn a short prompt into a sweep and defer its decode
+            // rows' claims.
+            uint32_t claiming = 0;
+            for (int e = 0; e < n_experts; e++) {
+                if (sh_counts[e] > 0 && sh_cls[e] != CLS_VRAM && !sh_marked[e] && sh_dec[e]) {
+                    claiming++;
+                }
+            }
+            claim = claiming <= sweep;
         }
+        // The live table's gate plane, which a victim's index is into.
+        uint64_t* const gate_plane =
+            gate_row != nullptr ? (uint64_t*)gate_row - (size_t)row * (size_t)n_experts : nullptr;
         int32_t off = 0;
         int32_t active = 0;
         for (int e = 0; e < n_experts; e++) {
@@ -345,16 +424,48 @@ extern "C" __global__ void moe_bucketize_kernel(
                     remote[4 * n_remote + 3] = order[pass] == CLS_COLD;
                     if (remote_dst != nullptr) {
                         uint64_t dst = 0ull;
-                        if (promo_slots != nullptr && head != tail && !sh_marked[e] &&
-                            (sh_dec[e] || tail - head > reserve)) {
-                            const uint32_t i = head % promo_cap;
-                            dst = ((const volatile uint64_t*)promo_slots)[i];
-                            ((volatile uint64_t*)promo_log)[i] =
-                                ((uint64_t)summary_seq << 32) | ((uint64_t)row << 16) |
-                                (uint64_t)e;
-                            ((volatile uint32_t*)promo_marks)[(size_t)row * n_experts + e] =
-                                summary_seq;
-                            head++;
+                        if (claim && !sh_marked[e] && (sh_dec[e] || tail - head > reserve)) {
+                            while (head != tail) {
+                                const uint32_t i = head % promo_cap;
+                                const uint64_t victim =
+                                    ((const volatile uint64_t*)promo_victims)[i];
+                                if (victim != PROMO_EMPTY && !sh_dec[e]) {
+                                    // A prompt-only expert evicts nothing: the
+                                    // next offer holds a resident expert, so it
+                                    // stays in scratch.
+                                    break;
+                                }
+                                if (victim != PROMO_EMPTY) {
+                                    const int32_t vr = (int32_t)(victim / (uint64_t)n_experts);
+                                    const int32_t ve = (int32_t)(victim % (uint64_t)n_experts);
+                                    if (vr == row && sh_counts[ve] > 0) {
+                                        ((volatile uint64_t*)promo_log)[i] =
+                                            ((uint64_t)summary_seq << 32) |
+                                            ((uint64_t)row << 16) | (uint64_t)PROMO_SKIP;
+                                        head++;
+                                        continue;
+                                    }
+                                    // No fence per claim: every later kernel sees
+                                    // these stores by stream order, nothing polls a
+                                    // VRAM victim's entry concurrently, and the host
+                                    // learns of the claim only through `head`, which
+                                    // is published behind a system fence below.
+                                    const volatile uint64_t* rt =
+                                        (const volatile uint64_t*)promo_retarget + 3 * (size_t)i;
+                                    volatile uint64_t* g = (volatile uint64_t*)gate_plane + victim;
+                                    g[table_plane] = rt[1];
+                                    g[2 * table_plane] = rt[2];
+                                    g[0] = rt[0];
+                                }
+                                dst = ((const volatile uint64_t*)promo_slots)[i];
+                                ((volatile uint64_t*)promo_log)[i] =
+                                    ((uint64_t)summary_seq << 32) | ((uint64_t)row << 16) |
+                                    (uint64_t)e;
+                                ((volatile uint32_t*)promo_marks)[(size_t)row * n_experts + e] =
+                                    summary_seq;
+                                head++;
+                                break;
+                            }
                         }
                         remote_dst[n_remote] = dst;
                     }
@@ -608,6 +719,13 @@ extern "C" int32_t run_moe_bucketize(
     uint32_t promo_cap,
     void* promo_marks,
     const void* promo_reserve,
+    const void* promo_sweep,
+    const void* promo_victims,
+    const void* promo_retarget,
+    const void* slot_owner,
+    uint64_t zone_end,
+    uint64_t zone_slot_bytes,
+    uint32_t zone_slots,
     int32_t row,
     void* remote_dst,
     void* started_rows,
@@ -618,7 +736,10 @@ extern "C" int32_t run_moe_bucketize(
         n_experts > MAX_EXPERTS || tile_w <= 0 || (gate_row != nullptr && snap == nullptr) ||
         (promo_slots != nullptr && (promo_cap == 0 || promo_log == nullptr ||
                                     promo_head == nullptr || promo_tail == nullptr ||
-                                    promo_marks == nullptr || remote_dst == nullptr)) ||
+                                    promo_marks == nullptr || remote_dst == nullptr ||
+                                    promo_sweep == nullptr || promo_victims == nullptr ||
+                                    promo_retarget == nullptr || gate_row == nullptr)) ||
+        (slot_owner != nullptr && (zone_slot_bytes == 0 || gate_row == nullptr)) ||
         decode_ranges < 0 || decode_ranges > MAX_DECODE_RANGES ||
         (decode_ranges > 0 && (decode_lo == nullptr || decode_hi == nullptr))) {
         return 1;
@@ -649,7 +770,9 @@ extern "C" int32_t run_moe_bucketize(
         (int32_t*)remote, (int32_t*)counters,
         (const uint64_t*)promo_slots, (uint64_t*)promo_log, (uint32_t*)promo_head,
         (const uint32_t*)promo_tail, promo_cap, (uint32_t*)promo_marks,
-        (const uint32_t*)promo_reserve, row,
+        (const uint32_t*)promo_reserve, (const uint32_t*)promo_sweep,
+        (const uint64_t*)promo_victims, (const uint64_t*)promo_retarget,
+        (const uint32_t*)slot_owner, zone_end, zone_slot_bytes, zone_slots, row,
         (uint64_t*)remote_dst, (uint64_t*)started_rows, ticket);
     cudaError_t launched = cudaPeekAtLastError();
     if (launched != cudaSuccess) {

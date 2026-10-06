@@ -7646,9 +7646,19 @@ pub fn moe_bucketize(
         crate::bail!("moe_bucketize: a live layer needs a snapshot buffer");
     }
     let promo = live.and_then(|l| l.promo);
-    if live.is_some_and(|l| l.promo.is_some_and(|p| p.cap == 0) || (l.promo.is_some() && l.remote_dst == 0))
-    {
-        crate::bail!("moe_bucketize: a promotion ring needs a capacity and a remote_dst list");
+    if live.is_some_and(|l| {
+        l.promo.is_some_and(|p| {
+            p.cap == 0 || p.sweep == 0 || p.victims == 0 || p.retarget == 0 || l.gate_row == 0
+        }) || (l.promo.is_some() && l.remote_dst == 0)
+    }) {
+        crate::bail!(
+            "moe_bucketize: a promotion ring needs a capacity, its sweep word, its victim \
+             arrays, a live table and a remote_dst list"
+        );
+    }
+    let owner = live.map_or(OwnerCheck::default(), |l| l.owner);
+    if owner.owners != 0 && (owner.slot_bytes == 0 || live.is_none_or(|l| l.gate_row == 0)) {
+        crate::bail!("moe_bucketize: the owner check needs a slot size and a live table");
     }
     ws.ensure(&device, n_tokens, k)?;
 
@@ -7720,6 +7730,13 @@ pub fn moe_bucketize(
             promo.map_or(0, |p| p.cap),
             promo.map_or(0, |p| p.marks) as *mut std::ffi::c_void,
             promo.map_or(0, |p| p.reserve) as *const std::ffi::c_void,
+            promo.map_or(0, |p| p.sweep) as *const std::ffi::c_void,
+            promo.map_or(0, |p| p.victims) as *const std::ffi::c_void,
+            promo.map_or(0, |p| p.retarget) as *const std::ffi::c_void,
+            owner.owners as *const std::ffi::c_void,
+            owner.zone_end,
+            owner.slot_bytes,
+            owner.slots,
             live.map_or(0, |l| l.row),
             live.map_or(0, |l| l.remote_dst) as *mut std::ffi::c_void,
             live.map_or(0, |l| l.started_rows) as *mut std::ffi::c_void,
@@ -7778,10 +7795,26 @@ pub struct BucketizeLive {
     pub started_rows: u64,
     /// This invocation's ticket.
     pub ticket: u64,
+    /// The slot-tenancy check ([`OwnerCheck`]); all zero runs none.
+    pub owner: OwnerCheck,
+}
+
+/// Where [`moe_bucketize`] checks every VRAM entry it snapshots against the
+/// expert last installed in that slot. `owners` is a mapped `u32[slots]` of
+/// tags `(row + 1) << 16 | expert`; slot `s` spans `[zone_end - (s + 1) ·
+/// slot_bytes, zone_end - s · slot_bytes)`, the weight zone's downward layout.
+/// A mismatch — a GEMM about to read one expert's weights under another's
+/// name — traps with the slot named. `owners == 0` checks nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OwnerCheck {
+    pub owners: u64,
+    pub zone_end: u64,
+    pub slot_bytes: u64,
+    pub slots: u32,
 }
 
 /// The promotion ring `moe_bucketize` takes slots from — device addresses into
-/// mapped host memory. The host frees VRAM slot images into `slots[tail % cap]`
+/// mapped host memory. The host offers VRAM slot images at `slots[tail % cap]`
 /// (`u64`) and advances `tail` (`u32`); the kernel takes them from `head`
 /// (`u32`), records `summary_seq << 32 | row << 16 | expert` in `log` (`u64`)
 /// at the same index, and advances `head`. `marks` (`u32[rows][n_experts]`) is
@@ -7791,6 +7824,14 @@ pub struct BucketizeLive {
 /// prompt-only expert takes a slot only while more than that value is stocked
 /// (a value of 0 lets it take any). A null address means a prompt-only expert
 /// never takes one.
+///
+/// `sweep` is the address of a `u32`: a launch with more claiming experts than
+/// it holds is a sweep and claims nothing. `victims` (`u64[cap]`) names the
+/// resident expert behind each offer — `row · n_experts + expert`, the index of
+/// its gate entry — or `PROMO_EMPTY` for an empty slot; a claimed victim's
+/// three entries are retargeted to `retarget` (`u64[cap][3]`: gate, up, down)
+/// before the slot is written, and a victim the launch itself routes is
+/// skipped and logged with the expert `PROMO_SKIP`.
 #[derive(Debug, Clone, Copy)]
 pub struct PromoRing {
     pub slots: u64,
@@ -7800,6 +7841,9 @@ pub struct PromoRing {
     pub cap: u32,
     pub marks: u64,
     pub reserve: u64,
+    pub sweep: u64,
+    pub victims: u64,
+    pub retarget: u64,
 }
 
 #[cfg(test)]

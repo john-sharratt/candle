@@ -14,7 +14,7 @@
 use candle_core::cuda_backend::cudarc::driver::{sys, DevicePtr};
 use candle_core::quantized::cuda::{
     grouped_qmatmul_dev_q8a128, moe_bucketize, to_dynamic, BucketizeLive, DynamicActs,
-    MoeBucketizeWorkspace, MoeLive,
+    MoeBucketizeWorkspace, MoeLive, OwnerCheck,
 };
 use candle_core::quantized::decode_rows::DecodeRows;
 use candle_core::quantized::{GgmlDType, Int8Mode, SumScale};
@@ -86,6 +86,7 @@ fn an_aborted_cold_wait_traps_and_the_next_sync_reports_it() -> Result<()> {
         remote_dst: 0,
         started_rows: 0,
         ticket: 0,
+        owner: OwnerCheck::default(),
     };
     drop((_g1, _g2, _g3, _g4, _g5, _g6));
     moe_bucketize(

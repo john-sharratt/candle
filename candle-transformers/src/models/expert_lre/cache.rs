@@ -48,10 +48,14 @@
 //! experts the current decode steps are routing, and a long one that keeps the
 //! experts decode keeps coming back to.
 
+#[cfg(feature = "tensor-assert")]
+use super::slot_owners::SlotOwners;
 use super::types::ExpertSlot;
 use candle_nn::kv_cache::WeightZone;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+#[cfg(feature = "tensor-assert")]
+use std::sync::Arc;
 
 /// Number of early MoE layers whose experts are never evicted.
 ///
@@ -316,6 +320,11 @@ pub struct ExpertCacheInner {
     /// immutable, which is what lets the eviction policy treat this as a
     /// property of the expert rather than something to re-check.
     pub(crate) warm_backed: Vec<bool>,
+    /// The slot-tenancy tags bucketize's owner check reads, once a device
+    /// cache has attached them ([`Self::attach_owners`]); every tenant a slot
+    /// gains after that is written through.
+    #[cfg(feature = "tensor-assert")]
+    owners: Option<Arc<SlotOwners>>,
 }
 
 impl ExpertCacheInner {
@@ -338,6 +347,28 @@ impl ExpertCacheInner {
             experts_per_layer,
             pinned_layers: pinned_layer_count(num_moe_layers),
             warm_backed: vec![false; num_moe_layers * experts_per_layer],
+            #[cfg(feature = "tensor-assert")]
+            owners: None,
+        }
+    }
+
+    /// Tag every slot with its tenant, and write through every tenant a slot
+    /// gains from here on — once the startup fill has installed its experts.
+    #[cfg(feature = "tensor-assert")]
+    pub(crate) fn attach_owners(&mut self, owners: Arc<SlotOwners>) {
+        for (slot, key) in self.slot_to_key.iter().enumerate() {
+            if let Some((row, expert)) = *key {
+                owners.set(slot, row, expert);
+            }
+        }
+        self.owners = Some(owners);
+    }
+
+    /// Slot `slot` gained the tenant `slot_to_key` names: write its tag.
+    #[cfg(feature = "tensor-assert")]
+    pub(crate) fn mirror_tenant(&self, slot: usize) {
+        if let (Some(owners), Some((row, expert))) = (&self.owners, self.slot_to_key[slot]) {
+            owners.set(slot, row, expert);
         }
     }
 
@@ -758,6 +789,8 @@ impl ExpertCacheInner {
         self.slots[slot_idx] = Some(slot);
         self.key_to_slot.insert((moe_idx, expert_idx), slot_idx);
         self.slot_to_key[slot_idx] = Some((moe_idx, expert_idx));
+        #[cfg(feature = "tensor-assert")]
+        self.mirror_tenant(slot_idx);
         self.promote(slot_idx);
     }
 }

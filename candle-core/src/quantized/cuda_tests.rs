@@ -10,6 +10,7 @@
 )]
 
 use super::*;
+use candle_kernels::simple::moe_bucketize::{PROMO_EMPTY, PROMO_SKIP};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 use half::bf16;
 use rand::Rng;
@@ -10238,28 +10239,34 @@ fn mapped_host(bytes: usize) -> (*mut c_void, u64) {
 }
 
 /// A promotion ring in mapped memory: `u64 slots[cap] | u64 log[cap] | u32 head
-/// | u32 tail | u32 marks[rows × n_experts] | u32 reserve`. The reserve starts
-/// at `u32::MAX` — no prompt-only expert takes a slot. Freed on drop.
+/// | u32 tail | u32 marks[rows × n_experts] | u32 reserve | u32 sweep | u64
+/// victims[cap] | u64 retarget[cap][3]` (the victims 8-aligned). The reserve
+/// starts at `u32::MAX` — no prompt-only expert takes a slot — and so does the
+/// sweep word — no launch is a sweep. Freed on drop.
 struct TestRing {
     host: *mut c_void,
     dev: u64,
     cap: usize,
     n_experts: usize,
     reserve_at: usize,
+    victims_at: usize,
 }
 
 impl TestRing {
     fn new(cap: usize, rows: usize, n_experts: usize) -> Self {
         let reserve_at = cap * 16 + 8 + rows * n_experts * 4;
-        let (host, dev) = mapped_host(reserve_at + 4);
+        let victims_at = (reserve_at + 8).next_multiple_of(8);
+        let (host, dev) = mapped_host(victims_at + cap * 32);
         let ring = Self {
             host,
             dev,
             cap,
             n_experts,
             reserve_at,
+            victims_at,
         };
         ring.set_reserve(u32::MAX);
+        ring.set_sweep(u32::MAX);
         ring
     }
 
@@ -10272,6 +10279,9 @@ impl TestRing {
             cap: self.cap as u32,
             marks: self.dev + (self.cap * 16 + 8) as u64,
             reserve: self.dev + self.reserve_at as u64,
+            sweep: self.dev + (self.reserve_at + 4) as u64,
+            victims: self.dev + self.victims_at as u64,
+            retarget: self.dev + (self.victims_at + self.cap * 8) as u64,
         }
     }
 
@@ -10279,6 +10289,20 @@ impl TestRing {
         unsafe {
             std::ptr::write_volatile((self.host as *mut u8).add(self.reserve_at) as *mut u32, n)
         }
+    }
+
+    fn set_sweep(&self, n: u32) {
+        unsafe {
+            std::ptr::write_volatile((self.host as *mut u8).add(self.reserve_at + 4) as *mut u32, n)
+        }
+    }
+
+    fn victims(&self) -> *mut u64 {
+        unsafe { (self.host as *mut u8).add(self.victims_at) as *mut u64 }
+    }
+
+    fn retarget(&self) -> *mut u64 {
+        unsafe { (self.host as *mut u8).add(self.victims_at + self.cap * 8) as *mut u64 }
     }
 
     fn mark_ptr(&self, row: usize, e: usize) -> *mut u32 {
@@ -10315,16 +10339,30 @@ impl TestRing {
         }
     }
 
-    /// Publish `slots` at `tail`, then advance `tail` past them.
+    /// Publish empty `slots` at `tail`, then advance `tail` past them.
     fn push(&self, slots: &[u64]) {
+        let offers: Vec<(u64, Option<(u64, [u64; 3])>)> = slots.iter().map(|&s| (s, None)).collect();
+        self.offer(&offers);
+    }
+
+    /// Publish `offers` at `tail` — each a slot image and, for a slot still
+    /// holding an expert, its gate-plane index and the three entries it is
+    /// retargeted to — then advance `tail` past them.
+    fn offer(&self, offers: &[(u64, Option<(u64, [u64; 3])>)]) {
         unsafe {
             let tail_p = (self.host as *mut u8).add(self.cap * 16 + 4) as *mut u32;
             let tail = std::ptr::read_volatile(tail_p);
-            for (i, &s) in slots.iter().enumerate() {
-                std::ptr::write_volatile(self.slots().add((tail as usize + i) % self.cap), s);
+            for (i, &(s, victim)) in offers.iter().enumerate() {
+                let at = (tail as usize + i) % self.cap;
+                std::ptr::write_volatile(self.slots().add(at), s);
+                let (index, entries) = victim.unwrap_or((PROMO_EMPTY, [0; 3]));
+                std::ptr::write_volatile(self.victims().add(at), index);
+                for (p, &v) in entries.iter().enumerate() {
+                    std::ptr::write_volatile(self.retarget().add(3 * at + p), v);
+                }
             }
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            std::ptr::write_volatile(tail_p, tail + slots.len() as u32);
+            std::ptr::write_volatile(tail_p, tail + offers.len() as u32);
         }
     }
 }
@@ -10382,6 +10420,7 @@ fn cuda_moe_bucketize_promotes_remote_experts_from_the_ring() -> Result<()> {
             remote_dst: remote_dst.device_ptr(&stream).0,
             started_rows: 0,
             ticket: 0,
+            owner: OwnerCheck::default(),
         };
         moe_bucketize(&t, 8, 2, ws, Some(&live), decode)?;
         Ok(dev.memcpy_dtov(&remote_dst.slice(..2))?)
@@ -10487,6 +10526,250 @@ fn cuda_moe_bucketize_promotes_remote_experts_from_the_ring() -> Result<()> {
     Ok(())
 }
 
+/// A `[3][rows][n_experts]` live table with every gate entry in VRAM at
+/// `0x10_0000 + (row · n_experts + e) · 0x100` — slot `rows · n_experts - 1 -
+/// (row · n_experts + e)` of a zone of `0x100`-byte slots ending at
+/// `0x10_0000 + rows · n_experts · 0x100` — except the `(row, e, gate)` in
+/// `pinned`; up and down at `+0x10` and `+0x20` of the gate entry.
+fn rows_live_table(rows: usize, n_experts: usize, pinned: &[(usize, usize, u64)]) -> Vec<u64> {
+    let mut gate: Vec<u64> = (0..rows * n_experts)
+        .map(|i| 0x10_0000 + i as u64 * 0x100)
+        .collect();
+    for &(r, e, g) in pinned {
+        gate[r * n_experts + e] = g;
+    }
+    let mut table = gate.clone();
+    table.extend(gate.iter().map(|&g| g + 0x10));
+    table.extend(gate.iter().map(|&g| g + 0x20));
+    table
+}
+
+/// **A miss claims the victim behind an offer, retargeting its entries before
+/// the slot is written, and skips a victim its own launch routes.** Row 1 of
+/// three, 8 experts; e1 and e5 pinned, e6 in VRAM. Three offers: `0xd000`
+/// holding (2, 3) — another row, claimable — `0xe000` holding (1, 6) — this
+/// launch routes e6, so skipped — and `0xf000` holding (1, 7), claimable. e1
+/// takes `0xd000`, e5 skips `0xe000` and takes `0xf000`; (2, 3) and (1, 7) read
+/// their retarget values in all three planes and (1, 6) is untouched. A later
+/// launch of row 2 then finds (2, 3) pinned. The owner check runs throughout,
+/// over tags matching the table, and passes.
+#[test]
+fn cuda_moe_bucketize_claims_victims_and_skips_its_own_routed_ones() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let (rows, n) = (3usize, 8usize);
+    let (e1_gate, e5_gate) = (TEST_PINNED[1].0 + 0x100, TEST_PINNED[1].0 + 0x500);
+    let table = rows_live_table(rows, n, &[(1, 1, e1_gate), (1, 5, e5_gate)]);
+    let table_dev = dev.memcpy_stod(&table)?;
+    let plane = (rows * n) as i64;
+    let snap = dev.memcpy_stod(&[0u64; 24])?;
+    let summary = dev.memcpy_stod(&[0u32; 9])?;
+    let remote = dev.memcpy_stod(&[0i32; 32])?;
+    let counters = dev.memcpy_stod(&[0i32; 3])?;
+    let remote_dst = dev.memcpy_stod(&[7u64; 8])?;
+    // Every VRAM slot tagged with the expert the table says is there.
+    let (owners_h, owners_d) = mapped_host(rows * n * 4);
+    for i in 0..rows * n {
+        let (r, e) = (i / n, i % n);
+        unsafe {
+            std::ptr::write_volatile(
+                (owners_h as *mut u32).add(rows * n - 1 - i),
+                ((r as u32 + 1) << 16) | e as u32,
+            );
+        }
+    }
+    let owner = OwnerCheck {
+        owners: owners_d,
+        zone_end: 0x10_0000 + (rows * n) as u64 * 0x100,
+        slot_bytes: 0x100,
+        slots: (rows * n) as u32,
+    };
+    let ring = TestRing::new(4, rows, n);
+    let retarget = |base: u64| [base, base + 0x10, base + 0x20];
+    let (r23, r17) = (retarget(0x9000_0300), retarget(0x9000_0700));
+    ring.offer(&[
+        (0xd000, Some(((2 * n + 3) as u64, r23))),
+        (0xe000, Some(((n + 6) as u64, retarget(0x9000_0600)))),
+        (0xf000, Some(((n + 7) as u64, r17))),
+    ]);
+    let stream = dev.cuda_stream();
+    let launch = |row: usize, ids: &[u32], seq: u32| -> Result<()> {
+        let t = crate::Tensor::from_vec(ids.to_vec(), (ids.len() / 2, 2), &device)?;
+        let mut ws = MoeBucketizeWorkspace::new(&dev, ids.len() / 2, 2)?;
+        let live = BucketizeLive {
+            gate_row: table_dev.device_ptr(&stream).0 + (row * n * 8) as u64,
+            table_plane: plane,
+            snap: snap.device_ptr(&stream).0,
+            pinned: TEST_PINNED,
+            summary: summary.device_ptr(&stream).0,
+            summary_seq: seq,
+            remote: remote.device_ptr(&stream).0,
+            counters: counters.device_ptr(&stream).0,
+            row: row as i32,
+            promo: Some(ring.ring()),
+            remote_dst: remote_dst.device_ptr(&stream).0,
+            started_rows: 0,
+            ticket: 0,
+            owner,
+        };
+        moe_bucketize(&t, n, 2, &mut ws, Some(&live), &DecodeRows::prefix(ids.len() / 2))
+    };
+
+    launch(1, &[5, 1, 1, 6, 5, 6], 7)?;
+    assert_eq!(dev.memcpy_dtov(&remote_dst.slice(..2))?, vec![0xd000, 0xf000]);
+    assert_eq!(ring.head(), 3, "two claims and a skip");
+    let logged = |e: u64| (7u64 << 32) | (1 << 16) | e;
+    assert_eq!(
+        (ring.log(0), ring.log(1), ring.log(2)),
+        (logged(1), logged(PROMO_SKIP as u64), logged(5))
+    );
+    assert_eq!((ring.mark(1, 1), ring.mark(1, 5)), (7, 7));
+    let after = dev.memcpy_dtov(&table_dev)?;
+    let mut want = table.clone();
+    for (p, &v) in r23.iter().enumerate() {
+        want[p * rows * n + 2 * n + 3] = v;
+    }
+    for (p, &v) in r17.iter().enumerate() {
+        want[p * rows * n + n + 7] = v;
+    }
+    assert_eq!(after, want, "only the two claimed victims retargeted, in all three planes");
+
+    // Row 2 now routes its displaced expert: pinned, from the entry it reads.
+    ring.clear_mark(1, 1);
+    ring.clear_mark(1, 5);
+    launch(2, &[3, 0], 8)?;
+    let s = dev.memcpy_dtov(&summary)?;
+    assert_eq!(s[3] & (1 << 29), 1 << 29, "(2, 3) is pinned");
+    assert_eq!(s[0] & (3 << 29), 0, "(2, 0) is still in VRAM");
+    assert_eq!(dev.memcpy_dtov(&remote_dst.slice(..1))?, vec![0], "nothing left to claim");
+    unsafe {
+        cudarc::driver::sys::cuMemFreeHost(owners_h);
+    }
+    Ok(())
+}
+
+/// **A prompt-only expert takes only an empty offer.** One prompt-only remote
+/// expert (e1, no decode row) with the reserve at 0: in front of it a victim
+/// offer, so it takes nothing and `head` stays; once an empty offer stands in
+/// front, it takes that. A prompt never evicts.
+#[test]
+fn cuda_moe_bucketize_a_prompt_only_expert_takes_only_an_empty_offer() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let mut class = vec![CLS_VRAM; 8];
+    class[1] = CLS_PINNED;
+    let t = crate::Tensor::from_vec(vec![1u32, 3], (1, 2), &device)?;
+    let table_dev = dev.memcpy_stod(&test_live_table(&class, &[]))?;
+    let snap = dev.memcpy_stod(&[0u64; 24])?;
+    let remote = dev.memcpy_stod(&[0i32; 32])?;
+    let remote_dst = dev.memcpy_stod(&[7u64; 8])?;
+    let ring = TestRing::new(4, 1, 8);
+    ring.set_reserve(0);
+    ring.offer(&[(0xa000, Some((6, [0x9000_0600, 0x9000_0610, 0x9000_0620])))]);
+    let mut ws = MoeBucketizeWorkspace::new(&dev, 1, 2)?;
+    let stream = dev.cuda_stream();
+    let mut run = |seq: u32| -> Result<u64> {
+        let live = BucketizeLive {
+            gate_row: table_dev.device_ptr(&stream).0,
+            table_plane: 8,
+            snap: snap.device_ptr(&stream).0,
+            pinned: TEST_PINNED,
+            summary: 0,
+            summary_seq: seq,
+            remote: remote.device_ptr(&stream).0,
+            counters: 0,
+            row: 0,
+            promo: Some(ring.ring()),
+            remote_dst: remote_dst.device_ptr(&stream).0,
+            started_rows: 0,
+            ticket: 0,
+            owner: OwnerCheck::default(),
+        };
+        moe_bucketize(&t, 8, 2, &mut ws, Some(&live), &DecodeRows::none())?;
+        Ok(dev.memcpy_dtov(&remote_dst.slice(..1))?[0])
+    };
+    assert_eq!(run(1)?, 0, "a victim in front: the prompt evicts nothing");
+    assert_eq!(ring.head(), 0);
+    assert_eq!(
+        dev.memcpy_dtov(&table_dev)?[6],
+        0x10_0000 + 6 * 0x100,
+        "the victim's entry is untouched"
+    );
+
+    // A fresh ring with an empty offer in front.
+    let ring2 = TestRing::new(4, 1, 8);
+    ring2.set_reserve(0);
+    ring2.offer(&[(0xb000, None), (0xa000, Some((6, [0; 3])))]);
+    let live = BucketizeLive {
+        gate_row: table_dev.device_ptr(&stream).0,
+        table_plane: 8,
+        snap: snap.device_ptr(&stream).0,
+        pinned: TEST_PINNED,
+        summary: 0,
+        summary_seq: 2,
+        remote: remote.device_ptr(&stream).0,
+        counters: 0,
+        row: 0,
+        promo: Some(ring2.ring()),
+        remote_dst: remote_dst.device_ptr(&stream).0,
+        started_rows: 0,
+        ticket: 0,
+        owner: OwnerCheck::default(),
+    };
+    moe_bucketize(&t, 8, 2, &mut ws, Some(&live), &DecodeRows::none())?;
+    assert_eq!(dev.memcpy_dtov(&remote_dst.slice(..1))?[0], 0xb000, "an empty offer it takes");
+    assert_eq!(ring2.head(), 1, "and only that one");
+    Ok(())
+}
+
+/// **A sweep claims nothing.** Two decode-scored remote experts against four
+/// empty offers: with the sweep word at 1 the launch has more claiming experts
+/// than it allows, so neither takes a slot and `head` stays; at 2 both do.
+#[test]
+fn cuda_moe_bucketize_claims_nothing_on_a_sweep() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let mut class = vec![CLS_VRAM; 8];
+    class[1] = CLS_PINNED;
+    class[5] = CLS_COLD;
+    let t = crate::Tensor::from_vec(vec![5u32, 1, 1, 3, 5, 6], (3, 2), &device)?;
+    let table_dev = dev.memcpy_stod(&test_live_table(&class, &[]))?;
+    let snap = dev.memcpy_stod(&[0u64; 24])?;
+    let remote = dev.memcpy_stod(&[0i32; 32])?;
+    let remote_dst = dev.memcpy_stod(&[7u64; 8])?;
+    let ring = TestRing::new(4, 1, 8);
+    ring.push(&[0xa000, 0xb000, 0xc000, 0xd000]);
+    let mut ws = MoeBucketizeWorkspace::new(&dev, 3, 2)?;
+    let stream = dev.cuda_stream();
+    let mut run = |seq: u32| -> Result<Vec<u64>> {
+        let live = BucketizeLive {
+            gate_row: table_dev.device_ptr(&stream).0,
+            table_plane: 8,
+            snap: snap.device_ptr(&stream).0,
+            pinned: TEST_PINNED,
+            summary: 0,
+            summary_seq: seq,
+            remote: remote.device_ptr(&stream).0,
+            counters: 0,
+            row: 0,
+            promo: Some(ring.ring()),
+            remote_dst: remote_dst.device_ptr(&stream).0,
+            started_rows: 0,
+            ticket: 0,
+            owner: OwnerCheck::default(),
+        };
+        moe_bucketize(&t, 8, 2, &mut ws, Some(&live), &DecodeRows::prefix(3))?;
+        Ok(dev.memcpy_dtov(&remote_dst.slice(..2))?)
+    };
+    ring.set_sweep(1);
+    assert_eq!(run(1)?, vec![0, 0], "two claiming experts over a sweep word of 1");
+    assert_eq!(ring.head(), 0, "a sweep takes nothing");
+    ring.set_sweep(2);
+    assert_eq!(run(2)?, vec![0xa000, 0xb000], "within it, both claim");
+    assert_eq!(ring.head(), 2);
+    Ok(())
+}
+
 /// **Bucketize marks its row begun with its ticket**, in the row's word and no
 /// other, so the host's reclaim rule can key on the invocation the device is
 /// inside. Raw expected words after two invocations of row 2 and one of row 0.
@@ -10515,6 +10798,7 @@ fn cuda_moe_bucketize_stores_its_ticket_in_its_rows_started_word() -> Result<()>
             remote_dst: 0,
             started_rows: started.device_ptr(&stream).0,
             ticket,
+            owner: OwnerCheck::default(),
         };
         moe_bucketize(&t, 8, 2, &mut ws, Some(&live), &DecodeRows::prefix(2))
     };
@@ -10539,6 +10823,7 @@ fn cuda_moe_bucketize_stores_its_ticket_in_its_rows_started_word() -> Result<()>
         remote_dst: 0,
         started_rows: started.device_ptr(&stream).0,
         ticket: 13,
+        owner: OwnerCheck::default(),
     };
     moe_bucketize(&t, 8, 2, &mut ws, Some(&live), &DecodeRows::prefix(2))?;
     assert_eq!(dev.memcpy_dtov(&started)?, vec![8, 0, 11, 0]);
@@ -10594,6 +10879,7 @@ fn run_bucketize_live(
             remote_dst: 0,
             started_rows: 0,
             ticket: 0,
+            owner: OwnerCheck::default(),
         };
         moe_bucketize(&t, n_experts, tile_w, &mut ws, Some(&live), decode)?;
     }
@@ -10897,27 +11183,49 @@ impl Drop for LiveFixture {
 ///
 /// A third of the experts are in VRAM, a third pinned, a third cold. The
 /// pinned and cold ones are computed by the launch's worker blocks — each copies
-/// a row tile's slice into its VRAM scratch slot and runs the unmodified impl
-/// over it as a 32-row matrix — and the cold ones are released only by host
+/// a row tile's slice into the expert's promotion slot and runs the unmodified
+/// impl over that row tile there (or, without a slot, into its VRAM scratch as
+/// a 32-row matrix) — and the cold ones are released only by host
 /// stores made 50 ms after the launch, with work already queued behind it. The
 /// output must equal the all-VRAM launch's bit for bit, and the worker counters
 /// must count every remote item once.
 #[test]
 fn cuda_live_launch_workers_compute_remote_experts_bit_identically() -> Result<()> {
-    live_launch_bit_identical(2)
+    live_launch_bit_identical(2, Slotted::All)
 }
 
 /// The same at the prefill tile modes: 64-wide tiles (`n_sub` 4)…
 #[test]
 fn cuda_live_launch_at_bm64_computes_remote_experts_bit_identically() -> Result<()> {
-    live_launch_bit_identical(4)
+    live_launch_bit_identical(4, Slotted::All)
 }
 
 /// …and 128-wide (`n_sub` 8), where a remote expert's workers run the wide kernel's
-/// sub-tile sweep over their scratch copy.
+/// sub-tile sweep over the projection they copied.
 #[test]
 fn cuda_live_launch_at_bm128_computes_remote_experts_bit_identically() -> Result<()> {
-    live_launch_bit_identical(8)
+    live_launch_bit_identical(8, Slotted::All)
+}
+
+/// **A ring that runs short mid-list**: the first half of the remote experts
+/// get a promotion slot and are computed from it, the rest from the workers'
+/// scratch — both paths in one launch, still bit for bit.
+#[test]
+fn cuda_live_launch_with_a_short_ring_computes_both_paths_bit_identically() -> Result<()> {
+    live_launch_bit_identical(2, Slotted::Half)
+}
+
+/// The same at the 128-wide tile mode.
+#[test]
+fn cuda_live_launch_at_bm128_with_a_short_ring_is_bit_identical() -> Result<()> {
+    live_launch_bit_identical(8, Slotted::Half)
+}
+
+/// How many of a live launch's remote experts the test ring holds a slot for.
+#[derive(Clone, Copy)]
+enum Slotted {
+    All,
+    Half,
 }
 
 /// The token-tile modes the host tile builder and every device-table launch share,
@@ -10933,7 +11241,7 @@ fn grouped_int8_tile_mode_bands() {
 
 /// One live launch at token-tile mode `n_sub` (tiles `16·n_sub` wide) against the
 /// all-VRAM launch at the same mode.
-fn live_launch_bit_identical(n_sub: usize) -> Result<()> {
+fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
     use cudarc::driver::sys;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
@@ -11010,15 +11318,21 @@ fn live_launch_bit_identical(n_sub: usize) -> Result<()> {
     let (scp, _g5) = scratch.device_ptr(&stream);
     let (hp, _g6) = ws.header.device_ptr(&stream);
     let (np, _g7) = snap.device_ptr(&stream);
-    // A promotion slot for every remote expert: the workers store each slice
-    // they copy there too, so each must end up holding its expert whole.
+    // Promotion slots for the first `n_slotted` remote experts: the workers copy
+    // each slice there and compute from it, so each must end up holding its
+    // expert whole. The rest are copied into scratch.
+    let n_slotted = match slotted {
+        Slotted::All => n_remote,
+        Slotted::Half => n_remote / 2,
+    };
+    assert!(n_slotted > 0, "the fixture must slot at least one remote expert");
     let promo_slots = dev.memcpy_stod(&vec![0u8; n_remote as usize * fx.expert_bytes])?;
     let remote_dst = dev.memcpy_stod(&vec![0u64; n_experts])?;
     let (pp, _g8) = promo_slots.device_ptr(&stream);
     let (dp, _g9) = remote_dst.device_ptr(&stream);
     let ring = TestRing::new(n_experts, 4, n_experts);
     ring.push(
-        &(0..n_remote)
+        &(0..n_slotted)
             .map(|i| pp + i * fx.expert_bytes as u64)
             .collect::<Vec<u64>>(),
     );
@@ -11037,6 +11351,7 @@ fn live_launch_bit_identical(n_sub: usize) -> Result<()> {
         remote_dst: dp,
         started_rows: 0,
         ticket: 0,
+        owner: OwnerCheck::default(),
     };
     drop((_g1, _g2, _g3, _g4, _g5, _g6, _g7, _g8, _g9));
     moe_bucketize(
@@ -11100,11 +11415,11 @@ fn live_launch_bit_identical(n_sub: usize) -> Result<()> {
     );
     assert_eq!(dev.memcpy_dtov(&counters)?[0] as u64, items + W as u64, "counter: every item, then one past per worker");
 
-    // Every remote expert took a promotion slot, in list order, and the
-    // workers left its projection there byte for byte.
-    assert_eq!(ring.head() as u64, n_remote, "one slot per remote expert");
+    // The first `n_slotted` remote experts took a promotion slot, in list
+    // order, and the workers left each projection there byte for byte.
+    assert_eq!(ring.head() as u64, n_slotted, "one slot per slotted remote expert");
     let promoted = dev.memcpy_dtov(&promo_slots)?;
-    for (i, r) in reference.remote.iter().enumerate() {
+    for (i, r) in reference.remote.iter().enumerate().take(n_slotted as usize) {
         let e = r[0] as usize;
         assert_eq!(ring.log(i), (1 << 32) | (3 << 16) | e as u64, "log entry {i}");
         let mut want = vec![0u8; fx.expert_bytes];

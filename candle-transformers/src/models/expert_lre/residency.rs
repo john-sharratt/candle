@@ -16,7 +16,7 @@
 //! slot that lost its tenant waits on a retire key — is the caller's to decide
 //! before it asks (`reclaim`); this type answers what the entry would become.
 
-use super::live_table::LiveTable;
+use super::live_table::{LiveTable, Proj};
 use std::sync::Arc;
 
 /// One expert's copies.
@@ -31,6 +31,24 @@ pub(crate) struct Place {
     /// Promotion copies reading the pad slot right now. A pinned pad slot is
     /// never evicted.
     pub(crate) pins: u32,
+    /// Standing in the promotion ring as a lazy victim whose fallback is cold:
+    /// a claim zeroes its entries on the device, so a routing summary that
+    /// finds it cold is the eviction, and the stager books it
+    /// ([`Residency::device_evicted`]) before staging it.
+    pub(crate) offered_cold: bool,
+}
+
+/// Where a lazy victim's entries go when a miss claims its slot — what an
+/// eviction here would publish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fallback {
+    /// Its pinned warm slot.
+    Warm,
+    /// Its pad slot, pinned against the stager for the life of the offer.
+    Pad,
+    /// Nowhere device-readable: entries 0, and the next launch that routes it
+    /// waits on the stager.
+    Cold,
 }
 
 impl Place {
@@ -131,11 +149,51 @@ impl Residency {
         self.places[i].warm = warm;
     }
 
-    /// Whether the expert keeps a device-readable host copy (a pad slot or a
-    /// pinned warm slot) — so leaving VRAM retargets its entry to an address,
-    /// never to 0.
-    pub(crate) fn has_pinned_copy(&self, row: usize, expert: usize) -> bool {
-        self.place(row, expert).pinned_source().is_some()
+    /// The entries (gate, up, down) a VRAM-resident expert falls back to when
+    /// the device evicts it — exactly what an eviction here would publish: its
+    /// pad slot's, else its pinned warm slot's, else 0 — and which that is, or
+    /// `None` when it is not in VRAM.
+    ///
+    /// The caller holds the fallback for as long as the offer stands: a pad
+    /// slot pinned (`pin_pad`), since the stager owns pad eviction and must not
+    /// reuse the slot the device may retarget to; a cold one marked
+    /// (`set_offered_cold`), so the stager reads a cold summary of it as the
+    /// device's eviction.
+    pub(crate) fn displaced_entries(
+        &self,
+        row: usize,
+        expert: usize,
+    ) -> Option<([u64; 3], Fallback)> {
+        let p = self.place(row, expert);
+        p.vram?;
+        Some(match p.pinned_source() {
+            Some((base, from_pad)) => (
+                [
+                    base + self.table.offset(Proj::Gate, row),
+                    base + self.table.offset(Proj::Up, row),
+                    base + self.table.offset(Proj::Down, row),
+                ],
+                if from_pad { Fallback::Pad } else { Fallback::Warm },
+            ),
+            None => ([0; 3], Fallback::Cold),
+        })
+    }
+
+    /// Mark (or clear) the expert as a lazy victim whose fallback is cold.
+    pub(crate) fn set_offered_cold(&mut self, row: usize, expert: usize, offered: bool) {
+        let i = self.at(row, expert);
+        self.places[i].offered_cold = offered;
+    }
+
+    /// The device evicted the expert from VRAM by claiming its slot: its
+    /// entries already name its fallback. Book it here, publishing the same
+    /// value. Idempotent — the stager calls it on the first cold summary, the
+    /// pipeline thread when it collects the claim, whichever comes first.
+    pub(crate) fn device_evicted(&mut self, row: usize, expert: usize) -> (u64, u64) {
+        self.change(row, expert, |p| {
+            p.vram = None;
+            p.offered_cold = false;
+        })
     }
 
     /// A promotion copy starts (`+1`) or ends (`-1`) reading the pad slot.
@@ -164,8 +222,53 @@ impl Residency {
 
 #[cfg(test)]
 mod tests {
-    use super::super::live_table::Proj;
     use super::*;
+
+    /// A lazy victim's fallback is exactly the entry eviction would publish —
+    /// its pad slot over its pinned warm slot, plus the row's projection
+    /// offsets, else 0 — and only an expert in VRAM is one.
+    #[test]
+    fn a_lazy_victim_falls_back_to_what_eviction_publishes() {
+        let (mut r, t) = residency();
+        let (warm, pad) = (0x7100_0000u64, 0x9000_0000u64);
+        r.set_warm(1, 2, Some((9, Some(warm))));
+        assert_eq!(r.displaced_entries(1, 2), None, "not in VRAM");
+        r.set_vram(1, 2, Some((40, 0xa000_0000)));
+        assert_eq!(
+            r.displaced_entries(1, 2),
+            Some(([warm, warm + 0x100, warm + 0x300], Fallback::Warm))
+        );
+        r.set_pad(1, 2, Some((3, pad)));
+        assert_eq!(
+            r.displaced_entries(1, 2),
+            Some(([pad, pad + 0x100, pad + 0x300], Fallback::Pad)),
+            "the pad copy is nearer"
+        );
+        r.set_vram(1, 2, None);
+        assert_eq!(t.entry(Proj::Gate, 1, 2), pad, "what the device writes, eviction publishes");
+
+        r.set_warm(0, 1, Some((4, None)));
+        r.set_vram(0, 1, Some((41, 0xa100_0000)));
+        assert_eq!(
+            r.displaced_entries(0, 1),
+            Some(([0; 3], Fallback::Cold)),
+            "a pageable warm copy is not device-readable"
+        );
+    }
+
+    /// A device eviction books the fallback the device wrote, clears the
+    /// offered-cold mark, and is idempotent.
+    #[test]
+    fn a_device_eviction_is_booked_once_whoever_sees_it_first() {
+        let (mut r, t) = residency();
+        r.set_vram(0, 1, Some((41, 0xa100_0000)));
+        r.set_offered_cold(0, 1, true);
+        assert!(r.place(0, 1).offered_cold);
+        assert_eq!(r.device_evicted(0, 1), (0xa100_0000, 0));
+        assert_eq!(t.entry(Proj::Gate, 0, 1), 0);
+        assert!(!r.place(0, 1).offered_cold);
+        assert_eq!(r.device_evicted(0, 1), (0, 0), "a second booking changes nothing");
+    }
 
     fn residency() -> (Residency, Arc<LiveTable>) {
         let t = Arc::new(LiveTable::host_only(2, 4, [0, 0x100, 0x300]));
