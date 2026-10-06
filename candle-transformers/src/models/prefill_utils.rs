@@ -830,7 +830,11 @@ fn paged_prefill_batched_impl<'w>(
         }
     };
 
-    let header_upload = build_slot_headers(caches, q_lens, generation, shared_pm, offsets, rope)?;
+    // Built on the host and uploaded: eager, behind everything recorded so far.
+    let header_upload = {
+        let _eager = q.device().eager()?;
+        build_slot_headers(caches, q_lens, generation, shared_pm, offsets, rope)?
+    };
     let headers_ptr = header_upload.headers_ptr;
 
     g_pack.end();
@@ -887,6 +891,9 @@ fn paged_prefill_batched_impl<'w>(
     // sync so they always see the final post-reconcile chunk routing.
     if !needs_reconcile {
         let t_prime = profile_now();
+        // Builds the slot buffers on the host and may claim slabs for them:
+        // eager, behind the recorded launches.
+        let _eager = q.device().eager()?;
         KvCache::prime_chunked_decode_slots_batch(caches)?;
         pipeline_record("prefill:prime", t_prime);
     }
@@ -1777,8 +1784,10 @@ pub fn paged_glue_attn<'w>(
     // other 47 reuse the device buffer, skipping the host build and the PCIe
     // copy that otherwise dominate this span.
     let zero_q = vec![0usize; b_sz];
-    let header_upload =
-        build_slot_headers(caches, &zero_q, generation, shared_pm, &kv_lens_host, rope)?;
+    let header_upload = {
+        let _eager = device.eager()?;
+        build_slot_headers(caches, &zero_q, generation, shared_pm, &kv_lens_host, rope)?
+    };
     g_hdr.end();
 
     let g_kernel = gpu_span("glue:kernel", device);
@@ -1819,6 +1828,9 @@ pub fn paged_glue_attn<'w>(
     // prefill's write region. `header_upload` stays alive until return.
     if !needs_reconcile {
         let t_prime = profile_now();
+        // Builds the slot buffers on the host and may claim slabs for them:
+        // eager, behind the recorded launches.
+        let _eager = device.eager()?;
         KvCache::prime_chunked_decode_slots_batch(caches)?;
         pipeline_record("prefill:prime", t_prime);
     }

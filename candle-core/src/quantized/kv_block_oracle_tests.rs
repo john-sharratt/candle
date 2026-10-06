@@ -131,6 +131,7 @@ fn encode_on_device(dtype: GgmlDType, src: &[f32], is_k: bool) -> Result<Vec<u8>
                 bb as i32,
                 arena_code(dtype),
                 is_k as i32,
+                std::ptr::null_mut(),
             )
         };
         dev.synchronize()?;
@@ -158,6 +159,7 @@ fn decode_on_device(dtype: GgmlDType, bytes: &[u8], is_k: bool) -> Result<Vec<f3
                 bb as i32,
                 arena_code(dtype),
                 is_k as i32,
+                std::ptr::null_mut(),
             )
         };
         dev.synchronize()?;

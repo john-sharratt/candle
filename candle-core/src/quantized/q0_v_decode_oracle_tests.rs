@@ -74,6 +74,7 @@ fn decode_on_device(is_k: bool, scale: f32) -> Result<[Vec<f32>; 4]> {
                 CODES as i32,
                 is_k as i32,
                 scale,
+                std::ptr::null_mut(),
             );
         }
         dev.synchronize()?;

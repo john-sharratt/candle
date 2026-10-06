@@ -96,7 +96,8 @@ extern "C" void run_fill_op(
     int32_t dtype,
     void* buf,
     uint64_t value_bits,
-    size_t numel
+    size_t numel,
+    void* stream
 ) {
     unsigned int grid = grid_size(numel);
     
@@ -106,14 +107,14 @@ extern "C" void run_fill_op(
                 uint32_t bits = (uint32_t)value_bits;
                 float value;
                 memcpy(&value, &bits, sizeof(float));
-                fill_f32<<<grid, BLOCK_SIZE>>>((float*)buf, value, numel);
+                fill_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((float*)buf, value, numel);
             }
             break;
         case 1: // f64
             {
                 double value;
                 memcpy(&value, &value_bits, sizeof(double));
-                fill_f64<<<grid, BLOCK_SIZE>>>((double*)buf, value, numel);
+                fill_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((double*)buf, value, numel);
             }
             break;
         case 2: // f16
@@ -121,7 +122,7 @@ extern "C" void run_fill_op(
                 uint16_t bits = (uint16_t)value_bits;
                 __half value;
                 memcpy(&value, &bits, sizeof(__half));
-                fill_f16<<<grid, BLOCK_SIZE>>>((__half*)buf, value, numel);
+                fill_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((__half*)buf, value, numel);
             }
             break;
         case 3: // bf16
@@ -129,7 +130,7 @@ extern "C" void run_fill_op(
                 uint16_t bits = (uint16_t)value_bits;
                 __nv_bfloat16 value;
                 memcpy(&value, &bits, sizeof(__nv_bfloat16));
-                fill_bf16<<<grid, BLOCK_SIZE>>>((__nv_bfloat16*)buf, value, numel);
+                fill_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((__nv_bfloat16*)buf, value, numel);
             }
             break;
         case 4: // f8_e4m3
@@ -137,17 +138,17 @@ extern "C" void run_fill_op(
                 uint8_t bits = (uint8_t)value_bits;
                 __nv_fp8_e4m3 value;
                 memcpy(&value, &bits, sizeof(__nv_fp8_e4m3));
-                fill_f8_e4m3<<<grid, BLOCK_SIZE>>>((__nv_fp8_e4m3*)buf, value, numel);
+                fill_f8_e4m3<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((__nv_fp8_e4m3*)buf, value, numel);
             }
             break;
         case 5: // u8
-            fill_u8<<<grid, BLOCK_SIZE>>>((uint8_t*)buf, (uint8_t)value_bits, numel);
+            fill_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((uint8_t*)buf, (uint8_t)value_bits, numel);
             break;
         case 6: // u32
-            fill_u32<<<grid, BLOCK_SIZE>>>((uint32_t*)buf, (uint32_t)value_bits, numel);
+            fill_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((uint32_t*)buf, (uint32_t)value_bits, numel);
             break;
         case 7: // i64
-            fill_i64<<<grid, BLOCK_SIZE>>>((int64_t*)buf, (int64_t)value_bits, numel);
+            fill_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((int64_t*)buf, (int64_t)value_bits, numel);
             break;
     }
 }
@@ -164,20 +165,21 @@ extern "C" void run_arange_op(
     void* buf,
     uint64_t start_bits,
     uint64_t step_bits,
-    size_t numel
+    size_t numel,
+    void* stream
 ) {
     if (numel == 0) return;
     unsigned int grid = grid_size(numel);
 
     switch (dtype) {
         case 5: // u8
-            arange_u8<<<grid, BLOCK_SIZE>>>((uint8_t*)buf, (uint8_t)start_bits, (uint8_t)step_bits, numel);
+            arange_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((uint8_t*)buf, (uint8_t)start_bits, (uint8_t)step_bits, numel);
             break;
         case 6: // u32
-            arange_u32<<<grid, BLOCK_SIZE>>>((uint32_t*)buf, (uint32_t)start_bits, (uint32_t)step_bits, numel);
+            arange_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((uint32_t*)buf, (uint32_t)start_bits, (uint32_t)step_bits, numel);
             break;
         case 7: // i64
-            arange_i64<<<grid, BLOCK_SIZE>>>((int64_t*)buf, (int64_t)start_bits, (int64_t)step_bits, numel);
+            arange_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((int64_t*)buf, (int64_t)start_bits, (int64_t)step_bits, numel);
             break;
         default: return; // float dtypes deliberately unsupported — callers must not reach here
     }
@@ -197,35 +199,36 @@ extern "C" void run_copy2d_op(
     uint32_t d1,
     uint32_t d2,
     uint32_t src_s,
-    uint32_t dst_s
+    uint32_t dst_s,
+    void* stream
 ) {
     size_t numel = (size_t)d1 * (size_t)d2;
     unsigned int grid = grid_size(numel);
     
     switch (dtype) {
         case 0: // f32
-            copy2d_f32<<<grid, BLOCK_SIZE>>>((const float*)src, (float*)dst, d1, d2, src_s, dst_s);
+            copy2d_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const float*)src, (float*)dst, d1, d2, src_s, dst_s);
             break;
         case 1: // f64
-            copy2d_f64<<<grid, BLOCK_SIZE>>>((const double*)src, (double*)dst, d1, d2, src_s, dst_s);
+            copy2d_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const double*)src, (double*)dst, d1, d2, src_s, dst_s);
             break;
         case 2: // f16
-            copy2d_f16<<<grid, BLOCK_SIZE>>>(src, dst, d1, d2, src_s, dst_s);
+            copy2d_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src, dst, d1, d2, src_s, dst_s);
             break;
         case 3: // bf16
-            copy2d_bf16<<<grid, BLOCK_SIZE>>>(src, dst, d1, d2, src_s, dst_s);
+            copy2d_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src, dst, d1, d2, src_s, dst_s);
             break;
         case 4: // f8_e4m3
-            copy2d_f8_e4m3<<<grid, BLOCK_SIZE>>>(src, dst, d1, d2, src_s, dst_s);
+            copy2d_f8_e4m3<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(src, dst, d1, d2, src_s, dst_s);
             break;
         case 5: // u8
-            copy2d_u8<<<grid, BLOCK_SIZE>>>((const uint8_t*)src, (uint8_t*)dst, d1, d2, src_s, dst_s);
+            copy2d_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const uint8_t*)src, (uint8_t*)dst, d1, d2, src_s, dst_s);
             break;
         case 6: // u32
-            copy2d_u32<<<grid, BLOCK_SIZE>>>((const uint32_t*)src, (uint32_t*)dst, d1, d2, src_s, dst_s);
+            copy2d_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const uint32_t*)src, (uint32_t*)dst, d1, d2, src_s, dst_s);
             break;
         case 7: // i64
-            copy2d_i64<<<grid, BLOCK_SIZE>>>((const int64_t*)src, (int64_t*)dst, d1, d2, src_s, dst_s);
+            copy2d_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const int64_t*)src, (int64_t*)dst, d1, d2, src_s, dst_s);
             break;
     }
 }
@@ -244,7 +247,8 @@ extern "C" void run_const_set_op(
     size_t num_dims,
     const size_t* info,
     uint64_t value_bits,
-    void* out
+    void* out,
+    void* stream
 ) {
     unsigned int grid = grid_size(numel);
     
@@ -254,14 +258,14 @@ extern "C" void run_const_set_op(
                 uint32_t bits = (uint32_t)value_bits;
                 float value;
                 memcpy(&value, &bits, sizeof(float));
-                const_set_f32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, value, (float*)out);
+                const_set_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, value, (float*)out);
             }
             break;
         case 1: // f64
             {
                 double value;
                 memcpy(&value, &value_bits, sizeof(double));
-                const_set_f64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, value, (double*)out);
+                const_set_f64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, value, (double*)out);
             }
             break;
         case 2: // f16
@@ -269,7 +273,7 @@ extern "C" void run_const_set_op(
                 uint16_t bits = (uint16_t)value_bits;
                 __half value;
                 memcpy(&value, &bits, sizeof(__half));
-                const_set_f16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, value, out);
+                const_set_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, value, out);
             }
             break;
         case 3: // bf16
@@ -277,7 +281,7 @@ extern "C" void run_const_set_op(
                 uint16_t bits = (uint16_t)value_bits;
                 __nv_bfloat16 value;
                 memcpy(&value, &bits, sizeof(__nv_bfloat16));
-                const_set_bf16<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, value, out);
+                const_set_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, value, out);
             }
             break;
         case 4: // f8_e4m3
@@ -285,17 +289,17 @@ extern "C" void run_const_set_op(
                 uint8_t bits = (uint8_t)value_bits;
                 __nv_fp8_e4m3 value;
                 memcpy(&value, &bits, sizeof(__nv_fp8_e4m3));
-                const_set_f8_e4m3<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, value, out);
+                const_set_f8_e4m3<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, value, out);
             }
             break;
         case 5: // u8
-            const_set_u8<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (uint8_t)value_bits, (uint8_t*)out);
+            const_set_u8<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (uint8_t)value_bits, (uint8_t*)out);
             break;
         case 6: // u32
-            const_set_u32<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (uint32_t)value_bits, (uint32_t*)out);
+            const_set_u32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (uint32_t)value_bits, (uint32_t*)out);
             break;
         case 7: // i64
-            const_set_i64<<<grid, BLOCK_SIZE>>>(numel, num_dims, info, (int64_t)value_bits, (int64_t*)out);
+            const_set_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(numel, num_dims, info, (int64_t)value_bits, (int64_t*)out);
             break;
     }
 }

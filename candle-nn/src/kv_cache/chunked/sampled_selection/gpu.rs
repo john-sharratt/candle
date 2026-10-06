@@ -67,33 +67,21 @@ fn stage_bytes_as_gpu_buf(
         pinned.as_mut_slice().copy_from_slice(bytes);
         return generation.submit(pinned);
     }
-    let stream = dev.cuda_stream();
     let Some(bump) = bump else {
         // No guard to bound a span range, so own the bytes outright rather than
         // bump: an unguarded range is one another thread's last-generation drop
         // can reset and re-hand-out under this kernel. Owned costs an
         // allocation, which these tables can afford — they are small and
         // uploaded once per selector.
-        let slice = stream
-            .memcpy_stod(bytes)
-            .map_err(|e| candle::Error::Msg(format!("selection table upload: {e}")))?;
+        let slice = dev.memcpy_stod(bytes)?;
         return Ok(GpuBuf::from_raw_owned(slice, dev));
     };
     // Allocated *through* the guard, so the range provably belongs to a
-    // generation that is still open — `BumpRange<'_>` borrows `bump`.
+    // generation that is still open — `BumpRange<'_>` borrows `bump`. The
+    // caller keeps `bump` alive for as long as the returned `GpuBuf`, and the
+    // upload is ordered behind everything issued before it.
     let range = bump.alloc(bytes.len(), 256)?;
-    // SAFETY: `range` is `bytes.len()` of the domain's span held by `bump`,
-    // which the caller keeps alive for as long as the returned `GpuBuf`;
-    // `bytes` is a host slice alive for this call; and the copy is enqueued on
-    // the same stream the kernel reads from.
-    unsafe {
-        candle::cuda_backend::cudarc::driver::result::memcpy_htod_async(
-            range.ptr,
-            bytes,
-            stream.cu_stream(),
-        )
-    }
-    .map_err(|e| candle::Error::Msg(format!("selection table upload: {e}")))?;
+    dev.upload_raw(range.ptr, bytes)?;
     Ok(GpuBuf::from_borrowed(range.ptr, range.len))
 }
 

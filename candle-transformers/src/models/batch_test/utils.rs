@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 
+#[cfg(feature = "cuda")]
+use crate::models::batch_test::graph_report::print_graph_line;
 use crate::models::batch_test::greedy::{greedy_token, live_vocab, token_ids};
 use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
 use crate::models::batch_test::side_compression::{print_side_table, SideCompression};
@@ -130,7 +132,20 @@ pub struct TestParams {
     pub stop_on_eos: Vec<u32>,
     pub names: Vec<String>,
     pub generate_token_count: usize, // Number of tokens to generate in generate phase
-    pub tokenizer: Tokenizer,        // Tokenizer for text-to-token conversion
+    /// Tokens the **C9 and C10** rows generate instead of
+    /// [`Self::generate_token_count`].
+    ///
+    /// The top rungs are the calibration probes, tuned just under their edge at
+    /// a fixed reproduction length; a longer reproduction is a stricter test, and
+    /// holding the probes to it would cost compression at every level to buy
+    /// margin at rungs nothing runs. C9 is included because it sits as close to
+    /// the edge: on Qwen3.6-35B-A3B at 256 tokens C9×2 failed 0/2 on the same
+    /// near-tie at character ~1,213 that C10 failed on (2026-10-05, RTX 3090),
+    /// while C0–C8 passed. The other rows decode longer so their rate is
+    /// measured after the expert working set has recovered from the prefill.
+    /// `None` runs every row at [`Self::generate_token_count`].
+    pub top_rung_token_count: Option<usize>,
+    pub tokenizer: Tokenizer, // Tokenizer for text-to-token conversion
     /// The ids [`Self::tokenizer`] can name ([`token_ids`]), read once here: the
     /// decode phase clamps every pick to it inside its timed window, and walking
     /// the vocabulary there was charged to decode.
@@ -200,6 +215,7 @@ impl TestParams {
                 .map(|s| s.to_string())
                 .collect(),
             generate_token_count,
+            top_rung_token_count: None,
             tokenizer,
             token_ids,
             dialect,
@@ -236,6 +252,21 @@ impl TestParams {
     pub fn with_speculative(mut self, max_draft: usize) -> Self {
         self.speculative_max_draft = DraftBudget::Fixed(max_draft);
         self
+    }
+
+    /// Generate `tokens` on the C9 and C10 rows — see
+    /// [`Self::top_rung_token_count`].
+    pub fn with_top_rung_tokens(mut self, tokens: usize) -> Self {
+        self.top_rung_token_count = Some(tokens);
+        self
+    }
+
+    /// Tokens a config of `mode` generates.
+    pub fn tokens_for(&self, mode: InferenceMode) -> usize {
+        match (mode, self.top_rung_token_count) {
+            (InferenceMode::C9 | InferenceMode::C10, Some(n)) => n,
+            _ => self.generate_token_count,
+        }
     }
 
     /// Set the inference [`Int8Mode`] shown in the comparison table's `int8` column.
@@ -495,7 +526,15 @@ pub struct TestResults {
     /// V's side of `compression_ratio`: its ratio and format mix.
     pub v_side: SideCompression,
     pub peak_tokens: usize, // Total tokens across all sessions at peak (after generation)
-    pub expert_stats: Option<PipelineStats>, // Expert cache telemetry (if model has MoE)
+    /// Expert cache telemetry for the decode phase alone (if the model has MoE):
+    /// the counters are reset at the prefill → decode boundary, after
+    /// [`Self::prefill_expert_stats`] is taken.
+    pub expert_stats: Option<PipelineStats>,
+    /// Expert cache telemetry for the prefill phase alone, and the gauges as
+    /// the decode inherits them. Separate because one wide prefill slab misses
+    /// on nearly every expert of every layer, and summed with the decode it
+    /// swamps the figures a decode-side change is judged by.
+    pub prefill_expert_stats: Option<PipelineStats>,
     /// This process's host RAM at the end of the decode. `None` where the
     /// platform has no address-space walk.
     pub host_after_decode: Option<ProcessRam>,
@@ -1724,6 +1763,11 @@ impl TestParams {
         // (quantize + seal follows), so the blocking drain costs nothing extra.
         gpu_drain_blocking();
         let pipeline_bulk_profile = pipeline_snapshot_and_reset();
+        // The expert counters split at the same boundary, for the same reason:
+        // `expert_stats` settles the pipeline thread, so every routed prefill
+        // layer is counted here and none in the decode figures that follow.
+        let prefill_expert_stats = model.expert_stats();
+        model.reset_expert_stats();
 
         // Quantize + seal the prefilled history, mirroring the substrate
         // scheduler's priming-projection boundary. `start_new_chunk = true` so
@@ -1750,6 +1794,14 @@ impl TestParams {
         // Arming is scoped to this block so an early `?` cannot leave the
         // detector on for the sealing and reporting that follow.
         let detector = forbidden_alloc::armed();
+        // What the wave chains did across the decode (`docs/decode_graphs.md`):
+        // how finely the forwards were cut, and how often a segment could be
+        // folded into its executable rather than instantiated afresh.
+        #[cfg(feature = "cuda")]
+        let graphs_before = match &self.device {
+            Device::Cuda(dev) => Some(dev.capture_stats()),
+            _ => None,
+        };
         // ONE generate path for every gate and every model. A model with a
         // drafter speculates; a model without one proposes nothing and the
         // driver degrades to a token-per-step decode, which is what the
@@ -1764,9 +1816,14 @@ impl TestParams {
             model,
             self.speculative_max_draft
                 .resolve(model, sequence_indices.len()),
+            self.tokens_for(config.mode),
         )?;
         self.device.synchronize()?;
         drop(detector);
+        #[cfg(feature = "cuda")]
+        if let (Some(before), Device::Cuda(dev)) = (graphs_before, &self.device) {
+            print_graph_line(&before, &dev.capture_stats());
+        }
         // **The clock stops here, before the reporting below** — the same rule the
         // prefill clock keeps. `ProcessRam::capture` walks every page of the address
         // space (~17M on Flash-Next's 54 GB mapping), and inside the window it was
@@ -1884,7 +1941,9 @@ impl TestParams {
 
         // Calculate peak tokens: sum of all tokens across all sessions
         let peak_tokens: usize = (0..config.num_contexts)
-            .map(|n| self.system_prompt_tokens(n).len() + user_lens[n] + self.generate_token_count)
+            .map(|n| {
+                self.system_prompt_tokens(n).len() + user_lens[n] + self.tokens_for(config.mode)
+            })
             .sum();
 
         // Verbose palette4 diagnostic: print per-chunk arena format distribution for the
@@ -2002,6 +2061,7 @@ impl TestParams {
             v_side,
             peak_tokens,
             expert_stats: None, // Filled by run() after collection
+            prefill_expert_stats,
             host_after_decode,
             row_cache_stats: None, // Likewise
             bulk_profile,
@@ -2066,12 +2126,12 @@ impl TestParams {
         runs: &mut [TestRun],
         model: &M,
         max_draft: usize,
+        max_tokens: usize,
     ) -> Result<usize>
     where
         M: ManagedBatchedModel + ?Sized,
     {
         let nl = model.num_layers();
-        let max_tokens = self.generate_token_count;
         let stop_on = &self.stop_on_eos;
         // First generated token per session = argmax of its prefill logits, held
         // OUT of the KV as the driver's `committed` seed. One fused greedy launch
@@ -2130,12 +2190,18 @@ impl TestParams {
         // across steps rather than made per step.
         let mut chooser = GreedyChooser::new(live);
         let t_spec = std::time::Instant::now();
+        // Wall time of each step. A step returns its emitted tokens to the host,
+        // so it is complete when the call returns, and the first one is the
+        // prefill → decode pivot: whatever the switch costs (the weight zone
+        // growing back, the decode working set re-promoted) lands there.
+        let mut step_ms: Vec<f64> = Vec::new();
         loop {
             let idxs: Vec<usize> = (0..sequence_indices.len()).filter(|&i| active[i]).collect();
             if idxs.is_empty() {
                 break;
             }
             steps += 1;
+            let t_step = std::time::Instant::now();
             let lens: Vec<usize> = idxs.iter().map(|&i| runs[i].output.len()).collect();
             let before: usize = lens.iter().sum();
             let seqs: Vec<usize> = idxs.iter().map(|&i| sequence_indices[i]).collect();
@@ -2182,8 +2248,27 @@ impl TestParams {
                 }
             }
             emitted += idxs.iter().map(|&i| runs[i].output.len()).sum::<usize>() - before;
+            step_ms.push(t_step.elapsed().as_secs_f64() * 1e3);
         }
         let secs = t_spec.elapsed().as_secs_f64();
+        if let Some((&first, rest)) = step_ms.split_first() {
+            let (mut lo, mut hi) = (f64::INFINITY, 0.0f64);
+            for &ms in rest {
+                lo = lo.min(ms);
+                hi = hi.max(ms);
+            }
+            let mean = if rest.is_empty() {
+                0.0
+            } else {
+                rest.iter().sum::<f64>() / rest.len() as f64
+            };
+            println!(
+                "  decode steps: first {first:.1} ms | rest {} × mean {mean:.1} ms \
+                 (min {:.1}, max {hi:.1})",
+                rest.len(),
+                if rest.is_empty() { 0.0 } else { lo },
+            );
+        }
         println!(
             "  speculative: {steps} steps, {emitted} tokens, {:.2} accepted/step \
              ({:.1} tok/s over the cohort, {drafted} drafted at a ceiling of {max_draft})",
@@ -2240,7 +2325,7 @@ impl TestParams {
 
                 // Check token count.  Skipped when EOS early-stop is enabled,
                 // since a short generation is the correct outcome there.
-                let min_expected_tokens = self.generate_token_count.saturating_sub(5);
+                let min_expected_tokens = self.tokens_for(result.config.mode).saturating_sub(5);
                 if self.stop_on_eos.is_empty() && session.output.len() < min_expected_tokens {
                     println!(
                         "\n❌ Session {} FAILED: Generated only {} tokens, expected at least {}",
@@ -2275,7 +2360,7 @@ impl TestParams {
                 //
                 //  2. **Pronoun neutralisation** — gendered pronouns like
                 //     "his"/"her", "he"/"she" are replaced with bracketed
-                //     placeholders ("[his/her]", "[he/she]", etc.), whole
+                //     placeholders ("[his/him/her]", "[he/she]", etc.), whole
                 //     words at any boundary (`story_normalize`).  This
                 //     lets us compare sessions that use female names against
                 //     the original male-protagonist prompt without false
@@ -2787,7 +2872,19 @@ impl TestParams {
         if !results.iter().any(|r| r.expert_stats.is_some()) {
             return;
         }
+        // One table per phase: the counters are reset at the prefill → decode
+        // boundary, and the gauges in the prefill table are what decode inherits.
+        Self::print_expert_phase_table("prefill", results, |r| r.prefill_expert_stats.as_ref());
+        Self::print_expert_phase_table("decode", results, |r| r.expert_stats.as_ref());
+        self.print_row_cache_report(results);
+    }
 
+    /// One phase's expert pipeline table: rows = metrics, columns = configs.
+    fn print_expert_phase_table(
+        phase: &str,
+        results: &[TestResults],
+        pick: impl Fn(&TestResults) -> Option<&PipelineStats>,
+    ) {
         // Build column headers from config descriptions.
         let headers: Vec<String> = results
             .iter()
@@ -2831,6 +2928,29 @@ impl TestParams {
             (
                 "Promotions (H2D)",
                 Box::new(|s: &PipelineStats| format!("{}", s.promotions)),
+            ),
+            // Whether the promotion ring kept up with the GPU: the slots bucketize
+            // took from it, the misses it found it empty for (each a second
+            // crossing of the link by the copy engine), and how many invocations
+            // the device had begun past the one the pipeline thread was serving,
+            // per routed layer.
+            (
+                "Ring slots taken",
+                Box::new(|s: &PipelineStats| format!("{}", s.ring_taken)),
+            ),
+            (
+                "Misses unslotted",
+                Box::new(|s: &PipelineStats| format!("{}", s.ring_unslotted)),
+            ),
+            (
+                "Pipeline lag (inv.)",
+                Box::new(|s: &PipelineStats| {
+                    if s.routed_messages == 0 {
+                        "-".to_string()
+                    } else {
+                        format!("{:.2}", s.pipeline_lag as f64 / s.routed_messages as f64)
+                    }
+                }),
             ),
             // The two gauges that turn the miss counts into a tier decomposition:
             // how much of the model is resident in VRAM, and how much of the KV
@@ -2939,7 +3059,7 @@ impl TestParams {
             .max(16);
 
         // ── Header ──
-        println!("\n=== Expert Pipeline Stats ===");
+        println!("\n=== Expert Pipeline Stats: {phase} ===");
         print!("┌{:─<lw$}", "", lw = label_w + 2);
         for _ in &headers {
             print!("┬{:─<cw$}", "", cw = col_w + 2);
@@ -2963,7 +3083,7 @@ impl TestParams {
         for (label, extractor) in &metrics {
             print!("│ {:label_w$} ", label);
             for r in results {
-                let stats = r.expert_stats.as_ref().unwrap_or(&default_stats);
+                let stats = pick(r).unwrap_or(&default_stats);
                 let val = extractor(stats);
                 print!("│ {:>col_w$} ", val);
             }
@@ -2976,8 +3096,6 @@ impl TestParams {
             print!("┴{:─<cw$}", "", cw = col_w + 2);
         }
         println!("┘");
-
-        self.print_row_cache_report(results);
     }
 
     /// Print the disk-resident embedding tier's row-cache hit rate, if the

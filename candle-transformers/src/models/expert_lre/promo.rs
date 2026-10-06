@@ -16,8 +16,10 @@
 //!   the expert's entry at it.
 //!
 //! In mapped pinned memory: `u64 slots[cap] | u64 log[cap] | u32 head | u32
-//! tail | u32 marks[rows][n_experts]`. `tail` is written only by the host,
-//! `head` only by the device. An expert's mark is set by the device when it
+//! tail | u32 marks[rows][n_experts] | u32 reserve`. `tail` and `reserve` are
+//! written only by the host, `head` only by the device. `reserve` is the stock
+//! kept for decode-scored experts: a prompt-only expert takes a slot only while
+//! more than it is stocked (`moe_bucketize.cu`, PROMOTION). An expert's mark is set by the device when it
 //! gives the expert a slot and cleared by the host when the promotion lands (or
 //! is dropped): until then a later invocation that still finds the expert
 //! remote — a prefill visiting the row again before the host has caught up —
@@ -33,6 +35,8 @@ pub(crate) struct PromotionRing {
     dev: u64,
     cap: usize,
     n_experts: usize,
+    /// Byte offset of the `reserve` word, after the marks.
+    reserve_at: usize,
 }
 
 // SAFETY: `tail` and the slots are written only by the pipeline thread (the
@@ -74,7 +78,8 @@ pub(crate) fn ticket_from_word(word: u32, near: u64) -> u64 {
 
 impl PromotionRing {
     pub(crate) fn new(cap: usize, rows: usize, n_experts: usize) -> Result<Self> {
-        let bytes = cap * 16 + 8 + rows * n_experts * 4;
+        let reserve_at = cap * 16 + 8 + rows * n_experts * 4;
+        let bytes = reserve_at + 4;
         let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: a page-locked, device-mapped allocation, freed in `drop`.
         let r = unsafe { sys::cuMemHostAlloc(&mut raw, bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP) };
@@ -93,12 +98,25 @@ impl PromotionRing {
         }
         // SAFETY: `bytes` just allocated, not yet visible to the device.
         unsafe { std::ptr::write_bytes(raw as *mut u8, 0, bytes) };
-        Ok(Self {
+        let ring = Self {
             host: raw as *mut u8,
             dev,
             cap,
             n_experts,
-        })
+            reserve_at,
+        };
+        // No prompt-only expert takes a slot until the host says how much is
+        // decode's.
+        ring.set_reserve(u32::MAX);
+        Ok(ring)
+    }
+
+    /// Keep `n` stocked slots for decode-scored experts: a prompt-only expert
+    /// takes one only while more than `n` are stocked.
+    pub(crate) fn set_reserve(&self, n: u32) {
+        // SAFETY: the reserve word this struct owns, after the marks.
+        unsafe { std::ptr::write_volatile(self.host.add(self.reserve_at) as *mut u32, n) };
+        fence(Ordering::SeqCst);
     }
 
     /// The expert's promotion has landed or been dropped: it may be given a
@@ -121,6 +139,7 @@ impl PromotionRing {
             tail: self.dev + (self.cap * 16 + 4) as u64,
             cap: self.cap as u32,
             marks: self.dev + (self.cap * 16 + 8) as u64,
+            reserve: self.dev + self.reserve_at as u64,
         }
     }
 

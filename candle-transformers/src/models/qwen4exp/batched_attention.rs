@@ -17,6 +17,7 @@
 //! `forward_attn_batched` on this wrapper.
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
+use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::{Int8Mode, SumScale};
 use candle::{DType, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
@@ -89,7 +90,7 @@ impl BatchedAttentionLayer for Qwen4ExpAttentionLayer<'_> {
         _x: &mut Tensor,
         _acts: DynamicActs<'w>,
         _work_dtype: DType,
-        _decode_tokens: usize,
+        _decode: &DecodeRows,
         _wave: Option<&'w WaveGeneration>,
     ) -> Result<()> {
         candle::bail!(

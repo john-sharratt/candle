@@ -101,9 +101,14 @@ impl Drop for Generation {
             // generation may have started, in which case the arena is live again
             // and no fence belongs here — that generation's own drop records one.
             if inner.live_generations == 0 {
+                // The fence must follow every kernel that read the arena, and
+                // inside a wave capture those are recorded but not yet issued:
+                // issue them first.
+                let dev = inner.dev.clone();
+                let _eager = dev.as_ref().and_then(|d| d.pause_capture().ok().flatten());
                 let stream = match (inner.explicit_stream.clone(), inner.dev.clone()) {
                     (Some(stream), _) => Some(stream),
-                    (None, Some(dev)) => Some(dev.cuda_stream().clone()),
+                    (None, Some(dev)) => Some(dev.compute_stream()),
                     (None, None) => None,
                 };
                 match stream {
@@ -186,9 +191,19 @@ impl Generation {
 pub struct GpuBuf {
     dev_ptr: u64,
     len: usize,
-    /// Holds the `CudaSlice` alive for owned (non-arena) buffers.
-    /// `None` for arena buffers — the arena owns the device memory.
-    _owned: Option<CudaSlice<u8>>,
+    /// Holds the `CudaSlice` alive for owned (non-arena) buffers, with the
+    /// device it is retired to on drop. `None` for arena buffers — the arena
+    /// owns the device memory.
+    _owned: Option<(CudaSlice<u8>, CudaDevice)>,
+}
+
+impl Drop for GpuBuf {
+    fn drop(&mut self) {
+        // A launch this thread recorded may still read the buffer.
+        if let Some((slice, dev)) = self._owned.take() {
+            dev.retire(slice);
+        }
+    }
 }
 
 impl GpuBuf {
@@ -220,7 +235,7 @@ impl GpuBuf {
     /// A `CudaDevice` reference is required to resolve the stable device pointer
     /// (a cudarc API requirement; the pointer is valid for the lifetime of the slice).
     pub fn from_raw_owned(slice: CudaSlice<u8>, dev: &CudaDevice) -> Self {
-        let stream = dev.cuda_stream();
+        let stream = dev.compute_stream();
         let ptr = {
             let (ptr, _guard) = slice.device_ptr(&stream);
             ptr
@@ -229,7 +244,7 @@ impl GpuBuf {
         Self {
             dev_ptr: ptr,
             len,
-            _owned: Some(slice),
+            _owned: Some((slice, dev.clone())),
         }
     }
 }
@@ -975,10 +990,11 @@ impl PinnedStager {
                 let len = buf.len();
                 inner.pending_owned_bytes += len;
                 inner.pending_owned.push(buf);
+                let dev = inner.dev.clone().expect("checked above");
                 Ok(GpuBuf {
                     dev_ptr,
                     len,
-                    _owned: Some(gpu),
+                    _owned: Some((gpu, dev)),
                 })
             }
             PinnedBuf::Host { .. } => Ok(GpuBuf {
@@ -1024,10 +1040,11 @@ impl PinnedStager {
             }
             PinnedBuf::Host { .. } => unreachable!("handled above"),
         }
+        let dev = inner.dev.clone().expect("checked above");
         Ok(GpuBuf {
             dev_ptr,
             len,
-            _owned: Some(gpu),
+            _owned: Some((gpu, dev)),
         })
     }
 
@@ -1035,13 +1052,14 @@ impl PinnedStager {
     /// the pinned → device copy. The copy is asynchronous (pinned source),
     /// stream-ordered ahead of every launch that follows.
     fn copy_to_device(inner: &PinnedStagerInner, buf: &PinnedBuf) -> Result<(u64, CudaSlice<u8>)> {
-        let stream = inner.explicit_stream.clone().unwrap_or_else(|| {
-            inner
-                .dev
-                .as_ref()
-                .expect("cuda stager missing device")
-                .cuda_stream()
-        });
+        let dev = inner.dev.as_ref().expect("cuda stager missing device");
+        // An allocation and a host copy: eager, behind whatever this thread
+        // has recorded.
+        let _eager = dev.pause_capture()?;
+        let stream = inner
+            .explicit_stream
+            .clone()
+            .unwrap_or_else(|| dev.compute_stream());
         let mut gpu = unsafe { stream.alloc::<u8>(buf.len()).w()? };
         stream.memcpy_htod(buf.as_slice(), &mut gpu).w()?;
         let dev_ptr = {
@@ -1071,10 +1089,14 @@ impl PinnedStager {
             let inner = self.inner.lock().unwrap();
             (inner.dev.clone(), inner.explicit_stream.clone())
         };
+        let _eager = match &dev {
+            Some(dev) => dev.pause_capture()?,
+            None => None,
+        };
         if let Some(stream) = explicit_stream {
             stream.synchronize().w()?;
-        } else if let Some(dev) = dev {
-            dev.cuda_stream().synchronize().w()?;
+        } else if let Some(dev) = &dev {
+            dev.compute_stream().synchronize().w()?;
         }
         let mut inner = self.inner.lock().unwrap();
         // Resets all arenas, drops the overflow slabs (keeping only the first),
@@ -1091,10 +1113,14 @@ impl PinnedStager {
             let inner = self.inner.lock().unwrap();
             (inner.dev.clone(), inner.explicit_stream.clone())
         };
+        let _eager = match &dev {
+            Some(dev) => dev.pause_capture()?,
+            None => None,
+        };
         if let Some(stream) = explicit_stream {
             stream.synchronize().w()?;
-        } else if let Some(dev) = dev {
-            dev.cuda_stream().synchronize().w()?;
+        } else if let Some(dev) = &dev {
+            dev.compute_stream().synchronize().w()?;
         }
         let mut inner = self.inner.lock().unwrap();
         // The stream sync above subsumes any deferred fence — an event recorded
@@ -1130,7 +1156,8 @@ impl Drop for PinnedStagerInner {
             if let Some(stream) = &self.explicit_stream {
                 let _ = stream.synchronize();
             } else if let Some(dev) = &self.dev {
-                let _ = dev.cuda_stream().synchronize();
+                let _eager = dev.pause_capture();
+                let _ = dev.compute_stream().synchronize();
             }
             self.pending_owned.clear();
         }

@@ -38,6 +38,8 @@ use crate::quantized_nn::RmsNorm;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::DynamicActs;
 #[cfg(feature = "cuda")]
+use candle::quantized::decode_rows::DecodeRows;
+#[cfg(feature = "cuda")]
 use candle::quantized::register_mmap_cuda;
 use candle::quantized::QTensor;
 use candle::quantized::{ggml_file, gguf_file, Int8Mode};
@@ -502,7 +504,7 @@ impl BatchedAttentionLayer for LayerWeights {
         work_dtype: DType,
         // A dense MLP has no expert cache to score, so the decode/prefill row
         // split says nothing here.
-        _decode_tokens: usize,
+        _decode: &DecodeRows,
         // A dense MLP allocates its own output, so nothing here is
         // wave-scoped; the parameter is the trait's, for the MoE case.
         _wave: Option<&'w WaveGeneration>,

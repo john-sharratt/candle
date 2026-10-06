@@ -669,7 +669,7 @@ pub fn solve_unit_lower<'w>(a: &LiveTensor<'w>, rhs: LiveTensor<'w>) -> Result<L
     let alpha = 1f32;
     let status = unsafe {
         cublas::cublasStrsmBatched(
-            *dev.cublas().handle(),
+            *dev.cublas()?.handle(),
             cublas::cublasSideMode_t::CUBLAS_SIDE_RIGHT,
             cublas::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER,
             cublas::cublasOperation_t::CUBLAS_OP_N,

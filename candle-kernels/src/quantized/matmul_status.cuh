@@ -1,7 +1,8 @@
 #pragma once
 
 // Status codes returned by the quantized-matmul host launchers
-// (`run_quantized_matmul`, `run_qkv_segmented_matmul`).
+// (`run_quantized_matmul`, `run_qkv_segmented_matmul`,
+// `run_grouped_quantized_matmul`).
 //
 // The launchers pick a kernel out of a static table indexed by (quantization
 // format, output dtype, tiling mode). A miss used to `return` silently, which
@@ -18,3 +19,9 @@
 #define QMM_NO_KERNEL      4  // no kernel for this (format, output dtype) pair
 #define QMM_BAD_OUT_DTYPE  5  // output dtype outside the dispatch table
 #define QMM_BAD_SPLIT      6  // split-K depth outside [2, K-tiles], or a format that never splits
+#define QMM_BAD_TILE_MODE  7  // int8 token-tile width (`n_sub`) with no kernel
+#define QMM_LAUNCH_FAILED  8  // the kernel was chosen but its launch returned an error
+//
+// A launcher that skipped its launch is the silent-loss case a recorded graph
+// cannot survive: the missing node would be missing from every replay. So the
+// status covers the launch itself, not only the table lookup.

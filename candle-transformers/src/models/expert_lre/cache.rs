@@ -34,12 +34,19 @@
 //! lightly-decayed access frequency: higher = more valuable = evicted last.
 //! Updated by pipeline events:
 //!
-//! - **Cache hit (decode-attributed)**: +1.0
+//! - **Cache hit (decode-attributed)**: +1.0, and +1.0 of decode reuse
+//! - **Miss (decode-attributed)**: +1.0, no decode reuse
 //! - **Cache hit (prefill-attributed)**: +0.1 — see [`PREFILL_HIT_SCORE`]
 //! - **Prefill-attributed elevation** (a fresh cold load streamed in to serve a
 //!   prefill row): set to −0.1 — see [`PREFILL_ELEVATE_PENALTY`]
 //! - **Prediction hit**: +0.3 (a speculative load the layer actually routed to)
-//! - **End-of-pass decay**: ×0.85 (recency-weighting of the frequency)
+//! - **End-of-pass decay**: ×[`DECODE_RECENCY_DECAY`] (recency-weighting of the
+//!   frequency); decode reuse ×[`DECODE_REUSE_DECAY`]
+//!
+//! The eviction score is the recency-weighted frequency plus
+//! [`DECODE_REUSE_WEIGHT`] × decode reuse: a short memory that keeps the
+//! experts the current decode steps are routing, and a long one that keeps the
+//! experts decode keeps coming back to.
 
 use super::types::ExpertSlot;
 use candle_nn::kv_cache::WeightZone;
@@ -107,6 +114,32 @@ pub const PREFILL_HIT_SCORE: f32 = 0.1;
 /// whatever its factors — `slot_eviction_score`'s `position_factor` and the
 /// batch scans' `window_factor` alike.
 pub const PREFILL_ELEVATE_PENALTY: f32 = -0.1;
+
+/// Per-pass decay of the recency-weighted score: a memory of about ten passes.
+pub const DECODE_RECENCY_DECAY: f32 = 0.85;
+
+/// Per-pass decay of [`ExpertCacheInner::decode_reuse`]: a memory of about a
+/// hundred decode steps, where the recency score's ×0.85 forgets in about ten.
+///
+/// One score cannot serve both needs a decode miss has. Credited as a hit, the
+/// expert holds its slot until the next step routes to it again — without that
+/// credit Qwen3.8-Flash-Next's wide decode loses a third (RTX 3090, ×16: 368 →
+/// 249 t/s) — but it then outbids every expert decode last routed more than a
+/// few steps ago, and a reply that returns to them pays for all of them again
+/// (a 13-step two-sequence row: 155 → 120 t/s, its first step 57 → 107 ms).
+/// A slower decay of the one score keeps those and loses the wide rows instead
+/// (×0.99: ×16 308 t/s). Reuse earned only by hits, decayed slowly and
+/// weighted in, keeps both. ×0.98 measured 1–3% under ×0.99 on most rows.
+pub const DECODE_REUSE_DECAY: f32 = 0.99;
+
+/// Weight of [`ExpertCacheInner::decode_reuse`] in the eviction score.
+///
+/// Measured on Qwen3.8-Flash-Next (RTX 3090): 0.02, 0.04 and 0.1 each raised
+/// every decode row a little over the one before; 0.3 raised the two- and
+/// eight-sequence rows another 1–2% and cost ×16 7% (372 → 347 t/s), the row
+/// whose working set most exceeds the zone, where old reuse is least worth
+/// keeping.
+pub const DECODE_REUSE_WEIGHT: f32 = 0.1;
 
 /// How many layers this model actually pins.
 ///
@@ -260,6 +293,10 @@ pub struct ExpertCacheInner {
     /// Flat score table: `expert_scores[layer * experts_per_layer + expert]`.
     /// A lightly-decayed access frequency — higher = more valuable = evicted last.
     pub(crate) expert_scores: Vec<f32>,
+    /// Long-memory decode reuse, indexed like `expert_scores`: decode hits
+    /// only, decayed by [`DECODE_REUSE_DECAY`] a pass. Weighted into
+    /// [`Self::score`] by [`DECODE_REUSE_WEIGHT`].
+    pub(crate) decode_reuse: Vec<f32>,
     /// Number of MoE layers (e.g. 48).
     pub(crate) num_moe_layers: usize,
     /// Experts per MoE layer (e.g. 128).
@@ -296,6 +333,7 @@ impl ExpertCacheInner {
             generation: 0,
             slot_to_key: vec![None; num_slots],
             expert_scores: vec![0.0f32; num_moe_layers * experts_per_layer],
+            decode_reuse: vec![0.0f32; num_moe_layers * experts_per_layer],
             num_moe_layers,
             experts_per_layer,
             pinned_layers: pinned_layer_count(num_moe_layers),
@@ -518,12 +556,23 @@ impl ExpertCacheInner {
     /// Get the current score for a (layer, expert) pair.
     #[inline]
     pub(crate) fn score(&self, layer: usize, expert: usize) -> f32 {
-        self.expert_scores[self.score_idx(layer, expert)]
+        let idx = self.score_idx(layer, expert);
+        self.expert_scores[idx] + DECODE_REUSE_WEIGHT * self.decode_reuse[idx]
     }
 
-    /// Record a cache hit: bumps score by +1.0.
+    /// Record a decode hit: +1.0, and +1.0 of long-memory decode reuse.
     #[inline]
     pub(crate) fn record_hit(&mut self, layer: usize, expert: usize) {
+        let idx = self.score_idx(layer, expert);
+        self.expert_scores[idx] += 1.0;
+        self.decode_reuse[idx] += 1.0;
+    }
+
+    /// Record a decode miss: +1.0, so the expert holds its slot to the next
+    /// step, which near-certainly routes to it again — but no decode reuse
+    /// until it is hit.
+    #[inline]
+    pub(crate) fn record_decode_miss(&mut self, layer: usize, expert: usize) {
         let idx = self.score_idx(layer, expert);
         self.expert_scores[idx] += 1.0;
     }
@@ -548,7 +597,13 @@ impl ExpertCacheInner {
     /// opposite of what an elevation means and exactly the "earlier, unrelated
     /// occupancy" the constant's doc says this must not inherit. An elevation is
     /// one event with one meaning: this expert was just paid for and is the
-    /// least likely thing in the zone to be wanted again.
+    /// least likely thing in the zone to be wanted again — by recency.
+    ///
+    /// **Decode reuse is kept.** It belongs to the expert, not to the slot, and
+    /// was earned by decode hits on this same expert, so an expert decode keeps
+    /// returning to still outranks a prompt's one-shot fetch after a prompt
+    /// happens to load it: its score is −0.1 plus [`DECODE_REUSE_WEIGHT`] × its
+    /// reuse.
     #[inline]
     pub(crate) fn record_prefill_elevate(&mut self, layer: usize, expert: usize) {
         let idx = self.score_idx(layer, expert);
@@ -562,10 +617,14 @@ impl ExpertCacheInner {
         self.expert_scores[idx] += 0.3;
     }
 
-    /// End-of-pass exponential decay: multiply all scores by `factor` (e.g. 0.85).
+    /// End-of-pass exponential decay: multiply all scores by `factor` (e.g. 0.85),
+    /// and decode reuse by [`DECODE_REUSE_DECAY`].
     pub(crate) fn decay_scores(&mut self, factor: f32) {
         for s in self.expert_scores.iter_mut() {
             *s *= factor;
+        }
+        for r in self.decode_reuse.iter_mut() {
+            *r *= DECODE_REUSE_DECAY;
         }
     }
 
@@ -953,7 +1012,44 @@ mod tests {
         let mut inner = cache(1);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
         inner.record_hit(10, 100);
+        let idx = 10 * inner.experts_per_layer + 100;
+        assert_eq!(inner.expert_scores[idx], 1.0);
+        assert_eq!(inner.decode_reuse[idx], 1.0);
+        assert_eq!(inner.score(10, 100), 1.1);
+    }
+
+    #[test]
+    fn a_decode_miss_earns_the_decode_credit_but_no_reuse() {
+        let mut inner = cache(1);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        inner.record_decode_miss(10, 100);
+        let idx = 10 * inner.experts_per_layer + 100;
+        assert_eq!(inner.expert_scores[idx], 1.0);
+        assert_eq!(inner.decode_reuse[idx], 0.0);
         assert_eq!(inner.score(10, 100), 1.0);
+    }
+
+    #[test]
+    fn decode_reuse_decays_on_its_own_slower_clock() {
+        let mut inner = cache(1);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        inner.record_hit(10, 100);
+        inner.decay_scores(0.5);
+        let idx = 10 * inner.experts_per_layer + 100;
+        assert_eq!(inner.expert_scores[idx], 0.5);
+        assert_eq!(inner.decode_reuse[idx], 0.99);
+    }
+
+    /// Two experts with the same recency score: the one decode has hit outranks
+    /// the one it has only missed.
+    #[test]
+    fn a_one_off_decode_miss_is_evicted_before_a_reused_expert() {
+        let mut inner = cache(2);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        occupy(&mut inner, 1, 10, 101, 1, 0.0);
+        inner.record_hit(10, 100);
+        inner.record_decode_miss(10, 101);
+        assert_eq!(best_victim(&inner, 20, &[]), Some((1, (10, 101))));
     }
 
     #[test]
@@ -962,6 +1058,21 @@ mod tests {
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
         inner.record_prefill_elevate(10, 100);
         assert_eq!(inner.score(10, 100), -0.1);
+    }
+
+    /// An elevation resets the recency score but keeps the decode reuse the
+    /// same expert earned: two decode hits leave −0.1 + 0.1 × 2.
+    #[test]
+    fn a_prefill_elevation_keeps_the_experts_decode_reuse() {
+        let mut inner = cache(1);
+        occupy(&mut inner, 0, 10, 100, 1, 0.0);
+        inner.record_hit(10, 100);
+        inner.record_hit(10, 100);
+        inner.record_prefill_elevate(10, 100);
+        let idx = inner.score_idx(10, 100);
+        assert_eq!(inner.expert_scores[idx], -0.1);
+        assert_eq!(inner.decode_reuse[idx], 2.0);
+        assert_eq!(inner.score(10, 100), 0.1);
     }
 
     /// **A previous tenant's score is not inherited.** `install` leaves

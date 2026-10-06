@@ -82,6 +82,7 @@ pub(crate) fn q8a128_dense_matmul_silu<'w>(
             m as i32,
             sum_scale.as_code(),
             i32::from(mode2),
+            stream.cu_stream() as *mut c_void,
         )
     };
     check_matmul_status(status, "q8a128 fused-silu matmul")?;

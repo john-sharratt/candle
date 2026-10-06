@@ -130,6 +130,7 @@ extern "C" __global__ void dequantize_q6_K(
 /// - nrows: Number of rows
 /// - ncols: Number of columns
 /// - qtype: Quantization type (0-9)
+/// - stream: Stream the launch is issued on
 ///
 /// Note: K/128 blocks have embedded scales - no external scales parameter.
 ///
@@ -139,7 +140,8 @@ extern "C" int32_t run_dequantize(
     void* out,
     int32_t nrows,
     int32_t ncols,
-    int32_t qtype
+    int32_t qtype,
+    void* stream
 ) {
     // Get QK and threads per block based on qtype
     // K/128 FORMAT: QK=128 (8 K-tiles × 16 elements), 16 threads per block
@@ -184,70 +186,70 @@ extern "C" int32_t run_dequantize(
     
     switch (qtype) {
         case 0:
-            dequantize_q4_0<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK>>>(
+            dequantize_q4_0<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK, 0, (cudaStream_t)stream>>>(
                 reinterpret_cast<const block_c_q4_0*>(x),
                 reinterpret_cast<float*>(out),
                 nrows, ncols
             );
             break;
         case 1:
-            dequantize_q4_1<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK>>>(
+            dequantize_q4_1<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK, 0, (cudaStream_t)stream>>>(
                 reinterpret_cast<const block_c_q4_1*>(x),
                 reinterpret_cast<float*>(out),
                 nrows, ncols
             );
             break;
         case 2:
-            dequantize_q5_0<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK>>>(
+            dequantize_q5_0<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK, 0, (cudaStream_t)stream>>>(
                 reinterpret_cast<const block_c_q5_0*>(x),
                 reinterpret_cast<float*>(out),
                 nrows, ncols
             );
             break;
         case 3:
-            dequantize_q5_1<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK>>>(
+            dequantize_q5_1<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK, 0, (cudaStream_t)stream>>>(
                 reinterpret_cast<const block_c_q5_1*>(x),
                 reinterpret_cast<float*>(out),
                 nrows, ncols
             );
             break;
         case 4:
-            dequantize_q8_0<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK>>>(
+            dequantize_q8_0<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK, 0, (cudaStream_t)stream>>>(
                 reinterpret_cast<const block_c_q8_0*>(x),
                 reinterpret_cast<float*>(out),
                 nrows, ncols
             );
             break;
         case 5:
-            dequantize_q2_K<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK>>>(
+            dequantize_q2_K<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK, 0, (cudaStream_t)stream>>>(
                 reinterpret_cast<const block_c_q2_K*>(x),
                 reinterpret_cast<float*>(out),
                 nrows, ncols
             );
             break;
         case 6:
-            dequantize_q3_K<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK>>>(
+            dequantize_q3_K<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK, 0, (cudaStream_t)stream>>>(
                 reinterpret_cast<const block_c_q3_K*>(x),
                 reinterpret_cast<float*>(out),
                 nrows, ncols
             );
             break;
         case 7:
-            dequantize_q4_K<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK>>>(
+            dequantize_q4_K<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK, 0, (cudaStream_t)stream>>>(
                 reinterpret_cast<const block_c_q4_K*>(x),
                 reinterpret_cast<float*>(out),
                 nrows, ncols
             );
             break;
         case 8:
-            dequantize_q5_K<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK>>>(
+            dequantize_q5_K<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK, 0, (cudaStream_t)stream>>>(
                 reinterpret_cast<const block_c_q5_K*>(x),
                 reinterpret_cast<float*>(out),
                 nrows, ncols
             );
             break;
         case 9:
-            dequantize_q6_K<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK>>>(
+            dequantize_q6_K<<<num_cuda_blocks, THREADS_PER_CUDA_BLOCK, 0, (cudaStream_t)stream>>>(
                 reinterpret_cast<const block_c_q6_K*>(x),
                 reinterpret_cast<float*>(out),
                 nrows, ncols

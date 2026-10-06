@@ -15,7 +15,7 @@ use crate::quantized::cuda::dtype_to_qtype;
 use crate::quantized::GgmlDType;
 use crate::{Result, Shape};
 use candle_kernels::simple::quantized::{run_dequantize_block, run_dequantize_ko};
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -29,8 +29,14 @@ const DEQUANT_OUT_F32: i32 = 0;
 pub const QTYPE_Q8A128V: i32 = 36;
 
 /// Dequantize `elem_count` elements of a raw quantized activation buffer into
-/// `dst` as F32.
-pub fn dequantize_flat_into(src: u64, dst: u64, elem_count: usize, qtype: i32) {
+/// `dst` as F32, launched on `stream`.
+pub fn dequantize_flat_into(
+    src: u64,
+    dst: u64,
+    elem_count: usize,
+    qtype: i32,
+    stream: &CudaStream,
+) {
     unsafe {
         crate::set_kernel_breadcrumb("run_dequantize_block", file!(), line!());
         run_dequantize_block(
@@ -39,6 +45,7 @@ pub fn dequantize_flat_into(src: u64, dst: u64, elem_count: usize, qtype: i32) {
             elem_count as i32,
             qtype,
             DEQUANT_OUT_F32,
+            stream.cu_stream() as *mut std::ffi::c_void,
         );
     }
 }
@@ -72,7 +79,10 @@ pub fn with_f32_scratch<R>(
                     from = s.buf.len(), to = elems,
                     "tensor_assert: growing the quantized-assert scratch"
                 );
-                s.buf = alloc(dev, elems)?;
+                // Retired, not dropped: a recorded dequant may still read the
+                // old buffer, and a free is refused while this thread records.
+                let old = std::mem::replace(&mut s.buf, alloc(dev, elems)?);
+                dev.retire(old);
             }
             s
         }
@@ -97,7 +107,15 @@ fn alloc(dev: &CudaDevice, elems: usize) -> Result<CudaSlice<f32>> {
 /// every other format is a flat array of blocks that `run_dequantize_block`
 /// walks by element count. Reading a KO tensor through the flat path would
 /// misinterpret the layout and report values the matmul never sees.
-pub fn dequantize_into(src: u64, dst: u64, shape: &Shape, dtype: GgmlDType) -> Result<()> {
+///
+/// Both families launch on `stream`.
+pub fn dequantize_into(
+    src: u64,
+    dst: u64,
+    shape: &Shape,
+    dtype: GgmlDType,
+    stream: &CudaStream,
+) -> Result<()> {
     let qtype = dtype_to_qtype(dtype)? as i32;
     let elem_count = shape.elem_count();
     let dims = shape.dims();
@@ -119,6 +137,7 @@ pub fn dequantize_into(src: u64, dst: u64, shape: &Shape, dtype: GgmlDType) -> R
                 nrows as i32,
                 ncols as i32,
                 qtype,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
         return Ok(());
@@ -132,6 +151,7 @@ pub fn dequantize_into(src: u64, dst: u64, shape: &Shape, dtype: GgmlDType) -> R
             elem_count as i32,
             qtype,
             DEQUANT_OUT_F32,
+            stream.cu_stream() as *mut std::ffi::c_void,
         );
     }
     Ok(())

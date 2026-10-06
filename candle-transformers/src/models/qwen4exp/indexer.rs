@@ -460,13 +460,15 @@ impl IndexCache {
         let candle::Device::Cuda(cuda) = &device else {
             candle::bail!("qsa index flush runs on CUDA");
         };
-        let stream = cuda.cuda_stream();
         debug_assert_eq!(jobs.len(), FLUSH_WORDS);
         let k_norm = tensor_ptr(&w.k_norm)?;
         // The one job through the device's staging scratch: a flush runs at a
         // page close between forwards as often as inside one, and allocates
-        // nothing in either.
+        // nothing in either. The stream is taken inside, where the launch is:
+        // the staged upload runs eagerly, so the launch belongs on the stream
+        // it names there.
         cuda.with_staged_upload(&jobs, |jobs_ptr| {
+            let stream = cuda.cuda_stream();
             candle::set_kernel_breadcrumb("run_qsa_index_flush", file!(), line!());
             unsafe {
                 run_qsa_index_flush(
@@ -2056,8 +2058,6 @@ pub fn append_wave(
         let candle::Device::Cuda(dev) = &device else {
             candle::bail!("qsa append runs on CUDA");
         };
-        let stream = dev.cuda_stream();
-        let raw_stream = stream.cu_stream() as *mut c_void;
         let n_jobs = jobs.len() / JOB_WORDS;
         let n_carry = carries.len() / CARRY_WORDS;
         // Both tables in one upload through the device's staging scratch — the
@@ -2067,7 +2067,11 @@ pub fn append_wave(
         let mut table = jobs;
         table.extend_from_slice(&carries);
         let k_norm = tensor_ptr(&w.k_norm)?;
+        // The stream is taken inside, where the launches are — the staged
+        // upload runs eagerly, so they belong on the stream it names there.
         dev.with_staged_upload(&table, |base| {
+            let stream = dev.cuda_stream();
+            let raw_stream = stream.cu_stream() as *mut c_void;
             if n_jobs > 0 {
                 candle::set_kernel_breadcrumb("run_qsa_index_append", file!(), line!());
                 unsafe {

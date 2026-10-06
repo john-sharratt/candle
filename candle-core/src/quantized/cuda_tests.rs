@@ -101,6 +101,7 @@ fn cuda_mm_gemx_large_n_batch1_no_row_aliasing() -> Result<()> {
                     0,
                     OutDType::F16 as i32,
                     SumScale::Raw.as_code(),
+                    std::ptr::null_mut(),
                 )
             };
             assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -203,6 +204,7 @@ fn cuda_mm_gemx_every_batch_matches_rows_alone() -> Result<()> {
                     0,
                     OutDType::F16 as i32,
                     SumScale::Raw.as_code(),
+                    std::ptr::null_mut(),
                 )
             };
             assert_eq!(status, 0, "matmul launcher rejected batch {batch}");
@@ -733,6 +735,7 @@ fn cuda_mm_q4_k_repacked() -> Result<()> {
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::F16 as i32,
                 SumScale::Raw.as_code(),
+                std::ptr::null_mut(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -836,6 +839,7 @@ fn cuda_mm_q4_k_repacked_model_size() -> Result<()> {
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::F16 as i32,
                 SumScale::Raw.as_code(),
+                std::ptr::null_mut(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -994,6 +998,7 @@ fn cuda_mm_q6_k_repacked() -> Result<()> {
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::F16 as i32,
                 SumScale::Raw.as_code(),
+                std::ptr::null_mut(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -1242,6 +1247,7 @@ fn cuda_mm_q4_k_gguf_vs_dequant() -> Result<()> {
                     0, // force_mode2 (tiling only; result-invariant)
                     OutDType::BF16 as i32,
                     SumScale::Raw.as_code(),
+                    std::ptr::null_mut(),
                 )
             };
             assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -1416,6 +1422,7 @@ fn cuda_mm_q4_k_fused_qkv() -> Result<()> {
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::BF16 as i32,
                 SumScale::Raw.as_code(),
+                std::ptr::null_mut(),
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -3249,6 +3256,7 @@ fn q8a128_unified_dispatch_matches_typed() -> Result<()> {
                 dp as *mut std::ffi::c_void,
                 n as i32,
                 QTYPE_Q8A128,
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -3287,6 +3295,7 @@ fn q8a128_unified_dispatch_matches_typed() -> Result<()> {
                 n as i32,
                 QTYPE_Q8A128,
                 0, // unified ordering: 0 = F32
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
     }
@@ -3358,6 +3367,7 @@ fn q8a128_throughput_bench() -> Result<()> {
                     cols_i,
                     dtype,
                     SumScale::Raw.as_code(),
+                    stream.cu_stream() as *mut c_void,
                 );
             }
         }
@@ -3372,6 +3382,7 @@ fn q8a128_throughput_bench() -> Result<()> {
                     cols_i,
                     dtype,
                     SumScale::Raw.as_code(),
+                    stream.cu_stream() as *mut c_void,
                 );
             }
         }
@@ -3387,6 +3398,7 @@ fn q8a128_throughput_bench() -> Result<()> {
                     rows_i,
                     cols_i,
                     dtype,
+                    stream.cu_stream() as *mut c_void,
                 );
             }
         }
@@ -3400,6 +3412,7 @@ fn q8a128_throughput_bench() -> Result<()> {
                     rows_i,
                     cols_i,
                     dtype,
+                    stream.cu_stream() as *mut c_void,
                 );
             }
         }
@@ -3498,24 +3511,60 @@ fn ko_quant_throughput_bench() -> Result<()> {
         let (dp, _g2) = dbuf.device_ptr_mut(&stream);
 
         for _ in 0..warm {
-            unsafe { run_quantize_ko(wp as *const f32, qp as *mut c_void, nr, nc, qtype) };
+            unsafe {
+                run_quantize_ko(
+                    wp as *const f32,
+                    qp as *mut c_void,
+                    nr,
+                    nc,
+                    qtype,
+                    stream.cu_stream() as *mut c_void,
+                )
+            };
         }
         dev.synchronize()?;
         let t0 = Instant::now();
         for _ in 0..iters {
-            unsafe { run_quantize_ko(wp as *const f32, qp as *mut c_void, nr, nc, qtype) };
+            unsafe {
+                run_quantize_ko(
+                    wp as *const f32,
+                    qp as *mut c_void,
+                    nr,
+                    nc,
+                    qtype,
+                    stream.cu_stream() as *mut c_void,
+                )
+            };
         }
         dev.synchronize()?;
         let qt = t0.elapsed().as_secs_f64() / iters as f64;
         let q_gbps = (f32_bytes + qbytes) as f64 / qt / 1e9;
 
         for _ in 0..warm {
-            unsafe { run_dequantize_ko(qp as *const c_void, dp as *mut f32, nr, nc, qtype) };
+            unsafe {
+                run_dequantize_ko(
+                    qp as *const c_void,
+                    dp as *mut f32,
+                    nr,
+                    nc,
+                    qtype,
+                    stream.cu_stream() as *mut c_void,
+                )
+            };
         }
         dev.synchronize()?;
         let t1 = Instant::now();
         for _ in 0..iters {
-            unsafe { run_dequantize_ko(qp as *const c_void, dp as *mut f32, nr, nc, qtype) };
+            unsafe {
+                run_dequantize_ko(
+                    qp as *const c_void,
+                    dp as *mut f32,
+                    nr,
+                    nc,
+                    qtype,
+                    stream.cu_stream() as *mut c_void,
+                )
+            };
         }
         dev.synchronize()?;
         let dt = t1.elapsed().as_secs_f64() / iters as f64;
@@ -3594,6 +3643,7 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
                     rows as i32,
                     cols as i32,
                     0,
+                    stream.cu_stream() as *mut c_void,
                 );
             }
         }
@@ -3642,6 +3692,7 @@ fn q8a128_f16_bf16_paths_match_f32() -> Result<()> {
                     rows as i32,
                     cols as i32,
                     1,
+                    stream.cu_stream() as *mut c_void,
                 );
             }
         }
@@ -8647,6 +8698,7 @@ fn expert_grouped_launch_cost() -> Result<()> {
                 0, // force_mode2 (tiling only; result-invariant)
                 OutDType::BF16 as i32,
                 SumScale::Raw.as_code(),
+                std::ptr::null_mut(),
             );
         };
 
@@ -8753,7 +8805,7 @@ fn expert_grouped_single_launch_cost() -> Result<()> {
             }
             let dev_buf = dev.memcpy_stod(&packed)?;
             let (base, _g) = dev_buf.device_ptr(&stream);
-            unsafe {
+            let status = unsafe {
                 run_grouped_quantized_matmul(
                     base as *const c_void,
                     (base + off_te as u64) as *const c_void,
@@ -8773,8 +8825,9 @@ fn expert_grouped_single_launch_cost() -> Result<()> {
                     SumScale::Raw.as_code(),
                     std::ptr::null(),
                     stream.cu_stream() as *mut c_void,
-                );
-            }
+                )
+            };
+            assert_eq!(status, 0, "grouped matmul launcher rejected the call");
             Ok(())
         };
 
@@ -9052,6 +9105,7 @@ fn bench_moe_route() -> Result<()> {
                     n_experts as i32,
                     k as i32,
                     1,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
             Ok(())
@@ -9676,7 +9730,14 @@ fn assert_bucketize_case(
         _ => unreachable!(),
     };
     let mut ws = MoeBucketizeWorkspace::new(&cuda_dev, n_tokens, k)?;
-    moe_bucketize(&t, n_experts, tile_w, &mut ws, None, n_tokens)?;
+    moe_bucketize(
+        &t,
+        n_experts,
+        tile_w,
+        &mut ws,
+        None,
+        &DecodeRows::prefix(n_tokens),
+    )?;
 
     let a_ub = n_tokens * k;
     let tok = cuda_dev.memcpy_dtov(&ws.tok_ids.slice(..a_ub))?;
@@ -9813,18 +9874,19 @@ fn bench_moe_bucketize() -> Result<()> {
         let mut ws = MoeBucketizeWorkspace::new(&dev, n_tokens, k)?;
 
         // Correctness gate FIRST — every table bit-exact vs the CPU sort.
-        moe_bucketize(&t, n_experts, tile_w, &mut ws, None, n_tokens)?;
+        let decode = DecodeRows::prefix(n_tokens);
+        moe_bucketize(&t, n_experts, tile_w, &mut ws, None, &decode)?;
         assert_bucketize_ws(&dev, &ws, &ids, n_tokens, k, n_experts, tile_w, label)?;
 
         // Warm up, then time `iters` launches with a single trailing sync.
         for _ in 0..20 {
-            moe_bucketize(&t, n_experts, tile_w, &mut ws, None, n_tokens)?;
+            moe_bucketize(&t, n_experts, tile_w, &mut ws, None, &decode)?;
         }
         let _ = dev.memcpy_dtov(&ws.header.slice(..1))?; // drain
 
         let start = Instant::now();
         for _ in 0..iters {
-            moe_bucketize(&t, n_experts, tile_w, &mut ws, None, n_tokens)?;
+            moe_bucketize(&t, n_experts, tile_w, &mut ws, None, &decode)?;
         }
         let _ = dev.memcpy_dtov(&ws.header.slice(..1))?; // drain
         let us = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
@@ -9894,7 +9956,14 @@ fn cuda_grouped_qmatmul_dev_matches_host_tables() -> Result<()> {
         // GPU tables.
         let t = crate::Tensor::from_vec(ids.clone(), (n_tokens, k), &device)?;
         let mut ws = MoeBucketizeWorkspace::new(&dev, n_tokens, k)?;
-        moe_bucketize(&t, n_experts, 32, &mut ws, None, n_tokens)?;
+        moe_bucketize(
+            &t,
+            n_experts,
+            32,
+            &mut ws,
+            None,
+            &DecodeRows::prefix(n_tokens),
+        )?;
 
         // One shared stacked activation covering the full launch bound.
         let act: Vec<f32> = (0..a_ub * ncols)
@@ -10102,13 +10171,14 @@ fn cuda_moe_bucketize_matches_cpu_reference() -> Result<()> {
         .collect();
     let t = crate::Tensor::from_vec(ids, (n_tokens, k), &device)?;
     let mut ws = MoeBucketizeWorkspace::new(&dev, n_tokens, k)?;
-    moe_bucketize(&t, 128, 32, &mut ws, None, n_tokens)?;
+    let decode = DecodeRows::prefix(n_tokens);
+    moe_bucketize(&t, 128, 32, &mut ws, None, &decode)?;
     let first = (
         dev.memcpy_dtov(&ws.tok_ids.slice(..n_tokens * k))?,
         dev.memcpy_dtov(&ws.perm.slice(..n_tokens * k))?,
         dev.memcpy_dtov(&ws.tile_b_cnt.slice(..n_tokens * k))?,
     );
-    moe_bucketize(&t, 128, 32, &mut ws, None, n_tokens)?;
+    moe_bucketize(&t, 128, 32, &mut ws, None, &decode)?;
     let second = (
         dev.memcpy_dtov(&ws.tok_ids.slice(..n_tokens * k))?,
         dev.memcpy_dtov(&ws.perm.slice(..n_tokens * k))?,
@@ -10168,23 +10238,29 @@ fn mapped_host(bytes: usize) -> (*mut c_void, u64) {
 }
 
 /// A promotion ring in mapped memory: `u64 slots[cap] | u64 log[cap] | u32 head
-/// | u32 tail | u32 marks[rows × n_experts]`. Freed on drop.
+/// | u32 tail | u32 marks[rows × n_experts] | u32 reserve`. The reserve starts
+/// at `u32::MAX` — no prompt-only expert takes a slot. Freed on drop.
 struct TestRing {
     host: *mut c_void,
     dev: u64,
     cap: usize,
     n_experts: usize,
+    reserve_at: usize,
 }
 
 impl TestRing {
     fn new(cap: usize, rows: usize, n_experts: usize) -> Self {
-        let (host, dev) = mapped_host(cap * 16 + 8 + rows * n_experts * 4);
-        Self {
+        let reserve_at = cap * 16 + 8 + rows * n_experts * 4;
+        let (host, dev) = mapped_host(reserve_at + 4);
+        let ring = Self {
             host,
             dev,
             cap,
             n_experts,
-        }
+            reserve_at,
+        };
+        ring.set_reserve(u32::MAX);
+        ring
     }
 
     fn ring(&self) -> PromoRing {
@@ -10195,6 +10271,13 @@ impl TestRing {
             tail: self.dev + (self.cap * 16 + 4) as u64,
             cap: self.cap as u32,
             marks: self.dev + (self.cap * 16 + 8) as u64,
+            reserve: self.dev + self.reserve_at as u64,
+        }
+    }
+
+    fn set_reserve(&self, n: u32) {
+        unsafe {
+            std::ptr::write_volatile((self.host as *mut u8).add(self.reserve_at) as *mut u32, n)
         }
     }
 
@@ -10280,7 +10363,11 @@ fn cuda_moe_bucketize_promotes_remote_experts_from_the_ring() -> Result<()> {
     ring.start_at(3);
     let mut ws = MoeBucketizeWorkspace::new(&dev, 3, 2)?;
     let stream = dev.cuda_stream();
-    let run = |ws: &mut MoeBucketizeWorkspace, seq: u32| -> Result<Vec<u64>> {
+    let run_ring = |ws: &mut MoeBucketizeWorkspace,
+                    seq: u32,
+                    decode: &DecodeRows,
+                    promo: PromoRing|
+     -> Result<Vec<u64>> {
         let live = BucketizeLive {
             gate_row: table_dev.device_ptr(&stream).0,
             table_plane: 8,
@@ -10291,12 +10378,19 @@ fn cuda_moe_bucketize_promotes_remote_experts_from_the_ring() -> Result<()> {
             remote: remote.device_ptr(&stream).0,
             counters: counters.device_ptr(&stream).0,
             row: 9,
-            promo: Some(ring.ring()),
+            promo: Some(promo),
             remote_dst: remote_dst.device_ptr(&stream).0,
+            started_rows: 0,
+            ticket: 0,
         };
-        moe_bucketize(&t, 8, 2, ws, Some(&live), 1)?;
+        moe_bucketize(&t, 8, 2, ws, Some(&live), decode)?;
         Ok(dev.memcpy_dtov(&remote_dst.slice(..2))?)
     };
+    let run_with = |ws: &mut MoeBucketizeWorkspace, seq: u32, decode: &DecodeRows| {
+        run_ring(ws, seq, decode, ring.ring())
+    };
+    // Token 0, the decode row, routes both remote experts (e5 and e1).
+    let run = |ws: &mut MoeBucketizeWorkspace, seq: u32| run_with(ws, seq, &DecodeRows::prefix(1));
 
     ring.push(&[0xd000]);
     assert_eq!(run(&mut ws, 1)?, vec![0xd000, 0], "one slot: the first remote expert");
@@ -10327,6 +10421,127 @@ fn cuda_moe_bucketize_promotes_remote_experts_from_the_ring() -> Result<()> {
     ring.clear_mark(9, 5);
     assert_eq!(run(&mut ws, 4)?, vec![0, 0]);
     assert_eq!(ring.head(), 7);
+
+    // A prompt-only expert takes no slot, whatever the ring holds: its workers
+    // compute it from pinned memory and the zone is left to decode. Token 2
+    // alone is decode-scored, routing e5 (remote) and e6 (VRAM) — e1, routed
+    // only by prompt tokens, gets nothing.
+    ring.push(&[0xe000, 0xf000]);
+    let mut last = DecodeRows::none();
+    last.push(2, 3);
+    assert_eq!(
+        run_with(&mut ws, 5, &last)?,
+        vec![0, 0xe000],
+        "only the decode expert"
+    );
+    assert_eq!(ring.head(), 8);
+    assert_eq!((ring.mark(9, 1), ring.mark(9, 5)), (0, 5));
+    ring.clear_mark(9, 5);
+    assert_eq!(
+        run_with(&mut ws, 6, &DecodeRows::none())?,
+        vec![0, 0],
+        "a prompt-only launch"
+    );
+    assert_eq!(ring.head(), 8, "takes nothing");
+
+    // With a reserve of one, prompt-only experts take slots only while more
+    // than one is stocked: of the two stocked (0xf000 left from above, and
+    // 0x9000), e1 takes the first and e5 is left the reserve.
+    ring.set_reserve(1);
+    ring.push(&[0x9000]);
+    assert_eq!(
+        run_with(&mut ws, 7, &DecodeRows::none())?,
+        vec![0xf000, 0],
+        "above the reserve"
+    );
+    assert_eq!(ring.head(), 9);
+    // A decode expert still takes the reserved slot.
+    ring.clear_mark(9, 1);
+    assert_eq!(
+        run_with(&mut ws, 8, &last)?,
+        vec![0, 0x9000],
+        "the reserve is decode's"
+    );
+    assert_eq!(ring.head(), 10);
+
+    // A null reserve address: a prompt-only expert never takes a slot, however
+    // much is stocked, while a decode expert still does.
+    ring.clear_mark(9, 5);
+    ring.push(&[0x1000, 0x2000, 0x3000]);
+    let unreserved = PromoRing {
+        reserve: 0,
+        ..ring.ring()
+    };
+    assert_eq!(
+        run_ring(&mut ws, 9, &DecodeRows::none(), unreserved)?,
+        vec![0, 0],
+        "no reserve word: prompt-only never"
+    );
+    assert_eq!(ring.head(), 10);
+    assert_eq!(
+        run_ring(&mut ws, 10, &last, unreserved)?,
+        vec![0, 0x1000],
+        "no reserve word: decode still takes one"
+    );
+    assert_eq!(ring.head(), 11);
+    Ok(())
+}
+
+/// **Bucketize marks its row begun with its ticket**, in the row's word and no
+/// other, so the host's reclaim rule can key on the invocation the device is
+/// inside. Raw expected words after two invocations of row 2 and one of row 0.
+#[test]
+fn cuda_moe_bucketize_stores_its_ticket_in_its_rows_started_word() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let t = crate::Tensor::from_vec(vec![1u32, 3, 3, 5], (2, 2), &device)?;
+    let table_dev = dev.memcpy_stod(&test_live_table(&[CLS_VRAM; 8], &[]))?;
+    let snap = dev.memcpy_stod(&[0u64; 24])?;
+    let started = dev.memcpy_stod(&[0u64; 4])?;
+    let mut ws = MoeBucketizeWorkspace::new(&dev, 2, 2)?;
+    let stream = dev.cuda_stream();
+    let mut run = |row: i32, ticket: u64| -> Result<()> {
+        let live = BucketizeLive {
+            gate_row: table_dev.device_ptr(&stream).0,
+            table_plane: 8,
+            snap: snap.device_ptr(&stream).0,
+            pinned: TEST_PINNED,
+            summary: 0,
+            summary_seq: 0,
+            remote: 0,
+            counters: 0,
+            row,
+            promo: None,
+            remote_dst: 0,
+            started_rows: started.device_ptr(&stream).0,
+            ticket,
+        };
+        moe_bucketize(&t, 8, 2, &mut ws, Some(&live), &DecodeRows::prefix(2))
+    };
+    run(2, 7)?;
+    run(0, 8)?;
+    run(2, 11)?;
+    assert_eq!(dev.memcpy_dtov(&started)?, vec![8, 0, 11, 0]);
+
+    // With no live table the kernel reads no entries, so it has nothing to
+    // order the store against: the started word is left as it was.
+    let live = BucketizeLive {
+        gate_row: 0,
+        table_plane: 0,
+        snap: 0,
+        pinned: TEST_PINNED,
+        summary: 0,
+        summary_seq: 0,
+        remote: 0,
+        counters: 0,
+        row: 1,
+        promo: None,
+        remote_dst: 0,
+        started_rows: started.device_ptr(&stream).0,
+        ticket: 13,
+    };
+    moe_bucketize(&t, 8, 2, &mut ws, Some(&live), &DecodeRows::prefix(2))?;
+    assert_eq!(dev.memcpy_dtov(&started)?, vec![8, 0, 11, 0]);
     Ok(())
 }
 
@@ -10346,7 +10561,7 @@ fn run_bucketize_live(
     tile_w: usize,
     class: &[u8],
     zero_down: &[usize],
-    decode_tokens: usize,
+    decode: &DecodeRows,
 ) -> Result<BucketizeRef> {
     let device = crate::Device::Cuda(dev.clone());
     let t = crate::Tensor::from_vec(ids.to_vec(), (n_tokens, k), &device)?;
@@ -10377,8 +10592,10 @@ fn run_bucketize_live(
             row: 0,
             promo: None,
             remote_dst: 0,
+            started_rows: 0,
+            ticket: 0,
         };
-        moe_bucketize(&t, n_experts, tile_w, &mut ws, Some(&live), decode_tokens)?;
+        moe_bucketize(&t, n_experts, tile_w, &mut ws, Some(&live), decode)?;
     }
     let a_ub = n_tokens * k;
     let hd = dev.memcpy_dtov(&ws.header.slice(..5))?;
@@ -10434,7 +10651,7 @@ fn cuda_moe_bucketize_live_table_orders_remote_first() -> Result<()> {
     let mut class = vec![CLS_VRAM; 8];
     class[1] = CLS_PINNED;
     class[5] = CLS_COLD;
-    let got = run_bucketize_live(&dev, &ids, 3, 2, 8, 2, &class, &[], 1)?;
+    let got = run_bucketize_live(&dev, &ids, 3, 2, 8, 2, &class, &[], &DecodeRows::prefix(1))?;
 
     // Pinned e1, cold e5, then VRAM e3 and e6; two remote experts own two tiles.
     assert_eq!(got.header, [4, 6, 4, 2, 2], "header");
@@ -10459,9 +10676,26 @@ fn cuda_moe_bucketize_live_table_orders_remote_first() -> Result<()> {
         "summary"
     );
 
+    // The decode rows are any set of ranges, not only a prefix: token 2 alone
+    // (the last token of a prompt, say) marks e5 and e6, and nothing else
+    // moves.
+    let mut last = DecodeRows::none();
+    last.push(2, 3);
+    let got = run_bucketize_live(&dev, &ids, 3, 2, 8, 2, &class, &[], &last)?;
+    assert_eq!(
+        got.summary,
+        vec![0, 2 | p, 0, 1, 0, 2 | c | d, 1 | d, 0],
+        "summary, token 2 decode"
+    );
+    assert_eq!(
+        got.tile_expert,
+        vec![1, 5, 3, 6, 0, 0],
+        "tile_expert, token 2 decode"
+    );
+
     // An expert whose gate entry names VRAM but whose down entry is 0 is cold:
     // a host retarget caught half-way must never reach a block as an address.
-    let got = run_bucketize_live(&dev, &ids, 3, 2, 8, 2, &class, &[3], 1)?;
+    let got = run_bucketize_live(&dev, &ids, 3, 2, 8, 2, &class, &[3], &DecodeRows::prefix(1))?;
     assert_eq!(got.header, [4, 6, 4, 3, 3], "header, e3 cold");
     assert_eq!(got.tile_b_start, vec![0, 2, 3, 5, 0, 0], "tile_b_start, e3 cold");
     assert_eq!(
@@ -10514,7 +10748,8 @@ fn cuda_moe_bucketize_live_table_orders_remote_first() -> Result<()> {
                 &ids, n_tokens, k, n_experts, 32, &class, decode_tokens,
             );
             let got = run_bucketize_live(
-                &dev, &ids, n_tokens, k, n_experts, 32, &class, &[], decode_tokens,
+                &dev, &ids, n_tokens, k, n_experts, 32, &class, &[],
+                &DecodeRows::prefix(decode_tokens),
             )?;
             let label = format!("{n_tokens}x{k}-e{n_experts}-dense{dense}");
             assert_eq!(got.header, want.header, "{label}: header");
@@ -10736,7 +10971,14 @@ fn live_launch_bit_identical(n_sub: usize) -> Result<()> {
 
     // Reference: every expert in VRAM, no workers.
     let mut ws_ref = MoeBucketizeWorkspace::new(&dev, n_tokens, k)?;
-    moe_bucketize(&t, n_experts, tile_w, &mut ws_ref, None, n_tokens)?;
+    moe_bucketize(
+        &t,
+        n_experts,
+        tile_w,
+        &mut ws_ref,
+        None,
+        &DecodeRows::prefix(n_tokens),
+    )?;
     let want = grouped_qmatmul_dev_q8a128(
         &op, &full_table, 0, n_experts, GgmlDType::Q6_KO, nrows, &ws_ref.tile_expert,
         &ws_ref.tile_b_start, &ws_ref.tile_b_cnt, a_ub, n_sub, None, &dev,
@@ -10793,9 +11035,18 @@ fn live_launch_bit_identical(n_sub: usize) -> Result<()> {
         row: 3,
         promo: Some(ring.ring()),
         remote_dst: dp,
+        started_rows: 0,
+        ticket: 0,
     };
     drop((_g1, _g2, _g3, _g4, _g5, _g6, _g7, _g8, _g9));
-    moe_bucketize(&t, n_experts, tile_w, &mut ws, Some(&blive), n_tokens)?;
+    moe_bucketize(
+        &t,
+        n_experts,
+        tile_w,
+        &mut ws,
+        Some(&blive),
+        &DecodeRows::prefix(n_tokens),
+    )?;
     let table = &snap; // the gate plane: expert_base 0
     let live = MoeLive {
         abort: fx.abort_d,
@@ -10946,7 +11197,14 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
         let n_tokens = ids.len();
         let t = crate::Tensor::from_vec(ids.to_vec(), (n_tokens, 1), &device)?;
         let mut ws = MoeBucketizeWorkspace::new(&dev, n_tokens, 1)?;
-        moe_bucketize(&t, n_experts, 32, &mut ws, None, n_tokens)?;
+        moe_bucketize(
+            &t,
+            n_experts,
+            32,
+            &mut ws,
+            None,
+            &DecodeRows::prefix(n_tokens),
+        )?;
         let a_ub = n_tokens;
         let launch_tiles = a_ub.min(a_ub.div_ceil(32) + n_experts);
         let act: Vec<f32> = (0..a_ub * ncols).map(|i| ((i % 97) as f32 - 48.0) / 50.0).collect();
@@ -11053,7 +11311,7 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
             let ids: Vec<u32> = (0..m as u32).collect();
             let t = crate::Tensor::from_vec(ids.clone(), (m, 1), &device)?;
             let mut ws = MoeBucketizeWorkspace::new(&dev, m, 1)?;
-            moe_bucketize(&t, n_experts, 32, &mut ws, None, m)?;
+            moe_bucketize(&t, n_experts, 32, &mut ws, None, &DecodeRows::prefix(m))?;
             let act: Vec<f32> = (0..m * ncols).map(|i| ((i % 97) as f32 - 48.0) / 50.0).collect();
             let op = quantize_acts_q8a128_test(&dev, &act, m, ncols)?;
             let launch = || {

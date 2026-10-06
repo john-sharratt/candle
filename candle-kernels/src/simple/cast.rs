@@ -110,6 +110,7 @@ extern "C" {
     /// - `info`: Pointer to dims and strides array (dims followed by strides)
     /// - `inp`: Input tensor data pointer
     /// - `out`: Output tensor data pointer
+    /// - `stream`: the stream the launch is issued on
     pub fn run_cast(
         src_dtype: i32,
         dst_dtype: i32,
@@ -118,6 +119,7 @@ extern "C" {
         info: *const usize,
         inp: *const c_void,
         out: *mut c_void,
+        stream: *mut c_void,
     );
 
     // =========================================================================
@@ -134,21 +136,30 @@ extern "C" {
     /// - `dst_dtype`: Destination data type
     /// - `numel`: Number of elements
     /// - `buf`: Buffer pointer (must be large enough for both source and destination)
+    /// - `stream`: the stream the launch is issued on
     ///
     /// # Safety
     /// The buffer must be large enough to hold `numel * max(src_size, dst_size)` bytes.
-    pub fn run_cast_mut(src_dtype: i32, dst_dtype: i32, numel: usize, buf: *mut c_void);
+    pub fn run_cast_mut(
+        src_dtype: i32,
+        dst_dtype: i32,
+        numel: usize,
+        buf: *mut c_void,
+        stream: *mut c_void,
+    );
 
     /// Dispatches to the appropriate in-place cast kernel with explicit mode selection.
     ///
     /// # Parameters
     /// - `mode`: Execution mode (0=auto, 1=single-block, 2=cooperative)
+    /// - `stream`: the stream the launch is issued on
     pub fn run_cast_mut_with_mode(
         src_dtype: i32,
         dst_dtype: i32,
         numel: usize,
         buf: *mut c_void,
         mode: i32,
+        stream: *mut c_void,
     );
 
     /// Widen a contiguous F16 buffer into a separate F32 one.
@@ -166,6 +177,7 @@ extern "C" {
     /// # Parameters
     /// - `inp`: source, `numel` F16 values
     /// - `out`: destination, `numel` f32 values
+    /// - `stream`: the stream the launch is issued on
     ///
     /// # Safety
     /// Both pointers must be device memory valid for `numel` elements of their own type.
@@ -175,6 +187,7 @@ extern "C" {
         numel: usize,
         num_dims: usize,
         info: *const usize,
+        stream: *mut c_void,
     );
 
     /// Widen a contiguous BF16 buffer into a separate F32 one. See [`run_cast_f16_f32`].
@@ -187,6 +200,7 @@ extern "C" {
         numel: usize,
         num_dims: usize,
         info: *const usize,
+        stream: *mut c_void,
     );
 
     /// Returns 1 if cooperative launch is supported on the current device, 0 otherwise.
@@ -208,7 +222,9 @@ extern "C" {
 /// - `inp` points to valid memory of the source dtype with at least `numel` elements
 /// - `out` points to valid memory of the destination dtype with at least `numel` elements
 /// - The memory regions don't overlap (or aliasing is acceptable for the operation)
+/// - `stream` is the stream the launch is issued on
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn dispatch_cast(
     src_dtype: CastDType,
     dst_dtype: CastDType,
@@ -217,6 +233,7 @@ pub unsafe fn dispatch_cast(
     info: *const usize,
     inp: *const c_void,
     out: *mut c_void,
+    stream: *mut c_void,
 ) {
     run_cast(
         src_dtype as i32,
@@ -226,6 +243,7 @@ pub unsafe fn dispatch_cast(
         info,
         inp,
         out,
+        stream,
     );
 }
 
@@ -240,14 +258,16 @@ pub unsafe fn dispatch_cast(
 /// - `buf` points to valid memory with at least `numel * max(src_dtype.size_bytes(), dst_dtype.size_bytes())` bytes
 /// - The buffer is properly aligned for both source and destination types
 /// - No other operations are accessing the buffer during the cast
+/// - `stream` is the stream the launch is issued on
 #[inline]
 pub unsafe fn dispatch_cast_mut(
     src_dtype: CastDType,
     dst_dtype: CastDType,
     numel: usize,
     buf: *mut c_void,
+    stream: *mut c_void,
 ) {
-    run_cast_mut(src_dtype as i32, dst_dtype as i32, numel, buf);
+    run_cast_mut(src_dtype as i32, dst_dtype as i32, numel, buf, stream);
 }
 
 /// Safe wrapper for the in-place cast dispatcher with explicit mode selection
@@ -261,8 +281,16 @@ pub unsafe fn dispatch_cast_mut_with_mode(
     numel: usize,
     buf: *mut c_void,
     mode: CastMutMode,
+    stream: *mut c_void,
 ) {
-    run_cast_mut_with_mode(src_dtype as i32, dst_dtype as i32, numel, buf, mode as i32);
+    run_cast_mut_with_mode(
+        src_dtype as i32,
+        dst_dtype as i32,
+        numel,
+        buf,
+        mode as i32,
+        stream,
+    );
 }
 
 // =============================================================================

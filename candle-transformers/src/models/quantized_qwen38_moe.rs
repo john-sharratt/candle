@@ -2096,8 +2096,15 @@ mod tests {
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
 
-        let params = TestParams::new(64, &tokenizer_json()?, Dialect::qwen35())
+        // 256 tokens, not 64: a wide prefill concedes the expert zone (to 11 GB
+        // at ×8 and 5 GB at ×16 on a 24 GB card), and the decode behind it
+        // rebuilds its working set over its first steps. At 64 tokens — 13
+        // speculative steps — that recovery was a third of the decode, so the
+        // rate measured the pivot rather than the decode. C10, the calibration
+        // probe, stays at the 64 its threshold row was derived against.
+        let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
             .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_top_rung_tokens(64)
             .with_suppress_thinking(true)
             .with_print_outputs(true)
             .with_int8mode(int8mode)

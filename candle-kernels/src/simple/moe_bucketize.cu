@@ -61,9 +61,18 @@
 // them and `header[4]` counts their tiles. `counters[0..3]` — the work counters
 // of the layer's gate, up and down launches — are zeroed here.
 //
-// PROMOTION: each remote expert, in list order, takes the next free VRAM slot
-// image from the promotion ring while it has one (`remote_dst[i]`, else 0),
-// and the ring's log records `summary_seq << 32 | row << 16 | expert` for it.
+// PROMOTION: each remote expert a decode-scored token routed, in list order,
+// takes the next free VRAM slot image from the promotion ring while it has one
+// (`remote_dst[i]`, else 0). A prompt-only expert takes one only while the ring
+// holds more than its `reserve` (a mapped word the host sets; a null address
+// means never). Where the zone has room for prompts the host sets it to 0 and a
+// prompt takes any stocked slot; where it has not, the host sets it to the
+// ring's whole stock target, which it stocks to and no further, so the stock
+// is decode's and a prompt — which sweeps the table about once — is served by
+// the workers' copies instead of evicting decode's working set. Only the brief
+// window after the target shrinks, before the host trims the surplus, lets a
+// prompt-only expert through there. The ring's log records
+// `summary_seq << 32 | row << 16 | expert` for each slot taken.
 // The expert's mark (`promo_marks[row][expert]`) is set with it and cleared by
 // the host when the promotion lands; a marked expert is not given a second
 // slot by a later invocation that finds it still remote. The grouped GEMMs'
@@ -72,8 +81,9 @@
 //
 // The ROUTING SUMMARY (`summary`, optional) is what the host learns about the
 // layer: `count | pinned << 29 | cold << 30 | decode << 31` per expert, where
-// `decode` marks an expert some assignment of a token `< decode_tokens` routed
-// to, then `summary_seq` in the word after them. The buffer is mapped host
+// `decode` marks an expert some assignment of a decode-scored token routed to
+// (one inside a `decode` range — the residency scoring weights such tokens'
+// experts as a decode step's), then `summary_seq` in the word after them. The buffer is mapped host
 // memory: the host polls the sequence word and reads the counts in place, with
 // no copy and no event.
 //
@@ -85,6 +95,7 @@
 // =============================================================================
 
 #include <stdint.h>
+#include <stdio.h>
 
 // 256 threads; every per-expert phase strides over `n_experts`, so the expert
 // count is independent of the block width. Phase 3 is one-thread-per-chunk.
@@ -101,6 +112,15 @@
 // Phase-3 chunk-table budget (ints). NCHUNK = SH_CC_INTS / n_experts chunks.
 #define SH_CC_INTS 8192
 #define SH_CC_MAX_CHUNK 128
+// The token ranges `[lo, hi)` scored as decode, passed by value in the launch
+// parameters: a wave's decode rows, its verify segments, and the last token of
+// each prompt — the token the sequence's decode continues from.
+#define MAX_DECODE_RANGES 32
+struct DecodeRanges {
+    uint32_t n;
+    uint32_t lo[MAX_DECODE_RANGES];
+    uint32_t hi[MAX_DECODE_RANGES];
+};
 // Where an expert's gate entry points.
 #define CLS_VRAM 0
 #define CLS_PINNED 1
@@ -135,7 +155,7 @@ extern "C" __global__ void moe_bucketize_kernel(
     // The two pinned host ranges `[lo, hi)` a remote entry lies in.
     const uint64_t pinned0_lo, const uint64_t pinned0_hi,
     const uint64_t pinned1_lo, const uint64_t pinned1_hi,
-    const int decode_tokens,             // tokens [0, decode_tokens) are decode rows
+    const DecodeRanges decode,           // the tokens scored as decode rows
     uint32_t* __restrict__ summary,      // [n_experts + 1] routing summary, or null
     const uint32_t summary_seq,          // stored at summary[n_experts] last
     int32_t* __restrict__ remote,        // [n_experts][4] remote list, or null
@@ -154,8 +174,16 @@ extern "C" __global__ void moe_bucketize_kernel(
     // is in flight — set here when a slot is given, cleared by the host when
     // it lands — so a later invocation does not promote it a second time.
     uint32_t* promo_marks,
+    // Mapped `u32`: the stock kept for decode-scored experts — a prompt-only
+    // expert takes a slot only while more than this is stocked. Null = never.
+    const uint32_t* promo_reserve,
     const int32_t row,                   // this layer's row, for the log
-    uint64_t* __restrict__ remote_dst)   // [n_experts] promotion slot per remote expert, or null
+    uint64_t* __restrict__ remote_dst,   // [n_experts] promotion slot per remote expert, or null
+    // `[rows]` started words (mapped), or null: `ticket` is stored into
+    // `started_rows[row]` before any live entry is read — the host's reclaim
+    // rule pairs its retarget-then-read with this store-then-read.
+    uint64_t* started_rows,
+    const uint64_t ticket)
 {
     const int tid = (int)threadIdx.x;
     const int a_ub = n_tokens * k;
@@ -195,9 +223,18 @@ extern "C" __global__ void moe_bucketize_kernel(
         const uint32_t e = topk_ids[i];
         if (e < (uint32_t)n_experts) {
             atomicAdd(&sh_counts[e], 1);
-            // Every writer stores the same 1, so the race is benign.
-            if (i / k < decode_tokens) {
-                sh_dec[e] = 1;
+            // Every writer stores the same 1, so the race is benign. An expert
+            // already marked needs no range scan — a stale 0 read only costs
+            // one — which keeps a wide prefill's many assignments to the
+            // same experts off the per-range loop.
+            if (!sh_dec[e]) {
+                const uint32_t t = (uint32_t)(i / k);
+                for (uint32_t r = 0; r < decode.n; r++) {
+                    if (t >= decode.lo[r] && t < decode.hi[r]) {
+                        sh_dec[e] = 1;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -213,6 +250,20 @@ extern "C" __global__ void moe_bucketize_kernel(
     // any of its three entries 0 — is the one exception: its workers wait on
     // the live gate entry and read the live up / down entries, which the host
     // publishes before it and never clears while this layer can read them.
+    //
+    // Before the first read, this invocation's ticket goes into its row's
+    // started word, and the fence orders it ahead of every entry load. The host
+    // retargets an entry, fences, then reads the word: so either it sees this
+    // ticket and holds the old slot until this invocation is done, or the loads
+    // below see the retargeted entry. That is what lets the host key slot reuse
+    // on the invocation the device is inside, not on what is queued behind it.
+    if (gate_row != nullptr && started_rows != nullptr) {
+        if (tid == 0) {
+            ((volatile uint64_t*)started_rows)[row] = ticket;
+        }
+        __threadfence_system();
+        __syncthreads();
+    }
     if (gate_row != nullptr) {
         for (int e = tid; e < n_experts; e += BUCKETIZE_THREADS) {
             if (sh_counts[e] == 0) {
@@ -256,9 +307,13 @@ extern "C" __global__ void moe_bucketize_kernel(
     if (tid == 0) {
         uint32_t head = 0;
         uint32_t tail = 0;
+        uint32_t reserve = 0xffffffffu;
         if (promo_slots != nullptr) {
             head = *(volatile const uint32_t*)promo_head;
             tail = *(volatile const uint32_t*)promo_tail;
+            if (promo_reserve != nullptr) {
+                reserve = *(volatile const uint32_t*)promo_reserve;
+            }
             // The slots the host published before its tail store.
             __threadfence_system();
         }
@@ -290,7 +345,8 @@ extern "C" __global__ void moe_bucketize_kernel(
                     remote[4 * n_remote + 3] = order[pass] == CLS_COLD;
                     if (remote_dst != nullptr) {
                         uint64_t dst = 0ull;
-                        if (promo_slots != nullptr && head != tail && !sh_marked[e]) {
+                        if (promo_slots != nullptr && head != tail && !sh_marked[e] &&
+                            (sh_dec[e] || tail - head > reserve)) {
                             const uint32_t i = head % promo_cap;
                             dst = ((const volatile uint64_t*)promo_slots)[i];
                             ((volatile uint64_t*)promo_log)[i] =
@@ -506,9 +562,15 @@ extern "C" __global__ void moe_bucketize_kernel(
 }
 
 // Single-block launch: one BUCKETIZE_THREADS-wide block over ≤ MAX_EXPERTS
-// experts. `stream` is the caller's compute stream, so the outputs are ordered
+// experts. `stream` is the caller's launch stream — the compute stream, or the
+// capture stream while the forward is recorded — so the outputs are ordered
 // after the router's writes with no host synchronisation.
-extern "C" void run_moe_bucketize(
+//
+// Returns 0 when the kernel was launched, 1 when an argument guard refused it
+// (nothing written: the workspace still holds the previous layer's tables), 2
+// when the launch itself returned an error, and 3 when an earlier launch on
+// this thread had left an error pending (nothing launched).
+extern "C" int32_t run_moe_bucketize(
     const void* topk_ids,
     int32_t n_tokens,
     int32_t k,
@@ -532,7 +594,9 @@ extern "C" void run_moe_bucketize(
     uint64_t pinned0_hi,
     uint64_t pinned1_lo,
     uint64_t pinned1_hi,
-    int32_t decode_tokens,
+    const uint32_t* decode_lo,
+    const uint32_t* decode_hi,
+    int32_t decode_ranges,
     void* summary,
     uint32_t summary_seq,
     void* remote,
@@ -543,16 +607,36 @@ extern "C" void run_moe_bucketize(
     const void* promo_tail,
     uint32_t promo_cap,
     void* promo_marks,
+    const void* promo_reserve,
     int32_t row,
     void* remote_dst,
+    void* started_rows,
+    uint64_t ticket,
     void* stream)
 {
     if (n_tokens <= 0 || k <= 0 || k > MAX_TOPK || n_experts <= 0 ||
         n_experts > MAX_EXPERTS || tile_w <= 0 || (gate_row != nullptr && snap == nullptr) ||
         (promo_slots != nullptr && (promo_cap == 0 || promo_log == nullptr ||
                                     promo_head == nullptr || promo_tail == nullptr ||
-                                    promo_marks == nullptr || remote_dst == nullptr))) {
-        return;
+                                    promo_marks == nullptr || remote_dst == nullptr)) ||
+        decode_ranges < 0 || decode_ranges > MAX_DECODE_RANGES ||
+        (decode_ranges > 0 && (decode_lo == nullptr || decode_hi == nullptr))) {
+        return 1;
+    }
+    DecodeRanges decode;
+    decode.n = (uint32_t)decode_ranges;
+    for (int r = 0; r < MAX_DECODE_RANGES; r++) {
+        decode.lo[r] = r < decode_ranges ? decode_lo[r] : 0u;
+        decode.hi[r] = r < decode_ranges ? decode_hi[r] : 0u;
+    }
+    // An error a PRIOR launch left on this thread is reported, not cleared:
+    // most launchers return nothing, so this checked launch is where a node
+    // dropped from the segment before it surfaces. Reading it also clears it,
+    // so the check below reports this launch and nothing else.
+    cudaError_t earlier = cudaGetLastError();
+    if (earlier != cudaSuccess) {
+        fprintf(stderr, "moe_bucketize: an earlier launch failed: %s\n", cudaGetErrorString(earlier));
+        return 3;
     }
     moe_bucketize_kernel<<<1, BUCKETIZE_THREADS, 0, (cudaStream_t)stream>>>(
         (const uint32_t*)topk_ids, n_tokens, k, n_experts, tile_w,
@@ -561,9 +645,16 @@ extern "C" void run_moe_bucketize(
         (uint32_t*)rw_ids, (int32_t*)token_starts, (int32_t*)header,
         (uint32_t*)inv, (int32_t*)scan, (const uint64_t*)gate_row,
         (long long)table_plane, (uint64_t*)snap, pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi,
-        decode_tokens, (uint32_t*)summary, summary_seq,
+        decode, (uint32_t*)summary, summary_seq,
         (int32_t*)remote, (int32_t*)counters,
         (const uint64_t*)promo_slots, (uint64_t*)promo_log, (uint32_t*)promo_head,
-        (const uint32_t*)promo_tail, promo_cap, (uint32_t*)promo_marks, row,
-        (uint64_t*)remote_dst);
+        (const uint32_t*)promo_tail, promo_cap, (uint32_t*)promo_marks,
+        (const uint32_t*)promo_reserve, row,
+        (uint64_t*)remote_dst, (uint64_t*)started_rows, ticket);
+    cudaError_t launched = cudaPeekAtLastError();
+    if (launched != cudaSuccess) {
+        fprintf(stderr, "moe_bucketize: launch failed: %s\n", cudaGetErrorString(launched));
+        return 2;
+    }
+    return 0;
 }

@@ -351,7 +351,8 @@ __host__ static int get_coop_block_count(cast_mut_fn_t kernel) {
 __host__ static void launch_cast_mut(
     const cast_mut_kernel_pair& kernels,
     size_t numel,
-    void* buf
+    void* buf,
+    cudaStream_t stream
 ) {
     if (kernels.fallback == nullptr) {
         return;  // Unsupported conversion
@@ -359,7 +360,7 @@ __host__ static void launch_cast_mut(
     
     // Fast path for small tensors - single block is more efficient
     if (numel <= SMALL_TENSOR_THRESHOLD) {
-        kernels.fallback<<<1, CAST_MUT_BLOCK_SIZE>>>(numel, buf);
+        kernels.fallback<<<1, CAST_MUT_BLOCK_SIZE, 0, stream>>>(numel, buf);
         return;
     }
     
@@ -379,7 +380,7 @@ __host__ static void launch_cast_mut(
             dim3(CAST_MUT_BLOCK_SIZE),
             args,
             0,  // shared memory
-            0   // stream (default)
+            stream
         );
         
         if (err == cudaSuccess) {
@@ -389,7 +390,7 @@ __host__ static void launch_cast_mut(
     }
     
     // Single-block fallback
-    kernels.fallback<<<1, CAST_MUT_BLOCK_SIZE>>>(numel, buf);
+    kernels.fallback<<<1, CAST_MUT_BLOCK_SIZE, 0, stream>>>(numel, buf);
 }
 
 // =============================================================================
@@ -513,25 +514,27 @@ extern "C" void run_cast(
     size_t num_dims,
     const size_t* info,
     const void* inp,
-    void* out
+    void* out,
+    void* stream
 ) {
     // Nothing to cast is not a launch. A zero grid is `cudaErrorInvalidConfiguration`,
     // which nothing here reads: it stays pending on the thread until the next
     // runtime-API caller that checks `cudaGetLastError` takes it as its own.
     if (numel == 0) return;
     int grid = cast_grid_size(numel);
+    cudaStream_t s = (cudaStream_t)stream;
 
     // Identity casts
     if (src_dtype == dst_dtype) {
         switch (src_dtype) {
-            case 0: cast_f32_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const float*)inp, (float*)out); break;
-            case 1: cast_f64_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const double*)inp, (double*)out); break;
-            case 2: cast_u8_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint8_t*)inp, (uint8_t*)out); break;
-            case 3: cast_u32_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint32_t*)inp, (uint32_t*)out); break;
-            case 4: cast_i64_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const int64_t*)inp, (int64_t*)out); break;
-            case 5: cast_f16_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __half*)inp, (__half*)out); break;
-            case 6: cast_bf16_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_bfloat16*)out); break;
-            case 7: cast_f8_e4m3_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (__nv_fp8_e4m3*)out); break;
+            case 0: cast_f32_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const float*)inp, (float*)out); break;
+            case 1: cast_f64_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const double*)inp, (double*)out); break;
+            case 2: cast_u8_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint8_t*)inp, (uint8_t*)out); break;
+            case 3: cast_u32_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint32_t*)inp, (uint32_t*)out); break;
+            case 4: cast_i64_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const int64_t*)inp, (int64_t*)out); break;
+            case 5: cast_f16_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (__half*)out); break;
+            case 6: cast_bf16_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_bfloat16*)out); break;
+            case 7: cast_f8_e4m3_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (__nv_fp8_e4m3*)out); break;
         }
         return;
     }
@@ -539,102 +542,102 @@ extern "C" void run_cast(
     // From f32
     if (src_dtype == 0) {
         switch (dst_dtype) {
-            case 1: cast_f32_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const float*)inp, (double*)out); break;
-            case 2: cast_f32_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const float*)inp, (uint8_t*)out); break;
-            case 3: cast_f32_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const float*)inp, (uint32_t*)out); break;
-            case 4: cast_f32_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const float*)inp, (int64_t*)out); break;
-            case 5: cast_f32_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const float*)inp, (__half*)out); break;
-            case 6: cast_f32_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const float*)inp, (__nv_bfloat16*)out); break;
-            case 7: cast_f32_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const float*)inp, (__nv_fp8_e4m3*)out); break;
+            case 1: cast_f32_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const float*)inp, (double*)out); break;
+            case 2: cast_f32_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const float*)inp, (uint8_t*)out); break;
+            case 3: cast_f32_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const float*)inp, (uint32_t*)out); break;
+            case 4: cast_f32_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const float*)inp, (int64_t*)out); break;
+            case 5: cast_f32_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const float*)inp, (__half*)out); break;
+            case 6: cast_f32_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const float*)inp, (__nv_bfloat16*)out); break;
+            case 7: cast_f32_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const float*)inp, (__nv_fp8_e4m3*)out); break;
         }
         return;
     }
     // From f64
     if (src_dtype == 1) {
         switch (dst_dtype) {
-            case 0: cast_f64_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const double*)inp, (float*)out); break;
-            case 2: cast_f64_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const double*)inp, (uint8_t*)out); break;
-            case 3: cast_f64_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const double*)inp, (uint32_t*)out); break;
-            case 4: cast_f64_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const double*)inp, (int64_t*)out); break;
-            case 5: cast_f64_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const double*)inp, (__half*)out); break;
-            case 6: cast_f64_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const double*)inp, (__nv_bfloat16*)out); break;
-            case 7: cast_f64_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const double*)inp, (__nv_fp8_e4m3*)out); break;
+            case 0: cast_f64_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const double*)inp, (float*)out); break;
+            case 2: cast_f64_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const double*)inp, (uint8_t*)out); break;
+            case 3: cast_f64_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const double*)inp, (uint32_t*)out); break;
+            case 4: cast_f64_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const double*)inp, (int64_t*)out); break;
+            case 5: cast_f64_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const double*)inp, (__half*)out); break;
+            case 6: cast_f64_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const double*)inp, (__nv_bfloat16*)out); break;
+            case 7: cast_f64_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const double*)inp, (__nv_fp8_e4m3*)out); break;
         }
         return;
     }
     // From u8
     if (src_dtype == 2) {
         switch (dst_dtype) {
-            case 0: cast_u8_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint8_t*)inp, (float*)out); break;
-            case 1: cast_u8_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint8_t*)inp, (double*)out); break;
-            case 3: cast_u8_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint8_t*)inp, (uint32_t*)out); break;
-            case 4: cast_u8_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint8_t*)inp, (int64_t*)out); break;
-            case 5: cast_u8_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint8_t*)inp, (__half*)out); break;
-            case 6: cast_u8_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint8_t*)inp, (__nv_bfloat16*)out); break;
-            case 7: cast_u8_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint8_t*)inp, (__nv_fp8_e4m3*)out); break;
+            case 0: cast_u8_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint8_t*)inp, (float*)out); break;
+            case 1: cast_u8_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint8_t*)inp, (double*)out); break;
+            case 3: cast_u8_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint8_t*)inp, (uint32_t*)out); break;
+            case 4: cast_u8_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint8_t*)inp, (int64_t*)out); break;
+            case 5: cast_u8_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint8_t*)inp, (__half*)out); break;
+            case 6: cast_u8_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint8_t*)inp, (__nv_bfloat16*)out); break;
+            case 7: cast_u8_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint8_t*)inp, (__nv_fp8_e4m3*)out); break;
         }
         return;
     }
     // From u32
     if (src_dtype == 3) {
         switch (dst_dtype) {
-            case 0: cast_u32_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint32_t*)inp, (float*)out); break;
-            case 1: cast_u32_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint32_t*)inp, (double*)out); break;
-            case 2: cast_u32_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint32_t*)inp, (uint8_t*)out); break;
-            case 4: cast_u32_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint32_t*)inp, (int64_t*)out); break;
-            case 5: cast_u32_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint32_t*)inp, (__half*)out); break;
-            case 6: cast_u32_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint32_t*)inp, (__nv_bfloat16*)out); break;
-            case 7: cast_u32_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const uint32_t*)inp, (__nv_fp8_e4m3*)out); break;
+            case 0: cast_u32_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint32_t*)inp, (float*)out); break;
+            case 1: cast_u32_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint32_t*)inp, (double*)out); break;
+            case 2: cast_u32_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint32_t*)inp, (uint8_t*)out); break;
+            case 4: cast_u32_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint32_t*)inp, (int64_t*)out); break;
+            case 5: cast_u32_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint32_t*)inp, (__half*)out); break;
+            case 6: cast_u32_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint32_t*)inp, (__nv_bfloat16*)out); break;
+            case 7: cast_u32_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const uint32_t*)inp, (__nv_fp8_e4m3*)out); break;
         }
         return;
     }
     // From i64
     if (src_dtype == 4) {
         switch (dst_dtype) {
-            case 0: cast_i64_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const int64_t*)inp, (float*)out); break;
-            case 1: cast_i64_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const int64_t*)inp, (double*)out); break;
-            case 2: cast_i64_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const int64_t*)inp, (uint8_t*)out); break;
-            case 3: cast_i64_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const int64_t*)inp, (uint32_t*)out); break;
-            case 5: cast_i64_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const int64_t*)inp, (__half*)out); break;
-            case 6: cast_i64_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const int64_t*)inp, (__nv_bfloat16*)out); break;
-            case 7: cast_i64_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const int64_t*)inp, (__nv_fp8_e4m3*)out); break;
+            case 0: cast_i64_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const int64_t*)inp, (float*)out); break;
+            case 1: cast_i64_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const int64_t*)inp, (double*)out); break;
+            case 2: cast_i64_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const int64_t*)inp, (uint8_t*)out); break;
+            case 3: cast_i64_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const int64_t*)inp, (uint32_t*)out); break;
+            case 5: cast_i64_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const int64_t*)inp, (__half*)out); break;
+            case 6: cast_i64_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const int64_t*)inp, (__nv_bfloat16*)out); break;
+            case 7: cast_i64_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const int64_t*)inp, (__nv_fp8_e4m3*)out); break;
         }
         return;
     }
     // From f16
     if (src_dtype == 5) {
         switch (dst_dtype) {
-            case 0: cast_f16_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __half*)inp, (float*)out); break;
-            case 1: cast_f16_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __half*)inp, (double*)out); break;
-            case 2: cast_f16_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __half*)inp, (uint8_t*)out); break;
-            case 3: cast_f16_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __half*)inp, (uint32_t*)out); break;
-            case 6: cast_f16_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __half*)inp, (__nv_bfloat16*)out); break;
-            case 7: cast_f16_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __half*)inp, (__nv_fp8_e4m3*)out); break;
+            case 0: cast_f16_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (float*)out); break;
+            case 1: cast_f16_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (double*)out); break;
+            case 2: cast_f16_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (uint8_t*)out); break;
+            case 3: cast_f16_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (uint32_t*)out); break;
+            case 6: cast_f16_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (__nv_bfloat16*)out); break;
+            case 7: cast_f16_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __half*)inp, (__nv_fp8_e4m3*)out); break;
         }
         return;
     }
     // From bf16
     if (src_dtype == 6) {
         switch (dst_dtype) {
-            case 0: cast_bf16_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (float*)out); break;
-            case 1: cast_bf16_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (double*)out); break;
-            case 2: cast_bf16_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (uint8_t*)out); break;
-            case 3: cast_bf16_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (uint32_t*)out); break;
-            case 5: cast_bf16_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__half*)out); break;
-            case 7: cast_bf16_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_fp8_e4m3*)out); break;
+            case 0: cast_bf16_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (float*)out); break;
+            case 1: cast_bf16_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (double*)out); break;
+            case 2: cast_bf16_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (uint8_t*)out); break;
+            case 3: cast_bf16_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (uint32_t*)out); break;
+            case 5: cast_bf16_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__half*)out); break;
+            case 7: cast_bf16_f8_e4m3<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_bfloat16*)inp, (__nv_fp8_e4m3*)out); break;
         }
         return;
     }
     // From f8_e4m3
     if (src_dtype == 7) {
         switch (dst_dtype) {
-            case 0: cast_f8_e4m3_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (float*)out); break;
-            case 1: cast_f8_e4m3_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (double*)out); break;
-            case 2: cast_f8_e4m3_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (uint8_t*)out); break;
-            case 3: cast_f8_e4m3_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (uint32_t*)out); break;
-            case 4: cast_f8_e4m3_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (int64_t*)out); break;
-            case 5: cast_f8_e4m3_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (__half*)out); break;
-            case 6: cast_f8_e4m3_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (__nv_bfloat16*)out); break;
+            case 0: cast_f8_e4m3_f32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (float*)out); break;
+            case 1: cast_f8_e4m3_f64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (double*)out); break;
+            case 2: cast_f8_e4m3_u8<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (uint8_t*)out); break;
+            case 3: cast_f8_e4m3_u32<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (uint32_t*)out); break;
+            case 4: cast_f8_e4m3_i64<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (int64_t*)out); break;
+            case 5: cast_f8_e4m3_f16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (__half*)out); break;
+            case 6: cast_f8_e4m3_bf16<<<grid, CAST_BLOCK_SIZE_LAUNCH, 0, s>>>(numel, num_dims, info, (const __nv_fp8_e4m3*)inp, (__nv_bfloat16*)out); break;
         }
         return;
     }
@@ -645,10 +648,11 @@ extern "C" void run_cast_mut(
     int32_t src_dtype,
     int32_t dst_dtype,
     size_t numel,
-    void* buf
+    void* buf,
+    void* stream
 ) {
     if (src_dtype >= 0 && src_dtype < 8 && dst_dtype >= 0 && dst_dtype < 8) {
-        launch_cast_mut(CAST_MUT_KERNELS[src_dtype][dst_dtype], numel, buf);
+        launch_cast_mut(CAST_MUT_KERNELS[src_dtype][dst_dtype], numel, buf, (cudaStream_t)stream);
     }
 }
 
@@ -664,7 +668,8 @@ __host__ static void launch_cast_mut_with_mode(
     const cast_mut_kernel_pair& kernels,
     size_t numel,
     void* buf,
-    int32_t mode
+    int32_t mode,
+    cudaStream_t stream
 ) {
     if (kernels.fallback == nullptr) {
         return;
@@ -672,7 +677,7 @@ __host__ static void launch_cast_mut_with_mode(
     
     switch (mode) {
         case CAST_MUT_MODE_SINGLE_BLOCK:
-            kernels.fallback<<<1, CAST_MUT_BLOCK_SIZE>>>(numel, buf);
+            kernels.fallback<<<1, CAST_MUT_BLOCK_SIZE, 0, stream>>>(numel, buf);
             break;
             
         case CAST_MUT_MODE_COOPERATIVE:
@@ -689,16 +694,16 @@ __host__ static void launch_cast_mut_with_mode(
                     dim3(CAST_MUT_BLOCK_SIZE),
                     args,
                     0,
-                    0
+                    stream
                 );
             } else {
-                kernels.fallback<<<1, CAST_MUT_BLOCK_SIZE>>>(numel, buf);
+                kernels.fallback<<<1, CAST_MUT_BLOCK_SIZE, 0, stream>>>(numel, buf);
             }
             break;
             
         case CAST_MUT_MODE_AUTO:
         default:
-            launch_cast_mut(kernels, numel, buf);
+            launch_cast_mut(kernels, numel, buf, stream);
             break;
     }
 }
@@ -709,12 +714,13 @@ extern "C" void run_cast_mut_with_mode(
     int32_t dst_dtype,
     size_t numel,
     void* buf,
-    int32_t mode
+    int32_t mode,
+    void* stream
 ) {
     if (src_dtype < 0 || src_dtype >= 8 || dst_dtype < 0 || dst_dtype >= 8) {
         return;
     }
-    launch_cast_mut_with_mode(CAST_MUT_KERNELS[src_dtype][dst_dtype], numel, buf, mode);
+    launch_cast_mut_with_mode(CAST_MUT_KERNELS[src_dtype][dst_dtype], numel, buf, mode, (cudaStream_t)stream);
 }
 
 // =============================================================================

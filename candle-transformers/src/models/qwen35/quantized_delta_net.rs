@@ -13,6 +13,8 @@
 //! layer's FFN sees — so rather than reshape the shared trait around a hybrid,
 //! the ten lines that drive it live here.
 
+#[cfg(feature = "cuda")]
+use candle::quantized::decode_rows::DecodeRows;
 use candle::Result;
 #[cfg(feature = "cuda")]
 use candle::{quantized::Int8Mode, DType, Device};
@@ -46,7 +48,7 @@ pub fn quantized_delta_net_ffn(
     act_dtype: DType,
     orig_dtype: DType,
     lora: LayerLora<'_>,
-    decode_tokens: usize,
+    decode: &DecodeRows,
 ) -> Result<()> {
     // MLP intermediates can exceed F16's range, so accumulate in BF16 there.
     let mlp_dtype = if act_dtype == DType::F16 {
@@ -94,7 +96,7 @@ pub fn quantized_delta_net_ffn(
                 x.as_cat_tensor_mut(),
                 acts,
                 mlp_dtype,
-                decode_tokens,
+                decode,
                 ffn_wave.as_ref(),
             )?;
             x.as_cat_tensor().assert("ffn.moe_residual");

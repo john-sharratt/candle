@@ -25,6 +25,7 @@ extern "C" {
         outer: f32,
         fmt: c_int,
         is_k: c_int,
+        stream: *mut c_void,
     );
 }
 
@@ -123,6 +124,7 @@ fn the_register_round_trip_matches_the_bytes_bit_for_bit() {
                             outer,
                             tag,
                             is_k,
+                            stream.cu_stream() as *mut c_void,
                         );
                     }
                 }

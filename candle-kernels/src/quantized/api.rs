@@ -161,6 +161,8 @@ pub enum MatmulStatus {
     NoKernel,
     BadOutDType,
     BadSplit,
+    BadTileMode,
+    LaunchFailed,
     Unknown(i32),
 }
 
@@ -174,6 +176,8 @@ impl MatmulStatus {
             4 => Self::NoKernel,
             5 => Self::BadOutDType,
             6 => Self::BadSplit,
+            7 => Self::BadTileMode,
+            8 => Self::LaunchFailed,
             other => Self::Unknown(other),
         }
     }
@@ -188,6 +192,8 @@ impl MatmulStatus {
             Self::NoKernel => Some("no kernel for this (format, output dtype) pair"),
             Self::BadOutDType => Some("unsupported output dtype"),
             Self::BadSplit => Some("split-K depth out of range, or a format that never splits"),
+            Self::BadTileMode => Some("int8 token-tile width with no kernel"),
+            Self::LaunchFailed => Some("the kernel launch returned an error"),
             Self::Unknown(_) => Some("unrecognised launcher status"),
         }
     }
@@ -231,6 +237,9 @@ extern "C" {
         // The activation operand's `SumScale::as_code()` — 0 raw Σx, 1 Σx/amax.
         // Read by the int8 dense path only; the FP kernels carry no q8a128 header.
         sum_norm: i32,
+        // The stream every launch is issued on: the device's compute stream, or a
+        // capture stream when the launches are being recorded into a graph.
+        stream: *mut c_void,
     ) -> i32;
 
     /// Split-K int8 dense matmul: q8a128 activations `[M, K]` × one KO weight `[N, K]` →
@@ -257,6 +266,7 @@ extern "C" {
         splits: i32,
         ws: *mut f32,
         counters: *mut u32,
+        stream: *mut c_void,
     ) -> i32;
 
     /// Fused-activation int8 dense matmul for a Q8_KO weight `[N, K]`:
@@ -275,6 +285,7 @@ extern "C" {
         total_batch: i32,
         sum_norm: i32,
         mode2: i32,
+        stream: *mut c_void,
     ) -> i32;
 
     /// Segmented qkv int8 dense matmul: one launch over a shared q8a128 activation × up to 3 KO
@@ -300,6 +311,8 @@ extern "C" {
         out_dtype: i32,
         // The activation operand's `SumScale::as_code()` — 0 raw Σx, 1 Σx/amax.
         sum_norm: i32,
+        // The stream the launch is issued on.
+        stream: *mut c_void,
     ) -> i32;
 
     /// Single-launch grouped matmul over all MoE expert tiles.
@@ -344,7 +357,7 @@ extern "C" {
         live: *const MoeLive,
         // The stream to launch on — the device handle's own.
         stream: *mut c_void,
-    );
+    ) -> i32;
 
     /// Repack quantized weights to GEMX format (K/128 with embedded scales).
     ///
@@ -407,6 +420,7 @@ extern "C" {
     /// - `nrows`: Number of rows
     /// - `ncols`: Number of columns (must be multiple of block size)
     /// - `qtype`: Quantization type (0-9, see QType enum)
+    /// - `stream`: the stream the launch is issued on
     ///
     /// Note: K/128 blocks have embedded scales - no external scales parameter.
     ///
@@ -418,6 +432,7 @@ extern "C" {
         nrows: i32,
         ncols: i32,
         qtype: i32,
+        stream: *mut c_void,
     ) -> i32;
 
     /// Get the output size (in floats) for dequantizing a tensor.
@@ -515,6 +530,42 @@ pub fn dispatch_info(batch_size: i32, weight_bytes: usize) -> String {
     let len = result as usize;
     let bytes: Vec<u8> = buffer[..len].iter().map(|&c| c as u8).collect();
     String::from_utf8_lossy(&bytes).to_string()
+}
+
+#[cfg(test)]
+mod matmul_status_tests {
+    //! Pin every status code to its variant. The values are the `QMM_*` defines in
+    //! `matmul_status.cuh`; a drift on either side turns a refused launch into a
+    //! different refusal — or into `Ok`.
+    use super::MatmulStatus;
+
+    #[test]
+    fn every_launcher_status_maps_to_its_variant() {
+        let expected = [
+            (0, MatmulStatus::Ok),
+            (1, MatmulStatus::BadQType),
+            (2, MatmulStatus::NoSegments),
+            (3, MatmulStatus::BadYType),
+            (4, MatmulStatus::NoKernel),
+            (5, MatmulStatus::BadOutDType),
+            (6, MatmulStatus::BadSplit),
+            (7, MatmulStatus::BadTileMode),
+            (8, MatmulStatus::LaunchFailed),
+            (9, MatmulStatus::Unknown(9)),
+        ];
+        for (code, status) in expected {
+            assert_eq!(MatmulStatus::from_code(code), status, "code {code}");
+        }
+    }
+
+    /// Only `Ok` means a kernel ran; every other code is a reason.
+    #[test]
+    fn only_ok_is_not_a_failure() {
+        for code in 0..=9 {
+            let failed = MatmulStatus::from_code(code).failure().is_some();
+            assert_eq!(failed, code != 0, "code {code}");
+        }
+    }
 }
 
 #[cfg(test)]

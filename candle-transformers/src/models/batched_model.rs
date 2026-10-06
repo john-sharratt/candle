@@ -64,6 +64,7 @@ use super::head_rows::select_head_rows;
 use super::lazy_rope::LazyRope;
 use super::prefill_utils::SharedPm;
 use super::quantized_matmul::QMatMul;
+use super::residency_rows::residency_decode_rows;
 use super::rope_schedule::{RopeRungs, RopeSchedule};
 use super::rope_tables::CisPrecomputations;
 use super::tensor_cat::TensorCat;
@@ -518,7 +519,6 @@ pub trait BatchedModelCore {
 
 /// Chunk size for extending RoPE tables.
 const ROPE_EXTEND_CHUNK: usize = 1024;
-
 /// Free KV regions a wave wants beyond one per sequence, before phase 0 stops
 /// asking the weight side for ground.
 ///
@@ -1073,6 +1073,15 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &glue_pm,
         );
 
+        // The rows the routed experts' residency scores as decode: the decode
+        // rows and each prompt's last row (`residency_rows`; this lineage has
+        // no verify segments).
+        let decode_like =
+            residency_decode_rows(n_decode, pre_q.iter().map(|&rows| (0, rows)), |_| false);
+        // Everything above — admission, the tier, the tables, the embedding — ran
+        // eagerly. The layers and the head are recorded as a chain of graphs
+        // (`docs/decode_graphs.md`), cut where a layer meets the host.
+        dev.record_launches()?;
         for layer_idx in layer_start..layer_end {
             let mut cache_refs: Vec<&mut KvCache> = contexts
                 .iter_mut()
@@ -1119,7 +1128,19 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 &mut x,
                 embed_dtype,
                 layer_idx,
+                &decode_like,
             )?;
+            // A forward recorded as one segment leaves the GPU idle until the
+            // host has recorded every layer, where eager launches had it start
+            // on the first; so each layer is handed over as it is recorded.
+            // Measured on the RTX 3090: as one segment, decode ran 5–9% under
+            // eager (Llama-3.2-3B F16×1 150.5 against 165.2 t/s); a segment a
+            // layer ran above it (178.5), and one every two layers the same or
+            // slightly under. A layer whose MoE ends its own segment needs no
+            // second cut — Qwen3-30B-A3B lost 3–6% of decode to one.
+            if !self.model.layer(layer_idx).ends_a_segment() {
+                dev.flush_launches()?;
+            }
         }
 
         // A window that stops short hands its residual to a later forward, past

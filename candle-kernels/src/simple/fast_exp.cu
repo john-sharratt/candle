@@ -209,36 +209,37 @@ void run_fast_exp_batch(
     int32_t dtype,
     const void* inp,
     void* out,
-    size_t numel
+    size_t numel,
+    void* stream
 ) {
     int grid = grid_size(numel);
-    
+
     if (dtype == 0) { // f32
         if (mode == 0) { // Generic
             switch (precision) {
-                case 0: fast_exp_batch_f32_generic_high<<<grid, BLOCK_SIZE>>>((const float*)inp, (float*)out, numel); break;
-                case 1: fast_exp_batch_f32_generic_medium<<<grid, BLOCK_SIZE>>>((const float*)inp, (float*)out, numel); break;
-                case 2: fast_exp_batch_f32_generic_low<<<grid, BLOCK_SIZE>>>((const float*)inp, (float*)out, numel); break;
+                case 0: fast_exp_batch_f32_generic_high<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const float*)inp, (float*)out, numel); break;
+                case 1: fast_exp_batch_f32_generic_medium<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const float*)inp, (float*)out, numel); break;
+                case 2: fast_exp_batch_f32_generic_low<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const float*)inp, (float*)out, numel); break;
             }
         } else { // Softmax
             switch (precision) {
-                case 0: fast_exp_batch_f32_softmax_high<<<grid, BLOCK_SIZE>>>((const float*)inp, (float*)out, numel); break;
-                case 1: fast_exp_batch_f32_softmax_medium<<<grid, BLOCK_SIZE>>>((const float*)inp, (float*)out, numel); break;
-                case 2: fast_exp_batch_f32_softmax_low<<<grid, BLOCK_SIZE>>>((const float*)inp, (float*)out, numel); break;
+                case 0: fast_exp_batch_f32_softmax_high<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const float*)inp, (float*)out, numel); break;
+                case 1: fast_exp_batch_f32_softmax_medium<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const float*)inp, (float*)out, numel); break;
+                case 2: fast_exp_batch_f32_softmax_low<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const float*)inp, (float*)out, numel); break;
             }
         }
     }
     else if (dtype == 1) { // f16
         if (mode == 1) { // Softmax only for f16
             switch (precision) {
-                case 0: fast_exp_batch_f16_softmax_high<<<grid, BLOCK_SIZE>>>((const __half*)inp, (__half*)out, numel); break;
-                case 1: fast_exp_batch_f16_softmax_medium<<<grid, BLOCK_SIZE>>>((const __half*)inp, (__half*)out, numel); break;
+                case 0: fast_exp_batch_f16_softmax_high<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const __half*)inp, (__half*)out, numel); break;
+                case 1: fast_exp_batch_f16_softmax_medium<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const __half*)inp, (__half*)out, numel); break;
             }
         }
     }
     else if (dtype == 2) { // bf16
         if (mode == 1) { // Softmax only for bf16
-            fast_exp_batch_bf16_softmax_low<<<grid, BLOCK_SIZE>>>((const __nv_bfloat16*)inp, (__nv_bfloat16*)out, numel);
+            fast_exp_batch_bf16_softmax_low<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const __nv_bfloat16*)inp, (__nv_bfloat16*)out, numel);
         }
     }
 }
@@ -251,25 +252,26 @@ void run_fast_activation_batch(
     int32_t dtype,
     const void* inp,
     void* out,
-    size_t numel
+    size_t numel,
+    void* stream
 ) {
     int grid = grid_size(numel);
     
     if (dtype == 0) { // f32
         switch (op) {
-            case 0: fast_sigmoid_batch_f32<<<grid, BLOCK_SIZE>>>((const float*)inp, (float*)out, numel); break;
-            case 1: fast_silu_batch_f32<<<grid, BLOCK_SIZE>>>((const float*)inp, (float*)out, numel); break;
-            case 2: fast_gelu_batch_f32<<<grid, BLOCK_SIZE>>>((const float*)inp, (float*)out, numel); break;
+            case 0: fast_sigmoid_batch_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const float*)inp, (float*)out, numel); break;
+            case 1: fast_silu_batch_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const float*)inp, (float*)out, numel); break;
+            case 2: fast_gelu_batch_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const float*)inp, (float*)out, numel); break;
         }
     }
     else if (dtype == 1) { // f16
         if (op == 0) {
-            fast_sigmoid_batch_f16<<<grid, BLOCK_SIZE>>>((const __half*)inp, (__half*)out, numel);
+            fast_sigmoid_batch_f16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const __half*)inp, (__half*)out, numel);
         }
     }
     else if (dtype == 2) { // bf16
         if (op == 0) {
-            fast_sigmoid_batch_bf16<<<grid, BLOCK_SIZE>>>((const __nv_bfloat16*)inp, (__nv_bfloat16*)out, numel);
+            fast_sigmoid_batch_bf16<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const __nv_bfloat16*)inp, (__nv_bfloat16*)out, numel);
         }
     }
 }
@@ -278,10 +280,11 @@ void run_fast_activation_batch(
 void run_reference_exp_batch(
     const float* inp,
     float* out,
-    size_t numel
+    size_t numel,
+    void* stream
 ) {
     int grid = grid_size(numel);
-    reference_exp_batch_f32<<<grid, BLOCK_SIZE>>>(inp, out, numel);
+    reference_exp_batch_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(inp, out, numel);
 }
 
 } // extern "C"

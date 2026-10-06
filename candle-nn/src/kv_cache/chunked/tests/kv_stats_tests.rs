@@ -1291,6 +1291,7 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
             num_blocks: c_int,
             outer: f32,
             is_k: c_int,
+            stream: *mut c_void,
         );
     }
 
@@ -1379,6 +1380,7 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
                 n as c_int,
                 1.0,
                 is_k,
+                stream.cu_stream() as *mut c_void,
             );
         }
         stream.synchronize().expect("sync");
@@ -2038,6 +2040,7 @@ fn test_q0_v_iterative_curve_selection() {
             centroid_table_bits_flat: *const c_void,
             peak_curve_indices: *const c_void,
             peak_bin_offsets: *const c_void,
+            stream: *mut c_void,
         );
     }
 
@@ -2532,6 +2535,7 @@ fn test_q0_v_iterative_curve_selection() {
                         cent_p as *const c_void,
                         pi_p as *const c_void,
                         po_p as *const c_void,
+                        stream.cu_stream() as *mut c_void,
                     );
                 }
                 stream.synchronize().expect("sync");
@@ -3525,6 +3529,7 @@ fn test_q0_v_iterative_curve_selection() {
                                 cent_p as *const c_void,
                                 pi_p as *const c_void,
                                 po_p as *const c_void,
+                                stream.cu_stream() as *mut c_void,
                             );
                         }
                         stream.synchronize().expect("sync");
@@ -3577,6 +3582,7 @@ fn test_q0_v_iterative_curve_selection() {
                                 cent_p as *const c_void,
                                 pi_p as *const c_void,
                                 po_p as *const c_void,
+                                stream.cu_stream() as *mut c_void,
                             );
                         }
                         stream.synchronize().expect("sync");
@@ -3730,6 +3736,7 @@ fn test_q0_v_iterative_curve_selection() {
                         cent_p as *const c_void,
                         pi_p as *const c_void,
                         po_p as *const c_void,
+                        stream.cu_stream() as *mut c_void,
                     );
                 }
                 stream.synchronize().expect("sync");

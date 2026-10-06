@@ -606,6 +606,14 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
     }
 
     fn issue_all(&mut self, ops: &[LoadOp]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        // A wave recording on this thread launches its open segment first, so
+        // the compute-stream event each copy waits on lands behind every GEMM
+        // recorded so far — including the ones still reading an evicted slot.
+        let device = self.device.clone();
+        let _eager = device.pause_capture()?;
         for &op in ops {
             if let Err(failed) = self.issue(op) {
                 // **Roll back before deciding what to do about it.** `issue`
@@ -677,7 +685,7 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
         // bytes that are still being read.
         let ready = self
             .device
-            .cuda_stream()
+            .compute_stream()
             .record_event(None)
             .map_err(candle::Error::wrap)?;
         self.copy.wait(&ready).map_err(candle::Error::wrap)?;
@@ -772,8 +780,13 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
     /// subsystem exists to create.
     fn join(&mut self, layer: usize) -> Result<()> {
         if let Some(fence) = self.fences[layer].take() {
+            // Paused, the wait goes on the compute stream every recorded
+            // segment launches into, so the layer's GEMMs recorded after it
+            // run behind the copy. A resident layer has no fence and never
+            // ends a segment here.
+            let _eager = self.device.pause_capture()?;
             self.device
-                .cuda_stream()
+                .compute_stream()
                 .wait(&fence)
                 .map_err(candle::Error::wrap)?;
         }
@@ -1046,7 +1059,7 @@ mod tests {
                 layer_stream::cache::tests::concurrent_cold_reads_keep_their_own_bytes \
                 -- --ignored --nocapture"]
     fn concurrent_cold_reads_keep_their_own_bytes() {
-        let Some(bad) = run_cold_only() else {
+        let Some(bad) = run_cold_only(false) else {
             return; // no device
         };
         assert_eq!(
@@ -1056,9 +1069,34 @@ mod tests {
         );
     }
 
+    /// **A recording wave streams layers in order.** The same cold-only pass,
+    /// inside a wave capture, with each layer's slot copied out by a recorded
+    /// device-to-device copy between `ensure` and `prefetch` — the place a
+    /// layer's GEMMs sit. A join left on the capture stream, or an eviction
+    /// ordered only behind the compute stream's eager work, lets a recorded
+    /// read see another layer's bytes.
+    #[test]
+    #[ignore = "needs a CUDA device; allocates a few hundred MB of VRAM and writes a \
+                temporary pack. Run with: cargo test -p candle-transformers \
+                --features cuda --lib \
+                layer_stream::cache::tests::a_recording_wave_reads_every_layer_it_streams \
+                -- --ignored --nocapture"]
+    fn a_recording_wave_reads_every_layer_it_streams() {
+        let Some(bad) = run_cold_only(true) else {
+            return; // no device
+        };
+        assert_eq!(
+            bad, 0,
+            "{bad} layers were read back holding another layer's bytes inside a \
+             recording wave"
+        );
+    }
+
     /// One pass with an empty warm tier and no per-layer readback; answers with
-    /// the number of resident slots holding the wrong layer's bytes.
-    fn run_cold_only() -> Option<usize> {
+    /// the number of resident slots holding the wrong layer's bytes. `recorded`
+    /// runs the pass inside a wave capture and also counts every layer whose
+    /// recorded copy-out read the wrong bytes.
+    fn run_cold_only(recorded: bool) -> Option<usize> {
         use candle::Device;
 
         let Ok(device) = Device::new_cuda(0) else {
@@ -1114,13 +1152,45 @@ mod tests {
         )
         .unwrap();
 
+        // Allocated before the wave opens, so the pass's only eager device
+        // calls are the cache's own.
+        let mut copies: Vec<CudaSlice<u8>> = (0..TEST_LAYERS)
+            .map(|li| unsafe { cuda.alloc::<u8>(images[li].total).unwrap() })
+            .collect();
+        let wave = recorded.then(|| {
+            let wave = cuda.begin_wave_capture().unwrap();
+            cuda.record_launches().unwrap();
+            wave
+        });
         // One pass, no synchronize inside it: the copy stream stays deep, which
         // is the condition the bug needs.
         for li in 0..TEST_LAYERS {
             cache.ensure(li).unwrap();
+            if recorded && li >= TEST_PINNED {
+                let off = (cache.slot_base_of(li).unwrap() - base) as usize;
+                cuda.cuda_stream()
+                    .memcpy_dtod(&arena.slice(off..off + images[li].total), &mut copies[li])
+                    .unwrap();
+            }
             cache.prefetch().unwrap();
         }
-        cuda.cuda_stream().synchronize().unwrap();
+        if let Some(wave) = wave {
+            wave.finish().unwrap();
+        }
+        cuda.compute_stream().synchronize().unwrap();
+        let mut wrong = 0usize;
+        if recorded {
+            for layer in TEST_PINNED..TEST_LAYERS {
+                let got = cuda.compute_stream().memcpy_dtov(&copies[layer]).unwrap();
+                for (i, p) in images[layer].placements.iter().enumerate() {
+                    if got[p.offset..p.offset + p.bytes] != payload(layer, i, p.bytes)[..] {
+                        eprintln!("  L{layer} projection {i} was read holding foreign bytes");
+                        wrong += 1;
+                        break;
+                    }
+                }
+            }
+        }
 
         let s = cache.stats();
         eprintln!(
@@ -1138,7 +1208,6 @@ mod tests {
         // The pinned head is excluded because this fixture never places it: it
         // has no pack record by construction, so the loader uploads it by hand
         // and there is nothing here for a cold read to have got wrong.
-        let mut wrong = 0usize;
         for layer in TEST_PINNED..TEST_LAYERS {
             if !cache.residency().residence(layer).is_readable() {
                 continue;

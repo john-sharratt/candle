@@ -15,6 +15,7 @@
 //!         input_ptr,
 //!         output_ptr,
 //!         num_elements,
+//!         stream,
 //!     );
 //! }
 //! ```
@@ -94,6 +95,7 @@ extern "C" {
     /// - `inp`: Input tensor pointer
     /// - `out`: Output tensor pointer
     /// - `numel`: Number of elements
+    /// - `stream`: the stream the launch is issued on
     ///
     /// # Supported Combinations
     /// - f32: All modes (Generic, Softmax) and all precisions (High, Medium, Low)
@@ -106,6 +108,7 @@ extern "C" {
         inp: *const c_void,
         out: *mut c_void,
         numel: usize,
+        stream: *mut c_void,
     );
 
     /// Dispatches to the appropriate fast activation kernel.
@@ -116,6 +119,7 @@ extern "C" {
     /// - `inp`: Input tensor pointer
     /// - `out`: Output tensor pointer
     /// - `numel`: Number of elements
+    /// - `stream`: the stream the launch is issued on
     ///
     /// # Supported Combinations
     /// - f32: All activations (sigmoid, silu, gelu)
@@ -127,11 +131,17 @@ extern "C" {
         inp: *const c_void,
         out: *mut c_void,
         numel: usize,
+        stream: *mut c_void,
     );
 
     /// Reference exponential using hardware __expf for testing comparison.
-    /// Only supports f32.
-    pub fn run_reference_exp_batch(inp: *const f32, out: *mut f32, numel: usize);
+    /// Only supports f32. `stream` is the stream the launch is issued on.
+    pub fn run_reference_exp_batch(
+        inp: *const f32,
+        out: *mut f32,
+        numel: usize,
+        stream: *mut c_void,
+    );
 }
 
 #[cfg(test)]

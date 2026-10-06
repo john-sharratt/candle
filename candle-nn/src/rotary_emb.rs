@@ -175,6 +175,7 @@ impl candle::CustomOp3 for RotaryEmbI {
                             bh,
                             td,
                             stride_b,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -517,6 +518,7 @@ impl candle::CustomOp3 for RotaryEmb {
                             td,
                             d_val,
                             stride_b,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -844,6 +846,7 @@ impl candle::CustomOp3 for RotaryEmbThd {
                             h as u32,
                             d as u32,
                             stride_b,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }

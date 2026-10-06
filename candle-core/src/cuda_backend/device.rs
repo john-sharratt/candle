@@ -1,13 +1,20 @@
 use crate::backend::BackendDevice;
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
 pub use cudarc;
+use cudarc::cublas::sys::cublasStatus_t;
+use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys::CUresult;
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice};
+use cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtrMut, DeviceRepr, HostSlice,
+    ValidAsZeroBits,
+};
 use float8::F8E4M3;
 use half::{bf16, f16};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use super::graph::{CaptureHub, CaptureStats, Paused, WaveCapture};
 use super::info_ring::InfoRing;
 use super::staged::pack_segments;
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
@@ -55,8 +62,11 @@ pub struct CudaDevice {
     id: DeviceId,
     context: Arc<cudarc::driver::CudaContext>,
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
-    stream: Arc<cudarc::driver::CudaStream>,
-    pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
+    stream: Arc<CudaStream>,
+    pub(crate) blas: Arc<CudaBlas>,
+    /// The fixed workspace `blas` runs in — see [`new_blas`]. Held beside the
+    /// handle for as long as the handle exists.
+    blas_workspace: Arc<CudaSlice<u8>>,
     curand: Arc<Mutex<CudaRng>>,
     /// Memoized device copies of small layout/info tables (dims+strides blobs the
     /// strided kernels read), carved from one ring. See [`Self::info_table`].
@@ -73,6 +83,40 @@ pub struct CudaDevice {
     /// — see [`Self::with_synced_upload`]. Separate from `staging` so a launch
     /// that waits out a long copy never holds the forward's scratch.
     synced_staging: Staging,
+    /// The wave capture shared by every clone of this handle — see
+    /// [`Self::begin_wave_capture`]. Per stream, like the caches above.
+    capture: Arc<CaptureHub>,
+}
+
+/// Bytes of the workspace every cuBLAS handle is given — NVIDIA's
+/// recommendation for this generation of card, and ample for the GEMMs and
+/// batched solves this backend issues.
+const BLAS_WORKSPACE_BYTES: usize = 4 << 20;
+
+/// A cuBLAS handle on `stream` with a workspace of its own.
+///
+/// Without one, cuBLAS allocates its workspace on the stream per call, which
+/// a wave capture records as a graph allocation and refuses; with one, a GEMM
+/// is kernels only, recorded or not.
+fn new_blas(stream: &Arc<CudaStream>) -> Result<(Arc<CudaBlas>, Arc<CudaSlice<u8>>)> {
+    let blas = CudaBlas::new(stream.clone()).w()?;
+    // SAFETY: cuBLAS writes its workspace before reading it.
+    let mut workspace = unsafe { stream.alloc::<u8>(BLAS_WORKSPACE_BYTES) }.w()?;
+    let (ptr, _g) = workspace.device_ptr_mut(stream);
+    // SAFETY: a live handle and a device buffer of the stated size that the
+    // returned pair keeps alive beside it.
+    let status = unsafe {
+        cudarc::cublas::sys::cublasSetWorkspace_v2(
+            *blas.handle(),
+            ptr as *mut std::ffi::c_void,
+            BLAS_WORKSPACE_BYTES,
+        )
+    };
+    drop(_g);
+    if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        crate::bail!("cublasSetWorkspace failed: {status:?}");
+    }
+    Ok((Arc::new(blas), Arc::new(workspace)))
 }
 
 /// One grow-only byte buffer, reused by every call that stages through it.
@@ -104,7 +148,7 @@ impl CudaDevice {
     /// declared region, which is every allocation in a healthy run — see
     /// [`crate::readonly_regions`].
     #[cfg(feature = "tensor-assert")]
-    fn guard_fresh_allocation<T>(what: &str, slice: &cudarc::driver::CudaSlice<T>, bytes: usize) {
+    fn guard_fresh_allocation<T>(what: &str, slice: &CudaSlice<T>, bytes: usize) {
         use cudarc::driver::DevicePtr;
         let stream = slice.stream().clone();
         let (base, _g) = slice.device_ptr(&stream);
@@ -117,12 +161,7 @@ impl CudaDevice {
     /// every device allocation in the process.
     #[cfg(not(feature = "tensor-assert"))]
     #[inline(always)]
-    fn guard_fresh_allocation<T>(
-        _what: &str,
-        _slice: &cudarc::driver::CudaSlice<T>,
-        _bytes: usize,
-    ) {
-    }
+    fn guard_fresh_allocation<T>(_what: &str, _slice: &CudaSlice<T>, _bytes: usize) {}
 
     /// `len` elements of device memory, **uninitialised**.
     ///
@@ -138,21 +177,17 @@ impl CudaDevice {
     /// unless the buffer is provably fully written: the hot-path rule is that a
     /// buffer a kernel completely overwrites must come from here, so the zeroing
     /// memset is not paid on bytes that are about to be stamped anyway.
-    pub unsafe fn alloc<T: cudarc::driver::DeviceRepr>(
-        &self,
-        len: usize,
-    ) -> Result<cudarc::driver::CudaSlice<T>> {
+    pub unsafe fn alloc<T: DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>> {
         forbidden_alloc::record("CudaDevice::alloc", len * std::mem::size_of::<T>());
+        let _eager = self.pause_capture()?;
         let s = self.stream.alloc::<T>(len).w()?;
         Self::guard_fresh_allocation("CudaDevice::alloc", &s, len * std::mem::size_of::<T>());
         Ok(s)
     }
 
-    pub fn alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
-        &self,
-        len: usize,
-    ) -> Result<cudarc::driver::CudaSlice<T>> {
+    pub fn alloc_zeros<T: DeviceRepr + ValidAsZeroBits>(&self, len: usize) -> Result<CudaSlice<T>> {
         forbidden_alloc::record("CudaDevice::alloc_zeros", len * std::mem::size_of::<T>());
+        let _eager = self.pause_capture()?;
         let s = self.stream.alloc_zeros::<T>(len).w()?;
         Self::guard_fresh_allocation(
             "CudaDevice::alloc_zeros",
@@ -162,11 +197,7 @@ impl CudaDevice {
         Ok(s)
     }
 
-    pub fn memcpy_htod<
-        T: cudarc::driver::DeviceRepr,
-        Src: cudarc::driver::HostSlice<T> + ?Sized,
-        Dst: cudarc::driver::DevicePtrMut<T>,
-    >(
+    pub fn memcpy_htod<T: DeviceRepr, Src: HostSlice<T> + ?Sized, Dst: DevicePtrMut<T>>(
         &self,
         src: &Src,
         dst: &mut Dst,
@@ -177,6 +208,7 @@ impl CudaDevice {
         // the wrong slot writes a contiguous, slot-sized block of plausible
         // bytes over whatever was there.
         self.guard_copy_dst::<T, _>("CudaDevice::memcpy_htod", dst, src.len());
+        let _eager = self.pause_capture()?;
         self.stream.memcpy_htod(src, dst).w()
     }
 
@@ -188,12 +220,7 @@ impl CudaDevice {
     /// [`crate::readonly_regions`] — and compiles away entirely without the
     /// `tensor-assert` feature.
     #[cfg(feature = "tensor-assert")]
-    fn guard_copy_dst<T, D: cudarc::driver::DevicePtrMut<T>>(
-        &self,
-        what: &str,
-        dst: &mut D,
-        elems: usize,
-    ) {
+    fn guard_copy_dst<T, D: DevicePtrMut<T>>(&self, what: &str, dst: &mut D, elems: usize) {
         let stream = self.stream.clone();
         let (base, _g) = dst.device_ptr_mut(&stream);
         crate::readonly_regions::forbid_write(what, base, elems * std::mem::size_of::<T>());
@@ -203,26 +230,14 @@ impl CudaDevice {
     /// path that runs for every host↔device copy.
     #[cfg(not(feature = "tensor-assert"))]
     #[inline(always)]
-    fn guard_copy_dst<T, D: cudarc::driver::DevicePtrMut<T>>(
-        &self,
-        _what: &str,
-        _dst: &mut D,
-        _elems: usize,
-    ) {
-    }
+    fn guard_copy_dst<T, D: DevicePtrMut<T>>(&self, _what: &str, _dst: &mut D, _elems: usize) {}
 
-    pub fn memcpy_dtov<T: cudarc::driver::DeviceRepr, Src: cudarc::driver::DevicePtr<T>>(
-        &self,
-        src: &Src,
-    ) -> Result<Vec<T>> {
+    pub fn memcpy_dtov<T: DeviceRepr, Src: DevicePtr<T>>(&self, src: &Src) -> Result<Vec<T>> {
+        let _eager = self.pause_capture()?;
         self.stream.memcpy_dtov(src).w()
     }
 
-    pub fn memcpy_dtod<
-        T,
-        Src: cudarc::driver::DevicePtr<T>,
-        Dst: cudarc::driver::DevicePtrMut<T>,
-    >(
+    pub fn memcpy_dtod<T, Src: DevicePtr<T>, Dst: DevicePtrMut<T>>(
         &self,
         src: &Src,
         dst: &mut Dst,
@@ -230,19 +245,18 @@ impl CudaDevice {
         // Same reasoning as `memcpy_htod`: a bulk write to a caller-computed
         // destination, invisible to every allocation-path guard.
         self.guard_copy_dst::<T, _>("CudaDevice::memcpy_dtod", dst, src.len());
+        let _eager = self.pause_capture()?;
         self.stream.memcpy_dtod(src, dst).w()
     }
 
-    pub fn memcpy_stod<
-        T: cudarc::driver::DeviceRepr,
-        Src: cudarc::driver::HostSlice<T> + ?Sized,
-    >(
+    pub fn memcpy_stod<T: DeviceRepr, Src: HostSlice<T> + ?Sized>(
         &self,
         src: &Src,
-    ) -> Result<cudarc::driver::CudaSlice<T>> {
+    ) -> Result<CudaSlice<T>> {
         // Allocates as well as copying: the destination slice is fresh device
         // memory, so this is a driver allocation like the two above.
         forbidden_alloc::record("CudaDevice::memcpy_stod", std::mem::size_of_val(src));
+        let _eager = self.pause_capture()?;
         let s = self.stream.memcpy_stod(src).w()?;
         // Allocates as well as copying, so it is an allocation path like the
         // two above and needs the same guard — and unlike them it writes to the
@@ -274,29 +288,71 @@ impl CudaDevice {
     /// the span it belongs to. Without it every per-wave descriptor table — the
     /// DeltaNet pointer tables, the rotary layouts, the batched row maps — is a
     /// driver allocation inside the wave.
-    pub fn memcpy_stod_leased<
-        T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
-        Src: cudarc::driver::HostSlice<T> + ?Sized,
-    >(
+    pub fn memcpy_stod_leased<T: DeviceRepr + ValidAsZeroBits, Src: HostSlice<T> + ?Sized>(
         &self,
         src: &Src,
         origin: Backing,
-    ) -> Result<(cudarc::driver::CudaSlice<T>, Backing)> {
+    ) -> Result<(CudaSlice<T>, Backing)> {
+        // An allocation that reaches the driver ends the recording segment on
+        // its own; a carve from the wave's arena does not need to.
         let (mut dst, backing) = unsafe { alloc_inheriting::<T>(self, src.len(), origin)? };
-        self.stream.memcpy_htod(src, &mut dst).w()?;
+        self.upload_into_slice(&mut dst, src)?;
         Ok((dst, backing))
     }
 
-    pub fn memcpy_stod_from<
-        T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
-        Src: cudarc::driver::HostSlice<T> + ?Sized,
-    >(
+    /// Copy `src` into the front of `dst`. Inside a recording wave capture the
+    /// copy is recorded (see [`Self::upload_raw`]); otherwise it is queued on
+    /// the compute stream like any upload.
+    pub fn upload_into_slice<T: DeviceRepr, Src: HostSlice<T> + ?Sized>(
+        &self,
+        dst: &mut CudaSlice<T>,
+        src: &Src,
+    ) -> Result<()> {
+        let (at, _g) = dst.device_ptr_mut(&self.stream);
+        // SAFETY: the slice is read on the host right here, before the guard
+        // drops; a host buffer has nothing to wait for.
+        let (host, _s) = unsafe { src.stream_synced_slice(&self.stream) };
+        // SAFETY: `host` is `len` plain device-representable values.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(host.as_ptr() as *const u8, std::mem::size_of_val(host))
+        };
+        self.upload_raw(at, bytes)
+    }
+
+    /// Copy `src` to the device address `dst`, which holds at least
+    /// `src.len()` bytes.
+    ///
+    /// While this thread records a wave capture, the bytes are staged in the
+    /// wave's ring and their copy is recorded into the segment, so the upload
+    /// does not end it. Otherwise — or when the ring is full — the copy is
+    /// queued on the compute stream behind everything issued before it; the
+    /// driver has staged pageable bytes before it returns, so `src` may go.
+    pub fn upload_raw(&self, dst: u64, src: &[u8]) -> Result<()> {
+        if src.is_empty() || self.capture.record_upload(dst, src) {
+            return Ok(());
+        }
+        let _eager = self.pause_capture()?;
+        // SAFETY: the caller's `dst` holds `src.len()` bytes; queued on the
+        // compute stream.
+        unsafe {
+            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                src.len(),
+                self.stream.cu_stream(),
+            )
+            .result()
+            .w()
+        }
+    }
+
+    pub fn memcpy_stod_from<T: DeviceRepr + ValidAsZeroBits, Src: HostSlice<T> + ?Sized>(
         &self,
         src: &Src,
         origin: Backing,
     ) -> Result<Uploaded<T>> {
         let (mut dst, backing) = unsafe { alloc_inheriting::<T>(self, src.len(), origin)? };
-        self.stream.memcpy_htod(src, &mut dst).w()?;
+        self.upload_into_slice(&mut dst, src)?;
         Ok(Uploaded {
             slice: std::mem::ManuallyDrop::new(dst),
             backing,
@@ -320,6 +376,9 @@ impl CudaDevice {
         bytes: usize,
         f: impl FnOnce(&mut CudaSlice<u8>) -> Result<R>,
     ) -> Result<R> {
+        // Eager for its whole extent: the scratch is reused by the next call,
+        // so a launch reading it must execute before the next upload lands.
+        let _eager = self.pause_capture()?;
         let mut slot = self.staging.lock().unwrap();
         if !slot.as_ref().is_some_and(|s| s.len() >= bytes) {
             let grown = slot.as_ref().map_or(0, |s| s.len() * 2).max(bytes).max(1);
@@ -341,7 +400,7 @@ impl CudaDevice {
     /// Allocates nothing in the steady state, inside a forward or between two:
     /// the copy and the launch `f` queues are ordered on this stream, and the
     /// scratch is not handed to another caller until `f` returns.
-    pub fn with_staged_upload<T: cudarc::driver::DeviceRepr, R>(
+    pub fn with_staged_upload<T: DeviceRepr, R>(
         &self,
         data: &[T],
         f: impl FnOnce(u64) -> Result<R>,
@@ -392,11 +451,12 @@ impl CudaDevice {
     /// holds the forward's [`Self::with_staging`].
     pub fn with_synced_upload<R>(
         &self,
-        stream: &Arc<cudarc::driver::CudaStream>,
+        stream: &Arc<CudaStream>,
         segments: &[&[u8]],
         f: impl FnOnce(&[u64]) -> Result<R>,
     ) -> Result<R> {
         let (bytes, offsets) = pack_segments(segments);
+        let _eager = self.pause_capture()?;
         let mut slot = self.synced_staging.lock().unwrap();
         if !slot.as_ref().is_some_and(|s| s.len() >= bytes.len()) {
             let grown = slot
@@ -458,6 +518,8 @@ impl CudaDevice {
         if let Some(t) = cache.get(&key) {
             return Ok(t.clone());
         }
+        // Clearing frees, and the build below uploads.
+        let _eager = self.pause_capture()?;
         if cache.len() >= 1024 {
             cache.clear();
         }
@@ -498,6 +560,7 @@ impl CudaDevice {
                 start_bits,
                 step_bits,
                 len,
+                self.cuda_stream().cu_stream() as *mut std::ffi::c_void,
             );
         };
         let slice = match dtype {
@@ -546,7 +609,7 @@ impl CudaDevice {
 /// reachable one — the same job [`super::Backing`] does for [`super::CudaStorage`],
 /// at the one place that hands out a raw slice.
 pub struct Uploaded<T> {
-    slice: std::mem::ManuallyDrop<cudarc::driver::CudaSlice<T>>,
+    slice: std::mem::ManuallyDrop<CudaSlice<T>>,
     backing: Backing,
     /// The allocation a leased `slice` points into, when that allocation is
     /// not owned by an arena that outlives it — an info-ring entry keeps its
@@ -557,10 +620,7 @@ pub struct Uploaded<T> {
 
 impl<T> Uploaded<T> {
     /// A leased view over memory `anchor` (when given) keeps alive.
-    pub(crate) fn leased(
-        slice: cudarc::driver::CudaSlice<T>,
-        anchor: Option<Arc<CudaSlice<usize>>>,
-    ) -> Self {
+    pub(crate) fn leased(slice: CudaSlice<T>, anchor: Option<Arc<CudaSlice<usize>>>) -> Self {
         Self {
             slice: std::mem::ManuallyDrop::new(slice),
             backing: Backing::Lease(LeaseOrigin::Foreign),
@@ -570,7 +630,7 @@ impl<T> Uploaded<T> {
 }
 
 impl<T> std::ops::Deref for Uploaded<T> {
-    type Target = cudarc::driver::CudaSlice<T>;
+    type Target = CudaSlice<T>;
 
     fn deref(&self) -> &Self::Target {
         &self.slice
@@ -601,7 +661,7 @@ impl<T> Drop for Uploaded<T> {
 
 pub struct CudaFunc {
     func: CudaFunction,
-    stream: Arc<cudarc::driver::CudaStream>,
+    stream: Arc<CudaStream>,
 }
 
 impl std::ops::Deref for CudaFunc {
@@ -635,8 +695,82 @@ impl CudaFunc {
 }
 
 impl CudaDevice {
-    pub fn cuda_stream(&self) -> Arc<cudarc::driver::CudaStream> {
+    /// The stream to launch on: the capture stream while this thread records a
+    /// wave ([`Self::begin_wave_capture`]), the compute stream otherwise.
+    ///
+    /// Launches take their stream from here. Anything that outlives the call
+    /// — a slice's home stream, a fence, a readback — takes
+    /// [`Self::compute_stream`] instead, because the capture stream executes
+    /// nothing until its segment is launched.
+    pub fn cuda_stream(&self) -> Arc<CudaStream> {
+        self.capture.launch_stream(&self.stream)
+    }
+
+    /// The device's compute stream — the legacy null stream every eager launch
+    /// and every graph launch goes on.
+    pub fn compute_stream(&self) -> Arc<CudaStream> {
         self.stream.clone()
+    }
+
+    /// Record this thread's launches as a chain of graphs until the returned
+    /// guard finishes.
+    ///
+    /// Launches are recorded, not executed, and are handed to the driver one
+    /// segment at a time. A segment ends at every call that has to meet the
+    /// device eagerly — an allocation, a free, an upload, a readback, a
+    /// synchronise — and at every [`Self::flush_launches`], and is launched
+    /// into the compute stream before that call runs, so the order every
+    /// operation executes in is the order it was issued in. See
+    /// [`super::graph`] for the mechanism.
+    ///
+    /// The wave opens **held**: nothing is recorded until the model reaches
+    /// the launches it wants recorded and calls [`Self::record_launches`], so a
+    /// forward's setup — its admission, tier placement and tables — runs
+    /// eagerly as it always has.
+    pub fn begin_wave_capture(&self) -> Result<WaveCapture> {
+        self.capture.begin_wave(&self.stream)?;
+        Ok(WaveCapture {
+            device: self.clone(),
+            finished: false,
+            _thread_bound: PhantomData,
+        })
+    }
+
+    /// Start recording the wave [`Self::begin_wave_capture`] opened on this
+    /// thread. Does nothing on a thread with no wave open.
+    pub fn record_launches(&self) -> Result<()> {
+        self.capture.record()
+    }
+
+    /// Hand everything this thread has issued to the driver and nudge WDDM to
+    /// submit it — the point a host protocol polling the device for a launch's
+    /// output waits on. Inside a wave capture this ends the recording segment.
+    pub fn flush_launches(&self) -> Result<()> {
+        self.capture.flush(&self.stream)
+    }
+
+    /// Suspend this thread's wave capture, if it has one, until the guard
+    /// drops: the recorded segment is launched first, and the caller's eager
+    /// device calls run in order behind it.
+    pub fn pause_capture(&self) -> Result<Option<Paused<'_>>> {
+        self.capture.pause(&self.stream)
+    }
+
+    /// Drop `value` — something owning device memory — once every launch this
+    /// thread has recorded so far has been issued; at once when it is not
+    /// recording. A free is refused while a capture records, and a recorded
+    /// launch may still read the memory, so it waits for its segment.
+    pub fn retire<T: Send + 'static>(&self, value: T) {
+        drop(self.capture.retire(Box::new(value)));
+    }
+
+    /// What this device's wave captures have done so far.
+    pub fn capture_stats(&self) -> CaptureStats {
+        self.capture.stats()
+    }
+
+    pub(crate) fn capture_hub(&self) -> &CaptureHub {
+        &self.capture
     }
 
     /// The cuBLAS handle, bound to [`Self::cuda_stream`].
@@ -647,8 +781,29 @@ impl CudaDevice {
     /// explicit matrix inverse — reaches it through here rather than opening a
     /// second handle, which would carry its own stream and lose the ordering
     /// every other op on this device relies on.
-    pub fn cublas(&self) -> &cudarc::cublas::CudaBlas {
-        &self.blas
+    ///
+    /// Re-bound on every call, because the stream a launch belongs on depends
+    /// on whether this thread is recording a wave.
+    pub fn cublas(&self) -> Result<&CudaBlas> {
+        let stream = self.cuda_stream();
+        // SAFETY: a live handle of this device and a stream of its context.
+        unsafe { cudarc::cublas::result::set_stream(*self.blas.handle(), stream.cu_stream() as _) }
+            .w()?;
+        // Setting the stream hands the handle back to cuBLAS's own workspace
+        // pool, which allocates on the stream; give it its fixed one again.
+        let (ptr, _g) = self.blas_workspace.device_ptr(&self.stream);
+        // SAFETY: the handle's own workspace, alive as long as the handle.
+        let status = unsafe {
+            cudarc::cublas::sys::cublasSetWorkspace_v2(
+                *self.blas.handle(),
+                ptr as *mut std::ffi::c_void,
+                BLAS_WORKSPACE_BYTES,
+            )
+        };
+        if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            crate::bail!("cublasSetWorkspace failed: {status:?}");
+        }
+        Ok(&self.blas)
     }
 
     /// Returns the underlying CUDA context.
@@ -872,7 +1027,7 @@ impl CudaDevice {
     pub fn new_with_stream(ordinal: usize) -> Result<Self> {
         let base = Self::new(ordinal)?;
         let stream = base.context.new_stream().w()?;
-        let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        let (blas, blas_workspace) = new_blas(&stream)?;
         let curand = cudarc::curand::CudaRng::new(DEFAULT_SEED, stream.clone()).w()?;
         // **Compiled modules are shared; memoised buffers are not.** A
         // `CudaModule` belongs to the context, is read-only once built, and is
@@ -887,12 +1042,14 @@ impl CudaDevice {
             context: base.context.clone(),
             custom_modules: base.custom_modules.clone(),
             stream,
-            blas: Arc::new(blas),
+            blas,
+            blas_workspace,
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             info_tables: Arc::new(Mutex::new(InfoRing::default())),
             perm_tables: Arc::new(Mutex::new(HashMap::new())),
             staging: Arc::new(Mutex::new(None)),
             synced_staging: Arc::new(Mutex::new(None)),
+            capture: Arc::new(CaptureHub::default()),
         })
     }
 
@@ -922,7 +1079,7 @@ impl CudaDevice {
     /// Called on **both** paths out of the cache: the hit, and the loser of a
     /// first-touch race, which is also handed a clone of a shared device.
     fn give_own_stateful(&mut self) -> Result<()> {
-        self.blas = Arc::new(cudarc::cublas::CudaBlas::new(self.stream.clone()).w()?);
+        (self.blas, self.blas_workspace) = new_blas(&self.stream)?;
         self.curand = Arc::new(Mutex::new(CudaRng(
             cudarc::curand::CudaRng::new(DEFAULT_SEED, self.stream.clone()).w()?,
         )));
@@ -1157,19 +1314,21 @@ impl BackendDevice for CudaDevice {
         Self::validate_compute_capability(&context)?;
         Self::disable_per_arg_event_tracking(&context);
         let stream = context.default_stream();
-        let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        let (blas, blas_workspace) = new_blas(&stream)?;
         let curand = cudarc::curand::CudaRng::new(DEFAULT_SEED, stream.clone()).w()?;
         let dev = Self {
             id: DeviceId::new(),
             context,
             stream,
-            blas: Arc::new(blas),
+            blas,
+            blas_workspace,
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             info_tables: Arc::new(Mutex::new(InfoRing::default())),
             perm_tables: Arc::new(Mutex::new(HashMap::new())),
             staging: Arc::new(Mutex::new(None)),
             synced_staging: Arc::new(Mutex::new(None)),
+            capture: Arc::new(CaptureHub::default()),
         };
         // Record free VRAM now, before any model weights load, so the KV budget
         // gate can estimate our resident footprint and credit pageable memory
@@ -1522,6 +1681,7 @@ impl BackendDevice for CudaDevice {
         // fixed cadence regardless of load), which is exactly why a poisoned
         // context showed up here as an endless identical retry with nothing
         // ever noticing.
+        let _eager = self.pause_capture()?;
         self.stream.synchronize().w()?;
         Ok(())
     }

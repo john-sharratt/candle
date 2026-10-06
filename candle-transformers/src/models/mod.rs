@@ -203,6 +203,8 @@ pub mod qwen35;
 pub mod qwen3_moe;
 #[cfg(feature = "cuda")]
 pub mod qwen4exp;
+/// Which of a wave's rows the expert cache scores as decode.
+pub(crate) mod residency_rows;
 pub mod residual_order;
 pub mod rope_schedule;
 pub mod rope_tables;

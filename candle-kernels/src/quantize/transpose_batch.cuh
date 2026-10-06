@@ -191,13 +191,15 @@ extern "C" void run_quantize_transposed_batched_typed(
     const void* src, void* dst,
     const int* src_offsets, const int* dst_offsets,
     int32_t num_chunks, int32_t n_head, int32_t chunk_size, int32_t head_dim,
-    int32_t qtype, int32_t src_dtype
+    int32_t qtype, int32_t src_dtype,
+    void* stream
 ) {
     if (num_chunks == 0) return;
     dim3 grid(num_chunks * n_head * head_dim), block(32);
-    
+    cudaStream_t s = (cudaStream_t)stream;
+
     // Dispatch on both qtype and src_dtype
-    #define L(T,Q,S) transpose_quant_batch_typed<T,Q,S><<<grid,block>>>(src,dst,src_offsets,dst_offsets,num_chunks,n_head,chunk_size,head_dim)
+    #define L(T,Q,S) transpose_quant_batch_typed<T,Q,S><<<grid,block,0,s>>>(src,dst,src_offsets,dst_offsets,num_chunks,n_head,chunk_size,head_dim)
     // Dispatch src_dtype by its canonical GgmlDType value.
     #define LQ(T,Q) switch(src_dtype) { \
         case SDTYPE_F32:    L(T,Q,SDTYPE_F32);    break; \
@@ -242,12 +244,14 @@ extern "C" void run_quantize_transposed_batched(
     const float* src, void* dst,
     const int* src_offsets, const int* dst_offsets,
     int32_t num_chunks, int32_t n_head, int32_t chunk_size, int32_t head_dim,
-    int32_t qtype
+    int32_t qtype,
+    void* stream
 ) {
     if (num_chunks == 0) return;
     dim3 grid(num_chunks * n_head * head_dim), block(32);
-    
-    #define L(T,Q) transpose_quant_batch<T,Q><<<grid,block>>>(src,dst,src_offsets,dst_offsets,num_chunks,n_head,chunk_size,head_dim)
+    cudaStream_t s = (cudaStream_t)stream;
+
+    #define L(T,Q) transpose_quant_batch<T,Q><<<grid,block,0,s>>>(src,dst,src_offsets,dst_offsets,num_chunks,n_head,chunk_size,head_dim)
     switch (qtype) {        
         case 3: L(block_r16,3); break;
         case 7: L(block_q8_0,7); break;

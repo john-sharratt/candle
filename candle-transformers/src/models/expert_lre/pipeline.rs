@@ -14,10 +14,12 @@
 //! - **Prefetch, by the copy engine.** The Markov transition matrix predicts the
 //!   next layers' experts; a predicted expert with a pinned copy is copied into
 //!   a slot on the copy stream and its entry pointed there once the copy is
-//!   **observed** complete — a completion delayed by a driver call on another
-//!   thread delays only the promotion. A predicted cold one is handed to the
-//!   stager to stage into the pad. A prefill-width row promotes the next row's
-//!   scored experts the same way.
+//!   **reported** complete. The copies are issued by the copier thread
+//!   (`copier`), never by this one: issuing a copy can stall in the driver
+//!   for as long as the forward the GPU is running, and this thread's ring
+//!   must not stall with it. A predicted cold one is handed to the stager to
+//!   stage into the pad. A prefill-width row promotes the next row's scored
+//!   experts the same way.
 //! - **Eviction** points an entry back at the expert's pinned copy (or 0) and
 //!   frees the slot under the reclaim rule (`reclaim`): an entry may go to 0
 //!   only for a quiet row, and a slot is reused only once every invocation that
@@ -27,7 +29,8 @@
 //! [`TransitionMatrix`]. The per-expert places it shares with the stager live in
 //! the [`Residency`] lock, which also writes the live table.
 
-use super::cache::ExpertCacheInner;
+use super::cache::{ExpertCacheInner, DECODE_RECENCY_DECAY};
+use super::copier::{Copier, CopyJob};
 use super::dispatch::{AbortWord, PassState, SummaryRing};
 use super::pinned::LayerGeometry;
 use super::promo::{ticket_from_word, PromotionRing};
@@ -39,7 +42,7 @@ use super::transition::TransitionMatrix;
 use super::types::{PipelineMessage, PipelineStats, RoutedLayer};
 use crate::models::profile::{profile_now, ProfileAccumulator};
 use candle::{Device, Result};
-use cudarc::driver::{CudaEvent, CudaStream};
+use cudarc::driver::CudaStream;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
@@ -80,7 +83,7 @@ const PREFETCH_PRECISION_FLOOR: f32 = 0.8;
 
 /// The fewest free slots the promotion ring is kept stocked with.
 ///
-/// Above it the stock is predicted: the next two rows' non-resident experts at
+/// Above it the stock is predicted: the next few rows' non-resident experts at
 /// the share of experts the current row routed (`process_routed`), and stock
 /// past that is taken back when the ring is quiet (`trim_ring`). Every stocked
 /// slot is an expert evicted ahead of need, so a standing deep stock is wrong —
@@ -91,6 +94,41 @@ const PREFETCH_PRECISION_FLOOR: f32 = 0.8;
 /// second time by the copy engine (756 of a cold prefill's, 1,169 t/s against
 /// 1,382 with the prediction).
 const RING_TARGET: usize = 32;
+
+/// How many rows past the one just served the promotion ring is stocked for.
+/// The stock has to be in the ring when the GPU's bucketize of those rows reads
+/// it, and this thread stocks only after reading the served row's summary — a
+/// refill per routed layer, made with no driver call (`copier`), so it trails
+/// the GPU by about a layer.
+const RING_HORIZON: usize = 2;
+
+/// Prompt-only experts are promoted only when the expert zone can hold at
+/// least this share of the model's experts (as `numerator / denominator`) —
+/// at its limit, a property of the model and the card, not at the size the KV
+/// side leaves it at the moment: the zone starts small and shrinks under a
+/// wide wave, and keying on that switched promotion off exactly when a cold or
+/// wide prompt needed it.
+///
+/// A prompt sweeps the expert table about once, so what promoting its misses
+/// buys depends on room. With most of the model resident there is little to
+/// evict and a promoted prompt expert is often read again (Qwen3.6-35B-A3B on
+/// an RTX 3090, ~95% at the limit: its prefill falls up to 20% unpromoted).
+/// With the working set several times the zone, a prompt cycles the whole zone
+/// through its own one-shot experts (Qwen3.8-Flash-Next on the same card, ~48%:
+/// promoted, a two-sequence prompt took ~12,600 promotions into a ~12,000-slot
+/// zone), and its prefill rows run up to 5% faster unpromoted — the workers'
+/// copies of a miss are all a prompt needs. The two models sit far apart;
+/// three quarters divides them.
+const PROMPT_ROOM: (usize, usize) = (3, 4);
+
+/// Who a batch of slots from `take_slots` is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Supply {
+    /// A miss, or the ring's stock: any victim.
+    Demand,
+    /// A prediction: quiet rows behind the wave only.
+    Speculative,
+}
 
 /// The summary bits the pipeline reads.
 const SUMMARY_COUNT: u32 = 0x1fff_ffff;
@@ -107,13 +145,13 @@ struct DevicePromotion {
     ticket: u64,
 }
 
-/// One promotion copy in flight.
+/// One promotion copy in flight on the copier, named by its job id.
 struct Promotion {
+    id: u64,
     row: usize,
     expert: usize,
     slot: usize,
     bytes: usize,
-    event: CudaEvent,
     /// The copy reads the expert's pad slot, pinned against pad eviction until
     /// the copy is done.
     from_pad: bool,
@@ -127,8 +165,12 @@ pub(crate) struct PipelineState {
     /// VRAM slots, eviction scores, the zone and its free list.
     pub(crate) inner: ExpertCacheInner,
     pub(crate) device: Device,
-    /// Every promotion and relocation copy, in order.
+    /// Every promotion and relocation copy, in order: promotions issued by the
+    /// copier, relocations by this thread with the copier flushed.
     pub(crate) copy_stream: Arc<CudaStream>,
+    copier: Copier,
+    /// The next promotion's job id.
+    next_copy: u64,
     pub(crate) residency: Arc<Mutex<Residency>>,
     pub(crate) clock: Arc<ReclaimClock>,
     pub(crate) ring: Arc<SummaryRing>,
@@ -205,14 +247,17 @@ impl PipelineState {
         all_resident: bool,
         promo_ring: Option<Arc<PromotionRing>>,
         stats: Arc<Mutex<PipelineStats>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let num_moe_layers = layer_geometries.len();
         let experts = inner.experts_per_layer;
         let ring_cap = promo_ring.as_ref().map_or(0, |r| r.cap());
-        Self {
+        let copier = Copier::spawn(copy_stream.clone())?;
+        Ok(Self {
             inner,
             device,
             copy_stream,
+            copier,
+            next_copy: 0,
             residency,
             clock,
             ring,
@@ -242,7 +287,7 @@ impl PipelineState {
             bw_ceiling_gbps: 0.0,
             profile: ProfileAccumulator::new(),
             stats,
-        }
+        })
     }
 
     pub(crate) fn residency(&self) -> Result<MutexGuard<'_, Residency>> {
@@ -256,9 +301,6 @@ impl PipelineState {
     /// expert chain was enqueued without it.
     pub(crate) fn process_routed(&mut self, msg: RoutedLayer) -> Result<()> {
         let row = msg.row;
-        if let Ok(mut s) = self.stats.lock() {
-            s.routed_messages += 1;
-        }
 
         // ── A new pass: the forward thread started its rows over ──
         if self.pass != Some(msg.pass) {
@@ -276,6 +318,7 @@ impl PipelineState {
         let t = profile_now();
         self.ring.wait(msg.slot, msg.summary_word)?;
         self.clock.observe(msg.ticket);
+        let lag = self.clock.latest_started().saturating_sub(msg.ticket);
         self.profile.record("pipe_routed_wait", t);
         // SAFETY: `wait` returned for this invocation, and the forward thread
         // does not rewrite the slot until `routed_served` passes this ticket.
@@ -349,6 +392,9 @@ impl PipelineState {
         let mut misses = 0usize;
         // Misses the GPU had no ring slot for: the copy engine promotes them.
         let mut unpromoted: Vec<usize> = Vec::new();
+        // Whether prompt-only experts are promoted (`PROMPT_ROOM`).
+        let prompt_room =
+            self.inner.zone.limit() * PROMPT_ROOM.1 >= self.inner.total_experts() * PROMPT_ROOM.0;
         for &e in &expert_ids {
             match self.inner.key_to_slot.get(&(row, e)) {
                 Some(&slot) if self.inner.slots[slot].is_some() => {
@@ -365,19 +411,27 @@ impl PipelineState {
                 }
                 _ => {
                     misses += 1;
-                    // The GPU promotes it if bucketize had a ring slot for it;
-                    // a prefill-only miss earns no benefit of the doubt either
-                    // way, so its score biases it toward the next eviction.
-                    if !decode.contains(&e) {
+                    // The GPU promotes it if bucketize had a ring slot for it.
+                    // A decode miss holds its slot to the next step, which
+                    // routes to it again; a prefill-only miss earns no benefit
+                    // of the doubt, so its score biases it toward the next
+                    // eviction.
+                    let routed_by_decode = decode.contains(&e);
+                    if routed_by_decode {
+                        self.inner.record_decode_miss(row, e);
+                    } else {
                         self.inner.record_prefill_elevate(row, e);
                     }
-                    if !self.promoting.contains(&(row, e)) {
+                    if (routed_by_decode || prompt_room) && !self.promoting.contains(&(row, e)) {
                         unpromoted.push(e);
                     }
                 }
             }
         }
         if let Ok(mut s) = self.stats.lock() {
+            s.routed_messages += 1;
+            s.pipeline_lag += lag;
+            s.ring_unslotted += unpromoted.len();
             s.expert_hits += hits;
             s.expert_misses += misses;
             s.worker_pinned += pinned;
@@ -386,32 +440,41 @@ impl PipelineState {
         self.profile.record("pipe_classify", t);
 
         if !self.all_resident {
-            // Stock for what the next two rows will miss — their non-resident
-            // experts, at the share of experts this row routed — since this
-            // thread's refill trails the GPU's bucketize by up to a layer;
-            // never below the floor. Stock the demand no longer wants is taken
-            // back (`trim_ring`).
+            // Stock for what the next `RING_HORIZON` rows will miss — their
+            // non-resident experts, at the share of experts this row routed
+            // that take ring slots (decode traffic, and prompt traffic only
+            // with room for it) — since this thread's refill trails the GPU's
+            // bucketize; never below the floor. Stock the demand no longer
+            // wants is taken back (`trim_ring`).
             if let Some(ring) = &self.promo_ring {
                 let width = self.inner.experts_per_layer.max(1);
-                let ahead: usize = (row + 1..(row + 3).min(self.num_moe_layers))
+                let promoted = if prompt_room {
+                    expert_ids.len()
+                } else {
+                    decode.len()
+                };
+                let ahead: usize = (row + 1..(row + 1 + RING_HORIZON).min(self.num_moe_layers))
                     .map(|r| {
                         let absent = (0..width)
                             .filter(|&e| !self.inner.key_to_slot.contains_key(&(r, e)))
                             .count();
-                        (absent * expert_ids.len()).div_ceil(width)
+                        (absent * promoted).div_ceil(width)
                     })
                     .sum();
                 self.ring_target = (ahead + ahead / 4).clamp(RING_TARGET, ring.cap() / 2);
+                // Without room, a prompt-only expert takes a slot only from
+                // stock past what decode is owed.
+                ring.set_reserve(if prompt_room {
+                    0
+                } else {
+                    self.ring_target as u32
+                });
             }
 
             // ── Misses the ring ran out for, by the copy engine ──
-            // A second crossing of the link, worth it: skipping the prefill-only
-            // ones left the qwen36 gate's next configs to miss them again
-            // (BF16×4 3,176 misses against 1,262), and deferring them to the
-            // pass's end landed thousands of copies on the first decode step
-            // (BF16×1 decode 55 → 25 t/s).
+            // A second crossing of the link, for decode traffic, and for
+            // prompt traffic only with room for it (`PROMPT_ROOM`).
             let t = profile_now();
-            unpromoted.sort_by_key(|e| !decode.contains(e));
             self.promote(row, row, &unpromoted, false)?;
             self.profile.record("pipe_promote", t);
 
@@ -432,8 +495,18 @@ impl PipelineState {
             // late — prefill 845 t/s with them, 1,075 without. A decode-width
             // launch leaves the link mostly idle, and there the look-ahead pays:
             // ×16 decode 237 t/s with it, 220 without.
+            //
+            // A narrower launch that routes prompt-only experts — any expert
+            // no decode-scored row routed — speculates only without room
+            // (`PROMPT_ROOM`); one whose experts are all decode's speculates as
+            // a decode launch does. With room the ring already promotes the
+            // prompt's misses and a speculative copy only competes with them:
+            // Qwen3.6-35B-A3B's one-sequence prompts ran 4–9% slower with it.
+            // Without room, it is the one way a prompt's experts reach VRAM
+            // ahead of the workers: Qwen3.8-Flash-Next's warm one-sequence
+            // prompt ran 4% faster with it.
             let t = profile_now();
-            if !msg.prefill_width {
+            if !msg.prefill_width && (decode.len() == expert_ids.len() || !prompt_room) {
                 if expert_ids.len() * 2 >= self.inner.experts_per_layer.max(1) {
                     self.lookahead(row)?;
                 } else {
@@ -442,31 +515,27 @@ impl PipelineState {
             }
             self.profile.record("pipe_prefetch", t);
         }
-        if row + 1 == self.num_moe_layers {
-            self.inner.decay_scores(0.85);
+        // Scores age once per pass that routed a decode-scored row, at its last
+        // MoE layer. That is nearly every pass — a prompt's last row is scored
+        // as decode (`residency_rows`) — so the recency term counts passes; a
+        // launch with no decode-scored row at all leaves the scores as they are.
+        if row + 1 == self.num_moe_layers && !decode.is_empty() {
+            self.inner.decay_scores(DECODE_RECENCY_DECAY);
         }
         self.publish_gauges();
-
-        // Submit what this message queued: the forward thread does not
-        // synchronize per layer, so on WDDM nothing else would flush these.
-        // SAFETY: a query on a stream this thread owns.
-        unsafe {
-            let _ = cudarc::driver::sys::cuStreamQuery(self.copy_stream.cu_stream());
-        }
         Ok(())
     }
 
     /// Land every promotion whose copy has completed: build the slot's views,
     /// install it, and point the expert's entry at VRAM.
+    /// The copier reports completions; this thread makes no driver call for it.
     pub(crate) fn poll_promotions(&mut self) -> Result<()> {
-        let mut i = 0;
-        while i < self.promotions.len() {
-            if self.promotions[i].event.is_complete() {
-                let p = self.promotions.swap_remove(i);
-                self.land(p)?;
-            } else {
-                i += 1;
-            }
+        for id in self.copier.completed()? {
+            let Some(i) = self.promotions.iter().position(|p| p.id == id) else {
+                candle::bail!("expert copier completed copy {id}, which was never submitted");
+            };
+            let p = self.promotions.swap_remove(i);
+            self.land(p)?;
         }
         Ok(())
     }
@@ -514,9 +583,11 @@ impl PipelineState {
     /// that copy, which is allowed at any time — and so may one of a row with
     /// no invocation in flight, whose entry may go to 0 (`reclaim`). A victim
     /// whose old readers may still run goes on the retire list and is reused
-    /// once they are done. `behind_only` (a speculative promotion's) restricts
-    /// victims to quiet rows in the window behind the wave.
-    fn take_slots(&mut self, row: usize, n: usize, behind_only: bool) -> Result<Vec<usize>> {
+    /// once they are done. `supply` says who the slots are for: a speculative
+    /// promotion takes victims only from quiet rows in the window behind the
+    /// wave.
+    fn take_slots(&mut self, row: usize, n: usize, supply: Supply) -> Result<Vec<usize>> {
+        let behind_only = supply == Supply::Speculative;
         let mut out = Vec::with_capacity(n);
         while out.len() < n {
             match self.inner.take_free() {
@@ -530,15 +601,37 @@ impl PipelineState {
         let quiet: Vec<bool> = (0..self.num_moe_layers)
             .map(|r| self.clock.quiet(r))
             .collect();
-        // Quiet rows first: their slots are reusable at once. Only for a
-        // demand shortfall, experts of busy rows with a pinned copy — their
-        // slots wait on the retire list, so taking them when a quiet victim
-        // exists would evict an expert for a slot nobody can use yet, and a
-        // speculative promotion is never worth that.
+        // A row with an invocation enqueued is held back: the wave is about to
+        // read its experts, so evicting one buys a miss within the pass. The
+        // started-word key leaves every row ahead of the GPU quiet, so with the
+        // forward recorded ahead of it nothing else keeps them out: on
+        // Qwen3.6-35B-A3B (RTX 3090) a prompt's misses doubled and prefill fell
+        // up to 24%.
+        let upcoming: Vec<bool> = (0..self.num_moe_layers)
+            .map(|r| self.clock.upcoming(r))
+            .collect();
+        // Quiet rows not held back first: their slots are reusable at once.
+        // Only for a demand shortfall, held-back rows, then experts of busy
+        // rows with a pinned copy — their slots wait on the retire list, so
+        // taking them when a quiet victim exists would evict an expert for a
+        // slot nobody can use yet, and a speculative promotion is never worth
+        // that.
         let mut victims = self
             .inner
-            .rank_victims(row, n - out.len(), behind_only, |_, layer| quiet[layer]);
-        if !behind_only && victims.len() < n - out.len() {
+            .rank_victims(row, n - out.len(), behind_only, |_, layer| {
+                quiet[layer] && !upcoming[layer]
+            });
+        let demand = supply == Supply::Demand;
+        if demand && victims.len() < n - out.len() {
+            let more = self.inner.rank_victims(
+                row,
+                n - out.len() - victims.len(),
+                behind_only,
+                |_, layer| quiet[layer] && upcoming[layer],
+            );
+            victims.extend(more);
+        }
+        if demand && victims.len() < n - out.len() {
             let places = self
                 .residency
                 .lock()
@@ -549,8 +642,7 @@ impl PipelineState {
                 n - out.len() - victims.len(),
                 behind_only,
                 |slot, layer| {
-                    !quiet[layer]
-                        && keys[slot].is_some_and(|(r, e)| places.has_pinned_copy(r, e))
+                    !quiet[layer] && keys[slot].is_some_and(|(r, e)| places.has_pinned_copy(r, e))
                 },
             );
             drop(places);
@@ -585,6 +677,9 @@ impl PipelineState {
             return;
         };
         let head = ring.head();
+        if let Ok(mut s) = self.stats.lock() {
+            s.ring_taken += head.wrapping_sub(self.ring_taken) as usize;
+        }
         while self.ring_taken != head {
             let i = self.ring_taken as usize % ring.cap();
             let logged = ring.log(self.ring_taken);
@@ -660,7 +755,7 @@ impl PipelineState {
         if want == 0 {
             return Ok(());
         }
-        for slot in self.take_slots(row, want, false)? {
+        for slot in self.take_slots(row, want, Supply::Demand)? {
             let at = ring.tail() as usize % ring.cap();
             self.ring_slots[at] = Some(slot);
             ring.push(self.inner.slot_base(slot));
@@ -760,38 +855,43 @@ impl PipelineState {
                 None => {}
             }
         }
-        let slots = self.take_slots(issue_row, sources.len(), speculative)?;
+        let supply = if speculative {
+            Supply::Speculative
+        } else {
+            Supply::Demand
+        };
+        let slots = self.take_slots(issue_row, sources.len(), supply)?;
         let mut issued = 0usize;
         for ((e, src, from_pad), slot) in sources.into_iter().zip(slots) {
             let dst = self.inner.slot_base(slot);
             if from_pad {
                 self.residency()?.pin_pad(row, e, 1);
             }
-            // SAFETY: `src` is a pinned slot image of at least `bytes`, kept
-            // unwritten until the copy lands (a warm slot is immutable; a pad
-            // slot is pinned against eviction above). `dst` is a slot the zone
-            // handed out with no reader left (`take_slots`).
-            let copied = unsafe {
-                let src = std::slice::from_raw_parts(src as *const u8, bytes);
-                cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream())
-            };
-            if let Err(e2) = copied {
+            // `src` is a pinned slot image of at least `bytes`, kept unwritten
+            // until the copy lands (a warm slot is immutable; a pad slot is
+            // pinned against eviction above); `dst` is a slot the zone handed
+            // out with no reader left (`take_slots`), named by no entry until
+            // the copy is reported complete.
+            let id = self.next_copy;
+            self.next_copy += 1;
+            if let Err(err) = self.copier.submit(CopyJob {
+                id,
+                dst,
+                src,
+                bytes,
+            }) {
                 if from_pad {
                     self.residency()?.pin_pad(row, e, -1);
                 }
                 self.inner.put_free(slot);
-                return Err(candle::Error::wrap(e2));
+                return Err(err);
             }
-            let event = self
-                .copy_stream
-                .record_event(None)
-                .map_err(candle::Error::wrap)?;
             self.promotions.push(Promotion {
+                id,
                 row,
                 expert: e,
                 slot,
                 bytes,
-                event,
                 from_pad,
                 speculative,
             });
@@ -930,11 +1030,10 @@ impl PipelineState {
     }
 
     /// Wait out every promotion copy and land it — before a boundary move,
-    /// which relocates and drops slots.
+    /// which relocates and drops slots, and issues its relocations on the
+    /// copy stream after the copier has nothing left to issue.
     pub(crate) fn finish_promotions(&mut self) -> Result<()> {
-        self.copy_stream
-            .synchronize()
-            .map_err(candle::Error::wrap)?;
+        self.copier.flush()?;
         self.poll_promotions()?;
         debug_assert!(self.promotions.is_empty());
         Ok(())
@@ -979,8 +1078,7 @@ pub(crate) fn spawn_pipeline_thread(
     mut state: PipelineState,
     dead_flag: Arc<AtomicBool>,
 ) -> mpsc::SyncSender<PipelineMessage> {
-    let (tx, rx) =
-        mpsc::sync_channel::<PipelineMessage>(super::dispatch::PIPELINE_CHANNEL_BOUND);
+    let (tx, rx) = mpsc::sync_channel::<PipelineMessage>(super::dispatch::PIPELINE_CHANNEL_BOUND);
 
     std::thread::Builder::new()
         .name("expert-pipeline".into())
@@ -989,8 +1087,9 @@ pub(crate) fn spawn_pipeline_thread(
                 dead: dead_flag,
                 abort: state.abort.clone(),
             };
-            // This thread issues CUDA calls (promotion copies, events, views)
-            // that need the device's context current on it.
+            // This thread builds the views of landed slots, which needs the
+            // device's context current on it. Promotion copies and their
+            // events are the copier thread's.
             if let Err(e) = state.bind_device_to_thread() {
                 tracing::error!(
                     target: "candle_transformers::expert_lre",

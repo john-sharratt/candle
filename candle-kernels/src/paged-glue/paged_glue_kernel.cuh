@@ -499,7 +499,7 @@ inline void launch_paged_glue_attn(
     float* pm = nullptr;
     if (num_splits > 1) {
         fused_attn::fused_attn_partial_pool((int64_t)total_q * n_q_head, num_splits, HEAD_DIM,
-                                            &pa, &pm, stream);
+                                            &pa, &pm);
         if (pa == nullptr || pm == nullptr) num_splits = 1; // pool alloc failed: single-pass
     }
 

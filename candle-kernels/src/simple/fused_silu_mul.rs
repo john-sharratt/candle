@@ -40,6 +40,7 @@ extern "C" {
         gate: *const c_void,
         up: *const c_void,
         out: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Fused SwiGLU → q8a128: `out = quantize(silu(gate) * up)` in one kernel (producer
@@ -61,5 +62,8 @@ extern "C" {
         // wider for the two halves of one fused gate|up projection (then `cols`
         // must be a multiple of 128).
         row_stride: i32,
+        // The stream the launch is issued on: the device's compute stream, or a
+        // capture stream when it is being recorded into a graph.
+        stream: *mut c_void,
     );
 }

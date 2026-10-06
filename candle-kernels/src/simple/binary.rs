@@ -108,6 +108,7 @@ extern "C" {
         lhs: *const c_void,
         rhs: *const c_void,
         out: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatches to the appropriate binary comparison kernel.
@@ -130,6 +131,7 @@ extern "C" {
         lhs: *const c_void,
         rhs: *const c_void,
         out: *mut u8,
+        stream: *mut c_void,
     );
 
     /// Unified dispatcher for all binary operations.
@@ -176,6 +178,7 @@ extern "C" {
         dims_and_strides: *const usize,
         lhs: *mut c_void,
         rhs: *const c_void,
+        stream: *mut c_void,
     );
 }
 

@@ -14,6 +14,7 @@
 //!   is exact.
 
 use candle::quantized::cuda::DynamicActs;
+use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::Int8Mode;
 use candle::{DType, LiveTensor, Result, Tensor};
 
@@ -140,7 +141,7 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
         x: &mut Tensor,
         acts: DynamicActs<'w>,
         work_dtype: DType,
-        decode_tokens: usize,
+        decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<()> {
         match &self.layer.ffn {
@@ -150,7 +151,7 @@ impl BatchedAttentionLayer for Qwen35AttentionLayer<'_> {
             }
             // The shared+routed combine, its narrowing and the residual add are
             // one launch.
-            QuantFfn::Moe(m) => m.forward_residual(x, acts, work_dtype, decode_tokens, wave),
+            QuantFfn::Moe(m) => m.forward_residual(x, acts, work_dtype, decode, wave),
         }
     }
 
