@@ -96,8 +96,17 @@ pub struct PipelineStats {
     pub pipeline_lag: u64,
     /// Ring slots bucketize gave remote experts, as collected from its log.
     pub ring_taken: usize,
-    /// Misses bucketize had no ring slot for — the copy engine's to promote.
+    /// Of those, slots that still held a resident expert — a lazy victim the
+    /// claim evicted on the device.
+    pub victims_claimed: usize,
+    /// Lazy victims bucketize passed over because their own launch routed them.
+    pub victims_skipped: usize,
+    /// Misses that took no ring slot and were not otherwise being promoted:
+    /// computed from scratch, claimed by the next launch that routes them.
     pub ring_unslotted: usize,
+    /// Of those, the ones a decode row routed — a decode row co-batched into a
+    /// sweep defers its claims to the next narrow launch.
+    pub decode_unslotted: usize,
     /// **Live** VRAM bytes held by resident expert slots — `occupied_slots ×
     /// slot_size`. Unlike the counters above (monotonic tallies), this is a
     /// gauge: it rises as experts load into VRAM and falls as they stream out
@@ -176,7 +185,10 @@ impl PipelineStats {
             s.routed_messages = 0;
             s.pipeline_lag = 0;
             s.ring_taken = 0;
+            s.victims_claimed = 0;
+            s.victims_skipped = 0;
             s.ring_unslotted = 0;
+            s.decode_unslotted = 0;
         }
     }
 

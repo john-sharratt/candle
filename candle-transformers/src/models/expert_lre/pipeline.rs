@@ -33,9 +33,9 @@ use super::cache::{ExpertCacheInner, DECODE_RECENCY_DECAY};
 use super::copier::{Copier, CopyJob};
 use super::dispatch::{AbortWord, PassState, SummaryRing};
 use super::pinned::LayerGeometry;
-use super::promo::{ticket_from_word, PromotionRing};
+use super::promo::{ticket_from_word, PromotionRing, Victim};
 use super::reclaim::{ReclaimClock, RetireList};
-use super::residency::Residency;
+use super::residency::{Fallback, Residency};
 use super::slot_image::{build_slot_view, slot_offsets};
 use super::stager::StagerMsg;
 use super::transition::TransitionMatrix;
@@ -121,13 +121,69 @@ const RING_HORIZON: usize = 2;
 /// three quarters divides them.
 const PROMPT_ROOM: (usize, usize) = (3, 4);
 
-/// Who a batch of slots from `take_slots` is for.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Supply {
-    /// A miss, or the ring's stock: any victim.
-    Demand,
-    /// A prediction: quiet rows behind the wave only.
-    Speculative,
+/// What the promotion ring is kept at: how many offers it holds, the reserve
+/// below which a prompt-only expert takes no slot, and the sweep word — the
+/// most claiming experts a launch may have and still claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RingStock {
+    target: usize,
+    reserve: u32,
+    sweep: u32,
+}
+
+/// The promotion ring's stock, from the stock the next rows' decode misses
+/// want (`decode_ahead`), the stock all their misses want (`all_ahead`), and
+/// the zone's **empty** slots — the free list plus the empty offers already
+/// standing in the ring.
+///
+/// **Every empty slot is stocked.** A ring slot is where a worker's copy of a
+/// missed expert lands and is computed from (`moe_live_worker`), so a miss that
+/// finds one is promoted for the copy the layer made anyway. An empty slot
+/// evicts nothing to stand there, so the ring holds all of them (to half its
+/// capacity) whatever the prediction says; the prediction sizes only the stock
+/// of lazy victims, which a claim evicts. Stocked to the prediction alone, a
+/// 16 GB card's zone stayed ~1,400 slots short of full for a whole
+/// Qwen3.6-35B-A3B run while its misses crossed the link and were thrown away.
+///
+/// With room (`PROMPT_ROOM`) nothing is reserved, so a prompt-only miss takes
+/// the stock like a decode one — in a launch that is not a sweep. Without room
+/// decode's own target is the reserve, so the stock a prompt-only expert may
+/// take is only what stands past it: empty slots, never a victim decode would
+/// not have made.
+///
+/// **The sweep word is the prediction, never the empties.** A launch whose
+/// claiming experts outnumber what the next rows were predicted to want is a
+/// prompt passing over the table, and claims nothing: its misses would evict
+/// one-shot experts into the zone decode reuses. Counting empty slots into it
+/// would let a cold prompt claim victims as soon as the zone had a hole. That
+/// holds with room too: a prefill launch's misses run to thousands against a
+/// prediction capped at half the ring, so even a model whose zone holds most of
+/// its experts promotes a prompt's misses only from launches narrow enough to
+/// fit the prediction — stencils, short prompts, the rows a decode step
+/// verifies.
+fn ring_stock(
+    decode_ahead: usize,
+    all_ahead: usize,
+    prompt_room: bool,
+    empty_slots: usize,
+    cap: usize,
+) -> RingStock {
+    let target = |ahead: usize| (ahead + ahead / 4).clamp(RING_TARGET, cap / 2);
+    let empties = empty_slots.min(cap / 2);
+    if prompt_room {
+        let all = target(all_ahead);
+        return RingStock {
+            target: all.max(empties),
+            reserve: 0,
+            sweep: all as u32,
+        };
+    }
+    let decode = target(decode_ahead);
+    RingStock {
+        target: decode.max(empties),
+        reserve: decode as u32,
+        sweep: decode as u32,
+    }
 }
 
 /// The summary bits the pipeline reads.
@@ -145,7 +201,31 @@ struct DevicePromotion {
     ticket: u64,
 }
 
-/// One promotion copy in flight on the copier, named by its job id.
+/// What stands at one ring index: a zone slot, and — when it was offered as a
+/// lazy victim — the resident expert it still holds and the fallback held for
+/// it as long as the offer stands (a pad slot pinned, a cold one marked).
+#[derive(Clone, Copy, Debug)]
+struct Offer {
+    slot: usize,
+    victim: Option<((usize, usize), Fallback)>,
+}
+
+/// A lazy victim chosen for an offer: its slot, its expert, what the device is
+/// told, and the fallback held for it.
+struct Chosen {
+    slot: usize,
+    key: (usize, usize),
+    victim: Victim,
+    fallback: Fallback,
+}
+
+/// The share of the pad lazy victims may hold pinned (`1 / PAD_PIN_SHARE`). A
+/// pinned pad slot cannot be evicted, and the stager stages every cold miss
+/// into the pad: offers holding most of it would leave a cold wait nowhere to
+/// land.
+const PAD_PIN_SHARE: usize = 4;
+
+/// One speculative promotion copy in flight on the copier, named by its job id.
 struct Promotion {
     id: u64,
     row: usize,
@@ -155,8 +235,6 @@ struct Promotion {
     /// The copy reads the expert's pad slot, pinned against pad eviction until
     /// the copy is done.
     from_pad: bool,
-    /// Predicted ahead of its row, rather than a miss the ring ran out for.
-    speculative: bool,
 }
 
 /// The pipeline thread's private state. Never crosses a thread boundary after
@@ -198,12 +276,16 @@ pub(crate) struct PipelineState {
     /// promoting.
     promotions: Vec<Promotion>,
     promoting: HashSet<(usize, usize)>,
-    /// The promotion ring (none when every expert is in VRAM); the zone slot
-    /// behind each ring index; how far this thread has collected the device's
-    /// takes; the slots the GPU is filling; and how many free slots the ring
-    /// is kept stocked with.
+    /// The promotion ring (none when every expert is in VRAM); the offer
+    /// behind each ring index; the slots standing in it, which nothing else
+    /// may evict, relocate or offer again until a claim or a withdrawal returns
+    /// them; how far this thread has collected the device's takes; the slots
+    /// the GPU is filling; and how many offers the ring is kept stocked with.
     promo_ring: Option<Arc<PromotionRing>>,
-    ring_slots: Vec<Option<usize>>,
+    ring_slots: Vec<Option<Offer>>,
+    offered: HashSet<usize>,
+    /// Standing offers whose victim's pad slot is pinned for them.
+    pad_pinned_offers: usize,
     ring_taken: u32,
     device_promotions: Vec<DevicePromotion>,
     ring_target: usize,
@@ -275,6 +357,8 @@ impl PipelineState {
             promoting: HashSet::new(),
             promo_ring,
             ring_slots: vec![None; ring_cap],
+            offered: HashSet::new(),
+            pad_pinned_offers: 0,
             ring_taken: 0,
             device_promotions: Vec::new(),
             ring_target: RING_TARGET.min(ring_cap / 2),
@@ -326,7 +410,7 @@ impl PipelineState {
         self.routed_served.store(msg.ticket, Ordering::Release);
 
         let t = profile_now();
-        self.collect_device_promotions(msg.ticket);
+        self.collect_device_promotions(msg.ticket)?;
         for slot in self.retired.drain(&self.clock) {
             self.inner.put_free(slot);
         }
@@ -373,11 +457,7 @@ impl PipelineState {
             }
         }
         self.speculative_loads.retain(|&(l, _)| l != row);
-        let late = self
-            .promotions
-            .iter()
-            .filter(|p| p.speculative && p.row == row)
-            .count();
+        let late = self.promotions.iter().filter(|p| p.row == row).count();
         if late > 0 {
             self.pass_late += late;
             if let Ok(mut s) = self.stats.lock() {
@@ -390,8 +470,11 @@ impl PipelineState {
         // ── Hits and misses, by this thread's own bookkeeping ──
         let mut hits = 0usize;
         let mut misses = 0usize;
-        // Misses the GPU had no ring slot for: the copy engine promotes them.
-        let mut unpromoted: Vec<usize> = Vec::new();
+        // Misses that took no ring slot and are not otherwise being promoted:
+        // their workers computed them from scratch, and the next launch that
+        // routes them claims one. Those a decode row routed are counted apart —
+        // a decode row co-batched into a sweep defers its claims this way.
+        let (mut unslotted, mut decode_unslotted) = (0usize, 0usize);
         // Whether prompt-only experts are promoted (`PROMPT_ROOM`).
         let prompt_room =
             self.inner.zone.limit() * PROMPT_ROOM.1 >= self.inner.total_experts() * PROMPT_ROOM.0;
@@ -422,8 +505,9 @@ impl PipelineState {
                     } else {
                         self.inner.record_prefill_elevate(row, e);
                     }
-                    if (routed_by_decode || prompt_room) && !self.promoting.contains(&(row, e)) {
-                        unpromoted.push(e);
+                    if !self.promoting.contains(&(row, e)) {
+                        unslotted += 1;
+                        decode_unslotted += usize::from(routed_by_decode);
                     }
                 }
             }
@@ -431,7 +515,8 @@ impl PipelineState {
         if let Ok(mut s) = self.stats.lock() {
             s.routed_messages += 1;
             s.pipeline_lag += lag;
-            s.ring_unslotted += unpromoted.len();
+            s.ring_unslotted += unslotted;
+            s.decode_unslotted += decode_unslotted;
             s.expert_hits += hits;
             s.expert_misses += misses;
             s.worker_pinned += pinned;
@@ -440,43 +525,36 @@ impl PipelineState {
         self.profile.record("pipe_classify", t);
 
         if !self.all_resident {
-            // Stock for what the next `RING_HORIZON` rows will miss — their
-            // non-resident experts, at the share of experts this row routed
-            // that take ring slots (decode traffic, and prompt traffic only
-            // with room for it) — since this thread's refill trails the GPU's
-            // bucketize; never below the floor. Stock the demand no longer
-            // wants is taken back (`trim_ring`).
+            // Stock every empty slot, and past them what the next
+            // `RING_HORIZON` rows will miss — their non-resident experts, at the
+            // share of experts this row routed that take ring slots — since this
+            // thread's refill trails the GPU's bucketize; never below the floor.
+            // Without room, prompt traffic gets only stock past decode's
+            // reserve, and a launch claiming more than the predicted demand is a
+            // sweep (`ring_stock`). Stock the demand no longer wants is taken
+            // back (`trim_ring`).
             if let Some(ring) = &self.promo_ring {
+                let empty_slots = self.inner.free_len() + self.empty_offers(ring);
                 let width = self.inner.experts_per_layer.max(1);
-                let promoted = if prompt_room {
-                    expert_ids.len()
-                } else {
-                    decode.len()
-                };
-                let ahead: usize = (row + 1..(row + 1 + RING_HORIZON).min(self.num_moe_layers))
+                let absent: usize = (row + 1..(row + 1 + RING_HORIZON).min(self.num_moe_layers))
                     .map(|r| {
-                        let absent = (0..width)
+                        (0..width)
                             .filter(|&e| !self.inner.key_to_slot.contains_key(&(r, e)))
-                            .count();
-                        (absent * promoted).div_ceil(width)
+                            .count()
                     })
                     .sum();
-                self.ring_target = (ahead + ahead / 4).clamp(RING_TARGET, ring.cap() / 2);
-                // Without room, a prompt-only expert takes a slot only from
-                // stock past what decode is owed.
-                ring.set_reserve(if prompt_room {
-                    0
-                } else {
-                    self.ring_target as u32
-                });
+                let ahead = |promoted: usize| (absent * promoted).div_ceil(width);
+                let stock = ring_stock(
+                    ahead(decode.len()),
+                    ahead(expert_ids.len()),
+                    prompt_room,
+                    empty_slots,
+                    ring.cap(),
+                );
+                self.ring_target = stock.target;
+                ring.set_reserve(stock.reserve);
+                ring.set_sweep(stock.sweep);
             }
-
-            // ── Misses the ring ran out for, by the copy engine ──
-            // A second crossing of the link, for decode traffic, and for
-            // prompt traffic only with room for it (`PROMPT_ROOM`).
-            let t = profile_now();
-            self.promote(row, row, &unpromoted, false)?;
-            self.profile.record("pipe_promote", t);
 
             // ── Stock the ring for the layers to come ──
             let t = profile_now();
@@ -564,30 +642,23 @@ impl PipelineState {
         self.inner.install(p.slot, p.row, p.expert, view);
         self.residency()?
             .set_vram(p.row, p.expert, Some((p.slot, base)));
-        if p.speculative {
-            self.speculative_loads.insert((p.row, p.expert));
-        }
+        self.speculative_loads.insert((p.row, p.expert));
         if let Ok(mut s) = self.stats.lock() {
             s.promotions += 1;
             s.promotion_bytes += p.bytes;
-            if p.speculative {
-                s.prefetch_promotions += 1;
-            }
+            s.prefetch_promotions += 1;
         }
         Ok(())
     }
 
-    /// Up to `n` VRAM slots no kernel can be reading: free ones first, then the
-    /// best victims (ranked against `row`, the row the wave is at). Any expert
-    /// with a pinned host copy may be a victim — its entry is retargeted to
-    /// that copy, which is allowed at any time — and so may one of a row with
-    /// no invocation in flight, whose entry may go to 0 (`reclaim`). A victim
-    /// whose old readers may still run goes on the retire list and is reused
-    /// once they are done. `supply` says who the slots are for: a speculative
-    /// promotion takes victims only from quiet rows in the window behind the
-    /// wave.
-    fn take_slots(&mut self, row: usize, n: usize, supply: Supply) -> Result<Vec<usize>> {
-        let behind_only = supply == Supply::Speculative;
+    /// Up to `n` VRAM slots no kernel can be reading, for a speculative
+    /// promotion: free ones first, then the best victims (ranked against
+    /// `row`, the row the wave is at) from quiet rows in the window behind the
+    /// wave. A row with no invocation in flight may have its entry go to 0
+    /// (`reclaim`); a victim whose old readers may still run goes on the retire
+    /// list and is reused once they are done. A slot standing in the promotion
+    /// ring is the ring's, and never taken here.
+    fn take_slots(&mut self, row: usize, n: usize) -> Result<Vec<usize>> {
         let mut out = Vec::with_capacity(n);
         while out.len() < n {
             match self.inner.take_free() {
@@ -610,44 +681,12 @@ impl PipelineState {
         let upcoming: Vec<bool> = (0..self.num_moe_layers)
             .map(|r| self.clock.upcoming(r))
             .collect();
-        // Quiet rows not held back first: their slots are reusable at once.
-        // Only for a demand shortfall, held-back rows, then experts of busy
-        // rows with a pinned copy — their slots wait on the retire list, so
-        // taking them when a quiet victim exists would evict an expert for a
-        // slot nobody can use yet, and a speculative promotion is never worth
-        // that.
-        let mut victims = self
+        let offered = &self.offered;
+        let victims = self
             .inner
-            .rank_victims(row, n - out.len(), behind_only, |_, layer| {
-                quiet[layer] && !upcoming[layer]
+            .rank_victims(row, n - out.len(), true, |slot, layer| {
+                quiet[layer] && !upcoming[layer] && !offered.contains(&slot)
             });
-        let demand = supply == Supply::Demand;
-        if demand && victims.len() < n - out.len() {
-            let more = self.inner.rank_victims(
-                row,
-                n - out.len() - victims.len(),
-                behind_only,
-                |_, layer| quiet[layer] && upcoming[layer],
-            );
-            victims.extend(more);
-        }
-        if demand && victims.len() < n - out.len() {
-            let places = self
-                .residency
-                .lock()
-                .map_err(|_| candle::Error::Msg("expert pipeline: residency poisoned".into()))?;
-            let keys = &self.inner.slot_to_key;
-            let more = self.inner.rank_victims(
-                row,
-                n - out.len() - victims.len(),
-                behind_only,
-                |slot, layer| {
-                    !quiet[layer] && keys[slot].is_some_and(|(r, e)| places.has_pinned_copy(r, e))
-                },
-            );
-            drop(places);
-            victims.extend(more);
-        }
         let mut evicted = 0usize;
         for victim in victims {
             let Some((vr, ve)) = self.inner.evict(victim) else {
@@ -669,32 +708,171 @@ impl PipelineState {
         Ok(out)
     }
 
-    /// Collect what the GPU has taken from the promotion ring: each taken slot
-    /// becomes a device promotion, whole once its invocation is done. `near` is
-    /// the ticket being served — the logged words are resolved against it.
-    fn collect_device_promotions(&mut self, near: u64) {
+    /// Collect what the GPU has taken from the promotion ring, in log order.
+    /// A skipped victim's offer comes back with its expert still resident. A
+    /// claimed victim was evicted by the device — its entries retargeted before
+    /// its slot was written — so its bookkeeping follows at once, ahead of any
+    /// later claim that could promote the same expert again. Each claimed slot
+    /// becomes a device promotion, whole once its invocation is done. `near`
+    /// is the ticket being served — the logged words are resolved against it.
+    fn collect_device_promotions(&mut self, near: u64) -> Result<()> {
         let Some(ring) = self.promo_ring.clone() else {
-            return;
+            return Ok(());
         };
         let head = ring.head();
-        if let Ok(mut s) = self.stats.lock() {
-            s.ring_taken += head.wrapping_sub(self.ring_taken) as usize;
-        }
+        let (mut taken, mut claimed, mut skipped) = (0usize, 0usize, 0usize);
         while self.ring_taken != head {
             let i = self.ring_taken as usize % ring.cap();
             let logged = ring.log(self.ring_taken);
-            let slot = self.ring_slots[i]
+            let offer = self.ring_slots[i]
                 .take()
-                .expect("a taken ring index holds the slot published there");
+                .expect("a taken ring index holds the offer made there");
+            self.ring_taken = self.ring_taken.wrapping_add(1);
+            self.offered.remove(&offer.slot);
+            if logged.skipped() {
+                self.release_offer(&offer)?;
+                skipped += 1;
+                continue;
+            }
+            if let Some(((vr, ve), _)) = offer.victim {
+                let evicted = self.inner.evict(offer.slot);
+                if evicted != Some((vr, ve)) {
+                    candle::bail!(
+                        "expert pipeline: ring slot {} was offered holding ({vr}, {ve}) but held \
+                         {evicted:?} when the device claimed it",
+                        offer.slot
+                    );
+                }
+                // The entry now names the fallback the device wrote (the
+                // stager may have booked a cold one first); only then may the
+                // stager evict a pad copy it names.
+                self.residency()?.device_evicted(vr, ve);
+                self.release_offer(&offer)?;
+                claimed += 1;
+            }
+            taken += 1;
             self.promoting.insert((logged.row, logged.expert));
             self.device_promotions.push(DevicePromotion {
                 row: logged.row,
                 expert: logged.expert,
-                slot,
+                slot: offer.slot,
                 ticket: ticket_from_word(logged.word, near),
             });
-            self.ring_taken = self.ring_taken.wrapping_add(1);
         }
+        if let Ok(mut s) = self.stats.lock() {
+            s.ring_taken += taken;
+            s.victims_claimed += claimed;
+            s.victims_skipped += skipped;
+            s.evictions += claimed;
+        }
+        Ok(())
+    }
+
+    /// Empty offers standing in the ring, untaken.
+    fn empty_offers(&self, ring: &PromotionRing) -> usize {
+        let (head, tail) = (ring.head(), ring.tail());
+        let mut i = head;
+        let mut n = 0usize;
+        while i != tail {
+            if self.ring_slots[i as usize % ring.cap()].is_some_and(|o| o.victim.is_none()) {
+                n += 1;
+            }
+            i = i.wrapping_add(1);
+        }
+        n
+    }
+
+    /// Up to `n` lazy victims, ranked against `row`: resident experts whose
+    /// slot a miss may claim, each with the entries the device retargets it
+    /// to (`Residency::displaced_entries`), never a slot already offered or
+    /// one being promoted into. The fallback is held here for the life of the
+    /// offer: a pad slot pinned, while fewer than a `PAD_PIN_SHARE`th of the
+    /// pad is pinned so (past that, a pad-backed expert is passed over); a cold
+    /// one marked, so the stager reads a cold summary of it as the device's
+    /// eviction. Rows with an invocation enqueued are offered last: the wave is
+    /// about to read their experts.
+    ///
+    /// The ranking runs without the residency lock — it is a scan of the whole
+    /// zone, and the stager publishes pad copies under that lock while cold
+    /// workers wait on them — so it asks for twice what it needs, and the lock
+    /// is held only to confirm and hold the ranked slots' fallbacks, in rank
+    /// order, keeping the first `n`.
+    fn lazy_victims(&mut self, row: usize, n: usize) -> Result<Vec<Chosen>> {
+        let upcoming: Vec<bool> = (0..self.num_moe_layers)
+            .map(|r| self.clock.upcoming(r))
+            .collect();
+        let keys = &self.inner.slot_to_key;
+        let offered = &self.offered;
+        let promoting = &self.promoting;
+        let width = self.inner.experts_per_layer;
+        let candidate = |slot: usize| {
+            !offered.contains(&slot)
+                && keys[slot].is_some_and(|(r, e)| !promoting.contains(&(r, e)))
+        };
+        let ask = 2 * n;
+        let mut slots = self
+            .inner
+            .rank_victims(row, ask, false, |slot, layer| !upcoming[layer] && candidate(slot));
+        if slots.len() < ask {
+            let more = self.inner.rank_victims(row, ask - slots.len(), false, |slot, layer| {
+                upcoming[layer] && candidate(slot)
+            });
+            slots.extend(more);
+        }
+        let pad_cap = self
+            .stats
+            .lock()
+            .map_or(0, |s| s.pad_slots / PAD_PIN_SHARE);
+        let mut pinned = self.pad_pinned_offers;
+        let mut chosen = Vec::with_capacity(n);
+        let mut places = self
+            .residency
+            .lock()
+            .map_err(|_| candle::Error::Msg("expert pipeline: residency poisoned".into()))?;
+        for slot in slots {
+            if chosen.len() == n {
+                break;
+            }
+            let Some((r, e)) = keys[slot] else { continue };
+            let Some((retarget, fallback)) = places.displaced_entries(r, e) else {
+                continue;
+            };
+            match fallback {
+                Fallback::Pad if pinned >= pad_cap => continue,
+                Fallback::Pad => {
+                    places.pin_pad(r, e, 1);
+                    pinned += 1;
+                }
+                Fallback::Cold => places.set_offered_cold(r, e, true),
+                Fallback::Warm => {}
+            }
+            chosen.push(Chosen {
+                slot,
+                key: (r, e),
+                victim: Victim {
+                    index: (r * width + e) as u64,
+                    retarget,
+                },
+                fallback,
+            });
+        }
+        drop(places);
+        self.pad_pinned_offers = pinned;
+        Ok(chosen)
+    }
+
+    /// An offer is over — claimed, skipped or taken back: release the fallback
+    /// it held.
+    fn release_offer(&mut self, offer: &Offer) -> Result<()> {
+        match offer.victim {
+            Some(((r, e), Fallback::Pad)) => {
+                self.residency()?.pin_pad(r, e, -1);
+                self.pad_pinned_offers -= 1;
+            }
+            Some(((r, e), Fallback::Cold)) => self.residency()?.set_offered_cold(r, e, false),
+            Some((_, Fallback::Warm)) | None => {}
+        }
+        Ok(())
     }
 
     /// Point every device-promoted expert whose invocation has completed — all
@@ -743,29 +921,61 @@ impl PipelineState {
         Ok(())
     }
 
-    /// Keep `ring_target` free slots published in the promotion ring.
+    /// Keep `ring_target` offers standing in the promotion ring: every empty
+    /// slot first, then lazy victims, which stay resident until a miss claims
+    /// them.
     fn refill_ring(&mut self, row: usize) -> Result<()> {
         let Some(ring) = self.promo_ring.clone() else {
             return Ok(());
         };
         let tail = ring.tail();
-        let free = tail.wrapping_sub(ring.head()) as usize;
+        let stocked = tail.wrapping_sub(ring.head()) as usize;
         let room = ring.cap() - tail.wrapping_sub(self.ring_taken) as usize;
-        let want = self.ring_target.saturating_sub(free).min(room);
+        let want = self.ring_target.saturating_sub(stocked).min(room);
         if want == 0 {
             return Ok(());
         }
-        for slot in self.take_slots(row, want, Supply::Demand)? {
+        let mut offers: Vec<(Offer, Option<Victim>)> = Vec::with_capacity(want);
+        while offers.len() < want {
+            match self.inner.take_free() {
+                Some(slot) => offers.push((Offer { slot, victim: None }, None)),
+                None => break,
+            }
+        }
+        if offers.len() < want {
+            for c in self.lazy_victims(row, want - offers.len())? {
+                offers.push((
+                    Offer {
+                        slot: c.slot,
+                        victim: Some((c.key, c.fallback)),
+                    },
+                    Some(c.victim),
+                ));
+            }
+        }
+        for (offer, victim) in offers {
             let at = ring.tail() as usize % ring.cap();
-            self.ring_slots[at] = Some(slot);
-            ring.push(self.inner.slot_base(slot));
+            self.ring_slots[at] = Some(offer);
+            self.offered.insert(offer.slot);
+            ring.offer(self.inner.slot_base(offer.slot), victim);
         }
         Ok(())
     }
 
-    /// Take back the stocked slots past `ring_target` — every one an expert
-    /// evicted for a promotion demand no longer brings — and return them to
-    /// the zone, where the next promotions take them before evicting anything.
+    /// Return an offer the device never took: an empty slot to the zone's free
+    /// list, a lazy victim to plain residency — its expert never left — with
+    /// its fallback released.
+    fn take_back(&mut self, offer: Offer) -> Result<()> {
+        self.offered.remove(&offer.slot);
+        self.release_offer(&offer)?;
+        if offer.victim.is_none() {
+            self.inner.put_free(offer.slot);
+        }
+        Ok(())
+    }
+
+    /// Take back the offers past `ring_target` — stock the demand no longer
+    /// wants.
     ///
     /// Only when no bucketize can be reading the ring: under the pass lock (no
     /// invocation can begin) with every invocation begun observed (its
@@ -792,44 +1002,37 @@ impl PipelineState {
         drop(p);
         let mut i = keep;
         while i != tail {
-            if let Some(slot) = self.ring_slots[i as usize % ring.cap()].take() {
-                self.inner.put_free(slot);
+            if let Some(offer) = self.ring_slots[i as usize % ring.cap()].take() {
+                self.take_back(offer)?;
             }
             i = i.wrapping_add(1);
         }
         Ok(())
     }
 
-    /// Take every slot out of the promotion ring — before a boundary move, with
-    /// the device synchronized: land what the GPU filled, free what it never
-    /// took.
+    /// Take every offer out of the promotion ring — before a boundary move,
+    /// with the device synchronized: land what the GPU filled, take back what
+    /// it never took.
     pub(crate) fn drain_ring(&mut self, near: u64) -> Result<()> {
         let Some(ring) = self.promo_ring.clone() else {
             return Ok(());
         };
-        self.collect_device_promotions(near);
+        self.collect_device_promotions(near)?;
         self.land_device_promotions(true)?;
         ring.withdraw();
-        for slot in self.ring_slots.iter_mut().filter_map(Option::take) {
-            self.inner.put_free(slot);
+        let untaken: Vec<Offer> = self.ring_slots.iter_mut().filter_map(Option::take).collect();
+        for offer in untaken {
+            self.take_back(offer)?;
         }
         self.ring_taken = ring.head();
         Ok(())
     }
 
-    /// Promote `experts` of `row` into VRAM by the copy engine, those with a
-    /// pinned copy. `speculative`: predicted ahead of their row — victims only
-    /// from behind the wave, and the cold ones go to the stager to stage ahead;
-    /// otherwise misses the ring ran out for, whose cold ones the stager is
-    /// already staging. `issue_row` is the row the wave is at — what victims
-    /// are ranked against.
-    fn promote(
-        &mut self,
-        issue_row: usize,
-        row: usize,
-        experts: &[usize],
-        speculative: bool,
-    ) -> Result<usize> {
+    /// Prefetch `experts` of `row`, predicted ahead of it, into VRAM by the copy
+    /// engine — those with a pinned copy; the cold ones go to the stager to
+    /// stage ahead. Victims only from behind the wave (`take_slots`).
+    /// `issue_row` is the row the wave is at — what victims are ranked against.
+    fn promote(&mut self, issue_row: usize, row: usize, experts: &[usize]) -> Result<usize> {
         let Device::Cuda(_) = &self.device else {
             return Ok(0);
         };
@@ -851,16 +1054,10 @@ impl PipelineState {
             }
             match self.residency()?.place(row, e).pinned_source() {
                 Some((src, from_pad)) => sources.push((e, src, from_pad)),
-                None if speculative => to_stage.push(e),
-                None => {}
+                None => to_stage.push(e),
             }
         }
-        let supply = if speculative {
-            Supply::Speculative
-        } else {
-            Supply::Demand
-        };
-        let slots = self.take_slots(issue_row, sources.len(), supply)?;
+        let slots = self.take_slots(issue_row, sources.len())?;
         let mut issued = 0usize;
         for ((e, src, from_pad), slot) in sources.into_iter().zip(slots) {
             let dst = self.inner.slot_base(slot);
@@ -893,7 +1090,6 @@ impl PipelineState {
                 slot,
                 bytes,
                 from_pad,
-                speculative,
             });
             self.promoting.insert((row, e));
             self.pass_dma_bytes += bytes;
@@ -928,7 +1124,7 @@ impl PipelineState {
         cands.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         cands.truncate(LOOKAHEAD_MAX);
         let experts: Vec<usize> = cands.into_iter().map(|(e, _)| e).collect();
-        self.promote(row, target, &experts, true)?;
+        self.promote(row, target, &experts)?;
         Ok(())
     }
 
@@ -958,7 +1154,7 @@ impl PipelineState {
             // A pinned layer's experts are all resident; the prediction still
             // chains through it.
             if target >= self.inner.pinned_layers {
-                self.promote(row, target, &predicted, true)?;
+                self.promote(row, target, &predicted)?;
             }
             source = predicted;
         }
@@ -1118,9 +1314,9 @@ pub(crate) fn spawn_pipeline_thread(
                         // Land whatever has completed, so a reader of the
                         // counters sees it.
                         let near = state.routed_served.load(Ordering::Acquire);
-                        state.collect_device_promotions(near);
                         if let Err(e) = state
-                            .poll_promotions()
+                            .collect_device_promotions(near)
+                            .and_then(|()| state.poll_promotions())
                             .and_then(|()| state.land_device_promotions(false))
                         {
                             tracing::error!(
@@ -1158,4 +1354,48 @@ pub(crate) fn spawn_pipeline_thread(
         .expect("failed to spawn expert-pipeline thread");
 
     tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ring_stock, RingStock};
+
+    fn stock(target: usize, reserve: u32, sweep: u32) -> RingStock {
+        RingStock {
+            target,
+            reserve,
+            sweep,
+        }
+    }
+
+    /// With room the ring stocks for every miss, ×1.25, reserves nothing, and
+    /// lets a launch claim up to that prediction.
+    #[test]
+    fn with_room_the_ring_stocks_for_all_misses_and_reserves_nothing() {
+        assert_eq!(ring_stock(8, 100, true, 0, 1024), stock(125, 0, 125));
+        // The floor and the half-capacity ceiling.
+        assert_eq!(ring_stock(0, 4, true, 0, 1024), stock(32, 0, 32));
+        assert_eq!(ring_stock(0, 1_000, true, 0, 1024), stock(512, 0, 512));
+        // More empty slots than the prediction: every one is stocked, and the
+        // sweep word stays the prediction.
+        assert_eq!(ring_stock(8, 100, true, 300, 1024), stock(300, 0, 125));
+    }
+
+    /// Without room decode's target is the reserve and the sweep word, and the
+    /// stock past it is empty slots only — a full zone stocks exactly decode's
+    /// target.
+    #[test]
+    fn without_room_the_stock_past_decodes_reserve_is_empty_slots() {
+        // Full zone: stock = reserve = sweep = decode's target.
+        assert_eq!(ring_stock(40, 100, false, 0, 1024), stock(50, 50, 50));
+        // Fewer empties than decode's target: the target, made of lazy victims.
+        assert_eq!(ring_stock(40, 100, false, 25, 1024), stock(50, 50, 50));
+        // Plenty empty: every one stocked, decode's target still reserved, and
+        // a prompt claiming past it still a sweep.
+        assert_eq!(ring_stock(40, 100, false, 300, 1024), stock(300, 50, 50));
+        // Never past half the ring.
+        assert_eq!(ring_stock(40, 1_000, false, 1_000, 256), stock(128, 50, 50));
+        // A prompt-only launch: decode's floor is still reserved.
+        assert_eq!(ring_stock(0, 100, false, 10, 1024), stock(32, 32, 32));
+    }
 }

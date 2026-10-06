@@ -1,32 +1,41 @@
-//! The promotion ring — free VRAM slots the GPU fills with the experts it
-//! misses.
+//! The promotion ring — VRAM slots the GPU fills with the experts it misses.
 //!
 //! A routed expert that is not in VRAM is copied over the link by its layer's
-//! GEMM workers anyway (`dispatch`), slice by slice, into VRAM scratch. If the
-//! same slices also land in a free weight-zone slot, the expert is in VRAM once
-//! the layer is done — a promotion that costs a VRAM write instead of a second
-//! crossing of the link. This ring is how the slots get there:
+//! GEMM workers anyway (`dispatch`), slice by slice. If the slices land in a
+//! weight-zone slot, the expert is in VRAM once the layer is done — a promotion
+//! that costs no crossing of the link of its own. This ring is how the slots
+//! get there:
 //!
-//! - the pipeline thread takes free slots (under the reclaim rule — nothing can
-//!   be reading them) and pushes their addresses at `tail`;
-//! - `moe_bucketize` gives each remote expert the next slot from `head`, and
-//!   logs `summary_word << 32 | row << 16 | expert` at its index;
-//! - the pipeline thread collects each logged slot, and once the invocation
-//!   that took it has completed (its ticket is below the observed one) points
-//!   the expert's entry at it.
+//! - the pipeline thread offers slots at `tail`: empty ones, and **lazy
+//!   victims** — slots whose expert is still resident and hittable, named with
+//!   the entries it is retargeted to when the slot is claimed;
+//! - `moe_bucketize` gives each remote expert the next offer from `head`; a
+//!   victim is evicted only then, on the device, by retargeting its entries
+//!   before the slot is written. It logs `summary_word << 32 | row << 16 |
+//!   expert` at the offer's index, or the expert `PROMO_SKIP` for a victim its
+//!   own launch routes, which it passes over;
+//! - the pipeline thread collects each logged offer — a claimed victim's
+//!   eviction at once, the promotion once the invocation that took it has
+//!   completed (its ticket is below the observed one) — and takes a skipped
+//!   victim's offer back.
 //!
 //! In mapped pinned memory: `u64 slots[cap] | u64 log[cap] | u32 head | u32
-//! tail | u32 marks[rows][n_experts] | u32 reserve`. `tail` and `reserve` are
-//! written only by the host, `head` only by the device. `reserve` is the stock
-//! kept for decode-scored experts: a prompt-only expert takes a slot only while
-//! more than it is stocked (`moe_bucketize.cu`, PROMOTION). An expert's mark is set by the device when it
-//! gives the expert a slot and cleared by the host when the promotion lands (or
-//! is dropped): until then a later invocation that still finds the expert
-//! remote — a prefill visiting the row again before the host has caught up —
-//! does not spend a second slot on it.
+//! tail | u32 marks[rows][n_experts] | u32 reserve | u32 sweep | u64
+//! victims[cap] | u64 retarget[cap][3]` (the victims 8-aligned). `tail`,
+//! `reserve`, `sweep`, the victims and the retarget entries are written only by
+//! the host, `head` only by the device. `reserve` is the stock kept for
+//! decode-scored experts: a prompt-only expert takes a slot only while more
+//! than it is stocked. `sweep` is the most claiming experts a launch may have
+//! and still claim: past it the launch is a prompt passing over the table and
+//! claims nothing (`moe_bucketize.cu`, PROMOTION). An expert's mark is set by
+//! the device when it gives the expert a slot and cleared by the host when the
+//! promotion lands (or is dropped): until then a later invocation that still
+//! finds the expert remote — a prefill visiting the row again before the host
+//! has caught up — does not spend a second slot on it.
 
 use candle::quantized::cuda::PromoRing;
 use candle::Result;
+use candle_kernels::simple::moe_bucketize::{PROMO_EMPTY, PROMO_SKIP};
 use cudarc::driver::sys;
 use std::sync::atomic::{fence, Ordering};
 
@@ -35,8 +44,19 @@ pub(crate) struct PromotionRing {
     dev: u64,
     cap: usize,
     n_experts: usize,
-    /// Byte offset of the `reserve` word, after the marks.
+    /// Byte offset of the `reserve` word, after the marks; `sweep` follows it.
     reserve_at: usize,
+    /// Byte offset of the victims, 8-aligned; the retarget entries follow.
+    victims_at: usize,
+}
+
+/// The resident expert behind an offer: its index `row · n_experts + expert`
+/// in the gate plane, and the entries (gate, up, down) it is retargeted to
+/// when a miss claims its slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Victim {
+    pub(crate) index: u64,
+    pub(crate) retarget: [u64; 3],
 }
 
 // SAFETY: `tail` and the slots are written only by the pipeline thread (the
@@ -61,6 +81,11 @@ impl Logged {
             expert: (v & 0xffff) as usize,
         }
     }
+
+    /// A victim the launch routed and passed over: the offer comes back.
+    pub(crate) fn skipped(&self) -> bool {
+        self.expert == PROMO_SKIP as usize
+    }
 }
 
 /// The ticket whose summary word is `word`, nearest `near`. Words are the
@@ -79,7 +104,8 @@ pub(crate) fn ticket_from_word(word: u32, near: u64) -> u64 {
 impl PromotionRing {
     pub(crate) fn new(cap: usize, rows: usize, n_experts: usize) -> Result<Self> {
         let reserve_at = cap * 16 + 8 + rows * n_experts * 4;
-        let bytes = reserve_at + 4;
+        let victims_at = (reserve_at + 8).next_multiple_of(8);
+        let bytes = victims_at + cap * 32;
         let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: a page-locked, device-mapped allocation, freed in `drop`.
         let r = unsafe { sys::cuMemHostAlloc(&mut raw, bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP) };
@@ -104,10 +130,12 @@ impl PromotionRing {
             cap,
             n_experts,
             reserve_at,
+            victims_at,
         };
         // No prompt-only expert takes a slot until the host says how much is
-        // decode's.
+        // decode's, and no launch claims until it says how many may.
         ring.set_reserve(u32::MAX);
+        ring.set_sweep(0);
         Ok(ring)
     }
 
@@ -116,6 +144,14 @@ impl PromotionRing {
     pub(crate) fn set_reserve(&self, n: u32) {
         // SAFETY: the reserve word this struct owns, after the marks.
         unsafe { std::ptr::write_volatile(self.host.add(self.reserve_at) as *mut u32, n) };
+        fence(Ordering::SeqCst);
+    }
+
+    /// A launch with more than `n` claiming experts is a sweep and claims
+    /// nothing.
+    pub(crate) fn set_sweep(&self, n: u32) {
+        // SAFETY: the sweep word this struct owns, after the reserve.
+        unsafe { std::ptr::write_volatile(self.host.add(self.reserve_at + 4) as *mut u32, n) };
         fence(Ordering::SeqCst);
     }
 
@@ -140,6 +176,9 @@ impl PromotionRing {
             cap: self.cap as u32,
             marks: self.dev + (self.cap * 16 + 8) as u64,
             reserve: self.dev + self.reserve_at as u64,
+            sweep: self.dev + (self.reserve_at + 4) as u64,
+            victims: self.dev + self.victims_at as u64,
+            retarget: self.dev + (self.victims_at + self.cap * 8) as u64,
         }
     }
 
@@ -167,14 +206,22 @@ impl PromotionRing {
         unsafe { std::ptr::read_volatile(self.word(self.cap * 16 + 4)) }
     }
 
-    /// Publish `slot_base` at `tail` and advance it. The caller must have room
-    /// (`tail - taken < cap`, where `taken` is what it has collected).
-    pub(crate) fn push(&self, slot_base: u64) {
+    /// Offer `slot_base` at `tail` and advance it — empty, or holding `victim`.
+    /// The caller must have room (`tail - taken < cap`, where `taken` is what it
+    /// has collected).
+    pub(crate) fn offer(&self, slot_base: u64, victim: Option<Victim>) {
         let tail = self.tail();
         let i = tail as usize % self.cap;
-        // SAFETY: `i < cap`, inside the slots array.
+        let (index, retarget) = victim.map_or((PROMO_EMPTY, [0; 3]), |v| (v.index, v.retarget));
+        // SAFETY: `i < cap`, inside the slots, victims and retarget arrays.
         unsafe {
             std::ptr::write_volatile((self.host as *mut u64).add(i), slot_base);
+            let victims = self.host.add(self.victims_at) as *mut u64;
+            std::ptr::write_volatile(victims.add(i), index);
+            let entries = self.host.add(self.victims_at + self.cap * 8) as *mut u64;
+            for (p, &v) in retarget.iter().enumerate() {
+                std::ptr::write_volatile(entries.add(3 * i + p), v);
+            }
         }
         fence(Ordering::SeqCst);
         // SAFETY: the counter word this struct owns.
@@ -190,15 +237,15 @@ impl PromotionRing {
         Logged::decode(v)
     }
 
-    /// Withdraw every published, untaken slot: `tail = head`. Only with no
-    /// bucketize in flight and none able to begin.
+    /// Withdraw every untaken offer: `tail = head`. Only with no bucketize in
+    /// flight and none able to begin.
     pub(crate) fn withdraw(&self) {
         self.withdraw_to(self.head());
     }
 
-    /// Withdraw the published, untaken slots past `tail`: set `tail` back to
-    /// it (`head <= tail <= self.tail()`). Only with no bucketize in flight and
-    /// none able to begin — a bucketize reads `tail` once and takes up to it.
+    /// Withdraw the untaken offers past `tail`: set `tail` back to it (`head <=
+    /// tail <= self.tail()`). Only with no bucketize in flight and none able to
+    /// begin — a bucketize reads `tail` once and takes up to it.
     pub(crate) fn withdraw_to(&self, tail: u32) {
         // SAFETY: the counter word this struct owns.
         unsafe { std::ptr::write_volatile(self.word(self.cap * 16 + 4), tail) };
@@ -245,7 +292,7 @@ mod tests {
         let ring = PromotionRing::new(4, 2, 8).unwrap();
         assert_eq!((ring.head(), ring.tail()), (0, 0));
         for base in [0x1000u64, 0x2000, 0x3000] {
-            ring.push(base);
+            ring.offer(base, None);
         }
         assert_eq!(ring.tail(), 3);
         // SAFETY: the slots array is the allocation's first `cap` u64s.
@@ -254,15 +301,59 @@ mod tests {
 
         ring.withdraw_to(1);
         assert_eq!(ring.tail(), 1);
-        ring.push(0x4000);
+        ring.offer(0x4000, None);
         assert_eq!((ring.tail(), slot(1)), (2, 0x4000));
 
         ring.withdraw();
         assert_eq!(ring.tail(), 0);
         for base in [0x5000u64, 0x6000, 0x7000, 0x8000, 0x9000] {
-            ring.push(base);
+            ring.offer(base, None);
         }
         assert_eq!((ring.tail(), slot(0)), (5, 0x9000));
+    }
+
+    /// An offer writes its victim's index and retarget entries at its own ring
+    /// index, and an empty one writes `PROMO_EMPTY` there; the sweep word starts
+    /// at 0 — nothing claims until the host says how many may — and sits right
+    /// after the reserve.
+    #[test]
+    fn an_offer_names_its_victim_and_the_sweep_word_follows_the_reserve() {
+        let Ok(_device) = candle::Device::new_cuda(0) else {
+            return;
+        };
+        let ring = PromotionRing::new(4, 2, 8).unwrap();
+        let word = |at: usize| unsafe { std::ptr::read_volatile(ring.host.add(at) as *const u32) };
+        let long = |at: usize| unsafe { std::ptr::read_volatile(ring.host.add(at) as *const u64) };
+        // reserve at 4·16 + 8 + 2·8·4 = 136, sweep at 140, victims at 144.
+        assert_eq!((ring.reserve_at, ring.victims_at), (136, 144));
+        assert_eq!((word(136), word(140)), (u32::MAX, 0));
+        ring.set_sweep(48);
+        assert_eq!(word(140), 48);
+
+        ring.offer(0x1000, None);
+        ring.offer(
+            0x2000,
+            Some(Victim {
+                index: 13,
+                retarget: [0x9000, 0x9010, 0x9020],
+            }),
+        );
+        assert_eq!((long(144), long(152)), (PROMO_EMPTY, 13));
+        // retarget at 144 + 4·8 = 176, three u64s per ring index.
+        assert_eq!((long(176 + 24), long(176 + 32), long(176 + 40)), (0x9000, 0x9010, 0x9020));
+        let r = ring.ring();
+        assert_eq!(
+            (r.sweep - r.reserve, r.victims - ring.dev, r.retarget - ring.dev),
+            (4, 144, 176)
+        );
+    }
+
+    /// A log entry naming `PROMO_SKIP` is a victim passed over.
+    #[test]
+    fn a_skip_entry_decodes_as_one() {
+        let skip = Logged::decode((5u64 << 32) | (3 << 16) | PROMO_SKIP as u64);
+        assert!(skip.skipped());
+        assert!(!Logged::decode((5u64 << 32) | (3 << 16) | 7).skipped());
     }
 
     /// A cleared mark is zero in the device's marks array, at `row × E + e`.

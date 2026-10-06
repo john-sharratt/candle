@@ -2930,17 +2930,31 @@ impl TestParams {
                 Box::new(|s: &PipelineStats| format!("{}", s.promotions)),
             ),
             // Whether the promotion ring kept up with the GPU: the slots bucketize
-            // took from it, the misses it found it empty for (each a second
-            // crossing of the link by the copy engine), and how many invocations
-            // the device had begun past the one the pipeline thread was serving,
-            // per routed layer.
+            // took from it (of them the lazy victims it evicted, and the ones it
+            // passed over for its own launch), the misses that took none —
+            // computed from scratch and claimed on their next launch, the decode
+            // rows' counted apart — and how many invocations the device had
+            // begun past the one the pipeline thread was serving, per routed
+            // layer.
             (
                 "Ring slots taken",
                 Box::new(|s: &PipelineStats| format!("{}", s.ring_taken)),
             ),
             (
+                "  victims claimed",
+                Box::new(|s: &PipelineStats| format!("{}", s.victims_claimed)),
+            ),
+            (
+                "  victims skipped",
+                Box::new(|s: &PipelineStats| format!("{}", s.victims_skipped)),
+            ),
+            (
                 "Misses unslotted",
                 Box::new(|s: &PipelineStats| format!("{}", s.ring_unslotted)),
+            ),
+            (
+                "  decode unslotted",
+                Box::new(|s: &PipelineStats| format!("{}", s.decode_unslotted)),
             ),
             (
                 "Pipeline lag (inv.)",

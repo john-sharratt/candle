@@ -327,6 +327,8 @@ impl PipelineState {
         self.inner.slot_to_key[from] = None;
         self.inner.slots[to] = Some(moved);
         self.inner.slot_to_key[to] = Some(key);
+        #[cfg(feature = "tensor-assert")]
+        self.inner.mirror_tenant(to);
         self.inner.key_to_slot.insert(key, to);
         self.inner.last_used[to] = self.inner.last_used[from];
         Ok(Some(key))

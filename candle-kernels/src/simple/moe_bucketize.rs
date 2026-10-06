@@ -20,6 +20,12 @@ pub const MAX_TOPK: usize = 32;
 /// `MAX_DECODE_RANGES` in the `.cu`.
 pub const MAX_DECODE_RANGES: usize = 32;
 
+/// A promotion offer with no resident expert behind it, mirrored from
+/// `PROMO_EMPTY` in the `.cu`.
+pub const PROMO_EMPTY: u64 = u64::MAX;
+/// The expert a skipped victim's log entry names, mirrored from `PROMO_SKIP`.
+pub const PROMO_SKIP: u32 = 0xffff;
+
 /// [`run_moe_bucketize`] launched the kernel.
 pub const BUCKETIZE_LAUNCHED: i32 = 0;
 /// [`run_moe_bucketize`]'s argument guards refused the call; nothing was written.
@@ -91,6 +97,23 @@ extern "C" {
         // Mapped `u32`, with the ring: a prompt-only expert takes a slot only
         // while more than this is stocked; null = never.
         promo_reserve: *const c_void,
+        // Mapped `u32`, required with the ring: a launch with more claiming
+        // experts than this is a sweep and claims nothing.
+        promo_sweep: *const c_void,
+        // Mapped, required with the ring: `u64[cap]` the victim behind each
+        // offer (`row · n_experts + expert` in the gate plane, or
+        // [`PROMO_EMPTY`]), and `u64[cap][3]` the entries (gate, up, down) a
+        // claimed victim is retargeted to.
+        promo_victims: *const c_void,
+        promo_retarget: *const c_void,
+        // Mapped `u32[zone_slots]` slot tags `(row + 1) << 16 | expert`, or null:
+        // every VRAM entry snapshotted is checked against its slot's tag, and a
+        // mismatch traps. Slot `s` spans `[zone_end - (s + 1) · zone_slot_bytes,
+        // zone_end - s · zone_slot_bytes)`.
+        slot_owner: *const c_void,
+        zone_end: u64,
+        zone_slot_bytes: u64,
+        zone_slots: u32,
         // This layer's row, recorded in the log.
         row: i32,
         // `u64[n_experts]` promotion slot per remote expert (0 = none), or null.

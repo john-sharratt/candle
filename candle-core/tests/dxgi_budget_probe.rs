@@ -120,6 +120,68 @@ fn print_non_local_budget_under_pinning() -> candle_core::Result<()> {
     Ok(())
 }
 
+/// Pins host memory in 2 GiB steps until the driver refuses, and after each
+/// step uploads 64 MiB to the device FROM the newest pinned block — a direct
+/// DMA, which needs the GPU to address that block — printing whether it lands
+/// and the NON_LOCAL budget and usage. The measurement that says whether a
+/// pinned block the driver granted can still be read by the GPU once the
+/// process's page-locked total passes the segment's budget.
+#[test]
+#[ignore]
+fn print_pinned_dma_under_pinning() -> candle_core::Result<()> {
+    use cudarc::driver::sys;
+    let device = Device::new_cuda(0)?;
+    let Device::Cuda(cuda) = &device else {
+        unreachable!()
+    };
+    let probe = DxgiProbe::for_cuda_device(cuda)?;
+    let stream = cuda.cuda_stream();
+    const STEP: usize = 2 << 30;
+    const COPY: usize = 64 << 20;
+    let dst = unsafe { stream.alloc::<u8>(COPY) }.map_err(candle_core::Error::wrap)?;
+    let dst_ptr = {
+        use cudarc::driver::DevicePtr;
+        dst.device_ptr(&stream).0
+    };
+    let mut held: Vec<*mut std::ffi::c_void> = Vec::new();
+    loop {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: a plain page-locked host allocation, freed below.
+        let granted = unsafe { sys::cuMemAllocHost_v2(&mut ptr, STEP) };
+        if granted != sys::CUresult::CUDA_SUCCESS {
+            println!(
+                "refused at {} GiB pinned: {granted:?}",
+                held.len() * STEP / (1 << 30)
+            );
+            break;
+        }
+        held.push(ptr);
+        // SAFETY: `ptr` holds STEP bytes; the device buffer holds COPY.
+        let dma = unsafe {
+            sys::cuMemcpyHtoDAsync_v2(dst_ptr, ptr, COPY, stream.cu_stream())
+                .result()
+                .and_then(|_| sys::cuStreamSynchronize(stream.cu_stream()).result())
+        };
+        let (budget, usage) = probe.non_local()?;
+        println!(
+            "pinned {:>3} GiB: dma {} | non-local budget={:.2} GiB usage={:.2} GiB available RAM={:.2} GiB",
+            held.len() * STEP / (1 << 30),
+            match dma {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("FAILED: {e:?}"),
+            },
+            budget as f64 / GIB as f64,
+            usage as f64 / GIB as f64,
+            available_physical_ram().unwrap_or(0) as f64 / GIB as f64,
+        );
+    }
+    for p in held {
+        // SAFETY: each came from `cuMemAllocHost_v2` above.
+        unsafe { sys::cuMemFreeHost(p) };
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore]
 fn print_dxgi_budget() -> candle_core::Result<()> {

@@ -367,11 +367,21 @@ impl Stager {
             pending: HashSet::new(),
         };
         {
-            let r = self.residency()?;
+            let mut r = self.residency()?;
             for e in cold {
                 if self.loading.contains(&(row, e)) {
                     d.pending.insert(e);
-                } else if r.place(row, e).entry() == 0 {
+                    continue;
+                }
+                // A lazy victim with a cold fallback reads cold only once a
+                // claim has zeroed its entries on the device, and the pipeline
+                // thread may not have collected that claim yet: book the
+                // eviction here, or the entry would still read VRAM and this
+                // cold wait would go unanswered.
+                if r.place(row, e).offered_cold {
+                    r.device_evicted(row, e);
+                }
+                if r.place(row, e).entry() == 0 {
                     d.unassigned.push_back(e);
                 }
             }

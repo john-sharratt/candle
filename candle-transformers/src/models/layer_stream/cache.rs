@@ -45,6 +45,7 @@ use super::residency::{LayerResidency, LoadOp, PlanScratch, Residence};
 use super::view::{build_layer_view, StreamedLayer};
 use super::warm::{warm_membership, warm_slots_for};
 use crate::models::expert_lre::pinned::WarmPool;
+use crate::models::expert_lre::warm_tier::addressable_pinned_slots;
 use crate::models::layer_stream::zone::{LayerPlacement, ZonePlan};
 use candle::vram::PinnedUse;
 
@@ -282,7 +283,14 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
         // grows — see `warm`'s header. It is filled once and never redrawn,
         // which is only sound because the top run is streamed under every prefix
         // the tier can reach.
-        let want = warm_slots_for(num_layers, pinned, warm_budget_slots);
+        // Bounded by what the device can still address as well as by the host
+        // budget: every pinned byte is charged against WDDM's non-local budget
+        // (`warm_tier::ADDRESSABLE_MARGIN`). Read after the staging ring.
+        let want = addressable_pinned_slots(
+            candle::vram::gpu_addressable_room(device),
+            stride,
+            warm_slots_for(num_layers, pinned, warm_budget_slots),
+        );
         let warm = WarmPool::new(want, stride, PinnedUse::WeightWarmTier);
         let members = warm_membership(num_layers, pinned, warm.num_slots());
         let slots = slot_table(plan);

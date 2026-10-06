@@ -42,6 +42,34 @@ use std::alloc::{alloc, dealloc, Layout};
 /// driver's room, and running it short fails the load rather than slowing it.
 const DRIVER_LOCK_MARGIN: usize = 1024 * 1024 * 1024;
 
+/// GPU-addressable host memory (WDDM's NON_LOCAL budget,
+/// [`candle::vram::gpu_addressable_room`]) the pinned part leaves unspent.
+///
+/// The driver charges every page-locked byte against that budget and keeps
+/// granting locks until it is gone, so [`DRIVER_LOCK_MARGIN`] — a lock the
+/// driver still grants — says nothing about whether the device can still
+/// *address* one: the warm tier pinned 16.02 GiB of a 17.22 GiB budget on the
+/// 31.5 GiB box, kept its lock margin, and the startup fill's first upload
+/// failed with `CUDA_ERROR_OUT_OF_MEMORY` on most runs. Runs that loaded had
+/// left 1.6 GiB or more. Two GiB keeps the pinned part below every failing
+/// figure with room for the paging WDDM does when VRAM is full.
+pub(crate) const ADDRESSABLE_MARGIN: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The most pinned slots of `slot_size` that leave [`ADDRESSABLE_MARGIN`] of
+/// `room` — GPU-addressable host memory not yet in use — unspent, capped at
+/// `want`. `None` is a platform with no such budget: the driver's own refusal
+/// is the only bound.
+pub(crate) fn addressable_pinned_slots(room: Option<u64>, slot_size: usize, want: usize) -> usize {
+    match room {
+        None => want,
+        Some(room) if slot_size == 0 => want.min(room as usize),
+        Some(room) => {
+            let fits = room.saturating_sub(ADDRESSABLE_MARGIN) / slot_size as u64;
+            want.min(fits as usize)
+        }
+    }
+}
+
 /// Whether the driver will still page-lock [`DRIVER_LOCK_MARGIN`] right now:
 /// one allocation of that size, freed at once.
 fn driver_lock_margin_free() -> bool {
@@ -154,10 +182,12 @@ pub(crate) struct WarmTier {
 
 impl WarmTier {
     /// A tier of `want_slots` stride-sized slots: as many pinned as the driver
-    /// grants while still leaving it [`DRIVER_LOCK_MARGIN`] to lock, the rest
+    /// grants while still leaving it [`DRIVER_LOCK_MARGIN`] to lock and the
+    /// device [`ADDRESSABLE_MARGIN`] of `addressable_room` to address, the rest
     /// pageable.
-    pub(crate) fn new(want_slots: usize, slot_size: usize) -> Self {
-        let mut pinned = WarmPool::new(want_slots, slot_size, PinnedUse::WeightWarmTier);
+    pub(crate) fn new(want_slots: usize, slot_size: usize, addressable_room: Option<u64>) -> Self {
+        let want_pinned = addressable_pinned_slots(addressable_room, slot_size, want_slots);
+        let mut pinned = WarmPool::new(want_pinned, slot_size, PinnedUse::WeightWarmTier);
         // Each probe that fails gives back one step and re-takes the smaller
         // pool: one pool at a time, since holding both would need the pages the
         // margin is asking for.
@@ -257,6 +287,31 @@ impl WarmTier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The 31.5 GiB box: 17.22 GiB of non-local budget with 0.66 GiB already in
+    /// use leaves 16.17 GiB of room, so at 1.84 MiB slots the pinned part stops
+    /// at 14.17 GiB — under the 16.02 GiB that failed.
+    #[test]
+    fn the_pinned_part_leaves_the_addressable_margin() {
+        let slot = 1_929_216usize; // 1.84 MiB
+        let room = 16_560 * 1024 * 1024u64;
+        let pinned = addressable_pinned_slots(Some(room), slot, 10_496);
+        assert_eq!(pinned, 7_887);
+        assert!(pinned as u64 * slot as u64 <= room - ADDRESSABLE_MARGIN);
+        assert!((pinned as u64 + 1) * slot as u64 > room - ADDRESSABLE_MARGIN);
+    }
+
+    /// Room for more than is wanted pins what is wanted; no room pins nothing;
+    /// a platform with no budget leaves the driver as the only bound.
+    #[test]
+    fn the_cap_only_ever_lowers_the_pinned_part() {
+        assert_eq!(addressable_pinned_slots(Some(64 * GIB), 1 << 20, 100), 100);
+        assert_eq!(addressable_pinned_slots(Some(GIB), 1 << 20, 100), 0);
+        assert_eq!(addressable_pinned_slots(Some(0), 1 << 20, 100), 0);
+        assert_eq!(addressable_pinned_slots(None, 1 << 20, 100), 100);
+    }
 
     /// A pool the driver leaves its margin beside is kept whole.
     #[test]

@@ -17,10 +17,14 @@ use std::path::PathBuf;
 const OVERRIDE_FILE: &str = "../models.override.yaml";
 
 fn main() {
-    // Rebuild when the override appears, changes, or is deleted. `rerun-if-changed`
-    // on a non-existent path is honoured — cargo re-runs the script when one
-    // shows up — which is what makes "drop the file in and rebuild" work.
-    println!("cargo:rerun-if-changed={OVERRIDE_FILE}");
+    // Rebuild when the override changes or is deleted. Only a file that exists is
+    // watched: cargo counts a missing `rerun-if-changed` path as stale on every
+    // invocation, so watching the absent file — the ordinary case — rebuilt this
+    // crate and everything above it on every `cargo test` and `cargo build`. A
+    // newly added override is picked up by touching this script.
+    if std::path::Path::new(OVERRIDE_FILE).exists() {
+        println!("cargo:rerun-if-changed={OVERRIDE_FILE}");
+    }
     println!("cargo:rerun-if-changed=build.rs");
 
     let out =

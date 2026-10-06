@@ -13,7 +13,9 @@
 
 use super::cache::{minimum_resident_slots, pinned_layer_count, ExpertCacheInner};
 #[cfg(feature = "cuda")]
-use super::dispatch::Dispatch;
+use super::dispatch::{Dispatch, OwnerTags};
+#[cfg(feature = "tensor-assert")]
+use super::slot_owners::SlotOwners;
 #[cfg(feature = "cuda")]
 use super::live_table::LiveTable;
 #[cfg(feature = "cuda")]
@@ -681,9 +683,14 @@ impl ExpertCache {
                     pinned,
                     WARM_DRAW_SEED,
                 );
-                // Pinned as far as the driver grants while keeping its margin,
-                // pageable for the rest — see `warm_tier`.
-                let mut warm = WarmTier::new(membership.len(), stride);
+                // Pinned as far as the driver grants and the device can address
+                // while keeping both margins, pageable for the rest — see
+                // `warm_tier`. Read after the pad, which is charged against it.
+                let mut warm = WarmTier::new(
+                    membership.len(),
+                    stride,
+                    candle::vram::gpu_addressable_room(cuda_dev),
+                );
                 // A refusal shortens the draw rather than leaving slots the tier
                 // does not have: `ram` must never name a slot outside it.
                 let membership = &membership[..membership.len().min(warm.num_slots())];
@@ -861,6 +868,28 @@ impl ExpertCache {
                 experts_per_layer,
             )?))
         };
+        // A lazy victim is named to the device by `row · experts_per_layer +
+        // expert` and decoded there against the table's width: the two must be
+        // one number, or a claim retargets another expert's entries.
+        if table.n_experts() != experts_per_layer {
+            candle::bail!(
+                "MoE expert cache: the live table is {} experts wide but the cache has {} per \
+                 layer — the promotion ring's victim indices would name the wrong experts",
+                table.n_experts(),
+                experts_per_layer
+            );
+        }
+        // The slot tags bucketize's owner check reads: every tenant the
+        // startup fill installed, then every one a slot gains from here on.
+        #[cfg(feature = "tensor-assert")]
+        let owner = {
+            let owners = Arc::new(SlotOwners::new(inner.zone.limit())?);
+            inner.attach_owners(owners.clone());
+            let slot_bytes = inner.zone.slot_bytes();
+            OwnerTags::new(owners, inner.slot_base(0) + slot_bytes as u64, slot_bytes)
+        };
+        #[cfg(not(feature = "tensor-assert"))]
+        let owner = OwnerTags::none();
         let dispatch = Dispatch::new(
             cuda_dev_ref,
             table,
@@ -868,6 +897,7 @@ impl ExpertCache {
             row_tile_bytes_for(&layer_geometries),
             experts_used,
             promo.clone(),
+            owner,
         )?;
         if let Ok(mut s) = stats.lock() {
             s.pad_slots = pad.num_slots();

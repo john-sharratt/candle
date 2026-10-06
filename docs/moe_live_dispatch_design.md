@@ -314,49 +314,121 @@ both on the one 12 GB/s link — and ran at 787 t/s against the baseline's
 bytes a second time.
 
 So the workers promote. The pipeline thread keeps a **promotion ring** in
-mapped memory (`expert_lre::promo`) stocked with free VRAM slots — `u64
-slots[cap] | u64 log[cap] | u32 head | u32 tail`, the host writing `tail`, the
-device `head`:
+mapped memory (`expert_lre::promo`) of VRAM slot **offers** — `u64 slots[cap] |
+u64 log[cap] | u32 head | u32 tail | u32 marks[rows][E] | u32 reserve | u32
+sweep | u64 victims[cap] | u64 retarget[cap][3]`, the host writing `tail`, the
+offers, `reserve` and `sweep`, the device `head` and the log:
 
-1. The pipeline thread takes free slots (free; else victims of quiet rows; for
-   the shortfall, experts of busy rows with a pinned copy, whose slots wait on
-   the retire list — Rule R) and publishes their addresses at `tail`. The
-   stock is **predicted**: the next two rows' non-resident experts at the share
-   of experts the current row routed, ×1.25, at least 32, at most `2E`; the ring
-   holds `4E` indices, the rest room for slots the device has taken and the host
-   not yet collected. Stock past the prediction is withdrawn (`tail` set back)
-   when no bucketize can be reading the ring — under the pass lock, with every
-   begun invocation observed — and its slots returned to the zone. Every stocked
-   slot is an expert evicted ahead of need: a standing stock of 256 cost C10×16
-   1,692 misses where 32 cost 278. A stock sized from the row just served ran
-   dry where a pass entered the cold layers (the startup fill leaves the early
-   layers resident and the late ones cold): 756 of the cold prefill's misses
-   crossed twice, 1,169 t/s against 1,382 predicted.
-2. `bucketize` gives each remote expert, in list order, the next slot at `head`
-   (`remote_dst[i]`, else 0 when the ring is empty), logs
-   `summary_word << 32 | row << 16 | expert` at its index, and stores `head`
-   before the summary word.
-3. Each worker stores every 16-byte unit it copies into scratch also at the
-   same offset of the slot's projection (`dst_offset` per launch): after the
-   gate, up and down launches the slot holds the whole slot image.
-4. The pipeline thread collects the log up to `head` and lands each slot once
-   its invocation's ticket (from the logged word) is below the observed one —
-   the invocation, all three launches, has completed: install the views, set
-   the entry to VRAM. An expert promoted twice (two invocations, or the copy
-   engine too) keeps one slot; the other goes back to the zone, never having
-   been named by any entry.
+1. The pipeline thread offers slots at `tail`. **Every empty slot is offered**
+   — the zone's free list plus the empty offers already standing, to half the
+   ring — because an empty slot evicts nothing to stand there and a miss that
+   finds one is promoted for the copy it made anyway; stocked only to the
+   prediction, a 16 GB card's zone stayed ~1,400 slots short of full for a
+   whole Qwen3.6-35B-A3B run. Past the empties the stock is **predicted**: the
+   next two rows' non-resident experts at the share of experts the current row
+   routed, ×1.25, at least 32, at most `2E`; the ring holds `4E` indices, the
+   rest room for offers the device has taken and the host not yet collected.
+   **The predicted stock is lazy victims, not evictions.** An offered victim is
+   a resident expert — ranked by the eviction policy, rows with an invocation
+   enqueued last — that **stays resident and hittable** until a miss claims its
+   slot, named by its gate-plane index `row · E + expert` and the three entries
+   (gate, up, down) it falls back to — exactly what an eviction would publish:
+   its pad slot, else its pinned warm slot, else 0 (cold). **Every resident
+   expert is offerable**, and the fallback is held for the life of the offer:
+   a pad slot is pinned against the stager, which owns pad eviction (at most a
+   quarter of the pad, so cold staging always has slots); a cold expert is
+   marked *offered cold* in the residency, because a later launch that routes
+   it after a claim reads its zeroed entries as cold before the pipeline thread
+   has booked the eviction — the stager stages a cold expert only when its
+   entry reads 0, so it books the eviction itself on the first cold summary of
+   an offered-cold expert (`Residency::device_evicted`, idempotent with the
+   pipeline thread's booking). Restricting offers to warm-backed experts
+   starved Qwen3.8-Flash-Next's ring — its zone is filled largely through the
+   pad — leaving up to 71,060 decode misses a config unslotted and the decode
+   hit rate 6–13 points down, and evicting dearer experts when the cheapest
+   were cold-only. An offered slot is the ring's: the host evicts, relocates
+   and offers nothing standing in it until a claim or a withdrawal returns it. Stocking by eviction emptied every stocked slot ahead of need —
+   a standing stock of 256 cost C10×16 1,692 misses where 32 cost 278 — which
+   is the cost a lazy offer does not pay: an unclaimed victim never left.
+   Without room (`PROMPT_ROOM`) the predicted decode stock is the reserve, so a
+   prompt-only expert takes only stock past it. Stock past the target is
+   withdrawn (`tail` set back) when no bucketize can be reading the ring —
+   under the pass lock, with every begun invocation observed — an empty offer
+   going back to the zone and a victim back to plain residency.
+2. **A prompt-only expert takes only an empty offer** — a prompt fills the
+   zone's holes and never evicts; when the next offer holds a victim it stays
+   in scratch. Letting prompts claim victims cost Qwen3.5-35B-A3B's prefill
+   15–18% (its hit rate 66% → 55%) while its decode gained 37–56%.
+   `bucketize` decides first whether the launch claims at all: **a launch whose
+   decode-scored claiming experts outnumber the `sweep` word is a sweep and
+   claims nothing**
+   — a prompt passing over the table, its misses left in its workers' scratch.
+   The host sets `sweep` to the predicted stock (decode's target without room,
+   all misses' with it), never counting empty slots in, so a cold prompt cannot
+   claim victims because the zone had a hole. Decided per layer launch on the
+   device from that launch's own misses — distinct missed experts, which is
+   what crosses the link — so a decode row co-batched with a prompt costs at
+   most a claim deferred to the next narrow launch. Otherwise it gives each
+   remote expert, in list order, the next offer at `head` (`remote_dst[i]`,
+   else 0 when the ring is empty). A victim **of this row that this launch
+   routes** is skipped — one of the launch's own tiles reads it — logged with
+   the expert `PROMO_SKIP` and handed back; the miss takes the next offer. A
+   claimed victim's entries are retargeted to its warm copy — up and down, then
+   gate — before the launch's workers write a byte into the slot. Every launch
+   enqueued earlier has completed in stream order, and every later one reads
+   the entries fresh in its own bucketize, so no tile reads the slot under the
+   victim's name again. No fence per claim: nothing reads a VRAM victim's entry
+   concurrently, and the host learns of the claim only through `head`, which
+   is published behind a system fence — a fence per claim would stall the
+   serial claim loop on a PCIe drain for every victim of a decode launch. It logs `summary_word << 32 | row << 16
+   | expert` at the offer's index and stores `head` before the summary word.
+3. A worker whose expert has a slot copies every 16-byte unit to the same
+   offset of the slot's projection (`dst_offset` per launch) **instead of** its
+   scratch, and computes the row tile from there, as a resident expert's tile
+   is computed (§0.10, worker step 4): the promotion costs no write the compute
+   did not already need. After the gate, up and down launches the slot holds
+   the whole slot image. A sweep's workers copy into scratch and the zone is
+   left to the experts decode reuses; nothing re-sends those misses afterwards
+   (step 6). Measured against copying every miss to both scratch and slot, with
+   the copy engine promoting prompt misses into empty slots: decode +9.4% on
+   Qwen3.6-35B-A3B's ladder and +5.8% on Qwen3.5-35B-A3B's (RTX 4090 Laptop,
+   alternating binaries), prefill within 0.5%.
+4. The pipeline thread collects the log up to `head`, in log order. A skipped
+   offer comes back with its expert still resident. A claimed victim's eviction
+   is booked at once — the device already made it — ahead of any later claim
+   that could promote the same expert again. Each claimed slot lands once its
+   invocation's ticket (from the logged word) is below the observed one — the
+   invocation, all three launches, has completed: install the views, set the
+   entry to VRAM. An expert promoted twice (two invocations, or the copy engine
+   too) keeps one slot; the other goes back to the zone, never having been
+   named by any entry.
 
 5. **One promotion in flight per expert.** `bucketize` sets the expert's mark
    (`u32 marks[rows][E]`, mapped, after the counters) when it hands out a slot
    and skips a marked expert; the host clears the mark when the slot lands or
    is dropped. Without it a prefill that visits a row again before the host
    has landed the first visit's slots promotes the same experts twice.
-6. **A miss the ring ran out for** is promoted by the copy engine — a second
-   crossing, worth paying: skipping the prefill-only ones left the next configs
-   to miss them again (BF16×4 3,176 misses against 1,262).
+6. **A miss that took no slot is not re-sent.** Its workers computed it from
+   scratch, and the next launch that routes it claims an offer. A copy-engine
+   promotion of it would be a second crossing of the link for bytes the workers
+   had just read: on Qwen3.8-Flash-Next (16 GB card) re-sending a prefill
+   launch's decode-scored misses was 0.6–1.1 GiB per prefill row, read while
+   the launch's workers saturated the link, and prefill ran 2–10% behind
+   workers that promoted into ring slots once. The copy engine promotes only
+   predictions (speculative prefetch), never a miss.
+
+7. **The owner check** (`tensor-assert`). Each zone slot carries a mapped tag of
+   the expert last installed there (`expert_lre::slot_owners`), written on an
+   install or a relocation's destination and never on an eviction — an
+   eviction retargets the entry while a bucketize may already hold the old
+   value, so clearing the tag then would race the checker against its subject.
+   Bucketize checks every VRAM entry it snapshots for a GEMM against its slot's
+   tag and traps on a mismatch, naming the slot: a tile about to read one
+   expert's weights under another's name is caught at the read.
 
 A boundary move drains the ring with the device synchronized: lands what was
-taken, frees what was not, and sets `tail = head`.
+taken, takes back what was not — an empty offer to the zone, a victim to plain
+residency — and sets `tail = head`.
 
 **Worker count by launch width.** `W` = 8 reaches the link's rate and is all a
 decode launch needs (a token tile per remote expert). A prefill launch's remote
@@ -486,6 +558,12 @@ changed**. Everything below is in `bucketize` and in the grouped entry
   prefix it already builds. And `snap[3][E]`, the routed experts' entries as
   read (phase 1b, after the histogram, one thread per routed expert).
 - The summary word gains the pinned and cold bits (§0.9).
+- **Promotion offers** (§0.7.1): thread 0 counts the launch's claiming experts
+  against the mapped `sweep` word before its first claim, then, in list order,
+  takes offers from `head`, skipping a victim of this row the launch routes and
+  retargeting a claimed victim's three live entries before the slot is handed
+  out. With an owner tag table (`tensor-assert`), phase 1b checks every VRAM
+  entry it snapshots against its slot's tag and traps on a mismatch.
 
 #### The grouped entry: `W` workers, then hits
 
@@ -512,17 +590,23 @@ grid — the order §0.10.1 showed overlaps and the reverse serialises.
      published the entry before the gate entry, so it is already there.
   2. **Mini loop**: all 128 threads copy row tile `j`'s slice — `K/128` pieces of
      `4 × chunk_bytes` (3,200 B for Q6_KO), piece `k` at chunk `k·(nrows/8) + 4j`
-     of the source — into the worker's VRAM scratch slot, 16-byte loads, four in
-     flight per thread. The slot then holds row tile `j` as a **32-row KO matrix**
+     of the source — 16-byte loads, four in flight per thread. With a promotion
+     slot (`remote_dst[r]`) each unit lands at its own offset in the slot's
+     projection, the source's layout; without one, in the worker's VRAM scratch
+     slot, which then holds row tile `j` as a **32-row KO matrix**
      (`[K block][4 row groups]`).
   3. **One `__syncthreads()`**: the stores are visible to the block's own
      `cp.async.cg` reads (both through L2).
   4. **Compute**: for each of `r`'s `n_tiles` token tiles, call the unmodified
-     impl with `weights = slot`, `nrows = 32`, `row_tile_idx = 0`, and
-     `dst + 32j` — the impl indexes chunks `k·(nrows/8) + warp` (= the slot
-     layout) and stores `dst[token·dst_stride + warp_row_base + …]`
-     (`store_tile_output`, `kernel.cuh:1834`), so the output lands in row tile
-     `j`'s columns with the same per-row arithmetic, bit for bit.
+     impl — over a promotion slot with `weights = slot projection`,
+     `nrows = nrows`, `row_tile_idx = j`, exactly a resident tile's call, which
+     reads only the chunks this worker just wrote; over scratch with
+     `weights = scratch`, `nrows = 32`, `row_tile_idx = 0` and `dst + 32j` — the
+     impl indexes chunks `k·(nrows/8) + warp` (= the scratch layout) and stores
+     `dst[token·dst_stride + warp_row_base + …]` (`store_tile_output`). Either
+     way the output lands in row tile `j`'s columns with the same per-row
+     arithmetic, bit for bit (`cuda_live_launch_*`, including a ring that runs
+     short mid-list).
   5. `__syncthreads()`, next item.
 - **`W` = 8** (§0.10.1–2): 8 workers reach the link's 12.2 GB/s; a ninth adds
   nothing and holds an SM slot. A launch with no remote expert pays 8 blocks
@@ -783,7 +867,7 @@ only pinned tier; demand misses no longer load), CLAUDE.md hot-path invariant 3
 |---|---|
 | Kernel side | §0.10: workers in the same launch, mini-loop copy + one sync, the unmodified impl over a scratch slot |
 | `W` | 8 for a decode launch, 32 over 64 tokens (§0.7.1) |
-| Promotion of misses | by the workers into ring slots; copy engine only for misses the ring ran out for, and for prefetch (§0.7.1) |
+| Promotion of misses | by the workers into ring slots; copy engine only for prefetch; a miss with no slot is claimed on its next launch, never re-sent (§0.7.1) |
 | Scratch | `W` slots of the largest projection slice — ~410 KB for qwen36 |
 | Pad size | one full layer, the floor that never needs a GPU→host "consumed" signal; anything above it is a pinned-budget split left at zero in this revision |
 | Promotion policy | every miss is a promotion candidate, admitted by the pipeline's existing score policy (today's behaviour minus the critical path) |

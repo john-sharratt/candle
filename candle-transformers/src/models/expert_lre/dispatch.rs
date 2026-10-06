@@ -18,8 +18,10 @@
 //! compute them; a cold expert's workers wait on its live gate entry, which the
 //! stager publishes once the expert is in the pad. A remote expert bucketize
 //! gave a slot from the promotion ring (`promo`) has its slices written there
-//! too, so the layer leaves it in VRAM. Nothing the GPU waits on needs a driver
-//! call (`docs/moe_live_dispatch_design.md` §0).
+//! instead, and computed from there, so the layer leaves it in VRAM. Whether a
+//! launch claims slots at all is bucketize's to decide, per launch: a prompt
+//! passing over the table (a sweep) claims none and stays in scratch. Nothing
+//! the GPU waits on needs a driver call (`docs/moe_live_dispatch_design.md` §0).
 //!
 //! The forward thread holds back only to keep the summary ring from being
 //! overwritten before both host threads have read it — a check against two
@@ -28,6 +30,8 @@
 use super::live_table::{LiveTable, Proj};
 use super::promo::PromotionRing;
 use super::reclaim::ReclaimClock;
+#[cfg(feature = "tensor-assert")]
+use super::slot_owners::SlotOwners;
 use super::stager::StagerMsg;
 use super::started::StartedRows;
 use super::types::{PipelineMessage, RoutedLayer};
@@ -38,7 +42,7 @@ use candle::cuda_backend::CudaDevice;
 use candle::quantized::cuda::{
     fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_int8_n_sub,
     grouped_qmatmul_dev_q8a128, moe_bucketize, silu_mul_q8a128, BucketizeLive,
-    MoeBucketizeWorkspace, MoeLive, Q8a128Operand,
+    MoeBucketizeWorkspace, MoeLive, OwnerCheck, Q8a128Operand,
 };
 use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::SumScale;
@@ -337,6 +341,36 @@ pub(crate) struct Reserved {
     row: usize,
 }
 
+/// Bucketize's owner check (`moe_bucketize.cu`, OWNER CHECK) and, with
+/// `tensor-assert`, the slot tags it reads — held here, beside the launches
+/// that read them, so they outlive every launch. Without the feature the check
+/// is all zero and bucketize checks nothing.
+pub(crate) struct OwnerTags {
+    check: OwnerCheck,
+    #[cfg(feature = "tensor-assert")]
+    _owners: Arc<SlotOwners>,
+}
+
+impl OwnerTags {
+    /// The check over `owners`, whose slot `s` ends `s · slot_bytes` below
+    /// `zone_end`.
+    #[cfg(feature = "tensor-assert")]
+    pub(crate) fn new(owners: Arc<SlotOwners>, zone_end: u64, slot_bytes: usize) -> Self {
+        Self {
+            check: owners.check(zone_end, slot_bytes),
+            _owners: owners,
+        }
+    }
+
+    /// No tags: bucketize checks nothing.
+    #[cfg(not(feature = "tensor-assert"))]
+    pub(crate) fn none() -> Self {
+        Self {
+            check: OwnerCheck::default(),
+        }
+    }
+}
+
 /// Everything the device-side expert forward needs that the host threads do
 /// not own.
 pub(crate) struct Dispatch {
@@ -365,6 +399,7 @@ pub(crate) struct Dispatch {
     /// `WORKERS_PREFILL` VRAM slots of `slot_bytes`, the workers' copies.
     scratch: CudaSlice<u8>,
     slot_bytes: usize,
+    owner: OwnerTags,
     /// Profile build only: per-row worker counters `[rows × 5]` (see
     /// `kernel.cuh`, "A live expert table").
     #[cfg(feature = "profile")]
@@ -399,6 +434,7 @@ impl Dispatch {
         slot_bytes: usize,
         k: usize,
         promo: Option<Arc<PromotionRing>>,
+        owner: OwnerTags,
     ) -> Result<Self> {
         let n_experts = table.n_experts();
         let ring = Arc::new(SummaryRing::new(n_experts)?);
@@ -443,6 +479,7 @@ impl Dispatch {
             remote_dst,
             scratch,
             slot_bytes,
+            owner,
             #[cfg(feature = "profile")]
             stall,
             #[cfg(feature = "profile")]
@@ -675,10 +712,17 @@ impl Dispatch {
                 remote,
                 counters,
                 row: row as i32,
+                // Every launch is offered the ring; a prompt passing over the
+                // table — more claiming experts than the ring's sweep word —
+                // claims nothing and stays in scratch, decided by bucketize
+                // for this launch alone, so a decode row co-batched with a
+                // prompt costs at most a deferred claim on the next narrow
+                // launch.
                 promo: self.promo.as_ref().map(|p| p.ring()),
                 remote_dst,
                 started_rows: self.clock.started_ptr(),
                 ticket: seq + 1,
+                owner: self.owner.check,
             }),
             decode,
         )?;

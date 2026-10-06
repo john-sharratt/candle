@@ -2600,9 +2600,12 @@ static __device__ void moe_live_worker(
         }
         __syncthreads();
         const uint8_t* src = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(s_src));
-        // A promotion slot: the same slice also lands at its place in the slot
-        // image, so the expert is in VRAM once the layer is done — promoted for
-        // the price of a VRAM write, with no second crossing of the link.
+        // A promotion slot is the copy's ONLY destination: the slice lands at its
+        // place in the slot image — the source's own layout — and the tile is
+        // computed from there, as a VRAM-resident expert's would be. The expert is
+        // in VRAM once the layer is done, for no write beyond the one the compute
+        // needed anyway and no second crossing of the link. Without a slot the
+        // slice goes to this worker's scratch as a compact 32-row matrix.
         const unsigned long long promo_base = live.remote_dst != nullptr ? live.remote_dst[r] : 0ull;
         uint8_t* promo = promo_base == 0ull
                              ? nullptr
@@ -2626,9 +2629,10 @@ static __device__ void moe_live_worker(
             for (int u = 0; u < 4; ++u) {
                 const int idx = b + u * NUM_THREADS;
                 if (idx < units) {
-                    reinterpret_cast<uint4*>(slot)[idx] = v[u];
                     if (promo != nullptr) {
                         *reinterpret_cast<uint4*>(promo + at[u]) = v[u];
+                    } else {
+                        reinterpret_cast<uint4*>(slot)[idx] = v[u];
                     }
                 }
             }
@@ -2645,11 +2649,21 @@ static __device__ void moe_live_worker(
         if constexpr (is_scale_separate<block_c_t>::value) {
             for (int t = 0; t < n_tiles; ++t) {
                 const int tile = first + t;
-                grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
-                    reinterpret_cast<const block_c_t*>(slot), vy, dst + (size_t)j * N_TILE,
-                    ncols_x, N_TILE, y_stride, dst_stride,
-                    tile_b_start[tile], tile_b_cnt[tile], 0,
-                    smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
+                if (promo != nullptr) {
+                    // Row tile `j` of the whole projection, read where it landed —
+                    // the chunks `k·(nrows/8) + 4j + warp` this worker just wrote.
+                    grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
+                        reinterpret_cast<const block_c_t*>(promo), vy, dst,
+                        ncols_x, nrows_x, y_stride, dst_stride,
+                        tile_b_start[tile], tile_b_cnt[tile], j,
+                        smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
+                } else {
+                    grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
+                        reinterpret_cast<const block_c_t*>(slot), vy, dst + (size_t)j * N_TILE,
+                        ncols_x, N_TILE, y_stride, dst_stride,
+                        tile_b_start[tile], tile_b_cnt[tile], 0,
+                        smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
+                }
                 // The next tile's prologue refills the buffers this one read.
                 __syncthreads();
             }
