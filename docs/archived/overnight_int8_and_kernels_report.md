@@ -70,6 +70,7 @@ Because decode is launch/sync-bound, the remaining host ops are high-value — b
 - **Indexer top-k** (`indexer.rs:183-190`): `index_score.to_vec1()` (device→host sync) + host `sort_by` + `take(top_k)`, returning `Vec<usize>`.
 - **KV gather** (`attention.rs:372-377`): host loop building `window ‖ selected` + `Tensor::stack` of ~128 + ≤512 tiny tensors; `window.remove(0)` is O(n).
 - **MoE route** (`engine.rs:364-395`): `indices.to_vec2()` (device→host sync) + host counting-sort into the grouped-GEMM assignment list — one sync per layer.
+  > Superseded: the per-layer routing readback described here was removed by the live MoE dispatch (`docs/moe_live_dispatch_design.md`); DeepSeek's MoE now calls `ExpertCache::forward_routed`.
 
 The attention **math** (scores `q·Kᵀ`, sink softmax, `softmax·V`, output proj) is **already on the GPU**. So "the attention kernel" is really two things: (a) put the KV cache on the GPU, and (b) fuse the gather+scores+softmax+value.
 

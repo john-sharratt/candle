@@ -175,6 +175,9 @@ Two things fall out:
   ~0, so this is not expert DMA (experts are resident); it is the forward thread
   blocking on the MoE routing round-trip. Same shape as the documented
   MoE-routing readback wall.
+
+  > Superseded: the per-layer routing readback described here was removed by
+  > the live MoE dispatch (`docs/moe_live_dispatch_design.md`).
 - **`qmatmul_q8` fires 3,510 times per config** at ~11.6 µs each. That is the
   §3c fragmentation counted by the engine itself, independent of nsys.
 
@@ -421,6 +424,8 @@ directly.
    DeepSeek-V4's `moe_bucketize`. **This is now the largest single span in
    prefill** and was invisible until the profiler stopped synchronising. It is
    also the one item on this list that pays off on both machines (§8d).
+   > Done: the live MoE dispatch (`docs/moe_live_dispatch_design.md`) removed
+   > the routing round-trip and `fwd_routing_wait` with it.
 6. **Add NVTX spans to the qwen35 wave** (§6) — makes 1–5 measurable per phase,
    and would let launches be attributed to source sites.
 
@@ -519,6 +524,9 @@ All three name the **MoE expert path**: routing readback → submit round-trip �
 fragmented expert GEMMs. On the resident card that path is latency- and
 launch-bound; on the streaming card it is I/O-bound. It is the one area where
 work pays off on both, and it is where §7 item 5 already points.
+
+> Superseded: the routing readback and submit round-trip named here were removed
+> by the live MoE dispatch (`docs/moe_live_dispatch_design.md`).
 
 ## Reproduction
 

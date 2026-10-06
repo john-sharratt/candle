@@ -98,6 +98,7 @@ experts (the pinned-set arithmetic exists — `affordable_pinned_layers`).
 **Evidence.** Prediction precision at width is 93%, but prefetch volume is
 ~9K against ~115K DMA loads on C8×20 — the predictor is right and barely
 used. Cold misses are synchronous NVMe reads on the pipeline thread.
+> Superseded: cold experts are now staged by the stager thread while the expert kernels' workers wait on a mapped word (`docs/moe_live_dispatch_design.md` §0).
 
 **Attack.** Raise prefetch depth/queue so predicted next-layer experts are
 in flight during the current layer's GEMM; overlap cold reads behind the

@@ -190,6 +190,10 @@ Key properties:
 
 ### 3.3 What does not change
 
+> Superseded: the host-orchestrated expert path named here (`submit_moe_work`,
+> `process_request`, `classify_and_load`, the per-layer routing readback) was
+> replaced by the live MoE dispatch (`docs/moe_live_dispatch_design.md`).
+
 - `SparseMoeBlock::forward_dynamic`, `submit_moe_work`, `process_request`,
   `classify_and_load`, the grouped GEMM (`compute.rs`), the Markov prefetch
   (`transition.rs`), and every `QMatMul` — **untouched**. They already consume a

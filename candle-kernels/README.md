@@ -84,5 +84,6 @@ points — nothing outside `candle-core` calls into `candle-kernels` directly.
   (`src/paged-glue/`, `paged-prefill`'s `GAP_FILL` specialization)
 - `docs/archived/paged_gallery_arena.md` — the provenance scan's resident VRAM gallery
   and the `bdp_bmma.cu`/`bdp_imma.cu` tensor-core backends (§14)
-- `docs/gpu_native_moe_dispatch.md` — GPU-native MoE expert dispatch built on
-  `src/simple/moe_bucketize.cu` and `moe_scatter.cu`
+- `docs/moe_live_dispatch_design.md` — the live MoE expert dispatch built on
+  `src/simple/moe_bucketize.cu` (live-table classification, routing summary)
+  and `moe_scatter.cu`

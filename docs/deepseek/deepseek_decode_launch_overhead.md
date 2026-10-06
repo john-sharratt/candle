@@ -1,5 +1,10 @@
 # DeepSeek-V4 decode: where the time actually goes
 
+> **Superseded:** the per-layer routing readback measured here (`moe:sort_readback`,
+> `moe:sort`, `moe:submit`) was removed by the live MoE dispatch
+> (`docs/moe_live_dispatch_design.md`). The figures below are a measurement record
+> of the host-readback path.
+
 **Status: measured, first two optimisation attempts NEUTRAL and one reverted.**
 Target is decode aggregate 48.5 → 100 t/s. This records the measurement and,
 more importantly, the two ways the instrumentation misleads — because both
@@ -144,23 +149,26 @@ that was already tried for the readback itself and reverted at −8% on cfg8.
 
 All five configs stayed valid; cfg16 bulk 971 → 973 t/s, single 51.7 → 52.0.
 
-## Why the readback cannot simply be removed
+## How the readback was removed
 
-`GpuDispatchTables::build` — the GPU-native path that eliminated this readback
-for fully-resident models — refuses DeepSeek on two independent counts:
+At the time of this measurement the only GPU-native expert path,
+`GpuDispatchTables::build`, required an all-resident cache of at most 128
+experts per layer, and DeepSeek — 256 experts per layer, 3632 of 11008 slots
+resident — fell to the host path, which needed the expert ids on the host to
+schedule pinned→VRAM DMA before the layer's GEMMs could run.
 
-```rust
-if n_experts > 128 || keys.len() != n_layers * n_experts { return None; }
-```
-
-DeepSeek routes 256 experts per layer, and the streaming cache holds 3632 of
-11008 slots, so the residency grid is permanently incomplete. The host needs
-the expert ids to schedule pinned→VRAM DMA; that is invariant 3's sanctioned
-readback, and it is load-bearing for the cache, not an oversight.
-
-A previously-tried variant (dedicated routing stream + async DtoH into a pinned
-buffer) was reverted at −8% on cfg8: the per-layer event/side-stream overhead
-over 43 layers × N sessions outweighed the pinned-copy saving.
+The live MoE dispatch (`docs/moe_live_dispatch_design.md`) removes that need
+for every expert-cache model, DeepSeek included. `bucketize` classifies each
+routed expert against a live per-expert pointer table (VRAM / pinned / cold) and
+the grouped GEMMs run at once: pinned misses are copied into VRAM scratch and
+computed by the expert kernel's own worker blocks, and cold experts are waited
+on in-kernel until the stager thread publishes them. The routing summary goes
+to the host through a mapped pinned ring, read asynchronously by the stager and
+the pipeline thread; nothing on the device waits for either. There is no
+per-layer event, side stream or DtoH, so the −8% that sank the earlier
+async-copy variant (dedicated routing stream + async DtoH into a pinned buffer,
+cfg8) does not apply: that variant still synchronised the host on the copy
+every layer.
 
 ## Where the remaining headroom is
 

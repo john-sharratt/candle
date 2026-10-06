@@ -79,18 +79,25 @@ central mechanisms:
   ~69% hit rate on Qwen3-30B-A3B; see `docs/archived/markov_expert_prediction_eval.md`
   for the full offline evaluation (LOOCV promotion/eviction study) and
   `eval.rs` for the harness.
-- **Wave-batched grouped GEMM** (`pipeline.rs`, `compute.rs`,
-  `gpu_dispatch.rs`): many concurrent sessions are stepped through each layer
+- **Wave-batched grouped GEMM** (`dispatch.rs`, `live_table.rs`,
+  `stager.rs`, `pipeline.rs`): many concurrent sessions are stepped through each layer
   together so one expert weight load is amortised across the whole batch
-  rather than paid per session. `handle.rs` exposes `ExpertCache` with two
-  modes — **threaded** (background pipeline thread owns cache state, used
-  when experts stream from mmap) and **inline** (all experts pre-loaded,
-  Mutex-protected, no DMA).
+  rather than paid per session. `handle.rs` exposes `ExpertCache`, and every
+  expert-cache MoE model (Qwen3-30B-A3B, Qwen3.5/3.6, Qwen3.8-Flash-Next,
+  DeepSeek-V4-Flash) runs its experts through one path,
+  `ExpertCache::forward_routed`: the GPU `bucketize` kernel reads a live
+  per-expert pointer table, classifies each routed expert VRAM / pinned /
+  cold, and the grouped GEMMs run at once — VRAM experts in place, pinned
+  misses copied into VRAM scratch by the expert kernel's own worker blocks,
+  cold experts waited on until the stager thread publishes them from NVMe.
+  The routing summary reaches the host through a mapped ring that the
+  pipeline thread (residency, promotion, eviction, Markov) and the stager
+  read asynchronously; nothing on the device waits for the host to read it.
 
 Eviction is score-based (frequency-decayed, layer-aware, with early-layer
 pinning); see the module header in `expert_lre/mod.rs` for the full four-part
-policy. `docs/gpu_native_moe_dispatch.md` covers the GPU-native routing
-dispatch that removes the per-layer expert-routing GPU→CPU readback, and
+policy. `docs/moe_live_dispatch_design.md` covers the live MoE dispatch — the
+expert forward with no per-layer routing readback and no host round trip — and
 `docs/unified_wave_inference_engine.md` / `docs/continuous_fair_waves.md`
 cover how decode, prefill, and glue forwards are interleaved so decode's hot
 expert working set survives large prefills.
@@ -131,4 +138,4 @@ long-context generator's `tokenizers` dependency).
 - `docs/archived/markov_expert_prediction_eval.md` — the Markov Wave paper: promotion/eviction study and final design.
 - `docs/unified_wave_inference_engine.md` — the original decode/prefill/glue wave design.
 - `docs/continuous_fair_waves.md` — supersedes the above: decode and prefill share the layer traversal instead of time-slicing it.
-- `docs/gpu_native_moe_dispatch.md` — GPU-native MoE routing dispatch (removes the per-layer GPU→CPU readback).
+- `docs/moe_live_dispatch_design.md` — the live MoE dispatch: live pointer table, worker-block miss service, stager and pipeline threads, no per-layer routing readback.

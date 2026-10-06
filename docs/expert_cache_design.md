@@ -383,9 +383,12 @@ It is verified on the **bulk** path: the startup fill, where thousands of record
 land at once, the cores are idle waiting on the drive, and the work parallelises.
 It is **not** verified on the per-miss cold read, and that is measured rather
 than assumed. A `fletcher32` over 2.9 MB costs about as much as the read it
-follows, on the pipeline thread, in front of a forward that is waiting for it:
-with it there the gate lost **more than half its throughput** — 723 → 299 t/s on
-the narrowest config — to insure ~850 records per config.
+follows, and a cold read sits on the critical path — it is made by the stager
+thread while the expert kernel's worker blocks spin on the expert's live-table
+entry (`docs/moe_live_dispatch_design.md` §0.6). Measured when that read was
+still made on the pipeline thread with the forward waiting on it, the checksum
+there cost the gate **more than half its throughput** — 723 → 299 t/s on the
+narrowest config — to insure ~850 records per config.
 
 What the trailer defends is the *medium* — bit rot, a bad sector, a truncating
 filesystem — on a file that lives beside the checkpoint for as long as the
@@ -485,8 +488,9 @@ bounded by min(what the machine is big enough for, what it has free now − head
 backed by cuMemAllocHost halving on refusal
 ```
 
-with the headroom (3 GiB) reserved for everything the process allocates *after*
-the warm tier — the staging ring, the routing buffer, the substrate's pinned
+with the headroom (4 GiB, `WARM_TIER_HEADROOM`) reserved for everything the process allocates *after*
+the warm tier — the mapped live table, routing-summary ring and promotion
+ring of the live dispatch, the substrate's pinned
 cold-load scratch, the `PinnedStager` arenas, and the warm KV tier. Pinned pages
 cannot be reclaimed under pressure, so a tier that fits by exactly nothing does
 not degrade, it fails.
@@ -506,7 +510,10 @@ they hold cold reads to 4 % of loads at 81 % coverage.
 
 Lowering the headroom to 1 GiB was measured. The tier grew to 5,090 slots and
 cold loads halved (986 → 435) — and **throughput did not improve**: flat to 1–2 %
-down, single-stream falling further. Past the knee, pinned pages come out of the
+down, single-stream falling further. On Flash-Next at 16 GB, 3 GiB against 4 GiB
+was measured too and was slower (decode 13.8 / 67.6 / 26.8 → 13.5 / 64.7 /
+22.8 t/s, BF16×1 / BF16×8 / C5×2), free RAM bottoming at 2.05 GiB against
+3.57 GiB — which is why the constant is 4 GiB. Past the knee, pinned pages come out of the
 page cache and the warm KV tier, and the reads they save are no longer on the
 critical path. The tier's job is to cover the miss stream, not to mirror the
 model.
@@ -874,7 +881,10 @@ tier. Reversing the order is the fix and it made the tier *bigger*, not smaller
 (5,100 slots against 4,979), because the warm sizing now runs against a machine
 whose mandatory allocations are already accounted. A sector-aligned host
 fallback inside the ring is the belt: it must never be a plain `Vec`, whose
-alignment `FILE_FLAG_NO_BUFFERING` rejects.
+alignment `FILE_FLAG_NO_BUFFERING` rejects. The ring itself is gone with the
+live dispatch; its successor, the **pad** (one layer of slots, mandatory — it is
+what makes a cold expert computable), is allocated before the warm tier by the
+same rule, and the startup fill borrows it as its landing ring.
 
 **Geometry validates where the bytes go, not what they are.** §5's identity —
 GGUF length, a 4 MiB checksum, and the record geometry — misses a repack that
@@ -900,8 +910,9 @@ is written first and is identical, so the result validates. The temp name now
 carries the pid and a nanosecond stamp.
 
 **An all-resident cache wants no warm tier.** When VRAM holds every expert
-nothing is ever evicted — `post_compute` returns before the eviction and boundary
-passes — so a warm slot could only be read by a load that misses, and none does.
+nothing is ever evicted — the pipeline thread's routed-message handling skips
+promotion, the promotion ring and speculation when `all_resident` — so a warm slot
+could only be read by a miss, and none happens.
 The old two-tier code had this guard (`if all_resident { 0 }`) and the rewrite
 dropped it, pinning the model's size in host RAM to serve nothing and paying a
 full-pack read at startup for it.

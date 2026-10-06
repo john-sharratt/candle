@@ -1072,6 +1072,10 @@ device | host (readback)`. It was previously a `tracing::warn` that every gate
 harness dropped on the floor for want of a subscriber — qwen3-MoE reads
 `device` at 100% hit rate, qwen4exp reads `host (readback)`.
 
+> Superseded: the per-layer routing readback described here was removed by the
+> live MoE dispatch (`docs/moe_live_dispatch_design.md`); there is one dispatch
+> path, and the `MoE dispatch` row is gone.
+
 *Exit met:* the kernel runs at 512, bit-exact, with no measured regression at
 256.
 
@@ -1664,6 +1668,10 @@ Decode, timed on its own in the same run: **64–69 ms/step** (14.5–15.6 tok/s
 at the QSA-capped read. Prefill of 2,434 tokens: 1.6–1.8 s.
 
 ### 13.3 Component baselines
+
+> Superseded: the per-layer routing readback measured above (`fwd_routing_wait`,
+> `submit_roundtrip`) and the `host (readback)` dispatch below were removed by the
+> live MoE dispatch (`docs/moe_live_dispatch_design.md`).
 
 | | |
 |---|---|

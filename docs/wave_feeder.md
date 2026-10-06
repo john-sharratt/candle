@@ -1127,6 +1127,10 @@ GPU-native MoE dispatch tables were never built in any of these runs — the
 cache streams experts on this card, and the tables are for an all-resident
 cache — so every MoE layer takes the host path's blocking routing readback.
 
+> Superseded: the per-layer routing readback described here was removed by the
+> live MoE dispatch (`docs/moe_live_dispatch_design.md`), for streaming and
+> all-resident caches alike.
+
 **The batched-forwarding gate, and what it says about the operating point.**
 `test_parallel_batched_forwarding_36_35b` on this card, after run AO, every
 row at 100%:

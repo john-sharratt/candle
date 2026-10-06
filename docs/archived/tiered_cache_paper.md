@@ -2,6 +2,8 @@
 
 *February 2026*
 
+> Superseded: the dual-thread dispatch described here — the forward thread handing routing to a pipeline thread that classifies, loads and runs the expert GEMMs (`submit_roundtrip`) — was replaced by the live MoE dispatch (`docs/moe_live_dispatch_design.md`), in which the expert kernels run on the forward's stream with no host round trip and the pipeline thread only reads a routing summary off the critical path.
+
 ---
 
 ## Abstract

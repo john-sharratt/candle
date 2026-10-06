@@ -443,7 +443,7 @@ Measured host readbacks per decode token ≈ **N + C + 1** (N = layers ≈ 43, C
 
 | Op | Now | Fix |
 |---|---|---|
-| **MoE route dispatch** (`engine.rs` `to_vec2` + host counting-sort, ×N) | GPU→CPU readback of route indices then host sort | The indices are **already on-device** (`arg_sort_last_dim` in `Gate::route`). The batched path (`batched.rs`) already builds the dispatch on-device via **`moe_bucketize`** + `GpuDispatchTables`. Route through that — **−N syncs**. |
+| **MoE route dispatch** (`engine.rs` `to_vec2` + host counting-sort, ×N) | GPU→CPU readback of route indices then host sort | **DONE — −N syncs.** The live MoE dispatch (`docs/moe_live_dispatch_design.md`): `ExpertCache::forward_routed` runs `moe_bucketize` over a live expert table and the grouped GEMMs at once; the routing summary reaches the host through a mapped ring nothing on the device waits for. |
 | **Indexer top-k** (`indexer.rs:183` `to_vec1` + host sort, ×C) | readback + host partial sort | Prefill's `build_mask` (`attention.rs:211`) **already does this top-k fully on-device** (`arg_sort_last_dim` + `narrow` + `scatter_add`). Reuse it in decode → return a **device index tensor** — **−C syncs**. |
 | **KV gather** (`attention.rs:362` `Vec<Tensor>` + `stack`, ×N) + window ring `remove(0)` | host-orchestrated per-step gather | Disappears entirely once KV lives in arenas + the attention kernel reads it (§3–5). |
 | **Sinkhorn** | ✅ already fused (shipped) | one kernel launch |
@@ -682,8 +682,8 @@ Both are key streams feeding one accumulator; the split-KV `num_splits` spans th
 _Revised at implementation (the palette-tiled-arena plan below it replaced assumed the stock
 adaptive-format staging; the fixed-FP8 direct-load fork obviates it)._ The implemented prefill is
 the **decode step itself, run once per prompt token inside the wave**. The wave's real batching
-win is the MoE (one grouped call + one routing readback per layer per wave, amortized over every
-row); attention absorbs the prompt through `kernel_attn_decode_step` — the SAME launch the decode
+win is the MoE (one grouped call per layer per wave, amortized over every row, with no routing
+readback — `docs/moe_live_dispatch_design.md`); attention absorbs the prompt through `kernel_attn_decode_step` — the SAME launch the decode
 rows use: in-kernel FP8 writer scatter, push→select→attend corpus order, auto split factor.
 Mechanism: `build_decode_metadata_at(seqs, generation, offset_overrides)` pre-builds one header
 snapshot per prompt token at wave entry (token `t` serialized at offset `base+t`, all layers;
@@ -873,7 +873,7 @@ Each step keeps the prior rung green as its gate; that green rung is the **next 
 | 3 | `FloatGalleryArena` + two-stage select (BO §3) | (a) **BDP recall ⊇ Indexer top-k**, swept per layer (§D validation); (b) corpus round-trip raw bytes; (c) two-stage == full Indexer top-k on synthetic gallery | rung 2 corpus path matches `sink_attend` (oracle b) over the same selection |
 | 4 | `paged-deepseek` **prefill** kernel (BO §4) | rung 2: prefill vs `streaming.rs::forward` on synthetic prompt → then **rung 3** | **`engine_generate_paris_fast` green on the real kernel path** (host attention gone) |
 | 5 | `BatchedModelCore` + temp-substrate migration (BO §6), incl. the §2 sync eliminations (`moe_bucketize` routing −N, on-device Indexer top-k −C) | **rung 4**: persist→reboot→resume == pre-reboot KV (monoid boundary-merge, §C); same Paris; instrumented **readbacks/token == 1** (the sampler) | rung 4 Paris + resume-exact + one-readback assert |
-|   | _Implemented as `ManagedBatchedModel` directly (`latent_moe/wave.rs` — the scheduler binds `Box<dyn ManagedBatchedModel>`, so the mHC loop stays private; zero scheduler changes). Readback accounting, measured and asserted (`wave_paris`): the Indexer top-k and prefill selections are fully on-device (−C ✓); MoE routing is ONE amortized readback per layer per **wave** — intrinsic to the **streaming** `ExpertCache` (host must see expert ids to schedule pinned→VRAM uploads; §2's zero-readback dispatch engages exactly when the expert set is fully resident, as on Qwen). Budget = 1 sampler readback/token + that documented routing set, nothing else._ | | |
+|   | _Implemented as `ManagedBatchedModel` directly (`latent_moe/wave.rs` — the scheduler binds `Box<dyn ManagedBatchedModel>`, so the mHC loop stays private; zero scheduler changes). Readback accounting, measured and asserted (`wave_paris`): the Indexer top-k and prefill selections are fully on-device (−C ✓); MoE routing is read back nowhere — the live MoE dispatch (`docs/moe_live_dispatch_design.md`) serves the **streaming** `ExpertCache` without the host seeing expert ids first, so the wave readback budget (`latent_moe::readback`) is zero. Budget = 1 sampler readback/token, nothing else._ | | |
 | 6 | Dynamic corpus/RoPE budgets to 1M (§L) | NIAH needle recall via `ruler_gen` (generic over `ManagedBatchedModel` — needs the step-5 core) + footprint **flat** as N grows | Paris green; footprint-flat + needle recall hold |
 | 7 | `paged-deepseek` **glue** kernel + compression-seam merge (BO §5, §E) | rung 2: glue-recombine vs host LSE fold (raw `(m,l,acc)`) → two-turn seam-straddling group reconstructs == single-shot forward of the concatenation | rung 4 Paris across a 2-turn seam |
 | 8 | **Intra-turn glue embedding (LAST)** (§E optimization) | equivalence: embedded-intra-glue reconstruction == fully-regenerated-glue reconstruction | no Paris/coherence regression |

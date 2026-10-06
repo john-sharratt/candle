@@ -1,5 +1,10 @@
 # GPU-native MoE dispatch — implementation report
 
+> **Superseded by `docs/moe_live_dispatch_design.md`.** This report's all-resident
+> dispatch tables and the host-readback path they fell back to are both gone: the
+> live MoE dispatch (its design grew from Phase B here) serves every expert-cache
+> model, paged or all-resident, with no per-layer routing readback.
+
 **Goal:** eliminate the per-layer expert-routing GPU→CPU readback (the dominant
 decode stall on WDDM) with a fully GPU-native dispatch, per the Option-1 design.
 

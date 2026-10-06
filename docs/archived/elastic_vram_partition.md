@@ -604,6 +604,8 @@ driven by a feedback signal rather than an exact computation. That was not a
 design decision so much as the consequence of one constraint discovered during
 the build, and it is worth recording because the phase lock is what dissolves it:
 
+> Superseded in part: under the live MoE dispatch (`docs/moe_live_dispatch_design.md` §9) a boundary move is governed by the live table and `ReclaimClock` tickets (`expert_lre/reclaim.rs`), not by the pipeline thread's end of pass.
+
 **`claim_region` runs on whichever thread needed an arena. The expert cache is
 owned by the pipeline thread, and its slots may be under read by kernels still
 in flight.** A synchronous retraction from the claim path is a cross-thread call

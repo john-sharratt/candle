@@ -202,12 +202,22 @@ wrong: it lands below `912 + 320`, so every forward would retract the weight sid
 to place its tier and then regrow it — layer slots traded for boundary churn on
 the hot path.)
 
-**A captured device address does not survive a boundary move.** The MoE dispatch
-tables cache one slot address per expert, on the reasoning that an all-resident
-cache's weights never move. They do: a concession evicts the slots at the frontier,
-and the zone then *grows back* — so capacity and floor read exactly as they did at
-load while the conceded slots hold something else. **Compare a monotonic concession
-count, never the geometry.**
+**A captured device address does not survive a boundary move.** A concession
+evicts the slots at the frontier, and the zone may then *grow back* — so capacity
+and floor read exactly as they did at load while the conceded slots hold something
+else; geometry cannot tell a holder its address went stale. The expert side is
+built so that nothing holds one across a move. The MoE kernels never cache a slot
+address: each invocation's `bucketize` snapshots the routed experts' entries from
+the **live table** (`expert_lre/live_table.rs`), and the GEMMs read only that
+snapshot. A concession first retargets the conceded slots' entries (to the
+expert's pinned copy, or 0), and the boundary moves only when quiet — no wave
+generation open, every begun invocation served, under the pass lock — and hands
+ground over behind a device-wide quiesce (`expert_lre/boundary.rs`). Slot reuse
+outside a boundary move is gated by tickets: a slot an entry no longer names is
+reused only once every invocation that could have snapshotted it has finished
+(`expert_lre/reclaim.rs`, `ReclaimClock`). The rule for any *other* tenant that
+captures an address stands: re-read the owner's current state, never infer it
+from the geometry.
 
 ---
 
@@ -501,7 +511,10 @@ Each has been violated in production at least once.
 4. An arena layout may not cross `weight_floor`. A wider forward arriving behind a
    live one must not walk its plan from a base chosen for a smaller purchase.
 5. A raw device address captured from one tenant is invalidated by any boundary
-   move. Compare a monotonic concession count, never the geometry.
+   move, and the geometry cannot say so. The expert kernels hold none across a
+   move: they read a per-invocation snapshot of the live table, and a conceded
+   slot is retargeted before the move and reused only behind the quiesce and the
+   reclaim tickets (§4).
 6. A boundary check must consult the **reservation**, never live occupancy. A check
    against a mid-wave `region_stats().transient_bytes` snapshot, or one comparing
    two figures derived from the same array, passes while the invariant is broken.

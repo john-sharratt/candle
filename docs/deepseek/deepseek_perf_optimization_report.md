@@ -82,6 +82,9 @@ attention sync used to drain. (`deepseek:moe` "rising" 44.6→87.6ms is that art
 unchanged.) Eliminating that second per-layer drain is the next decode lever — it needs GPU-native
 streaming dispatch (below).
 
+> Superseded: the per-layer routing readback described here was removed by the live MoE dispatch
+> (`docs/moe_live_dispatch_design.md`).
+
 ### Measured results (final `[1,4,8]` run, all 100% correct)
 
 | Config | Prefill t/s | vs baseline | Decode t/s | vs baseline |
@@ -317,6 +320,10 @@ approximate kernel (recall shortlist) with a tie-agnostic gate, not a false dete
    keeps the (roughly-fitting ~100–150 experts/layer) working set resident so misses become rare. Deep
    `expert_lre` work. Note PCIe itself is *not* the cost (`pipe_fence_wait` = 0.7ms total); it's the
    compute+launch of the expert GEMM, serialized by the readback.
+
+   > Superseded: the GPU-native dispatch tolerant of partial residency asked for here is the live
+   > MoE dispatch (`docs/moe_live_dispatch_design.md`), which removed the readback and the
+   > `all_resident` requirement for every expert-cache model, DeepSeek included.
 3. **x-projection concat** — fuse `wq_a`/`wkv` + the compressors' projections into one matmul via int8-KO
    weight concatenation at load (keeps the matmul fast). Delicate quant-weight surgery.
 

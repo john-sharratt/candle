@@ -491,12 +491,22 @@ This is the crux the first pass missed. `from_gguf_by_path_with_int8`
   KV floor free, and `num_slots = expert_budget / max_expert_size` is the hot active set; the
   rest lives in pinned RAM.
 - **Cross-session wave** (`forward_wave` / `forward_wave_contexts`): co-batches decode + prefill
-  rows from many sessions into one sweep, so each MoE layer runs `submit_moe_work` **once per
+  rows from many sessions into one sweep, so each MoE layer runs its expert dispatch **once per
   layer per wave** over the *union* of routed experts — the load is amortized across sessions.
 
-Net: the sizing constraint is **experts fit in VRAM + host RAM**, and DeepSeek's 147 GB fit
-(§3.2). The GPU-native MoE pipeline itself is `moe_route → moe_bucketize → gather → grouped
-GEMM → silu_mul → scatter` with zero routing readback.
+> **Since then — the live MoE dispatch (`docs/moe_live_dispatch_design.md`).** The per-layer
+> `classify_and_load` / `submit_moe_work` host path above is gone, and so is demand eviction.
+> Every layer runs `ExpertCache::forward_routed`: `moe_bucketize` classifies each routed expert
+> VRAM / pinned / cold against a live per-expert pointer table, and the grouped GEMMs run at once
+> — VRAM experts in place, pinned misses copied into VRAM scratch by the expert kernel's own
+> worker blocks, cold experts (on the NVMe pack only) waited on in-kernel until the stager thread
+> publishes them into a pinned pad. VRAM residency changes only by promotion and eviction on the
+> pipeline thread, off the critical path. The startup and governor bullets above predate the
+> three-tier cache (`docs/expert_cache_design.md`).
+
+Net: the sizing constraint is **experts fit in VRAM + host RAM + the NVMe pack**, and DeepSeek's
+147 GB fit (§3.2). The MoE pipeline itself is `moe_route → moe_bucketize → gather → grouped
+GEMM → silu_mul → scatter`, all on the GPU, with zero routing readback.
 
 ### 5.2 The seam map — what plugs in vs. what is model-owned
 

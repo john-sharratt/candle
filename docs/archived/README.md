@@ -46,7 +46,8 @@ code no longer has.
 | Doc | Covers |
 |---|---|
 | `boundary_injection_design.md` | Static chunk cache for structural ChatML boundary tokens (system/user/assistant transitions), to skip repeated prefill of fixed inter-turn text. |
-| `expert_pipeline_dataflow.md` | Async fork-join MoE expert pipeline design: CPU as a pure submission engine, GPU as a stream-dependency dataflow machine. |
+| `expert_pipeline_dataflow.md` | Async fork-join MoE expert pipeline design: CPU as a pure submission engine, GPU as a stream-dependency dataflow machine. Superseded by `docs/moe_live_dispatch_design.md`. |
+| `gpu_native_moe_dispatch.md` | GPU-native MoE routing dispatch for an all-resident expert cache, with a host-readback path for the paged case. Superseded by `docs/moe_live_dispatch_design.md`, which removes the readback for every expert-cache model. |
 | `paged_glue_kernel.md` | Earlier dedicated glue-attention kernel derived from paged-decode; superseded by the batched `GAP_FILL` approach in `docs/glue_prefill_kernel.md`. |
 | `prefill_optimization.md` | **Built, 5.2–18.6× measured.** INT8 prefix-attention prefill kernel with GQA-packed tiles — the design record for what became `paged_prefill_int8_kernel.cuh`. |
 

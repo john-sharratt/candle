@@ -1830,6 +1830,13 @@ Counting from the routing summary fixes that by construction.
 
 ## 17. Documentation to update
 
+> **Applied 2026-10-07:** the §18.1 READMEs (`candle-transformers`, `candle-kernels`,
+> `docs/README.md`, `docs/archived/README.md`), the §18.2 design docs, the §18.3
+> superseded-by pointers, and the §18.5 code comments are updated. `docs/decode_graphs.md`
+> already described the live dispatch and needed no change. The paper (§18.4) is still
+> flagged, not edited. `CLAUDE.md` (invariants 3, 4 and 7's example) and the `bed` and
+> `sweep` skills are updated too.
+
 Audited across `docs/`, `CLAUDE.md`, the skills, the READMEs and every Rust and
 CUDA doc comment. **A** = states behaviour this change makes false; rewrite with
 the code. **B** = a historical record; leave it, add a superseded-by pointer

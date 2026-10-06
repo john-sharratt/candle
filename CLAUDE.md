@@ -190,14 +190,22 @@ architecture says is unnecessary. Full study + per-invariant violation catalogue
    `candle-kernels/src/arena_table.cuh` (`ArenaTableEntry`/`PerHeadTableEntry`) for the paged
    attention kernels, the gallery's `region_ptr_cache`, and `bdp_recall_batched`'s per-gallery
    sign-pointer table (which replaced an O(Σ len × words) concatenation).
-3. **No unnecessary GPU→CPU transfers.** Exactly two sanctioned readbacks: (a) MoE expert
-   routing (`indices` → host), because the streaming `ExpertCache` schedules pinned→VRAM
-   uploads by expert id; and (b) the embedding lookup (token ids → host, CPU `index_select`,
-   transfer in), a pure index + transfer that keeps the embed table off VRAM. Everything else —
+3. **No unnecessary GPU→CPU transfers.** Exactly one sanctioned readback on the forward
+   path: the embedding lookup (token ids → host, CPU `index_select`, transfer in), a pure
+   index + transfer that keeps the embed table off VRAM. Everything else — MoE routing,
    comp-idx assembly, select remaps, gather indices — stays on the GPU.
+   > **MoE routing has no readback.** The live MoE dispatch (`docs/moe_live_dispatch_design.md`)
+   > is the expert path for every `ExpertCache` model: `bucketize` classifies each routed
+   > expert VRAM / pinned / cold on the device and writes a routing *summary* into a mapped
+   > pinned ring; the expert kernels copy pinned misses themselves, and only a cold expert waits
+   > — on a mapped word the stager thread publishes, never on a driver call. The host threads
+   > read the summary off the critical path (staging, residency scoring, promotion). **Nothing on
+   > the device waits for the host to read it.** Older docs, memory notes and profiles that
+   > describe a per-layer `indices.to_vec2()`, a host counting-sort or `submit_moe_work` (e.g.
+   > "3.3 ms per layer, 43 times per token") describe the removed path.
 4. **Run as much as possible on the GPU.** No host-side compute a kernel can do: no host
    counting-sort, no host set-union/dedup/remap. Host code issues launches; it does not
-   compute over per-token data. (The two transfers in #3 are the only exceptions.)
+   compute over per-token data. (The transfer in #3 is the only exception.)
 5. **Everything in prefill and decode runs fully batched.** One launch over all slots / all
    sessions, not a per-seq or per-token loop. Decode batches select, gather, attention, and
    out-proj across sessions; prefill must reach the same shape — a multi-slot attention kernel
@@ -230,11 +238,13 @@ architecture says is unnecessary. Full study + per-invariant violation catalogue
      a live one leaves its plan standing over the previous, narrower tier. The layout then
      walks the wider plan from a base chosen for a smaller purchase.
    - **A raw device address captured from one tenant is invalidated by any boundary move.**
-     The MoE dispatch tables cache one slot address per expert on the reasoning that an
+     The MoE dispatch once cached one slot address per expert on the reasoning that an
      all-resident cache's weights never move. They do: a concession evicts the slots at the
      frontier, and the zone then *grows back* — so capacity and floor read exactly as they did
-     at load while the conceded slots hold something else. Compare a monotonic concession
-     count, never the geometry.
+     at load while the conceded slots hold something else. The live table replaced that cache:
+     an entry is retargeted before its slot is re-tenanted, and the slot is reused only once
+     every invocation that could have snapshotted the old address has finished
+     (`expert_lre/reclaim.rs`). Never infer "nothing moved" from the geometry.
 
    **The danger, stated plainly:** a boundary check that consults live occupancy
    (`region_stats().transient_bytes`, a mid-wave snapshot) instead of the reservation, or that

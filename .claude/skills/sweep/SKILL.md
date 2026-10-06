@@ -153,20 +153,16 @@ reasons and only one of them is about numerics:
   fits (the 30B on a 72 GB card) has nothing to take; the probe then prints
   `weights fully resident` instead of a percentage, and that is a pass.
 
-**The efficiency gate fails by construction while KV compaction is switched off** (see
-`compact_backings`), and must be reported as the standing cost of that, not tuned: the
-number is correct and the mechanism it measures is off on purpose. Measured 2026-09-27 with
-it off — 30B 40% and Flash-Next 2%, against a 90% threshold.
+**KV compaction is on** (`compact_backings`, and `compact_recurrent` for the span tenants),
+so the efficiency gate is expected to pass: 2026-10-07 read 99% (30B) and 97% (Flash-Next)
+worst sustained. A failure is a fragmentation regression to attribute, not a standing cost.
 
-**The uptake gate is a different question and is not compaction-gated.**
-`reclaim_spare_ground` runs between forwards from the wave loop, and the growth policy's own
-refusal (`Refusal::Pressure`, when KV demand is rising or the KV side asked since the last
-negotiation) is a KV-pressure gate. On the 30B it passed at 100% with compaction off. On
-Flash-Next it read **0%** with `weight grow: asked=0` for an unrelated reason: the `qwen4exp`
-wave loop never calls `reclaim_spare_ground()` on its `ExpertCache`, though
-`qwen4exp/engine.rs` holds one — the `latent_moe` loop does call it and `quantized_qwen3_moe`
-wires it through `BatchedModelCore`. So read the two gates separately and attribute uptake to
-the model's own wiring, not to the disable.
+**The uptake gate is a different question.** `reclaim_spare_ground` runs between forwards
+from every wave loop (`qwen4exp/wave.rs`, `latent_moe`, and `quantized_qwen3_moe` through
+`BatchedModelCore`), and the growth policy's own refusal (`Refusal::Pressure`, when KV demand
+is rising or the KV side asked since the last negotiation) is a KV-pressure gate. Flash-Next
+reads well under 100% with its zone at its limit (59% on 2026-10-07) — read that as the zone
+being full, not as a missing call.
 
 The story gate is the one that is about numerics, and it is the one that must stay green:
 `story N/N` with no `non-finite` line and no `!!!!` in the log is what says K/V and the

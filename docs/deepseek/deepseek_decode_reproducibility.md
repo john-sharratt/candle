@@ -35,6 +35,11 @@ root causes here were sub-ULP effects. Hunt for ULPs, not for garbage.
 
 ## Source 1 — residency-dependent accumulation order (decode)
 
+> Superseded: the host-orchestrated expert path described here
+> (`compute_experts_grouped`, the per-layer routing readback) was replaced by the
+> live MoE dispatch (`docs/moe_live_dispatch_design.md`), which keeps one
+> canonical scatter order whatever the residency.
+
 `expert_lre/pipeline.rs`. `compute_experts_grouped` was called **twice per
 layer** — once for `classified.hits`, once for `classified.loaded` — both
 accumulating into the same `ys`. Inside each call the scatter builds its

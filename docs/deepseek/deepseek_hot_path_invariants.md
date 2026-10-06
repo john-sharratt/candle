@@ -240,11 +240,14 @@ bit-exact (1 seq ⇒ global == per-seq).
   kernel wants bf16 input (an f32-input kernel would 2× the per-tile re-read); the
   cast is the f32-norm→bf16-kernel rounding. Eliminating it needs a candle-nn
   `rms_norm` that stores bf16 — a fork for marginal gain.
-- **Inv 4 MoE counting-sort** (`engine.rs:411-444`) — rides the **sanctioned**
-  expert-id readback (`indices.to_vec2`, needed to schedule streaming pinned→VRAM
-  uploads). The sort post-processes already-host data; `submit_moe_work` consumes host
-  `assignments`. Moving it to GPU means re-uploading + reworking the bit-exact
-  streaming submit for a host sort whose visible cost is GPU drain, not sort compute.
+- **Inv 4 MoE counting-sort** — **closed by the live MoE dispatch**
+  (`docs/moe_live_dispatch_design.md`). The host sort, the `indices.to_vec2` routing
+  readback it rode on, and `submit_moe_work` are gone: `ExpertCache::forward_routed`
+  runs GPU `bucketize` over the live expert table, the grouped GEMMs run at once
+  (pinned misses fetched by the expert kernels' own worker blocks, cold experts staged
+  by the stager thread), and the routing summary reaches the host through a mapped ring
+  that nothing on the device waits for. The `latent_moe::readback` budget for the wave
+  forward is zero.
 - **Inv 3/4/5 out-of-regime recall** (`kernel_attention.rs:621` + wave Host arm) —
   deep-prompt only (corpus wider than the shortlist), NOT exercised by the gate. The
   per-token *recall* (not exact top-k) is required for prefill≡decode parity, so it
@@ -256,8 +259,8 @@ and `gallery.rs:1704/1766` are test/bench-only, not hot sites (Inv 6 had 5 real
 sites, not 7).
 
 The priority list at the bottom predates these measurements: the "multi-slot prefill
-kernel" is now BUILT (structural, wall-flat, above), and "GPU MoE bucketize" is the
-MoE-sort residual (rides the sanctioned readback).
+kernel" is now BUILT (structural, wall-flat, above), and "GPU MoE bucketize" is BUILT
+as part of the live MoE dispatch, which also removed the routing readback.
 
 ---
 
@@ -273,12 +276,13 @@ MoE-sort residual (rides the sanctioned readback).
    tensor. If a consumer needs a specific layout, teach it to read the layout that exists
    (offset + stride), or produce the layout directly from the kernel that made the data.
 
-3. **No unnecessary GPU→CPU transfers.** Two sanctioned exceptions: (a) MoE expert routing
-   (`indices` → host), because the streaming `ExpertCache` schedules pinned→VRAM uploads by
-   expert id; and (b) the embedding lookup (token ids → host, CPU `index_select`, transfer
-   in), because it is a pure index + transfer with no compute and keeps the embed table off
-   VRAM. Everything else — comp-idx assembly, select remaps, gather indices — stays on the
-   GPU.
+3. **No unnecessary GPU→CPU transfers.** One sanctioned exception: the embedding lookup
+   (token ids → host, CPU `index_select`, transfer in), because it is a pure index +
+   transfer with no compute and keeps the embed table off VRAM. The MoE expert routing is
+   **not** read back: `bucketize` writes a routing summary into a mapped pinned ring, the
+   expert-cache host threads read it asynchronously, and nothing on the device waits for
+   them to (`docs/moe_live_dispatch_design.md`). Everything else — comp-idx assembly,
+   select remaps, gather indices — stays on the GPU.
 
 4. **Run as much as possible on the GPU.** No host-side compute that a kernel can do:
    no host counting-sort, no host set-union/dedup/remap, no host embedding gather. Host
@@ -345,8 +349,8 @@ of them.
 
 | Phase | Site | Transfer | Verdict |
 |---|---|---|---|
-| MoE | `engine.rs:413` `indices.to_vec2` | routing readback | **SANCTIONED** — expert streaming schedules by id |
-| both | `wave.rs:371` `token_ids` (`to_vec1`) | input token-id readback | **SANCTIONED** — MoE needs host ids, and it feeds the embed gather (also sanctioned, see below) |
+| MoE | `engine.rs` `indices.to_vec2` | routing readback | **REMOVED** by the live MoE dispatch — the routing summary goes to the host through a mapped ring that no device work waits on; the wave readback budget (`latent_moe::readback`) is zero |
+| both | `wave.rs` `token_ids` | input token ids | **SANCTIONED** — host-origin ids that feed the embed gather (also sanctioned, see below); the MoE hash routing reads the ids uploaded with the wave, not host ids |
 | prefill | `kernel_attention.rs:621` `g.to_vec1::<u32>()` | per-token GID readback (out-of-regime recall) | violation (deep-prompt fallback) — keep on GPU |
 | decode | `wave.rs:995-1046` `idx_flat` host build + `from_vec` | comp-idx assembly | build comp-idx on-device from the batched select's offsets |
 | both | `gallery.rs` `gather_corpus` spilled arm `to_device(Cpu)` | warm-tier re-heat | **NEEDED** (tiering) — keep |
@@ -357,7 +361,7 @@ of them.
 
 | Phase | Site | Host compute | Fix |
 |---|---|---|---|
-| MoE | `engine.rs:411-444` | **counting-sort + `assignments` built on host** then re-uploaded | GPU bucketize (reuse `moe_bucketize`); the readback at 413 stays, the *sort* moves to the GPU |
+| MoE | `engine.rs` | counting-sort + `assignments` built on host then re-uploaded | **FIXED** — GPU `moe_bucketize` over the live expert table (`ExpertCache::forward_routed`); the host sort and the readback it rode on are both gone |
 | prefill | `wave.rs:1227-1267` (Host-select) | `union.sort/dedup` + `remap` HashMap + `idx_flat` host build + `from_vec` | extend `batched_causal_select_device` to the out-of-regime/HCA/SWA arms |
 | both | `wave.rs:377` `embed_rows` | `from_vec(Cpu)` + `index_select(Cpu)` | **SANCTIONED** — this is an index + host→device transfer, not compute; the embed table stays CPU-resident to save VRAM |
 
@@ -434,7 +438,8 @@ batched, and the compressor assemble is a `force_contiguous` storm. In order of 
    (Invariants 2 + 6, prefill).
 2. **Multi-slot batched prefill attention kernel + on-device comp-idx** — kills the
    per-seq pass-2 loop (Invariant 5, prefill).
-3. **GPU MoE bucketize** — kills the host counting-sort (Invariant 4).
+3. **GPU MoE bucketize** — kills the host counting-sort (Invariant 4). BUILT with the
+   live MoE dispatch, which also removed the routing readback (Invariant 3).
 4. **Kernels emit final type** (drop q/kv and out casts) + **`Tensor::empty` sweep** for
    pure outputs (Invariants 1 + 6) — second-order (100s of ms) but broad.
 5. **Batched `lm_head`** (Invariant 5). (Embed stays a CPU gather — sanctioned.)

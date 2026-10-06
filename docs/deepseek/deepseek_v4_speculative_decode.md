@@ -49,16 +49,16 @@ wasting draft launches on tokens that will be rejected. Effective decode floor d
 ~74 ms/token to **~74/2.39 ≈ 31 ms/token** *before* the adaptive gain — and the draft is one
 transformer block, not 43.
 
-**The catch, stated up front:** the drafter is a full decoder block with MoE routing, and
-routing readback is the WDDM wall we already fought (memory `deepseek-moe-wddm-readback-wall`,
-`gpu-native-moe-dispatch`). Three sequential recurrent draft steps add three routing
-readbacks per cycle on top of the verify forward's 43 — but the confidence-gated draft length
-(§4.2) only launches those steps while the drafter is sure, cutting the readbacks it doesn't
-earn. The design keeps the drafter on the resident GPU-native MoE dispatch (`moe_bucketize` +
-`grouped_qmatmul_dev_q8a128`) so those readbacks are the on-device histogram path, not a host
-counting-sort. §6 makes measuring this the first gate — if draft launch overhead still eats
-the win, we raise `τ` / lower `k_max` or drop to the n-gram drafter (§7), but the arithmetic
-above says we have comfortable margin.
+**The catch, stated up front:** the drafter is a full decoder block with MoE routing, so
+each draft pass adds MoE launches on top of the verify forward's 43 layers. Neither side
+reads routing back to the host: the verify forward's experts run through the live MoE
+dispatch (`ExpertCache::forward_routed`, `docs/moe_live_dispatch_design.md`), and the
+drafter's all-resident MoE (`dspark_experts.rs`: `moe_bucketize` + a device-resident pointer
+table into `grouped_qmatmul_dev_q8a128`) never leaves the GPU. What remains is launch
+overhead, and the confidence-gated draft length (§4.2) only spends it while the drafter is
+sure. §6 makes measuring this the first gate — if draft launch overhead still eats the win,
+we raise `τ` / lower `k_max` or drop to the n-gram drafter (§7), but the arithmetic above
+says we have comfortable margin.
 
 Output is **bit-for-bit the base model's greedy output** (verify uses the true model; drafts
 only propose). This is a pure throughput change, not a quality trade — the same property
@@ -166,10 +166,10 @@ for k in 1..=γ:                                                       # sequent
 ```
 
 The **backbone runs once per block** (all γ base logits in parallel), then the γ positions are
-a cheap sequential bias+argmax — so the WDDM-costly part (the 3-block forward with MoE routing
-readbacks) is paid **once per cycle, not once per token**. This is structurally better on our
-launch-bound box than a per-token recurrence. Keep the backbone on GPU-native resident MoE
-dispatch (`forward_moe_gpu`) so its routing readback is the on-device histogram.
+a cheap sequential bias+argmax — so the WDDM-costly part (the 3-block forward's launches) is
+paid **once per cycle, not once per token**. This is structurally better on our launch-bound
+box than a per-token recurrence. The backbone's MoE is the drafter's all-resident GPU-native
+dispatch (`dspark_experts.rs`), so its routing never leaves the device.
 
 **Target conditioning (the hard part).** `Hctx` needs the target's hidden states at
 `dflash.target_layers`, captured during the verify/prefill forward, and injected into the
@@ -205,8 +205,8 @@ draft fewer — at zero, do a normal decode."
 - **τ selection:** default range **0.4–0.6** (vLLM DSL); model- and workload-dependent, so we
   calibrate it on our fixtures against effective ms/token (§6, measurement 5). A single scalar,
   read from deployment config like a model path — **not** a per-path feature flag.
-- **Why it compounds on WDDM specifically:** each avoided draft step is a full avoided kernel
-  launch *and* an avoided MoE routing readback (the §7 wall). Confidence-gating removes draft
+- **Why it compounds on WDDM specifically:** each avoided draft step is a full avoided set of
+  kernel launches (the §7 overhead). Confidence-gating removes draft
   launches exactly where they have negative expected value (low accept probability), so the
   per-launch WDDM cost we're most exposed to is spent only when it pays. For Zen Code the
   local predictability is strongly bimodal, so adaptive depth is a large lever, not a marginal
@@ -418,7 +418,7 @@ pieces, not tolerances.
    contained, with adaptive length beating any fixed `k`. Also **check draft-confidence
    calibration** directly: bucket drafts by `c_j` and plot realized acceptance per bucket — the
    whole scheme rests on `c_j` tracking acceptance (EAGLE/DSL show it does; confirm on our
-   model). Break out draft vs verify launch time to size the WDDM-readback concern from §1.
+   model). Break out draft vs verify launch time to size the WDDM launch-overhead concern from §1.
 
 ---
 
@@ -430,12 +430,12 @@ pieces, not tolerances.
   runs with **streaming experts** (not fully resident) — the at-risk config. Counterweight: our
   bottleneck is WDDM *launch* overhead, which amortization still attacks. Net effect is
   genuinely unknown until measured (test 5) — this must be an empirical go/no-go, not assumed.
-- **Draft backbone overhead (WDDM).** The 3-block backbone forward carries MoE routing
-  readbacks — but it runs **once per block** (all γ base logits in one pass), not once per
-  token, so the semi-AR structure already amortizes it. Confidence scheduling (§4.2) further
-  caps `block_size`. If test 5 still shows it eating the win: raise `τ` / lower `block_size`,
-  keep the backbone on GPU-native resident MoE dispatch (`forward_moe_gpu`), or fall back to a
-  cheap n-gram drafter behind the same accept/verify machinery (drafter-agnostic — a swap).
+- **Draft backbone overhead (WDDM).** The 3-block backbone forward carries its own MoE
+  launches (all on the GPU — no routing readback, `dspark_experts.rs`) — but it runs **once
+  per block** (all γ base logits in one pass), not once per token, so the semi-AR structure
+  already amortizes it. Confidence scheduling (§4.2) further caps `block_size`. If test 5
+  still shows it eating the win: raise `τ` / lower `block_size`, or fall back to a cheap
+  n-gram drafter behind the same accept/verify machinery (drafter-agnostic — a swap).
 - **Target KV-injection integration (the main build risk).** `Hctx` from `dflash.target_layers`
   injected into a *bidirectional* draft attention (§4.1) is a new attention path on top of our
   causal paged-latent kernel. Getting it bit-faithful to the trained drafter is the crux of

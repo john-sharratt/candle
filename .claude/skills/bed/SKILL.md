@@ -80,9 +80,9 @@ the work touched (`forward_wave` and what it calls, per layer, per wave):
 1. no `to_dtype` in the loop; **1b** validate with `expect_dtype`, never a defensive cast;
 2. no allocate-plus-copy to materialise a layout (`contiguous`, `cat`, `slice_set`,
    `to_owned_tensor` costing the parent); **2b** per-row data through descriptor tables;
-3. **no unnecessary GPU→CPU transfers** — only the two sanctioned readbacks (MoE routing
-   indices, embedding token ids); every other readback, sync, or `to_vec` on the hot path is
-   a finding;
+3. **no unnecessary GPU→CPU transfers** — only the one sanctioned readback (embedding token
+   ids); MoE routing never comes back to the host (live dispatch); every other readback, sync,
+   or `to_vec` on the hot path is a finding;
 4. no host-side compute a kernel can do;
 5. everything batched across slots/sessions — no per-seq or per-token launch loops;
 6. no zeroing buffers a kernel fully overwrites (`alloc_uninit`);

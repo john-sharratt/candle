@@ -54,6 +54,11 @@ decided per layer by **tensor presence** (`ffn_gate_inp.weight` /
   host-orchestrated path (async index readback + O(A+E) bucketing +
   `submit_moe_work`). The GPU-native dispatch table refuses to build above
   **128 experts** (`expert_lre/gpu_dispatch.rs:84-87`).
+
+  > Superseded: both paths were replaced by the live MoE dispatch
+  > (`docs/moe_live_dispatch_design.md`) — one GPU path for every expert-cache
+  > model with no per-layer routing readback; `gpu_dispatch.rs`, its 128-expert
+  > and `hidden % 1024` limits, and `submit_moe_work` are gone.
 - Load order is load-bearing: dense weights → measure → reserve span →
   expert cache; the cache registers as the **ground broker** for the elastic
   KV/weight boundary.
@@ -113,6 +118,10 @@ Hard numeric constraints (all verified in-code by the research pass):
 | `moe_route` | `n_experts ≤ 256`, `k ≤ 16` | `cuda.rs:6062-6070` |
 | GPU-native MoE dispatch | `n_experts ≤ 128` (else host path) | `gpu_dispatch.rs:84-87` |
 | KV chunk | `CHUNK_SIZE = 32`, shared Rust/CUDA | `candle-kernels/src/lib.rs:22` |
+
+> Superseded: the `MoE gather` (`hidden % 1024`) and `GPU-native MoE dispatch`
+> (`n_experts ≤ 128`) rows were removed by the live MoE dispatch
+> (`docs/moe_live_dispatch_design.md`).
 
 ---
 

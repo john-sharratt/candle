@@ -48,7 +48,11 @@ read-only static sweep of the forward hot path across five lenses: (1) VRAM↔RA
 
 Empirically proven on this codebase: **a per-layer D2H sync often only *attributes* an unavoidable
 pipeline drain — removing it relocates the wait to the next sync, for ~0 wall-clock gain.** Confirmed
-mirages: the append_batch f32-archive D2H, and the per-layer MoE routing readback (`indices.to_vec2`).
+mirages: the append_batch f32-archive D2H, and the per-layer MoE routing readback (`indices.to_vec2`)
+as it stood — removing the readback *alone* would have moved the drain. It has since been removed
+together with the host wait it served, by the live MoE dispatch (`docs/moe_live_dispatch_design.md`):
+the expert GEMMs no longer depend on anything the host does with the routing, so there is no drain
+left to relocate.
 Every finding below was screened against this filter; the ones that survive are **genuine work
 reduction** (redundant quantizes/casts/copies/allocs removed, or fewer launches on the launch-bound
 decode floor), not sync relocations.
@@ -261,10 +265,12 @@ bit-exact with a tested prefill precedent.
 
 ## Explicitly NOT wins — parked artifacts (do not chase)
 
-- **MoE routing readback** — `engine.rs:409` `indices.to_vec2::<u32>()`. Intrinsic: the streaming
-  `ExpertCache` schedules pinned→VRAM uploads by expert id, so routing must be host-visible. Removing it
-  relocates the per-layer drain. The counting-sort host loop (`engine.rs:411-440`) hangs off it and is
-  cheap vs the expert GEMM.
+- **MoE routing readback** — **removed** by the live MoE dispatch (`docs/moe_live_dispatch_design.md`),
+  with the host counting-sort that hung off it. Routing no longer has to be host-visible before the
+  expert GEMMs run: `bucketize` classifies routed experts against the live expert table, the GEMMs'
+  worker blocks fetch pinned misses themselves, the stager thread publishes cold experts, and the routing
+  summary reaches the host through a mapped ring read asynchronously. Removing the readback alone would
+  have relocated the drain; removing the host's place on the critical path is what removed it.
 - **append_batch f32-archive D2H** — `gallery.rs:275-278` (`attn.to_device(Cpu)`). Proven
   sync-attribution artifact (removing it just moved the drain to `prefill:writeback`). The `attn` field is
   bench-only (`gather_selected` has no production caller) — but the D2H is not the real cost.

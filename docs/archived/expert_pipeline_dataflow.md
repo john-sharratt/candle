@@ -1,5 +1,9 @@
 # Async Fork-Join Expert Pipeline
 
+> Superseded: the host-submitted expert pipeline and per-layer routing readback
+> described here were replaced by the live MoE dispatch
+> (`docs/moe_live_dispatch_design.md`).
+
 ## Design Philosophy
 
 The MoE expert pipeline is not a synchronous layer-by-layer execution
