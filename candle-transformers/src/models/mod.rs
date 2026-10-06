@@ -203,7 +203,9 @@ pub mod qwen35;
 pub mod qwen3_moe;
 #[cfg(feature = "cuda")]
 pub mod qwen4exp;
-/// Which of a wave's rows the expert cache scores as decode.
+/// Which of a wave's rows the expert cache scores as decode. Its consumers,
+/// the wave forwards, are CUDA-only.
+#[cfg(feature = "cuda")]
 pub(crate) mod residency_rows;
 pub mod residual_order;
 pub mod rope_schedule;

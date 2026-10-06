@@ -1515,23 +1515,46 @@ fn covering_plan(standing: [usize; 3], wanted: [usize; 3]) -> [usize; 3] {
 /// for fewer rows and exhausts it — measured on the 35B-A3B, a 2-row cohort
 /// asking 9,216 B at offset 61,952 of a 64,256 B span, which is one row's price.
 ///
-/// The recorded plan is raised to the per-phase maximum of itself and
-/// `per_phase`, never replaced: the forward that priced it may have reserved
-/// for work still to come (a rewind's replay), and a plan shrunk to the walk's
-/// width would take that room back. A plan that already covers `per_phase`
-/// changes nothing and moves nothing.
+/// While a tier stands, the recorded plan is raised to the per-phase maximum of
+/// itself and `per_phase`, never replaced: the forward that priced it may have
+/// reserved for work still to come (a rewind's replay), and a plan shrunk to the
+/// walk's width would take that room back. A plan that already covers
+/// `per_phase` changes nothing and moves nothing.
+///
+/// **With no tier standing, the caller prices for itself alone.** The ground
+/// went back to the weight side, and with it whatever the last forward reserved
+/// — there is no room left to preserve. Merging anyway re-bought the last
+/// forward's whole tier for a walk a fraction of its width: measured on
+/// Flash-Next's C5×8 gate, a draft walk after the prefill asked for the
+/// prefill's 4.0 GB, against a partition whose KV had grown since and whose
+/// weight side would not concede mid-flight, and the wave failed.
 pub fn cover_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<()> {
     let wanted = align_phase_plan(per_phase);
-    let merged = {
+    let target = {
         let mut map = lock_domains();
         let (_, domain) = domain_entry(&mut map, stream);
-        match domain.planned {
-            Some(standing) if covering_plan(standing, wanted) == standing => return Ok(()),
-            Some(standing) => covering_plan(standing, wanted),
-            None => wanted,
-        }
+        cover_target(domain.planned, domain.placed_at.is_some(), wanted)
     };
-    plan_wave_transient(stream, merged)
+    match target {
+        Some(plan) => plan_wave_transient(stream, plan),
+        None => Ok(()),
+    }
+}
+
+/// The plan [`cover_wave_transient`] places for `wanted`, or `None` when the
+/// standing tier already covers it — see there for the rule.
+fn cover_target(
+    planned: Option<[usize; 3]>,
+    tier_standing: bool,
+    wanted: [usize; 3],
+) -> Option<[usize; 3]> {
+    match planned {
+        Some(standing) if tier_standing => {
+            let merged = covering_plan(standing, wanted);
+            (merged != standing).then_some(merged)
+        }
+        _ => Some(wanted),
+    }
 }
 
 /// Open a generation on `phase`'s span.
@@ -1979,7 +2002,7 @@ pub(crate) fn persistence_domain(stream: &Arc<CudaStream>) -> Result<BumpArena> 
 #[cfg(test)]
 mod tests {
 
-    use super::{align_phase_plan, aligned_start, covering_plan, WAVE_SPAN_ALIGN};
+    use super::{align_phase_plan, aligned_start, cover_target, covering_plan, WAVE_SPAN_ALIGN};
 
     /// A walk wider than the forward raises the phases it outgrows and keeps the
     /// ones the forward reserved for something else.
@@ -1990,6 +2013,33 @@ mod tests {
         assert_eq!(covering_plan(forward, walk), [128_512, 30_720, 8_192]);
         assert_eq!(covering_plan(walk, forward), [128_512, 30_720, 8_192]);
         assert_eq!(covering_plan(forward, forward), forward);
+    }
+
+    /// With no tier standing, a recorded plan is a past forward's and buys
+    /// nothing: the walk places only what it asked for. A prefill's 4 GB plan
+    /// merged into a later walk's few MiB re-bought the prefill tier into live
+    /// KV on Flash-Next C5×8.
+    #[test]
+    fn with_no_tier_standing_a_stale_plan_is_not_merged() {
+        let prefill = [4_009_754_624, 30_720, 4_096];
+        let walk = [128_512, 20_480, 8_192];
+        assert_eq!(cover_target(Some(prefill), false, walk), Some(walk));
+        assert_eq!(cover_target(None, false, walk), Some(walk));
+    }
+
+    /// A standing tier that already covers the walk places nothing; one it
+    /// does not cover is raised phase by phase, never lowered.
+    #[test]
+    fn a_standing_tier_is_raised_only_where_the_walk_outgrows_it() {
+        let forward = [64_256, 30_720, 4_096];
+        let narrower = [32_000, 20_480, 4_096];
+        let wider = [128_512, 20_480, 8_192];
+        assert_eq!(cover_target(Some(forward), true, narrower), None);
+        assert_eq!(cover_target(Some(forward), true, forward), None);
+        assert_eq!(
+            cover_target(Some(forward), true, wider),
+            Some([128_512, 30_720, 8_192])
+        );
     }
 
     /// Ranges from one generation never overlap — the property that removes

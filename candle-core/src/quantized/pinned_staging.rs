@@ -187,22 +187,45 @@ impl Generation {
 ///
 /// Holds either a pointer into the device-side arena (zero-alloc) or an
 /// individually allocated `CudaSlice` for large transfers.
+///
+/// **A clone is another handle on the same device bytes**, whichever kind it
+/// is. An owned buffer's slice is shared, not copied: cloning one used to clone
+/// the `CudaSlice` — a device allocation and a copy per clone, issued on the
+/// hot path by every drafter that hands its step a header buffer, and refused
+/// outright inside a wave capture — while keeping the original's `dev_ptr`, so
+/// the copy was never even read and the original it pointed at was not held.
 #[derive(Clone)]
 pub struct GpuBuf {
     dev_ptr: u64,
     len: usize,
-    /// Holds the `CudaSlice` alive for owned (non-arena) buffers, with the
-    /// device it is retired to on drop. `None` for arena buffers — the arena
-    /// owns the device memory.
-    _owned: Option<(CudaSlice<u8>, CudaDevice)>,
+    /// Holds the `CudaSlice` alive for owned (non-arena) buffers until the last
+    /// handle drops. `None` for arena buffers — the arena owns the device
+    /// memory.
+    _owned: Option<Arc<OwnedDeviceBytes>>,
 }
 
-impl Drop for GpuBuf {
+/// An owned buffer's device bytes, retired to their device when the last
+/// [`GpuBuf`] naming them drops.
+struct OwnedDeviceBytes {
+    slice: Option<CudaSlice<u8>>,
+    dev: CudaDevice,
+}
+
+impl Drop for OwnedDeviceBytes {
     fn drop(&mut self) {
         // A launch this thread recorded may still read the buffer.
-        if let Some((slice, dev)) = self._owned.take() {
-            dev.retire(slice);
+        if let Some(slice) = self.slice.take() {
+            self.dev.retire(slice);
         }
+    }
+}
+
+impl OwnedDeviceBytes {
+    fn new(slice: CudaSlice<u8>, dev: CudaDevice) -> Arc<Self> {
+        Arc::new(Self {
+            slice: Some(slice),
+            dev,
+        })
     }
 }
 
@@ -244,7 +267,7 @@ impl GpuBuf {
         Self {
             dev_ptr: ptr,
             len,
-            _owned: Some((slice, dev.clone())),
+            _owned: Some(OwnedDeviceBytes::new(slice, dev.clone())),
         }
     }
 }
@@ -994,7 +1017,7 @@ impl PinnedStager {
                 Ok(GpuBuf {
                     dev_ptr,
                     len,
-                    _owned: Some((gpu, dev)),
+                    _owned: Some(OwnedDeviceBytes::new(gpu, dev)),
                 })
             }
             PinnedBuf::Host { .. } => Ok(GpuBuf {
@@ -1044,7 +1067,7 @@ impl PinnedStager {
         Ok(GpuBuf {
             dev_ptr,
             len,
-            _owned: Some((gpu, dev)),
+            _owned: Some(OwnedDeviceBytes::new(gpu, dev)),
         })
     }
 
@@ -1233,6 +1256,35 @@ mod deferred_reset_tests {
         let a = stager.begin_generation().epoch();
         let b = stager.begin_generation().epoch();
         assert!(b > a, "epoch must advance so stale pointers are detectable");
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_buf_clone_tests {
+    use super::*;
+    use crate::backend::BackendDevice;
+
+    /// A clone of an owned buffer is another handle on the same device bytes:
+    /// same address, no second allocation, and the bytes outlive the handle
+    /// they were made with.
+    #[test]
+    fn a_clone_shares_an_owned_buffers_bytes() {
+        let crate::Device::Cuda(dev) = crate::Device::new_cuda(0).unwrap() else {
+            unreachable!("asked for a CUDA device")
+        };
+        let bytes: Vec<u8> = (0u8..64).collect();
+        let original = GpuBuf::from_raw_owned(dev.memcpy_stod(&bytes).unwrap(), &dev);
+        let clone = original.clone();
+        assert_eq!(clone.dev_ptr(), original.dev_ptr());
+        assert_eq!(clone.len(), 64);
+        let shared = clone._owned.as_ref().expect("an owned buffer");
+        assert_eq!(Arc::strong_count(shared), 2, "the clone allocated");
+        drop(original);
+        dev.synchronize().unwrap();
+        let mut back = vec![0u8; 64];
+        // SAFETY: `clone` holds the 64 bytes at `dev_ptr` alive.
+        unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut back, clone.dev_ptr()) }.unwrap();
+        assert_eq!(back, bytes);
     }
 }
 

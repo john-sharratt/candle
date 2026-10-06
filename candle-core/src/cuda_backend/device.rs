@@ -319,6 +319,19 @@ impl CudaDevice {
         self.upload_raw(at, bytes)
     }
 
+    /// Record the copy of `src` to the device address `dst` into this thread's
+    /// recording segment, staged through the wave's ring, and return `true`;
+    /// return `false` and do nothing when this thread is not recording or the
+    /// ring is full.
+    ///
+    /// For an uploader with an eager path of its own — pinned staging that
+    /// outruns the pageable copy [`Self::upload_raw`] falls back to — which it
+    /// then runs inside [`Self::pause_capture`], behind the launches recorded
+    /// so far.
+    pub fn record_upload(&self, dst: u64, src: &[u8]) -> bool {
+        self.capture.record_upload(dst, src)
+    }
+
     /// Copy `src` to the device address `dst`, which holds at least
     /// `src.len()` bytes.
     ///
@@ -328,7 +341,7 @@ impl CudaDevice {
     /// queued on the compute stream behind everything issued before it; the
     /// driver has staged pageable bytes before it returns, so `src` may go.
     pub fn upload_raw(&self, dst: u64, src: &[u8]) -> Result<()> {
-        if src.is_empty() || self.capture.record_upload(dst, src) {
+        if src.is_empty() || self.record_upload(dst, src) {
             return Ok(());
         }
         let _eager = self.pause_capture()?;

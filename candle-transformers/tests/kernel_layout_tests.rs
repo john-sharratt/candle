@@ -517,10 +517,8 @@ fn build_segmented_slot(
             stager,
             device,
         )?;
-        // `prime_chunked_decode_slots_batch` ran at the end of the
-        // segment's prefill and may have appended a trailing empty
-        // chunk for a hypothetical follow-up decode.  Drop it
-        // before sealing so it doesn't bleed into slot B's layout.
+        // Seal exactly the chunks the segment's tokens fill, so nothing
+        // the scratch slot holds past them bleeds into slot B's layout.
         let real_chunks = seg_len.div_ceil(CHUNK_SIZE);
         backing.truncate_sequence_to_blocks(1, real_chunks)?;
         let sealed = backing.record_turn(1)?;
@@ -533,9 +531,8 @@ fn build_segmented_slot(
     Ok((backing, cache))
 }
 
-/// Cross-check that slot A has all-full chunks (modulo a possible
-/// trailing empty allocated by `prime_chunked_decode_slots_batch`) and
-/// slot B's chunk usages exactly match `segments`.
+/// Cross-check that slot A has all-full chunks (modulo a partial last one)
+/// and slot B's chunk usages exactly match `segments`.
 fn assert_slot_layouts(
     cache_a: &KvCache,
     cache_b: &KvCache,

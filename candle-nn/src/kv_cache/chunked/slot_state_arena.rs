@@ -35,19 +35,20 @@
 //!
 //! # Why releasing needs no fence
 //!
-//! Every sequence takes its stream from `CudaDevice::cuda_stream()` — the
-//! device's *primary* stream — so every copy into and out of these slots is
-//! FIFO-ordered against every other. A released slot handed straight back out
-//! cannot be written before the copy that drained it has run, because that
-//! write is enqueued behind it. This is the property that lets the
-//! `stream.synchronize()` disappear rather than merely move.
+//! Every copy into these slots runs on the device's compute stream, or is
+//! recorded into a wave's segment and launched there in issue order, so every
+//! copy into and out of them is FIFO-ordered against every other. A released
+//! slot handed straight back out cannot be written before the copy that
+//! drained it has run, because that write is issued behind it. This is the
+//! property that lets the `stream.synchronize()` disappear rather than merely
+//! move.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
-use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use candle::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr};
 use candle::cuda_backend::WrapErr;
-use candle::Result;
+use candle::{CudaDevice, Result};
 
 use super::types::TARGET_ARENA_BYTES;
 
@@ -175,13 +176,18 @@ fn arenas() -> &'static Mutex<HashMap<usize, Inner>> {
     ARENAS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Claim a slot of at least `bytes` on `stream`'s device.
+/// Claim a slot of at least `bytes` on `device`.
 ///
 /// Allocates a fresh slab only when the class has no free slot — the same
 /// scarcity rule the KV classes follow. Errors if `bytes` exceeds the top
 /// rung, which at 16 MiB and 688 B per entry means a single sequence's
 /// slot-state in one layer has passed ~781 K tokens.
-pub(crate) fn claim(stream: &Arc<CudaStream>, bytes: usize) -> Result<SlotStateSlot> {
+///
+/// A slab is a driver allocation, which a thread recording a wave may not
+/// make, so it is made inside [`CudaDevice::pause_capture`], behind the
+/// launches recorded so far. Only then: a claim from a class with a free slot
+/// — every claim once the slabs have settled — touches no device at all.
+pub(crate) fn claim(device: &CudaDevice, bytes: usize) -> Result<SlotStateSlot> {
     let class = class_for(bytes).ok_or_else(|| {
         candle::Error::Msg(format!(
             "slot-state buffer of {bytes} B exceeds the {} B top class — a single \
@@ -190,9 +196,25 @@ pub(crate) fn claim(stream: &Arc<CudaStream>, bytes: usize) -> Result<SlotStateS
         ))
     })?;
     let slot_bytes = SLOT_STATE_LADDER[class];
+    let stream = device.compute_stream();
     let device_id = stream.context().ordinal();
 
-    let mut map = arenas().lock().unwrap();
+    // Paused before the arena lock is taken, never under it: a pause launches
+    // the recorded segment and frees what it retired, and nothing it frees may
+    // find this lock held. So an empty class drops the lock, pauses, and looks
+    // again — another thread may have refilled or drained it meanwhile.
+    let mut paused = None;
+    let mut map = loop {
+        let map = arenas().lock().unwrap();
+        let empty = map
+            .get(&device_id)
+            .is_none_or(|inner| inner.classes[class].free.is_empty());
+        if !empty || paused.is_some() {
+            break map;
+        }
+        drop(map);
+        paused = Some(device.pause_capture()?);
+    };
     let inner = map.entry(device_id).or_insert_with(|| Inner {
         classes: (0..SLOT_STATE_LADDER.len())
             .map(|_| ClassPool::new())
@@ -218,7 +240,7 @@ pub(crate) fn claim(stream: &Arc<CudaStream>, bytes: usize) -> Result<SlotStateS
         let slab_bytes = per_slab * slot_bytes;
         let slab = unsafe { stream.alloc::<u8>(slab_bytes).w()? };
         let base = {
-            let (base, _guard) = slab.device_ptr(stream);
+            let (base, _guard) = slab.device_ptr(&stream);
             base
         };
         let slab_idx = inner.classes[class].slabs.len();
@@ -237,6 +259,8 @@ pub(crate) fn claim(stream: &Arc<CudaStream>, bytes: usize) -> Result<SlotStateS
         .expect("just refilled the class");
     let ptr = inner.classes[class].bases[slab] + (index * slot_bytes) as u64;
     inner.live += 1;
+    drop(map);
+    drop(paused);
     Ok(SlotStateSlot {
         ptr,
         class,
@@ -250,8 +274,8 @@ pub(crate) fn claim(stream: &Arc<CudaStream>, bytes: usize) -> Result<SlotStateS
 /// No fence: see the module header. The slot's bytes are left as they are —
 /// the next tenant writes every byte it reads, and nothing reads past what it
 /// wrote (`n_chunks` bounds the kernel's walk).
-pub(crate) fn release(stream: &Arc<CudaStream>, slot: SlotStateSlot) {
-    let device_id = stream.context().ordinal();
+pub(crate) fn release(device: &CudaDevice, slot: SlotStateSlot) {
+    let device_id = device.compute_stream().context().ordinal();
     let mut map = arenas().lock().unwrap();
     if let Some(inner) = map.get_mut(&device_id) {
         inner.classes[slot.class].free.push((slot.slab, slot.index));

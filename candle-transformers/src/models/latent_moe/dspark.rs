@@ -291,11 +291,11 @@ impl ConfidenceHead {
 #[cfg(feature = "cuda")]
 pub struct DsparkDrafter {
     pub cfg: DsparkConfig,
-    /// `block_count` backbone blocks (mHC attention + norms; the MoE is the shared streaming cache).
+    /// `block_count` backbone blocks (mHC attention + norms; the MoE is the shared `moe` below).
     pub blocks: Vec<DsparkBlock>,
-    /// The drafter's routed experts: host-resident, streamed into a small VRAM slot set on demand
-    /// (one shared cache across all blocks). Replaces the per-block eager MoE the target uses —
-    /// the drafter's 3×256 experts are far too large to keep VRAM-resident alongside the 284B target.
+    /// The drafter's routed experts, requantized to Q2_KO and permanently VRAM-resident (one
+    /// shared set across all blocks) — loaded only on a card large enough to hold them beside the
+    /// target ([`resident_slots_for_vram`](super::dspark_experts::resident_slots_for_vram)).
     moe: DsparkStreamingMoe,
     /// Target-feature encoder projection `Wc` (`fc.weight`): concatenated target-layer
     /// hidden states → draft hidden width (paper Eq. 2).
@@ -341,17 +341,17 @@ impl DsparkDrafter {
         let total_experts = cfg.base.n_layers * cfg.base.n_routed_experts;
         let n_slots = resident_slots_for_vram(total_vram, total_experts).ok_or_else(|| {
             candle::Error::msg(format!(
-                "DSpark drafter needs > 24 GiB VRAM ({:.1} GiB present) — speculative decode disabled",
+                "DSpark drafter needs > 64 GiB VRAM ({:.1} GiB present) — speculative decode disabled",
                 total_vram as f64 / (1u64 << 30) as f64
             ))
         })?;
 
-        // Backbone blocks: attention + norms only (the MoE is the shared streaming cache below).
+        // Backbone blocks: attention + norms only (the MoE is the shared expert set below).
         let mut blocks = Vec::with_capacity(cfg.base.n_layers);
         for layer in 0..cfg.base.n_layers {
             blocks.push(load_dspark_block(&mut m, &cfg.base, layer, device)?);
         }
-        // The drafter's routed experts → host RAM + `n_slots` VRAM slots streamed on demand.
+        // The drafter's routed experts → `n_slots` permanent VRAM slots (the whole set).
         let moe = DsparkStreamingMoe::load(&mut m, &cfg.base, cfg.base.n_layers, n_slots, device)?;
 
         // Target-feature encoder: fc (Wc) then its RMSNorm → Hctx.

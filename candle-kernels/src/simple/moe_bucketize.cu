@@ -1,20 +1,17 @@
 // =============================================================================
 // GPU MoE EXPERT BUCKETIZE
 // =============================================================================
-// Replaces the CPU counting-sort in the grouped expert compute path: the
-// per-layer routing indices no longer round-trip GPU→CPU→GPU. One launch turns
-// `moe_route`'s top-k index tensor into every table the downstream GPU pipeline
-// consumes — the expert-grouped assignment lists (gather), the tile tables
-// (grouped GEMM), and the token-major segment tables (deterministic scatter) —
-// entirely on the device.
+// The expert path's routing step, entirely on the device: the per-layer routing
+// indices never leave the GPU. One launch turns `moe_route`'s top-k index tensor
+// into every table the downstream GPU pipeline consumes — the expert-grouped
+// assignment lists (gather), the tile tables (grouped GEMM), and the token-major
+// segment tables (deterministic scatter) — and, over a live expert table, the
+// weight snapshot, the remote list and the routing summary the host reads.
 //
-// The kernel is a SINGLE thread block of BUCKETIZE_THREADS (256) threads, and
-// serves up to MAX_EXPERTS (512) experts — MORE experts than it has threads, so
-// every per-expert phase is a grid-stride loop rather than one-thread-per-expert.
-// That distinction is the whole of what raising the bound cost: at 256 the two
-// forms coincide, and at 512 the one-thread-per-expert form would have left the
-// upper half of the experts with no offsets, no scatter bases and no tiles —
-// silently, because their assignments would simply land at stale positions.
+// The kernel is a SINGLE thread block of BUCKETIZE_THREADS (512) threads — one
+// thread per expert up to MAX_EXPERTS (512), which every per-expert phase relies
+// on: the offsets, the tile order and the remote list are block-wide scans over
+// the expert axis, one value per thread.
 //
 // Every output is bit-deterministic:
 //   * phase 1 — a grid-stride per-expert histogram: each assignment is read
@@ -23,14 +20,18 @@
 //     sums are order-independent, so the counts — and every table derived from
 //     them — are identical to a serial scan, at O(a_ub) instead of
 //     O(n_experts × a_ub) work;
-//   * phase 2 — thread 0 prefix-scans the counts into bucket offsets,
-//     accumulates the per-expert tile counts, and writes the device header;
+//   * phase 2 — block-wide scans turn the counts into bucket offsets, the
+//     per-expert tile counts into the tile order, and the routed remote experts
+//     into the remote list; thread 0 then walks only that list for the
+//     promotion ring, and writes the device header. A serial walk of all 512
+//     experts here — four of them, for the offsets and the three tile classes —
+//     was 100 µs of every 116 µs decode call;
 //   * phase 3 — a chunked STABLE counting-sort scatter: the list is split into
 //     NCHUNK contiguous chunks, each chunk counts its assignments per expert, a
 //     per-expert exclusive prefix across chunks gives each chunk its write base,
 //     and each chunk scatters in ascending i. Chunks ordered + within-chunk
-//     ascending ⇒ each bucket is STABLE (ascending i), matching the CPU sort
-//     exactly, in O(a_ub) work (no per-expert full rescan);
+//     ascending ⇒ each bucket is STABLE (ascending i), exactly the buckets of a
+//     serial stable counting sort, in O(a_ub) work (no per-expert full rescan);
 //   * phase 4 — each thread emits its expert's GEMM tiles (≤ tile_w tokens
 //     per tile); the tail up to the launch bound is padded with `b_cnt = 0`
 //     tiles the grouped kernel skips, so the HOST needs no data-dependent
@@ -129,16 +130,17 @@
 #include <stdint.h>
 #include <stdio.h>
 
-// 256 threads; every per-expert phase strides over `n_experts`, so the expert
-// count is independent of the block width. Phase 3 is one-thread-per-chunk.
+// One thread per expert; phase 3 is one-thread-per-chunk.
 //
 // MAX_EXPERTS 512 is Qwen3.8-Flash-Next's width (Qwen3-MoE has 128, Qwen3.5 has
-// 256). The static shared-memory cost is `sh_cc` (32 KB, fixed) plus three
-// int32 arrays over the expert axis — 512·4·3 ≈ 6 KB — plus ~1 KB of scan and
-// header, ≈ 39 KB against the 48 KiB static cap. Raising the bound again means
-// dynamic shared memory, not a constant change.
-#define BUCKETIZE_THREADS 256
+// 256). The static shared-memory cost is `sh_cc` (32 KB, fixed) plus four
+// int32 arrays over the expert axis — 512·4·4 ≈ 8 KB — plus ~2 KB of scan and
+// header, ≈ 42 KB against the 48 KiB static cap. Raising the bound again means
+// dynamic shared memory and a wider block, not a constant change.
+#define BUCKETIZE_THREADS 512
+#define BUCKETIZE_WARPS (BUCKETIZE_THREADS / 32)
 #define MAX_EXPERTS 512
+static_assert(MAX_EXPERTS <= BUCKETIZE_THREADS, "phase 2 scans one expert per thread");
 #define MAX_TOPK 32
 #define INVALID_ROW 0xFFFFFFFFu
 // Phase-3 chunk-table budget (ints). NCHUNK = SH_CC_INTS / n_experts chunks.
@@ -161,6 +163,54 @@ struct DecodeRanges {
 #define PROMO_EMPTY 0xFFFFFFFFFFFFFFFFull
 // The expert a skipped victim's log entry names.
 #define PROMO_SKIP 0xFFFFu
+// The tile order's rank of each class: pinned, then cold, then VRAM.
+__device__ __forceinline__ int class_rank(uint8_t cls) {
+    return cls == CLS_PINNED ? 0 : (cls == CLS_COLD ? 1 : 2);
+}
+// The tile scan packs one 21-bit lane per class rank into a u64.
+#define TILE_LANE_BITS 21
+#define TILE_LANE_MASK ((1ull << TILE_LANE_BITS) - 1ull)
+
+// Inclusive scan across a warp.
+template <typename T>
+__device__ __forceinline__ T warp_inclusive_scan(T v) {
+    const int lane = (int)(threadIdx.x & 31);
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const T n = __shfl_up_sync(0xffffffffu, v, o);
+        if (lane >= o) {
+            v += n;
+        }
+    }
+    return v;
+}
+
+// Exclusive scan of `v` across the block, in thread order; the block total
+// lands in `*total`. `sh` is this scan's own `[BUCKETIZE_WARPS + 1]` buffer.
+// Every thread of the block must call it.
+template <typename T>
+__device__ __forceinline__ T block_exclusive_scan(T v, T* sh, T* total) {
+    const int lane = (int)(threadIdx.x & 31);
+    const int warp = (int)(threadIdx.x >> 5);
+    const T inclusive = warp_inclusive_scan(v);
+    if (lane == 31) {
+        sh[warp] = inclusive;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const T w = lane < BUCKETIZE_WARPS ? sh[lane] : (T)0;
+        const T wi = warp_inclusive_scan(w);
+        if (lane < BUCKETIZE_WARPS) {
+            sh[lane] = wi - w;
+        }
+        if (lane == BUCKETIZE_WARPS - 1) {
+            sh[BUCKETIZE_WARPS] = wi;
+        }
+    }
+    __syncthreads();
+    *total = sh[BUCKETIZE_WARPS];
+    return sh[warp] + inclusive - v;
+}
 
 extern "C" __global__ void moe_bucketize_kernel(
     const uint32_t* __restrict__ topk_ids, // [n_tokens * k] row-major
@@ -248,6 +298,13 @@ extern "C" __global__ void moe_bucketize_kernel(
     __shared__ uint8_t sh_dec[MAX_EXPERTS];
     // Per routed remote expert: a promotion of it is already in flight.
     __shared__ uint8_t sh_marked[MAX_EXPERTS];
+    // The remote list's experts, in list order, for the promotion walk.
+    __shared__ int32_t sh_remote_e[MAX_EXPERTS];
+    // One buffer per block-wide scan, so no scan waits on the one before it.
+    __shared__ uint32_t sh_scan_off[BUCKETIZE_WARPS + 1];
+    __shared__ unsigned long long sh_scan_tiles[BUCKETIZE_WARPS + 1];
+    __shared__ unsigned long long sh_scan_remote[BUCKETIZE_WARPS + 1];
+    __shared__ int32_t sh_scan_valid[BUCKETIZE_WARPS + 1];
     // Per-chunk per-expert scratch for the phase-3 stable scatter, flat
     // `[NCHUNK][n_experts]` with a runtime `n_experts` stride. 8192 ints (32 KB)
     // gives NCHUNK = 8192/n_experts chunks — 64 at 128 experts, 32 at 256.
@@ -360,142 +417,160 @@ extern "C" __global__ void moe_bucketize_kernel(
         }
     }
 
-    // ── Phase 2: offsets + tile prefix + remote list + header (thread 0) ──
+    // ── Phase 2: offsets + tile order + remote list (block scans), then the
+    // promotion walk and the header (thread 0) ──
     // Offsets ascend by expert id (the row layout); the tile prefix runs over
-    // the pinned experts, then the cold, then the VRAM ones (the tile order),
-    // and every routed remote expert is listed as it is placed — and given the
-    // next promotion slot while the ring has one.
-    if (tid == 0) {
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        uint32_t reserve = 0xffffffffu;
-        // Whether this launch claims at all: not a sweep.
-        bool claim = false;
-        if (promo_slots != nullptr) {
-            head = *(volatile const uint32_t*)promo_head;
-            tail = *(volatile const uint32_t*)promo_tail;
-            if (promo_reserve != nullptr) {
-                reserve = *(volatile const uint32_t*)promo_reserve;
-            }
-            const uint32_t sweep = *(volatile const uint32_t*)promo_sweep;
-            // The slots the host published before its tail store.
-            __threadfence_system();
-            // The experts whose claims would evict: the decode-scored ones. A
-            // prompt-only expert takes only an empty offer, so it evicts
-            // nothing and decides nothing — counting it would let a zone's
-            // holes turn a short prompt into a sweep and defer its decode
-            // rows' claims.
-            uint32_t claiming = 0;
-            for (int e = 0; e < n_experts; e++) {
-                if (sh_counts[e] > 0 && sh_cls[e] != CLS_VRAM && !sh_marked[e] && sh_dec[e]) {
-                    claiming++;
-                }
-            }
-            claim = claiming <= sweep;
+    // the pinned experts, then the cold, then the VRAM ones (the tile order);
+    // the remote list names every routed remote expert in tile order. Each is a
+    // block-wide exclusive scan over the expert axis, thread `e` holding expert
+    // `e`: the tile order is ONE scan whose three 21-bit lanes are the classes'
+    // tile counts, and the remote list one scan whose two 32-bit lanes are the
+    // pinned and cold experts' flags.
+    {
+        const int e = tid;
+        const bool in = e < n_experts;
+        const int32_t cnt = in ? sh_counts[e] : 0;
+        const int32_t n_tiles = (cnt + tile_w - 1) / tile_w;
+        const uint8_t cls = in ? sh_cls[e] : (uint8_t)CLS_VRAM;
+        const int rank = class_rank(cls);
+
+        uint32_t total_valid_u = 0;
+        const uint32_t off = block_exclusive_scan<uint32_t>((uint32_t)cnt, sh_scan_off, &total_valid_u);
+
+        unsigned long long tile_totals = 0ull;
+        const unsigned long long tile_before = block_exclusive_scan<unsigned long long>(
+            (unsigned long long)n_tiles << (TILE_LANE_BITS * rank), sh_scan_tiles, &tile_totals);
+        const int32_t t_pinned = (int32_t)(tile_totals & TILE_LANE_MASK);
+        const int32_t t_cold = (int32_t)((tile_totals >> TILE_LANE_BITS) & TILE_LANE_MASK);
+        const int32_t t_vram = (int32_t)((tile_totals >> (2 * TILE_LANE_BITS)) & TILE_LANE_MASK);
+        const int32_t class_base = rank == 0 ? 0 : (rank == 1 ? t_pinned : t_pinned + t_cold);
+        const int32_t tile_pref =
+            class_base + (int32_t)((tile_before >> (TILE_LANE_BITS * rank)) & TILE_LANE_MASK);
+
+        const bool is_remote = in && cls != CLS_VRAM && n_tiles > 0;
+        unsigned long long remote_totals = 0ull;
+        const unsigned long long remote_before = block_exclusive_scan<unsigned long long>(
+            is_remote ? (1ull << (32 * (cls == CLS_COLD))) : 0ull, sh_scan_remote, &remote_totals);
+        const int32_t r_pinned = (int32_t)(remote_totals & 0xffffffffull);
+        const int32_t r_cold = (int32_t)(remote_totals >> 32);
+
+        const int32_t active = __syncthreads_count(in && cnt > 0);
+        // The experts whose claims would evict: the decode-scored ones. A
+        // prompt-only expert takes only an empty offer, so it evicts nothing
+        // and decides nothing — counting it would let a zone's holes turn a
+        // short prompt into a sweep and defer its decode rows' claims.
+        const int32_t claiming = __syncthreads_count(
+            promo_slots != nullptr && in && cnt > 0 && cls != CLS_VRAM && !sh_marked[e] && sh_dec[e]);
+
+        if (in) {
+            sh_offsets[e] = (int32_t)off;
+            sh_tile_pref[e] = tile_pref;
         }
-        // The live table's gate plane, which a victim's index is into.
-        uint64_t* const gate_plane =
-            gate_row != nullptr ? (uint64_t*)gate_row - (size_t)row * (size_t)n_experts : nullptr;
-        int32_t off = 0;
-        int32_t active = 0;
-        for (int e = 0; e < n_experts; e++) {
-            sh_offsets[e] = off;
-            const int32_t c = sh_counts[e];
-            off += c;
-            if (c > 0) {
-                active++;
+        if (is_remote && remote != nullptr) {
+            const int32_t at = cls == CLS_PINNED
+                ? (int32_t)(remote_before & 0xffffffffull)
+                : r_pinned + (int32_t)(remote_before >> 32);
+            remote[4 * at + 0] = e;
+            remote[4 * at + 1] = tile_pref;
+            remote[4 * at + 2] = n_tiles;
+            remote[4 * at + 3] = cls == CLS_COLD;
+            sh_remote_e[at] = e;
+        }
+        if (tid == 0) {
+            const int32_t total_valid = (int32_t)total_valid_u;
+            const int32_t tiles = t_pinned + t_cold + t_vram;
+            sh_offsets[n_experts] = total_valid;
+            sh_tile_pref[n_experts] = tiles;
+            sh_header[0] = active;
+            sh_header[1] = total_valid;
+            sh_header[2] = tiles;
+            header[0] = active;
+            header[1] = total_valid;
+            header[2] = tiles;
+            header[3] = remote != nullptr ? r_pinned + r_cold : 0;
+            header[4] = t_pinned + t_cold;
+            if (counters != nullptr) {
+                counters[0] = 0;
+                counters[1] = 0;
+                counters[2] = 0;
             }
         }
-        int32_t tiles = 0;
-        int32_t n_remote = 0;
-        const uint8_t order[3] = {CLS_PINNED, CLS_COLD, CLS_VRAM};
-        int32_t remote_tiles = 0;
-        for (int pass = 0; pass < 3; pass++) {
-            for (int e = 0; e < n_experts; e++) {
-                if (sh_cls[e] != order[pass]) {
-                    continue;
+        __syncthreads();
+        // The promotion walk: in list order, each remote expert takes the next
+        // slot while the ring has one. Serial because each grant moves the head
+        // the next one is judged against — but over the remote list alone, which
+        // a decode step whose experts are all resident leaves empty.
+        if (tid == 0 && remote != nullptr && remote_dst != nullptr) {
+            const int32_t n_remote = r_pinned + r_cold;
+            uint32_t head = 0;
+            uint32_t tail = 0;
+            uint32_t reserve = 0xffffffffu;
+            // Whether this launch claims at all: not a sweep.
+            bool claim = false;
+            if (promo_slots != nullptr) {
+                head = *(volatile const uint32_t*)promo_head;
+                tail = *(volatile const uint32_t*)promo_tail;
+                if (promo_reserve != nullptr) {
+                    reserve = *(volatile const uint32_t*)promo_reserve;
                 }
-                const int32_t n = (sh_counts[e] + tile_w - 1) / tile_w;
-                sh_tile_pref[e] = tiles;
-                if (order[pass] != CLS_VRAM && n > 0 && remote != nullptr) {
-                    remote[4 * n_remote + 0] = e;
-                    remote[4 * n_remote + 1] = tiles;
-                    remote[4 * n_remote + 2] = n;
-                    remote[4 * n_remote + 3] = order[pass] == CLS_COLD;
-                    if (remote_dst != nullptr) {
-                        uint64_t dst = 0ull;
-                        if (claim && !sh_marked[e] && (sh_dec[e] || tail - head > reserve)) {
-                            while (head != tail) {
-                                const uint32_t i = head % promo_cap;
-                                const uint64_t victim =
-                                    ((const volatile uint64_t*)promo_victims)[i];
-                                if (victim != PROMO_EMPTY && !sh_dec[e]) {
-                                    // A prompt-only expert evicts nothing: the
-                                    // next offer holds a resident expert, so it
-                                    // stays in scratch.
-                                    break;
-                                }
-                                if (victim != PROMO_EMPTY) {
-                                    const int32_t vr = (int32_t)(victim / (uint64_t)n_experts);
-                                    const int32_t ve = (int32_t)(victim % (uint64_t)n_experts);
-                                    if (vr == row && sh_counts[ve] > 0) {
-                                        ((volatile uint64_t*)promo_log)[i] =
-                                            ((uint64_t)summary_seq << 32) |
-                                            ((uint64_t)row << 16) | (uint64_t)PROMO_SKIP;
-                                        head++;
-                                        continue;
-                                    }
-                                    // No fence per claim: every later kernel sees
-                                    // these stores by stream order, nothing polls a
-                                    // VRAM victim's entry concurrently, and the host
-                                    // learns of the claim only through `head`, which
-                                    // is published behind a system fence below.
-                                    const volatile uint64_t* rt =
-                                        (const volatile uint64_t*)promo_retarget + 3 * (size_t)i;
-                                    volatile uint64_t* g = (volatile uint64_t*)gate_plane + victim;
-                                    g[table_plane] = rt[1];
-                                    g[2 * table_plane] = rt[2];
-                                    g[0] = rt[0];
-                                }
-                                dst = ((const volatile uint64_t*)promo_slots)[i];
+                const uint32_t sweep = *(volatile const uint32_t*)promo_sweep;
+                // The slots the host published before its tail store.
+                __threadfence_system();
+                claim = (uint32_t)claiming <= sweep;
+            }
+            // The live table's gate plane, which a victim's index is into.
+            uint64_t* const gate_plane =
+                gate_row != nullptr ? (uint64_t*)gate_row - (size_t)row * (size_t)n_experts : nullptr;
+            for (int32_t r = 0; r < n_remote; r++) {
+                const int32_t x = sh_remote_e[r];
+                uint64_t dst = 0ull;
+                if (claim && !sh_marked[x] && (sh_dec[x] || tail - head > reserve)) {
+                    while (head != tail) {
+                        const uint32_t i = head % promo_cap;
+                        const uint64_t victim = ((const volatile uint64_t*)promo_victims)[i];
+                        if (victim != PROMO_EMPTY && !sh_dec[x]) {
+                            // A prompt-only expert evicts nothing: the next
+                            // offer holds a resident expert, so it stays in
+                            // scratch.
+                            break;
+                        }
+                        if (victim != PROMO_EMPTY) {
+                            const int32_t vr = (int32_t)(victim / (uint64_t)n_experts);
+                            const int32_t ve = (int32_t)(victim % (uint64_t)n_experts);
+                            if (vr == row && sh_counts[ve] > 0) {
                                 ((volatile uint64_t*)promo_log)[i] =
                                     ((uint64_t)summary_seq << 32) | ((uint64_t)row << 16) |
-                                    (uint64_t)e;
-                                ((volatile uint32_t*)promo_marks)[(size_t)row * n_experts + e] =
-                                    summary_seq;
+                                    (uint64_t)PROMO_SKIP;
                                 head++;
-                                break;
+                                continue;
                             }
+                            // No fence per claim: every later kernel sees these
+                            // stores by stream order, nothing polls a VRAM
+                            // victim's entry concurrently, and the host learns of
+                            // the claim only through `head`, which is published
+                            // behind a system fence below.
+                            const volatile uint64_t* rt =
+                                (const volatile uint64_t*)promo_retarget + 3 * (size_t)i;
+                            volatile uint64_t* g = (volatile uint64_t*)gate_plane + victim;
+                            g[table_plane] = rt[1];
+                            g[2 * table_plane] = rt[2];
+                            g[0] = rt[0];
                         }
-                        remote_dst[n_remote] = dst;
+                        dst = ((const volatile uint64_t*)promo_slots)[i];
+                        ((volatile uint64_t*)promo_log)[i] =
+                            ((uint64_t)summary_seq << 32) | ((uint64_t)row << 16) | (uint64_t)x;
+                        ((volatile uint32_t*)promo_marks)[(size_t)row * n_experts + x] = summary_seq;
+                        head++;
+                        break;
                     }
-                    n_remote++;
                 }
-                tiles += n;
+                remote_dst[r] = dst;
             }
-            if (order[pass] == CLS_COLD) {
-                remote_tiles = tiles;
+            if (promo_slots != nullptr) {
+                // The log entries before the counter that covers them.
+                __threadfence_system();
+                *(volatile uint32_t*)promo_head = head;
             }
-        }
-        sh_offsets[n_experts] = off;
-        sh_tile_pref[n_experts] = tiles;
-        sh_header[0] = active;
-        sh_header[1] = off;   // total_valid
-        sh_header[2] = tiles; // num_tiles
-        header[0] = active;
-        header[1] = off;
-        header[2] = tiles;
-        header[3] = n_remote;
-        header[4] = remote_tiles;
-        if (counters != nullptr) {
-            counters[0] = 0;
-            counters[1] = 0;
-            counters[2] = 0;
-        }
-        if (promo_slots != nullptr) {
-            // The log entries before the counter that covers them.
-            __threadfence_system();
-            *(volatile uint32_t*)promo_head = head;
         }
     }
     __syncthreads();
@@ -517,8 +592,8 @@ extern "C" __global__ void moe_bucketize_kernel(
     // those counts into each chunk's write base for each expert. Pass 2: each
     // chunk re-scans in ASCENDING i and writes every assignment at `base[e]++`.
     // Chunks are ordered and within a chunk i is ascending, so each expert's
-    // bucket comes out STABLE (ascending i) — bit-identical to the CPU sort —
-    // and no expert ever rescans the whole list.
+    // bucket comes out STABLE (ascending i) — bit-identical to a serial stable
+    // counting sort — and no expert ever rescans the whole list.
     const int NCHUNK =
         (SH_CC_INTS / n_experts < SH_CC_MAX_CHUNK) ? (SH_CC_INTS / n_experts) : SH_CC_MAX_CHUNK;
     const int chunk_len = (a_ub + NCHUNK - 1) / NCHUNK;
@@ -607,17 +682,11 @@ extern "C" __global__ void moe_bucketize_kernel(
             local++;
         }
     }
-    sh_scan[tid] = local;
-    __syncthreads();
-    // 5b: exclusive scan of the 128 chunk sums (thread 0).
+    // 5b: exclusive scan of the chunk sums, block-wide.
+    int32_t valid_total = 0;
+    sh_scan[tid] = block_exclusive_scan<int32_t>(local, sh_scan_valid, &valid_total);
     if (tid == 0) {
-        int32_t run = 0;
-        for (int t = 0; t < BUCKETIZE_THREADS; t++) {
-            const int32_t c = sh_scan[t];
-            sh_scan[t] = run;
-            run += c;
-        }
-        sh_scan[BUCKETIZE_THREADS] = run;
+        sh_scan[BUCKETIZE_THREADS] = valid_total;
     }
     __syncthreads();
     // 5c: chunk re-sweep → the full exclusive scan.
@@ -632,9 +701,9 @@ extern "C" __global__ void moe_bucketize_kernel(
     // 5d: per-token compaction + segment boundaries + padding. Within a token
     // the (perm, rw_ids) pairs are ordered by ASCENDING expert-grouped row —
     // the scatter accumulates each token's contributions sequentially in perm
-    // order, and this matches the CPU path's `sort_by_key((token_id, row))`
-    // exactly, so the float-summation order (and therefore every output bit)
-    // is identical to the CPU-built tables. k is small (≤ MAX_TOPK), so each
+    // order, which is `sort_by_key((token_id, row))` exactly, so the
+    // float-summation order (and therefore every output bit) is a function of
+    // the routing alone. k is small (≤ MAX_TOPK), so each
     // token sorts its pairs with an in-register insertion sort — deterministic,
     // one thread per token.
     for (int t = tid; t < n_tokens; t += BUCKETIZE_THREADS) {

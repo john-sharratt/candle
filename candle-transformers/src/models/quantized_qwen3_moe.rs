@@ -175,9 +175,9 @@ impl AttentionWeights {
 /// The routed half of a sparse MoE layer: router → top-k → expert cache.
 ///
 /// `pub(crate)` because Qwen3.5 routes over the same machinery — same
-/// `ExpertCache`, same GPU-native/host dispatch fork, same 256-expert
-/// bucketize — and differs only by adding an always-active shared expert
-/// alongside it (`qwen35::quantized_moe`). Exposing the existing block is
+/// `ExpertCache`, same device-side expert forward
+/// ([`ExpertCache::forward_routed`]), same bucketize — and differs only by
+/// adding an always-active shared expert alongside it (`qwen35::quantized_moe`). Exposing the existing block is
 /// deliberately all that is done for that: no fields move, no trait is
 /// reshaped, and this model is otherwise untouched.
 pub(crate) struct SparseMoeBlock {
@@ -1406,7 +1406,7 @@ impl ModelWeights {
             Err(_) => load_tensor("token_embd.weight")?,
         };
         let lm_head = QMatMul::from_weights_with_mode(lm_head_tensor.into(), int8mode)?;
-        // Read before the struct takes ownership — see the reader path above.
+        // Read before the struct takes ownership of `lm_head`.
         let vocab = lm_head.weight_dims().first().copied().unwrap_or(0);
 
         // ── Reserve the span, then build the expert cache into it ──
@@ -2695,7 +2695,7 @@ mod tests {
     /// Per-op decode profiler: prefill a realistic context, then time N single-token
     /// decode steps and dump the `snapshot_profiles` op breakdown so we can see where
     /// the per-token forward spends its time (attention kernel vs qkv/o_proj vs the
-    /// MoE `fwd_routing_wait` host sync vs the expert path). Iterates in ~1 min so
+    /// MoE route, bucketize and expert GEMMs). Iterates in ~1 min so
     /// it drives forward-latency optimization without the daemon's substrate reload.
     ///
     /// Run with the profiler enabled:

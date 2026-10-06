@@ -64,6 +64,27 @@ fn launch(
     Ok(())
 }
 
+/// `y = x * mul + add` over the first `n` elements, on a grid sized for `n` —
+/// the same kernel at a different shape when `n` differs.
+#[allow(clippy::too_many_arguments)]
+fn launch_n(
+    f: &CudaFunction,
+    stream: &Arc<CudaStream>,
+    x: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    mul: f32,
+    add: f32,
+    n: usize,
+) -> Result<()> {
+    let count = n as i32;
+    let mut b = stream.launch_builder(f);
+    b.arg(x).arg(y).arg(&mul).arg(&add).arg(&count);
+    // SAFETY: the kernel's signature is the five arguments pushed above, and
+    // both buffers hold `N ≥ n` elements.
+    unsafe { b.launch(LaunchConfig::for_num_elems(n as u32)) }.w()?;
+    Ok(())
+}
+
 fn ramp(scale: f32) -> Vec<f32> {
     (0..N).map(|i| i as f32 * scale).collect()
 }
@@ -637,6 +658,40 @@ fn alternating_wave_shapes_each_fold_into_their_own_executable() -> Result<()> {
     let after = dev.capture_stats();
     assert_eq!(after.instantiated - before.instantiated, 0, "{after:?}");
     assert_eq!(after.updated - before.updated, 4, "{after:?}");
+    Ok(())
+}
+
+/// One kernel at two grid sizes taking turns — the same topology, so either
+/// capture could be folded over the other — each keep an executable at their
+/// own shape once both have recurred: every later wave folds in place without
+/// rewriting another shape's executable, and each computes its own result.
+#[test]
+fn recurring_shapes_of_one_topology_each_keep_their_executable() -> Result<()> {
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let mut before = dev.capture_stats();
+    for wave in 0..10u32 {
+        if wave == 4 {
+            before = dev.capture_stats();
+        }
+        let n = if wave % 2 == 0 { N } else { N / 2 };
+        dev.memcpy_htod(&vec![-1.0f32; N], &mut y)?;
+        let capture = dev.begin_wave_capture()?;
+        dev.record_launches()?;
+        launch_n(&f, &dev.cuda_stream(), &x, &mut y, 1.0, wave as f32, n)?;
+        capture.finish()?;
+        let want: Vec<f32> = (0..N)
+            .map(|i| if i < n { i as f32 + wave as f32 } else { -1.0 })
+            .collect();
+        assert_eq!(dev.memcpy_dtov(&y)?, want, "wave {wave}");
+    }
+    let after = dev.capture_stats();
+    assert_eq!(after.instantiated - before.instantiated, 0, "{after:?}");
+    assert_eq!(after.reshaped - before.reshaped, 0, "{after:?}");
+    assert_eq!(after.updated - before.updated, 6, "{after:?}");
     Ok(())
 }
 

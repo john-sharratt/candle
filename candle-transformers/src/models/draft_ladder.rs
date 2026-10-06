@@ -49,18 +49,34 @@
 /// speculate. They must ascend in width with non-increasing budgets —
 /// [`DraftLadder::check`] asserts it, and the module's tests run it over every
 /// row here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Beside the brackets, what one drafted token costs relative to a step's fixed
+/// cost — the `c / T0` [`super::draft_depth`] prices a depth with. Measured at
+/// width 1, where a step is cheapest and a drafted token is therefore dearest
+/// relative to it; a wider wave's verify is dearer, so the same figure there
+/// errs toward drafting shallow.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DraftLadder {
     brackets: &'static [(usize, usize)],
+    token_cost: f32,
 }
 
 impl DraftLadder {
-    pub const fn new(brackets: &'static [(usize, usize)]) -> Self {
-        Self { brackets }
+    pub const fn new(brackets: &'static [(usize, usize)], token_cost: f32) -> Self {
+        Self {
+            brackets,
+            token_cost,
+        }
     }
 
     /// A checkpoint that never speculates — no drafter, or one not yet measured.
-    pub const NONE: Self = Self::new(&[]);
+    /// Its token cost is never read: every budget it answers is zero.
+    pub const NONE: Self = Self::new(&[], 0.0);
+
+    /// What one drafted token costs relative to a step's fixed cost.
+    pub fn token_cost(&self) -> f32 {
+        self.token_cost
+    }
 
     /// Tokens each sequence drafts on a wave of `width` sequences.
     pub fn budget(&self, width: usize) -> usize {
@@ -206,18 +222,28 @@ impl DraftLadder {
 /// red for a reason that lives here.
 const LINEAGE_START: &[(usize, usize)] = &[(16, 2)];
 
+/// The lineage's drafted-token cost — **chosen, not measured**.
+///
+/// At a ceiling of 2 the cost decides one thing: the acceptance at which a
+/// sequence drafts two rather than one. At 0.1, for a drafter accepting each
+/// proposal at a steady `p`, that is `p ≈ 0.35`, where the one-past-acceptance
+/// rule that preceded the cost model switched at `p ≈ 0.37` — so these
+/// checkpoints draft as they were measured to, and a measurement of their own
+/// replaces this figure.
+const LINEAGE_TOKEN_COST: f32 = 0.1;
+
 /// Qwen3.5-9B (dense). Has a NextN head.
-pub const QWEN35_9B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START);
+pub const QWEN35_9B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START, LINEAGE_TOKEN_COST);
 
 /// Qwen3.5-0.8B (dense). **No NextN head in any conversion**, so no ladder —
 /// this is the checkpoint's real capability, not a gap awaiting measurement.
 pub const QWEN35_0_8B_DRAFT: DraftLadder = DraftLadder::NONE;
 
 /// Qwen3.5-35B-A3B (routed). Has a NextN head, itself a full routed block.
-pub const QWEN35_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START);
+pub const QWEN35_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START, LINEAGE_TOKEN_COST);
 
 /// Qwen3.6-35B-A3B (routed). Has a NextN head, itself a full routed block.
-pub const QWEN36_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START);
+pub const QWEN36_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START, LINEAGE_TOKEN_COST);
 
 /// Qwen3.8-27B (dense). Has a NextN head, dense rather than routed — shipped as
 /// a **sidecar** GGUF rather than embedded (`mtp-Qwen3.8-27B-Q4_0.gguf`).
@@ -281,7 +307,8 @@ pub const QWEN36_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START);
 // permits a depth that does not fit. Until that disagreement is understood,
 // this row stays at the width that is measured to work.
 const QWEN38_27B_BRACKETS: &[(usize, usize)] = &[(16, 4)];
-pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS);
+/// The lineage's chosen cost, unmeasured here as there.
+pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS, LINEAGE_TOKEN_COST);
 
 /// Qwen3.8-Flash-Next (`qwen4exp`). Its NextN head is a full routed block of
 /// the same architecture, folded into the artifact as `blk.48`.
@@ -330,16 +357,48 @@ pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS);
 /// past what has been run — which is exactly the mistake this table replaced.
 ///
 /// **These are ceilings, not the depth a sequence drafts at.** Each sequence
-/// drafts `round(acceptance) + 1` clipped here ([`super::draft_depth`]): the
-/// rewrite above fills the block, but free continuation accepts ~2.1 per step
-/// (`docs/performance.md` §3.6), and drafting it four deep pays the head's walk
-/// and a wider verify for tokens the walk throws away.
+/// drafts the depth that buys it the most tokens per second at its own
+/// acceptance, clipped here ([`super::draft_depth`]): the rewrite above fills
+/// the block, but free continuation accepts ~2.1 per step (`docs/performance.md`
+/// §3.6), and drafting it deep pays the head's walk and a wider verify for
+/// tokens the walk throws away.
+///
+/// **One sequence alone drafts up to 4, like a wave of eight.** Deeper pays
+/// only on text the head can copy. Measured on the 72 GB card (one load, three
+/// warm runs, 2026-10-06), each depth drafted on every step:
+///
+/// | task | depth | accepted / step | ms / step | t/s |
+/// |---|---|---:|---:|---:|
+/// | rewrite (`profile_single_session_decode`) | 8 | 7.50 | 26.7 | 279 |
+/// | | 12 | 11.09 | 33.4 | 330 |
+/// | | 16 | 12.75 | 38.9 | 327 |
+/// | essay (`profile_single_session_essay`) | 1 | 1.68 | 20.7 | 81 |
+/// | | 2 | 2.22 | 22.9 | 97 |
+/// | | 3 | 2.12 | 25.4 | 84 |
+///
+/// and under the depth rule (2026-10-07), ceiling 4 against 12: rewrite 4.90
+/// accepted / step at 236 t/s against 9.44 at 315, essay 2.14 at 88 against
+/// ~2.2 at 92. A ceiling of 12 buys its third only on a near-verbatim rewrite;
+/// on free continuation the rule settles near 2 under either ceiling, so the
+/// one-session rate is quoted at the depth real text drafts at.
+///
+/// **The token cost, 0.125, is the essay's measured `c / T0` and tuned on both
+/// tasks.** A drafted token costs `1.4 / 16.5 ≈ 0.085` of the step on the
+/// rewrite's ~1.3K-token context and `2.3 / 18.4 ≈ 0.125` on the essay's ~4.3K —
+/// its walk step and its verify row both attend over the context. Swept as
+/// (rewrite, essay) t/s under an earlier form of the depth rule whose unreached
+/// positions aged three times as fast: 0.085 → (313, 83), 0.125 → (324, 88),
+/// 0.15 → (313, 87), 0.2 → (290, 96) — run-to-run spread on the essay is a few
+/// per cent, as each run writes a slightly different essay. Under the rule as
+/// it stands, 0.125 → (316, 92) at a ceiling of 12.
 const QWEN38_FLASH_NEXT_BRACKETS: &[(usize, usize)] = &[(8, 4), (16, 2)];
-pub const QWEN38_FLASH_NEXT_DRAFT: DraftLadder = DraftLadder::new(QWEN38_FLASH_NEXT_BRACKETS);
+pub const QWEN38_FLASH_NEXT_DRAFT: DraftLadder =
+    DraftLadder::new(QWEN38_FLASH_NEXT_BRACKETS, 0.125);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::draft_depth::DraftDepth;
 
     /// Every ladder shipped here must satisfy the ordering `budget` relies on —
     /// checked over the real rows, so a mis-edited table fails here rather than
@@ -352,6 +411,7 @@ mod tests {
             ("35B-A3B", QWEN35_35B_A3B_DRAFT),
             ("3.6-35B-A3B", QWEN36_35B_A3B_DRAFT),
             ("27B", QWEN38_27B_DRAFT),
+            ("Flash-Next", QWEN38_FLASH_NEXT_DRAFT),
         ] {
             if let Err(e) = ladder.check() {
                 panic!("{name} ladder is malformed: {e}");
@@ -429,8 +489,26 @@ mod tests {
     /// exactly why `check` exists — pin that it catches both malformations.
     #[test]
     fn check_rejects_shadowed_and_rising_brackets() {
-        assert!(DraftLadder::new(&[(16, 2), (8, 1)]).check().is_err());
-        assert!(DraftLadder::new(&[(8, 1), (16, 2)]).check().is_err());
-        assert!(DraftLadder::new(&[(8, 2), (16, 1)]).check().is_ok());
+        assert!(DraftLadder::new(&[(16, 2), (8, 1)], 0.1).check().is_err());
+        assert!(DraftLadder::new(&[(8, 1), (16, 2)], 0.1).check().is_err());
+        assert!(DraftLadder::new(&[(8, 2), (16, 1)], 0.1).check().is_ok());
+    }
+
+    /// The lineage's cost puts its one-or-two switch where the rule before it
+    /// did, near a steady `p = 0.35`: a sequence that kept one of two drafts
+    /// two (`q₁ ≈ 0.96`, `q₂ ≈ 0.37`), one whose first proposal has missed
+    /// four times running drafts one (`q₁ ≈ 0.08`).
+    #[test]
+    fn the_lineage_cost_switches_to_two_drafts_near_a_third() {
+        let ceiling = QWEN35_9B_DRAFT.budget(1);
+        let cost = QWEN35_9B_DRAFT.token_cost();
+        let mut half = DraftDepth::default();
+        half.record(2, 2);
+        assert_eq!(half.budget(ceiling, cost), 2);
+        let mut missing = DraftDepth::default();
+        for _ in 0..4 {
+            missing.record(2, 1);
+        }
+        assert_eq!(missing.budget(ceiling, cost), 1);
     }
 }

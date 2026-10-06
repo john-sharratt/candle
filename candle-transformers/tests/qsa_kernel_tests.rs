@@ -343,8 +343,11 @@ impl SlotHeaders {
             .k_cache()
             .chunked_slot()
             .expect("cache bound to a chunked backing");
-        let arena_info = backing.resolve_arena_info()?;
+        // Ensure the write chunk first, then resolve the arenas: a history that
+        // ends on an arena's last chunk puts the write chunk in a new arena, and
+        // a table resolved before it exists names that arena's base as 0.
         backing.ensure_for_batch_entries(&[(slot, seq_offset)], 1)?;
+        let arena_info = backing.resolve_arena_info()?;
 
         let chunks = cache
             .k_cache()

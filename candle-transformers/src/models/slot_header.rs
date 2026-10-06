@@ -19,7 +19,9 @@
 //! [`SlotHeaderHost::write`], so the layout lives in one place on this side.
 
 /// Bytes of one `SlotHeader`; mirrors `sizeof(SlotHeader)` in `slot_types.cuh`.
-pub const SLOT_HEADER_BYTES: usize = 32;
+/// Declared beside the wave plan, which prices the headers a prefill launch
+/// carves from its attention span.
+pub use candle_nn::kv_cache::SLOT_HEADER_BYTES;
 
 /// One sequence's header, as the host builds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

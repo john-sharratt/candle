@@ -10,11 +10,12 @@ pub(crate) fn graph_line(before: &CaptureStats, after: &CaptureStats) -> String 
     let segments = after.segments - before.segments;
     let nodes = after.nodes - before.nodes;
     let updated = after.updated - before.updated;
+    let reshaped = after.reshaped - before.reshaped;
     let instantiated = after.instantiated - before.instantiated;
     let per = |n: u64, d: u64| if d == 0 { 0.0 } else { n as f64 / d as f64 };
     format!(
         "  graphs: {waves} waves, {:.1} segments/wave, {:.1} launches/segment, \
-         {updated} updated in place, {instantiated} instantiated",
+         {updated} updated in place ({reshaped} reshaped), {instantiated} instantiated",
         per(segments, waves),
         per(nodes, segments),
     )
@@ -34,6 +35,7 @@ mod tests {
             waves: 3,
             segments: 100,
             updated: 90,
+            reshaped: 30,
             instantiated: 10,
             nodes: 2_000,
         };
@@ -41,13 +43,14 @@ mod tests {
             waves: 7,
             segments: 264,
             updated: 252,
+            reshaped: 37,
             instantiated: 12,
             nodes: 6_100,
         };
         assert_eq!(
             graph_line(&before, &after),
             "  graphs: 4 waves, 41.0 segments/wave, 25.0 launches/segment, \
-             162 updated in place, 2 instantiated"
+             162 updated in place (7 reshaped), 2 instantiated"
         );
     }
 
@@ -57,7 +60,7 @@ mod tests {
         assert_eq!(
             graph_line(&s, &s),
             "  graphs: 0 waves, 0.0 segments/wave, 0.0 launches/segment, \
-             0 updated in place, 0 instantiated"
+             0 updated in place (0 reshaped), 0 instantiated"
         );
     }
 }

@@ -325,6 +325,13 @@ impl TestParams {
         self
     }
 
+    /// Replace the system prompt. Empty leaves the system turn with no text in
+    /// it — the turn's own markers are still prefilled.
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt_system = prompt.into();
+        self
+    }
+
     /// Provide per-config user-prompt overrides (indexed by config position).
     /// A non-empty entry replaces `prompt_user` for that config in `run()`.
     pub fn with_per_config_prompts(mut self, prompts: Vec<String>) -> Self {
@@ -429,6 +436,48 @@ impl TestParams {
     /// [`Dialect::thinking_suppression`], which owns the one-mechanism split.
     fn thinking_suppression(&self) -> (&'static str, &'static str) {
         self.dialect.thinking_suppression(self.suppress_thinking)
+    }
+
+    /// The user turn's opening and `user_text`, as the prompt phase prefills
+    /// them: encoded separately from [`Self::user_suffix_tokens`], so the
+    /// harness can pad inside the user turn between the two.
+    pub fn user_content_tokens(&self, user_text: &str) -> Vec<u32> {
+        let (no_think, _) = self.thinking_suppression();
+        let content = format!("{}{}{}", self.dialect.user_start, no_think, user_text);
+        self.tokenizer
+            .encode(content.as_str(), true)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != self.begin_document_token)
+            .collect()
+    }
+
+    /// The user turn's close and the assistant opening — with the closed
+    /// reasoning block where this dialect suppresses thinking there.
+    pub fn user_suffix_tokens(&self) -> Vec<u32> {
+        let (_, closed_think) = self.thinking_suppression();
+        let suffix = format!(
+            "{}{}{}",
+            self.dialect.user_end, self.dialect.assistant_start, closed_think
+        );
+        self.tokenizer
+            .encode(suffix.as_str(), false)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != self.begin_document_token)
+            .collect()
+    }
+
+    /// Every token one session of a single-context config prefills for
+    /// `user_text`: the system turn, then the user turn.
+    pub fn prefill_token_count(&self, user_text: &str) -> usize {
+        self.system_prompt_tokens(0).len()
+            + self.user_content_tokens(user_text).len()
+            + self.user_suffix_tokens().len()
     }
 
     pub fn user_prompt_tokens(&self, index: usize) -> Vec<u32> {
@@ -1468,34 +1517,11 @@ impl TestParams {
         // pad tokens inside the user turn where they are harmless trailing
         // whitespace, rather than after <|im_start|>assistant where they
         // would cause the model to emit EOS immediately.
-        let (no_think, closed_think) = self.thinking_suppression();
-        let suffix_str = format!(
-            "{}{}{}",
-            self.dialect.user_end, self.dialect.assistant_start, closed_think
-        );
-        let suffix_tokens: Vec<u32> = self
-            .tokenizer
-            .encode(suffix_str.as_str(), false)
-            .unwrap()
-            .get_ids()
-            .iter()
-            .copied()
-            .filter(|id| Some(*id) != self.begin_document_token)
-            .collect();
-
+        let suffix_tokens = self.user_suffix_tokens();
         let content_tokens_per_session: Vec<Vec<u32>> = (0..config.num_contexts)
             .map(|n| {
                 let name = &self.names[n % self.names.len()];
-                let user_text = self.prompt_user.replace("{INSERT_NAME}", name);
-                let content = format!("{}{}{}", self.dialect.user_start, no_think, user_text);
-                self.tokenizer
-                    .encode(content.as_str(), true)
-                    .unwrap()
-                    .get_ids()
-                    .iter()
-                    .copied()
-                    .filter(|id| Some(*id) != self.begin_document_token)
-                    .collect::<Vec<u32>>()
+                self.user_content_tokens(&self.prompt_user.replace("{INSERT_NAME}", name))
             })
             .collect();
 
@@ -2180,9 +2206,11 @@ impl TestParams {
         // so mean accepted/step IS the speedup ceiling. Reported rather than
         // asserted — it is a property of the text, not of the code.
         let (mut steps, mut emitted, mut drafted) = (0usize, 0usize, 0usize);
-        // Each session drafts one past its own acceptance, clipped at the
-        // model's ladder — the same rule the scheduler applies.
+        // Each session drafts the depth its own acceptance makes cheapest per
+        // token at the model's drafted-token cost, clipped at the model's
+        // ladder — the same rule the scheduler applies.
         let mut depths = vec![DraftDepth::default(); sequence_indices.len()];
+        let token_cost = model.draft_token_cost();
         // Greedy: this harness seeds from the prefill row's argmax and
         // validates every run against a fixed expected string, so the
         // speculative path must reproduce plain greedy decode token for token.
@@ -2206,7 +2234,10 @@ impl TestParams {
             let before: usize = lens.iter().sum();
             let seqs: Vec<usize> = idxs.iter().map(|&i| sequence_indices[i]).collect();
             let comms: Vec<u32> = idxs.iter().map(|&i| committed[i]).collect();
-            let budgets: Vec<usize> = idxs.iter().map(|&i| depths[i].budget(max_draft)).collect();
+            let budgets: Vec<usize> = idxs
+                .iter()
+                .map(|&i| depths[i].budget(max_draft, token_cost))
+                .collect();
             // Per-session emit sinks over DISJOINT `runs` borrows: each pushes
             // into its own output and applies the budget/EOS policy — the exact
             // per-token loop plain decode uses.

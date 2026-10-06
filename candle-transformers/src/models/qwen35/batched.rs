@@ -793,6 +793,11 @@ impl HybridBatched {
             .min(self.affordable_draft_budget(width))
     }
 
+    /// The drafted-token cost this checkpoint's ladder carries.
+    pub fn draft_token_cost_for(&self) -> f32 {
+        self.draft.token_cost()
+    }
+
     /// The deepest budget whose rewind stash the KV side can currently hold.
     ///
     /// `usize::MAX` when the question does not arise — no reservation to measure

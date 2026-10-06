@@ -2023,6 +2023,80 @@ mod tests {
         )
     }
 
+    /// One session writing freely — the drafter guessing rather than copying —
+    /// at a shallow depth and long enough for its draft depth to settle: the
+    /// counterpart of [`profile_single_session_decode`]'s rewrite, and what the
+    /// draft-depth rule (`draft_depth`) is priced against on text it predicts
+    /// poorly.
+    #[test]
+    #[ignore = "profiling run: loads this card's engine artifact. Run with: cargo test \
+                --release --features cuda -p candle-transformers --lib \
+                quantized_qwen38_moe::tests::profile_single_session_essay \
+                -- --ignored --nocapture --test-threads=1"]
+    fn profile_single_session_essay() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+        use crate::models::batched_inference::InferenceMode;
+        use crate::models::dialect::Dialect;
+        use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+        use candle::quantized::Int8Mode;
+
+        let merged = engine_gguf()?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        let tok = tokenizer_json()?;
+        let bf16 = &[InferenceMode::BF16][..];
+        long_context_gate(
+            "Qwen3.8-Flash-Next single-session essay",
+            int8mode,
+            &tok,
+            Dialect::qwen35(),
+            262_144,
+            &[(4_096, bf16), (4_096, bf16), (4_096, bf16)],
+            1,
+            256,
+            DepthTask::Essay,
+            &device,
+            || {
+                let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+                Qwen4ExpBatched::new(gpu)
+            },
+        )
+    }
+
+    /// **Strata's single-session benchmark, on this engine.** The requests of
+    /// Strata's published RTX 5090 run (`batch_test::strata_bench`): a synthetic
+    /// Python module cut to 4,096 / 32,768 / 128,000 prompt tokens and a request
+    /// to explain it, greedy, 256 tokens, one warm-up then three runs a length,
+    /// reported as the median beside Strata's 179.4 / 175.7 / 165.0 t/s.
+    #[test]
+    #[ignore = "benchmark: loads this card's engine artifact and prefills to 128K. Run with: \
+                cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen38_moe::tests::strata_bench_single_session \
+                -- --ignored --nocapture --test-threads=1"]
+    fn strata_bench_single_session() -> Result<()> {
+        use crate::models::batch_test::strata_bench::strata_bench;
+        use crate::models::batched_inference::InferenceMode;
+        use crate::models::dialect::Dialect;
+        use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+        use candle::quantized::Int8Mode;
+
+        let merged = engine_gguf()?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        strata_bench(
+            "Qwen3.8-Flash-Next",
+            int8mode,
+            &tokenizer_json()?,
+            Dialect::qwen35(),
+            InferenceMode::BF16,
+            &device,
+            || {
+                let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+                Qwen4ExpBatched::new(gpu)
+            },
+        )
+    }
+
     /// The width ladder's task, run at the depth ladder's depths.
     ///
     /// [`profile_decode_vs_depth`] and [`test_parallel_batched_forwarding`]
@@ -2126,6 +2200,46 @@ mod tests {
             Ok(m)
         };
         params.run(configs, load)
+    }
+
+    /// **Single-session decode, alone.** The gate's one-context row — same task,
+    /// same 256 tokens, same dialect — run once cold and three times warm in one
+    /// load, so the per-step cost of one conversation can be measured and
+    /// profiled without the rest of the ladder in front of it.
+    ///
+    /// Under `--features cuda,profile` the harness fills its span tables; without
+    /// it, the throughput table alone.
+    #[test]
+    #[ignore = "profiling run: loads this card's engine artifact. Run with: cargo test \
+                --release --features cuda,profile -p candle-transformers --lib \
+                quantized_qwen38_moe::tests::profile_single_session_decode \
+                -- --ignored --nocapture --test-threads=1"]
+    fn profile_single_session_decode() -> Result<()> {
+        use crate::models::batch_test::utils::TestParams;
+        use crate::models::dialect::Dialect;
+        use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+        use candle::quantized::Int8Mode;
+
+        let merged = engine_gguf()?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
+            .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_suppress_thinking(true)
+            .with_int8mode(int8mode)
+            .with_timeout_secs(3600);
+        let one = || TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        };
+        let configs = vec![one(), one(), one(), one()];
+        params.run(configs, || {
+            let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+            Qwen4ExpBatched::new(gpu)
+        })
     }
 
     /// The Phase-1 oracle gate: `forward_batched` end to end on the real

@@ -157,6 +157,22 @@ pub fn draft_walk(
     let mut ids = tokens.get(0)?;
     let mut h = seeds.clone();
 
+    // **The walk's launches run as a chain of graphs**, as a forward's do
+    // (`docs/decode_graphs.md`): each step's block — dozens of small launches
+    // over a handful of rows — is recorded and handed to the driver a segment
+    // at a time, so the GPU runs a step while the host records the next. Issued
+    // eagerly, the steps were launch-bound: on Flash-Next's single-session
+    // decode the eager stream sat idle ~3.9 ms of every 30 ms step between its
+    // own back-to-back launches. A failed walk drops the capture, discarding
+    // the segment it was recording; the rollback below runs eagerly.
+    let device = seeds.device();
+    #[cfg(feature = "cuda")]
+    let capture = match device {
+        candle::Device::Cuda(cuda) => Some(cuda.begin_wave_capture()?),
+        _ => None,
+    };
+    device.record_launches()?;
+
     let drafted = (|| -> Result<()> {
         for j in 0..max_len {
             let at: Vec<usize> = base.iter().map(|&b| b + j).collect();
@@ -165,6 +181,10 @@ pub fn draft_walk(
             // The head's layer alone: the trunk's layers are not being written
             // by a draft, and naming them would reconcile a group against
             // positions that do not exist on them.
+            //
+            // Built inside the recording: the slot-state upload is recorded
+            // into the segment, and whatever must meet the device eagerly
+            // pauses the recording itself.
             let (headers, stride) = session.build_decode_metadata_at(
                 kv_layer..kv_layer + 1,
                 seqs,
@@ -234,6 +254,11 @@ pub fn draft_walk(
         }
         Ok(())
     })();
+    #[cfg(feature = "cuda")]
+    let drafted = match (drafted, capture) {
+        (Ok(()), Some(capture)) => capture.finish(),
+        (drafted, _) => drafted,
+    };
 
     // Roll the walk's positions away, error or not — see the module docs.
     let mut rolled_back = Ok(());

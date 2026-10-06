@@ -38,8 +38,8 @@
 //! moves between waves.
 //!
 //! **`W` is the only boundary that moves**, and it moves in one place, at one
-//! time: the expert pipeline thread, where no expert GEMM for the pass is still
-//! being issued. The KV side never moves it directly — it *buys* ground through
+//! time: the expert pipeline thread, and only with no wave live and no expert
+//! invocation the forward thread has begun still unserved. The KV side never moves it directly — it *buys* ground through
 //! [`set_ground_broker`], which sends the request to that thread and blocks on
 //! the answer, so the eviction still happens where it is safe while the
 //! arithmetic stays with the claim that knows the number.

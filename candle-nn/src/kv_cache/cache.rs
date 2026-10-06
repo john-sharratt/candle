@@ -1081,41 +1081,6 @@ impl KvCache {
         Ok((slots, pins, stats))
     }
 
-    /// Prime the persistent decode slot-state buffers after prefill.
-    ///
-    /// This materializes the per-sequence GPU slot headers ahead of the first
-    /// decode token so decode can immediately reuse them on the hot path. Only
-    /// a missing buffer is built: one that exists is left to the decode sync,
-    /// which re-serialises its writer region if the prefill's commit marked it
-    /// (`ChunkedKvBacking::prime_decode_gpu_chunks`).
-    pub fn prime_chunked_decode_slots_batch(caches: &mut [&mut KvCache]) -> Result<()> {
-        if caches.is_empty() {
-            return Ok(());
-        }
-        let backing = match &caches[0].k.storage {
-            CacheStorage::Chunked(c) => c.backing.clone(),
-            CacheStorage::Contiguous { .. } => return Ok(()),
-        };
-        let entries: Vec<(usize, usize)> = caches
-            .iter()
-            .filter_map(|cache| {
-                cache
-                    .k
-                    .chunked_batch_idx()
-                    .map(|b| (b, cache.k.current_seq_len))
-            })
-            .collect();
-        if entries.is_empty() {
-            return Ok(());
-        }
-        // Ensure the write chunk exists for each sequence. When prefill ends exactly
-        // at a chunk boundary (seq_len % CHUNK_SIZE == 0), the tail chunk is already
-        // full and the next decode token needs a new chunk that isn't allocated yet.
-        // ensure_for_batch_entries(entries, 1) allocates that chunk if needed.
-        backing.ensure_for_batch_entries(&entries, 1)?;
-        backing.prime_decode_gpu_chunks(&entries)
-    }
-
     /// Finalize sequences after generation completes.
     /// Get the current K cache data (narrowed to current_seq_len).
     pub fn k(&self) -> Result<Option<Tensor>> {

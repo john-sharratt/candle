@@ -3,11 +3,9 @@
 //!
 //! Qwen3.5's MoE is Qwen3-MoE's with one addition, so this reuses rather than
 //! restates. The routed half is [`SparseMoeBlock`] verbatim — same
-//! [`ExpertCache`], same GPU-native/host dispatch fork, same counting-sort —
-//! and needs nothing from this family: 256 experts is inside
-//! `moe_bucketize`'s `MAX_EXPERTS`, and the `> 128` check in `gpu_dispatch`
-//! degrades to the host path rather than failing, which is the documented
-//! behaviour for an oversized id space.
+//! [`ExpertCache`], same device-side expert forward, same bucketize — and
+//! needs nothing from this family: 256 experts is inside `moe_bucketize`'s
+//! `MAX_EXPERTS` (512), which the live table checks at load.
 //!
 //! What is new is the **shared expert**: an ordinary SwiGLU that every token
 //! goes through, scaled by a per-token scalar `sigmoid(w_gate · x)`, summed

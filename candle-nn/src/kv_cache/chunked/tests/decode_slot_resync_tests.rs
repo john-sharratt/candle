@@ -266,50 +266,39 @@ fn a_commit_leaves_the_buffer_to_the_next_sync() {
     drop(kv);
 }
 
-/// The prime after a prefill builds only a MISSING buffer. One that exists is
-/// left to the decode step's sync, stale writer region and all: the prime runs
-/// once per prefill layer, and an upload there sits between that layer's
-/// kernels and the next.
+/// A slot-state buffer whose last upload went through pinned staging fences that
+/// upload before the slot changes hands — and when that happens inside a
+/// recording wave, the fence must pause the recording first. Querying the
+/// upload's event on the capturing thread invalidates the whole capture, which
+/// surfaced on Flash-Next's four-sequence gate as
+/// `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED` at the end of a draft walk: the
+/// prompt's rebuilds had overflowed the wave's ring into staging, and the walk's
+/// first chunk boundary cleared the buffer.
 #[test]
-fn a_prime_leaves_an_existing_buffer_to_the_decode_sync() {
+fn a_fence_inside_a_recording_wave_leaves_the_capture_intact() {
     let _gpu = gpu_serial();
     let dev = Device::new_cuda(0).unwrap();
+    let Device::Cuda(cuda) = &dev else {
+        unreachable!("a CUDA test");
+    };
     let (backing, mut cache, seq) = setup(&dev);
 
+    // Outside any wave, so the rebuild's upload is staged and leaves an event.
     write_outside_decode(&mut cache, &dev, 0, 8);
-    let (ptr, n_slices) = live_slot(&backing, seq, 8);
-    let kv = write_kv_ahead(&mut cache, &dev, 8, 4);
-    cache.commit_written_tokens(8, 4).unwrap();
-    KvCache::prime_chunked_decode_slots_batch(&mut [&mut cache]).unwrap();
+    live_slot(&backing, seq, 8);
+
+    let capture = cuda.begin_wave_capture().unwrap();
+    cuda.record_launches().unwrap();
+    // Across the 32-token boundary: a new chunk, so the buffer clears and
+    // fences the staged upload.
+    let kv = write_kv_ahead(&mut cache, &dev, 8, 30);
+    cache.commit_written_tokens(8, 30).unwrap();
+    let (ptr, n_slices) = live_slot(&backing, seq, 38);
+    capture.finish().unwrap();
+
     dev.synchronize().unwrap();
-    assert_eq!(
-        read_lens(&dev, ptr, n_slices),
-        vec![8],
-        "the prime rewrote a buffer the decode sync owns bringing up to date"
-    );
-    assert_eq!(live_slot(&backing, seq, 12), (ptr, n_slices));
-    assert_eq!(read_lens(&dev, ptr, n_slices), vec![12]);
+    assert_eq!(read_lens(&dev, ptr, n_slices), vec![32, 6]);
     drop(kv);
-}
-
-/// A sequence with no buffer — a fresh prefill — gets one from the prime, so
-/// the first decode step reuses it rather than building it.
-#[test]
-fn a_prime_builds_a_missing_buffer() {
-    let _gpu = gpu_serial();
-    let dev = Device::new_cuda(0).unwrap();
-    let (backing, mut cache, seq) = setup(&dev);
-
-    write_outside_decode(&mut cache, &dev, 0, 8);
-    KvCache::prime_chunked_decode_slots_batch(&mut [&mut cache]).unwrap();
-    let info = backing.resolve_arena_info().unwrap();
-    let (ptrs, _, stats) = backing.sync_decode_gpu_chunks(&[(seq, 8)], &info).unwrap();
-    assert_eq!(
-        (stats.rebuilds, stats.reuses),
-        (0, 1),
-        "the decode sync rebuilt a buffer the prime should have built"
-    );
-    assert_eq!(read_lens(&dev, ptrs[0].0, ptrs[0].1 as usize), vec![8]);
 }
 
 /// The harness first: work enqueued behind a closed [`StreamGate`] does not

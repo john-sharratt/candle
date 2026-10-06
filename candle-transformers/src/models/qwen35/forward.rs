@@ -195,6 +195,11 @@ impl ManagedBatchedModel for HybridBatched {
         self.draft_budget_for(width)
     }
 
+    /// This checkpoint's own ladder's drafted-token cost.
+    fn draft_token_cost(&self) -> f32 {
+        self.draft_token_cost_for()
+    }
+
     /// Draft with the checkpoint's own NextN/MTP head ([`super::mtp`]), for the
     /// whole cohort in one batched pass.
     ///

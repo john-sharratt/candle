@@ -26,7 +26,9 @@ use crate::models::rope_schedule::RopeRungs;
 #[cfg(feature = "cuda")]
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 #[cfg(feature = "cuda")]
-use crate::models::slot_state::SlotTokenLayout;
+use crate::models::slot_state::{tensor_u8_device_ptr, SlotTokenLayout};
+#[cfg(feature = "cuda")]
+use crate::models::wave_buffers::wave_from_vec_ticketed;
 #[cfg(feature = "cuda")]
 use candle_kernels::rope::RopeRungsFfi;
 #[cfg(feature = "cuda")]
@@ -50,8 +52,9 @@ use candle_nn::kv_cache::WaveGeneration;
 struct SlotHeaderUpload {
     /// Raw GPU address of `SlotHeader[b]`.
     headers_ptr: u64,
-    /// Keeps the header upload alive for the duration of the kernel launch.
-    _headers_gpu: GpuBuf,
+    /// The headers' device bytes: a lease on the launch's wave arena, or a pool
+    /// buffer when the launch has no wave. Held for the duration of the launch.
+    _headers: Tensor,
     /// Pins every chunk the uploaded slot headers address: an uploaded page
     /// table is a REFERENCE, so it must hold the referenced gids alive. While
     /// held, a concurrent quantize-swap (`quantize_sealed_in_place` on the
@@ -185,7 +188,17 @@ fn classify_pm_divergence(
 /// the position map's write region and the headers, and those are all that is
 /// built here. Each header carries its slot's RoPE rung, from the deepest
 /// position the launch writes for it.
+///
+/// **Runs inside the recording wave capture, and in the common case does not
+/// end its segment.** The headers are carved from the launch's `wave` arena and
+/// their upload is recorded beside the kernel that reads them. The device work
+/// that remains — re-serialising a slot whose chunk table changed, and the
+/// first layer's position map — pauses the recording on its own. Wrapping the
+/// whole build in an eager section instead cut every attention layer's segment
+/// twice and left the build's host time on the GPU's critical path: on
+/// Flash-Next's single-session verify, ~80 µs of idle per attention layer.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn build_slot_headers(
     caches: &[&mut KvCache],
     q_lens: &[usize],
@@ -193,6 +206,8 @@ fn build_slot_headers(
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
     offsets: &[usize],
     rope: &RopeRungs,
+    device: &Device,
+    wave: Option<&WaveGeneration>,
 ) -> Result<SlotHeaderUpload> {
     let t_build = profile_now();
     if caches.len() != offsets.len() || caches.len() != q_lens.len() {
@@ -575,15 +590,16 @@ fn build_slot_headers(
         .write(&mut header_buf);
     }
 
-    let mut pinned = generation.alloc(header_buf.len())?;
-    pinned.copy_from_slice(&header_buf);
-    let headers_gpu = generation.submit_resident(pinned)?;
-    let headers_ptr = headers_gpu.dev_ptr();
+    // Device memory, as the map is — every block of the kernel walks the
+    // headers before its first K/V load.
+    let n_bytes = header_buf.len();
+    let headers = wave_from_vec_ticketed(header_buf, n_bytes, device, wave.map(|w| w.ticket()))?;
+    let headers_ptr = tensor_u8_device_ptr(&headers)?;
     pipeline_record("slot:pack", t_pack);
 
     Ok(SlotHeaderUpload {
         headers_ptr,
-        _headers_gpu: headers_gpu,
+        _headers: headers,
         _pinned_gids: pinned_gids,
     })
 }
@@ -808,33 +824,31 @@ fn paged_prefill_batched_impl<'w>(
 
     let softmax_scale = 1f32 / (head_dim as f32).sqrt();
 
-    // Check storage policy to determine if reconcile is needed after prefill.
-    // Validate that any quantized storage policy is kernel-native.
-    // Reconcile and consolidation now happen once after all layers in batched_model.rs.
-    let needs_reconcile = {
+    // Any quantized storage policy must be kernel-native.
+    {
         let first = caches
             .first()
             .ok_or_else(|| candle::Error::Msg("expected non-empty caches".into()))?;
-        match first.k_cache().chunked_storage_policy() {
-            Some(policy) => {
-                let is_quant = policy.is_quantized();
-                if is_quant && !policy.is_kernel_native() {
-                    candle::bail!(
-                        "storage policy uses a quantized format that the kernel cannot read natively; \
-                         all quantized formats must be kernel-native"
-                    );
-                }
-                is_quant
+        if let Some(policy) = first.k_cache().chunked_storage_policy() {
+            if policy.is_quantized() && !policy.is_kernel_native() {
+                candle::bail!(
+                    "storage policy uses a quantized format that the kernel cannot read natively; \
+                     all quantized formats must be kernel-native"
+                );
             }
-            None => false,
         }
-    };
+    }
 
-    // Built on the host and uploaded: eager, behind everything recorded so far.
-    let header_upload = {
-        let _eager = q.device().eager()?;
-        build_slot_headers(caches, q_lens, generation, shared_pm, offsets, rope)?
-    };
+    let header_upload = build_slot_headers(
+        caches,
+        q_lens,
+        generation,
+        shared_pm,
+        offsets,
+        rope,
+        q.device(),
+        wave,
+    )?;
     let headers_ptr = header_upload.headers_ptr;
 
     g_pack.end();
@@ -872,31 +886,13 @@ fn paged_prefill_batched_impl<'w>(
     KvCache::commit_written_tokens_batch(caches, offsets, q_lens)?;
     pipeline_record("prefill:commit", t_commit);
 
-    // After each prefill layer, eagerly quantize all fully-sealed chunks so that
-    // float F16 arenas are freed as we go rather than accumulating to OOM.
-    // The partial tail chunk (still being written to) is skipped automatically by
-    // reconcile_multi, which only processes blocks where seq_len / CHUNK_SIZE > blk.
-    //
-    // After reconcile, float arenas hold only the sparse tail chunks. Consolidate
-    // them into the minimum number of arenas and CUDA-free the rest. This is critical
-    // for large batches (e.g. Q4_0×460) where uncompacted tail arenas would exceed
-    // the available VRAM budget (each F16 arena is 64 MiB regardless of occupancy).
-    // Reconcile and consolidate now happen once after all layers complete,
-    // in batched_model.rs. Per-layer reconcile was removed to avoid paying
-    // the quantization cost on every layer during prefill.
-
-    // Prefill and any post-prefill migrations are now complete. For pure-float
-    // paths we can materialize the persistent decode slot buffers eagerly here.
-    // Quantized paths are left to rebuild lazily on the next decode metadata
-    // sync so they always see the final post-reconcile chunk routing.
-    if !needs_reconcile {
-        let t_prime = profile_now();
-        // Builds the slot buffers on the host and may claim slabs for them:
-        // eager, behind the recorded launches.
-        let _eager = q.device().eager()?;
-        KvCache::prime_chunked_decode_slots_batch(caches)?;
-        pipeline_record("prefill:prime", t_prime);
-    }
+    // Nothing is primed for the decode that follows. The slot-state buffers
+    // this launch's headers synced are the ones decode reads, and the commit
+    // above marked them for decode's own sync to bring the writer region up to
+    // date; decode claims its write chunk before its forward begins
+    // (`ensure_for_batch_entries_all`). Priming here instead was a second
+    // eager section per attention layer, every forward, for a buffer that
+    // already existed.
 
     // Return the attention output FLAT-packed in cu_seqlens_q token order:
     // [total_q, n_head, head_dim]. The caller reshapes to [total_q, n_head*head_dim]
@@ -1721,16 +1717,6 @@ pub fn paged_glue_attn<'w>(
         (k_compute, first.k_cache().chunked_max_blocks())
     };
 
-    let needs_reconcile = {
-        let first = caches
-            .first()
-            .ok_or_else(|| candle::Error::Msg("expected non-empty caches".into()))?;
-        match first.k_cache().chunked_storage_policy() {
-            Some(policy) => policy.is_quantized(),
-            None => false,
-        }
-    };
-
     let q_packed = if q.is_contiguous() {
         q.clone()
     } else {
@@ -1784,10 +1770,16 @@ pub fn paged_glue_attn<'w>(
     // other 47 reuse the device buffer, skipping the host build and the PCIe
     // copy that otherwise dominate this span.
     let zero_q = vec![0usize; b_sz];
-    let header_upload = {
-        let _eager = device.eager()?;
-        build_slot_headers(caches, &zero_q, generation, shared_pm, &kv_lens_host, rope)?
-    };
+    let header_upload = build_slot_headers(
+        caches,
+        &zero_q,
+        generation,
+        shared_pm,
+        &kv_lens_host,
+        rope,
+        device,
+        wave,
+    )?;
     g_hdr.end();
 
     let g_kernel = gpu_span("glue:kernel", device);
@@ -1825,15 +1817,8 @@ pub fn paged_glue_attn<'w>(
     // would double-count the slot length and, because `writer_start` points past
     // the last chunk, `set_len`'s `writer_start.min(n-1)` fallback would inflate
     // the final gap chunk's usage — desyncing the slot and overflowing the next
-    // prefill's write region. `header_upload` stays alive until return.
-    if !needs_reconcile {
-        let t_prime = profile_now();
-        // Builds the slot buffers on the host and may claim slabs for them:
-        // eager, behind the recorded launches.
-        let _eager = device.eager()?;
-        KvCache::prime_chunked_decode_slots_batch(caches)?;
-        pipeline_record("prefill:prime", t_prime);
-    }
+    // prefill's write region. Nothing is primed for the decode that follows,
+    // for the reason `paged_prefill_batched_impl` gives.
     drop(header_upload);
     // Returned at the ARENA's compute dtype, which is not always the caller's
     // activation dtype — and deliberately NOT reconciled here.

@@ -5,8 +5,8 @@
 //!
 //! The expert grid on this configuration is **fully resident**: 10,496 slots
 //! for 41 layers × 256 experts, `free_slots=0`, `warm_slots=0`, one permanent
-//! slot per expert. Nothing evicts, nothing is re-uploaded, and the dispatch
-//! tables hold a fixed address per expert for the life of the process. So an
+//! slot per expert. Nothing evicts, nothing is re-uploaded, and every expert's
+//! live-table entry names the same VRAM slot for the life of the process. So an
 //! expert's bytes are written once, during the startup fill, and should never
 //! change again.
 //!
@@ -25,7 +25,7 @@
 //!
 //! The alternative is 23 GiB across PCIe. `run_fletcher32` reads the weights
 //! where they already live and returns four bytes per slot, and it takes the
-//! (pointer, length) plan model that the dispatch tables already are — so the
+//! (pointer, length) plan model that the live table's entries already are — so the
 //! pointers the GEMM dereferences are literally the pointers that get
 //! fingerprinted, with no separate accounting to drift.
 //!

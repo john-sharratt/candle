@@ -55,6 +55,7 @@ extern "C" __global__ void arange_i64(int64_t*, int64_t, int64_t, size_t);
 // Forward declarations: copy2d kernels (all are __global__)
 // Signature: (src, dst, d1, d2, src_s, dst_s)
 // =============================================================================
+extern "C" __global__ void copy_bytes(const uint8_t*, uint8_t*, uint32_t);
 extern "C" __global__ void copy2d_u8(const uint8_t*, uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 extern "C" __global__ void copy2d_u32(const uint32_t*, uint32_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 extern "C" __global__ void copy2d_i64(const int64_t*, int64_t*, uint32_t, uint32_t, uint32_t, uint32_t);
@@ -231,6 +232,29 @@ extern "C" void run_copy2d_op(
             copy2d_i64<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const int64_t*)src, (int64_t*)dst, d1, d2, src_s, dst_s);
             break;
     }
+}
+
+// =============================================================================
+// Byte copy on a power-of-two grid
+// =============================================================================
+// The grid is the power of two at or above the blocks `n` needs, capped at
+// COPY_BYTES_MAX_GRID; the kernel strides over whatever that leaves. So copies
+// of nearby sizes launch identically — which is what lets a recorded graph
+// that carries one fold into its executable in place when the size moves, a
+// growing table included, where a grid sized to `n` made every new size a new
+// graph shape.
+#define COPY_BYTES_MAX_GRID 1024u
+
+static inline unsigned int copy_bytes_grid(uint32_t n) {
+    unsigned int need = (unsigned int)grid_size(n);
+    unsigned int grid = 1;
+    while (grid < need && grid < COPY_BYTES_MAX_GRID) grid <<= 1;
+    return grid;
+}
+
+extern "C" void run_copy_bytes(const void* src, void* dst, uint32_t n, void* stream) {
+    copy_bytes<<<copy_bytes_grid(n), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
+        (const uint8_t*)src, (uint8_t*)dst, n);
 }
 
 // =============================================================================

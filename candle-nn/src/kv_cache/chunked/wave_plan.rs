@@ -299,6 +299,11 @@ impl WaveWidth {
 /// reach of a build without CUDA; a CUDA test holds the two equal.
 pub const DELTA_NET_SCAN_CHUNK: usize = 64;
 
+/// Bytes of one paged-attention `SlotHeader` — `sizeof(SlotHeader)` in
+/// `candle-kernels/src/paged-decode/slot_types.cuh`. A prefill launch carves one
+/// per sequence from its attention span ([`WaveBuffer::PrefillSlotHeaders`]).
+pub const SLOT_HEADER_BYTES: usize = 32;
+
 /// The width the FFN carries its intermediates in, for activations of `act`.
 ///
 /// An F16 activation is widened to BF16 for the SwiGLU, whose range can exceed
@@ -740,6 +745,10 @@ pub enum WaveBuffer {
     KBias,
     /// `v + bv`, as [`Self::QBias`].
     VBias,
+    /// The `SlotHeader`s a multi-token attention launch reads first, one per
+    /// sequence, built on the host and uploaded beside the launch. Prefill and
+    /// glue each build their own set, so a wave carrying both carves twice.
+    PrefillSlotHeaders,
     /// The attention context in its **dense** form, which prefill and glue
     /// write — and decode too, on a stack whose decode kernel emits no q8
     /// context ([`ModelGeometry::decode_q8_context`]).
@@ -1535,6 +1544,7 @@ impl WaveBuffer {
             | Self::QBias
             | Self::KBias
             | Self::VBias
+            | Self::PrefillSlotHeaders
             | Self::AttnOutput
             | Self::DecodeContext
             | Self::OProjOperand
@@ -1779,6 +1789,14 @@ impl WaveBuffer {
             // could not say.
             // A decode row's context is dense too where the decode kernel does
             // not emit q8 (`decode_q8_context` off — Qwen2's head dim 64).
+            // One header per prefill or glue sequence — at least one where any
+            // prefill row runs — in two carves when a wave runs both groups.
+            Self::PrefillSlotHeaders if w.prefill_rows > 0 => dense(
+                w.prefill_spans.max(1) * SLOT_HEADER_BYTES + BUMP_ALIGNMENT,
+                1,
+                DType::U8,
+            ),
+            Self::PrefillSlotHeaders => dense(0, 0, DType::U8),
             Self::AttnOutput if g.decode_q8_context => {
                 dense(w.prefill_rows, g.attn_cols(), g.act_dtype)
             }
@@ -2523,6 +2541,14 @@ impl WavePlan {
 mod tests {
     use super::*;
     use crate::kv_cache::WAVE_SPAN_BYTES;
+
+    /// What a prefill's slot headers add to its attention chain over `spans`
+    /// sequences: a header each and the glue group's room beside them, and the
+    /// alignment the carve after them starts on — one sequence's 288 bytes walk
+    /// as 512.
+    fn prefill_headers(spans: usize) -> usize {
+        (spans * SLOT_HEADER_BYTES + BUMP_ALIGNMENT).div_ceil(BUMP_ALIGNMENT) * BUMP_ALIGNMENT
+    }
 
     /// A prefill wave of `rows` tokens over one sequence.
     ///
@@ -3391,8 +3417,13 @@ mod tests {
         );
         assert_eq!(WaveBuffer::OProjOutput.bytes(&g, rows), 4_300_800);
         assert_eq!(
+            WaveBuffer::PrefillSlotHeaders.bytes(&g, rows),
+            rows.prefill_spans * SLOT_HEADER_BYTES + BUMP_ALIGNMENT,
+            "a header per sequence, and room for a glue group's beside them"
+        );
+        assert_eq!(
             plan.chain_bytes(Chain::Attention, rows),
-            88_435_200 + 4_838_400 + 4_300_800,
+            88_435_200 + 4_838_400 + 4_300_800 + prefill_headers(rows.prefill_spans),
             "a pure-prefill wave must price its generation exactly"
         );
         assert_eq!(
@@ -4268,7 +4299,7 @@ mod tests {
         let prefill_only = plan.phase_bytes(LayerPhase::Attention, WaveWidth::prefill(rows, 1));
         assert_eq!(
             prefill_only,
-            MEASURED_ATTN_PREFILL_PER_ROW * rows,
+            MEASURED_ATTN_PREFILL_PER_ROW * rows + prefill_headers(1),
             "a wave with no decode rows must price the prefill chain exactly"
         );
 

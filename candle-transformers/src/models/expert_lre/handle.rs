@@ -140,9 +140,10 @@ use candle::vram::PAGEABLE_RESERVE;
 /// How many warm slots to ask for: **every expert the machine will actually
 /// give room for.**
 ///
-/// The target is the whole model. A miss that reaches the cold tier is a
-/// synchronous NVMe read on the pipeline thread, so the warm tier is not an
-/// optimisation over the pack — it is what keeps the pack off the critical path.
+/// The target is the whole model. A miss that reaches the cold tier is an NVMe
+/// read by the stager that the expert GEMM's worker blocks spin on, where a warm
+/// miss is a pinned read nothing waits for — so the warm tier is not an
+/// optimisation over the pack, it is what keeps the pack off the critical path.
 /// The first build of this sized it as a *share* of spare RAM (half), which left
 /// 2,241 of 6,144 experts warm and sent **64 % of every miss to disk**;
 /// aggregate throughput fell by a third against the two-tier cache it replaced.
@@ -769,8 +770,8 @@ impl ExpertCache {
 
         let stats = PipelineStats::new_shared();
         // Seed the resident-expert VRAM gauge with the startup footprint (occupied
-        // slots × slot size) so it reads correctly before the first classify
-        // refreshes it. `inner` + `layer_geometries` are still in scope here,
+        // slots × slot size) so it reads correctly before the pipeline thread's
+        // first per-layer refresh. `inner` + `layer_geometries` are still in scope here,
         // before they move into `PipelineState` below.
         #[cfg(feature = "cuda")]
         {
@@ -802,26 +803,24 @@ impl ExpertCache {
                 s.warm_paged_slots = warm.paged_slots();
                 s.total_experts = num_moe_layers * experts_per_layer;
                 s.moe_layers = num_moe_layers;
-                // **The zone's shape, seeded here and not left to the first classify.**
+                // **The zone's shape, seeded here and not left to the pipeline thread.**
                 //
                 // These four are what `WeightPlan::from_stats` needs, and it refuses the
                 // whole gauge set if any reads zero — correctly, since a zero slot size
-                // makes a routed expert look free. They used to be written only by
-                // `classify_and_load`, which on an all-resident cache does no loading
-                // worth the name: nothing streams, so nothing refreshed them, so they
-                // stayed at zero for the process lifetime.
+                // makes a routed expert look free. The pipeline thread refreshes them
+                // per routed layer (`publish_gauges`), but the scheduler reads them
+                // before the first forward has routed anything.
                 //
-                // The consequence was an inversion. With no weight plan the scheduler's
-                // rate planner cannot be armed, and admission falls back to one prefill
-                // per pass — so a card *large enough to hold the whole checkpoint* ran
-                // waves one row wide, while a card small enough to stream experts
-                // published gauges, planned, and batched. Measured on the 30B-A3B at 72
-                // GiB: `decode seqs avg=1.0 max=1` and 32 t/s against a batched ceiling
-                // of 518.
+                // Left at zero they invert admission. With no weight plan the
+                // scheduler's rate planner cannot be armed, and admission falls back to
+                // one prefill per pass — so a card *large enough to hold the whole
+                // checkpoint* runs waves one row wide. Measured on the 30B-A3B at 72
+                // GiB with the gauges unseeded: `decode seqs avg=1.0 max=1` and 32 t/s
+                // against a batched ceiling of 518.
                 //
                 // Every term is known here — the zone is carved before this point and
                 // `slot_bytes` is the same figure the resident gauge above is a multiple
-                // of — so there was never a reason to wait for a classify.
+                // of.
                 let zone_slot_bytes = inner.zone.slot_bytes();
                 s.expert_slot_bytes = zone_slot_bytes;
                 s.zone_bytes = inner.zone.capacity() * zone_slot_bytes;
@@ -961,9 +960,9 @@ impl ExpertCache {
 
     /// Live VRAM bytes held by resident expert slots (`occupied_slots ×
     /// slot_size`) — the model's **time-varying** MoE weight footprint. Rises as
-    /// experts load into VRAM and falls as they stream out to pinned RAM under
-    /// pressure. Read lock-free from the shared stats gauge (seeded at
-    /// construction, refreshed each classify). `0` on non-CUDA / no-expert models.
+    /// experts are promoted into VRAM and falls as they are evicted or the zone
+    /// concedes ground. Read from the shared stats gauge (seeded at
+    /// construction, refreshed by the pipeline thread each routed layer). `0` on non-CUDA / no-expert models.
     pub fn resident_vram_bytes(&self) -> usize {
         PipelineStats::snapshot(&self.stats).resident_vram_bytes
     }
@@ -1082,16 +1081,13 @@ impl ExpertCache {
     /// relocates expert slots, and a wave in flight may be reading either, so
     /// `set_weight_floor` refuses while a wave generation is open on the span.
     ///
-    /// This used to be driven from the pipeline thread's `post_compute`, which
-    /// runs the instant a MoE layer's work is answered — with the forward thread
-    /// still inside `ffn_residual` holding that layer's FFN wave guard. So it was
-    /// asked forty-eight times a forward from inside the wave, and whether it
-    /// landed came down to a race with the forward thread's phase transitions:
-    /// refused in the common case, and in the narrow window between one layer's
-    /// guard dropping and the next one's opening, granted — at the cost of a
-    /// device-wide quiesce in the middle of a forward. Neither outcome is one the
-    /// engine should depend on, which is why the caller is now the wave loop's
-    /// own inter-forward gap, alongside the transient tier's hand-back.
+    /// The caller is the wave loop's own inter-forward gap, alongside the
+    /// transient tier's hand-back — never the pipeline thread. That thread
+    /// serves a routed layer while the forward thread is still inside
+    /// `ffn_residual` holding the layer's FFN wave guard, so asking from there
+    /// would be refused in the common case and, in the narrow window between one
+    /// layer's guard dropping and the next one's opening, granted at the cost of
+    /// a device-wide quiesce in the middle of a forward.
     ///
     /// Answers with the bytes taken — always zero, since this direction concedes
     /// nothing; the value exists so the two directions share a signature.
@@ -1181,12 +1177,12 @@ impl ExpertCache {
     }
 
     /// Span bytes the weight zone could concede to the KV side on demand —
-    /// the gauge the pipeline thread publishes each classify
+    /// the gauge the pipeline thread publishes each routed layer
     /// (`PipelineStats::zone_cedeable_bytes`). Feeds the prefill width cap:
     /// the elastic boundary cedes this ground to stuck KV claims
     /// (`request_kv_ground`), so a wave sized against it is admissible even
     /// when little KV ground is standing free. Reads 0 before the first
-    /// classify — the cold-start waves are far below any cap that matters.
+    /// routed layer — the cold-start waves are far below any cap that matters.
     pub fn cedeable_span_bytes(&self) -> usize {
         PipelineStats::snapshot(&self.stats).zone_cedeable_bytes
     }

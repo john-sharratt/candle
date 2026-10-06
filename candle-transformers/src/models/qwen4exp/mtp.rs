@@ -48,7 +48,7 @@
 //! `mtp_use_dedicated_embeddings: false` — which is what makes the head file's
 //! own copies safe to drop at merge.
 
-use candle::quantized::Int8Mode;
+use candle::quantized::{GgmlDType, Int8Mode};
 use candle::wave_provenance::WaveTicket;
 use candle::{Device, Result, Tensor};
 
@@ -58,7 +58,7 @@ use super::engine::GpuLayer;
 use super::hyper::ko::HcWeightsKo;
 use super::hyper::{hc_grouped_norm, hc_mix, HcWeights};
 use crate::models::latent_moe::GgufModel;
-use crate::models::quantized_matmul::QMatMul;
+use crate::models::quantized_matmul::{QMatMul, WeightResidency};
 use crate::quantized_nn::RmsNorm;
 
 /// The `[enorm ; mixer(hnorm)] → eh_proj` input assembly.
@@ -99,9 +99,36 @@ pub struct MtpHead {
     /// inject), and like it, the output norm itself — KO-quantized as the
     /// trunk's modules are.
     pub mixer: HcWeightsKo,
+    /// The LM head the walk proposes through: the trunk's `output` table at
+    /// [`DRAFT_LM_HEAD_FORMAT`] (see there).
+    pub lm_head: QMatMul,
     /// Trunk block index the head sits at, which is also its tensor prefix.
     pub layer_index: usize,
 }
+
+/// The format of the draft walk's LM head in an int8 session.
+///
+/// A proposal is only ever an argmax the verify forward re-scores through the
+/// trunk's own head, so the draft's copy of the table may be narrower than the
+/// trunk's without changing a single emitted token — it can only move the
+/// acceptance rate. And the table is the walk's widest read: 248,320 rows that
+/// every drafted position streams whole, ~0.8 GB at the checkpoint's `Q8_0`,
+/// one of the largest kernels in a single-session step. At `Q4_KO` it is half
+/// the bytes.
+///
+/// Measured on the single-session story decode (RTX PRO 5000, ceiling 8):
+///
+/// | draft table | ms/step | accepted/step | t/s |
+/// |---|---:|---:|---:|
+/// | `Q8_KO` (the trunk's) | 31.2 | 7.50 | 237 |
+/// | `Q4_KO` | 29.4 | 7.50 | 254 |
+/// | `Q3_KO` | 29.3 | 7.73 | 262 |
+///
+/// `Q3_KO` buys no step time over `Q4_KO` — the kernel stops being bound by
+/// the table's bytes there — and its higher rate is one story's acceptance,
+/// which a narrower table moves in either direction. `Q4_KO` takes the bytes
+/// and leaves the proposals where the trunk's table put them.
+const DRAFT_LM_HEAD_FORMAT: GgmlDType = GgmlDType::Q4_KO;
 
 /// The head's own dense weights, before its block is attached.
 ///
@@ -117,6 +144,7 @@ pub struct MtpHead {
 pub struct MtpDense {
     input: MtpInput,
     mixer: HcWeightsKo,
+    lm_head: QMatMul,
     layer_index: usize,
 }
 
@@ -127,6 +155,7 @@ impl MtpDense {
             input: self.input,
             block,
             mixer: self.mixer,
+            lm_head: self.lm_head,
             layer_index: self.layer_index,
         }
     }
@@ -137,11 +166,17 @@ impl MtpDense {
     /// the trunk does, because a drafted position and the wave position that
     /// later replaces it must agree — or the K/V the draft attended over and the
     /// K/V the verify wrote disagree on a token both accepted.
+    ///
+    /// `trunk_head` is the trunk's LM head and the tensor it was read from. An
+    /// int8 session re-reads that tensor into the walk's own narrower table
+    /// ([`DRAFT_LM_HEAD_FORMAT`]); a session off the int8 path has no KO twin to
+    /// narrow to, and shares the trunk's.
     pub fn load(
         g: &mut GgufModel,
         cfg: &Qwen4ExpConfig,
         eps: f64,
         int8mode: Int8Mode,
+        trunk_head: (&str, &QMatMul),
         device: &Device,
     ) -> Result<Self> {
         let li = cfg.num_layers;
@@ -174,9 +209,21 @@ impl MtpDense {
             )?,
             int8mode,
         )?;
+        let (head_name, trunk_lm_head) = trunk_head;
+        let lm_head = if int8mode.is_int8() {
+            QMatMul::from_qtensor_narrowed(
+                g.qtensor(head_name, device)?,
+                int8mode,
+                WeightResidency::Span,
+                DRAFT_LM_HEAD_FORMAT,
+            )?
+        } else {
+            trunk_lm_head.clone()
+        };
         Ok(Self {
             input,
             mixer,
+            lm_head,
             layer_index: li,
         })
     }

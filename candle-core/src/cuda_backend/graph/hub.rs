@@ -27,7 +27,7 @@
 //! does not. A wave whose shape, tier placement or launch scalars differ from
 //! the last one therefore replays correctly with no key and no epoch to check.
 
-use super::slot::ExecSlot;
+use super::slot::{ExecSlot, Folded};
 use super::staging::StagingRing;
 use super::GraphError;
 use crate::cuda_backend::{CudaDevice, WrapErr};
@@ -48,6 +48,9 @@ pub struct CaptureStats {
     pub segments: u64,
     /// Segments folded into an existing executable in place.
     pub updated: u64,
+    /// Of those, the ones folded into an executable last shaped differently —
+    /// grids or functions rewritten as well as arguments, the costly fold.
+    pub reshaped: u64,
     /// Segments that needed a fresh instantiation.
     pub instantiated: u64,
     /// Graph nodes launched — kernels, memsets, device copies and event
@@ -396,14 +399,17 @@ impl CaptureHub {
         }
         let on = super::ComputeStream::from_stream(compute.clone());
         // SAFETY: the capture's own graph; `fold` takes ownership.
-        let (exec, updated) = unsafe { st.slots[segment].fold(graph, &on, nodes)? };
+        let (exec, folded) = unsafe { st.slots[segment].fold(graph, &on, nodes)? };
         exec.launch(&on)?;
         st.stats.segments += 1;
         st.stats.nodes += nodes as u64;
-        if updated {
-            st.stats.updated += 1;
-        } else {
-            st.stats.instantiated += 1;
+        match folded {
+            Folded::InPlace => st.stats.updated += 1,
+            Folded::Reshaped => {
+                st.stats.updated += 1;
+                st.stats.reshaped += 1;
+            }
+            Folded::Instantiated => st.stats.instantiated += 1,
         }
         Ok(())
     }

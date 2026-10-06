@@ -2,8 +2,9 @@
 //!
 //! The decode hot path allows exactly one readback per token — the sampler.
 //! Every other D2H transfer in the wave forward is counted here so tests can
-//! assert the budget, which is zero: the MoE routing reaches the streaming
-//! `ExpertCache` as an async per-expert summary copy, not a blocking read.
+//! assert the budget, which is zero: the MoE routing reaches the
+//! `ExpertCache`'s host threads as a per-expert summary `moe_bucketize` writes
+//! into mapped pinned memory, not a blocking read.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

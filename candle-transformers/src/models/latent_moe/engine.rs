@@ -3,7 +3,7 @@
 //! This is the **fast** path (vs the block-streaming `StreamingModel` reference): the
 //! non-expert weights (embedding, attention, mHC params, norms, router, shared experts —
 //! ~8 GB) are resident in VRAM, and the 147 GB of routed MXFP4 experts live in the shared
-//! [`ExpertCache`] (VRAM hot pool + pinned host RAM, reordered to the 4-bit MXFP4_KO
+//! [`ExpertCache`] (VRAM hot pool + pinned host RAM + the NVMe pack, reordered to the 4-bit MXFP4_KO
 //! exponent-collapse int8 twin at stage-in — an exact byte-permute, no requant). The forward reuses the **validated** decode math (`Attention` /
 //! `HyperConnection` / `Gate`, all locked against `model.py`), but each layer's routed MoE
 //! runs against resident experts instead of re-reading them from disk every forward — the
@@ -499,8 +499,10 @@ impl Engine {
 
     /// Batched MoE over `nt` rows. The routed experts run through
     /// [`ExpertCache::forward_routed`], which never waits on the host: the
-    /// routing reaches the pipeline thread as a per-expert summary, and the
-    /// gate GEMM waits on the device for any expert still loading.
+    /// routing reaches the pipeline thread as a per-expert summary, an expert
+    /// in pinned memory is copied into VRAM scratch by the expert GEMM's worker
+    /// blocks, and only a cold expert's workers wait — on the stager publishing
+    /// it.
     ///
     /// `token_ids` is the rows' `[nt]` U32 ids on the device — uploaded once per
     /// wave by the caller, because every layer routes the same rows.

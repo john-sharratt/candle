@@ -1720,14 +1720,31 @@ impl ChunkedKvBacking {
     /// all 48 layers onto ONE position map, so the same probe carries the
     /// layout each layer would produce and [`Self::unify_decode_layout`]
     /// establishes the invariance that map depends on.
+    ///
+    /// **Called from inside recorded waves** — every draft-walk step builds its
+    /// metadata in the recording — so the probe is all the steady state does,
+    /// and anything past it runs in an eager section. Allocating a chunk can
+    /// create an arena, compact, or reconcile a diverged writer chunk, and none
+    /// of that is legal on a thread recording a wave: measured on Flash-Next's
+    /// four-sequence draft walk, a step whose tail needed a fresh block despite
+    /// the walk's up-front ensure invalidated the capture from here.
     pub fn ensure_for_batch_entries_all(
         backings: &[ChunkedKvBacking],
         entries: &[(usize, usize)],
         add: usize,
     ) -> Result<()> {
+        let probes = backings
+            .iter()
+            .map(|b| b.probe_decode_entries(entries, add))
+            .collect::<Result<Vec<_>>>()?;
+        let diverged = probes.windows(2).any(|w| w[0].1 != w[1].1);
+        let work = diverged || probes.iter().any(|(needs_work, _)| *needs_work);
+        let _eager = match (work, backings.first()) {
+            (true, Some(b)) => Some(b.device().eager()?),
+            _ => None,
+        };
         let mut layouts: Vec<Vec<Option<DecodeLayout>>> = Vec::with_capacity(backings.len());
-        for b in backings {
-            let (needs_work, layout) = b.probe_decode_entries(entries, add)?;
+        for (b, (needs_work, layout)) in backings.iter().zip(probes) {
             if needs_work {
                 b.ensure_for_batch_entries(entries, add)?;
                 // The allocation changed this layer's structure, so the layout

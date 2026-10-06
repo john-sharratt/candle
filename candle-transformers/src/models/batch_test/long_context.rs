@@ -211,12 +211,19 @@ pub enum DepthTask {
     /// Rewrite the story that follows the padding, renaming its character.
     /// Validated as [`TestMode::StoryRewrite`].
     Rewrite,
+    /// Write a long essay of the model's own — free text from first token to
+    /// last, so a decode of any length measures a drafter guessing.
+    /// `Coherence`'s two sentences end within ~40 tokens, and a longer decode
+    /// of it runs on past the turn's end into whatever the model emits after
+    /// `<|im_end|>`, which is not free text and not what a drafter is for.
+    /// Validated as [`TestMode::CoherenceCheck`].
+    Essay,
 }
 
 impl DepthTask {
     fn test_mode(self) -> TestMode {
         match self {
-            Self::Coherence => TestMode::CoherenceCheck,
+            Self::Coherence | Self::Essay => TestMode::CoherenceCheck,
             Self::Rewrite => TestMode::StoryRewrite,
         }
     }
@@ -236,6 +243,12 @@ fn depth_prompt(tokenizer: &Tokenizer, depth: usize, task: DepthTask) -> String 
         // That is the whole point of the row: hold the task fixed and vary
         // depth, so the two tables differ in one axis rather than three.
         DepthTask::Rewrite => format!("{padding}\n\n{}", story_prompt()),
+        DepthTask::Essay => format!(
+            "{padding}\n\nGreet {{INSERT_NAME}} by name in one short sentence. Then \
+             write a long, detailed essay of at least eight paragraphs on how \
+             lighthouses were built, kept and lit over the last three centuries, \
+             and what replaced their keepers.",
+        ),
     }
 }
 

@@ -18,6 +18,8 @@ use std::sync::Arc;
 pub struct GraphExec {
     exec: sys::CUgraphExec,
     nodes: usize,
+    /// The [shape](audit) it was last instantiated or folded at.
+    shape: u64,
     ctx: Arc<CudaContext>,
 }
 
@@ -37,12 +39,21 @@ impl Drop for Template {
 }
 
 /// Check `graph` holds exactly `expected` nodes, every one of them a kernel, a
-/// memset, a device-to-device copy or an event record.
+/// memset, a device-to-device copy or an event record, and answer its shape.
 ///
 /// A host copy, a host callback or a graph allocation recorded inside a region
 /// is a launcher that uploaded, read back or allocated during the capture;
 /// replaying it would repeat that side effect against stale host state.
-pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<()> {
+///
+/// **The shape** is everything about the graph but its arguments: each node's
+/// kind in order, and for a kernel its function, grid, block and shared memory,
+/// for a memset or copy its extent. Two captures of one shape differ only in
+/// addresses and scalars, which is the cheap fold — `cuGraphExecUpdate` then
+/// rewrites arguments and nothing else. Folding a capture into an executable
+/// last shaped differently also succeeds, at several times the cost: measured
+/// on Flash-Next's adaptive-depth verify, 200–500 µs a segment against 2–60.
+pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<u64> {
+    let mut shape = ShapeFold::default();
     let mut recorded = 0usize;
     // SAFETY: a null node array asks only for the count.
     unsafe { sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut recorded).result() }.w()?;
@@ -62,12 +73,39 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<()> {
         let mut kind = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL;
         // SAFETY: a node of `graph`.
         unsafe { sys::cuGraphNodeGetType(node, &mut kind).result() }.w()?;
+        shape.word(kind as u64);
         match kind {
+            sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL => {
+                let mut p = MaybeUninit::<sys::CUDA_KERNEL_NODE_PARAMS>::uninit();
+                // SAFETY: a kernel node of `graph`; the driver fills the parameters.
+                let p = unsafe {
+                    sys::cuGraphKernelNodeGetParams_v2(node, p.as_mut_ptr())
+                        .result()
+                        .w()?;
+                    p.assume_init()
+                };
+                shape.word(p.func as u64);
+                shape.word(u64::from(p.gridDimX) | (u64::from(p.gridDimY) << 32));
+                shape.word(u64::from(p.gridDimZ) | (u64::from(p.blockDimX) << 32));
+                shape.word(u64::from(p.blockDimY) | (u64::from(p.blockDimZ) << 32));
+                shape.word(u64::from(p.sharedMemBytes));
+            }
+            sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMSET => {
+                let mut p = MaybeUninit::<sys::CUDA_MEMSET_NODE_PARAMS>::uninit();
+                // SAFETY: a memset node of `graph`; the driver fills the parameters.
+                let p = unsafe {
+                    sys::cuGraphMemsetNodeGetParams(node, p.as_mut_ptr())
+                        .result()
+                        .w()?;
+                    p.assume_init()
+                };
+                shape.word(u64::from(p.elementSize));
+                shape.word(p.width as u64);
+                shape.word(p.height as u64);
+            }
             // An event-record node is a profiling span's timestamp, recorded
             // on purpose as external so it fires on every replay.
-            sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL
-            | sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMSET
-            | sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EVENT_RECORD => {}
+            sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EVENT_RECORD => {}
             sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMCPY => {
                 let mut p = MaybeUninit::<sys::CUDA_MEMCPY3D>::uninit();
                 // SAFETY: a memcpy node of `graph`; the driver fills every field.
@@ -82,6 +120,9 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<()> {
                 if p.srcMemoryType == sys::CUmemorytype::CU_MEMORYTYPE_DEVICE
                     && p.dstMemoryType == sys::CUmemorytype::CU_MEMORYTYPE_DEVICE
                 {
+                    shape.word(p.WidthInBytes as u64);
+                    shape.word(p.Height as u64);
+                    shape.word(p.Depth as u64);
                     continue;
                 }
                 let after = all[..index]
@@ -108,7 +149,32 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(shape.finish())
+}
+
+/// The shape of a graph folded one word at a time (FNV-1a over the words). A
+/// collision costs only an expensive fold, never a wrong one: the driver
+/// decides whether a fold is possible, the shape only which executable is
+/// offered it first.
+struct ShapeFold(u64);
+
+impl Default for ShapeFold {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl ShapeFold {
+    fn word(&mut self, w: u64) {
+        for b in w.to_le_bytes() {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 /// The function a kernel node launches, for naming the neighbour of a node
@@ -174,15 +240,17 @@ impl GraphExec {
         expected_nodes: usize,
     ) -> Result<Self> {
         let template = Template(graph);
-        audit(template.0, expected_nodes)?;
-        Self::instantiate_audited(template, on, expected_nodes)
+        let shape = audit(template.0, expected_nodes)?;
+        Self::instantiate_audited(template, on, expected_nodes, shape)
     }
 
-    /// Instantiate and upload a template [`audit`] has already passed.
+    /// Instantiate and upload a template [`audit`] has already passed as
+    /// `shape`.
     pub(super) fn instantiate_audited(
         template: Template,
         on: &ComputeStream,
         expected_nodes: usize,
+        shape: u64,
     ) -> Result<Self> {
         let mut exec: sys::CUgraphExec = std::ptr::null_mut();
         // SAFETY: `graph` is valid; flags 0 is the default instantiation.
@@ -192,6 +260,7 @@ impl GraphExec {
         let me = Self {
             exec,
             nodes: expected_nodes,
+            shape,
             ctx: on.context(),
         };
         // Uploading ahead of the first launch keeps the one-time setup off the
@@ -218,22 +287,23 @@ impl GraphExec {
         expected_nodes: usize,
     ) -> Result<bool> {
         let template = Template(graph);
-        audit(template.0, expected_nodes)?;
-        if self.try_fold(&template, on, expected_nodes)? {
+        let shape = audit(template.0, expected_nodes)?;
+        if self.try_fold(&template, on, expected_nodes, shape)? {
             return Ok(true);
         }
-        *self = Self::instantiate_audited(template, on, expected_nodes)?;
+        *self = Self::instantiate_audited(template, on, expected_nodes, shape)?;
         Ok(false)
     }
 
-    /// Fold an audited `template` into this executable's parameters in place.
-    /// `false` when the driver refuses it — a different topology or different
-    /// kernels — and the executable is left as it was.
+    /// Fold an audited `template` of `shape` into this executable's parameters
+    /// in place. `false` when the driver refuses it — a different topology or
+    /// different kernels — and the executable is left as it was.
     pub(super) fn try_fold(
         &mut self,
         template: &Template,
         on: &ComputeStream,
         expected_nodes: usize,
+        shape: u64,
     ) -> Result<bool> {
         if expected_nodes != self.nodes {
             return Ok(false);
@@ -246,8 +316,17 @@ impl GraphExec {
         };
         // SAFETY: a valid executable and a valid graph of the same context.
         let folded = unsafe { sys::cuGraphExecUpdate_v2(self.exec, template.0, &mut info) };
-        Ok(folded == sys::CUresult::CUDA_SUCCESS
-            && info.result == sys::CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS)
+        let ok = folded == sys::CUresult::CUDA_SUCCESS
+            && info.result == sys::CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS;
+        if ok {
+            self.shape = shape;
+        }
+        Ok(ok)
+    }
+
+    /// The [shape](audit) this executable was last instantiated or folded at.
+    pub(super) fn shape(&self) -> u64 {
+        self.shape
     }
 
     /// Replay into `on`.

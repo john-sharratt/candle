@@ -59,7 +59,7 @@ use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
 use crate::models::profile::{gpu_span, pipeline_record_duration, span};
 use crate::models::speculative_choice::{
-    AcceptWalk, SpeculativeStep, TokenChooser, TypicalAcceptance,
+    all_rows, AcceptWalk, SpeculativeStep, TokenChooser, TypicalAcceptance,
 };
 use crate::models::verify_wave::{issue_verify_wave, upload_plan_rows, VerifyPlan, WaveCoBatch};
 #[cfg(feature = "cuda")]
@@ -4355,6 +4355,18 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// What one drafted token costs relative to a step's fixed cost — the price
+    /// [`super::draft_depth::DraftDepth::budget`] weighs a depth's expected
+    /// tokens against. Carried on the model's ladder beside its ceilings
+    /// ([`super::draft_ladder::DraftLadder::token_cost`]).
+    ///
+    /// Read only when [`Self::draft_budget`] is non-zero. The default prices a
+    /// drafted token at nothing, so a drafting model that names no cost drafts
+    /// its ceiling — the ladder's own figure.
+    fn draft_token_cost(&self) -> f32 {
+        0.0
+    }
+
     /// Draft up to `max_len` speculative next-tokens for **every** sequence in the step's
     /// cohort, each following its own `committed` token, using the model's own drafter (e.g.
     /// an MTP / DSpark head). Proposals only — the caller verifies them and keeps the
@@ -4881,7 +4893,7 @@ pub trait ManagedBatchedModel {
     /// row's logits and each block's per-position next-token logits rows. Default: one batched
     /// plain decode wave + sequential [`Self::verify_block`] calls — correct for any model. A
     /// model overrides with ONE wave carrying BOTH cohorts (plain rows leading, verify rows
-    /// trailing): the per-wave fixed costs (MoE routing readbacks, expert DMA, launch overhead)
+    /// trailing): the per-wave fixed costs (every layer's launches, expert fetches)
     /// then amortize across every session AND the two cohorts stop paying two launch floors per
     /// step. Advances plain sequences by 1 and drafted sequences by their block length; the
     /// driver truncates drafted sequences back to the accepted lengths.
@@ -5367,24 +5379,48 @@ pub trait ManagedBatchedModel {
         // state along exactly the path this loop commits.
         pipeline_record_duration("spec:gather", t_gather.elapsed(), 1);
         let t_accept = std::time::Instant::now();
+        // A stateless chooser picks every scored row in one call — one launch
+        // and one readback for the step, where walking costs one of each per
+        // position, serialised: ~0.75 ms of Flash-Next's 29 ms single-session
+        // step went to nine of those round trips. The walk below commits from
+        // the picks by the same rule either way.
+        let ahead = if chooser.stateless() {
+            let all = match Tensor::cat_view(&rows, 0) {
+                Some(all) => all,
+                None => Tensor::cat(&rows, 0)?,
+            };
+            Some(chooser.choose(&all, &all_rows(&blocks, &row_of))?)
+        } else {
+            None
+        };
         let mut walk = AcceptWalk::new(&blocks);
         while !walk.finished() {
-            let walked = walk.rows();
-            // This position's rows across the cohort. Rows that sit together in
-            // their head's block are named as one view; others are gathered
-            // beside the logits on the span (`WaveBuffer::AcceptRows` — each
-            // scored row is selected at most once across the walk). No index
-            // is uploaded: the rows are named on the host, where they are known.
-            let picked: Vec<Tensor> = walk
-                .alive()
-                .iter()
-                .map(|&i| rows[row_of[i].0 + walk.position()].clone())
-                .collect();
-            let block = match Tensor::cat_view(&picked, 0) {
-                Some(block) => block,
-                None => Tensor::cat(&picked, 0)?,
+            let tokens = match &ahead {
+                Some(picks) => walk
+                    .alive()
+                    .iter()
+                    .map(|&i| picks[row_of[i].0 + walk.position()])
+                    .collect(),
+                None => {
+                    let walked = walk.rows();
+                    // This position's rows across the cohort. Rows that sit
+                    // together in their head's block are named as one view;
+                    // others are gathered beside the logits on the span
+                    // (`WaveBuffer::AcceptRows` — each scored row is selected
+                    // at most once across the walk). No index is uploaded: the
+                    // rows are named on the host, where they are known.
+                    let picked: Vec<Tensor> = walk
+                        .alive()
+                        .iter()
+                        .map(|&i| rows[row_of[i].0 + walk.position()].clone())
+                        .collect();
+                    let block = match Tensor::cat_view(&picked, 0) {
+                        Some(block) => block,
+                        None => Tensor::cat(&picked, 0)?,
+                    };
+                    chooser.choose(&block, &walked)?
+                }
             };
-            let tokens = chooser.choose(&block, &walked)?;
             walk.commit(&tokens, |i, token| (emits[i])(token))?;
         }
         let (next, kept) = walk.finish();
@@ -5624,7 +5660,7 @@ pub(crate) const MAX_PREFILL_TOKENS: usize = 8192;
 
 /// The width cap plus 25% slack — the ceiling a single prefill slab may
 /// actually reach. The asymmetry is measured: a wave's FIXED cost (~2.37 s —
-/// the full per-layer routing readback + expert sweep) is paid per slab
+/// the full sweep of every layer's launches and routed-expert fetches) is paid per slab
 /// regardless of width, while the compute-saturation cap is soft — tokens 25%
 /// past it cost the same ~0.87 ms each as the ones before. So a 128-token
 /// straggler slab after an 8192 slab spends a whole fixed sweep on 1.5% of the

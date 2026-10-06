@@ -19,12 +19,12 @@ use candle::{Result, Tensor};
 ///
 /// | Total VRAM | Mode |
 /// |------------|------|
-/// | > 64 GiB   | **all-resident** — the ENTIRE expert set (`total_experts`) lives in VRAM; no host RAM bank, no streaming, no per-layer routing readback. The drafter MoE runs fully on the GPU (`moe_bucketize` + device pointer table). |
+/// | > 64 GiB   | **all-resident** — the ENTIRE expert set (`total_experts`) lives in VRAM; no host RAM bank, no streaming. The drafter MoE runs fully on the GPU (`moe_bucketize` + a static device pointer table). |
 /// | otherwise  | disabled (`None`) — speculative decode off; the drafter is never loaded. |
 ///
-/// Streaming below 64 GiB is deliberately dropped: on a launch-bound (WDDM) box the per-layer
-/// `to_vec2` routing readback the streaming path needs is the dominant cost, so a partially-resident
-/// drafter is worse than none. All-resident removes the readback entirely.
+/// There is no partially-resident drafter: this MoE holds its experts in a static pointer table of
+/// its own, not in the paged [`ExpertCache`](crate::models::expert_lre::ExpertCache), so it has no
+/// tier to page from.
 pub fn resident_slots_for_vram(total_vram_bytes: usize, total_experts: usize) -> Option<usize> {
     const GIB: usize = 1 << 30;
     if total_vram_bytes > 64 * GIB {
@@ -39,8 +39,8 @@ pub fn resident_slots_for_vram(total_vram_bytes: usize, total_experts: usize) ->
 /// below that — see [`resident_slots_for_vram`]). With static weight addresses there is no streaming
 /// and, crucially, **no per-layer routing readback**: routing indices stay on the GPU,
 /// `moe_bucketize` turns them into the grouped-GEMM tile tables on-device, and the expert GEMMs index
-/// a device-resident pointer table (`grouped_qmatmul_dev_q8a128`). Bit-identical to the host
-/// counting-sort path; the whole draft MoE runs on the GPU with no host round-trip.
+/// a device-resident pointer table (`grouped_qmatmul_dev_q8a128`). The whole draft MoE runs on the
+/// GPU with no host round-trip.
 #[cfg(feature = "cuda")]
 pub struct DsparkStreamingMoe {
     n_experts: usize,
@@ -68,8 +68,9 @@ pub struct DsparkStreamingMoe {
 
 #[cfg(feature = "cuda")]
 impl DsparkStreamingMoe {
-    /// Load the streaming MoE for `n_blocks` drafter blocks from `m`: the router + shared expert
-    /// per block land in VRAM (`device`); the routed experts stay in host RAM as 3-D `QTensor`s.
+    /// Load the MoE for `n_blocks` drafter blocks from `m`: the router + shared expert per block
+    /// land in VRAM (`device`); the routed experts are requantized to Q2_KO and uploaded into
+    /// permanent VRAM slots, their weight pointers into per-block device tables.
     pub fn load(
         m: &mut super::loader::GgufModel,
         cfg: &super::config::Config,
@@ -213,7 +214,7 @@ impl DsparkStreamingMoe {
     /// `[b, s, dim]`. Route on GPU → `moe_bucketize` (device tile tables, **no routing readback**)
     /// → gather → grouped gate/up GEMM (device pointer table) → fused SwiGLU → grouped down GEMM →
     /// deterministic scatter, summed onto the shared expert. Every expert is VRAM-resident, so the
-    /// whole MoE runs on the GPU; bit-identical to the host counting-sort path.
+    /// whole MoE runs on the GPU.
     pub fn forward(&self, block: usize, x: &Tensor, input_ids: &Tensor) -> Result<Tensor> {
         use candle::quantized::cuda::{
             fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_qmatmul_dev_q8a128,

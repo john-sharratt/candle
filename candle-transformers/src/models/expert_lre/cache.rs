@@ -8,17 +8,17 @@
 //!
 //! Frequency-dominated, layer-aware, with pinning.  In brief:
 //!
-//! 1. **Exact-demand batch eviction** — classify counts a layer's misses
-//!    before any load and evicts exactly `misses − free` bottom-scored slots
-//!    in one scan ([`ExpertCacheInner::demand_eviction`]), scored at the
-//!    wave's real layer with the layer's own hits protected. Eviction is a
-//!    pure drop (the cold pack holds every expert; the warm tier is
-//!    immutable), so there is no copy to hide and nothing to do ahead of
-//!    time.
-//! 2. **Layer-aware forced eviction** — the per-miss backstop when the batch
-//!    scan could not free enough (pathological): prefer evicting a low-scored
-//!    expert from a layer already executed this pass (behind the wave, so it
-//!    can never cascade), then fall back to the global lowest-scored victim.
+//! 1. **Ranked victims, taken by the caller** — a promotion that finds no free
+//!    slot asks [`ExpertCacheInner::rank_victims`] for its best victims in one
+//!    scan, scored at the promoting row, and takes only those the reclaim rule
+//!    lets go. A demand miss never takes a slot: the expert kernels' worker
+//!    blocks serve it from pinned memory, and the cache learns of it only
+//!    through the promotion that follows. Eviction is a retarget (the cold
+//!    pack holds every expert; the warm tier is immutable), so there is no
+//!    copy to hide and nothing to do ahead of time.
+//! 2. **Behind-window preference** — a demand-driven promotion scores the
+//!    [`PREFETCH_EVICT_WINDOW`] layers just behind the wave at half their
+//!    frequency, so a just-executed layer's expert goes first.
 //! 3. **Early-layer pinning** — the first [`PINNED_LAYERS`] layers are never
 //!    evicted (they run first every pass with no compute to hide a reload).
 //! 4. **Windowed prefetch eviction** — speculative prefetch makes room only
@@ -148,8 +148,8 @@ pub const DECODE_REUSE_WEIGHT: f32 = 0.1;
 /// How many layers this model actually pins.
 ///
 /// [`PINNED_LAYERS`], except for a model with fewer MoE layers than that — in
-/// which case every layer is pinned and there is no evictable set, the
-/// all-resident case the cache already handles inline.
+/// which case every layer is pinned and there is no evictable set: every
+/// expert stays in VRAM and none needs a reload path.
 ///
 /// Both the pack writer and the warm-tier draw derive their skip from this, so
 /// a single number decides which experts have a reload path.
@@ -164,10 +164,12 @@ pub(crate) fn pinned_layer_count(num_moe_layers: usize) -> usize {
 /// enough to route to every expert in those layers fills
 /// `PINNED_LAYERS × experts_per_layer` slots that no victim search will ever
 /// select. Give the zone fewer slots than that and it can reach a state where
-/// every resident slot holds a pinned-layer expert: the `layer >= PINNED_LAYERS`
-/// filter in [`ExpertCacheInner::evict_lru_for`] matches nothing, and every load
-/// from then on fails with "Expert cache full, cannot evict (all pinned)" — for
-/// the life of the process, because nothing in that state can ever free a slot.
+/// every resident slot holds a pinned-layer expert: the `layer >= pinned_layers`
+/// filter in [`ExpertCacheInner::rank_victims`] matches nothing, and no
+/// promotion can take a slot from then on — for the life of the process,
+/// because nothing in that state can ever free one. Fewer slots than the pinned
+/// set itself strands a pinned expert outright: it has no warm or pack copy to
+/// be served from.
 ///
 /// The daemon reached it: the boundary retracted to 297 slots against a
 /// pinned-eligible set of 384, and the next 1,774 wave steps all failed
@@ -252,8 +254,7 @@ impl VictimKey {
 #[cfg(any(feature = "cuda", test))]
 pub(crate) const PREFETCH_EVICT_WINDOW: usize = 5;
 
-/// Mutable bookkeeping owned exclusively by the pipeline thread (threaded
-/// mode) or the Mutex (inline mode).
+/// Mutable bookkeeping owned exclusively by the pipeline thread.
 ///
 /// All fields are plain data — no `Arc`, no atomic types.
 ///
@@ -489,8 +490,7 @@ impl ExpertCacheInner {
         // full working layer, and `WeightZone::retract_to` will not go below it.
         // (The failure this guards against is measured: a zone that retracted to
         // 297 slots against a 384-expert pinned set failed 1,774 consecutive
-        // `allocate_slot` calls, because `layer >= pinned_layers` matched
-        // nothing.)
+        // slot allocations, because `layer >= pinned_layers` matched nothing.)
         debug_assert!(
             target.max(self.zone.min_capacity())
                 >= minimum_resident_slots(self.experts_per_layer).min(self.total_experts()),
@@ -822,8 +822,9 @@ mod tests {
     ///
     /// The failure this rules out is not a slow cache, it is a dead one: once
     /// every resident slot holds a pinned-layer expert, the `layer >= pinned`
-    /// filter matches nothing, and every load from then on fails — permanently,
-    /// because escaping the state requires an eviction the state forbids. The
+    /// filter matches nothing, and no promotion can take a slot from then on —
+    /// permanently, because escaping the state requires an eviction the state
+    /// forbids. The
     /// daemon reached it with 297 slots against a 384-expert pinned set and
     /// failed 1,774 consecutive forwards.
     ///
@@ -893,8 +894,8 @@ mod tests {
     /// Fill every slot of a minimum-sized cache with pinned-layer experts — the
     /// worst case, a batch wide enough to route to all of them — and the scan
     /// must still find something to evict. Below this size it cannot: the
-    /// pinned-layer filter matches nothing and every load from then on fails,
-    /// permanently, because escaping the state requires an eviction the state
+    /// pinned-layer filter matches nothing and no promotion can take a slot from
+    /// then on, permanently, because escaping the state requires an eviction the state
     /// forbids. The daemon sat at 297 slots against a 384-slot floor and failed
     /// 1,774 consecutive forwards that way.
     #[test]
@@ -1405,7 +1406,7 @@ mod tests {
     #[test]
     fn demand_eviction_caps_at_the_candidates() {
         // Asking for more than the non-pinned population frees what exists and
-        // no more — the per-miss backstop in `allocate_slot` covers the rest.
+        // no more; a promotion short of victims takes fewer slots.
         let mut inner = cache(2);
         occupy(&mut inner, 0, 1, 100, 1, 0.1); // pinned
         occupy(&mut inner, 1, 10, 101, 2, 0.2);

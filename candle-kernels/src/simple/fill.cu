@@ -44,6 +44,14 @@ void FNNAME(const TYPENAME *src, TYPENAME *dst, uint32_t d1, uint32_t d2, uint32
   copy2d(src, dst, d1, d2, src_s, dst_s); \
 } \
 
+// `n` bytes from `src` to `dst`, grid-stride, so the launch's grid is the
+// caller's choice rather than a function of `n`.
+extern "C" __global__ void copy_bytes(const uint8_t *src, uint8_t *dst, uint32_t n) {
+  for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+    dst[i] = src[i];
+  }
+}
+
 COPY2D_OP(float, copy2d_f32)
 COPY2D_OP(double, copy2d_f64)
 COPY2D_OP(uint8_t, copy2d_u8)

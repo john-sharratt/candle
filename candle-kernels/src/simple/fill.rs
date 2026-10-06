@@ -132,6 +132,11 @@ extern "C" {
         stream: *mut c_void,
     );
 
+    /// Copies `n` bytes from `src` to `dst` on a grid from a power-of-two
+    /// ladder, so copies of nearby sizes launch identically — a recorded graph
+    /// carrying one keeps its shape when the size moves.
+    pub fn run_copy_bytes(src: *const c_void, dst: *mut c_void, n: u32, stream: *mut c_void);
+
     /// Dispatches to the appropriate const_set kernel.
     ///
     /// Strided fill operation with layout info.

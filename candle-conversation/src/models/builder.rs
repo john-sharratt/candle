@@ -269,7 +269,7 @@ impl ModelBuilder {
     /// How many tokens one prefill forward carries.
     ///
     /// **A wave's fixed cost is paid per slab regardless of width** — the
-    /// per-layer routing readback and expert sweep, measured at ~2.37 s on the
+    /// sweep of every layer's launches and routed-expert fetches, measured at ~2.37 s on the
     /// 35B — while the compute-saturation cap is soft: tokens past it cost the
     /// same per token as the ones before. So the budget decides how often that
     /// fixed cost is paid, and a workload whose items are nearly as large as the

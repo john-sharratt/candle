@@ -669,16 +669,16 @@ impl Dispatch {
         let table = &*self.table;
         let n_experts = table.n_experts();
         let (gate_dtype, down_dtype) = (table.gate_dtype(row), table.down_dtype(row));
-        // **The token-tile width, chosen per launch as the host tile builder chooses
-        // it** — the tile width is the GEMM's weight-reuse factor, so a prefill at
+        // **The token-tile width, chosen per launch from the expected rows per
+        // expert** — the tile width is the GEMM's weight-reuse factor, so a prefill at
         // ~100–300 rows per expert run at the decode width re-streams and re-dequants
         // every expert 2–4× per projection. Rows per expert are not known without the
         // routing readback this path exists to avoid; `n_tokens·k / E` is what uniform
         // routing would give, a lower bound on the rows of an active expert and, at
         // prefill widths, near it — nearly every expert is active. One width for the
         // three projections, since they share one tile table, and wide only where both
-        // dtypes have the wide kernels. Measured before this (RTX 3090): Qwen3-30B-A3B
-        // prefill at ×10 fell 11% against the host path's wide tiles, Qwen3.8-Flash-Next
+        // dtypes have the wide kernels. Measured at the fixed decode width (RTX 3090):
+        // Qwen3-30B-A3B prefill at ×10 ran 11% under wide tiles, Qwen3.8-Flash-Next
         // at ×8–×16 25–33%.
         let n_sub = grouped_int8_n_sub(
             (num_tokens * k) / n_experts.max(1),

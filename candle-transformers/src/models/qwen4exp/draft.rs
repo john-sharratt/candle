@@ -557,11 +557,11 @@ impl Qwen4ExpBatched {
         let narrow = head.to_shared_head(&res, eps, fwd_ticket)?;
         let acts = to_dynamic(
             &narrow,
-            m.lm_head.int8mode(),
+            head.lm_head.int8mode(),
             cuda,
             candle::quantized::SumScale::Raw,
         )?;
-        let logits = m
+        let logits = head
             .lm_head
             .forward_dynamic(acts.as_dynamic(), DType::F32)?
             .reshape((n, cfg.vocab_size))?;

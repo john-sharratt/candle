@@ -9,8 +9,8 @@
 //! `request_kv_ground` reports bytes conceded *after the fact*, and the zone
 //! grows back — so capacity and frontier read exactly as they did at load while
 //! the conceded slots hold something else. A figure inferred from concessions is
-//! therefore the same whether or not the ground came back, which is the trap
-//! hot-path invariant 7 records for cached slot addresses, one tenant over.
+//! therefore the same whether or not the ground came back — the trap hot-path
+//! invariant 7 records as "never infer 'nothing moved' from the geometry".
 //!
 //! So the zone publishes it. Every field is a gauge on
 //! [`PipelineStats`](super::PipelineStats), refreshed where the numbers are

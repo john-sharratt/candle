@@ -31,7 +31,7 @@ use super::head_gids::{band_tags, HeadGids};
 use super::meta_pool::MetaGid;
 use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo};
 #[cfg(feature = "cuda")]
-use candle::cuda_backend::cudarc::driver::CudaStream;
+use candle::CudaDevice;
 use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -606,10 +606,10 @@ pub(crate) struct SequenceState {
 
 impl SequenceState {
     #[cfg(feature = "cuda")]
-    pub(super) fn new(stream: Option<Arc<CudaStream>>) -> Self {
+    pub(super) fn new(device: Option<CudaDevice>) -> Self {
         Self {
             chunks: Vec::new(),
-            gpu_chunks: GpuChunks::new(stream),
+            gpu_chunks: GpuChunks::new(device),
             writer_start_idx: 0,
             base_pos: 0,
             decode_stale_from: None,
@@ -1399,35 +1399,6 @@ impl SequenceState {
 
         let ptr = self.gpu_chunks.raw_device_ptr();
         Ok((ptr, n as u32, wi as u32))
-    }
-
-    /// Whether the decode slot buffer is missing and would be built in full by
-    /// the next sync — the one thing [`Self::prime_decode_gpu_chunks`] does.
-    pub(crate) fn needs_decode_rebuild(&self) -> bool {
-        !self.chunks.is_empty() && self.gpu_chunks.n_chunks() == 0
-    }
-
-    /// Build the decode slot buffer ahead of the first decode step if it is
-    /// missing, and do nothing else.
-    ///
-    /// A buffer that exists is left as it stands, stale writer region
-    /// included: the decode step's own sync re-serialises that region before
-    /// it reads the buffer (see [`Self::mark_decode_writer_stale`]). Doing it
-    /// here would put an upload between one prefill layer's kernels and the
-    /// next, once per layer per sequence — a GPU bubble that costs a small
-    /// model a quarter of its single-context prefill — for bytes the next sync
-    /// carries anyway.
-    pub(crate) fn prime_decode_gpu_chunks(
-        &mut self,
-        n_kv_head: usize,
-        head_dim: usize,
-        seq_offset: usize,
-        arena_info: &[ResolvedArenaInfo],
-    ) -> candle::Result<()> {
-        if self.needs_decode_rebuild() {
-            self.rebuild_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?;
-        }
-        Ok(())
     }
 
     /// The entry count a decode header promises the kernel must be the entry

@@ -151,8 +151,12 @@ know which of its calls are host interactions:
   `to_cpu_storage` / `to_cpu_scalar` (the silent readback of §0.2), the pinned stager's
   owned copies, fences and syncs, the table ring's half switch, the bucketize workspace's
   regrowth, KV format selection.
-- `Device::eager()` around model host protocol that does several of these: the paged slot
-  headers (host-built, uploaded) and the slot priming after a prefill launch.
+- Device calls a recorded upload cannot stand in for, made by the KV slot-state buffers
+  (`GpuChunks`): a pinned-staging copy when the wave's ring is full or the thread is not
+  recording, the fence before a slot changes hands, a slot-state slab claim. Each runs
+  inside `pause_capture` itself. The slot-state upload and the paged slot headers built on
+  it are otherwise **recorded** — the bytes into the ring, the copy into the segment — so a
+  verify's attention layer and a draft-walk step build their headers without a cut.
 - The streamed layer store (`layer_stream::LayerCache`), when a layer must be loaded or
   joined: its copies are ordered behind a compute-stream event and its joins wait on the
   compute stream, so the recorded GEMMs still reading an evicted slot are launched first. A
@@ -165,11 +169,14 @@ What does **not** end a segment:
   dropped on any thread, since the last reference to memory a recorded launch reads may be
   released elsewhere. The graveyard is emptied outside the hub's lock.
 - **Uploads to existing or freshly carved device memory** (`upload_raw`, `upload_into_slice`,
-  `wave_from_vec_ticketed`, `upload_into`, the selection and QSA index tables). The bytes
-  are copied into the wave's pinned, device-mapped ring and a `copy2d_u8` from the ring is
-  recorded. Two rings alternate by wave, each fenced by an event recorded when its wave
-  finishes, so staged bytes outlive every replay that reads them. A full ring falls back to
-  an eager upload.
+  `wave_from_vec_ticketed`, `upload_into`, `record_upload`, the selection and QSA index
+  tables, the KV slot-state buffers and the paged slot headers). The bytes are copied into
+  the wave's pinned, device-mapped ring and a `copy_bytes` from the ring is recorded. Its
+  grid comes from a power-of-two ladder rather than from the size, so a table that grows a
+  little from one wave to the next — a slot-state buffer gaining a chunk — keeps its
+  segment's shape and folds in place. Two rings alternate by wave, each fenced by an event
+  recorded when its wave finishes, so staged bytes outlive every replay that reads them. A
+  full ring falls back to an eager upload.
 - **cuBLAS.** `CudaDevice::cublas()` rebinds the handle to the launch stream on every call and
   re-applies the handle's fixed 4 MiB workspace — `cublasSetStream` resets it to cuBLAS's own
   pool, which allocates on the stream, and a graph allocation is refused by the audit.
@@ -351,6 +358,13 @@ The pipeline statistics table now reports the ring's health: slots bucketize too
 found the ring empty for, and how many invocations the device had begun past the one the
 pipeline thread was serving.
 
+**The draft walk records too.** A speculative step's walk (`draft_walk`, shared by every
+NextN drafter) opens a wave capture of its own between the verify forwards: each drafted
+position is one head block over a row per sequence — dozens of small launches — and issued
+eagerly the walk was launch-bound, ~3.9 ms of every 30 ms single-session Flash-Next step
+idle between its back-to-back launches. Recorded, with its per-step slot headers built
+inside the recording, the step fell from 29.4 to 28.2 ms (254 → 265 tok/s).
+
 ### 3.3 Other models
 
 The Qwen3.5 lineage (0.8B, 9B, Qwen3.8-27B, 3.5-35B and the three Qwen3.6 gates) records
@@ -455,10 +469,10 @@ per segment, in-place updates, instantiations — and is unit-tested on its text
    verify segments and prompts' last rows as decode, as Flash-Next does, measured lower
    prefill on its one-sequence rows.
 3. **Fewer segments.** About 52 per Qwen3.6 wave: 40 MoE flushes, which the dispatch host
-   protocol needs, and the attention layers' eager slot-header builds. The headers are host
-   bookkeeping over chunk tables plus an upload; built once per forward for every attention
-   layer before recording starts (as the DeltaNet decode table already is), they stop
-   cutting. Prefill waves, the widest, pay the most per cut.
+   protocol needs, and what is left of the attention layers' header builds. The headers
+   themselves no longer cut — the slot-state upload is recorded (§2.3) and the
+   post-prefill slot priming is gone — so a layer cuts only when its slot-state
+   buffer needs a device call a recording cannot make: a full ring, a fence, a slab claim.
 4. **Fuse MoE layers whose experts are all resident.** The host protocol is the only thing
    that cuts an MoE chain; a configuration that drops it (not built) would let several layers
    share a segment.

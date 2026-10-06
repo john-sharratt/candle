@@ -2017,8 +2017,8 @@ impl<'w> LiveQTensor<'w> {
     /// Copy the raw quantized data to a host buffer on the given CUDA stream.
     ///
     /// When `dst` is backed by pinned memory (`cuMemAllocHost`), the copy
-    /// is truly asynchronous — the CPU returns immediately.  This is the
-    /// D2H eviction path for the two-tier expert cache.
+    /// is truly asynchronous — the CPU returns immediately.  The layer
+    /// stream's pack build reads each repacked layer back to the host this way.
     ///
     /// `dst` must be at least [`storage_size_in_bytes()`](Self::storage_size_in_bytes) bytes.
     #[cfg(feature = "cuda")]

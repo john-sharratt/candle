@@ -26,19 +26,19 @@ use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
 use crate::kv_cache::{active_kv_formats, KvFormat};
 
 impl ChunkedKvBacking {
-    /// Create a new [`SequenceState`] bound to this backing's device stream.
+    /// Create a new [`SequenceState`] bound to this backing's device.
     ///
-    /// Under the `cuda` feature the state receives a clone of the device's
-    /// `CudaStream` so that async H->D copies can be issued from the guard.
+    /// Under the `cuda` feature the state receives a handle on the device, from
+    /// which its guard records or issues its slot-state uploads.
     #[inline]
     pub(super) fn make_sequence_state(&self) -> Result<SequenceState> {
         #[cfg(feature = "cuda")]
         {
-            let stream = match &self.inner.device {
-                candle::Device::Cuda(dev) => Some(dev.cuda_stream()),
+            let device = match &self.inner.device {
+                candle::Device::Cuda(dev) => Some(dev.clone()),
                 _ => None,
             };
-            Ok(SequenceState::new(stream))
+            Ok(SequenceState::new(device))
         }
         #[cfg(not(feature = "cuda"))]
         {

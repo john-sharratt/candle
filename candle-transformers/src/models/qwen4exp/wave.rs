@@ -2046,6 +2046,11 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             .min(self.affordable_draft_budget(width))
     }
 
+    /// The checkpoint's measured drafted-token cost — see its ladder.
+    fn draft_token_cost(&self) -> f32 {
+        QWEN38_FLASH_NEXT_DRAFT.token_cost()
+    }
+
     /// Draft with the checkpoint's own NextN head, for the whole cohort in one
     /// batched walk ([`super::draft`]).
     fn speculative_draft(
@@ -2683,7 +2688,11 @@ impl WaveSweep for Qwen4ExpBatched {
                     plan.phase_bytes(LayerPhase::Ffn, width),
                     plan.phase_bytes(LayerPhase::Forward, width),
                 ];
-                plan_wave_transient(&d.cuda_stream(), per_phase)?;
+                // The refusal names the partition; the wave it was refused for
+                // is what says which of the wave's parts to look at.
+                plan_wave_transient(&d.cuda_stream(), per_phase).map_err(|e| {
+                    candle::Error::Msg(format!("{e} — for a wave of {width:?}, {per_phase:?} B"))
+                })?;
             }
         }
 
@@ -3556,8 +3565,8 @@ impl Qwen4ExpBatched {
                         // The whole attention block, not just its kernel.
                         // `decode:kernel` and `prefill:kernel` are reported by the
                         // kernel wrappers themselves, so the projections, rope, KV
-                        // append and out-proj around them were unattributed — and
-                        // `fwd_routing_wait`'s sync collected them. The difference
+                        // append and out-proj around them would otherwise go
+                        // unattributed. The difference
                         // between this span and the kernel row inside it is that
                         // surrounding work.
                         let g_attn = crate::models::profile::gpu_span("q4e:attn_decode", dev);
@@ -3711,13 +3720,12 @@ impl Qwen4ExpBatched {
             // reads it inside the same phase, so owning it was a full
             // `[rows, n_embd]` copy into a pool allocation on *every* layer.
             //
-            // **Spanned because the routing readback syncs.** This is 512 experts
-            // per layer and the largest block of device work in the model, and it
-            // had no span of its own — so its time was collected by
-            // `fwd_routing_wait`, which drains the stream and therefore charges
-            // itself for everything enqueued and unfinished ahead of it. That made
-            // the profile's largest row a measure of the queue rather than of the
-            // readback, and left the work that filled the queue unattributed.
+            // **The MoE block's device time, on its own span.** 512 experts per
+            // layer — shared expert, router, bucketize, gather, the grouped expert
+            // GEMMs (including any worker copies of non-VRAM experts) and the
+            // scatter — is the largest block of device work in the model. Nothing
+            // here waits on the host, so this event span is the one place that
+            // device time is attributed.
             let g_moe = crate::models::profile::gpu_span("q4e:moe_routed", dev);
             // The layer's output in its three parts: the shared expert's gate is
             // applied by the combine below, which reads the block output anyway,

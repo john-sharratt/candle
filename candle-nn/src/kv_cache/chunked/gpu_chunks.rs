@@ -24,9 +24,10 @@ use crate::kv_cache::arena_table::ResolvedArenaInfo;
 #[cfg(test)]
 use crate::kv_cache::arena_table::N_PALETTE;
 use candle::cuda_backend::cudarc::driver::result::memcpy_htod_async;
-use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaStream};
+use candle::cuda_backend::cudarc::driver::CudaEvent;
 use candle::cuda_backend::WrapErr;
 use candle::quantized::pinned_staging::{give_recycled_wc, take_recycled_wc, PinnedBuf};
+use candle::CudaDevice;
 use std::sync::Arc;
 
 /// Everything one serialised chunk's headers dereference, held alive for the life of
@@ -86,9 +87,17 @@ pub(crate) struct GpuChunks {
     /// generally larger than the live entries; the kernel's walk is bounded by
     /// `n_chunks`, never by the slot.
     slot: Option<SlotStateSlot>,
-    /// Stream used for all async H→D copies. `None` for CPU-backed tests even
-    /// when the crate is compiled with the CUDA feature enabled.
-    stream: Option<Arc<CudaStream>>,
+    /// The device the slot lives on. `None` for CPU-backed tests even when the
+    /// crate is compiled with the CUDA feature enabled.
+    ///
+    /// A device, not a stream, because this buffer is brought up to date from
+    /// inside recorded waves (`docs/decode_graphs.md`): an upload is recorded
+    /// into the wave's segment where it can be, and every other device call —
+    /// a pinned-staging copy, a fence, a slab claim — runs behind the launches
+    /// recorded so far, inside [`CudaDevice::pause_capture`], on the compute
+    /// stream. A stream handle taken while recording would be the capture
+    /// stream.
+    device: Option<CudaDevice>,
     /// Byte size of one serialised chunk entry (e.g. one `TokenSliceHost`).
     /// Zero until the first call to [`GpuChunksGuard::update`].
     chunk_byte_size: usize,
@@ -222,11 +231,11 @@ impl std::fmt::Debug for GpuChunks {
 }
 
 impl GpuChunks {
-    pub(crate) fn new(stream: Option<Arc<CudaStream>>) -> Self {
+    pub(crate) fn new(device: Option<CudaDevice>) -> Self {
         Self {
             host: Vec::new(),
             slot: None,
-            stream,
+            device,
             chunk_byte_size: 0,
             gen_records: None,
             n_chunks: 0,
@@ -258,13 +267,35 @@ impl GpuChunks {
     /// it retiring retires them all, and the kernels enqueued since keep
     /// running. Rewriting the host copy needs no fence at all — no copy reads
     /// it (see [`Self::staging`]).
+    ///
+    /// Only staged copies are tracked. A copy recorded into a wave's segment
+    /// runs in issue order with everything after it on the compute stream, so
+    /// the next tenant's own upload lands after it.
     fn fence_uploads(&mut self) {
         let Some(event) = self.last_upload.and_then(|i| self.staging[i].done.as_ref()) else {
             return;
         };
+        // A query or a wait on an event is host protocol, refused on a thread
+        // recording a wave — the query as much as the wait: it invalidates the
+        // capture. Once fenced, `last_upload` clears, so a buffer pays this
+        // pause once per staged upload, and one whose uploads are all recorded
+        // never.
+        let _paused = match self.device.as_ref().map(CudaDevice::pause_capture) {
+            Some(Ok(paused)) => paused,
+            Some(Err(e)) => {
+                log::error!("GpuChunks: could not pause the wave capture to fence: {e:?}");
+                None
+            }
+            None => None,
+        };
+        if event.is_complete() {
+            self.last_upload = None;
+            return;
+        }
         if let Err(e) = event.synchronize().w() {
             log::warn!("GpuChunks: fencing a pending slot-state upload failed: {e:?}");
         }
+        self.last_upload = None;
     }
 
     pub(crate) fn as_mut(&mut self) -> GpuChunksGuard<'_> {
@@ -289,8 +320,8 @@ impl GpuChunks {
     /// slot to another sequence lets the pending transfer land in a buffer it
     /// does not own.
     fn release_slot(&mut self) {
-        if let (Some(slot), Some(stream)) = (self.slot.take(), self.stream.as_ref()) {
-            slot_state_arena::release(stream, slot);
+        if let (Some(slot), Some(device)) = (self.slot.take(), self.device.as_ref()) {
+            slot_state_arena::release(device, slot);
         }
     }
 
@@ -553,7 +584,7 @@ impl GpuChunksGuard<'_> {
         }
 
         // Device: keep the slot if it still fits, else promote.
-        let Some(stream) = self.inner.stream.as_ref().cloned() else {
+        let Some(device) = self.inner.device.clone() else {
             self.inner.slot = None;
             return Ok(());
         };
@@ -563,7 +594,7 @@ impl GpuChunksGuard<'_> {
             .as_ref()
             .is_some_and(|s| s.capacity() >= byte_len);
         if !fits {
-            let next = slot_state_arena::claim(&stream, byte_len)?;
+            let next = slot_state_arena::claim(&device, byte_len)?;
             // The old slot changes hands: retire any copy still writing it.
             self.inner.fence_uploads();
             self.inner.release_slot();
@@ -848,12 +879,39 @@ impl Drop for GpuChunksGuard<'_> {
         let Some(slot_ptr) = self.inner.slot.as_ref().map(|s| s.ptr) else {
             return;
         };
-        let Some(stream) = self.inner.stream.clone() else {
+        let Some(device) = self.inner.device.clone() else {
             return;
         };
 
         let rec_bytes = chunk_byte_size - SLICE_HEADER_BYTES;
-        let ranges = upload_ranges(&self.dirty_chunks, n_chunks, rec_bytes);
+        let all = upload_ranges(&self.dirty_chunks, n_chunks, rec_bytes);
+
+        // **Recorded where the thread is recording a wave**: the bytes go into
+        // the wave's ring and the copy into its segment, so bringing the slot up
+        // to date does not end the segment — the per-layer header build of a
+        // recorded verify and each step of a recorded draft walk run without a
+        // cut. Whatever the ring will not take, or every range on a thread that
+        // is not recording, goes through the pinned staging below.
+        let staged_from = all
+            .iter()
+            .position(|r| {
+                !device.record_upload(slot_ptr + r.start as u64, &self.inner.host[r.clone()])
+            })
+            .unwrap_or(all.len());
+        let ranges = &all[staged_from..];
+        if ranges.is_empty() {
+            return;
+        }
+        // Behind every launch this thread has recorded, on the compute stream —
+        // and the event waits below are refused on a recording thread.
+        let _paused = match device.pause_capture() {
+            Ok(paused) => paused,
+            Err(e) => {
+                log::error!("GpuChunksGuard: could not pause the wave capture to upload: {e:?}");
+                None
+            }
+        };
+        let stream = device.compute_stream();
         let total: usize = ranges.iter().map(|r| r.len()).sum();
 
         let inner = &mut *self.inner;
@@ -892,7 +950,7 @@ impl Drop for GpuChunksGuard<'_> {
                         "GpuChunks: no {total}-byte staging buffer ({e:?}); uploading from \
                          the host copy and draining the stream"
                     );
-                    for range in &ranges {
+                    for range in ranges {
                         // SAFETY: `range` lies inside the live entry count,
                         // which `resize` sized the slot to hold; the stream is
                         // drained below, before the host copy can change.
@@ -919,7 +977,7 @@ impl Drop for GpuChunksGuard<'_> {
         // a copy carries are the ones packed here, whatever the host copy
         // becomes before the stream reaches it.
         let mut cursor = 0usize;
-        for range in &ranges {
+        for range in ranges {
             let n = range.len();
             staging.buf.as_mut_slice()[cursor..cursor + n]
                 .copy_from_slice(&inner.host[range.clone()]);
@@ -997,7 +1055,7 @@ impl Clone for GpuChunks {
         Self {
             host: Vec::new(),
             slot: None,
-            stream: self.stream.clone(),
+            device: self.device.clone(),
             chunk_byte_size: 0,
             gen_records: None,
             n_chunks: 0,

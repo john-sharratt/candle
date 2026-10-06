@@ -18,9 +18,9 @@
 //!   projections, routers, shared experts, the LM head — through the same
 //!   `QMatMul` repack every production model uses (Q8_0 → Q8_KO here).
 //! - **Routed experts stay Q4_KO in the `ExpertCache`**: VRAM hot slots over
-//!   pinned warm RAM over the mmap, exactly the three-tier machinery
-//!   DeepSeek-V4 and Qwen3.6-35B stream through. 512 experts rides the host
-//!   dispatch (`moe_bucketize` declines >256 by design).
+//!   pinned warm and pad RAM over the NVMe pack, the same device-side expert
+//!   forward (`ExpertCache::forward_routed`) DeepSeek-V4 and Qwen3.6-35B run
+//!   through. 512 experts is exactly `moe_bucketize`'s `MAX_EXPERTS`.
 //! - **The PLE table stays on NVMe** behind the §0.1 row cache
 //!   (`loader::open_cached_ple` — the same source the oracle reads, so the
 //!   two consume identical records).
@@ -228,11 +228,12 @@ impl Qwen4ExpGpu {
         // it unconditionally made the engine refuse artifacts the oracle
         // accepts, which is exactly the pair the oracle-vs-engine diff needs to
         // be able to run on the same checkpoint.
-        let lm_head = if gguf.info("output.weight").is_some() {
-            qm(&mut gguf, "output.weight")?
+        let lm_head_name = if gguf.info("output.weight").is_some() {
+            "output.weight"
         } else {
-            qm(&mut gguf, "token_embd.weight")?
+            "token_embd.weight"
         };
+        let lm_head = qm(&mut gguf, lm_head_name)?;
         let out_hc = hc(&mut gguf, "output_hc", false)?;
 
         use crate::models::delta_net::LayerKind;
@@ -402,7 +403,14 @@ impl Qwen4ExpGpu {
         // ahead of the expert-zone measurement below — see [`MtpDense`].
         let mtp_dense = match cfg.num_mtp_layers {
             0 => None,
-            1 => Some(MtpDense::load(&mut gguf, &cfg, eps, int8mode, device)?),
+            1 => Some(MtpDense::load(
+                &mut gguf,
+                &cfg,
+                eps,
+                int8mode,
+                (lm_head_name, &lm_head),
+                device,
+            )?),
             n => candle::bail!(
                 "qwen4exp engine: {n} draft-head blocks declared — this engine reads the \
                  one-block NextN form (`mtp_num_hidden_layers: 1`), which is what the \

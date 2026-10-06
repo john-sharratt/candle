@@ -1871,46 +1871,6 @@ impl ChunkedKvBacking {
         Ok((results, pins, stats))
     }
 
-    /// Build the decode slot buffer of every sequence in `batch_entries` that
-    /// has none, ahead of its first decode step — see
-    /// [`super::types::SequenceState::prime_decode_gpu_chunks`]. A buffer that
-    /// exists is left to the decode sync, which brings a stale writer region up
-    /// to date itself. The arena table is resolved only when some sequence
-    /// actually needs a build: after a prefill into buffers that already exist,
-    /// the call costs one read of the block table.
-    pub fn prime_decode_gpu_chunks(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
-        let needs_build = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-            batch_entries.iter().any(|&(seq_idx, _)| {
-                matches!(state.sequences.get(seq_idx), Some(Some(seq)) if seq.needs_decode_rebuild())
-            })
-        };
-        if !needs_build {
-            return Ok(());
-        }
-        // Resolved before the state lock: the arena table sits behind the
-        // storage lock, not this one.
-        let arena_info = self.resolve_arena_info()?;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-        for &(seq_idx, seq_offset) in batch_entries {
-            if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
-                seq.prime_decode_gpu_chunks(
-                    self.inner.n_kv_head,
-                    self.inner.head_dim,
-                    seq_offset,
-                    &arena_info,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     /// Like [`Self::sync_decode_gpu_chunks`], but each returned `slices_ptr` is
     /// an immutable copy of that sequence's slot-state placed in the pinned
     /// stager `generation` (device pointer stable for the whole forward),

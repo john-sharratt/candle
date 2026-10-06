@@ -3880,9 +3880,9 @@ impl QCudaStorage {
             );
         }
         // Goes to the STREAM's `memcpy_htod`, not the device's, so the guard on
-        // `CudaDevice::memcpy_htod` never sees it. This is the expert cache's
-        // DMA-overlap upload — the one path that writes a whole expert slot at
-        // a caller-computed destination — so an off-by-one slot index here
+        // `CudaDevice::memcpy_htod` never sees it. It writes a whole quantized
+        // buffer — an expert slot, say — at a caller-computed destination, so an
+        // off-by-one slot index here
         // replaces a contiguous run of resident weights with another expert's
         // bytes: finite, plausibly-shaped, and wrong.
         #[cfg(feature = "tensor-assert")]
@@ -3906,8 +3906,8 @@ impl QCudaStorage {
     ///
     /// When `dst` is backed by pinned memory (`cuMemAllocHost`), the copy is
     /// truly asynchronous — the CPU returns immediately and the DMA engine
-    /// handles the transfer.  This is the D2H path used for VRAM → pinned
-    /// eviction in the two-tier expert cache.
+    /// handles the transfer.  The layer stream's pack build reads each
+    /// repacked layer back to the host this way.
     ///
     /// `dst` must be at least `self.storage_size_in_bytes()` bytes.
     pub fn copy_to_host_on_stream(
@@ -5726,15 +5726,13 @@ impl<'w> Q8a128Operand<'w> {
     ///
     /// `'static` here is a statement about *ownership*, not lifetime: the result
     /// owns no memory, so there is nothing for a lifetime to bound. That is what
-    /// lets it cross a channel — a `MoeWorkRequest` cannot carry a borrow — and
-    /// it is also exactly why the caller carries the obligation below.
+    /// lets it cross a boundary a borrow cannot — a channel, a stored request —
+    /// and it is also exactly why the caller carries the obligation below.
     ///
     /// # Safety
-    /// `self` must outlive every use of the returned operand. On the expert
-    /// pipeline that is structural rather than hoped for: `submit_moe_work`
-    /// sends the request and immediately blocks on the response channel, so the
-    /// submitting frame — and the activation it holds — is live for the whole of
-    /// the worker's use, and both threads issue on the same stream.
+    /// `self` must outlive every use of the returned operand: the caller keeps
+    /// the frame holding the activation live until every launch that reads the
+    /// operand has been issued, on the stream the activation was produced on.
     pub unsafe fn as_foreign_lease(&self, device: &CudaDevice) -> Result<Q8a128Operand<'static>> {
         let bytes = self.byte_len();
         let dev = crate::Device::Cuda(device.clone());
@@ -5808,8 +5806,7 @@ impl<'w> Q8a128Operand<'w> {
     /// Packed size of the q8a1024 blocks backing this operand.
     ///
     /// Delegates to [`q8a1024_byte_len`] rather than recomputing: this is the
-    /// size `as_foreign_lease` stamps on the lease it hands the expert pipeline,
-    /// and a figure that disagrees with what the quantizer actually allocated is
+    /// size `as_foreign_lease` stamps on the lease it hands out, and a figure that disagrees with what the quantizer actually allocated is
     /// a lease that lies about its own extent.
     pub fn byte_len(&self) -> usize {
         q8a1024_byte_len(self.rows, self.cols)
@@ -6735,8 +6732,9 @@ pub fn grouped_qmatmul<'w>(
 /// packs per-active-expert weight pointers + tile tables on the CPU (requiring
 /// the routing indices to round-trip GPU→CPU first), this variant reads
 /// everything from device memory:
-///  * `weight_ptrs_dev` — the resident expert pointer table (u64 rows, built
-///    once at load; every expert VRAM-resident); `expert_base` is the element
+///  * `weight_ptrs_dev` — the expert pointer table (u64 rows; without `live`
+///    every entry is a VRAM address, with it the table is bucketize's
+///    per-invocation snapshot, below); `expert_base` is the element
 ///    offset of THIS layer's `[n_experts]` row block inside it, so
 ///    `tile_expert` carries RAW expert ids straight from `moe_bucketize`;
 ///  * `tile_expert` / `tile_b_start` / `tile_b_cnt` — `moe_bucketize`'s device

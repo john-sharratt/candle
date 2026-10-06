@@ -38,6 +38,10 @@ pub mod span_report;
 /// normalisation the gates do, or the two disagree about what a correct rewrite
 /// is. Pure string work with no test-only dependencies.
 pub mod story_normalize;
+/// Strata's published single-session speed benchmark, rebuilt request for
+/// request and run through the harness. Test-only, like [`utils`].
+#[cfg(test)]
+pub mod strata_bench;
 #[cfg(test)]
 pub mod test_helpers;
 /// The batched comparison harness: `TestParams`, the config ladder's row type, and the

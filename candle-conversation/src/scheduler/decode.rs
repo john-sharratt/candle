@@ -48,7 +48,8 @@ impl Scheduler {
     /// counter delta: expert activations routed by the forward, VRAM hit rate,
     /// DMA traffic, and Markov-prediction precision. This is the ground truth
     /// for why a glue forward costs what it does — a low hit rate means the
-    /// wave paid PCIe latency to stream the missing experts in.
+    /// expert GEMMs' workers pulled the missing experts across PCIe from pinned
+    /// memory, and `cold_misses` counts the ones they waited on the stager for.
     fn log_glue_expert_telemetry(
         before: &PipelineStats,
         after: &PipelineStats,
@@ -522,17 +523,21 @@ impl Scheduler {
         // The model's own measured width ladder is the CEILING: how far it is
         // worth drafting shrinks as the wave widens, and where it stops paying
         // depends on the checkpoint's shape rather than on anything the
-        // scheduler knows. Each turn drafts one past its own acceptance under
-        // it, and the drafter walks the cohort to the deepest of them. A turn
+        // scheduler knows. Each turn drafts, under it, the depth its own
+        // acceptance makes cheapest per token at the model's drafted-token cost
+        // (`DraftDepth`), and the drafter walks the cohort to the deepest of them. A turn
         // its guard keeps to a plain row drafts nothing and must not set that
         // depth, or one such turn keeps the whole wave drafting at the ceiling
         // for proposals that are all thrown away.
         let ceiling = self.model.draft_budget(seq_ids.len());
+        let token_cost = self.model.draft_token_cost();
         let depths: Vec<usize> = seq_ids
             .iter()
             .zip(&guards)
             .map(|(id, guard)| match guard {
-                Some(_) => self.active_decodes[id].draft_depth.budget(ceiling),
+                Some(_) => self.active_decodes[id]
+                    .draft_depth
+                    .budget(ceiling, token_cost),
                 None => 0,
             })
             .collect();
@@ -1988,7 +1993,8 @@ impl Scheduler {
         );
         // Snapshot the expert-pipeline counters so the wave's cost can be
         // reported as a delta: how many expert activations this forward routed,
-        // how many were VRAM-resident (hits) vs DMA'd in (misses), and how well
+        // how many were VRAM-resident (hits) vs fetched by the expert GEMMs'
+        // workers from pinned memory or the stager (misses), and how well
         // the Markov predictor pre-staged them. `None` on dense models.
         let expert_before = self.model.expert_stats();
         // With `--features profile`, drain the kernel-span accumulators built up

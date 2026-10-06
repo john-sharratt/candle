@@ -11,7 +11,7 @@
 //!
 //! Nothing here is Qwen3.5-specific except the tensor names, which are the
 //! frozen `ffn_{gate,up,down}_exps` schema. The expert machinery — the
-//! cache, its tiers, the GPU-native/host dispatch fork — is the engine's and
+//! cache, its tiers, the device-side expert forward — is the engine's and
 //! is used exactly as Qwen3-MoE uses it.
 
 use candle::quantized::gguf_file::Content;

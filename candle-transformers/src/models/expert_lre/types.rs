@@ -1,7 +1,7 @@
 //! Shared data types for the expert cache pipeline.
 //!
-//! These types are used across all submodules — cache bookkeeping, DMA
-//! loading, pipeline dispatch, and the public API.
+//! These types are used across all submodules — cache bookkeeping, the
+//! pipeline thread's messages and telemetry, and the public API.
 
 use super::compute::QMatMul;
 use crate::models::profile::{ProfileMark, ProfileSnapshot};
@@ -109,17 +109,17 @@ pub struct PipelineStats {
     pub decode_unslotted: usize,
     /// **Live** VRAM bytes held by resident expert slots — `occupied_slots ×
     /// slot_size`. Unlike the counters above (monotonic tallies), this is a
-    /// gauge: it rises as experts load into VRAM and falls as they stream out
-    /// to pinned RAM under pressure, so the whole-card VRAM decomposition can
-    /// show the model's time-varying resident-expert footprint. Seeded at cache
-    /// construction and refreshed by the pipeline thread each classify.
+    /// gauge: it rises as experts are promoted into VRAM and falls as they are
+    /// evicted or the zone concedes ground, so the whole-card VRAM decomposition
+    /// can show the model's time-varying resident-expert footprint. Seeded at
+    /// cache construction and refreshed by the pipeline thread each routed layer.
     pub resident_vram_bytes: usize,
     /// Gauge: span bytes the weight zone could concede to the KV side on demand
     /// — `(capacity − floor) × slot_bytes`. The elastic boundary already cedes
     /// this ground to stuck KV claims (`request_kv_ground`); publishing it lets
     /// the prefill width cap count it as admissible instead of pre-slicing the
     /// fleet at whatever happens to be standing free. Refreshed by the pipeline
-    /// thread each classify, like `resident_vram_bytes`.
+    /// thread each routed layer, like `resident_vram_bytes`.
     pub zone_cedeable_bytes: usize,
     /// **Gauge**: the weight zone as it stands, and the range it may move in —
     /// `capacity`, `min_capacity` and `limit`, each in bytes.

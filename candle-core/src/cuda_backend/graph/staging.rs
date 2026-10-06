@@ -14,7 +14,7 @@
 
 use crate::cuda_backend::WrapErr;
 use crate::Result;
-use candle_kernels::simple::fill::run_copy2d_op;
+use candle_kernels::simple::fill::run_copy_bytes;
 use cudarc::driver::{sys, CudaEvent, CudaStream};
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -27,9 +27,6 @@ pub(super) const RING_BYTES: usize = 8 << 20;
 /// Every staged upload starts on this boundary, so a copy kernel never reads
 /// an unaligned table and two uploads never share a cache line.
 const ALIGN: usize = 256;
-
-/// `copy2d`'s dtype code for bytes.
-const COPY_U8: i32 = 5;
 
 /// One pinned, device-mapped ring of staged upload bytes.
 pub(super) struct StagingRing {
@@ -106,16 +103,16 @@ impl StagingRing {
         // only grows within it.
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.host.add(at), n) };
         // SAFETY: the source is the ring's device mapping of the bytes just
-        // written and `dst` holds `n` bytes the caller owns; one row of `n`
-        // bytes, launched on the capture stream so it is recorded.
+        // written and `dst` holds `n` bytes the caller owns; launched on the
+        // capture stream so it is recorded. Its grid comes from a power-of-two
+        // ladder rather than from `n`, so a table whose size moves from one
+        // wave to the next — a slot-state buffer growing a chunk at a time —
+        // leaves its segment's shape alone, and the segment folds into its
+        // executable in place instead of reshaping it.
         unsafe {
-            run_copy2d_op(
-                COPY_U8,
+            run_copy_bytes(
                 (self.device + at as u64) as *const c_void,
                 dst as *mut c_void,
-                1,
-                n as u32,
-                n as u32,
                 n as u32,
                 capture.cu_stream() as *mut c_void,
             );

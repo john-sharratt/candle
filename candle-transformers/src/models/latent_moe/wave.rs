@@ -408,13 +408,13 @@ impl BatchedEngine {
     /// draft time).
     ///
     /// **Load order matters.** The drafter's int8 backbone (attention + norms + router + shared) is
-    /// GPU-resident (~1 GB); its 3×256 routed experts live in host RAM and stream into a small VRAM
-    /// slot set on demand ([`super::dspark_experts::DsparkStreamingMoe`], VRAM-adaptive count). The
+    /// GPU-resident (~1 GB); its 3×256 routed experts are a permanently VRAM-resident Q2_KO set
+    /// (~5 GiB, [`super::dspark_experts::DsparkStreamingMoe`]). The
     /// target engine sizes its expert pool greedily to *all* free VRAM (spilling the remainder to
     /// the pinned pool), so the engine must be loaded **first**; the drafter then loads into the
     /// engine's activation headroom (shared with target KV/activations), leaving the target's expert
     /// pool — and its pinned remainder — at the baseline that fits the page-lock ceiling. On a
-    /// device below the smallest slot tier (≤ 24 GiB) the drafter's `load` already errored, so this
+    /// device of 64 GiB or less the drafter's `load` already errored, so this
     /// is never reached and speculative stays disabled.
     pub fn with_drafter(mut self, drafter: super::dspark::DsparkDrafter) -> Result<Self> {
         // `dflash.target_layers` (1-based, [41,42,43] on the 43-layer target) name the three
@@ -928,8 +928,9 @@ impl ManagedBatchedModel for BatchedEngine {
         // not adopted the span's wave arenas), so the default cap's FFN-span
         // pricing bounds a tier this model never allocates from — and at the
         // 8-way expert fan-out it sliced an 8-prompt fleet into three waves,
-        // tripling the per-wave fixed costs (the per-layer routing readback +
-        // expert-set assembly) that ARE the prefill wall. The engine's pool
+        // tripling the per-wave fixed costs (every layer's launches, and the
+        // routed experts each wave fetches again) that dominate prefill. The
+        // engine's pool
         // cushion is reserved at load for exactly this activation peak, so the
         // real ceilings are compute saturation and what the KV side can admit
         // — which includes the expert ground the elastic boundary would cede
@@ -1043,10 +1044,10 @@ impl ManagedBatchedModel for BatchedEngine {
     }
 
     fn snapshot_profiles(&self) -> ProfileSnapshot {
-        // Drain the expert-pipeline worker profile (upload-wait vs GEMM vs
-        // eviction) so the per-phase Bulk/Single profile tables surface the
-        // MoE-internal breakdown — the forward thread's coarse `moe:submit`
-        // span otherwise hides where the ~100ms/token of decode MoE goes.
+        // Drain the expert pipeline thread's `pipe_*` spans and, in a profile
+        // build, the expert GEMMs' worker counters (copy and cold-wait time) so
+        // the per-phase Bulk/Single profile tables surface the MoE-internal
+        // breakdown the forward thread's own spans cannot see.
         self.engine.experts().snapshot_profiles()
     }
 
@@ -1088,8 +1089,8 @@ impl ManagedBatchedModel for BatchedEngine {
     /// so the two encodings meet at the same kernels; what the prefill-slot
     /// form buys is the wave driver's contract (one context per sequence, no
     /// duplicated ids) and with it the fair-wave co-batch. The wave is
-    /// launch-bound, so its fixed costs (per-layer MoE routing readbacks,
-    /// expert DMA) amortize across every session instead of being paid once
+    /// launch-bound, so its fixed costs (every layer's launches, expert
+    /// fetches) amortize across every session instead of being paid once
     /// per session. Lossless is unchanged: the driver still accepts only the
     /// model's own argmaxes. `verify_all_rows` marks the verifying sequences
     /// for the sweep (row expansion + full-row head scoring); it is cleared by
@@ -2954,10 +2955,9 @@ impl BatchedEngine {
             let h1 = hc.post(&x, &h, &post, &comb)?;
             s_hc_post.end();
 
-            // MoE sub-block: one batched call — a single routing readback per
-            // layer per wave, amortized over every row (the expert ids must be
-            // host-visible to schedule the streaming cache's pinned→VRAM
-            // uploads; it reaches zero only under full residency).
+            // MoE sub-block: one batched call per layer per wave over every row.
+            // The routing stays on the device; the expert cache's pipeline
+            // thread reads the layer's routing summary off the critical path.
             let s_moe = span("deepseek:moe");
             let s_moe_hcpre = span("moe:hc_pre");
             let (x, post, comb) = hc.pre(&h1, &layer.hc_ffn)?;
@@ -3415,8 +3415,8 @@ mod tests {
         );
 
         // Readback budget: the wave forward makes no device→host transfer at
-        // all — the MoE routing reaches the expert pipeline as an async summary
-        // copy, never a blocking read. Sampling (`to_scalar` above) is the
+        // all — the MoE routing reaches the expert pipeline as a summary
+        // bucketize writes into mapped pinned memory, never a blocking read. Sampling (`to_scalar` above) is the
         // one-per-token the budget allows and belongs to the caller.
         let got = super::super::readback::readback_count();
         assert_eq!(got, 0, "wave-path readbacks: {got}");

@@ -129,6 +129,21 @@ pub trait TokenChooser {
     /// Choose one token per row of `logits` (`[rows, vocab]`), in row order.
     /// `rows[m]` describes row `m`.
     fn choose(&mut self, logits: &Tensor, rows: &[SpecRow<'_>]) -> Result<Vec<u32>>;
+
+    /// Whether a row's token depends on nothing but the row itself and its
+    /// [`SpecRow`] — no state that committing one position's token advances
+    /// before the next is priced.
+    ///
+    /// Such a chooser is asked for every scored row of a step in one call —
+    /// one launch and one readback — and the accept walk then commits from
+    /// those picks position by position, by the same rule. Rows past where a
+    /// sequence stops are chosen and never read, which is only sound when
+    /// choosing them changed nothing. A chooser carrying penalties, an RNG
+    /// stream or a grammar stencil advances that state per committed token, so
+    /// it is walked position by position and says `false`.
+    fn stateless(&self) -> bool {
+        false
+    }
 }
 
 /// Whether a sequence walks on to the next position of its verify block after
@@ -352,6 +367,35 @@ impl TokenChooser for GreedyChooser {
         logits.batched_sample_argmax_into(self.live_vocab, &picks)?;
         picks.to_vec1::<u32>()
     }
+
+    /// An argmax reads its row and nothing else.
+    fn stateless(&self) -> bool {
+        true
+    }
+}
+
+/// Every scored row of a step at once, in row order — what a
+/// [stateless](TokenChooser::stateless) chooser is asked for.
+///
+/// `blocks[i]` is sequence `i`'s verify block and `row_of[i]` the first of its
+/// `blocks[i].len()` rows; every row is described as the accept walk would
+/// describe it on reaching it, prefix and draft included.
+pub fn all_rows<'b>(blocks: &'b [Vec<u32>], row_of: &[(usize, usize)]) -> Vec<SpecRow<'b>> {
+    let total: usize = blocks.iter().map(Vec::len).sum();
+    let mut rows: Vec<Option<SpecRow<'b>>> = vec![None; total];
+    for (i, block) in blocks.iter().enumerate() {
+        for position in 0..block.len() {
+            rows[row_of[i].0 + position] = Some(SpecRow {
+                seq: i,
+                position,
+                prefix: &block[1..=position],
+                draft: block.get(position + 1).copied(),
+            });
+        }
+    }
+    rows.into_iter()
+        .map(|r| r.expect("row_of tiles the rows"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -606,6 +650,58 @@ mod tests {
         assert_eq!(walk.rows()[0].draft, Some(33));
         walk.commit(&[33], |_, _| true).unwrap();
         assert_eq!(walk.rows()[0].draft, None);
+    }
+
+    /// Every row comes out where `row_of` puts it, described exactly as the
+    /// walk describes it on reaching it — so committing from these picks is
+    /// committing from what a position-by-position walk would have asked for.
+    #[test]
+    fn all_rows_describes_each_row_as_the_walk_does() {
+        // Cohort order 0, 1, 2; row order puts sequence 2 first.
+        let blocks = vec![vec![7u32, 22, 33], vec![8u32], vec![9u32, 90]];
+        let row_of = vec![(2, 3), (5, 1), (0, 2)];
+        let rows = all_rows(&blocks, &row_of);
+        let got: Vec<(usize, usize, Vec<u32>, Option<u32>)> = rows
+            .iter()
+            .map(|r| (r.seq, r.position, r.prefix.to_vec(), r.draft))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (2, 0, vec![], Some(90)),
+                (2, 1, vec![90], None),
+                (0, 0, vec![], Some(22)),
+                (0, 1, vec![22], Some(33)),
+                (0, 2, vec![22, 33], None),
+                (1, 0, vec![], None),
+            ]
+        );
+        let mut walk = AcceptWalk::new(&blocks);
+        while !walk.finished() {
+            for r in walk.rows() {
+                let at = &rows[row_of[r.seq].0 + r.position];
+                assert_eq!((at.prefix, at.draft), (r.prefix, r.draft));
+            }
+            let picks: Vec<u32> = walk
+                .alive()
+                .iter()
+                .map(|&i| blocks[i].get(walk.position() + 1).copied().unwrap_or(0))
+                .collect();
+            walk.commit(&picks, |_, _| true).unwrap();
+        }
+    }
+
+    /// Greedy reads its row and nothing else; the default is to walk.
+    #[test]
+    fn only_a_chooser_that_reads_nothing_but_its_row_is_stateless() {
+        struct Walks;
+        impl TokenChooser for Walks {
+            fn choose(&mut self, _: &Tensor, rows: &[SpecRow<'_>]) -> Result<Vec<u32>> {
+                Ok(vec![0; rows.len()])
+            }
+        }
+        assert!(GreedyChooser::new(3).stateless());
+        assert!(!Walks.stateless());
     }
 
     /// A token count that disagrees with the live set is a caller bug that

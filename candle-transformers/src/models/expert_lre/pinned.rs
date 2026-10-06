@@ -646,7 +646,8 @@ unsafe impl Send for WarmPool {}
 // module doc: "static, immutable, a stratified subset") — the mutating
 // accessors (`slot_mut`, `span_mut`) are only reachable through `&mut self`,
 // and the pool is shared read-only via `Arc` (which makes `&mut` unreachable)
-// between the pipeline thread and the expert streamer. Concurrent `slot_ref`
+// between the host threads that read it (the pipeline thread and the stager)
+// and, through the warm-slot addresses, the expert kernels. Concurrent `slot_ref`
 // reads of stable pinned memory are race-free.
 #[cfg(feature = "cuda")]
 unsafe impl Sync for WarmPool {}
@@ -870,7 +871,7 @@ mod tests {
         assert_eq!(per_layer_counts(&m, 4)[1], 6);
     }
 
-    /// **The bandwidth denominator for the expert streamer.**
+    /// **The bandwidth denominator for expert promotion and prefetch.**
     ///
     /// Whether prefetching can help at all depends on which side of saturation
     /// the warm→VRAM path runs on, and that cannot be read off the load counts
@@ -880,8 +881,8 @@ mod tests {
     /// does.
     ///
     /// Reports three numbers, because they answer different questions:
-    ///  * **pinned, back-to-back** — the ceiling a perfectly-pipelined streamer
-    ///    could reach.
+    ///  * **pinned, back-to-back** — the ceiling a perfectly-pipelined copy
+    ///    engine could reach.
     ///  * **pinned, one-at-a-time (sync per copy)** — what a demand load that
     ///    something is waiting on actually gets, latency included.
     ///  * **pageable** — the penalty for missing the pinned tier.
@@ -978,12 +979,14 @@ mod tests {
         // ── The other half of the question: what does a synchronous D2H COST,
         // independent of how much data it moves or what the GPU is doing? ──
         //
-        // The MoE routing readback is 3.3 ms per layer, 43 times per token, and
-        // whether that is recoverable depends entirely on which it is: GPU
-        // catch-up (real work, only fixable by making the work cheaper) or WDDM
-        // round-trip latency (pure overhead, fixable only by removing the sync).
-        // Draining the queue first and then timing a 512-byte readback isolates
-        // the latency with certainty — there is nothing left to catch up on.
+        // The latency floor of a synchronous small D2H on this driver: the price
+        // of any host round trip left on the hot path, as against GPU catch-up
+        // (real work, only fixable by making the work cheaper). The expert path
+        // makes no routing readback — its routing summary reaches the host
+        // through mapped memory with nothing on the device waiting — so this is
+        // what that design avoids paying per MoE layer. Draining the queue first
+        // and then timing a 512-byte readback isolates the latency with
+        // certainty: there is nothing left to catch up on.
         let tiny = Tensor::zeros(128, DType::F32, &device).expect("tiny buffer");
         stream.synchronize().expect("drain");
         let t0 = std::time::Instant::now();
@@ -999,7 +1002,7 @@ mod tests {
         );
         eprintln!(
             "[d2h] empty-queue sync readback (512 B) = {per_readback_us:.0} us \
-             — the floor under the per-layer routing readback"
+             — the latency floor of any synchronous D2H on this driver"
         );
         eprintln!("[h2d] pinned, back-to-back   = {streamed:.1} GB/s");
         eprintln!(
