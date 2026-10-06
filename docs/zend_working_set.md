@@ -12,9 +12,10 @@ its own turns as **one sequence in the order its members entered**. The unit is
 always a **whole ingest conversation** — one file or one folder — so an item
 moves between tiers without changing shape or place.
 
-1. **Locks** — files and folders the model asked for with `file_read` /
-   `file_list` that the corpus already holds. The call is answered "already in
-   context" and the content is pinned for the rest of the task.
+1. **Locks** — files the model asked for with `file_read` that the corpus
+   already holds whole. The call is answered `in_context` and the content is
+   pinned for the rest of the task. A `file_list` is never served: it runs and
+   its listing is prefilled (§4.5).
 2. **Provenance** — the files the conversation keeps attending to, by a
    per-file momentum score. A lock released at the end of a task becomes
    provenance where it stands.
@@ -211,6 +212,10 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
 
 ### 4.3 State and momentum
 
+One reprojection admits at most `working_set.max_admits` provenance newcomers
+(default 2). The rest keep their momentum and enter on later reprojections. See
+`docs/projection_swap_cap.md`.
+
 The substrate keeps one `WorkingSet` per dialogue,
 `HashMap<TimelineId, WorkingSet>`, in `candle-conversation/src/working_set/`:
 
@@ -338,8 +343,12 @@ added.
   ceil(LINES_KEY / PAGE_LINES)`. A chain cut at `MAX_FILE_READ_ROUNDS`, or one
   that skipped a page, runs for real (§3.3). A finished chain never changes, so
   the answer is computed once per timeline and cached beside the screen.
-  Ingestion is not changed. A folder unit holds page 0 of its listing, which is
-  the only page the screen serves, so folders need no coverage check.
+  Ingestion is not changed.
+- **Only `file_read` is screened.** A `file_list` runs and its listing is
+  prefilled. Serving it put the folder's `repo_map` unit in its place — a
+  placed `file_list` round trip the model is told it did not make — and the
+  model then lost track of whether it had listed the folder at all; a listing
+  is short, so the prefill costs little.
 - **Tombstone removes.** `tombstone_timeline` drops the timeline from every
   working set — locks and momentum, seeds included (§3.4).
 
@@ -387,7 +396,6 @@ A served call answers
 
 ```json
 {"status":"in_context","anchor":"file=candle/Cargo.toml"}
-{"status":"in_context","anchor":"the `zend/src/` folder in the `candle` repository"}
 ```
 
 and nothing else. The reply stands in for a read, so every token it spends is
@@ -404,11 +412,7 @@ change — the literal anchor arrives in the reply.
 **The anchor is byte-identical to what the content begins with.** A file's is the
 `file=<repo>/<path>` attribute every page's opening fence carries
 (`zend_tools::tools::file::render::file_anchor`, used by both the fence and the
-reply). A folder's is the phrase its unit's opening request names it by
-(`repo_scan::render::folder_anchor`): the listing's JSON names only its
-repository, and the call is rendered in the checkpoint's own syntax, so the
-request's phrase is the one dialect-independent string every folder unit
-carries. Measured 2026-09-30: told only "in your context", the model searched its
+reply). Measured 2026-09-30: told only "in your context", the model searched its
 own reads, found none, called the reply false and refused to use the file —
 although both of the file's ingest turns were pinned in every projection of that
 turn. The status is not "already read" for the same reason: a served file is

@@ -66,12 +66,13 @@ use crate::conv_overlay::{self, Mirror};
 use crate::fast_path::coverage::Coverage;
 use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
+use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
 use crate::model_choice;
 use crate::origin_watch::OriginWatch;
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
-use crate::projection_event::ProjectionEventOut;
+use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
 use crate::repeat_guard::{self, RepeatGuard, Verdict};
 use crate::repo_path::shown as shown_unit;
@@ -152,6 +153,7 @@ pub struct ToolStatusOut {
 }
 
 /// Items yielded by [`ZendSession::submit`].
+#[derive(Clone)]
 pub enum StreamItem {
     Status(String),
     Token(String),
@@ -185,6 +187,44 @@ pub enum StreamItem {
         usage: Usage,
         finish: FinishReason,
     },
+}
+
+/// A dialogue conversation's recovered history, as `GET /v1/conversations/{id}`
+/// shows it — the summariser's ghost summary turns hidden.
+fn dialogue_history(state: &InferenceState, conv_id: &str) -> Vec<RecoveredMessage> {
+    let timeline = timeline_for(conv_id);
+    let base = state.base_conv.lock().unwrap();
+    base.recovered_history(timeline, false)
+}
+
+/// Forward a turn's items to the request that started it, recording each one
+/// in `live` for a client that reconnects.
+///
+/// Drains `ts` to the end whether or not the request is still there: the turn
+/// runs to completion either way, and a client that comes back mid-turn follows
+/// it from `live`. An error item is recorded as the text the request showed for
+/// it, so a follower sees the same failure.
+async fn relay_live(
+    ts: &mut Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>>,
+    tx: &mpsc::Sender<anyhow::Result<StreamItem>>,
+    live: &LiveTurn,
+    conv_id: &str,
+) {
+    let mut listening = true;
+    while let Some(item) = ts.next().await {
+        live.push(match &item {
+            Ok(i) => i.clone(),
+            Err(e) => StreamItem::Token(format!("\n\n⚠ {e}")),
+        });
+        if listening && tx.send(item).await.is_err() {
+            listening = false;
+            tracing::info!(
+                conv_id,
+                "client went away mid-stream — the turn runs to completion and a \
+                 reconnecting client follows it live"
+            );
+        }
+    }
 }
 
 /// Process-global monotonic id for projection events, so dot ids stay unique
@@ -3929,7 +3969,14 @@ fn run_inference_stream(
 
             // Group-commit the substrate redo log: the just-sealed turn is
             // now durable on disk, so a crash or restart resumes it intact.
-            if let Err(e) = state.engine.lock().unwrap().commit_persistence() {
+            //
+            // Through a cloned handle, with the engine lock already released:
+            // the commit waits for the persistence lock, which a segment
+            // compaction holds batch by batch, and holding the engine lock
+            // across that wait stalled every reader of it — `/v1/status` and
+            // the conversation fetch a page reload makes among them.
+            let conversation = state.engine.lock().unwrap().conversation();
+            if let Err(e) = conversation.commit_persistence() {
                 tracing::warn!(conv_id = %conv_id, "persistence commit error: {e}");
             }
 
@@ -3939,10 +3986,10 @@ fn run_inference_stream(
 
             // Answer what the corpus has already ingested before dispatching the
             // rest. A `file_read` of a file an existing `code_reading`
-            // conversation read whole, or a `file_list` of a folder an existing
-            // `repo_map` conversation lists, is served by locking that
-            // conversation into this one's working set — the K/V exists, so it
-            // costs an elevation rather than a prefill and a decode. Anything
+            // conversation read whole is served by locking that conversation
+            // into this one's working set — the K/V exists, so it costs an
+            // elevation rather than a prefill and a decode. Every other call,
+            // a `file_list` included, runs and is prefilled. Anything
             // unsure (changed file, no complete conversation, the working set
             // full) is left in the round and runs for real, and so is every
             // call from the round's first write on. Each served call marks the
@@ -3957,21 +4004,12 @@ fn run_inference_stream(
                     let screen_files = Arc::clone(&cs.files);
                     let unscreened = round.clone();
                     match tokio::task::spawn_blocking(move || {
-                        let folder_of = |repo: &str, inner: &str| {
-                            screen_state.retrieval_scope.folder_unit(
-                                &screen_state.engine,
-                                &screen_files,
-                                repo,
-                                inner,
-                            )
-                        };
                         fast_path::screen(
                             &Screen {
                                 engine: &screen_state.engine,
                                 target: timeline,
                                 workspace: &screen_state.workspace,
                                 files: &screen_files,
-                                folder_of: &folder_of,
                                 config: &config,
                                 coverage: &screen_state.read_coverage,
                             },
@@ -4517,7 +4555,9 @@ async fn passthrough_turn(
     if let Err(e) = live.seq.finish_turn(handle, &resp) {
         tracing::warn!(key, "passthrough: finish_turn: {e}");
     }
-    if let Err(e) = state.engine.lock().unwrap().commit_persistence() {
+    // Outside the engine lock — see the dialogue path's commit.
+    let conversation = state.engine.lock().unwrap().conversation();
+    if let Err(e) = conversation.commit_persistence() {
         tracing::warn!(key, "passthrough: persistence commit: {e}");
     }
     live.history.push(Exchange {
@@ -4706,6 +4746,9 @@ pub struct ZendSession {
     /// Structured load-state machine — drives the frontend's loading
     /// overlay (current step + progress + completed list).
     load_progress: Arc<LoadProgress>,
+    /// Each conversation's reply in flight, recorded so a client that
+    /// reconnects mid-turn can follow it (`GET /v1/conversations/{id}/live`).
+    live_turns: Arc<LiveTurns>,
     /// Wall-clock time (ms since Unix epoch) when this `ZendSession` was
     /// constructed — i.e. when the daemon process started. Surfaced via
     /// `GET /v1/status` so the frontend can detect daemon restarts and
@@ -4861,6 +4904,7 @@ impl ZendSession {
             ready_tx,
             status_tx,
             load_progress: Arc::new(LoadProgress::new()),
+            live_turns: Arc::new(LiveTurns::default()),
             started_at_ms,
             file_store,
             load_thread: Mutex::new(None),
@@ -4987,8 +5031,8 @@ impl ZendSession {
     /// loaded.
     pub fn substrate_maintenance(&self) -> Option<MaintenanceStatus> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let engine = state.engine.lock().unwrap();
-        Some(engine.substrate_maintenance_status())
+        let conversation = state.engine.lock().unwrap().conversation();
+        Some(conversation.maintenance_status())
     }
 
     /// How this boot loaded its prompt sections — restored from the redo log or
@@ -5547,12 +5591,12 @@ impl ZendSession {
         let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
             return Vec::new();
         };
+        // Polled every few seconds by every open tab, under the engine lock, so
+        // it reads what each listed conversation holds and nothing more: a turn
+        // count is its own timeline's, never a walk of every turn the substrate
+        // holds (the ingest layers are most of them).
         let engine = state.engine.lock().unwrap();
         let titler_timeline = state.titler_timeline;
-        let turn_counts: std::collections::HashMap<projection::TimelineId, u32> = {
-            let base = state.base_conv.lock().unwrap();
-            base.recovered_timelines().into_iter().collect()
-        };
         let known = engine.known_conversations();
         let passthrough_tagged = engine.conversations_with_metadata_key(passthrough::METADATA_KEY);
         let conv = engine.conversation();
@@ -5563,17 +5607,10 @@ impl ZendSession {
             .filter(|(tl, _, _, _, _)| *tl != titler_timeline)
             .filter(|(_, _, _, archived, _)| include_archived || !*archived)
             .map(|(tl, conv_id, label, archived, order)| {
-                // A passthrough conversation is not among the dialogue's
-                // recovered timelines; its turns are counted in the substrate.
-                let turn_count = if conv_id.starts_with(passthrough::CONV_ID_PREFIX) {
-                    view.turn_indices(tl).count() as u32
-                } else {
-                    turn_counts.get(&tl).copied().unwrap_or(0)
-                };
                 let entry = ConvEntry {
                     id: conv_id,
                     label,
-                    turn_count,
+                    turn_count: view.turn_count_of(tl),
                     archived,
                     updated_ms: 0,
                 };
@@ -5596,7 +5633,7 @@ impl ZendSession {
                 ConvEntry {
                     id: passthrough::conv_id_of(tl),
                     label: passthrough::label_for(&first_user),
-                    turn_count: view.turn_indices(tl).count() as u32,
+                    turn_count: view.turn_count_of(tl),
                     archived: entry.archived,
                     updated_ms: 0,
                 },
@@ -5735,10 +5772,12 @@ impl ZendSession {
                     .collect(),
             );
         }
-        let timeline = timeline_for(conv_id);
-        let base = state.base_conv.lock().unwrap();
-        // Conversation view: hide the summariser's ghost summary turns.
-        Some(base.recovered_history(timeline, false))
+        Some(dialogue_history(&state, conv_id))
+    }
+
+    /// The reply in flight for `conv_id`, if there is one.
+    pub fn live_turn(&self, conv_id: &str) -> Option<Arc<LiveTurn>> {
+        self.live_turns.get(conv_id)
     }
 
     /// The composer dials this conversation last ran under, for the GUI to set
@@ -5933,6 +5972,33 @@ impl ZendSession {
             .and_then(|m| m.get("uploads").cloned())
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
+    }
+
+    /// [`Self::conversation_projections`] as the history carries it: each
+    /// point light, without the selection and spine only the projection panel
+    /// reads, under a fresh display id. One bucket per assistant turn, in order.
+    pub fn conversation_spans(&self, conv_id: &str) -> Vec<Vec<ProjectionSpanOut>> {
+        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+            return Vec::new();
+        };
+        let timeline = timeline_for(conv_id);
+        let raw = {
+            let base = state.base_conv.lock().unwrap();
+            base.recovered_projection_points(timeline)
+        };
+        raw.into_iter()
+            .enumerate()
+            .map(|(turn, points)| {
+                points
+                    .into_iter()
+                    .enumerate()
+                    .map(|(event, point)| {
+                        let seq = PROJ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        ProjectionSpanOut::of(seq, point, turn, event)
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Projection-event buckets banked for a conversation this daemon session,
@@ -6183,6 +6249,16 @@ impl ZendSession {
                             .lock()
                             .unwrap()
                             .warm_collection_normalization(&schema);
+                        load_progress.set_step(LoadStep::Preloading);
+                        let t_preload = Instant::now();
+                        let preload = state.engine.lock().unwrap().preload_galleries(&schema);
+                        tracing::info!(
+                            turns = preload.turns,
+                            resident = preload.resident,
+                            tokens = preload.tokens,
+                            ms = t_preload.elapsed().as_millis() as u64,
+                            "projection galleries preloaded"
+                        );
                         status_tx.send(String::new()).ok();
                         // Substrate persistence runs in the engine's own
                         // thread (`PersistenceThread`) — 5 s tick + per-turn
@@ -6507,6 +6583,7 @@ impl ZendSession {
         let inference = Arc::clone(&self.inference);
         let mut ready_rx = self.ready_tx.subscribe();
         let mut status_rx = self.status_tx.subscribe();
+        let live_turns = Arc::clone(&self.live_turns);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamItem>>(64);
 
@@ -6553,6 +6630,8 @@ impl ZendSession {
             let state: Option<Arc<InferenceState>> =
                 { inference.read().unwrap().as_ref().map(Arc::clone) };
             if let Some(state) = state {
+                let history_before = dialogue_history(&state, &conv_id).len();
+                let live = live_turns.begin(&conv_id, last_user.clone(), history_before);
                 let mut ts = run_inference_stream(
                     state,
                     conv_id.clone(),
@@ -6567,11 +6646,8 @@ impl ZendSession {
                     selection,
                     None,
                 );
-                while let Some(item) = ts.next().await {
-                    if tx.send(item).await.is_err() {
-                        break;
-                    }
-                }
+                relay_live(&mut ts, &tx, &live, &conv_id).await;
+                live_turns.end(&conv_id, &live);
             } else {
                 tx.send(Ok(StreamItem::Status("Model unavailable.".into())))
                     .await

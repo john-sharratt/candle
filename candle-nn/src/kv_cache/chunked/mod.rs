@@ -156,7 +156,7 @@ pub use size_class::{
     payload_bytes_for_tag, SizeClass, GID_STRIDE, LADDER,
 };
 pub use types::{ChunkMeta, CHUNK_SIZE};
-pub use types::{LiveChunkRef, SealedChunk, SealedSequence, WriterTail};
+pub use types::{DetachedChunks, LiveChunkRef, SealedChunk, SealedSequence, WriterTail};
 pub use weight_zone::{
     RetractPlan, WeightZone, WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
 };

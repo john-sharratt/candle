@@ -86,6 +86,7 @@ mod tests {
             max_file_tokens: 500,
             seeds: Vec::new(),
             release_on: release_on.iter().map(|s| s.to_string()).collect(),
+            max_admits: 2,
         }
     }
 

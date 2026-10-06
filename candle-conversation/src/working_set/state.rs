@@ -269,13 +269,18 @@ impl WorkingSet {
     ///    leaves the sequence — the gap closes. So does an unlocked member
     ///    `admissible` no longer allows (out of scope, gone).
     /// 3. The strongest candidates that are not members try to enter, each
-    ///    dislodging only provenance it beats by [`DISLODGE_MARGIN`].
+    ///    dislodging only provenance it beats by [`DISLODGE_MARGIN`] — at most
+    ///    `max_admits` of them. One reprojection that admits a dozen files
+    ///    rebuilds the slot past every one of them and lifts each into VRAM;
+    ///    the ones turned away keep their momentum and enter on the next
+    ///    reprojections, so the set takes in new content without churning.
     pub fn observe(
         &mut self,
         fresh: &HashMap<TimelineId, f32>,
         beta: f32,
         min_momentum: f32,
         limits: Limits,
+        max_admits: usize,
         candidate: &dyn Fn(TimelineId) -> Option<Candidate>,
     ) {
         let locked: Vec<TimelineId> = self.pinned();
@@ -312,7 +317,11 @@ impl WorkingSet {
             .map(|(timeline, m)| (*timeline, *m))
             .collect();
         newcomers.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.raw().cmp(&b.0.raw())));
+        let mut admitted = 0usize;
         for (timeline, strength) in newcomers {
+            if admitted == max_admits {
+                break;
+            }
             let Some(Candidate {
                 tokens: Some(tokens),
                 share: Some(share),
@@ -327,6 +336,7 @@ impl WorkingSet {
             if let Some(victims) = self.room_for(tokens, share, limits, &beaten) {
                 self.evict(&victims);
                 self.admit(timeline, tokens, share);
+                admitted += 1;
             }
         }
     }
@@ -466,7 +476,7 @@ mod tests {
 
     fn observe(ws: &mut WorkingSet, fresh: &[(u64, f32)], budget: usize) {
         let fresh: HashMap<TimelineId, f32> = fresh.iter().map(|&(r, s)| (tl(r), s)).collect();
-        ws.observe(&fresh, 0.2, 100.0, limits(budget), &info);
+        ws.observe(&fresh, 0.2, 100.0, limits(budget), usize::MAX, &info);
     }
 
     /// **Locks enter just before the insertion point**: the oldest lock stays
@@ -645,7 +655,7 @@ mod tests {
             max_file_tokens: 1_000,
         };
         let fresh: HashMap<TimelineId, f32> = HashMap::from([(tl(50), 900.0), (tl(1), 200.0)]);
-        ws.observe(&fresh, 0.2, 100.0, lim, &info);
+        ws.observe(&fresh, 0.2, 100.0, lim, usize::MAX, &info);
         assert_eq!(order(&ws), vec![50, 1]);
         ws.lock(tl(51), cand(51), lim).unwrap();
         assert_eq!(
@@ -663,8 +673,37 @@ mod tests {
         observe(&mut ws, &[(1, 900.0)], 1_000);
         ws.lock(tl(2), cand(2), limits(1_000)).unwrap();
         let gone = |t: TimelineId| (t.raw() > 2).then(|| cand(t.raw()));
-        ws.observe(&HashMap::new(), 0.2, 100.0, limits(1_000), &gone);
+        ws.observe(
+            &HashMap::new(),
+            0.2,
+            100.0,
+            limits(1_000),
+            usize::MAX,
+            &gone,
+        );
         assert_eq!(order(&ws), vec![2]);
+    }
+
+    /// **One reprojection admits at most `max_admits` newcomers**, strongest
+    /// first; the rest keep their momentum and enter on the next ones.
+    #[test]
+    fn a_reprojection_admits_at_most_max_admits_newcomers() {
+        let mut ws = WorkingSet::default();
+        let fresh: HashMap<TimelineId, f32> = HashMap::from([
+            (tl(1), 900.0),
+            (tl(2), 800.0),
+            (tl(3), 700.0),
+            (tl(4), 600.0),
+        ]);
+        ws.observe(&fresh, 0.2, 100.0, limits(1_000), 2, &info);
+        assert_eq!(order(&ws), vec![1, 2]);
+        assert_eq!(
+            ws.momentum_of(tl(4)),
+            Some(600.0),
+            "a waiting file keeps its momentum"
+        );
+        ws.observe(&HashMap::new(), 0.2, 100.0, limits(1_000), 2, &info);
+        assert_eq!(order(&ws), vec![1, 2, 3, 4]);
     }
 
     /// A restored lock is put back whatever it costs — the model was told.

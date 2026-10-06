@@ -853,6 +853,35 @@ pub fn decode_events(payload: &[u8]) -> Vec<ProjectionEvent> {
     serde_json::from_slice(payload).unwrap_or_default()
 }
 
+/// A projection point as a conversation's timeline draws it: a
+/// [`ProjectionEvent`] without its `selection` and `materialized` spine.
+///
+/// Those two are read only by the projection panel and are most of a point's
+/// bytes — about ten kilobytes each. Decoded into this type they are skipped
+/// as the JSON is read, never built, so loading a conversation's history costs
+/// its timeline and not its panel.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ProjectionPoint {
+    #[serde(default)]
+    pub start_token: u32,
+    #[serde(default)]
+    pub seconds: f64,
+    #[serde(default)]
+    pub materialized_tokens: u32,
+    #[serde(default)]
+    pub substrate_tokens: u32,
+    #[serde(default)]
+    pub buckets: Vec<ProjectionBucket>,
+    #[serde(default)]
+    pub self_reference: bool,
+}
+
+/// Decode a projection-events record payload into its points, light — see
+/// [`ProjectionPoint`]. Empty on malformed input, like [`decode_events`].
+pub fn decode_points(payload: &[u8]) -> Vec<ProjectionPoint> {
+    serde_json::from_slice(payload).unwrap_or_default()
+}
+
 /// The name of the system-prompt collection a section belongs to, or `None`
 /// when the section is a bare top-level item (i.e. part of the system prompt
 /// proper, not a named group).
@@ -913,8 +942,9 @@ mod tests {
         GeneratedIdentity, ProjectionSegment, ResolvedSection, ResolvedTurn, SealedKind,
     };
     use super::{
-        aggregate, decode_events, encode_events, from_projection, staged_ingest_event,
-        summary_node_event, BucketKind, SegmentTokens, SelectedTurn, SelectionScores, SystemItem,
+        aggregate, decode_events, decode_points, encode_events, from_projection,
+        staged_ingest_event, summary_node_event, BucketKind, MaterializedPiece, ProjectionBucket,
+        ProjectionPoint, SegmentTokens, SelectedTurn, SelectionScores, SystemItem,
     };
     use crate::substrate::ContentResolver;
     use crate::summary_tree::TurnKind;
@@ -1008,6 +1038,44 @@ mod tests {
     fn decode_events_tolerates_garbage() {
         assert!(super::decode_events(b"not json").is_empty());
         assert!(super::decode_events(&[]).is_empty());
+        assert!(decode_points(b"not json").is_empty());
+    }
+
+    /// **A point is the event without its panel fields**, read from the same
+    /// record: every timeline field arrives, and a selection and spine in the
+    /// payload are skipped rather than refused.
+    #[test]
+    fn a_record_decodes_to_its_light_points() {
+        let mut full = aggregate(
+            &[seg(BucketKind::Turns, "conversation", 540)],
+            42_000,
+            120,
+            8.0,
+        );
+        full.self_reference = true;
+        full.materialized = vec![MaterializedPiece::Glue {
+            text: "<|im_start|>user\n".into(),
+        }];
+        full.selection.system = vec![SystemItem::Glue {
+            name: "system_start".into(),
+            content: "<|im_start|>system\n".into(),
+            tokens: 3,
+        }];
+        assert_eq!(
+            decode_points(&encode_events(&[full])),
+            vec![ProjectionPoint {
+                start_token: 120,
+                seconds: 8.0,
+                materialized_tokens: 540,
+                substrate_tokens: 42_000,
+                buckets: vec![ProjectionBucket {
+                    label: "conversation".into(),
+                    kind: BucketKind::Turns,
+                    tokens: 540,
+                }],
+                self_reference: true,
+            }]
+        );
     }
 
     // ── from_projection (schema + resolver classification) ───────────────────

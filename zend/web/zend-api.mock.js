@@ -82,8 +82,10 @@
     // The active conv (id '1') is already hydrated; others get a canned exchange
     // synthesized from the title so lazy-hydrate-on-select is demonstrable. The
     // wait is long enough for the pane's loading state to be seen.
+    // A test sets `window.__ZEND_MOCK_HYDRATE_DELAY_MS__` to hold every fetch
+    // that long, so one can still be in flight when the next turn is sent.
     async getConversation(id) {
-      await delay(350);
+      await delay(window.__ZEND_MOCK_HYDRATE_DELAY_MS__ || 350);
       const seed = (this._convs || []).find((c) => c.id === String(id));
       // The dials the daemon holds for a conversation — the levels its last
       // turn ran at. Deliberately not the composer's defaults, so adopting them
@@ -93,6 +95,29 @@
         return Object.assign({}, seed, { dials });
       }
       const title = seed ? seed.title : 'Conversation';
+      // Conversation 3 holds a round of two calls to one tool, the second
+      // refused — stored as the daemon stores a round of several calls, each
+      // result labelled `[i/n name]` ahead of its body.
+      if (String(id) === '3') {
+        return {
+          id: '3', title, dials, archived: false,
+          updated_ms: seed ? seed.updated_ms : Date.now(), turn_count: seed ? seed.turn_count : 2,
+          history: [
+            { role: 'user', content: title },
+            { role: 'assistant', content: J([
+              '<tool_call>{"name":"file_list","arguments":{"repo":"candle","path":"zend/src/api"}}</tool_call>',
+              '<tool_call>{"name":"file_list","arguments":{"repo":"candle","path":"zend/src/nope"}}</tool_call>',
+            ]) },
+            { role: 'user', content: J([
+              '<tool_response>[1/2 file_list]',
+              '{"entries":["conversations.rs","mod.rs"],"paging":{"page":0,"pages":1,"total":2}}</tool_response>',
+              '<tool_response>[2/2 file_list]',
+              '{"error":"not_found","detail":"no such folder: zend/src/nope"}</tool_response>',
+            ]) },
+            { role: 'assistant', content: 'The archive route belongs beside the others in `conversations.rs`.' },
+          ],
+        };
+      }
       return {
         id: String(id), title, dials,
         archived: seed ? seed.archived : false,
@@ -462,6 +487,13 @@
     // A message asking to read a file runs one tool round first, as the daemon
     // does: the call streams, the tool runs (`tool` running → done), and its
     // result is prefilled with progress (`prefill` events) before the answer.
+    // The mock keeps no reply running between requests, so there is never one
+    // to follow: the stored conversation is always complete.
+    followConversation(id, handlers) {
+      const t = setTimeout(() => { if (handlers.onGone) handlers.onGone(); }, 34);
+      return { cancel: () => clearTimeout(t) };
+    },
+
     streamChatCompletion(conv, text, opts, handlers) {
       const timers = [];
       let cancelled = false;

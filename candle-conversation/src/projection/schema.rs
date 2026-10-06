@@ -1047,6 +1047,11 @@ pub struct GroupSchema {
     /// exchanges is selected (e.g. `first` = the file-header exchange). `None`
     /// = no anchor.
     pub anchor: Option<AnchorConfig>,
+    /// The most conversations a mid-decode reprojection may bring into this
+    /// group's selection (`docs/projection_swap_cap.md`); the rest wait for the
+    /// next. Belief-driven groups only — the working set fades by its own
+    /// momentum, and section collections (the tool catalog) are not capped.
+    pub max_swaps: usize,
 }
 
 impl GroupSchema {
@@ -1432,6 +1437,7 @@ mod belief_config_tests {
     use super::{Budget, GroupSchema, SelectionPolicy, SelectionRule};
     use crate::projection::ids::GroupId;
     use crate::projection::policy::PolicyPreset;
+    use crate::projection::swap_cap::DEFAULT_MAX_SWAPS;
     use crate::projection::ScanPolicy;
 
     fn group(score_threshold: Option<f32>, min: f32, evict: f32) -> GroupSchema {
@@ -1463,6 +1469,7 @@ mod belief_config_tests {
             budget_adaptive: None,
             locality: None,
             anchor: None,
+            max_swaps: DEFAULT_MAX_SWAPS,
         }
     }
 

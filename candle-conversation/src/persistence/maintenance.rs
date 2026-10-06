@@ -60,7 +60,7 @@
 //! the source's higher-id-losing copies are simply superseded by id order.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use super::content_hash::section_stream_id;
 use super::manifest::{encode_conv_state_payload, encode_label_payload, ChunkLoc, RecordLoc};
@@ -519,7 +519,7 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
                     rt: RecordType::TurnIndexPage,
                     stream_id: stream_id.0,
                     chunk_index: 0,
-                    payload: p.clone(),
+                    payload: p.bytes().to_vec(),
                 });
             }
         }
@@ -771,7 +771,9 @@ impl SubstratePersistence {
         if sealed.is_empty() {
             return Ok(None);
         }
+        let t_liveness = Instant::now();
         let (liveness, carried) = self.liveness_and_carry(substrate);
+        let liveness_ms = t_liveness.elapsed().as_millis() as u64;
         let now = SystemTime::now();
         let mut stats = Vec::with_capacity(sealed.len());
         for &id in &sealed {
@@ -789,11 +791,14 @@ impl SubstratePersistence {
         // lose a unique metadata record — i.e. it targets a segment not covered by
         // the last re-emission. Skipping it for older-only targets is what breaks
         // the re-emit→looks-dead→compact churn (see `need_resident_reemit`).
+        let t_resident = Instant::now();
         let resident = if self.need_resident_reemit(&op.targets(), &carried) {
             gather_resident_set(substrate)
         } else {
             Vec::new()
         };
+        let resident_ms = t_resident.elapsed().as_millis() as u64;
+        let t_relocs = Instant::now();
         let reemit_floor = (!resident.is_empty()).then(|| self.segments.active_id());
         let (
             chunk_relocs,
@@ -804,6 +809,7 @@ impl SubstratePersistence {
         ) = self.gather_relocations(substrate, &op.targets());
         let npc_relocs = self.npc_relocations(&op.targets());
         let vfs_relocs = self.vfs_relocations(substrate, &op.targets());
+        let relocs_ms = t_relocs.elapsed().as_millis() as u64;
         // What this op carries off the target segments, by type. The incremental
         // path is the one that actually runs on a busy store — the 143 GB store
         // burned through ~370 segment generations without a single full
@@ -845,6 +851,9 @@ impl SubstratePersistence {
             singletons = singleton_relocs.len(),
             npcs = npc_relocs.len(),
             vfs = vfs_relocs.len(),
+            liveness_ms,
+            resident_ms,
+            relocs_ms,
             "maintenance {:?}: re-emitting {}",
             op,
             resident_census.summary()

@@ -11,8 +11,8 @@ use crate::persistence::thread::PersistenceThread;
 use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::SharedSubstrate;
 use crate::projection::{
-    Builder, CollectionWarm, Conversation, GroupId, LayerId, PlainPromptFrames, ProjectionTarget,
-    Reserved, Schema, SectionId, TimelineId, TurnIndex, WorkingSetShare,
+    Builder, CollectionWarm, Conversation, GalleryPreload, GroupId, LayerId, PlainPromptFrames,
+    ProjectionTarget, Reserved, Schema, SectionId, TimelineId, TurnIndex, WorkingSetShare,
 };
 use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
@@ -889,6 +889,27 @@ impl ConversationEngine {
             .is_err()
         {
             return CollectionWarm::default();
+        }
+        rx.recv().unwrap_or_default()
+    }
+
+    /// Preload what a projection's belief scan reads — every scanned group's
+    /// signatures and every collection's gallery, decoded and resident on the
+    /// GPU gallery arena — so the first projection after a start does none of
+    /// it. Runs on the scheduler thread, which owns the arena, and blocks until
+    /// it is done. See [`Conversation::preload_galleries`].
+    pub fn preload_galleries(&self, schema: &Schema) -> GalleryPreload {
+        let (tx, rx) = flume::bounded(1);
+        if self
+            .scheduler_tx
+            .send(SchedulerRequest::PreloadGalleries {
+                conversation: self.conversation.clone(),
+                schema: Box::new(schema.clone()),
+                response_tx: tx,
+            })
+            .is_err()
+        {
+            return GalleryPreload::default();
         }
         rx.recv().unwrap_or_default()
     }

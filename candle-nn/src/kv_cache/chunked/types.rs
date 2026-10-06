@@ -539,6 +539,25 @@ pub(crate) fn front_evict_count(
     drained
 }
 
+/// A freed sequence's block table, detached from its slot
+/// ([`ChunkedKvBacking::free_sequence_detached`](super::ChunkedKvBacking::free_sequence_detached)).
+///
+/// Dropping it releases the chunks, on whichever thread drops it. Nothing in it
+/// touches the device.
+pub struct DetachedChunks(pub(crate) Vec<ChunkWindow>);
+
+impl DetachedChunks {
+    /// Chunks held.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether it holds no chunk.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SequenceState {
     /// All blocks in token order.  Shared (prefix) and owned chunks
@@ -1182,6 +1201,14 @@ impl SequenceState {
     pub(crate) fn clear_chunks(&mut self) {
         self.chunks.clear();
         self.gpu_chunks.as_mut().clear();
+    }
+
+    /// Move every chunk out and clear the GPU buffer, handing the chunks to
+    /// the caller to drop.
+    pub(crate) fn take_chunks(&mut self) -> Vec<ChunkWindow> {
+        let chunks = std::mem::take(&mut self.chunks);
+        self.gpu_chunks.as_mut().clear();
+        chunks
     }
 
     /// Drain the first `n` chunks (RAII-drops their GIDs) and clear the GPU buffer.

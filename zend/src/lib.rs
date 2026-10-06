@@ -29,6 +29,7 @@ pub mod ingest_backlog;
 pub mod ingest_report;
 pub mod ingest_worker;
 pub mod lenient_json;
+pub mod live_turn;
 pub mod loading;
 pub mod log_broadcast;
 pub mod log_line;

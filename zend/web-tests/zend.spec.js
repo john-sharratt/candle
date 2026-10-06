@@ -198,6 +198,14 @@ test.describe('1.3b a failed send', () => {
     await page.getByRole('button', { name: 'Reload conversation' }).click();
     await expect(page.locator('.zerr')).toHaveCount(0);
   });
+
+  // A phone dropping the connection mid-reply: the daemon still has the turn,
+  // so the page picks it up again by itself — nobody has to press anything.
+  test('a stream that broke after the daemon took the turn reconnects by itself', async ({ page }) => {
+    await sendFailing(page, { message: 'The response stream broke: network error', reached: true });
+    await expect(page.locator('.zerr')).toHaveCount(0, { timeout: 5000 });
+    await expect(page.locator('.z-turn', { hasText: 'Give me the short version' })).toHaveCount(0);
+  });
 });
 
 test.describe('1.5b dials follow the conversation', () => {
@@ -518,6 +526,59 @@ test.describe('1.11 opening a conversation', () => {
     await expect(card.locator('.tool-call-badge.ok')).toBeVisible({ timeout: 5000 });
     await card.locator('summary').click();
     await expect(card.locator('.tool-call-out-tokens')).toHaveText('2,140 tokens');
+  });
+
+  // A round of several calls is stored with each result labelled `[i/n name]`
+  // ahead of its body. Read without the label, the failed call's error was no
+  // JSON and its card turned green once the conversation was loaded again.
+  test('a stored round of two calls keeps the failed one red', async ({ page }) => {
+    await boot(page, { conv: '3' });
+    const cards = page.locator('details.tool-call-card');
+    await expect(cards).toHaveCount(2);
+    await expect(cards.nth(0).locator('.tool-call-badge.ok')).toBeVisible();
+    await expect(cards.nth(1).locator('.tool-call-badge.err')).toHaveText('error');
+    await expect(cards.nth(0).locator('.tool-call-detail')).toHaveText('2 files');
+  });
+
+  // A collapsed card's output and a collapsed thought's body are drawn when
+  // they open, not with the page.
+  test('a collapsed output and thought are drawn when opened', async ({ page }) => {
+    await boot(page, { conv: '3' });
+    const card = page.locator('details.tool-call-card').nth(1);
+    const out = card.locator('.tool-call-out-body');
+    await expect(out).toHaveText('');
+    await card.locator('summary').click();
+    await expect(out).toContainText('no such folder: zend/src/nope');
+    await boot(page, { conv: '1' });
+    const think = page.locator('details.think-block').first();
+    await expect(think.locator('.think-body')).toHaveText('');
+    await think.locator('summary').click();
+    await expect(think.locator('.think-body')).toContainText('Substrate::recover');
+  });
+});
+
+test.describe('1.11a the next turn survives a late refresh', () => {
+  // The fetch that reconciles a finished turn can land after the next turn was
+  // sent. It cannot hold that turn, so adopting it hid the new question and
+  // left the stream writing into the previous answer until the turn ended.
+  test('a snapshot landing mid-stream leaves the new turn and its stream alone', async ({ page }) => {
+    await boot(page, { conv: '2' });
+    await expect(page.locator('.zmd').first()).toBeVisible();
+    await page.evaluate(() => { window.__ZEND_MOCK_HYDRATE_DELAY_MS__ = 1500; });
+    const ta = page.locator('#zend-prompt');
+    await ta.fill('Give me the short version');
+    await ta.press('Enter');
+    // Turn 1 done: its reconcile fetch is now in flight for 1.5 s.
+    await expect(page.getByTitle('Stop generating')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByTitle('Stop generating')).toHaveCount(0, { timeout: 15000 });
+    await ta.fill('And the long version');
+    await ta.press('Enter');
+    await page.waitForTimeout(2000); // past the late fetch
+    await expect(page.locator('.z-turn', { hasText: 'And the long version' })).toHaveCount(1);
+    const before = await page.locator('[data-msg]').last().locator('.zmd').innerText();
+    await page.waitForTimeout(500);
+    const after = await page.locator('[data-msg]').last().locator('.zmd').innerText();
+    expect(after.length).toBeGreaterThan(before.length);
   });
 });
 

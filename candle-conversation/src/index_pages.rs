@@ -22,11 +22,14 @@
 //!
 //! The turn record stores one payload, last-writer-wins per turn stream id, and
 //! five persistence sites depend on that shape. So the list is framed into that
-//! single payload here rather than becoming several records: the record, the
-//! substrate field, and `Scheduler::turn_positional` all keep their types, and
-//! only the producer and the consumer learn about the framing.
+//! single payload here rather than becoming several records, and only the
+//! producer and the consumer learn about the framing. In memory the payload is
+//! held as [`StoredPages`], which keeps each page's key beside it.
 
 use std::fmt::{self, Display, Formatter};
+use std::sync::{Arc, OnceLock};
+
+use candle_transformers::models::piece_key::PieceKey;
 
 /// A malformed page payload.
 ///
@@ -133,17 +136,18 @@ pub struct Pushed {
 /// error: the width to advance over is then the turn's whole K/V, which only the
 /// caller knows.
 pub fn push_in_order<E: Display>(
-    blob: &[u8],
-    mut push: impl FnMut(&[u8]) -> Result<(), E>,
+    stored: &StoredPages,
+    mut push: impl FnMut(&[u8], &PieceKey) -> Result<(), E>,
     mut gap: impl FnMut(usize),
 ) -> Result<Pushed, MalformedPages> {
-    let pages = decode(blob)?;
+    let pages = decode(stored.bytes())?;
+    let keys = stored.page_keys();
     let declared: usize = pages.iter().map(|(tokens, _)| *tokens).sum();
     let mut covered = 0usize;
     let mut accepted = 0usize;
     let mut refused = None;
-    for (tokens, page) in pages {
-        match push(page) {
+    for ((tokens, page), key) in pages.into_iter().zip(keys) {
+        match push(page, key) {
             Ok(()) => {
                 accepted += 1;
                 covered += tokens;
@@ -181,6 +185,25 @@ pub fn push_in_order<E: Display>(
 /// `seal_positional_tail_span` produces for a turn's own width.
 pub fn without_span(blob: &[u8], span: std::ops::Range<usize>) -> Option<Vec<u8>> {
     let pages = decode(blob).ok()?;
+    // **An empty span removes nothing, so everything is kept.** See
+    // `kept_outside`.
+    if span.is_empty() {
+        return Some(blob.to_vec());
+    }
+    let kept = kept_outside(&pages, span)?;
+    Some(encode(
+        &kept
+            .iter()
+            .map(|&i| (pages[i].0, pages[i].1.to_vec()))
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// The positions in `pages` of the pages outside `span`, or `None` when the
+/// span does not fall on page boundaries — the decision [`without_span`]
+/// frames, shared with [`StoredPages::without_span`], which carries the kept
+/// pages' keys over instead of digesting them again.
+fn kept_outside(pages: &[Page<'_>], span: std::ops::Range<usize>) -> Option<Vec<usize>> {
     // **An empty span removes nothing, so everything is kept.** The final
     // equality below compares `dropped_from` against `span.start`, and a
     // zero-width span drops no page at all, so it stays `None` and the check
@@ -188,13 +211,13 @@ pub fn without_span(blob: &[u8], span: std::ops::Range<usize>) -> Option<Vec<u8>
     // A `Thinking` span can legitimately be zero-width (a block whose reasoning
     // was clamped away), and such a turn is windowed by keeping it intact.
     if span.is_empty() {
-        return Some(blob.to_vec());
+        return Some((0..pages.len()).collect());
     }
-    let mut kept: Vec<(usize, Vec<u8>)> = Vec::with_capacity(pages.len());
+    let mut kept: Vec<usize> = Vec::with_capacity(pages.len());
     let mut dropped_from: Option<usize> = None;
     let mut dropped_tokens = 0usize;
     let mut cursor = 0usize;
-    for (tokens, bytes) in pages {
+    for (i, &(tokens, _)) in pages.iter().enumerate() {
         let page = cursor..cursor + tokens;
         cursor = page.end;
         // **A zero-width page describes no token, so it cannot straddle
@@ -220,10 +243,106 @@ pub fn without_span(blob: &[u8], span: std::ops::Range<usize>) -> Option<Vec<u8>
         if page.start < span.end && page.end > span.start {
             return None;
         }
-        kept.push((tokens, bytes.to_vec()));
+        kept.push(i);
     }
     // The dropped pages must be exactly the span — same start, same width.
-    (dropped_from == Some(span.start) && dropped_tokens == span.len()).then(|| encode(&kept))
+    (dropped_from == Some(span.start) && dropped_tokens == span.len()).then_some(kept)
+}
+
+/// A piece's sealed page bytes as held in memory, with their [`PieceKey`]s
+/// taken once.
+///
+/// The bytes are shared: every projection that selects the piece hands them to
+/// the model, which finds the piece's placed rows by key. A turn's page list
+/// runs to a megabyte and more on a model that indexes every attention layer,
+/// so digesting it per hand-over was a third of what re-injecting a turn cost.
+/// The keys are taken on first use and kept with the bytes they describe — the
+/// bytes never change under them — and a windowed copy inherits the kept
+/// pages' keys rather than digesting them again.
+///
+/// A turn's bytes are a framed page list ([`encode`]), read through
+/// [`Self::page_keys`] and [`push_in_order`]; a prompt section's are a single
+/// page, read through [`Self::whole_key`].
+#[derive(Debug)]
+pub struct StoredPages {
+    bytes: Arc<[u8]>,
+    page_keys: OnceLock<Box<[PieceKey]>>,
+    whole_key: OnceLock<PieceKey>,
+}
+
+impl StoredPages {
+    pub fn new(bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            page_keys: OnceLock::new(),
+            whole_key: OnceLock::new(),
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Each framed page's key, in page order — empty for a payload that does
+    /// not decode, which [`push_in_order`] refuses before it reads a key.
+    pub fn page_keys(&self) -> &[PieceKey] {
+        self.page_keys.get_or_init(|| {
+            decode(&self.bytes)
+                .map(|pages| pages.iter().map(|(_, p)| PieceKey::of(p)).collect())
+                .unwrap_or_default()
+        })
+    }
+
+    /// The key of the bytes as one page.
+    pub fn whole_key(&self) -> PieceKey {
+        *self.whole_key.get_or_init(|| PieceKey::of(&self.bytes))
+    }
+
+    /// [`without_span`], keyed: the pages outside `span` with the keys they
+    /// already had. `None` when the span does not fall on page boundaries or
+    /// the payload does not decode.
+    pub fn without_span(&self, span: std::ops::Range<usize>) -> Option<StoredPages> {
+        let pages = decode(&self.bytes).ok()?;
+        let kept = kept_outside(&pages, span)?;
+        if kept.len() == pages.len() {
+            return Some(self.clone());
+        }
+        let keys = self.page_keys();
+        let framed = encode(
+            &kept
+                .iter()
+                .map(|&i| (pages[i].0, pages[i].1.to_vec()))
+                .collect::<Vec<_>>(),
+        );
+        Some(StoredPages {
+            bytes: framed.into(),
+            page_keys: kept
+                .iter()
+                .map(|&i| keys[i])
+                .collect::<Box<[PieceKey]>>()
+                .into(),
+            whole_key: OnceLock::new(),
+        })
+    }
+}
+
+impl Clone for StoredPages {
+    /// The same bytes, and whatever keys were already taken of them.
+    fn clone(&self) -> Self {
+        Self {
+            bytes: Arc::clone(&self.bytes),
+            page_keys: self
+                .page_keys
+                .get()
+                .cloned()
+                .map_or_else(OnceLock::new, OnceLock::from),
+            whole_key: self
+                .whole_key
+                .get()
+                .copied()
+                .map_or_else(OnceLock::new, OnceLock::from),
+        }
+    }
 }
 
 /// The page boundaries a blob describes, as cumulative grid positions starting
@@ -247,7 +366,8 @@ pub fn boundaries(blob: &[u8]) -> Option<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode, push_in_order, without_span, Pushed};
+    use super::{decode, encode, push_in_order, without_span, Pushed, StoredPages};
+    use candle_transformers::models::piece_key::PieceKey;
 
     fn pages(spec: &[(usize, &[u8])]) -> Vec<(usize, Vec<u8>)> {
         spec.iter().map(|(t, b)| (*t, b.to_vec())).collect()
@@ -444,8 +564,9 @@ mod tests {
         let mut seen: Vec<Vec<u8>> = Vec::new();
         let mut gaps: Vec<usize> = Vec::new();
         let out = push_in_order(
-            &blob,
-            |p| {
+            &StoredPages::new(blob),
+            |p, k| {
+                assert_eq!(*k, PieceKey::of(p), "each page arrives with its own key");
                 seen.push(p.to_vec());
                 Ok::<(), String>(())
             },
@@ -476,8 +597,8 @@ mod tests {
         let mut seen: Vec<Vec<u8>> = Vec::new();
         let mut gaps: Vec<usize> = Vec::new();
         let out = push_in_order(
-            &blob,
-            |p| {
+            &StoredPages::new(blob),
+            |p, _| {
                 if p == [0xB1] {
                     return Err("refused".to_string());
                 }
@@ -511,8 +632,8 @@ mod tests {
         let mut pushes = 0usize;
         let mut gaps = 0usize;
         let out = push_in_order(
-            b"not a page list",
-            |_| {
+            &StoredPages::new(&b"not a page list"[..]),
+            |_, _| {
                 pushes += 1;
                 Ok::<(), String>(())
             },
@@ -520,5 +641,40 @@ mod tests {
         );
         assert!(out.is_err());
         assert_eq!((pushes, gaps), (0, 0));
+    }
+
+    /// **A windowed copy carries the kept pages' own keys** — the keys a fresh
+    /// digest of those pages gives — and the payload [`without_span`] frames.
+    /// A span that keeps everything hands back the same bytes.
+    #[test]
+    fn a_windowed_copy_keeps_the_kept_pages_keys() {
+        let blob = encode(&pages(&[(10, b"pre"), (15, b"think"), (15, b"ans")]));
+        let stored = StoredPages::new(blob.clone());
+        let kept = stored.without_span(10..25).expect("aligned");
+        assert_eq!(
+            kept.bytes(),
+            without_span(&blob, 10..25).unwrap().as_slice()
+        );
+        assert_eq!(
+            kept.page_keys(),
+            &[PieceKey::of(b"pre"), PieceKey::of(b"ans")][..]
+        );
+        assert!(stored.without_span(11..25).is_none());
+
+        let whole = stored
+            .without_span(4..4)
+            .expect("an empty span keeps everything");
+        assert_eq!(whole.bytes(), blob.as_slice());
+        assert_eq!(whole.page_keys(), stored.page_keys());
+    }
+
+    /// A section's page is its whole bytes, keyed as one; a payload that does
+    /// not decode has no page keys.
+    #[test]
+    fn a_whole_page_is_keyed_as_one() {
+        let stored = StoredPages::new(&b"a section page"[..]);
+        assert_eq!(stored.whole_key(), PieceKey::of(b"a section page"));
+        assert!(stored.page_keys().is_empty());
+        assert_eq!(stored.clone().whole_key(), stored.whole_key());
     }
 }

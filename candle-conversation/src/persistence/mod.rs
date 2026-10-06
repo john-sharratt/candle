@@ -41,6 +41,7 @@ pub mod maintenance;
 pub mod manifest;
 pub mod payload_parts;
 pub mod pipeline;
+pub mod priority_lock;
 pub mod record;
 pub mod recovery;
 pub mod relocation_watch;
@@ -59,7 +60,7 @@ pub mod writer;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use thiserror::Error;
 
@@ -73,6 +74,7 @@ use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
 use manifest::{ChunkLoc, Manifest, RecordLoc};
+pub use priority_lock::PersistenceLock;
 use record::{
     decode_record, encode_record, ChunkPayload, CustomObjectPayload, DebugIdPayload, NpcPayload,
     RecordHeader, RecordType, SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
@@ -212,7 +214,7 @@ pub(crate) fn dir_fingerprint(dir: &Path) -> Vec<(String, u64, [u8; 32])> {
 #[derive(Clone)]
 pub struct SharedSubstrate {
     pub substrate: Arc<RwLock<Substrate>>,
-    pub persistence: Arc<Mutex<SubstratePersistence>>,
+    pub persistence: Arc<PersistenceLock>,
 }
 
 /// Names the directory rather than the contents. A substrate's interesting
@@ -241,7 +243,7 @@ impl SharedSubstrate {
     pub fn new(substrate: Substrate, persistence: SubstratePersistence) -> Self {
         Self {
             substrate: Arc::new(RwLock::new(substrate)),
-            persistence: Arc::new(Mutex::new(persistence)),
+            persistence: Arc::new(PersistenceLock::new(persistence)),
         }
     }
 

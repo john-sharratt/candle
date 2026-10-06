@@ -37,6 +37,7 @@ use candle_nn::kv_cache::{relocate_tensor, ArenaSlot};
 use super::index_keys::{alloc_buffers, PAGE_BLOCKS};
 use super::indexer::{i64_ptr, tensor_ptr};
 use super::place::PLACE_TILE_R;
+use crate::models::piece_key::PieceKey;
 use crate::models::wave_buffers::wave_from_vec_ticketed;
 
 /// How a resident page's rows sit in each of its chunks.
@@ -289,19 +290,6 @@ impl ResidentPage {
 pub struct PageRegistry {
     /// One page per KV layer; `None` for a layer that indexes nothing.
     map: Mutex<HashMap<PieceKey, Vec<Option<Weak<ResidentPage>>>>>,
-}
-
-/// A piece's identity: the BLAKE3 digest of its record bytes. The pages are a
-/// pure function of those bytes — rows, widths, layer order — and where a page
-/// sits is recorded by the cache that holds it, not by the page, so equal
-/// records are interchangeable in every slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PieceKey([u8; 32]);
-
-impl PieceKey {
-    pub fn of(record: &[u8]) -> Self {
-        Self(*blake3::hash(record).as_bytes())
-    }
 }
 
 impl PageRegistry {

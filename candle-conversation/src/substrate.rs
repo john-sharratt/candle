@@ -46,11 +46,11 @@ use ahash::{AHashMap, AHashSet};
 use candle_nn::kv_cache::{
     rewrite_sealed, try_hold_chunk_locations, QuantFormat, SealedSequence, Sweep,
 };
-use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
 
 use crate::conversation::window_sealed_tokens;
-use crate::index_pages;
+use crate::index_pages::{self, StoredPages};
 use crate::normalization::Phase;
 use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
 use crate::persistence::manifest::{
@@ -64,8 +64,8 @@ use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
 use crate::projection::{
     decode_events, CorruptTurnPolicy, GroupId, LayerId, OwnedSection, OwnedSections,
-    ProjectionTarget, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
-    WorkingSetMembers, WorkingSetShare,
+    ProjectionEvent, ProjectionTarget, SectionId, SystemItem, TimelineAllocator, TimelineId,
+    TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
 };
 use crate::provenance::{decode_wide_sigs_for_scoring, WideQSig};
 use crate::summary_tree::exchange::Couplings;
@@ -74,7 +74,8 @@ use crate::summary_tree::{
     TurnKind, MERGE_FANOUT,
 };
 use crate::token_buffer::TokenBuffer;
-use crate::turn_layout::{phase_span_of, TurnLayout, TurnSegment};
+use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnSegment};
+use crate::working_set::marks::is_dialogue;
 use crate::working_set::{Candidate, Limits, Refusal, WorkingSet};
 use crate::ConversationError;
 
@@ -112,7 +113,42 @@ type SigCache = HashMap<StreamId, Option<Arc<Vec<WideQSig>>>>;
 
 /// Per-stream memo of a turn's self-referencing sub-window seam offsets (sorted,
 /// deduped). See [`Substrate::decoded_seams`].
-type SeamCache = HashMap<StreamId, Arc<Vec<usize>>>;
+/// What the belief scans read from a turn's projection-events blob, decoded
+/// from its JSON once: the seams of its self-referencing sub-windows, sorted
+/// and deduped, and per section collection the section its latest projection
+/// that chose one in that collection selected.
+#[derive(Debug, Default)]
+struct EventsDigest {
+    seams: Arc<Vec<usize>>,
+    selected: HashMap<String, String>,
+}
+
+type EventsCache = HashMap<StreamId, Arc<EventsDigest>>;
+
+/// The digest of a turn's projection events, in their recorded order.
+fn digest_events(events: &[ProjectionEvent]) -> EventsDigest {
+    let mut seams: Vec<usize> = events
+        .iter()
+        .filter(|e| e.self_reference)
+        .map(|e| e.start_token as usize)
+        .collect();
+    seams.sort_unstable();
+    seams.dedup();
+    let mut selected = HashMap::new();
+    for event in events {
+        for item in &event.selection.system {
+            if let SystemItem::Collection { name, sections, .. } = item {
+                if let Some(s) = sections.iter().find(|s| s.selected) {
+                    selected.insert(name.clone(), s.name.clone());
+                }
+            }
+        }
+    }
+    EventsDigest {
+        seams: Arc::new(seams),
+        selected,
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Substrate {
@@ -252,6 +288,17 @@ pub struct Substrate {
     /// memory — reload rebuilds it from record headers.
     streams: HashMap<StreamId, StreamRuntime>,
 
+    /// The streams of `streams` whose declaration is a turn in a gather scope —
+    /// one carrying a tag that is not a working-set mark — kept in step with
+    /// every declaration installed and every stream removed.
+    ///
+    /// A tagged collection's gallery is drawn from these alone, and they are a
+    /// small fixed corpus (the tool calibration turns) beside a substrate of
+    /// every turn and chunk stream ingest has written. Walking all of `streams`
+    /// to find them was ~115 ms, paid on the first reprojection after every
+    /// seal anywhere in the workspace.
+    tagged_turns: BTreeSet<StreamId>,
+
     /// Bumped whenever anything a collection's belief gallery is assembled from
     /// changes — a stream declared, a signature or projection-event blob
     /// written, a turn or timeline tombstoned, the streams cleared. The gallery
@@ -267,11 +314,12 @@ pub struct Substrate {
     /// gallery. See [`Self::decoded_wide_sig`].
     sig_cache: Mutex<SigCache>,
 
-    /// Interior-mutable per-stream memo of a turn's self-referencing sub-window
-    /// seam offsets, decoded from the (JSON) projection-events blob once per
-    /// session instead of re-parsing it on every belief scan. Invalidated
-    /// per-stream on an events-blob write. See [`Self::decoded_seams`].
-    seam_cache: Mutex<SeamCache>,
+    /// Interior-mutable per-stream memo of what the belief scans read from a
+    /// turn's projection-events blob — its seams and its selections — decoded
+    /// from the JSON once per session instead of on every scan and every
+    /// gallery assembly. Invalidated per-stream on an events-blob write. See
+    /// [`Self::decoded_seams`] and [`Self::last_selected_in`].
+    events_cache: Mutex<EventsCache>,
 
     /// Reverse index: stable resume keys (`debug_id`) → `TimelineId`.
     /// Populated by [`Self::set_debug_id`] and the cold-load reader.
@@ -1457,7 +1505,13 @@ pub struct StreamRuntime {
     /// A projection that borrows this turn's K/V needs these rows handed over
     /// with it: the index is computed from hidden states, so unlike the K/V it
     /// cannot be reconstructed by the slot that borrows it.
-    pub index_page: Option<Vec<u8>>,
+    ///
+    /// Shared, not owned, and keyed once: every projection that selects the
+    /// turn hands these bytes over, and a turn's page runs to a megabyte and
+    /// more on a model that indexes every attention layer, so a copy and a
+    /// digest per projection were most of what re-injecting a turn cost. See
+    /// [`StoredPages`].
+    pub index_page: Option<Arc<StoredPages>>,
     /// Highest chunk index the stream is durably committed through.
     pub committed_through: Option<u64>,
 }
@@ -3233,9 +3287,10 @@ impl Substrate {
         beta: f32,
         min_momentum: f32,
         limits: Limits,
+        max_admits: usize,
     ) {
         let mut ws = self.working_sets.remove(&target).unwrap_or_default();
-        ws.observe(fresh, beta, min_momentum, limits, &|timeline| {
+        ws.observe(fresh, beta, min_momentum, limits, max_admits, &|timeline| {
             self.working_set_candidate(target, timeline)
         });
         self.working_sets.insert(target, ws);
@@ -3787,34 +3842,42 @@ impl Substrate {
     /// or no self-referencing seams (the common case for a code-read scope, which
     /// scores as one whole-turn window). See [`Self::score_belief_groups`].
     pub fn decoded_seams(&self, stream_id: StreamId) -> Arc<Vec<usize>> {
+        self.events_digest(stream_id).seams.clone()
+    }
+
+    /// The section `collection` was last seen selecting in this turn's
+    /// projections — the latest of its events that selected one there — or
+    /// `None` when none did. What labels an untagged turn in a collection's
+    /// belief gallery, read from the memo rather than by decoding the turn's
+    /// events JSON on every assembly.
+    pub fn last_selected_in(&self, stream_id: StreamId, collection: &str) -> Option<String> {
+        self.events_digest(stream_id)
+            .selected
+            .get(collection)
+            .cloned()
+    }
+
+    fn events_digest(&self, stream_id: StreamId) -> Arc<EventsDigest> {
         {
-            let cache = self.seam_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self.events_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(hit) = cache.get(&stream_id) {
                 return hit.clone();
             }
         }
         // Decode OUTSIDE the lock (mirrors `decoded_wide_sig`): a concurrent miss
         // on the same stream just decodes twice — harmless, the value is identical.
-        let mut seams: Vec<usize> = self
+        let events = self
             .streams
             .get(&stream_id)
             .and_then(|e| e.projection_events.as_deref())
             .map(decode_events)
-            .map(|evs| {
-                evs.iter()
-                    .filter(|e| e.self_reference)
-                    .map(|e| e.start_token as usize)
-                    .collect()
-            })
             .unwrap_or_default();
-        seams.sort_unstable();
-        seams.dedup();
-        let arc = Arc::new(seams);
-        self.seam_cache
+        let digest = Arc::new(digest_events(&events));
+        self.events_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(stream_id, arc.clone());
-        arc
+            .insert(stream_id, digest.clone());
+        digest
     }
 
     /// True iff the substrate has any record of `stream_id`.
@@ -3857,6 +3920,7 @@ impl Substrate {
     /// per-turn KV residence slots) is preserved.
     pub fn clear_walker_state(&mut self) {
         self.streams.clear();
+        self.tagged_turns.clear();
         self.gallery_epoch += 1;
         self.timeline_by_debug_id.clear();
         // The two indexes compaction can *shrink* — an entry whose record was
@@ -4002,8 +4066,25 @@ impl Substrate {
                 self.register_timeline(timeline, layer, group);
             }
         }
+        match &decl {
+            StreamDecl::Turn(t) if !is_dialogue(&t.tags) => {
+                self.tagged_turns.insert(stream_id);
+            }
+            _ => {
+                self.tagged_turns.remove(&stream_id);
+            }
+        }
         self.streams.entry(stream_id).or_default().decl = Some(decl);
         self.gallery_epoch += 1;
+    }
+
+    /// Every stream declared as a turn in a gather scope, with its runtime —
+    /// the members a tagged collection's gallery is drawn from. See the
+    /// `tagged_turns` field.
+    pub fn tagged_turn_streams(&self) -> impl Iterator<Item = (StreamId, &StreamRuntime)> + '_ {
+        self.tagged_turns
+            .iter()
+            .filter_map(|sid| self.streams.get(sid).map(|e| (*sid, e)))
     }
 
     /// Record a chunk location for `stream_id` at chunk index `idx`.
@@ -4470,6 +4551,7 @@ impl Substrate {
     fn reset_tombstoned_stream(&mut self, stream_id: StreamId) {
         self.tombstoned_sections.insert(stream_id);
         self.streams.remove(&stream_id);
+        self.tagged_turns.remove(&stream_id);
         self.gallery_epoch += 1;
     }
 
@@ -5037,7 +5119,7 @@ impl Substrate {
                 self.gallery_epoch += 1;
                 // Mirror the `WideQSig` arm: drop this stream's memoized seams so a
                 // replay/apply after the seam cache warmed can't serve stale seams.
-                self.seam_cache
+                self.events_cache
                     .get_mut()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&stream_id);
@@ -5054,7 +5136,7 @@ impl Substrate {
                 // Opaque QSA index-page bytes, last-writer-wins per stream id —
                 // a turn's or a prompt section's; a re-seal replaces the page.
                 self.streams.entry(stream_id).or_default().index_page =
-                    Some(entry.record.payload.clone());
+                    Some(Arc::new(StoredPages::new(entry.record.payload.as_slice())));
             }
             // Singletons go to the manifest, not the substrate; the
             // header-index chain is consumed by recovery, never here.
@@ -5459,6 +5541,37 @@ impl Substrate {
             .unwrap_or_default()
     }
 
+    /// A turn's reasoning length ([`TurnLayout::thinking_length`]), read from
+    /// its layout in place.
+    pub fn thinking_length_of(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        estimate: impl Fn(&str) -> u32,
+    ) -> Option<ThinkingLength> {
+        self.turn(timeline, index)?
+            .content
+            .layout
+            .thinking_length(estimate)
+    }
+
+    /// The ids of a turn's user body, where its layout places them in the
+    /// turn's grid — borrowed, not copied.
+    pub fn user_body_ids(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u32]> {
+        let e = self.turn(timeline, index)?;
+        let span = e.content.layout.user_span();
+        e.content
+            .token_ids
+            .get(span.offset as usize..span.end() as usize)
+    }
+
+    /// Whether [`Self::assistant_text_of`] would be non-empty, without
+    /// building the text.
+    pub fn has_assistant_text(&self, timeline: TimelineId, index: TurnIndex) -> bool {
+        self.turn(timeline, index)
+            .is_some_and(|e| e.content.layout.has_assistant_text())
+    }
+
     /// Turn token IDs as an owned `Vec` (clones the buffer).
     pub fn token_ids_of(&self, timeline: TimelineId, index: TurnIndex) -> Vec<u32> {
         self.turn(timeline, index)
@@ -5610,8 +5723,9 @@ impl Substrate {
         &self,
         timeline: TimelineId,
         index: TurnIndex,
-        pages: Option<Vec<u8>>,
-    ) -> Result<Option<(Arc<Vec<SealedSequence>>, Option<Vec<u8>>)>, ConversationError> {
+        pages: Option<Arc<StoredPages>>,
+    ) -> Result<Option<(Arc<Vec<SealedSequence>>, Option<Arc<StoredPages>>)>, ConversationError>
+    {
         let (Some(full), Some(turn)) = (
             self.turn_sealed_of(timeline, index),
             self.turn(timeline, index),
@@ -5652,16 +5766,14 @@ impl Substrate {
         // Qwen3-30B-A3B and Llama-3.2-3B, which is the whole of what those
         // models do. The turn goes over whole, matching what the assembler
         // already does for a turn with no index page.
-        let Some(blob) = pages.as_deref() else {
+        let Some(stored) = pages.as_deref() else {
             return Ok(Some((full, pages)));
         };
-        let Some(filtered) = index_pages::without_span(blob, span.range()) else {
+        let Some(filtered) = stored.without_span(span.range()) else {
             // The boundaries, not just the fact that the span missed them. The
             // question a refusal always raises is WHICH cut was missing, and
             // that is read straight off the two positions the span sits between.
-            let bounds = pages
-                .as_deref()
-                .and_then(index_pages::boundaries)
+            let bounds = index_pages::boundaries(stored.bytes())
                 .map(|b| format!("{b:?}"))
                 .unwrap_or_else(|| "absent".to_string());
             return Err(ConversationError::Channel(format!(
@@ -5690,7 +5802,7 @@ impl Substrate {
                 location: h.location,
             })
             .collect();
-        Ok(Some((Arc::new(windowed), Some(filtered))))
+        Ok(Some((Arc::new(windowed), Some(Arc::new(filtered)))))
     }
 
     /// Token ids of the turn's *assistant-response body* `[asst_start, total)`.
@@ -5787,6 +5899,13 @@ impl Substrate {
             .get(&timeline)
             .into_iter()
             .flat_map(|t| t.turns.keys().copied())
+    }
+
+    /// How many turns `timeline` holds — `0` for one the substrate does not.
+    pub fn turn_count_of(&self, timeline: TimelineId) -> u32 {
+        self.timelines
+            .get(&timeline)
+            .map_or(0, |t| t.turns.len() as u32)
     }
 
     pub fn all_turns(&self) -> impl Iterator<Item = TurnKey> + '_ {
@@ -6170,7 +6289,7 @@ impl Substrate {
         self.gallery_epoch += 1;
         // Incremental invalidation: evict only this stream's decoded seams so a
         // single seal doesn't force a full-gallery JSON re-parse on the next scan.
-        self.seam_cache
+        self.events_cache
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&stream_id);
@@ -6201,7 +6320,8 @@ impl Substrate {
 
     /// Cache a turn's QSA index page, last-writer-wins.
     pub fn set_index_page_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
-        self.streams.entry(stream_id).or_default().index_page = Some(payload);
+        self.streams.entry(stream_id).or_default().index_page =
+            Some(Arc::new(StoredPages::new(payload)));
     }
 
     /// The stored QSA index page for a turn, if any.
@@ -6213,6 +6333,19 @@ impl Substrate {
         self.streams
             .get(&turn_stream_id(timeline.raw(), index.0))
             .and_then(|s| s.index_page.as_deref())
+            .map(StoredPages::bytes)
+    }
+
+    /// [`Self::index_page_blob`] as held, with its keys — for a caller that
+    /// hands the pages to the model, or keeps them past the substrate lock.
+    pub fn index_page_shared(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Option<Arc<StoredPages>> {
+        self.streams
+            .get(&turn_stream_id(timeline.raw(), index.0))
+            .and_then(|s| s.index_page.clone())
     }
 
     /// The stored QSA index page for a prompt section, keyed by the section's
@@ -6223,6 +6356,14 @@ impl Substrate {
         self.streams
             .get(&stream_id)
             .and_then(|s| s.index_page.as_deref())
+            .map(StoredPages::bytes)
+    }
+
+    /// [`Self::section_index_page`] as held, with its key.
+    pub fn section_index_page_shared(&self, stream_id: StreamId) -> Option<Arc<StoredPages>> {
+        self.streams
+            .get(&stream_id)
+            .and_then(|s| s.index_page.clone())
     }
 
     /// A sealed turn's gather-scope tags, as persisted on its `TurnDecl`.
@@ -7168,6 +7309,7 @@ mod tests {
             0.2,
             100.0,
             ws_limits(1000),
+            usize::MAX,
         );
         assert_eq!(sub.working_set(target).unwrap().members().len(), 3);
         for r in &reads {
@@ -7368,6 +7510,19 @@ mod tests {
         assert_eq!(meta.kind, TurnKind::Normal);
         assert!(meta.children.is_empty());
         assert_eq!(meta.tree_height, 0);
+    }
+
+    /// A timeline's turn count is its own turns, and an unknown timeline holds
+    /// none.
+    #[test]
+    fn a_turn_count_is_the_timelines_own() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        assert_eq!(sub.turn_count_of(timeline), 0);
+        sub.append_with_blocks(timeline, 10, 0, 1);
+        sub.append_with_blocks(timeline, 10, 1, 2);
+        assert_eq!(sub.turn_count_of(timeline), 2);
+        let unknown = TimelineId::from_raw(timeline.raw() + 1000).unwrap();
+        assert_eq!(sub.turn_count_of(unknown), 0);
     }
 
     #[test]
@@ -10243,6 +10398,109 @@ mod tests {
         moved(&sub, "a reset");
         sub.clear_walker_state();
         moved(&sub, "clearing the streams");
+    }
+
+    /// **A turn's events digest to its seams and, per collection, the section
+    /// its latest projection that chose one there selected** — an event that
+    /// selected nothing in a collection leaves the earlier choice standing, and
+    /// a rewrite of the events blob is read afresh.
+    #[test]
+    fn a_turns_events_digest_to_its_seams_and_latest_selections() {
+        use crate::projection::{encode_events, ProjectionSelection, SelectedSection};
+        let tools = |picked: Option<&str>| SystemItem::Collection {
+            name: "tools".into(),
+            member_glue: String::new(),
+            member_glue_tokens: 0,
+            sections: ["a", "b"]
+                .iter()
+                .map(|n| SelectedSection {
+                    name: n.to_string(),
+                    tokens: 1,
+                    selected: Some(*n) == picked,
+                    score: 0.0,
+                    qualified: false,
+                })
+                .collect(),
+        };
+        let event = |start: u32, seam: bool, item: SystemItem| ProjectionEvent {
+            start_token: start,
+            self_reference: seam,
+            selection: ProjectionSelection {
+                system: vec![item],
+                turns: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let mut sub = Substrate::new();
+        let sid = turn_stream_id(1, 0);
+        sub.set_projection_events_blob(
+            sid,
+            encode_events(&[
+                event(40, true, tools(Some("b"))),
+                event(10, true, tools(None)),
+                event(10, false, tools(Some("a"))),
+                event(90, false, tools(None)),
+            ]),
+        );
+        assert_eq!(*sub.decoded_seams(sid), vec![10, 40]);
+        assert_eq!(sub.last_selected_in(sid, "tools"), Some("a".to_string()));
+        assert_eq!(sub.last_selected_in(sid, "memory"), None);
+
+        sub.set_projection_events_blob(sid, encode_events(&[event(5, false, tools(Some("b")))]));
+        assert_eq!(sub.last_selected_in(sid, "tools"), Some("b".to_string()));
+        assert!(sub.decoded_seams(sid).is_empty());
+        assert_eq!(sub.last_selected_in(turn_stream_id(2, 0), "tools"), None);
+    }
+
+    /// **The tagged-turn index follows every declaration.** A turn in a gather
+    /// scope enters it; a dialogue turn, a turn carrying only working-set marks,
+    /// and a non-turn stay out; a redeclaration moves a stream in or out; and a
+    /// stream removed or cleared leaves it — so a tagged gallery drawn from the
+    /// index is the one a walk of every stream would draw.
+    #[test]
+    fn the_tagged_turn_index_follows_every_declaration() {
+        let decl = |tl: u64, tags: &[&str]| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id: tl,
+                turn_index: 0,
+                turn_id_day: 0,
+                turn_id_seq: 1,
+                role: 1,
+                block_start: 0,
+                block_end: 1,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+            })
+        };
+        let tagged = |sub: &Substrate| {
+            sub.tagged_turn_streams()
+                .map(|(s, _)| s)
+                .collect::<Vec<_>>()
+        };
+        let mut sub = Substrate::new();
+        let (tool, chat, marked) = (
+            turn_stream_id(1, 0),
+            turn_stream_id(2, 0),
+            turn_stream_id(3, 0),
+        );
+        sub.apply_stream_decl(tool, decl(1, &["tool"]));
+        sub.apply_stream_decl(chat, decl(2, &[]));
+        sub.apply_stream_decl(marked, decl(3, &["working_set:release"]));
+        assert_eq!(tagged(&sub), vec![tool]);
+
+        sub.apply_stream_decl(chat, decl(2, &["tool"]));
+        sub.apply_stream_decl(tool, decl(1, &[]));
+        assert_eq!(tagged(&sub), vec![chat]);
+
+        sub.reset_tombstoned_stream(chat);
+        assert!(tagged(&sub).is_empty());
+        sub.apply_stream_decl(tool, decl(1, &["tool"]));
+        sub.clear_walker_state();
+        assert!(tagged(&sub).is_empty());
     }
 
     /// Invalidation is per-stream: rewriting one turn's sig evicts only that

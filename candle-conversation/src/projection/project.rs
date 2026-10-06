@@ -105,6 +105,7 @@ use super::schema::{
     SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, WorkingSetShare,
 };
 use super::selection::{apply_selection, trim_to_budget_low_score_first};
+use super::swap_cap::{cap_new_members, SwapCap};
 use super::working_set_pick;
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{NodeId, SelectionDiagnostics, SelectionOrigin};
@@ -1486,7 +1487,7 @@ pub fn run_with_sink<R: ContentResolver>(
                     cfg.budget_max =
                         ba.effective_max(cfg.budget_max, resolver.group_attention_mass(group.id));
                 }
-                let beliefs = crate::provenance::belief_step(
+                let mut beliefs = crate::provenance::belief_step(
                     &fresh,
                     &prior_scores,
                     &prior_selected,
@@ -1495,6 +1496,35 @@ pub fn run_with_sink<R: ContentResolver>(
                     cfg.budget(),
                     floor,
                 );
+                // A mid-decode reprojection brings at most `max_swaps` new
+                // conversations into the group and keeps a leaver for each one
+                // it holds back (`swap_cap`). The opening projection of a turn
+                // (position 0) is a new question and reselects freely.
+                if decode_pos.is_some_and(|pos| pos > 0) {
+                    let keys: Vec<TurnKey> = all_turns.iter().map(|(k, _)| *k).collect();
+                    let mut selected: Vec<bool> = beliefs.iter().map(|b| b.selected).collect();
+                    let scores: Vec<f32> = beliefs.iter().map(|b| b.score).collect();
+                    let capped = cap_new_members(
+                        &keys,
+                        &mut selected,
+                        &prior_selected,
+                        &scores,
+                        group.max_swaps,
+                    );
+                    if capped != SwapCap::default() {
+                        tracing::debug!(
+                            target: "candle_conversation::scheduler::reproject",
+                            group = %group.name,
+                            held_back = capped.held_back,
+                            kept = capped.kept,
+                            max_swaps = group.max_swaps,
+                            "reprojection swap cap: newcomers held back"
+                        );
+                        for (b, s) in beliefs.iter_mut().zip(selected) {
+                            b.selected = s;
+                        }
+                    }
+                }
                 let mut out = Vec::new();
                 for ((key, _), b) in all_turns.iter().zip(&beliefs) {
                     // Record every candidate's belief so `build_selection` stamps

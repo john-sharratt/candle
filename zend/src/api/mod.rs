@@ -134,6 +134,7 @@ pub fn router(session: Arc<ZendSession>) -> Router {
             "/v1/conversations/:id/archive",
             post(conversations::archive),
         )
+        .route("/v1/conversations/:id/live", get(conversations::live))
         .route(
             "/v1/conversations/:id/projections/:turn/:event",
             get(projections::get),

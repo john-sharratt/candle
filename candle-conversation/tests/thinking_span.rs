@@ -225,7 +225,7 @@ fn windowing_drops_exactly_the_span_or_nothing_at_all() {
 
     let whole = read.turn_sealed_of(tl, idx).expect("the turn is hot");
     let whole_tokens = whole[0].token_count;
-    let pages = read.index_page_blob(tl, idx).map(|b| b.to_vec());
+    let pages = read.index_page_shared(tl, idx);
     let layout = read.turn_layout(tl, idx).expect("layout");
     let span = layout.segments.iter().find_map(|s| match s {
         TurnSegment::Thinking { kv, .. } => *kv,
@@ -309,7 +309,7 @@ fn only_the_newest_turn_keeps_its_reasoning() {
         let Some(whole) = read.turn_sealed_of(tl, idx) else {
             continue; // demoted out of hot; not this test's subject
         };
-        let pages = read.index_page_blob(tl, idx).map(|b| b.to_vec());
+        let pages = read.index_page_shared(tl, idx);
         let (windowed, _) = read
             .turn_sealed_without_thinking(tl, idx, pages)
             .expect("the turn's reasoning windows onto its page boundaries")

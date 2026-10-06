@@ -22,9 +22,10 @@ use axum::{
     Json,
 };
 use candle_conversation::turn_layout::ThinkingLength;
-use candle_conversation::Role as TurnRole;
+use candle_conversation::{RecoveredMessage, Role as TurnRole};
 use serde::{Deserialize, Serialize};
 
+use super::chat;
 use super::compressed;
 use crate::chatml::split_turn;
 use crate::projection_event::ProjectionSpanOut;
@@ -79,14 +80,41 @@ pub async fn delete(
     }
 }
 
+/// `GET /v1/conversations/{id}/live` — the reply in flight, as a chat stream.
+///
+/// For a client that reconnected mid-turn (a reload, a dropped phone
+/// connection): every frame the turn has streamed so far, then the rest as they
+/// come, ending with the turn. `404` when nothing is in flight — the stored
+/// conversation is then complete.
+pub async fn live(
+    State(session): State<Arc<ZendSession>>,
+    Path(id): Path<String>,
+) -> Result<Response, StatusCode> {
+    let turn = session.live_turn(&id).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(chat::follow_sse(turn.follow()))
+}
+
 pub async fn get(
     State(session): State<Arc<ZendSession>>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    let history = session
+    // Read before the history: a turn that finishes in between is then stored
+    // in full and the client's follow finds nothing to follow, rather than the
+    // history missing a turn nobody says is live.
+    let live = session.live_turn(&id);
+    let mut history = session
         .conversation_history(&id)
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    // A reply in flight is the live stream's to show, every round of it from
+    // the first: the history stops where it started, and the question it
+    // answers — which the substrate records only with the reply's first round —
+    // is shown from the record.
+    // Its sealed rounds' projection points go with it.
+    let reply_assistant_turns = match &live {
+        Some(turn) => cut_reply(&mut history, turn.history_before()),
+        None => 0,
+    };
 
     // Uploaded files recorded against this conversation (substrate event),
     // grouped by their turn position so a burst dropped together tiles into
@@ -164,13 +192,25 @@ pub async fn get(
     // Any uploads recorded past the last turn (uploaded after the final turn)
     // append at the end.
     emit_uploads(&mut messages, u32::MAX);
+    if let Some(turn) = &live {
+        messages.push(HistoryMessage {
+            role: role_str(Role::User),
+            content: turn.user().to_string(),
+            no_think: false,
+            thinking: None,
+            tool_tokens: Vec::new(),
+            spans: Vec::new(),
+            files: Vec::new(),
+        });
+    }
 
     // Re-attach the recorded projection points, light. Records correspond to
     // the most recent decodes, so align them to the *trailing* assistant
     // bubbles — that way conversations recovered from disk (no records) keep
     // their older turns dot-free without shifting the mapping. Each point keeps
     // its `(turn, event)` address so the panel can fetch it in full.
-    let records = session.conversation_projections(&id);
+    let mut records = session.conversation_spans(&id);
+    records.truncate(records.len().saturating_sub(reply_assistant_turns));
     let assistant_idxs: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -178,14 +218,10 @@ pub async fn get(
         .map(|(i, _)| i)
         .collect();
     let take = records.len().min(assistant_idxs.len());
-    for j in 0..take {
+    let first = records.len() - take;
+    for (j, spans) in records.drain(first..).enumerate() {
         let mi = assistant_idxs[assistant_idxs.len() - take + j];
-        let turn = records.len() - take + j;
-        messages[mi].spans = records[turn]
-            .iter()
-            .enumerate()
-            .map(|(event, point)| ProjectionSpanOut::of(point, turn, event))
-            .collect();
+        messages[mi].spans = spans;
     }
 
     let title = session.conversation_label(&id);
@@ -199,9 +235,23 @@ pub async fn get(
             messages,
             uploads,
             dials,
+            live: live.is_some(),
         },
         &headers,
     ))
+}
+
+/// Cut `history` back to the `history_before` entries that predate a reply in
+/// flight, answering how many of the removed entries were the reply's own
+/// assistant turns — each carries a projection record that must go with it.
+fn cut_reply(history: &mut Vec<RecoveredMessage>, history_before: usize) -> usize {
+    let cut = history_before.min(history.len());
+    let assistant = history[cut..]
+        .iter()
+        .filter(|m| m.role == TurnRole::Assistant)
+        .count();
+    history.truncate(cut);
+    assistant
 }
 
 fn chat_role(role: TurnRole) -> Role {
@@ -249,6 +299,11 @@ pub struct HistoryBody {
     /// turn — the client keeps its own defaults there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dials: Option<ConversationDials>,
+    /// A reply is in flight: `messages` ends at its user turn and the turns it
+    /// has sealed so far, and `GET /v1/conversations/{id}/live` streams the
+    /// whole reply, from its start, until it ends.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub live: bool,
 }
 
 #[derive(Serialize)]
@@ -312,5 +367,47 @@ impl From<&UploadInfo> for UploadOut {
             added: u.added.clone(),
             stats: u.stats.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: TurnRole, text: &str) -> RecoveredMessage {
+        RecoveredMessage {
+            role,
+            text: text.to_string(),
+            no_think: false,
+            thinking: None,
+            tool_tokens: Vec::new(),
+        }
+    }
+
+    /// The reply's sealed rounds go, and the count says how many of them were
+    /// assistant turns — one projection record each.
+    #[test]
+    fn a_live_reply_is_cut_back_to_what_preceded_it() {
+        let mut history = vec![
+            msg(TurnRole::User, "earlier question"),
+            msg(TurnRole::Assistant, "earlier answer"),
+            msg(TurnRole::User, "the live question"),
+            msg(TurnRole::Assistant, "round one: a tool call"),
+            msg(TurnRole::User, "round one's results"),
+            msg(TurnRole::Assistant, "round two: a tool call"),
+        ];
+        assert_eq!(cut_reply(&mut history, 2), 2);
+        let left: Vec<&str> = history.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(left, ["earlier question", "earlier answer"]);
+    }
+
+    /// A reply that has sealed nothing yet cuts nothing, and a stale count past
+    /// the end is harmless.
+    #[test]
+    fn a_reply_that_sealed_nothing_cuts_nothing() {
+        let mut history = vec![msg(TurnRole::User, "q"), msg(TurnRole::Assistant, "a")];
+        assert_eq!(cut_reply(&mut history, 2), 0);
+        assert_eq!(cut_reply(&mut history, 9), 0);
+        assert_eq!(history.len(), 2);
     }
 }

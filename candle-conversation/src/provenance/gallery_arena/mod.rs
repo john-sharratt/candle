@@ -19,6 +19,7 @@
 mod eviction;
 mod page_io;
 mod pages;
+mod probe_rows;
 mod scan;
 
 pub use pages::{page_u64, pages_for, transpose_to_pages, PAGE_TOKENS};

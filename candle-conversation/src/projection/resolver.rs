@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use super::belief_files::{assemble_file_scans, scan_file_scans};
-use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::owned_sections::OwnedSection;
 use super::project::ProjectionTarget;
@@ -41,7 +40,9 @@ use crate::persistence::sealed_reader::{SealedReader, SEALED_READ_ATTEMPTS};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
-use crate::persistence::{Result as PersistenceResult, SharedSubstrate, SubstratePersistence};
+use crate::persistence::{
+    PersistenceLock, Result as PersistenceResult, SharedSubstrate, SubstratePersistence,
+};
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
@@ -51,8 +52,8 @@ use crate::provenance::{
 };
 use crate::scheduler::note_persistence_maint_us;
 use crate::substrate::{
-    ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, Substrate, SubstrateRead,
-    SubstrateWrite, TurnPartWrite,
+    ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, StreamRuntime, Substrate,
+    SubstrateRead, SubstrateWrite, TurnPartWrite,
 };
 use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
@@ -263,19 +264,19 @@ pub(super) fn subwindow_bounds(len: usize, seams: &[usize]) -> Vec<(usize, usize
     bounds
 }
 
-/// The name of the section a projection selected inside `collection`, if any.
-fn selected_in_collection(sel: &ProjectionSelection, collection: &str) -> Option<String> {
-    sel.system.iter().find_map(|item| match item {
-        SystemItem::Collection { name, sections, .. } if name == collection => {
-            sections.iter().find(|s| s.selected).map(|s| s.name.clone())
-        }
-        _ => None,
-    })
-}
-
 /// A collection's belief gallery: each member's wide-Q window, the slot it
 /// votes for, and its stream id (the window's arena residency key).
 pub type BeliefGallery = (Vec<Arc<Vec<WideQSig>>>, Vec<usize>, Vec<StreamId>);
+
+/// What [`Conversation::preload_galleries`] loaded.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GalleryPreload {
+    /// Turns walked across the scanned groups and the collections.
+    pub turns: usize,
+    /// Turns resident on the arena, and their signature tokens.
+    pub resident: usize,
+    pub tokens: usize,
+}
 
 /// Which gallery an assembly is for: the collection's name, its scope tags, and
 /// its members in slot order. The members are part of the key because the
@@ -310,7 +311,7 @@ pub struct Conversation {
     allocator: Arc<TimelineAllocator>,
     /// The mandatory persistence layer — every turn is recorded into its
     /// redo log (`docs/archived/kv_tier_migration.md` §13.6).
-    persistence: Arc<Mutex<SubstratePersistence>>,
+    persistence: Arc<PersistenceLock>,
     /// Runtime, in-memory score normalization (per-scope hit levels). NOT
     /// persisted — rebuilt from the substrate's existing turns on first use, then
     /// evolved as new turns seal. Shared across clones of this handle so learning
@@ -523,7 +524,7 @@ impl Conversation {
         let maintenance = Arc::new(Mutex::new((persistence.segment_count(), None, false)));
         let sealed = persistence.sealed_reader();
         let inner = Arc::new(RwLock::new(substrate));
-        let persistence = Arc::new(Mutex::new(persistence));
+        let persistence = Arc::new(PersistenceLock::new(persistence));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
         Self {
             inner,
@@ -821,7 +822,15 @@ impl Conversation {
         let mut windows: Vec<Arc<Vec<WideQSig>>> = Vec::new();
         let mut slots: Vec<usize> = Vec::new();
         let mut sids: Vec<StreamId> = Vec::new();
-        for (sid, e) in sub.all_streams() {
+        // A tagged collection admits only turns in a gather scope, which the
+        // substrate indexes; an untagged one admits dialogue, which is every
+        // other turn, so it walks them all.
+        let streams: Box<dyn Iterator<Item = (StreamId, &StreamRuntime)>> = if tags.is_empty() {
+            Box::new(sub.all_streams())
+        } else {
+            Box::new(sub.tagged_turn_streams())
+        };
+        for (sid, e) in streams {
             let Some(StreamDecl::Turn(d)) = &e.decl else {
                 continue;
             };
@@ -852,14 +861,7 @@ impl Conversation {
                 continue;
             };
             let slot = d.tags.iter().find_map(|t| slot_of(t)).or_else(|| {
-                e.projection_events
-                    .as_ref()
-                    .map(|b| decode_events(b))
-                    .and_then(|evs| {
-                        evs.iter()
-                            .rev()
-                            .find_map(|ev| selected_in_collection(&ev.selection, collection))
-                    })
+                sub.last_selected_in(sid, collection)
                     .and_then(|name| slot_of(&name))
             });
             let Some(slot) = slot else {
@@ -875,6 +877,74 @@ impl Conversation {
             .unwrap()
             .insert(key, (epoch, gallery.clone()));
         gallery
+    }
+
+    /// Load everything a projection's belief scan reads before it first runs:
+    /// every scanned turn group's signature windows decoded (and their events
+    /// digested), every section collection's gallery assembled, and all of them
+    /// resident on `arena` under the fingerprints the scan itself takes — so
+    /// the scan finds them all and uploads nothing.
+    ///
+    /// Without it the first projection after a start paid for all of that
+    /// inline, ahead of its first token: measured at ~515 ms decoding and
+    /// ~435 ms uploading a 1,000-file `code_reading` gallery, and ~115 ms
+    /// assembling the tool catalog's. Every scope sees the same turns resident,
+    /// so a group is preloaded whole rather than for one conversation's scope.
+    ///
+    /// A failed upload is logged and skipped — the scan uploads what it does
+    /// not find, so a preload that stops short costs that projection the
+    /// difference and nothing else.
+    pub fn preload_galleries(
+        &self,
+        schema: &Schema,
+        arena: Option<&GalleryArena>,
+    ) -> GalleryPreload {
+        let mut windows: Vec<(StreamId, Arc<Vec<WideQSig>>)> = Vec::new();
+        let mut preload = GalleryPreload::default();
+        {
+            let sub = self.inner.read().unwrap();
+            for group in schema.layers.iter().flat_map(|l| l.groups.iter()) {
+                if !group.is_scanned() {
+                    continue;
+                }
+                let timelines: Vec<TimelineId> = sub.timelines_for_group(group.id).collect();
+                let (files, turns) = assemble_file_scans(&sub, timelines);
+                preload.turns += turns;
+                for f in files {
+                    windows.extend(f.arc_sids.into_iter().zip(f.arcs_kept));
+                }
+            }
+        }
+        for item in &schema.system_prompt.items {
+            let SystemPromptItem::Collection(coll) = item else {
+                continue;
+            };
+            let members: Vec<String> = coll.sections.iter().map(|s| s.name.clone()).collect();
+            let (gallery, _, sids) = self.belief_gallery(&coll.name, &coll.policy.tags, &members);
+            preload.turns += gallery.len();
+            windows.extend(sids.into_iter().zip(gallery));
+        }
+        let Some(arena) = arena else {
+            return preload;
+        };
+        let mut seen: HashSet<StreamId> = HashSet::new();
+        for (sid, sigs) in windows {
+            if !seen.insert(sid) {
+                continue;
+            }
+            match arena.ensure_resident(sid, &sigs, sig_fingerprint(&sigs)) {
+                Ok(_) => {
+                    preload.resident += 1;
+                    preload.tokens += sigs.len();
+                }
+                Err(e) => tracing::warn!(
+                    target: "candle_conversation::provenance",
+                    stream = sid.0,
+                    "gallery preload: upload refused ({e}) — the first scan uploads this turn"
+                ),
+            }
+        }
+        preload
     }
 
     /// Score every belief-driven collection in the shared system prompt against
@@ -1235,6 +1305,7 @@ impl Conversation {
             cfg.beta,
             cfg.min_momentum,
             cfg.limits(),
+            cfg.max_admits,
         );
     }
 
@@ -3659,6 +3730,11 @@ impl Conversation {
         self.write().rewrite_for_compaction(sweep)
     }
 
+    /// Whether `self` and `other` are handles on the same substrate.
+    pub fn same_substrate(&self, other: &Conversation) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Set the substrate-side resume key (`debug_id`) for `timeline`
     /// and persist a `RecordType::DebugId` record to the redo log.
     /// Last-write-wins on replay.  Idempotent: if the substrate
@@ -4375,12 +4451,16 @@ impl Conversation {
     /// Run one step of a maintenance op under its own hold of the persistence
     /// lock, adding the time the lock was held to `held`. A step that fails
     /// ends the op's relocation watch, since no later step of it will run.
+    ///
+    /// Taken behind any foreground caller waiting for the lock — a cold load, a
+    /// seal write — so between two steps the op lets them in rather than
+    /// re-taking the lock first (see [`PersistenceLock`]).
     fn maintenance_hold<T>(
         &self,
         held: &mut Duration,
         step: impl FnOnce(&mut SubstratePersistence) -> PersistenceResult<T>,
     ) -> candle::Result<T> {
-        let mut p = self.persistence.lock().unwrap();
+        let mut p = self.persistence.lock_behind_waiters().unwrap();
         let t = Instant::now();
         let out = step(&mut p);
         *held += t.elapsed();
@@ -4405,7 +4485,7 @@ impl Conversation {
         //    leaves the status alone: the op in flight owns `running`.
         let t_plan = Instant::now();
         let plan = {
-            let mut p = self.persistence.lock().unwrap();
+            let mut p = self.persistence.lock_behind_waiters().unwrap();
             if p.relocation_in_flight() {
                 tracing::debug!(
                     target: "candle_conversation::persistence::maintenance",
@@ -4476,7 +4556,7 @@ impl Conversation {
                 // 4. Unlink the drained source segments under the persistence lock.
                 let t_finish = Instant::now();
                 {
-                    let mut p = self.persistence.lock().unwrap();
+                    let mut p = self.persistence.lock_behind_waiters().unwrap();
                     p.finish_maintenance(&plan).map_err(|e| {
                         candle::Error::Msg(format!("substrate maintenance drop: {e}"))
                     })?;
@@ -4835,8 +4915,8 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collection_warm_plan, ingest_group, is_warmable, selected_in_collection, subwindow_bounds,
-        warmable, Conversation, Observe,
+        collection_warm_plan, ingest_group, is_warmable, subwindow_bounds, warmable, Conversation,
+        Observe,
     };
 
     use std::collections::BTreeMap;
@@ -5243,7 +5323,7 @@ mod tests {
         assert!(!Observe::No.teaches(&tools));
         assert!(!Observe::No.teaches(&unscoped));
     }
-    use crate::projection::{Builder, ProjectionSelection, SelectedSection, SystemItem};
+    use crate::projection::Builder;
     use std::collections::HashSet;
 
     /// A belief layer with two ranked groups beside a dialogue layer — enough
@@ -5471,37 +5551,6 @@ layers:
         );
         // Empty turn → a single empty window (the caller filters `e > s`).
         assert_eq!(subwindow_bounds(0, &[]), vec![(0, 0)]);
-    }
-
-    #[test]
-    fn selected_in_collection_finds_the_selected_member() {
-        let sel = ProjectionSelection {
-            system: vec![SystemItem::Collection {
-                name: "tools".into(),
-                member_glue: String::new(),
-                member_glue_tokens: 0,
-                sections: vec![
-                    SelectedSection {
-                        name: "a".into(),
-                        tokens: 1,
-                        selected: false,
-                        score: 2.0,
-                        qualified: false,
-                    },
-                    SelectedSection {
-                        name: "b".into(),
-                        tokens: 1,
-                        selected: true,
-                        score: 9.0,
-                        qualified: true,
-                    },
-                ],
-            }],
-            turns: vec![],
-        };
-        assert_eq!(selected_in_collection(&sel, "tools"), Some("b".to_string()));
-        // A different collection name matches nothing.
-        assert_eq!(selected_in_collection(&sel, "memory"), None);
     }
 }
 

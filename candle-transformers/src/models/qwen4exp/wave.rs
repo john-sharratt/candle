@@ -57,7 +57,7 @@ use super::ple::{PleSpan, PleState};
 use super::ple_fused::ple_apply_spans_fused;
 use super::qsa::IndexerWeights;
 use super::qsa_select::{budget_fits_kernel, Strata};
-use super::resident_page::{PageRegistry, PieceKey, ResidentPage};
+use super::resident_page::{PageRegistry, ResidentPage};
 use super::select_bytes::select_layer_bytes;
 use super::spec::SpecCapture;
 use super::state_slots::state_buffer;
@@ -81,6 +81,7 @@ use crate::models::expert_lre::{WeightPlan, WeightPlanning};
 use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
 use crate::models::operand_guard::expect_dense_view;
+use crate::models::piece_key::PieceKey;
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::profile::span;
@@ -904,13 +905,14 @@ impl Qwen4ExpBatched {
     /// holds this record's pages, otherwise decoded and placed now — every
     /// indexed layer in one launch, into slots of the index tenant.
     #[cfg(feature = "cuda")]
-    fn resident_pages(&self, blob: &[u8]) -> Result<Vec<Option<Arc<ResidentPage>>>> {
+    fn resident_pages(
+        &self,
+        blob: &[u8],
+        key: &PieceKey,
+    ) -> Result<Vec<Option<Arc<ResidentPage>>>> {
         let cfg = &self.model.cfg;
         let want = cfg.kv_layers().total();
-        let hash = span("qsa:page:key");
-        let key = PieceKey::of(blob);
-        hash.end();
-        if let Some(layers) = self.pages.get(&key) {
+        if let Some(layers) = self.pages.get(key) {
             return Ok(layers);
         }
         let _place = span("qsa:page:decode_place");
@@ -936,18 +938,19 @@ impl Qwen4ExpBatched {
             .iter()
             .map(|&r| if r > 0 { placed.next() } else { None })
             .collect();
-        self.pages.insert(key, &layers);
+        self.pages.insert(*key, &layers);
         Ok(layers)
     }
 
     /// Install a sealed page per attention layer ahead of `seq`'s live tail.
+    /// `key` is the page's [`PieceKey`], taken by the caller.
     #[cfg(feature = "cuda")]
-    pub fn push_positional_state(&self, seq: usize, blob: &[u8]) -> Result<()> {
+    pub fn push_positional_state(&self, seq: usize, blob: &[u8], key: &PieceKey) -> Result<()> {
         let cfg = &self.model.cfg;
         let want = cfg.kv_layers().total();
         let ratios = self.attention_ratios();
         // Resolved before the lock is taken: a placement is a launch.
-        let layers = self.resident_pages(blob)?;
+        let layers = self.resident_pages(blob, key)?;
         let mut map = self
             .index
             .write()
@@ -1994,8 +1997,8 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             .or(Some(0))
     }
 
-    fn push_positional_state(&self, seq: usize, blob: &[u8]) -> Result<bool> {
-        Qwen4ExpBatched::push_positional_state(self, seq, blob)?;
+    fn push_positional_state(&self, seq: usize, blob: &[u8], key: &PieceKey) -> Result<bool> {
+        Qwen4ExpBatched::push_positional_state(self, seq, blob, key)?;
         Ok(true)
     }
     fn push_positional_gap(&self, seq: usize, tokens: usize) -> Result<()> {

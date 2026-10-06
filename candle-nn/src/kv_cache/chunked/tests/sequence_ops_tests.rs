@@ -1983,6 +1983,109 @@ mod tests {
                 .collect();
             assert_eq!(usages, [5], "the written tail is restored, tokens and all");
         }
+
+        /// **A view carved in two halves is the view carved in one.** The borrow
+        /// holds the parent's blocks and nothing past them; opening the writer
+        /// adds the one fresh chunk writes land in, at the writer boundary.
+        #[test]
+        fn test_borrow_then_open_writer_is_create_view() {
+            const CHUNK_SIZE: usize = 32;
+            let (n_kv_head, head_dim) = (4usize, 32usize);
+            let parent_tokens = CHUNK_SIZE + 8;
+            let backing =
+                ChunkedKvBacking::new(4, n_kv_head, head_dim, DType::BF16, &Device::Cpu, 256)
+                    .unwrap();
+            let parent = backing.alloc_sequence().unwrap();
+            backing.ensure_for_offset(parent, 0, parent_tokens).unwrap();
+            let k = Tensor::zeros(
+                (1, n_kv_head, parent_tokens, head_dim),
+                DType::BF16,
+                &Device::Cpu,
+            )
+            .unwrap();
+            backing.write_contiguous(parent, 0, &k, &k).unwrap();
+            backing.set_len(parent, parent_tokens);
+            let shape = |slot: usize| {
+                let state = backing.state.read().unwrap();
+                let seq = state.sequences[slot].as_ref().unwrap();
+                let usages: Vec<u32> = seq.chunks_slice().iter().map(|c| c.usage).collect();
+                (usages, seq.writer_start_idx())
+            };
+
+            let whole = backing.alloc_sequence().unwrap();
+            let whole_counts = backing
+                .create_view_sequence(whole, parent, &[(0, 2)])
+                .unwrap();
+
+            let halves = backing.alloc_sequence().unwrap();
+            let borrowed = backing.borrow_into_view(halves, parent, &[(0, 2)]).unwrap();
+            assert_eq!(borrowed, whole_counts);
+            assert_eq!(borrowed, (2, parent_tokens));
+            assert_eq!(
+                shape(halves).0,
+                [CHUNK_SIZE as u32, 8],
+                "the borrow alone holds the parent's blocks and no writer",
+            );
+            backing.open_view_writer(halves).unwrap();
+            assert_eq!(shape(halves), shape(whole));
+            assert_eq!(shape(halves), (vec![CHUNK_SIZE as u32, 8, 0], 2));
+        }
+
+        /// **A detached free releases the slot and hands back its whole table.**
+        /// The chunks stay alive exactly as long as the handed-back table does: a
+        /// view's borrowed blocks keep counting the view as a holder until it drops.
+        #[test]
+        fn test_free_sequence_detached_hands_back_the_table() {
+            const CHUNK_SIZE: usize = 32;
+            let (n_kv_head, head_dim) = (4usize, 32usize);
+            let backing =
+                ChunkedKvBacking::new(4, n_kv_head, head_dim, DType::BF16, &Device::Cpu, 256)
+                    .unwrap();
+            let parent = backing.alloc_sequence().unwrap();
+            backing.ensure_for_offset(parent, 0, CHUNK_SIZE).unwrap();
+            let k = Tensor::zeros(
+                (1, n_kv_head, CHUNK_SIZE, head_dim),
+                DType::BF16,
+                &Device::Cpu,
+            )
+            .unwrap();
+            backing.write_contiguous(parent, 0, &k, &k).unwrap();
+            backing.set_len(parent, CHUNK_SIZE);
+            // Every chunk of this backing carries the one identity palette as
+            // both its K and its V palette, so its count moves by exactly two
+            // per chunk held anywhere.
+            let identity_pal = {
+                let state = backing.state.read().unwrap();
+                state.sequences[parent].as_ref().unwrap().chunks_slice()[0]
+                    .k_pal
+                    .clone()
+            };
+            let held = || std::sync::Arc::strong_count(&identity_pal);
+            let before = held();
+
+            let view = backing.alloc_sequence().unwrap();
+            backing
+                .create_view_sequence(view, parent, &[(0, 1)])
+                .unwrap();
+            assert_eq!(held(), before + 2 * 2, "the borrowed block and the writer");
+
+            let table = backing.free_sequence_detached(view).unwrap();
+            assert_eq!(
+                table.len(),
+                2,
+                "the table is the borrowed block and the writer"
+            );
+            assert!(
+                backing.state.read().unwrap().sequences[view].is_none(),
+                "the slot is free before the table drops",
+            );
+            assert_eq!(held(), before + 2 * 2, "the table still holds both");
+            drop(table);
+            assert_eq!(held(), before, "and lets go when it drops");
+
+            let again = backing.free_sequence_detached(view).unwrap();
+            assert!(again.is_empty(), "a free slot hands back nothing");
+        }
     }
 
     // ==================== CPU↔GPU sealed-sequence primitives =================

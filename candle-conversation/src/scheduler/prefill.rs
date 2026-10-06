@@ -477,7 +477,7 @@ impl Scheduler {
         // is safe because a pass is idempotent under one `Sweep`: after a rewrite the
         // residence holds NEW gids and the map is keyed on the old ones, so a second
         // visit matches nothing.
-        let substrates: Vec<_> = self.slot_conversations.values().cloned().collect();
+        let substrates = self.distinct_substrates();
         let mut swept = 0usize;
         // **The projection caches are holders too.** Taken out for the duration so
         // the closure can rewrite them while `self.session` is borrowed — two
@@ -1493,8 +1493,7 @@ impl Scheduler {
         let t = std::time::Instant::now();
         let mut report = crate::substrate::EvictionReport { count: 0, bytes: 0 };
         let mut remaining = target_bytes;
-        let convs: Vec<Conversation> = self.slot_conversations.values().cloned().collect();
-        for conv in convs {
+        for conv in self.distinct_substrates() {
             if remaining == 0 {
                 break;
             }
@@ -1758,8 +1757,7 @@ impl Scheduler {
         }
         let mut report = crate::substrate::EvictionReport { count: 0, bytes: 0 };
         let mut remaining = target_bytes;
-        let convs: Vec<Conversation> = self.slot_conversations.values().cloned().collect();
-        for conv in convs {
+        for conv in self.distinct_substrates() {
             if remaining == 0 {
                 break;
             }
@@ -1828,7 +1826,7 @@ impl Scheduler {
         // like `quantize_section_batch`.
         let backings = self.session.backings();
 
-        let convs: Vec<Conversation> = self.slot_conversations.values().cloned().collect();
+        let convs = self.distinct_substrates();
         let mut compressed = 0usize;
         let mut refused = false;
         // Estimated float bytes queued for compression so far — the bound.

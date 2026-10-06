@@ -81,6 +81,7 @@ use super::schema::{
     SectionTree, SelectionDefault, SelectionRule, SystemPromptItem, SystemPromptSchema,
     TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
 };
+use super::swap_cap::DEFAULT_MAX_SWAPS;
 use crate::summary_tree::scope::Scope;
 use crate::working_set::WorkingSetConfig;
 
@@ -675,6 +676,10 @@ struct YamlGroup {
     /// Concept D: timeline anchor member.
     #[serde(default)]
     anchor: Option<YamlAnchor>,
+    /// Newcomers a mid-decode reprojection may admit; [`DEFAULT_MAX_SWAPS`]
+    /// when absent.
+    #[serde(default)]
+    max_swaps: Option<usize>,
 }
 
 /// YAML shadow of [`SelectionDefault`] — `default: { tag: "…" }`.
@@ -764,6 +769,10 @@ struct YamlWorkingSet {
     seeds: Vec<String>,
     #[serde(default)]
     release_on: Vec<String>,
+    /// Provenance members one reprojection admits; [`DEFAULT_MAX_SWAPS`] when
+    /// absent.
+    #[serde(default)]
+    max_admits: Option<usize>,
 }
 
 // ── Conversion ────────────────────────────────────────────────────────────────
@@ -802,6 +811,7 @@ fn parse_working_set(
         max_file_tokens: yw.max_file_tokens,
         seeds: yw.seeds.clone(),
         release_on: yw.release_on.clone(),
+        max_admits: yw.max_admits.unwrap_or(DEFAULT_MAX_SWAPS),
     }))
 }
 
@@ -1113,6 +1123,7 @@ fn build(
                 budget_adaptive: parse_member_budget_adaptive(&yg.id, yg.budget_adaptive.as_ref())?,
                 locality: parse_locality(&yg.id, yg.locality.as_ref())?,
                 anchor: parse_anchor(&yg.id, yg.anchor.as_ref())?,
+                max_swaps: yg.max_swaps.unwrap_or(DEFAULT_MAX_SWAPS),
             });
         }
 

@@ -11,7 +11,7 @@
 //! label). The GUI reconstructs each projection's governed interval and its
 //! throughput from the sequence of points; we send the engine numerics verbatim.
 
-use candle_conversation::{ProjectionBucket, ProjectionEvent};
+use candle_conversation::{ProjectionBucket, ProjectionEvent, ProjectionPoint};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,19 +68,20 @@ pub struct ProjectionSpanOut {
 }
 
 impl ProjectionSpanOut {
-    /// The light form of `out`, the `event`-th point of the `turn`-th record.
-    pub fn of(out: &ProjectionEventOut, turn: usize, event: usize) -> Self {
-        let e = &out.event;
+    /// `point`, the `event`-th point of the `turn`-th record, as the history
+    /// carries it under display id `id` — anchored to the answer region, as
+    /// [`ProjectionEventOut::answer`] anchors the full point.
+    pub fn of(id: u64, point: ProjectionPoint, turn: usize, event: usize) -> Self {
         Self {
-            id: out.id,
-            region: out.region,
-            step: out.step.clone(),
-            start_token: e.start_token,
-            seconds: e.seconds,
-            materialized_tokens: e.materialized_tokens,
-            substrate_tokens: e.substrate_tokens,
-            buckets: e.buckets.clone(),
-            self_reference: e.self_reference,
+            id,
+            region: "answer",
+            step: format!("t={}", point.start_token),
+            start_token: point.start_token,
+            seconds: point.seconds,
+            materialized_tokens: point.materialized_tokens,
+            substrate_tokens: point.substrate_tokens,
+            buckets: point.buckets,
+            self_reference: point.self_reference,
             turn,
             event,
         }
@@ -90,10 +91,13 @@ impl ProjectionSpanOut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_conversation::projection::{MaterializedPiece, ProjectionSelection, SystemItem};
+    use candle_conversation::projection::{
+        decode_points, encode_events, MaterializedPiece, ProjectionSelection, SystemItem,
+    };
 
     /// The light span carries every field the timeline draws, its address, and
-    /// neither of the panel-only fields — however much the full point holds.
+    /// neither of the panel-only fields — however much the full point held when
+    /// it was recorded.
     #[test]
     fn a_light_span_drops_the_selection_and_names_its_point() {
         let event = ProjectionEvent {
@@ -114,8 +118,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let out = ProjectionEventOut::answer(7, event);
-        let light = serde_json::to_value(ProjectionSpanOut::of(&out, 2, 4)).unwrap();
+        let point = decode_points(&encode_events(&[event])).remove(0);
+        let light = serde_json::to_value(ProjectionSpanOut::of(7, point, 2, 4)).unwrap();
         assert_eq!(
             light,
             serde_json::json!({

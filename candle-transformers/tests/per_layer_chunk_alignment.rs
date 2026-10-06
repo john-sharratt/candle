@@ -169,6 +169,54 @@ fn a_snapshot_carries_no_trailing_empty_chunk() -> Result<()> {
     Ok(())
 }
 
+/// **A tail snapshot is the full snapshot sliced**, chunk for chunk and token for
+/// token — the trailing empty writer chunk dropped the same way — whether the
+/// cut falls inside the content, on its last chunk, or past it.
+#[test]
+fn a_tail_snapshot_is_the_full_snapshot_sliced() -> Result<()> {
+    let mut s = session()?;
+    let seq = s.create_sequence()?;
+    fill(&mut s, seq, 0, 3 * CHUNK + 5)?;
+    for b in s.backings() {
+        b.push_empty_writer_chunk(seq)?;
+    }
+    let full = s.snapshot_sequence_per_layer(seq)?;
+    let shape = |layers: &[candle_nn::kv_cache::SealedSequence]| {
+        layers
+            .iter()
+            .map(|l| {
+                (
+                    l.token_count,
+                    l.chunks
+                        .iter()
+                        .map(|c| (c.token_count, c.offset))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for start in [0, 1, 3, 4, 9] {
+        let sliced: Vec<candle_nn::kv_cache::SealedSequence> = full
+            .iter()
+            .map(|l| {
+                let chunks = l.chunks.get(start..).unwrap_or_default().to_vec();
+                candle_nn::kv_cache::SealedSequence {
+                    token_count: chunks.iter().map(|c| c.token_count as usize).sum(),
+                    chunks,
+                    chunk_size: l.chunk_size,
+                    location: l.location,
+                }
+            })
+            .collect();
+        assert_eq!(
+            shape(&s.snapshot_sequence_tail(seq, start)?),
+            shape(&sliced),
+            "from block {start}"
+        );
+    }
+    Ok(())
+}
+
 /// The two snapshots are two views of the same layer, and callers resolve a block
 /// range against one before slicing the other — so they must report the same chunk
 /// count.

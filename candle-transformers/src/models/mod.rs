@@ -100,6 +100,7 @@ pub mod kv_collect_utils;
 // and the wave scheduler are all kernel wrappers.
 #[cfg(feature = "cuda")]
 pub mod latent_moe;
+pub mod layer_parallel;
 pub mod layer_stream;
 pub mod lazy_rope;
 pub mod llama;
@@ -144,6 +145,7 @@ pub mod profile;
 // The carrier for a block-sparse attention selection (QSA). Model-independent
 // on purpose: the semantics live with the architecture that has them
 // (`qwen4exp::qsa_select`), the tensors the kernels read live here.
+pub mod piece_key;
 pub mod qsa_selection;
 /// Choosing an expert weight format from the card the model lands on.
 pub mod quant_ladder;

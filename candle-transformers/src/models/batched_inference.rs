@@ -30,6 +30,8 @@ use super::expert_lre::WeightPlanning;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::RecurrentCompaction;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
+use crate::models::layer_parallel;
+use crate::models::piece_key::PieceKey;
 use crate::models::rope_schedule::RungSelect;
 use crate::models::selection_strata::StrataTokens;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
@@ -1388,10 +1390,15 @@ impl BatchedInferenceSession {
             candle::bail!("invalid sequence index {}", idx);
         }
 
-        // Free in all backings
-        for backing in &self.backings {
-            backing.free_sequence(idx)?;
-        }
+        // Free in all backings. Each slot and its device buffer go here; the
+        // block tables come back detached and drop across threads — a view's
+        // is its parent's whole prefix in every layer.
+        let tables = self
+            .backings
+            .iter()
+            .map(|backing| backing.free_sequence_detached(idx))
+            .collect::<Result<Vec<_>>>()?;
+        layer_parallel::drop_all(tables);
 
         // Mark as inactive
         self.sequences[idx] = None;
@@ -2346,24 +2353,28 @@ impl BatchedInferenceSession {
             );
         }
         let view_idx = self.create_sequence()?;
+        // Every layer borrows its prefix at once — host bookkeeping only — and
+        // then each opens its writer chunk here, where the allocation runs.
+        let borrowed = layer_parallel::map(&self.backings, |backing| {
+            backing.borrow_into_view(view_idx, parent_idx, visible_block_ranges)
+        });
         let mut borrowed_block_count = 0;
         let mut borrowed_token_count = 0;
-        let mut first = true;
-        for (i, backing) in self.backings.iter().enumerate() {
-            let (n_blks, n_toks) = backing
-                .create_view_sequence(view_idx, parent_idx, visible_block_ranges)
-                .map_err(|e| {
-                    candle::Error::Msg(format!(
-                        "create_view_sequence: layer {i} of {} refused a view of sequence \
-                         {parent_idx} into {view_idx} after {i} earlier layer(s) already \
-                         created theirs — the view's layers now disagree on its length: {e}",
-                        self.backings.len(),
-                    ))
-                })?;
-            if first {
+        for (i, (backing, result)) in self.backings.iter().zip(borrowed).enumerate() {
+            let (n_blks, n_toks) = result.map_err(|e| {
+                candle::Error::Msg(format!(
+                    "create_view_sequence: layer {i} of {} refused a view of sequence \
+                     {parent_idx} into {view_idx} — the view's layers now disagree on its \
+                     length: {e}",
+                    self.backings.len(),
+                ))
+            })?;
+            if n_blks > 0 {
+                backing.open_view_writer(view_idx)?;
+            }
+            if i == 0 {
                 borrowed_block_count = n_blks;
                 borrowed_token_count = n_toks;
-                first = false;
             }
         }
         // The view's write cursor starts right after the borrowed tokens.
@@ -3535,6 +3546,35 @@ impl BatchedInferenceSession {
             out.push(seq);
         }
         assert_sealed_layers_aligned(&out, idx, "snapshot_sequence_per_layer")?;
+        Ok(out)
+    }
+
+    /// [`Self::snapshot_sequence_per_layer`] from block `start_block` to the
+    /// end, on every layer — the full snapshot sliced to `[start_block..]`,
+    /// trailing empty writer chunk dropped the same way, at the cost of the
+    /// tail alone.
+    ///
+    /// What a reprojection takes of the turn it is decoding: a few blocks off
+    /// the end of a slot that holds the whole projected context — ~9,300
+    /// blocks a layer at a 300K-token prompt, every one of which the full
+    /// snapshot built a sealed record for on every reprojection only for all
+    /// but the tail to be thrown away.
+    pub fn snapshot_sequence_tail(
+        &self,
+        idx: usize,
+        start_block: usize,
+    ) -> Result<Vec<candle_nn::kv_cache::SealedSequence>> {
+        let mut out = Vec::with_capacity(self.backings.len());
+        for backing in &self.backings {
+            let mut seq = backing
+                .record_turn_blocks(idx, start_block, usize::MAX)
+                .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_tail: {e}")))?;
+            // See `snapshot_sequence_per_layer`: the trailing empty chunk is
+            // structure, and the layers disagree about having one.
+            seq.drop_empty_tail();
+            out.push(seq);
+        }
+        assert_sealed_layers_aligned(&out, idx, "snapshot_sequence_tail")?;
         Ok(out)
     }
 
@@ -4768,9 +4808,14 @@ pub trait ManagedBatchedModel {
     /// at a position whose blocks the model does not hold, and the select
     /// refuses rather than scoring against a prefix it never indexed.
     ///
+    /// `key` is `page`'s identity ([`PieceKey::of`] its bytes), taken by the
+    /// caller once when the page entered memory: the same pages are handed over
+    /// on every projection that selects their piece, and a model that shares
+    /// placed pages across slots finds them by it.
+    ///
     /// Returns `false` when the model carries none, so the caller can offer it
     /// unconditionally.
-    fn push_positional_state(&self, _seq: usize, _blob: &[u8]) -> Result<bool> {
+    fn push_positional_state(&self, _seq: usize, _page: &[u8], _key: &PieceKey) -> Result<bool> {
         Ok(false)
     }
 

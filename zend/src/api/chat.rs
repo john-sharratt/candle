@@ -315,6 +315,26 @@ pub fn dial_selection(
 
 // ── Streaming path ────────────────────────────────────────────────────────────
 
+/// A dialogue reply already in flight, framed for a client that reconnected to
+/// it — the same frames the request that started it receives, from its first
+/// item. Only the daemon's own dialogue is recorded live, so the framing is its
+/// framing: reasoning inline, no client tools.
+pub(crate) fn follow_sse(token_stream: TokenStream) -> Response {
+    let framing = Framing {
+        split_reasoning: false,
+        tools: None,
+    };
+    let id = format!("chatcmpl-{}", unix_ms());
+    stream_sse(
+        token_stream,
+        "zen-code".to_string(),
+        id,
+        unix_secs(),
+        framing,
+        false,
+    )
+}
+
 fn stream_sse(
     token_stream: TokenStream,
     model: String,

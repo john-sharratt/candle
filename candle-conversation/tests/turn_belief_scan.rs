@@ -7,10 +7,11 @@
 //! retrieval target IS the turn, so each candidate turn is its own slot.
 
 use candle_conversation::persistence::content_hash::turn_stream_id;
+use candle_conversation::projection::TurnIndex;
 use candle_conversation::projection::{
-    Builder, CollectionWarm, Conversation, Observe, ProjectionTarget, TimelineId,
+    Builder, CollectionWarm, Conversation, GalleryPreload, Observe, ProjectionTarget, TimelineId,
 };
-use candle_conversation::provenance::{encode_wide_sigs, WideQSig};
+use candle_conversation::provenance::{encode_wide_sigs, GalleryArena, WideQSig};
 use candle_conversation::substrate::{ProjectionScores, TurnPartWrite};
 use candle_conversation::turn::Role;
 
@@ -122,6 +123,118 @@ fn score_belief_groups_self_matches_the_probed_turn() {
         s1 > s0 && s1 > s2,
         "probed turn 1 must score highest (self-match): s0={s0}, s1={s1}, s2={s2}"
     );
+}
+
+/// A three-turn `clusters` conversation for the preload tests, with the
+/// builder whose schema scans it.
+fn preload_fixture(dir: &std::path::Path) -> (Conversation, Builder) {
+    let conv = open_conversation(dir);
+    let builder = Builder::from_yaml(SCAN_YAML).unwrap();
+    let layer = builder.id_for_layer("mem").unwrap();
+    let group = builder.id_for_group("clusters").unwrap();
+    let timeline = TimelineId::from_raw(7).expect("timeline id");
+    conv.register_timeline(timeline, layer, group);
+    for fill in [
+        0xAAAA_AAAA_AAAA_AAAAu64,
+        0x5555_5555_5555_5555,
+        0xFFFF_FFFF_FFFF_FFFF,
+    ] {
+        let idx = conv
+            .record_turn(
+                timeline,
+                Role::User,
+                TurnPartWrite {
+                    token_count: 4,
+                    tags: vec!["repo_map".to_string()],
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record_turn");
+        conv.persist_wide_q_sigs(
+            turn_stream_id(timeline.raw(), idx.0),
+            &encode_wide_sigs(&[sig(fill)]),
+        )
+        .expect("persist sigs");
+    }
+    (conv, builder)
+}
+
+/// Without an arena the preload still walks every scanned group's turns —
+/// their signatures decoded, nothing placed.
+#[test]
+fn a_preload_without_an_arena_walks_the_scanned_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (conv, builder) = preload_fixture(dir.path());
+    assert_eq!(
+        conv.preload_galleries(builder.schema(), None),
+        GalleryPreload {
+            turns: 3,
+            resident: 0,
+            tokens: 0,
+        }
+    );
+}
+
+/// **A preloaded gallery is the one the first scan reads.** Every turn the
+/// scan touches is already resident under the scan's own fingerprint, so the
+/// scan uploads nothing — and it scores exactly as on an arena nothing was
+/// preloaded into. Skips without CUDA.
+#[test]
+fn the_first_scan_after_a_preload_uploads_nothing_and_scores_the_same() {
+    let device = match candle::Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (conv, builder) = preload_fixture(dir.path());
+    let target = ProjectionTarget {
+        layer: builder.id_for_layer("mem").unwrap(),
+        group: builder.id_for_group("clusters").unwrap(),
+        timeline: TimelineId::from_raw(7).unwrap(),
+    };
+    let probe = vec![sig(0x5555_5555_5555_5555)];
+    let scan = |arena: &GalleryArena| {
+        let mut scores = ProjectionScores::new();
+        conv.score_belief_groups(
+            &builder.schema().layers[0],
+            target,
+            &probe,
+            None,
+            &mut scores,
+            Observe::No,
+            Some(arena),
+        );
+        (0..3)
+            .map(|i| scores.turn(target.timeline, TurnIndex(i)).to_bits())
+            .collect::<Vec<u32>>()
+    };
+
+    let preloaded = GalleryArena::new(&device, 24, 3).unwrap();
+    assert_eq!(
+        conv.preload_galleries(builder.schema(), Some(&preloaded)),
+        GalleryPreload {
+            turns: 3,
+            resident: 3,
+            tokens: 3,
+        }
+    );
+    assert_eq!(preloaded.resident_turns(), 3);
+    let resident_bytes = preloaded.resident_bytes();
+    let got = scan(&preloaded);
+    assert_eq!(
+        preloaded.resident_turns(),
+        3,
+        "the scan found every turn resident"
+    );
+    assert_eq!(
+        preloaded.resident_bytes(),
+        resident_bytes,
+        "and uploaded nothing"
+    );
+
+    let fresh = GalleryArena::new(&device, 24, 3).unwrap();
+    assert_eq!(got, scan(&fresh));
 }
 
 /// Regression: `code_reading`/`repo_map` are marked `gathered = false` so no

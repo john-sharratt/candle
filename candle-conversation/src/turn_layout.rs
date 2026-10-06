@@ -212,6 +212,33 @@ mod thinking_length_tests {
         }
     }
 
+    /// **`has_assistant_text` answers what `assistant_text` would**, case by
+    /// case: no assistant segment is no text whatever the reasoning holds, and
+    /// either reasoning or an answer makes it some.
+    #[test]
+    fn has_assistant_text_agrees_with_the_built_text() {
+        let said = |text: Option<&str>| TurnSegment::Assistant {
+            text: text.map(Into::into),
+            kv: KvSpan::new(0, 1),
+        };
+        let cases = [
+            vec![],
+            vec![thinking("<think>r</think>", None)],
+            vec![answer(0, 2)],
+            vec![said(Some(""))],
+            vec![said(Some("ok"))],
+            vec![thinking("", None), answer(0, 2)],
+            vec![thinking("<think>r</think>", None), answer(0, 2)],
+        ];
+        let expected = [false, false, false, false, true, false, true];
+        for (segments, want) in cases.into_iter().zip(expected) {
+            let layout = TurnLayout { segments };
+            let built = !layout.assistant_text().unwrap_or_default().is_empty();
+            assert_eq!(built, want, "{:?}", layout.segments);
+            assert_eq!(layout.has_assistant_text(), want, "{:?}", layout.segments);
+        }
+    }
+
     /// An estimator that must not be consulted: a real span is already exact.
     fn never(_: &str) -> u32 {
         panic!("a real reasoning span was re-estimated from its prose")
@@ -366,6 +393,25 @@ impl TurnLayout {
             }
         }
         has_assistant.then_some(out)
+    }
+
+    /// Whether [`Self::assistant_text`] would be non-empty, without building
+    /// it: an assistant segment is present and some thinking or assistant text
+    /// is.
+    pub fn has_assistant_text(&self) -> bool {
+        let mut has_assistant = false;
+        let mut any_text = false;
+        for s in &self.segments {
+            match s {
+                TurnSegment::Thinking { text, .. } => any_text |= !text.is_empty(),
+                TurnSegment::Assistant { text, .. } => {
+                    has_assistant = true;
+                    any_text |= text.as_deref().is_some_and(|t| !t.is_empty());
+                }
+                _ => {}
+            }
+        }
+        has_assistant && any_text
     }
 
     /// The `<think>…</think>` reasoning prose, if a thinking segment is present.

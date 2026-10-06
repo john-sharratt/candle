@@ -50,6 +50,7 @@ use super::schema::{
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema,
     SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
 };
+use super::swap_cap::DEFAULT_MAX_SWAPS;
 use super::yaml::{from_yaml, NameMaps};
 use crate::substrate::ContentResolver;
 use crate::summary_tree::scope::Scope;
@@ -1379,6 +1380,7 @@ impl Builder {
                     budget_adaptive: None,
                     locality: None,
                     anchor: None,
+                    max_swaps: DEFAULT_MAX_SWAPS,
                 }],
                 policy: SelectionPolicy::default_policy(),
                 gather_scope: GatherScope::default(),

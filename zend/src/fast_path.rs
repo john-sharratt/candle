@@ -1,5 +1,5 @@
-//! Serving a `file_read` or a `file_list` from content the corpus has already
-//! ingested, by locking that conversation into the dialogue's working set
+//! Serving a `file_read` from content the corpus has already ingested, by
+//! locking that conversation into the dialogue's working set
 //! (`docs/zend_working_set.md` §4.5).
 //!
 //! A `code_reading` conversation is a whole file, read once, sealed in the
@@ -10,10 +10,11 @@
 //! say so. The K/V is already there, so the call costs an elevation instead of
 //! a prefill and a decode.
 //!
-//! A `repo_map` conversation is the same for a folder: it holds the folder's
-//! `file_list` response and its summary, keyed by what the listing shows
-//! (§6.2). A `file_list` of the first page of a folder whose unit the
-//! conversation's base holds carries that unit instead of listing again.
+//! **Only `file_read` is served.** A `file_list` always runs and its listing is
+//! prefilled as the tool's response: a listing is short, so serving it saves
+//! little, and the unit that would stand in for it is a placed `file_list`
+//! round trip the model is told it did not make — handed that as its answer,
+//! it lost track of whether it had listed the folder at all.
 //!
 //! **The hit test is the whole file; the lock is the whole file.** A call for
 //! page 1 of a file hits on the file's content key, and what lands in context
@@ -42,7 +43,6 @@ use zend_vfs::{Oid, RepoFiles, Workspace};
 
 use crate::branch_ingest::keys::{file_key, CONTENT_KEY, LINES_KEY};
 use crate::code_read::chain_finished;
-use crate::repo_scan::render::folder_anchor;
 use crate::tool_round::Step;
 use crate::tools::ToolResult;
 use crate::working_set::releases;
@@ -50,9 +50,6 @@ use coverage::Coverage;
 
 /// Whole-file reads are content-addressed by `code_reading`.
 const FILE_READ: &str = "file_read";
-
-/// Folder listings are content-addressed by `repo_map`.
-const FILE_LIST: &str = "file_list";
 
 /// The status a served call answers with. It is also the name of the system
 /// prompt's rule for placed content (`in_context` in `projection.yaml`), so the
@@ -84,26 +81,18 @@ fn served_response(anchor: String) -> Value {
 pub struct Served {
     /// The tool whose call was answered.
     pub tool: &'static str,
-    /// Workspace-relative: a file (`candle/src/lib.rs`) or a folder with its
-    /// trailing `/` (`candle/src/`).
+    /// Workspace-relative: `candle/src/lib.rs`.
     pub path: String,
     pub timeline: TimelineId,
 }
 
-/// Finds the committed `repo_map` unit for a folder — repository and path
-/// inside it, `""` for its root — as the conversation's base lists it
-/// (`RetrievalScope::folder_unit`).
-pub type FolderOf<'a> = &'a dyn Fn(&str, &str) -> Option<TimelineId>;
-
 /// What one screening consults: the conversation, its view of every
-/// repository, where the ingested units are, and the working set they lock
-/// into.
+/// repository, and the working set a read locks into.
 pub struct Screen<'a> {
     pub engine: &'a Mutex<ConversationEngine>,
     pub target: TimelineId,
     pub workspace: &'a Workspace,
     pub files: &'a RepoFiles,
-    pub folder_of: FolderOf<'a>,
     pub config: &'a WorkingSetConfig,
     pub coverage: &'a Coverage,
 }
@@ -150,36 +139,6 @@ fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, Strin
     Some((format!("{repo}/{rel}"), repo.to_string(), rel))
 }
 
-/// The repository and the folder inside it (`""` for its root) a `file_list`
-/// call asks for — only a call for the listing's first page, the one page a
-/// folder unit holds. `None` for a repository the workspace does not list.
-fn list_key(step: &Step, workspace: &Workspace) -> Option<(String, String)> {
-    let Step::Run(call) = step else {
-        return None;
-    };
-    if call.name != FILE_LIST {
-        return None;
-    }
-    let args = &call.arguments;
-    let first_page = match args.get("page") {
-        None | Some(Value::Null) => true,
-        Some(page) => page.as_u64() == Some(0),
-    };
-    if !first_page {
-        return None;
-    }
-    let repo = args.get("repo")?.as_str()?;
-    let dir = &workspace.repo(repo)?.dir;
-    let path = match args.get("path") {
-        None | Some(Value::Null) => "",
-        Some(path) => path.as_str()?,
-    };
-    let inner = normalise(path, dir);
-    let inner = inner.trim_end_matches('/');
-    let inner = if inner == "." { "" } else { inner };
-    Some((repo.to_string(), inner.to_string()))
-}
-
 /// The finished, complete `code_reading` conversation that read `rel` in
 /// `repo` at the blob the conversation's base holds, with its line count —
 /// `None` when the conversation changed the file (its own copy is what its
@@ -224,11 +183,8 @@ impl Screen<'_> {
     /// conversation and the ingest worker for the length of a round. The lock
     /// is taken per candidate, around the lookup and lock only.
     fn hit(&self, step: &Step) -> Option<Hit> {
-        if let Some((key, repo, rel)) = read_key(step, self.workspace) {
-            return self.read_hit(key, &repo, &rel);
-        }
-        let (repo, inner) = list_key(step, self.workspace)?;
-        self.list_hit(&repo, &inner)
+        let (key, repo, rel) = read_key(step, self.workspace)?;
+        self.read_hit(key, &repo, &rel)
     }
 
     /// A `file_read` of a file the conversation left alone, whose version a
@@ -261,38 +217,6 @@ impl Screen<'_> {
         })
     }
 
-    /// A `file_list` of a folder whose finished `repo_map` unit the
-    /// conversation's base lists exactly as the unit shows it.
-    fn list_hit(&self, repo: &str, inner: &str) -> Option<Hit> {
-        let dir = if inner.is_empty() {
-            format!("{repo}/")
-        } else {
-            format!("{repo}/{inner}/")
-        };
-        // Looked up before the engine is locked: the lookup takes it itself.
-        let unit = (self.folder_of)(repo, inner);
-        let locked = unit.filter(|&tl| {
-            let e = self.engine.lock().unwrap();
-            chain_finished(&e, tl) && self.lock(&e, tl, &dir)
-        });
-        let Some(timeline) = locked else {
-            tracing::debug!(
-                target: "zend::fast_path",
-                path = %dir,
-                "no conversation carries this folder into the working set — listing it for real",
-            );
-            return None;
-        };
-        Some(Hit {
-            response: served_response(folder_anchor(repo, inner)),
-            served: Served {
-                tool: FILE_LIST,
-                path: dir,
-                timeline,
-            },
-        })
-    }
-
     /// Lock `timeline` into the target's working set; a refusal is logged
     /// with its reason and reads as a miss.
     fn lock(&self, engine: &ConversationEngine, timeline: TimelineId, path: &str) -> bool {
@@ -319,9 +243,9 @@ pub struct Screened {
     pub served: Vec<Served>,
 }
 
-/// Replace every `file_read` and `file_list` in `steps` whose result the
-/// corpus already holds with an answer carrying that conversation, locked into
-/// the target's working set.
+/// Replace every `file_read` in `steps` whose file the corpus already holds
+/// with an answer carrying that conversation, locked into the target's working
+/// set. Every other call runs.
 ///
 /// **Only the calls before the round's first `release_on` call are screened.**
 /// A round runs in order, and a write may change what a later read would
@@ -330,9 +254,9 @@ pub struct Screened {
 /// real.
 ///
 /// A call is also left alone — and so runs for real — whenever anything is
-/// unsure: the conversation has changed what it names (its own copy is not
-/// the committed one the corpus ingested), its base holds no such file or
-/// folder, no finished conversation read it whole, or the working set refuses
+/// unsure: the conversation has changed the file (its own copy is not the
+/// committed one the corpus ingested), its base holds no such file, no
+/// finished conversation read it whole, or the working set refuses
 /// it. Nothing is read: the keys come from the base's tree, the line count
 /// from the conversation that read the file.
 pub fn screen(screen: &Screen<'_>, steps: Vec<Step>) -> Screened {
@@ -492,14 +416,6 @@ mod tests {
             serde_json::to_string(&served_response(file_anchor("candle", "Cargo.toml"))).unwrap(),
             r#"{"status":"in_context","anchor":"file=candle/Cargo.toml"}"#
         );
-        assert_eq!(
-            serde_json::to_string(&served_response(folder_anchor("candle", "zend/src"))).unwrap(),
-            r#"{"status":"in_context","anchor":"the `zend/src/` folder in the `candle` repository"}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&served_response(folder_anchor("candle", ""))).unwrap(),
-            r#"{"status":"in_context","anchor":"the `candle` repository"}"#
-        );
     }
 
     /// **The status is the system prompt's rule name**, so the reply recalls
@@ -516,38 +432,22 @@ mod tests {
         assert!(yaml.contains(&format!("{IN_CONTEXT} — ")));
     }
 
-    /// A listing is keyed by its repository and the folder inside it, however
-    /// the call spells the folder; the root is the empty folder.
+    /// **A listing is never served.** It always runs and its listing is
+    /// prefilled, so a folder in the corpus is no candidate, whatever the call
+    /// asks for.
     #[test]
-    fn a_listing_is_keyed_by_its_repository_and_folder() {
-        let key = |args: serde_json::Value| list_key(&call(FILE_LIST, args), &workspace());
-        let src = Some(("candle".to_string(), "zend/src".to_string()));
-        assert_eq!(key(json!({"repo": "candle", "path": "zend/src"})), src);
-        assert_eq!(key(json!({"repo": "candle", "path": "./zend/src/"})), src);
-        assert_eq!(key(json!({"repo": "candle", "path": "zend\\src"})), src);
-        let root = Some(("candle".to_string(), String::new()));
-        assert_eq!(key(json!({"repo": "candle"})), root);
-        assert_eq!(key(json!({"repo": "candle", "path": ""})), root);
-        assert_eq!(key(json!({"repo": "candle", "path": "."})), root);
-        assert_eq!(
-            key(json!({"repo": "candle", "path": null, "page": 0})),
-            root
-        );
-    }
-
-    /// **Only the first page is served** — it is the one page a folder unit
-    /// holds — and an unlisted repository never is.
-    #[test]
-    fn a_later_page_or_an_unlisted_repository_is_not_a_candidate() {
-        let key = |args: serde_json::Value| list_key(&call(FILE_LIST, args), &workspace());
-        assert_eq!(key(json!({"repo": "candle", "page": 1})), None);
-        assert_eq!(key(json!({"repo": "candle", "page": "0"})), None);
-        assert_eq!(key(json!({"repo": "other"})), None);
-        assert_eq!(key(json!({"path": "zend/src"})), None);
-        assert_eq!(
-            list_key(&call(FILE_READ, json!({"repo": "candle"})), &workspace()),
-            None
-        );
+    fn a_listing_is_never_a_candidate() {
+        for args in [
+            json!({"repo": "candle"}),
+            json!({"repo": "candle", "path": "zend/src"}),
+            json!({"repo": "candle", "path": "zend/src/main.rs"}),
+        ] {
+            assert_eq!(
+                read_key(&call("file_list", args.clone()), &workspace()),
+                None,
+                "{args}"
+            );
+        }
     }
 
     #[test]
@@ -623,6 +523,7 @@ mod tests {
             max_file_tokens: 500,
             seeds: Vec::new(),
             release_on: vec!["write".into(), "file_edit".into()],
+            max_admits: 2,
         }
     }
 

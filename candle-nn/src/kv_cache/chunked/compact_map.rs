@@ -440,24 +440,35 @@ impl<'m> Sweep<'m> {
     /// following that record's copy is right, and reclaims the old record's slot.
     #[cfg(feature = "cuda")]
     pub(super) fn follow_record(&mut self, meta: &mut Option<MetaGid>) -> bool {
+        if !self.follows(meta) {
+            return false;
+        }
         let Some(old) = meta.as_ref() else {
             return false;
         };
         let raw = old.raw();
-        if self.minted.contains(&raw) {
-            return false;
-        }
         let Some((slot, addr)) = self.map.record(raw) else {
             return false;
         };
         let Some(bands) = old.bands() else {
-            // A detached record names nothing and has no slot to follow.
             return false;
         };
         let next = MetaGid::from_slot(slot.clone(), bands.clone(), *addr);
         self.records_followed.insert(raw);
         self.install_record(meta, next);
         true
+    }
+
+    /// Whether [`Self::follow_record`] would move `meta` — asked without touching it,
+    /// so a holder that does not move is never cloned to find out.
+    #[cfg(feature = "cuda")]
+    pub(super) fn follows(&self, meta: &Option<MetaGid>) -> bool {
+        let Some(old) = meta.as_ref() else {
+            return false;
+        };
+        let raw = old.raw();
+        // A detached record names nothing and has no slot to follow.
+        !self.minted.contains(&raw) && self.map.record(raw).is_some() && old.bands().is_some()
     }
 
     /// What this sweep replaced in the holders it reached: every original band
@@ -582,58 +593,109 @@ pub fn rewrite_sealed(
     if sweep.map.is_empty() {
         return Ok(None);
     }
-    let mut touched_any = false;
-    let mut out: Vec<SealedSequence> = Vec::with_capacity(seqs.len());
-    for seq in seqs {
-        let mut chunks: Vec<SealedChunk> = Vec::with_capacity(seq.chunks.len());
-        for chunk in &seq.chunks {
-            let mut c = chunk.clone();
-            let mut changed = false;
-            if let Some(next) = sweep.rewrite_gids(&chunk.gids)? {
-                // **A fresh record for the new bands, and only if this chunk had
-                // one.** Installing it retires the old record — and with it, once the
-                // sweep ends, the clone of the old gids the old record was holding —
-                // which is what lets the source be reclaimed. A chunk with no record is
-                // addressed from its gids and must not be given one; a chunk with one
-                // that cannot have a fresh one stays whole on its source.
-                #[cfg(feature = "cuda")]
-                let movable = sweep.remint(
-                    &next,
-                    &mut c.meta,
-                    RecordInputs {
-                        k_pal: &c.k_pal,
-                        v_pal: &c.v_pal,
-                        k_scale: &c.k_scale,
-                        v_scale: &c.v_scale,
-                        k_fmt: &c.k_fmt,
-                        v_fmt: &c.v_fmt,
-                    },
-                )?;
-                #[cfg(not(feature = "cuda"))]
-                let movable = true;
-                if movable {
-                    sweep.witness(&next);
-                    c.gids = next;
-                    changed = true;
-                }
+    // **Copy on write.** A pass moves a handful of chunks and the sweep visits every
+    // chunk in the process, so cloning each one into a replacement that is then thrown
+    // away was the whole cost of a sweep — a dozen refcount round trips per chunk across
+    // every resident turn, ~120 ms a pass on a long-lived substrate. Nothing is cloned
+    // until the first chunk that actually changes, and only its sequence and the ones
+    // after it are rebuilt.
+    let mut out: Option<Vec<SealedSequence>> = None;
+    for (i, seq) in seqs.iter().enumerate() {
+        let chunks = rewrite_chunks(&seq.chunks, sweep)?;
+        match (chunks, out.as_mut()) {
+            (Some(chunks), Some(out)) => out.push(with_chunks(seq, chunks)),
+            (Some(chunks), None) => {
+                let mut fresh = Vec::with_capacity(seqs.len());
+                fresh.extend_from_slice(&seqs[..i]);
+                fresh.push(with_chunks(seq, chunks));
+                out = Some(fresh);
             }
-            // The record itself may have been copied lower. After the band rewrite, so a
-            // record just minted for new bands is never swapped for a copy of the old one.
-            #[cfg(feature = "cuda")]
-            if sweep.follow_record(&mut c.meta) {
-                changed = true;
-            }
-            touched_any |= changed;
-            chunks.push(c);
+            (None, Some(out)) => out.push(seq.clone()),
+            (None, None) => {}
         }
-        out.push(SealedSequence {
-            chunks,
-            token_count: seq.token_count,
-            chunk_size: seq.chunk_size,
-            location: seq.location,
-        });
     }
-    Ok(if touched_any { Some(out) } else { None })
+    Ok(out)
+}
+
+/// `seq` holding `chunks` in place of its own.
+fn with_chunks(seq: &SealedSequence, chunks: Vec<SealedChunk>) -> SealedSequence {
+    SealedSequence {
+        chunks,
+        token_count: seq.token_count,
+        chunk_size: seq.chunk_size,
+        location: seq.location,
+    }
+}
+
+/// One sequence's chunks rewritten through the sweep, or `None` when none of them
+/// changed. Clones only from the first chunk that changed — see [`rewrite_sealed`].
+fn rewrite_chunks(
+    chunks: &[SealedChunk],
+    sweep: &mut Sweep<'_>,
+) -> candle::Result<Option<Vec<SealedChunk>>> {
+    let mut out: Option<Vec<SealedChunk>> = None;
+    for (i, chunk) in chunks.iter().enumerate() {
+        match (rewrite_chunk(chunk, sweep)?, out.as_mut()) {
+            (Some(c), Some(out)) => out.push(c),
+            (Some(c), None) => {
+                let mut fresh = Vec::with_capacity(chunks.len());
+                fresh.extend_from_slice(&chunks[..i]);
+                fresh.push(c);
+                out = Some(fresh);
+            }
+            (None, Some(out)) => out.push(chunk.clone()),
+            (None, None) => {}
+        }
+    }
+    Ok(out)
+}
+
+/// One chunk's replacement, or `None` when the sweep leaves it as it is.
+fn rewrite_chunk(
+    chunk: &SealedChunk,
+    sweep: &mut Sweep<'_>,
+) -> candle::Result<Option<SealedChunk>> {
+    let mut changed: Option<SealedChunk> = None;
+    if let Some(next) = sweep.rewrite_gids(&chunk.gids)? {
+        let mut c = chunk.clone();
+        // **A fresh record for the new bands, and only if this chunk had one.**
+        // Installing it retires the old record — and with it, once the sweep ends, the
+        // clone of the old gids the old record was holding — which is what lets the
+        // source be reclaimed. A chunk with no record is addressed from its gids and
+        // must not be given one; a chunk with one that cannot have a fresh one stays
+        // whole on its source.
+        #[cfg(feature = "cuda")]
+        let movable = sweep.remint(
+            &next,
+            &mut c.meta,
+            RecordInputs {
+                k_pal: &c.k_pal,
+                v_pal: &c.v_pal,
+                k_scale: &c.k_scale,
+                v_scale: &c.v_scale,
+                k_fmt: &c.k_fmt,
+                v_fmt: &c.v_fmt,
+            },
+        )?;
+        #[cfg(not(feature = "cuda"))]
+        let movable = true;
+        if movable {
+            sweep.witness(&next);
+            c.gids = next;
+            changed = Some(c);
+        }
+    }
+    // The record itself may have been copied lower. After the band rewrite, so a record
+    // just minted for new bands is never swapped for a copy of the old one.
+    #[cfg(feature = "cuda")]
+    {
+        let meta = changed.as_ref().map_or(&chunk.meta, |c| &c.meta);
+        if sweep.follows(meta) {
+            let c = changed.get_or_insert_with(|| chunk.clone());
+            sweep.follow_record(&mut c.meta);
+        }
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -814,6 +876,63 @@ mod tests {
         let mut sweep = Sweep::new(&map);
         assert!(rewrite_sealed(&[seq], &mut sweep).unwrap().is_none());
         assert_eq!(sweep.allocations_rewritten(), 0);
+    }
+
+    /// **Copy on write keeps every untouched chunk and sequence, in order.** The sweep
+    /// clones nothing until the first change, so the chunks and sequences before it are
+    /// copied in afterwards, and everything after it is carried through — the replacement
+    /// must be the input with exactly the moved chunk swapped.
+    #[test]
+    fn a_change_mid_walk_keeps_every_untouched_chunk_in_place() {
+        let gids = |arena, chunk| HeadGids::uniform(ChunkGid::detached(raw(arena, chunk)), 1);
+        let seq = |chunks: Vec<SealedChunk>| SealedSequence {
+            token_count: 32 * chunks.len(),
+            chunks,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        };
+        let before = seq(vec![chunk_with(gids(7, 0)), chunk_with(gids(7, 1))]);
+        let moved = seq(vec![
+            chunk_with(gids(7, 2)),
+            chunk_with(gids(5, 2)),
+            chunk_with(gids(7, 3)),
+        ]);
+        let after = seq(vec![chunk_with(gids(7, 4))]);
+        let input = [before, moved, after];
+
+        let mut map = CompactionMap::new();
+        map.insert(raw(5, 2), ChunkGid::detached(raw(0, 1)), 0x4000);
+        let mut sweep = Sweep::new(&map);
+        let out = rewrite_sealed(&input, &mut sweep).unwrap().expect("moved");
+
+        let names: Vec<Vec<i64>> = out
+            .iter()
+            .map(|s| {
+                s.chunks
+                    .iter()
+                    .map(|c| c.gids.as_slice()[0].raw())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                vec![raw(7, 0), raw(7, 1)],
+                vec![raw(7, 2), raw(0, 1), raw(7, 3)],
+                vec![raw(7, 4)],
+            ],
+        );
+        for (s, (o, i)) in out.iter().zip(input.iter()).enumerate() {
+            assert_eq!(o.token_count, i.token_count, "sequence {s}");
+            for (c, (oc, ic)) in o.chunks.iter().zip(i.chunks.iter()).enumerate() {
+                if (s, c) != (1, 1) {
+                    assert!(
+                        oc.gids.is_same_alloc(&ic.gids),
+                        "untouched chunk {s}.{c} is carried through, not rebuilt",
+                    );
+                }
+            }
+        }
     }
 
     /// **A destination is witnessed where a holder installs it, not where it is

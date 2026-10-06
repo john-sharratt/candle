@@ -20,7 +20,7 @@ use super::band_codec::encode_band;
 use super::gid_pool::ChunkGid;
 use super::head_gids::HeadGids;
 use super::io::read_band_chunk;
-use super::types::{ChunkWindow, SealedChunk, SealedSequence};
+use super::types::{ChunkWindow, DetachedChunks, SealedChunk, SealedSequence};
 use super::{ChunkedKvBacking, SequenceState};
 use crate::kv_cache::arena_table::{ArenaFormatTag, N_PALETTE};
 use crate::kv_cache::{active_kv_formats, KvFormat};
@@ -155,6 +155,37 @@ impl ChunkedKvBacking {
         drop(slot);
         drop(state);
         Ok(())
+    }
+
+    /// [`Self::free_sequence`], with the block table handed back instead of
+    /// dropped.
+    ///
+    /// The slot and its device buffer are released here, on the caller's
+    /// thread. What comes back is only the chunk table — RAII gids and Arc'd
+    /// metadata, whose drops make no device call — so a session freeing a long
+    /// sequence drops every layer's table at once. A freed view's table is the
+    /// parent's whole prefix, borrowed: thousands of refcount decrements per
+    /// layer that release nothing.
+    pub fn free_sequence_detached(&self, batch_idx: usize) -> Result<DetachedChunks> {
+        let batch = self.batch_capacity();
+        if batch_idx >= batch {
+            candle::bail!(
+                "batch_idx {} out of range for chunked backing (capacity {})",
+                batch_idx,
+                batch
+            )
+        }
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let Some(mut slot) = state.sequences[batch_idx].take() else {
+            return Ok(DetachedChunks(Vec::new()));
+        };
+        let chunks = slot.take_chunks();
+        drop(slot);
+        drop(state);
+        Ok(DetachedChunks(chunks))
     }
 
     pub fn set_len(&self, batch_idx: usize, len: usize) {
@@ -1466,9 +1497,29 @@ impl ChunkedKvBacking {
     ///
     /// Returns `(borrowed_block_count, borrowed_token_count)`. All borrowed
     /// chunks are read-only Arc clones of parent's chunks; writes land in a
-    /// fresh active chunk pushed after the borrow loop. `borrowed_block_count`
-    /// must be passed unchanged to [`finalize_view`].
+    /// fresh active chunk pushed after them. `borrowed_block_count` must be
+    /// passed unchanged to [`finalize_view`].
     pub fn create_view_sequence(
+        &self,
+        view_batch: usize,
+        parent_batch: usize,
+        visible_block_ranges: &[(usize, usize)],
+    ) -> Result<(usize, usize)> {
+        let borrowed = self.borrow_into_view(view_batch, parent_batch, visible_block_ranges)?;
+        if borrowed.0 > 0 {
+            self.open_view_writer(view_batch)?;
+        }
+        Ok(borrowed)
+    }
+
+    /// The borrow half of [`Self::create_view_sequence`]: the view slot holds
+    /// the parent's visible blocks and nothing else — no writer chunk yet, see
+    /// [`Self::open_view_writer`].
+    ///
+    /// Host bookkeeping only — Arc clones of the parent's chunk table, no
+    /// allocation and no device call — so a session borrows every layer's
+    /// prefix at once rather than one layer after another.
+    pub fn borrow_into_view(
         &self,
         view_batch: usize,
         parent_batch: usize,
@@ -1608,70 +1659,64 @@ impl ChunkedKvBacking {
         //   - the tail-is-shared debug class becomes structurally impossible.
         let borrowed_count = parent_blocks.len();
 
-        // Free any blocks currently in the view slot (if solely owned)
-        {
-            let vs = state.sequences[view_batch].as_mut().unwrap();
-            // GIDs are dropped via RAII, returning to pool
-            vs.clear_chunks();
-        }
-
-        // Clone parent blocks (Arc shared, read-only) and push one fresh
-        // empty active chunk so the next write has somewhere unshared to land.
-        {
-            let vs = state.sequences[view_batch].as_mut().unwrap();
-            for (
-                source_gids,
-                usage,
-                offset,
-                source_k_pal,
-                source_v_pal,
-                source_k_scale,
-                source_v_scale,
-                source_k_fmt,
-                source_v_fmt,
-                source_meta,
-            ) in borrowed_meta.into_iter()
-            {
-                vs.push_chunk(ChunkWindow {
-                    gids: source_gids,
-                    usage,
-                    offset,
-                    k_pal: source_k_pal,
-                    v_pal: source_v_pal,
-                    k_scale: source_k_scale,
-                    v_scale: source_v_scale,
-                    k_fmt: source_k_fmt,
-                    v_fmt: source_v_fmt,
-                    // Shares the parent's GIDs/placement, so the parent's
-                    // resident record applies — read it instead of rebuilding.
-                    meta: source_meta,
-                });
-            }
-        }
-
-        // Push the fresh active chunk that writes will land in. Allocated in
-        // the active K/V arena keys (R16 K + F16 V on GPU) so decode/prefill
-        // kernels can write directly. Its gids have strong_count = 1, so the
-        // tail of the slot is unshared by construction — no COW step needed.
-        {
-            let active_cw = self.alloc_block_chunks(0, 0)?;
-            let vs = state.sequences[view_batch].as_mut().unwrap();
-            vs.push_chunk(active_cw);
-        }
-
-        // Writes start at the fresh active chunk (one past the borrowed prefix).
-        {
-            let vs = state.sequences[view_batch].as_mut().unwrap();
-            let view_block_count = vs.block_count();
-            // borrowed_count blocks borrowed read-only, then one fresh active.
-            // The active chunk is at index `borrowed_count` and is where new
-            // tokens land.
-            vs.set_writer_start_idx(view_block_count.saturating_sub(1));
-        }
-
+        // Clone parent blocks (Arc shared, read-only) into the view in one
+        // replacement — whatever the slot held goes back to the pool via RAII.
+        let chunks: Vec<ChunkWindow> = borrowed_meta
+            .into_iter()
+            .map(
+                |(gids, usage, offset, k_pal, v_pal, k_scale, v_scale, k_fmt, v_fmt, meta)| {
+                    ChunkWindow {
+                        gids,
+                        usage,
+                        offset,
+                        k_pal,
+                        v_pal,
+                        k_scale,
+                        v_scale,
+                        k_fmt,
+                        v_fmt,
+                        // Shares the parent's GIDs/placement, so the parent's
+                        // resident record applies — read it instead of rebuilding.
+                        meta,
+                    }
+                },
+            )
+            .collect();
+        state.sequences[view_batch]
+            .as_mut()
+            .unwrap()
+            .replace_chunks(chunks);
         drop(state);
 
         Ok((borrowed_count, borrowed_token_count))
+    }
+
+    /// Push the fresh active chunk a view's writes land in, past the prefix
+    /// [`Self::borrow_into_view`] borrowed.
+    ///
+    /// Allocated in the active K/V arena keys (R16 K + F16 V on GPU) so
+    /// decode/prefill kernels can write directly. Its gids have
+    /// strong_count = 1, so the tail of the slot is unshared by construction.
+    pub fn open_view_writer(&self, view_batch: usize) -> Result<()> {
+        let active_cw = self.alloc_block_chunks(0, 0)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let vs = state
+            .sequences
+            .get_mut(view_batch)
+            .and_then(|s| s.as_mut())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "open_view_writer: view slot {view_batch} not allocated"
+                ))
+            })?;
+        vs.push_chunk(active_cw);
+        // Writes start at the fresh active chunk, one past the borrowed prefix.
+        let view_block_count = vs.block_count();
+        vs.set_writer_start_idx(view_block_count.saturating_sub(1));
+        Ok(())
     }
 
     /// Finish a view sequence and transfer its newly-written blocks to the parent.

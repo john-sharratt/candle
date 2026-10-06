@@ -11,6 +11,7 @@
  *   - getProjectionDetail                    GET …/{id}/projections/{turn}/{event}
  *   - getProjectionContext                   POST …/{id}/projection-context
  *   - streamChatCompletion (token + status + think + prefill)  POST /v1/chat/completions (SSE)
+ *   - followConversation (the reply in flight, same frames)    GET …/{id}/live (SSE)
  *   - subscribeLogs / seedLogs               WS /ws/logs (structured JSON frames)
  *   - getToolSchemas                         GET /v1/substrate/tools
  *   - getMe                                  GET /v1/me
@@ -66,6 +67,9 @@
         // The composer dials this conversation last ran at, as levels. Absent
         // for one that has never taken a turn — the composer keeps its own.
         dials: body.dials || null,
+        // A reply is in flight: `history` ends at its question, and
+        // `followConversation` streams the reply.
+        live: !!body.live,
       };
     },
     archiveConversation(id) { return postVoid('/v1/conversations/' + enc(id) + '/archive'); },
@@ -180,44 +184,32 @@
             });
           return;
         }
-        if (!resp.body) {
-          fail(handlers, 'The response arrived without a body.', true);
-          return;
-        }
-        const reader = resp.body.getReader();
-        const dec = new TextDecoder();
-        let buf = '';
-        let sawFrame = false;
-        const pump = () => reader.read().then(({ done, value }) => {
-          if (done) {
-            // A stream that closed without ever sending a frame produced no
-            // answer at all. The daemon logs why; the user needs to know it
-            // happened.
-            if (!sawFrame) {
-              fail(handlers, 'The response ended before it started. The daemon logged the reason.', true);
-              return;
-            }
-            handlers.onDone();
-            return;
-          }
-          buf += dec.decode(value, { stream: true });
-          let nl;
-          while ((nl = buf.indexOf('\n\n')) !== -1) {
-            const frame = buf.slice(0, nl);
-            buf = buf.slice(nl + 2);
-            sawFrame = true;
-            handleFrame(frame, handlers);
-          }
-          return pump();
-        }).catch((e) => {
-          // An abort is the user pressing stop, not a failure.
-          if (e && e.name === 'AbortError') { handlers.onDone(); return; }
-          fail(handlers, 'The response stream broke: ' + errText(e), true);
-        });
-        pump();
+        readStream(resp, handlers);
       }).catch((e) => {
         if (e && e.name === 'AbortError') { handlers.onDone(); return; }
         fail(handlers, 'Could not reach the daemon: ' + errText(e), false);
+      });
+      return { cancel: () => controller.abort() };
+    },
+
+    // GET /v1/conversations/{id}/live — the reply in flight, from its first
+    // frame, then live until it ends. For a page that opened (or reloaded, or
+    // lost its connection) while the daemon was still answering: the turn runs
+    // to completion regardless, and this is how the page catches up with it.
+    // `handlers.onGone` runs instead of anything else when nothing is in flight
+    // any more — the stored conversation is then complete.
+    followConversation(id, handlers) {
+      const controller = new AbortController();
+      fetch('/v1/conversations/' + enc(id) + '/live', { signal: controller.signal }).then((resp) => {
+        if (resp.status === 404) { if (handlers.onGone) handlers.onGone(); return; }
+        if (!resp.ok) {
+          fail(handlers, 'Following the reply failed with HTTP ' + resp.status + '.', true);
+          return;
+        }
+        readStream(resp, handlers);
+      }).catch((e) => {
+        if (e && e.name === 'AbortError') { handlers.onDone(); return; }
+        fail(handlers, 'Could not reach the daemon: ' + errText(e), true);
       });
       return { cancel: () => controller.abort() };
     },
@@ -326,6 +318,45 @@
     else if (event === 'file_rejected' && handlers.onFileRejected) handlers.onFileRejected(obj.name, obj.reason);
     else if (event === 'phase' && handlers.onPhase) handlers.onPhase(obj.phase, obj.state, obj);
     else if (event === 'stats' && handlers.onStats) handlers.onStats(obj);
+  }
+
+  // Read a chat stream's SSE frames into `handlers` until it ends.
+  function readStream(resp, handlers) {
+    if (!resp.body) {
+      fail(handlers, 'The response arrived without a body.', true);
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let sawFrame = false;
+    const pump = () => reader.read().then(({ done, value }) => {
+      if (done) {
+        // A stream that closed without ever sending a frame produced no
+        // answer at all. The daemon logs why; the user needs to know it
+        // happened.
+        if (!sawFrame) {
+          fail(handlers, 'The response ended before it started. The daemon logged the reason.', true);
+          return;
+        }
+        handlers.onDone();
+        return;
+      }
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n\n')) !== -1) {
+        const frame = buf.slice(0, nl);
+        buf = buf.slice(nl + 2);
+        sawFrame = true;
+        handleFrame(frame, handlers);
+      }
+      return pump();
+    }).catch((e) => {
+      // An abort is the user pressing stop, not a failure.
+      if (e && e.name === 'AbortError') { handlers.onDone(); return; }
+      fail(handlers, 'The response stream broke: ' + errText(e), true);
+    });
+    pump();
   }
 
   // A stream ended badly. Tell the caller what happened, then end the stream

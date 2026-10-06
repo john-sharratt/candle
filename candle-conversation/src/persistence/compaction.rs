@@ -514,13 +514,13 @@ pub fn collect_live_records(
                 RecordHeader {
                     record_type: RecordType::TurnIndexPage,
                     format: 0,
-                    payload_len: payload.len() as u64,
+                    payload_len: payload.bytes().len() as u64,
                     crc: 0,
                     stream_id: stream_id.0,
                     chunk_index: 0,
                     token_count: 0,
                 },
-                payload.clone(),
+                payload.bytes().to_vec(),
             ));
         }
         if let Some(through) = entry.committed_through {

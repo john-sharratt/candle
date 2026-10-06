@@ -215,6 +215,7 @@ mod resolver;
 mod schema;
 mod score;
 mod selection;
+mod swap_cap;
 pub mod warm_pool;
 mod working_set_observe;
 mod working_set_pick;
@@ -235,10 +236,10 @@ pub use adaptive::{
 pub use builder::Builder;
 pub use error::ConstructionError;
 pub use event::{
-    aggregate, decode_events, encode_events, from_projection, from_projection_with_origins,
-    staged_ingest_event, summary_node_event, BucketKind, MaterializedPiece, ProjectionBucket,
-    ProjectionEvent, ProjectionSelection, SelectedSection, SelectedTurn, SelectionScores,
-    SystemItem,
+    aggregate, decode_events, decode_points, encode_events, from_projection,
+    from_projection_with_origins, staged_ingest_event, summary_node_event, BucketKind,
+    MaterializedPiece, ProjectionBucket, ProjectionEvent, ProjectionPoint, ProjectionSelection,
+    SelectedSection, SelectedTurn, SelectionScores, SystemItem,
 };
 pub use ids::{
     CollectionId, GroupId, LayerId, Reserved, SectionId, TimelineAllocator, TimelineId, TurnId,
@@ -256,7 +257,9 @@ pub use project::{
     TOOLS_ENABLED_SELECTOR, TOOL_ROUND_SELECTOR,
 };
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
-pub use resolver::{CollectionWarm, Conversation, Observe, SectionLoads, TargetedRead, WarmProbe};
+pub use resolver::{
+    CollectionWarm, Conversation, GalleryPreload, Observe, SectionLoads, TargetedRead, WarmProbe,
+};
 pub use schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection,

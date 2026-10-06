@@ -11,6 +11,8 @@
 //! 5. **Priming** — read the priming chain the base conversation descends
 //!    from (`crate::branch_ingest::prime`).
 //! 6. **Normalizing** — relearn the tool catalog's score-normalization levels.
+//! 7. **Preloading** — decode and place on the GPU what a projection's belief
+//!    scan reads, so the first question asked does not pay for it.
 //!
 //! `LoadProgress` is the single source of truth; the daemon advances it
 //! via [`Self::set_step`], reports intra-step progress via
@@ -45,6 +47,12 @@ pub enum LoadStep {
     /// corpus is complete, and before `ready`, because a query scored against
     /// cold levels ranks the tools differently rather than merely lower.
     Normalizing,
+    /// Everything a projection's belief scan reads — the ingested files' and
+    /// folders' signatures and the tool catalog's gallery — decoded and resident
+    /// on the GPU (`ConversationEngine::preload_galleries`). Before `ready`,
+    /// because otherwise the first question after a start pays for it ahead of
+    /// its first token: about a second at a thousand ingested files.
+    Preloading,
 }
 
 impl LoadStep {
@@ -59,6 +67,7 @@ impl LoadStep {
         LoadStep::SelfCheck,
         LoadStep::Priming,
         LoadStep::Normalizing,
+        LoadStep::Preloading,
     ];
 
     /// Human-readable label rendered in the loading overlay.
@@ -72,6 +81,7 @@ impl LoadStep {
             LoadStep::SelfCheck => "Checking conversations",
             LoadStep::Priming => "Reading the repositories",
             LoadStep::Normalizing => "Normalizing scores",
+            LoadStep::Preloading => "Preloading projections",
         }
     }
 
@@ -95,6 +105,7 @@ impl LoadStep {
             LoadStep::SelfCheck => "conversations",
             LoadStep::Priming => "documents",
             LoadStep::Normalizing => "",
+            LoadStep::Preloading => "",
         }
     }
 }

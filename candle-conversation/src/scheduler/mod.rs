@@ -65,7 +65,7 @@ use crate::decode_health::DecodeHealthState;
 use crate::decoded_text::{decode_turn_text, TagIds};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
-use crate::index_pages;
+use crate::index_pages::{self, StoredPages};
 use crate::persistence::cold_load::{
     preallocate_pinned_scratch, ColdLoadStager, PINNED_PREALLOC_BYTES,
 };
@@ -86,7 +86,7 @@ use crate::projection::{
     ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
     TimelineId, TurnId, TurnIndex, TurnKey,
 };
-use crate::projection::{CollectionWarm, GroupId, LayerId, Schema};
+use crate::projection::{CollectionWarm, GalleryPreload, GroupId, LayerId, Schema};
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
@@ -119,6 +119,7 @@ use candle_transformers::models::batched_inference::{
 };
 use candle_transformers::models::delta_net::ExportedLayerState;
 use candle_transformers::models::draft_depth::DraftDepth;
+use candle_transformers::models::piece_key::PieceKey;
 
 use self::exported_state::{ExportedState, SharedState};
 use self::norm_warm::NormWarm;
@@ -718,6 +719,15 @@ pub(crate) enum SchedulerRequest {
         conversation: Conversation,
         schema: Box<Schema>,
         response_tx: Sender<CollectionWarm>,
+    },
+
+    /// Decode and place on this thread's GPU gallery arena everything a
+    /// projection's belief scan reads ([`Conversation::preload_galleries`]),
+    /// so the first projection after a start finds it all resident.
+    PreloadGalleries {
+        conversation: Conversation,
+        schema: Box<Schema>,
+        response_tx: Sender<GalleryPreload>,
     },
 
     /// Warm one slice of an ingest group's per-file hit levels on this thread's
@@ -3065,7 +3075,7 @@ pub(crate) struct Scheduler {
     /// page, so the first ingest to borrow it warns and selects against a
     /// prefix it never indexed. Persisting it belongs beside the section's own
     /// records, keyed by the same stream id.
-    pub(super) section_positional: HashMap<SectionId, Arc<Vec<u8>>>,
+    pub(super) section_positional: HashMap<SectionId, Arc<StoredPages>>,
     /// Each sealed turn's per-position model state, keyed as its K/V is.
     ///
     /// The conversation counterpart of [`Self::section_positional`], and the
@@ -3076,7 +3086,7 @@ pub(crate) struct Scheduler {
     /// Process-local, with the same limit stated there — a turn cold-loaded on
     /// a later run has its K/V and not its page, and the injection says so
     /// rather than selecting silently against a prefix it never indexed.
-    pub(super) turn_positional: HashMap<TurnKey, Arc<Vec<u8>>>,
+    pub(super) turn_positional: HashMap<TurnKey, Arc<StoredPages>>,
     /// Batched sampler for token generation.
     sampler: BatchedSampler,
     /// When `true`, special tokens are included in streamed text.
@@ -4965,6 +4975,17 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::PreloadGalleries {
+                conversation,
+                schema,
+                response_tx,
+            } => {
+                let preload =
+                    conversation.preload_galleries(&schema, self.gallery_arena.as_deref());
+                let _ = response_tx.send(preload);
+                true
+            }
+
             SchedulerRequest::WarmIngestSlice {
                 conversation,
                 schema,
@@ -6570,6 +6591,23 @@ impl Scheduler {
         }
     }
 
+    /// One handle per substrate the live slots are bound to.
+    ///
+    /// Every slot of a workspace registers its own handle on the same substrate, so
+    /// a walk over [`Self::slot_conversations`] visits that substrate once per slot.
+    /// A pass over residences — a compaction sweep, a relief eviction — finds nothing
+    /// left to do on a second visit, and pays a full walk of every residence to learn
+    /// it.
+    pub(super) fn distinct_substrates(&self) -> Vec<Conversation> {
+        let mut out: Vec<Conversation> = Vec::new();
+        for conv in self.slot_conversations.values() {
+            if !out.iter().any(|seen| seen.same_substrate(conv)) {
+                out.push(conv.clone());
+            }
+        }
+        out
+    }
+
     // —— Sequence creation ——————————————————————————————————————————
 
     /// Allocate a fresh empty GPU slot bound to a `Conversation`
@@ -7763,8 +7801,7 @@ impl Scheduler {
         let page = if self.model.carries_positional_state() {
             let page = conversation
                 .read()
-                .section_index_page(stream_id)
-                .map(<[u8]>::to_vec)
+                .section_index_page_shared(stream_id)
                 .ok_or_else(|| {
                     ConversationError::Channel(format!(
                         "section {section_id:?}: persisted without its index page — re-ingest"
@@ -7794,7 +7831,7 @@ impl Scheduler {
             tokens_arc,
         );
         if let Some(page) = page {
-            self.section_positional.insert(section_id, Arc::new(page));
+            self.section_positional.insert(section_id, page);
         }
         Ok(chunks_per_layer)
     }
@@ -7857,10 +7894,15 @@ impl Scheduler {
     /// runs — a startup wedged in "Prefilling tool sections".
     fn push_prefix_section_index(&self, seq: SequenceId, prefix_id: SectionId, tokens: usize) {
         let refused = match self.section_positional.get(&prefix_id) {
-            Some(blob) => match self.model.push_positional_state(seq.0, blob) {
-                Ok(_) => None,
-                Err(e) => Some(format!("index page refused: {e}")),
-            },
+            Some(page) => {
+                match self
+                    .model
+                    .push_positional_state(seq.0, page.bytes(), &page.whole_key())
+                {
+                    Ok(_) => None,
+                    Err(e) => Some(format!("index page refused: {e}")),
+                }
+            }
             None if self.model.carries_positional_state() => Some("has no index page".to_string()),
             None => None,
         };
@@ -8109,7 +8151,8 @@ impl Scheduler {
                          so a restart prefills this section again instead of restoring it",
                     ),
                 }
-                self.section_positional.insert(section_id, Arc::new(blob));
+                self.section_positional
+                    .insert(section_id, Arc::new(StoredPages::new(blob)));
             }
             // **`None` from a model that keeps per-position state is a section
             // with no index.** It used to be swallowed, and that silence is what
@@ -8995,7 +9038,7 @@ impl Scheduler {
                                     timeline: target.timeline,
                                     index: idx,
                                 },
-                                Arc::new(payload),
+                                Arc::new(StoredPages::new(payload)),
                             );
                         }
                     }
@@ -9610,16 +9653,9 @@ impl Scheduler {
                             // resident copy first, then the turn's stored page,
                             // the same order a projection uses.
                             let key = TurnKey::new(target.timeline, idx);
-                            let page =
-                                self.turn_positional
-                                    .get(&key)
-                                    .map(|b| b.to_vec())
-                                    .or_else(|| {
-                                        conversation
-                                            .read()
-                                            .index_page_blob(target.timeline, idx)
-                                            .map(|b| b.to_vec())
-                                    });
+                            let page = self.turn_positional.get(&key).cloned().or_else(|| {
+                                conversation.read().index_page_shared(target.timeline, idx)
+                            });
                             // The stored page is a framed LIST of pages, and the
                             // model reads one page at a time — see
                             // `index_pages::push_in_order`. However the pages fare,
@@ -9647,7 +9683,9 @@ impl Scheduler {
                                 Some(blob) => {
                                     let pushed = index_pages::push_in_order(
                                         &blob,
-                                        |p| model.push_positional_state(scratch, p).map(|_| ()),
+                                        |p, key| {
+                                            model.push_positional_state(scratch, p, key).map(|_| ())
+                                        },
                                         &advance,
                                     );
                                     match pushed {
@@ -10812,29 +10850,11 @@ impl Scheduler {
             self.session
                 .reconcile_block_counts(view_id.0)
                 .map_err(ConversationError::Model)?;
-            let snapshot = self
-                .session
-                .snapshot_sequence_per_layer(view_id.0)
-                .map_err(ConversationError::Model)?;
-            let tail_start = view_state.turn_start_parent_blocks;
-            snapshot
-                .into_iter()
-                .map(|seq| {
-                    let chunks: Vec<candle_nn::kv_cache::SealedChunk> =
-                        if tail_start < seq.chunks.len() {
-                            seq.chunks[tail_start..].to_vec()
-                        } else {
-                            Vec::new()
-                        };
-                    let token_count: usize = chunks.iter().map(|c| c.token_count as usize).sum();
-                    candle_nn::kv_cache::SealedSequence {
-                        chunks,
-                        token_count,
-                        chunk_size: seq.chunk_size,
-                        location: seq.location,
-                    }
-                })
-                .collect::<Vec<_>>()
+            // The turn's blocks only — never the whole slot, which holds the
+            // entire projected context ahead of them.
+            self.session
+                .snapshot_sequence_tail(view_id.0, view_state.turn_start_parent_blocks)
+                .map_err(ConversationError::Model)?
         };
         // Pull DecodeState / sampling_state off the old view id before
         // freeing the slot, then re-bind to the new view id after the
@@ -11077,8 +11097,10 @@ impl Scheduler {
             // borrowed piece uses.
             if !tail_index_page.is_empty() {
                 // In order: each piece the turn spanned keeps its own width.
+                // Sealed a moment ago and handed over once, so keyed here.
                 for (_tokens, page) in tail_index_page.iter() {
-                    if let Err(e) = self.model.push_positional_state(parent_id.0, page) {
+                    let key = PieceKey::of(page);
+                    if let Err(e) = self.model.push_positional_state(parent_id.0, page, &key) {
                         tracing::warn!(
                             slot = parent_id.0,
                             tail_token_count,
@@ -12049,10 +12071,22 @@ mod tests {
 
         /// Takes a page only in its own format, and refuses anything else the
         /// way the real model refuses a malformed page.
-        fn push_positional_state(&self, seq: usize, blob: &[u8]) -> candle::Result<bool> {
+        fn push_positional_state(
+            &self,
+            seq: usize,
+            blob: &[u8],
+            key: &PieceKey,
+        ) -> candle::Result<bool> {
             if !blob.starts_with(TOY_PAGE) {
                 candle::bail!("toy page: a format this double does not read");
             }
+            // The key must be the page's own — the caller takes it once and
+            // hands it over with every push.
+            assert_eq!(
+                *key,
+                PieceKey::of(blob),
+                "a page pushed under another page's key"
+            );
             let mut pushed = self.probe.pushed.lock().unwrap();
             pushed
                 .entry(seq)
@@ -12592,10 +12626,11 @@ mod tests {
         let good_page = [TOY_PAGE, b"-good"].concat();
         sched
             .section_positional
-            .insert(good, Arc::new(good_page.clone()));
-        sched
-            .section_positional
-            .insert(stale, Arc::new(b"\x02\x00\x00\x00rotated".to_vec()));
+            .insert(good, Arc::new(StoredPages::new(good_page.clone())));
+        sched.section_positional.insert(
+            stale,
+            Arc::new(StoredPages::new(b"\x02\x00\x00\x00rotated".to_vec())),
+        );
 
         let seq = SequenceId(5);
         sched.push_prefix_section_index(seq, good, 40);
@@ -15360,6 +15395,26 @@ mod tests {
         });
         scheduler.drain_parked_forks();
         assert!(rx.try_recv().expect("answered").is_err());
+    }
+
+    /// **A substrate shared by several slots is walked once.** Three slots on one
+    /// workspace and one on another give two substrates, whichever slot registered
+    /// them.
+    #[test]
+    fn slots_sharing_a_substrate_are_walked_once() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let workspace = crate::projection::Conversation::new();
+        let other = crate::projection::Conversation::new();
+        for _ in 0..3 {
+            create_scratch_slot(&mut scheduler, &workspace);
+        }
+        create_scratch_slot(&mut scheduler, &other);
+
+        let distinct = scheduler.distinct_substrates();
+        assert_eq!(distinct.len(), 2);
+        assert!(distinct.iter().any(|c| c.same_substrate(&workspace)));
+        assert!(distinct.iter().any(|c| c.same_substrate(&other)));
+        assert!(!workspace.same_substrate(&other));
     }
 
     /// **A requester that gave up costs no slot.**

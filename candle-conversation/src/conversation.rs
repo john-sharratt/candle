@@ -17,9 +17,9 @@ use crate::persistence::content_hash::{
 use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    from_projection_with_origins, Builder, Conversation, Observe, ProjectionEvent, ProjectionMode,
-    ProjectionTarget, SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId,
-    TurnIndex,
+    decode_events, decode_points, from_projection_with_origins, Builder, Conversation, Observe,
+    ProjectionEvent, ProjectionMode, ProjectionPoint, ProjectionTarget, SectionId, SectionTree,
+    SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::scheduler::exported_state::SharedState;
@@ -4866,18 +4866,8 @@ impl Sequence {
             let no_think = read.turn_no_think(timeline, idx);
             if !user_text.is_empty() {
                 let tool_tokens = if user_text.contains(TOOL_RESPONSE_OPEN) {
-                    // The user body's ids, where the layout places them in the
-                    // turn's grid.
-                    let body: Vec<u32> = read
-                        .turn_layout(timeline, idx)
-                        .and_then(|layout| {
-                            let span = layout.user_span();
-                            read.token_ids_of(timeline, idx)
-                                .get(span.offset as usize..span.end() as usize)
-                                .map(<[u32]>::to_vec)
-                        })
-                        .unwrap_or_default();
-                    tool_response_lengths(&body, &response_open)
+                    let body = read.user_body_ids(timeline, idx).unwrap_or_default();
+                    tool_response_lengths(body, &response_open)
                 } else {
                     Vec::new()
                 };
@@ -4890,9 +4880,7 @@ impl Sequence {
                 });
             }
             if !assistant_text.is_empty() {
-                let thinking = read
-                    .turn_layout(timeline, idx)
-                    .and_then(|layout| layout.thinking_length(estimate));
+                let thinking = read.thinking_length_of(timeline, idx, estimate);
                 out.push(RecoveredMessage {
                     role: Role::Assistant,
                     text: assistant_text,
@@ -5028,6 +5016,29 @@ impl Sequence {
     /// turn in turn order (empty for turns that have none). Mirrors
     /// [`recovered_history`](Self::recovered_history); backs the GUI timeline
     /// replay after reload.
+    /// [`Self::recovered_projection_events`], light: each turn's points as the
+    /// conversation's timeline draws them, without the selection or spine the
+    /// projection panel reads — what loading a conversation's history needs, at
+    /// a fraction of the decode.
+    pub fn recovered_projection_points(&self, timeline: TimelineId) -> Vec<Vec<ProjectionPoint>> {
+        let read = self.substrate.read();
+        let indices: Vec<TurnIndex> = read.turn_indices(timeline).collect();
+        indices
+            .into_iter()
+            .filter(|&idx| {
+                !read
+                    .tree_meta_of(timeline, idx)
+                    .is_some_and(|m| m.kind.is_summary())
+                    && read.has_assistant_text(timeline, idx)
+            })
+            .map(|idx| {
+                read.projection_events_blob(timeline, idx)
+                    .map(decode_points)
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
     pub fn recovered_projection_events(&self, timeline: TimelineId) -> Vec<Vec<ProjectionEvent>> {
         let read = self.substrate.read();
         let indices: Vec<TurnIndex> = read.turn_indices(timeline).collect();
@@ -5041,26 +5052,14 @@ impl Sequence {
                 !read
                     .tree_meta_of(timeline, idx)
                     .is_some_and(|m| m.kind.is_summary())
-                    && !read.assistant_text_of(timeline, idx).is_empty()
+                    && read.has_assistant_text(timeline, idx)
             })
             .map(|idx| {
                 read.projection_events_blob(timeline, idx)
-                    .map(crate::projection::decode_events)
+                    .map(decode_events)
                     .unwrap_or_default()
             })
             .collect()
-    }
-
-    /// Every timeline with at least one recovered turn, paired with the
-    /// turn count.
-    pub fn recovered_timelines(&self) -> Vec<(TimelineId, u32)> {
-        let read = self.substrate.read();
-        let mut counts: std::collections::HashMap<TimelineId, u32> =
-            std::collections::HashMap::new();
-        for key in read.all_turns() {
-            *counts.entry(key.timeline).or_insert(0) += 1;
-        }
-        counts.into_iter().collect()
     }
 
     /// The substrate-backed sidebar label for `timeline`, or `None`.

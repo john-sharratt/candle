@@ -153,7 +153,9 @@ pub use chunked::{
 };
 pub use chunked::{rewrite_sealed, CompactionMap, Sweep};
 pub use chunked::{ArenaKey, StoragePolicy};
-pub use chunked::{LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE};
+pub use chunked::{
+    DetachedChunks, LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE,
+};
 pub use rotating::{
     IndicesAndMask, RotatingCache, RotatingKvCache, ScatteredCacheBuilder, ScatteredKvCache,
 };

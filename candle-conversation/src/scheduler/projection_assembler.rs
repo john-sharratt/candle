@@ -40,7 +40,7 @@ use candle_transformers::models::batched_inference::{
 
 use crate::conversation::slice_per_layer_sealed;
 use crate::error::ConversationError;
-use crate::index_pages;
+use crate::index_pages::{self, StoredPages};
 use crate::persistence::content_hash::turn_stream_id;
 use crate::projection::event::{group_name_of, layer_name_of_group, role_str};
 use crate::projection::{
@@ -646,10 +646,10 @@ pub(super) struct ApplyContext<'a> {
     /// Each sealed section's per-position model state, so a borrowed section
     /// brings its index rows along with its chunks. Empty for a model that
     /// carries none — see `Scheduler::section_positional`.
-    pub(super) section_positional: &'a HashMap<SectionId, Arc<Vec<u8>>>,
+    pub(super) section_positional: &'a HashMap<SectionId, Arc<StoredPages>>,
     /// Each sealed turn's per-position model state — the dialogue counterpart
     /// of [`Self::section_positional`], and the one this path uses most.
-    pub(super) turn_positional: &'a HashMap<TurnKey, Arc<Vec<u8>>>,
+    pub(super) turn_positional: &'a HashMap<TurnKey, Arc<StoredPages>>,
 }
 
 /// A built-but-not-yet-fired gap-fill descriptor for one slot. Owned (no
@@ -1536,8 +1536,11 @@ fn inject_sealed_section(
     // The rows that go with those chunks. Borrowing the K/V is what makes this
     // path cheap; the index cannot be borrowed the same way, because its keys
     // come from hidden states this slot never computed.
-    if let Some(blob) = ctx.section_positional.get(&sid) {
-        match ctx.model.push_positional_state(parent_id.0, blob) {
+    if let Some(page) = ctx.section_positional.get(&sid) {
+        match ctx
+            .model
+            .push_positional_state(parent_id.0, page.bytes(), &page.whole_key())
+        {
             Ok(_) => walker.pages_pushed += 1,
             Err(e) => tracing::warn!(
                 "apply_projection: section {} index page refused: {e}",
@@ -1683,10 +1686,10 @@ fn inject_sealed_turn(
     // the whole reason the pages are written to the log rather than kept in RAM.
     let key = TurnKey { timeline, index };
     let fetch = profile::span("inject:turn:fetch_page");
-    let resident = ctx.turn_positional.get(&key).map(|b| b.to_vec());
+    let resident = ctx.turn_positional.get(&key).cloned();
     let (sealed, page) = {
         let conv = ctx.conversation.read();
-        let stored = resident.or_else(|| conv.index_page_blob(timeline, index).map(|b| b.to_vec()));
+        let stored = resident.or_else(|| conv.index_page_shared(timeline, index));
         fetch.end();
         let _window = profile::span("inject:turn:window");
         // **"Most recent" is the SLOT's most recent, not each timeline's.**
@@ -1825,7 +1828,7 @@ fn inject_sealed_turn(
         let _push = profile::span("inject:turn:push_pages");
         let pushed = index_pages::push_in_order(
             &blob,
-            |p| model.push_positional_state(parent_id.0, p).map(|_| ()),
+            |p, key| model.push_positional_state(parent_id.0, p, key).map(|_| ()),
             |gap| {
                 if carries {
                     advanced = model.push_positional_gap(parent_id.0, gap).is_ok();
@@ -2021,15 +2024,18 @@ fn inject_arc_sealed(
 #[derive(Clone)]
 pub(super) struct CapturedSpan {
     pub kv: Arc<Vec<SealedSequence>>,
-    /// `None` only for a model that indexes nothing.
-    pub page: Option<Arc<Vec<u8>>>,
+    /// `None` only for a model that indexes nothing. One page, keyed whole.
+    pub page: Option<Arc<StoredPages>>,
 }
 
 /// Hand a re-injected span's index rows back to the model.
 fn push_captured_page(ctx: &mut ApplyContext<'_>, span: &CapturedSpan, what: &str) {
     match &span.page {
         Some(page) => {
-            if let Err(e) = ctx.model.push_positional_state(ctx.parent_id.0, page) {
+            if let Err(e) =
+                ctx.model
+                    .push_positional_state(ctx.parent_id.0, page.bytes(), &page.whole_key())
+            {
                 tracing::warn!("apply_projection: {what} index page refused: {e}");
             }
         }
@@ -2215,7 +2221,7 @@ fn drive_prefill_and_capture(
     // re-injects the K/V from cache, and leaves the slot holding this span's
     // tokens with nothing indexing them.
     let page = match ctx.model.seal_positional_range(parent_id.0, start_pos) {
-        Ok(page) => page.map(Arc::new),
+        Ok(page) => page.map(|p| Arc::new(StoredPages::new(p))),
         Err(e) => {
             tracing::warn!(
                 "apply_projection: captured span at {start_pos} has no index page ({e}); \
@@ -2714,6 +2720,7 @@ mod tests {
             0.2,
             100.0,
             limits,
+            usize::MAX,
         );
         let target = ProjectionTarget {
             layer,

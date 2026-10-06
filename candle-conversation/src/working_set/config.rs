@@ -34,6 +34,10 @@ pub struct WorkingSetConfig {
     /// Tool names whose call releases the locks — anything that changes what a
     /// later read would return.
     pub release_on: Vec<String>,
+    /// The most provenance members one reprojection admits; the rest keep
+    /// their momentum and enter on later ones (`WorkingSet::observe`). Locks
+    /// and seeds are not counted — a lock answers a call the model just made.
+    pub max_admits: usize,
 }
 
 impl WorkingSetConfig {
@@ -78,6 +82,7 @@ mod tests {
             max_file_tokens: 100_000,
             seeds: Vec::new(),
             release_on: vec!["write".into(), "file_edit".into()],
+            max_admits: 2,
         }
     }
 
