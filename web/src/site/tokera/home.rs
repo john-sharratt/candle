@@ -17,7 +17,7 @@ use super::page::{self, Kind, Meta, Nav, Width};
 /// Measured, from the headline results of `docs/performance.md` (claims 1, 3, 5).
 const STATS: [(&str, &str); 4] = [
     ("180B", "parameters on a 16 GB laptop"),
-    ("1,202", "tokens/sec across 64, one card"),
+    ("2,419", "tokens/sec across 64, one card"),
     ("7.6×", "KV cache compression"),
     ("24×", "llama.cpp's best decode, one card"),
 ];

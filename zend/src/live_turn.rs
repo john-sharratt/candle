@@ -171,7 +171,10 @@ mod tests {
             text(follower.await.unwrap()),
             ["status:thinking", "Hel", "lo"]
         );
-        assert!(turns.get("c").is_none(), "a finished turn is no longer live");
+        assert!(
+            turns.get("c").is_none(),
+            "a finished turn is no longer live"
+        );
     }
 
     /// A finished turn's own record does not remove the newer turn that
