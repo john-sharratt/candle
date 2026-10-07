@@ -632,6 +632,7 @@ impl ChunkedKvBacking {
                         for k in self.inner.pool.format_keys() {
                             while let Some(idx) = self.inner.pool.next_tombstone(k) {
                                 arena_state.release_arena(idx);
+                                self.inner.pool.recycle_arena_index(idx);
                                 swept += 1;
                             }
                         }
@@ -1342,8 +1343,19 @@ impl BackingInner {
     /// pass can create it in the gap rather than rediscovering the need at the
     /// same depth and failing the same way — see [`Self::create_deferred_arenas`].
     pub(super) fn ensure_arena_exists(&self, arena_idx: usize, key: ArenaKey) -> Result<()> {
-        let exists = self.storage.read(|s| s.has_arena(arena_idx))?;
-        if exists {
+        // **An arena already standing at the index must be this key's.** One left
+        // over from the index's previous tenant has another class's stride, and
+        // adopting it puts slots of one size in a pool of another — which the
+        // compaction planner then reports as a copy between slots of unequal extent,
+        // pass after pass, failing every turn it touches.
+        if let Some(standing) = self.storage.read(|s| s.arena_key(arena_idx))? {
+            if standing != key {
+                candle::bail!(
+                    "arena index {arena_idx} was registered for {key:?} but storage still \
+                     holds an arena for {standing:?} there — the index was reissued before \
+                     its last tenant's storage was released"
+                );
+            }
             return Ok(());
         }
 

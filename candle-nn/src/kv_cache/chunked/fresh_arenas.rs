@@ -225,6 +225,9 @@ mod tests {
         fn release_if_empty(&self, key: ArenaKey, arena_idx: usize) -> Result<bool> {
             let done = self.pool.tombstone_if_empty(key, arena_idx);
             if done {
+                // There is no storage here to release; the index goes straight back,
+                // as it does after `BackingInner`'s storage release.
+                self.pool.recycle_arena_index(arena_idx);
                 self.released.borrow_mut().push(arena_idx);
             }
             Ok(done)

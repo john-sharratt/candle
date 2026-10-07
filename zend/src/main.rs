@@ -674,6 +674,10 @@ async fn main() -> anyhow::Result<()> {
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    // No Nagle: a body leaves in many small writes, and each would otherwise
+    // wait on the peer's delayed ACK — the same stall the `web` gateway's
+    // client side had (see `web/src/server.rs`).
+    .tcp_nodelay(true)
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 

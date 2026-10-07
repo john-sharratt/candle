@@ -212,6 +212,12 @@ impl Builder {
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        // **No Nagle on the client side.** A response body leaves in many small
+        // writes; with Nagle on, each one waits for the ACK of the last, and the
+        // client's delayed ACK holds that for up to ~200 ms. Over Cloudflare's
+        // round trip that capped a 150 KB response at ~20 KB/s — the GUI's page
+        // and tool catalog took 7–8 s to load while the LAN path took 2 ms.
+        .tcp_nodelay(true)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("shutting down");

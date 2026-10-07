@@ -1500,21 +1500,42 @@ impl ChunkGidPool {
             .expect("just registered arena, must have capacity")
     }
 
-    /// Find a fully-free arena of this format and release it.
+    /// Find a fully-free arena of this format and release its pool entry.
+    ///
+    /// **The index is not reissued yet.** The caller releases the arena's storage
+    /// next and then hands the index back with [`Self::recycle_arena_index`]. Freed
+    /// here, a registration on another thread could take the index while storage
+    /// still held the old arena, and `ensure_arena_exists` — which asks only whether
+    /// an arena exists at the index — would adopt it under the new key with the old
+    /// key's stride.
     pub fn next_tombstone(&self, key: ArenaKey) -> Option<usize> {
         let mut state = self.inner.metadata.lock().unwrap();
         let pool = self.inner.pools.get(&key)?;
         let arena_idx = pool.try_tombstone(&state.protected_arenas)?;
         state.arena_registry[arena_idx] = None;
-        state.free_arenas.push_back(arena_idx);
         Some(arena_idx)
     }
 
-    /// Release one named arena if it is empty and past its creation window, returning
-    /// its index to the free list; `true` when it did.
+    /// Return a tombstoned index to the free list, once its storage is released.
+    ///
+    /// The second half of [`Self::next_tombstone`] and [`Self::tombstone_if_empty`]:
+    /// from here the next registration may take the index, and storage holds no
+    /// arena at it to be mistaken for the new one.
+    pub fn recycle_arena_index(&self, arena_idx: usize) {
+        let mut state = self.inner.metadata.lock().unwrap();
+        debug_assert!(
+            state.arena_registry.get(arena_idx).is_none_or(|k| k.is_none()),
+            "recycling arena index {arena_idx} that is still registered"
+        );
+        state.free_arenas.push_back(arena_idx);
+    }
+
+    /// Release one named arena's pool entry if it is empty and past its creation
+    /// window; `true` when it did.
     ///
     /// For a creator handing back an arena it made and did not use. The caller releases
-    /// the arena's storage afterwards, exactly as after [`Self::next_tombstone`].
+    /// the arena's storage afterwards and then recycles the index, exactly as after
+    /// [`Self::next_tombstone`].
     ///
     /// **The index leaves the protected set here, under the same lock that puts it on
     /// the free list.** Lifted any later, the index would sit free and protected at once,
@@ -1530,7 +1551,6 @@ impl ChunkGidPool {
         }
         state.arena_registry[arena_idx] = None;
         state.protected_arenas.remove(&arena_idx);
-        state.free_arenas.push_back(arena_idx);
         true
     }
 
@@ -1608,24 +1628,24 @@ impl ChunkGidPool {
             .any(|pool| pool.reclaimable_arenas() >= 1)
     }
 
-    /// Force-release an arena's bookkeeping after an external drain
-    /// of its gids. Used by the compaction path that manually frees
-    /// chunks then expects the pool slot to disappear.
+    /// Force-release the bookkeeping of an arena whose storage was never created —
+    /// the creation paths' rollback when building the arena failed — and recycle
+    /// its index at once, since storage holds nothing at it.
+    ///
+    /// **The pool entry goes before the index is freed, under one lock.** Freed
+    /// first, a registration on another thread could take the index and land its
+    /// key's entry beside the stale one, and this removal would then take the new
+    /// tenant's.
     pub fn force_release_arena(&self, arena_idx: usize) {
-        let key = {
-            let mut state = self.inner.metadata.lock().unwrap();
-            let key = state.arena_registry.get(arena_idx).and_then(|k| *k);
-            if key.is_some() {
-                state.arena_registry[arena_idx] = None;
-                state.free_arenas.push_back(arena_idx);
-            }
-            key
+        let mut state = self.inner.metadata.lock().unwrap();
+        let Some(key) = state.arena_registry.get(arena_idx).and_then(|k| *k) else {
+            return;
         };
-        if let Some(key) = key {
-            if let Some(pool) = self.inner.pools.get(&key) {
-                pool.force_release(arena_idx);
-            }
+        if let Some(pool) = self.inner.pools.get(&key) {
+            pool.force_release(arena_idx);
         }
+        state.arena_registry[arena_idx] = None;
+        state.free_arenas.push_back(arena_idx);
     }
 
     /// Return the set of format keys currently registered in the pool.
@@ -1918,6 +1938,29 @@ mod tests {
         assert!(r3.iter().all(|g| g.arena_idx() == c));
     }
 
+    /// **A tombstoned index is not reissued until its storage is gone.** The pool
+    /// and the arena storage release an arena in two steps, and a registration in
+    /// between used to take the index while storage still held the old arena —
+    /// which `ensure_arena_exists` then adopted, old stride and all, under the new
+    /// key. Compaction found the result as a copy between slots of unequal extent:
+    /// arena 398 holding 4096 B slots in a pool of 8192 B ones.
+    #[test]
+    fn a_tombstoned_index_waits_for_its_storage_release() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let other = ArenaKey::new(SizeClass::at(1), ArenaLocation::Gpu);
+        let a = pool.register_arena(key);
+        pool.finish_creation(key, a);
+        assert_eq!(pool.next_tombstone(key), Some(a));
+        let b = pool.register_arena(other);
+        assert_ne!(
+            b, a,
+            "the index was reissued while its storage could still hold the old arena"
+        );
+        pool.recycle_arena_index(a);
+        assert_eq!(pool.register_arena(other), a, "and is reissued once released");
+    }
+
     /// An arena that registers below the point the walk has passed is a fresh
     /// arena with a whole tail, and it is preferred again — lowest-first
     /// placement is what compaction packs against, and recycled indices are how
@@ -1934,9 +1977,11 @@ mod tests {
         let in_b = pool.allocate_run_for(key, 2).unwrap();
         assert!(in_b.iter().all(|g| g.arena_idx() == b));
 
-        // `a` empties and its index is recycled by the next registration.
+        // `a` empties, its storage is released, and its index is recycled by the
+        // next registration.
         drop(fill_a);
         assert_eq!(pool.next_tombstone(key), Some(a));
+        pool.recycle_arena_index(a);
         assert_eq!(pool.register_arena(key), a);
 
         let run = pool.allocate_run_for(key, 2).unwrap();
