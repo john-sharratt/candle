@@ -112,7 +112,48 @@ pub const REPORT_STUCK: Tool = desk_on!(
 /// taken up and answered for there, and carried out in the world between.
 pub const MISSION_ACTS: &[Tool] = &[COLLECT_MISSION, REPORT_DONE, REPORT_STUCK];
 
+/// Whether the table offers `tool` to a body in this state: `on_mission` whether
+/// it carries an open mission, `holds_order` whether it holds a standing order.
+///
+/// **What cannot be done is not offered.** The table listed `collect_mission`
+/// beside `report_done` to a character back with its work done; it took the
+/// first, was refused, read the refusal as being sent to collect first, and
+/// stood at the table going round. One carrying a mission has only the reports;
+/// one carrying none has only the collect. `orders_report_done` is for a body
+/// holding an order — a character with a mission and no order filed its mission
+/// against an order it never held.
+pub fn offered(tool: &str, on_mission: bool, holds_order: bool) -> bool {
+    match tool {
+        t if t == COLLECT_MISSION.name => !on_mission,
+        t if t == REPORT_DONE.name || t == REPORT_STUCK.name => on_mission,
+        "orders_report_done" => holds_order,
+        _ => true,
+    }
+}
+
 /// Whether a tool is one of these, for the dispatcher.
 pub fn is_mine(tool: &str) -> bool {
     MISSION_ACTS.iter().any(|t| t.name == tool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offered;
+
+    #[test]
+    fn the_table_offers_only_what_the_body_can_do_there() {
+        // Carrying nothing: take one up, nothing to report.
+        assert!(offered("collect_mission", false, false));
+        assert!(!offered("report_done", false, false));
+        assert!(!offered("report_stuck", false, false));
+        // Carrying one: report it, take nothing new.
+        assert!(!offered("collect_mission", true, false));
+        assert!(offered("report_done", true, false));
+        assert!(offered("report_stuck", true, false));
+        // An order is reported only by whoever holds one.
+        assert!(!offered("orders_report_done", true, false));
+        assert!(offered("orders_report_done", false, true));
+        // Everything else is the table's as ever.
+        assert!(offered("present", true, false));
+    }
 }

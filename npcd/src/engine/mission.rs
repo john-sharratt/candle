@@ -145,6 +145,16 @@ pub struct Mission {
     pub report: Option<Report>,
     /// Where the mission came from.
     pub origin: Origin,
+    /// What the engine itself saw happen toward the mission — a machine's state
+    /// when the character stood beside it, who it spoke to — in the order it
+    /// happened. The character's answer is its own account; this is the record
+    /// to check that account against.
+    #[serde(default)]
+    pub observed: Vec<String>,
+    /// How many times `report_stuck` was turned away while the next step was
+    /// plainly within reach — see `engine::work`.
+    #[serde(default)]
+    pub stuck_refused: u32,
 }
 
 impl Mission {
@@ -156,6 +166,24 @@ impl Mission {
             answer: None,
             report: None,
             origin,
+            observed: Vec::new(),
+            stuck_refused: 0,
+        }
+    }
+
+    /// Count a `report_stuck` the desk turned away because the step was plainly
+    /// doable, and say how many there have been.
+    pub fn refuse_stuck(&mut self) -> u32 {
+        self.stuck_refused += 1;
+        self.stuck_refused
+    }
+
+    /// Note something the engine saw happen toward the mission. A line already
+    /// noted is not noted twice.
+    pub fn observe(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        if !self.observed.contains(&line) {
+            self.observed.push(line);
         }
     }
 
@@ -207,6 +235,98 @@ impl Mission {
         }
         self.todo.push(Todo::new(text));
         true
+    }
+
+    /// Sign off every open step that is a journey to `room`, because the body is
+    /// standing in it. Returns whether anything was signed off.
+    ///
+    /// **Where a body stands is a fact, not a claim.** A step like "go to the
+    /// plant room" was left for the guardian to tick on the character's own word,
+    /// over several confirmations — so a character that had walked there read
+    /// `[ ] go to the plant room` on arrival, took the list to mean it had not
+    /// begun, and walked back to the table to start again. The engine knows
+    /// where the body is; it signs the journey off itself.
+    pub fn arrived_in(&mut self, room: &str) -> bool {
+        let room = plain(room);
+        let mut ticked = false;
+        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+            if journey_to(&step.text).is_some_and(|to| names(&to, &room)) {
+                step.done = true;
+                step.outcome = Some(StepOutcome::Achieved);
+                ticked = true;
+            }
+        }
+        ticked
+    }
+
+    /// Sign off every open step that is a reading of one of `seen` — the machines
+    /// a `scan` of the room just showed the body, each with its state. Returns
+    /// whether anything was signed off.
+    pub fn read_off(&mut self, seen: &[String]) -> bool {
+        let seen: Vec<String> = seen.iter().map(|n| plain(n)).collect();
+        let mut ticked = false;
+        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+            if reading_of(&step.text).is_some_and(|of| seen.iter().any(|n| names(&of, n))) {
+                step.done = true;
+                step.outcome = Some(StepOutcome::Achieved);
+                ticked = true;
+            }
+        }
+        ticked
+    }
+
+    /// Sign off every open step that asks the body to be with `who` — find
+    /// them, go to them, visit them, look in on them — because it is in the
+    /// same room as them. Returns whether anything was signed off.
+    pub fn met(&mut self, who: &str) -> bool {
+        self.tick_about(who, MEETING)
+    }
+
+    /// Sign off every open step that asks the body to be with `who` or to say
+    /// something to them — ask, tell, talk to, hear them out — because a word
+    /// it addressed to them landed. Returns whether anything was signed off.
+    ///
+    /// **Who a character spoke to is a fact, not a claim**, the same as where
+    /// it stands: the world took the `ask` or the `tell`, naming them.
+    pub fn spoke_with(&mut self, who: &str) -> bool {
+        let met = self.tick_about(who, MEETING);
+        self.tick_about(who, SPEAKING) || met
+    }
+
+    fn tick_about(&mut self, who: &str, verbs: &[&str]) -> bool {
+        let mut ticked = false;
+        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+            let text = step.text.trim().to_lowercase();
+            if verbs.iter().any(|v| text.starts_with(v)) && mentions(&text, who) {
+                step.done = true;
+                step.outcome = Some(StepOutcome::Achieved);
+                ticked = true;
+            }
+        }
+        ticked
+    }
+
+    /// The first step not yet signed off, if any.
+    pub fn next_step(&self) -> Option<&Todo> {
+        self.todo.iter().find(|t| !t.done)
+    }
+
+    /// The first open step that is a reading of one of `machines` the body has
+    /// not made, if any.
+    ///
+    /// What `report_done` is checked against: a mission whose point is to read a
+    /// machine cannot be reported done by a character that never read it. Only a
+    /// step the engine can see done for itself counts — a reading of a machine
+    /// the world holds, which a scan of its room always shows. A step it cannot
+    /// observe ("form your own view of it", or a scan of something no scan lists)
+    /// never holds a report up.
+    pub fn unread_step(&self, machines: &[String]) -> Option<&str> {
+        let machines: Vec<String> = machines.iter().map(|n| plain(n)).collect();
+        self.todo
+            .iter()
+            .filter(|t| !t.done && !t.reports)
+            .find(|t| reading_of(&t.text).is_some_and(|of| machines.iter().any(|m| names(&of, m))))
+            .map(|t| t.text.as_str())
     }
 
     /// File the completion report, closing the mission. `answer` overwrites the
@@ -300,6 +420,252 @@ impl Mission {
         }
         h.finish()
     }
+}
+
+/// What a step asks of the world, as far as the engine can tell: a room to be
+/// in, a machine to read, or somebody to be with or speak to. What
+/// `report_stuck` is checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Aim {
+    /// A journey: the [`plain`] name of the room.
+    Room(String),
+    /// A reading: what the step reads, to match against a machine's name.
+    Machine(String),
+    /// Being with or speaking to somebody, by the step's own words.
+    Person(String),
+}
+
+impl Aim {
+    /// What `step` asks for, or `None` for a step the engine cannot see.
+    pub fn of(step: &str) -> Option<Aim> {
+        if let Some(of) = reading_of(step) {
+            return Some(Aim::Machine(of));
+        }
+        let lower = step.trim().to_lowercase();
+        if MEETING.iter().chain(SPEAKING).any(|v| lower.starts_with(v)) {
+            // A journey to a room is a meeting verb too ("go to"); the caller
+            // tries the room first and the person after.
+            if let Some(room) = journey_to(step) {
+                return Some(Aim::Room(room));
+            }
+            return Some(Aim::Person(lower));
+        }
+        journey_to(step).map(Aim::Room)
+    }
+
+    /// Whether this aim is the room called `name`.
+    pub fn is_room(&self, name: &str) -> bool {
+        matches!(self, Aim::Room(room) if names(room, &plain(name)))
+    }
+
+    /// Whether this aim reads the machine called `name`.
+    pub fn is_machine(&self, name: &str) -> bool {
+        matches!(self, Aim::Machine(of) if names(of, &plain(name)))
+    }
+
+    /// Whether this aim is about the person called `who`.
+    pub fn is_person(&self, who: &str) -> bool {
+        match self {
+            Aim::Person(step) | Aim::Room(step) => mentions(step, who),
+            Aim::Machine(_) => false,
+        }
+    }
+}
+
+/// What a character is told when the engine signs a step off for it: `lead` (what
+/// it has just done, "You are in the plant room"), that the step is done, and the
+/// one thing to do next — the next step, or the report when that is all that is
+/// left.
+///
+/// `here` is the machines standing where the body is. When the next step reads
+/// one of them, the line says how in the grammar's own terms — `scan`, naming
+/// no place — because "scan the breaker panel" read as naming the panel as the
+/// place to look at, and a character standing beside it scanned another room.
+pub fn progress_line(lead: &str, next: Option<&Todo>, here: &[String]) -> String {
+    let here: Vec<String> = here.iter().map(|n| plain(n)).collect();
+    match next {
+        Some(step)
+            if !step.reports
+                && reading_of(&step.text).is_some_and(|of| here.iter().any(|m| names(&of, m))) =>
+        {
+            format!(
+                "{lead}: that step of your mission is done. Next: {}. It is here, in this room: \
+                 `scan` naming no place, and it lists it with the state it is in.",
+                step.text.trim().trim_end_matches('.')
+            )
+        }
+        Some(step) if !step.reports => format!(
+            "{lead}: that step of your mission is done. Next: {}.",
+            step.text.trim().trim_end_matches('.')
+        ),
+        _ => format!(
+            "{lead}: that was the last step of your mission. Now go back to the table where \
+             work is handed out, `scan` it, and `invoke` its `report_done` with exactly what \
+             you found."
+        ),
+    }
+}
+
+/// The mission compass: the one next thing to do, and where whoever it names is
+/// right now. `people` is everybody else in the world, each with the room they
+/// are in, or `None` when they are in the body's own room.
+///
+/// **Where somebody is is the engine's to say.** A character sent to find
+/// someone went to the room it had last seen them in, found it empty, and gave
+/// the mission up as stuck — while the person stood in the next room, and then
+/// walked into its own. It cannot track the cast; the world can.
+///
+/// Each person's `Some` is the way to them as a phrase — "the plant room:
+/// `move_to` it", or the lift ride when they are on another level. `way` is the
+/// way to the room or machine the step names, when it names one.
+pub fn compass_line(next: &Todo, people: &[(String, Option<String>)], way: Option<&str>) -> String {
+    let step = next.text.trim().trim_end_matches('.');
+    let lower = step.to_lowercase();
+    let mut line = format!("Your mission, next: {step}.");
+    if let Some(way) = way {
+        line.push(' ');
+        line.push_str(way);
+    }
+    let speak = SPEAKING.iter().any(|v| lower.starts_with(v));
+    for (who, room) in people.iter().filter(|(who, _)| mentions(&lower, who)) {
+        match room {
+            None if speak => line.push_str(&format!(
+                " {who} is here with you: say it to them now — `ask` or `tell` them."
+            )),
+            None => line.push_str(&format!(" {who} is here with you.")),
+            // Or by phone: somebody busy on their own errand keeps moving, and
+            // a character chasing them room to room gave the mission up as
+            // stuck. A `message` to them is a word to them like any other.
+            Some(way) => line.push_str(&format!(
+                " {who} is in {way} — or `message` them, which reaches them wherever they are."
+            )),
+        }
+    }
+    line
+}
+
+/// The mission compass when the work is done and only the report is left.
+/// `table` is the way to the table — its room, and the lift ride when it is on
+/// another level; `at_table` whether the body is at it;
+/// `seen` what the engine observed toward the mission, which is what the report
+/// is to say.
+///
+/// **The report is about this mission.** Characters filed accounts of the
+/// mission before last, or of the scan they made at the table; handed what it
+/// saw on this one, in the line that tells it to report, it reports that.
+pub fn compass_report_line(table: Option<&str>, at_table: bool, seen: &[String]) -> String {
+    let mut line = report_way(table, at_table);
+    if !seen.is_empty() {
+        line.push_str(&format!(" What you saw on it: {}.", seen.join("; ")));
+    }
+    line
+}
+
+fn report_way(table: Option<&str>, at_table: bool) -> String {
+    match (at_table, table) {
+        (true, _) => "Your mission's work is done and you are at the table: report it now — \
+                      `invoke` the table's `report_done` with exactly what you found."
+            .to_string(),
+        (false, Some(way)) => format!(
+            "Your mission's work is done. Go back to the table, in {way}, and report it: \
+             `invoke` the table's `report_done` with exactly what you found."
+        ),
+        (false, None) => "Your mission's work is done. Go back to the table where work is \
+                          handed out and report it: `invoke` its `report_done` with exactly \
+                          what you found."
+            .to_string(),
+    }
+}
+
+/// A name as it is compared: lower case, trimmed, with no leading article and no
+/// closing full stop, so "The plant room." and "the plant room" are one room.
+fn plain(name: &str) -> String {
+    let lower = name.trim().trim_end_matches('.').trim().to_lowercase();
+    lower
+        .strip_prefix("the ")
+        .map(str::to_string)
+        .unwrap_or(lower)
+}
+
+/// Whether `said` — the rest of a step after its verb — names `thing`: the whole
+/// of it, or it followed by more words ("the coolant valve and read its state").
+fn names(said: &str, thing: &str) -> bool {
+    !thing.is_empty()
+        && (said == thing
+            || said.starts_with(&format!("{thing} "))
+            || said.starts_with(&format!("{thing},")))
+}
+
+/// Where a journey step leads, as a [`plain`] name: "go to the plant room" →
+/// "plant room". `None` for a step that is not a journey.
+fn journey_to(step: &str) -> Option<String> {
+    let step = step.trim().to_lowercase();
+    [
+        "go to ",
+        "go back to ",
+        "travel to ",
+        "walk to ",
+        "head to ",
+        "make your way to ",
+    ]
+    .iter()
+    .find_map(|verb| step.strip_prefix(verb))
+    .map(plain)
+}
+
+/// How a step that is about being with somebody begins.
+const MEETING: &[&str] = &[
+    "find ",
+    "go and find ",
+    "go to ",
+    "travel to ",
+    "visit ",
+    "seek out ",
+    "look in on ",
+    "meet ",
+];
+
+/// How a step that is about saying something to somebody begins.
+const SPEAKING: &[&str] = &[
+    "ask ",
+    "tell ",
+    "talk to ",
+    "talk with ",
+    "speak to ",
+    "speak with ",
+    "give ",
+    "draw ",
+    "hear ",
+];
+
+/// Whether a lower-cased step names `who` — by their whole name, or by their
+/// first name as a word of its own ("ask Paxon what he found").
+fn mentions(step: &str, who: &str) -> bool {
+    let who = who.trim().to_lowercase();
+    if who.is_empty() {
+        return false;
+    }
+    if step.contains(&who) {
+        return true;
+    }
+    // A first name, never an article: "the channel" once matched every step
+    // that said "go to the …", and a message to the channel signed off journeys
+    // nobody made.
+    let first = who.split_whitespace().next().unwrap_or_default();
+    !matches!(first, "the" | "a" | "an")
+        && who.split_whitespace().count() > 1
+        && first.len() >= 3
+        && step
+            .split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .any(|word| word.trim_end_matches("'s") == first)
+}
+
+/// What a reading step reads, as a [`plain`] name: "scan the coolant valve and
+/// read what state it is in" → "coolant valve and read what state it is in",
+/// matched against a machine's name by [`names`]. `None` for any other step.
+fn reading_of(step: &str) -> Option<String> {
+    let step = step.trim().to_lowercase();
+    step.strip_prefix("scan ").map(plain)
 }
 
 /// A bank of routine missions — the ones a character is given when nothing has
@@ -604,6 +970,206 @@ mod tests {
                 by: "u_abc".to_string(),
             },
         )
+    }
+
+    fn read_the_valve() -> Mission {
+        Mission::new(
+            "Go to the plant room and read the coolant valve.",
+            vec![
+                Todo::new("go to the plant room"),
+                Todo::new("scan the coolant valve and read what state it is in"),
+                Todo::report("go back to the table and report it"),
+            ],
+            Origin::Lodged {
+                by: "u_abc".to_string(),
+            },
+        )
+    }
+
+    /// **Arriving signs the journey off; arriving somewhere else does not.** The
+    /// room is compared by name, with or without its article.
+    #[test]
+    fn arriving_in_the_named_room_signs_off_the_journey_to_it() {
+        let mut m = read_the_valve();
+        assert!(!m.arrived_in("the command room"));
+        assert!(!m.todo[0].done);
+        assert!(m.arrived_in("The plant room"));
+        assert_eq!(m.todo[0].outcome, Some(StepOutcome::Achieved));
+        assert!(!m.arrived_in("the plant room"), "already signed off");
+        assert_eq!(
+            m.next_step().map(|t| t.text.as_str()),
+            Some("scan the coolant valve and read what state it is in")
+        );
+    }
+
+    /// **A scan that shows the machine signs off the reading of it**, and a
+    /// mission with a reading still to make holds `report_done` up — until the
+    /// reading is made, when only the report is left.
+    #[test]
+    fn a_scan_that_shows_the_machine_signs_off_the_reading() {
+        let mut m = read_the_valve();
+        let machines = ["the coolant valve".to_string()];
+        assert_eq!(
+            m.unread_step(&machines),
+            Some("scan the coolant valve and read what state it is in")
+        );
+        assert_eq!(
+            m.unread_step(&["the breaker panel".to_string()]),
+            None,
+            "a reading of nothing the world holds is not the engine's to hold up"
+        );
+        assert!(!m.read_off(&["the plant panel".to_string()]));
+        assert!(m.read_off(&[
+            "the plant panel".to_string(),
+            "the coolant valve".to_string()
+        ]));
+        assert_eq!(m.unread_step(&machines), None);
+        assert_eq!(
+            m.next_step().map(|t| t.text.as_str()),
+            Some("go to the plant room"),
+            "the journey was never signed off, and reading does not sign it"
+        );
+        assert!(m.arrived_in("the plant room"));
+        assert!(m.next_step().unwrap().reports);
+        assert!(!m.todo[2].done, "nothing but the report closes the report");
+    }
+
+    /// **Being with somebody signs off finding them; speaking to them signs off
+    /// asking them too.** By whole name or first name; nobody else's name does.
+    #[test]
+    fn meeting_and_speaking_to_somebody_sign_off_the_steps_about_them() {
+        let mut m = Mission::new(
+            "Find out what Paxon Vael is working on.",
+            vec![
+                Todo::new("find Paxon Vael"),
+                Todo::new("ask Paxon what he is working on"),
+                Todo::new("tell Ione Valtiere what you learnt"),
+                Todo::report("go back to the table and report it"),
+            ],
+            Origin::Lodged {
+                by: "u_abc".to_string(),
+            },
+        );
+        assert!(!m.met("Vespera Kaine"));
+        assert!(m.met("Paxon Vael"));
+        assert!(m.todo[0].done);
+        assert!(!m.todo[1].done, "being in the room is not asking");
+        assert!(m.spoke_with("Paxon Vael"));
+        assert!(m.todo[1].done, "asked by first name");
+        assert!(!m.todo[2].done);
+        assert!(!m.spoke_with("Pax"), "a fragment of a name is nobody");
+        assert!(
+            !m.spoke_with("the channel"),
+            "an article is not a first name"
+        );
+        assert!(m.spoke_with("Ione Valtiere"));
+        assert!(m.next_step().unwrap().reports);
+    }
+
+    /// **The compass names the next step and where the person it names is.**
+    #[test]
+    fn the_compass_says_where_the_person_the_step_names_is() {
+        let ask = Todo::new("ask Paxon Vael what he has been working on");
+        let elsewhere = [
+            (
+                "Paxon Vael".to_string(),
+                Some("the plant room: `move_to` it".to_string()),
+            ),
+            ("Vespera Kaine".to_string(), None),
+        ];
+        assert_eq!(
+            super::compass_line(&ask, &elsewhere, None),
+            "Your mission, next: ask Paxon Vael what he has been working on. Paxon Vael is in \
+             the plant room: `move_to` it — or `message` them, which reaches them wherever they \
+             are."
+        );
+        let here = [("Paxon Vael".to_string(), None)];
+        assert_eq!(
+            super::compass_line(&ask, &here, None),
+            "Your mission, next: ask Paxon Vael what he has been working on. Paxon Vael is here \
+             with you: say it to them now — `ask` or `tell` them."
+        );
+        assert_eq!(
+            super::compass_line(
+                &Todo::new("go to band three"),
+                &here,
+                Some("Band three is on the record level: go to the lift.")
+            ),
+            "Your mission, next: go to band three. Band three is on the record level: go to the \
+             lift."
+        );
+        assert!(
+            super::compass_report_line(Some("the command room: `move_to` it"), false, &[])
+                .contains("Go back to the table, in the command room: `move_to` it, and report")
+        );
+        let seen = ["in the plant room, the coolant valve: tight".to_string()];
+        let now = super::compass_report_line(None, true, &seen);
+        assert!(now.contains("report it now"), "{now}");
+        assert!(
+            now.ends_with(" What you saw on it: in the plant room, the coolant valve: tight."),
+            "{now}"
+        );
+    }
+
+    #[test]
+    fn a_step_names_its_aim() {
+        use super::Aim;
+        assert_eq!(
+            Aim::of("go to the plant room"),
+            Some(Aim::Room("plant room".into()))
+        );
+        let read = Aim::of("scan the coolant valve and read what state it is in").unwrap();
+        assert!(read.is_machine("the coolant valve"));
+        assert!(!read.is_machine("the breaker panel"));
+        let ask = Aim::of("ask Paxon Vael what he has been working on").unwrap();
+        assert!(ask.is_person("Paxon Vael"));
+        assert!(!ask.is_room("the plant room"));
+        let go_to_him = Aim::of("go to Paxon Vael").unwrap();
+        assert!(go_to_him.is_person("Paxon Vael"));
+        assert_eq!(Aim::of("form your own view of it"), None);
+    }
+
+    /// A step the engine cannot observe never holds a report up.
+    #[test]
+    fn a_step_the_engine_cannot_see_does_not_hold_the_report_up() {
+        let m = Mission::new(
+            "Hear Pax out.",
+            vec![Todo::new("find Pax"), Todo::new("form your own view of it")],
+            Origin::Lodged {
+                by: "u_abc".to_string(),
+            },
+        );
+        assert_eq!(m.unread_step(&["Pax".to_string()]), None);
+    }
+
+    #[test]
+    fn the_progress_line_names_the_next_step_or_the_report() {
+        let m = read_the_valve();
+        assert_eq!(
+            super::progress_line("You are in the plant room", m.todo.get(1), &[]),
+            "You are in the plant room: that step of your mission is done. Next: scan the \
+             coolant valve and read what state it is in."
+        );
+        assert_eq!(
+            super::progress_line(
+                "You are in the plant room",
+                m.todo.get(1),
+                &[
+                    "the breaker panel".to_string(),
+                    "the coolant valve".to_string()
+                ]
+            ),
+            "You are in the plant room: that step of your mission is done. Next: scan the \
+             coolant valve and read what state it is in. It is here, in this room: `scan` \
+             naming no place, and it lists it with the state it is in."
+        );
+        let last = super::progress_line("You have read it", m.todo.get(2), &[]);
+        assert!(
+            last.starts_with("You have read it: that was the last step of your mission."),
+            "{last}"
+        );
+        assert!(last.contains("`report_done`"), "{last}");
+        assert_eq!(super::progress_line("You have read it", None, &[]), last);
     }
 
     #[test]

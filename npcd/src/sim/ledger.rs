@@ -253,7 +253,23 @@ impl Ledger {
 
     // ---- orders ----
 
+    /// Put an order on the board — or, when the same order is already standing
+    /// open, leave that one and hand it back.
+    ///
+    /// **The same fault raised twice is one fault.** Characters reading a
+    /// machine raised what they saw as a fault at the panel each time they
+    /// passed it, and the board grew "the fault in the coolant valve" over and
+    /// over; everybody reading the standing orders then read a pile of
+    /// contradictions and argued with the record instead of working.
     pub fn set_order(&mut self, what: &str, by: &str, on_behalf_of: Option<&str>) -> Order {
+        let key = what.trim().to_lowercase();
+        if let Some(open) = self
+            .orders
+            .iter()
+            .find(|o| !o.done && o.what.trim().to_lowercase() == key)
+        {
+            return open.clone();
+        }
         let o = Order {
             id: self.id(),
             what: what.to_string(),
@@ -494,6 +510,25 @@ mod tests {
     /// This is the whole point of writing it down: as an event it existed for
     /// one turn and was gone, and a live cast delivered three questions and
     /// returned zero answers.
+    /// The same order raised again while it stands open is the one order; once
+    /// finished, raising it again is a new one.
+    #[test]
+    fn the_same_open_order_is_set_once() {
+        let mut l = Ledger::new();
+        let first = l.set_order("the fault in the coolant valve", "the panel", None);
+        let again = l.set_order("The fault in the coolant valve ", "the panel", None);
+        assert_eq!(first.id, again.id);
+        assert_eq!(
+            l.unheld(),
+            vec!["the fault in the coolant valve".to_string()]
+        );
+        l.take_order("the fault in the coolant valve", "m1")
+            .unwrap();
+        assert!(l.finish("m1", "the fault in the coolant valve"));
+        let later = l.set_order("the fault in the coolant valve", "the panel", None);
+        assert_ne!(later.id, first.id);
+    }
+
     #[test]
     fn a_question_is_owed_by_the_person_it_was_put_to() {
         let mut l = Ledger::new();

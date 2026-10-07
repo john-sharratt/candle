@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use crate::engine::guardian::module::Module;
 use crate::engine::guardian::view::{words, NpcView, Question, Verdict};
-use crate::engine::mission::StepOutcome;
+use crate::engine::mission::{Aim, StepOutcome};
 
 pub const DONE: &str = "yes, it is done";
 pub const COULD_NOT: &str = "I tried and could not do it";
@@ -53,6 +53,13 @@ impl Module for StepTracker {
             return None;
         }
         let step = mission.open_step()?;
+        // **A step the engine can see done is the engine's to sign off.** Asked
+        // whether it had gone to band three, a character pacing the command
+        // level answered that it had tried and could not — and the journey was
+        // struck as thwarted without the body going near the lift.
+        if Aim::of(step).is_some() {
+            return None;
+        }
         Some(Question {
             text: format!(
                 "One thing you were asked to do is: \"{step}\" Looking back over what you have \
@@ -120,6 +127,23 @@ mod tests {
         );
         assert_eq!(t.question(&with_mission(&[])), None);
         assert_eq!(t.question(&view(None)), None);
+    }
+
+    /// A journey, a reading or a word to somebody is the engine's to sign off,
+    /// so the character is never asked about one.
+    #[test]
+    fn a_step_the_engine_sees_is_never_asked_about() {
+        let t = StepTracker::new(1);
+        for step in [
+            "go to band three",
+            "scan the coolant valve and read what state it is in",
+            "ask Paxon Vael what he found",
+        ] {
+            assert_eq!(t.question(&with_mission(&[step])), None, "{step}");
+        }
+        assert!(t
+            .question(&with_mission(&["form your own view of it"]))
+            .is_some());
     }
 
     #[test]

@@ -529,10 +529,20 @@ impl Sim {
     /// turns an `area/node` place into the name a character knows the room by;
     /// a machine in a room it cannot name is left out, and so is every machine
     /// in the table's own room, where there would be nowhere to go.
+    ///
+    /// **Only what the body can get to, its own level first.** `reach` is every
+    /// `area/node` place the body can walk or ride to, nearest first, starting
+    /// with where it stands. A world can hold more than one order table — the
+    /// vault's command room and the Redoubt's muster hall — and the table a
+    /// mission ends at is the one this body would be summoned to: the nearest
+    /// on its own level, else the nearest it can reach. Machines are drawn from
+    /// its own level when it has any there, else from anywhere it can reach, so
+    /// a routine never names a room the character has no way into.
     pub fn mission_material(
         &self,
         me: &str,
         room_name: &dyn Fn(&str) -> Option<String>,
+        reach: &[String],
     ) -> MissionMaterial {
         let makers = self
             .contacts_roster()
@@ -541,16 +551,28 @@ impl Sim {
             .collect();
         let mut records = self.record.names_of(record::Kind::Era);
         records.extend(self.record.names_of(record::Kind::Story));
-        let table_place = self
-            .part_tools
+        let level = |place: &str| place.split_once('/').map(|(area, _)| area.to_string());
+        let own_level = reach.first().and_then(|here| level(here));
+        let on_own_level = |place: &str| own_level.is_some() && level(place) == own_level;
+        let tables: Vec<&String> = reach
             .iter()
-            .find(|(_, tools)| tools.iter().any(|t| t == COLLECT_MISSION.name))
-            .map(|(place, _)| place.clone());
+            .filter(|place| self.part_offers(place, COLLECT_MISSION.name))
+            .collect();
+        let table_place = tables
+            .iter()
+            .find(|place| on_own_level(place))
+            .or_else(|| tables.first())
+            .map(|place| place.to_string());
         let table = table_place.as_deref().and_then(room_name);
-        let duties = self
-            .devices
+        let reachable: Vec<&device::Device> = reach
             .iter()
-            .filter(|d| Some(d.at.as_str()) != table_place.as_deref())
+            .filter(|place| Some(place.as_str()) != table_place.as_deref())
+            .flat_map(|place| self.devices.iter().filter(move |d| &d.at == place))
+            .collect();
+        let any_near = reachable.iter().any(|d| on_own_level(&d.at));
+        let duties = reachable
+            .into_iter()
+            .filter(|d| !any_near || on_own_level(&d.at))
             .filter_map(|d| {
                 Some(Duty {
                     room: room_name(&d.at)?,
@@ -723,8 +745,9 @@ mod tests {
             "hall/foundry" => Some("the foundry".to_string()),
             _ => None,
         };
+        let reach = places(&["hall/muster", "hall/foundry", "hall/void"]);
 
-        let material = s.mission_material("someone", &rooms);
+        let material = s.mission_material("someone", &rooms, &reach);
 
         assert_eq!(material.table.as_deref(), Some("the muster hall"));
         assert_eq!(
@@ -734,6 +757,102 @@ mod tests {
                 device: "the coolant valve".to_string(),
             }]
         );
+    }
+
+    fn places(at: &[&str]) -> Vec<String> {
+        at.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// **The table and the machines are the ones this body can get to, its own
+    /// level first.** A world with two order tables — the Redoubt's muster hall
+    /// sorts before the vault's command room — once sent every vault character
+    /// to report at the muster hall, a building it has no way into, and to read
+    /// machines there. A body in the vault is given the vault's table and the
+    /// machines on its own level; one on a level with no machines of its own is
+    /// given those it can ride to.
+    #[test]
+    fn mission_material_is_the_table_and_machines_the_body_can_reach() {
+        let mut s = Sim::new();
+        for table in ["tower-redoubt/muster-hall", "vault-command/command-room"] {
+            s.set_part_tools(table, vec![COLLECT_MISSION.name.to_string()]);
+        }
+        for (id, name, at) in [
+            ("gate", "the gate winch", "tower-redoubt/gatehouse"),
+            ("breaker", "the breaker panel", "vault-command/plant"),
+            ("loom", "the loom", "vault-studio/studio"),
+        ] {
+            s.devices.install(device::Device::new(
+                id,
+                name,
+                device::Kind::Panel,
+                at,
+                &["ok"],
+            ));
+        }
+        let rooms = |place: &str| {
+            Some(
+                match place {
+                    "tower-redoubt/muster-hall" => "the muster hall",
+                    "tower-redoubt/gatehouse" => "the gatehouse",
+                    "vault-command/command-room" => "the command room",
+                    "vault-command/plant" => "the plant room",
+                    "vault-studio/studio" => "the studio",
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        };
+
+        let in_the_vault = s.mission_material(
+            "someone",
+            &rooms,
+            &places(&[
+                "vault-command/ring-north",
+                "vault-command/command-room",
+                "vault-command/plant",
+                "vault-studio/studio",
+            ]),
+        );
+        assert_eq!(in_the_vault.table.as_deref(), Some("the command room"));
+        assert_eq!(
+            in_the_vault.duties,
+            vec![Duty {
+                room: "the plant room".to_string(),
+                device: "the breaker panel".to_string(),
+            }]
+        );
+
+        let on_the_studio_level = s.mission_material(
+            "someone",
+            &rooms,
+            &places(&[
+                "vault-studio/studio-hall",
+                "vault-studio/studio",
+                "vault-command/command-room",
+                "vault-command/plant",
+            ]),
+        );
+        assert_eq!(
+            on_the_studio_level.table.as_deref(),
+            Some("the command room"),
+            "no table on its own level, so the nearest it can ride to"
+        );
+        assert_eq!(
+            on_the_studio_level.duties,
+            vec![Duty {
+                room: "the studio".to_string(),
+                device: "the loom".to_string(),
+            }]
+        );
+
+        let in_the_redoubt = s.mission_material(
+            "someone",
+            &rooms,
+            &places(&["tower-redoubt/gatehouse", "tower-redoubt/muster-hall"]),
+        );
+        assert_eq!(in_the_redoubt.table.as_deref(), Some("the muster hall"));
+        assert_eq!(in_the_redoubt.duties.len(), 1);
+        assert_eq!(in_the_redoubt.duties[0].device, "the gate winch");
     }
 
     /// A cast whose phones are on the channel and nothing else.

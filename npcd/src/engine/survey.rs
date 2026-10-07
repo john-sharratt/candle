@@ -9,19 +9,50 @@
 //! is also what the API serves, so what an operator reads is what the character
 //! was told.
 
+use npc_map::text;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::effector::router::address_of;
 use crate::effector::station;
 use crate::engine::body::Outcome;
+use crate::engine::mission::{progress_line, Mission};
+use crate::engine::mission_acts;
 use crate::engine::on_you;
 use crate::engine::tools::Tool;
 use crate::world::Hosted;
 
 /// Survey the room the body stands in and what it carries, as the character reads it.
+///
+/// A scan is also how a machine is read, so a mission step to read one that
+/// stands here is signed off by it, and the character is told what to do next
+/// beneath what it read.
 pub fn here(hosted: &Hosted, body: &str) -> Outcome {
-    Outcome::Did(Survey::of(hosted, body).prose())
+    let survey = Survey::of(hosted, body);
+    let mut said = survey.prose();
+    let seen: Vec<String> = survey.stations.iter().map(|e| e.name.clone()).collect();
+    let room = hosted.read(|w| {
+        w.actor(body)
+            .and_then(|a| w.node(&a.at))
+            .map(|n| n.name.clone())
+    });
+    let next = hosted.with_sim(|s| {
+        // A scan is made standing in the room, so it is there too.
+        if let Some(room) = &room {
+            s.missions.arrived_in(body, room);
+        }
+        if !s.missions.read_off(body, &seen) {
+            return None;
+        }
+        let next = s.missions.active(body).and_then(Mission::next_step);
+        tracing::info!(npc = %body, "mission reading signed off by a scan");
+        Some(progress_line("You have read it", next, &seen))
+    });
+    if let Some(line) = next {
+        said.push('\n');
+        said.push_str(&line);
+    }
+    Outcome::Did(said)
 }
 
 /// A parameter a station verb takes, as the character is told it.
@@ -90,12 +121,31 @@ impl Survey {
                 .map()
                 .instances_at(&at)
                 .into_iter()
-                .filter_map(|inst| {
-                    let url = address_of(&inst)?;
-                    let verbs = station::verbs_at(inst.part_id());
-                    let acts: Vec<&str> = verbs.iter().map(|(_, t)| t.name).collect();
-                    let read = sim.reading(&inst.id(), &place, &acts, &who);
-                    Some(Entry::new(inst.name(), &url, &verbs, &read))
+                .filter_map(|inst| match address_of(&inst) {
+                    Some(url) => {
+                        let mut verbs = station::verbs_at(inst.part_id());
+                        // Only what this body can do here — see
+                        // [`mission_acts::offered`].
+                        let on_mission = sim.missions.is_on_mission(body);
+                        let holds_order = !sim.ledger.held_by(body).is_empty();
+                        verbs.retain(|(_, t)| {
+                            mission_acts::offered(t.name, on_mission, holds_order)
+                        });
+                        let acts: Vec<&str> = verbs.iter().map(|(_, t)| t.name).collect();
+                        let read = sim.reading(&inst.id(), &place, &acts, &who);
+                        Some(Entry::new(inst.name(), &url, &verbs, &read))
+                    }
+                    // **A machine with no controls still has a state to read.** A
+                    // coolant valve or a breaker panel affords no act, so no route
+                    // serves it and it has no address — but it is standing here in
+                    // a state, and "go and read the coolant valve" is a mission. It
+                    // is listed by the name the sim knows it by, with its reading
+                    // and nothing to `invoke`.
+                    None => {
+                        let device = sim.station(&inst.id())?;
+                        let read = sim.reading(&inst.id(), &place, &[], &who);
+                        Some(Entry::new(&device.name, "", &[], &read))
+                    }
                 })
                 .collect::<Vec<_>>();
             (stations, threads, lately)
@@ -186,6 +236,30 @@ impl Entry {
             true => format!("{}.", capital(&self.name)),
             false => format!("{}: {}.", capital(&self.name), self.state.join(", ")),
         };
+        if self.verbs.is_empty() {
+            // A machine with no address is worked with `operate`, not `invoke`;
+            // say into what, from its own states, so the line is complete.
+            let current = self.reading.get("mode").and_then(Value::as_str);
+            let others: Vec<String> = self
+                .reading
+                .get("modes")
+                .and_then(Value::as_array)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(Value::as_str)
+                        .filter(|m| Some(*m) != current)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !others.is_empty() {
+                out.push_str(&format!(
+                    " It can be put to {} with `operate`.",
+                    text::list_or(&others)
+                ));
+            }
+            return out;
+        }
         out.push_str(&format!(" You can `invoke` {what}"));
         if !self.can.is_empty() {
             out.push_str(&format!(" — the tower can {}", self.can.join(", ")));
@@ -364,6 +438,24 @@ mod tests {
         assert!(
             said.starts_with("Terminal. You can `invoke` `http://local/x/y/"),
             "{said}"
+        );
+    }
+
+    /// **A machine with no controls is read, not worked.** The plant room's
+    /// coolant valve and breaker panel afford no act, and a mission to read one
+    /// was impossible while the survey left them out: the character found only
+    /// the plant panel and raised a fault on it instead.
+    #[test]
+    fn a_machine_with_no_controls_reads_its_state_and_offers_nothing_to_invoke() {
+        let r = read(json!({ "mode": "open", "modes": ["open", "shut", "half"], "working": true }));
+        assert_eq!(
+            Entry::new("the coolant valve", "", &[], &r).prose(),
+            "The coolant valve: open. It can be put to shut or half with `operate`."
+        );
+        let broken = read(json!({ "mode": "tripped", "modes": ["tripped"], "working": false }));
+        assert_eq!(
+            Entry::new("the breaker panel", "", &[], &broken).prose(),
+            "The breaker panel: tripped, not working."
         );
     }
 
