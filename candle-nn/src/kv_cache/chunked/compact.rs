@@ -1203,42 +1203,31 @@ impl super::backing::ChunkedKvBacking {
         Ok(report)
     }
 
-    /// Give every censused pool fresh arenas as low in the span as the free list can
-    /// place them, **the pool highest on the frontier first**, and add each to its pool's
-    /// census so the walk plans into it.
+    /// Give the pools holding the frontier fresh arenas as low in the span as the free
+    /// list can place them, **the pool highest on the frontier first**, and add each to
+    /// its pool's census so the walk plans into it.
     ///
-    /// **As many as the pool has arenas' worth of live chunks above them, not one.** A
-    /// full arena moves down only into free slots of its own pool, so one fresh arena a
-    /// pass let each pool lower by at most one arena however many holes stood below it.
-    /// Measured on Qwen3-30B-A3B through a burst: passes moving 170,000–210,000 chunks
-    /// and releasing 25–42 arenas each lowered the frontier by 1–3 regions, the released
-    /// arenas becoming holes under a frontier the full arenas above them still held. The
-    /// pools take turns, highest first, so the lowest holes still go to the pools
-    /// standing highest; `MAX_FRESH` bounds the claims one pass makes.
-    ///
-    /// **Why every pool, not just the top one.** Packing is per pool, so each pool
-    /// converges onto *its own* lowest arenas — and a pool whose lowest arena sits high
-    /// in the span packs perfectly and stays exactly where it is: every pool gapless, 131
-    /// arenas live and a frontier of 330 is a state a per-pool pack alone settles into. A
-    /// lower destination for only the pool owning the topmost arena moves that one arena
-    /// and no other pool. A fresh arena per pool gives each of them ground below its own,
-    /// so the whole population moves down together.
+    /// **One per KV arena holding the frontier, and only those.** The regions worth
+    /// emptying are the KV arenas from the frontier down to the first region another
+    /// tenant holds, paired with the holes below them (`region_pool::frontier_relocations`)
+    /// — every pool among them, because packing is per pool and a pool gets no lower
+    /// destination than its own lowest arena otherwise (every pool gapless, 131 arenas
+    /// live and a frontier of 330 is a state a per-pool pack alone settles into). An
+    /// arena standing under another tenant's region gets none: emptied, it would leave
+    /// a hole under a frontier that tenant holds, which the next pass refills from the
+    /// next arena down. Sized by "every pool, whatever lies above it", passes moved every
+    /// chunk above any hole and the frontier stayed put — Qwen3-30B-A3B, 16 million chunk
+    /// moves in one probe. `MAX_FRESH` bounds the claims one pass makes.
     ///
     /// **Why this order places them right.** `census_by_pool` is already sorted by each
     /// pool's highest arena, highest first, and the region free list is lowest-index
     /// first — so claiming in this order hands the lowest hole to the pool standing
-    /// highest, the next hole to the next, and so on. Nothing needs to be computed for
-    /// that pairing; it falls out of the two orders.
+    /// highest, the next hole to the next, and so on.
     ///
-    /// **Only while a hole exists below the frontier.** With none, the claim would take a
-    /// region *above* it and raise the very number the pass exists to lower, so the lower
-    /// pools go without — they are the ones whose position matters least.
-    ///
-    /// An arena that lands above its own pool's top receives nothing, because the walk
-    /// fills the lowest slots first, and the pass releases it as soon as the claims are
-    /// in ([`FreshArenas::release_unused`]) — on a pass that stops earlier, when
-    /// [`FreshArenas`] drops. That is the churn this costs: one region claim and one
-    /// release, both O(1) on the region free list.
+    /// A claim that lands at or above the lowest region it was meant to empty — another
+    /// claim took the hole — ends the provisioning: that arena receives nothing, and the
+    /// pass releases it as soon as the claims are in ([`FreshArenas::release_unused`]),
+    /// or when [`FreshArenas`] drops on a pass that stops earlier.
     fn provision_low_arenas(
         &self,
         census_by_pool: &mut [(ArenaKey, Vec<ArenaSlots>)],
@@ -1246,9 +1235,30 @@ impl super::backing::ChunkedKvBacking {
     ) {
         /// Fresh arenas one pass may claim across every pool.
         const MAX_FRESH: usize = 64;
-        // Per pool, how many more fresh arenas its live chunks above the holes could
-        // fill. Unknown until its first arena lands, then refined as each one does.
-        let mut wanted: Vec<usize> = vec![usize::MAX; census_by_pool.len()];
+        // **Only for the arenas holding the frontier.** The KV arenas from the frontier
+        // down to the first region another tenant holds, one per hole below them: each
+        // emptied lowers the frontier. One below another tenant's region, emptied, is a
+        // hole under a frontier that tenant still holds, which the next pass refills from
+        // the next arena down — every chunk above any hole moved each pass, and the
+        // frontier did not (Qwen3-30B-A3B: 16 million chunk moves in one probe).
+        let held: HashSet<usize> = census_by_pool
+            .iter()
+            .flat_map(|(_, census)| census.iter().map(|a| a.rank))
+            .collect();
+        let relocate = self.regions_to_relocate(&held);
+        let budget = relocate.len().min(MAX_FRESH);
+        if budget == 0 {
+            return;
+        }
+        // A fresh arena must land below the lowest region it is meant to empty; one the
+        // free list placed at or above it receives nothing, and goes back unused.
+        let cutoff = relocate[budget - 1];
+        let to_empty: HashSet<usize> = relocate[..budget].iter().copied().collect();
+        // Per pool, its arenas among those — one fresh arena each.
+        let mut wanted: Vec<usize> = census_by_pool
+            .iter()
+            .map(|(_, census)| census.iter().filter(|a| to_empty.contains(&a.rank)).count())
+            .collect();
         let mut made = 0usize;
         loop {
             let mut claimed_any = false;
@@ -1256,7 +1266,7 @@ impl super::backing::ChunkedKvBacking {
                 if census.is_empty() || wanted[i] == 0 {
                     continue;
                 }
-                if made >= MAX_FRESH || !self.has_region_hole() {
+                if made >= budget {
                     return;
                 }
                 let arena_idx = match fresh.claim(&self.inner, *key) {
@@ -1277,17 +1287,10 @@ impl super::backing::ChunkedKvBacking {
                     wanted[i] = 0;
                     continue;
                 };
-                // The live chunks standing above where this arena landed, in arenas'
-                // worth: this one takes the first, and the rest are still wanted. One
-                // that landed above all of them is wanted by nothing, and goes back
-                // unused with the rest.
-                let live_above: usize = census
-                    .iter()
-                    .filter(|a| a.rank > slots.rank)
-                    .map(|a| a.occupied.len())
-                    .sum();
-                let need = live_above.div_ceil(slots.capacity.max(1));
-                wanted[i] = need.saturating_sub(1).min(wanted[i].saturating_sub(1));
+                if slots.rank >= cutoff {
+                    return;
+                }
+                wanted[i] -= 1;
                 census.push(slots);
             }
             if !claimed_any {

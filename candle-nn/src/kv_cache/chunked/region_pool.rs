@@ -2837,6 +2837,65 @@ pub fn span_layout(ordinal: usize) -> Option<SpanLayout> {
     })
 }
 
+/// The regions a tenant's compaction may usefully empty into fresh low arenas:
+/// the span-level two-cursor plan, restricted to the regions the tenant holds.
+///
+/// The top cursor walks down from the frontier over live regions while the
+/// tenant holds them, and stops at the first live region it does not; the bottom
+/// cursor walks up over free regions. They pair while each hole lies below the
+/// region it would receive. Answers the paired regions, highest first — each one
+/// emptied lowers the frontier.
+///
+/// **Only those, because emptying anything else moves a hole rather than
+/// closing one.** A region below another tenant's live region leaves, when
+/// emptied, a hole under a frontier that tenant still holds; the next pass finds
+/// that hole and fills it from the next region down. Planned per tenant against
+/// "any hole below the frontier", Qwen3.8-Flash-Next's recurrent-state passes
+/// moved 912 slots each with the region count unchanged, KV arenas above them
+/// holding the frontier where it was.
+pub(crate) fn frontier_relocations(
+    watermark: usize,
+    is_free: impl Fn(usize) -> bool,
+    held: impl Fn(usize) -> bool,
+) -> Vec<usize> {
+    let mut run = Vec::new();
+    for i in (0..watermark).rev() {
+        if is_free(i) {
+            continue;
+        }
+        if !held(i) {
+            break;
+        }
+        run.push(i);
+    }
+    let holes = (0..watermark).filter(|&i| is_free(i));
+    let pairs = holes
+        .zip(run.iter())
+        .take_while(|(hole, region)| hole < *region)
+        .count();
+    run.truncate(pairs);
+    run
+}
+
+/// [`frontier_relocations`] on `ordinal`'s pool, for a tenant holding the regions
+/// `held` names (by index). `None` without a reservation.
+///
+/// The caller gathers `held` under its own lock first: this takes the region
+/// pool's, and no tenant lock is ever taken inside it.
+pub fn regions_to_relocate(
+    ordinal: usize,
+    held: &std::collections::HashSet<usize>,
+) -> Option<Vec<usize>> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    let pool = map.get(&ordinal)?;
+    let free: std::collections::HashSet<usize> = pool.free.iter().map(|Reverse(i)| *i).collect();
+    Some(frontier_relocations(
+        pool.live_watermark(),
+        |i| free.contains(&i),
+        |i| held.contains(&i),
+    ))
+}
+
 /// Occupancy of a device's KV side, or `None` if it has no reservation yet.
 pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
     let map = pools().lock().unwrap_or_else(|e| e.into_inner());
@@ -2869,10 +2928,53 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_region, kv_grow_step, place_transient, region_stats, release_transient, REGION_BYTES,
+        claim_region, frontier_relocations, kv_grow_step, place_transient, region_stats,
+        release_transient, REGION_BYTES,
     };
     use candle::{Device, Result};
     use std::sync::Arc;
+
+    /// A tenant whose regions stand under another tenant's live region empties
+    /// none: emptying them would only move a hole under a frontier it does not hold.
+    #[test]
+    fn a_tenant_under_another_relocates_nothing() {
+        // 0..10: free 1 and 3; the tenant holds 5, 6, 7; another holds 8 and 9.
+        let free = |i: usize| i == 1 || i == 3;
+        let held = |i: usize| (5..=7).contains(&i);
+        assert_eq!(frontier_relocations(10, free, held), Vec::<usize>::new());
+    }
+
+    /// The tenant at the frontier empties its topmost regions, one per hole below
+    /// them — and stops where the next hole is no longer below the next region.
+    #[test]
+    fn the_tenant_at_the_frontier_pairs_its_top_with_the_lowest_holes() {
+        // 0..10: free 1, 3, 6; another tenant holds 2; the tenant holds 0, 4, 5, 7, 8, 9.
+        let free = |i: usize| [1, 3, 6].contains(&i);
+        let held = |i: usize| [0, 4, 5, 7, 8, 9].contains(&i);
+        // Run from the top: 9, 8, 7 (6 free, skipped), 5, 4, then 3 free, 2 another's → stop.
+        // Holes ascending 1, 3, 6 pair with 9, 8, 7: all below.
+        assert_eq!(frontier_relocations(10, free, held), vec![9, 8, 7]);
+    }
+
+    /// Pairing ends where a hole is no longer below the region it would receive:
+    /// moving a region up is never a relocation.
+    #[test]
+    fn pairing_stops_where_the_cursors_cross() {
+        // 0..8: free 2 and 5; the tenant holds everything else.
+        let free = |i: usize| i == 2 || i == 5;
+        let held = |i: usize| !free(i);
+        // Run 7, 6, 4, 3, 1, 0; holes 2, 5. Pair 2 → 7, then 5 → 6: both below.
+        assert_eq!(frontier_relocations(8, free, held), vec![7, 6]);
+        // 0..6: free 4 only, the tenant holds the rest: 4 < 5 pairs, nothing else.
+        let free = |i: usize| i == 4;
+        let held = |i: usize| i != 4;
+        assert_eq!(frontier_relocations(6, free, held), vec![5]);
+        // No holes at all: nothing to move into.
+        assert_eq!(
+            frontier_relocations(6, |_| false, |_| true),
+            Vec::<usize>::new()
+        );
+    }
 
     /// The growth step is geometric, but it may never invent ground that the
     /// guards did not offer, and it may never round a genuine zero up to eight —

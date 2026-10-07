@@ -2328,6 +2328,16 @@ impl ChunkedKvBacking {
         false
     }
 
+    /// Of the regions `held` names, those holding the frontier that a fresh low arena
+    /// could empty, highest first — see `region_pool::frontier_relocations`.
+    #[cfg(feature = "cuda")]
+    pub(super) fn regions_to_relocate(&self, held: &HashSet<usize>) -> Vec<usize> {
+        let candle::DeviceLocation::Cuda { gpu_id } = self.device().location() else {
+            return Vec::new();
+        };
+        super::region_pool::regions_to_relocate(gpu_id, held).unwrap_or_default()
+    }
+
     /// Regions held by this device's **record** arenas.
     ///
     /// In-use ground that no size-class row accounts for: `gpu_class_stats` reports only

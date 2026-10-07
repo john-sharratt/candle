@@ -52,7 +52,7 @@ use super::compact_plan::{pack_moves, SlotRun};
 #[cfg(feature = "cuda")]
 use std::collections::hash_map::Entry;
 #[cfg(feature = "cuda")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -62,7 +62,9 @@ use candle::cuda_backend::cudarc::driver::result::{memcpy_dtod_async, memset_d8_
 use candle::{DType, Device, DeviceLocation, LeaseAnchor, Shape, Tensor};
 
 #[cfg(feature = "cuda")]
-use super::region_pool::{region_stats, span_region_refusal, SpanClaims, SpanRegion, REGION_BYTES};
+use super::region_pool::{
+    regions_to_relocate, span_region_refusal, SpanClaims, SpanRegion, REGION_BYTES,
+};
 
 /// Alignment of every slot base: what a fresh CUDA allocation guarantees and what the
 /// kernels' vectorised loads assume of a base pointer.
@@ -213,6 +215,12 @@ impl<R: Ground> StrideArenas<R> {
     /// Regions these arenas hold.
     pub(crate) fn regions(&self) -> usize {
         self.arenas.len()
+    }
+
+    /// The span positions of the regions these arenas hold.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn ranks(&self) -> impl Iterator<Item = usize> + '_ {
+        self.arenas.iter().map(|a| a.region.rank())
     }
 
     /// Slots held across these arenas.
@@ -683,11 +691,13 @@ pub struct SlotMove {
 /// moves that pack their live slots toward the low end of the span, destinations
 /// claimed.
 ///
-/// **Fresh low arenas first, while there are holes below the frontier** — the step the
-/// KV pools take (`provision_low_arenas`), sized to what this pass can fill. The
-/// region free list is lowest-index first, so new arenas land in the lowest holes,
-/// rank lowest among this pool's arenas, and the walk fills them first; the arenas at
-/// the top empty and their regions go back when their last holders move off. An arena
+/// **Fresh low arenas only for the arenas that hold the frontier**
+/// ([`regions_to_relocate`]): this pool's topmost regions, above every other tenant's
+/// live region, one per hole below them. The region free list is lowest-index first,
+/// so new arenas land in the lowest holes, rank lowest among this pool's arenas, and
+/// the walk fills them first; the arenas at the top empty and their regions go back
+/// when their last holders move off, lowering the frontier. An arena under another
+/// tenant's region is left where it is — emptying it would only move a hole. An arena
 /// the walk puts nothing in is released before this returns. Claiming takes the arena
 /// window, so this runs **between forwards**, like every other claim on the span.
 ///
@@ -705,37 +715,51 @@ pub fn plan_slot_moves(
     };
     let stride = slot_stride(bytes);
     let key = (gpu_id, tenant, stride);
-    let (regions, capacity) = pools()
+    let (held, capacity) = pools()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
-        .map_or((0, 1), |set| (set.regions(), set.capacity() as usize));
-    if regions == 0 {
+        .map_or((HashSet::new(), 1), |set| {
+            (
+                set.ranks().collect::<HashSet<usize>>(),
+                set.capacity() as usize,
+            )
+        });
+    if held.is_empty() {
         return Ok(Vec::new());
     }
-    // **As many low arenas as this pass can fill, not one.** Each fresh arena lets the
-    // walk empty one arena at the top, so a pass that provisions one lowers the pool
-    // by at most a region — slower than holders churn, and the holes they leave stay
-    // stranded (measured: Flash-Next held at 84 % with one, 98 % sized like this). The
-    // pass can move `max_moves` blocks, which fill `max_moves / capacity` arenas, and
-    // there is no point holding more low arenas than this pool has arenas to empty.
-    // Claimed while a hole remains below the frontier; an arena that lands above
-    // everything this pool holds, or that the walk does not reach, receives nothing
-    // and goes back below.
+    // **As many low arenas as there are frontier regions to empty, and no more.** Each
+    // fresh arena lets the walk empty one arena at the top; a pass that provisions one
+    // lowers the frontier by at most a region, slower than holders churn (measured:
+    // Flash-Next held at 84 % with one). But only this pool's regions that hold the
+    // frontier are worth emptying — below another tenant's, an emptied arena is a hole
+    // the next pass refills from the next arena down, and Flash-Next's passes moved 912
+    // slots each that way with the region count unchanged. The pass can also move only
+    // `max_moves` blocks, which fill `max_moves / capacity` arenas.
+    //
+    // Gathered under this module's lock and asked of the region pool outside it, for
+    // the reason on `claim_arena_slots`.
+    let relocate = regions_to_relocate(gpu_id, &held).unwrap_or_default();
     let want = if max_moves == 0 {
-        regions
+        relocate.len()
     } else {
-        max_moves.div_ceil(capacity).min(regions)
+        max_moves.div_ceil(capacity).min(relocate.len())
     };
-    // Outside this module's lock, for the reason on `claim_arena_slots`.
+    // A fresh arena has to land below the lowest region it is meant to empty; one the
+    // free list placed at or above it (another claim took the hole) receives nothing
+    // and goes back below.
+    let cutoff = relocate.get(want.saturating_sub(1)).copied().unwrap_or(0);
     let mut fresh: Vec<SpanRegion> = Vec::new();
-    let has_hole = || region_stats(gpu_id).is_some_and(|s| s.live_watermark > s.live);
-    if has_hole() {
+    if want > 0 {
         let claims = SpanClaims::open(device, tenant.label())?;
-        while fresh.len() < want && has_hole() {
+        while fresh.len() < want {
             let Some(region) = claims.claim()? else {
                 break;
             };
+            if region.index() >= cutoff {
+                drop(region);
+                break;
+            }
             fresh.push(region);
         }
     }
