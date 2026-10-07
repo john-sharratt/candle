@@ -1438,6 +1438,13 @@ fn sweep_layers(
         // first would end the borrow the assert path is still inside.
         q.layers.prefetch()?;
         g_layer.end();
+        // A segment per layer, as the uniform sweep cuts it: recorded whole, the
+        // forward would be one segment and the GPU would idle until the host had
+        // recorded every layer. A routed checkpoint's expert dispatch already
+        // ends a segment in each layer, so only a dense one is cut here.
+        if q.cfg.moe.is_none() {
+            dev.flush_launches()?;
+        }
     }
 
     // File the stash back, whether this sweep was whole or one window of a

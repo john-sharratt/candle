@@ -384,16 +384,25 @@ impl CudaDevice {
     /// settles in a few steps — and is never handed back, which is what makes a
     /// steady-state wave allocation-free. The lock is held while `f` runs, so
     /// two callers on this handle cannot interleave their quantize and read.
+    ///
+    /// **Inside a recording wave capture a scratch already wide enough is used
+    /// in place**, so `f`'s write and read are recorded: `f` must launch only on
+    /// [`Self::cuda_stream`]. A segment replays whole on the compute stream, so
+    /// any eager user of the scratch — this thread's after a pause, or another
+    /// thread's — runs entirely before that segment or entirely after it, never
+    /// between its write and its read. Pausing here instead ended the segment at
+    /// every legacy quantized matmul: measured on Qwen3.5-0.8B, one cut per
+    /// DeltaNet input projection, 25–176 µs of idle GPU each — ~1.5 ms of a
+    /// ~5 ms two-session decode step. Growth allocates, so it runs eagerly.
     pub fn with_staging<R>(
         &self,
         bytes: usize,
         f: impl FnOnce(&mut CudaSlice<u8>) -> Result<R>,
     ) -> Result<R> {
-        // Eager for its whole extent: the scratch is reused by the next call,
-        // so a launch reading it must execute before the next upload lands.
-        let _eager = self.pause_capture()?;
         let mut slot = self.staging.lock().unwrap();
-        if !slot.as_ref().is_some_and(|s| s.len() >= bytes) {
+        let fits = slot.as_ref().is_some_and(|s| s.len() >= bytes);
+        let _eager = if fits { None } else { self.pause_capture()? };
+        if !fits {
             let grown = slot.as_ref().map_or(0, |s| s.len() * 2).max(bytes).max(1);
             // Dropping the old buffer frees it on this stream, after every
             // launch already queued against it.
@@ -445,6 +454,10 @@ impl CudaDevice {
                 }
             }
         }
+        // The copy below is issued on the compute stream itself, not recorded,
+        // so a segment still holding a read of the scratch must be launched
+        // ahead of it.
+        let _eager = self.pause_capture()?;
         self.with_staging(bytes, |buf| {
             if bytes > 0 {
                 self.stream

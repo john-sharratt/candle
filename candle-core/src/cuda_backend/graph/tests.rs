@@ -8,7 +8,7 @@ use super::{CaptureSession, CaptureStream, ComputeStream};
 use crate::backend::BackendDevice;
 use crate::cuda_backend::{CudaDevice, WrapErr};
 use crate::Result;
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -787,6 +787,63 @@ fn staged_uploads_while_recording_keep_their_order_without_a_cut() -> Result<()>
         dev.capture_stats().segments - segments,
         1,
         "a staged upload ended the segment"
+    );
+    Ok(())
+}
+
+/// Two uses of the staging scratch in one recording — each a kernel writing it
+/// and a kernel reading it back, as a quantized matmul's quantize and product
+/// do — each read their own write, and neither ends the segment.
+#[test]
+fn staging_scratch_while_recording_keeps_its_order_without_a_cut() -> Result<()> {
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let a = dev.memcpy_stod(&ramp(2.0))?;
+    let b = dev.memcpy_stod(&ramp(5.0))?;
+    let mut first = dev.alloc_zeros::<f32>(N)?;
+    let mut second = dev.alloc_zeros::<f32>(N)?;
+    // Grow the scratch eagerly first: a recorded call never allocates.
+    dev.with_staging(N * 4, |_| Ok(()))?;
+    dev.synchronize()?;
+
+    // Copy `src` into the scratch with one launch, then the scratch into `out`
+    // with another.
+    let through = |src: &CudaSlice<f32>, out: &mut CudaSlice<f32>| -> Result<()> {
+        dev.with_staging(N * 4, |scratch| {
+            let stream = dev.cuda_stream();
+            let n = N as i32;
+            let (mul, add) = (1.0f32, 0.0f32);
+            let (s, _gs) = scratch.device_ptr(&stream);
+            let mut w = stream.launch_builder(&f);
+            w.arg(src).arg(&s).arg(&mul).arg(&add).arg(&n);
+            // SAFETY: the scratch holds `N` f32s, `src` holds `N`.
+            unsafe { w.launch(LaunchConfig::for_num_elems(N as u32)) }.w()?;
+            let mut r = stream.launch_builder(&f);
+            r.arg(&s).arg(out).arg(&mul).arg(&add).arg(&n);
+            // SAFETY: as above, `out` holds `N`.
+            unsafe { r.launch(LaunchConfig::for_num_elems(N as u32)) }.w()?;
+            Ok(())
+        })
+    };
+
+    let segments = dev.capture_stats().segments;
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    through(&a, &mut first)?;
+    through(&b, &mut second)?;
+    capture.finish()?;
+
+    assert_eq!(dev.memcpy_dtov(&first)?, ramp(2.0), "the first use's read");
+    assert_eq!(
+        dev.memcpy_dtov(&second)?,
+        ramp(5.0),
+        "the second use's read"
+    );
+    assert_eq!(
+        dev.capture_stats().segments - segments,
+        1,
+        "a use of the staging scratch ended the segment"
     );
     Ok(())
 }
