@@ -62,6 +62,11 @@
 #define DNP_ALD (DNP_CHUNK + 1)
 // d_v rows of state owned by one state-pass block.
 #define DNP_TV 32
+// The state pass's row strides: multiples of 4 floats, so every row is
+// 16-byte aligned and its dots read four columns per load. +4 rather than +1
+// keeps a quarter-warp's lane-distinct float4 rows on distinct banks.
+#define DNP_SLD (DNP_DIM + 4)
+#define DNP_VLD (DNP_TV + 4)
 // Tokens the state pass stages per half-chunk — half of DNP_CHUNK, so its
 // stage buffer is half-size and two blocks fit an SM (see the kernel header).
 #define DNP_TH 32
@@ -376,11 +381,44 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
 // smem operand feeds four FMAs) because the LSU, not the FMA pipe, was the
 // measured ceiling.
 //
-// Dynamic smem (~42 KB — the size that fits TWO blocks per SM, keeping all
-// n_v_heads·4 blocks of the grid resident in one wave): s_tile [TV][LD],
-// stage [TH][LD] staging HALF a chunk at a time, reused w → q → k,
-// vnew [C][TV+1], and the chunk's decay vectors.
+// Every dot reads four columns per shared load (float4 on 16-byte-aligned
+// rows), because shared-load ISSUE, not bandwidth, was the ceiling: with one
+// scalar load per FMA group a 64-token chunk cost ~33K warp load instructions
+// per block. The accumulation order is unchanged — each accumulator still sums
+// its columns 0, 1, 2, … in turn — so the results are the same bits.
+//
+// Dynamic smem (~43 KB — the size that fits TWO blocks per SM, keeping all
+// n_v_heads·4 blocks of the grid resident in one wave): s_tile [TV][SLD],
+// stage [TH][SLD] staging HALF a chunk at a time, reused w → q → k,
+// vnew [C][VLD], and the chunk's decay vectors.
 // ============================================================================
+// acc[q] += Σ_j stage[warp + 8q][j] · srow[j] for the warp's (up to) four
+// tokens below `hlen`, four columns per shared load. Each accumulator sums its
+// columns in ascending order, the order the scalar loop it replaces used.
+static __device__ __forceinline__ void dnp_dot4(
+        const float* __restrict__ srow,
+        const float* __restrict__ stage,
+        int warp,
+        int hlen,
+        float acc[4]) {
+    const float4* s4 = reinterpret_cast<const float4*>(srow);
+    #pragma unroll 4
+    for (int j4 = 0; j4 < DNP_DIM / 4; ++j4) {
+        const float4 sv = s4[j4];
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int t = warp + q * 8;
+            if (t < hlen) {
+                const float4 st = reinterpret_cast<const float4*>(&stage[t * DNP_SLD])[j4];
+                acc[q] += st.x * sv.x;
+                acc[q] += st.y * sv.y;
+                acc[q] += st.z * sv.z;
+                acc[q] += st.w * sv.w;
+            }
+        }
+    }
+}
+
 static __global__ void delta_net_prefill_state_f32_kernel(
         const float* __restrict__ qk_wave,// Q|K columns of the conv output
         const float* __restrict__ u,      // [h_v, T_tran, D]
@@ -396,11 +434,11 @@ static __global__ void delta_net_prefill_state_f32_kernel(
         int n_k_heads,
         int tok_stride, // conv_dim: q and k are strided views of the conv output
         float q_scale) {
-    extern __shared__ float smem[];
-    float* s_tile = smem;                            // [TV][LD]
-    float* stage = s_tile + DNP_TV * DNP_LD;         // [TH][LD]
-    float* vnew  = stage + DNP_TH * DNP_LD;          // [C][TV+1]
-    float* sge   = vnew + DNP_CHUNK * (DNP_TV + 1);  // e^{G}
+    extern __shared__ __align__(16) float smem[];
+    float* s_tile = smem;                            // [TV][SLD]
+    float* stage = s_tile + DNP_TV * DNP_SLD;        // [TH][SLD]
+    float* vnew  = stage + DNP_TH * DNP_SLD;         // [C][VLD]
+    float* sge   = vnew + DNP_CHUNK * DNP_VLD;       // e^{G}
     float* sgd   = sge + DNP_CHUNK;                  // e^{G_last − G}
     __shared__ float s_decay;                        // e^{G_last}
 
@@ -442,7 +480,7 @@ static __global__ void delta_net_prefill_state_f32_kernel(
         #pragma unroll
         for (int k = 0; k < DNP_TILE_PER_THREAD; ++k) {
             const int idx = tid + k * DNP_THREADS;
-            s_tile[(idx / DNP_DIM) * DNP_LD + idx % DNP_DIM] = v[k];
+            s_tile[(idx / DNP_DIM) * DNP_SLD + idx % DNP_DIM] = v[k];
         }
     }
 
@@ -474,38 +512,29 @@ static __global__ void delta_net_prefill_state_f32_kernel(
             for (int idx = tid; idx < hlen * DNP_DIM; idx += (int)blockDim.x) {
                 const int i = idx / DNP_DIM;
                 const int d = idx % DNP_DIM;
-                stage[i * DNP_LD + d] =
+                stage[i * DNP_SLD + d] =
                     w[((size_t)h * t_tran + tran + (t0 + hb + i)) * DNP_DIM + d];
             }
             __syncthreads();
-            // warp → t (stride 8, 4 at a time), lane → r: stage[t][j]
-            // broadcasts, s_tile[r][j] hits distinct banks per lane, u/vnew
-            // accesses are consecutive in r. The 4-way t-tile is register
-            // reuse against the smem bandwidth ceiling: one s_tile operand
-            // load feeds four FMAs. A warp with no token in this half skips the
-            // dot outright (warp-uniform): at a verify-width span of a few
-            // tokens, most warps have none, and running the loop with every
-            // operation predicated off still spent the shared-memory issue the
-            // live warps were waiting on.
+            // warp → t (stride 8, 4 at a time), lane → r: stage[t][j..j+3]
+            // broadcasts, s_tile[r][j..j+3] lands a quarter-warp's lanes on
+            // distinct banks, u/vnew accesses are consecutive in r. The 4-way
+            // t-tile is register reuse: one s_tile load feeds sixteen FMAs. A
+            // warp with no token in this half skips the dot outright
+            // (warp-uniform): at a verify-width span of a few tokens, most warps
+            // have none, and running the loop with every operation predicated
+            // off still spent the shared-memory issue the live warps were
+            // waiting on.
             if (warp < hlen) {
-                const float* srow = &s_tile[lane * DNP_LD];
                 float acc[4] = {0.f, 0.f, 0.f, 0.f};
-                #pragma unroll 8
-                for (int j = 0; j < DNP_DIM; ++j) {
-                    const float sv = srow[j];
-                    #pragma unroll
-                    for (int q = 0; q < 4; ++q) {
-                        const int t = warp + q * 8;
-                        if (t < hlen) acc[q] += stage[t * DNP_LD + j] * sv;
-                    }
-                }
+                dnp_dot4(&s_tile[lane * DNP_SLD], stage, warp, hlen, acc);
                 #pragma unroll
                 for (int q = 0; q < 4; ++q) {
                     const int t = warp + q * 8;
                     if (t < hlen) {
                         const float uv = u[((size_t)h * t_tran + tran + (t0 + hb + t)) * DNP_DIM +
                                            (i_base + lane)];
-                        vnew[(hb + t) * (DNP_TV + 1) + lane] = uv - acc[q];
+                        vnew[(hb + t) * DNP_VLD + lane] = uv - acc[q];
                     }
                 }
             }
@@ -518,22 +547,13 @@ static __global__ void delta_net_prefill_state_f32_kernel(
             for (int idx = tid; idx < hlen * DNP_DIM; idx += (int)blockDim.x) {
                 const int i = idx / DNP_DIM;
                 const int d = idx % DNP_DIM;
-                stage[i * DNP_LD + d] =
+                stage[i * DNP_SLD + d] =
                     qk[(size_t)(t0 + hb + i) * qk_stride + kh * DNP_DIM + d] * q_scale;
             }
             __syncthreads();
             if (warp < hlen) { // as phase 1: a warp with no token skips the dot
-                const float* srow = &s_tile[lane * DNP_LD];
                 float inter[4] = {0.f, 0.f, 0.f, 0.f};
-                #pragma unroll 8
-                for (int j = 0; j < DNP_DIM; ++j) {
-                    const float sv = srow[j];
-                    #pragma unroll
-                    for (int q = 0; q < 4; ++q) {
-                        const int t = warp + q * 8;
-                        if (t < hlen) inter[q] += stage[t * DNP_LD + j] * sv;
-                    }
-                }
+                dnp_dot4(&s_tile[lane * DNP_SLD], stage, warp, hlen, inter);
                 #pragma unroll
                 for (int q = 0; q < 4; ++q) {
                     const int t = warp + q * 8;
@@ -546,7 +566,7 @@ static __global__ void delta_net_prefill_state_f32_kernel(
                         kq + ((size_t)h * t_tran + tran + (t0 + tc)) * DNP_CHUNK;
                     float intra = 0.f;
                     for (int s = 0; s <= tc; ++s) {
-                        intra += __ldg(kqrow + s) * vnew[s * (DNP_TV + 1) + lane];
+                        intra += __ldg(kqrow + s) * vnew[s * DNP_VLD + lane];
                     }
                     o[(size_t)(t0 + tc) * o_stride + (size_t)h * DNP_DIM +
                       (i_base + lane)] =
@@ -560,7 +580,8 @@ static __global__ void delta_net_prefill_state_f32_kernel(
         // Each thread owns 16 S elements: j fixed per half-block, r striped —
         // disjoint (r, j) pairs, so the in-place update has no races. All 16
         // accumulators live in registers (persisting across the staged
-        // halves) so one stage[t][j]·sgd[t] operand load feeds 16 FMAs.
+        // halves) so one stage[t][j]·sgd[t] operand load feeds 16 FMAs, and
+        // the 16 v_new values it multiplies are four warp-broadcast loads.
         {
             const int j = tid & (DNP_DIM - 1);        // 0..127
             const int r0 = (tid >> 7) * (DNP_TV / 2); // 0 or 16
@@ -572,17 +593,22 @@ static __global__ void delta_net_prefill_state_f32_kernel(
                 for (int idx = tid; idx < hlen * DNP_DIM; idx += (int)blockDim.x) {
                     const int i = idx / DNP_DIM;
                     const int d = idx % DNP_DIM;
-                    stage[i * DNP_LD + d] =
+                    stage[i * DNP_SLD + d] =
                         qk[(size_t)(t0 + hb + i) * qk_stride +
                            (n_k_heads + kh) * DNP_DIM + d];
                 }
                 __syncthreads();
                 for (int t = 0; t < hlen; ++t) {
-                    const float kg = stage[t * DNP_LD + j] * sgd[hb + t];
-                    const float* vrow = &vnew[(hb + t) * (DNP_TV + 1) + r0];
+                    const float kg = stage[t * DNP_SLD + j] * sgd[hb + t];
+                    const float4* vrow =
+                        reinterpret_cast<const float4*>(&vnew[(hb + t) * DNP_VLD + r0]);
                     #pragma unroll
-                    for (int rr = 0; rr < DNP_TV / 2; ++rr) {
-                        acc[rr] += vrow[rr] * kg;
+                    for (int r4 = 0; r4 < DNP_TV / 8; ++r4) {
+                        const float4 vv = vrow[r4];
+                        acc[4 * r4 + 0] += vv.x * kg;
+                        acc[4 * r4 + 1] += vv.y * kg;
+                        acc[4 * r4 + 2] += vv.z * kg;
+                        acc[4 * r4 + 3] += vv.w * kg;
                     }
                 }
                 __syncthreads(); // stage free for the next half
@@ -590,7 +616,7 @@ static __global__ void delta_net_prefill_state_f32_kernel(
             const float dec = s_decay;
             #pragma unroll
             for (int rr = 0; rr < DNP_TV / 2; ++rr) {
-                float* sp = &s_tile[(r0 + rr) * DNP_LD + j];
+                float* sp = &s_tile[(r0 + rr) * DNP_SLD + j];
                 *sp = *sp * dec + acc[rr];
             }
         }
@@ -611,7 +637,7 @@ static __global__ void delta_net_prefill_state_f32_kernel(
         #pragma unroll
         for (int k = 0; k < DNP_TILE_PER_THREAD; ++k) {
             const int idx = tid + k * DNP_THREADS;
-            v[k] = s_tile[(idx / DNP_DIM) * DNP_LD + idx % DNP_DIM];
+            v[k] = s_tile[(idx / DNP_DIM) * DNP_SLD + idx % DNP_DIM];
         }
         #pragma unroll
         for (int k = 0; k < DNP_TILE_PER_THREAD; ++k) {
@@ -713,9 +739,9 @@ static inline void launch_prefill_state_f32(
         float q_scale,
         cudaStream_t stream) {
     if (n_spans <= 0 || n_v_heads <= 0 || n_k_heads <= 0) return;
-    // ~42 KB — deliberately under the 48 KB default so two blocks share an SM.
-    const int smem_bytes = (DNP_TV * DNP_LD + DNP_TH * DNP_LD +
-                            DNP_CHUNK * (DNP_TV + 1) + 2 * DNP_CHUNK) *
+    // ~43 KB — deliberately under the 48 KB default so two blocks share an SM.
+    const int smem_bytes = (DNP_TV * DNP_SLD + DNP_TH * DNP_SLD +
+                            DNP_CHUNK * DNP_VLD + 2 * DNP_CHUNK) *
                            (int)sizeof(float);
     // No span dimension in the grid's extent beyond `n_spans`: this pass walks
     // its span's chunks serially inside the block, so its shape never depended
