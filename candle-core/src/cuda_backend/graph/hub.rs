@@ -38,6 +38,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::ThreadId;
+use std::time::Instant;
 
 /// What the wave captures on a device have done since it was created.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,13 @@ pub struct CaptureStats {
     pub reshaped: u64,
     /// Segments that needed a fresh instantiation.
     pub instantiated: u64,
+    /// Host time, in µs, folding segments in place into an executable already of
+    /// their shape — arguments only.
+    pub in_place_us: u64,
+    /// Host time, in µs, folding segments into an executable of another shape.
+    pub reshaped_us: u64,
+    /// Host time, in µs, instantiating and uploading segments.
+    pub instantiated_us: u64,
     /// Graph nodes launched — kernels, memsets, device copies and event
     /// records alike.
     pub nodes: u64,
@@ -398,18 +406,27 @@ impl CaptureHub {
             st.slots.resize_with(segment + 1, ExecSlot::default);
         }
         let on = super::ComputeStream::from_stream(compute.clone());
+        let started = Instant::now();
         // SAFETY: the capture's own graph; `fold` takes ownership.
         let (exec, folded) = unsafe { st.slots[segment].fold(graph, &on, nodes)? };
+        let fold_us = started.elapsed().as_micros() as u64;
         exec.launch(&on)?;
         st.stats.segments += 1;
         st.stats.nodes += nodes as u64;
         match folded {
-            Folded::InPlace => st.stats.updated += 1,
+            Folded::InPlace => {
+                st.stats.updated += 1;
+                st.stats.in_place_us += fold_us;
+            }
             Folded::Reshaped => {
                 st.stats.updated += 1;
                 st.stats.reshaped += 1;
+                st.stats.reshaped_us += fold_us;
             }
-            Folded::Instantiated => st.stats.instantiated += 1,
+            Folded::Instantiated => {
+                st.stats.instantiated += 1;
+                st.stats.instantiated_us += fold_us;
+            }
         }
         Ok(())
     }

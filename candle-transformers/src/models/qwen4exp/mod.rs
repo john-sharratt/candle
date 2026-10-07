@@ -65,6 +65,8 @@ pub mod qsa_select;
 pub mod resident_page;
 pub mod rope;
 #[cfg(feature = "cuda")]
+pub mod rows_matmul;
+#[cfg(feature = "cuda")]
 pub mod select_bytes;
 pub mod spec;
 pub mod state_slots;

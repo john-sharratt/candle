@@ -114,6 +114,10 @@ pub mod comp_idx;
 // session of a wave
 pub mod rows_scatter;
 
+// F32 rows × weightᵀ for a few rows: one block per output column, K cut across
+// its threads — the QSA indexer's projections at decode and verify width
+pub mod f32_rows_matmul;
+
 // One content hash per KV slot over the bands its block tables name, folded
 // commutatively so block scheduling cannot change the result — the integrity
 // primitive the compaction boundaries compare across

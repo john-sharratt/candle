@@ -37,7 +37,7 @@
 //! Reach for these guards for the other case, where the two types are *supposed*
 //! to agree and the cast is there in case they do not.
 
-use candle::{DType, LiveTensor, Result, Tensor};
+use candle::{DType, LiveTensor, Result};
 
 /// Require `t` to already be `want`.
 ///
@@ -72,7 +72,7 @@ pub fn expect_dtype(t: &LiveTensor<'_>, want: DType, what: &str) -> Result<()> {
 ///
 /// A caller that hits this wants either the full tensor or a wrapper that
 /// forwards the offset — not a copy.
-pub fn expect_dense(t: &Tensor, what: &str) -> Result<()> {
+pub fn expect_dense(t: &LiveTensor<'_>, what: &str) -> Result<()> {
     if !t.is_contiguous() {
         candle::bail!(
             "{what}: kernel operand has layout {:?} stride {:?}, which is not dense — the \
@@ -94,7 +94,7 @@ pub fn expect_dense(t: &Tensor, what: &str) -> Result<()> {
 }
 
 /// Both checks, which is what a kernel operand almost always needs.
-pub fn expect_dense_dtype(t: &Tensor, want: DType, what: &str) -> Result<()> {
+pub fn expect_dense_dtype(t: &LiveTensor<'_>, want: DType, what: &str) -> Result<()> {
     expect_dtype(t, want, what)?;
     expect_dense(t, what)
 }
@@ -105,7 +105,7 @@ pub fn expect_dense_dtype(t: &Tensor, want: DType, what: &str) -> Result<()> {
 ///
 /// Only a wrapper that forwards the offset may use this; one that takes the
 /// storage base pointer must keep [`expect_dense`].
-pub fn expect_dense_view(t: &Tensor, what: &str) -> Result<()> {
+pub fn expect_dense_view(t: &LiveTensor<'_>, what: &str) -> Result<()> {
     if !t.is_contiguous() {
         candle::bail!(
             "{what}: kernel operand has layout {:?} stride {:?}, which is not dense — the \
@@ -119,7 +119,7 @@ pub fn expect_dense_view(t: &Tensor, what: &str) -> Result<()> {
 }
 
 /// [`expect_dtype`] and [`expect_dense_view`].
-pub fn expect_dense_view_dtype(t: &Tensor, want: DType, what: &str) -> Result<()> {
+pub fn expect_dense_view_dtype(t: &LiveTensor<'_>, want: DType, what: &str) -> Result<()> {
     expect_dtype(t, want, what)?;
     expect_dense_view(t, what)
 }
@@ -127,7 +127,7 @@ pub fn expect_dense_view_dtype(t: &Tensor, want: DType, what: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle::Device;
+    use candle::{Device, Tensor};
 
     #[test]
     fn accepts_a_dense_operand_of_the_right_type() -> Result<()> {

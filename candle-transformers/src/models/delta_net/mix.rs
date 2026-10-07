@@ -56,6 +56,8 @@ use candle_nn::kv_cache::{relocate_tensor, ArenaSlot};
 
 #[cfg(feature = "cuda")]
 use crate::models::latent_moe::scatter::{rows_scatter_inline, RowRun};
+#[cfg(feature = "cuda")]
+use crate::models::operand_guard::expect_dense_dtype;
 
 use super::types::{DeltaNetDims, ZGate};
 
@@ -1765,12 +1767,20 @@ pub fn delta_net_mix_spans<'w>(
 /// batched over all spans through the span table); everywhere else each span
 /// takes one [`delta_net_mix_spans`] call over its own rows, which is the
 /// reference the kernels are parity-locked to.
+///
+/// `conved` is the fused path's `[T, conv_dim]` F32 conv output, and the
+/// **provenance root** of the replay: `p` is read in place from the rewind
+/// stash, which the sequence owns across waves and so names no arena, and the
+/// scan's output and the span table are placed beside `conved` instead. A
+/// caller replaying on a wave carves it there; the reference path convolves
+/// each span itself and never reads it.
 pub fn delta_net_advance_spans(
     p: &DeltaNetProjections<'_>,
     c: &DeltaNetConstants<'_>,
     dims: &DeltaNetDims,
     seqs: &mut [DeltaNetSeq<'_>],
     rms_eps: f64,
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] conved: &LiveTensor<'_>,
 ) -> Result<()> {
     if seqs.is_empty() {
         return Ok(());
@@ -1815,24 +1825,31 @@ pub fn delta_net_advance_spans(
     );
     #[cfg(feature = "cuda")]
     if replay_ok {
-        let spans = super::cuda::build_span_table_all(seqs, &p.qkv)?;
-        // Fully kernel-written within the spans and read only within them, so
-        // uninitialised (invariant 6); the gap rows are never touched. Beside
-        // the staged operands, so the whole replay chain — the conv, the scan's
-        // transients and its output — lands on the replay's wave
-        // (`WaveBuffer::Replay*`).
-        let conved = p.qkv.empty_beside((t, dims.conv_dim()), DType::F32)?;
+        expect_dense_dtype(conved, DType::F32, "replay conved")?;
+        if conved.dims() != [t, dims.conv_dim()] {
+            candle::bail!(
+                "delta_net_advance_spans: conved is {:?}, the replay convolves [{t}, {}]",
+                conved.dims(),
+                dims.conv_dim()
+            );
+        }
+        // Beside `conved`, so the whole replay chain — the span table, the
+        // scan's transients and its output — lands where the caller carved the
+        // conv (`WaveBuffer::Replay*`). The conv writes every row of every span
+        // and the scan reads only those, so `conved` arrives uninitialised
+        // (invariant 6); the gap rows are never touched.
+        let spans = super::cuda::build_span_table_all(seqs, conved)?;
         super::cuda::delta_net_conv_prefill(
             &p.qkv,
             c.conv,
             &spans,
             2 * dims.key_dim(),
             rms_eps as f32,
-            &conved,
+            conved,
         )?;
         let o = conved.empty_beside((t, dims.value_dim()), DType::F32)?;
         let fused = super::cuda::DeltaNetFused {
-            conved: &conved,
+            conved,
             alpha: &p.alpha_lin,
             blin: &p.beta_lin,
             dt_bias: c.dt_bias,
@@ -2628,7 +2645,8 @@ mod tests {
                     });
                 }
             }
-            delta_net_advance_spans(&p, &c, &dims, &mut seqs, 1e-6).unwrap();
+            let conved = Tensor::empty((total, dims.conv_dim()), DType::F32, &dev).unwrap();
+            delta_net_advance_spans(&p, &c, &dims, &mut seqs, 1e-6, &conved).unwrap();
         }
 
         // Alone: each rewinding span through the ordinary mixer over its rows.

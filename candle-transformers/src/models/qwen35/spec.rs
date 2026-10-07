@@ -45,13 +45,11 @@ use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
-#[cfg(feature = "cuda")]
-use candle::DType;
-use candle::{Device, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 
 use crate::models::delta_net::{
-    delta_net_advance_spans, DeltaNetConstants, DeltaNetDims, DeltaNetOut, DeltaNetProjections,
-    DeltaNetSeq, DeltaNetState, LayerKind, RecurrentStateStore, SpanOperands,
+    delta_net_advance_spans, DeltaNetConstants, DeltaNetDims, DeltaNetOut, DeltaNetSeq,
+    DeltaNetState, LayerKind, RecurrentStateStore, SpanOperands,
 };
 #[cfg(feature = "cuda")]
 use crate::models::wave_buffers::wave_empty;
@@ -325,61 +323,6 @@ impl VerifyStash {
     }
 }
 
-/// Re-advance every job's store from the state it entered its stashed block
-/// with to the state after the block's first `kept` tokens — the whole cohort
-/// in one batched launch pair per recurrent layer, through the same span-table
-/// kernels the verify wave itself ran.
-///
-/// Call **once per step**, immediately after the verify wave committed and
-/// before any other wave touches these sequences: the entering states live in
-/// each store's non-live half only until the next wave writes there.
-///
-/// A job whose `kept == span.len` is a full accept and is skipped without
-/// touching anything — its live state already covers exactly those tokens.
-/// One layer's stashed operands, copied onto the wave's half.
-///
-/// The **provenance root** for a replay. Every buffer the mixer allocates is
-/// placed beside one of these, so leasing them here is what keeps the whole
-/// chain off the pool — see [`replay_accepted_prefixes`] for the measurement
-/// that made it necessary.
-///
-/// Without a wave (no CUDA, or a caller that could not open a generation) this
-/// hands back the stash's own tensors unchanged: the replay is still correct,
-/// it simply allocates the way it always did.
-#[cfg(feature = "cuda")]
-fn stage_on_wave<'w>(
-    ops: &SpanOperands,
-    device: &Device,
-    wave: Option<&'w WaveGeneration>,
-) -> Result<DeltaNetProjections<'w>> {
-    let Some(_) = wave else {
-        return Ok(ops.all_rows());
-    };
-    // Uninitialised, not zeroed: the `slice_set` below writes every element, and
-    // a `memset` first would be a full-width pass per operand per layer that
-    // nothing reads (hot-path invariant 6).
-    let stage = |src: &Tensor| -> Result<candle::LiveTensor<'w>> {
-        let dst = wave_empty(src.shape(), src.dtype(), device, wave)?;
-        dst.slice_set(src, 0, 0)?;
-        Ok(dst)
-    };
-    Ok(DeltaNetProjections {
-        qkv: stage(&ops.qkv)?,
-        z: stage(&ops.z)?,
-        beta_lin: stage(&ops.beta_lin)?,
-        alpha_lin: stage(&ops.alpha_lin)?,
-    })
-}
-
-#[cfg(not(feature = "cuda"))]
-fn stage_on_wave<'w>(
-    ops: &SpanOperands,
-    _device: &Device,
-    _wave: Option<&'w ()>,
-) -> Result<DeltaNetProjections<'static>> {
-    Ok(ops.all_rows())
-}
-
 /// Per recurrent layer, in sweep order: the four small constants the mixer
 /// needs, and the transformer-layer index they belong to.
 ///
@@ -395,7 +338,16 @@ pub struct ReplayLayer<'a> {
 }
 
 /// Advance each rewinding sequence's recurrent state to its accepted prefix,
-/// from the state the block was entered with.
+/// from the state the block was entered with — the whole cohort in one batched
+/// launch pair per recurrent layer, through the same span-table kernels the
+/// verify wave itself ran.
+///
+/// Call **once per step**, immediately after the verify wave committed and
+/// before any other wave touches these sequences: the entering states live in
+/// each store's non-live half only until the next wave writes there.
+///
+/// A job whose `kept == span.len` is a full accept and is skipped without
+/// touching anything — its live state already covers exactly those tokens.
 ///
 /// Model-agnostic: everything specific to a checkpoint is resolved by the
 /// caller into `layers` — see [`ReplayLayer`]. Both the hybrid and `qwen4exp`
@@ -466,12 +418,12 @@ pub fn replay_accepted_prefixes(
     // **A generation for the replay, because the stash has no provenance to
     // lend.**
     //
-    // `SpanOperands` is allocated with `Tensor::zeros` outside any forward — the
-    // sequence owns it across waves, which is the whole point of a rewind stash —
-    // so its tensors are `Owned` and name no arena. The mixer then builds every
-    // intermediate with `empty_beside`, and beside an `Owned` operand is the
-    // pool: `conved`, then `u`/`w`/`kq`/`g_cs`, then everything downstream, per
-    // DeltaNet layer, per rewinding sequence, on every accept.
+    // `SpanOperands` lives outside any forward — the sequence owns it across
+    // waves, which is the whole point of a rewind stash — so its tensors name no
+    // wave. Every intermediate the mixer builds with `empty_beside` a stash
+    // operand would land on the pool: `conved`, then `u`/`w`/`kq`/`g_cs`, then
+    // everything downstream, per DeltaNet layer, per rewinding sequence, on
+    // every accept.
     //
     // Measured with `--features forbidden_allocations` on the 27B: **20.0 GB** of
     // driver allocation at 20 contexts against 921 MB at one, on a card with
@@ -480,21 +432,18 @@ pub fn replay_accepted_prefixes(
     // the device was simply full — and no region-pool diagnostic showed distress,
     // since none of it went through the pool.
     //
-    // Speculation is what made it reachable at that scale: a rewind happens
-    // exactly when proposals are rejected, so enabling drafting at width 20
-    // multiplied this path by the cohort.
-    //
     // Opening a generation is not sufficient on its own — `empty_beside` relays
-    // provenance rather than creating it, so the *root* must be leased. Hence the
-    // staging copy below.
+    // provenance rather than creating it, so the *root* must be leased. The root
+    // is the conv's output, carved here; the kernels read the stash in place,
+    // and the span table and the scan's buffers follow `conved` onto the wave.
     //
     // **The generation is per layer, not per replay.** The span is sized for one
     // layer's attention phase; holding one guard across the sweep accumulates
-    // every layer's staging in it and exhausts it — measured, at layer 48 of the
+    // every layer's carves in it and exhausts it — measured, at layer 48 of the
     // first config: *"transient span exhausted — 491520 B at offset 23240704
     // exceeds the 23638784 B budget"*. Dropping the guard each iteration returns
-    // the staging **and** the mixer's own intermediates before the next layer
-    // asks, which is the same lifetime a forward gives its phases.
+    // the mixer's intermediates before the next layer asks, which is the same
+    // lifetime a forward gives its phases.
     for (ord, &li) in layer_indices.iter().enumerate() {
         let entry = &layers[ord];
         if entry.layer_index != li {
@@ -510,13 +459,18 @@ pub fn replay_accepted_prefixes(
             Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
             _ => None,
         };
+        let p = stash.layers[ord].all_rows();
+        let stash_rows = p.qkv.dim(0)?;
+        // Uninitialised: the conv writes every row the scan reads (invariant 6).
+        #[cfg(feature = "cuda")]
+        let conved = wave_empty(
+            (stash_rows, dims.conv_dim()),
+            DType::F32,
+            device,
+            wave.as_ref(),
+        )?;
         #[cfg(not(feature = "cuda"))]
-        let wave: Option<()> = None;
-        // The stash staged onto the wave's half, so the chain the mixer builds
-        // from it has a leased root. Four copies per layer of buffers the
-        // capture already copied once — against the pool traffic above, and
-        // against a `contiguous()` the `rows()` path would have paid anyway.
-        let p = stage_on_wave(&stash.layers[ord], device, wave.as_ref())?;
+        let conved = Tensor::empty((stash_rows, dims.conv_dim()), DType::F32, device)?;
         let c = &entry.consts;
         // One span per rewinding sequence, over its own rows of the shared
         // buffers. For each: READ the half the block was entered from, WRITE
@@ -538,7 +492,7 @@ pub fn replay_accepted_prefixes(
         // The gated activations are the layer's output, which the accepted
         // tokens' logits were already produced from. Only the states are
         // wanted, and every sequence's advances in ONE launch pair.
-        delta_net_advance_spans(&p, c, dims, &mut seqs, eps)?;
+        delta_net_advance_spans(&p, c, dims, &mut seqs, eps, &conved)?;
     }
     Ok(())
 }

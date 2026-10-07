@@ -2383,6 +2383,14 @@ static __device__ void quantized_matmul_dense_entry_int8(
 // operand. `proj` is the bottleneck's `[M, proj_stride]` F32 output, read through its row
 // stride. Same tile schedule as the dense entry, and the same bits as `gr_silu_q8` followed
 // by it.
+//
+// Pipeline depth (see `grouped_matmul_impl_int8`'s STAGES): the computed tile plus three in
+// flight in mode 1. The `up` contraction is the hyper-connection bottleneck, K = 384 — three
+// K tiles — so a block's whole K is issued in its prologue instead of one DRAM round trip per
+// tile; mode 2 keeps the ping-pong its prefill widths are tuned on.
+template <int N_SUB>
+constexpr int dense_silu_stages() { return N_SUB == 1 ? 4 : 2; }
+
 template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1>
 static __device__ void quantized_matmul_dense_silu_entry_int8(
     const block_compact_t<block_q_t>* __restrict__ weights,
@@ -2393,16 +2401,17 @@ static __device__ void quantized_matmul_dense_silu_entry_int8(
     int sum_norm)
 {
     constexpr int BATCH = N_SUB * 16;
+    constexpr int STAGES = dense_silu_stages<N_SUB>();
     const int b_start = blockIdx.x * BATCH;
     const int b_cnt = min(BATCH, total_batch - b_start);
     const int row_tile_idx = blockIdx.y;
 
-    __shared__ __align__(16) int8_t smem_A_i8[2][BATCH][KI8_STRIDE];
-    __shared__ __align__(16) half2 smem_A_ds[2][BATCH];
-    __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RING_I8 * int8_chunk_bytes<block_compact_t<block_q_t>>::value];
+    __shared__ __align__(16) int8_t smem_A_i8[STAGES][BATCH][KI8_STRIDE];
+    __shared__ __align__(16) half2 smem_A_ds[STAGES][BATCH];
+    __shared__ uint8_t smem_W_flat[(N_TILE / 8) * (STAGES - 1) * int8_chunk_bytes<block_compact_t<block_q_t>>::value];
 
     if constexpr (is_scale_separate<block_compact_t<block_q_t>>::value) {
-        grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB, 2, false, true>(
+        grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB, STAGES, false, true>(
             weights, nullptr, dst, ncols_x, nrows_x, 0, dst_stride,
             b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm,
             0, -1, nullptr, 0, proj, proj_stride);
@@ -2431,6 +2440,62 @@ static __device__ void quantized_matmul_dense_silu_entry_int8(
 // Pipeline depth of a split-K block (see `grouped_matmul_impl_int8`'s STAGES): the computed
 // tile plus two in flight — a short slice is issued whole, a longer one streams.
 constexpr int SPLITK_STAGES = 3;
+
+// The split-K reducer's threads (one block of the dense tile) and the partials each thread
+// keeps in flight per L2 round trip, whatever its share of the outputs.
+constexpr int SPLITK_RED_THREADS = 4 * WARP_SIZE_TC;
+constexpr int SPLITK_RED_INFLIGHT = 32;
+
+// The last block's reduction of one output tile: thread `tid` owns outputs `tid + j·THREADS`
+// for j < OUTS (those below `outs`), and sums each over all `k_blocks` per-tile partials in
+// tile order from zero, `BATCH_K` tiles per round trip — every load of a round trip is issued
+// before its adds, and the adds run in tile order, so the chain is the unsplit kernel's.
+// `__ldcg` reads past L1, which the other blocks' stores never touched. N is a multiple of 32
+// (the launcher refuses anything else), so every output row of the tile exists.
+template <int OUTS, int BATCH_K, typename output_t>
+static __device__ __forceinline__ void splitk_reduce_tiles(
+    const float* __restrict__ ws, size_t slice, int k_blocks,
+    output_t* __restrict__ dst, int dst_stride, int b_start, int row0, int outs, int tid)
+{
+    // Offsets within one tile's `[M, N]` partial — the scratch holds 2²² floats, so 32 bits
+    // index it.
+    unsigned int off[OUTS];
+    bool live[OUTS];
+    float acc[OUTS];
+    #pragma unroll
+    for (int j = 0; j < OUTS; ++j) {
+        const int o = tid + j * SPLITK_RED_THREADS;
+        live[j] = o < outs;
+        off[j] = (unsigned int)((b_start + o / N_TILE) * dst_stride + row0 + o % N_TILE);
+        acc[j] = 0.f;
+    }
+    for (int s = 0; s < k_blocks; s += BATCH_K) {
+        float v[OUTS][BATCH_K];
+        #pragma unroll
+        for (int j = 0; j < OUTS; ++j) {
+            #pragma unroll
+            for (int i = 0; i < BATCH_K; ++i) {
+                v[j][i] = live[j] && s + i < k_blocks
+                              ? __ldcg(&ws[(size_t)(s + i) * slice + off[j]]) : 0.f;
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < OUTS; ++j) {
+            #pragma unroll
+            for (int i = 0; i < BATCH_K; ++i) {
+                if (s + i < k_blocks) acc[j] += v[j][i];
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < OUTS; ++j) {
+        if (live[j]) {
+            if constexpr (std::is_same_v<output_t, float>) dst[off[j]] = acc[j];
+            else if constexpr (std::is_same_v<output_t, half>) dst[off[j]] = __float2half_rn(acc[j]);
+            else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) dst[off[j]] = __float2bfloat16_rn(acc[j]);
+        }
+    }
+}
 
 template <int qk, int qi, typename block_q_t, int vdr, typename output_t>
 static __device__ void quantized_matmul_dense_splitk_entry_int8(
@@ -2482,55 +2547,24 @@ static __device__ void quantized_matmul_dense_splitk_entry_int8(
         // The reduction: 32 output rows × b_cnt tokens, each output summed over every K
         // tile's partial in tile order from zero — the unsplit chain, so every bit of the
         // result is the unsplit kernel's. It runs in one block per output tile while the
-        // rest of the card idles, so it is bound by L2 round trips: each thread owns up to
-        // OUTS outputs and walks them TOGETHER, RED_BATCH tiles at a time — OUTS·RED_BATCH
-        // loads in flight per round trip, where walking the outputs one after another pays
-        // a round trip per batch per output — a tail that grows with the rows (ncu, the
-        // hyper-connection `down` split 27 ways: 8 µs at one token, 29 µs at sixteen,
-        // against 12.5 µs at sixteen walking them together). `__ldcg` reads past L1, which
-        // the other blocks' stores never touched. N is a multiple of 32 (the launcher
-        // refuses anything else), so every output row of the tile exists.
+        // rest of the card idles, so it is bound by L2 round trips. The block's 128 threads
+        // own ceil(outs / 128) outputs each and hold a fixed budget of 32 partials in flight
+        // per round trip, shared out across those outputs: one output per thread (up to
+        // four tokens — every draft and single-row decode) walks 32 tiles a trip, two (a
+        // five-row verify) 16, four (a full token tile) 8. The hyper-connection `down` has
+        // 80 K tiles, so a five-row verify reduces in 5 round trips and a draft row in 3,
+        // where a fixed 8-tile batch paid 10 at every width.
         const int row0 = row_tile_idx * N_TILE;
-        constexpr int THREADS = 4 * WARP_SIZE_TC;
-        constexpr int OUTS = BATCH * N_TILE / THREADS;
-        constexpr int RED_BATCH = 8;
         const int outs = b_cnt * N_TILE;
-        // Offsets within one tile's `[M, N]` partial — the scratch holds 2²² floats, so
-        // 32 bits index it.
-        unsigned int off[OUTS];
-        float acc[OUTS];
-        #pragma unroll
-        for (int j = 0; j < OUTS; ++j) {
-            const int o = tid + j * THREADS;
-            off[j] = (unsigned int)((b_start + o / N_TILE) * dst_stride + row0 + o % N_TILE);
-            acc[j] = 0.f;
-        }
-        for (int s = 0; s < k_blocks; s += RED_BATCH) {
-            float v[OUTS][RED_BATCH];
-            #pragma unroll
-            for (int j = 0; j < OUTS; ++j) {
-                const bool live = tid + j * THREADS < outs;
-                #pragma unroll
-                for (int i = 0; i < RED_BATCH; ++i) {
-                    v[j][i] = live && s + i < k_blocks
-                                  ? __ldcg(&ws[(size_t)(s + i) * slice + off[j]]) : 0.f;
-                }
-            }
-            #pragma unroll
-            for (int j = 0; j < OUTS; ++j) {
-                #pragma unroll
-                for (int i = 0; i < RED_BATCH; ++i) {
-                    if (s + i < k_blocks) acc[j] += v[j][i];
-                }
-            }
-        }
-        #pragma unroll
-        for (int j = 0; j < OUTS; ++j) {
-            if (tid + j * THREADS < outs) {
-                if constexpr (std::is_same_v<output_t, float>) dst[off[j]] = acc[j];
-                else if constexpr (std::is_same_v<output_t, half>) dst[off[j]] = __float2half_rn(acc[j]);
-                else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) dst[off[j]] = __float2bfloat16_rn(acc[j]);
-            }
+        if (outs <= SPLITK_RED_THREADS) {
+            splitk_reduce_tiles<1, SPLITK_RED_INFLIGHT>(ws, slice, k_blocks, dst, dst_stride,
+                                                        b_start, row0, outs, tid);
+        } else if (outs <= 2 * SPLITK_RED_THREADS) {
+            splitk_reduce_tiles<2, SPLITK_RED_INFLIGHT / 2>(ws, slice, k_blocks, dst, dst_stride,
+                                                            b_start, row0, outs, tid);
+        } else {
+            splitk_reduce_tiles<4, SPLITK_RED_INFLIGHT / 4>(ws, slice, k_blocks, dst, dst_stride,
+                                                            b_start, row0, outs, tid);
         }
         if (tid == 0) {
             counters[tile] = 0u;

@@ -54,6 +54,7 @@ use super::qsa_select::{
     max_entries_for, max_gathered_for, max_keep, selected_width, Strata, MAX_RATIO,
 };
 use super::resident_page::ResidentPage;
+use super::rows_matmul::rows_matmul_t;
 use super::spec::SpecCapture;
 use crate::models::delta_net::mix::SeqSpan;
 use crate::models::delta_net::RecurrentCompaction;
@@ -1826,7 +1827,7 @@ impl SelectionTable {
 /// small GEMM per sequence per layer on the decode path, where launches are
 /// the wall.
 pub fn project_keys(h: &Tensor, w: &IndexerWeights) -> Result<Tensor> {
-    h.matmul(&w.k_proj.t()?)
+    rows_matmul_t(h, &w.k_proj)
 }
 
 /// The wave's indexer queries — projected, normed, and rotated at each row's
@@ -1851,9 +1852,7 @@ pub fn project_queries(
     ticket: Option<WaveTicket>,
 ) -> Result<Tensor> {
     let rows = h.dim(0)?;
-    let q = h
-        .matmul(&w.q_proj.t()?)?
-        .reshape((rows, cfg.n_heads, cfg.head_dim))?;
+    let q = rows_matmul_t(h, &w.q_proj)?.reshape((rows, cfg.n_heads, cfg.head_dim))?;
     let q = rms_norm_last(&q, &w.q_norm, rms_eps)?.reshape((rows * cfg.n_heads, cfg.head_dim))?;
     rotate_rows(
         RowSource::Dense(&q),

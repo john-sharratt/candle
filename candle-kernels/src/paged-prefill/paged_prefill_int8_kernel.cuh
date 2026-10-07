@@ -972,6 +972,13 @@ paged_prefill_int8_kernel(
 // with base-e log-sum-exp. Empty shards carry (m = -inf, l = 0) and vanish.
 // ============================================================================
 
+// The most shards a launch splits into. A short window over a long prefix —
+// a speculative verify of a few rows — runs as few as 4 unsplit blocks, and
+// with the walk range-split each shard's latency is its share of the
+// selection, so the launch fills every resident slot: 2 blocks/SM at
+// HEAD_DIM 256 is 220 slots on 110 SMs, 55 shards of 4 blocks.
+constexpr int I8_MAX_SPLITS = 64;
+
 template <typename QT, int HEAD_DIM>
 __global__ void paged_prefill_int8_combine_kernel(
     const float* __restrict__ partials,
@@ -985,27 +992,43 @@ __global__ void paged_prefill_int8_combine_kernel(
     const int d = (int)threadIdx.x;
 
     __shared__ float s_gm;
-    __shared__ float s_scale[32]; // exp(m_s - gm) per split (num_splits ≤ 32)
+    __shared__ float s_scale[I8_MAX_SPLITS]; // exp(m_s - gm) per split
     __shared__ float s_inv_l;
 
     const float* base = partials + row_id * num_splits * REC;
-    if (d == 0) {
-        float gm = -INFINITY;
-        for (int s = 0; s < num_splits; ++s) gm = fmaxf(gm, base[s * REC + HEAD_DIM]);
-        float l_tot = 0.f;
-        for (int s = 0; s < num_splits; ++s) {
-            float m_s = base[s * REC + HEAD_DIM];
-            float sc = (m_s == -INFINITY) ? 0.f : __expf(m_s - gm);
-            s_scale[s] = sc;
-            l_tot += base[s * REC + HEAD_DIM + 1] * sc;
+    // The shards' (m, l) fold on warp 0, two shards per lane: every load is
+    // issued at once and the max and the rescaled sum are shuffle trees, so a
+    // wide split costs one round trip rather than a serial chain per shard.
+    static_assert(I8_MAX_SPLITS <= 64, "the fold gives each lane two shards");
+    if (d < 32) {
+        const int s0 = d, s1 = d + 32;
+        const float m0 = s0 < num_splits ? base[s0 * REC + HEAD_DIM] : -INFINITY;
+        const float m1 = s1 < num_splits ? base[s1 * REC + HEAD_DIM] : -INFINITY;
+        const float l0 = s0 < num_splits ? base[s0 * REC + HEAD_DIM + 1] : 0.f;
+        const float l1 = s1 < num_splits ? base[s1 * REC + HEAD_DIM + 1] : 0.f;
+        float gm = fmaxf(m0, m1);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            gm = fmaxf(gm, __shfl_xor_sync(0xffffffffu, gm, off));
+        const float sc0 = (m0 == -INFINITY) ? 0.f : __expf(m0 - gm);
+        const float sc1 = (m1 == -INFINITY) ? 0.f : __expf(m1 - gm);
+        if (s0 < num_splits) s_scale[s0] = sc0;
+        if (s1 < num_splits) s_scale[s1] = sc1;
+        float l_tot = l0 * sc0 + l1 * sc1;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            l_tot += __shfl_xor_sync(0xffffffffu, l_tot, off);
+        if (d == 0) {
+            s_gm = gm;
+            s_inv_l = (l_tot > 0.f) ? 1.f / l_tot : 0.f;
         }
-        s_gm = gm;
-        s_inv_l = (l_tot > 0.f) ? 1.f / l_tot : 0.f;
     }
     __syncthreads();
     if (s_gm == -INFINITY) return; // row never attended anything
 
     float acc = 0.f;
+    // Unrolled so a batch of shards' loads is in flight before their adds.
+    #pragma unroll 8
     for (int s = 0; s < num_splits; ++s) {
         acc += base[s * REC + d] * s_scale[s];
     }
@@ -1075,7 +1098,7 @@ inline void launch_paged_prefill_int8(
     if (base_blocks < s_sm_count) {
         num_splits = (i8_min_blocks(HEAD_DIM) * s_sm_count) / base_blocks;
         if (num_splits < 1) num_splits = 1;
-        if (num_splits > 32) num_splits = 32;
+        if (num_splits > I8_MAX_SPLITS) num_splits = I8_MAX_SPLITS;
     }
 
     // Persistent grow-on-demand partial pool (same idiom as the decode

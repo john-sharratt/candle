@@ -239,13 +239,18 @@ mod tests {
     /// tile at a time, in tile order — at decode widths, across one and two full token tiles
     /// (32 rows: every reducing thread owns its full share of outputs), a partial tile, a
     /// short last slice (K = 384 is three tiles), one tile per slice and many, and two KO
-    /// formats.
+    /// formats. The reducer shares its loads in flight by outputs per thread, so the rows
+    /// also sit on each side of its two thresholds: 4 rows (128 outputs, one per thread),
+    /// 5 and 8 (two), 16 (four).
     #[test]
     fn a_split_is_the_unsplit_kernel_bit_for_bit() -> Result<()> {
         let dev = CudaDevice::new(0)?;
         for (src, m, n, k) in [
             (GgmlDType::Q8_0, 1, 416, 10_240),
+            (GgmlDType::Q8_0, 4, 416, 10_240),
             (GgmlDType::Q8_0, 5, 416, 10_240),
+            (GgmlDType::Q8_0, 8, 416, 10_240),
+            (GgmlDType::Q8_0, 9, 416, 10_240),
             (GgmlDType::Q8_0, 16, 416, 10_240),
             (GgmlDType::Q8_0, 17, 416, 10_240),
             (GgmlDType::Q8_0, 32, 416, 10_240),

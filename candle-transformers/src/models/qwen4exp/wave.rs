@@ -2632,12 +2632,12 @@ impl WaveSweep for Qwen4ExpBatched {
                     .and_then(|g| g.as_ref().map(|c| c.seqs.keys().copied().collect()))
                     .unwrap_or_default();
                 // **The rewind this wave may owe.** `replay_accepted_prefixes`
-                // — the same one the hybrid runs — carves the cohort stash's
-                // operands off THIS Attention span at accept time, and these two
-                // units are what price that chain. Left at zero it prices to
-                // nothing and the span is short by the whole stash. Rows are the
+                // — the same one the hybrid runs — carves its conv, scan and
+                // span table off THIS Attention span at accept time, and these
+                // two units are what price that chain. Left at zero it prices to
+                // nothing and the span is short by the whole chain. Rows are the
                 // stash's CAPACITY, not this cohort's total: the buffers only
-                // grow and `stage_on_wave` stages each operand's full shape.
+                // grow and the replay's kernels run over every stash row.
                 let staged: Option<(usize, usize)> = self
                     .verify
                     .read()

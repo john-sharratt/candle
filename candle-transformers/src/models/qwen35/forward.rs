@@ -989,13 +989,13 @@ fn sweep_layers(
                 prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
                 // **The rewind this wave may owe.** A verify wave's accept can
                 // reject proposals, and the replay that rewinds the recurrence
-                // then carves the cohort stash's four operands per recurrent
-                // layer off THIS span (`replay_accepted_prefixes`). These two
-                // units are what price that chain; left at zero it prices to
-                // nothing, and the span this forward reserves has no room for a
-                // replay that arrives behind it.
+                // then carves its conv, scan and span table per recurrent layer
+                // off THIS span (`replay_accepted_prefixes`). These two units
+                // are what price that chain; left at zero it prices to nothing,
+                // and the span this forward reserves has no room for a replay
+                // that arrives behind it.
                 //
-                // Measured on the 35B-A3B gate at 16 contexts: `ReplayQkv`
+                // Measured on the 35B-A3B gate at 16 contexts: the replay
                 // asking 1,572,864 B of a 240,384 B span — this wave's own
                 // attention price, *smaller* than the one-context case, because
                 // `staged_rows` was 0. Reserved by the forward rather than

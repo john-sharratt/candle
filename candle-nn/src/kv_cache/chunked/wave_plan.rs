@@ -328,14 +328,10 @@ pub fn ffn_work_dtype(act: DType) -> DType {
 /// four projections ask the KO kernel to store F32 out of the accumulator it
 /// already has, and the output projection reads that F32 directly. Only the
 /// final `w_out` result narrows, to whatever the residual stream carries.
-/// A **live** mixer's projections are downstream of a provenance break and
-/// allocate from the CUDA pool, so none of these price a buffer on an ordinary
-/// wave — see the note on the `DeltaNet*` variants. They price the
-/// [`Chain::DeltaNetReplay`] instead: a speculative replay *stages* the same
-/// four operands onto the wave deliberately (`spec::stage_on_wave`), because
-/// the staged copy is the provenance root that keeps the replayed mixer off the
-/// pool. So the widths are unused by the live chain and load-bearing for the
-/// replayed one.
+/// The widths price the live mixer's carves and the [`Chain::DeltaNetReplay`]:
+/// a speculative replay reads the rewind stash in place and carves the conv's
+/// output on the wave as its provenance root, so the conv, the scan and the
+/// span table it builds are sized from these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaNetWidths {
     /// `2 · key_dim + value_dim` — the fused `[Q|K|V]` projection's width.
@@ -858,26 +854,17 @@ pub enum WaveBuffer {
     /// `w_out`'s result, `hidden` wide in the activation dtype.
     DeltaNetLiveOut,
 
-    // ── A speculative replay's staged operands ──────────────────────────────
-    // Measured on the 9B at 30 staged rows over 6 spans: six carves totalling
-    // 1,482,480 B, every one of them `wave_empty` or a table built beside it.
+    // ── A speculative replay's carves ───────────────────────────────────────
     // The 27B is where leaving them undeclared stopped being survivable — 20
-    // rows of `conv_dim` 10240 and `value_dim` 6144 come to 1,318,400 B against
-    // a span priced at 1,216,768, and the replay exhausted it mid-flight.
-    /// The stashed `[Q|K|V]` projection, staged onto the wave in F32.
-    ReplayQkv,
-    /// The stashed `z`, staged likewise.
-    ReplayZ,
-    /// The stashed `beta`, one F32 per V head per staged row.
-    ReplayBeta,
-    /// The stashed `alpha`, the same shape as [`Self::ReplayBeta`].
-    ReplayAlpha,
+    // rows of `conv_dim` 10240 and `value_dim` 6144 came to 1,318,400 B against
+    // a span priced at 1,216,768, and the replay exhausted it mid-flight. The
+    // kernels read the rewind stash in place; only what they write is carved.
     /// The span table's pointer block: four device pointers per span.
     ReplaySpanPtrs,
     /// The span table's extents: two `u32` per span.
     ReplaySpanExtents,
-    /// The replayed causal conv's output, `[staged, conv_dim]` F32, carved
-    /// beside the staged `[Q|K|V]` — the root the scan's carves inherit.
+    /// The replayed causal conv's output, `[staged, conv_dim]` F32 — the
+    /// replay's provenance root, which the table and the scan's carves inherit.
     ReplayConved,
     /// The scan's output rows, `[staged, value_dim]` F32. Discarded — a replay
     /// wants the advanced states — but the kernel writes them.
@@ -1284,15 +1271,13 @@ pub enum Chain {
     /// the attention generation, because it is the same scope — the thing a
     /// layer opens before its FFN.
     DeltaNet,
-    /// A speculative **replay's** staged operands, in that same generation.
+    /// A speculative **replay's** carves, in that same generation.
     ///
-    /// The one chain that is not a *layer's*. `spec::stage_on_wave` copies the
-    /// stashed `qkv`/`z`/`beta`/`alpha` onto the wave before replaying the
-    /// mixer, deliberately: the staged copy is the provenance root that keeps
-    /// the replayed chain off the pool. The two span tables are built
-    /// `from_vec_beside` that copy, so they follow it onto the arena — which is
-    /// also why they do **not** appear on an ordinary wave, where the anchor
-    /// (`qkv`) is itself on the pool.
+    /// The one chain that is not a *layer's*. The replay reads the rewind stash
+    /// in place and carves the conv's output on the wave first, deliberately:
+    /// that carve is the provenance root that keeps the replayed chain off the
+    /// pool. The two span tables are built beside it, so they follow it onto
+    /// the arena.
     DeltaNetReplay,
     /// The **MoE** FFN: the router, the expert gather, the grouped GEMMs and
     /// the combine.
@@ -1410,11 +1395,7 @@ impl WaveBuffer {
             | Self::DeltaNetLiveNormGate
             | Self::DeltaNetLiveOutOperand
             | Self::DeltaNetLiveOut => Chain::DeltaNet,
-            Self::ReplayQkv
-            | Self::ReplayZ
-            | Self::ReplayBeta
-            | Self::ReplayAlpha
-            | Self::ReplaySpanPtrs
+            Self::ReplaySpanPtrs
             | Self::ReplaySpanExtents
             | Self::ReplayConved
             | Self::ReplayOut
@@ -1491,10 +1472,6 @@ impl WaveBuffer {
             | Self::DeltaNetLiveNormGate
             | Self::DeltaNetLiveOutOperand
             | Self::DeltaNetLiveOut
-            | Self::ReplayQkv
-            | Self::ReplayZ
-            | Self::ReplayBeta
-            | Self::ReplayAlpha
             | Self::ReplaySpanPtrs
             | Self::ReplaySpanExtents
             | Self::ReplayConved
@@ -1939,21 +1916,7 @@ impl WaveBuffer {
             // Sized by the **staged** rows and spans, which are zero on every
             // forward but a replay — so this chain drops out of the attention
             // phase's `max` everywhere else.
-            Self::ReplayQkv => dense(
-                w.staged_rows,
-                g.delta_net.map_or(0, |d| d.conv_dim),
-                DType::F32,
-            ),
-            Self::ReplayZ => dense(
-                w.staged_rows,
-                g.delta_net.map_or(0, |d| d.value_dim),
-                DType::F32,
-            ),
-            Self::ReplayBeta | Self::ReplayAlpha => dense(
-                w.staged_rows,
-                g.delta_net.map_or(0, |d| d.n_v_heads),
-                DType::F32,
-            ),
+            //
             // Four device pointers and two extents per span — and nothing at
             // all on a stack with no mixer, which has no recurrent state, so no
             // rewind stash and no replay to build a table for.
@@ -3925,13 +3888,12 @@ mod tests {
         assert_eq!(WaveBuffer::HeadLogitsF32.bytes(&float32, w60), 0);
     }
 
-    /// **A speculative replay's staged operands, against its measured
-    /// generation.**
+    /// **A speculative replay's carves, priced to the byte.**
     ///
-    /// A `wave-census-labels` build on Qwen3.5-9B: six carves, 1,482,480 B, at 30
-    /// staged rows over 6 spans — `conv_dim` 8192 and `value_dim` 4096 in F32,
-    /// two `n_v_heads`-wide scalars, and the span table's 4 pointers and 2
-    /// extents per span.
+    /// Qwen3.5-9B geometry at 30 staged rows over 6 spans — `conv_dim` 8192 and
+    /// `value_dim` 4096 in F32, `n_v_heads` 32, and the span table's 4 pointers
+    /// and 2 extents per span. The stash itself is read in place, so nothing
+    /// prices its operands.
     ///
     /// **And it is charged to nothing else.** The chain is sized by
     /// `staged_rows`/`staged_spans`, which are zero on every ordinary forward,
@@ -3952,10 +3914,6 @@ mod tests {
         let plan = WavePlan::new(g);
         let replay = WaveWidth::replay(30, 6);
         for (b, want) in [
-            (WaveBuffer::ReplayQkv, 30 * 8192 * 4),
-            (WaveBuffer::ReplayZ, 30 * 4096 * 4),
-            (WaveBuffer::ReplayBeta, 30 * 32 * 4),
-            (WaveBuffer::ReplayAlpha, 30 * 32 * 4),
             (WaveBuffer::ReplaySpanPtrs, 6 * 4 * 8),
             (WaveBuffer::ReplaySpanExtents, 6 * 2 * 4),
             (WaveBuffer::ReplayConved, 30 * 8192 * 4),

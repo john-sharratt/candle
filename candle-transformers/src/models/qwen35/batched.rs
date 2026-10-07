@@ -309,16 +309,17 @@ impl HybridBatched {
     /// `None` when no cohort is armed.
     ///
     /// The forward prices this into its Attention span, because the forward is
-    /// what creates the obligation: `replay_accepted_prefixes` carves four
-    /// operands per recurrent layer off that span at accept time, and
-    /// `WaveWidth::replay` is what prices them. A width built with
+    /// what creates the obligation: `replay_accepted_prefixes` carves the conv,
+    /// the scan and the span table per recurrent layer off that span at accept
+    /// time, and `WaveWidth::replay` is what prices them. A width built with
     /// `staged_rows: 0` prices that chain at exactly zero — correct for a wave
-    /// that stages nothing, and short by the whole stash for one that does.
+    /// that owes no replay, and short by the whole chain for one that does.
     ///
     /// **Rows are the stash's CAPACITY, not this cohort's total.** The buffers
-    /// only ever grow, and `stage_on_wave` stages each operand's full shape — so
-    /// a cohort narrower than the high-water mark still carves the high-water
-    /// mark, and pricing the cohort would under-reserve by the difference.
+    /// only ever grow, and the replay's kernels run over the stash's full row
+    /// count — so a cohort narrower than the high-water mark still carves the
+    /// high-water mark, and pricing the cohort would under-reserve by the
+    /// difference.
     pub fn verify_stash_width(&self) -> Result<Option<(usize, usize)>> {
         let slot = self
             .verify_stash

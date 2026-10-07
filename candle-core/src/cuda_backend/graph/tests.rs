@@ -517,6 +517,120 @@ fn per_wave_capture_cost() -> Result<()> {
     Ok(())
 }
 
+/// What `cuGraphExecUpdate` costs on a segment-sized graph by how much of it
+/// changed — nothing, one node's scalar, every node's scalar — against rewriting
+/// one changed node alone with `cuGraphExecKernelNodeSetParams`. Prints µs per
+/// call for each; asserts nothing but that every path took effect.
+#[test]
+#[ignore = "benchmark: cargo test -p candle-core --features cuda --release graph::tests::exec_update_cost_by_change -- --ignored --nocapture"]
+fn exec_update_cost_by_change() -> Result<()> {
+    use cudarc::driver::{result, sys};
+    const NODES: usize = 220;
+    const ROUNDS: usize = 50;
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let stream = dev.cuda_context().new_stream().w()?;
+
+    // One capture of NODES launches; node `i`'s `add` is `adds[i]`.
+    let capture = |adds: &[f32], y: &mut CudaSlice<f32>| -> Result<sys::CUgraph> {
+        // SAFETY: a stream this test owns, not capturing.
+        unsafe {
+            result::stream::begin_capture(
+                stream.cu_stream(),
+                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .w()?;
+        }
+        for &add in adds {
+            launch(&f, &stream, &x, y, 1.0, add)?;
+        }
+        // SAFETY: the capture begun above.
+        unsafe { result::stream::end_capture(stream.cu_stream()).w() }
+    };
+    let base: Vec<f32> = vec![0.0; NODES];
+    let template = capture(&base, &mut y)?;
+    let mut exec: sys::CUgraphExec = std::ptr::null_mut();
+    // SAFETY: a valid graph; default flags.
+    unsafe { sys::cuGraphInstantiateWithFlags(&mut exec, template, 0).result() }.w()?;
+
+    let update = |graph: sys::CUgraph| -> Result<f64> {
+        let mut info = sys::CUgraphExecUpdateResultInfo {
+            result: sys::CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS,
+            errorNode: std::ptr::null_mut(),
+            errorFromNode: std::ptr::null_mut(),
+        };
+        let t = std::time::Instant::now();
+        // SAFETY: a valid executable and a graph of the same topology.
+        unsafe { sys::cuGraphExecUpdate_v2(exec, graph, &mut info).result() }.w()?;
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        assert_eq!(
+            info.result,
+            sys::CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS
+        );
+        // SAFETY: a graph this test captured, destroyed once.
+        unsafe { result::graph::destroy(graph) }.w()?;
+        Ok(us)
+    };
+    let (mut same, mut one, mut all, mut set_one) = (0.0, 0.0, 0.0, 0.0);
+    for round in 0..ROUNDS {
+        let r = round as f32 + 1.0;
+        same += update(capture(&base, &mut y)?)?;
+        let mut adds = base.clone();
+        adds[NODES / 2] = r;
+        one += update(capture(&adds, &mut y)?)?;
+        let adds: Vec<f32> = (0..NODES).map(|i| r + i as f32).collect();
+        all += update(capture(&adds, &mut y)?)?;
+
+        // One node's parameters, rewritten in the executable directly: the
+        // fresh capture supplies them, the template supplies the node handle.
+        let mut adds = base.clone();
+        adds[NODES / 2] = r;
+        let fresh = capture(&adds, &mut y)?;
+        let nodes_of = |g: sys::CUgraph| -> Result<Vec<sys::CUgraphNode>> {
+            let mut n = NODES;
+            let mut v = vec![std::ptr::null_mut(); NODES];
+            // SAFETY: `v` holds `n` slots.
+            unsafe { sys::cuGraphGetNodes(g, v.as_mut_ptr(), &mut n).result() }.w()?;
+            Ok(v)
+        };
+        let (old, new) = (nodes_of(template)?, nodes_of(fresh)?);
+        let mut p = std::mem::MaybeUninit::<sys::CUDA_KERNEL_NODE_PARAMS>::uninit();
+        // SAFETY: a kernel node of `fresh`; the driver fills the parameters.
+        let p = unsafe {
+            sys::cuGraphKernelNodeGetParams_v2(new[NODES / 2], p.as_mut_ptr())
+                .result()
+                .w()?;
+            p.assume_init()
+        };
+        let t = std::time::Instant::now();
+        // SAFETY: the executable's own node, parameters of the same function.
+        unsafe { sys::cuGraphExecKernelNodeSetParams_v2(exec, old[NODES / 2], &p).result() }.w()?;
+        set_one += t.elapsed().as_secs_f64() * 1e6;
+        // SAFETY: a graph this test captured, destroyed once.
+        unsafe { result::graph::destroy(fresh) }.w()?;
+    }
+    // SAFETY: the executable and template this test made, launched and destroyed once.
+    unsafe {
+        sys::cuGraphLaunch(exec, stream.cu_stream()).result().w()?;
+        stream.synchronize().w()?;
+        sys::cuGraphExecDestroy(exec).result().w()?;
+        result::graph::destroy(template).w()?;
+    }
+    let r = ROUNDS as f64;
+    println!(
+        "{NODES}-node exec update, µs per call: nothing changed {:.1} | one node {:.1} | \
+         every node {:.1} || one node via SetParams {:.2}",
+        same / r,
+        one / r,
+        all / r,
+        set_one / r
+    );
+    Ok(())
+}
+
 /// What the capturing thread's own null-stream calls do while a capture is
 /// open: a synchronise, a readback, a host upload and a pool allocation.
 /// Prints each outcome and whether the capture survived it.
