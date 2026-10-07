@@ -19,6 +19,14 @@ pub const DELTA_NET_PREFILL_CHUNK: usize = 64;
 /// Other widths take the tensor-op fallback in `delta_chunked`.
 pub const DELTA_NET_PREFILL_DIM: usize = 128;
 
+/// Pointers per layer in a prefill launch's layer table, in the kernels'
+/// `DnLayerOps` order: conv input, conv weights, alpha, beta_lin, dt_bias, a.
+pub const DELTA_NET_LAYER_OPS: usize = 6;
+
+/// The most `(layer, span)` pairs one prefill launch covers — the grid's
+/// z extent. The launchers refuse a stack past it.
+pub const DELTA_NET_MAX_LAYER_SPANS: usize = 65_535;
+
 extern "C" {
     /// One gated-delta-rule token step per decode sequence, batched over the
     /// wave: grid `(n_v_heads, n_decode)`. Each sequence's state lives in its
@@ -101,6 +109,14 @@ extern "C" {
     /// `tail_out [channels, kwidth−1]` (the advanced RAW tail; a separate
     /// buffer because blocks computing the first `kwidth−1` outputs read the
     /// entering tail concurrently). `qk_channels`/`eps` as in the conv step.
+    ///
+    /// **The layer stack.** With `layers` non-null, the launch replays
+    /// `n_layers` recurrent layers at once: `layers` is a device table of
+    /// [`DELTA_NET_LAYER_OPS`] pointers per layer (conv input, conv weights,
+    /// alpha, beta_lin, dt_bias, a — the last four read by the intra pass), and
+    /// `y_wave [n_layers, t_wave, channels]` / `ptrs [n_layers, 4, n_spans]` are
+    /// stacked by layer; `x_wave`/`kernel` are then ignored. Null `layers` with
+    /// `n_layers == 1` is the single-layer launch every forward makes.
     pub fn run_delta_net_conv_prefill_f32(
         x_wave: *const f32,
         kernel: *const f32,
@@ -108,6 +124,9 @@ extern "C" {
         ptrs: *const i64,
         spans: *const u32,
         n_spans: i32,
+        layers: *const i64,
+        n_layers: i32,
+        t_wave: i32,
         max_len: i32,
         channels: i32,
         kwidth: i32,
@@ -127,6 +146,10 @@ extern "C" {
     /// emits `u`/`w [n_v_heads, t_len, 128]`,
     /// `kq [n_v_heads, t_len, DELTA_NET_PREFILL_CHUNK]` (rows valid for
     /// `s ≤ t` only) and `g_cs [n_v_heads, t_len]`.
+    ///
+    /// With `layers` non-null (see [`run_delta_net_conv_prefill_f32`]) the
+    /// gate projections and constants come from the table, and the conv output
+    /// (`t_tran` rows a layer) and every transient are stacked by layer.
     pub fn run_delta_net_prefill_intra_f32(
         qk_wave: *const f32,
         v_wave: *const f32,
@@ -140,6 +163,8 @@ extern "C" {
         g_cs: *mut f32,
         spans: *const u32,
         n_spans: i32,
+        layers: *const i64,
+        n_layers: i32,
         max_len: i32,
         t_tran: i32,
         n_v_heads: i32,
@@ -156,6 +181,10 @@ extern "C" {
     /// output `o [.., n_v_heads·128]`, and updates `state [n_v_heads, 128,
     /// 128]` in place in the stored orientation. `qk`/`tok_stride` as in the
     /// intra kernel.
+    ///
+    /// With `layers` non-null every buffer is stacked by layer — the conv
+    /// output, the transients, `o` (`t_tran` rows a layer) and `ptrs` — and the
+    /// table itself is not read: this pass touches only what the launch carved.
     pub fn run_delta_net_prefill_state_f32(
         qk_wave: *const f32,
         u: *const f32,
@@ -166,6 +195,8 @@ extern "C" {
         ptrs: *const i64,
         spans: *const u32,
         n_spans: i32,
+        layers: *const i64,
+        n_layers: i32,
         t_tran: i32,
         n_v_heads: i32,
         n_k_heads: i32,

@@ -56,9 +56,9 @@ use candle_nn::kv_cache::{relocate_tensor, ArenaSlot};
 
 #[cfg(feature = "cuda")]
 use crate::models::latent_moe::scatter::{rows_scatter_inline, RowRun};
-#[cfg(feature = "cuda")]
-use crate::models::operand_guard::expect_dense_dtype;
 
+#[cfg(feature = "cuda")]
+use super::replay_stack::{delta_net_replay_stack, ReplaySpan, ReplayStates, StackedLayer};
 use super::types::{DeltaNetDims, ZGate};
 
 /// The carried per-sequence state of one DeltaNet layer.
@@ -1823,41 +1823,26 @@ pub fn delta_net_advance_spans(
             }),
         ],
     );
+    // A one-layer stack: the replay's one CUDA implementation, which the
+    // speculative rewind runs over every recurrent layer at once. Its tables
+    // and transients land beside `conved`, where the caller carved the conv
+    // (`WaveBuffer::Replay*`); the conv writes every row of every span and the
+    // scan reads only those, so `conved` arrives uninitialised (invariant 6).
     #[cfg(feature = "cuda")]
     if replay_ok {
-        expect_dense_dtype(conved, DType::F32, "replay conved")?;
-        if conved.dims() != [t, dims.conv_dim()] {
-            candle::bail!(
-                "delta_net_advance_spans: conved is {:?}, the replay convolves [{t}, {}]",
-                conved.dims(),
-                dims.conv_dim()
-            );
-        }
-        // Beside `conved`, so the whole replay chain — the span table, the
-        // scan's transients and its output — lands where the caller carved the
-        // conv (`WaveBuffer::Replay*`). The conv writes every row of every span
-        // and the scan reads only those, so `conved` arrives uninitialised
-        // (invariant 6); the gap rows are never touched.
-        let spans = super::cuda::build_span_table_all(seqs, conved)?;
-        super::cuda::delta_net_conv_prefill(
-            &p.qkv,
-            c.conv,
-            &spans,
-            2 * dims.key_dim(),
-            rms_eps as f32,
-            conved,
-        )?;
-        let o = conved.empty_beside((t, dims.value_dim()), DType::F32)?;
-        let fused = super::cuda::DeltaNetFused {
-            conved,
-            alpha: &p.alpha_lin,
-            blin: &p.beta_lin,
-            dt_bias: c.dt_bias,
-            a: c.a,
-            o: &o,
-            q_scale: (1.0 / (d as f64).sqrt()) as f32,
-        };
-        return super::cuda::delta_net_prefill_scan(&fused, &spans);
+        let states = seqs
+            .iter()
+            .map(|s| ReplayStates::of(s.state, &s.out, dims))
+            .collect::<Result<Vec<_>>>()?;
+        let spans: Vec<ReplaySpan> = seqs
+            .iter()
+            .map(|s| ReplaySpan {
+                start: s.start,
+                len: s.len,
+            })
+            .collect();
+        let layer = StackedLayer { p, c, states };
+        return delta_net_replay_stack(&[layer], &spans, dims, rms_eps as f32, conved);
     }
 
     // Reference path: each span through the full mixer over its own rows,

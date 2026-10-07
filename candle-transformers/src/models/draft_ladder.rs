@@ -404,6 +404,10 @@ pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS, 
 /// on free continuation the rule settles near 2 under either ceiling, so the
 /// one-session rate is quoted at the depth real text drafts at.
 ///
+/// **A one-session ceiling of 5 loses** (Strata's benchmark, 2026-10-07): 3.0–3.45
+/// accepted / step against ~3.07 at 4, for ~2 ms more per step — 143.2 / 140.1 /
+/// 110.3 t/s at 4K / 32K / 128K against 148.0 / 145.2 / 122.2.
+///
 /// **The token cost, 0.125, is the essay's measured `c / T0` and tuned on both
 /// tasks.** A drafted token costs `1.4 / 16.5 ≈ 0.085` of the step on the
 /// rewrite's ~1.3K-token context and `2.3 / 18.4 ≈ 0.125` on the essay's ~4.3K —

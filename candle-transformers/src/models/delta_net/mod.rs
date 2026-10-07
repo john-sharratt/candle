@@ -22,6 +22,8 @@ pub mod mix;
 /// scatter is a kernel wrapper, so it shares that module's gate.
 #[cfg(feature = "cuda")]
 pub mod quantized;
+#[cfg(feature = "cuda")]
+pub mod replay_stack;
 pub mod state_store;
 pub mod types;
 

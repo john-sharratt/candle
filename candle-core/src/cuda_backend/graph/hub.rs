@@ -61,6 +61,11 @@ pub struct CaptureStats {
     pub reshaped_us: u64,
     /// Host time, in µs, instantiating and uploading segments.
     pub instantiated_us: u64,
+    /// Host time, in µs, segments spent recording — from the capture's start to
+    /// its end, everything the forward thread did to issue the segment's
+    /// launches. Against the device time of the segment before it, this says
+    /// whether the host keeps ahead of the GPU at a segment boundary.
+    pub recording_us: u64,
     /// Graph nodes launched — kernels, memsets, device copies and event
     /// records alike.
     pub nodes: u64,
@@ -181,6 +186,8 @@ struct Wave {
     /// A resume that failed inside a guard's `drop`, reported at the next
     /// segment boundary.
     error: Option<String>,
+    /// When the recording segment began, for [`CaptureStats::recording_us`].
+    recording_since: Option<Instant>,
 }
 
 /// One forward's wave capture on the thread that opened it — see
@@ -243,7 +250,10 @@ impl Drop for Paused<'_> {
         let resumed = st.hand_to_compute().and_then(|()| begin(&capture));
         let wave = st.wave.as_mut().expect("checked above");
         match resumed {
-            Ok(()) => wave.recording = true,
+            Ok(()) => {
+                wave.recording = true;
+                wave.recording_since = Some(Instant::now());
+            }
             Err(e) => wave.error = Some(e.to_string()),
         }
     }
@@ -335,6 +345,7 @@ impl CaptureHub {
             held: true,
             segment: 0,
             error: None,
+            recording_since: None,
         });
         // The tag before the flag: a thread that sees the wave active reads
         // its owner's tag.
@@ -364,7 +375,9 @@ impl CaptureHub {
             // run before anything recorded from here.
             st.hand_to_compute()?;
             begin(&capture.expect("a wave has a capture stream"))?;
-            st.wave.as_mut().expect("checked above").recording = true;
+            let wave = st.wave.as_mut().expect("checked above");
+            wave.recording = true;
+            wave.recording_since = Some(Instant::now());
         }
         Ok(())
     }
@@ -385,6 +398,10 @@ impl CaptureHub {
             return Ok(());
         }
         wave.recording = false;
+        if let Some(since) = wave.recording_since.take() {
+            st.stats.recording_us += since.elapsed().as_micros() as u64;
+        }
+        let wave = st.wave.as_mut().expect("called inside a wave");
         capture.context().bind_to_thread().w()?;
         // SAFETY: this wave began the capture on the hub's stream.
         let graph = unsafe { result::stream::end_capture(capture.cu_stream()) }.w()?;

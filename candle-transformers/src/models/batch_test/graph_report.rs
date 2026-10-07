@@ -16,16 +16,19 @@ pub(crate) fn graph_line(before: &CaptureStats, after: &CaptureStats) -> String 
     let in_place_us = after.in_place_us - before.in_place_us;
     let reshaped_us = after.reshaped_us - before.reshaped_us;
     let instantiated_us = after.instantiated_us - before.instantiated_us;
+    let recording_us = after.recording_us - before.recording_us;
     let per = |n: u64, d: u64| if d == 0 { 0.0 } else { n as f64 / d as f64 };
     format!(
         "  graphs: {waves} waves, {:.1} segments/wave, {:.1} launches/segment, \
          {updated} updated in place ({reshaped} reshaped), {instantiated} instantiated; \
-         fold µs each: in place {:.1}, reshaped {:.1}, instantiated {:.1}",
+         fold µs each: in place {:.1}, reshaped {:.1}, instantiated {:.1}; \
+         recording µs/segment {:.1}",
         per(segments, waves),
         per(nodes, segments),
         per(in_place_us, updated - reshaped),
         per(reshaped_us, reshaped),
         per(instantiated_us, instantiated),
+        per(recording_us, segments),
     )
 }
 
@@ -49,6 +52,7 @@ mod tests {
             in_place_us: 1_000,
             reshaped_us: 9_000,
             instantiated_us: 5_000,
+            recording_us: 10_000,
         };
         let after = CaptureStats {
             waves: 7,
@@ -60,12 +64,14 @@ mod tests {
             in_place_us: 8_750,
             reshaped_us: 12_500,
             instantiated_us: 6_000,
+            recording_us: 26_400,
         };
         assert_eq!(
             graph_line(&before, &after),
             "  graphs: 4 waves, 41.0 segments/wave, 25.0 launches/segment, \
              162 updated in place (7 reshaped), 2 instantiated; \
-             fold µs each: in place 50.0, reshaped 500.0, instantiated 500.0"
+             fold µs each: in place 50.0, reshaped 500.0, instantiated 500.0; \
+             recording µs/segment 100.0"
         );
     }
 
@@ -76,7 +82,8 @@ mod tests {
             graph_line(&s, &s),
             "  graphs: 0 waves, 0.0 segments/wave, 0.0 launches/segment, \
              0 updated in place (0 reshaped), 0 instantiated; \
-             fold µs each: in place 0.0, reshaped 0.0, instantiated 0.0"
+             fold µs each: in place 0.0, reshaped 0.0, instantiated 0.0; \
+             recording µs/segment 0.0"
         );
     }
 }

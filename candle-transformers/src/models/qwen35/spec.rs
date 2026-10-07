@@ -29,16 +29,16 @@
 //! whole point of the rewind is that the sequence cannot tell speculation
 //! happened.
 //!
-//! The replay runs through [`delta_net_mix_spans`] — the same function the wave
-//! ran, not a second transcription of it — so it takes whichever path the wave
-//! took (fused CUDA kernels or the tensor-op reference) and matches it by
-//! construction. Its output activations are discarded; only the advanced state
-//! is wanted.
+//! The replay runs the same arithmetic the wave ran, not a second transcription
+//! of it: on the device the very prefill kernels the wave launched
+//! (`delta_net::replay_stack`), elsewhere the tensor-op reference the kernels
+//! are parity-locked to. Its output activations are discarded; only the
+//! advanced state is wanted.
 //!
-//! Cost, for a block of `k` proposals accepted at `m`: `n_deltanet_layers`
-//! mixer calls over `m ≤ k+1` rows, against a whole forward's 48 layers of
-//! projections, attention, and a 512-expert MoE. On the measured hybrid that is
-//! a few percent of the wave it lets us skip.
+//! Cost, for a block of `k` proposals accepted at `m`: the mixer over `m ≤ k+1`
+//! rows in every DeltaNet layer — on the device one launch triple for a stack of
+//! layers, since no layer's replay reads another's — against a whole forward's
+//! 48 layers of projections, attention, and a 512-expert MoE.
 
 #[cfg(feature = "cuda")]
 use std::collections::HashMap;
@@ -47,6 +47,14 @@ use std::sync::Arc;
 
 use candle::{DType, Device, Result, Tensor};
 
+#[cfg(feature = "cuda")]
+use crate::models::delta_net::cuda::DELTA_NET_PREFILL_DIM;
+#[cfg(feature = "cuda")]
+use crate::models::delta_net::replay_stack::{
+    delta_net_replay_stack, ReplaySpan, ReplayStates, StackedLayer,
+};
+#[cfg(feature = "cuda")]
+use crate::models::delta_net::DeltaNetProjections;
 use crate::models::delta_net::{
     delta_net_advance_spans, DeltaNetConstants, DeltaNetDims, DeltaNetOut, DeltaNetSeq,
     DeltaNetState, LayerKind, RecurrentStateStore, SpanOperands,
@@ -55,13 +63,13 @@ use crate::models::delta_net::{
 use crate::models::wave_buffers::wave_empty;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    begin_wave, claim_arena_slots, plan_slot_moves, slot_stride, ArenaSlot, LayerPhase, SlotTenant,
-    WaveGeneration,
+    begin_wave, claim_arena_slots, plan_slot_moves, slot_stride, ArenaSlot, DeltaNetWidths,
+    LayerPhase, SlotTenant, WaveGeneration,
 };
 
 /// The COHORT's stashed speculative blocks: every verifying sequence's rows in
 /// one set of shared buffers, so the replay that consumes them advances every
-/// sequence's state in one batched launch per layer.
+/// sequence's state, in a stack of layers, in one batched launch.
 ///
 /// `layers` is in sweep order — the same order
 /// [`RecurrentStateStore::recurrent_layer_indices`] yields, because both walk
@@ -338,9 +346,10 @@ pub struct ReplayLayer<'a> {
 }
 
 /// Advance each rewinding sequence's recurrent state to its accepted prefix,
-/// from the state the block was entered with — the whole cohort in one batched
-/// launch pair per recurrent layer, through the same span-table kernels the
-/// verify wave itself ran.
+/// from the state the block was entered with — on the device, the whole cohort
+/// across a stack of recurrent layers in one launch triple
+/// ([`replay_stacked`]), through the same span-table kernels the verify wave
+/// itself ran.
 ///
 /// Call **once per step**, immediately after the verify wave committed and
 /// before any other wave touches these sequences: the entering states live in
@@ -414,6 +423,20 @@ pub fn replay_accepted_prefixes(
             stash.filled.len(),
         );
     }
+    for (ord, &li) in layer_indices.iter().enumerate() {
+        if layers[ord].layer_index != li {
+            candle::bail!(
+                "verify replay: layer {} supplied where the store's ordinal {ord} is layer \
+                 {li} — a replay against the wrong layer's constants advances the state \
+                 silently and wrongly",
+                layers[ord].layer_index
+            );
+        }
+    }
+    #[cfg(feature = "cuda")]
+    if device.is_cuda() && dims.head_dim == DELTA_NET_PREFILL_DIM {
+        return replay_stacked(layers, dims, eps, device, stash, &mut short, &layer_indices);
+    }
 
     // **A generation for the replay, because the stash has no provenance to
     // lend.**
@@ -446,14 +469,6 @@ pub fn replay_accepted_prefixes(
     // lifetime a forward gives its phases.
     for (ord, &li) in layer_indices.iter().enumerate() {
         let entry = &layers[ord];
-        if entry.layer_index != li {
-            candle::bail!(
-                "verify replay: layer {} supplied where the store's ordinal {ord} is layer \
-                 {li} — a replay against the wrong layer's constants advances the state \
-                 silently and wrongly",
-                entry.layer_index
-            );
-        }
         #[cfg(feature = "cuda")]
         let wave: Option<WaveGeneration> = match device {
             Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
@@ -493,6 +508,89 @@ pub fn replay_accepted_prefixes(
         // tokens' logits were already produced from. Only the states are
         // wanted, and every sequence's advances in ONE launch pair.
         delta_net_advance_spans(&p, c, dims, &mut seqs, eps, &conved)?;
+    }
+    Ok(())
+}
+
+/// [`replay_accepted_prefixes`] on the device: the recurrent layers in stacks
+/// of [`DeltaNetWidths::replay_stack`], one launch triple a stack.
+///
+/// **The stack is sized from the stash's whole cohort, not from the spans that
+/// rewind.** The verify forward priced the replay's carves from the stash's
+/// capacity and its span count — it ran before anyone knew which blocks would
+/// be cut short — and fewer spans make a layer cheaper, so sizing from the
+/// short ones could stack more layers than the forward reserved room for.
+///
+/// One generation per stack, for the reason the per-layer path holds one per
+/// layer: a stack's carves are what the forward priced for one replay launch,
+/// and the guard's drop returns them before the next stack asks.
+#[cfg(feature = "cuda")]
+fn replay_stacked(
+    layers: &[ReplayLayer<'_>],
+    dims: &DeltaNetDims,
+    eps: f64,
+    device: &Device,
+    stash: &VerifyStash,
+    short: &mut [&mut (StashSpan, usize, &mut RecurrentStateStore)],
+    layer_indices: &[usize],
+) -> Result<()> {
+    let Device::Cuda(cuda) = device else {
+        candle::bail!("qwen35 verify replay: the stacked replay runs on a CUDA device");
+    };
+    let rows = stash.capacity()?;
+    let widths = DeltaNetWidths {
+        conv_dim: dims.conv_dim(),
+        value_dim: dims.value_dim(),
+        n_v_heads: dims.n_v_heads,
+        layers: layer_indices.len(),
+    };
+    let per = widths.replay_stack(rows, stash.spans.len());
+    if per == 0 {
+        candle::bail!(
+            "qwen35 verify replay: a {rows}-row stash over {} spans stacks no layer",
+            stash.spans.len()
+        );
+    }
+    let spans: Vec<ReplaySpan> = short
+        .iter()
+        .map(|job| ReplaySpan {
+            start: job.0.row,
+            len: job.1,
+        })
+        .collect();
+    let projections: Vec<DeltaNetProjections<'static>> =
+        stash.layers.iter().map(|l| l.all_rows()).collect();
+    for first in (0..layer_indices.len()).step_by(per) {
+        let ords = first..(first + per).min(layer_indices.len());
+        let mut stacked: Vec<StackedLayer<'_, '_>> = Vec::with_capacity(ords.len());
+        for ord in ords.clone() {
+            let li = layer_indices[ord];
+            // Each store's two halves of this layer, read as addresses: the
+            // half the block entered with, and the live one the shorter advance
+            // replaces. The borrow ends with the read; the buffers stay where
+            // the stores hold them for the launch below.
+            let states = short
+                .iter_mut()
+                .map(|job| {
+                    let (entering, out) = job.2.layer_state_rewind(li)?;
+                    ReplayStates::of(entering, &out, dims)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            stacked.push(StackedLayer {
+                p: &projections[ord],
+                c: &layers[ord].consts,
+                states,
+            });
+        }
+        let wave = begin_wave(&cuda.cuda_stream(), LayerPhase::Attention)?;
+        // Uninitialised: the conv writes every row the scan reads (invariant 6).
+        let conved = wave_empty(
+            (ords.len() * rows, dims.conv_dim()),
+            DType::F32,
+            device,
+            Some(&wave),
+        )?;
+        delta_net_replay_stack(&stacked, &spans, dims, eps as f32, &conved)?;
     }
     Ok(())
 }

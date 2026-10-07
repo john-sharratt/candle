@@ -102,6 +102,35 @@ struct DnSpan {
     int          len;
 };
 
+// ============================================================================
+// The layer stack — a speculative rewind's form of the same launch.
+//
+// A rewind replays the accepted prefix through EVERY recurrent layer, and no
+// layer's replay reads another's output: each starts from its own entering
+// state and its own stashed operands. So the layers are as independent as the
+// spans are, and they take the same answer — one launch for the stack, with
+// `blockIdx.z = layer · n_spans + span`.
+//
+// What differs per layer comes in two kinds:
+//   * operands that live in their own allocations (the stashed projections,
+//     the layer's constants) — read from a `DnLayerOps` table;
+//   * buffers the launch itself carves (the conv output, the scan transients,
+//     the discarded output, the span pointer rows) — stacked by layer in one
+//     allocation each, so the layer's slice is a fixed stride from the base.
+//
+// `layers == nullptr` is the single-layer launch the forward makes: every
+// pointer argument is the layer's own and the layer index is 0. One kernel
+// serves both, so a rewind retraces the wave's arithmetic by construction.
+// ============================================================================
+struct DnLayerOps {
+    const float* x;       // the conv's raw input rows [T, C]
+    const float* kernel;  // the conv weights [C, K]
+    const float* alpha;   // raw decay-gate projection [T, h_v]
+    const float* blin;    // raw beta projection [T, h_v]
+    const float* dt_bias; // [h_v]
+    const float* a_neg;   // [h_v]
+};
+
 __device__ __forceinline__ DnSpan dn_span(
         const long long* __restrict__ ptrs,
         const unsigned int* __restrict__ spans,
@@ -128,15 +157,19 @@ __device__ __forceinline__ DnSpan dn_span(
 // t < K−1 are still reading the entering tail.
 //
 // One launch for every span in the wave: `blockIdx.z` picks the span, and
-// `x`/`y` are the whole packed buffers rebased by its `start`.
+// `x`/`y` are the whole packed buffers rebased by its `start`. With a layer
+// table, `blockIdx.z` picks the (layer, span) pair and `y`/`ptrs` are the
+// layer-stacked buffers.
 // ============================================================================
 static __global__ void delta_net_conv_prefill_f32_kernel(
         const float* __restrict__ x_wave,  // [T_wave, C]
         const float* __restrict__ kernel,  // [C, K]
-        float*       __restrict__ y_wave,  // [T_wave, C]
-        const long long*    __restrict__ ptrs,
+        float*       __restrict__ y_wave,  // [layers, T_wave, C]
+        const long long*    __restrict__ ptrs,   // [layers, 4, n_spans]
         const unsigned int* __restrict__ spans,
         int n_spans,
+        const DnLayerOps* __restrict__ layers,   // null: one layer, the args
+        int t_wave,
         int channels,
         int kwidth,
         int qk_channels,
@@ -144,7 +177,15 @@ static __global__ void delta_net_conv_prefill_f32_kernel(
     __shared__ float red[256];
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
-    const DnSpan sp = dn_span(ptrs, spans, n_spans, blockIdx.z);
+    const int layer = (int)blockIdx.z / n_spans;
+    const int z = (int)blockIdx.z - layer * n_spans;
+    if (layers != nullptr) {
+        x_wave = layers[layer].x;
+        kernel = layers[layer].kernel;
+        y_wave += (size_t)layer * t_wave * channels;
+        ptrs += (size_t)layer * 4 * n_spans;
+    }
+    const DnSpan sp = dn_span(ptrs, spans, n_spans, z);
     const int t = blockIdx.y;
     // The launch is a rectangle over the WIDEST span, so shorter spans leave
     // block rows with no token. `t` is `blockIdx.y`, so this is uniform across
@@ -213,7 +254,9 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
         float*       __restrict__ g_cs,      // [h_v, T_tran]
         const unsigned int* __restrict__ spans,
         int n_spans,
-        int t_tran,     // rows per head of the shared transients
+        const DnLayerOps* __restrict__ layers, // null: one layer, the args
+        int t_tran,     // rows per head of the shared transients, and rows of
+                        // the conv output a layer's slice holds
         int n_v_heads,
         int n_k_heads,
         int tok_stride, // conv_dim: q, k and v are strided views of one buffer
@@ -227,7 +270,22 @@ static __global__ void delta_net_prefill_intra_f32_kernel(
     float* sg = sA + rows * DNP_ALD;           // [C] G cumsum
     float* sb = sg + DNP_CHUNK;                // [C] β
 
-    const int z = blockIdx.z;
+    const int layer = (int)blockIdx.z / n_spans;
+    const int z = (int)blockIdx.z - layer * n_spans;
+    if (layers != nullptr) {
+        const size_t conv_slice = (size_t)layer * t_tran * tok_stride;
+        const size_t head_rows = (size_t)layer * n_v_heads * t_tran;
+        qk_wave += conv_slice;
+        v_wave += conv_slice;
+        alpha_wave = layers[layer].alpha;
+        blin_wave = layers[layer].blin;
+        dt_bias = layers[layer].dt_bias;
+        a_neg = layers[layer].a_neg;
+        u += head_rows * DNP_DIM;
+        w += head_rows * DNP_DIM;
+        kq += head_rows * DNP_CHUNK;
+        g_cs += head_rows;
+    }
     const int span_start = (int)spans[z];
     const int t_len = (int)spans[n_spans + z];
     const int t0 = blockIdx.x * DNP_CHUNK;
@@ -429,6 +487,7 @@ static __global__ void delta_net_prefill_state_f32_kernel(
         const long long*    __restrict__ ptrs,
         const unsigned int* __restrict__ spans,
         int n_spans,
+        int n_layers_stacked, // > 0: every buffer is layer-stacked
         int t_tran,
         int n_v_heads,
         int n_k_heads,
@@ -442,7 +501,22 @@ static __global__ void delta_net_prefill_state_f32_kernel(
     float* sgd   = sge + DNP_CHUNK;                  // e^{G_last − G}
     __shared__ float s_decay;                        // e^{G_last}
 
-    const DnSpan sp = dn_span(ptrs, spans, n_spans, blockIdx.z);
+    // Every operand this pass reads is one the launch carved — the conv output,
+    // the scan transients, the output, the span pointers — so a layer stack
+    // needs no operand table here, only the slice strides.
+    const int layer = (int)blockIdx.z / n_spans;
+    const int z = (int)blockIdx.z - layer * n_spans;
+    if (n_layers_stacked > 0) {
+        const size_t head_rows = (size_t)layer * n_v_heads * t_tran;
+        qk_wave += (size_t)layer * t_tran * tok_stride;
+        u += head_rows * DNP_DIM;
+        w += head_rows * DNP_DIM;
+        kq += head_rows * DNP_CHUNK;
+        g_cs += head_rows;
+        o_wave += head_rows * DNP_DIM;
+        ptrs += (size_t)layer * 4 * n_spans;
+    }
+    const DnSpan sp = dn_span(ptrs, spans, n_spans, z);
     const int t_len = sp.len;
     const float* __restrict__ state = sp.state;
     float* __restrict__ state_out = sp.state_out;
@@ -655,6 +729,9 @@ static inline void launch_conv_prefill_f32(
         const long long* ptrs,
         const unsigned int* spans,
         int n_spans,
+        const DnLayerOps* layers,
+        int n_layers,
+        int t_wave,
         int max_len,
         int channels,
         int kwidth,
@@ -662,14 +739,17 @@ static inline void launch_conv_prefill_f32(
         float eps,
         cudaStream_t stream) {
     if (n_spans <= 0 || max_len <= 0 || channels <= 0 || kwidth <= 1) return;
+    // A layer stack needs its operand table; a single layer reads the args.
+    if (n_layers <= 0 || (n_layers > 1 && layers == nullptr)) return;
+    if ((long long)n_layers * n_spans > 65535) return;
     // The epilogue's norm reduction is block-local; a block must hold whole
     // head groups, which qk_channels = h_k·256 guarantees at 256 threads.
     if (qk_channels < 0 || qk_channels > channels || qk_channels % 256 != 0) return;
     const int threads = 256;
-    dim3 grid((channels + threads - 1) / threads, max_len, n_spans);
+    dim3 grid((channels + threads - 1) / threads, max_len, n_layers * n_spans);
     delta_net_conv_prefill_f32_kernel<<<grid, threads, 0, stream>>>(
-        x_wave, kernel, y_wave, ptrs, spans, n_spans, channels, kwidth,
-        qk_channels, eps);
+        x_wave, kernel, y_wave, ptrs, spans, n_spans, layers, t_wave, channels,
+        kwidth, qk_channels, eps);
 }
 
 static inline void launch_prefill_intra_f32(
@@ -685,6 +765,8 @@ static inline void launch_prefill_intra_f32(
         float* g_cs,
         const unsigned int* spans,
         int n_spans,
+        const DnLayerOps* layers,
+        int n_layers,
         int max_len,
         int t_tran,
         int n_v_heads,
@@ -693,6 +775,8 @@ static inline void launch_prefill_intra_f32(
         float q_scale,
         cudaStream_t stream) {
     if (n_spans <= 0 || max_len <= 0 || n_v_heads <= 0 || n_k_heads <= 0) return;
+    if (n_layers <= 0 || (n_layers > 1 && layers == nullptr)) return;
+    if ((long long)n_layers * n_spans > 65535) return;
     // The row buffers hold the longest chunk any block of this launch walks,
     // rounded up to the A/kq grid's 4-wide j-tile: a tile reads k rows jt..jt+3
     // whole, past c_len when c_len is not a multiple of 4, and those reads must
@@ -716,10 +800,11 @@ static inline void launch_prefill_intra_f32(
     // top of the kernel. A rectangle wastes at most `max_len − len` block rows
     // per span, which is nothing against the launch it replaces.
     const int n_chunks = (max_len + DNP_CHUNK - 1) / DNP_CHUNK;
-    dim3 grid(n_chunks, n_v_heads, n_spans);
+    dim3 grid(n_chunks, n_v_heads, n_layers * n_spans);
     delta_net_prefill_intra_f32_kernel<<<grid, DNP_THREADS, smem_bytes, stream>>>(
         qk_wave, v_wave, alpha_wave, blin_wave, dt_bias, a_neg, u, w, kq, g_cs,
-        spans, n_spans, t_tran, n_v_heads, n_k_heads, tok_stride, q_scale, rows);
+        spans, n_spans, layers, t_tran, n_v_heads, n_k_heads, tok_stride,
+        q_scale, rows);
 }
 
 static inline void launch_prefill_state_f32(
@@ -732,6 +817,8 @@ static inline void launch_prefill_state_f32(
         const long long* ptrs,
         const unsigned int* spans,
         int n_spans,
+        const DnLayerOps* layers, // read for presence only: see the kernel
+        int n_layers,
         int t_tran,
         int n_v_heads,
         int n_k_heads,
@@ -739,6 +826,9 @@ static inline void launch_prefill_state_f32(
         float q_scale,
         cudaStream_t stream) {
     if (n_spans <= 0 || n_v_heads <= 0 || n_k_heads <= 0) return;
+    const bool stacked = layers != nullptr;
+    if (n_layers <= 0 || (n_layers > 1 && !stacked)) return;
+    if ((long long)n_layers * n_spans > 65535) return;
     // ~43 KB — deliberately under the 48 KB default so two blocks share an SM.
     const int smem_bytes = (DNP_TV * DNP_SLD + DNP_TH * DNP_SLD +
                             DNP_CHUNK * DNP_VLD + 2 * DNP_CHUNK) *
@@ -746,10 +836,11 @@ static inline void launch_prefill_state_f32(
     // No span dimension in the grid's extent beyond `n_spans`: this pass walks
     // its span's chunks serially inside the block, so its shape never depended
     // on the length.
-    dim3 grid(n_v_heads, DNP_DIM / DNP_TV, n_spans);
+    dim3 grid(n_v_heads, DNP_DIM / DNP_TV, n_layers * n_spans);
     delta_net_prefill_state_f32_kernel<<<grid, 256, smem_bytes, stream>>>(
-        qk_wave, u, w, kq, g_cs, o_wave, ptrs, spans, n_spans, t_tran,
-        n_v_heads, n_k_heads, tok_stride, q_scale);
+        qk_wave, u, w, kq, g_cs, o_wave, ptrs, spans, n_spans,
+        stacked ? n_layers : 0, t_tran, n_v_heads, n_k_heads, tok_stride,
+        q_scale);
 }
 
 } // namespace delta_net

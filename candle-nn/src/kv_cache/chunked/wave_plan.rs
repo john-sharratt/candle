@@ -345,6 +345,47 @@ pub struct DeltaNetWidths {
     pub layers: usize,
 }
 
+/// Pointers per layer in a replay's layer table — the kernels' `DnLayerOps`
+/// (`candle_kernels::delta_net::DELTA_NET_LAYER_OPS`, out of reach of a build
+/// without CUDA; a CUDA test holds the two equal).
+pub const DELTA_NET_REPLAY_LAYER_OPS: usize = 6;
+
+/// The most `(layer, span)` pairs one replay launch covers — the kernels'
+/// grid z extent (`candle_kernels::delta_net::DELTA_NET_MAX_LAYER_SPANS`).
+pub const DELTA_NET_REPLAY_MAX_LAYER_SPANS: usize = 65_535;
+
+/// What one replay launch may carve across the layers it stacks. A single
+/// verifying session stacks every layer of a 36-layer mixer well inside it;
+/// a wide cohort replays in several stacks rather than buying a tier the size
+/// of every layer's transients at once.
+pub const DELTA_NET_REPLAY_STACK_BYTES: usize = 32 << 20;
+
+impl DeltaNetWidths {
+    /// Bytes ONE layer of a replay carves for `rows` staged rows over `spans`
+    /// spans: the conv output, the discarded scan output, the scan's four
+    /// transients, the layer's table entries.
+    pub fn replay_layer_bytes(&self, rows: usize, spans: usize) -> usize {
+        let f32_cols =
+            self.conv_dim + 3 * self.value_dim + self.n_v_heads * (DELTA_NET_SCAN_CHUNK + 1);
+        rows * f32_cols * 4 + (4 * spans + DELTA_NET_REPLAY_LAYER_OPS) * 8
+    }
+
+    /// Recurrent layers one replay launch stacks for `rows` staged rows over
+    /// `spans` spans — **the one definition**, read by the forward that prices
+    /// the replay's carves and by the replay that makes them. Zero when nothing
+    /// is staged; otherwise every layer, unless their carves together pass
+    /// [`DELTA_NET_REPLAY_STACK_BYTES`] or their spans the grid's z extent, and
+    /// never fewer than one.
+    pub fn replay_stack(&self, rows: usize, spans: usize) -> usize {
+        if rows == 0 || spans == 0 || self.layers == 0 {
+            return 0;
+        }
+        let by_bytes = DELTA_NET_REPLAY_STACK_BYTES / self.replay_layer_bytes(rows, spans);
+        let by_grid = DELTA_NET_REPLAY_MAX_LAYER_SPANS / spans;
+        by_bytes.min(by_grid).min(self.layers).max(1)
+    }
+}
+
 /// A MoE layer's always-active **shared expert**, as
 /// [`ModelGeometry::shared_expert`] carries it.
 ///
@@ -859,23 +900,29 @@ pub enum WaveBuffer {
     // rows of `conv_dim` 10240 and `value_dim` 6144 came to 1,318,400 B against
     // a span priced at 1,216,768, and the replay exhausted it mid-flight. The
     // kernels read the rewind stash in place; only what they write is carved.
-    /// The span table's pointer block: four device pointers per span.
+    // A replay stacks `DeltaNetWidths::replay_stack` layers per launch, and
+    // every carve below but the extents holds one slice per stacked layer.
+    /// The stack's pointer block, one upload: per layer its
+    /// [`DELTA_NET_REPLAY_LAYER_OPS`] operand pointers, then per layer four
+    /// state pointers per span.
     ReplaySpanPtrs,
-    /// The span table's extents: two `u32` per span.
+    /// The span table's extents: two `u32` per span, shared by every layer.
     ReplaySpanExtents,
-    /// The replayed causal conv's output, `[staged, conv_dim]` F32 — the
-    /// replay's provenance root, which the table and the scan's carves inherit.
+    /// The replayed causal conv's output, `[layers, staged, conv_dim]` F32 —
+    /// the replay's provenance root, which the table and the scan's carves
+    /// inherit.
     ReplayConved,
-    /// The scan's output rows, `[staged, value_dim]` F32. Discarded — a replay
-    /// wants the advanced states — but the kernel writes them.
+    /// The scan's output rows, `[layers, staged, value_dim]` F32. Discarded — a
+    /// replay wants the advanced states — but the kernel writes them.
     ReplayOut,
-    /// The scan's `u` transient, `[v_heads, staged, head_dim]` F32.
+    /// The scan's `u` transient, `[layers, v_heads, staged, head_dim]` F32.
     ReplayScanU,
     /// The scan's `w` transient, the same shape as [`Self::ReplayScanU`].
     ReplayScanW,
-    /// The scan's chunk-local `k·q` block, `[v_heads, staged, chunk]` F32.
+    /// The scan's chunk-local `k·q` block, `[layers, v_heads, staged, chunk]`
+    /// F32.
     ReplayScanKq,
-    /// The scan's cumulative decay, one F32 per V head per staged row.
+    /// The scan's cumulative decay, one F32 per V head per staged row per layer.
     ReplayDecay,
 
     /// The FFN phase's Gated Residual pre-mix — the same five carves as
@@ -1923,10 +1970,22 @@ impl WaveBuffer {
             Self::ReplaySpanPtrs | Self::ReplaySpanExtents if g.delta_net.is_none() => {
                 dense(0, 0, DType::U32)
             }
-            Self::ReplaySpanPtrs => dense(w.staged_spans, 4, DType::I64),
+            // One upload per stack: every layer's operand pointers, then every
+            // layer's four state addresses per span.
+            Self::ReplaySpanPtrs => {
+                let d = g.delta_net.expect("guarded above");
+                let stack = d.replay_stack(w.staged_rows, w.staged_spans);
+                dense(
+                    stack * (4 * w.staged_spans + DELTA_NET_REPLAY_LAYER_OPS),
+                    1,
+                    DType::I64,
+                )
+            }
+            // The extents are the spans' rows, the same in every layer.
             Self::ReplaySpanExtents => dense(w.staged_spans, 2, DType::U32),
-            // The replayed conv and scan, over every staged row: the kernels
-            // run over the stash's whole buffers and touch only the spans.
+            // The replayed conv and scan, over every staged row of every layer
+            // the stack holds: the kernels run over the stash's whole buffers
+            // and touch only the spans, and each layer writes its own slice.
             Self::ReplayConved
             | Self::ReplayOut
             | Self::ReplayScanU
@@ -1937,26 +1996,22 @@ impl WaveBuffer {
             {
                 dense(0, 0, DType::F32)
             }
-            Self::ReplayConved => dense(
-                w.staged_rows,
-                g.delta_net.expect("guarded above").conv_dim,
-                DType::F32,
-            ),
-            Self::ReplayOut | Self::ReplayScanU | Self::ReplayScanW => dense(
-                w.staged_rows,
-                g.delta_net.expect("guarded above").value_dim,
-                DType::F32,
-            ),
-            Self::ReplayScanKq => dense(
-                w.staged_rows,
-                g.delta_net.expect("guarded above").n_v_heads * DELTA_NET_SCAN_CHUNK,
-                DType::F32,
-            ),
-            Self::ReplayDecay => dense(
-                w.staged_rows,
-                g.delta_net.expect("guarded above").n_v_heads,
-                DType::F32,
-            ),
+            Self::ReplayConved
+            | Self::ReplayOut
+            | Self::ReplayScanU
+            | Self::ReplayScanW
+            | Self::ReplayScanKq
+            | Self::ReplayDecay => {
+                let d = g.delta_net.expect("guarded above");
+                let rows = d.replay_stack(w.staged_rows, w.staged_spans) * w.staged_rows;
+                let cols = match self {
+                    Self::ReplayConved => d.conv_dim,
+                    Self::ReplayScanKq => d.n_v_heads * DELTA_NET_SCAN_CHUNK,
+                    Self::ReplayDecay => d.n_v_heads,
+                    _ => d.value_dim,
+                };
+                dense(rows, cols, DType::F32)
+            }
             // The shared expert's half of the chain, on a stack whose MoE has
             // one — and nothing at all otherwise.
             Self::SharedGateUp
@@ -3891,9 +3946,11 @@ mod tests {
     /// **A speculative replay's carves, priced to the byte.**
     ///
     /// Qwen3.5-9B geometry at 30 staged rows over 6 spans — `conv_dim` 8192 and
-    /// `value_dim` 4096 in F32, `n_v_heads` 32, and the span table's 4 pointers
-    /// and 2 extents per span. The stash itself is read in place, so nothing
-    /// prices its operands.
+    /// `value_dim` 4096 in F32, `n_v_heads` 32, and per stacked layer the span
+    /// table's 4 pointers per span plus the layer's 6 operand pointers, with the
+    /// 2 extents per span shared. One layer carves 2,707,440 B at this width,
+    /// so a 32 MiB stack holds 12 of the 24 layers. The stash itself is read in
+    /// place, so nothing prices its operands.
     ///
     /// **And it is charged to nothing else.** The chain is sized by
     /// `staged_rows`/`staged_spans`, which are zero on every ordinary forward,
@@ -3914,14 +3971,17 @@ mod tests {
         let plan = WavePlan::new(g);
         let replay = WaveWidth::replay(30, 6);
         for (b, want) in [
-            (WaveBuffer::ReplaySpanPtrs, 6 * 4 * 8),
+            (WaveBuffer::ReplaySpanPtrs, 12 * (6 * 4 + 6) * 8),
             (WaveBuffer::ReplaySpanExtents, 6 * 2 * 4),
-            (WaveBuffer::ReplayConved, 30 * 8192 * 4),
-            (WaveBuffer::ReplayOut, 30 * 4096 * 4),
-            (WaveBuffer::ReplayScanU, 30 * 4096 * 4),
-            (WaveBuffer::ReplayScanW, 30 * 4096 * 4),
-            (WaveBuffer::ReplayScanKq, 30 * 32 * DELTA_NET_SCAN_CHUNK * 4),
-            (WaveBuffer::ReplayDecay, 30 * 32 * 4),
+            (WaveBuffer::ReplayConved, 12 * 30 * 8192 * 4),
+            (WaveBuffer::ReplayOut, 12 * 30 * 4096 * 4),
+            (WaveBuffer::ReplayScanU, 12 * 30 * 4096 * 4),
+            (WaveBuffer::ReplayScanW, 12 * 30 * 4096 * 4),
+            (
+                WaveBuffer::ReplayScanKq,
+                12 * 30 * 32 * DELTA_NET_SCAN_CHUNK * 4,
+            ),
+            (WaveBuffer::ReplayDecay, 12 * 30 * 32 * 4),
         ] {
             assert_eq!(
                 b.bytes(&g, replay),
@@ -3939,6 +3999,40 @@ mod tests {
         // And an ordinary wave is charged nothing for it, however wide.
         let ordinary = WaveWidth::prefill(8192, 64);
         assert_eq!(plan.chain_bytes(Chain::DeltaNetReplay, ordinary), 0);
+    }
+
+    /// **How many layers one replay launch stacks.** Flash-Next's mixer
+    /// (`conv_dim` 8192, `value_dim` 4096, 32 V heads, 36 layers): one session's
+    /// five-row block costs 451,280 B a layer, so every layer fits one stack;
+    /// at 40 rows over 8 spans a layer is 3,609,904 B and the 32 MiB budget
+    /// holds 9; nothing staged stacks nothing; and the grid's z extent bounds a
+    /// cohort of many spans before the bytes do.
+    #[test]
+    fn the_replay_stacks_every_layer_its_budget_holds() {
+        let d = DeltaNetWidths {
+            conv_dim: 8192,
+            value_dim: 4096,
+            n_v_heads: 32,
+            layers: 36,
+        };
+        assert_eq!(d.replay_layer_bytes(5, 1), 451_280);
+        assert_eq!(d.replay_stack(5, 1), 36);
+        assert_eq!(d.replay_layer_bytes(40, 8), 3_609_904);
+        assert_eq!(d.replay_stack(40, 8), 9);
+        assert_eq!(d.replay_stack(0, 0), 0);
+        assert_eq!(d.replay_stack(5, 0), 0);
+        // 4,096 one-row spans of a narrow mixer: 1,310,768 B a layer would stack
+        // 25, and 65,535 / 4,096 = 15 layers by the grid.
+        let tiny = DeltaNetWidths {
+            conv_dim: 4,
+            value_dim: 1,
+            n_v_heads: 1,
+            layers: 36,
+        };
+        assert_eq!(tiny.replay_layer_bytes(4_096, 4_096), 1_310_768);
+        assert_eq!(tiny.replay_stack(4_096, 4_096), 15);
+        // A layer wider than the whole budget still replays, one at a time.
+        assert_eq!(d.replay_stack(1_000, 8), 1);
     }
 
     /// **A wave that stops short of the last layer runs no head**, so it

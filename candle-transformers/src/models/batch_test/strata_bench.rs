@@ -29,6 +29,7 @@ use candle::{Device, Result};
 use super::utils::{account_model_load, TestConfig, TestMode, TestParams, TestResults};
 use crate::models::batched_inference::{InferenceMode, ManagedBatchedModel};
 use crate::models::dialect::Dialect;
+use crate::models::profile::ProfileSnapshot;
 use candle::quantized::Int8Mode;
 
 /// Prompt lengths, in tokens of the rendered chat prompt — `--targets`.
@@ -195,6 +196,34 @@ fn report(results: &[TestResults]) {
             median_of(&decode),
         );
     }
+    for (i, target) in TARGETS.iter().enumerate() {
+        let mut merged = ProfileSnapshot::default();
+        for r in &results[1 + i * RUNS..1 + (i + 1) * RUNS] {
+            merged.merge(&r.pipeline_profile);
+        }
+        if let Some(table) = step_breakdown(&merged) {
+            println!("\n  {target} tokens, per speculative step (`--features profile`):\n{table}");
+        }
+    }
+}
+
+/// The speculative step's host phases from a run's pipeline profile, each as
+/// milliseconds per step — `None` when the profile is empty (built without
+/// `--features profile`) or recorded no step.
+fn step_breakdown(snap: &ProfileSnapshot) -> Option<String> {
+    let steps = snap
+        .entries
+        .iter()
+        .find(|(name, _, _)| name == "spec:verify")
+        .map(|&(_, _, calls)| calls)
+        .filter(|&calls| calls > 0)?;
+    let lines: Vec<String> = snap
+        .entries
+        .iter()
+        .filter(|(name, _, _)| name.starts_with("spec:"))
+        .map(|(name, ms, _)| format!("    {name:<16} {:>7.3} ms", ms / steps as f64))
+        .collect();
+    Some(lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -259,5 +288,25 @@ mod tests {
             "103.1 (99.4, 115.5, 103.1)"
         );
         assert_eq!(median_of(&[2.0, 1.0]), "1.5 (2.0, 1.0)");
+    }
+
+    /// Each `spec:` phase divided by the step count `spec:verify` records, in
+    /// recording order; other spans are left out.
+    #[test]
+    fn the_step_breakdown_is_per_verify_step() {
+        let snap = ProfileSnapshot {
+            entries: vec![
+                ("spec:draft".into(), 40.0, 20),
+                ("wv:sweep".into(), 999.0, 20),
+                ("spec:verify".into(), 300.0, 20),
+                ("spec:rollback".into(), 5.0, 20),
+            ],
+        };
+        assert_eq!(
+            step_breakdown(&snap).unwrap(),
+            "    spec:draft         2.000 ms\n    spec:verify       15.000 ms\n    \
+             spec:rollback      0.250 ms"
+        );
+        assert!(step_breakdown(&ProfileSnapshot::default()).is_none());
     }
 }

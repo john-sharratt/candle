@@ -322,9 +322,9 @@ impl Qwen4ExpBatched {
         }
 
         // **Recorded as one wave, like the draft walk.** Everything below is a
-        // chain of small launches — per DeltaNet layer a staging copy of the
-        // stashed operands, the span table and two mixer kernels; per attention
-        // layer an index append — with no host decision between them. Issued
+        // chain of small launches — the stacked DeltaNet replay's table uploads
+        // and three mixer kernels; per attention layer an index append — with
+        // no host decision between them. Issued
         // eagerly they left the GPU idle between every pair: measured on
         // Flash-Next's single-session verify, ~3.6 ms of wall a step for ~0.8 ms
         // of kernels. Anything below that must reach the driver (an allocation,

@@ -363,24 +363,6 @@ pub fn build_span_table<'w>(
     build_span_rows(&spans, anchor).map(Some)
 }
 
-/// [`build_span_table`] over EVERY span, single-row spans included.
-///
-/// The wave filters those out because its decode kernels take them; the
-/// speculative replay must not — the wave ran its stashed rows through the
-/// PREFILL kernels whatever the count, and a rewind that retraced a one-row
-/// accept through the decode kernels instead would be a different reduction
-/// order where bit-identity to the wave is the contract.
-pub fn build_span_table_all<'w>(
-    seqs: &[DeltaNetSeq<'_>],
-    anchor: &LiveTensor<'w>,
-) -> Result<DeltaNetSpanTable<'w>> {
-    if seqs.is_empty() {
-        candle::bail!("delta_net cuda: no spans to table");
-    }
-    let spans: Vec<&DeltaNetSeq<'_>> = seqs.iter().collect();
-    build_span_rows(&spans, anchor)
-}
-
 fn build_span_rows<'w>(
     spans: &[&DeltaNetSeq<'_>],
     anchor: &LiveTensor<'w>,
@@ -745,6 +727,9 @@ pub fn delta_net_conv_prefill(
             ptrs_p as *const i64,
             spans_p as *const u32,
             table.n as i32,
+            std::ptr::null(),
+            1,
+            t_wave as i32,
             table.max_len as i32,
             channels as i32,
             kwidth as i32,
@@ -826,6 +811,8 @@ pub fn delta_net_prefill_scan(
                 gcs_p as *mut f32,
                 spans_p as *const u32,
                 table.n as i32,
+                std::ptr::null(),
+                1,
                 table.max_len as i32,
                 t_wave as i32,
                 p.h_v as i32,
@@ -844,6 +831,8 @@ pub fn delta_net_prefill_scan(
                 ptrs_p as *const i64,
                 spans_p as *const u32,
                 table.n as i32,
+                std::ptr::null(),
+                1,
                 t_wave as i32,
                 p.h_v as i32,
                 p.h_k as i32,
