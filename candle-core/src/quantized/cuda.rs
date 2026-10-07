@@ -42,7 +42,7 @@ use candle_kernels::simple::fused_silu_mul::run_silu_mul_q8a128_op;
 // K/128 blocks have embedded scales, no external scale extraction needed.
 use candle_kernels::quantized::{
     dispatch_info, flush_l2_cache, run_grouped_quantized_matmul, run_qkv_segmented_matmul,
-    run_quantized_matmul, MatmulStatus, OutDType, VxSegment, YType,
+    run_quantized_matmul, MatmulStatus, OutDType, VxSegment, YType, SPLITK_MAX_SEGS,
 };
 /// The wait state of a grouped GEMM over a live weight table — see
 /// [`grouped_qmatmul_dev_q8a128`].
@@ -59,7 +59,7 @@ mod silu_matmul;
 mod split_k;
 pub(crate) use silu_matmul::q8a128_dense_matmul_silu;
 pub use split_k::ensure_split_k_scratch;
-use split_k::q8a128_dense_matmul_split_k;
+use split_k::{q8a128_dense_matmul_split_k, q8a128_dense_matmul_split_k_segmented};
 
 /// Process-cached SM count for the int8 dense tiling (occupancy) heuristic. SM count is a fixed
 /// device property; querying the driver attribute on every matmul would add an FFI call to the hot
@@ -6980,6 +6980,39 @@ pub(crate) fn qkv_segmented_matmul<'w>(
     tensor_from_owned_out(owned_dst, dst_ptr, out_backing, out_shape, device)
 }
 
+/// Several KO weights that read the same q8a128 operand, as ONE launch writing their outputs
+/// side by side: `[lead.., ΣNᵢ]`, weight `i`'s columns after those before it. At decode width
+/// the combined width splits K (the segmented split-K launch); otherwise it runs the unsplit
+/// segmented kernel. Either way every column is the one its weight's own launch computes, bit
+/// for bit: the split's sum is tile-ordered whatever the depth, and the unsplit kernel walks
+/// each tile row exactly as the single-weight kernel does. The split form needs one format
+/// across the segments and at most [`SPLITK_MAX_SEGS`] of them; the unsplit form takes up to
+/// three of any KO formats.
+pub(crate) fn dense_qmatmul_stacked<'w>(
+    op: &Q8a128Operand<'w>,
+    segments: &[(u64, GgmlDType, usize)],
+    out_dtype: crate::DType,
+    device: &CudaDevice,
+) -> Result<crate::LiveTensor<'w>> {
+    let n_total: usize = segments.iter().map(|&(_, _, n)| n).sum();
+    let dtype = segments
+        .first()
+        .map(|&(_, d, _)| d)
+        .ok_or_else(|| crate::Error::Msg("dense_qmatmul_stacked: no weights".into()))?;
+    let one_format = segments.iter().all(|&(_, d, _)| d == dtype);
+    let splits = if one_format && dtype != GgmlDType::MXFP4_KO && segments.len() <= SPLITK_MAX_SEGS
+    {
+        q8a128_dense_k_splits(op.rows, n_total, op.cols, cached_sm_count(device))
+    } else {
+        1
+    };
+    if splits > 1 {
+        let segs: Vec<(u64, usize)> = segments.iter().map(|&(p, _, n)| (p, n)).collect();
+        return q8a128_dense_matmul_split_k_segmented(op, &segs, dtype, splits, out_dtype, device);
+    }
+    qkv_segmented_matmul(op, segments, out_dtype, device)
+}
+
 /// The q8a128 int8 dense launch with an **explicit** tiling mode (`mode2`: false = mode-1 `Bm=16`,
 /// true = mode-2 `Bm=32` weight-reuse). Production reaches this from [`dense_qmatmul`] with the mode
 /// chosen by [`q8a128_dense_use_mode2`]; the crossover benchmark calls it directly to time each mode
@@ -7283,9 +7316,15 @@ pub fn moe_route<'w>(
     let moe_dtype = dtype_to_moe_scatter_dtype(dtype)?;
 
     let (storage, layout) = logits.storage_and_layout();
-    let (o1, o2) = layout
-        .contiguous_offsets()
-        .ok_or_else(|| crate::Error::RequiresContiguous { op: "moe_route" }.bt())?;
+    // Rows of unit-stride columns at any pitch: a router whose projection shared its
+    // launch reads its columns of the wider output row in place.
+    let row_stride = layout.stride()[0];
+    if layout.stride()[1] != 1 || (num_tokens > 1 && row_stride < n_experts) {
+        return Err(crate::Error::RequiresContiguous { op: "moe_route" }.bt());
+    }
+    let row_stride = row_stride.max(n_experts);
+    let o1 = layout.start_offset();
+    let o2 = o1 + (num_tokens.saturating_sub(1)) * row_stride + n_experts;
     let cuda = match &*storage {
         crate::Storage::Cuda(c) => c,
         _ => crate::bail!("moe_route: expected CUDA storage"),
@@ -7313,6 +7352,7 @@ pub fn moe_route<'w>(
                     wp as *mut f32,
                     num_tokens as i32,
                     n_experts as i32,
+                    row_stride as i32,
                     k as i32,
                     norm_topk as i32,
                     stream.cu_stream() as *mut std::ffi::c_void,

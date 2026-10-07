@@ -354,34 +354,12 @@ impl QuantizedMlp {
             gate = adapt(lora.gate, gate, &x)?;
             up = adapt(lora.up, up, &x)?;
         }
-        // **The SwiGLU emits the down projection's operand itself** when that
-        // projection runs int8 and no adapter needs the float result: one launch
-        // for `silu(gate) · up` and its quantize, reading the two halves of the
-        // fused projection where it wrote them. Its arithmetic is the eager chain
-        // below, bit for bit, at both working widths — at BF16 that is `silu(gate)`
-        // rounded, then the product rounded, exactly the two stores the chain
-        // makes — then the one q8a128 tile emitter, so the bytes are the ones
-        // `down` would quantize from `gated`. The KV calibration rows were derived
-        // on that arithmetic; a single rounding of the F32 product, though more
-        // precise, moved the 0.8B's top rungs across their edge.
-        //
-        // Unadapted only: an adapter on gate or up alone turns that half into a
-        // fresh dense tensor whose rows no longer step with the other half's
-        // view of the fused output, and `down`'s adapter reads the float result.
-        if lora.gate.is_none()
-            && lora.up.is_none()
-            && lora.down.is_none()
-            && self.down_proj.int8mode().is_int8()
-            && matches!(self.act_fn, Activation::Silu)
-        {
-            if let Device::Cuda(dev) = gate.device() {
-                // The Σx convention `down` reads, as its own quantize would write it.
-                let sum_scale = self.down_proj.sum_scale();
-                let op = silu_mul_q8a128(&gate, &up, dev, gate.cuda_backing(), sum_scale)?;
-                return self
-                    .down_proj
-                    .forward_dynamic(DynamicTensor::Int8(&op), out_dtype);
-            }
+        // Unadapted: the back half on its own. An adapter on gate or up alone turns
+        // that half into a fresh dense tensor whose rows no longer step with the
+        // other half's view of the fused output, and `down`'s adapter reads the
+        // float result, so an adapted MLP keeps the eager tail below.
+        if lora.gate.is_none() && lora.up.is_none() && lora.down.is_none() {
+            return self.forward_from_gate_up(&gate, &up, out_dtype);
         }
         let gated = (&self.act_fn.forward_live(&gate)? * &up)?;
         let out = self.down_proj.forward_live_as(&gated, out_dtype)?;
@@ -391,6 +369,40 @@ impl QuantizedMlp {
             Some(_) => adapt(lora.down, out, &gated),
             None => Ok(out),
         }
+    }
+
+    /// The MLP's back half — `down(act(gate) · up)` — from gate and up projections the
+    /// caller already has, in `work_dtype`: the two halves of this MLP's own fused
+    /// projection, or views of a launch that projection shared with other projections of
+    /// the same activation. `down` stores `out_dtype`.
+    ///
+    /// **The SwiGLU emits the down projection's operand itself** when that projection runs
+    /// int8: one launch for `silu(gate) · up` and its quantize, reading the halves where
+    /// they were written, through their row stride. Its arithmetic is the eager chain
+    /// below, bit for bit, at both working widths — at BF16 that is `silu(gate)` rounded,
+    /// then the product rounded, exactly the two stores the chain makes — then the one
+    /// q8a128 tile emitter, so the bytes are the ones `down` would quantize from `gated`.
+    /// The KV calibration rows were derived on that arithmetic; a single rounding of the
+    /// F32 product, though more precise, moved the 0.8B's top rungs across their edge.
+    #[cfg(feature = "cuda")]
+    pub fn forward_from_gate_up<'w>(
+        &self,
+        gate: &LiveTensor<'w>,
+        up: &LiveTensor<'w>,
+        out_dtype: DType,
+    ) -> Result<LiveTensor<'w>> {
+        if self.down_proj.int8mode().is_int8() && matches!(self.act_fn, Activation::Silu) {
+            if let Device::Cuda(dev) = gate.device() {
+                // The Σx convention `down` reads, as its own quantize would write it.
+                let sum_scale = self.down_proj.sum_scale();
+                let op = silu_mul_q8a128(gate, up, dev, gate.cuda_backing(), sum_scale)?;
+                return self
+                    .down_proj
+                    .forward_dynamic(DynamicTensor::Int8(&op), out_dtype);
+            }
+        }
+        let gated = (&self.act_fn.forward_live(gate)? * up)?;
+        self.down_proj.forward_live_as(&gated, out_dtype)
     }
 }
 

@@ -421,18 +421,19 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16_SMEM8 name##_dense_silu_m2( \
 
 //   name##_dense_sk — the mode-1 tile with K split across gridDim.z slices, for a
 //                     decode-width projection whose unsplit grid cannot fill the
-//                     card. F32 partials in `ws`, self-resetting per-tile counters;
-//                     see grouped_tc::quantized_matmul_dense_splitk_entry_int8.
+//                     card, over one or more weight segments of a shared output
+//                     row (`SplitKSegs`). F32 partials in `ws`, self-resetting
+//                     per-tile counters; see
+//                     grouped_tc::quantized_matmul_dense_splitk_entry_int8.
 #define INSTANTIATE_KERNEL_DENSE_INT8_SK(name, qk, qi, block_type, vdr, dst_t) \
 extern "C" __global__ void LAUNCH_BOUNDS_TC16_SMEM8 name##_dense_sk( \
-    const void* __restrict__ weights, \
+    const SplitKSegs segs, \
     const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
-    const int ncols_x, const int nrows_x, const int total_batch, \
+    const int ncols_x, const int total_batch, \
     const int dst_stride, const int sum_norm, \
     float* __restrict__ ws, unsigned int* __restrict__ counters) { \
     grouped_tc::quantized_matmul_dense_splitk_entry_int8<qk, qi, block_type, vdr, dst_t>( \
-        reinterpret_cast<const block_compact_t<block_type>*>(weights), \
-        vy, dst, ncols_x, nrows_x, total_batch, dst_stride, sum_norm, ws, counters); \
+        segs, vy, dst, ncols_x, total_batch, dst_stride, sum_norm, ws, counters); \
 }
 
 // The KO formats: mode-2 for prefill, at every output width.

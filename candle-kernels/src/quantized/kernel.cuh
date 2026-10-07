@@ -70,6 +70,8 @@ struct YTiles {
 #include "../fast_exp.cuh"           // the SiLU the fused-activation loader applies
 #include "../quantize/q8a128_tile.cuh" // the one q8a128 quantization, for that loader
 #include "moe_live.cuh"                 // the grouped entry's workers over a live expert table
+#include "splitk_segs.cuh"              // the split-K dense entry's weight segments
+#include "pdl.cuh"                      // programmatic dependent launch: prefetch, then wait
 
 // =============================================================================
 // FORWARD DECLARATIONS - Optimized standalone dequant functions
@@ -2371,6 +2373,26 @@ static __device__ void quantized_matmul_dense_entry_int8(
     // The int8 impl is KO-only (inline-scale k1024 chunks). Only instantiate it for KO; for
     // any non-KO type the call is discarded so the kernel is a no-op (never dispatched to).
     if constexpr (is_scale_separate<block_compact_t<block_q_t>>::value) {
+        // Launched with programmatic serialization (`pdl.cuh`): the row tile's first
+        // K tiles into L2 while the kernel before it finishes, then the wait, before the
+        // activation is read. Only the first tiles: a wide grid's later blocks start
+        // after the predecessor has finished anyway, and a block's pipeline covers the
+        // rest of its K once it is running.
+        {
+            constexpr int CB = int8_chunk_bytes<block_compact_t<block_q_t>>::value;
+            constexpr int PREFETCH_TILES = 4;
+            const int row0 = row_tile_idx * N_TILE;
+            const int t_id = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
+            const int k_tiles = ncols_x / K_TILE;
+            if (row0 < nrows_x) {
+                for (int t = 0; t < k_tiles && t < PREFETCH_TILES; ++t) {
+                    pdl_prefetch_l2(&weights[(int64_t)t * (nrows_x / 8) + row0 / 8],
+                                    (N_TILE / 8) * CB, t_id, 4 * WARP_SIZE_TC);
+                }
+            }
+            pdl_launch_dependents();
+            pdl_wait();
+        }
         grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
             weights, act, dst, ncols_x, nrows_x, y_stride, dst_stride,
             b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
@@ -2411,6 +2433,22 @@ static __device__ void quantized_matmul_dense_silu_entry_int8(
     __shared__ uint8_t smem_W_flat[(N_TILE / 8) * (STAGES - 1) * int8_chunk_bytes<block_compact_t<block_q_t>>::value];
 
     if constexpr (is_scale_separate<block_compact_t<block_q_t>>::value) {
+        // Launched with programmatic serialization (`pdl.cuh`): the row tile's whole
+        // weight — `N_TILE / 8` chunks per K tile — into L2 while the kernel before it
+        // finishes, then the wait, before `proj` is read.
+        {
+            constexpr int CB = int8_chunk_bytes<block_compact_t<block_q_t>>::value;
+            const int row0 = row_tile_idx * N_TILE;
+            const int t_id = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
+            if (row0 < nrows_x) {
+                for (int t = 0; t < ncols_x / K_TILE; ++t) {
+                    pdl_prefetch_l2(&weights[(int64_t)t * (nrows_x / 8) + row0 / 8],
+                                    (N_TILE / 8) * CB, t_id, 4 * WARP_SIZE_TC);
+                }
+            }
+            pdl_launch_dependents();
+            pdl_wait();
+        }
         grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB, STAGES, false, true>(
             weights, nullptr, dst, ncols_x, nrows_x, 0, dst_stride,
             b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm,
@@ -2497,19 +2535,41 @@ static __device__ __forceinline__ void splitk_reduce_tiles(
     }
 }
 
+// `segs` — the weight segments of the shared output row (`splitk_segs.cuh`).
 template <int qk, int qi, typename block_q_t, int vdr, typename output_t>
 static __device__ void quantized_matmul_dense_splitk_entry_int8(
-    const block_compact_t<block_q_t>* __restrict__ weights,
+    const SplitKSegs& segs,
     const block_q8a128* __restrict__ act,
-    output_t* __restrict__ dst,
-    int ncols_x, int nrows_x, int total_batch, int dst_stride, int sum_norm,
-    float* __restrict__ ws,
+    output_t* __restrict__ dst_all,
+    int ncols_x, int total_batch, int dst_stride, int sum_norm,
+    float* __restrict__ ws_all,
     unsigned int* __restrict__ counters)
 {
     constexpr int BATCH = 16;
     const int b_start = blockIdx.x * BATCH;
     const int b_cnt = min(BATCH, total_batch - b_start);
-    const int row_tile_idx = blockIdx.y;
+    // This block's segment: the tiles are contiguous per segment, in order. Selected by
+    // an unrolled compare over static indices, never `segs.w[seg]`: a runtime index into
+    // a by-value parameter struct makes the compiler copy the whole table to local
+    // memory in every block, and that alone cost a single-weight launch 15–30%.
+    const void* seg_w = segs.w[0];
+    int seg_tile0 = segs.tile_start[0];
+    int nrows_x = segs.n[0];
+    int seg_col = segs.col_off[0];
+    #pragma unroll
+    for (int s = 1; s < SPLITK_MAX_SEGS; ++s) {
+        if (s < segs.num && (int)blockIdx.y >= segs.tile_start[s]) {
+            seg_w = segs.w[s];
+            seg_tile0 = segs.tile_start[s];
+            nrows_x = segs.n[s];
+            seg_col = segs.col_off[s];
+        }
+    }
+    const int row_tile_idx = (int)blockIdx.y - seg_tile0;
+    const auto* __restrict__ weights = reinterpret_cast<const block_compact_t<block_q_t>*>(seg_w);
+    // The segment's columns of the shared output and of every K tile's partial.
+    output_t* __restrict__ dst = dst_all + seg_col;
+    float* __restrict__ ws = ws_all + seg_col;
     const int splits = gridDim.z;
     const int k_blocks = ncols_x / K_TILE;
     // This block's slice.
@@ -2524,6 +2584,23 @@ static __device__ void quantized_matmul_dense_splitk_entry_int8(
     __shared__ bool s_last;
 
     if constexpr (is_scale_separate<block_compact_t<block_q_t>>::value) {
+        // Launched with programmatic serialization (`pdl.cuh`): this slice's weight
+        // span — `N_TILE / 8` consecutive chunks per K tile — into L2 while the kernel
+        // before it finishes, then the wait, before the activation, the partials or
+        // the counters are touched.
+        {
+            constexpr int CB = int8_chunk_bytes<block_compact_t<block_q_t>>::value;
+            const int row0 = row_tile_idx * N_TILE;
+            const int t_id = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
+            if (row0 < nrows_x) {
+                for (int t = k_lo; t < k_hi; ++t) {
+                    pdl_prefetch_l2(&weights[(int64_t)t * (nrows_x / 8) + row0 / 8],
+                                    (N_TILE / 8) * CB, t_id, 4 * WARP_SIZE_TC);
+                }
+            }
+            pdl_launch_dependents();
+            pdl_wait();
+        }
         const size_t slice = (size_t)total_batch * dst_stride;
         grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, 1, STAGES, true>(
             weights, act, dst, ncols_x, nrows_x, 0, dst_stride,

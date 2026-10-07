@@ -93,7 +93,103 @@ __global__ void rope_rows_kernel(
     }
 }
 
+// The indexer's queries take an RMS norm with a per-channel weight before they
+// rotate: `y = x / sqrt(Σx²·(1/d) + eps) · w`, then the rotation above. That
+// was seven elementwise launches ahead of this one; here a warp owns a row,
+// folds its square sum with an xor tree, writes the normed row to shared
+// memory, and rotates it from there with the same lookup and scale. The
+// operations and their order are the eager chain's — multiply by `1/d`, add
+// `eps`, square root, divide, weight — apart from the order of the square sum.
+constexpr int NORM_WARPS = 4;
+constexpr int NORM_MAX_D = 256;
+
+__global__ void rope_rows_norm_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int n_rows,
+    int d,
+    int rows_per_pos,
+    const uint32_t* __restrict__ pos,
+    long long pos_base,
+    int pos_step,
+    const RopeRungs rungs,
+    const uint32_t* __restrict__ group_rung,
+    uint32_t rung,
+    int q_scale,
+    const float* __restrict__ norm_w,
+    float eps
+) {
+    __shared__ float s_row[NORM_WARPS][NORM_MAX_D];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * NORM_WARPS + warp;
+    if (row >= n_rows) return;
+    const float* s = src + (long long)row * d;
+    float* o = dst + (long long)row * d;
+
+    float ss = 0.f;
+    for (int c = lane; c < d; c += 32) {
+        const float x = s[c];
+        ss = fmaf(x, x, ss);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+    const float ms = ss * (1.f / (float)d);
+    const float denom = sqrtf(ms + eps);
+    for (int c = lane; c < d; c += 32) s_row[warp][c] = s[c] / denom * __ldg(norm_w + c);
+    __syncwarp();
+
+    const int pairs = (int)rungs.pairs;
+    const int group = row / rows_per_pos;
+    const int p = pos != nullptr ? (int)__ldg(pos + group)
+                                 : (int)(pos_base + (long long)group * pos_step);
+    const RopeView v = rope_view(rungs, group_rung != nullptr ? __ldg(group_rung + group) : rung);
+    const float scale = q_scale ? v.q_scale : 1.f;
+    for (int k = lane; k < d - pairs; k += 32) {
+        if (k < pairs) {
+            float lo = s_row[warp][k];
+            float hi = s_row[warp][k + pairs];
+            rope_f_rotate(lo, hi, rope_f_lookup(v.tab, pairs, p, k));
+            o[k] = lo * scale;
+            o[k + pairs] = hi * scale;
+        } else {
+            const int c = k + pairs;
+            o[c] = s_row[warp][c];
+        }
+    }
+}
+
 } // namespace qsa_rope_rows
+
+// The rows of a dense `src`, RMS-normed with `norm_w` and `eps`, then rotated as
+// `run_qsa_rope_rows` rotates them. `d` must not exceed `NORM_MAX_D`.
+extern "C" void run_qsa_rope_rows_norm(
+    const float* src,
+    float* dst,
+    int32_t n_rows,
+    int32_t d,
+    int32_t rows_per_pos,
+    const uint32_t* pos,
+    long long pos_base,
+    int32_t pos_step,
+    RopeRungs rungs,
+    const uint32_t* group_rung,
+    uint32_t rung,
+    int32_t q_scale,
+    const float* norm_w,
+    float eps,
+    void* stream
+) {
+    const int pairs = (int)rungs.pairs;
+    if (n_rows <= 0 || d <= 0 || d > qsa_rope_rows::NORM_MAX_D || pairs <= 0 || 2 * pairs > d
+        || rows_per_pos <= 0) return;
+    const unsigned blocks =
+        (unsigned)((n_rows + qsa_rope_rows::NORM_WARPS - 1) / qsa_rope_rows::NORM_WARPS);
+    qsa_rope_rows::rope_rows_norm_kernel<<<blocks, qsa_rope_rows::NORM_WARPS * 32, 0,
+                                           (cudaStream_t)stream>>>(
+        src, dst, n_rows, d, rows_per_pos, pos, pos_base, pos_step, rungs, group_rung, rung,
+        q_scale, norm_w, eps);
+}
 
 extern "C" void run_qsa_rope_rows(
     const float* src,

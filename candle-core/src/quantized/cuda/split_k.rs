@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use candle_kernels::quantized::run_dense_int8_splitk;
+use candle_kernels::quantized::{run_dense_int8_splitk, SPLITK_MAX_SEGS};
 use cudarc::driver::{CudaSlice, DevicePtr};
 
 use super::super::int8_split_k::{
@@ -104,9 +104,39 @@ pub(crate) fn q8a128_dense_matmul_split_k<'w>(
     out_dtype: DType,
     device: &CudaDevice,
 ) -> Result<LiveTensor<'w>> {
-    if !nrows.is_multiple_of(32) {
-        crate::bail!("q8a128 split-K matmul: N={nrows} must be a multiple of 32");
+    q8a128_dense_matmul_split_k_segmented(
+        op,
+        &[(weight_ptr, nrows)],
+        weight_dtype,
+        splits,
+        out_dtype,
+        device,
+    )
+}
+
+/// `op [M, K] × [W₀; W₁; …]ᵀ → [M, ΣNᵢ]` at `out_dtype` in ONE split-K launch: the weights
+/// `segments` (`(device pointer, rows)`, all of `weight_dtype`) read the same operand, and each
+/// writes its columns after the segments before it. Every output column is what the same
+/// weight's own launch computes, bit for bit — the split's tile-ordered sum does not depend on
+/// the columns beside it. At most [`SPLITK_MAX_SEGS`] segments, each a multiple of 32 rows.
+pub(crate) fn q8a128_dense_matmul_split_k_segmented<'w>(
+    op: &Q8a128Operand<'w>,
+    segments: &[(u64, usize)],
+    weight_dtype: GgmlDType,
+    splits: usize,
+    out_dtype: DType,
+    device: &CudaDevice,
+) -> Result<LiveTensor<'w>> {
+    if segments.is_empty() || segments.len() > SPLITK_MAX_SEGS {
+        crate::bail!(
+            "q8a128 split-K matmul: {} weight segments, against 1..={SPLITK_MAX_SEGS}",
+            segments.len()
+        );
     }
+    if let Some(&(_, n)) = segments.iter().find(|&&(_, n)| !n.is_multiple_of(32)) {
+        crate::bail!("q8a128 split-K matmul: a segment of N={n} must be a multiple of 32");
+    }
+    let nrows: usize = segments.iter().map(|&(_, n)| n).sum();
     if !op.cols.is_multiple_of(128) {
         crate::bail!(
             "q8a128 split-K matmul: K={} must be a multiple of 128",
@@ -145,14 +175,19 @@ pub(crate) fn q8a128_dense_matmul_split_k<'w>(
     let stream = device.cuda_stream();
     let (ws_ptr, _ws_guard) = s.partials.device_ptr(&stream);
     let (ctr_ptr, _ctr_guard) = s.counters.device_ptr(&stream);
+    let weights: Vec<*const c_void> = segments.iter().map(|&(p, _)| p as *const c_void).collect();
+    let rows: Vec<i32> = segments.iter().map(|&(_, n)| n as i32).collect();
     op.with_device_ptr(device, |act_ptr| {
+        // SAFETY: `weights`/`rows` are host arrays of `segments.len()` entries the launcher
+        // copies into the kernel parameters; every pointer is a KO weight of its row count.
         let status = unsafe {
             run_dense_int8_splitk(
-                weight_ptr as *const c_void,
+                weights.as_ptr(),
+                rows.as_ptr(),
+                segments.len() as i32,
                 act_ptr as *const c_void,
                 dst_ptr as *mut c_void,
                 op.cols as i32,
-                n as i32,
                 m as i32,
                 qtype,
                 out_code,
@@ -177,7 +212,8 @@ mod tests {
 
     use super::super::super::int8_split_k::{dense_k_split_depth, q8a128_dense_k_splits};
     use super::super::super::{GgmlDType, Int8Mode, QMatMul, QStorage, QTensor, SumScale};
-    use super::super::{dense_qmatmul_with_splits, to_dynamic, CudaDevice};
+    use super::super::{dense_qmatmul_with_splits, to_dynamic, CudaDevice, DynamicActs};
+    use super::q8a128_dense_matmul_split_k_segmented;
     use crate::backend::BackendDevice;
     use crate::{DType, Device, Result, Tensor};
 
@@ -271,6 +307,65 @@ mod tests {
                     unsplit,
                     "{src:?} [{m}x{k}]·[{n}x{k}]ᵀ, {d} slices"
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Weights that share an operand, launched as segments of one row, are each weight's own
+    /// launch bit for bit, column for column — a MoE layer's router, shared gate_up and gate
+    /// at their real widths, at one and five rows, at several depths.
+    #[test]
+    fn segments_of_one_launch_are_each_weights_own_launch() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let k = 2560usize;
+        for m in [1usize, 5] {
+            let parts: Vec<(QMatMul, Tensor)> = [512usize, 1280, 32]
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| operands(&dev, GgmlDType::Q8_0, m, n, k, 40 + i as u64))
+                .collect::<Result<_>>()?;
+            // One activation for all three: the segments read the same operand.
+            let x = &parts[0].1;
+            let acts = to_dynamic(x, Int8Mode::Performance, &dev, SumScale::Raw)?;
+            let DynamicActs::Int8(op) = &acts else {
+                unreachable!("an int8 mode quantizes")
+            };
+            let mut segs = Vec::new();
+            let mut alone = Vec::new();
+            for (w, _) in &parts {
+                let q = w.qtensor().expect("a KO weight");
+                let ptr = match &q.storage {
+                    QStorage::Cuda(cs) => cs.data_ptr(),
+                    _ => unreachable!("a CUDA weight"),
+                };
+                segs.push((ptr, q.shape().dims()[0]));
+                alone.push(run(&dev, w, x, dense_k_split_depth(k, 7))?);
+            }
+            let dtype = parts[0].0.qtensor().expect("KO").dtype();
+            let total: usize = segs.iter().map(|&(_, n)| n).sum();
+            for depth in [2usize, 7, 20] {
+                let got = q8a128_dense_matmul_split_k_segmented(
+                    op,
+                    &segs,
+                    dtype,
+                    dense_k_split_depth(k, depth),
+                    DType::F32,
+                    &dev,
+                )?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+                let mut col = 0usize;
+                for (s, &(_, n)) in segs.iter().enumerate() {
+                    for r in 0..m {
+                        assert_eq!(
+                            &got[r * total + col..r * total + col + n],
+                            &alone[s][r * n..(r + 1) * n],
+                            "{m} rows, depth {depth}: segment {s} row {r}"
+                        );
+                    }
+                    col += n;
+                }
             }
         }
         Ok(())

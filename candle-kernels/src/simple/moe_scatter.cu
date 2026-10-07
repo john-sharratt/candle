@@ -282,18 +282,20 @@ template<> __device__ __forceinline__ float moe_route_to_f32<float>(float x) { r
 template<> __device__ __forceinline__ float moe_route_to_f32<__half>(__half x) { return __half2float(x); }
 template<> __device__ __forceinline__ float moe_route_to_f32<__nv_bfloat16>(__nv_bfloat16 x) { return __bfloat162float(x); }
 
+// `row_stride` is the logits' row pitch in elements, `≥ n_experts`: a router whose
+// projection shares its launch with others reads its columns of the wider row in place.
 template<typename T, int SLOTS>
 __device__ void moe_route_impl(
-    const T*       __restrict__ logits,      // [num_tokens, n_experts]
+    const T*       __restrict__ logits,      // [num_tokens, row_stride], first n_experts columns
     uint32_t*      __restrict__ out_idx,     // [num_tokens, k]
     float*         __restrict__ out_weights, // [num_tokens, k]
-    int num_tokens, int n_experts, int k, int norm_topk
+    int num_tokens, int n_experts, int row_stride, int k, int norm_topk
 ) {
     const unsigned FULL = 0xffffffffu;
     const int lane  = (int)(threadIdx.x & 31);
     const int token = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     if (token >= num_tokens) return;  // whole warp shares `token`, so it exits together
-    const T* row = logits + (size_t)token * (size_t)n_experts;
+    const T* row = logits + (size_t)token * (size_t)row_stride;
 
     // Coalesced single read of this lane's experts into registers (−inf pads the tail).
     float v[SLOTS];
@@ -352,7 +354,16 @@ __device__ void moe_route_impl(
         // already written to survive. Below that width the index is in bounds but
         // still masks a slot no round asked for, so the guard is on the sentinel
         // rather than on the width.
-        if (bi < n_experts && lane == (bi & 31)) v[bi >> 5] = -INFINITY;
+        //
+        // Masked by an unrolled compare, not `v[bi >> 5]`: a runtime index into
+        // the per-lane array puts the whole array in local memory, and every
+        // round's scan above then reads it from there — on the 512-expert
+        // instantiation that was the kernel's entire cost, 7.6 µs for a top-10
+        // over five rows. Statically indexed, `v` stays in registers.
+        #pragma unroll
+        for (int j = 0; j < SLOTS; ++j) {
+            if (bi < n_experts && lane + 32 * j == bi) v[j] = -INFINITY;
+        }
     }
 
     if (lane == 0) {
@@ -378,45 +389,20 @@ __device__ void moe_route_impl(
     }
 }
 
-extern "C" __global__ void moe_route_f32(
-    const float* logits, uint32_t* out_idx, float* out_weights,
-    int num_tokens, int n_experts, int k, int norm_topk
-) {
-    moe_route_impl<float, 8>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-}
+#define MOE_ROUTE_ENTRY(name, T, SLOTS)                                                  \
+    extern "C" __global__ void name(                                                     \
+        const T* logits, uint32_t* out_idx, float* out_weights,                          \
+        int num_tokens, int n_experts, int row_stride, int k, int norm_topk              \
+    ) {                                                                                  \
+        moe_route_impl<T, SLOTS>(logits, out_idx, out_weights, num_tokens, n_experts,    \
+                                 row_stride, k, norm_topk);                              \
+    }
 
-extern "C" __global__ void moe_route_f16(
-    const __half* logits, uint32_t* out_idx, float* out_weights,
-    int num_tokens, int n_experts, int k, int norm_topk
-) {
-    moe_route_impl<__half, 8>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-}
-
-extern "C" __global__ void moe_route_bf16(
-    const __nv_bfloat16* logits, uint32_t* out_idx, float* out_weights,
-    int num_tokens, int n_experts, int k, int norm_topk
-) {
-    moe_route_impl<__nv_bfloat16, 8>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-}
-
+MOE_ROUTE_ENTRY(moe_route_f32, float, 8)
+MOE_ROUTE_ENTRY(moe_route_f16, __half, 8)
+MOE_ROUTE_ENTRY(moe_route_bf16, __nv_bfloat16, 8)
 // The 512-expert instantiations (16 slots per lane) — qwen4exp's router.
-extern "C" __global__ void moe_route_f32_x512(
-    const float* logits, uint32_t* out_idx, float* out_weights,
-    int num_tokens, int n_experts, int k, int norm_topk
-) {
-    moe_route_impl<float, 16>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-}
-
-extern "C" __global__ void moe_route_f16_x512(
-    const __half* logits, uint32_t* out_idx, float* out_weights,
-    int num_tokens, int n_experts, int k, int norm_topk
-) {
-    moe_route_impl<__half, 16>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-}
-
-extern "C" __global__ void moe_route_bf16_x512(
-    const __nv_bfloat16* logits, uint32_t* out_idx, float* out_weights,
-    int num_tokens, int n_experts, int k, int norm_topk
-) {
-    moe_route_impl<__nv_bfloat16, 16>(logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-}
+MOE_ROUTE_ENTRY(moe_route_f32_x512, float, 16)
+MOE_ROUTE_ENTRY(moe_route_f16_x512, __half, 16)
+MOE_ROUTE_ENTRY(moe_route_bf16_x512, __nv_bfloat16, 16)
+#undef MOE_ROUTE_ENTRY

@@ -131,6 +131,44 @@ impl Qwen35MoeBlock {
         decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<MoeParts<'w>> {
+        // **The three projections of the layer input as one launch.** The router, the
+        // shared expert's fused gate_up and its gate all read the same q8a128 operand, and
+        // at decode width each was a narrow split-K launch of its own, latency-bound at a
+        // few microseconds apiece. Stacked, they are one launch writing
+        // `[router | gate_up | gate]` side by side, and every column is the one its own
+        // launch computed, bit for bit (`QMatMul::forward_stacked`). The parts below read
+        // their columns of that row in place.
+        if let (DynamicActs::Int8(op), Some(gate_up)) = (&acts, self.shared.fused_gate_up()) {
+            let n_experts = self.routed.gate.weight_dims()[0];
+            let n_gate_up = gate_up.weight_dims()[0];
+            let half = n_gate_up / 2;
+            let stacked = QMatMul::forward_stacked(
+                op,
+                &[&self.routed.gate, gate_up, &self.shared_gate],
+                out_dtype,
+            )?;
+            let width = stacked.dim(stacked.rank() - 1)?;
+            let rows = stacked.elem_count() / width;
+            let flat = stacked.reshape((rows, width))?;
+            let lead: Vec<usize> = op.lead.clone();
+            let gate_half = flat.narrow(1, n_experts, half)?;
+            let up_half = flat.narrow(1, n_experts + half, half)?;
+            let y = self
+                .shared
+                .forward_from_gate_up(&gate_half, &up_half, out_dtype)?;
+            let mut y_dims = lead;
+            y_dims.push(y.dim(y.rank() - 1)?);
+            let shared = SharedExpertParts {
+                y: y.reshape(y_dims)?,
+                // The gate weight is padded to a full KO tile; its first column is the gate.
+                gate: flat.narrow(1, n_experts + n_gate_up, 1)?,
+            };
+            let logits = flat.narrow(1, 0, n_experts)?;
+            let routed = self
+                .routed
+                .forward_with_logits(logits, acts, out_dtype, decode, wave)?;
+            return Ok(MoeParts { routed, shared });
+        }
         // Shared expert first — see the module note on ownership.
         let shared = shared_expert_parts(&self.shared, &self.shared_gate, &acts, out_dtype)?;
         let routed = self.routed.forward_dynamic(acts, out_dtype, decode, wave)?;

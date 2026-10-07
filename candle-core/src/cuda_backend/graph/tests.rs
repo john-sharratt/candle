@@ -304,6 +304,7 @@ fn migrated_launchers_record_on_the_capture_stream() -> Result<()> {
                 wp as *mut f32,
                 ROWS as i32,
                 EXPERTS as i32,
+                EXPERTS as i32,
                 TOP_K as i32,
                 1,
                 s,

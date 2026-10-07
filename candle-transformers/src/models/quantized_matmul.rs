@@ -1,5 +1,5 @@
 #[cfg(feature = "cuda")]
-use candle::quantized::cuda::DynamicTensor;
+use candle::quantized::cuda::{DynamicTensor, Q8a128Operand};
 #[cfg(feature = "cuda")]
 use candle::quantized::ko_quant::ko_tileable;
 use candle::quantized::{GgmlDType, Int8Mode, QTensor, SumScale};
@@ -448,6 +448,23 @@ impl QMatMul {
         // Int8 (pre-quantized) activation × KO weight, stored at the compute dtype.
         let t_mm = profile_now();
         let out = self.inner.forward_dynamic(input, out_dtype)?;
+        pipeline_record("qmatmul_q8", t_mm);
+        Ok(out)
+    }
+
+    /// Several projections of the same pre-quantized activation in ONE launch, their outputs
+    /// side by side — `[lead.., ΣNᵢ]`, projection `i`'s columns after those before it — each
+    /// column bit for bit what [`Self::forward_dynamic`] on that weight computes. Every weight
+    /// must be a KO int8 twin, which an int8 operand already requires of each of them.
+    #[cfg(feature = "cuda")]
+    pub fn forward_stacked<'w>(
+        op: &Q8a128Operand<'w>,
+        weights: &[&QMatMul],
+        out_dtype: DType,
+    ) -> Result<LiveTensor<'w>> {
+        let inner: Vec<&candle::quantized::QMatMul> = weights.iter().map(|w| &w.inner).collect();
+        let t_mm = profile_now();
+        let out = candle::quantized::QMatMul::forward_stacked(op, &inner, out_dtype)?;
         pipeline_record("qmatmul_q8", t_mm);
         Ok(out)
     }

@@ -70,6 +70,8 @@
 // The one q8a128 tile emitter: the two q8 producers below write, from the same
 // floats, exactly what `quantize_q8a128_kernel` writes.
 #include "../quantize/q8a128_tile.cuh"
+// The trigger that lets a programmatic launch behind the norm start early.
+#include "../quantized/pdl.cuh"
 
 namespace gr_hyper {
 
@@ -276,6 +278,10 @@ extern "C" __global__ void __launch_bounds__(THREADS) gr_norm_q8_kernel(
     const float* __restrict__ x, const float* __restrict__ gain, float* __restrict__ xn,
     uint8_t* __restrict__ q8, int d, int hc, float eps, int sum_norm
 ) {
+    // Its consumer is the hyper-connection `down`, a programmatic launch
+    // (`quantized/pdl.cuh`): let it start prefetching its weights now. It waits for
+    // this grid to finish before it reads `q8`.
+    pdl_launch_dependents();
     gr_norm_body<true>(x, gain, xn, q8, d, hc, eps, 1, sum_norm);
 }
 

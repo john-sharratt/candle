@@ -981,12 +981,12 @@ extern "C" __global__ void moe_gather_f32(float*, const float*, const uint32_t*,
 extern "C" __global__ void moe_gather_q8a128_tiles(uint8_t*, const uint8_t*, const uint32_t*, size_t, size_t);
 // Fused router: softmax + top-k select + (optional) renormalize, one thread per token.
 // The `_x512` variants are the 16-slot instantiation (up to 512 experts).
-extern "C" __global__ void moe_route_f32(const float*, uint32_t*, float*, int, int, int, int);
-extern "C" __global__ void moe_route_f16(const __half*, uint32_t*, float*, int, int, int, int);
-extern "C" __global__ void moe_route_bf16(const __nv_bfloat16*, uint32_t*, float*, int, int, int, int);
-extern "C" __global__ void moe_route_f32_x512(const float*, uint32_t*, float*, int, int, int, int);
-extern "C" __global__ void moe_route_f16_x512(const __half*, uint32_t*, float*, int, int, int, int);
-extern "C" __global__ void moe_route_bf16_x512(const __nv_bfloat16*, uint32_t*, float*, int, int, int, int);
+extern "C" __global__ void moe_route_f32(const float*, uint32_t*, float*, int, int, int, int, int);
+extern "C" __global__ void moe_route_f16(const __half*, uint32_t*, float*, int, int, int, int, int);
+extern "C" __global__ void moe_route_bf16(const __nv_bfloat16*, uint32_t*, float*, int, int, int, int, int);
+extern "C" __global__ void moe_route_f32_x512(const float*, uint32_t*, float*, int, int, int, int, int);
+extern "C" __global__ void moe_route_f16_x512(const __half*, uint32_t*, float*, int, int, int, int, int);
+extern "C" __global__ void moe_route_bf16_x512(const __nv_bfloat16*, uint32_t*, float*, int, int, int, int, int);
 // Deterministic scatter (sequential per-token reduce, no atomicAdd, variable k via prefix sum)
 extern "C" __global__ void deterministic_scatter_bf16(__nv_bfloat16*, const __nv_bfloat16*, const uint32_t*, const float*, const uint32_t*, const int*, int, int);
 extern "C" __global__ void deterministic_scatter_f16(__half*, const __half*, const uint32_t*, const float*, const uint32_t*, const int*, int, int);
@@ -1554,9 +1554,11 @@ void run_moe_gather(int32_t dtype, void* out, const void* xs,
 // in `dtype` (0=f32,1=f16,2=bf16); writes top-k expert indices (u32) and routing weights
 // (f32), both [num_tokens, k] in descending-logit order. `norm_topk` selects renormalized
 // top-k softmax (1) vs plain full-softmax weights (0).
+// `row_stride` — the logits' row pitch in elements, at least `n_experts`.
 void run_moe_route(int32_t dtype, const void* logits, uint32_t* out_idx, float* out_weights,
-                   int num_tokens, int n_experts, int k, int norm_topk, cudaStream_t stream) {
-    if (num_tokens == 0) return;
+                   int num_tokens, int n_experts, int row_stride, int k, int norm_topk,
+                   cudaStream_t stream) {
+    if (num_tokens == 0 || row_stride < n_experts) return;
     // One warp per token; 256-thread blocks pack 8 warps (= 8 tokens) each.
     const int tpb = 256;
     const int warps_per_block = tpb / 32;
@@ -1566,16 +1568,16 @@ void run_moe_route(int32_t dtype, const void* logits, uint32_t* out_idx, float* 
     const bool wide = n_experts > 256;
     switch (dtype) {
         case 0: // f32
-            if (wide) moe_route_f32_x512<<<blocks, tpb, 0, stream>>>((const float*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-            else      moe_route_f32<<<blocks, tpb, 0, stream>>>((const float*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            if (wide) moe_route_f32_x512<<<blocks, tpb, 0, stream>>>((const float*)logits, out_idx, out_weights, num_tokens, n_experts, row_stride, k, norm_topk);
+            else      moe_route_f32<<<blocks, tpb, 0, stream>>>((const float*)logits, out_idx, out_weights, num_tokens, n_experts, row_stride, k, norm_topk);
             break;
         case 1: // f16
-            if (wide) moe_route_f16_x512<<<blocks, tpb, 0, stream>>>((const __half*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-            else      moe_route_f16<<<blocks, tpb, 0, stream>>>((const __half*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            if (wide) moe_route_f16_x512<<<blocks, tpb, 0, stream>>>((const __half*)logits, out_idx, out_weights, num_tokens, n_experts, row_stride, k, norm_topk);
+            else      moe_route_f16<<<blocks, tpb, 0, stream>>>((const __half*)logits, out_idx, out_weights, num_tokens, n_experts, row_stride, k, norm_topk);
             break;
         case 2: // bf16
-            if (wide) moe_route_bf16_x512<<<blocks, tpb, 0, stream>>>((const __nv_bfloat16*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
-            else      moe_route_bf16<<<blocks, tpb, 0, stream>>>((const __nv_bfloat16*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            if (wide) moe_route_bf16_x512<<<blocks, tpb, 0, stream>>>((const __nv_bfloat16*)logits, out_idx, out_weights, num_tokens, n_experts, row_stride, k, norm_topk);
+            else      moe_route_bf16<<<blocks, tpb, 0, stream>>>((const __nv_bfloat16*)logits, out_idx, out_weights, num_tokens, n_experts, row_stride, k, norm_topk);
             break;
     }
 }

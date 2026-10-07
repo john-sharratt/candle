@@ -5,6 +5,10 @@
 
 use core::ffi::c_void;
 
+/// The most weight segments one split-K dense launch takes ([`run_dense_int8_splitk`]),
+/// mirroring `SPLITK_MAX_SEGS` in `quantized/splitk_segs.cuh`.
+pub const SPLITK_MAX_SEGS: usize = 4;
+
 /// Segment descriptor for segmented dispatch.
 /// One per expert (MoE) or one total (non-MoE).
 /// Matches C-side `vx_segment_t` in dispatcher.cu.
@@ -242,23 +246,27 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
-    /// Split-K int8 dense matmul: q8a128 activations `[M, K]` × one KO weight `[N, K]` →
-    /// `dst [M, N]` at `out_dtype`, with K cut into `splits` slices so a decode-width
-    /// projection with a narrow N fills the card.
-    /// - `ws`: `K/128 × M × N` F32 partials — one per K tile — device memory.
+    /// Split-K int8 dense matmul: q8a128 activations `[M, K]` × `num_segs` KO weights of one
+    /// format, `weights[s]` of `nrows[s]` rows (each a multiple of 32, at most
+    /// [`SPLITK_MAX_SEGS`]) → `dst [M, ΣN]` at `out_dtype`, segment `s` in the columns after
+    /// the segments before it. K is cut into `splits` slices so a decode-width projection
+    /// with a narrow N fills the card; segments that read one operand share the launch.
+    /// - `weights`, `nrows`: HOST arrays of `num_segs` entries.
+    /// - `ws`: `K/128 × M × ΣN` F32 partials — one per K tile — device memory.
     /// - `counters`: one u32 per (16-token tile, 32-row tile), all ZERO on entry; the kernel
     ///   leaves them zero, so one buffer serves every launch ordered on the same stream.
     ///
     /// The sum over K tiles runs in tile order in whichever block finishes last — the chain the
-    /// unsplit kernel folds in for the affine KO formats, so the result is the unsplit kernel's
-    /// bit for bit. MXFP4 is not split (its per-sub fold has no per-tile partial). Returns a
-    /// [`MatmulStatus`] code.
+    /// unsplit kernel folds in for the affine KO formats, so every output column is the unsplit
+    /// kernel's bit for bit, whatever the segments beside it. MXFP4 is not split (its per-sub
+    /// fold has no per-tile partial). Returns a [`MatmulStatus`] code.
     pub fn run_dense_int8_splitk(
-        weights: *const c_void,
+        weights: *const *const c_void,
+        nrows: *const i32,
+        num_segs: i32,
         vy: *const c_void,
         dst: *mut c_void,
         ncols_x: i32,
-        nrows_x: i32,
         total_batch: i32,
         qtype: i32,
         out_dtype: i32,

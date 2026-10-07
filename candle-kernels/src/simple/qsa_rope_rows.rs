@@ -40,4 +40,31 @@ extern "C" {
         q_scale: i32,
         stream: *mut c_void,
     );
+
+    /// The rows of a dense `src`, RMS-normed — `x / sqrt(Σx²·(1/d) + eps) · norm_w`
+    /// — then rotated exactly as [`run_qsa_rope_rows`] rotates them, in one launch.
+    /// `d` must not exceed [`QSA_ROPE_NORM_MAX_D`]; the kernel writes nothing for a
+    /// shape outside its bounds, which the caller checks first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_qsa_rope_rows_norm(
+        src: *const f32,
+        dst: *mut f32,
+        n_rows: i32,
+        d: i32,
+        rows_per_pos: i32,
+        pos: *const u32,
+        pos_base: i64,
+        pos_step: i32,
+        rungs: RopeRungsFfi,
+        group_rung: *const u32,
+        rung: u32,
+        q_scale: i32,
+        norm_w: *const f32,
+        eps: f32,
+        stream: *mut c_void,
+    );
 }
+
+/// The widest row [`run_qsa_rope_rows_norm`] takes, mirroring `NORM_MAX_D` in
+/// `simple/qsa_rope_rows.cu`.
+pub const QSA_ROPE_NORM_MAX_D: usize = 256;

@@ -8939,6 +8939,29 @@ fn cuda_moe_route_matches_reference() -> Result<()> {
     Ok(())
 }
 
+/// A router whose projection shared its launch reads its columns of the wider row in
+/// place: routing the first 512 columns of a 1824-wide row is routing those columns
+/// copied out, index for index and bit for bit.
+#[test]
+fn cuda_moe_route_reads_a_strided_row() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let (rows, width, experts, k) = (5usize, 1824usize, 512usize, 10usize);
+    let data: Vec<f32> = (0..rows * width)
+        .map(|i| (((i * 131 + 17) % 521) as f32) * 0.5)
+        .collect();
+    let wide = crate::Tensor::from_vec(data, (rows, width), &device)?;
+    let view = wide.narrow(1, 0, experts)?;
+    let packed = view.contiguous()?;
+    for norm in [true, false] {
+        let (w_view, i_view) = moe_route(&view, k, norm)?;
+        let (w_packed, i_packed) = moe_route(&packed, k, norm)?;
+        assert_eq!(i_view.to_vec2::<u32>()?, i_packed.to_vec2::<u32>()?, "norm={norm}");
+        assert_eq!(w_view.to_vec2::<f32>()?, w_packed.to_vec2::<f32>()?, "norm={norm}");
+    }
+    Ok(())
+}
+
 /// Degenerate-logit guard: a token whose logits are all `-inf`/`NaN`, or that has
 /// fewer finite experts than `k`, must NEVER route to an out-of-range expert. The
 /// kernel seeds its argmax with `bi = n_experts` as a "not found" sentinel; if that
@@ -9103,6 +9126,7 @@ fn bench_moe_route() -> Result<()> {
                     iptr as *mut u32,
                     wptr as *mut f32,
                     nt as i32,
+                    n_experts as i32,
                     n_experts as i32,
                     k as i32,
                     1,

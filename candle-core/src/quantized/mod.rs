@@ -3012,6 +3012,43 @@ impl QMatMul {
         cuda::qkv_segmented_matmul(op, &segs, out_dtype, &device)
     }
 
+    /// Several KO weights that read the same q8a128 operand `op`, in ONE launch: `[lead.., ΣNᵢ]`,
+    /// weight `i`'s columns after those before it, stored at `out_dtype`. Every column is the
+    /// one that weight's own [`forward_dynamic`](Self::forward_dynamic) computes, bit for bit —
+    /// see [`cuda::dense_qmatmul_stacked`] for the launch it picks. Each weight must be a KO
+    /// QTensor on CUDA with a multiple of 32 rows.
+    #[cfg(feature = "cuda")]
+    pub fn forward_stacked<'w>(
+        op: &cuda::Q8a128Operand<'w>,
+        weights: &[&QMatMul],
+        out_dtype: crate::DType,
+    ) -> Result<LiveTensor<'w>> {
+        let mut segs = Vec::with_capacity(weights.len());
+        let mut device = None;
+        for w in weights {
+            let t = match w {
+                Self::QTensor(t) => t,
+                _ => crate::bail!("forward_stacked requires KO QTensor weights"),
+            };
+            let cs = match &t.storage {
+                QStorage::Cuda(cs) => cs,
+                _ => crate::bail!("forward_stacked requires CUDA storage"),
+            };
+            if t.shape().dims()[1] != op.cols {
+                crate::bail!(
+                    "forward_stacked: a {:?} weight against a {}-wide operand",
+                    t.shape().dims(),
+                    op.cols
+                );
+            }
+            device = Some(cs.device().clone());
+            segs.push((cs.data_ptr(), t.dtype(), t.shape().dims()[0]));
+        }
+        let device =
+            device.ok_or_else(|| crate::Error::Msg("forward_stacked: no weights".into()))?;
+        cuda::dense_qmatmul_stacked(op, &segs, out_dtype, &device)
+    }
+
     /// Int8 tensor-core matmul: q8a128 activations × KO weights. The weight must already be the
     /// KO twin QTensor on CUDA (produced by [`QMatMul::repack_for_optimization`] with an int8
     /// `mode`) — the twin choice was baked in at repack time, so here `mode` only selects the

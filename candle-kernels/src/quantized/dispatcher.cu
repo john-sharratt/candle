@@ -40,6 +40,8 @@
 #include "dispatch_table.cuh"
 #include "matmul_status.cuh"  // QMM_* launcher status codes
 #include "moe_live.cuh"       // the grouped launch's workers over a live expert table
+#include "splitk_segs.cuh"    // the split-K launch's weight segments
+#include "pdl.cuh"            // programmatic dependent launch for the weight GEMMs that wait
 
 // =============================================================================
 // L2 CACHE FLUSH UTILITY
@@ -740,7 +742,7 @@ DECL_DENSE_INT8_M2_ALL(q3_ko_int8)
 
 // Split-K twins of the KO dense kernels — decode width, narrow N (see run_dense_int8_splitk).
 #define DECL_DENSE_INT8_SK(name) \
-    extern "C" __global__ void name(const void*, const void*, void*, int, int, int, int, int, \
+    extern "C" __global__ void name(const SplitKSegs, const void*, void*, int, int, int, int, \
                                     float*, unsigned int*);
 #define DECL_DENSE_INT8_SK_ALL(base) \
     DECL_DENSE_INT8_SK(base##_f16_dense_sk) \
@@ -848,17 +850,21 @@ static_assert(
     (int)(sizeof(dense_kernels_int8_sk[0]) / sizeof(dense_kernels_int8_sk[0][0])) == KO_ROW_COUNT,
     "every KO format must have a split-K entry (null where it never splits)");
 
-// Split-K int8 dense matmul: the mode-1 tile grid (ceil(M/16) × N/32) times `splits`
-// slices of K. Rust decides `splits` (q8a128_dense_k_splits) and owns the scratch:
-// `ws` holds K-tiles × M × N F32 partials (one per K tile), `counters` one zeroed u32
-// per (batch tile, row tile), returned to zero by the kernel itself. Both must be
-// stream-ordered with every other split-K launch that shares them.
+// Split-K int8 dense matmul: the mode-1 tile grid (ceil(M/16) × ΣN/32) times `splits`
+// slices of K, over `num_segs` weight segments of one KO format sharing the activation
+// (`splitk_segs.cuh`) — `weights[s]` of `nrows[s]` rows, each a multiple of 32, written
+// to consecutive column ranges of the `ΣN`-wide output. Rust decides `splits`
+// (q8a128_dense_k_splits) and owns the scratch: `ws` holds K-tiles × M × ΣN F32 partials
+// (one per K tile), `counters` one zeroed u32 per (batch tile, row tile), returned to
+// zero by the kernel itself. Both must be stream-ordered with every other split-K
+// launch that shares them.
 extern "C" int run_dense_int8_splitk(
-    const void* weights,
+    const void* const* weights,
+    const int32_t* nrows,
+    int32_t num_segs,
     const void* vy,
     void* dst,
     int32_t ncols_x,      // K
-    int32_t nrows_x,      // N
     int32_t total_batch,  // M
     int32_t qtype,
     int32_t out_dtype,
@@ -881,17 +887,38 @@ extern "C" int run_dense_int8_splitk(
     if (kfn == nullptr || splits < 2 || splits > ncols_x / 128) {
         return QMM_BAD_SPLIT;
     }
+    if (num_segs < 1) {
+        return QMM_NO_SEGMENTS;
+    }
+    if (num_segs > SPLITK_MAX_SEGS) {
+        return QMM_NO_KERNEL;
+    }
+    SplitKSegs segs;
+    int tile = 0, col = 0;
+    for (int s = 0; s < num_segs; ++s) {
+        if (nrows[s] <= 0 || nrows[s] % 32 != 0) {
+            return QMM_NO_KERNEL;
+        }
+        segs.w[s] = weights[s];
+        segs.tile_start[s] = tile;
+        segs.n[s] = nrows[s];
+        segs.col_off[s] = col;
+        tile += nrows[s] / 32;
+        col += nrows[s];
+    }
+    segs.tile_start[num_segs] = tile;
+    segs.num = num_segs;
     const int batch_tiles = (total_batch + 15) / 16;
-    const int row_tiles = (nrows_x + 31) / 32;
-    dim3 grid(batch_tiles, row_tiles, splits);
+    dim3 grid(batch_tiles, tile, splits);
     dim3 block(WARP_SIZE, 4, 1);
-    const int dst_stride = nrows_x;
+    const int dst_stride = col;
     void* args[] = {
-        (void*)&weights, (void*)&vy, (void*)&dst,
-        (void*)&ncols_x, (void*)&nrows_x, (void*)&total_batch,
+        (void*)&segs, (void*)&vy, (void*)&dst,
+        (void*)&ncols_x, (void*)&total_batch,
         (void*)&dst_stride, (void*)&sum_norm, (void*)&ws, (void*)&counters,
     };
-    if (cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
+    // The split-K entry waits (`pdl_wait`) before its activation, partials and counters.
+    if (launch_pdl(kfn, grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
         return QMM_LAUNCH_FAILED;
     }
     return QMM_OK;
@@ -936,8 +963,9 @@ extern "C" int run_dense_int8_silu_q8ko_f32(
         (void*)&ncols_x, (void*)&nrows_x, (void*)&total_batch,
         (void*)&dst_stride, (void*)&sum_norm,
     };
-    if (cudaLaunchKernel(mode2 ? (void*)q8_ko_int8_f32_dense_silu_m2 : (void*)q8_ko_int8_f32_dense_silu,
-                         grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
+    // The fused-activation entry waits (`pdl_wait`) before it reads `proj`.
+    if (launch_pdl(mode2 ? (void*)q8_ko_int8_f32_dense_silu_m2 : (void*)q8_ko_int8_f32_dense_silu,
+                   grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
         return QMM_LAUNCH_FAILED;
     }
     return QMM_OK;
@@ -1072,7 +1100,13 @@ extern "C" int run_quantized_matmul(
             (void*)&ncols_x, (void*)&nrows_x, (void*)&total_batch,
             (void*)&y_stride, (void*)&dst_stride, (void*)&sum_norm,
         };
-        if (cudaLaunchKernel(kfn, grid, block, args, 0, stream) != cudaSuccess) {
+        // The KO entries wait (`pdl_wait`) before reading the activation, so they launch
+        // programmatically; the legacy rows are no-op entries that never reach here in
+        // production and keep the ordinary launch.
+        const bool ko = kernel_row >= KO_ROW_FIRST && kernel_row - KO_ROW_FIRST < KO_ROW_COUNT;
+        const cudaError_t launched = ko ? launch_pdl(kfn, grid, block, args, 0, stream)
+                                        : cudaLaunchKernel(kfn, grid, block, args, 0, stream);
+        if (launched != cudaSuccess) {
             return QMM_LAUNCH_FAILED;
         }
         return QMM_OK;

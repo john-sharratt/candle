@@ -510,6 +510,101 @@ __device__ void finish_row(
     }
 }
 
+// Exclusive block-wide prefix sum of each thread's `v`, with the block's total
+// in `*total`: a shuffle scan per warp, then one over the warp totals. `warp_sums`
+// is THREADS / 32 ints of scratch.
+__device__ __forceinline__ int block_exclusive_scan(int v, int* warp_sums, int* total, int tid) {
+    const int lane = tid & (WARP - 1);
+    const int warp = tid / WARP;
+    int incl = v;
+#pragma unroll
+    for (int off = 1; off < WARP; off <<= 1) {
+        const int u = __shfl_up_sync(0xFFFFFFFFu, incl, off);
+        if (lane >= off) incl += u;
+    }
+    if (lane == WARP - 1) warp_sums[warp] = incl;
+    __syncthreads();
+    if (warp == 0) {
+        constexpr int WARPS = THREADS / WARP;
+        int w = lane < WARPS ? warp_sums[lane] : 0;
+#pragma unroll
+        for (int off = 1; off < WARPS; off <<= 1) {
+            const int u = __shfl_up_sync(0xFFFFFFFFu, w, off);
+            if (lane >= off) w += u;
+        }
+        if (lane < WARPS) warp_sums[lane] = w;
+    }
+    __syncthreads();
+    const int before = warp > 0 ? warp_sums[warp - 1] : 0;
+    *total = warp_sums[THREADS / WARP - 1];
+    return before + incl - v;
+}
+
+// The single-window row's selection, written ascending without sorting it.
+//
+// One window draws its pool from disjoint ranges, so no block is chosen twice
+// and the widest-cut reduction `finish_row` sorts for has nothing to reduce: the
+// answer is the settled buffer's `keep` blocks in ascending order. A bitmap over
+// the candidate blocks gives that order directly — each survivor sets its block's
+// bit, each thread counts the set bits of a contiguous run of words, and one scan
+// places them. The entries, their order and the partial cut on the
+// threshold's block are exactly what `emit_window` and `finish_row` produce; the
+// bitonic sort of `keep` entries and its ~45 barrier stages are what is gone.
+//
+// `bits` holds at least `ceil(cand / 32)` words (the host's `ent_cap` is checked
+// against it by the caller), `warp_sums` THREADS / 32 ints.
+__device__ void finish_row_single(
+    const Survivors& s,
+    const Row& g,
+    int keep,
+    int ratio,
+    uint32_t* bits,
+    int* warp_sums,
+    uint32_t* __restrict__ out,
+    uint32_t* __restrict__ cnt_out,
+    int tid
+) {
+    const int words = (g.cand + 31) / 32;
+    for (int i = tid; i < words; i += THREADS) bits[i] = 0u;
+    __syncthreads();
+    for (int r = tid; r < keep; r += THREADS) {
+        const uint32_t b = key_block(s.buf[r]);
+        atomicOr(&bits[b >> 5], 1u << (b & 31));
+    }
+    __syncthreads();
+    const bool part = g.rem > 0 && keep > g.full;
+    const uint32_t last_block = key_block(*s.thr);
+    const int per = (words + THREADS - 1) / THREADS;
+    const int a = tid * per;
+    const int e = a + per < words ? a + per : words;
+    int mine = 0;
+    for (int i = a; i < e; ++i) mine += __popc(bits[i]);
+    int kept = 0;
+    int at = block_exclusive_scan(mine, warp_sums, &kept, tid);
+    for (int i = a; i < e; ++i) {
+        uint32_t w = bits[i];
+        while (w != 0u) {
+            const int bit = __ffs(w) - 1;
+            w &= w - 1u;
+            const uint32_t b = (uint32_t)(i * 32 + bit);
+            const int cells = (part && b == last_block) ? g.rem : ratio;
+            out[at++] = (b << 2) | (uint32_t)(cells - 1);
+        }
+    }
+    const int n_forced = g.cand - g.forced_lo;
+    for (int i = tid; i < n_forced; i += THREADS) {
+        out[kept + i] = ((uint32_t)(g.forced_lo + i) << 2) | (uint32_t)(ratio - 1);
+    }
+    if (tid == 0) {
+        int n = kept + n_forced;
+        if (g.n_tail > 0) {
+            out[n] = ((uint32_t)g.cand << 2) | (uint32_t)(g.n_tail - 1);
+            n += 1;
+        }
+        *cnt_out = (uint32_t)n;
+    }
+}
+
 // The shared-memory layout every kernel here uses: CAP u64 survivors, then the
 // entry buffer.
 struct Smem {
@@ -563,6 +658,7 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
     int window_blocks,
     int recent_blocks,
     int recent_forced,
+    int ent_cap,
     int n_rows
 ) {
     const int row = (int)blockIdx.x;
@@ -588,6 +684,24 @@ __global__ void __launch_bounds__(THREADS) qsa_topk_entries_kernel(
     if (tid == 0) s_n_ent = 0;
 
     const float* srow = scores + (size_t)row * (size_t)score_stride;
+    // One window whose bitmap fits the entry buffer writes its selection
+    // straight from the bitmap (`finish_row_single`); every other row gathers
+    // its windows' entries and sorts them.
+    if (g.n_win == 1 && (g.cand + 31) / 32 <= ent_cap) {
+        const Window v = window_of(g, 0, recent_forced);
+        const int pool = span_len(v.lo, v.r1_hi) + shared_pool(g, v);
+        const int keep = g.keep < pool ? g.keep : pool;
+        uint32_t* out = entries + (size_t)row * (size_t)entry_stride;
+        if (keep > 0) {
+            survivors_reset(m.s, tid);
+            const int n = offer_pool(m.s, srow, g, v, v.lo, v.r1_hi, true, keep, tid);
+            survivors_finish(m.s, keep, n, tid);
+        }
+        __shared__ int s_warp_sums[THREADS / WARP];
+        finish_row_single(
+            m.s, g, keep > 0 ? keep : 0, ratio, m.ent, s_warp_sums, out, cnt + row, tid);
+        return;
+    }
     for (int w = 0; w < g.n_win; ++w) {
         const Window v = window_of(g, w, recent_forced);
         const int pool = span_len(v.lo, v.r1_hi) + shared_pool(g, v);
@@ -839,7 +953,7 @@ extern "C" void run_qsa_topk_entries(
         qsa_topk::opt_in_smem(qsa_topk::qsa_topk_entries_kernel, qsa_topk::entries_granted, smem);
         qsa_topk::qsa_topk_entries_kernel<<<(unsigned)n_rows, qsa_topk::THREADS, smem, s>>>(
             scores, score_stride, n_cand, qpos, tail_len, prompt_blocks, entries, entry_stride,
-            cnt, ratio, top_k, window_blocks, recent_blocks, recent_forced, n_rows);
+            cnt, ratio, top_k, window_blocks, recent_blocks, recent_forced, ent_cap, n_rows);
         return;
     }
     const int win = (window_blocks > 0 && window_blocks < cand_max) ? window_blocks : cand_max;

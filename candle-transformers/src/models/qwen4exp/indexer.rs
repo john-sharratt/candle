@@ -49,7 +49,7 @@ use super::index_keys::{
     alloc_buffers, row_addr, write_host, KeyPages, SnapshotBuffer, SnapshotBuffers,
     SNAPSHOT_BUFFERS,
 };
-use super::qsa::{rms_norm_last, IndexerWeights};
+use super::qsa::IndexerWeights;
 use super::qsa_select::{
     max_entries_for, max_gathered_for, max_keep, selected_width, Strata, MAX_RATIO,
 };
@@ -58,7 +58,7 @@ use super::rows_matmul::rows_matmul_t;
 use super::spec::SpecCapture;
 use crate::models::delta_net::mix::SeqSpan;
 use crate::models::delta_net::RecurrentCompaction;
-use crate::models::operand_guard::expect_dense;
+use crate::models::operand_guard::{expect_dense, expect_dense_dtype};
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::selection_strata::Recent;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
@@ -1326,8 +1326,16 @@ pub enum RotSide {
 
 /// The rows [`rotate_rows`] reads.
 pub enum RowSource<'a> {
-    /// One dense `[n, d]` tensor — a wave's queries.
+    /// One dense `[n, d]` tensor.
     Dense(&'a Tensor),
+    /// One dense `[n, d]` tensor RMS-normed over each row with `weight` and
+    /// `eps` before it rotates — a wave's queries, normed and rotated in one
+    /// launch with `qsa::rms_norm_last`'s arithmetic.
+    Normed {
+        rows: &'a Tensor,
+        weight: &'a Tensor,
+        eps: f64,
+    },
     /// `rows` rows of width `d` in pages of `rows_per_page`, row `r` at
     /// `pages[r / rows_per_page] + (r % rows_per_page)·d` floats — a live tail's
     /// keys, read in place.
@@ -1356,13 +1364,28 @@ pub fn rotate_rows(
     // The open layer phase, for the position and rung tables below.
     ticket: Option<WaveTicket>,
 ) -> Result<Tensor> {
-    use candle_kernels::simple::qsa_rope_rows::run_qsa_rope_rows;
+    use candle_kernels::simple::qsa_rope_rows::{
+        run_qsa_rope_rows, run_qsa_rope_rows_norm, QSA_ROPE_NORM_MAX_D,
+    };
 
     let (n, d, device) = match &src {
         RowSource::Dense(t) => {
             expect_dense(t, "qsa rope rows")?;
             let (n, d) = t.dims2()?;
             (n, d, t.device())
+        }
+        RowSource::Normed { rows, weight, .. } => {
+            expect_dense(rows, "qsa rope rows")?;
+            expect_dense_dtype(weight, DType::F32, "qsa rope rows norm weight")?;
+            let (n, d) = rows.dims2()?;
+            if weight.dims() != [d] || d > QSA_ROPE_NORM_MAX_D {
+                candle::bail!(
+                    "qsa rope rows: a {:?} norm weight on {d}-wide rows (at most {})",
+                    weight.dims(),
+                    QSA_ROPE_NORM_MAX_D
+                );
+            }
+            (n, d, rows.device())
         }
         RowSource::Paged {
             pages,
@@ -1455,6 +1478,7 @@ pub fn rotate_rows(
     // The page table, uploaded for the launch; the dense source needs none.
     let (src_ptr, pages_t, rows_per_src_page) = match &src {
         RowSource::Dense(t) => (tensor_ptr(t)?, None, 0usize),
+        RowSource::Normed { rows, .. } => (tensor_ptr(rows)?, None, 0usize),
         RowSource::Paged {
             pages,
             rows_per_page,
@@ -1481,6 +1505,32 @@ pub fn rotate_rows(
         candle::bail!("qsa rope rows runs on CUDA");
     };
     let stream = cuda.cuda_stream();
+    if let RowSource::Normed { weight, eps, .. } = &src {
+        candle::set_kernel_breadcrumb("run_qsa_rope_rows_norm", file!(), line!());
+        // SAFETY: `src_ptr` is `[n, d]` dense F32, `weight` `[d]` F32 and `dst`
+        // `[n, d]`, checked above; the position and rung tables are sized to the
+        // groups.
+        unsafe {
+            run_qsa_rope_rows_norm(
+                src_ptr as *const f32,
+                tensor_ptr(&dst)? as *mut f32,
+                n as i32,
+                d as i32,
+                rows_per_pos as i32,
+                pos_ptr,
+                base as i64,
+                step as i32,
+                rope.rungs().ffi()?,
+                rung_ptr,
+                rung,
+                i32::from(side == RotSide::Query),
+                tensor_ptr(weight)? as *const f32,
+                *eps as f32,
+                stream.cu_stream() as *mut c_void,
+            );
+        }
+        return Ok(dst);
+    }
     candle::set_kernel_breadcrumb("run_qsa_rope_rows", file!(), line!());
     unsafe {
         run_qsa_rope_rows(
@@ -1852,10 +1902,13 @@ pub fn project_queries(
     ticket: Option<WaveTicket>,
 ) -> Result<Tensor> {
     let rows = h.dim(0)?;
-    let q = rows_matmul_t(h, &w.q_proj)?.reshape((rows, cfg.n_heads, cfg.head_dim))?;
-    let q = rms_norm_last(&q, &w.q_norm, rms_eps)?.reshape((rows * cfg.n_heads, cfg.head_dim))?;
+    let q = rows_matmul_t(h, &w.q_proj)?.reshape((rows * cfg.n_heads, cfg.head_dim))?;
     rotate_rows(
-        RowSource::Dense(&q),
+        RowSource::Normed {
+            rows: &q,
+            weight: &w.q_norm,
+            eps: rms_eps,
+        },
         rope,
         cfg.n_heads,
         RowPositions::PerGroup(positions),
@@ -4263,6 +4316,84 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// **Normed rotation is the eager norm then the rotation, to rounding.** The
+    /// queries' fused launch against `rms_norm_last` followed by the dense
+    /// rotation, at the indexer's head width on two rungs; and the fused launch
+    /// repeats bit for bit.
+    #[test]
+    fn normed_rotation_is_the_eager_norm_then_the_rotation() -> Result<()> {
+        use super::super::qsa::rms_norm_last;
+        use crate::models::rope_schedule::{RopeRungs, RopeSchedule, Rung};
+        let Some(device) = cuda() else { return Ok(()) };
+        let schedule = RopeSchedule::yarn(
+            64,
+            1e6,
+            4096,
+            vec![
+                Rung {
+                    ceiling: 4096,
+                    factor: 1.0,
+                },
+                Rung {
+                    ceiling: 16384,
+                    factor: 4.0,
+                },
+            ],
+            true,
+        )?;
+        let rungs = RopeRungs::new(&schedule, &device)?;
+        let rope = FactoredRope::over(&rungs, &device)?;
+        let (heads, d) = (4usize, 128usize);
+        let pos = [3usize, 900, 5000, 12_000, 17];
+        let row_rung = [0u32, 0, 1, 1, 0];
+        let n = pos.len() * heads;
+        let src = Tensor::from_vec(lcg(n * d, 0x6B, 4.0), (n, d), &device)?;
+        let weight = Tensor::from_vec(lcg(d, 0x6C, 1.0), (d,), &device)?;
+        let eps = 1e-6;
+        let normed = || {
+            rotate_rows(
+                RowSource::Normed {
+                    rows: &src,
+                    weight: &weight,
+                    eps,
+                },
+                &rope,
+                heads,
+                RowPositions::PerGroup(&pos),
+                RowRungs::PerGroup(&row_rung),
+                RotSide::Query,
+                None,
+            )
+        };
+        let got = normed()?;
+        let eager = rms_norm_last(&src, &weight, eps)?;
+        let want = rotate_rows(
+            RowSource::Dense(&eager),
+            &rope,
+            heads,
+            RowPositions::PerGroup(&pos),
+            RowRungs::PerGroup(&row_rung),
+            RotSide::Query,
+            None,
+        )?;
+        let diff = (&got - &want)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        let scale = want.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        assert!(
+            diff <= 1e-5 * scale.max(1.0),
+            "fused norm+rotate off the eager chain by {diff} at scale {scale}"
+        );
+        assert_eq!(
+            got.flatten_all()?.to_vec1::<f32>()?,
+            normed()?.flatten_all()?.to_vec1::<f32>()?,
+            "the fused launch differs between two runs"
+        );
         Ok(())
     }
 

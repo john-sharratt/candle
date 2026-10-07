@@ -205,22 +205,44 @@ impl SparseMoeBlock {
         decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<LiveTensor<'w>> {
+        let num_tokens = match &acts {
+            DynamicActs::Float(t) => {
+                let (b, s, _) = t.dims3()?;
+                b * s
+            }
+            DynamicActs::Int8(op) => op.rows,
+        };
+        let router_logits = self
+            .gate
+            .forward_dynamic(acts.as_dynamic(), out_dtype)?
+            .reshape((num_tokens, ()))?;
+        self.forward_with_logits(router_logits, acts, out_dtype, decode, wave)
+    }
+
+    /// [`Self::forward_dynamic`] from router logits the caller already projected —
+    /// `[num_tokens, n_experts]`, rows at any pitch with unit-stride columns, so a router
+    /// that shared its launch with other projections of the same activation hands over
+    /// its columns of the wider row in place.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn forward_with_logits<'w>(
+        &self,
+        router_logits: LiveTensor<'w>,
+        acts: DynamicActs<'w>,
+        out_dtype: DType,
+        decode: &DecodeRows,
+        wave: Option<&'w WaveGeneration>,
+    ) -> Result<LiveTensor<'w>> {
         let (b_size, seq_len, hidden_dim) = match &acts {
             DynamicActs::Float(t) => t.dims3()?,
             DynamicActs::Int8(op) => match op.lead.as_slice() {
                 &[b, s] => (b, s, op.cols),
                 other => candle::bail!(
-                    "SparseMoeBlock::forward_dynamic: expected [b, seq] lead, got {other:?}"
+                    "SparseMoeBlock::forward_with_logits: expected [b, seq] lead, got {other:?}"
                 ),
             },
         };
-        let num_tokens = b_size * seq_len;
         let k = self.num_experts_per_tok;
         let t = profile_now();
-        let router_logits = self
-            .gate
-            .forward_dynamic(acts.as_dynamic(), out_dtype)?
-            .reshape((num_tokens, ()))?;
         // The router's own output is the first thing that can be bad here, and
         // `moe_route` clamps a sentinel out of `-inf`/NaN logits — so a NaN in
         // the logits is fixed up into a plausible route rather than propagating

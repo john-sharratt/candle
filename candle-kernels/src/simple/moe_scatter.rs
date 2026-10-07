@@ -46,7 +46,10 @@ extern "C" {
     /// softmax denominator, so the kernel makes a single pass over the experts.
     ///
     /// - `dtype`: MoeScatterDType value (logits dtype: 0=f32, 1=f16, 2=bf16)
-    /// - `logits`: device pointer to `[num_tokens, n_experts]`
+    /// - `logits`: device pointer to `[num_tokens, row_stride]`, the first `n_experts`
+    ///   columns of each row read — a router sharing its projection's launch reads its
+    ///   columns of the wider row in place
+    /// - `row_stride`: the logits' row pitch in elements, `≥ n_experts`
     /// - `out_idx`: device pointer to u32 `[num_tokens, k]` top-k expert indices (descending)
     /// - `out_weights`: device pointer to f32 `[num_tokens, k]` routing weights (descending)
     /// - `norm_topk`: 1 = renormalized top-k softmax, 0 = plain full-softmax weights
@@ -57,6 +60,7 @@ extern "C" {
         out_weights: *mut f32,
         num_tokens: i32,
         n_experts: i32,
+        row_stride: i32,
         k: i32,
         norm_topk: i32,
         stream: *mut c_void,
