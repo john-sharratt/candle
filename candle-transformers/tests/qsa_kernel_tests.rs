@@ -1681,6 +1681,270 @@ fn prefill_selected_walk_matches_masked_full_walk_at_hd256() -> Result<()> {
     )
 }
 
+/// **A verify window: a handful of query rows over a deep, sparse prefix.**
+///
+/// A speculative step verifies its drafts as a short prompt — five rows here —
+/// and a launch that small leaves most of the card idle, so the launcher splits
+/// the KV walk across `grid.z`. [`prefill_walk_case`] cannot reach that path: it
+/// sizes its grid to cover the SMs precisely so the walk runs unsplit. This is
+/// the split path at the depths decode runs at, against two oracles:
+///
+/// - **exact** — flipping every history position no row selects moves no output
+///   bit (each split stages only selected positions);
+/// - **tolerance** — the same rows with one row marked dense attend the same
+///   positions through a different tiling (a dense row walks the whole prefix
+///   block by block), so the sparse rows agree with that twin to int8 rounding
+///   and no further. A split that skipped part of the selection, or staged a
+///   block twice across a split boundary, misses by far more.
+fn prefill_verify_window_case(history: usize, seed: u64) -> Result<()> {
+    let _guard = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let g = FLASH_NEXT;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    // A verify window at the one-session draft ceiling: the step's token and
+    // four drafts.
+    const Q_LEN: usize = 5;
+    // The released checkpoint's indexer budget.
+    const TOP_K: usize = 2048;
+    // As in `prefill_walk_case`: a gain at which a misplaced column moves the
+    // answer, and the twin allowance an order above int8 rounding at it.
+    const PEAK_GAIN: f64 = 16.0;
+    const TWIN_TOL: f32 = 1e-2;
+    // The twin's dense row. It must share a block with the rows it is compared
+    // on: a block's rows share one walk, so a dense row alone in its block
+    // leaves the others' walk unchanged and the twin compares nothing. With four
+    // tokens to a block, row 3 puts rows 0–2 behind the dense walk.
+    const DENSE_ROW_AT: usize = 3;
+    assert_eq!(
+        prefill_block_tokens(g),
+        4,
+        "the dense row must share the first block"
+    );
+    let row_len = g.n_head * g.head_dim;
+
+    let (rows, selected): (Vec<Vec<u32>>, Vec<Vec<bool>>) = (0..Q_LEN)
+        .map(|t| budget_row(history + t + 1, TOP_K, t & 1))
+        .unzip();
+    let sparse = selection(&rows, &device)?;
+    let dense: Vec<bool> = (0..Q_LEN).map(|t| t == DENSE_ROW_AT).collect();
+    let twin_sel = mixed_selection(&rows, &dense, &device)?;
+
+    let (q_flat, k, v) = make_qkv_at(g, history, Q_LEN, seed, &[], &device)?;
+    let q_peak = (&q_flat * PEAK_GAIN)?;
+    let run = |backing: &ChunkedKvBacking,
+               cache: &mut KvCache,
+               sel: &QsaSelection,
+               q: &Tensor|
+     -> Result<Vec<f32>> {
+        backing.truncate_sequence_to_tokens(0, history)?;
+        backing.ensure_for_batch_entries(&[(0, history)], Q_LEN)?;
+        let generation = stager.begin_generation();
+        let out = {
+            let mut caches_arr: [&mut KvCache; 1] = [cache];
+            paged_prefill_batched(
+                None,
+                &mut caches_arr[..],
+                &[history],
+                q,
+                &k,
+                &v,
+                1,
+                &[Q_LEN],
+                g.n_head,
+                g.n_kv_head,
+                g.head_dim,
+                None,
+                &rope,
+                false,
+                &generation,
+                &std::cell::RefCell::new(None),
+                Some(sel),
+            )?
+        };
+        let out = bits(&out.to_owned_tensor()?)?;
+        assert_eq!(out.len(), Q_LEN * row_len, "output shape");
+        Ok(out)
+    };
+    let token = |o: &[f32], t: usize| o[t * row_len..(t + 1) * row_len].to_vec();
+
+    let (backing, mut cache) = build_history_slot(
+        g,
+        history,
+        seed,
+        &none_alt(history),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    let base = run(&backing, &mut cache, &sparse, &q_flat)?;
+    for t in 0..Q_LEN {
+        let o = token(&base, t);
+        assert!(
+            o.iter().all(|x| x.is_finite()) && o.iter().any(|x| *x != 0.0),
+            "history {history}: query token {t} came out degenerate"
+        );
+    }
+    // The splits run concurrently with the launch's own arena write, and a
+    // greedy decode is only reproducible if their result never depends on
+    // which finishes first: the same launch, repeated, is the same bits.
+    for rep in 0..8 {
+        assert_eq!(
+            base,
+            run(&backing, &mut cache, &sparse, &q_flat)?,
+            "history {history}: repeat {rep} of an identical verify launch changed its output — \
+             the splits race"
+        );
+    }
+
+    let twin = run(&backing, &mut cache, &twin_sel, &q_peak)?;
+    let packed = run(&backing, &mut cache, &sparse, &q_peak)?;
+    let mut worst = (0usize, 0usize, 0f32);
+    for t in (0..Q_LEN).filter(|&t| t != DENSE_ROW_AT) {
+        for (d, (a, b)) in token(&twin, t).iter().zip(&token(&packed, t)).enumerate() {
+            let diff = (a - b).abs();
+            if diff > worst.2 {
+                worst = (t, d, diff);
+            }
+        }
+    }
+    eprintln!(
+        "history {history}: split sparse walk vs dense-marked twin, worst |diff| {:.3e} at \
+         token {} dim {}",
+        worst.2, worst.0, worst.1
+    );
+    assert!(
+        worst.2 <= TWIN_TOL,
+        "history {history}: token {} dim {} differs by {:.3e} between the split sparse walk \
+         and its dense-marked twin — a split lost or doubled part of the selection",
+        worst.0,
+        worst.1,
+        worst.2
+    );
+
+    let mut looked_at = vec![false; history];
+    for s in &selected {
+        for (p, &x) in s[..history].iter().enumerate() {
+            looked_at[p] |= x;
+        }
+    }
+    let alt: Vec<bool> = looked_at.iter().map(|s| !s).collect();
+    assert!(
+        alt.iter().any(|&a| a),
+        "every history position was selected"
+    );
+    let (backing_alt, mut cache_alt) =
+        build_history_slot(g, history, seed, &alt, &rope, &stager, &device)?;
+    let flipped = run(&backing_alt, &mut cache_alt, &sparse, &q_flat)?;
+    assert_eq!(
+        base, flipped,
+        "history {history}: an unselected history position moved a verify row — a split \
+         staged a position no row selects"
+    );
+    Ok(())
+}
+
+#[test]
+fn prefill_verify_window_honours_selection_at_4k() -> Result<()> {
+    prefill_verify_window_case(4_096 + 100, 0xB01)
+}
+
+#[test]
+fn prefill_verify_window_honours_selection_at_32k() -> Result<()> {
+    prefill_verify_window_case(32_768 + 100, 0xB02)
+}
+
+/// What a verify window's attention launch costs, by depth.
+///
+/// A speculative step verifies five rows per attention layer; the selection
+/// keeps each row's read at the budget whatever the depth, so the launch should
+/// cost a few decode rows' worth and stay flat in depth. The timed call is the
+/// prefill wrapper the layer launches.
+#[test]
+#[ignore = "microbenchmark; run with: cargo test --release --features cuda \
+            -p candle-transformers --test qsa_kernel_tests \
+            bench_verify_window_cost -- --ignored --nocapture"]
+fn bench_verify_window_cost() -> Result<()> {
+    use std::time::Instant;
+
+    let _guard = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let g = FLASH_NEXT;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    const Q_LEN: usize = 5;
+    const TOP_K: usize = 2048;
+    const WARM: usize = 5;
+    const ITERS: usize = 50;
+    println!("\n  history   rows   us/launch");
+    for &history in &[4_096usize, 32_768, 131_072] {
+        let (backing, mut cache) = build_history_slot(
+            g,
+            history,
+            0x9003,
+            &none_alt(history),
+            &rope,
+            &stager,
+            &device,
+        )?;
+        let (q, k, v) = make_qkv_at(g, history, Q_LEN, 0x9003, &[], &device)?;
+        let rows: Vec<Vec<u32>> = (0..Q_LEN)
+            .map(|t| budget_row(history + t + 1, TOP_K, t & 1).0)
+            .collect();
+        let sel = selection(&rows, &device)?;
+        let mut launch = || -> Result<()> {
+            backing.truncate_sequence_to_tokens(0, history)?;
+            backing.ensure_for_batch_entries(&[(0, history)], Q_LEN)?;
+            let generation = stager.begin_generation();
+            let mut caches_arr: [&mut KvCache; 1] = [&mut cache];
+            paged_prefill_batched(
+                None,
+                &mut caches_arr[..],
+                &[history],
+                &q,
+                &k,
+                &v,
+                1,
+                &[Q_LEN],
+                g.n_head,
+                g.n_kv_head,
+                g.head_dim,
+                None,
+                &rope,
+                false,
+                &generation,
+                &std::cell::RefCell::new(None),
+                Some(&sel),
+            )?;
+            Ok(())
+        };
+        for _ in 0..WARM {
+            launch()?;
+        }
+        device.synchronize()?;
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            launch()?;
+        }
+        device.synchronize()?;
+        let us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+        println!("  {history:>7}  {Q_LEN:>5}  {us:>10.1}");
+    }
+    Ok(())
+}
+
 /// Thirty-two query tokens per block: the widest merge the walk runs, with a
 /// lane's two row slots both bound.
 #[test]

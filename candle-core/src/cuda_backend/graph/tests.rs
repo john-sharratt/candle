@@ -739,6 +739,58 @@ fn an_upload_while_recording_lands_in_issue_order_without_a_cut() -> Result<()> 
     Ok(())
 }
 
+/// Two staged-upload tables in one recording share the staging scratch, and
+/// each launch that reads it still sees its own: the second copy is recorded
+/// after the first table's reader, so it cannot land under it. Neither call
+/// ends the segment.
+#[test]
+fn staged_uploads_while_recording_keep_their_order_without_a_cut() -> Result<()> {
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let mut first = dev.alloc_zeros::<f32>(N)?;
+    let mut second = dev.alloc_zeros::<f32>(N)?;
+    // Grow the scratch eagerly first: a recorded call never allocates.
+    dev.with_staged_upload(&ramp(0.0), |_| Ok(()))?;
+    dev.synchronize()?;
+
+    // Launch `scale_add` reading the staged table at `at` into `out`.
+    let read = |at: u64, out: &mut CudaSlice<f32>| -> Result<()> {
+        let stream = dev.cuda_stream();
+        let n = N as i32;
+        let (mul, add) = (1.0f32, 0.0f32);
+        let mut b = stream.launch_builder(&f);
+        b.arg(&at).arg(out).arg(&mul).arg(&add).arg(&n);
+        // SAFETY: `at` holds `N` f32s staged by the caller, `out` holds `N`.
+        unsafe { b.launch(LaunchConfig::for_num_elems(N as u32)) }.w()?;
+        Ok(())
+    };
+
+    let segments = dev.capture_stats().segments;
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    dev.with_staged_upload(&ramp(2.0), |at| read(at, &mut first))?;
+    dev.with_staged_upload(&ramp(5.0), |at| read(at, &mut second))?;
+    capture.finish()?;
+
+    assert_eq!(
+        dev.memcpy_dtov(&first)?,
+        ramp(2.0),
+        "the first table's reader"
+    );
+    assert_eq!(
+        dev.memcpy_dtov(&second)?,
+        ramp(5.0),
+        "the second table's reader"
+    );
+    assert_eq!(
+        dev.capture_stats().segments - segments,
+        1,
+        "a staged upload ended the segment"
+    );
+    Ok(())
+}
+
 /// A launcher that took the launch stream while recording and launches inside
 /// a later eager section holds the capture stream, which is no longer
 /// capturing, so its launch runs at once. It must still run after everything

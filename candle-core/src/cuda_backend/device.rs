@@ -413,16 +413,39 @@ impl CudaDevice {
     /// Allocates nothing in the steady state, inside a forward or between two:
     /// the copy and the launch `f` queues are ordered on this stream, and the
     /// scratch is not handed to another caller until `f` returns.
+    ///
+    /// **Inside a recording wave capture it records rather than pauses**, once
+    /// the scratch is already wide enough: the copy is staged through the
+    /// wave's ring ([`Self::record_upload`]) and `f`'s launches are recorded
+    /// behind it. A recorded chain runs in stream order, so the next call's
+    /// copy into the scratch lands after this call's launches have read it —
+    /// the same guarantee the eager path buys by running both now — and a
+    /// pause before any eager user of the scratch submits everything recorded
+    /// ahead of it. Pausing instead ended the wave's segment at every call: a
+    /// QSA index append per attention layer, each a graph launch and a host
+    /// round trip behind it. Growth still runs eagerly; it allocates.
     pub fn with_staged_upload<T: DeviceRepr, R>(
         &self,
         data: &[T],
         f: impl FnOnce(u64) -> Result<R>,
     ) -> Result<R> {
         let bytes = std::mem::size_of_val(data);
+        // SAFETY: `data` is `bytes` of plain device-representable values; read
+        // as bytes, it is exactly what the kernel reads back.
+        let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) };
+        if bytes > 0 {
+            let slot = self.staging.lock().unwrap();
+            if let Some(buf) = slot.as_ref().filter(|s| s.len() >= bytes) {
+                let (ptr, _guard) = buf.device_ptr(&self.stream);
+                if self.record_upload(ptr, src) {
+                    // The lock is held while `f` records, as on the eager path:
+                    // no other caller's copy can be recorded between this
+                    // copy and the launches that read it.
+                    return f(ptr);
+                }
+            }
+        }
         self.with_staging(bytes, |buf| {
-            // SAFETY: `data` is `bytes` of plain device-representable values;
-            // read as bytes, it is exactly what the kernel reads back.
-            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) };
             if bytes > 0 {
                 self.stream
                     .memcpy_htod(src, &mut buf.slice_mut(..bytes))

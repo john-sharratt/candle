@@ -37,6 +37,8 @@
 
 use std::collections::HashMap;
 
+#[cfg(feature = "cuda")]
+use candle::Device;
 use candle::{Result, Tensor};
 
 use super::capture_rows::{CaptureRows, CaptureWidths};
@@ -258,7 +260,6 @@ impl Qwen4ExpBatched {
         session: &mut BatchedInferenceSession,
         targets: &[(usize, usize)],
     ) -> Result<()> {
-        let cfg = &self.model.cfg;
         let mut guard = self
             .verify
             .write()
@@ -320,6 +321,44 @@ impl Qwen4ExpBatched {
             jobs.push((seq, kept));
         }
 
+        // **Recorded as one wave, like the draft walk.** Everything below is a
+        // chain of small launches — per DeltaNet layer a staging copy of the
+        // stashed operands, the span table and two mixer kernels; per attention
+        // layer an index append — with no host decision between them. Issued
+        // eagerly they left the GPU idle between every pair: measured on
+        // Flash-Next's single-session verify, ~3.6 ms of wall a step for ~0.8 ms
+        // of kernels. Anything below that must reach the driver (an allocation,
+        // a readback) pauses the recording at its own call site and resumes it.
+        #[cfg(feature = "cuda")]
+        let capture = match &self.model.device {
+            Device::Cuda(cuda) => Some(cuda.begin_wave_capture()?),
+            _ => None,
+        };
+        self.model.device.record_launches()?;
+        let rewound = self.rewind_recorded(session, targets, &cap, &jobs);
+        #[cfg(feature = "cuda")]
+        let rewound = match (rewound, capture) {
+            (Ok(()), Some(capture)) => capture.finish(),
+            (rewound, _) => rewound,
+        };
+        rewound?;
+        // Consumed: its spans named this step's blocks and nothing later. The
+        // buffers go back for the next step to lay its own cohort over.
+        self.park_verify_stash(cap);
+        Ok(())
+    }
+
+    /// The device half of [`Self::rewind_cohort`]: the GDN replay, the PLE and
+    /// QSA rewinds, the draft head's seed and the K/V truncation, for `jobs`
+    /// (`(sequence, rows kept)`) of the block `cap` stashed.
+    fn rewind_recorded(
+        &self,
+        session: &mut BatchedInferenceSession,
+        targets: &[(usize, usize)],
+        cap: &SpecCapture,
+        jobs: &[(usize, usize)],
+    ) -> Result<()> {
+        let cfg = &self.model.cfg;
         // ── The GDN half: one batched replay over the whole cohort. ──
         let short: Vec<(usize, usize)> = jobs
             .iter()
@@ -413,7 +452,7 @@ impl Qwen4ExpBatched {
                     indexer.push(i);
                 }
             }
-            for &(seq, kept) in &jobs {
+            for &(seq, kept) in jobs {
                 let Some(stash) = cap.seqs.get(&seq) else {
                     continue;
                 };
@@ -449,7 +488,7 @@ impl Qwen4ExpBatched {
                 .seeds
                 .write()
                 .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?;
-            for &(seq, kept) in &jobs {
+            for &(seq, kept) in jobs {
                 let Some(stash) = cap.seqs.get(&seq) else {
                     continue;
                 };
@@ -480,9 +519,6 @@ impl Qwen4ExpBatched {
                 session.truncate_sequence_to_tokens(seq, tokens)?;
             }
         }
-        // Consumed: its spans named this step's blocks and nothing later. The
-        // buffers go back for the next step to lay its own cohort over.
-        self.park_verify_stash(cap);
         Ok(())
     }
 }

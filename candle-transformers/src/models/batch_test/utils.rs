@@ -125,6 +125,10 @@ pub struct TestParams {
     /// Used by the routing-trace capture to drive diverse prompts through a
     /// single model load.
     pub per_config_prompts: Vec<String>,
+    /// Optional per-config names, indexed by config position, heading that
+    /// config's profile tables in place of its `mode×contexts` — for a run
+    /// whose configs share a mode and width and differ only in their prompts.
+    pub config_labels: Vec<String>,
     /// Token IDs that end generation early when sampled (e.g. EOS).  Empty =
     /// always generate the full `generate_token_count` (benchmark behaviour).
     /// When set, the batched generate loop stops once every session has emitted
@@ -209,6 +213,7 @@ impl TestParams {
             prompt_system: super::fixtures::system_prompt(),
             prompt_user: story_prompt(),
             per_config_prompts: Vec::new(),
+            config_labels: Vec::new(),
             stop_on_eos: Vec::new(),
             names: include_str!("names.md")
                 .lines()
@@ -336,6 +341,12 @@ impl TestParams {
     /// A non-empty entry replaces `prompt_user` for that config in `run()`.
     pub fn with_per_config_prompts(mut self, prompts: Vec<String>) -> Self {
         self.per_config_prompts = prompts;
+        self
+    }
+
+    /// Name each config's profile tables — see [`Self::config_labels`].
+    pub fn with_config_labels(mut self, labels: Vec<String>) -> Self {
+        self.config_labels = labels;
         self
     }
 
@@ -1327,7 +1338,7 @@ impl TestParams {
             result.expert_stats = model.expert_stats();
             result.row_cache_stats = model.row_cache_stats();
 
-            self.print_row_profiles(&result);
+            self.print_row_profiles(&result, self.config_labels.get(n).map(String::as_str));
             results.push(result);
 
             // Release GPU logits tensors from completed config — they're not needed
@@ -3317,9 +3328,12 @@ impl TestParams {
     /// table holds that row alone: a span that grows with the rows before it
     /// shows up as the same span read down successive dumps. Prints nothing
     /// without the `profile` feature, which leaves every snapshot empty.
-    fn print_row_profiles(&self, result: &TestResults) {
+    fn print_row_profiles(&self, result: &TestResults, label: Option<&str>) {
         let row = std::slice::from_ref(result);
-        let name = format!("{:?}×{}", result.config.mode, result.config.num_contexts);
+        let name = match label {
+            Some(label) => label.to_string(),
+            None => format!("{:?}×{}", result.config.mode, result.config.num_contexts),
+        };
         self.print_profile_table(row, &format!("{name} — Bulk (Prompt) Profile"), |r| {
             &r.bulk_profile
         });

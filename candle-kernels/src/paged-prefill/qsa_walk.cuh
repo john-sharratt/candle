@@ -118,6 +118,39 @@ struct QsaWalk {
         }
     }
 
+    // Move every sparse row's cursor to its first entry whose block starts at
+    // or past `pos` — what `next` would reach by consuming the entries below
+    // `pos` one step at a time, in a binary search per row. A dense row has no
+    // cursor; a walk that seeks must have none (a dense row's step runs from
+    // `bound` whatever it covers, so it has no entry to seek to).
+    __device__ __forceinline__ void seek(int pos) {
+        #pragma unroll
+        for (int h = 0; h < QSA_WALK_ROWS_PER_LANE; ++h) {
+            uint32_t lo = c[h], hi = n[h];
+            while (lo < hi) {
+                const uint32_t mid = (lo + hi) >> 1;
+                if (start_of(base[e[h] + mid] >> QSA_CELL_BITS) < pos) lo = mid + 1;
+                else hi = mid;
+            }
+            c[h] = lo;
+        }
+    }
+
+    // The first position of the entry `ordinal` of this run's first row
+    // (lane 0, slot 0) — where the `split`-th of `splits` equal shares of that
+    // row's list begins. 0 for the first share, `QSA_WALK_END` past the last.
+    // Warp-collective: every lane returns lane 0's answer.
+    __device__ __forceinline__ int share_start(int split, int splits) const {
+        int pos = 0;
+        if (split >= splits) {
+            pos = QSA_WALK_END;
+        } else if (split > 0 && n[0] > 0) {
+            const uint32_t ordinal = (uint32_t)(((uint64_t)n[0] * (uint32_t)split) / (uint32_t)splits);
+            pos = start_of(base[e[0] + ordinal] >> QSA_CELL_BITS);
+        }
+        return __shfl_sync(0xffffffffu, pos, 0);
+    }
+
     // The start of the lowest step at or past `bound` some row reads, or
     // QSA_WALK_END; `end` receives where that step stops, which is the
     // `bound` of the next call. Warp-collective: every lane returns the same

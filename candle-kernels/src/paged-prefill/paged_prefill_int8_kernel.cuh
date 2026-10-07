@@ -27,6 +27,9 @@
  *    dense causal read, in the same loop. Per-row masking inside a tile is
  *    a bit test: the walk reports which cells of each block each row
  *    selects, and the compute phase ANDs that with the causal horizon.
+ *    Under split-KV a launch of sparse rows hands each split a contiguous
+ *    range of positions to seek to and walk; one with a dense row deals
+ *    tiles round-robin (see the ownership note before the tile loop).
  *
  *  - PER-WARP COLUMN STAGING: warp w owns tile columns 4w..4w+3 and
  *    decodes each straight from its source — a fresh token's packed
@@ -523,9 +526,33 @@ paged_prefill_int8_kernel(
     };
 
     // ==================================================================
+    // Split-KV ownership. A launch of sparse rows gives each split a
+    // contiguous RANGE of positions — split s takes the blocks starting in
+    // [share_start(s), share_start(s+1)), the s-th equal share of the first
+    // row's entry list — and the split seeks straight to it and walks only
+    // that. The walk is a serial chain of dependent loads per selected block,
+    // so a split that walked the whole selection to keep every
+    // `num_splits`-th tile paid the full walk however many splits shared the
+    // work: a 5-row verify window at a 2,048-position budget ran ~300 µs per
+    // launch, flat across 32 splits. A block belongs to the split its start
+    // falls in, so no block is staged twice or skipped across a boundary.
+    //
+    // A dense row steps from the walk's bound through every position, so a
+    // step can straddle a range boundary; a launch with any dense row keeps
+    // the round-robin over tiles instead.
+    // ==================================================================
+    const bool range_split = num_splits > 1 && !__any_sync(0xffffffffu, walk.dense != 0u);
+    int bound = 0;               // next block start the walk may return
+    int split_end = QSA_WALK_END; // first position past this split's range
+    if (range_split) {
+        bound = walk.share_start(split_idx, num_splits);
+        split_end = walk.share_start(split_idx + 1, num_splits);
+        walk.seek(bound);
+    }
+
+    // ==================================================================
     // Tile loop: each tile is the next NB selected blocks, packed.
     // ==================================================================
-    int bound = 0;    // next block start the walk may return
     int tile_ord = 0; // visited-tile ordinal, for split-KV round-robin
     for (;;) {
         // ---- WALK (every warp, identical): the tile's blocks ----
@@ -539,7 +566,7 @@ paged_prefill_int8_kernel(
             uint32_t mk[QSA_WALK_ROWS_PER_LANE];
             int step_end;
             const int q = walk.next(bound, mk, step_end);
-            if (q >= kv_len) break;
+            if (q >= kv_len || q >= split_end) break;
             rm[0] |= mk[0] << (b * QB);
             rm[1] |= mk[1] << (b * QB);
             if (b == my_blk) my_q = q;
@@ -552,7 +579,7 @@ paged_prefill_int8_kernel(
         // Round-robin tiles across shards. The skip is block-uniform
         // (every thread computes identical walk state), so the staging
         // barriers below stay convergent.
-        const bool mine = (tile_ord % num_splits) == split_idx;
+        const bool mine = range_split || (tile_ord % num_splits) == split_idx;
         tile_ord += 1;
         if (!mine) continue;
 

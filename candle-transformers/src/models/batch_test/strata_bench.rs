@@ -142,19 +142,24 @@ pub fn strata_bench<M: ManagedBatchedModel>(
     println!("\n=== {label}: Strata single-session benchmark ===\n");
     let filler = filler();
     let mut prompts = vec![WARMUP.to_string()];
+    let mut labels = vec!["warmup".to_string()];
     for target in TARGETS {
         for run in 1..=RUNS {
             let (prompt, actual) =
                 fit_prompt(&filler, target, run, |p| params.prefill_token_count(p))?;
-            println!("  tokens-{target}-run-{run}: {actual} prompt tokens");
+            let label = format!("tokens-{target}-run-{run}");
+            println!("  {label}: {actual} prompt tokens");
             prompts.push(prompt);
+            labels.push(label);
         }
     }
     println!(
         "  (the system turn is empty and counted: {} of each prompt's tokens)\n",
         params.system_prompt_tokens(0).len()
     );
-    params = params.with_per_config_prompts(prompts.clone());
+    params = params
+        .with_per_config_prompts(prompts.clone())
+        .with_config_labels(labels);
 
     crate::models::batched_model::ensure_vram_governor(device);
     let model = account_model_load(device, load)?;
