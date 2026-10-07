@@ -2063,6 +2063,51 @@ mod tests {
         )
     }
 
+    /// Eight sessions writing freely near zend's working shape: a 32K-token
+    /// context each, C5 KV — the cohort a code-reading ingest decodes (zend's run
+    /// at 41–66K; 8 × 64K fully resident does not fit the harness, which has no
+    /// warm tier). Against the forward gate's eight sessions at a few thousand
+    /// tokens, this is the row that says what depth costs an eight-wide
+    /// speculative decode.
+    #[test]
+    #[ignore = "profiling run: loads this card's engine artifact and prefills 8 x 32K. Run \
+                with: cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen38_moe::tests::profile_eight_sessions_at_32k \
+                -- --ignored --nocapture --test-threads=1"]
+    fn profile_eight_sessions_at_32k() -> Result<()> {
+        use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
+        use crate::models::batched_inference::InferenceMode;
+        use crate::models::dialect::Dialect;
+        use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+        use candle::quantized::Int8Mode;
+
+        let merged = engine_gguf()?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        let tok = tokenizer_json()?;
+        let c5 = &[InferenceMode::C5][..];
+        // The same cohort at 8K in both KV formats first: what C5's compressed
+        // reads cost against BF16 at a depth where both fit, then zend's format
+        // at depth.
+        let both = &[InferenceMode::BF16, InferenceMode::C5][..];
+        long_context_gate(
+            "Qwen3.8-Flash-Next eight sessions at 32K",
+            int8mode,
+            &tok,
+            Dialect::qwen35(),
+            262_144,
+            &[(8_192, both), (32_768, c5)],
+            8,
+            256,
+            DepthTask::Essay,
+            &device,
+            || {
+                let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+                Qwen4ExpBatched::new(gpu)
+            },
+        )
+    }
+
     /// **Strata's single-session benchmark, on this engine.** The requests of
     /// Strata's published RTX 5090 run (`batch_test::strata_bench`): a synthetic
     /// Python module cut to 4,096 / 32,768 / 128,000 prompt tokens and a request

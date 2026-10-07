@@ -22,6 +22,60 @@
 use super::pipeline::pipeline_record_duration;
 #[cfg(all(feature = "profile", feature = "cuda"))]
 use candle::cuda_backend::CudaDevice;
+#[cfg(all(feature = "profile", feature = "cuda"))]
+use std::cell::Cell;
+#[cfg(all(feature = "profile", feature = "cuda"))]
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// One forward in this many records its GPU spans — see
+/// [`set_gpu_span_period`]. Every forward until something says otherwise.
+#[cfg(all(feature = "profile", feature = "cuda"))]
+static GPU_SPAN_PERIOD: AtomicU32 = AtomicU32::new(1);
+
+#[cfg(all(feature = "profile", feature = "cuda"))]
+thread_local! {
+    /// Forwards this thread has begun ([`begin_gpu_span_forward`]).
+    static FORWARDS: Cell<u32> = const { Cell::new(0) };
+    /// What each span this thread opens stands for: the period while the
+    /// current forward is sampled, 0 while it is not. A thread that never
+    /// begins a forward records every span at weight 1.
+    static SPAN_WEIGHT: Cell<u32> = const { Cell::new(1) };
+}
+
+/// Record GPU spans on one forward in `period`, each counted `period` times.
+///
+/// **Why a period.** A span is two event records on the launch stream, and in a
+/// wave capture each is a graph node — on a decode step bound by the host's
+/// issue rate, dozens per layer are the step: measured on Flash-Next, a
+/// profiling build decoded ~2.5× slower than the release build, so every
+/// number it reported described a different program. Sampling keeps the
+/// per-call averages and the totals (scaled by the period) while leaving most
+/// forwards exactly as the release build runs them.
+///
+/// The default, 1, records every forward — what a gate's per-run breakdown
+/// needs. A long-running daemon samples.
+pub fn set_gpu_span_period(period: u32) {
+    #[cfg(all(feature = "profile", feature = "cuda"))]
+    GPU_SPAN_PERIOD.store(period.max(1), Ordering::Relaxed);
+    #[cfg(not(all(feature = "profile", feature = "cuda")))]
+    let _ = period;
+}
+
+/// Mark the start of a forward on this thread: decides whether the spans it
+/// opens until the next forward are recorded ([`set_gpu_span_period`]).
+#[inline(always)]
+pub fn begin_gpu_span_forward() {
+    #[cfg(all(feature = "profile", feature = "cuda"))]
+    {
+        let period = GPU_SPAN_PERIOD.load(Ordering::Relaxed).max(1);
+        let n = FORWARDS.with(|f| {
+            let n = f.get().wrapping_add(1);
+            f.set(n);
+            n
+        });
+        SPAN_WEIGHT.with(|w| w.set(if n % period == 0 { period } else { 0 }));
+    }
+}
 
 /// A named GPU span, bracketed by two enqueued CUDA events.
 ///
@@ -35,6 +89,8 @@ pub struct GpuSpan {
 #[cfg(all(feature = "profile", feature = "cuda"))]
 struct GpuSpanInner {
     name: &'static str,
+    /// How many spans this one is counted as ([`set_gpu_span_period`]).
+    weight: u32,
     /// Index of the borrowed event pair in the pool's `lent` slot list.
     slot: usize,
     /// The stop is recorded on the device's launch stream as it is at the
@@ -55,6 +111,8 @@ mod gpu_pool {
 
     pub(super) struct Pending {
         pub name: &'static str,
+        /// How many spans this one is counted as.
+        pub weight: u32,
         pub pair: Pair,
     }
 
@@ -151,7 +209,7 @@ mod gpu_pool {
     }
 
     /// Record the stop event and move the pair to the pending list.
-    pub(super) fn close(name: &'static str, slot: usize, stream: &Arc<CudaStream>) {
+    pub(super) fn close(name: &'static str, weight: u32, slot: usize, stream: &Arc<CudaStream>) {
         POOL.with(|p| {
             let mut p = p.borrow_mut();
             let Some(pair) = p.lent.get_mut(slot).and_then(Option::take) else {
@@ -161,7 +219,7 @@ mod gpu_pool {
                 p.free.push(pair);
                 return;
             }
-            p.pending.push(Pending { name, pair });
+            p.pending.push(Pending { name, weight, pair });
         });
     }
 }
@@ -176,6 +234,11 @@ pub fn gpu_span(name: &'static str, device: &candle::Device) -> GpuSpan {
     let candle::Device::Cuda(dev) = device else {
         return GpuSpan { inner: None };
     };
+    // A forward outside the sample records nothing — no event, no graph node.
+    let weight = SPAN_WEIGHT.with(Cell::get);
+    if weight == 0 {
+        return GpuSpan { inner: None };
+    }
     // Recycle before borrowing. The non-blocking pass is the common case and
     // costs a few `cuEventQuery` calls once every HIGH_WATER spans.
     //
@@ -201,6 +264,7 @@ pub fn gpu_span(name: &'static str, device: &candle::Device) -> GpuSpan {
     }
     let inner = gpu_pool::open(&dev.cuda_stream()).map(|slot| GpuSpanInner {
         name,
+        weight,
         slot,
         device: dev.clone(),
     });
@@ -263,7 +327,12 @@ impl Drop for GpuSpan {
     #[inline(always)]
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
-            gpu_pool::close(inner.name, inner.slot, &inner.device.cuda_stream());
+            gpu_pool::close(
+                inner.name,
+                inner.weight,
+                inner.slot,
+                &inner.device.cuda_stream(),
+            );
         }
     }
 }
@@ -303,7 +372,7 @@ pub(super) fn pending_len_for_test() -> usize {
 
 #[cfg(all(feature = "profile", feature = "cuda"))]
 fn drain_inner(block: bool) {
-    let harvested: Vec<(&'static str, std::time::Duration)> = gpu_pool::POOL.with(|p| {
+    let harvested: Vec<(&'static str, std::time::Duration, u32)> = gpu_pool::POOL.with(|p| {
         let mut p = p.borrow_mut();
         let mut out = Vec::new();
         let mut still_pending = Vec::with_capacity(p.pending.len());
@@ -325,6 +394,7 @@ fn drain_inner(block: bool) {
                 out.push((
                     entry.name,
                     std::time::Duration::from_secs_f64(ms as f64 / 1e3),
+                    entry.weight,
                 ));
             }
             p.free.push(entry.pair);
@@ -335,8 +405,10 @@ fn drain_inner(block: bool) {
     // Accumulate outside the pool borrow — `pipeline_record_duration` takes its
     // own thread-local borrow, and holding both invites a panic if the two ever
     // become the same cell.
-    for (name, elapsed) in harvested {
-        pipeline_record_duration(name, elapsed, 1);
+    // A sampled span stands for `weight` of its kind — the same time, as many
+    // times — so the totals sit beside the host spans' (which time every call).
+    for (name, elapsed, weight) in harvested {
+        pipeline_record_duration(name, elapsed * weight, weight as u64);
     }
 }
 

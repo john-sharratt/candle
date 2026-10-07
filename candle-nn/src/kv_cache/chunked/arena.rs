@@ -13,7 +13,7 @@ use ahash::AHashMap;
 #[cfg(feature = "cuda")]
 use candle::wave_provenance::LeaseOrigin;
 use candle::LiveTensor;
-use candle::{DType, Result, Tensor};
+use candle::{DType, Result, Storage, Tensor};
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 
@@ -600,6 +600,40 @@ impl Arena {
     pub(crate) fn slot_bytes(&self, chunk_idx: usize, len: usize) -> Result<Tensor> {
         let off = self.slot_offset(chunk_idx, len)?;
         self.data.narrow(0, off, len)
+    }
+
+    /// Copy the `dst.len()` bytes at the head of slot `chunk_idx` into `dst`.
+    ///
+    /// A host slab is read in place: one bounds-checked slice of the slab's own
+    /// storage, copied once. Through [`Self::slot_bytes`] every band cost a
+    /// tensor `narrow`, a fresh `Vec` and a second copy — and lifting a
+    /// dialogue's working set warm→hot reads hundreds of thousands of bands,
+    /// which ran at ~0.8 GB/s (1.66 s for ~150K tokens). A device slab still
+    /// reads through `slot_bytes`, which is the one device-to-host copy it needs.
+    pub(crate) fn copy_slot_bytes(&self, chunk_idx: usize, dst: &mut [u8]) -> Result<()> {
+        let off = self.slot_offset(chunk_idx, dst.len())?;
+        {
+            let (storage, layout) = self.data.storage_and_layout();
+            if let Storage::Cpu(cpu) = &*storage {
+                if !layout.is_contiguous() {
+                    candle::bail!("arena slot: a host slab must be one contiguous byte run");
+                }
+                let start = layout.start_offset() + off;
+                let src = cpu
+                    .as_slice::<u8>()?
+                    .get(start..start + dst.len())
+                    .ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "arena slot: bytes {start}..{} lie past the slab",
+                            start + dst.len()
+                        ))
+                    })?;
+                dst.copy_from_slice(src);
+                return Ok(());
+            }
+        }
+        dst.copy_from_slice(&self.data.narrow(0, off, dst.len())?.to_vec1::<u8>()?);
+        Ok(())
     }
 
     /// Write `src` (a 1-D `U8` tensor on this arena's device) into the head of

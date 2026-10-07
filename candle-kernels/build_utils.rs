@@ -1637,7 +1637,38 @@ mod host_compiler_tests {
 #[cfg(test)]
 mod cache_freshness_tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
+
+    /// A fresh directory under the system temp dir, removed on drop. Built on
+    /// `std` because this file is `include!`d by both the build script and the
+    /// `kernel_tool` binary, and the binary's test target does not link the
+    /// crate's dev-dependencies.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "candle-kernels-cache-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Write `contents` to `path` and stamp its modification time.
     fn write_at(path: &Path, contents: &[u8], mtime: SystemTime) {
@@ -1656,7 +1687,7 @@ mod cache_freshness_tests {
 
     #[test]
     fn an_object_older_than_a_source_is_stale() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let src = dir.path().join("k.cuh");
         let obj = dir.path().join("k.o");
         write_at(&obj, b"old object", t0());
@@ -1666,7 +1697,7 @@ mod cache_freshness_tests {
 
     #[test]
     fn an_object_built_after_every_source_is_fresh() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let a = dir.path().join("a.cu");
         let b = dir.path().join("b.cuh");
         let obj = dir.path().join("k.o");
@@ -1680,7 +1711,7 @@ mod cache_freshness_tests {
     /// newest source decides, not the first.
     #[test]
     fn the_newest_source_decides() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let old = dir.path().join("old.cuh");
         let new = dir.path().join("new.cuh");
         let obj = dir.path().join("k.o");
@@ -1692,7 +1723,7 @@ mod cache_freshness_tests {
 
     #[test]
     fn equal_modification_times_count_as_fresh() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let src = dir.path().join("k.cu");
         let obj = dir.path().join("k.o");
         write_at(&src, b"src", later(5));
@@ -1704,7 +1735,7 @@ mod cache_freshness_tests {
     /// rebuild is cheap, a spurious hit is a wrong kernel.
     #[test]
     fn missing_metadata_is_stale() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let src = dir.path().join("k.cu");
         let obj = dir.path().join("k.o");
         write_at(&src, b"src", t0());
@@ -1720,7 +1751,7 @@ mod cache_freshness_tests {
     /// current hash. The hash matches, so the pair used to read as a hit.
     #[test]
     fn a_relabelled_stale_object_is_not_a_staged_hit() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let src = dir.path().join("k.cu");
         write_at(&src, b"edited source", later(100));
         let staged = dir.path().join("staged");
@@ -1749,7 +1780,7 @@ mod cache_freshness_tests {
 
     #[test]
     fn a_stale_object_is_refused_and_nothing_is_written() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let build = dir.path().join("build");
         let staged = dir.path().join("staged");
         fs::create_dir(&build).unwrap();
@@ -1767,7 +1798,7 @@ mod cache_freshness_tests {
 
     #[test]
     fn a_missing_object_is_an_error_not_a_silent_skip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let build = dir.path().join("build");
         let staged = dir.path().join("staged");
         fs::create_dir(&build).unwrap();
@@ -1782,7 +1813,7 @@ mod cache_freshness_tests {
 
     #[test]
     fn a_fresh_object_is_copied_byte_for_byte_and_labelled_with_the_hash() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let build = dir.path().join("build");
         let staged = dir.path().join("staged");
         fs::create_dir(&build).unwrap();
@@ -1812,7 +1843,7 @@ mod cache_freshness_tests {
     /// own time passes; the object behind it is what fails.
     #[test]
     fn an_archive_relinked_from_a_stale_object_is_not_fresh() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let group = one_kernel_group(dir.path());
         let staged = dir.path().join("staged");
         fs::create_dir(&staged).unwrap();
@@ -1832,7 +1863,7 @@ mod cache_freshness_tests {
 
     #[test]
     fn an_archive_over_fresh_or_absent_objects_is_fresh() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let group = one_kernel_group(dir.path());
         let staged = dir.path().join("staged");
         fs::create_dir(&staged).unwrap();
@@ -1852,7 +1883,7 @@ mod cache_freshness_tests {
 
     #[test]
     fn an_archive_older_than_its_sources_is_not_valid() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let src = dir.path().join("k.cu");
         write_at(&src, b"edited source", later(100));
         write_at(&dir.path().join("libg.a.gz"), b"archive", t0());

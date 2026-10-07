@@ -120,6 +120,41 @@ fn a_gpu_span_times_real_device_work() {
     assert!(row.1 > 0.0, "elapsed must be positive, got {}ms", row.1);
 }
 
+/// **A sampled forward stands for the whole period.** With a period of 4,
+/// eight forwards record their span on the 4th and the 8th only, and each
+/// recorded span is counted four times — so the row reads eight calls, as an
+/// unsampled run would. Unsampled forwards record no events at all.
+#[cfg(all(feature = "profile", feature = "cuda"))]
+#[test]
+fn a_sampled_forward_stands_for_its_whole_period() {
+    let Ok(dev) = candle::Device::new_cuda(0) else {
+        eprintln!("skipping: CUDA device required");
+        return;
+    };
+    let a = candle::Tensor::ones((64, 64), candle::DType::F32, &dev).unwrap();
+    gpu_drain_blocking();
+    set_gpu_span_period(4);
+    for _ in 0..8 {
+        begin_gpu_span_forward();
+        let g = gpu_span("probe:sampled", &dev);
+        let _ = a.matmul(&a).unwrap();
+        g.end();
+    }
+    set_gpu_span_period(1);
+    gpu_drain_blocking();
+    let snap = pipeline_snapshot_and_reset();
+    let row = snap
+        .entries
+        .iter()
+        .find(|(n, _, _)| n == "probe:sampled")
+        .expect("the sampled spans must reach the pipeline accumulator");
+    assert_eq!(
+        row.2, 8,
+        "two sampled spans, each counted for its period of 4"
+    );
+    assert!(row.1 > 0.0, "elapsed must be positive, got {}ms", row.1);
+}
+
 /// A run that never reaches a drain boundary must still be bounded. Opening far
 /// more spans than `HIGH_WATER` without draining once has to leave the pending
 /// list capped and every span still accounted for — the failure this catches is

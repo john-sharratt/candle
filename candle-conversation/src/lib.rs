@@ -84,7 +84,9 @@ pub mod projection;
 /// second table by another name. Snapshotting resets, so two reads bracket a
 /// window exactly.
 pub mod profile {
-    pub use candle_transformers::models::profile::{pipeline_snapshot_and_reset, ProfileSnapshot};
+    pub use candle_transformers::models::profile::{
+        pipeline_snapshot_and_reset, set_gpu_span_period, ProfileSnapshot,
+    };
 }
 pub mod prompts;
 pub mod provenance;

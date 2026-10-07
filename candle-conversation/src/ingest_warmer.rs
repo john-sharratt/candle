@@ -6,9 +6,11 @@
 //! scan per probe, and over 1,344 files it held eight cores for 270 s after
 //! every start. On the arena each file costs one batched launch for all of its
 //! probes. The arena belongs to the scheduler thread, so the work is sent there
-//! in slices small enough that decode waves keep running between them; a
-//! scheduler without an arena (a host with no CUDA) answers so, and the whole
-//! warm-up then runs on the host's warm pool as before.
+//! a slice at a time, and the scheduler scores each slice at ingest priority —
+//! between its waves, and not while a dialogue holds the device or is in its
+//! cooldown — so the warm-up never stands in front of a live turn. A scheduler
+//! without an arena (a host with no CUDA) answers so, and the whole warm-up then
+//! runs on the host's warm pool as before.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,8 +22,9 @@ use crate::projection::{Conversation, GroupId, LayerId, Schema, TimelineId};
 use crate::scheduler::SchedulerRequest;
 
 /// Files per slice. One slice is one uninterrupted stretch of scheduler time,
-/// a few milliseconds per file on the arena, so this bounds how long a decode
-/// wave can wait behind the warm-up.
+/// ~19 ms per file on the arena (each file's self-match is its probes' tokens
+/// against all of its own), so this bounds how long the loop spends in one
+/// warm-up step between waves.
 const WARM_SLICE_TIMELINES: usize = 16;
 
 /// A handle that runs the ingest warm-up without holding the engine: the

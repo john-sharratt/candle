@@ -378,6 +378,29 @@ mod tests {
             assert!(read(2).iter().all(|&b| b == 0), "slot 2 must be untouched");
         }
 
+        /// **A host slot copies out its own payload bytes, read in place.** Slot
+        /// 1 holds a known pattern between two other tenants; the copy of its
+        /// first 6 bytes is exactly those bytes, and a copy past the stride is
+        /// refused as `slot_bytes` refuses it.
+        #[test]
+        fn a_host_slot_copies_its_payload_in_place() {
+            let class = small();
+            let mut arena = slab(class, ArenaLocation::Cpu, 0);
+            let stride = class.bytes();
+            let fill = |v: u8| Tensor::full(v, stride, &Device::Cpu).unwrap();
+            arena.write_slot_bytes(0, &fill(0xAA)).unwrap();
+            arena.write_slot_bytes(2, &fill(0xCC)).unwrap();
+            let pattern = Tensor::new(&[1u8, 2, 3, 4, 5, 6], &Device::Cpu).unwrap();
+            arena.write_slot_bytes(1, &pattern).unwrap();
+
+            let mut dst = [0u8; 6];
+            arena.copy_slot_bytes(1, &mut dst).unwrap();
+            assert_eq!(dst, [1, 2, 3, 4, 5, 6]);
+
+            let mut too_long = vec![0u8; stride + 1];
+            assert!(arena.copy_slot_bytes(1, &mut too_long).is_err());
+        }
+
         /// **Zero-on-recycle covers the whole stride, not the payload.** The
         /// next tenant may be any format that fits, so a partial wipe would
         /// leave the previous tenant's bytes readable past the new one's

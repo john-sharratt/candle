@@ -130,3 +130,54 @@ segment. This is a cheap experiment.
   one launch triple (`delta_net/replay_stack.rs`) instead of 36 per-layer triples. The
   per-layer replay had measured ~767 µs of GPU time per rewind; the stacked form was
   estimated, not traced. Measured +3 t/s at 4K, 149.0 → 152.0, at unchanged tokens.
+
+# Possible performance boosts — zend (the daemon around the engine)
+
+Measured 2026-10-08 in zend on the RTX PRO 5000, plain `cargo build --release -p zend`
+(a `--features profile` build decodes ~2.5× slower unless its GPU spans are sampled —
+zend now samples one forward in 8, `ZEND_GPU_SPAN_PERIOD`).
+
+**Where zend stands.** A dialogue materializes 150–295K tokens by design (the working
+set's 250K budget plus the 116K window), and decodes essay text at ~50–60 t/s there:
+~34 ms a step at ~2.1 accepted tokens. The engine's own bench step at 128K is ~24 ms
+at ~3 accepted, so most of the distance to ~150 t/s is depth and acceptance, not
+daemon overhead. Workspace ingest decodes ~110–125 t/s with prefill ~1.7–1.9K t/s:
+each file worker spends most of its file in 8K-token bulk prefill forwards (5–7 s at
+75–150K depth), so decode runs one or two sequences wide.
+
+Fixed this round: ingest warm-up slices no longer preempt a dialogue
+(`scheduler/norm_warm.rs`), a cold recall lands hot-only instead of round-tripping a
+warm copy on the projection's critical path (`ColdRecall`), warm→hot reads host arenas
+in place (`Arena::copy_slot_bytes`).
+
+Tried and backed out: **ending a sparse background decode quantum after its step** so
+waiting prefill ran sooner and the workers it finished decoded together. Decode width
+did rise (4–6 sequences against 1–2), but every step then carried the 8K-row creep, an
+~8.7 GB tier placed against a moving KV frontier: draft forwards were refused their tier
+("1 regions into ground live KV arenas hold"), files failed their ingest, and the run
+hit an illegal address. A wider ingest decode needs the tier problem below solved first.
+
+## Open, by expected size
+
+- **Bulk prefill buys its tier from the expert zone every forward.** An 8K-row
+  Flash-Next prefill's transient tier is ~6.4 GB (the F32 four-stream residual priced
+  honestly — the hyper prelude alone is ~107 KB a row), and `placeable_tier_bytes`
+  counts every cedeable expert byte as ground, so each bulk forward concedes ~3,200
+  slots and the hit rate inside it falls to ~74%. `docs/wave_feeder.md` §4.11.4 prices
+  the cap against the frontier↔floor gap instead. Needs a measured width/hit-rate
+  trade (a cap that collapses once cut bulk prefill 2.1K → 700 t/s).
+- **Bulk prefill attention at depth.** ~2.35 s of a ~5 s 8K-token forward at ~75K
+  depth (49 ms per 2,048-row attention call, C5 history). Grows with depth.
+- **Ingest normalization warm-up recomputes identical levels every boot.** ~29 s of
+  arena scans (13 ms GPU per file: up to 8 whole turns' token signatures against all of
+  the file's tokens). Persisting the learned levels would remove it on a no-change
+  restart; it now runs only in the gaps a dialogue leaves.
+- **Accept walk: one sampler dispatch and readback per block position.** ~2.2 a step
+  at ~1.8 ms. One dispatch over every position is equivalent — a position is reached
+  only when every earlier one accepted its draft, so its penalty history is the drafts
+  — but the sampler's per-sequence state (DRY span, segment ramps, close scripts) has
+  to be forked per position and the unreached positions rolled back.
+- **Warm-tier writes allocate per band.** `write_chunk_from_pinned_bytes` builds a
+  tensor per band and `slice_set`s it; a direct copy needs mutable CPU storage access,
+  which `candle-core` keeps crate-private (and would expose as `unsafe`). Background
+  (persistence thread), so it bounds the drain rate, not a turn.

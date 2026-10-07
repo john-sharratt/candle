@@ -2494,6 +2494,10 @@ impl WaveSweep for Qwen4ExpBatched {
         if layer_start > layer_end || layer_end > num_layers {
             candle::bail!("qwen4exp wave: bad layer range [{layer_start}, {layer_end})");
         }
+        // Host time, in three parts. A decode step at depth is host-bound — the
+        // readback after it waits ~1.6 ms — so what the forward thread spends
+        // issuing the sweep is the step, and the GPU spans cannot say which part.
+        let preamble_span = span("q4e:host:preamble");
 
         // Hand back the PREVIOUS wave's transient tier, here rather than at the
         // end of the wave that placed it. `end_wave_transient` gates on
@@ -2789,6 +2793,8 @@ impl WaveSweep for Qwen4ExpBatched {
             }
         }
 
+        drop(preamble_span);
+        let layers_span = span("q4e:host:layers");
         let swept = self.sweep_layers(
             contexts,
             seq_ids,
@@ -2804,6 +2810,8 @@ impl WaveSweep for Qwen4ExpBatched {
             eps,
             fwd_ticket,
         );
+        drop(layers_span);
+        let _tail_span = span("q4e:host:tail");
 
         // Close the wave: commit on success, rewind everything on failure. A
         // rollback that itself fails leaves the sequence's state unaccounted
@@ -3262,11 +3270,33 @@ impl Qwen4ExpBatched {
                 .zip(pre_q.iter().copied()),
             |s| verify_seqs.contains(&s),
         );
+        // The prefill-shaped attention serves two very different workloads: a
+        // bulk prompt chunk (thousands of rows over the whole history) and the
+        // speculative verify (a few rows per sequence, every decode step). One
+        // span over both averaged a 200 ms bulk layer with hundreds of sub-ms
+        // verify layers into a number that described neither.
+        // The routed experts likewise: a wave carrying a prompt chunk is a
+        // different MoE workload from a decode step.
+        let bulk_prefill = seq_ids[n_decode..]
+            .iter()
+            .zip(pre_q)
+            .any(|(s, &l)| l > 1 && !verify_seqs.contains(s));
+        let (attn_prefill_span, moe_span) = if bulk_prefill {
+            ("q4e:attn_prefill", "q4e:moe_routed:bulk")
+        } else {
+            ("q4e:attn_verify", "q4e:moe_routed:step")
+        };
 
         dev.record_launches()?;
 
         for li in layer_start..layer_end {
             let layer = &m.layers[li];
+            // The forward thread's time issuing this layer, by mixer kind.
+            let _host_layer = span(if matches!(cfg.layer_kinds[li], LayerKind::Attention) {
+                "q4e:host:attn_layer"
+            } else {
+                "q4e:host:dn_layer"
+            });
 
             // ── PLE, before this layer's mixer (§12.4). ──
             let g_ple = if li == cfg.ple.layer {
@@ -3601,7 +3631,7 @@ impl Qwen4ExpBatched {
                         // Starts at row `n_decode` of `h`; the projections
                         // address it from its own first element.
                         expect_dense_view(x_g.as_cat_tensor(), "q4e prefill attention rows")?;
-                        let g_attn = crate::models::profile::gpu_span("q4e:attn_prefill", dev);
+                        let g_attn = crate::models::profile::gpu_span(attn_prefill_span, dev);
                         let out = forward_attn_batched(
                             &alayer,
                             pre_c,
@@ -3726,7 +3756,7 @@ impl Qwen4ExpBatched {
             // scatter — is the largest block of device work in the model. Nothing
             // here waits on the host, so this event span is the one place that
             // device time is attributed.
-            let g_moe = crate::models::profile::gpu_span("q4e:moe_routed", dev);
+            let g_moe = crate::models::profile::gpu_span(moe_span, dev);
             // The layer's output in its three parts: the shared expert's gate is
             // applied by the combine below, which reads the block output anyway,
             // rather than by three launches of its own.

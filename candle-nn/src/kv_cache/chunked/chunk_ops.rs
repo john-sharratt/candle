@@ -146,12 +146,7 @@ pub(super) fn needs_reconcile_source_tag(tag: ArenaFormatTag) -> bool {
 /// doing so addresses slot `n` at `n * payload` and walks into a neighbour
 /// (`docs/archived/arena_unification.md` invariant 8).
 fn read_chunk_into_pinned_bytes(arena: &Arena, chunk_idx: usize, dst: &mut [u8]) -> Result<()> {
-    let view = arena.slot_bytes(chunk_idx, dst.len())?;
-    // `to_vec1` is the only stable path to a contiguous byte read of a CPU
-    // tensor in candle today; the Vec is one extra copy on top of the pinned
-    // memcpy, acceptable for the warm→hot path (rare, eviction-driven).
-    dst.copy_from_slice(&view.to_vec1::<u8>()?);
-    Ok(())
+    arena.copy_slot_bytes(chunk_idx, dst)
 }
 
 /// Per-block parameter bundle for [`ChunkedKvBacking::alloc_sealed_blocks_bulk`].

@@ -6,6 +6,7 @@ use super::admit;
 use super::admit_ground::AdmitPass;
 use super::compaction_stall::{PassOutcome, PoolShape};
 use super::first_sample::{contiguous_runs, FirstSample, FirstSampled, PrefillEnd};
+use super::phase_split::cobatched_decode_rows;
 use super::wave_logits::WaveLogits;
 use super::*;
 use crate::persistence::thread::effective_turn_policy;
@@ -2004,14 +2005,21 @@ impl Scheduler {
         if self.foreground_decode_width() == 0 {
             return n;
         }
-        let ratio = self
-            .active_decodes
+        n.div_ceil(self.decode_airtime_ratio() as usize).max(1)
+    }
+
+    /// `R`, the decode-to-prefill airtime ratio the active decodes ask for: the
+    /// max `decode_priority` ratio over them (`High` where a layer cannot be
+    /// resolved), never below 1. The prefill throttle divides the layers by it,
+    /// and the decode quantum owes decode that share of a co-batched step.
+    pub(super) fn decode_airtime_ratio(&self) -> u32 {
+        self.active_decodes
             .keys()
             .filter_map(|sid| self.decode_layer_priority(*sid))
             .map(|p| p.ratio())
             .max()
-            .unwrap_or_else(|| crate::projection::DecodePriority::High.ratio());
-        n.div_ceil(ratio.max(1) as usize).max(1)
+            .unwrap_or_else(|| crate::projection::DecodePriority::High.ratio())
+            .max(1)
     }
 
     /// Resolve the `decode_priority` of a decode slot's target layer, or `None`
@@ -2871,6 +2879,7 @@ impl Scheduler {
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
+        self.wave_cobatched = has_glue || !seq_ids.is_empty();
 
         // No creep group → one full-sweep [0, N) forward folding decode + a
         // standalone section chunk (if pending) + glue. All full-sweep, no residual
@@ -2897,6 +2906,7 @@ impl Scheduler {
             }
             if !sec_seqs.is_empty() {
                 self.wave_section_advanced = true;
+                self.wave_cobatched = true;
             }
             if let Some(p) = glue_pending {
                 self.session.set_pending_glue(p.clone());
@@ -2944,6 +2954,12 @@ impl Scheduler {
                     sec_adv.iter().sum(),
                     sec_kv,
                     t_wave.elapsed().as_millis() as u64,
+                );
+                self.wave_stats.record_cobatched_split(
+                    cobatched_decode_rows(decode_inputs, verify_inputs),
+                    0,
+                    sec_adv.iter().sum(),
+                    t_wave.elapsed().as_micros() as u64,
                 );
                 super::PREFILL_OK_TOKENS.fetch_add(
                     sec_adv.iter().sum::<usize>() as u64,
@@ -3135,6 +3151,15 @@ impl Scheduler {
             if sc_seqs > 0 {
                 self.wave_stats.record_section(sc_seqs, sc_tok, sc_kv, ms);
             }
+            // The phase timeline's share of this sweep: one forward, split by rows
+            // between the decode rows that rode it and the members above.
+            let decode_rows = cobatched_decode_rows(decode_inputs, verify_inputs);
+            self.wave_stats.record_cobatched_split(
+                decode_rows,
+                pf_tok,
+                sc_tok,
+                t_seg2.elapsed().as_micros() as u64,
+            );
             // **Teach the planner what this machine actually did.** A forward is
             // `T = X/bw + W·c` — non-resident expert bytes over the bus, plus
             // compute for the rows — so one observation is one equation in two

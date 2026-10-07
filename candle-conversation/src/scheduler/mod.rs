@@ -35,6 +35,7 @@ mod decode;
 mod ephemeral_fork;
 pub mod exported_state;
 mod first_sample;
+mod graph_window;
 mod guest_room;
 mod interleave;
 #[cfg(feature = "kv-zero-check")]
@@ -43,6 +44,7 @@ pub mod memory_report;
 mod named_tool;
 mod norm_warm;
 pub mod phase_ring;
+mod phase_split;
 mod piece_identity;
 mod prefill;
 mod priority_pause;
@@ -57,6 +59,9 @@ mod spec_chooser;
 #[cfg(test)]
 mod test_substrate;
 mod wave_logits;
+
+use graph_window::graph_window;
+use phase_split::cobatched_shares;
 
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
@@ -109,6 +114,7 @@ use crate::{FinishReason, SubstrateReloadStatus, TurnStats};
 use admit::pass_budget::RateWidth;
 use first_sample::PrefillEnd;
 
+use candle::cuda_backend::graph::CaptureStats;
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, Tensor};
 use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
@@ -732,7 +738,8 @@ pub(crate) enum SchedulerRequest {
 
     /// Warm one slice of an ingest group's per-file hit levels on this thread's
     /// GPU gallery arena ([`Conversation::warm_ingest_timelines`]). Sent a slice
-    /// at a time by [`crate::IngestWarmer`], so decode waves run between slices.
+    /// at a time by [`crate::IngestWarmer`], and scored at ingest priority — in
+    /// the gaps a dialogue leaves, one slice per loop iteration (`norm_warm`).
     /// Replies with the timelines warmed, or `None` when this scheduler has no
     /// arena and the caller must score on the host.
     WarmIngestSlice {
@@ -776,6 +783,50 @@ pub(crate) enum SchedulerRequest {
 
     /// Shut down the scheduler.
     Shutdown,
+}
+
+impl SchedulerRequest {
+    /// The profile span a request's handling is recorded under — one per kind,
+    /// so a drain that costs the decode loop half a second says which request
+    /// did it.
+    fn span_name(&self) -> &'static str {
+        match self {
+            Self::NewSequence { .. } => "req:new_sequence",
+            Self::NewEphemeralSequence { .. } => "req:new_ephemeral_sequence",
+            Self::ForkEphemeralSequence { .. } => "req:fork_ephemeral_sequence",
+            Self::ResumeSequence { .. } => "req:resume_sequence",
+            Self::SubmitTurn { .. } => "req:submit_turn",
+            Self::FreeSequence { .. } => "req:free_sequence",
+            Self::ResetSequence { .. } => "req:reset_sequence",
+            Self::SetSequenceAdapter { .. } => "req:set_sequence_adapter",
+            Self::ScoreSealedTurn { .. } => "req:score_sealed_turn",
+            Self::IngestSection { .. } => "req:ingest_section",
+            Self::InstallRecurrentState { .. } => "req:install_recurrent_state",
+            Self::SeedRecurrentFromLineage { .. } => "req:seed_recurrent_from_lineage",
+            Self::MemoryCatchUp { .. } => "req:memory_catch_up",
+            Self::BranchCheckpointPass { .. } => "req:branch_checkpoint_pass",
+            Self::RestoreSection { .. } => "req:restore_section",
+            Self::RetireSections { .. } => "req:retire_sections",
+            Self::PrimingProjection { .. } => "req:priming_projection",
+            Self::OffloadCollectionMembers { .. } => "req:offload_collection_members",
+            Self::ExtractRawKvq { .. } => "req:extract_raw_kvq",
+            Self::ProbeWideSigs { .. } => "req:probe_wide_sigs",
+            #[cfg(any(test, feature = "test-helpers"))]
+            Self::ReadRecurrentMemory { .. } => "req:read_recurrent_memory",
+            #[cfg(any(test, feature = "test-helpers"))]
+            Self::ReadTurnKvDigest { .. } => "req:read_turn_kv_digest",
+            #[cfg(any(test, feature = "test-helpers"))]
+            Self::CountRecurrentMemories { .. } => "req:count_recurrent_memories",
+            Self::SubmitSummaryProbe { .. } => "req:submit_summary_probe",
+            Self::ReconstructSubstrate { .. } => "req:reconstruct_substrate",
+            Self::WarmCollectionNormalization { .. } => "req:warm_collection_normalization",
+            Self::PreloadGalleries { .. } => "req:preload_galleries",
+            Self::WarmIngestSlice { .. } => "req:warm_ingest_slice",
+            Self::DemoteTimelinesHot { .. } => "req:demote_timelines_hot",
+            Self::Wake => "req:wake",
+            Self::Shutdown => "req:shutdown",
+        }
+    }
 }
 
 /// Hot-path timing instrumentation for the scheduler.
@@ -2272,9 +2323,20 @@ struct WaveStats {
     drain_prefill_tokens: u64,
     drain_elevate_ms: u64,
     drain_glue_ms: u64,
+    /// The prefill and section shares of the co-batched forwards inside the
+    /// decode quantum, in microseconds — see [`Self::record_cobatched_split`].
+    cobatched_prefill_us: u64,
+    cobatched_section_us: u64,
+    /// Set for the span of the decode quantum, so a co-batched split is taken
+    /// only from a forward whose time decode's timer holds — the same wave step
+    /// also runs from the prefill quantum.
+    in_decode_quantum: bool,
     /// The expert pipeline's `(hits, misses, DMA loads)` at the previous flush,
     /// so each wave line reports this window's own — `None` on a dense model.
-    experts_prev: Option<(usize, usize, usize)>,
+    experts_prev: Option<(usize, usize, usize, usize)>,
+    /// The device's wave-capture counters at the previous flush, so the wave
+    /// line reports this window's own — `None` off CUDA.
+    graphs_prev: Option<CaptureStats>,
 }
 
 impl WaveStats {
@@ -2306,8 +2368,39 @@ impl WaveStats {
             drain_prefill_tokens: 0,
             drain_elevate_ms: 0,
             drain_glue_ms: 0,
+            cobatched_prefill_us: 0,
+            cobatched_section_us: 0,
+            in_decode_quantum: false,
             experts_prev: None,
+            graphs_prev: None,
         }
+    }
+
+    /// Split one co-batched forward's wall-clock between the classes that rode
+    /// it, by their share of its rows.
+    ///
+    /// The forward runs inside the decode quantum, so all of it is already in
+    /// `decode_ms`; this records how much of it was prefill's and section's work,
+    /// which the phase window moves out of decode. A forward cannot be spent
+    /// twice: a 3-row decode beside an 8K-token prefill shared one 4.6 s sweep,
+    /// and charging that sweep to both drew a decode bar the length of the whole
+    /// window at ~12 tok/s.
+    fn record_cobatched_split(
+        &mut self,
+        decode_rows: usize,
+        prefill_rows: usize,
+        section_rows: usize,
+        fwd_us: u64,
+    ) {
+        let (pf, sc) = cobatched_shares(
+            self.in_decode_quantum,
+            decode_rows,
+            prefill_rows,
+            section_rows,
+            fwd_us,
+        );
+        self.cobatched_prefill_us += pf;
+        self.cobatched_section_us += sc;
     }
 
     /// Accumulate one eviction event (relief-ladder shed of resident KV).
@@ -2431,7 +2524,8 @@ impl WaveStats {
         fmt: Option<(u32, u64, u64, u32, u64, u64)>,
         vram_decomp: (u64, u64, u64, u64),
         slots: (u32, u32, u32, u32),
-        experts: Option<(usize, usize, usize)>,
+        experts: Option<(usize, usize, usize, usize)>,
+        graphs: Option<CaptureStats>,
     ) {
         let elapsed = self.window_start.elapsed();
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
@@ -2497,21 +2591,34 @@ impl WaveStats {
         // This window's expert activations and how many were already resident —
         // a miss crosses the link inside its layer's GEMMs, and the one number
         // that says whether decode is bound by the card or by the link; and how
-        // many experts the window promoted into VRAM.
+        // many experts the window promoted into VRAM. `cold` is the share of the
+        // misses that were in no pinned slot and waited on the stager's pack
+        // read — the slow kind, which a miss count alone cannot tell apart.
         let experts_str = match (experts, self.experts_prev) {
-            (Some((h, m, d)), Some((h0, m0, d0))) if (h + m) > (h0 + m0) => {
+            (Some((h, m, d, c)), Some((h0, m0, d0, c0))) if (h + m) > (h0 + m0) => {
                 let (hits, misses) = (h.saturating_sub(h0), m.saturating_sub(m0));
                 format!(
-                    " | experts hit={:.2}% miss={misses} promoted={}",
+                    " | experts hit={:.2}% miss={misses} cold={} promoted={}",
                     100.0 * hits as f64 / (hits + misses) as f64,
+                    c.saturating_sub(c0),
                     d.saturating_sub(d0),
                 )
             }
             _ => String::new(),
         };
         self.experts_prev = experts;
+        // This window's wave captures: how many forwards ran as a recorded chain,
+        // into how many graph launches they were cut, and how many of those had
+        // to be instantiated afresh. Decode steps that outnumber captured waves
+        // ran eager — launch-bound at decode width — and a high instantiation
+        // share is host time spent building graphs instead of replaying them.
+        let graphs_str = match (graphs, self.graphs_prev) {
+            (Some(g), Some(g0)) => graph_window(&g0, &g),
+            _ => String::new(),
+        };
+        self.graphs_prev = graphs;
         tracing::info!(
-            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}",
+            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}",
             elapsed.as_secs_f64()
         );
         // Phase breakdown: where the wall-clock went on the scheduler thread.
@@ -2627,6 +2734,8 @@ impl WaveStats {
         self.drain_prefill_tokens = 0;
         self.drain_elevate_ms = 0;
         self.drain_glue_ms = 0;
+        self.cobatched_prefill_us = 0;
+        self.cobatched_section_us = 0;
     }
 
     /// Emit this window's per-phase measurements to the GUI ring as a **disjoint**
@@ -2658,22 +2767,23 @@ impl WaveStats {
         // hidden as token-less projection time.
         let drain_prefill = self.drain_prefill_ms.min(self.drain_ms);
         let mut proj_dur = self.drain_ms.saturating_sub(drain_prefill) + self.reproj_ms;
-        let mut decode_dur = self.decode_ms.saturating_sub(self.reproj_ms);
         // Continuous-fair-wave co-batching folds the prefill cohort and section
         // chunks INTO the decode quantum — one shared forward per wave — so their
-        // PHASE wall-clock (`prefill_ms`/`section_ms`) is ~0; the time lives in
-        // `decode_ms`. The panel derives each phase's tok/s as `tok / dur`, so a
-        // per-phase duration of 0 renders prefill as an invisible zero-width bar,
-        // while stealing time from `decode_dur` to give prefill a slice inflates the
-        // decode rate (fewer ms for the same decode tokens). Instead give prefill
-        // and section their OWN co-batched forward time — the channel `ms_sum`
-        // recorded per wave in `decode_forward_cobatched` — as the display duration.
-        // These overlap the decode quantum (they ran concurrently inside it), which
-        // the stacked timeline normalizes to its own sum; the win is that `tok / dur`
-        // yields each class's real CONCURRENT rate, and decode keeps its full
-        // duration so its rate stays truthful.
-        let mut prefill_dur = self.prefill.ms_sum.max(self.prefill_ms) + drain_prefill;
-        let mut section_dur = self.section.ms_sum.max(self.section_ms);
+        // own quanta (`prefill_ms`/`section_ms`) hold little and their time sits in
+        // `decode_ms`. Each co-batched forward's share of prefill and section rows
+        // (`record_cobatched_split`) is moved out of decode into those phases, so
+        // every band is wall-clock the window actually spent and the bands sum to
+        // it. Charging the shared forward to every class instead stacked one sweep
+        // two and three times: a 5.3 s window drew a 9.9 s bar, its 65-token decode
+        // credited with the whole 5.3 s.
+        let cobatched_prefill = self.cobatched_prefill_us / 1000;
+        let cobatched_section = self.cobatched_section_us / 1000;
+        let mut decode_dur = self
+            .decode_ms
+            .saturating_sub(self.reproj_ms)
+            .saturating_sub(cobatched_prefill + cobatched_section);
+        let mut prefill_dur = self.prefill_ms + cobatched_prefill + drain_prefill;
+        let mut section_dur = self.section_ms + cobatched_section;
         let alloc_dur = self.promote_ms;
         let accounted =
             self.drain_ms + self.promote_ms + self.decode_ms + self.prefill_ms + self.section_ms;
@@ -3398,6 +3508,10 @@ pub(crate) struct Scheduler {
     /// prefill cohort, so only the FIRST decode step of the quantum folds the
     /// cohort in (one budget-sized layer advance per wave, not per decode step).
     wave_cohort_advanced: bool,
+    /// The last wave step carried rows other than decode and verify — a prefill
+    /// creep, a section chunk or glue — so the profile can tell an 8-session
+    /// decode step from one that also paid for ingest.
+    wave_cobatched: bool,
     /// Set once per wave after the co-batched decode wave folded the active
     /// section-ingest chunk into its full sweep (section rides decode's `[0, N)`
     /// as a prefill-group member — one shared MoE grouped GEMM per layer serves
@@ -3678,6 +3792,7 @@ impl Scheduler {
             wave_prefill_cursor: 0,
             wave_prefill_members: Vec::new(),
             wave_cohort_advanced: false,
+            wave_cobatched: false,
             wave_section_advanced: false,
             shutdown_requested: false,
             section_name_cache: HashMap::new(),
@@ -3748,7 +3863,9 @@ impl Scheduler {
                     // ingest opening thousands of conversations spends real
                     // scheduler time here and it must not read as Blocked.
                     let t_req = Instant::now();
+                    let req_span = profile::span(req.span_name());
                     let keep_going = self.handle_request(req);
+                    req_span.end();
                     self.wave_stats
                         .add_requests(t_req.elapsed().as_micros() as u64);
                     if !keep_going {
@@ -4994,10 +5111,16 @@ impl Scheduler {
                 timelines,
                 response_tx,
             } => {
-                let warmed = self.gallery_arena.as_deref().map(|arena| {
-                    conversation.warm_ingest_timelines(&schema, layer, group, &timelines, arena)
+                // Background work: scored at ingest priority from the loop top
+                // (`step_norm_warm`), never inside the drain that received it.
+                self.queue_ingest_warm_slice(norm_warm::IngestSliceJob {
+                    conversation,
+                    schema,
+                    layer,
+                    group,
+                    timelines,
+                    response_tx,
                 });
-                let _ = response_tx.send(warmed);
                 true
             }
 

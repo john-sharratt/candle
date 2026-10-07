@@ -80,7 +80,7 @@ fn note_sticky_cuda_fault(err: &CudaError) {
         CudaError::Load { cuda, .. } => cuda,
         _ => return,
     };
-    let root = || format!("{driver:?}\n{}", super::last_cuda_kernel_launch());
+    let root = || format!("{driver:?}\n{}", super::every_thread_kernel_launches());
     if is_out_of_memory_driver_error(driver) {
         crate::gpu_poison::note_oom(root);
         return;
@@ -134,6 +134,34 @@ mod tests {
         assert!(
             !is_sticky_driver_error(&oom),
             "OOM is handled as its own streak, never the immediate-poison path"
+        );
+    }
+
+    /// A sticky fault's record names the launches of threads other than the one
+    /// that noticed it — the thread that synchronises first is usually not the
+    /// one that launched the faulting kernel.
+    #[test]
+    fn the_fault_record_shows_every_live_threads_launches() {
+        use crate::cuda_backend::{every_thread_kernel_launches, set_kernel_breadcrumb};
+        use std::sync::mpsc;
+        let (marked_tx, marked_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let worker = std::thread::Builder::new()
+            .name("breadcrumb-probe".into())
+            .spawn(move || {
+                set_kernel_breadcrumb("probe_kernel", "probe.rs", 7);
+                marked_tx.send(()).expect("the test is waiting");
+                let _ = done_rx.recv();
+            })
+            .expect("spawn the probe thread");
+        marked_rx.recv().expect("the probe marked its launch");
+        let record = every_thread_kernel_launches();
+        done_tx.send(()).expect("the probe is waiting");
+        worker.join().expect("the probe thread panicked");
+        assert!(
+            record.contains("thread 'breadcrumb-probe':")
+                && record.contains("'probe_kernel' (probe.rs:7)"),
+            "another thread's launch is missing from the fault record:\n{record}"
         );
     }
 

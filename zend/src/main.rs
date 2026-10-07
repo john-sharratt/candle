@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use candle_conversation::models::{Model, Recent, StrataTokens};
 use candle_conversation::persistence::SUBSTRATE_DIR;
+use candle_conversation::profile::set_gpu_span_period;
 use candle_conversation::relief_trace;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -42,6 +43,12 @@ use zend::config::{DaemonConfig, ModelChoice, SelfCheck};
 use zend::download;
 use zend::log_broadcast::{BusWriter, LogBus};
 use zend::session::ZendSession;
+
+/// One forward in this many records its GPU spans in a profiling build (see
+/// `set_gpu_span_period`). At a decode step of ~35 ms that is a sampled forward
+/// every ~0.3 s — dozens per `/v1/profile` window — while the rest run as the
+/// release build does.
+const ZEND_GPU_SPAN_PERIOD: u32 = 8;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -623,6 +630,12 @@ async fn main() -> anyhow::Result<()> {
         port = cli.port,
         "starting zend",
     );
+
+    // A profiling build serves `/v1/profile` for as long as it runs, so its GPU
+    // spans sample one forward in `ZEND_GPU_SPAN_PERIOD`: every forward's event
+    // records made the profiled daemon a different, ~2.5× slower program than
+    // the release build. A no-op without the `profile` feature.
+    set_gpu_span_period(ZEND_GPU_SPAN_PERIOD);
 
     // ── Session + router ──────────────────────────────────────────────────────
 

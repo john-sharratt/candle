@@ -37,7 +37,7 @@ use super::batched_inference::{
 };
 use super::batched_model::{WaveGuard, WavePhase};
 use super::kv_cache_utils::SequenceContext;
-use super::profile::gpu_span;
+use super::profile::{begin_gpu_span_forward, gpu_span};
 use super::residual_order::{caller_runs, reorder, Run};
 use super::tensor_cat::TensorCat;
 use super::window_residuals::WindowResiduals;
@@ -360,6 +360,8 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     {
         candle::bail!("forward_wave: input/seq length mismatch");
     }
+    // Whether this forward's GPU spans are sampled (`set_gpu_span_period`).
+    begin_gpu_span_forward();
 
     // Bound a single forward's token count: a PURE prefill full sweep whose
     // total tokens exceed the budget is split into token-bounded sub-forwards

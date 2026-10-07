@@ -121,6 +121,9 @@ impl Scheduler {
             .map(|(&id, _)| id)
             .collect();
         let max_recent = self.sampler.max_recent_len();
+        // Every static run's prefill input, in the order the runs were played —
+        // forwarded together once every sequence has been stepped.
+        let mut deferred: Vec<(SequenceId, Vec<u32>)> = Vec::new();
 
         for id in ids {
             let mut guard = 0usize;
@@ -234,21 +237,16 @@ impl Scheduler {
                 // Empty only when nothing is pending and the run is one token —
                 // that token rides the decode, so there is no forward to make.
                 // The recording below is unchanged either way.
+                // Forwarded below, in one batched pass with every other
+                // sequence's runs — not here, one sequence at a time. Each was a
+                // whole-model forward of its own on the decode loop: with eight
+                // templated ingest turns that was up to eight serial forwards
+                // between decode steps, ~29 ms a step of the 8-session decode.
+                // The bookkeeping below does not depend on the forward having
+                // run, so the run is recorded now and the forward follows.
                 if !input.is_empty() {
-                    if let Err(e) = self.run_prefill(id, &input) {
-                        tracing::warn!(
-                            seq_id = id.0,
-                            "stencil prefill forward failed: {e} — dropping"
-                        );
-                        if let Some(s) = self.active_decodes.get_mut(&id) {
-                            if let Some(d) = &s.stencil {
-                                Self::log_stencil_finish(id.0, d, "prefill failed");
-                            }
-                            s.stencil = None;
-                        }
-                        break;
-                    }
-                    // Everything pending went out with that pass.
+                    deferred.push((id, input));
+                    // Everything pending goes out with that pass.
                     if let Some(s) = self.active_decodes.get_mut(&id) {
                         s.mark_forwarded();
                     }
@@ -334,6 +332,29 @@ impl Scheduler {
                 // Loop: the next action is the node after this static run.
             }
         }
+
+        // One batched pass for every sequence's runs: a wave per split round,
+        // each sequence's spans in the order it played them.
+        if deferred.is_empty() {
+            return;
+        }
+        let spans: Vec<(SequenceId, &[u32])> = deferred
+            .iter()
+            .map(|(id, input)| (*id, input.as_slice()))
+            .collect();
+        let failed = self.run_prefill_batch(&spans);
+        // A failed forward leaves runs recorded whose K/V was never written —
+        // the turn would seal tokens with nothing behind them — so it fails,
+        // rather than dropping its stencil and decoding on over the gap.
+        for (id, e) in failed {
+            if let Some(s) = self.active_decodes.get_mut(&id) {
+                if let Some(d) = &s.stencil {
+                    Self::log_stencil_finish(id.0, d, "prefill failed");
+                }
+                s.stencil = None;
+            }
+            self.fail_all_decodes(&[id], &format!("stencil prefill forward failed: {e}"));
+        }
     }
 
     // ── Decode ─────────────────────────────────────────────────────────
@@ -343,6 +364,7 @@ impl Scheduler {
     /// Each sequence contributes exactly 1 token (its last generated token).
     /// One batched `forward_batched` call processes all sequences in parallel.
     pub(super) fn batch_decode_step(&mut self) {
+        let t_select = std::time::Instant::now();
         // A slot with a pending deferred glue fire reprojects THIS wave (the
         // co-batched glue member rewrites its `[sealed | glue]` prefix), so its
         // logical offset and block table are mid-rewrite. It must not also run
@@ -435,12 +457,19 @@ impl Scheduler {
                 || self.prefill_width() > 0
                 || self.section_ingest_width() > 0
             {
+                let _g = profile::span("decode:step:rowless_wave");
                 if let Err(e) = self.decode_forward_cobatched(&[], &[], &[], &[]) {
                     tracing::error!("decode: decode-less wave for excluded rows failed: {e}");
                 }
+            } else {
+                // A step with nothing to run at all — every decode excluded and
+                // no other work to carry. Counted, so a quantum that spins
+                // through these reads as such rather than as decode time.
+                profile::record("decode:step:no_rows", t_select.elapsed());
             }
             return;
         }
+        profile::record("decode:step:select", t_select.elapsed());
 
         let _t_step = super::PhaseTimer::new("decode_batch_step");
 
@@ -593,6 +622,7 @@ impl Scheduler {
         let spec_seqs: Vec<usize> = spec_idx.iter().map(|&i| seq_ids_raw[i]).collect();
         let spec_blocks: Vec<Vec<u32>> = spec_idx.iter().map(|&i| blocks[i].clone()).collect();
         draft_span.end();
+        let draft_elapsed = t_fwd.elapsed();
 
         // ── The wave ─────────────────────────────────────────────────────────
         //
@@ -650,6 +680,18 @@ impl Scheduler {
         };
         forward_span.end();
         let fwd_elapsed = t_fwd.elapsed();
+        // The step's two halves by the wave's shape, so a pure decode step is
+        // never averaged with one that also carried an ingest chunk.
+        let (draft_name, verify_name) = if self.wave_cobatched {
+            ("decode:cobatched:draft", "decode:cobatched:verify_forward")
+        } else {
+            (
+                "decode:decode_only:draft",
+                "decode:decode_only:verify_forward",
+            )
+        };
+        profile::record(draft_name, draft_elapsed);
+        profile::record(verify_name, fwd_elapsed.saturating_sub(draft_elapsed));
         let fwd_ms = fwd_elapsed.as_millis() as u64;
         // Charge the forward's FULL duration to every sequence in it — this is
         // decode-busy time per turn, the denominator of the reported tok/s.
@@ -1013,6 +1055,7 @@ impl Scheduler {
         // Healed prefixes to forward once the rollback has settled — see
         // `HealPrefill`.
         let mut heal_prefills: Vec<HealPrefill> = Vec::new();
+        let commit_span = profile::span("decode:commit");
         for p in 0..deepest {
             let at: Vec<usize> = (0..blocks.len())
                 .filter(|&i| emitted[i].len() > p)
@@ -1086,6 +1129,7 @@ impl Scheduler {
                 committed[i] += 1;
             }
         }
+        commit_span.end();
 
         // ── Roll each sequence back to what actually reached the turn ────────
         //
@@ -1112,15 +1156,19 @@ impl Scheduler {
         drop(captured);
         drop(rows_of);
         drop(held);
+        let rollback_span = profile::span("decode:rollback");
         if let Err(e) = self.model.truncate_sequences(&mut self.session, &targets) {
             self.fail_all_decodes(&seq_ids, &format!("speculative rollback failed: {e}"));
             return;
         }
+        rollback_span.end();
         // The healed prefixes, now that each sequence's KV ends at its last
         // committed position — the only place they belong.
+        let heal_span = profile::span("decode:heal");
         for heal in heal_prefills {
             self.forward_heal_prefill(heal);
         }
+        heal_span.end();
         // **Now the cuts.** The rollback has settled, so the live tail is the
         // accepted prefix rather than the drafted block — which is both the only
         // point a cut describes the right tokens, and the only point at which it

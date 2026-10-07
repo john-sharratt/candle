@@ -1441,25 +1441,22 @@ fn run_pass(
     //
     // The warm (RAM) copies produced by Phase 1 are durable the moment
     // their cold copy lands (Phase 2 / 2.5 above), but nothing else drops
-    // them: `install_cold` frees hot, never warm, and the only other
-    // `purge_warm_to_budget` call site is the cold→hot recall path in
-    // `elevate_to_hot`. During a bulk ingest (calibration, repo scan)
-    // there are almost no recalls — just hot→warm→cold migration — so the
-    // warm tier would otherwise grow unbounded and exhaust host RAM (the
-    // OOM that killed a full load). Run the same LRU purge here, where warm
-    // is actually produced, dropping the least-recently-used warm copies
-    // until the OS holds at least `max(2 GiB, 5% × total)` free. Every warm
-    // residence reachable here is already cold-backed (Phase 2 persisted
-    // this pass's whole warm-without-cold set), so no un-persisted bytes
-    // are dropped. `incoming = 0`: we bound the existing footprint, not
-    // reserve for an upcoming allocation.
+    // them: `install_cold` frees hot, never warm, and this is the only
+    // `purge_warm_to_budget` call site. During a bulk ingest (calibration,
+    // repo scan) the warm tier would otherwise grow unbounded and exhaust
+    // host RAM (the OOM that killed a full load). Run the LRU purge here,
+    // where warm is actually produced, dropping the least-recently-used warm
+    // copies until the OS holds at least `max(2 GiB, 5% × total)` free. Every
+    // warm residence reachable here is already cold-backed (Phase 2 persisted
+    // this pass's whole warm-without-cold set), so no un-persisted bytes are
+    // dropped. `incoming = 0`: we bound the existing footprint, not reserve
+    // for an upcoming allocation.
     //
     // Gated on there BEING warm to purge, not on this pass having produced it.
-    // The migration above is not warm's only producer: `elevate_to_hot` lands a
-    // cold recall as `hot + warm`, and the resume path installs warm directly. A
-    // gate on "did this pass migrate?" therefore goes silent in exactly the state
-    // that most needs the purge — a workspace whose hot→warm and warm→cold sets
-    // have both drained to empty while recalls keep pushing warm bytes back into
+    // The migration above is not warm's only producer: the resume path installs
+    // warm directly. A gate on "did this pass migrate?" therefore goes silent in
+    // exactly the state that most needs the purge — a workspace whose hot→warm
+    // and warm→cold sets have both drained to empty while warm stays resident in
     // RAM. That state pins free RAM under the floor indefinitely, which the
     // scheduler reads as permanent host-RAM pressure and answers by throttling
     // admission to its floor, forever, against a cause VRAM admission cannot

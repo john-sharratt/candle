@@ -21,6 +21,12 @@
 //! a caller still holds on the host and has not launched against yet; the
 //! entry's `Arc` count says so, and when any is held the ring moves to a fresh
 //! buffer instead, which the held entries keep alive through their anchor.
+//!
+//! **Another thread's recording segment is not in stream order yet.** Its
+//! launches are issued only when the segment ends, so a rewind from this
+//! thread would land ahead of their reads. While one records, a full ring
+//! moves to a fresh buffer as if a table were held, and the buffer it leaves
+//! is retired to the capture hub — freed once that segment has launched.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,7 +86,14 @@ impl InfoRing {
         let _eager = dev.pause_capture()?;
         let capacity = self.buf.as_ref().map(|b| b.len());
         let wraps = capacity.is_some_and(|cap| self.used + info.len() > cap);
-        let held = wraps && self.tables.values().any(|t| Arc::strong_count(t) > 1);
+        // Another thread's recording segment holds the old words too, and its
+        // launches are not issued yet: the pause above flushed only this
+        // thread's. A rewind would overwrite tables they are about to read —
+        // a kernel then walks the wrong dims and strides — so the ring moves
+        // to a fresh buffer instead, exactly as for a table held on the host.
+        let held = wraps
+            && (dev.capture_hub().recording_elsewhere()
+                || self.tables.values().any(|t| Arc::strong_count(t) > 1));
         let at = match place(self.used, info.len(), capacity, held) {
             Place::At(at) => at,
             Place::Rewind => {
@@ -89,6 +102,12 @@ impl InfoRing {
             }
             Place::Fresh(words) => {
                 self.tables.clear();
+                // Retired rather than dropped: a recording segment on another
+                // thread may still read it, and freed now the pool could hand
+                // the bytes back to the driver before that segment runs.
+                if let Some(old) = self.buf.take() {
+                    dev.retire(old);
+                }
                 // SAFETY: a word is read only through a table, and each table's
                 // words are written by its own upload below before any launch.
                 self.buf = Some(Arc::new(unsafe { dev.alloc::<usize>(words)? }));

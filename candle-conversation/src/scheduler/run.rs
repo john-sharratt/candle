@@ -101,6 +101,24 @@ fn cleanup_due(
     }
 }
 
+/// The decode time a quantum owes after a step that also carried the prefill
+/// creep, given that step's duration and the airtime ratio `R` the decodes ask
+/// for: never less than a [`WAVE_SLICE`], and at least the step's own length over
+/// `R`.
+///
+/// **A co-batched step must not use up the slice it ran in.** The creep folds
+/// into a quantum's first step, and at `R = 1` (a `Low`-priority decode — an
+/// ingest's own turns) it takes every layer of an 8K-token chunk: 4.2 s at depth,
+/// past a 2 s slice, so the quantum returned after that one step and the next one
+/// co-batched again. Measured in zend: 24 of 135 steps carried the creep and took
+/// 100 s of a 120 s window — eight sessions decoding ~14% of the time where `R = 1`
+/// means equal airtime. Owing the step's length over `R` restores that ratio; a
+/// throttled creep (`Normal`, `High`) is a few layers, its step is short, and the
+/// slice it gets is the one it always had.
+fn decode_owed_after_cobatched(step: Duration, ratio: u32) -> Duration {
+    WAVE_SLICE.max(step / ratio.max(1))
+}
+
 impl Scheduler {
     /// Number of currently-active decode sequences (including summary probes).
     /// Used as the "is there decode work to run" guard — and by the decode-less
@@ -164,7 +182,7 @@ impl Scheduler {
         }
         self.wave_stats
             .add_phase(WavePhase::Reproject, t_reproj0.elapsed().as_millis() as u64);
-        let deadline = Instant::now() + WAVE_SLICE;
+        let mut deadline = Instant::now() + WAVE_SLICE;
         let mut steps = 0usize;
         // When this quantum first saw a finished turn it has not yet cleaned up —
         // the clock `CLEANUP_DEFER` runs on.
@@ -192,7 +210,26 @@ impl Scheduler {
             }
             {
                 let _g = profile::span("loop:decode:step");
+                // Reset before the step so a step that runs no wave reads as
+                // decode-only, then filed by the shape the wave turned out to be.
+                self.wave_cobatched = false;
+                let t_step = Instant::now();
                 self.batch_decode_step();
+                let step = t_step.elapsed();
+                profile::record(
+                    if self.wave_cobatched {
+                        "decode:cobatched:step"
+                    } else {
+                        "decode:decode_only:step"
+                    },
+                    step,
+                );
+                // The creep's share of a co-batched step is prefill airtime, not
+                // the decode's — see `decode_owed_after_cobatched`.
+                if self.wave_cobatched {
+                    let owed = decode_owed_after_cobatched(step, self.decode_airtime_ratio());
+                    deadline = deadline.max(Instant::now() + owed);
+                }
             }
             // Drain any continuous-re-projection swaps queued during the
             // batch.  Must run BEFORE cleanup_finished so a swap that
@@ -275,17 +312,20 @@ impl Scheduler {
             // drain buckets and `apply_projection` DEFERS its gap-fills into the
             // unified wave step (`take_wave_glue`), exactly as the loop-top drain.
             let t_drain = Instant::now();
+            let drain_span = profile::span("mid:drain");
             IN_DRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
             self.batch_drain_gap_fills = true;
             let cont = self.drain_submissions();
             self.batch_drain_gap_fills = false;
             IN_DRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
+            drain_span.end();
             self.wave_stats
                 .add_phase(WavePhase::Drain, t_drain.elapsed().as_millis() as u64);
             if !cont {
                 return false;
             }
             let t_promote = Instant::now();
+            let _g = profile::span("mid:promote");
             self.promote_new_prefills();
             self.wave_stats
                 .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
@@ -294,7 +334,11 @@ impl Scheduler {
         // once per quantum. Self-gated on an active ingest so a plain dialogue decode
         // pays nothing (the loop-top call still handles the ingest-finished reopen).
         if !self.ingest_timelines.is_empty() {
-            self.regulate_ingest_admission();
+            {
+                let _g = profile::span("mid:regulate_ingest");
+                self.regulate_ingest_admission();
+            }
+            let _g = profile::span("mid:demote_cold_ingest");
             self.demote_cold_ingest_if_pressured();
         }
         true
@@ -930,7 +974,11 @@ impl Scheduler {
                     slots,
                     self.model
                         .expert_stats()
-                        .map(|s| (s.expert_hits, s.expert_misses, s.promotions)),
+                        .map(|s| (s.expert_hits, s.expert_misses, s.promotions, s.worker_cold)),
+                    match &self.device {
+                        Device::Cuda(d) => Some(d.capture_stats()),
+                        _ => None,
+                    },
                 );
                 // Same cadence: publish the full memory report (global slot for
                 // `GET /v1/memory` + one JSON debug line). See `memory_report`.
@@ -1093,7 +1141,9 @@ impl Scheduler {
     fn timed_decode(&mut self) {
         let _g = profile::span("loop:decode");
         let t = Instant::now();
+        self.wave_stats.in_decode_quantum = true;
         self.run_decode_until_budget();
+        self.wave_stats.in_decode_quantum = false;
         self.wave_stats
             .add_phase(WavePhase::Decode, t.elapsed().as_millis() as u64);
     }
@@ -1274,5 +1324,47 @@ mod cleanup_deferral_tests {
     fn a_tool_call_turn_is_cleaned_up_without_waiting() {
         let at = Instant::now();
         assert!(cleanup_due(Some(at), at, 6, true));
+    }
+}
+
+#[cfg(test)]
+mod decode_airtime_tests {
+    use super::{decode_owed_after_cobatched, WAVE_SLICE};
+    use std::time::Duration;
+
+    /// The measured case: a 4.2 s co-batched step under a `Low` decode (R = 1)
+    /// owes the decode 4.2 s of its own — equal airtime — not the 2 s slice it
+    /// already spent.
+    #[test]
+    fn an_unthrottled_creep_owes_the_decode_its_own_length() {
+        let step = Duration::from_millis(4_200);
+        assert_eq!(decode_owed_after_cobatched(step, 1), step);
+    }
+
+    /// A throttled creep's step is short, so the decode gets the slice it always
+    /// had — `High` and `Normal` waves are unchanged.
+    #[test]
+    fn a_throttled_creep_leaves_the_slice_alone() {
+        assert_eq!(
+            decode_owed_after_cobatched(Duration::from_millis(150), 64),
+            WAVE_SLICE
+        );
+        assert_eq!(
+            decode_owed_after_cobatched(Duration::from_millis(600), 16),
+            WAVE_SLICE
+        );
+    }
+
+    /// A long step at a higher ratio owes its share, and a zero ratio reads as 1.
+    #[test]
+    fn the_share_scales_with_the_ratio() {
+        assert_eq!(
+            decode_owed_after_cobatched(Duration::from_millis(64_000), 16),
+            Duration::from_millis(4_000)
+        );
+        assert_eq!(
+            decode_owed_after_cobatched(Duration::from_millis(3_000), 0),
+            Duration::from_millis(3_000)
+        );
     }
 }

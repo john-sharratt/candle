@@ -1147,6 +1147,81 @@ fn a_release_from_another_thread_waits_for_the_recording_segment() -> Result<()>
     Ok(())
 }
 
+/// **Another thread's eager staging never shares the wave's scratch.** A
+/// recording thread's segment writes the scratch through its recorded uploads
+/// and is launched whenever that thread next ends a segment — which can fall
+/// between a second thread's eager copy into the scratch and the kernel that
+/// reads it. The kernel then reads the segment's bytes as its own: measured in
+/// zend as the persistence thread's record fill taking a quantized activation
+/// for its descriptor table and writing a KV record to an unmapped address.
+#[test]
+fn another_threads_eager_staging_is_not_the_waves_scratch() -> Result<()> {
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    let (wave_scratch, _) = dev.with_staged_upload(&[1u8; 16], |at| Ok((at, ())))?;
+    let foreign_scratch = {
+        let dev = dev.clone();
+        std::thread::spawn(move || -> Result<u64> {
+            dev.cuda_context().bind_to_thread().w()?;
+            dev.with_staged_upload(&[2u8; 16], Ok)
+        })
+        .join()
+        .expect("the eager thread panicked")?
+    };
+    capture.finish()?;
+    assert_ne!(
+        wave_scratch, foreign_scratch,
+        "an eager copy from another thread landed in the scratch a recorded segment writes"
+    );
+    Ok(())
+}
+
+/// **A full info ring does not rewind under another thread's recording
+/// segment.** That segment's launches read layout tables from the ring and are
+/// not issued yet; a rewind from a second thread would overwrite those words
+/// before they run. The ring moves to a fresh buffer instead and retires the
+/// old one until the segment has launched.
+#[test]
+fn an_info_ring_wrap_from_another_thread_retires_instead_of_rewinding() -> Result<()> {
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 1.0, 0.0)?;
+    let before = dev.capture_hub().retired_len();
+    {
+        let dev = dev.clone();
+        // Distinct tables a sixteenth of the ring wide, enough to wrap it at
+        // least once from wherever earlier tests left it.
+        std::thread::spawn(move || -> Result<()> {
+            dev.cuda_context().bind_to_thread().w()?;
+            let words = crate::cuda_backend::info_ring::RING_WORDS / 16;
+            for i in 0..17usize {
+                let table: Vec<usize> = (0..words).map(|w| w ^ (i << 32)).collect();
+                dev.info_table(&table)?;
+            }
+            Ok(())
+        })
+        .join()
+        .expect("the uploading thread panicked")?;
+    }
+    assert!(
+        dev.capture_hub().retired_len() > before,
+        "the ring rewound or freed its buffer under a recording segment"
+    );
+    {
+        let _eager = dev.pause_capture()?;
+        assert_eq!(dev.capture_hub().retired_len(), 0, "released once launched");
+    }
+    capture.finish()?;
+    Ok(())
+}
+
 /// Retired memory is dropped outside the hub's lock, so an item whose own drop
 /// retires more does not deadlock the wave.
 #[test]

@@ -752,22 +752,27 @@ pub struct PromotionPlan {
 /// A full rehydration from cold (disk-only) state.
 ///
 /// The elevation orchestrator produces one of these per turn that was
-/// pulled out of the redo log: `load_to_hot` writes the bytes into
-/// VRAM, then `migrate_sealed_to_cpu_batch_async` materialises a
-/// fresh CPU-arena copy. The residence lands dual-tier (hot + warm)
-/// in a single install so future hot evictions are no-DMA — the warm
-/// copy is already there.
+/// pulled out of the redo log: the cold load writes the bytes into VRAM,
+/// and the residence lands **hot, backed by its cold record** — the state
+/// every freshly sealed turn is in. The persistence thread's hot→warm pass
+/// gives it a warm copy the way it gives every hot-only residence one, once
+/// no live working set pins it.
+///
+/// Recalled dual-tier, the warm copy was a second crossing of the link on
+/// the projection's critical path — the bytes gathered back off the GPU that
+/// the cold load had just read into host memory — and it cost more than the
+/// load itself: 227 ms against 136 ms for a 320 MB recall, every
+/// reprojection of a dialogue opened after a restart.
 ///
 /// Conceptually a *recall*: reaching back into durable storage and
-/// reactivating a turn fully into the working set. Pairs with
-/// [`WarmLift`] (the faster RAM-cached hop) and is consumed
-/// alongside it by [`Substrate::install_promoted`].
+/// reactivating a turn into the working set. Pairs with [`WarmLift`] (the
+/// faster RAM-cached hop) and is consumed alongside it by
+/// [`Substrate::install_promoted`].
 #[derive(Debug)]
 pub struct ColdRecall {
     pub kind: PromotionItemKind,
     pub residence: ResidenceIndex,
     pub hot: Vec<SealedSequence>,
-    pub warm: Vec<SealedSequence>,
 }
 
 /// A fast promotion from warm (RAM-cached) state into hot.
@@ -2451,14 +2456,8 @@ impl Substrate {
             if recall.hot.is_empty() {
                 continue;
             }
-            // Warm goes first: the cold→hot leg produces a fresh
-            // warm payload as part of the recall, and the residence
-            // is guaranteed `warm = None` pre-recall (otherwise it'd
-            // have classified as a WarmLift). install_hot then
-            // transitions hot+warm dual-residency.
-            if !recall.warm.is_empty() && self.residence[recall.residence.0].warm.is_none() {
-                self.install_warm(recall.residence, recall.warm);
-            }
+            // Hot only: the cold record already makes it durable, and the
+            // persistence thread produces the warm copy off this path.
             match recall.kind {
                 PromotionItemKind::Section(_) => {
                     self.install_section_hot(recall.residence, recall.hot);

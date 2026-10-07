@@ -51,7 +51,10 @@ mod span;
 mod tests;
 
 pub use accumulator::{ProfileAccumulator, ProfileSnapshot};
-pub use gpu::{gpu_drain, gpu_drain_blocking, gpu_span, gpu_span_if, gpu_span_phase, GpuSpan};
+pub use gpu::{
+    begin_gpu_span_forward, gpu_drain, gpu_drain_blocking, gpu_span, gpu_span_if, gpu_span_phase,
+    set_gpu_span_period, GpuSpan,
+};
 pub use mark::{profile_now, ProfileMark};
 pub use pipeline::{
     pipeline_record, pipeline_record_duration, pipeline_snapshot, pipeline_snapshot_and_reset,

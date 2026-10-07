@@ -79,9 +79,11 @@ use std::time::Instant;
 
 use candle::cuda_backend::cudarc::driver::result::memset_d8_sync;
 use candle::cuda_backend::cudarc::driver::CudaStream;
+use candle::cuda_backend::graph::try_without_recording;
 use candle::vram::AllocClass;
 use candle::Result;
 
+use super::bump_arena::KV_ARENA_MID_WAVE;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::growth_policy::{kv_grow_step, GrowthPolicy, Occupancy, Refusal};
 use super::reservation::Reservation;
@@ -1670,23 +1672,43 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
             // the region since (it has been on the free list throughout).
             // Bound unconditionally: the fill below needs a current context on
             // this thread whether or not the sync ran.
-            let bound = stream.context().bind_to_thread();
+            //
+            // **Never while a wave records.** The driver refuses a context-wide
+            // synchronise while any stream captures, and the refusal invalidates
+            // the capture on the recording thread — measured in zend as a draft
+            // walk killed by the persistence thread's arena creation, and the
+            // expert pipeline aborting behind it. The gate runs the clean only
+            // when nothing records, and holds recordings off until it is done;
+            // otherwise the region goes back and the claim is deferred like any
+            // other mid-wave arena creation.
             let needs_sync = pool.dirty_epoch[index] == pool.quiesce_epoch;
-            let t_sync = Instant::now();
-            let synced = bound.and_then(|()| {
-                if !needs_sync {
-                    return Ok(());
-                }
-                let r = stream.context().synchronize();
-                if r.is_ok() {
-                    pool.quiesce_epoch += 1;
-                }
-                r
+            let quiesce_epoch = &mut pool.quiesce_epoch;
+            let cleaned = try_without_recording(|| {
+                let bound = stream.context().bind_to_thread();
+                let t_sync = Instant::now();
+                let synced = bound.and_then(|()| {
+                    if !needs_sync {
+                        return Ok(());
+                    }
+                    let r = stream.context().synchronize();
+                    if r.is_ok() {
+                        *quiesce_epoch += 1;
+                    }
+                    r
+                });
+                let sync_ns = t_sync.elapsed().as_nanos() as u64;
+                let t_fill = Instant::now();
+                let zeroed = synced.and_then(|()| unsafe { memset_d8_sync(base, 0, REGION_BYTES) });
+                record_recycle(needs_sync, sync_ns, t_fill.elapsed().as_nanos() as u64);
+                zeroed
             });
-            let sync_ns = t_sync.elapsed().as_nanos() as u64;
-            let t_fill = Instant::now();
-            let zeroed = synced.and_then(|()| unsafe { memset_d8_sync(base, 0, REGION_BYTES) });
-            record_recycle(needs_sync, sync_ns, t_fill.elapsed().as_nanos() as u64);
+            let Some(zeroed) = cleaned else {
+                pool.free.push(Reverse(index));
+                candle::bail!(
+                    "{KV_ARENA_MID_WAVE} (recycling region {index}): a wave capture is \
+                     recording, and the clean's device-wide synchronise would invalidate it"
+                )
+            };
             if let Err(e) = zeroed {
                 // Put it back: a region that could not be cleaned is still the
                 // pool's, and losing it here would shrink the span silently.

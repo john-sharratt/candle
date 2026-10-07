@@ -12,7 +12,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use candle::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DriverError};
 use candle::{CudaDevice, Device, Result};
@@ -23,6 +23,7 @@ use candle_kernels::provenance::{
 use core::ffi::c_void;
 
 use crate::persistence::streams::StreamId;
+use crate::scheduler::profile;
 
 use super::super::gpu::{needle_tally_segments, BDP_TQ};
 use super::super::WideQSig;
@@ -407,6 +408,14 @@ impl GalleryArena {
             }
         };
         let index_us = t_index.elapsed().as_micros() as u64;
+        profile::record(
+            if reused {
+                "arena:index_reused"
+            } else {
+                "arena:index_built"
+            },
+            t_index.elapsed(),
+        );
         // Residency mutations (uploads, evictions, moves) on the whole device
         // while this index was found or built — this scan's and any concurrent
         // conversation's. With `reused` it separates "my working set churned"
@@ -415,6 +424,7 @@ impl GalleryArena {
         let t_launch = Instant::now();
         let result = self.launch_paged(&idx, probes, group_weights, force);
         let launch_us = t_launch.elapsed().as_micros() as u64;
+        profile::record("arena:launch", t_launch.elapsed());
         // Release the scan's pins whether or not the launch succeeded — the pages
         // are no longer being read once the launch has synchronized (or failed).
         for &sid in &idx.pinned_sids {
@@ -487,8 +497,10 @@ impl GalleryArena {
         // kernel; the rest are read back from the rows it kept (`ProbeRows`).
         // Held to the end of the launch, so a concurrent scan of the same index
         // cannot start the cache over between this plan and the assembly.
+        let t_plan = Instant::now();
         let mut rows = idx.rows.lock().unwrap_or_else(|e| e.into_inner());
         let fresh = rows.plan(&probe_words, wpt);
+        profile::record("arena:rows_plan", t_plan.elapsed());
         let (upload_us, kernel_us, readback_us) = if fresh.is_empty() {
             (0, 0, 0)
         } else {
@@ -499,13 +511,17 @@ impl GalleryArena {
             let words: Vec<u64> = tokens.concat();
             let (case, vote, timing) =
                 self.launch_kernel(dev, d_idx, idx, &words, tokens.len(), force)?;
+            let t_insert = Instant::now();
             rows.insert(&tokens, &case, &vote);
+            profile::record("arena:rows_insert", t_insert.elapsed());
             timing
         };
+        let t_assemble = Instant::now();
         let (out_case, out_vote) = rows
             .assemble(&probe_words, wpt)
             .expect("every probe token has a row once its launch is in");
         drop(rows);
+        profile::record("arena:rows_assemble", t_assemble.elapsed());
 
         let t_tally = Instant::now();
         let votes = needle_tally_segments(
@@ -518,6 +534,10 @@ impl GalleryArena {
             n_cases,
             group_weights,
         );
+        profile::record("arena:launch_upload", Duration::from_micros(upload_us));
+        profile::record("arena:launch_kernel", Duration::from_micros(kernel_us));
+        profile::record("arena:launch_readback", Duration::from_micros(readback_us));
+        profile::record("arena:launch_tally", t_tally.elapsed());
         // Where a launch's time goes: the probe upload, the kernel (to its
         // synchronize), the vote readback, and the host tally — over the
         // `scored` tokens no earlier launch over this index had scored.
@@ -727,9 +747,12 @@ impl GalleryArena {
                     "paged scan: no backend available for this device/geometry".into(),
                 ));
             }
+            profile::record("arena:launch_enqueue", t_kernel.elapsed());
+            let t_sync = Instant::now();
             stream
                 .synchronize()
                 .map_err(|e| candle::Error::Msg(format!("paged scan: synchronize: {e}")))?;
+            profile::record("arena:launch_sync", t_sync.elapsed());
         }
         let kernel_us = t_kernel.elapsed().as_micros() as u64;
 

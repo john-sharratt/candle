@@ -27,10 +27,11 @@
 //! does not. A wave whose shape, tier placement or launch scalars differ from
 //! the last one therefore replays correctly with no key and no epoch to check.
 
+use super::record_gate;
 use super::slot::{ExecSlot, Folded};
 use super::staging::StagingRing;
 use super::GraphError;
-use crate::cuda_backend::{CudaDevice, WrapErr};
+use crate::cuda_backend::{set_kernel_breadcrumb, CudaDevice, WrapErr};
 use crate::Result;
 use cudarc::driver::{result, sys, CudaEvent, CudaStream};
 use std::hash::{Hash, Hasher};
@@ -259,17 +260,34 @@ impl Drop for Paused<'_> {
     }
 }
 
+/// Start recording on the hub's stream, counted into the record gate for as
+/// long as the segment records — see [`record_gate`]. Every successful `begin`
+/// is paired with one [`end_capture`].
 fn begin(capture: &Arc<CudaStream>) -> Result<()> {
     capture.context().bind_to_thread().w()?;
+    record_gate::recording_begins();
     // SAFETY: the hub's own stream, not recording — a wave records on it only
     // between `begin` and `end_segment`, under the hub's lock.
-    unsafe {
+    let begun = unsafe {
         result::stream::begin_capture(
             capture.cu_stream(),
             sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
         )
     }
-    .w()
+    .w();
+    if begun.is_err() {
+        record_gate::recording_ends();
+    }
+    begun
+}
+
+/// End the capture [`begin`] started, and count the segment out of the record
+/// gate whether or not the driver hands back a graph.
+fn end_capture(capture: &Arc<CudaStream>) -> Result<sys::CUgraph> {
+    // SAFETY: this wave began the capture on the hub's stream.
+    let graph = unsafe { result::stream::end_capture(capture.cu_stream()) }.w();
+    record_gate::recording_ends();
+    graph
 }
 
 impl CaptureHub {
@@ -308,6 +326,17 @@ impl CaptureHub {
                 .wave
                 .as_ref()
                 .is_some_and(|w| w.owner == std::thread::current().id())
+    }
+
+    /// Whether another thread is recording a segment now — one whose launches
+    /// are not issued yet, so an eager write from this thread to memory they
+    /// read lands before them, not after.
+    pub(crate) fn recording_elsewhere(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+            && matches!(
+                &self.lock().wave,
+                Some(w) if w.recording && w.owner != std::thread::current().id()
+            )
     }
 
     /// Open a wave capture on this thread.
@@ -402,9 +431,13 @@ impl CaptureHub {
             st.stats.recording_us += since.elapsed().as_micros() as u64;
         }
         let wave = st.wave.as_mut().expect("called inside a wave");
-        capture.context().bind_to_thread().w()?;
-        // SAFETY: this wave began the capture on the hub's stream.
-        let graph = unsafe { result::stream::end_capture(capture.cu_stream()) }.w()?;
+        if let Err(e) = capture.context().bind_to_thread().w() {
+            // The capture cannot be ended from an unbound thread; it is lost,
+            // and so is its count in the gate.
+            record_gate::recording_ends();
+            return Err(e);
+        }
+        let graph = end_capture(&capture)?;
         if graph.is_null() {
             return Err(crate::Error::wrap(GraphError::NoGraph));
         }
@@ -427,6 +460,9 @@ impl CaptureHub {
         // SAFETY: the capture's own graph; `fold` takes ownership.
         let (exec, folded) = unsafe { st.slots[segment].fold(graph, &on, nodes)? };
         let fold_us = started.elapsed().as_micros() as u64;
+        // The recorded launches' own breadcrumbs were left at record time; this
+        // one marks where they were actually issued.
+        set_kernel_breadcrumb("graph segment launch", file!(), line!());
         exec.launch(&on)?;
         st.stats.segments += 1;
         st.stats.nodes += nodes as u64;
@@ -568,6 +604,12 @@ impl CaptureHub {
         }
     }
 
+    /// How many releases are waiting for the recording segment to launch.
+    #[cfg(test)]
+    pub(crate) fn retired_len(&self) -> usize {
+        self.lock().graveyard.len()
+    }
+
     /// Close this thread's wave without launching what is recording — the
     /// forward it belonged to has already failed.
     pub(crate) fn abandon_wave(&self, compute: &Arc<CudaStream>) {
@@ -578,14 +620,16 @@ impl CaptureHub {
             };
             self.active.store(false, Ordering::Release);
             if wave.recording {
-                if let Some(capture) = &st.capture {
-                    // SAFETY: this wave began the capture on the hub's stream.
-                    if let Ok(graph) = unsafe { result::stream::end_capture(capture.cu_stream()) } {
-                        if !graph.is_null() {
-                            // SAFETY: the capture's own graph, destroyed once.
-                            let _ = unsafe { result::graph::destroy(graph) };
+                match &st.capture {
+                    Some(capture) => {
+                        if let Ok(graph) = end_capture(capture) {
+                            if !graph.is_null() {
+                                // SAFETY: the capture's own graph, destroyed once.
+                                let _ = unsafe { result::graph::destroy(graph) };
+                            }
                         }
                     }
+                    None => record_gate::recording_ends(),
                 }
             }
             // Segments launched before the failure may still read the ring.

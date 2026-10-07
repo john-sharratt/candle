@@ -10,6 +10,7 @@
 
 use super::pipeline::PipelineState;
 use super::slot_image::{build_slot_view, slot_offsets};
+use candle::cuda_backend::graph::try_without_recording;
 use candle::{Device, Result};
 use candle_nn::kv_cache::{kv_spare_regions, set_weight_floor, wave_is_live, weight_floor_after};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,7 +99,25 @@ impl PipelineState {
             }
             return Ok(0);
         }
-        let conceded = self.renegotiate_boundary(want);
+        // **Never while a wave records.** The move quiesces the device on both
+        // sides of the handover, and the driver refuses a context-wide
+        // synchronise while any stream captures — refusing it invalidates the
+        // capture on the recording thread. Between forwards is not enough: the
+        // draft walk and the speculative rewind record there. Measured in zend:
+        // a requested retraction landed inside a draft walk, its next launch
+        // failed, and the expert pipeline aborted. Held for the whole move, so no
+        // recording can begin between the two quiesces; refused, it concedes
+        // nothing now and the next negotiation asks again.
+        let conceded = match try_without_recording(|| self.renegotiate_boundary(want)) {
+            Some(conceded) => conceded,
+            None => {
+                tracing::debug!(
+                    target: "candle_transformers::expert_lre",
+                    "boundary move deferred: a wave capture is recording"
+                );
+                Ok(0)
+            }
+        };
         drop(p);
         conceded
     }

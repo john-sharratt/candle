@@ -57,6 +57,7 @@
 //! runs of resident layers between them, and therefore the most time to hide the
 //! transfers that replace them.
 
+use candle::cuda_backend::graph::try_without_recording;
 use candle::Result;
 use candle_nn::kv_cache::{
     kv_spare_regions, set_weight_floor, span_end, wave_is_live, REGION_BYTES,
@@ -136,7 +137,18 @@ fn quiesce(device: &candle::CudaDevice) -> Result<()> {
 /// left the zone believing it was smaller while slots past the new capacity were
 /// still live, and the next pass handed a grouped GEMM an address below the
 /// weight floor. Here the order is: decide, quiesce, publish, then drop.
+///
+/// **Never while a wave records** (see [`try_without_recording`]): the quiesce
+/// is a context-wide synchronise, which a capture on any thread refuses and is
+/// invalidated by. Refused, it concedes nothing and the next claim asks again.
 pub fn concede_kv_ground<T, A: SlotAssembler<T>>(
+    cache: &mut LayerCache<T, A>,
+    regions: usize,
+) -> Result<u64> {
+    try_without_recording(|| concede_kv_ground_now(cache, regions)).unwrap_or(Ok(0))
+}
+
+fn concede_kv_ground_now<T, A: SlotAssembler<T>>(
     cache: &mut LayerCache<T, A>,
     regions: usize,
 ) -> Result<u64> {
@@ -233,7 +245,14 @@ pub fn concede_kv_ground<T, A: SlotAssembler<T>>(
 /// top slot and hands a GEMM an address below the floor, which is KV ground.
 /// That exact bug is written up on `ExpertCache::renegotiate_boundary`; the
 /// order here is the one it arrived at.
+///
+/// Like [`concede_kv_ground`], refused while a wave records: it reclaims
+/// nothing and the next quiet moment asks again.
 pub fn reclaim_spare_ground<T, A: SlotAssembler<T>>(cache: &mut LayerCache<T, A>) -> Result<u64> {
+    try_without_recording(|| reclaim_spare_ground_now(cache)).unwrap_or(Ok(0))
+}
+
+fn reclaim_spare_ground_now<T, A: SlotAssembler<T>>(cache: &mut LayerCache<T, A>) -> Result<u64> {
     growth_note(0);
     let before = cache.residency().homed();
     let num_layers = cache.residency().num_layers();

@@ -329,6 +329,14 @@ pub(crate) fn opening_prompt(key: &str, lines: usize) -> String {
 /// Narrowing the pool buys back the weight zone, which is worth more than the
 /// extra concurrency — 8 is 1.5× the rate of 16 on the same corpus. Below 8 the
 /// card is no longer the constraint and the rate falls off with the width.
+///
+/// Re-measured at 32 with the K/V now a small tenant (≈1.2 GB at 8): the decode
+/// width did grow (5–23 sequences against 1–2), but the decode rate barely moved
+/// — 124 tok/s against 107 — because each step got dearer: the routed experts
+/// went from 0.3 to 1.2 ms a layer at a 90–94% hit rate, as the extra contexts
+/// and every 8k prefill's transient tier pushed the zone off its working set.
+/// Prefill fell from 1,725 to 1,154 tok/s, with the hit rate at 56% inside a
+/// 17-sequence prefill. Width is not the lever here; the expert zone is.
 pub const CODE_READ_PARALLELISM: usize = 8;
 
 /// Worker count for the parallel ingest — [`CODE_READ_PARALLELISM`].

@@ -51,23 +51,60 @@ pub use cudarc;
 /// always within the last handful of launches ahead of the detection point.
 const KERNEL_RING_LEN: usize = 16;
 
-thread_local! {
-    static KERNEL_RING: std::cell::RefCell<[(&'static str, &'static str, u32); KERNEL_RING_LEN]> =
-        const { std::cell::RefCell::new([("", "", 0); KERNEL_RING_LEN]) };
+/// One thread's recent launches, newest at `pos - 1`.
+struct KernelRing {
+    slots: [(&'static str, &'static str, u32); KERNEL_RING_LEN],
     /// Index of the NEXT slot to write (ring is `[pos-1, pos-2, …]` newest→oldest).
-    static KERNEL_RING_POS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pos: usize,
+}
+
+impl KernelRing {
+    fn render(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for k in 0..KERNEL_RING_LEN {
+            let i = (self.pos + KERNEL_RING_LEN - 1 - k) % KERNEL_RING_LEN;
+            let (name, file, line) = self.slots[i];
+            if name.is_empty() {
+                continue;
+            }
+            out.push(format!("    #{k} '{name}' ({file}:{line})"));
+        }
+        out
+    }
+}
+
+/// Every thread's ring, by thread name, so a fault report can show the threads
+/// that did **not** notice it. The thread that reaches a sync first is rarely
+/// the one that launched the faulting kernel: a background thread that syncs
+/// often reports the fault, and the launcher's history is the one that names it.
+static KERNEL_RINGS: Mutex<Vec<(String, Weak<Mutex<KernelRing>>)>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static KERNEL_RING: Arc<Mutex<KernelRing>> = {
+        let ring = Arc::new(Mutex::new(KernelRing {
+            slots: [("", "", 0); KERNEL_RING_LEN],
+            pos: 0,
+        }));
+        let name = std::thread::current()
+            .name()
+            .map_or_else(|| format!("{:?}", std::thread::current().id()), str::to_string);
+        let mut rings = KERNEL_RINGS.lock().unwrap_or_else(|p| p.into_inner());
+        rings.retain(|(_, w)| w.strong_count() > 0);
+        rings.push((name, Arc::downgrade(&ring)));
+        ring
+    };
 }
 
 /// Record a breadcrumb for the current thread's latest kernel launch.
 /// Called via the `cuda_breadcrumb!` macro before each kernel FFI call.
 #[inline(always)]
 pub fn set_kernel_breadcrumb(name: &'static str, file: &'static str, line: u32) {
-    let pos = KERNEL_RING_POS.with(|p| {
-        let i = p.get();
-        p.set((i + 1) % KERNEL_RING_LEN);
-        i
+    KERNEL_RING.with(|r| {
+        let mut ring = r.lock().unwrap_or_else(|p| p.into_inner());
+        let pos = ring.pos;
+        ring.slots[pos] = (name, file, line);
+        ring.pos = (pos + 1) % KERNEL_RING_LEN;
     });
-    KERNEL_RING.with(|r| r.borrow_mut()[pos] = (name, file, line));
 }
 
 /// Dump the recent kernel-launch breadcrumbs on this thread, newest first.
@@ -75,28 +112,39 @@ pub fn set_kernel_breadcrumb(name: &'static str, file: &'static str, line: u32) 
 /// but may be a few entries back — the history is what makes that visible.
 /// Read from the panic hook / CUDA error sites when a `DriverError` surfaces.
 pub fn last_cuda_kernel_launch() -> String {
-    let pos = KERNEL_RING_POS.with(|p| p.get());
-    KERNEL_RING.with(|r| {
-        let ring = r.borrow();
-        let mut out = Vec::new();
-        for k in 0..KERNEL_RING_LEN {
-            let i = (pos + KERNEL_RING_LEN - 1 - k) % KERNEL_RING_LEN;
-            let (name, file, line) = ring[i];
-            if name.is_empty() {
-                continue;
-            }
-            out.push(format!("    #{k} '{name}' ({file}:{line})"));
+    let out = KERNEL_RING.with(|r| r.lock().unwrap_or_else(|p| p.into_inner()).render());
+    if out.is_empty() {
+        "(no kernels recorded on this thread)".to_string()
+    } else {
+        format!(
+            "recent CUDA kernel launches on this thread, newest first — async \
+             error, fault is usually #0 but can be a few back:\n{}",
+            out.join("\n")
+        )
+    }
+}
+
+/// Every live thread's recent launches, newest first per thread — the record a
+/// sticky fault keeps, because the error surfaces on whichever thread
+/// synchronises next and that is usually not the thread that launched the
+/// faulting kernel.
+pub fn every_thread_kernel_launches() -> String {
+    let rings = KERNEL_RINGS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut out = vec![
+        "recent CUDA kernel launches on every thread, newest first — async error, the \
+         faulting kernel is near the top of one of these:"
+            .to_string(),
+    ];
+    for (name, weak) in rings.iter() {
+        let Some(ring) = weak.upgrade() else { continue };
+        let lines = ring.lock().unwrap_or_else(|p| p.into_inner()).render();
+        if lines.is_empty() {
+            continue;
         }
-        if out.is_empty() {
-            "(no kernels recorded on this thread)".to_string()
-        } else {
-            format!(
-                "recent CUDA kernel launches on this thread, newest first — async \
-                 error, fault is usually #0 but can be a few back:\n{}",
-                out.join("\n")
-            )
-        }
-    })
+        out.push(format!("  thread '{name}':"));
+        out.extend(lines);
+    }
+    out.join("\n")
 }
 
 /// Set the thread-local kernel breadcrumb.  Captures `file!()` / `line!()` at
@@ -117,7 +165,7 @@ use float8::F8E4M3;
 use half::{bf16, f16};
 use std::any::Any;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 #[cfg(feature = "cudnn")]
 pub mod cudnn;

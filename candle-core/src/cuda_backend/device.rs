@@ -79,6 +79,11 @@ pub struct CudaDevice {
     /// The quantized-matmul path's activation staging — see
     /// [`Self::with_staging`]. Per stream, like the caches above.
     staging: Staging,
+    /// The same scratch for every thread that is not recording a wave — see
+    /// [`Self::with_staging`]. Recorded segments never touch it, so a segment
+    /// launched between another thread's copy and its kernel cannot overwrite
+    /// what that kernel reads.
+    foreign_staging: Staging,
     /// Launch tables for work that synchronises its stream before it returns
     /// — see [`Self::with_synced_upload`]. Separate from `staging` so a launch
     /// that waits out a long copy never holds the forward's scratch.
@@ -388,25 +393,44 @@ impl CudaDevice {
     /// **Inside a recording wave capture a scratch already wide enough is used
     /// in place**, so `f`'s write and read are recorded: `f` must launch only on
     /// [`Self::cuda_stream`]. A segment replays whole on the compute stream, so
-    /// any eager user of the scratch — this thread's after a pause, or another
-    /// thread's — runs entirely before that segment or entirely after it, never
-    /// between its write and its read. Pausing here instead ended the segment at
-    /// every legacy quantized matmul: measured on Qwen3.5-0.8B, one cut per
-    /// DeltaNet input projection, 25–176 µs of idle GPU each — ~1.5 ms of a
-    /// ~5 ms two-session decode step. Growth allocates, so it runs eagerly.
+    /// this thread's own eager use after a pause runs entirely before that
+    /// segment or entirely after it, never between its write and its read.
+    /// Pausing here instead ended the segment at every legacy quantized matmul:
+    /// measured on Qwen3.5-0.8B, one cut per DeltaNet input projection,
+    /// 25–176 µs of idle GPU each — ~1.5 ms of a ~5 ms two-session decode step.
+    /// Growth allocates, so it runs eagerly.
+    ///
+    /// **Every other thread stages through a scratch of its own.** A recording
+    /// thread launches its segment whenever it next ends one, and that launch
+    /// does not take this lock — so it can land between another thread's copy
+    /// into a shared scratch and the kernel that reads it, and the segment's
+    /// recorded uploads overwrite what that kernel is about to read. Measured
+    /// in zend: the persistence thread's KV record fill read a quantized
+    /// activation as its descriptor table and wrote a record to an unmapped
+    /// address. Recorded segments never touch the other scratch, so nothing
+    /// can be launched between its copy and its read but that thread's own
+    /// work, which the lock already orders.
     pub fn with_staging<R>(
         &self,
         bytes: usize,
         f: impl FnOnce(&mut CudaSlice<u8>) -> Result<R>,
     ) -> Result<R> {
-        let mut slot = self.staging.lock().unwrap();
+        let scratch = if self.capture.capturing_here() {
+            &self.staging
+        } else {
+            &self.foreign_staging
+        };
+        let mut slot = scratch.lock().unwrap();
         let fits = slot.as_ref().is_some_and(|s| s.len() >= bytes);
         let _eager = if fits { None } else { self.pause_capture()? };
         if !fits {
             let grown = slot.as_ref().map_or(0, |s| s.len() * 2).max(bytes).max(1);
-            // Dropping the old buffer frees it on this stream, after every
-            // launch already queued against it.
-            *slot = None;
+            // Retired rather than dropped: freed behind every launch that may
+            // still read it — at once when nothing records, since the pause
+            // above has launched this thread's segment.
+            if let Some(old) = slot.take() {
+                self.retire(old);
+            }
             // SAFETY: staging is written by the quantize the caller launches
             // before its kernel reads it.
             *slot = Some(unsafe { self.alloc::<u8>(grown)? });
@@ -560,7 +584,8 @@ impl CudaDevice {
     ///
     /// Entries are pool-owned (`Backing::Owned`) and outlive any single wave; kernels only read
     /// them. Cleared wholesale past a bound, like the info-table cache — in-flight users hold
-    /// their own `Arc`, so clearing is safe and a rebuild is trivial.
+    /// their own `Arc`, and the cleared entries are retired to the capture hub rather than
+    /// dropped, so a launch another thread recorded against one is issued before it is freed.
     pub fn group_major_ids(&self, rows: usize, groups: usize) -> Result<Arc<Uploaded<u32>>> {
         let key = (rows, groups);
         let mut cache = self.perm_tables.lock().unwrap();
@@ -570,7 +595,9 @@ impl CudaDevice {
         // Clearing frees, and the build below uploads.
         let _eager = self.pause_capture()?;
         if cache.len() >= 1024 {
-            cache.clear();
+            // Retired, not dropped: the pause above flushed only this thread's
+            // capture, and another thread's recording segment may read these.
+            self.retire(std::mem::take(&mut *cache));
         }
         let mut ids: Vec<u32> = Vec::with_capacity(rows * groups);
         for g in 0..groups {
@@ -1097,6 +1124,7 @@ impl CudaDevice {
             info_tables: Arc::new(Mutex::new(InfoRing::default())),
             perm_tables: Arc::new(Mutex::new(HashMap::new())),
             staging: Arc::new(Mutex::new(None)),
+            foreign_staging: Arc::new(Mutex::new(None)),
             synced_staging: Arc::new(Mutex::new(None)),
             capture: Arc::new(CaptureHub::default()),
         })
@@ -1376,6 +1404,7 @@ impl BackendDevice for CudaDevice {
             info_tables: Arc::new(Mutex::new(InfoRing::default())),
             perm_tables: Arc::new(Mutex::new(HashMap::new())),
             staging: Arc::new(Mutex::new(None)),
+            foreign_staging: Arc::new(Mutex::new(None)),
             synced_staging: Arc::new(Mutex::new(None)),
             capture: Arc::new(CaptureHub::default()),
         };

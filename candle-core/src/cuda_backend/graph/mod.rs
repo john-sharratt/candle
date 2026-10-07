@@ -24,6 +24,7 @@
 mod error;
 mod exec;
 mod hub;
+mod record_gate;
 #[cfg(test)]
 mod session;
 mod slot;
@@ -36,6 +37,7 @@ pub use error::GraphError;
 pub use exec::GraphExec;
 pub(crate) use hub::CaptureHub;
 pub use hub::{CaptureStats, Paused, WaveCapture};
+pub use record_gate::try_without_recording;
 #[cfg(test)]
 use session::CaptureSession;
 #[cfg(test)]

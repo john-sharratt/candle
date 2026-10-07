@@ -51,6 +51,7 @@ use crate::provenance::{
     FusionMode, GalleryArena, WideQSig,
 };
 use crate::scheduler::note_persistence_maint_us;
+use crate::scheduler::profile;
 use crate::substrate::{
     ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, StreamRuntime, Substrate,
     SubstrateRead, SubstrateWrite, TurnPartWrite,
@@ -1976,6 +1977,7 @@ impl Conversation {
         // The file's own turn signatures and its candidates, under one
         // short-lived read lock, released before any scoring.
         let (sigs, files) = {
+            let _g = profile::span("warm:assemble");
             let sub = self.inner.read().unwrap();
             let count = sub.turn_count(tl);
             let sigs: Vec<(u64, Arc<Vec<WideQSig>>)> = (0..count)
@@ -2004,7 +2006,10 @@ impl Conversation {
             return;
         }
         let probe_refs: Vec<&[WideQSig]> = probes.iter().map(|(_, p)| *p).collect();
+        let scan_span = profile::span("warm:scan");
         let scanned = scan_file_scans(&files, group, &probe_refs, arena);
+        scan_span.end();
+        let _g = profile::span("warm:fold");
         let scope = ScopeKey::turn_group(group.id.raw() as u64, tl.raw());
         let child_of =
             |slot: usize| ChildKey::turn(file.arc_turn[file.ex_ranges[slot].start].0 as u64);

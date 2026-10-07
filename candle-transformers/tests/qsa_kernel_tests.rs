@@ -596,6 +596,50 @@ fn budget_row(visible: usize, top_k: usize, phase: usize) -> (Vec<u32>, Vec<bool
     (entries, selected)
 }
 
+/// A projected prefix of `history` positions laid out as consecutive pieces of
+/// `piece` tokens — each its own index page, ending in a short block when
+/// `piece` is off the ratio — and then the live tail's page at `history`.
+fn piece_layout(history: usize, piece: usize) -> Vec<(u32, u32)> {
+    let blocks_per_piece = piece.div_ceil(RATIO);
+    let n_pieces = history / piece;
+    assert_eq!(
+        n_pieces * piece,
+        history,
+        "history is a whole number of pieces"
+    );
+    let mut layout: Vec<(u32, u32)> = (0..n_pieces)
+        .map(|i| ((i * piece) as u32, (i * blocks_per_piece) as u32))
+        .collect();
+    layout.push((history as u32, (n_pieces * blocks_per_piece) as u32));
+    layout
+}
+
+/// [`budget_row`] through a page layout: the same spread of `top_k` positions'
+/// worth of blocks below the query's tail block, each entry clamped to its
+/// block's own width (a page's last block is short), then the tail block.
+fn paged_budget_row(layout: &Layout, visible: usize, top_k: usize, phase: usize) -> Vec<u32> {
+    let tail_block = paged_block_of(layout, visible - 1);
+    let want = (top_k / RATIO).min(tail_block + 1).max(1);
+    let shift = phase * (tail_block / want / 2);
+    let mut keep: Vec<usize> = Vec::with_capacity(want);
+    for i in 0..want.saturating_sub(1) {
+        let b = (i * tail_block.max(1) / want.max(1) + shift).min(tail_block.max(1) - 1);
+        if keep.last() != Some(&b) {
+            keep.push(b);
+        }
+    }
+    if keep.last() != Some(&tail_block) {
+        keep.push(tail_block);
+    }
+    keep.iter()
+        .map(|&b| {
+            let start = paged_block_start(layout, b);
+            let end = paged_block_start(layout, b + 1).min(visible);
+            pack_entry(b, RATIO.min(end - start))
+        })
+        .collect()
+}
+
 fn bits(t: &Tensor) -> Result<Vec<f32>> {
     t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
 }
@@ -1888,8 +1932,21 @@ fn bench_verify_window_cost() -> Result<()> {
     const TOP_K: usize = 2048;
     const WARM: usize = 5;
     const ITERS: usize = 50;
-    println!("\n  history   rows   us/launch");
-    for &history in &[4_096usize, 32_768, 131_072] {
+    // The level the session seals at: what a conversation's history is held in
+    // once it is past its live chunk, and so what a verify at depth walks.
+    const SEAL_LEVEL: u8 = 5;
+    // A projected conversation's prefix is pieces — sections and spliced turns,
+    // each its own index page ending in a short block — so the walk maps every
+    // selected block to its position through the page table. 146 tokens is
+    // 36 whole blocks and a short one of 2 cells.
+    const PIECE: usize = 146;
+    println!(
+        "\n  history   rows   bf16 us/launch   sealed-C{SEAL_LEVEL} us/launch   \
+         sealed-C{SEAL_LEVEL} paged us/launch"
+    );
+    // Whole numbers of pieces; the deepest rung is a projected conversation's
+    // measured depth in zend (a fresh dialogue turn materialised ~295K tokens).
+    for &history in &[28 * PIECE, 224 * PIECE, 898 * PIECE, 2_020 * PIECE] {
         let (backing, mut cache) = build_history_slot(
             g,
             history,
@@ -1904,43 +1961,55 @@ fn bench_verify_window_cost() -> Result<()> {
             .map(|t| budget_row(history + t + 1, TOP_K, t & 1).0)
             .collect();
         let sel = selection(&rows, &device)?;
-        let mut launch = || -> Result<()> {
-            backing.truncate_sequence_to_tokens(0, history)?;
-            backing.ensure_for_batch_entries(&[(0, history)], Q_LEN)?;
-            let generation = stager.begin_generation();
-            let mut caches_arr: [&mut KvCache; 1] = [&mut cache];
-            paged_prefill_batched(
-                None,
-                &mut caches_arr[..],
-                &[history],
-                &q,
-                &k,
-                &v,
-                1,
-                &[Q_LEN],
-                g.n_head,
-                g.n_kv_head,
-                g.head_dim,
-                None,
-                &rope,
-                false,
-                &generation,
-                &std::cell::RefCell::new(None),
-                Some(&sel),
-            )?;
-            Ok(())
+        let layout = piece_layout(history, PIECE);
+        let paged_rows: Vec<Vec<u32>> = (0..Q_LEN)
+            .map(|t| paged_budget_row(&layout, history + t + 1, TOP_K, t & 1))
+            .collect();
+        let paged_sel = paged_selection(&layout, &paged_rows, &device)?;
+        let time_slot = |slot: usize, cache: &mut KvCache, sel: &QsaSelection| -> Result<f64> {
+            let mut launch = || -> Result<()> {
+                backing.truncate_sequence_to_tokens(slot, history)?;
+                backing.ensure_for_batch_entries(&[(slot, history)], Q_LEN)?;
+                let generation = stager.begin_generation();
+                let mut caches_arr: [&mut KvCache; 1] = [&mut *cache];
+                paged_prefill_batched(
+                    None,
+                    &mut caches_arr[..],
+                    &[history],
+                    &q,
+                    &k,
+                    &v,
+                    1,
+                    &[Q_LEN],
+                    g.n_head,
+                    g.n_kv_head,
+                    g.head_dim,
+                    None,
+                    &rope,
+                    false,
+                    &generation,
+                    &std::cell::RefCell::new(None),
+                    Some(sel),
+                )?;
+                Ok(())
+            };
+            for _ in 0..WARM {
+                launch()?;
+            }
+            device.synchronize()?;
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                launch()?;
+            }
+            device.synchronize()?;
+            Ok(t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64)
         };
-        for _ in 0..WARM {
-            launch()?;
-        }
-        device.synchronize()?;
-        let t0 = Instant::now();
-        for _ in 0..ITERS {
-            launch()?;
-        }
-        device.synchronize()?;
-        let us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
-        println!("  {history:>7}  {Q_LEN:>5}  {us:>10.1}");
+        let us = time_slot(0, &mut cache, &sel)?;
+        // Sealing records slot 0's chunks, so it runs after the float column.
+        let (mut sealed, _) = seal_history(&backing, history, SEAL_LEVEL, 1, &device)?;
+        let us_sealed = time_slot(1, &mut sealed, &sel)?;
+        let us_paged = time_slot(1, &mut sealed, &paged_sel)?;
+        println!("  {history:>7}  {Q_LEN:>5}  {us:>15.1}  {us_sealed:>22.1}  {us_paged:>28.1}");
     }
     Ok(())
 }

@@ -419,7 +419,7 @@ fn print_pipeline_profile(title: &str) {
     // visibly rather than hiding somewhere. Regenerate with:
     //   grep -rhoE 'gpu_span(_if|_phase)?\("[a-z0-9_:]+"' --include=*.rs \
     //     candle-transformers/src candle-conversation/src | grep -oE '"[a-z0-9_:]+"' | sort -u
-    const GPU_SPANS: [&str; 46] = [
+    const GPU_SPANS: [&str; 48] = [
         "decode:kernel",
         "decode:out_proj",
         "decode:qkv_proj",
@@ -455,12 +455,14 @@ fn print_pipeline_profile(title: &str) {
         "probe:recycle",
         "q4e:attn_decode",
         "q4e:attn_prefill",
+        "q4e:attn_verify",
         "q4e:gr_combine",
         "q4e:gr_combine_ffn",
         "q4e:gr_pre",
         "q4e:gr_pre_ffn",
         "q4e:moe_acts",
-        "q4e:moe_routed",
+        "q4e:moe_routed:bulk",
+        "q4e:moe_routed:step",
         "q4e:mtp_head",
         "q4e:ple",
         "q4e:qsa_select",
