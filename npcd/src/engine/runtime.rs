@@ -21,7 +21,7 @@
 //! console shows an engine that is present and broken rather than absent. The
 //! loader logs what failed and exits the process.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -80,7 +80,9 @@ use crate::engine::journal::world::Snapshot;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
-use crate::engine::mission::MissionPrompt;
+use crate::engine::mission::{
+    compass_line, compass_report_line, progress_line, Aim, Mission, MissionPrompt,
+};
 use crate::engine::mission_acts;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::reflect;
@@ -94,6 +96,7 @@ use crate::npcs::{Casting, Npcs};
 use crate::sim::missions::Missions;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
+use npc_map::schema::NodeKind;
 use npc_map::world::Where;
 use npc_map::{describe, perceive, route};
 
@@ -409,6 +412,9 @@ pub struct Runtime {
     /// Each world's missions as last written to the substrate, so a beat that
     /// changed nothing writes nothing.
     missions_saved: Mutex<BTreeMap<String, Missions>>,
+    /// Each character's mission compass as last told to it — see
+    /// [`Runtime::mission_compass`] — so it is told again only when it changes.
+    compass_told: Mutex<HashMap<u64, String>>,
     /// The characters with a dream being written — from the moment their
     /// reflection's first question is answered to the moment the dream is kept.
     /// §7: *"At most one dream in flight per character."*
@@ -641,6 +647,15 @@ pub const AT_THE_TABLE: &str =
      out, and when it is done come back and `invoke` the table's `report_done` — \
      or `report_stuck` if it will not finish — then take up the next.";
 
+/// The summons for a character **at the command table with its mission's work
+/// done** — everything but the report signed off. See
+/// [`Runtime::at_table_summons`].
+pub const REPORT_AT_THE_TABLE: &str =
+    "You are at the command table and every step of your mission is done but the \
+     report. Report it now, here: `invoke` the table's `report_done` with exactly \
+     what you found — or its `report_stuck` with what stopped you. Do not take up \
+     another until it is reported.";
+
 /// How long a character must go without news before the standing task is
 /// restated to it.
 ///
@@ -753,6 +768,7 @@ impl Runtime {
             metronomes: Mutex::new(BTreeMap::new()),
             places: Mutex::new(BTreeMap::new()),
             missions_saved: Mutex::new(BTreeMap::new()),
+            compass_told: Mutex::new(HashMap::new()),
             dreaming: Mutex::new(HashSet::new()),
             reflect_domain: AtomicUsize::new(0),
             feelings: RwLock::new(Vec::new()),
@@ -1076,12 +1092,277 @@ impl Runtime {
     /// nature — the moment it takes a mission this returns `None` — so repeating
     /// it here does not pile up the way a summons repeated over a long journey
     /// does.
+    ///
+    /// **And a character standing there with its mission's work done is told to
+    /// report it.** The report is filed nowhere but the table, and a character
+    /// that came back with everything done read only its brief — so it reached
+    /// for `collect_mission`, was refused, and walked back out to begin again.
+    /// Same window, same reasoning: it stops the moment the report is filed.
     pub fn at_table_summons(&self, npc_id: u64) -> Option<String> {
         let (hosted, body) = self.body_of(npc_id)?;
-        let (on_mission, table_open) =
-            hosted.sim(|s| (s.missions.is_on_mission(&body), s.table_open));
-        (table_open && !on_mission && self.at_command_table(npc_id))
-            .then(|| AT_THE_TABLE.to_string())
+        if !self.at_command_table(npc_id) {
+            return None;
+        }
+        // The exact address, for a mission set for this character by name: the
+        // general call to take one up was read past, turn after turn, by a
+        // character that walked in and out of the table room on other business.
+        let collect = self
+            .invokable_urls(&hosted, &body)
+            .into_iter()
+            .find(|i| i.act == mission_acts::COLLECT_MISSION.name)
+            .map(|i| i.url);
+        hosted.sim(|s| match s.missions.active(&body) {
+            None if s.missions.has_lodged(&body) => Some(match &collect {
+                Some(url) => format!(
+                    "A mission has been set for you by name, and it is waiting at this table. \
+                     Take it up now: `invoke` {url}."
+                ),
+                None => AT_THE_TABLE.to_string(),
+            }),
+            None => s.table_open.then(|| AT_THE_TABLE.to_string()),
+            // A mission carried on its ask alone has no steps to have done, so
+            // it is not told they are.
+            Some(m) => (!m.todo.is_empty() && m.next_step().is_none_or(|t| t.reports)).then(|| {
+                match m.observed.is_empty() {
+                    true => REPORT_AT_THE_TABLE.to_string(),
+                    false => format!(
+                        "{REPORT_AT_THE_TABLE} What you saw on it: {}.",
+                        m.observed.join("; ")
+                    ),
+                }
+            }),
+        })
+    }
+
+    /// Sign off what this character's mission asked of the room it is standing
+    /// in — the journey to it, and the reading of any machine standing in it —
+    /// and say so, with the readings and what comes next. `None` when nothing was
+    /// signed off: no mission, nothing asked of this room, or already ticked.
+    ///
+    /// **Standing in the room is the reading.** The situation a character reads
+    /// on arrival already lists every machine within reach with its state —
+    /// "breaker panel (closed), coolant valve (weeping)" — so a mission to go and
+    /// read one is met by being there. Waiting for a `scan` the character had no
+    /// reason to make, with the answer already in front of it, left it walking
+    /// between the room and the table until it gave the mission up as stuck.
+    pub fn mark_arrival(&self, npc_id: u64) -> Option<String> {
+        let (hosted, body) = self.body_of(npc_id)?;
+        hosted.with_both(|w, s| {
+            let at = w.actor(&body).map(|a| a.at.clone())?;
+            let room = w.node(&at).map(|n| n.name.clone())?;
+            let place = format!("{}/{}", at.area, at.node);
+            let here: Vec<(String, String)> = s
+                .devices
+                .iter()
+                .filter(|d| d.at == place)
+                .map(|d| (d.name.clone(), d.mode.clone()))
+                .collect();
+            let wanted: Vec<String> = s
+                .missions
+                .active(&body)?
+                .todo
+                .iter()
+                .filter(|t| !t.done)
+                .map(|t| t.text.clone())
+                .collect();
+            let arrived = s.missions.arrived_in(&body, &room);
+            let names: Vec<String> = here.iter().map(|(n, _)| n.clone()).collect();
+            let read = s.missions.read_off(&body, &names);
+            // Whoever is in the room with it: a step to find them is met.
+            let company: Vec<String> = w
+                .actors_at(&at)
+                .into_iter()
+                .filter(|other| other.id != body)
+                .map(|other| other.name.clone())
+                .collect();
+            let found: Vec<String> = company
+                .iter()
+                .filter(|who| s.missions.met(&body, who))
+                .cloned()
+                .collect();
+            if !arrived && !read && found.is_empty() {
+                return None;
+            }
+            // The readings the mission asked for, in the words of the situation,
+            // and kept as what the engine saw.
+            let asked: Vec<&(String, String)> = here
+                .iter()
+                .filter(|(name, _)| {
+                    wanted
+                        .iter()
+                        .any(|step| step.to_lowercase().contains(&name.to_lowercase()))
+                })
+                .collect();
+            let readings: Vec<String> = asked
+                .iter()
+                .map(|(name, mode)| format!("{name} here reads {mode}"))
+                .collect();
+            for (name, mode) in &asked {
+                s.missions
+                    .observe(&body, format!("in {room}, {name}: {mode}"));
+            }
+            for who in &found {
+                s.missions.observe(&body, format!("was with {who} in {room}"));
+            }
+            // Who was there when it got there — the answer to "go and see who is
+            // in…", and evidence an operator can check the report against.
+            if arrived {
+                let there = match company.is_empty() {
+                    true => "nobody else".to_string(),
+                    false => npc_map::text::list(&company),
+                };
+                s.missions.observe(&body, format!("in {room}: {there}"));
+            }
+            let lead = match (readings.is_empty(), found.is_empty()) {
+                (true, true) => format!("You are in {room}"),
+                (false, _) => format!("You are in {room}, and {}", npc_map::text::list(&readings)),
+                (true, false) => format!(
+                    "{} {} here with you",
+                    npc_map::text::list(&found),
+                    npc_map::text::is_are(found.len())
+                ),
+            };
+            let next = s.missions.active(&body).and_then(Mission::next_step);
+            tracing::info!(npc = %body, %room, arrived, read, "mission steps signed off on arrival");
+            Some(progress_line(&lead, next, &names))
+        })
+    }
+
+    /// The mission compass for this character as things stand — its mission's
+    /// next step and where whoever it names is now, or the way to the table to
+    /// report when that is all that is left. `None` with no mission, or one
+    /// carried on its ask alone.
+    pub fn mission_compass(&self, npc_id: u64) -> Option<String> {
+        let (hosted, body) = self.body_of(npc_id)?;
+        let at_table = self.at_command_table(npc_id);
+        hosted.with_both(|w, s| {
+            let mission = s.missions.active(&body)?;
+            let next = mission.next_step()?.clone();
+            let here = w.actor(&body)?.at.clone();
+            // The way to a place, in the grammar's verbs: a walk on this level,
+            // the lift to any other — `move_to` does not cross floors.
+            let way_to = |to: &Where| -> Option<String> {
+                let room = w.node(to)?.name.clone();
+                if to.area == here.area {
+                    return Some(format!("{room}: `move_to` it"));
+                }
+                let level = w.map().get(&to.area)?.name.clone();
+                // At the lift already, the way is the ride itself — said from
+                // where the body stands, so it is news there and is told again.
+                // Told only "go to the lift" back in the room, a character reached
+                // the lift, had nothing new, and walked back out.
+                let at_lift = w.node(&here).is_some_and(|n| n.kind == NodeKind::Core);
+                Some(match at_lift {
+                    true => format!(
+                        "{room}, on {level}. You are at the lift: `lift_call` it if it is not \
+                         here, then `lift_use` naming {level}, then `move_to` {room}"
+                    ),
+                    false => format!(
+                        "{room}, on {level}: `move_to` the lift, `lift_call` it, `lift_use` \
+                         naming {level}, then `move_to` {room}"
+                    ),
+                })
+            };
+            let reach: Vec<Where> = std::iter::once(here.clone())
+                .chain(route::reachable_from(w.map(), &here))
+                .collect();
+            let place = |at: &Where| format!("{}/{}", at.area, at.node);
+            if next.reports {
+                // The way back to the table, lift and all: told only the room, a
+                // character that had done its reading three floors down rode
+                // nowhere and paced the level it was on for twenty minutes.
+                let tables: Vec<&Where> = reach
+                    .iter()
+                    .filter(|at| s.part_offers(&place(at), mission_acts::COLLECT_MISSION.name))
+                    .collect();
+                let table = tables
+                    .iter()
+                    .find(|at| at.area == here.area)
+                    .or_else(|| tables.first())
+                    .and_then(|at| way_to(at));
+                return Some(compass_report_line(
+                    table.as_deref(),
+                    at_table,
+                    &mission.observed,
+                ));
+            }
+            let way = Aim::of(&next.text).and_then(|aim| {
+                let target = reach
+                    .iter()
+                    .find(|at| w.node(at).is_some_and(|n| aim.is_room(&n.name)))
+                    .or_else(|| {
+                        let d = s.devices.iter().find(|d| aim.is_machine(&d.name))?;
+                        reach.iter().find(|at| place(at) == d.at)
+                    })?;
+                (target != &here).then(|| way_to(target)).flatten()
+            });
+            let people: Vec<(String, Option<String>)> = w
+                .actors()
+                .filter(|a| a.id != body)
+                .map(|a| {
+                    let room = (a.at != here).then(|| way_to(&a.at)).flatten();
+                    (a.name.clone(), room)
+                })
+                .collect();
+            let way = way.map(|w| format!("It is in {w}."));
+            Some(compass_line(&next, &people, way.as_deref()))
+        })
+    }
+
+    /// The mission compass, when it says something this character has not
+    /// already been told. Recorded as told either way.
+    pub fn compass_news(&self, npc_id: u64) -> Option<String> {
+        let now = self.mission_compass(npc_id);
+        let mut told = self.compass_told.lock().unwrap();
+        match now {
+            Some(line) if told.get(&npc_id) != Some(&line) => {
+                told.insert(npc_id, line.clone());
+                Some(line)
+            }
+            Some(_) => None,
+            None => {
+                told.remove(&npc_id);
+                None
+            }
+        }
+    }
+
+    /// The acts that are a word addressed to somebody, by the argument naming
+    /// them.
+    const SPOKEN: &'static [&'static str] = &["ask", "tell", "message", "gesture", "give"];
+
+    /// Sign off the steps of this character's mission that the word it just
+    /// addressed to somebody was about, and say what is next. `None` when the
+    /// act was not a word to somebody, or no step was about them.
+    fn mark_spoken(&self, npc_id: u64, act: &Act) -> Option<String> {
+        if !Self::SPOKEN.contains(&act.tool) {
+            return None;
+        }
+        let who = act
+            .args
+            .get("to")
+            .and_then(|v| v.as_str())?
+            .trim()
+            .to_string();
+        let (hosted, body) = self.body_of(npc_id)?;
+        // Only a word to somebody in the world: a message to the channel is to
+        // nobody in particular, and signs no step about anybody off.
+        if !hosted.read(|w| w.actors().any(|a| a.name.eq_ignore_ascii_case(&who))) {
+            return None;
+        }
+        hosted.with_sim(|s| {
+            if !s.missions.spoke_with(&body, &who) {
+                return None;
+            }
+            s.missions.observe(&body, act.summary());
+            tracing::info!(npc = %body, %who, "mission step signed off by a word to somebody");
+            let next = s.missions.active(&body).and_then(Mission::next_step);
+            Some(progress_line(
+                &format!("You have spoken to {who}"),
+                next,
+                &[],
+            ))
+        })
     }
 
     /// Whether this character stands where a mission is taken up — i.e. the order
@@ -1327,6 +1608,13 @@ impl Runtime {
     /// will actually serve — not a bare resource, not a missing verb.
     fn invokable_urls(&self, hosted: &Arc<Hosted>, body: &str) -> Vec<Invokable> {
         let mut invoke = Vec::new();
+        // Only what this body can do here — see [`mission_acts::offered`].
+        let (on_mission, holds_order) = hosted.sim(|s| {
+            (
+                s.missions.is_on_mission(body),
+                !s.ledger.held_by(body).is_empty(),
+            )
+        });
         hosted.read(|w| {
             if let Some(at) = w.actor(body).map(|a| a.at.clone()) {
                 for inst in w.map().instances_at(&at) {
@@ -1334,7 +1622,9 @@ impl Runtime {
                         continue;
                     };
                     for (verb, tool) in station::verbs_at(inst.part_id()) {
-                        invoke.push(Invokable::new(format!("{url}/{verb}"), tool.name));
+                        if mission_acts::offered(tool.name, on_mission, holds_order) {
+                            invoke.push(Invokable::new(format!("{url}/{verb}"), tool.name));
+                        }
                     }
                 }
             }
@@ -1736,10 +2026,18 @@ impl Runtime {
         // What the character is told, whatever the verdict. `NotOfTheBody` has
         // no line of its own — nothing in a world happened — so it says so
         // rather than echoing the call back.
-        let answer = match outcome.line() {
+        let mut answer = match outcome.line() {
             Some(line) => line.to_string(),
             None => format!("Nothing in the world answers `{}`.", act.tool),
         };
+        // A word to somebody that a mission step asked for signs the step off,
+        // and the character is told so beneath what came of it.
+        if landed {
+            if let Some(line) = self.mark_spoken(npc_id, act) {
+                answer.push('\n');
+                answer.push_str(&line);
+            }
+        }
         // **Both halves, always, in one shape.**
         //
         // The feed used to show one or the other and the choice depended on the
@@ -2293,6 +2591,7 @@ impl Runtime {
     /// waiting on it, and a dream that did not land costs a dream.
     async fn dream_now(&self, npc_id: u64, brief: &str, assumption: &str) {
         let started = Instant::now();
+        tracing::info!("npc {npc_id}: dream begun");
         let Some(minds) = self.minds.read().unwrap().clone() else {
             return;
         };
@@ -4329,6 +4628,28 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                     EventKind::Nudge { text },
                 ));
             }
+            // A journey on its mission that ends where it now stands is done, and
+            // it is told so, with what comes next — in this tick, so it reads its
+            // progress the turn it arrives rather than an unticked step that sends
+            // it back to the table to begin again.
+            if let Some(text) = rt.mark_arrival(id) {
+                start.events.push(Event::new(
+                    rt.scheduler.next_seq(),
+                    world_ms,
+                    Salience::URGENT,
+                    EventKind::Nudge { text },
+                ));
+            }
+            // The mission compass — the next step and where whoever it names is
+            // now — whenever that has changed since it was last told.
+            if let Some(text) = rt.compass_news(id) {
+                start.events.push(Event::new(
+                    rt.scheduler.next_seq(),
+                    world_ms,
+                    Salience::URGENT,
+                    EventKind::Nudge { text },
+                ));
+            }
             let mut awaiting_reflection: Option<(oneshot::Receiver<String>, Owed)> = None;
             // The curated prose the character read, captured out of the think
             // step so the tick record reports it in place of the raw events —
@@ -6163,6 +6484,64 @@ mod tests {
         rt.set_table_open(false);
         assert_eq!(rt.at_table_summons(1), None, "the table closed");
         assert_eq!(rt.table_summons(2), None, "the table closed");
+    }
+
+    /// **A character back at the table with its mission's work done is told to
+    /// report it**, every tick it stands there — and not before the work is
+    /// done, not away from the table, and not once it has reported. Arriving in
+    /// the room the mission sent it to signs that journey off and says what is
+    /// next.
+    #[tokio::test]
+    async fn the_table_calls_for_the_report_once_the_work_is_done() {
+        use crate::engine::mission::{Mission, Origin, Outcome as Verdict, Todo};
+        let rt = vaulted();
+        rt.set_table_open(true);
+        let read_the_valve = || {
+            Mission::new(
+                "Read the coolant valve.",
+                vec![
+                    Todo::new("go to the plant room"),
+                    Todo::new("scan the coolant valve and read what state it is in"),
+                    Todo::report("go back to the table and report it"),
+                ],
+                Origin::Lodged {
+                    by: "u_op".to_string(),
+                },
+            )
+        };
+        let hosted = rt.hosted.get(WORLD).unwrap();
+
+        // In the plant room: the journey and the reading of the valve standing
+        // there are signed off, once, with the reading named, and it is told the
+        // report is what is left. Not at the table, so not called to report.
+        embody_at(&rt, 1, "m1", Where::new("vault-command", "plant"));
+        hosted.with_sim(|s| s.missions.assign("m1", read_the_valve()));
+        let arrived = rt.mark_arrival(1).expect("the journey ends here");
+        assert!(
+            arrived.starts_with("You are in the plant room, and the coolant valve here reads "),
+            "{arrived}"
+        );
+        assert!(arrived.contains(": that was the last step"), "{arrived}");
+        assert!(hosted.sim(|s| s.missions.active("m1").unwrap().todo[1].done));
+        assert_eq!(rt.mark_arrival(1), None, "signed off once");
+        assert_eq!(rt.at_table_summons(1), None, "not at the table");
+
+        // At the table with the journey still to make: not called to report.
+        embody_at(&rt, 2, "m2", Where::new("vault-command", "command-room"));
+        hosted.with_sim(|s| s.missions.assign("m2", read_the_valve()));
+        assert_eq!(rt.at_table_summons(2), None, "the work is not done");
+
+        // At the table with the work done: report it now.
+        hosted.with_sim(|s| {
+            s.missions.arrived_in("m2", "the plant room");
+            s.missions
+                .read_off("m2", &["the coolant valve".to_string()]);
+        });
+        assert_eq!(rt.at_table_summons(2).as_deref(), Some(REPORT_AT_THE_TABLE));
+
+        // Reported, it is free and called to take the next.
+        hosted.with_sim(|s| s.missions.report("m2", Verdict::Pass, "ok", None));
+        assert_eq!(rt.at_table_summons(2).as_deref(), Some(AT_THE_TABLE));
     }
 
     /// **The passive standing task is location-aware too.** [`Runtime::nudge_for`]

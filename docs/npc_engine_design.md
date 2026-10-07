@@ -251,6 +251,44 @@ hold an `order-table`, so a Redoubt character is sent to its own muster hall, on
 never told to ride a lift to the vault's level. A body with no table in reach (the waste) gets no
 summons and reads the ordinary standing task for its company instead.
 
+**A mission's steps are signed off by what the engine sees, not by what the character says.**
+Where a body stands, which machines stand there in what state, and who it spoke to are facts
+the world holds, so the steps that name them are ticked by the engine itself
+(`Mission::arrived_in`, `read_off`, `met`, `spoke_with`):
+
+| Step begins | Signed off when |
+|---|---|
+| `go to` / `go back to` / `travel to` / `walk to` / `head to` / `make your way to` *a room* | the body stands in that room |
+| `scan` *a machine* | the body stands in the machine's room — the situation lists every machine within reach with its state — or a `scan` lists it |
+| `find` / `go to` / `visit` / `seek out` / `look in on` / `meet` *a person* | that person is in the body's room |
+| `ask` / `tell` / `talk to` / `speak to` / `give` / `draw` / `hear` *a person* | an `ask`, `tell`, `message`, `gesture` or `give` addressed to them lands |
+
+Anything else ("form your own view of it") is left to the guardian's step tracker, which never
+asks about a step the engine can see. A mission lodged with no steps is given them from its brief
+at lodging: a journey to each reachable room and a finding of each person it names, in the order
+it names them. When the
+engine signs a step off it tells the character so in the same tick, with the one thing to do
+next. Every tick it also carries the **mission compass** whenever that has changed: the next step
+and the way to whatever it names — a room, the room a machine stands in, the room a person is in
+right now — or, when only the report is left, the way back to the table. A way on another level is
+the lift ride (`lift_call`, `lift_use` naming the level, then `move_to`), worded from the landing
+when the body is standing at the lift so it is told again there. The table offers only what the
+body can do at it: `collect_mission` to one carrying nothing, `report_done` / `report_stuck` to
+one carrying a mission, `orders_report_done` to one holding a standing order; a body with a
+mission lodged for it by name is told so at the table with the address to `invoke`.
+`report_stuck` is turned away twice while the next step's room, machine or person is within
+reach, with the way there, and taken the third time. `report_done` is turned away — with the way
+— whenever the next step is one the engine can see and it is still within reach. A character standing at the table with only the report left is told to report it every
+tick it stands there (`REPORT_AT_THE_TABLE`). `report_done` is refused while a reading of a
+machine the world holds is still unmade. What the engine saw —
+readings, meetings, words — is kept on the mission as `observed`, beside the character's own
+`answer`, so an operator can check one against the other, and it is handed to the character in
+the line that tells it to report, so the report is about this mission. `GET /v1/npc/:nid/mission`
+returns the mission in hand, the last one `finished`, and how many are `lodged` and waiting.
+
+Random routines are drawn from what the body can reach: the table it would be summoned to (its
+own level's first), and machines on its own level before any it would have to ride to.
+
 ### The idle turn is authored, not generated
 
 An NPC with a high pace floor never truly blocks, so most of its turns arrive with nothing

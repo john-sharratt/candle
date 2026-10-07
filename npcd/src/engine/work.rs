@@ -28,9 +28,10 @@ use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
 use crate::engine::body::Outcome;
-use crate::engine::mission::Outcome as Verdict;
+use crate::engine::mission::{Aim, Outcome as Verdict};
 use crate::sim::record::{slug_of, Condition, Item, Kind, State};
 use crate::world::Hosted;
+use npc_map::route;
 use npc_map::schema::Where;
 
 /// The acts this module performs.
@@ -97,12 +98,33 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             // — so without this a character could draw a fresh mission over an
             // open one, discarding the answer it built and never filing it to
             // `done`. Report it first; then the desk has something new to give.
-            if let Some(carried) =
-                hosted.sim(|s| s.missions.active(body).map(|m| m.standing_text()))
-            {
+            if let Some((carried, next)) = hosted.sim(|s| {
+                s.missions.active(body).map(|m| {
+                    (
+                        m.standing_text(),
+                        m.next_step().filter(|t| !t.reports).map(|t| t.text.clone()),
+                    )
+                })
+            }) {
+                // **Say the one thing to do, not the whole brief again.** A
+                // character that came back to the table mid-mission and was handed
+                // its brief whole went back out to the first step it had already
+                // done; one with everything done needs telling that the report is
+                // what is left, here, now.
+                let what_now = match next {
+                    Some(step) => format!(
+                        "It is not finished: the next thing to do on it is to {}. Go and do \
+                         that, then come back and `invoke` this table's `report_done` with what \
+                         you found — or `report_stuck` if it cannot be done.",
+                        step.trim().trim_end_matches('.')
+                    ),
+                    None => "Every step of it is done, and you are at the table: report it now — \
+                             `invoke` this table's `report_done` with exactly what you found."
+                        .to_string(),
+                };
                 return Outcome::Refused(format!(
-                    "You are already carrying a mission. Report how it went at the \
-                     desk — report_done or report_stuck — before taking another.\n{carried}"
+                    "You are already carrying a mission, and the table gives out one at a time. \
+                     {what_now}\n{carried}"
                 ));
             }
             // The character's own name, so a routine that would send it to visit
@@ -115,7 +137,16 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     let (area, node) = place.split_once('/')?;
                     w.node(&Where::new(area, node)).map(|n| n.name.clone())
                 };
-                let material = s.mission_material(&me, &room_name);
+                let reach: Vec<String> = w
+                    .actor(body)
+                    .map(|actor| {
+                        std::iter::once(actor.at.clone())
+                            .chain(route::reachable_from(w.map(), &actor.at))
+                            .map(|at| format!("{}/{}", at.area, at.node))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let material = s.mission_material(&me, &room_name, &reach);
                 let mission = s.missions.collect(body, &material.facts());
                 let brief = mission.standing_text();
                 tracing::info!(npc = body, prompt = %mission.mission_text(), "mission taken up at the command table");
@@ -128,6 +159,37 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "You meant to report it done, but did not say what you found.".into(),
                 );
             };
+            // **A step the engine can see, not yet done and still doable, holds
+            // the report.** A character sent to two rooms messaged the channel
+            // and reported the mission done from the table; the journeys were
+            // never made. The way to the step is the refusal.
+            if let Some(way) = still_doable(hosted, body) {
+                let step = hosted
+                    .sim(|s| s.missions.active(body)?.next_step().map(|t| t.text.clone()))
+                    .unwrap_or_default();
+                return Outcome::Refused(format!(
+                    "You have not done this yet: {step}. {way} Then come back and report it. If \
+                     it cannot be done, `invoke` the table's `report_stuck` and say why."
+                ));
+            }
+            // **A reading nobody made cannot be reported.** A mission to read a
+            // machine was filed as a pass by a character whose own account said
+            // it never read it. Reading is a `scan` in the machine's room, which
+            // the engine sees; until it has happened, done is not the report.
+            if let Some(step) = hosted.sim(|s| {
+                let machines: Vec<String> = s.devices.iter().map(|d| d.name.clone()).collect();
+                s.missions
+                    .active(body)?
+                    .unread_step(&machines)
+                    .map(str::to_string)
+            }) {
+                return Outcome::Refused(format!(
+                    "You have not done this yet: {step}. Go to the room it is in and `scan` there \
+                     — what you scan shows each machine with the state it is in. Then come back \
+                     and report it. If you cannot get to it or read it, `invoke` the table's \
+                     `report_stuck` and say why."
+                ));
+            }
             hosted.with_sim(|s| {
                 // The account is both the report's notes (how it went) and the
                 // answer (what was found) — for a mission done, the two are the
@@ -137,7 +199,7 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     .report(body, Verdict::Pass, &account, Some(account.clone()))
                 {
                     Some(m) => {
-                        tracing::info!(npc = body, prompt = %m.mission_text(), "mission reported DONE at the command table");
+                        tracing::info!(npc = body, prompt = %m.mission_text(), %account, "mission reported DONE at the command table");
                         Outcome::Did(format!(
                             "Reported done, and your answer filed: {}",
                             m.mission_text()
@@ -153,10 +215,26 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "You meant to report it stuck, but did not say why.".into(),
                 );
             };
+            // **Stuck is for a step that cannot be done, and the world can see
+            // when one can.** Characters gave missions up as stuck a minute in —
+            // the person "nowhere to be found" one room away, the machine "not
+            // responding" in a room they never reached. When the next step's
+            // room, machine or person is within reach, the desk says where and
+            // how instead. Twice, then it takes the report: a character that has
+            // been told the way twice and still cannot is reporting a real block.
+            if let Some(way) = still_doable(hosted, body) {
+                let refused = hosted.with_sim(|s| s.missions.refuse_stuck(body));
+                if refused <= STUCK_REFUSALS {
+                    return Outcome::Refused(format!(
+                        "It is not stuck yet — {way} Do that, then come back to the table and \
+                         `invoke` its `report_done` with what you found."
+                    ));
+                }
+            }
             hosted.with_sim(
                 |s| match s.missions.report(body, Verdict::Fail, &why, None) {
                     Some(m) => {
-                        tracing::info!(npc = body, prompt = %m.mission_text(), "mission reported STUCK at the command table");
+                        tracing::info!(npc = body, prompt = %m.mission_text(), %why, "mission reported STUCK at the command table");
                         Outcome::Did(format!(
                             "Reported as not done, with your reasons: {}",
                             m.mission_text()
@@ -168,6 +246,67 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         }
         other => Outcome::Refused(format!("`{other}` is not a mission act.")),
     }
+}
+
+/// How many times `report_stuck` is turned away while the next step is within
+/// reach before the report is taken anyway.
+const STUCK_REFUSALS: u32 = 2;
+
+/// How the next step of the body's mission can be done from here, when the
+/// engine can see that it can: its room is within reach, its machine stands in
+/// a room within reach, or its person is in one. `None` when there is no such
+/// step, or what it names is nowhere the body can get to.
+fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
+    hosted.with_both(|w, s| {
+        let step = s
+            .missions
+            .active(body)?
+            .next_step()
+            .filter(|t| !t.reports)?
+            .text
+            .clone();
+        let aim = Aim::of(&step)?;
+        let here = w.actor(body)?.at.clone();
+        let reach: Vec<Where> = std::iter::once(here.clone())
+            .chain(route::reachable_from(w.map(), &here))
+            .collect();
+        let room_of = |at: &Where| w.node(at).map(|n| n.name.clone());
+        let place = |at: &Where| format!("{}/{}", at.area, at.node);
+        if let Some(room) = reach
+            .iter()
+            .filter_map(room_of)
+            .find(|name| aim.is_room(name))
+        {
+            return Some(format!("{room} is within reach: `move_to` it."));
+        }
+        for d in s.devices.iter().filter(|d| aim.is_machine(&d.name)) {
+            if let Some(at) = reach.iter().find(|at| place(at) == d.at) {
+                let room = room_of(at)?;
+                return Some(format!(
+                    "{} stands in {room}, within reach: `move_to` {room}, and you read its \
+                     state as you arrive.",
+                    d.name
+                ));
+            }
+        }
+        for a in w
+            .actors()
+            .filter(|a| a.id != body && aim.is_person(&a.name))
+        {
+            if reach.contains(&a.at) {
+                let room = room_of(&a.at)?;
+                return Some(match a.at == here {
+                    true => format!("{} is here with you: `ask` or `tell` them.", a.name),
+                    false => format!(
+                        "{} is in {room}, within reach: `move_to` {room} and `ask` or `tell` \
+                         them — or `message` them, which reaches them wherever they are.",
+                        a.name
+                    ),
+                });
+            }
+        }
+        None
+    })
 }
 
 /// Perform one station or bench act.
@@ -2679,6 +2818,30 @@ mod tests {
             other => panic!("a second collect must be refused, got {other:?}"),
         }
 
+        // The bank's first routine goes to a room and reads a machine there, and
+        // a journey not made cannot be reported done: the desk says what is left
+        // and the way to it, and that `report_stuck` is the honest close if it
+        // cannot be made.
+        match perform(&h, "m1", &act("report_done", json!({"account":"all fine"}))) {
+            Outcome::Refused(why) => {
+                assert!(
+                    why.starts_with("You have not done this yet: go to "),
+                    "{why}"
+                );
+                assert!(why.contains("`move_to`"), "{why}");
+                assert!(why.contains("report_stuck"), "{why}");
+            }
+            other => panic!("a journey not made cannot be reported done, got {other:?}"),
+        }
+        // Going there and reading it signs both steps off.
+        let room = h.sim(|s| {
+            let step = &s.missions.active("m1").unwrap().todo[0].text;
+            step.trim_start_matches("go to ").to_string()
+        });
+        let machines: Vec<String> = h.sim(|s| s.devices.iter().map(|d| d.name.clone()).collect());
+        assert!(h.with_sim(|s| s.missions.arrived_in("m1", &room)));
+        assert!(h.with_sim(|s| s.missions.read_off("m1", &machines)));
+
         // Reporting done closes it, frees the character, and files the answer so
         // an operator can still read it.
         assert!(perform(
@@ -2698,6 +2861,33 @@ mod tests {
             h.sim(|s| s.missions.done("m1").unwrap().answer.clone()),
             Some("the ledger is two years out".to_string())
         );
+    }
+
+    /// **Stuck is turned away while the next step is within reach**, with where
+    /// and how — twice. The third time the report is taken: a character told
+    /// the way twice that still cannot is reporting a real block.
+    #[test]
+    fn stuck_is_refused_while_the_next_step_is_within_reach() {
+        let h = vault();
+        assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
+        let stuck = || {
+            perform(
+                &h,
+                "m1",
+                &act("report_stuck", json!({"why":"it will not answer"})),
+            )
+        };
+        for _ in 0..2 {
+            match stuck() {
+                Outcome::Refused(why) => {
+                    assert!(why.starts_with("It is not stuck yet — "), "{why}");
+                    assert!(why.contains("`move_to`"), "{why}");
+                }
+                other => panic!("a reachable step is not stuck, got {other:?}"),
+            }
+        }
+        assert!(stuck().happened(), "the third time, the report is taken");
+        assert!(!h.sim(|s| s.missions.is_on_mission("m1")));
     }
 
     #[test]

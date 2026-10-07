@@ -1457,12 +1457,28 @@ mod tests {
     /// **A room with nothing to work says so rather than listing nothing.**
     #[test]
     fn a_survey_of_an_empty_room_points_elsewhere() {
-        let h = tower_with(&[("c1", "Wren Weaver", "rampart")]);
+        let h = tower_with(&[("c1", "Wren Weaver", "barracks")]);
         let out = perform(&h, "c1", &act("scan", json!({})));
         assert_eq!(
             out.line().unwrap(),
             "Nothing in this room answers to you. To see somewhere else, name a place."
         );
+    }
+
+    /// **A machine with no address is still read by a scan.** The rampart's
+    /// turrets afford no `invoke`; they are worked with `operate`, and a scan
+    /// shows each in its state with the states it can be put to — the reading a
+    /// mission to "read the turret" asks for.
+    #[test]
+    fn a_survey_reads_the_machines_that_have_no_address() {
+        let h = tower_with(&[("c1", "Wren Weaver", "rampart")]);
+        let out = perform(&h, "c1", &act("scan", json!({})));
+        let line = out.line().unwrap();
+        assert!(
+            line.starts_with("Here you can work:\n- Wall turret 1: "),
+            "{line}"
+        );
+        assert_eq!(line.matches("with `operate`.").count(), 4, "{line}");
     }
 
     #[test]

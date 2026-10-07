@@ -509,6 +509,22 @@ fn a_lost_journey_reads_as_the_answer_to_the_question_that_was_asked() {
     assert!(text.contains("having set off somewhere else"), "{text}");
 }
 
+/// Setting off again for where you are already going carries on — it neither
+/// loses the way nor starts the journey over.
+#[test]
+fn setting_off_again_for_the_same_place_carries_on() {
+    let mut w = vault();
+    w.enter("m1", "Maker-01", casting("band-one")).unwrap();
+    w.set_off("m1", command("command-room")).unwrap();
+    w.mark_seen("m1");
+    w.set_off("m1", command("command-room")).unwrap();
+    assert!(
+        told(&w, "m1").is_empty(),
+        "a second order to go where it was going said: {:?}",
+        told(&w, "m1")
+    );
+}
+
 #[test]
 fn no_journey_ever_ends_without_an_answer() {
     // The property that keeps a body from waiting for ever: every walk that

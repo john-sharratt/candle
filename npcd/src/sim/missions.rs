@@ -142,6 +142,52 @@ impl Missions {
             .is_some_and(|m| m.check_off(step, outcome))
     }
 
+    /// Sign off the journeys on the body's open mission that end in `room`, where
+    /// it now stands — see [`Mission::arrived_in`].
+    pub fn arrived_in(&mut self, body: &str, room: &str) -> bool {
+        self.active
+            .get_mut(body)
+            .is_some_and(|m| m.arrived_in(room))
+    }
+
+    /// Sign off the readings on the body's open mission of the machines it just
+    /// scanned — see [`Mission::read_off`].
+    pub fn read_off(&mut self, body: &str, seen: &[String]) -> bool {
+        self.active.get_mut(body).is_some_and(|m| m.read_off(seen))
+    }
+
+    /// Sign off the steps on the body's open mission that are about being with
+    /// `who`, who is in the room with it — see [`Mission::met`].
+    pub fn met(&mut self, body: &str, who: &str) -> bool {
+        self.active.get_mut(body).is_some_and(|m| m.met(who))
+    }
+
+    /// Sign off the steps on the body's open mission that are about being with
+    /// or speaking to `who`, to whom it just said something — see
+    /// [`Mission::spoke_with`].
+    pub fn spoke_with(&mut self, body: &str, who: &str) -> bool {
+        self.active.get_mut(body).is_some_and(|m| m.spoke_with(who))
+    }
+
+    /// Note on the body's open mission something the engine saw — see
+    /// [`Mission::observe`].
+    pub fn observe(&mut self, body: &str, line: impl Into<String>) {
+        if let Some(m) = self.active.get_mut(body) {
+            m.observe(line);
+        }
+    }
+
+    /// Count a `report_stuck` turned away on the body's open mission — see
+    /// [`Mission::refuse_stuck`]. `0` with no open mission.
+    pub fn refuse_stuck(&mut self, body: &str) -> u32 {
+        self.active.get_mut(body).map_or(0, Mission::refuse_stuck)
+    }
+
+    /// How many missions are lodged for the body and not yet collected.
+    pub fn lodged_count(&self, body: &str) -> usize {
+        self.lodged.get(body).map_or(0, Vec::len)
+    }
+
     /// Add a step to the body's open mission. `false` when it has no open
     /// mission, or the step was blank or a duplicate — see [`Mission::add_todo`].
     pub fn add_todo(&mut self, body: &str, step: &str) -> bool {

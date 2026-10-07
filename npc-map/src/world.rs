@@ -1048,6 +1048,13 @@ impl World {
         if path.is_empty() {
             return Ok(0);
         }
+        // **Setting off again for where you are already going is carrying on.**
+        // Ending the walk and starting it over told the body it "never got to
+        // the lift, having set off somewhere else" in the same breath as
+        // "got to the lift" — a contradiction it then reasoned about as a trap.
+        if let Some(walk) = self.actors[id].walk.as_ref().filter(|w| w.toward == to) {
+            return Ok(walk.to_go(&from));
+        }
 
         self.end_walk(id, &from, Lost::Diverted);
         // Walking away cancels a lift you were waiting on: you are no longer on

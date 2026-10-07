@@ -23,6 +23,7 @@ use crate::api::{err, owner_of, Authored};
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::mission::{Mission, Origin, StepOutcome, Todo};
 use crate::engine::{no_engine, owned, owned_by, speaking_as};
+use npc_map::route;
 
 #[derive(Debug, Deserialize)]
 pub struct LodgeBody {
@@ -78,6 +79,43 @@ pub async fn lodge(
         .filter(|step| !step.trim().is_empty())
         .map(Todo::new)
         .collect();
+    // **A brief with no steps still names where to go and whom to find.** Lodged
+    // on its ask alone, a mission gave the engine nothing to sign off and the
+    // character nothing to be told next, and was given up as stuck within a
+    // minute. The rooms the character can reach and the people in its world
+    // that the brief names become its steps, in the order the brief names them.
+    if todo.is_empty() {
+        let (rooms, places, people) = hosted.read(|w| {
+            let Some(here) = w.actor(&character).map(|a| a.at.clone()) else {
+                return (Vec::new(), Vec::new(), Vec::new());
+            };
+            let reach: Vec<_> = std::iter::once(here.clone())
+                .chain(route::reachable_from(w.map(), &here))
+                .collect();
+            let rooms: Vec<String> = reach
+                .iter()
+                .filter_map(|at| w.node(at).map(|n| n.name.clone()))
+                .collect();
+            let places: Vec<String> = reach
+                .iter()
+                .map(|at| format!("{}/{}", at.area, at.node))
+                .collect();
+            let people: Vec<String> = w
+                .actors()
+                .filter(|a| a.id != character)
+                .map(|a| a.name.clone())
+                .collect();
+            (rooms, places, people)
+        });
+        let machines: Vec<String> = hosted.sim(|s| {
+            s.devices
+                .iter()
+                .filter(|d| places.contains(&d.at))
+                .map(|d| d.name.clone())
+                .collect()
+        });
+        todo = steps_named_in(&prompt, &rooms, &machines, &people);
+    }
     if !todo.is_empty() {
         todo.push(Todo::report("go back to the table and report it"));
     }
@@ -138,15 +176,32 @@ pub async fn status(
     let Some((hosted, character)) = rt.body_of(nid) else {
         // No body is no mission, not an error: a character out of the world
         // simply has none, which is what a caller wants to know.
-        return Json(json!({ "on_mission": false, "mission": Value::Null })).into_response();
+        return Json(json!({
+            "on_mission": false,
+            "mission": Value::Null,
+            "finished": Value::Null,
+            "lodged": 0,
+        }))
+        .into_response();
     };
-    let (on_mission, mission) = hosted.sim(|sim| {
+    // The last one it finished as well as the one in hand: a character that
+    // reports and takes up the next at once would otherwise hide the outcome an
+    // operator came to read behind the mission it has just started.
+    let (on_mission, mission, finished, lodged) = hosted.sim(|sim| {
         (
             sim.missions.is_on_mission(&character),
             sim.missions.latest(&character).map(mission_view),
+            sim.missions.done(&character).map(mission_view),
+            sim.missions.lodged_count(&character),
         )
     });
-    Json(json!({ "on_mission": on_mission, "mission": mission })).into_response()
+    Json(json!({
+        "on_mission": on_mission,
+        "mission": mission,
+        "finished": finished,
+        "lodged": lodged,
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,6 +357,58 @@ pub async fn cancel(
     Json(json!({ "cancelled": rt.cancel_mission(nid, world_ms) })).into_response()
 }
 
+/// What a name in a brief is.
+#[derive(Clone, Copy)]
+enum Named {
+    Room,
+    Machine,
+    Person,
+}
+
+/// The steps a brief names: a journey to each of `rooms`, a reading of each of
+/// `machines` and a finding of each of `people` that appears in it, in the order
+/// it names them. A name given twice, or inside a longer name also given, is
+/// one step.
+fn steps_named_in(
+    brief: &str,
+    rooms: &[String],
+    machines: &[String],
+    people: &[String],
+) -> Vec<Todo> {
+    let lower = brief.to_lowercase();
+    let mut found: Vec<(usize, Todo)> = Vec::new();
+    let mut taken: Vec<(usize, usize)> = Vec::new();
+    let mut by_length: Vec<(&String, Named)> = rooms
+        .iter()
+        .map(|r| (r, Named::Room))
+        .chain(machines.iter().map(|m| (m, Named::Machine)))
+        .chain(people.iter().map(|p| (p, Named::Person)))
+        .collect();
+    by_length.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
+    for (name, kind) in by_length {
+        let bare = name.trim().trim_start_matches("the ").to_lowercase();
+        if bare.len() < 3 {
+            continue;
+        }
+        let Some(at) = lower.find(&bare) else {
+            continue;
+        };
+        let span = (at, at + bare.len());
+        if taken.iter().any(|(a, b)| span.0 < *b && *a < span.1) {
+            continue;
+        }
+        taken.push(span);
+        let step = match kind {
+            Named::Room => format!("go to {name}"),
+            Named::Machine => format!("scan {name} and read what state it is in"),
+            Named::Person => format!("find {name}"),
+        };
+        found.push((at, Todo::new(step)));
+    }
+    found.sort_by_key(|(at, _)| *at);
+    found.into_iter().map(|(_, t)| t).collect()
+}
+
 /// One mission, as an operator reads it back.
 fn mission_view(m: &Mission) -> Value {
     json!({
@@ -310,6 +417,7 @@ fn mission_view(m: &Mission) -> Value {
         "origin": m.origin,
         "todo": m.todo,
         "answer": m.answer,
+        "observed": m.observed,
         "report": m.report.as_ref().map(|r| json!({
             "outcome": r.outcome.as_str(),
             "notes": r.notes,
@@ -319,7 +427,39 @@ fn mission_view(m: &Mission) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::mission_view;
+    use super::{mission_view, steps_named_in};
+
+    /// A brief with no steps is given a journey to each room and a finding of
+    /// each person it names, in its own order — the longer room name winning
+    /// over one inside it, and nothing it does not name.
+    #[test]
+    fn a_brief_with_no_steps_is_given_the_rooms_and_people_it_names() {
+        let rooms = [
+            "the plant room".to_string(),
+            "the room".to_string(),
+            "the anteroom".to_string(),
+        ];
+        let people = ["Paxon Vael".to_string(), "Ione Valtiere".to_string()];
+        let machines = ["the coolant valve".to_string()];
+        let steps: Vec<String> = steps_named_in(
+            "Ask Paxon Vael who was in the plant room, then read the coolant valve.",
+            &rooms,
+            &machines,
+            &people,
+        )
+        .into_iter()
+        .map(|t| t.text)
+        .collect();
+        assert_eq!(
+            steps,
+            vec![
+                "find Paxon Vael",
+                "go to the plant room",
+                "scan the coolant valve and read what state it is in"
+            ]
+        );
+        assert!(steps_named_in("Think it over.", &rooms, &machines, &people).is_empty());
+    }
     use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome, Todo};
 
     #[test]

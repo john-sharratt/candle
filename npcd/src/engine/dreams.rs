@@ -190,6 +190,10 @@ pub async fn dream(
     // writes, and a caller that drops this future mid-decode leaves only a
     // drop guard to run the tombstone.
     let _retired = Throwaway::new(engine, timeline, "dream");
+    // Each stage of a dream is logged: a dream runs with nobody waiting on it,
+    // so one that stops partway is otherwise a slot held with no trace of where.
+    let started = Instant::now();
+    tracing::info!(npc_id, "dream: conversation open, dreaming");
 
     let mut selection = projected.identities.selection_for(
         npc_id,
@@ -232,6 +236,12 @@ pub async fn dream(
         )
         .await;
     drop(sequence);
+    tracing::info!(
+        npc_id,
+        ok = answer.is_ok(),
+        ms = started.elapsed().as_millis() as u64,
+        "dream: dreamt, keeping"
+    );
 
     let story = plain_prose(&answer?.text);
     anyhow::ensure!(!story.trim().is_empty(), "the dream came back empty");
