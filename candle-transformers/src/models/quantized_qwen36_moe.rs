@@ -397,8 +397,43 @@ mod tests {
         hybrid_gate(|_| Int8Mode::Performance)
     }
 
+    /// **One row of the npcd gate, alone** — C10×16, the widest — for a kernel
+    /// trace (`nsys`) small enough to read. A cold cache: the expert figures
+    /// are not the ladder's, the kernels' own times are.
+    #[test]
+    #[ignore = "loads the two Qwen3.6-35B-A3B fine-tunes and runs C10x16 alone, for a \
+                kernel trace; needs the card to itself"]
+    fn hybrid_c10x16_alone() -> Result<()> {
+        hybrid_row_alone(InferenceMode::C10, 16)
+    }
+
+    /// C5×1 alone — one session, the launch-bound end of the ladder — for the
+    /// same kind of trace.
+    #[test]
+    #[ignore = "loads the two Qwen3.6-35B-A3B fine-tunes and runs C5x1 alone, for a \
+                kernel trace; needs the card to itself"]
+    fn hybrid_c5x1_alone() -> Result<()> {
+        hybrid_row_alone(InferenceMode::C5, 1)
+    }
+
+    fn hybrid_row_alone(mode: InferenceMode, contexts: usize) -> Result<()> {
+        hybrid_gate_with(Int8Mode::auto, |device| {
+            batched_forward_configs(device)
+                .into_iter()
+                .filter(|c| c.mode == mode && c.num_contexts == contexts)
+                .collect()
+        })
+    }
+
     /// The body both hybrid gates share; `mode` picks the int8 path for the card.
     fn hybrid_gate(mode: impl Fn(&Device) -> Int8Mode) -> Result<()> {
+        hybrid_gate_with(mode, batched_forward_configs)
+    }
+
+    fn hybrid_gate_with(
+        mode: impl Fn(&Device) -> Int8Mode,
+        configs: impl Fn(&Device) -> Vec<TestConfig>,
+    ) -> Result<()> {
         println!("\n=== Qwen3.6-35B-A3B AntiLoop trunk + StyleTune head, batched forwarding ===\n");
         let hub = |(repo, rev, file): (&str, &str, &str)| hf_get(repo, RepoType::Model, rev, file);
         let trunk = hub(QWEN36_35B_A3B_ANTILOOP)?;
@@ -417,7 +452,7 @@ mod tests {
             .with_print_outputs(true)
             .with_int8mode(int8mode)
             .with_timeout_secs(3600);
-        let configs = batched_forward_configs(&device);
+        let configs = configs(&device);
 
         let load = || {
             let m = from_gguf_path(

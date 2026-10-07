@@ -164,10 +164,9 @@ impl DraftLadder {
 /// in — the asymmetry favours it, because the loss past the turn (0.39x) dwarfs
 /// the gain before it.
 ///
-/// The 35B-A3B and 27B carry this row **unmeasured**. The 3.6-35B is the only
-/// routed checkpoint with cold points of its own, and it tracked the dense 9B
-/// closely enough to justify sharing — but "same head, similar curve" is
-/// evidence for two checkpoints, not for four.
+/// The 3.5-35B-A3B carries this row **unmeasured**. The 3.6-35B, whose cold
+/// points below tracked the dense 9B's width curve, has since taken its own row
+/// for depth ([`QWEN36_35B_A3B_DRAFT`]); the width bracket it keeps is this one.
 ///
 /// # The routed checkpoints share this row, and now by measurement
 ///
@@ -243,7 +242,30 @@ pub const QWEN35_0_8B_DRAFT: DraftLadder = DraftLadder::NONE;
 pub const QWEN35_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START, LINEAGE_TOKEN_COST);
 
 /// Qwen3.6-35B-A3B (routed). Has a NextN head, itself a full routed block.
-pub const QWEN36_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START, LINEAGE_TOKEN_COST);
+///
+/// **Its own row: budget 4 to width 8, the lineage's 2 to 16** — Flash-Next's
+/// shape, on the same evidence that the lineage's 2 was the binding ceiling, not
+/// the drafter: at budget 2 every proposal on a StoryRewrite run was accepted.
+/// Measured on the RTX 3090, decode t/s, the stock gate (255 generated tokens)
+/// and the AntiLoop+StyleTune gate (10), alternate runs of one build:
+///
+/// | config | stock, 2 | stock, 3 | stock, 4 | hybrid, 2 | hybrid, 4 |
+/// |---|---|---|---|---|---|
+/// | C0–C3 ×1 | 216–225 | 264–267 | **295–301** | 177–182 | 192–209 |
+/// | C4–C7 ×1 | 216–218 | 258–263 | **288–297** | 176–186 | 134–146 |
+/// | BF16 ×4 | 682 | 801 | **840** | 510 | 490 |
+/// | C5 ×8 | 908 | 1,076 | **1,110** | 716 | 743 |
+/// | C8 ×5 | 762 | 857 | **937** | 590 | 630 |
+/// | C10 ×8 | 810 | 900 | 873 | 749 | **817** |
+///
+/// Acceptance on the long run is 4.90 of 5 per step. The hybrid's C4–C7 rows
+/// each reject one early proposal at depth 3 and 4 alike, and a 10-token run
+/// has three steps to amortise it in; a reply long enough for the per-sequence
+/// depth choice to learn from its acceptance is the stock column. Width 8 is
+/// Flash-Next's measured stash limit at budget 4, kept rather than extended.
+pub const QWEN36_35B_A3B_DRAFT: DraftLadder =
+    DraftLadder::new(QWEN36_35B_A3B_BRACKETS, LINEAGE_TOKEN_COST);
+const QWEN36_35B_A3B_BRACKETS: &[(usize, usize)] = &[(8, 4), (16, 2)];
 
 /// Qwen3.8-27B (dense). Has a NextN head, dense rather than routed — shipped as
 /// a **sidecar** GGUF rather than embedded (`mtp-Qwen3.8-27B-Q4_0.gguf`).
