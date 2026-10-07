@@ -137,19 +137,23 @@ const _: () = assert!(
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RetractPlan {
     /// `(from, to)` — copy the slot's bytes to the new index and rewrite
-    /// whatever names it. Ordered hottest-first, which is also the order the
-    /// destinations ascend in, so the hottest survivor lands furthest right.
+    /// whatever names it. Ordered hottest-first: free destinations first, then
+    /// the displaced slots.
     pub relocate: Vec<(usize, usize)>,
-    /// Slots whose contents are dropped. Cold by construction: a doomed slot is
-    /// only evicted once every free slot below the new frontier has been used
-    /// by a hotter one.
+    /// Slots past the frontier whose contents are dropped: every free slot
+    /// below the new frontier went to a hotter doomed slot, and no displaceable
+    /// survivor was colder.
     pub evict: Vec<usize>,
+    /// Slots below the new frontier whose contents are dropped so a hotter
+    /// doomed slot can be relocated into them. The caller evicts these
+    /// **before** performing the relocations that name them.
+    pub displace: Vec<usize>,
 }
 
 impl RetractPlan {
     /// Whether this plan asks for anything at all.
     pub fn is_empty(&self) -> bool {
-        self.relocate.is_empty() && self.evict.is_empty()
+        self.relocate.is_empty() && self.evict.is_empty() && self.displace.is_empty()
     }
 }
 
@@ -400,13 +404,16 @@ impl WeightZone {
         gained
     }
 
-    /// Shrink to `new_capacity` slots: relocate the hottest doomed occupants
-    /// into free slots below the new frontier, evict the rest.
+    /// Shrink to `new_capacity` slots, keeping the most valuable occupants:
+    /// relocate the hottest doomed ones into free slots below the new frontier,
+    /// then into the slots of colder survivors, and evict the rest.
     ///
     /// `score` is the caller's worth for a slot — any ordered key, higher is
-    /// more valuable. It is the *only* thing this module knows about worth, and
-    /// it never decides which of two resident experts survives in general; it
-    /// decides only which of the doomed ones is worth a memcpy.
+    /// more valuable. `displaceable` says which surviving slots may give up
+    /// their occupant to a hotter doomed one. Without displacement a full zone
+    /// dropped everything past the frontier by position: a ×16 wave's
+    /// concession on Qwen3.6-35B-A3B evicted ~680 experts its decode then
+    /// missed over PCIe, while colder ones below the frontier stayed.
     ///
     /// The bookkeeping is applied here. The returned [`RetractPlan`] is what the
     /// caller must do to the bytes to make them agree.
@@ -414,6 +421,7 @@ impl WeightZone {
         &mut self,
         new_capacity: usize,
         score: impl Fn(usize) -> K,
+        displaceable: impl Fn(usize) -> bool,
     ) -> RetractPlan {
         // **The weight side has a floor of its own, and it had none.**
         // `MIN_ELASTIC_RESERVE` bounds how far the weight side may *grow* — it
@@ -455,18 +463,44 @@ impl WeightZone {
             (0..new_capacity).filter(|&i| !self.occupied[i]).collect();
         destinations.truncate(doomed.len());
 
+        // Then survivors a doomed slot outranks, coldest first. Doomed descend
+        // and survivors ascend, so the first pair that does not trade ends it.
+        let mut survivors: Vec<usize> = if doomed.len() > destinations.len() {
+            (0..new_capacity)
+                .filter(|&i| self.occupied[i] && displaceable(i))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        survivors.sort_by(|&a, &b| {
+            score(a)
+                .partial_cmp(&score(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+
         let mut plan = RetractPlan::default();
+        let mut survivors = survivors.into_iter();
+        let mut trading = true;
         for (n, &from) in doomed.iter().enumerate() {
-            match destinations.get(n) {
-                Some(&to) => {
-                    self.occupied[to] = true;
-                    plan.relocate.push((from, to));
-                }
-                None => {
-                    self.live -= 1;
-                    plan.evict.push(from);
+            if let Some(&to) = destinations.get(n) {
+                self.occupied[to] = true;
+                plan.relocate.push((from, to));
+                continue;
+            }
+            if trading {
+                match survivors.next() {
+                    Some(to) if score(to) < score(from) => {
+                        self.live -= 1;
+                        plan.displace.push(to);
+                        plan.relocate.push((from, to));
+                        continue;
+                    }
+                    _ => trading = false,
                 }
             }
+            self.live -= 1;
+            plan.evict.push(from);
         }
 
         // The suffix ceases to exist. Rebuild the free list over what is left
@@ -565,12 +599,12 @@ mod tests {
         assert_eq!(z.min_capacity(), 100);
 
         // Asked for everything in one step: the floor holds.
-        z.retract_to(0, |_| 0.0);
+        z.retract_to(0, |_| 0.0, |_| true);
         assert_eq!(z.capacity(), 100);
 
         // Asked again and again, as the retry loop did: still the floor.
         for _ in 0..50 {
-            z.retract_to(0, |_| 0.0);
+            z.retract_to(0, |_| 0.0, |_| true);
         }
         assert_eq!(z.capacity(), 100, "repeated asks must not walk it down");
     }
@@ -580,7 +614,7 @@ mod tests {
     #[test]
     fn the_floor_does_not_impede_an_ordinary_retraction() {
         let mut z = zone(800);
-        z.retract_to(200, |_| 0.0);
+        z.retract_to(200, |_| 0.0, |_| true);
         assert_eq!(z.capacity(), 200, "the KV side may take most of the zone");
     }
 
@@ -599,7 +633,7 @@ mod tests {
     fn the_floor_is_the_caller_s_measured_minimum() {
         let mut z = WeightZone::new(END, SLOT, 2377, 2377, 385);
         assert_eq!(z.min_capacity(), 385, "the stated floor, not 2377/8 = 297");
-        z.retract_to(0, |_| 0.0);
+        z.retract_to(0, |_| 0.0, |_| true);
         assert_eq!(
             z.capacity(),
             385,
@@ -637,7 +671,7 @@ mod tests {
             "past the floor, the stated floor applies"
         );
 
-        z.retract_to(0, |_| 0.0);
+        z.retract_to(0, |_| 0.0, |_| true);
         assert_eq!(
             z.capacity(),
             385,
@@ -731,7 +765,7 @@ mod tests {
         for _ in 0..8 {
             z.alloc().unwrap();
         }
-        let plan = z.retract_to(5, |_| 1.0);
+        let plan = z.retract_to(5, |_| 1.0, |_| true);
         assert_eq!(z.capacity(), 5);
         assert_eq!(plan.relocate, vec![], "no free slots below to move into");
         let mut evicted = plan.evict.clone();
@@ -761,7 +795,7 @@ mod tests {
         // Doomed slots 4..8 with deliberately non-monotonic scores, so a plan
         // that sorted by index instead of temperature gives a different answer.
         let scores = [0.0, 0.0, 0.0, 0.0, 2.0, 9.0, 0.5, 7.0];
-        let plan = z.retract_to(4, |i| scores[i]);
+        let plan = z.retract_to(4, |i| scores[i], |_| false);
 
         assert_eq!(
             plan.relocate,
@@ -787,7 +821,7 @@ mod tests {
             z.alloc().unwrap();
         }
         z.release(0);
-        let plan = z.retract_to(3, |_| 1.0);
+        let plan = z.retract_to(3, |_| 1.0, |_| true);
         assert_eq!(
             plan.relocate,
             vec![(3, 0)],
@@ -803,7 +837,7 @@ mod tests {
         for _ in 0..4 {
             z.alloc().unwrap();
         }
-        let plan = z.retract_to(0, |_| 1.0);
+        let plan = z.retract_to(0, |_| 1.0, |_| true);
         assert_eq!(plan.relocate, vec![]);
         assert_eq!(plan.evict.len(), 4);
         assert_eq!(z.capacity(), 0);
@@ -901,7 +935,7 @@ mod tests {
                 }
                 3 => {
                     let c = (next() % 33) as usize;
-                    z.retract_to(c, |i| (i % 7) as f32);
+                    z.retract_to(c, |i| (i % 7) as f32, |i| i % 2 == 0);
                 }
                 _ => {
                     let c = (next() % 33) as usize;
@@ -976,7 +1010,10 @@ mod tests {
             // The frontier breathes: KV takes space on odd cycles, gives it back
             // on even ones.
             if cycle % 2 == 0 {
-                let plan = z.retract_to(20, |i| slot_score(&tenant, i));
+                let plan = z.retract_to(20, |i| slot_score(&tenant, i), |_| true);
+                for &d in &plan.displace {
+                    tenant[d] = None;
+                }
                 for &(from, to) in &plan.relocate {
                     tenant[to] = tenant[from].take();
                 }
@@ -1024,7 +1061,7 @@ mod tests {
         let evict_only_retract = |z: &mut WeightZone, tenant: &mut Vec<Option<usize>>| {
             // score 0 everywhere ⇒ ties everywhere ⇒ relocation still happens by
             // index, so suppress it explicitly by filling the low slots first.
-            let plan = z.retract_to(20, |_| 0.0);
+            let plan = z.retract_to(20, |_| 0.0, |_| true);
             for &(from, to) in &plan.relocate {
                 tenant[to] = tenant[from].take();
             }
@@ -1069,7 +1106,7 @@ mod tests {
             z.release(i);
         }
         let scores = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let plan = z.retract_to(6, |i| scores[i]);
+        let plan = z.retract_to(6, |i| scores[i], |_| false);
         for &(from, to) in &plan.relocate {
             assert!(from >= 6, "source {from} was not doomed");
             assert!(to < 6, "destination {to} does not survive the retraction");
@@ -1080,5 +1117,68 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), dests.len(), "a destination was reused");
         assert_eq!(sorted, vec![0, 2, 5], "exactly the free surviving slots");
+    }
+
+    /// **A full zone keeps its hottest experts, not its rightmost ones.** With
+    /// no free slot below the frontier, a doomed occupant hotter than the
+    /// coldest survivor takes that survivor's slot; the trade stops at the
+    /// first pair where it would not gain.
+    #[test]
+    fn a_full_zone_displaces_colder_survivors() {
+        let mut z = zone(8);
+        for _ in 0..8 {
+            z.alloc().unwrap();
+        }
+        // Survivors 0..4, doomed 4..8.
+        let scores = [5.0, 0.2, 3.0, 0.1, 9.0, 0.3, 4.0, 0.05];
+        let plan = z.retract_to(4, |i| scores[i], |_| true);
+
+        // Doomed hottest-first 4 (9.0), 6 (4.0), 5 (0.3), 7 (0.05); survivors
+        // coldest-first 3 (0.1), 1 (0.2), 2 (3.0), 0 (5.0). 9.0 > 0.1 and
+        // 4.0 > 0.2 trade; 0.3 < 3.0 ends it.
+        assert_eq!(plan.displace, vec![3, 1]);
+        assert_eq!(plan.relocate, vec![(4, 3), (6, 1)]);
+        assert_eq!(plan.evict, vec![5, 7]);
+        assert_eq!(z.capacity(), 4);
+        assert_eq!(z.live(), 4, "every surviving slot still holds an expert");
+        assert_eq!(z.free_count(), 0);
+    }
+
+    /// Free slots are used before any survivor is displaced, and a survivor
+    /// the caller marks non-displaceable is never taken, however cold.
+    #[test]
+    fn displacement_follows_the_free_slots_and_spares_the_protected() {
+        let mut z = zone(8);
+        for _ in 0..8 {
+            z.alloc().unwrap();
+        }
+        z.release(2);
+        let scores = [0.0, 0.5, 0.0, 0.0, 9.0, 8.0, 7.0, 0.01];
+        // Slot 0 and 3 are the coldest survivors; 0 is protected.
+        let plan = z.retract_to(4, |i| scores[i], |i| i != 0);
+
+        assert_eq!(
+            plan.relocate,
+            vec![(4, 2), (5, 3), (6, 1)],
+            "the free slot first, then survivors coldest-first, skipping slot 0"
+        );
+        assert_eq!(plan.displace, vec![3, 1]);
+        assert_eq!(plan.evict, vec![7]);
+        assert!(z.is_occupied(0), "the protected survivor is untouched");
+        assert_eq!(z.live(), 4);
+    }
+
+    /// Equal worth is not a trade: a doomed slot only displaces a survivor it
+    /// strictly outranks, so a flat score moves nothing but into free slots.
+    #[test]
+    fn equal_worth_displaces_nothing() {
+        let mut z = zone(6);
+        for _ in 0..6 {
+            z.alloc().unwrap();
+        }
+        let plan = z.retract_to(3, |_| 1.0, |_| true);
+        assert!(plan.displace.is_empty());
+        assert!(plan.relocate.is_empty());
+        assert_eq!(plan.evict, vec![3, 4, 5]);
     }
 }

@@ -498,7 +498,9 @@ impl ExpertCacheInner {
         );
         // Keep key: pack-only experts survive a concession ahead of
         // warm-backed ones, then the hotter within each tier — the eviction
-        // passes, inverted.
+        // passes, inverted. The same key decides which survivor below the
+        // frontier a hotter doomed expert displaces; a pinned-layer expert is
+        // never displaced, having nowhere to reload from.
         let keep: Vec<(bool, f32)> = (0..self.zone.capacity())
             .map(|i| {
                 self.slot_to_key[i].map_or((false, 0.0), |(layer, expert)| {
@@ -510,7 +512,13 @@ impl ExpertCacheInner {
             })
             .collect();
         let before = self.zone.capacity();
-        let plan = self.zone.retract_to(target, |i| keep[i]);
+        let pinned_layers = self.pinned_layers;
+        let slot_to_key = &self.slot_to_key;
+        let plan = self.zone.retract_to(
+            target,
+            |i| keep[i],
+            |i| slot_to_key[i].is_some_and(|(layer, _)| layer >= pinned_layers),
+        );
         // Keyed on the CAPACITY changing, not on the plan being non-empty: a
         // concession of slots that happened to be free moves the boundary just
         // the same, while asking nothing to be relocated or evicted.
@@ -1648,6 +1656,27 @@ mod tests {
         let plan = inner.retract_zone(4);
         assert_eq!(plan.relocate, vec![(5, 0)]);
         assert_eq!(plan.evict, vec![4]);
+    }
+
+    /// A concession on a full zone trades a hot doomed expert for the coldest
+    /// survivor below the frontier — never for a pinned-layer expert, which has
+    /// no tier to reload from, however cold.
+    #[test]
+    fn a_full_concession_displaces_the_coldest_unpinned_survivor() {
+        let mut inner = sized_cache(6, 1);
+        let p = inner.pinned_layers;
+        assert!(p >= 1, "the fixture needs a pinned layer");
+        occupy(&mut inner, 0, 0, 0, 0, 0.0); // pinned, coldest of all
+        occupy(&mut inner, 1, p + 1, 0, 1, 0.1); // the coldest unpinned survivor
+        occupy(&mut inner, 2, p + 2, 0, 2, 5.0);
+        occupy(&mut inner, 3, p + 3, 0, 3, 5.0);
+        occupy(&mut inner, 4, p + 4, 0, 4, 9.0); // doomed, hot
+        occupy(&mut inner, 5, p + 5, 0, 5, 0.05); // doomed, cold
+
+        let plan = inner.retract_zone(4);
+        assert_eq!(plan.displace, vec![1]);
+        assert_eq!(plan.relocate, vec![(4, 1)]);
+        assert_eq!(plan.evict, vec![5]);
     }
 
     /// The prefetch make-room path weighs it too — it is the same choice.

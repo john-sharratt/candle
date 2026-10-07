@@ -1152,7 +1152,7 @@ fn e5_the_dense_and_expert_zones_concede_to_the_same_contract() {
                 let full = zone.capacity();
                 let mut last = full;
                 for target in (0..=full).rev().step_by((full / 32).max(1)) {
-                    let plan = zone.retract_to(target, |_| 0.0);
+                    let plan = zone.retract_to(target, |_| 0.0, |_| true);
                     assert!(
                         zone.capacity() <= last,
                         "{}: retracting raised capacity",

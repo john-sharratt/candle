@@ -220,8 +220,15 @@ impl PipelineState {
         self.drain_ring(self.routed_served.load(Ordering::Acquire))?;
         self.release_retired();
 
-        // The zone decides who moves and who goes; this performs it.
+        // The zone decides who moves and who goes; this performs it. A
+        // displaced survivor is evicted first: the relocation into its slot
+        // takes over the slot's bookkeeping.
         let plan = self.inner.retract_zone(target);
+        let displaced: Vec<(usize, usize)> = plan
+            .displace
+            .iter()
+            .filter_map(|&slot_idx| self.inner.evict(slot_idx))
+            .collect();
         let mut moved = Vec::with_capacity(plan.relocate.len());
         for &(from, to) in &plan.relocate {
             if let Some(key) = self.relocate_slot(from, to)? {
@@ -238,6 +245,9 @@ impl PipelineState {
                 .residency
                 .lock()
                 .map_err(|_| candle::Error::Msg("expert pipeline: residency poisoned".into()))?;
+            for &(row, expert) in &displaced {
+                r.set_vram(row, expert, None);
+            }
             for &((row, expert), to) in &moved {
                 r.set_vram(row, expert, Some((to, self.inner.slot_base(to))));
             }
@@ -248,7 +258,7 @@ impl PipelineState {
             }
         }
         if let Ok(mut s) = self.stats.lock() {
-            s.evictions += plan.evict.len();
+            s.evictions += plan.evict.len() + displaced.len();
         }
         // Only now: the relocations above read `slot_to_key` for the slots the
         // truncation removes.
@@ -314,8 +324,9 @@ impl PipelineState {
         let src = self.inner.slot_base(from);
         let dst = self.inner.slot_base(to);
         // SAFETY: both addresses name whole slots of the zone; the source is
-        // live and the destination free (the plan chose it from the free list),
-        // so the two cannot alias. The device is quiesced.
+        // live past the frontier and the destination below it — free, or
+        // emptied by its displaced occupant's eviction — so the two cannot
+        // alias. The device is quiesced.
         unsafe {
             cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.copy_stream.cu_stream())
                 .map_err(candle::Error::wrap)?;

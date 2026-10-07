@@ -30,7 +30,6 @@
 
 use std::cell::RefCell;
 
-use candle::quantized::decode_rows::DecodeRows;
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
@@ -70,6 +69,7 @@ use crate::models::expert_lre::{PipelineStats, ProfileSnapshot, WeightPlan, Weig
 use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
 use crate::models::prefill_utils::SharedPm;
+use crate::models::residency_rows::residency_decode_rows;
 use crate::models::rope_schedule::RungSelect;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_admit::admit_wave_kv;
@@ -1196,8 +1196,17 @@ fn sweep_layers(
     // already formed, and the search belongs upstream of `layer_start`.
     x.as_cat_tensor().assert("qwen35.sweep_in");
 
-    // The rows the routed experts' residency scores as decode.
-    let decode_like = DecodeRows::prefix(n_decode);
+    // The rows the routed experts' residency scores as decode: the decode rows,
+    // the verify segments and each prompt's last row (`residency_rows`). A
+    // drafting checkpoint decodes in verify waves, which carry no decode rows.
+    let decode_like = residency_decode_rows(
+        n_decode,
+        seq_ids[n_decode..]
+            .iter()
+            .copied()
+            .zip(pre_q.iter().copied()),
+        |s| verify_seqs.contains(&s),
+    );
 
     // Everything above — admission, the tier, the tables, the embedding — ran
     // eagerly. The layers and the head are recorded as a chain of graphs
