@@ -81,6 +81,12 @@ pub struct VerifyStash {
     pub layers: Vec<SpanOperands>,
     /// Per verifying sequence.
     pub spans: Vec<StashSpan>,
+    /// How many spans [`Self::begin`] laid out for this cohort — what the verify
+    /// forward priced the replay's carves from. Not `spans.len()`: a caller
+    /// consumes each span before its replay runs ([`Self::remove`]), so by the
+    /// time the stacked replay sizes its stacks the list can be empty while the
+    /// rewind it is running is the cohort's.
+    pub cohort: usize,
     /// Which recurrent layers this cohort's sweep has actually captured, by the
     /// same ordinal that indexes `layers`.
     ///
@@ -243,6 +249,7 @@ impl VerifyStash {
         Ok(Self {
             layers,
             spans: Vec::new(),
+            cohort: 0,
             filled: vec![false; n],
         })
     }
@@ -268,6 +275,7 @@ impl VerifyStash {
             candle::bail!("qwen35 verify stash: a {total}-row cohort against {cap}-row buffers");
         }
         self.spans.clear();
+        self.cohort = blocks.len();
         // A new cohort has captured nothing yet, whatever the last one left.
         self.filled.iter_mut().for_each(|f| *f = false);
         let mut row = 0usize;
@@ -544,11 +552,11 @@ fn replay_stacked(
         n_v_heads: dims.n_v_heads,
         layers: layer_indices.len(),
     };
-    let per = widths.replay_stack(rows, stash.spans.len());
+    let per = widths.replay_stack(rows, stash.cohort);
     if per == 0 {
         candle::bail!(
-            "qwen35 verify replay: a {rows}-row stash over {} spans stacks no layer",
-            stash.spans.len()
+            "qwen35 verify replay: a {rows}-row stash over a {}-span cohort stacks no layer",
+            stash.cohort
         );
     }
     let spans: Vec<ReplaySpan> = short
@@ -646,6 +654,38 @@ mod tests {
     /// Also pins that the buffers arrive **zeroed**: a replay hands the mixer the
     /// whole `cap`-row buffer while only the captured span was filled, so the rows
     /// above the span are read before they are written.
+    /// **The cohort outlives the spans consumed from it.** The hybrid consumes
+    /// every rewinding span before it replays (`truncate_sequences`), and the
+    /// stacked replay sized its stacks from the spans left — none — and refused
+    /// every rewind: "a 5-row stash over 0 spans stacks no layer", on every
+    /// decode of every character. The count the verify forward priced is the
+    /// one `begin` laid out.
+    #[test]
+    fn the_cohort_is_what_begin_laid_out_however_many_spans_are_consumed() {
+        let Ok(device) = Device::new_cuda(0) else {
+            return;
+        };
+        let dims = DeltaNetDims {
+            head_dim: 4,
+            n_k_heads: 2,
+            n_v_heads: 4,
+            conv_kernel: 3,
+        };
+        let mut stash = VerifyStash::new(&[LayerKind::DeltaNet], &dims, 8, &device).unwrap();
+        assert_eq!(stash.cohort, 0);
+        stash.begin(&[(7, 5), (9, 2)]).unwrap();
+        assert_eq!(stash.cohort, 2);
+        stash.remove(7);
+        stash.remove(9);
+        assert!(stash.spans.is_empty());
+        assert_eq!(
+            stash.cohort, 2,
+            "consuming the spans does not shrink the cohort"
+        );
+        stash.begin(&[(3, 1)]).unwrap();
+        assert_eq!(stash.cohort, 1, "a new cohort replaces the last");
+    }
+
     #[test]
     fn the_four_operand_buffers_are_distinct_and_zeroed() {
         let Ok(device) = Device::new_cuda(0) else {
