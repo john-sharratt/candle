@@ -2503,17 +2503,22 @@ impl Runtime {
                 &mut |_| true,
             )
             .await?;
-        if let (Some(brief), Some(assumption)) = (r.brief.clone(), r.assumption.clone()) {
-            let rt = Arc::clone(self);
-            match &self.spawner {
-                Some(handle) => {
-                    handle
-                        .spawn(async move { rt.dream_if_free(npc_id, &brief, &assumption).await });
+        match r.dream() {
+            Ok((brief, assumption)) => {
+                let (brief, assumption) = (brief.to_string(), assumption.to_string());
+                let rt = Arc::clone(self);
+                match &self.spawner {
+                    Some(handle) => {
+                        handle.spawn(
+                            async move { rt.dream_if_free(npc_id, &brief, &assumption).await },
+                        );
+                    }
+                    None => tracing::warn!(
+                        "npc {npc_id}: the dream could not be started — no async runtime"
+                    ),
                 }
-                None => tracing::warn!(
-                    "npc {npc_id}: the dream could not be started — no async runtime"
-                ),
             }
+            Err(why) => tracing::warn!("npc {npc_id}: no dream from this reflection — {why}"),
         }
         Ok(r)
     }
@@ -2603,11 +2608,11 @@ impl Runtime {
             .await
         {
             Ok(kept) => tracing::info!(
-                "npc {npc_id}: dreamt, {} line(s) kept in {:?} — {} dream(s) now:\n{}",
-                kept.lines.len(),
+                "npc {npc_id}: dreamt, {} passage(s) kept in {:?} — {} dream(s) now:\n{}",
+                kept.passages.len(),
                 started.elapsed(),
                 minds.dreams_kept(npc_id),
-                kept.lines.join("\n"),
+                kept.passages.join("\n\n"),
             ),
             Err(e) => tracing::warn!("npc {npc_id}: the dream was not kept — {e:#}"),
         }
@@ -2919,9 +2924,9 @@ impl Runtime {
             );
             return;
         }
-        match (r.brief.as_deref(), r.assumption.as_deref()) {
-            (Some(brief), Some(assumption)) => self.dream_now(npc_id, brief, assumption).await,
-            _ => tracing::warn!("npc {npc_id}: the reflection produced no brief, so no dream"),
+        match r.dream() {
+            Ok((brief, assumption)) => self.dream_now(npc_id, brief, assumption).await,
+            Err(why) => tracing::warn!("npc {npc_id}: no dream from this reflection — {why}"),
         }
     }
 

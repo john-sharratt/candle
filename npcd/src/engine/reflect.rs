@@ -241,21 +241,29 @@ const DREAM: Tool = Tool {
     category: "Dreaming",
     plane: Plane::World,
     availability: Availability::Always,
-    description: "The dream you are asked for. `assumption` is the one thing that is untrue in \
-                  it, on its own line. `brief` is the dream itself, present tense, the dreamer \
-                  addressed as \"you\".",
+    description: "The dream you are asked for. `brief` is the dream itself, present tense, the \
+                  dreamer addressed as \"you\". `assumption` names the one thing that is untrue \
+                  in it, on its own line.",
+    // **The dream first, the assumption after.** The grammar emits the fields in
+    // this order, and with `assumption` first the checkpoint began the dream the
+    // moment the first field opened: measured, an imagined dream of building in
+    // "the spaces between worlds" went whole into `assumption` — seventeen
+    // sentences — with a three-sentence summary of it left for `brief`, refused at
+    // every round and never dreamt. Naming what a dream suspended is easy once
+    // the dream is written; writing the dream inside a field meant for one line
+    // is what it did instead.
     params: &[
-        Param {
-            name: "assumption",
-            ty: "string",
-            required: true,
-            description: "The single thing that has stopped being true. One short line.",
-        },
         Param {
             name: "brief",
             ty: "string",
             required: true,
             description: "The dream, about two hundred words.",
+        },
+        Param {
+            name: "assumption",
+            ty: "string",
+            required: true,
+            description: "The single thing that has stopped being true in it. One short line.",
         },
     ],
     examples: &[],
@@ -625,6 +633,30 @@ pub struct Reflection {
     /// where — the prompt does. The `simulate` route reports the daemon's own
     /// prompt for the same reason.
     pub system_prompt: String,
+}
+
+impl Reflection {
+    /// The brief and assumption to dream from, or why there is no dream.
+    ///
+    /// **A brief whose assumption is not one short line is not dreamt.** The
+    /// exchange refuses such an answer twice and then hands back what it has, and
+    /// a faulty brief is otherwise still taken — a brief in the wrong person still
+    /// carries a dream. The assumption is different: it is stored as the dream's
+    /// axis and sampled back into every later reflection as something to steer
+    /// away from. Measured: eleven of fifty kept dreams carried an "assumption" of
+    /// one to two hundred words — the reflection's own loop of what the character
+    /// had been doing, run on with *and… and…* — and the dreams decoded from those
+    /// briefs repeated it nearly verbatim.
+    pub fn dream(&self) -> Result<(&str, &str), String> {
+        let (Some(brief), Some(assumption)) = (self.brief.as_deref(), self.assumption.as_deref())
+        else {
+            return Err("the reflection produced no brief".into());
+        };
+        match assumption_fault(assumption) {
+            Some(fault) => Err(fault),
+            None => Ok((brief, assumption)),
+        }
+    }
 }
 
 /// What one pass of the repair review did to the brief.
@@ -1495,7 +1527,23 @@ impl<'t> Reflect<'t> {
         // real outcome, and taking it because it came last is how a review turns
         // into a downgrade. Every pass is recorded either way.
         let mut repairs = Vec::with_capacity(self.turns.repair.len());
-        for (n, question) in self.turns.repair.iter().enumerate() {
+        // **Not over a brief that will never be dreamt.** A brief whose
+        // assumption is still not one short line after the retry is refused at
+        // the dream ([`Reflection::dream`]), so reviewing it is decode spent on
+        // nothing — and it is the most expensive case there is: measured, a
+        // thirty-sentence assumption re-emitted through every pass and every
+        // refusal round, eighteen turns and 11,510 tokens in 162 seconds for a
+        // reflection that ended with no dream.
+        let repairable = parsed
+            .assumption
+            .as_deref()
+            .is_some_and(|a| assumption_fault(a).is_none());
+        let questions = if repairable {
+            &self.turns.repair[..]
+        } else {
+            &[]
+        };
+        for (n, question) in questions.iter().enumerate() {
             // **The dream in front of it, not recalled.** A pass that works from
             // memory is working from a conversation several turns deep that the
             // window will eventually trim, and it drifts — one measured run went
@@ -1812,6 +1860,51 @@ mod tests {
         assert!(
             dream_call_fault(&call).is_some(),
             "the exchange has to refuse it, not only report it"
+        );
+    }
+
+    fn reflected(assumption: Option<&str>, brief: Option<&str>) -> Reflection {
+        Reflection {
+            npc_id: 7,
+            situation: String::new(),
+            feeling: String::new(),
+            domain: String::new(),
+            sampled_axes: Vec::new(),
+            reflection: String::new(),
+            assumption: assumption.map(str::to_string),
+            brief: brief.map(str::to_string),
+            raw: String::new(),
+            original_raw: String::new(),
+            retried: true,
+            fault: None,
+            retry_raw: None,
+            retry_fault: None,
+            repairs: Vec::new(),
+            reflection_fault: None,
+            transcript: Vec::new(),
+            tokens: Vec::new(),
+            timeline: 0,
+            ms: 0,
+            system_prompt: String::new(),
+        }
+    }
+
+    /// **A run-on assumption is not dreamt, whatever else the brief got right.**
+    /// The refusal loop hands back its last answer after two rounds, and the
+    /// live run-ons were exactly that: the reflection's own loop, joined by
+    /// *and*, stored as the axis and repeated by the dream.
+    #[test]
+    fn a_brief_with_a_run_on_assumption_is_not_dreamt() {
+        let brief = "You walk to the lift and the floor under it is not there.";
+        let run_on = "Language is a stable container for meaning, and the light is steady, and \
+                      the channel is silent, and you are alone with the light and the silence, \
+                      and you have told Vespera Kaine about the table, and nobody is here";
+        assert!(reflected(Some(run_on), Some(brief)).dream().is_err());
+        assert!(reflected(None, Some(brief)).dream().is_err());
+        assert!(reflected(Some("The floor holds."), None).dream().is_err());
+        assert_eq!(
+            reflected(Some("The floor holds."), Some(brief)).dream(),
+            Ok((brief, "The floor holds."))
         );
     }
 

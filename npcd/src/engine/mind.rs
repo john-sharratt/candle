@@ -1707,10 +1707,11 @@ impl Minds {
                         recalled.iter().map(|(_, s)| format!("{s:.0}")).collect();
                     tracing::info!(
                         "npc {npc_id}: this turn was reminded of {} line(s) from {} of its \
-                         dream(s), scored {}",
+                         dream(s), scored {} — timelines {:?}",
                         recalled.len(),
                         from.len(),
-                        scores.join("/")
+                        scores.join("/"),
+                        from
                     );
                 }
             }

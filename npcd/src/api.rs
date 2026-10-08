@@ -830,8 +830,8 @@ async fn post_dream(
             // Stringified for the same reason every id on the wire is: a u64
             // past 2^53 does not survive a JavaScript client exact.
             "timeline": kept.timeline.to_string(),
-            "lines": kept.lines,
-            "text": kept.lines.join("\n"),
+            "passages": kept.passages,
+            "text": kept.passages.join("\n\n"),
         }))
         .into_response(),
         Err(e) => err(

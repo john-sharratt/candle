@@ -771,6 +771,11 @@ async fn main() -> anyhow::Result<()> {
                         .iter()
                         .map(|p| (p.id.clone(), field(&p.body, "anchor")))
                         .collect(),
+                    // What a dream reads in the anchor's place.
+                    inner_lives: personalities
+                        .iter()
+                        .map(|p| (p.id.clone(), field(&p.body, "inner_life")))
+                        .collect(),
                     // Rendered through the same function the fallback prompt
                     // uses, so a character reads the same words either way. The
                     // world is not rendered in — it is its own collection,
