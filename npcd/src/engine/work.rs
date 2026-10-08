@@ -159,6 +159,23 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "You meant to report it done, but did not say what you found.".into(),
                 );
             };
+            // **An account says what was found.** A character filed its own
+            // name as the account of a reading, six times over; a few words are
+            // not an answer anybody can use. Turned back with what the engine
+            // saw on the mission, so the next try has the facts in front of it.
+            if account.split_whitespace().count() < MIN_ACCOUNT_WORDS {
+                let seen = hosted
+                    .sim(|s| s.missions.active(body).map(|m| m.observed.clone()))
+                    .unwrap_or_default();
+                let hint = match seen.is_empty() {
+                    true => String::new(),
+                    false => format!(" What you saw on it: {}.", seen.join("; ")),
+                };
+                return Outcome::Refused(format!(
+                    "\"{account}\" is not an account of what you found. Say it in a sentence — \
+                     what you found, made or concluded.{hint}"
+                ));
+            }
             // **A step the engine can see, not yet done and still doable, holds
             // the report.** A character sent to two rooms messaged the channel
             // and reported the mission done from the table; the journeys were
@@ -247,6 +264,9 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         other => Outcome::Refused(format!("`{other}` is not a mission act.")),
     }
 }
+
+/// The fewest words `report_done` takes as an account of what was found.
+const MIN_ACCOUNT_WORDS: usize = 4;
 
 /// How many times `report_stuck` is turned away while the next step is within
 /// reach before the report is taken anyway.
@@ -2822,7 +2842,11 @@ mod tests {
         // a journey not made cannot be reported done: the desk says what is left
         // and the way to it, and that `report_stuck` is the honest close if it
         // cannot be made.
-        match perform(&h, "m1", &act("report_done", json!({"account":"all fine"}))) {
+        match perform(
+            &h,
+            "m1",
+            &act("report_done", json!({"account":"it all looks fine to me"})),
+        ) {
             Outcome::Refused(why) => {
                 assert!(
                     why.starts_with("You have not done this yet: go to "),
@@ -2841,6 +2865,23 @@ mod tests {
         let machines: Vec<String> = h.sim(|s| s.devices.iter().map(|d| d.name.clone()).collect());
         assert!(h.with_sim(|s| s.missions.arrived_in("m1", &room)));
         assert!(h.with_sim(|s| s.missions.read_off("m1", &machines)));
+        h.with_sim(|s| {
+            s.missions
+                .observe("m1", "in the plant room, the coolant valve: open")
+        });
+
+        // A name is not an account: turned back with what was seen.
+        match perform(
+            &h,
+            "m1",
+            &act("report_done", json!({"account":"Paxon Vael"})),
+        ) {
+            Outcome::Refused(why) => {
+                assert!(why.contains("is not an account of what you found"), "{why}");
+                assert!(why.contains("the coolant valve: open"), "{why}");
+            }
+            other => panic!("a name is not an account, got {other:?}"),
+        }
 
         // Reporting done closes it, frees the character, and files the answer so
         // an operator can still read it.
