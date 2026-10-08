@@ -41,9 +41,9 @@ use std::time::Instant;
 use super::admission::prefill_cost_bytes;
 use super::admit::{Budget, Cost, Ground, Headroom, Kind};
 use super::interleave;
-use super::{Scheduler, SequenceId};
+use super::{Scheduler, SequenceId, WaveMember};
 use crate::projection::DecodePriority;
-use candle_nn::kv_cache::CHUNK_SIZE;
+use candle_nn::kv_cache::{prefill_kv_stage_positions, CHUNK_SIZE};
 
 /// The least advance the engine hands a sequence, and so the width a forward
 /// worth running is priced at. 128 rows.
@@ -178,12 +178,19 @@ impl<'a> AdmitPass<'a> {
         }
     }
 
-    /// The tier a chunk of `rows` would need, or zero when the model cannot
-    /// price one.
-    fn tier_for(&self, rows: usize) -> u64 {
+    /// The tier a chunk of `rows` from sequence `seq` would need, or zero when
+    /// the model cannot price one — its pre-stage at that sequence's depth
+    /// included.
+    fn tier_for(&self, rows: usize, seq: SequenceId) -> u64 {
+        let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         self.sched
             .model
-            .wave_tier_bytes(rows, 1, self.sched.session.activation_dtype())
+            .wave_tier_bytes(
+                rows,
+                1,
+                prefill_kv_stage_positions(&[rows], &[depth]),
+                self.sched.session.activation_dtype(),
+            )
             .unwrap_or(0)
     }
 
@@ -191,14 +198,15 @@ impl<'a> AdmitPass<'a> {
     /// carries one sequence more. The tier is superlinear in sequences — the span
     /// tables hold an entry per span — so a join is not free even though it adds
     /// no row, and pricing it at zero lets a forward widen to the sequence cap on
-    /// a tier admission never charged.
+    /// a tier admission never charged. It stages nothing: it brings no rows
+    /// into this forward, and the forwards that give it rows price it standing.
     fn join_tier(&self, rows: usize) -> u64 {
         let dtype = self.sched.session.activation_dtype();
         let seqs = self.sched.running_prefills();
         let tier = |n: usize| {
             self.sched
                 .model
-                .wave_tier_bytes(rows, n, dtype)
+                .wave_tier_bytes(rows, n, 0, dtype)
                 .unwrap_or(0)
         };
         tier(seqs + 1).saturating_sub(tier(seqs))
@@ -334,7 +342,7 @@ impl Ground for AdmitPass<'_> {
         let activations = if rows == 0 {
             self.join_tier(rows_in_forward)
         } else {
-            self.tier_for(rows)
+            self.tier_for(rows, w.sequence_id)
         };
         Some(Cost {
             // The whole turn's K/V, not this chunk's: admitting the turn commits
@@ -459,12 +467,15 @@ impl Scheduler {
     /// that places the tier, which is what makes it follow the model's geometry
     /// instead of being a byte count to re-derive per card.
     pub(super) fn min_forward_tier_bytes(&self) -> u64 {
+        // The least advance is a few chunks, far below the rows a launch
+        // pre-stages for, so it stages nothing.
         self.model
-            .wave_tier_bytes(PREFILL_MIN_ADVANCE, 1, self.session.activation_dtype())
+            .wave_tier_bytes(PREFILL_MIN_ADVANCE, 1, 0, self.session.activation_dtype())
             .unwrap_or(0)
     }
 
-    /// The tier the wave already in flight reserves — the held creep group.
+    /// The tier the wave already in flight reserves — the held creep group,
+    /// its members' pre-stage at each one's own depth included.
     ///
     /// A fact this decision reads, not an output it feeds back into itself: the
     /// tier each *new* admission adds is charged separately, through
@@ -473,8 +484,23 @@ impl Scheduler {
     pub(super) fn standing_tier_bytes(&self) -> usize {
         let rows = self.standing_rows();
         let seqs = self.wave_prefill_members.len().max(1);
+        let (advances, depths): (Vec<usize>, Vec<usize>) = self
+            .wave_prefill_members
+            .iter()
+            .map(|m| match m {
+                WaveMember::Prefill { seq_id, advance }
+                | WaveMember::Section { seq_id, advance } => {
+                    (*advance, self.session.sequence_offset(*seq_id).unwrap_or(0))
+                }
+            })
+            .unzip();
         self.model
-            .wave_tier_bytes(rows, seqs, self.session.activation_dtype())
+            .wave_tier_bytes(
+                rows,
+                seqs,
+                prefill_kv_stage_positions(&advances, &depths),
+                self.session.activation_dtype(),
+            )
             .unwrap_or(0) as usize
     }
 

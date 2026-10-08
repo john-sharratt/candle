@@ -35,8 +35,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, WavePlan,
-    WaveWidth,
+    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, prefill_kv_stage_positions,
+    LayerPhase, WavePlan, WaveWidth,
 };
 
 use super::batched::HybridBatched;
@@ -1005,6 +1005,9 @@ fn sweep_layers(
                 // needs (measured: `wave-ffn … exceeds the 0 B budget`).
                 staged_rows: staged.map_or(0, |(rows, _)| rows),
                 staged_spans: staged.map_or(0, |(_, spans)| spans),
+                // The prefill launch's pre-staged K/V: every position of each
+                // bulk chunk's sequence.
+                kv_stage_positions: prefill_kv_stage_positions(pre_q, pre_off),
             };
             let per_phase = [
                 plan.phase_bytes(LayerPhase::Attention, width),
@@ -1440,11 +1443,10 @@ fn sweep_layers(
         g_layer.end();
         // A segment per layer, as the uniform sweep cuts it: recorded whole, the
         // forward would be one segment and the GPU would idle until the host had
-        // recorded every layer. A routed checkpoint's expert dispatch already
-        // ends a segment in each layer, so only a dense one is cut here.
-        if q.cfg.moe.is_none() {
-            dev.flush_launches()?;
-        }
+        // recorded every layer. A routed checkpoint is cut the same way: its
+        // expert dispatch flushes only on `expert_lre::flush_schedule`'s doubling
+        // cadence, which was measured for Flash-Next's own sweep, not this one.
+        dev.flush_launches()?;
     }
 
     // File the stash back, whether this sweep was whole or one window of a

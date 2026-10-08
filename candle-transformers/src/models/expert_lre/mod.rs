@@ -138,6 +138,9 @@ mod copier;
 mod dispatch;
 #[cfg(test)]
 mod eval;
+/// Where a wave's MoE invocations launch the graph segment they record into.
+#[cfg(feature = "cuda")]
+mod flush_schedule;
 /// `pub(crate)` so the layer warm tier can size itself through the same three
 /// host-RAM ceilings this one does — see `handle::warm_slots_for`.
 pub(crate) mod handle;
@@ -168,12 +171,12 @@ mod promo;
 mod reclaim;
 #[cfg(feature = "cuda")]
 mod residency;
+#[cfg(feature = "cuda")]
+mod slot_image;
 /// Fletcher-32 fingerprints of the resident expert weights, taken once after
 /// the fill so a later corruption can be told from a bad fill.
 #[cfg(feature = "cuda")]
 pub mod slot_integrity;
-#[cfg(feature = "cuda")]
-mod slot_image;
 /// The slot-tenancy tags bucketize's owner check reads.
 #[cfg(feature = "tensor-assert")]
 mod slot_owners;
@@ -192,6 +195,8 @@ mod weight_plan;
 
 // Re-exports — the public API of this module.
 pub use crate::models::profile::ProfileSnapshot;
+#[cfg(feature = "cuda")]
+pub use boundary::grow_tally;
 #[cfg(feature = "cuda")]
 pub use cache::minimum_resident_slots;
 /// Shared with the layer cache, which pins the same count for the same reason:
@@ -212,8 +217,6 @@ pub use handle::{
 /// and the boundary has to be placed before a single expert is uploaded into it.
 #[cfg(feature = "cuda")]
 pub(crate) use pinned::layer_geometries;
-#[cfg(feature = "cuda")]
-pub use boundary::grow_tally;
 #[cfg(feature = "cuda")]
 pub(crate) use slot_image::slot_bytes_for;
 pub use types::{ExpertSlot, MmapExpertRef, PipelineStats};

@@ -208,6 +208,15 @@ pub struct WaveWidth {
     /// wave whose rows are all within the dense budget, states zero for all of
     /// it but the index keys every attention layer appends.
     pub qsa_bytes: usize,
+    /// Key positions one attention layer's prefill launch **pre-stages** —
+    /// [`WaveBuffer::PrefillKvStage`], counted by
+    /// [`prefill_kv_stage_positions`] over the prefill group.
+    ///
+    /// Not a function of the width either: a staged sequence stages its whole
+    /// kv length, prefix and chunk alike, so the stage is as deep as the
+    /// contexts the wave's bulk chunks are prefilled against. Zero for a wave
+    /// with no prefill sequence of [`PREFILL_KV_STAGE_MIN_Q_LEN`] rows.
+    pub kv_stage_positions: usize,
 }
 
 impl WaveWidth {
@@ -232,6 +241,7 @@ impl WaveWidth {
             staged_spans: 0,
             accept_rows: 0,
             qsa_bytes: 0,
+            kv_stage_positions: 0,
         }
     }
 
@@ -247,6 +257,7 @@ impl WaveWidth {
             staged_spans: 0,
             accept_rows: 0,
             qsa_bytes: 0,
+            kv_stage_positions: 0,
         }
     }
 
@@ -267,6 +278,7 @@ impl WaveWidth {
             staged_spans: spans,
             accept_rows: 0,
             qsa_bytes: 0,
+            kv_stage_positions: 0,
         }
     }
 
@@ -303,6 +315,47 @@ pub const DELTA_NET_SCAN_CHUNK: usize = 64;
 /// `candle-kernels/src/paged-decode/slot_types.cuh`. A prefill launch carves one
 /// per sequence from its attention span ([`WaveBuffer::PrefillSlotHeaders`]).
 pub const SLOT_HEADER_BYTES: usize = 32;
+
+/// Query rows at which a sequence's prefill launch **pre-stages** its K/V —
+/// decodes, rotates and quantises every key position once, ahead of the
+/// attention kernel, rather than in every block that selects it
+/// (`candle-kernels/src/paged-prefill/kv_stage.cuh`).
+///
+/// A prefill block serves a couple of query tokens and decodes every position
+/// it selects, so a chunk of `q` rows decodes each selected position about
+/// `q / 2` times per KV head over; staging decodes each position once, but
+/// every position of the sequence. A bulk chunk — hundreds to thousands of
+/// rows — is far past where that pays. A verify window — a handful of rows
+/// over a long prefix — is far short of it: it would stage a whole context to
+/// read a few thousand positions of it. The line sits where a chunk's blocks
+/// decode about as many columns as staging its whole context would at the
+/// budget's depth, with room either side for the two shapes the engine runs.
+pub const PREFILL_KV_STAGE_MIN_Q_LEN: usize = 256;
+
+/// Key positions one prefill launch over `q_lens` at `offsets` pre-stages:
+/// the whole kv length (`offset + q_len`) of every sequence with at least
+/// [`PREFILL_KV_STAGE_MIN_Q_LEN`] rows. **The one definition** — the launcher
+/// stages and sizes its buffer by it, and a wave prices
+/// [`WaveBuffer::PrefillKvStage`] by it.
+pub fn prefill_kv_stage_positions(q_lens: &[usize], offsets: &[usize]) -> usize {
+    q_lens
+        .iter()
+        .zip(offsets)
+        .filter(|(&q, _)| q >= PREFILL_KV_STAGE_MIN_Q_LEN)
+        .map(|(&q, &off)| off + q)
+        .sum()
+}
+
+/// Bytes of the pre-staged K/V for `positions` key positions over `n_kv_head`
+/// heads at `head_dim`: int8 K codes, their FP16 per-32-dim-window scales and
+/// FP16 V, each `[n_kv_head][positions][…]`, the first two planes rounded up
+/// to [`BUMP_ALIGNMENT`] so each plane starts aligned —
+/// `kv_stage_bytes` in `kv_stage.cuh`, which the launcher holds a buffer to.
+pub fn prefill_kv_stage_bytes(positions: usize, n_kv_head: usize, head_dim: usize) -> usize {
+    let rows = n_kv_head * positions;
+    let align = |b: usize| b.div_ceil(BUMP_ALIGNMENT) * BUMP_ALIGNMENT;
+    align(rows * head_dim) + align(rows * (head_dim / 32) * 2) + rows * head_dim * 2
+}
 
 /// The width the FFN carries its intermediates in, for activations of `act`.
 ///
@@ -790,6 +843,12 @@ pub enum WaveBuffer {
     /// write — and decode too, on a stack whose decode kernel emits no q8
     /// context ([`ModelGeometry::decode_q8_context`]).
     AttnOutput,
+    /// The prefill launch's pre-staged K/V, carved beside its context: every
+    /// key position of the launch's bulk sequences, decoded once
+    /// ([`prefill_kv_stage_bytes`] over [`WaveWidth::kv_stage_positions`]).
+    /// One per attention layer, so the phase's reset hands every layer the
+    /// same ground.
+    PrefillKvStage,
     /// The attention context in its **packed** form.
     ///
     /// The int8 decode kernel emits q8a1024 directly (`PagedDecode::q8_byte_size`)
@@ -1570,6 +1629,7 @@ impl WaveBuffer {
             | Self::VBias
             | Self::PrefillSlotHeaders
             | Self::AttnOutput
+            | Self::PrefillKvStage
             | Self::DecodeContext
             | Self::OProjOperand
             | Self::OProjOutput
@@ -1825,6 +1885,11 @@ impl WaveBuffer {
                 dense(w.prefill_rows, g.attn_cols(), g.act_dtype)
             }
             Self::AttnOutput => dense(w.rows(), g.attn_cols(), g.act_dtype),
+            Self::PrefillKvStage => dense(
+                prefill_kv_stage_bytes(w.kv_stage_positions, g.n_kv_head, g.head_dim),
+                1,
+                DType::U8,
+            ),
             // Only where the decode kernel emits it — see
             // `ModelGeometry::decode_q8_context`.
             Self::DecodeContext if g.decode_q8_context => q8(w.decode_rows, g.attn_cols()),
@@ -3358,6 +3423,7 @@ mod tests {
                         staged_spans: rows,
                         accept_rows: rows,
                         qsa_bytes: rows,
+                        kv_stage_positions: rows,
                     };
                     let s = b.shape(&g, width);
                     if conditional {
@@ -4558,5 +4624,75 @@ mod tests {
         );
         // Monotonic in the budget: halving the span must not admit more rows.
         assert!(plan.max_rows_within(WAVE_FFN_BYTES / 2, empty_head()) <= rows);
+    }
+
+    /// A launch pre-stages the whole kv length of each sequence with a bulk
+    /// chunk, and nothing of a short one: a verify window, a decode-shaped
+    /// row and a chunk one short of the line stage nothing.
+    #[test]
+    fn the_stage_counts_bulk_sequences_whole_and_nothing_else() {
+        assert_eq!(PREFILL_KV_STAGE_MIN_Q_LEN, 256);
+        assert_eq!(
+            prefill_kv_stage_positions(&[5], &[4196]),
+            0,
+            "a verify window"
+        );
+        assert_eq!(prefill_kv_stage_positions(&[255], &[0]), 0);
+        assert_eq!(prefill_kv_stage_positions(&[256], &[0]), 256);
+        assert_eq!(
+            prefill_kv_stage_positions(&[5, 256, 2048, 255], &[4196, 100, 8192, 0]),
+            (100 + 256) + (8192 + 2048),
+            "the bulk sequences' prefix and chunk alike; the short ones not at all"
+        );
+    }
+
+    /// The stage's bytes, to the byte: int8 K codes, FP16 window scales, FP16
+    /// V — 784 B a position per KV head at head_dim 256 — the first two planes
+    /// rounded up to the bump alignment.
+    #[test]
+    fn the_stage_is_784_bytes_a_position_at_head_dim_256() {
+        // 128K of history behind an 8K chunk, two KV heads: 139,264 positions,
+        // every plane already a multiple of 256.
+        assert_eq!(
+            prefill_kv_stage_bytes(131_072 + 8192, 2, 256),
+            (131_072 + 8192) * 2 * 784
+        );
+        assert_eq!(prefill_kv_stage_bytes(131_072 + 8192, 2, 256), 218_365_952);
+        // 21,192 rows: K 5,425,152 B; scales 339,072 B, padded to 339,200;
+        // V 10,850,304 B.
+        assert_eq!(
+            prefill_kv_stage_bytes(10_596, 2, 256),
+            5_425_152 + 339_200 + 10_850_304
+        );
+        // Three rows at head_dim 64: K 192 → 256, scales 12 → 256, V 384.
+        assert_eq!(prefill_kv_stage_bytes(3, 1, 64), 256 + 256 + 384);
+        assert_eq!(prefill_kv_stage_bytes(0, 2, 256), 0);
+    }
+
+    /// The plan charges the stage on the attention phase, at the geometry's
+    /// KV heads and head dim, and nothing for a wave that stages nothing.
+    #[test]
+    fn the_stage_is_an_attention_buffer_priced_by_its_positions() {
+        let g = hyper_moe();
+        let plan = WavePlan::new(g);
+        assert_eq!(WaveBuffer::PrefillKvStage.phase(), LayerPhase::Attention);
+        assert_eq!(WaveBuffer::PrefillKvStage.chain(), Chain::Attention);
+        let plain = w(2048);
+        assert_eq!(WaveBuffer::PrefillKvStage.bytes(&g, plain), 0);
+        let staged = WaveWidth {
+            kv_stage_positions: 10_240,
+            ..plain
+        };
+        let want = prefill_kv_stage_bytes(10_240, g.n_kv_head, g.head_dim);
+        assert!(want > 0);
+        assert_eq!(WaveBuffer::PrefillKvStage.bytes(&g, staged), want);
+        // One more aligned carve on the attention chain: its bytes, plus at
+        // most the alignment its start costs.
+        let grew =
+            plan.chain_bytes(Chain::Attention, staged) - plan.chain_bytes(Chain::Attention, plain);
+        assert!(
+            (want..want + BUMP_ALIGNMENT).contains(&grew),
+            "the attention chain grew by {grew} B for a {want} B stage"
+        );
     }
 }

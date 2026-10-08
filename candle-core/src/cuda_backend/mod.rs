@@ -167,6 +167,8 @@ use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
+/// The greedy pick, many blocks to a row.
+pub mod argmax_rows;
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
 mod device;

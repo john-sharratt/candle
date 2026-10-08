@@ -43,6 +43,7 @@ use super::types::{PipelineMessage, PipelineStats, RoutedLayer};
 use crate::models::profile::{profile_now, ProfileAccumulator};
 use candle::{Device, Result};
 use cudarc::driver::CudaStream;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
@@ -65,6 +66,31 @@ const PREFETCH_LATE_FLOOR: usize = 2;
 /// hides single-hop latency, and multi-hop batches for it would only queue
 /// bytes ahead of the next row's.
 const PREFETCH_MULTI_HOP_MAX_SOURCES: usize = 32;
+
+/// Free zone slots a decode launch's restock fills per layer, with the
+/// layer's best-scored non-resident experts (`restock`). Two a layer is ~100
+/// copies — ~250 MB of link — a Flash-Next decode step, a fraction of the
+/// step's link time, so the restock never competes with a step's own misses
+/// for long; a zone a long prompt left ~2,000 slots short fills in ~20 steps.
+const RESTOCK_PER_LAYER: usize = 2;
+
+/// Free slots a restock leaves untaken, for the ring's empty offers and the
+/// prefetches that fill them.
+const RESTOCK_KEEP_FREE: usize = 64;
+
+/// The experts a restock promotes out of `cands` (`(expert, score)`): the `n`
+/// best with a positive score — score descending, then expert id ascending, so
+/// equal scores choose the same experts on every run.
+fn restock_choice(mut cands: Vec<(usize, f32)>, n: usize) -> Vec<usize> {
+    cands.retain(|&(_, s)| s > 0.0);
+    cands.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(CmpOrdering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    cands.truncate(n);
+    cands.into_iter().map(|(e, _)| e).collect()
+}
 
 /// Upper bound on one lookahead: the next row's scored experts, highest first.
 /// Bounds its bus time to roughly one layer's compute window; a bigger batch
@@ -235,6 +261,10 @@ struct Promotion {
     /// The copy reads the expert's pad slot, pinned against pad eviction until
     /// the copy is done.
     from_pad: bool,
+    /// A restock (`PipelineState::restock`), not a prediction: it lands like
+    /// any promotion but is no evidence for or against the predictor, so it
+    /// stays out of `speculative_loads` and the prefetch counters.
+    restock: bool,
 }
 
 /// The pipeline thread's private state. Never crosses a thread boundary after
@@ -591,6 +621,9 @@ impl PipelineState {
                     self.speculative_prefetch(row, &expert_ids)?;
                 }
             }
+            if !msg.prefill_width && decode.len() == expert_ids.len() {
+                self.restock(row)?;
+            }
             self.profile.record("pipe_prefetch", t);
         }
         // Scores age once per pass that routed a decode-scored row, at its last
@@ -642,11 +675,15 @@ impl PipelineState {
         self.inner.install(p.slot, p.row, p.expert, view);
         self.residency()?
             .set_vram(p.row, p.expert, Some((p.slot, base)));
-        self.speculative_loads.insert((p.row, p.expert));
+        if !p.restock {
+            self.speculative_loads.insert((p.row, p.expert));
+        }
         if let Ok(mut s) = self.stats.lock() {
             s.promotions += 1;
             s.promotion_bytes += p.bytes;
-            s.prefetch_promotions += 1;
+            if !p.restock {
+                s.prefetch_promotions += 1;
+            }
         }
         Ok(())
     }
@@ -810,19 +847,18 @@ impl PipelineState {
                 && keys[slot].is_some_and(|(r, e)| !promoting.contains(&(r, e)))
         };
         let ask = 2 * n;
-        let mut slots = self
-            .inner
-            .rank_victims(row, ask, false, |slot, layer| !upcoming[layer] && candidate(slot));
+        let mut slots = self.inner.rank_victims(row, ask, false, |slot, layer| {
+            !upcoming[layer] && candidate(slot)
+        });
         if slots.len() < ask {
-            let more = self.inner.rank_victims(row, ask - slots.len(), false, |slot, layer| {
-                upcoming[layer] && candidate(slot)
-            });
+            let more = self
+                .inner
+                .rank_victims(row, ask - slots.len(), false, |slot, layer| {
+                    upcoming[layer] && candidate(slot)
+                });
             slots.extend(more);
         }
-        let pad_cap = self
-            .stats
-            .lock()
-            .map_or(0, |s| s.pad_slots / PAD_PIN_SHARE);
+        let pad_cap = self.stats.lock().map_or(0, |s| s.pad_slots / PAD_PIN_SHARE);
         let mut pinned = self.pad_pinned_offers;
         let mut chosen = Vec::with_capacity(n);
         let mut places = self
@@ -1020,7 +1056,11 @@ impl PipelineState {
         self.collect_device_promotions(near)?;
         self.land_device_promotions(true)?;
         ring.withdraw();
-        let untaken: Vec<Offer> = self.ring_slots.iter_mut().filter_map(Option::take).collect();
+        let untaken: Vec<Offer> = self
+            .ring_slots
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect();
         for offer in untaken {
             self.take_back(offer)?;
         }
@@ -1032,7 +1072,14 @@ impl PipelineState {
     /// engine — those with a pinned copy; the cold ones go to the stager to
     /// stage ahead. Victims only from behind the wave (`take_slots`).
     /// `issue_row` is the row the wave is at — what victims are ranked against.
-    fn promote(&mut self, issue_row: usize, row: usize, experts: &[usize]) -> Result<usize> {
+    /// `restock` marks the copies as a restock's ([`Promotion::restock`]).
+    fn promote(
+        &mut self,
+        issue_row: usize,
+        row: usize,
+        experts: &[usize],
+        restock: bool,
+    ) -> Result<usize> {
         let Device::Cuda(_) = &self.device else {
             return Ok(0);
         };
@@ -1090,6 +1137,7 @@ impl PipelineState {
                 slot,
                 bytes,
                 from_pad,
+                restock,
             });
             self.promoting.insert((row, e));
             self.pass_dma_bytes += bytes;
@@ -1121,10 +1169,50 @@ impl PipelineState {
                 (s > 0.0).then_some((e, s))
             })
             .collect();
-        cands.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        cands.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
         cands.truncate(LOOKAHEAD_MAX);
         let experts: Vec<usize> = cands.into_iter().map(|(e, _)| e).collect();
-        self.promote(row, target, &experts)?;
+        self.promote(row, target, &experts, false)?;
+        Ok(())
+    }
+
+    /// Fill free zone slots with `row`'s best-scored non-resident experts, a
+    /// few per decode launch, by the copy engine.
+    ///
+    /// **What it is for.** A prompt's tier is bought from the weight side and the
+    /// zone grows back once the prompt is done — but growing back adds empty
+    /// slots, not experts: after a 128K prompt ~2,000 slots stood empty for the
+    /// whole decode, and every step paid ~20 worker pulls for experts the zone
+    /// had room to hold. A miss promotes itself only after it has been paid for
+    /// on the critical path; this brings the decode's likely experts in first.
+    ///
+    /// Free slots only — a restock evicts nothing (`take_slots` is never asked
+    /// for more than the free list holds), and leaves [`RESTOCK_KEEP_FREE`] for
+    /// the ring. Pinned-backed experts only — a cold one would be staged from
+    /// the pack into the pad, not copied into the zone, so it takes no slot and
+    /// may displace a pad copy. The row just routed is the one the next step
+    /// routes again, so its experts are restocked: by the score decode hits
+    /// earn, a prompt's experts last.
+    fn restock(&mut self, row: usize) -> Result<()> {
+        if row < self.inner.pinned_layers {
+            return Ok(());
+        }
+        let n = RESTOCK_PER_LAYER.min(self.inner.free_len().saturating_sub(RESTOCK_KEEP_FREE));
+        if n == 0 {
+            return Ok(());
+        }
+        // The residency guard is dropped before `promote`, which takes it again.
+        let cands: Vec<(usize, f32)> = {
+            let residency = self.residency()?;
+            (0..self.inner.experts_per_layer)
+                .filter(|&e| !self.inner.key_to_slot.contains_key(&(row, e)))
+                .filter(|&e| !self.promoting.contains(&(row, e)))
+                .filter(|&e| residency.place(row, e).pinned_source().is_some())
+                .map(|e| (e, self.inner.score(row, e)))
+                .collect()
+        };
+        let experts = restock_choice(cands, n);
+        self.promote(row, row, &experts, true)?;
         Ok(())
     }
 
@@ -1154,7 +1242,7 @@ impl PipelineState {
             // A pinned layer's experts are all resident; the prediction still
             // chains through it.
             if target >= self.inner.pinned_layers {
-                self.promote(row, target, &predicted)?;
+                self.promote(row, target, &predicted, false)?;
             }
             source = predicted;
         }
@@ -1358,7 +1446,19 @@ pub(crate) fn spawn_pipeline_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{ring_stock, RingStock};
+    use super::{restock_choice, ring_stock, RingStock};
+
+    /// A restock takes the `n` best-scored experts, ties broken by expert id,
+    /// and never one with no score.
+    #[test]
+    fn a_restock_takes_the_best_scored_then_the_lowest_ids() {
+        let cands = vec![(7, 0.5), (3, 2.0), (9, 2.0), (1, 0.0), (4, 1.0), (2, -1.0)];
+        assert_eq!(restock_choice(cands.clone(), 2), vec![3, 9]);
+        assert_eq!(restock_choice(cands.clone(), 4), vec![3, 9, 4, 7]);
+        assert_eq!(restock_choice(cands, 10), vec![3, 9, 4, 7]);
+        assert!(restock_choice(vec![(5, 0.0)], 2).is_empty());
+        assert!(restock_choice(vec![(5, 3.0)], 0).is_empty());
+    }
 
     fn stock(target: usize, reserve: u32, sweep: u32) -> RingStock {
         RingStock {

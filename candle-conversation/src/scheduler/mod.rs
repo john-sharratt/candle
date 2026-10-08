@@ -3486,6 +3486,12 @@ pub(crate) struct Scheduler {
     /// drain). See [`projection_assembler::apply_segments`].
     batch_drain_gap_fills: bool,
     deferred_glue_fires: Vec<projection_assembler::GapFillPlan>,
+    /// Sequences whose next token `inject_stencil_prefills` sampled this
+    /// iteration from its static run's own prefill. They sit out the decode
+    /// step that follows: the token it would carry is the one just sampled, and
+    /// the stencil's constraint for the token after it is set by the next
+    /// injection, not by a step that has not seen the driver advance.
+    stencil_sampled: HashSet<SequenceId>,
     /// Ephemeral-fork requests whose parent had a turn in flight when they
     /// arrived, answered at the turn boundary. See [`ephemeral_fork`].
     parked_forks: Vec<ephemeral_fork::ParkedFork>,
@@ -3787,6 +3793,7 @@ impl Scheduler {
             ingest_timelines: HashSet::new(),
             batch_drain_gap_fills: false,
             deferred_glue_fires: Vec::new(),
+            stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
             wave_prefill_residual: None,
             wave_prefill_cursor: 0,
@@ -14700,7 +14707,7 @@ mod tests {
             sched.prefill_queue.push_back(test_prefill_work(id));
         }
         let dtype = sched.session.activation_dtype();
-        let tier = |n: usize| sched.model.wave_tier_bytes(chunk, n, dtype).unwrap_or(0);
+        let tier = |n: usize| sched.model.wave_tier_bytes(chunk, n, 0, dtype).unwrap_or(0);
         let join_price: Vec<u64> = (0..=members)
             .map(|n| tier(n + 1).saturating_sub(tier(n)))
             .collect();

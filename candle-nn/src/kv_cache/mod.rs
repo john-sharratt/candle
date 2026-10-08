@@ -62,10 +62,11 @@ pub use chunked::slot_state_stats;
 /// worst defects were geometry, and none of them needed a GPU to find.
 pub use chunked::span_geometry;
 pub use chunked::wave_plan::{
-    ffn_work_dtype, BufferShape, Chain, DeltaNetWidths, Encoding, HyperWidths, LayerPhase,
-    ModelGeometry, SharedExpertWidths, WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT,
-    DELTA_NET_REPLAY_LAYER_OPS, DELTA_NET_REPLAY_MAX_LAYER_SPANS, DELTA_NET_REPLAY_STACK_BYTES,
-    DELTA_NET_SCAN_CHUNK, SLOT_HEADER_BYTES,
+    ffn_work_dtype, prefill_kv_stage_bytes, prefill_kv_stage_positions, BufferShape, Chain,
+    DeltaNetWidths, Encoding, HyperWidths, LayerPhase, ModelGeometry, SharedExpertWidths,
+    WaveBuffer, WavePlan, WaveWidth, BUMP_ALIGNMENT, DELTA_NET_REPLAY_LAYER_OPS,
+    DELTA_NET_REPLAY_MAX_LAYER_SPANS, DELTA_NET_REPLAY_STACK_BYTES, DELTA_NET_SCAN_CHUNK,
+    PREFILL_KV_STAGE_MIN_Q_LEN, SLOT_HEADER_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

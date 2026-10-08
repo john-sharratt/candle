@@ -114,6 +114,17 @@ fn bench_qsa_topk_selection() -> Result<()> {
         "{:>11} {:>6} {:>8} {:>10} {:>12}",
         "strata", "rows", "blocks", "tokens", "ms/launch"
     );
+    // A single session's speculative verify: five rows at the depths the Strata
+    // benchmark runs (4K, 32K and 128K tokens).
+    for &blocks in &[1_024usize, 8_192, 32_000] {
+        let ms = time_fill(5, blocks, &Strata::WHOLE, 500)?;
+        println!(
+            "{:>11} {:>6} {blocks:>8} {:>10} {ms:>12.3}",
+            "whole",
+            5,
+            blocks * RATIO
+        );
+    }
     for (name, s) in strata() {
         for &(rows, iters) in &[(16usize, 200usize), (1024, 20), (8192, 4)] {
             for &blocks in &[16_384usize, 32_768, 73_728, 262_144] {

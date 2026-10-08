@@ -69,14 +69,22 @@ impl SlotOwners {
 
     /// Slot `slot` now holds `(row, expert)`.
     pub(crate) fn set(&self, slot: usize, row: usize, expert: usize) {
-        assert!(slot < self.slots, "slot owners: slot {slot} past {}", self.slots);
+        assert!(
+            slot < self.slots,
+            "slot owners: slot {slot} past {}",
+            self.slots
+        );
         // SAFETY: `slot < slots`, inside the allocation.
         unsafe { std::ptr::write_volatile(self.host.add(slot), owner_tag(row, expert)) };
     }
 
     /// The tag slot `slot` holds.
     pub(crate) fn get(&self, slot: usize) -> u32 {
-        assert!(slot < self.slots, "slot owners: slot {slot} past {}", self.slots);
+        assert!(
+            slot < self.slots,
+            "slot owners: slot {slot} past {}",
+            self.slots
+        );
         // SAFETY: as `set`.
         unsafe { std::ptr::read_volatile(self.host.add(slot)) }
     }

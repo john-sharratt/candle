@@ -22,10 +22,10 @@ use candle::{DType, Device, LiveTensor, Result};
 use candle_kernels::delta_net::{
     run_delta_net_conv_prefill_f32, run_delta_net_prefill_intra_f32,
     run_delta_net_prefill_state_f32, DELTA_NET_LAYER_OPS, DELTA_NET_MAX_LAYER_SPANS,
-    DELTA_NET_PREFILL_CHUNK, DELTA_NET_PREFILL_DIM,
+    DELTA_NET_PREFILL_CHUNK, DELTA_NET_PREFILL_CONV_MAX, DELTA_NET_PREFILL_DIM,
 };
 
-use super::cuda::{f32_ptr, typed_ptr};
+use super::cuda::{aligned16, f32_ptr, typed_ptr};
 use super::mix::{DeltaNetConstants, DeltaNetOut, DeltaNetProjections, DeltaNetState};
 use super::types::DeltaNetDims;
 use crate::models::operand_guard::expect_dense_dtype;
@@ -84,8 +84,8 @@ impl ReplayStates {
         Ok(Self {
             tail_in: f32_ptr(&entering.conv_tail, "conv tail in")?,
             tail_out: f32_ptr(&out.conv_tail, "conv tail out")?,
-            state_in: f32_ptr(&entering.s, "state in")?,
-            state_out: f32_ptr(&out.s, "state out")?,
+            state_in: aligned16(f32_ptr(&entering.s, "state in")?, "state in")?,
+            state_out: aligned16(f32_ptr(&out.s, "state out")?, "state out")?,
         })
     }
 }
@@ -140,6 +140,13 @@ pub fn delta_net_replay_stack(
     let (h_v, h_k) = (dims.n_v_heads, dims.n_k_heads);
     if h_k == 0 || !h_v.is_multiple_of(h_k) {
         candle::bail!("delta_net replay stack: h_v {h_v} must be a multiple of h_k {h_k}");
+    }
+    if !(2..=DELTA_NET_PREFILL_CONV_MAX).contains(&dims.conv_kernel) {
+        candle::bail!(
+            "delta_net replay stack: the prefill conv takes windows of \
+             2..={DELTA_NET_PREFILL_CONV_MAX}, got {}",
+            dims.conv_kernel
+        );
     }
     let (conv_dim, value_dim) = (dims.conv_dim(), dims.value_dim());
     let qk_channels = 2 * dims.key_dim();
@@ -246,10 +253,13 @@ pub fn delta_net_replay_stack(
     let ops_p = typed_ptr(&table, DType::I64, "layer table")?;
     let ptrs_p = ops_p + (g * DELTA_NET_LAYER_OPS * std::mem::size_of::<i64>()) as u64;
     let spans_p = typed_ptr(&extents, DType::U32, "span extents")?;
-    let conved_p = f32_ptr(conved, "conved")?;
+    let conved_p = aligned16(f32_ptr(conved, "conved")?, "conved")?;
     let v_p = conved_p + ((conv_dim - value_dim) * std::mem::size_of::<f32>()) as u64;
-    let (o_p, u_p, w_p) = (f32_ptr(&o, "o")?, f32_ptr(&u, "u")?, f32_ptr(&w, "w")?);
-    let (kq_p, gcs_p) = (f32_ptr(&kq, "kq")?, f32_ptr(&g_cs, "g_cs")?);
+    let o_p = f32_ptr(&o, "o")?;
+    let u_p = aligned16(f32_ptr(&u, "u")?, "u")?;
+    let w_p = aligned16(f32_ptr(&w, "w")?, "w")?;
+    let kq_p = aligned16(f32_ptr(&kq, "kq")?, "kq")?;
+    let gcs_p = f32_ptr(&g_cs, "g_cs")?;
     let q_scale = (1.0 / (d as f64).sqrt()) as f32;
     // The per-layer operands the table supplies are ignored by the kernels in
     // a stacked launch; the first layer's are passed so no argument is null.
@@ -266,7 +276,7 @@ pub fn delta_net_replay_stack(
         f32_ptr(first.c.dt_bias, "dt_bias")?,
         f32_ptr(first.c.a, "a")?,
     );
-    unsafe {
+    let conv_status = unsafe {
         run_delta_net_conv_prefill_f32(
             x0 as *const f32,
             k0 as *const f32,
@@ -283,7 +293,17 @@ pub fn delta_net_replay_stack(
             qk_channels as i32,
             eps,
             raw,
+        )
+    };
+    // The scan passes read the conv's output; one refused leaves it unwritten.
+    if conv_status != 0 {
+        candle::bail!(
+            "delta_net replay stack: the conv refused {g} layers × {n} spans of up to \
+             {max_len} rows, window {} and wrote nothing",
+            dims.conv_kernel
         );
+    }
+    unsafe {
         run_delta_net_prefill_intra_f32(
             conved_p as *const f32,
             v_p as *const f32,
@@ -334,7 +354,7 @@ pub fn delta_net_replay_stack(
 mod tests {
     use super::*;
     use crate::models::delta_net::cuda::{
-        delta_net_conv_prefill, delta_net_prefill_scan, DeltaNetFused,
+        delta_net_conv_prefill, delta_net_prefill_scan, delta_net_short_span_scan, DeltaNetFused,
     };
     use crate::models::delta_net::DeltaNetSpanTable;
     use candle::Tensor;
@@ -365,8 +385,8 @@ mod tests {
     }
 
     /// One layer's stashed operands and constants, and per span the entering
-    /// buffers plus two sets of output buffers — one for the wave's launch, one
-    /// for the stack's.
+    /// buffers plus three sets of output buffers — the wave's conv + scan
+    /// launches, the wave's short-span launch, and the stack's.
     struct Layer {
         p: DeltaNetProjections<'static>,
         conv: Tensor,
@@ -375,6 +395,7 @@ mod tests {
         norm: Tensor,
         entering: Vec<DeltaNetState>,
         wave_out: Vec<DeltaNetOut>,
+        short_out: Vec<DeltaNetOut>,
         stack_out: Vec<DeltaNetOut>,
     }
 
@@ -382,9 +403,10 @@ mod tests {
     /// mixer with GQA (2 K heads under 4 V heads) and two rewinding spans — a
     /// three-row accept and a one-row accept, with an unreplayed row between
     /// them — replayed once as a stack and once a layer at a time through the
-    /// very wrappers the verify wave calls. Every advanced state and conv tail
-    /// must match byte for byte: a rewind the sequence can tell apart from the
-    /// wave is a rewind that changed the conversation.
+    /// very wrappers the verify wave calls: the conv + scan pair, and the
+    /// short-span launch a verify-width wave takes instead. Every advanced state
+    /// and conv tail must match byte for byte: a rewind the sequence can tell
+    /// apart from the wave is a rewind that changed the conversation.
     #[test]
     fn a_stacked_replay_is_each_layers_wave_launch_bit_for_bit() {
         let Ok(gpu) = Device::new_cuda(0) else {
@@ -436,6 +458,7 @@ mod tests {
                         })
                         .collect(),
                     wave_out: spans.iter().map(|_| out()).collect(),
+                    short_out: spans.iter().map(|_| out()).collect(),
                     stack_out: spans.iter().map(|_| out()).collect(),
                 }
             })
@@ -451,23 +474,26 @@ mod tests {
             .collect();
 
         // The wave's launches, a layer at a time.
-        for (l, layer) in layers.iter().enumerate() {
+        let span_table = |entering: &[DeltaNetState], outs: &[DeltaNetOut]| {
             let mut ptrs: Vec<i64> = Vec::new();
             for col in 0..4 {
-                for (s, entering) in layer.entering.iter().enumerate() {
-                    let o = &layer.wave_out[s];
+                for (s, entering) in entering.iter().enumerate() {
+                    let o = &outs[s];
                     let t = [&entering.conv_tail, &o.conv_tail, &entering.s, &o.s][col];
                     ptrs.push(f32_ptr(t, "table").unwrap() as i64);
                 }
             }
             let mut ext: Vec<u32> = spans.iter().map(|s| s.start as u32).collect();
             ext.extend(spans.iter().map(|s| s.len as u32));
-            let table = DeltaNetSpanTable {
+            DeltaNetSpanTable {
                 ptrs: Tensor::from_vec(ptrs, (4, spans.len()), &gpu).unwrap(),
                 spans: Tensor::from_vec(ext, (2, spans.len()), &gpu).unwrap(),
                 n: spans.len(),
                 max_len: 3,
-            };
+            }
+        };
+        for (l, layer) in layers.iter().enumerate() {
+            let table = span_table(&layer.entering, &layer.wave_out);
             let conved = zeros(&[rows, conv_dim]);
             delta_net_conv_prefill(
                 &layer.p.qkv,
@@ -489,6 +515,22 @@ mod tests {
                 q_scale: (1.0 / (d as f64).sqrt()) as f32,
             };
             delta_net_prefill_scan(&fused, &table).unwrap();
+
+            let o = zeros(&[rows, dims.value_dim()]);
+            let geometry = zeros(&[rows, conv_dim]);
+            let fused = DeltaNetFused {
+                conved: &geometry,
+                o: &o,
+                ..fused
+            };
+            delta_net_short_span_scan(
+                &fused,
+                &layer.p.qkv,
+                &layer.conv,
+                &span_table(&layer.entering, &layer.short_out),
+                eps,
+            )
+            .unwrap();
         }
 
         // The stack, every layer in one launch triple.
@@ -522,6 +564,17 @@ mod tests {
                     bits(&w.conv_tail),
                     bits(&k.conv_tail),
                     "layer {l} span {s}: conv tail"
+                );
+                let short = &layer.short_out[s];
+                assert_eq!(
+                    bits(&short.s),
+                    bits(&k.s),
+                    "layer {l} span {s}: short-span state"
+                );
+                assert_eq!(
+                    bits(&short.conv_tail),
+                    bits(&k.conv_tail),
+                    "layer {l} span {s}: short-span conv tail"
                 );
             }
         }

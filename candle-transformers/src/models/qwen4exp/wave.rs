@@ -35,9 +35,9 @@ use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
     arena_regions, begin_forward, begin_wave, end_wave_transient, ffn_work_dtype,
-    plan_wave_transient, region_stats, DeltaNetWidths, HyperWidths, KvCache, LayerPhase,
-    ModelGeometry, SharedExpertWidths, SlotTenant, SpanRegion, WavePlan, WaveWidth, REGION_BYTES,
-    WAVE_SPAN_BYTES,
+    plan_wave_transient, prefill_kv_stage_positions, region_stats, DeltaNetWidths, HyperWidths,
+    KvCache, LayerPhase, ModelGeometry, SharedExpertWidths, SlotTenant, SpanRegion, WavePlan,
+    WaveWidth, REGION_BYTES, WAVE_SPAN_BYTES,
 };
 
 use super::kv_row::kv_factors_for;
@@ -84,7 +84,7 @@ use crate::models::operand_guard::expect_dense_view;
 use crate::models::piece_key::PieceKey;
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
-use crate::models::profile::{span, ProfileSnapshot};
+use crate::models::profile::{pipeline_record, profile_now, span, ProfileSnapshot};
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows, VerifyStash};
@@ -2498,6 +2498,10 @@ impl WaveSweep for Qwen4ExpBatched {
         // readback after it waits ~1.6 ms — so what the forward thread spends
         // issuing the sweep is the step, and the GPU spans cannot say which part.
         let preamble_span = span("q4e:host:preamble");
+        // The preamble's parts, each on its own host span: at depth the
+        // preamble is hundreds of milliseconds a forward with the GPU idle, and
+        // the whole-preamble span cannot say which part.
+        let t_pre = profile_now();
 
         // Hand back the PREVIOUS wave's transient tier, here rather than at the
         // end of the wave that placed it. `end_wave_transient` gates on
@@ -2512,6 +2516,7 @@ impl WaveSweep for Qwen4ExpBatched {
         if let Device::Cuda(d) = &m.device {
             end_wave_transient(&d.cuda_stream());
         }
+        pipeline_record("q4e:pre:end_tier", t_pre);
 
         // The KV↔expert boundary's GROWING direction, in the one gap it is legal
         // in: between forwards, on the line after the transient tier goes back, so
@@ -2525,7 +2530,9 @@ impl WaveSweep for Qwen4ExpBatched {
         // that runs out buys its own ground. Mirrors `latent_moe`'s wave and the
         // blanket `BatchedModel` wave's phase 0; Flash-Next runs its own engine
         // rather than `BatchedModelCore`, so it does not inherit either.
+        let t_pre = profile_now();
         m.experts.reclaim_spare_ground();
+        pipeline_record("q4e:pre:reclaim", t_pre);
 
         let n_glue = seq_ids.len() - n_decode - n_prefill;
         if n_glue > 0 || pending_glue.is_some() {
@@ -2554,6 +2561,7 @@ impl WaveSweep for Qwen4ExpBatched {
         // session's STREAM layers — the draft head's layer is stepped by the
         // head's own pass, and `build_decode_metadata` scopes itself to the
         // stream for exactly that reason.
+        let t_pre = profile_now();
         let decode_headers = if n_decode > 0 {
             let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
             DecodeHeaders::Decode { buf, stride }
@@ -2563,16 +2571,21 @@ impl WaveSweep for Qwen4ExpBatched {
                 stride: 0,
             }
         };
+        pipeline_record("q4e:pre:headers", t_pre);
         // Read before the contexts borrow the session: the tier pricing below
         // needs it, and `assemble_wave_contexts` holds a mutable borrow across
         // everything that follows.
         let tier_act_dtype = session.activation_dtype();
+        let t_pre = profile_now();
         let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
         let contexts = contexts.as_mut_slice();
+        pipeline_record("q4e:pre:contexts", t_pre);
 
         // Admit: claim every KV chunk this wave writes, over the KV range.
+        let t_pre = profile_now();
         let (kv_start, kv_end) = self.kv_layer_range(layer_start, layer_end);
         admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
+        pipeline_record("q4e:pre:admit", t_pre);
 
         // ── Carried state: ensure (reset at offset 0), open the GDN wave,
         // snapshot the PLE states for the failure bracket. ──
@@ -2599,9 +2612,11 @@ impl WaveSweep for Qwen4ExpBatched {
         // arena frontier as it stands, so a region claimed after the placement
         // moves the frontier under a tier already standing on it (hot-path
         // invariant 7).
+        let t_pre = profile_now();
         for ((&seq, &off), &q) in seq_ids.iter().zip(&offsets).zip(&q_lens) {
             self.ensure_seq_state(seq, off, off + q, layer_start)?;
         }
+        pipeline_record("q4e:pre:ensure_state", t_pre);
 
         // **Price and reserve this wave's transient tier**, sized to this wave
         // rather than to the widest one the engine can run — after the KV claim
@@ -2609,6 +2624,7 @@ impl WaveSweep for Qwen4ExpBatched {
         // it, and before `begin_forward` below, because the placement may buy
         // ground from the weight side and `set_weight_floor` refuses while a
         // forward is open.
+        let t_pre = profile_now();
         #[cfg(feature = "cuda")]
         if total_rows > 0 {
             if let Device::Cuda(d) = &m.device {
@@ -2686,6 +2702,9 @@ impl WaveSweep for Qwen4ExpBatched {
                         layer_start,
                         layer_end,
                     )?,
+                    // The prefill launch's pre-staged K/V: every position of
+                    // each bulk chunk's sequence.
+                    kv_stage_positions: prefill_kv_stage_positions(pre_q, pre_off),
                 };
                 let per_phase = [
                     plan.phase_bytes(LayerPhase::Attention, width),
@@ -2699,14 +2718,17 @@ impl WaveSweep for Qwen4ExpBatched {
                 })?;
             }
         }
+        pipeline_record("q4e:pre:plan_tier", t_pre);
 
         // From here the forward owns the span partition: the tier is placed and
         // must not move under it.
+        let t_pre = profile_now();
         #[cfg(feature = "cuda")]
         let _forward_open = match &m.device {
             Device::Cuda(d) => Some(begin_forward(&d.cuda_stream())),
             _ => None,
         };
+        pipeline_record("q4e:pre:begin_forward", t_pre);
 
         // **The forward-scoped span**, held for the whole sweep rather than per
         // layer: it carries the metadata a forward builds once and every layer
@@ -2729,10 +2751,13 @@ impl WaveSweep for Qwen4ExpBatched {
         // the wave's ragged prefill offsets — read by every layer, written once
         // — which is the forward span's stated purpose. Nothing above needs
         // them, so moving the construction down costs only this comment.
+        let t_pre = profile_now();
         let prefill_headers = DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
             pre_off, pre_q, &m.device, fwd_ticket,
         )?);
+        pipeline_record("q4e:pre:meta", t_pre);
 
+        let t_pre = profile_now();
         let index_snapshot: Vec<(usize, Vec<IndexSnapshot>)> = {
             let idx = self
                 .index
@@ -2792,6 +2817,7 @@ impl WaveSweep for Qwen4ExpBatched {
                 rec.get_mut(&s).expect("ensured above").begin_wave()?;
             }
         }
+        pipeline_record("q4e:pre:snapshots", t_pre);
 
         drop(preamble_span);
         let layers_span = span("q4e:host:layers");

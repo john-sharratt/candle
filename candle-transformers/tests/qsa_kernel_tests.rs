@@ -40,12 +40,14 @@ use candle::quantized::pinned_staging::{Generation, GpuBuf, PinnedBuf, PinnedSta
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     quantize_sealed_in_place, ArenaFormatTag, ChunkedKvBacking, CompressionPolicy, KvCache,
-    CHUNK_SIZE, N_PALETTE,
+    QuantFormat, CHUNK_SIZE, N_PALETTE,
 };
-use candle_transformers::models::prefill_utils::{paged_decode_attn, paged_prefill_batched};
+use candle_transformers::models::prefill_utils::{
+    paged_decode_attn, paged_prefill_batched, paged_prefill_kv_stage,
+};
 use candle_transformers::models::qsa_selection::QsaSelection;
 use candle_transformers::models::qwen4exp::qsa_select::{entry_block, pack_entry, DENSE_ROW};
-use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
+use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule, Rung};
 use candle_transformers::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
 use candle_transformers::models::slot_state::{
     tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
@@ -267,7 +269,23 @@ fn seal_history(
     slot: usize,
     device: &Device,
 ) -> Result<(KvCache, Vec<FormatBandCount>)> {
-    let policy = CompressionPolicy::new(level);
+    seal_history_with(
+        backing,
+        history,
+        &CompressionPolicy::new(level),
+        slot,
+        device,
+    )
+}
+
+/// [`seal_history`] through `policy` rather than a level's production one.
+fn seal_history_with(
+    backing: &ChunkedKvBacking,
+    history: usize,
+    policy: &CompressionPolicy,
+    slot: usize,
+    device: &Device,
+) -> Result<(KvCache, Vec<FormatBandCount>)> {
     // The history alone: launches against the float slot have appended past
     // it, and a history off the chunk grid seals as a partial chunk — the
     // gap shape every turn boundary leaves behind.
@@ -279,7 +297,7 @@ fn seal_history(
     };
     let mut pinned: Option<PinnedBuf> = None;
     let warm =
-        quantize_sealed_in_place(backing, &[&src], &policy, device, &copy_stream, &mut pinned)?;
+        quantize_sealed_in_place(backing, &[&src], policy, device, &copy_stream, &mut pinned)?;
     copy_stream
         .synchronize()
         .map_err(|e| candle::Error::Msg(format!("seal sync: {e}")))?;
@@ -1909,14 +1927,18 @@ fn prefill_verify_window_honours_selection_at_32k() -> Result<()> {
 /// A speculative step verifies five rows per attention layer; the selection
 /// keeps each row's read at the budget whatever the depth, so the launch should
 /// cost a few decode rows' worth and stay flat in depth. The timed call is the
-/// prefill wrapper the layer launches.
+/// prefill wrapper the layer launches, host-timed, so it carries the wrapper's
+/// own host work; the attention kernel's device time is read from a profile of
+/// this run (`nsys profile -t cuda`, then the per-launch durations of
+/// `paged_prefill_int8_kernel`). Each geometry runs its four columns in the
+/// order printed, `WARM + ITERS` launches each, and its launches have a grid
+/// of their own — hpg 8 splits 2×2×55, hpg 12 3×2×36 on a 110-SM card — so a
+/// profile's launches group by grid and then by position.
 #[test]
 #[ignore = "microbenchmark; run with: cargo test --release --features cuda \
             -p candle-transformers --test qsa_kernel_tests \
             bench_verify_window_cost -- --ignored --nocapture"]
 fn bench_verify_window_cost() -> Result<()> {
-    use std::time::Instant;
-
     let _guard = gpu_serial();
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
@@ -1925,9 +1947,24 @@ fn bench_verify_window_cost() -> Result<()> {
             return Ok(());
         }
     };
-    let g = FLASH_NEXT;
     let stager = PinnedStager::new_from_device(&device);
-    let rope = rope_of(g, &device)?;
+    // Both GQA groupings the checkpoint family runs: 16 query heads (hpg 8, a
+    // prefill block packs four tokens) and 24 (hpg 12, two tokens).
+    for (geometry, g) in [("hpg 8", FLASH_NEXT), ("hpg 12", FLASH_NEXT_HPG12)] {
+        bench_verify_window_geometry(geometry, g, stager.clone(), device.clone())?;
+    }
+    Ok(())
+}
+
+/// [`bench_verify_window_cost`]'s table for one geometry.
+fn bench_verify_window_geometry(
+    geometry: &str,
+    g: Geom,
+    stager: PinnedStager,
+    device: Device,
+) -> Result<()> {
+    use std::time::Instant;
+
     const Q_LEN: usize = 5;
     const TOP_K: usize = 2048;
     const WARM: usize = 5;
@@ -1940,9 +1977,10 @@ fn bench_verify_window_cost() -> Result<()> {
     // selected block to its position through the page table. 146 tokens is
     // 36 whole blocks and a short one of 2 cells.
     const PIECE: usize = 146;
+    let rope = rope_of(g, &device)?;
     println!(
-        "\n  history   rows   bf16 us/launch   sealed-C{SEAL_LEVEL} us/launch   \
-         sealed-C{SEAL_LEVEL} paged us/launch"
+        "\n  {geometry}\n  history   rows   bf16 us/launch   bf16 dense us/launch   \
+         sealed-C{SEAL_LEVEL} us/launch   sealed-C{SEAL_LEVEL} paged us/launch"
     );
     // Whole numbers of pieces; the deepest rung is a projected conversation's
     // measured depth in zend (a fresh dialogue turn materialised ~295K tokens).
@@ -1966,50 +2004,55 @@ fn bench_verify_window_cost() -> Result<()> {
             .map(|t| paged_budget_row(&layout, history + t + 1, TOP_K, t & 1))
             .collect();
         let paged_sel = paged_selection(&layout, &paged_rows, &device)?;
-        let time_slot = |slot: usize, cache: &mut KvCache, sel: &QsaSelection| -> Result<f64> {
-            let mut launch = || -> Result<()> {
-                backing.truncate_sequence_to_tokens(slot, history)?;
-                backing.ensure_for_batch_entries(&[(slot, history)], Q_LEN)?;
-                let generation = stager.begin_generation();
-                let mut caches_arr: [&mut KvCache; 1] = [&mut *cache];
-                paged_prefill_batched(
-                    None,
-                    &mut caches_arr[..],
-                    &[history],
-                    &q,
-                    &k,
-                    &v,
-                    1,
-                    &[Q_LEN],
-                    g.n_head,
-                    g.n_kv_head,
-                    g.head_dim,
-                    None,
-                    &rope,
-                    false,
-                    &generation,
-                    &std::cell::RefCell::new(None),
-                    Some(sel),
-                )?;
-                Ok(())
+        let time_slot =
+            |slot: usize, cache: &mut KvCache, sel: Option<&QsaSelection>| -> Result<f64> {
+                let mut launch = || -> Result<()> {
+                    backing.truncate_sequence_to_tokens(slot, history)?;
+                    backing.ensure_for_batch_entries(&[(slot, history)], Q_LEN)?;
+                    let generation = stager.begin_generation();
+                    let mut caches_arr: [&mut KvCache; 1] = [&mut *cache];
+                    paged_prefill_batched(
+                        None,
+                        &mut caches_arr[..],
+                        &[history],
+                        &q,
+                        &k,
+                        &v,
+                        1,
+                        &[Q_LEN],
+                        g.n_head,
+                        g.n_kv_head,
+                        g.head_dim,
+                        None,
+                        &rope,
+                        false,
+                        &generation,
+                        &std::cell::RefCell::new(None),
+                        sel,
+                    )?;
+                    Ok(())
+                };
+                for _ in 0..WARM {
+                    launch()?;
+                }
+                device.synchronize()?;
+                let t0 = Instant::now();
+                for _ in 0..ITERS {
+                    launch()?;
+                }
+                device.synchronize()?;
+                Ok(t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64)
             };
-            for _ in 0..WARM {
-                launch()?;
-            }
-            device.synchronize()?;
-            let t0 = Instant::now();
-            for _ in 0..ITERS {
-                launch()?;
-            }
-            device.synchronize()?;
-            Ok(t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64)
-        };
-        let us = time_slot(0, &mut cache, &sel)?;
-        // Sealing records slot 0's chunks, so it runs after the float column.
+        let us = time_slot(0, &mut cache, Some(&sel))?;
+        let us_dense = time_slot(0, &mut cache, None)?;
+        // Sealing records slot 0's chunks, so it runs after the float columns.
         let (mut sealed, _) = seal_history(&backing, history, SEAL_LEVEL, 1, &device)?;
-        let us_sealed = time_slot(1, &mut sealed, &sel)?;
-        let us_paged = time_slot(1, &mut sealed, &paged_sel)?;
-        println!("  {history:>7}  {Q_LEN:>5}  {us:>15.1}  {us_sealed:>22.1}  {us_paged:>28.1}");
+        let us_sealed = time_slot(1, &mut sealed, Some(&sel))?;
+        let us_paged = time_slot(1, &mut sealed, Some(&paged_sel))?;
+        println!(
+            "  {history:>7}  {Q_LEN:>5}  {us:>15.1}  {us_dense:>21.1}  {us_sealed:>22.1}  \
+             {us_paged:>28.1}"
+        );
     }
     Ok(())
 }
@@ -2028,6 +2071,1023 @@ fn prefill_selected_walk_matches_masked_full_walk_at_hd128() -> Result<()> {
         4_096,
         0xA12,
     )
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Prefill output identity
+// ──────────────────────────────────────────────────────────────────────
+
+/// Qwen3.8-Flash-Next's prefill attention as the engine runs it: 24 query
+/// heads over 2 KV heads at head_dim 256 — `heads_per_group` 12, so a
+/// prefill block packs two query tokens.
+const FLASH_NEXT_HPG12: Geom = Geom {
+    n_head: 24,
+    n_kv_head: 2,
+    head_dim: 256,
+};
+
+/// The released checkpoint's indexer budget, for the output-identity cases.
+const GOLDEN_TOP_K: usize = 2048;
+
+/// FNV-1a over the bit pattern of every output element: two runs agree on
+/// this only if they agree on every bit.
+fn fnv1a(values: &[f32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in values {
+        for b in v.to_bits().to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// A slot with nothing in it yet, room for `tokens`: what a prompt prefilled
+/// from position 0 starts from.
+fn empty_slot(g: Geom, tokens: usize, device: &Device) -> Result<(ChunkedKvBacking, KvCache)> {
+    let blocks = MAX_BLOCKS.max(tokens.div_ceil(CHUNK_SIZE) + 2);
+    let backing = ChunkedKvBacking::new(4, g.n_kv_head, g.head_dim, DType::BF16, device, blocks)?;
+    let mut cache = KvCache::new(2, 64);
+    cache.force_dtype(DType::BF16);
+    cache.set_chunked_backing(&backing, 0, None)?;
+    Ok((backing, cache))
+}
+
+/// `history` tokens prefilled onto `slot` of `backing`, which must have room
+/// for them — [`build_history_slot`] for a slot other than the first, so two
+/// sequences of one backing can share a launch.
+#[allow(clippy::too_many_arguments)]
+fn history_on_slot(
+    g: Geom,
+    backing: &ChunkedKvBacking,
+    slot: usize,
+    history: usize,
+    seed: u64,
+    rope: &RopeRungs,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<KvCache> {
+    let (k, v) = make_kv_at(g, 0, history, seed, &[], device)?;
+    prefill_history(g, backing, slot, &k, &v, rope, stager, device)
+}
+
+/// `k`/`v` (packed `[history, n_kv_head, head_dim]`) prefilled onto `slot`
+/// of `backing` as its history.
+#[allow(clippy::too_many_arguments)]
+fn prefill_history(
+    g: Geom,
+    backing: &ChunkedKvBacking,
+    slot: usize,
+    k: &Tensor,
+    v: &Tensor,
+    rope: &RopeRungs,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<KvCache> {
+    let history = k.dim(0)?;
+    let mut cache = KvCache::new(2, 64);
+    cache.force_dtype(DType::BF16);
+    cache.set_chunked_backing(backing, slot, None)?;
+    backing.ensure_for_batch_entries(&[(slot, 0)], history)?;
+    let q = Tensor::zeros((history, g.n_head, g.head_dim), DType::BF16, device)?;
+    let generation = stager.begin_generation();
+    {
+        let mut caches_arr: [&mut KvCache; 1] = [&mut cache];
+        let _ = paged_prefill_batched(
+            None,
+            &mut caches_arr[..],
+            &[0],
+            &q,
+            k,
+            v,
+            1,
+            &[history],
+            g.n_head,
+            g.n_kv_head,
+            g.head_dim,
+            None,
+            rope,
+            false,
+            &generation,
+            &std::cell::RefCell::new(None),
+            None,
+        )?;
+    }
+    cache.set_current_seq_len(history)?;
+    Ok(cache)
+}
+
+/// One prefill launch of `q_len` tokens following `history` on `slot`,
+/// through `sel`, and the output's values. The slot is cut back to `history`
+/// first, so a launch repeated on one cache prefills at the same offset.
+#[allow(clippy::too_many_arguments)]
+fn prefill_bits(
+    g: Geom,
+    backing: &ChunkedKvBacking,
+    cache: &mut KvCache,
+    slot: usize,
+    history: usize,
+    q_len: usize,
+    seed: u64,
+    sel: Option<&QsaSelection>,
+    rope: &RopeRungs,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<Vec<f32>> {
+    let (q, k, v) = make_qkv_at(g, history, q_len, seed, &[], device)?;
+    backing.truncate_sequence_to_tokens(slot, history)?;
+    backing.ensure_for_batch_entries(&[(slot, history)], q_len)?;
+    let generation = stager.begin_generation();
+    let out = {
+        let mut caches_arr: [&mut KvCache; 1] = [cache];
+        paged_prefill_batched(
+            None,
+            &mut caches_arr[..],
+            &[history],
+            &q,
+            &k,
+            &v,
+            1,
+            &[q_len],
+            g.n_head,
+            g.n_kv_head,
+            g.head_dim,
+            None,
+            rope,
+            false,
+            &generation,
+            &std::cell::RefCell::new(None),
+            sel,
+        )?
+    };
+    let out = bits(&out.to_owned_tensor()?)?;
+    assert_eq!(out.len(), q_len * g.n_head * g.head_dim, "output shape");
+    Ok(out)
+}
+
+/// [`budget_row`] for every query of a `q_len`-token chunk after `history`,
+/// neighbours at opposite phases — the way the indexer's rows fall.
+fn budget_selection(history: usize, q_len: usize, device: &Device) -> Result<QsaSelection> {
+    let rows: Vec<Vec<u32>> = (0..q_len)
+        .map(|t| budget_row(history + t + 1, GOLDEN_TOP_K, t & 1).0)
+        .collect();
+    selection(&rows, device)
+}
+
+/// What the device is, or `None` (and a skip line) without one.
+fn cuda_device() -> Option<Device> {
+    match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => Some(d),
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            None
+        }
+    }
+}
+
+/// The prefill output of one launch, pinned to the bit by its checksum.
+/// Whatever path a launch's columns take into the tile, the tile they make —
+/// and so every bit after it — must not move.
+fn assert_golden(what: &str, out: &[f32], want: u64) {
+    let got = fnv1a(out);
+    assert!(
+        out.iter().all(|x| x.is_finite()),
+        "{what}: a non-finite output"
+    );
+    assert_eq!(
+        got, want,
+        "{what}: output checksum {got:#018x}, golden {want:#018x} — the prefill output moved"
+    );
+}
+
+/// A prompt prefilled from position 0: 4,096 rows, every row dense, so every
+/// block walks the causal prefix tile by tile.
+#[test]
+fn prefill_output_golden_prefix0_dense_4k() -> Result<()> {
+    let _guard = gpu_serial();
+    let Some(device) = cuda_device() else {
+        return Ok(());
+    };
+    let g = FLASH_NEXT_HPG12;
+    const Q_LEN: usize = 4096;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    let (backing, mut cache) = empty_slot(g, Q_LEN, &device)?;
+    let out = prefill_bits(
+        g, &backing, &mut cache, 0, 0, Q_LEN, 0x6A01, None, &rope, &stager, &device,
+    )?;
+    assert_golden("prefix 0, 4,096 dense rows", &out, 0x84ed_1dd9_2712_32ed);
+    Ok(())
+}
+
+/// A prefix off the four-position grid, dense: the quad of columns that holds
+/// the prefix's last positions holds the chunk's first ones too.
+#[test]
+fn prefill_output_golden_odd_prefix_dense() -> Result<()> {
+    let _guard = gpu_serial();
+    let Some(device) = cuda_device() else {
+        return Ok(());
+    };
+    let g = FLASH_NEXT_HPG12;
+    const HISTORY: usize = 1002;
+    const Q_LEN: usize = 512;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    let (backing, mut cache) = build_history_slot(
+        g,
+        HISTORY,
+        0x6A02,
+        &none_alt(HISTORY),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    let out = prefill_bits(
+        g, &backing, &mut cache, 0, HISTORY, Q_LEN, 0x6A02, None, &rope, &stager, &device,
+    )?;
+    assert_golden("history 1,002, 512 dense rows", &out, 0xf8ee_6633_206b_04dc);
+    Ok(())
+}
+
+/// A 2,048-row chunk over 8K of history through the released budget.
+#[test]
+fn prefill_output_golden_8k_selected() -> Result<()> {
+    let _guard = gpu_serial();
+    let Some(device) = cuda_device() else {
+        return Ok(());
+    };
+    let g = FLASH_NEXT_HPG12;
+    const HISTORY: usize = 8192;
+    const Q_LEN: usize = 2048;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    let (backing, mut cache) = build_history_slot(
+        g,
+        HISTORY,
+        0x6A03,
+        &none_alt(HISTORY),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    let sel = budget_selection(HISTORY, Q_LEN, &device)?;
+    let out = prefill_bits(
+        g,
+        &backing,
+        &mut cache,
+        0,
+        HISTORY,
+        Q_LEN,
+        0x6A03,
+        Some(&sel),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    assert_golden(
+        "history 8K, 2,048 selected rows",
+        &out,
+        0x47d0_50ae_5abe_eca8,
+    );
+    Ok(())
+}
+
+/// A 2,048-row chunk over 32K of history through the released budget.
+#[test]
+fn prefill_output_golden_32k_selected() -> Result<()> {
+    let _guard = gpu_serial();
+    let Some(device) = cuda_device() else {
+        return Ok(());
+    };
+    let g = FLASH_NEXT_HPG12;
+    const HISTORY: usize = 32_768;
+    const Q_LEN: usize = 2048;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    let (backing, mut cache) = build_history_slot(
+        g,
+        HISTORY,
+        0x6A04,
+        &none_alt(HISTORY),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    let sel = budget_selection(HISTORY, Q_LEN, &device)?;
+    let out = prefill_bits(
+        g,
+        &backing,
+        &mut cache,
+        0,
+        HISTORY,
+        Q_LEN,
+        0x6A04,
+        Some(&sel),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    assert_golden(
+        "history 32K, 2,048 selected rows",
+        &out,
+        0xd5f4_92f1_cf87_1eae,
+    );
+    Ok(())
+}
+
+/// The 8K case over the history the session seals at depth: quant palettes,
+/// outer scales and routed dims, decoded through the quad and element paths.
+#[test]
+fn prefill_output_golden_8k_sealed_selected() -> Result<()> {
+    let _guard = gpu_serial();
+    let Some(device) = cuda_device() else {
+        return Ok(());
+    };
+    let g = FLASH_NEXT_HPG12;
+    const HISTORY: usize = 8192;
+    const Q_LEN: usize = 2048;
+    // The level the session seals at (`session.rs`).
+    const SEAL_LEVEL: u8 = 5;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    let (backing, _cache) = build_history_slot(
+        g,
+        HISTORY,
+        0x6A05,
+        &none_alt(HISTORY),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    let (mut sealed, formats) = seal_history(&backing, HISTORY, SEAL_LEVEL, 1, &device)?;
+    eprintln!("sealed formats (K, V) → bands: {formats:?}");
+    let sel = budget_selection(HISTORY, Q_LEN, &device)?;
+    let out = prefill_bits(
+        g,
+        &backing,
+        &mut sealed,
+        1,
+        HISTORY,
+        Q_LEN,
+        0x6A05,
+        Some(&sel),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    assert_golden(
+        "sealed history 8K, 2,048 selected rows",
+        &out,
+        0x8f28_b195_e505_1b95,
+    );
+    Ok(())
+}
+
+/// A bulk chunk through a page layout whose pieces end in short blocks, so
+/// selected blocks start off the four-position grid and a warp's columns
+/// start mid-quad.
+#[test]
+fn prefill_output_golden_paged_bulk() -> Result<()> {
+    let _guard = gpu_serial();
+    let Some(device) = cuda_device() else {
+        return Ok(());
+    };
+    let g = FLASH_NEXT_HPG12;
+    // 146 tokens is 36 whole blocks and a short one of 2 cells.
+    const PIECE: usize = 146;
+    const HISTORY: usize = 14 * PIECE;
+    const Q_LEN: usize = 256;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    let (backing, mut cache) = build_history_slot(
+        g,
+        HISTORY,
+        0x6A06,
+        &none_alt(HISTORY),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    let layout = piece_layout(HISTORY, PIECE);
+    let rows: Vec<Vec<u32>> = (0..Q_LEN)
+        .map(|t| paged_budget_row(&layout, HISTORY + t + 1, GOLDEN_TOP_K / 4, t & 1))
+        .collect();
+    let sel = paged_selection(&layout, &rows, &device)?;
+    let out = prefill_bits(
+        g,
+        &backing,
+        &mut cache,
+        0,
+        HISTORY,
+        Q_LEN,
+        0x6A06,
+        Some(&sel),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    assert_golden(
+        "paged history 2,044, 256 selected rows",
+        &out,
+        0xe6de_568c_7761_a93b,
+    );
+    Ok(())
+}
+
+/// What a verify-window golden reads its history through.
+#[derive(Clone, Copy)]
+enum VerifySel {
+    /// The released budget over a prefix held in one piece.
+    Budget,
+    /// The released budget through a projected prefix's page layout — pieces of
+    /// [`VERIFY_PIECE`] tokens, each ending in a short block.
+    Paged,
+    /// No selection: every row reads its whole causal prefix, so the split
+    /// shards deal tiles round-robin instead of seeking to a range.
+    Dense,
+}
+
+/// 36 whole blocks and a short one of 2 cells.
+const VERIFY_PIECE: usize = 146;
+
+/// A verify window — five rows over a deep prefix: the launch shape that reads
+/// its few columns straight from the arena, split across the card. `sealed`
+/// runs it over the history the session seals at depth.
+fn verify_window_bits(
+    history: usize,
+    seed: u64,
+    sealed: bool,
+    kind: VerifySel,
+) -> Result<Option<Vec<f32>>> {
+    let _guard = gpu_serial();
+    let Some(device) = cuda_device() else {
+        return Ok(None);
+    };
+    let g = FLASH_NEXT_HPG12;
+    const Q_LEN: usize = 5;
+    const SEAL_LEVEL: u8 = 5;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    let (backing, cache) = build_history_slot(
+        g,
+        history,
+        seed,
+        &none_alt(history),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    let sel = match kind {
+        VerifySel::Budget => Some(budget_selection(history, Q_LEN, &device)?),
+        VerifySel::Paged => {
+            let layout = piece_layout(history, VERIFY_PIECE);
+            let rows: Vec<Vec<u32>> = (0..Q_LEN)
+                .map(|t| paged_budget_row(&layout, history + t + 1, GOLDEN_TOP_K, t & 1))
+                .collect();
+            Some(paged_selection(&layout, &rows, &device)?)
+        }
+        VerifySel::Dense => None,
+    };
+    let (mut cache, slot) = if sealed {
+        (
+            seal_history(&backing, history, SEAL_LEVEL, 1, &device)?.0,
+            1,
+        )
+    } else {
+        (cache, 0)
+    };
+    let out = prefill_bits(
+        g,
+        &backing,
+        &mut cache,
+        slot,
+        history,
+        Q_LEN,
+        seed,
+        sel.as_ref(),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    Ok(Some(out))
+}
+
+/// The SM count the verify-window goldens were recorded on (RTX PRO 5000).
+///
+/// A 5-row verify window fills too few blocks to cover the card, so the
+/// launcher splits its walk across shards sized from the SM count — and the
+/// shard ranges and the combine over them are part of the arithmetic. Another
+/// card's split gives other bits from the same kernel, so these goldens hold
+/// on the card that recorded them and print the checksum anywhere else.
+const VERIFY_GOLDEN_SMS: usize = 110;
+
+/// [`assert_golden`] for a split verify window: asserted on a card with
+/// [`VERIFY_GOLDEN_SMS`] SMs, printed for capture on any other.
+fn assert_verify_golden(what: &str, out: &[f32], want: u64) -> Result<()> {
+    let Device::Cuda(dev) = Device::new_cuda(0)? else {
+        unreachable!("a CUDA test")
+    };
+    let sms = dev.multiprocessor_count()?;
+    if sms != VERIFY_GOLDEN_SMS {
+        eprintln!(
+            "{what}: {sms} SMs split the walk differently from the recording card's \
+             {VERIFY_GOLDEN_SMS}; checksum here {:#018x}, not asserted",
+            fnv1a(out)
+        );
+        return Ok(());
+    }
+    assert_golden(what, out, want);
+    Ok(())
+}
+
+#[test]
+fn prefill_output_golden_verify_window_float() -> Result<()> {
+    if let Some(out) = verify_window_bits(4096 + 100, 0x6A07, false, VerifySel::Budget)? {
+        assert_verify_golden(
+            "verify window over float history",
+            &out,
+            0x4891_7f48_acee_558a,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prefill_output_golden_verify_window_sealed() -> Result<()> {
+    if let Some(out) = verify_window_bits(4096 + 100, 0x6A07, true, VerifySel::Budget)? {
+        assert_verify_golden(
+            "verify window over sealed history",
+            &out,
+            0xdc29_8a18_4966_5563,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prefill_output_golden_verify_window_float_32k() -> Result<()> {
+    if let Some(out) = verify_window_bits(32_768 + 100, 0x6A08, false, VerifySel::Budget)? {
+        assert_verify_golden(
+            "verify window over 32K float history",
+            &out,
+            0xe6fd_6c31_9033_e1ee,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prefill_output_golden_verify_window_sealed_32k() -> Result<()> {
+    if let Some(out) = verify_window_bits(32_768 + 100, 0x6A08, true, VerifySel::Budget)? {
+        assert_verify_golden(
+            "verify window over 32K sealed history",
+            &out,
+            0xdd44_1a99_f45f_2bb7,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prefill_output_golden_verify_window_paged_sealed_4k() -> Result<()> {
+    if let Some(out) = verify_window_bits(28 * VERIFY_PIECE, 0x6A09, true, VerifySel::Paged)? {
+        assert_verify_golden(
+            "verify window over 4K paged sealed history",
+            &out,
+            0x68af_ef5d_cd5d_4918,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prefill_output_golden_verify_window_paged_sealed_128k() -> Result<()> {
+    if let Some(out) = verify_window_bits(898 * VERIFY_PIECE, 0x6A0A, true, VerifySel::Paged)? {
+        assert_verify_golden(
+            "verify window over 128K paged sealed history",
+            &out,
+            0x595b_cc27_e065_ae7f,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prefill_output_golden_verify_window_dense_float() -> Result<()> {
+    if let Some(out) = verify_window_bits(4096 + 100, 0x6A0B, false, VerifySel::Dense)? {
+        assert_verify_golden(
+            "verify window over dense float history",
+            &out,
+            0x3552_f84d_c730_38ca,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prefill_output_golden_verify_window_dense_sealed() -> Result<()> {
+    if let Some(out) = verify_window_bits(4096 + 100, 0x6A0B, true, VerifySel::Dense)? {
+        assert_verify_golden(
+            "verify window over dense sealed history",
+            &out,
+            0x5a77_bc28_d29f_3a5a,
+        )?;
+    }
+    Ok(())
+}
+
+/// **Two sequences in one bulk launch answer exactly what each answers alone.**
+///
+/// A ragged launch packs both sequences' rows; each block serves one
+/// sequence, rotates by that sequence's own rung and reads that sequence's
+/// own prefix, so nothing of one may reach the other. Prefixes off the
+/// four-position grid and on different rungs, with and without a selection.
+/// Bit for bit: every launch's grid covers the SMs, so none splits its walk.
+#[test]
+fn ragged_bulk_launch_matches_single_launches() -> Result<()> {
+    let _guard = gpu_serial();
+    let Some(device) = cuda_device() else {
+        return Ok(());
+    };
+    let g = FLASH_NEXT_HPG12;
+    let stager = PinnedStager::new_from_device(&device);
+    // Two rungs: the trained RoPE up to 1,024 positions, ×4 past it.
+    let rope = RopeRungs::new(
+        &RopeSchedule::yarn(
+            g.head_dim,
+            10_000.0,
+            1024,
+            vec![
+                Rung {
+                    ceiling: 1024,
+                    factor: 1.0,
+                },
+                Rung {
+                    ceiling: 65_536,
+                    factor: 4.0,
+                },
+            ],
+            false,
+        )?,
+        &device,
+    )?;
+    const HISTORY: [usize; 2] = [102, 2001];
+    const Q_LEN: [usize; 2] = [300, 256];
+    const SEED: [u64; 2] = [0x6B01, 0x6B02];
+    assert_ne!(
+        rope.rung_for(HISTORY[0] + Q_LEN[0])?,
+        rope.rung_for(HISTORY[1] + Q_LEN[1])?,
+        "the two sequences must rotate on different rungs"
+    );
+    let blocks = MAX_BLOCKS.max((HISTORY[1] + Q_LEN[1]).div_ceil(CHUNK_SIZE) + 2);
+    let backing = ChunkedKvBacking::new(4, g.n_kv_head, g.head_dim, DType::BF16, &device, blocks)?;
+    let mut c0 = history_on_slot(g, &backing, 0, HISTORY[0], SEED[0], &rope, &stager, &device)?;
+    let mut c1 = history_on_slot(g, &backing, 1, HISTORY[1], SEED[1], &rope, &stager, &device)?;
+
+    let (q0, k0, v0) = make_qkv_at(g, HISTORY[0], Q_LEN[0], SEED[0], &[], &device)?;
+    let (q1, k1, v1) = make_qkv_at(g, HISTORY[1], Q_LEN[1], SEED[1], &[], &device)?;
+    let q = Tensor::cat(&[&q0, &q1], 0)?;
+    let k = Tensor::cat(&[&k0, &k1], 0)?;
+    let v = Tensor::cat(&[&v0, &v1], 0)?;
+    let row_len = g.n_head * g.head_dim;
+
+    let sel_rows: Vec<Vec<u32>> = (0..2)
+        .flat_map(|s| {
+            (0..Q_LEN[s]).map(move |t| budget_row(HISTORY[s] + t + 1, GOLDEN_TOP_K / 4, t & 1).0)
+        })
+        .collect();
+    let single_sel: [Vec<Vec<u32>>; 2] =
+        [sel_rows[..Q_LEN[0]].to_vec(), sel_rows[Q_LEN[0]..].to_vec()];
+
+    for selected in [false, true] {
+        let joint_sel = if selected {
+            Some(selection(&sel_rows, &device)?)
+        } else {
+            None
+        };
+        backing.truncate_sequence_to_tokens(0, HISTORY[0])?;
+        backing.truncate_sequence_to_tokens(1, HISTORY[1])?;
+        backing.ensure_for_batch_entries(&[(0, HISTORY[0])], Q_LEN[0])?;
+        backing.ensure_for_batch_entries(&[(1, HISTORY[1])], Q_LEN[1])?;
+        let generation = stager.begin_generation();
+        let joint = {
+            let mut caches_arr: [&mut KvCache; 2] = [&mut c0, &mut c1];
+            paged_prefill_batched(
+                None,
+                &mut caches_arr[..],
+                &HISTORY,
+                &q,
+                &k,
+                &v,
+                2,
+                &Q_LEN,
+                g.n_head,
+                g.n_kv_head,
+                g.head_dim,
+                None,
+                &rope,
+                false,
+                &generation,
+                &std::cell::RefCell::new(None),
+                joint_sel.as_ref(),
+            )?
+        };
+        let joint = bits(&joint.to_owned_tensor()?)?;
+        let caches: [&mut KvCache; 2] = [&mut c0, &mut c1];
+        for (s, cache) in caches.into_iter().enumerate() {
+            let sel = if selected {
+                Some(selection(&single_sel[s], &device)?)
+            } else {
+                None
+            };
+            let alone = prefill_bits(
+                g,
+                &backing,
+                cache,
+                s,
+                HISTORY[s],
+                Q_LEN[s],
+                SEED[s],
+                sel.as_ref(),
+                &rope,
+                &stager,
+                &device,
+            )?;
+            let start = if s == 0 { 0 } else { Q_LEN[0] * row_len };
+            assert!(
+                joint[start..start + Q_LEN[s] * row_len] == alone[..],
+                "sequence {s} (selected: {selected}) answered differently in the ragged launch \
+                 than alone"
+            );
+        }
+    }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// K/V pre-staging
+// ──────────────────────────────────────────────────────────────────────
+
+/// Window `w`'s scale exponent in the staging oracle's K: its absmax is
+/// `127 · 2^-k`, so the window's scale is exactly `2^-k` and every code is an
+/// exact product — nothing the device's fast-math division could round
+/// differently from the host's.
+fn stage_window_exp(w: usize) -> i32 {
+    7 + (w % 3) as i32
+}
+
+/// The staging oracle's K at token `t`, KV head `h`, dim `d` (head_dim 256,
+/// 16 rotary pairs — dims 0..16 rotate against 128..144, the rest are
+/// pass-through):
+///
+/// - dim 20 of every window, a pass-through dim: `±127 · 2^-k`, the window's
+///   absmax, which fixes its scale at `2^-k`;
+/// - a rotating pair: one side nonzero and the other zero, alternating by dim
+///   and token, so each rotated value is one rounded product whichever way a
+///   contraction fuses `l·c − h·s`;
+/// - every other dim: a whole number of `2^-k` steps under 60, so its code is
+///   that whole number.
+fn stage_k_value(t: usize, h: usize, d: usize) -> f32 {
+    let (w, i) = (d / 32, d % 32);
+    let unit = 2f32.powi(-stage_window_exp(w));
+    let absmax = 127.0 * unit;
+    if i == 20 {
+        return if (t + h).is_multiple_of(2) {
+            absmax
+        } else {
+            -absmax
+        };
+    }
+    if (w == 0 || w == 4) && i < 16 {
+        let lo_side = (i + t).is_multiple_of(2);
+        if lo_side != (w == 0) {
+            return 0.0;
+        }
+        // Under a quarter of its own window's absmax and so under half the
+        // partner window's: neither window's absmax moves when RoPE turns a
+        // value into the other.
+        return pseudo(t, h, d, 0x5A1) * absmax * 0.5;
+    }
+    (pseudo(t, h, d, 0x5A2) * 120.0).round().clamp(-60.0, 60.0) * unit
+}
+
+/// The staging oracle's packed K and V for tokens `base..base + n`, BF16.
+fn stage_kv_at(g: Geom, base: usize, n: usize, device: &Device) -> Result<(Tensor, Tensor)> {
+    let mut k = Vec::with_capacity(n * g.n_kv_head * g.head_dim);
+    let mut v = Vec::with_capacity(n * g.n_kv_head * g.head_dim);
+    for t in base..base + n {
+        for h in 0..g.n_kv_head {
+            for d in 0..g.head_dim {
+                k.push(stage_k_value(t, h, d));
+                v.push(pseudo(t, h, d, 0x5A3));
+            }
+        }
+    }
+    let shape = (n, g.n_kv_head, g.head_dim);
+    Ok((
+        Tensor::from_vec(k, shape, device)?.to_dtype(DType::BF16)?,
+        Tensor::from_vec(v, shape, device)?.to_dtype(DType::BF16)?,
+    ))
+}
+
+/// One staged row, computed on the host: K rotated at `pos` on `rung` (the
+/// half-split pairing, frequency `d` for the pair `(d, d + 128)`), quantised
+/// per 32-dim window against its absmax — `fma(x, 127 / absmax, 1.5·2^23)`'s
+/// low byte — with the scale as FP16 bits, and V as FP16 bits.
+fn stage_row_cpu(
+    k: &[f32],
+    v: &[f32],
+    pos: usize,
+    rung: u32,
+    rope: &RopeRungs,
+) -> (Vec<i8>, Vec<u16>, Vec<u16>) {
+    let hd = k.len();
+    let half = hd / 2;
+    let mut x = k.to_vec();
+    for d in 0..half {
+        let (c, s) = rope.cos_sin(rung, pos, d);
+        let (l, h) = (k[d], k[d + half]);
+        x[d] = l * c - h * s;
+        x[d + half] = l * s + h * c;
+    }
+    let mut codes = Vec::with_capacity(hd);
+    let mut scales = Vec::with_capacity(hd / 32);
+    for win in x.chunks(32) {
+        let a = win.iter().fold(0f32, |m, &e| m.max(e.abs()));
+        let scale = a / 127.0;
+        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        scales.push(half::f16::from_f32(scale).to_bits());
+        for &e in win {
+            codes.push((e.mul_add(inv, 12_582_912.0).to_bits() & 0xff) as u8 as i8);
+        }
+    }
+    let vbits = v
+        .iter()
+        .map(|&e| half::f16::from_f32(e).to_bits())
+        .collect();
+    (codes, scales, vbits)
+}
+
+/// **The pre-staging pass writes the bytes the attention kernel's own column
+/// decode writes**, pinned to a host port of that arithmetic over every
+/// position of a launch: a sealed history read through the quad decode (whole
+/// four-aligned quads in one slice) and the per-column decode (the quad that
+/// straddles the prefix), and the chunk's fresh tokens from the packed inputs
+/// — rotated by the sequence's own rung, not the first.
+///
+/// `quantized` seals the history as a C5 turn with K forced to Q8_0 and V to
+/// Q4_0 (unit outer scales, identity routing), so the decode reads quant
+/// blocks; otherwise it is the float arena the prefill writes.
+fn kv_stage_case(quantized: bool) -> Result<()> {
+    let _guard = gpu_serial();
+    let Some(device) = cuda_device() else {
+        return Ok(());
+    };
+    let g = FLASH_NEXT_HPG12;
+    // Off the four-position grid: the quad 36..39 holds two sealed and two
+    // fresh positions.
+    const HISTORY: usize = 38;
+    const Q_LEN: usize = 256;
+    let stager = PinnedStager::new_from_device(&device);
+    // 16 rotary pairs on two rungs: the trained RoPE to 128 positions, ×4 past.
+    let schedule = RopeSchedule::yarn(
+        32,
+        10_000.0,
+        128,
+        vec![
+            Rung {
+                ceiling: 128,
+                factor: 1.0,
+            },
+            Rung {
+                ceiling: 65_536,
+                factor: 4.0,
+            },
+        ],
+        false,
+    )?;
+    let rope = RopeRungs::new(&schedule, &device)?;
+    let rung = rope.rung_for(HISTORY + Q_LEN)?;
+    assert_eq!(rung, 1, "the launch must rotate on the second rung");
+
+    let (k_all, v_all) = stage_kv_at(g, 0, HISTORY + Q_LEN, &device)?;
+    let backing =
+        ChunkedKvBacking::new(4, g.n_kv_head, g.head_dim, DType::BF16, &device, MAX_BLOCKS)?;
+    let float = prefill_history(
+        g,
+        &backing,
+        0,
+        &k_all.narrow(0, 0, HISTORY)?.contiguous()?,
+        &v_all.narrow(0, 0, HISTORY)?.contiguous()?,
+        &rope,
+        &stager,
+        &device,
+    )?;
+    let (mut cache, slot) = if quantized {
+        let policy = CompressionPolicy::new(5)
+            .with_override_k_quant(Some(QuantFormat::Q8_0))
+            .with_override_v_quant(Some(QuantFormat::Q4_0));
+        let (sealed, formats) = seal_history_with(&backing, HISTORY, &policy, 1, &device)?;
+        assert!(
+            formats
+                .iter()
+                .all(|((k, v), _)| *k == ArenaFormatTag::Q8_0 && *v == ArenaFormatTag::Q4_0),
+            "the override seals K as Q8_0 and V as Q4_0, got {formats:?}"
+        );
+        (sealed, 1)
+    } else {
+        (float, 0)
+    };
+    backing.ensure_for_batch_entries(&[(slot, HISTORY)], Q_LEN)?;
+
+    // What the decode reads for each history position — the arena's values
+    // as the kernels see them — and the packed inputs for the chunk.
+    let (k_hist, v_hist) = backing.read_contiguous(slot, 0, HISTORY)?;
+    let hist = |t: &Tensor| -> Result<Vec<f32>> {
+        // [1, n_kv_head, HISTORY, hd] → per (head, position) rows.
+        t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+    };
+    let (k_hist, v_hist) = (hist(&k_hist)?, hist(&v_hist)?);
+    let k_flat = bits(&k_all)?;
+    let v_flat = bits(&v_all)?;
+    let hd = g.head_dim;
+    let row = |flat: &[f32], hist: &[f32], h: usize, p: usize| -> Vec<f32> {
+        if p < HISTORY {
+            hist[(h * HISTORY + p) * hd..(h * HISTORY + p + 1) * hd].to_vec()
+        } else {
+            flat[(p * g.n_kv_head + h) * hd..(p * g.n_kv_head + h + 1) * hd].to_vec()
+        }
+    };
+
+    let k_fresh = k_all.narrow(0, HISTORY, Q_LEN)?.contiguous()?;
+    let v_fresh = v_all.narrow(0, HISTORY, Q_LEN)?.contiguous()?;
+    let generation = stager.begin_generation();
+    let stage = {
+        let caches_arr: [&mut KvCache; 1] = [&mut cache];
+        paged_prefill_kv_stage(
+            &caches_arr[..],
+            &[HISTORY],
+            &k_fresh,
+            &v_fresh,
+            &[Q_LEN],
+            g.n_kv_head,
+            g.head_dim,
+            &rope,
+            false,
+            &generation,
+        )?
+    };
+    assert_eq!(stage.positions, HISTORY + Q_LEN, "one row per position");
+
+    let mut rotated = false;
+    for h in 0..g.n_kv_head {
+        for p in 0..HISTORY + Q_LEN {
+            let (k, v) = (row(&k_flat, &k_hist, h, p), row(&v_flat, &v_hist, h, p));
+            let (codes, scales, vbits) = stage_row_cpu(&k, &v, p, rung, &rope);
+            let what = format!("head {h} position {p} (quantized: {quantized})");
+            assert_eq!(stage.k_codes(h, p), &codes[..], "{what}: K codes");
+            assert_eq!(stage.k_scales(h, p), &scales[..], "{what}: K scales");
+            assert_eq!(stage.v(h, p), &vbits[..], "{what}: V");
+            // The raw bytes the construction fixes, whatever the port says:
+            // window scales 2^-7, 2^-8, 2^-9 (FP16 0x2000, 0x1c00, 0x1800), and
+            // the absmax dim at ±127.
+            for w in 0..hd / 32 {
+                let want_scale = [0x2000u16, 0x1c00, 0x1800][w % 3];
+                assert_eq!(
+                    stage.k_scales(h, p)[w],
+                    want_scale,
+                    "{what}: window {w} scale"
+                );
+                let want_code: i8 = if (p + h) % 2 == 0 { 127 } else { -127 };
+                assert_eq!(
+                    stage.k_codes(h, p)[32 * w + 20],
+                    want_code,
+                    "{what}: dim 20"
+                );
+            }
+            // The first rung would have rotated this position differently: the
+            // stage used the sequence's own.
+            if p > 0 {
+                let (rung0, _, _) = stage_row_cpu(&k, &v, p, 0, &rope);
+                rotated |= rung0 != codes;
+            }
+        }
+    }
+    assert!(
+        rotated,
+        "no position's codes depend on the rung — the case cannot tell the rungs apart"
+    );
+    Ok(())
+}
+
+#[test]
+fn kv_stage_matches_host_port_over_float_history() -> Result<()> {
+    kv_stage_case(false)
+}
+
+#[test]
+fn kv_stage_matches_host_port_over_quantized_history() -> Result<()> {
+    kv_stage_case(true)
 }
 
 // ──────────────────────────────────────────────────────────────────────

@@ -81,6 +81,10 @@ pub struct VerifyStash {
     pub layers: Vec<SpanOperands>,
     /// Per verifying sequence.
     pub spans: Vec<StashSpan>,
+    /// Spans the last [`Self::begin`] laid out. [`Self::remove`] leaves it
+    /// alone: it is the cohort the verify forward priced the replay's carves
+    /// from, and a rewind removes the spans it consumes before replaying them.
+    cohort: usize,
     /// Which recurrent layers this cohort's sweep has actually captured, by the
     /// same ordinal that indexes `layers`.
     ///
@@ -243,6 +247,7 @@ impl VerifyStash {
         Ok(Self {
             layers,
             spans: Vec::new(),
+            cohort: 0,
             filled: vec![false; n],
         })
     }
@@ -280,7 +285,14 @@ impl VerifyStash {
             });
             row += len;
         }
+        self.cohort = blocks.len();
         Ok(())
+    }
+
+    /// Spans the last [`Self::begin`] laid out, however many have since been
+    /// removed — the span count the verify forward priced the replay from.
+    pub fn cohort_spans(&self) -> usize {
+        self.cohort
     }
 
     /// This sequence's span, if the last verify wave stashed one for it.
@@ -544,11 +556,11 @@ fn replay_stacked(
         n_v_heads: dims.n_v_heads,
         layers: layer_indices.len(),
     };
-    let per = widths.replay_stack(rows, stash.spans.len());
+    let cohort = stash.cohort_spans();
+    let per = widths.replay_stack(rows, cohort);
     if per == 0 {
         candle::bail!(
-            "qwen35 verify replay: a {rows}-row stash over {} spans stacks no layer",
-            stash.spans.len()
+            "qwen35 verify replay: a {rows}-row stash over {cohort} spans stacks no layer"
         );
     }
     let spans: Vec<ReplaySpan> = short
@@ -692,6 +704,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **A rewind consumes its spans before it replays them**, so the cohort the
+    /// replay is sized from must outlive [`VerifyStash::remove`] — sizing from
+    /// the spans left read zero and refused every hybrid rewind.
+    #[test]
+    fn the_cohort_survives_the_rewind_removing_its_spans() {
+        let dims = DeltaNetDims {
+            head_dim: 4,
+            n_k_heads: 2,
+            n_v_heads: 4,
+            conv_kernel: 3,
+        };
+        let mut stash = VerifyStash::new(&[LayerKind::DeltaNet], &dims, 8, &Device::Cpu).unwrap();
+        assert_eq!(stash.cohort_spans(), 0);
+        stash.begin(&[(7, 3), (9, 2), (4, 1)]).unwrap();
+        assert_eq!(stash.cohort_spans(), 3);
+        for seq in [7, 9, 4] {
+            stash.remove(seq);
+        }
+        assert!(stash.is_unused());
+        assert_eq!(stash.cohort_spans(), 3);
+        stash.begin(&[(5, 4)]).unwrap();
+        assert_eq!(stash.cohort_spans(), 1);
     }
 
     #[test]

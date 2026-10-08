@@ -20,16 +20,18 @@ use super::compact_map::Replaced;
 use super::compact_plan::ArenaSlots;
 use super::fresh_arenas::FreshArenas;
 use super::head_gids::ChunkBands;
+use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
+use super::types::DecodeGpuChunksSyncKind;
 use super::{
     Arena, ArenaKey, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta,
     CompressionPolicy, GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
 };
 // Only the CUDA-gated compress-eligibility helper needs the sealed-sequence type.
-use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
 #[cfg(feature = "cuda")]
 use super::SealedSequence;
 use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, PerHeadEntry};
 use std::collections::HashSet;
+use std::time::Duration;
 
 use super::gid_pool::ChunkGid;
 // `N_PALETTE` is referenced by the intra-doc links throughout this file and by
@@ -405,10 +407,16 @@ pub struct DecodeGpuChunkSyncStats {
     pub reuses: u64,
     /// Slots whose stale writer region was re-serialised, then served.
     pub resyncs: u64,
+    /// Slots extended over appended chunks — their tail serialised, then
+    /// served.
+    pub extends: u64,
+    /// Entries those extends serialised, all slots together.
+    pub extend_entries: u64,
     pub empty: u64,
-    pub rebuild_time: std::time::Duration,
-    pub reuse_time: std::time::Duration,
-    pub resync_time: std::time::Duration,
+    pub rebuild_time: Duration,
+    pub reuse_time: Duration,
+    pub resync_time: Duration,
+    pub extend_time: Duration,
 }
 
 impl BackingInner {
@@ -1852,23 +1860,28 @@ impl ChunkedKvBacking {
                 synced
             } else {
                 pins.push(Arc::new(Vec::new()));
-                ((0, 0, 0), super::types::DecodeGpuChunksSyncKind::Empty)
+                ((0, 0, 0), DecodeGpuChunksSyncKind::Empty)
             };
             let elapsed = t_sync.elapsed();
             match sync_kind {
-                super::types::DecodeGpuChunksSyncKind::Rebuild => {
+                DecodeGpuChunksSyncKind::Rebuild => {
                     stats.rebuilds += 1;
                     stats.rebuild_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Reuse => {
+                DecodeGpuChunksSyncKind::Reuse => {
                     stats.reuses += 1;
                     stats.reuse_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Resync => {
+                DecodeGpuChunksSyncKind::Resync => {
                     stats.resyncs += 1;
                     stats.resync_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Empty => {
+                DecodeGpuChunksSyncKind::Extend { entries } => {
+                    stats.extends += 1;
+                    stats.extend_entries += entries as u64;
+                    stats.extend_time += elapsed;
+                }
+                DecodeGpuChunksSyncKind::Empty => {
                     stats.empty += 1;
                 }
             }
@@ -1936,23 +1949,28 @@ impl ChunkedKvBacking {
                 };
                 ((ptr, n_slices, write_slice), kind)
             } else {
-                ((0, 0, 0), super::types::DecodeGpuChunksSyncKind::Empty)
+                ((0, 0, 0), DecodeGpuChunksSyncKind::Empty)
             };
             let elapsed = t_sync.elapsed();
             match sync_kind {
-                super::types::DecodeGpuChunksSyncKind::Rebuild => {
+                DecodeGpuChunksSyncKind::Rebuild => {
                     stats.rebuilds += 1;
                     stats.rebuild_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Reuse => {
+                DecodeGpuChunksSyncKind::Reuse => {
                     stats.reuses += 1;
                     stats.reuse_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Resync => {
+                DecodeGpuChunksSyncKind::Resync => {
                     stats.resyncs += 1;
                     stats.resync_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Empty => {
+                DecodeGpuChunksSyncKind::Extend { entries } => {
+                    stats.extends += 1;
+                    stats.extend_entries += entries as u64;
+                    stats.extend_time += elapsed;
+                }
+                DecodeGpuChunksSyncKind::Empty => {
                     stats.empty += 1;
                 }
             }

@@ -707,16 +707,26 @@ struct ArenaPool {
     /// Bit `i` set ⇒ arena `i` has ≥1 free slot. `allocate_any` finds the
     /// lowest such arena via find-first-set instead of walking every arena.
     capacity: Arc<CapacityBitmap>,
-    /// Every arena below this index has no never-used tail left, so it can host
-    /// no run of any length — its high-water mark never retreats. A run claim
-    /// starts here instead of at the lowest arena, which keeps lowest-first
-    /// placement while skipping the exhausted prefix: that prefix is every arena
-    /// a wide prefill has already filled, and a chunk makes 2·n_kv_head run
-    /// claims, so walking it each time made a claim's cost grow with the arenas
-    /// in the pool. Lowered when an arena registers below it (a recycled index
-    /// is a fresh arena with a whole tail); only moved under the `tables` lock.
-    run_floor: AtomicUsize,
+    /// `run_floors[l]`: every arena below this index has a never-used tail
+    /// shorter than `l` slots, so it can host no run of `l` or more — its
+    /// high-water mark never retreats. A run claim of length `l` starts at
+    /// `run_floors[min(l, RUN_FLOOR_LENS − 1)]` instead of at the lowest arena,
+    /// which keeps lowest-first placement while skipping the prefix that cannot
+    /// serve it: that prefix is every arena a wide prefill has already filled,
+    /// and a chunk makes 2·n_kv_head run claims, so walking it each time made a
+    /// claim's cost grow with the arenas in the pool. One floor per length,
+    /// because an arena whose tail is a few slots short of a run — left behind
+    /// when single-slot claims have moved its high-water mark off the run grid —
+    /// stops a floor kept for "no tail at all" dead, and every run claim then
+    /// walked every arena past it. Lowered when an arena registers below them (a
+    /// recycled index is a fresh arena with a whole tail); only moved under the
+    /// `tables` lock.
+    run_floors: [AtomicUsize; RUN_FLOOR_LENS],
 }
+
+/// Run lengths with a floor of their own in [`ArenaPool::run_floors`]; a longer
+/// run starts from the last one's, which no longer run can be served below.
+const RUN_FLOOR_LENS: usize = 33;
 
 impl ArenaPool {
     fn new(class: SizeClass) -> Self {
@@ -736,8 +746,13 @@ impl ArenaPool {
             arena_chunks,
             alloc_gate: Mutex::new(()),
             capacity: Arc::new(CapacityBitmap::new()),
-            run_floor: AtomicUsize::new(0),
+            run_floors: std::array::from_fn(|_| AtomicUsize::new(0)),
         }
+    }
+
+    /// The floor a run of `len` slots starts its walk at.
+    fn run_floor(&self, len: usize) -> &AtomicUsize {
+        &self.run_floors[len.min(RUN_FLOOR_LENS - 1)]
     }
 
     /// Register a new arena with the pool — creates its refcount table.
@@ -752,8 +767,11 @@ impl ArenaPool {
         {
             let mut tables = self.tables.write().unwrap();
             tables.insert(arena_idx, Arc::clone(&table));
-            // A fresh arena has its whole tail: runs may land at or above it.
-            self.run_floor.fetch_min(arena_idx, Ordering::Relaxed);
+            // A fresh arena has its whole tail: runs of every length may land
+            // at or above it.
+            for floor in &self.run_floors {
+                floor.fetch_min(arena_idx, Ordering::Relaxed);
+            }
         }
         self.total_arenas.fetch_add(1, Ordering::Relaxed);
         // A fresh arena is all free — mark it available. Ordered after the
@@ -774,9 +792,13 @@ impl ArenaPool {
         let _gate = self.alloc_gate.lock().unwrap();
         let stride = GID_STRIDE;
         let tables = self.tables.read().unwrap();
-        let floor = self.run_floor.load(Ordering::Relaxed);
-        // The exhausted prefix grows as the walk passes arenas with no tail at
-        // all; it stops growing at the first arena that still has some.
+        let floor_len = len.min(RUN_FLOOR_LENS - 1);
+        let floor = self.run_floor(len).load(Ordering::Relaxed);
+        // The prefix that cannot serve this length grows as the walk passes
+        // arenas whose tail is too short for it, and stops at the first arena
+        // that could. Only `floor_len`'s floor moves: a tail too short for a
+        // longer run may still serve a shorter one, and one too short for a run
+        // past the last floor says nothing about that floor's length.
         let mut next_floor = floor;
         let mut prefix_exhausted = true;
         for (&arena_idx, table) in tables.range(floor..) {
@@ -785,17 +807,17 @@ impl ArenaPool {
                     if table.is_full() {
                         self.capacity.clear(arena_idx);
                     }
-                    self.run_floor.store(next_floor, Ordering::Relaxed);
+                    self.run_floors[floor_len].store(next_floor, Ordering::Relaxed);
                     return Some(((arena_idx * stride + first) as i64, Arc::clone(table)));
                 }
             }
-            if prefix_exhausted && !table.run_fits(1) {
+            if prefix_exhausted && !table.run_fits(floor_len) {
                 next_floor = arena_idx + 1;
             } else {
                 prefix_exhausted = false;
             }
         }
-        self.run_floor.store(next_floor, Ordering::Relaxed);
+        self.run_floors[floor_len].store(next_floor, Ordering::Relaxed);
         None
     }
 
@@ -1356,6 +1378,15 @@ impl ChunkGidPool {
         )
     }
 
+    /// The arena a run claim of `len` slots in `key`'s pool starts its walk at.
+    #[cfg(test)]
+    fn run_floor_for(&self, key: ArenaKey, len: usize) -> usize {
+        self.inner
+            .pools
+            .get(&key)
+            .map_or(0, |pool| pool.run_floor(len).load(Ordering::Relaxed))
+    }
+
     /// Whether a run of `len` consecutive slots could be claimed right now,
     /// **without claiming it**.
     ///
@@ -1369,7 +1400,7 @@ impl ChunkGidPool {
             return false;
         };
         let tables = pool.tables.read().unwrap();
-        let floor = pool.run_floor.load(Ordering::Relaxed);
+        let floor = pool.run_floor(len).load(Ordering::Relaxed);
         tables.range(floor..).any(|(_, t)| t.run_fits(len))
     }
 
@@ -1966,6 +1997,39 @@ mod tests {
             a,
             "and is reissued once released"
         );
+    }
+
+    /// **A tail too short for a run moves that run length's floor past it, and
+    /// only that length's.** Two arenas are left one slot short of empty; a run
+    /// of two lands in the third and the length-2 walk starts there from now on,
+    /// while a single slot still finds the lowest arena with one left. With one
+    /// floor kept for "no tail at all", the one-slot tails held it at the first
+    /// arena and every run claim walked the whole pool.
+    #[test]
+    fn a_short_tail_moves_only_its_run_lengths_floor() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        let cap = test_arena_chunks();
+        let a = pool.register_arena(key);
+        let b = pool.register_arena(key);
+        let c = pool.register_arena(key);
+
+        let fill_a = pool.allocate_run_for(key, cap - 1).unwrap();
+        assert!(fill_a.iter().all(|g| g.arena_idx() == a));
+        let fill_b = pool.allocate_run_for(key, cap - 1).unwrap();
+        assert!(fill_b.iter().all(|g| g.arena_idx() == b));
+
+        let pair = pool.allocate_run_for(key, 2).unwrap();
+        assert!(pair.iter().all(|g| g.arena_idx() == c));
+        assert_eq!(pool.run_floor_for(key, 2), c);
+        assert_eq!(pool.run_floor_for(key, 3), 0, "no length-3 walk ran");
+        assert_eq!(pool.run_floor_for(key, 1), 0);
+
+        let single = pool.allocate_run_for(key, 1).unwrap();
+        assert_eq!(single[0].arena_idx(), a);
+        let single = pool.allocate_run_for(key, 1).unwrap();
+        assert_eq!(single[0].arena_idx(), b);
+        assert_eq!(pool.run_floor_for(key, 1), b);
     }
 
     /// An arena that registers below the point the walk has passed is a fresh

@@ -32,6 +32,7 @@ use crate::working_set::{Limits, Refusal, WorkingSet};
 use candle::quantized::pinned_staging::release_recycled_wc;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
+use candle_transformers::models::delta_net::release_seal_readback;
 use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2418,8 +2419,11 @@ impl ConversationEngine {
         // The scheduler thread owned every sequence, so by its join each
         // `(layer, slot)` has handed its staging pair to the process-wide
         // recycler. Nothing of this engine will take them again; unpin them
-        // rather than leave them held for the life of the process.
+        // rather than leave them held for the life of the process. The same goes
+        // for the recurrent stores' seal readback buffer: the scheduler was the
+        // only thread that sealed.
         release_recycled_wc();
+        release_seal_readback();
         Ok(())
     }
 }

@@ -92,6 +92,8 @@ __device__ __forceinline__ int gemx_unpermute_64(int linear_idx) {
 // its split-K twin (three activation stages: 6 at Q8_KO). A 10-block register bound (48 regs)
 // buys them no occupancy and costs registers; 8 blocks leaves 64 at no occupancy cost.
 #define LAUNCH_BOUNDS_TC16_SMEM8 __launch_bounds__(128, 8)
+// The prefill-width int8 tiles (dense mode-4, grouped mode-4 / mode-8) take their bound from
+// `grouped_tc::wide_min_blocks` in kernel.cuh, per format and tile.
 #define LAUNCH_BOUNDS_TC32 __launch_bounds__(128, 8)  // 8 blocks/SM, ~15% faster FP8
 
 // =============================================================================

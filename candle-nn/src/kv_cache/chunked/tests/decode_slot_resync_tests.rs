@@ -24,7 +24,7 @@ use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use candle::{DType, Device, Tensor};
 
 use crate::kv_cache::chunked::gpu_test_lock::gpu_serial;
-use crate::kv_cache::{ChunkedKvBacking, KvCache};
+use crate::kv_cache::{ChunkedKvBacking, DecodeGpuChunkSyncStats, KvCache};
 
 const N_KV_HEAD: usize = 2;
 const HEAD_DIM: usize = 32;
@@ -272,8 +272,8 @@ fn a_commit_leaves_the_buffer_to_the_next_sync() {
 /// upload's event on the capturing thread invalidates the whole capture, which
 /// surfaced on Flash-Next's four-sequence gate as
 /// `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED` at the end of a draft walk: the
-/// prompt's rebuilds had overflowed the wave's ring into staging, and the walk's
-/// first chunk boundary cleared the buffer.
+/// prompt's rebuilds had overflowed the wave's ring into staging, and a mutation
+/// inside the walk cleared the buffer.
 #[test]
 fn a_fence_inside_a_recording_wave_leaves_the_capture_intact() {
     let _gpu = gpu_serial();
@@ -289,10 +289,12 @@ fn a_fence_inside_a_recording_wave_leaves_the_capture_intact() {
 
     let capture = cuda.begin_wave_capture().unwrap();
     cuda.record_launches().unwrap();
-    // Across the 32-token boundary: a new chunk, so the buffer clears and
-    // fences the staged upload.
+    // Across the 32-token boundary — an extend, recorded into the wave — and
+    // then a structural mutation, so the buffer clears and fences the staged
+    // upload while the wave records.
     let kv = write_kv_ahead(&mut cache, &dev, 8, 30);
     cache.commit_written_tokens(8, 30).unwrap();
+    backing.invalidate_decode_slot(seq);
     let (ptr, n_slices) = live_slot(&backing, seq, 38);
     capture.finish().unwrap();
 
@@ -583,4 +585,213 @@ fn a_snapshot_after_a_commit_carries_the_committed_lengths() {
     );
     drop(generation);
     drop(kv);
+}
+
+/// One slice header as the device holds it, `(offset, len, rope, kvheads_ptr)`,
+/// and the record its pointer names.
+#[derive(Debug, PartialEq)]
+struct Entry {
+    offset: u16,
+    len: u16,
+    rope: u32,
+    record: Vec<u8>,
+}
+
+/// Every entry of the slot at `ptr` as the device holds it, each record read
+/// through its own header's pointer, so two buffers in different slots compare
+/// equal exactly when they describe the same KV.
+fn slot_image(dev: &Device, ptr: u64, n_slices: usize, rec_bytes: usize) -> Vec<Entry> {
+    let Device::Cuda(cuda) = dev else {
+        unreachable!("a CUDA test");
+    };
+    let stream = cuda.cuda_stream();
+    let read = |at: u64, len: usize| -> Vec<u8> {
+        // SAFETY: `at` lies in a live slot buffer and `len` bytes from it are
+        // inside the entry or record being read.
+        let view: CudaSlice<u8> = unsafe { stream.upgrade_device_ptr::<u8>(at, len) };
+        let host = cuda.memcpy_dtov(&view).unwrap();
+        // A borrow of the buffer, not an owner: dropping it would free the slot.
+        std::mem::forget(view);
+        host
+    };
+    read(ptr, n_slices * SLICE_BYTES)
+        .chunks_exact(SLICE_BYTES)
+        .map(|h| {
+            let kvheads = u64::from_le_bytes(h[8..16].try_into().unwrap());
+            Entry {
+                offset: u16::from_le_bytes([h[0], h[1]]),
+                len: u16::from_le_bytes([h[2], h[3]]),
+                rope: u32::from_le_bytes(h[4..8].try_into().unwrap()),
+                record: read(kvheads, rec_bytes),
+            }
+        })
+        .collect()
+}
+
+/// The bytes of one inline record: the distance between two consecutive
+/// entries' records, which a float backing serialises side by side.
+fn inline_record_bytes(dev: &Device, ptr: u64) -> usize {
+    let Device::Cuda(cuda) = dev else {
+        unreachable!("a CUDA test");
+    };
+    let stream = cuda.cuda_stream();
+    // SAFETY: the slot holds at least two 16-byte headers.
+    let view: CudaSlice<u8> = unsafe { stream.upgrade_device_ptr::<u8>(ptr, 2 * SLICE_BYTES) };
+    let h = cuda.memcpy_dtov(&view).unwrap();
+    std::mem::forget(view);
+    let p0 = u64::from_le_bytes(h[8..16].try_into().unwrap());
+    let p1 = u64::from_le_bytes(h[24..32].try_into().unwrap());
+    assert!(p1 > p0, "two inline records, in entry order");
+    (p1 - p0) as usize
+}
+
+/// Sync the slot a decode step at `offset` reads, the way the decode metadata
+/// build does — ensure the write chunk, which pushes a fresh writer at a
+/// boundary, then sync — returning its pointer, count and how it was brought up
+/// to date.
+fn sync_at(
+    backing: &ChunkedKvBacking,
+    seq: usize,
+    offset: usize,
+) -> (u64, usize, DecodeGpuChunkSyncStats) {
+    backing.ensure_for_offset(seq, offset, 1).unwrap();
+    let info = backing.resolve_arena_info().unwrap();
+    let (ptrs, _, stats) = backing
+        .sync_decode_gpu_chunks(&[(seq, offset)], &info)
+        .unwrap();
+    (ptrs[0].0, ptrs[0].1 as usize, stats)
+}
+
+/// **A 32-token boundary extends the buffer in place, to the bytes a rebuild
+/// writes.** A sequence decoded across seven boundaries, synced after every
+/// block of eight tokens, rebuilds once — its first sync — and extends at each
+/// boundary into the same slot; then the buffer, entry for entry and record for
+/// record, is what a rebuild from the host state writes.
+#[test]
+fn a_chunk_boundary_extends_the_buffer_to_a_rebuilds_bytes() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    let (ptr, n, stats) = sync_at(&backing, seq, 8);
+    assert_eq!((n, stats.rebuilds, stats.extends), (1, 1, 0));
+
+    let (mut rebuilds, mut extends, mut entries) = (0, 0, 0);
+    for offset in (8..240).step_by(8) {
+        write_outside_decode(&mut cache, &dev, offset, 8);
+        let (p, _, stats) = sync_at(&backing, seq, offset + 8);
+        assert_eq!(p, ptr, "offset {offset}: the buffer left its slot");
+        rebuilds += stats.rebuilds;
+        extends += stats.extends;
+        entries += stats.extend_entries;
+    }
+    assert_eq!(
+        (rebuilds, extends, entries),
+        (0, 7, 14),
+        "every boundary from 32 to 224 extends — the filled writer and the \
+         fresh one, two entries each; none rebuilds"
+    );
+
+    let (ptr, n, _) = sync_at(&backing, seq, 240);
+    let rec = inline_record_bytes(&dev, ptr);
+    let extended = slot_image(&dev, ptr, n, rec);
+    let expected: Vec<(u16, u16, u32)> = (0..8)
+        .map(|i| (0, if i < 7 { 32 } else { 16 }, 32 * i))
+        .collect();
+    assert_eq!(
+        extended
+            .iter()
+            .map(|e| (e.offset, e.len, e.rope))
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    backing.invalidate_decode_slot(seq);
+    let (ptr, n, stats) = sync_at(&backing, seq, 240);
+    assert_eq!(stats.rebuilds, 1);
+    assert_eq!(extended, slot_image(&dev, ptr, n, rec));
+}
+
+/// **A commit at depth re-serialises the chunks it filled, not the sequence.**
+/// Eight full chunks are serialised; a 96-token block then fills the writer
+/// and two chunks pushed for it, and the decode step after it pushes a fresh
+/// writer. The extend starts at the chunk the commit filled first — the four
+/// entries 8..12 — where starting at the writer boundary (chunk 0, for a
+/// sequence written from its first token) would have re-serialised all
+/// twelve. The buffer is still byte-for-byte a rebuild's.
+#[test]
+fn a_commit_at_depth_extends_from_the_chunk_it_filled_first() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let backing = ChunkedKvBacking::new(1, N_KV_HEAD, HEAD_DIM, DType::F16, &dev, 1024).unwrap();
+    let seq = backing.alloc_sequence().unwrap();
+    let mut cache = KvCache::new(2, 1024);
+    cache.set_chunked_backing(&backing, seq, None).unwrap();
+
+    for offset in (0..256).step_by(32) {
+        write_outside_decode(&mut cache, &dev, offset, 32);
+        sync_at(&backing, seq, offset + 32);
+    }
+    let (_, n, _) = sync_at(&backing, seq, 256);
+    assert_eq!(n, 9, "eight full chunks and the writer pushed at 256");
+
+    write_outside_decode(&mut cache, &dev, 256, 96);
+    let (ptr, n, stats) = sync_at(&backing, seq, 352);
+    assert_eq!(n, 12);
+    assert_eq!(
+        (stats.rebuilds, stats.extends, stats.extend_entries),
+        (0, 1, 4),
+        "the extend re-serialised from chunk 8, the first the commit filled"
+    );
+
+    let rec = inline_record_bytes(&dev, ptr);
+    let extended = slot_image(&dev, ptr, n, rec);
+    backing.invalidate_decode_slot(seq);
+    let (ptr, n, _) = sync_at(&backing, seq, 352);
+    assert_eq!(extended, slot_image(&dev, ptr, n, rec));
+}
+
+/// An append past the layout's capacity rebuilds — the records cannot move
+/// under the entries already serialised — and the sync after it extends again
+/// in the wider slot. The capacity is the smallest slot class in entries of
+/// this backing's size.
+#[test]
+fn an_append_past_the_layout_rebuilds_into_a_wider_slot() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let backing = ChunkedKvBacking::new(1, N_KV_HEAD, HEAD_DIM, DType::F16, &dev, 4096).unwrap();
+    let seq = backing.alloc_sequence().unwrap();
+    let mut cache = KvCache::new(2, 4096);
+    cache.set_chunked_backing(&backing, seq, None).unwrap();
+
+    write_outside_decode(&mut cache, &dev, 0, 64);
+    let (ptr, _, _) = sync_at(&backing, seq, 64);
+    let entry_bytes = SLICE_BYTES + inline_record_bytes(&dev, ptr);
+    let capacity = 4096 / entry_bytes;
+
+    let mut offset = 64;
+    let mut seen = Vec::new();
+    while offset < 32 * (capacity + 2) {
+        write_outside_decode(&mut cache, &dev, offset, 32);
+        offset += 32;
+        let (_, n, stats) = sync_at(&backing, seq, offset);
+        seen.push((n, stats.rebuilds, stats.extends));
+    }
+    // Chunk `capacity + 1` is the first the 4 KiB class cannot hold.
+    for &(n, rebuilds, extends) in &seen {
+        let want = if n == capacity + 1 { (1, 0) } else { (0, 1) };
+        assert_eq!(
+            (rebuilds, extends),
+            want,
+            "at {n} chunks (capacity {capacity})"
+        );
+    }
+
+    let (ptr, n, _) = sync_at(&backing, seq, offset);
+    let rec = entry_bytes - SLICE_BYTES;
+    let extended = slot_image(&dev, ptr, n, rec);
+    backing.invalidate_decode_slot(seq);
+    let (ptr, n, _) = sync_at(&backing, seq, offset);
+    assert_eq!(extended, slot_image(&dev, ptr, n, rec));
 }

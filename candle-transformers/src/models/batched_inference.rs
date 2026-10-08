@@ -1318,11 +1318,13 @@ impl BatchedInferenceSession {
                 generation,
                 &snapshot_mask,
             )?;
-            // A resync is a reuse that first patched the writer region, so decode
-            // reads it as one.
-            slot_reuse_time += sync_stats.reuse_time + sync_stats.resync_time;
+            // A resync is a reuse that first patched the writer region, and an
+            // extend one that first serialised its appended tail, so decode
+            // reads both as one.
+            slot_reuse_time +=
+                sync_stats.reuse_time + sync_stats.resync_time + sync_stats.extend_time;
             slot_rebuild_time += sync_stats.rebuild_time;
-            saw_slot_reuse |= sync_stats.reuses + sync_stats.resyncs > 0;
+            saw_slot_reuse |= sync_stats.reuses + sync_stats.resyncs + sync_stats.extends > 0;
             saw_slot_rebuild |= sync_stats.rebuilds > 0;
 
             // Append this layer's headers (one `SlotHeader` per sequence; the
@@ -4145,24 +4147,35 @@ pub trait ManagedBatchedModel {
     }
 
     /// The wave transient tier a prefill of `rows` rows across `sequences`
-    /// would need, in bytes.
+    /// would need, in bytes, with `stage_positions` key positions pre-staged
+    /// ([`WaveWidth::kv_stage_positions`]).
     ///
     /// **The same function the tier is actually placed from**, not an estimate
     /// of it: admission judges an offer on the residency it dislodges, and the
     /// tier dislodges weights exactly as a region claim does. Pricing it any
     /// other way lets the two figures drift, and the one that drifts is the one
-    /// the placement then refuses.
+    /// the placement then refuses. The pre-stage is the one buffer priced by
+    /// depth rather than width — at 296K tokens of Flash-Next history ~460 MB a
+    /// layer's launch — so its positions come from the caller, who knows the
+    /// sequences' depths.
     ///
     /// The tier is superlinear in *spans*, not only in rows — the mixer's span
     /// tables hold an entry per span and the prefill scan's transients turn on
     /// with the first — so `sequences` is not decoration, and a caller that
     /// prices N admissions as N separate one-sequence waves understates the wave
     /// they compose.
-    fn wave_tier_bytes(&self, rows: usize, sequences: usize, act_dtype: DType) -> Option<u64> {
-        Some(
-            WavePlan::new(self.wave_geometry(act_dtype))
-                .tier_bytes(WaveWidth::prefill(rows, sequences.max(1))) as u64,
-        )
+    fn wave_tier_bytes(
+        &self,
+        rows: usize,
+        sequences: usize,
+        stage_positions: usize,
+        act_dtype: DType,
+    ) -> Option<u64> {
+        let width = WaveWidth {
+            kv_stage_positions: stage_positions,
+            ..WaveWidth::prefill(rows, sequences.max(1))
+        };
+        Some(WavePlan::new(self.wave_geometry(act_dtype)).tier_bytes(width) as u64)
     }
 
     /// Rows the KV side has room to admit, or `None` when it cannot say.

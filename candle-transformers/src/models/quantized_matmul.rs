@@ -484,18 +484,6 @@ impl QMatMul {
         Ok(out)
     }
 
-    /// [`Self::forward_dynamic`] on an int8 operand with the K split forced to `splits` — the
-    /// projection bench's sweep over what the split rule would choose.
-    #[cfg(feature = "cuda")]
-    pub fn forward_dynamic_split_k<'w>(
-        &self,
-        input: DynamicTensor<'_, 'w>,
-        out_dtype: DType,
-        splits: usize,
-    ) -> Result<LiveTensor<'w>> {
-        self.inner.forward_dynamic_split_k(input, out_dtype, splits)
-    }
-
     /// Dequantize the underlying tensor.
     /// This is primarily for testing/validation.
     pub fn dequantize(&self) -> Result<Tensor> {

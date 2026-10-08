@@ -40,6 +40,7 @@ pub use quantized::{
     QuantDeltaNetWeights,
 };
 pub use state_store::{
-    compact_stores, ExportedLayerState, RecurrentCompaction, RecurrentStateStore,
+    compact_stores, release_seal_readback, ExportedLayerState, RecurrentCompaction,
+    RecurrentStateStore,
 };
 pub use types::{DeltaNetDims, LayerKind, ZGate};

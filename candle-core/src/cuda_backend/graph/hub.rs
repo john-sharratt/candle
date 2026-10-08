@@ -281,6 +281,17 @@ fn begin(capture: &Arc<CudaStream>) -> Result<()> {
     begun
 }
 
+/// Nudge WDDM to submit what has been issued on `compute`.
+fn query_submits(compute: &Arc<CudaStream>) -> Result<()> {
+    // SAFETY: a query on the compute stream, which is never recording, made
+    // while this thread captures nothing. Its only purpose is the WDDM
+    // submission it forces; `NOT_READY` is the expected answer.
+    match unsafe { sys::cuStreamQuery(compute.cu_stream()) } {
+        sys::CUresult::CUDA_SUCCESS | sys::CUresult::CUDA_ERROR_NOT_READY => Ok(()),
+        e => e.result().w(),
+    }
+}
+
 /// End the capture [`begin`] started, and count the segment out of the record
 /// gate whether or not the driver hands back a graph.
 fn end_capture(capture: &Arc<CudaStream>) -> Result<sys::CUgraph> {
@@ -316,6 +327,19 @@ impl CaptureHub {
     fn owned_here(&self) -> bool {
         self.active.load(Ordering::Acquire)
             && self.owner_tag.load(Ordering::Acquire) == thread_tag()
+    }
+
+    /// The segment this thread is recording into right now, as `(wave serial,
+    /// segment ordinal)` — `None` when its launches reach the device as issued.
+    pub(crate) fn recording_segment(&self) -> Option<(u64, usize)> {
+        if !self.owned_here() {
+            return None;
+        }
+        self.lock()
+            .wave
+            .as_ref()
+            .filter(|w| w.recording && w.owner == std::thread::current().id())
+            .map(|w| (w.serial, w.segment))
     }
 
     /// Whether this thread has a wave capture open, recording or paused.
@@ -496,7 +520,12 @@ impl CaptureHub {
         }
         let (paused, dead) = {
             let mut st = self.lock();
-            let ended = Self::end_segment(&mut st, compute);
+            // Launched and submitted: the segment may hold MoE invocations whose
+            // summary words the expert threads wait on, and on WDDM a launched
+            // batch waits for a query before it reaches the GPU. Nothing is
+            // capturing between the launch and the hand-off, so the query is
+            // legal here.
+            let ended = Self::end_segment(&mut st, compute).and_then(|()| query_submits(compute));
             // Everything released while the segment recorded can go once it
             // is launched: the frees queue on the compute stream behind it.
             let dead = match ended {
@@ -521,14 +550,59 @@ impl CaptureHub {
     /// Hand everything this thread has issued to the driver: the recording
     /// segment, if any, is launched, then `compute` is queried so WDDM submits
     /// it. Recording resumes at the next launch.
+    ///
+    /// **No hand-offs.** A flush runs no eager section: between launching the
+    /// segment and beginning the next one this thread issues nothing, and no
+    /// other thread is ever given the capture stream. So the two event pairs a
+    /// [`Self::pause`] records — which exist to order a stray launch made
+    /// inside an eager section — order nothing here, and they cost the device a
+    /// four-hop chain to resolve before the next segment may start, at every
+    /// boundary. The segment is launched and recording resumes directly. A wave
+    /// held, or paused by an outer guard, is not recording: there is nothing to
+    /// end, and resuming is the guard's business.
+    ///
+    /// Everything that touches the legacy stream — the memory the segment
+    /// retired, freed behind it, and the query that forces WDDM to submit —
+    /// runs between the launch and the resume: a legacy-stream call made while
+    /// this thread captures is refused, and refusing it invalidates the
+    /// capture.
     pub(crate) fn flush(&self, compute: &Arc<CudaStream>) -> Result<()> {
-        let _paused = self.pause(compute)?;
-        // SAFETY: a query on the compute stream, which is never recording. Its
-        // only purpose is the WDDM submission it forces; `NOT_READY` is the
-        // expected answer.
-        match unsafe { sys::cuStreamQuery(compute.cu_stream()) } {
-            sys::CUresult::CUDA_SUCCESS | sys::CUresult::CUDA_ERROR_NOT_READY => Ok(()),
-            e => e.result().w(),
+        if !self.capturing_here() {
+            return query_submits(compute);
+        }
+        let (ended, dead) = {
+            let mut st = self.lock();
+            if !st.wave.as_ref().is_some_and(|w| w.recording) {
+                // Held, or paused by an outer guard: nothing records on this
+                // thread and there is nothing to end; resuming is the guard's.
+                drop(st);
+                return query_submits(compute);
+            }
+            match Self::end_segment(&mut st, compute) {
+                Ok(()) => (Ok(()), std::mem::take(&mut st.graveyard)),
+                Err(e) => (Err(e), Graveyard::new()),
+            }
+        };
+        drop(dead);
+        ended?;
+        query_submits(compute)?;
+        let mut st = self.lock();
+        let capture = st.capture.clone().expect("a wave has a capture stream");
+        let resumed = begin(&capture);
+        let wave = st
+            .wave
+            .as_mut()
+            .expect("this thread's wave stays open across its flush");
+        match resumed {
+            Ok(()) => {
+                wave.recording = true;
+                wave.recording_since = Some(Instant::now());
+                Ok(())
+            }
+            Err(e) => {
+                wave.error = Some(e.to_string());
+                Err(e)
+            }
         }
     }
 
@@ -610,31 +684,34 @@ impl CaptureHub {
         self.lock().graveyard.len()
     }
 
-    /// Close this thread's wave without launching what is recording — the
-    /// forward it belonged to has already failed.
+    /// Close the wave of a forward that failed, **launching what is recording**.
+    ///
+    /// The forward has failed, but the work it recorded before the failure was
+    /// issued, and parties outside the wave already wait on some of it: an MoE
+    /// invocation tells the stager and the expert pipeline its summary ticket
+    /// before its bucketize is recorded, and a segment may hold up to
+    /// `MAX_UNFLUSHED_INVOCATIONS` of them (`expert_lre::flush_schedule`).
+    /// Discarding the segment would leave those summary words unwritten — the
+    /// stager waiting on them for good, the pipeline thread aborting, the
+    /// retried forward's cold experts never published. Launching it is what an
+    /// eager forward would have done up to the failure; everything after it is
+    /// stream-ordered behind it. A capture that can no longer be ended has lost
+    /// its launches either way, and the failure that broke it is reported on
+    /// its own path.
     pub(crate) fn abandon_wave(&self, compute: &Arc<CudaStream>) {
         let dead = {
             let mut st = self.lock();
-            let Some(wave) = st.wave.take() else {
+            if st.wave.is_none() {
                 return;
-            };
-            self.active.store(false, Ordering::Release);
-            if wave.recording {
-                match &st.capture {
-                    Some(capture) => {
-                        if let Ok(graph) = end_capture(capture) {
-                            if !graph.is_null() {
-                                // SAFETY: the capture's own graph, destroyed once.
-                                let _ = unsafe { result::graph::destroy(graph) };
-                            }
-                        }
-                    }
-                    None => record_gate::recording_ends(),
-                }
             }
-            // Segments launched before the failure may still read the ring.
+            let _ = Self::end_segment(&mut st, compute)
+                .and_then(|()| st.hand_to_capture())
+                .and_then(|()| query_submits(compute));
+            st.wave = None;
+            self.active.store(false, Ordering::Release);
+            // Segments launched before and by this close may still read the ring.
             let _ = Self::close_ring(&mut st, compute);
-            // Nothing recorded will run, so nothing still reads these.
+            // Everything recorded is launched; frees now queue behind it.
             std::mem::take(&mut st.graveyard)
         };
         drop(dead);

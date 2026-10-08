@@ -303,6 +303,20 @@ Changed:
   row (many sequences decoding together), where the link has room. A
   prompt-prefill launch's workers saturate the link and are not given
   speculation to compete with (§0.7.1).
+- **A decode launch restocks from free ground.** A long prompt leaves the zone
+  thousands of slots short (it fills holes and never evicts), and a decode row
+  routed by a few sequences (single-session decode, a speculative verify) is too
+  narrow for the wide-row prediction — so its misses stream through the workers
+  every step. After any row whose every token is decode, the pipeline thread
+  promotes up to `RESTOCK_PER_LAYER` (2) of that row's highest-scored
+  non-resident experts **with a pinned copy** — score descending, then expert
+  id — into **free slots only**, keeping `RESTOCK_KEEP_FREE` (64) back for the
+  promotion ring's empty offers. It evicts nothing and stages nothing (a cold
+  expert would go to the pad, not the zone), so a wrong guess costs one copy on
+  an idle link and never a resident expert; a zone ~2,000 slots short refills in
+  ~20 steps. A landed restock counts as a promotion and its bytes against the
+  link, but not as a prediction: it stays out of the speculative set the
+  prefetch depth is tuned from.
 
 ### 0.7.1 Promotion by the workers
 
@@ -518,7 +532,9 @@ experts, and its cold ones are not in the pad).
   cold << 30 | decode << 31`; an unrouted expert's word is 0. Its kernel
   outputs are §0.10.
 - **The token-tile width is chosen per launch, as the host tile builder chooses
-  it** (`grouped_int8_n_sub`): Bm 32 at decode, 64 or 128 at prefill. The tile width
+  it** (`grouped_int8_n_sub`): Bm 32 at decode, 64 or 128 at prefill (per format:
+  affine KO tables 64 from 32 rows per expert; a table with an MXFP4 projection 64
+  below 64 rows and 128 from there). The tile width
   is the grouped GEMM's weight-reuse factor, and it has to be decided without the
   routing readback, so it is read off `n_tokens·k / E` — what uniform routing gives,
   a lower bound on an active expert's rows and close to it at prefill widths, where
@@ -540,10 +556,15 @@ experts, and its cold ones are not in the pad).
 
 ### 0.10 Kernel changes
 
-The int8 impl (`grouped_matmul_impl_int8`, `kernel.cuh:2126` — STAGES 2, a
-one-slot per-warp weight ring, static shared memory sized for occupancy) is **not
-changed**. Everything below is in `bucketize` and in the grouped entry
-(`quantized_matmul_grouped_entry`, `kernel.cuh:2569`) that calls the impl.
+The int8 impl (`grouped_matmul_impl_int8` — STAGES 2, a one-slot per-warp weight
+ring, static shared memory sized for occupancy) is the one every grouped and dense
+launch runs. Its row tile is `32·RN` rows — RN 8-row weight chunks per warp: the
+mode-2 tile (Bm 32) runs RN 1, the prefill tiles RN 4 (mode-4, Bm 64 × 128 rows) and
+RN 2 (mode-8, Bm 128 × 64 rows). A live launch's hit tiles run the launch's RN; a
+worker runs RN 1 over the 32-row slice it copied, whatever the launch's mode. Each
+output's K tiles fold in the same order whichever runs it, so the bits are the same.
+Everything below is in `bucketize` and in the grouped entry
+(`quantized_matmul_grouped_entry`) that calls the impl.
 
 #### `bucketize`
 
@@ -558,6 +579,36 @@ changed**. Everything below is in `bucketize` and in the grouped entry
   prefix it already builds. And `snap[3][E]`, the routed experts' entries as
   read (phase 1b, after the histogram, one thread per routed expert).
 - The summary word gains the pinned and cold bits (§0.9).
+- **The host-memory chain is paid only where it buys something.** The ticket store is
+  fenced by thread 0 alone, then a block barrier (the store is visible system-wide before
+  any thread's first live-table load); and a launch with no remote expert reads no ring
+  word and republishes no `head` — two system fences and a round of mapped loads a decode
+  step whose experts are all resident never needed.
+- **Every assignment-wide phase runs on every lane.** The histogram aggregates a warp's
+  same-expert lanes into one shared atomic (`__match_any_sync`); the stable scatter gives
+  each warp a contiguous chunk of the list (count, per-expert prefix across warps, then a
+  32-wide walk placing same-expert lanes by rank); the valid-flag scan is block-wide over
+  `BUCKETIZE_PRELOAD` assignments a thread. The chunk-per-thread scatter it replaced kept
+  16 of 512 threads busy at 512 experts. Measured (`bench_moe_bucketize`, 8,192 tokens ×
+  top-10 × 512 experts, RTX PRO 5000): 832 → 726 µs; the remaining time is not in the
+  scatter, and is not yet attributed.
+- **A narrow launch runs the narrow kernel** (`moe_bucketize_narrow.cuh`): at most 256
+  assignments — a decode, draft or verify step — one per thread, in five block barriers
+  where the general kernel takes ~22. An assignment's row is the count of composite keys
+  `e << 9 | i` below its own (ascending expert, then i: the stable counting sort's
+  buckets); its token-major slot is the valid assignments before its token plus its own
+  token's keys below it (the per-token ascending-row order); one packed u64 block scan over
+  the expert axis gives the offsets, the tile order and the remote list. The first
+  assignment of an expert to reach its shared counter issues the live-entry loads before
+  the rank walk, so the mapped read overlaps it. Same bytes as the general kernel, pinned by
+  `cuda_moe_bucketize_output_digest`; the started word, the snapshot and the promotion walk
+  are the shared device functions of `moe_bucketize_live.cuh`. At these widths the general
+  kernel's cost was its barrier chain and its serial per-token tail (a third of the warp
+  samples), not its work. Kernel µs (ncu, cold caches), RTX PRO 5000, 512 experts, top-10,
+  production path (live table, summary and started words mapped, ring present, all
+  resident): draft 1 row 13.3 → 6.3, verify 5 rows 14.8 → 7.5, 16 rows 16.4 → 9.5; warm,
+  back-to-back (`bench_moe_bucketize`, graph replay) 4.5, 5.6 and 6.7. Every launch above
+  256 assignments is the general kernel, unchanged.
 - **Promotion offers** (§0.7.1): thread 0 counts the launch's claiming experts
   against the mapped `sweep` word before its first claim, then, in list order,
   takes offers from `head`, skipping a victim of this row the launch routes and
@@ -567,7 +618,8 @@ changed**. Everything below is in `bucketize` and in the grouped entry
 
 #### The grouped entry: `W` workers, then hits
 
-The live launch's grid is `(row_tiles, worker_rows + launch_tiles)` with
+The live launch's grid is `(row_tiles, worker_rows + launch_tiles)` — `row_tiles =
+⌈N / 32·RN⌉`, the launch mode's row tiles — with
 `worker_rows = ⌈W / row_tiles⌉` — `row_fast = 1`, the order the live gate already
 uses (`cuda.rs` `grouped_qmatmul_dev_q8a128`); grid rows `y < worker_rows` are the
 **workers**, numbered row by row, and the rest are today's tile blocks with
@@ -580,8 +632,8 @@ grid — the order §0.10.1 showed overlaps and the reverse serialises.
   exactly as today. **Hit blocks never wait.**
 - **A worker** (`y < worker_rows`, number `y·row_tiles + x < W`; the last worker
   row's blocks past `W` exit) loops over
-  *items* `(remote expert r, row tile j)`, `n_items = header[3] × row_tiles`,
-  pulled off a per-launch device counter:
+  *items* `(remote expert r, row tile j)` over 32-row slices whatever the launch's
+  mode, `n_items = header[3] × N/32`, pulled off a per-launch device counter:
   1. **Source**: thread 0 takes a pinned expert's address from the snapshot. A
      cold expert's it reads from the projection's **live** row
      (`MoeLive::live_row`) with a system-scope acquire load, spinning while it
@@ -597,7 +649,7 @@ grid — the order §0.10.1 showed overlaps and the reverse serialises.
      (`[K block][4 row groups]`).
   3. **One `__syncthreads()`**: the stores are visible to the block's own
      `cp.async.cg` reads (both through L2).
-  4. **Compute**: for each of `r`'s `n_tiles` token tiles, call the unmodified
+  4. **Compute**: for each of `r`'s `n_tiles` token tiles, call the 32-row (RN 1)
      impl — over a promotion slot with `weights = slot projection`,
      `nrows = nrows`, `row_tile_idx = j`, exactly a resident tile's call, which
      reads only the chunks this worker just wrote; over scratch with
@@ -1502,10 +1554,14 @@ with it on or off; the device fork's refusal under capture (`:286`) goes.
 All three dev machines run WDDM (`docs/performance.md:215-224`), which batches
 submissions and drains at sync points (`docs/decode_graphs.md` §1).
 Today the per-layer synchronize is such a point; this design removes it. So the
-two hand-offs flush explicitly with a non-blocking query: the forward thread
-after enqueuing the summary copy (§5.1 step 3), the pipeline thread after
+hand-offs flush explicitly with a non-blocking query: the forward thread every
+time a segment holding MoE invocations is launched — at the flush schedule's
+cadence (`expert_lre::flush_schedule`: 1, 1, 2, 4, … 32 invocations a segment),
+at every eager pause that ends a segment early, and when a failed wave's capture
+is dropped, which launches its open segment rather than discarding the
+bucketizes the stager already waits on — and the pipeline thread after
 enqueuing fills (§6.1 step 6) and after an abort. Each is one driver call per
-layer or per miss batch.
+segment or per miss batch.
 
 ## 12. What is deleted
 

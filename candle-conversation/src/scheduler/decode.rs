@@ -107,13 +107,15 @@ impl Scheduler {
     /// once before `batch_decode_step` each decode iteration.
     ///
     /// A static run `R` following the sequence's pending token `Y` (the last
-    /// generated, not-yet-forwarded token) is injected as `[Y] ++ R[..last]` in
-    /// one prefill forward; the whole run is appended to `generated_tokens`, and
-    /// `R.last()` rides the normal decode forward in `batch_decode_step` — that
-    /// forward is exactly what produces the after-run logits for the next
-    /// `Branch`/`Free` token.  So an N-token run costs one prefill instead of N
-    /// decode steps, with no double-write of any token's KV.
+    /// generated, not-yet-forwarded token) is injected as `[Y] ++ R` in one
+    /// prefill forward, and the token after it is sampled from that forward's
+    /// last row under the stencil's next action ([`Self::commit_after_injection`]).
+    /// So an N-token run costs **one** forward: not N decode steps, and not a
+    /// prefill plus a decode step that re-forwards `R.last()` to read the same
+    /// row. A run that ends the turn (its last token is EOS) leaves the EOS
+    /// unforwarded, exactly as a sampled EOS is.
     pub(super) fn inject_stencil_prefills(&mut self) {
+        self.stencil_sampled.clear();
         let ids: Vec<SequenceId> = self
             .active_decodes
             .iter()
@@ -121,9 +123,13 @@ impl Scheduler {
             .map(|(&id, _)| id)
             .collect();
         let max_recent = self.sampler.max_recent_len();
-        // Every static run's prefill input, in the order the runs were played —
-        // forwarded together once every sequence has been stepped.
+        // Each sequence's prefill input — its runs this iteration, in the order
+        // they were played — forwarded together once every sequence has been
+        // stepped. One entry per sequence, so its last row is its last run's.
         let mut deferred: Vec<(SequenceId, Vec<u32>)> = Vec::new();
+        // The sequences whose runs leave a token to sample: the turn goes on
+        // after them, so the row after the last run is the next token's.
+        let mut continues: HashSet<SequenceId> = HashSet::new();
 
         for id in ids {
             let mut guard = 0usize;
@@ -151,9 +157,14 @@ impl Scheduler {
                 };
 
                 let StepMask::Prefill(run) = action else {
-                    // Branch / Free / Done — the action for the upcoming decode.
+                    // Branch / Free / Done — the action for the next token. When
+                    // runs were played above, that token is sampled from their
+                    // prefill's last row; otherwise the decode step samples it.
                     if let Some(s) = self.active_decodes.get_mut(&id) {
                         s.pending_mask = Some(action);
+                    }
+                    if deferred.iter().any(|(s, _)| *s == id) {
+                        continues.insert(id);
                     }
                     break;
                 };
@@ -180,7 +191,8 @@ impl Scheduler {
                     break;
                 }
 
-                // Prefill `[pending] ++ run[..last]`; `run.last()` rides the decode.
+                // Prefill `[pending] ++ run` — the whole run, so the forward's last
+                // row is the next token's.
                 //
                 // **`pending` is what has not been forwarded, not simply the last
                 // entry.** Both are usually the same single token — but the path
@@ -228,15 +240,13 @@ impl Scheduler {
 
                 let mut input = Vec::with_capacity(1 + run.len());
                 input.extend(pending);
-                // `run.last()` is never forwarded here: for a normal run it rides
-                // the decode in `batch_decode_step`; for an EOS-terminated run it
-                // is the turn terminator, whose KV is never written (exactly as a
-                // model-sampled EOS).  Either way it is excluded from the prefill.
-                input.extend_from_slice(&run[..run.len() - 1]);
+                // An EOS-terminated run's EOS is the turn terminator, whose KV is
+                // never written (exactly as a model-sampled EOS), so it is left
+                // out; every other run goes in whole.
+                let forwarded = if ends_turn { run.len() - 1 } else { run.len() };
+                input.extend_from_slice(&run[..forwarded]);
 
-                // Empty only when nothing is pending and the run is one token —
-                // that token rides the decode, so there is no forward to make.
-                // The recording below is unchanged either way.
+                // Empty only when nothing is pending and the run is a lone EOS.
                 // Forwarded below, in one batched pass with every other
                 // sequence's runs — not here, one sequence at a time. Each was a
                 // whole-model forward of its own on the decode loop: with eight
@@ -245,42 +255,41 @@ impl Scheduler {
                 // The bookkeeping below does not depend on the forward having
                 // run, so the run is recorded now and the forward follows.
                 if !input.is_empty() {
-                    deferred.push((id, input));
+                    // One input per sequence: a second run this iteration extends
+                    // the first, so the forward's last row follows the last run.
+                    match deferred.iter_mut().find(|(s, _)| *s == id) {
+                        Some((_, existing)) => existing.extend_from_slice(&input),
+                        None => deferred.push((id, input)),
+                    }
                     // Everything pending goes out with that pass.
                     if let Some(s) = self.active_decodes.get_mut(&id) {
                         s.mark_forwarded();
                     }
                 }
 
-                // Append the run to the emitted output and stream it; `run.last()`
-                // becomes `generated_tokens.last()`, which the decode forwards.
-                // The trailing EOS of a close run is pushed to the buffer (it is
-                // part of the sealed turn) but never streamed — matching the
-                // normal decode path, which buffers EOS but does not emit it.
+                // Append the run to the emitted output and stream it. The
+                // trailing EOS of a close run is pushed to the buffer (it is part
+                // of the sealed turn) but never streamed — matching the normal
+                // decode path, which buffers EOS but does not emit it.
                 let mut carries_eot = false;
                 let think_close = self.think_close;
                 let breaks = &self.page_break_tokens;
                 if let Some(s) = self.active_decodes.get_mut(&id) {
-                    let last = run.len() - 1;
                     for (k, &t) in run.iter().enumerate() {
-                        // The page cut for this run was already made by
-                        // `run_prefill`, which splits the forward at the
-                        // boundary — the only place it can be made, since these
-                        // tokens are forwarded above and their rows are pooled
-                        // by that pass. A marker in the run's LAST slot is not
-                        // forwarded here at all; the decode step that carries it
-                        // cuts at its own commit.
-                        // The run's LAST token was deliberately excluded from
-                        // `input` above — it rides the next decode step — so it
-                        // is pending, not forwarded. Recording it as forwarded
-                        // is what would make the next injection skip a token
-                        // that still needs carrying.
-                        if k == last {
-                            s.push_pending(t, think_close, breaks);
-                        } else {
+                        // The page cut inside this run was already made by the
+                        // prefill, which splits the forward at each boundary — the
+                        // only place it can be made, since these tokens' rows are
+                        // pooled by that pass. A break in the run's LAST slot has
+                        // nothing after it in the pass, so its cut is the token
+                        // after it: `commit_after_injection` commits that token and
+                        // takes it.
+                        if k < forwarded {
                             s.push_forwarded(t, think_close, breaks);
+                        } else {
+                            // The terminating EOS: committed, never forwarded.
+                            s.push_pending(t, think_close, breaks);
                         }
-                        if !(ends_turn && k == last) {
+                        if !(ends_turn && k + 1 == run.len()) {
                             let _ = s.event_tx.send(TurnEvent::Token(t));
                         }
                     }
@@ -342,7 +351,7 @@ impl Scheduler {
             .iter()
             .map(|(id, input)| (*id, input.as_slice()))
             .collect();
-        let failed = self.run_prefill_batch(&spans);
+        let (failed, rows) = self.run_prefill_batch_keeping(&spans, &continues);
         // A failed forward leaves runs recorded whose K/V was never written —
         // the turn would seal tokens with nothing behind them — so it fails,
         // rather than dropping its stencil and decoding on over the gap.
@@ -355,6 +364,181 @@ impl Scheduler {
             }
             self.fail_all_decodes(&[id], &format!("stencil prefill forward failed: {e}"));
         }
+        self.commit_after_injection(rows);
+    }
+
+    /// Each listed sequence's sampling config for this token, with its stencil's
+    /// pending action folded in.
+    ///
+    /// The action was set by `inject_stencil_prefills`, which already played any
+    /// static runs before it: a branch is its frontier (a tiny gather + sample),
+    /// a free-text span clears the stencil (free decode through the kernel), and
+    /// `Done` ends the walk (free decode + drop). The sampler resolves these per
+    /// row in `sample_batch`, so a mask set here constrains only this sequence —
+    /// other rows are unaffected, and constrained rows never run the full-vocab
+    /// kernel.
+    ///
+    /// One function for every place a decoded token is sampled — the decode step
+    /// and the token after an injected run — because two copies of this fold
+    /// would be two opinions about what a stencil allows.
+    fn step_configs(&mut self, seq_ids: &[SequenceId]) -> Vec<SamplingConfig> {
+        let mut configs: Vec<SamplingConfig> = seq_ids
+            .iter()
+            .map(|id| self.active_decodes[id].sampling_config.clone())
+            .collect();
+        for (i, &id) in seq_ids.iter().enumerate() {
+            if let Some(state) = self.active_decodes.get_mut(&id) {
+                if state.stencil.is_none() {
+                    continue;
+                }
+                match state.pending_mask.take() {
+                    Some(StepMask::Branch(set)) => {
+                        configs[i].stencil = set.tokens().iter().map(|&t| t as i32).collect();
+                    }
+                    Some(StepMask::Free { .. }) => {
+                        // A free-text span decodes normally — nothing is banned.  A
+                        // think-steer span's `</think>` and EOS are both intercepted
+                        // by the session's `observe` (the suppressed close drops the
+                        // token and prefills a continuation; the final span injects
+                        // the closing tag), and tool-call value spans close on a byte
+                        // delimiter — so the sampler just runs free here.
+                        configs[i].stencil.clear();
+                    }
+                    Some(StepMask::Done) => {
+                        if let Some(d) = &state.stencil {
+                            Self::log_stencil_finish(id.0, d, "completed");
+                        }
+                        state.stencil = None;
+                        configs[i].stencil.clear();
+                    }
+                    // A `Prefill` is consumed by `inject_stencil_prefills`; `None`
+                    // means the driver wasn't advanced — free-decode this step.
+                    Some(StepMask::Prefill(_)) | None => configs[i].stencil.clear(),
+                }
+            }
+        }
+        configs
+    }
+
+    /// Take each listed sequence's persistent sampling state for one sample, with
+    /// its steering span's close semantics synced for this token. The caller puts
+    /// them back.
+    ///
+    /// The sync is only consulted inside a segment: the hard-cap closer script
+    /// may play only in a TERMINAL free-text span (or an unsteered block, where
+    /// there is no stencil). Everywhere else — a span that retires into further
+    /// decoding, a tool-call value, a static prefill — a forced close stays bare.
+    fn take_sampling_states(
+        &mut self,
+        seq_ids: &[SequenceId],
+    ) -> Vec<(SequenceId, SequenceSamplingState)> {
+        seq_ids
+            .iter()
+            .map(|&id| {
+                let mut state = self
+                    .sampling_states
+                    .remove(&id)
+                    .expect("sampling state must exist for active sequence");
+                if state.in_segment {
+                    state.close_would_continue = self
+                        .active_decodes
+                        .get(&id)
+                        .and_then(|s| s.stencil.as_ref())
+                        .is_some_and(|d| !d.in_terminal_close_span());
+                }
+                (id, state)
+            })
+            .collect()
+    }
+
+    /// Sample and commit the token after each sequence's injected static run,
+    /// from the row its run's own prefill left.
+    ///
+    /// **This is what makes a static run one forward.** The prefill already
+    /// computed the row after the run's last token; forwarding that token again
+    /// as the next decode step's row, only to read the same distribution, was a
+    /// second pass — a whole forward when the stencil's sequence was decoding
+    /// alone. The token goes through [`Self::commit_decoded_tokens`], the path
+    /// every decoded token takes, against the row that produced it, and the
+    /// sequence then sits out this iteration's decode step (`stencil_sampled`):
+    /// its stencil has advanced, and the constraint for the token after this one
+    /// is the next injection's to set.
+    fn commit_after_injection(&mut self, mut rows: HashMap<SequenceId, Tensor>) {
+        let mut ids: Vec<SequenceId> = rows
+            .keys()
+            .copied()
+            .filter(|id| self.active_decodes.get(id).is_some_and(|s| !s.finished))
+            .collect();
+        ids.sort_by_key(|id| id.0);
+        if ids.is_empty() {
+            return;
+        }
+        // `[1, vocab]` each, as the decode step's rows are.
+        let shaped: candle::Result<Vec<Tensor>> = ids
+            .iter()
+            .map(|id| {
+                rows.remove(id)
+                    .expect("ids are the rows' keys")
+                    .flatten_all()
+                    .and_then(|r| r.unsqueeze(0))
+            })
+            .collect();
+        let (row_list, stacked) = match shaped.and_then(|r| Tensor::cat(&r, 0).map(|s| (r, s))) {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.fail_all_decodes(&ids, &format!("stencil continuation rows: {e}"));
+                return;
+            }
+        };
+        let configs = self.step_configs(&ids);
+        let (state_ids, mut states): (Vec<SequenceId>, Vec<SequenceSamplingState>) =
+            self.take_sampling_states(&ids).into_iter().unzip();
+        let sampled = {
+            let config_refs: Vec<&SamplingConfig> = configs.iter().collect();
+            let mut state_refs: Vec<&mut SequenceSamplingState> = states.iter_mut().collect();
+            self.sampler
+                .sample_batch(&stacked, &mut state_refs, &config_refs)
+        };
+        for (id, state) in state_ids.into_iter().zip(states) {
+            if state.degenerate_run == crate::batched_sampler::DEGENERATE_TOKEN_RUN {
+                describe_recurrent_state(self.model.as_ref(), id);
+            }
+            self.sampling_states.insert(id, state);
+        }
+        let mut tokens = match sampled {
+            Ok(t) if t.len() == ids.len() => t,
+            Ok(t) => {
+                self.fail_all_decodes(
+                    &ids,
+                    &format!(
+                        "stencil continuation sampled {} tokens for {}",
+                        t.len(),
+                        ids.len()
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                self.fail_all_decodes(&ids, &format!("stencil continuation sample failed: {e}"));
+                return;
+            }
+        };
+        let heals = self.commit_decoded_tokens(&ids, &mut tokens, &row_list);
+        // Nothing to roll back: the KV ends at the run's last token, which is
+        // exactly where a healed prefix is forwarded from.
+        for heal in heals {
+            self.forward_heal_prefill(heal);
+        }
+        // A run whose last token is a break leaves the cut to the token after it
+        // (`push_committed` records it), and the KV already ends at the break —
+        // the edge the cut belongs on — so it is taken now, as the decode step
+        // takes its own once its rollback has settled.
+        for &id in &ids {
+            if let Some(state) = self.active_decodes.get_mut(&id) {
+                super::flush_page_cut(self.model.as_ref(), id, state);
+            }
+        }
+        self.stencil_sampled.extend(ids);
     }
 
     // ── Decode ─────────────────────────────────────────────────────────
@@ -379,12 +563,16 @@ impl Scheduler {
             .iter()
             .map(|p| p.parent_id.0)
             .collect();
+        // A sequence whose next token the stencil injection just sampled has
+        // nothing for this step to produce: that token is the one it would
+        // forward, and the constraint for the one after is the next injection's.
         let mut seq_ids: Vec<SequenceId> = self
             .active_decodes
             .iter()
             .filter(|(_, s)| !s.finished)
             .map(|(&id, _)| id)
             .filter(|id| !glue_pending.contains(&id.0))
+            .filter(|id| !self.stencil_sampled.contains(id))
             .collect();
 
         // **Why this wave is as wide as it is, in the one place that decides.** A decode
@@ -773,80 +961,13 @@ impl Scheduler {
             }
         }
 
-        // Clone sampling configs before taking mutable references
-        let mut configs: Vec<SamplingConfig> = seq_ids
-            .iter()
-            .map(|id| self.active_decodes[id].sampling_config.clone())
-            .collect();
-
-        // Fold each active tool-call stencil's constraint for this token (set by
-        // `inject_stencil_prefills`, which already injected any preceding static
-        // runs) into this row's `stencil` allow-list: a branch is its frontier (a
-        // tiny gather + sample), a free-text span clears the stencil (free decode
-        // through the kernel), and `Done` ends the walk (free decode + drop).
-        //
-        // The sampler resolves these per row in `sample_batch`, so a mask set
-        // here constrains only this sequence — other rows in the wave are
-        // unaffected, and constrained rows never run the full-vocab kernel.
-        for (i, &id) in seq_ids.iter().enumerate() {
-            if let Some(state) = self.active_decodes.get_mut(&id) {
-                if state.stencil.is_none() {
-                    continue;
-                }
-                match state.pending_mask.take() {
-                    Some(StepMask::Branch(set)) => {
-                        configs[i].stencil = set.tokens().iter().map(|&t| t as i32).collect();
-                    }
-                    Some(StepMask::Free { .. }) => {
-                        // A free-text span decodes normally — nothing is banned.  A
-                        // think-steer span's `</think>` and EOS are both intercepted
-                        // by the session's `observe` (the suppressed close drops the
-                        // token and prefills a continuation; the final span injects
-                        // the closing tag), and tool-call value spans close on a byte
-                        // delimiter — so the sampler just runs free here.
-                        configs[i].stencil.clear();
-                    }
-                    Some(StepMask::Done) => {
-                        if let Some(d) = &state.stencil {
-                            Self::log_stencil_finish(id.0, d, "completed");
-                        }
-                        state.stencil = None;
-                        configs[i].stencil.clear();
-                    }
-                    // A `Prefill` is consumed by `inject_stencil_prefills`; `None`
-                    // means the driver wasn't advanced — free-decode this step.
-                    Some(StepMask::Prefill(_)) | None => configs[i].stencil.clear(),
-                }
-            }
-        }
+        let configs = self.step_configs(&seq_ids);
 
         // Hand the persistent sampling states to the chooser for the duration of
         // the step: it needs them mutably (each sampled token is recorded into
         // its sequence's history, which is what prices the next block position),
         // and they go back into the map immediately after the walk.
-        let removed_states: Vec<(SequenceId, SequenceSamplingState)> = seq_ids
-            .iter()
-            .map(|&id| {
-                let mut state = self
-                    .sampling_states
-                    .remove(&id)
-                    .expect("sampling state must exist for active sequence");
-                // Sync the steering span's close semantics into the sampler for
-                // THIS step (only consulted inside a segment): the hard-cap
-                // closer script may play only in a TERMINAL free-text span (or
-                // an unsteered block, where there is no stencil). Everywhere
-                // else — a span that retires into further decoding, a tool-call
-                // value, a static prefill — a forced close stays bare.
-                if state.in_segment {
-                    state.close_would_continue = self
-                        .active_decodes
-                        .get(&id)
-                        .and_then(|s| s.stencil.as_ref())
-                        .is_some_and(|d| !d.in_terminal_close_span());
-                }
-                (id, state)
-            })
-            .collect();
+        let removed_states = self.take_sampling_states(&seq_ids);
 
         // ── Accept walk ──────────────────────────────────────────────────────
         //

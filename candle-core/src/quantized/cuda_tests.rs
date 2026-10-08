@@ -10,7 +10,10 @@
 )]
 
 use super::*;
-use candle_kernels::simple::moe_bucketize::{PROMO_EMPTY, PROMO_SKIP};
+use candle_kernels::simple::moe_bucketize::{
+    run_moe_bucketize, BUCKETIZE_LAUNCHED, PROMO_EMPTY, PROMO_SKIP,
+};
+use cudarc::driver::sys::{cuMemFreeHost, CUstream};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 use half::bf16;
 use rand::Rng;
@@ -733,7 +736,7 @@ fn cuda_mm_q4_k_repacked() -> Result<()> {
                 qtype,
                 YType::F16 as i32,
                 xs_repacked.data.len,
-                0, // force_mode2 (tiling only; result-invariant)
+                0, // tile_mode (tiling only; result-invariant)
                 OutDType::F16 as i32,
                 SumScale::Raw.as_code(),
                 std::ptr::null_mut(),
@@ -837,7 +840,7 @@ fn cuda_mm_q4_k_repacked_model_size() -> Result<()> {
                 qtype,
                 YType::F16 as i32,
                 xs_repacked.data.len,
-                0, // force_mode2 (tiling only; result-invariant)
+                0, // tile_mode (tiling only; result-invariant)
                 OutDType::F16 as i32,
                 SumScale::Raw.as_code(),
                 std::ptr::null_mut(),
@@ -996,7 +999,7 @@ fn cuda_mm_q6_k_repacked() -> Result<()> {
                 qtype,
                 YType::F16 as i32,
                 xs_repacked.data.len,
-                0, // force_mode2 (tiling only; result-invariant)
+                0, // tile_mode (tiling only; result-invariant)
                 OutDType::F16 as i32,
                 SumScale::Raw.as_code(),
                 std::ptr::null_mut(),
@@ -1245,7 +1248,7 @@ fn cuda_mm_q4_k_gguf_vs_dequant() -> Result<()> {
                     qtype,
                     YType::BF16 as i32,
                     repacked.data.len,
-                    0, // force_mode2 (tiling only; result-invariant)
+                    0, // tile_mode (tiling only; result-invariant)
                     OutDType::BF16 as i32,
                     SumScale::Raw.as_code(),
                     std::ptr::null_mut(),
@@ -1420,7 +1423,7 @@ fn cuda_mm_q4_k_fused_qkv() -> Result<()> {
                 qtype,
                 YType::BF16 as i32,
                 repacked.data.len,
-                0, // force_mode2 (tiling only; result-invariant)
+                0, // tile_mode (tiling only; result-invariant)
                 OutDType::BF16 as i32,
                 SumScale::Raw.as_code(),
                 std::ptr::null_mut(),
@@ -8696,7 +8699,7 @@ fn expert_grouped_launch_cost() -> Result<()> {
                 qtype,
                 YType::BF16 as i32,
                 0, // weight_bytes=0 → L2-cached assumption (matches grouped_matmul_gemx)
-                0, // force_mode2 (tiling only; result-invariant)
+                0, // tile_mode (tiling only; result-invariant)
                 OutDType::BF16 as i32,
                 SumScale::Raw.as_code(),
                 std::ptr::null_mut(),
@@ -8956,8 +8959,16 @@ fn cuda_moe_route_reads_a_strided_row() -> Result<()> {
     for norm in [true, false] {
         let (w_view, i_view) = moe_route(&view, k, norm)?;
         let (w_packed, i_packed) = moe_route(&packed, k, norm)?;
-        assert_eq!(i_view.to_vec2::<u32>()?, i_packed.to_vec2::<u32>()?, "norm={norm}");
-        assert_eq!(w_view.to_vec2::<f32>()?, w_packed.to_vec2::<f32>()?, "norm={norm}");
+        assert_eq!(
+            i_view.to_vec2::<u32>()?,
+            i_packed.to_vec2::<u32>()?,
+            "norm={norm}"
+        );
+        assert_eq!(
+            w_view.to_vec2::<f32>()?,
+            w_packed.to_vec2::<f32>()?,
+            "norm={norm}"
+        );
     }
     Ok(())
 }
@@ -9241,6 +9252,11 @@ fn q8a128_dense_mode_crossover() -> Result<()> {
                 let act: Vec<f32> = (0..m * k).map(|_| rng.random_range(-1.0f32..1.0)).collect();
                 let op = quantize_acts_q8a128_test(&dev, &act, m, k)?;
                 let time = |mode2: bool| -> Result<f64> {
+                    let tile = if mode2 {
+                        DenseTile::Mode2
+                    } else {
+                        DenseTile::Mode1
+                    };
                     for _ in 0..WARMUP {
                         let _ = q8a128_dense_matmul(
                             &op,
@@ -9248,7 +9264,7 @@ fn q8a128_dense_mode_crossover() -> Result<()> {
                             kod,
                             n,
                             wbytes,
-                            mode2,
+                            tile,
                             crate::DType::F32,
                             &dev,
                         )?;
@@ -9264,7 +9280,7 @@ fn q8a128_dense_mode_crossover() -> Result<()> {
                             kod,
                             n,
                             wbytes,
-                            mode2,
+                            tile,
                             crate::DType::F32,
                             &dev,
                         )?;
@@ -9652,7 +9668,12 @@ fn bucketize_ref_live(
             if class[e] == want {
                 tile_pref[e] = num_tiles;
                 if want != CLS_VRAM && tiles_of(e) > 0 {
-                    remote.push([e as i32, num_tiles, tiles_of(e), i32::from(want == CLS_COLD)]);
+                    remote.push([
+                        e as i32,
+                        num_tiles,
+                        tiles_of(e),
+                        i32::from(want == CLS_COLD),
+                    ]);
                 }
                 num_tiles += tiles_of(e);
             }
@@ -9730,7 +9751,13 @@ fn bucketize_ref_live(
         perm,
         rw_ids,
         token_starts,
-        header: [n_active, total_valid, num_tiles, remote.len() as i32, remote_tiles],
+        header: [
+            n_active,
+            total_valid,
+            num_tiles,
+            remote.len() as i32,
+            remote_tiles,
+        ],
         summary,
         remote,
     }
@@ -9851,74 +9878,343 @@ fn assert_bucketize_ws(
     Ok(())
 }
 
-/// Micro-benchmark harness for `moe_bucketize`. For each size regime qwen3
-/// actually hits (k=8, 128 experts) plus a 256-expert stress case, it FIRST
-/// asserts every output table is bit-identical to the CPU reference, then times
-/// the kernel end-to-end (wall clock, one sync per batch of launches). Prints
-/// µs/call and throughput. `--ignored` (needs a GPU); run with `--nocapture`.
+/// The live-layer buffers of a production bucketize: the live table, the
+/// routing summary and the started words in mapped host memory, as
+/// `expert_lre` allocates them, a promotion ring offering nothing, and the
+/// device-side snapshot, remote list, counters and promotion slots. Every
+/// expert's entries name VRAM, so the launch is the all-resident decode step:
+/// no remote expert, no ring word read. Freed on drop.
+struct BenchLive {
+    table_h: *mut c_void,
+    summary_h: *mut c_void,
+    started_h: *mut c_void,
+    _ring: TestRing,
+    _device: Vec<CudaSlice<u64>>,
+    live: BucketizeLive,
+}
+
+impl BenchLive {
+    fn new(dev: &CudaDevice, n_experts: usize) -> Result<Self> {
+        let table = test_live_table(&vec![CLS_VRAM; n_experts], &[]);
+        let (table_h, table_d) = mapped_host(table.len() * 8);
+        // SAFETY: the mapped allocation just made, `table.len()` u64s long.
+        unsafe { std::ptr::copy_nonoverlapping(table.as_ptr(), table_h as *mut u64, table.len()) };
+        let (summary_h, summary_d) = mapped_host((n_experts + 1) * 4);
+        let (started_h, started_d) = mapped_host(8);
+        let ring = TestRing::new(16, 1, n_experts);
+        let stream = dev.cuda_stream();
+        let device: Vec<CudaSlice<u64>> = vec![
+            dev.memcpy_stod(&vec![0u64; 3 * n_experts])?,
+            dev.memcpy_stod(&vec![0u64; 2 * n_experts])?,
+            dev.memcpy_stod(&[0u64; 2])?,
+            dev.memcpy_stod(&vec![0u64; n_experts])?,
+        ];
+        let ptr = |i: usize| device[i].device_ptr(&stream).0;
+        let live = BucketizeLive {
+            gate_row: table_d,
+            table_plane: n_experts as i64,
+            snap: ptr(0),
+            pinned: TEST_PINNED,
+            summary: summary_d,
+            summary_seq: 5,
+            remote: ptr(1),
+            counters: ptr(2),
+            row: 0,
+            promo: Some(ring.ring()),
+            remote_dst: ptr(3),
+            started_rows: started_d,
+            ticket: 9,
+            owner: OwnerCheck::default(),
+        };
+        Ok(Self {
+            table_h,
+            summary_h,
+            started_h,
+            _ring: ring,
+            _device: device,
+            live,
+        })
+    }
+
+    /// The routing summary as the host reads it, sequence word last.
+    fn summary(&self, n_experts: usize) -> Vec<u32> {
+        (0..=n_experts)
+            // SAFETY: inside the mapped summary, written by the device and drained.
+            .map(|e| unsafe { std::ptr::read_volatile((self.summary_h as *const u32).add(e)) })
+            .collect()
+    }
+}
+
+impl Drop for BenchLive {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `mapped_host`, each freed once.
+        unsafe {
+            cuMemFreeHost(self.table_h);
+            cuMemFreeHost(self.summary_h);
+            cuMemFreeHost(self.started_h);
+        }
+    }
+}
+
+/// A workspace's eleven device addresses in `run_moe_bucketize`'s argument
+/// order (`tok_ids` … `scan`), read once: a graph capture has no place for the
+/// sync event reading a slice's address records.
+fn bucketize_ws_ptrs(dev: &CudaDevice, ws: &MoeBucketizeWorkspace) -> [u64; 11] {
+    let s = dev.cuda_stream();
+    let ptrs = [
+        ws.tok_ids.device_ptr(&s).0,
+        ws.weight_ids.device_ptr(&s).0,
+        ws.tile_expert.device_ptr(&s).0,
+        ws.tile_b_start.device_ptr(&s).0,
+        ws.tile_b_cnt.device_ptr(&s).0,
+        ws.perm.device_ptr(&s).0,
+        ws.rw_ids.device_ptr(&s).0,
+        ws.token_starts.device_ptr(&s).0,
+        ws.header.device_ptr(&s).0,
+        ws.inv.device_ptr(&s).0,
+        ws.scan.device_ptr(&s).0,
+    ];
+    ptrs
+}
+
+/// One `run_moe_bucketize` on `stream`, over a workspace's addresses
+/// ([`bucketize_ws_ptrs`]) already sized for the launch — what the bench's
+/// graph replays.
+fn launch_bucketize_raw(
+    ids: u64,
+    n_tokens: usize,
+    k: usize,
+    n_experts: usize,
+    tile_w: usize,
+    ws: &[u64; 11],
+    live: Option<&BucketizeLive>,
+    decode: &DecodeRows,
+    stream: CUstream,
+) -> Result<()> {
+    let p = |b: u64| b as *mut c_void;
+    let (lo, hi) = decode.ranges();
+    let promo = live.and_then(|l| l.promo);
+    let owner = live.map_or(OwnerCheck::default(), |l| l.owner);
+    // SAFETY: every address is a live allocation sized for the launch, on this
+    // device; the stream is the caller's.
+    let status = unsafe {
+        run_moe_bucketize(
+            p(ids),
+            n_tokens as i32,
+            k as i32,
+            n_experts as i32,
+            tile_w as i32,
+            p(ws[0]),
+            p(ws[1]),
+            p(ws[2]),
+            p(ws[3]),
+            p(ws[4]),
+            p(ws[5]),
+            p(ws[6]),
+            p(ws[7]),
+            p(ws[8]),
+            p(ws[9]),
+            p(ws[10]),
+            p(live.map_or(0, |l| l.gate_row)),
+            live.map_or(0, |l| l.table_plane),
+            p(live.map_or(0, |l| l.snap)),
+            live.map_or(0, |l| l.pinned[0].0),
+            live.map_or(0, |l| l.pinned[0].1),
+            live.map_or(0, |l| l.pinned[1].0),
+            live.map_or(0, |l| l.pinned[1].1),
+            lo.as_ptr(),
+            hi.as_ptr(),
+            lo.len() as i32,
+            p(live.map_or(0, |l| l.summary)),
+            live.map_or(0, |l| l.summary_seq),
+            p(live.map_or(0, |l| l.remote)),
+            p(live.map_or(0, |l| l.counters)),
+            p(promo.map_or(0, |r| r.slots)),
+            p(promo.map_or(0, |r| r.log)),
+            p(promo.map_or(0, |r| r.head)),
+            p(promo.map_or(0, |r| r.tail)),
+            promo.map_or(0, |r| r.cap),
+            p(promo.map_or(0, |r| r.marks)),
+            p(promo.map_or(0, |r| r.reserve)),
+            p(promo.map_or(0, |r| r.sweep)),
+            p(promo.map_or(0, |r| r.victims)),
+            p(promo.map_or(0, |r| r.retarget)),
+            p(owner.owners),
+            owner.zone_end,
+            owner.slot_bytes,
+            owner.slots,
+            live.map_or(0, |l| l.row),
+            p(live.map_or(0, |l| l.remote_dst)),
+            p(live.map_or(0, |l| l.started_rows)),
+            live.map_or(0, |l| l.ticket),
+            stream as *mut c_void,
+        )
+    };
+    if status != BUCKETIZE_LAUNCHED {
+        crate::bail!("bench bucketize: launcher status {status}");
+    }
+    Ok(())
+}
+
+/// Micro-benchmark harness for `moe_bucketize`. For each size regime the
+/// models hit — Qwen3 (k=8, 128 experts), Qwen3.8-Flash-Next (k=10, 512
+/// experts: a draft step's one row, a verify's five, a 16-row wave, prefill) —
+/// it FIRST asserts every output table is bit-identical to the CPU reference,
+/// then measures DEVICE µs per launch: `per_graph` launches captured into a
+/// CUDA graph and replayed between events, so no host launch cost is in the
+/// figure. The `live` rows run the production path — live table, summary and
+/// started words in mapped host memory, a promotion ring present, every expert
+/// resident. `--ignored` (needs a GPU); run with `--nocapture`.
 #[test]
 #[ignore]
 fn bench_moe_bucketize() -> Result<()> {
-    use std::time::Instant;
+    use super::graph_bench::time_graph;
     let dev = CudaDevice::new(0)?;
-    let device = crate::Device::Cuda(dev.clone());
-    let tile_w = 32usize;
-    let iters = 300usize;
-
-    // (n_tokens, k, n_experts, label)
-    let configs: &[(usize, usize, usize, &str)] = &[
-        (1, 8, 128, "decode-1"),
-        (64, 8, 128, "decode-64"),
-        (512, 8, 128, "prefill-512"),
-        (2048, 8, 128, "prefill-2048"),
-        (4096, 8, 128, "prefill-4096"),
-        (8192, 8, 128, "prefill-8192"),
-        (4096, 8, 256, "prefill-4096-e256"),
-        // Qwen3.8-Flash-Next: 512 experts, top-10. §0.4 rule 2 — the width the
-        // bound was raised for AND the width it was raised from, so a
-        // regression for the existing callers cannot hide.
-        (16, 10, 512, "decode-16-e512"),
-        (713, 10, 512, "prefill-713-e512"),
-        (2048, 10, 512, "prefill-2048-e512"),
-        (4096, 10, 512, "prefill-4096-e512"),
-        (4096, 10, 256, "prefill-4096-e256-k10"),
-    ];
-
-    println!("\n=== moe_bucketize micro-bench (tile_w={tile_w}, iters={iters}) ===");
+    let per_graph = 200usize;
     println!(
-        "{:<20} {:>8} {:>7} {:>12} {:>14}",
+        "\n=== moe_bucketize micro-bench (tile_w={BENCH_TILE_W}, device µs, graph replay) ==="
+    );
+    println!(
+        "{:<24} {:>8} {:>7} {:>12} {:>14}",
         "config", "a_ub", "n_exp", "us/call", "M-assign/s"
     );
-    for &(n_tokens, k, n_experts, label) in configs {
+    for &(n_tokens, k, n_experts, is_live, label) in BUCKETIZE_BENCH_CONFIGS {
+        let case = BenchCase::new(&dev, n_tokens, k, n_experts, is_live, label)?;
+        let items = vec![(); per_graph];
+        let us = time_graph(&dev, &items, |(), cs| case.launch(cs))?;
         let a_ub = n_tokens * k;
-        // Deterministic pseudo-random dense routing (all slots valid).
+        let massign = (a_ub as f64) / (us * 1e-6) / 1e6;
+        println!("{label:<24} {a_ub:>8} {n_experts:>7} {us:>12.2} {massign:>14.1}");
+    }
+    Ok(())
+}
+
+/// The bench's configurations once each — exactly one launch per
+/// configuration (its correctness gate), in [`BUCKETIZE_BENCH_CONFIGS`] order:
+/// the target for an `ncu` pass, where launch `i` is configuration `i`.
+/// `--ignored` (needs a GPU).
+#[test]
+#[ignore]
+fn profile_moe_bucketize_once() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    for &(n_tokens, k, n_experts, is_live, label) in BUCKETIZE_BENCH_CONFIGS {
+        BenchCase::new(&dev, n_tokens, k, n_experts, is_live, label)?;
+    }
+    Ok(())
+}
+
+/// The bench's tile width.
+const BENCH_TILE_W: usize = 32;
+
+/// `(n_tokens, k, n_experts, live, label)` for the bucketize bench.
+const BUCKETIZE_BENCH_CONFIGS: &[(usize, usize, usize, bool, &str)] = &[
+    (1, 8, 128, false, "decode-1"),
+    (1, 10, 512, true, "draft-1-e512-live"),
+    (5, 10, 512, false, "verify-5-e512"),
+    (5, 10, 512, true, "verify-5-e512-live"),
+    (16, 10, 512, false, "decode-16-e512"),
+    (16, 10, 512, true, "decode-16-e512-live"),
+    (64, 8, 128, false, "decode-64"),
+    (512, 8, 128, false, "prefill-512"),
+    (2048, 8, 128, false, "prefill-2048"),
+    (4096, 8, 128, false, "prefill-4096"),
+    (8192, 8, 128, false, "prefill-8192"),
+    (4096, 8, 256, false, "prefill-4096-e256"),
+    // Qwen3.8-Flash-Next prefill: §0.4 rule 2 — the width the bound was
+    // raised for AND the width it was raised from, so a regression for the
+    // existing callers cannot hide.
+    (713, 10, 512, false, "prefill-713-e512"),
+    (713, 10, 512, true, "prefill-713-e512-live"),
+    (2048, 10, 512, false, "prefill-2048-e512"),
+    (4096, 10, 512, false, "prefill-4096-e512"),
+    (8192, 10, 512, false, "prefill-8192-e512"),
+    (4096, 10, 256, false, "prefill-4096-e256-k10"),
+];
+
+/// One bench configuration, set up and gated: deterministic dense routing,
+/// a workspace, the live-layer buffers for a `live` row, and ONE launch whose
+/// every table is asserted bit-exact against the CPU reference (and, live, the
+/// summary too) before anything is timed.
+struct BenchCase {
+    // The routing and the workspace the addresses below point into.
+    _t: crate::Tensor,
+    _ws: MoeBucketizeWorkspace,
+    bench_live: Option<BenchLive>,
+    decode: DecodeRows,
+    ids_ptr: u64,
+    ws_ptrs: [u64; 11],
+    n_tokens: usize,
+    k: usize,
+    n_experts: usize,
+}
+
+impl BenchCase {
+    fn new(
+        dev: &CudaDevice,
+        n_tokens: usize,
+        k: usize,
+        n_experts: usize,
+        is_live: bool,
+        label: &str,
+    ) -> Result<Self> {
+        let device = crate::Device::Cuda(dev.clone());
+        let a_ub = n_tokens * k;
         let ids: Vec<u32> = (0..a_ub)
             .map(|i| ((i as u64).wrapping_mul(2654435761) % n_experts as u64) as u32)
             .collect();
         let t = crate::Tensor::from_vec(ids.clone(), (n_tokens, k), &device)?;
-        let mut ws = MoeBucketizeWorkspace::new(&dev, n_tokens, k)?;
-
-        // Correctness gate FIRST — every table bit-exact vs the CPU sort.
+        let mut ws = MoeBucketizeWorkspace::new(dev, n_tokens, k)?;
+        let bench_live = if is_live {
+            Some(BenchLive::new(dev, n_experts)?)
+        } else {
+            None
+        };
+        let live = bench_live.as_ref().map(|b| b.live);
         let decode = DecodeRows::prefix(n_tokens);
-        moe_bucketize(&t, n_experts, tile_w, &mut ws, None, &decode)?;
-        assert_bucketize_ws(&dev, &ws, &ids, n_tokens, k, n_experts, tile_w, label)?;
-
-        // Warm up, then time `iters` launches with a single trailing sync.
-        for _ in 0..20 {
-            moe_bucketize(&t, n_experts, tile_w, &mut ws, None, &decode)?;
+        moe_bucketize(&t, n_experts, BENCH_TILE_W, &mut ws, live.as_ref(), &decode)?;
+        assert_bucketize_ws(dev, &ws, &ids, n_tokens, k, n_experts, BENCH_TILE_W, label)?;
+        if let Some(b) = &bench_live {
+            let mut want = bucketize_ref(&ids, n_tokens, k, n_experts, BENCH_TILE_W).summary;
+            want.push(5);
+            assert_eq!(b.summary(n_experts), want, "{label}: summary");
         }
-        let _ = dev.memcpy_dtov(&ws.header.slice(..1))?; // drain
-
-        let start = Instant::now();
-        for _ in 0..iters {
-            moe_bucketize(&t, n_experts, tile_w, &mut ws, None, &decode)?;
-        }
-        let _ = dev.memcpy_dtov(&ws.header.slice(..1))?; // drain
-        let us = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
-        let massign = (a_ub as f64) / (us * 1e-6) / 1e6;
-        println!("{label:<20} {a_ub:>8} {n_experts:>7} {us:>12.2} {massign:>14.1}");
+        let ids_ptr = {
+            let stream = dev.cuda_stream();
+            let (s, _) = t.storage_and_layout();
+            let ptr = match &*s {
+                crate::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.device_ptr(&stream).0,
+                _ => unreachable!(),
+            };
+            ptr
+        };
+        let ws_ptrs = bucketize_ws_ptrs(dev, &ws);
+        Ok(Self {
+            _t: t,
+            _ws: ws,
+            bench_live,
+            decode,
+            ids_ptr,
+            ws_ptrs,
+            n_tokens,
+            k,
+            n_experts,
+        })
     }
-    Ok(())
+
+    /// One launch on `stream`, with no host-side address reads.
+    fn launch(&self, stream: CUstream) -> Result<()> {
+        launch_bucketize_raw(
+            self.ids_ptr,
+            self.n_tokens,
+            self.k,
+            self.n_experts,
+            BENCH_TILE_W,
+            &self.ws_ptrs,
+            self.bench_live.as_ref().map(|b| &b.live),
+            &self.decode,
+            stream,
+        )
+    }
 }
 
 /// The GPU-native dispatch gate: `grouped_qmatmul_dev_q8a128` (full resident
@@ -10148,6 +10444,57 @@ fn cuda_moe_bucketize_matches_cpu_reference() -> Result<()> {
         "e512-sentinels",
     )?;
 
+    // The narrow kernel's edge: 256 assignments to one expert at one token per
+    // tile — every lane of its packed scan at its largest total (256 rows, 256
+    // tiles) — and one assignment either side of the bound, each kernel's.
+    assert_bucketize_case(
+        &device,
+        vec![511u32; 256],
+        128,
+        2,
+        512,
+        1,
+        "narrow-one-expert-256x1",
+    )?;
+    assert_bucketize_case(
+        &device,
+        (0..256u32).map(|i| (i * 7) % 3).collect(),
+        256,
+        1,
+        3,
+        1,
+        "narrow-256-k1-three-experts",
+    )?;
+    assert_bucketize_case(
+        &device,
+        (0..257u32).map(|i| (i * 7) % 3).collect(),
+        257,
+        1,
+        3,
+        1,
+        "general-257-k1-three-experts",
+    )?;
+
+    // A skewed bulk prefill: a third of every assignment to one expert, so a
+    // warp's lanes share an expert more often than not and one bucket spans
+    // every tile of the walk; the rest strided over the table, a sentinel in
+    // every 97th slot.
+    assert_bucketize_case(
+        &device,
+        (0..8192u32 * 10)
+            .map(|i| match (i % 3, i % 97) {
+                (_, 0) => 512,
+                (0, _) => 5,
+                _ => (i.wrapping_mul(2654435761) >> 7) % 512,
+            })
+            .collect(),
+        8192,
+        10,
+        512,
+        64,
+        "e512-skewed-8192",
+    )?;
+
     // Seeded fuzz across prefill-like shapes, with a sprinkle of sentinels.
     let mut rng = StdRng::seed_from_u64(0xb0cc_e71e);
     for &(n_tokens, k, n_experts, tile_w) in &[
@@ -10166,6 +10513,19 @@ fn cuda_moe_bucketize_matches_cpu_reference() -> Result<()> {
         (2048, 10, 512, 32),
         (64, 10, 257, 32),
         (33, 10, 512, 16),
+        // Either side of the narrow kernel's bound, and a verify's width.
+        (5, 10, 512, 32),
+        (25, 10, 512, 32),
+        (32, 8, 128, 32),
+        (8, 32, 512, 32),
+        (257, 1, 512, 1),
+        (26, 10, 512, 32),
+        // Bulk-prefill widths at the wide tile modes, where the scatter walks
+        // the list in many block-wide tiles: an exact multiple of the tile, a
+        // partial last tile, and the 8,192-row chunk.
+        (4096, 10, 512, 128),
+        (4097, 10, 512, 64),
+        (8192, 10, 512, 64),
     ] {
         let ids: Vec<u32> = (0..n_tokens * k)
             .map(|_| {
@@ -10317,7 +10677,10 @@ impl TestRing {
 
     fn set_sweep(&self, n: u32) {
         unsafe {
-            std::ptr::write_volatile((self.host as *mut u8).add(self.reserve_at + 4) as *mut u32, n)
+            std::ptr::write_volatile(
+                (self.host as *mut u8).add(self.reserve_at + 4) as *mut u32,
+                n,
+            )
         }
     }
 
@@ -10331,7 +10694,8 @@ impl TestRing {
 
     fn mark_ptr(&self, row: usize, e: usize) -> *mut u32 {
         unsafe {
-            ((self.host as *mut u8).add(self.cap * 16 + 8) as *mut u32).add(row * self.n_experts + e)
+            ((self.host as *mut u8).add(self.cap * 16 + 8) as *mut u32)
+                .add(row * self.n_experts + e)
         }
     }
 
@@ -10348,24 +10712,32 @@ impl TestRing {
     }
 
     fn log(&self, i: usize) -> u64 {
-        unsafe { std::ptr::read_volatile((self.host as *const u8).add(self.cap * 8 + 8 * i) as *const u64) }
+        unsafe {
+            std::ptr::read_volatile((self.host as *const u8).add(self.cap * 8 + 8 * i) as *const u64)
+        }
     }
 
     fn head(&self) -> u32 {
-        unsafe { std::ptr::read_volatile((self.host as *const u8).add(self.cap * 16) as *const u32) }
+        unsafe {
+            std::ptr::read_volatile((self.host as *const u8).add(self.cap * 16) as *const u32)
+        }
     }
 
     /// Set head and tail, an empty ring positioned at `at`.
     fn start_at(&self, at: u32) {
         unsafe {
             std::ptr::write_volatile((self.host as *mut u8).add(self.cap * 16) as *mut u32, at);
-            std::ptr::write_volatile((self.host as *mut u8).add(self.cap * 16 + 4) as *mut u32, at);
+            std::ptr::write_volatile(
+                (self.host as *mut u8).add(self.cap * 16 + 4) as *mut u32,
+                at,
+            );
         }
     }
 
     /// Publish empty `slots` at `tail`, then advance `tail` past them.
     fn push(&self, slots: &[u64]) {
-        let offers: Vec<(u64, Option<(u64, [u64; 3])>)> = slots.iter().map(|&s| (s, None)).collect();
+        let offers: Vec<(u64, Option<(u64, [u64; 3])>)> =
+            slots.iter().map(|&s| (s, None)).collect();
         self.offer(&offers);
     }
 
@@ -10394,7 +10766,7 @@ impl TestRing {
 impl Drop for TestRing {
     fn drop(&mut self) {
         unsafe {
-            cudarc::driver::sys::cuMemFreeHost(self.host);
+            cuMemFreeHost(self.host);
         }
     }
 }
@@ -10456,14 +10828,26 @@ fn cuda_moe_bucketize_promotes_remote_experts_from_the_ring() -> Result<()> {
     let run = |ws: &mut MoeBucketizeWorkspace, seq: u32| run_with(ws, seq, &DecodeRows::prefix(1));
 
     ring.push(&[0xd000]);
-    assert_eq!(run(&mut ws, 1)?, vec![0xd000, 0], "one slot: the first remote expert");
+    assert_eq!(
+        run(&mut ws, 1)?,
+        vec![0xd000, 0],
+        "one slot: the first remote expert"
+    );
     assert_eq!(ring.head(), 4);
     assert_eq!(ring.log(3), (1 << 32) | (9 << 16) | 1);
-    assert_eq!((ring.mark(9, 1), ring.mark(9, 5)), (1, 0), "e1 marked in flight");
+    assert_eq!(
+        (ring.mark(9, 1), ring.mark(9, 5)),
+        (1, 0),
+        "e1 marked in flight"
+    );
 
     // e1 is still in flight: only e5 takes a slot.
     ring.push(&[0xa000, 0xb000]);
-    assert_eq!(run(&mut ws, 2)?, vec![0, 0xa000], "the marked expert is not promoted twice");
+    assert_eq!(
+        run(&mut ws, 2)?,
+        vec![0, 0xa000],
+        "the marked expert is not promoted twice"
+    );
     assert_eq!(ring.head(), 5);
     assert_eq!(ring.log(0), (2 << 32) | (9 << 16) | 5);
     assert_eq!(ring.mark(9, 5), 2);
@@ -10636,11 +11020,21 @@ fn cuda_moe_bucketize_claims_victims_and_skips_its_own_routed_ones() -> Result<(
             ticket: 0,
             owner,
         };
-        moe_bucketize(&t, n, 2, &mut ws, Some(&live), &DecodeRows::prefix(ids.len() / 2))
+        moe_bucketize(
+            &t,
+            n,
+            2,
+            &mut ws,
+            Some(&live),
+            &DecodeRows::prefix(ids.len() / 2),
+        )
     };
 
     launch(1, &[5, 1, 1, 6, 5, 6], 7)?;
-    assert_eq!(dev.memcpy_dtov(&remote_dst.slice(..2))?, vec![0xd000, 0xf000]);
+    assert_eq!(
+        dev.memcpy_dtov(&remote_dst.slice(..2))?,
+        vec![0xd000, 0xf000]
+    );
     assert_eq!(ring.head(), 3, "two claims and a skip");
     let logged = |e: u64| (7u64 << 32) | (1 << 16) | e;
     assert_eq!(
@@ -10656,7 +11050,10 @@ fn cuda_moe_bucketize_claims_victims_and_skips_its_own_routed_ones() -> Result<(
     for (p, &v) in r17.iter().enumerate() {
         want[p * rows * n + n + 7] = v;
     }
-    assert_eq!(after, want, "only the two claimed victims retargeted, in all three planes");
+    assert_eq!(
+        after, want,
+        "only the two claimed victims retargeted, in all three planes"
+    );
 
     // Row 2 now routes its displaced expert: pinned, from the entry it reads.
     ring.clear_mark(1, 1);
@@ -10665,9 +11062,13 @@ fn cuda_moe_bucketize_claims_victims_and_skips_its_own_routed_ones() -> Result<(
     let s = dev.memcpy_dtov(&summary)?;
     assert_eq!(s[3] & (1 << 29), 1 << 29, "(2, 3) is pinned");
     assert_eq!(s[0] & (3 << 29), 0, "(2, 0) is still in VRAM");
-    assert_eq!(dev.memcpy_dtov(&remote_dst.slice(..1))?, vec![0], "nothing left to claim");
+    assert_eq!(
+        dev.memcpy_dtov(&remote_dst.slice(..1))?,
+        vec![0],
+        "nothing left to claim"
+    );
     unsafe {
-        cudarc::driver::sys::cuMemFreeHost(owners_h);
+        cuMemFreeHost(owners_h);
     }
     Ok(())
 }
@@ -10741,7 +11142,11 @@ fn cuda_moe_bucketize_a_prompt_only_expert_takes_only_an_empty_offer() -> Result
         owner: OwnerCheck::default(),
     };
     moe_bucketize(&t, 8, 2, &mut ws, Some(&live), &DecodeRows::none())?;
-    assert_eq!(dev.memcpy_dtov(&remote_dst.slice(..1))?[0], 0xb000, "an empty offer it takes");
+    assert_eq!(
+        dev.memcpy_dtov(&remote_dst.slice(..1))?[0],
+        0xb000,
+        "an empty offer it takes"
+    );
     assert_eq!(ring2.head(), 1, "and only that one");
     Ok(())
 }
@@ -10786,7 +11191,11 @@ fn cuda_moe_bucketize_claims_nothing_on_a_sweep() -> Result<()> {
         Ok(dev.memcpy_dtov(&remote_dst.slice(..2))?)
     };
     ring.set_sweep(1);
-    assert_eq!(run(1)?, vec![0, 0], "two claiming experts over a sweep word of 1");
+    assert_eq!(
+        run(1)?,
+        vec![0, 0],
+        "two claiming experts over a sweep word of 1"
+    );
     assert_eq!(ring.head(), 0, "a sweep takes nothing");
     ring.set_sweep(2);
     assert_eq!(run(2)?, vec![0xa000, 0xb000], "within it, both claim");
@@ -10911,15 +11320,27 @@ fn run_bucketize_live(
     let hd = dev.memcpy_dtov(&ws.header.slice(..5))?;
     let mut summary = dev.memcpy_dtov(&summary_dev)?;
     assert_eq!(summary.pop(), Some(77), "summary sequence word");
-    assert_eq!(dev.memcpy_dtov(&counters_dev)?, vec![0, 0, 0], "launch counters zeroed");
+    assert_eq!(
+        dev.memcpy_dtov(&counters_dev)?,
+        vec![0, 0, 0],
+        "launch counters zeroed"
+    );
     // The snapshot holds every routed expert's three entries as read, and
     // nothing else is written.
     let snap = dev.memcpy_dtov(&snap_dev)?;
     for e in 0..n_experts {
         let routed = summary[e] & 0x1fff_ffff != 0;
         for p in 0..3 {
-            let want = if routed { table[p * n_experts + e] } else { 0xffff_ffff };
-            assert_eq!(snap[p * n_experts + e], want, "snapshot of expert {e}, projection {p}");
+            let want = if routed {
+                table[p * n_experts + e]
+            } else {
+                0xffff_ffff
+            };
+            assert_eq!(
+                snap[p * n_experts + e],
+                want,
+                "snapshot of expert {e}, projection {p}"
+            );
         }
     }
     let remote_all = dev.memcpy_dtov(&remote_dev)?;
@@ -11007,13 +11428,21 @@ fn cuda_moe_bucketize_live_table_orders_remote_first() -> Result<()> {
     // a host retarget caught half-way must never reach a block as an address.
     let got = run_bucketize_live(&dev, &ids, 3, 2, 8, 2, &class, &[3], &DecodeRows::prefix(1))?;
     assert_eq!(got.header, [4, 6, 4, 3, 3], "header, e3 cold");
-    assert_eq!(got.tile_b_start, vec![0, 2, 3, 5, 0, 0], "tile_b_start, e3 cold");
+    assert_eq!(
+        got.tile_b_start,
+        vec![0, 2, 3, 5, 0, 0],
+        "tile_b_start, e3 cold"
+    );
     assert_eq!(
         got.remote,
         vec![[1, 0, 1, 0], [3, 1, 1, 1], [5, 2, 1, 1]],
         "remote list, e3 cold"
     );
-    assert_eq!(got.tile_expert, vec![1, 3, 5, 6, 0, 0], "tile_expert, e3 cold");
+    assert_eq!(
+        got.tile_expert,
+        vec![1, 3, 5, 6, 0, 0],
+        "tile_expert, e3 cold"
+    );
     assert_eq!(
         got.summary,
         vec![0, 2 | p | d, 0, 1 | c, 0, 2 | c | d, 1, 0],
@@ -11054,11 +11483,16 @@ fn cuda_moe_bucketize_live_table_orders_remote_first() -> Result<()> {
                 })
                 .collect();
             let decode_tokens = rng.random_range(0..=n_tokens);
-            let want = bucketize_ref_live(
-                &ids, n_tokens, k, n_experts, 32, &class, decode_tokens,
-            );
+            let want = bucketize_ref_live(&ids, n_tokens, k, n_experts, 32, &class, decode_tokens);
             let got = run_bucketize_live(
-                &dev, &ids, n_tokens, k, n_experts, 32, &class, &[],
+                &dev,
+                &ids,
+                n_tokens,
+                k,
+                n_experts,
+                32,
+                &class,
+                &[],
                 &DecodeRows::prefix(decode_tokens),
             )?;
             let label = format!("{n_tokens}x{k}-e{n_experts}-dense{dense}");
@@ -11076,11 +11510,273 @@ fn cuda_moe_bucketize_live_table_orders_remote_first() -> Result<()> {
             // The row tables are those of the all-VRAM order.
             let base = bucketize_ref(&ids, n_tokens, k, n_experts, 32);
             assert_eq!(got.perm, base.perm, "{label}: perm moved with the classes");
-            assert_eq!(got.tok_ids, base.tok_ids, "{label}: rows moved with the classes");
+            assert_eq!(
+                got.tok_ids, base.tok_ids,
+                "{label}: rows moved with the classes"
+            );
         }
     }
     Ok(())
 }
+
+/// FNV-1a over `bytes`, folded into `h`.
+fn fnv1a(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(0x100_0000_01b3);
+    }
+}
+
+/// Fold every value of `v` into `h`, little-endian.
+fn fnv1a_u32s(h: &mut u64, v: &[u32]) {
+    for x in v {
+        fnv1a(h, &x.to_le_bytes());
+    }
+}
+
+/// **Every byte bucketize writes, across a seeded sweep of launches, is the
+/// pinned digest.** Widths from a one-row draft step through a verify, a
+/// decode wave and prefill; dense, skewed and sentinel-strewn routing; and,
+/// over a two-row live table, every class mix from all-resident to half
+/// remote, with a promotion ring holding empty and victim offers (some of the
+/// launch's own row and routed — skipped), marks in flight, every reserve and
+/// sweep setting, and decode ranges from none through a prefix to scattered
+/// ranges. The digest covers the row and tile tables, the header, the summary
+/// with its sequence word, the remote list, the snapshot, the promotion slots,
+/// the zeroed counters, the live table after any retarget, the started words,
+/// and the ring's head, log and marks. The reference tests above pin what each
+/// output means; this pins that no phase moves a byte of any of them.
+#[test]
+fn cuda_moe_bucketize_output_digest() -> Result<()> {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let stream = dev.cuda_stream();
+    let mut rng = StdRng::seed_from_u64(0xd16e_57ed);
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    // (n_tokens, k, n_experts, tile_w)
+    let shapes: &[(usize, usize, usize, usize)] = &[
+        (1, 8, 128, 32),
+        (1, 10, 512, 32),
+        (2, 10, 512, 32),
+        (3, 8, 256, 16),
+        (5, 10, 512, 32),
+        (5, 10, 512, 64),
+        (8, 10, 512, 32),
+        (16, 10, 512, 32),
+        (16, 8, 128, 32),
+        (31, 10, 512, 128),
+        (51, 10, 512, 32),
+        (64, 10, 512, 32),
+        (64, 8, 128, 32),
+        (4, 32, 512, 32),
+        (1, 1, 4, 1),
+        (7, 3, 16, 2),
+        (205, 10, 512, 64),
+        (333, 8, 256, 32),
+        (713, 10, 512, 64),
+    ];
+    let rows = 2usize;
+    // At the narrow kernel's widths, launches whose walk claimed a slot,
+    // logged a skip, and retargeted a victim: the sweep must reach all three.
+    let (mut narrow_claims, mut narrow_skips, mut narrow_retargets) = (0, 0, 0);
+    for &(n_tokens, k, n_experts, tile_w) in shapes {
+        for variant in 0..7u32 {
+            let a_ub = n_tokens * k;
+            // Variant 6 routes everything to four experts: a warp's lanes share
+            // an expert far more often than not.
+            let span = if variant == 6 {
+                n_experts.min(4)
+            } else {
+                n_experts
+            };
+            let ids: Vec<u32> = (0..a_ub)
+                .map(|_| {
+                    if rng.random_ratio(1, 20) {
+                        n_experts as u32 + rng.random_range(0..2)
+                    } else {
+                        rng.random_range(0..span as u32)
+                    }
+                })
+                .collect();
+            fnv1a_u32s(&mut h, &ids);
+            let t = crate::Tensor::from_vec(ids, (n_tokens, k), &device)?;
+            let mut ws = MoeBucketizeWorkspace::new(&dev, n_tokens, k)?;
+            let mut decode = DecodeRows::none();
+            match rng.random_range(0..3) {
+                0 => {}
+                1 => {
+                    decode.push(0, rng.random_range(0..=n_tokens));
+                }
+                _ => {
+                    for _ in 0..rng.random_range(1..4) {
+                        let lo = rng.random_range(0..n_tokens);
+                        decode.push(lo, rng.random_range(lo..=n_tokens));
+                    }
+                }
+            }
+            if variant == 0 {
+                moe_bucketize(&t, n_experts, tile_w, &mut ws, None, &decode)?;
+            } else {
+                // 1 in `remote_one_in` of the live table's entries is remote.
+                let remote_one_in = [0u32, 0, 16, 3, 2, 8, 4][variant as usize];
+                let plane = rows * n_experts;
+                let mut table = vec![0u64; 3 * plane];
+                for i in 0..plane {
+                    let e = (i % n_experts) as u64;
+                    let vram = 0x10_0000 + i as u64 * 0x100;
+                    let remote = remote_one_in != 0 && rng.random_ratio(1, remote_one_in);
+                    let (g, cold_plane) = if !remote {
+                        (vram, 3)
+                    } else {
+                        match rng.random_range(0..4) {
+                            0 => (TEST_PINNED[0].0 + i as u64 * 0x100, 3),
+                            1 => (TEST_PINNED[1].0 + e * 0x100, 3),
+                            2 => (0, 0),
+                            _ => (vram, rng.random_range(1..3)),
+                        }
+                    };
+                    table[i] = g;
+                    for p in 1..3 {
+                        table[p * plane + i] = if cold_plane == p || g == 0 {
+                            0
+                        } else {
+                            g + 0x10 * p as u64
+                        };
+                    }
+                }
+                let row = rng.random_range(0..rows);
+                let table_dev = dev.memcpy_stod(&table)?;
+                let snap = dev.memcpy_stod(&vec![0x5a5a_5a5a_5a5a_5a5au64; 3 * n_experts])?;
+                let summary = dev.memcpy_stod(&vec![0xdead_beefu32; n_experts + 1])?;
+                let remote = dev.memcpy_stod(&vec![-1i32; 4 * n_experts])?;
+                let counters = dev.memcpy_stod(&[7i32, 7, 7])?;
+                let remote_dst = dev.memcpy_stod(&vec![7u64; n_experts])?;
+                let started = dev.memcpy_stod(&vec![0u64; rows])?;
+                let ring = TestRing::new(8, rows, n_experts);
+                let head_at = rng.random_range(0..20);
+                ring.start_at(head_at);
+                ring.set_reserve([0u32, 1, 2, u32::MAX][rng.random_range(0..4)]);
+                ring.set_sweep([u32::MAX, u32::MAX, 0, 1, 2, 5][rng.random_range(0..6)]);
+                for _ in 0..rng.random_range(0..4) {
+                    // SAFETY: inside the ring's mapped marks.
+                    unsafe {
+                        std::ptr::write_volatile(ring.mark_ptr(row, rng.random_range(0..span)), 3)
+                    };
+                }
+                let offers: Vec<(u64, Option<(u64, [u64; 3])>)> = (0..rng.random_range(0..8))
+                    .map(|o| {
+                        let slot = 0xa000 + o as u64 * 0x1000;
+                        if rng.random_ratio(1, 2) {
+                            (slot, None)
+                        } else {
+                            // Half the victims sit in the launch's own row,
+                            // among the experts it routes most.
+                            let ve = rng.random_range(0..span);
+                            let vr = if rng.random_ratio(1, 2) {
+                                row
+                            } else {
+                                rng.random_range(0..rows)
+                            };
+                            let r = 0x9000_0000 + (vr * n_experts + ve) as u64 * 0x100;
+                            (
+                                slot,
+                                Some(((vr * n_experts + ve) as u64, [r, r + 0x10, r + 0x20])),
+                            )
+                        }
+                    })
+                    .collect();
+                ring.offer(&offers);
+                let live = BucketizeLive {
+                    gate_row: table_dev.device_ptr(&stream).0 + (row * n_experts * 8) as u64,
+                    table_plane: plane as i64,
+                    snap: snap.device_ptr(&stream).0,
+                    pinned: TEST_PINNED,
+                    summary: summary.device_ptr(&stream).0,
+                    summary_seq: 40 + variant,
+                    remote: remote.device_ptr(&stream).0,
+                    counters: counters.device_ptr(&stream).0,
+                    row: row as i32,
+                    promo: if variant == 1 && n_tokens > 8 {
+                        None
+                    } else {
+                        Some(ring.ring())
+                    },
+                    remote_dst: remote_dst.device_ptr(&stream).0,
+                    started_rows: started.device_ptr(&stream).0,
+                    ticket: 1000 + variant as u64,
+                    owner: OwnerCheck::default(),
+                };
+                moe_bucketize(&t, n_experts, tile_w, &mut ws, Some(&live), &decode)?;
+                fnv1a_u32s(&mut h, &dev.memcpy_dtov(&summary)?);
+                for v in dev.memcpy_dtov(&remote)? {
+                    fnv1a(&mut h, &v.to_le_bytes());
+                }
+                for v in dev.memcpy_dtov(&counters)? {
+                    fnv1a(&mut h, &v.to_le_bytes());
+                }
+                for buf in [&snap, &remote_dst, &table_dev, &started] {
+                    for v in dev.memcpy_dtov(buf)? {
+                        fnv1a(&mut h, &v.to_le_bytes());
+                    }
+                }
+                fnv1a(&mut h, &ring.head().to_le_bytes());
+                for i in 0..8 {
+                    fnv1a(&mut h, &ring.log(i).to_le_bytes());
+                }
+                if a_ub <= 256 {
+                    let logged: Vec<u64> = (0..8).map(|i| ring.log(i)).collect();
+                    narrow_claims += usize::from(
+                        logged
+                            .iter()
+                            .any(|&l| l != 0 && l & 0xffff != PROMO_SKIP as u64),
+                    );
+                    narrow_skips += usize::from(
+                        logged
+                            .iter()
+                            .any(|&l| l != 0 && l & 0xffff == PROMO_SKIP as u64),
+                    );
+                    narrow_retargets += usize::from(dev.memcpy_dtov(&table_dev)? != table);
+                    assert!(ring.head() >= head_at, "head never moves back");
+                }
+                for r in 0..rows {
+                    for e in 0..n_experts {
+                        fnv1a(&mut h, &ring.mark(r, e).to_le_bytes());
+                    }
+                }
+            }
+            for v in dev.memcpy_dtov(&ws.header.slice(..5))? {
+                fnv1a(&mut h, &v.to_le_bytes());
+            }
+            for buf in [&ws.tok_ids, &ws.weight_ids, &ws.perm, &ws.rw_ids] {
+                fnv1a_u32s(&mut h, &dev.memcpy_dtov(&buf.slice(..a_ub))?);
+            }
+            for buf in [&ws.tile_expert, &ws.tile_b_start, &ws.tile_b_cnt] {
+                for v in dev.memcpy_dtov(&buf.slice(..a_ub))? {
+                    fnv1a(&mut h, &v.to_le_bytes());
+                }
+            }
+            for v in dev.memcpy_dtov(&ws.token_starts.slice(..n_tokens + 1))? {
+                fnv1a(&mut h, &v.to_le_bytes());
+            }
+        }
+    }
+    assert!(
+        narrow_claims > 0 && narrow_skips > 0 && narrow_retargets > 0,
+        "the narrow widths' walk coverage: {narrow_claims} claiming, {narrow_skips} skipping, \
+         {narrow_retargets} retargeting launches"
+    );
+    assert_eq!(
+        h, BUCKETIZE_OUTPUT_DIGEST,
+        "bucketize output digest: {h:#018x}"
+    );
+    Ok(())
+}
+
+/// [`cuda_moe_bucketize_output_digest`]'s expected value.
+const BUCKETIZE_OUTPUT_DIGEST: u64 = 0x6327_c589_8236_423d;
 
 /// A live expert table for the worker tests: `n_experts` KO experts with a VRAM
 /// copy each and a pinned host copy each (`cuMemAllocHost`, one block), and a
@@ -11104,7 +11800,13 @@ struct LiveFixture {
 }
 
 impl LiveFixture {
-    fn new(dev: &CudaDevice, n_experts: usize, nrows: usize, ncols: usize, seed: u64) -> Result<Self> {
+    fn new(
+        dev: &CudaDevice,
+        n_experts: usize,
+        nrows: usize,
+        ncols: usize,
+        seed: u64,
+    ) -> Result<Self> {
         use cudarc::driver::sys;
         use rand::rngs::StdRng;
         use rand::SeedableRng;
@@ -11116,7 +11818,10 @@ impl LiveFixture {
                 .map(|_| rng.random_range(-1.0..1.0))
                 .collect();
             let mut q = QCudaStorage::zeros(dev, ncols * nrows, GgmlDType::Q6_K)?;
-            q.quantize(&CudaStorage::wrap_cuda_slice(dev.memcpy_stod(&w)?, dev.clone()))?;
+            q.quantize(&CudaStorage::wrap_cuda_slice(
+                dev.memcpy_stod(&w)?,
+                dev.clone(),
+            ))?;
             storages.push(q.repack_ko(&shape, GgmlDType::Q6_KO)?);
         }
         let expert_bytes = storages[0].storage_size_in_bytes();
@@ -11253,14 +11958,33 @@ enum Slotted {
 }
 
 /// The token-tile modes the host tile builder and every device-table launch share,
-/// at each band's edges — and the decode width for formats without wide kernels.
+/// at each band's edges: affine KO formats run mode-4 from 32 rows/expert, MXFP4 mode-4
+/// below 64 and mode-8 from there, a table shared with a non-KO format the decode width.
 #[test]
 fn grouped_int8_tile_mode_bands() {
+    let rows = [0, 31, 32, 63, 64, 127, 128, 300];
     assert_eq!(
-        [0, 31, 32, 63, 64, 127, 128, 300].map(|rows| grouped_int8_n_sub(rows, true)),
-        [2, 2, 4, 4, 8, 8, 4, 4],
+        rows.map(|r| grouped_int8_n_sub(r, &[GgmlDType::Q4_KO])),
+        [2, 2, 4, 4, 4, 4, 4, 4],
     );
-    assert_eq!(grouped_int8_n_sub(300, false), 2);
+    assert_eq!(
+        rows.map(|r| grouped_int8_n_sub(r, &[GgmlDType::Q8_KO, GgmlDType::Q6_KO])),
+        [2, 2, 4, 4, 4, 4, 4, 4],
+    );
+    assert_eq!(
+        rows.map(|r| grouped_int8_n_sub(r, &[GgmlDType::MXFP4_KO])),
+        [2, 2, 4, 4, 8, 8, 8, 8],
+    );
+    assert_eq!(
+        rows.map(|r| grouped_int8_n_sub(r, &[GgmlDType::Q4_KO, GgmlDType::MXFP4_KO])),
+        [2, 2, 4, 4, 8, 8, 8, 8],
+    );
+    assert_eq!(grouped_int8_n_sub(300, &[GgmlDType::Q4_K]), 2);
+    assert_eq!(
+        grouped_int8_n_sub(300, &[GgmlDType::Q4_KO, GgmlDType::Q4_K]),
+        2
+    );
+    assert_eq!(grouped_int8_n_sub(300, &[]), 2);
 }
 
 /// One live launch at token-tile mode `n_sub` (tiles `16·n_sub` wide) against the
@@ -11285,7 +12009,9 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
     let ids: Vec<u32> = (0..a_ub)
         .map(|_| rng.random_range(0..n_experts as u32))
         .collect();
-    let class: Vec<u8> = (0..n_experts).map(|e| [CLS_PINNED, CLS_COLD, CLS_VRAM][e % 3]).collect();
+    let class: Vec<u8> = (0..n_experts)
+        .map(|e| [CLS_PINNED, CLS_COLD, CLS_VRAM][e % 3])
+        .collect();
     let reference = bucketize_ref_live(&ids, n_tokens, k, n_experts, tile_w, &class, n_tokens);
     let total_valid = reference.header[1] as usize;
     let n_remote = reference.header[3] as u64;
@@ -11312,8 +12038,19 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
         &DecodeRows::prefix(n_tokens),
     )?;
     let want = grouped_qmatmul_dev_q8a128(
-        &op, &full_table, 0, n_experts, GgmlDType::Q6_KO, nrows, &ws_ref.tile_expert,
-        &ws_ref.tile_b_start, &ws_ref.tile_b_cnt, a_ub, n_sub, None, &dev,
+        &op,
+        &full_table,
+        0,
+        n_experts,
+        GgmlDType::Q6_KO,
+        nrows,
+        &ws_ref.tile_expert,
+        &ws_ref.tile_b_start,
+        &ws_ref.tile_b_cnt,
+        a_ub,
+        n_sub,
+        None,
+        &dev,
     )?;
     let want = read_f32_tensor(&dev, &want)?;
 
@@ -11349,7 +12086,10 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
         Slotted::All => n_remote,
         Slotted::Half => n_remote / 2,
     };
-    assert!(n_slotted > 0, "the fixture must slot at least one remote expert");
+    assert!(
+        n_slotted > 0,
+        "the fixture must slot at least one remote expert"
+    );
     let promo_slots = dev.memcpy_stod(&vec![0u8; n_remote as usize * fx.expert_bytes])?;
     let remote_dst = dev.memcpy_stod(&vec![0u64; n_experts])?;
     let (pp, _g8) = promo_slots.device_ptr(&stream);
@@ -11360,7 +12100,10 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
             .map(|i| pp + i * fx.expert_bytes as u64)
             .collect::<Vec<u64>>(),
     );
-    let pinned = [(fx.host as u64, fx.host as u64 + fx.host_bytes as u64), (0, 0)];
+    let pinned = [
+        (fx.host as u64, fx.host as u64 + fx.host_bytes as u64),
+        (0, 0),
+    ];
     let blive = BucketizeLive {
         gate_row: fx.table_d,
         table_plane: n_experts as i64,
@@ -11402,8 +12145,19 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
         workers: W as i32,
     };
     let got = grouped_qmatmul_dev_q8a128(
-        &op, table, 0, n_experts, GgmlDType::Q6_KO, nrows, &ws.tile_expert, &ws.tile_b_start,
-        &ws.tile_b_cnt, a_ub, n_sub, Some(&live), &dev,
+        &op,
+        table,
+        0,
+        n_experts,
+        GgmlDType::Q6_KO,
+        nrows,
+        &ws.tile_expert,
+        &ws.tile_b_start,
+        &ws.tile_b_cnt,
+        a_ub,
+        n_sub,
+        Some(&live),
+        &dev,
     )?;
     // Work queued behind the launch, then the cold experts published late.
     let tail = (&tail + 1.0)?;
@@ -11422,11 +12176,21 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
     let got = read_f32_tensor(&dev, &got)?;
     let n_cmp = total_valid * nrows;
     assert_eq!(
-        got[..n_cmp].iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
-        want[..n_cmp].iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+        got[..n_cmp]
+            .iter()
+            .map(|f| f.to_bits())
+            .collect::<Vec<u32>>(),
+        want[..n_cmp]
+            .iter()
+            .map(|f| f.to_bits())
+            .collect::<Vec<u32>>(),
         "the live launch must equal the all-VRAM launch"
     );
-    assert_eq!(tail.flatten_all()?.get(0)?.to_scalar::<f32>()?, 1.0, "the queued work ran");
+    assert_eq!(
+        tail.flatten_all()?.get(0)?.to_scalar::<f32>()?,
+        1.0,
+        "the queued work ran"
+    );
     let c = dev.memcpy_dtov(&stall)?;
     let items = n_remote * (nrows as u64 / 32);
     assert_eq!(c[1], items, "every remote item once");
@@ -11437,19 +12201,35 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
         "cold wait {} ns for a {delay:?} delay",
         c[0]
     );
-    assert_eq!(dev.memcpy_dtov(&counters)?[0] as u64, items + W as u64, "counter: every item, then one past per worker");
+    assert_eq!(
+        dev.memcpy_dtov(&counters)?[0] as u64,
+        items + W as u64,
+        "counter: every item, then one past per worker"
+    );
 
     // The first `n_slotted` remote experts took a promotion slot, in list
     // order, and the workers left each projection there byte for byte.
-    assert_eq!(ring.head() as u64, n_slotted, "one slot per slotted remote expert");
+    assert_eq!(
+        ring.head() as u64,
+        n_slotted,
+        "one slot per slotted remote expert"
+    );
     let promoted = dev.memcpy_dtov(&promo_slots)?;
     for (i, r) in reference.remote.iter().enumerate().take(n_slotted as usize) {
         let e = r[0] as usize;
-        assert_eq!(ring.log(i), (1 << 32) | (3 << 16) | e as u64, "log entry {i}");
+        assert_eq!(
+            ring.log(i),
+            (1 << 32) | (3 << 16) | e as u64,
+            "log entry {i}"
+        );
         let mut want = vec![0u8; fx.expert_bytes];
         unsafe {
             assert_eq!(
-                sys::cuMemcpyDtoH_v2(want.as_mut_ptr() as *mut c_void, fx.vram_ptrs[e], fx.expert_bytes),
+                sys::cuMemcpyDtoH_v2(
+                    want.as_mut_ptr() as *mut c_void,
+                    fx.vram_ptrs[e],
+                    fx.expert_bytes
+                ),
                 sys::CUresult::CUDA_SUCCESS
             );
         }
@@ -11532,7 +12312,10 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
 
     // One routed launch: `ids` is `[n_tokens]` (top-1), rows sorted by
     // bucketize. Returns (output, mean µs per launch).
-    let run = |table: &cudarc::driver::CudaSlice<u64>, ids: &[u32], iters: usize| -> Result<(Vec<f32>, f64)> {
+    let run = |table: &cudarc::driver::CudaSlice<u64>,
+               ids: &[u32],
+               iters: usize|
+     -> Result<(Vec<f32>, f64)> {
         let n_tokens = ids.len();
         let t = crate::Tensor::from_vec(ids.to_vec(), (n_tokens, 1), &device)?;
         let mut ws = MoeBucketizeWorkspace::new(&dev, n_tokens, 1)?;
@@ -11546,7 +12329,9 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
         )?;
         let a_ub = n_tokens;
         let launch_tiles = a_ub.min(a_ub.div_ceil(32) + n_experts);
-        let act: Vec<f32> = (0..a_ub * ncols).map(|i| ((i % 97) as f32 - 48.0) / 50.0).collect();
+        let act: Vec<f32> = (0..a_ub * ncols)
+            .map(|i| ((i % 97) as f32 - 48.0) / 50.0)
+            .collect();
         let op = quantize_acts_q8a128_test(&dev, &act, a_ub, ncols)?;
         let launch = || {
             grouped_qmatmul_dev_q8a128(
@@ -11594,7 +12379,10 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
 
     // ── 2. link throughput vs concurrent host-reading blocks ──
     println!("2. distinct experts (16 row-tile blocks each), one token tile each:");
-    println!("   {:>7} {:>7} {:>11} {:>9} {:>11} {:>9}", "experts", "blocks", "vram µs", "vram GB/s", "pinned µs", "pin GB/s");
+    println!(
+        "   {:>7} {:>7} {:>11} {:>9} {:>11} {:>9}",
+        "experts", "blocks", "vram µs", "vram GB/s", "pinned µs", "pin GB/s"
+    );
     for m in [1usize, 2, 4, 8, 16, 32, 64] {
         let ids: Vec<u32> = (0..m as u32).collect();
         let (_, vus) = run(&vram_table, &ids, 20)?;
@@ -11645,18 +12433,34 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
         }
         let stable = dev.memcpy_stod(&sptrs)?;
         println!("2b. 32-row experts, one block each (pinned):");
-        println!("   {:>7} {:>11} {:>9} {:>14}", "blocks", "pinned µs", "GB/s", "GB/s per block");
+        println!(
+            "   {:>7} {:>11} {:>9} {:>14}",
+            "blocks", "pinned µs", "GB/s", "GB/s per block"
+        );
         for m in [1usize, 2, 4, 8, 16] {
             let ids: Vec<u32> = (0..m as u32).collect();
             let t = crate::Tensor::from_vec(ids.clone(), (m, 1), &device)?;
             let mut ws = MoeBucketizeWorkspace::new(&dev, m, 1)?;
             moe_bucketize(&t, n_experts, 32, &mut ws, None, &DecodeRows::prefix(m))?;
-            let act: Vec<f32> = (0..m * ncols).map(|i| ((i % 97) as f32 - 48.0) / 50.0).collect();
+            let act: Vec<f32> = (0..m * ncols)
+                .map(|i| ((i % 97) as f32 - 48.0) / 50.0)
+                .collect();
             let op = quantize_acts_q8a128_test(&dev, &act, m, ncols)?;
             let launch = || {
                 grouped_qmatmul_dev_q8a128(
-                    &op, &stable, 0, n_experts, ko_dtype, small_rows, &ws.tile_expert,
-                    &ws.tile_b_start, &ws.tile_b_cnt, m.min(m.div_ceil(32) + n_experts), 2, None, &dev,
+                    &op,
+                    &stable,
+                    0,
+                    n_experts,
+                    ko_dtype,
+                    small_rows,
+                    &ws.tile_expert,
+                    &ws.tile_b_start,
+                    &ws.tile_b_cnt,
+                    m.min(m.div_ceil(32) + n_experts),
+                    2,
+                    None,
+                    &dev,
                 )
             };
             for _ in 0..3 {
@@ -11679,7 +12483,10 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
 
     // ── 3. re-reads: one expert, T token tiles ──
     println!("3. one expert, T token tiles of 32:");
-    println!("   {:>3} {:>11} {:>11} {:>14}", "T", "vram µs", "pinned µs", "pinned/T=1");
+    println!(
+        "   {:>3} {:>11} {:>11} {:>14}",
+        "T", "vram µs", "pinned µs", "pinned/T=1"
+    );
     let mut p1 = 0.0;
     for tiles in [1usize, 2, 4, 8] {
         let ids = vec![0u32; tiles * 32];
@@ -11688,14 +12495,24 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
         if tiles == 1 {
             p1 = pus;
         }
-        println!("   {:>3} {:>11.1} {:>11.1} {:>14.2}", tiles, vus, pus, pus / p1);
+        println!(
+            "   {:>3} {:>11.1} {:>11.1} {:>14.2}",
+            tiles,
+            vus,
+            pus,
+            pus / p1
+        );
     }
 
     // ── 4. interference: VRAM tiles beside pinned tiles in one launch ──
     // Prefill-like VRAM work: 32 VRAM experts × 4 token tiles; pinned work: 8
     // pinned experts × 1 token tile.
-    let vram_ids: Vec<u32> = (0..32u32).flat_map(|e| std::iter::repeat_n(e, 128)).collect();
-    let pin_ids: Vec<u32> = (32..40u32).flat_map(|e| std::iter::repeat_n(e, 32)).collect();
+    let vram_ids: Vec<u32> = (0..32u32)
+        .flat_map(|e| std::iter::repeat_n(e, 128))
+        .collect();
+    let pin_ids: Vec<u32> = (32..40u32)
+        .flat_map(|e| std::iter::repeat_n(e, 32))
+        .collect();
     let both: Vec<u32> = vram_ids.iter().chain(pin_ids.iter()).copied().collect();
     let (_, a_us) = run(&mixed_table, &vram_ids, 20)?;
     let (_, b_us) = run(&mixed_table, &pin_ids, 20)?;
@@ -11703,14 +12520,20 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
     println!("4. interference (one launch):");
     println!("   VRAM tiles alone   {a_us:>9.1} µs");
     println!("   pinned tiles alone {b_us:>9.1} µs");
-    println!("   both together      {c_us:>9.1} µs   (sum {:.1}, max {:.1})", a_us + b_us, a_us.max(b_us));
+    println!(
+        "   both together      {c_us:>9.1} µs   (sum {:.1}, max {:.1})",
+        a_us + b_us,
+        a_us.max(b_us)
+    );
     // The same with the pinned tiles FIRST in tile order — the order revision 2
     // dispatches them in: experts 0..32 pinned, 32..64 in VRAM.
     let first_ptrs: Vec<u64> = (0..n_experts)
         .map(|e| if e < 32 { host_ptrs[e] } else { vram_ptrs[e] })
         .collect();
     let first_table = dev.memcpy_stod(&first_ptrs)?;
-    let vram_ids2: Vec<u32> = (32..64u32).flat_map(|e| std::iter::repeat_n(e, 128)).collect();
+    let vram_ids2: Vec<u32> = (32..64u32)
+        .flat_map(|e| std::iter::repeat_n(e, 128))
+        .collect();
     let pin_ids2: Vec<u32> = (0..8u32).flat_map(|e| std::iter::repeat_n(e, 32)).collect();
     let both2: Vec<u32> = pin_ids2.iter().chain(vram_ids2.iter()).copied().collect();
     let (_, a2) = run(&first_table, &vram_ids2, 20)?;
@@ -11741,7 +12564,11 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
         }
         stream.synchronize().map_err(crate::Error::wrap)?;
         let us = start.elapsed().as_secs_f64() * 1e6 / 10.0;
-        println!("SM reads of host memory (sum over {} MiB): {:.2} GB/s", (floats * 4) >> 20, gbps(floats * 4, us));
+        println!(
+            "SM reads of host memory (sum over {} MiB): {:.2} GB/s",
+            (floats * 4) >> 20,
+            gbps(floats * 4, us)
+        );
         std::mem::forget(t);
     }
 
@@ -11760,7 +12587,12 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
         }
         stream.synchronize().map_err(crate::Error::wrap)?;
         let us = start.elapsed().as_secs_f64() * 1e6 / 20.0;
-        println!("   {:>3} experts {:>9.1} µs {:>7.2} GB/s", m, us, gbps(bytes, us));
+        println!(
+            "   {:>3} experts {:>9.1} µs {:>7.2} GB/s",
+            m,
+            us,
+            gbps(bytes, us)
+        );
     }
     unsafe {
         sys::cuMemFreeHost(host);
@@ -11936,7 +12768,10 @@ fn bench_pinned_host_read_bandwidth() -> Result<()> {
     };
 
     println!("1. flat 16-byte loads, 256 threads/block, 4 in flight per thread (GB/s)");
-    println!("   {:>10} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}", "load", "32 blk", "82", "164", "328", "656", "1312");
+    println!(
+        "   {:>10} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "load", "32 blk", "82", "164", "328", "656", "1312"
+    );
     for name in ["rd_def", "rd_nc", "rd_cg", "rd_l2_128", "rd_l2_256"] {
         let f = module.load_function(name).map_err(crate::Error::wrap)?;
         let mut row = format!("   {name:>10}");
@@ -11990,8 +12825,13 @@ fn bench_pinned_host_read_bandwidth() -> Result<()> {
     }
 
     println!("3. the GEMM's pattern: one chunk per warp via cp.async, 128 threads/block (GB/s)");
-    println!("   {:>6} {:>8} {:>8} {:>7} {:>7} {:>7}", "chunk", "aligned", "hint", "16 blk", "82", "328");
-    let f = module.load_function("rd_chunks").map_err(crate::Error::wrap)?;
+    println!(
+        "   {:>6} {:>8} {:>8} {:>7} {:>7} {:>7}",
+        "chunk", "aligned", "hint", "16 blk", "82", "328"
+    );
+    let f = module
+        .load_function("rd_chunks")
+        .map_err(crate::Error::wrap)?;
     for chunk in [800i32, 896, 1024] {
         for aligned in [0i32, 1] {
             for hint in [0i32, 1, 2] {
@@ -12067,7 +12907,9 @@ fn bench_pinned_host_read_bandwidth() -> Result<()> {
 
     println!("5. the GEMM's address walk, 64 experts × 16 row-tile blocks (GB/s)");
     {
-        let f = module.load_function("rd_gemm_walk").map_err(crate::Error::wrap)?;
+        let f = module
+            .load_function("rd_gemm_walk")
+            .map_err(crate::Error::wrap)?;
         for depth in [1i32, 4] {
             let g = time(
                 &|| {
@@ -12095,7 +12937,12 @@ fn bench_pinned_host_read_bandwidth() -> Result<()> {
         let g = time(
             &|| {
                 let r = unsafe {
-                    sys::cuMemcpyHtoDAsync_v2(dst_ptr, host as *const c_void, BYTES, stream.cu_stream())
+                    sys::cuMemcpyHtoDAsync_v2(
+                        dst_ptr,
+                        host as *const c_void,
+                        BYTES,
+                        stream.cu_stream(),
+                    )
                 };
                 if r == sys::CUresult::CUDA_SUCCESS {
                     Ok(())
@@ -12297,7 +13144,9 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
         }
     };
     let module = compile(MOE_SIM, "moe_sim")?;
-    let sim = module.load_function("moe_sim").map_err(crate::Error::wrap)?;
+    let sim = module
+        .load_function("moe_sim")
+        .map_err(crate::Error::wrap)?;
     // Compiled now, loaded only during the spin (experiment D).
     let late_ptx = cudarc::nvrtc::compile_ptx_with_opts(
         LATE_MODULE,
@@ -12379,8 +13228,13 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
     // Launch `misses` (experts, all tiles) on workers and `hits` (experts, all
     // tiles) as hit blocks; `cold` experts start unpublished and `during` runs
     // on this thread right after the launch (the stager and the forward thread).
-    let run = |misses: &[usize], hits: &[usize], cold: &[usize], w: i32, reps: i32,
-               during: &dyn Fn() -> Result<()>| -> Result<Run> {
+    let run = |misses: &[usize],
+               hits: &[usize],
+               cold: &[usize],
+               w: i32,
+               reps: i32,
+               during: &dyn Fn() -> Result<()>|
+     -> Result<Run> {
         let items = |es: &[usize]| -> Vec<i32> {
             es.iter()
                 .flat_map(|&e| (0..TILES).flat_map(move |t| [e as i32, t as i32]))
@@ -12388,8 +13242,16 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
         };
         let mi = items(misses);
         let hi = items(hits);
-        let mi_d = dev.memcpy_stod(if mi.is_empty() { &[0i32, 0][..] } else { &mi[..] })?;
-        let hi_d = dev.memcpy_stod(if hi.is_empty() { &[0i32, 0][..] } else { &hi[..] })?;
+        let mi_d = dev.memcpy_stod(if mi.is_empty() {
+            &[0i32, 0][..]
+        } else {
+            &mi[..]
+        })?;
+        let hi_d = dev.memcpy_stod(if hi.is_empty() {
+            &[0i32, 0][..]
+        } else {
+            &hi[..]
+        })?;
         let (mi_p, _a) = mi_d.device_ptr(&stream);
         let (hi_p, _b) = hi_d.device_ptr(&stream);
         let counter = dev.alloc_zeros::<i32>(1)?;
@@ -12397,7 +13259,11 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
         let clocks = dev.memcpy_stod(&[u64::MAX, 0, 0, 0])?;
         let (ck, _d) = clocks.device_ptr(&stream);
         for e in 0..N_E {
-            let v = if cold.contains(&e) { 0 } else { warm as u64 + (e * EXPERT) as u64 };
+            let v = if cold.contains(&e) {
+                0
+            } else {
+                warm as u64 + (e * EXPERT) as u64
+            };
             unsafe { std::ptr::write_volatile(entries_h.add(e), v) };
         }
         stream.synchronize().map_err(crate::Error::wrap)?;
@@ -12407,9 +13273,21 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
         let grid = (w + n_hit) as u32;
         let start = Instant::now();
         let mut b = stream.launch_builder(&sim);
-        b.arg(&entries_d).arg(&abort_d).arg(&vram_ptr).arg(&mi_p).arg(&n_miss).arg(&hi_p)
-            .arg(&n_hit).arg(&w).arg(&reps).arg(&scratch_ptr).arg(&cp).arg(&om).arg(&oh)
-            .arg(&ck).arg(&spin_limit);
+        b.arg(&entries_d)
+            .arg(&abort_d)
+            .arg(&vram_ptr)
+            .arg(&mi_p)
+            .arg(&n_miss)
+            .arg(&hi_p)
+            .arg(&n_hit)
+            .arg(&w)
+            .arg(&reps)
+            .arg(&scratch_ptr)
+            .arg(&cp)
+            .arg(&om)
+            .arg(&oh)
+            .arg(&ck)
+            .arg(&spin_limit);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (grid, 1, 1),
@@ -12427,14 +13305,28 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
         // Verify every item.
         let got_m = dev.memcpy_dtov(&out_miss)?;
         for (i, pair) in mi.chunks(2).enumerate() {
-            assert_eq!(got_m[i], expect(pair[0] as usize, pair[1] as usize), "miss item {i}");
+            assert_eq!(
+                got_m[i],
+                expect(pair[0] as usize, pair[1] as usize),
+                "miss item {i}"
+            );
         }
         let got_h = dev.memcpy_dtov(&out_hit)?;
         for (i, pair) in hi.chunks(2).enumerate() {
-            assert_eq!(got_h[i], expect(pair[0] as usize, pair[1] as usize), "hit item {i}");
+            assert_eq!(
+                got_h[i],
+                expect(pair[0] as usize, pair[1] as usize),
+                "hit item {i}"
+            );
         }
         let c = dev.memcpy_dtov(&clocks)?;
-        let span = |end: u64| if end > c[0] { (end - c[0]) as f64 / 1e3 } else { 0.0 };
+        let span = |end: u64| {
+            if end > c[0] {
+                (end - c[0]) as f64 / 1e3
+            } else {
+                0.0
+            }
+        };
         Ok(Run {
             kernel_us,
             hits_us: span(c[1]),
@@ -12447,7 +13339,10 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
     run(&[0], &[32], &[], 4, 1, &nothing)?;
 
     println!("A. warm misses only (all 16 tiles each), one token tile — copy + fake GEMM");
-    println!("   {:>7} {:>5} {:>10} {:>9} {:>14}", "experts", "W", "misses µs", "GB/s", "µs per expert");
+    println!(
+        "   {:>7} {:>5} {:>10} {:>9} {:>14}",
+        "experts", "W", "misses µs", "GB/s", "µs per expert"
+    );
     for m in [1usize, 2, 8, 32] {
         for w in [4i32, 8, 16] {
             let misses: Vec<usize> = (0..m).collect();
@@ -12478,7 +13373,10 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
 
     // The stager: QD reader threads, each reads whole cold experts from the
     // file into pad slots and publishes them with a host store. No CUDA calls.
-    let stage = |cold: Vec<usize>, qd: usize, delay: Duration| -> std::thread::JoinHandle<Vec<f64>> {
+    let stage = |cold: Vec<usize>,
+                 qd: usize,
+                 delay: Duration|
+     -> std::thread::JoinHandle<Vec<f64>> {
         let file = Arc::clone(&file);
         let pad = pad as usize;
         let entries = entries_h as usize;
@@ -12489,7 +13387,8 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
             let cold = Arc::new(cold);
             let done: Vec<std::thread::JoinHandle<Vec<f64>>> = (0..qd)
                 .map(|q| {
-                    let (file, next, cold) = (Arc::clone(&file), Arc::clone(&next), Arc::clone(&cold));
+                    let (file, next, cold) =
+                        (Arc::clone(&file), Arc::clone(&next), Arc::clone(&cold));
                     std::thread::spawn(move || {
                         let mut published = Vec::new();
                         loop {
@@ -12499,17 +13398,24 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
                             }
                             let e = cold[i];
                             let slot = pad + i * EXPERT;
-                            let dest = unsafe { std::slice::from_raw_parts_mut(slot as *mut u8, EXPERT) };
-                            file.read_at_with_handle(q, (e * EXPERT) as u64, dest).expect("pack read");
+                            let dest =
+                                unsafe { std::slice::from_raw_parts_mut(slot as *mut u8, EXPERT) };
+                            file.read_at_with_handle(q, (e * EXPERT) as u64, dest)
+                                .expect("pack read");
                             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                            unsafe { std::ptr::write_volatile((entries as *mut u64).add(e), slot as u64) };
+                            unsafe {
+                                std::ptr::write_volatile((entries as *mut u64).add(e), slot as u64)
+                            };
                             published.push(t0.elapsed().as_secs_f64() * 1e3);
                         }
                         published
                     })
                 })
                 .collect();
-            let mut all: Vec<f64> = done.into_iter().flat_map(|h| h.join().expect("reader")).collect();
+            let mut all: Vec<f64> = done
+                .into_iter()
+                .flat_map(|h| h.join().expect("reader"))
+                .collect();
             all.sort_by(|a, b| a.partial_cmp(b).unwrap());
             all
         })
@@ -12550,7 +13456,9 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
                 Ok(m) => m,
                 Err(_) => dev.load_module_via_ptxas("late_module", &late_ptx)?,
             };
-            let f = late.load_function("late_kernel").map_err(crate::Error::wrap)?;
+            let f = late
+                .load_function("late_kernel")
+                .map_err(crate::Error::wrap)?;
             let (bp, _g) = buf.device_ptr(&stream);
             let mut b = stream.launch_builder(&f);
             b.arg(&bp);
@@ -12570,7 +13478,11 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
             "   forward thread in load+launch {:.2} ms; stager published {:.2}–{:.2} ms (after a 20 ms start delay); kernel {:.1} µs, worker spin {:.2} ms",
             blocked.get(), pubs[0] + 20.0, pubs[pubs.len() - 1] + 20.0, r.kernel_us, r.wait_ms
         );
-        assert_eq!(dev.memcpy_dtov(&buf)?[0], 1.0, "the late kernel ran after the spinning launch");
+        assert_eq!(
+            dev.memcpy_dtov(&buf)?[0],
+            1.0,
+            "the late kernel ran after the spinning launch"
+        );
     }
 
     println!("E. spinning workers do not slow the hits: 32 hits + 8 cold misses published after 30 ms, W = 8");
@@ -12596,7 +13508,6 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
-
 
 /// The context-free total-VRAM probe must succeed and report a sane size.
 /// (In-process test order may mean a context already exists on this thread;

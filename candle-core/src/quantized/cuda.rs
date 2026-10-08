@@ -40,26 +40,32 @@ use candle_kernels::simple::fused_silu_mul::run_silu_mul_q8a128_op;
 
 // Import the new quantized matmul dispatcher
 // K/128 blocks have embedded scales, no external scale extraction needed.
+/// The wait state of a grouped GEMM over a live weight table — see
+/// [`grouped_qmatmul_dev_q8a128`].
+pub use candle_kernels::quantized::MoeLive;
 use candle_kernels::quantized::{
     dispatch_info, flush_l2_cache, run_grouped_quantized_matmul, run_qkv_segmented_matmul,
     run_quantized_matmul, MatmulStatus, OutDType, VxSegment, YType, SPLITK_MAX_SEGS,
 };
-/// The wait state of a grouped GEMM over a live weight table — see
-/// [`grouped_qmatmul_dev_q8a128`].
-pub use candle_kernels::quantized::MoeLive;
 
 // Import GEMX repacking dispatcher
 use candle_kernels::quantized::{get_repacked_size_bytes, is_gemx_supported, run_repack_gemx};
 
-use super::int8_matmul_mode::q8a128_dense_use_mode2;
-use super::int8_split_k::q8a128_dense_k_splits;
+use super::int8_matmul_mode::{q8a128_dense_tile, q8a128_dense_use_mode2, DenseTile};
+use super::int8_split_k::{q8a128_dense_plan, DensePlan};
 use super::table_ring::table_ring;
 
+#[cfg(test)]
+mod graph_bench;
+mod narrow;
+#[cfg(test)]
+mod prefill_tile_tests;
 mod silu_matmul;
 mod split_k;
+use narrow::q8a128_dense_matmul_narrow_segmented;
 pub(crate) use silu_matmul::q8a128_dense_matmul_silu;
 pub use split_k::ensure_split_k_scratch;
-use split_k::{q8a128_dense_matmul_split_k, q8a128_dense_matmul_split_k_segmented};
+use split_k::q8a128_dense_matmul_split_k_segmented;
 
 /// Process-cached SM count for the int8 dense tiling (occupancy) heuristic. SM count is a fixed
 /// device property; querying the driver attribute on every matmul would add an FFI call to the hot
@@ -84,20 +90,58 @@ fn cached_l2_bytes(device: &CudaDevice) -> usize {
 
 /// Grid axis order for a grouped launch (see `quantized_matmul_grouped_entry`):
 /// row-tiles-fast whenever the stacked activation cannot stay L2-resident
-/// alongside the streaming weights — token-tiles-fast would then re-stream the
-/// whole activation from DRAM once per row-tile wave (measured 6× DRAM traffic
-/// amplification at prefill scale). When the activation comfortably fits L2,
-/// residency is free under either order and token-tiles-fast keeps consecutive
-/// blocks on the same weight rows instead. The half-L2 threshold leaves the
-/// other half for the weight stream, and `moe_layer_gemm_bench` (both layouts ×
-/// decode/cfg8/cfg20, 96 MiB L2) confirms it classifies every measured band
-/// correctly: token-fast wins at 2.7 MB (decode, +5%) and 48 MB (down cfg8,
-/// +5%); row-fast wins from 100 MB up (+28..40%). Mis-choosing costs 5% on the
-/// token-fast side of the line and 40% on the row-fast side, so the threshold
-/// deliberately sits well below the row-fast danger zone. Both orders are
-/// bit-identical (schedule only) — the crossover is a pure performance band.
-pub(crate) fn grouped_grid_row_fast(act_bytes: usize, device: &CudaDevice) -> bool {
-    act_bytes * 2 > cached_l2_bytes(device)
+/// through one row-tile pass — token-tiles-fast would then re-stream the whole
+/// activation from DRAM once per pass (measured 6× DRAM traffic amplification
+/// at prefill scale). A pass streams the activation AND the output columns of
+/// its row tile (`out_pass_bytes`: every row × the row tile's width), so both
+/// count against the L2: with the 128-row prefill tile a 7500-token `down`
+/// pass writes 38 MB of F32 beside its 48 MB activation, and token-fast measured
+/// 2.07 ms against row-fast's 1.36 ms (`bench_prefill_grouped`, ncu: L2 hit 54%,
+/// the activation re-read every pass). When both fit comfortably, residency is
+/// free under either order and token-tiles-fast keeps consecutive blocks on the
+/// same weight rows instead. The third-of-L2 threshold leaves the rest for the
+/// weight stream and the replacement policy's slack; it classifies every band
+/// `bench_prefill_grouped` and `moe_layer_gemm_bench` measured (96 MiB L2):
+/// token-fast wins at decode (2.7 MB, +5%) and at a 2048-token 64-row-tile
+/// `down` (+5%); row-fast wins every 128-row-tile prefill and everything from
+/// 100 MB up (+20..50%). Mis-choosing costs ~5% on the token-fast side of the
+/// line and up to 50% on the row-fast side, so the threshold sits well below the
+/// row-fast danger zone. Both orders are bit-identical (schedule only) — the
+/// crossover is a pure performance band.
+pub(crate) fn grouped_grid_row_fast(
+    act_bytes: usize,
+    out_pass_bytes: usize,
+    device: &CudaDevice,
+) -> bool {
+    (act_bytes + out_pass_bytes) * 3 > cached_l2_bytes(device)
+}
+
+/// Rows per block of the FP grouped kernels.
+const GROUPED_FP_ROW_TILE: usize = 32;
+
+/// Rows per block of the grouped int8 kernels at token-tile mode `n_sub` — the
+/// row-tile height `run_grouped_quantized_matmul` sizes its grid with (mode-2: the
+/// 32-row tile; mode-4: 128 rows, RN = 4; mode-8: 64 rows, RN = 2).
+pub(crate) fn grouped_int8_row_tile(n_sub: usize) -> usize {
+    match n_sub {
+        4 => 128,
+        8 => 64,
+        _ => 32,
+    }
+}
+
+/// [`grouped_grid_row_fast`] for a grouped int8 launch of `total_batch` rows over `ncols`
+/// (K) and `nrows` (N) at token-tile mode `n_sub`: q8a128 activations are ~1 B/elem (int8
+/// qs + per-128 scales), the output F32.
+pub(crate) fn grouped_int8_row_fast(
+    total_batch: usize,
+    ncols: usize,
+    nrows: usize,
+    n_sub: usize,
+    device: &CudaDevice,
+) -> bool {
+    let row_tile = grouped_int8_row_tile(n_sub).min(nrows);
+    grouped_grid_row_fast(total_batch * ncols, total_batch * row_tile * 4, device)
 }
 
 // ============================================================================
@@ -3066,7 +3110,7 @@ fn dense_qmatmul_float(
                         qtype,
                         ytype as i32,
                         weight_len,
-                        0, // force_mode2: FP path ignores it
+                        0, // tile_mode: FP path ignores it
                         // out_dtype: the FP kernels store at the activation dtype, so this
                         // only has to be a valid code — it is not consulted.
                         OutDType::F32 as i32,
@@ -5265,7 +5309,12 @@ fn grouped_matmul_gemx_impl<'w>(
             YType::F32 => 4usize,
             _ => 2, // F16 / BF16
         };
-        let row_fast = grouped_grid_row_fast(total_batch * k * y_elem, device) as i32;
+        // The FP grouped kernels store at the activation's width.
+        let row_fast = grouped_grid_row_fast(
+            total_batch * k * y_elem,
+            total_batch * GROUPED_FP_ROW_TILE * y_elem,
+            device,
+        ) as i32;
 
         macro_rules! dispatch_grouped {
             ($y_data:expr) => {{
@@ -5843,8 +5892,8 @@ impl<'w> Q8a128Operand<'w> {
 /// A qmatmul activation/LHS that is either a plain float tensor (F16/BF16/F32 — the
 /// dequant-weight float path) or pre-quantized q8a1024 int8 blocks (the int8 tensor-core
 /// path). Threading one type through the matmul hides whether it runs in float or int8
-/// mode: the int8 arm runs the q8a128 tensor-core path (mode-1/mode-2 chosen by the occupancy
-/// formula `q8a128_dense_use_mode2` at dispatch), the float arm derives it from the tensor's dtype.
+/// mode: the int8 arm runs the q8a128 tensor-core path (its tiling chosen by the grid-fill
+/// formula `q8a128_dense_tile` at dispatch), the float arm derives it from the tensor's dtype.
 /// Two lifetimes, deliberately distinct: `'a` is how long this borrow of the
 /// operand lasts, `'w` is the generation the operand's memory belongs to.
 ///
@@ -5971,7 +6020,7 @@ pub(crate) fn q8a1024_byte_len(rows: usize, cols: usize) -> usize {
 /// Quantize activations `[rows, cols]` (dtype 0=F16,1=BF16,2=F32 at `act_ptr`) →
 /// q8a1024 flat-grouped blocks (8 × 128-tiles per 1152-byte super-block; qs
 /// de-interleaved from the per-32 ds — see blocks.cuh). The matmul mode is not chosen here; it is
-/// derived later by the occupancy formula `q8a128_dense_use_mode2` at dispatch.
+/// derived later by the grid-fill formula `q8a128_dense_tile` at dispatch.
 pub fn quantize_acts_q8a128<'w>(
     act_ptr: u64,
     dtype: i32,
@@ -6457,26 +6506,27 @@ pub const GROUPED_GEMM_TILE_W: usize = 32;
 /// IS the weight-reuse factor: at decode's 1–32 rows/expert the 32-wide mode-2 tile is
 /// already optimal (a partial tile costs the same weight traffic), but at PREFILL's
 /// ~100–300 rows/expert it re-streams and re-dequants every expert 4×+ per launch —
-/// measured as the flat ~0.87 ms/token marginal prefill cost. Wide modes (Bm 64 / 128)
-/// exist for the KO rows only (`wide_ok`); thresholds sit at the widths where the wider
-/// tile's weight-traffic saving is guaranteed even for a final partial tile.
+/// measured as the flat ~0.87 ms/token marginal prefill cost. Wide modes exist for the
+/// KO formats only: a launch whose `dtypes` (every weight format sharing the tile table)
+/// are not all KO runs mode-2.
 ///
-/// BENCH-derived (`moe_layer_gemm_bench`, real shapes: 256 experts, gate/up
-/// [2048,7168] / down [7168,2048] MXFP4_KO): at ~91 rows/expert Bm-128 wins (29.3 vs
-/// 36.3 ms), but at ~192 rows/expert Bm-64 beats Bm-128 (52.9 vs 60.3 ms) — the
-/// widest tile loses more occupancy than its extra reuse pays back once several tiles
-/// per expert exist. The bands encode those two measured points.
-pub fn grouped_int8_n_sub(avg_rows: usize, wide_ok: bool) -> usize {
-    if !wide_ok {
+/// The wide modes are also tall (mode-4: Bm 64 × 128 rows; mode-8: Bm 128 × 64 rows —
+/// see `grouped_int8_row_tile`), and which one wins depends on the fold, so the bands are
+/// per format. Device time, `bench_prefill_grouped` (RTX PRO 5000):
+/// - **Affine KO** (Q2..Q8_KO — one fold per 128-K tile): mode-4 wins at every prefill
+///   width — Flash-Next Q4_KO experts at 40 / 80 / 146 rows/expert, gate/up 440 / 798 /
+///   1291 µs against mode-8's 624 / 865 / 1584, `down` 583 / 889 / 1461 against 658 /
+///   954 / 1724.
+/// - **MXFP4_KO** (a fold per 32-K sub, four times the fold work and registers): mode-4
+///   wins at 48 rows/expert (DeepSeek-V4-Flash gate/up 3.99 ms against 4.53), mode-8 from
+///   64 up (91 rows: 5.90 against 7.33 ms; 192 rows: 11.65 against 13.21 ms).
+pub fn grouped_int8_n_sub(avg_rows: usize, dtypes: &[GgmlDType]) -> usize {
+    if avg_rows < 32 || dtypes.is_empty() || !dtypes.iter().all(|d| d.is_ko()) {
         2
-    } else if avg_rows >= 128 {
-        4
-    } else if avg_rows >= 64 {
+    } else if avg_rows >= 64 && dtypes.contains(&GgmlDType::MXFP4_KO) {
         8
-    } else if avg_rows >= 32 {
-        4
     } else {
-        2
+        4
     }
 }
 
@@ -6509,9 +6559,8 @@ fn grouped_matmul_gemx_q8a128<'w>(
         .filter(|&e| expert_offsets[e + 1] > expert_offsets[e])
         .count();
     let avg_rows = total_batch.checked_div(active).unwrap_or(0);
-    let n_sub = grouped_int8_n_sub(avg_rows, weight_dtype.is_ko());
-    // q8a128 activations are ~1 B/elem (int8 qs + per-128 scales).
-    let row_fast = grouped_grid_row_fast(total_batch * ncols, device);
+    let n_sub = grouped_int8_n_sub(avg_rows, &[weight_dtype]);
+    let row_fast = grouped_int8_row_fast(total_batch, ncols, nrows, n_sub, device);
     grouped_matmul_gemx_q8a128_with_mode(
         act_ptr,
         weight_ptrs,
@@ -6828,8 +6877,8 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
         let (tbc, _g3) = tile_b_cnt.device_ptr(&stream);
         // A live launch has its grid fixed by the launcher (row tiles on x, the
         // workers' rows ahead of the tiles); any other launch picks its axis order
-        // for L2 (q8a128 activations are ~1 B/elem).
-        let row_fast = grouped_grid_row_fast(total_batch * ncols, device) as i32;
+        // for L2.
+        let row_fast = grouped_int8_row_fast(total_batch, ncols, nrows, n_sub, device) as i32;
         let live_ptr = live.map_or(std::ptr::null(), |l| l as *const MoeLive);
         op.with_device_ptr(device, |act_ptr| {
             let status = unsafe {
@@ -6867,7 +6916,7 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
 /// Dense (non-MoE) quantized matmul over a [`DynamicTensor`] activation: a single weight
 /// `[nrows(N) × ncols(K)]` (KO format for the `Int8` arm, FP GEMX K/128-repack for the
 /// `Float` arm) × the activation `[.. × K]` → `[.., N]` (leading dims preserved on both arms).
-/// `Int8` runs the q8a128 tensor-core path (mode-1/mode-2 chosen by `q8a128_dense_use_mode2` at
+/// `Int8` runs the q8a128 tensor-core path (its tiling chosen by `q8a128_dense_tile` at
 /// dispatch), output F32; `Float` runs the dequant-weight float path
 /// ([`dense_qmatmul_float`]), output matching the activation dtype. The caller stays
 /// agnostic to which numeric mode runs. `weight_len` is the quantized-weight byte length
@@ -6982,12 +7031,13 @@ pub(crate) fn qkv_segmented_matmul<'w>(
 
 /// Several KO weights that read the same q8a128 operand, as ONE launch writing their outputs
 /// side by side: `[lead.., ΣNᵢ]`, weight `i`'s columns after those before it. At decode width
-/// the combined width splits K (the segmented split-K launch); otherwise it runs the unsplit
-/// segmented kernel. Either way every column is the one its weight's own launch computes, bit
-/// for bit: the split's sum is tile-ordered whatever the depth, and the unsplit kernel walks
-/// each tile row exactly as the single-weight kernel does. The split form needs one format
-/// across the segments and at most [`SPLITK_MAX_SEGS`] of them; the unsplit form takes up to
-/// three of any KO formats.
+/// the combined width runs narrow or splits K ([`q8a128_dense_plan`] — the segmented narrow or
+/// split-K launch); otherwise it runs the unsplit segmented kernel. Every plan computes each
+/// column as its weight's own launch does, bit for bit: the narrow and split sums are
+/// tile-ordered whatever their geometry, and the unsplit kernel walks each tile row exactly as
+/// the single-weight kernel does. The narrow and split forms need one format across the
+/// segments and at most [`SPLITK_MAX_SEGS`] of them; the unsplit form takes up to three of any
+/// KO formats.
 pub(crate) fn dense_qmatmul_stacked<'w>(
     op: &Q8a128Operand<'w>,
     segments: &[(u64, GgmlDType, usize)],
@@ -7000,32 +7050,39 @@ pub(crate) fn dense_qmatmul_stacked<'w>(
         .map(|&(_, d, _)| d)
         .ok_or_else(|| crate::Error::Msg("dense_qmatmul_stacked: no weights".into()))?;
     let one_format = segments.iter().all(|&(_, d, _)| d == dtype);
-    let splits = if one_format && dtype != GgmlDType::MXFP4_KO && segments.len() <= SPLITK_MAX_SEGS
-    {
-        q8a128_dense_k_splits(op.rows, n_total, op.cols, cached_sm_count(device))
-    } else {
-        1
-    };
-    if splits > 1 {
-        let segs: Vec<(u64, usize)> = segments.iter().map(|&(p, _, n)| (p, n)).collect();
-        return q8a128_dense_matmul_split_k_segmented(op, &segs, dtype, splits, out_dtype, device);
+    let plan = q8a128_dense_plan(
+        op.rows,
+        n_total,
+        op.cols,
+        cached_sm_count(device),
+        one_format && dtype != GgmlDType::MXFP4_KO && segments.len() <= SPLITK_MAX_SEGS,
+    );
+    let segs = || -> Vec<(u64, usize)> { segments.iter().map(|&(p, _, n)| (p, n)).collect() };
+    match plan {
+        DensePlan::Narrow { warps } => {
+            q8a128_dense_matmul_narrow_segmented(op, &segs(), dtype, warps, out_dtype, device)
+        }
+        DensePlan::SplitK(splits) => {
+            q8a128_dense_matmul_split_k_segmented(op, &segs(), dtype, splits, out_dtype, device)
+        }
+        DensePlan::Unsplit => qkv_segmented_matmul(op, segments, out_dtype, device),
     }
-    qkv_segmented_matmul(op, segments, out_dtype, device)
 }
 
-/// The q8a128 int8 dense launch with an **explicit** tiling mode (`mode2`: false = mode-1 `Bm=16`,
-/// true = mode-2 `Bm=32` weight-reuse). Production reaches this from [`dense_qmatmul`] with the mode
-/// chosen by [`q8a128_dense_use_mode2`]; the crossover benchmark calls it directly to time each mode
-/// at a fixed `(M, N, K)`. Result is the `[lead.., N]` output (rank rebuilt from `op.lead`) stored at
+/// The q8a128 int8 dense launch with an **explicit** tiling ([`DenseTile`]). Production reaches
+/// this from [`dense_qmatmul`] with the tiling chosen by [`q8a128_dense_tile`]; the benches and
+/// the tiling tests call it directly to run each one at a fixed `(M, N, K)` — every tiling gives
+/// the same bits. Result is the `[lead.., N]` output (rank rebuilt from `op.lead`) stored at
 /// `out_dtype` — the MMA accumulates in F32 registers and converts on the store, so a narrow
 /// `out_dtype` is bit-identical to the F32 kernel followed by a cast, minus the cast.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn q8a128_dense_matmul<'w>(
     op: &Q8a128Operand<'w>,
     weight_ptr: u64,
     weight_dtype: GgmlDType,
     nrows: usize,
     weight_len: usize,
-    mode2: bool,
+    tile: DenseTile,
     out_dtype: crate::DType,
     device: &CudaDevice,
 ) -> Result<crate::LiveTensor<'w>> {
@@ -7062,9 +7119,9 @@ pub(crate) fn q8a128_dense_matmul<'w>(
                 total_batch as i32, // nrows_y = M
                 nrows as i32,       // nrows_dst = N
                 qtype,
-                YType::Q8A128 as i32, // int8 activation; tiling forced via `mode2`
+                YType::Q8A128 as i32, // int8 activation; tiling forced via `tile`
                 weight_len,           // weight_bytes (FP path only; int8 ignores)
-                mode2 as i32,         // 0 = mode-1, 1 = mode-2 (weight-reuse)
+                tile.code(),          // mode-1 / mode-2 / mode-4
                 out_code,             // store width
                 // The operand's own Σx convention — the bytes say how to read them.
                 op.sum_scale.as_code(),
@@ -7094,7 +7151,7 @@ pub fn dense_qmatmul<'w>(
     out_dtype: crate::DType,
     device: &CudaDevice,
 ) -> Result<crate::LiveTensor<'w>> {
-    dense_qmatmul_with_splits(
+    dense_qmatmul_with_plan(
         input,
         weight_ptr,
         weight_dtype,
@@ -7106,18 +7163,18 @@ pub fn dense_qmatmul<'w>(
     )
 }
 
-/// [`dense_qmatmul`] with the int8 path's K split chosen by the caller: `Some(s)` runs `s`
-/// slices (`1` is the unsplit kernel), `None` takes [`q8a128_dense_k_splits`]'s answer. The
+/// [`dense_qmatmul`] with the int8 path's launch chosen by the caller: `Some(plan)` runs that
+/// plan, `None` takes [`q8a128_dense_plan`]'s answer. Every plan produces the same bits. The
 /// forced form is what the KO projection bench sweeps; production calls [`dense_qmatmul`].
 #[allow(clippy::too_many_arguments)]
-pub fn dense_qmatmul_with_splits<'w>(
+pub fn dense_qmatmul_with_plan<'w>(
     input: DynamicTensor<'_, 'w>,
     weight_ptr: u64,
     weight_dtype: GgmlDType,
     nrows: usize,
     weight_len: usize,
     out_dtype: crate::DType,
-    splits: Option<usize>,
+    plan: Option<DensePlan>,
     device: &CudaDevice,
 ) -> Result<crate::LiveTensor<'w>> {
     ensure_qmatmul_pairing(&input, weight_dtype)?;
@@ -7125,40 +7182,56 @@ pub fn dense_qmatmul_with_splits<'w>(
     match input {
         DynamicTensor::Int8(op) => {
             // A decode-width projection with a narrow N cannot fill the card unsplit — 13 blocks
-            // for the 416-wide hyper-connection `down` on 110 SMs. Split K there; everything the
-            // rule declines (every prefill shape among them) takes the tilings below unchanged.
-            // MXFP4 never splits: its per-sub fold accumulates straight into the running sum,
-            // which per-tile partials cannot reproduce bit for bit.
+            // for the 416-wide hyper-connection `down` on 110 SMs. Up to eight rows it runs
+            // narrow, wider it splits K; everything the rule declines (every prefill shape among
+            // them) takes the tilings below unchanged. MXFP4 does neither: its per-sub fold
+            // accumulates straight into the running sum, which per-tile folds cannot reproduce
+            // bit for bit.
             let sm = cached_sm_count(device);
-            let splits = splits.unwrap_or_else(|| {
-                if weight_dtype == GgmlDType::MXFP4_KO {
-                    1
-                } else {
-                    q8a128_dense_k_splits(op.rows, nrows, op.cols, sm)
-                }
-            });
-            if splits > 1 {
-                return q8a128_dense_matmul_split_k(
-                    op,
-                    weight_ptr,
-                    weight_dtype,
+            let plan = plan.unwrap_or_else(|| {
+                q8a128_dense_plan(
+                    op.rows,
                     nrows,
-                    splits,
-                    out_dtype,
-                    device,
-                );
+                    op.cols,
+                    sm,
+                    weight_dtype != GgmlDType::MXFP4_KO,
+                )
+            });
+            match plan {
+                DensePlan::Narrow { warps } => {
+                    return q8a128_dense_matmul_narrow_segmented(
+                        op,
+                        &[(weight_ptr, nrows)],
+                        weight_dtype,
+                        warps,
+                        out_dtype,
+                        device,
+                    );
+                }
+                DensePlan::SplitK(splits) => {
+                    return q8a128_dense_matmul_split_k_segmented(
+                        op,
+                        &[(weight_ptr, nrows)],
+                        weight_dtype,
+                        splits,
+                        out_dtype,
+                        device,
+                    );
+                }
+                DensePlan::Unsplit => {}
             }
-            // Tiling choice (mode-1 Bm=16 vs mode-2 Bm=32, N_SUB=2): an occupancy decision driven by
-            // M and N (block count vs SM count) plus the [17,32] trap — not weight bytes. The bench
-            // reaches the same launch with a forced mode via `q8a128_dense_matmul`.
-            let mode2 = q8a128_dense_use_mode2(op.rows, nrows, op.cols, sm);
+            // Tiling choice (mode-1 Bm=16, mode-2 Bm=32, mode-4 Bm=64 × 128 rows): a grid-fill
+            // decision driven by M and N (block count vs SM count) plus mode-2's [17,32] trap —
+            // not weight bytes. The bench reaches the same launch with a forced tiling via
+            // `q8a128_dense_matmul`.
+            let tile = q8a128_dense_tile(op.rows, nrows, op.cols, sm);
             q8a128_dense_matmul(
                 op,
                 weight_ptr,
                 weight_dtype,
                 nrows,
                 weight_len,
-                mode2,
+                tile,
                 out_dtype,
                 device,
             )

@@ -14,7 +14,7 @@ use zend::log_broadcast::LogBus;
 use zend::session::{StreamItem, ZendSession};
 use zend::types::{ChatMessage, Role, ToolMode};
 
-use crate::common::{needs_compaction, served, PROJECT_REPO};
+use crate::common::{kept_workspace, needs_compaction, served, PROJECT_REPO};
 use crate::verdict::{verdict_for, Verdict};
 
 /// The script, in order. The last question is the one judged: it has the model
@@ -92,7 +92,7 @@ pub fn run_arm(arm: &Arm) {
 /// The arm's workspace, holding the files the script reads in its one
 /// repository.
 fn workspace(arm: &Arm) -> PathBuf {
-    let ws = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(arm.workspace);
+    let ws = kept_workspace(arm.workspace);
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("zend sits inside the repo");

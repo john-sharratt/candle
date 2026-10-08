@@ -32,6 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::persistence::content_hash::ContentHash;
+use candle_conversation::persistence::log_file::FILE_FORMAT_VERSION;
 use candle_conversation::persistence::record::SnapshotPayload;
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::projection::{self, TimelineId};
@@ -299,7 +300,8 @@ impl Default for Workspace {
 // ── The production-model workspace ───────────────────────────────────────────
 
 /// The workspace every production-model daemon test boots on:
-/// `target/tmp/zend_production_ws`, one directory shared by every test binary.
+/// `target/tmp/zend_production_ws_log_v<format>` ([`kept_workspace`]), one
+/// directory shared by every test binary.
 ///
 /// **Never the source tree.** A daemon writes its substrate, logs and uploads
 /// into its workspace. Booting on the repo root writes into the user's live
@@ -312,8 +314,21 @@ impl Default for Workspace {
 /// every later boot resumes it. A workspace admits one daemon at a time, which
 /// these `#[ignore]`d tests honour by being run by name, one at a time.
 pub fn production_workspace() -> PathBuf {
-    let ws = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("zend_production_ws");
-    std::fs::create_dir_all(&ws).expect("create the production workspace");
+    kept_workspace("zend_production_ws")
+}
+
+/// A workspace kept under `target/tmp` between runs, its directory named for
+/// the redo-log format its substrate is written in.
+///
+/// A kept workspace outlives the build that wrote it, and a daemon refuses a
+/// log in any format but its own — there is no migration. Keyed by
+/// [`FILE_FORMAT_VERSION`], a format bump starts a fresh workspace (calibration
+/// paid once more) instead of booting into a substrate the daemon will not
+/// open, which exits the test process before any assertion runs.
+pub fn kept_workspace(name: &str) -> PathBuf {
+    let ws = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{name}_log_v{FILE_FORMAT_VERSION}"));
+    std::fs::create_dir_all(&ws).expect("create the kept workspace");
     ws
 }
 

@@ -129,6 +129,21 @@ extern "C" {
         stream: *mut c_void,
     );
 
+    /// The sampler's greedy pick of each of `rows` F32 rows (`row_stride`
+    /// elements apart, the first `live` eligible) into `out`, many blocks to a
+    /// row. `slots` and `arrived` (`rows` each) must be zero; the launch leaves
+    /// them zero. Returns 0 when launched, 1 for a shape it refuses.
+    pub fn run_argmax_rows_f32(
+        logits: *const f32,
+        rows: i32,
+        row_stride: i32,
+        live: i32,
+        out: *mut u32,
+        slots: *mut u64,
+        arrived: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
     /// `table[offsets[i]] = values[i]` for `i < n`, or `= 0` when `values` is
     /// null, queued on `stream`. The offsets must be distinct. Stamps a
     /// dispatch's nonzero counts into the sampler's resident count table, and

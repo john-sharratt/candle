@@ -1,11 +1,18 @@
 //! Tiling-mode selection for the q8a128 int8 **dense** matmul.
 //!
-//! The dense int8 kernel (`candle-kernels/.../dispatcher.cu`) has two tilings:
+//! The dense int8 kernel (`candle-kernels/.../dispatcher.cu`) has three tilings ([`DenseTile`]):
 //!
 //! - **mode-1** (`Bm = 16`, `N_SUB = 1`): `ceil(M/16)` batch-tiles × `ceil(N/32)` N-tiles.
 //! - **mode-2** (`Bm = 32`, `N_SUB = 2`): `ceil(M/32)` batch-tiles × `ceil(N/64)` N-tiles — about
 //!   **¼** as many blocks, and roughly **half** the DRAM traffic (it amortizes weight reads across
 //!   a 2× wider token tile and activation reads across a 2× wider output tile).
+//! - **mode-4** (`Bm = 64` × 128 rows, KO formats): each warp owns 32 output rows, so every A
+//!   fragment feeds four MMAs and every dequanted weight chunk four token sub-tiles. At prefill
+//!   width it runs at about twice mode-2's int8 throughput (Q8_KO at M = 4096: ~217 TOPS against
+//!   ~113 on the RTX PRO 5000); its gate is grid fill ([`q8a128_dense_use_mode4`]).
+//!
+//! All three fold every output's K tiles in the same order through the same expression, so they
+//! give the same bits; the choice is speed only.
 //!
 //! # What the 3-axis crossover benchmark showed (RTX 4090, 76 SMs, 64 MiB L2)
 //!
@@ -139,6 +146,73 @@ pub fn q8a128_dense_use_mode2(m: usize, n: usize, k: usize, sm_count: usize) -> 
     let (num, den) = mode2_blocks_per_sm(sm_count);
     let threshold = sm_count * num / den;
     blk2 >= threshold
+}
+
+/// The q8a128 dense matmul's tiling — `run_quantized_matmul`'s `tile_mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseTile {
+    /// `Bm = 16` × 32 rows.
+    Mode1,
+    /// `Bm = 32` × 32 rows: each weight chunk's dequant reused across two token sub-tiles.
+    Mode2,
+    /// `Bm = 64` × 128 rows (KO formats): each warp owns 32 rows, so every A fragment it loads
+    /// feeds four n8 MMAs and every dequanted chunk four m16 sub-tiles — the prefill tile.
+    Mode4,
+}
+
+impl DenseTile {
+    /// The dispatcher's code for this tiling.
+    pub fn code(self) -> i32 {
+        match self {
+            DenseTile::Mode1 => 0,
+            DenseTile::Mode2 => 1,
+            DenseTile::Mode4 => 2,
+        }
+    }
+}
+
+/// Mode-4's token tile (`Bm`).
+const M_TILE_MODE4: usize = 64;
+/// Mode-4's row tile.
+const N_TILE_MODE4: usize = 128;
+
+/// The fraction of the SM count, as `(numerator, denominator)`, that mode-4's grid must reach
+/// before it beats mode-2.
+///
+/// Measured on the RTX PRO 5000 (110 SMs; `bench_dense_tile_crossover`, Q8_KO, K = 2560,
+/// weights rotated past the L2): mode-4 wins from `blk4 = 96` at every N tried — N = 512 at
+/// M = 1536 (35.7 against mode-2's 38.8 µs), N = 6144 at M = 128 (35.6 / 40.9), N = 13312 at
+/// M = 64 (blk4 = 104; 38.0 / 45.5) — and loses at `blk4 = 80` (N = 1280, M = 512: 36.0 /
+/// 31.8; N = 2560, M = 256: 35.5 / 32.4). A mode-4 block holds four times mode-2's outputs, so
+/// below about one block per SM the grid leaves SMs idle that mode-2 fills. Other parts take
+/// the same fraction of their SM count — unmeasured, and documented as a guess.
+const MODE4_SM_FRACTION: (usize, usize) = (7, 8);
+
+/// Whether the mode-4 prefill tile runs: at least one full token tile of rows (every winning
+/// shape measured had `M ≥ 64`; below it a 64-token tile is mostly padding, and a decode-width
+/// launch over a wide `N` would otherwise reach the grid bound on its rows alone), and its
+/// grid, `ceil(M/64)·ceil(N/128)` blocks, must reach [`MODE4_SM_FRACTION`] of the SM count.
+/// `0` SMs (a failed query) keeps the measured mode-1/mode-2 rule.
+pub fn q8a128_dense_use_mode4(m: usize, n: usize, sm_count: usize) -> bool {
+    if m < M_TILE_MODE4 || sm_count == 0 {
+        return false;
+    }
+    let blk4 = ceil_div(m, M_TILE_MODE4) * ceil_div(n, N_TILE_MODE4);
+    let (num, den) = MODE4_SM_FRACTION;
+    blk4 >= sm_count * num / den
+}
+
+/// Decide the q8a128 dense matmul tiling: mode-4 once its grid fills the card (see
+/// [`q8a128_dense_use_mode4`]), otherwise [`q8a128_dense_use_mode2`]'s choice between mode-1
+/// and mode-2. Allocation-free.
+pub fn q8a128_dense_tile(m: usize, n: usize, k: usize, sm_count: usize) -> DenseTile {
+    if q8a128_dense_use_mode4(m, n, sm_count) {
+        DenseTile::Mode4
+    } else if q8a128_dense_use_mode2(m, n, k, sm_count) {
+        DenseTile::Mode2
+    } else {
+        DenseTile::Mode1
+    }
 }
 
 #[cfg(test)]
@@ -379,5 +453,119 @@ mod tests {
     fn zero_sm_count_degrades_to_mode2_outside_trap() {
         assert!(q8a128_dense_use_mode2(1, 1024, 2048, 0));
         assert!(!q8a128_dense_use_mode2(24, 1024, 2048, 0)); // trap still holds
+    }
+
+    /// The dispatcher's tile codes: `run_quantized_matmul` reads 0 / 1 / 2.
+    #[test]
+    fn dense_tile_codes_are_the_dispatchers() {
+        assert_eq!(
+            [DenseTile::Mode1, DenseTile::Mode2, DenseTile::Mode4].map(DenseTile::code),
+            [0, 1, 2]
+        );
+    }
+
+    /// Blackwell's measured mode-4 cells (`bench_dense_tile_crossover`): every cell where mode-4
+    /// won has `blk4 ≥ 96`, every cell where it lost `blk4 ≤ 80`, and the gate sits between.
+    #[test]
+    fn mode4_gate_matches_the_measured_blackwell_cells() {
+        assert_eq!(SM_BW * MODE4_SM_FRACTION.0 / MODE4_SM_FRACTION.1, 96);
+        // (N, M) where mode-4 measured fastest.
+        for &(n, m) in &[
+            (512usize, 1536usize),
+            (1280, 768),
+            (2560, 384),
+            (6144, 128),
+            (13_312, 64),
+        ] {
+            assert!(
+                q8a128_dense_use_mode4(m, n, SM_BW),
+                "N={n} M={m} should run mode-4"
+            );
+            assert_eq!(q8a128_dense_tile(m, n, 2560, SM_BW), DenseTile::Mode4);
+        }
+        // (N, M) where it measured slower than mode-2.
+        for &(n, m) in &[(512usize, 1024usize), (1280, 512), (2560, 256), (6144, 64)] {
+            assert!(
+                !q8a128_dense_use_mode4(m, n, SM_BW),
+                "N={n} M={m} should not run mode-4"
+            );
+        }
+    }
+
+    /// Every Flash-Next prefill projection at a 2048-token wave and up runs mode-4.
+    #[test]
+    fn flash_next_prefill_projections_run_mode4() {
+        for n in [16_480usize, 13_312, 2560, 640, 1280] {
+            for m in [2048usize, 4096, 7500] {
+                assert_eq!(
+                    q8a128_dense_tile(m, n, 2560, SM_BW),
+                    DenseTile::Mode4,
+                    "N={n} M={m}"
+                );
+            }
+        }
+    }
+
+    /// Below mode-4's gate the choice is mode-2's own, unchanged: a decode-width or tiny-N
+    /// launch never reaches mode-4, and the `[17, 32]` trap still picks mode-1.
+    #[test]
+    fn below_the_mode4_gate_the_mode2_rule_decides() {
+        for &sm in &[SM, SM_BW] {
+            for m in 1..=64usize {
+                for n in [512usize, 2560, 4096] {
+                    if !q8a128_dense_use_mode4(m, n, sm) {
+                        let expect = if q8a128_dense_use_mode2(m, n, 4096, sm) {
+                            DenseTile::Mode2
+                        } else {
+                            DenseTile::Mode1
+                        };
+                        assert_eq!(
+                            q8a128_dense_tile(m, n, 4096, sm),
+                            expect,
+                            "sm={sm} m={m} n={n}"
+                        );
+                    }
+                }
+            }
+            for m in (M_TILE_MODE1 + 1)..=M_TILE_MODE2 {
+                assert_eq!(
+                    q8a128_dense_tile(m, 2560, 4096, sm),
+                    DenseTile::Mode1,
+                    "trap m={m}"
+                );
+            }
+        }
+    }
+
+    /// Fewer rows than one mode-4 token tile never run it, however wide the output: at decode
+    /// width a 13,312- or 16,480-row projection would otherwise reach the grid bound on `N`
+    /// alone (104 and 129 blocks at M = 1) and run a 64-token tile that is 63/64 padding. A
+    /// failed SM query keeps the measured mode-1/mode-2 rule.
+    #[test]
+    fn decode_width_never_runs_mode4() {
+        for &sm in &[SM, SM_BW] {
+            for m in 1..M_TILE_MODE4 {
+                for n in [13_312usize, 16_480, 65_536] {
+                    assert!(!q8a128_dense_use_mode4(m, n, sm), "sm={sm} m={m} n={n}");
+                }
+            }
+        }
+        assert_eq!(q8a128_dense_tile(1, 13_312, 2560, SM_BW), DenseTile::Mode1);
+        assert!(!q8a128_dense_use_mode4(4096, 16_480, 0));
+    }
+
+    /// More rows or more columns never take mode-4 away: the gate is monotone in both.
+    #[test]
+    fn mode4_gate_is_monotone() {
+        for &sm in &[SM, SM_BW] {
+            for n in (128..=16_384usize).step_by(128) {
+                let mut seen = false;
+                for m in (1..=4096usize).step_by(7) {
+                    let on = q8a128_dense_use_mode4(m, n, sm);
+                    assert!(!seen || on, "sm={sm} n={n} m={m}");
+                    seen |= on;
+                }
+            }
+        }
     }
 }

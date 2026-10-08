@@ -8,18 +8,24 @@
 
 use candle::cuda_backend::cudarc::cublas::sys as cublas;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
+use candle::quantized::cuda::{produce_q8a128, Q8a128Operand};
+use candle::quantized::SumScale;
 use candle::{DType, Device, LiveTensor, Result, Storage, Tensor};
 pub use candle_kernels::delta_net::DELTA_NET_PREFILL_DIM;
 use candle_kernels::delta_net::{
     run_delta_net_batch_ptrs, run_delta_net_conv_decode_f32, run_delta_net_conv_prefill_f32,
     run_delta_net_decode_step_f32, run_delta_net_norm_gate_f32, run_delta_net_prefill_intra_f32,
-    run_delta_net_prefill_state_f32, DELTA_NET_PREFILL_CHUNK,
+    run_delta_net_prefill_state_f32, run_delta_net_short_span_f32, DELTA_NET_PREFILL_CHUNK,
+    DELTA_NET_PREFILL_CONV_MAX,
 };
+pub use candle_kernels::delta_net::{DELTA_NET_SHORT_SPAN_CONV, DELTA_NET_SHORT_SPAN_ROWS};
 
 use super::mix::{DeltaNetLayerTable, DeltaNetSeq, DeltaNetSpanTable, SeqSpan};
 use super::state_store::RecurrentStateStore;
+use super::ZGate;
 use crate::models::wave_buffers::wave_from_vec_ticketed;
 use candle::wave_provenance::WaveTicket;
+use std::ffi::c_void;
 
 /// The wave tensors every fused DeltaNet kernel reads through strides, plus
 /// the geometry derived from them — validated once per layer, not once per
@@ -192,6 +198,16 @@ pub fn typed_ptr(t: &LiveTensor<'_>, dtype: DType, what: &str) -> Result<u64> {
 
 pub fn f32_ptr(t: &LiveTensor<'_>, what: &str) -> Result<u64> {
     typed_ptr(t, DType::F32, what)
+}
+
+/// `ptr`, checked 16-byte aligned: the prefill passes read the state, the
+/// Q|K rows and the scan transients four floats at a time, and a misaligned
+/// base would fault inside a kernel that cannot say which operand it was.
+pub fn aligned16(ptr: u64, what: &str) -> Result<u64> {
+    if !ptr.is_multiple_of(16) {
+        candle::bail!("delta_net cuda: {what} at {ptr:#x} is not 16-byte aligned");
+    }
+    Ok(ptr)
 }
 
 /// The whole forward's decode pointer table: for every DeltaNet layer, every
@@ -402,10 +418,10 @@ fn build_span_rows<'w>(
                 s.out.s.dims()
             );
         }
-        ptrs.push(f32_ptr(&s.state.s, "state in")? as i64);
+        ptrs.push(aligned16(f32_ptr(&s.state.s, "state in")?, "state in")? as i64);
     }
     for s in spans {
-        ptrs.push(f32_ptr(&s.out.s, "state out")? as i64);
+        ptrs.push(aligned16(f32_ptr(&s.out.s, "state out")?, "state out")? as i64);
     }
     // `start` is the span's row in the PACKED wave buffer; the transients the
     // scan hands between its two passes are indexed by the same number, which
@@ -700,6 +716,12 @@ pub fn delta_net_conv_prefill(
     if kc != channels {
         candle::bail!("delta_net cuda: kernel channels {kc} != x channels {channels}");
     }
+    if !(2..=DELTA_NET_PREFILL_CONV_MAX).contains(&kwidth) {
+        candle::bail!(
+            "delta_net cuda: the prefill conv takes windows of 2..={DELTA_NET_PREFILL_CONV_MAX}, \
+             got {kwidth}"
+        );
+    }
     let (tc, cc) = conved.dims2()?;
     if cc != channels || tc != t_wave {
         candle::bail!(
@@ -719,7 +741,7 @@ pub fn delta_net_conv_prefill(
     let y_p = f32_ptr(conved, "conved")?;
     let ptrs_p = typed_ptr(&table.ptrs, DType::I64, "span ptrs")?;
     let spans_p = typed_ptr(&table.spans, DType::U32, "span extents")?;
-    unsafe {
+    let status = unsafe {
         run_delta_net_conv_prefill_f32(
             x_p as *const f32,
             k_p as *const f32,
@@ -735,7 +757,15 @@ pub fn delta_net_conv_prefill(
             kwidth as i32,
             qk_channels as i32,
             eps,
-            stream.cu_stream() as *mut core::ffi::c_void,
+            stream.cu_stream() as *mut c_void,
+        )
+    };
+    if status != 0 {
+        candle::bail!(
+            "delta_net cuda: the prefill conv refused {} spans of up to {} rows, {channels} \
+             channels, window {kwidth} and wrote nothing",
+            table.n,
+            table.max_len
         );
     }
     Ok(())
@@ -750,7 +780,7 @@ pub fn delta_net_conv_prefill(
 /// read from — and written into — the wave tensors in `fused`, through
 /// strides. The intra-chunk kernel (parallel over chunks × heads) hands
 /// `u`/`w`/`kq` to the sequential state walk through wave-backed transients;
-/// the state kernel keeps its S tile in registers across the whole sequence.
+/// the state kernel keeps its S tile in shared memory across the whole sequence.
 pub fn delta_net_prefill_scan(
     fused: &DeltaNetFused<'_, '_>,
     table: &DeltaNetSpanTable,
@@ -790,9 +820,10 @@ pub fn delta_net_prefill_scan(
     let g_cs = fused.conved.empty_beside((h_v, t_wave), DType::F32)?;
     {
         let stream = dev.cuda_stream();
-        let u_p = f32_ptr(&u, "u")?;
-        let w_p = f32_ptr(&w, "w")?;
-        let kq_p = f32_ptr(&kq, "kq")?;
+        aligned16(p.qk_p, "the conv output")?;
+        let u_p = aligned16(f32_ptr(&u, "u")?, "u")?;
+        let w_p = aligned16(f32_ptr(&w, "w")?, "w")?;
+        let kq_p = aligned16(f32_ptr(&kq, "kq")?, "kq")?;
         let gcs_p = f32_ptr(&g_cs, "g_cs")?;
         let ptrs_p = typed_ptr(&table.ptrs, DType::I64, "span ptrs")?;
         let spans_p = typed_ptr(&table.spans, DType::U32, "span extents")?;
@@ -845,6 +876,103 @@ pub fn delta_net_prefill_scan(
     Ok(())
 }
 
+/// The conv and the fused prefill scan for a wave whose multi-row spans are
+/// all at most [`DELTA_NET_SHORT_SPAN_ROWS`] long — a verify wave — in ONE
+/// launch, where [`delta_net_conv_prefill`] + [`delta_net_prefill_scan`] take
+/// three chained through global memory.
+///
+/// The same bits as that pair in every output it writes: `fused.o`'s span rows,
+/// every span's advanced state and advanced conv tail. It reads the raw `qkv`
+/// rows and convolves them itself, so the span rows of `fused.conved` are
+/// neither read nor written — that buffer supplies the wave's geometry here, and
+/// holds only the decode rows the batched decode conv writes beside this.
+///
+/// Refused with an error, nothing written, when a span is longer than
+/// [`DELTA_NET_SHORT_SPAN_ROWS`] or the conv is not
+/// [`DELTA_NET_SHORT_SPAN_CONV`] wide — the shapes the pair serves.
+pub fn delta_net_short_span_scan(
+    fused: &DeltaNetFused<'_, '_>,
+    qkv: &LiveTensor<'_>,
+    kernel: &Tensor,
+    table: &DeltaNetSpanTable,
+    eps: f32,
+) -> Result<()> {
+    if table.max_len > DELTA_NET_SHORT_SPAN_ROWS {
+        candle::bail!(
+            "delta_net cuda: the short-span scan takes spans of at most \
+             {DELTA_NET_SHORT_SPAN_ROWS} rows, got one of {}",
+            table.max_len
+        );
+    }
+    let p = fused.resolve_wave()?;
+    if p.d != DELTA_NET_PREFILL_DIM {
+        candle::bail!(
+            "delta_net cuda: the short-span scan is compiled for d == \
+             {DELTA_NET_PREFILL_DIM}, got {}",
+            p.d
+        );
+    }
+    let t_wave = fused.conved.dim(0)?;
+    if qkv.dims2()? != (t_wave, p.conv_dim) {
+        candle::bail!(
+            "delta_net cuda: qkv {:?} does not match the wave's conv rows [{t_wave}, {}]",
+            qkv.dims(),
+            p.conv_dim
+        );
+    }
+    if kernel.dims2()? != (p.conv_dim, DELTA_NET_SHORT_SPAN_CONV) {
+        candle::bail!(
+            "delta_net cuda: the short-span scan convolves {DELTA_NET_SHORT_SPAN_CONV} wide over \
+             {} channels, got a {:?} kernel",
+            p.conv_dim,
+            kernel.dims()
+        );
+    }
+    let dev = match qkv.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => candle::bail!("delta_net cuda: qkv must live on a CUDA device"),
+    };
+    let stream = dev.cuda_stream();
+    let x_p = f32_ptr(qkv, "qkv")?;
+    let k_p = f32_ptr(kernel, "kernel")?;
+    let ptrs_p = typed_ptr(&table.ptrs, DType::I64, "span ptrs")?;
+    let spans_p = typed_ptr(&table.spans, DType::U32, "span extents")?;
+    let status = unsafe {
+        run_delta_net_short_span_f32(
+            x_p as *const f32,
+            k_p as *const f32,
+            p.alpha_p as *const f32,
+            p.blin_p as *const f32,
+            p.dt_p as *const f32,
+            p.a_p as *const f32,
+            p.o_p as *mut f32,
+            ptrs_p as *const i64,
+            spans_p as *const u32,
+            table.n as i32,
+            table.max_len as i32,
+            p.h_v as i32,
+            p.h_k as i32,
+            p.conv_dim as i32,
+            DELTA_NET_SHORT_SPAN_CONV as i32,
+            eps,
+            fused.q_scale,
+            stream.cu_stream() as *mut core::ffi::c_void,
+        )
+    };
+    if status != 0 {
+        candle::bail!(
+            "delta_net cuda: the short-span scan refused {} spans of up to {} rows over \
+             h_v {} / h_k {} / {} channels and wrote nothing",
+            table.n,
+            table.max_len,
+            p.h_v,
+            p.h_k,
+            p.conv_dim
+        );
+    }
+    Ok(())
+}
+
 /// The mixer epilogue over the whole wave in one launch: per `(token, V head)`
 /// row, `out = (o / sqrt(mean(o²) + eps)) ⊙ gain ⊙ zgate(z)` — the per-head
 /// RMS norm and the z-gate that were ~6 ops and three full-width
@@ -856,8 +984,45 @@ pub fn delta_net_norm_gate<'w>(
     gain: &Tensor,
     d: usize,
     eps: f32,
-    zgate: super::ZGate,
+    zgate: ZGate,
 ) -> Result<LiveTensor<'w>> {
+    let (t, cols) = norm_gate_shape(o, z, gain, d)?;
+    let out = o.empty_beside((t, cols), DType::F32)?;
+    norm_gate_launch(o, z, gain, d, eps, zgate, f32_ptr(&out, "out")?, 0, 0)?;
+    Ok(out)
+}
+
+/// [`delta_net_norm_gate`]'s output as the q8a128 operand under `sum_scale`
+/// alone — the bytes a standalone quantize of that output would write, emitted
+/// by the epilogue from the values it computes — for an out-projection that
+/// runs int8 and reads nothing else. No F32 output is stored. One tile per row,
+/// so `d` must be 128.
+pub fn delta_net_norm_gate_q8<'w>(
+    o: &LiveTensor<'w>,
+    z: &LiveTensor<'w>,
+    gain: &Tensor,
+    d: usize,
+    eps: f32,
+    zgate: ZGate,
+    sum_scale: SumScale,
+) -> Result<Q8a128Operand<'w>> {
+    let (t, cols) = norm_gate_shape(o, z, gain, d)?;
+    if d != 128 {
+        candle::bail!("delta_net cuda: the norm-gate emits its operand one 128-wide tile per row, got d = {d}");
+    }
+    // The operand is placed beside `o`, the way the F32 output would have been.
+    produce_q8a128(o, t, cols, sum_scale, |q8| {
+        norm_gate_launch(o, z, gain, d, eps, zgate, 0, q8, sum_scale.as_code())
+    })
+}
+
+/// `(T, cols)` of a norm-gate over `o`, after checking `z` and `gain` against it.
+fn norm_gate_shape(
+    o: &LiveTensor<'_>,
+    z: &LiveTensor<'_>,
+    gain: &Tensor,
+    d: usize,
+) -> Result<(usize, usize)> {
     let (t, cols) = o.dims2()?;
     if z.dims2()? != (t, cols) {
         candle::bail!(
@@ -871,33 +1036,55 @@ pub fn delta_net_norm_gate<'w>(
             "delta_net cuda: gain [{d}] must divide {cols} rows-wise (cap {MAX_HEAD_DIM})"
         );
     }
+    Ok((t, cols))
+}
+
+/// One norm-gate launch writing the F32 output at `out_p`, the q8a128 operand
+/// at `q8`, or both; a `0` address writes nothing there.
+#[allow(clippy::too_many_arguments)]
+fn norm_gate_launch(
+    o: &LiveTensor<'_>,
+    z: &LiveTensor<'_>,
+    gain: &Tensor,
+    d: usize,
+    eps: f32,
+    zgate: ZGate,
+    out_p: u64,
+    q8: u64,
+    sum_norm: i32,
+) -> Result<()> {
+    let (t, cols) = o.dims2()?;
     let dev = match o.device() {
         Device::Cuda(dv) => dv.clone(),
         _ => candle::bail!("delta_net cuda: o must live on a CUDA device"),
     };
-    let out = o.empty_beside((t, cols), DType::F32)?;
-    {
-        let stream = dev.cuda_stream();
-        let o_p = f32_ptr(o, "o")?;
-        let z_p = f32_ptr(z, "z")?;
-        let g_p = f32_ptr(gain, "gain")?;
-        let out_p = f32_ptr(&out, "out")?;
-        let rows = t * (cols / d);
-        unsafe {
-            run_delta_net_norm_gate_f32(
-                o_p as *const f32,
-                z_p as *const f32,
-                g_p as *const f32,
-                out_p as *mut f32,
-                rows as i32,
-                d as i32,
-                eps,
-                matches!(zgate, super::ZGate::Sigmoid) as i32,
-                stream.cu_stream() as *mut core::ffi::c_void,
-            );
-        }
+    let o_p = f32_ptr(o, "o")?;
+    let z_p = f32_ptr(z, "z")?;
+    let g_p = f32_ptr(gain, "gain")?;
+    let rows = t * (cols / d);
+    let stream = dev.cuda_stream();
+    // SAFETY: `o`, `z` and `gain` are live F32 buffers of the checked shapes,
+    // and `out_p` / `q8` are either 0 or sized by the caller for `rows` rows
+    // of `d` (one q8a128 tile per row); the launch is on the device's stream.
+    let status = unsafe {
+        run_delta_net_norm_gate_f32(
+            o_p as *const f32,
+            z_p as *const f32,
+            g_p as *const f32,
+            out_p as *mut f32,
+            rows as i32,
+            d as i32,
+            eps,
+            matches!(zgate, ZGate::Sigmoid) as i32,
+            q8 as *mut u8,
+            sum_norm,
+            stream.cu_stream() as *mut c_void,
+        )
+    };
+    if status != 0 {
+        candle::bail!("delta_net cuda: the norm-gate refused rows={rows} d={d} and wrote nothing");
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -905,6 +1092,8 @@ mod tests {
     use super::super::mix::{causal_conv1d, delta_recurrence, l2_norm};
     use super::*;
     use candle::{DType, Device};
+
+    mod prefill_golden;
 
     /// One span as the kernel tests hold it: they drive the launches directly,
     /// without the mixer's [`DeltaNetSeq`] bookkeeping around them.
@@ -1707,6 +1896,248 @@ mod tests {
         }
     }
 
+    fn f32_bits(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// One mixer layer's raw wave operands for the short-span tests: the QKV
+    /// projection rows the conv reads, the conv weights, and the gate
+    /// projections and constants. GQA 3:1, Flash-Next's ratio (48 V heads over
+    /// 16 K heads), at a width a test can afford.
+    struct ShortCase {
+        qkv: Tensor,
+        kern: Tensor,
+        alpha: Tensor,
+        blin: Tensor,
+        dt_bias: Tensor,
+        a: Tensor,
+        h_k: usize,
+        h_v: usize,
+        conv_dim: usize,
+    }
+
+    impl ShortCase {
+        const D: usize = 128;
+
+        fn build(t: usize, seed: u64, gpu: &Device) -> Self {
+            let cpu = Device::Cpu;
+            let (h_k, h_v) = (2usize, 6usize);
+            let conv_dim = (2 * h_k + h_v) * Self::D;
+            let to = |x: Tensor| x.to_device(gpu).unwrap().contiguous().unwrap();
+            Self {
+                qkv: to(lcg_tensor(&[t, conv_dim], seed, &cpu)
+                    .affine(4.0, 0.0)
+                    .unwrap()),
+                kern: to(lcg_tensor(
+                    &[conv_dim, DELTA_NET_SHORT_SPAN_CONV],
+                    seed + 1,
+                    &cpu,
+                )),
+                alpha: to(lcg_tensor(&[t, h_v], seed + 2, &cpu)
+                    .affine(4.0, 0.0)
+                    .unwrap()),
+                blin: to(lcg_tensor(&[t, h_v], seed + 3, &cpu)
+                    .affine(4.0, 0.0)
+                    .unwrap()),
+                dt_bias: to(lcg_tensor(&[h_v], seed + 4, &cpu)),
+                a: to((lcg_tensor(&[h_v], seed + 5, &cpu).abs().unwrap() + 0.1)
+                    .unwrap()
+                    .neg()
+                    .unwrap()),
+                h_k,
+                h_v,
+                conv_dim,
+            }
+        }
+
+        fn fused<'a>(&'a self, conved: &'a Tensor, o: &'a Tensor) -> DeltaNetFused<'a, 'static> {
+            DeltaNetFused {
+                conved,
+                alpha: &self.alpha,
+                blin: &self.blin,
+                dt_bias: &self.dt_bias,
+                a: &self.a,
+                o,
+                q_scale: 1.0 / (Self::D as f32).sqrt(),
+            }
+        }
+    }
+
+    /// **The short-span launch is the three launches, to the bit.**
+    ///
+    /// A verify wave takes [`delta_net_short_span_scan`] where every other wave
+    /// takes [`delta_net_conv_prefill`] + [`delta_net_prefill_scan`], and a
+    /// rewind replays the verify wave's rows through the pair
+    /// (`replay_stack`) — so any bit the fused kernel computes differently is a
+    /// rewind that diverges from the wave it rewinds. Two waves of two spans
+    /// each — {5, 1} with separate state buffers, {8, 3} advancing in place —
+    /// from random entering states and tails, every output pre-filled with
+    /// distinct poison per path so an element either path leaves unwritten
+    /// cannot agree by accident: `o`, every advanced state and every advanced
+    /// conv tail must match bit for bit.
+    #[test]
+    fn a_short_span_fused_launch_is_the_three_launches_bit_for_bit() {
+        let Ok(gpu) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let d = ShortCase::D;
+        let eps = 1e-6f32;
+        for (case, (lens, in_place)) in [(&[5usize, 1][..], false), (&[8, 3], true)]
+            .into_iter()
+            .enumerate()
+        {
+            let t: usize = lens.iter().sum();
+            let seed = 300 + 50 * case as u64;
+            let c = ShortCase::build(t, seed, &gpu);
+            let (h_v, conv_dim) = (c.h_v, c.conv_dim);
+            let starts: Vec<usize> = lens
+                .iter()
+                .scan(0usize, |acc, &l| {
+                    let s = *acc;
+                    *acc += l;
+                    Some(s)
+                })
+                .collect();
+            let entering: Vec<Tensor> = (0..lens.len())
+                .map(|i| lcg_tensor(&[h_v, d, d], seed + 10 + i as u64, &gpu))
+                .collect();
+            let tails: Vec<Tensor> = (0..lens.len())
+                .map(|i| lcg_tensor(&[conv_dim, 3], seed + 20 + i as u64, &gpu))
+                .collect();
+            let poison =
+                |shape: &[usize], s: u64| lcg_tensor(shape, s, &gpu).affine(1e3, 0.0).unwrap();
+
+            // Per path: its own advanced buffers, poisoned differently, and —
+            // advancing in place — its own copy of the entering state.
+            struct PathBufs {
+                state_in: Vec<Tensor>,
+                state_out: Vec<Tensor>,
+                tail_out: Vec<Tensor>,
+                o: Tensor,
+            }
+            let bufs = |salt: u64| PathBufs {
+                state_in: entering.iter().map(|s| s.copy().unwrap()).collect(),
+                state_out: (0..lens.len())
+                    .map(|i| poison(&[h_v, d, d], salt + i as u64))
+                    .collect(),
+                tail_out: (0..lens.len())
+                    .map(|i| poison(&[conv_dim, 3], salt + 5 + i as u64))
+                    .collect(),
+                o: poison(&[t, h_v * d], salt + 9),
+            };
+            let table = |b: &PathBufs| {
+                let rows: Vec<TestSpan<'_>> = (0..lens.len())
+                    .map(|i| TestSpan {
+                        tail: &tails[i],
+                        tail_out: &b.tail_out[i],
+                        state: &b.state_in[i],
+                        state_out: if in_place {
+                            &b.state_in[i]
+                        } else {
+                            &b.state_out[i]
+                        },
+                        start: starts[i],
+                        len: lens[i],
+                    })
+                    .collect();
+                span_table(&rows)
+            };
+
+            let three = bufs(seed + 1000);
+            let conved = Tensor::zeros((t, conv_dim), DType::F32, &gpu).unwrap();
+            let tbl = table(&three);
+            delta_net_conv_prefill(&c.qkv, &c.kern, &tbl, 2 * c.h_k * d, eps, &conved).unwrap();
+            delta_net_prefill_scan(&c.fused(&conved, &three.o), &tbl).unwrap();
+
+            let short = bufs(seed + 2000);
+            let geometry = Tensor::zeros((t, conv_dim), DType::F32, &gpu).unwrap();
+            delta_net_short_span_scan(
+                &c.fused(&geometry, &short.o),
+                &c.qkv,
+                &c.kern,
+                &table(&short),
+                eps,
+            )
+            .unwrap();
+
+            let advanced = |b: &PathBufs, i: usize| -> Vec<u32> {
+                f32_bits(if in_place {
+                    &b.state_in[i]
+                } else {
+                    &b.state_out[i]
+                })
+            };
+            assert_eq!(f32_bits(&three.o), f32_bits(&short.o), "{lens:?}: o");
+            for (i, entered) in entering.iter().enumerate().take(lens.len()) {
+                let state = advanced(&three, i);
+                assert_ne!(
+                    state,
+                    f32_bits(entered),
+                    "{lens:?} span {i}: the three launches left the state where it entered"
+                );
+                assert!(
+                    state.iter().any(|&b| b != 0),
+                    "{lens:?} span {i}: the advanced state is zero"
+                );
+                assert_eq!(
+                    state,
+                    advanced(&short, i),
+                    "{lens:?} span {i}: advanced state"
+                );
+                assert_eq!(
+                    f32_bits(&three.tail_out[i]),
+                    f32_bits(&short.tail_out[i]),
+                    "{lens:?} span {i}: advanced conv tail"
+                );
+            }
+        }
+    }
+
+    /// A span past [`DELTA_NET_SHORT_SPAN_ROWS`] is refused by name, before
+    /// anything launches — the pair serves it.
+    #[test]
+    fn a_nine_row_span_is_refused_by_the_short_span_launch() {
+        let Ok(gpu) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let t = DELTA_NET_SHORT_SPAN_ROWS + 1;
+        let c = ShortCase::build(t, 77, &gpu);
+        let d = ShortCase::D;
+        let state = Tensor::zeros((c.h_v, d, d), DType::F32, &gpu).unwrap();
+        let tail = Tensor::zeros((c.conv_dim, 3), DType::F32, &gpu).unwrap();
+        let tail_out = Tensor::zeros((c.conv_dim, 3), DType::F32, &gpu).unwrap();
+        let o = Tensor::zeros((t, c.h_v * d), DType::F32, &gpu).unwrap();
+        let conved = Tensor::zeros((t, c.conv_dim), DType::F32, &gpu).unwrap();
+        let tbl = span_table(&[TestSpan {
+            tail: &tail,
+            tail_out: &tail_out,
+            state: &state,
+            state_out: &state,
+            start: 0,
+            len: t,
+        }]);
+        let err = delta_net_short_span_scan(&c.fused(&conved, &o), &c.qkv, &c.kern, &tbl, 1e-6)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("the short-span scan takes spans of at most 8 rows, got one of 9"),
+            "{err}"
+        );
+        assert_eq!(
+            f32_bits(&o).iter().filter(|&&b| b != 0).count(),
+            0,
+            "a refused launch wrote output"
+        );
+    }
+
     /// The conv half of the same property: every span's tail advanced in one
     /// launch must equal each advanced alone.
     #[test]
@@ -1989,6 +2420,77 @@ mod tests {
                 diff <= 2e-5,
                 "epilogue diverged from the op forms under {zgate:?}: {diff}"
             );
+        }
+    }
+
+    /// Each q8a128 tile of `op` as its 128 int8 codes then its 4-byte
+    /// `{scale, Σx}` header, in tile order — the operand's bytes without the
+    /// super-block padding, which no reader touches.
+    fn tile_bytes(op: &Q8a128Operand<'_>, dev: &candle::cuda_backend::CudaDevice) -> Vec<u8> {
+        use candle::quantized::cuda::Q8a128Data;
+        const BLK: usize = 1152;
+        const META: usize = 1024;
+        let raw = match &op.data {
+            Q8a128Data::Tensor(t) => t.flatten_all().unwrap().to_vec1::<u8>().unwrap(),
+            Q8a128Data::Owned(s) => dev.memcpy_dtov(s).unwrap(),
+        };
+        let tiles = op.rows * op.cols / 128;
+        let mut out = Vec::with_capacity(tiles * 132);
+        for tile in 0..tiles {
+            let base = (tile / 8) * BLK;
+            let qs = base + (tile % 8) * 128;
+            let ds = base + META + (tile % 8) * 16;
+            out.extend_from_slice(&raw[qs..qs + 128]);
+            out.extend_from_slice(&raw[ds..ds + 4]);
+        }
+        out
+    }
+
+    /// The operand the epilogue emits is the standalone quantize of the output
+    /// the F32 epilogue stores, byte for byte — under both gates and both Σx
+    /// conventions, at a decode width, a verify width and a prefill-like one,
+    /// at the released 48 heads (48 tiles a row, whole super-blocks of 8) and at
+    /// 5 heads, whose 5-tile rows leave every super-block but the first partial.
+    #[test]
+    fn the_norm_gate_emits_the_quantize_bytes() {
+        use candle::quantized::cuda::{to_dynamic, DynamicTensor};
+        use candle::quantized::Int8Mode;
+        let Ok(gpu) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let Device::Cuda(dev) = &gpu else {
+            unreachable!("built as CUDA")
+        };
+        let cpu = Device::Cpu;
+        let d = 128usize;
+        let mode = Int8Mode::auto(&gpu);
+        for h_v in [48usize, 5] {
+            for t in [1usize, 5, 37] {
+                let seed = 81 + (h_v * 100 + t) as u64;
+                let o = lcg_tensor(&[t, h_v * d], seed, &cpu)
+                    .to_device(&gpu)
+                    .unwrap();
+                let z = lcg_tensor(&[t, h_v * d], seed + 1, &cpu)
+                    .to_device(&gpu)
+                    .unwrap();
+                let gain = lcg_tensor(&[d], 83, &cpu).to_device(&gpu).unwrap();
+                for zgate in [ZGate::Silu, ZGate::Sigmoid] {
+                    for ss in [SumScale::Raw, SumScale::ByAmax] {
+                        let plain = delta_net_norm_gate(&o, &z, &gain, d, 1e-6, zgate).unwrap();
+                        let op = delta_net_norm_gate_q8(&o, &z, &gain, d, 1e-6, zgate, ss).unwrap();
+                        let acts = to_dynamic(&plain, mode, dev, ss).unwrap();
+                        let DynamicTensor::Int8(want) = acts.as_dynamic() else {
+                            panic!("an int8 mode quantizes")
+                        };
+                        assert_eq!(
+                            tile_bytes(&op, dev),
+                            tile_bytes(want, dev),
+                            "h_v={h_v} t={t} {zgate:?} {ss:?}: operand bytes"
+                        );
+                    }
+                }
+            }
         }
     }
 }

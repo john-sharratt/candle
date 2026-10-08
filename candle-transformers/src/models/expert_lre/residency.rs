@@ -144,7 +144,12 @@ impl Residency {
 
     /// Record the expert's warm slot — at startup, once; the warm tier is
     /// immutable.
-    pub(crate) fn set_warm(&mut self, row: usize, expert: usize, warm: Option<(usize, Option<u64>)>) {
+    pub(crate) fn set_warm(
+        &mut self,
+        row: usize,
+        expert: usize,
+        warm: Option<(usize, Option<u64>)>,
+    ) {
         let i = self.at(row, expert);
         self.places[i].warm = warm;
     }
@@ -173,7 +178,11 @@ impl Residency {
                     base + self.table.offset(Proj::Up, row),
                     base + self.table.offset(Proj::Down, row),
                 ],
-                if from_pad { Fallback::Pad } else { Fallback::Warm },
+                if from_pad {
+                    Fallback::Pad
+                } else {
+                    Fallback::Warm
+                },
             ),
             None => ([0; 3], Fallback::Cold),
         })
@@ -200,7 +209,10 @@ impl Residency {
     pub(crate) fn pin_pad(&mut self, row: usize, expert: usize, delta: i32) {
         let i = self.at(row, expert);
         let pins = self.places[i].pins as i64 + delta as i64;
-        assert!(pins >= 0, "residency: pad pin count of ({row}, {expert}) below zero");
+        assert!(
+            pins >= 0,
+            "residency: pad pin count of ({row}, {expert}) below zero"
+        );
         self.places[i].pins = pins as u32;
     }
 
@@ -245,7 +257,11 @@ mod tests {
             "the pad copy is nearer"
         );
         r.set_vram(1, 2, None);
-        assert_eq!(t.entry(Proj::Gate, 1, 2), pad, "what the device writes, eviction publishes");
+        assert_eq!(
+            t.entry(Proj::Gate, 1, 2),
+            pad,
+            "what the device writes, eviction publishes"
+        );
 
         r.set_warm(0, 1, Some((4, None)));
         r.set_vram(0, 1, Some((41, 0xa100_0000)));
@@ -267,7 +283,11 @@ mod tests {
         assert_eq!(r.device_evicted(0, 1), (0xa100_0000, 0));
         assert_eq!(t.entry(Proj::Gate, 0, 1), 0);
         assert!(!r.place(0, 1).offered_cold);
-        assert_eq!(r.device_evicted(0, 1), (0, 0), "a second booking changes nothing");
+        assert_eq!(
+            r.device_evicted(0, 1),
+            (0, 0),
+            "a second booking changes nothing"
+        );
     }
 
     fn residency() -> (Residency, Arc<LiveTable>) {
@@ -287,10 +307,16 @@ mod tests {
         assert_eq!(t.entry(Proj::Down, 1, 2), pinned_warm + 0x300);
 
         // Promotion lands: VRAM.
-        assert_eq!(r.set_vram(1, 2, Some((40, 0xa000_0000))), (pinned_warm, 0xa000_0000));
+        assert_eq!(
+            r.set_vram(1, 2, Some((40, 0xa000_0000))),
+            (pinned_warm, 0xa000_0000)
+        );
         assert_eq!(t.entry(Proj::Up, 1, 2), 0xa000_0100);
         // The stager publishes a pad copy: the entry stays VRAM.
-        assert_eq!(r.set_pad(1, 2, Some((3, 0x9000_0000))), (0xa000_0000, 0xa000_0000));
+        assert_eq!(
+            r.set_pad(1, 2, Some((3, 0x9000_0000))),
+            (0xa000_0000, 0xa000_0000)
+        );
         assert_eq!(t.entry(Proj::Gate, 1, 2), 0xa000_0000);
         // VRAM eviction falls back to the pad.
         assert_eq!(r.set_vram(1, 2, None), (0xa000_0000, 0x9000_0000));

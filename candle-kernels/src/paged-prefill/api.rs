@@ -38,6 +38,39 @@ extern "C" {
         sel_page_win: *const u32,
         sel_stride: i32,
         sel_ratio: i32,
+        // The pre-staged K/V (`src/paged-prefill/kv_stage.cuh`): null stages
+        // nothing; otherwise every sequence with `q_len >= stage_min_q_len`
+        // is staged into `stage_buf` (`stage_bytes` long; `stage_positions`
+        // the sum of those sequences' kv lengths, `stage_max_kv` the deepest)
+        // ahead of the attention kernel, which reads its columns from there.
+        stage_buf: *mut u8,
+        stage_bytes: i64,
+        stage_positions: i64,
+        stage_min_q_len: i32,
+        stage_max_kv: i32,
+    );
+
+    /// The pre-staging pass of [`run_paged_prefill_int8`] alone, into
+    /// `stage_buf`. kv_dtype: 1=F16, 2=BF16 — the packed K/V's type.
+    pub fn run_paged_prefill_kv_stage(
+        k_ptr: *const c_void,
+        v_ptr: *const c_void,
+        headers_ptr: *const u8,
+        cu_seqlens_q: *const u32,
+        q_lens: *const u32,
+        kv_lens: *const u32,
+        batch_size: i32,
+        n_kv_head: i32,
+        head_dim: i32,
+        kv_dtype: i32,
+        rungs: RopeRungsFfi,
+        rope_interleaved: i32,
+        stream: *mut c_void,
+        stage_buf: *mut u8,
+        stage_bytes: i64,
+        stage_positions: i64,
+        stage_min_q_len: i32,
+        stage_max_kv: i32,
     );
 
 }

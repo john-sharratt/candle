@@ -27,6 +27,7 @@
 //! overwritten before both host threads have read it — a check against two
 //! counters, never against the driver or the GPU.
 
+use super::flush_schedule::{SegmentFill, MAX_UNFLUSHED_INVOCATIONS};
 use super::live_table::{LiveTable, Proj};
 use super::promo::PromotionRing;
 use super::reclaim::ReclaimClock;
@@ -154,7 +155,10 @@ impl SummaryRing {
     }
 
     fn host_slot_ptr(&self, slot: usize) -> *mut u32 {
-        assert!(slot < SUMMARY_RING, "summary ring slot {slot} of {SUMMARY_RING}");
+        assert!(
+            slot < SUMMARY_RING,
+            "summary ring slot {slot} of {SUMMARY_RING}"
+        );
         // SAFETY: in bounds by the assertion.
         unsafe { self.host.add(slot * self.stride()) }
     }
@@ -167,8 +171,9 @@ impl SummaryRing {
     /// completed. That is the whole signal: no event and no copy.
     pub(crate) fn ready(&self, slot: usize, word: u32) -> bool {
         // SAFETY: the word is inside the mapped ring; the device writes it.
-        let ready = unsafe { std::ptr::read_volatile(self.host_slot_ptr(slot).add(self.n_experts)) }
-            == word;
+        let ready =
+            unsafe { std::ptr::read_volatile(self.host_slot_ptr(slot).add(self.n_experts)) }
+                == word;
         if ready {
             std::sync::atomic::fence(Ordering::Acquire);
         }
@@ -321,7 +326,13 @@ pub(crate) struct PassState {
 struct ForwardSide {
     seq: u64,
     last_row: Option<usize>,
+    /// The invocations recorded into the current graph segment — what decides
+    /// where [`Dispatch::after`] launches it.
+    fill: SegmentFill,
 }
+
+// Every invocation the ring hold can wait on has been launched.
+const _: () = assert!(2 * MAX_UNFLUSHED_INVOCATIONS <= SUMMARY_RING);
 
 /// The two pinned host ranges a remote entry lies in: the warm tier's pinned
 /// part, and the pad.
@@ -471,6 +482,7 @@ impl Dispatch {
             forward: Mutex::new(ForwardSide {
                 seq: 0,
                 last_row: None,
+                fill: SegmentFill::default(),
             }),
             snap,
             remote,
@@ -513,10 +525,9 @@ impl Dispatch {
     /// previous one's. Returns `(seq, pass)`.
     fn begin_invocation(&self, row: usize) -> Result<(u64, u64)> {
         let (seq, new_pass) = {
-            let mut f = self
-                .forward
-                .lock()
-                .map_err(|_| candle::Error::Msg("expert dispatch: forward state poisoned".into()))?;
+            let mut f = self.forward.lock().map_err(|_| {
+                candle::Error::Msg("expert dispatch: forward state poisoned".into())
+            })?;
             let new_pass = f.last_row.is_none_or(|last| row <= last);
             f.last_row = Some(row);
             let seq = f.seq;
@@ -538,8 +549,12 @@ impl Dispatch {
     /// read the slot's previous tenant, ticket `ticket - SUMMARY_RING`.
     fn hold_for_ring(&self, ticket: u64) -> Result<()> {
         let need = ticket.saturating_sub(SUMMARY_RING as u64);
+        // Host time the forward thread spends here is the GPU's, not its own:
+        // the readers consume a slot only once the device has written it.
+        let t = profile_now();
         let mut spins = 0u32;
-        while self.served.load(Ordering::Acquire) < need || self.staged.load(Ordering::Acquire) < need
+        while self.served.load(Ordering::Acquire) < need
+            || self.staged.load(Ordering::Acquire) < need
         {
             if self.abort.is_raised() {
                 candle::bail!("expert pipeline or stager died — the layer cannot be served");
@@ -551,6 +566,7 @@ impl Dispatch {
                 std::thread::yield_now();
             }
         }
+        crate::models::profile::pipeline_record("moe:hold_ring", t);
         Ok(())
     }
 
@@ -639,11 +655,25 @@ impl Dispatch {
 
     /// Submit what [`Self::record`] queued. Both host threads wait on the
     /// summary word bucketize writes, and nothing on the forward thread
-    /// synchronizes, so on WDDM nothing else would flush it. Inside a wave
-    /// capture this is where a segment ends: the recorded launches, bucketize
-    /// among them, are launched as one graph before the query.
+    /// synchronizes, so on WDDM nothing else would flush it. Issued eagerly,
+    /// every invocation is submitted. Inside a wave capture this is where a
+    /// segment ends — once it holds the invocations the flush schedule gives
+    /// its ordinal (`flush_schedule`): the recorded launches, bucketize among them, are
+    /// launched as one graph before the query.
     fn after(&self, device: &CudaDevice) -> Result<()> {
-        device.flush_launches()
+        let flush = match device.recording_segment() {
+            None => true,
+            Some((wave, ordinal)) => self
+                .forward
+                .lock()
+                .map_err(|_| candle::Error::Msg("expert dispatch: forward state poisoned".into()))?
+                .fill
+                .record(wave, ordinal),
+        };
+        if flush {
+            device.flush_launches()?;
+        }
+        Ok(())
     }
 
     /// The launches of one reserved invocation, and nothing else: bucketize,
@@ -682,7 +712,7 @@ impl Dispatch {
         // at ×8–×16 25–33%.
         let n_sub = grouped_int8_n_sub(
             (num_tokens * k) / n_experts.max(1),
-            gate_dtype.is_ko() && down_dtype.is_ko(),
+            &[gate_dtype, down_dtype],
         );
         let tile_w = 16 * n_sub;
         let compute = cuda_dev.cuda_stream();

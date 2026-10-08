@@ -1,11 +1,15 @@
 //! GPU-side slot-state cache for a single sequence.
 //!
 //! Holds a host copy of the serialised slot-state and a matching device slot,
-//! laid out in two sections — `[ slice headers (16 B) | KvHead records ]` — so the
-//! slice headers stay a contiguous 16-byte-stride array (what the kernel's
-//! `get_slice` indexes) while each header's `kvheads_ptr` points into the records
-//! section. Dirty chunk indices accumulate on the [`GpuChunksGuard`]; on drop the
-//! guard coalesces adjacent indices into runs, packs each run's two ranges (the
+//! laid out in two sections — `[ slice headers (16 B) × capacity | KvHead records ]`
+//! — so the slice headers stay a contiguous 16-byte-stride array (what the
+//! kernel's `get_slice` indexes) while each header's `kvheads_ptr` points into the
+//! records section. The records begin past room for `capacity` headers, not past
+//! the live ones, so a chunk appended within the capacity moves no record and the
+//! entries before it stay valid as they stand: a sequence crossing a 32-token
+//! boundary serialises its new tail ([`GpuChunksGuard::extend_decode`]), not its
+//! whole history. Dirty chunk indices accumulate on the [`GpuChunksGuard`]; on drop
+//! the guard coalesces adjacent indices into runs, packs each run's two ranges (the
 //! headers range + the records range) into a pinned staging buffer, and uploads
 //! them from there.
 //!
@@ -113,6 +117,21 @@ pub(crate) struct GpuChunks {
     /// is grow-only and the device slot is a class width, so neither length
     /// divides down to the entry count.
     n_chunks: usize,
+    /// Entries the current layout has room for: the records section begins at
+    /// `capacity × SLICE_HEADER_BYTES`. Fixed between full serialisations, so
+    /// an entry appended below it is written where the layout already expects
+    /// it. The slot class's width in entries, set by `resize`.
+    capacity: usize,
+    /// The writer entry of the most recent serialisation — the one entry whose
+    /// length is the offset-derived write length rather than its chunk's
+    /// stored usage, and whose device copy the decode kernel advances in
+    /// place. An extend re-serialises from here at the latest.
+    write_idx: usize,
+    /// Chunks were appended to the host list since the last serialisation, so
+    /// the `n_chunks` entries held are a strict prefix of it and the next sync
+    /// extends rather than rebuilds. Set by [`Self::mark_appended`], cleared by
+    /// any serialisation and by `clear`.
+    appended: bool,
     /// The chunks this serialisation REFERENCES, held alive by their gids.
     ///
     /// A serialised slot-state is a page table: its records name arena base
@@ -239,10 +258,33 @@ impl GpuChunks {
             chunk_byte_size: 0,
             gen_records: None,
             n_chunks: 0,
+            capacity: 0,
+            write_idx: 0,
+            appended: false,
             pins: Arc::new(Vec::new()),
             staging: [Staging::empty(), Staging::empty()],
             last_upload: None,
         }
+    }
+
+    /// Record that chunks were appended to the host list this buffer
+    /// serialises. A buffer holding nothing has nothing to extend — its next
+    /// sync rebuilds it — so it is left as it is.
+    pub(crate) fn mark_appended(&mut self) {
+        if self.n_chunks != 0 {
+            self.appended = true;
+        }
+    }
+
+    /// Whether chunks were appended since the last serialisation
+    /// ([`Self::mark_appended`]).
+    pub(crate) fn appended(&self) -> bool {
+        self.appended
+    }
+
+    /// The writer entry of the most recent serialisation.
+    pub(crate) fn write_idx(&self) -> usize {
+        self.write_idx
     }
 
     /// The chunks this serialisation references, for a consumer to hold across
@@ -367,14 +409,13 @@ impl GpuChunks {
         write_idx: usize,
         write_len: u16,
     ) -> candle::Result<u64> {
-        let len = self.host.len();
-        if len == 0 {
+        let n = self.n_chunks();
+        if n == 0 {
             return Ok(0);
         }
         // Cacheable memory, read in place by every pass below (headers copy,
         // records copy, pointer rebase, debug checksum).
         let host: &[u8] = &self.host;
-        let n = self.n_chunks();
         // `write_idx` is `decode_write_chunk_idx()` (always `< host chunk count`);
         // after `sync_decode_gpu_chunks` the serialised buffer holds exactly that
         // many chunks, so `write_idx < n` is an invariant. Fail loudly rather
@@ -386,10 +427,13 @@ impl GpuChunks {
             );
         }
         let headers_len = n * SLICE_HEADER_BYTES;
-        let records_len = len - headers_len;
+        // The live records: `n` of them, from where the layout places the
+        // section — past room for `capacity` headers.
+        let records_off = self.capacity * SLICE_HEADER_BYTES;
+        let records_len = n * (self.chunk_byte_size - SLICE_HEADER_BYTES);
         let d_old = self.raw_device_ptr();
-        let records_base_old = d_old + headers_len as u64;
-        let records_end_old = d_old + len as u64;
+        let records_base_old = d_old + records_off as u64;
+        let records_end_old = records_base_old + records_len as u64;
 
         // Records section: reuse the cached generation copy when it still matches
         // this generation's epoch and chunk count; otherwise copy it in. The
@@ -404,7 +448,7 @@ impl GpuChunks {
         let records_ptr = if records_len == 0 {
             0
         } else {
-            let records_src = &host[headers_len..headers_len + records_len];
+            let records_src = &host[records_off..records_off + records_len];
             let hit = self
                 .gen_records
                 .as_ref()
@@ -552,12 +596,13 @@ pub(crate) struct GpuChunksGuard<'a> {
 
 impl GpuChunksGuard<'_> {
     /// Ensure the host copy and the device slot can hold `n_chunks` entries of
-    /// `chunk_byte_size` bytes.
+    /// `chunk_byte_size` bytes, and lay the buffer out for the slot class's
+    /// width in entries ([`GpuChunks::capacity`]).
     ///
-    /// **Content is not preserved, and does not need to be.** The buffer has
-    /// two sections — `[ slice headers | records ]` — so the records section
-    /// moves whenever `n_chunks` changes, and the only caller
-    /// ([`Self::rebuild_decode`]) rewrites every entry immediately after.
+    /// **Content is not preserved, and does not need to be.** The records
+    /// section begins past room for `capacity` headers, so it moves whenever
+    /// the class does, and the only caller ([`Self::rebuild_decode`]) rewrites
+    /// every entry immediately after.
     ///
     /// Growth on the device is a **promotion**: claim a wider slot from the
     /// next class up and release the old one — no allocator call and no copy.
@@ -572,6 +617,7 @@ impl GpuChunksGuard<'_> {
         self.inner.n_chunks = n_chunks;
 
         if byte_len == 0 {
+            self.inner.capacity = 0;
             // The slot changes hands: retire any copy still writing it.
             self.inner.fence_uploads();
             self.inner.release_slot();
@@ -579,6 +625,9 @@ impl GpuChunksGuard<'_> {
         }
 
         let want = slot_state_arena::class_bytes_for(byte_len)?;
+        // Every entry takes `chunk_byte_size` across the two sections, so the
+        // class holds `want / chunk_byte_size` of them — at least `n_chunks`.
+        self.inner.capacity = want / chunk_byte_size;
         if self.inner.host.len() < want {
             self.inner.host.resize(want, 0);
         }
@@ -621,50 +670,33 @@ impl GpuChunksGuard<'_> {
         // was issued with however this changes them.
         let n_palette = chunk_n_palette(chunk, n_kv_head);
         let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim, n_palette);
-        // The LIVE entry count, not one derived from the buffer length. Both
-        // buffers are capacities now — the host side is grow-only and the
-        // device slot is a class width — and `records_off` below is
-        // `n * SLICE_HEADER_BYTES`, so a capacity-derived count would place
-        // the records section past where `rebuild_decode` wrote it and point
-        // every `kvheads_ptr` at unwritten bytes.
+        // The LIVE entry count, not one derived from the buffer length: both
+        // buffers are capacities — the host side is grow-only and the device
+        // slot is a class width.
         let current_n = if self.inner.chunk_byte_size == chunk_byte_size && chunk_byte_size > 0 {
             self.inner.n_chunks
         } else {
             0
         };
         if chunk_idx >= current_n {
+            // A chunk appended since the last serialisation: the pending extend
+            // serialises it from the host state, this change included.
+            if self.inner.appended && current_n > 0 {
+                return Ok(());
+            }
             candle::bail!(
                 "update_chunk: index {chunk_idx} out of range (buf holds {current_n} chunks)"
             );
         }
-        let rec_bytes = record_bytes(n_kv_head, head_dim, n_palette);
-        let records_off = current_n * SLICE_HEADER_BYTES;
-        let base = self.inner.raw_device_ptr();
-        let len = chunk.usage as u16;
-        // Resident chunk: point at its meta-pool record; else inline (see
-        // rebuild_decode for the rationale).
-        let kvheads_ptr = match chunk.meta.as_ref().map(|m| m.device_addr()) {
-            Some(addr) if addr != 0 => addr,
-            _ => {
-                let r0 = records_off + chunk_idx * rec_bytes;
-                write_record_for_chunk(
-                    &mut self.inner.host[r0..r0 + rec_bytes],
-                    chunk,
-                    n_kv_head,
-                    head_dim,
-                    n_palette,
-                    arena_info,
-                );
-                base + (records_off + chunk_idx * rec_bytes) as u64
-            }
-        };
-        let s0 = chunk_idx * SLICE_HEADER_BYTES;
-        write_slice_header(
-            &mut self.inner.host[s0..s0 + SLICE_HEADER_BYTES],
-            chunk.offset,
-            len,
+        self.write_entry(
+            chunk_idx,
+            chunk,
+            chunk.usage as u16,
             rope_base,
-            kvheads_ptr,
+            n_kv_head,
+            head_dim,
+            n_palette,
+            arena_info,
         );
         // Keep the pin describing what the bytes now reference. The gids are the
         // same object on every writer-length patch — the overwhelmingly common
@@ -730,57 +762,139 @@ impl GpuChunksGuard<'_> {
         let n_palette = chunk_n_palette(&chunks[0], n_kv_head);
         let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim, n_palette);
         self.resize(n, chunk_byte_size)?;
-
-        // Two sections: slice headers [0 .. n*16), then records. Resolve the GPU
-        // base once (the allocation is fixed for the buffer's lifetime) so each
-        // header's kvheads_ptr can point into the records section.
-        let rec_bytes = record_bytes(n_kv_head, head_dim, n_palette);
-        let records_off = n * SLICE_HEADER_BYTES;
-        let base = self.inner.raw_device_ptr();
+        self.inner.appended = false;
+        self.inner.write_idx = write_idx;
 
         // Seeded at `base_pos` (tokens evicted off the front by the sliding
         // window) so the serialised per-chunk `rope_base` stays ABSOLUTE after
         // the ring slides; zero for non-windowed slots → byte-identical.
         let mut rope_base = base_pos;
         for (i, chunk) in chunks.iter().enumerate() {
-            // The writer chunk gets the seq_offset-derived `write_len`; every
-            // other chunk (including trailing empties past the writer) keeps its
-            // own stored usage.
-            let len = if i == write_idx {
-                write_len
-            } else {
-                chunk.usage as u16
-            };
-            // Resident chunk: point at its co-resident record in the meta-pool
-            // slab and skip serializing a record here. Otherwise serialize an
-            // inline record into this chunk's records-section slot and point at it.
-            let kvheads_ptr = match chunk.meta.as_ref().map(|m| m.device_addr()) {
-                Some(addr) if addr != 0 => addr,
-                _ => {
-                    let r0 = records_off + i * rec_bytes;
-                    write_record_for_chunk(
-                        &mut self.inner.host[r0..r0 + rec_bytes],
-                        chunk,
-                        n_kv_head,
-                        head_dim,
-                        n_palette,
-                        arena_info,
-                    );
-                    base + (records_off + i * rec_bytes) as u64
-                }
-            };
-            let s0 = i * SLICE_HEADER_BYTES;
-            write_slice_header(
-                &mut self.inner.host[s0..s0 + SLICE_HEADER_BYTES],
-                chunk.offset,
-                len,
-                rope_base,
-                kvheads_ptr,
+            let len = decode_entry_len(chunk, i, write_idx, write_len);
+            self.write_entry(
+                i, chunk, len, rope_base, n_kv_head, head_dim, n_palette, arena_info,
             );
             self.dirty_chunks.push(i);
             rope_base += chunk.usage;
         }
         Ok(())
+    }
+
+    /// Bring the buffer up to `chunks` after an append, serialising only the
+    /// entries from `start` on, and return how many that was — or nothing at
+    /// all, returning `None`, when the current layout cannot hold them, for the
+    /// caller to [`Self::rebuild_decode`].
+    ///
+    /// The buffer's `n_chunks` entries are a prefix of `chunks`
+    /// ([`GpuChunks::appended`]), and every entry below `start` is already what
+    /// `rebuild_decode` would write now: an entry's bytes depend only on its own
+    /// chunk, the usages before it and whether it is the writer, so the caller
+    /// passes a `start` no later than the previous writer and the first entry a
+    /// pending commit marked stale. The entries from `start` are written by the
+    /// same rules as a rebuild, so the result describes the same K/V as the
+    /// rebuild's, entry for entry. It is not always the same bytes: an entry
+    /// below `start` serialised inline keeps its inline record after the chunk
+    /// gains a resident one (a cold load's meta attach), where a rebuild would
+    /// point at the resident record — two copies of one record.
+    ///
+    /// Bounded by the layout's [`GpuChunks::capacity`]: past it the records
+    /// would have to move, and a rebuild promotes the slot to the next class —
+    /// once per doubling, so a sequence growing to `n` chunks serialises O(n)
+    /// entries in all rather than O(n²).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn extend_decode(
+        &mut self,
+        chunks: &[ChunkWindow],
+        n_kv_head: usize,
+        head_dim: usize,
+        arena_info: &[ResolvedArenaInfo],
+        write_len: u16,
+        write_idx: usize,
+        base_pos: u32,
+        start: usize,
+    ) -> candle::Result<Option<usize>> {
+        let held = self.inner.n_chunks;
+        let n = chunks.len();
+        if !self.inner.appended || held == 0 || n < held || start > held || n > self.inner.capacity
+        {
+            return Ok(None);
+        }
+        let n_palette = chunk_n_palette(&chunks[0], n_kv_head);
+        if token_slice_serialized_size(n_kv_head, head_dim, n_palette) != self.inner.chunk_byte_size
+        {
+            return Ok(None);
+        }
+        // The device slot is a class width at least `capacity` entries wide
+        // (`resize`), so the new entries land inside it.
+        self.inner.n_chunks = n;
+        self.inner.appended = false;
+        self.inner.write_idx = write_idx;
+        // The pins follow the entries: unchanged below `start`, re-taken from
+        // it. `make_mut` copies the vector when a launch still holds it, so that
+        // launch keeps the set its headers were serialised against.
+        {
+            let pins = Arc::make_mut(&mut self.inner.pins);
+            pins.truncate(start);
+            pins.extend(chunks[start..].iter().map(ChunkPin::of));
+        }
+        let mut rope_base = base_pos;
+        for c in &chunks[..start] {
+            rope_base += c.usage;
+        }
+        for (i, chunk) in chunks.iter().enumerate().skip(start) {
+            let len = decode_entry_len(chunk, i, write_idx, write_len);
+            self.write_entry(
+                i, chunk, len, rope_base, n_kv_head, head_dim, n_palette, arena_info,
+            );
+            self.dirty_chunks.push(i);
+            rope_base += chunk.usage;
+        }
+        Ok(Some(n - start))
+    }
+
+    /// Write entry `i` — its slice header and, for a chunk with no resident
+    /// record, its inline record — into the host copy at the layout
+    /// [`GpuChunks::capacity`] fixes.
+    #[allow(clippy::too_many_arguments)]
+    fn write_entry(
+        &mut self,
+        i: usize,
+        chunk: &ChunkWindow,
+        len: u16,
+        rope_base: u32,
+        n_kv_head: usize,
+        head_dim: usize,
+        n_palette: usize,
+        arena_info: &[ResolvedArenaInfo],
+    ) {
+        let rec_bytes = record_bytes(n_kv_head, head_dim, n_palette);
+        let records_off = self.inner.capacity * SLICE_HEADER_BYTES;
+        // Resident chunk: point at its co-resident record in the meta-pool
+        // slab and serialise no record here. Otherwise serialise an inline
+        // record into this entry's records-section slot and point at it.
+        let kvheads_ptr = match chunk.meta.as_ref().map(|m| m.device_addr()) {
+            Some(addr) if addr != 0 => addr,
+            _ => {
+                let r0 = records_off + i * rec_bytes;
+                write_record_for_chunk(
+                    &mut self.inner.host[r0..r0 + rec_bytes],
+                    chunk,
+                    n_kv_head,
+                    head_dim,
+                    n_palette,
+                    arena_info,
+                );
+                self.inner.raw_device_ptr() + r0 as u64
+            }
+        };
+        let s0 = i * SLICE_HEADER_BYTES;
+        write_slice_header(
+            &mut self.inner.host[s0..s0 + SLICE_HEADER_BYTES],
+            chunk.offset,
+            len,
+            rope_base,
+            kvheads_ptr,
+        );
     }
 
     /// Reset the host buffer to empty and cancel any pending dirty uploads.
@@ -795,11 +909,13 @@ impl GpuChunksGuard<'_> {
         self.inner.fence_uploads();
         // No free: the device side goes back to its class free list, and the
         // host copy and staging buffers are kept for the next fill. `clear` is
-        // called by *every* structural mutation — `push_chunk` alone fires each
-        // time a sequence crosses a 32-token boundary — and the fence above
-        // fires only when a transfer is genuinely outstanding, which the common
-        // `clear` is not.
+        // called by every structural mutation but an append, and the fence
+        // above fires only when a transfer is genuinely outstanding, which the
+        // common `clear` is not.
         self.inner.release_slot();
+        self.inner.capacity = 0;
+        self.inner.write_idx = 0;
+        self.inner.appended = false;
         self.inner.chunk_byte_size = 0;
         // The cached generation records described the old chunk set; drop it so
         // the next snapshot re-copies from the rebuilt buffer.
@@ -812,34 +928,55 @@ impl GpuChunksGuard<'_> {
     }
 }
 
+/// Serialised `len` of entry `i`: the offset-derived `write_len` for the writer,
+/// the chunk's stored usage for every other entry (trailing empties past the
+/// writer included).
+fn decode_entry_len(chunk: &ChunkWindow, i: usize, write_idx: usize, write_len: u16) -> u16 {
+    if i == write_idx {
+        write_len
+    } else {
+        chunk.usage as u16
+    }
+}
+
 /// The byte ranges of the slot buffer an upload must carry, for the dirty chunk
-/// indices `dirty` (ascending, no duplicates) of a slot holding `n_chunks`
-/// entries whose out-of-line records are `rec_bytes` each.
+/// indices `dirty` (ascending, no duplicates) of a slot holding `n_chunks` live
+/// entries in a layout of `capacity`, whose out-of-line records are `rec_bytes`
+/// each.
 ///
-/// The buffer has two sections — slice headers `[0 .. n*16)`, then records — and
-/// a run of adjacent chunk indices is contiguous in *both*, so each run is two
-/// ranges: its 16-byte headers and its records. Ranges that touch are one range:
-/// a run covering the whole slot ends its headers where its records begin, and
-/// carrying that as one copy rather than two halves a full rebuild's driver
-/// submissions — what a prefill pays for every `(layer, slot)` it brings up to
-/// date, where each submission is a separate trip into the driver and a queue
-/// already deep with kernels makes each of them wait.
+/// The buffer has two sections — slice headers `[0 .. capacity*16)`, then
+/// records — and a run of adjacent chunk indices is contiguous in *both*, so
+/// each run is two ranges: its 16-byte headers and its records. A run covering
+/// every live entry carries its headers on through the unused header room to
+/// where the records begin, so the whole slot is one copy rather than two —
+/// half a full rebuild's driver submissions, which is what a prefill pays for
+/// every `(layer, slot)` it brings up to date, where each submission is a
+/// separate trip into the driver and a queue already deep with kernels makes
+/// each of them wait. The bytes past the live headers are never read: the
+/// kernel's walk is bounded by the entry count. Ranges that touch are one
+/// range.
 fn upload_ranges(
     dirty: &[usize],
     n_chunks: usize,
+    capacity: usize,
     rec_bytes: usize,
 ) -> Vec<std::ops::Range<usize>> {
     let Some(&first) = dirty.first() else {
         return Vec::new();
     };
-    let records_off = n_chunks * SLICE_HEADER_BYTES;
+    let records_off = capacity * SLICE_HEADER_BYTES;
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
     let mut push = |range: std::ops::Range<usize>| match ranges.last_mut() {
         Some(last) if last.end == range.start => last.end = range.end,
         _ => ranges.push(range),
     };
     let mut push_run = |start: usize, end: usize| {
-        push(start * SLICE_HEADER_BYTES..end * SLICE_HEADER_BYTES);
+        let headers_end = if start == 0 && end == n_chunks && rec_bytes > 0 {
+            records_off
+        } else {
+            end * SLICE_HEADER_BYTES
+        };
+        push(start * SLICE_HEADER_BYTES..headers_end);
         if rec_bytes > 0 {
             push(records_off + start * rec_bytes..records_off + end * rec_bytes);
         }
@@ -884,7 +1021,7 @@ impl Drop for GpuChunksGuard<'_> {
         };
 
         let rec_bytes = chunk_byte_size - SLICE_HEADER_BYTES;
-        let all = upload_ranges(&self.dirty_chunks, n_chunks, rec_bytes);
+        let all = upload_ranges(&self.dirty_chunks, n_chunks, self.inner.capacity, rec_bytes);
 
         // **Recorded where the thread is recording a wave**: the bytes go into
         // the wave's ring and the copy into its segment, so bringing the slot up
@@ -1059,6 +1196,9 @@ impl Clone for GpuChunks {
             chunk_byte_size: 0,
             gen_records: None,
             n_chunks: 0,
+            capacity: 0,
+            write_idx: 0,
+            appended: false,
             // Nothing is serialised here yet, so nothing is referenced.
             pins: Arc::new(Vec::new()),
             // Nothing was copied out of this one; it owns no slot and no copy.
@@ -1095,7 +1235,7 @@ pub(crate) fn record_bytes(n_kv_head: usize, head_dim: usize, n_palette: usize) 
 
 /// Per-chunk footprint in the `GpuChunks` buffer: the 16-byte slice header plus
 /// its out-of-line record. The buffer is laid out in two sections —
-/// `[ slice_header × n_chunks | record × n_chunks ]` — so slice headers stay a
+/// `[ slice_header × capacity | record × capacity ]` — so slice headers stay a
 /// contiguous 16-byte-stride array (what the kernel's `get_slice` indexes) while
 /// each header's `kvheads_ptr` points into the records section.
 pub(crate) fn token_slice_serialized_size(
@@ -1289,8 +1429,8 @@ mod snapshot_tests {
 mod upload_range_tests {
     use super::upload_ranges;
 
-    /// A slot of four chunks with 100-byte records: headers fill `[0, 64)`,
-    /// records `[64, 464)`.
+    /// A slot of four chunks with 100-byte records in a layout of four: headers
+    /// fill `[0, 64)`, records `[64, 464)`.
     const N: usize = 4;
     const REC: usize = 100;
 
@@ -1299,14 +1439,32 @@ mod upload_range_tests {
     /// `(layer, slot)` it serialises from nothing.
     #[test]
     fn a_whole_slot_is_one_range() {
-        assert_eq!(upload_ranges(&[0, 1, 2, 3], N, REC), vec![0..464]);
+        assert_eq!(upload_ranges(&[0, 1, 2, 3], N, N, REC), vec![0..464]);
+    }
+
+    /// In a layout wider than the live entries the records begin at
+    /// `capacity · 16`; a whole-slot run carries its headers on through the
+    /// unused header room to them, and is still one copy. Three entries in a
+    /// layout of eight: headers `[0, 48)`, room to 128, records `[128, 428)`.
+    #[test]
+    fn a_whole_slot_in_a_wider_layout_is_one_range() {
+        assert_eq!(upload_ranges(&[0, 1, 2], 3, 8, REC), vec![0..428]);
+    }
+
+    /// An extend's run — the previous writer and the chunk appended after it —
+    /// is its headers and its records, at the layout's record offset. Entries
+    /// 2 and 3 of four in a layout of eight: headers `[32, 64)`, records
+    /// `[128 + 200, 128 + 400)`.
+    #[test]
+    fn an_extend_run_is_its_headers_and_its_records() {
+        assert_eq!(upload_ranges(&[2, 3], 4, 8, REC), vec![32..64, 328..528]);
     }
 
     /// A run in the middle of the slot has headers and records far apart: two
     /// ranges, each exactly its run's bytes.
     #[test]
     fn an_interior_run_is_two_ranges() {
-        assert_eq!(upload_ranges(&[1, 2], N, REC), vec![16..48, 164..364]);
+        assert_eq!(upload_ranges(&[1, 2], N, N, REC), vec![16..48, 164..364]);
     }
 
     /// Runs that do not touch stay separate, in run order: each run's headers,
@@ -1314,7 +1472,7 @@ mod upload_range_tests {
     #[test]
     fn separated_runs_stay_separate() {
         assert_eq!(
-            upload_ranges(&[0, 2], N, REC),
+            upload_ranges(&[0, 2], N, N, REC),
             vec![0..16, 64..164, 32..48, 264..364]
         );
     }
@@ -1323,27 +1481,29 @@ mod upload_range_tests {
     /// its records: the headers end at 64, the records begin at 64 + 3·100.
     #[test]
     fn a_tail_run_is_two_ranges() {
-        assert_eq!(upload_ranges(&[3], N, REC), vec![48..64, 364..464]);
+        assert_eq!(upload_ranges(&[3], N, N, REC), vec![48..64, 364..464]);
     }
 
     /// A slot of two chunks, whole: headers `[0, 32)` run into records
     /// `[32, 232)`.
     #[test]
     fn a_two_chunk_slot_is_one_range() {
-        assert_eq!(upload_ranges(&[0, 1], 2, REC), vec![0..232]);
+        assert_eq!(upload_ranges(&[0, 1], 2, 2, REC), vec![0..232]);
     }
 
-    /// With no out-of-line record, only the headers travel.
+    /// With no out-of-line record, only the headers travel — the live ones,
+    /// never the unused room.
     #[test]
     fn a_slot_without_records_carries_headers_alone() {
-        assert_eq!(upload_ranges(&[0, 1, 2, 3], N, 0), vec![0..64]);
-        assert_eq!(upload_ranges(&[1], N, 0), vec![16..32]);
+        assert_eq!(upload_ranges(&[0, 1, 2, 3], N, N, 0), vec![0..64]);
+        assert_eq!(upload_ranges(&[0, 1, 2], 3, 8, 0), vec![0..48]);
+        assert_eq!(upload_ranges(&[1], N, N, 0), vec![16..32]);
     }
 
     /// Nothing dirty, nothing to upload.
     #[test]
     fn no_dirty_chunks_is_no_ranges() {
-        assert!(upload_ranges(&[], N, REC).is_empty());
+        assert!(upload_ranges(&[], N, N, REC).is_empty());
     }
 }
 

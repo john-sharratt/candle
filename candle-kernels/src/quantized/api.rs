@@ -195,7 +195,9 @@ impl MatmulStatus {
             Self::BadYType => Some("unsupported activation type"),
             Self::NoKernel => Some("no kernel for this (format, output dtype) pair"),
             Self::BadOutDType => Some("unsupported output dtype"),
-            Self::BadSplit => Some("split-K depth out of range, or a format that never splits"),
+            Self::BadSplit => {
+                Some("split-K depth or narrow geometry out of range, or a format that never splits")
+            }
             Self::BadTileMode => Some("int8 token-tile width with no kernel"),
             Self::LaunchFailed => Some("the kernel launch returned an error"),
             Self::Unknown(_) => Some("unrecognised launcher status"),
@@ -218,8 +220,9 @@ extern "C" {
     /// - `qtype`: Quantization type (0-9, see QType enum)
     /// - `ytype`: Y vector type (0-2, see YType enum). Note: F32 (2) only for Q4_K.
     /// - `weight_bytes`: Weight tensor size in bytes (for L2 cache dispatch decision, FP path)
-    /// - `force_mode2`: int8 dense tiling select — 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32
-    ///   weight-reuse). Decided in Rust by [`q8a128_dense_use_mode2`]; ignored by the FP path.
+    /// - `tile_mode`: int8 dense tiling select — 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32
+    ///   weight-reuse), 2 = mode-4 (Bm=64 × 128-row prefill tile, KO formats). Decided in Rust
+    ///   by `q8a128_dense_tile` (candle-core); ignored by the FP path.
     /// - `out_dtype`: int8 dense store width (see [`OutDType`]); ignored by the FP path, where
     ///   the output dtype is the activation dtype.
     ///
@@ -236,7 +239,7 @@ extern "C" {
         qtype: i32,
         ytype: i32,
         weight_bytes: usize,
-        force_mode2: i32,
+        tile_mode: i32,
         out_dtype: i32,
         // The activation operand's `SumScale::as_code()` — 0 raw Σx, 1 Σx/amax.
         // Read by the int8 dense path only; the FP kernels carry no q8a128 header.
@@ -274,6 +277,32 @@ extern "C" {
         splits: i32,
         ws: *mut f32,
         counters: *mut u32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// Narrow int8 dense matmul for decode width: q8a128 activations `[M ≤ 8, K]` ×
+    /// `num_segs` KO weights of one format, `weights[s]` of `nrows[s]` rows (each a multiple of
+    /// 32, at most [`SPLITK_MAX_SEGS`]) → `dst [M, ΣN]` at `out_dtype`, segment `s` in the
+    /// columns after the segments before it. One block per 8-row output tile, its `warps`
+    /// warps (1..=16) walking contiguous ranges of K and summing their per-tile folds in shared
+    /// memory, in tile order — the unsplit kernel's chain, so every output is the unsplit
+    /// kernel's bit for bit. No scratch. MXFP4 does not run narrow.
+    /// - `weights`, `nrows`: HOST arrays of `num_segs` entries.
+    ///
+    /// Returns a [`MatmulStatus`] code: `BadSplit` for M outside 1..=8, a warp count outside
+    /// 1..=16, a K whose shared memory exceeds the narrow cap, or a format with no narrow entry.
+    pub fn run_dense_int8_narrow(
+        weights: *const *const c_void,
+        nrows: *const i32,
+        num_segs: i32,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        total_batch: i32,
+        qtype: i32,
+        out_dtype: i32,
+        sum_norm: i32,
+        warps: i32,
         stream: *mut c_void,
     ) -> i32;
 

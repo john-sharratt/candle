@@ -209,12 +209,16 @@ impl ChunkedKvBacking {
                 let chunk_size = CHUNK_SIZE;
                 let writer_start = seq.writer_start_idx();
                 let mut idx = writer_start.min(n.saturating_sub(1));
+                let mut first_filled = None;
                 while remaining > 0 && idx < n {
                     let cap = {
                         let c = &seq.chunks_slice()[idx];
                         chunk_size - (c.offset as usize + c.usage as usize)
                     };
                     let take = remaining.min(cap);
+                    if take > 0 && first_filled.is_none() {
+                        first_filled = Some(idx);
+                    }
                     seq.chunk_at_mut(idx).unwrap().usage += take as u32;
                     remaining -= take;
                     idx += 1;
@@ -223,7 +227,11 @@ impl ChunkedKvBacking {
                 // slot buffer is left alone: the decode kernel advances its
                 // writer length on the device, and a commit made outside the
                 // decode kernel marks it (`SequenceState::mark_decode_writer_stale`)
-                // for the next sync to re-serialise.
+                // for the next sync to re-serialise — from the first chunk this
+                // filled, every one before it being full and untouched.
+                if let Some(first) = first_filled {
+                    seq.note_fill_from(first);
+                }
             }
         }
     }

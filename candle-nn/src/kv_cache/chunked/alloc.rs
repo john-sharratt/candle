@@ -2206,9 +2206,10 @@ impl ChunkedKvBacking {
                     state.sequences[batch_idx] = Some(self.make_sequence_state()?);
                 }
                 let slot = state.sequences[batch_idx].as_mut().unwrap();
+                // Each push marks the slot buffer appended-to, so its next sync
+                // serialises the new tail rather than the whole table.
                 for cw in cws {
                     slot.push_chunk(cw);
-                    slot.invalidate_gpu_chunks();
                 }
             }
 
@@ -2217,7 +2218,6 @@ impl ChunkedKvBacking {
                 if self.tail_needs_new_block(&state, batch_idx) {
                     let slot = state.sequences[batch_idx].as_mut().unwrap();
                     slot.push_chunk(cw);
-                    slot.invalidate_gpu_chunks();
                 }
             }
         }
