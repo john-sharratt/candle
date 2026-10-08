@@ -39,6 +39,8 @@ pub use quantized::{
     quantized_delta_net_layer_forward, quantized_delta_net_layer_forward_spans,
     QuantDeltaNetWeights,
 };
+#[cfg(feature = "cuda")]
+pub use state_store::release_seal_readback;
 pub use state_store::{
     compact_stores, ExportedLayerState, RecurrentCompaction, RecurrentStateStore,
 };

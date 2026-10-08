@@ -81,11 +81,33 @@ use std::sync::Mutex;
 /// One per process rather than one per store: the scheduler seals one turn at a
 /// time on its loop thread, so a single buffer serves them all, where a buffer per
 /// conversation would pin ~65 MB of host memory for every sequence alive. It never
-/// shrinks, and has nothing to shrink from: a store's size is its model's geometry,
-/// identical for every sequence, so the buffer settles at one store's size on the
-/// first seal.
+/// shrinks while an engine runs, and has nothing to shrink from: a store's size is
+/// its model's geometry, identical for every sequence, so the buffer settles at one
+/// store's size on the first seal. An engine's shutdown frees it
+/// ([`release_seal_readback`]).
 #[cfg(feature = "cuda")]
 static READBACK: Mutex<Option<PinnedBuf>> = Mutex::new(None);
+
+/// Unpin the seal readback buffer ([`READBACK`]).
+///
+/// The buffer is process-wide, so it outlives the engine whose stores filled it:
+/// without this, a shut-down engine leaves one store's whole recurrent state —
+/// 19.3 MiB on the 0.8B, ~65 MB on the 35B-A3B — pinned for the life of the
+/// process. Called once the engine's scheduler, the thread that seals, has
+/// joined. A seal after it pins a fresh buffer on its first readback.
+#[cfg(feature = "cuda")]
+pub fn release_seal_readback() {
+    release_readback_in(&READBACK);
+}
+
+/// Empty `slot`, freeing its buffer outside the lock (the drop is a
+/// `cuMemFreeHost`). A poisoned lock still releases: the buffer is only ever
+/// replaced whole, so a panicking holder cannot leave it half-written.
+#[cfg(feature = "cuda")]
+fn release_readback_in(slot: &Mutex<Option<PinnedBuf>>) {
+    let held = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(held);
+}
 use candle::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
@@ -1931,6 +1953,43 @@ mod tests {
             RecurrentStateStore::reserved_bytes_for(&[LayerKind::Attention], &d),
             0,
             "no DeltaNet layers, no reservation"
+        );
+    }
+
+    /// **A release empties the readback slot**, so the buffer a shut-down engine's
+    /// seals pinned is freed rather than held for the life of the process — and an
+    /// empty slot releases as a no-op.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_release_empties_the_readback_slot() {
+        let slot = Mutex::new(Some(PinnedBuf::Host {
+            data: vec![0u8; 64],
+        }));
+        release_readback_in(&slot);
+        assert!(slot.lock().unwrap().is_none(), "the buffer was released");
+        release_readback_in(&slot);
+        assert!(slot.lock().unwrap().is_none(), "an empty slot stays empty");
+    }
+
+    /// **A poisoned slot still releases.** A seal that panicked while holding the
+    /// lock must not keep the buffer pinned past its engine's shutdown.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_poisoned_readback_slot_still_releases() {
+        let slot = Arc::new(Mutex::new(Some(PinnedBuf::Host {
+            data: vec![0u8; 64],
+        })));
+        let poisoner = Arc::clone(&slot);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().unwrap();
+            panic!("a seal panicked holding the readback lock");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+        release_readback_in(&slot);
+        assert!(
+            slot.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "the buffer was released through the poison"
         );
     }
 }

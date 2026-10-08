@@ -32,6 +32,7 @@ use crate::working_set::{Limits, Refusal, WorkingSet};
 use candle::quantized::pinned_staging::release_recycled_wc;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
+use candle_transformers::models::delta_net::release_seal_readback;
 use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2420,6 +2421,10 @@ impl ConversationEngine {
         // recycler. Nothing of this engine will take them again; unpin them
         // rather than leave them held for the life of the process.
         release_recycled_wc();
+        // The seal readback buffer is process-wide for the same reason, and the
+        // scheduler was its only user: a recurrent model's whole per-store state
+        // stays pinned behind this engine unless it is released here.
+        release_seal_readback();
         Ok(())
     }
 }
