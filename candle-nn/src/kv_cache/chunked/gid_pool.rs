@@ -1524,7 +1524,10 @@ impl ChunkGidPool {
     pub fn recycle_arena_index(&self, arena_idx: usize) {
         let mut state = self.inner.metadata.lock().unwrap();
         debug_assert!(
-            state.arena_registry.get(arena_idx).is_none_or(|k| k.is_none()),
+            state
+                .arena_registry
+                .get(arena_idx)
+                .is_none_or(|k| k.is_none()),
             "recycling arena index {arena_idx} that is still registered"
         );
         state.free_arenas.push_back(arena_idx);
@@ -1958,7 +1961,11 @@ mod tests {
             "the index was reissued while its storage could still hold the old arena"
         );
         pool.recycle_arena_index(a);
-        assert_eq!(pool.register_arena(other), a, "and is reissued once released");
+        assert_eq!(
+            pool.register_arena(other),
+            a,
+            "and is reissued once released"
+        );
     }
 
     /// An arena that registers below the point the walk has passed is a fresh
