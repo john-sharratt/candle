@@ -1039,6 +1039,10 @@ impl ManagedBatchedModel for BatchedEngine {
         Some(self.engine.experts().expert_stats())
     }
 
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        self.engine.experts().hit_references()
+    }
+
     fn reset_expert_stats(&self) {
         self.engine.experts().reset_expert_stats();
     }
@@ -1247,6 +1251,11 @@ impl ManagedBatchedModel for BatchedEngine {
 impl WaveSweep for BatchedEngine {
     fn device(&self) -> &Device {
         self.engine.engine_device()
+    }
+
+    fn take_device_fault(&self) -> Result<()> {
+        self.engine.engine_device().synchronize()?;
+        self.engine.experts().take_fault()
     }
 
     fn num_layers(&self) -> usize {

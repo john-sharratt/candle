@@ -14,6 +14,7 @@ use candle::forbidden_alloc;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::QuantFormat;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +32,7 @@ use crate::models::batched_inference::{
 };
 use crate::models::dialect::Dialect;
 use crate::models::draft_depth::DraftDepth;
-use crate::models::expert_lre::PipelineStats;
+use crate::models::expert_lre::{PipelineStats, ReadLatency};
 use crate::models::speculative_choice::GreedyChooser;
 use candle::vram::process_ram::ProcessRam;
 
@@ -186,6 +187,11 @@ pub struct TestParams {
     /// Rows the caller measured itself, appended below the harness's own in the
     /// comparison table. See [`ExtraRow`] for why the table takes them.
     pub extra_rows: Vec<ExtraRow>,
+    /// Where each config's expert routing is written after its decode — the
+    /// decode interval with the prefill before it as warm-up
+    /// (`ExpertCache::write_routing_trace`) — for replaying residency and
+    /// prediction policies offline. `None` writes nothing.
+    pub routing_trace_dir: Option<PathBuf>,
 }
 
 impl TestParams {
@@ -232,7 +238,15 @@ impl TestParams {
             speculative_max_draft: DraftBudget::Adaptive,
             override_k_quant: None,
             extra_rows: Vec::new(),
+            routing_trace_dir: None,
         })
+    }
+
+    /// Write each config's expert routing into `dir` — see
+    /// [`Self::routing_trace_dir`].
+    pub fn with_routing_trace_dir(mut self, dir: PathBuf) -> Self {
+        self.routing_trace_dir = Some(dir);
+        self
     }
 
     /// Pin every sealed K block to `fmt` — see [`Self::override_k_quant`].
@@ -713,8 +727,8 @@ pub fn decode_reproducibility<M: ManagedBatchedModel>(
         // what each run really exercised rather than against an assumption.
         if let Some(s) = model.expert_stats() {
             eprintln!(
-                "[repro:{label}] experts hits={} misses={} evictions={} promotions={} cold={}",
-                s.expert_hits, s.expert_misses, s.evictions, s.promotions, s.worker_cold
+                "[repro:{label}] experts hits={} misses={} evictions={} read-ahead={} cold={}",
+                s.expert_hits, s.expert_misses, s.evictions, s.ahead_claims, s.worker_cold
             );
         }
     }
@@ -980,6 +994,33 @@ pub fn prefill_replay_probe<M: ManagedBatchedModel>(
     }
     eprintln!("[prefill:{label}] dirty = {dirty}/{}", repeats - 1);
     Ok(dirty)
+}
+
+/// One read source's cell in the expert-pipeline table: reads, the slowest,
+/// and how many were slow.
+fn read_latency_cell(l: &ReadLatency) -> String {
+    if l.reads == 0 {
+        "-".to_string()
+    } else {
+        format!(
+            "{} · max {:.1} ms · {} slow",
+            l.reads,
+            l.max().as_secs_f64() * 1e3,
+            l.slow
+        )
+    }
+}
+
+/// The expert pipeline's tallies for the interval just ended, with its
+/// residency ceiling filled in — taken where the tallies are, before the reset
+/// that starts the next interval.
+fn expert_stats_with_ceiling<M: ManagedBatchedModel + ?Sized>(model: &M) -> Option<PipelineStats> {
+    let mut stats = model.expert_stats()?;
+    if let Some((lru, min)) = model.expert_hit_references() {
+        stats.hit_lru = lru;
+        stats.hit_ceiling = min;
+    }
+    Some(stats)
 }
 
 /// Calculate statistics from timing measurements, dropping the first (warmup) and worst outlier
@@ -1335,8 +1376,17 @@ impl TestParams {
 
             // Collect expert pipeline stats for this config
             let mut result = result;
-            result.expert_stats = model.expert_stats();
+            result.expert_stats = expert_stats_with_ceiling(model);
             result.row_cache_stats = model.row_cache_stats();
+            if let Some(dir) = &self.routing_trace_dir {
+                let path = dir.join(format!(
+                    "{:02}_{:?}x{}.bin",
+                    n + 1,
+                    config.mode,
+                    config.num_contexts
+                ));
+                model.write_expert_routing_trace(&path)?;
+            }
 
             self.print_row_profiles(&result, self.config_labels.get(n).map(String::as_str));
             results.push(result);
@@ -1803,7 +1853,7 @@ impl TestParams {
         // The expert counters split at the same boundary, for the same reason:
         // `expert_stats` settles the pipeline thread, so every routed prefill
         // layer is counted here and none in the decode figures that follow.
-        let prefill_expert_stats = model.expert_stats();
+        let prefill_expert_stats = expert_stats_with_ceiling(model);
         model.reset_expert_stats();
 
         // Quantize + seal the prefilled history, mirroring the substrate
@@ -2952,6 +3002,17 @@ impl TestParams {
                 "Hit rate",
                 Box::new(|s: &PipelineStats| format!("{:.1}%", s.hit_rate())),
             ),
+            // The same routing replayed at the zone's capacity: under plain
+            // LRU, and under what no eviction policy could beat (Belady's
+            // MIN) — the gap to MIN is the policy's.
+            (
+                "  LRU replay",
+                Box::new(|s: &PipelineStats| format!("{:.1}%", s.hit_lru)),
+            ),
+            (
+                "  ceiling (MIN)",
+                Box::new(|s: &PipelineStats| format!("{:.1}%", s.hit_ceiling)),
+            ),
             // Misses split by where bucketize found them: pinned (a warm or pad
             // slot — computed by the GEMM workers at once) or cold (waited on
             // until the stager staged them).
@@ -2966,10 +3027,6 @@ impl TestParams {
             (
                 "Worker promotions",
                 Box::new(|s: &PipelineStats| format!("{}", s.worker_promotions)),
-            ),
-            (
-                "Promotions (H2D)",
-                Box::new(|s: &PipelineStats| format!("{}", s.promotions)),
             ),
             // Whether the promotion ring kept up with the GPU: the slots bucketize
             // took from it (of them the lazy victims it evicted, and the ones it
@@ -3050,8 +3107,20 @@ impl TestParams {
                 Box::new(|s: &PipelineStats| format!("{}", s.staged_paged)),
             ),
             (
+                "Stage requests",
+                Box::new(|s: &PipelineStats| format!("{}", s.stage_requests)),
+            ),
+            (
                 "Staged ahead",
                 Box::new(|s: &PipelineStats| format!("{}", s.staged_speculative)),
+            ),
+            (
+                "  then routed",
+                Box::new(|s: &PipelineStats| format!("{}", s.staged_ahead_routed)),
+            ),
+            (
+                "  listed on landing",
+                Box::new(|s: &PipelineStats| format!("{}", s.staged_listed)),
             ),
             (
                 "Pad evictions",
@@ -3061,31 +3130,58 @@ impl TestParams {
                 "Evictions",
                 Box::new(|s: &PipelineStats| format!("{}", s.evictions)),
             ),
+            // Read-ahead: the slots the GPU claimed for experts predicted for
+            // later rows, of them those copied from the pad, how many the rows
+            // then routed, the window each layer gave it and how far ahead it
+            // looked.
             (
-                "Prefetch promotions",
-                Box::new(|s: &PipelineStats| format!("{}", s.prefetch_promotions)),
+                "Read-ahead claims",
+                Box::new(|s: &PipelineStats| format!("{}", s.ahead_claims)),
             ),
             (
-                "Predicted loads",
+                "  from the pad",
+                Box::new(|s: &PipelineStats| format!("{}", s.ahead_pad_claims)),
+            ),
+            (
+                "  judged",
                 Box::new(|s: &PipelineStats| format!("{}", s.predicted_total)),
             ),
             (
-                "Prediction prec.",
+                "  precision",
                 Box::new(|s: &PipelineStats| format!("{:.1}%", s.prediction_precision())),
             ),
+            // The router look-ahead: of the experts each hop's votes predicted,
+            // the share the target row routed.
             (
-                "Late loads",
-                Box::new(|s: &PipelineStats| format!("{}", s.late_loads)),
+                "Look-ahead precision",
+                Box::new(|s: &PipelineStats| {
+                    if s.lookahead_judged.iter().all(|&j| j == 0) {
+                        "-".to_string()
+                    } else {
+                        (1..=s.lookahead_judged.len())
+                            .map(|h| format!("{:.0}", s.lookahead_precision(h)))
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    }
+                }),
             ),
             (
-                "Load-ahead N",
+                "  window (images)",
+                Box::new(|s: &PipelineStats| format!("{}", s.ahead_window)),
+            ),
+            (
+                "  depth (rows)",
                 Box::new(|s: &PipelineStats| format!("{}", s.prefetch_depth)),
             ),
-            // Bytes each mover put over its link: promotions on the copy engine,
-            // staging off the drive (or out of pageable RAM) into the pad.
             (
-                "Promotion GiB",
-                Box::new(|s: &PipelineStats| format!("{:.2}", s.promotion_bytes as f64 / GIB)),
+                "  pad pins held",
+                Box::new(|s: &PipelineStats| format!("{}", s.ahead_pinned)),
+            ),
+            // Bytes each mover put over its link: read-ahead into VRAM, staging
+            // off the drive (or out of pageable RAM) into the pad.
+            (
+                "Read-ahead GiB",
+                Box::new(|s: &PipelineStats| format!("{:.2}", s.ahead_bytes as f64 / GIB)),
             ),
             (
                 "Staged GiB",
@@ -3100,6 +3196,16 @@ impl TestParams {
                         format!("{:.2}", s.staged_bytes as f64 / s.stage_read_ns as f64)
                     }
                 }),
+            ),
+            // The slowest single read per source, and the reads over the slow
+            // threshold: a cold wait that traps was waiting on one of these.
+            (
+                "  pack reads",
+                Box::new(|s: &PipelineStats| read_latency_cell(&s.pack_reads)),
+            ),
+            (
+                "  pageable reads",
+                Box::new(|s: &PipelineStats| read_latency_cell(&s.paged_reads)),
             ),
             (
                 "Routed layers",

@@ -306,6 +306,42 @@ fn turn_state(conv: &Conversation, key: TurnKey) -> TierState {
         .expect("turn must be tracked")
 }
 
+/// Give the recalled turn its warm copy the way the persistence thread's
+/// hot→warm phase does: a cold recall lands hot only and stays pending a warm
+/// copy (`snapshot_pending_warm`), and the phase migrates each layer's hot
+/// sequence to a CPU arena, format for format, and installs it as the
+/// residence's warm tier. A test that exercises warm→hot after a recall makes
+/// that copy here, with the hot copy kept, so the next elevate reads warm.
+fn install_warm_from_hot(
+    conv: &Conversation,
+    backings: &[ChunkedKvBacking],
+    device: &Device,
+    stream: &Arc<CudaStream>,
+    pinned: &mut Option<PinnedBuf>,
+    key: TurnKey,
+) {
+    let pending = conv.read().snapshot_pending_warm();
+    assert_eq!(
+        pending.len(),
+        1,
+        "{key:?} is the one recalled turn, pending its warm copy"
+    );
+    let (residence, hot, _) = pending.into_iter().next().unwrap();
+    let warm: Vec<SealedSequence> = backings
+        .iter()
+        .zip(hot.iter())
+        .map(|(backing, seq)| {
+            backing
+                .migrate_sealed_to_cpu_batch_async(device, stream, pinned, &[seq])
+                .expect("hot→warm migrate")
+                .pop()
+                .expect("one sequence in, one out")
+        })
+        .collect();
+    stream.synchronize().expect("the migrate's copies land");
+    conv.write().install_warm(residence, warm);
+}
+
 fn section_state(conv: &Conversation, section: SectionId) -> TierState {
     conv.read()
         .section_tier_state(section)
@@ -521,13 +557,12 @@ fn full_cold_warm_hot_round_trip() {
         );
     }
 
-    // ── Phase 7: cold → hot + warm ───────────────────────────────────────
+    // ── Phase 7: cold → hot ──────────────────────────────────────────────
     //
     // elevate_to_hot routes each turn through the ColdRecall leg:
-    // recover_turn_chunks pulls the grid out of the redo log, load_to_hot
-    // scatters it into fresh VRAM arenas, migrate_sealed_to_cpu produces
-    // a fresh warm copy, and install_promoted lands both tiers under one
-    // write lock.
+    // recover_turn_chunks pulls the grid out of the redo log and load_to_hot
+    // scatters it into fresh VRAM arenas. The recall lands hot only — the
+    // cold record stays the turn's host copy, so no warm copy is made.
     let main_stream = cuda_stream(&device);
     let mut pinned: Option<PinnedBuf> = None;
     let mut stager = ColdLoadStager::new();
@@ -551,8 +586,8 @@ fn full_cold_warm_hot_round_trip() {
     for (key, original) in &snapshots {
         let st = turn_state(&conv, *key);
         assert!(
-            st.hot && st.warm && st.cold,
-            "post cold→hot {key:?} should be hot+warm+cold, got {st:?}"
+            st.hot && !st.warm && st.cold,
+            "post cold→hot {key:?} should be hot+cold (a recall makes no warm copy), got {st:?}"
         );
         let now = snapshot_turn_bytes(&conv, &backings, &device, key.timeline, key.index);
         assert_eq!(
@@ -1054,10 +1089,17 @@ fn cold_marker_turn_passes_existence_check() {
     assert_eq!(report.cold_to_hot, 1);
     assert_eq!(report.missing, 0);
 
+    // A cold recall lands hot only: the cold record is the turn's host copy,
+    // so no warm copy is made for it.
     let post = conv.read().turn_tier_state(timeline, key.index).unwrap();
-    assert!(
-        post.hot && post.warm && post.cold,
-        "post-elevate the turn lives in all three tiers, got {post:?}"
+    assert_eq!(
+        post,
+        TierState {
+            hot: true,
+            warm: false,
+            cold: true,
+        },
+        "post-elevate the turn is hot and still cold"
     );
 }
 
@@ -2523,8 +2565,9 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
     // The `#[ignore]`d full version below re-opens the substrate from disk for
     // each leg (cold→hot determinism + a separate warm→hot) to mirror distinct
     // restarts. The per-cycle guard folds it into a SINGLE reopen: cold→hot
-    // (reference + varied-format sanity), then evict + warm→hot in the same
-    // session (cold→hot pre-populated warm), asserting the two legs produce
+    // (reference + varied-format sanity), then a warm copy made from hot the
+    // way the persistence thread makes one (a recall lands hot only), evict +
+    // warm→hot in the same session, asserting the two legs produce
     // byte-identical metadata. Same per-(h, p) reorder/drift/fallback coverage,
     // ~half the GPU+disk work.
     if mini {
@@ -2550,6 +2593,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
         let reference = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
         assert_varied_formats(&reference, "mini cold→hot");
 
+        install_warm_from_hot(&conv, &backings, &device, &main_stream, &mut pinned, key);
         let purged = evict_from_hot(&conv, &[], &[]);
         assert_eq!(
             purged.count, 1,
@@ -2577,8 +2621,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
     //
     // Re-opening the substrate from disk (rather than reusing the
     // Conversation from Phase 1) is what the production restart path
-    // does: the warm tier is populated by cold-load on reopen, then
-    // elevated. So Phase 2's "reference" snapshot is *the* image set
+    // does: the turn is recalled from cold on reopen, landing hot. So Phase 2's "reference" snapshot is *the* image set
     // every subsequent transition must preserve.
     let reference = {
         let conv = open_conversation(&dir);
@@ -2654,7 +2697,8 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
         let mut stager = ColdLoadStager::new();
-        // First elevate populates warm via cold-load.
+        // The first elevate lands the recall hot only; the warm copy is made
+        // from hot as the persistence thread makes one.
         elevate_to_hot(
             &conv,
             &backings,
@@ -2666,6 +2710,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
             &[key],
         )
         .unwrap();
+        install_warm_from_hot(&conv, &backings, &device, &main_stream, &mut pinned, key);
         // Drop hot — turn is now warm+cold only.
         let purged = evict_from_hot(&conv, &[], &[]);
         assert_eq!(
@@ -2794,6 +2839,7 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
         .unwrap();
         let reference = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
 
+        install_warm_from_hot(&conv, &backings, &device, &main_stream, &mut pinned, key);
         let purged = evict_from_hot(&conv, &[], &[]);
         assert_eq!(
             purged.count, 1,
@@ -2861,6 +2907,7 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
             &[key],
         )
         .unwrap();
+        install_warm_from_hot(&conv, &backings, &device, &main_stream, &mut pinned, key);
         evict_from_hot(&conv, &[], &[]);
         let report = elevate_to_hot(
             &conv,

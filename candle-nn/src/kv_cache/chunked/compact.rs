@@ -92,6 +92,16 @@ use crate::kv_cache::ArenaLocation;
 pub struct CompactionReport {
     /// Chunk slots physically copied to a lower address.
     pub moves: usize,
+    /// Moves the plan produced, of which the budget let `moves` through.
+    pub planned_moves: usize,
+    /// Pools the census reached before the planning deadline.
+    pub pools_censused: usize,
+    /// Pools with an arena to rank — what the census set out to reach.
+    pub pools_ranked: usize,
+    /// Region rank of the first planned move's source — the arena the pass empties
+    /// first. When the census reached the top-ranked pool this is the arena holding
+    /// the frontier; `None` when nothing was planned.
+    pub first_source_rank: Option<usize>,
     /// `HeadGids` allocations rewritten. Lower than `moves` whenever holders share.
     pub allocations_rewritten: usize,
     /// Moves this pass declined because the slot claimed for them was one it had
@@ -157,6 +167,12 @@ pub struct CompactionReport {
     /// everything below the cursor is packed and nothing moved upward, so the next
     /// pass resumes closer.
     pub clipped: bool,
+    /// `true` when some pool's plan stopped at [`planned_moves_cap`] — the pool has
+    /// moves left that this pass never planned. Kept apart from [`Self::clipped`]
+    /// because it is not progress by itself: a pool whose top arena cannot move caps
+    /// its plan on every pass while reclaiming nothing, and counted as progress that
+    /// would re-run the same useless pass after every wave.
+    pub plan_capped: bool,
     /// The arena standing highest in the span once the pass is done, across every pool
     /// it packs — band and record. When its region is the frontier it is what holds the
     /// frontier up, and its live count says whether a later pass can move it; when it
@@ -197,7 +213,15 @@ pub struct CompactionTimings {
     pub quiesce: Duration,
     /// Ranking the pools, then walking every arena's occupancy bitmap and planning.
     /// Usually the largest share, and the one the budget's planning half bounds.
+    /// The sum of the three below.
     pub plan: Duration,
+    /// Of `plan`: ranking the pools and reading each censused pool's occupancy.
+    pub census: Duration,
+    /// Of `plan`: claiming fresh low arenas for the pools holding the frontier.
+    pub provision: Duration,
+    /// Of `plan`: the two-cursor walks and merging them into one list by source
+    /// rank.
+    pub walk: Duration,
     /// The host walk that claims each destination slot and computes both addresses.
     pub claim: Duration,
     /// Uploading the three record arrays and launching the batched copy.
@@ -403,6 +427,45 @@ pub enum CompactionRefused {
 /// clock check off the per-claim path while staying fine-grained enough that a
 /// budget of a few milliseconds is respected.
 const MOVES_PER_BATCH: usize = 512;
+
+/// Moves one pass plans per pool — no more than the pass can claim.
+///
+/// **Planning what the budget cannot claim is what stopped compaction.** The walk is
+/// ~0.12 µs a move and the claim ~0.55 µs, so a pass spends its budget on whichever
+/// it is handed more of. Planned without a cap, a fragmented pool at a high frontier
+/// produced 570,000–770,000 moves: the walk alone took 75–100 ms of the 80 ms budget,
+/// the pass claimed only its one guaranteed batch of 512, and a top arena holding
+/// 768–1,280 live chunks was never emptied — the frontier held at 376–517 regions
+/// pass after pass, and Qwen3-30B-A3B's engine probe sat at 36% efficiency on the
+/// RTX 4090 Laptop. The passes that did lower it had planned 75,000–145,000 and
+/// claimed 60,000–115,000.
+///
+/// **Capping a pool keeps exactly the moves that matter.** The two-cursor walk takes
+/// its sources off the right cursor, highest address first, so a capped plan is the
+/// pool's top arenas — the ones holding the frontier — and what it drops is the low
+/// tail the budget would never have reached. A capped plan marks the pass clipped, so
+/// the next resumes from the shorter distance. At this cap even four active pools
+/// plan in ~16 ms, leaving the rest of the budget for ~100,000 claims.
+///
+/// A capped plan is reported as `plan_capped`, not as `clipped`: it is only progress
+/// when the pass also reclaimed something.
+const PLANNED_MOVES_PER_POOL: usize = 32_768;
+
+/// One pool's plan cap: [`PLANNED_MOVES_PER_POOL`], or one whole arena of the pool
+/// when that is more.
+///
+/// **A pass must be able to empty the arena holding the frontier, not just drain
+/// it.** Allocation is leftmost by address, so once a pass has packed every lower
+/// arena of a pool full, the only free slots in the pool are the ones it just
+/// vacated at the top — and the next allocations land exactly there. An arena left
+/// part-drained is refilled before the next pass reaches it. Capped below an
+/// arena's capacity, the smallest rung (52,428 slots an arena) could never be
+/// emptied in one pass: on Qwen3-30B-A3B the class-0 arena at the frontier was
+/// planned first on pass after pass, and its live count went 2,499 → 7,266 →
+/// 4,957 → 2,750 → 5,228 with the frontier pinned at 364 regions.
+fn planned_moves_cap(key: ArenaKey) -> usize {
+    PLANNED_MOVES_PER_POOL.max(key.chunks())
+}
 
 /// The copy plan, as the migration kernel wants it: one entry per relocated slot,
 /// in three parallel arrays.
@@ -709,6 +772,7 @@ impl super::backing::ChunkedKvBacking {
             .filter_map(|key| self.pool_top_rank(key).map(|(rank, _)| (rank, key)))
             .collect();
         by_rank.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+        report.pools_ranked = by_rank.len();
         let mut census_by_pool: Vec<(ArenaKey, Vec<ArenaSlots>)> = Vec::new();
         for (_, key) in by_rank {
             if started.elapsed() >= plan_deadline && !census_by_pool.is_empty() {
@@ -720,11 +784,15 @@ impl super::backing::ChunkedKvBacking {
             };
             census_by_pool.push((key, census));
         }
+        report.timings.census = started.elapsed();
         // Every arena the pass creates ahead of demand goes through `fresh`, which keeps
         // the empty sweep off it while the pass needs it and releases the ones nothing
         // landed in itself — see [`FreshArenas`].
         let mut fresh = FreshArenas::new(&*self.inner);
+        let provision_started = Instant::now();
         self.provision_low_arenas(&mut census_by_pool, &mut fresh);
+        report.timings.provision = provision_started.elapsed();
+        let walk_started = Instant::now();
         // **One list over every pool, highest source region first** — see
         // [`by_source_rank`]. The budget clips this list, so its order decides which
         // regions a clipped pass empties.
@@ -734,8 +802,11 @@ impl super::backing::ChunkedKvBacking {
             .collect();
         let plans: Vec<CompactPlan> = census_by_pool
             .iter()
-            .filter_map(|(key, census)| plan_pool(census, *key, 0))
+            .filter_map(|(key, census)| plan_pool(census, *key, planned_moves_cap(*key)))
             .collect();
+        // A pool cut short has work left, which the next pass resumes — reported apart
+        // from the budget's clip; see `CompactionReport::plan_capped`.
+        report.plan_capped = plans.iter().any(|p| p.clipped);
         for (m, key) in by_source_rank(&plans, |idx| rank_of.get(&idx).copied().unwrap_or(0)) {
             pending.push(m);
             pool_of.push(key);
@@ -743,6 +814,12 @@ impl super::backing::ChunkedKvBacking {
         if pending.is_empty() {
             return Err(CompactionRefused::AlreadyPacked);
         }
+        report.planned_moves = pending.len();
+        report.pools_censused = census_by_pool.len();
+        report.first_source_rank = pending
+            .first()
+            .and_then(|m| rank_of.get(&m.from.0).copied());
+        report.timings.walk = walk_started.elapsed();
         report.timings.plan = started.elapsed();
         let mut phase = Instant::now();
 
@@ -1902,6 +1979,23 @@ pub(super) fn slot_addr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pool's plan cap covers at least one whole arena, so a pass can empty the
+    /// arena holding the frontier rather than leave it part-drained for the next
+    /// allocations to refill: the smallest rung's arena (16 MiB of 320 B slots)
+    /// raises the cap, the largest rung's (16 MiB of 16 KiB slots) does not.
+    #[test]
+    fn a_pools_plan_cap_covers_one_whole_arena() {
+        let smallest = ArenaKey::new(SizeClass::from_index(0).unwrap(), ArenaLocation::Gpu);
+        let largest = ArenaKey::new(
+            SizeClass::from_index(SizeClass::COUNT - 1).unwrap(),
+            ArenaLocation::Gpu,
+        );
+        assert_eq!(smallest.chunks(), 52_428);
+        assert_eq!(planned_moves_cap(smallest), 52_428);
+        assert_eq!(largest.chunks(), 1_024);
+        assert_eq!(planned_moves_cap(largest), 32_768);
+    }
 
     /// The figure the pass is judged by is the frontier's fall, not the move count
     /// — a pass that copies ten thousand chunks and leaves the frontier where it

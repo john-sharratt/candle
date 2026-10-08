@@ -76,13 +76,12 @@ impl Scheduler {
             hits,
             misses,
             hit_rate_pct = format!("{:.1}", pct(hits, activations)).as_str(),
-            promotions = after.promotions.saturating_sub(before.promotions),
-            prefetch_promotions =
-                after.prefetch_promotions.saturating_sub(before.prefetch_promotions),
+            worker_promotions = after.worker_promotions.saturating_sub(before.worker_promotions),
+            ahead_claims = after.ahead_claims.saturating_sub(before.ahead_claims),
             pred_precision_pct =
                 format!("{:.1}", pct(predicted_hits, predicted_total)).as_str(),
             cold_misses = after.worker_cold.saturating_sub(before.worker_cold),
-            promotion_mb = after.promotion_bytes.saturating_sub(before.promotion_bytes) >> 20,
+            ahead_mb = after.ahead_bytes.saturating_sub(before.ahead_bytes) >> 20,
             resident_mb = after.resident_vram_bytes >> 20,
             "gap-fill wave: expert telemetry",
         );

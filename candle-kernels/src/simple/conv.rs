@@ -198,7 +198,10 @@ extern "C" {
     ///
     /// # Parameters
     /// - `dtype`: Data type (see ConvDType enum values)
-    /// - `dst_numel`: Total number of destination elements
+    /// - `columns`: `b · l_out · c_in` — one thread each, writing that
+    ///   column's `l_k` elements, so `dst` holds `columns · l_k`. Not the
+    ///   destination's element count: a launch sized by that runs `l_k` times
+    ///   the threads and writes past the end of `dst`.
     /// - `l_out`: Output length
     /// - `l_k`: Kernel length
     /// - `stride`: Convolution stride
@@ -209,7 +212,7 @@ extern "C" {
     /// - `dst`: Destination tensor
     pub fn run_im2col1d(
         dtype: i32,
-        dst_numel: usize,
+        columns: usize,
         l_out: usize,
         l_k: usize,
         stride: usize,
@@ -503,9 +506,11 @@ impl ConvDispatcher {
     /// # Safety
     /// - All pointers must be valid for the specified data type
     /// - `info` must point to a valid dims/strides array
+    /// - `columns` is `b · l_out · c_in` and `dst` holds `columns · l_k`
+    ///   elements (`run_im2col1d`)
     pub unsafe fn im2col1d(
         dtype: ConvDType,
-        dst_numel: usize,
+        columns: usize,
         l_out: usize,
         l_k: usize,
         stride: usize,
@@ -517,7 +522,7 @@ impl ConvDispatcher {
     ) {
         run_im2col1d(
             dtype as i32,
-            dst_numel,
+            columns,
             l_out,
             l_k,
             stride,

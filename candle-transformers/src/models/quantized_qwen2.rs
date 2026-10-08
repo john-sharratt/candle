@@ -465,6 +465,10 @@ impl BatchedModelCore for ModelWeights {
         false
     }
 
+    fn take_device_fault(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn prune(&self) -> Result<()> {
         self.embeddings.compact();
         if let Some(layer) = self.layers.first() {

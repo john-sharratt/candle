@@ -238,10 +238,7 @@ impl SubstrateWriter {
     ///
     /// Over a read-only persistence handle no thread is spawned: there is
     /// nothing to append to and nothing to commit.
-    pub fn spawn(
-        substrate: Arc<RwLock<Substrate>>,
-        persistence: Arc<PersistenceLock>,
-    ) -> Self {
+    pub fn spawn(substrate: Arc<RwLock<Substrate>>, persistence: Arc<PersistenceLock>) -> Self {
         let (tx, rx) = channel::unbounded::<(WriteJob, u64)>();
         let backpressure = Arc::new(Backpressure {
             state: Mutex::new((0, 0)),

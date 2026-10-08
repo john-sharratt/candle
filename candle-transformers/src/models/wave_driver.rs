@@ -264,6 +264,19 @@ pub trait WaveSweep {
         super::wave_admit::rollback_wave_kv(contexts, kv_start, kv_end)
     }
 
+    /// Fail the segment just swept if the device gave up part of it — an expert
+    /// cache whose workers lost a cold expert (`ExpertCache::take_fault`). The
+    /// driver calls it after every segment, residual or logits, and on an error
+    /// rolls the segment back exactly as a failed sweep, so a faulted segment
+    /// never commits its KV or hands its residual on.
+    ///
+    /// The fault word is complete only once every launch that could claim it
+    /// is, so a model that can fault synchronises its device first — free after
+    /// the logits copy, which already has; one drain per residual segment.
+    /// Required, not defaulted: every sweep states whether its device can give
+    /// work up, so a model gaining an expert cache cannot silently skip it.
+    fn take_device_fault(&self) -> Result<()>;
+
     /// Run `[layer_start, layer_end)` over the wave, returning the residual
     /// (range stopped short of the head) or the logits (range reached it).
     ///
@@ -635,23 +648,33 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     // rather than a decode against per-layer token windows. This is the single
     // choke point every wave goes through; the sweep itself stays free to
     // advance eagerly, because whatever it did is undone here on the way out.
+    // The sweep's mutable session borrow ended with it, so the rollback
+    // re-assembles the contexts it needs. An assembly failure here is the same
+    // unrecoverable shape as a failed rollback: report both.
+    let fail = |session: &mut BatchedInferenceSession, e: candle::Error| -> candle::Error {
+        let (kv_start, kv_end) = model.kv_layer_range(layer_start, layer_end);
+        let rolled = assemble_wave_contexts(session, &all_seqs, &all_inputs)
+            .and_then(|mut contexts| model.rollback_wave(&mut contexts, kv_start, kv_end));
+        match rolled {
+            Ok(()) => e,
+            Err(rb) => candle::Error::Msg(format!(
+                "wave failed ({e}) and the KV rollback that keeps that failure \
+                 recoverable also failed ({rb}) — the affected sequences may hold \
+                 per-layer token windows"
+            )),
+        }
+    };
     let (phase, head_span) = match wave {
         Ok(v) => v,
+        // A launch refused over an untaken fault fails the sweep before any
+        // logits exist, so the fault is taken here too — or it would stay set
+        // and refuse every later wave. It is the cause, so it is the error.
         Err(e) => {
-            // The sweep's mutable session borrow ended with it, so the rollback
-            // re-assembles the contexts it needs. An assembly failure here is
-            // the same unrecoverable shape as a failed rollback: report both.
-            let (kv_start, kv_end) = model.kv_layer_range(layer_start, layer_end);
-            let rolled = assemble_wave_contexts(session, &all_seqs, &all_inputs)
-                .and_then(|mut contexts| model.rollback_wave(&mut contexts, kv_start, kv_end));
-            if let Err(rb) = rolled {
-                candle::bail!(
-                    "wave failed ({e}) and the KV rollback that keeps that failure \
-                     recoverable also failed ({rb}) — the affected sequences may hold \
-                     per-layer token windows"
-                )
-            }
-            return Err(e);
+            let e = match model.take_device_fault() {
+                Ok(()) => e,
+                Err(f) => candle::Error::Msg(format!("{f} (the sweep stopped on: {e})")),
+            };
+            return Err(fail(session, e));
         }
     };
     // Output ordering. The single-token prefills were folded into the decode
@@ -666,6 +689,11 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     //   on the way back in, exact inverses that round-trip across layer windows.
     let step = match phase {
         WavePhase::Residual(x) => {
+            // A segment that faulted must not commit: the next segment would
+            // carry its residual on and roll back only its own layers.
+            if let Err(e) = model.take_device_fault() {
+                return Err(fail(session, e));
+            }
             // Internal order → caller order. Tokens are dim 1.
             let res = match runs.as_deref() {
                 Some(r) => reorder(&x.to_tensor(), r, false, &window)?,
@@ -710,6 +738,12 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
             // writes into offset+1 with a stale KV row at offset. Copy first,
             // advance after, and nothing is advanced for an undelivered token.
             let lg = l.into_vec()?;
+            // The copy synchronised the wave: anything the device gave up in it
+            // has said so by now, and the wave is failed and rolled back like a
+            // failed sweep — its logits were computed from what was given up.
+            if let Err(e) = model.take_device_fault() {
+                return Err(fail(session, e));
+            }
             // The advance itself is per layer with no transaction, so a failure
             // at layer k is unwound here — truncating the advanced layers back
             // to their entry length, the same idempotent operation admit

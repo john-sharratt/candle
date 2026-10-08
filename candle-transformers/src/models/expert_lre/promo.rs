@@ -19,11 +19,22 @@
 //!   completed (its ticket is below the observed one) — and takes a skipped
 //!   victim's offer back.
 //!
+//! The ring also carries **read-ahead**: the host's predictions for each row
+//! (`predict`), each with the slot image it vetted as the expert's source, the
+//! layer window the link has for them (`set_window`) and how many rows ahead to
+//! read (`set_depth`). A launch at row `r` claims offers for
+//! the predicted warm experts of rows `r + 2 ..= r + depth` with what its own
+//! misses leave of the window, and its gate launch's workers copy and publish
+//! them (`moe_bucketize.cu`, READ-AHEAD); the log names such a claim's target
+//! row and sets `AHEAD_FLAG` in its expert field.
+//!
 //! In mapped pinned memory: `u64 slots[cap] | u64 log[cap] | u32 head | u32
 //! tail | u32 marks[rows][n_experts] | u32 reserve | u32 sweep | u64
-//! victims[cap] | u64 retarget[cap][3]` (the victims 8-aligned). `tail`,
-//! `reserve`, `sweep`, the victims and the retarget entries are written only by
-//! the host, `head` only by the device. `reserve` is the stock kept for
+//! victims[cap] | u64 retarget[cap][3] | u32 window | u32 depth | u32
+//! ahead_n[rows] | u32 ahead_list[rows][AHEAD_CAP] | u64
+//! ahead_src[rows][AHEAD_CAP]` (the victims and the sources 8-aligned).
+//! `tail`, `reserve`, `sweep`, the victims, the retarget entries and the
+//! read-ahead words are written only by the host, `head` only by the device. `reserve` is the stock kept for
 //! decode-scored experts: a prompt-only expert takes a slot only while more
 //! than it is stocked. `sweep` is the most claiming experts a launch may have
 //! and still claim: past it the launch is a prompt passing over the table and
@@ -35,19 +46,27 @@
 
 use candle::quantized::cuda::PromoRing;
 use candle::Result;
-use candle_kernels::simple::moe_bucketize::{PROMO_EMPTY, PROMO_SKIP};
+use candle_kernels::simple::moe_bucketize::{AHEAD_FLAG, PROMO_EMPTY, PROMO_SKIP};
 use cudarc::driver::sys;
 use std::sync::atomic::{fence, Ordering};
+
+/// Predictions the ring holds per row for read-ahead.
+pub(crate) const AHEAD_CAP: usize = 32;
 
 pub(crate) struct PromotionRing {
     host: *mut u8,
     dev: u64,
     cap: usize,
     n_experts: usize,
+    rows: usize,
     /// Byte offset of the `reserve` word, after the marks; `sweep` follows it.
     reserve_at: usize,
     /// Byte offset of the victims, 8-aligned; the retarget entries follow.
     victims_at: usize,
+    /// Byte offset of the read-ahead words: window, depth, then the lists.
+    ahead_at: usize,
+    /// Byte offset of the lists' vetted sources, 8-aligned.
+    src_at: usize,
 }
 
 /// The resident expert behind an offer: its index `row · n_experts + expert`
@@ -65,20 +84,26 @@ pub(crate) struct Victim {
 unsafe impl Send for PromotionRing {}
 unsafe impl Sync for PromotionRing {}
 
-/// One logged promotion: which invocation's word, which row and expert.
+/// One logged promotion: which invocation's word, which row and expert, and
+/// whether it was read ahead — claimed for a later row's predicted expert
+/// rather than for a miss of the launch's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Logged {
     pub(crate) word: u32,
     pub(crate) row: usize,
     pub(crate) expert: usize,
+    pub(crate) ahead: bool,
 }
 
 impl Logged {
     fn decode(v: u64) -> Self {
+        let x = (v & 0xffff) as u32;
+        let ahead = x != PROMO_SKIP && x & AHEAD_FLAG != 0;
         Self {
             word: (v >> 32) as u32,
             row: ((v >> 16) & 0xffff) as usize,
-            expert: (v & 0xffff) as usize,
+            expert: if ahead { x & !AHEAD_FLAG } else { x } as usize,
+            ahead,
         }
     }
 
@@ -105,7 +130,9 @@ impl PromotionRing {
     pub(crate) fn new(cap: usize, rows: usize, n_experts: usize) -> Result<Self> {
         let reserve_at = cap * 16 + 8 + rows * n_experts * 4;
         let victims_at = (reserve_at + 8).next_multiple_of(8);
-        let bytes = victims_at + cap * 32;
+        let ahead_at = victims_at + cap * 32;
+        let src_at = (ahead_at + 8 + rows * 4 + rows * AHEAD_CAP * 4).next_multiple_of(8);
+        let bytes = src_at + rows * AHEAD_CAP * 8;
         let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: a page-locked, device-mapped allocation, freed in `drop`.
         let r = unsafe { sys::cuMemHostAlloc(&mut raw, bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP) };
@@ -129,14 +156,64 @@ impl PromotionRing {
             dev,
             cap,
             n_experts,
+            rows,
             reserve_at,
             victims_at,
+            ahead_at,
+            src_at,
         };
         // No prompt-only expert takes a slot until the host says how much is
-        // decode's, and no launch claims until it says how many may.
+        // decode's, no launch claims until it says how many may, and nothing is
+        // read ahead until it says how much the link has room for (the zeroed
+        // window).
         ring.set_reserve(u32::MAX);
         ring.set_sweep(0);
         Ok(ring)
+    }
+
+    fn ahead_word(&self, at: usize) -> *mut u32 {
+        // SAFETY: callers pass offsets inside the read-ahead words.
+        unsafe { self.host.add(self.ahead_at + at) as *mut u32 }
+    }
+
+    /// The slot images the link moves in one layer: a launch reads ahead with
+    /// what its own misses leave of it.
+    pub(crate) fn set_window(&self, slots: u32) {
+        // SAFETY: the window word, first of the read-ahead words.
+        unsafe { std::ptr::write_volatile(self.ahead_word(0), slots) };
+        fence(Ordering::SeqCst);
+    }
+
+    /// A launch at row `r` reads ahead for rows `r + 2 ..= r + depth`.
+    pub(crate) fn set_depth(&self, depth: u32) {
+        // SAFETY: the depth word, after the window.
+        unsafe { std::ptr::write_volatile(self.ahead_word(4), depth) };
+        fence(Ordering::SeqCst);
+    }
+
+    /// Predict `experts` for `row`, best first, at most [`AHEAD_CAP`], each
+    /// with the slot image vetted as its source: the list's entries, then its
+    /// count. A bucketize reading the list while it changes may pair an
+    /// expert with the source listed beside the one it replaced; it acts only
+    /// when the expert's entry points at that source, and a source still
+    /// readable through any list is a warm slot or a pinned pad slot — neither
+    /// of which can come to hold another expert — so a mismatched pair is
+    /// passed over.
+    pub(crate) fn predict(&self, row: usize, experts: &[(usize, u64)]) {
+        let n = experts.len().min(AHEAD_CAP);
+        let list = 8 + self.rows * 4 + row * AHEAD_CAP * 4;
+        let src = self.src_at + row * AHEAD_CAP * 8;
+        for (q, &(e, image)) in experts[..n].iter().enumerate() {
+            // SAFETY: inside row `row`'s list and sources of `AHEAD_CAP`
+            // entries each.
+            unsafe {
+                std::ptr::write_volatile(self.ahead_word(list + q * 4), e as u32);
+                std::ptr::write_volatile(self.host.add(src + q * 8) as *mut u64, image);
+            }
+        }
+        fence(Ordering::Release);
+        // SAFETY: row `row`'s count, inside `ahead_n`.
+        unsafe { std::ptr::write_volatile(self.ahead_word(8 + row * 4), n as u32) };
     }
 
     /// Keep `n` stocked slots for decode-scored experts: a prompt-only expert
@@ -179,6 +256,12 @@ impl PromotionRing {
             sweep: self.dev + (self.reserve_at + 4) as u64,
             victims: self.dev + self.victims_at as u64,
             retarget: self.dev + (self.victims_at + self.cap * 8) as u64,
+            window: self.dev + self.ahead_at as u64,
+            depth: self.dev + (self.ahead_at + 4) as u64,
+            ahead_n: self.dev + (self.ahead_at + 8) as u64,
+            ahead_list: self.dev + (self.ahead_at + 8 + self.rows * 4) as u64,
+            ahead_src: self.dev + self.src_at as u64,
+            ahead_cap: AHEAD_CAP as u32,
         }
     }
 
@@ -233,7 +316,8 @@ impl PromotionRing {
     pub(crate) fn log(&self, i: u32) -> Logged {
         let i = i as usize % self.cap;
         // SAFETY: inside the log array.
-        let v = unsafe { std::ptr::read_volatile((self.host.add(self.cap * 8) as *const u64).add(i)) };
+        let v =
+            unsafe { std::ptr::read_volatile((self.host.add(self.cap * 8) as *const u64).add(i)) };
         Logged::decode(v)
     }
 
@@ -267,7 +351,9 @@ impl Drop for PromotionRing {
 mod tests {
     use super::*;
 
-    /// A log entry carries the word, the row and the expert.
+    /// A log entry carries the word, the row and the expert; a read-ahead
+    /// claim's expert field carries `AHEAD_FLAG` over the expert, and a skip's
+    /// `PROMO_SKIP` — whose bits include the flag's — is no read-ahead.
     #[test]
     fn a_log_entry_decodes() {
         let v = (0xdead_beefu64 << 32) | (39 << 16) | 255;
@@ -276,9 +362,85 @@ mod tests {
             Logged {
                 word: 0xdead_beef,
                 row: 39,
-                expert: 255
+                expert: 255,
+                ahead: false
             }
         );
+        let a = (7u64 << 32) | (41 << 16) | AHEAD_FLAG as u64 | 300;
+        assert_eq!(
+            Logged::decode(a),
+            Logged {
+                word: 7,
+                row: 41,
+                expert: 300,
+                ahead: true
+            }
+        );
+        let skip = Logged::decode((7u64 << 32) | (2 << 16) | PROMO_SKIP as u64);
+        assert!(skip.skipped() && !skip.ahead);
+    }
+
+    /// The read-ahead words follow the retarget entries: window, depth, the
+    /// per-row counts, the per-row lists of `AHEAD_CAP`, then their vetted
+    /// sources, 8-aligned. A prediction writes its experts, their sources and
+    /// its count, truncated at the cap; a shorter one later leaves the old tail
+    /// behind its count.
+    #[test]
+    fn read_ahead_words_sit_after_the_retarget_entries() {
+        let Ok(_device) = candle::Device::new_cuda(0) else {
+            return;
+        };
+        let ring = PromotionRing::new(4, 2, 8).unwrap();
+        let word = |at: usize| unsafe { std::ptr::read_volatile(ring.host.add(at) as *const u32) };
+        // victims at 144, retarget 144 + 32 = 176 for 96 bytes: words at 272.
+        assert_eq!(ring.ahead_at, 272);
+        let long = |at: usize| unsafe { std::ptr::read_volatile(ring.host.add(at) as *const u64) };
+        let r = ring.ring();
+        // Lists at 288 for 2 rows × 32 × 4 bytes: sources at 544.
+        assert_eq!(
+            (
+                r.window - ring.dev,
+                r.depth - ring.dev,
+                r.ahead_n - ring.dev,
+                r.ahead_list - ring.dev,
+                r.ahead_src - ring.dev,
+                r.ahead_cap
+            ),
+            (272, 276, 280, 288, 544, AHEAD_CAP as u32)
+        );
+        assert_eq!(
+            (word(272), word(276)),
+            (0, 0),
+            "nothing read ahead until told"
+        );
+        ring.set_window(12);
+        ring.set_depth(4);
+        assert_eq!((word(272), word(276)), (12, 4));
+
+        let many: Vec<(usize, u64)> = (100..100 + AHEAD_CAP + 3)
+            .map(|e| (e, 0x7000_0000 + e as u64 * 0x1000))
+            .collect();
+        ring.predict(1, &many);
+        let (row1, src1) = (288 + AHEAD_CAP * 4, 544 + AHEAD_CAP * 8);
+        assert_eq!(word(284), AHEAD_CAP as u32, "truncated at the cap");
+        assert_eq!(
+            (word(row1), word(row1 + 4 * (AHEAD_CAP - 1))),
+            (100, 100 + AHEAD_CAP as u32 - 1)
+        );
+        assert_eq!(
+            (long(src1), long(src1 + 8 * (AHEAD_CAP - 1))),
+            (
+                0x7006_4000,
+                0x7000_0000 + (100 + AHEAD_CAP as u64 - 1) * 0x1000
+            )
+        );
+        ring.predict(1, &[(7, 0x9000_0000), (9, 0x9000_1000)]);
+        assert_eq!(
+            (word(284), word(row1), word(row1 + 4), word(row1 + 8)),
+            (2, 7, 9, 102)
+        );
+        assert_eq!((long(src1), long(src1 + 8)), (0x9000_0000, 0x9000_1000));
+        assert_eq!(word(280), 0, "row 0 untouched");
     }
 
     /// Published slots land at `tail` in order and wrap at `cap`; withdrawing
@@ -340,10 +502,17 @@ mod tests {
         );
         assert_eq!((long(144), long(152)), (PROMO_EMPTY, 13));
         // retarget at 144 + 4·8 = 176, three u64s per ring index.
-        assert_eq!((long(176 + 24), long(176 + 32), long(176 + 40)), (0x9000, 0x9010, 0x9020));
+        assert_eq!(
+            (long(176 + 24), long(176 + 32), long(176 + 40)),
+            (0x9000, 0x9010, 0x9020)
+        );
         let r = ring.ring();
         assert_eq!(
-            (r.sweep - r.reserve, r.victims - ring.dev, r.retarget - ring.dev),
+            (
+                r.sweep - r.reserve,
+                r.victims - ring.dev,
+                r.retarget - ring.dev
+            ),
             (4, 144, 176)
         );
     }
@@ -379,7 +548,10 @@ mod tests {
         assert_eq!(ticket_from_word(7, 9), 7);
         assert_eq!(ticket_from_word(12, 9), 12);
         let near = (5u64 << 32) | 3;
-        assert_eq!(ticket_from_word(0xffff_fffe, near), (4u64 << 32) | 0xffff_fffe);
+        assert_eq!(
+            ticket_from_word(0xffff_fffe, near),
+            (4u64 << 32) | 0xffff_fffe
+        );
         let near = (5u64 << 32) | 0xffff_fff0;
         assert_eq!(ticket_from_word(4, near), (6u64 << 32) | 4);
     }

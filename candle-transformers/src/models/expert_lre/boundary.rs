@@ -235,9 +235,7 @@ impl PipelineState {
         // lock is held), so every entry may change at once: nothing can read
         // the table until the move is done.
         self.quiesce_before_handover()?;
-        self.finish_promotions()?;
         self.drain_ring(self.routed_served.load(Ordering::Acquire))?;
-        self.release_retired();
 
         // The zone decides who moves and who goes; this performs it. A
         // displaced survivor is evicted first: the relocation into its slot
@@ -347,8 +345,13 @@ impl PipelineState {
         // emptied by its displaced occupant's eviction — so the two cannot
         // alias. The device is quiesced.
         unsafe {
-            cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.copy_stream.cu_stream())
-                .map_err(candle::Error::wrap)?;
+            cudarc::driver::result::memcpy_dtod_async(
+                dst,
+                src,
+                bytes,
+                self.copy_stream.cu_stream(),
+            )
+            .map_err(candle::Error::wrap)?;
         }
         // SAFETY: the copy above puts this layer's three projections at `dst`
         // before anything reads the views (the caller synchronizes first).

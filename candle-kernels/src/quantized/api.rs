@@ -31,8 +31,11 @@ unsafe impl Sync for VxSegment {}
 /// blocks and the counter layout.
 ///
 /// Every field is a device address or a plain number:
-/// - `abort` — a mapped host `u32` the host sets non-zero to end every waiting
-///   worker in a trap;
+/// - `abort` — a mapped host `u32` the host sets non-zero to end every wait;
+/// - `fault` — a mapped host `u64` the first worker whose wait ends without its
+///   expert (aborted, or past `spin_limit_ns`) claims with what it waited on;
+///   any other cold wait that sees it set gives its expert up at once, and the
+///   host fails the forward (`MOE_FAULT_*` below for the bits);
 /// - `live_row` — this projection's row of the live table (mapped host
 ///   memory), where a worker waits for a cold expert; every other expert's
 ///   address comes from the launch's weight table, `moe_bucketize`'s snapshot;
@@ -42,13 +45,18 @@ unsafe impl Sync for VxSegment {}
 ///   they copy there too;
 /// - `counter` — this launch's work counter (zeroed by `moe_bucketize`);
 /// - `scratch`, `slot_bytes` — the workers' VRAM slots;
-/// - `stall` — the profile build's `u64[5]` per-row counters (0 otherwise);
+/// - `stall` — the profile build's `u64[STALL_WORDS]` per-row counters (0
+///   otherwise);
+/// - `ahead`, `ahead_done` — the gate launch's read-ahead items and their piece
+///   counters (`moe_read_ahead.cuh`), 0 on the up and down launches;
 /// - `spin_limit_ns` — the backstop on any single wait;
-/// - `workers` — the worker-block count.
+/// - `workers` — the worker-block count;
+/// - `row` — the launch's MoE row, which a fault names.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeLive {
     pub abort: u64,
+    pub fault: u64,
     pub live_row: u64,
     pub remote: u64,
     pub remote_dst: u64,
@@ -58,9 +66,24 @@ pub struct MoeLive {
     pub slot_bytes: u64,
     pub dst_offset: u64,
     pub stall: u64,
+    pub ahead: u64,
+    pub ahead_done: u64,
     pub spin_limit_ns: u64,
     pub workers: i32,
+    pub row: i32,
 }
+
+/// The fault word's fields (`MoeLive::fault`), mirrored from `kernel.cuh`:
+/// bit 63 set when the wait ended on the abort word rather than the spin limit,
+/// the row in bits 48–62, the expert in bits 32–47, the microseconds waited in
+/// bits 0–31 (saturating).
+pub const MOE_FAULT_ABORTED: u64 = 1 << 63;
+pub const MOE_FAULT_ROW_SHIFT: u32 = 48;
+pub const MOE_FAULT_EXPERT_SHIFT: u32 = 32;
+
+/// `u64` profile counters per row in `MoeLive::stall`, mirrored from
+/// `MOE_LIVE_STALL_WORDS` in `kernel.cuh`.
+pub const STALL_WORDS: usize = 7;
 
 /// Quantization type enum for the matmul dispatcher (`run_quantized_matmul`).
 ///

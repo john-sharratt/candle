@@ -207,9 +207,9 @@ ceiling:
 |---|---|---:|---:|---:|---|---:|
 
 - **weight uptake** — the percentage, or `weights fully resident` when the probe says so.
-- **result** — PASS only when all three of that probe's gates passed. When the only failure
-  is the efficiency gate and KV compaction is switched off, write `FAIL (efficiency —
-  compaction disabled)` so the reason is in the table and nobody re-derives it.
+- **result** — PASS only when all three of that probe's gates passed. An efficiency failure
+  is a fragmentation regression to attribute and fix forward (step 9), like any other
+  failure — KV compaction is on, so it is never a standing cost.
 - Then one line: **SWEEP PASS** only if every run gate **and every engine probe** passed;
   otherwise **SWEEP FAIL** and the list of failing gate × mode × ctx and failing probe ×
   gate.

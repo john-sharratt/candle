@@ -125,22 +125,34 @@
 //! | `boundary`     | the elastic weight/KV boundary move |
 //! | `slot_image`   | one expert's slot image: offsets, views, uploads |
 //! | `startup`      | building or reusing the pack, and the startup fill |
+//! | `read_ahead`, `ahead_pins`, `link_rate` | read-ahead's window, pad pins and the link it is sized from |
+//! | `votes`        | the router look-ahead's per-hop votes, beside the summary ring |
+//! | `fault`        | the word a launch reports a lost cold expert in, and the forward's error |
+//! | `belady`, `routing_trace`, `replay` | the residency references and the offline policy replay |
 //! | [`handle`]     | `ExpertCache` public API |
 
+/// The pad pins read-ahead holds for the pad-backed experts it lists.
+#[cfg(feature = "cuda")]
+mod ahead_pins;
+/// Belady's optimal hit rate over a recorded routing — the residency ceiling.
+mod belady;
 #[cfg(feature = "cuda")]
 mod boundary;
 mod cache;
 pub(crate) mod compute;
-/// Copy-engine promotions, issued off the pipeline thread.
-#[cfg(feature = "cuda")]
-mod copier;
 #[cfg(feature = "cuda")]
 mod dispatch;
 #[cfg(test)]
 mod eval;
+/// The word a live launch's workers report a lost cold expert in.
+#[cfg(feature = "cuda")]
+mod fault;
 /// `pub(crate)` so the layer warm tier can size itself through the same three
 /// host-RAM ceilings this one does — see `handle::warm_slots_for`.
 pub(crate) mod handle;
+/// The host→device link's rate, measured at startup for read-ahead.
+#[cfg(feature = "cuda")]
+mod link_rate;
 #[cfg(feature = "cuda")]
 mod live_table;
 #[cfg(all(test, feature = "cuda"))]
@@ -164,16 +176,29 @@ pub(crate) mod pinned;
 mod pipeline;
 #[cfg(feature = "cuda")]
 mod promo;
+/// Read-ahead's host policy: its depth and its link window.
+#[cfg(feature = "cuda")]
+mod read_ahead;
+/// The stager's per-read latency, by source.
+mod read_latency;
+/// The stager's reader queue: demand reads before speculative ones.
+#[cfg(feature = "cuda")]
+mod read_queue;
 #[cfg(feature = "cuda")]
 mod reclaim;
+/// Offline replay of residency policies over a written routing trace.
+#[cfg(test)]
+mod replay;
 #[cfg(feature = "cuda")]
 mod residency;
+/// The routing the pipeline thread served, kept for the residency ceiling.
+mod routing_trace;
+#[cfg(feature = "cuda")]
+mod slot_image;
 /// Fletcher-32 fingerprints of the resident expert weights, taken once after
 /// the fill so a later corruption can be told from a bad fill.
 #[cfg(feature = "cuda")]
 pub mod slot_integrity;
-#[cfg(feature = "cuda")]
-mod slot_image;
 /// The slot-tenancy tags bucketize's owner check reads.
 #[cfg(feature = "tensor-assert")]
 mod slot_owners;
@@ -186,6 +211,9 @@ mod started;
 mod startup;
 mod transition;
 mod types;
+/// The router look-ahead votes, one ring slot per invocation.
+#[cfg(feature = "cuda")]
+mod votes;
 #[cfg(feature = "cuda")]
 pub(crate) mod warm_tier;
 mod weight_plan;
@@ -193,11 +221,18 @@ mod weight_plan;
 // Re-exports — the public API of this module.
 pub use crate::models::profile::ProfileSnapshot;
 #[cfg(feature = "cuda")]
+pub use boundary::grow_tally;
+#[cfg(feature = "cuda")]
 pub use cache::minimum_resident_slots;
 /// Shared with the layer cache, which pins the same count for the same reason:
 /// the leading layers are reached first on every forward and have the least
 /// time to be fetched, so they are the ones worth never fetching at all.
 pub use cache::PINNED_LAYERS;
+/// The router look-ahead's reach — the rows past a layer it predicts — and the
+/// widest launch it runs on: a prompt prefill routes most of every row, which
+/// leaves nothing to predict.
+#[cfg(feature = "cuda")]
+pub(crate) use dispatch::PREFILL_LAUNCH_TOKENS as LOOK_AHEAD_MAX_TOKENS;
 pub use handle::ExpertCache;
 pub use handle::ExpertCacheSetup;
 #[cfg(feature = "cuda")]
@@ -212,9 +247,9 @@ pub use handle::{
 /// and the boundary has to be placed before a single expert is uploaded into it.
 #[cfg(feature = "cuda")]
 pub(crate) use pinned::layer_geometries;
-#[cfg(feature = "cuda")]
-pub use boundary::grow_tally;
+pub use read_latency::ReadLatency;
 #[cfg(feature = "cuda")]
 pub(crate) use slot_image::slot_bytes_for;
-pub use types::{ExpertSlot, MmapExpertRef, PipelineStats};
+pub(crate) use transition::HOPS as LOOK_AHEAD_HOPS;
+pub use types::{ExpertSlot, LookAhead, MmapExpertRef, PipelineStats};
 pub use weight_plan::{WeightPlan, WeightPlanning};

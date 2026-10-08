@@ -47,7 +47,10 @@ pub(crate) enum Proj {
 /// The table's memory: mapped pinned host memory, or — for host-only tests of
 /// the policy above it — an ordinary allocation with no device address.
 enum TableMemory {
-    Mapped { host: *mut u64, dev: u64 },
+    Mapped {
+        host: *mut u64,
+        dev: u64,
+    },
     #[cfg(test)]
     Host(Box<[u64]>),
 }
@@ -177,7 +180,13 @@ impl LiveTable {
                 dims(&g.up_shape, "up", row)?,
                 dims(&g.down_shape, "down", row)?,
             );
-            if shapes != ((gate_nrows, gate_k), (gate_nrows, gate_k), (down_nrows, down_k)) {
+            if shapes
+                != (
+                    (gate_nrows, gate_k),
+                    (gate_nrows, gate_k),
+                    (down_nrows, down_k),
+                )
+            {
                 candle::bail!(
                     "live table: row {row} projections {shapes:?} differ from row 0's — every \
                      row feeds the same tensors, so they must share one shape"

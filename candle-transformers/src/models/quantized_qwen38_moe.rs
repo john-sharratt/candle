@@ -2227,7 +2227,13 @@ mod tests {
             .with_suppress_thinking(true)
             .with_print_outputs(true)
             .with_int8mode(int8mode)
-            .with_timeout_secs(3600);
+            .with_timeout_secs(3600)
+            // Each config's routing, for replaying residency and prediction
+            // policies offline (`expert_lre::replay`).
+            .with_routing_trace_dir(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../target/routing_traces/qwen38_flash_next"),
+            );
 
         let configs = batched_forward_configs(&device);
 

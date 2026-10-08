@@ -1,15 +1,19 @@
-//! **A live launch whose cold expert can never be published ends in a sticky
-//! error.**
+//! **A live launch whose cold expert never arrives gives it up and says so.**
 //!
 //! The live-table grouped GEMM's worker blocks wait for a cold expert's entry.
-//! When the host cannot deliver it — a failed pack read, a dead thread — it
-//! raises the abort word with a plain host store, and every waiting worker traps.
-//! The next synchronising call must then report an error, so no result computed
-//! from the layer is ever returned.
-//!
-//! In a binary of its own: a trap poisons the CUDA context for the whole
-//! process, which would fail every test that shared it.
+//! When the host cannot deliver it — it raises the abort word (a failed pack
+//! read, a dead thread), or the wait passes the launch's spin limit (a drive
+//! that stopped answering) — the waiting worker claims the mapped fault word
+//! with the row, the expert and why, and gives the item up; any other cold wait
+//! that sees the word set gives its expert up at once. The launch ends without
+//! a trap, so the context stays usable: the next
+//! synchronise succeeds and the host fails the forward from the fault word.
 #![cfg(feature = "cuda")]
+
+use std::ptr;
+use std::sync::atomic::{fence, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use candle_core::cuda_backend::cudarc::driver::{sys, DevicePtr};
 use candle_core::quantized::cuda::{
@@ -19,6 +23,7 @@ use candle_core::quantized::cuda::{
 use candle_core::quantized::decode_rows::DecodeRows;
 use candle_core::quantized::{GgmlDType, Int8Mode, SumScale};
 use candle_core::{DType, Device, Result, Tensor};
+use candle_kernels::quantized::{MOE_FAULT_ABORTED, MOE_FAULT_EXPERT_SHIFT, MOE_FAULT_ROW_SHIFT};
 
 /// `bytes` of mapped pinned host memory, zeroed: (host pointer, device address).
 fn mapped(bytes: usize) -> (*mut std::ffi::c_void, u64) {
@@ -38,8 +43,10 @@ fn mapped(bytes: usize) -> (*mut std::ffi::c_void, u64) {
     (raw, d)
 }
 
-#[test]
-fn an_aborted_cold_wait_traps_and_the_next_sync_reports_it() -> Result<()> {
+/// One live gate launch over a table where every expert is cold, on MoE row
+/// `row`, with the given spin limit; `release` runs once the launch is queued.
+/// Returns the fault word after the next synchronise, which must succeed.
+fn cold_launch(row: i32, spin_limit_ns: u64, release: impl FnOnce(*mut u32)) -> Result<u64> {
     let device = Device::new_cuda(0)?;
     let Device::Cuda(dev) = &device else {
         unreachable!()
@@ -51,7 +58,7 @@ fn an_aborted_cold_wait_traps_and_the_next_sync_reports_it() -> Result<()> {
     // Every expert cold: every routed expert goes to the workers, which wait,
     // and nothing will publish them.
     let (_table_h, table_d) = mapped(3 * n_experts * 8);
-    let (abort_h, abort_d) = mapped(4);
+    let (words_h, words_d) = mapped(16);
     let snap = dev.alloc_zeros::<u64>(3 * n_experts)?;
     let ids: Vec<u32> = (0..a_ub as u32).map(|i| i % n_experts as u32).collect();
     let t = Tensor::from_vec(ids, (n_tokens, k), &device)?;
@@ -81,12 +88,13 @@ fn an_aborted_cold_wait_traps_and_the_next_sync_reports_it() -> Result<()> {
         summary_seq: 1,
         remote: rp,
         counters: cp,
-        row: 0,
+        row,
         promo: None,
         remote_dst: 0,
         started_rows: 0,
         ticket: 0,
         owner: OwnerCheck::default(),
+        ahead: None,
     };
     drop((_g1, _g2, _g3, _g4, _g5, _g6));
     moe_bucketize(
@@ -98,7 +106,8 @@ fn an_aborted_cold_wait_traps_and_the_next_sync_reports_it() -> Result<()> {
         &DecodeRows::prefix(n_tokens),
     )?;
     let live = MoeLive {
-        abort: abort_d,
+        abort: words_d,
+        fault: words_d + 8,
         live_row: table_d,
         remote_dst: 0,
         dst_offset: 0,
@@ -108,10 +117,11 @@ fn an_aborted_cold_wait_traps_and_the_next_sync_reports_it() -> Result<()> {
         scratch: scp,
         slot_bytes: 65536,
         stall: 0,
-        // Far above the test's own delay, so the abort — not the backstop — is
-        // what ends the wait.
-        spin_limit_ns: 60_000_000_000,
+        ahead: 0,
+        ahead_done: 0,
+        spin_limit_ns,
         workers: 8,
+        row,
     };
     let _out = grouped_qmatmul_dev_q8a128(
         &op,
@@ -131,16 +141,48 @@ fn an_aborted_cold_wait_traps_and_the_next_sync_reports_it() -> Result<()> {
     unsafe {
         let _ = sys::cuStreamQuery(stream.cu_stream());
     }
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    release(words_h as *mut u32);
+    stream.synchronize().map_err(candle_core::Error::wrap)?;
+    // The context survived: work after the launch still runs.
+    let after = (Tensor::ones(4, DType::F32, &device)? + 1.0)?.to_vec1::<f32>()?;
+    assert_eq!(after, vec![2.0; 4], "the context is usable after a fault");
+    Ok(unsafe { std::ptr::read_volatile((words_h as *const u8).add(8) as *const u64) })
+}
 
-    // The host's abort: a store to a mapped word — no driver call.
-    unsafe { std::ptr::write_volatile(abort_h as *mut u32, 1) };
-    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-
-    let synced = stream.synchronize();
+/// The host's abort — a store to a mapped word, no driver call — ends the wait:
+/// the fault word says aborted, on the launch's row, for a routed expert.
+#[test]
+fn an_aborted_cold_wait_claims_the_fault_word_and_leaves_the_context_usable() -> Result<()> {
+    // Far above the test's own delay, so the abort — not the backstop — is
+    // what ends the wait.
+    let word = cold_launch(7, 60_000_000_000, |abort| {
+        thread::sleep(Duration::from_millis(50));
+        unsafe { ptr::write_volatile(abort, 1) };
+        fence(Ordering::SeqCst);
+    })?;
+    assert_ne!(word & MOE_FAULT_ABORTED, 0, "aborted: {word:#x}");
+    assert_eq!((word >> MOE_FAULT_ROW_SHIFT) & 0x7fff, 7, "row");
     assert!(
-        synced.is_err(),
-        "an aborted wait must surface as an error at the next synchronize"
+        (word >> MOE_FAULT_EXPERT_SHIFT) & 0xffff < 8,
+        "a routed expert: {word:#x}"
+    );
+    Ok(())
+}
+
+/// A wait past the spin limit ends on its own: the fault word says not
+/// aborted, with at least the limit waited.
+#[test]
+fn a_cold_wait_past_the_spin_limit_claims_the_fault_word() -> Result<()> {
+    let word = cold_launch(2, 20_000_000, |_| {})?;
+    assert_eq!(
+        word & MOE_FAULT_ABORTED,
+        0,
+        "timed out, not aborted: {word:#x}"
+    );
+    assert_eq!((word >> MOE_FAULT_ROW_SHIFT) & 0x7fff, 2, "row");
+    assert!(
+        word & 0xffff_ffff >= 20_000,
+        "waited at least the 20 ms limit: {word:#x}"
     );
     Ok(())
 }

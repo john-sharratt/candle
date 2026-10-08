@@ -11,15 +11,17 @@
 //!   workers write each slice they copy into the slot as well as their scratch,
 //!   and once the invocation has completed this thread points the expert's
 //!   entry at the slot: a miss is promoted with no second crossing of the link.
-//! - **Prefetch, by the copy engine.** The Markov transition matrix predicts the
-//!   next layers' experts; a predicted expert with a pinned copy is copied into
-//!   a slot on the copy stream and its entry pointed there once the copy is
-//!   **reported** complete. The copies are issued by the copier thread
-//!   (`copier`), never by this one: issuing a copy can stall in the driver
-//!   for as long as the forward the GPU is running, and this thread's ring
-//!   must not stall with it. A predicted cold one is handed to the stager to
-//!   stage into the pad. A prefill-width row promotes the next row's scored
-//!   experts the same way.
+//! - **Read-ahead, by the GPU too.** The Markov transition matrix predicts the
+//!   next layers' experts (a row routing most of its experts predicts the next
+//!   rows' scored ones instead), and this thread writes each row's prediction
+//!   into the promotion ring (`PromotionRing::predict`) while a launch that
+//!   reads it has yet to begin. A later launch claims offers for the predicted
+//!   experts whose pinned copy this thread vetted (a warm slot, or a pad slot
+//!   it pinned — `ahead_pins`) with the link time its own misses leave
+//!   (`read_ahead`), and its gate launch's workers copy them into the slots and
+//!   publish their entries — no copy issued here and no landing waited for. A
+//!   predicted cold expert is handed to the stager to stage into the pad, and
+//!   listed from there as the stager reports it landed.
 //! - **Eviction** points an entry back at the expert's pinned copy (or 0) and
 //!   frees the slot under the reclaim rule (`reclaim`): an entry may go to 0
 //!   only for a quiet row, and a slot is reused only once every invocation that
@@ -29,57 +31,30 @@
 //! [`TransitionMatrix`]. The per-expert places it shares with the stager live in
 //! the [`Residency`] lock, which also writes the live table.
 
+use super::ahead_pins::{AheadPins, Candidate};
 use super::cache::{ExpertCacheInner, DECODE_RECENCY_DECAY};
-use super::copier::{Copier, CopyJob};
 use super::dispatch::{AbortWord, PassState, SummaryRing};
+use super::fault::FaultWord;
 use super::pinned::LayerGeometry;
-use super::promo::{ticket_from_word, PromotionRing, Victim};
-use super::reclaim::{ReclaimClock, RetireList};
+use super::promo::{ticket_from_word, PromotionRing, Victim, AHEAD_CAP};
+use super::read_ahead::{listing_readable, median, read_ahead_window, READ_AHEAD_DEPTH};
+use super::reclaim::ReclaimClock;
 use super::residency::{Fallback, Residency};
+use super::routing_trace::RoutingTrace;
 use super::slot_image::{build_slot_view, slot_offsets};
 use super::stager::StagerMsg;
-use super::transition::TransitionMatrix;
+use super::transition::{TransitionMatrix, HOPS};
 use super::types::{PipelineMessage, PipelineStats, RoutedLayer};
+use super::votes::{ranked, VoteRing};
 use crate::models::profile::{profile_now, ProfileAccumulator};
 use candle::{Device, Result};
+use candle_kernels::simple::moe_bucketize::AHEAD_MAX;
 use cudarc::driver::CudaStream;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
-
-// ============================================================================
-// Dynamic load-ahead (prefetch depth N) controller constants
-// ============================================================================
-
-/// Upper clamp on the dynamic prefetch depth `N`. Adjacent-chained prediction
-/// compounds precision per hop (~0.95×/hop from the 93–97% steady state), so
-/// beyond a few hops the extra DMA is mostly waste even when latency-bound.
-const PREFETCH_DEPTH_MAX: usize = 4;
-
-/// Deepen only when a pass accumulated at least this many late promotions.
-/// A single straggler in one pass is noise.
-const PREFETCH_LATE_FLOOR: usize = 2;
-
-/// Chained hops beyond `L+1` are issued only for decode-narrow source sets
-/// (at most this many routed experts). A prefill-width row's compute window
-/// hides single-hop latency, and multi-hop batches for it would only queue
-/// bytes ahead of the next row's.
-const PREFETCH_MULTI_HOP_MAX_SOURCES: usize = 32;
-
-/// Upper bound on one lookahead: the next row's scored experts, highest first.
-/// Bounds its bus time to roughly one layer's compute window; a bigger batch
-/// cannot land before its row and only queues bytes.
-const LOOKAHEAD_MAX: usize = 64;
-
-/// Deepen only when the pass's achieved copy bandwidth sits below this
-/// fraction of the empirical ceiling. Late promotions WITHOUT slack mean the
-/// link is saturated, and issuing earlier would only queue more bytes.
-const PREFETCH_BW_SLACK: f32 = 0.8;
-
-/// Shallow back when a pass finishes with zero late promotions and its
-/// prediction precision fell below this floor: the extra hops are landing in
-/// time but bringing in the wrong experts.
-const PREFETCH_PRECISION_FLOOR: f32 = 0.8;
+use std::time::Instant;
 
 /// The fewest free slots the promotion ring is kept stocked with.
 ///
@@ -98,8 +73,8 @@ const RING_TARGET: usize = 32;
 /// How many rows past the one just served the promotion ring is stocked for.
 /// The stock has to be in the ring when the GPU's bucketize of those rows reads
 /// it, and this thread stocks only after reading the served row's summary — a
-/// refill per routed layer, made with no driver call (`copier`), so it trails
-/// the GPU by about a layer.
+/// refill per routed layer, made with no driver call, so it trails the GPU by
+/// about a layer.
 const RING_HORIZON: usize = 2;
 
 /// Prompt-only experts are promoted only when the expert zone can hold at
@@ -161,26 +136,36 @@ struct RingStock {
 /// its experts promotes a prompt's misses only from launches narrow enough to
 /// fit the prediction — stencils, short prompts, the rows a decode step
 /// verifies.
+///
+/// **Read-ahead stocks on top.** A launch reads ahead with up to `window` offers
+/// past its own misses, so the stock grows by the window — in the target only:
+/// the reserve and the sweep word decide what misses may claim, and read-ahead
+/// spends only the stock above the reserve (`moe_bucketize.cu`). When decode's
+/// own target reaches half the ring, the target is clamped there too and equals
+/// the reserve: read-ahead then gets only the zone's empty slots, since the
+/// ring has no room left to stock a window past what decode's misses want.
 fn ring_stock(
     decode_ahead: usize,
     all_ahead: usize,
     prompt_room: bool,
     empty_slots: usize,
+    window: usize,
     cap: usize,
 ) -> RingStock {
     let target = |ahead: usize| (ahead + ahead / 4).clamp(RING_TARGET, cap / 2);
     let empties = empty_slots.min(cap / 2);
+    let stocked = |t: usize| (t + window).min(cap / 2).max(empties);
     if prompt_room {
         let all = target(all_ahead);
         return RingStock {
-            target: all.max(empties),
+            target: stocked(all),
             reserve: 0,
             sweep: all as u32,
         };
     }
     let decode = target(decode_ahead);
     RingStock {
-        target: decode.max(empties),
+        target: stocked(decode),
         reserve: decode as u32,
         sweep: decode as u32,
     }
@@ -192,6 +177,26 @@ const SUMMARY_PINNED: u32 = 1 << 29;
 const SUMMARY_COLD: u32 = 1 << 30;
 const SUMMARY_DECODE: u32 = 1 << 31;
 
+/// Whether a device promotion lands now: its invocation is `complete`, and
+/// either it is a read-ahead claim (which never waits on a cold expert) or no
+/// forward has `faulted` — a demand claim's item may have been given up, its
+/// slot never written, and it waits for the fault to be taken, which drops it
+/// (`PipelineState::drop_demand_promotions`).
+///
+/// `faulted` is read only after `complete` was: a worker claims the fault word
+/// and fences before any later launch begins, and a later launch's start is
+/// what makes a claim complete — so a claim of the faulted launch judged
+/// complete always reads the word set.
+fn lands(complete: bool, ahead: bool, faulted: impl FnOnce() -> bool) -> bool {
+    complete && (ahead || !faulted())
+}
+
+/// Pending promotions split into the read-ahead claims, which a fault leaves to
+/// land, and the demand claims it drops — each in its pending order.
+fn split_ahead(pending: Vec<DevicePromotion>) -> (Vec<DevicePromotion>, Vec<DevicePromotion>) {
+    pending.into_iter().partition(|p| p.ahead)
+}
+
 /// A slot the GPU is filling with a missed expert: whole once invocation
 /// `ticket` has completed.
 struct DevicePromotion {
@@ -199,6 +204,9 @@ struct DevicePromotion {
     expert: usize,
     slot: usize,
     ticket: u64,
+    /// A read-ahead claim: its gate launch's workers copy it whole and publish
+    /// it, whatever else the launch gives up (`fault`).
+    ahead: bool,
 }
 
 /// What stands at one ring index: a zone slot, and — when it was offered as a
@@ -225,16 +233,32 @@ struct Chosen {
 /// land.
 const PAD_PIN_SHARE: usize = 4;
 
-/// One speculative promotion copy in flight on the copier, named by its job id.
-struct Promotion {
-    id: u64,
-    row: usize,
-    expert: usize,
-    slot: usize,
-    bytes: usize,
-    /// The copy reads the expert's pad slot, pinned against pad eviction until
-    /// the copy is done.
-    from_pad: bool,
+/// The share of the pad read-ahead's listings may hold pinned
+/// (`1 / AHEAD_PIN_SHARE`), beside the lazy victims' share: together they leave
+/// the stager most of the pad for cold demand rows.
+const AHEAD_PIN_SHARE: usize = 8;
+
+/// Experts predicted for a row within two of the served one: too near for a
+/// launch to read ahead (`read_ahead::listing_readable`), so the prediction
+/// only stages its cold experts into the pad for the row's own workers, and
+/// the pad — one layer of slots, shared with every demand row — is what
+/// bounds it. A row past that is listed for read-ahead as well and takes the
+/// ring's list (`AHEAD_CAP`).
+const STAGE_CAP: usize = 32;
+
+/// The score a non-resident expert needs to be predicted for its row from
+/// decode's own history (`scored_absent`): a decode routing credits 1.0 and a
+/// pass decays it by `DECODE_RECENCY_DECAY` (0.85), so this admits an expert
+/// decode routed there within the last four steps.
+const RECENT_MIN_SCORE: f32 = 0.5;
+
+/// How many experts a row is predicted at `hop` rows ahead.
+fn prediction_cap(hop: usize) -> usize {
+    if hop >= 3 {
+        AHEAD_CAP
+    } else {
+        STAGE_CAP
+    }
 }
 
 /// The pipeline thread's private state. Never crosses a thread boundary after
@@ -243,16 +267,14 @@ pub(crate) struct PipelineState {
     /// VRAM slots, eviction scores, the zone and its free list.
     pub(crate) inner: ExpertCacheInner,
     pub(crate) device: Device,
-    /// Every promotion and relocation copy, in order: promotions issued by the
-    /// copier, relocations by this thread with the copier flushed.
+    /// The boundary moves' relocation copies.
     pub(crate) copy_stream: Arc<CudaStream>,
-    copier: Copier,
-    /// The next promotion's job id.
-    next_copy: u64,
     pub(crate) residency: Arc<Mutex<Residency>>,
     pub(crate) clock: Arc<ReclaimClock>,
     pub(crate) ring: Arc<SummaryRing>,
     pub(crate) abort: Arc<AbortWord>,
+    /// The live launches' fault word: while set, no demand promotion lands.
+    fault: Arc<FaultWord>,
     /// The forward thread's pass, shared for the boundary rule.
     pub(crate) pass_state: Arc<Mutex<PassState>>,
     /// The pass of the routed layer being served.
@@ -269,12 +291,10 @@ pub(crate) struct PipelineState {
     pub(crate) all_resident: bool,
     /// Online-learned transition matrix for speculative prefetch.
     pub(crate) transition_matrix: TransitionMatrix,
-    /// `(layer, expert)` pairs promoted speculatively and not yet judged: their
-    /// layer's routing scores the prediction.
+    /// `(layer, expert)` pairs read ahead and not yet judged: their layer's
+    /// routing scores the prediction.
     pub(crate) speculative_loads: HashSet<(usize, usize)>,
-    /// Promotion copies in flight, and the experts they — or the GPU — are
-    /// promoting.
-    promotions: Vec<Promotion>,
+    /// The experts the GPU is promoting — a miss's claim or a read-ahead.
     promoting: HashSet<(usize, usize)>,
     /// The promotion ring (none when every expert is in VRAM); the offer
     /// behind each ring index; the slots standing in it, which nothing else
@@ -289,22 +309,31 @@ pub(crate) struct PipelineState {
     ring_taken: u32,
     device_promotions: Vec<DevicePromotion>,
     ring_target: usize,
-    /// Evicted slots waiting for their old readers (`reclaim`).
-    retired: RetireList<usize>,
-    /// Dynamic load-ahead depth `N`, adapted once per pass by
-    /// [`PipelineState::adapt_prefetch_depth`].
-    pub(crate) prefetch_depth: usize,
-    /// Wall-clock start of the current pass — the denominator of the achieved
-    /// promotion bandwidth.
-    pub(crate) pass_started: Option<std::time::Instant>,
-    /// Promotion bytes enqueued this pass.
-    pub(crate) pass_dma_bytes: usize,
-    /// Speculative promotions late this pass.
-    pub(crate) pass_late: usize,
-    /// Per-pass prediction precision counters `(hits, total)`.
-    pub(crate) pass_pred: (usize, usize),
-    /// Running max of per-pass achieved GB/s — the controller's ceiling.
-    pub(crate) bw_ceiling_gbps: f32,
+    /// Read-ahead's window inputs: the link's measured rate (bytes/s), the
+    /// largest slot image, the intervals between consecutive rows' summaries
+    /// this pass, the last summary's arrival and row, and the window the ring
+    /// carries — set once per pass from the previous pass's median interval.
+    link_rate: f64,
+    image_bytes: usize,
+    layer_intervals: Vec<f64>,
+    last_summary: Option<(Instant, usize)>,
+    window: u32,
+    /// The pad pins read-ahead's listings hold (`ahead_pins`).
+    ahead_pins: AheadPins,
+    /// Per row, its latest prediction, best first — what the row's listing is
+    /// vetted from: at the prediction, and again as the stager lands what it
+    /// staged ahead for the row.
+    predicted: Vec<Vec<usize>>,
+    /// Speculative reads the stager has landed, `(row, expert)`: each a staged
+    /// expert its row may now list from the pad.
+    landed_ahead: mpsc::Receiver<(usize, usize)>,
+    /// Every routed invocation served, for the residency references
+    /// (`ExpertCache::hit_references`).
+    trace: Arc<Mutex<RoutingTrace>>,
+    /// The router look-ahead's votes (`votes`), and per row and hop the latest
+    /// prediction they made for it, which the row's routing judges.
+    votes: Arc<VoteRing>,
+    voted: Vec<[Option<Vec<usize>>; HOPS]>,
     /// Timing accumulator for pipeline spans.
     pub(crate) profile: ProfileAccumulator,
     /// Shared telemetry counters (always-on).
@@ -322,28 +351,42 @@ impl PipelineState {
         clock: Arc<ReclaimClock>,
         ring: Arc<SummaryRing>,
         abort: Arc<AbortWord>,
+        fault: Arc<FaultWord>,
         pass_state: Arc<Mutex<PassState>>,
         routed_served: Arc<AtomicU64>,
         stager: mpsc::Sender<StagerMsg>,
+        landed_ahead: mpsc::Receiver<(usize, usize)>,
         layer_geometries: Arc<Vec<LayerGeometry>>,
         all_resident: bool,
         promo_ring: Option<Arc<PromotionRing>>,
+        link_rate: f64,
         stats: Arc<Mutex<PipelineStats>>,
+        trace: Arc<Mutex<RoutingTrace>>,
+        votes: Arc<VoteRing>,
     ) -> Result<Self> {
         let num_moe_layers = layer_geometries.len();
         let experts = inner.experts_per_layer;
         let ring_cap = promo_ring.as_ref().map_or(0, |r| r.cap());
-        let copier = Copier::spawn(copy_stream.clone())?;
+        let image_bytes = layer_geometries
+            .iter()
+            .map(|g| slot_offsets(g).3)
+            .max()
+            .unwrap_or(0);
+        if let Some(ring) = &promo_ring {
+            ring.set_depth(READ_AHEAD_DEPTH);
+        }
+        if let Ok(mut s) = stats.lock() {
+            s.prefetch_depth = READ_AHEAD_DEPTH as usize;
+        }
         Ok(Self {
             inner,
             device,
             copy_stream,
-            copier,
-            next_copy: 0,
             residency,
             clock,
             ring,
             abort,
+            fault,
             pass_state,
             pass: None,
             routed_served,
@@ -353,7 +396,6 @@ impl PipelineState {
             all_resident,
             transition_matrix: TransitionMatrix::new(num_moe_layers, experts),
             speculative_loads: HashSet::new(),
-            promotions: Vec::new(),
             promoting: HashSet::new(),
             promo_ring,
             ring_slots: vec![None; ring_cap],
@@ -362,13 +404,17 @@ impl PipelineState {
             ring_taken: 0,
             device_promotions: Vec::new(),
             ring_target: RING_TARGET.min(ring_cap / 2),
-            retired: RetireList::new(),
-            prefetch_depth: 1,
-            pass_started: None,
-            pass_dma_bytes: 0,
-            pass_late: 0,
-            pass_pred: (0, 0),
-            bw_ceiling_gbps: 0.0,
+            link_rate,
+            image_bytes,
+            layer_intervals: Vec::new(),
+            last_summary: None,
+            window: 0,
+            ahead_pins: AheadPins::new(num_moe_layers),
+            predicted: vec![Vec::new(); num_moe_layers],
+            landed_ahead,
+            trace,
+            votes,
+            voted: vec![Default::default(); num_moe_layers],
             profile: ProfileAccumulator::new(),
             stats,
         })
@@ -390,32 +436,47 @@ impl PipelineState {
         if self.pass != Some(msg.pass) {
             if self.pass.is_some() {
                 self.transition_matrix.reset_pass();
-                self.adapt_prefetch_depth();
+                self.set_read_ahead_window();
             }
             self.pass = Some(msg.pass);
-        }
-        if self.pass_started.is_none() {
-            self.pass_started = Some(std::time::Instant::now());
+            self.last_summary = None;
         }
 
         // ── The routing summary ──
         let t = profile_now();
-        self.ring.wait(msg.slot, msg.summary_word)?;
+        // While it waits, land what the GPU has finished promoting, so the
+        // residency this thread ranks victims and predictions on is current,
+        // and list what the stager has staged ahead while a launch can still
+        // read the listing.
+        self.list_landed()?;
+        let ring = self.ring.clone();
+        ring.wait(msg.slot, msg.summary_word, || {
+            self.land_device_promotions(false)?;
+            self.list_landed()
+        })?;
+        let arrived = Instant::now();
+        if let Some((at, prev)) = self.last_summary {
+            if row == prev + 1 {
+                self.layer_intervals
+                    .push(arrived.duration_since(at).as_secs_f64());
+            }
+        }
+        self.last_summary = Some((arrived, row));
         self.clock.observe(msg.ticket);
         let lag = self.clock.latest_started().saturating_sub(msg.ticket);
         self.profile.record("pipe_routed_wait", t);
         // SAFETY: `wait` returned for this invocation, and the forward thread
-        // does not rewrite the slot until `routed_served` passes this ticket.
+        // does not rewrite the slot — or its vote slot — until `routed_served`
+        // passes this ticket.
         let summary: Vec<u32> = unsafe { self.ring.read(msg.slot) }.to_vec();
+        let votes =
+            (msg.voted_hops > 0).then(|| unsafe { self.votes.read(msg.slot, msg.voted_hops) });
         self.routed_served.store(msg.ticket, Ordering::Release);
 
         let t = profile_now();
         self.collect_device_promotions(msg.ticket)?;
-        for slot in self.retired.drain(&self.clock) {
-            self.inner.put_free(slot);
-        }
-        self.poll_promotions()?;
         self.land_device_promotions(false)?;
+        self.release_ahead_pins(false)?;
 
         let mut expert_ids: Vec<usize> = Vec::new();
         let mut decode: HashSet<usize> = HashSet::new();
@@ -431,8 +492,16 @@ impl PipelineState {
             pinned += usize::from(w & SUMMARY_PINNED != 0);
             cold += usize::from(w & SUMMARY_COLD != 0);
         }
+        if let Ok(mut t) = self.trace.lock() {
+            let routed: Vec<(usize, u32, bool)> = expert_ids
+                .iter()
+                .map(|&e| (e, summary[e] & SUMMARY_COUNT, decode.contains(&e)))
+                .collect();
+            t.push(row, &routed, row < self.inner.pinned_layers);
+        }
 
-        // ── Prediction precision, and late speculative promotions ──
+        // ── Read-ahead precision: of the experts read ahead for this row, the
+        // ones it routed ──
         let spec_for_layer: Vec<usize> = self
             .speculative_loads
             .iter()
@@ -444,8 +513,6 @@ impl PipelineState {
                 .iter()
                 .filter(|e| expert_ids.binary_search(e).is_ok())
                 .count();
-            self.pass_pred.0 += hits;
-            self.pass_pred.1 += spec_for_layer.len();
             if let Ok(mut s) = self.stats.lock() {
                 s.predicted_total += spec_for_layer.len();
                 s.predicted_hits += hits;
@@ -457,15 +524,30 @@ impl PipelineState {
             }
         }
         self.speculative_loads.retain(|&(l, _)| l != row);
-        let late = self.promotions.iter().filter(|p| p.row == row).count();
-        if late > 0 {
-            self.pass_late += late;
+
+        // ── The router look-ahead's latest predictions for this row, judged ──
+        for hop in 1..=HOPS {
+            let Some(predicted) = self.voted[row][hop - 1].take() else {
+                continue;
+            };
+            let hits = predicted
+                .iter()
+                .filter(|e| expert_ids.binary_search(e).is_ok())
+                .count();
             if let Ok(mut s) = self.stats.lock() {
-                s.late_loads += late;
+                s.lookahead_judged[hop - 1] += predicted.len();
+                s.lookahead_hits[hop - 1] += hits;
             }
         }
 
-        self.transition_matrix.observe(row, &expert_ids);
+        // The predictor learns from decode routing alone: a prompt launch
+        // routes most of the row, so its transitions are near-uniform and
+        // would wash out the sharper statistics decode's steps carry.
+        if !msg.prefill_width {
+            let mut decode_ids: Vec<usize> = decode.iter().copied().collect();
+            decode_ids.sort_unstable();
+            self.transition_matrix.observe(row, &decode_ids);
+        }
 
         // ── Hits and misses, by this thread's own bookkeeping ──
         let mut hits = 0usize;
@@ -549,6 +631,7 @@ impl PipelineState {
                     ahead(expert_ids.len()),
                     prompt_room,
                     empty_slots,
+                    self.window as usize,
                     ring.cap(),
                 );
                 self.ring_target = stock.target;
@@ -562,34 +645,30 @@ impl PipelineState {
             self.refill_ring(row)?;
             self.profile.record("pipe_ring", t);
 
-            // ── Speculation, only where the link has room for it ──
+            // ── Predictions for read-ahead, only where the link has room ──
             // A prefill-width launch's misses are pulled by enough workers to
-            // saturate the link, so a speculative copy for the next row takes
-            // bandwidth from them and saves nothing: either it lands late and the
-            // workers have pulled the same bytes, or it lands in time and they
-            // would have pulled them at the same cost. Measured on
-            // Qwen3.8-Flash-Next ×16 prefill (RTX 3090, a working set 3× the
-            // zone): 40,823 copy-engine promotions, 52.6 GiB, nearly every one
-            // late — prefill 845 t/s with them, 1,075 without. A decode-width
-            // launch leaves the link mostly idle, and there the look-ahead pays:
-            // ×16 decode 237 t/s with it, 220 without.
+            // saturate the link, so reading ahead for it takes bandwidth from
+            // them and saves nothing — its launches' own misses use up their
+            // window anyway (`read_ahead`). Measured with copy-engine prefetch
+            // on Qwen3.8-Flash-Next ×16 prefill (RTX 3090, a working set 3× the
+            // zone): 40,823 promotions, 52.6 GiB, nearly every one late —
+            // prefill 845 t/s with them, 1,075 without. A decode-width launch
+            // leaves the link mostly idle, and there reading ahead pays: ×16
+            // decode 237 t/s with it, 220 without.
             //
             // A narrower launch that routes prompt-only experts — any expert
-            // no decode-scored row routed — speculates only without room
-            // (`PROMPT_ROOM`); one whose experts are all decode's speculates as
-            // a decode launch does. With room the ring already promotes the
-            // prompt's misses and a speculative copy only competes with them:
+            // no decode-scored row routed — predicts only without room
+            // (`PROMPT_ROOM`); one whose experts are all decode's predicts as a
+            // decode launch does. With room the ring already promotes the
+            // prompt's misses and reading ahead only competes with them:
             // Qwen3.6-35B-A3B's one-sequence prompts ran 4–9% slower with it.
             // Without room, it is the one way a prompt's experts reach VRAM
             // ahead of the workers: Qwen3.8-Flash-Next's warm one-sequence
             // prompt ran 4% faster with it.
             let t = profile_now();
             if !msg.prefill_width && (decode.len() == expert_ids.len() || !prompt_room) {
-                if expert_ids.len() * 2 >= self.inner.experts_per_layer.max(1) {
-                    self.lookahead(row)?;
-                } else {
-                    self.speculative_prefetch(row, &expert_ids)?;
-                }
+                let wide = expert_ids.len() * 2 >= self.inner.experts_per_layer.max(1);
+                self.predict_rows(row, &expert_ids, votes.as_deref(), wide)?;
             }
             self.profile.record("pipe_prefetch", t);
         }
@@ -604,123 +683,22 @@ impl PipelineState {
         Ok(())
     }
 
-    /// Land every promotion whose copy has completed: build the slot's views,
-    /// install it, and point the expert's entry at VRAM.
-    /// The copier reports completions; this thread makes no driver call for it.
-    pub(crate) fn poll_promotions(&mut self) -> Result<()> {
-        for id in self.copier.completed()? {
-            let Some(i) = self.promotions.iter().position(|p| p.id == id) else {
-                candle::bail!("expert copier completed copy {id}, which was never submitted");
-            };
-            let p = self.promotions.swap_remove(i);
-            self.land(p)?;
-        }
-        Ok(())
-    }
-
-    fn land(&mut self, p: Promotion) -> Result<()> {
-        let Device::Cuda(cd) = &self.device else {
-            candle::bail!("expert promotion requires a CUDA device");
-        };
-        if p.from_pad {
-            self.residency()?.pin_pad(p.row, p.expert, -1);
-        }
-        self.promoting.remove(&(p.row, p.expert));
-        // The GPU promoted it first: nothing ever named this slot.
-        if self
-            .inner
-            .key_to_slot
-            .get(&(p.row, p.expert))
-            .is_some_and(|&s| self.inner.slots[s].is_some())
-        {
-            self.inner.put_free(p.slot);
-            return Ok(());
-        }
-        let base = self.inner.slot_base(p.slot);
-        // SAFETY: the copy that filled the slot has completed.
-        let view = unsafe { build_slot_view(&self.layer_geometries[p.row], cd, base)? };
-        self.inner.install(p.slot, p.row, p.expert, view);
-        self.residency()?
-            .set_vram(p.row, p.expert, Some((p.slot, base)));
-        self.speculative_loads.insert((p.row, p.expert));
-        if let Ok(mut s) = self.stats.lock() {
-            s.promotions += 1;
-            s.promotion_bytes += p.bytes;
-            s.prefetch_promotions += 1;
-        }
-        Ok(())
-    }
-
-    /// Up to `n` VRAM slots no kernel can be reading, for a speculative
-    /// promotion: free ones first, then the best victims (ranked against
-    /// `row`, the row the wave is at) from quiet rows in the window behind the
-    /// wave. A row with no invocation in flight may have its entry go to 0
-    /// (`reclaim`); a victim whose old readers may still run goes on the retire
-    /// list and is reused once they are done. A slot standing in the promotion
-    /// ring is the ring's, and never taken here.
-    fn take_slots(&mut self, row: usize, n: usize) -> Result<Vec<usize>> {
-        let mut out = Vec::with_capacity(n);
-        while out.len() < n {
-            match self.inner.take_free() {
-                Some(s) => out.push(s),
-                None => break,
-            }
-        }
-        if out.len() == n {
-            return Ok(out);
-        }
-        let quiet: Vec<bool> = (0..self.num_moe_layers)
-            .map(|r| self.clock.quiet(r))
-            .collect();
-        // A row with an invocation enqueued is held back: the wave is about to
-        // read its experts, so evicting one buys a miss within the pass. The
-        // started-word key leaves every row ahead of the GPU quiet, so with the
-        // forward recorded ahead of it nothing else keeps them out: on
-        // Qwen3.6-35B-A3B (RTX 3090) a prompt's misses doubled and prefill fell
-        // up to 24%.
-        let upcoming: Vec<bool> = (0..self.num_moe_layers)
-            .map(|r| self.clock.upcoming(r))
-            .collect();
-        let offered = &self.offered;
-        let victims = self
-            .inner
-            .rank_victims(row, n - out.len(), true, |slot, layer| {
-                quiet[layer] && !upcoming[layer] && !offered.contains(&slot)
-            });
-        let mut evicted = 0usize;
-        for victim in victims {
-            let Some((vr, ve)) = self.inner.evict(victim) else {
-                out.push(victim);
-                continue;
-            };
-            self.residency()?.set_vram(vr, ve, None);
-            evicted += 1;
-            let key = self.clock.retire_key(vr);
-            if self.clock.reclaimable(key) {
-                out.push(victim);
-            } else {
-                self.retired.push(key, victim);
-            }
-        }
-        if let Ok(mut s) = self.stats.lock() {
-            s.evictions += evicted;
-        }
-        Ok(out)
-    }
-
     /// Collect what the GPU has taken from the promotion ring, in log order.
     /// A skipped victim's offer comes back with its expert still resident. A
     /// claimed victim was evicted by the device — its entries retargeted before
     /// its slot was written — so its bookkeeping follows at once, ahead of any
     /// later claim that could promote the same expert again. Each claimed slot
-    /// becomes a device promotion, whole once its invocation is done. `near`
-    /// is the ticket being served — the logged words are resolved against it.
+    /// becomes a device promotion, whole once its invocation is done; a
+    /// read-ahead claim's expert is already published by the device, and its
+    /// row's routing will judge the prediction. `near` is the ticket being
+    /// served — the logged words are resolved against it.
     fn collect_device_promotions(&mut self, near: u64) -> Result<()> {
         let Some(ring) = self.promo_ring.clone() else {
             return Ok(());
         };
         let head = ring.head();
         let (mut taken, mut claimed, mut skipped) = (0usize, 0usize, 0usize);
+        let (mut ahead, mut ahead_bytes, mut ahead_pad) = (0usize, 0usize, 0usize);
         while self.ring_taken != head {
             let i = self.ring_taken as usize % ring.cap();
             let logged = ring.log(self.ring_taken);
@@ -751,12 +729,20 @@ impl PipelineState {
                 claimed += 1;
             }
             taken += 1;
+            if logged.ahead {
+                ahead += 1;
+                ahead_bytes += slot_offsets(&self.layer_geometries[logged.row]).3;
+                // Listed from the pad: its pin holds until this lands.
+                ahead_pad += usize::from(self.ahead_pins.lists(logged.row, logged.expert));
+                self.speculative_loads.insert((logged.row, logged.expert));
+            }
             self.promoting.insert((logged.row, logged.expert));
             self.device_promotions.push(DevicePromotion {
                 row: logged.row,
                 expert: logged.expert,
                 slot: offer.slot,
                 ticket: ticket_from_word(logged.word, near),
+                ahead: logged.ahead,
             });
         }
         if let Ok(mut s) = self.stats.lock() {
@@ -764,6 +750,9 @@ impl PipelineState {
             s.victims_claimed += claimed;
             s.victims_skipped += skipped;
             s.evictions += claimed;
+            s.ahead_claims += ahead;
+            s.ahead_bytes += ahead_bytes;
+            s.ahead_pad_claims += ahead_pad;
         }
         Ok(())
     }
@@ -810,19 +799,18 @@ impl PipelineState {
                 && keys[slot].is_some_and(|(r, e)| !promoting.contains(&(r, e)))
         };
         let ask = 2 * n;
-        let mut slots = self
-            .inner
-            .rank_victims(row, ask, false, |slot, layer| !upcoming[layer] && candidate(slot));
+        let mut slots = self.inner.rank_victims(row, ask, false, |slot, layer| {
+            !upcoming[layer] && candidate(slot)
+        });
         if slots.len() < ask {
-            let more = self.inner.rank_victims(row, ask - slots.len(), false, |slot, layer| {
-                upcoming[layer] && candidate(slot)
-            });
+            let more = self
+                .inner
+                .rank_victims(row, ask - slots.len(), false, |slot, layer| {
+                    upcoming[layer] && candidate(slot)
+                });
             slots.extend(more);
         }
-        let pad_cap = self
-            .stats
-            .lock()
-            .map_or(0, |s| s.pad_slots / PAD_PIN_SHARE);
+        let pad_cap = self.stats.lock().map_or(0, |s| s.pad_slots / PAD_PIN_SHARE);
         let mut pinned = self.pad_pinned_offers;
         let mut chosen = Vec::with_capacity(n);
         let mut places = self
@@ -884,8 +872,9 @@ impl PipelineState {
         let mut i = 0;
         let mut landed = 0usize;
         while i < self.device_promotions.len() {
-            let ticket = self.device_promotions[i].ticket;
-            if !(idle || self.clock.reclaimable(ticket)) {
+            let p = &self.device_promotions[i];
+            let complete = idle || self.clock.reclaimable(p.ticket);
+            if !lands(complete, p.ahead, || self.fault.is_set()) {
                 i += 1;
                 continue;
             }
@@ -894,8 +883,8 @@ impl PipelineState {
             if let Some(ring) = &self.promo_ring {
                 ring.clear_mark(p.row, p.expert);
             }
-            // Promoted twice — by the GPU on two invocations, or by the copy
-            // engine as well: nothing ever named this slot, so it is free.
+            // Promoted twice — by the GPU on two invocations: nothing ever
+            // named this slot, so it is free.
             if self
                 .inner
                 .key_to_slot
@@ -1010,92 +999,163 @@ impl PipelineState {
         Ok(())
     }
 
+    /// A forward faulted (`fault`) and the device has been synchronized: its
+    /// workers gave demand items up, and a given-up item's promotion slot was
+    /// never written. Collect what the device took, and drop every demand
+    /// promotion still to land — its slot back to the zone, its mark cleared —
+    /// instead of installing bytes that were never copied. Every demand claim
+    /// made since the fault is still pending (`land_device_promotions` holds
+    /// them while the word is set). Read-ahead claims stay: they never wait on
+    /// a cold expert, and the device has published them. `near` is the ticket
+    /// last served.
+    pub(crate) fn drop_demand_promotions(&mut self, near: u64) -> Result<()> {
+        self.collect_device_promotions(near)?;
+        self.drop_pending_demand();
+        Ok(())
+    }
+
+    /// Drop every demand promotion still to land — its slot back to the zone,
+    /// its mark cleared — keeping the read-ahead claims.
+    fn drop_pending_demand(&mut self) {
+        let (ahead, demand) = split_ahead(std::mem::take(&mut self.device_promotions));
+        self.device_promotions = ahead;
+        for p in demand {
+            self.promoting.remove(&(p.row, p.expert));
+            if let Some(ring) = &self.promo_ring {
+                ring.clear_mark(p.row, p.expert);
+            }
+            self.inner.put_free(p.slot);
+        }
+    }
+
     /// Take every offer out of the promotion ring — before a boundary move,
     /// with the device synchronized: land what the GPU filled, take back what
-    /// it never took.
+    /// it never took, and release the pad pins read-ahead's old listings still
+    /// held, whose readers are all done. With a fault not yet taken, its demand
+    /// promotions are dropped here rather than left pending: the move may
+    /// retract the zone below their slots.
     pub(crate) fn drain_ring(&mut self, near: u64) -> Result<()> {
         let Some(ring) = self.promo_ring.clone() else {
             return Ok(());
         };
         self.collect_device_promotions(near)?;
+        if self.fault.is_set() {
+            self.drop_pending_demand();
+        }
         self.land_device_promotions(true)?;
         ring.withdraw();
-        let untaken: Vec<Offer> = self.ring_slots.iter_mut().filter_map(Option::take).collect();
+        let untaken: Vec<Offer> = self
+            .ring_slots
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect();
         for offer in untaken {
             self.take_back(offer)?;
         }
         self.ring_taken = ring.head();
+        self.release_ahead_pins(true)
+    }
+
+    /// `experts` predicted for row `row`, best first — the row's latest
+    /// prediction, which its listing is vetted from now (`list_row`) and again
+    /// as the stager lands what it stages ahead for it (`list_landed`).
+    fn predict_ahead(&mut self, row: usize, experts: &[usize]) -> Result<()> {
+        if row < self.inner.pinned_layers {
+            return Ok(());
+        }
+        self.predicted[row] = experts.to_vec();
+        self.list_row(row, true)?;
         Ok(())
     }
 
-    /// Prefetch `experts` of `row`, predicted ahead of it, into VRAM by the copy
-    /// engine — those with a pinned copy; the cold ones go to the stager to
-    /// stage ahead. Victims only from behind the wave (`take_slots`).
-    /// `issue_row` is the row the wave is at — what victims are ranked against.
-    fn promote(&mut self, issue_row: usize, row: usize, experts: &[usize]) -> Result<usize> {
-        let Device::Cuda(_) = &self.device else {
-            return Ok(0);
+    /// Whether a launch that reads `row`'s listing has yet to begin
+    /// (`read_ahead::listing_readable`): the served row is the last whose
+    /// summary this thread read, and the served ticket is where the forward
+    /// thread's ring hold stands — the previous pass's last between passes.
+    fn listing_readable(&self, row: usize) -> bool {
+        let served_row = self.last_summary.map(|(_, r)| r);
+        let served_ticket = self.routed_served.load(Ordering::Acquire);
+        listing_readable(row, served_row, served_ticket, |r| self.clock.begun(r))
+    }
+
+    /// Write `row`'s read-ahead listing from its latest prediction: the
+    /// predicted experts not in VRAM and not being promoted that have a pinned
+    /// copy, each with its slot image as the vetted source, replacing the last
+    /// listing — only while a launch that reads it has yet to begin
+    /// (`listing_readable`), since a launch at `r` reads the lists of `r + 2`
+    /// on. A warm copy is listed as it is; a pad copy only with its slot
+    /// pinned for the listing (`ahead_pins`), since the stager may otherwise
+    /// reuse it under another row's launch. With `stage`, the cold ones (no
+    /// device-readable copy) go to the stager to stage into the pad, whether
+    /// or not the row is listed now — staged in time for its own workers at the
+    /// least, and listed from the pad as each lands (`list_landed`). Returns
+    /// the experts listed.
+    fn list_row(&mut self, row: usize, stage: bool) -> Result<Vec<usize>> {
+        let Some(ring) = self.promo_ring.clone() else {
+            return Ok(Vec::new());
         };
-        if row < self.inner.pinned_layers {
-            return Ok(0);
+        let readable = self.listing_readable(row);
+        if !readable && !stage {
+            return Ok(Vec::new());
         }
-        let bytes = slot_offsets(&self.layer_geometries[row]).3;
-        let mut to_stage: Vec<usize> = Vec::new();
-        let mut sources: Vec<(usize, u64, bool)> = Vec::new();
-        for &e in experts {
-            if self.promoting.contains(&(row, e))
-                || self
+        let cap = self
+            .stats
+            .lock()
+            .map_or(0, |s| s.pad_slots / AHEAD_PIN_SHARE);
+        let mut to_stage = Vec::new();
+        let mut planned = None;
+        {
+            let mut places = self
+                .residency
+                .lock()
+                .map_err(|_| candle::Error::Msg("expert pipeline: residency poisoned".into()))?;
+            let predicted = &self.predicted[row];
+            let mut candidates = Vec::with_capacity(predicted.len().min(AHEAD_CAP));
+            for &e in predicted {
+                let resident = self
                     .inner
                     .key_to_slot
                     .get(&(row, e))
-                    .is_some_and(|&s| self.inner.slots[s].is_some())
-            {
-                continue;
+                    .is_some_and(|&s| self.inner.slots[s].is_some());
+                if resident || self.promoting.contains(&(row, e)) {
+                    continue;
+                }
+                let p = places.place(row, e);
+                if p.entry() == 0 {
+                    if stage {
+                        to_stage.push(e);
+                    }
+                } else if p.vram.is_none() && candidates.len() < AHEAD_CAP {
+                    candidates.push(Candidate {
+                        expert: e,
+                        image: p.entry(),
+                        pad: p.pad.is_some(),
+                    });
+                }
             }
-            match self.residency()?.place(row, e).pinned_source() {
-                Some((src, from_pad)) => sources.push((e, src, from_pad)),
-                None => to_stage.push(e),
+            if readable {
+                // Pinned under the residency lock the candidates were read
+                // under, so each pad slot listed is the one its entry names.
+                let plan = self.ahead_pins.plan(row, &candidates, cap);
+                for &e in &plan.pin {
+                    places.pin_pad(row, e, 1);
+                }
+                planned = Some(plan.listing);
             }
         }
-        let slots = self.take_slots(issue_row, sources.len())?;
-        let mut issued = 0usize;
-        for ((e, src, from_pad), slot) in sources.into_iter().zip(slots) {
-            let dst = self.inner.slot_base(slot);
-            if from_pad {
-                self.residency()?.pin_pad(row, e, 1);
+        let mut listed = Vec::new();
+        if let Some(listing) = planned {
+            ring.predict(row, &listing);
+            self.ahead_pins.commit(self.clock.readers_key());
+            if let Ok(mut s) = self.stats.lock() {
+                s.ahead_pinned = self.ahead_pins.held();
             }
-            // `src` is a pinned slot image of at least `bytes`, kept unwritten
-            // until the copy lands (a warm slot is immutable; a pad slot is
-            // pinned against eviction above); `dst` is a slot the zone handed
-            // out with no reader left (`take_slots`), named by no entry until
-            // the copy is reported complete.
-            let id = self.next_copy;
-            self.next_copy += 1;
-            if let Err(err) = self.copier.submit(CopyJob {
-                id,
-                dst,
-                src,
-                bytes,
-            }) {
-                if from_pad {
-                    self.residency()?.pin_pad(row, e, -1);
-                }
-                self.inner.put_free(slot);
-                return Err(err);
-            }
-            self.promotions.push(Promotion {
-                id,
-                row,
-                expert: e,
-                slot,
-                bytes,
-                from_pad,
-            });
-            self.promoting.insert((row, e));
-            self.pass_dma_bytes += bytes;
-            issued += 1;
+            listed = listing.into_iter().map(|(e, _)| e).collect();
         }
         if !to_stage.is_empty() {
+            if let Ok(mut s) = self.stats.lock() {
+                s.stage_requests += to_stage.len();
+            }
             // A closed channel means the stager is gone; its guard has raised
             // the abort word, which the next routed layer reports.
             let _ = self.stager.send(StagerMsg::Stage {
@@ -1103,95 +1163,164 @@ impl PipelineState {
                 experts: to_stage,
             });
         }
-        Ok(issued)
+        Ok(listed)
     }
 
-    /// A decode-width launch that routed most of the row's experts (many
-    /// sequences decoding together): the next row will too, so promote its scored
-    /// experts, highest first — nothing to predict.
-    fn lookahead(&mut self, row: usize) -> Result<()> {
-        let target = row + 1;
-        if target >= self.num_moe_layers || target < self.inner.pinned_layers {
+    /// The experts the stager has staged ahead since this was last called,
+    /// each now in the pad: every row among them whose latest prediction still
+    /// names the expert, and that a launch has yet to read, is listed again —
+    /// from that prediction, so now with the staged expert from the pad.
+    fn list_landed(&mut self) -> Result<()> {
+        let mut landed: Vec<(usize, usize)> = Vec::new();
+        while let Ok(l) = self.landed_ahead.try_recv() {
+            landed.push(l);
+        }
+        if landed.is_empty() {
             return Ok(());
         }
-        let mut cands: Vec<(usize, f32)> = (0..self.inner.experts_per_layer)
-            .filter(|&e| !self.inner.key_to_slot.contains_key(&(target, e)))
-            .filter_map(|e| {
-                let s = self.inner.score(target, e);
-                (s > 0.0).then_some((e, s))
-            })
-            .collect();
-        cands.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        cands.truncate(LOOKAHEAD_MAX);
-        let experts: Vec<usize> = cands.into_iter().map(|(e, _)| e).collect();
-        self.promote(row, target, &experts)?;
+        let mut rows: Vec<usize> = landed.iter().map(|&(r, _)| r).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        let mut listed = 0usize;
+        for row in rows {
+            let staged: Vec<usize> = landed
+                .iter()
+                .filter(|&&(r, e)| r == row && self.predicted[row].contains(&e))
+                .map(|&(_, e)| e)
+                .collect();
+            if staged.is_empty() {
+                continue;
+            }
+            let now = self.list_row(row, false)?;
+            listed += staged.iter().filter(|e| now.contains(e)).count();
+        }
+        if listed > 0 {
+            if let Ok(mut s) = self.stats.lock() {
+                s.staged_listed += listed;
+            }
+        }
         Ok(())
     }
 
-    /// Speculatively promote the experts the next `prefetch_depth` MoE layers
-    /// will need, one confidence-gated hop at a time.
+    /// Release the pad pins read-ahead's listings dropped once every
+    /// invocation that could have read them has finished — all of them when
+    /// `idle` (the device has been synchronized).
+    fn release_ahead_pins(&mut self, idle: bool) -> Result<()> {
+        let clock = &self.clock;
+        let due = self.ahead_pins.due(|key| idle || clock.reclaimable(key));
+        if !due.is_empty() {
+            let mut places = self.residency()?;
+            for (row, e) in due {
+                places.pin_pad(row, e, -1);
+            }
+            drop(places);
+            if let Ok(mut s) = self.stats.lock() {
+                s.ahead_pinned = self.ahead_pins.held();
+            }
+        }
+        Ok(())
+    }
+
+    /// `row`'s experts not in VRAM that decode routed recently — a score of at
+    /// least `min` (`RECENT_MIN_SCORE`: within the last few steps) — highest
+    /// first, at most `cap`: what the zone let go of and the next step is
+    /// likely to want back.
+    fn scored_absent(&self, row: usize, min: f32, cap: usize) -> Vec<usize> {
+        let mut cands: Vec<(usize, f32)> = (0..self.inner.experts_per_layer)
+            .filter(|&e| !self.inner.key_to_slot.contains_key(&(row, e)))
+            .filter_map(|e| {
+                let s = self.inner.score(row, e);
+                (s >= min).then_some((e, s))
+            })
+            .collect();
+        cands.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(CmpOrdering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        cands.truncate(cap);
+        cands.into_iter().map(|(e, _)| e).collect()
+    }
+
+    /// Predict the experts the next rows will need, out to the last row a
+    /// launch reads ahead for, each hop's candidates in order of evidence up
+    /// to the hop's cap:
     ///
-    /// Prediction stays ADJACENT — each hop asks the shared transition matrix
-    /// to predict `target` from the previous hop's set — so precision compounds
-    /// per hop and the chain stops at the first hop with no confident
-    /// prediction. Mispredictions cost slots and bandwidth, never correctness.
-    fn speculative_prefetch(&mut self, row: usize, current: &[usize]) -> Result<()> {
-        let depth = if current.len() <= PREFETCH_MULTI_HOP_MAX_SOURCES {
-            self.prefetch_depth
-        } else {
-            1
-        };
-        let mut source: Vec<usize> = current.to_vec();
-        for hop in 1..=depth {
+    /// 1. the router look-ahead's votes (`votes`) — that row's own router
+    ///    applied to this layer's input, most-voted first;
+    /// 2. for a narrow launch, the Markov table from this row's routing to the
+    ///    hop's arrivals (`transition`) — a launch routing most of the row
+    ///    (`wide`) leaves it nothing specific to imply;
+    /// 3. the target row's experts the zone let go of that decode routed
+    ///    recently (`scored_absent`) — any scored one for a wide launch, which
+    ///    will route most of that row too.
+    ///
+    /// A wrong prediction costs a pad slot or a ring offer and the link time
+    /// its window allowed, never correctness.
+    fn predict_rows(
+        &mut self,
+        row: usize,
+        current: &[usize],
+        votes: Option<&[u32]>,
+        wide: bool,
+    ) -> Result<()> {
+        let width = self.inner.experts_per_layer;
+        let voted_hops = votes.map_or(0, |v| v.len() / width.max(1));
+        for hop in 1..=HOPS {
             let target = row + hop;
             if target >= self.num_moe_layers {
                 break;
             }
-            let predicted = self.transition_matrix.predict_prefetch(target - 1, &source);
+            let cap = prediction_cap(hop);
+            let mut predicted = Vec::with_capacity(cap);
+            let push = |e: usize, predicted: &mut Vec<usize>| {
+                if predicted.len() < cap && !predicted.contains(&e) {
+                    predicted.push(e);
+                }
+            };
+            if let Some(v) = votes.filter(|_| hop <= voted_hops) {
+                let by_votes = ranked(v, width, hop, cap);
+                self.voted[target][hop - 1] = Some(by_votes.clone());
+                by_votes.into_iter().for_each(|e| push(e, &mut predicted));
+            }
+            if !wide {
+                for e in self.transition_matrix.predict_hop(row, hop, current, cap) {
+                    push(e, &mut predicted);
+                }
+            }
+            let min = if wide {
+                f32::MIN_POSITIVE
+            } else {
+                RECENT_MIN_SCORE
+            };
+            for e in self.scored_absent(target, min, cap) {
+                push(e, &mut predicted);
+            }
             if predicted.is_empty() {
-                break;
+                continue;
             }
-            // A pinned layer's experts are all resident; the prediction still
-            // chains through it.
-            if target >= self.inner.pinned_layers {
-                self.promote(row, target, &predicted)?;
-            }
-            source = predicted;
+            // A pinned layer's experts are all resident; `predict_ahead`
+            // passes it over.
+            self.predict_ahead(target, &predicted)?;
         }
         Ok(())
     }
 
-    /// Adapt the load-ahead depth `N` at a pass boundary, from the pass that
-    /// just finished: deepen when promotions were late and the link had slack,
-    /// shallow when nothing was late and precision fell below the floor.
-    fn adapt_prefetch_depth(&mut self) {
-        let elapsed = self.pass_started.take().map(|t| t.elapsed().as_secs_f32());
-        let late = self.pass_late;
-        let bytes = self.pass_dma_bytes;
-        let (pred_hits, pred_total) = self.pass_pred;
-        self.pass_late = 0;
-        self.pass_dma_bytes = 0;
-        self.pass_pred = (0, 0);
-
-        let Some(dt) = elapsed else { return };
-        if dt <= 0.0 {
+    /// Size read-ahead's window from the pass just finished: the median
+    /// interval between its consecutive rows' summaries, at the link's measured
+    /// rate (`read_ahead`). A pass with no such interval leaves the window as
+    /// it was.
+    fn set_read_ahead_window(&mut self) {
+        let Some(layer_secs) = median(&mut self.layer_intervals) else {
             return;
-        }
-        let achieved_gbps = bytes as f32 / dt / 1e9;
-        if achieved_gbps > self.bw_ceiling_gbps {
-            self.bw_ceiling_gbps = achieved_gbps;
-        }
-        let slack = achieved_gbps < PREFETCH_BW_SLACK * self.bw_ceiling_gbps;
-        if late >= PREFETCH_LATE_FLOOR && slack {
-            self.prefetch_depth = (self.prefetch_depth + 1).min(PREFETCH_DEPTH_MAX);
-        } else if late == 0
-            && pred_total > 0
-            && (pred_hits as f32) < PREFETCH_PRECISION_FLOOR * pred_total as f32
-        {
-            self.prefetch_depth = self.prefetch_depth.saturating_sub(1).max(1);
+        };
+        self.layer_intervals.clear();
+        self.window = read_ahead_window(self.link_rate, layer_secs, self.image_bytes, AHEAD_MAX);
+        if let Some(ring) = &self.promo_ring {
+            ring.set_window(self.window);
         }
         if let Ok(mut s) = self.stats.lock() {
-            s.prefetch_depth = self.prefetch_depth;
+            s.ahead_window = self.window as usize;
         }
     }
 
@@ -1214,27 +1343,6 @@ impl PipelineState {
         }
     }
 
-    /// Return every retired slot to the zone — before a boundary move, with the
-    /// device synchronized. A retired slot waits on a ticket the host has not
-    /// yet observed; once the device is idle its readers are done whatever was
-    /// observed, and a slot left on the list past a retraction names ground the
-    /// per-slot tables no longer cover.
-    pub(crate) fn release_retired(&mut self) {
-        for slot in self.retired.drain_all() {
-            self.inner.put_free(slot);
-        }
-    }
-
-    /// Wait out every promotion copy and land it — before a boundary move,
-    /// which relocates and drops slots, and issues its relocations on the
-    /// copy stream after the copier has nothing left to issue.
-    pub(crate) fn finish_promotions(&mut self) -> Result<()> {
-        self.copier.flush()?;
-        self.poll_promotions()?;
-        debug_assert!(self.promotions.is_empty());
-        Ok(())
-    }
-
     /// Make the device's CUDA context current on the calling thread — the
     /// pipeline thread, at start.
     fn bind_device_to_thread(&self) -> Result<()> {
@@ -1255,7 +1363,7 @@ impl PipelineState {
 /// Marks the thread dead and raises the abort word when dropped — including on
 /// unwind. Nothing the GPU waits on comes from this thread, but a dead pipeline
 /// means the cache's state can no longer be trusted, so every waiting worker
-/// traps and the next synchronizing call reports it.
+/// gives its expert up and the forward fails (`fault`).
 struct DeadFlagGuard {
     dead: Arc<AtomicBool>,
     abort: Arc<AbortWord>,
@@ -1283,9 +1391,9 @@ pub(crate) fn spawn_pipeline_thread(
                 dead: dead_flag,
                 abort: state.abort.clone(),
             };
-            // This thread builds the views of landed slots, which needs the
-            // device's context current on it. Promotion copies and their
-            // events are the copier thread's.
+            // This thread builds the views of landed slots and issues the
+            // boundary moves' relocations, which need the device's context
+            // current on it.
             if let Err(e) = state.bind_device_to_thread() {
                 tracing::error!(
                     target: "candle_transformers::expert_lre",
@@ -1316,12 +1424,23 @@ pub(crate) fn spawn_pipeline_thread(
                         let near = state.routed_served.load(Ordering::Acquire);
                         if let Err(e) = state
                             .collect_device_promotions(near)
-                            .and_then(|()| state.poll_promotions())
                             .and_then(|()| state.land_device_promotions(false))
                         {
                             tracing::error!(
                                 target: "candle_transformers::expert_lre",
                                 "expert pipeline: a promotion could not land, aborting: {e}"
+                            );
+                            return;
+                        }
+                        let _ = response_tx.send(());
+                    }
+                    PipelineMessage::DropDemandPromotions { response_tx } => {
+                        let near = state.routed_served.load(Ordering::Acquire);
+                        if let Err(e) = state.drop_demand_promotions(near) {
+                            tracing::error!(
+                                target: "candle_transformers::expert_lre",
+                                "expert pipeline: a faulted forward's promotions could not be \
+                                 dropped, aborting: {e}"
                             );
                             return;
                         }
@@ -1358,7 +1477,59 @@ pub(crate) fn spawn_pipeline_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{ring_stock, RingStock};
+    use super::{lands, ring_stock, split_ahead, DevicePromotion, RingStock};
+    use std::cell::Cell;
+
+    fn promo(row: usize, expert: usize, slot: usize, ahead: bool) -> DevicePromotion {
+        DevicePromotion {
+            row,
+            expert,
+            slot,
+            ticket: 40 + row as u64,
+            ahead,
+        }
+    }
+
+    /// A fault drops the demand claims and keeps the read-ahead ones, each side
+    /// in pending order.
+    #[test]
+    fn a_fault_keeps_read_ahead_claims_and_drops_demand_ones() {
+        let (ahead, demand) = split_ahead(vec![
+            promo(3, 7, 100, false),
+            promo(5, 2, 101, true),
+            promo(4, 9, 102, false),
+            promo(6, 1, 103, true),
+        ]);
+        let key = |v: &[DevicePromotion]| {
+            v.iter()
+                .map(|p| (p.row, p.expert, p.slot))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(key(&ahead), vec![(5, 2, 101), (6, 1, 103)]);
+        assert_eq!(key(&demand), vec![(3, 7, 100), (4, 9, 102)]);
+    }
+
+    /// A complete claim lands unless it is a demand claim under a fault; an
+    /// incomplete one never lands, and the fault word is read only for a
+    /// complete demand claim — after the completion it is ordered behind.
+    #[test]
+    fn a_demand_claim_waits_out_a_fault_and_a_read_ahead_claim_does_not() {
+        let reads = Cell::new(0);
+        let word = |set: bool| {
+            let reads = &reads;
+            move || {
+                reads.set(reads.get() + 1);
+                set
+            }
+        };
+        assert!(lands(true, false, word(false)));
+        assert!(!lands(true, false, word(true)));
+        assert_eq!(reads.get(), 2);
+        assert!(lands(true, true, word(true)));
+        assert!(!lands(false, false, word(false)));
+        assert!(!lands(false, true, word(false)));
+        assert_eq!(reads.get(), 2, "read only for a complete demand claim");
+    }
 
     fn stock(target: usize, reserve: u32, sweep: u32) -> RingStock {
         RingStock {
@@ -1372,13 +1543,13 @@ mod tests {
     /// lets a launch claim up to that prediction.
     #[test]
     fn with_room_the_ring_stocks_for_all_misses_and_reserves_nothing() {
-        assert_eq!(ring_stock(8, 100, true, 0, 1024), stock(125, 0, 125));
+        assert_eq!(ring_stock(8, 100, true, 0, 0, 1024), stock(125, 0, 125));
         // The floor and the half-capacity ceiling.
-        assert_eq!(ring_stock(0, 4, true, 0, 1024), stock(32, 0, 32));
-        assert_eq!(ring_stock(0, 1_000, true, 0, 1024), stock(512, 0, 512));
+        assert_eq!(ring_stock(0, 4, true, 0, 0, 1024), stock(32, 0, 32));
+        assert_eq!(ring_stock(0, 1_000, true, 0, 0, 1024), stock(512, 0, 512));
         // More empty slots than the prediction: every one is stocked, and the
         // sweep word stays the prediction.
-        assert_eq!(ring_stock(8, 100, true, 300, 1024), stock(300, 0, 125));
+        assert_eq!(ring_stock(8, 100, true, 300, 0, 1024), stock(300, 0, 125));
     }
 
     /// Without room decode's target is the reserve and the sweep word, and the
@@ -1387,15 +1558,32 @@ mod tests {
     #[test]
     fn without_room_the_stock_past_decodes_reserve_is_empty_slots() {
         // Full zone: stock = reserve = sweep = decode's target.
-        assert_eq!(ring_stock(40, 100, false, 0, 1024), stock(50, 50, 50));
+        assert_eq!(ring_stock(40, 100, false, 0, 0, 1024), stock(50, 50, 50));
         // Fewer empties than decode's target: the target, made of lazy victims.
-        assert_eq!(ring_stock(40, 100, false, 25, 1024), stock(50, 50, 50));
+        assert_eq!(ring_stock(40, 100, false, 25, 0, 1024), stock(50, 50, 50));
         // Plenty empty: every one stocked, decode's target still reserved, and
         // a prompt claiming past it still a sweep.
-        assert_eq!(ring_stock(40, 100, false, 300, 1024), stock(300, 50, 50));
+        assert_eq!(ring_stock(40, 100, false, 300, 0, 1024), stock(300, 50, 50));
         // Never past half the ring.
-        assert_eq!(ring_stock(40, 1_000, false, 1_000, 256), stock(128, 50, 50));
+        assert_eq!(
+            ring_stock(40, 1_000, false, 1_000, 0, 256),
+            stock(128, 50, 50)
+        );
         // A prompt-only launch: decode's floor is still reserved.
-        assert_eq!(ring_stock(0, 100, false, 10, 1024), stock(32, 32, 32));
+        assert_eq!(ring_stock(0, 100, false, 10, 0, 1024), stock(32, 32, 32));
+    }
+
+    /// Read-ahead's window is stocked past the misses' target, never past half
+    /// the ring, and moves neither the reserve nor the sweep word.
+    #[test]
+    fn the_read_ahead_window_is_stocked_on_top() {
+        assert_eq!(ring_stock(40, 100, false, 0, 14, 1024), stock(64, 50, 50));
+        assert_eq!(ring_stock(8, 100, true, 0, 14, 1024), stock(139, 0, 125));
+        assert_eq!(ring_stock(40, 100, false, 0, 100, 256), stock(128, 50, 50));
+        // Empty slots past target + window are still all stocked.
+        assert_eq!(
+            ring_stock(40, 100, false, 300, 14, 1024),
+            stock(300, 50, 50)
+        );
     }
 }

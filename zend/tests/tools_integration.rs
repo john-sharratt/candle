@@ -60,7 +60,7 @@ mod tool_scenarios {
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use futures::StreamExt;
     use tokio::runtime::Runtime;
@@ -76,6 +76,14 @@ mod tool_scenarios {
     use zend::log_broadcast::LogBus;
     use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role, ToolMode};
+
+    /// How long a shut-down session's tasks may take to unwind and release
+    /// what they pinned: well past any boot's wind-down, so only a leak waits
+    /// it out.
+    const UNWIND_DEADLINE: Duration = Duration::from_secs(60);
+
+    /// How long the pinned count must hold still to be taken as a baseline.
+    const SETTLED_FOR: Duration = Duration::from_secs(2);
 
     /// Per-scenario cap. A scenario on a warm workspace is ~10 s; the first run
     /// on a fresh one also calibrates the whole tool catalog once, which is what
@@ -480,6 +488,23 @@ mod tool_scenarios {
 
     // Named to sort before every scenario: it releases the shared daemon, so
     // run after one it would make the suite boot a daemon only to shut it down.
+    /// The pinned bytes outside the recycler once they have held still for
+    /// [`SETTLED_FOR`], or as they stand at [`UNWIND_DEADLINE`].
+    async fn settled_pinned() -> u64 {
+        let deadline = Instant::now() + UNWIND_DEADLINE;
+        let mut last = pinned_outside_the_recycler();
+        let mut since = Instant::now();
+        while Instant::now() < deadline && since.elapsed() < SETTLED_FOR {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let now = pinned_outside_the_recycler();
+            if now != last {
+                last = now;
+                since = Instant::now();
+            }
+        }
+        last
+    }
+
     #[test]
     fn a_boot_after_a_boot_restores_every_prompt_section() {
         init_tracing();
@@ -489,23 +514,33 @@ mod tool_scenarios {
         let _one_at_a_time = SCENARIO.lock().unwrap_or_else(|e| e.into_inner());
         let (first, second) = runtime().block_on(async {
             release_shared_session().await;
-            // The shared runtime outlives its daemons, so a daemon's tasks
-            // unwind while it runs on: give them the time before measuring.
-            let unwind = || tokio::time::sleep(Duration::from_secs(2));
-            unwind().await;
-            let pinned_before = pinned_outside_the_recycler();
+            // The shared runtime outlives its daemons, so the released daemon's
+            // tasks unwind while it runs on. The baseline is taken once the count
+            // has held still — measured early, an inflated baseline would sit above
+            // where the count settles, and the check below would wait out its
+            // deadline and blame the session under test.
+            let pinned_before = settled_pinned().await;
 
             let session = boot(workspace(), ModelChoice::Preset(Box::new(MODEL))).await;
             let first = section_loads_of(&session);
             session.shutdown().await;
-            unwind().await;
             // **A shut-down session releases what it pinned.** A full boot and
             // shutdown in this one process must leave exactly what was pinned
-            // before it.
+            // before it. Its tasks unwind on the shared runtime after `shutdown`
+            // returns, for as long as the boot's work takes to wind down — a
+            // fixed grace lost that race on a boot that compacted the log — so
+            // the count is waited for, up to a deadline that only a leak
+            // reaches.
+            let deadline = Instant::now() + UNWIND_DEADLINE;
+            while pinned_outside_the_recycler() != pinned_before && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             assert_eq!(
                 pinned_outside_the_recycler(),
                 pinned_before,
-                "a shut-down session left pinned host memory behind (by consumer: {:?})",
+                "a shut-down session left pinned host memory behind {}s after shutdown \
+                 (by consumer: {:?})",
+                UNWIND_DEADLINE.as_secs(),
                 host_pinned_breakdown(),
             );
 

@@ -46,7 +46,7 @@ use candle_kernels::quantized::{
 };
 /// The wait state of a grouped GEMM over a live weight table — see
 /// [`grouped_qmatmul_dev_q8a128`].
-pub use candle_kernels::quantized::MoeLive;
+pub use candle_kernels::quantized::{MoeLive, STALL_WORDS};
 
 // Import GEMX repacking dispatcher
 use candle_kernels::quantized::{get_repacked_size_bytes, is_gemx_supported, run_repack_gemx};
@@ -6896,6 +6896,10 @@ fn ko_fmt_code(dtype: GgmlDType) -> Result<i32> {
     })
 }
 
+/// The segments one segmented launch carries (`qkv_segmented_f32.cu` passes them by value as
+/// `s0`, `s1`, `s2`): a launch over more would compute the rest with the third's weights.
+pub(crate) const QKV_MAX_SEGS: usize = 3;
+
 /// Fused qkv int8 dense matmul: a SINGLE launch multiplies the shared q8a128 activation `op`
 /// (`[lead.., K]`) by up to three KO weights of possibly-different formats, writing the
 /// **concatenated** `[lead.., ΣN]` output at `out_dtype`. Per thread-block the global N-tile resolves to one
@@ -6916,8 +6920,11 @@ pub(crate) fn qkv_segmented_matmul<'w>(
             op.cols
         );
     }
-    if segments.is_empty() {
-        crate::bail!("qkv_segmented_matmul: no segments");
+    if segments.is_empty() || segments.len() > QKV_MAX_SEGS {
+        crate::bail!(
+            "qkv_segmented_matmul: {} segments — the kernel takes 1 to at most {QKV_MAX_SEGS}",
+            segments.len()
+        );
     }
     let k = op.cols;
     let m = op.rows;
@@ -7391,6 +7398,77 @@ pub fn moe_route<'w>(
     Ok((weights, indices))
 }
 
+/// Router look-ahead votes: `rows` is a `[num_tokens, width]` f32 projection
+/// holding, from column `first_col`, `hops` later layers' router logits of
+/// `n_experts` columns each; for every hop, the count of tokens whose top `k`
+/// names each expert is written to `out` — `[hops, n_experts]` u32 at a device
+/// address (mapped host memory), behind a system fence. One launch, ordered on
+/// the launch stream like the projection that produced `rows`.
+pub fn moe_predict_votes(
+    rows: &LiveTensor<'_>,
+    first_col: usize,
+    hops: usize,
+    n_experts: usize,
+    k: usize,
+    out: u64,
+) -> Result<()> {
+    use crate::cuda_backend::CudaStorageSlice;
+
+    let (num_tokens, width) = rows.dims2()?;
+    if hops == 0 || num_tokens == 0 {
+        return Ok(());
+    }
+    if n_experts > 512 || k == 0 || k > n_experts {
+        crate::bail!("moe_predict_votes: n_experts={n_experts}, k={k} out of range");
+    }
+    if first_col + hops * n_experts > width {
+        crate::bail!(
+            "moe_predict_votes: {hops} hops of {n_experts} from column {first_col} exceed the \
+             row's {width}"
+        );
+    }
+    let device = match rows.device() {
+        crate::Device::Cuda(d) => d.clone(),
+        _ => crate::bail!("moe_predict_votes: expected a CUDA tensor"),
+    };
+    let (storage, layout) = rows.storage_and_layout();
+    let row_stride = layout.stride()[0];
+    if layout.stride()[1] != 1 || (num_tokens > 1 && row_stride < width) {
+        return Err(crate::Error::RequiresContiguous {
+            op: "moe_predict_votes",
+        }
+        .bt());
+    }
+    let row_stride = row_stride.max(width);
+    let o1 = layout.start_offset();
+    let o2 = o1 + (num_tokens - 1) * row_stride + width;
+    let crate::Storage::Cuda(cuda) = &*storage else {
+        crate::bail!("moe_predict_votes: expected CUDA storage");
+    };
+    let CudaStorageSlice::F32(s) = &cuda.slice else {
+        crate::bail!("moe_predict_votes: the projection must be f32");
+    };
+    let stream = device.cuda_stream();
+    let v = s.slice(o1..o2);
+    let (lp, _lg) = v.device_ptr(&stream);
+    // SAFETY: `lp` covers every row read; `out` is `hops × n_experts` u32 the
+    // caller owns for the launch's lifetime.
+    unsafe {
+        candle_kernels::simple::moe_scatter::run_moe_predict_votes(
+            lp as *const f32,
+            out as *mut u32,
+            num_tokens as i32,
+            n_experts as i32,
+            row_stride as i32,
+            first_col as i32,
+            hops as i32,
+            k as i32,
+            stream.cu_stream() as *mut std::ffi::c_void,
+        );
+    }
+    Ok(())
+}
+
 /// B3: gather pre-quantized q8a128 activations by token id into a stacked q8a128 operand the
 /// experts consume directly — no gather-then-quantize. Tile by tile: output tile `(r, t)` is
 /// source tile `(ids[r], t)`, quants and scale, so any `hidden` that is a multiple of 128 works,
@@ -7698,6 +7776,30 @@ pub fn moe_bucketize(
     if owner.owners != 0 && (owner.slot_bytes == 0 || live.is_none_or(|l| l.gate_row == 0)) {
         crate::bail!("moe_bucketize: the owner check needs a slot size and a live table");
     }
+    let ahead = live.and_then(|l| l.ahead);
+    if let (Some(a), Some(l)) = (ahead, live) {
+        let ring_ok = l.promo.is_some_and(|p| {
+            p.window != 0
+                && p.depth != 0
+                && p.ahead_n != 0
+                && p.ahead_list != 0
+                && p.ahead_src != 0
+                && p.ahead_cap != 0
+        });
+        if !ring_ok
+            || l.remote == 0
+            || a.row_layout == 0
+            || a.items == 0
+            || a.done == 0
+            || a.rows <= 0
+            || l.row >= a.rows
+        {
+            crate::bail!(
+                "moe_bucketize: read-ahead needs the promotion ring with its read-ahead words, \
+                 a remote list, the row layout, the item buffers and a row inside the table"
+            );
+        }
+    }
     ws.ensure(&device, n_tokens, k)?;
 
     let (storage, layout) = indices.storage_and_layout();
@@ -7779,6 +7881,16 @@ pub fn moe_bucketize(
             live.map_or(0, |l| l.remote_dst) as *mut std::ffi::c_void,
             live.map_or(0, |l| l.started_rows) as *mut std::ffi::c_void,
             live.map_or(0, |l| l.ticket),
+            promo.map_or(0, |p| p.window) as *const std::ffi::c_void,
+            promo.map_or(0, |p| p.depth) as *const std::ffi::c_void,
+            promo.map_or(0, |p| p.ahead_n) as *const std::ffi::c_void,
+            promo.map_or(0, |p| p.ahead_list) as *const std::ffi::c_void,
+            promo.map_or(0, |p| p.ahead_src) as *const std::ffi::c_void,
+            promo.map_or(0, |p| p.ahead_cap),
+            ahead.map_or(0, |a| a.rows),
+            ahead.map_or(0, |a| a.row_layout) as *const std::ffi::c_void,
+            ahead.map_or(0, |a| a.items) as *mut std::ffi::c_void,
+            ahead.map_or(0, |a| a.done) as *mut std::ffi::c_void,
             stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
@@ -7835,6 +7947,26 @@ pub struct BucketizeLive {
     pub ticket: u64,
     /// The slot-tenancy check ([`OwnerCheck`]); all zero runs none.
     pub owner: OwnerCheck,
+    /// Read-ahead into the promotion ring ([`ReadAhead`]), or `None`. Requires
+    /// `promo`.
+    pub ahead: Option<ReadAhead>,
+}
+
+/// The device buffers [`moe_bucketize`]'s read-ahead walk writes and the gate
+/// launch's workers consume (`candle-kernels/src/moe_read_ahead.cuh`). The
+/// predictions it walks, its budget and its depth are mapped words in the
+/// promotion ring ([`PromoRing`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ReadAhead {
+    /// `u64[rows][4]`: each row's gate, up and down offsets inside a slot image,
+    /// and the image's bytes — what a read-ahead copy moves.
+    pub row_layout: u64,
+    /// Rows in the live table: targets wrap at it.
+    pub rows: i32,
+    /// `u64[1 + AHEAD_MAX · AHEAD_ITEM_WORDS]`: the item count, then the items.
+    pub items: u64,
+    /// `u32[AHEAD_MAX]`: pieces of each item copied so far, zeroed per item.
+    pub done: u64,
 }
 
 /// Where [`moe_bucketize`] checks every VRAM entry it snapshots against the
@@ -7870,6 +8002,16 @@ pub struct OwnerCheck {
 /// three entries are retargeted to `retarget` (`u64[cap][3]`: gate, up, down)
 /// before the slot is written, and a victim the launch itself routes is
 /// skipped and logged with the expert `PROMO_SKIP`.
+///
+/// The read-ahead words ([`ReadAhead`]): `window` (`u32`) is the slot images
+/// the link moves in one layer — a launch reads ahead with what its own remote
+/// experts leave of it; `depth` (`u32`) the last hop, so a launch at row `r`
+/// reads ahead for rows `r + 2 ..= r + depth`; and the host's predictions,
+/// `ahead_n` (`u32[rows]`) experts listed per row in `ahead_list`
+/// (`u32[rows][ahead_cap]`), each with the slot image the host vetted as its
+/// source in `ahead_src` (`u64[rows][ahead_cap]`) — a warm slot, or a pad slot
+/// it holds pinned. An expert is read ahead only while its entries still point
+/// at its vetted image.
 #[derive(Debug, Clone, Copy)]
 pub struct PromoRing {
     pub slots: u64,
@@ -7882,6 +8024,12 @@ pub struct PromoRing {
     pub sweep: u64,
     pub victims: u64,
     pub retarget: u64,
+    pub window: u64,
+    pub depth: u64,
+    pub ahead_n: u64,
+    pub ahead_list: u64,
+    pub ahead_src: u64,
+    pub ahead_cap: u32,
 }
 
 #[cfg(test)]

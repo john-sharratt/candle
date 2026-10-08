@@ -548,6 +548,7 @@ impl Engine {
             &DecodeRows::prefix(nt),
             DType::F32,
             None,
+            &[],
         )?; // [nt, dim] F32
         let s_shared = span("moe:shared");
         let shared = layer.shared.forward(&normed)?; // [nt, dim] F32
@@ -764,22 +765,30 @@ impl KernelSession<'_> {
         let headers = headers.ok_or_else(|| candle::Error::msg("no decode metadata"))?;
         let base = headers.dev_ptr();
 
-        for (l, layer) in e.layers.iter().enumerate() {
-            let (x, post, comb) = e.hc.pre(&h, &layer.hc_attn)?;
-            let x = rms_norm(&x, &layer.attn_norm, e.cfg.norm_eps)?;
-            let x = self.layers[l].step(
-                &layer.attn,
-                &x,
-                e.rope_for(l),
-                self.pos,
-                base + (l as u64) * stride,
-            )?;
-            let h1 = e.hc.post(&x, &h, &post, &comb)?;
+        let pos = self.pos;
+        let layers = &mut self.layers;
+        let swept = (|| -> Result<Tensor> {
+            for (l, layer) in e.layers.iter().enumerate() {
+                let (x, post, comb) = e.hc.pre(&h, &layer.hc_attn)?;
+                let x = rms_norm(&x, &layer.attn_norm, e.cfg.norm_eps)?;
+                let x = layers[l].step(
+                    &layer.attn,
+                    &x,
+                    e.rope_for(l),
+                    pos,
+                    base + (l as u64) * stride,
+                )?;
+                let h1 = e.hc.post(&x, &h, &post, &comb)?;
 
-            let (x, post, comb) = e.hc.pre(&h1, &layer.hc_ffn)?;
-            let moe = e.moe_forward(layer, &x, token_id)?;
-            h = e.hc.post(&moe, &h1, &post, &comb)?;
-        }
+                let (x, post, comb) = e.hc.pre(&h1, &layer.hc_ffn)?;
+                let moe = e.moe_forward(layer, &x, token_id)?;
+                h = e.hc.post(&moe, &h1, &post, &comb)?;
+            }
+            Ok(h)
+        })();
+        // Checked before the position advances: a faulted step is not taken,
+        // and the retry rewrites the same position.
+        let h = e.expert_checked(swept)?;
         drop(generation);
         self.pos += 1;
 
@@ -801,6 +810,9 @@ impl EngineSession<'_> {
     /// One decode step: `token_id` → logits `[vocab]` at this position. mHC-wrapped incremental
     /// attention + resident-`ExpertCache` MoE, all in the validated math — same result as the
     /// streaming reference row, with resident (not per-forward-reloaded) experts.
+    ///
+    /// A step that fails ends the session: each layer's incremental attention
+    /// has already taken this token's K/V, so the session cannot retry it.
     pub fn step(&mut self, token_id: u32) -> Result<Tensor> {
         let e = self.engine;
         let dim = e.cfg.dim;
@@ -814,23 +826,51 @@ impl EngineSession<'_> {
             .to_device(&e.device)?;
         let mut h = e.hc.expand(&row)?; // [1,1,hc,dim]
 
-        for (l, layer) in e.layers.iter().enumerate() {
-            // Attention sub-block: mHC pre → norm → incremental attention → mHC post.
-            let (x, post, comb) = e.hc.pre(&h, &layer.hc_attn)?;
-            let x = rms_norm(&x, &layer.attn_norm, e.cfg.norm_eps)?;
-            let x = self.attn[l].step(&x, e.rope_for(l))?;
-            let h1 = e.hc.post(&x, &h, &post, &comb)?;
+        let attn = &mut self.attn;
+        let swept = (|| -> Result<Tensor> {
+            for (l, layer) in e.layers.iter().enumerate() {
+                // Attention sub-block: mHC pre → norm → incremental attention → mHC post.
+                let (x, post, comb) = e.hc.pre(&h, &layer.hc_attn)?;
+                let x = rms_norm(&x, &layer.attn_norm, e.cfg.norm_eps)?;
+                let x = attn[l].step(&x, e.rope_for(l))?;
+                let h1 = e.hc.post(&x, &h, &post, &comb)?;
 
-            // MoE sub-block: mHC pre → routed(ExpertCache)+shared → mHC post.
-            let (x, post, comb) = e.hc.pre(&h1, &layer.hc_ffn)?;
-            let moe = e.moe_forward(layer, &x, token_id)?;
-            h = e.hc.post(&moe, &h1, &post, &comb)?;
-        }
+                // MoE sub-block: mHC pre → routed(ExpertCache)+shared → mHC post.
+                let (x, post, comb) = e.hc.pre(&h1, &layer.hc_ffn)?;
+                let moe = e.moe_forward(layer, &x, token_id)?;
+                h = e.hc.post(&moe, &h1, &post, &comb)?;
+            }
+            Ok(h)
+        })();
+        let h = e.expert_checked(swept)?;
 
         let h = e.hc.head_reduce(&h, &e.hc_head)?;
         let h = rms_norm(&h, &e.output_norm, e.cfg.norm_eps)?;
         let logits = e.lm_head.forward(&h)?; // [1,1,vocab]
         logits.reshape((e.cfg.vocab_size,))
+    }
+}
+
+impl Engine {
+    /// A step's layer sweep, failed if the expert cache's workers gave a cold
+    /// expert up (`ExpertCache::take_fault`) — on success, since its result was
+    /// computed from what was given up, and on error too, since a launch
+    /// refused over the untaken fault is how a later layer of the same step
+    /// fails, and a fault left untaken would refuse every later step. The
+    /// fault is the cause, so it is the error. Synchronises first: the word is
+    /// complete only once every launch that could claim it is.
+    fn expert_checked<T>(&self, swept: Result<T>) -> Result<T> {
+        let fault = self
+            .device
+            .synchronize()
+            .and_then(|()| self.experts.take_fault());
+        match (swept, fault) {
+            (Ok(_), Err(f)) => Err(f),
+            (Err(e), Err(f)) => Err(candle::Error::Msg(format!(
+                "{f} (the step stopped on: {e})"
+            ))),
+            (swept, Ok(())) => swept,
+        }
     }
 }
 

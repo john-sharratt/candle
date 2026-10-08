@@ -27,6 +27,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -77,7 +78,9 @@ use crate::models::delta_net::{
     ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore, SeqSpan, ZGate,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
-use crate::models::expert_lre::{WeightPlan, WeightPlanning};
+use crate::models::expert_lre::{
+    WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS,
+};
 use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
 use crate::models::operand_guard::expect_dense_view;
@@ -86,6 +89,7 @@ use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::profile::{span, ProfileSnapshot};
 use crate::models::qsa_selection::QsaSelection;
+use crate::models::quantized_matmul::QMatMul;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows, VerifyStash};
 use crate::models::residency_rows::residency_decode_rows;
@@ -2357,6 +2361,14 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Some(self.model.experts.expert_stats())
     }
 
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        self.model.experts.hit_references()
+    }
+
+    fn write_expert_routing_trace(&self, path: &Path) -> Result<()> {
+        self.model.experts.write_routing_trace(path)
+    }
+
     fn weight_plan(&self) -> WeightPlanning {
         WeightPlan::from_stats(&self.model.experts.expert_stats())
     }
@@ -2415,6 +2427,11 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 impl WaveSweep for Qwen4ExpBatched {
     fn device(&self) -> &Device {
         &self.model.device
+    }
+
+    fn take_device_fault(&self) -> Result<()> {
+        self.model.device.synchronize()?;
+        self.model.experts.take_fault()
     }
 
     fn num_layers(&self) -> usize {
@@ -3757,12 +3774,25 @@ impl Qwen4ExpBatched {
             // here waits on the host, so this event span is the one place that
             // device time is attributed.
             let g_moe = crate::models::profile::gpu_span(moe_span, dev);
+            // The next rows' routers, applied to this layer's input in its own
+            // stacked projection: their votes predict those rows' experts for the
+            // expert cache's read-ahead and staging. Decode-width launches only —
+            // a prompt routes most of every row, which leaves nothing to predict.
+            let look_ahead: Vec<&QMatMul> = if total_rows <= LOOK_AHEAD_MAX_TOKENS {
+                m.layers[li + 1..(li + 1 + LOOK_AHEAD_HOPS).min(num_layers)]
+                    .iter()
+                    .map(|l| &l.moe.routed.gate)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // The layer's output in its three parts: the shared expert's gate is
             // applied by the combine below, which reads the block output anyway,
             // rather than by three launches of its own.
-            let parts = layer
-                .moe
-                .forward_parts(acts, DType::F32, &decode_like, moe_wave)?;
+            let parts =
+                layer
+                    .moe
+                    .forward_parts(acts, DType::F32, &decode_like, moe_wave, &look_ahead)?;
             let routed = parts.routed.reshape((total_rows, n_embd))?;
             g_moe.end();
             #[cfg(feature = "tensor-assert")]

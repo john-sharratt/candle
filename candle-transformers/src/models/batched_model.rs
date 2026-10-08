@@ -362,6 +362,19 @@ pub trait BatchedModelCore {
         None
     }
 
+    /// The expert cache's residency references over the interval the counters
+    /// cover, `(lru, min)` (`ExpertCache::hit_references`), if this model has
+    /// one.
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        None
+    }
+
+    /// Synchronise and fail the segment just swept if the expert cache's
+    /// workers gave a cold expert up (`WaveSweep::take_device_fault`); `Ok` for
+    /// a model without one, which has nothing the device can give up. Required,
+    /// so a model gaining an expert cache states it.
+    fn take_device_fault(&self) -> Result<()>;
+
     /// The wave transient tier a prefill of `rows` rows across `sequences`
     /// would need, in bytes.
     ///

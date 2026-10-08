@@ -1022,7 +1022,10 @@ mod tests {
         let s = *inner
             .rank_victims(current, 1, false, |s, _| !protect.contains(&s))
             .first()?;
-        Some((s, inner.slot_to_key[s].expect("a ranked victim holds an expert")))
+        Some((
+            s,
+            inner.slot_to_key[s].expect("a ranked victim holds an expert"),
+        ))
     }
 
     #[test]
@@ -1200,7 +1203,7 @@ mod tests {
         inner.record_prefill_elevate(10, 101);
         inner.set_warm_backed(&[(10, 100)]);
         // current=15, n=48 → dist 43 = min_dist, so both are in the window.
-        let evicted = evict_for_prefetch_batch(&mut inner,15, 1);
+        let evicted = evict_for_prefetch_batch(&mut inner, 15, 1);
         assert_eq!(
             evicted,
             vec![(0, Some((10, 100)))],
@@ -1218,7 +1221,7 @@ mod tests {
         inner.record_prefill_elevate(10, 100);
         inner.record_prefill_elevate(10, 101);
         inner.set_warm_backed(&[(10, 100)]);
-        let evicted = demand_eviction(&mut inner,15, 1, &[]);
+        let evicted = demand_eviction(&mut inner, 15, 1, &[]);
         assert_eq!(
             evicted,
             vec![(10, 100)],
@@ -1240,7 +1243,7 @@ mod tests {
         inner.record_prefill_elevate(10, 100);
         inner.record_prefill_elevate(20, 101);
         inner.set_warm_backed(&[(10, 100), (20, 101)]);
-        let evicted = demand_eviction(&mut inner,15, 1, &[]);
+        let evicted = demand_eviction(&mut inner, 15, 1, &[]);
         assert_eq!(
             evicted,
             vec![(10, 100)],
@@ -1269,7 +1272,7 @@ mod tests {
         assert_eq!(inner.score(10, 100), 0.0);
         assert_eq!(inner.score(10, 101), 0.0);
 
-        let evicted = demand_eviction(&mut inner,15, 1, &[]);
+        let evicted = demand_eviction(&mut inner, 15, 1, &[]);
         assert_eq!(
             evicted,
             vec![(10, 100)],
@@ -1284,7 +1287,7 @@ mod tests {
         occupy(&mut inner, 0, 10, 100, 5, 0.0); // warm, most recently used
         occupy(&mut inner, 1, 10, 101, 1, 0.0); // pack-only, least recently used
         inner.set_warm_backed(&[(10, 100)]);
-        let evicted = evict_for_prefetch_batch(&mut inner,15, 1);
+        let evicted = evict_for_prefetch_batch(&mut inner, 15, 1);
         assert_eq!(
             evicted,
             vec![(0, Some((10, 100)))],
@@ -1304,7 +1307,7 @@ mod tests {
         occupy(&mut inner, 0, 20, 100, 1, 0.0); // ahead of the wave: factor 1.0
         occupy(&mut inner, 1, 10, 101, 2, 1.0); // one decode hit, in the window
         inner.record_prefill_elevate(20, 100);
-        let evicted = demand_eviction(&mut inner,15, 1, &[]);
+        let evicted = demand_eviction(&mut inner, 15, 1, &[]);
         assert_eq!(
             evicted,
             vec![(20, 100)],
@@ -1339,7 +1342,7 @@ mod tests {
         occupy(&mut inner, 2, 20, 102, 3, 0.4); // colder, but out of window (key 1.6·cost)
         occupy(&mut inner, 3, 30, 103, 4, 0.5); // in window (key 0.25·cost) → victim
 
-        let evicted = demand_eviction(&mut inner,35, 1, &[]);
+        let evicted = demand_eviction(&mut inner, 35, 1, &[]);
         assert_eq!(evicted, vec![(30, 103)], "behind-window expert goes first");
         assert!(inner.key_to_slot.contains_key(&(10, 101)));
         assert!(inner.key_to_slot.contains_key(&(20, 102)));
@@ -1359,7 +1362,7 @@ mod tests {
         occupy(&mut inner, 0, 33, 100, 1, 6.0); // in window, hot
         occupy(&mut inner, 1, 31, 101, 2, 0.3); // in window, coldest → victim
         occupy(&mut inner, 2, 34, 102, 3, 2.0); // in window, warm
-        let evicted = demand_eviction(&mut inner,35, 1, &[]);
+        let evicted = demand_eviction(&mut inner, 35, 1, &[]);
         assert_eq!(evicted, vec![(31, 101)]);
     }
 
@@ -1374,7 +1377,7 @@ mod tests {
         occupy(&mut inner, 0, 32, 100, 1, 1.0); // in window, cold-only
         occupy(&mut inner, 1, 40, 101, 2, 1.0); // ahead, warm-backed
         inner.set_warm_backed(&[(40, 101)]);
-        let evicted = demand_eviction(&mut inner,35, 1, &[]);
+        let evicted = demand_eviction(&mut inner, 35, 1, &[]);
         assert_eq!(
             evicted,
             vec![(40, 101)],
@@ -1392,7 +1395,7 @@ mod tests {
         occupy(&mut inner, 0, 30, 100, 1, 0.1); // in window, coldest — but a HIT, protected
         occupy(&mut inner, 1, 10, 101, 2, 5.0);
         occupy(&mut inner, 2, 33, 102, 3, 0.4); // in window, next-coldest → victim
-        let evicted = demand_eviction(&mut inner,35, 1, &[0]);
+        let evicted = demand_eviction(&mut inner, 35, 1, &[0]);
         assert_eq!(evicted, vec![(33, 102)], "protected hit slot spared");
         assert!(inner.key_to_slot.contains_key(&(30, 100)));
     }
@@ -1406,7 +1409,7 @@ mod tests {
         occupy(&mut inner, 0, 36, 100, 1, 0.0); // in-flight install for L+1, protected
         occupy(&mut inner, 1, 20, 101, 2, 0.5); // out-of-window fallback → victim
         occupy(&mut inner, 2, 37, 102, 3, 4.0);
-        let evicted = demand_eviction(&mut inner,35, 1, &[0]);
+        let evicted = demand_eviction(&mut inner, 35, 1, &[0]);
         assert_eq!(evicted, vec![(20, 101)], "in-flight install spared");
         assert!(inner.key_to_slot.contains_key(&(36, 100)));
     }
@@ -1418,7 +1421,7 @@ mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 1, 100, 1, 0.1); // pinned
         occupy(&mut inner, 1, 10, 101, 2, 0.2);
-        let evicted = demand_eviction(&mut inner,20, 5, &[]);
+        let evicted = demand_eviction(&mut inner, 20, 5, &[]);
         assert_eq!(evicted, vec![(10, 101)]);
         assert!(inner.key_to_slot.contains_key(&(1, 100)), "pinned survives");
     }
@@ -1454,7 +1457,7 @@ mod tests {
         occupy(&mut inner, 0, 9, 100, 5, 8.0); // L-1, furthest, but hot
         occupy(&mut inner, 1, 7, 102, 5, 0.0); // L-3, never used
         occupy(&mut inner, 2, 30, 103, 5, 9.0); // out of window (dist 20)
-        let (slot, key) = evict_for_prefetch_batch(&mut inner,10, 1)
+        let (slot, key) = evict_for_prefetch_batch(&mut inner, 10, 1)
             .into_iter()
             .next()
             .unwrap();
@@ -1468,7 +1471,7 @@ mod tests {
         let mut inner = cache(4);
         occupy(&mut inner, 0, 9, 100, 5, 0.0); // L-1 (dist 47), cold
         occupy(&mut inner, 1, 6, 101, 5, 0.0); // L-4 (dist 44), cold
-        let (_, key) = evict_for_prefetch_batch(&mut inner,10, 1)
+        let (_, key) = evict_for_prefetch_batch(&mut inner, 10, 1)
             .into_iter()
             .next()
             .unwrap();
@@ -1483,7 +1486,7 @@ mod tests {
         let mut inner = cache(4);
         occupy(&mut inner, 0, 12, 200, 5, 0.0); // near-future, never used — protected
         occupy(&mut inner, 1, 8, 201, 5, 9.0); // L-2, in window, hot
-        let (_, key) = evict_for_prefetch_batch(&mut inner,10, 1)
+        let (_, key) = evict_for_prefetch_batch(&mut inner, 10, 1)
             .into_iter()
             .next()
             .unwrap();
@@ -1506,12 +1509,12 @@ mod tests {
         occupy(&mut inner, 0, 61, 100, 5, 1.0); // tail: ahead of the wave this pass
         occupy(&mut inner, 1, 5, 101, 5, 0.0); // near-future (dist 3), protected
         assert!(
-            evict_for_prefetch_batch(&mut inner,2, 1).is_empty(),
+            evict_for_prefetch_batch(&mut inner, 2, 1).is_empty(),
             "no prefetch victim from a row the pass has yet to reach"
         );
         // Three rows later the tail is still ahead, layer 4 is behind.
         occupy(&mut inner, 2, 4, 102, 5, 1.0);
-        let (_, key) = evict_for_prefetch_batch(&mut inner,5, 1)
+        let (_, key) = evict_for_prefetch_batch(&mut inner, 5, 1)
             .into_iter()
             .next()
             .unwrap();
@@ -1526,7 +1529,7 @@ mod tests {
         occupy(&mut inner, 0, 9, 100, 5, 0.0); // L-1, cold
         occupy(&mut inner, 1, 8, 101, 5, 0.0); // L-2, cold
         occupy(&mut inner, 2, 7, 102, 5, 5.0); // L-3, hot — kept
-        let victims = evict_for_prefetch_batch(&mut inner,10, 2);
+        let victims = evict_for_prefetch_batch(&mut inner, 10, 2);
         assert_eq!(victims.len(), 2);
         assert_eq!(victims[0].1, Some((9, 100)));
         assert_eq!(victims[1].1, Some((8, 101)));
@@ -1542,7 +1545,7 @@ mod tests {
         for layer in 0..PINNED_LAYERS {
             occupy(&mut inner, layer, layer, 100 + layer, layer as u32 + 1, 0.0);
         }
-        assert!(evict_for_prefetch_batch(&mut inner,5, 1).is_empty());
+        assert!(evict_for_prefetch_batch(&mut inner, 5, 1).is_empty());
     }
 
     #[test]
@@ -1616,7 +1619,7 @@ mod tests {
         occupy(&mut inner, 4, 32, 54, 5, 3.0); // pack-only, in window: key 1.5
         inner.set_warm_backed(&[(10, 50), (11, 51)]);
 
-        let evicted = demand_eviction(&mut inner,35, 4, &[]);
+        let evicted = demand_eviction(&mut inner, 35, 4, &[]);
         assert_eq!(
             evicted,
             vec![(11, 51), (10, 50), (12, 52), (32, 54)],
@@ -1634,7 +1637,7 @@ mod tests {
         occupy(&mut inner, 0, 10, 50, 1, 6.0);
         occupy(&mut inner, 1, 20, 51, 2, 0.5);
         occupy(&mut inner, 2, 33, 52, 3, 0.8); // in window: key 0.4
-        let evicted = demand_eviction(&mut inner,35, 2, &[]);
+        let evicted = demand_eviction(&mut inner, 35, 2, &[]);
         assert_eq!(evicted, vec![(33, 52), (20, 51)]);
     }
 
@@ -1686,7 +1689,7 @@ mod tests {
         occupy(&mut inner, 0, 9, 100, 5, 1.0); // L-1, warm-backed
         occupy(&mut inner, 1, 9, 101, 5, 1.0); // L-1, cold-only
         inner.set_warm_backed(&[(9, 100)]);
-        let (_, key) = evict_for_prefetch_batch(&mut inner,10, 1)
+        let (_, key) = evict_for_prefetch_batch(&mut inner, 10, 1)
             .into_iter()
             .next()
             .unwrap();

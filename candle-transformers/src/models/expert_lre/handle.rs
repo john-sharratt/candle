@@ -14,8 +14,8 @@
 use super::cache::{minimum_resident_slots, pinned_layer_count, ExpertCacheInner};
 #[cfg(feature = "cuda")]
 use super::dispatch::{Dispatch, OwnerTags};
-#[cfg(feature = "tensor-assert")]
-use super::slot_owners::SlotOwners;
+#[cfg(feature = "cuda")]
+use super::link_rate::measure_link_rate;
 #[cfg(feature = "cuda")]
 use super::live_table::LiveTable;
 #[cfg(feature = "cuda")]
@@ -34,7 +34,11 @@ use super::promo::PromotionRing;
 #[cfg(feature = "cuda")]
 use super::residency::Residency;
 #[cfg(feature = "cuda")]
+use super::routing_trace::RoutingTrace;
+#[cfg(feature = "cuda")]
 use super::slot_image::{row_tile_bytes_for, slot_bytes_for, slot_offsets};
+#[cfg(feature = "tensor-assert")]
+use super::slot_owners::SlotOwners;
 #[cfg(feature = "cuda")]
 use super::stager::{spawn_stager, StagerCtx, StagerMsg};
 #[cfg(feature = "cuda")]
@@ -42,6 +46,8 @@ use super::startup::{
     startup_from_pack, startup_pinned_prefix, startup_repack, StartupRing, StartupTargets,
     PACK_TAIL_STEPS,
 };
+#[cfg(feature = "cuda")]
+use super::types::LookAhead;
 use super::types::{MmapExpertRef, PipelineMessage, PipelineStats};
 #[cfg(feature = "cuda")]
 use super::warm_tier::WarmTier;
@@ -57,6 +63,7 @@ use candle::{Device, Result};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::WaveGeneration;
 use candle_nn::kv_cache::WeightZone;
+use std::path::Path;
 #[cfg(feature = "cuda")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -406,7 +413,8 @@ pub struct ExpertCache {
     dispatch: Dispatch,
     /// Set when the pipeline thread or the stager has exited (normally or by
     /// panic). Their guards raise the abort word as they go, so every waiting
-    /// worker traps instead of waiting on an expert that will never come.
+    /// worker gives its expert up and fails the forward instead of waiting on
+    /// an expert that will never come.
     #[cfg(feature = "cuda")]
     pipeline_dead: Arc<AtomicBool>,
     #[cfg(feature = "cuda")]
@@ -419,6 +427,13 @@ pub struct ExpertCache {
     _pad: Arc<Pad>,
     /// Shared telemetry counters (always-on).
     stats: Arc<Mutex<PipelineStats>>,
+    /// The routing the pipeline thread has served, for the residency
+    /// ceiling ([`Self::hit_ceiling`]), and the slots the permanently resident
+    /// layers hold, which the ceiling's replay does not get.
+    #[cfg(feature = "cuda")]
+    trace: Arc<Mutex<RoutingTrace>>,
+    #[cfg(feature = "cuda")]
+    pinned_slots: usize,
 }
 
 /// Everything [`ExpertCache::new`] needs, gathered rather than passed as nine
@@ -442,10 +457,10 @@ pub struct ExpertCacheSetup<'a> {
     /// is checked against the router's bound.
     pub experts_used: usize,
     /// The checkpoint the experts come from — names the pack and identifies it.
-    pub gguf_path: &'a std::path::Path,
+    pub gguf_path: &'a Path,
     /// Where a persistent pack lives, or `None` for a temp file that is
     /// unlinked as soon as it is open and costs a repack every boot.
-    pub expert_pack_dir: Option<&'a std::path::Path>,
+    pub expert_pack_dir: Option<&'a Path>,
     pub progress: Option<&'a dyn Fn(usize, usize)>,
     pub int8mode: Int8Mode,
     /// Mapped bytes outside the experts that host RAM never serves after load —
@@ -726,13 +741,7 @@ impl ExpertCache {
                         pack
                     }
                     PackSource::Build(mut writer) => {
-                        startup_repack(
-                            targets,
-                            &mut writer,
-                            &mut ring,
-                            cuda_dev,
-                            progress,
-                        )?;
+                        startup_repack(targets, &mut writer, &mut ring, cuda_dev, progress)?;
                         // Publishing flushes and `fsync`s the whole pack — tens
                         // of gigabytes, and the single largest thing that used
                         // to happen behind a bar already reading 100%. It is
@@ -889,15 +898,24 @@ impl ExpertCache {
         };
         #[cfg(not(feature = "tensor-assert"))]
         let owner = OwnerTags::none();
+        let image_bytes: Vec<usize> = layer_geometries.iter().map(|g| slot_offsets(g).3).collect();
         let dispatch = Dispatch::new(
             cuda_dev_ref,
             table,
             [warm.pinned_range(), pad.range()],
             row_tile_bytes_for(&layer_geometries),
+            &image_bytes,
             experts_used,
             promo.clone(),
             owner,
         )?;
+        // The link read-ahead's window is sized from — only where there is
+        // anything to read ahead.
+        let link_rate = if promo.is_some() {
+            measure_link_rate(cuda_dev_ref, &copy_stream)?
+        } else {
+            0.0
+        };
         if let Ok(mut s) = stats.lock() {
             s.pad_slots = pad.num_slots();
         }
@@ -906,6 +924,9 @@ impl ExpertCache {
         let warm = Arc::new(warm);
         let pad = Arc::new(pad);
         let stager_dead = Arc::new(AtomicBool::new(false));
+        // The speculative reads the stager lands, for the pipeline thread to
+        // list from the pad.
+        let (landed_tx, landed_rx) = mpsc::channel();
         let stager = spawn_stager(
             StagerCtx {
                 pack,
@@ -916,6 +937,7 @@ impl ExpertCache {
                 ring: dispatch.ring.clone(),
                 abort: dispatch.abort.clone(),
                 consumed: dispatch.staged.clone(),
+                landed_ahead: landed_tx,
                 stats: stats.clone(),
                 rows: num_moe_layers,
                 n_experts: experts_per_layer,
@@ -923,6 +945,8 @@ impl ExpertCache {
             stager_dead.clone(),
         )?;
 
+        let trace = Arc::new(Mutex::new(RoutingTrace::new()));
+        let pinned_slots = pinned_layer_count(num_moe_layers) * experts_per_layer;
         let state = PipelineState::new(
             inner,
             device.clone(),
@@ -931,13 +955,18 @@ impl ExpertCache {
             dispatch.clock.clone(),
             dispatch.ring.clone(),
             dispatch.abort.clone(),
+            dispatch.fault.clone(),
             dispatch.pass.clone(),
             dispatch.served.clone(),
             stager.clone(),
+            landed_rx,
             Arc::new(layer_geometries),
             all_resident,
             promo,
+            link_rate,
             stats.clone(),
+            trace.clone(),
+            dispatch.votes.clone(),
         )?;
         let pipeline_dead = Arc::new(AtomicBool::new(false));
         let tx = spawn_pipeline_thread(state, pipeline_dead.clone());
@@ -951,6 +980,8 @@ impl ExpertCache {
             _warm: warm,
             _pad: pad,
             stats,
+            trace,
+            pinned_slots,
         })
     }
 
@@ -979,6 +1010,10 @@ impl ExpertCache {
     /// the pipeline thread and the stager, and the call returns. The GPU waits
     /// only in an expert GEMM's worker blocks, on a cold expert the stager is
     /// still reading.
+    ///
+    /// `look_ahead`, when given, is the next rows' routers applied to this
+    /// layer's input: their votes predict those rows' experts for read-ahead
+    /// and staging (`votes`).
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub fn forward_routed<'w>(
@@ -990,6 +1025,7 @@ impl ExpertCache {
         decode: &DecodeRows,
         out_dtype: DType,
         wave: Option<&'w WaveGeneration>,
+        look_ahead: &[LookAhead<'_>],
     ) -> Result<LiveTensor<'w>> {
         self.dispatch.forward(
             &self.tx,
@@ -1001,12 +1037,40 @@ impl ExpertCache {
             decode,
             out_dtype,
             wave,
+            look_ahead,
         )
     }
 
+    /// Fail the forward that just synchronised if any of its expert launches
+    /// gave a cold expert up (`fault`): the error names the row, the expert
+    /// and the wait. Call it only once every launch of the forward is complete.
+    ///
+    /// The word is cleared last. The pipeline thread serves its channel in
+    /// order and usually lags the forward thread, so messages of the faulted
+    /// forward may still be queued; with the word still set, none of them can
+    /// land a demand promotion, and the drop sent behind them removes every one
+    /// still pending. Cleared first, a queued landing would read the word clear
+    /// and install a slot the given-up item never wrote.
+    #[cfg(feature = "cuda")]
+    pub fn take_fault(&self) -> Result<()> {
+        let Some(fault) = self.dispatch.fault.peek() else {
+            return Ok(());
+        };
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        if self
+            .tx
+            .send(PipelineMessage::DropDemandPromotions { response_tx })
+            .is_ok()
+        {
+            let _ = response_rx.recv();
+        }
+        self.dispatch.fault.clear();
+        Err(fault.error())
+    }
+
     /// Whether the pipeline thread or the stager has exited. Its guard raised
-    /// the abort word as it went, so any expert layer enqueued since traps on
-    /// the device and the next synchronize reports it.
+    /// the abort word as it went, so any expert layer enqueued since gives its
+    /// cold experts up and the forward fails ([`Self::take_fault`]).
     #[cfg(feature = "cuda")]
     pub fn pipeline_dead(&self) -> bool {
         self.pipeline_dead.load(Ordering::Acquire) || self.stager_dead.load(Ordering::Acquire)
@@ -1156,6 +1220,8 @@ impl ExpertCache {
                     gib = c.bytes as f64 / (1u64 << 30) as f64,
                     copy_ms = c.copy_ns as f64 / 1e6,
                     cold_wait_ms = c.cold_wait_ns as f64 / 1e6,
+                    ahead_items = c.ahead_items,
+                    ahead_gib = c.ahead_bytes as f64 / (1u64 << 30) as f64,
                     "expert workers since the last snapshot"
                 );
             }
@@ -1187,10 +1253,62 @@ impl ExpertCache {
         PipelineStats::snapshot(&self.stats).zone_cedeable_bytes
     }
 
-    /// Reset all pipeline telemetry counters to zero.
+    /// Reset all pipeline telemetry counters to zero, and start a new interval
+    /// of the routing trace the residency ceiling replays.
     pub fn reset_expert_stats(&self) {
         self.settle();
         PipelineStats::reset(&self.stats);
+        #[cfg(feature = "cuda")]
+        if let Ok(mut t) = self.trace.lock() {
+            t.reset();
+        }
+    }
+
+    /// Write the routing served since the start of the previous interval to
+    /// `path`, in `routing_trace`'s file format, for offline replay.
+    pub fn write_routing_trace(&self, path: &Path) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            self.settle();
+            let capacity = self.evictable_slots().unwrap_or(0);
+            let t = self
+                .trace
+                .lock()
+                .map_err(|_| candle::Error::Msg("expert cache: routing trace poisoned".into()))?;
+            t.write(path, capacity).map_err(candle::Error::wrap)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = path;
+            Ok(())
+        }
+    }
+
+    /// The residency references for the interval since the last
+    /// [`Self::reset_expert_stats`], as hit rates in percent over the routing
+    /// served in it, at the weight zone's present capacity, on the measured
+    /// hit rate's terms: `(lru, min)` — least-recently-used eviction, and
+    /// Belady's optimum (`belady`), which no policy can beat. A replay of the
+    /// whole interval: a reporting call, never a per-step one. `None` before
+    /// any routing.
+    pub fn hit_references(&self) -> Option<(f64, f64)> {
+        #[cfg(feature = "cuda")]
+        {
+            self.settle();
+            let capacity = self.evictable_slots()?;
+            let t = self.trace.lock().ok()?;
+            Some((t.lru(capacity)?, t.ceiling(capacity)?))
+        }
+        #[cfg(not(feature = "cuda"))]
+        None
+    }
+
+    /// The weight zone's slots now, less the permanently resident layers'.
+    #[cfg(feature = "cuda")]
+    fn evictable_slots(&self) -> Option<usize> {
+        let s = PipelineStats::snapshot(&self.stats);
+        let slots = s.zone_bytes.checked_div(s.expert_slot_bytes)?;
+        Some(slots.saturating_sub(self.pinned_slots))
     }
 }
 

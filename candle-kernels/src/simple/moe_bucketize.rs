@@ -26,6 +26,17 @@ pub const PROMO_EMPTY: u64 = u64::MAX;
 /// The expert a skipped victim's log entry names, mirrored from `PROMO_SKIP`.
 pub const PROMO_SKIP: u32 = 0xffff;
 
+/// Read-ahead items one bucketize may write, mirrored from `AHEAD_MAX` in
+/// `moe_read_ahead.cuh` — which documents the item layout.
+pub const AHEAD_MAX: usize = 64;
+/// `u64` words per read-ahead item, mirrored from `AHEAD_ITEM_WORDS`.
+pub const AHEAD_ITEM_WORDS: usize = 11;
+/// Pieces each read-ahead item is copied in, mirrored from `AHEAD_CHUNKS`.
+pub const AHEAD_CHUNKS: usize = 16;
+/// Set in a promotion log entry's expert field for a read-ahead claim,
+/// mirrored from `AHEAD_FLAG`.
+pub const AHEAD_FLAG: u32 = 0x4000;
+
 /// [`run_moe_bucketize`] launched the kernel.
 pub const BUCKETIZE_LAUNCHED: i32 = 0;
 /// [`run_moe_bucketize`]'s argument guards refused the call; nothing was written.
@@ -120,6 +131,25 @@ extern "C" {
         remote_dst: *mut c_void,
         started_rows: *mut c_void,
         ticket: u64,
+        // Read-ahead, or a null `ahead_items` (which requires the ring): the
+        // mapped `u32` window (slot images the link moves in one layer) and
+        // depth (targets `row + 2 ..= row + depth`), the mapped prediction
+        // lists `u32[rows]` counts, `u32[rows][ahead_cap]` experts and
+        // `u64[rows][ahead_cap]` vetted source images — an expert is read
+        // ahead only while its entries still point at that image; the device
+        // `u64[rows][4]` row layout (gate, up, down offset, image bytes), item
+        // buffer `u64[1 + AHEAD_MAX · AHEAD_ITEM_WORDS]` and `u32[AHEAD_MAX]`
+        // piece counters.
+        ahead_window: *const c_void,
+        ahead_depth: *const c_void,
+        ahead_n: *const c_void,
+        ahead_list: *const c_void,
+        ahead_src: *const c_void,
+        ahead_cap: u32,
+        rows: i32,
+        row_layout: *const c_void,
+        ahead_items: *mut c_void,
+        ahead_done: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
 }

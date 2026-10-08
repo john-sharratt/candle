@@ -23,11 +23,16 @@ use candle::{DType, LiveTensor, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
 use candle_nn::ops::sigmoid;
 
+use crate::models::expert_lre::LookAhead;
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::quantized_mlp::QuantizedMlp;
 use crate::models::quantized_qwen3_moe::SparseMoeBlock;
 
 use super::shared_residual::add_moe_residual;
+
+/// Look-ahead routers per stacked launch: an unsplit stacked launch carries
+/// at most three weights (`qkv_segmented_matmul`).
+const LOOK_AHEAD_PER_LAUNCH: usize = 3;
 
 /// One Qwen3.5 MoE layer.
 ///
@@ -124,12 +129,17 @@ pub struct MoeParts<'w> {
 impl Qwen35MoeBlock {
     /// The layer's three parts, uncombined — see [`MoeParts`]. For a consumer
     /// that folds the combine into a pass it already makes.
+    ///
+    /// `look_ahead` are the next rows' routers, nearest first: applied to this
+    /// layer's input in the same launch, their votes predict the experts those
+    /// rows will route (`ExpertCache::forward_routed`). Empty for none.
     pub fn forward_parts<'w>(
         &self,
         acts: DynamicActs<'w>,
         out_dtype: DType,
         decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
+        look_ahead: &[&QMatMul],
     ) -> Result<MoeParts<'w>> {
         // **The three projections of the layer input as one launch.** The router, the
         // shared expert's fused gate_up and its gate all read the same q8a128 operand, and
@@ -138,6 +148,9 @@ impl Qwen35MoeBlock {
         // `[router | gate_up | gate]` side by side, and every column is the one its own
         // launch computed, bit for bit (`QMatMul::forward_stacked`). The parts below read
         // their columns of that row in place.
+        //
+        // The look-ahead routers are their own stacked launches, a few at a time: a
+        // stacked launch that does not split K carries at most `QKV_MAX_SEGS` weights.
         if let (DynamicActs::Int8(op), Some(gate_up)) = (&acts, self.shared.fused_gate_up()) {
             let n_experts = self.routed.gate.weight_dims()[0];
             let n_gate_up = gate_up.weight_dims()[0];
@@ -147,6 +160,10 @@ impl Qwen35MoeBlock {
                 &[&self.routed.gate, gate_up, &self.shared_gate],
                 out_dtype,
             )?;
+            let ahead_rows = look_ahead
+                .chunks(LOOK_AHEAD_PER_LAUNCH)
+                .map(|routers| QMatMul::forward_stacked(op, routers, DType::F32))
+                .collect::<Result<Vec<_>>>()?;
             let width = stacked.dim(stacked.rank() - 1)?;
             let rows = stacked.elem_count() / width;
             let flat = stacked.reshape((rows, width))?;
@@ -164,9 +181,27 @@ impl Qwen35MoeBlock {
                 gate: flat.narrow(1, n_experts + n_gate_up, 1)?,
             };
             let logits = flat.narrow(1, 0, n_experts)?;
+            let ahead_flat = ahead_rows
+                .iter()
+                .map(|t| {
+                    let width = t.dim(t.rank() - 1)?;
+                    t.reshape((t.elem_count() / width, width))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let ahead: Vec<LookAhead<'_>> = ahead_flat
+                .iter()
+                .zip(look_ahead.chunks(LOOK_AHEAD_PER_LAUNCH))
+                .enumerate()
+                .map(|(i, (rows, routers))| LookAhead {
+                    rows,
+                    first_col: 0,
+                    first_hop: 1 + i * LOOK_AHEAD_PER_LAUNCH,
+                    hops: routers.len(),
+                })
+                .collect();
             let routed = self
                 .routed
-                .forward_with_logits(logits, acts, out_dtype, decode, wave)?;
+                .forward_with_logits(logits, acts, out_dtype, decode, wave, &ahead)?;
             return Ok(MoeParts { routed, shared });
         }
         // Shared expert first — see the module note on ownership.
@@ -191,7 +226,8 @@ impl Qwen35MoeBlock {
         decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
     ) -> Result<()> {
-        let MoeParts { routed, shared } = self.forward_parts(acts, work_dtype, decode, wave)?;
+        let MoeParts { routed, shared } =
+            self.forward_parts(acts, work_dtype, decode, wave, &[])?;
         // The values the layer's output is made of, checked where they are
         // still separable — the routed sum, the shared expert and its gate apart,
         // then the residual they land in. Bad on an input names the addend; bad

@@ -4,8 +4,11 @@
 //! pipeline thread's messages and telemetry, and the public API.
 
 use super::compute::QMatMul;
+use super::read_latency::ReadLatency;
+use super::transition::HOPS as LOOK_AHEAD_HOPS;
 use crate::models::profile::{ProfileMark, ProfileSnapshot};
 use candle::quantized::GgmlDType;
+use candle::LiveTensor;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -34,12 +37,9 @@ pub struct PipelineStats {
     /// Experts evicted from VRAM. A retarget, not a copy — every expert has a
     /// copy in the pack, and usually one in pinned memory.
     pub evictions: usize,
-    /// Promotions into VRAM that landed by the copy engine, from a pinned slot
-    /// (the speculative ones), and their bytes.
-    pub promotions: usize,
-    pub promotion_bytes: usize,
     /// Promotions the GEMM workers made: misses whose slices they also wrote
-    /// into a VRAM slot from the promotion ring — no link traffic of their own.
+    /// into a VRAM slot from the promotion ring — no link traffic of their own —
+    /// and the read-ahead claims among the promotions they landed.
     pub worker_promotions: usize,
     /// Cold experts the stager staged for a routed row, of them those copied
     /// from a pageable warm slot rather than read from the pack, the ones it
@@ -47,10 +47,26 @@ pub struct PipelineStats {
     pub staged_cold: usize,
     pub staged_paged: usize,
     pub staged_speculative: usize,
+    /// Cold experts the pipeline thread's predictions asked the stager to
+    /// stage ahead. Over this, `staged_speculative` is how many reads the
+    /// stager issued for them; the rest were readable by the time their turn
+    /// came, or found no slot worth taking.
+    pub stage_requests: usize,
+    /// Of the experts staged ahead, those their row then routed — over
+    /// `staged_speculative`, the stager's lookahead precision.
+    pub staged_ahead_routed: usize,
+    /// Of the experts staged ahead, those read-ahead listed from the pad as
+    /// they landed — in time for a launch to read them ahead of their row.
+    pub staged_listed: usize,
     pub staged_bytes: usize,
     /// Reader time summed over the stager's reads, ns — `staged_bytes` over
     /// this is the per-reader rate.
     pub stage_read_ns: u64,
+    /// The stager's reads from the pack and from pageable warm slots, each
+    /// with its slowest read and its count of slow ones — which of the two a
+    /// stalled cold wait was waiting on.
+    pub pack_reads: ReadLatency,
+    pub paged_reads: ReadLatency,
     /// Pad slots the stager took back from a staged expert.
     pub pad_evictions: usize,
     /// **Gauge**, not a tally: experts the warm tier holds, of the model's
@@ -69,24 +85,34 @@ pub struct PipelineStats {
     /// `moe_layers` layers, and a layer's copy is capped at `total_experts /
     /// moe_layers` experts. Their product alone cannot say either.
     pub moe_layers: usize,
-    /// Speculative promotions (predictor and wide-row lookahead) that landed.
-    pub prefetch_promotions: usize,
-    /// Speculatively promoted experts that the layer actually routed to.
-    /// Numerator of prediction precision.
+    /// Read-ahead claims: ring slots bucketize gave a predicted warm expert of a
+    /// later row, copied and published by its gate launch's workers — and their
+    /// bytes, the link time read-ahead spent.
+    pub ahead_claims: usize,
+    pub ahead_bytes: usize,
+    /// Of the read-ahead claims, those copied from the pad — staged ahead off
+    /// the drive first, then read ahead into VRAM.
+    pub ahead_pad_claims: usize,
+    /// The router look-ahead's predictions by hop (`votes`): experts predicted
+    /// for the row `h + 1` past the one that voted, judged against that row's
+    /// routing, and of them the ones it routed.
+    pub lookahead_judged: [usize; LOOK_AHEAD_HOPS],
+    pub lookahead_hits: [usize; LOOK_AHEAD_HOPS],
+    /// Experts read ahead that their row then routed. Numerator of prediction
+    /// precision.
     pub predicted_hits: usize,
-    /// Total speculatively promoted experts evaluated against actual routing.
-    /// Denominator of prediction precision.
+    /// Experts read ahead, judged against their row's routing. Denominator of
+    /// prediction precision.
     pub predicted_total: usize,
-    /// Speculative promotions still in flight when their target layer's
-    /// routing arrived. The latency-bound signal for the dynamic load-ahead
-    /// controller: late > 0 with bandwidth slack means the prefetcher should
-    /// issue earlier (deepen N); late ≈ 0 with falling precision means it
-    /// should shallow back.
-    pub late_loads: usize,
-    /// **Gauge**: the dynamic load-ahead depth `N` as of the last pass
-    /// boundary — how many layers ahead the speculative prefetcher currently
-    /// issues for.
+    /// **Gauge**: how many rows ahead read-ahead looks — a launch at `r` reads
+    /// for `r + 2 ..= r + prefetch_depth`.
     pub prefetch_depth: usize,
+    /// **Gauge**: the read-ahead window as of the last pass boundary — slot
+    /// images the link moves in one layer, at the read-ahead share.
+    pub ahead_window: usize,
+    /// **Gauge**: pad slots read-ahead's listings hold pinned — the pad-backed
+    /// experts it may read ahead, and those whose readers have yet to finish.
+    pub ahead_pinned: usize,
     /// Routed layers the pipeline thread has processed — one per MoE layer per
     /// forward.
     pub routed_messages: usize,
@@ -136,6 +162,13 @@ pub struct PipelineStats {
     /// **Gauge**: bytes one expert slot occupies — the unit every figure above
     /// is a multiple of, and the grain the rate model prices a routed expert in.
     pub expert_slot_bytes: usize,
+    /// The residency references: LRU's and Belady's hit rates, in percent,
+    /// over the routing of the interval these tallies cover, at the zone's
+    /// capacity (`ExpertCache::hit_references`). Not kept by the pipeline
+    /// thread — a replay of the whole interval, too costly per layer — but
+    /// filled by a reader that asks for them beside the tallies; 0 otherwise.
+    pub hit_lru: f64,
+    pub hit_ceiling: f64,
 }
 
 impl PipelineStats {
@@ -169,19 +202,25 @@ impl PipelineStats {
             s.worker_pinned = 0;
             s.worker_cold = 0;
             s.evictions = 0;
-            s.promotions = 0;
-            s.promotion_bytes = 0;
             s.worker_promotions = 0;
             s.staged_cold = 0;
             s.staged_paged = 0;
             s.staged_speculative = 0;
+            s.stage_requests = 0;
+            s.staged_ahead_routed = 0;
+            s.staged_listed = 0;
             s.staged_bytes = 0;
             s.stage_read_ns = 0;
+            s.pack_reads = ReadLatency::default();
+            s.paged_reads = ReadLatency::default();
             s.pad_evictions = 0;
-            s.prefetch_promotions = 0;
+            s.ahead_claims = 0;
+            s.ahead_bytes = 0;
+            s.ahead_pad_claims = 0;
             s.predicted_hits = 0;
             s.predicted_total = 0;
-            s.late_loads = 0;
+            s.lookahead_judged = [0; LOOK_AHEAD_HOPS];
+            s.lookahead_hits = [0; LOOK_AHEAD_HOPS];
             s.routed_messages = 0;
             s.pipeline_lag = 0;
             s.ring_taken = 0;
@@ -189,6 +228,8 @@ impl PipelineStats {
             s.victims_skipped = 0;
             s.ring_unslotted = 0;
             s.decode_unslotted = 0;
+            s.hit_lru = 0.0;
+            s.hit_ceiling = 0.0;
         }
     }
 
@@ -202,10 +243,21 @@ impl PipelineStats {
         }
     }
 
-    /// Prediction precision as a percentage (0.0–100.0): of all
-    /// speculatively loaded experts, the fraction the layer actually routed
-    /// to.  This isolates the transition-matrix predictor's quality from the
-    /// overall cache hit rate.  Returns 0.0 when no speculative loads occurred.
+    /// The router look-ahead's precision at hop `h` (1-based), in percent; 0
+    /// when nothing was judged there.
+    pub fn lookahead_precision(&self, h: usize) -> f64 {
+        let judged = self.lookahead_judged[h - 1];
+        if judged == 0 {
+            0.0
+        } else {
+            100.0 * self.lookahead_hits[h - 1] as f64 / judged as f64
+        }
+    }
+
+    /// Prediction precision as a percentage (0.0–100.0): of the experts read
+    /// ahead, the fraction their row actually routed to. This isolates the
+    /// predictor's quality from the overall cache hit rate. Returns 0.0 when
+    /// nothing was read ahead.
     pub fn prediction_precision(&self) -> f64 {
         if self.predicted_total == 0 {
             0.0
@@ -217,10 +269,11 @@ impl PipelineStats {
 
 #[cfg(test)]
 mod stats_tests {
-    use super::PipelineStats;
+    use super::{PipelineStats, ReadLatency};
 
     /// A reset clears the tallies and keeps the gauges — including the warm
-    /// tier's pageable share, which a report reads after every config.
+    /// tier's pageable share and the read-ahead window, which a report reads
+    /// after every config.
     #[test]
     fn a_reset_keeps_the_gauges() {
         let shared = PipelineStats::new_shared();
@@ -229,15 +282,69 @@ mod stats_tests {
             s.warm_slots = 13_508;
             s.warm_paged_slots = 2_138;
             s.pad_slots = 256;
+            s.ahead_window = 14;
+            s.prefetch_depth = 4;
             s.worker_cold = 11_225;
-            s.promotion_bytes = 4096;
+            s.ahead_bytes = 4096;
+            s.ahead_claims = 3;
+            s.ahead_pad_claims = 2;
+            s.staged_listed = 9;
+            s.stage_requests = 4;
+            s.lookahead_judged = [10, 8, 0, 0, 4];
+            s.lookahead_hits = [7, 2, 0, 0, 1];
+            assert_eq!(
+                (1..=5)
+                    .map(|h| s.lookahead_precision(h))
+                    .collect::<Vec<_>>(),
+                vec![70.0, 25.0, 0.0, 0.0, 25.0]
+            );
             s.stage_read_ns = 77;
+            s.pack_reads.record(250_000_000);
+            s.paged_reads.record(1_000);
         }
         PipelineStats::reset(&shared);
         let s = PipelineStats::snapshot(&shared);
-        assert_eq!((s.warm_slots, s.warm_paged_slots, s.pad_slots), (13_508, 2_138, 256));
-        assert_eq!((s.worker_cold, s.promotion_bytes, s.stage_read_ns), (0, 0, 0));
+        assert_eq!(
+            (s.warm_slots, s.warm_paged_slots, s.pad_slots),
+            (13_508, 2_138, 256)
+        );
+        assert_eq!((s.ahead_window, s.prefetch_depth), (14, 4));
+        assert_eq!(
+            (
+                s.worker_cold,
+                s.ahead_bytes,
+                s.ahead_claims,
+                s.stage_read_ns
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            (s.ahead_pad_claims, s.staged_listed, s.stage_requests),
+            (0, 0, 0)
+        );
+        assert_eq!((s.lookahead_judged, s.lookahead_hits), ([0; 5], [0; 5]));
+        assert_eq!(
+            (s.pack_reads, s.paged_reads),
+            (ReadLatency::default(), ReadLatency::default())
+        );
     }
+}
+
+// ============================================================================
+// Router look-ahead
+// ============================================================================
+
+/// Some of the next rows' routers applied to this layer's input: `rows` is a
+/// stacked projection, `[tokens, width]` f32, holding `hops` routers of
+/// `n_experts` columns each from column `first_col`, for hops `first_hop ..
+/// first_hop + hops` — hop `h`'s router is row `row + h`'s. The expert forward
+/// turns them into votes for the experts those rows will route (`votes`).
+#[derive(Clone, Copy)]
+pub struct LookAhead<'a> {
+    pub rows: &'a LiveTensor<'a>,
+    pub first_col: usize,
+    pub first_hop: usize,
+    pub hops: usize,
 }
 
 // ============================================================================
@@ -313,6 +420,9 @@ pub struct RoutedLayer {
     /// are pulled by enough workers to saturate the link, so a speculative copy
     /// for the next row competes with them.
     pub prefill_width: bool,
+    /// Hops of router look-ahead votes the invocation writes into its vote
+    /// ring slot (`votes`); 0 when it writes none.
+    pub voted_hops: usize,
     /// Timestamp captured just before `send`, so the worker can measure the
     /// hand-off. Zero-sized off-`profile`.
     pub submitted_at: ProfileMark,
@@ -326,9 +436,10 @@ pub enum PipelineMessage {
     /// Answer once every message sent before this one has been processed. What
     /// a reader of the counters, or of anything else the pipeline thread
     /// writes, sends first to read them complete.
-    Settle {
-        response_tx: mpsc::SyncSender<()>,
-    },
+    Settle { response_tx: mpsc::SyncSender<()> },
+    /// A forward faulted (`fault`): drop the demand promotions still to land,
+    /// whose slots its workers may have left part-written. Answers when done.
+    DropDemandPromotions { response_tx: mpsc::SyncSender<()> },
     /// Snapshot and reset the pipeline thread’s profile accumulator.
     SnapshotProfile {
         /// Oneshot channel for returning the snapshot.

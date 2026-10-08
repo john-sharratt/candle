@@ -553,7 +553,10 @@ impl Scheduler {
         let pass = match &outcome {
             Ok(r) => Some(PackPass {
                 released: r.arenas_released,
-                clipped: r.clipped,
+                // Another pass right away when this one ran out of budget, or capped a
+                // pool's plan and still handed regions back. A capped pass that freed
+                // nothing is not pursued: re-running it would plan the same moves.
+                clipped: r.clipped || (r.plan_capped && r.arenas_released > 0),
             }),
             Err(
                 candle_nn::kv_cache::CompactionRefused::WaveInFlight
@@ -598,6 +601,7 @@ impl Scheduler {
                         report.regions_reclaimed() * (candle_nn::kv_cache::REGION_BYTES >> 20),
                     substrate_sequences = swept,
                     clipped = report.clipped,
+                    plan_capped = report.plan_capped,
                     // **What the pass waited for, beside what it did.** The pre-plan
                     // drain is the one phase whose cost belongs to other work — it
                     // waits for whatever was in flight when the pass began — and it
@@ -610,6 +614,14 @@ impl Scheduler {
                     // claim walk. A pass that clips after one batch spent its budget in
                     // the first.
                     plan_us = report.timings.plan.as_micros(),
+                    // The plan's three steps, so a slow plan names its step.
+                    census_us = report.timings.census.as_micros(),
+                    provision_us = report.timings.provision.as_micros(),
+                    walk_us = report.timings.walk.as_micros(),
+                    planned_moves = report.planned_moves,
+                    pools_censused = report.pools_censused,
+                    pools_ranked = report.pools_ranked,
+                    first_source_rank = ?report.first_source_rank,
                     claim_us = report.timings.claim.as_micros(),
                     // The host walk over every slot's decode-buffer pins, outside the
                     // budget like the quiesce. Named because it scales with slots ×

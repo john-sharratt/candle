@@ -406,3 +406,74 @@ MOE_ROUTE_ENTRY(moe_route_f32_x512, float, 16)
 MOE_ROUTE_ENTRY(moe_route_f16_x512, __half, 16)
 MOE_ROUTE_ENTRY(moe_route_bf16_x512, __nv_bfloat16, 16)
 #undef MOE_ROUTE_ENTRY
+
+// ============================================================================
+// Router look-ahead votes
+// ============================================================================
+//
+// A later layer's router applied to this layer's FFN input predicts the experts
+// that layer will route: the residual stream changes little from one layer to
+// the next. The look-ahead logits come out of the layer's own stacked
+// projection — `hops` routers of `n_experts` columns each, the first at column
+// `first_col` of a `row_stride`-wide row — and this kernel turns them into one
+// vote count per expert and hop: how many of the launch's tokens put the expert
+// in their top `k`. Block `h` takes hop `h`; one warp owns one token at a time,
+// its top `k` found exactly as `moe_route_impl` finds it (warp argmax rounds,
+// lowest index on a tie), the winners counted in shared memory. The counts go
+// to `out[h][n_experts]` — mapped host memory the expert pipeline reads beside
+// the layer's routing summary — behind a system fence, so a reader that has
+// seen any later store of the stream (the summary word) sees them.
+#define MOE_VOTE_MAX_EXPERTS 512
+#define MOE_VOTE_SLOTS (MOE_VOTE_MAX_EXPERTS / 32)
+
+extern "C" __global__ void moe_predict_votes_f32(
+    const float* __restrict__ logits, // [num_tokens, row_stride]
+    uint32_t* __restrict__ out,       // [hops, n_experts], mapped
+    int num_tokens, int n_experts, int row_stride, int first_col, int k
+) {
+    __shared__ uint32_t votes[MOE_VOTE_MAX_EXPERTS];
+    const int hop = (int)blockIdx.x;
+    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) votes[e] = 0u;
+    __syncthreads();
+
+    const unsigned FULL = 0xffffffffu;
+    const int lane = (int)(threadIdx.x & 31);
+    const int warp = (int)(threadIdx.x >> 5);
+    const int n_warps = (int)(blockDim.x >> 5);
+    const int col0 = first_col + hop * n_experts;
+    for (int token = warp; token < num_tokens; token += n_warps) {
+        const float* row = logits + (size_t)token * (size_t)row_stride + col0;
+        float v[MOE_VOTE_SLOTS];
+        #pragma unroll
+        for (int j = 0; j < MOE_VOTE_SLOTS; ++j) {
+            const int e = lane + 32 * j;
+            v[j] = e < n_experts ? row[e] : -INFINITY;
+        }
+        for (int p = 0; p < k; ++p) {
+            float bv = -INFINITY;
+            int bi = n_experts;
+            #pragma unroll
+            for (int j = 0; j < MOE_VOTE_SLOTS; ++j) {
+                const int e = lane + 32 * j;
+                if (e < n_experts && v[j] > bv) { bv = v[j]; bi = e; }
+            }
+            for (int off = 16; off > 0; off >>= 1) {
+                const float obv = __shfl_xor_sync(FULL, bv, off);
+                const int obi = __shfl_xor_sync(FULL, bi, off);
+                if (obv > bv || (obv == bv && obi < bi)) { bv = obv; bi = obi; }
+            }
+            if (bi >= n_experts) break;
+            if (lane == 0) atomicAdd(&votes[bi], 1u);
+            #pragma unroll
+            for (int j = 0; j < MOE_VOTE_SLOTS; ++j) {
+                if (lane + 32 * j == bi) v[j] = -INFINITY;
+            }
+        }
+    }
+    __syncthreads();
+    uint32_t* dst = out + (size_t)hop * (size_t)n_experts;
+    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
+        ((volatile uint32_t*)dst)[e] = votes[e];
+    }
+    __threadfence_system();
+}
