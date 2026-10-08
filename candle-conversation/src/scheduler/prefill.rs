@@ -3764,9 +3764,14 @@ impl Scheduler {
             } else {
                 FinishReason::Length
             };
-            // A one-token reply is still a reply: its token reaches the stream
-            // on both paths below, which otherwise finish it without decoding.
-            if streams_committed(first_is_eos) {
+            // **A turn with no decode budget has no reply.** The token sampled
+            // after its prefill is never forwarded — it is the model's guess at
+            // what would come next — so it is not streamed, not reported, and not
+            // written into the turn's text. A turn WITH a budget whose first token
+            // ended it is a one-token reply, and that token reaches the stream on
+            // both paths below, which otherwise finish it without decoding.
+            let replies = work.max_decode_tokens > 0;
+            if replies && streams_committed(first_is_eos) {
                 let _ = work.event_tx.send(TurnEvent::Token(first_token));
             }
             // View sequences (SubmitTurn path): the prefill already wrote KV
@@ -3832,17 +3837,19 @@ impl Scheduler {
                     pending_mask: None,
                     recorded_reply: work.recorded_reply.map(Replay::new),
                 };
-                // The turn's first token opens a page at the prefill/decode
-                // boundary, so the reasoning starts one of its own.
-                state.push_committed(first_token, self.think_close, &self.page_break_tokens);
-                // No speculative rewind can be in flight — this turn decodes
-                // nothing — so the cut is taken at once.
-                super::flush_page_cut(self.model.as_ref(), work.sequence_id, &mut state);
+                if replies {
+                    // The turn's first token opens a page at the prefill/decode
+                    // boundary, so the reasoning starts one of its own.
+                    state.push_committed(first_token, self.think_close, &self.page_break_tokens);
+                    // No speculative rewind can be in flight — this turn decodes
+                    // nothing more — so the cut is taken at once.
+                    super::flush_page_cut(self.model.as_ref(), work.sequence_id, &mut state);
+                }
                 self.active_decodes.insert(work.sequence_id, state);
             } else {
                 self.finish_immediately(
                     work.sequence_id,
-                    first_token,
+                    replies.then_some(first_token),
                     &work.event_tx,
                     prefill_ms,
                     turn_start,
