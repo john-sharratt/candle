@@ -1156,7 +1156,7 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                     // Being at the lift, or in it, is where the body is standing,
                     // not a fact about the channel — said in `needs` instead.
                     | Availability::AtLift
-                    | Availability::InLift => true,
+                    | Availability::AtLanding => true,
                     Availability::PhysicalOnly => **m == Mode::Physical,
                     Availability::MessagingOnly => m.remote(),
                     Availability::Pictorial => m.carries_pictures(),
@@ -1222,7 +1222,7 @@ fn describe_catalog(part_names: &PartNames) -> Value {
                         None => json!("standing at a station"),
                     },
                     Availability::AtLift => json!("at the lift, with it on another floor"),
-                    Availability::InLift => json!("in the lift, its doors open"),
+                    Availability::AtLanding => json!("at the lift, wherever the car is"),
                 },
                 // Every station, named, however many there are. The `needs`
                 // line above summarises for the table; this is what the detail

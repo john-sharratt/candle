@@ -18,6 +18,13 @@
 //! decodes under [`think_off`] with the segment closed after one token — the
 //! reflection's and the dream's mechanism.
 //!
+//! # An answer can be a call
+//!
+//! [`decode_call`] holds the turn to one of a set of calls — the dialect's own
+//! call envelope, every argument closing on its terminator — and returns the call
+//! as written, for a caller that reads its fields. The command table's mission
+//! generator answers this way (`engine::mission_gen`).
+//!
 //! # A fixed set of answers is a grammar, not a request
 //!
 //! `choices` compiles to a stencil whose root branches once per arm, so an answer
@@ -29,7 +36,9 @@
 use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::{Builder, GroupId, LayerId, Reserved, SectionId};
-use candle_conversation::stencil::{StencilTree, StencilTreeBuilder};
+use candle_conversation::stencil::{
+    compile_tool_call_tree, StencilTree, StencilTreeBuilder, ToolCallEnvelope, ToolSpec,
+};
 use candle_conversation::{
     ConversationEngine, Sequence, SequenceConfig, TokenDecoder, TurnEvent, TurnOptions,
     TurnResponse,
@@ -50,9 +59,6 @@ pub async fn decode(
     seed: u64,
     on_fragment: &mut (dyn FnMut(&str) + Send),
 ) -> anyhow::Result<Answer> {
-    let mut cfg = base.clone();
-    // One turn with nothing before it: there is no history to carry.
-    cfg.context_window_turns = 0;
     let system = match request.system.trim() {
         "" => DEFAULT_SYSTEM,
         _ => request.system.as_str(),
@@ -70,6 +76,104 @@ pub async fn decode(
         }
         _ => (think_off(engine, base), None),
     };
+    let held = Held {
+        turn_grammar,
+        prefill,
+        max_tokens: request.max_tokens as usize,
+        temperature: request.temperature,
+    };
+    let (text, tokens) = framed(
+        engine,
+        base,
+        system,
+        &request.prompt,
+        held,
+        seed,
+        on_fragment,
+    )
+    .await?;
+    Ok(Answer {
+        text: plain_prose(&text),
+        tokens,
+        seed,
+    })
+}
+
+/// One answer to ask for as a call — see [`decode_call`].
+pub struct CallAsk<'a> {
+    /// The voice.
+    pub system: &'a str,
+    /// What is asked.
+    pub prompt: &'a str,
+    /// The calls the answer may be — one of them, and nothing else.
+    pub calls: &'a [ToolSpec],
+    pub max_tokens: usize,
+    /// `None` keeps the checkpoint's own.
+    pub temperature: Option<f32>,
+    pub seed: u64,
+}
+
+/// Decode an answer held to one of `ask.calls`, and return the call as written.
+///
+/// **The answer is the call, not prose about it.** The turn opens inside the
+/// dialect's call envelope and every argument closes on its own terminator —
+/// the reflection's mechanism (`reflect::call_tree`) — so what comes back is a
+/// call the caller reads with [`crate::engine::journal::tools::arguments`].
+pub async fn decode_call(
+    engine: &Arc<Mutex<ConversationEngine>>,
+    base: &SequenceConfig,
+    ask: &CallAsk<'_>,
+) -> anyhow::Result<String> {
+    let tree = compile_tool_call_tree(ask.calls, &ToolCallEnvelope::for_dialect(&base.dialect))
+        .map_err(|e| anyhow::anyhow!("the answer grammar would not build: {e:#}"))?;
+    let tree = engine.lock().unwrap().compile_stencil(&tree)?;
+    let held = Held {
+        turn_grammar: Some(Arc::new(tree)),
+        prefill: None,
+        max_tokens: ask.max_tokens,
+        temperature: ask.temperature,
+    };
+    let (text, _) = framed(
+        engine,
+        base,
+        ask.system,
+        ask.prompt,
+        held,
+        ask.seed,
+        &mut |_: &str| {},
+    )
+    .await?;
+    Ok(text)
+}
+
+/// What one job's turn is held to.
+struct Held {
+    turn_grammar: Option<Arc<StencilTree>>,
+    prefill: Option<String>,
+    max_tokens: usize,
+    temperature: Option<f32>,
+}
+
+/// One turn under `system`, in a conversation opened for it and then thrown
+/// away. Returns the text past any prefilled opening, and the tokens decoded.
+async fn framed(
+    engine: &Arc<Mutex<ConversationEngine>>,
+    base: &SequenceConfig,
+    system: &str,
+    prompt: &str,
+    held: Held,
+    seed: u64,
+    on_fragment: &mut (dyn FnMut(&str) + Send),
+) -> anyhow::Result<(String, u32)> {
+    let mut cfg = base.clone();
+    // One turn with nothing before it: there is no history to carry.
+    cfg.context_window_turns = 0;
+    let Held {
+        turn_grammar,
+        prefill,
+        max_tokens,
+        temperature,
+    } = held;
 
     let formatted = base.dialect.format_system_prompt(system);
     // Taken outside the engine lock below, so that when it is let go — at the
@@ -97,25 +201,18 @@ pub async fn decode(
         .with_seed(seed)
         .with_graceful_segment_close_after(0)
         .with_force_segment_close_after(1);
-    if let Some(t) = request.temperature {
+    if let Some(t) = temperature {
         sampling.temperature = t;
     }
     let options = TurnOptions {
-        max_tokens: Some(request.max_tokens as usize),
+        max_tokens: Some(max_tokens),
         sampling: Some(sampling),
         turn_grammar,
         assistant_prefill: prefill.clone(),
         ..Default::default()
     };
 
-    let decoded = run_turn(
-        &mut sequence,
-        &request.prompt,
-        options,
-        &decoder,
-        on_fragment,
-    )
-    .await;
+    let decoded = run_turn(&mut sequence, prompt, options, &decoder, on_fragment).await;
     drop(sequence);
 
     let r = decoded?;
@@ -125,11 +222,7 @@ pub async fn decode(
         Some(p) => r.text.strip_prefix(p.as_str()).unwrap_or(&r.text),
         None => r.text.as_str(),
     };
-    Ok(Answer {
-        text: plain_prose(text),
-        tokens: r.stats.tokens_generated as u32,
-        seed,
-    })
+    Ok((text.to_string(), r.stats.tokens_generated as u32))
 }
 
 /// A transient frame this job holds, released when the job is done with it.

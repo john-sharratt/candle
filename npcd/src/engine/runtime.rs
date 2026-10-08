@@ -81,9 +81,11 @@ use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mission::{
-    compass_line, compass_report_line, progress_line, Aim, Mission, MissionPrompt,
+    compass_line, compass_report_line, doc_compass, progress_line, Aim, DeskVerbs, DocStep,
+    Mission, MissionPrompt,
 };
 use crate::engine::mission_acts;
+use crate::engine::mission_gen;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::reflect;
 use crate::engine::schema;
@@ -613,8 +615,8 @@ pub const TO_THE_TABLE: &str =
     "The command table is open and there is work waiting for you. Leave off \
      whatever you are doing or saying and go to it now. The table is in the \
      command room, on the command level: if you are on another floor, go to the \
-     lift, call it with `lift_call`, ride it to the command level with \
-     `lift_use`, and then `move_to` the command room — you cannot walk between \
+     lift, ride it to the command level with `lift_use` — it calls the car and \
+     waits for it — and then `move_to` the command room; you cannot walk between \
      floors. This comes before talk — do not answer the room, go. Once you are \
      there, the table is on your effector device: `scan` to see what it offers, \
      then take up a mission by `invoke` on its `collect_mission`. Carry it out, \
@@ -1165,7 +1167,12 @@ impl Runtime {
                 .filter(|t| !t.done)
                 .map(|t| t.text.clone())
                 .collect();
-            let arrived = s.missions.arrived_in(&body, &room);
+            let level = w
+                .map()
+                .get(&at.area)
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            let arrived = s.missions.arrived_in(&body, &room, &level);
             let names: Vec<String> = here.iter().map(|(n, _)| n.clone()).collect();
             let read = s.missions.read_off(&body, &names);
             // Whoever is in the room with it: a step to find them is met.
@@ -1235,7 +1242,23 @@ impl Runtime {
     pub fn mission_compass(&self, npc_id: u64) -> Option<String> {
         let (hosted, body) = self.body_of(npc_id)?;
         let at_table = self.at_command_table(npc_id);
+        // The desk's own addresses, for a step about a document — read before
+        // the world is borrowed below, which this also reads.
+        let urls = self.invokable_urls(&hosted, &body);
+        let url_of = |act: &str| urls.iter().find(|i| i.act == act).map(|i| i.url.clone());
+        let desk = DeskVerbs {
+            read: url_of("file_read"),
+            write: url_of("file_write"),
+            edit: url_of("file_edit"),
+            commit: url_of("bench_commit"),
+        };
         hosted.with_both(|w, s| {
+            // Riding the lift, there is nothing to do but arrive: told the way
+            // from the landing it is still standing on, a rider tried to call
+            // the car it was already in.
+            if w.riding(&body).is_some() {
+                return None;
+            }
             let mission = s.missions.active(&body)?;
             let next = mission.next_step()?.clone();
             let here = w.actor(&body)?.at.clone();
@@ -1254,12 +1277,12 @@ impl Runtime {
                 let at_lift = w.node(&here).is_some_and(|n| n.kind == NodeKind::Core);
                 Some(match at_lift {
                     true => format!(
-                        "{room}, on {level}. You are at the lift: `lift_call` it if it is not \
-                         here, then `lift_use` naming {level}, then `move_to` {room}"
+                        "{room}, on {level}. You are at the lift: `lift_use` naming {level} — it \
+                         calls the car and waits for it if it is not here — then `move_to` {room}"
                     ),
                     false => format!(
-                        "{room}, on {level}: `move_to` the lift, `lift_call` it, `lift_use` \
-                         naming {level}, then `move_to` {room}"
+                        "{room}, on {level}: `move_to` the lift, `lift_use` naming {level}, then \
+                         `move_to` {room}"
                     ),
                 })
             };
@@ -1286,10 +1309,26 @@ impl Runtime {
                     &mission.observed,
                 ));
             }
+            if let Some(doc) = DocStep::of(&next.text) {
+                // The nearest desk that reads documents, when this is not one.
+                let way = (desk.read.is_none())
+                    .then(|| {
+                        reach
+                            .iter()
+                            .find(|at| s.part_offers(&place(at), "file_read"))
+                            .and_then(&way_to)
+                    })
+                    .flatten();
+                return Some(doc_compass(&doc, &desk, way.as_deref()));
+            }
             let way = Aim::of(&next.text).and_then(|aim| {
                 let target = reach
                     .iter()
-                    .find(|at| w.node(at).is_some_and(|n| aim.is_room(&n.name)))
+                    .find(|at| {
+                        let level = w.map().get(&at.area).map(|a| a.name.as_str());
+                        w.node(at)
+                            .is_some_and(|n| aim.is_room(&n.name, level.unwrap_or_default()))
+                    })
                     .or_else(|| {
                         let d = s.devices.iter().find(|d| aim.is_machine(&d.name))?;
                         reach.iter().find(|at| place(at) == d.at)
@@ -3664,6 +3703,11 @@ fn load(
     // here is only that the load is over.
     p.mark_ready();
     tracing::info!("engine ready in {:?}", rt.uptime());
+
+    // The command table's generator, once there is a cast to set work for.
+    if rt_handle.is_some() {
+        mission_gen::run::spawn(Arc::clone(rt));
+    }
 
     supervise(rt);
     Ok(())
@@ -6538,7 +6582,8 @@ mod tests {
 
         // At the table with the work done: report it now.
         hosted.with_sim(|s| {
-            s.missions.arrived_in("m2", "the plant room");
+            s.missions
+                .arrived_in("m2", "the plant room", "the command level");
             s.missions
                 .read_off("m2", &["the coolant valve".to_string()]);
         });

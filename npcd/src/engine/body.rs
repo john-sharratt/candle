@@ -571,6 +571,17 @@ fn thing_here_called(hosted: &Hosted, body: &str, want: &str) -> Option<String> 
 /// a list that named sixty rooms would be a list nobody could read.
 pub fn destinations(hosted: &Hosted, body: &str) -> Vec<(String, Where)> {
     hosted.read(|w| {
+        // **Nowhere, while it rides the lift.** A rider waits on its landing
+        // until the car opens at its floor, and it is offered turns while it
+        // waits — and a `move_to` taken then walks it off the landing and
+        // abandons the ride. Measured: a Keeper on a mission to the casting
+        // level boarded, set off, and walked back to the command room on the
+        // next turn, five times running, until the cast agreed the lift was
+        // broken. A body that has boarded has chosen; it goes nowhere else until
+        // it is set down.
+        if w.riding(body).is_some() {
+            return Vec::new();
+        }
         // **From where the body began deciding, while it is deciding.** The
         // grammar offers these names before a decode that outlasts a step of
         // the metronome, and the act chosen from them is answered after it.
@@ -1240,6 +1251,12 @@ mod tests {
         let dest_name = h.read(|w| w.floor_name(dest).unwrap().to_string());
         let out = perform(&h, "m1", &act("lift_use", json!({ "floor": dest_name })));
         assert!(out.happened(), "the ride was refused: {out:?}");
+        // Boarded, it is offered nowhere to walk: a `move_to` now would step it
+        // off the landing and abandon the ride.
+        assert!(
+            destinations(&h, "m1").is_empty(),
+            "a rider was offered somewhere to walk off to"
+        );
 
         let dest_core = shaft[dest].clone();
         for _ in 0..80 {
@@ -1255,6 +1272,49 @@ mod tests {
             dest_core,
             "the rider was not set down on the level they chose"
         );
+        assert!(
+            !destinations(&h, "m1").is_empty(),
+            "set down, it can walk again"
+        );
+    }
+
+    /// **Asking to ride with the car away is waiting for it.** One act: the car
+    /// is called, the body waits on the landing with nowhere offered to walk
+    /// off to, and is carried to the level it named.
+    #[test]
+    fn riding_with_the_car_away_calls_it_and_carries_the_body() {
+        let h = vault();
+        let shaft: Vec<Where> = h.read(|w| w.shaft().to_vec());
+        let (from, dest) = (shaft.len() - 1, 0);
+        h.with(|w| {
+            w.enter("m1", "Maker-01", shaft[from].clone()).unwrap();
+        });
+        h.delta("m1");
+        assert!(
+            !h.read(|w| w.lift().unwrap().boardable_at(from)),
+            "the car starts elsewhere"
+        );
+        let dest_name = h.read(|w| w.floor_name(dest).unwrap().to_string());
+        let out = perform(&h, "m1", &act("lift_use", json!({ "floor": dest_name })));
+        assert!(
+            out.line()
+                .unwrap()
+                .starts_with("The lift is on another floor. You call it and wait"),
+            "{out:?}"
+        );
+        assert!(
+            destinations(&h, "m1").is_empty(),
+            "a waiting rider wandered"
+        );
+        for _ in 0..160 {
+            if h.read(|w| w.actor("m1").unwrap().at.clone()) == shaft[dest] {
+                break;
+            }
+            h.with(|w| {
+                w.tick();
+            });
+        }
+        assert_eq!(h.read(|w| w.actor("m1").unwrap().at.clone()), shaft[dest]);
     }
 
     /// Riding the lift from off the shaft, or with the car away, is refused with

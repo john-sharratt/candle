@@ -163,13 +163,12 @@ pub enum Availability {
     PhysicalOnly,
     /// Only while standing on a lift landing with the car somewhere else — the
     /// one moment calling it does anything. With the car already open here there
-    /// is nothing to call, so the act is absent and [`Availability::InLift`]'s is
-    /// present instead. See [`crate::engine::lift`].
+    /// is nothing to call, so the act is absent. See [`crate::engine::lift`].
     AtLift,
-    /// Only while standing on a landing with the car open at it — you are in the
-    /// lift and can choose a floor. Absent while the car is elsewhere, when there
-    /// is nothing to ride.
-    InLift,
+    /// While standing on a landing, wherever the car is: with it open here you
+    /// get in and ride, with it elsewhere it is called and you wait to ride it.
+    /// Absent once you have asked to ride, until you are set down.
+    AtLanding,
 }
 
 /// One parameter, as the model sees it.
@@ -1087,7 +1086,7 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             // Whether you are at the lift, and whether the car is there, are both
             // facts about where the body is standing this moment — the
             // situation's to offer, not the prompt's.
-            Availability::AtLift | Availability::InLift => false,
+            Availability::AtLift | Availability::AtLanding => false,
         })
         .collect()
 }
@@ -1412,7 +1411,7 @@ pub enum Choices {
     Reachable,
     /// A floor the lift can carry this body to, by the level's name — never the
     /// one it is standing on. Bound to `lift_use`, and offered only while the
-    /// body is in the lift (see [`Availability::InLift`]).
+    /// body is on a landing (see [`Availability::AtLanding`]).
     Floors,
 
     // ---- what a body carries ----
@@ -1849,7 +1848,7 @@ pub struct Within {
     /// journey home to make.
     pub away_from_home: bool,
     /// Whether this body is standing on a lift landing — where the lift acts can
-    /// be reached. See [`Availability::AtLift`] / [`Availability::InLift`].
+    /// be reached. See [`Availability::AtLift`] / [`Availability::AtLanding`].
     pub at_lift: bool,
     /// Whether the car is open at this landing right now, so a body here can step
     /// in and ride. `false` while the car is away or its doors are shut.
@@ -2011,7 +2010,7 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             // riding it only while it is open here. The two never overlap, so a
             // body at the lift is offered exactly one of them.
             Availability::AtLift => within.at_lift && !within.lift_here,
-            Availability::InLift => within.at_lift && within.lift_here,
+            Availability::AtLanding => within.at_lift,
         })
         .filter(|t| performable(t, within))
         .map(|t| ToolSpec {

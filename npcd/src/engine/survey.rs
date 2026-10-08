@@ -32,14 +32,14 @@ pub fn here(hosted: &Hosted, body: &str) -> Outcome {
     let mut said = survey.prose();
     let seen: Vec<String> = survey.stations.iter().map(|e| e.name.clone()).collect();
     let room = hosted.read(|w| {
-        w.actor(body)
-            .and_then(|a| w.node(&a.at))
-            .map(|n| n.name.clone())
+        let at = &w.actor(body)?.at;
+        let level = w.map().get(&at.area).map(|a| a.name.clone())?;
+        Some((w.node(at)?.name.clone(), level))
     });
     let next = hosted.with_sim(|s| {
         // A scan is made standing in the room, so it is there too.
-        if let Some(room) = &room {
-            s.missions.arrived_in(body, room);
+        if let Some((room, level)) = &room {
+            s.missions.arrived_in(body, room, level);
         }
         if !s.missions.read_off(body, &seen) {
             return None;

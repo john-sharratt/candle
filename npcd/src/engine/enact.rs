@@ -537,8 +537,9 @@ fn lift_call(hosted: &Hosted, body: &str) -> Outcome {
     Outcome::Did("You call the lift. It is on its way; wait for its doors to open.".into())
 }
 
-/// Ride the lift to another level. Grammar-gated to being in the car (see
-/// [`tools::Availability::InLift`]).
+/// Ride the lift to another level. Grammar-gated to standing on a landing (see
+/// [`tools::Availability::AtLanding`]); with the car elsewhere it is called, and
+/// the body waits for it and rides when it comes ([`npc_map::world::World::ride_lift`]).
 fn lift_use(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     let Some(name) = text(args, "floor") else {
         return Outcome::Refused(
@@ -546,24 +547,25 @@ fn lift_use(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         );
     };
     let Some(from) = hosted.read(|w| w.at_landing(body)) else {
-        return Outcome::Refused("You are not in the lift. Go to it first.".into());
+        return Outcome::Refused("You are not at the lift. Go to it first.".into());
     };
-    if !hosted.read(|w| w.lift().is_some_and(|l| l.boardable_at(from))) {
-        return Outcome::Refused("The lift is not here. Call it first with `lift_call`.".into());
-    }
     let Some(dest) = hosted.read(|w| w.floor_named(&name)) else {
         return Outcome::Refused(format!("There is no level called \"{name}\" to ride to."));
     };
     if dest == from {
         return Outcome::Refused("You are already on that level.".into());
     }
-    if hosted.with(|w| w.ride_lift(body, dest)) {
-        Outcome::Did(format!(
-            "You get in and ride the lift toward {name}. It sets off."
-        ))
-    } else {
-        Outcome::Refused("The lift would not take you — its doors are not open here.".into())
+    let here = hosted.read(|w| w.lift().is_some_and(|l| l.boardable_at(from)));
+    if !hosted.with(|w| w.ride_lift(body, dest)) {
+        return Outcome::Refused("The lift would not take you.".into());
     }
+    Outcome::Did(match here {
+        true => format!("You get in and ride the lift toward {name}. It sets off."),
+        false => format!(
+            "The lift is on another floor. You call it and wait here; when it comes you get in \
+             and it takes you to {name}."
+        ),
+    })
 }
 
 fn scan(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {

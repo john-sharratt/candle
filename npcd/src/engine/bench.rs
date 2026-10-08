@@ -50,8 +50,9 @@ const BENCHES: &[&str] = &[
     "map-table",
 ];
 
-/// Where working files are actually made. A story desk accumulates scratch
-/// nobody else has to see; a settling table never does.
+/// Where a working file can be thrown away. A story desk accumulates scratch
+/// nobody else has to see; the other benches write the record, and a document
+/// there is retired with a reason (`record_let_go`) rather than deleted.
 const SCRATCH: &[&str] = &["story-desk"];
 
 /// A bench act with no arguments — it acts on what you are working on.
@@ -263,9 +264,13 @@ pub const FILE_READ: Tool = Tool {
     }],
 };
 
+/// **At every bench, not only the story desk.** A life is written at a character
+/// terminal and an era corrected at a chronicle terminal, and a document can only
+/// be new where `file_write` is offered — held to the story desk, a mission to
+/// write a year of somebody's life sent its Maker to the wrong level to write it.
 pub const FILE_WRITE: Tool = Tool {
     name: "file_write",
-    at: SCRATCH,
+    at: BENCHES,
     category: "Bench",
     plane: Plane::World,
     availability: Availability::AtPart,
@@ -337,7 +342,7 @@ pub const FILE_EDIT: Tool = Tool {
 
 pub const FILE_LIST: Tool = bench_on!(
     "file_list",
-    SCRATCH,
+    BENCHES,
     "See what documents are actually in a place — including the ones you have made and not \
      committed, and without the ones you have taken out. What exists, rather than what anything \
      says exists.",

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -22,6 +22,8 @@ use serde_json::{json, Value};
 use crate::api::{err, owner_of, Authored};
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::mission::{Mission, Origin, StepOutcome, Todo};
+use crate::engine::mission_gen::config::Config;
+use crate::engine::mission_gen::run;
 use crate::engine::{no_engine, owned, owned_by, speaking_as};
 use npc_map::route;
 
@@ -357,6 +359,164 @@ pub async fn cancel(
     Json(json!({ "cancelled": rt.cancel_mission(nid, world_ms) })).into_response()
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct GenerateBody {
+    /// Which generator to use; absent draws by weight.
+    #[serde(default)]
+    generator: Option<String>,
+    /// Which hosted world; absent is every world with documents to work on.
+    #[serde(default)]
+    world: Option<String>,
+}
+
+/// `POST /v1/pulse/missions/generate` — write one mission now, whether or not
+/// the table is open, and say what came of it.
+pub async fn generate(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    body: Option<Json<GenerateBody>>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("generating a mission");
+    };
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let Some(mind) = rt.mind.clone() else {
+        return err(
+            StatusCode::CONFLICT,
+            "no_mind",
+            "this daemon has no mind to work from",
+        );
+    };
+    let config = match Config::load(&mind) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return err(
+                StatusCode::CONFLICT,
+                "no_generator",
+                "the mind has no missions.yaml — nothing configures the generator",
+            )
+        }
+        Err(e) => return err(StatusCode::UNPROCESSABLE_ENTITY, "bad_generator", &e),
+    };
+    let mut out = Vec::new();
+    for id in rt.hosted.ids() {
+        if body.world.as_deref().is_some_and(|w| w != id) {
+            continue;
+        }
+        let Some(hosted) = rt.hosted.get(&id) else {
+            continue;
+        };
+        if !hosted.sim(|sim| sim.bench.has_root()) {
+            continue;
+        }
+        match run::generate(rt, &hosted, &config, body.generator.as_deref()).await {
+            Ok(g) => out.push(json!({ "world": id, "generation": g })),
+            Err(e) => out.push(json!({ "world": id, "error": format!("{e:#}") })),
+        }
+    }
+    Json(json!({ "generated": out })).into_response()
+}
+
+/// `GET /v1/pulse/missions/pool` — every world's generated missions waiting at
+/// the table, and every target the generator has found with what became of it.
+pub async fn pool(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("reading the pool");
+    };
+    let mut worlds = serde_json::Map::new();
+    for id in rt.hosted.ids() {
+        let Some(hosted) = rt.hosted.get(&id) else {
+            continue;
+        };
+        let view = hosted.sim(|sim| {
+            json!({
+                "pool": sim.missions.pooled().iter().map(mission_view).collect::<Vec<_>>(),
+                "targets": sim.missions.targets(),
+            })
+        });
+        worlds.insert(id, view);
+    }
+    Json(Value::Object(worlds)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewBody {
+    /// The mind path of the document to review.
+    path: String,
+}
+
+/// `POST /v1/pulse/missions/review` — put a document in line for the review
+/// generator, in every world with documents. For work done outside the table —
+/// written by hand, or by a mission from before reviews existed.
+pub async fn review(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Json(body): Json<ReviewBody>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("lining up a review");
+    };
+    let path = body.path.trim().trim_start_matches('/').to_string();
+    if !rt.mind.as_ref().is_some_and(|m| m.join(&path).is_file()) {
+        return err(
+            StatusCode::NOT_FOUND,
+            "no_document",
+            "there is no such document in the mind to review",
+        );
+    }
+    let mut queued = 0;
+    for hosted in rt.hosted.ids().iter().filter_map(|id| rt.hosted.get(id)) {
+        if hosted.sim(|sim| sim.bench.has_root())
+            && hosted.with_sim(|sim| sim.missions.review_later(&path))
+        {
+            queued += 1;
+        }
+    }
+    Json(json!({ "path": path, "queued": queued })).into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DiscardQuery {
+    /// Forget the settled targets too, so all of the corpus can be found again.
+    #[serde(default)]
+    ledger: bool,
+}
+
+/// `DELETE /v1/pulse/missions/pool` — throw away every generated mission still
+/// waiting, so the next are written from the corpus as it now stands; with
+/// `?ledger=true`, forget every settled target as well.
+pub async fn discard_pool(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Query(q): Query<DiscardQuery>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("clearing the pool");
+    };
+    let (mut discarded, mut forgotten) = (0, 0);
+    for hosted in rt.hosted.ids().iter().filter_map(|id| rt.hosted.get(id)) {
+        hosted.with_sim(|sim| {
+            discarded += sim.missions.discard_pool();
+            if q.ledger {
+                forgotten += sim.missions.forget_settled();
+            }
+        });
+    }
+    Json(json!({ "discarded": discarded, "forgotten": forgotten })).into_response()
+}
+
 /// What a name in a brief is.
 #[derive(Clone, Copy)]
 enum Named {
@@ -415,6 +575,7 @@ fn mission_view(m: &Mission) -> Value {
         "prompt": m.mission_text(),
         "open": m.is_open(),
         "origin": m.origin,
+        "work": m.work,
         "todo": m.todo,
         "answer": m.answer,
         "observed": m.observed,

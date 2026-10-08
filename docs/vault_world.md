@@ -398,7 +398,8 @@ single posts, never banks of desks, so no standing order can queue the crew
 behind them.
 
 **The enquiry room is the only room that faces outward.** Every other room
-consumes work from the standing list. This one takes a question from somebody
+consumes work from the standing list — which the command table now writes for
+itself, from what the record lacks: see [`mission_generator.md`](mission_generator.md). This one takes a question from somebody
 downstream of the whole building, phrased in their words rather than the vault's,
 and the ones that cannot be answered are the valuable ones: an unanswerable
 enquiry names a hole nobody inside had noticed. It is a second source of work

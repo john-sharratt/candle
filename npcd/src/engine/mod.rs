@@ -74,6 +74,7 @@ pub mod mind;
 pub mod mission;
 pub mod mission_acts;
 pub mod mission_api;
+pub mod mission_gen;
 pub mod narration;
 pub mod narrator;
 pub mod on_you;
@@ -320,6 +321,24 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             "/v1/pulse/missions/cancel",
             Role::Admin,
             post(mission_api::cancel_all),
+        )
+        // The table's generator: write one mission now, and read or clear what
+        // it has put on the table and what it has found. Admin — the work it
+        // sets is taken up by the whole cast.
+        .route(
+            "/v1/pulse/missions/generate",
+            Role::Admin,
+            post(mission_api::generate),
+        )
+        .route(
+            "/v1/pulse/missions/pool",
+            Role::Admin,
+            get(mission_api::pool).delete(mission_api::discard_pool),
+        )
+        .route(
+            "/v1/pulse/missions/review",
+            Role::Admin,
+            post(mission_api::review),
         )
         // ── generation ──────────────────────────────────────────────────────
         .route(

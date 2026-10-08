@@ -649,7 +649,9 @@ async fn the_chronicle_options_lists_its_verbs_and_their_shapes() {
             "bench_status",
             "bench_unstage",
             "file_edit",
+            "file_list",
             "file_read",
+            "file_write",
             "retire_entry",
             "rewrite_page",
         ],
@@ -712,7 +714,9 @@ async fn a_get_reads_the_station_descriptor() {
             "bench_blame",
             "bench_log",
             "file_read",
+            "file_write",
             "file_edit",
+            "file_list",
         ])
     );
 }
@@ -877,7 +881,9 @@ async fn the_portrait_options_and_draw_runs_through_the_bench() {
             "bench_unstage",
             "draw",
             "file_edit",
+            "file_list",
             "file_read",
+            "file_write",
             "prompt_edit",
             "prompt_read",
         ]

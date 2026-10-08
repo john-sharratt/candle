@@ -3353,6 +3353,9 @@ mod tests {
                 // character, so admin.
                 ("/v1/pulse/guardian", "admin"),
                 ("/v1/pulse/missions/cancel", "admin"),
+                ("/v1/pulse/missions/generate", "admin"),
+                ("/v1/pulse/missions/pool", "admin"),
+                ("/v1/pulse/missions/review", "admin"),
                 // Generation on the resident model, over the caller's own cast.
                 ("/v1/generate/description", "user"),
                 ("/v1/generate/description/stream", "user"),
