@@ -266,6 +266,15 @@ impl JournalState {
         entry
     }
 
+    /// Keep an entry the engine wrote itself — the close of a mission's chapter
+    /// ([`super::closing`]) — beside whatever draft is in flight, which it
+    /// leaves to finish as it would have.
+    pub fn keep_closing(&mut self, entry: Entry) -> Entry {
+        let entry = self.stage(entry);
+        self.apply(entry.clone());
+        entry
+    }
+
     /// The gate said there was nothing worth writing in the span. The verdict
     /// is final for those turns: `covered_to` moves past them, so the next draft
     /// is asked only about what has happened since.

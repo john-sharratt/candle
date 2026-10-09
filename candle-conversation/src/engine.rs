@@ -1321,6 +1321,12 @@ impl ConversationEngine {
             .collect()
     }
 
+    /// The `(layer, group)` `timeline` was written to — fixed when it was
+    /// created. `None` for a timeline this engine does not hold.
+    pub fn timeline_target(&self, timeline: TimelineId) -> Option<(LayerId, GroupId)> {
+        self.conversation.timeline_target(timeline)
+    }
+
     /// Both halves of every turn in `timeline`, in order — `(user, assistant)`,
     /// verbatim as stored.
     pub fn conversation_texts(&self, timeline: TimelineId) -> Vec<(String, String)> {

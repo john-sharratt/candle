@@ -206,7 +206,10 @@ mod tests {
     #[test]
     fn victims_prefer_vram_backed_then_the_coldest() {
         let mut b = PadBook::new(5, 2, 4);
-        for (slot, (row, e)) in [(1, 0), (1, 1), (1, 2), (0, 3), (0, 0)].into_iter().enumerate() {
+        for (slot, (row, e)) in [(1, 0), (1, 1), (1, 2), (0, 3), (0, 0)]
+            .into_iter()
+            .enumerate()
+        {
             assert_eq!(b.take_free(), Some(slot));
             b.start_load(slot, row, e);
             if slot != 4 {
@@ -227,6 +230,10 @@ mod tests {
             _ => Some(false),
         });
         assert_eq!(v, vec![2, 1, 0]);
-        assert_eq!(b.victims(1, |_, _| Some(false)), vec![3], "the unscored slot first");
+        assert_eq!(
+            b.victims(1, |_, _| Some(false)),
+            vec![3],
+            "the unscored slot first"
+        );
     }
 }

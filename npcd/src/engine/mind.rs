@@ -54,7 +54,9 @@ use std::time::Duration;
 
 use tokio::sync::Mutex as ConversationLock;
 
-use candle_conversation::projection::{Builder, GroupId, LayerId, SelectionState, TimelineId};
+use candle_conversation::projection::{
+    Builder, GroupId, LayerId, SelectedTurn, SelectionState, TimelineId,
+};
 use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, StencilTree, ThinkMode, ThinkSteerEnvelope,
     ToolCallEnvelope, ToolSpec, TreeSpec,
@@ -67,6 +69,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::engine::act::{self, Parsed};
+use crate::engine::bearings::Scopes;
 use crate::engine::dreams;
 use crate::engine::event::Event;
 use crate::engine::identity;
@@ -164,6 +167,9 @@ struct Live {
     /// The day this conversation belongs to. A mismatch against the world's day
     /// is what triggers the roll-over.
     day: u64,
+    /// The chapter — missions closed — it belongs to. A mission handed in rolls
+    /// it over the same way.
+    chapter: u64,
     id: String,
     /// The first turn retention has **not** yet retired.
     ///
@@ -241,6 +247,9 @@ pub struct Minds {
     /// before any await — a `RwLock` guard held across a decode would pin the
     /// whole cast's schema reads behind one turn.
     projection: RwLock<Option<Arc<Projected>>>,
+    /// What each bench draws on of the shared layers — `None` until the mind
+    /// declares bearings, and then every shared layer is drawn on everywhere.
+    scopes: RwLock<Option<Arc<Scopes>>>,
     /// Each conversation behind its own async lock, so a decode holds only the
     /// character that is thinking — see the module's *Locking* note.
     live: Mutex<HashMap<u64, Arc<ConversationLock<Live>>>>,
@@ -575,6 +584,7 @@ impl Minds {
             acts,
             grammar_ok: ok,
             projection: RwLock::new(None),
+            scopes: RwLock::new(None),
             live: Mutex::new(HashMap::new()),
             askers: Mutex::new(HashMap::new()),
             system_prompts: Mutex::new(HashMap::new()),
@@ -626,6 +636,12 @@ impl Minds {
     ///
     /// Called once at load, before the cast is woken — a character woken first
     /// would open under the rendered prompt and keep it for the day.
+    /// Draw on the shared layers by bearing from here on — see
+    /// [`crate::engine::bearings`].
+    pub fn set_scopes(&self, scopes: Scopes) {
+        *self.scopes.write().unwrap() = Some(Arc::new(scopes));
+    }
+
     pub fn set_projection(&self, projected: Projected) {
         tracing::info!(
             "minds: characters think under the mind's own projection — {} bytes of shared frame, \
@@ -1359,10 +1375,11 @@ impl Minds {
         &self,
         npc_id: u64,
         day: u64,
+        chapter: u64,
         persona: &Persona<'_>,
         mode: Mode,
     ) -> anyhow::Result<Live> {
-        let id = conversation_id(npc_id, day);
+        let id = conversation_id(npc_id, day, chapter);
         let mut cfg = self.base_config.clone();
         cfg.context_window_turns = CONTEXT_WINDOW_TURNS;
         // **The mind's own schema, when there is one.**
@@ -1471,6 +1488,7 @@ impl Minds {
                 journal: Carried::new(false),
                 journal_record: String::new(),
                 day,
+                chapter,
                 id,
                 // Not zero: a conversation this deep has already retired its
                 // tail, and re-walking it from the bottom would cost the first
@@ -1540,6 +1558,7 @@ impl Minds {
             journal: Carried::new(true),
             journal_record: String::new(),
             day,
+            chapter,
             id,
             retired_through: 0,
             pending: Vec::new(),
@@ -1563,6 +1582,7 @@ impl Minds {
         persona: &Persona<'_>,
         mode: Mode,
         day: u64,
+        chapter: u64,
         events: &[Event],
         within: &tools::Within,
     ) -> anyhow::Result<Thought> {
@@ -1580,10 +1600,26 @@ impl Minds {
                 // a timer fires on host-elapsed time and would be wrong the
                 // moment the narrative clock is paused, jumped or re-paced —
                 // all of which the console can do at any moment.
-                let from = current.lock().await.day;
-                if from == day {
+                // **And the mission boundary.** A mission handed in closes a
+                // chapter: the next starts in a conversation of its own, the
+                // journal carrying the work across, so a stretch that went badly
+                // — Makers once spent hours telling each other there was nothing
+                // left to do — ends with the work it went badly on.
+                let (from, from_chapter) = {
+                    let l = current.lock().await;
+                    (l.day, l.chapter)
+                };
+                if from == day && from_chapter == chapter {
                     current
                 } else {
+                    if from_chapter != chapter {
+                        tracing::info!(
+                            npc_id,
+                            from = from_chapter,
+                            to = chapter,
+                            "a mission was handed in — a new conversation for the next"
+                        );
+                    }
                     // Tombstone, not delete. The turns stay in the redo log;
                     // what changes is that they stop being selected by default.
                     let gone = self.live.lock().unwrap().remove(&npc_id);
@@ -1591,11 +1627,19 @@ impl Minds {
                     if let Some(l) = gone {
                         retire(&self.engine, &*l.lock().await);
                     }
-                    thought.rolled_over = Some((from, day));
-                    self.adopt(npc_id, self.open_conversation(npc_id, day, persona, mode)?)
+                    if from != day {
+                        thought.rolled_over = Some((from, day));
+                    }
+                    self.adopt(
+                        npc_id,
+                        self.open_conversation(npc_id, day, chapter, persona, mode)?,
+                    )
                 }
             }
-            None => self.adopt(npc_id, self.open_conversation(npc_id, day, persona, mode)?),
+            None => self.adopt(
+                npc_id,
+                self.open_conversation(npc_id, day, chapter, persona, mode)?,
+            ),
         };
 
         // **The answers to last turn's acts, then everything that has happened
@@ -1678,6 +1722,18 @@ impl Minds {
             // raw events behind it — this is what actually went to the model.
             thought.perception = narration.clone();
             let perception = compose_narrated(&answers, &narration);
+            // **What this turn may reach for, from where it stands** — set
+            // before the send, so the prefill's projection and every one the
+            // decode makes after it read the same shelves.
+            let scopes = self.scopes.read().unwrap().as_ref().map(Arc::clone);
+            let bearing = scopes.as_ref().map(|s| {
+                s.apply(
+                    &self.engine.lock().unwrap(),
+                    live.sequence.timeline_id(),
+                    &within.parts,
+                    within.year,
+                )
+            });
             let response = live
                 .sequence
                 .send_turn_with_options_async(&perception, options)
@@ -1698,6 +1754,43 @@ impl Minds {
                     .filter(|t| t.layer == dreams::LAYER && t.selected)
                     .filter_map(|t| Some((t.timeline?, t.score)))
                     .collect();
+                // **What the shared layers brought in.** The world, the eras
+                // and the stories reach a character only by winning the gather,
+                // and for as long as they sat where no gather could read them
+                // nothing said so: every turn's count here was zero.
+                let own = self
+                    .projected()
+                    .and_then(|p| {
+                        let layers = &p.builder.schema().layers;
+                        Some(layers.iter().find(|l| l.id == p.layer)?.name.clone())
+                    })
+                    .unwrap_or_default();
+                let shared = recalled_by_layer(&ev.selection.turns, &own);
+                tracing::info!(
+                    "npc {npc_id}: recalled from beneath{} — {}",
+                    format!(
+                        "{}{}",
+                        bearing
+                            .as_deref()
+                            .map(|b| format!(" at {b}"))
+                            .unwrap_or_default(),
+                        within.year.map(|y| format!(" in {y}")).unwrap_or_default()
+                    ),
+                    match shared.is_empty() {
+                        true => "nothing".to_string(),
+                        false => shared
+                            .iter()
+                            .map(|(layer, r)| {
+                                let top = r
+                                    .top
+                                    .and_then(|t| scopes.as_ref()?.address(t))
+                                    .unwrap_or("?");
+                                format!("{layer} {} (best {:.0} {top})", r.count, r.best)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    }
+                );
                 if !recalled.is_empty() {
                     let from: BTreeSet<u64> = recalled.iter().map(|(tl, _)| *tl).collect();
                     // The scores too: whether a line came back because it
@@ -2157,6 +2250,39 @@ fn own_act_line(act: &act::Act, departing: bool) -> Option<String> {
     Some(format!("you — {verb} — meaning: \"{intent}\""))
 }
 
+/// What a turn's projection brought in from each layer beneath its own `own`
+/// layer, dreams aside (they are reported on their own): per layer, how many
+/// turns were selected, the best score among them, and the timeline that
+/// scored it.
+fn recalled_by_layer(turns: &[SelectedTurn], own: &str) -> BTreeMap<String, Recalled> {
+    let mut out: BTreeMap<String, Recalled> = BTreeMap::new();
+    for t in turns
+        .iter()
+        .filter(|t| t.selected && t.layer != own && t.layer != dreams::LAYER)
+    {
+        let e = out.entry(t.layer.clone()).or_insert(Recalled {
+            count: 0,
+            best: f32::MIN,
+            top: None,
+        });
+        e.count += 1;
+        if t.score > e.best {
+            e.best = t.score;
+            e.top = t.timeline;
+        }
+    }
+    out
+}
+
+/// What one layer brought into a turn — see [`recalled_by_layer`].
+#[derive(Debug, PartialEq)]
+struct Recalled {
+    count: usize,
+    best: f32,
+    /// The timeline of the best-scoring turn.
+    top: Option<u64>,
+}
+
 fn compose_narrated(answers: &[String], narration: &str) -> String {
     let mut s = String::new();
     for a in answers {
@@ -2187,6 +2313,41 @@ pub fn render_turn(speaker: Speaker, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Each layer beneath the turn's own is counted, with its best score.**
+    /// The turn's own layer and the dreams (logged on their own) are not, and
+    /// a turn the gather passed over is not.
+    #[test]
+    fn what_a_turn_recalled_is_counted_by_layer() {
+        let turn = |layer: &str, selected: bool, score: f32, timeline: u64| -> SelectedTurn {
+            serde_json::from_value(serde_json::json!({
+                "layer": layer, "group": "g", "index": 0, "role": "assistant", "tokens": 9,
+                "selected": selected, "score": score, "timeline": timeline,
+            }))
+            .unwrap()
+        };
+        let turns = [
+            turn("eras", true, 640.0, 1),
+            turn("eras", true, 910.0, 2),
+            turn("world", true, 300.0, 3),
+            turn("stories", false, 990.0, 4),
+            turn("interaction", true, 0.0, 5),
+            turn(dreams::LAYER, true, 815.0, 6),
+        ];
+        let got = recalled_by_layer(&turns, "interaction");
+        let recalled = |count, best, top| Recalled {
+            count,
+            best,
+            top: Some(top),
+        };
+        assert_eq!(
+            got.into_iter().collect::<Vec<_>>(),
+            [
+                ("eras".to_string(), recalled(2, 910.0, 2)),
+                ("world".to_string(), recalled(1, 300.0, 3))
+            ]
+        );
+    }
 
     /// The fingerprint is what decides whether a conversation on disk is still
     /// this character's to continue, so the same frame has to produce the same
@@ -2300,8 +2461,13 @@ mod tests {
     /// day's name so both halves stay attributable to the character.
     #[test]
     fn a_days_conversation_id_is_stable_across_a_restart() {
-        assert_eq!(conversation_id(4, 9), conversation_id(4, 9));
-        assert_ne!(conversation_id(4, 9), conversation_id(4, 10));
+        assert_eq!(conversation_id(4, 9, 1), conversation_id(4, 9, 1));
+        assert_ne!(conversation_id(4, 9, 1), conversation_id(4, 10, 1));
+        assert_ne!(
+            conversation_id(4, 9, 1),
+            conversation_id(4, 9, 2),
+            "a mission handed in starts the next"
+        );
     }
 
     #[test]

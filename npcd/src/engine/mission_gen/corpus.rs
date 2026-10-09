@@ -101,10 +101,6 @@ pub struct Corpus {
     /// The world's own `setting`, from `worlds/<id>.yaml` — what kind of place
     /// this is, which a story or a life written in it must not step outside.
     pub setting: Option<String>,
-    /// The documents Makers have written for generated missions, oldest first —
-    /// what a review reads. Not read off the disk: the ledger knows which
-    /// documents are Makers' work, and the caller hands them in.
-    pub reviewable: Vec<String>,
     /// In the order they happened.
     pub eras: Vec<Era>,
     /// By personality id.
@@ -180,7 +176,6 @@ impl Corpus {
         Corpus {
             root: root.to_path_buf(),
             setting,
-            reviewable: Vec::new(),
             eras,
             lives,
             stories,
@@ -196,6 +191,12 @@ impl Corpus {
         if let Some(s) = self.stories.iter().find(|s| s.path == path) {
             return Some(s.text.clone());
         }
+        std::fs::read_to_string(self.root.join(path)).ok()
+    }
+
+    /// A document's file exactly as it stands on disk, by mind path — `None`
+    /// when there is none.
+    pub fn on_disk(&self, path: &str) -> Option<String> {
         std::fs::read_to_string(self.root.join(path)).ok()
     }
 
@@ -261,23 +262,27 @@ fn personalities(dir: &Path) -> Vec<(String, serde_yaml::Value)> {
 }
 
 /// A document's first `# ` heading.
-fn heading(text: &str) -> Option<String> {
+pub(crate) fn heading(text: &str) -> Option<String> {
     text.lines()
         .find_map(|l| l.strip_prefix("# "))
         .map(|h| h.trim().to_string())
 }
 
-/// The year an era opens: the number before the first `CE`.
-fn era_year(text: &str) -> Option<u32> {
+/// The year an era opens: the first year of the date its first `CE` closes —
+/// `**Era 350–450 · 2837–2937 CE**` opens in 2837, `**Era 0 · 2487 CE**` in
+/// 2487. The date runs from the last `·` before the `CE` (or the line's start).
+///
+/// **The opening year, not the closing one.** Read as the digits just before
+/// `CE`, a ranged era gave its last year, so every year inside it was placed in
+/// the era before — a life set in 2850 was checked against the Concord.
+pub(crate) fn era_year(text: &str) -> Option<u32> {
     let at = text.find(" CE")?;
-    let head = &text[..at];
-    let digits: String = head
+    let line = &text[text[..at].rfind('\n').map_or(0, |i| i + 1)..at];
+    let date = line.rsplit('·').next().unwrap_or(line);
+    let digits: String = date
         .chars()
-        .rev()
+        .skip_while(|c| !c.is_ascii_digit())
         .take_while(|c| c.is_ascii_digit())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
         .collect();
     digits.parse().ok()
 }
@@ -356,6 +361,13 @@ pub(crate) mod tests {
             c.setting.as_deref(),
             Some("A world of towers after the sky went out.")
         );
+        // The year an era opens, whichever way its date is written.
+        assert_eq!(era_year("# T\n\n**Era 0 · 2487 CE**\n"), Some(2487));
+        assert_eq!(era_year("**Era 350–450 · 2837–2937 CE**"), Some(2837));
+        assert_eq!(era_year("**Era −336 to −1 · 2151–2486 CE**"), Some(2151));
+        assert_eq!(era_year("**Era 600 · 3087 CE — present day**"), Some(3087));
+        assert_eq!(era_year("In 2791 CE it ended."), Some(2791));
+        assert_eq!(era_year("no date here"), None);
         let eras: Vec<(&str, Option<u32>)> =
             c.eras.iter().map(|e| (e.title.as_str(), e.year)).collect();
         assert_eq!(

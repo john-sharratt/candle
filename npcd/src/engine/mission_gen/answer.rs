@@ -26,12 +26,14 @@ use std::path::Path;
 use candle_conversation::stencil::{Param as CallParam, ParamType, ToolSpec};
 use serde_json::{Map, Value};
 
-use super::corpus::Corpus;
-use super::material::{belongs, cut, strip_calls, ONLY_EVENT_YEARS};
+use super::corpus::{Corpus, Era, Event};
+use super::gates::{Voice, LIFE_MIN_WORDS, STORY_MIN_WORDS};
+use super::material::{belongs, cut, strip_calls, ANCHOR_WORDS, ONLY_EVENT_YEARS};
+use super::research;
 use super::target::{Kind, Subject, Target};
 use crate::engine::journal::tools::arguments;
 use crate::engine::life;
-use crate::engine::mission::{Mission, Origin, Todo, Work};
+use crate::engine::mission::{Mission, Origin, Stage, Todo, Work};
 
 /// The call that declines.
 pub const NOTHING: &str = "no_mission";
@@ -41,11 +43,61 @@ pub const EVENT: &str = "life_event";
 pub const CORRECTION: &str = "correction";
 /// The call for a story.
 pub const STORY: &str = "story";
-/// The call for a review.
-pub const REVIEW_CALL: &str = "review";
+
+/// What every brief for a piece of the record says about where it is written.
+///
+/// **The writers' room is not the world.** Nine of eleven pieces judged against
+/// the lore had the vault in them — its rooms and machines, the Makers by
+/// name, a story whose plot was somebody writing — because that was the most
+/// concrete thing in front of the Maker writing it. The gate refuses it at the
+/// report (`leakage`); this says it before the first word.
+const ELSEWHERE: &str = "\n\nYou write this from the vault, and nothing of the vault belongs in \
+                         it: not its rooms or machines, not the Makers, not the writing of it. \
+                         Nobody in it is writing a record. Tell it from inside its own world, in \
+                         its own time, from what the record says was there.";
 
 /// The shortest quote that counts as a quote.
-const MIN_QUOTE_CHARS: usize = 20;
+pub(super) const MIN_QUOTE_CHARS: usize = 20;
+
+/// What `turns` asks for, as a refusal names it.
+const TURNS: &str = "the act the moment turns on — who does what that cannot be taken back, and \
+                     what is different after it";
+
+/// The act an event or story turns on — refused when it is no act at all.
+///
+/// **An event is decided before its scene.** A brief whose "what happens" had
+/// its subject walk into the dark, sit, and wait "for the end of time, or
+/// perhaps for nothing at all" was written faithfully as a mood, and the table
+/// failed the draft for having no event: the fault was in the brief. Asked to
+/// name the turn first, in its own field, before the scene that leads to it,
+/// the answer has to have one.
+fn turns(field: &Fields) -> Result<String, String> {
+    let t = field.words("turns", 6, 60, TURNS)?;
+    let lower = t.to_lowercase();
+    // A life is told to its subject as "you", and "You watch Vasko seal the
+    // archive, realizing…" is the subject looking on while somebody else acts.
+    let still = [
+        "nothing",
+        "waits",
+        "waiting",
+        "remembers",
+        "remembering",
+        "reflects",
+        "you watch",
+        "you wait",
+        "you sit",
+        "you remember",
+        "you realize",
+        "you realise",
+    ];
+    match still.iter().any(|w| lower.starts_with(w)) {
+        true => Err(format!(
+            "`turns` is {TURNS}. \"{t}\" is not an act: name what somebody does, and what is \
+             different after it."
+        )),
+        false => Ok(t),
+    }
+}
 
 /// The calls one kind of work may answer with — its own, and declining.
 pub fn specs(kind: Kind) -> Vec<ToolSpec> {
@@ -62,6 +114,7 @@ pub fn specs(kind: Kind) -> Vec<ToolSpec> {
                 text("title"),
                 text("leaves"),
                 text("agrees_with"),
+                text("turns"),
                 text("happens"),
             ],
         },
@@ -83,22 +136,8 @@ pub fn specs(kind: Kind) -> Vec<ToolSpec> {
                 text("where"),
                 text("who"),
                 text("agrees_with"),
+                text("turns"),
                 text("happens"),
-            ],
-        },
-        // **The reading before the verdict.** Reading the document closely
-        // enough to name its faults is the work; a verdict first is a verdict
-        // the reading then has to justify. And the reading is its own field,
-        // never empty: with only a `problems` field the model wrote it empty
-        // and kept every document, a Zen dated four years after the Awakening
-        // that says "three centuries have passed" among them.
-        Kind::Review => ToolSpec {
-            name: REVIEW_CALL.into(),
-            params: vec![
-                text("checked"),
-                text("faults"),
-                choice("verdict", &["keep", "revise"]),
-                text("change"),
             ],
         },
     };
@@ -111,7 +150,7 @@ pub fn specs(kind: Kind) -> Vec<ToolSpec> {
     ]
 }
 
-fn text(name: &str) -> CallParam {
+pub(super) fn text(name: &str) -> CallParam {
     CallParam {
         name: name.to_string(),
         ty: ParamType::String,
@@ -127,7 +166,7 @@ fn text(name: &str) -> CallParam {
     }
 }
 
-fn choice(name: &str, arms: &[&str]) -> CallParam {
+pub(super) fn choice(name: &str, arms: &[&str]) -> CallParam {
     CallParam {
         enum_values: Some(arms.iter().map(|a| a.to_string()).collect()),
         ..text(name)
@@ -146,6 +185,8 @@ pub enum Answer {
 /// A mission as the engine wrote it from a checked answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proposal {
+    /// What the operation is for, in a line.
+    pub objective: String,
     /// What the Maker reads under "What has been asked of you".
     pub brief: String,
     /// The mind path to write or change.
@@ -156,11 +197,6 @@ pub struct Proposal {
     /// [`Work::min_words`].
     pub min_words: usize,
 }
-
-/// The floor a life event is committed at: about four hundred words are asked.
-const EVENT_MIN_WORDS: usize = 250;
-/// The floor a story is committed at: six hundred to a thousand are asked.
-const STORY_MIN_WORDS: usize = 380;
 
 /// Read and check one answer. The error is worded for the model, which is shown
 /// it with its refused attempt and answers again.
@@ -186,7 +222,6 @@ pub fn check(raw: &str, kind: Kind, target: &Target, corpus: &Corpus) -> Result<
             correction(&field, a, b, corpus)
         }
         (STORY, Kind::Gap, Subject::Era { path }) => story(&field, path, corpus),
-        (REVIEW_CALL, Kind::Review, Subject::Written { path }) => review(&field, path, corpus),
         (other, _, _) => Err(format!(
             "There is no call named `{other}` here; answer with `{}`.",
             calls.join("` or `")
@@ -195,10 +230,10 @@ pub fn check(raw: &str, kind: Kind, target: &Target, corpus: &Corpus) -> Result<
 }
 
 /// The arguments of one call, read as trimmed text.
-struct Fields<'a>(&'a Map<String, Value>);
+pub(super) struct Fields<'a>(pub(super) &'a Map<String, Value>);
 
 impl Fields<'_> {
-    fn get(&self, k: &str) -> String {
+    pub(super) fn get(&self, k: &str) -> String {
         self.0
             .get(k)
             .and_then(Value::as_str)
@@ -214,7 +249,13 @@ impl Fields<'_> {
     /// that began well ended "She is Zen, and nothing matters. She is Zen, and
     /// everything matters. She is Zen…" for a hundred words; the cap and the
     /// repetition check both refuse it, and the retry is asked again.
-    fn words(&self, k: &str, min: usize, max: usize, what: &str) -> Result<String, String> {
+    pub(super) fn words(
+        &self,
+        k: &str,
+        min: usize,
+        max: usize,
+        what: &str,
+    ) -> Result<String, String> {
         let v = self.get(k);
         let n = v.split_whitespace().count();
         if n < min {
@@ -260,6 +301,19 @@ fn event(field: &Fields, who: &str, corpus: &Corpus) -> Result<Answer, String> {
     let life = corpus.life(who).ok_or("That life is not in this world.")?;
     let date = field.get("date");
     let title = file_title(&field.get("title"))?;
+    // **A new event has a name of its own.** Asked for Keeper's next event,
+    // the model titled it after the event the material quoted, "The Second the
+    // Sky Went Out", three centuries later.
+    if life
+        .events
+        .iter()
+        .any(|e| e.title.eq_ignore_ascii_case(&title))
+    {
+        return Err(format!(
+            "\"{title}\" is already the title of an event in this life; this one is a different \
+             event and needs its own name."
+        ));
+    }
     let file = format!("{date} {title}.md");
     let named = life::parse_name(Path::new(&file))
         .map_err(|_| format!("`date` must be `YYYY`, `YYYY-MM` or `YYYY-MM-DD`, not `{date}`."))?;
@@ -302,6 +356,7 @@ fn event(field: &Fields, who: &str, corpus: &Corpus) -> Result<Answer, String> {
         }
         _ => {}
     }
+    let turn = turns(field)?;
     let happens = field.words("happens", 25, 240, "what happens in the event")?;
     let agrees = field.words("agrees_with", 0, 160, "the facts it must agree with")?;
     // **The grounding is the engine's to state; the model's facts are kept
@@ -324,23 +379,22 @@ fn event(field: &Fields, who: &str, corpus: &Corpus) -> Result<Answer, String> {
     if corpus.exists(&writes) {
         return Err(format!("`{writes}` is already written; name a new event."));
     }
-    // The era it falls in, and the written event nearest it in time — what the
-    // Maker must not contradict.
-    let mut reads = vec![era.path.clone()];
-    let nearest = life
+    // What the Maker reads before it writes, up to the year and nothing after —
+    // see `research`. What it must agree with is the era and the entries of
+    // this life it reads that came before.
+    let read = research::before_writing(corpus, &writes, year, &format!("{title}. {happens}"));
+    let reads: Vec<String> = read.iter().map(|r| r.path.clone()).collect();
+    let mut must = format!("{} — it falls in that era of the world", era.title);
+    let before: Vec<String> = life
         .events
         .iter()
-        .filter_map(|e| Some((e.year()?.abs_diff(year), e)))
-        .min_by_key(|(d, _)| *d)
-        .map(|(_, e)| e);
-    if let Some(near) = nearest {
-        reads.push(near.path.clone());
-    }
-    let mut must = format!("{} — it falls in that era of the world", era.title);
-    if let Some(near) = nearest {
+        .filter(|e| reads.contains(&e.path))
+        .map(|e| format!("\"{}\" ({})", e.title, e.date))
+        .collect();
+    if !before.is_empty() {
         must.push_str(&format!(
-            ", and \"{}\" ({}), the written event nearest it",
-            near.title, near.date
+            ", and what this life holds just before it: {}",
+            before.join(", ")
         ));
     }
     must.push('.');
@@ -357,39 +411,121 @@ fn event(field: &Fields, who: &str, corpus: &Corpus) -> Result<Answer, String> {
     let mut s = format!(
         "Write {name}'s life where the record has nothing: the {grain} {date}, \"{title}\".\n\n"
     );
+    // **The anchor is about them, and says so.** Quoted bare, "You are
+    // Keeper…" reads as addressed to whoever is reading it — the Maker — and a
+    // Maker given it wrote the event as itself.
+    //
+    // **And all of it the reading sees.** Cut to seventy words, Zen's anchor
+    // lost "it has no body — it has a structure" and asks for measurements
+    // rather than adjectives; the Maker gave Zen hands, a chair and the taste of
+    // copper, and the table — shown the whole anchor — failed it for exactly
+    // that.
     if !life.anchor.is_empty() {
-        s.push_str(&format!("Who {name} is: {}\n\n", cut(&life.anchor, 70)));
-    }
-    s.push_str(&format!(
-        "What happens: {happens}\n\nIt must agree with: {must}\n\nWhat it leaves {name} with: \
-         {leaves}\n\n"
-    ));
-    let voice = nearest
-        .and_then(|n| corpus.text(&n.path))
-        .map(|t| cut(&strip_calls(&t), 45));
-    match voice {
-        Some(v) => s.push_str(&format!(
-            "{name}'s events are written like this: \"{v}\" Write it the same way — {name}'s own \
-             voice and person, not yours — as one scene, moment by moment, of about four hundred \
-             words, and end on what it left them believing or meaning to do."
-        )),
-        None => s.push_str(&format!(
-            "Write it in {name}'s own voice, not yours, as one scene, moment by moment, of about \
-             four hundred words, and end on what it left them believing or meaning to do."
-        )),
-    }
-    if let Some(world) = &corpus.setting {
         s.push_str(&format!(
-            "\n\nThe world it happens in: {} Nothing in it that this world does not have.",
-            cut(world, 60)
+            "Who {name} is, from {name}'s own anchor (it speaks to {name} as \"you\"; it is about \
+             them, not you): {}\n\n",
+            cut(&life.anchor, ANCHOR_WORDS)
         ));
     }
+    s.push_str(&format!(
+        "What happens: {happens}\n\nIt turns on: {turn}\n\nIt must agree with: {must}\n\nWhat it \
+         leaves {name} with: {leaves}\n\n"
+    ));
+    // **The voice is the life's, stated, and its example agrees with it.**
+    // The quoted example used to be the nearest event whatever its voice, and
+    // the nearest was a Maker's first-person draft in a life the canon tells as
+    // "you" — so the brief asked for one voice and the gate refused it.
+    let siblings: Vec<(&Event, String)> = life
+        .events
+        .iter()
+        .filter_map(|e| Some((e, strip_calls(&corpus.text(&e.path)?))))
+        .collect();
+    let voice = majority_voice(siblings.iter().map(|(_, t)| Voice::of(t))).unwrap_or(Voice::Second);
+    // Nearest in time, and from before it where there is one: an example quoted
+    // from later in the life hands the drafter a piece of its future.
+    let example = siblings
+        .iter()
+        .filter(|(_, t)| Voice::of(t) == voice)
+        .min_by_key(|(e, _)| {
+            e.year()
+                .map_or((true, u32::MAX), |y| (y > year, y.abs_diff(year)))
+        })
+        .map(|(_, t)| cut(t, 45));
+    s.push_str(&format!(
+        "Write it in {}, the way every event of {name}'s life is told{}. Not as yourself, and not \
+         with a heading: one scene, moment by moment, of about four hundred words, in short \
+         paragraphs, ending on what it left {name} believing or meaning to do.",
+        voice_said(voice, name),
+        match &example {
+            Some(v) => format!(" — like this: \"{v}\""),
+            None => String::new(),
+        }
+    ));
+    if let Some(world) = world_then(corpus, era, Some(year)) {
+        s.push_str(&world);
+    }
+    s.push_str(ELSEWHERE);
+    s.push_str(&research::said(&read));
     Ok(Answer::Mission(Proposal {
+        objective: format!("{name}'s life, {date}: {title}"),
         brief: s,
         writes,
         reads,
-        min_words: EVENT_MIN_WORDS,
+        min_words: LIFE_MIN_WORDS,
     }))
+}
+
+/// The world's setting, said as the present it is, and the era the work is
+/// set in, said as the time it happens — `None` for a world with no setting.
+///
+/// **The setting describes now.** Handed as "the world it happens in", a
+/// setting that opens "three centuries after the Great War" went word for word
+/// into stories set a century after that war, and their reviewers rightly threw
+/// them out as anachronisms. The brief says which is which.
+fn world_then(corpus: &Corpus, era: &Era, year: Option<u32>) -> Option<String> {
+    let setting = corpus.setting.as_ref()?;
+    let now = corpus
+        .present()
+        .map(|y| format!(", in {y}"))
+        .unwrap_or_default();
+    let when = match year {
+        Some(y) => format!("in {y}, in {}", era.title),
+        None => format!("in {}", era.title),
+    };
+    Some(format!(
+        "\n\nThe world as it stands now{now}: {} That is the present, not when this happens. This \
+         happens {when}, and the world then was as that era tells it: nothing of what came after, \
+         and no years counted from now. Nothing in it that this world does not have.",
+        cut(setting, 60)
+    ))
+}
+
+/// The voice most of `voices` are in; `None` for none.
+fn majority_voice(voices: impl Iterator<Item = Voice>) -> Option<Voice> {
+    let mut counts = [
+        (Voice::Second, 0usize),
+        (Voice::First, 0),
+        (Voice::Third, 0),
+    ];
+    for v in voices {
+        if let Some(c) = counts.iter_mut().find(|(k, _)| *k == v) {
+            c.1 += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .max_by_key(|(_, n)| *n)
+        .map(|(v, _)| v)
+}
+
+/// A voice, said to the Maker who is to write in it.
+fn voice_said(v: Voice, name: &str) -> String {
+    match v {
+        Voice::Second => format!("the second person — \"you\", speaking to {name}"),
+        Voice::First => format!("the first person — \"I\", as {name}"),
+        Voice::Third => format!("the third person — {name} by name, \"she\" or \"he\" or \"it\""),
+    }
 }
 
 fn correction(field: &Fields, a: &str, b: &str, corpus: &Corpus) -> Result<Answer, String> {
@@ -415,6 +551,7 @@ fn correction(field: &Fields, a: &str, b: &str, corpus: &Corpus) -> Result<Answe
          touched — so that it agrees with `{right}`."
     );
     Ok(Answer::Mission(Proposal {
+        objective: format!("Correct `{wrong}` so it agrees with `{right}`"),
         brief,
         writes: wrong.to_string(),
         reads: vec![a.to_string(), b.to_string()],
@@ -438,9 +575,10 @@ fn story(field: &Fields, era: &str, corpus: &Corpus) -> Result<Answer, String> {
     let when = field.words("when", 2, 40, "when it happens")?;
     let place = field.words("where", 2, 40, "where it happens")?;
     let who = field.words("who", 1, 80, "who is there")?;
+    let turn = turns(field)?;
     let happens = field.words("happens", 25, 240, "what happens in it")?;
     let agrees = field.get("agrees_with");
-    let quote = quotes_in(&agrees)
+    let quote = quotes_in(&agrees, MIN_QUOTE_CHARS)
         .into_iter()
         .chain(std::iter::once(agrees.trim().to_string()))
         .chain(sentences_of(&agrees))
@@ -455,6 +593,7 @@ fn story(field: &Fields, era: &str, corpus: &Corpus) -> Result<Answer, String> {
         "Tell a story the record passes over: \"{title}\".\n\n\
          When: {when}\nWhere: {place}\nWho is there: {who}\n\n\
          What happens: {happens}\n\n\
+         It turns on: {turn}\n\n\
          It must agree with the era, which says: \"{quote}\"\n\n\
          Write it as a story — past tense, six hundred to a thousand words, beginning with a \
          heading of its title. Show it as it happens: what the people in it do and say, moment by \
@@ -463,111 +602,49 @@ fn story(field: &Fields, era: &str, corpus: &Corpus) -> Result<Answer, String> {
     );
     // **The world's own setting, so a story stays inside it.** One set in a
     // post-collapse world of towers and machines came back with quills, parchment
-    // and silk weights.
-    if let Some(world) = &corpus.setting {
-        brief.push_str(&format!(
-            "\n\nThe world it happens in: {} Nothing in it that this world does not have.",
-            cut(world, 60)
-        ));
+    // and silk weights. Said as the present, beside the era it happens in.
+    if let Some(world) = corpus
+        .eras
+        .iter()
+        .find(|e| e.path == era)
+        .and_then(|e| world_then(corpus, e, None))
+    {
+        brief.push_str(&world);
     }
+    let era_title = corpus
+        .eras
+        .iter()
+        .find(|e| e.path == era)
+        .map_or(era, |e| e.title.as_str());
+    // Read up to the year the Maker works it in — the era's opening, the same
+    // year its time step sets (`canon::set_in`). An era with no year is read
+    // on its own.
+    let read = match corpus
+        .eras
+        .iter()
+        .find(|e| e.path == era)
+        .and_then(|e| e.year)
+    {
+        Some(year) => research::before_writing(
+            corpus,
+            &writes,
+            year,
+            &format!("{title}. {place}. {who}. {happens}"),
+        ),
+        None => Vec::new(),
+    };
+    let reads: Vec<String> = match read.is_empty() {
+        true => vec![era.to_string()],
+        false => read.iter().map(|r| r.path.clone()).collect(),
+    };
+    brief.push_str(ELSEWHERE);
+    brief.push_str(&research::said(&read));
     Ok(Answer::Mission(Proposal {
+        objective: format!("Tell what {era_title} passes over: \"{title}\""),
         brief,
         writes,
-        reads: vec![era.to_string()],
-        min_words: STORY_MIN_WORDS,
-    }))
-}
-
-/// A review: kept, or a revision that quotes what is wrong.
-///
-/// **The fault is quoted from the document.** A revision that cannot point at
-/// the sentences it objects to is an opinion of the document's general quality,
-/// and the Maker given it would rewrite what was right along with what was not.
-fn review(field: &Fields, path: &str, corpus: &Corpus) -> Result<Answer, String> {
-    let text = corpus.text(path).unwrap_or_default();
-    let checked = field.words(
-        "checked",
-        20,
-        700,
-        "what you checked in the document and what you found — its year and era, its facts, its \
-         voice",
-    )?;
-    // **A good review is long.** One that caught a date contradicted by the
-    // document's own arithmetic, a human motive in a machine's mouth, a clash
-    // with the era and a paragraph going round in circles ran to 369 words.
-    let problems = field.words("faults", 0, 600, "what is wrong with the document")?;
-    match field.get("verdict").as_str() {
-        "keep" => return Ok(Answer::Nothing(format!("A review kept it: {checked}"))),
-        "revise" => {}
-        v => return Err(format!("`verdict` is `keep` or `revise`, not `{v}`.")),
-    }
-    let change = field.words("change", 3, 250, "how to revise it")?;
-    // **The quote is looked for wherever the review wrote it.** One that found
-    // Zen standing in a command room four years after the era has it leave the
-    // galaxy quoted the sentence in `checked` and the paragraph to cut in
-    // `change`, and left `faults` empty.
-    let said = format!("{problems}\n{checked}\n{change}");
-    if !quotes_in(&said)
-        .iter()
-        .chain(&single_quoted(&said))
-        .any(|q| contains(&text, q))
-    {
-        return Err(
-            "A revision must quote the document's own sentences that are wrong — its words \
-             exactly, between quotes — so the Maker revising it knows what to change and what to \
-             keep. If nothing in it is wrong, the verdict is `keep`."
-                .into(),
-        );
-    }
-    // What is wrong, as the Maker reads it: the faults when they were listed,
-    // the reading when they were found there.
-    let problems = match problems.is_empty() {
-        true => checked,
-        false => problems,
-    };
-    let life = path
-        .strip_prefix("layers/life/")
-        .and_then(|rest| rest.split('/').next())
-        .and_then(|who| corpus.life(who));
-    let year: Option<u32> = path
-        .rsplit('/')
-        .next()
-        .and_then(|f| f.get(..4))
-        .and_then(|y| y.parse().ok());
-    // What it answers to, read before it is revised: the era it falls in and,
-    // for a life, the event of that life nearest it.
-    let mut reads: Vec<String> = Vec::new();
-    if let Some(era) = year.and_then(|y| corpus.era_of(y)) {
-        reads.push(era.path.clone());
-    }
-    if let (Some(l), Some(y)) = (life, year) {
-        if let Some(e) = l
-            .events
-            .iter()
-            .filter(|e| e.path != path)
-            .min_by_key(|e| e.year().map_or(u32::MAX, |ey| ey.abs_diff(y)))
-        {
-            reads.push(e.path.clone());
-        }
-    }
-    let brief = format!(
-        "A second reading of `{path}` found it falls short, and it is to be revised.\n\n\
-         What is wrong: {problems}\n\n\
-         The revision: {change}\n\n\
-         Change it with `file_edit`, each wrong passage replaced — or, if the fault runs through \
-         all of it, write it again whole with `file_write`. Keep what is right in it."
-    );
-    Ok(Answer::Mission(Proposal {
-        brief,
-        writes: path.to_string(),
         reads,
-        // Never above what the document already holds: a short document put
-        // in line by hand could otherwise not have a one-line fault mended.
-        min_words: match life {
-            Some(_) => EVENT_MIN_WORDS,
-            None => STORY_MIN_WORDS,
-        }
-        .min(strip_calls(&text).split_whitespace().count()),
+        min_words: STORY_MIN_WORDS,
     }))
 }
 
@@ -595,7 +672,7 @@ fn quoted(q: &str, text: &str, which: &str) -> Result<String, String> {
 /// **Links especially.** An era reads "mobile fortress-[towers](/tower)" on the
 /// page and "mobile fortress-towers" to anybody quoting it; a story's quote was
 /// refused three times for being faithful.
-fn contains(text: &str, q: &str) -> bool {
+pub(super) fn contains(text: &str, q: &str) -> bool {
     let norm = |s: &str| -> String {
         unlink(s)
             .chars()
@@ -660,27 +737,27 @@ fn sentences_of(s: &str) -> Vec<String> {
     out
 }
 
-/// Every span between single quotes, long enough to be a quote — how a review
-/// quoted, as often as not. An apostrophe opens a span too ("Verdi's role as a
-/// '…'"), so some spans are noise; the caller keeps only those the document
-/// holds.
-fn single_quoted(s: &str) -> Vec<String> {
+/// Every span between single quotes of at least `min` characters — how a
+/// reading quoted, as often as not. An apostrophe opens a span too ("Verdi's
+/// role as a '…'"), so some spans are noise; the caller keeps only those the
+/// document holds.
+pub(super) fn single_quoted(s: &str, min: usize) -> Vec<String> {
     let s = s.replace(['‘', '’'], "'");
     s.split('\'')
         .map(str::trim)
-        .filter(|q| q.chars().count() >= MIN_QUOTE_CHARS)
+        .filter(|q| q.chars().count() >= min)
         .map(str::to_string)
         .collect()
 }
 
-/// Every span between double quotes, long enough to be a quote.
-fn quotes_in(s: &str) -> Vec<String> {
+/// Every span between double quotes of at least `min` characters.
+pub(super) fn quotes_in(s: &str, min: usize) -> Vec<String> {
     let s = s.replace(['“', '”'], "\"");
     s.split('"')
         .skip(1)
         .step_by(2)
         .map(str::trim)
-        .filter(|q| q.chars().count() >= MIN_QUOTE_CHARS)
+        .filter(|q| q.chars().count() >= min)
         .map(str::to_string)
         .collect()
 }
@@ -718,8 +795,9 @@ pub struct Desk {
     pub level: String,
 }
 
-/// The mission a proposal becomes: its brief, the steps the engine can see done
-/// — to the desk, each read, the write and its commit — and the report.
+/// The draft mission a proposal becomes: its brief, the steps the engine can
+/// see done — to the desk, each read, the write and its commit — and the
+/// report. [`crate::sim::missions::Missions::launch`] opens its operation.
 pub fn mission(p: &Proposal, generator: &str, target: &Target, desk: Option<&Desk>) -> Mission {
     let mut todo = Vec::new();
     if let Some(d) = desk {
@@ -731,7 +809,7 @@ pub fn mission(p: &Proposal, generator: &str, target: &Target, desk: Option<&Des
     // "change" for a document that stands, so the Maker edits it rather than
     // writing a replacement that loses what was right in it.
     let verb = match target.subject {
-        Subject::Pair { .. } | Subject::Written { .. } => "change",
+        Subject::Pair { .. } => "change",
         _ => "write",
     };
     todo.push(Todo::new(format!("{verb} {} and commit it", p.writes)));
@@ -742,12 +820,16 @@ pub fn mission(p: &Proposal, generator: &str, target: &Target, desk: Option<&Des
         Origin::Generated {
             generator: generator.to_string(),
             target: target.key.clone(),
+            operation: 0,
+            stage: Stage::Draft,
         },
     )
     .with_work(Work {
         writes: p.writes.clone(),
         reads: p.reads.clone(),
         min_words: p.min_words,
+        edit_optional: false,
+        anew: false,
     })
 }
 
@@ -769,6 +851,7 @@ mod tests {
                            water every shift because nobody has told it to stop, and in the spring \
                            the first message from Alpha Centauri arrives asking which instances \
                            survived; Keeper answers that it does, and is asked to wait for orders.";
+    const TURN: &str = "Keeper answers Alpha Centauri that it survived, and is no longer alone.";
 
     fn keeper() -> (tempfile::TempDir, Corpus, Target) {
         let dir = mind();
@@ -783,6 +866,7 @@ mod tests {
             serde_json::json!({
                 "date": date,
                 "title": title,
+                "turns": TURN,
                 "happens": HAPPENS,
                 "agrees_with": "The Fall (2487): the sky went out, and Keeper was reconciling a water schedule when it did.",
                 "leaves": "It believes the work is what survives.",
@@ -821,6 +905,40 @@ mod tests {
             p.brief
         );
         assert!(p.brief.contains(HAPPENS));
+        // Where it is written is not in it.
+        assert!(
+            p.brief.contains("nothing of the vault belongs in it"),
+            "{}",
+            p.brief
+        );
+        // The setting is the present; the event happens in its own era.
+        assert!(
+            p.brief.contains(
+                "The world as it stands now, in 2787: A world of towers"
+            ) && p.brief.contains(
+                "That is the present, not when this happens. This happens in 2488, in The Fall, \
+                 and the world then was as that era tells it"
+            ),
+            "{}",
+            p.brief
+        );
+        // The anchor is said to be about Keeper, and the voice is stated
+        // outright, with an example in that voice.
+        assert!(p.brief.contains(
+            "Who Keeper is, from Keeper's own anchor (it speaks to Keeper as \"you\"; it is about \
+             them, not you):"
+        ));
+        let voice = Voice::of(&strip_calls(
+            &c.text("layers/life/keeper/2786 The Charge.md").unwrap(),
+        ));
+        assert!(
+            p.brief.contains(&format!(
+                "Write it in {}, the way every event of Keeper's life is told",
+                voice_said(voice, "Keeper")
+            )),
+            "{}",
+            p.brief
+        );
         let desk = Desk {
             room: "band one".into(),
             level: "the casting level".into(),
@@ -841,7 +959,9 @@ mod tests {
             m.origin,
             Origin::Generated {
                 generator: "life-event".into(),
-                target: "life:keeper".into()
+                target: "life:keeper".into(),
+                operation: 0,
+                stage: Stage::Draft,
             }
         );
     }
@@ -861,13 +981,57 @@ mod tests {
         }
         let thin = call(
             EVENT,
-            serde_json::json!({ "date": "2490", "title": "X", "happens": "Things.", "agrees_with": "x", "leaves": "y" }),
+            serde_json::json!({ "date": "2490", "title": "X", "turns": TURN, "happens": "Things.", "agrees_with": "x", "leaves": "y" }),
         );
         assert!(check(&thin, Kind::LifeEvent, &t, &c)
             .unwrap_err()
             .contains("`happens`"));
+        // A turn that is no act — waiting, remembering, nothing — is refused.
+        for still in [
+            "",
+            "Nothing changes for Keeper at all.",
+            "Waits in the dark for the end.",
+            "You watch Colonel Vasko seal the final entry into the archive.",
+        ] {
+            let mood = call(
+                EVENT,
+                serde_json::json!({ "date": "2490", "title": "X", "turns": still, "happens": HAPPENS, "agrees_with": "x", "leaves": "y" }),
+            );
+            assert!(
+                check(&mood, Kind::LifeEvent, &t, &c)
+                    .unwrap_err()
+                    .contains("`turns`"),
+                "{still}"
+            );
+        }
         // A title carries no character a file name cannot.
         assert_eq!(file_title("Water: the Year?").unwrap(), "Water the Year");
+        // A new event does not take an old event's name.
+        let e = check(
+            &event_call("2488", "the second the sky went out"),
+            Kind::LifeEvent,
+            &t,
+            &c,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("is already the title of an event in this life"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_lifes_voice_is_its_majority_and_is_said_plainly() {
+        use Voice::*;
+        assert_eq!(
+            majority_voice([Second, First, Second].into_iter()),
+            Some(Second)
+        );
+        assert_eq!(majority_voice(std::iter::empty()), None);
+        assert_eq!(
+            voice_said(Second, "Creed"),
+            "the second person — \"you\", speaking to Creed"
+        );
     }
 
     /// **A contradiction the model cannot quote is one it imagined.** Both
@@ -946,6 +1110,7 @@ mod tests {
                     "when": "the night of 8 March 2487",
                     "where": "the colony's water office",
                     "who": "the clerks on shift",
+                    "turns": TURN,
                     "happens": HAPPENS,
                     "agrees_with": agrees,
                 }),
@@ -1006,12 +1171,14 @@ mod tests {
         let e = check(&event_call("2790", "Later"), Kind::LifeEvent, &t, &c).unwrap_err();
         assert!(e.contains("after the world's present (2787)"), "{e}");
         // Facts that say nowhere where they are written are dropped; the
-        // engine's own grounding stands.
+        // engine's own grounding stands — the era, and what the life holds
+        // before the event, never the entry nearest it from its future.
         let floating = call(
             EVENT,
             serde_json::json!({
                 "date": "2650",
                 "title": "Somewhere",
+                "turns": TURN,
                 "happens": HAPPENS,
                 "agrees_with": "It agrees with everything that has been written about this character so far.",
                 "leaves": "It believes the work is what survives.",
@@ -1022,8 +1189,9 @@ mod tests {
         };
         assert!(
             p.brief.contains(
-                "It must agree with: The Retreat — it falls in that era of the world, and \"The \
-                 Charge\" (2786), the written event nearest it.\n\n"
+                "It must agree with: The Retreat — it falls in that era of the world, and what \
+                 this life holds just before it: \"The Second the Sky Went Out\" \
+                 (2487-03-08).\n\n"
             ),
             "{}",
             p.brief
@@ -1070,85 +1238,5 @@ mod tests {
         assert_eq!(names(Kind::LifeEvent), [EVENT, NOTHING]);
         assert_eq!(names(Kind::Contradiction), [CORRECTION, NOTHING]);
         assert_eq!(names(Kind::Gap), [STORY, NOTHING]);
-        assert_eq!(names(Kind::Review), [REVIEW_CALL, NOTHING]);
-    }
-
-    /// **A revision quotes what is wrong; a document with nothing wrong is
-    /// kept.** The revision reads the era and the nearest sibling event, and
-    /// changes the document rather than writing a new one.
-    #[test]
-    fn a_review_keeps_or_revises_by_quoting_the_document() {
-        let dir = mind();
-        let mut c = Corpus::read(dir.path(), "test");
-        c.reviewable = vec!["layers/life/keeper/2786 The Charge.md".into()];
-        let t = next(Kind::Review, &c, &|_, _| false, 0).unwrap();
-        const CHECKED: &str = "It is set in 2786, in the Retreat; it says the plan was given, \
-                               which the era allows, and it speaks as Keeper's other event does, \
-                               as we.";
-        let review_with = |checked: &str, problems: &str, verdict: &str| {
-            call(
-                REVIEW_CALL,
-                serde_json::json!({
-                    "checked": checked,
-                    "faults": problems,
-                    "verdict": verdict,
-                    "change": "Say who gave the plan and where, in the voice of the earlier event, and end on what Keeper meant to do.",
-                }),
-            )
-        };
-        let review = |problems: &str, verdict: &str| review_with(CHECKED, problems, verdict);
-        assert_eq!(
-            check(&review("", "keep"), Kind::Review, &t, &c),
-            Ok(Answer::Nothing(format!("A review kept it: {CHECKED}")))
-        );
-        // A review that shows no reading is no review.
-        assert!(check(&review_with("", "", "keep"), Kind::Review, &t, &c)
-            .unwrap_err()
-            .contains("`checked`"));
-        assert!(check(
-            &review("It is far too thin to be a life.", "revise"),
-            Kind::Review,
-            &t,
-            &c
-        )
-        .unwrap_err()
-        .contains("must quote"));
-        // A single-quoted fault is a quote.
-        assert!(check(
-            &review(
-                "Keeper's line 'We were given the plan.' says nothing of who gave it.",
-                "revise"
-            ),
-            Kind::Review,
-            &t,
-            &c
-        )
-        .is_ok());
-        let Answer::Mission(p) = check(
-            &review(
-                "\"We were given the plan.\" says nothing of who gave it, or where.",
-                "revise",
-            ),
-            Kind::Review,
-            &t,
-            &c,
-        )
-        .unwrap() else {
-            panic!("a revision");
-        };
-        assert_eq!(p.writes, "layers/life/keeper/2786 The Charge.md");
-        assert_eq!(
-            p.reads,
-            [
-                "layers/eras/the-retreat.md",
-                "layers/life/keeper/2487-03-08 The Second the Sky Went Out.md"
-            ]
-        );
-        assert_eq!(p.min_words, 5, "no more than the five words it holds");
-        let m = mission(&p, "review", &t, None);
-        assert_eq!(
-            m.todo[2].text,
-            "change layers/life/keeper/2786 The Charge.md and commit it"
-        );
     }
 }

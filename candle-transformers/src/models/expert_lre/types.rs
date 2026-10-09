@@ -235,8 +235,14 @@ mod stats_tests {
         }
         PipelineStats::reset(&shared);
         let s = PipelineStats::snapshot(&shared);
-        assert_eq!((s.warm_slots, s.warm_paged_slots, s.pad_slots), (13_508, 2_138, 256));
-        assert_eq!((s.worker_cold, s.promotion_bytes, s.stage_read_ns), (0, 0, 0));
+        assert_eq!(
+            (s.warm_slots, s.warm_paged_slots, s.pad_slots),
+            (13_508, 2_138, 256)
+        );
+        assert_eq!(
+            (s.worker_cold, s.promotion_bytes, s.stage_read_ns),
+            (0, 0, 0)
+        );
     }
 }
 
@@ -326,9 +332,7 @@ pub enum PipelineMessage {
     /// Answer once every message sent before this one has been processed. What
     /// a reader of the counters, or of anything else the pipeline thread
     /// writes, sends first to read them complete.
-    Settle {
-        response_tx: mpsc::SyncSender<()>,
-    },
+    Settle { response_tx: mpsc::SyncSender<()> },
     /// Snapshot and reset the pipeline thread’s profile accumulator.
     SnapshotProfile {
         /// Oneshot channel for returning the snapshot.

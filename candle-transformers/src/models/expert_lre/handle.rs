@@ -14,8 +14,6 @@
 use super::cache::{minimum_resident_slots, pinned_layer_count, ExpertCacheInner};
 #[cfg(feature = "cuda")]
 use super::dispatch::{Dispatch, OwnerTags};
-#[cfg(feature = "tensor-assert")]
-use super::slot_owners::SlotOwners;
 #[cfg(feature = "cuda")]
 use super::live_table::LiveTable;
 #[cfg(feature = "cuda")]
@@ -35,6 +33,8 @@ use super::promo::PromotionRing;
 use super::residency::Residency;
 #[cfg(feature = "cuda")]
 use super::slot_image::{row_tile_bytes_for, slot_bytes_for, slot_offsets};
+#[cfg(feature = "tensor-assert")]
+use super::slot_owners::SlotOwners;
 #[cfg(feature = "cuda")]
 use super::stager::{spawn_stager, StagerCtx, StagerMsg};
 #[cfg(feature = "cuda")]
@@ -726,13 +726,7 @@ impl ExpertCache {
                         pack
                     }
                     PackSource::Build(mut writer) => {
-                        startup_repack(
-                            targets,
-                            &mut writer,
-                            &mut ring,
-                            cuda_dev,
-                            progress,
-                        )?;
+                        startup_repack(targets, &mut writer, &mut ring, cuda_dev, progress)?;
                         // Publishing flushes and `fsync`s the whole pack — tens
                         // of gigabytes, and the single largest thing that used
                         // to happen behind a bar already reading 100%. It is

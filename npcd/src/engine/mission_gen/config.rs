@@ -53,6 +53,12 @@ pub struct Config {
     /// How many generated missions to keep waiting at the table.
     #[serde(default = "default_keep")]
     pub keep: usize,
+    /// What the table is asked when it reads a draft, before a review is set —
+    /// see [`super::reading`].
+    pub reading: String,
+    /// The voice a Maker writes a piece in when it sits down to compose —
+    /// see [`crate::engine::compose`].
+    pub writing: String,
     pub generators: Vec<Generator>,
 }
 
@@ -66,6 +72,12 @@ impl Config {
         let c: Config = serde_yaml::from_str(yaml).map_err(|e| format!("{FILE}: {e}"))?;
         if c.system.trim().is_empty() {
             return Err(format!("{FILE}: `system` is empty"));
+        }
+        if c.reading.trim().is_empty() {
+            return Err(format!("{FILE}: `reading` is empty"));
+        }
+        if c.writing.trim().is_empty() {
+            return Err(format!("{FILE}: `writing` is empty"));
         }
         if c.generators.is_empty() {
             return Err(format!("{FILE}: no generators"));
@@ -129,6 +141,8 @@ mod tests {
     const YAML: &str = "\
 system: You set work.
 keep: 3
+reading: Read the draft.
+writing: You write for the record.
 generators:
   - id: lives
     kind: life_event
@@ -168,18 +182,22 @@ generators:
     #[test]
     fn a_broken_configuration_is_refused_with_why() {
         for (yaml, why) in [
-            ("system: ''\ngenerators: []\n", "`system` is empty"),
-            ("system: x\ngenerators: []\n", "no generators"),
+            ("system: ''\nreading: r\nwriting: w\ngenerators: []\n", "`system` is empty"),
+            ("system: x\nreading: ' '\nwriting: w\ngenerators: []\n", "`reading` is empty"),
+            ("system: x\nreading: r\nwriting: ' '\ngenerators: []\n", "`writing` is empty"),
+            ("system: x\nwriting: w\ngenerators: []\n", "missing field `reading`"),
+            ("system: x\nreading: r\ngenerators: []\n", "missing field `writing`"),
+            ("system: x\nreading: r\nwriting: w\ngenerators: []\n", "no generators"),
             (
-                "system: x\ngenerators:\n  - {id: a, kind: gap, prompt: p}\n  - {id: a, kind: gap, prompt: q}\n",
+                "system: x\nreading: r\nwriting: w\ngenerators:\n  - {id: a, kind: gap, prompt: p}\n  - {id: a, kind: gap, prompt: q}\n",
                 "named twice",
             ),
             (
-                "system: x\ngenerators:\n  - {id: a, kind: gap, weight: 0, prompt: p}\n",
+                "system: x\nreading: r\nwriting: w\ngenerators:\n  - {id: a, kind: gap, weight: 0, prompt: p}\n",
                 "weight 0",
             ),
             (
-                "system: x\ngenerators:\n  - {id: a, kind: nonsense, prompt: p}\n",
+                "system: x\nreading: r\nwriting: w\ngenerators:\n  - {id: a, kind: review, prompt: p}\n",
                 "unknown variant",
             ),
         ] {

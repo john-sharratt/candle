@@ -38,7 +38,10 @@ pub mod device;
 pub mod field;
 pub mod item;
 pub mod ledger;
+pub mod missing;
 pub mod missions;
+pub mod operation_names;
+pub mod operations;
 pub mod phone;
 pub mod posting;
 pub mod reading;
@@ -59,6 +62,7 @@ use field::{Field, Resource};
 use item::Pack;
 use ledger::Ledger;
 use missions::{MissionMaterial, Missions};
+use operations::Operation;
 use tower::Tower;
 
 /// Everything about a world that is not its map.
@@ -255,6 +259,53 @@ impl Sim {
             }
         }
         out
+    }
+
+    /// What becomes of a failed operation's document: a draft is moved out of
+    /// the record to `rejected/` ([`Operation::leaves_on_failure`]); a document
+    /// the record already held is put back to what it said when the operation
+    /// opened, so a rejected correction does not stand — unless a later
+    /// operation on it has since succeeded, whose accepted text that would
+    /// overwrite. Returns where the document is now, or why it could not be
+    /// settled; `None` when there was nothing to do.
+    pub fn set_aside_failed(&mut self, op: &Operation) -> Option<Result<String, String>> {
+        match (op.leaves_on_failure(), &op.before) {
+            (true, _) => {
+                let to = op.name.to_lowercase().replace(' ', "-");
+                Some(self.bench.retire(&op.document, &to))
+            }
+            (false, Some(_)) if self.missions.operations().succeeded_after(op) => None,
+            (false, Some(before)) => Some(self.bench.put_back(&op.document, before)),
+            (false, None) => None,
+        }
+    }
+
+    /// `creator_present.what` — this body's own finished work: the documents
+    /// its open mission and the one it closed last write, where the record
+    /// holds them filed.
+    ///
+    /// **Presenting is of a thing, by its name.** Left free, the field took
+    /// whatever a Maker meant to say: one with its report to hand in wrote the
+    /// whole report into it, six times, and was told six times that there was
+    /// nothing by that name. Bound to its own filed work, a Maker with nothing
+    /// filed is not offered the chair at all, and the table's `report_done` is
+    /// where a report goes.
+    pub fn presentable(&self, body: &str) -> Vec<String> {
+        let documents: Vec<&str> = [self.missions.active(body), self.missions.last_closed(body)]
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.work.as_ref().map(|w| w.writes.as_str()))
+            .collect();
+        self.record
+            .iter()
+            .filter(|i| i.state == record::State::Filed)
+            .filter(|i| {
+                i.path
+                    .as_deref()
+                    .is_some_and(|p| documents.iter().any(|d| d.eq_ignore_ascii_case(p)))
+            })
+            .map(|i| i.name.clone())
+            .collect()
     }
 
     /// `read.what` — what there is here with something on it this body has not
@@ -702,6 +753,43 @@ impl Sim {
 mod tests {
     use super::*;
     use item::{Item, Kind};
+    use operations::Operations;
+
+    /// **A failed correction is undone; a failed draft leaves.** The era a
+    /// correction worked on goes back to what it said when the operation
+    /// opened; a story drafted new is moved to `rejected/`.
+    #[test]
+    fn a_failed_operation_sets_its_document_aside_by_what_it_was() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("layers/eras")).unwrap();
+        std::fs::create_dir_all(root.path().join("layers/stories")).unwrap();
+        std::fs::write(root.path().join("layers/eras/a.md"), "corrected badly").unwrap();
+        std::fs::write(root.path().join("layers/stories/s.md"), "a weak story").unwrap();
+        let mut sim = Sim::default();
+        sim.set_bench_root(root.path());
+        let mut ops = Operations::default();
+
+        let fix = ops.open("contradiction", "pair:a|b", "fix", "layers/eras/a.md");
+        ops.kept_before(fix, "the era as it was");
+        let put = sim.set_aside_failed(ops.get(fix).unwrap());
+        assert_eq!(put, Some(Ok("layers/eras/a.md".to_string())));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("layers/eras/a.md")).unwrap(),
+            "the era as it was"
+        );
+
+        let story = ops.open(
+            "untold",
+            "era:layers/eras/a.md",
+            "tell",
+            "layers/stories/s.md",
+        );
+        let moved = sim.set_aside_failed(ops.get(story).unwrap());
+        let to = moved.expect("a draft is set aside").expect("and moved");
+        assert!(to.starts_with("rejected/") && to.ends_with("/s.md"), "{to}");
+        assert!(!root.path().join("layers/stories/s.md").exists());
+        assert!(root.path().join(&to).is_file());
+    }
 
     fn two_bodies() -> Sim {
         let mut s = Sim::new();
@@ -712,6 +800,46 @@ mod tests {
         s.pack_mut("c2")
             .add(Item::new("bolt", "bolt rounds", Kind::Ammunition, 30));
         s
+    }
+
+    /// **What a Maker may present is its own filed work, by name** — not
+    /// anything it cares to write, and not somebody else's piece.
+    #[test]
+    fn a_maker_presents_only_its_own_filed_work() {
+        use crate::engine::mission::{Mission, Origin, Todo, Work};
+        let mut s = Sim::new();
+        let path = "layers/stories/the-first-city-opens.md";
+        s.record.put(
+            record::Item::new("doc_first", "the first city opens", record::Kind::Story)
+                .in_state(record::State::Filed)
+                .at_path(path),
+        );
+        s.record.put(
+            record::Item::new("doc_other", "somebody else's story", record::Kind::Story)
+                .in_state(record::State::Filed)
+                .at_path("layers/stories/other.md"),
+        );
+        assert!(
+            s.presentable("m1").is_empty(),
+            "nothing carried, nothing to present"
+        );
+
+        s.missions.assign(
+            "m1",
+            Mission::new(
+                "Tell what the record passes over.",
+                vec![Todo::new(format!("write {path} and commit it"))],
+                Origin::Lodged { by: "op".into() },
+            )
+            .with_work(Work {
+                writes: path.into(),
+                reads: Vec::new(),
+                min_words: 0,
+                edit_optional: false,
+                anew: false,
+            }),
+        );
+        assert_eq!(s.presentable("m1"), ["the first city opens"]);
     }
 
     #[test]

@@ -1066,10 +1066,34 @@ mod tests {
         assert_eq!(
             merged,
             vec![
-                (ChunkMove { from: (11, 2), to: (10, 1) }, gpu()),
-                (ChunkMove { from: (11, 1), to: (10, 2) }, gpu()),
-                (ChunkMove { from: (21, 3), to: (20, 1) }, other),
-                (ChunkMove { from: (21, 0), to: (20, 2) }, other),
+                (
+                    ChunkMove {
+                        from: (11, 2),
+                        to: (10, 1)
+                    },
+                    gpu()
+                ),
+                (
+                    ChunkMove {
+                        from: (11, 1),
+                        to: (10, 2)
+                    },
+                    gpu()
+                ),
+                (
+                    ChunkMove {
+                        from: (21, 3),
+                        to: (20, 1)
+                    },
+                    other
+                ),
+                (
+                    ChunkMove {
+                        from: (21, 0),
+                        to: (20, 2)
+                    },
+                    other
+                ),
             ],
         );
     }

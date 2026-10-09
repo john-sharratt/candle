@@ -67,9 +67,26 @@ fn revoice(text: &str, voice: Voice) -> String {
     // alone. (A proper-noun subject, `Pax was`, is the residual edge this does
     // not catch; it never turns a pronoun subject's verb wrong, which is the one
     // that would read as broken.)
-    let map = |w: &str, subj_i: bool| -> Option<&'static str> {
+    //
+    // In the focal character's own act, the `you` it said is whoever it spoke
+    // to, and reading it back as `you` collides with the character itself: "I am
+    // not ignoring you" became "you are not ignoring you". That second person
+    // becomes the third: `they` where a verb follows it as its subject, `them`
+    // elsewhere.
+    let map = |w: &str, subj_i: bool, next: Option<&str>| -> Option<&'static str> {
         let lower = w.to_ascii_lowercase();
         Some(match (voice, lower.as_str()) {
+            (Voice::You, "you") => match next.is_some_and(follows_a_subject) {
+                true => "they",
+                false => "them",
+            },
+            (Voice::You, "your") => "their",
+            (Voice::You, "yours") => "theirs",
+            (Voice::You, "yourself") => "themselves",
+            (Voice::You, "you're") => "they're",
+            (Voice::You, "you've") => "they've",
+            (Voice::You, "you'll") => "they'll",
+            (Voice::You, "you'd") => "they'd",
             (Voice::You, "i") => "you",
             (Voice::You, "me") => "you",
             (Voice::You, "my") => "your",
@@ -96,10 +113,15 @@ fn revoice(text: &str, voice: Voice) -> String {
 
     let mut out = String::with_capacity(normalized.len() + 8);
     let mut subj_i = false;
-    for tok in tokenize(&normalized) {
-        match tok {
+    let tokens = tokenize(&normalized);
+    for (i, tok) in tokens.iter().enumerate() {
+        match *tok {
             Token::Word(w) => {
-                out.push_str(map(w, subj_i).unwrap_or(w));
+                let next = tokens[i + 1..].iter().find_map(|t| match t {
+                    Token::Word(n) => Some(*n),
+                    Token::Other(_) => None,
+                });
+                out.push_str(map(w, subj_i, next).unwrap_or(w));
                 let lower = w.to_ascii_lowercase();
                 if lower == "i" {
                     subj_i = true;
@@ -116,6 +138,50 @@ fn revoice(text: &str, voice: Voice) -> String {
         }
     }
     recapitalize_sentences(&out)
+}
+
+/// Whether `word` is one a subject pronoun stands in front of — a verb, or the
+/// adverb that sits between the two (`you never …`). What decides whether the
+/// listener re-voiced out of an own act is `they` or `them`.
+fn follows_a_subject(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "are"
+            | "were"
+            | "have"
+            | "had"
+            | "will"
+            | "would"
+            | "can"
+            | "could"
+            | "should"
+            | "shall"
+            | "must"
+            | "may"
+            | "might"
+            | "do"
+            | "did"
+            | "don't"
+            | "didn't"
+            | "won't"
+            | "can't"
+            | "need"
+            | "know"
+            | "knew"
+            | "want"
+            | "think"
+            | "said"
+            | "say"
+            | "see"
+            | "saw"
+            | "told"
+            | "asked"
+            | "never"
+            | "always"
+            | "already"
+            | "still"
+            | "also"
+    )
 }
 
 enum Token<'a> {
@@ -161,17 +227,28 @@ fn tokenize(s: &str) -> Vec<Token<'_>> {
 /// Capitalise the first letter of the text and of every sentence after a
 /// terminator (`.`/`!`/`?`), so re-voiced pronouns that landed at a sentence
 /// start read correctly.
+///
+/// **A terminator ends a sentence only when a space follows it.** Without that
+/// rule the `.md` of every path a character was told to write became `.Md` —
+/// `write layers/life/…/Recovery, Line 7.Md` — and the Makers wrote, edited and
+/// committed to the path as they read it, which is not the document their
+/// mission writes.
 fn recapitalize_sentences(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut at_start = true;
+    let mut after_stop = false;
     for c in s.chars() {
+        if after_stop {
+            after_stop = false;
+            at_start = c.is_whitespace();
+        }
         if at_start && c.is_alphabetic() {
             out.extend(c.to_uppercase());
             at_start = false;
         } else {
             out.push(c);
             if matches!(c, '.' | '!' | '?') {
-                at_start = true;
+                after_stop = true;
             } else if !c.is_whitespace() {
                 at_start = false;
             }
@@ -401,6 +478,26 @@ mod tests {
             render_event(line).unwrap(),
             "You tell Pax Veridian that you need to know what has changed in the data stream \
              since our last conversation."
+        );
+    }
+
+    /// **Whoever was spoken to is not the speaker.** The `you` in an own act's
+    /// meaning is the listener; left as `you` it collided with the character
+    /// itself — "you are not ignoring you".
+    #[test]
+    fn the_listener_in_an_own_tell_is_the_third_person() {
+        let line = "you — tell Ione Valtiere — meaning: \"I am observing the data streams, but I \
+                    am not ignoring you. I will tell you when you have the draft back, and your \
+                    notes are mine to keep.\"";
+        assert_eq!(
+            render_event(line).unwrap(),
+            "You tell Ione Valtiere you are observing the data streams, but you are not ignoring \
+             them. You will tell them when they have the draft back, and their notes are yours \
+             to keep."
+        );
+        assert_eq!(
+            revoice("you're right, and you've seen it yourself", Voice::You),
+            "They're right, and they've seen it themselves"
         );
     }
 
@@ -670,6 +767,20 @@ mod tests {
         assert_eq!(
             revoice("is it me? I think so.", Voice::You),
             "Is it you? You think so."
+        );
+    }
+
+    /// **A full stop inside a word is not the end of a sentence.** The `.md`
+    /// of a path a Maker was told to write came out `.Md`, and it wrote to that
+    /// — which is not the document its mission writes.
+    #[test]
+    fn a_path_keeps_its_extension_as_written() {
+        let told = "Your mission, next: write layers/life/zenling-drone/3086-11-17 Recovery, \
+                    Line 7.md. invoke it at the terminal.";
+        assert_eq!(
+            render_event(told).unwrap(),
+            "Your mission, next: write layers/life/zenling-drone/3086-11-17 Recovery, Line \
+             7.md. Invoke it at the terminal."
         );
     }
 

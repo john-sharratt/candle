@@ -233,7 +233,8 @@ impl PromotionRing {
     pub(crate) fn log(&self, i: u32) -> Logged {
         let i = i as usize % self.cap;
         // SAFETY: inside the log array.
-        let v = unsafe { std::ptr::read_volatile((self.host.add(self.cap * 8) as *const u64).add(i)) };
+        let v =
+            unsafe { std::ptr::read_volatile((self.host.add(self.cap * 8) as *const u64).add(i)) };
         Logged::decode(v)
     }
 
@@ -340,10 +341,17 @@ mod tests {
         );
         assert_eq!((long(144), long(152)), (PROMO_EMPTY, 13));
         // retarget at 144 + 4·8 = 176, three u64s per ring index.
-        assert_eq!((long(176 + 24), long(176 + 32), long(176 + 40)), (0x9000, 0x9010, 0x9020));
+        assert_eq!(
+            (long(176 + 24), long(176 + 32), long(176 + 40)),
+            (0x9000, 0x9010, 0x9020)
+        );
         let r = ring.ring();
         assert_eq!(
-            (r.sweep - r.reserve, r.victims - ring.dev, r.retarget - ring.dev),
+            (
+                r.sweep - r.reserve,
+                r.victims - ring.dev,
+                r.retarget - ring.dev
+            ),
             (4, 144, 176)
         );
     }
@@ -379,7 +387,10 @@ mod tests {
         assert_eq!(ticket_from_word(7, 9), 7);
         assert_eq!(ticket_from_word(12, 9), 12);
         let near = (5u64 << 32) | 3;
-        assert_eq!(ticket_from_word(0xffff_fffe, near), (4u64 << 32) | 0xffff_fffe);
+        assert_eq!(
+            ticket_from_word(0xffff_fffe, near),
+            (4u64 << 32) | 0xffff_fffe
+        );
         let near = (5u64 << 32) | 0xffff_fff0;
         assert_eq!(ticket_from_word(4, near), (6u64 << 32) | 4);
     }

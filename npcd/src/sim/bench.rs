@@ -38,6 +38,7 @@ use serde_json::{Map, Value};
 
 use crate::mind::path::MindPath;
 use crate::registry::yaml_edit;
+use crate::sim::missing::no_document;
 
 /// One document's pending change.
 ///
@@ -68,6 +69,40 @@ impl Change {
             (Some(_), None) => "gone",
             _ => "changed",
         }
+    }
+}
+
+/// The longest document a refused edit hands back whole, in words. A life
+/// event or a story fits; a longer document is read back in its own turn.
+const SHOWN_WHOLE: usize = 900;
+
+/// Why an edit found nothing to replace, and what is actually there.
+///
+/// "Read it back" alone was not followed: Makers went on quoting the text of
+/// their own refused edits, sure those had landed, and were refused turn after
+/// turn. The document as it stands is what the next edit has to quote, so a
+/// document short enough to show is shown.
+///
+/// Shown it, one Maker went on refused nine times: it was quoting an earlier
+/// version as what to replace and the document as it stands as the
+/// replacement — rewriting the piece through a tool for changing a passage of
+/// it. So the refusal names the act that does what it was after.
+fn not_there(key: &str, current: &str) -> String {
+    let refused = format!(
+        "That does not appear in {key} — what you are replacing has to be what is actually \
+         there, word for word."
+    );
+    let rewrite = "If you meant to replace the whole piece, write it whole again rather than \
+                   editing it.";
+    match current.split_whitespace().count() {
+        0 => format!("{refused} {key} is empty: write it whole first."),
+        n if n <= SHOWN_WHOLE => {
+            format!(
+                "{refused} {rewrite} It says, as it stands now:\n\n{}",
+                current.trim_end()
+            )
+        }
+        _ => format!("{refused} {rewrite} Otherwise read it back first."),
     }
 }
 
@@ -126,9 +161,72 @@ impl Benches {
         self.root = Some(root.into());
     }
 
+    /// Take back the working sets `saved` held — what every body had open, set
+    /// aside and last committed — keeping the root this daemon was given.
+    ///
+    /// **Uncommitted work outlives a reboot.** Only the missions were saved,
+    /// so every restart threw away each Maker's working copy, and a Maker that
+    /// had composed its piece and was about to commit it came back to an empty
+    /// set and composed it all over again.
+    pub fn restore(&mut self, saved: Benches) {
+        self.open = saved.open;
+        self.stashed = saved.stashed;
+        self.last = saved.last;
+    }
+
     /// Whether this world has documents at all.
     pub fn has_root(&self) -> bool {
         self.root.is_some()
+    }
+
+    /// The folder this world's documents live in, if it has any.
+    pub fn mind_root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// Move the document at `raw` out of the record, to
+    /// `rejected/<to>/<its file name>` under the root — where no world reads
+    /// it, and an operator still can. Anybody's change to it, open or set
+    /// aside, is dropped with it — a stash brought back and committed would
+    /// write the rejected document into the record again. Returns where it
+    /// went, as a mind path.
+    pub fn retire(&mut self, raw: &str, to: &str) -> Result<String, String> {
+        let (key, full) = self.doc(raw)?;
+        let root = self.root()?.to_path_buf();
+        let name = full
+            .file_name()
+            .ok_or_else(|| format!("{raw} names no file"))?
+            .to_string_lossy()
+            .to_string();
+        let slug: String = to
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .collect();
+        let dest_rel = format!("rejected/{slug}/{name}");
+        let dest = root.join(&dest_rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("{} would not open: {e}", parent.display()))?;
+        }
+        std::fs::rename(&full, &dest).map_err(|e| format!("{raw} would not move aside: {e}"))?;
+        for working in self.open.values_mut().chain(self.stashed.values_mut()) {
+            working.files.remove(&key);
+        }
+        self.last.remove(&key);
+        Ok(dest_rel)
+    }
+
+    /// Put the document at `raw` back to `text` in the record, dropping
+    /// anybody's change to it, open or set aside — for a correction that
+    /// failed, whose edit is not to stand. Returns its mind path.
+    pub fn put_back(&mut self, raw: &str, text: &str) -> Result<String, String> {
+        let (key, full) = self.doc(raw)?;
+        std::fs::write(&full, text).map_err(|e| format!("{raw} would not go back: {e}"))?;
+        for working in self.open.values_mut().chain(self.stashed.values_mut()) {
+            working.files.remove(&key);
+        }
+        self.last.remove(&key);
+        Ok(key)
     }
 
     fn root(&self) -> Result<&Path, String> {
@@ -232,7 +330,7 @@ impl Benches {
                 )),
             };
         }
-        std::fs::read_to_string(&full).map_err(|_| format!("There is no document at {key}."))
+        std::fs::read_to_string(&full).map_err(|_| no_document(&key, &full))
     }
 
     /// Read a document as a numbered excerpt, capped at [`MAX_READ_LINES`].
@@ -328,10 +426,7 @@ impl Benches {
         let (key, _) = self.doc(raw)?;
         let current = self.read(body, raw)?;
         match current.matches(old).count() {
-            0 => Err(format!(
-                "That does not appear in {key}. Read it back — what you are replacing has to be \
-                 what is actually there."
-            )),
+            0 => Err(not_there(&key, &current)),
             1 => {
                 let next = current.replacen(old, new, 1);
                 self.write(body, about, raw, &next)
@@ -424,7 +519,7 @@ impl Benches {
             None => full.exists(),
         };
         if !there {
-            return Err(format!("There is no document at {key}."));
+            return Err(no_document(&key, &full));
         }
         let fresh = held.is_none();
         let base = fresh.then(|| on_disk(&full)).flatten();
@@ -576,7 +671,12 @@ impl Benches {
 
         for (key, c) in &changed {
             let (_, full) = self.doc(key)?;
-            if on_disk(&full) != c.base {
+            // **Nobody collides with themselves.** A reviewer back from a
+            // restart with its working copy restored was refused its commit
+            // because the document had "moved under" it — and the hand named
+            // was its own.
+            let own = self.last.get(key).is_some_and(|who| who == body);
+            if on_disk(&full) != c.base && !own {
                 return Err(match self.last.get(key) {
                     Some(who) => format!(
                         "{key} has moved under you — {who} committed over the same ground while \
@@ -601,6 +701,23 @@ impl Benches {
         }
         self.open.remove(body);
         Ok(written)
+    }
+
+    /// Take what is on disk now as the base of every open or set-aside change
+    /// to `raw` — for the engine's own clerical rewrite of a document
+    /// (`gates::tidy_on_disk`), which is nobody's commit and must not read as
+    /// one: a working copy opened before it would otherwise be refused at its
+    /// commit for a change nobody made.
+    pub fn rebase(&mut self, raw: &str) {
+        let Ok((key, full)) = self.doc(raw) else {
+            return;
+        };
+        let now = on_disk(&full);
+        for working in self.open.values_mut().chain(self.stashed.values_mut()) {
+            if let Some(c) = working.files.get_mut(&key) {
+                c.base = now.clone();
+            }
+        }
     }
 
     /// Who last committed a document, when anybody has.
@@ -778,6 +895,30 @@ mod tests {
         (b, root)
     }
 
+    /// **A working copy comes back through a save and a restore**, under the
+    /// root the restoring daemon was given rather than the saved one.
+    #[test]
+    fn uncommitted_work_survives_a_save_and_restore() {
+        let (mut b, root) = rooted("restore");
+        b.write("m1", "the third era", "layers/eras/third.md", "rewritten\n")
+            .unwrap();
+        let saved: Benches = serde_json::from_value(serde_json::to_value(&b).unwrap()).unwrap();
+
+        let (mut fresh, fresh_root) = rooted("restore-fresh");
+        fresh.restore(saved);
+        assert_eq!(fresh.mind_root(), Some(fresh_root.as_path()));
+        assert_eq!(
+            fresh.read("m1", "layers/eras/third.md").unwrap(),
+            "rewritten\n"
+        );
+        assert_eq!(
+            fresh.opened("m1").unwrap().changed(),
+            [&"layers/eras/third.md".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(fresh_root);
+    }
+
     #[test]
     fn a_world_with_no_root_has_no_documents_and_says_so() {
         let mut b = Benches::new();
@@ -786,6 +927,78 @@ mod tests {
         assert!(err.contains("no documents"), "{err}");
         assert!(b.write("m1", "x", "layers/eras/third.md", "…").is_err());
         assert!(b.list("m1", "layers/eras").is_err());
+    }
+
+    /// **A retired document leaves the record for `rejected/`**, and anybody's
+    /// open change to it goes with it.
+    #[test]
+    fn a_retired_document_moves_aside_out_of_the_record() {
+        let (mut b, root) = rooted("retire");
+        b.write("m2", "x", "layers/eras/third.md", "set aside")
+            .unwrap();
+        assert!(b.stash("m2"));
+        b.write("m1", "x", "layers/eras/third.md", "an edit")
+            .unwrap();
+        let to = b
+            .retire("layers/eras/third.md", "operation-iron-lantern")
+            .unwrap();
+        assert_eq!(to, "rejected/operation-iron-lantern/third.md");
+        assert!(!root.join("layers/eras/third.md").exists());
+        assert!(root.join(&to).is_file());
+        assert!(b.opened("m1").is_none_or(|w| w.changed().is_empty()));
+        // A stash brought back carries nothing of it to commit.
+        let _ = b.pop("m2");
+        assert!(b.opened("m2").is_none_or(|w| w.changed().is_empty()));
+        assert!(b.retire("layers/eras/third.md", "again").is_err());
+        assert_eq!(b.mind_root(), Some(root.as_path()));
+    }
+
+    /// **Nobody collides with themselves, nor with the engine's tidying.** A
+    /// body's own earlier commit, or a rebased clerical rewrite, is not a
+    /// change made under it; somebody else's commit still is.
+    #[test]
+    fn only_somebody_elses_commit_is_a_collision() {
+        let (mut b, root) = rooted("own-commit");
+        let path = "layers/eras/third.md";
+        b.write("m1", "x", path, "first pass\n").unwrap();
+        b.commit("m1").unwrap();
+        // It opens again, and its own earlier hand changes the file under it.
+        b.write("m1", "x", path, "second pass\n").unwrap();
+        std::fs::write(root.join(path), "first pass, tidied\n").unwrap();
+        assert!(b.commit("m1").is_ok(), "its own hand is no collision");
+
+        // The engine tidies under somebody else's open copy: rebased, it commits.
+        b.write("m2", "x", path, "a mend\n").unwrap();
+        std::fs::write(root.join(path), "second pass, tidied\n").unwrap();
+        b.rebase(path);
+        assert!(b.commit("m2").is_ok());
+
+        // Somebody else's commit under an open copy is still a collision.
+        b.write("m3", "x", path, "late\n").unwrap();
+        b.write("m1", "x", path, "first in\n").unwrap();
+        b.commit("m1").unwrap();
+        let e = b.commit("m3").unwrap_err();
+        assert!(e.contains("m1 committed over the same ground"), "{e}");
+    }
+
+    /// **A document put back says what it said, and nobody's change to it
+    /// survives.**
+    #[test]
+    fn a_document_put_back_says_what_it_said() {
+        let (mut b, root) = rooted("put-back");
+        b.write("m1", "x", "layers/eras/third.md", "a failed correction")
+            .unwrap();
+        b.commit("m1").unwrap();
+        b.write("m2", "x", "layers/eras/third.md", "more").unwrap();
+        assert_eq!(
+            b.put_back("layers/eras/third.md", "the third era\n"),
+            Ok("layers/eras/third.md".to_string())
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("layers/eras/third.md")).unwrap(),
+            "the third era\n"
+        );
+        assert!(b.opened("m2").is_none_or(|w| w.changed().is_empty()));
     }
 
     #[test]
@@ -932,6 +1145,28 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("does not appear"), "{err}");
+        // **And it is shown what is there** — the text the next edit has to
+        // quote, including this working set's own earlier changes.
+        assert!(
+            err.ends_with(
+                "If you meant to replace the whole piece, write it whole again rather than \
+                 editing it. It says, as it stands now:\n\nthe third era\nburned in the spring"
+            ),
+            "{err}"
+        );
+    }
+
+    /// A document too long to hand back whole is pointed at, not pasted.
+    #[test]
+    fn a_long_document_is_not_pasted_into_a_refusal() {
+        let long = "word ".repeat(SHOWN_WHOLE + 1);
+        let err = not_there("layers/eras/third.md", &long);
+        assert!(err.ends_with("Otherwise read it back first."), "{err}");
+        assert!(
+            err.contains("write it whole again rather than editing it"),
+            "{err}"
+        );
+        assert!(not_there("layers/eras/third.md", "").ends_with("write it whole first."));
     }
 
     #[test]

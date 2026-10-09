@@ -1,0 +1,44 @@
+id: vault-time
+kind: level
+within: creators-vault
+ordinal: 7
+name: the time level
+summary: >
+  Where a Maker goes before it writes the past. A time machine sets the year
+  it works in, and from then until the work is reported nothing that happened
+  after that year reaches it.
+character: >
+  The quietest level in the vault, because nothing on it is happening now.
+lacks:
+  - way off this level except the lift
+spine:
+  name: the hall
+  loop: false
+  through: [hall-north, hall-south]
+nodes:
+  - { id: hall-north, kind: passage, name: the north walk }
+  - { id: hall-south, kind: passage, name: the south walk, off: [hall-north] }
+
+  - id: core
+    kind: core
+    name: the lift
+    plural: false
+    off: [hall-north]
+
+  - id: first-time-room
+    kind: work
+    name: the first time room
+    off: [hall-north]
+    parts: [{ part: time-machine, count: 8 }, light-ring]
+
+  - id: second-time-room
+    kind: work
+    name: the second time room
+    off: [hall-south]
+    parts: [{ part: time-machine, count: 8 }, air-handler]
+
+  - id: waiting-room
+    kind: social
+    name: the waiting room
+    off: [hall-south]
+    parts: [{ part: seat, count: 6 }]

@@ -375,6 +375,13 @@ impl LayerSource {
         }
     }
 
+    /// Whether a conversation whose first turn carries `tags` is one of this
+    /// source's documents — every document's turn is tagged exactly
+    /// [`Self::tags`], and nothing else is.
+    pub fn wrote(&self, tags: &[String]) -> bool {
+        tags == self.tags().as_slice()
+    }
+
     /// The system prompt a document's conversation is opened under.
     ///
     /// Short on purpose. The conversation exists to carry one document into the
@@ -436,6 +443,25 @@ mod tests {
             unit: "documents".into(),
             owner: None,
         }
+    }
+
+    /// A layer's documents are known by their tags: a shared layer's by its
+    /// name alone, a character's own by its name and the character.
+    #[test]
+    fn a_document_is_known_by_its_layers_tags() {
+        let eras = source("eras", PathBuf::from("layers/eras"));
+        assert!(eras.wrote(&["eras".to_string()]));
+        assert!(!eras.wrote(&["stories".to_string()]));
+        assert!(
+            !eras.wrote(&[]),
+            "a character's own turn carries no layer tag"
+        );
+        let mine = LayerSource {
+            owner: Some("creed".into()),
+            ..source("memory", PathBuf::from("layers/memory/creed"))
+        };
+        assert!(mine.wrote(&["memory".to_string(), "memory:creed".to_string()]));
+        assert!(!mine.wrote(&["memory".to_string()]));
     }
 
     // ── the window ──────────────────────────────────────────────────────────

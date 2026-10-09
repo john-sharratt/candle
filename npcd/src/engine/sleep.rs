@@ -107,23 +107,26 @@ impl DayTracker {
     }
 }
 
-/// The conversation id a character uses for a given day.
+/// The conversation id a character uses for a given day and chapter — the
+/// chapter being how many missions it has closed (`Missions::chapter`), so each
+/// mission handed in starts the next conversation.
 ///
 /// Derived rather than allocated, and recorded against the timeline by
 /// [`crate::engine::mind::Minds::open_conversation`], so a character's day is
 /// identifiable as its own from the log alone.
 ///
 /// Being derived is what makes a restart able to *find* the conversation it left
-/// — the name is recomputed from `(npc_id, day)` rather than remembered — so a
-/// character rejoins its morning rather than starting the day again beside it.
+/// — the name is recomputed from `(npc_id, day, chapter)` rather than remembered,
+/// the chapter being kept with the missions — so a character rejoins the work it
+/// was in the middle of rather than starting it again beside itself.
 ///
 /// Determinism alone is not the property: this function was correct and its
 /// result was never handed to the substrate, which made every timeline
 /// unattributable while two doc comments said otherwise. A test that only
 /// exercises the string cannot see that, which is why the caller is what the
 /// doc points at.
-pub fn conversation_id(npc_id: u64, day: u64) -> String {
-    format!("npc-{npc_id}-day-{day}")
+pub fn conversation_id(npc_id: u64, day: u64, chapter: u64) -> String {
+    format!("npc-{npc_id}-day-{day}-chapter-{chapter}")
 }
 
 #[cfg(test)]
@@ -236,9 +239,10 @@ mod tests {
     /// reaches the substrate is `mind::think`'s to do and its own doc's to say.
     #[test]
     fn a_days_conversation_id_is_derived_not_allocated() {
-        assert_eq!(conversation_id(7, 3), "npc-7-day-3");
-        assert_eq!(conversation_id(7, 3), conversation_id(7, 3));
-        assert_ne!(conversation_id(7, 3), conversation_id(7, 4));
-        assert_ne!(conversation_id(8, 3), conversation_id(7, 3));
+        assert_eq!(conversation_id(7, 3, 2), "npc-7-day-3-chapter-2");
+        assert_eq!(conversation_id(7, 3, 2), conversation_id(7, 3, 2));
+        assert_ne!(conversation_id(7, 3, 2), conversation_id(7, 4, 2));
+        assert_ne!(conversation_id(7, 3, 2), conversation_id(7, 3, 3));
+        assert_ne!(conversation_id(8, 3, 2), conversation_id(7, 3, 2));
     }
 }

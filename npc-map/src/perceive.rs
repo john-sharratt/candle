@@ -98,6 +98,14 @@ fn lift_status(world: &World, id: &str, at: &Where) -> Option<String> {
             None => "You have boarded the lift. Wait for it to arrive.".to_string(),
         });
     }
+    // **Called is not to be called again.** Told the car's floor and to call it
+    // on every floor it passed, a Maker waiting at the command level read the
+    // same instruction five times while the car came up from the time level —
+    // for something it had already done. Once called here, the line is the wait,
+    // and says nothing of where the car is, so it does not change as it comes.
+    if lift.called_to(floor) && !lift.boardable_at(floor) {
+        return Some("The lift has been called and is on its way. Wait here for it.".to_string());
+    }
     Some(if lift.boardable_at(floor) {
         "The lift is here, its doors open. You can step in and ride it to another level."
             .to_string()

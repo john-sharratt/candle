@@ -19,9 +19,11 @@
 //! (`engine::guardian::modules::journal`), which starts a draft on a yes.
 
 pub mod ask;
+pub mod closing;
 pub mod desk;
 pub mod entry;
 pub mod record;
+pub mod repeats;
 pub mod section;
 pub mod state;
 pub mod tools;

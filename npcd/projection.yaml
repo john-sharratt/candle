@@ -360,6 +360,12 @@ layers:
 
       A world YAML selects which tags of this layer's corpus it admits, which
       is how one ingested corpus serves several settings.
+
+      Ranked below every conversation layer. A projection sees only the layers
+      ranked under its target, and a rank defaults to the declaration index —
+      so declared after `interaction`, the world was never in a character's
+      gather.
+    rank: -1
     window: 8000
     score_threshold: 0.30
     gather_scope: shared

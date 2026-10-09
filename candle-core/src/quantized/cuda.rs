@@ -40,13 +40,13 @@ use candle_kernels::simple::fused_silu_mul::run_silu_mul_q8a128_op;
 
 // Import the new quantized matmul dispatcher
 // K/128 blocks have embedded scales, no external scale extraction needed.
+/// The wait state of a grouped GEMM over a live weight table — see
+/// [`grouped_qmatmul_dev_q8a128`].
+pub use candle_kernels::quantized::MoeLive;
 use candle_kernels::quantized::{
     dispatch_info, flush_l2_cache, run_grouped_quantized_matmul, run_qkv_segmented_matmul,
     run_quantized_matmul, MatmulStatus, OutDType, VxSegment, YType, SPLITK_MAX_SEGS,
 };
-/// The wait state of a grouped GEMM over a live weight table — see
-/// [`grouped_qmatmul_dev_q8a128`].
-pub use candle_kernels::quantized::MoeLive;
 
 // Import GEMX repacking dispatcher
 use candle_kernels::quantized::{get_repacked_size_bytes, is_gemx_supported, run_repack_gemx};

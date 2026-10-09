@@ -11,7 +11,9 @@
 #![cfg(feature = "cuda")]
 
 use candle_core::cuda_backend::cudarc::driver::{sys, DevicePtr};
-use candle_core::quantized::cuda::{moe_bucketize, BucketizeLive, MoeBucketizeWorkspace, OwnerCheck};
+use candle_core::quantized::cuda::{
+    moe_bucketize, BucketizeLive, MoeBucketizeWorkspace, OwnerCheck,
+};
 use candle_core::quantized::decode_rows::DecodeRows;
 use candle_core::{Device, Result, Tensor};
 
@@ -42,7 +44,9 @@ fn a_vram_entry_on_another_experts_slot_traps() -> Result<()> {
     let n_experts = 8usize;
     // One row, every expert in VRAM: gate entries at `0x10_0000 + e · 0x100`,
     // slot `7 - e` of a zone of `0x100`-byte slots ending at `0x10_0800`.
-    let mut table: Vec<u64> = (0..n_experts as u64).map(|e| 0x10_0000 + e * 0x100).collect();
+    let mut table: Vec<u64> = (0..n_experts as u64)
+        .map(|e| 0x10_0000 + e * 0x100)
+        .collect();
     let gate = table.clone();
     table.extend(gate.iter().map(|g| g + 0x10));
     table.extend(gate.iter().map(|g| g + 0x20));
@@ -79,7 +83,14 @@ fn a_vram_entry_on_another_experts_slot_traps() -> Result<()> {
             slots: n_experts as u32,
         },
     };
-    moe_bucketize(&t, n_experts, 32, &mut ws, Some(&live), &DecodeRows::prefix(1))?;
+    moe_bucketize(
+        &t,
+        n_experts,
+        32,
+        &mut ws,
+        Some(&live),
+        &DecodeRows::prefix(1),
+    )?;
     assert!(
         stream.synchronize().is_err(),
         "expert 2's entry points at a slot tagged for expert 6: the launch must trap"

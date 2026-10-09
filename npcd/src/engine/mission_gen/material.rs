@@ -16,8 +16,9 @@
 use super::corpus::{Corpus, Life};
 use super::target::{Kind, Subject, Target};
 
-/// Words of a character's anchor shown.
-const ANCHOR_WORDS: usize = 220;
+/// Words of a character's anchor shown — to the generator, to the table's
+/// reading, and to the Maker who writes the event, all the same.
+pub(crate) const ANCHOR_WORDS: usize = 220;
 /// Words of a life story shown.
 const STORY_WORDS: usize = 450;
 /// Words of the latest written event shown.
@@ -36,23 +37,23 @@ pub fn render(kind: Kind, target: &Target, corpus: &Corpus) -> Option<String> {
         (Subject::Life { who }, Kind::LifeEvent) => life(corpus.life(who)?, corpus),
         (Subject::Pair { a, b }, Kind::Contradiction) => pair(corpus, a, b),
         (Subject::Era { path }, Kind::Gap) => gap(corpus, path),
-        (Subject::Written { path }, Kind::Review) => review(corpus, path),
         _ => None,
     }
 }
 
-/// Words of a document under review shown — all of any document a mission
-/// asks for.
-const REVIEW_WORDS: usize = 1400;
+/// Words of a draft shown to the table's reading — all of any document an
+/// operation asks for.
+const DRAFT_WORDS: usize = 1600;
 
-/// A written document and what it answers to: for a life event, whose life it
-/// is, the events around it and how they are written, and the era it falls in;
-/// for a story, the world and its eras.
-fn review(corpus: &Corpus, path: &str) -> Option<String> {
+/// A draft and what it answers to, for the table's reading: for a life event,
+/// whose life it is, the events around it and how they are written, and the
+/// era it falls in; for a story, the world and its eras. `None` when the draft
+/// is not on the record.
+pub fn draft(corpus: &Corpus, path: &str) -> Option<String> {
     let text = corpus.text(path)?;
     let mut s = format!(
-        "## The document under review (`{path}`)\n\n{}\n",
-        cut(&strip_calls(&text), REVIEW_WORDS)
+        "## The draft (`{path}`)\n\n{}\n",
+        cut(&strip_calls(&text), DRAFT_WORDS)
     );
     if let Some(who) = path
         .strip_prefix("layers/life/")
@@ -98,8 +99,18 @@ fn review(corpus: &Corpus, path: &str) -> Option<String> {
             ));
         }
     }
+    // The setting is the world as it is now, said so: read as the world of
+    // the draft's own time, it makes a story set a century earlier look wrong
+    // for not saying "three centuries after the war".
     if let Some(world) = &corpus.setting {
-        s.push_str(&format!("\n## The world\n\n{}\n", cut(world, 120)));
+        let now = corpus
+            .present()
+            .map(|y| format!(" (in {y})"))
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "\n## The world as it is now{now} — not as it was at the draft's own time\n\n{}\n",
+            cut(world, 120)
+        ));
     }
     s.push_str(&timeline(corpus));
     Some(s)
@@ -322,18 +333,15 @@ mod tests {
         assert_eq!(render(Kind::LifeEvent, &t, &c), None);
     }
 
-    /// **A life event under review is shown with whose it is, a sibling event
-    /// for its voice, and its era.**
+    /// **A drafted life event is shown with whose it is, a sibling event for
+    /// its voice, and its era.**
     #[test]
-    fn a_review_shows_the_document_and_what_it_answers_to() {
+    fn a_draft_shows_the_document_and_what_it_answers_to() {
         let dir = mind();
-        let mut c = Corpus::read(dir.path(), "test");
-        c.reviewable = vec!["layers/life/keeper/2786 The Charge.md".into()];
-        let t = next(Kind::Review, &c, &|_, _| false, 0).unwrap();
-        let m = render(Kind::Review, &t, &c).unwrap();
+        let c = Corpus::read(dir.path(), "test");
+        let m = draft(&c, "layers/life/keeper/2786 The Charge.md").unwrap();
         assert!(m.starts_with(
-            "## The document under review (`layers/life/keeper/2786 The Charge.md`)\n\nWe were \
-             given the plan."
+            "## The draft (`layers/life/keeper/2786 The Charge.md`)\n\nWe were given the plan."
         ));
         assert!(m.contains("## Whose life it is\n\nKeeper (`keeper`)"));
         assert!(m.contains(
@@ -341,7 +349,10 @@ mod tests {
              Second the Sky Went Out.md`)"
         ));
         assert!(m.contains("## The era it falls in (`layers/eras/the-retreat.md`)"));
-        assert!(m.contains("## The world\n\nA world of towers"));
+        assert!(m.contains(
+            "## The world as it is now (in 2787) — not as it was at the draft's own time\n\nA \
+             world of towers"
+        ));
     }
 
     /// **A life with one event is told where else to look, in years.** The

@@ -445,45 +445,6 @@ pub async fn pool(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Respons
     Json(Value::Object(worlds)).into_response()
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ReviewBody {
-    /// The mind path of the document to review.
-    path: String,
-}
-
-/// `POST /v1/pulse/missions/review` — put a document in line for the review
-/// generator, in every world with documents. For work done outside the table —
-/// written by hand, or by a mission from before reviews existed.
-pub async fn review(
-    State(s): State<Arc<Authored>>,
-    headers: HeaderMap,
-    Json(body): Json<ReviewBody>,
-) -> Response {
-    if let Err(r) = owner_of(&s, &headers).await {
-        return *r;
-    }
-    let Some(rt) = s.runtime.as_ref() else {
-        return no_engine("lining up a review");
-    };
-    let path = body.path.trim().trim_start_matches('/').to_string();
-    if !rt.mind.as_ref().is_some_and(|m| m.join(&path).is_file()) {
-        return err(
-            StatusCode::NOT_FOUND,
-            "no_document",
-            "there is no such document in the mind to review",
-        );
-    }
-    let mut queued = 0;
-    for hosted in rt.hosted.ids().iter().filter_map(|id| rt.hosted.get(id)) {
-        if hosted.sim(|sim| sim.bench.has_root())
-            && hosted.with_sim(|sim| sim.missions.review_later(&path))
-        {
-            queued += 1;
-        }
-    }
-    Json(json!({ "path": path, "queued": queued })).into_response()
-}
-
 #[derive(Debug, Default, Deserialize)]
 pub struct DiscardQuery {
     /// Forget the settled targets too, so all of the corpus can be found again.

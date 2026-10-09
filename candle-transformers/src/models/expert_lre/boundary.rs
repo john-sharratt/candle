@@ -347,8 +347,13 @@ impl PipelineState {
         // emptied by its displaced occupant's eviction — so the two cannot
         // alias. The device is quiesced.
         unsafe {
-            cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.copy_stream.cu_stream())
-                .map_err(candle::Error::wrap)?;
+            cudarc::driver::result::memcpy_dtod_async(
+                dst,
+                src,
+                bytes,
+                self.copy_stream.cu_stream(),
+            )
+            .map_err(candle::Error::wrap)?;
         }
         // SAFETY: the copy above puts this layer's three projections at `dst`
         // before anything reads the views (the caller synchronizes first).

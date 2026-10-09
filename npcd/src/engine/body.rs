@@ -39,6 +39,7 @@ use serde_json::{Map, Value};
 use npc_map::world::{Refused, Voice, Where};
 
 use crate::engine::act::Act;
+use crate::engine::tools::CATALOG;
 use crate::world::Hosted;
 
 /// What came of an act.
@@ -112,6 +113,52 @@ pub const ANSWERS: &[&str] = &[
 /// Whether this act's product is the line it answers with.
 pub fn answers(tool: &str) -> bool {
     ANSWERS.contains(&tool)
+}
+
+/// Whether this act is a composition — written in a sitting of its own under
+/// the mind's writing voice, so enacted by the runtime, which holds the
+/// engine, and not by [`perform`]. See [`crate::engine::compose`].
+pub fn composes(tool: &str) -> bool {
+    tool == "compose"
+}
+
+/// The catalog category of the acts that work on documents at a desk.
+const BENCH: &str = "Bench";
+
+/// Whether `act` is work on a document — a bench act by name, or an `invoke`
+/// of one of the bench's verbs at a device.
+pub fn document_work(act: &Act) -> bool {
+    let verb = match is_device(act.tool) {
+        true => act
+            .args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .and_then(|url| url.rsplit('/').next())
+            .unwrap_or_default(),
+        false => act.tool,
+    };
+    CATALOG
+        .iter()
+        .any(|t| t.name == verb && t.category == BENCH)
+}
+
+/// Whether what came of `act` is something the character must get a turn to
+/// act on at once, rather than whenever the world next happens to wake it.
+///
+/// - **What answers** ([`ANSWERS`]): a read's contents are in its outcome and
+///   nowhere else.
+/// - **A refusal**, of any act: the world said no and why, and that is the
+///   next thing to act on — the corrected call, or something else. Left until
+///   the room next woke it, a refused Maker at a quiet desk stood for minutes
+///   holding the reason.
+/// - **Work on a document**: the bench says what the work is now and what the
+///   step after it is — written, committed, short of its length.
+///
+/// Not speech, and not a gesture. A free turn after saying something is the
+/// treadmill: a character that speaks and is at once asked again speaks
+/// again, into the same silence, until its window holds only its own voice.
+pub fn continues(act: &Act, landed: bool) -> bool {
+    answers(act.tool) || !landed || document_work(act)
 }
 
 /// Whether this tool is one a body performs.
@@ -872,6 +919,37 @@ mod tests {
                 "`{tool}` answers but never reaches a world"
             );
         }
+    }
+
+    /// **What the world answered gets a turn; what the character said does
+    /// not.** A read, a refusal of anything, and work on a document — directly
+    /// or through a device — come straight back. A word that landed waits for
+    /// the world.
+    #[test]
+    fn what_the_world_answered_gets_a_turn_and_speech_does_not() {
+        let a = |tool: &'static str, args: serde_json::Value| Act {
+            tool,
+            args: args.as_object().unwrap().clone(),
+        };
+        let read = a("file_read", serde_json::json!({"path": "layers/eras/x.md"}));
+        let write = a(
+            "file_write",
+            serde_json::json!({"path": "layers/eras/x.md", "content": "x"}),
+        );
+        let committed = a(
+            "invoke",
+            serde_json::json!({"url": "http://local/bench/desk~1/bench_commit"}),
+        );
+        let told = a("tell", serde_json::json!({"to": "Pax", "intent": "hello"}));
+        let walked = a("move_to", serde_json::json!({"destination": "the lift"}));
+
+        assert!(continues(&read, true));
+        assert!(continues(&write, true));
+        assert!(continues(&committed, true));
+        assert!(!continues(&told, true), "speech is the treadmill");
+        assert!(!continues(&walked, true), "the arrival is what wakes it");
+        assert!(continues(&told, false), "a refusal is an answer");
+        assert!(continues(&walked, false), "a refusal is an answer");
     }
 
     fn vault() -> Hosted {

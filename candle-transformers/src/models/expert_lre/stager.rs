@@ -79,7 +79,10 @@ pub(crate) enum StagerMsg {
 
 /// Where a reader's bytes come from.
 enum Source {
-    Pack { row: usize, expert: usize },
+    Pack {
+        row: usize,
+        expert: usize,
+    },
     /// A pageable warm slot's record.
     Warm(usize),
 }

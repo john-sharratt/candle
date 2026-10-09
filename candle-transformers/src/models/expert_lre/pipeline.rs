@@ -810,19 +810,18 @@ impl PipelineState {
                 && keys[slot].is_some_and(|(r, e)| !promoting.contains(&(r, e)))
         };
         let ask = 2 * n;
-        let mut slots = self
-            .inner
-            .rank_victims(row, ask, false, |slot, layer| !upcoming[layer] && candidate(slot));
+        let mut slots = self.inner.rank_victims(row, ask, false, |slot, layer| {
+            !upcoming[layer] && candidate(slot)
+        });
         if slots.len() < ask {
-            let more = self.inner.rank_victims(row, ask - slots.len(), false, |slot, layer| {
-                upcoming[layer] && candidate(slot)
-            });
+            let more = self
+                .inner
+                .rank_victims(row, ask - slots.len(), false, |slot, layer| {
+                    upcoming[layer] && candidate(slot)
+                });
             slots.extend(more);
         }
-        let pad_cap = self
-            .stats
-            .lock()
-            .map_or(0, |s| s.pad_slots / PAD_PIN_SHARE);
+        let pad_cap = self.stats.lock().map_or(0, |s| s.pad_slots / PAD_PIN_SHARE);
         let mut pinned = self.pad_pinned_offers;
         let mut chosen = Vec::with_capacity(n);
         let mut places = self
@@ -1020,7 +1019,11 @@ impl PipelineState {
         self.collect_device_promotions(near)?;
         self.land_device_promotions(true)?;
         ring.withdraw();
-        let untaken: Vec<Offer> = self.ring_slots.iter_mut().filter_map(Option::take).collect();
+        let untaken: Vec<Offer> = self
+            .ring_slots
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect();
         for offer in untaken {
             self.take_back(offer)?;
         }

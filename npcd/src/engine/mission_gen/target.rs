@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 
 use super::corpus::Corpus;
 use super::fingerprint::Fingerprint;
-use crate::sim::missions::REVIEW;
 
 /// A kind of work a generator finds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -27,9 +26,6 @@ pub enum Kind {
     /// Something an era passes over that nobody has told, written as a story in
     /// `layers/stories/`.
     Gap,
-    /// A document a Maker wrote for a generated mission, read against what it
-    /// must agree with and how its kind is written; kept, or revised.
-    Review,
 }
 
 /// What a target is about.
@@ -41,8 +37,6 @@ pub enum Subject {
     Pair { a: String, b: String },
     /// An era, by mind path.
     Era { path: String },
-    /// A document under review, by mind path.
-    Written { path: String },
 }
 
 /// One piece of work a mission can be generated for.
@@ -69,7 +63,6 @@ pub fn next(
         Kind::LifeEvent => lives(corpus),
         Kind::Contradiction => pairs(corpus),
         Kind::Gap => eras(corpus),
-        Kind::Review => written(corpus),
     };
     let open: Vec<(usize, Target)> = candidates
         .into_iter()
@@ -171,29 +164,6 @@ fn eras(corpus: &Corpus) -> Vec<(usize, Target)> {
         .collect()
 }
 
-/// Every document Makers have written that is still on the record, oldest
-/// first — the earliest work is reviewed before the latest.
-fn written(corpus: &Corpus) -> Vec<(usize, Target)> {
-    corpus
-        .reviewable
-        .iter()
-        .enumerate()
-        .filter_map(|(age, path)| {
-            let text = corpus.text(path)?;
-            let mut h = Fingerprint::new();
-            h.add(&text);
-            Some((
-                age,
-                Target {
-                    key: format!("{REVIEW}{path}"),
-                    fingerprint: h.finish(),
-                    subject: Subject::Written { path: path.clone() },
-                },
-            ))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,28 +236,6 @@ mod tests {
         );
         assert_eq!(before.key, after.key);
         assert_ne!(before.fingerprint, after.fingerprint);
-    }
-
-    /// **The oldest written work is reviewed first**, a document no longer on
-    /// the record is not, and a reviewed one waits until it changes.
-    #[test]
-    fn the_oldest_written_document_is_reviewed_first() {
-        let dir = mind();
-        let mut c = Corpus::read(dir.path(), "test");
-        c.reviewable = vec![
-            "layers/stories/the-charge.md".into(),
-            "layers/stories/gone.md".into(),
-            "layers/life/keeper/2786 The Charge.md".into(),
-        ];
-        let t = next(Kind::Review, &c, &nothing_blocked, 0).unwrap();
-        assert_eq!(t.key, "review:layers/stories/the-charge.md");
-        let t = next(Kind::Review, &c, &|k, _| k.ends_with("the-charge.md"), 0).unwrap();
-        assert_eq!(
-            t.subject,
-            Subject::Written {
-                path: "layers/life/keeper/2786 The Charge.md".into()
-            }
-        );
     }
 
     /// The least-told era is chosen; "The Charge" names no era here, so all

@@ -154,7 +154,10 @@ impl SummaryRing {
     }
 
     fn host_slot_ptr(&self, slot: usize) -> *mut u32 {
-        assert!(slot < SUMMARY_RING, "summary ring slot {slot} of {SUMMARY_RING}");
+        assert!(
+            slot < SUMMARY_RING,
+            "summary ring slot {slot} of {SUMMARY_RING}"
+        );
         // SAFETY: in bounds by the assertion.
         unsafe { self.host.add(slot * self.stride()) }
     }
@@ -167,8 +170,9 @@ impl SummaryRing {
     /// completed. That is the whole signal: no event and no copy.
     pub(crate) fn ready(&self, slot: usize, word: u32) -> bool {
         // SAFETY: the word is inside the mapped ring; the device writes it.
-        let ready = unsafe { std::ptr::read_volatile(self.host_slot_ptr(slot).add(self.n_experts)) }
-            == word;
+        let ready =
+            unsafe { std::ptr::read_volatile(self.host_slot_ptr(slot).add(self.n_experts)) }
+                == word;
         if ready {
             std::sync::atomic::fence(Ordering::Acquire);
         }
@@ -513,10 +517,9 @@ impl Dispatch {
     /// previous one's. Returns `(seq, pass)`.
     fn begin_invocation(&self, row: usize) -> Result<(u64, u64)> {
         let (seq, new_pass) = {
-            let mut f = self
-                .forward
-                .lock()
-                .map_err(|_| candle::Error::Msg("expert dispatch: forward state poisoned".into()))?;
+            let mut f = self.forward.lock().map_err(|_| {
+                candle::Error::Msg("expert dispatch: forward state poisoned".into())
+            })?;
             let new_pass = f.last_row.is_none_or(|last| row <= last);
             f.last_row = Some(row);
             let seq = f.seq;
@@ -539,7 +542,8 @@ impl Dispatch {
     fn hold_for_ring(&self, ticket: u64) -> Result<()> {
         let need = ticket.saturating_sub(SUMMARY_RING as u64);
         let mut spins = 0u32;
-        while self.served.load(Ordering::Acquire) < need || self.staged.load(Ordering::Acquire) < need
+        while self.served.load(Ordering::Acquire) < need
+            || self.staged.load(Ordering::Acquire) < need
         {
             if self.abort.is_raised() {
                 candle::bail!("expert pipeline or stager died — the layer cannot be served");

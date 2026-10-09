@@ -26,6 +26,7 @@ contains:
   - vault-cartography
   - vault-casting
   - vault-portraits
+  - vault-time
 lacks:
   - way out of the vault
 # Where a Maker teleports to. The one journey in the building that is not
@@ -272,4 +273,6 @@ portals:
   - between: [vault-cartography/core, vault-casting/core]
     kind: a lift
   - between: [vault-casting/core, vault-portraits/core]
+    kind: a lift
+  - between: [vault-portraits/core, vault-time/core]
     kind: a lift

@@ -760,6 +760,89 @@ fn score_belief_groups_scores_every_conversation_in_a_multi_file_group() {
     assert!(cluster_cands.iter().any(|(k, _)| k.timeline == file_b));
 }
 
+/// **Documents of one exchange compete with each other.** A group of
+/// one-turn conversations — a world's entries, one era each — is one score
+/// competition: the document a probe is drawn from wins, and a document it is
+/// not drawn from scores nothing. Scored each against itself alone, every one
+/// has no runner-up, its margin is its raw agreement — half the bits for any
+/// pair — and every document scored well against every probe, so the same
+/// generic entries came top for every query.
+#[test]
+fn one_exchange_documents_compete_as_one_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let conv = open_conversation(dir.path());
+    let builder = Builder::from_yaml(TWO_LAYER_YAML).unwrap();
+    let mem_layer = builder.id_for_layer("mem").unwrap();
+    let clusters = builder.id_for_group("clusters").unwrap();
+    let dialogue_layer = builder.id_for_layer("dialogue").unwrap();
+    let convo = builder.id_for_group("convo").unwrap();
+
+    let fills = [
+        0xAAAA_AAAA_AAAA_AAAAu64,
+        0x5555_5555_5555_5555u64,
+        0x0F0F_0F0F_0F0F_0F0Fu64,
+        0x3333_3333_3333_3333u64,
+    ];
+    let docs: Vec<TimelineId> = (0..fills.len())
+        .map(|i| TimelineId::from_raw(301 + i as u64).unwrap())
+        .collect();
+    for (tl, fill) in docs.iter().zip(fills) {
+        conv.register_timeline(*tl, mem_layer, clusters);
+        let idx = conv
+            .record_turn(
+                *tl,
+                Role::User,
+                TurnPartWrite {
+                    token_count: 4,
+                    tags: vec!["repo_map".to_string()],
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record_turn");
+        conv.persist_wide_q_sigs(
+            turn_stream_id(tl.raw(), idx.0),
+            &encode_wide_sigs(&[sig(fill)]),
+        )
+        .expect("persist sigs");
+    }
+    let dlg_tl = TimelineId::from_raw(399).unwrap();
+    conv.register_timeline(dlg_tl, dialogue_layer, convo);
+    let target = ProjectionTarget {
+        layer: dialogue_layer,
+        group: convo,
+        timeline: dlg_tl,
+    };
+
+    // Drawn from the third document; scored, then taught at seal, then scored
+    // again on the levels the pool learned.
+    let probe = vec![sig(fills[2])];
+    for observe in [
+        Observe::No,
+        Observe::Yes {
+            tags: &[],
+            source: 1,
+        },
+        Observe::No,
+    ] {
+        let (scores, _) = conv.score_beliefs(builder.schema(), target, &probe, None, observe, None);
+        let got: Vec<f32> = docs
+            .iter()
+            .map(|tl| scores.turn(*tl, TurnIndex(0)))
+            .collect();
+        assert!(
+            got[2] > 0.0,
+            "the document the probe is drawn from: {got:?}"
+        );
+        for (i, s) in got.iter().enumerate().filter(|(i, _)| *i != 2) {
+            assert_eq!(
+                *s, 0.0,
+                "document {i} is not what the probe is about: {got:?}"
+            );
+        }
+    }
+}
+
 /// The wired reproject path (`device = Some`) must produce the SAME per-turn
 /// scores as the CPU per-file scan (`device = None`) — the GPU segmented scan is
 /// a proven-equivalent accelerator, not a behaviour change. This drives the

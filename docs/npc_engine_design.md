@@ -276,8 +276,14 @@ when the body is standing at the lift so it is told again there. The table offer
 body can do at it: `collect_mission` to one carrying nothing, `report_done` / `report_stuck` to
 one carrying a mission, `orders_report_done` to one holding a standing order; a body with a
 mission lodged for it by name is told so at the table with the address to `invoke`.
+The mission compass says the exact act for a step that sets the year — `time_travel` naming it
+at a time machine, or the way to one (`mission::time_compass`); told only "set your time to 2837
+at a time machine", Makers wandered between levels for an hour and told each other the lift was
+broken. The loop guard counts `message` as speech, and never strikes the lift (`lift_use`,
+`lift_call`), which is movement.
 `report_stuck` is turned away twice while the next step's room, machine or person is within
-reach, with the way there, and taken the third time. `report_done` is turned away — with the way
+reach — or, for a step that reads or writes a document, a desk is (`file_read` offered there) —
+with the way there, and taken the third time. `report_done` is turned away — with the way
 — whenever the next step is one the engine can see and it is still within reach. A character standing at the table with only the report left is told to report it every
 tick it stands there (`REPORT_AT_THE_TABLE`). `report_done` is refused while a reading of a
 machine the world holds is still unmade. What the engine saw —

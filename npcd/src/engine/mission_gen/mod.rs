@@ -25,9 +25,15 @@
 //! The design is `docs/mission_generator.md`.
 
 pub mod answer;
+pub mod canon;
 pub mod config;
 pub mod corpus;
 pub mod fingerprint;
+pub mod gates;
+pub mod leakage;
 pub mod material;
+pub mod reading;
+pub mod rejection;
+pub mod research;
 pub mod run;
 pub mod target;

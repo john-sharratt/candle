@@ -57,7 +57,11 @@ use crate::sim::Sim;
 /// Still a range, and still jittered, for the reason it always was: rooms on a
 /// fixed interval speak on the same beat, and a building that does everything at
 /// once is one loud world rather than several quiet ones.
-pub const WAIT: Range<Duration> = Duration::from_secs(10)..Duration::from_secs(30);
+///
+/// Fifteen to forty seconds rather than ten to thirty: at the faster beat the
+/// room's noises crowded a Maker's turns at the table, where the work is, and
+/// read as events rather than as the building's background.
+pub const WAIT: Range<Duration> = Duration::from_secs(15)..Duration::from_secs(40);
 
 /// A room that has somebody in it, and what its building is doing.
 struct Room {

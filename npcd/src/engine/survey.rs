@@ -126,11 +126,8 @@ impl Survey {
                         let mut verbs = station::verbs_at(inst.part_id());
                         // Only what this body can do here — see
                         // [`mission_acts::offered`].
-                        let on_mission = sim.missions.is_on_mission(body);
-                        let holds_order = !sim.ledger.held_by(body).is_empty();
-                        verbs.retain(|(_, t)| {
-                            mission_acts::offered(t.name, on_mission, holds_order)
-                        });
+                        let carrying = mission_acts::carrying(sim, body);
+                        verbs.retain(|(_, t)| mission_acts::offered(t.name, carrying));
                         let acts: Vec<&str> = verbs.iter().map(|(_, t)| t.name).collect();
                         let read = sim.reading(&inst.id(), &place, &acts, &who);
                         Some(Entry::new(inst.name(), &url, &verbs, &read))

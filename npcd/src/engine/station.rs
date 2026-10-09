@@ -178,6 +178,26 @@ const PLANT: &[&str] = &["plant-panel"];
 const STORES: &[&str] = &["stores"];
 const STRUCTURE: &[&str] = &["structure-board"];
 const READING_TABLE: &[&str] = &["reading-table"];
+const TIME_MACHINE: &[&str] = &["time-machine"];
+
+// ── The time machine ────────────────────────────────────────────────────────
+
+pub const TIME_TRAVEL: Tool = on!(
+    "time_travel",
+    TIME_MACHINE,
+    "Time",
+    Plane::World,
+    "Set the year of the world's history you work in. Until you report the work you carry, \
+     nothing that happened after that year — no later era, no story set after it — comes \
+     back to you; you recall the world as it stood then. Reporting the work returns you to \
+     the present.",
+    "year",
+    "The year to work in, as a number: 2937.",
+    "Your mission is to write a life event set in 2937, and its first step sends you here.",
+    r#"{"year":"2937"}"#,
+    "What came after the year you write cannot be in it, and what you do not recall you \
+     cannot put there by mistake."
+);
 
 // ── The chronicle ───────────────────────────────────────────────────────────
 
@@ -994,6 +1014,7 @@ pub const GATHER_CALL: Tool = on_with!(
 
 /// Everything in this module, in the order it is offered.
 pub const STATION_ACTS: &[Tool] = &[
+    TIME_TRAVEL,
     CHRONICLE_ADD_ENTRY,
     CHRONICLE_REWRITE_PAGE,
     CHRONICLE_RETIRE_ENTRY,

@@ -50,6 +50,8 @@ pub fn namespace_of(part_id: &str) -> &str {
         "stores" | "fabricator" => "stores",
         "bridge-console" => "tower",
         "seat" => "room",
+        // `time_travel` is `http://local/time/<id>/travel`.
+        "time-machine" => "time",
         // Anything unmapped addresses itself.
         other => other,
     }
