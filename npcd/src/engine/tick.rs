@@ -46,8 +46,10 @@ use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::engine::event::{Event, EventKind, Salience};
+use crate::engine::journal::closing;
 use crate::engine::journal::section::JournalPrompt;
 use crate::engine::journal::state::{JournalState, Span, Waiting};
+use crate::engine::mission::Mission;
 use crate::engine::sleep::{DayAction, DayTracker};
 use crate::engine::window::Window;
 use crate::npcs;
@@ -194,6 +196,13 @@ pub struct Inbox {
     /// which otherwise puts the deadline back to `NEVER` on the empty queue
     /// both of those cases have by definition. Cleared there.
     scheduled: bool,
+    /// Owed a turn on what its last act came back with — see
+    /// [`Inbox::think_again`]. Taken by the next [`Scheduler::begin_tick`],
+    /// which runs that turn even with nothing new in the queue.
+    owed: bool,
+    /// How many events at the head of the queue a failed turn handed back,
+    /// already written into the window — see [`Scheduler::retry`].
+    replayed: usize,
     /// World time (ms) the standing task was last restated to this character.
     ///
     /// **The task has to be quiet about itself too.** It is not news, so it
@@ -237,6 +246,8 @@ impl Inbox {
             events_seen: 0,
             last_act_at: None,
             scheduled: false,
+            owed: false,
+            replayed: 0,
             last_news_ms: 0,
             last_nudge_ms: 0,
             waker: Arc::new(Notify::new()),
@@ -292,9 +303,18 @@ impl Inbox {
     /// silence, and its own window fills with its own voice until the nucleus
     /// collapses. Asking the world a question is different from talking: the
     /// world said something back.
+    ///
+    /// **The turn is owed, and runs on an empty queue.** What the act came back
+    /// with rides on the conversation as a pending answer, not as an event in
+    /// the queue — so a follow-up that waited for an event never ran: the
+    /// character came due, found nothing queued, and went quiet with the answer
+    /// unread until something else in the world happened to wake it. While the
+    /// building spoke every half minute that was hidden; a Maker at its desk,
+    /// spared the building's noise, stopped for minutes after every read.
     pub fn think_again(&mut self) {
         self.due_at = 0;
         self.scheduled = true;
+        self.owed = true;
     }
 
     pub fn depth(&self) -> usize {
@@ -688,6 +708,36 @@ impl Scheduler {
         true
     }
 
+    /// Give a turn that never happened back to the character: its events go
+    /// back to the head of the queue, and it is owed a turn `after_ms` from
+    /// `now_ms`.
+    ///
+    /// **A turn the decode never took is not a turn taken.** `begin_tick` had
+    /// already drained the queue and taken what was owed, so a decode that
+    /// failed — or an engine not yet loaded — ended the tick with what the
+    /// character had been told consumed and nothing done about it, and nothing
+    /// scheduled again. The events were in its window and never in front of the
+    /// model. Handed back, they are read by the turn that does run; they are not
+    /// written into the window a second time.
+    pub fn retry(&self, npc_id: u64, now_ms: u64, after_ms: u64, events: Vec<Event>) -> bool {
+        let waker = {
+            let mut g = self.inboxes.lock().unwrap();
+            let Some(i) = g.get_mut(&npc_id) else {
+                return false;
+            };
+            i.replayed += events.len();
+            for e in events.into_iter().rev() {
+                i.queue.push_front(e);
+            }
+            i.due_at = now_ms.saturating_add(after_ms);
+            i.scheduled = true;
+            i.owed = true;
+            Arc::clone(&i.waker)
+        };
+        waker.notify_one();
+        true
+    }
+
     /// Bring a character straight back, because its last act answered with
     /// something. See [`Inbox::think_again`].
     pub fn think_again(&self, npc_id: u64) -> bool {
@@ -929,14 +979,16 @@ impl Scheduler {
     /// every other character's `deliver` for that whole time.
     pub fn begin_tick(&self, npc_id: u64) -> Option<TickStart> {
         // The drain takes the lock and gives it straight back.
-        let (events, cause) = {
+        let (events, cause, owed, replayed) = {
             let mut inboxes = self.inboxes.lock().unwrap();
             let inbox = inboxes.get_mut(&npc_id)?;
             // Readiness FIRST. `drain` clears the preempt flag, so reading it
             // afterwards reports `Blocked` for every tick and the Pulse feed
             // loses the one column that says why a character woke.
             let cause = inbox.readiness();
-            (inbox.drain(), cause)
+            let owed = std::mem::take(&mut inbox.owed);
+            let replayed = std::mem::take(&mut inbox.replayed);
+            (inbox.drain(), cause, owed, replayed)
         };
 
         /* **Nothing happened, so there is nothing to think about.**
@@ -982,7 +1034,10 @@ impl Scheduler {
          * Setting it back to `NEVER` is what the module already says an empty
          * queue means — unscheduled until the world says otherwise — and it is
          * what lets the next `deliver` see a character that needs queueing. */
-        if events.is_empty() {
+        /* **Unless a turn is owed.** An act that answered left its answer
+         * pending on the conversation, and the turn that reads it has nothing
+         * in the queue by construction — see `Inbox::think_again`. */
+        if events.is_empty() && !owed {
             let mut inboxes = self.inboxes.lock().unwrap();
             if let Some(inbox) = inboxes.get_mut(&npc_id) {
                 inbox.due_at = NEVER;
@@ -1006,7 +1061,9 @@ impl Scheduler {
         let snapshot = {
             let mut inboxes = self.inboxes.lock().unwrap();
             let inbox = inboxes.get_mut(&npc_id)?;
-            for e in &events {
+            // A retried turn's events lead the queue and are in the window
+            // already — see [`Scheduler::retry`].
+            for e in events.iter().skip(replayed) {
                 inbox.window.push_event(e);
             }
             inbox.window.clone()
@@ -1162,6 +1219,22 @@ impl Scheduler {
         self.journal_of_mut(npc_id, |j| {
             let gone = j.forget(ids);
             (gone, j.prompt())
+        })
+    }
+
+    /// Close a chapter of a character's journal: keep the entry recording the
+    /// mission it handed in ([`closing::closing_entry`]), at world time `at_ms`.
+    /// Returns the journal as it now reads, or `None` for a character nobody
+    /// has woken.
+    pub fn journal_close_chapter(
+        &self,
+        npc_id: u64,
+        mission: &Mission,
+        at_ms: u64,
+    ) -> Option<JournalPrompt> {
+        self.journal_of_mut(npc_id, |j| {
+            j.keep_closing(closing::closing_entry(mission, at_ms, j.covered_to()));
+            j.prompt()
         })
     }
 
@@ -1344,12 +1417,26 @@ mod tests {
         s.tick(1, 1_000, 0, |_, _| vec!["read the board".into()]);
         s.think_again(1);
 
-        // The pass that finds an empty queue.
+        // The turn it is owed, on what the read came back with: nothing is
+        // queued, and it runs anyway.
         assert!(s.is_due(1, 2_000), "it was not even due");
-        assert!(
-            s.tick(1, 2_000, 0, |_, _| vec![]).is_none(),
-            "there was nothing to drain, so there is no record"
-        );
+        let owed = s
+            .tick(
+                1,
+                2_000,
+                0,
+                |_, _| vec!["write down the three names".into()],
+            )
+            .expect("the turn it was owed ran");
+        assert!(owed.perceived.is_empty(), "{:?}", owed.perceived);
+
+        // The pass that finds an empty queue, and nothing owed.
+        if s.is_due(1, 2_500) {
+            assert!(
+                s.tick(1, 2_500, 0, |_, _| vec![]).is_none(),
+                "there was nothing to drain and nothing owed, so there is no record"
+            );
+        }
 
         // The character must now be schedulable again by an ordinary arrival.
         s.deliver(1, 0, Salience::NORMAL, say("somebody comes in"));
@@ -2381,6 +2468,43 @@ mod tests {
         assert!(
             s.is_due(1, 0),
             "it was told something and given nowhere to put it"
+        );
+        // **Due is not enough: the turn has to run.** The answer rides on the
+        // conversation, not in the queue, so this pass drains nothing — and it
+        // used to end there, with the character due, unticked, and the answer
+        // unread until something else happened to wake it.
+        let next = s
+            .tick(1, 0, 0, |_, _| vec!["tell — the three names".to_string()])
+            .expect("the turn it was owed ran");
+        assert!(next.perceived.is_empty());
+        // And having had it, it is quiet again until the world says something.
+        assert!(!s.is_due(1, 1_000), "a turn owed once ran twice");
+    }
+
+    /// **A turn the decode never took is given back.** The queue was drained
+    /// before the decode, so a decode that failed used to leave what the
+    /// character had been told consumed and nothing scheduled again. Handed
+    /// back, the same events are read by the turn that runs — after the wait,
+    /// not before — and are not written into the window a second time.
+    #[test]
+    fn a_failed_turn_is_tried_again_on_the_same_events() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("the board says three names"));
+        let start = s.begin_tick(1).expect("something to think about");
+        let events = start.events.clone();
+        let in_window = s.window_of(1, |w| w.len()).unwrap();
+        s.end_tick(1, 0, 0, start, Vec::new());
+
+        assert!(s.retry(1, 1_000, 5_000, events));
+        assert!(!s.is_due(1, 2_000), "tried again before the wait was out");
+        assert!(s.is_due(1, 6_000), "never tried again");
+        let again = s.begin_tick(1).expect("the turn it was given back ran");
+        assert_eq!(again.events.len(), 1, "the events were not handed back");
+        assert_eq!(
+            s.window_of(1, |w| w.len()).unwrap(),
+            in_window,
+            "written into the window twice"
         );
     }
 

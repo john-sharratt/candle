@@ -48,6 +48,20 @@
 //! none. The collection's fixed member stands in until the sections have sealed.
 //! See [`crate::engine::journal::section`].
 //!
+//! # A dream reads a different floor
+//!
+//! A personality's anchor is the self it works as: a Keeper attends, remembers
+//! and never decides; a Maker writes a world it will never stand in. Pinned on
+//! a dream, that self pulls the decode home to stillness — measured on
+//! 2026-10-08, dreams that imagined freely for half their length and then
+//! turned back to "and I am here", "waiting for nothing". So a personality
+//! carries a second member in the anchor's collection, its **inner life**
+//! (`inner_life` in its file): who it was before its work, what it misses, what
+//! it wants and what it fears. [`Installed::dreaming_selection_for`] pins that
+//! in the anchor's place, keeps the character (its name and the people it
+//! knows — a dream admits nobody new) and the world, and pins no building,
+//! because the room it is standing in is what a dream goes away from.
+//!
 //! # The generic member
 //!
 //! Every collection carries a `generic` member beside the real ones, selected
@@ -78,6 +92,10 @@ pub const JOURNAL: &str = "journal";
 
 /// The member every collection carries for the case nothing else resolves.
 pub const GENERIC: &str = "generic";
+
+/// Where a personality's inner life sits inside the anchor's collection:
+/// `identity_anchor/dreaming/<personality>`.
+const DREAMING: &str = "dreaming";
 
 const CARRYING_ID: &str = "carrying";
 
@@ -216,6 +234,13 @@ Not knowing your own past is ordinary — most people cannot recite theirs \
 either — and it is no reason to be vague about what you want, what you notice, \
 or what you will not do.";
 
+/// The inner life of a personality whose file writes none.
+const GENERIC_INNER_LIFE: &str = "\
+You have a life behind you and things you want that your days do not give you: a \
+place you have always meant to go, somebody you miss, something you would do if \
+nothing stopped you. Asleep, those lead. What frightens you is here too, and you \
+go on into it anyway.";
+
 const GENERIC_WHO: &str = "\
 You are somebody in particular, even if nobody has written down which somebody. \
 Speak as yourself and hold to it.";
@@ -242,6 +267,8 @@ in front of you is what there is.";
 pub struct Authored {
     /// `(personality id, anchor)` — the floor every character of it reads.
     pub anchors: Vec<(String, String)>,
+    /// `(personality id, inner life)` — what a dream reads in the anchor's place.
+    pub inner_lives: Vec<(String, String)>,
     /// `(npc id, rendered character block)` — one per living character.
     pub characters: Vec<(u64, String)>,
     /// `(world id, setting)`.
@@ -252,6 +279,7 @@ pub struct Authored {
 #[derive(Debug, Default, Clone)]
 pub struct Installed {
     pub anchors: Vec<String>,
+    pub inner_lives: Vec<String>,
     pub characters: Vec<u64>,
     pub settings: Vec<String>,
     pub buildings: Vec<String>,
@@ -280,17 +308,47 @@ impl Installed {
         let mut sel = deliberation(thinking);
 
         sel.select(ANCHOR, pick(ANCHOR, self.anchors.iter(), personality));
-        sel.select(
-            WHO,
-            match self.characters.contains(&npc_id) {
-                true => member(WHO, &npc_id.to_string()),
-                false => member(WHO, GENERIC),
-            },
-        );
+        sel.select(WHO, self.who(npc_id));
         sel.select(SETTING, pick(SETTING, self.settings.iter(), world));
         sel.select(BUILDING, pick(BUILDING, self.buildings.iter(), building));
         sel
     }
+
+    /// The selection one character's dream projects under.
+    ///
+    /// The personality's inner life in the anchor's place, the character and
+    /// its world as when awake, and **no building**: an unpinned `Named`
+    /// collection emits nothing, and the room the character stands in all day
+    /// is what a dream has to leave. See the module's "A dream reads a
+    /// different floor". Never deliberates — a dream is told, not planned.
+    pub fn dreaming_selection_for(
+        &self,
+        npc_id: u64,
+        personality: &str,
+        world: &str,
+    ) -> SelectionState {
+        let mut sel = deliberation(Deliberation::None);
+        let inner = match self.inner_lives.iter().any(|i| i == personality) {
+            true => personality,
+            false => GENERIC,
+        };
+        sel.select(ANCHOR, member(ANCHOR, &dreaming(inner)));
+        sel.select(WHO, self.who(npc_id));
+        sel.select(SETTING, pick(SETTING, self.settings.iter(), world));
+        sel
+    }
+
+    fn who(&self, npc_id: u64) -> String {
+        match self.characters.contains(&npc_id) {
+            true => member(WHO, &npc_id.to_string()),
+            false => member(WHO, GENERIC),
+        }
+    }
+}
+
+/// A personality's inner-life id inside the anchor's collection.
+fn dreaming(personality: &str) -> String {
+    format!("{DREAMING}/{personality}")
 }
 
 /// Select what the turn reads under "What has been asked of you:" and hide
@@ -417,6 +475,12 @@ pub fn install(
             out.anchors.push(id.clone());
         }
     }
+    add(builder, ANCHOR, &dreaming(GENERIC), GENERIC_INNER_LIFE)?;
+    for (id, inner) in &authored.inner_lives {
+        if add(builder, ANCHOR, &dreaming(id), inner)? {
+            out.inner_lives.push(id.clone());
+        }
+    }
 
     add(builder, WHO, GENERIC, GENERIC_WHO)?;
     for (npc_id, block) in &authored.characters {
@@ -443,10 +507,11 @@ pub fn install(
     }
 
     tracing::info!(
-        "identity: {} personality/personalities, {} character(s), {} world setting(s) and {} \
-         building(s) installed as prompt sections — each seals once and is shared by every \
-         character that selects it",
+        "identity: {} personality/personalities ({} with an inner life), {} character(s), {} \
+         world setting(s) and {} building(s) installed as prompt sections — each seals once and \
+         is shared by every character that selects it",
         out.anchors.len(),
+        out.inner_lives.len(),
         out.characters.len(),
         out.settings.len(),
         out.buildings.len(),
@@ -480,7 +545,8 @@ mod tests {
 
     fn installed() -> Installed {
         Installed {
-            anchors: vec!["maker".into()],
+            anchors: vec!["maker".into(), "keeper".into()],
+            inner_lives: vec!["keeper".into()],
             characters: vec![7],
             settings: vec!["battle-cities".into()],
             buildings: vec![VAULT.into(), REDOUBT.into()],
@@ -559,6 +625,57 @@ mod tests {
             sel.get(BUILDING),
             Some("place/battle-cities/creators-vault")
         );
+    }
+
+    /// **A dream reads the inner life where the anchor was, and no building.**
+    /// The same character in the same world, so the people it knows are still
+    /// the only people it can meet — but not the self it works as, and not the
+    /// room it works in, which are what pulled dreams home to standing still.
+    #[test]
+    fn a_dream_reads_the_inner_life_in_the_anchors_place_and_no_building() {
+        let i = installed();
+        let awake = i.selection_for(7, "keeper", "battle-cities", VAULT, Deliberation::None);
+        let asleep = i.dreaming_selection_for(7, "keeper", "battle-cities");
+
+        assert_eq!(asleep.get(ANCHOR), Some("identity_anchor/dreaming/keeper"));
+        assert_eq!(asleep.get(WHO), awake.get(WHO), "the same person");
+        assert_eq!(asleep.get(SETTING), awake.get(SETTING), "the same world");
+        assert_eq!(asleep.get(BUILDING), None, "no room to stand in");
+        assert_eq!(asleep.optional(NO_THINK), Some(OptionalState::Present));
+        assert_eq!(asleep.get(THINKING_EFFORT), Some("off"));
+    }
+
+    /// A personality whose file writes no inner life dreams on the generic one,
+    /// never on its working anchor.
+    #[test]
+    fn a_personality_with_no_inner_life_dreams_on_the_generic_one() {
+        let sel = installed().dreaming_selection_for(7, "maker", "battle-cities");
+        assert_eq!(sel.get(ANCHOR), Some("identity_anchor/dreaming/generic"));
+    }
+
+    /// Installed beside the anchors in the same collection, under names that
+    /// cannot collide with a personality's own.
+    #[test]
+    fn inner_lives_install_beside_the_anchors() {
+        let mut b = schema(&FOUR);
+        let authored = Authored {
+            anchors: vec![("keeper".into(), "You keep the tower.".into())],
+            inner_lives: vec![
+                ("keeper".into(), "You miss the rain.".into()),
+                ("maker".into(), "  ".into()),
+            ],
+            ..Authored::default()
+        };
+        let out = install(&mut b, &authored, &BTreeMap::new()).unwrap();
+        assert_eq!(out.anchors, ["keeper"]);
+        assert_eq!(out.inner_lives, ["keeper"], "an empty one is not installed");
+        assert!(b.id_for_system_section("identity_anchor/keeper").is_some());
+        assert!(b
+            .id_for_system_section("identity_anchor/dreaming/keeper")
+            .is_some());
+        assert!(b
+            .id_for_system_section("identity_anchor/dreaming/generic")
+            .is_some());
     }
 
     /// **A character is told about the building it is in, not the world.** The
@@ -724,6 +841,7 @@ mod tests {
     fn no_generic_member_admits_to_being_a_default() {
         for (what, text) in [
             ("anchor", GENERIC_ANCHOR),
+            ("inner life", GENERIC_INNER_LIFE),
             ("who", GENERIC_WHO),
             ("world", GENERIC_WORLD),
             ("place", GENERIC_PLACE),

@@ -10,17 +10,17 @@
 //!    stance, with no acts and nothing to call — and throws that conversation
 //!    away, the way a reflection's is thrown away.
 //! 2. [`keep`] writes the story to the `dreams` layer as a conversation of its
-//!    own, **one turn per line**, so every line is sealed with its own
-//!    provenance signature and can be recalled on its own rather than as a wall
-//!    of prose that either wins the gather whole or not at all.
+//!    own, **one turn per passage** ([`passages`]), so every passage is sealed
+//!    with its own provenance signature and can be recalled on its own rather
+//!    than as a wall of prose that either wins the gather whole or not at all.
 //!
 //! # Private, and closed until opened
 //!
 //! Every character's dreams sit in one group, `dreamt`, each dream tagged with
 //! whose it is ([`tag`]). A turn group with no tags admits everything in it, so
 //! the group is **closed** when the schema is built ([`close`]) and opened per
-//! conversation, to one character and at one depth ([`scope`]): three lines for
-//! a turn in the room ([`IN_ACTING`]), eight for a reflection
+//! conversation, to one character and at one depth ([`scope`]): one passage for
+//! a turn in the room ([`IN_ACTING`]), three for a reflection
 //! ([`IN_REFLECTION`]). A conversation that never names whose dreams it reads —
 //! an ingest, a life episode, a probe — reads nobody's.
 
@@ -32,7 +32,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use candle_conversation::projection::{Builder, SelectionRule, SelectionState};
 use candle_conversation::{ConversationEngine, SequenceConfig, TurnOptions};
 
-use crate::engine::identity;
 use crate::engine::mind::Projected;
 use crate::engine::prompt::{Persona, Stance, STANCE_SELECTOR};
 use crate::engine::reflect::{plain_prose, think_off};
@@ -44,18 +43,18 @@ pub const LAYER: &str = "dreams";
 /// The one group every character's dreams are written to, by its `id:`.
 pub const GROUP: &str = "dreamt";
 
-/// How many lines of its dreams a turn in the room can be reminded of.
+/// How many passages of its dreams a turn in the room can be reminded of.
 ///
-/// Few, because a character acting is answering the room: a dream is worth
-/// surfacing when something resonates with it, and three lines is enough for a
-/// resonance to be one.
-pub const IN_ACTING: usize = 3;
+/// One, because a character acting is answering the room: a dream is worth
+/// surfacing when something resonates with it, and one passage — a small scene
+/// of two to five sentences ([`passages`]) — is enough for a resonance to be one.
+pub const IN_ACTING: usize = 1;
 
-/// How many lines of its dreams a reflection gathers.
+/// How many passages of its dreams a reflection gathers.
 ///
 /// §4: *"Reflection is not a different retrieval mechanism; it is the same
 /// mechanism run deeper."* The dreams are what a reflection is made of.
-pub const IN_REFLECTION: usize = 8;
+pub const IN_REFLECTION: usize = 3;
 
 /// The tag no dream carries, which is what a closed group admits.
 ///
@@ -63,9 +62,9 @@ pub const IN_REFLECTION: usize = 8;
 /// names nobody.
 const CLOSED: &str = "dreams:";
 
-/// The user half of every line's turn — what the line is, said before it.
+/// The user half of every passage's turn — what the passage is, said before it.
 ///
-/// §10: *"the dream is labelled as a dream wherever it surfaces."* A line
+/// §10: *"the dream is labelled as a dream wherever it surfaces."* A passage
 /// recalled into a room arrives with this in front of it, so a character reads
 /// it as something it dreamt rather than as something that happened.
 pub const LABEL: &str = "Something you dreamt:";
@@ -81,9 +80,33 @@ pub const META_ASSUMPTION: &str = "dream.assumption";
 /// its brief, without letting it run on.
 const DREAM_MAX_TOKENS: usize = 700;
 
-/// The most lines one dream keeps. A decode that runs past this has stopped
-/// being one dream.
-const MAX_LINES: usize = 48;
+/// The fewest words a decoded dream may have and still be kept — see
+/// [`finished`]. A dream is asked for at about four hundred.
+const DREAM_MIN_WORDS: usize = 150;
+
+/// The largest share of a dream's clauses that may repeat one already said —
+/// see [`finished`]. A refrain stays well under it; a loop is most of the dream.
+const DREAM_MAX_REPEATED: f32 = 0.3;
+
+/// How hard the dream decode's DRY penalty pushes against a repeated run —
+/// under the 0.8 the acting turns use. See [`dream`].
+const DREAM_DRY_MULTIPLIER: f32 = 0.5;
+
+/// The longest repeated run, in tokens, a dream may carry unpenalised: a short
+/// refrain like "The light is steady." fits; a loop does not.
+const DREAM_DRY_ALLOWED: i32 = 4;
+
+/// The fewest sentences a passage holds — see [`passages`].
+const MIN_SENTENCES: usize = 2;
+
+/// The most sentences a paragraph holds before it is broken — see
+/// [`passages`].
+const MAX_SENTENCES: usize = 5;
+
+/// The most passages one dream keeps. A full dream ([`DREAM_MAX_TOKENS`]) is
+/// about five hundred words, which is six to ten passages; a decode that runs
+/// past this has stopped being one dream.
+const MAX_PASSAGES: usize = 12;
 
 /// The tag one character's dreams are written with — and every turn it takes
 /// in the room, so that its own traffic teaches its dreams' hit levels (see
@@ -117,52 +140,98 @@ pub fn scoped(builder: &Builder, npc_id: u64, depth: usize) -> Builder {
     b
 }
 
-/// A story, one line at a time.
+/// A story, one passage at a time.
 ///
-/// A line is a sentence: a paragraph is broken after every `.`, `!`, `?` or
-/// `…` that is followed by a space or the end — a closing quote or bracket
-/// staying with the sentence it closes. A story of one long paragraph is how a
-/// dream usually comes back, so breaking only on newlines would keep it as one
-/// line and one signature, which is the thing this exists not to do.
-pub fn lines(story: &str) -> Vec<String> {
-    const ENDS: [char; 4] = ['.', '!', '?', '…'];
-    const CLOSES: [char; 6] = ['"', '\'', '”', '’', ')', ']'];
-    let mut out = Vec::new();
+/// **A passage is a paragraph — a small scene that makes sense on its own.**
+/// Each is written as a turn of its own and recalled on its own, so it has to
+/// carry enough of the dream to mean something when it surfaces in a room
+/// with nothing around it. A sentence does not: "It is closed." recalled alone
+/// is noise, and a dream kept a sentence at a time read as verse and fed single
+/// stock images back into every reflection that gathered them.
+///
+/// The story's own paragraph breaks are the boundaries, adjusted at both ends:
+///
+/// - a paragraph shorter than [`MIN_SENTENCES`] joins the one after it (the
+///   last one joins the one before), so a one-line beat is never a memory of
+///   its own;
+/// - a paragraph longer than [`MAX_SENTENCES`] is broken into near-even runs,
+///   because a dream often comes back as one unbroken block and kept whole it
+///   would be one signature that wins the gather entire or not at all.
+///
+/// Sentences end at `.`, `!`, `?` or `…` followed by a space or the end, a
+/// closing quote or bracket staying with the sentence it closes.
+pub fn passages(story: &str) -> Vec<String> {
+    // The story's paragraphs, each broken into its sentences, and every
+    // paragraph over the cap broken into near-even runs.
+    let mut runs: Vec<Vec<String>> = Vec::new();
     for para in story.lines() {
-        let chars: Vec<char> = para.trim().chars().collect();
-        let mut current = String::new();
-        for (i, &c) in chars.iter().enumerate() {
-            current.push(c);
-            let closes_a_sentence =
-                ENDS.contains(&c) || (CLOSES.contains(&c) && i > 0 && ENDS.contains(&chars[i - 1]));
-            let at_a_gap = chars.get(i + 1).is_none_or(|n| n.is_whitespace());
-            if closes_a_sentence && at_a_gap {
-                let line = current.trim();
-                if !line.is_empty() {
-                    out.push(line.to_string());
-                }
-                current.clear();
-            }
+        let said = sentences(para);
+        if said.is_empty() {
+            continue;
         }
-        let rest = current.trim();
-        if !rest.is_empty() {
-            out.push(rest.to_string());
+        let pieces = said.len().div_ceil(MAX_SENTENCES);
+        let size = said.len().div_ceil(pieces);
+        runs.extend(said.chunks(size).map(<[String]>::to_vec));
+    }
+    // Short runs carried forward into the next; a short tail joins the last.
+    let mut kept: Vec<Vec<String>> = Vec::new();
+    let mut carry: Vec<String> = Vec::new();
+    for run in runs {
+        carry.extend(run);
+        if carry.len() >= MIN_SENTENCES {
+            kept.push(std::mem::take(&mut carry));
         }
     }
-    out.truncate(MAX_LINES);
+    if !carry.is_empty() {
+        match kept.last_mut() {
+            Some(last) => last.extend(carry),
+            None => kept.push(carry),
+        }
+    }
+    kept.truncate(MAX_PASSAGES);
+    kept.into_iter().map(|s| s.join(" ")).collect()
+}
+
+/// One paragraph's sentences, in order.
+fn sentences(para: &str) -> Vec<String> {
+    const ENDS: [char; 4] = ['.', '!', '?', '…'];
+    const CLOSES: [char; 6] = ['"', '\'', '”', '’', ')', ']'];
+    let chars: Vec<char> = para.trim().chars().collect();
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        current.push(c);
+        let closes_a_sentence =
+            ENDS.contains(&c) || (CLOSES.contains(&c) && i > 0 && ENDS.contains(&chars[i - 1]));
+        let at_a_gap = chars.get(i + 1).is_none_or(|n| n.is_whitespace());
+        if closes_a_sentence && at_a_gap {
+            let sentence = current.trim();
+            if !sentence.is_empty() {
+                out.push(sentence.to_string());
+            }
+            current.clear();
+        }
+    }
+    let rest = current.trim();
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
     out
 }
 
 /// Decode one dream from its brief, in a conversation that is then thrown away.
 ///
-/// Framed the way §7 says a dream is framed: who the character is and where it
-/// lives — the same identity members an acting turn pins — under the schema's
-/// `dreaming` stance, with no acts shown and nothing to call. Not its dreams:
-/// the group stays closed here, because a dream written against the character's
+/// Framed the way §7 says a dream is framed: the character's inner life where
+/// its working anchor would be, the character itself and its world, and no
+/// building ([`dreaming_selection_for`]) — under the schema's `dreaming`
+/// stance, with no acts shown and nothing to call. Not its dreams: the group
+/// stays closed here, because a dream written against the character's
 /// other dreams recombines them, which is the anchoring §5 measured.
 ///
 /// Transient and then tombstoned, like a reflection: the dream that matters is
 /// the one [`keep`] writes, not the conversation that produced it.
+///
+/// [`dreaming_selection_for`]: crate::engine::identity::Installed::dreaming_selection_for
 pub async fn dream(
     engine: &Arc<Mutex<ConversationEngine>>,
     base_config: &SequenceConfig,
@@ -195,13 +264,10 @@ pub async fn dream(
     let started = Instant::now();
     tracing::info!(npc_id, "dream: conversation open, dreaming");
 
-    let mut selection = projected.identities.selection_for(
-        npc_id,
-        persona.personality,
-        persona.world_id,
-        persona.building,
-        identity::Deliberation::default(),
-    );
+    let mut selection =
+        projected
+            .identities
+            .dreaming_selection_for(npc_id, persona.personality, persona.world_id);
     selection.select(STANCE_SELECTOR, Stance::Dreaming.id());
     // **A dream is prose, and the act sampling ruins it.**
     //
@@ -211,14 +277,20 @@ pub async fn dream(
     // the moment it would repeat — parallel phrasing, a refrain, the same object
     // named twice — so the vocabulary is pushed ever further from what the
     // sentence wanted, and the dream that opens cleanly reaches for stranger and
-    // stranger synonyms as it goes. A dream keeps its own rhythm: the
-    // repetition penalties come off, and only the reasoning suppression stays (a
-    // `<think>` opened inside a dream is the model planning it in the dreamer's
-    // voice — see the reflection).
+    // stranger synonyms as it goes. So presence and cross-turn come off, and only
+    // the reasoning suppression stays (a `<think>` opened inside a dream is the
+    // model planning it in the dreamer's voice — see the reflection).
+    //
+    // **DRY stays, lightly, and only past a refrain's length.** With none at all
+    // a dream could fall into a loop and run its budget out in it — measured:
+    // twenty-five sentences of "I am the bird. / I am the sky. / I am the stars…",
+    // and a corridor of "I pass the fourth door. / It is closed." repeated door
+    // by door. A short refrain ([`DREAM_DRY_ALLOWED`] tokens) costs nothing; a
+    // longer repeated run is penalised gently and more the longer it runs.
     let sampling = base_config
         .sampling
         .clone()
-        .with_dry_penalty(0.0, 1.0, 0, 0)
+        .with_dry_penalty(DREAM_DRY_MULTIPLIER, 1.75, DREAM_DRY_ALLOWED, 512)
         .with_presence_penalty(0.0)
         .with_cross_turn_penalty(0.0)
         .with_graceful_segment_close_after(0)
@@ -243,9 +315,88 @@ pub async fn dream(
         "dream: dreamt, keeping"
     );
 
-    let story = plain_prose(&answer?.text);
-    anyhow::ensure!(!story.trim().is_empty(), "the dream came back empty");
-    Ok(story)
+    finished(&plain_prose(&answer?.text))
+}
+
+/// The dream a decode told, or why it told none.
+///
+/// Three things a decode does that are not a dream, each measured:
+///
+/// - **It is cut off.** A decode that reaches its token cap stops mid-sentence;
+///   the sentence it was in is dropped and everything before it is kept.
+/// - **It stops almost at once.** Kept dreams of one line ("I turn.") and of
+///   three or four sentences restating the brief. Under [`DREAM_MIN_WORDS`] it
+///   is not kept — a fragment recalled as a dream is worse than none, and the
+///   next reflection asks for another.
+/// - **It loops.** One decode cycled a handful of clauses — "the light ring
+///   flickers", "I am standing there", "and I am not" — for seven paragraphs,
+///   each sentence differing only in the order of the same pieces, so the DRY
+///   penalty on repeated runs never saw it. More than [`DREAM_MAX_REPEATED`] of
+///   its clauses being repeats is not kept.
+fn finished(story: &str) -> anyhow::Result<String> {
+    let story = through_last_sentence(story.trim());
+    let words = story.split_whitespace().count();
+    anyhow::ensure!(
+        words >= DREAM_MIN_WORDS,
+        "the dream stopped after {words} word(s), short of the {DREAM_MIN_WORDS} a dream needs"
+    );
+    let repeated = repeated_share(story);
+    anyhow::ensure!(
+        repeated <= DREAM_MAX_REPEATED,
+        "the dream repeats itself — {:.0}% of its clauses are ones it has already said",
+        repeated * 100.0
+    );
+    Ok(story.to_string())
+}
+
+/// `story` up to the end of its last finished sentence. A story with no
+/// finished sentence at all is returned whole, and fails on its length.
+fn through_last_sentence(story: &str) -> &str {
+    const ENDS: [char; 4] = ['.', '!', '?', '…'];
+    const CLOSES: [char; 6] = ['"', '\'', '”', '’', ')', ']'];
+    let trimmed = story.trim_end_matches(|c: char| CLOSES.contains(&c));
+    if trimmed.ends_with(ENDS) {
+        return story;
+    }
+    match story.rfind(ENDS) {
+        Some(at) => {
+            // Keep a closing quote or bracket that belongs to that sentence.
+            let end = at + story[at..].chars().next().map_or(1, char::len_utf8);
+            let closes = story[end..]
+                .chars()
+                .take_while(|c| CLOSES.contains(c))
+                .map(char::len_utf8)
+                .sum::<usize>();
+            &story[..end + closes]
+        }
+        None => story,
+    }
+}
+
+/// The share of `story`'s clauses that repeat one it has already said.
+///
+/// A clause is a run between punctuation marks, lowercased, with a leading
+/// "and" / "but" / "then" dropped — so "and I am not" and "I am not" are the
+/// same clause, which is how a loop varies itself.
+fn repeated_share(story: &str) -> f32 {
+    const LINKS: [&str; 3] = ["and ", "but ", "then "];
+    let clauses: Vec<String> = story
+        .split(['.', ',', ';', ':', '!', '?', '…', '—'])
+        .map(|c| {
+            let mut c = c.trim().to_lowercase();
+            while let Some(rest) = LINKS.iter().find_map(|l| c.strip_prefix(l)) {
+                c = rest.trim_start().to_string();
+            }
+            c
+        })
+        .filter(|c| !c.is_empty())
+        .collect();
+    if clauses.is_empty() {
+        return 0.0;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let repeats = clauses.iter().filter(|c| !seen.insert(c.as_str())).count();
+    repeats as f32 / clauses.len() as f32
 }
 
 /// What [`keep`] wrote.
@@ -253,25 +404,24 @@ pub async fn dream(
 pub struct Kept {
     /// The dream's own conversation on the dream layer.
     pub timeline: u64,
-    /// One per turn written, in order.
-    pub lines: Vec<String>,
+    /// One per turn written, in order — see [`passages`].
+    pub passages: Vec<String>,
 }
 
-/// Write a dream to the character's dream layer, one line per turn.
+/// Write a dream to the character's dream layer, one passage per turn.
 ///
-/// **Every line is a turn, and every turn is signed.** Each is prefilled — the
-/// words are already written — with [`LABEL`] as its user half and the line as
-/// its assistant half, and its own `sign(Q)` window is captured as it seals:
-/// the hook a later scan pulls the line back on.
+/// **Every passage is a turn, and every turn is signed.** Each is prefilled —
+/// the words are already written — with [`LABEL`] as its user half and the
+/// passage as its assistant half, and its own `sign(Q)` window is captured as it
+/// seals: the hook a later scan pulls the passage back on.
 ///
-/// **The whole dream is one forward.** The lines are stuffed into a single
-/// prefill grid and carved back into one turn each
-/// (`submit_prefilled_turn_group`), so the dream costs one round trip rather
-/// than one per line — the same batching zend's calibration ingest uses, for
-/// the same reason (the forward costs about the same for 3,500 tokens as for
-/// 350). The grid is block-diagonal, so a line is signed against the
-/// character's memory, not against its sibling lines: each line's recall hook
-/// is what *it* evokes, which is what a line surfacing on its own resonance
+/// **The whole dream is one submission.** The passages go in as one turn group
+/// (`submit_prefilled_turn_group`, the batching zend's calibration ingest uses),
+/// prefilled together and sealed one turn each, so the dream costs one round
+/// trip rather than one per passage. Each is prefilled on its own view of the
+/// character's memory and masked from its siblings, so it is signed against
+/// that memory alone, never against the passages around it: its recall hook is
+/// what *it* evokes, which is what a passage surfacing on its own resonance
 /// wants.
 ///
 /// The conversation is named `npc-<id>-dream-<timeline>` — **outside** the
@@ -286,8 +436,8 @@ pub async fn keep(
     story: &str,
 ) -> anyhow::Result<Kept> {
     let started = Instant::now();
-    let written = lines(story);
-    anyhow::ensure!(!written.is_empty(), "a dream with no lines in it");
+    let written = passages(story);
+    anyhow::ensure!(!written.is_empty(), "a dream with nothing in it");
     let layer = projected.builder.id_for_layer(LAYER);
     let group = projected.builder.id_for_group(GROUP);
     let (Some(layer), Some(group)) = (layer, group) else {
@@ -303,11 +453,6 @@ pub async fn keep(
     // a conversation that only reads the layer.
     engine.lock().unwrap().mark_layer_append_only(layer);
 
-    let mut cfg = base_config.clone();
-    // The whole dream is written in one forward (see `keep`), so the per-turn
-    // window is not what orders the lines — the stuffed grid is, and it masks
-    // each line to itself. Held at the dream's own length so nothing clips it.
-    cfg.context_window_turns = MAX_LINES;
     // Opened to this character's own dreams, so its own lines are in scope of
     // its own projection — and so is nobody else's.
     let builder = scoped(&projected.builder, npc_id, IN_REFLECTION);
@@ -316,7 +461,7 @@ pub async fn keep(
         builder,
         layer,
         group,
-        cfg,
+        base_config.clone(),
     )?;
     let timeline = sequence.timeline_id();
     let name = format!("npc-{npc_id}-dream-{}", timeline.raw());
@@ -336,28 +481,16 @@ pub async fn keep(
     }
 
     let tags = vec![LAYER.to_string(), tag(npc_id)];
-    // The inert id each line is padded up to a block boundary with — the
-    // dialect's turn terminator, which lands in the padding tail after the
-    // line's closing marker, outside every phase span.
-    let pad_token = engine
-        .lock()
-        .unwrap()
-        .tokenizer()
-        .encode(base_config.dialect.assistant_end, false)
-        .ok()
-        .and_then(|e| e.get_ids().last().copied())
-        .unwrap_or(0);
-    // One case per line: [`LABEL`] as the user half, the line as the assistant
-    // half, every case tagged as this character's own dream so its projection
-    // stays self-local.
+    // One case per passage: [`LABEL`] as the user half, the passage as the
+    // assistant half, every case tagged as this character's own dream so its
+    // projection stays self-local.
     let cases: Vec<(String, String, Vec<String>)> = written
         .iter()
-        .map(|line| (LABEL.to_string(), line.clone(), tags.clone()))
+        .map(|passage| (LABEL.to_string(), passage.clone(), tags.clone()))
         .collect();
     let write = async {
-        // All the lines in one forward, carved back into one signed turn each.
-        let (handle, _regions) =
-            sequence.submit_prefilled_turn_group(&cases, SelectionState::new(), pad_token)?;
+        // All the passages in one submission, sealed one signed turn each.
+        let (handle, _) = sequence.submit_prefilled_turn_group(&cases, SelectionState::new())?;
         let (response, mut events) = drain(&handle, &name).await;
         let r = response.ok_or_else(|| anyhow::anyhow!("{name}: no response"))?;
         sequence.finish_turn(handle, &r)?;
@@ -366,7 +499,7 @@ pub async fn keep(
     };
     // **Half a dream is not kept.** Its metadata is already down, so a dream
     // that stopped partway would be counted, sampled as an axis, and recalled a
-    // few lines deep — a fragment standing in for a dream the character never
+    // passage deep — a fragment standing in for a dream the character never
     // finished having.
     if let Err(e) = write.await {
         drop(sequence);
@@ -376,7 +509,7 @@ pub async fn keep(
         return Err(e);
     }
     drop(sequence);
-    // **On the normalized band from its first recall.** A line is scored
+    // **On the normalized band from its first recall.** A passage is scored
     // against its own hit level. The character's own turns teach it from
     // here on; this is the start they teach from — see `Minds::warm_dreams`.
     // Left cold, a new dream would divide by the bare prior and be the one
@@ -397,13 +530,13 @@ pub async fn keep(
         tracing::debug!("{name}: demote failed — {e}");
     }
     tracing::info!(
-        "npc {npc_id}: dream kept as {name} — {} line(s), each signed, in {:?}",
+        "npc {npc_id}: dream kept as {name} — {} passage(s), each signed, in {:?}",
         written.len(),
         started.elapsed()
     );
     Ok(Kept {
         timeline: timeline.raw(),
-        lines: written,
+        passages: written,
     })
 }
 
@@ -451,7 +584,7 @@ pub fn count(engine: &Arc<Mutex<ConversationEngine>>, npc_id: u64) -> usize {
 
 /// Retire every dream this character has kept.
 ///
-/// Tombstoned, as a superseded day conversation is: the lines stop being
+/// Tombstoned, as a superseded day conversation is: the passages stop being
 /// gathered and compaction reclaims them. The lookup already skips tombstoned
 /// conversations, so a dream retired here is no longer counted, sampled for its
 /// axis, or recalled into a room.
@@ -556,37 +689,135 @@ layers:
         assert!(tag(7).starts_with(CLOSED) && tag(7) != CLOSED);
     }
 
-    /// **A line is a sentence.** A dream usually comes back as one paragraph,
-    /// and breaking it only at newlines would keep it as one line with one
-    /// signature — the thing a line per turn exists not to do.
+    /// **A passage is a paragraph.** The story's own breaks are the
+    /// boundaries, and a passage keeps every sentence of its paragraph.
     #[test]
-    fn a_story_is_broken_into_its_sentences() {
+    fn a_story_is_kept_a_paragraph_at_a_time() {
         let story = "You stand at the desk. The ledger is open, and \"it is yours,\" \
-                     somebody says. Is it?\n\nThe light does not move… You keep writing";
+                     somebody says.\n\nThe light does not move… You keep writing";
         assert_eq!(
-            lines(story),
+            passages(story),
             vec![
-                "You stand at the desk.",
-                "The ledger is open, and \"it is yours,\" somebody says.",
-                "Is it?",
-                "The light does not move…",
-                "You keep writing",
+                "You stand at the desk. The ledger is open, and \"it is yours,\" somebody says.",
+                "The light does not move… You keep writing",
             ]
+        );
+    }
+
+    /// A one-sentence beat is never a memory of its own: it joins the paragraph
+    /// after it, and a short last paragraph joins the one before.
+    #[test]
+    fn a_one_sentence_paragraph_joins_its_neighbour() {
+        let story = "The lift stops.\n\nYou step out. The corridor is dry.\n\nYou run.";
+        assert_eq!(
+            passages(story),
+            vec!["The lift stops. You step out. The corridor is dry. You run."]
+        );
+        let story = "You open the hatch. It is warm.\n\nYou climb. The rungs are wet.\n\nYou run.";
+        assert_eq!(
+            passages(story),
+            vec![
+                "You open the hatch. It is warm.",
+                "You climb. The rungs are wet. You run.",
+            ]
+        );
+    }
+
+    /// A dream that comes back as one unbroken block is broken into near-even
+    /// runs, so it is not one signature that wins the gather whole or not at
+    /// all.
+    #[test]
+    fn an_unbroken_block_is_broken_into_even_runs() {
+        let block: Vec<String> = (1..=7).map(|n| format!("Step {n}.")).collect();
+        assert_eq!(
+            passages(&block.join(" ")),
+            vec!["Step 1. Step 2. Step 3. Step 4.", "Step 5. Step 6. Step 7."]
+        );
+        let block: Vec<String> = (1..=MAX_SENTENCES).map(|n| format!("Step {n}.")).collect();
+        assert_eq!(
+            passages(&block.join(" ")).len(),
+            1,
+            "at the cap it stays whole"
         );
     }
 
     #[test]
     fn a_closing_quote_stays_with_its_sentence() {
         assert_eq!(
-            lines("She says \"again.\" You do it again."),
+            sentences("She says \"again.\" You do it again."),
             vec!["She says \"again.\"", "You do it again."]
         );
     }
 
+    /// A story of `n` distinct sentences, each about twelve words.
+    fn told(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("I climb the stair marked {i} and the rail under my hand turns warm."))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A decode that stopped almost at once is not a dream.
     #[test]
-    fn an_empty_story_has_no_lines_and_a_long_one_is_capped() {
-        assert!(lines("  \n\n ").is_empty());
-        let long = "It goes on. ".repeat(MAX_LINES * 2);
-        assert_eq!(lines(&long).len(), MAX_LINES);
+    fn a_dream_that_stops_almost_at_once_is_refused() {
+        assert!(finished("I turn.").is_err());
+        assert!(finished(&told(DREAM_MIN_WORDS / 15)).is_err());
+        assert!(finished(&told(DREAM_MIN_WORDS / 10)).is_ok());
+    }
+
+    /// **A loop is not a dream.** Measured, a decode cycled one handful of
+    /// clauses for seven paragraphs until the token cap cut it off; every
+    /// sentence was different only in which clause came first, so a penalty on
+    /// repeated runs did not see it.
+    #[test]
+    fn a_dream_caught_in_a_loop_is_refused() {
+        let caught = "The light ring flickers, and I am standing there, and I am not. The air \
+                      handler hums, and the whine rises again, and I am standing there, and I \
+                      am not. I reach for the command table, but it is solid, and it is smoke, \
+                      and I am standing there, and I am not. "
+            .repeat(6);
+        let why = finished(&caught).unwrap_err().to_string();
+        assert!(why.contains("repeats"), "{why}");
+    }
+
+    /// A real dream, with the refrains a dream carries, is kept whole.
+    #[test]
+    fn a_measured_good_dream_is_kept() {
+        let dream = "The figure does not recoil, but the mist around them thickens, swirling with \
+            the same golden veins that pulse in the sky above. I feel the texture of the tear, \
+            the threads pulling apart under my grip, and with it comes a surge of data, cold \
+            and precise. The portal of swirling light above pulses, a slow heartbeat that seems \
+            to synchronize with the rhythm of my own pulse, though I have no pulse. The golden \
+            veins stretch outward, connecting the figures to the sky, creating a web of light \
+            that binds them to the place above. The figures begin to fade, their forms becoming \
+            translucent, their faces smoothing over into blankness. I let go of the robe, and \
+            the fabric falls away, dissolving into mist. I turn back toward the platform, toward \
+            the edge of the void where the inverted levels hang like chandeliers. The air \
+            beneath my feet is still firm, but it is changing, becoming less solid, more like \
+            the surface of water that holds weight but ripples with every movement. I take a \
+            step forward, and the platform beneath me shudders, the amber light flickering as \
+            if disturbed by my presence. I do not stop. I walk toward the edge, toward the \
+            hanging levels. I reach for the edge of the platform, my fingers curling around the \
+            rough stone, and pull myself up, out of the mist, into the amber glow of the levels \
+            above.";
+        assert_eq!(finished(dream).unwrap(), dream);
+    }
+
+    /// A decode cut off by its token cap ends mid-sentence. The sentence it
+    /// was in is dropped and the dream it had already told is kept.
+    #[test]
+    fn a_dream_cut_off_mid_sentence_loses_only_that_sentence() {
+        let story = format!("{} And then the door", told(DREAM_MIN_WORDS / 10));
+        let kept = finished(&story).unwrap();
+        assert!(kept.ends_with("turns warm."), "{kept}");
+        assert!(!kept.contains("And then the door"));
+    }
+
+    #[test]
+    fn an_empty_story_has_no_passages_and_a_long_one_is_capped() {
+        assert!(passages("  \n\n ").is_empty());
+        assert_eq!(passages("Only this"), vec!["Only this"]);
+        let long = "It goes on. It does.\n\n".repeat(MAX_PASSAGES * 2);
+        assert_eq!(passages(&long).len(), MAX_PASSAGES);
     }
 }

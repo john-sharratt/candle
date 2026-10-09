@@ -131,6 +131,32 @@ normalizes into the same ~0–1000 band, selection thresholds become **uniform
 across scopes** (the "800 for tools vs 200 for repo_map" problem dissolves).
 Per-node thresholds remain *available* (varied now, a good uniform default later).
 
+### 3.3a A group of one-exchange documents is one competition
+
+The scorer votes `z × margin`, and the margin is the leading case's agreement
+over the runner-up's — so a competition needs two cases. A file scan of a file
+with one exchange has none to beat: its margin is its raw agreement, about half
+the signature bits for any pair at all. A group whose every timeline is one
+document (npcd's world, eras and stories layers — one conversation per document)
+scored each document as itself against nothing; normalized against its own
+level, every document landed in the same 0.7–0.9 band against every probe, and
+the same generic entries (a derelict ship, a tower's construction) came top for
+every character whatever it was doing.
+
+So `belief_files::competitions` pools a scan's one-exchange files into one
+gallery, a case each, and a file of several exchanges stays its own competition
+(zend's code reads). The pool is one score-competition scope —
+`ScopeKey::Pool { group }`, children keyed `ChildKey::Timeline` — so its floor is
+taken across the documents and a seal folds all of them at once. Its levels are
+**learned from traffic only**: a document probed by its own signature agrees with
+itself on every bit and leaves the next document far behind, which is the
+self-match ceiling §2 rejects (measured live: every hit at 1–2% of the band), so
+the ingest warm-up self-matches only files of several exchanges. Measured on the
+live mind after the change: top hits 1,000–2,500 with lock-ons above (a reviewer
+locked on its own draft at 13,365), documents with no evidence at exactly 0, and
+no document winning across unrelated activities. Pinned by
+`turn_belief_scan::one_exchange_documents_compete_as_one_pool`.
+
 ### 3.4 Subdividing a scope by phase — tried, measured, REMOVED
 
 > **Status: not in the engine.** The phase lens was built, A/B'd, and found to be

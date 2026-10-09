@@ -388,12 +388,14 @@ fn frame_reflecting(tools: &[&Tool], env: &ToolCallEnvelope) -> String {
         },
         env.render(
             "dream",
+            // The dream first, then what it suspended — the order the grammar
+            // emits the fields in (see `reflect::DREAM`).
             &[
-                ("assumption", "that the ground bears your weight"),
                 (
                     "brief",
                     "You are four levels down when the floor stops being there…"
                 ),
+                ("assumption", "that the ground bears your weight"),
             ],
         ),
     ));
@@ -646,10 +648,12 @@ pub fn build(p: &Persona<'_>, mode: Mode, tools: &[&Tool], env: &ToolCallEnvelop
 
 /// [`build`] under a chosen [`Stance`].
 ///
-/// Everything before the frame is stance-independent on purpose — a character
-/// dreaming is the same character, with the same beliefs and the same building,
-/// and a reflection that read a different identity than the tick before it would
-/// be a different person thinking.
+/// Everything before the frame is stance-independent on purpose — a reflection
+/// that read a different identity than the tick before it would be a different
+/// person thinking. A dream is the exception, and it is not framed here: it
+/// opens against the projection and reads the personality's inner life in the
+/// anchor's place, with no building
+/// ([`dreaming_selection_for`](crate::engine::identity::Installed::dreaming_selection_for)).
 pub fn build_for(
     stance: Stance,
     p: &Persona<'_>,

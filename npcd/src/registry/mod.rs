@@ -397,15 +397,24 @@ impl Registry {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// A directory no other test in this run shares.
+    ///
+    /// **The clock alone does not separate them.** Named by process and time,
+    /// two tests started in parallel inside one tick of the Windows clock got
+    /// the same directory, and one test's `ardh.yaml` was the other's.
     fn tmp() -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let p = std::env::temp_dir().join(format!(
-            "npcd-registry-{}-{}",
+            "npcd-registry-{}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         p

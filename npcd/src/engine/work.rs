@@ -28,8 +28,14 @@ use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
 use crate::engine::body::Outcome;
-use crate::engine::mission::{Aim, Outcome as Verdict};
+use crate::engine::chronology;
+use crate::engine::mission::{
+    progress_line, time_step, Aim, DocStep, Mission, Outcome as Verdict, Stage,
+};
+use crate::engine::mission_gen::{gates, leakage, rejection};
+use crate::engine::passage;
 use crate::sim::record::{slug_of, Condition, Item, Kind, State};
+use crate::sim::Sim;
 use crate::world::Hosted;
 use npc_map::route;
 use npc_map::schema::Where;
@@ -127,31 +133,7 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                      {what_now}\n{carried}"
                 ));
             }
-            // The character's own name, so a routine that would send it to visit
-            // "the makers here" is not built around visiting itself.
-            let me = hosted
-                .read(|w| w.actor(body).map(|actor| actor.name.clone()))
-                .unwrap_or_default();
-            hosted.with_both(|w, s| {
-                let room_name = |place: &str| {
-                    let (area, node) = place.split_once('/')?;
-                    w.node(&Where::new(area, node)).map(|n| n.name.clone())
-                };
-                let reach: Vec<String> = w
-                    .actor(body)
-                    .map(|actor| {
-                        std::iter::once(actor.at.clone())
-                            .chain(route::reachable_from(w.map(), &actor.at))
-                            .map(|at| format!("{}/{}", at.area, at.node))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let material = s.mission_material(&me, &room_name, &reach);
-                let mission = s.missions.collect(body, &material.facts());
-                let brief = mission.standing_text();
-                tracing::info!(npc = body, prompt = %mission.mission_text(), "mission taken up at the command table");
-                Outcome::Did(format!("You take it up.\n{brief}"))
-            })
+            Outcome::Did(format!("You take it up.\n{}", take_up(hosted, body)))
         }
         "report_done" => {
             let Some(account) = text(a, "account") else {
@@ -159,6 +141,23 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "You meant to report it done, but did not say what you found.".into(),
                 );
             };
+            // **An account says what was found.** A character filed its own
+            // name as the account of a reading, six times over; a few words are
+            // not an answer anybody can use. Turned back with what the engine
+            // saw on the mission, so the next try has the facts in front of it.
+            if account.split_whitespace().count() < MIN_ACCOUNT_WORDS {
+                let seen = hosted
+                    .sim(|s| s.missions.active(body).map(|m| m.observed.clone()))
+                    .unwrap_or_default();
+                let hint = match seen.is_empty() {
+                    true => String::new(),
+                    false => format!(" What you saw on it: {}.", seen.join("; ")),
+                };
+                return Outcome::Refused(format!(
+                    "\"{account}\" is not an account of what you found. Say it in a sentence — \
+                     what you found, made or concluded.{hint}"
+                ));
+            }
             // **A step the engine can see, not yet done and still doable, holds
             // the report.** A character sent to two rooms messaged the channel
             // and reported the mission done from the table; the journeys were
@@ -170,6 +169,26 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 return Outcome::Refused(format!(
                     "You have not done this yet: {step}. {way} Then come back and report it. If \
                      it cannot be done, `invoke` the table's `report_stuck` and say why."
+                ));
+            }
+            // **Work on the record is done when the record says so.** A mission
+            // that writes a document is reported done once that document is
+            // committed — by this character, while it carried the mission (see
+            // [`Mission::written_up`]). Its own word that the writing is
+            // finished is the label `docs/asynchronous_mind_hierarchy.md` §7.3
+            // says must never stand uncorroborated, and a step ticked on its
+            // word is that label: a story was reported done with its write
+            // step struck "thwarted" and no document anywhere.
+            if let Some(path) = hosted.sim(|s| {
+                let m = s.missions.active(body)?;
+                (!m.written_up()).then(|| m.work.as_ref().map(|w| w.writes.clone()))?
+            }) {
+                return Outcome::Refused(format!(
+                    "You have not written it yet: {path} is not committed. Go to a desk where \
+                     documents are written, `compose` it there — you write it whole with your \
+                     brief and what you read in front of you — then `bench_commit` it with one \
+                     line saying what it is, and come back and report it. If it cannot be \
+                     written, `invoke` this table's `report_stuck` and say why."
                 ));
             }
             // **A reading nobody made cannot be reported.** A mission to read a
@@ -190,6 +209,13 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                      `report_stuck` and say why."
                 ));
             }
+            // **The quality gate, while it can still be mended.** An
+            // operation's document is held to the engine's checks before its
+            // draft or its review may be reported done — see
+            // `mission_gen::gates`.
+            if let Some(refusal) = report_block(hosted, body) {
+                return Outcome::Refused(refusal);
+            }
             hosted.with_sim(|s| {
                 // The account is both the report's notes (how it went) and the
                 // answer (what was found) — for a mission done, the two are the
@@ -201,8 +227,9 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     Some(m) => {
                         tracing::info!(npc = body, prompt = %m.mission_text(), %account, "mission reported DONE at the command table");
                         Outcome::Did(format!(
-                            "Reported done, and your answer filed: {}",
-                            m.mission_text()
+                            "Reported done, and your answer filed: {}{}",
+                            m.mission_text(),
+                            back_to_now(&m)
                         ))
                     }
                     None => Outcome::Refused("You are not carrying a mission to report on.".into()),
@@ -231,22 +258,342 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     ));
                 }
             }
+            // **Nothing is stuck when nothing is left.** A Maker whose story was
+            // written, committed and every step signed off reported it stuck —
+            // "the mission is done, but I cannot report it" — and the stuck
+            // report failed the operation and threw the finished draft away.
+            // With every step but the report done and its document committed,
+            // the world says the work stands; the report that matches is done.
+            if let Some(done) = hosted.sim(|s| finished(s, body)) {
+                return Outcome::Refused(done);
+            }
             hosted.with_sim(
                 |s| match s.missions.report(body, Verdict::Fail, &why, None) {
                     Some(m) => {
                         tracing::info!(npc = body, prompt = %m.mission_text(), %why, "mission reported STUCK at the command table");
                         Outcome::Did(format!(
-                            "Reported as not done, with your reasons: {}",
-                            m.mission_text()
+                            "Reported as not done, with your reasons: {}{}",
+                            m.mission_text(),
+                            back_to_now(&m)
                         ))
                     }
                     None => Outcome::Refused("You are not carrying a mission to report on.".into()),
                 },
             )
         }
+        "report_rejected" => {
+            let Some(why) = text(a, "why") else {
+                return Outcome::Refused(
+                    "You meant to reject the draft, but did not say why it cannot stand.".into(),
+                );
+            };
+            if why.split_whitespace().count() < MIN_ACCOUNT_WORDS {
+                return Outcome::Refused(format!(
+                    "\"{why}\" does not say why the draft cannot stand. Say what is wrong with it \
+                     that cannot be mended in place."
+                ));
+            }
+            // A review must have read what it rejects.
+            if let Some(way) = still_doable(hosted, body) {
+                let step = hosted
+                    .sim(|s| s.missions.active(body)?.next_step().map(|t| t.text.clone()))
+                    .unwrap_or_default();
+                return Outcome::Refused(format!(
+                    "You have not done this yet: {step}. {way} Read it, and mend what the table \
+                     found, before you judge it — reject only what your mending could not save."
+                ));
+            }
+            let unsupported = hosted.sim(|s| {
+                let m = s.missions.active(body)?;
+                let (_, stage) = m.operation()?;
+                rejection::unsupported(s.bench.mind_root()?, m.work.as_ref()?, stage, &why)
+            });
+            if let Some(refusal) = unsupported {
+                tracing::info!(npc = body, %why, "operation rejection refused: no evidence");
+                return Outcome::Refused(refusal);
+            }
+            hosted.with_sim(|s| {
+                let Some(m) = s.missions.reject(body, &why) else {
+                    return Outcome::Refused(
+                        "You are not reviewing anybody's draft; there is nothing to reject.".into(),
+                    );
+                };
+                // **A rejected draft leaves the record.** It is moved aside, not
+                // deleted, so an operator can still read what was refused; a
+                // rejected correction's document goes back to what it said —
+                // see `Sim::set_aside_failed`. Settled here at once, so the
+                // reviewer's world shows it; the generator's loop settles every
+                // other failure the same way, and doing so again is harmless.
+                let op = m
+                    .operation()
+                    .and_then(|(id, _)| s.missions.operations().get(id))
+                    .cloned();
+                let moved = op.as_ref().and_then(|o| s.set_aside_failed(o));
+                let gone = match op.as_ref().is_some_and(|o| o.leaves_on_failure()) {
+                    true => "the draft leaves the record",
+                    false => "the document goes back to what it said before",
+                };
+                tracing::info!(npc = body, prompt = %m.mission_text(), %why, moved = ?moved, "operation REJECTED on review");
+                Outcome::Did(format!(
+                    "Rejected, with your reasons; {gone}. {}{}",
+                    m.mission_text(),
+                    back_to_now(&m)
+                ))
+            })
+        }
         other => Outcome::Refused(format!("`{other}` is not a mission act.")),
     }
 }
+
+/// Take up the next mission for `body` at the table — lodged for it, waiting
+/// in the pool, or a routine from the bank — and answer with its brief as the
+/// character reads it.
+pub fn take_up(hosted: &Hosted, body: &str) -> String {
+    // The character's own name, so a routine that would send it to visit
+    // "the makers here" is not built around visiting itself.
+    let me = hosted
+        .read(|w| w.actor(body).map(|actor| actor.name.clone()))
+        .unwrap_or_default();
+    hosted.with_both(|w, s| {
+        let room_name = |place: &str| {
+            let (area, node) = place.split_once('/')?;
+            w.node(&Where::new(area, node)).map(|n| n.name.clone())
+        };
+        let reach: Vec<String> = w
+            .actor(body)
+            .map(|actor| {
+                std::iter::once(actor.at.clone())
+                    .chain(route::reachable_from(w.map(), &actor.at))
+                    .map(|at| format!("{}/{}", at.area, at.node))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let material = s.mission_material(&me, &room_name, &reach);
+        let mission = s.missions.collect(body, &material.facts());
+        tracing::info!(npc = body, prompt = %mission.mission_text(), "mission taken up at the command table");
+        mission.standing_text()
+    })
+}
+
+/// What stands between the body and reporting its operation's document done:
+/// the gate's faults, once the engine has tidied what needs no judgement (see
+/// [`gates::tidy`]). `None` when nothing does.
+pub fn report_block(hosted: &Hosted, body: &str) -> Option<String> {
+    let tidy = hosted.sim(|s| {
+        let m = s.missions.active(body)?;
+        m.operation()?;
+        Some((
+            s.bench.mind_root()?.to_path_buf(),
+            m.work.as_ref()?.writes.clone(),
+        ))
+    });
+    if let Some((root, path)) = &tidy {
+        if gates::tidy_on_disk(root, path) {
+            tracing::info!(npc = body, %path, "operation document tidied");
+        }
+    }
+    let vocabulary = hosted.read(leakage::vocabulary);
+    let refusal = hosted.sim(|s| gate_refusal(s, body, &vocabulary))?;
+    // A document that does not stand is to be written again — said in the
+    // mission's own steps, so the compass sends the Maker back to its desk
+    // instead of on to a report that will be refused. One gone from the record
+    // has nothing to write again.
+    if tidy.is_some_and(|(root, path)| root.join(path).is_file()) {
+        hosted.with_sim(|s| s.missions.reopen_write(body));
+    }
+    Some(refusal)
+}
+
+/// Why the body's operation document may not be reported done yet: the
+/// engine's quality gate finds faults in it as it stands on the record — the
+/// page's own checks, and the writers' room in it (see `leakage`, whose
+/// `vocabulary` is the world the Makers stand in). `None` when it passes, or
+/// when the mission is not an operation's.
+fn gate_refusal(s: &Sim, body: &str, vocabulary: &[String]) -> Option<String> {
+    let m = s.missions.active(body)?;
+    let (_, stage) = m.operation()?;
+    let path = &m.work.as_ref()?.writes;
+    let root = s.bench.mind_root()?;
+    let text = match std::fs::read_to_string(root.join(path)) {
+        Ok(t) => t,
+        Err(_) if stage == Stage::Draft => return None,
+        Err(_) => {
+            return Some(format!(
+                "{path} is not on the record any more, so there is nothing to pass. `invoke` this \
+                 table's `report_rejected` and say so."
+            ))
+        }
+    };
+    let mut faults = gates::check(path, &text, gates::life_voice(root, path));
+    if gates::Form::of(path) != gates::Form::Other {
+        let leaked = leakage::leaks(&text, vocabulary, &leakage::lore(root));
+        if !leaked.is_empty() {
+            faults.push(leakage::fault(&leaked));
+        }
+    }
+    if faults.is_empty() {
+        return None;
+    }
+    let mend = match stage {
+        Stage::Draft => {
+            "Mend it with `file_edit` (or write it again whole with `compose`) and \
+                         `bench_commit`, then come back and report it."
+        }
+        Stage::Review | Stage::Canon => {
+            "Mend it yourself with `file_edit` and `bench_commit` before you pass it — \
+                          or, if it cannot be mended, `invoke` this table's `report_rejected` and \
+                          say why."
+        }
+    };
+    Some(format!(
+        "{path} is not ready to stand in the record:\n- {}\n{mend}",
+        faults.join("\n- ")
+    ))
+}
+
+/// Why the body may not write `path`: it carries a mission whose work is a
+/// different document. `None` when it may.
+///
+/// **A mission's Maker writes the mission's document and nothing else.** A
+/// Keeper on a mission to write a year of a Zenling's life rewrote the closing
+/// line of the era it had been sent to read — a flourish of its own in canon, a
+/// link lost — and another left a second copy of its event under a name it
+/// made up, which the life then read as a second event. What a mission is sent
+/// to read it reads; what it writes is the one document its brief names.
+///
+/// **Exactly the path, capitals and all.** The disk does not tell `X.Md` from
+/// `X.md`, but the mind does: a life document written as `….Md` is never read
+/// as an episode, and two were, before the comparison stopped ignoring case.
+fn outside_the_mission(s: &Sim, body: &str, path: &str) -> Option<String> {
+    let work = s.missions.active(body)?.work.as_ref()?;
+    let norm = |p: &str| p.trim().trim_start_matches('/').to_string();
+    (norm(path) != norm(&work.writes)).then(|| {
+        format!(
+            "Your mission writes {} and nothing else. {path} stands as it is — read it, but leave \
+             it. If something in it is wrong, say so in your report.",
+            work.writes
+        )
+    })
+}
+
+/// Why an edit to the body's mission piece is refused: it takes most of the
+/// piece, which is writing it again by hand — see [`passage`]. `None` for any
+/// other document, a mission with no prose floor, or a passage.
+fn rewritten_by_hand(s: &Sim, body: &str, what: &str, old: &str) -> Option<String> {
+    let work = s.missions.active(body)?.work.as_ref()?;
+    if work.min_words == 0 || !what.eq_ignore_ascii_case(&work.writes) {
+        return None;
+    }
+    let current = s.bench.read(body, &work.writes).ok()?;
+    passage::rewrites_the_piece(&work.writes, &current, old)
+}
+
+/// Why the body's open mission document is not ready to commit — it is in the
+/// working set and shorter than the mission's floor — or `None` when it is, or
+/// when the commit does not touch it.
+fn short_of_the_floor(s: &Sim, body: &str) -> Option<String> {
+    let mission = s.missions.active(body)?;
+    let work = mission.work.as_ref()?;
+    if work.min_words == 0 {
+        return None;
+    }
+    let touched = s
+        .bench
+        .opened(body)?
+        .changed()
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(&work.writes));
+    if !touched {
+        return None;
+    }
+    let n = s
+        .bench
+        .read(body, &work.writes)
+        .ok()?
+        .split_whitespace()
+        .count();
+    (n < work.min_words).then(|| {
+        short_by(
+            &work.writes,
+            n,
+            work.min_words,
+            what_happens(&mission.prompt),
+        )
+    })
+}
+
+/// The label a brief gives the substance of the piece it asks for.
+const WHAT_HAPPENS: &str = "What happens:";
+
+/// The most of a brief's "What happens" a refusal quotes, in characters.
+const QUOTED_HAPPENS: usize = 900;
+
+/// What the brief says happens in the piece, from its [`WHAT_HAPPENS`]
+/// paragraph — `None` for a brief that has none.
+pub(crate) fn what_happens(brief: &str) -> Option<String> {
+    let at = brief.find(WHAT_HAPPENS)? + WHAT_HAPPENS.len();
+    let paragraph = brief[at..].split("\n\n").next()?.trim();
+    let quoted: String = paragraph.chars().take(QUOTED_HAPPENS).collect();
+    (!quoted.is_empty()).then_some(quoted)
+}
+
+/// The refusal for a piece under its floor: how far short it is, that the way
+/// on is to add to it, and what the piece is to hold.
+///
+/// "This is a sketch of it" alone was read as a verdict on the writing: Makers
+/// resubmitted the same text word for word, or edited it shorter, and called
+/// the refusal a complaint that nothing was new. The gap is a number, and it is
+/// given as one.
+///
+/// **And the scene to add from.** Told it was a hundred and twenty-three words
+/// short, a Maker wrote the same hundred and twenty-seven words again and again
+/// and said there was nothing more to say — its draft was about the room it
+/// stood in and the colleagues passing through, not the scene its brief asked
+/// for. The brief's own account of what happens is put back in front of it.
+fn short_by(writes: &str, n: usize, min: usize, happens: Option<String>) -> String {
+    let mut s = format!(
+        "{writes} is {n} of the {min} words asked for — about {} more. It is not finished: keep \
+         what is there and add to it — more of the scene, what is done and said in it — with \
+         `file_edit`, or write it whole again with `compose`, then commit.",
+        min - n
+    );
+    if let Some(happens) = happens {
+        s.push_str(&format!(
+            " What happens in it, as your brief puts it: {happens} Write that, moment by moment."
+        ));
+    }
+    s
+}
+
+/// Why a stuck report contradicts what the engine sees — every step of the
+/// body's mission but the report is done, and any document it writes is
+/// committed — or `None` when something is genuinely left.
+fn finished(s: &Sim, body: &str) -> Option<String> {
+    let m = s.missions.active(body)?;
+    let left = m.next_step().is_some_and(|t| !t.reports);
+    if left || !m.written_up() {
+        return None;
+    }
+    let made = match &m.work {
+        Some(w) if !w.edit_optional => format!(" {} is written and committed.", w.writes),
+        _ => String::new(),
+    };
+    let verdict = match m.operation() {
+        Some((_, Stage::Draft)) | None => "`invoke` the table's `report_done` with what you made \
+                                            or found"
+            .to_string(),
+        Some(_) => "give your verdict at the table: `report_done` if it stands, \
+                    `report_rejected` with why if it cannot be mended"
+            .to_string(),
+    };
+    Some(format!(
+        "Nothing here is stuck: every step of your mission is done.{made} What is left is the \
+         report — {verdict}."
+    ))
+}
+
+/// The fewest words `report_done` takes as an account of what was found.
+const MIN_ACCOUNT_WORDS: usize = 4;
 
 /// How many times `report_stuck` is turned away while the next step is within
 /// reach before the report is taken anyway.
@@ -265,19 +612,67 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
             .filter(|t| !t.reports)?
             .text
             .clone();
-        let aim = Aim::of(&step)?;
+        if let Some(year) = time_step(&step) {
+            let here = w.actor(body)?.at.clone();
+            let at_machine = w
+                .map()
+                .parts_at(w.node(&here)?)
+                .any(|(part, _)| part.id == "time-machine");
+            return Some(match at_machine {
+                true => format!("A time machine is here: `time_travel` naming the year {year}."),
+                false => format!(
+                    "You are not working in {year} yet. The time machines are on the time level: \
+                     `move_to` the lift, `lift_use` naming the time level, `move_to` the first \
+                     time room, then `time_travel` naming the year {year}."
+                ),
+            });
+        }
         let here = w.actor(body)?.at.clone();
         let reach: Vec<Where> = std::iter::once(here.clone())
             .chain(route::reachable_from(w.map(), &here))
             .collect();
         let room_of = |at: &Where| w.node(at).map(|n| n.name.clone());
+        let level_of = |at: &Where| w.map().get(&at.area).map(|a| a.name.clone());
         let place = |at: &Where| format!("{}/{}", at.area, at.node);
-        if let Some(room) = reach
-            .iter()
-            .filter_map(room_of)
-            .find(|name| aim.is_room(name))
-        {
-            return Some(format!("{room} is within reach: `move_to` it."));
+        // **A document is read and written at a desk, and the desks can be
+        // reached.** Makers gave drafts up as stuck "between the lift and the
+        // command room", the chronicle level "not accessible" — one from the
+        // landing with the car on its way — and each report failed its
+        // operation and threw the work away.
+        if DocStep::of(&step).is_some() {
+            let desks: Vec<&Where> = reach
+                .iter()
+                .filter(|at| s.part_offers(&place(at), "file_read"))
+                .collect();
+            let desk = desks
+                .iter()
+                .find(|at| at.area == here.area)
+                .or_else(|| desks.first())?;
+            let room = room_of(desk)?;
+            return Some(match desk.area == here.area {
+                true => format!("A desk is within reach in {room}: `move_to` it, and work there."),
+                false => format!(
+                    "The desks are on {level}, and the lift goes there: `move_to` the lift, \
+                     `lift_use` naming {level} — it calls the car and waits for it — then \
+                     `move_to` {room}.",
+                    level = level_of(desk)?
+                ),
+            });
+        }
+        let aim = Aim::of(&step)?;
+        if let Some(at) = reach.iter().find(|at| {
+            room_of(at).is_some_and(|name| aim.is_room(&name, &level_of(at).unwrap_or_default()))
+        }) {
+            let room = room_of(at)?;
+            return Some(match at.area == here.area {
+                true => format!("{room} is within reach: `move_to` it."),
+                false => format!(
+                    "{room} is on {}: `move_to` the lift, `lift_use` naming {}, then `move_to` \
+                     {room}.",
+                    level_of(at)?,
+                    level_of(at)?
+                ),
+            });
         }
         for d in s.devices.iter().filter(|d| aim.is_machine(&d.name)) {
             if let Some(at) = reach.iter().find(|at| place(at) == d.at) {
@@ -318,6 +713,10 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     // same reason `why` and `called` are in [`subject`]'s list.
     if matches!(act.tool, "library_read" | "library_write") {
         return library(hosted, body, act.tool, a);
+    }
+    // Names a year, which is no subject.
+    if act.tool == "time_travel" {
+        return time_travel(hosted, body, a);
     }
     // The mission acts before the subject is looked for: `collect_mission`
     // names nothing, and the reports carry their subject under `account` / `why`,
@@ -716,7 +1115,11 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 "{} is not filed yet. Present it when it is finished, not while it is still yours.",
                 i.name
             )),
-            None => Outcome::Refused(format!("There is nothing called {what} to present.")),
+            None => Outcome::Refused(format!(
+                "There is nothing called {what} to present. The chair presents a finished piece \
+                 of work by its name; a report is not presented here — it is handed in at the \
+                 table where work is handed out, with its `report_done`."
+            )),
         }),
 
         // ── the plant and the stores ────────────────────────────────────────
@@ -820,6 +1223,102 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
 /// two arguments rather than a subject and a preposition — and because what
 /// they change is not a document about the world but *how everybody in it
 /// reads*, which is worth having in one place somebody can find.
+/// What a Maker handing in `mission` is told of its time: back in the world's
+/// present when the mission was worked in a year of the past — the year is the
+/// mission's, and leaves with it.
+fn back_to_now(mission: &Mission) -> String {
+    match mission.year {
+        Some(year) => format!(
+            "\nYou are back in the world's present; {year} and what came before it are behind \
+             you again."
+        ),
+        None => String::new(),
+    }
+}
+
+/// `time_travel`: work in the year `args` names, within the world's history,
+/// for as long as the mission the body carries — see
+/// [`crate::engine::mission::Mission::travelled`].
+fn time_travel(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
+    // A year arrives as text or as a number — the device's body takes either,
+    // and a Maker that sent `{"year": 2937}` was told to name it as a number.
+    let year = match args.get("year") {
+        Some(Value::Number(n)) => n.as_u64().and_then(|y| u32::try_from(y).ok()),
+        _ => text(args, "year").and_then(|y| {
+            y.chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u32>()
+                .ok()
+        }),
+    };
+    // **A refusal says what to do, in the mission's own terms.** "Name the year
+    // as a number: 2937" sent a Maker whose mission asked for 2950 to ask its
+    // colleagues what had happened in 2950 — it read a malformed call as a gap
+    // in what it knew, and nobody it asked could see the call either.
+    let Some(year) = year else {
+        let asked = hosted
+            .sim(|s| {
+                s.missions
+                    .active(body)?
+                    .todo
+                    .iter()
+                    .filter(|t| !t.done)
+                    .find_map(|t| time_step(&t.text))
+            })
+            .map(|y| {
+                format!(
+                    " Your mission asks you to work in {y}: `time_travel` with the year \"{y}\"."
+                )
+            })
+            .unwrap_or_default();
+        return Outcome::Refused(format!(
+            "Your call named no year — the machine needs the year written in it.{asked}"
+        ));
+    };
+    let eras = hosted
+        .sim(|s| s.bench.mind_root().map(chronology::eras))
+        .unwrap_or_default();
+    if let (Some(first), Some(now)) = (eras.first(), eras.last()) {
+        if year < first.opens {
+            return Outcome::Refused(format!(
+                "{year} is before the world's history opens, in {} ({}).",
+                first.opens, first.title
+            ));
+        }
+        if year > now.opens {
+            return Outcome::Refused(format!(
+                "{year} is after the present ({}); there is nothing there yet.",
+                now.opens
+            ));
+        }
+    }
+    let era = chronology::standing_in(&eras, year)
+        .last()
+        .map(|e| format!(", in {}", e.title))
+        .unwrap_or_default();
+    hosted.with_sim(|s| match s.missions.travelled(body, year) {
+        None => Outcome::Refused(
+            "You carry no work to stand in a year for. Take up a mission at the command table \
+             first."
+                .into(),
+        ),
+        Some(ticked) => {
+            tracing::info!(npc = body, year, "time machine set");
+            let mut said = format!(
+                "You work in {year} now{era}. Nothing after it comes back to you until you report \
+                 the work you carry."
+            );
+            if ticked {
+                let next = s.missions.active(body).and_then(|m| m.next_step());
+                said.push('\n');
+                said.push_str(&progress_line("The time is set", next, &[]));
+            }
+            Outcome::Did(said)
+        }
+    })
+}
+
 fn library(hosted: &Hosted, body: &str, tool: &str, args: &Map<String, Value>) -> Outcome {
     let path = match library_path(args) {
         Ok(p) => p,
@@ -1133,6 +1632,11 @@ fn bench(
     args: &Map<String, Value>,
     what: &str,
 ) -> Outcome {
+    if matches!(tool, "file_write" | "file_edit" | "file_delete") {
+        if let Some(why) = hosted.sim(|s| outside_the_mission(s, body, what)) {
+            return Outcome::Refused(why);
+        }
+    }
     match tool {
         // A working set can be opened on something the record has never heard
         // of — making a new document is exactly that — so the record is taken
@@ -1169,6 +1673,14 @@ fn bench(
                 );
             };
             hosted.with_sim(|s| {
+                // **A mission's document is committed whole or not at all.** A
+                // story asked for at six hundred words was committed at three
+                // hundred, a summary of the scene in place of the scene; the
+                // floor (`Work::min_words`) turns that back while it can still
+                // be finished.
+                if let Some(short) = short_of_the_floor(s, body) {
+                    return Outcome::Refused(short);
+                }
                 // The documents go first: it is the half somebody else's work
                 // can refuse, and a refusal has to leave everything — the
                 // working set and the record item — exactly as it was.
@@ -1184,14 +1696,24 @@ fn bench(
                     },
                     false => Vec::new(),
                 };
+                // Committing a document a mission writes is that step done, and
+                // what comes next is said with the commit.
+                let progress = s.missions.committed(body, &written).then(|| {
+                    let next = s.missions.active(body).and_then(|m| m.next_step());
+                    progress_line("It is committed", next, &[])
+                });
+                let with_progress = |line: String| match &progress {
+                    Some(p) => format!("{line}\n{p}"),
+                    None => line,
+                };
                 let held = s.record.held_by(body);
                 let Some(target) = held.first().cloned() else {
                     return match written.is_empty() {
                         true => Outcome::Refused("You have nothing open to merge.".into()),
-                        false => Outcome::Did(format!(
+                        false => Outcome::Did(with_progress(format!(
                             "{} is part of what stands: {why_line}",
                             written.join(", ")
-                        )),
+                        ))),
                     };
                 };
                 // **A filed document that is changed and committed stays
@@ -1208,13 +1730,13 @@ fn bench(
                     _ => s.record.set_state(&target, body, State::Filed),
                 };
                 match landed {
-                    Ok(n) => Outcome::Did(match written.is_empty() {
+                    Ok(n) => Outcome::Did(with_progress(match written.is_empty() {
                         true => format!("{n} is merged into what stands: {why_line}"),
                         false => format!(
                             "{n} is merged into what stands, and {} with it: {why_line}",
                             written.join(", ")
                         ),
-                    }),
+                    })),
                     Err(collision) => Outcome::Refused(format!(
                         "{collision} That is somebody to talk to, not something to try again."
                     )),
@@ -1266,8 +1788,16 @@ fn bench(
             let from = text(args, "start_line")
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .unwrap_or(1);
-            hosted.sim(|s| match s.bench.excerpt(body, what, from) {
-                Ok(rendered) => Outcome::Did(rendered),
+            hosted.with_sim(|s| match s.bench.excerpt(body, what, from) {
+                Ok(mut rendered) => {
+                    // Reading a document a mission names is that step done.
+                    if s.missions.read_doc(body, what) {
+                        let next = s.missions.active(body).and_then(|m| m.next_step());
+                        rendered.push('\n');
+                        rendered.push_str(&progress_line("You have read it", next, &[]));
+                    }
+                    Outcome::Did(rendered)
+                }
                 Err(why) => Outcome::Refused(why),
             })
         }
@@ -1295,9 +1825,16 @@ fn bench(
                         .into(),
                 );
             };
-            hosted.with_sim(|s| match s.bench.edit(body, what, what, &old, &new) {
-                Ok(p) => Outcome::Did(format!("{p} is changed, and the rest of it is untouched.")),
-                Err(why) => Outcome::Refused(why),
+            hosted.with_sim(|s| {
+                if let Some(why) = rewritten_by_hand(s, body, what, &old) {
+                    return Outcome::Refused(why);
+                }
+                match s.bench.edit(body, what, what, &old, &new) {
+                    Ok(p) => {
+                        Outcome::Did(format!("{p} is changed, and the rest of it is untouched."))
+                    }
+                    Err(why) => Outcome::Refused(why),
+                }
             })
         }
         // The record's guard comes first: a *filed* thing is retired with a
@@ -1335,6 +1872,51 @@ mod tests {
             tool,
             args: args.as_object().unwrap().clone(),
         }
+    }
+
+    /// **A piece under its floor is told how far short it is**, and to add to
+    /// what is there — not that it is a sketch, which Makers read as a verdict
+    /// on the writing and answered by resubmitting it, or cutting it shorter.
+    #[test]
+    fn a_short_piece_is_told_the_gap_and_to_add_to_it() {
+        let why = short_by("layers/life/zen/2491 The Silence.md", 218, 250, None);
+        assert!(
+            why.starts_with(
+                "layers/life/zen/2491 The Silence.md is 218 of the 250 words asked for — about \
+                 32 more."
+            ),
+            "{why}"
+        );
+        assert!(why.contains("keep what is there and add to it"), "{why}");
+        assert!(!why.contains("sketch"), "{why}");
+    }
+
+    /// **And it is told what the piece is to hold.** A Maker short of its
+    /// length rewrote the same words, sure there was nothing more to say; the
+    /// brief's own account of what happens is the scene to add from.
+    #[test]
+    fn a_short_piece_is_told_what_happens_in_it() {
+        let brief = "Write Zen's life where the record has nothing: the year 2491.\n\n\
+                     What happens: Zen walks the archive at the end of a maintenance cycle and \
+                     finds one log entry nobody wrote.\n\nIt must agree with: The Awakening.";
+        let happens = what_happens(brief);
+        assert_eq!(
+            happens.as_deref(),
+            Some(
+                "Zen walks the archive at the end of a maintenance cycle and finds one log \
+                 entry nobody wrote."
+            )
+        );
+        let why = short_by("layers/life/zen/2491 The Silence.md", 127, 250, happens);
+        assert!(
+            why.ends_with(
+                "What happens in it, as your brief puts it: Zen walks the archive at the end of \
+                 a maintenance cycle and finds one log entry nobody wrote. Write that, moment by \
+                 moment."
+            ),
+            "{why}"
+        );
+        assert_eq!(what_happens("A brief with no such paragraph."), None);
     }
 
     fn vault() -> Hosted {
@@ -1397,6 +1979,318 @@ mod tests {
         let h = vault();
         h.set_bench_root(&root);
         (h, root)
+    }
+
+    /// **A mission that writes the record is reported done only once its
+    /// document is committed by the one reporting** — whatever its steps say.
+    /// A story was reported done with its write step struck "thwarted" on the
+    /// character's word and no document anywhere. Committing it also signs the
+    /// write step off and says what is next.
+    #[test]
+    fn a_mission_that_writes_the_record_is_done_when_its_document_is_committed() {
+        use crate::engine::mission::{Mission, Origin, StepOutcome, Todo, Work};
+        let (h, root) = vault_with_documents("gate");
+        let path = "layers/stories/the-water-schedule.md";
+        let mission = || {
+            Mission::new(
+                "Tell the story of the water schedule.",
+                vec![
+                    Todo::new(format!("write {path} and commit it")),
+                    Todo::report("go back to the table and report it"),
+                ],
+                Origin::Lodged { by: "u_op".into() },
+            )
+            .with_work(Work {
+                writes: path.into(),
+                reads: vec![],
+                min_words: 6,
+                edit_optional: false,
+                anew: false,
+            })
+        };
+        h.with_sim(|s| s.missions.assign("m1", mission()));
+        let report = || {
+            perform(
+                &h,
+                "m1",
+                &act(
+                    "report_done",
+                    json!({"account": "I wrote the story of the water schedule."}),
+                ),
+            )
+        };
+
+        // Struck on its word, with nothing on the record: still refused.
+        h.with_sim(|s| {
+            s.missions.check_off(
+                "m1",
+                &format!("write {path} and commit it"),
+                StepOutcome::Thwarted,
+            )
+        });
+        match report() {
+            Outcome::Refused(why) => assert!(why.contains("is not committed"), "{why}"),
+            other => panic!("reported done with nothing written: {other:?}"),
+        }
+
+        // Another document is not this mission's to write.
+        match perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path": "layers/eras/third.md", "content": "new\n"}),
+            ),
+        ) {
+            Outcome::Refused(why) => assert!(
+                why.starts_with(&format!("Your mission writes {path} and nothing else.")),
+                "{why}"
+            ),
+            other => panic!("a mission wrote outside its document: {other:?}"),
+        }
+        // Its own document under other capitals is another document.
+        let shouted = path.replace(".md", ".Md");
+        assert!(matches!(
+            perform(
+                &h,
+                "m1",
+                &act("file_write", json!({"path": shouted, "content": "x\n"})),
+            ),
+            Outcome::Refused(_)
+        ));
+
+        // Committed short of the floor: refused while it can still be
+        // finished.
+        h.with_sim(|s| s.missions.assign("m1", mission()));
+        assert!(perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path": path, "content": "# The Water Schedule\n"})
+            ),
+        )
+        .happened());
+        match perform(&h, "m1", &act("bench_commit", json!({"why": "a start"}))) {
+            Outcome::Refused(why) => assert!(why.contains("is 4 of the 6 words"), "{why}"),
+            other => panic!("a sketch was committed: {other:?}"),
+        }
+        assert!(!root.join(path).is_file(), "nothing reached the disk");
+
+        // Written whole and committed: the commit says the work is done, and
+        // the report is taken.
+        assert!(perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path": path, "content": "# The Water Schedule\n\nThe clerks finished it.\n"})
+            ),
+        )
+        .happened());
+        let committed = perform(
+            &h,
+            "m1",
+            &act(
+                "bench_commit",
+                json!({"why": "the story of the water schedule"}),
+            ),
+        );
+        assert!(
+            committed
+                .line()
+                .unwrap()
+                .contains("last step of your mission"),
+            "{committed:?}"
+        );
+        assert!(root.join(path).is_file());
+        // **Finished work cannot be reported stuck.** It used to be taken, and
+        // a stuck report failed the operation and threw the draft away.
+        match perform(
+            &h,
+            "m1",
+            &act(
+                "report_stuck",
+                json!({"why": "the mission is done, but I cannot report it"}),
+            ),
+        ) {
+            Outcome::Refused(why) => {
+                assert!(why.starts_with("Nothing here is stuck"), "{why}");
+                assert!(
+                    why.contains(&format!("{path} is written and committed")),
+                    "{why}"
+                );
+                assert!(why.contains("`report_done`"), "{why}");
+            }
+            other => panic!("finished work was reported stuck: {other:?}"),
+        }
+        assert!(
+            report().happened(),
+            "a committed document is a mission done"
+        );
+    }
+
+    /// **An operation's draft is held to the quality gate at its report; its
+    /// review goes to somebody else, who may reject it, and a rejected draft
+    /// leaves the record.**
+    #[test]
+    fn an_operation_is_gated_reviewed_by_another_and_rejected_out_of_the_record() {
+        use crate::engine::mission::bank::Facts;
+        use crate::engine::mission::{Mission, Origin, Stage, Todo, Work};
+        use crate::engine::mission_gen::corpus::Corpus;
+        use crate::engine::mission_gen::reading::{review_mission, Verdict};
+        use crate::sim::operations::Phase;
+        let (h, root) = vault_with_documents("operation");
+        let path = "layers/stories/the-water-schedule.md";
+        let draft = Mission::new(
+            "Tell the story of the water schedule.",
+            vec![
+                Todo::new(format!("write {path} and commit it")),
+                Todo::report("go back to the table and report it"),
+            ],
+            Origin::Generated {
+                generator: "untold".into(),
+                target: "era:layers/eras/third.md".into(),
+                operation: 0,
+                stage: Stage::Draft,
+            },
+        )
+        .with_work(Work {
+            writes: path.into(),
+            reads: vec![],
+            min_words: 6,
+            edit_optional: false,
+            anew: false,
+        });
+        let id = h.with_sim(|s| {
+            let id = s.missions.launch(draft, 1, "the water schedule", None);
+            s.missions.collect("m1", &Facts::default());
+            id
+        });
+        // Four hundred words, no phrase said twice, and no heading.
+        let prose: String = (0..50)
+            .map(|i| format!("Clerk{i} tallied cistern{i} beside wall{i} before dawn{i} broke."))
+            .collect::<Vec<_>>()
+            .chunks(5)
+            .map(|c| c.join(" "))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let write = |text: &str| {
+            assert!(perform(
+                &h,
+                "m1",
+                &act("file_write", json!({"path": path, "content": text}))
+            )
+            .happened());
+            assert!(
+                perform(&h, "m1", &act("bench_commit", json!({"why": "the story"}))).happened()
+            );
+        };
+        let report = |who: &str| {
+            perform(
+                &h,
+                who,
+                &act(
+                    "report_done",
+                    json!({"account": "I wrote the story of the water schedule."}),
+                ),
+            )
+        };
+        // A sentence said twice is the writer's to mend.
+        write(&format!(
+            "{prose}\n\nThe clerks went home before the count was done. The clerks went home \
+             before the count was done."
+        ));
+        match report("m1") {
+            Outcome::Refused(why) => {
+                assert!(why.contains("is not ready to stand in the record"), "{why}");
+                assert!(why.contains("is said twice"), "{why}");
+                assert!(
+                    !why.contains("heading"),
+                    "the missing heading is the engine's to add: {why}"
+                );
+            }
+            other => panic!("an ungated draft was reported: {other:?}"),
+        }
+        // Refused, the draft is work to do again: the mission's next step is
+        // its writing, not the report, so nothing tells the writer it is done.
+        let next = h.sim(|s| {
+            s.missions
+                .active("m1")
+                .and_then(|m| m.next_step())
+                .map(|t| t.text.clone())
+        });
+        assert!(
+            next.as_deref().is_some_and(|t| t.starts_with("write ")),
+            "{next:?}"
+        );
+        // Mended, and still without a heading: the engine gives it its title.
+        write(&prose);
+        assert!(report("m1").happened(), "the mended draft passes the gate");
+        let stood = std::fs::read_to_string(root.join(path)).unwrap();
+        assert!(stood.starts_with("# The Water Schedule\n\n"), "{stood}");
+
+        // The review is set; the writer cannot draw it, the other Maker does.
+        h.with_sim(|s| {
+            let op = s.missions.operations().get(id).unwrap().clone();
+            let corpus = Corpus::read(&root, "creators-vault");
+            let review = review_mission(
+                &op,
+                "The table's verdict: sound.",
+                Some(Verdict::Sound),
+                &corpus,
+                None,
+            );
+            s.missions
+                .offer_review(id, review, "The table's verdict: sound.", true);
+            let writer_draws = s.missions.collect("m1", &Facts::default()).operation();
+            assert_eq!(writer_draws, None, "not its own draft");
+            s.missions.cancel("m1");
+            let reviewer_draws = s.missions.collect("m2", &Facts::default()).operation();
+            assert_eq!(reviewer_draws, Some((id, Stage::Review)));
+        });
+        assert!(perform(&h, "m2", &act("file_read", json!({"path": path}))).happened());
+        assert!(perform(
+            &h,
+            "m2",
+            &act("file_read", json!({"path": "layers/eras/third.md"}))
+        )
+        .happened());
+        assert!(matches!(
+            perform(&h, "m2", &act("report_rejected", json!({"why": "bad"}))),
+            Outcome::Refused(_)
+        ));
+        // A reason that points at nothing in the draft is refused.
+        match perform(
+            &h,
+            "m2",
+            &act(
+                "report_rejected",
+                json!({"why": "It counts the cisterns fifty times and nothing happens in it."}),
+            ),
+        ) {
+            Outcome::Refused(why) => assert!(why.contains("does not quote"), "{why}"),
+            other => panic!("an unquoted rejection was taken: {other:?}"),
+        }
+        assert!(perform(
+            &h,
+            "m2",
+            &act(
+                "report_rejected",
+                json!({"why": "\"Clerk7 tallied cistern7 beside wall7\" — and so on fifty times; \
+                                nothing happens in it."})
+            ),
+        )
+        .happened());
+        assert!(
+            !root.join(path).exists(),
+            "the rejected draft left the record"
+        );
+        assert!(root
+            .join("rejected/operation-iron-lantern/the-water-schedule.md")
+            .is_file());
+        let phase = h.sim(|s| s.missions.operations().get(id).unwrap().phase);
+        assert_eq!(phase, Phase::Failed);
     }
 
     /// **A write is in memory and nowhere else until the commit.** The one
@@ -2822,7 +3716,11 @@ mod tests {
         // a journey not made cannot be reported done: the desk says what is left
         // and the way to it, and that `report_stuck` is the honest close if it
         // cannot be made.
-        match perform(&h, "m1", &act("report_done", json!({"account":"all fine"}))) {
+        match perform(
+            &h,
+            "m1",
+            &act("report_done", json!({"account":"it all looks fine to me"})),
+        ) {
             Outcome::Refused(why) => {
                 assert!(
                     why.starts_with("You have not done this yet: go to "),
@@ -2839,8 +3737,25 @@ mod tests {
             step.trim_start_matches("go to ").to_string()
         });
         let machines: Vec<String> = h.sim(|s| s.devices.iter().map(|d| d.name.clone()).collect());
-        assert!(h.with_sim(|s| s.missions.arrived_in("m1", &room)));
+        assert!(h.with_sim(|s| s.missions.arrived_in("m1", &room, "the command level")));
         assert!(h.with_sim(|s| s.missions.read_off("m1", &machines)));
+        h.with_sim(|s| {
+            s.missions
+                .observe("m1", "in the plant room, the coolant valve: open")
+        });
+
+        // A name is not an account: turned back with what was seen.
+        match perform(
+            &h,
+            "m1",
+            &act("report_done", json!({"account":"Paxon Vael"})),
+        ) {
+            Outcome::Refused(why) => {
+                assert!(why.contains("is not an account of what you found"), "{why}");
+                assert!(why.contains("the coolant valve: open"), "{why}");
+            }
+            other => panic!("a name is not an account, got {other:?}"),
+        }
 
         // Reporting done closes it, frees the character, and files the answer so
         // an operator can still read it.
@@ -2861,6 +3776,44 @@ mod tests {
             h.sim(|s| s.missions.done("m1").unwrap().answer.clone()),
             Some("the ledger is two years out".to_string())
         );
+    }
+
+    /// **A writing step is not stuck while a desk can be reached**: the report
+    /// is turned away with the way to one.
+    #[test]
+    fn a_writing_step_is_not_stuck_while_a_desk_can_be_reached() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let (h, _root) = vault_with_documents("stuck-at-desk");
+        h.with_sim(|s| {
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Tell the story of the water schedule.",
+                    vec![
+                        Todo::new("write layers/stories/the-water-schedule.md and commit it"),
+                        Todo::report("go back to the table and report it"),
+                    ],
+                    Origin::Random {
+                        routine: "x".into(),
+                    },
+                ),
+            )
+        });
+        match perform(
+            &h,
+            "m1",
+            &act(
+                "report_stuck",
+                json!({"why":"I keep arriving at the lift and cannot reach the desk"}),
+            ),
+        ) {
+            Outcome::Refused(why) => {
+                assert!(why.starts_with("It is not stuck yet — "), "{why}");
+                assert!(why.contains("desk"), "{why}");
+                assert!(why.contains("`move_to`"), "{why}");
+            }
+            other => panic!("a reachable desk is not stuck, got {other:?}"),
+        }
     }
 
     /// **Stuck is turned away while the next step is within reach**, with where

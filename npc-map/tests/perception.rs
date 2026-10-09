@@ -48,6 +48,42 @@ fn walk(world: &mut World, id: &str, node: &str) {
     world.settle();
 }
 
+/// **A body that has called the lift is told to wait, not to call it again** —
+/// and told the same thing while the car comes, floor after floor, rather than
+/// a new line naming each floor it passes.
+#[test]
+fn a_called_lift_is_waited_for_not_called_again() {
+    let mut w = vault();
+    let shaft: Vec<Where> = w.shaft().to_vec();
+    let here = shaft.len() - 1;
+    w.enter("m1", "Maker-01", shaft[here].clone()).unwrap();
+    assert!(
+        flat(&w, "m1").contains("Call it to bring it to you"),
+        "uncalled, it may be called: {}",
+        flat(&w, "m1")
+    );
+
+    w.call_lift(here);
+    let mut said: Vec<String> = Vec::new();
+    for _ in 0..50 {
+        if w.lift().unwrap().boardable_at(here) {
+            break;
+        }
+        said.push(flat(&w, "m1"));
+        w.tick();
+    }
+    assert!(said.len() > 1, "the car took more than one step to come");
+    for line in &said {
+        assert!(line.contains("has been called and is on its way"), "{line}");
+        assert!(!line.contains("Call it"), "{line}");
+    }
+    assert!(
+        said.windows(2).all(|p| p[0] == p[1]),
+        "the wait does not change as it comes"
+    );
+    assert!(flat(&w, "m1").contains("The lift is here"));
+}
+
 /// A crew, entered at the lift of the casting level.
 fn crew(world: &mut World, n: usize) -> Vec<String> {
     (1..=n)

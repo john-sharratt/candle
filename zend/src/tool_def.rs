@@ -96,11 +96,11 @@ pub struct ToolDef {
     /// region, and these are entries that are *only* that region — so a tool can
     /// carry many more phrasings than it could afford as full examples.
     ///
-    /// **All of a tool's questions are calibrated in ONE submission**, stuffed
-    /// into a single prefill grid and carved back into one turn each
-    /// (`candle_conversation::stuffed_grid`). They are therefore resumed as a
-    /// unit: the group's marker covers every question, so editing any one of
-    /// them regenerates the whole set.
+    /// **All of a tool's questions are calibrated in ONE submission**, a turn
+    /// group whose cases prefill together, each masked to itself, and seal one
+    /// turn each (`candle_conversation::turn_group`). They are therefore resumed
+    /// as a unit: the group's marker covers every question, so editing any one
+    /// of them regenerates the whole set.
     #[serde(default)]
     pub questions: Vec<String>,
 }

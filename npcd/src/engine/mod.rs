@@ -49,10 +49,14 @@
 pub mod act;
 pub mod acts;
 pub mod ask_api;
+pub mod at_work;
 pub mod authoring;
+pub mod bearings;
 pub mod bench;
 pub mod body;
 pub mod check;
+pub mod chronology;
+pub mod compose;
 pub mod cooldown;
 pub mod dreams;
 pub mod driver;
@@ -71,12 +75,16 @@ pub mod life;
 pub mod loading;
 pub mod loopguard;
 pub mod mind;
+pub mod mind_record;
 pub mod mission;
 pub mod mission_acts;
 pub mod mission_api;
+pub mod mission_gen;
 pub mod narration;
 pub mod narrator;
 pub mod on_you;
+pub mod operations_api;
+pub mod passage;
 pub mod perceived;
 pub mod persona;
 pub mod prompt;
@@ -103,6 +111,7 @@ pub mod watch;
 pub mod watcher;
 pub mod whereabouts;
 pub mod window;
+pub mod witnessed;
 pub mod work;
 
 use std::collections::BTreeMap;
@@ -113,7 +122,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::Json;
 use serde_json::{json, Value};
 use web::auth::{Identity, Role};
@@ -320,6 +329,52 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             "/v1/pulse/missions/cancel",
             Role::Admin,
             post(mission_api::cancel_all),
+        )
+        // The table's generator: write one mission now, and read or clear what
+        // it has put on the table and what it has found. Admin — the work it
+        // sets is taken up by the whole cast.
+        .route(
+            "/v1/pulse/missions/generate",
+            Role::Admin,
+            post(mission_api::generate),
+        )
+        .route(
+            "/v1/pulse/missions/pool",
+            Role::Admin,
+            get(mission_api::pool).delete(mission_api::discard_pool),
+        )
+        // Operations: the objectives the table holds, each a draft and a review
+        // by two Makers. Read every world's, put a document through review,
+        // edit one, call one off. Admin, like the rest of the table.
+        .route(
+            "/v1/pulse/operations",
+            Role::Admin,
+            get(operations_api::list).post(operations_api::review),
+        )
+        .route(
+            "/v1/pulse/operations/:wid/:oid",
+            Role::Admin,
+            patch(operations_api::edit),
+        )
+        .route(
+            "/v1/pulse/operations/:wid/:oid/cancel",
+            Role::Admin,
+            post(operations_api::cancel),
+        )
+        .route(
+            "/v1/pulse/operations/:wid/:oid/read-again",
+            Role::Admin,
+            post(operations_api::read_again),
+        )
+        .route(
+            "/v1/pulse/operations/:wid/:oid/check",
+            Role::Admin,
+            post(operations_api::check),
+        )
+        .route(
+            "/v1/pulse/operations/:wid/:oid/document",
+            Role::Admin,
+            get(operations_api::document),
         )
         // ── generation ──────────────────────────────────────────────────────
         .route(

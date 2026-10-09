@@ -271,6 +271,44 @@ character.
 piece with no existing precedent here. Everything else in this design is an
 arrangement of parts that already work.
 
+**Where a document lands, and who can read it.** Two rules decide whether a
+shared document ever reaches a character, and both were broken at once, so the
+`world`, `eras` and `stories` layers reached nobody:
+
+- *A shared document is written into its own layer's group*
+  (`schema::document_target`): the layer's one group, when it selects by score.
+  A timeline's group is fixed when it is created, and a projection reads its
+  own target group only along its own timeline, so the ~1,300 documents first
+  written into the live conversation group were scored against no character's
+  turn. At boot each such document still standing in the live group is retired
+  (found by its layer tag) and written again into its layer's group, which is
+  marked append-only — a document's own projection reads only itself, as zend
+  writes a file onto its ingest layer. Every document is one exchange, so a
+  group's documents compete as one pool and their hit levels are learned from
+  the characters' turns (`docs/provenance_score_normalization.md` §3.3a).
+- *A projection sees only the layers ranked beneath its target.* A layer's rank
+  is its declaration index unless it declares `rank:`, and the mind declares
+  `interaction` first — so every shared layer declares a negative rank to sit
+  under it (`world` −4, `eras` −3, `stories` −2, `dreams` −1).
+
+**What a character draws on follows where it stands and when it works**
+(`engine::bearings`, the mind's `bearings.yaml`). Before each turn every shared
+group is scoped (`set_retrieval_scope`) to what the parts in the character's
+room draw on — the storyline and stories at a story desk, places at the map
+table and in the halls, eras alone at the command table; game mechanics nowhere.
+A character working in a year of the past — set at a time machine on the time
+level, the first step of every operation on a life event or a story — is held
+to it: of the storyline, the era the year falls in and the one before
+(`timed: eras: era`); of the stories, those that say they are set by then
+(`stories: dated`), an undated one held back since nothing shows it is not
+later. The year is the mission's (`Mission::year`) and ends with it. The
+storyline group also gates on relevance (`min_score` 1150, `evict_score` 950 on
+the normalized band), so a turn that is not about the past recalls no era.
+
+Every character turn logs what it recalled from beneath, layer by layer, with
+its bearing, its year and each layer's best (`recalled from beneath at
+story-desk in 2950 — eras 1 (best 2349 eras/the-tower-age), …`).
+
 ---
 
 ## 11. What was verified, and how

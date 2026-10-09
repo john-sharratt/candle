@@ -318,6 +318,27 @@ fn live_target(builder: &Builder) -> Option<(LayerId, GroupId)> {
     Some((layer.id, layer.groups.first()?.id))
 }
 
+/// The `(layer, group)` a document of layer `name` is written to: the layer's
+/// own group, when that group selects by score. `None` for a layer that has no
+/// such group — a conversation layer, or one the schema does not declare — whose
+/// documents go to the live target.
+///
+/// **A document in the live group reaches nobody.** A projection reads its own
+/// target group only along its own timeline, so the world, the eras and the
+/// stories written there — every document the mind holds — sat in the gather of
+/// no character at all. In their own layer's group they are scored against every
+/// turn a character takes.
+pub fn document_target(builder: &Builder, name: &str) -> Option<(LayerId, GroupId)> {
+    use candle_conversation::projection::SelectionRule;
+    let layer = builder.schema().layers.iter().find(|l| l.name == name)?;
+    match layer.groups.as_slice() {
+        [group] if !matches!(group.selection, SelectionRule::Sequence { .. }) => {
+            Some((layer.id, group.id))
+        }
+        _ => None,
+    }
+}
+
 /// Everything in the system prompt before the first collection.
 ///
 /// The static prelude. What follows a collection is expanded at projection time
@@ -609,6 +630,49 @@ mod tests {
         assert!(
             !p.prelude.is_empty(),
             "the prelude is empty — every conversation would open with no system prompt"
+        );
+    }
+
+    /// **A world document is written to the world's own group, and the world
+    /// is in a character's gather.** The bundled schema declares `interaction`
+    /// before `world`, so the world's rank puts it under the live layer
+    /// explicitly; a conversation layer's documents keep the live target.
+    #[test]
+    fn a_document_lands_in_its_own_layer_beneath_the_live_one() {
+        let mind = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if !mind.join("projection.yaml").is_file() {
+            return; // no bundled schema in this checkout
+        }
+        let p = build(Some(mind), "battle-cities").expect("the bundled schema parses");
+        let b = &p.builder;
+        assert_eq!(
+            document_target(b, "world"),
+            Some((
+                b.id_for_layer("world").unwrap(),
+                b.id_for_group("canon").unwrap()
+            ))
+        );
+        assert_eq!(document_target(b, "memory"), None, "a conversation layer");
+        assert_eq!(document_target(b, "nowhere"), None);
+        let rank = |name: &str| {
+            b.schema()
+                .layers
+                .iter()
+                .find(|l| l.name == name)
+                .unwrap()
+                .rank
+        };
+        let live = b
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.id == p.layer)
+            .unwrap()
+            .name
+            .clone();
+        assert!(
+            rank("world") < rank(&live),
+            "the world must rank beneath `{live}` to be read from it"
         );
     }
 

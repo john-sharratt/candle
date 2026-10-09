@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use crate::engine::guardian::module::Module;
 use crate::engine::guardian::view::{words, NpcView, Question, Verdict};
-use crate::engine::mission::{Aim, StepOutcome};
+use crate::engine::mission::{engine_sees, StepOutcome};
 
 pub const DONE: &str = "yes, it is done";
 pub const COULD_NOT: &str = "I tried and could not do it";
@@ -56,8 +56,9 @@ impl Module for StepTracker {
         // **A step the engine can see done is the engine's to sign off.** Asked
         // whether it had gone to band three, a character pacing the command
         // level answered that it had tried and could not — and the journey was
-        // struck as thwarted without the body going near the lift.
-        if Aim::of(step).is_some() {
+        // struck as thwarted without the body going near the lift. The same for
+        // a document read or written: see [`engine_sees`].
+        if engine_sees(step) {
             return None;
         }
         Some(Question {

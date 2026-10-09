@@ -32,14 +32,14 @@ pub fn here(hosted: &Hosted, body: &str) -> Outcome {
     let mut said = survey.prose();
     let seen: Vec<String> = survey.stations.iter().map(|e| e.name.clone()).collect();
     let room = hosted.read(|w| {
-        w.actor(body)
-            .and_then(|a| w.node(&a.at))
-            .map(|n| n.name.clone())
+        let at = &w.actor(body)?.at;
+        let level = w.map().get(&at.area).map(|a| a.name.clone())?;
+        Some((w.node(at)?.name.clone(), level))
     });
     let next = hosted.with_sim(|s| {
         // A scan is made standing in the room, so it is there too.
-        if let Some(room) = &room {
-            s.missions.arrived_in(body, room);
+        if let Some((room, level)) = &room {
+            s.missions.arrived_in(body, room, level);
         }
         if !s.missions.read_off(body, &seen) {
             return None;
@@ -126,11 +126,8 @@ impl Survey {
                         let mut verbs = station::verbs_at(inst.part_id());
                         // Only what this body can do here — see
                         // [`mission_acts::offered`].
-                        let on_mission = sim.missions.is_on_mission(body);
-                        let holds_order = !sim.ledger.held_by(body).is_empty();
-                        verbs.retain(|(_, t)| {
-                            mission_acts::offered(t.name, on_mission, holds_order)
-                        });
+                        let carrying = mission_acts::carrying(sim, body);
+                        verbs.retain(|(_, t)| mission_acts::offered(t.name, carrying));
                         let acts: Vec<&str> = verbs.iter().map(|(_, t)| t.name).collect();
                         let read = sim.reading(&inst.id(), &place, &acts, &who);
                         Some(Entry::new(inst.name(), &url, &verbs, &read))

@@ -1941,7 +1941,7 @@ impl Conversation {
         let Some((_, group)) = warmable(schema, layer, group) else {
             return false;
         };
-        self.warm_timeline(group, timeline, None);
+        self.warm_timelines(group, &[timeline], None);
         true
     }
 
@@ -1968,11 +1968,16 @@ impl Conversation {
     /// timeline)` a live query reads back.
     ///
     /// The observation is the live seal scan's: each probe's raw per-exchange
-    /// scores against the file's own exchanges (self-local — an ingest file
-    /// scores only against itself), folded in probe order. The file is
-    /// assembled once and every probe scored in one call — one launch on
-    /// `arena` — where scoring probe by probe re-assembled it each time and
-    /// took the host path.
+    /// scores against the file's own exchanges, folded in probe order. Every
+    /// probe is scored in one call — one launch on `arena` — where scoring probe
+    /// by probe took the host path.
+    ///
+    /// **A file of one exchange is not warmed.** It competes in its group's
+    /// pool (`belief_files::competitions`), where a document probed by its own
+    /// signature agrees with itself on every bit and leaves the next document
+    /// far behind: the self-match ceiling `docs/provenance_score_normalization.md`
+    /// §2 rejects, which put every live hit at 1–2% of the band. Its level is
+    /// learned from query traffic, as §3 has it.
     fn warm_timeline(&self, group: &GroupSchema, tl: TimelineId, arena: Option<&GalleryArena>) {
         // The file's own turn signatures and its candidates, under one
         // short-lived read lock, released before any scoring.
@@ -1989,6 +1994,9 @@ impl Conversation {
             let (files, _) = assemble_file_scans(&sub, vec![tl]);
             (sigs, files)
         };
+        let Some(file) = files.first().filter(|f| f.n_slots > 1) else {
+            return;
+        };
         // A handful of self-probes is enough: the asymmetric EWMA (alpha_up
         // 0.30) is ~94% converged after 8 observes, and each already scores
         // against ALL the file's exchanges, so this caps the warm cost without
@@ -1999,9 +2007,6 @@ impl Conversation {
             .filter(|(_, sig)| !sig.is_empty())
             .map(|(source, sig)| (*source, sig.as_slice()))
             .collect();
-        let Some(file) = files.first() else {
-            return;
-        };
         if probes.is_empty() || ingest_cancelled() {
             return;
         }
@@ -2223,11 +2228,26 @@ impl Conversation {
             // normalized band compresses genuine concentration away, while the
             // raw top-1-share² formula keeps the code-vs-history contrast.
             let mut group_raw: Vec<f32> = Vec::new();
+            // The pooled documents are one competition, so one scope: each is
+            // normalized against its level there, and the pool's levels are
+            // folded together once the loop has its raw scores (`observe`
+            // folds a source into a scope once, so per-document folds would
+            // teach only the first).
+            let pool_scope = ScopeKey::pool(group.id.raw() as u64);
+            let mut pool_raw: Vec<(ChildKey, f32)> = Vec::new();
             for (fi, (f, fresh)) in files.iter().zip(&fresh_per_file).enumerate() {
                 let timeline = f.timeline;
-                let scope = ScopeKey::turn_group(group.id.raw() as u64, timeline.raw());
-                let child_of =
-                    |slot: usize| ChildKey::turn(f.arc_turn[f.ex_ranges[slot].start].0 as u64);
+                // `belief_files::competitions` pools exactly the files of one
+                // exchange.
+                let in_pool = f.n_slots == 1;
+                let scope = match in_pool {
+                    true => pool_scope.clone(),
+                    false => ScopeKey::turn_group(group.id.raw() as u64, timeline.raw()),
+                };
+                let child_of = |slot: usize| match in_pool {
+                    true => ChildKey::timeline(timeline.raw()),
+                    false => ChildKey::turn(f.arc_turn[f.ex_ranges[slot].start].0 as u64),
+                };
                 let raw_pairs: Vec<(ChildKey, f32)> = (0..f.n_slots)
                     .map(|slot| (child_of(slot), fresh.get(slot).copied().unwrap_or(0.0)))
                     .collect();
@@ -2258,10 +2278,16 @@ impl Conversation {
                     // A turn group's retrieval target IS the turn, so its gather
                     // scope is the group's own; `tags` on the group route the
                     // same way collections are routed above.
-                    if let (true, Some(source)) =
-                        (observe.teaches(&group.policy.tags), observe.source())
-                    {
-                        cache.observe(&scope, source, &raw_pairs, t_tail);
+                    match (
+                        in_pool,
+                        observe.teaches(&group.policy.tags),
+                        observe.source(),
+                    ) {
+                        (true, true, Some(_)) => pool_raw.extend(raw_pairs.iter().cloned()),
+                        (false, true, Some(source)) => {
+                            cache.observe(&scope, source, &raw_pairs, t_tail)
+                        }
+                        _ => {}
                     }
                     (normed, normed_q)
                 };
@@ -2300,6 +2326,14 @@ impl Conversation {
                     }
                 }
                 group_raw.extend_from_slice(&mass_base_per_file[fi]);
+            }
+            if let (false, Some(source)) = (pool_raw.is_empty(), observe.source()) {
+                self.normalization.lock().unwrap().observe(
+                    &pool_scope,
+                    source,
+                    &pool_raw,
+                    probe.len(),
+                );
             }
             if cands.is_empty() {
                 continue;

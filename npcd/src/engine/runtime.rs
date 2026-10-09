@@ -30,9 +30,12 @@ use std::time::{Duration, Instant};
 use futures::executor::block_on;
 use tokio::sync::oneshot;
 
+use candle_conversation::guest::resolve_seed;
 use candle_conversation::persistence::record::CustomObjectPayload;
 use candle_conversation::persistence::SharedSubstrate;
-use candle_conversation::projection::{Builder, ProjectionEvent, SelectionState};
+use candle_conversation::projection::{
+    Builder, GroupId, LayerId, ProjectionEvent, SelectionState, TimelineId,
+};
 use candle_conversation::{
     ConversationEngine, Sequence, SequenceConfig, TurnEvent, TurnHandle, TurnResponse,
 };
@@ -64,7 +67,9 @@ use crate::effector::station;
 use crate::effector::token::Tokens;
 use crate::engine::act::Act;
 use crate::engine::authoring;
+use crate::engine::bearings;
 use crate::engine::body::{self, Outcome};
+use crate::engine::compose;
 use crate::engine::driver::{self, Metronome};
 use crate::engine::environment;
 use crate::engine::event::{Event, EventKind, Salience};
@@ -79,21 +84,32 @@ use crate::engine::journal::workflow::{Outcome as Drafted, Timing};
 use crate::engine::journal::world::Snapshot;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
+use crate::engine::loopguard::{salient, Took, NUDGE};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
+use crate::engine::mind_record;
 use crate::engine::mission::{
-    compass_line, compass_report_line, progress_line, Aim, Mission, MissionPrompt,
+    compass_line, compass_report_line, doc_compass, progress_line, time_compass, time_step, Aim,
+    DeskVerbs, DocStep, Mission, MissionPrompt,
 };
 use crate::engine::mission_acts;
+use crate::engine::mission_gen;
+use crate::engine::mission_gen::config::Config;
+use crate::engine::mission_gen::material::strip_calls;
 use crate::engine::prompt::{self, Persona};
+use crate::engine::prose::{decode_call, CallAsk};
 use crate::engine::reflect;
 use crate::engine::schema;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
-use crate::engine::watcher::Ledger;
+use crate::engine::watcher::{self, Ledger, Reconcile};
+use crate::engine::witnessed;
+use crate::engine::work;
 use crate::mind::Mind;
 use crate::model;
 use crate::npcs::{Casting, Npcs};
+use crate::sim::bench::Benches;
 use crate::sim::missions::Missions;
+use crate::sim::Sim;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
 use npc_map::schema::NodeKind;
@@ -412,9 +428,16 @@ pub struct Runtime {
     /// Each world's missions as last written to the substrate, so a beat that
     /// changed nothing writes nothing.
     missions_saved: Mutex<BTreeMap<String, Missions>>,
+    /// Each world's benches — the uncommitted working sets — as last written
+    /// to the substrate, for the same reason.
+    benches_saved: Mutex<BTreeMap<String, Benches>>,
     /// Each character's mission compass as last told to it — see
     /// [`Runtime::mission_compass`] — so it is told again only when it changes.
     compass_told: Mutex<HashMap<u64, String>>,
+    /// The chapter — missions closed — each character's last turn was taken
+    /// in, so the turn after a hand-in closes the chapter in its journal before
+    /// its new conversation opens. See [`Runtime::turn_chapter`].
+    chapters: Mutex<HashMap<u64, u64>>,
     /// The characters with a dream being written — from the moment their
     /// reflection's first question is answered to the moment the dream is kept.
     /// §7: *"At most one dream in flight per character."*
@@ -447,9 +470,8 @@ pub struct Runtime {
     pub cooldowns: crate::engine::cooldown::Cooldowns,
     /// How each character is kept out of a behavioural loop, in turns rather than
     /// in real time — the counterpart to [`Self::cooldowns`], which paces the
-    /// body. Exponential cooldown on a repeated act, a protected set that keeps
-    /// a character interacting, and a closeness breaker that forces a reflect
-    /// when an act loops in all but wording. See [`crate::engine::loopguard`].
+    /// body. An act taken again meaning the same as one of its last takings is
+    /// struck, for longer while the loop goes on. See [`crate::engine::loopguard`].
     pub loop_guards: crate::engine::loopguard::LoopGuards,
     /// Set on shutdown so every character task stops at its next wait rather
     /// than being killed mid-tick with a half-written turn.
@@ -597,6 +619,64 @@ fn missions_key(world: &str) -> String {
     format!("missions/{world}")
 }
 
+/// Substrate key for one world's benches — see [`Runtime::checkpoint_benches`].
+fn benches_key(world: &str) -> String {
+    format!("benches/{world}")
+}
+
+/// How many words of the mission's document `body`'s working copy holds,
+/// uncommitted, when `doc` is the step that writes it and that is up to the
+/// mission's floor — see [`doc_compass`].
+fn written_up_to_floor(s: &Sim, body: &str, mission: &Mission, doc: &DocStep) -> Option<usize> {
+    let DocStep::Write(p) = doc else {
+        return None;
+    };
+    let work = mission.work.as_ref()?;
+    if work.min_words == 0 || !p.eq_ignore_ascii_case(&work.writes) {
+        return None;
+    }
+    let changed = s
+        .bench
+        .opened(body)?
+        .changed()
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&work.writes));
+    if !changed {
+        return None;
+    }
+    let words = s
+        .bench
+        .read(body, &work.writes)
+        .ok()?
+        .split_whitespace()
+        .count();
+    (words >= work.min_words).then_some(words)
+}
+
+/// The mind paths of every document an operation in `worlds` has not finished
+/// with — drafting, reading, reviewing or checking it — read from the missions
+/// each world saved,
+/// because the worlds themselves are not loaded until the cast wakes, after the
+/// mind is ingested.
+fn held_drafts<'a>(rt: &Runtime, worlds: impl Iterator<Item = &'a str>) -> HashSet<String> {
+    let Some(shared) = rt.substrate.read().unwrap().clone() else {
+        return HashSet::new();
+    };
+    let worlds: HashSet<&str> = worlds.collect();
+    worlds
+        .into_iter()
+        .filter_map(|w| shared.custom_object(&missions_key(w)))
+        .filter_map(|o| serde_json::from_value::<Missions>(o.blob).ok())
+        .flat_map(|m| {
+            m.operations()
+                .all()
+                .filter(|o| !o.phase.finished())
+                .map(|o| o.document.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// What a character with no mission is set on **while the command table is
 /// open**: go to it and take one up.
 ///
@@ -613,8 +693,8 @@ pub const TO_THE_TABLE: &str =
     "The command table is open and there is work waiting for you. Leave off \
      whatever you are doing or saying and go to it now. The table is in the \
      command room, on the command level: if you are on another floor, go to the \
-     lift, call it with `lift_call`, ride it to the command level with \
-     `lift_use`, and then `move_to` the command room — you cannot walk between \
+     lift, ride it to the command level with `lift_use` — it calls the car and \
+     waits for it — and then `move_to` the command room; you cannot walk between \
      floors. This comes before talk — do not answer the room, go. Once you are \
      there, the table is on your effector device: `scan` to see what it offers, \
      then take up a mission by `invoke` on its `collect_mission`. Carry it out, \
@@ -656,6 +736,21 @@ pub const REPORT_AT_THE_TABLE: &str =
      what you found — or its `report_stuck` with what stopped you. Do not take up \
      another until it is reported.";
 
+/// [`REPORT_AT_THE_TABLE`] for a **review**, whose report is a verdict.
+///
+/// **A review has nothing to find; it has a judgement to give.** Told to report
+/// "exactly what you found", a reviewer that had read the draft and corrected a
+/// title stood at the table saying there was "nothing substantive to report" —
+/// it was looking for a discovery, and a review's answer is pass or reject.
+pub const VERDICT_AT_THE_TABLE: &str =
+    "You are at the command table and you have read the draft you were sent to \
+     review. Give your verdict now, here. If it can stand — as you found it, or \
+     with what you mended — `invoke` the table's `report_done` saying what you \
+     checked and what, if anything, you changed; \"I checked its dates against \
+     the era and its voice against the life, and corrected its title\" is a whole \
+     report. If it cannot stand, `invoke` the table's `report_rejected` saying \
+     why. Nothing more is needed from you than that judgement.";
+
 /// How long a character must go without news before the standing task is
 /// restated to it.
 ///
@@ -678,6 +773,13 @@ const IDLE_AFTER_MS: u64 = 90_000;
 /// window it stops being read as work and becomes a pattern the character
 /// remarks on instead of obeying.
 const SUMMONS_AFTER_MS: u64 = 30_000;
+
+/// How long a character due a turn waits for the engine and its persona when
+/// either is not there yet — at boot, before the model has loaded.
+const UNREADY_RETRY: Duration = Duration::from_secs(2);
+
+/// How long after a failed decode the turn is tried again, on the same events.
+const DECODE_RETRY_MS: u64 = 5_000;
 
 /// The same instruction, for a character that is not alone.
 ///
@@ -768,7 +870,9 @@ impl Runtime {
             metronomes: Mutex::new(BTreeMap::new()),
             places: Mutex::new(BTreeMap::new()),
             missions_saved: Mutex::new(BTreeMap::new()),
+            benches_saved: Mutex::new(BTreeMap::new()),
             compass_told: Mutex::new(HashMap::new()),
+            chapters: Mutex::new(HashMap::new()),
             dreaming: Mutex::new(HashSet::new()),
             reflect_domain: AtomicUsize::new(0),
             feelings: RwLock::new(Vec::new()),
@@ -843,12 +947,26 @@ impl Runtime {
                 .unwrap()
                 .insert(id.to_string(), missions.clone());
         }
+        let benches = self.substrate.read().unwrap().clone().and_then(|shared| {
+            let obj = shared.custom_object(&benches_key(id))?;
+            serde_json::from_value::<Benches>(obj.blob).ok()
+        });
         world.with_sim(|s| {
             s.table_open = open;
             if let Some(missions) = restored {
                 s.missions = missions;
             }
+            if let Some(benches) = benches {
+                s.bench.restore(benches);
+            }
         });
+        // What was just restored is what the substrate holds: the first beat
+        // writes only what has changed since.
+        let restored_benches = world.with_sim(|s| s.bench.clone());
+        self.benches_saved
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), restored_benches);
         let back = Arc::downgrade(self);
         let name = id.to_string();
         let moving = world.clone();
@@ -867,6 +985,7 @@ impl Runtime {
                 rt.checkpoint_places(&moving);
             }
             rt.checkpoint_missions(&moving);
+            rt.checkpoint_benches(&moving);
         });
         self.metronomes.lock().unwrap().insert(name, beat);
         Ok(world)
@@ -1103,6 +1222,20 @@ impl Runtime {
         if !self.at_command_table(npc_id) {
             return None;
         }
+        // **The table hands its work to whoever stands at it free.** Told every
+        // tick to take one up, Makers stood at the open table with operations
+        // waiting, scanned it, reflected, rode the lift and came back — forty
+        // minutes without one collected, thirty-five reviews waiting. A Maker
+        // free at the open table is given the next operation's mission it may
+        // take, and reads its brief.
+        if hosted.sim(|s| {
+            s.table_open && !s.missions.is_on_mission(&body) && s.missions.has_pooled_for(&body)
+        }) {
+            return Some(format!(
+                "The table hands you the next piece of work, and you take it up.\n{}",
+                work::take_up(&hosted, &body)
+            ));
+        }
         // The exact address, for a mission set for this character by name: the
         // general call to take one up was read past, turn after turn, by a
         // character that walked in and out of the table room on other business.
@@ -1111,6 +1244,21 @@ impl Runtime {
             .into_iter()
             .find(|i| i.act == mission_acts::COLLECT_MISSION.name)
             .map(|i| i.url);
+        // **"Report it now" only when the report will be taken.** A Maker told
+        // every tick that all but the report was done, and refused at every
+        // report by the quality gate, went round until it said it wanted to
+        // scream. With its work done but the document not yet able to stand,
+        // it is told what is in the way instead.
+        let work_done = hosted.sim(|s| {
+            s.missions
+                .active(&body)
+                .is_some_and(|m| !m.todo.is_empty() && m.next_step().is_none_or(|t| t.reports))
+        });
+        if work_done {
+            if let Some(block) = work::report_block(&hosted, &body) {
+                return Some(block);
+            }
+        }
         hosted.sim(|s| match s.missions.active(&body) {
             None if s.missions.has_lodged(&body) => Some(match &collect {
                 Some(url) => format!(
@@ -1122,6 +1270,13 @@ impl Runtime {
             None => s.table_open.then(|| AT_THE_TABLE.to_string()),
             // A mission carried on its ask alone has no steps to have done, so
             // it is not told they are.
+            Some(m)
+                if !m.todo.is_empty()
+                    && m.next_step().is_none_or(|t| t.reports)
+                    && m.operation().is_some_and(|(_, stage)| stage.judges()) =>
+            {
+                Some(VERDICT_AT_THE_TABLE.to_string())
+            }
             Some(m) => (!m.todo.is_empty() && m.next_step().is_none_or(|t| t.reports)).then(|| {
                 match m.observed.is_empty() {
                     true => REPORT_AT_THE_TABLE.to_string(),
@@ -1165,7 +1320,12 @@ impl Runtime {
                 .filter(|t| !t.done)
                 .map(|t| t.text.clone())
                 .collect();
-            let arrived = s.missions.arrived_in(&body, &room);
+            let level = w
+                .map()
+                .get(&at.area)
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            let arrived = s.missions.arrived_in(&body, &room, &level);
             let names: Vec<String> = here.iter().map(|(n, _)| n.clone()).collect();
             let read = s.missions.read_off(&body, &names);
             // Whoever is in the room with it: a step to find them is met.
@@ -1235,7 +1395,23 @@ impl Runtime {
     pub fn mission_compass(&self, npc_id: u64) -> Option<String> {
         let (hosted, body) = self.body_of(npc_id)?;
         let at_table = self.at_command_table(npc_id);
+        // The desk's own addresses, for a step about a document — read before
+        // the world is borrowed below, which this also reads.
+        let urls = self.invokable_urls(&hosted, &body);
+        let url_of = |act: &str| urls.iter().find(|i| i.act == act).map(|i| i.url.clone());
+        let desk = DeskVerbs {
+            read: url_of("file_read"),
+            compose: url_of("compose"),
+            edit: url_of("file_edit"),
+            commit: url_of("bench_commit"),
+        };
         hosted.with_both(|w, s| {
+            // Riding the lift, there is nothing to do but arrive: told the way
+            // from the landing it is still standing on, a rider tried to call
+            // the car it was already in.
+            if w.riding(&body).is_some() {
+                return None;
+            }
             let mission = s.missions.active(&body)?;
             let next = mission.next_step()?.clone();
             let here = w.actor(&body)?.at.clone();
@@ -1254,12 +1430,12 @@ impl Runtime {
                 let at_lift = w.node(&here).is_some_and(|n| n.kind == NodeKind::Core);
                 Some(match at_lift {
                     true => format!(
-                        "{room}, on {level}. You are at the lift: `lift_call` it if it is not \
-                         here, then `lift_use` naming {level}, then `move_to` {room}"
+                        "{room}, on {level}. You are at the lift: `lift_use` naming {level} — it \
+                         calls the car and waits for it if it is not here — then `move_to` {room}"
                     ),
                     false => format!(
-                        "{room}, on {level}: `move_to` the lift, `lift_call` it, `lift_use` \
-                         naming {level}, then `move_to` {room}"
+                        "{room}, on {level}: `move_to` the lift, `lift_use` naming {level}, then \
+                         `move_to` {room}"
                     ),
                 })
             };
@@ -1284,12 +1460,44 @@ impl Runtime {
                     table.as_deref(),
                     at_table,
                     &mission.observed,
+                    mission.operation().is_some_and(|(_, stage)| stage.judges()),
                 ));
+            }
+            if let Some(year) = time_step(&next.text) {
+                let has_machine = |at: &Where| {
+                    w.node(at).is_some_and(|n| {
+                        w.map()
+                            .parts_at(n)
+                            .any(|(part, _)| part.id == "time-machine")
+                    })
+                };
+                let here_has = has_machine(&here);
+                let way = (!here_has)
+                    .then(|| reach.iter().find(|at| has_machine(at)).and_then(&way_to))
+                    .flatten();
+                return Some(time_compass(year, here_has, way.as_deref()));
+            }
+            if let Some(doc) = DocStep::of(&next.text) {
+                // The nearest desk that reads documents, when this is not one.
+                let way = (desk.read.is_none())
+                    .then(|| {
+                        reach
+                            .iter()
+                            .find(|at| s.part_offers(&place(at), "file_read"))
+                            .and_then(&way_to)
+                    })
+                    .flatten();
+                let written = written_up_to_floor(s, &body, mission, &doc);
+                return Some(doc_compass(&doc, &desk, way.as_deref(), written));
             }
             let way = Aim::of(&next.text).and_then(|aim| {
                 let target = reach
                     .iter()
-                    .find(|at| w.node(at).is_some_and(|n| aim.is_room(&n.name)))
+                    .find(|at| {
+                        let level = w.map().get(&at.area).map(|a| a.name.as_str());
+                        w.node(at)
+                            .is_some_and(|n| aim.is_room(&n.name, level.unwrap_or_default()))
+                    })
                     .or_else(|| {
                         let d = s.devices.iter().find(|d| aim.is_machine(&d.name))?;
                         reach.iter().find(|at| place(at) == d.at)
@@ -1307,6 +1515,38 @@ impl Runtime {
             let way = way.map(|w| format!("It is in {w}."));
             Some(compass_line(&next, &people, way.as_deref()))
         })
+    }
+
+    /// The chapter this character's turn is taken in — how many missions it has
+    /// closed — closing the last one in its journal first when a mission has
+    /// been handed in since its last turn. `0` for a character with no body.
+    ///
+    /// **The work, carried across.** The turn after a hand-in opens a new
+    /// conversation (`Minds::think`); the journal is what crosses with it, so the
+    /// mission just closed is written into it — by the engine, from the
+    /// mission's record — before the turn's persona reads it.
+    pub fn turn_chapter(&self, npc_id: u64, world_ms: u64) -> u64 {
+        let Some((hosted, body)) = self.body_of(npc_id) else {
+            return 0;
+        };
+        let (chapter, closed) = hosted.sim(|s| {
+            (
+                s.missions.chapter(&body),
+                s.missions.last_closed(&body).cloned(),
+            )
+        });
+        let before = self.chapters.lock().unwrap().insert(npc_id, chapter);
+        let turned = before.is_some_and(|b| b < chapter);
+        if let (true, Some(mission)) = (turned, closed) {
+            if self
+                .scheduler
+                .journal_close_chapter(npc_id, &mission, world_ms)
+                .is_some()
+            {
+                tracing::info!(npc_id, chapter, "journal: a mission's chapter closed");
+            }
+        }
+        chapter
     }
 
     /// The mission compass, when it says something this character has not
@@ -1363,6 +1603,14 @@ impl Runtime {
                 &[],
             ))
         })
+    }
+
+    /// Let the room see that something standing in it refused this character.
+    /// See [`witnessed::show`].
+    fn show_refusal(&self, npc_id: u64, act: &Act, answer: &str) {
+        if let Some((hosted, body)) = self.body_of(npc_id) {
+            witnessed::show(&hosted, &body, act, answer);
+        }
     }
 
     /// Whether this character stands where a mission is taken up — i.e. the order
@@ -1545,6 +1793,15 @@ impl Runtime {
             // Never where it stands — see [`body::reachable`]. Walking to your
             // own room was refused, and refusal is not a lesson.
             places: body::reachable(&hosted, &body),
+            parts: hosted.read(|w| {
+                let Some(node) = w.actor(&body).and_then(|a| w.node(&a.at)) else {
+                    return Vec::new();
+                };
+                w.map()
+                    .parts_at(node)
+                    .map(|(part, _)| part.id.clone())
+                    .collect()
+            }),
             // What this body has done too recently to do again, and what the
             // loop guard has struck to break a repetition. Both asked here, at
             // the one place a situation is composed, so no route can build a
@@ -1609,12 +1866,7 @@ impl Runtime {
     fn invokable_urls(&self, hosted: &Arc<Hosted>, body: &str) -> Vec<Invokable> {
         let mut invoke = Vec::new();
         // Only what this body can do here — see [`mission_acts::offered`].
-        let (on_mission, holds_order) = hosted.sim(|s| {
-            (
-                s.missions.is_on_mission(body),
-                !s.ledger.held_by(body).is_empty(),
-            )
-        });
+        let carrying = hosted.sim(|s| mission_acts::carrying(s, body));
         hosted.read(|w| {
             if let Some(at) = w.actor(body).map(|a| a.at.clone()) {
                 for inst in w.map().instances_at(&at) {
@@ -1622,7 +1874,7 @@ impl Runtime {
                         continue;
                     };
                     for (verb, tool) in station::verbs_at(inst.part_id()) {
-                        if mission_acts::offered(tool.name, on_mission, holds_order) {
+                        if mission_acts::offered(tool.name, carrying) {
                             invoke.push(Invokable::new(format!("{url}/{verb}"), tool.name));
                         }
                     }
@@ -1734,9 +1986,89 @@ impl Runtime {
         let moment = environment::advance(hosted, &self.bodies, &self.scheduler, &|id| {
             self.world_ms(id)
         });
+        for (npc_id, _) in self.bodies.in_world(hosted.id()) {
+            self.standing_task(npc_id);
+        }
+        // Whoever an operation called off has stood down is told, whatever
+        // called it off — see [`crate::sim::missions::Missions::take_stood_down`].
+        for body in hosted.with_sim(|s| s.missions.take_stood_down()) {
+            if let Some(npc_id) = self.bodies.mind_of(hosted.id(), &body) {
+                self.scheduler.deliver(
+                    npc_id,
+                    self.world_ms(npc_id),
+                    Salience::URGENT,
+                    EventKind::Nudge {
+                        text: MISSION_WITHDRAWN.to_string(),
+                    },
+                );
+            }
+        }
         self.keep_visitors_with_their_hosts(hosted);
         self.show_out_the_expired();
         moment
+    }
+
+    /// What this character is set on, restated when it has gone quiet.
+    ///
+    /// **Asked on the world's clock, not the character's.** It used to be asked
+    /// at the head of the character's own turn — which only comes when
+    /// something wakes it, so a character with nothing waking it was never
+    /// asked, and the standing task written for exactly that character never
+    /// reached it. Every other way of being stranded ended here with nothing to
+    /// rescue it. Asked from the moment, every bound character is, and the
+    /// delivery itself is the wake.
+    ///
+    /// **Only after a stretch of quiet.** Gated on an empty inbox it never
+    /// fired, because the situation is re-sent every moment; ungated it landed
+    /// inside conversations, at the most recent position in the window, telling
+    /// a character mid-conversation that nothing had been asked of it — two
+    /// characters alternated for a hundred turns that way. So two clocks, both
+    /// [`IDLE_AFTER_MS`]: quiet since anything happened, and since the task
+    /// was last restated (without the second the gate latches open, because the
+    /// task is not news).
+    ///
+    /// **The table's active summons rides its own, shorter clock**
+    /// ([`SUMMONS_AFTER_MS`], since last restated alone) and is URGENT, so it
+    /// reaches a free character deep in conversation that the quiet gate never
+    /// would — but not every turn, or the character fixates on the repetition
+    /// instead of going.
+    ///
+    /// **A character with a mission is told its next step.** Its brief is in
+    /// its prompt, so the brief is not restated; but a Maker gone quiet at its
+    /// desk had nothing at all to bring it back, and the next step — what to do
+    /// now — is what it needs.
+    fn standing_task(&self, npc_id: u64) {
+        let world_ms = self.world_ms(npc_id);
+        // Asked twice a second for everybody, so the clock first: neither gate
+        // opens before the shorter one has, and reading the way to the table is
+        // a route search.
+        if !self
+            .scheduler
+            .summons_due(npc_id, world_ms, SUMMONS_AFTER_MS)
+        {
+            return;
+        }
+        let summons = self.table_summons(npc_id);
+        let (gate_after, salience, text) = match &summons {
+            Some(t) => (SUMMONS_AFTER_MS, Salience::URGENT, Some(t.clone())),
+            None => (
+                IDLE_AFTER_MS,
+                Salience::IDLE,
+                self.nudge_for(npc_id)
+                    .or_else(|| self.mission_compass(npc_id)),
+            ),
+        };
+        let Some(text) = text else {
+            return;
+        };
+        let due = match summons.is_some() {
+            true => self.scheduler.summons_due(npc_id, world_ms, gate_after),
+            false => self.scheduler.nudge_due(npc_id, world_ms, gate_after),
+        };
+        if due {
+            self.scheduler
+                .deliver(npc_id, world_ms, salience, EventKind::Nudge { text });
+        }
     }
 
     /// Take out the bodies of anybody whose conversation has gone quiet.
@@ -1929,14 +2261,33 @@ impl Runtime {
     /// contents written into its window, went to sleep, and read the board again
     /// the next time anything woke it.
     ///
-    /// Only [`body::ANSWERS`], never every act. A free follow-up after *any* act
-    /// is the treadmill: a character that speaks and is immediately asked again
-    /// speaks again, into the same silence, until its own window holds nothing
-    /// but its own voice.
-    fn arm_followup(&self, npc_id: u64, act: &Act) {
-        if body::answers(act.tool) {
+    /// The same holds for a refusal and for work on a document — the world said
+    /// something back — and not for speech, which is the treadmill: a
+    /// character that speaks and is immediately asked again speaks again, into
+    /// the same silence, until its own window holds nothing but its own voice.
+    /// [`body::continues`] holds the rule.
+    ///
+    /// **Whatever the act, one that `moved` the mission comes straight back.**
+    /// A word that signed a step off, a time machine set, a mission taken up
+    /// or handed in: each is answered with what comes next, and that is the
+    /// world answering, not the character talking.
+    fn arm_followup(&self, npc_id: u64, act: &Act, landed: bool, moved: bool) {
+        if moved || body::continues(act, landed) {
             self.scheduler.think_again(npc_id);
         }
+    }
+
+    /// Where this character's mission stands — which one it carries, and how
+    /// many of its steps are done — or `None` with none. Two reads either side
+    /// of an act that differ mean the act moved the mission: a step signed off,
+    /// a mission taken up or handed in.
+    fn mission_mark(&self, npc_id: u64) -> Option<(String, usize)> {
+        let (hosted, body) = self.body_of(npc_id)?;
+        hosted.sim(|s| {
+            s.missions
+                .active(&body)
+                .map(|m| (m.prompt.clone(), m.todo.iter().filter(|t| t.done).count()))
+        })
     }
 
     /// The world and body a character acts through, if it has one.
@@ -2229,6 +2580,157 @@ impl Runtime {
         Ok((status, value))
     }
 
+    /// Enact `compose`: the character sits down and writes its mission's piece
+    /// in one sitting. See [`compose`].
+    ///
+    /// The mind's writing voice is put the brief, every document the mission
+    /// sent the character to read, and the piece as it stands when there is
+    /// one — in a conversation opened for the sitting, not on the character's
+    /// own — and answers with the whole piece; that goes into the character's
+    /// working set through `file_write` — the same act, held to the same checks
+    /// — and the character is told to read it back, mend it and commit it.
+    pub(crate) async fn compose(&self, npc_id: u64, act: &Act) -> Recorded {
+        let refused = |why: String| Recorded {
+            feed: format!("{} {REFUSED} {why}", act.summary()),
+            answer: why,
+            landed: false,
+            departing: false,
+        };
+        let Some((hosted, body)) = self.body_of(npc_id) else {
+            return refused("There is nothing here to write at.".into());
+        };
+        let job = hosted.sim(|s| {
+            let m = s.missions.active(&body)?;
+            let w = m.work.as_ref()?;
+            let root = s.bench.mind_root()?.to_path_buf();
+            let written = written_up_to_floor(s, &body, m, &DocStep::Write(w.writes.clone()));
+            Some((
+                m.prompt.clone(),
+                w.writes.clone(),
+                w.reads.clone(),
+                w.min_words,
+                root,
+                w.anew,
+                written,
+            ))
+        });
+        let Some((brief, writes, reads, min_words, root, anew, written)) = job else {
+            return refused("You carry no piece of work to write.".into());
+        };
+        // **A written piece is not written over.** Back from a restart with
+        // its piece composed and uncommitted, a Maker sat straight down and
+        // composed it again from nothing, every time.
+        if let Some(words) = written {
+            return refused(compose::already_written(&writes, words));
+        }
+        // The piece as the record has it — what the table read — never the
+        // Maker's own working copy, which holds whatever it last typed by hand;
+        // and nothing when the piece is to be written anew.
+        let standing = match anew {
+            true => None,
+            false => std::fs::read_to_string(root.join(&writes))
+                .ok()
+                .map(|t| strip_calls(&t)),
+        };
+        let sources: Vec<(String, String)> = reads
+            .iter()
+            .filter(|p| **p != writes)
+            .filter_map(|p| {
+                let text = std::fs::read_to_string(root.join(p)).ok()?;
+                Some((
+                    p.clone(),
+                    compose::cut(&strip_calls(&text), compose::SOURCE_WORDS),
+                ))
+            })
+            .collect();
+        let question = compose::question(&brief, &writes, min_words, &sources, standing.as_deref());
+        let Some(minds) = self.minds.read().unwrap().clone() else {
+            return refused("You cannot settle to write yet.".into());
+        };
+        let voice = match Config::load(&root) {
+            Ok(Some(config)) => config.writing,
+            Ok(None) => return refused("Nothing here says how this record is written.".into()),
+            Err(e) => return refused(format!("You cannot settle to write: {e}")),
+        };
+        let (engine, base) = (minds.engine(), minds.base_config());
+        let calls = [compose::spec()];
+        // One sitting writes the whole piece: one that comes in short of its
+        // floor is carried on from where it stopped — see `compose::fuller` —
+        // and what comes next is put after it.
+        let mut asked = question.clone();
+        let mut text: Option<String> = None;
+        for _ in 0..compose::SITTINGS {
+            let ask = CallAsk {
+                system: &voice,
+                prompt: &asked,
+                calls: &calls,
+                max_tokens: compose::COMPOSE_TOKENS,
+                temperature: None,
+                seed: resolve_seed(None),
+            };
+            let raw = match decode_call(&engine, &base, &ask).await {
+                Ok(raw) => raw,
+                Err(e) if text.is_none() => {
+                    return refused(format!("You sat down to write and could not: {e}"))
+                }
+                Err(_) => break,
+            };
+            let Some(written) = compose::read(&raw) else {
+                break;
+            };
+            let written = compose::unlabelled(&written, &writes);
+            // A sitting that wrote nothing but the file's name wrote nothing.
+            if written.trim().is_empty() {
+                break;
+            }
+            let piece = match &text {
+                Some(so_far) => compose::joined(so_far, &written),
+                None => written,
+            };
+            let words = piece.split_whitespace().count();
+            if words >= min_words {
+                text = Some(piece);
+                break;
+            }
+            asked = compose::fuller(&question, &piece, words, min_words);
+            text = Some(piece);
+        }
+        let Some(text) = text else {
+            return refused(
+                "You sat down to write and nothing came. Read your brief and your sources again, \
+                 and sit down to it again."
+                    .into(),
+            );
+        };
+        let words = text.split_whitespace().count();
+        let write = Act {
+            tool: "file_write",
+            args: json!({ "path": writes, "content": text })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let wrote = self.record_act(npc_id, &write);
+        if !wrote.landed {
+            return refused(wrote.answer);
+        }
+        tracing::info!(npc_id, %writes, words, "composed a draft");
+        Recorded {
+            feed: format!(
+                "{} {LANDED} wrote {writes} through, {words} words",
+                act.summary()
+            ),
+            answer: format!(
+                "You sat down with your brief and your sources open and wrote {writes} through: \
+                 {words} words, in your working copy. Read it back with `file_read`. If it \
+                 stands, `bench_commit` it; where one passage in it is wrong, put that passage \
+                 right with `file_edit` — not the rest."
+            ),
+            landed: true,
+            departing: false,
+        }
+    }
+
     /// Enact one effector-device call — `invoke` — on the async fast path and
     /// build the same [`Recorded`] a body act produces through
     /// [`Self::record_act`], so the character reads a device call's outcome back
@@ -2271,6 +2773,18 @@ impl Runtime {
             .trim()
             .to_string();
         let path = device_path(&url);
+        // A desk's `compose`, reached through the device, is the same sitting
+        // down to write as the act itself — at an address this character is
+        // offered `compose` at, not any url that happens to end in the word.
+        let composes_here = path.rsplit('/').next().is_some_and(body::composes)
+            && self
+                .within(npc_id)
+                .invokable
+                .iter()
+                .any(|i| device_path(&i.url) == path && body::composes(i.act));
+        if composes_here {
+            return self.compose(npc_id, act).await;
+        }
 
         match act.tool {
             "invoke" => {
@@ -2437,6 +2951,33 @@ impl Runtime {
         }
     }
 
+    /// Write a world's benches to the substrate when they differ from what was
+    /// last written, so a reboot finds every body's uncommitted working set as
+    /// it stood — see [`Benches::restore`].
+    fn checkpoint_benches(&self, hosted: &Hosted) {
+        let Some(shared) = self.substrate.read().unwrap().clone() else {
+            return;
+        };
+        let now = hosted.with_sim(|s| s.bench.clone());
+        let mut saved = self.benches_saved.lock().unwrap();
+        if saved.get(hosted.id()) == Some(&now) {
+            return;
+        }
+        let blob = match serde_json::to_value(&now) {
+            Ok(blob) => blob,
+            Err(e) => {
+                tracing::warn!("encoding benches failed: {e}");
+                return;
+            }
+        };
+        match shared.put_custom_object(CustomObjectPayload::new(benches_key(hosted.id()), blob)) {
+            Ok(()) => {
+                saved.insert(hosted.id().to_string(), now);
+            }
+            Err(e) => tracing::warn!("persisting benches failed: {e}"),
+        }
+    }
+
     /// Supply the already-open substrate for the engine to adopt. Called once
     /// at startup, before [`start`], with the handle
     /// [`crate::npcs::Npcs::load`] opened.
@@ -2503,17 +3044,22 @@ impl Runtime {
                 &mut |_| true,
             )
             .await?;
-        if let (Some(brief), Some(assumption)) = (r.brief.clone(), r.assumption.clone()) {
-            let rt = Arc::clone(self);
-            match &self.spawner {
-                Some(handle) => {
-                    handle
-                        .spawn(async move { rt.dream_if_free(npc_id, &brief, &assumption).await });
+        match r.dream() {
+            Ok((brief, assumption)) => {
+                let (brief, assumption) = (brief.to_string(), assumption.to_string());
+                let rt = Arc::clone(self);
+                match &self.spawner {
+                    Some(handle) => {
+                        handle.spawn(
+                            async move { rt.dream_if_free(npc_id, &brief, &assumption).await },
+                        );
+                    }
+                    None => tracing::warn!(
+                        "npc {npc_id}: the dream could not be started — no async runtime"
+                    ),
                 }
-                None => tracing::warn!(
-                    "npc {npc_id}: the dream could not be started — no async runtime"
-                ),
             }
+            Err(why) => tracing::warn!("npc {npc_id}: no dream from this reflection — {why}"),
         }
         Ok(r)
     }
@@ -2603,11 +3149,11 @@ impl Runtime {
             .await
         {
             Ok(kept) => tracing::info!(
-                "npc {npc_id}: dreamt, {} line(s) kept in {:?} — {} dream(s) now:\n{}",
-                kept.lines.len(),
+                "npc {npc_id}: dreamt, {} passage(s) kept in {:?} — {} dream(s) now:\n{}",
+                kept.passages.len(),
                 started.elapsed(),
                 minds.dreams_kept(npc_id),
-                kept.lines.join("\n"),
+                kept.passages.join("\n\n"),
             ),
             Err(e) => tracing::warn!("npc {npc_id}: the dream was not kept — {e:#}"),
         }
@@ -2919,9 +3465,9 @@ impl Runtime {
             );
             return;
         }
-        match (r.brief.as_deref(), r.assumption.as_deref()) {
-            (Some(brief), Some(assumption)) => self.dream_now(npc_id, brief, assumption).await,
-            _ => tracing::warn!("npc {npc_id}: the reflection produced no brief, so no dream"),
+        match r.dream() {
+            Ok((brief, assumption)) => self.dream_now(npc_id, brief, assumption).await,
+            Err(why) => tracing::warn!("npc {npc_id}: no dream from this reflection — {why}"),
         }
     }
 
@@ -2945,6 +3491,10 @@ impl Runtime {
         if let Some(minds) = minds {
             minds.deliver_outcomes(npc_id, owed.answers).await;
         }
+        // **And a turn to read it.** The tick that reflected has ended by
+        // now, unscheduled — a reflect earns no follow-up of its own — so the
+        // reflection and every answer it carried waited on the room.
+        self.scheduler.think_again(npc_id);
     }
 
     fn persona_of(&self, npc_id: u64) -> Option<OwnedPersona> {
@@ -3451,24 +4001,92 @@ fn load(
     // this thread has entered.
     match &rt.mind {
         Some(dir) => {
+            // ── what has left the record leaves memory ────────────────────
+            //
+            // Before anything is ingested: a document gone from disk — deleted,
+            // or a rejected draft moved to `rejected/` — and a draft an
+            // operation has not yet passed are retired from the substrate, and
+            // the ledger forgets them, so a passed draft is ingested afresh.
+            let held = held_drafts(rt, plan.cast.iter().map(|c| c.world_id.as_str()));
+            let mut out_of_record: Vec<PathBuf> = rt.ledger.missing();
+            out_of_record.extend(
+                held.iter()
+                    .map(|r| dir.join(r))
+                    .filter(|p| !matches!(rt.ledger.inspect(p, None), Reconcile::Unchanged)),
+            );
+            if !out_of_record.is_empty() {
+                let e = engine.lock().unwrap();
+                let retired: usize = out_of_record
+                    .iter()
+                    .filter_map(|p| mind_record::rel(dir, p))
+                    .map(|r| mind_record::retire(&e, &r))
+                    .sum();
+                drop(e);
+                for p in &out_of_record {
+                    rt.ledger.forget(p);
+                }
+                rt.ledger.flush();
+                tracing::info!(
+                    "mind: {} document(s) out of the record — {retired} conversation(s) retired",
+                    out_of_record.len()
+                );
+            }
+            let held_path = |p: &Path| mind_record::rel(dir, p).is_some_and(|r| held.contains(&r));
+            let mind_root: &Path = dir;
+
             let units = crate::projection::ingest_units(&rt.mind_handle);
             let sources = ingest::sources(dir, &units, &plan.characters);
             if sources.is_empty() {
                 tracing::info!("mind: no layer declares content to ingest");
             }
+            let mut shared_groups: Vec<(String, GroupId)> = Vec::new();
             for source in &sources {
-                let (turns, mut report) = ingest::pending(source, &rt.ledger)?;
+                // A shared layer's documents are written into its own group,
+                // and a projection targeting that layer reads only the document
+                // it is writing — as zend writes a file onto its ingest layer.
+                if let Some((p, (layer, group))) = projection
+                    .as_ref()
+                    .and_then(|p| Some((p, shared_target(p, source)?)))
+                {
+                    engine.lock().unwrap().mark_layer_append_only(layer);
+                    let moved = retire_misplaced(&engine, p.group, source, &rt.ledger);
+                    if moved > 0 {
+                        tracing::info!(
+                            "layer {}: {moved} document(s) were in the live group, where no \
+                             character could reach them — retired, to be written into the \
+                             layer's own group",
+                            source.label()
+                        );
+                    }
+                    shared_groups.push((source.name.clone(), group));
+                }
+                let (mut turns, mut report) = ingest::pending(source, &rt.ledger)?;
+                // An operation's draft enters memory when it is passed, not
+                // when it is written.
+                let owed = turns.len();
+                turns.retain(|t| !held_path(&t.path));
+                let held_back = owed - turns.len();
+                report.written -= held_back;
+                if held_back > 0 {
+                    tracing::info!(
+                        "layer {}: {held_back} draft(s) held back until their review passes",
+                        source.label()
+                    );
+                }
                 let total = turns.len();
                 ingest::announce(p, source, 0, total);
 
                 if total > 0 {
                     let failed = block_on(ingest_layer(
                         &engine,
+                        Record {
+                            mind: dir,
+                            ledger: &rt.ledger,
+                        },
                         &conv_config,
                         projection.as_ref(),
                         source,
                         &turns,
-                        &rt.ledger,
                         p,
                     ))?;
                     report.written -= failed;
@@ -3488,6 +4106,12 @@ fn load(
                 );
             }
 
+            // The shared layers are not warmed by self-match. Every document is
+            // one exchange, so a group's documents compete as one pool, and a
+            // document probed by its own signature is a ceiling no query
+            // reaches (`docs/provenance_score_normalization.md` §2). Their hit
+            // levels are learned from the characters' turns, at each seal.
+
             // ── the lives ──────────────────────────────────────────────────
             //
             // After the world, because a life is lived against it: an episode's
@@ -3500,7 +4124,8 @@ fn load(
             // formed at the point in the life where it formed, by the same
             // mechanism a belief would be formed at run time.
             for (who, dir) in life::lives(dir, &plan.characters) {
-                let (episodes, rejected) = life::episodes(&dir, &who);
+                let (mut episodes, rejected) = life::episodes(&dir, &who);
+                episodes.retain(|ep| !held_path(&ep.path));
                 for r in &rejected {
                     // A life with a hole in it is still a life, but the author
                     // has to be told which document fell out.
@@ -3514,6 +4139,7 @@ fn load(
                 p.set_progress(0, episodes.len() as u64);
                 match block_on(run_life(
                     &engine,
+                    mind_root,
                     &conv_config,
                     projection.as_ref(),
                     &who,
@@ -3537,6 +4163,41 @@ fn load(
                     Err(e) => tracing::warn!("life {who}: not run — {e:#}"),
                 }
                 rt.ledger.flush();
+            }
+
+            // ── what each bench draws on ───────────────────────────────────
+            //
+            // After the lives, which are written against the whole of the
+            // world: from here on a shared group offers a conversation only what
+            // the bearing it stands at draws on. See `bearings`.
+            match bearings::Bearings::read(dir) {
+                Ok(Some(b)) if !shared_groups.is_empty() => {
+                    let e = engine.lock().unwrap();
+                    let shelves: Vec<bearings::Shelf> = shared_groups
+                        .iter()
+                        .map(|(name, group)| bearings::Shelf::read(&e, name, *group))
+                        .collect();
+                    let scopes = bearings::Scopes::new(b, shelves);
+                    for group in scopes.groups() {
+                        e.mark_group_scoped(group);
+                    }
+                    drop(e);
+                    if let Some(minds) = rt.minds.read().unwrap().as_ref() {
+                        minds.set_scopes(scopes);
+                    }
+                    tracing::info!(
+                        "bearings: {} shared layer(s) drawn on by what stands where a character is",
+                        shared_groups.len()
+                    );
+                }
+                Ok(_) => tracing::info!(
+                    "bearings: none declared — every shared layer is drawn on everywhere"
+                ),
+                Err(e) => tracing::warn!(
+                    "bearings: {} could not be read ({e:#}) — every shared layer is drawn on \
+                     everywhere",
+                    bearings::FILE
+                ),
             }
         }
         None => tracing::info!("mind: none — nothing to ingest"),
@@ -3659,6 +4320,11 @@ fn load(
     // here is only that the load is over.
     p.mark_ready();
     tracing::info!("engine ready in {:?}", rt.uptime());
+
+    // The command table's generator, once there is a cast to set work for.
+    if rt_handle.is_some() {
+        mission_gen::run::spawn(Arc::clone(rt));
+    }
 
     supervise(rt);
     Ok(())
@@ -3785,17 +4451,80 @@ fn wipe_conversations(engine: &SharedEngine) -> usize {
     retired
 }
 
+/// Where an ingest records what it wrote: the mind's root, so each document's
+/// conversations are marked with its path (see `mind_record`), and the ledger.
+struct Record<'a> {
+    mind: &'a Path,
+    // Each document's hash is recorded **as its turn seals**, so a document that never
+    // reached the substrate is not claimed to be in it. See `ingest::Pending`.
+    ledger: &'a Ledger,
+}
+
+/// The shared layer group a source's documents are written to — see
+/// [`schema::document_target`]. `None` for a character's own content and for a
+/// layer with no group of its own, which keep the live target.
+fn shared_target(
+    p: &schema::Projection,
+    source: &ingest::LayerSource,
+) -> Option<(LayerId, GroupId)> {
+    match source.owner {
+        Some(_) => None,
+        None => schema::document_target(&p.builder, &source.name),
+    }
+}
+
+/// Retire `source`'s documents still standing in the live group, and have the
+/// ledger forget the source's files so they are written again — into their own
+/// layer's group. Answers how many conversations were retired.
+///
+/// **A timeline's group is fixed when it is created**, so a document written to
+/// the wrong group is moved by writing it again. Found by its tags, which every
+/// document's turn carries and no character's does.
+fn retire_misplaced(
+    engine: &SharedEngine,
+    live: GroupId,
+    source: &ingest::LayerSource,
+    ledger: &Ledger,
+) -> usize {
+    let e = engine.lock().unwrap();
+    let misplaced: Vec<TimelineId> = e
+        .group_conversations(live)
+        .into_iter()
+        .filter(|t| {
+            e.turn_tag_lists(*t)
+                .first()
+                .is_some_and(|tags| source.wrote(tags))
+        })
+        .collect();
+    let mut retired = 0;
+    for t in misplaced {
+        match e.tombstone_timeline(t) {
+            Ok(()) => retired += 1,
+            Err(err) => {
+                tracing::warn!("conversation {t} not retired from the live group — {err:?}")
+            }
+        }
+    }
+    drop(e);
+    if retired > 0 {
+        for file in watcher::walk(&source.dir).unwrap_or_default() {
+            ledger.forget(&file);
+        }
+        ledger.flush();
+    }
+    retired
+}
+
 async fn ingest_layer(
     engine: &SharedEngine,
+    record: Record<'_>,
     base_config: &SequenceConfig,
     proj: Option<&schema::Projection>,
     source: &ingest::LayerSource,
     turns: &[ingest::Pending],
-    // Each document's hash is recorded **as its turn seals**, so a document that never
-    // reached the substrate is not claimed to be in it. See `ingest::Pending`.
-    ledger: &Ledger,
     p: &LoadProgress,
 ) -> anyhow::Result<usize> {
+    let Record { mind, ledger } = record;
     let mut cfg = base_config.clone();
     // A layer document is content, not dialogue: there is no recent-turn tail to
     // carry, and the gather is the only way back to it.
@@ -3823,7 +4552,10 @@ async fn ingest_layer(
         }
     };
     let (prompt, builder, layer_id, group_id) = match (proj, &synthetic) {
-        (Some(p), _) => (p.prelude.clone(), &p.builder, p.layer, p.group),
+        (Some(p), _) => {
+            let (layer, group) = shared_target(p, source).unwrap_or((p.layer, p.group));
+            (p.prelude.clone(), &p.builder, layer, group)
+        }
         (None, Some((prompt, b, l, g))) => (prompt.clone(), b, *l, *g),
         (None, None) => unreachable!("synthetic is built exactly when proj is None"),
     };
@@ -3869,6 +4601,17 @@ async fn ingest_layer(
                     continue;
                 }
             };
+            // A changed document's old conversation leaves memory before its
+            // new text enters it, so the gather never holds both versions.
+            if matches!(
+                ledger.inspect(&doc.path, Some(&doc.body)),
+                Reconcile::Changed
+            ) {
+                if let Some(r) = mind_record::rel(mind, &doc.path) {
+                    let gone = mind_record::retire(&engine.lock().unwrap(), &r);
+                    tracing::info!("{addr}: changed — {gone} old conversation(s) retired");
+                }
+            }
             // Prefilled, not decoded: both halves are written verbatim in one
             // batched forward, because the text is already on disk.
             match conv.submit_prefilled_turn(
@@ -3920,6 +4663,9 @@ async fn ingest_layer(
                         // that reached the substrate.
                         p.add_prefill_tokens(r.stats.turn_prefill_tokens as u64);
                         persist_signatures(&mut conv, &r, &mut events, addr);
+                        if let Some(rel) = mind_record::rel(mind, &doc.path) {
+                            mind_record::mark(&engine.lock().unwrap(), timeline, &rel);
+                        }
                         // **The seal is what earns the ledger entry.** Recorded here, at the
                         // one point the document is provably a turn in the substrate, so a
                         // failure on any path above leaves it un-recorded and therefore
@@ -4032,6 +4778,7 @@ pub struct Lived {
 #[allow(clippy::too_many_arguments)]
 async fn run_life(
     engine: &SharedEngine,
+    mind: &Path,
     base_config: &SequenceConfig,
     proj: Option<&schema::Projection>,
     who: &str,
@@ -4052,13 +4799,25 @@ async fn run_life(
         // question; the answer is recorded at the seal below, so an episode that errors on the
         // way there is re-lived next boot instead of being silently lost with every belief,
         // relationship and intention it would have formed.
-        if !matches!(
-            ledger.inspect(&ep.path, Some(&raw)),
-            crate::engine::watcher::Reconcile::Added | crate::engine::watcher::Reconcile::Changed
-        ) {
-            lived.episodes += 1;
-            p.set_progress(i as u64 + 1, episodes.len() as u64);
-            continue;
+        let rel = mind_record::rel(mind, &ep.path);
+        match ledger.inspect(&ep.path, Some(&raw)) {
+            Reconcile::Added => {}
+            // The episode as it was, and every belief, relationship and
+            // intention it formed, leave memory before it is lived again.
+            Reconcile::Changed => {
+                if let Some(r) = &rel {
+                    let gone = mind_record::retire(&engine.lock().unwrap(), r);
+                    tracing::info!(
+                        "life {who}: {} changed — {gone} conversation(s) retired",
+                        ep.title
+                    );
+                }
+            }
+            Reconcile::Unchanged | Reconcile::Removed => {
+                lived.episodes += 1;
+                p.set_progress(i as u64 + 1, episodes.len() as u64);
+                continue;
+            }
         }
 
         let parsed = authoring::parse(&raw);
@@ -4118,6 +4877,9 @@ async fn run_life(
         // this happened and what it was called — which is what a projection
         // needs to reach an episode by *when* rather than only by what it said.
         let timeline = conv.timeline_id();
+        if let Some(r) = &rel {
+            mind_record::mark(&engine.lock().unwrap(), timeline, r);
+        }
         for (key, value) in [
             ("life.date", ep.date.as_str()),
             ("life.title", ep.title.as_str()),
@@ -4139,7 +4901,7 @@ async fn run_life(
         // Now the consequences, on their own records, after the episode they
         // came from is durable.
         for call in &parsed.calls {
-            match write_consequence(engine, &cfg, proj, who, ep, call).await {
+            match write_consequence(engine, &cfg, proj, who, ep, rel.as_deref(), call).await {
                 Ok(()) => match call.tool {
                     "form_belief" => lived.beliefs += 1,
                     "form_relationship" | "revise_relationship" => lived.relationships += 1,
@@ -4183,6 +4945,8 @@ async fn write_consequence(
     proj: Option<&schema::Projection>,
     who: &str,
     ep: &life::Episode,
+    // The episode's mind path, so the consequence leaves memory with it.
+    rel: Option<&str>,
     call: &authoring::Call,
 ) -> anyhow::Result<()> {
     let layer = authoring::by_name(call.tool)
@@ -4242,6 +5006,9 @@ async fn write_consequence(
         let e = engine.lock().unwrap();
         let _ = e.set_conversation_metadata(timeline, "from.date", &ep.date);
         let _ = e.set_conversation_metadata(timeline, "from.title", &ep.title);
+        if let Some(r) = rel {
+            mind_record::mark(&e, timeline, r);
+        }
         let _ = e.demote_timelines_hot(&[timeline], true);
     }
     Ok(())
@@ -4495,93 +5262,23 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 rt.scheduler
                     .deliver(id, world_ms, Salience::NORMAL, EventKind::Wake { day: to });
             }
-            // What this character is set on, restated every turn.
-            // Delivered rather than synthesised inside the tick: the
-            // scheduler knows a character has an empty inbox and
-            // nothing at all about what it is for.
-            //
-            // **Only when there is nothing else to answer.** This gate
-            // has now been wrong in both directions, and the two
-            // mistakes are instructive.
-            //
-            // It was first gated on an *empty inbox*, which never
-            // happened: a character with a body is handed the situation
-            // it is standing in every moment, so the depth is never
-            // zero, so the standing task written for exactly the case of
-            // having company was the one that never arrived. Two Makers
-            // met, had nothing telling them to stay, and walked out of
-            // the room in opposite directions.
-            //
-            // Removing the gate fixed that and introduced the opposite
-            // fault. The task supersedes in its own band, so restating
-            // it never accumulates — but it does keep moving to the most
-            // recent position in the window, which is where attention
-            // weights hardest. A character mid-conversation was being
-            // told, more recently than anything its companion had
-            // actually said, that nothing had been asked of it.
-            //
-            // The question was never "is the inbox empty", it is "is
-            // anything *happening*" — and the situation is a fact about
-            // the room rather than an event. `has_news` was that
-            // question asked about this instant, which is the third way
-            // of getting it wrong: a conversation is mostly the gaps
-            // between its utterances, and in every one of those gaps
-            // there is momentarily no news queued.
-            //
-            // So the task landed *inside* conversations, and because it
-            // supersedes in its own band it sat in the most recent
-            // position in the window every time. Two characters
-            // alternated for a hundred turns — heard the other speak,
-            // were told nothing had been asked of them, heard the other
-            // speak — each being told, more recently than anything its
-            // companion had said, that nothing was going on.
-            //
-            // A stretch of quiet is what the task was always described
-            // as waiting for. See [`IDLE_AFTER_MS`].
-            // Two clocks, both `IDLE_AFTER_MS`: quiet since anything
-            // happened, and quiet since the task itself was last
-            // restated. Without the second the gate latches open — the
-            // task is not news, so nothing it does moves the first
-            // clock — and a character nobody is talking to is handed it
-            // again on every tick.
-            // The standing-task nudge rides a quiet-stretch gate: delivery makes
-            // a character due at once (see `Scheduler::deliver`), so firing it
-            // every tick would be a tight re-tick loop.
-            //
-            // Two gates, by whether the command table is actively calling this
-            // character:
-            //   - **Table open, no mission** — the ACTIVE summons. It rides the
-            //     shorter "since last restated" clock ALONE (`summons_due`), so
-            //     it reaches a character deep in conversation that the full quiet
-            //     gate never would: a busy one talks past the one-time tannoy and
-            //     never comes. URGENT, so it reads as the thing to break off for.
-            //     Not every tick — repeating the same line into the window
-            //     collapses the character onto the repetition itself (it starts
-            //     saying "are we just going to keep running this loop" instead of
-            //     going). See `SUMMONS_AFTER_MS`.
-            //   - **Otherwise** — the passive standing task (nothing asked, or a
-            //     mission in hand) on the full quiet gate.
-            // The active summons carries its own text (location-aware: go to the
-            // table, or take one up now if already there — see `table_summons`);
-            // the passive path reads it from `nudge_for`.
-            let summons = rt.table_summons(id);
-            let (gate_after, salience, text) = match &summons {
-                Some(t) => (SUMMONS_AFTER_MS, Salience::URGENT, Some(t.clone())),
-                None => (IDLE_AFTER_MS, Salience::IDLE, rt.nudge_for(id)),
-            };
-            let due = match summons.is_some() {
-                true => rt.scheduler.summons_due(id, world_ms, gate_after),
-                false => rt.scheduler.nudge_due(id, world_ms, gate_after),
-            };
-            if due {
-                if let Some(text) = text {
-                    rt.scheduler
-                        .deliver(id, world_ms, salience, EventKind::Nudge { text });
-                }
-            }
-
+            // The standing task is restated from the world's moment, not
+            // here — see [`Runtime::standing_task`].
             let minds = rt.minds.read().unwrap().clone();
+            // Before the persona, which reads the journal a closed chapter
+            // has just been written into.
+            let chapter = rt.turn_chapter(id, world_ms);
             let persona = rt.persona_of_async(id).await;
+            // **No engine yet, or no persona: wait for them, and take nothing.**
+            // Ticking anyway drained the inbox into a turn that could not run —
+            // at every boot, every character told something before the model
+            // loaded lost it — and left the character unscheduled with it.
+            // Nothing is drained here; the character comes back once there is
+            // something to think with.
+            let (Some(minds), Some(p)) = (minds, persona) else {
+                tokio::time::sleep(UNREADY_RETRY).await;
+                continue;
+            };
             let day = crate::clock::day_of(world_ms);
             // What the grammar is built from this turn: the acts that
             // are reachable from where this character stands, and the
@@ -4613,21 +5310,6 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 rt.end_decision(id);
                 continue;
             };
-            // **A character standing at the table is told to take one up, every
-            // tick it stands there.** Appended to the tick in hand rather than
-            // `deliver`ed (whose `due_at = 0` would tight-loop): the window is a
-            // turn or two before it drifts off, so the slow gated summons misses
-            // it, and a Maker that reached the table and was told nothing new
-            // wandered back out. It stops the instant it holds a mission
-            // (`at_table_summons` returns `None`).
-            if let Some(text) = rt.at_table_summons(id) {
-                start.events.push(Event::new(
-                    rt.scheduler.next_seq(),
-                    world_ms,
-                    Salience::URGENT,
-                    EventKind::Nudge { text },
-                ));
-            }
             // A journey on its mission that ends where it now stands is done, and
             // it is told so, with what comes next — in this tick, so it reads its
             // progress the turn it arrives rather than an unticked step that sends
@@ -4650,214 +5332,287 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                     EventKind::Nudge { text },
                 ));
             }
+            // What a failed decode hands back to be read again: everything so
+            // far, told once — not the summons below, which is made afresh
+            // every tick and would otherwise be read twice.
+            let told_once = start.events.len();
+            // **A character standing at the table is told to take one up, every
+            // tick it stands there.** Appended to the tick in hand rather than
+            // `deliver`ed (whose `due_at = 0` would tight-loop): the window is a
+            // turn or two before it drifts off, so the slow gated summons misses
+            // it, and a Maker that reached the table and was told nothing new
+            // wandered back out. It stops the instant it holds a mission
+            // (`at_table_summons` returns `None`).
+            if let Some(text) = rt.at_table_summons(id) {
+                start.events.push(Event::new(
+                    rt.scheduler.next_seq(),
+                    world_ms,
+                    Salience::URGENT,
+                    EventKind::Nudge { text },
+                ));
+            }
             let mut awaiting_reflection: Option<(oneshot::Receiver<String>, Owed)> = None;
             // The curated prose the character read, captured out of the think
             // step so the tick record reports it in place of the raw events —
             // what the pulse shows is then what went to the model.
             let mut narrated: Option<String> = None;
-            let done = match (minds.as_ref(), persona.as_ref()) {
-                (Some(minds), Some(p)) => {
-                    match minds
-                        .think(id, &p.as_persona(), p.mode, day, &start.events, &within)
-                        .await
-                    {
-                        Ok(t) => {
-                            // The curated prose this tick read, for the record.
-                            if !t.perception.is_empty() {
-                                narrated = Some(t.perception.clone());
+            // A decode that failed hands its events back, so the turn that does
+            // run reads them — see [`Scheduler::retry`].
+            let mut retry: Option<Vec<Event>> = None;
+            let done = {
+                match minds
+                    .think(
+                        id,
+                        &p.as_persona(),
+                        p.mode,
+                        day,
+                        chapter,
+                        &start.events,
+                        &within,
+                    )
+                    .await
+                {
+                    Ok(t) => {
+                        // The curated prose this tick read, for the record.
+                        if !t.perception.is_empty() {
+                            narrated = Some(t.perception.clone());
+                        }
+                        // Reported, never swallowed: a character failing
+                        // to act and one choosing not to look identical
+                        // from outside and need completely different
+                        // fixes.
+                        //
+                        // And told to the character, not only to the
+                        // log. A rejection it cannot see is a character
+                        // acting into silence — it has no reason to do
+                        // anything differently, so it makes the same
+                        // malformed call every turn for as long as it
+                        // runs.
+                        // Two lists, because the feed and the character
+                        // read different sentences — see `Recorded`.
+                        // A rejection is the one case where they agree:
+                        // the world's words are all there is.
+                        let mut done: Vec<String> = Vec::new();
+                        let mut answers: Vec<String> = Vec::new();
+                        for r in &t.parsed.rejected {
+                            tracing::warn!("npc {id}: act rejected — {r:?}");
+                            done.push(r.line());
+                            answers.push(r.line());
+                        }
+                        // A call the grammar could not take is a refusal
+                        // like any other, and is read in a turn of its
+                        // own — not whenever the room next wakes it.
+                        if !t.parsed.rejected.is_empty() {
+                            rt.scheduler.think_again(id);
+                        }
+                        if t.parsed.is_empty() && t.parsed.rejected.is_empty() {
+                            // Chose to do nothing, and said so cleanly.
+                            // Distinct from a decode that failed, which
+                            // logged above.
+                            tracing::debug!("npc {id}: no act this tick");
+                        }
+                        if !t.parsed.narration.is_empty() {
+                            tracing::debug!(
+                                "npc {id}: narration (not an act) — {}",
+                                t.parsed.narration
+                            );
+                        }
+                        // Acts that belong to a body go to the world
+                        // they stand in, and the world's verdict — not
+                        // the character's intent — decides how each one
+                        // is recorded. A refusal is an ordinary
+                        // outcome, perceived like any other, so the
+                        // character learns it went wrong rather than
+                        // believing it worked. `record_act` holds the
+                        // rule.
+                        // **A reflect the world took is answered by a
+                        // reflection** — at most one per turn. Its slot
+                        // keeps `body::NO_REFLECTION` until the
+                        // reflection answers.
+                        let mut reflecting: Option<(Owed, [String; 3])> = None;
+                        for a in &t.parsed.acts {
+                            // A device call (`invoke`) is enacted on
+                            // the async effector fast path rather than through
+                            // the synchronous `record_act`/`body::perform`
+                            // path — the effector router is an async tower
+                            // service. Both produce a `Recorded`, so the feed,
+                            // the answer, and everything downstream are one
+                            // shape. See `Runtime::enact_device`.
+                            let before = rt.mission_mark(id);
+                            let r = if body::is_device(a.tool) {
+                                rt.enact_device(id, a, pinned_at.as_ref()).await
+                            } else if body::composes(a.tool) {
+                                rt.compose(id, a).await
+                            } else {
+                                rt.record_act(id, a)
+                            };
+                            // An act that moved the mission is answered by
+                            // what comes next, and that is read at once.
+                            let moved = rt.mission_mark(id) != before;
+                            // A machine that refused is refused in front of
+                            // the room, so a colleague can see what went
+                            // wrong rather than hear what it was taken for.
+                            let took = r.landed;
+                            if !took {
+                                rt.show_refusal(id, a, &r.answer);
                             }
-                            // Reported, never swallowed: a character failing
-                            // to act and one choosing not to look identical
-                            // from outside and need completely different
-                            // fixes.
-                            //
-                            // And told to the character, not only to the
-                            // log. A rejection it cannot see is a character
-                            // acting into silence — it has no reason to do
-                            // anything differently, so it makes the same
-                            // malformed call every turn for as long as it
-                            // runs.
-                            // Two lists, because the feed and the character
-                            // read different sentences — see `Recorded`.
-                            // A rejection is the one case where they agree:
-                            // the world's words are all there is.
-                            let mut done: Vec<String> = Vec::new();
-                            let mut answers: Vec<String> = Vec::new();
-                            for r in &t.parsed.rejected {
-                                tracing::warn!("npc {id}: act rejected — {r:?}");
-                                done.push(r.line());
-                                answers.push(r.line());
-                            }
-                            if t.parsed.is_empty() && t.parsed.rejected.is_empty() {
-                                // Chose to do nothing, and said so cleanly.
-                                // Distinct from a decode that failed, which
-                                // logged above.
-                                tracing::debug!("npc {id}: no act this tick");
-                            }
-                            if !t.parsed.narration.is_empty() {
-                                tracing::debug!(
-                                    "npc {id}: narration (not an act) — {}",
-                                    t.parsed.narration
-                                );
-                            }
-                            // Acts that belong to a body go to the world
-                            // they stand in, and the world's verdict — not
-                            // the character's intent — decides how each one
-                            // is recorded. A refusal is an ordinary
-                            // outcome, perceived like any other, so the
-                            // character learns it went wrong rather than
-                            // believing it worked. `record_act` holds the
-                            // rule.
-                            // **A reflect the world took is answered by a
-                            // reflection** — at most one per turn. Its slot
-                            // keeps `body::NO_REFLECTION` until the
-                            // reflection answers.
-                            let mut reflecting: Option<(Owed, [String; 3])> = None;
-                            for a in &t.parsed.acts {
-                                // A device call (`invoke`) is enacted on
-                                // the async effector fast path rather than through
-                                // the synchronous `record_act`/`body::perform`
-                                // path — the effector router is an async tower
-                                // service. Both produce a `Recorded`, so the feed,
-                                // the answer, and everything downstream are one
-                                // shape. See `Runtime::enact_device`.
-                                let r = if body::is_device(a.tool) {
-                                    rt.enact_device(id, a, pinned_at.as_ref()).await
-                                } else {
-                                    rt.record_act(id, a)
-                                };
-                                // Intent-carrying acts read back a narration of
-                                // what they did, not the bare "You tell X." the
-                                // world hands them — and the same line shows in
-                                // the feed. Only when the act landed; a narration
-                                // failure keeps the plain reply. See
-                                // `tools::narrates` / `Minds::narrate_act`.
-                                let (feed, answer) = if r.landed
-                                    && crate::engine::tools::narrates(a.tool)
-                                {
-                                    match minds
-                                        .narrate_act(id, &p.as_persona(), a, r.departing)
-                                        .await
-                                    {
-                                        Ok(Some(n)) => (format!("{} {LANDED} {n}", a.summary()), n),
-                                        _ => (r.feed, r.answer),
-                                    }
-                                } else {
-                                    (r.feed, r.answer)
-                                };
-                                done.push(feed);
-                                if a.tool == "reflect"
-                                    && r.landed
-                                    && reflecting.is_none()
-                                    && rt.can_reflect()
-                                {
-                                    let arg = |k: &str| {
-                                        a.args
-                                            .get(k)
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or_default()
-                                            .to_string()
-                                    };
-                                    // Recorded as the act alone — `reflect`
-                                    // and its thought — and completed with
-                                    // what came back once it has.
-                                    let row = a.summary();
-                                    if let Some(last) = done.last_mut() {
-                                        *last = row.clone();
-                                    }
-                                    reflecting = Some((
-                                        Owed {
-                                            answers: Vec::new(),
-                                            slot: answers.len(),
-                                            row,
-                                        },
-                                        [arg("situation"), arg("inner_thoughts"), arg("feeling")],
-                                    ));
-                                }
-                                answers.push(answer);
-                                // A pause that landed stops the character
-                                // here. Armed after the act rather than
-                                // inside it because going quiet is
-                                // scheduling and being seen to stop is the
-                                // world's — two halves of one act, and only
-                                // this half knows the clock.
-                                rt.arm_pause(id, a, now_ms);
-                                // And an act that answered brings it
-                                // straight back, so it has a turn in which
-                                // to use what it was told.
-                                rt.arm_followup(id, a);
-                            }
-                            // **Fold this decode into the loop guard.** Every
-                            // well-formed act, with what it meant, in call
-                            // order — the guard escalates a repeated act out of
-                            // the next grammar and, when an act loops in all but
-                            // wording, forces a reflect. The break has to be
-                            // *explained*, so a fired breaker delivers a nudge
-                            // that rides the next turn as a `<tool_response>` —
-                            // the model demonstrably reads a bare redirect and
-                            // repeats anyway, so the guarantee is the forced
-                            // reflect and this only says why. See
-                            // [`crate::engine::loopguard`].
-                            let taken: Vec<(String, String)> = t
-                                .parsed
-                                .acts
-                                .iter()
-                                .map(|a| (a.tool.to_string(), crate::engine::loopguard::salient(a)))
-                                .collect();
-                            // A fight is the one place the guard lets `act`
-                            // repeat; `within.hostiles` is what tells it a fight
-                            // is on. Read from the turn's own `within`, so a
-                            // character shaking a companion in a quiet room is
-                            // guarded while one trading blows is not.
-                            if rt
-                                .loop_guards
-                                .record(id, &taken, !within.hostiles.is_empty())
+                            // Intent-carrying acts read back a narration of
+                            // what they did, not the bare "You tell X." the
+                            // world hands them — and the same line shows in
+                            // the feed. Only when the act landed; a narration
+                            // failure keeps the plain reply. See
+                            // `tools::narrates` / `Minds::narrate_act`.
+                            let (feed, answer) = if r.landed
+                                && crate::engine::tools::narrates(a.tool)
                             {
-                                minds
-                                    .deliver_outcomes(
-                                        id,
-                                        vec![crate::engine::loopguard::NUDGE.to_string()],
-                                    )
-                                    .await;
-                            }
-                            // **And the character is told what came of it.**
-                            //
-                            // One answer per call it made, riding at the
-                            // head of its next turn as `<tool_response>` —
-                            // the half of the protocol that was missing.
-                            // Without it a character acts and reads the
-                            // weather back, which is how every one of them
-                            // came to do nothing but reflect.
-                            //
-                            // The world's verdict, not the feed line: what
-                            // a person watching wants to read and what the
-                            // character needs to know are different
-                            // sentences. See `Recorded`.
-                            //
-                            // A turn with a reflection in it hands its
-                            // answers to the reflection instead, delivered
-                            // when its first question is answered — the
-                            // await below this tick.
-                            match reflecting {
-                                Some((owed, [situation, inner, feeling])) => {
-                                    let rx = rt.spawn_reflection(id, situation, inner, feeling);
-                                    awaiting_reflection = Some((rx, Owed { answers, ..owed }));
+                                match minds.narrate_act(id, &p.as_persona(), a, r.departing).await {
+                                    Ok(Some(n)) => (format!("{} {LANDED} {n}", a.summary()), n),
+                                    _ => (r.feed, r.answer),
                                 }
-                                None => minds.deliver_outcomes(id, answers).await,
+                            } else {
+                                (r.feed, r.answer)
+                            };
+                            done.push(feed);
+                            if a.tool == "reflect"
+                                && r.landed
+                                && reflecting.is_none()
+                                && rt.can_reflect()
+                            {
+                                let arg = |k: &str| {
+                                    a.args
+                                        .get(k)
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string()
+                                };
+                                // Recorded as the act alone — `reflect`
+                                // and its thought — and completed with
+                                // what came back once it has.
+                                let row = a.summary();
+                                if let Some(last) = done.last_mut() {
+                                    *last = row.clone();
+                                }
+                                reflecting = Some((
+                                    Owed {
+                                        answers: Vec::new(),
+                                        slot: answers.len(),
+                                        row,
+                                    },
+                                    [arg("situation"), arg("inner_thoughts"), arg("feeling")],
+                                ));
                             }
-                            done
+                            answers.push(answer);
+                            // A pause that landed stops the character
+                            // here. Armed after the act rather than
+                            // inside it because going quiet is
+                            // scheduling and being seen to stop is the
+                            // world's — two halves of one act, and only
+                            // this half knows the clock.
+                            rt.arm_pause(id, a, now_ms);
+                            // And an act the world answered — a read, a
+                            // refusal, work on a document, a step of the
+                            // mission moved — brings it straight back, so
+                            // it has a turn in which to use what it was
+                            // told.
+                            rt.arm_followup(id, a, took, moved);
                         }
-                        Err(e) => {
-                            tracing::warn!("npc {id}: decode failed — {e:#}");
-                            Vec::new()
+                        // **Fold this decode into the loop guard.** Every
+                        // well-formed act, with what it meant, in call
+                        // order — an act taken again meaning the same is
+                        // struck from the next grammar, and only it. The
+                        // strike is *explained* by a nudge that rides the
+                        // next turn as a `<tool_response>`. See
+                        // [`crate::engine::loopguard`].
+                        //
+                        // A device call goes in under the verb at its
+                        // address: under `invoke`, a loop at one device
+                        // struck every device in reach.
+                        let taken: Vec<Took> = t
+                            .parsed
+                            .acts
+                            .iter()
+                            .map(|a| match body::is_device(a.tool) {
+                                true => {
+                                    let path = device_path(
+                                        a.args.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                                    );
+                                    // An address it was not offered keeps its
+                                    // address in what it meant, so two calls to
+                                    // two different unknown devices are never
+                                    // one call — and `invoke` itself is struck
+                                    // only for the same call made again.
+                                    match within
+                                        .invokable
+                                        .iter()
+                                        .find(|i| device_path(&i.url) == path)
+                                    {
+                                        Some(i) => Took::call(i.act, salient(a)),
+                                        None => {
+                                            Took::call(a.tool, format!("{path} {}", salient(a)))
+                                        }
+                                    }
+                                }
+                                false => Took::new(a.tool, salient(a)),
+                            })
+                            .collect();
+                        // A fight is the one place the guard lets `act`
+                        // repeat; `within.hostiles` is what tells it a fight
+                        // is on. Read from the turn's own `within`, so a
+                        // character shaking a companion in a quiet room is
+                        // guarded while one trading blows is not.
+                        if rt
+                            .loop_guards
+                            .record(id, &taken, !within.hostiles.is_empty())
+                        {
+                            // Pointed at the work: the next step of the
+                            // mission, when there is one.
+                            let nudge = match rt.mission_compass(id) {
+                                Some(next) => format!("{NUDGE}\n{next}"),
+                                None => NUDGE.to_string(),
+                            };
+                            minds.deliver_outcomes(id, vec![nudge]).await;
+                            // And a turn to read it in, with the looping
+                            // act struck: a loop of speech earns no
+                            // follow-up of its own, and the nudge would
+                            // otherwise wait on the room.
+                            rt.scheduler.think_again(id);
                         }
+                        // **And the character is told what came of it.**
+                        //
+                        // One answer per call it made, riding at the
+                        // head of its next turn as `<tool_response>` —
+                        // the half of the protocol that was missing.
+                        // Without it a character acts and reads the
+                        // weather back, which is how every one of them
+                        // came to do nothing but reflect.
+                        //
+                        // The world's verdict, not the feed line: what
+                        // a person watching wants to read and what the
+                        // character needs to know are different
+                        // sentences. See `Recorded`.
+                        //
+                        // A turn with a reflection in it hands its
+                        // answers to the reflection instead, delivered
+                        // when its first question is answered — the
+                        // await below this tick.
+                        match reflecting {
+                            Some((owed, [situation, inner, feeling])) => {
+                                let rx = rt.spawn_reflection(id, situation, inner, feeling);
+                                awaiting_reflection = Some((rx, Owed { answers, ..owed }));
+                            }
+                            None => minds.deliver_outcomes(id, answers).await,
+                        }
+                        done
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "npc {id}: decode failed — {e:#}; trying again in {}s",
+                            DECODE_RETRY_MS / 1000
+                        );
+                        retry = Some(start.events.iter().take(told_once).cloned().collect());
+                        Vec::new()
                     }
                 }
-                // No engine yet, or a character the authored state no
-                // longer knows. Perception still lands in the window —
-                // that half needs nothing — and no acts is the honest
-                // answer rather than an invented one.
-                _ => Vec::new(),
             };
             rt.end_decision(id);
             // Report the curated prose as what was perceived, when a narration
@@ -4867,6 +5622,9 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 start.perceived = vec![prose];
             }
             rt.scheduler.end_tick(id, now_ms, world_ms, start, done);
+            if let Some(events) = retry {
+                rt.scheduler.retry(id, now_ms, DECODE_RETRY_MS, events);
+            }
 
             // The turn reflected: its answer has to be the next thing
             // this character reads about the act, so the loop does not
@@ -5254,6 +6012,23 @@ mod tests {
 
     fn at(node: &str) -> npc_map::world::Where {
         npc_map::world::Where::new("vault-casting", node)
+    }
+
+    /// **Composing is refused honestly, never faked.** With no piece of work to
+    /// write there is nothing to sit down to; nothing is written into the working
+    /// set, and the refusal says why.
+    #[tokio::test]
+    async fn compose_is_refused_without_a_piece_to_write() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        let compose = Act {
+            tool: "compose",
+            args: serde_json::Map::new(),
+        };
+        let r = rt.compose(1, &compose).await;
+        assert!(!r.landed);
+        assert_eq!(r.answer, "You carry no piece of work to write.");
+        assert!(r.feed.starts_with("compose ✗"), "{}", r.feed);
     }
 
     /// Put a body in the world and give a character to it.
@@ -6221,6 +6996,79 @@ mod tests {
         assert_eq!(rt.nudge_for(1).as_deref(), Some(NO_MISSION));
     }
 
+    /// **A Maker gone quiet on its mission is brought back by the world, not by
+    /// its own turn.** The standing task used to be asked at the head of the
+    /// character's turn — which only comes when something wakes it — and a
+    /// character with a mission had none at all. A Maker at a quiet desk with
+    /// nothing waking it stayed there. Now the moment asks, and a character
+    /// quiet past the gate is told its mission's next step.
+    #[tokio::test]
+    async fn a_maker_gone_quiet_on_its_mission_is_told_its_next_step() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        rt.set_table_open(false);
+        let mission = Mission::new(
+            "Read the record 'the-charge' and check it against the storyline.",
+            vec![Todo::new("go to the archives")],
+            Origin::Lodged {
+                by: "u_op".to_string(),
+            },
+        );
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.assign("m1", mission));
+        // Everything embodying queued is read, and the character goes quiet.
+        rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
+        rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
+        assert!(!rt.scheduler.due_now(1).contains(&1), "not quiet");
+
+        // Not yet: a moment inside the quiet gate brings nothing.
+        rt.set_clock(Arc::new(|_| IDLE_AFTER_MS / 2));
+        rt.moment(&hosted);
+        rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
+        assert!(!rt.scheduler.due_now(1).contains(&1), "told too soon");
+
+        // Past it, the moment tells it what to do next, and that wakes it.
+        rt.set_clock(Arc::new(|_| IDLE_AFTER_MS * 2));
+        rt.moment(&hosted);
+        let told = rt
+            .scheduler
+            .tick(1, 0, IDLE_AFTER_MS * 2, |_, _| Vec::new())
+            .expect("it was woken");
+        let read = told.perceived.join("\n");
+        assert!(read.contains("archives"), "{read}");
+    }
+
+    /// **A step that sets the year is pointed at the machine that sets it.**
+    /// Told only the step, Makers wandered between levels for an hour; the
+    /// compass names the act, and the way to a time machine from where they
+    /// stand.
+    #[tokio::test]
+    async fn the_compass_for_the_year_names_the_machine_and_the_way() {
+        use crate::engine::mission::{time_step_text, Mission, Origin, Todo};
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        let mission = Mission::new(
+            "Write the year.",
+            vec![Todo::new(time_step_text(2837))],
+            Origin::Lodged {
+                by: "u_op".to_string(),
+            },
+        );
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.assign("m1", mission));
+        let told = rt.mission_compass(1).expect("a compass");
+        assert!(
+            told.starts_with("Your mission, next: set your time to 2837."),
+            "{told}"
+        );
+        assert!(told.contains("The time machines are in"), "{told}");
+        assert!(
+            told.contains("`time_travel` naming the year 2837"),
+            "{told}"
+        );
+    }
+
     /// **A carried mission is in the system prompt, not restated.** Given a
     /// mission, the persona a turn reads carries its ask, its steps and where it
     /// ends, and the quiet-turn nudge says nothing — neither the "nothing has
@@ -6314,6 +7162,57 @@ mod tests {
             !MISSION_WITHDRAWN.is_empty() && !MISSION_WITHDRAWN.contains("ledger"),
             "the notice names no subject"
         );
+    }
+
+    /// **Uncommitted work outlives a restart.** A body's working copy,
+    /// checkpointed to the substrate, is open again in the world a fresh
+    /// runtime hosts over the same substrate.
+    #[tokio::test]
+    async fn working_copies_are_checkpointed_and_restored_on_the_next_boot() {
+        use crate::npcs::Npcs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "npcd-benches-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mind = dir.join("mind");
+        std::fs::create_dir_all(mind.join("layers/stories")).unwrap();
+        let npcs = Npcs::load(&dir).unwrap();
+        const DOC: &str = "layers/stories/the-count.md";
+
+        let first = rt();
+        first.set_substrate(npcs.substrate());
+        let hosted = first
+            .host(WORLD, Path::new(ROOMS))
+            .expect("the vault loads");
+        hosted.with_sim(|s| {
+            s.set_bench_root(&mind);
+            s.bench
+                .write(
+                    "m1",
+                    "a story",
+                    DOC,
+                    "# The Count\n\nYou count the fleet.\n",
+                )
+                .unwrap();
+        });
+        first.checkpoint_benches(&hosted);
+
+        let second = rt();
+        second.set_substrate(npcs.substrate());
+        let revived = second
+            .host(WORLD, Path::new(ROOMS))
+            .expect("the vault loads");
+        let back = revived.with_sim(|s| {
+            s.set_bench_root(&mind);
+            s.bench.read("m1", DOC)
+        });
+        assert_eq!(back.as_deref(), Ok("# The Count\n\nYou count the fleet.\n"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **A mission outlives a restart.** Checkpointed to the substrate, a world
@@ -6486,6 +7385,87 @@ mod tests {
         assert_eq!(rt.table_summons(2), None, "the table closed");
     }
 
+    /// **A Maker free at the open table is handed the operation waiting there**
+    /// — and never the review of a draft it wrote; that one it is only told to
+    /// take up something else for, and the table's routine stays its to choose.
+    #[tokio::test]
+    async fn the_open_table_hands_its_work_to_whoever_stands_at_it_free() {
+        use crate::engine::mission::{Origin, Outcome as Verdict, Stage, Todo, Work};
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
+            .unwrap();
+        rt.set_table_open(true);
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let (_, body) = rt.body_of(1).unwrap();
+        let draft = Mission::new(
+            "Write the next year of Keeper's life.",
+            vec![Todo::new("write it"), Todo::report("report it")],
+            Origin::Generated {
+                generator: "life-event".into(),
+                target: "life:keeper".into(),
+                operation: 0,
+                stage: Stage::Draft,
+            },
+        )
+        .with_work(Work {
+            writes: "layers/life/keeper/2488 X.md".into(),
+            reads: vec![],
+            min_words: 0,
+            edit_optional: false,
+            anew: false,
+        });
+        let id = hosted.with_sim(|s| s.missions.launch(draft, 1, "Keeper's next year", None));
+        let handed = rt.at_table_summons(1).unwrap();
+        assert!(
+            handed.starts_with("The table hands you the next piece of work, and you take it up."),
+            "{handed}"
+        );
+        assert_eq!(
+            hosted.sim(|s| s.missions.active(&body).and_then(|m| m.operation())),
+            Some((id, Stage::Draft))
+        );
+
+        // Its own draft's review is not handed to it.
+        hosted.with_sim(|s| {
+            s.missions.report(&body, Verdict::Pass, "written", None);
+            let review = Mission::new(
+                "Review it.",
+                vec![],
+                s.missions.active(&body).map_or(
+                    Origin::Generated {
+                        generator: "life-event".into(),
+                        target: "life:keeper".into(),
+                        operation: 0,
+                        stage: Stage::Review,
+                    },
+                    |m| m.origin.clone(),
+                ),
+            );
+            s.missions.offer_review(id, review, "sound", true);
+        });
+        assert_eq!(rt.at_table_summons(1).as_deref(), Some(AT_THE_TABLE));
+        assert!(!hosted.sim(|s| s.missions.is_on_mission(&body)));
+
+        // A reviewer whose reading is done is asked for its verdict, not for
+        // what it found.
+        let review = Mission::new(
+            "Review it.",
+            vec![Todo::report("report your verdict")],
+            Origin::Generated {
+                generator: "life-event".into(),
+                target: "life:keeper".into(),
+                operation: id,
+                stage: Stage::Review,
+            },
+        );
+        hosted.with_sim(|s| s.missions.assign(&body, review));
+        assert_eq!(
+            rt.at_table_summons(1).as_deref(),
+            Some(VERDICT_AT_THE_TABLE)
+        );
+    }
+
     /// **A character back at the table with its mission's work done is told to
     /// report it**, every tick it stands there — and not before the work is
     /// done, not away from the table, and not once it has reported. Arriving in
@@ -6533,7 +7513,8 @@ mod tests {
 
         // At the table with the work done: report it now.
         hosted.with_sim(|s| {
-            s.missions.arrived_in("m2", "the plant room");
+            s.missions
+                .arrived_in("m2", "the plant room", "the command level");
             s.missions
                 .read_off("m2", &["the coolant valve".to_string()]);
         });

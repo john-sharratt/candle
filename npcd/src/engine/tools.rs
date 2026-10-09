@@ -51,7 +51,7 @@ use candle_conversation::stencil::{Param as StencilParam, ParamType, ToolSpec};
 use serde::Serialize;
 
 use crate::engine::invoke_body::{self, Invokable};
-use crate::engine::{acts, bench, mission_acts, station};
+use crate::engine::{acts, bench, mission, mission_acts, station};
 
 /// What a tool changes, which decides where it can be used and what it must be
 /// checked against.
@@ -163,13 +163,12 @@ pub enum Availability {
     PhysicalOnly,
     /// Only while standing on a lift landing with the car somewhere else — the
     /// one moment calling it does anything. With the car already open here there
-    /// is nothing to call, so the act is absent and [`Availability::InLift`]'s is
-    /// present instead. See [`crate::engine::lift`].
+    /// is nothing to call, so the act is absent. See [`crate::engine::lift`].
     AtLift,
-    /// Only while standing on a landing with the car open at it — you are in the
-    /// lift and can choose a floor. Absent while the car is elsewhere, when there
-    /// is nothing to ride.
-    InLift,
+    /// While standing on a landing, wherever the car is: with it open here you
+    /// get in and ride, with it elsewhere it is called and you wait to ride it.
+    /// Absent once you have asked to ride, until you are set down.
+    AtLanding,
 }
 
 /// One parameter, as the model sees it.
@@ -1087,7 +1086,7 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             // Whether you are at the lift, and whether the car is there, are both
             // facts about where the body is standing this moment — the
             // situation's to offer, not the prompt's.
-            Availability::AtLift | Availability::InLift => false,
+            Availability::AtLift | Availability::AtLanding => false,
         })
         .collect()
 }
@@ -1412,8 +1411,15 @@ pub enum Choices {
     Reachable,
     /// A floor the lift can carry this body to, by the level's name — never the
     /// one it is standing on. Bound to `lift_use`, and offered only while the
-    /// body is in the lift (see [`Availability::InLift`]).
+    /// body is on a landing (see [`Availability::AtLanding`]).
     Floors,
+    /// A year the body's mission asks it to work in, from its steps still to
+    /// do. Bound to `time_travel`, so the year is the mission's and not a
+    /// guess: left free, a Maker at the machine sent `{"year": ""}`, was
+    /// refused, and went round the time rooms asking colleagues what had
+    /// happened in 2950. Empty for a body with no such step, which takes the
+    /// act out of the grammar — there is no year to stand in without work.
+    Years,
 
     // ---- what a body carries ----
     //
@@ -1487,6 +1493,10 @@ pub enum Choices {
     /// regardless of what is on it, so a character can start a board that
     /// nobody has written on, and cannot invent one that is not there.
     Postable,
+    /// This character's own finished work, by name — see
+    /// [`crate::sim::Sim::presentable`]. Empty with nothing filed, which takes
+    /// the chair's `creator_present` out of the grammar.
+    Presentable,
     /// The conversations on this character's phone, as it names them.
     ///
     /// Empty for a character carrying no handset, which takes every phone act
@@ -1711,6 +1721,7 @@ const LIVE: &[(&str, &str, Choices)] = &[
     ("reflect", "feeling", Choices::Feelings),
     ("move_to", "destination", Choices::Reachable),
     ("lift_use", "floor", Choices::Floors),
+    ("time_travel", "year", Choices::Years),
     // ---- contact and obligation ----
     ("act", "on", Choices::CompanyOrSelf),
     ("give", "what", Choices::Carried),
@@ -1729,6 +1740,7 @@ const LIVE: &[(&str, &str, Choices)] = &[
     // ---- working the world ----
     ("read", "what", Choices::Readable),
     ("post_notice", "on", Choices::Postable),
+    ("creator_present", "what", Choices::Presentable),
     ("claim", "what", Choices::Claimable),
     ("operate", "what", Choices::Operable),
     ("operate", "mode", Choices::DeviceModes),
@@ -1817,6 +1829,8 @@ pub struct Within {
     /// The surfaces here that can be written on, whether or not anything is on
     /// them yet — see [`Choices::Postable`].
     pub postable: Vec<String>,
+    /// This character's own filed work — see [`Choices::Presentable`].
+    pub presentable: Vec<String>,
     /// The stances available, which is nothing at all when nothing is hostile.
     pub postures: Vec<String>,
     /// The conversations on this character's phone, as it names them.
@@ -1834,6 +1848,16 @@ pub struct Within {
     pub contacts: Vec<String>,
     /// The acts the parts standing here carry, straight off the map.
     pub station: Vec<String>,
+    /// The parts standing here, by id — what decides which shared material
+    /// this turn draws on (see [`crate::engine::bearings`]).
+    pub parts: Vec<String>,
+    /// The year of the world's history this body works in, set at a time
+    /// machine for the mission it carries; `None` is the present. Nothing after
+    /// it reaches the turn's recall (see [`crate::engine::bearings`]).
+    pub year: Option<u32>,
+    /// The years the body's mission still asks it to set at a time machine.
+    /// What [`Choices::Years`] binds `time_travel` to.
+    pub years: Vec<String>,
     /// **Every address an `invoke` may act on** — each reachable resource's
     /// verb-paths (`<resource-url>/<verb>`), with the act each one runs. Bound to
     /// `invoke`'s `url` so the grammar forces a whole verb-path a resource
@@ -1849,7 +1873,7 @@ pub struct Within {
     /// journey home to make.
     pub away_from_home: bool,
     /// Whether this body is standing on a lift landing — where the lift acts can
-    /// be reached. See [`Availability::AtLift`] / [`Availability::InLift`].
+    /// be reached. See [`Availability::AtLift`] / [`Availability::AtLanding`].
     pub at_lift: bool,
     /// Whether the car is open at this landing right now, so a body here can step
     /// in and ride. `false` while the car is away or its doors are shut.
@@ -1939,7 +1963,27 @@ impl Within {
         // addresses, so it keys on the thing a rename cannot move.
         self.readable = sim.readable_at(place, body);
         self.postable = sim.postable_at(place);
+        self.presentable = sim.presentable(body);
+        // What the parts here carry, less what the table does not offer this
+        // body — the rule `invoke`'s addresses already keep. Without it a Maker
+        // carrying an operation was still handed the bench's working-set verbs
+        // as acts of their own, and stashed and logged round and round.
+        self.year = sim.missions.year_of(body);
+        self.years = sim
+            .missions
+            .active(body)
+            .map(|m| {
+                m.todo
+                    .iter()
+                    .filter(|t| !t.done)
+                    .filter_map(|t| mission::time_step(&t.text))
+                    .map(|y| y.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let carrying = mission_acts::carrying(sim, body);
         self.station = sim.station_tools(place);
+        self.station.retain(|t| mission_acts::offered(t, carrying));
         // A world with no muster point is one nobody can be called back to, so
         // there is no journey home from anywhere in it.
         self.away_from_home = sim.homes().iter().any(|home| home != place);
@@ -2011,7 +2055,7 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             // riding it only while it is open here. The two never overlap, so a
             // body at the lift is offered exactly one of them.
             Availability::AtLift => within.at_lift && !within.lift_here,
-            Availability::InLift => within.at_lift && within.lift_here,
+            Availability::AtLanding => within.at_lift,
         })
         .filter(|t| performable(t, within))
         .map(|t| ToolSpec {
@@ -2159,6 +2203,7 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         }
         Choices::Reachable => within.places.clone(),
         Choices::Floors => within.floors.clone(),
+        Choices::Years => within.years.clone(),
         Choices::Feelings => within.feelings.clone(),
         Choices::Carried => within.carried.clone(),
         Choices::Equippable => within.equippable.clone(),
@@ -2174,6 +2219,7 @@ fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Claimable => within.claimable.clone(),
         Choices::Readable => within.readable.clone(),
         Choices::Postable => within.postable.clone(),
+        Choices::Presentable => within.presentable.clone(),
         Choices::Postures => within.postures.clone(),
         Choices::Threads => within.threads.clone(),
         Choices::Leavable => within.leavable.clone(),

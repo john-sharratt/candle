@@ -39,6 +39,11 @@ pub enum ScopeKey {
     /// A turn group's gallery on a specific timeline. A re-scan mints a new
     /// timeline, hence a new scope; the old one is evicted on the next observe.
     TurnGroup { group: u64, timeline: u64 },
+    /// A turn group's pooled documents — every one-exchange timeline of the
+    /// group, competing as one gallery (`projection::belief_files::competitions`).
+    /// One competition, so one scope: its children are the documents, keyed by
+    /// timeline ([`ChildKey::Timeline`]), and its floor is taken across them.
+    Pool { group: u64 },
     /// A section collection (the tool catalog); its gallery is stable, no timeline.
     Collection { group: u64, name: String },
     /// One PHASE of a section collection's gallery — the same competition scored
@@ -62,6 +67,9 @@ pub enum ScopeKey {
 impl ScopeKey {
     pub fn turn_group(group: u64, timeline: u64) -> Self {
         ScopeKey::TurnGroup { group, timeline }
+    }
+    pub fn pool(group: u64) -> Self {
+        ScopeKey::Pool { group }
     }
     pub fn collection(group: u64, name: impl Into<String>) -> Self {
         ScopeKey::Collection {
@@ -106,11 +114,16 @@ pub enum Phase {
 pub enum ChildKey {
     Turn(u64),
     Named(String),
+    /// A pooled document, by its timeline's raw id — see [`ScopeKey::Pool`].
+    Timeline(u64),
 }
 
 impl ChildKey {
     pub fn turn(index: u64) -> Self {
         ChildKey::Turn(index)
+    }
+    pub fn timeline(raw: u64) -> Self {
+        ChildKey::Timeline(raw)
     }
     pub fn named(name: impl Into<String>) -> Self {
         ChildKey::Named(name.into())

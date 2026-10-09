@@ -22,14 +22,14 @@ references, below and in full in §6.8).
    laptop-GPU run of this model has been published, and the published
    single-GPU runs that state their host use 64–128 GB of RAM
    **[E49 · E51 · E52]**. On a 24 GB RTX 3090 with 64 GB of RAM the same
-   artifact decodes **122.8 t/s at one session and 460.8 t/s aggregate at
+   artifact decodes **138.1 t/s at one session and 543.8 t/s aggregate at
    ×16**, every session validated, where the published llama.cpp run on an RTX
    3090 with 128 GB decodes 15 t/s single-stream — one session on the 3090 is
    above every published llama.cpp run of the model, the RTX 5090's 48.0
-   included, and at four sessions its 312.5 t/s aggregate is five times the only
+   included, and at four sessions its 320.5 t/s aggregate is five times the only
    published single-card aggregate (Strata's 63.1 at four sessions) **[I18 · E51 ·
    E52 · E92]**. Single-stream it is now ahead of Strata at an equal expert
-   footprint, on a slower bus: 122.8 t/s on a PCIe 3.0 RTX 3090 with 36–49% of
+   footprint, on a slower bus: 138.1 t/s on a PCIe 3.0 RTX 3090 with 36–49% of
    the experts in VRAM, against 93–94 on a PCIe 5.0 RTX 5070 with 14% **[E90]**
    and 93.0 on a PCIe Gen4 RTX 3090 at 3-bit **[E93]**. On Strata's own benchmark
    requests on Blackwell Strata still leads: 179.4 t/s on an RTX 5090 against our
@@ -65,11 +65,11 @@ references, below and in full in §6.8).
    10–45× **[E66 · E67]**.
 
 5. **In aggregate, one card out-decodes llama.cpp's best published rate — by
-   31×.** Serving concurrent conversations from one card, this engine's
+   36×.** Serving concurrent conversations from one card, this engine's
    aggregate decode beats the best published llama.cpp single-stream figure for
-   the same model on the same class of card: **2.7–30.7× on the RTX 3090**
-   (Qwen3-8B 383.5 vs 115.3 t/s; Qwen3.5-35B-A3B 1,067.3 vs 111.2; Qwen3.8-27B
-   390.1 vs 65.3 with MTP; Flash-Next 460.8 at ×16 vs 15, the published run at
+   the same model on the same class of card: **2.7–36.3× on the RTX 3090**
+   (Qwen3-8B 383.8 vs 115.3 t/s; Qwen3.5-35B-A3B 1,228.8 vs 111.2; Qwen3.8-27B
+   390.1 vs 65.3 with MTP; Flash-Next 543.8 at ×16 vs 15, the published run at
    a 130K context on UD-Q4_K_XL against our ~700-token prompt on Q2_KO experts, so
    the least like-for-like row),
    **1.4–3.9× on 16 GB cards** (Qwen3-8B; Qwen3.6-35B-A3B; Flash-Next), and
@@ -84,8 +84,8 @@ references, below and in full in §6.8).
    5–10 concurrent requests **[E47 · E48]**.
 
 6. **Workstation-class throughput from a laptop.** On the 16 GB laptop,
-   Qwen3.5-0.8B prefills 32 concurrent sessions at **46,057 t/s** — twice the
-   24 GB RTX 3090's 23,497 t/s on the same rung — and decodes them at **3,811 t/s
+   Qwen3.5-0.8B prefills 32 concurrent sessions at **46,057 t/s** — above the
+   24 GB RTX 3090's 42,982 t/s on the same rung — and decodes them at **3,811 t/s
    aggregate** under C8 compression, and Qwen3-30B-A3B prefills at **6,139 t/s
    with its experts streaming** **[I9 · I10]**. One wave engine carries
    prefill rows and decode rows in the same forward, which is what the engine
@@ -113,12 +113,13 @@ references, below and in full in §6.8).
 10. **The whole engine, proven under load — not just its kernels.** The engine
     probe drives admission, per-turn context projection, the persistence thread,
     KV compaction and the three memory tiers together. On the RTX 3090 all three
-    probes pass every gate: Qwen3-30B-A3B 20/20, Qwen3.6-35B-A3B 16/16 under
-    speculative decode with its recurrent state rewound on every rejected draft,
-    and Flash-Next 8/8, at **98–99% VRAM efficiency** with the expert weights
-    taking all the ground they may **[I15]**. In a week Flash-Next's decode
-    on that card went from **24.3 to 122.8 t/s at one session and from 95.6 to
-    306.3 t/s at C10 ×8**, with zero loss of validation **[I17]**.
+    probes tell their story in full: Qwen3-30B-A3B 20/20, Qwen3.6-35B-A3B 16/16
+    under speculative decode with its recurrent state rewound on every rejected
+    draft, and Flash-Next 8/8, with the expert weights taking all the ground they
+    may. At `7aecbeab3` all three held **97–99% VRAM efficiency**; on the
+    2026-10-10 build two of them fall to 59% and 79% **[I15]**. In ten days
+    Flash-Next's decode on that card went from **24.3 to 138.1 t/s at one session
+    and from 95.6 to 361.6 t/s at C10 ×8**, with zero loss of validation **[I17]**.
 
 ### Internal references — our results
 
@@ -133,15 +134,15 @@ references, below and in full in §6.8).
 | **I7** | Compression at 8K: 0–8% of decode for 3.3×–6.3× | §3.4 |
 | **I8** | Width: 35B MoEs 2,461.8 / 2,419.0 t/s aggregate at ×64 (2026-10-06) against 196.0 / 300.0 at ×1 (the second 2026-10-06 sweep); within the first run, Qwen3.6-35B-A3B 221.4 → 2,419.0 t/s (×1 BF16 → ×64 C10 at 6.42×), 10.9×, prefill 7,128.2 → 9,748.2; Qwen3.5-0.8B at ×256 | §3.7; `results/sweep_rtx_pro_5000_72gb_2026-10-06.md`, `results/flash_next_single_session_rtx_pro_5000_72gb_2026-10-06.md` |
 | **I9** | Qwen3.5-0.8B C8 ×32 on the laptop: prefill 46,056.8, decode 3,810.7 t/s (2026-10-10, `21c36efbd`) | §3.9 *Qwen3.5-0.8B* |
-| **I10** | Qwen3-30B-A3B Q8_0 ×20: 6,139.1 t/s prefill on the laptop with its experts streamed; Qwen3.5-0.8B C8 ×32 prefill 46,056.8 on the laptop (2026-10-10, `21c36efbd`) against 23,496.9 on the RTX 3090 (2026-10-07, `e0db692cd`) | §3.9, §3.8; `results/sweep_rtx_3090_24gb_2026-10-07.md` |
+| **I10** | Qwen3-30B-A3B Q8_0 ×20: 6,139.1 t/s prefill on the laptop with its experts streamed; Qwen3.5-0.8B C8 ×32 prefill 46,056.8 on the laptop (2026-10-10, `21c36efbd`) against 42,982.2 on the RTX 3090 (2026-10-10, `c375834c8`) | §3.9, §3.8; `results/sweep_rtx_4090_mobile_16gb_2026-10-10.md`, `results/sweep_rtx_3090_24gb_2026-10-10.md` |
 | **I11** | Qwen3.5/3.6-35B-A3B C10 ×16 on the laptop: 330.8 / 336.7 t/s aggregate, 7.01× / 6.42× (2026-10-10, `21c36efbd`) | §3.9 *Qwen3.5-35B-A3B*, *Qwen3.6-35B-A3B* |
 | **I12** | DeepSeek-V4-Flash on the 72 GB card: ×16 1,140.7 t/s prefill (2026-10-06), 73.5 t/s aggregate decode | §3.7 |
-| **I13** | Thirteen gates: 193 rows on the RTX 3090 and 192 on the laptop with no failing session; the same gates on the 72 GB card | §3.7–§3.9; §5 provenance table |
+| **I13** | Thirteen gates: 213 rows on the RTX 3090 and 192 on the laptop with no failing session; the same gates on the 72 GB card | §3.7–§3.9; §5 provenance table |
 | **I14** | C10 on the RTX 3090's current build: Qwen3.5-35B 7.03×, Qwen3.6-35B 6.45×, Qwen3-8B 5.82×, Flash-Next 5.80× at ×8, every session validated | §3.8 |
-| **I15** | Engine probes. RTX 3090 (2026-10-05): Qwen3-30B-A3B 20/20, Qwen3.6-35B-A3B 16/16 with speculative decode, Flash-Next 8/8; worst sustained efficiency 99% / 99% / 98%; weight zone at its limit in all three. Again on 2026-10-07 at `7aecbeab3`, the same stories, 99% / 98% / 97%. RTX 4090 Mobile, Flash-Next: story 8/8, efficiency 100%, uptake 73% (2026-09-30) and 88% (2026-09-29) | §3.8 *Engine probes*; §3.9 *Engine probes* |
-| **I16** | Aggregate decode against llama.cpp's best published single-stream rate, same model and card class. RTX 3090 (best measured, 2026-10-05 to 2026-10-07): Qwen3-8B C8 ×10 383.5 vs 115.3; Qwen3-30B-A3B Q8_0 ×20 415.8 vs 153.6; Qwen3.5-35B C10 ×16 1,067.3 vs 111.2; Qwen3.6-35B C10 ×16 1,228.6 vs 157.66; Qwen3.8-27B C10 ×10 390.1 vs 65.28 (MTP); Llama-2-7B BF16 ×48 950.0 vs 161.89; Flash-Next BF16 ×16 460.8 vs 15 (published at 130K context, UD-Q4_K_XL; ours Q2_KO experts, ~700-token prompt; I18). 16 GB (RTX 4090 Mobile, 2026-10-10, `21c36efbd`): Qwen3-8B C8 ×10 308.4 vs 102.7 (RTX 4080); Qwen3.6-35B C10 ×16 336.7 vs 183.29 / 249.33 MTP (RTX 4080, IQ3_S resident); Flash-Next C5 ×8 107.9 vs 27.5–29 (RTX 5080). Blackwell (our RTX PRO 5000 vs a published RTX 5090, 2026-10-06): Qwen3-8B C8 ×10 625.3 vs 200.4; Qwen3-30B-A3B Q8_0 ×20 806.2 vs 226.1; Qwen3.5-35B C10 ×64 2,461.8 vs 194.0; Qwen3.6-35B C10 ×64 2,419.0 vs 333.55 (MTP); Llama-2-7B BF16 ×48 1,684.6 vs 300.40 | §3.7–§3.9 ladders; §6.2–§6.5 |
-| **I17** | Flash-Next gate on the RTX 3090, build `e596fad8d` (2026-09-30) → `5776799ac` (2026-10-05) → `7aecbeab3` (2026-10-07): warm ×1 decode 24.3 → 73.3 → 122.8 t/s, ×8 113.2 → 233.8 → 413.7, C10 ×8 95.6 → 255.1 → 306.3, BF16 ×4 prefill 1,033.4 → 1,229.5 → 1,351.8, every row validated on all three. On the laptop, builds `9be7b182c` → `a475e852c`: prefill 430.7 → 627.0 t/s (BF16 ×4) | §3.8 *Qwen3.8-Flash-Next*; `results/performance_rtx_3090_24gb_rows_2026-09-30.tsv`, `results/performance_rtx_3090_24gb_rows_2026-10-05.tsv`, `results/sweep_rtx_3090_24gb_2026-10-07.md`; §7.3 |
-| **I18** | Flash-Next on the RTX 3090 (i7-10700K, 64 GB RAM), Q2_KO experts, build `7aecbeab3` (2026-10-07): full ladder incl. ×16, every row validated; BF16 ×1 warm 528.7 / 122.8 t/s, ×4 1,351.8 prefill and 312.5 aggregate decode, ×8 413.7, ×16 460.8, C10 ×8 306.3, C10 5.80–5.83×; engine probe story 8/8, efficiency 97% (98% on 2026-10-05), 100% weight uptake | §3.8 *Qwen3.8-Flash-Next*; `results/sweep_rtx_3090_24gb_2026-10-07.md` |
+| **I15** | Engine probes. RTX 3090 (2026-10-05): Qwen3-30B-A3B 20/20, Qwen3.6-35B-A3B 16/16 with speculative decode, Flash-Next 8/8; worst sustained efficiency 99% / 99% / 98%; weight zone at its limit in all three. Again on 2026-10-07 at `7aecbeab3`, the same stories, 99% / 98% / 97%. On 2026-10-10 at `c375834c8`, the same stories, 59% / 98% / 79% — the Qwen3-30B and Flash-Next probes failing the efficiency gate. RTX 4090 Mobile, Flash-Next: story 8/8, efficiency 100%, uptake 73% (2026-09-30) and 88% (2026-09-29) | §3.8 *Engine probes*; §3.9 *Engine probes* |
+| **I16** | Aggregate decode against llama.cpp's best published single-stream rate, same model and card class. RTX 3090 (best measured, 2026-10-05 to 2026-10-10): Qwen3-8B C8 ×10 383.8 vs 115.3; Qwen3-30B-A3B Q8_0 ×20 415.8 vs 153.6; Qwen3.5-35B C10 ×16 1,228.8 vs 111.2; Qwen3.6-35B C10 ×16 1,346.3 vs 157.66; Qwen3.8-27B C10 ×10 390.1 vs 65.28 (MTP); Llama-2-7B BF16 ×48 950.0 vs 161.89; Flash-Next BF16 ×16 543.8 vs 15 (published at 130K context, UD-Q4_K_XL; ours Q2_KO experts, ~700-token prompt; I18). 16 GB (RTX 4090 Mobile, 2026-10-10, `21c36efbd`): Qwen3-8B C8 ×10 308.4 vs 102.7 (RTX 4080); Qwen3.6-35B C10 ×16 336.7 vs 183.29 / 249.33 MTP (RTX 4080, IQ3_S resident); Flash-Next C5 ×8 107.9 vs 27.5–29 (RTX 5080). Blackwell (our RTX PRO 5000 vs a published RTX 5090, 2026-10-06): Qwen3-8B C8 ×10 625.3 vs 200.4; Qwen3-30B-A3B Q8_0 ×20 806.2 vs 226.1; Qwen3.5-35B C10 ×64 2,461.8 vs 194.0; Qwen3.6-35B C10 ×64 2,419.0 vs 333.55 (MTP); Llama-2-7B BF16 ×48 1,684.6 vs 300.40 | §3.7–§3.9 ladders; §6.2–§6.5 |
+| **I17** | Flash-Next gate on the RTX 3090, build `e596fad8d` (2026-09-30) → `5776799ac` (2026-10-05) → `7aecbeab3` (2026-10-07) → `c375834c8` (2026-10-10): warm ×1 decode 24.3 → 73.3 → 122.8 → 138.1 t/s, ×8 113.2 → 233.8 → 413.7 → 477.2, C10 ×8 95.6 → 255.1 → 306.3 → 361.6, BF16 ×4 prefill 1,033.4 → 1,229.5 → 1,351.8 → 1,570.5, every row validated on all four. On the laptop, builds `9be7b182c` → `a475e852c`: prefill 430.7 → 627.0 t/s (BF16 ×4) | §3.8 *Qwen3.8-Flash-Next*; `results/performance_rtx_3090_24gb_rows_2026-09-30.tsv`, `results/performance_rtx_3090_24gb_rows_2026-10-05.tsv`, `results/sweep_rtx_3090_24gb_2026-10-07.md`, `results/sweep_rtx_3090_24gb_2026-10-10.md`; §7.3 |
+| **I18** | Flash-Next on the RTX 3090 (i7-10700K, 64 GB RAM), Q2_KO experts, build `c375834c8` (2026-10-10): full ladder incl. ×16, every row validated; BF16 ×1 warm 556.5 / 138.1 t/s, ×4 1,570.5 prefill and 320.5 aggregate decode, ×8 477.2, ×16 2,301.9 / 543.8, C10 ×8 361.6, C10 5.80–5.83×; engine probe story 8/8, efficiency 79% (97% at `7aecbeab3`), 110% weight uptake | §3.8 *Qwen3.8-Flash-Next*; `results/sweep_rtx_3090_24gb_2026-10-10.md` |
 
 ### External references — published results
 
@@ -187,8 +188,8 @@ references, below and in full in §6.8).
 >   tables (§3.6 *Width*, §3.7) report the **highest** measurement per cell,
 >   **†** marking a 2026-09-13 cell and **◆** a 2026-09-15 cell. A best-of-several
 >   sits above any one run by up to the 1–4% noise floor (§5).
-> - **RTX 3090 24 GB** — a width/throughput gate sweep on 2026-10-05 (§3.8),
->   build `5776799ac`: the same `test_parallel_batched_forwarding*` gates as
+> - **RTX 3090 24 GB** — a width/throughput gate sweep on 2026-10-10 (§3.8),
+>   build `c375834c8`: the same `test_parallel_batched_forwarding*` gates as
 >   §3.7, run one model at a time, plus all three `kv_fragmentation` engine
 >   probes (§2.2). Ten of the fleet's models, the two AntiLoop+StyleTune hybrids,
 >   and **Qwen3.8-Flash-Next** from the same Q2_KO-expert artifact the 4090
@@ -733,8 +734,8 @@ those widest points are the best of the last two sweeps rather than all three.
 
 ### 3.8 RTX 3090 24 GB — the width gate sweep
 
-Every gate and engine probe on **2026-10-07**, on the RTX 3090 (§1), build
-`7aecbeab3`, of the same `test_parallel_batched_forwarding*` gates that produce
+Every gate and engine probe on **2026-10-10**, on the RTX 3090 (§1), build
+`c375834c8`, of the same `test_parallel_batched_forwarding*` gates that produce
 §3.6 *Width* and §3.7 — one `cargo test` invocation per model so exactly one was
 ever resident, `--release --features cuda`, with the daemon stopped and the card
 at its idle floor before each. This is a **width / throughput** sweep: each gate
@@ -742,9 +743,11 @@ runs its own ladder of KV modes and context counts at a fixed ~700-token prompt,
 so it measures aggregate throughput and the compression ladder, **not** depth —
 the `long_context_*` and `profile_*` depth gates were not run here. Numbers are
 single measurements, so the 1–4 % noise floor (§5) applies to each cell alone.
-Every gate passed: no session in any of the 213 rows failed its check. The run,
-the commits since the 2026-10-05 sweep (`5776799ac`) and the earlier runs of the
-day are in `results/sweep_rtx_3090_24gb_2026-10-07.md`.
+Every gate passed: no session in any of the 213 rows failed its check. Two engine
+probes failed their efficiency gate (below). The run and its comparison with the
+2026-10-07 sweep (`7aecbeab3`) are in `results/sweep_rtx_3090_24gb_2026-10-10.md`;
+the 2026-10-07 run, its earlier runs that day and the commits before it are in
+`results/sweep_rtx_3090_24gb_2026-10-07.md`.
 
 **Thirteen gates — ten of the fleet's models, the two AntiLoop+StyleTune
 hybrids** (the production 3.6-35B npcd serves), **and Qwen3.8-Flash-Next**, from
@@ -759,37 +762,43 @@ card; the hybrid's Performance gate prices the other posture.
 
 **Summary** — best prefill, best decode, and the best validated compression over
 each model's ladder. A published figure is the best measured, never a lower one: a
-cell marked ¹ was measured higher earlier on 2026-10-07 on a committed build, and
-one marked ² in the 2026-10-05 sweep — the ladders below are this run's own.
+cell marked ¹ was measured higher on 2026-10-07 on a committed build, and one marked
+² in the 2026-10-05 sweep — the ladders below are this run's own.
 
 | Model | best prefill t/s | best decode t/s | best compression (mode) |
 |---|---:|---:|---|
-| Qwen2-0.5B | 54,332.8 ¹ | 6,745.8 ¹ | — (no ladder) |
-| Qwen3.5-0.8B | 24,695.8 ¹ | 4,033.2 ¹ | 4.38× (C10) |
-| Llama-3.2-3B † | 7,276.3 | 784.0 ¹ | 4.35× (C10) |
-| Llama-2-7B | 3,986.5 ¹ | 950.0 ¹ | 3.56× (Q4_0) |
-| Qwen3-8B | 3,285.0 | 383.5 ¹ | 5.82× (C10) |
-| Qwen3.5-9B | 3,386.8 ¹ | 958.2 ¹ | 5.57× (C10) |
-| Qwen3.8-27B | 1,089.3 | 390.1 ² | 5.05× (C10) |
-| Qwen3-30B-A3B ‡ | 5,075.5 ¹ | 415.8 ¹ | 5.45× (C10) |
-| Qwen3.5-35B-A3B | 5,805.6 ¹ | 1,067.3 | 7.03× (C10) |
-| Qwen3.6-35B-A3B | 5,049.8 ¹ | 1,228.6 | 6.45× (C10) ² |
-| Qwen3.6-35B AntiLoop+StyleTune (auto/Precision) | 5,922.5 ¹ | 1,046.7 | 6.47× (C10) |
-| Qwen3.6-35B AntiLoop+StyleTune (Performance) | 6,141.2 ¹ | 1,162.0 | 6.45× (C10) |
-| Qwen3.8-Flash-Next (Q2_KO experts) | 1,667.8 | 460.8 | 5.83× (C10) |
+| Qwen2-0.5B | 72,012.4 | 7,258.1 | — (no ladder) |
+| Qwen3.5-0.8B | 44,981.3 | 4,177.8 | 4.38× (C10) |
+| Llama-3.2-3B † | 10,920.1 | 789.1 | 4.35× (C10) |
+| Llama-2-7B | 5,737.5 | 950.0 ¹ | 3.56× (Q4_0) |
+| Qwen3-8B | 5,285.5 | 383.8 | 5.82× (C10) |
+| Qwen3.5-9B | 6,735.3 | 958.2 ¹ | 5.57× (C10) |
+| Qwen3.8-27B | 2,067.0 | 390.1 ² | 5.05× (C10) |
+| Qwen3-30B-A3B ‡ | 6,821.5 | 415.8 ¹ | 5.45× (C10) |
+| Qwen3.5-35B-A3B | 10,041.6 | 1,228.8 | 7.03× (C10) |
+| Qwen3.6-35B-A3B | 7,184.4 | 1,346.3 | 6.45× (C10) ² |
+| Qwen3.6-35B AntiLoop+StyleTune (auto/Precision) | 8,348.6 | 1,166.7 | 6.47× (C10) |
+| Qwen3.6-35B AntiLoop+StyleTune (Performance) | 10,221.6 | 1,269.0 | 6.45× (C10) |
+| Qwen3.8-Flash-Next (Q2_KO experts) | 2,301.9 | 543.8 | 5.83× (C10) |
 
 † ran on the no-flash-attn path (above).
 ‡ best over validated rows. The 415.8 (Q8_0 ×20) came from one run at `c589b057e`;
-the four sweeps after it read 364–369 on that row, and this run 368.6. The gate's
-unvalidated Q4_0 rows reach 5,056.5 prefill (×4) and 389.4 decode (×20) here.
+the sweeps after it read 364–378 on that row, and this run 377.7. The gate's
+unvalidated Q4_0 rows reach 6,709.1 prefill (×4) and 390.4 decode (×20) here.
+
+**Against 2026-10-07 (`7aecbeab3`).** Best prefill rose on every model, by 36%
+(Qwen3-30B-A3B) to 101% (Qwen3.5-9B). Best decode rose 9–18% on the 35B MoEs and
+Flash-Next, and moved −2.1% to +8.3% on the rest, inside the single-run noise.
+Compression is unchanged on every row. Per-gate deltas are in
+`results/sweep_rtx_3090_24gb_2026-10-10.md`.
 
 **Against the 72 GB card, on the models both ran.** The comparison holds only on
 the width gate, and only loosely: the 3090's ladders stop at a narrower widest
 context (×16 on the 35Bs, where the 72 GB reached ×64), because 24 GB caps how
 many concurrent sessions fit. On the 35B MoEs the 72 GB card prefills about
-**1.6×** the 3090 at one context (~7,200 vs ~4,600 t/s for the 3.5-35B's C-mode
-rows), and its aggregate decode at ×64 is **2.3×** the 3090's at ×16 (2,461.8
-vs 1,067.3 t/s on the 3.5-35B, I8) — that gap being the extra 48 sessions the
+**1.3×** the 3090 at one context (~7,200 vs ~5,700 t/s for the 3.5-35B's C-mode
+rows), and its aggregate decode at ×64 is **2.0×** the 3090's at ×16 (2,461.8
+vs 1,228.8 t/s on the 3.5-35B, I8) — that gap being the extra 48 sessions the
 bigger card holds. The 3090 runs the current C10 calibration, which compresses
 the two 35Bs 7.03× and 6.43–6.47×. The sm_86 and PCIe-3.0 traps (§1) sit under
 the 3090's absolute rates.
@@ -803,190 +812,187 @@ reproduction check (`✓`, or `-` for a mode not validated for reproduction);
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| F32 | off | no | 1 | - | 32336.0 | 493.5 | - | - | 308 |
-| BF16 | off | yes | 1 | - | 33515.0 | 519.5 | - | - | 308 |
-| F16 | off | yes | 1 | - | 33783.8 | 466.5 | - | - | 308 |
-| F16 | off | yes | 4 | - | 51712.3 | 1525.2 | - | - | 1272 |
-| F16 | off | yes | 60 | - | 44277.2 | 6648.7 | - | - | 18612 |
-| BF16 | off | yes | 60 | - | 44376.8 | 6701.5 | - | - | 18612 |
+| F32 | off | no | 1 | - | 33396.7 | 506.0 | - | - | 308 |
+| BF16 | off | yes | 1 | - | 33891.2 | 529.1 | - | - | 308 |
+| F16 | off | yes | 1 | - | 33892.3 | 478.6 | - | - | 308 |
+| F16 | off | yes | 4 | - | 62291.3 | 1565.5 | - | - | 1272 |
+| F16 | off | yes | 60 | - | 72012.4 | 7240.6 | - | - | 18612 |
+| BF16 | off | yes | 60 | - | 70686.8 | 7258.1 | - | - | 18612 |
 
 #### Qwen3.5-0.8B
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| F16 | prec | yes | 1 | ✓ | 19324.9 | 241.3 | - | - | 659 |
-| BF16 | prec | yes | 1 | ✓ | 19296.3 | 274.9 | - | - | 659 |
-| BF16 | prec | yes | 16 | ✓ | 23172.4 | 2974.0 | - | - | 10618 |
-| Q8_0 | prec | yes | 4 | ✓ | 23771.2 | 1139.6 | 100.0% | 1.88x | 2678 |
-| C0 | prec | yes | 2 | ✓ | 23593.6 | 622.6 | 100.0% | 1.87x | 1358 |
-| C1 | prec | yes | 2 | ✓ | 23878.8 | 614.0 | 100.0% | 2.13x | 1358 |
-| C2 | prec | yes | 2 | ✓ | 23683.2 | 478.4 | 100.0% | 2.33x | 1358 |
-| C3 | prec | yes | 2 | ✓ | 16652.6 | 408.7 | 100.0% | 2.82x | 1358 |
-| C4 | prec | yes | 2 | ✓ | 17326.8 | 391.2 | 100.0% | 2.66x | 1358 |
-| C5 | prec | yes | 2 | ✓ | 17141.0 | 402.6 | 100.0% | 2.93x | 1358 |
-| C6 | prec | yes | 2 | ✓ | 17396.8 | 367.3 | 100.0% | 3.23x | 1358 |
-| C7 | prec | yes | 2 | ✓ | 15020.1 | 371.7 | 100.0% | 3.59x | 1358 |
-| C8 | prec | yes | 32 | ✓ | 23363.3 | 3998.0 | 100.0% | 3.98x | 21202 |
-| C9 | prec | yes | 5 | ✓ | 24509.2 | 1358.8 | 100.0% | 4.16x | 3337 |
-| C10 | prec | yes | 10 | ✓ | 23316.7 | 2139.1 | 100.0% | 4.38x | 6640 |
+| F16 | prec | yes | 1 | ✓ | 32534.2 | 257.6 | - | - | 659 |
+| BF16 | prec | yes | 1 | ✓ | 32462.0 | 273.9 | - | - | 659 |
+| BF16 | prec | yes | 16 | ✓ | 43998.0 | 3072.3 | - | - | 10618 |
+| Q8_0 | prec | yes | 4 | ✓ | 42489.4 | 1180.5 | 100.0% | 1.88x | 2678 |
+| C0 | prec | yes | 2 | ✓ | 40576.3 | 647.4 | 100.0% | 1.87x | 1358 |
+| C1 | prec | yes | 2 | ✓ | 40737.7 | 648.2 | 100.0% | 2.13x | 1358 |
+| C2 | prec | yes | 2 | ✓ | 24221.4 | 379.7 | 100.0% | 2.33x | 1358 |
+| C3 | prec | yes | 2 | ✓ | 22229.3 | 364.2 | 100.0% | 2.82x | 1358 |
+| C4 | prec | yes | 2 | ✓ | 20682.0 | 346.2 | 100.0% | 2.66x | 1358 |
+| C5 | prec | yes | 2 | ✓ | 19866.4 | 331.6 | 100.0% | 2.93x | 1358 |
+| C6 | prec | yes | 2 | ✓ | 18485.0 | 339.1 | 100.0% | 3.23x | 1358 |
+| C7 | prec | yes | 2 | ✓ | 19440.7 | 346.8 | 100.0% | 3.59x | 1358 |
+| C8 | prec | yes | 32 | ✓ | 42982.2 | 4177.8 | 100.0% | 3.98x | 21202 |
+| C9 | prec | yes | 5 | ✓ | 44767.3 | 1418.7 | 100.0% | 4.16x | 3337 |
+| C10 | prec | yes | 10 | ✓ | 44981.3 | 2231.0 | 100.0% | 4.38x | 6640 |
 
 C2–C7 ×2 ran in a light-load clock window (every kernel 1.4–2× slower, recovering
-at the ×32 row); C0–C1 show the rate: 614–623 t/s. See
-`results/sweep_rtx_3090_24gb_2026-10-07.md`.
+at the ×32 row); C0–C1 show the rate: 647–648 t/s. The 2026-10-07 sweep showed the
+same window on the same rows.
 
 #### Llama-3.2-3B (no flash-attn)
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| F32 | prec | no | 1 | ✓ | 2804.6 | 88.2 | - | - | 654 |
-| F16 | prec | yes | 1 | ✓ | 2923.0 | 86.6 | - | - | 654 |
-| F16 | prec | yes | 4 | ✓ | 3620.3 | 486.2 | - | - | 2658 |
-| R16 | prec | yes | 1 | ✓ | 7189.7 | 166.4 | 0.0% | - | 654 |
-| Q8_0 | prec | yes | 1 | ✓ | 7204.7 | 173.7 | 100.0% | 1.88x | 654 |
-| Q8_Q4 | prec | yes | 1 | ✓ | 7276.3 | 171.3 | 100.0% | 2.29x | 654 |
-| BF16 | prec | yes | 4 | ✓ | 6497.5 | 554.1 | - | - | 2658 |
-| Q8_1 | prec | yes | 4 | ✓ | 6536.1 | 458.7 | 100.0% | 1.78x | 2658 |
-| Q8_KS | prec | yes | 4 | ✓ | 6512.2 | 447.7 | 100.0% | 1.78x | 2658 |
-| Q8_Q4 | prec | yes | 4 | ✓ | 6506.0 | 468.2 | 100.0% | 2.29x | 2658 |
-| Q4_0 | prec | yes | 4 | - | 6493.3 | 493.2 | 100.0% | 3.56x | 2658 |
-| Q4_1 | prec | yes | 4 | - | 6503.0 | 469.9 | 100.0% | 3.20x | 2658 |
-| Q4_KS | prec | yes | 4 | - | 6495.3 | 485.4 | 100.0% | 3.20x | 2658 |
-| C0 | prec | yes | 1 | ✓ | 7131.0 | 168.8 | 100.0% | 1.88x | 654 |
-| C1 | prec | yes | 1 | ✓ | 6952.7 | 169.5 | 100.0% | 2.24x | 654 |
-| C2 | prec | yes | 1 | ✓ | 6993.3 | 171.6 | 100.0% | 2.45x | 654 |
-| C3 | prec | yes | 1 | ✓ | 7155.7 | 169.4 | 100.0% | 3.02x | 654 |
-| C4 | prec | yes | 1 | ✓ | 7206.8 | 169.6 | 100.0% | 2.80x | 654 |
-| C5 | prec | yes | 1 | ✓ | 7122.8 | 170.0 | 100.0% | 3.08x | 654 |
-| C6 | prec | yes | 1 | ✓ | 7087.9 | 170.0 | 100.0% | 3.53x | 654 |
-| C7 | prec | yes | 1 | ✓ | 7179.9 | 169.7 | 100.0% | 3.73x | 654 |
-| C8 | prec | yes | 10 | ✓ | 5500.9 | 778.0 | 100.0% | 3.92x | 6590 |
-| C9 | prec | yes | 10 | ✓ | 5516.2 | 763.2 | 100.0% | 4.16x | 6590 |
-| C10 | prec | yes | 5 | ✓ | 6294.0 | 552.8 | 100.0% | 4.35x | 3312 |
-
-F32 ×1 and F16 ×1 ran in a light-load clock window; outside it, the same build
-decodes them at 179.7 and 178.8 t/s and prefills them at 4,887.9 and 7,008.1.
+| F32 | prec | no | 1 | ✓ | 10510.0 | 184.7 | - | - | 654 |
+| F16 | prec | yes | 1 | ✓ | 10508.9 | 183.4 | - | - | 654 |
+| F16 | prec | yes | 4 | ✓ | 10920.1 | 559.3 | - | - | 2658 |
+| R16 | prec | yes | 1 | ✓ | 10676.7 | 163.3 | 0.0% | - | 654 |
+| Q8_0 | prec | yes | 1 | ✓ | 10643.7 | 169.2 | 100.0% | 1.88x | 654 |
+| Q8_Q4 | prec | yes | 1 | ✓ | 10622.6 | 165.4 | 100.0% | 2.29x | 654 |
+| BF16 | prec | yes | 4 | ✓ | 10769.8 | 555.2 | - | - | 2658 |
+| Q8_1 | prec | yes | 4 | ✓ | 10770.3 | 458.9 | 100.0% | 1.78x | 2658 |
+| Q8_KS | prec | yes | 4 | ✓ | 10708.4 | 446.9 | 100.0% | 1.78x | 2658 |
+| Q8_Q4 | prec | yes | 4 | ✓ | 10714.3 | 462.7 | 100.0% | 2.29x | 2658 |
+| Q4_0 | prec | yes | 4 | - | 10729.3 | 484.0 | 100.0% | 3.56x | 2658 |
+| Q4_1 | prec | yes | 4 | - | 10694.2 | 466.8 | 100.0% | 3.20x | 2658 |
+| Q4_KS | prec | yes | 4 | - | 10674.7 | 478.1 | 100.0% | 3.20x | 2658 |
+| C0 | prec | yes | 1 | ✓ | 10550.7 | 164.0 | 100.0% | 1.88x | 654 |
+| C1 | prec | yes | 1 | ✓ | 10299.0 | 165.6 | 100.0% | 2.24x | 654 |
+| C2 | prec | yes | 1 | ✓ | 10319.0 | 167.0 | 100.0% | 2.45x | 654 |
+| C3 | prec | yes | 1 | ✓ | 10580.4 | 166.3 | 100.0% | 3.02x | 654 |
+| C4 | prec | yes | 1 | ✓ | 10518.0 | 165.4 | 100.0% | 2.80x | 654 |
+| C5 | prec | yes | 1 | ✓ | 10584.7 | 165.8 | 100.0% | 3.08x | 654 |
+| C6 | prec | yes | 1 | ✓ | 10523.8 | 165.4 | 100.0% | 3.53x | 654 |
+| C7 | prec | yes | 1 | ✓ | 10562.2 | 166.0 | 100.0% | 3.73x | 654 |
+| C8 | prec | yes | 10 | ✓ | 9966.1 | 789.1 | 100.0% | 3.92x | 6590 |
+| C9 | prec | yes | 10 | ✓ | 9908.2 | 772.2 | 100.0% | 4.16x | 6590 |
+| C10 | prec | yes | 5 | ✓ | 10618.2 | 552.8 | 100.0% | 4.35x | 3312 |
 
 #### Llama-2-7B
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| F32 | perf | no | 1 | - | 3769.4 | 117.1 | - | - | 283 |
-| F16 | perf | yes | 1 | - | 3805.3 | 117.3 | - | - | 283 |
-| F16 | perf | yes | 4 | - | 3923.7 | 354.1 | - | - | 1176 |
-| F16 | perf | yes | 8 | - | 3555.4 | 528.7 | - | - | 2316 |
-| BF16 | perf | yes | 1 | - | 3814.3 | 119.0 | - | - | 283 |
-| BF16 | perf | yes | 8 | - | 3534.8 | 505.5 | - | - | 2316 |
-| BF16 | perf | yes | 16 | - | 2820.4 | 740.7 | - | - | 4624 |
-| BF16 | perf | yes | 48 | - | 2650.8 | 946.9 | - | - | 13796 |
-| Q8_0 | perf | yes | 32 | - | 2471.4 | 629.8 | 100.0% | 1.88x | 9220 |
-| Q4_0 | perf | yes | 32 | - | 2461.5 | 648.2 | 100.0% | 3.56x | 9220 |
+| F32 | perf | no | 1 | - | 4960.4 | 118.5 | - | - | 283 |
+| F16 | perf | yes | 1 | - | 4974.6 | 117.9 | - | - | 283 |
+| F16 | perf | yes | 4 | - | 5737.5 | 355.9 | - | - | 1176 |
+| F16 | perf | yes | 8 | - | 5511.0 | 536.6 | - | - | 2316 |
+| BF16 | perf | yes | 1 | - | 4966.8 | 120.6 | - | - | 283 |
+| BF16 | perf | yes | 8 | - | 5479.6 | 543.3 | - | - | 2316 |
+| BF16 | perf | yes | 16 | - | 4869.2 | 741.0 | - | - | 4624 |
+| BF16 | perf | yes | 48 | - | 4600.2 | 934.9 | - | - | 13796 |
+| Q8_0 | perf | yes | 32 | - | 4309.8 | 605.9 | 100.0% | 1.88x | 9220 |
+| Q4_0 | perf | yes | 32 | - | 4284.1 | 635.2 | 100.0% | 3.56x | 9220 |
 
 #### Qwen3-8B
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| BF16 | perf | no | 1 | ✓ | 3264.8 | 85.0 | - | - | 636 |
-| F16 | perf | yes | 1 | ✓ | 3252.8 | 84.7 | - | - | 636 |
-| F16 | perf | yes | 2 | ✓ | 3224.1 | 146.0 | - | - | 1312 |
-| BF16 | perf | yes | 4 | ✓ | 2808.7 | 261.1 | - | - | 2586 |
-| Q8_0 | perf | yes | 4 | ✓ | 2802.3 | 231.5 | 100.0% | 1.88x | 2586 |
-| C0 | perf | yes | 1 | ✓ | 3221.9 | 78.8 | 100.0% | 1.91x | 636 |
-| C1 | perf | yes | 1 | ✓ | 3285.0 | 79.1 | 100.0% | 2.56x | 636 |
-| C2 | perf | yes | 1 | ✓ | 3216.6 | 79.8 | 100.0% | 2.79x | 636 |
-| C3 | perf | yes | 1 | ✓ | 3213.4 | 80.7 | 100.0% | 3.28x | 636 |
-| C4 | perf | yes | 1 | ✓ | 3214.8 | 79.1 | 100.0% | 3.21x | 636 |
-| C5 | perf | yes | 1 | ✓ | 3220.7 | 79.6 | 100.0% | 3.40x | 636 |
-| C6 | perf | yes | 1 | ✓ | 3236.4 | 78.9 | 100.0% | 4.04x | 636 |
-| C7 | perf | yes | 1 | ✓ | 3237.0 | 79.1 | 100.0% | 4.31x | 636 |
-| C8 | perf | yes | 10 | ✓ | 2379.0 | 380.5 | 100.0% | 4.79x | 6410 |
-| C9 | perf | yes | 5 | ✓ | 2562.3 | 270.3 | 100.0% | 5.17x | 3222 |
-| C10 | perf | yes | 5 | ✓ | 2542.4 | 269.4 | 100.0% | 5.82x | 3222 |
+| BF16 | perf | no | 1 | ✓ | 4914.3 | 85.6 | - | - | 636 |
+| F16 | perf | yes | 1 | ✓ | 4913.4 | 84.9 | - | - | 636 |
+| F16 | perf | yes | 2 | ✓ | 5285.5 | 146.3 | - | - | 1312 |
+| BF16 | perf | yes | 4 | ✓ | 5168.3 | 259.8 | - | - | 2586 |
+| Q8_0 | perf | yes | 4 | ✓ | 5139.6 | 230.7 | 100.0% | 1.88x | 2586 |
+| C0 | perf | yes | 1 | ✓ | 4865.3 | 78.1 | 100.0% | 1.91x | 636 |
+| C1 | perf | yes | 1 | ✓ | 4772.8 | 78.8 | 100.0% | 2.56x | 636 |
+| C2 | perf | yes | 1 | ✓ | 4892.7 | 79.4 | 100.0% | 2.79x | 636 |
+| C3 | perf | yes | 1 | ✓ | 4871.0 | 78.7 | 100.0% | 3.28x | 636 |
+| C4 | perf | yes | 1 | ✓ | 4838.8 | 78.5 | 100.0% | 3.21x | 636 |
+| C5 | perf | yes | 1 | ✓ | 4896.3 | 78.5 | 100.0% | 3.40x | 636 |
+| C6 | perf | yes | 1 | ✓ | 4909.1 | 78.0 | 100.0% | 4.04x | 636 |
+| C7 | perf | yes | 1 | ✓ | 4791.3 | 78.3 | 100.0% | 4.31x | 636 |
+| C8 | perf | yes | 10 | ✓ | 4664.1 | 383.8 | 100.0% | 4.79x | 6410 |
+| C9 | perf | yes | 5 | ✓ | 4987.3 | 270.6 | 100.0% | 5.17x | 3222 |
+| C10 | perf | yes | 5 | ✓ | 5001.8 | 269.8 | 100.0% | 5.82x | 3222 |
 
 #### Qwen3.5-9B
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| F16 | prec | yes | 1 | ✓ | 3344.8 | 137.8 | - | - | 659 |
-| BF16 | prec | yes | 1 | ✓ | 3304.5 | 145.6 | - | - | 659 |
-| BF16 | prec | yes | 4 | ✓ | 2873.2 | 527.6 | - | - | 2678 |
-| Q8_0 | prec | yes | 4 | ✓ | 2875.4 | 497.5 | 100.0% | 1.88x | 2678 |
-| C0 | prec | yes | 1 | ✓ | 3319.5 | 148.0 | 100.0% | 2.20x | 659 |
-| C1 | prec | yes | 1 | ✓ | 3322.1 | 155.2 | 100.0% | 2.43x | 659 |
-| C2 | prec | yes | 1 | ✓ | 3334.5 | 155.9 | 100.0% | 2.72x | 659 |
-| C3 | prec | yes | 1 | ✓ | 3315.4 | 156.5 | 100.0% | 3.19x | 659 |
-| C4 | prec | yes | 1 | ✓ | 3315.4 | 155.2 | 100.0% | 3.26x | 659 |
-| C5 | prec | yes | 1 | ✓ | 3313.1 | 155.5 | 100.0% | 3.60x | 659 |
-| C6 | prec | yes | 1 | ✓ | 3312.7 | 154.8 | 100.0% | 4.04x | 659 |
-| C7 | prec | yes | 1 | ✓ | 3319.9 | 155.3 | 100.0% | 4.23x | 659 |
-| C8 | prec | yes | 20 | ✓ | 2808.4 | 945.8 | 100.0% | 4.71x | 13278 |
-| C9 | prec | yes | 5 | ✓ | 2665.9 | 583.9 | 100.0% | 5.17x | 3337 |
-| C10 | prec | yes | 10 | ✓ | 2877.4 | 860.4 | 100.0% | 5.57x | 6640 |
+| F16 | prec | yes | 1 | ✓ | 5788.8 | 144.8 | - | - | 659 |
+| BF16 | prec | yes | 1 | ✓ | 5804.9 | 146.1 | - | - | 659 |
+| BF16 | prec | yes | 4 | ✓ | 6735.3 | 549.1 | - | - | 2678 |
+| Q8_0 | prec | yes | 4 | ✓ | 6716.1 | 543.1 | 100.0% | 1.88x | 2678 |
+| C0 | prec | yes | 1 | ✓ | 5782.3 | 157.7 | 100.0% | 2.20x | 659 |
+| C1 | prec | yes | 1 | ✓ | 5808.7 | 158.4 | 100.0% | 2.43x | 659 |
+| C2 | prec | yes | 1 | ✓ | 5795.1 | 158.2 | 100.0% | 2.72x | 659 |
+| C3 | prec | yes | 1 | ✓ | 5780.3 | 158.7 | 100.0% | 3.19x | 659 |
+| C4 | prec | yes | 1 | ✓ | 5800.9 | 158.0 | 100.0% | 3.26x | 659 |
+| C5 | prec | yes | 1 | ✓ | 5780.7 | 158.5 | 100.0% | 3.60x | 659 |
+| C6 | prec | yes | 1 | ✓ | 5789.7 | 157.4 | 100.0% | 4.04x | 659 |
+| C7 | prec | yes | 1 | ✓ | 5777.4 | 157.6 | 100.0% | 4.23x | 659 |
+| C8 | prec | yes | 20 | ✓ | 6435.7 | 926.2 | 100.0% | 4.71x | 13278 |
+| C9 | prec | yes | 5 | ✓ | 6687.4 | 588.9 | 100.0% | 5.17x | 3337 |
+| C10 | prec | yes | 10 | ✓ | 6395.6 | 880.6 | 100.0% | 5.57x | 6640 |
 
 #### Qwen3.8-27B
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| BF16 | perf | yes | 1 | ✓ | 1089.3 | 69.1 | - | - | 659 |
-| BF16 | perf | yes | 4 | ✓ | 840.0 | 254.6 | - | - | 2678 |
-| Q8_0 | perf | yes | 4 | ✓ | 840.2 | 248.8 | 100.0% | 1.88x | 2678 |
-| C0 | perf | yes | 1 | ✓ | 1083.0 | 82.2 | 100.0% | 2.17x | 659 |
-| C1 | perf | yes | 1 | ✓ | 1083.5 | 82.5 | 100.0% | 2.33x | 659 |
-| C2 | perf | yes | 1 | ✓ | 1082.3 | 83.4 | 100.0% | 2.57x | 659 |
-| C3 | perf | yes | 1 | ✓ | 1081.8 | 82.3 | 100.0% | 3.10x | 659 |
-| C4 | perf | yes | 1 | ✓ | 1081.9 | 80.8 | 100.0% | 3.03x | 659 |
-| C5 | perf | yes | 1 | ✓ | 1085.4 | 81.9 | 100.0% | 3.42x | 659 |
-| C6 | perf | yes | 1 | ✓ | 1081.8 | 82.3 | 100.0% | 3.81x | 659 |
-| C7 | perf | yes | 1 | ✓ | 1083.3 | 82.3 | 100.0% | 3.96x | 659 |
-| C8 | perf | yes | 20 | ✓ | 948.5 | 366.4 | 100.0% | 4.39x | 13278 |
-| C9 | perf | yes | 5 | ✓ | 984.9 | 289.0 | 100.0% | 4.77x | 3337 |
-| C10 | perf | yes | 10 | ✓ | 878.6 | 349.1 | 100.0% | 5.05x | 6640 |
+| BF16 | perf | yes | 1 | ✓ | 1854.7 | 70.8 | - | - | 659 |
+| BF16 | perf | yes | 4 | ✓ | 2067.0 | 263.1 | - | - | 2678 |
+| Q8_0 | perf | yes | 4 | ✓ | 2061.5 | 250.2 | 100.0% | 1.88x | 2678 |
+| C0 | perf | yes | 1 | ✓ | 1851.7 | 81.0 | 100.0% | 2.17x | 659 |
+| C1 | perf | yes | 1 | ✓ | 1852.2 | 80.4 | 100.0% | 2.33x | 659 |
+| C2 | perf | yes | 1 | ✓ | 1853.6 | 82.2 | 100.0% | 2.57x | 659 |
+| C3 | perf | yes | 1 | ✓ | 1855.3 | 81.3 | 100.0% | 3.10x | 659 |
+| C4 | perf | yes | 1 | ✓ | 1846.2 | 81.9 | 100.0% | 3.03x | 659 |
+| C5 | perf | yes | 1 | ✓ | 1856.0 | 80.6 | 100.0% | 3.42x | 659 |
+| C6 | perf | yes | 1 | ✓ | 1847.3 | 81.3 | 100.0% | 3.81x | 659 |
+| C7 | perf | yes | 1 | ✓ | 1845.9 | 81.3 | 100.0% | 3.96x | 659 |
+| C8 | perf | yes | 20 | ✓ | 1999.7 | 358.7 | 100.0% | 4.39x | 13278 |
+| C9 | perf | yes | 5 | ✓ | 2004.0 | 288.9 | 100.0% | 4.77x | 3337 |
+| C10 | perf | yes | 10 | ✓ | 2007.6 | 341.6 | 100.0% | 5.05x | 6640 |
 
 C10 ×10 read 390.1 t/s in the 2026-10-05 sweep (`5776799ac`), the figure the summary
-keeps; it has read 307–349 on every build since, while the ×1 and ×4 rows rose 12–20%.
+keeps; it has read 307–349 on every build since.
 
 #### Qwen3-30B-A3B
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| F16 | perf | yes | 1 | ✓ | 2586.9 | 51.2 | - | - | 626 |
-| BF16 | perf | yes | 1 | ✓ | 3845.2 | 69.6 | - | - | 626 |
-| BF16 | perf | yes | 10 | ✓ | 5023.8 | 388.5 | - | - | 6310 |
-| Q8_0 | perf | yes | 20 | ✓ | 4987.8 | 368.6 | 100.0% | 1.88x | 12620 |
-| Q4_0 | perf | yes | 4 | - | 5056.5 | 191.6 | 100.0% | 3.56x | 2546 |
-| C0 | perf | yes | 2 | ✓ | 4742.0 | 116.3 | 100.0% | 2.03x | 1292 |
-| C1 | perf | yes | 2 | ✓ | 4754.6 | 117.7 | 100.0% | 2.49x | 1292 |
-| C2 | perf | yes | 2 | ✓ | 4751.9 | 117.3 | 100.0% | 2.70x | 1292 |
-| C3 | perf | yes | 2 | ✓ | 4744.4 | 116.2 | 100.0% | 3.20x | 1292 |
-| C4 | perf | yes | 2 | ✓ | 4746.0 | 115.7 | 100.0% | 3.10x | 1292 |
-| C5 | perf | yes | 2 | ✓ | 4747.3 | 116.2 | 100.0% | 3.35x | 1292 |
-| C5 | perf | yes | 8 | ✓ | 4962.9 | 300.5 | 100.0% | 3.35x | 5052 |
-| C6 | perf | yes | 2 | ✓ | 4744.7 | 116.1 | 100.0% | 3.86x | 1292 |
-| C7 | perf | yes | 2 | ✓ | 4753.5 | 116.1 | 100.0% | 4.06x | 1292 |
-| C8 | perf | yes | 2 | ✓ | 4746.2 | 116.6 | 100.0% | 4.57x | 1292 |
-| C9 | perf | yes | 2 | ✓ | 4749.2 | 115.7 | 100.0% | 5.01x | 1292 |
-| C10 | perf | yes | 2 | ✓ | 4728.2 | 115.5 | 100.0% | 5.45x | 1292 |
-| BF16 | perf | yes | 1 | ✓ | 4091.1 | 71.8 | - | - | 626 |
-| Q4_0 | perf | yes | 20 | - | 4980.1 | 389.4 | 100.0% | 3.56x | 12620 |
+| F16 | perf | yes | 1 | ✓ | 2715.8 | 55.4 | - | - | 626 |
+| BF16 | perf | yes | 1 | ✓ | 4117.2 | 69.9 | - | - | 626 |
+| BF16 | perf | yes | 10 | ✓ | 6821.5 | 400.5 | - | - | 6310 |
+| Q8_0 | perf | yes | 20 | ✓ | 6671.8 | 377.7 | 100.0% | 1.88x | 12620 |
+| Q4_0 | perf | yes | 4 | - | 6709.1 | 193.7 | 100.0% | 3.56x | 2546 |
+| C0 | perf | yes | 2 | ✓ | 6395.6 | 119.7 | 100.0% | 2.03x | 1292 |
+| C1 | perf | yes | 2 | ✓ | 6402.1 | 120.8 | 100.0% | 2.49x | 1292 |
+| C2 | perf | yes | 2 | ✓ | 6369.1 | 120.7 | 100.0% | 2.70x | 1292 |
+| C3 | perf | yes | 2 | ✓ | 6362.2 | 119.5 | 100.0% | 3.20x | 1292 |
+| C4 | perf | yes | 2 | ✓ | 6398.5 | 119.4 | 100.0% | 3.10x | 1292 |
+| C5 | perf | yes | 2 | ✓ | 6372.7 | 119.2 | 100.0% | 3.35x | 1292 |
+| C5 | perf | yes | 8 | ✓ | 6655.0 | 310.7 | 100.0% | 3.35x | 5052 |
+| C6 | perf | yes | 2 | ✓ | 6371.8 | 121.2 | 100.0% | 3.86x | 1292 |
+| C7 | perf | yes | 2 | ✓ | 6397.4 | 121.9 | 100.0% | 4.06x | 1292 |
+| C8 | perf | yes | 2 | ✓ | 6397.8 | 122.0 | 100.0% | 4.57x | 1292 |
+| C9 | perf | yes | 2 | ✓ | 6408.8 | 122.0 | 100.0% | 5.01x | 1292 |
+| C10 | perf | yes | 2 | ✓ | 6419.6 | 120.9 | 100.0% | 5.45x | 1292 |
+| BF16 | perf | yes | 1 | ✓ | 4370.4 | 72.7 | - | - | 626 |
+| Q4_0 | perf | yes | 20 | - | 6662.5 | 390.4 | 100.0% | 3.56x | 12620 |
 
 #### Qwen3.5-35B-A3B
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| BF16 | perf | yes | 1 | ✓ | 1511.3 | 59.1 | - | - | 659 |
-| BF16 | perf | yes | 4 | ✓ | 4729.6 | 568.7 | - | - | 2678 |
-| Q8_0 | perf | yes | 2 | ✓ | 5392.4 | 316.6 | 100.0% | 1.88x | 1358 |
-| C0 | perf | yes | 1 | ✓ | 4600.9 | 185.2 | 100.0% | 2.21x | 659 |
-| C1 | perf | yes | 1 | ✓ | 4606.3 | 187.8 | 100.0% | 2.85x | 659 |
-| C2 | perf | yes | 1 | ✓ | 4594.9 | 179.4 | 100.0% | 3.24x | 659 |
-| C3 | perf | yes | 1 | ✓ | 4671.7 | 188.1 | 100.0% | 3.39x | 659 |
-| C4 | perf | yes | 1 | ✓ | 4587.2 | 185.6 | 100.0% | 3.73x | 659 |
-| C5 | perf | yes | 1 | ✓ | 4615.8 | 186.2 | 100.0% | 4.03x | 659 |
-| C6 | perf | yes | 1 | ✓ | 4608.1 | 185.7 | 100.0% | 4.62x | 659 |
-| C7 | perf | yes | 1 | ✓ | 4587.8 | 187.0 | 100.0% | 4.90x | 659 |
-| C8 | perf | yes | 5 | ✓ | 5801.6 | 636.2 | 100.0% | 5.52x | 3337 |
-| C9 | perf | yes | 2 | ✓ | 5421.0 | 336.1 | 100.0% | 6.23x | 1358 |
-| C10 | perf | yes | 8 | ✓ | 5698.3 | 830.3 | 100.0% | 7.03x | 5316 |
-| C10 | perf | yes | 16 | ✓ | 5587.4 | 1067.3 | 100.0% | 7.01x | 10618 |
+| BF16 | perf | yes | 1 | ✓ | 1610.8 | 78.1 | - | - | 659 |
+| BF16 | perf | yes | 4 | ✓ | 7094.1 | 618.4 | - | - | 2678 |
+| Q8_0 | perf | yes | 2 | ✓ | 8775.2 | 339.8 | 100.0% | 1.88x | 1358 |
+| C0 | perf | yes | 1 | ✓ | 5710.6 | 201.6 | 100.0% | 2.21x | 659 |
+| C1 | perf | yes | 1 | ✓ | 5716.2 | 203.0 | 100.0% | 2.85x | 659 |
+| C2 | perf | yes | 1 | ✓ | 5722.1 | 200.9 | 100.0% | 3.24x | 659 |
+| C3 | perf | yes | 1 | ✓ | 5683.2 | 200.3 | 100.0% | 3.39x | 659 |
+| C4 | perf | yes | 1 | ✓ | 5699.4 | 199.5 | 100.0% | 3.73x | 659 |
+| C5 | perf | yes | 1 | ✓ | 5704.8 | 127.0 | 100.0% | 4.03x | 659 |
+| C6 | perf | yes | 1 | ✓ | 4152.1 | 199.4 | 100.0% | 4.62x | 659 |
+| C7 | perf | yes | 1 | ✓ | 5705.2 | 200.2 | 100.0% | 4.90x | 659 |
+| C8 | perf | yes | 5 | ✓ | 10041.6 | 674.4 | 100.0% | 5.52x | 3337 |
+| C9 | perf | yes | 2 | ✓ | 8806.0 | 351.4 | 100.0% | 6.23x | 1358 |
+| C10 | perf | yes | 8 | ✓ | 9694.0 | 888.6 | 100.0% | 7.03x | 5316 |
+| C10 | perf | yes | 16 | ✓ | 9439.8 | 1228.8 | 100.0% | 7.01x | 10618 |
 
 #### Qwen3.6-35B-A3B
 
@@ -996,22 +1002,22 @@ eight sessions (`draft_ladder.rs`), at 4.90 accepted tokens a step.
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| BF16 | prec | yes | 1 | ✓ | 1046.1 | 199.3 | - | - | 905 |
-| BF16 | prec | yes | 4 | ✓ | 4283.8 | 865.4 | - | - | 3662 |
-| Q8_0 | prec | yes | 1 | ✓ | 2499.7 | 309.8 | 100.0% | 1.88x | 905 |
-| C0 | prec | yes | 1 | ✓ | 2511.5 | 311.5 | 100.0% | 2.21x | 905 |
-| C1 | prec | yes | 1 | ✓ | 2528.6 | 310.6 | 100.0% | 2.66x | 905 |
-| C2 | prec | yes | 1 | ✓ | 2533.1 | 309.2 | 100.0% | 3.11x | 905 |
-| C3 | prec | yes | 1 | ✓ | 2550.0 | 308.7 | 100.0% | 3.34x | 905 |
-| C4 | prec | yes | 1 | ✓ | 2558.1 | 306.3 | 100.0% | 3.58x | 905 |
-| C5 | prec | yes | 1 | ✓ | 2585.0 | 307.2 | 100.0% | 3.91x | 905 |
-| C5 | prec | yes | 8 | ✓ | 4365.8 | 1130.6 | 100.0% | 3.91x | 7284 |
-| C6 | prec | yes | 1 | ✓ | 2583.0 | 297.6 | 100.0% | 4.40x | 905 |
-| C7 | prec | yes | 1 | ✓ | 2564.9 | 298.9 | 100.0% | 4.61x | 905 |
-| C8 | prec | yes | 5 | ✓ | 5007.9 | 953.2 | 100.0% | 5.24x | 4567 |
-| C9 | prec | yes | 2 | ✓ | 3788.8 | 477.0 | 100.0% | 5.83x | 1466 |
-| C10 | prec | yes | 8 | ✓ | 4427.8 | 937.0 | 100.0% | 6.43x | 5748 |
-| C10 | prec | yes | 16 | ✓ | 4574.6 | 1228.6 | 100.0% | 6.42x | 11482 |
+| BF16 | prec | yes | 1 | ✓ | 1094.2 | 228.0 | - | - | 905 |
+| BF16 | prec | yes | 4 | ✓ | 6024.3 | 911.6 | - | - | 3662 |
+| Q8_0 | prec | yes | 1 | ✓ | 2777.8 | 324.5 | 100.0% | 1.88x | 905 |
+| C0 | prec | yes | 1 | ✓ | 2791.8 | 322.1 | 100.0% | 2.21x | 905 |
+| C1 | prec | yes | 1 | ✓ | 2818.4 | 320.5 | 100.0% | 2.66x | 905 |
+| C2 | prec | yes | 1 | ✓ | 2833.0 | 319.4 | 100.0% | 3.11x | 905 |
+| C3 | prec | yes | 1 | ✓ | 2844.2 | 319.0 | 100.0% | 3.34x | 905 |
+| C4 | prec | yes | 1 | ✓ | 2857.4 | 316.0 | 100.0% | 3.58x | 905 |
+| C5 | prec | yes | 1 | ✓ | 2894.5 | 317.9 | 100.0% | 3.91x | 905 |
+| C5 | prec | yes | 8 | ✓ | 5862.9 | 1171.3 | 100.0% | 3.91x | 7284 |
+| C6 | prec | yes | 1 | ✓ | 2943.1 | 310.0 | 100.0% | 4.40x | 905 |
+| C7 | prec | yes | 1 | ✓ | 2943.2 | 310.1 | 100.0% | 4.61x | 905 |
+| C8 | prec | yes | 5 | ✓ | 7184.4 | 976.1 | 100.0% | 5.24x | 4567 |
+| C9 | prec | yes | 2 | ✓ | 4856.9 | 484.5 | 100.0% | 5.83x | 1466 |
+| C10 | prec | yes | 8 | ✓ | 6079.7 | 991.4 | 100.0% | 6.43x | 5748 |
+| C10 | prec | yes | 16 | ✓ | 6481.5 | 1346.3 | 100.0% | 6.42x | 11482 |
 
 #### Qwen3.6-35B AntiLoop+StyleTune (auto/Precision)
 
@@ -1020,25 +1026,26 @@ at `Int8Mode::auto` (Precision on this int8-MMA-less card).
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| BF16 | prec | yes | 1 | ✓ | 1148.5 | 46.3 | - | - | 659 |
-| BF16 | prec | yes | 4 | ✓ | 4351.6 | 497.8 | - | - | 2678 |
-| Q8_0 | prec | yes | 1 | ✓ | 2670.2 | 182.1 | 100.0% | 1.88x | 659 |
-| C0 | prec | yes | 1 | ✓ | 3156.3 | 218.3 | 100.0% | 2.21x | 659 |
-| C1 | prec | yes | 1 | ✓ | 3178.1 | 215.0 | 100.0% | 2.67x | 659 |
-| C2 | prec | yes | 1 | ✓ | 3176.5 | 218.2 | 100.0% | 3.13x | 659 |
-| C3 | prec | yes | 1 | ✓ | 3167.5 | 215.8 | 100.0% | 3.35x | 659 |
-| C4 | prec | yes | 1 | ✓ | 3160.3 | 205.2 | 100.0% | 3.59x | 659 |
-| C5 | prec | yes | 1 | ✓ | 3142.8 | 137.9 | 100.0% | 3.91x | 659 |
-| C5 | prec | yes | 8 | ✓ | 5122.9 | 768.1 | 100.0% | 3.91x | 5316 |
-| C6 | prec | yes | 1 | ✓ | 3354.2 | 210.2 | 100.0% | 4.41x | 659 |
-| C7 | prec | yes | 1 | ✓ | 4610.9 | 153.2 | 100.0% | 4.64x | 659 |
-| C8 | prec | yes | 5 | ✓ | 5847.3 | 679.9 | 100.0% | 5.24x | 3337 |
-| C9 | prec | yes | 2 | ✓ | 5359.1 | 376.5 | 100.0% | 5.83x | 1358 |
-| C10 | prec | yes | 8 | ✓ | 5666.7 | 822.6 | 100.0% | 6.47x | 5316 |
-| C10 | prec | yes | 16 | ✓ | 5025.4 | 1046.7 | 100.0% | 6.46x | 10618 |
+| BF16 | prec | yes | 1 | ✓ | 1198.4 | 63.3 | - | - | 659 |
+| BF16 | prec | yes | 4 | ✓ | 5991.7 | 559.8 | - | - | 2678 |
+| Q8_0 | prec | yes | 1 | ✓ | 2980.8 | 200.6 | 100.0% | 1.88x | 659 |
+| C0 | prec | yes | 1 | ✓ | 3635.4 | 231.8 | 100.0% | 2.21x | 659 |
+| C1 | prec | yes | 1 | ✓ | 3617.1 | 227.9 | 100.0% | 2.67x | 659 |
+| C2 | prec | yes | 1 | ✓ | 3608.0 | 231.9 | 100.0% | 3.13x | 659 |
+| C3 | prec | yes | 1 | ✓ | 3645.1 | 228.3 | 100.0% | 3.35x | 659 |
+| C4 | prec | yes | 1 | ✓ | 3626.9 | 219.7 | 100.0% | 3.59x | 659 |
+| C5 | prec | yes | 1 | ✓ | 3586.8 | 149.9 | 100.0% | 3.91x | 659 |
+| C5 | prec | yes | 8 | ✓ | 7568.4 | 829.9 | 100.0% | 3.91x | 5316 |
+| C6 | prec | yes | 1 | ✓ | 3809.5 | 219.2 | 100.0% | 4.41x | 659 |
+| C7 | prec | yes | 1 | ✓ | 3915.2 | 163.4 | 100.0% | 4.64x | 659 |
+| C8 | prec | yes | 5 | ✓ | 8348.6 | 711.0 | 100.0% | 5.24x | 3337 |
+| C9 | prec | yes | 2 | ✓ | 6451.2 | 386.7 | 100.0% | 5.83x | 1358 |
+| C10 | prec | yes | 8 | ✓ | 8121.1 | 900.5 | 100.0% | 6.47x | 5316 |
+| C10 | prec | yes | 16 | ✓ | 7226.2 | 1166.7 | 100.0% | 6.46x | 10618 |
 
-The gate decodes 10 tokens a row, at the same depth-4 drafting; C5 and C7 ×1 each
-rejected an early proposal, which a three-step row has no room to amortise.
+The gate decodes 10 tokens a row, at the same depth-4 drafting; C5 and C7 ×1 read
+under their neighbours, as on 2026-10-07, where an early rejected proposal leaves a
+three-step row no room to amortise it.
 
 #### Qwen3.6-35B AntiLoop+StyleTune (Performance)
 
@@ -1047,22 +1054,22 @@ the `auto`/Precision row above.
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| BF16 | perf | yes | 1 | ✓ | 1730.2 | 62.2 | - | - | 659 |
-| BF16 | perf | yes | 4 | ✓ | 5078.5 | 584.7 | - | - | 2678 |
-| Q8_0 | perf | yes | 1 | ✓ | 4792.5 | 197.5 | 100.0% | 1.88x | 659 |
-| C0 | perf | yes | 1 | ✓ | 4778.7 | 218.2 | 100.0% | 2.21x | 659 |
-| C1 | perf | yes | 1 | ✓ | 4844.5 | 226.2 | 100.0% | 2.66x | 659 |
-| C2 | perf | yes | 1 | ✓ | 4808.9 | 226.8 | 100.0% | 3.12x | 659 |
-| C3 | perf | yes | 1 | ✓ | 4780.3 | 225.4 | 100.0% | 3.35x | 659 |
-| C4 | perf | yes | 1 | ✓ | 4793.3 | 157.0 | 100.0% | 3.58x | 659 |
-| C5 | perf | yes | 1 | ✓ | 4775.8 | 222.8 | 100.0% | 3.91x | 659 |
-| C5 | perf | yes | 8 | ✓ | 5986.0 | 889.7 | 100.0% | 3.91x | 5316 |
-| C6 | perf | yes | 1 | ✓ | 4764.5 | 158.3 | 100.0% | 4.40x | 659 |
-| C7 | perf | yes | 1 | ✓ | 4822.9 | 160.3 | 100.0% | 4.63x | 659 |
-| C8 | perf | yes | 5 | ✓ | 6087.3 | 743.3 | 100.0% | 5.22x | 3337 |
-| C9 | perf | yes | 2 | ✓ | 5618.2 | 393.9 | 100.0% | 5.81x | 1358 |
-| C10 | perf | yes | 8 | ✓ | 5984.6 | 746.1 | 100.0% | 6.45x | 5316 |
-| C10 | perf | yes | 16 | ✓ | 5939.0 | 1162.0 | 100.0% | 6.42x | 10618 |
+| BF16 | perf | yes | 1 | ✓ | 1864.5 | 80.7 | - | - | 659 |
+| BF16 | perf | yes | 4 | ✓ | 7590.5 | 650.3 | - | - | 2678 |
+| Q8_0 | perf | yes | 1 | ✓ | 5827.0 | 213.9 | 100.0% | 1.88x | 659 |
+| C0 | perf | yes | 1 | ✓ | 5853.2 | 240.0 | 100.0% | 2.21x | 659 |
+| C1 | perf | yes | 1 | ✓ | 5836.0 | 153.5 | 100.0% | 2.66x | 659 |
+| C2 | perf | yes | 1 | ✓ | 4440.6 | 237.9 | 100.0% | 3.12x | 659 |
+| C3 | perf | yes | 1 | ✓ | 5899.2 | 242.8 | 100.0% | 3.35x | 659 |
+| C4 | perf | yes | 1 | ✓ | 5830.4 | 112.9 | 100.0% | 3.58x | 659 |
+| C5 | perf | yes | 1 | ✓ | 5696.0 | 221.8 | 100.0% | 3.91x | 659 |
+| C5 | perf | yes | 8 | ✓ | 9917.7 | 947.4 | 100.0% | 3.91x | 5316 |
+| C6 | perf | yes | 1 | ✓ | 5828.5 | 171.0 | 100.0% | 4.40x | 659 |
+| C7 | perf | yes | 1 | ✓ | 5853.4 | 173.8 | 100.0% | 4.63x | 659 |
+| C8 | perf | yes | 5 | ✓ | 10221.6 | 764.7 | 100.0% | 5.22x | 3337 |
+| C9 | perf | yes | 2 | ✓ | 8961.1 | 404.2 | 100.0% | 5.81x | 1358 |
+| C10 | perf | yes | 8 | ✓ | 9902.3 | 790.9 | 100.0% | 6.45x | 5316 |
+| C10 | perf | yes | 16 | ✓ | 9907.9 | 1269.0 | 100.0% | 6.42x | 10618 |
 
 #### Qwen3.8-Flash-Next (Q2_KO experts)
 
@@ -1077,56 +1084,66 @@ NVMe pack. The 4090 Mobile's 31.5 GiB host cannot hold that tier.
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
-| BF16 | prec | yes | 1 (cold) | ✓ | 253.9 | 88.6 | - | - | 905 |
-| BF16 | prec | yes | 4 | ✓ | 1351.8 | 312.5 | - | - | 3662 |
-| BF16 | prec | yes | 8 | ✓ | 1576.3 | 413.7 | - | - | 7284 |
-| BF16 | prec | yes | 16 | ✓ | 1667.8 | 460.8 | - | - | 14554 |
-| BF16 | prec | yes | 1 (warm) | ✓ | 528.7 | 122.8 | - | - | 905 |
-| C0 | prec | yes | 2 | ✓ | 936.5 | 220.4 | 100.0% | 2.19x | 1850 |
-| C5 | prec | yes | 2 | ✓ | 932.0 | 216.0 | 100.0% | 3.80x | 1850 |
-| C5 | prec | yes | 8 | ✓ | 1572.8 | 359.3 | 100.0% | 3.79x | 7284 |
-| C8 | prec | yes | 2 | ✓ | 920.6 | 202.0 | 100.0% | 4.87x | 1850 |
-| C10 | prec | yes | 2 | ✓ | 932.8 | 183.4 | 100.0% | 5.83x | 1466 |
-| C10 | prec | yes | 8 | ✓ | 1583.5 | 306.3 | 100.0% | 5.80x | 5748 |
+| BF16 | prec | yes | 1 (cold) | ✓ | 270.6 | 97.3 | - | - | 905 |
+| BF16 | prec | yes | 4 | ✓ | 1570.5 | 320.5 | - | - | 3662 |
+| BF16 | prec | yes | 8 | ✓ | 2051.7 | 477.2 | - | - | 7284 |
+| BF16 | prec | yes | 16 | ✓ | 2301.9 | 543.8 | - | - | 14554 |
+| BF16 | prec | yes | 1 (warm) | ✓ | 556.5 | 138.1 | - | - | 905 |
+| C0 | prec | yes | 2 | ✓ | 1036.1 | 222.0 | 100.0% | 2.19x | 1850 |
+| C5 | prec | yes | 2 | ✓ | 1025.1 | 212.0 | 100.0% | 3.80x | 1850 |
+| C5 | prec | yes | 8 | ✓ | 2053.8 | 417.1 | 100.0% | 3.79x | 7284 |
+| C8 | prec | yes | 2 | ✓ | 1010.0 | 210.0 | 100.0% | 4.87x | 1850 |
+| C10 | prec | yes | 2 | ✓ | 1024.5 | 191.1 | 100.0% | 5.83x | 1466 |
+| C10 | prec | yes | 8 | ✓ | 2078.9 | 361.6 | 100.0% | 5.80x | 5748 |
 
-**One warm session decodes 122.8 t/s, and sixteen reach 460.8 t/s aggregate.**
-The gate decodes 256 tokens a row now (C9/C10 at 64), where the 2026-10-05 sweep
-decoded 64. The model's first run on this card, on 2026-09-30 (build `e596fad8d`),
-read 24.3 t/s for one warm session, 113.2 at ×8, 147.0 at ×16 and 95.6 at C10
-×8, with prefill at ×4 of 1,033.4. Against that run, decode is 5.1× at one
-session, 3.7× at ×8, 3.1× at ×16 and 3.2× at C10 ×8, and prefill at ×4 is up 31%.
-The 2026-10-05 sweep (`5776799ac`) stood at 73.3, 233.8, 226.6 and 255.1: the decode
-hot-path work that landed by 2026-10-04 (fused MoE shared-expert residual, fused
-hyper-connection producers, host-side wave overhead, QSA index pages resident in
-the span) doubled decode across the ladder, the live MoE dispatch added 40–47% to
-the compressed ×2 rows, and the single-session decode work since — a Q4 draft
-head with a recorded draft walk, latency-bound split-K and verify-attention
-kernels, stacked MoE input projections — took the rest. C10 here is the retuned
-row (K 1.35, V 1.9): 5.80× at ×8, 5.83× at ×2.
+**One warm session decodes 138.1 t/s, and sixteen reach 543.8 t/s aggregate.**
+The gate decodes 256 tokens a row (C9/C10 at 64); the 2026-10-05 sweep decoded 64.
+The model's first run on this card, on 2026-09-30 (build `e596fad8d`), read 24.3
+t/s for one warm session, 113.2 at ×8, 147.0 at ×16 and 95.6 at C10 ×8, with
+prefill at ×4 of 1,033.4. Against that run, decode is 5.7× at one session, 4.2× at
+×8, 3.7× at ×16 and 3.8× at C10 ×8, and prefill at ×4 is up 52%. The 2026-10-05
+sweep (`5776799ac`) stood at 73.3, 233.8, 226.6 and 255.1, and the 2026-10-07 sweep
+(`7aecbeab3`) at 122.8, 413.7, 460.8 and 306.3. The decode hot-path work that landed
+by 2026-10-04 (fused MoE shared-expert residual, fused hyper-connection producers,
+host-side wave overhead, QSA index pages resident in the span) doubled decode across
+the ladder, the live MoE dispatch added 40–47% to the compressed ×2 rows, and the
+single-session decode work after it — a Q4 draft head with a recorded draft walk,
+latency-bound split-K and verify-attention kernels, stacked MoE input projections —
+took it to the 2026-10-07 figures. Router look-ahead, wider copy workers, a give-up
+for cold waits and the blended read-ahead predictor added 12–18% more by 2026-10-10,
+and prefill at ×4–×16 rose 16–38%. C10 here is the retuned row (K 1.35, V 1.9):
+5.80× at ×8, 5.83× at ×2.
 
 **Against the 4090 Mobile (§3.9, 2026-10-10), same artifact.** BF16 decode at
-×8 is 413.7 against 108.5 t/s (3.8×), one warm session 122.8 against 34.9, and
-the 3090 adds a ×16 row; prefill at ×4 is 1,351.8 against 793.4.
+×8 is 477.2 against 108.5 t/s (4.4×), one warm session 138.1 against 34.9, and
+the 3090 adds a ×16 row; prefill at ×4 is 1,570.5 against 793.4.
 
 **Engine probes** (`kv_fragmentation`, §2.2), at the same build, under the same
 card-to-itself rule:
 
 | Probe | Story | Worst sustained VRAM efficiency | Weight uptake | Result |
 |---|---:|---:|---|---|
-| Qwen3-30B-A3B (`qwen3_30b_a3b_q4`) | 20/20 | 99% (single sample 76%) | at its limit | pass |
-| Qwen3.6-35B-A3B (`qwen36_35b_a3b_q4`) | 16/16 | 98% (single sample 56%) | at its limit, 96% uptake | pass |
-| Qwen3.8-Flash-Next (`qwen38_flash_next`) | 8/8 | 97% (single sample 72%) | 100% | pass |
+| Qwen3-30B-A3B (`qwen3_30b_a3b_q4`) | 20/20 | **59%** (single sample 48%) | at its limit | fail (efficiency) |
+| Qwen3.6-35B-A3B (`qwen36_35b_a3b_q4`) | 16/16 | 98% (single sample 56%) | at its limit, 100% uptake | pass |
+| Qwen3.8-Flash-Next (`qwen38_flash_next`) | 8/8 | **79%** (single sample 71%) | at its limit, 110% uptake | fail (efficiency) |
 
 The Qwen3.6-35B probe runs speculative decode with the model's NextN head, so
 every rejected draft rewinds the DeltaNet recurrent state; all sixteen sessions
-rewrote the story correctly. **The efficiency figures come from `7aecbeab3`.** Before
-it the Qwen3-30B and Flash-Next probes failed the 90% gate on this card (85% and
-76–78%, story correct throughout): compaction relocated every tenant's arenas into
-any hole below the frontier, so an arena under another tenant's live region was
-emptied into a hole the next pass refilled — Flash-Next's recurrent-state passes
-moved 912 slots each with the region count unchanged. It now relocates only the
-arenas holding the frontier (`region_pool::frontier_relocations`), with 24–28%
-fewer moves. The 2026-10-05 sweep read 99% / 99% / 98%.
+rewrote the story correctly. Every probe told its story in full, with no
+non-finite layer. **The Qwen3-30B and Flash-Next probes failed the 90% efficiency
+gate with KV compaction running**: 3,008 MiB and 1,264 MiB of the ground denied
+to the weight side were not holding KV. At `7aecbeab3` (2026-10-07) they read 99%
+and 97%. The 72 GB card recorded the same gate as open on 2026-10-10, flipping
+between about 80% and 99% from run to run; 59% is below that range. The cause is
+not yet established.
+
+At `7aecbeab3` compaction stopped relocating every tenant's arenas into any hole
+below the frontier — an arena under another tenant's live region was emptied into
+a hole the next pass refilled, and Flash-Next's recurrent-state passes moved 912
+slots each with the region count unchanged — and relocates only the arenas holding
+the frontier (`region_pool::frontier_relocations`), with 24–28% fewer moves. Before
+it these two probes read 85% and 76–78% on this card. The 2026-10-05 sweep read
+99% / 99% / 98%.
 
 ### 3.9 RTX 4090 Mobile 16 GB — the width gate sweep
 
@@ -1188,19 +1205,19 @@ this card at every build recorded (7.0 and 28.6 on 2026-09-30) while its other �
 rows decode at 82–83; they are not heat. The ladder below is the rerun.
 
 **Against the RTX 3090, on the models both ran.** The 3090's sweep (§3.8) is on
-build `7aecbeab3`, three days older than this one.
+build `c375834c8`, the same day as this one.
 
-- **Prefill is higher on the 16 GB card on every model** — Qwen2-0.5B 86,038 vs
-  54,333, Qwen3.5-0.8B 52,031 vs 24,696, Llama-3.2-3B 15,195 vs 7,276 (the 3090's
-  without flash-attn), Llama-2-7B 6,574 vs 3,987, Qwen3-8B 6,562 vs 3,285,
-  Qwen3.5-9B 7,602 vs 3,387, Qwen3.8-27B 2,319 vs 1,089, and on the streamed MoEs
-  Qwen3-30B 6,461 vs 5,076 — except the Qwen3.5/3.6-35B family and Flash-Next,
-  where the 3090 holds more of each expert set (3.5-35B 3,307 vs 5,806,
-  Flash-Next 1,129 vs 1,668).
+- **Prefill is higher on the 16 GB card on every dense model** — Qwen2-0.5B
+  86,038 vs 72,012, Qwen3.5-0.8B 52,031 vs 44,981, Llama-3.2-3B 15,195 vs 10,920
+  (the 3090's without flash-attn), Llama-2-7B 6,574 vs 5,738, Qwen3-8B 6,562 vs
+  5,286, Qwen3.5-9B 7,602 vs 6,735, Qwen3.8-27B 2,319 vs 2,067. On the streamed
+  MoEs the 3090 leads, by the most where it holds more of each expert set:
+  Qwen3-30B 6,461 vs 6,822, Qwen3.5-35B 3,307 vs 10,042, Qwen3.6-35B 2,650 vs
+  7,184, Flash-Next 1,129 vs 2,302.
 - **Decode is lower here on every model**, least on the dense ones (Llama-2-7B
-  904.6 vs 950.0, Qwen3.5-9B 873.0 vs 958.2) and most on the MoEs: Qwen3.5-35B
-  395.2 vs 1,067.3, Qwen3.6-35B 336.7 vs 1,228.6, Flash-Next 108.5 vs 460.8 (the
-  3090 adds a ×16 row). Expert streaming
+  904.6 vs 950.0, Qwen3.5-9B 873.0 vs 958.2, Qwen3.5-0.8B 3,810.7 vs 4,177.8) and
+  most on the MoEs: Qwen3.5-35B 395.2 vs 1,228.8, Qwen3.6-35B 336.7 vs 1,346.3,
+  Flash-Next 108.5 vs 543.8 (the 3090 adds a ×16 row). Expert streaming
   is the expected cause (above): a bigger card buys speed, not feasibility.
 - **Compression at C10** is now the same calibration on both cards: 7.03× / 6.43×
   on the two 35Bs here against the 3090's 7.03× / 6.45×.

@@ -33,6 +33,7 @@ import { estateSwitcher } from './lib/estate.js';
  *   /personalities → GET /v1/personality            unauthenticated (writes are admin)
  *   /personality/:aid/life → GET /v1/life/:who      admin
  *   /performance → GET  /v1/telemetry, /v1/memory   user
+ *   /operations  → GET  /v1/pulse/operations        admin
  *   /substrate   → GET  /v1/substrate/storage       admin
  *   /logs        → WS   /ws/logs                    admin
  */
@@ -88,6 +89,10 @@ definePage({ path: '/images', role: 'user', nav: { section: 'main', order: 42, l
 // subject from opposite ends: what a character *can* do, and what it is doing.
 definePage({ path: '/pulse', role: 'user', nav: { section: 'main', order: 45, label: 'Pulse' },
   load: () => import('./pages/pulse.js') });
+// The command table's operations — admin, like `/v1/pulse/operations`: an
+// operation's missions are carried by the whole cast.
+definePage({ path: '/operations', role: 'admin', nav: { section: 'main', order: 47, label: 'Operations' },
+  load: () => import('./pages/operations.js') });
 // Names the redo log's absolute path, so it matches `/v1/substrate/storage`.
 definePage({ path: '/substrate', role: 'admin', nav: { section: 'main', order: 50, label: 'Substrate' },
   load: () => import('./pages/substrate.js') });

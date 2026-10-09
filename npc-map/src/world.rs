@@ -480,6 +480,10 @@ pub struct World {
     /// Who is riding, and the floor each is bound for. They come off at their
     /// floor when the car opens there.
     riders: BTreeMap<String, usize>,
+    /// Who is waiting on a landing for the car to come, and the floor each will
+    /// ride to. They board when the car opens at their landing — see
+    /// [`World::ride_lift`].
+    waiting: BTreeMap<String, usize>,
     /// The company each body was in when it began deciding, for the bodies that
     /// are deciding now. See [`World::begin_decision`].
     deciding: BTreeMap<String, Deliberation>,
@@ -514,6 +518,7 @@ impl World {
             lift,
             shaft,
             riders: BTreeMap::new(),
+            waiting: BTreeMap::new(),
             deciding: BTreeMap::new(),
         }
     }
@@ -560,12 +565,22 @@ impl World {
         self.shaft.iter().position(|c| c == at)
     }
 
-    /// The floor a body is riding to, if it has boarded and not yet been set down.
-    /// A rider waits on its origin landing until the car opens at this floor (see
+    /// The floor a body is riding to, if it has asked to ride and not yet been
+    /// set down — waiting for the car on its landing, or aboard. A rider stays on
+    /// its origin landing until the car opens at its floor (see
     /// [`World::ride_lift`]); until then it has already chosen, so it is neither
     /// offered the lift again nor told the car has left without it.
     pub fn riding(&self, id: &str) -> Option<usize> {
-        self.riders.get(id).copied()
+        self.riders
+            .get(id)
+            .or_else(|| self.waiting.get(id))
+            .copied()
+    }
+
+    /// Whether a body has asked to ride and is waiting on its landing for the
+    /// car to come.
+    pub fn waiting_for_lift(&self, id: &str) -> bool {
+        self.waiting.contains_key(id)
     }
 
     /// The lift facts a tool grammar is gated on, for the body `id`, in one pass:
@@ -633,23 +648,35 @@ impl World {
         }
     }
 
-    /// Board `rider` into the car and send it to `dest`; the rider comes off
-    /// there when the doors open. `false` — refused — when the rider is not on a
-    /// landing with the car open at it, there is no lift, or `dest` is off the
-    /// shaft. The rider stays on its landing until the car reaches `dest`, so a
-    /// body waiting with it is company until then.
+    /// Ride to `dest`: board now when the car is open at the rider's landing,
+    /// otherwise call it there and wait, boarding when it opens. Either way the
+    /// rider comes off at `dest` when the doors open there, and stays on its
+    /// landing until then, so a body waiting with it is company. `false` —
+    /// refused — when the rider is not on a landing, there is no lift, `dest` is
+    /// off the shaft, or `dest` is the floor it is on.
+    ///
+    /// **Asking to ride is waiting for the car.** Calling it and boarding were
+    /// two acts with a wait between, and a body given a turn in the wait spent it
+    /// walking away: measured, Makers called the car and left the landing before
+    /// it came, five and six times running, until the cast agreed among
+    /// themselves that the lift was broken.
     pub fn ride_lift(&mut self, rider: &str, dest: usize) -> bool {
         let Some(from) = self.at_landing(rider) else {
             return false;
         };
-        if dest >= self.shaft.len() {
+        if dest >= self.shaft.len() || dest == from {
             return false;
         }
-        if !self.lift.as_ref().is_some_and(|l| l.boardable_at(from)) {
+        let Some(lift) = self.lift.as_mut() else {
             return false;
+        };
+        if lift.boardable_at(from) {
+            self.riders.insert(rider.to_string(), dest);
+            lift.call(dest);
+        } else {
+            self.waiting.insert(rider.to_string(), dest);
+            lift.call(from);
         }
-        self.riders.insert(rider.to_string(), dest);
-        self.lift.as_mut().expect("checked above").call(dest);
         true
     }
 
@@ -706,6 +733,21 @@ impl World {
             for r in arrivals {
                 self.riders.remove(&r);
                 self.land(&r, &core, at);
+            }
+            // Board whoever was waiting on this landing, and send the car on to
+            // where each is going.
+            let boarding: Vec<(String, usize)> = self
+                .waiting
+                .iter()
+                .filter(|(r, _)| self.at_landing(r) == Some(floor))
+                .map(|(r, d)| (r.clone(), *d))
+                .collect();
+            for (r, dest) in boarding {
+                self.waiting.remove(&r);
+                self.riders.insert(r, dest);
+                if let Some(lift) = self.lift.as_mut() {
+                    lift.call(dest);
+                }
             }
         }
     }
@@ -979,6 +1021,7 @@ impl World {
             actor.at = to.clone();
             actor.walk = None;
             self.riders.remove(&id);
+            self.waiting.remove(&id);
             self.log.push(Event {
                 at,
                 actor: id.clone(),
@@ -1018,6 +1061,7 @@ impl World {
         self.lift = (shaft.len() >= 2).then(|| Lift::new(shaft.len(), start));
         self.shaft = shaft;
         self.riders.clear();
+        self.waiting.clear();
     }
 
     /// Set off for somewhere, and find out later whether you got there.
@@ -1060,6 +1104,7 @@ impl World {
         // Walking away cancels a lift you were waiting on: you are no longer on
         // the landing to be carried off, so the car must not set you down later.
         self.riders.remove(id);
+        self.waiting.remove(id);
         if self.actors[id].hold.is_some() {
             self.release(id)?;
         }
@@ -1270,6 +1315,7 @@ impl World {
         // only catches a body moved by some other means (placed, teleported)
         // while it was waiting, which must not then be carried off a second time.
         self.riders.remove(id);
+        self.waiting.remove(id);
         // Leaving is releasing, wherever the move came from.
         if actor.hold.is_some() {
             let _ = self.release_at(id, at);
@@ -2176,6 +2222,44 @@ mod tests {
             shaft[far],
             "the far rider never arrived"
         );
+    }
+
+    /// **Asking to ride with the car elsewhere calls it and waits.** The rider
+    /// is riding from the moment it asks — offered nothing else to do with the
+    /// lift — boards when the car opens on its landing, and is set down where it
+    /// chose.
+    #[test]
+    fn asking_to_ride_with_the_car_away_calls_it_and_boards_when_it_comes() {
+        let mut w = vault();
+        let shaft: Vec<Where> = w.shaft().to_vec();
+        let (from, dest) = (0usize, shaft.len() - 1);
+        // Send the car away from the rider's floor first.
+        w.call_lift(dest);
+        for _ in 0..50 {
+            if w.lift().unwrap().boardable_at(dest) {
+                break;
+            }
+            w.tick();
+        }
+        assert!(!w.lift().unwrap().boardable_at(from));
+        w.enter("m1", "Maker-01", shaft[from].clone()).unwrap();
+        w.mark_seen("m1");
+
+        assert!(w.ride_lift("m1", dest), "asking to ride was refused");
+        assert!(w.waiting_for_lift("m1"));
+        assert_eq!(w.riding("m1"), Some(dest));
+        assert_eq!(w.lift_within("m1"), (false, false, Vec::new()));
+        assert!(!w.ride_lift("m1", from), "riding to the floor it is on");
+
+        for _ in 0..120 {
+            if w.actor("m1").unwrap().at == shaft[dest] {
+                break;
+            }
+            w.tick();
+        }
+        assert_eq!(w.actor("m1").unwrap().at, shaft[dest], "never carried");
+        assert_eq!(w.riding("m1"), None);
+        assert!(!w.waiting_for_lift("m1"));
     }
 
     /// **Walking off the landing cancels the ride.** A rider waits on its origin

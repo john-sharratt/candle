@@ -184,6 +184,28 @@ impl Ledger {
         self.flush();
     }
 
+    /// Every document the ledger records as ingested whose file is gone —
+    /// deleted, or moved out of the record (a rejected draft goes to
+    /// `rejected/`).
+    pub fn missing(&self) -> Vec<PathBuf> {
+        let mut gone: Vec<PathBuf> = self
+            .hashes
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|p| !p.is_file())
+            .cloned()
+            .collect();
+        gone.sort();
+        gone
+    }
+
+    /// Stop recording `path` — its conversations have been retired. Not
+    /// persisted until the next [`Self::flush`].
+    pub fn forget(&self, path: &Path) {
+        self.hashes.lock().unwrap().remove(path);
+    }
+
     /// The verdict [`Self::reconcile`] would give, **without recording it**.
     ///
     /// The ledger's entry is a claim that a document is a turn in the substrate, so writing one
@@ -568,6 +590,23 @@ mod tests {
         assert_eq!(l.reconcile(p, None), Reconcile::Removed);
         // Already retired — a second pass must not tombstone it again.
         assert_eq!(l.reconcile(p, None), Reconcile::Unchanged);
+    }
+
+    /// **A recorded document whose file is gone is listed as missing**, and
+    /// forgetting it stops listing it.
+    #[test]
+    fn a_recorded_document_whose_file_is_gone_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().join("here.md");
+        let gone = dir.path().join("gone.md");
+        std::fs::write(&here, "x").unwrap();
+        let l = Ledger::new();
+        l.reconcile(&here, Some("x"));
+        l.reconcile(&gone, Some("y"));
+        assert_eq!(l.missing(), vec![gone.clone()]);
+        l.forget(&gone);
+        assert!(l.missing().is_empty());
+        assert_eq!(l.inspect(&gone, Some("y")), Reconcile::Added);
     }
 
     /// An editor creating and deleting a temp file inside one debounce window

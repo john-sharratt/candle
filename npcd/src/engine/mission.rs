@@ -120,6 +120,73 @@ pub enum Origin {
     Lodged { by: String },
     /// A routine drawn from the bank when nothing was lodged (`routine` names it).
     Random { routine: String },
+    /// Written by the command table for one stage of an operation (`generator`
+    /// names which of the configured generators found the work, `target` the
+    /// piece of the corpus it is about, `operation` the operation it belongs to)
+    /// — see `engine::mission_gen` and `sim::operations`.
+    Generated {
+        generator: String,
+        target: String,
+        #[serde(default)]
+        operation: u64,
+        #[serde(default)]
+        stage: Stage,
+    },
+}
+
+/// Which stage of an operation a generated mission is.
+///
+/// **Work is checked by somebody other than whoever did it.** The draft is
+/// written by one Maker; the review is carried by another, who may mend what is
+/// wrong in it and pass the operation, or reject it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    /// Write the document the operation is for.
+    #[default]
+    Draft,
+    /// Read what the draft wrote, mend it, and pass or reject it.
+    Review,
+    /// Check the reviewed document against the main storyline, and accept,
+    /// mend or reject it.
+    Canon,
+}
+
+impl Stage {
+    /// Whether this stage ends in a verdict on somebody else's work — passed
+    /// or rejected — rather than in work of its own.
+    pub fn judges(self) -> bool {
+        matches!(self, Stage::Review | Stage::Canon)
+    }
+}
+
+/// The documents a mission is about: the one it is to produce or change, and the
+/// ones to read first.
+///
+/// **What makes a mission checkable by something other than the character.** A
+/// mission that writes the record is done when the record says so: `writes` was
+/// committed, by this character, after it took the mission up. The report is
+/// refused until then — see `engine::work`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Work {
+    /// The mind path of the document to write or change.
+    pub writes: String,
+    /// The mind paths of the documents to read before writing, in order.
+    pub reads: Vec<String>,
+    /// The fewest words the written document may hold when it is committed —
+    /// a floor well under what the brief asks for, below which it is a sketch
+    /// of the work rather than the work. Zero for none.
+    #[serde(default)]
+    pub min_words: usize,
+    /// Whether the document may be left as it is. A review may mend what it
+    /// reads or find nothing to mend; a draft must write.
+    #[serde(default)]
+    pub edit_optional: bool,
+    /// Whether the document is to be written anew rather than mended: a review
+    /// of a draft the table failed. Sitting down to write it, the writer is not
+    /// shown the failed text — see `engine::compose`.
+    #[serde(default)]
+    pub anew: bool,
 }
 
 /// What a character's system prompt carries of its mission: the section text and
@@ -155,6 +222,14 @@ pub struct Mission {
     /// plainly within reach — see `engine::work`.
     #[serde(default)]
     pub stuck_refused: u32,
+    /// The documents the mission is about, when it is work on the record.
+    #[serde(default)]
+    pub work: Option<Work>,
+    /// The year of the world's history its carrier works in, set at a time
+    /// machine ([`Self::travelled`]). Nothing after it reaches the carrier's
+    /// recall while the mission is carried; it ends with the mission.
+    #[serde(default)]
+    pub year: Option<u32>,
 }
 
 impl Mission {
@@ -168,7 +243,133 @@ impl Mission {
             origin,
             observed: Vec::new(),
             stuck_refused: 0,
+            work: None,
+            year: None,
         }
+    }
+
+    /// The same mission, about `work`.
+    pub fn with_work(mut self, work: Work) -> Self {
+        self.work = Some(work);
+        self
+    }
+
+    /// The operation this mission is a stage of, and which stage — `None` for a
+    /// mission that is not the table's.
+    pub fn operation(&self) -> Option<(u64, Stage)> {
+        match &self.origin {
+            Origin::Generated {
+                operation, stage, ..
+            } => Some((*operation, *stage)),
+            _ => None,
+        }
+    }
+
+    /// Sign off every open step that reads `path`, because the body just read
+    /// it. Returns whether anything was signed off.
+    ///
+    /// **A read is a fact, not a claim**, the same as where a body stands: the
+    /// bench served the document.
+    pub fn read_doc(&mut self, path: &str) -> bool {
+        let path = plain_path(path);
+        let mut ticked = false;
+        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+            if reading_doc(&step.text).is_some_and(|p| p == path) {
+                step.done = true;
+                step.outcome = Some(StepOutcome::Achieved);
+                ticked = true;
+            }
+        }
+        ticked
+    }
+
+    /// Whether the mission's document has been committed while it was carried
+    /// — its write step signed off as achieved, which nothing but a commit of
+    /// that document does ([`Self::committed`]). `true` for a mission with no
+    /// document to write.
+    ///
+    /// **The mission's own record, not the bench's.** Asking the bench who last
+    /// committed the path passed a review whose Maker had written the document
+    /// before it was ever reviewed, and failed every mission after a restart,
+    /// because the bench's record of hands is not kept and the mission is.
+    pub fn written_up(&self) -> bool {
+        let Some(work) = &self.work else {
+            return true;
+        };
+        if work.edit_optional {
+            return true;
+        }
+        let path = plain_path(&work.writes);
+        self.todo.iter().any(|t| {
+            t.done
+                && t.outcome == Some(StepOutcome::Achieved)
+                && writing_doc(&t.text).is_some_and(|p| p == path)
+        })
+    }
+
+    /// Put the writing of `path` back in front of the carrier, because the
+    /// document as committed does not stand: its writing step, done, is to do
+    /// again, and a mission that had none — a review whose reading found it
+    /// sound, a check against the storyline — gains one before its report.
+    ///
+    /// **A refused document is work still to do, and the steps must say so.**
+    /// With every step ticked, a Maker whose draft the gate refused was told in
+    /// one breath to write it again and that its work was done and to report it
+    /// now — at the command table, two levels from the only desk it could write
+    /// at. It reported, was refused, and was told the same again, until four
+    /// Makers sat on a bench telling each other there was nothing left to do.
+    pub fn reopen_write(&mut self, path: &str) {
+        let plain = plain_path(path);
+        let mut found = false;
+        for step in self
+            .todo
+            .iter_mut()
+            .filter(|t| writing_doc(&t.text).is_some_and(|p| p == plain))
+        {
+            step.done = false;
+            step.outcome = None;
+            found = true;
+        }
+        if !found {
+            let at = self
+                .todo
+                .iter()
+                .position(|t| t.reports)
+                .unwrap_or(self.todo.len());
+            self.todo
+                .insert(at, Todo::new(format!("change {path} and commit it")));
+        }
+    }
+
+    /// Work in `year` from now on, because the carrier set a time machine to
+    /// it, and sign off every open step that asks for that year. Returns whether
+    /// anything was signed off.
+    pub fn travelled(&mut self, year: u32) -> bool {
+        self.year = Some(year);
+        let mut ticked = false;
+        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+            if time_step(&step.text) == Some(year) {
+                step.done = true;
+                step.outcome = Some(StepOutcome::Achieved);
+                ticked = true;
+            }
+        }
+        ticked
+    }
+
+    /// Sign off every open step that writes one of `paths`, because a commit
+    /// just wrote them. Returns whether anything was signed off.
+    pub fn committed(&mut self, paths: &[String]) -> bool {
+        let paths: Vec<String> = paths.iter().map(|p| plain_path(p)).collect();
+        let mut ticked = false;
+        for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
+            if writing_doc(&step.text).is_some_and(|p| paths.contains(&p)) {
+                step.done = true;
+                step.outcome = Some(StepOutcome::Achieved);
+                ticked = true;
+            }
+        }
+        ticked
     }
 
     /// Count a `report_stuck` the desk turned away because the step was plainly
@@ -237,8 +438,8 @@ impl Mission {
         true
     }
 
-    /// Sign off every open step that is a journey to `room`, because the body is
-    /// standing in it. Returns whether anything was signed off.
+    /// Sign off every open step that is a journey to `room` on `level`, because
+    /// the body is standing in it. Returns whether anything was signed off.
     ///
     /// **Where a body stands is a fact, not a claim.** A step like "go to the
     /// plant room" was left for the guardian to tick on the character's own word,
@@ -246,11 +447,15 @@ impl Mission {
     /// `[ ] go to the plant room` on arrival, took the list to mean it had not
     /// begun, and walked back to the table to start again. The engine knows
     /// where the body is; it signs the journey off itself.
-    pub fn arrived_in(&mut self, room: &str) -> bool {
-        let room = plain(room);
+    ///
+    /// **A step that names its level holds to it.** A step to write on the
+    /// casting level says "go to band one on the casting level", and a room of
+    /// the same name on any other level does not sign it off.
+    pub fn arrived_in(&mut self, room: &str, level: &str) -> bool {
+        let (room, level) = (plain(room), plain(level));
         let mut ticked = false;
         for step in self.todo.iter_mut().filter(|t| !t.done && !t.reports) {
-            if journey_to(&step.text).is_some_and(|to| names(&to, &room)) {
+            if journey_to(&step.text).is_some_and(|to| at_place(&to, &room, &level)) {
                 step.done = true;
                 step.outcome = Some(StepOutcome::Achieved);
                 ticked = true;
@@ -453,9 +658,9 @@ impl Aim {
         journey_to(step).map(Aim::Room)
     }
 
-    /// Whether this aim is the room called `name`.
-    pub fn is_room(&self, name: &str) -> bool {
-        matches!(self, Aim::Room(room) if names(room, &plain(name)))
+    /// Whether this aim is the room called `name` on the level called `level`.
+    pub fn is_room(&self, name: &str, level: &str) -> bool {
+        matches!(self, Aim::Room(room) if at_place(room, &plain(name), &plain(level)))
     }
 
     /// Whether this aim reads the machine called `name`.
@@ -544,6 +749,138 @@ pub fn compass_line(next: &Todo, people: &[(String, Option<String>)], way: Optio
     line
 }
 
+/// The addresses a document step is done through, at the desk the body stands
+/// at — each `None` when no desk here offers it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeskVerbs {
+    pub read: Option<String>,
+    /// Where the piece is written whole — `compose`.
+    pub compose: Option<String>,
+    pub edit: Option<String>,
+    pub commit: Option<String>,
+}
+
+/// The mission compass for a step that sets the year: the act at a time machine
+/// standing here, else the way to one (`way`).
+///
+/// **The year is set at a machine, and the compass says which act.** Told only
+/// "set your time to 2837 at a time machine", four Makers walked between the
+/// lift and their rooms for an hour, told each other the lift was broken and
+/// went looking for a level nothing had sent them to.
+pub fn time_compass(year: u32, machine_here: bool, way: Option<&str>) -> String {
+    match (machine_here, way) {
+        (true, _) => format!(
+            "Your mission, next: set your time to {year}. A time machine is here: `time_travel` \
+             naming the year {year}."
+        ),
+        (false, Some(way)) => format!(
+            "Your mission, next: set your time to {year}. The time machines are in {way}; there, \
+             `time_travel` naming the year {year}."
+        ),
+        (false, None) => format!(
+            "Your mission, next: set your time to {year}, at a time machine on the time level: \
+             `move_to` the lift and `lift_use` naming the time level."
+        ),
+    }
+}
+
+/// The mission compass for a step about a document: the exact act that does it
+/// when the body stands at a desk, else the way to one (`way`).
+///
+/// **The act, not the intention.** Told only "next: read layers/eras/…", a
+/// Keeper who had reached the writing room reflected and dreamt for ten minutes
+/// and never touched the desk: reading a document is an `invoke` of the desk's
+/// `file_read` naming it, and nothing in what it read said so.
+///
+/// `written` is how many words of the document to write the working copy holds,
+/// uncommitted, when that is already up to its floor.
+///
+/// **A written piece is committed, not written again.** Told "sit down and
+/// write it whole" straight after it had composed five hundred words, a Maker
+/// composed the same story five times over and never committed it.
+pub fn doc_compass(
+    doc: &DocStep,
+    at: &DeskVerbs,
+    way: Option<&str>,
+    written: Option<usize>,
+) -> String {
+    match (doc, at, written) {
+        (
+            DocStep::Write(p),
+            DeskVerbs {
+                read: Some(read),
+                commit: Some(commit),
+                ..
+            },
+            Some(words),
+        ) => format!(
+            "Your mission, next: commit {p}. It is written — {words} words in your working copy. \
+             Read it back with `invoke` {read} with `path` \"{p}\"; if it stands, `invoke` {commit} \
+             with `why`, one line saying what it is. Put one passage right first if one is wrong, \
+             but do not write it again."
+        ),
+        (doc, at, _) => doc_compass_unwritten(doc, at, way),
+    }
+}
+
+fn doc_compass_unwritten(doc: &DocStep, at: &DeskVerbs, way: Option<&str>) -> String {
+    match (doc, at) {
+        (
+            DocStep::Read(p),
+            DeskVerbs {
+                read: Some(url), ..
+            },
+        ) => format!(
+            "Your mission, next: read {p}. `invoke` {url} with `path` \"{p}\" — it comes back a \
+             page at a time."
+        ),
+        // **Sit down to it.** The piece is written whole with `compose`, in one
+        // sitting with the brief and the sources open — see `engine::compose`;
+        // a draft put together line by line between other acts carried the room
+        // it was written in. An edit is for a passage the checks name.
+        (
+            DocStep::Write(p),
+            DeskVerbs {
+                compose: Some(compose),
+                edit,
+                commit: Some(commit),
+                ..
+            },
+        ) => {
+            let mend = match edit {
+                Some(edit) => format!(
+                    " To put one passage right afterwards, `invoke` {edit} with the words to \
+                     replace as `old_str` and what replaces them as `new_str`."
+                ),
+                None => String::new(),
+            };
+            format!(
+                "Your mission, next: write {p}. Sit down and write it whole: `invoke` {compose} — \
+                 you write it through with your brief and what you read open in front of you, \
+                 and it goes into your working copy.{mend} Then `invoke` {commit} with `why`, one \
+                 line saying what it is. Until it is committed nobody else can see it, and the \
+                 mission is not done."
+            )
+        }
+        (doc, _) => {
+            let (verb, p) = match doc {
+                DocStep::Read(p) => ("read", p),
+                DocStep::Write(p) => ("write", p),
+            };
+            match way {
+                Some(way) => format!(
+                    "Your mission, next: {verb} {p}. Documents are read and written at a desk: \
+                     the nearest is in {way}."
+                ),
+                None => format!(
+                    "Your mission, next: {verb} {p}. Documents are read and written at a desk; \
+                     at one, `scan` shows its address."
+                ),
+            }
+        }
+    }
+}
+
 /// The mission compass when the work is done and only the report is left.
 /// `table` is the way to the table — its room, and the lift ride when it is on
 /// another level; `at_table` whether the body is at it;
@@ -553,27 +890,45 @@ pub fn compass_line(next: &Todo, people: &[(String, Option<String>)], way: Optio
 /// **The report is about this mission.** Characters filed accounts of the
 /// mission before last, or of the scan they made at the table; handed what it
 /// saw on this one, in the line that tells it to report, it reports that.
-pub fn compass_report_line(table: Option<&str>, at_table: bool, seen: &[String]) -> String {
-    let mut line = report_way(table, at_table);
+///
+/// **A review's report is its verdict** (`verdict`): told to report "exactly
+/// what you found", a reviewer that had read the draft and corrected its title
+/// stood at the table saying there was nothing substantive to report.
+pub fn compass_report_line(
+    table: Option<&str>,
+    at_table: bool,
+    seen: &[String],
+    verdict: bool,
+) -> String {
+    let mut line = report_way(table, at_table, verdict);
     if !seen.is_empty() {
         line.push_str(&format!(" What you saw on it: {}.", seen.join("; ")));
     }
     line
 }
 
-fn report_way(table: Option<&str>, at_table: bool) -> String {
+fn report_way(table: Option<&str>, at_table: bool, verdict: bool) -> String {
+    let what = match verdict {
+        true => {
+            "its `report_done` if the draft can stand, saying what you checked and what you \
+                 changed — or its `report_rejected` if it cannot, saying why. That verdict is the \
+                 whole report"
+        }
+        false => "its `report_done` with exactly what you found",
+    };
     match (at_table, table) {
-        (true, _) => "Your mission's work is done and you are at the table: report it now — \
-                      `invoke` the table's `report_done` with exactly what you found."
-            .to_string(),
+        (true, _) => format!(
+            "Your mission's work is done and you are at the table: report it now — `invoke` \
+             {what}."
+        ),
         (false, Some(way)) => format!(
             "Your mission's work is done. Go back to the table, in {way}, and report it: \
-             `invoke` the table's `report_done` with exactly what you found."
+             `invoke` {what}."
         ),
-        (false, None) => "Your mission's work is done. Go back to the table where work is \
-                          handed out and report it: `invoke` its `report_done` with exactly \
-                          what you found."
-            .to_string(),
+        (false, None) => format!(
+            "Your mission's work is done. Go back to the table where work is handed out and \
+             report it: `invoke` {what}."
+        ),
     }
 }
 
@@ -594,6 +949,116 @@ fn names(said: &str, thing: &str) -> bool {
         && (said == thing
             || said.starts_with(&format!("{thing} "))
             || said.starts_with(&format!("{thing},")))
+}
+
+/// Whether the engine signs `step` off itself, from what it sees: a journey, a
+/// reading of a machine, somebody met or spoken to, a document read or
+/// committed. Nothing else may sign such a step off on the character's word —
+/// asked whether it had written a story, a character said it had tried and
+/// could not, and the write was struck as thwarted with no document on the
+/// record.
+pub fn engine_sees(step: &str) -> bool {
+    Aim::of(step).is_some()
+        || reading_doc(step).is_some()
+        || writing_doc(step).is_some()
+        || time_step(step).is_some()
+}
+
+/// The step that sends a carrier to a time machine to work in `year`.
+pub fn time_step_text(year: u32) -> String {
+    format!("set your time to {year} at a time machine")
+}
+
+/// The year a [`time_step_text`] step asks for. `None` for any other step.
+pub fn time_step(step: &str) -> Option<u32> {
+    let rest = step.trim().strip_prefix("set your time to ")?;
+    let (year, tail) = rest.split_once(' ')?;
+    (tail.trim() == "at a time machine")
+        .then(|| year.parse().ok())
+        .flatten()
+}
+
+/// Whether `said` — a journey's [`plain`] destination — is `room` on `level`,
+/// both [`plain`]. A destination that names no level is any room so called.
+fn at_place(said: &str, room: &str, level: &str) -> bool {
+    match split_level(said) {
+        (r, Some(l)) => names(&r, room) && l == level,
+        (r, None) => names(&r, room),
+    }
+}
+
+/// A destination and the level it names, when it names one: "band one on the
+/// casting level" → ("band one", Some("casting level")). Only a trailing "on …
+/// level" is a level, so "the room on the left" stays one name.
+fn split_level(said: &str) -> (String, Option<String>) {
+    if let Some((room, level)) = said.rsplit_once(" on ") {
+        let level = plain(level);
+        if level.ends_with("level") {
+            return (room.trim().to_string(), Some(level));
+        }
+    }
+    (said.to_string(), None)
+}
+
+/// A mind path as compared: trimmed, forward slashes, lower case, no leading
+/// slash — "Layers/eras/x.md" and "/layers/eras/x.md" are one document.
+fn plain_path(path: &str) -> String {
+    path.trim()
+        .trim_matches('`')
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_lowercase()
+}
+
+/// The document a reading step reads: "read layers/eras/x.md" → its
+/// [`plain_path`]. `None` for any other step, or one naming no document.
+fn reading_doc(step: &str) -> Option<String> {
+    doc_after(step, "read ")
+}
+
+/// The document a writing step writes: "write layers/life/x/2510 y.md and
+/// commit it" → its [`plain_path`]. `None` for any other step.
+fn writing_doc(step: &str) -> Option<String> {
+    doc_after(step, "write ").or_else(|| doc_after(step, "change "))
+}
+
+/// The document path a step names after `verb`, up to its `.md`/`.yaml` end, as
+/// [`plain_path`] compares it.
+fn doc_after(step: &str, verb: &str) -> Option<String> {
+    raw_doc_after(step, verb).map(|p| plain_path(&p))
+}
+
+/// The same path exactly as the step spells it — what a character is told to
+/// name, so a new document is created with its title's own capitals.
+fn raw_doc_after(step: &str, verb: &str) -> Option<String> {
+    let rest = step.trim().strip_prefix(verb)?;
+    // ASCII lowering keeps every byte where it was, so an offset found in
+    // `lower` is a char boundary in `rest`; full Unicode lowering does not
+    // (`İ` grows a byte) and a title holding one sliced mid-character.
+    let lower = rest.to_ascii_lowercase();
+    let end = [".md", ".yaml"]
+        .iter()
+        .filter_map(|ext| lower.find(ext).map(|at| at + ext.len()))
+        .min()?;
+    Some(rest[..end].trim().trim_matches('`').to_string())
+}
+
+/// A step about a document: one to read, or one to write and commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocStep {
+    Read(String),
+    Write(String),
+}
+
+impl DocStep {
+    /// The document step `step` is, with its path as the step spells it.
+    pub fn of(step: &str) -> Option<DocStep> {
+        raw_doc_after(step, "read ").map(DocStep::Read).or_else(|| {
+            raw_doc_after(step, "write ")
+                .or_else(|| raw_doc_after(step, "change "))
+                .map(DocStep::Write)
+        })
+    }
 }
 
 /// Where a journey step leads, as a [`plain`] name: "go to the plant room" →
@@ -953,7 +1418,7 @@ pub mod bank {
 #[cfg(test)]
 mod tests {
     use super::bank::{random, Duty, Facts, ROUTINES};
-    use super::{Mission, Origin, Outcome, StepOutcome, Todo};
+    use super::{Mission, Origin, Outcome, Stage, StepOutcome, Todo, Work};
 
     fn makers() -> Vec<String> {
         vec!["Wren".to_string(), "Pax".to_string(), "Soren".to_string()]
@@ -991,14 +1456,218 @@ mod tests {
     #[test]
     fn arriving_in_the_named_room_signs_off_the_journey_to_it() {
         let mut m = read_the_valve();
-        assert!(!m.arrived_in("the command room"));
+        assert!(!m.arrived_in("the command room", "the command level"));
         assert!(!m.todo[0].done);
-        assert!(m.arrived_in("The plant room"));
+        assert!(m.arrived_in("The plant room", "the command level"));
         assert_eq!(m.todo[0].outcome, Some(StepOutcome::Achieved));
-        assert!(!m.arrived_in("the plant room"), "already signed off");
+        assert!(
+            !m.arrived_in("the plant room", "the command level"),
+            "already signed off"
+        );
         assert_eq!(
             m.next_step().map(|t| t.text.as_str()),
             Some("scan the coolant valve and read what state it is in")
+        );
+    }
+
+    fn write_a_year() -> Mission {
+        Mission::new(
+            "Write the year the sky went out.",
+            vec![
+                Todo::new("go to band one on the casting level"),
+                Todo::new("read layers/eras/the-awakening.md"),
+                Todo::new("read layers/life/keeper/2487-03-08 The Second the Sky Went Out.md"),
+                Todo::new("write layers/life/keeper/2488 The Year After.md and commit it"),
+                Todo::report("go back to the table and report it"),
+            ],
+            Origin::Generated {
+                generator: "life-event".into(),
+                target: "life:keeper".into(),
+                operation: 1,
+                stage: Stage::Draft,
+            },
+        )
+        .with_work(Work {
+            writes: "layers/life/keeper/2488 The Year After.md".into(),
+            reads: vec!["layers/eras/the-awakening.md".into()],
+            min_words: 250,
+            edit_optional: false,
+            anew: false,
+        })
+    }
+
+    /// **A room of the same name on another level is not the one asked for**;
+    /// the level decides.
+    #[test]
+    fn a_journey_that_names_its_level_is_signed_off_only_there() {
+        let mut m = write_a_year();
+        assert!(!m.arrived_in("band one", "the chronicle"));
+        assert!(!m.todo[0].done);
+        assert!(m.arrived_in("band one", "the casting level"));
+        assert!(m.todo[0].done);
+    }
+
+    /// **Reading a named document and committing the written one sign their
+    /// steps off**, whatever case or slashes the path came back in.
+    #[test]
+    fn reading_and_committing_the_named_documents_sign_their_steps_off() {
+        let mut m = write_a_year();
+        assert!(!m.read_doc("layers/eras/the-salvation.md"));
+        assert!(m.read_doc("Layers/eras/the-awakening.md"));
+        assert!(m.todo[1].done);
+        assert!(m.read_doc("/layers/life/keeper/2487-03-08 The Second the Sky Went Out.md"));
+        assert!(!m.committed(&["layers/life/keeper/2489 Another.md".to_string()]));
+        assert!(!m.todo[3].done);
+        assert!(m.committed(&[
+            "layers/eras/the-awakening.md".to_string(),
+            "layers/life/keeper/2488 The Year After.md".to_string()
+        ]));
+        assert!(m.todo[3].done);
+        assert!(m.written_up());
+        assert!(m.arrived_in("band one", "the casting level"));
+        assert!(m.next_step().unwrap().reports);
+    }
+
+    /// **Written up means committed while carried** — a write step struck on
+    /// somebody's word is not the document on the record.
+    #[test]
+    fn only_a_commit_writes_a_mission_up() {
+        let mut m = write_a_year();
+        assert!(!m.written_up());
+        m.check_off(
+            "write layers/life/keeper/2488 The Year After.md and commit it",
+            StepOutcome::Thwarted,
+        );
+        assert!(!m.written_up(), "thwarted is not written");
+        assert!(read_the_valve().written_up(), "nothing to write");
+    }
+
+    /// **Only the engine signs off what the engine sees** — the journey, the
+    /// reads and the write — and anything else may be signed off on the
+    /// character's word.
+    #[test]
+    fn the_steps_the_engine_sees_are_named() {
+        for step in &write_a_year().todo[..4] {
+            assert!(super::engine_sees(&step.text), "{}", step.text);
+        }
+        assert!(super::engine_sees(
+            "scan the coolant valve and read what state it is in"
+        ));
+        assert!(!super::engine_sees("form your own view of it"));
+    }
+
+    /// **The compass for the year says the act at the machine, or the way to it.**
+    #[test]
+    fn the_compass_for_the_year_says_the_act_or_the_way() {
+        use super::time_compass;
+        assert_eq!(
+            time_compass(2837, true, None),
+            "Your mission, next: set your time to 2837. A time machine is here: `time_travel` \
+             naming the year 2837."
+        );
+        assert_eq!(
+            time_compass(
+                2837,
+                false,
+                Some("the first time room, on the time level: `move_to` the lift, `lift_use` naming the time level, then `move_to` the first time room")
+            ),
+            "Your mission, next: set your time to 2837. The time machines are in the first time \
+             room, on the time level: `move_to` the lift, `lift_use` naming the time level, then \
+             `move_to` the first time room; there, `time_travel` naming the year 2837."
+        );
+        assert!(time_compass(2837, false, None).contains("`lift_use` naming the time level"));
+    }
+
+    /// **At a desk, the compass says the exact act; away from one, the way.**
+    #[test]
+    fn the_compass_for_a_document_says_the_act_that_does_it() {
+        use super::{doc_compass, DeskVerbs, DocStep};
+        let desk = DeskVerbs {
+            read: Some("http://local/desk/1/file_read".into()),
+            compose: Some("http://local/desk/1/compose".into()),
+            edit: None,
+            commit: Some("http://local/desk/1/bench_commit".into()),
+        };
+        assert_eq!(
+            doc_compass(&DocStep::Read("layers/eras/x.md".into()), &desk, None, None),
+            "Your mission, next: read layers/eras/x.md. `invoke` http://local/desk/1/file_read \
+             with `path` \"layers/eras/x.md\" — it comes back a page at a time."
+        );
+        let written = doc_compass(
+            &DocStep::Write("layers/stories/y.md".into()),
+            &desk,
+            None,
+            Some(537),
+        );
+        assert_eq!(
+            written,
+            "Your mission, next: commit layers/stories/y.md. It is written — 537 words in your \
+             working copy. Read it back with `invoke` http://local/desk/1/file_read with `path` \
+             \"layers/stories/y.md\"; if it stands, `invoke` http://local/desk/1/bench_commit with \
+             `why`, one line saying what it is. Put one passage right first if one is wrong, but \
+             do not write it again."
+        );
+        let write = doc_compass(
+            &DocStep::Write("layers/stories/y.md".into()),
+            &desk,
+            None,
+            None,
+        );
+        assert!(
+            write.contains(
+                "Sit down and write it whole: `invoke` http://local/desk/1/compose — you write it \
+                 through"
+            ) && write.contains("Then `invoke` http://local/desk/1/bench_commit with `why`"),
+            "{write}"
+        );
+        assert_eq!(
+            doc_compass(
+                &DocStep::Read("layers/eras/x.md".into()),
+                &DeskVerbs::default(),
+                Some("band one, on the story level: `move_to` the lift"),
+                None
+            ),
+            "Your mission, next: read layers/eras/x.md. Documents are read and written at a desk: \
+             the nearest is in band one, on the story level: `move_to` the lift."
+        );
+    }
+
+    /// The paths a step names, by the step's own verb.
+    #[test]
+    fn a_step_names_the_document_it_reads_or_writes() {
+        assert_eq!(
+            super::reading_doc("read layers/eras/the-awakening.md closely"),
+            Some("layers/eras/the-awakening.md".into())
+        );
+        assert_eq!(
+            super::writing_doc("write layers/life/keeper/2488 The Year After.md and commit it"),
+            Some("layers/life/keeper/2488 the year after.md".into())
+        );
+        assert_eq!(
+            super::writing_doc("change worlds/battle-cities.yaml so both agree"),
+            Some("worlds/battle-cities.yaml".into())
+        );
+        assert_eq!(super::reading_doc("read the record 'the-charge'"), None);
+        assert_eq!(super::writing_doc("go to band one"), None);
+        // Told to the character as the step spells it.
+        assert_eq!(
+            super::DocStep::of("write layers/life/keeper/2488 The Year After.md and commit it"),
+            Some(super::DocStep::Write(
+                "layers/life/keeper/2488 The Year After.md".into()
+            ))
+        );
+        assert_eq!(
+            super::DocStep::of("read layers/eras/the-awakening.md"),
+            Some(super::DocStep::Read("layers/eras/the-awakening.md".into()))
+        );
+        assert_eq!(super::DocStep::of("go to band one"), None);
+        // A title whose lowercase is longer than itself does not split a
+        // character.
+        assert_eq!(
+            super::DocStep::of("write layers/stories/İstanbul Gate.MD and commit it"),
+            Some(super::DocStep::Write(
+                "layers/stories/İstanbul Gate.MD".into()
+            ))
         );
     }
 
@@ -1029,7 +1698,7 @@ mod tests {
             Some("go to the plant room"),
             "the journey was never signed off, and reading does not sign it"
         );
-        assert!(m.arrived_in("the plant room"));
+        assert!(m.arrived_in("the plant room", "the command level"));
         assert!(m.next_step().unwrap().reports);
         assert!(!m.todo[2].done, "nothing but the report closes the report");
     }
@@ -1098,16 +1767,73 @@ mod tests {
             "Your mission, next: go to band three. Band three is on the record level: go to the \
              lift."
         );
+        assert!(super::compass_report_line(
+            Some("the command room: `move_to` it"),
+            false,
+            &[],
+            false
+        )
+        .contains("Go back to the table, in the command room: `move_to` it, and report"));
+        let review = super::compass_report_line(None, true, &[], true);
         assert!(
-            super::compass_report_line(Some("the command room: `move_to` it"), false, &[])
-                .contains("Go back to the table, in the command room: `move_to` it, and report")
+            review.contains("That verdict is the whole report."),
+            "{review}"
         );
+        assert!(review.contains("`report_rejected`"), "{review}");
         let seen = ["in the plant room, the coolant valve: tight".to_string()];
-        let now = super::compass_report_line(None, true, &seen);
+        let now = super::compass_report_line(None, true, &seen, false);
         assert!(now.contains("report it now"), "{now}");
         assert!(
             now.ends_with(" What you saw on it: in the plant room, the coolant valve: tight."),
             "{now}"
+        );
+    }
+
+    /// **A document that does not stand is to be written again**: a done
+    /// writing step is reopened, and a mission with none gains one before its
+    /// report.
+    #[test]
+    fn a_refused_document_puts_its_writing_back_in_front() {
+        use super::{Mission, Origin, Todo};
+        let doc = "layers/life/keeper/2950 The Archive.md";
+        let mut drafted = Mission::new(
+            "write it",
+            vec![
+                Todo::new(format!("write {doc} and commit it")),
+                Todo::report("go back to the table and report it"),
+            ],
+            Origin::Random {
+                routine: "r".into(),
+            },
+        );
+        drafted.committed(&[doc.to_string()]);
+        assert!(drafted.next_step().is_some_and(|t| t.reports));
+        drafted.reopen_write(doc);
+        assert_eq!(
+            drafted.next_step().map(|t| t.text.as_str()),
+            Some(format!("write {doc} and commit it").as_str())
+        );
+
+        let mut checked = Mission::new(
+            "check it",
+            vec![
+                Todo::new(format!("read {doc}")),
+                Todo::report("go back to the table and report your verdict"),
+            ],
+            Origin::Random {
+                routine: "r".into(),
+            },
+        );
+        checked.read_doc(doc);
+        checked.reopen_write(doc);
+        let steps: Vec<&str> = checked.todo.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(
+            steps,
+            [
+                format!("read {doc}").as_str(),
+                format!("change {doc} and commit it").as_str(),
+                "go back to the table and report your verdict"
+            ]
         );
     }
 
@@ -1123,7 +1849,14 @@ mod tests {
         assert!(!read.is_machine("the breaker panel"));
         let ask = Aim::of("ask Paxon Vael what he has been working on").unwrap();
         assert!(ask.is_person("Paxon Vael"));
-        assert!(!ask.is_room("the plant room"));
+        assert!(!ask.is_room("the plant room", "the command level"));
+        // A destination that names its level is that room on that level only.
+        let band = Aim::of("go to band one on the casting level").unwrap();
+        assert!(band.is_room("band one", "the casting level"));
+        assert!(!band.is_room("band one", "the chronicle"));
+        assert!(Aim::of("go to the plant room")
+            .unwrap()
+            .is_room("the plant room", "anywhere"));
         let go_to_him = Aim::of("go to Paxon Vael").unwrap();
         assert!(go_to_him.is_person("Paxon Vael"));
         assert_eq!(Aim::of("form your own view of it"), None);
@@ -1362,7 +2095,9 @@ mod tests {
                         "known routine: {routine}"
                     );
                 }
-                Origin::Lodged { .. } => panic!("bank produces Random origins"),
+                Origin::Lodged { .. } | Origin::Generated { .. } => {
+                    panic!("bank produces Random origins")
+                }
             }
         }
     }
@@ -1399,7 +2134,9 @@ mod tests {
                     no_material.contains(&routine.as_str()),
                     "a lone character gets a routine needing no material, got {routine}"
                 ),
-                Origin::Lodged { .. } => panic!("bank produces Random origins"),
+                Origin::Lodged { .. } | Origin::Generated { .. } => {
+                    panic!("bank produces Random origins")
+                }
             }
         }
     }

@@ -539,13 +539,17 @@ export async function render(params) {
         : null);
   }
 
+  /* Whether the reader has the drafting log open — kept across the journal's
+   * repaints, which otherwise fold it shut whenever a draft starts or ends. */
+  let logOpen = false;
+
   function draftLog(drafts) {
     if (!drafts.length) return null;
     const words = {
       wrote: 'written', nothing: 'nothing worth writing',
       abandoned: 'given up', not_started: 'could not start',
     };
-    return h('details', { class: 'jr-log' },
+    const log = h('details', { class: 'jr-log', open: logOpen || null },
       h('summary', {}, `Drafting log · last ${drafts.length}`),
       drafts.slice().reverse().map((d) => h('div', { class: 'jr-log-row is-' + d.result },
         h('span', { class: 'mono' }, `turns ${d.from_turn}–${d.to_turn}`),
@@ -553,6 +557,8 @@ export async function render(params) {
         d.entry ? h('span', { class: 'mono dim' }, 'No. ' + d.entry) : null,
         h('span', { class: 'jr-log-detail' }, d.detail || ''),
         h('span', { class: 'mono dim' }, (d.took_ms / 1000).toFixed(1) + 's'))));
+    log.addEventListener('toggle', () => { logOpen = log.open; });
+    return log;
   }
 
   async function journalTab() {

@@ -179,6 +179,75 @@ pub(crate) fn assemble_file_scans(
     (files, turns_walked)
 }
 
+/// The score competitions `files` form, each as the indices of its files.
+///
+/// **A competition needs two cases.** The scorer votes `z × margin`, the
+/// margin being the leading case's agreement over the runner-up's. A file of
+/// one exchange has no runner-up, so its margin is its raw agreement — about
+/// half the signature bits for any pair at all — and the file is scored as
+/// itself against nothing. A corpus of one-exchange documents (a world's
+/// entries, one era each) then ranks by size and genericity, normalization
+/// compresses every document into the same band, and the same derelict ship
+/// came top for every character whatever it was doing. So every file of one
+/// exchange competes in one gallery, a case each, and a file of several
+/// exchanges stays its own competition, its exchanges against each other.
+pub(crate) fn competitions(files: &[FileScan]) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut pooled: Vec<usize> = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        match f.n_slots {
+            1 => pooled.push(i),
+            _ => out.push(vec![i]),
+        }
+    }
+    if !pooled.is_empty() {
+        out.push(pooled);
+    }
+    out
+}
+
+/// One competition's gallery windows, the case each votes for, and its case
+/// count: each file's exchanges at its offset among the competition's cases.
+fn competition_windows<'a>(
+    files: &'a [FileScan],
+    comp: &[usize],
+) -> (Vec<&'a [WideQSig]>, Vec<usize>, usize) {
+    let mut wref = Vec::new();
+    let mut wslot = Vec::new();
+    let mut n_cases = 0usize;
+    for &fi in comp {
+        let f = &files[fi];
+        for &(k, s, e, slot) in &f.windows {
+            wref.push(&f.arcs_kept[k][s..e]);
+            wslot.push(n_cases + slot);
+        }
+        n_cases += f.n_slots;
+    }
+    (wref, wslot, n_cases)
+}
+
+/// `v` at exactly `n` entries — a scorer that answered short is zeros beyond.
+fn resized(mut v: Vec<f32>, n: usize) -> Vec<f32> {
+    v.resize(n, 0.0);
+    v
+}
+
+/// Split `votes` — every competition's cases laid end to end, in competition
+/// order — back into one vector per file, in file order.
+fn scatter(files: &[FileScan], comps: &[Vec<usize>], votes: &[f32]) -> Vec<Vec<f32>> {
+    let mut out: Vec<Vec<f32>> = vec![Vec::new(); files.len()];
+    let mut at = 0usize;
+    for comp in comps {
+        for &fi in comp {
+            let n = files[fi].n_slots;
+            let end = (at + n).min(votes.len());
+            out[fi] = resized(votes.get(at..end).unwrap_or(&[]).to_vec(), n);
+            at += n;
+        }
+    }
+    out
+}
+
 /// Score every probe against every file: `[probe][file]` of `(fused, mass
 /// base)` — the policy-fused per-exchange scores and the UNGATED additive sum
 /// Concept B reads. Every probe rides the same launch — one pass over the
@@ -197,33 +266,35 @@ pub(crate) fn scan_file_scans(
     arena: Option<&GalleryArena>,
 ) -> Vec<Vec<(Vec<f32>, Vec<f32>)>> {
     let weights = &group.policy.layer_weights;
-    // The CPU per-file scan of one probe — the path a host without the arena
-    // takes.
+    let comps = competitions(files);
+    // The CPU scan of one probe — the path a host without the arena takes —
+    // one competition at a time, its votes laid end to end in competition
+    // order, as the arena lays them.
     let scan_files_cpu = |p: &[WideQSig]| -> Vec<(Vec<f32>, Vec<f32>)> {
-        files
-            .iter()
-            .map(|f| {
-                let wref: Vec<&[WideQSig]> = f
-                    .windows
-                    .iter()
-                    .map(|&(k, s, e, _)| &f.arcs_kept[k][s..e])
-                    .collect();
-                let wslot: Vec<usize> = f.windows.iter().map(|&(_, _, _, slot)| slot).collect();
-                match group.policy.scan.fusion {
-                    FusionMode::Additive => {
-                        let v = score_slots_weighted(p, &wref, &wslot, f.n_slots, weights);
-                        (v.clone(), v)
-                    }
-                    mode => {
-                        let grouped = score_slots_grouped(p, &wref, &wslot, f.n_slots, weights);
-                        if grouped.is_empty() {
-                            (vec![0.0; f.n_slots], vec![0.0; f.n_slots])
-                        } else {
-                            (mode.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
-                        }
+        let mut fused_all: Vec<f32> = Vec::new();
+        let mut base_all: Vec<f32> = Vec::new();
+        for comp in &comps {
+            let (wref, wslot, n_cases) = competition_windows(files, comp);
+            let (fused, base) = match group.policy.scan.fusion {
+                FusionMode::Additive => {
+                    let v = score_slots_weighted(p, &wref, &wslot, n_cases, weights);
+                    (v.clone(), v)
+                }
+                mode => {
+                    let grouped = score_slots_grouped(p, &wref, &wslot, n_cases, weights);
+                    if grouped.is_empty() {
+                        (vec![0.0; n_cases], vec![0.0; n_cases])
+                    } else {
+                        (mode.fuse(&grouped), FusionMode::Additive.fuse(&grouped))
                     }
                 }
-            })
+            };
+            fused_all.extend(resized(fused, n_cases));
+            base_all.extend(resized(base, n_cases));
+        }
+        scatter(files, &comps, &fused_all)
+            .into_iter()
+            .zip(scatter(files, &comps, &base_all))
             .collect()
     };
     let gpu_scores: Option<Vec<Vec<(Vec<f32>, Vec<f32>)>>> = arena.and_then(|arena| {
@@ -235,22 +306,26 @@ pub(crate) fn scan_file_scans(
         // sample is the ABA guard against an in-place re-seal / substrate reset
         // reusing an address. Keyed per turn, so a seal re-uploads only that
         // turn's pages; unchanged turns stay resident (no upload).
-        let segments: Vec<PagedSegment> = files
+        // One segment per competition, each file's exchanges at its offset in
+        // the competition's cases.
+        let segments: Vec<PagedSegment> = comps
             .iter()
-            .map(|f| PagedSegment {
-                windows: f
-                    .windows
-                    .iter()
-                    .map(|&(k, s, e, slot)| PagedWindow {
+            .map(|comp| {
+                let mut windows = Vec::new();
+                let mut n_cases = 0usize;
+                for &fi in comp {
+                    let f = &files[fi];
+                    windows.extend(f.windows.iter().map(|&(k, s, e, slot)| PagedWindow {
                         sid: f.arc_sids[k],
                         fingerprint: sig_fingerprint(&f.arcs_kept[k]),
                         turn: f.arcs_kept[k].as_slice(),
                         start: s,
                         end: e,
-                        case: slot,
-                    })
-                    .collect(),
-                n_cases: f.n_slots,
+                        case: n_cases + slot,
+                    }));
+                    n_cases += f.n_slots;
+                }
+                PagedSegment { windows, n_cases }
             })
             .collect();
         // `[probe][file][slot]`.
@@ -258,23 +333,10 @@ pub(crate) fn scan_file_scans(
             match arena.scan_weighted(&segments, probes, w) {
                 Ok(out) => {
                     // One per-GLOBAL-case vote vector per probe, in segment
-                    // (file) order. Split each back per file by cumulative
-                    // `n_slots`.
+                    // (competition) order — split back per file.
                     Some(
                         out.into_iter()
-                            .map(|votes| {
-                                let mut cum = 0usize;
-                                files
-                                    .iter()
-                                    .map(|f| {
-                                        let end = (cum + f.n_slots).min(votes.len());
-                                        let mut v = votes.get(cum..end).unwrap_or(&[]).to_vec();
-                                        v.resize(f.n_slots, 0.0);
-                                        cum += f.n_slots;
-                                        v
-                                    })
-                                    .collect()
-                            })
+                            .map(|votes| scatter(files, &comps, &votes))
                             .collect(),
                     )
                 }
@@ -346,4 +408,99 @@ pub(crate) fn scan_file_scans(
         }
     });
     gpu_scores.unwrap_or_else(|| probes.iter().map(|p| scan_files_cpu(p)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic pseudo-random folded signature: 3 groups × 4 heads ×
+    /// 2 words.
+    fn sig(seed: u64) -> WideQSig {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let words = (0..24)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            })
+            .collect();
+        WideQSig { n_heads: 12, words }
+    }
+
+    /// A file of `exchanges` one-turn exchanges of `tokens` signature tokens
+    /// each, seeded from `seed`.
+    fn file(timeline: u64, seed: u64, exchanges: usize, tokens: usize) -> FileScan {
+        let arcs: Vec<Arc<Vec<WideQSig>>> = (0..exchanges)
+            .map(|e| {
+                Arc::new(
+                    (0..tokens)
+                        .map(|t| sig(seed * 10_000 + (e * tokens + t) as u64))
+                        .collect(),
+                )
+            })
+            .collect();
+        let tl = TimelineId::for_test(timeline);
+        FileScan {
+            timeline: tl,
+            arc_turn: (0..exchanges as u32).map(TurnIndex).collect(),
+            ex_ranges: (0..exchanges).map(|e| e..e + 1).collect(),
+            n_slots: exchanges,
+            arc_sids: (0..exchanges as u32)
+                .map(|i| turn_stream_id(tl.raw(), i))
+                .collect(),
+            windows: (0..exchanges).map(|e| (e, 0, tokens, e)).collect(),
+            ex_tokens: vec![tokens; exchanges],
+            arcs_kept: arcs,
+        }
+    }
+
+    /// Files of one exchange compete together, a file of several on its own.
+    #[test]
+    fn single_exchange_files_compete_as_one_gallery() {
+        let files = vec![file(1, 1, 1, 4), file(2, 2, 3, 4), file(3, 3, 1, 4)];
+        assert_eq!(competitions(&files), vec![vec![1], vec![0, 2]]);
+        // Votes laid out as the competitions are — file 1's three, then the
+        // pool's 0 and 2 — come back in file order.
+        let votes = [10.0, 11.0, 12.0, 20.0, 30.0];
+        assert_eq!(
+            scatter(&files, &competitions(&files), &votes),
+            vec![vec![20.0], vec![10.0, 11.0, 12.0], vec![30.0]]
+        );
+    }
+
+    /// **The pooled document that holds the probe wins, and only it.** Scored
+    /// alone, a one-exchange document has no runner-up, so its margin is its
+    /// raw agreement and every document scores well against a probe that is
+    /// none of them; pooled, the margin is over the next document and a
+    /// document the probe is not drawn from scores next to nothing.
+    #[test]
+    fn a_pooled_document_is_scored_against_the_others() {
+        let files: Vec<FileScan> = (1..=5).map(|i| file(i, i, 1, 24)).collect();
+        // The probe is a stretch of document 3's own signature.
+        let probe: Vec<WideQSig> = files[2].arcs_kept[0][4..16].to_vec();
+
+        let comps = competitions(&files);
+        assert_eq!(comps, vec![vec![0, 1, 2, 3, 4]]);
+        let (wref, wslot, n_cases) = competition_windows(&files, &comps[0]);
+        let pooled = scatter(
+            &files,
+            &comps,
+            &score_slots_weighted(&probe, &wref, &wslot, n_cases, &[]),
+        );
+        let others = [0, 1, 3, 4].map(|i| pooled[i][0]);
+        assert!(
+            others.iter().all(|&o| pooled[2][0] > 10.0 * o.max(1e-3)),
+            "pooled: {pooled:?}"
+        );
+
+        // Alone, a document the probe is not from still scores most of what
+        // the right one does.
+        let alone = |f: &FileScan| {
+            let (wref, wslot, n) = competition_windows(std::slice::from_ref(f), &[0]);
+            score_slots_weighted(&probe, &wref, &wslot, n, &[])[0]
+        };
+        assert!(alone(&files[0]) > 0.2 * alone(&files[2]));
+    }
 }
