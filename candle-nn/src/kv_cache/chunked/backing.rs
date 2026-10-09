@@ -287,7 +287,12 @@ impl BackingInner {
         let keys = self.pool.format_keys();
         for key in keys {
             while let Some(arena_idx) = self.pool.next_tombstone(key) {
+                // Storage first, then the index: reissued any earlier, a registration
+                // could adopt the arena still standing at it (see `next_tombstone`).
+                // A release that fails leaves the index out of circulation for good —
+                // storage may still hold the arena, so reusing it is the bug itself.
                 self.storage.release_arena(arena_idx)?;
+                self.pool.recycle_arena_index(arena_idx);
                 // Paired with the recycle log in `ChunkGidPool::register_arena`:
                 // a fault correlated between a free here and a re-registration
                 // of the same index is the index-re-tenancy signature.
@@ -349,6 +354,7 @@ impl BackingInner {
             return Ok(false);
         }
         self.storage.release_arena(arena_idx)?;
+        self.pool.recycle_arena_index(arena_idx);
         self.pool.resync_counters();
         Ok(true)
     }
