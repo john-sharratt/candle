@@ -7,8 +7,9 @@ code is the same as the final code of `sweep_rtx_pro_5000_72gb_2026-10-10_post_m
 The baseline for code changes is the 2026-10-09 sweep (`sweep_rtx_pro_5000_72gb_2026-10-09.md`),
 taken before the merge.
 
-All 206 gate rows validated, for every session. No probe log has a `non-finite` layer or a
-`!!!!`. These are single runs, so a gap under about 5% is noise.
+All 212 gate rows pass, and every session of every row the gates validate reproduced its
+reference. No probe log has a `non-finite` layer or a `!!!!`. These are single runs, so a
+gap under about 5% is noise.
 
 ## Gates
 

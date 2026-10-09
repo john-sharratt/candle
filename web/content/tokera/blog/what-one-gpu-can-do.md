@@ -7,78 +7,81 @@ tags: [inference, performance, benchmarks]
 summary: >-
   A 180B model on a 16 GB laptop. Context that gets longer without getting
   slower. KV compressed 7× inline, as it's written. And one card that
-  out-serves llama.cpp's best published decode by 36×. Measured on three
-  machines, set against everything published, with every source cited.
+  out-serves llama.cpp's best published decode by 24× on a matched prompt.
+  Measured on three machines, set against every published run I could find,
+  with every source cited.
 ---
+
+*Updated 2026-10-10 with the latest run on each of the three cards.*
 
 **A 180-billion-parameter model, serving eight people at once, from a 16 GB
 laptop — out-serving every published run of it, all of them on desktops with two
 to four times the memory.**
 
 <figure class="fig">
-<svg viewBox="0 0 640 252" role="img" aria-label="Every headline result as a multiple of the best published figure for the same thing, which is 1 times. Aggregate decode against llama.cpp 36.3 times; concurrent sessions on one card 6.4 times; a 284B model's decode on one GPU 4.1 times; KV-cache compression 4.0 times; a 180B model on a laptop 2.26 times; speed kept at 128K context 1.7 times.">
+<svg viewBox="0 0 640 252" role="img" aria-label="Every headline result as a multiple of the best published figure for the same thing, which is 1 times, on a logarithmic scale. Aggregate decode against llama.cpp on a matched prompt 24.2 times; concurrent sessions on one card 6.4 times; a 284B model's decode on one GPU 4.1 times; KV-cache compression 4.0 times; a 180B model on a laptop 2.26 times; decode kept at 128K context 1.6 times.">
   <text class="ttl" x="16" y="20">Every result, against the best published figure</text>
-  <text class="ttl-sub" x="16" y="38">best published = 1× · ours in green · details in each section below</text>
-  <path class="grid base" d="M260 50 V226"/>
-  <path class="grid" d="M350 50 V226 M440 50 V226 M530 50 V226"/>
-  <path class="parity" d="M269 50 V226"/>
+  <text class="ttl-sub" x="16" y="38">best published = 1× · log scale · ours in green · details in each section below</text>
+  <path class="grid" d="M335.2 50 V226 M421.4 50 V226 M486.6 50 V226 M551.8 50 V226"/>
+  <path class="parity" d="M270 50 V226"/>
   <text class="cat" x="16" y="64">Aggregate decode vs llama.cpp</text>
-  <text class="cat-sub" x="16" y="77">Flash-Next, RTX 3090: 543.8 against 15 t/s</text>
-  <path class="line-us" d="M269 66 H586.7"/>
-  <circle class="dot-them" cx="269" cy="66" r="5"/>
-  <circle class="dot-us" cx="586.7" cy="66" r="6.5"/>
-  <text class="v-us" x="598.7" y="71">36.3×</text>
+  <text class="cat-sub" x="16" y="77">Flash-Next, Blackwell: 1,163.9 vs 48.0 t/s</text>
+  <path class="line-us" d="M270 66 H569.7"/>
+  <circle class="dot-them" cx="270" cy="66" r="5"/>
+  <circle class="dot-us" cx="569.7" cy="66" r="6.5"/>
+  <text class="v-us" x="581.7" y="71">24.2×</text>
   <text class="cat" x="16" y="94">Concurrent sessions, one card</text>
   <text class="cat-sub" x="16" y="107">64 against 10 published</text>
-  <path class="line-us" d="M269 96 H317.6"/>
-  <circle class="dot-them" cx="269" cy="96" r="5"/>
-  <circle class="dot-us" cx="317.6" cy="96" r="6.5"/>
-  <text class="v-us" x="329.6" y="101">6.4×</text>
+  <path class="line-us" d="M270 96 H444.6"/>
+  <circle class="dot-them" cx="270" cy="96" r="5"/>
+  <circle class="dot-us" cx="444.6" cy="96" r="6.5"/>
+  <text class="v-us" x="456.6" y="101">6.4×</text>
   <text class="cat" x="16" y="124">284B model, one GPU, decode</text>
   <text class="cat-sub" x="16" y="137">114.4 against 28 t/s</text>
-  <path class="line-us" d="M269 126 H296.9"/>
-  <circle class="dot-them" cx="269" cy="126" r="5"/>
-  <circle class="dot-us" cx="296.9" cy="126" r="6.5"/>
-  <text class="v-us" x="308.9" y="131">4.1×</text>
+  <path class="line-us" d="M270 126 H402.7"/>
+  <circle class="dot-them" cx="270" cy="126" r="5"/>
+  <circle class="dot-us" cx="402.7" cy="126" r="6.5"/>
+  <text class="v-us" x="414.7" y="131">4.1×</text>
   <text class="cat" x="16" y="154">KV-cache compression</text>
   <text class="cat-sub" x="16" y="167">7.6× against llama.cpp q8_0's 1.9×</text>
-  <path class="line-us" d="M269 156 H296"/>
-  <circle class="dot-them" cx="269" cy="156" r="5"/>
-  <circle class="dot-us" cx="296" cy="156" r="6.5"/>
-  <text class="v-us" x="308" y="161">4.0×</text>
+  <path class="line-us" d="M270 156 H400.4"/>
+  <circle class="dot-them" cx="270" cy="156" r="5"/>
+  <circle class="dot-us" cx="400.4" cy="156" r="6.5"/>
+  <text class="v-us" x="412.4" y="161">4.0×</text>
   <text class="cat" x="16" y="184">180B model on a laptop</text>
   <text class="cat-sub" x="16" y="197">108.5 against 48.0 t/s on an RTX 5090</text>
-  <path class="line-us" d="M269 186 H280.3"/>
-  <circle class="dot-them" cx="269" cy="186" r="5"/>
-  <circle class="dot-us" cx="280.3" cy="186" r="6.5"/>
-  <text class="v-us" x="292.3" y="191">2.26×</text>
-  <text class="cat" x="16" y="214">Speed kept at 128K context</text>
-  <text class="cat-sub" x="16" y="227">decode 111% against 65%</text>
-  <path class="line-us" d="M269 216 H275.3"/>
-  <circle class="dot-them" cx="269" cy="216" r="5"/>
-  <circle class="dot-us" cx="275.3" cy="216" r="6.5"/>
-  <text class="v-us" x="287.3" y="221">1.7×</text>
-  <text class="tick mid" x="260" y="244">0×</text>
-  <text class="tick mid" x="350" y="244">10×</text>
-  <text class="tick mid" x="440" y="244">20×</text>
-  <text class="tick mid" x="530" y="244">30×</text>
+  <path class="line-us" d="M270 186 H346.7"/>
+  <circle class="dot-them" cx="270" cy="186" r="5"/>
+  <circle class="dot-us" cx="346.7" cy="186" r="6.5"/>
+  <text class="v-us" x="358.7" y="191">2.26×</text>
+  <text class="cat" x="16" y="214">Decode kept at 128K context</text>
+  <text class="cat-sub" x="16" y="227">107% against 65%</text>
+  <path class="line-us" d="M270 216 H316.9"/>
+  <circle class="dot-them" cx="270" cy="216" r="5"/>
+  <circle class="dot-us" cx="316.9" cy="216" r="6.5"/>
+  <text class="v-us" x="328.9" y="221">1.6×</text>
+  <text class="tick mid" x="270" y="244">1×</text>
+  <text class="tick mid" x="335.2" y="244">2×</text>
+  <text class="tick mid" x="421.4" y="244">5×</text>
+  <text class="tick mid" x="486.6" y="244">10×</text>
+  <text class="tick mid" x="551.8" y="244">20×</text>
 </svg>
 </figure>
 
-That's the first of ten results. Every one is measured by a test in this
-repository and set beside the best figure anyone has published for the same
-model on the same class of card.
+Here are all ten results. Every one is measured by a test in this repository
+and set beside the best figure I could find published for the same model on the
+same class of card.
 
 1. **A 180B model on a 16 GB laptop.** 108.5 t/s aggregate across eight
    sessions, with 32 GB of RAM, more than twice every published llama.cpp run.
-2. **Context length is free.** 16× more context and decode gets *faster*: 99% of
-   prefill and 111% of decode kept from 32K to 128K.
+2. **Context length is free.** Sixteen times more history, 8K to 128K, and
+   prefill and decode both end faster than they started.
 3. **Up to 7.6× KV-cache compression, written inline, every output validated** —
-   no calibration data, no per-model calibration.
+   no calibration dataset, just one threshold per model.
 4. **Nearly 4× the compression of llama.cpp's q8_0 cache — while slowing decode
    less.**
-5. **36× llama.cpp's best published decode, from one card** — 1.35× to 36.3× on
-   every model measured.
+5. **24× llama.cpp's best published decode on a matched prompt, from one card**
+   — 1.35× to 36.3× across every model measured.
 6. **Sixty-four conversations on one card:** 2,761.0 t/s aggregate, 5.8× a
    single session that already decodes at 476.6, with prefill rising 67%.
 7. **A 284B model serving sixteen people from a single GPU**, at 4.1× the best
@@ -86,13 +89,14 @@ model on the same class of card.
 8. **Workstation work from a laptop:** a small model prefills faster than on a
    24 GB RTX 3090, a 30B MoE prefills at 6,100 t/s with its experts streaming,
    and a 35B MoE serves sixteen users at 330 t/s.
-9. **One engine, every card:** 213 ladder rows on the RTX 3090 and 192 on the
-   laptop, not one failing session.
+9. **One engine, every card:** 213 ladder rows on the RTX 3090, 212 on the
+   Blackwell card and 192 on the laptop, not one failing session.
 10. **The whole engine, proven under load:** admission, projection, persistence,
-    compaction and all three memory tiers at once — 8/8 correct at 100% VRAM
-    efficiency.
+    compaction and all three memory tiers at once — every story told correctly,
+    on every card.
 
-And every single session, in every row, produced the right answer.
+And in every row the gates check, every single session produced the right
+answer.
 
 The machines — three cards anyone can buy:
 
@@ -181,7 +185,7 @@ whole time.
   <text class="tick mid" x="420" y="414">300</text>
   <text class="tick mid" x="505" y="414">450</text>
   <text class="tick mid" x="590" y="414">600</text>
-  <text class="t-dim" x="16" y="438">this engine decodes speculatively with the model's own MTP head; the RTX 5080 run uses n-gram speculation</text>
+  <text class="t-dim" x="16" y="438">ours: the gate's short rewrite prompt, decoded with the model's own MTP head · RTX 5080: n-gram speculation</text>
 </svg>
 <figcaption>Every published single-GPU run of this model that states its host uses
 64–128 GB of RAM. The laptop has 32 and serves eight people at once; the RTX 3090
@@ -210,16 +214,31 @@ aggregate**, thirty-six times the published figure, every session validated.
 (Their run was at a 130K context and a 4-bit quant; ours is a short prompt on
 the 2-bit expert artifact.)
 
-The fastest single-session rival is [Strata](https://github.com/Niko1221/Strata),
-built for this model alone, which keeps the hot experts in VRAM and computes the
-misses on the CPU. On a PCIe 5.0 RTX 5070 with 12 GB, holding 14% of the experts
-against our 36–49% on a PCIe 3.0 3090, it decodes 94 t/s to our 138.1, both on
-2-bit experts of the same size and both with MTP. On an RTX 3090 of its own, with
-a PCIe Gen4 link and an EPYC host, it decodes 93 t/s on larger 3-bit experts.
-Its one published batched run, four sessions on the 5070, is 63.1 t/s aggregate,
-below its 70.7 one request at a time. Width is where this engine pulls furthest
-ahead. (On Blackwell, Strata is still the faster single session — more on that at
-the end.)
+The fastest single-session decoder of this model I've found is
+[Strata](https://github.com/Niko1221/Strata), built for it alone, which keeps the
+hot experts in VRAM and computes the misses on the CPU. The cleanest comparison is
+on Blackwell: a community run on an RTX 5090, close hardware to our RTX PRO 5000.
+I rebuilt Strata's own benchmark requests, prompt for prompt, and ran them through
+this engine as a daemon runs them:
+
+- **One session:** Strata decodes 179.4 / 175.7 / 165.0 t/s at 4K / 32K / 128K,
+  on 2-bit experts; we decode 156.6 / 152.5 / 141.6, on 4-bit experts that are
+  twice the bytes per expert — 86–87% of its speed. Our prefill is ahead at 4K
+  (6,020 against 4,270) and level at 32K. On one conversation, Strata is faster.
+- **Many sessions:** our eight-session aggregate is 1,008.2 t/s, and sixteen
+  reach 1,163.9. Strata's one published batched run, four sessions on an RTX 5070,
+  comes to 63.1 t/s, 0.89× its 70.7 one request at a time. That ratio doesn't
+  depend on the card, and it's where the two designs part ways.
+- **The KV cache:** ours is compressed 7.13× as it's written, while eight
+  sessions still decode 885.8 t/s, 88% of uncompressed. Strata's int8 KV is
+  about 2×.
+
+On smaller cards the two haven't run the same requests. On the gate's short
+rewrite prompt — easier for a speculative drafter than Strata's free text — our
+3090 decodes 138.1 t/s, where Strata publishes 94 on a PCIe 5.0 RTX 5070 and 93
+on an RTX 3090 of its own, so treat that pairing as indicative only. Strata's
+benchmarks, hardware and method are all published in the open for anyone to
+reproduce, and work like that moves the whole field. It's well worth a look.
 
 As far as I can find, this is the first time anyone has published this model
 running on a laptop GPU — or in 32 GB of host memory at all.
@@ -299,10 +318,11 @@ What would you expect to happen to the speed?
 and 110K. Ours ends the range faster than it started.</figcaption>
 </figure>
 
-**99% of prefill kept from 32K to 128K. 111% of decode.**
+**At 128K, 114% of the prefill and 107% of the decode it had at 8K.**
 
-For context, every other hybrid model in the fleet keeps 25–30% of its prefill
-over the same range, on the same engine:
+For context, here's the whole fleet on one depth test from 32K to 128K, on the
+same engine. Flash-Next keeps 99% of its prefill and 111% of its decode; every
+other hybrid model keeps 25–30% of its prefill:
 
 <figure class="fig">
 <svg viewBox="0 0 640 306" role="img" aria-label="Share of 32K throughput kept at 128K, one context, same engine. Qwen3.8-Flash-Next prefill 99 percent, decode 111. Qwen3.8-27B 28 and 58. Qwen3.6-35B 26 and 49. Qwen3.5-9B 30 and 48. Qwen3.5-35B 26 and 47. Qwen3.5-0.8B 25 and 86.">
@@ -357,7 +377,9 @@ over the same range, on the same engine:
   <text class="cat-sub mid" x="565.8" y="297">Qwen3.5</text>
 </svg>
 <figcaption>One model breaks away from the pack, and it is the one whose attention
-works over a selected working set rather than the whole history.</figcaption>
+works over a selected working set rather than the whole history. (A different
+task from the chart above, so Flash-Next's percentages differ slightly between
+the two.)</figcaption>
 </figure>
 
 So this isn't the engine being generous to one model. It's what happens when a
@@ -377,7 +399,8 @@ The block is born compressed. That's it. That's the whole trick.
 The top rung of the [adaptive ladder](/blog/palquant-per-block) picks a format
 per block and compresses the cache **4.1× to 7.6×** across the fleet, quantizes
 100% of blocks, and still reproduces every session's output — with no
-calibration data and no per-model calibration. And prefill with it switched on
+calibration dataset, just one threshold per model, set where its outputs stop
+validating. And prefill with it switched on
 lands within a few percent of uncompressed — at 128K it's marginally *faster* on
 every model, because there are fewer bytes to read back.
 
@@ -437,7 +460,7 @@ with everything else out there.
 4.6×.</figcaption>
 </figure>
 
-The top-right cluster is 8K context: **3.3× to 6.3× compression for 0–8% of
+The top-right cluster is 8K context: **4.6× to 6.3× compression for 0–8% of
 decode**, on every model measured there. At 32K the bigger models pay 27–31% for
 6.3–7.5×, and Flash-Next at 128K pays 19% for 7×.
 
@@ -465,7 +488,7 @@ perplexity number, not a cosine threshold, the actual text.</p>
 starts failing. That's what makes it the top rung.</p>
 </div>
 
-## One card out-decodes llama.cpp by 36×
+## One card out-decodes llama.cpp by 24×, like for like
 
 This is the one I'd most like people to go and check, so here's exactly what it
 claims.
@@ -477,88 +500,94 @@ Then take this engine's **aggregate** decode serving concurrent conversations on
 the same class of card. Divide.
 
 <figure class="fig">
-<svg viewBox="0 0 640 472" role="img" aria-label="Our aggregate decode divided by llama.cpp's best published single-stream decode, same model and card class. Flash-Next on RTX 3090 36.3 times; Qwen3.5-35B Blackwell 14.79; Qwen3.5-35B on RTX 3090 11.05; Qwen3.6-35B RTX 3090 8.54; Qwen3.6-35B Blackwell 8.28; Llama-2-7B RTX 3090 5.77; Qwen3.8-27B RTX 3090 5.49; Llama-2-7B Blackwell 5.45; Qwen3-30B Blackwell 4.15; Flash-Next 16 GB 3.74; Qwen3-8B RTX 3090 3.33; Qwen3-8B Blackwell 3.11; Qwen3-8B 16 GB 3.00; Qwen3-30B RTX 3090 2.61; Qwen3.6-35B 16 GB 1.35.">
+<svg viewBox="0 0 640 498" role="img" aria-label="Our aggregate decode divided by llama.cpp's best published single-stream decode, same model and card class. Flash-Next on RTX 3090 36.3 times; Flash-Next Blackwell 24.2; Qwen3.5-35B Blackwell 14.79; Qwen3.5-35B on RTX 3090 11.05; Qwen3.6-35B RTX 3090 8.54; Qwen3.6-35B Blackwell 8.28; Llama-2-7B RTX 3090 5.77; Qwen3.8-27B RTX 3090 5.49; Llama-2-7B Blackwell 5.45; Qwen3-30B Blackwell 4.15; Flash-Next 16 GB 3.74; Qwen3-8B RTX 3090 3.33; Qwen3-8B Blackwell 3.11; Qwen3-8B 16 GB 3.00; Qwen3-30B RTX 3090 2.61; Qwen3.6-35B 16 GB 1.35.">
   <text class="ttl" x="16" y="20">Our aggregate decode ÷ llama.cpp's best published decode</text>
   <text class="ttl-sub" x="16" y="38">same model, same class of card · 1× is parity</text>
-  <path class="grid base" d="M250 56 V448"/>
-  <path class="grid" d="M340 56 V448 M430 56 V448 M520 56 V448"/>
-  <path class="parity" d="M259 56 V448"/>
+  <path class="grid base" d="M250 56 V474"/>
+  <path class="grid" d="M340 56 V474 M430 56 V474 M520 56 V474"/>
+  <path class="parity" d="M259 56 V474"/>
   <text class="t-them" x="263" y="52">llama.cpp's best = 1×</text>
   <text class="cat" x="16" y="75">Flash-Next</text>
   <text class="cat-sub" x="240" y="75" text-anchor="end">RTX 3090</text>
   <rect class="us" x="250" y="62" width="326.3" height="17" rx="4"/>
   <text class="v-us" x="584.3" y="76">36.3×</text>
-  <text class="cat" x="16" y="101">Qwen3.5-35B</text>
+  <text class="cat" x="16" y="101">Flash-Next</text>
   <text class="cat-sub" x="240" y="101" text-anchor="end">Blackwell</text>
-  <rect class="us" x="250" y="88" width="133.1" height="17" rx="4"/>
-  <text class="v-us" x="391.1" y="102">14.79×</text>
+  <rect class="us" x="250" y="88" width="218.2" height="17" rx="4"/>
+  <text class="v-us" x="476.2" y="102">24.2×</text>
   <text class="cat" x="16" y="127">Qwen3.5-35B</text>
-  <text class="cat-sub" x="240" y="127" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="114" width="99.5" height="17" rx="4"/>
-  <text class="v-us" x="357.5" y="128">11.05×</text>
-  <text class="cat" x="16" y="153">Qwen3.6-35B</text>
+  <text class="cat-sub" x="240" y="127" text-anchor="end">Blackwell</text>
+  <rect class="us" x="250" y="114" width="133.1" height="17" rx="4"/>
+  <text class="v-us" x="391.1" y="128">14.79×</text>
+  <text class="cat" x="16" y="153">Qwen3.5-35B</text>
   <text class="cat-sub" x="240" y="153" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="140" width="76.9" height="17" rx="4"/>
-  <text class="v-us" x="334.9" y="154">8.54×</text>
+  <rect class="us" x="250" y="140" width="99.5" height="17" rx="4"/>
+  <text class="v-us" x="357.5" y="154">11.05×</text>
   <text class="cat" x="16" y="179">Qwen3.6-35B</text>
-  <text class="cat-sub" x="240" y="179" text-anchor="end">Blackwell</text>
-  <rect class="us" x="250" y="166" width="74.5" height="17" rx="4"/>
-  <text class="v-us" x="332.5" y="180">8.28×</text>
-  <text class="cat" x="16" y="205">Llama-2-7B</text>
-  <text class="cat-sub" x="240" y="205" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="192" width="51.9" height="17" rx="4"/>
-  <text class="v-us" x="309.9" y="206">5.77×</text>
-  <text class="cat" x="16" y="231">Qwen3.8-27B</text>
+  <text class="cat-sub" x="240" y="179" text-anchor="end">RTX 3090</text>
+  <rect class="us" x="250" y="166" width="76.9" height="17" rx="4"/>
+  <text class="v-us" x="334.9" y="180">8.54×</text>
+  <text class="cat" x="16" y="205">Qwen3.6-35B</text>
+  <text class="cat-sub" x="240" y="205" text-anchor="end">Blackwell</text>
+  <rect class="us" x="250" y="192" width="74.5" height="17" rx="4"/>
+  <text class="v-us" x="332.5" y="206">8.28×</text>
+  <text class="cat" x="16" y="231">Llama-2-7B</text>
   <text class="cat-sub" x="240" y="231" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="218" width="49.4" height="17" rx="4"/>
-  <text class="v-us" x="307.4" y="232">5.49×</text>
-  <text class="cat" x="16" y="257">Llama-2-7B</text>
-  <text class="cat-sub" x="240" y="257" text-anchor="end">Blackwell</text>
-  <rect class="us" x="250" y="244" width="49.1" height="17" rx="4"/>
-  <text class="v-us" x="307.1" y="258">5.45×</text>
-  <text class="cat" x="16" y="283">Qwen3-30B</text>
+  <rect class="us" x="250" y="218" width="51.9" height="17" rx="4"/>
+  <text class="v-us" x="309.9" y="232">5.77×</text>
+  <text class="cat" x="16" y="257">Qwen3.8-27B</text>
+  <text class="cat-sub" x="240" y="257" text-anchor="end">RTX 3090</text>
+  <rect class="us" x="250" y="244" width="49.4" height="17" rx="4"/>
+  <text class="v-us" x="307.4" y="258">5.49×</text>
+  <text class="cat" x="16" y="283">Llama-2-7B</text>
   <text class="cat-sub" x="240" y="283" text-anchor="end">Blackwell</text>
-  <rect class="us" x="250" y="270" width="37.4" height="17" rx="4"/>
-  <text class="v-us" x="295.4" y="284">4.15×</text>
-  <text class="cat" x="16" y="309">Flash-Next</text>
-  <text class="cat-sub" x="240" y="309" text-anchor="end">16 GB</text>
-  <rect class="us" x="250" y="296" width="33.7" height="17" rx="4"/>
-  <text class="v-us" x="291.7" y="310">3.74×</text>
-  <text class="cat" x="16" y="335">Qwen3-8B</text>
-  <text class="cat-sub" x="240" y="335" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="322" width="30" height="17" rx="4"/>
-  <text class="v-us" x="288" y="336">3.33×</text>
+  <rect class="us" x="250" y="270" width="49.1" height="17" rx="4"/>
+  <text class="v-us" x="307.1" y="284">5.45×</text>
+  <text class="cat" x="16" y="309">Qwen3-30B</text>
+  <text class="cat-sub" x="240" y="309" text-anchor="end">Blackwell</text>
+  <rect class="us" x="250" y="296" width="37.4" height="17" rx="4"/>
+  <text class="v-us" x="295.4" y="310">4.15×</text>
+  <text class="cat" x="16" y="335">Flash-Next</text>
+  <text class="cat-sub" x="240" y="335" text-anchor="end">16 GB</text>
+  <rect class="us" x="250" y="322" width="33.7" height="17" rx="4"/>
+  <text class="v-us" x="291.7" y="336">3.74×</text>
   <text class="cat" x="16" y="361">Qwen3-8B</text>
-  <text class="cat-sub" x="240" y="361" text-anchor="end">Blackwell</text>
-  <rect class="us" x="250" y="348" width="28" height="17" rx="4"/>
-  <text class="v-us" x="286" y="362">3.11×</text>
+  <text class="cat-sub" x="240" y="361" text-anchor="end">RTX 3090</text>
+  <rect class="us" x="250" y="348" width="30" height="17" rx="4"/>
+  <text class="v-us" x="288" y="362">3.33×</text>
   <text class="cat" x="16" y="387">Qwen3-8B</text>
-  <text class="cat-sub" x="240" y="387" text-anchor="end">16 GB</text>
-  <rect class="us" x="250" y="374" width="27" height="17" rx="4"/>
-  <text class="v-us" x="285" y="388">3.00×</text>
-  <text class="cat" x="16" y="413">Qwen3-30B</text>
-  <text class="cat-sub" x="240" y="413" text-anchor="end">RTX 3090</text>
-  <rect class="us" x="250" y="400" width="23.5" height="17" rx="4"/>
-  <text class="v-us" x="281.5" y="414">2.61×</text>
-  <text class="cat" x="16" y="439">Qwen3.6-35B</text>
-  <text class="cat-sub" x="240" y="439" text-anchor="end">16 GB</text>
-  <rect class="us" x="250" y="426" width="12.2" height="17" rx="4"/>
-  <text class="v-us" x="270.2" y="440">1.35×</text>
-  <text class="tick mid" x="250" y="464">0×</text>
-  <text class="tick mid" x="340" y="464">10×</text>
-  <text class="tick mid" x="430" y="464">20×</text>
-  <text class="tick mid" x="520" y="464">30×</text>
+  <text class="cat-sub" x="240" y="387" text-anchor="end">Blackwell</text>
+  <rect class="us" x="250" y="374" width="28" height="17" rx="4"/>
+  <text class="v-us" x="286" y="388">3.11×</text>
+  <text class="cat" x="16" y="413">Qwen3-8B</text>
+  <text class="cat-sub" x="240" y="413" text-anchor="end">16 GB</text>
+  <rect class="us" x="250" y="400" width="27" height="17" rx="4"/>
+  <text class="v-us" x="285" y="414">3.00×</text>
+  <text class="cat" x="16" y="439">Qwen3-30B</text>
+  <text class="cat-sub" x="240" y="439" text-anchor="end">RTX 3090</text>
+  <rect class="us" x="250" y="426" width="23.5" height="17" rx="4"/>
+  <text class="v-us" x="281.5" y="440">2.61×</text>
+  <text class="cat" x="16" y="465">Qwen3.6-35B</text>
+  <text class="cat-sub" x="240" y="465" text-anchor="end">16 GB</text>
+  <rect class="us" x="250" y="452" width="12.2" height="17" rx="4"/>
+  <text class="v-us" x="270.2" y="466">1.35×</text>
+  <text class="tick mid" x="250" y="490">0×</text>
+  <text class="tick mid" x="340" y="490">10×</text>
+  <text class="tick mid" x="430" y="490">20×</text>
+  <text class="tick mid" x="520" y="490">30×</text>
 </svg>
-<figcaption>Every row clears parity. The widest is Flash-Next on the RTX 3090:
-543.8 t/s across sixteen sessions against a published 15 — their run at a 130K
-context on a 4-bit quant, ours at a short prompt on 2-bit experts, so it is the
-least like-for-like row. The widest like-for-like one is Qwen3.5-35B on our
-Blackwell card: 2,869.9 across sixty-four sessions against a published RTX 5090's
-194.0. The narrowest is Qwen3.6-35B on 16 GB, against a 3-bit quant that fits
-wholly in VRAM and decodes one stream at 249 with MTP.</figcaption>
+<figcaption>Every row clears parity. The widest like-for-like row is Flash-Next
+on our Blackwell card: 1,163.9 t/s across sixteen sessions against 48.0 on a
+published RTX 5090, both from a short prompt, with our experts at 4 bits to their
+2. The widest of all is Flash-Next on the RTX 3090, 543.8 against a published
+15 — their run at a 130K context on a 4-bit quant, ours at a short prompt on
+2-bit experts, so it is the least like-for-like row. The narrowest is
+Qwen3.6-35B on 16 GB, against a 3-bit quant that fits wholly in VRAM and decodes
+one stream at 249 with MTP.</figcaption>
 </figure>
 
-**Between 1.35× and 36.3×, on every row.**
+**Between 1.35× and 36.3×, on every row — and 24× where the two runs are most
+alike.**
 
 My favourite is the oldest card in the fleet. A 3090, behind a PCIe 3.0 bus, with
 no native FP8, serves Qwen3.5-35B at **1,228.8 t/s aggregate** — against a
@@ -567,8 +596,8 @@ published 111.2. Qwen3.8-27B on the same card does 358.7 against a published
 And the 180B Flash-Next, streaming its experts from 64 GB of RAM, serves sixteen
 conversations at **543.8 t/s** against a published 15.
 
-A six-year-old card, doing the work of eleven — and on the biggest model, of
-thirty-six.
+A six-year-old card, out-serving the best published single stream eleven times
+over — and on the biggest model, thirty-six.
 
 Aggregate against single-stream is exactly the comparison that matters when
 you're deciding how many cards to buy. llama.cpp can serve parallel requests too,
@@ -580,7 +609,7 @@ published record allows, labelled as what it is.
 
 So how far does it go?
 
-Here's Qwen3.6-35B on one 72 GB card, doubling the session count until the gate
+Here's Qwen3.6-35B on one 72 GB card, widening the session count until the gate
 runs out of ladder:
 
 <figure class="fig">
@@ -624,16 +653,17 @@ runs out of ladder:
   <text class="tick mid" x="420" y="280">×16</text>
   <text class="tick mid" x="505" y="280">×32</text>
   <text class="tick mid" x="590" y="280">×64</text>
-  <text class="t-dim" x="16" y="306">prefill over the same range: 10,582 → 17,642 t/s (+66.7%) · vLLM: Millstone AI, FP8</text>
+  <text class="t-dim" x="16" y="306">prefill: 10,582 → 17,642 t/s (+66.7%) · ours: the gate's rewrite prompt · vLLM: Millstone AI, FP8</text>
 </svg>
-<figcaption>5.8× the decode of a single session that already runs at 2.4× vLLM's,
-and prefill rises with it.</figcaption>
+<figcaption>5.8× the decode of a single session, and prefill rises with it. The
+KV cache switches from BF16 to compressed between ×4 and ×8, which is where the
+curve's one flat step sits.</figcaption>
 </figure>
 
-**476.6 t/s for one conversation — 2.4× vLLM's single stream on a bigger card —
-and 2,761.0 t/s for sixty-four.** Nearly six times the work from the same card,
-with the KV cache compressed 6.4× so they all fit, and every one of the sixty-four
-sessions checked for the right answer. Prefill, over the same range, rises 67%.
+**476.6 t/s for one conversation and 2,761.0 t/s for sixty-four.** Nearly six
+times the work from the same card, with the KV cache compressed 6.4× so they all
+fit, and every one of the sixty-four sessions checked for the right answer.
+Prefill, over the same range, rises 67%.
 
 Qwen3.5-0.8B goes further still and serves **256 concurrent sessions**. The
 published single-card serving runs of these models stop at five to ten
@@ -742,10 +772,11 @@ serving a model nearly twice its memory, to sixteen people, from a bag.
 The last one isn't a speed number at all, and I think it matters more than any of
 them.
 
-The same thirteen gates pass on an Ada laptop, on a Blackwell workstation, and on
-a 3090 behind a PCIe 3.0 bus with no native FP8 — where the fast provenance-scan
-backends don't even apply and fall back a rung. **213 ladder rows on the 3090 and
-192 on the laptop, and not one failing session.** The engine sizes its own memory
+The same gates pass on an Ada laptop, on a Blackwell workstation — which runs a
+fourteenth, the 284B — and on a 3090 behind a PCIe 3.0 bus with no native FP8,
+where the fast provenance-scan backends don't even apply and fall back a rung.
+**213 ladder rows on the 3090, 212 on the Blackwell card and 192 on the laptop,
+and not one failing session.** The engine sizes its own memory
 partition to each card; there's no per-machine tuning file.
 
 On the 3090's current build, C10 compresses the Qwen3.5-35B **7.03×**, and every
@@ -759,7 +790,7 @@ the laptop. On the 3090 all three probes tell their story correctly — the 30B,
 Flash-Next, and the Qwen3.6-35B under speculative decode, its recurrent state
 rewound on every rejected draft. Their VRAM efficiency is the open item: 97–99%
 on the previous build, and on the latest two of the three fall to 59% and 79%,
-which we're chasing now.
+which I'm chasing now.
 
 And it's still getting faster. In the ten days since Flash-Next first ran on the
 3090, its single-session decode there has **more than quintupled, from 24.3 to
@@ -802,9 +833,9 @@ build.
 
 A model twice the size of the machine's memory, serving eight people from a
 laptop. Context that gets longer without getting slower. A KV cache seven times
-smaller, compressed as it's written, with every answer checked. One card doing
-the decode work of up to thirty-six llama.cpp instances. A 284B model in a single
-workstation.
+smaller, compressed as it's written, with every answer checked. One card
+out-serving llama.cpp's best published single stream 24 times over, like for
+like. A 284B model in a single workstation.
 
 None of it came from a bigger GPU. All of it came from the constraint of not
 having one — and, as [the first post](/blog/one-card-unbounded-context) argued,
@@ -817,31 +848,6 @@ question.
 The code is in the public domain. The numbers are in the repository with the
 tests that produced them. Go and try them — and if you beat them, I'd love to
 hear about it.
-
-One last word, about [Strata](https://github.com/Niko1221/Strata). It was built
-for Flash-Next alone, and it is the fastest single-session decoder of that model
-I've found. A community run on an RTX 5090 — close hardware to our RTX PRO 5000 —
-makes the cleanest comparison:
-
-- **One session:** we rebuilt Strata's own benchmark requests, prompt for prompt,
-  and ran them through this engine as a daemon runs them. Strata decodes 179.4 /
-  175.7 / 165.0 t/s at 4K / 32K / 128K, on 2-bit experts; we decode 156.6 / 152.5
-  / 141.6, on 4-bit experts that are twice the bytes per expert — 86–87% of its
-  speed. Our prefill is ahead at 4K (6,020 against 4,270) and level at 32K. On one
-  conversation, Strata is still faster.
-- **Many sessions:** our eight-session aggregate is 1,008.2 t/s, 3.4× our single
-  session on the same task, and sixteen reach 1,163.9. Strata's one published
-  batched run, four sessions on an RTX 5070, comes to 63.1 t/s, 0.89× its 70.7
-  one request at a time. That ratio doesn't depend on the card, and it's where
-  the two designs part ways.
-- **The KV cache:** ours is compressed 7.13× as it's written, while eight
-  sessions still decode 885.8 t/s, 88% of uncompressed. Strata's int8 KV is
-  about 2×.
-
-Strata has never run on our 3090 machine, so the 3090 comparison earlier is only
-indicative. Its benchmarks, hardware and method are all published in the open
-for anyone to reproduce, and work like that moves the whole field. It's well
-worth a look.
 
 <div class="key">
 <h4>Sources</h4>
