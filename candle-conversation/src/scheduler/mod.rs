@@ -55,6 +55,7 @@ pub mod relief_trace;
 mod run;
 mod sample;
 mod seal_scan;
+mod settle;
 mod spec_chooser;
 #[cfg(test)]
 mod test_substrate;
@@ -130,8 +131,9 @@ use candle_transformers::models::piece_key::PieceKey;
 use self::exported_state::{ExportedState, SharedState};
 use self::norm_warm::NormWarm;
 use self::priority_pause::PriorityPause;
-use self::projection_identity::{section_content_stamp, segments_identity};
+use self::projection_identity::{section_content_stamp, segments_identity, turn_start_identity};
 pub(crate) use self::seal_scan::SealedProbe;
+pub use self::settle::SettleReport;
 use self::turn_group::{GroupCaseId, TurnGroup};
 use flume::{Receiver, Sender, TryRecvError};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -780,6 +782,17 @@ pub(crate) enum SchedulerRequest {
     /// on its own or is woken to it — there is no ordering in which both miss.
     Wake,
 
+    /// Settle the device: sweep the empty arenas, pack the pools and let the
+    /// weight side grow back into what freed — see `Scheduler::settle_device`.
+    /// Replies with the partition as it then stands, once the scheduler has
+    /// fallen idle and run the settle: work in flight is finished first.
+    ///
+    /// Sent once a caller knows the work it put on the card has left it — an
+    /// evicted timeline whose turns no longer hold a device copy — so the next
+    /// request starts on ground the last one gave back, rather than finding the
+    /// housekeeping still owed inside its own first forwards.
+    Settle { response_tx: Sender<SettleReport> },
+
     /// Shut down the scheduler.
     Shutdown,
 }
@@ -823,6 +836,7 @@ impl SchedulerRequest {
             Self::WarmIngestSlice { .. } => "req:warm_ingest_slice",
             Self::DemoteTimelinesHot { .. } => "req:demote_timelines_hot",
             Self::Wake => "req:wake",
+            Self::Settle { .. } => "req:settle",
             Self::Shutdown => "req:shutdown",
         }
     }
@@ -3068,6 +3082,14 @@ pub(crate) struct Scheduler {
     /// Starts `true`: nothing has completed on a fresh engine, and one that
     /// waited for a completion before its first admission would never take one.
     pub(super) settled_since_admit: bool,
+    /// Whether forwards have run since the device was last settled
+    /// ([`Self::settle_device`]). The idle branch settles once when it is set,
+    /// so the weight side grows back into what the finished work left behind
+    /// while there is nothing in flight to pace against.
+    pub(super) settle_owed: bool,
+    /// Callers waiting on that settle ([`SchedulerRequest::Settle`]), each sent
+    /// its report when the idle branch runs it.
+    pub(super) settle_waiters: Vec<Sender<SettleReport>>,
     /// Which priority bands have had work recently — lower bands wait while a
     /// higher one runs, and for a cooldown after (see [`priority_pause`]).
     pub(super) priority_pause: PriorityPause,
@@ -3440,6 +3462,12 @@ pub(crate) struct Scheduler {
     /// drain). See [`projection_assembler::apply_segments`].
     batch_drain_gap_fills: bool,
     deferred_glue_fires: Vec<projection_assembler::GapFillPlan>,
+    /// Sequences whose next token `inject_stencil_prefills` sampled this
+    /// iteration from its static run's own prefill. They sit out the decode
+    /// step that follows: the token it would carry is the one just sampled, and
+    /// the stencil's constraint for the token after it is set by the next
+    /// injection, not by a step that has not seen the driver advance.
+    stencil_sampled: HashSet<SequenceId>,
     /// Ephemeral-fork requests whose parent had a turn in flight when they
     /// arrived, answered at the turn boundary. See [`ephemeral_fork`].
     parked_forks: Vec<ephemeral_fork::ParkedFork>,
@@ -3687,6 +3715,8 @@ impl Scheduler {
             prefill_queue: VecDeque::new(),
             // See the field: the first pass has nothing to wait for.
             settled_since_admit: true,
+            settle_owed: false,
+            settle_waiters: Vec::new(),
             priority_pause: PriorityPause::default(),
             norm_warm: NormWarm::default(),
             last_kv_compaction: None,
@@ -3743,6 +3773,7 @@ impl Scheduler {
             ingest_timelines: HashSet::new(),
             batch_drain_gap_fills: false,
             deferred_glue_fires: Vec::new(),
+            stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
             wave_prefill_residual: None,
             wave_prefill_cursor: 0,
@@ -4461,7 +4492,7 @@ impl Scheduler {
                         original_borrowed: borrowed,
                         turn_start_parent_blocks,
                         question_tokens: user_content_end as usize,
-                        applied_identity: None,
+                        applied_identity: turn_start_identity(parent_block_count),
                     },
                 );
 
@@ -5131,6 +5162,14 @@ impl Scheduler {
             // Nothing to do. Returning to the top of the loop *is* the work —
             // that is where the guest queue is polled.
             SchedulerRequest::Wake => true,
+
+            // Answered by the idle branch's settle, never from here: this drain
+            // runs between forwards of live decodes, and a settle is unbudgeted.
+            SchedulerRequest::Settle { response_tx } => {
+                self.settle_waiters.push(response_tx);
+                self.settle_owed = true;
+                true
+            }
 
             SchedulerRequest::Shutdown => false,
         }
@@ -10782,6 +10821,10 @@ impl Scheduler {
             );
             return Ok(None);
         }
+        // The rebuild below — capture, seal and re-inject the active turn, then
+        // re-assemble the parent — scales with the turn's length, and on a turn's
+        // first reprojection that is the whole prompt.
+        let _rebuild = profile::span("reproject:rebuild");
 
         // 6. Zero-copy rebuild.
         //
@@ -14606,7 +14649,12 @@ mod tests {
             sched.prefill_queue.push_back(test_prefill_work(id));
         }
         let dtype = sched.session.activation_dtype();
-        let tier = |n: usize| sched.model.wave_tier_bytes(chunk, n, dtype).unwrap_or(0);
+        let tier = |n: usize| {
+            sched
+                .model
+                .wave_tier_bytes(chunk, n, &[], &[], dtype)
+                .unwrap_or(0)
+        };
         let join_price: Vec<u64> = (0..=members)
             .map(|n| tier(n + 1).saturating_sub(tier(n)))
             .collect();

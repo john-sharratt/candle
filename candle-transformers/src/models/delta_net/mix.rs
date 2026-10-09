@@ -45,10 +45,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(feature = "cuda")]
+use candle::quantized::cuda::Q8a128Operand;
+#[cfg(feature = "cuda")]
+use candle::quantized::SumScale;
 use candle::wave_provenance::WaveTicket;
 #[cfg(feature = "cuda")]
 use candle::LeaseAnchor;
 use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_kernels::delta_net::{DELTA_NET_SHORT_SPAN_CONV, DELTA_NET_SHORT_SPAN_ROWS};
 #[cfg(feature = "cuda")]
 use candle_kernels::simple::rows_scatter::ROWS_SCATTER_INLINE_MAX;
 #[cfg(feature = "cuda")]
@@ -1405,9 +1411,11 @@ fn conv_fused_spans<'w>(
     spans: Option<&DeltaNetSpanTable>,
 ) -> Result<LiveTensor<'w>> {
     let (t, channels) = qkv.dims2()?;
-    // Every row is written exactly once — by the batched decode conv or by a
-    // prefill span's kernel — so the buffer is allocated uninitialised
-    // (hot-path invariant 6), in `qkv`'s arena.
+    // Every row a kernel reads is written exactly once — by the batched decode
+    // conv or by a prefill span's conv — so the buffer is allocated
+    // uninitialised (hot-path invariant 6), in `qkv`'s arena. Spans the
+    // short-span scan takes (`spans` is `None` for them) convolve inside that
+    // kernel, which reads none of these rows, so theirs stay unwritten.
     let conved = qkv.empty_beside((t, channels), DType::F32)?;
     if let Some(tbl) = table {
         // All decode spans in one launch: tails via the pointer table, rows
@@ -1507,8 +1515,6 @@ pub fn delta_net_mix_spans<'w>(
     ticket: Option<WaveTicket>,
 ) -> Result<LiveTensor<'w>> {
     let (t, _) = p.qkv.dims2()?;
-    let (h_k, h_v, d) = (dims.n_k_heads, dims.n_v_heads, dims.head_dim);
-
     // **The spans must tile the buffer exactly, in order.** The two carried
     // steps below slice their inputs by `start`/`len` and their results are
     // concatenated back in span order, so a gap, an overlap or a reordering
@@ -1516,6 +1522,81 @@ pub fn delta_net_mix_spans<'w>(
     // looks like a model fault rather than a packing fault. Checked rather than
     // assumed: the caller derives these from the wave's own packing, and this is
     // the one place that can see both.
+    check_span_tiling(seqs, t)?;
+    #[cfg(feature = "cuda")]
+    let d = dims.head_dim;
+
+    #[cfg(feature = "cuda")]
+    if let Some(o) = fused_mix(p, c, dims, seqs, rms_eps, table, ticket)? {
+        // The z-gate is a kernel template instantiation: SiLU for the Qwen3.5
+        // lineage, sigmoid for qwen4exp (§12.6 — the one numerical difference
+        // between the two generations' GDN).
+        return super::cuda::delta_net_norm_gate(&o, &p.z, c.norm, d, rms_eps as f32, zgate);
+    }
+    mix_spans_by_ops(p, c, dims, seqs, rms_eps, zgate)
+}
+
+/// What [`delta_net_mix_spans_q8`] hands an int8 output projection: its operand
+/// emitted by the fused epilogue, or — where there is no fused epilogue to emit
+/// from — the F32 activations for the projection to quantize itself.
+#[cfg(feature = "cuda")]
+pub enum MixOut<'w> {
+    /// The gated activations as F32.
+    F32(LiveTensor<'w>),
+    /// The gated activations as the projection's q8a128 operand, with no F32
+    /// copy stored.
+    Q8(Q8a128Operand<'w>),
+}
+
+/// [`delta_net_mix_spans`] for a layer whose output projection runs int8: on
+/// the fused path the epilogue writes its output as the projection's q8a128
+/// operand under `sum_scale` (`delta_net_norm_gate_q8`) and stores no F32 copy
+/// nothing would read. The tensor-op path — CPU, a reference dtype, another
+/// head geometry — has no fused epilogue to emit from and returns the F32
+/// activations, leaving the projection to quantize them itself.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn delta_net_mix_spans_q8<'w>(
+    p: &DeltaNetProjections<'w>,
+    c: &DeltaNetConstants<'_>,
+    dims: &DeltaNetDims,
+    seqs: &mut [DeltaNetSeq<'_>],
+    rms_eps: f64,
+    table: Option<&DeltaNetLayerTable>,
+    zgate: ZGate,
+    ticket: Option<WaveTicket>,
+    sum_scale: SumScale,
+) -> Result<MixOut<'w>> {
+    let (t, _) = p.qkv.dims2()?;
+    check_span_tiling(seqs, t)?;
+    let d = dims.head_dim;
+    match fused_mix(p, c, dims, seqs, rms_eps, table, ticket)? {
+        Some(o) if d == 128 => Ok(MixOut::Q8(super::cuda::delta_net_norm_gate_q8(
+            &o,
+            &p.z,
+            c.norm,
+            d,
+            rms_eps as f32,
+            zgate,
+            sum_scale,
+        )?)),
+        Some(o) => Ok(MixOut::F32(super::cuda::delta_net_norm_gate(
+            &o,
+            &p.z,
+            c.norm,
+            d,
+            rms_eps as f32,
+            zgate,
+        )?)),
+        None => Ok(MixOut::F32(mix_spans_by_ops(
+            p, c, dims, seqs, rms_eps, zgate,
+        )?)),
+    }
+}
+
+/// The spans must tile the packed buffer exactly, in order — see
+/// [`delta_net_mix_spans`].
+fn check_span_tiling(seqs: &[DeltaNetSeq<'_>], t: usize) -> Result<()> {
     let mut cursor = 0usize;
     for (i, s) in seqs.iter().enumerate() {
         if s.start != cursor {
@@ -1530,13 +1611,31 @@ pub fn delta_net_mix_spans<'w>(
     if cursor != t {
         candle::bail!("delta_net_mix_spans: spans cover {cursor} rows but the buffer holds {t}");
     }
+    Ok(())
+}
 
+/// The fused mixer up to its epilogue — the conv, the scan or decode step —
+/// returning the whole-wave output `o` the norm-gate epilogue reads, or `None`
+/// when this layer's dtypes, geometry or device rule the fused kernels out.
+#[cfg(feature = "cuda")]
+fn fused_mix<'w>(
+    p: &DeltaNetProjections<'w>,
+    c: &DeltaNetConstants<'_>,
+    dims: &DeltaNetDims,
+    seqs: &mut [DeltaNetSeq<'_>],
+    rms_eps: f64,
+    table: Option<&DeltaNetLayerTable>,
+    ticket: Option<WaveTicket>,
+) -> Result<Option<LiveTensor<'w>>> {
+    let (t, _) = p.qkv.dims2()?;
+    let d = dims.head_dim;
     let (qkv, w) = (&p.qkv, c);
     let key_dim = dims.key_dim();
 
     // The fused path: everything from the conv to the output projection in
-    // three kernels per prefill span (or two per decode span) plus one
-    // epilogue launch over the whole wave. The conv kernels' SiLU + Q|K-norm
+    // three launches over the prefill spans (one when they are all
+    // verify-width), two over the decode spans, plus one epilogue launch over
+    // the whole wave. The conv kernels' SiLU + Q|K-norm
     // epilogue makes their output THE operand buffer — q, k and v are strided
     // views of it, the GQA broadcast is an index (`kh = h % h_k`), the read
     // scale is applied on load, the gates are computed in-kernel, and each
@@ -1544,10 +1643,9 @@ pub fn delta_net_mix_spans<'w>(
     // launches and their full-width copy, the repeat/scale materialisations,
     // the per-span operand copies, the output concatenation, and the
     // epilogue's three full-width intermediates do not exist here. The
-    // tensor-op path below is the same arithmetic (the kernels are
-    // parity-locked to it) and serves CPU, reference dtypes, and any other
+    // tensor-op path (`mix_spans_by_ops`) is the same arithmetic (the kernels
+    // are parity-locked to it) and serves CPU, reference dtypes, and any other
     // head geometry.
-    #[cfg(feature = "cuda")]
     let fused_ok = dispatch_verdict(
         0,
         &[
@@ -1565,8 +1663,10 @@ pub fn delta_net_mix_spans<'w>(
             }),
         ],
     );
-    #[cfg(feature = "cuda")]
-    if fused_ok {
+    if !fused_ok {
+        return Ok(None);
+    }
+    {
         // The decode spans run as ONE conv launch and ONE step launch however
         // many sessions the wave carries, through the pointer table. The hot
         // path receives the table from the wave driver (built once per
@@ -1586,6 +1686,15 @@ pub fn delta_net_mix_spans<'w>(
         // rather than of the sequences, so there is nothing for the driver to
         // hoist out of the layer sweep.
         let spans = super::cuda::build_span_table(seqs, qkv)?;
+        // A verify wave's spans are a few rows each, and at that width the
+        // conv, the intra-chunk solve and the state pass are three latency-bound
+        // launches chained through global memory. One launch does all three
+        // on chip — same bits — whenever every multi-row span fits it; a wave
+        // carrying a longer span (bulk prefill) takes the conv + scan pair.
+        let short = spans
+            .as_ref()
+            .is_some_and(|sp| sp.max_len <= DELTA_NET_SHORT_SPAN_ROWS)
+            && dims.conv_kernel == DELTA_NET_SHORT_SPAN_CONV;
 
         let conved = conv_fused_spans(
             qkv,
@@ -1593,7 +1702,7 @@ pub fn delta_net_mix_spans<'w>(
             2 * key_dim,
             rms_eps as f32,
             table,
-            spans.as_ref(),
+            if short { None } else { spans.as_ref() },
         )?;
         let o = conved.empty_beside((t, dims.value_dim()), DType::F32)?;
         let fused = super::cuda::DeltaNetFused {
@@ -1610,14 +1719,31 @@ pub fn delta_net_mix_spans<'w>(
         if let Some(tbl) = table {
             super::cuda::delta_net_decode_batch(&fused, tbl)?;
         }
-        if let Some(sp) = spans.as_ref() {
-            super::cuda::delta_net_prefill_scan(&fused, sp)?;
+        match spans.as_ref() {
+            Some(sp) if short => {
+                super::cuda::delta_net_short_span_scan(&fused, qkv, w.conv, sp, rms_eps as f32)?
+            }
+            Some(sp) => super::cuda::delta_net_prefill_scan(&fused, sp)?,
+            None => {}
         }
-        // The z-gate is a kernel template instantiation: SiLU for the Qwen3.5
-        // lineage, sigmoid for qwen4exp (§12.6 — the one numerical difference
-        // between the two generations' GDN).
-        return super::cuda::delta_net_norm_gate(&o, &p.z, c.norm, d, rms_eps as f32, zgate);
+        Ok(Some(o))
     }
+}
+
+/// The mixer as tensor ops — the arithmetic the fused kernels are
+/// parity-locked to, for CPU, reference dtypes and any other head geometry.
+fn mix_spans_by_ops<'w>(
+    p: &DeltaNetProjections<'w>,
+    c: &DeltaNetConstants<'_>,
+    dims: &DeltaNetDims,
+    seqs: &mut [DeltaNetSeq<'_>],
+    rms_eps: f64,
+    zgate: ZGate,
+) -> Result<LiveTensor<'w>> {
+    let (t, _) = p.qkv.dims2()?;
+    let (h_k, h_v, d) = (dims.n_k_heads, dims.n_v_heads, dims.head_dim);
+    let (qkv, w) = (&p.qkv, c);
+    let key_dim = dims.key_dim();
 
     // Causal conv, then SiLU.
     //

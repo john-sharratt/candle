@@ -14,7 +14,10 @@ use {
     candle::cuda_backend::cudarc::driver::{DevicePtr, DeviceRepr},
     candle_kernels::paged_glue::{run_paged_glue_bf16, run_paged_glue_fp16},
     candle_kernels::paged_prefill::*,
-    candle_nn::kv_cache::{ArenaFormatTag, ChunkedKvBacking},
+    candle_nn::kv_cache::{
+        prefill_kv_stage_bytes, prefill_kv_stage_positions, ArenaFormatTag, ChunkedKvBacking,
+        PrefillKvStageLayout, PrefillLaunchBounds, BUMP_ALIGNMENT, PREFILL_KV_STAGE_MIN_Q_LEN,
+    },
     core::ffi::c_void,
     half::{bf16, f16},
 };
@@ -33,6 +36,8 @@ use crate::models::wave_buffers::wave_from_vec_ticketed;
 use candle_kernels::rope::RopeRungsFfi;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::ChunkPin;
+#[cfg(feature = "cuda")]
+use std::cell::RefCell;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -237,7 +242,7 @@ fn build_slot_headers(
     pipeline_record("slot:arena", t_arena);
     let t_sync = profile_now();
     let (slot_states, pinned_gids, sync_stats) =
-        KvCache::sync_chunked_slot_states(caches, offsets, &arena_info)?;
+        KvCache::sync_chunked_slot_states(caches, offsets, &arena_info, generation)?;
     pipeline_record("slot:sync", t_sync);
     // What `slot:sync` spent, by how each slot was brought up to date.
     pipeline_record_duration(
@@ -251,6 +256,11 @@ fn build_slot_headers(
         sync_stats.resyncs,
     );
     pipeline_record_duration("slot:sync.reuse", sync_stats.reuse_time, sync_stats.reuses);
+    pipeline_record_duration(
+        "slot:sync.extend",
+        sync_stats.extend_time,
+        sync_stats.extends,
+    );
     let table_changed = sync_stats.rebuilds > 0;
 
     // The position_map is layer-invariant (see [`SharedPm`]). The first layer of
@@ -268,9 +278,13 @@ fn build_slot_headers(
     // (CUDA_ERROR_ILLEGAL_ADDRESS) with zero attribution. Refuse to launch and
     // name the chunk instead.
     //
-    // Scanned when the table changed, which is when a stale gid can enter it: a
-    // slot that handed back its live pointer serialised the very same gids on an
-    // earlier pass of this scan, and has held them pinned since.
+    // Scanned when the table was rebuilt, which is when a stale gid can enter
+    // it: a slot that handed back its live pointer serialised the very same
+    // gids on an earlier pass of this scan, and has held them pinned since; one
+    // that was extended serialised only chunks appended since — allocated
+    // fresh, so live — and the previous writer, which that earlier pass
+    // covered. A whole-table walk per extend would put back, per layer, the
+    // depth-proportional cost the extend exists to remove.
     if table_changed {
         let mut dangling: Option<(usize, i64, usize, u16, u16)> = None;
         for (slot_i, cache) in caches.iter().enumerate() {
@@ -636,6 +650,7 @@ fn paged_prefill_batched_impl<'w>(
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
     qsa: Option<&QsaSelection>,
+    bounds: PrefillLaunchBounds,
 ) -> Result<LiveTensor<'w>> {
     // Ragged/varlen prefill. q/k/v arrive FLAT-packed:
     //   q: [total_q, n_head, head_dim], k/v: [total_q, n_kv_head, head_dim]
@@ -872,6 +887,7 @@ fn paged_prefill_batched_impl<'w>(
         rope,
         rope_interleaved,
         max_add,
+        PrefillLaunchCut::new(q_lens, offsets, n_head, n_kv_head, head_dim, bounds),
         qsa,
     )?;
     g_kernel.end();
@@ -943,7 +959,260 @@ pub fn paged_prefill_batched<'w>(
         generation,
         shared_pm,
         qsa,
+        PrefillLaunchBounds::PRODUCTION,
     )
+}
+
+/// [`paged_prefill_batched`] with the launch cut by `bounds` instead of the
+/// production key chunk and row group — what the bit-identity tests use to cut
+/// small launches into many windows and groups. The output is the same bits
+/// whatever the bounds.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn paged_prefill_batched_bounded<'w>(
+    wave: Option<&'w WaveGeneration>,
+    caches: &mut [&mut KvCache],
+    offsets: &[usize],
+    q: &LiveTensor<'_>,
+    k: &LiveTensor<'_>,
+    v: &LiveTensor<'_>,
+    b_sz: usize,
+    q_lens: &[usize],
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
+    rope: &RopeRungs,
+    rope_interleaved: bool,
+    generation: &Generation,
+    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
+    qsa: Option<&QsaSelection>,
+    bounds: PrefillLaunchBounds,
+) -> Result<LiveTensor<'w>> {
+    paged_prefill_batched_impl(
+        wave,
+        caches,
+        offsets,
+        q,
+        k,
+        v,
+        b_sz,
+        q_lens,
+        n_head,
+        n_kv_head,
+        head_dim,
+        prefill_meta,
+        rope,
+        rope_interleaved,
+        generation,
+        shared_pm,
+        qsa,
+        bounds,
+    )
+}
+
+/// The pre-staged K/V of one prefill launch, read back to the host: per KV
+/// head, one row per staged key position — int8 post-RoPE K codes, their FP16
+/// per-32-dim-window scales (as bits), FP16 V (as bits). A staged sequence's
+/// rows start at the staged kv lengths of the sequences before it.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+pub struct KvStageHost {
+    /// Rows per KV head.
+    pub positions: usize,
+    /// Dims per row.
+    pub head_dim: usize,
+    k_codes: Vec<i8>,
+    k_scales: Vec<u16>,
+    v: Vec<u16>,
+}
+
+#[cfg(feature = "cuda")]
+impl KvStageHost {
+    /// Row `row`'s K codes for KV head `head`, natural dim order.
+    pub fn k_codes(&self, head: usize, row: usize) -> &[i8] {
+        let at = (head * self.positions + row) * self.head_dim;
+        &self.k_codes[at..at + self.head_dim]
+    }
+
+    /// Row `row`'s K window scales for KV head `head`, FP16 bits.
+    pub fn k_scales(&self, head: usize, row: usize) -> &[u16] {
+        let n_win = self.head_dim / 32;
+        let at = (head * self.positions + row) * n_win;
+        &self.k_scales[at..at + n_win]
+    }
+
+    /// Row `row`'s V for KV head `head`, FP16 bits, natural dim order.
+    pub fn v(&self, head: usize, row: usize) -> &[u16] {
+        let at = (head * self.positions + row) * self.head_dim;
+        &self.v[at..at + self.head_dim]
+    }
+}
+
+/// The pre-staging pass of a prefill launch alone — what
+/// [`paged_prefill_batched`] stages ahead of its attention kernel for
+/// `caches` about to prefill `q_lens` tokens (packed `k`/`v`, flat
+/// `[Σ q_lens, n_kv_head, head_dim]` in the arena's compute dtype) at
+/// `offsets` — read back to the host. Writes nothing to the caches; the
+/// writer region must already be claimed, as for the launch itself.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn paged_prefill_kv_stage(
+    caches: &[&mut KvCache],
+    offsets: &[usize],
+    k: &Tensor,
+    v: &Tensor,
+    q_lens: &[usize],
+    n_kv_head: usize,
+    head_dim: usize,
+    rope: &RopeRungs,
+    rope_interleaved: bool,
+    generation: &Generation,
+) -> Result<KvStageHost> {
+    if !int8_prefill_head_dim(head_dim) {
+        candle::bail!("prefill kv stage: head_dim {head_dim} has no int8 prefill kernel");
+    }
+    let device = k.device().clone();
+    let Device::Cuda(dev) = &device else {
+        candle::bail!("prefill kv stage: K must be a CUDA tensor");
+    };
+    let plan = KvStagePlan::new(q_lens, offsets);
+    if plan.positions == 0 {
+        candle::bail!(
+            "prefill kv stage: no sequence of {q_lens:?} has {PREFILL_KV_STAGE_MIN_Q_LEN} rows"
+        );
+    }
+    let kv_dtype_code: i32 = match k.dtype() {
+        DType::F16 => 1,
+        DType::BF16 => 2,
+        dt => candle::bail!("prefill kv stage: unsupported K/V dtype {dt:?}"),
+    };
+    let total_q: usize = q_lens.iter().sum();
+    for (t, what) in [(k, "k"), (v, "v")] {
+        if t.dims() != [total_q, n_kv_head, head_dim]
+            || !t.is_contiguous()
+            || t.dtype() != k.dtype()
+        {
+            candle::bail!("prefill kv stage: {what} is {:?}, not packed", t.shape());
+        }
+    }
+    let b_sz = q_lens.len();
+    let mut cu = Vec::with_capacity(b_sz + 1);
+    cu.push(0u32);
+    for &l in q_lens {
+        cu.push(cu[cu.len() - 1] + l as u32);
+    }
+    let cu = Tensor::from_vec(cu, b_sz + 1, &device)?;
+    let q_lens_dev = Tensor::from_vec(
+        q_lens.iter().map(|&l| l as u32).collect::<Vec<_>>(),
+        b_sz,
+        &device,
+    )?;
+    let kv_lens_dev = Tensor::from_vec(
+        offsets
+            .iter()
+            .zip(q_lens)
+            .map(|(&o, &l)| (o + l) as u32)
+            .collect::<Vec<_>>(),
+        b_sz,
+        &device,
+    )?;
+    let headers = build_slot_headers(
+        caches,
+        q_lens,
+        generation,
+        &RefCell::new(None),
+        offsets,
+        rope,
+        &device,
+        None,
+    )?;
+
+    let bytes = plan.bytes(n_kv_head, head_dim);
+    let stage = KernelOutput::<u8>::new(dev, bytes, None)?;
+    let stream = dev.cuda_stream();
+    let ptr_of = |t: &Tensor| -> Result<u64> {
+        let (s, l) = t.storage_and_layout();
+        let Storage::Cuda(c) = &*s else {
+            candle::bail!("prefill kv stage: expected a CUDA tensor")
+        };
+        let base = match t.dtype() {
+            DType::U32 => {
+                c.as_cuda_slice::<u32>()?
+                    .slice(l.start_offset()..)
+                    .device_ptr(&stream)
+                    .0
+            }
+            DType::F16 => {
+                c.as_cuda_slice::<f16>()?
+                    .slice(l.start_offset()..)
+                    .device_ptr(&stream)
+                    .0
+            }
+            DType::BF16 => {
+                c.as_cuda_slice::<bf16>()?
+                    .slice(l.start_offset()..)
+                    .device_ptr(&stream)
+                    .0
+            }
+            dt => candle::bail!("prefill kv stage: unexpected dtype {dt:?}"),
+        };
+        Ok(base)
+    };
+    let (k_ptr, v_ptr) = (ptr_of(k)?, ptr_of(v)?);
+    let (cu_ptr, ql_ptr, kv_ptr) = (ptr_of(&cu)?, ptr_of(&q_lens_dev)?, ptr_of(&kv_lens_dev)?);
+    {
+        let (stage_ptr, _guard) = stage.device_ptr(&stream);
+        candle::set_kernel_breadcrumb("run_paged_prefill_kv_stage", file!(), line!());
+        // SAFETY: every pointer is a live device buffer of the extent the
+        // kernel addresses — the packed K/V and the length tables built above,
+        // the uploaded headers held by `headers`, and `bytes` of stage.
+        unsafe {
+            run_paged_prefill_kv_stage(
+                k_ptr as *const c_void,
+                v_ptr as *const c_void,
+                headers.headers_ptr as *const u8,
+                cu_ptr as *const u32,
+                ql_ptr as *const u32,
+                kv_ptr as *const u32,
+                b_sz as i32,
+                n_kv_head as i32,
+                head_dim as i32,
+                kv_dtype_code,
+                rope.ffi()?,
+                rope_interleaved as i32,
+                stream.cu_stream() as *mut c_void,
+                stage_ptr as *mut u8,
+                bytes as i64,
+                plan.positions as i64,
+                PREFILL_KV_STAGE_MIN_Q_LEN as i32,
+                plan.max_kv_len as i32,
+            );
+        }
+    }
+    let raw = stage
+        .into_tensor(dev.clone(), bytes)
+        .to_owned_tensor()?
+        .to_vec1::<u8>()?;
+    drop(headers);
+
+    // The planes as `prefill_kv_stage_bytes` lays them out.
+    let rows = n_kv_head * plan.positions;
+    let align = |b: usize| b.div_ceil(BUMP_ALIGNMENT) * BUMP_ALIGNMENT;
+    let s_off = align(rows * head_dim);
+    let v_off = s_off + align(rows * (head_dim / 32) * 2);
+    let half = |b: &[u8]| -> Vec<u16> {
+        b.chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect()
+    };
+    Ok(KvStageHost {
+        positions: plan.positions,
+        head_dim,
+        k_codes: raw[..rows * head_dim].iter().map(|&b| b as i8).collect(),
+        k_scales: half(&raw[s_off..s_off + rows * (head_dim / 32) * 2]),
+        v: half(&raw[v_off..v_off + rows * head_dim * 2]),
+    })
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -1081,12 +1350,84 @@ pub fn paged_glue_attn(
     candle::bail!("paged-glue requires the cuda feature")
 }
 
+/// What an uncut pre-staging pass stages (`candle-kernels/src/paged-prefill/kv_stage.cuh`):
+/// every key position of each sequence with at least
+/// [`PREFILL_KV_STAGE_MIN_Q_LEN`] rows — the bulk chunks, whose blocks would
+/// otherwise each decode the positions they select — and the deepest of them.
+/// A launch of short sequences (a verify window, a decode-shaped row) stages
+/// nothing and reads every column from its source.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KvStagePlan {
+    /// The stage's rows per KV head: [`prefill_kv_stage_positions`].
+    positions: usize,
+    /// The deepest staged sequence's kv length — the pre-staging grid's extent.
+    max_kv_len: usize,
+}
+
+/// How one prefill attention launch is cut and what it carves
+/// ([`PrefillKvStageLayout`]): the buffer's layout, each row group's key
+/// windows, and the deepest staged sequence.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PrefillLaunchCut {
+    layout: PrefillKvStageLayout,
+    /// Key windows per row group — the launcher's loop.
+    group_chunks: Vec<u32>,
+    /// The deepest staged sequence's kv length — the pre-staging grid's extent.
+    max_kv_len: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl PrefillLaunchCut {
+    fn new(
+        q_lens: &[usize],
+        offsets: &[usize],
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        bounds: PrefillLaunchBounds,
+    ) -> Self {
+        let layout =
+            PrefillKvStageLayout::new(q_lens, offsets, n_head, n_kv_head, head_dim, bounds);
+        Self {
+            layout,
+            group_chunks: layout.group_chunks(q_lens, offsets),
+            max_kv_len: KvStagePlan::new(q_lens, offsets).max_kv_len,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl KvStagePlan {
+    fn new(q_lens: &[usize], offsets: &[usize]) -> Self {
+        Self {
+            positions: prefill_kv_stage_positions(q_lens, offsets),
+            max_kv_len: q_lens
+                .iter()
+                .zip(offsets)
+                .filter(|(&q, _)| q >= PREFILL_KV_STAGE_MIN_Q_LEN)
+                .map(|(&q, &off)| off + q)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    /// The stage buffer's length for `n_kv_head` heads of `head_dim`.
+    fn bytes(&self, n_kv_head: usize, head_dim: usize) -> usize {
+        prefill_kv_stage_bytes(self.positions, n_kv_head, head_dim)
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
 struct PagedPrefillInt8<'k> {
     /// Longest per-sequence q_len in the batch — sizes the kernel's
     /// query-tile grid exactly.
     max_q_len: usize,
+    /// The launch's cut, and its carve — the pre-staged K/V, the carry and the
+    /// resume table — beside the output, when it stages anything.
+    cut: PrefillLaunchCut,
     softmax_scale: f32,
     cu_seqlens_q: Tensor,
     q_lens: Tensor,
@@ -1200,6 +1541,18 @@ impl<'k> PagedPrefillInt8<'k> {
 
         let elem_count = q_l.shape().elem_count();
         let dst = KernelOutput::<O>::new(dev, elem_count, wave)?;
+        // Carved after the context, as the plan walks the attention chain
+        // (`WaveBuffer::PrefillKvStage`) — one buffer of stage, carry and
+        // resume table at the layout's offsets — and never zeroed: the
+        // pre-staging pass writes every stage row the attention kernel reads,
+        // and a carrying block writes its carry rows and resume entry in the
+        // launch before the one that reads them (invariant 6).
+        let layout = self.cut.layout;
+        let carve = if layout.stage_positions > 0 {
+            Some(KernelOutput::<u8>::new(dev, layout.bytes(), wave)?)
+        } else {
+            None
+        };
 
         // Compute q_dtype code from Q's actual dtype
         // q_dtype codes: 0=F32, 1=F16, 2=BF16, 3=F8E4M3
@@ -1229,6 +1582,18 @@ impl<'k> PagedPrefillInt8<'k> {
             let (cu_ptr, _guard) = cu_seqlens_q.device_ptr(&stream);
             let (q_lens_ptr, _guard) = q_lens.device_ptr(&stream);
             let (kv_lens_ptr, _guard) = kv_lens.device_ptr(&stream);
+            let (stage_ptr, _guard) = match &carve {
+                Some(s) => s.device_ptr(&stream),
+                None => (0, None),
+            };
+            let (carry_ptr, resume_ptr) = if layout.carry_tokens > 0 && stage_ptr != 0 {
+                (
+                    stage_ptr + layout.carry_offset() as u64,
+                    stage_ptr + layout.resume_offset() as u64,
+                )
+            } else {
+                (0, 0)
+            };
             // The kernel applies fused RoPE to Q (in smem) and to new K tokens
             // (k_pos >= prefix_len), each at its own position under its
             // sequence's rung, before computing attention scores and writing
@@ -1267,6 +1632,17 @@ impl<'k> PagedPrefillInt8<'k> {
                         sel_win,
                         sel_stride,
                         sel_ratio,
+                        stage_ptr as *mut u8,
+                        layout.stage_bytes() as i64,
+                        layout.stage_positions as i64,
+                        PREFILL_KV_STAGE_MIN_Q_LEN as i32,
+                        self.cut.max_kv_len as i32,
+                        self.cut.group_chunks.as_ptr(),
+                        self.cut.group_chunks.len() as i32,
+                        layout.group_blocks as i32,
+                        layout.chunk_positions as i32,
+                        carry_ptr as *mut f32,
+                        resume_ptr as *mut u32,
                     )
                 },
             )?;
@@ -1361,7 +1737,8 @@ pub(crate) fn paged_decode_q8_head_dim(head_dim: usize) -> bool {
 /// `headers_ptr` is the raw GPU address of `SlotHeader[batch_size]`, reusing the
 /// same persistent slot-payload representation as decode.
 /// `compute_dtype` is the pre-resolved F16 or BF16 dtype for Q/K/V (derived from arena formats).
-pub(crate) fn paged_prefill_attn_varlen_chunks<'w>(
+/// `cut` is how the launch is cut and what it carves ([`PrefillLaunchCut`]).
+fn paged_prefill_attn_varlen_chunks<'w>(
     wave: Option<&'w WaveGeneration>,
     q: &LiveTensor<'_>,
     cu_seqlens_q: &Tensor,
@@ -1378,6 +1755,7 @@ pub(crate) fn paged_prefill_attn_varlen_chunks<'w>(
     rope: &RopeRungs,
     rope_interleaved: bool,
     max_q_len: usize,
+    cut: PrefillLaunchCut,
     qsa: Option<&QsaSelection>,
 ) -> Result<LiveTensor<'w>> {
     // The kernel handles both RoPE pairings (half-split in-thread; interleaved
@@ -1422,6 +1800,7 @@ pub(crate) fn paged_prefill_attn_varlen_chunks<'w>(
 
     let op = PagedPrefillInt8 {
         max_q_len,
+        cut,
         softmax_scale,
         cu_seqlens_q: cu_seqlens_q.clone(),
         q_lens: q_lens.clone(),
@@ -2355,7 +2734,7 @@ mod tests {
     #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
     use super::paged_prefill_batched as paged_prefill_flat;
-    use candle_nn::kv_cache::ChunkedKvBacking;
+    use candle_nn::kv_cache::{ChunkedKvBacking, PrefillLaunchBounds};
 
     /// Serialize the GPU tests: the split-KV launcher's grow-on-demand
     /// partial pool is a function-local static sized for the production
@@ -2451,6 +2830,63 @@ mod tests {
         (0..head_dim / 2)
             .map(|i| 1.0f32 / 10000.0f32.powf(2.0 * i as f32 / head_dim as f32))
             .collect()
+    }
+
+    /// A launch stages exactly its bulk sequences, whole: a verify window
+    /// beside them — or alone — stages nothing and reads the arena, and the
+    /// stage is as deep as the deepest bulk context.
+    #[test]
+    fn a_launch_stages_its_bulk_sequences_whole_and_nothing_else() {
+        use super::KvStagePlan;
+        assert_eq!(
+            KvStagePlan::new(&[5], &[4196]),
+            KvStagePlan {
+                positions: 0,
+                max_kv_len: 0
+            },
+            "a verify window stages nothing"
+        );
+        let ragged = KvStagePlan::new(&[300, 5, 256], &[102, 50_000, 2001]);
+        assert_eq!(
+            ragged,
+            KvStagePlan {
+                positions: 402 + 2257,
+                max_kv_len: 2257
+            }
+        );
+        // 5,318 rows: K 1,361,408 B; scales 85,088 B padded to 85,248; V
+        // 2,722,816 B.
+        assert_eq!(ragged.bytes(2, 256), 1_361_408 + 85_248 + 2_722_816);
+    }
+
+    /// The launch's cut on Flash-Next attention (24 heads over 2 at head_dim
+    /// 256): an 8K chunk at 295K of history runs two row groups of ten key
+    /// windows each, out of one 152,862,720 B carve; beside a verify window it
+    /// cuts the same, and the verify window stages nothing.
+    #[test]
+    fn a_deep_launch_is_cut_into_groups_and_windows() {
+        use super::PrefillLaunchCut;
+        let cut = PrefillLaunchCut::new(
+            &[8192, 5],
+            &[295_000, 4096],
+            24,
+            2,
+            256,
+            PrefillLaunchBounds::PRODUCTION,
+        );
+        assert_eq!(cut.group_chunks, vec![10, 10]);
+        assert_eq!(cut.max_kv_len, 303_192);
+        assert_eq!(cut.layout.stage_positions, 32_768);
+        assert_eq!(cut.layout.group_blocks, 2048);
+        assert_eq!(cut.layout.bytes(), 152_862_720);
+        // An 8K prompt from zero fits one window: nothing carries, so it is
+        // one launch over the whole grid.
+        let fresh =
+            PrefillLaunchCut::new(&[8192], &[0], 24, 2, 256, PrefillLaunchBounds::PRODUCTION);
+        assert_eq!(fresh.group_chunks, vec![1]);
+        assert_eq!(fresh.layout.group_blocks, 4096);
+        assert_eq!(fresh.layout.carry_tokens, 0);
+        assert_eq!(fresh.layout.bytes(), 8192 * 2 * 784);
     }
 
     /// Zero frequencies for correctness tests: RoPE rotation becomes identity

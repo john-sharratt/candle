@@ -27,6 +27,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -36,8 +37,8 @@ use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
     arena_regions, begin_forward, begin_wave, end_wave_transient, ffn_work_dtype,
     plan_wave_transient, region_stats, DeltaNetWidths, HyperWidths, KvCache, LayerPhase,
-    ModelGeometry, SharedExpertWidths, SlotTenant, SpanRegion, WavePlan, WaveWidth, REGION_BYTES,
-    WAVE_SPAN_BYTES,
+    ModelGeometry, PrefillKvStageLayout, PrefillLaunchBounds, SharedExpertWidths, SlotTenant,
+    SpanRegion, WavePlan, WaveWidth, REGION_BYTES, WAVE_SPAN_BYTES,
 };
 
 use super::kv_row::kv_factors_for;
@@ -77,15 +78,18 @@ use crate::models::delta_net::{
     ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore, SeqSpan, ZGate,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
-use crate::models::expert_lre::{WeightPlan, WeightPlanning};
+use crate::models::expert_lre::{
+    WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS,
+};
 use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
 use crate::models::operand_guard::expect_dense_view;
 use crate::models::piece_key::PieceKey;
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
-use crate::models::profile::{span, ProfileSnapshot};
+use crate::models::profile::{pipeline_record, profile_now, span, ProfileSnapshot};
 use crate::models::qsa_selection::QsaSelection;
+use crate::models::quantized_matmul::QMatMul;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows, VerifyStash};
 use crate::models::residency_rows::residency_decode_rows;
@@ -1658,6 +1662,38 @@ impl Qwen4ExpBatched {
             .index
             .read()
             .map_err(|_| candle::Error::Msg("index lock poisoned".into()))?;
+        self.qsa_bytes_over(&spans, offsets, &idx, layer_start, layer_end)
+    }
+
+    /// [`Self::wave_qsa_bytes`] for sequences that have not run yet — prefills of
+    /// `q_lens[i]` rows from `offsets[i]` against fresh contiguous indexes, over
+    /// the whole stack. What a turn's admission prices its chunks' tiers with,
+    /// through the same `select_layer_bytes` the wave itself carves by (a sequence
+    /// with no cache is priced there as one live tail from position zero).
+    fn fresh_qsa_bytes(&self, q_lens: &[usize], offsets: &[usize]) -> Result<usize> {
+        // Ids no live sequence holds: slot ids are small indices.
+        let seqs: Vec<usize> = (0..q_lens.len()).map(|i| usize::MAX - i).collect();
+        let spans = seq_spans(&seqs, q_lens)?;
+        self.qsa_bytes_over(
+            &spans,
+            offsets,
+            &HashMap::new(),
+            0,
+            self.model.cfg.num_layers,
+        )
+    }
+
+    /// The widest selection carve any KV layer of `[layer_start, layer_end)` makes
+    /// over `spans`, given the sequences' caches in `idx` — the draft head's layer
+    /// included when the range reaches the head.
+    fn qsa_bytes_over(
+        &self,
+        spans: &[SeqSpan],
+        offsets: &[usize],
+        idx: &HashMap<usize, Vec<IndexCache>>,
+        layer_start: usize,
+        layer_end: usize,
+    ) -> Result<usize> {
         let cfg = &self.model.cfg;
         let mut worst = 0usize;
         let mut kv = 0usize;
@@ -1667,9 +1703,9 @@ impl Qwen4ExpBatched {
                     worst = worst.max(select_layer_bytes(
                         kv,
                         *compress_ratio,
-                        &spans,
+                        spans,
                         offsets,
-                        &idx,
+                        idx,
                         &cfg.indexer,
                     )?);
                 }
@@ -1682,9 +1718,9 @@ impl Qwen4ExpBatched {
                     worst = worst.max(select_layer_bytes(
                         kv,
                         *compress_ratio,
-                        &spans,
+                        spans,
                         offsets,
-                        &idx,
+                        idx,
                         &cfg.indexer,
                     )?);
                 }
@@ -1824,6 +1860,55 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             // The multi-stream head is the one `HyperWidths` states.
             mtp_head: false,
         }
+    }
+
+    /// The generic pricing plus **the sparse selection's carve**, the one term
+    /// of this model's tier that follows context depth past the pre-stage's
+    /// key-chunk bound: the score buffer and the scoring products are as wide
+    /// as the candidate blocks the deepest row can see. Left to the generic
+    /// pricing it is zero, and admission priced a 128K turn's deepest chunk at
+    /// the tier of its first.
+    ///
+    /// Priced through the same `select_layer_bytes` the wave places its tier
+    /// by, over fresh contiguous indexes ([`Self::fresh_qsa_bytes`]) — the shape
+    /// a sequence prefilling its whole prompt has. With no chunk list the rows
+    /// are priced as one chunk from position zero.
+    fn wave_tier_bytes(
+        &self,
+        rows: usize,
+        sequences: usize,
+        stage_q_lens: &[usize],
+        stage_offsets: &[usize],
+        act_dtype: DType,
+    ) -> Option<u64> {
+        let geometry = self.wave_geometry(act_dtype);
+        let (q_lens, offsets) = if stage_q_lens.is_empty() {
+            (vec![rows], vec![0])
+        } else {
+            (stage_q_lens.to_vec(), stage_offsets.to_vec())
+        };
+        let qsa_bytes = match self.fresh_qsa_bytes(&q_lens, &offsets) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // The wave this would price refuses by the same error at
+                // placement; admission says why it charged no tier.
+                tracing::warn!(error = %e, rows, "qwen4exp: selection carve unpriceable");
+                return None;
+            }
+        };
+        let width = WaveWidth {
+            kv_stage: PrefillKvStageLayout::new(
+                stage_q_lens,
+                stage_offsets,
+                geometry.n_head,
+                geometry.n_kv_head,
+                geometry.head_dim,
+                PrefillLaunchBounds::PRODUCTION,
+            ),
+            qsa_bytes,
+            ..WaveWidth::prefill(rows, sequences.max(1))
+        };
+        Some(WavePlan::new(geometry).tier_bytes(width) as u64)
     }
 
     /// The widest prefill **this card** can place: the rows whose whole tier —
@@ -2357,6 +2442,18 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Some(self.model.experts.expert_stats())
     }
 
+    fn expert_hit_counts(&self) -> Option<(usize, usize)> {
+        Some(self.model.experts.hit_counts())
+    }
+
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        self.model.experts.hit_references()
+    }
+
+    fn write_expert_routing_trace(&self, path: &Path) -> Result<()> {
+        self.model.experts.write_routing_trace(path)
+    }
+
     fn weight_plan(&self) -> WeightPlanning {
         WeightPlan::from_stats(&self.model.experts.expert_stats())
     }
@@ -2373,6 +2470,23 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     fn reset_expert_stats(&self) {
         self.model.experts.reset_expert_stats();
+    }
+
+    /// Buy `regions` of expert-zone ground for the KV side, between forwards — the
+    /// scheduler's half of the boundary. See `ExpertCache::request_kv_ground`.
+    fn request_kv_ground(&self, regions: usize) -> u64 {
+        self.model.experts.request_kv_ground(regions)
+    }
+
+    /// Let the expert zone take back KV ground standing free, between forwards.
+    ///
+    /// The wave asks this at the head of every forward, but a scheduler that has
+    /// just packed the pools or watched a turn leave the device has to be able to
+    /// ask too: left to the next forward, the question lands in a prefill that is
+    /// buying ground and is refused, so the zone stayed down at its 128K low from
+    /// one Strata run to the next — 24,914 → 23,430 → 21,953 slots.
+    fn reclaim_spare_ground(&self) {
+        self.model.experts.reclaim_spare_ground();
     }
 
     /// The expert pipeline thread's spans — where its time goes serving each
@@ -2415,6 +2529,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 impl WaveSweep for Qwen4ExpBatched {
     fn device(&self) -> &Device {
         &self.model.device
+    }
+
+    fn take_device_fault(&self) -> Result<()> {
+        self.model.experts.take_segment_fault(&self.model.device)
     }
 
     fn num_layers(&self) -> usize {
@@ -2498,6 +2616,10 @@ impl WaveSweep for Qwen4ExpBatched {
         // readback after it waits ~1.6 ms — so what the forward thread spends
         // issuing the sweep is the step, and the GPU spans cannot say which part.
         let preamble_span = span("q4e:host:preamble");
+        // The preamble's parts, each on its own host span: at depth the
+        // preamble is hundreds of milliseconds a forward with the GPU idle, and
+        // the whole-preamble span cannot say which part.
+        let t_pre = profile_now();
 
         // Hand back the PREVIOUS wave's transient tier, here rather than at the
         // end of the wave that placed it. `end_wave_transient` gates on
@@ -2512,6 +2634,7 @@ impl WaveSweep for Qwen4ExpBatched {
         if let Device::Cuda(d) = &m.device {
             end_wave_transient(&d.cuda_stream());
         }
+        pipeline_record("q4e:pre:end_tier", t_pre);
 
         // The KV↔expert boundary's GROWING direction, in the one gap it is legal
         // in: between forwards, on the line after the transient tier goes back, so
@@ -2525,7 +2648,9 @@ impl WaveSweep for Qwen4ExpBatched {
         // that runs out buys its own ground. Mirrors `latent_moe`'s wave and the
         // blanket `BatchedModel` wave's phase 0; Flash-Next runs its own engine
         // rather than `BatchedModelCore`, so it does not inherit either.
+        let t_pre = profile_now();
         m.experts.reclaim_spare_ground();
+        pipeline_record("q4e:pre:reclaim", t_pre);
 
         let n_glue = seq_ids.len() - n_decode - n_prefill;
         if n_glue > 0 || pending_glue.is_some() {
@@ -2554,6 +2679,7 @@ impl WaveSweep for Qwen4ExpBatched {
         // session's STREAM layers — the draft head's layer is stepped by the
         // head's own pass, and `build_decode_metadata` scopes itself to the
         // stream for exactly that reason.
+        let t_pre = profile_now();
         let decode_headers = if n_decode > 0 {
             let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
             DecodeHeaders::Decode { buf, stride }
@@ -2563,16 +2689,21 @@ impl WaveSweep for Qwen4ExpBatched {
                 stride: 0,
             }
         };
+        pipeline_record("q4e:pre:headers", t_pre);
         // Read before the contexts borrow the session: the tier pricing below
         // needs it, and `assemble_wave_contexts` holds a mutable borrow across
         // everything that follows.
         let tier_act_dtype = session.activation_dtype();
+        let t_pre = profile_now();
         let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
         let contexts = contexts.as_mut_slice();
+        pipeline_record("q4e:pre:contexts", t_pre);
 
         // Admit: claim every KV chunk this wave writes, over the KV range.
+        let t_pre = profile_now();
         let (kv_start, kv_end) = self.kv_layer_range(layer_start, layer_end);
         admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
+        pipeline_record("q4e:pre:admit", t_pre);
 
         // ── Carried state: ensure (reset at offset 0), open the GDN wave,
         // snapshot the PLE states for the failure bracket. ──
@@ -2599,9 +2730,11 @@ impl WaveSweep for Qwen4ExpBatched {
         // arena frontier as it stands, so a region claimed after the placement
         // moves the frontier under a tier already standing on it (hot-path
         // invariant 7).
+        let t_pre = profile_now();
         for ((&seq, &off), &q) in seq_ids.iter().zip(&offsets).zip(&q_lens) {
             self.ensure_seq_state(seq, off, off + q, layer_start)?;
         }
+        pipeline_record("q4e:pre:ensure_state", t_pre);
 
         // **Price and reserve this wave's transient tier**, sized to this wave
         // rather than to the widest one the engine can run — after the KV claim
@@ -2609,10 +2742,12 @@ impl WaveSweep for Qwen4ExpBatched {
         // it, and before `begin_forward` below, because the placement may buy
         // ground from the weight side and `set_weight_floor` refuses while a
         // forward is open.
+        let t_pre = profile_now();
         #[cfg(feature = "cuda")]
         if total_rows > 0 {
             if let Device::Cuda(d) = &m.device {
-                let plan = WavePlan::new(self.wave_geometry(tier_act_dtype));
+                let geometry = self.wave_geometry(tier_act_dtype);
+                let plan = WavePlan::new(geometry);
                 // The wave's composition, not just its row count: the chains
                 // price a prefill row, a decode row and a scored row
                 // differently, and the Gated Residual's streams are carried by
@@ -2686,6 +2821,16 @@ impl WaveSweep for Qwen4ExpBatched {
                         layer_start,
                         layer_end,
                     )?,
+                    // The prefill launch's carve: up to one key chunk of each
+                    // bulk chunk's sequence, and the carry beside it.
+                    kv_stage: PrefillKvStageLayout::new(
+                        pre_q,
+                        pre_off,
+                        geometry.n_head,
+                        geometry.n_kv_head,
+                        geometry.head_dim,
+                        PrefillLaunchBounds::PRODUCTION,
+                    ),
                 };
                 let per_phase = [
                     plan.phase_bytes(LayerPhase::Attention, width),
@@ -2699,14 +2844,17 @@ impl WaveSweep for Qwen4ExpBatched {
                 })?;
             }
         }
+        pipeline_record("q4e:pre:plan_tier", t_pre);
 
         // From here the forward owns the span partition: the tier is placed and
         // must not move under it.
+        let t_pre = profile_now();
         #[cfg(feature = "cuda")]
         let _forward_open = match &m.device {
             Device::Cuda(d) => Some(begin_forward(&d.cuda_stream())),
             _ => None,
         };
+        pipeline_record("q4e:pre:begin_forward", t_pre);
 
         // **The forward-scoped span**, held for the whole sweep rather than per
         // layer: it carries the metadata a forward builds once and every layer
@@ -2729,10 +2877,13 @@ impl WaveSweep for Qwen4ExpBatched {
         // the wave's ragged prefill offsets — read by every layer, written once
         // — which is the forward span's stated purpose. Nothing above needs
         // them, so moving the construction down costs only this comment.
+        let t_pre = profile_now();
         let prefill_headers = DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
             pre_off, pre_q, &m.device, fwd_ticket,
         )?);
+        pipeline_record("q4e:pre:meta", t_pre);
 
+        let t_pre = profile_now();
         let index_snapshot: Vec<(usize, Vec<IndexSnapshot>)> = {
             let idx = self
                 .index
@@ -2792,6 +2943,7 @@ impl WaveSweep for Qwen4ExpBatched {
                 rec.get_mut(&s).expect("ensured above").begin_wave()?;
             }
         }
+        pipeline_record("q4e:pre:snapshots", t_pre);
 
         drop(preamble_span);
         let layers_span = span("q4e:host:layers");
@@ -3757,12 +3909,28 @@ impl Qwen4ExpBatched {
             // here waits on the host, so this event span is the one place that
             // device time is attributed.
             let g_moe = crate::models::profile::gpu_span(moe_span, dev);
+            // The next rows' routers, applied to this layer's input in its own
+            // stacked projection: their votes predict those rows' experts for the
+            // expert cache's read-ahead and staging. Decode-width launches only —
+            // a prompt routes most of every row, which leaves nothing to predict —
+            // and only while the cache copies experts often enough to repay them
+            // (`ExpertCache::reads_ahead`).
+            let look_ahead: Vec<&QMatMul> =
+                if total_rows <= LOOK_AHEAD_MAX_TOKENS && layer.moe.routed.cache.reads_ahead() {
+                    m.layers[li + 1..(li + 1 + LOOK_AHEAD_HOPS).min(num_layers)]
+                        .iter()
+                        .map(|l| &l.moe.routed.gate)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             // The layer's output in its three parts: the shared expert's gate is
             // applied by the combine below, which reads the block output anyway,
             // rather than by three launches of its own.
-            let parts = layer
-                .moe
-                .forward_parts(acts, DType::F32, &decode_like, moe_wave)?;
+            let parts =
+                layer
+                    .moe
+                    .forward_parts(acts, DType::F32, &decode_like, moe_wave, &look_ahead)?;
             let routed = parts.routed.reshape((total_rows, n_embd))?;
             g_moe.end();
             #[cfg(feature = "tensor-assert")]

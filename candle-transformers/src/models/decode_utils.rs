@@ -304,11 +304,7 @@ mod cuda_tests {
         }
         backing.ensure_for_offset(0, seq_offset, 1)?;
 
-        let arena_info = backing.resolve_arena_info()?;
-        let (ptrs, _pins, _) = backing.sync_decode_gpu_chunks(&[(0, seq_offset)], &arena_info)?;
-        let (ptr, n_slices, write_slice) = ptrs[0];
-
-        // Stage the SlotHeader to GPU.
+        // Stages the slot sync's upload and the SlotHeader.
         //
         // IMPORTANT: `gen` must stay alive until after `paged_decode_attn` returns.
         // GpuBuf arena buffers point into the stager's pinned GPU-mapped arena;
@@ -316,6 +312,11 @@ mod cuda_tests {
         // before the kernel runs causes CUDA_ERROR_ILLEGAL_ADDRESS.
         let stager = PinnedStager::new(device.as_cuda_device()?);
         let gen = stager.begin_generation();
+        let arena_info = backing.resolve_arena_info()?;
+        let (ptrs, _pins, _) =
+            backing.sync_decode_gpu_chunks(&[(0, seq_offset)], &arena_info, &gen)?;
+        let (ptr, n_slices, write_slice) = ptrs[0];
+
         let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
         SlotHeaderHost {
             n_slices,
@@ -417,12 +418,13 @@ mod cuda_tests {
         backing.set_block_window(0, 1, 0, w as u32)?;
         backing.test_set_writer_start(0, 1)?;
 
-        let arena_info = backing.resolve_arena_info()?;
-        let (ptrs, _pins, _) = backing.sync_decode_gpu_chunks(&[(0, seq_offset)], &arena_info)?;
-        let (ptr, n_slices, write_slice) = ptrs[0];
-
         let stager = PinnedStager::new(device.as_cuda_device()?);
         let gen = stager.begin_generation();
+        let arena_info = backing.resolve_arena_info()?;
+        let (ptrs, _pins, _) =
+            backing.sync_decode_gpu_chunks(&[(0, seq_offset)], &arena_info, &gen)?;
+        let (ptr, n_slices, write_slice) = ptrs[0];
+
         let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
         SlotHeaderHost {
             n_slices,

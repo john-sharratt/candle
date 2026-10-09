@@ -39,12 +39,14 @@
 
 use candle::Device;
 use candle_conversation::fragmentation_probe::{
-    names, profile, run, run_baseline, run_on_model, ModelProfile, Probe, ProbeOutcome,
+    names, profile, run, run_baseline, run_on_model, run_strata, ModelProfile, Probe, ProbeOutcome,
 };
 use candle_conversation::models::Model;
 use candle_conversation::ManagedBatchedModel;
 use candle_transformers::models::batch_test::utils::{TestConfig, TestMode, TestParams};
 use candle_transformers::models::batched_inference::InferenceMode;
+use candle_transformers::models::dialect::Dialect;
+use candle_transformers::models::profile::pipeline_snapshot_and_reset;
 use candle_transformers::models::quant_ladder;
 use candle_transformers::models::{
     quantized_qwen36_moe, quantized_qwen38_moe, quantized_qwen3_moe,
@@ -208,6 +210,39 @@ fn qwen38_flash_next_combined() {
         flash_next_row(),
         quantized_qwen38_moe::batched_forward_configs,
         true,
+    );
+}
+
+/// **Strata's single-session benchmark, delivered through the engine.** The requests of
+/// `quantized_qwen38_moe::tests::strata_bench_single_session`, byte for byte, through a
+/// `ConversationEngine` at the probe's C5 and Flash-Next's native 262,144 context — the
+/// level and the context zend builds its dialogue engine with. Read beside the forward
+/// bench's table: the forward bench is the ceiling, this is what a daemon delivers, and
+/// the gap is what the engine costs on Strata's work.
+#[test]
+#[ignore = "loads Qwen3.8-Flash-Next at this card's rung and prefills to 128K through the \
+            engine — minutes; needs the card to itself"]
+fn qwen38_flash_next_strata() {
+    logging();
+    let mut row = flash_next_row();
+    row.max_seq_len = 262_144;
+    // Empty unless built with `--features hub,profile`: each length's spans alone. The
+    // warm-up's are read and discarded so the first length's table holds only its own.
+    let runs = run_strata(
+        &Probe::new(row),
+        Dialect::qwen35(),
+        |boundary| match boundary {
+            None => drop(pipeline_snapshot_and_reset()),
+            Some(target) => {
+                print_pipeline_profile(&format!("Strata through the engine — {target} tokens"))
+            }
+        },
+    )
+    .expect("the bench ran");
+    assert_eq!(
+        runs.len(),
+        1 + 3 * 3,
+        "the warm-up and three runs at each length"
     );
 }
 
@@ -386,7 +421,7 @@ fn qwen3_30b_a3b_q4_profile_engine() {
 /// cost rather than execution order because the question this answers is "where did the
 /// time go", and the answer is the first few rows.
 fn print_pipeline_profile(title: &str) {
-    let snap = candle_transformers::models::profile::pipeline_snapshot_and_reset();
+    let snap = pipeline_snapshot_and_reset();
     if snap.entries.is_empty() {
         println!(
             "\n=== {title} ===\n  (no spans recorded — build with `--features profile`, \

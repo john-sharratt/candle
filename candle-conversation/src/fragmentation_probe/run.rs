@@ -330,7 +330,7 @@ pub fn run(probe: &Probe) -> anyhow::Result<ProbeOutcome> {
 /// must be held for the engine's whole life; dropping it removes the store, and a
 /// previous run's corpse is swept on creation. See `scratch_substrate` for what that
 /// does and does not promise.
-fn start_engine(
+pub(super) fn start_engine(
     probe: &Probe,
     device: &Device,
     tokenizer: &tokenizers::Tokenizer,

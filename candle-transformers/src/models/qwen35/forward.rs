@@ -35,8 +35,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, WavePlan,
-    WaveWidth,
+    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase,
+    PrefillKvStageLayout, PrefillLaunchBounds, WavePlan, WaveWidth,
 };
 
 use super::batched::HybridBatched;
@@ -637,6 +637,31 @@ impl ManagedBatchedModel for HybridBatched {
         }
     }
 
+    fn expert_hit_counts(&self) -> Option<(usize, usize)> {
+        #[cfg(feature = "cuda")]
+        {
+            self.model().experts.as_ref().map(|c| c.hit_counts())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        #[cfg(feature = "cuda")]
+        {
+            self.model()
+                .experts
+                .as_ref()
+                .and_then(|c| c.hit_references())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
     fn weight_plan(&self) -> WeightPlanning {
         // A dense checkpoint of this lineage has no expert cache, which is `Dense` and
         // not a broken gauge set — see `WeightPlanning`.
@@ -685,6 +710,14 @@ impl ManagedBatchedModel for HybridBatched {
             let _ = regions;
             0
         }
+    }
+
+    /// Let the weight side — experts or streamed layers — take back KV ground
+    /// standing free, between forwards. The wave asks at its own head; this is the
+    /// scheduler asking after a compaction or a settle, which would otherwise wait
+    /// for the next forward and find it buying ground instead.
+    fn reclaim_spare_ground(&self) {
+        HybridBatched::reclaim_spare_ground(self);
     }
 
     /// Dense tensors **plus** whatever experts are resident, which is what the
@@ -753,6 +786,14 @@ impl WaveSweep for HybridBatched {
 
     fn kv_layer_range(&self, layer_start: usize, layer_end: usize) -> (usize, usize) {
         HybridBatched::kv_layer_range(self, layer_start, layer_end)
+    }
+
+    fn take_device_fault(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Some(c) = self.model().experts.as_ref() {
+            c.take_segment_fault(HybridBatched::device(self))?;
+        }
+        Ok(())
     }
 
     /// Open the wave's recurrent state, sweep, then commit or roll back.
@@ -945,7 +986,8 @@ fn sweep_layers(
     #[cfg(feature = "cuda")]
     if total_rows > 0 {
         if let Device::Cuda(d) = dev {
-            let plan = WavePlan::new(model.wave_geometry(embed_dtype));
+            let geometry = model.wave_geometry(embed_dtype);
+            let plan = WavePlan::new(geometry);
             // **Scored rows are not all rows.** The head runs every decode row
             // and the LAST row of each prefill span — a verifying span excepted,
             // where each row is a prediction to compare a proposal against.
@@ -1005,6 +1047,16 @@ fn sweep_layers(
                 // needs (measured: `wave-ffn … exceeds the 0 B budget`).
                 staged_rows: staged.map_or(0, |(rows, _)| rows),
                 staged_spans: staged.map_or(0, |(_, spans)| spans),
+                // The prefill launch's carve: up to one key chunk of each bulk
+                // chunk's sequence, and the carry beside it.
+                kv_stage: PrefillKvStageLayout::new(
+                    pre_q,
+                    pre_off,
+                    geometry.n_head,
+                    geometry.n_kv_head,
+                    geometry.head_dim,
+                    PrefillLaunchBounds::PRODUCTION,
+                ),
             };
             let per_phase = [
                 plan.phase_bytes(LayerPhase::Attention, width),
@@ -1440,11 +1492,10 @@ fn sweep_layers(
         g_layer.end();
         // A segment per layer, as the uniform sweep cuts it: recorded whole, the
         // forward would be one segment and the GPU would idle until the host had
-        // recorded every layer. A routed checkpoint's expert dispatch already
-        // ends a segment in each layer, so only a dense one is cut here.
-        if q.cfg.moe.is_none() {
-            dev.flush_launches()?;
-        }
+        // recorded every layer. A routed checkpoint is cut the same way: its
+        // expert dispatch flushes only on `expert_lre::flush_schedule`'s doubling
+        // cadence, which was measured for Flash-Next's own sweep, not this one.
+        dev.flush_launches()?;
     }
 
     // File the stash back, whether this sweep was whole or one window of a

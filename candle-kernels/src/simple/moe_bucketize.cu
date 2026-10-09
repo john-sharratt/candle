@@ -13,30 +13,43 @@
 // on: the offsets, the tile order and the remote list are block-wide scans over
 // the expert axis, one value per thread.
 //
+// Two kernels, one contract. A launch of at most BUCKETIZE_NARROW (256)
+// assignments — a decode, draft or verify step — runs
+// `moe_bucketize_narrow_kernel` (`moe_bucketize_narrow.cuh`): one assignment
+// per thread, five block barriers, the same bytes. At that width the phases
+// below cost their ~22 barriers and serial tails, not their work (12 µs a
+// launch at 50 assignments over 512 experts, RTX PRO 5000). Wider launches run
+// the phases below. The
+// host-memory protocol — the started word, the live-entry snapshot, the
+// promotion walk — is one set of device functions both kernels call
+// (`moe_bucketize_live.cuh`).
+//
 // Every output is bit-deterministic:
-//   * phase 1 — a grid-stride per-expert histogram: each assignment is read
-//     ONCE and bumped into its expert's shared bin with an atomicAdd (an id
-//     ≥ n_experts is the router's "no expert" sentinel and is skipped). The
-//     sums are order-independent, so the counts — and every table derived from
-//     them — are identical to a serial scan, at O(a_ub) instead of
-//     O(n_experts × a_ub) work;
+//   * phase 1 — a per-expert histogram: each assignment is read ONCE, and the
+//     lanes of a warp routing one expert add their count to its shared bin
+//     with one atomicAdd (an id ≥ n_experts is the router's "no expert"
+//     sentinel and is skipped). The sums are order-independent, so the counts
+//     — and every table derived from them — are identical to a serial scan;
 //   * phase 2 — block-wide scans turn the counts into bucket offsets, the
 //     per-expert tile counts into the tile order, and the routed remote experts
 //     into the remote list; thread 0 then walks only that list for the
 //     promotion ring, and writes the device header. A serial walk of all 512
 //     experts here — four of them, for the offsets and the three tile classes —
 //     was 100 µs of every 116 µs decode call;
-//   * phase 3 — a chunked STABLE counting-sort scatter: the list is split into
-//     NCHUNK contiguous chunks, each chunk counts its assignments per expert, a
-//     per-expert exclusive prefix across chunks gives each chunk its write base,
-//     and each chunk scatters in ascending i. Chunks ordered + within-chunk
-//     ascending ⇒ each bucket is STABLE (ascending i), exactly the buckets of a
-//     serial stable counting sort, in O(a_ub) work (no per-expert full rescan);
+//   * phase 3 — a STABLE counting-sort scatter, one contiguous chunk of the
+//     list per warp: each warp counts its chunk per expert, a per-expert
+//     prefix across the warps gives each its write bases, and each walks its
+//     chunk again 32 assignments a step, placing same-expert lanes by
+//     `__match_any_sync`. Chunks, steps and lanes all ascend in i, so each
+//     bucket is STABLE (ascending i), exactly the buckets of a serial stable
+//     counting sort — with every lane of every warp working, where the
+//     chunk-per-thread form it replaced kept 16 threads busy at 512 experts,
+//     ~1.5 ms a call at 8,192 rows;
 //   * phase 4 — each thread emits its expert's GEMM tiles (≤ tile_w tokens
 //     per tile); the tail up to the launch bound is padded with `b_cnt = 0`
 //     tiles the grouped kernel skips, so the HOST needs no data-dependent
 //     value for the GEMM grid — it launches at the `n_tokens × k` bound;
-//   * phase 5 — a chunked block scan over the valid flags builds the
+//   * phase 5 — a tiled block scan over the valid flags builds the
 //     token-major compaction: `perm` (expert-grouped row of each valid
 //     assignment), `reordered_weight_ids`, and `token_starts`, the exact
 //     inputs of `deterministic_scatter_*`.
@@ -68,11 +81,11 @@
 // holds more than its `reserve` (a mapped word the host sets; a null address
 // means never). Where the zone has room for prompts the host sets it to 0 and a
 // prompt takes any stocked slot; where it has not, the host sets it to the
-// ring's whole stock target, which it stocks to and no further, so the stock
-// is decode's and a prompt — which sweeps the table about once — is served by
-// the workers' copies instead of evicting decode's working set. Only the brief
-// window after the target shrinks, before the host trims the surplus, lets a
-// prompt-only expert through there.
+// stock decode's misses want, so a prompt — which sweeps the table about once —
+// is served by the workers' copies instead of evicting decode's working set.
+// What stands above the reserve is the read-ahead window and the zone's empty
+// slots: prompt-only experts and read-ahead (below) share it, and read-ahead
+// never takes the stock below the reserve.
 //
 // A PROMPT-ONLY expert takes only an EMPTY offer — a prompt fills the zone's
 // holes and never evicts. When the next offer holds a victim, it stays in its
@@ -106,6 +119,29 @@
 // GEMMs' workers write every slice they copy into that slot, so once the layer
 // is done the expert is whole in VRAM and the host points its entry there.
 //
+// READ-AHEAD (`ahead_items`, optional; `moe_read_ahead.cuh` is the item
+// contract): after its own misses, a launch that claims at all spends what is
+// left of the layer's link window on experts predicted for the rows after the
+// next — `row + 2 … row + depth` (wrapping into the next pass), the host's
+// prediction lists in `ahead_list[t][..ahead_n[t]]`, each expert with the slot
+// image the host vetted as its source in `ahead_src[t][..]`. The budget is the
+// mapped `window` word (slot images the link moves in one layer) less this
+// launch's remote experts, at most AHEAD_MAX. A predicted expert is read ahead
+// only while its entries still point at that vetted image, in pinned memory: a
+// VRAM expert needs nothing, a cold one is the stager's to stage, and an image
+// the host did not vet may be a pad slot nobody pinned — the stager may evict
+// it while this launch reads it, since the pad's reuse rules guard the pad's
+// own row's invocations, not this one. The host vets a warm slot as it is (it
+// never changes) and a pad slot only once it has pinned it, and keeps the pin
+// until every launch that could read the listing has finished. An unmarked
+// vetted expert takes the next offer exactly as a miss does (a victim of this row that this
+// launch routes is skipped; a claimed victim is retargeted first), is logged
+// `summary_seq << 32 | t << 16 | AHEAD_FLAG | expert` and marked, and gets an
+// item: the gate launch's workers copy its image into the slot and the last of
+// them publishes its entries, so a later row's bucketize finds it in VRAM with
+// no host step between. A row's prediction is a hint, never a correctness
+// input: a wrong one costs a slot and the link time the budget allowed.
+//
 // OWNER CHECK (`slot_owner`, optional): the zone's slots, each tagged with the
 // expert last installed there as `(row + 1) << 16 | expert`. Every VRAM entry
 // snapshotted for a GEMM is checked against its slot's tag, and a mismatch —
@@ -127,90 +163,23 @@
 //                                        segments only cover valid rows)
 // =============================================================================
 
-#include <stdint.h>
-#include <stdio.h>
+#include "moe_bucketize_common.cuh"
+#include "moe_bucketize_live.cuh"
+#include "moe_bucketize_narrow.cuh"
 
-// One thread per expert; phase 3 is one-thread-per-chunk.
+// One thread per expert; phase 3 is one chunk per warp.
 //
-// MAX_EXPERTS 512 is Qwen3.8-Flash-Next's width (Qwen3-MoE has 128, Qwen3.5 has
-// 256). The static shared-memory cost is `sh_cc` (32 KB, fixed) plus four
-// int32 arrays over the expert axis — 512·4·4 ≈ 8 KB — plus ~2 KB of scan and
-// header, ≈ 42 KB against the 48 KiB static cap. Raising the bound again means
+// The static shared-memory cost is `sh_cc` (32 KB, fixed) plus four int32
+// arrays over the expert axis — 512·4·4 ≈ 8 KB — plus ~2 KB of scan and header,
+// ≈ 42 KB against the 48 KiB static cap. Raising MAX_EXPERTS again means
 // dynamic shared memory and a wider block, not a constant change.
-#define BUCKETIZE_THREADS 512
-#define BUCKETIZE_WARPS (BUCKETIZE_THREADS / 32)
-#define MAX_EXPERTS 512
-static_assert(MAX_EXPERTS <= BUCKETIZE_THREADS, "phase 2 scans one expert per thread");
-#define MAX_TOPK 32
-#define INVALID_ROW 0xFFFFFFFFu
-// Phase-3 chunk-table budget (ints). NCHUNK = SH_CC_INTS / n_experts chunks.
+// Phase-3 per-warp count table (ints): one count per warp per expert.
 #define SH_CC_INTS 8192
-#define SH_CC_MAX_CHUNK 128
-// The token ranges `[lo, hi)` scored as decode, passed by value in the launch
-// parameters: a wave's decode rows, its verify segments, and the last token of
-// each prompt — the token the sequence's decode continues from.
-#define MAX_DECODE_RANGES 32
-struct DecodeRanges {
-    uint32_t n;
-    uint32_t lo[MAX_DECODE_RANGES];
-    uint32_t hi[MAX_DECODE_RANGES];
-};
-// Where an expert's gate entry points.
-#define CLS_VRAM 0
-#define CLS_PINNED 1
-#define CLS_COLD 2
-// A promotion offer with no resident expert behind it.
-#define PROMO_EMPTY 0xFFFFFFFFFFFFFFFFull
-// The expert a skipped victim's log entry names.
-#define PROMO_SKIP 0xFFFFu
-// The tile order's rank of each class: pinned, then cold, then VRAM.
-__device__ __forceinline__ int class_rank(uint8_t cls) {
-    return cls == CLS_PINNED ? 0 : (cls == CLS_COLD ? 1 : 2);
-}
+// Block-wide tiles of the assignment list whose loads the walks issue together.
+#define BUCKETIZE_PRELOAD 8
 // The tile scan packs one 21-bit lane per class rank into a u64.
 #define TILE_LANE_BITS 21
 #define TILE_LANE_MASK ((1ull << TILE_LANE_BITS) - 1ull)
-
-// Inclusive scan across a warp.
-template <typename T>
-__device__ __forceinline__ T warp_inclusive_scan(T v) {
-    const int lane = (int)(threadIdx.x & 31);
-#pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-        const T n = __shfl_up_sync(0xffffffffu, v, o);
-        if (lane >= o) {
-            v += n;
-        }
-    }
-    return v;
-}
-
-// Exclusive scan of `v` across the block, in thread order; the block total
-// lands in `*total`. `sh` is this scan's own `[BUCKETIZE_WARPS + 1]` buffer.
-// Every thread of the block must call it.
-template <typename T>
-__device__ __forceinline__ T block_exclusive_scan(T v, T* sh, T* total) {
-    const int lane = (int)(threadIdx.x & 31);
-    const int warp = (int)(threadIdx.x >> 5);
-    const T inclusive = warp_inclusive_scan(v);
-    if (lane == 31) {
-        sh[warp] = inclusive;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        const T w = lane < BUCKETIZE_WARPS ? sh[lane] : (T)0;
-        const T wi = warp_inclusive_scan(w);
-        if (lane < BUCKETIZE_WARPS) {
-            sh[lane] = wi - w;
-        }
-        if (lane == BUCKETIZE_WARPS - 1) {
-            sh[BUCKETIZE_WARPS] = wi;
-        }
-    }
-    __syncthreads();
-    *total = sh[BUCKETIZE_WARPS];
-    return sh[warp] + inclusive - v;
-}
 
 extern "C" __global__ void moe_bucketize_kernel(
     const uint32_t* __restrict__ topk_ids, // [n_tokens * k] row-major
@@ -282,7 +251,23 @@ extern "C" __global__ void moe_bucketize_kernel(
     // `started_rows[row]` before any live entry is read — the host's reclaim
     // rule pairs its retarget-then-read with this store-then-read.
     uint64_t* started_rows,
-    const uint64_t ticket)
+    const uint64_t ticket,
+    // READ-AHEAD, or null `ahead_items` (requires the ring). Mapped: the
+    // `window` and `depth` words and the per-row prediction lists
+    // `ahead_n[rows]`, `ahead_list[rows][ahead_cap]` and the vetted source
+    // images `ahead_src[rows][ahead_cap]`. Device: `row_layout`
+    // `u64[rows][4]` (gate, up, down offset in a slot image, image bytes), the
+    // item buffer and its per-item piece counters (`moe_read_ahead.cuh`).
+    const uint32_t* ahead_window,
+    const uint32_t* ahead_depth,
+    const uint32_t* ahead_n,
+    const uint32_t* ahead_list,
+    const uint64_t* ahead_src,
+    const uint32_t ahead_cap,
+    const int32_t rows,
+    const uint64_t* row_layout,
+    uint64_t* ahead_items,
+    uint32_t* ahead_done)
 {
     const int tid = (int)threadIdx.x;
     const int a_ub = n_tokens * k;
@@ -290,7 +275,6 @@ extern "C" __global__ void moe_bucketize_kernel(
     __shared__ int32_t sh_counts[MAX_EXPERTS];
     __shared__ int32_t sh_offsets[MAX_EXPERTS + 1];
     __shared__ int32_t sh_tile_pref[MAX_EXPERTS + 1];
-    __shared__ int32_t sh_scan[BUCKETIZE_THREADS + 1];
     __shared__ int32_t sh_header[3]; // n_active, total_valid, num_tiles
     // Per-expert: where the gate entry points (CLS_VRAM / CLS_PINNED / CLS_COLD),
     // and whether a decode row routed here.
@@ -305,9 +289,8 @@ extern "C" __global__ void moe_bucketize_kernel(
     __shared__ unsigned long long sh_scan_tiles[BUCKETIZE_WARPS + 1];
     __shared__ unsigned long long sh_scan_remote[BUCKETIZE_WARPS + 1];
     __shared__ int32_t sh_scan_valid[BUCKETIZE_WARPS + 1];
-    // Per-chunk per-expert scratch for the phase-3 stable scatter, flat
-    // `[NCHUNK][n_experts]` with a runtime `n_experts` stride. 8192 ints (32 KB)
-    // gives NCHUNK = 8192/n_experts chunks — 64 at 128 experts, 32 at 256.
+    // Per-warp per-expert counts for the phase-3 stable scatter, flat
+    // `[BUCKETIZE_WARPS][n_experts]` with a runtime `n_experts` stride.
     __shared__ int32_t sh_cc[SH_CC_INTS];
 
     // ── Phase 1: per-expert histogram (grid-stride, shared-memory atomics) ──
@@ -325,14 +308,37 @@ extern "C" __global__ void moe_bucketize_kernel(
         sh_marked[e] = 0;
     }
     __syncthreads();
-    for (int i = tid; i < a_ub; i += BUCKETIZE_THREADS) {
-        const uint32_t e = topk_ids[i];
-        if (e < (uint32_t)n_experts) {
-            atomicAdd(&sh_counts[e], 1);
+    // The loop bound is block-uniform so every lane of every warp reaches the
+    // match below; a lane past the list carries the invalid key.
+    const int lane = tid & 31;
+    // BUCKETIZE_PRELOAD tiles' loads are issued together before any is used,
+    // so the walk waits on global memory once per group rather than per tile.
+    for (int g0 = 0; g0 < a_ub; g0 += BUCKETIZE_THREADS * BUCKETIZE_PRELOAD) {
+        uint32_t ids[BUCKETIZE_PRELOAD];
+        #pragma unroll
+        for (int u = 0; u < BUCKETIZE_PRELOAD; ++u) {
+            const int i = g0 + u * BUCKETIZE_THREADS + tid;
+            ids[u] = i < a_ub ? topk_ids[i] : INVALID_ROW;
+        }
+        #pragma unroll
+        for (int u = 0; u < BUCKETIZE_PRELOAD; ++u) {
+            const int i = g0 + u * BUCKETIZE_THREADS + tid;
+            const uint32_t e = ids[u];
+            const bool valid = e < (uint32_t)n_experts;
+            // Lanes routing the same expert add their count once, from the
+            // lowest of them: a wide prefill's thousands of assignments per
+            // expert would otherwise all serialise on one shared bin.
+            const uint32_t peers = __match_any_sync(0xffffffffu, valid ? e : INVALID_ROW);
+            if (!valid) {
+                continue;
+            }
+            if (lane == __ffs(peers) - 1) {
+                atomicAdd(&sh_counts[e], __popc(peers));
+            }
             // Every writer stores the same 1, so the race is benign. An expert
             // already marked needs no range scan — a stale 0 read only costs
-            // one — which keeps a wide prefill's many assignments to the
-            // same experts off the per-range loop.
+            // one — which keeps a wide prefill's many assignments to the same
+            // experts off the per-range loop.
             if (!sh_dec[e]) {
                 const uint32_t t = (uint32_t)(i / k);
                 for (uint32_t r = 0; r < decode.n; r++) {
@@ -363,11 +369,15 @@ extern "C" __global__ void moe_bucketize_kernel(
     // ticket and holds the old slot until this invocation is done, or the loads
     // below see the retargeted entry. That is what lets the host key slot reuse
     // on the invocation the device is inside, not on what is queued behind it.
+    //
+    // Thread 0 alone fences, then the barrier: the store is visible
+    // system-wide before any thread's first entry load issues, which is all
+    // the pairing needs — sixteen warps each draining a PCIe write behind the
+    // same fence bought nothing.
     if (gate_row != nullptr && started_rows != nullptr) {
         if (tid == 0) {
-            ((volatile uint64_t*)started_rows)[row] = ticket;
+            store_started_ticket(started_rows, row, ticket);
         }
-        __threadfence_system();
         __syncthreads();
     }
     if (gate_row != nullptr) {
@@ -375,35 +385,13 @@ extern "C" __global__ void moe_bucketize_kernel(
             if (sh_counts[e] == 0) {
                 continue;
             }
-            const volatile uint64_t* g = (const volatile uint64_t*)gate_row;
-            const uint64_t pg = g[e];
-            const uint64_t pu = g[table_plane + e];
-            const uint64_t pd = g[2 * table_plane + e];
-            uint8_t cls = CLS_VRAM;
-            if (pg == 0ull || pu == 0ull || pd == 0ull) {
-                cls = CLS_COLD;
-            } else if ((pg >= pinned0_lo && pg < pinned0_hi) || (pg >= pinned1_lo && pg < pinned1_hi)) {
-                cls = CLS_PINNED;
-            }
-            if (slot_owner != nullptr && cls == CLS_VRAM && pg < zone_end &&
-                pg >= zone_end - (uint64_t)zone_slots * zone_slot_bytes) {
-                const uint32_t s = (uint32_t)((zone_end - 1ull - pg) / zone_slot_bytes);
-                const uint32_t want = ((uint32_t)(row + 1) << 16) | (uint32_t)e;
-                const uint32_t got = ((const volatile uint32_t*)slot_owner)[s];
-                if (got != want) {
-                    printf("moe_bucketize: row %d expert %d reads slot %u, whose tenant is "
-                           "row %d expert %u\n",
-                           row, e, s, (int)(got >> 16) - 1, got & 0xffffu);
-                    __trap();
-                }
-            }
+            const LiveEntries entries = load_live_entries(gate_row, table_plane, e);
+            const uint8_t cls = snapshot_expert(
+                e, entries, n_experts, snap, pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi,
+                slot_owner, zone_end, zone_slot_bytes, zone_slots, row);
             sh_cls[e] = cls;
-            snap[e] = pg;
-            snap[n_experts + e] = pu;
-            snap[2 * n_experts + e] = pd;
             if (promo_slots != nullptr && cls != CLS_VRAM) {
-                sh_marked[e] =
-                    ((const volatile uint32_t*)promo_marks)[(size_t)row * n_experts + e] != 0u;
+                sh_marked[e] = promotion_marked(promo_marks, row, n_experts, e);
             }
         }
         __syncthreads();
@@ -499,78 +487,22 @@ extern "C" __global__ void moe_bucketize_kernel(
         // The promotion walk: in list order, each remote expert takes the next
         // slot while the ring has one. Serial because each grant moves the head
         // the next one is judged against — but over the remote list alone, which
-        // a decode step whose experts are all resident leaves empty.
-        if (tid == 0 && remote != nullptr && remote_dst != nullptr) {
-            const int32_t n_remote = r_pinned + r_cold;
-            uint32_t head = 0;
-            uint32_t tail = 0;
-            uint32_t reserve = 0xffffffffu;
-            // Whether this launch claims at all: not a sweep.
-            bool claim = false;
-            if (promo_slots != nullptr) {
-                head = *(volatile const uint32_t*)promo_head;
-                tail = *(volatile const uint32_t*)promo_tail;
-                if (promo_reserve != nullptr) {
-                    reserve = *(volatile const uint32_t*)promo_reserve;
-                }
-                const uint32_t sweep = *(volatile const uint32_t*)promo_sweep;
-                // The slots the host published before its tail store.
-                __threadfence_system();
-                claim = (uint32_t)claiming <= sweep;
-            }
-            // The live table's gate plane, which a victim's index is into.
-            uint64_t* const gate_plane =
-                gate_row != nullptr ? (uint64_t*)gate_row - (size_t)row * (size_t)n_experts : nullptr;
-            for (int32_t r = 0; r < n_remote; r++) {
-                const int32_t x = sh_remote_e[r];
-                uint64_t dst = 0ull;
-                if (claim && !sh_marked[x] && (sh_dec[x] || tail - head > reserve)) {
-                    while (head != tail) {
-                        const uint32_t i = head % promo_cap;
-                        const uint64_t victim = ((const volatile uint64_t*)promo_victims)[i];
-                        if (victim != PROMO_EMPTY && !sh_dec[x]) {
-                            // A prompt-only expert evicts nothing: the next
-                            // offer holds a resident expert, so it stays in
-                            // scratch.
-                            break;
-                        }
-                        if (victim != PROMO_EMPTY) {
-                            const int32_t vr = (int32_t)(victim / (uint64_t)n_experts);
-                            const int32_t ve = (int32_t)(victim % (uint64_t)n_experts);
-                            if (vr == row && sh_counts[ve] > 0) {
-                                ((volatile uint64_t*)promo_log)[i] =
-                                    ((uint64_t)summary_seq << 32) | ((uint64_t)row << 16) |
-                                    (uint64_t)PROMO_SKIP;
-                                head++;
-                                continue;
-                            }
-                            // No fence per claim: every later kernel sees these
-                            // stores by stream order, nothing polls a VRAM
-                            // victim's entry concurrently, and the host learns of
-                            // the claim only through `head`, which is published
-                            // behind a system fence below.
-                            const volatile uint64_t* rt =
-                                (const volatile uint64_t*)promo_retarget + 3 * (size_t)i;
-                            volatile uint64_t* g = (volatile uint64_t*)gate_plane + victim;
-                            g[table_plane] = rt[1];
-                            g[2 * table_plane] = rt[2];
-                            g[0] = rt[0];
-                        }
-                        dst = ((const volatile uint64_t*)promo_slots)[i];
-                        ((volatile uint64_t*)promo_log)[i] =
-                            ((uint64_t)summary_seq << 32) | ((uint64_t)row << 16) | (uint64_t)x;
-                        ((volatile uint32_t*)promo_marks)[(size_t)row * n_experts + x] = summary_seq;
-                        head++;
-                        break;
-                    }
-                }
-                remote_dst[r] = dst;
-            }
-            if (promo_slots != nullptr) {
-                // The log entries before the counter that covers them.
-                __threadfence_system();
-                *(volatile uint32_t*)promo_head = head;
-            }
+        // a decode step whose experts are all resident leaves empty. With no
+        // remote expert and no read-ahead there is nothing to claim, so the ring
+        // is not read and `head` is not republished: its two system fences and
+        // the round of mapped loads are a decode step's most common avoidable
+        // wait. Read-ahead runs even with every routed expert resident — that
+        // is when the layer's link window is free.
+        if (tid == 0 && remote != nullptr && remote_dst != nullptr &&
+            (r_pinned + r_cold > 0 || ahead_items != nullptr)) {
+            promotion_walk(r_pinned + r_cold, claiming, sh_remote_e, sh_marked, sh_dec, sh_counts,
+                           gate_row, table_plane, n_experts, row, summary_seq, promo_slots,
+                           promo_log, promo_head, promo_tail, promo_cap, promo_marks,
+                           promo_reserve, promo_sweep, promo_victims, promo_retarget, remote_dst,
+                           ReadAhead{ahead_window, ahead_depth, ahead_n, ahead_list, ahead_src,
+                                     ahead_cap, rows, row_layout, ahead_items, ahead_done},
+                           ZoneRanges{pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi, slot_owner,
+                                      zone_end, zone_slot_bytes, zone_slots});
         }
     }
     __syncthreads();
@@ -585,60 +517,91 @@ extern "C" __global__ void moe_bucketize_kernel(
     const int32_t total_valid = sh_header[1];
     const int32_t num_tiles = sh_header[2];
 
-    // ── Phase 3: chunked STABLE counting-sort scatter (O(a_ub) work) ──
-    // Split the list into NCHUNK contiguous chunks. Pass 1: each chunk-thread
-    // counts its chunk's assignments per expert into `sh_cc[chunk][e]`. A
-    // per-expert exclusive prefix across chunks (seeded at `sh_offsets[e]`) turns
-    // those counts into each chunk's write base for each expert. Pass 2: each
-    // chunk re-scans in ASCENDING i and writes every assignment at `base[e]++`.
-    // Chunks are ordered and within a chunk i is ascending, so each expert's
-    // bucket comes out STABLE (ascending i) — bit-identical to a serial stable
-    // counting sort — and no expert ever rescans the whole list.
-    const int NCHUNK =
-        (SH_CC_INTS / n_experts < SH_CC_MAX_CHUNK) ? (SH_CC_INTS / n_experts) : SH_CC_MAX_CHUNK;
-    const int chunk_len = (a_ub + NCHUNK - 1) / NCHUNK;
-    for (int idx = tid; idx < NCHUNK * n_experts; idx += BUCKETIZE_THREADS) {
+    // ── Phase 3: STABLE counting-sort scatter, a contiguous chunk per warp ──
+    // The list is cut into BUCKETIZE_WARPS contiguous chunks, warp w owning
+    // chunk w. Pass 1: each warp counts its chunk's assignments per expert into
+    // its row of `sh_cc` (`[BUCKETIZE_WARPS][n_experts]`). A per-expert
+    // exclusive prefix across the warps, seeded at the bucket's offset, turns
+    // those counts into each warp's write base for each expert. Pass 2: each
+    // warp walks its chunk again, 32 assignments a step in ascending i; an
+    // assignment's slot is its warp's base plus the same-expert lanes below it
+    // in the step (`__match_any_sync`), and the lowest such lane advances the
+    // base. Chunks are ordered, steps ascend within a chunk and lanes within a
+    // step, so every bucket comes out in ascending i — the buckets of a serial
+    // stable counting sort, bit for bit. Each warp's walk needs no block
+    // barrier: only its own row of bases moves.
+    static_assert(BUCKETIZE_WARPS * MAX_EXPERTS <= SH_CC_INTS,
+                  "phase 3 keeps one count per warp per expert in sh_cc");
+    for (int idx = tid; idx < BUCKETIZE_WARPS * n_experts; idx += BUCKETIZE_THREADS) {
         sh_cc[idx] = 0;
     }
     __syncthreads();
-    // Pass 1: per-chunk per-expert counts.
-    if (tid < NCHUNK) {
-        const int lo = tid * chunk_len;
-        const int hi = (lo + chunk_len < a_ub) ? (lo + chunk_len) : a_ub;
-        int32_t* cc = &sh_cc[tid * n_experts];
-        for (int i = lo; i < hi; i++) {
-            const uint32_t e = topk_ids[i];
-            if (e < (uint32_t)n_experts) {
-                cc[e]++;
+    {
+        const int warp = tid >> 5;
+        const uint32_t lanes_below = (1u << lane) - 1u;
+        // Whole 32-wide steps per chunk, so every lane of a warp runs every step.
+        const int chunk = ((a_ub + BUCKETIZE_WARPS - 1) / BUCKETIZE_WARPS + 31) & ~31;
+        const int c_lo = warp * chunk;
+        const int c_hi = min(a_ub, c_lo + chunk);
+        int32_t* const base = &sh_cc[warp * n_experts];
+        constexpr int STEP_LOADS = BUCKETIZE_PRELOAD;
+        // Pass 1: the warp's per-expert counts.
+        for (int s0 = c_lo; s0 < c_hi; s0 += 32 * STEP_LOADS) {
+            uint32_t ids[STEP_LOADS];
+            #pragma unroll
+            for (int u = 0; u < STEP_LOADS; ++u) {
+                const int i = s0 + 32 * u + lane;
+                ids[u] = i < c_hi ? topk_ids[i] : INVALID_ROW;
+            }
+            #pragma unroll
+            for (int u = 0; u < STEP_LOADS; ++u) {
+                const uint32_t e = ids[u];
+                const bool valid = e < (uint32_t)n_experts;
+                const uint32_t peers = __match_any_sync(0xffffffffu, valid ? e : INVALID_ROW);
+                if (valid && lane == __ffs(peers) - 1) {
+                    base[e] += __popc(peers);
+                }
+                __syncwarp();
             }
         }
-    }
-    __syncthreads();
-    // Per-expert exclusive prefix across chunks: sh_cc[c][e] becomes chunk c's
-    // write base for expert e. A thread owns an expert and sweeps the NCHUNK
-    // counts; with more experts than threads it takes several, striding.
-    for (int e = tid; e < n_experts; e += BUCKETIZE_THREADS) {
-        int32_t run = sh_offsets[e];
-        for (int c = 0; c < NCHUNK; c++) {
-            const int idx = c * n_experts + e;
-            const int32_t v = sh_cc[idx];
-            sh_cc[idx] = run;
-            run += v;
+        __syncthreads();
+        // Per-expert exclusive prefix across the warps, from the bucket offset.
+        for (int e = tid; e < n_experts; e += BUCKETIZE_THREADS) {
+            int32_t run = sh_offsets[e];
+            for (int w = 0; w < BUCKETIZE_WARPS; w++) {
+                const int idx = w * n_experts + e;
+                const int32_t v = sh_cc[idx];
+                sh_cc[idx] = run;
+                run += v;
+            }
         }
-    }
-    __syncthreads();
-    // Pass 2: stable scatter using each chunk's per-expert running base.
-    if (tid < NCHUNK) {
-        const int lo = tid * chunk_len;
-        const int hi = (lo + chunk_len < a_ub) ? (lo + chunk_len) : a_ub;
-        int32_t* base = &sh_cc[tid * n_experts];
-        for (int i = lo; i < hi; i++) {
-            const uint32_t e = topk_ids[i];
-            if (e < (uint32_t)n_experts) {
-                const int32_t pos = base[e]++;
-                tok_ids[pos] = (uint32_t)(i / k);
-                weight_ids[pos] = (uint32_t)i;
-                inv[i] = (uint32_t)pos;
+        __syncthreads();
+        // Pass 2: the stable scatter, from the warp's own bases.
+        for (int s0 = c_lo; s0 < c_hi; s0 += 32 * STEP_LOADS) {
+            uint32_t ids[STEP_LOADS];
+            #pragma unroll
+            for (int u = 0; u < STEP_LOADS; ++u) {
+                const int i = s0 + 32 * u + lane;
+                ids[u] = i < c_hi ? topk_ids[i] : INVALID_ROW;
+            }
+            #pragma unroll
+            for (int u = 0; u < STEP_LOADS; ++u) {
+                const int i = s0 + 32 * u + lane;
+                const uint32_t e = ids[u];
+                const bool valid = e < (uint32_t)n_experts;
+                const uint32_t peers = __match_any_sync(0xffffffffu, valid ? e : INVALID_ROW);
+                if (valid) {
+                    const int32_t pos = base[e] + __popc(peers & lanes_below);
+                    tok_ids[pos] = (uint32_t)(i / k);
+                    weight_ids[pos] = (uint32_t)i;
+                    inv[i] = (uint32_t)pos;
+                }
+                // Every lane has read this step's bases before the leaders move them.
+                __syncwarp();
+                if (valid && lane == __ffs(peers) - 1) {
+                    base[e] += __popc(peers);
+                }
+                __syncwarp();
             }
         }
     }
@@ -671,33 +634,40 @@ extern "C" __global__ void moe_bucketize_kernel(
     }
     __syncthreads();
 
-    // ── Phase 5: token-major compaction (chunked exclusive scan of valid) ──
-    // 5a: per-thread chunk sums.
-    const int chunk = (a_ub + BUCKETIZE_THREADS - 1) / BUCKETIZE_THREADS;
-    const int c_lo = tid * chunk;
-    const int c_hi = c_lo + chunk < a_ub ? c_lo + chunk : a_ub;
-    int32_t local = 0;
-    for (int i = c_lo; i < c_hi; i++) {
-        if (topk_ids[i] < (uint32_t)n_experts) {
-            local++;
+    // ── Phase 5: token-major compaction (exclusive scan of valid) ──
+    // 5a: the exclusive scan of the valid flags, a block-wide group at a time:
+    // each thread takes BUCKETIZE_PRELOAD consecutive assignments, the group's
+    // per-thread counts are one block scan, and the running total carries into
+    // the next group.
+    {
+        int32_t carried = 0;
+        for (int g0 = 0; g0 < a_ub; g0 += BUCKETIZE_THREADS * BUCKETIZE_PRELOAD) {
+            const int i_lo = g0 + tid * BUCKETIZE_PRELOAD;
+            uint32_t flags = 0u;
+            int32_t local = 0;
+            #pragma unroll
+            for (int u = 0; u < BUCKETIZE_PRELOAD; ++u) {
+                const int i = i_lo + u;
+                if (i < a_ub && topk_ids[i] < (uint32_t)n_experts) {
+                    flags |= 1u << u;
+                    local++;
+                }
+            }
+            int32_t group_total = 0;
+            int32_t run = carried + block_exclusive_scan<int32_t>(local, sh_scan_valid, &group_total);
+            #pragma unroll
+            for (int u = 0; u < BUCKETIZE_PRELOAD; ++u) {
+                const int i = i_lo + u;
+                if (i < a_ub) {
+                    scan[i] = run;
+                    run += (int32_t)((flags >> u) & 1u);
+                }
+            }
+            carried += group_total;
+            // The next group's scan rewrites the buffer this one's total was read from.
+            __syncthreads();
         }
     }
-    // 5b: exclusive scan of the chunk sums, block-wide.
-    int32_t valid_total = 0;
-    sh_scan[tid] = block_exclusive_scan<int32_t>(local, sh_scan_valid, &valid_total);
-    if (tid == 0) {
-        sh_scan[BUCKETIZE_THREADS] = valid_total;
-    }
-    __syncthreads();
-    // 5c: chunk re-sweep → the full exclusive scan.
-    int32_t run = sh_scan[tid];
-    for (int i = c_lo; i < c_hi; i++) {
-        scan[i] = run;
-        if (topk_ids[i] < (uint32_t)n_experts) {
-            run++;
-        }
-    }
-    __syncthreads();
     // 5d: per-token compaction + segment boundaries + padding. Within a token
     // the (perm, rw_ids) pairs are ordered by ASCENDING expert-grouped row —
     // the scatter accumulates each token's contributions sequentially in perm
@@ -799,8 +769,25 @@ extern "C" int32_t run_moe_bucketize(
     void* remote_dst,
     void* started_rows,
     uint64_t ticket,
+    const void* ahead_window,
+    const void* ahead_depth,
+    const void* ahead_n,
+    const void* ahead_list,
+    const void* ahead_src,
+    uint32_t ahead_cap,
+    int32_t rows,
+    const void* row_layout,
+    void* ahead_items,
+    void* ahead_done,
     void* stream)
 {
+    if (ahead_items != nullptr &&
+        (promo_slots == nullptr || remote == nullptr || ahead_window == nullptr ||
+         ahead_depth == nullptr || ahead_n == nullptr || ahead_list == nullptr ||
+         ahead_src == nullptr || ahead_cap == 0 ||
+         rows <= 0 || row >= rows || row_layout == nullptr || ahead_done == nullptr)) {
+        return 1;
+    }
     if (n_tokens <= 0 || k <= 0 || k > MAX_TOPK || n_experts <= 0 ||
         n_experts > MAX_EXPERTS || tile_w <= 0 || (gate_row != nullptr && snap == nullptr) ||
         (promo_slots != nullptr && (promo_cap == 0 || promo_log == nullptr ||
@@ -828,7 +815,13 @@ extern "C" int32_t run_moe_bucketize(
         fprintf(stderr, "moe_bucketize: an earlier launch failed: %s\n", cudaGetErrorString(earlier));
         return 3;
     }
-    moe_bucketize_kernel<<<1, BUCKETIZE_THREADS, 0, (cudaStream_t)stream>>>(
+    // A narrow launch — a decode, draft or verify step — takes the narrow
+    // kernel, which writes the same bytes in a few barriers; anything wider
+    // the general one.
+    const bool narrow = (int64_t)n_tokens * (int64_t)k <= BUCKETIZE_NARROW;
+    void (*const kernel)(MOE_BUCKETIZE_KERNEL_PARAMS) =
+        narrow ? moe_bucketize_narrow_kernel : moe_bucketize_kernel;
+    kernel<<<1, BUCKETIZE_THREADS, 0, (cudaStream_t)stream>>>(
         (const uint32_t*)topk_ids, n_tokens, k, n_experts, tile_w,
         (uint32_t*)tok_ids, (uint32_t*)weight_ids, (int32_t*)tile_expert,
         (int32_t*)tile_b_start, (int32_t*)tile_b_cnt, (uint32_t*)perm,
@@ -842,7 +835,11 @@ extern "C" int32_t run_moe_bucketize(
         (const uint32_t*)promo_reserve, (const uint32_t*)promo_sweep,
         (const uint64_t*)promo_victims, (const uint64_t*)promo_retarget,
         (const uint32_t*)slot_owner, zone_end, zone_slot_bytes, zone_slots, row,
-        (uint64_t*)remote_dst, (uint64_t*)started_rows, ticket);
+        (uint64_t*)remote_dst, (uint64_t*)started_rows, ticket,
+        (const uint32_t*)ahead_window, (const uint32_t*)ahead_depth, (const uint32_t*)ahead_n,
+        (const uint32_t*)ahead_list, (const uint64_t*)ahead_src, ahead_cap, rows,
+        (const uint64_t*)row_layout,
+        (uint64_t*)ahead_items, (uint32_t*)ahead_done);
     cudaError_t launched = cudaPeekAtLastError();
     if (launched != cudaSuccess) {
         fprintf(stderr, "moe_bucketize: launch failed: %s\n", cudaGetErrorString(launched));

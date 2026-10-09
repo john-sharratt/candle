@@ -1147,6 +1147,83 @@ fn a_release_from_another_thread_waits_for_the_recording_segment() -> Result<()>
     Ok(())
 }
 
+/// The segment this thread is recording, by `(wave, ordinal)`: the ordinal
+/// counts the segments the wave has launched, a flush moves to the next, a
+/// paused wave records none, and another wave carries another serial.
+#[test]
+fn the_recording_segment_advances_with_each_launch() -> Result<()> {
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    assert_eq!(dev.recording_segment(), None, "no wave open");
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 1.0, 0.0)?;
+    let (wave, first) = dev.recording_segment().expect("recording");
+    assert_eq!(first, 0);
+    dev.flush_launches()?;
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 1.0, 1.0)?;
+    assert_eq!(
+        dev.recording_segment(),
+        Some((wave, 1)),
+        "a flush launched segment 0"
+    );
+    {
+        let _eager = dev.pause_capture()?;
+        assert_eq!(
+            dev.recording_segment(),
+            None,
+            "a paused wave records nothing"
+        );
+    }
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 1.0, 2.0)?;
+    assert_eq!(
+        dev.recording_segment(),
+        Some((wave, 2)),
+        "the pause launched segment 1"
+    );
+    capture.finish()?;
+    assert_eq!(dev.recording_segment(), None, "the wave closed");
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 1.0, 3.0)?;
+    let (next, ordinal) = dev.recording_segment().expect("recording");
+    assert_ne!(next, wave, "a new wave has its own serial");
+    assert_eq!(ordinal, 0);
+    capture.finish()?;
+    dev.synchronize()?;
+    let want: Vec<f32> = ramp(1.0).iter().map(|v| v + 3.0).collect();
+    assert_eq!(dev.memcpy_dtov(&y)?, want);
+    Ok(())
+}
+
+/// **An abandoned wave still runs what it recorded.** A forward that fails
+/// mid-wave drops its capture unfinished, and parties outside the wave may
+/// already wait on launches the open segment holds — an MoE invocation's
+/// summary word is announced to the stager before its bucketize is recorded.
+/// So the drop launches the segment rather than discarding it.
+#[test]
+fn an_abandoned_wave_launches_its_recording_segment() -> Result<()> {
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 2.0, 1.0)?;
+    drop(capture);
+    dev.synchronize()?;
+    let want: Vec<f32> = ramp(1.0).iter().map(|v| 2.0 * v + 1.0).collect();
+    assert_eq!(dev.memcpy_dtov(&y)?, want);
+    // The hub is free for the next wave.
+    let capture = dev.begin_wave_capture()?;
+    capture.finish()?;
+    Ok(())
+}
+
 /// **Another thread's eager staging never shares the wave's scratch.** A
 /// recording thread's segment writes the scratch through its recorded uploads
 /// and is launched whenever that thread next ends a segment — which can fall

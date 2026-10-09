@@ -1516,10 +1516,20 @@ fn covering_plan(standing: [usize; 3], wanted: [usize; 3]) -> [usize; 3] {
 /// asking 9,216 B at offset 61,952 of a 64,256 B span, which is one row's price.
 ///
 /// While a tier stands, the recorded plan is raised to the per-phase maximum of
-/// itself and `per_phase`, never replaced: the forward that priced it may have
-/// reserved for work still to come (a rewind's replay), and a plan shrunk to the
-/// walk's width would take that room back. A plan that already covers
-/// `per_phase` changes nothing and moves nothing.
+/// itself and `per_phase` **if that still fits the bytes the tier holds**: the
+/// spans are re-laid inside the standing tier and nothing is bought, so the room
+/// the forward reserved in the phases the walk does not outgrow is kept. A plan
+/// that already covers `per_phase` changes nothing and moves nothing.
+///
+/// **A merge the standing tier cannot hold places the walk's own width.**
+/// Placing releases the standing tier first, so a merged plan keeps none of the
+/// forward's room — it only re-buys that forward's whole footprint, against a
+/// partition whose KV has grown since. Measured in zend: a draft walk after an
+/// 8K-row prefill outgrew one phase by 86 KB, merged to 8,992,587,776 B, and was
+/// refused by a gap of 8,992,501,760 B; six files failed their ingest on it.
+/// Nothing after a walk needs the previous forward's room: the next forward
+/// prices its own tier, and a rewind's replay runs on the tier of the forward it
+/// rewinds.
 ///
 /// **With no tier standing, the caller prices for itself alone.** The ground
 /// went back to the weight side, and with it whatever the last forward reserved
@@ -1533,27 +1543,54 @@ pub fn cover_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> 
     let target = {
         let mut map = lock_domains();
         let (_, domain) = domain_entry(&mut map, stream);
-        cover_target(domain.planned, domain.placed_at.is_some(), wanted)
+        let target = cover_target(
+            domain.planned,
+            domain.placed_at.and(domain.placed_bytes),
+            wanted,
+        );
+        // Re-laid in place: `begin_wave` keeps a standing tier that holds the
+        // recorded plan and lays the spans out from it.
+        if let Cover::Relay(plan) = target {
+            domain.planned = Some(plan);
+        }
+        target
     };
     match target {
-        Some(plan) => plan_wave_transient(stream, plan),
-        None => Ok(()),
+        Cover::Place(plan) => plan_wave_transient(stream, plan),
+        Cover::Keep | Cover::Relay(_) => Ok(()),
     }
 }
 
-/// The plan [`cover_wave_transient`] places for `wanted`, or `None` when the
-/// standing tier already covers it — see there for the rule.
+/// What [`cover_wave_transient`] does for a walk — see there for the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cover {
+    /// The standing tier and its plan already hold the walk.
+    Keep,
+    /// Record this plan; it fits inside the standing tier, so nothing moves.
+    Relay([usize; 3]),
+    /// Place a tier for this plan.
+    Place([usize; 3]),
+}
+
+/// The [`Cover`] action for `wanted`, given the recorded plan and the bytes the
+/// standing tier holds (`None` when no tier stands).
 fn cover_target(
     planned: Option<[usize; 3]>,
-    tier_standing: bool,
+    standing_bytes: Option<usize>,
     wanted: [usize; 3],
-) -> Option<[usize; 3]> {
-    match planned {
-        Some(standing) if tier_standing => {
+) -> Cover {
+    match (planned, standing_bytes) {
+        (Some(standing), Some(bytes)) => {
             let merged = covering_plan(standing, wanted);
-            (merged != standing).then_some(merged)
+            if merged == standing {
+                Cover::Keep
+            } else if merged.iter().sum::<usize>() <= bytes {
+                Cover::Relay(merged)
+            } else {
+                Cover::Place(wanted)
+            }
         }
-        _ => Some(wanted),
+        _ => Cover::Place(wanted),
     }
 }
 
@@ -2002,7 +2039,9 @@ pub(crate) fn persistence_domain(stream: &Arc<CudaStream>) -> Result<BumpArena> 
 #[cfg(test)]
 mod tests {
 
-    use super::{align_phase_plan, aligned_start, cover_target, covering_plan, WAVE_SPAN_ALIGN};
+    use super::{
+        align_phase_plan, aligned_start, cover_target, covering_plan, Cover, WAVE_SPAN_ALIGN,
+    };
 
     /// A walk wider than the forward raises the phases it outgrows and keeps the
     /// ones the forward reserved for something else.
@@ -2023,22 +2062,53 @@ mod tests {
     fn with_no_tier_standing_a_stale_plan_is_not_merged() {
         let prefill = [4_009_754_624, 30_720, 4_096];
         let walk = [128_512, 20_480, 8_192];
-        assert_eq!(cover_target(Some(prefill), false, walk), Some(walk));
-        assert_eq!(cover_target(None, false, walk), Some(walk));
+        assert_eq!(cover_target(Some(prefill), None, walk), Cover::Place(walk));
+        assert_eq!(cover_target(None, None, walk), Cover::Place(walk));
     }
 
-    /// A standing tier that already covers the walk places nothing; one it
-    /// does not cover is raised phase by phase, never lowered.
+    /// A standing tier that already covers the walk places nothing.
     #[test]
-    fn a_standing_tier_is_raised_only_where_the_walk_outgrows_it() {
+    fn a_standing_tier_that_covers_the_walk_is_kept() {
         let forward = [64_256, 30_720, 4_096];
         let narrower = [32_000, 20_480, 4_096];
-        let wider = [128_512, 20_480, 8_192];
-        assert_eq!(cover_target(Some(forward), true, narrower), None);
-        assert_eq!(cover_target(Some(forward), true, forward), None);
+        let bytes = forward.iter().sum();
         assert_eq!(
-            cover_target(Some(forward), true, wider),
-            Some([128_512, 30_720, 8_192])
+            cover_target(Some(forward), Some(bytes), narrower),
+            Cover::Keep
+        );
+        assert_eq!(
+            cover_target(Some(forward), Some(bytes), forward),
+            Cover::Keep
+        );
+    }
+
+    /// A walk that outgrows one phase, but whose merged plan still fits the bytes
+    /// the standing tier holds, re-lays the spans inside that tier: raised where
+    /// the walk outgrows it, kept where the forward reserved more, nothing bought.
+    #[test]
+    fn a_merged_plan_that_fits_the_standing_tier_is_laid_out_in_place() {
+        let forward = [64_256, 30_720, 4_096];
+        let wider = [128_512, 20_480, 8_192];
+        assert_eq!(
+            cover_target(Some(forward), Some(200_000), wider),
+            Cover::Relay([128_512, 30_720, 8_192])
+        );
+    }
+
+    /// **A merged plan the standing tier cannot hold re-places the walk's own
+    /// width, not the merge.** Re-placing releases the standing tier, so merging
+    /// keeps none of its room and re-buys a previous forward's whole footprint:
+    /// in zend a draft walk after an 8K-row prefill asked for 8,992,587,776 B —
+    /// the prefill's tier plus 86 KB — against a gap of 8,992,501,760 B, and six
+    /// files failed their ingest on it.
+    #[test]
+    fn a_merged_plan_that_outgrows_the_standing_tier_places_only_the_walk() {
+        let prefill = [2_000_000_000, 6_000_000_000, 992_501_760];
+        let bytes = prefill.iter().sum();
+        let walk = [2_000_086_016, 20_480, 8_192];
+        assert_eq!(
+            cover_target(Some(prefill), Some(bytes), walk),
+            Cover::Place(walk)
         );
     }
 

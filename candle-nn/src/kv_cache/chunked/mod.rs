@@ -79,6 +79,9 @@ mod meta_pool;
 pub mod migrate;
 pub mod migrate_flight;
 mod palette_layout;
+/// Unconditional: the carve of a bulk prefill launch and the cut that bounds it
+/// are host arithmetic the wave plan prices on any machine.
+pub mod prefill_kv_stage;
 #[cfg(feature = "cuda")]
 pub(crate) mod region_pool;
 #[cfg(feature = "tensor-assert")]
@@ -90,6 +93,8 @@ mod sequence_ops;
 mod size_class;
 #[cfg(feature = "cuda")]
 pub(crate) mod slot_state_arena;
+#[cfg(feature = "cuda")]
+pub(crate) mod slot_upload_batch;
 /// Where the tier may stand and what the KV side may reach. Pure arithmetic, and
 /// outside the `cuda` gate so it can be exercised on any machine.
 pub mod span_geometry;
@@ -190,10 +195,10 @@ pub use guest_stage_cpu::guest_stage;
 #[cfg(feature = "cuda")]
 pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
-    freeze_dense, initial_weight_bytes, kv_spare_regions, reclaim_empty_arenas,
-    reclaim_load_headroom, region_stats, set_ground_broker, set_weight_floor, span_end,
-    span_layout, span_region_refusal, spare_tally, weight_capacity_bytes, weight_floor_after,
-    RegionStats, SpanClaims, SpanLayout, SpanRegion, REGION_BYTES,
+    forget_last_tier, freeze_dense, initial_weight_bytes, kv_spare_regions, reclaim_empty_arenas,
+    reclaim_load_headroom, region_stats, set_ground_broker, set_kv_free_target, set_weight_floor,
+    span_end, span_layout, span_region_refusal, spare_tally, weight_capacity_bytes,
+    weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanRegion, REGION_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;

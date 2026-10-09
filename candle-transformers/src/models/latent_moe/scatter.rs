@@ -225,7 +225,7 @@ fn scatter_impl(runs: &[RowRun<'_>], generation: Option<&Generation>) -> Result<
     let p_desc = staged
         .as_ref()
         .map_or(std::ptr::null(), |s| s.ptr() as *const u8);
-    unsafe {
+    let status = unsafe {
         run_rows_scatter(
             p_desc as *const i64,
             desc.as_ptr(),
@@ -233,7 +233,10 @@ fn scatter_impl(runs: &[RowRun<'_>], generation: Option<&Generation>) -> Result<
             max_elems as i32,
             max_rows as i32,
             stream.cu_stream() as *mut core::ffi::c_void,
-        );
+        )
+    };
+    if status != 0 {
+        candle::bail!("rows_scatter: launch failed with CUDA error {status}");
     }
     Ok(())
 }

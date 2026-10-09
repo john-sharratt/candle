@@ -51,6 +51,8 @@ __device__ void conv1d(
   dst[dst_i] = static_cast<T>(d);
 }
 
+// One thread per column (b, l, c) — `numel` is b · l_out · c_in — writing that
+// column's l_k elements.
 template <typename T>
 __device__ void im2col1d(
     const size_t numel,

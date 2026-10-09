@@ -2398,7 +2398,18 @@ fn emit_system_prompt_items<R: ContentResolver>(
 ///
 /// The distinction survives in the schema (`is_template` still selects the
 /// dialect text at build time) but no longer changes what a projection emits.
+///
+/// **A section with no content emits nothing.** Ingest seals what a section's
+/// content tokenises to and skips one with no content (`insert_section_with_prefix`
+/// in `conversation.rs`), so such a section never has K/V. A
+/// segment naming it is one no walk can place: the assembler counts it skipped,
+/// the projection is never recorded as complete, and every reprojection rebuilds
+/// the slot — re-sealing the whole active turn, ~330 ms at 128K. The same test
+/// as ingest's, on the same text, so the two agree on which sections exist.
 fn push_section_segment(out: &mut Vec<ProjectionSegment>, s: &SectionSchema) {
+    if s.content.is_empty() {
+        return;
+    }
     out.push(ProjectionSegment::Sealed(SealedKind::Section(
         ResolvedSection { id: s.id },
     )));

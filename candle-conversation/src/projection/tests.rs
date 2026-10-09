@@ -705,6 +705,35 @@ fn system_prompt_sections_always_emitted() {
     assert_eq!(proj.sealed_sections().count(), 2);
 }
 
+/// **A section with no content is not projected.** Ingest never seals one —
+/// it tokenises to nothing — so a segment naming it is a section no walk can
+/// place: the assembler counts it skipped, the projection is never recorded as
+/// complete, and every reprojection rebuilds the slot, re-sealing the whole
+/// active turn. A conversation opened with an empty system prompt (an API
+/// request that carries none) projects its turns and nothing else.
+#[test]
+fn an_empty_section_is_not_projected() {
+    let project = |prompt: &str| {
+        let b = Builder::for_plain_prompt(prompt, SectionId::new(7));
+        let target = ProjectionTarget {
+            layer: b.id_for_layer("dialogue").unwrap(),
+            group: b.id_for_group("primary_conversation").unwrap(),
+            timeline: TimelineId::for_test(1),
+        };
+        let ids: Vec<SectionId> = b
+            .project(target, &MockResolver::new())
+            .sealed_sections()
+            .map(|s| s.id)
+            .collect();
+        ids
+    };
+    assert_eq!(project(""), Vec::<SectionId>::new());
+    assert_eq!(
+        project("You are a helpful assistant."),
+        vec![SectionId::new(7)]
+    );
+}
+
 #[test]
 fn turns_appear_after_append() {
     let b = Builder::from_yaml(SIMPLE_YAML).unwrap();

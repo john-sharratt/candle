@@ -30,7 +30,9 @@
 //! That makes "each wave is optimal" and "no unjustified waste" the same
 //! property, which is why one audit covers both.
 
-use candle_nn::kv_cache::{kv_grow_step, GrowthPolicy, Occupancy, WeightZone, MIN_ELASTIC_RESERVE};
+use candle_nn::kv_cache::{
+    kv_grow_step, FreeRegionTarget, GrowthPolicy, Occupancy, WeightZone, MIN_ELASTIC_RESERVE,
+};
 use candle_transformers::models::layer_stream::{
     layer_image, plan_zone, FfnForm, LayerImage, LayerTensor, MixKind, Projection, PROJECTION_ALIGN,
 };
@@ -693,12 +695,16 @@ impl Soak {
             .saturating_sub(self.zone_regions)
             .saturating_sub(self.live);
         let occ = Occupancy {
+            total: self.total_regions.saturating_sub(self.zone_regions),
+            // The bare forward path has no scheduler defending a relief target.
+            kv_target: FreeRegionTarget::default(),
             live: self.live,
             free_below_ceiling: free,
             ceiling_blocked: 0,
             // The model packs its arenas, so every free region is in the gap.
             free_above_live: free,
             tier_bytes: self.tier_bytes,
+            last_tier_bytes: self.tier_bytes,
             tier_high_water: self.tier_high_water,
         };
         if let Ok(spare) = self.policy.spare(occ, SLACK_REGIONS, REGION) {

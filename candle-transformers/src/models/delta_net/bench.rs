@@ -30,6 +30,14 @@ use super::{DeltaNetConstants, DeltaNetState};
 /// The card's L2. A timed working set below this measures cache, not memory.
 const L2_BYTES: usize = 96 * 1024 * 1024;
 
+/// The gate's prefill length: one full chunk and a ragged second, through the
+/// conv + scan pair.
+const GATE_TOKENS: usize = 96;
+
+/// The gate's verify-width length: a ceiling-4 draft block plus its accepted
+/// token, through the short-span launch.
+const GATE_SHORT_TOKENS: usize = 5;
+
 /// One benchmark point.
 #[derive(Clone, Copy, Debug)]
 pub struct DeltaNetBenchCfg {
@@ -139,12 +147,19 @@ fn constants(
 ///
 /// Small on purpose — the point is to catch a wrong kernel, and the CPU
 /// reference is a scalar walk. A gate that took as long as the benchmark would
-/// simply not be run.
-fn correctness_gate(dev: &Device, dims: &DeltaNetDims, seed: u64, eps: f64) -> Result<f32> {
-    const GATE_TOKENS: usize = 96;
+/// simply not be run. Run at two lengths, because they take different kernels:
+/// [`GATE_TOKENS`] through the conv + scan pair, [`GATE_SHORT_TOKENS`] through
+/// the short-span launch a verify wave takes.
+fn correctness_gate(
+    dev: &Device,
+    dims: &DeltaNetDims,
+    seed: u64,
+    eps: f64,
+    gate_tokens: usize,
+) -> Result<f32> {
     let cpu = Device::Cpu;
 
-    let p_cpu = projections(GATE_TOKENS, dims, seed, &cpu)?;
+    let p_cpu = projections(gate_tokens, dims, seed, &cpu)?;
     let (dt_bias, a, conv, norm) = constants(dims, seed, &cpu)?;
     let want = {
         let c = DeltaNetConstants {
@@ -157,7 +172,7 @@ fn correctness_gate(dev: &Device, dims: &DeltaNetDims, seed: u64, eps: f64) -> R
         delta_net_mix(&p_cpu.view(), &c, dims, &mut st, eps, ZGate::Sigmoid)?
     };
 
-    let p_gpu = projections(GATE_TOKENS, dims, seed, dev)?;
+    let p_gpu = projections(gate_tokens, dims, seed, dev)?;
     let (dt_bias, a, conv, norm) = constants(dims, seed, dev)?;
     let got = {
         let c = DeltaNetConstants {
@@ -170,7 +185,7 @@ fn correctness_gate(dev: &Device, dims: &DeltaNetDims, seed: u64, eps: f64) -> R
         let out = st.solo_out()?;
         let mut seqs = [DeltaNetSeq {
             start: 0,
-            len: GATE_TOKENS,
+            len: gate_tokens,
             state: &mut st,
             out,
             stash: None,
@@ -206,14 +221,19 @@ pub fn run_delta_net_kernels(dev: &Device, cfg: DeltaNetBenchCfg) -> Result<()> 
     let eps = 1e-6;
     let dims = cfg.dims;
 
-    let gap = correctness_gate(dev, &dims, cfg.seed, eps)?;
-    if gap > 2e-4 {
-        candle::bail!(
-            "delta_net bench: the fused scan disagrees with the tensor-op reference \
-             by {gap} — timing a wrong kernel measures nothing"
+    for gate_tokens in [GATE_TOKENS, GATE_SHORT_TOKENS] {
+        let gap = correctness_gate(dev, &dims, cfg.seed, eps, gate_tokens)?;
+        if gap > 2e-4 {
+            candle::bail!(
+                "delta_net bench: the fused scan disagrees with the tensor-op reference \
+                 by {gap} at {gate_tokens} tokens — timing a wrong kernel measures nothing"
+            );
+        }
+        println!(
+            "correctness gate: fused vs tensor-op reference at {gate_tokens} tokens, \
+             rel gap {gap:.2e}"
         );
     }
-    println!("correctness gate: fused vs tensor-op reference, rel gap {gap:.2e}");
 
     let per_seq = cfg.tokens / cfg.seqs;
     let total = per_seq * cfg.seqs;

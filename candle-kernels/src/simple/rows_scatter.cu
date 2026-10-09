@@ -150,7 +150,8 @@ extern "C" __global__ void rows_scatter_inline_kernel(
     rows_scatter_run(&table.w[e * ROWS_SCATTER_WORDS]);
 }
 
-extern "C" void run_rows_scatter(
+// Returns the launch's `cudaGetLastError` (0 on success, and for an empty set).
+extern "C" int run_rows_scatter(
     const long long* desc,
     const long long* host_desc,
     int n_runs,
@@ -158,7 +159,7 @@ extern "C" void run_rows_scatter(
     int max_rows,
     void* stream)
 {
-    if (n_runs <= 0 || max_elems <= 0 || max_rows <= 0) return;
+    if (n_runs <= 0 || max_elems <= 0 || max_rows <= 0) return 0;
     const int threads = 256;
     // Column tiles cover the widest run's *vector* width — sizing on the scalar
     // width would launch four times the blocks the vector path needs and leave
@@ -183,7 +184,8 @@ extern "C" void run_rows_scatter(
         }
         rows_scatter_inline_kernel<<<grid, threads, 0, (cudaStream_t)stream>>>(
             desc, n_runs, table);
-        return;
+        return (int)cudaGetLastError();
     }
     rows_scatter_kernel<<<grid, threads, 0, (cudaStream_t)stream>>>(desc, n_runs);
+    return (int)cudaGetLastError();
 }

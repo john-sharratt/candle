@@ -22,36 +22,39 @@
 //! # Typical acceptance
 //!
 //! Each row also hands the sampler the draft it tests, with the model's
-//! [`TypicalAcceptance`] thresholds ([`BatchedSampler::sample_verify_rows`]).
-//! The kernel commits that draft instead of the sample when the row's
-//! distribution gives it enough mass, so a step keeps every draft the exact
-//! rule would and some it would not. The rule and why it needs no argmax
-//! clause are in `speculative_choice`.
+//! [`TypicalAcceptance`] thresholds. The kernel commits that draft instead of
+//! the sample when the row's distribution gives it enough mass, so a step keeps
+//! every draft the exact rule would and some it would not. The rule and why it
+//! needs no argmax clause are in `speculative_choice`.
 //!
-//! # History comes from the sampler's own state
+//! # One dispatch per step, committed position by position
 //!
 //! Repetition and DRY penalties at block position `j` must see the tokens
-//! committed at `0..j`. They do, without anything here replaying them: the
-//! driver walks positions in order, `sample_batch` records each sampled token
-//! into the sequence's [`SequenceSamplingState`], and a sequence that leaves the
-//! walk is simply absent from later positions. So the state advances along
-//! exactly the committed path and no further. The `prefix` each row carries is
-//! used to *check* that — a state that has not advanced by one token per
-//! position has desynced, and silently mispriced penalties are the kind of bug
-//! that reads as a mysterious quality regression rather than a failure.
+//! committed at `0..j`. The walk reaches position `j` only by committing the
+//! block's first `j` drafts, so that history is known before the walk starts:
+//! [`SpecChooser::score`] prices every position against the state those drafts
+//! would leave and scores the whole step in one dispatch
+//! ([`BatchedSampler::score_rows`]). The walk then commits position by position
+//! ([`SpecChooser::commit`]), each commit advancing the sequence's state along
+//! exactly the committed path and no further — and refusing, rather than
+//! committing, a row whose scored state is not the one the walk arrived at.
+//! The `prefix` each row carries checks the walk's side of the same agreement:
+//! a state that has not advanced by one token per position has desynced, and
+//! silently mispriced penalties are the kind of bug that reads as a mysterious
+//! quality regression rather than a failure.
 
 use candle::{IndexOp, Result, Tensor};
-use candle_transformers::models::speculative_choice::{SpecRow, TokenChooser, TypicalAcceptance};
+use candle_transformers::models::speculative_choice::{SpecRow, TypicalAcceptance};
 
-use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
+use crate::batched_sampler::{BatchedSampler, RowSpec, Scored, SequenceSamplingState};
 use crate::config::SamplingConfig;
 
-/// The scheduler's [`TokenChooser`].
+/// The scheduler's chooser for one speculative step.
 ///
-/// Owns the cohort's sampling states for the duration of one speculative step —
-/// they are lifted out of the scheduler's map the same way the plain decode path
-/// lifts them, so the sampler can borrow them mutably — and hands them back
-/// through [`Self::into_states`].
+/// Owns the cohort's sampling states for the duration of the step — they are
+/// lifted out of the scheduler's map the same way the plain decode path lifts
+/// them, so the sampler can borrow them mutably — and hands them back through
+/// [`Self::into_states`].
 pub(super) struct SpecChooser<'a> {
     sampler: &'a BatchedSampler,
     /// Per cohort index, in the order the driver was given its sequences.
@@ -67,6 +70,12 @@ pub(super) struct SpecChooser<'a> {
     committed: Vec<usize>,
     /// The thresholds a draft the sample missed is accepted on.
     typical: TypicalAcceptance,
+    /// The step's logits block, once [`Self::score`] has read it.
+    block: Option<Tensor>,
+    /// Per cohort index and block position: the block row the position was
+    /// scored from and its pick, or `None` for a position the earlier ones
+    /// cannot reach.
+    scored: Vec<Vec<Option<(usize, Scored)>>>,
 }
 
 impl<'a> SpecChooser<'a> {
@@ -84,7 +93,117 @@ impl<'a> SpecChooser<'a> {
             rows: vec![Vec::new(); n],
             committed: vec![0; n],
             typical,
+            block: None,
+            scored: vec![Vec::new(); n],
         }
+    }
+
+    /// Score every position of every block in one dispatch. `blocks[i]` is
+    /// cohort sequence `i`'s committed token followed by its drafts, and
+    /// `positions[i][p]` the row of `block` that scores its position `p`.
+    pub(super) fn score(
+        &mut self,
+        block: Tensor,
+        positions: &[Vec<usize>],
+        blocks: &[Vec<u32>],
+    ) -> Result<()> {
+        if blocks.len() != self.states.len() || positions.len() != blocks.len() {
+            candle::bail!(
+                "SpecChooser::score: {} blocks and {} position lists for a {}-sequence cohort",
+                blocks.len(),
+                positions.len(),
+                self.states.len()
+            );
+        }
+        let mut specs: Vec<RowSpec<'_>> = Vec::new();
+        let mut at: Vec<(usize, usize)> = Vec::new();
+        for (i, b) in blocks.iter().enumerate() {
+            if positions[i].len() != b.len() {
+                candle::bail!(
+                    "SpecChooser::score: sequence {i} has {} scored rows for a {}-token block",
+                    positions[i].len(),
+                    b.len()
+                );
+            }
+            for (p, &logits_row) in positions[i].iter().enumerate() {
+                specs.push(RowSpec {
+                    seq: i,
+                    logits_row,
+                    draft: b.get(p + 1).copied(),
+                    ahead: &b[1..=p],
+                });
+                at.push((i, p));
+            }
+        }
+        let mut states: Vec<&mut SequenceSamplingState> = self.states.iter_mut().collect();
+        let configs: Vec<&SamplingConfig> = self.configs.iter().collect();
+        let scored =
+            self.sampler
+                .score_rows(&block, &mut states, &configs, &specs, Some(self.typical))?;
+        self.scored = blocks.iter().map(|b| vec![None; b.len()]).collect();
+        for ((i, p), (spec, s)) in at.into_iter().zip(specs.iter().zip(scored)) {
+            self.scored[i][p] = s.map(|s| (spec.logits_row, s));
+        }
+        self.block = Some(block);
+        Ok(())
+    }
+
+    /// Commit the walk's rows at one position, in ascending cohort order,
+    /// returning each row's token.
+    pub(super) fn commit(&mut self, rows: &[SpecRow<'_>]) -> Result<Vec<u32>> {
+        let Some(block) = self.block.as_ref() else {
+            candle::bail!("SpecChooser::commit: the step was never scored");
+        };
+        // The walk hands live sequences over in ascending cohort order; a caller
+        // that reordered them would pair each row with the wrong sequence.
+        if rows.windows(2).any(|w| w[0].seq >= w[1].seq) {
+            candle::bail!("SpecChooser: rows are not in ascending cohort order");
+        }
+        let mut tokens = Vec::with_capacity(rows.len());
+        for r in rows {
+            if r.seq >= self.states.len() {
+                candle::bail!(
+                    "SpecChooser: row names sequence {} of a {}-sequence cohort",
+                    r.seq,
+                    self.states.len()
+                );
+            }
+            // One token committed per position walked, or the penalties this row
+            // was priced with are stale.
+            if self.committed[r.seq] != r.prefix.len() {
+                candle::bail!(
+                    "SpecChooser: sequence {} has committed {} tokens this step but its row \
+                     at position {} carries a {}-token prefix — the sampling state has \
+                     desynced from the accept walk",
+                    r.seq,
+                    self.committed[r.seq],
+                    r.position,
+                    r.prefix.len()
+                );
+            }
+            let Some((logits_row, scored)) = self.scored[r.seq].get(r.position).copied().flatten()
+            else {
+                candle::bail!(
+                    "SpecChooser: the walk reached sequence {} position {}, which its scoring \
+                     found unreachable",
+                    r.seq,
+                    r.position
+                );
+            };
+            let token = self.sampler.commit_row(
+                block,
+                logits_row,
+                &mut self.states[r.seq],
+                &self.configs[r.seq],
+                scored,
+            )?;
+            // Keep the row the token was drawn from, shaped like a plain decode
+            // step's row (`[1, vocab]`) so the health checks read it identically.
+            self.rows[r.seq].push(block.i(logits_row..logits_row + 1)?);
+            self.committed[r.seq] += 1;
+            tokens.push(token);
+        }
+        Ok(tokens)
     }
 
     /// The logits rows that produced each sequence's committed tokens, in
@@ -99,69 +218,70 @@ impl<'a> SpecChooser<'a> {
     }
 }
 
-impl TokenChooser for SpecChooser<'_> {
-    fn choose(&mut self, logits: &Tensor, rows: &[SpecRow<'_>]) -> Result<Vec<u32>> {
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-        // The walk hands live sequences over in ascending cohort order, which is
-        // what lets `iter_mut().enumerate().filter(..)` below produce mutable
-        // borrows lined up with `rows`. A caller that reordered them would pair
-        // each row with the wrong sequence's penalties and RNG.
-        if rows.windows(2).any(|w| w[0].seq >= w[1].seq) {
-            candle::bail!("SpecChooser: rows are not in ascending cohort order");
-        }
-        for r in rows {
-            if r.seq >= self.states.len() {
-                candle::bail!(
-                    "SpecChooser: row names sequence {} of a {}-sequence cohort",
-                    r.seq,
-                    self.states.len()
-                );
-            }
-            // One token committed per position walked, or the penalties this row
-            // is about to be priced with are stale.
-            if self.committed[r.seq] != r.prefix.len() {
-                candle::bail!(
-                    "SpecChooser: sequence {} has committed {} tokens this step but its row \
-                     at position {} carries a {}-token prefix — the sampling state has \
-                     desynced from the accept walk",
-                    r.seq,
-                    self.committed[r.seq],
-                    r.position,
-                    r.prefix.len()
-                );
-            }
-        }
-
-        let live: Vec<usize> = rows.iter().map(|r| r.seq).collect();
-        let mut states: Vec<&mut SequenceSamplingState> = self
-            .states
-            .iter_mut()
-            .enumerate()
-            .filter(|(i, _)| live.contains(i))
-            .map(|(_, s)| s)
+/// The wave's scored rows as one `[rows, vocab]` block, and where each of
+/// `per_seq`'s rows sits in it.
+///
+/// A wave run in one forward hands its rows back as views on the one tensor
+/// its head wrote, so the block is a view as well and a row's place in it is
+/// its offset: the step's single dispatch reads the rows where the head wrote
+/// them, with nothing copied to line them up. A wave run in slices owns each
+/// slice's rows separately (`wave_driver`'s sliced path copies them off each
+/// slice's span), and those are joined once, in walk order — one copy for the
+/// step.
+pub(super) fn locate_rows(
+    wave: &[Tensor],
+    per_seq: &[Vec<Tensor>],
+) -> Result<(Tensor, Vec<Vec<usize>>)> {
+    let flat: Vec<Tensor> = wave
+        .iter()
+        .map(|t| t.flatten_all()?.unsqueeze(0))
+        .collect::<Result<_>>()?;
+    let Some(block) = Tensor::cat_view(&flat, 0) else {
+        let rows: Vec<Tensor> = per_seq
+            .iter()
+            .flatten()
+            .map(|t| t.flatten_all()?.unsqueeze(0))
+            .collect::<Result<_>>()?;
+        let joined = Tensor::cat(&rows, 0)?;
+        let mut next = 0;
+        let positions = per_seq
+            .iter()
+            .map(|rows| {
+                let at: Vec<usize> = (next..next + rows.len()).collect();
+                next += rows.len();
+                at
+            })
             .collect();
-        let configs: Vec<&SamplingConfig> = live.iter().map(|&i| &self.configs[i]).collect();
-        // The sampler records each committed token into its sequence's state,
-        // so the next position is priced against this one.
-        let drafts: Vec<Option<u32>> = rows.iter().map(|r| r.draft).collect();
-        let tokens = self.sampler.sample_verify_rows(
-            logits,
-            &mut states,
-            &configs,
-            &drafts,
-            self.typical,
-        )?;
-
-        // Keep the row each token was drawn from, shaped like a plain decode
-        // step's row (`[1, vocab]`) so the health checks read it identically.
-        for (m, r) in rows.iter().enumerate() {
-            self.rows[r.seq].push(logits.i(m..m + 1)?);
-            self.committed[r.seq] += 1;
-        }
-        Ok(tokens)
-    }
+        return Ok((joined, positions));
+    };
+    let (n, vocab) = block.dims2()?;
+    let base = block.layout().start_offset();
+    let positions = per_seq
+        .iter()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let off = row.layout().start_offset();
+                    let within = off.checked_sub(base).filter(|d| d % vocab == 0);
+                    match within.map(|d| d / vocab) {
+                        Some(i)
+                            if i < n
+                                && row.elem_count() == vocab
+                                && row.is_contiguous()
+                                && row.same_storage(&block) =>
+                        {
+                            Ok(i)
+                        }
+                        _ => candle::bail!(
+                            "locate_rows: a scored row at offset {off} is not a row of the \
+                             wave's {n} × {vocab} block at offset {base}"
+                        ),
+                    }
+                })
+                .collect::<Result<Vec<usize>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((block, positions))
 }
 
 #[cfg(test)]
@@ -175,11 +295,17 @@ mod tests {
 
     /// One `[1, VOCAB]` row with `p(5) = 0.8` and `p(7) = 0.2`; every other
     /// token sits ~2e-9.
-    fn row() -> Tensor {
+    fn row_values() -> Vec<f32> {
         let mut data = vec![0.0f32; VOCAB];
         data[5] = 20.0;
         data[7] = 20.0 + 0.25f32.ln();
-        Tensor::from_vec(data, (1, VOCAB), &Device::Cpu).expect("row")
+        data
+    }
+
+    /// `n` such rows as one `[n, VOCAB]` block.
+    fn block(n: usize) -> Tensor {
+        let data: Vec<f32> = (0..n).flat_map(|_| row_values()).collect();
+        Tensor::from_vec(data, (n, VOCAB), &Device::Cpu).expect("block")
     }
 
     fn sampled(seed: u64) -> SamplingConfig {
@@ -212,21 +338,59 @@ mod tests {
                 TypicalAcceptance::MEDUSA,
             );
             let blocks = vec![vec![1u32, 7, 30], vec![1u32, 9]];
+            // Sequence 0 scores rows 0..3 of the block, sequence 1 rows 3..5.
+            chooser.score(block(5), &[vec![0, 1, 2], vec![3, 4]], &blocks)?;
             let mut walk = AcceptWalk::new(&blocks);
 
-            let first = chooser.choose(&Tensor::cat(&[row(), row()], 0)?, &walk.rows())?;
+            let first = chooser.commit(&walk.rows())?;
             assert_eq!(first[0], 7, "seed {seed}: the 0.2 draft is committed");
             assert!(matches!(first[1], 5 | 7), "seed {seed}: {first:?}");
             walk.commit(&first, |_, _| true)?;
             assert_eq!(walk.alive(), &[0]);
 
-            let second = chooser.choose(&row(), &walk.rows())?;
+            let second = chooser.commit(&walk.rows())?;
             assert!(matches!(second[0], 5 | 7), "seed {seed}: {second:?}");
 
             let states = chooser.into_states();
             assert_eq!(states[0].rng_offset, 2, "seed {seed}: two rows sampled");
             assert_eq!(states[1].rng_offset, 1, "seed {seed}: one row sampled");
         }
+        Ok(())
+    }
+
+    /// A sliced wave's rows are separate tensors: they are joined in walk order
+    /// and located by that order.
+    #[test]
+    fn a_sliced_waves_rows_are_joined_in_walk_order() -> Result<()> {
+        let wave: Vec<Tensor> = (0..3).map(|_| block(1)).collect();
+        let per_seq = vec![
+            vec![wave[2].clone()],
+            vec![wave[0].clone(), wave[1].clone()],
+        ];
+        let (joined, positions) = locate_rows(&wave, &per_seq)?;
+        assert_eq!(positions, vec![vec![0], vec![1, 2]]);
+        assert_eq!(joined.dims(), &[3, VOCAB]);
+        Ok(())
+    }
+
+    /// The rows of a wave are found where the head wrote them: a block's views
+    /// locate by offset, and a row of some other tensor is refused.
+    #[test]
+    fn rows_are_located_in_the_wave_block_by_offset() -> Result<()> {
+        let head = block(4);
+        let wave: Vec<Tensor> = (0..4)
+            .map(|i| head.narrow(0, i, 1))
+            .collect::<Result<_>>()?;
+        let per_seq = vec![
+            vec![wave[2].clone(), wave[3].clone()],
+            vec![wave[0].clone()],
+        ];
+        let (located, positions) = locate_rows(&wave, &per_seq)?;
+        assert_eq!(positions, vec![vec![2, 3], vec![0]]);
+        assert!(located.same_storage(&head), "a view, not a copy");
+
+        let stranger = block(1);
+        assert!(locate_rows(&wave, &[vec![stranger]]).is_err());
         Ok(())
     }
 }

@@ -389,6 +389,24 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16_SMEM8 name##_dense_m2( \
         vy, dst, ncols_x, nrows_x, total_batch, y_stride, dst_stride, sum_norm); \
 }
 
+//   name##_dense_m4 — the prefill tile: N_SUB=4 (Bm=64) × RN=4 (128 rows per block, 32 per
+//                     warp). Every A fragment a warp loads feeds four n8 MMAs and every weight
+//                     chunk four m16 sub-tiles, so a 64×128 block moves a quarter of mode-2's
+//                     shared-memory and L2 bytes per MMA. Same per-output fold chain as mode-1
+//                     and mode-2. The host launches it with grid = (ceil(M/64), ceil(N/128)).
+#define INSTANTIATE_KERNEL_DENSE_INT8_M4(name, qk, qi, block_type, vdr, dst_t) \
+extern "C" __global__ void \
+__launch_bounds__(128, grouped_tc::wide_min_blocks<block_compact_t<block_type>, 4, true>()) \
+name##_dense_m4( \
+    const void* __restrict__ weights, \
+    const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
+    const int ncols_x, const int nrows_x, const int total_batch, \
+    const int y_stride, const int dst_stride, const int sum_norm) { \
+    grouped_tc::quantized_matmul_dense_entry_int8<qk, qi, block_type, vdr, dst_t, 4, 4>( \
+        reinterpret_cast<const block_compact_t<block_type>*>(weights), \
+        vy, dst, ncols_x, nrows_x, total_batch, y_stride, dst_stride, sum_norm); \
+}
+
 //   name##_dense_silu / name##_dense_silu_m2 — the mode-1 / mode-2 tiles over a fused
 //                     activation: `silu` of F32 rows `proj_stride` apart, quantized as it
 //                     loads (grouped_tc::quantized_matmul_dense_silu_entry_int8). The
@@ -436,11 +454,33 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16_SMEM8 name##_dense_sk( \
         segs, vy, dst, ncols_x, total_batch, dst_stride, sum_norm, ws, counters); \
 }
 
-// The KO formats: mode-2 for prefill, at every output width.
+//   name##_dense_nw — the decode-width (≤ 8 rows) tile: one 8-row output tile per
+//                     block, K walked by its warps (blockDim.y of them) and summed in
+//                     shared memory, over one or more weight segments of a shared
+//                     output row (`SplitKSegs`, tiles of 8 rows). Dynamic shared memory
+//                     per `narrow_layout.cuh`; see
+//                     grouped_tc::quantized_matmul_dense_narrow_entry_int8.
+//                     Two of the widest blocks per SM — 32 resident warps, so at most
+//                     64 registers a thread — is what the host's warp rule
+//                     (`int8_split_k::narrow_warps`, NARROW_WARPS_PER_SM) assumes.
+#define INSTANTIATE_KERNEL_DENSE_INT8_NW(name, qk, qi, block_type, vdr, dst_t) \
+extern "C" __global__ void __launch_bounds__(NARROW_MAX_WARPS * 32, 2) name##_dense_nw( \
+    const SplitKSegs segs, \
+    const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
+    const int ncols_x, const int total_batch, \
+    const int dst_stride, const int sum_norm) { \
+    grouped_tc::quantized_matmul_dense_narrow_entry_int8<qk, qi, block_type, vdr, dst_t>( \
+        segs, vy, dst, ncols_x, total_batch, dst_stride, sum_norm); \
+}
+
+// The KO formats: mode-2 and mode-4 for prefill, at every output width.
 #define INSTANTIATE_KERNEL_DENSE_INT8_M2_ALL(base, qk, qi, block_type, vdr) \
     INSTANTIATE_KERNEL_DENSE_INT8_M2(base##_f16, qk, qi, block_type, vdr, half) \
     INSTANTIATE_KERNEL_DENSE_INT8_M2(base##_bf16, qk, qi, block_type, vdr, __nv_bfloat16) \
-    INSTANTIATE_KERNEL_DENSE_INT8_M2(base##_f32, qk, qi, block_type, vdr, float)
+    INSTANTIATE_KERNEL_DENSE_INT8_M2(base##_f32, qk, qi, block_type, vdr, float) \
+    INSTANTIATE_KERNEL_DENSE_INT8_M4(base##_f16, qk, qi, block_type, vdr, half) \
+    INSTANTIATE_KERNEL_DENSE_INT8_M4(base##_bf16, qk, qi, block_type, vdr, __nv_bfloat16) \
+    INSTANTIATE_KERNEL_DENSE_INT8_M4(base##_f32, qk, qi, block_type, vdr, float)
 
 // The affine KO formats: split-K for decode, at every output width. MXFP4 has none — its
 // per-sub fold accumulates straight into the sum, which per-tile partials cannot reproduce.
@@ -448,6 +488,13 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16_SMEM8 name##_dense_sk( \
     INSTANTIATE_KERNEL_DENSE_INT8_SK(base##_f16, qk, qi, block_type, vdr, half) \
     INSTANTIATE_KERNEL_DENSE_INT8_SK(base##_bf16, qk, qi, block_type, vdr, __nv_bfloat16) \
     INSTANTIATE_KERNEL_DENSE_INT8_SK(base##_f32, qk, qi, block_type, vdr, float)
+
+// The affine KO formats: the narrow decode tile, at every output width. MXFP4 has none, for
+// the reason it has no split-K twin.
+#define INSTANTIATE_KERNEL_DENSE_INT8_NW_ALL(base, qk, qi, block_type, vdr) \
+    INSTANTIATE_KERNEL_DENSE_INT8_NW(base##_f16, qk, qi, block_type, vdr, half) \
+    INSTANTIATE_KERNEL_DENSE_INT8_NW(base##_bf16, qk, qi, block_type, vdr, __nv_bfloat16) \
+    INSTANTIATE_KERNEL_DENSE_INT8_NW(base##_f32, qk, qi, block_type, vdr, float)
 
 #define INSTANTIATE_KERNEL_GROUPED_INT8(name, qk, qi, block_type, vdr, dst_t) \
 extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_grouped( \
@@ -472,13 +519,18 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_grouped( \
  * wide tiles there would MMA mostly zero-padding for the same weight traffic).
  * Bit-identical per output row to the N_SUB=2 kernel: the K-loop accumulation
  * order is unchanged; the sub-tile split only regroups which tokens share a
- * block. Relaxed launch bounds: the wide tiles hold 4·N_SUB accumulators per
- * thread and 2×(16·N_SUB)×KI8_STRIDE activation smem, so the TC16 10-block
- * register budget (~51/thread) would spill them.
+ * block. The wide tiles are also tall — 128 rows a block at mode-4 (RN=4), 64
+ * at mode-8 (RN=2) — so each warp runs every A fragment against several weight
+ * chunks and a token tile's activation is re-read from L2 once per 128 (64)
+ * output rows instead of once per 32; the dispatcher sizes the row-tile axis
+ * to match. Launch bounds per format and tile (`grouped_tc::wide_min_blocks`):
+ * 4·N_SUB·RN accumulators per thread.
  * The host picks the mode from rows-per-expert (cuda.rs
  * grouped_matmul_gemx_q8a128) and sizes the tile tables to 16·N_SUB. */
 #define INSTANTIATE_KERNEL_GROUPED_INT8_M4(name, qk, qi, block_type, vdr, dst_t) \
-extern "C" __global__ void LAUNCH_BOUNDS_ITER name##_grouped_m4( \
+extern "C" __global__ void \
+__launch_bounds__(128, grouped_tc::wide_min_blocks<block_compact_t<block_type>, 4, false>()) \
+name##_grouped_m4( \
     const uint64_t* __restrict__ weight_ptrs, \
     const int* __restrict__ tile_expert, \
     const int* __restrict__ tile_b_start, \
@@ -486,13 +538,15 @@ extern "C" __global__ void LAUNCH_BOUNDS_ITER name##_grouped_m4( \
     const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
     const int ncols_x, const int nrows_x, const int y_stride, const int dst_stride, \
     const int row_fast, const int sum_norm, const MoeLive live) { \
-    grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, block_q8a128, dst_t, 4>( \
+    grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, block_q8a128, dst_t, 4, 4>( \
         weight_ptrs, tile_expert, tile_b_start, tile_b_cnt, \
         vy, dst, ncols_x, nrows_x, y_stride, dst_stride, row_fast, sum_norm, live); \
 }
 
 #define INSTANTIATE_KERNEL_GROUPED_INT8_M8(name, qk, qi, block_type, vdr, dst_t) \
-extern "C" __global__ void LAUNCH_BOUNDS_VSMALL name##_grouped_m8( \
+extern "C" __global__ void \
+__launch_bounds__(128, grouped_tc::wide_min_blocks<block_compact_t<block_type>, 8, false>()) \
+name##_grouped_m8( \
     const uint64_t* __restrict__ weight_ptrs, \
     const int* __restrict__ tile_expert, \
     const int* __restrict__ tile_b_start, \
@@ -500,7 +554,7 @@ extern "C" __global__ void LAUNCH_BOUNDS_VSMALL name##_grouped_m8( \
     const block_q8a128* __restrict__ vy, dst_t* __restrict__ dst, \
     const int ncols_x, const int nrows_x, const int y_stride, const int dst_stride, \
     const int row_fast, const int sum_norm, const MoeLive live) { \
-    grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, block_q8a128, dst_t, 8>( \
+    grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, block_q8a128, dst_t, 8, 2>( \
         weight_ptrs, tile_expert, tile_b_start, tile_b_cnt, \
         vy, dst, ncols_x, nrows_x, y_stride, dst_stride, row_fast, sum_norm, live); \
 }

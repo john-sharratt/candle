@@ -3,6 +3,8 @@ use crate::{
 };
 
 #[cfg(feature = "cuda")]
+use crate::cuda_backend::argmax_rows::argmax_rows_f32;
+#[cfg(feature = "cuda")]
 use crate::CudaStorage;
 
 #[cfg(feature = "metal")]
@@ -524,6 +526,25 @@ impl BatchedSampling {
         let device = &storage.device;
         let stream = device.cuda_stream();
 
+        // A greedy pick over F32 rows spreads each row across many blocks
+        // (`argmax_rows`) — the same pick, ties included, as the fused
+        // sampler's one-block-a-row argmax, which streams a whole vocabulary row
+        // through one SM. Every other dtype, and every draw, takes the fused
+        // sampler.
+        if self.temperature <= 0.0 {
+            if let CudaStorageSlice::F32(s) = &storage.slice {
+                let (ptr, _guard) = s.device_ptr(&stream);
+                return argmax_rows_f32(
+                    device,
+                    ptr + layout.start_offset() as u64 * 4,
+                    batch_size,
+                    vocab_size,
+                    self.live_vocab.min(vocab_size),
+                    output_ptr,
+                );
+            }
+        }
+
         // RNG offsets [batch_size] u64 — for a draw only. An argmax
         // (`temperature <= 0`) reads no RNG and the kernel takes a null pointer
         // there, so a greedy pick uploads nothing: it runs once per accept-walk
@@ -914,6 +935,96 @@ mod tests {
                 .batched_sample_argmax_into(3, &buf.flatten_all()?)
                 .is_err());
         }
+        Ok(())
+    }
+
+    /// The fused sampler's greedy pick, as its kernel computes it: thread
+    /// `i mod 1024` keeps the first index of its stride class that is strictly
+    /// greater than its running maximum (which `fmaxf` updates, so NaN never
+    /// registers), then a tree keeps the lower thread on ties.
+    fn sampler_greedy(row: &[f32], live: usize) -> u32 {
+        const THREADS: usize = 1024;
+        let mut vals = [f32::NEG_INFINITY; THREADS];
+        let mut idxs = [0u32; THREADS];
+        for t in 0..THREADS {
+            for i in (t..live).step_by(THREADS) {
+                let v = row[i];
+                if v > vals[t] {
+                    idxs[t] = i as u32;
+                }
+                vals[t] = vals[t].max(v);
+            }
+        }
+        let (mut best_v, mut best_i) = (vals[0], idxs[0]);
+        for t in 1..THREADS {
+            if vals[t] > best_v {
+                best_v = vals[t];
+                best_i = idxs[t];
+            }
+        }
+        best_i
+    }
+
+    /// The many-blocks greedy pick is the fused sampler's pick on every row:
+    /// ties resolved by the lower `i mod 1024` and then the lower index, +0
+    /// tying −0, NaN never winning, a −∞ row answering 0, a padded tail
+    /// ignored — and on pseudo-random vocabulary-width rows.
+    #[test]
+    fn the_greedy_pick_is_the_fused_samplers_pick() -> Result<()> {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let width = 248_320usize;
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+        let at = |pairs: &[(usize, f32)]| {
+            let mut r = vec![0f32; width];
+            for &(i, v) in pairs {
+                r[i] = v;
+            }
+            r
+        };
+        rows.push(at(&[(5, 1.0), (1027, 1.0)])); // 1027: class 3 beats class 5
+        rows.push(at(&[(3, 1.0), (1027, 1.0)])); // same class: the lower index
+        rows.push(at(&[(2051, 1.0), (1027, 1.0)]));
+        rows.push(vec![f32::NEG_INFINITY; width]);
+        let mut nan_row = vec![f32::NEG_INFINITY; width];
+        nan_row[0] = f32::NAN;
+        nan_row[9] = 2.0;
+        rows.push(nan_row);
+        rows.push(vec![f32::NAN; width]);
+        let mut zeros = vec![-1f32; width];
+        zeros[7] = -0.0;
+        zeros[2000] = 0.0;
+        rows.push(zeros);
+        let mut tail = vec![0f32; width];
+        tail[width - 1] = 9.0; // past the live vocabulary below
+        tail[width - 3] = 4.0; // in the slice's last partial quad
+        rows.push(tail);
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..5 {
+            rows.push(
+                (0..width)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        // A coarse grid, so a row holds repeated maxima.
+                        ((s >> 40) % 4096) as f32 / 64.0
+                    })
+                    .collect(),
+            );
+        }
+        let live = width - 2;
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        let logits = Tensor::from_vec(flat, (rows.len(), width), &dev)?;
+        let got = logits.batched_sample_argmax(live)?.to_vec1::<u32>()?;
+        let want: Vec<u32> = rows.iter().map(|r| sampler_greedy(r, live)).collect();
+        assert_eq!(got, want);
+        assert_eq!(&want[..4], &[1027, 3, 1027, 0]);
+        assert_eq!(want[4], 9);
+        assert_eq!(want[5], 0);
+        assert_eq!(want[6], 7);
+        assert_eq!(want[7], (width - 3) as u32);
         Ok(())
     }
 

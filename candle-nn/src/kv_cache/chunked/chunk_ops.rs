@@ -30,10 +30,16 @@ use crate::kv_cache::arena_table::ArenaFormatTag;
 use crate::kv_cache::arena_table::{ArenaLocation, N_PALETTE};
 use crate::kv_cache::KvFormat;
 #[cfg(feature = "cuda")]
+use candle::cuda_backend::cudarc::driver::CudaStream;
+#[cfg(feature = "cuda")]
 use candle::quantized::cuda::SELECT_FMT_F16;
+#[cfg(feature = "cuda")]
+use candle::quantized::pinned_staging::PinnedBuf;
 #[cfg(feature = "cuda")]
 use candle::Device;
 use candle::{Result, Tensor};
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 /// The arena keys a run of per-band formats allocates from.
 ///
@@ -118,6 +124,64 @@ pub(super) fn staging_groups(lens: &[usize], cap: usize) -> Vec<(usize, usize, u
         i = j;
     }
     groups
+}
+
+/// A run of consecutive bands of one layer inside a cross-layer staging group:
+/// `layer`'s bands `start..end`, in that layer's band order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LayerRun {
+    pub layer: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// One gather + DtoH of a cross-layer migrate: its bytes, and the layer runs it
+/// carries in staging order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StagingGroup {
+    pub bytes: usize,
+    pub runs: Vec<LayerRun>,
+}
+
+/// Split every layer's band lengths, taken in layer order, into groups that each
+/// fit `cap` — [`staging_groups`] over the bands of all layers at once.
+///
+/// **By band, not by layer.** A layer's hot set is not bounded by the staging
+/// span — one layer of a 128K turn is ~84 MB at C5 against the 64 MiB span — so
+/// grouping whole layers left the floor at one oversized layer, which the span
+/// refused. A band is one chunk's palette payload, kilobytes, so every group fits
+/// by construction, and the group count stays `ceil(total / cap)`.
+///
+/// A layer with no bands contributes no run. Pure, so the boundary arithmetic is
+/// testable without a GPU ([`cross_layer_groups_split_a_layer_wider_than_the_cap`](tests)).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(super) fn cross_layer_staging_groups(
+    layer_lens: &[Vec<usize>],
+    cap: usize,
+) -> Vec<StagingGroup> {
+    let at: Vec<(usize, usize)> = layer_lens
+        .iter()
+        .enumerate()
+        .flat_map(|(layer, lens)| (0..lens.len()).map(move |band| (layer, band)))
+        .collect();
+    let lens: Vec<usize> = layer_lens.iter().flatten().copied().collect();
+    staging_groups(&lens, cap)
+        .into_iter()
+        .map(|(i, j, bytes)| {
+            let mut runs: Vec<LayerRun> = Vec::new();
+            for &(layer, band) in &at[i..j] {
+                match runs.last_mut() {
+                    Some(run) if run.layer == layer => run.end = band + 1,
+                    _ => runs.push(LayerRun {
+                        layer,
+                        start: band,
+                        end: band + 1,
+                    }),
+                }
+            }
+            StagingGroup { bytes, runs }
+        })
+        .collect()
 }
 
 /// Source formats the quantize-on-evict kernel can ingest directly: `Float`
@@ -1226,12 +1290,11 @@ impl ChunkedKvBacking {
     pub fn migrate_sealed_to_cpu_batch_async(
         &self,
         device: &Device,
-        copy_stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
-        pinned_scratch: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
+        copy_stream: &Arc<CudaStream>,
+        pinned_scratch: &mut Option<PinnedBuf>,
         sequences: &[&SealedSequence],
     ) -> candle::Result<Vec<SealedSequence>> {
         use candle::cuda_backend::WrapErr;
-        use candle::quantized::pinned_staging::PinnedBuf;
 
         use super::migrate::{kv_migrate_on, MigrationPlan};
 
@@ -1457,10 +1520,12 @@ impl ChunkedKvBacking {
     /// Cross-layer batched hot→warm DtoH. The per-layer
     /// [`Self::migrate_sealed_to_cpu_batch_async`] issues a gather + DtoH + sync
     /// **per backing** (48× per persist pass on Qwen3); this resolves EVERY
-    /// layer's chunks into ONE contiguous staging blob, runs a SINGLE gather +
-    /// SINGLE DtoH + SINGLE `copy_stream.synchronize()`, then scatters per-layer
-    /// into fresh CPU arenas. Collapses the WDDM per-launch/per-sync overhead
-    /// that made `copy_ms` the hot→warm drain bottleneck. `backings[i]` owns
+    /// layer's bands in one walk and stages them in `ceil(total / span)` groups
+    /// ([`cross_layer_staging_groups`]) — one gather + one DtoH + one
+    /// `copy_stream.synchronize()` per group — scattering each group's bands into
+    /// fresh CPU arenas layer by layer. Collapses the WDDM per-launch/per-sync
+    /// overhead that made `copy_ms` the hot→warm drain bottleneck, and fits the
+    /// staging span whatever one layer holds. `backings[i]` owns
     /// `per_layer_seqs[i]`; returns the warm (CPU) sequences per layer, in the
     /// same order. Bit-identical to the per-layer path — proven by
     /// `migrate_layers_deferred_matches_immediate_bytes` extended, and the
@@ -1469,12 +1534,34 @@ impl ChunkedKvBacking {
     pub fn migrate_sealed_layers_to_cpu_batch(
         backings: &[&ChunkedKvBacking],
         device: &Device,
-        copy_stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
-        pinned_scratch: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
+        copy_stream: &Arc<CudaStream>,
+        pinned_scratch: &mut Option<PinnedBuf>,
         per_layer_seqs: &[Vec<&SealedSequence>],
     ) -> candle::Result<Vec<Vec<SealedSequence>>> {
+        Self::migrate_sealed_layers_to_cpu_batch_in(
+            backings,
+            device,
+            copy_stream,
+            pinned_scratch,
+            per_layer_seqs,
+            MIGRATION_STAGING_CAP_BYTES,
+        )
+    }
+
+    /// [`Self::migrate_sealed_layers_to_cpu_batch`] staging in groups of at most
+    /// `cap` bytes — the span's size in production; a test passes a few bands'
+    /// worth so its small sequences split mid-layer exactly as a 128K turn's
+    /// layer splits against the span.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn migrate_sealed_layers_to_cpu_batch_in(
+        backings: &[&ChunkedKvBacking],
+        device: &Device,
+        copy_stream: &Arc<CudaStream>,
+        pinned_scratch: &mut Option<PinnedBuf>,
+        per_layer_seqs: &[Vec<&SealedSequence>],
+        cap: usize,
+    ) -> candle::Result<Vec<Vec<SealedSequence>>> {
         use candle::cuda_backend::WrapErr;
-        use candle::quantized::pinned_staging::PinnedBuf;
         use std::collections::{HashMap, HashSet};
 
         use super::migrate::{kv_migrate_on, MigrationPlan};
@@ -1494,14 +1581,13 @@ impl ChunkedKvBacking {
         }
 
         // Per-layer resolution kept for the scatter phase. Offsets are assigned
-        // per staging batch below (not globally), so the transient GPU staging
+        // per staging group below (not globally), so the transient GPU staging
         // buffer never scales with the whole cross-layer batch.
         struct LayerResolve {
             unique_raws: Vec<i64>,
             /// Source device ptr + byte length per unique raw gid.
             src: HashMap<i64, (i64, usize)>,
             src_keys: HashMap<i64, ArenaKey>,
-            layer_bytes: usize,
         }
 
         // ── Resolve every layer's sources (device ptr + len per gid) ────
@@ -1514,7 +1600,6 @@ impl ChunkedKvBacking {
             let mut unique_raws: Vec<i64> = Vec::new();
             let mut src: HashMap<i64, (i64, usize)> = HashMap::new();
             let mut src_keys: HashMap<i64, ArenaKey> = HashMap::new();
-            let mut layer_bytes = 0usize;
             let elems = backing.inner.elems_per_chunk();
             for seq in &per_layer_seqs[li] {
                 for chunk in &seq.chunks {
@@ -1545,7 +1630,7 @@ impl ChunkedKvBacking {
                         let ptr = info.base_ptr as i64 + chunk_idx as i64 * info.chunk_byte_stride;
                         src.insert(raw, (ptr, len));
                         unique_raws.push(raw);
-                        layer_bytes += len;
+                        grand_total += len;
                         let key = backing
                             .inner
                             .storage
@@ -1559,12 +1644,10 @@ impl ChunkedKvBacking {
                     }
                 }
             }
-            grand_total += layer_bytes;
             layers.push(LayerResolve {
                 unique_raws,
                 src,
                 src_keys,
-                layer_bytes,
             });
         }
 
@@ -1575,135 +1658,58 @@ impl ChunkedKvBacking {
                 .collect());
         }
 
-        // ── Migrate in contiguous layer batches, each capped by STAGING_CAP ─
-        // A single cross-layer gather would size the transient GPU staging to
-        // the ENTIRE batch (all layers at once) — under ingest pressure that
-        // alloc can OOM the very copy meant to relieve pressure. Instead, group
-        // layers so each batch's staging stays ≤ cap and issue ONE gather + DtoH
-        // + sync per batch. Layers are ~uniform (≈1/n_layers of the total each),
-        // so this is ceil(total/cap) syncs — still collapsing the WDDM per-launch
-        // overhead that made `copy_ms` the drain bottleneck, not the per-layer 48.
-        const STAGING_CAP_BYTES: usize = MIGRATION_STAGING_CAP_BYTES;
-        let mut out: Vec<Vec<SealedSequence>> = Vec::with_capacity(backings.len());
-        let mut li = 0usize;
-        while li < backings.len() {
-            // Grow the batch while under the cap; always take ≥1 layer so a lone
-            // layer larger than the cap still makes progress.
-            let mut batch_bytes = 0usize;
-            let mut lj = li;
-            while lj < backings.len() {
-                let lb = layers[lj].layer_bytes;
-                if lj > li && batch_bytes + lb > STAGING_CAP_BYTES {
-                    break;
-                }
-                batch_bytes += lb;
-                lj += 1;
-            }
-
-            if batch_bytes == 0 {
-                // A trailing run of wholly-empty layers — emit their (empty)
-                // sequences with no GPU work.
-                for seqs in &per_layer_seqs[li..lj] {
-                    out.push(seqs.iter().map(|s| (*s).clone()).collect());
-                }
-                li = lj;
-                continue;
-            }
-
-            // Allocate the host + GPU staging for [li, lj), shrinking the batch
-            // and retrying on OOM. Both allocs happen BEFORE any scatter side
-            // effect, so a failed attempt leaves no partial state — halving the
-            // layer span (down to a single ~30 MB layer) lets migration make
-            // progress even when host RAM is fragmented or VRAM is tight, instead
-            // of aborting. Only when a lone layer still won't fit do we propagate
-            // the error (the turn stays hot-float + consistent, retried next pass).
-            // The generation opens *before* the bisect, not on success inside
-            // it: the range allocated below borrows it, so the two cannot be
-            // produced as a pair. Retries need no fresh guard — a failed
-            // `alloc` bails before it advances the cursor — and a
-            // domain-creation failure is not memory pressure on this batch, so
-            // shrinking would not have helped it anyway.
-            let staging_gen =
-                bump_arena::persistence_domain(copy_stream)?.generation(NOT_A_WAVE, NOT_A_WAVE)?;
-            let staging = loop {
-                let batch_bytes: usize = layers[li..lj].iter().map(|l| l.layer_bytes).sum();
-                // **GPU staging first, host scratch only once it is in place.**
-                // The order used to be the other way round, and the host buffer is
-                // grow-only PINNED memory: a batch the domain was always going to
-                // refuse still left `pinned_scratch` sized to it. With a single
-                // 126–186 MB layer against the 64 MiB budget that is ~186 MB of
-                // non-pageable host memory held for the process, to serve a retry
-                // that can never need more than the cap.
-                //
-                // The bisect shrinks against the domain's *declared* budget rather
-                // than against the driver refusing an allocation — same loop, a
-                // bound that is ours.
-                let alloc_res = staging_gen.alloc(batch_bytes, 256).and_then(|range| {
-                    // Host scratch (fallible — see the per-layer variant's note).
-                    let need_grow = pinned_scratch
-                        .as_ref()
-                        .map(|b| b.len() < batch_bytes)
-                        .unwrap_or(true);
-                    if need_grow {
-                        PinnedBuf::alloc_default_or_host_fallible(batch_bytes)
-                            .map(|b| *pinned_scratch = Some(b))?;
-                    }
-                    Ok(range)
-                });
-                match alloc_res {
-                    Ok(range) => break range,
-                    Err(e) if lj > li + 1 => {
-                        lj = li + ((lj - li) / 2).max(1);
-                        tracing::warn!(
-                            target: "candle_conversation::persistence::tier",
-                            batch_bytes,
-                            layers = lj - li,
-                            "hot→warm staging alloc failed under memory pressure; \
-                             shrinking migration batch and retrying: {e}"
-                        );
-                        continue;
-                    }
-                    // **A lone layer over the cap is reported, not retried here.**
-                    //
-                    // The bisect halves a layer *span*, so its floor is one layer —
-                    // and one layer's hot set is not bounded by the cap. A workload
-                    // that seals many lossless-R16 turns before the drain catches up
-                    // puts 100–200 MB in a single layer against a 64 MiB span.
-                    //
-                    // The per-layer path (`migrate_sealed_to_cpu_batch_async`) groups
-                    // by BAND and always fits, so it is the right answer — but NOT
-                    // from here. This function is reached with the sequence-state
-                    // write lock held across its allocation loop, and re-entering the
-                    // allocator underneath it is the shape that deadlocked the daemon
-                    // three times (`bump_arena`'s lock-order note). The caller runs
-                    // with no such lock, so the retry belongs there; see
-                    // `persistence::thread`'s handling of this error.
-                    Err(e) => return Err(e),
-                }
-            };
-
-            // ── ONE gather + ONE DtoH + ONE sync for this batch ─────────────
+        // ── Stage in band groups that each fit the span, across layers ──
+        // A single cross-layer gather would size the transient GPU staging to the
+        // ENTIRE batch — under ingest pressure that alloc can OOM the very copy
+        // meant to relieve pressure — and grouping whole layers left a lone layer
+        // wider than the span (one layer of a 128K turn is ~84 MB at C5) with
+        // nowhere smaller to go. So the bands of every layer, in layer order, are
+        // grouped to the span: ONE gather + DtoH + sync per group, `ceil(total /
+        // cap)` of them, every group fitting by construction.
+        let layer_lens: Vec<Vec<usize>> = layers
+            .iter()
+            .map(|l| l.unique_raws.iter().map(|r| l.src[r].1).collect())
+            .collect();
+        let groups = cross_layer_staging_groups(&layer_lens, cap);
+        let mut new_gids: Vec<HashMap<i64, ChunkGid>> =
+            (0..backings.len()).map(|_| HashMap::new()).collect();
+        let domain = bump_arena::persistence_domain(copy_stream)?;
+        for group in &groups {
+            // One generation per group: dropping it fences the copy stream and
+            // rewinds the cursor, so the next group reuses the same bytes. The
+            // range below borrows it, so it cannot outlive the generation.
+            let staging_gen = domain.generation(NOT_A_WAVE, NOT_A_WAVE)?;
+            let staging = staging_gen.alloc(group.bytes, 256)?;
             let staging_base = staging.ptr as i64;
+            // **Host scratch only once the span has granted the group.** Pinned
+            // memory grows and never shrinks, so growing it ahead of a staging the
+            // span then refuses — a lone band wider than the cap is grouped alone
+            // — would leave an oversized buffer held for the process, and every
+            // later pass would repeat the refusal over it. The persistence thread
+            // preallocates the span's size, so a group that fits the span needs no
+            // growth here at all.
+            if pinned_scratch
+                .as_ref()
+                .is_none_or(|b| b.len() < group.bytes)
+            {
+                *pinned_scratch = Some(PinnedBuf::alloc_default_or_host_fallible(group.bytes)?);
+            }
             let mut plan = MigrationPlan::new();
-            // Batch-local byte offset per unique gid, per layer, for the scatter.
-            let mut batch_ranges: Vec<HashMap<i64, (usize, usize)>> = Vec::with_capacity(lj - li);
             let mut off = 0i64;
-            for layer in &layers[li..lj] {
-                let mut ranges: HashMap<i64, (usize, usize)> = HashMap::new();
-                for &raw in &layer.unique_raws {
-                    let (ptr, len) = layer.src[&raw];
+            for run in &group.runs {
+                let layer = &layers[run.layer];
+                for raw in &layer.unique_raws[run.start..run.end] {
+                    let (ptr, len) = layer.src[raw];
                     plan.push(ptr, staging_base + off, len as i64);
-                    ranges.insert(raw, (off as usize, len));
                     off += len as i64;
                 }
-                batch_ranges.push(ranges);
             }
             kv_migrate_on(device, &plan, Some(copy_stream))?;
             {
                 let scratch = pinned_scratch
                     .as_mut()
                     .expect("pinned scratch allocated above");
-                let dst = &mut scratch.as_mut_slice()[..staging.len];
+                let dst = &mut scratch.as_mut_slice()[..group.bytes];
                 // SAFETY: as the hot->warm site — a range of this domain's span
                 // held by `staging_gen`, which `staging` borrows, so it is
                 // still open here by construction; copied into pinned host
@@ -1718,38 +1724,38 @@ impl ChunkedKvBacking {
                 .map_err(|e| candle::Error::Msg(format!("layer staging readback: {e}")))?;
                 copy_stream.synchronize().w()?;
             }
-            // The generation drops at the end of this batch iteration, fencing
-            // the stream and rewinding the cursor for the next batch. Dropping
-            // it earlier is no longer expressible: `staging` borrows it, and
-            // the last read of `staging` is the readback just above.
             drop(staging_gen);
 
-            // ── Per-layer scatter into fresh CPU arenas ─────────────────────
-            for (k, backing) in backings[li..lj].iter().enumerate() {
-                let resolve = &layers[li + k];
-                let ranges = &batch_ranges[k];
-                // Phase 3: allocate dest CPU GIDs (one state.write per backing).
-                let mut new_gids: HashMap<i64, ChunkGid> = HashMap::new();
+            // ── Scatter this group's bands into fresh CPU arenas ───────────
+            let scratch_ref = pinned_scratch
+                .as_ref()
+                .expect("pinned scratch allocated above");
+            let mut run_off = 0usize;
+            for run in &group.runs {
+                let backing = backings[run.layer];
+                let resolve = &layers[run.layer];
+                let raws = &resolve.unique_raws[run.start..run.end];
+                let gids = &mut new_gids[run.layer];
+                // Allocate dest CPU GIDs (one state.write per run).
                 {
                     let _state = backing
                         .state
                         .write()
                         .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-                    for &raw in &resolve.unique_raws {
-                        let src_key = &resolve.src_keys[&raw];
-                        let cpu_key = src_key.at(ArenaLocation::Cpu);
-                        new_gids.insert(raw, backing.alloc_chunk_for_key(cpu_key)?);
+                    for &raw in raws {
+                        let cpu_key = resolve.src_keys[&raw].at(ArenaLocation::Cpu);
+                        gids.insert(raw, backing.alloc_chunk_for_key(cpu_key)?);
                     }
                 }
-                // Phase 4: write this layer's slice of the batch blob → CPU arena.
-                let scratch_ref = pinned_scratch
-                    .as_ref()
-                    .expect("pinned scratch allocated above");
+                // Write this run's slice of the group blob → CPU arena.
+                let base = run_off;
                 backing.inner.storage.try_write(|s| -> candle::Result<()> {
-                    for &raw in &resolve.unique_raws {
-                        let (off, len) = ranges[&raw];
-                        let bytes = &scratch_ref.as_slice()[off..off + len];
-                        let new_gid = new_gids[&raw].clone();
+                    let mut at = base;
+                    for &raw in raws {
+                        let len = resolve.src[&raw].1;
+                        let bytes = &scratch_ref.as_slice()[at..at + len];
+                        at += len;
+                        let new_gid = &gids[&raw];
                         Self::write_chunk_from_pinned_bytes(
                             s.arenas_mut(),
                             new_gid.arena_idx(),
@@ -1759,35 +1765,45 @@ impl ChunkedKvBacking {
                     }
                     Ok(())
                 })?;
-                // Phase 5: rebuild SealedSequences with mapped CPU GIDs.
-                let seqs: candle::Result<Vec<SealedSequence>> = per_layer_seqs[li + k]
-                    .iter()
-                    .map(|seq| -> candle::Result<SealedSequence> {
-                        let new_chunks: candle::Result<Vec<SealedChunk>> = seq
-                            .chunks
-                            .iter()
-                            .map(|chunk| {
-                                let mapped = chunk
-                                    .gids
-                                    .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
-                                Ok(SealedChunk {
-                                    gids: mapped,
-                                    meta: None,
-                                    ..chunk.clone()
-                                })
-                            })
-                            .collect();
-                        Ok(SealedSequence {
-                            chunks: new_chunks?,
-                            token_count: seq.token_count,
-                            chunk_size: seq.chunk_size,
-                            location: ArenaLocation::Cpu,
-                        })
-                    })
-                    .collect();
-                out.push(seqs?);
+                run_off += raws.iter().map(|r| resolve.src[r].1).sum::<usize>();
             }
-            li = lj;
+        }
+
+        // ── Rebuild each layer's SealedSequences with its mapped CPU GIDs ──
+        // A layer with no bands carried no GPU bytes and is handed back as it
+        // came, exactly as the per-layer path hands back a layer with nothing to
+        // copy.
+        let mut out: Vec<Vec<SealedSequence>> = Vec::with_capacity(backings.len());
+        for (li, gids) in new_gids.iter().enumerate() {
+            if layers[li].unique_raws.is_empty() {
+                out.push(per_layer_seqs[li].iter().map(|s| (*s).clone()).collect());
+                continue;
+            }
+            let seqs: candle::Result<Vec<SealedSequence>> = per_layer_seqs[li]
+                .iter()
+                .map(|seq| -> candle::Result<SealedSequence> {
+                    let new_chunks: candle::Result<Vec<SealedChunk>> = seq
+                        .chunks
+                        .iter()
+                        .map(|chunk| {
+                            let mapped =
+                                chunk.gids.map_unique(|gid| Ok(gids[&gid.raw()].clone()))?;
+                            Ok(SealedChunk {
+                                gids: mapped,
+                                meta: None,
+                                ..chunk.clone()
+                            })
+                        })
+                        .collect();
+                    Ok(SealedSequence {
+                        chunks: new_chunks?,
+                        token_count: seq.token_count,
+                        chunk_size: seq.chunk_size,
+                        location: ArenaLocation::Cpu,
+                    })
+                })
+                .collect();
+            out.push(seqs?);
         }
         Ok(out)
     }
@@ -1856,12 +1872,10 @@ impl ChunkedKvBacking {
     pub fn migrate_sealed_to_gpu_batch_async(
         &self,
         device: &Device,
-        copy_stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
-        pinned_scratch: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
+        copy_stream: &Arc<CudaStream>,
+        pinned_scratch: &mut Option<PinnedBuf>,
         sequences: &[&SealedSequence],
     ) -> candle::Result<Vec<SealedSequence>> {
-        use candle::quantized::pinned_staging::PinnedBuf;
-
         use super::migrate::{kv_migrate_on, MigrationPlan};
 
         if sequences.is_empty() {
@@ -2268,6 +2282,52 @@ mod tests {
             expect_start = j;
         }
         assert_eq!(expect_start, lens.len(), "groups must cover every element");
+    }
+
+    /// A layer wider than the cap is split across groups, a group carries the
+    /// tail of one layer and the head of the next, an empty layer contributes no
+    /// run — and no multi-band group exceeds the cap. The shape of a 128K turn's
+    /// migrate, where one layer is wider than the whole span.
+    #[test]
+    fn cross_layer_groups_split_a_layer_wider_than_the_cap() {
+        let run = |layer, start, end| LayerRun { layer, start, end };
+        let groups = cross_layer_staging_groups(
+            &[
+                vec![30, 30, 30],
+                vec![10],
+                vec![],
+                vec![70],
+                vec![20, 20, 20, 20],
+            ],
+            64,
+        );
+        assert_eq!(
+            groups,
+            vec![
+                StagingGroup {
+                    bytes: 60,
+                    runs: vec![run(0, 0, 2)],
+                },
+                StagingGroup {
+                    bytes: 40,
+                    runs: vec![run(0, 2, 3), run(1, 0, 1)],
+                },
+                // A single band wider than the cap still forms its own group.
+                StagingGroup {
+                    bytes: 70,
+                    runs: vec![run(3, 0, 1)],
+                },
+                StagingGroup {
+                    bytes: 60,
+                    runs: vec![run(4, 0, 3)],
+                },
+                StagingGroup {
+                    bytes: 20,
+                    runs: vec![run(4, 3, 4)],
+                },
+            ]
+        );
+        assert!(cross_layer_staging_groups(&[vec![], vec![]], 64).is_empty());
     }
     use candle::{DType, Device, Tensor};
 

@@ -70,6 +70,7 @@ struct YTiles {
 #include "../fast_exp.cuh"           // the SiLU the fused-activation loader applies
 #include "../quantize/q8a128_tile.cuh" // the one q8a128 quantization, for that loader
 #include "moe_live.cuh"                 // the grouped entry's workers over a live expert table
+#include "../moe_read_ahead.cuh"        // the gate launch's read-ahead items
 #include "splitk_segs.cuh"              // the split-K dense entry's weight segments
 #include "pdl.cuh"                      // programmatic dependent launch: prefetch, then wait
 
@@ -1650,12 +1651,27 @@ __device__ void tc16_kernel(
 //   image) also has each slice the workers copy stored there, at the
 //   projection's offset (`dst_offset`): once the layer's three launches are
 //   done the slot holds the whole expert, and the host points its entry there.
+// - The gate launch's workers then READ AHEAD (`ahead`, `moe_read_ahead.cuh`):
+//   past the launch's own items come `AHEAD_CHUNKS` pieces of each item
+//   bucketize claimed for a later row's predicted expert. A piece is a plain
+//   byte copy of the expert's warm-slot image into its claimed slot — no
+//   compute, no layer geometry. The worker that finishes an item's last piece
+//   publishes it: the slot's owner tag, the up and down entries, a system
+//   fence, then gate. A later bucketize then finds the expert in VRAM without
+//   the host having done anything; the host books it when it collects the
+//   claim from the ring log. Demand items come first, so read-ahead only ever
+//   fills time the launch's own experts left over.
 //
 // Only workers wait, and what they wait on is a host store — never a submitted
 // copy or any other driver call, which a thread blocked in the driver (a lazy
 // kernel load behind this launch) could hold back. `abort` (a mapped host word)
-// and `spin_limit_ns` end a wait in `__trap()`, a sticky error the next
-// synchronising call reports, so no result computed from the layer is returned.
+// and `spin_limit_ns` end a wait without the expert: the worker claims `fault`
+// (a mapped host word naming the row, the expert and the wait) and gives the
+// item up; any other cold wait that sees the word set gives its expert up at
+// once. The host reads it once the forward has synchronised and fails the
+// forward, so no result computed from the layer is returned, and the context is
+// left usable. A given-up item writes nothing — not its output, and not the
+// promotion slot it was copying into, which the host therefore never installs.
 //
 // `stall` is the profile build's per-row counter block, null otherwise:
 //   stall[0] cold_wait_ns     — workers' time spent waiting for a cold expert
@@ -1663,8 +1679,11 @@ __device__ void tc16_kernel(
 //   stall[2] bytes            — bytes workers copied into scratch
 //   stall[3] copy_ns          — workers' time in the copy (mini loop)
 //   stall[4] launches         — live launches (one per projection per layer)
+//   stall[5] ahead_items      — read-ahead items published
+//   stall[6] ahead_bytes      — bytes read ahead
 //
 // The struct itself is in `moe_live.cuh`, shared with the launcher.
+#define MOE_LIVE_STALL_WORDS 7
 
 __device__ __forceinline__ unsigned long long moe_live_now() {
     unsigned long long t;
@@ -1697,8 +1716,32 @@ __device__ __forceinline__ uint4 moe_live_ld16(const uint8_t* p) {
 // off to tens of microseconds so the polls never compete with the copies.
 #define MOE_LIVE_MAX_SLEEP_NS 32768u
 
+// 16-byte loads each worker thread keeps in flight in a slice copy. Eight measured
+// level with four on Flash-Next decode (RTX 4090 Laptop, 32 workers): with that
+// many workers, the round trips of one are hidden by the others.
+#define MOE_LIVE_LOADS 4
+
+// The fault word's fields (`MoeLive::fault`; `api.rs`'s `MOE_FAULT_*`): bit 63
+// set when the wait ended on the abort word, the row in bits 48-62, the expert
+// in bits 32-47, the microseconds waited in bits 0-31, saturating.
+#define MOE_FAULT_ABORTED (1ull << 63)
+#define MOE_FAULT_ROW_SHIFT 48
+#define MOE_FAULT_EXPERT_SHIFT 32
+
+// Whether a worker of any launch has claimed the fault word. A forward that
+// faulted is failed by the host, so a cold wait that sees the word gives its
+// expert up at once instead of waiting out the spin limit. Read only inside a
+// wait, which polls the link anyway: an item whose expert is already published
+// pays nothing for it.
+__device__ __forceinline__ bool moe_live_faulted(const MoeLive& live) {
+    return *reinterpret_cast<const volatile unsigned long long*>(live.fault) != 0ull;
+}
+
 // Thread 0 of a worker: the live entry of a cold `expert`, waited for while it
-// is 0. Returns the time spent waiting.
+// is 0. Returns the time spent waiting. A wait that ends without the expert —
+// the abort word raised, or past `spin_limit_ns` — claims the fault word with
+// what it waited on and leaves `*src` 0: the worker gives the item up rather
+// than trapping, so the context survives and the host fails only the forward.
 __device__ __forceinline__ unsigned long long moe_live_source(
     int expert, const MoeLive& live, unsigned long long* src)
 {
@@ -1711,9 +1754,19 @@ __device__ __forceinline__ unsigned long long moe_live_source(
     const unsigned long long t0 = moe_live_now();
     unsigned int ns = 32;
     while (p == 0) {
-        if (*reinterpret_cast<const volatile unsigned int*>(live.abort) != 0u ||
-            moe_live_now() - t0 > live.spin_limit_ns) {
-            __trap();
+        const unsigned int aborted = *reinterpret_cast<const volatile unsigned int*>(live.abort);
+        const unsigned long long waited = moe_live_now() - t0;
+        if (aborted != 0u || waited > live.spin_limit_ns || moe_live_faulted(live)) {
+            const unsigned long long us = waited / 1000ull;
+            const unsigned long long code =
+                (aborted != 0u ? MOE_FAULT_ABORTED : 0ull) |
+                ((unsigned long long)(live.row & 0x7fff) << MOE_FAULT_ROW_SHIFT) |
+                ((unsigned long long)(expert & 0xffff) << MOE_FAULT_EXPERT_SHIFT) |
+                (us < 0xffffffffull ? us : 0xffffffffull);
+            atomicCAS(live.fault, 0ull, code);
+            __threadfence_system();
+            *src = 0;
+            return waited;
         }
 #if __CUDA_ARCH__ >= 700
         __nanosleep(ns);
@@ -2038,16 +2091,17 @@ __device__ __forceinline__ void load_act_tile(
 // two-stage entries; the deeper split-K pipeline sizes its own ring of STAGES−1 slots.
 constexpr int RING_I8 = 1;
 
-// Load this warp's own k1024 weight chunk for `k_blk` into `slot_ptr` with its 32 lanes.
-// `weights` is an array of k1024 chunks laid out [k_blk][row-group of 8]; the chunk carries
-// its quants AND its inline scales, so this single contiguous coalesced cp.async brings the
-// whole chunk in (no separate scale stream). Caller commits the group.
-template <typename block_c_t>
+// Load this warp's own k1024 weight chunks for `k_blk` into `slot_ptr` with its 32 lanes: the
+// RN consecutive 8-row groups from `warp_row_base`. `weights` is an array of k1024 chunks laid
+// out [k_blk][row-group of 8], so a warp's RN chunks of one K tile are contiguous; each carries
+// its quants AND its inline scales, so this single contiguous coalesced cp.async brings them in
+// (no separate scale stream). Caller commits the group.
+template <typename block_c_t, int RN = 1>
 __device__ __forceinline__ void load_warp_chunk_int8(
     uint8_t* slot_ptr, const block_c_t* __restrict__ weights, int k_blk,
     int warp_row_base, int nrows, int lane)
 {
-    constexpr int N16 = int8_chunk_bytes<block_c_t>::value / 16;   // 16B units in the chunk
+    constexpr int N16 = RN * int8_chunk_bytes<block_c_t>::value / 16;   // 16B units in the chunks
     const uint8_t* sbytes;
     if constexpr (is_scale_separate<block_c_t>::value) {
         // KO k1024: one 8-row chunk, indexed [k_blk][row-group of 8].
@@ -2075,6 +2129,87 @@ struct is_mxfp4_persub<block_c_mxfp4_k1024> {
     static constexpr bool value = true;
 };
 
+// Blocks per SM the prefill-width int8 entries (dense mode-4, grouped mode-4 / mode-8 — RN > 1)
+// are compiled for: `__launch_bounds__(128, wide_min_blocks<block_c_t, N_SUB, DENSE>())`. Three
+// — 168 registers a thread — is the budget wherever ptxas fits the tile in it without a spill,
+// which `ptxas -v` shows for every affine KO tile on sm_120 and every one but the mode-8 tile on
+// sm_86 / sm_89 (8 bytes spilled). MXFP4's per-sub fold keeps four scales a fold row per chunk:
+// its tiles spill at three on sm_86 / sm_89, and its dense tile (which also holds the PDL
+// prefetch state) on sm_120 too. Those take two. The third block is worth keeping where it fits:
+// DeepSeek's MXFP4 experts at mode-8 measured 6.53 ms at two blocks against 5.90 at three.
+template <typename block_c_t, int N_SUB, bool DENSE>
+constexpr int wide_min_blocks()
+{
+    constexpr bool mxfp4 = is_mxfp4_persub<block_c_t>::value;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
+    if (mxfp4 || N_SUB >= 8) {
+        return 2;
+    }
+#else
+    if (mxfp4 && DENSE) {
+        return 2;
+    }
+#endif
+    return 3;
+}
+
+// The affine per-128 fold of one K tile into one m16 token sub-tile's accumulator `acc`
+// (frag_c layout: [0] token g / row rl, [1] token g / row rl+1, [2] token g+8 / row rl,
+// [3] token g+8 / row rl+1). `C` is the tile's exact int32 dot product — the four k32
+// sub-MMAs collapsed — `d0`/`d1` the (scale, min) of rows rl/rl+1, `a0`/`a1` the
+// activation's stored (scale, Σ-field) of tokens g/g+8, and `sum_a`/`sum_b` the hoisted
+// coefficients that rebuild Σx from that field, whichever convention wrote it
+// (blocks.cuh):
+//   raw    (0, 1): fmaf(a.x, 0, 1) = 1     → a.y, the stored Σx, EXACTLY
+//   by-amax(127,0): fmaf(a.x, 127, 0)      → a.y · amax = Σx
+// The raw arm is bit-identical to reading `a.y` directly, because multiplying by an
+// exact 1.0f is exact in IEEE.
+//
+// Every int8 dense entry folds through this one function — the unsplit and split-K
+// impl and the narrow entry (`dense_narrow.cuh`) — so the expression, and with it the
+// compiler's FMA contraction of it, is the same everywhere: a tile's fold joins the
+// running sum in one add, and the entries that sum per-tile folds in tile order from
+// zero reproduce the unsplit kernel's accumulator bit for bit.
+__device__ __forceinline__ void ko_affine_fold(
+    float* acc, const int32_t C[4], float2 d0, float2 d1, float2 a0, float2 a1,
+    float sum_a, float sum_b)
+{
+    const float a0_sum = a0.y * fmaf(a0.x, sum_a, sum_b);
+    const float a1_sum = a1.y * fmaf(a1.x, sum_a, sum_b);
+    acc[0] += d0.x * a0.x * (float)C[0] + d0.y * a0_sum;
+    acc[1] += d1.x * a0.x * (float)C[1] + d1.y * a0_sum;
+    acc[2] += d0.x * a1.x * (float)C[2] + d0.y * a1_sum;
+    acc[3] += d1.x * a1.x * (float)C[3] + d1.y * a1_sum;
+}
+
+// The affine fold's K order. A tile's exact int32 dot product does not depend on the order its
+// 128 K products are summed in, so the impl runs the tile as four m16n8k32 MMAs over PAIRED K
+// segments rather than one per 32-K sub: MMA q's B operand is two dequanted registers of the same
+// half of two subs — {b[s][h], b[s+1][h]} — and its A fragment the matching 16-byte segments,
+// `kseg_lo(q)` for the first 16 K of the MMA and `kseg_lo(q) + 32` for the second. A format that
+// unpacks a chunk with one wide shared-memory load per half (Q8's two LDS.128, `q8_K.cuh`) then
+// hands the MMA a register pair the load already made adjacent, where the per-sub order
+// {b[s][0], b[s][1]} needed a MOV per MMA to build it.
+//   q  B operand                 A segments (bytes of the 128-K tile)
+//   0  {b[0][0], b[1][0]}        0..15,  32..47
+//   1  {b[2][0], b[3][0]}        64..79, 96..111
+//   2  {b[0][1], b[1][1]}        16..31, 48..63
+//   3  {b[2][1], b[3][1]}        80..95, 112..127
+__host__ __device__ constexpr int kseg_lo(int q) { return (q & 1) * 64 + (q >> 1) * 16; }
+
+// The A fragment of MMA q (see kseg_lo): ldmatrix.x4 over the m16 sub-tile at `tile_row0`
+// (rows KI8_STRIDE bytes apart), matrices 0/1 (rows 0-7 / 8-15) from byte `klo` and matrices
+// 2/3 from byte `khi` — `load_a_frag_m16k32_ldmatrix` with the second half's K offset free.
+__device__ __forceinline__ void load_a_frag_kseg(
+    uint32_t (&a)[4], const int8_t* tile_row0, int klo, int khi, int lane)
+{
+    const int tile_idx = lane >> 3;
+    const int row = (tile_idx & 1) * 8 + (lane & 7);
+    const int k = (tile_idx >> 1) ? khi : klo;
+    fused_attn::ldmatrix_x4_b16(a, static_cast<uint32_t>(__cvta_generic_to_shared(
+        tile_row0 + row * KI8_STRIDE + k)));
+}
+
 // load_warp_chunk_int8 weight stage, then the int8 MMA + deferred fold per sub.
 // N_SUB = m16 token sub-tiles per block. Mode-1 = 1 (Bm 16); mode-2 = larger Bm so each
 // weight chunk's dequant is reused across N_SUB token sub-tiles (fewer weight re-reads).
@@ -2096,13 +2231,24 @@ struct is_mxfp4_persub<block_c_mxfp4_k1024> {
 // bit. So a split launch is the unsplit kernel's bits whatever tiles each block takes, a
 // row's output never depends on how many rows its wave carried, and the unsplit kernel
 // carries nothing for it. (MXFP4's per-sub fold accumulates straight into the sum, which a
-// per-tile partial cannot reproduce; it never splits — see `dense_qmatmul_with_splits`.)
+// per-tile partial cannot reproduce; it never splits — see `dense_qmatmul_with_plan`.)
 //
 // ACT_SILU: the activation is `silu` of F32 rows (`act_f32`, `act_f32_stride` apart) and
 // each tile is quantized as it is loaded (`load_silu_f32_activations`) — no q8a128 operand
 // exists; `act` is unread.
+//
+// RN = 8-row weight chunks per warp, so a block's row tile is N_TILE·RN rows (`row_tile_idx`
+// counts tiles of that height). A warp dequants its RN chunks once per K tile and runs each A
+// fragment it loads against all RN of them: at prefill width the per-K-tile shared-memory and
+// L2 traffic per MMA falls with the tile area, which is what bounds the 32-row tile there (each
+// m16 A fragment was loaded by every warp for a single n8 MMA, and every 32 output rows
+// re-streamed the whole activation from L2). Per output, the tile order and the fold are the
+// RN = 1 kernel's — each chunk keeps its own accumulator and folds through `ko_affine_fold` in
+// tile order — so the bits do not depend on RN. A row tile may overhang N by whole warps
+// (N is a multiple of 32, a warp covers 8·RN ≤ 32 rows): such a warp loads, computes and
+// stores nothing, and still joins the activation loads and barriers.
 template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1,
-          int STAGES = 2, bool TILE_PARTIALS = false, bool ACT_SILU = false>
+          int STAGES = 2, bool TILE_PARTIALS = false, bool ACT_SILU = false, int RN = 1>
 __device__ void grouped_matmul_impl_int8(
     const block_compact_t<block_q_t>* __restrict__ weights,
     const block_q8a128* __restrict__ act,
@@ -2127,6 +2273,7 @@ __device__ void grouped_matmul_impl_int8(
     int act_f32_stride = 0)
 {
     using block_c_t = block_compact_t<block_q_t>;
+    static_assert(32 % (8 * RN) == 0, "a warp's rows must divide the 32-row granule N comes in");
     // The operand's sum convention, as the two coefficients that rebuild Σx.
     // Uniform across the grid and resolved once here, so the k-loop below is
     // branchless and identical in shape for both conventions.
@@ -2135,15 +2282,19 @@ __device__ void grouped_matmul_impl_int8(
     const int tid = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
     const int warp_id = tid / WARP_SIZE_TC;
     const int lane = tid % WARP_SIZE_TC;
-    const int row0 = row_tile_idx * N_TILE;
+    const int row0 = row_tile_idx * N_TILE * RN;
     if (row0 >= nrows || b_cnt <= 0) return;
 
-    const int warp_row_base = row0 + warp_id * 8;
+    const int warp_row_base = row0 + warp_id * 8 * RN;
+    // Whether this warp's rows exist. Warp-uniform; always true for RN = 1, where a row tile
+    // is the 32-row granule itself.
+    const bool warp_live = RN == 1 || warp_row_base < nrows;
     const int tiles_per_row = ncols / K_TILE;  // block_q8a128 tiles per activation row
 
-    // N_SUB m16 token sub-tiles per block: frag_c[t*4 .. t*4+3] = tokens [t*16, t*16+16).
-    // The weight (and its dequant) is shared across them — dequanted once per k_blk, reused.
-    float frag_c[4 * N_SUB] = {};
+    // N_SUB m16 token sub-tiles × RN 8-row chunks per warp: frag_c[(t*RN + r)*4 .. +3] = tokens
+    // [t*16, t*16+16) × rows [8r, 8r+8) of the warp's. The weight (and its dequant) is shared
+    // across the sub-tiles — dequanted once per k_blk, reused.
+    float frag_c[4 * N_SUB * RN] = {};
     const int k_begin = k_lo;
     const int k_blocks = k_hi < 0 ? ncols / K_TILE : k_hi;
 
@@ -2170,9 +2321,10 @@ __device__ void grouped_matmul_impl_int8(
     constexpr int AHEAD = (ABUF == 2) ? STAGES - 1 : 1;
     constexpr int WRING = AHEAD;
     constexpr int CB = int8_chunk_bytes<block_c_t>::value;   // one 8-row chunk
-    uint8_t* warp_ring = smem_W_flat + warp_id * WRING * CB;
+    constexpr int SLOT = RN * CB;                             // a warp's chunks of one K tile
+    uint8_t* warp_ring = smem_W_flat + warp_id * WRING * SLOT;
     // Tile `t`'s weight slot and activation buffer, counted from this block's first tile.
-    auto w_slot = [&](int t) { return warp_ring + ((t - k_begin) % WRING) * CB; };
+    auto w_slot = [&](int t) { return warp_ring + ((t - k_begin) % WRING) * SLOT; };
     auto a_buf = [&](int t) { return (ABUF == 1) ? 0 : (t - k_begin) % STAGES; };
 
     // Prologue: the first AHEAD tiles — weight chunk + activation tile, one cp.async group each.
@@ -2182,7 +2334,9 @@ __device__ void grouped_matmul_impl_int8(
     for (int s = 0; s < AHEAD; ++s) {
         const int t = k_begin + s;
         if (t < k_blocks) {
-            load_warp_chunk_int8<block_c_t>(w_slot(t), weights, t, warp_row_base, nrows, lane);
+            if (warp_live) {
+                load_warp_chunk_int8<block_c_t, RN>(w_slot(t), weights, t, warp_row_base, nrows, lane);
+            }
             load_act_tile<N_SUB, ACT_SILU>(act, act_f32, act_f32_stride, b_start, b_cnt, t,
                                            tiles_per_row, tid, sum_norm,
                                            smem_A_i8[a_buf(t)], smem_A_ds[a_buf(t)]);
@@ -2196,43 +2350,54 @@ __device__ void grouped_matmul_impl_int8(
         uint8_t* my_slot = w_slot(k_blk);
         cp_async_wait_group<AHEAD - 1>(); // tile k_blk (weight + activation) resident
 
-        // Inline scales + up-front dequant: read this warp's chunk into registers. Intra-warp
+        // Inline scales + up-front dequant: read this warp's chunks into registers. Intra-warp
         // (no barrier needed); frees the weight slot for the next prefetch. This thread owns
-        // fold rows (threadID*2, threadID*2+1). Affine formats read the per-128 (scale,min)
-        // pair from blk.dm[row]; MXFP4 reads the four per-sub E8M0 scales per fold row
-        // instead (its per-sub fold below never touches dm).
-        const block_c_t* blk = reinterpret_cast<const block_c_t*>(my_slot);
+        // fold rows (threadID*2, threadID*2+1) of each chunk. Affine formats read the per-128
+        // (scale,min) pair from blk.dm[row]; MXFP4 reads the four per-sub E8M0 scales per fold
+        // row instead (its per-sub fold below never touches dm).
         const int rl = threadID * 2;
-        float2 d0 = make_float2(0.f, 0.f); // (d, m) row rl   — affine fold only
-        float2 d1 = make_float2(0.f, 0.f); // (d, m) row rl+1 — affine fold only
-        float f0[4], f1[4];                // per-sub scales  — mxfp4 fold only
-        if constexpr (is_mxfp4_persub<block_c_t>::value) {
-            gemx_dequant_traits<block_c_t, half, half>::load_sub_scales(my_slot, rl, f0, f1);
-        } else {
-            // dm[rl] and dm[rl+1] are adjacent half2 (8 B, rl*4 is 8-aligned) → ONE int2 LDS.64.
-            const int2 dd = *reinterpret_cast<const int2*>(&blk->dm[rl]);
-            d0 = __half22float2(*reinterpret_cast<const half2*>(&dd.x));
-            d1 = __half22float2(*reinterpret_cast<const half2*>(&dd.y));
-            f0[0] = 0.f; f0[1] = 0.f; f0[2] = 0.f; f0[3] = 0.f;
-            f1[0] = 0.f; f1[1] = 0.f; f1[2] = 0.f; f1[3] = 0.f;
-        }
+        float2 d0[RN];                     // (d, m) row rl   — affine fold only
+        float2 d1[RN];                     // (d, m) row rl+1 — affine fold only
+        float f0[RN][4], f1[RN][4];        // per-sub scales  — mxfp4 fold only
         // Lane-major dequant: this lane's 4 subs are stored contiguously, so each stream is
         // pulled in ONE wide LDS (ql int4, plus crumb/hi for Q5/Q6, or 2 int4 for Q8) instead
         // of 4 per-sub loads — fewer MIO instructions, still bank-conflict-free.
-        uint32_t b_frags[4][2];
-        gemx_dequant_traits<block_c_t, half, half>::dequant_all_subs_int8(my_slot, lane, b_frags);
+        uint32_t b_frags[RN][4][2];
+        if (warp_live) {
+            #pragma unroll
+            for (int r = 0; r < RN; ++r) {
+                const uint8_t* chunk = my_slot + r * CB;
+                const block_c_t* blk = reinterpret_cast<const block_c_t*>(chunk);
+                d0[r] = make_float2(0.f, 0.f);
+                d1[r] = make_float2(0.f, 0.f);
+                if constexpr (is_mxfp4_persub<block_c_t>::value) {
+                    gemx_dequant_traits<block_c_t, half, half>::load_sub_scales(chunk, rl, f0[r], f1[r]);
+                } else {
+                    // dm[rl] and dm[rl+1] are adjacent half2 (8 B, rl*4 is 8-aligned) → ONE
+                    // int2 LDS.64.
+                    const int2 dd = *reinterpret_cast<const int2*>(&blk->dm[rl]);
+                    d0[r] = __half22float2(*reinterpret_cast<const half2*>(&dd.x));
+                    d1[r] = __half22float2(*reinterpret_cast<const half2*>(&dd.y));
+                    f0[r][0] = 0.f; f0[r][1] = 0.f; f0[r][2] = 0.f; f0[r][3] = 0.f;
+                    f1[r][0] = 0.f; f1[r][1] = 0.f; f1[r][2] = 0.f; f1[r][3] = 0.f;
+                }
+                gemx_dequant_traits<block_c_t, half, half>::dequant_all_subs_int8(chunk, lane, b_frags[r]);
+            }
+        }
 
         __syncthreads();  // RAW: tile k activation visible to all warps; also guarantees tile
                           // k-1's MMA (which read the buffer the prefetch below fills) finished.
 
         if constexpr (ABUF == 2) {
-            // Prefetch tile k+AHEAD: its weight chunk lands in the slot the dequant above just
+            // Prefetch tile k+AHEAD: its weight chunks land in the slot the dequant above just
             // drained (the ring is AHEAD long, so tile k+AHEAD maps to tile k's slot) and its
             // activation in the buffer tile k-1's MMA released, ONE cp.async group. Both overlap
             // the MMA below, which reads only registers and buffer `ab`.
             const int next = k_blk + AHEAD;
             if (next < k_blocks) {
-                load_warp_chunk_int8<block_c_t>(w_slot(next), weights, next, warp_row_base, nrows, lane);
+                if (warp_live) {
+                    load_warp_chunk_int8<block_c_t, RN>(w_slot(next), weights, next, warp_row_base, nrows, lane);
+                }
                 load_act_tile<N_SUB, ACT_SILU>(act, act_f32, act_f32_stride, b_start, b_cnt,
                                                next, tiles_per_row, tid, sum_norm,
                                                smem_A_i8[a_buf(next)], smem_A_ds[a_buf(next)]);
@@ -2243,82 +2408,112 @@ __device__ void grouped_matmul_impl_int8(
             // Single buffer: only the weight prefetch overlaps the MMA (its slot is already
             // free). The activation reload waits for the WAR barrier after the sub-tile loop.
             if (k_blk + 1 < k_blocks) {
-                load_warp_chunk_int8<block_c_t>(my_slot, weights, k_blk + 1, warp_row_base, nrows, lane);
+                if (warp_live) {
+                    load_warp_chunk_int8<block_c_t, RN>(my_slot, weights, k_blk + 1, warp_row_base, nrows, lane);
+                }
                 cp_async_commit();
             }
         }
 
         // Per token sub-tile. The dequanted weight (b_frags + scales) is REUSED across all
         // N_SUB sub-tiles — that's the mode-2 win (one weight dequant amortized over
-        // N_SUB·16 tokens). Each sub-tile t has its own activation (smem at t*16) and
-        // output frag_c[t*4..].
-        #pragma unroll
-        for (int t = 0; t < N_SUB; ++t) {
-            const float2 a0 = __half22float2(smem_A_ds[ab][t * 16 + groupID]);      // token-half A
-            const float2 a1 = __half22float2(smem_A_ds[ab][t * 16 + groupID + 8]);  // token-half B
-            // Rebuild Σx from the stored field, whichever convention wrote it
-            // (blocks.cuh). `sum_a`/`sum_b` are hoisted from the operand's
-            // `SumScale` before the k-loop, so this is one FMA + one multiply
-            // either way — no branch in the inner loop, and no second kernel:
-            //   raw    (0, 1): fmaf(a.x, 0, 1) = 1     → a.y, the stored Σx, EXACTLY
-            //   by-amax(127,0): fmaf(a.x, 127, 0)      → a.y · amax = Σx
-            // The raw arm is bit-identical to reading `a.y` directly, because
-            // multiplying by an exact 1.0f is exact in IEEE.
-            const float a0_sum = a0.y * fmaf(a0.x, sum_a, sum_b);
-            const float a1_sum = a1.y * fmaf(a1.x, sum_a, sum_b);
-            if constexpr (is_mxfp4_persub<block_c_t>::value) {
-                // PER-SUB fold: each 32-K sub's exact int32 sum scaled by its own
-                // E8M0 `2^(e_sub-128)` (the activation scale is per-128, so it is
-                // constant across the four subs). One reusable accumulator — the
-                // fold drains it before the next sub's MMA, so this branch holds
-                // no more registers live than the affine one. MXFP4 is centred
-                // (m = 0): no activation-sum term.
-                #pragma unroll
-                for (int sub = 0; sub < 4; ++sub) {
-                    uint32_t af[4];
-                    fused_attn::load_a_frag_m16k32_ldmatrix(af, &smem_A_i8[ab][t * 16][sub * 32], KI8_STRIDE, lane);
-                    int32_t C[4] = {0, 0, 0, 0};
-                    fused_attn::mma_int8_m16n8k32(C, af, b_frags[sub], C);
-                    frag_c[t * 4 + 0] += (f0[sub] * a0.x) * (float)C[0];
-                    frag_c[t * 4 + 1] += (f1[sub] * a0.x) * (float)C[1];
-                    frag_c[t * 4 + 2] += (f0[sub] * a1.x) * (float)C[2];
-                    frag_c[t * 4 + 3] += (f1[sub] * a1.x) * (float)C[3];
+        // N_SUB·16 tokens) — and each A fragment across the warp's RN chunks. Each sub-tile t
+        // has its own activation (smem at t*16) and outputs frag_c[(t*RN + r)*4..].
+        //
+        // A sub-tile holding no live token is skipped: its rows are the loader's
+        // zero fill and nothing below ever stores them, so the result is the
+        // same bits without its ldmatrix and MMA work. `b_cnt` is block-uniform,
+        // so the guard costs no divergence, and `t` stays a compile-time index.
+        // A wide prefill tile (Bm 128 over ~80 rows an expert) is a third
+        // padding.
+        if (warp_live) {
+            #pragma unroll
+            for (int t = 0; t < N_SUB; ++t) {
+                if (t * 16 >= b_cnt) continue;
+                const float2 a0 = __half22float2(smem_A_ds[ab][t * 16 + groupID]);      // token-half A
+                const float2 a1 = __half22float2(smem_A_ds[ab][t * 16 + groupID + 8]);  // token-half B
+                if constexpr (is_mxfp4_persub<block_c_t>::value) {
+                    // PER-SUB fold: each 32-K sub's exact int32 sum scaled by its own
+                    // E8M0 `2^(e_sub-128)` (the activation scale is per-128, so it is
+                    // constant across the four subs). One reusable accumulator per chunk —
+                    // the fold drains it straight after its MMA. MXFP4 is centred (m = 0): no
+                    // activation-sum term.
+                    #pragma unroll
+                    for (int sub = 0; sub < 4; ++sub) {
+                        uint32_t af[4];
+                        fused_attn::load_a_frag_m16k32_ldmatrix(af, &smem_A_i8[ab][t * 16][sub * 32], KI8_STRIDE, lane);
+                        #pragma unroll
+                        for (int r = 0; r < RN; ++r) {
+                            float* acc = &frag_c[(t * RN + r) * 4];
+                            int32_t C[4] = {0, 0, 0, 0};
+                            fused_attn::mma_int8_m16n8k32(C, af, b_frags[r][sub], C);
+                            acc[0] += (f0[r][sub] * a0.x) * (float)C[0];
+                            acc[1] += (f1[r][sub] * a0.x) * (float)C[1];
+                            acc[2] += (f0[r][sub] * a1.x) * (float)C[2];
+                            acc[3] += (f1[r][sub] * a1.x) * (float)C[3];
+                        }
+                    }
+                } else {
+                    // Affine per-128 fold: the tile's four MMAs over paired K segments
+                    // (`kseg_lo`) sum into one int32 per chunk, and the (d, m) pair folds once
+                    // over it. Consecutive MMAs go to different chunks, so with RN ≥ 2 they are
+                    // independent; a lone chunk splits its MMAs over two accumulators instead.
+                    constexpr int NACC = RN == 1 ? 2 : 1;
+                    int32_t C[RN][NACC][4];
+                    #pragma unroll
+                    for (int r = 0; r < RN; ++r) {
+                        #pragma unroll
+                        for (int j = 0; j < NACC; ++j) {
+                            #pragma unroll
+                            for (int i = 0; i < 4; ++i) C[r][j][i] = 0;
+                        }
+                    }
+                    #pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        uint32_t af[4];
+                        load_a_frag_kseg(af, &smem_A_i8[ab][t * 16][0], kseg_lo(q), kseg_lo(q) + 32,
+                                         lane);
+                        const int s = (q & 1) * 2;   // the pair's first sub
+                        const int h = q >> 1;        // which half of each sub
+                        #pragma unroll
+                        for (int r = 0; r < RN; ++r) {
+                            const uint32_t bq[2] = {b_frags[r][s][h], b_frags[r][s + 1][h]};
+                            fused_attn::mma_int8_m16n8k32(C[r][q % NACC], af, bq, C[r][q % NACC]);
+                        }
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < RN; ++r) {
+                        if constexpr (NACC == 2) {
+                            #pragma unroll
+                            for (int i = 0; i < 4; ++i) C[r][0][i] += C[r][1][i];
+                        }
+                        // `sum_a`/`sum_b` are hoisted from the operand's `SumScale` before the
+                        // k-loop, so the Σx rebuild inside is one FMA + one multiply either way
+                        // — no branch in the inner loop, and no second kernel.
+                        ko_affine_fold(&frag_c[(t * RN + r) * 4], C[r][0], d0[r], d1[r], a0, a1,
+                                       sum_a, sum_b);
+                    }
                 }
-            } else {
-                // Affine per-128 fold: two accumulators break the C-dependency
-                // chain per sub-tile; the (d, m) pair folds once over the summed
-                // subs.
-                int32_t C0[4] = {0, 0, 0, 0};
-                int32_t C1[4] = {0, 0, 0, 0};
-                #pragma unroll
-                for (int sub = 0; sub < 4; sub += 2) {
-                    uint32_t a0f[4], a1f[4];
-                    fused_attn::load_a_frag_m16k32_ldmatrix(a0f, &smem_A_i8[ab][t * 16][sub * 32], KI8_STRIDE, lane);
-                    fused_attn::load_a_frag_m16k32_ldmatrix(a1f, &smem_A_i8[ab][t * 16][(sub + 1) * 32], KI8_STRIDE, lane);
-                    fused_attn::mma_int8_m16n8k32(C0, a0f, b_frags[sub], C0);
-                    fused_attn::mma_int8_m16n8k32(C1, a1f, b_frags[sub + 1], C1);
-                }
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) C0[i] += C1[i];
-                frag_c[t * 4 + 0] += d0.x * a0.x * (float)C0[0] + d0.y * a0_sum;
-                frag_c[t * 4 + 1] += d1.x * a0.x * (float)C0[1] + d1.y * a0_sum;
-                frag_c[t * 4 + 2] += d0.x * a1.x * (float)C0[2] + d0.y * a1_sum;
-                frag_c[t * 4 + 3] += d1.x * a1.x * (float)C0[3] + d1.y * a1_sum;
             }
         }
 
         if constexpr (TILE_PARTIALS) {
             // This tile's fold to its own slot, and the accumulator restarts at zero.
             float* slot = partial + (size_t)k_blk * partial_stride;
-            #pragma unroll
-            for (int t = 0; t < N_SUB; ++t) {
-                const int rem = b_cnt - t * 16;
-                const int cnt = rem < 0 ? 0 : (rem > 16 ? 16 : rem);
-                store_tile_output<float>(slot, &frag_c[t * 4], dst_stride, warp_row_base,
-                                         b_start + t * 16, cnt, lane);
+            if (warp_live) {
+                #pragma unroll
+                for (int t = 0; t < N_SUB; ++t) {
+                    const int rem = b_cnt - t * 16;
+                    const int cnt = rem < 0 ? 0 : (rem > 16 ? 16 : rem);
+                    #pragma unroll
+                    for (int r = 0; r < RN; ++r) {
+                        store_tile_output<float>(slot, &frag_c[(t * RN + r) * 4], dst_stride,
+                                                 warp_row_base + 8 * r, b_start + t * 16, cnt, lane);
+                    }
+                }
             }
             #pragma unroll
-            for (int i = 0; i < 4 * N_SUB; ++i) frag_c[i] = 0.f;
+            for (int i = 0; i < 4 * N_SUB * RN; ++i) frag_c[i] = 0.f;
         }
 
         if constexpr (ABUF == 1) {
@@ -2333,25 +2528,31 @@ __device__ void grouped_matmul_impl_int8(
         }
     }
 
-    // One store per sub-tile: tile t → tokens [b_start+t*16, +16). store_tile_output
-    // clamps via the token count, so partial/empty tiles write nothing. A split-K
-    // block has stored its per-tile partials already; the entry finishes the reduction.
+    // One store per (sub-tile, chunk): tile t → tokens [b_start+t*16, +16) of chunk r's rows.
+    // store_tile_output clamps via the token count, so partial/empty tiles write nothing. A
+    // split-K block has stored its per-tile partials already; the entry finishes the reduction.
     if constexpr (!TILE_PARTIALS) {
-        #pragma unroll
-        for (int t = 0; t < N_SUB; ++t) {
-            const int rem = b_cnt - t * 16;
-            const int cnt = rem < 0 ? 0 : (rem > 16 ? 16 : rem);
-            store_tile_output<output_t>(dst, &frag_c[t * 4], dst_stride, warp_row_base,
-                                        b_start + t * 16, cnt, lane);
+        if (warp_live) {
+            #pragma unroll
+            for (int t = 0; t < N_SUB; ++t) {
+                const int rem = b_cnt - t * 16;
+                const int cnt = rem < 0 ? 0 : (rem > 16 ? 16 : rem);
+                #pragma unroll
+                for (int r = 0; r < RN; ++r) {
+                    store_tile_output<output_t>(dst, &frag_c[(t * RN + r) * 4], dst_stride,
+                                                warp_row_base + 8 * r, b_start + t * 16, cnt, lane);
+                }
+            }
         }
     }
 }
 
 // INT8 dense entry (regular non-MoE QMatMul): one weight, implicit tile schedule —
-// blockIdx.x → the ≤16-token batch slice, blockIdx.y → the 32-row tile. Launched
+// blockIdx.x → the 16·N_SUB-token batch slice, blockIdx.y → the 32·RN-row tile. Launched
 // from run_quantized_matmul on ytype==3. Each row folds K tile by tile in order, the
-// same chain whatever the batch width, and the split-K reducer reproduces it bit for bit.
-template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1>
+// same chain whatever the batch width or tile shape, and the split-K reducer reproduces it
+// bit for bit.
+template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1, int RN = 1>
 static __device__ void quantized_matmul_dense_entry_int8(
     const block_compact_t<block_q_t>* __restrict__ weights,
     const block_q8a128* __restrict__ act,
@@ -2368,7 +2569,7 @@ static __device__ void quantized_matmul_dense_entry_int8(
 
     __shared__ __align__(16) int8_t smem_A_i8[2][BATCH][KI8_STRIDE];   // double-buffered
     __shared__ __align__(16) half2 smem_A_ds[2][BATCH];
-    __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RING_I8 * int8_chunk_bytes<block_compact_t<block_q_t>>::value];
+    __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RN * RING_I8 * int8_chunk_bytes<block_compact_t<block_q_t>>::value];
 
     // The int8 impl is KO-only (inline-scale k1024 chunks). Only instantiate it for KO; for
     // any non-KO type the call is discarded so the kernel is a no-op (never dispatched to).
@@ -2381,19 +2582,21 @@ static __device__ void quantized_matmul_dense_entry_int8(
         {
             constexpr int CB = int8_chunk_bytes<block_compact_t<block_q_t>>::value;
             constexpr int PREFETCH_TILES = 4;
-            const int row0 = row_tile_idx * N_TILE;
+            const int row0 = row_tile_idx * N_TILE * RN;
             const int t_id = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
             const int k_tiles = ncols_x / K_TILE;
             if (row0 < nrows_x) {
+                // The tile's rows that exist: the last row tile may overhang N.
+                const int rows = min(N_TILE * RN, nrows_x - row0);
                 for (int t = 0; t < k_tiles && t < PREFETCH_TILES; ++t) {
                     pdl_prefetch_l2(&weights[(int64_t)t * (nrows_x / 8) + row0 / 8],
-                                    (N_TILE / 8) * CB, t_id, 4 * WARP_SIZE_TC);
+                                    (rows / 8) * CB, t_id, 4 * WARP_SIZE_TC);
                 }
             }
             pdl_launch_dependents();
             pdl_wait();
         }
-        grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
+        grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB, 2, false, false, RN>(
             weights, act, dst, ncols_x, nrows_x, y_stride, dst_stride,
             b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
     }
@@ -2649,6 +2852,58 @@ static __device__ void quantized_matmul_dense_splitk_entry_int8(
     }
 }
 
+// Piece `c` of read-ahead item `a` (`moe_read_ahead.cuh`): the item's bytes
+// `[c · piece, min(bytes, (c + 1) · piece))` from its warm-slot image into its
+// claimed slot, every thread four 16-byte loads in flight, then their stores.
+// Each thread fences its own stores before the block counts the piece done, so
+// the worker that counts an item's last piece publishes an expert whose every
+// byte is written; it stores the owner tag, up, down, a system fence, then
+// gate. Called by every thread of the block.
+static __device__ void moe_live_ahead_piece(const MoeLive& live, int a, int c, int tid) {
+    const unsigned long long* item = live.ahead + 1 + (size_t)a * AHEAD_ITEM_WORDS;
+    const unsigned long long bytes = item[2];
+    const unsigned long long piece = ahead_piece_bytes(bytes);
+    const unsigned long long lo = (unsigned long long)c * piece;
+    const unsigned long long hi = lo + piece < bytes ? lo + piece : bytes;
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(item[0]));
+    uint8_t* dst = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(item[1]));
+    const long long units = lo < hi ? (long long)((hi - lo) / 16ull) : 0ll;
+    for (long long b = tid; b < units; b += NUM_THREADS * 4) {
+        uint4 v[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const long long idx = b + (long long)u * NUM_THREADS;
+            if (idx < units) {
+                v[u] = moe_live_ld16(src + lo + (size_t)idx * 16);
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const long long idx = b + (long long)u * NUM_THREADS;
+            if (idx < units) {
+                *reinterpret_cast<uint4*>(dst + lo + (size_t)idx * 16) = v[u];
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0 && atomicAdd(&live.ahead_done[a], 1u) == AHEAD_CHUNKS - 1u) {
+        __threadfence();
+        if (item[9] != 0ull) {
+            *reinterpret_cast<volatile unsigned int*>(static_cast<uintptr_t>(item[9])) =
+                (unsigned int)item[10];
+        }
+        *reinterpret_cast<volatile unsigned long long*>(static_cast<uintptr_t>(item[4])) = item[7];
+        *reinterpret_cast<volatile unsigned long long*>(static_cast<uintptr_t>(item[5])) = item[8];
+        __threadfence_system();
+        *reinterpret_cast<volatile unsigned long long*>(static_cast<uintptr_t>(item[3])) = item[6];
+        if (live.stall != nullptr) {
+            atomicAdd(&live.stall[5], 1ull);
+            atomicAdd(&live.stall[6], bytes);
+        }
+    }
+}
+
 // A worker of a live launch (see "A live expert table" above): items
 // `(remote expert r, row tile j)` off the launch's counter until none are left.
 // Per item: the expert's entry (waited for while cold); the row tile's slice
@@ -2683,6 +2938,8 @@ static __device__ void moe_live_worker(
     const int row_tiles = nrows_x / N_TILE;
     const int units = (ncols_x / K_TILE) * UNITS_PER_PIECE;
     const int n_items = live.header[3] * row_tiles;
+    // The launch's own items, then the read-ahead pieces.
+    const int n_all = n_items + (live.ahead != nullptr ? (int)live.ahead[0] * AHEAD_CHUNKS : 0);
     uint8_t* slot = live.scratch + (size_t)worker * live.slot_bytes;
     if (live.stall != nullptr && worker == 0 && tid == 0) {
         atomicAdd(&live.stall[4], 1ull);
@@ -2693,8 +2950,14 @@ static __device__ void moe_live_worker(
         }
         __syncthreads();
         const int it = s_item;
-        if (it >= n_items) {
+        if (it >= n_all) {
             return;
+        }
+        if (it >= n_items) {
+            // Read-ahead pieces never wait on a cold expert, so a fault does not
+            // touch them: each publishes an expert its own copy completes.
+            moe_live_ahead_piece(live, (it - n_items) / AHEAD_CHUNKS, (it - n_items) % AHEAD_CHUNKS, tid);
+            continue;
         }
         const int r = it / row_tiles;
         const int j = it - r * row_tiles;
@@ -2710,6 +2973,10 @@ static __device__ void moe_live_worker(
             }
         }
         __syncthreads();
+        // The wait gave the expert up (the fault word names it): skip the item.
+        if (s_src == 0ull) {
+            continue;
+        }
         const uint8_t* src = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(s_src));
         // A promotion slot is the copy's ONLY destination: the slice lands at its
         // place in the slot image — the source's own layout — and the tile is
@@ -2722,12 +2989,14 @@ static __device__ void moe_live_worker(
                              ? nullptr
                              : reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(promo_base + live.dst_offset));
         const unsigned long long t_copy = moe_live_now();
-        // The mini loop: every thread four 16-byte loads in flight, then their stores.
-        for (int b = tid; b < units; b += NUM_THREADS * 4) {
-            uint4 v[4];
-            size_t at[4];
+        // The mini loop: every thread `MOE_LIVE_LOADS` 16-byte loads in flight, then
+        // their stores. A slice is a few PCIe round trips, so loads in flight per
+        // round trip are what the worker's rate is.
+        for (int b = tid; b < units; b += NUM_THREADS * MOE_LIVE_LOADS) {
+            uint4 v[MOE_LIVE_LOADS];
+            size_t at[MOE_LIVE_LOADS];
             #pragma unroll
-            for (int u = 0; u < 4; ++u) {
+            for (int u = 0; u < MOE_LIVE_LOADS; ++u) {
                 const int idx = b + u * NUM_THREADS;
                 if (idx < units) {
                     const int k = idx / UNITS_PER_PIECE;
@@ -2737,7 +3006,7 @@ static __device__ void moe_live_worker(
                 }
             }
             #pragma unroll
-            for (int u = 0; u < 4; ++u) {
+            for (int u = 0; u < MOE_LIVE_LOADS; ++u) {
                 const int idx = b + u * NUM_THREADS;
                 if (idx < units) {
                     if (promo != nullptr) {
@@ -2797,7 +3066,12 @@ static __device__ void moe_live_worker(
 // Both orders run the same blocks with the same per-block work — the choice only
 // changes schedule order, so outputs are bit-identical. The host picks per launch
 // from the activation working set vs L2 (see grouped_grid_row_fast in cuda.rs).
-template <int qk, int qi, typename block_q_t, int vdr, typename act_t, typename output_t, int N_SUB = 1>
+//
+// RN (int8 only) sets the row tile to 32·RN rows — the host sizes the row-tile axis to match
+// (run_grouped_quantized_matmul). A live launch's workers keep the 32-row slices their scratch
+// slots hold, and run the RN = 1 impl over them; the bits are the same either way.
+template <int qk, int qi, typename block_q_t, int vdr, typename act_t, typename output_t, int N_SUB = 1,
+          int RN = 1>
 static __device__ void quantized_matmul_grouped_entry(
     const uint64_t* __restrict__ weight_ptrs,  // [num_experts] device weight pointers
     const int* __restrict__ tile_expert,       // [total_tiles] owning expert
@@ -2829,7 +3103,7 @@ static __device__ void quantized_matmul_grouped_entry(
         constexpr int ABUF = (N_SUB >= 8) ? 1 : 2;
         __shared__ __align__(16) int8_t smem_A_i8[ABUF][BATCH_I8][KI8_STRIDE];
         __shared__ __align__(16) half2 smem_A_ds[ABUF][BATCH_I8];
-        __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RING_I8 * int8_chunk_bytes<block_c_t>::value];
+        __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RN * RING_I8 * int8_chunk_bytes<block_c_t>::value];
         int tile;
         int row_tile_idx;
         if (live.abort != nullptr) {
@@ -2868,7 +3142,7 @@ static __device__ void quantized_matmul_grouped_entry(
         const int b_start = tile_b_start[tile];
         // KO-only int8 impl (inline-scale k1024). Non-KO → discarded (no-op kernel).
         if constexpr (is_scale_separate<block_c_t>::value) {
-            grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
+            grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB, 2, false, false, RN>(
                 weights, vy, dst, ncols_x, nrows_x, y_stride, dst_stride,
                 b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat, sum_norm);
         }
@@ -2899,6 +3173,9 @@ static __device__ void quantized_matmul_grouped_entry(
 }
 
 } // namespace grouped_tc
+
+// The decode-width dense entry that walks K across the warps of one block (grouped_tc).
+#include "dense_narrow.cuh"
 
 // =============================================================================
 // SN_TC: TENSOR CORE KERNEL FOR BATCH 5-15 (RUNTIME PADDED MMA)

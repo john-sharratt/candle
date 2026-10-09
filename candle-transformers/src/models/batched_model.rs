@@ -45,7 +45,7 @@ use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
     begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, ModelGeometry,
-    WavePlan, WaveWidth,
+    PrefillKvStageLayout, PrefillLaunchBounds, WavePlan, WaveWidth,
 };
 use candle_nn::Module;
 
@@ -362,8 +362,34 @@ pub trait BatchedModelCore {
         None
     }
 
+    /// The expert cache's `(hits, misses)` tallies so far, unsettled
+    /// (`ExpertCache::hit_counts`) — the per-step read, where
+    /// [`Self::expert_stats`] waits for the pipeline thread.
+    fn expert_hit_counts(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// The expert cache's residency references over the interval the counters
+    /// cover, `(lru, min)` (`ExpertCache::hit_references`), if this model has
+    /// one.
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        None
+    }
+
+    /// Fail the segment just swept if the expert cache's workers gave a cold
+    /// expert up (`WaveSweep::take_device_fault`, through
+    /// `ExpertCache::take_segment_fault`, which waits for the device only when
+    /// the cache can fault); `Ok` for a model without one, which has nothing the
+    /// device can give up. Required, so a model gaining an expert cache states
+    /// it.
+    fn take_device_fault(&self) -> Result<()>;
+
     /// The wave transient tier a prefill of `rows` rows across `sequences`
-    /// would need, in bytes.
+    /// would need, in bytes, with its attention launch carving the pre-stage,
+    /// carry and resume table of chunks of `stage_q_lens` rows at
+    /// `stage_offsets` (`candle_nn::kv_cache::PrefillKvStageLayout` — the one
+    /// quantity in the tier that follows context depth rather than width, up
+    /// to its key-chunk bound).
     ///
     /// **The same function the tier is actually placed from**, not an estimate
     /// of it: admission judges an offer on the residency it dislodges, and the
@@ -373,7 +399,14 @@ pub trait BatchedModelCore {
     ///
     /// `None` for a model that cannot price a wave — the caller then charges no
     /// tier, which is what it did before this existed.
-    fn wave_tier_bytes(&self, _rows: usize, _sequences: usize, _act_dtype: DType) -> Option<u64> {
+    fn wave_tier_bytes(
+        &self,
+        _rows: usize,
+        _sequences: usize,
+        _stage_q_lens: &[usize],
+        _stage_offsets: &[usize],
+        _act_dtype: DType,
+    ) -> Option<u64> {
         None
     }
 
@@ -858,7 +891,8 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             let rows = n_decode + pre_rows + glue_rows;
             if rows > 0 {
                 if let Device::Cuda(d) = self.model.device() {
-                    let plan = WavePlan::new(self.model.wave_geometry(embed_dtype));
+                    let geometry = self.model.wave_geometry(embed_dtype);
+                    let plan = WavePlan::new(geometry);
                     // The plan prices all three phases from the wave's
                     // composition, the forward one included — it knows what the
                     // head's logits cost because the geometry carries `vocab`.
@@ -887,6 +921,17 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                         accept_rows: if accept_in_place { scored_rows } else { 0 },
                         // This stack's attention is dense: no sparse selection.
                         qsa_bytes: 0,
+                        // The prefill launch's carve: up to one key chunk of
+                        // each bulk chunk's sequence, and the carry beside it.
+                        // Glue rows take their own kernel, which stages nothing.
+                        kv_stage: PrefillKvStageLayout::new(
+                            pre_q,
+                            pre_off,
+                            geometry.n_head,
+                            geometry.n_kv_head,
+                            geometry.head_dim,
+                            PrefillLaunchBounds::PRODUCTION,
+                        ),
                     };
                     let per_phase = [
                         plan.phase_bytes(LayerPhase::Attention, width),
@@ -1136,11 +1181,10 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             // Measured on the RTX 3090: as one segment, decode ran 5–9% under
             // eager (Llama-3.2-3B F16×1 150.5 against 165.2 t/s); a segment a
             // layer ran above it (178.5), and one every two layers the same or
-            // slightly under. A layer whose MoE ends its own segment needs no
-            // second cut — Qwen3-30B-A3B lost 3–6% of decode to one.
-            if !self.model.layer(layer_idx).ends_a_segment() {
-                dev.flush_launches()?;
-            }
+            // slightly under. An MoE layer is cut the same way: its dispatch
+            // flushes only on `expert_lre::flush_schedule`'s doubling cadence,
+            // which was measured for Flash-Next's own sweep, not this one.
+            dev.flush_launches()?;
         }
 
         // A window that stops short hands its residual to a later forward, past

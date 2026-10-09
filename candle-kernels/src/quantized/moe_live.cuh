@@ -9,6 +9,10 @@ struct MoeLive {
     // Mapped host word the host sets non-zero when a cold expert can never be
     // published; null for every launch that is not live.
     const unsigned int* abort;
+    // Mapped host word the first worker whose wait ends without its expert
+    // claims (`kernel.cuh`, "A live expert table", for the bits); the host
+    // fails the forward on it.
+    unsigned long long* fault;
     // This projection's row of the live table (mapped host memory): where a
     // worker waits for a COLD expert. Every other expert's address comes from
     // the launch's `weight_ptrs`, `moe_bucketize`'s snapshot in VRAM.
@@ -30,7 +34,15 @@ struct MoeLive {
     unsigned long long dst_offset;
     // Profile build only: this row's counters (see `kernel.cuh`); null otherwise.
     unsigned long long* stall;
-    // Backstop below the display watchdog: a worker waiting longer traps.
+    // The gate launch only: `moe_bucketize`'s read-ahead items and their piece
+    // counters (`moe_read_ahead.cuh`) — copied and published by the workers
+    // after their own items. Null on the up and down launches.
+    const unsigned long long* ahead;
+    unsigned int* ahead_done;
+    // Backstop below the display watchdog: a worker waiting longer gives the
+    // expert up and claims the fault word.
     unsigned long long spin_limit_ns;
     int workers;
+    // The launch's MoE row, which a fault names.
+    int row;
 };

@@ -65,6 +65,8 @@ pub mod simd128;
 pub mod utils;
 mod warp_mirror;
 use half::{bf16, f16};
+#[cfg(feature = "cuda")]
+use int8_split_k::DensePlan;
 
 pub use k_quants::GgmlType;
 
@@ -2914,33 +2916,33 @@ impl QMatMul {
         cuda::dense_qmatmul(input, wptr, wdtype, nrows, wlen, out_dtype, &device)
     }
 
-    /// [`Self::forward_dynamic`] with the int8 path's K split forced to `splits` slices (`1` is
-    /// the unsplit kernel) rather than chosen by `q8a128_dense_k_splits` — what the projection
-    /// bench sweeps to tune that rule. Production calls [`Self::forward_dynamic`].
+    /// [`Self::forward_dynamic`] with the int8 path's launch forced to `plan` rather than chosen
+    /// by `q8a128_dense_plan` — what the projection bench sweeps to tune that rule. Every plan
+    /// produces the same bits. Production calls [`Self::forward_dynamic`].
     #[cfg(feature = "cuda")]
-    pub fn forward_dynamic_split_k<'w>(
+    pub fn forward_dynamic_plan<'w>(
         &self,
         input: cuda::DynamicTensor<'_, 'w>,
         out_dtype: crate::DType,
-        splits: usize,
+        plan: DensePlan,
     ) -> Result<LiveTensor<'w>> {
         let t = match self {
             Self::QTensor(t) => t,
-            _ => crate::bail!("forward_dynamic_split_k requires a QTensor weight"),
+            _ => crate::bail!("forward_dynamic_plan requires a QTensor weight"),
         };
         let cs = match &t.storage {
             QStorage::Cuda(cs) => cs,
-            _ => crate::bail!("forward_dynamic_split_k requires CUDA storage"),
+            _ => crate::bail!("forward_dynamic_plan requires CUDA storage"),
         };
         let device = cs.device().clone();
-        cuda::dense_qmatmul_with_splits(
+        cuda::dense_qmatmul_with_plan(
             input,
             cs.data_ptr(),
             t.dtype(),
             t.shape().dims()[0],
             cs.storage_size_in_bytes(),
             out_dtype,
-            Some(splits),
+            Some(plan),
             &device,
         )
     }

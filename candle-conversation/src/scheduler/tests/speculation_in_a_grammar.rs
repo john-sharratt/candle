@@ -16,6 +16,7 @@ use candle::{Device, Result};
 use candle_nn::kv_cache::ModelGeometry;
 use candle_transformers::models::batched_inference::WaveStep;
 use candle_transformers::models::verify_wave::VerifyPlan;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The blocks a [`ChainDrafter`] was asked to verify, in order.
 type Verified = Arc<Mutex<Vec<Vec<u32>>>>;
@@ -42,6 +43,12 @@ fn successor(t: u32) -> u32 {
 struct ChainDrafter {
     inner: DummyModel,
     verified: Verified,
+    /// The sequences the current step verifies — scored at every position. Any
+    /// other prefill member is a plain span and gets one row, after its last
+    /// token, as a real model's prefill does.
+    verifying: Arc<Mutex<Vec<usize>>>,
+    /// Whole-model forwards run, so a test can count what a step cost.
+    forwards: Arc<AtomicUsize>,
 }
 
 impl ChainDrafter {
@@ -79,15 +86,15 @@ impl ManagedBatchedModel for ChainDrafter {
         Ok(())
     }
 
-    /// One row per decode member and one per token of every prefill-slot
-    /// member — a verify block is scored at every position.
+    /// One row per decode member, one per token of a verifying member, and one
+    /// after the last token of a plain prefill span.
     #[allow(clippy::too_many_arguments)]
     fn forward_wave(
         &self,
         _session: &mut BatchedInferenceSession,
         _decode_seqs: &[usize],
         decode_inputs: &[Tensor],
-        _prefill_seqs: &[usize],
+        prefill_seqs: &[usize],
         prefill_inputs: &[Tensor],
         _glue_seqs: &[usize],
         _glue_inputs: &[Tensor],
@@ -95,15 +102,22 @@ impl ManagedBatchedModel for ChainDrafter {
         _layer_end: usize,
         _residual_in: Option<Tensor>,
     ) -> Result<WaveResult> {
+        self.forwards.fetch_add(1, Ordering::Relaxed);
         let mut rows = Vec::new();
         for t in decode_inputs {
             for id in Self::ids(t)? {
                 rows.push(self.row_after(id)?);
             }
         }
-        for t in prefill_inputs {
-            for id in Self::ids(t)? {
-                rows.push(self.row_after(id)?);
+        let verifying = self.verifying.lock().unwrap().clone();
+        for (seq, t) in prefill_seqs.iter().zip(prefill_inputs) {
+            let ids = Self::ids(t)?;
+            if verifying.contains(seq) {
+                for id in ids {
+                    rows.push(self.row_after(id)?);
+                }
+            } else if let Some(&last) = ids.last() {
+                rows.push(self.row_after(last)?);
             }
         }
         Ok(WaveResult::owned(WaveStep {
@@ -146,6 +160,7 @@ impl ManagedBatchedModel for ChainDrafter {
         _budget: usize,
     ) -> Result<Option<VerifyPlan>> {
         self.verified.lock().unwrap().extend(blocks.iter().cloned());
+        *self.verifying.lock().unwrap() = seqs.to_vec();
         let device = self.inner.device();
         Ok(Some(VerifyPlan {
             decode_seqs: plain.iter().map(|&(s, _)| s).collect(),
@@ -173,6 +188,7 @@ impl ManagedBatchedModel for ChainDrafter {
         blocks: &[Vec<u32>],
         logits: Vec<Tensor>,
     ) -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
+        self.verifying.lock().unwrap().clear();
         let (plain_rows, mut rest) = logits.split_at(plain.len());
         let mut per_block = Vec::with_capacity(blocks.len());
         for b in blocks {
@@ -218,6 +234,7 @@ struct Slot {
     scheduler: Scheduler,
     id: SequenceId,
     verified: Verified,
+    forwards: Arc<AtomicUsize>,
     /// The turn's event stream. Held so the slot's token sends succeed — a
     /// closed stream finishes the turn at its first token.
     _events: Receiver<TurnEvent>,
@@ -229,9 +246,12 @@ struct Slot {
 /// there before a decode step.
 fn decoding_slot(last: u32, in_think_span: bool) -> Slot {
     let verified = Arc::new(Mutex::new(Vec::new()));
+    let forwards = Arc::new(AtomicUsize::new(0));
     let model = ChainDrafter {
         inner: DummyModel::new(),
         verified: Arc::clone(&verified),
+        verifying: Arc::new(Mutex::new(Vec::new())),
+        forwards: Arc::clone(&forwards),
     };
     let (_tx, rx) = flume::bounded(16);
     let mut scheduler = Scheduler::new(
@@ -275,6 +295,7 @@ fn decoding_slot(last: u32, in_think_span: bool) -> Slot {
         scheduler,
         id,
         verified,
+        forwards,
         _events: events,
     }
 }
@@ -289,6 +310,7 @@ fn a_think_span_commits_every_drafted_token_it_accepts() {
         id: slot,
         verified,
         _events,
+        ..
     } = decoding_slot(110, true);
     scheduler.batch_decode_step();
 
@@ -317,6 +339,7 @@ fn free_decode_commits_every_drafted_token_it_accepts() {
         id: slot,
         verified,
         _events,
+        ..
     } = decoding_slot(110, false);
     scheduler.batch_decode_step();
 
@@ -336,6 +359,7 @@ fn a_think_span_block_ends_at_the_close_it_drops() {
         mut scheduler,
         id: slot,
         verified,
+        forwards,
         _events,
     } = decoding_slot(100, true);
     scheduler.batch_decode_step();
@@ -362,10 +386,45 @@ fn a_think_span_block_ends_at_the_close_it_drops() {
     assert!(state.pending_mask.is_none());
     assert!(!state.stencil.as_ref().unwrap().mid_free_span());
 
-    // The tree's closing tag is a one-token static: it rides the next decode,
-    // with no prefill of anything already written.
+    // **The tree's closing tag is a static run, and it costs one forward.** It
+    // is prefilled — nothing already written goes with it — and the token after
+    // it is sampled from that forward's own last row, rather than the tag riding
+    // a second, decode, forward that reads the same distribution.
+    let before = forwards.load(Ordering::Relaxed);
     scheduler.inject_stencil_prefills();
+    assert_eq!(
+        forwards.load(Ordering::Relaxed) - before,
+        1,
+        "the static run and the token after it share one forward"
+    );
+    let after_close = successor(THINK_CLOSE);
     let state = &scheduler.active_decodes[&slot];
-    assert_eq!(&state.generated_tokens[..], &[100u32, 101, THINK_CLOSE][..]);
-    assert_eq!(scheduler.session.sequence_offset(slot.0), Some(2));
+    assert_eq!(
+        &state.generated_tokens[..],
+        &[100u32, 101, THINK_CLOSE, after_close][..],
+        "the run, then the token sampled from the run's own row"
+    );
+    assert_eq!(
+        scheduler.session.sequence_offset(slot.0),
+        Some(3),
+        "the closing tag is written; the token after it is not yet"
+    );
+    assert_eq!(
+        state.pending_forward(),
+        &[after_close][..],
+        "only the sampled token waits to be forwarded"
+    );
+
+    // Its next step is the next iteration's: this one has nothing left to do.
+    let before = forwards.load(Ordering::Relaxed);
+    scheduler.batch_decode_step();
+    assert_eq!(
+        forwards.load(Ordering::Relaxed) - before,
+        0,
+        "the decode step does not re-forward the run to read the same row"
+    );
+    assert_eq!(
+        &scheduler.active_decodes[&slot].generated_tokens[..],
+        &[100u32, 101, THINK_CLOSE, after_close][..]
+    );
 }

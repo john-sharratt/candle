@@ -85,7 +85,7 @@ use candle::Result;
 
 use super::bump_arena::KV_ARENA_MID_WAVE;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
-use super::growth_policy::{kv_grow_step, GrowthPolicy, Occupancy, Refusal};
+use super::growth_policy::{kv_grow_step, FreeRegionTarget, GrowthPolicy, Occupancy, Refusal};
 use super::reservation::Reservation;
 use super::span_geometry::{blocked, ceiling_regions, claimable, tier_fits};
 use super::types::TARGET_ARENA_BYTES;
@@ -489,6 +489,11 @@ struct RegionPool {
     /// no spare at all. Removing the seed exposed it, and a geometric grow step
     /// made it reachable within a few waves rather than dozens.
     transient_high_water: usize,
+    /// The tier the most recent forward placed, in bytes — **not** cleared on
+    /// release. The growth negotiation leaves this much free: the forward after a
+    /// prefill chunk is the next chunk, a little deeper, and its tier stands on the
+    /// same ground (see [`Occupancy::last_tier_bytes`]).
+    last_tier_bytes: usize,
     /// Persistence-staging bytes carved from the fixed left block.
     persist_carved: usize,
     /// Fresh regions claimed while a wave's transient tier was placed.
@@ -525,6 +530,9 @@ struct RegionPool {
     /// single-call test can see. Same split, and the same reason, as
     /// [`super::weight_zone`] on the mirror side.
     growth: GrowthPolicy,
+    /// The free regions the KV side's scheduler defends ([`set_kv_free_target`]),
+    /// which the growth policy leaves standing. None until a scheduler states one.
+    kv_target: FreeRegionTarget,
 }
 
 /// Regions bought in one go when a claim runs the KV side out of ground.
@@ -1020,6 +1028,7 @@ impl RegionPool {
             transient_base: None,
             transient_bytes: 0,
             transient_high_water: 0,
+            last_tier_bytes: 0,
             persist_carved: 0,
             fresh_claims_during_wave: 0,
             refusals_during_wave: 0,
@@ -1028,6 +1037,7 @@ impl RegionPool {
             // enforces that is `observing_until` below — not a fabricated peak,
             // which the window roll would carry for a second window.
             growth: GrowthPolicy::new(),
+            kv_target: FreeRegionTarget::default(),
         })
     }
 
@@ -1298,6 +1308,12 @@ impl RegionPool {
             for slot in self.dirty_epoch.iter_mut().skip(layout.total - gained) {
                 *slot = stale;
             }
+            // **Every concession is the KV side's demand, whoever asked for it.**
+            // A purchase through the broker said so already; one asked for
+            // between forwards (`request_kv_ground` — admission, relief) did not,
+            // and the next forward's growth negotiation read the ground it had
+            // just conceded as spare and took it straight back.
+            self.growth.note_demand();
         }
         // Regions past the new total no longer exist: drop them from the free
         // list and pull `next` back so the fresh-region path cannot hand one out.
@@ -1360,12 +1376,15 @@ impl RegionPool {
         // defects have all been trajectory defects, and a trajectory is only
         // testable if it can be run without a device.
         let occ = Occupancy {
+            total: self.total,
+            kv_target: self.kv_target,
             live: self.live,
             free_below_ceiling: self.free_count(),
             ceiling_blocked: self.ceiling_blocked(),
             free_above_live: self.total.saturating_sub(self.live_watermark()),
             tier_bytes: self.transient_bytes,
             tier_high_water: self.transient_high_water,
+            last_tier_bytes: self.last_tier_bytes,
         };
         match self.growth.spare(occ, slack, REGION_BYTES) {
             Ok(spare) => {
@@ -1979,6 +1998,7 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
         // Survives the release, so the between-forwards demand reading still
         // knows a tier of this size is about to want its ground back.
         pool.transient_high_water = pool.transient_high_water.max(len);
+        pool.last_tier_bytes = len;
         Ok(Placed::At(base))
     })
 }
@@ -2026,6 +2046,28 @@ pub(crate) fn release_transient(stream: &std::sync::Arc<CudaStream>) {
         }
         pool.transient_base = None;
         pool.transient_bytes = 0;
+        Ok(())
+    });
+}
+
+/// Forget the tier the most recent forward placed, so the growth negotiation
+/// stops keeping its ground free for a forward that is not coming.
+///
+/// The negotiation leaves the last forward's tier free because, between two
+/// forwards of a prefill, the next one is a little deeper and stands on the same
+/// ground. With nothing in flight that reasoning has nothing to apply to: the
+/// work is over, and a turn whose last forward was a 128K prefill chunk — a
+/// section ingest, which decodes nothing — would otherwise hold the weight side
+/// back by that whole tier for as long as the engine sat idle. The next forward
+/// prices and places its own tier, buying back what it needs.
+///
+/// A placed tier is left alone: a caller that is wrong about being outside a
+/// forward changes nothing.
+pub fn forget_last_tier(stream: &std::sync::Arc<CudaStream>) {
+    let _ = with_pool(stream, |pool| {
+        if pool.transient_base.is_none() {
+            pool.last_tier_bytes = 0;
+        }
         Ok(())
     });
 }
@@ -2591,6 +2633,17 @@ pub fn empty_sweep_stats() -> (u64, u64) {
 /// `min_grant` is the caller's own allocation unit in regions — the smallest
 /// grant it can actually spend. A grant below it is not conservative, it is
 /// wasted: see [`kv_grow_step`].
+/// State the free regions `ordinal`'s KV side keeps in hand — its scheduler's
+/// relief target — so the weight side's growth leaves them standing (see
+/// [`FreeRegionTarget`]). Called once, as the scheduler starts. A device with no
+/// reservation has nothing to divide, and is left alone.
+pub fn set_kv_free_target(ordinal: usize, target: FreeRegionTarget) {
+    let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pool) = map.get_mut(&ordinal) {
+        pool.kv_target = target;
+    }
+}
+
 pub fn kv_spare_regions(
     stream: &std::sync::Arc<CudaStream>,
     slack: usize,
@@ -3131,6 +3184,33 @@ mod tests {
             Ok(Device::Cuda(d)) => Some(d.cuda_stream()),
             _ => None,
         }
+    }
+
+    /// A settled device forgets the last forward's tier, so the growth
+    /// negotiation stops holding its ground free — and a tier still standing is
+    /// not forgotten under it.
+    #[test]
+    fn a_settled_device_forgets_the_last_forwards_tier() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let last = || -> Result<usize> { with_pool(&s, |p| Ok(p.last_tier_bytes)) };
+
+        place_transient(&s, 4 * REGION_BYTES)?;
+        super::forget_last_tier(&s);
+        assert_eq!(
+            last()?,
+            4 * REGION_BYTES,
+            "a standing tier is not forgotten"
+        );
+        release_transient(&s);
+        assert_eq!(
+            last()?,
+            4 * REGION_BYTES,
+            "the release keeps it for the next forward"
+        );
+        super::forget_last_tier(&s);
+        assert_eq!(last()?, 0, "settled, nothing is coming");
+        Ok(())
     }
 
     /// The weight side may not take ground a standing tier is holding.

@@ -65,8 +65,8 @@ impl Place {
         }
     }
 
-    /// A pinned host copy the copy engine may promote from, and whether it is
-    /// the pad's.
+    /// The pinned host copy the device reads the expert from once its VRAM
+    /// slot is claimed, and whether it is the pad's.
     pub(crate) fn pinned_source(&self) -> Option<(u64, bool)> {
         if let Some((_, b)) = self.pad {
             Some((b, true))
@@ -205,7 +205,10 @@ impl Residency {
         })
     }
 
-    /// A promotion copy starts (`+1`) or ends (`-1`) reading the pad slot.
+    /// Something the device may read the pad slot through starts (`+1`) or
+    /// stops (`-1`) standing: a read-ahead listing (`ahead_pins`), or a lazy
+    /// victim's offer whose fallback is the slot. The stager evicts no pinned
+    /// slot.
     pub(crate) fn pin_pad(&mut self, row: usize, expert: usize, delta: i32) {
         let i = self.at(row, expert);
         let pins = self.places[i].pins as i64 + delta as i64;

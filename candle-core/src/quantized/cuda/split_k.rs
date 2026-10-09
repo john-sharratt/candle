@@ -91,34 +91,14 @@ pub fn ensure_split_k_scratch(device: &CudaDevice) -> Result<()> {
     Ok(())
 }
 
-/// `op [M, K] × weight [N, K]ᵀ → [M, N]` at `out_dtype`, K cut into `splits` slices of
-/// `ceil(K_tiles / splits)` tiles, one block each. `splits` must be a depth with no empty slice
-/// ([`dense_k_split_depth`]); every such depth produces the unsplit kernel's bits.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn q8a128_dense_matmul_split_k<'w>(
-    op: &Q8a128Operand<'w>,
-    weight_ptr: u64,
-    weight_dtype: GgmlDType,
-    nrows: usize,
-    splits: usize,
-    out_dtype: DType,
-    device: &CudaDevice,
-) -> Result<LiveTensor<'w>> {
-    q8a128_dense_matmul_split_k_segmented(
-        op,
-        &[(weight_ptr, nrows)],
-        weight_dtype,
-        splits,
-        out_dtype,
-        device,
-    )
-}
-
-/// `op [M, K] × [W₀; W₁; …]ᵀ → [M, ΣNᵢ]` at `out_dtype` in ONE split-K launch: the weights
-/// `segments` (`(device pointer, rows)`, all of `weight_dtype`) read the same operand, and each
-/// writes its columns after the segments before it. Every output column is what the same
-/// weight's own launch computes, bit for bit — the split's tile-ordered sum does not depend on
-/// the columns beside it. At most [`SPLITK_MAX_SEGS`] segments, each a multiple of 32 rows.
+/// `op [M, K] × [W₀; W₁; …]ᵀ → [M, ΣNᵢ]` at `out_dtype` in ONE split-K launch, K cut into
+/// `splits` slices of `ceil(K_tiles / splits)` tiles, one block each: the weights `segments`
+/// (`(device pointer, rows)`, all of `weight_dtype`) read the same operand, and each writes its
+/// columns after the segments before it. `splits` must be a depth with no empty slice
+/// ([`dense_k_split_depth`]); every such depth produces the unsplit kernel's bits, and every
+/// output column is what the same weight's own launch computes — the split's tile-ordered sum
+/// does not depend on the columns beside it. At most [`SPLITK_MAX_SEGS`] segments, each a
+/// multiple of 32 rows. A single weight is a one-segment table.
 pub(crate) fn q8a128_dense_matmul_split_k_segmented<'w>(
     op: &Q8a128Operand<'w>,
     segments: &[(u64, usize)],
@@ -210,9 +190,11 @@ pub(crate) fn q8a128_dense_matmul_split_k_segmented<'w>(
 mod tests {
     use rand::{Rng, SeedableRng};
 
-    use super::super::super::int8_split_k::{dense_k_split_depth, q8a128_dense_k_splits};
+    use super::super::super::int8_split_k::{
+        dense_k_split_depth, q8a128_dense_k_splits, DensePlan,
+    };
     use super::super::super::{GgmlDType, Int8Mode, QMatMul, QStorage, QTensor, SumScale};
-    use super::super::{dense_qmatmul_with_splits, to_dynamic, CudaDevice, DynamicActs};
+    use super::super::{dense_qmatmul_with_plan, to_dynamic, CudaDevice, DynamicActs};
     use super::q8a128_dense_matmul_split_k_segmented;
     use crate::backend::BackendDevice;
     use crate::{DType, Device, Result, Tensor};
@@ -245,7 +227,16 @@ mod tests {
         run_with(dev, w, x, Some(splits))
     }
 
-    /// One matmul at a forced slice count, or the rule's when `None`, as F32 values.
+    /// The plan that runs `splits` slices: the unsplit kernel at one.
+    fn split_plan(splits: usize) -> DensePlan {
+        if splits == 1 {
+            DensePlan::Unsplit
+        } else {
+            DensePlan::SplitK(splits)
+        }
+    }
+
+    /// One matmul at a forced slice count, or the rule's plan when `None`, as F32 values.
     fn run_with(
         dev: &CudaDevice,
         w: &QMatMul,
@@ -258,14 +249,14 @@ mod tests {
             _ => unreachable!("a CUDA weight"),
         };
         let acts = to_dynamic(x, Int8Mode::Performance, dev, SumScale::Raw)?;
-        let out = dense_qmatmul_with_splits(
+        let out = dense_qmatmul_with_plan(
             acts.as_dynamic(),
             ptr,
             q.dtype(),
             q.shape().dims()[0],
             len,
             DType::F32,
-            splits,
+            splits.map(split_plan),
             dev,
         )?;
         out.flatten_all()?.to_vec1::<f32>()
@@ -453,14 +444,14 @@ mod tests {
         let acts = to_dynamic(x, Int8Mode::Performance, dev, SumScale::Raw)?;
         let n = q.shape().dims()[0];
         let launch = || {
-            dense_qmatmul_with_splits(
+            dense_qmatmul_with_plan(
                 acts.as_dynamic(),
                 ptr,
                 q.dtype(),
                 n,
                 len,
                 DType::BF16,
-                Some(splits),
+                Some(split_plan(splits)),
                 dev,
             )
         };

@@ -7,6 +7,7 @@ use super::chunked::{
     ChunkPin, ChunkedKvBacking, CompressionPolicy, DecodeGpuChunkSyncStats, CHUNK_SIZE, GID_STRIDE,
 };
 use ahash::HashMap;
+use candle::quantized::pinned_staging::Generation;
 use candle::quantized::GgmlDType;
 use candle::{DType, Result, Tensor};
 use std::sync::Arc;
@@ -1055,6 +1056,7 @@ impl KvCache {
         caches: &[&mut KvCache],
         offsets: &[usize],
         arena_info: &[super::ResolvedArenaInfo],
+        generation: &Generation,
     ) -> Result<SlotStateSync> {
         if caches.len() != offsets.len() {
             candle::bail!(
@@ -1077,7 +1079,8 @@ impl KvCache {
             })?;
             entries.push((batch_idx, offset));
         }
-        let (slots, pins, stats) = backing.sync_decode_gpu_chunks(&entries, arena_info)?;
+        let (slots, pins, stats) =
+            backing.sync_decode_gpu_chunks(&entries, arena_info, generation)?;
         Ok((slots, pins, stats))
     }
 

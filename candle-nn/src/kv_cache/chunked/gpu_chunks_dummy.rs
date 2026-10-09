@@ -64,6 +64,17 @@ impl GpuChunks {
         0
     }
 
+    /// The stub holds no entries, so there is nothing to extend.
+    pub(crate) fn mark_appended(&mut self) {}
+
+    pub(crate) fn appended(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn write_idx(&self) -> usize {
+        0
+    }
+
     /// Empty, because the stub serialises nothing and so references no chunks.
     /// A consumer holding this across a launch is holding nothing, which is
     /// correct: without the feature there is no launch to outlive.
@@ -113,5 +124,20 @@ impl GpuChunksGuard<'_> {
         _base_pos: u32,
     ) -> candle::Result<()> {
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn extend_decode(
+        &mut self,
+        _chunks: &[ChunkWindow],
+        _n_kv_head: usize,
+        _head_dim: usize,
+        _arena_info: &[ResolvedArenaInfo],
+        _write_len: u16,
+        _write_idx: usize,
+        _base_pos: u32,
+        _start: usize,
+    ) -> candle::Result<Option<usize>> {
+        Ok(None)
     }
 }

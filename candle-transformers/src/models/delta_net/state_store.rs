@@ -88,15 +88,15 @@ use std::sync::Mutex;
 #[cfg(feature = "cuda")]
 static READBACK: Mutex<Option<PinnedBuf>> = Mutex::new(None);
 
-/// Unpin the seal readback buffer ([`READBACK`]).
+/// Free the seal readback buffer ([`READBACK`]), unpinning its pages.
 ///
-/// The buffer is process-wide, so it outlives the engine whose stores filled it:
+/// The buffer is process-wide, so it outlives the engine whose seals sized it:
 /// without this, a shut-down engine leaves one store's whole recurrent state —
 /// 19.3 MiB on the 0.8B, ~65 MB on the 35B-A3B — pinned for the life of the
-/// process. Called once the engine's scheduler, the thread that seals, has
-/// joined. A seal after it pins a fresh buffer on its first readback.
-#[cfg(feature = "cuda")]
+/// process. Called once the engine's scheduler, the only thread that seals, has
+/// joined; the next engine's first seal allocates it again.
 pub fn release_seal_readback() {
+    #[cfg(feature = "cuda")]
     release_readback_in(&READBACK);
 }
 
@@ -1821,6 +1821,28 @@ mod tests {
         // Twice, so the second export reads through the buffer the first sized.
         let again = filled_store_on(&Device::new_cuda(0)?).export()?;
         assert_eq!(again, cpu);
+        Ok(())
+    }
+
+    /// **A released readback buffer unpins exactly what the seal pinned.** The
+    /// fixture's three recurrent layers each read back 256 bytes of state and
+    /// 256 of conv tail, so one export pins 1,536 bytes of staging; releasing it
+    /// returns the process to where it stood — what an engine's shutdown relies
+    /// on to leave no pinned memory behind.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn releasing_the_seal_readback_unpins_it() -> Result<()> {
+        use candle::vram::{host_pinned_bytes_for, PinnedUse};
+        let store = filled_store_on(&Device::new_cuda(0)?);
+        release_seal_readback();
+        let before = host_pinned_bytes_for(PinnedUse::Staging);
+        store.export()?;
+        assert_eq!(host_pinned_bytes_for(PinnedUse::Staging), before + 1_536);
+        release_seal_readback();
+        assert_eq!(host_pinned_bytes_for(PinnedUse::Staging), before);
+        // The next seal allocates it afresh and reads the same bytes.
+        assert_eq!(store.export()?, filled_store().export()?);
+        release_seal_readback();
         Ok(())
     }
 

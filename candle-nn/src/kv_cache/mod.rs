@@ -48,13 +48,22 @@ pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, Gold
 /// defects are trajectory defects, so the decision has to be runnable over a
 /// simulated workload with no device in reach
 /// (`docs/vram_partition_behavioural_tests.md`).
-pub use chunked::growth_policy::{kv_grow_step, GrowthPolicy, Occupancy, Refusal};
+pub use chunked::growth_policy::{
+    kv_grow_step, FreeRegionTarget, GrowthPolicy, Occupancy, Refusal,
+};
 /// A guest's pipeline stage. Defined in both configurations — `f(x)` when there
 /// is no GPU backend, since no guest arena can exist without one — because the
 /// model code that marks its stages is built in both.
 pub use chunked::guest_stage;
 #[cfg(feature = "cuda")]
 pub use chunked::persistence_domain_stats;
+/// The carve of a bulk prefill attention launch and the cut that bounds it —
+/// the one definition the launcher sizes from and the wave plan prices by.
+pub use chunked::prefill_kv_stage::{
+    prefill_attn_block_tokens, prefill_kv_stage_bytes, prefill_kv_stage_positions,
+    PrefillKvStageLayout, PrefillLaunchBounds, PREFILL_ATTN_ROW_GROUP_TOKENS,
+    PREFILL_KV_STAGE_CHUNK_POSITIONS, PREFILL_KV_STAGE_MIN_Q_LEN,
+};
 #[cfg(feature = "cuda")]
 pub use chunked::slot_state_stats;
 /// Where the tier may stand and what the KV side may reach — the span's
@@ -87,13 +96,14 @@ pub use chunked::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    empty_sweep_stats, reclaim_empty_arenas, region_stats, spare_tally, RegionStats, REGION_BYTES,
+    empty_sweep_stats, forget_last_tier, reclaim_empty_arenas, region_stats, spare_tally,
+    RegionStats, REGION_BYTES,
 };
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    initial_weight_bytes, kv_spare_regions, set_ground_broker, set_weight_floor, span_end,
-    weight_capacity_bytes, weight_floor_after,
+    initial_weight_bytes, kv_spare_regions, set_ground_broker, set_kv_free_target,
+    set_weight_floor, span_end, weight_capacity_bytes, weight_floor_after,
 };
 /// Fixed-stride slot arenas, one set per span tenant — see `chunked::tenant_arena`.
 pub use chunked::{slot_stride, SlotTenant, SLOT_ALIGN};

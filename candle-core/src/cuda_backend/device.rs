@@ -825,6 +825,13 @@ impl CudaDevice {
         self.capture.flush(&self.stream)
     }
 
+    /// The wave segment this thread's launches are being recorded into right
+    /// now, as `(wave serial, segment ordinal within the wave)` — `None` when
+    /// they reach the device as they are issued.
+    pub fn recording_segment(&self) -> Option<(u64, usize)> {
+        self.capture.recording_segment()
+    }
+
     /// Suspend this thread's wave capture, if it has one, until the guard
     /// drops: the recorded segment is launched first, and the caller's eager
     /// device calls run in order behind it.

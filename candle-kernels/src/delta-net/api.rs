@@ -27,6 +27,19 @@ pub const DELTA_NET_LAYER_OPS: usize = 6;
 /// z extent. The launchers refuse a stack past it.
 pub const DELTA_NET_MAX_LAYER_SPANS: usize = 65_535;
 
+/// The longest span [`run_delta_net_short_span_f32`] takes: a speculative
+/// verify block (the drafts plus the accepted token) with room to spare. The
+/// kernel's per-row buffers are sized by it (`DNS_ROWS`).
+pub const DELTA_NET_SHORT_SPAN_ROWS: usize = 8;
+
+/// The causal-conv width the short-span kernel is compiled for (`DNS_KW`).
+pub const DELTA_NET_SHORT_SPAN_CONV: usize = 4;
+
+/// The widest causal-conv window [`run_delta_net_conv_prefill_f32`] takes: each
+/// thread holds its channel's window in registers sized by it (`DNC_KMAX`), and
+/// the launcher refuses a wider kernel.
+pub const DELTA_NET_PREFILL_CONV_MAX: usize = 8;
+
 extern "C" {
     /// One gated-delta-rule token step per decode sequence, batched over the
     /// wave: grid `(n_v_heads, n_decode)`. Each sequence's state lives in its
@@ -109,6 +122,9 @@ extern "C" {
     /// `tail_out [channels, kwidth−1]` (the advanced RAW tail; a separate
     /// buffer because blocks computing the first `kwidth−1` outputs read the
     /// entering tail concurrently). `qk_channels`/`eps` as in the conv step.
+    /// `kwidth` is at most [`DELTA_NET_PREFILL_CONV_MAX`]; a wider kernel, like
+    /// every other refused shape, returns `1` with nothing written (`0` when
+    /// launched).
     ///
     /// **The layer stack.** With `layers` non-null, the launch replays
     /// `n_layers` recurrent layers at once: `layers` is a device table of
@@ -133,7 +149,7 @@ extern "C" {
         qk_channels: i32,
         eps: f32,
         stream: *mut c_void,
-    );
+    ) -> i32;
 
     /// Intra-chunk half of the fused prefill scan, parallel over
     /// (chunk, V head): in-kernel gates from the raw projections, per-chunk
@@ -145,7 +161,8 @@ extern "C" {
     /// load), `v` at the V column; `alpha`/`blin [t_len, n_v_heads]` raw;
     /// emits `u`/`w [n_v_heads, t_len, 128]`,
     /// `kq [n_v_heads, t_len, DELTA_NET_PREFILL_CHUNK]` (rows valid for
-    /// `s ≤ t` only) and `g_cs [n_v_heads, t_len]`.
+    /// `s ≤ t` only) and `g_cs [n_v_heads, t_len]`. The q/k rows are read four
+    /// floats at a time, so `qk_wave` must be 16-byte aligned.
     ///
     /// With `layers` non-null (see [`run_delta_net_conv_prefill_f32`]) the
     /// gate projections and constants come from the table, and the conv output
@@ -175,12 +192,16 @@ extern "C" {
     );
 
     /// Sequential half of the fused prefill scan: walks the chunks in order
-    /// with the state tile register-resident, computes the fused output
+    /// with the state tile resident in shared memory, computes the fused output
     /// (inter-chunk read of the pre-update state + intra-chunk reads of the
     /// chunk's own writes) directly into the span's rows of the whole-wave
     /// output `o [.., n_v_heads·128]`, and updates `state [n_v_heads, 128,
     /// 128]` in place in the stored orientation. `qk`/`tok_stride` as in the
     /// intra kernel.
+    ///
+    /// The pass reads `qk`, `u`, `w`, `kq` and every span's states four floats
+    /// at a time, so each of those bases must be 16-byte aligned (`tok_stride`
+    /// is a multiple of 128, which keeps every row aligned with its base).
     ///
     /// With `layers` non-null every buffer is stacked by layer — the conv
     /// output, the transients, `o` (`t_tran` rows a layer) and `ptrs` — and the
@@ -205,11 +226,53 @@ extern "C" {
         stream: *mut c_void,
     );
 
+    /// The whole prefill scan — conv, intra-chunk solve and state pass — in
+    /// one launch, for spans of at most [`DELTA_NET_SHORT_SPAN_ROWS`] rows:
+    /// grid `(n_v_heads, 128/32, n_spans)`, each block convolving the q/k/v
+    /// rows it reads itself and keeping every intermediate on chip. Writes
+    /// exactly what the three-launch path writes into `o`, the advanced states
+    /// and the advanced conv tails — the same bits — and no conv-output rows.
+    ///
+    /// `x_wave [T_wave, channels]` is the raw QKV projection (token-major),
+    /// `kernel [channels, DELTA_NET_SHORT_SPAN_CONV]`; `alpha`/`blin
+    /// [T_wave, n_v_heads]` raw; `o_wave [T_wave, n_v_heads·128]`; `ptrs`/
+    /// `spans` the span table of [`run_delta_net_conv_prefill_f32`] (entering
+    /// and advanced conv tails must be separate buffers; the states may be
+    /// one). `max_len` is the table's longest span. Returns 0 when launched,
+    /// 1 when the shape is refused and nothing was written: `max_len` outside
+    /// `1..=DELTA_NET_SHORT_SPAN_ROWS`, `kwidth` other than
+    /// [`DELTA_NET_SHORT_SPAN_CONV`], or `channels` not `(2·h_k + h_v)·128`.
+    pub fn run_delta_net_short_span_f32(
+        x_wave: *const f32,
+        kernel: *const f32,
+        alpha_wave: *const f32,
+        blin_wave: *const f32,
+        dt_bias: *const f32,
+        a_neg: *const f32,
+        o_wave: *mut f32,
+        ptrs: *const i64,
+        spans: *const u32,
+        n_spans: i32,
+        max_len: i32,
+        n_v_heads: i32,
+        n_k_heads: i32,
+        channels: i32,
+        kwidth: i32,
+        eps: f32,
+        q_scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+
     /// Row-wise epilogue over the whole wave: per `(token, V head)` row,
     /// `out = (o / sqrt(mean(o²) + eps)) ⊙ gain ⊙ zgate(z)` — the per-head
     /// RMS norm and the z-gate in one launch. `rows = T · n_v_heads`,
     /// `gain [d]`, `d ≤ 256`. `sigmoid_gate` selects the gate instantiation:
     /// 0 = SiLU(z) (the Qwen3.5 lineage), nonzero = sigmoid(z) (qwen4exp).
+    ///
+    /// `q8`, when non-null, also receives `out` as a q8a1024 operand (row-major
+    /// tiles, the bytes a standalone quantize of `out` writes; `sum_norm` its
+    /// Σx convention) — only at `d = 128`, one tile per row. Returns 0 when
+    /// launched, 1 when the shape is refused and nothing was written.
     pub fn run_delta_net_norm_gate_f32(
         o: *const f32,
         z: *const f32,
@@ -219,6 +282,8 @@ extern "C" {
         d: i32,
         eps: f32,
         sigmoid_gate: i32,
+        q8: *mut u8,
+        sum_norm: i32,
         stream: *mut c_void,
-    );
+    ) -> i32;
 }

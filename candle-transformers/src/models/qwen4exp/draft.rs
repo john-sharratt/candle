@@ -54,7 +54,7 @@ use candle::{DType, Result, Tensor};
 use super::batched_attention::Qwen4ExpAttentionLayer;
 use super::capture_rows::CaptureRows;
 use super::engine::GpuLayerMix;
-use super::hyper::{hc_combine, hc_combine_gated, hc_mix};
+use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::indexer::{IndexCache, IndexSnapshot};
 use super::mtp::MtpHead;
 use super::spec::SpecCapture;
@@ -72,7 +72,7 @@ use crate::models::profile::gpu_span;
 use crate::models::rope_schedule::FactoredRope;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_buffers::wave_empty_ticketed;
-use candle::quantized::cuda::to_dynamic;
+use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::quantized::decode_rows::DecodeRows;
 use candle_nn::kv_cache::{
     begin_wave, cover_wave_transient, KvCache, LayerPhase, WavePlan, WaveWidth,
@@ -522,28 +522,35 @@ impl Qwen4ExpBatched {
         // ── MoE half. ──
         let g_moe = gpu_span("q4e:draft:moe", dev);
         let ffn_wave = begin_wave(&stream, LayerPhase::Ffn)?;
-        let (h2, inject2) = hc_mix(&res, &head.block.hc_ffn, eps, Some(ffn_wave.ticket()))?;
+        let (h2, inject2, h2_q8) =
+            hc_mix_with_operand(&res, &head.block.hc_ffn, eps, Some(ffn_wave.ticket()))?;
         let inject2 = inject2.expect("a block's HC modules carry an inject");
-        // Quantized once in the session's mode, as the trunk's MoE input is:
-        // the router, the shared expert and the routed experts' tile gather all
-        // read the one operand.
-        let acts = to_dynamic(
-            &h2.reshape((1, n, n_embd))?,
-            m.lm_head.int8mode(),
-            cuda,
-            // Raw Σx — a language model's block sums stay far below f16's
-            // ceiling.
-            candle::quantized::SumScale::Raw,
-        )?;
+        // Quantized once, as the trunk's MoE input is: the router, the shared
+        // expert and the routed experts' tile gather all read the one operand —
+        // the mix's own when the module runs int8, which writes it as it
+        // stores `h2`.
+        let acts = match h2_q8 {
+            Some(op) => DynamicActs::Int8(op.with_lead(vec![1, n])),
+            None => to_dynamic(
+                &h2.reshape((1, n, n_embd))?,
+                m.lm_head.int8mode(),
+                cuda,
+                // Raw Σx — a language model's block sums stay far below f16's
+                // ceiling.
+                candle::quantized::SumScale::Raw,
+            )?,
+        };
         // The layer's output in its three parts, assembled by the combine as
         // the trunk's are. A draft head only ever runs behind a decode step —
         // there is no prefill/prompt traffic through one — so all `n` rows are
         // decode-attributed.
+        // The head is the last MoE row: there are no rows after it to predict.
         let parts = head.block.moe.forward_parts(
             acts,
             DType::F32,
             &DecodeRows::prefix(n),
             Some(&ffn_wave),
+            &[],
         )?;
         let routed = parts.routed.reshape((n, n_embd))?;
         hc_combine_gated(&mut res, &routed, &parts.shared, &inject2)?;

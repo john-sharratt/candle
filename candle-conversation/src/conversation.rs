@@ -1028,8 +1028,12 @@ impl Sequence {
                     // Sections with `depends_on` are conditional — they
                     // only emit when the named collection materialises —
                     // so they must NOT contribute to the priming
-                    // projection's `fixed_prefix`.
-                    if s.depends_on.is_none() {
+                    // projection's `fixed_prefix`. Nor does a section with
+                    // no content: ingest seals nothing for it and the
+                    // projection emits nothing for it, so priming must not
+                    // name it either, or the two lists disagree about what
+                    // the slot holds.
+                    if s.depends_on.is_none() && !s.content.is_empty() {
                         fixed_prefix.push(s.id);
                     }
                     done_bytes += s.content.len() as u64;

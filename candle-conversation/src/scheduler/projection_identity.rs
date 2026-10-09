@@ -113,6 +113,20 @@ pub(super) fn segments_identity(
     h.finish()
 }
 
+/// The identity a turn's view starts with, given the block count of the parent
+/// it borrows.
+///
+/// A view otherwise learns its parent's identity only from a rebuild, so a turn's
+/// first reprojection always rebuilds — and that rebuild tears the whole active
+/// turn off the parent and puts it back, ~290 ms for a 128K prompt, even when it
+/// selects exactly what the parent already holds. An **empty** parent is exactly
+/// the assembly of an empty segment list, so the view can start with that
+/// identity and a reprojection that selects nothing keeps it. A parent holding
+/// anything starts with none: only the assembly that built it knows what it is.
+pub(super) fn turn_start_identity(parent_block_count: usize) -> Option<u64> {
+    (parent_block_count == 0).then(|| segments_identity(&[], |_| (0, 0)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -218,6 +232,22 @@ mod tests {
         assert_eq!(
             section_content_stamp(&old),
             section_content_stamp(&old.clone())
+        );
+    }
+
+    /// An empty parent is the empty list's assembly, so a turn opened on one
+    /// starts with that identity and a reprojection that selects nothing keeps
+    /// it; a parent holding anything starts with none.
+    #[test]
+    fn only_an_empty_parent_starts_a_turn_with_an_identity() {
+        use super::turn_start_identity;
+        assert_eq!(turn_start_identity(0), Some(segments_identity(&[], stamp)));
+        assert_eq!(turn_start_identity(1), None);
+        assert_eq!(turn_start_identity(4002), None);
+        assert_ne!(
+            turn_start_identity(0),
+            Some(segments_identity(&[section(3)], stamp)),
+            "a projection that selects something still rebuilds"
         );
     }
 

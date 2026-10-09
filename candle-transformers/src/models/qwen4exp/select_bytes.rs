@@ -18,7 +18,10 @@ use candle::Result;
 use candle_kernels::simple::qsa_topk::SPLIT_KEYS;
 
 use super::config::IndexerConfig;
-use super::indexer::{selection_engages, selection_stride, widest_candidates, IndexCache};
+use super::indexer::{
+    fresh_score_bound, selection_engages, selection_stride, widest_candidates, IndexCache,
+    ScoreRows,
+};
 use crate::models::delta_net::SeqSpan;
 
 /// The bump alignment every carve starts on.
@@ -78,13 +81,32 @@ pub fn select_layer_bytes(
     let mut needs_pages = false;
     let mut prefixes = 0usize;
     for (s, &off) in spans.iter().zip(offsets) {
+        let last = off + s.len;
+        let appended = s.len / ratio + 1;
         let Some(cache) = idx_map.get(&s.seq).and_then(|c| c.get(kv)) else {
+            // **A sequence with no cache yet is priced as the one it will be**:
+            // one contiguous live tail from position zero, the shape every
+            // sequence that forwards its whole prefix has. That is the wave a
+            // turn's admission prices before its first chunk has run — its
+            // deepest chunk included — and skipping it priced that chunk's
+            // scoring at nothing, the term that dominates the tier at depth.
+            let cand = last / ratio;
+            widest = widest.max(cand);
+            bytes += fresh_score_bound(
+                off / ratio + appended,
+                ScoreRows {
+                    t: s.len,
+                    cand_max: cand,
+                    heads: h,
+                    d,
+                },
+                CARVE_ALIGN,
+            );
             continue;
         };
-        let last = off + s.len;
         let cand = cache.candidates_at(last.saturating_sub(1), ratio);
         widest = widest.max(cand);
-        bytes += cache.score_bound(s.len, cand, s.len / ratio + 1, h, d, CARVE_ALIGN)?;
+        bytes += cache.score_bound(s.len, cand, appended, h, d, CARVE_ALIGN)?;
         needs_pages |= cache.has_pages();
         prefixes += cache.page_prefixes().len();
     }

@@ -14,7 +14,7 @@ use crate::projection::{
     Builder, CollectionWarm, Conversation, GalleryPreload, GroupId, LayerId, PlainPromptFrames,
     ProjectionTarget, Reserved, Schema, SectionId, TimelineId, TurnIndex, WorkingSetShare,
 };
-use crate::scheduler::{Scheduler, SchedulerRequest};
+use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
     compile, compile_think_tree, compile_tool_call_loop, HfVocab, StencilTree, ThinkMode,
@@ -38,6 +38,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// The compiled thinking-block steering trees, one per effort dial, built once
 /// at engine init (parallel to the tool-call registry).  Each turn derives its
@@ -1458,6 +1459,56 @@ impl ConversationEngine {
         flagged
     }
 
+    /// Wait for an evicted `timeline` to leave the device, then settle it.
+    ///
+    /// [`Self::evict_ingest_timeline`] only flags the timeline: the persistence
+    /// thread quantizes each turn and drops its device copy as the warm copy
+    /// lands, on its own schedule. A caller that wants its next request to start
+    /// on the ground the last one gave back calls this after it — the Strata
+    /// harness does, standing in for the idle time a daemon has between one
+    /// user's requests. It drives the persistence thread until no turn of
+    /// `timeline` holds a device copy, then has the scheduler sweep the emptied
+    /// arenas, pack the pools and let the weight side grow back into what that
+    /// freed (`Scheduler::settle_device`), and answers the partition as it then
+    /// stands.
+    ///
+    /// **Fails rather than returning early** when a turn still holds a device
+    /// copy after `timeout`: a turn the persistence thread cannot migrate is a
+    /// fault to name, not a state to measure the next request through.
+    pub fn settle_evicted_timeline(
+        &self,
+        timeline: TimelineId,
+        timeout: Duration,
+    ) -> crate::Result<SettleReport> {
+        let trigger = self.persist_thread.trigger_handle();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let hot = self.conversation.timeline_hot_residences(timeline);
+            if hot == 0 {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ConversationError::Other(format!(
+                    "timeline {timeline:?} still holds {hot} turn(s) on the device {timeout:?} \
+                     after its eviction: the persistence thread did not migrate them to warm"
+                )));
+            }
+            // A flush that cannot be queued is one already in flight, whose pass
+            // serves this wait as well; look again shortly rather than spin.
+            if !trigger.flush_blocking(deadline - now) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let (response_tx, response_rx) = flume::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::Settle { response_tx })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        response_rx
+            .recv()
+            .map_err(|_| ConversationError::SchedulerGone)
+    }
+
     /// The segmented redo log's maintenance state — `(segment_count, last_op)`,
     /// where `last_op` is `(label, unix_secs)` — for the daemon status / GUI
     /// compaction indicator.
@@ -2425,11 +2476,10 @@ impl ConversationEngine {
         // The scheduler thread owned every sequence, so by its join each
         // `(layer, slot)` has handed its staging pair to the process-wide
         // recycler. Nothing of this engine will take them again; unpin them
-        // rather than leave them held for the life of the process.
+        // rather than leave them held for the life of the process. The same goes
+        // for the recurrent stores' seal readback buffer: the scheduler was the
+        // only thread that sealed.
         release_recycled_wc();
-        // The seal readback buffer is process-wide for the same reason, and the
-        // scheduler was its only user: a recurrent model's whole per-store state
-        // stays pinned behind this engine unless it is released here.
         release_seal_readback();
         Ok(())
     }

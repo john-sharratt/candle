@@ -32,6 +32,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -40,7 +41,8 @@
 #include "dispatch_table.cuh"
 #include "matmul_status.cuh"  // QMM_* launcher status codes
 #include "moe_live.cuh"       // the grouped launch's workers over a live expert table
-#include "splitk_segs.cuh"    // the split-K launch's weight segments
+#include "splitk_segs.cuh"    // the split-K and narrow launches' weight segments
+#include "narrow_layout.cuh"  // the narrow launch's geometry and shared memory
 #include "pdl.cuh"            // programmatic dependent launch for the weight GEMMs that wait
 
 // =============================================================================
@@ -700,7 +702,10 @@ typedef struct {
 #define DECL_DENSE_INT8_M2_ALL(base) \
     DECL_DENSE_INT8(base##_f16_dense_m2) \
     DECL_DENSE_INT8(base##_bf16_dense_m2) \
-    DECL_DENSE_INT8(base##_f32_dense_m2)
+    DECL_DENSE_INT8(base##_f32_dense_m2) \
+    DECL_DENSE_INT8(base##_f16_dense_m4) \
+    DECL_DENSE_INT8(base##_bf16_dense_m4) \
+    DECL_DENSE_INT8(base##_f32_dense_m4)
 
 DECL_DENSE_INT8_ALL(q4_0_int8)
 DECL_DENSE_INT8_ALL(q4_1_int8)
@@ -728,10 +733,10 @@ DECL_DENSE_INT8_ALL(q2_ko_int8)
 // Q3_KO 3-bit affine twin (row 20).
 DECL_DENSE_INT8_ALL(q3_ko_int8)
 
-// q8a128 mode-1 → mode-2 (Bm=32 weight-reuse) crossover. The DENSE crossover is decided in Rust
-// (a weight-aware closed-form fit, see q8a128_dense_use_mode2) and passed in as `force_mode2`,
-// since the optimal point depends on weight bytes vs L2, not token count alone.
-// Mode-2 exists for the KO formats only — they are the ones a prefill wave runs.
+// q8a128 mode-1 → mode-2 (Bm=32 weight-reuse) → mode-4 (Bm=64 × 128-row prefill tile). The
+// DENSE tiling is decided in Rust (`int8_matmul_mode::q8a128_dense_tile`, a grid-fill rule)
+// and passed in as `tile_mode`. Mode-2 and mode-4 exist for the KO formats only — they are the
+// ones a prefill wave runs.
 DECL_DENSE_INT8_M2_ALL(q4_ko_int8)
 DECL_DENSE_INT8_M2_ALL(q5_ko_int8)
 DECL_DENSE_INT8_M2_ALL(q6_ko_int8)
@@ -756,6 +761,23 @@ DECL_DENSE_INT8_SK_ALL(q2_ko_int8)
 DECL_DENSE_INT8_SK_ALL(q3_ko_int8)
 #undef DECL_DENSE_INT8_SK_ALL
 #undef DECL_DENSE_INT8_SK
+
+// Narrow twins of the KO dense kernels — decode width, K across a block's warps (see
+// run_dense_int8_narrow).
+#define DECL_DENSE_INT8_NW(name) \
+    extern "C" __global__ void name(const SplitKSegs, const void*, void*, int, int, int, int);
+#define DECL_DENSE_INT8_NW_ALL(base) \
+    DECL_DENSE_INT8_NW(base##_f16_dense_nw) \
+    DECL_DENSE_INT8_NW(base##_bf16_dense_nw) \
+    DECL_DENSE_INT8_NW(base##_f32_dense_nw)
+DECL_DENSE_INT8_NW_ALL(q4_ko_int8)
+DECL_DENSE_INT8_NW_ALL(q5_ko_int8)
+DECL_DENSE_INT8_NW_ALL(q6_ko_int8)
+DECL_DENSE_INT8_NW_ALL(q8_ko_int8)
+DECL_DENSE_INT8_NW_ALL(q2_ko_int8)
+DECL_DENSE_INT8_NW_ALL(q3_ko_int8)
+#undef DECL_DENSE_INT8_NW_ALL
+#undef DECL_DENSE_INT8_NW
 
 #undef DECL_DENSE_INT8_M2_ALL
 #undef DECL_DENSE_INT8_ALL
@@ -813,6 +835,27 @@ static void* dense_kernels_int8_m2[3][7] = {
 };
 #undef DENSE_INT8_M2_ROW
 
+// Indexed by [out_dtype][kernel_row - KO_ROW_FIRST], the mode-2 table's order: the mode-4
+// prefill tile (Bm=64 × 128 rows, `INSTANTIATE_KERNEL_DENSE_INT8_M4`).
+#define DENSE_INT8_M4_ROW(tag) { \
+    (void*)q4_ko_int8_##tag##_dense_m4, \
+    (void*)q5_ko_int8_##tag##_dense_m4, \
+    (void*)q6_ko_int8_##tag##_dense_m4, \
+    (void*)q8_ko_int8_##tag##_dense_m4, \
+    (void*)mxfp4_ko_int8_##tag##_dense_m4, \
+    (void*)q2_ko_int8_##tag##_dense_m4, \
+    (void*)q3_ko_int8_##tag##_dense_m4, \
+}
+static void* dense_kernels_int8_m4[3][7] = {
+    DENSE_INT8_M4_ROW(f16),
+    DENSE_INT8_M4_ROW(bf16),
+    DENSE_INT8_M4_ROW(f32),
+};
+#undef DENSE_INT8_M4_ROW
+static_assert(
+    sizeof(dense_kernels_int8_m4[0]) == sizeof(dense_kernels_int8_m2[0]),
+    "every KO format with a mode-2 tile must have a mode-4 tile");
+
 // First kernel row with a mode-2 (Bm=32 weight-reuse) twin, and how many there are.
 //
 // **Derived from the m2 table's own width, not written down.** The count used to be a literal
@@ -849,6 +892,44 @@ static void* dense_kernels_int8_sk[3][7] = {
 static_assert(
     (int)(sizeof(dense_kernels_int8_sk[0]) / sizeof(dense_kernels_int8_sk[0][0])) == KO_ROW_COUNT,
     "every KO format must have a split-K entry (null where it never splits)");
+
+// Indexed by [out_dtype][kernel_row - KO_ROW_FIRST], the mode-2 table's order. MXFP4 has no
+// narrow twin, for the reason it has no split one.
+#define DENSE_INT8_NW_ROW(tag) { \
+    (void*)q4_ko_int8_##tag##_dense_nw, \
+    (void*)q5_ko_int8_##tag##_dense_nw, \
+    (void*)q6_ko_int8_##tag##_dense_nw, \
+    (void*)q8_ko_int8_##tag##_dense_nw, \
+    nullptr, /* mxfp4: never runs narrow */ \
+    (void*)q2_ko_int8_##tag##_dense_nw, \
+    (void*)q3_ko_int8_##tag##_dense_nw, \
+}
+static void* dense_kernels_int8_nw[3][7] = {
+    DENSE_INT8_NW_ROW(f16),
+    DENSE_INT8_NW_ROW(bf16),
+    DENSE_INT8_NW_ROW(f32),
+};
+#undef DENSE_INT8_NW_ROW
+static_assert(
+    (int)(sizeof(dense_kernels_int8_nw[0]) / sizeof(dense_kernels_int8_nw[0][0])) == KO_ROW_COUNT,
+    "every KO format must have a narrow entry (null where it never runs narrow)");
+
+// The 8-row weight chunk of each narrow entry's format, in the table's order — what its
+// shared-memory ring is sized in (`narrow_layout.cuh`). Zero where there is no entry.
+static const int dense_narrow_chunk_bytes[7] = {
+    (int)sizeof(block_c_q4_KO_k1024),
+    (int)sizeof(block_c_q5_KO_k1024),
+    (int)sizeof(block_c_q6_KO_k1024),
+    (int)sizeof(block_c_q8_KO_k1024),
+    0,
+    (int)sizeof(block_c_q2_KO_k1024),
+    (int)sizeof(block_c_q3_KO_k1024),
+};
+
+// Whether each narrow kernel has been opted into NARROW_SMEM_CAP of dynamic shared memory.
+// Set once per kernel, before its first launch; the attribute is idempotent, so two threads
+// that both find it unset both set the same value.
+static std::atomic<bool> dense_narrow_smem_opted[3][7] = {};
 
 // Split-K int8 dense matmul: the mode-1 tile grid (ceil(M/16) × ΣN/32) times `splits`
 // slices of K, over `num_segs` weight segments of one KO format sharing the activation
@@ -924,6 +1005,90 @@ extern "C" int run_dense_int8_splitk(
     return QMM_OK;
 }
 
+// Narrow int8 dense matmul: one block per 8-row output tile of ΣN, `warps` warps walking K
+// between them and summing in shared memory (grouped_tc::quantized_matmul_dense_narrow_entry_int8),
+// over `num_segs` weight segments of one KO format sharing the activation (`splitk_segs.cuh`,
+// tiles of 8 rows) — `weights[s]` of `nrows[s]` rows, each a multiple of 32, written to
+// consecutive column ranges of the `ΣN`-wide output. At most NARROW_MAX_ROWS tokens. No
+// scratch: the reduction never leaves the block. Rust decides when it runs and at how many
+// warps (`int8_split_k::q8a128_dense_plan`).
+extern "C" int run_dense_int8_narrow(
+    const void* const* weights,
+    const int32_t* nrows,
+    int32_t num_segs,
+    const void* vy,
+    void* dst,
+    int32_t ncols_x,      // K
+    int32_t total_batch,  // M
+    int32_t qtype,
+    int32_t out_dtype,
+    int32_t sum_norm,
+    int32_t warps,
+    void* stream
+) {
+    if (out_dtype < 0 || out_dtype > 2) {
+        return QMM_BAD_OUT_DTYPE;
+    }
+    const int kernel_row = qtype_to_matmul_kernel_index(qtype);
+    if (kernel_row < KO_ROW_FIRST || kernel_row - KO_ROW_FIRST >= KO_ROW_COUNT) {
+        return QMM_BAD_QTYPE;
+    }
+    const int fmt = kernel_row - KO_ROW_FIRST;
+    void* kfn = dense_kernels_int8_nw[out_dtype][fmt];
+    const int k_tiles = ncols_x / 128;
+    // A null entry is a format that never runs narrow. One token tile of at most
+    // NARROW_MAX_ROWS rows, whole K tiles, a warp count the launch bounds admit.
+    if (kfn == nullptr || total_batch < 1 || total_batch > NARROW_MAX_ROWS
+        || ncols_x <= 0 || ncols_x % 128 != 0 || warps < 1 || warps > NARROW_MAX_WARPS) {
+        return QMM_BAD_SPLIT;
+    }
+    const int smem = narrow_smem_bytes(dense_narrow_chunk_bytes[fmt], k_tiles, warps);
+    if (smem > NARROW_SMEM_CAP) {
+        return QMM_BAD_SPLIT;
+    }
+    if (num_segs < 1) {
+        return QMM_NO_SEGMENTS;
+    }
+    if (num_segs > SPLITK_MAX_SEGS) {
+        return QMM_NO_KERNEL;
+    }
+    SplitKSegs segs;
+    int tile = 0, col = 0;
+    for (int s = 0; s < num_segs; ++s) {
+        if (nrows[s] <= 0 || nrows[s] % 32 != 0) {
+            return QMM_NO_KERNEL;
+        }
+        segs.w[s] = weights[s];
+        segs.tile_start[s] = tile;
+        segs.n[s] = nrows[s];
+        segs.col_off[s] = col;
+        tile += nrows[s] / 8;
+        col += nrows[s];
+    }
+    segs.tile_start[num_segs] = tile;
+    segs.num = num_segs;
+    if (!dense_narrow_smem_opted[out_dtype][fmt].load(std::memory_order_acquire)) {
+        if (cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 NARROW_SMEM_CAP) != cudaSuccess) {
+            return QMM_LAUNCH_FAILED;
+        }
+        dense_narrow_smem_opted[out_dtype][fmt].store(true, std::memory_order_release);
+    }
+    dim3 grid(1, tile, 1);
+    dim3 block(WARP_SIZE, warps, 1);
+    const int dst_stride = col;
+    void* args[] = {
+        (void*)&segs, (void*)&vy, (void*)&dst,
+        (void*)&ncols_x, (void*)&total_batch,
+        (void*)&dst_stride, (void*)&sum_norm,
+    };
+    // The narrow entry waits (`pdl_wait`) before its activation.
+    if (launch_pdl(kfn, grid, block, args, (size_t)smem, (cudaStream_t)stream) != cudaSuccess) {
+        return QMM_LAUNCH_FAILED;
+    }
+    return QMM_OK;
+}
+
 // The fused-activation dense matmul: `dst [M, N] = silu(proj[:, 0..K]) · Wᵀ` for a Q8_KO
 // weight and an F32 output, the activation quantized by the kernel's own loader
 // (grouped_tc::quantized_matmul_dense_silu_entry_int8). `proj` rows are `proj_stride`
@@ -983,7 +1148,8 @@ extern "C" int run_quantized_matmul(
     int32_t qtype,
     int32_t ytype,
     size_t weight_bytes,  // Weight tensor size in bytes for L2 cache decision (FP path)
-    int32_t force_mode2,  // int8 dense tiling: 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32 reuse). Rust decides.
+    int32_t tile_mode,    // int8 dense tiling: 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32), 2 = mode-4
+                          // (Bm=64 × 128 rows; KO formats). Rust decides (`DenseTile`).
     int32_t out_dtype,    // int8 dense store width: 0 = F16, 1 = BF16, 2 = F32. FP path ignores it
                           // (there the output dtype is the activation dtype).
     int32_t sum_norm,     // q8a128 Σx convention (`SumScale::as_code()`); the int8 dense path
@@ -1078,21 +1244,32 @@ extern "C" int run_quantized_matmul(
         const int total_batch = nrows_y;                  // M
         const int y_stride = ncols_x;                     // unused by the int8 kernel (ABI)
         const int dst_stride = nrows_x;                   // N
-        const bool mode2 = (force_mode2 != 0);  // weight-reuse crossover decided in Rust
+        const bool ko_row = kernel_row >= KO_ROW_FIRST && kernel_row - KO_ROW_FIRST < KO_ROW_COUNT;
         void* kfn;
         int batch_div;
-        if (mode2 && kernel_row >= KO_ROW_FIRST && kernel_row - KO_ROW_FIRST < KO_ROW_COUNT) {
+        int row_div;
+        if (tile_mode == 2 && ko_row) {
+            kfn = dense_kernels_int8_m4[out_dtype][kernel_row - KO_ROW_FIRST];  // prefill tile
+            batch_div = 64;                               // Bm = 64 (mode-4, N_SUB=4)
+            row_div = 128;                                // 32 rows × RN=4
+        } else if (tile_mode == 1 && ko_row) {
             kfn = dense_kernels_int8_m2[out_dtype][kernel_row - KO_ROW_FIRST];  // Bm=32 weight-reuse
             batch_div = 32;                               // Bm = 32 (mode-2, N_SUB=2)
-        } else {
+            row_div = 32;
+        } else if (tile_mode == 0) {
+            // The wider tiles exist for the KO rows alone; a wider tile asked of any
+            // other row is refused below, never quietly run as mode-1.
             kfn = dense_kernels_int8[out_dtype][kernel_row];
             batch_div = 16;                               // BATCH_TILE_I8 = 16 (mode-1)
+            row_div = 32;
+        } else {
+            return QMM_BAD_TILE_MODE;
         }
         if (kfn == nullptr) {
             return QMM_NO_KERNEL;
         }
         const int batch_tiles = (total_batch + batch_div - 1) / batch_div;
-        const int row_tiles = (nrows_x + 31) / 32;        // N_TILE = 32
+        const int row_tiles = (nrows_x + row_div - 1) / row_div;
         dim3 grid(batch_tiles, row_tiles, 1);
         dim3 block(WARP_SIZE, 4, 1);                       // 128 threads (4 warps × 32)
         void* args[] = {
@@ -1523,11 +1700,14 @@ extern "C" int run_grouped_quantized_matmul(
     // to 16·n_sub, so a mode without a kernel MUST refuse rather than launch a
     // narrower kernel that would drop the tiles' upper rows.
     void* kfn;
+    // Rows per block: 32 for the FP and mode-2 tiles, 32·RN for the wide int8 tiles
+    // (`INSTANTIATE_KERNEL_GROUPED_INT8_M4/_M8`: RN = 4 / 2).
+    int row_div = 32;
     if (ytype == 3) {
         switch (n_sub) {
             case 2: kfn = grouped_kernels_int8[kernel_row]; break;
-            case 4: kfn = grouped_kernels_int8_m4[kernel_row]; break;
-            case 8: kfn = grouped_kernels_int8_m8[kernel_row]; break;
+            case 4: kfn = grouped_kernels_int8_m4[kernel_row]; row_div = 128; break;
+            case 8: kfn = grouped_kernels_int8_m8[kernel_row]; row_div = 64; break;
             default: return QMM_BAD_TILE_MODE;
         }
     } else {
@@ -1537,7 +1717,7 @@ extern "C" int run_grouped_quantized_matmul(
         return QMM_NO_KERNEL;
     }
 
-    const int row_tiles = (nrows_x + 31) / 32;  // N_TILE = 32
+    const int row_tiles = (nrows_x + row_div - 1) / row_div;
     // Grid axis order is the caller's per-launch choice (see the kernel entry doc):
     // row_fast puts row tiles on x so consecutive blocks share one token tile's
     // activation slab in L2; token-fast is the transpose. Whichever axis carries

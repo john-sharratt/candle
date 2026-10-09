@@ -320,6 +320,12 @@ impl HybridBatched {
     /// count — so a cohort narrower than the high-water mark still carves the
     /// high-water mark, and pricing the cohort would under-reserve by the
     /// difference.
+    ///
+    /// **Spans are the ones still outstanding.** The verify forward reads this
+    /// right after `begin`, when they are the whole cohort — the count the replay
+    /// later sizes its stacks from (`VerifyStash::cohort_spans`), after the rewinds
+    /// have removed theirs. A forward read after those removals prices no replay,
+    /// which is right: it owes none.
     pub fn verify_stash_width(&self) -> Result<Option<(usize, usize)>> {
         let slot = self
             .verify_stash

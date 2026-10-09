@@ -13,7 +13,7 @@
 //! family's weight containers (the `qwen35` lineage's
 //! `quantized_delta_net.rs`).
 
-use candle::quantized::cuda::DynamicActs;
+use candle::quantized::cuda::{DynamicActs, DynamicTensor};
 use candle::quantized::{Int8Mode, SumScale};
 use candle::{DType, LiveTensor, Result, Tensor};
 
@@ -27,8 +27,8 @@ use crate::models::quantized_matmul::QMatMul;
 use crate::models::stacked_proj::project_grouped;
 
 use super::mix::{
-    capture_spans, delta_net_mix_spans, DeltaNetConstants, DeltaNetLayerTable, DeltaNetProjections,
-    DeltaNetSeq, DeltaNetState, StashCapture,
+    capture_spans, delta_net_mix_spans, delta_net_mix_spans_q8, DeltaNetConstants,
+    DeltaNetLayerTable, DeltaNetProjections, DeltaNetSeq, DeltaNetState, MixOut, StashCapture,
 };
 use super::types::{DeltaNetDims, ZGate};
 
@@ -229,16 +229,33 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
         norm: &w.norm,
     };
     let g_mix = gpu_span("dn:mix", device);
-    let gated = delta_net_mix_spans(
-        &p,
-        &c,
-        dims,
-        seqs,
-        rms_eps,
-        table,
-        zgate,
-        wave.map(|g| g.ticket()),
-    )?;
+    // An int8 output projection takes its operand from the mixer's epilogue,
+    // written as it stores the gated output — the bytes the projection's own
+    // quantize would write, without that launch.
+    let gated = if w.w_out.int8mode().is_int8() {
+        delta_net_mix_spans_q8(
+            &p,
+            &c,
+            dims,
+            seqs,
+            rms_eps,
+            table,
+            zgate,
+            wave.map(|g| g.ticket()),
+            w.w_out.sum_scale(),
+        )?
+    } else {
+        MixOut::F32(delta_net_mix_spans(
+            &p,
+            &c,
+            dims,
+            seqs,
+            rms_eps,
+            table,
+            zgate,
+            wave.map(|g| g.ticket()),
+        )?)
+    };
     g_mix.end();
 
     let g_out = gpu_span("dn:out_proj", device);
@@ -247,7 +264,12 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
     // the mixer has just computed — and the FP fallback would widen it right
     // back on the next line. `out_dtype` names what the residual stream wants,
     // so the store does the conversion the cast used to.
-    let out = w.w_out.forward_live_as(&gated, out_dtype)?;
+    let out = match gated {
+        MixOut::Q8(op) => w
+            .w_out
+            .forward_dynamic(DynamicTensor::Int8(&op), out_dtype)?,
+        MixOut::F32(gated) => w.w_out.forward_live_as(&gated, out_dtype)?,
+    };
     g_out.end();
     Ok(out)
 }

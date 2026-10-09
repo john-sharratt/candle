@@ -697,6 +697,10 @@ impl BatchedModelCore for ModelWeights {
         true
     }
 
+    fn take_device_fault(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn prune(&self) -> Result<()> {
         // Compact the embedding cache to free GPU copies
         self.embeddings.compact();

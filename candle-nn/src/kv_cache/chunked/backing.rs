@@ -20,16 +20,17 @@ use super::compact_map::Replaced;
 use super::compact_plan::ArenaSlots;
 use super::fresh_arenas::FreshArenas;
 use super::head_gids::ChunkBands;
+use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
+#[cfg(feature = "cuda")]
+use super::slot_upload_batch::SlotUploadBatch;
+use super::types::DecodeGpuChunksSyncKind;
 use super::{
     Arena, ArenaKey, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta,
     CompressionPolicy, GpuArenaClassStats, LiveChunkRef, SealedChunk, StoragePolicy,
 };
-// Only the CUDA-gated compress-eligibility helper needs the sealed-sequence type.
-use super::size_class::{class_for_payload, payload_bytes_for_tag, SizeClass};
-#[cfg(feature = "cuda")]
-use super::SealedSequence;
 use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, PerHeadEntry};
 use std::collections::HashSet;
+use std::time::Duration;
 
 use super::gid_pool::ChunkGid;
 // `N_PALETTE` is referenced by the intra-doc links throughout this file and by
@@ -405,10 +406,21 @@ pub struct DecodeGpuChunkSyncStats {
     pub reuses: u64,
     /// Slots whose stale writer region was re-serialised, then served.
     pub resyncs: u64,
+    /// Entries those resyncs serialised, all slots together.
+    pub resync_entries: u64,
+    /// Slots extended over appended chunks — their tail serialised, then
+    /// served.
+    pub extends: u64,
+    /// Entries those extends serialised, all slots together.
+    pub extend_entries: u64,
     pub empty: u64,
-    pub rebuild_time: std::time::Duration,
-    pub reuse_time: std::time::Duration,
-    pub resync_time: std::time::Duration,
+    pub rebuild_time: Duration,
+    pub reuse_time: Duration,
+    pub resync_time: Duration,
+    pub extend_time: Duration,
+    /// Host time of the one batched upload that copies every slot the sync
+    /// re-serialised.
+    pub upload_time: Duration,
 }
 
 impl BackingInner {
@@ -815,7 +827,6 @@ impl ChunkedKvBacking {
 
     /// Whether this backing's records live in device memory, and so whether there is
     /// anything to build or mint at all.
-    #[allow(dead_code)] // the only caller is `compact_mint`, which is cuda-gated
     pub(super) fn records_are_resident(&self) -> bool {
         self.inner.meta_pool.is_device_resident()
     }
@@ -1816,11 +1827,13 @@ impl ChunkedKvBacking {
 
     /// Synchronise decode slot-state buffers for the selected sequences and
     /// return both the raw slot pointers and aggregated rebuild-versus-reuse
-    /// timing stats.
+    /// timing stats. Every slot re-serialised is uploaded by one scatter staged
+    /// through `generation` (see `slot_upload_batch`).
     pub fn sync_decode_gpu_chunks(
         &self,
         batch_entries: &[(usize, usize)],
         arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
+        generation: &Generation,
     ) -> candle::Result<(
         Vec<(u64, u32, u32)>,
         Vec<Arc<Vec<super::gpu_chunks::ChunkPin>>>,
@@ -1842,6 +1855,12 @@ impl ChunkedKvBacking {
         // replaced, on a lock the persistence thread contends.
         let mut pins = Vec::with_capacity(batch_entries.len());
         let mut stats = DecodeGpuChunkSyncStats::default();
+        // Flushed below under the state lock still held, which owns every slot
+        // this loop writes.
+        #[cfg(feature = "cuda")]
+        let batch = SlotUploadBatch::open(generation)?;
+        #[cfg(not(feature = "cuda"))]
+        let _ = generation;
         for &(seq_idx, seq_offset) in batch_entries {
             let t_sync = std::time::Instant::now();
             let (result, sync_kind) = if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
@@ -1852,28 +1871,41 @@ impl ChunkedKvBacking {
                 synced
             } else {
                 pins.push(Arc::new(Vec::new()));
-                ((0, 0, 0), super::types::DecodeGpuChunksSyncKind::Empty)
+                ((0, 0, 0), DecodeGpuChunksSyncKind::Empty)
             };
             let elapsed = t_sync.elapsed();
             match sync_kind {
-                super::types::DecodeGpuChunksSyncKind::Rebuild => {
+                DecodeGpuChunksSyncKind::Rebuild => {
                     stats.rebuilds += 1;
                     stats.rebuild_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Reuse => {
+                DecodeGpuChunksSyncKind::Reuse => {
                     stats.reuses += 1;
                     stats.reuse_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Resync => {
+                DecodeGpuChunksSyncKind::Resync { entries } => {
                     stats.resyncs += 1;
+                    stats.resync_entries += entries as u64;
                     stats.resync_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Empty => {
+                DecodeGpuChunksSyncKind::Extend { entries } => {
+                    stats.extends += 1;
+                    stats.extend_entries += entries as u64;
+                    stats.extend_time += elapsed;
+                }
+                DecodeGpuChunksSyncKind::Empty => {
                     stats.empty += 1;
                 }
             }
             results.push(result);
         }
+        #[cfg(feature = "cuda")]
+        {
+            let t_upload = std::time::Instant::now();
+            batch.flush()?;
+            stats.upload_time = t_upload.elapsed();
+        }
+        drop(state);
         Ok((results, pins, stats))
     }
 
@@ -1901,6 +1933,11 @@ impl ChunkedKvBacking {
 
         let mut results = Vec::with_capacity(batch_entries.len());
         let mut stats = DecodeGpuChunkSyncStats::default();
+        // Every slot this loop re-serialises is uploaded by ONE scatter when the
+        // batch flushes below — under the state lock still held here, which owns
+        // every one of those slots (see `slot_upload_batch`).
+        #[cfg(feature = "cuda")]
+        let batch = SlotUploadBatch::open(generation)?;
         // A speculative-verify wave carries one entry per BLOCK POSITION, so a
         // sequence appears `block_len` times with an identical (seq, offset)
         // key — and an identical snapshot. Snapshot once per key and reuse the
@@ -1936,28 +1973,41 @@ impl ChunkedKvBacking {
                 };
                 ((ptr, n_slices, write_slice), kind)
             } else {
-                ((0, 0, 0), super::types::DecodeGpuChunksSyncKind::Empty)
+                ((0, 0, 0), DecodeGpuChunksSyncKind::Empty)
             };
             let elapsed = t_sync.elapsed();
             match sync_kind {
-                super::types::DecodeGpuChunksSyncKind::Rebuild => {
+                DecodeGpuChunksSyncKind::Rebuild => {
                     stats.rebuilds += 1;
                     stats.rebuild_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Reuse => {
+                DecodeGpuChunksSyncKind::Reuse => {
                     stats.reuses += 1;
                     stats.reuse_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Resync => {
+                DecodeGpuChunksSyncKind::Resync { entries } => {
                     stats.resyncs += 1;
+                    stats.resync_entries += entries as u64;
                     stats.resync_time += elapsed;
                 }
-                super::types::DecodeGpuChunksSyncKind::Empty => {
+                DecodeGpuChunksSyncKind::Extend { entries } => {
+                    stats.extends += 1;
+                    stats.extend_entries += entries as u64;
+                    stats.extend_time += elapsed;
+                }
+                DecodeGpuChunksSyncKind::Empty => {
                     stats.empty += 1;
                 }
             }
             results.push(result);
         }
+        #[cfg(feature = "cuda")]
+        {
+            let t_upload = std::time::Instant::now();
+            batch.flush()?;
+            stats.upload_time = t_upload.elapsed();
+        }
+        drop(state);
         Ok((results, stats))
     }
 
@@ -2489,6 +2539,51 @@ impl ChunkedKvBacking {
             .flatten()
     }
 
+    /// The highest region any KV arena on this device holds — every band pool and
+    /// the record pool together — or `None` with no KV arena.
+    ///
+    /// The question a compaction gate asks before it pays for a census: a KV pass
+    /// can lower the frontier only when a KV arena is what stands at it. When the
+    /// topmost live region is another tenant's, packing the KV pools moves holes
+    /// about beneath it and the frontier stays where it is. Cheap for the reason
+    /// [`Self::pool_top_rank`] is.
+    ///
+    /// **An arena emptied and not yet swept still counts.** It holds its region
+    /// until a sweep returns it, so while it stands at the frontier the frontier is
+    /// the KV side's to lower — the KV pass's sweep is what lowers it. Counted only
+    /// by its live slots, it read as another tenant's region, sent the gate to a
+    /// span-tenant pass that could not move it, and stalled the gate on that.
+    pub fn kv_top_rank(&self) -> Option<usize> {
+        let record_key = if self.records_are_resident() {
+            self.record_layout().ok().map(|l| l.key)
+        } else {
+            None
+        };
+        SizeClass::all()
+            .map(|class| ArenaKey::new(class, ArenaLocation::Gpu))
+            .chain(record_key)
+            .filter_map(|key| self.pool_top_region(key))
+            .max()
+    }
+
+    /// The highest region rank any arena of `key` holds, live slots or none.
+    fn pool_top_region(&self, key: ArenaKey) -> Option<usize> {
+        let load = self.inner.pool.pool_arena_load(key);
+        if load.is_empty() {
+            return None;
+        }
+        self.inner
+            .storage
+            .read(|s| {
+                let arenas = s.arenas();
+                load.iter()
+                    .filter_map(|(idx, _, _)| arenas.get(idx).and_then(|a| a.region_rank()))
+                    .max()
+            })
+            .ok()
+            .flatten()
+    }
+
     /// The census one pool's compaction plans from — occupancy joined to physical
     /// address order.
     ///
@@ -2566,39 +2661,6 @@ impl ChunkedKvBacking {
     /// float side. See [`GpuArenaClassStats`].
     pub fn gpu_arena_class_stats(&self) -> GpuArenaClassStats {
         self.inner.pool.gpu_class_stats()
-    }
-
-    /// True when at least one of `seq`'s chunks is still wholly in a GPU float /
-    /// R16 source arena — i.e. `quantize_sealed_in_place` would do real kernel
-    /// work on this sequence rather than pass it through unchanged.
-    ///
-    /// Mirrors the per-chunk eligibility test in `compress.rs`: a chunk is
-    /// compressible when every one of its `(h, p)` source bands is GPU-resident
-    /// and recorded as `Float` or `Quantized(R16)`. Used by the scheduler's
-    /// compress-to-free relief rung to skip turns whose hot is already
-    /// quantized (a prior relief pass, or the persistence thread, beat it to
-    /// them), so an undrained `snapshot_pending_warm` backlog doesn't re-walk
-    /// finished turns.
-    ///
-    /// The two halves of the test come from different owners: **location** is
-    /// arena identity and is read from storage, **format** travels with the
-    /// chunk and is read from its own band tags.
-    #[cfg(feature = "cuda")]
-    pub fn sealed_has_compressible_chunk(&self, seq: &SealedSequence) -> bool {
-        self.inner
-            .storage
-            .read(|storage| {
-                seq.chunks.iter().any(|chunk| {
-                    chunk.bands().all(|(gid, tag)| {
-                        super::chunk_ops::needs_reconcile_source_tag(tag)
-                            && matches!(
-                                storage.arena_key(gid.arena_idx()),
-                                Some(k) if k.location == ArenaLocation::Gpu
-                            )
-                    })
-                })
-            })
-            .unwrap_or(false)
     }
 
     /// Calculate the percentage of a sequence's tokens that are stored in quantized arenas.

@@ -27,26 +27,34 @@
 //! overwritten before both host threads have read it — a check against two
 //! counters, never against the driver or the GPU.
 
+use super::fault::FaultWord;
+use super::flush_schedule::{SegmentFill, MAX_UNFLUSHED_INVOCATIONS};
 use super::live_table::{LiveTable, Proj};
 use super::promo::PromotionRing;
+use super::read_ahead_gate::{LinkTime, ReadAheadGate};
 use super::reclaim::ReclaimClock;
 #[cfg(feature = "tensor-assert")]
 use super::slot_owners::SlotOwners;
 use super::stager::StagerMsg;
 use super::started::StartedRows;
-use super::types::{PipelineMessage, RoutedLayer};
+use super::transition::HOPS;
+use super::types::{LookAhead, PipelineMessage, RoutedLayer};
+use super::votes::VoteRing;
 use crate::models::batched_inference::MAX_PREFILL_TOKENS;
 use crate::models::profile::{gpu_span, profile_now};
 use crate::models::wave_buffers::{wave_empty, wave_root};
 use candle::cuda_backend::CudaDevice;
+#[cfg(feature = "profile")]
+use candle::quantized::cuda::STALL_WORDS;
 use candle::quantized::cuda::{
     fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_int8_n_sub,
-    grouped_qmatmul_dev_q8a128, moe_bucketize, silu_mul_q8a128, BucketizeLive,
-    MoeBucketizeWorkspace, MoeLive, OwnerCheck, Q8a128Operand,
+    grouped_qmatmul_dev_q8a128, moe_bucketize, moe_predict_votes, silu_mul_q8a128, BucketizeLive,
+    MoeBucketizeWorkspace, MoeLive, OwnerCheck, Q8a128Operand, ReadAhead,
 };
 use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::SumScale;
 use candle::{DType, Device, LiveTensor, Result};
+use candle_kernels::simple::moe_bucketize::{AHEAD_ITEM_WORDS, AHEAD_MAX};
 use candle_nn::kv_cache::WaveGeneration;
 use cudarc::driver::{sys, CudaSlice, DevicePtr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,16 +70,40 @@ pub(crate) const SUMMARY_RING: usize = 64;
 /// so this only bounds the queue.
 pub(crate) const PIPELINE_CHANNEL_BOUND: usize = SUMMARY_RING;
 
-/// The longest a single worker may wait for a cold expert before it traps. A
-/// backstop below the display watchdog's 2 s (TDR), never meant to fire: a wait
-/// this long means the stager is not delivering.
-pub(crate) const SPIN_LIMIT_NS: u64 = 1_500_000_000;
+/// The longest a single worker waits for a cold expert before it gives the
+/// expert up and fails the forward (`fault`). A backstop well inside the
+/// display watchdog's 2 s (TDR), never meant to fire: a wait this long means the
+/// stager is not delivering.
+pub(crate) const SPIN_LIMIT_NS: u64 = 1_000_000_000;
+
+/// Ranks past the router's own top `k` each token names in the look-ahead's
+/// votes (`moe_predict_votes`).
+///
+/// The look-ahead applies a later layer's router to this layer's input, a layer
+/// stale, so the experts that layer actually routes sit just below its top `k`
+/// more often than the cut admits — at ×1 about four of the ten. The margin
+/// predicts past the cut at the cost of copies that may go unused. It needs no
+/// schedule by width: the margin picks rank below every routed pick
+/// (`votes::ranked`), and the per-row caps, the read-ahead window and the
+/// stager's in-flight limit all cut a list from the bottom — so at ×1 the margin
+/// fills the room one token's ten leave, and at ×8 the routed picks fill it.
+///
+/// Measured on Qwen3.8-Flash-Next (RTX 4090 Laptop, two alternating pairs
+/// against a margin of 0): hop-1 recall 51 → 65% at ×1 and 32 → 45% at ×8, ×8
+/// decode +1.5–2.5% (94.9 → 96.3, 97.1 → 98.8 t/s; C5×8 99.3 → 100.7), ×8 cold
+/// misses −5–6%, ×1 level. It pays only with room in the staging list: at a
+/// `STAGE_CAP` of 32 the routed picks of a five-token verify wave already filled
+/// it, and the margin moved recall one point.
+pub(crate) const LOOK_AHEAD_MARGIN: usize = 6;
 
 /// Worker blocks per expert launch, by its width.
 ///
-/// 8 reach the link's rate (§0.10.1–2), and a decode launch's remote experts
-/// carry a token tile each, so 8 is all decode needs; every block past what is
-/// needed is a block launched to exit, on every launch. A prefill launch's
+/// A worker's copy of a slice is a few PCIe round trips, then its compute: a
+/// worker is latency-bound, and the link fills only with many of them. Decode
+/// launches take 32: on Flash-Next (RTX 4090 Laptop) 8 → 16 raised decode a
+/// third (×8 68 → 89 t/s, ×1 22 → 29), 32 a few percent more (×8 93), and 64
+/// measured level with 32 — the blocks past what the link needs launch only to
+/// exit, on every launch. A prefill launch's
 /// remote experts carry several token tiles each and the workers compute them
 /// all: on the qwen36 gate's cold prefill (RTX 3090) 8 workers made it
 /// compute-bound at 814 t/s, 32 ran at 1,083, 64 no faster. Where misses are
@@ -79,7 +111,7 @@ pub(crate) const SPIN_LIMIT_NS: u64 = 1_500_000_000;
 /// working set 3× the zone) ran 969 t/s at 32, 1,031 at 64 and 1,044 at 128, and
 /// 128 cost its ×16 decode ~4%. The workers take their own grid rows, so a count
 /// above a projection's row tiles adds rows, never width.
-pub(crate) const WORKERS_DECODE: usize = 8;
+pub(crate) const WORKERS_DECODE: usize = 32;
 pub(crate) const WORKERS_PREFILL: usize = 64;
 
 /// Launches over more tokens than this take [`WORKERS_PREFILL`].
@@ -179,14 +211,23 @@ impl SummaryRing {
         ready
     }
 
-    /// Wait for [`Self::ready`]. A word that never arrives means the device
-    /// faulted or the forward thread's chain died; that is reported rather
-    /// than waited out.
-    pub(crate) fn wait(&self, slot: usize, word: u32) -> Result<()> {
+    /// Wait for [`Self::ready`], calling `idle` every [`WAIT_IDLE_EVERY`] polls
+    /// — the waiter's chance to do work that must not wait for this word. A
+    /// word that never arrives means the device faulted or the forward
+    /// thread's chain died; that is reported rather than waited out.
+    pub(crate) fn wait(
+        &self,
+        slot: usize,
+        word: u32,
+        mut idle: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         let start = std::time::Instant::now();
         let mut spins = 0u32;
         while !self.ready(slot, word) {
             spins += 1;
+            if spins.is_multiple_of(WAIT_IDLE_EVERY) {
+                idle()?;
+            }
             if spins < 1024 {
                 std::hint::spin_loop();
             } else {
@@ -214,9 +255,15 @@ impl SummaryRing {
     }
 }
 
+/// Polls of a routing-summary word between two calls of the waiter's idle work:
+/// often enough that a finished copy is landed within microseconds, rarely
+/// enough that the poll stays a load of one mapped word.
+const WAIT_IDLE_EVERY: u32 = 64;
+
 /// How long the pipeline thread waits for a routing summary before it decides
 /// the device is not going to produce one. Far above any layer's compute — a
-/// worker traps after [`SPIN_LIMIT_NS`] — so it fires only on a dead device.
+/// worker gives a cold expert up after [`SPIN_LIMIT_NS`] — so it fires only on
+/// a dead device.
 const SUMMARY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The sequence word bucketize stores for invocation `seq`: never zero, which
@@ -238,9 +285,9 @@ impl Drop for SummaryRing {
 /// The word every waiting worker polls, and the means to raise it.
 ///
 /// Raised when a cold expert can never be published — a failed pack read, a
-/// stager or pipeline thread that died. Every waiting worker then traps, the
-/// next synchronizing call reports the sticky error, and no token computed
-/// from the layer is returned.
+/// stager or pipeline thread that died. Every waiting worker then gives its
+/// expert up and claims the fault word (`fault`), the host fails the forward
+/// once it has synchronised, and no token computed from the layer is returned.
 ///
 /// The word lives in mapped pinned memory and is raised with a plain host
 /// store: raising it must not need the driver.
@@ -325,7 +372,13 @@ pub(crate) struct PassState {
 struct ForwardSide {
     seq: u64,
     last_row: Option<usize>,
+    /// The invocations recorded into the current graph segment — what decides
+    /// where [`Dispatch::after`] launches it.
+    fill: SegmentFill,
 }
+
+// Every invocation the ring hold can wait on has been launched.
+const _: () = assert!(2 * MAX_UNFLUSHED_INVOCATIONS <= SUMMARY_RING);
 
 /// The two pinned host ranges a remote entry lies in: the warm tier's pinned
 /// part, and the pad.
@@ -380,7 +433,13 @@ impl OwnerTags {
 pub(crate) struct Dispatch {
     pub(crate) table: Arc<LiveTable>,
     pub(crate) ring: Arc<SummaryRing>,
+    /// The router look-ahead votes, slot for slot with `ring`.
+    pub(crate) votes: Arc<VoteRing>,
     pub(crate) abort: Arc<AbortWord>,
+    /// Where a worker that gave a cold expert up says so (`fault`); shared
+    /// with the pipeline thread, which lands no demand promotion while it is
+    /// set.
+    pub(crate) fault: Arc<FaultWord>,
     pub(crate) clock: Arc<ReclaimClock>,
     pub(crate) pass: Arc<Mutex<PassState>>,
     /// The ticket of the last routed layer the pipeline thread has served.
@@ -404,12 +463,49 @@ pub(crate) struct Dispatch {
     scratch: CudaSlice<u8>,
     slot_bytes: usize,
     owner: OwnerTags,
-    /// Profile build only: per-row worker counters `[rows × 5]` (see
+    /// Read-ahead's device buffers, with the promotion ring: each row's slot
+    /// image layout (`u64[rows][4]`: gate, up, down offset, image bytes), the
+    /// items bucketize writes and the gate launch's workers copy, and their
+    /// piece counters (`candle-kernels/src/moe_read_ahead.cuh`).
+    ahead: Option<AheadBuffers>,
+    /// Whether the invocation being recorded reads ahead — set by the pipeline
+    /// thread from the cache's link time per decode invocation
+    /// (`read_ahead_gate`). Off, bucketize is not given `ahead` and the caller
+    /// passes no look-ahead routers.
+    pub(crate) read_ahead: Arc<ReadAheadGate>,
+    /// Profile build only: per-row worker counters `[rows × STALL_WORDS]` (see
     /// `kernel.cuh`, "A live expert table").
     #[cfg(feature = "profile")]
     pub(crate) stall: CudaSlice<u64>,
     #[cfg(feature = "profile")]
     device: CudaDevice,
+}
+
+/// Read-ahead's device buffers ([`Dispatch::ahead`]).
+struct AheadBuffers {
+    row_layout: CudaSlice<u64>,
+    items: CudaSlice<u64>,
+    done: CudaSlice<u32>,
+}
+
+/// Each row's read-ahead layout, `[rows][4]`: the gate, up and down entries'
+/// offsets inside a slot image — what a published entry adds to the slot base —
+/// and the bytes a read-ahead copies, the image rounded up to the 16-byte unit
+/// the workers move. Every slot and warm slot holds at least that: both are cut
+/// to a stride padded well past it.
+fn row_layout(table: &LiveTable, image_bytes: &[usize]) -> Vec<u64> {
+    image_bytes
+        .iter()
+        .enumerate()
+        .flat_map(|(row, &bytes)| {
+            [
+                table.offset(Proj::Gate, row),
+                table.offset(Proj::Up, row),
+                table.offset(Proj::Down, row),
+                bytes.next_multiple_of(16) as u64,
+            ]
+        })
+        .collect()
 }
 
 /// The expert GEMMs' worker counters, summed over rows since the last drain.
@@ -426,22 +522,46 @@ pub(crate) struct WorkerCounters {
     pub(crate) copy_ns: u64,
     /// Live launches.
     pub(crate) launches: u64,
+    /// Read-ahead items the gate launches' workers copied and published, and
+    /// their bytes.
+    pub(crate) ahead_items: u64,
+    pub(crate) ahead_bytes: u64,
 }
 
 impl Dispatch {
     /// `slot_bytes` is the largest 32-row tile slice of any projection — one
-    /// worker's scratch slot.
+    /// worker's scratch slot. `image_bytes` is each row's slot image size —
+    /// what a read-ahead copies; with the promotion ring, read-ahead is on.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         device: &CudaDevice,
         table: Arc<LiveTable>,
         pinned: PinnedRanges,
         slot_bytes: usize,
+        image_bytes: &[usize],
         k: usize,
         promo: Option<Arc<PromotionRing>>,
         owner: OwnerTags,
     ) -> Result<Self> {
+        if image_bytes.len() != table.n_rows() {
+            candle::bail!(
+                "expert dispatch: {} slot image sizes for a live table of {} rows",
+                image_bytes.len(),
+                table.n_rows()
+            );
+        }
+        let ahead = match &promo {
+            Some(_) => Some(AheadBuffers {
+                row_layout: device.memcpy_stod(&row_layout(&table, image_bytes))?,
+                items: device.memcpy_stod(&vec![0u64; 1 + AHEAD_MAX * AHEAD_ITEM_WORDS])?,
+                done: device.memcpy_stod(&vec![0u32; AHEAD_MAX])?,
+            }),
+            None => None,
+        };
+        let read_ahead = Arc::new(ReadAheadGate::new(&LinkTime::new(promo.is_none())));
         let n_experts = table.n_experts();
         let ring = Arc::new(SummaryRing::new(n_experts)?);
+        let votes = Arc::new(VoteRing::new(n_experts)?);
         let abort = Arc::new(AbortWord::new()?);
         let clock = Arc::new(ReclaimClock::new(StartedRows::mapped(table.n_rows())?));
         // Sized here for the widest wave the engine composes — its prefill
@@ -458,11 +578,13 @@ impl Dispatch {
         // SAFETY: each worker writes its slot before reading it.
         let scratch = unsafe { device.alloc::<u8>(WORKERS_PREFILL * slot_bytes)? };
         #[cfg(feature = "profile")]
-        let stall = device.memcpy_stod(&vec![0u64; table.n_rows() * 5])?;
+        let stall = device.memcpy_stod(&vec![0u64; table.n_rows() * STALL_WORDS])?;
         Ok(Self {
             table,
             ring,
+            votes,
             abort,
+            fault: Arc::new(FaultWord::new()?),
             clock,
             pass: Arc::new(Mutex::new(PassState {
                 pass: 0,
@@ -475,6 +597,7 @@ impl Dispatch {
             forward: Mutex::new(ForwardSide {
                 seq: 0,
                 last_row: None,
+                fill: SegmentFill::default(),
             }),
             snap,
             remote,
@@ -484,6 +607,8 @@ impl Dispatch {
             scratch,
             slot_bytes,
             owner,
+            ahead,
+            read_ahead,
             #[cfg(feature = "profile")]
             stall,
             #[cfg(feature = "profile")]
@@ -503,12 +628,14 @@ impl Dispatch {
         unsafe { cudarc::driver::result::memset_d8_sync(ptr, 0, rows.len() * 8) }
             .map_err(candle::Error::wrap)?;
         let mut c = WorkerCounters::default();
-        for r in rows.chunks_exact(5) {
+        for r in rows.chunks_exact(STALL_WORDS) {
             c.cold_wait_ns += r[0];
             c.items += r[1];
             c.bytes += r[2];
             c.copy_ns += r[3];
             c.launches += r[4];
+            c.ahead_items += r[5];
+            c.ahead_bytes += r[6];
         }
         Ok(c)
     }
@@ -541,6 +668,9 @@ impl Dispatch {
     /// read the slot's previous tenant, ticket `ticket - SUMMARY_RING`.
     fn hold_for_ring(&self, ticket: u64) -> Result<()> {
         let need = ticket.saturating_sub(SUMMARY_RING as u64);
+        // Host time the forward thread spends here is the GPU's, not its own:
+        // the readers consume a slot only once the device has written it.
+        let t = profile_now();
         let mut spins = 0u32;
         while self.served.load(Ordering::Acquire) < need
             || self.staged.load(Ordering::Acquire) < need
@@ -555,6 +685,7 @@ impl Dispatch {
                 std::thread::yield_now();
             }
         }
+        crate::models::profile::pipeline_record("moe:hold_ring", t);
         Ok(())
     }
 
@@ -586,13 +717,29 @@ impl Dispatch {
         decode: &DecodeRows,
         out_dtype: DType,
         wave: Option<&'w WaveGeneration>,
+        look_ahead: &[LookAhead<'_>],
     ) -> Result<LiveTensor<'w>> {
         let Device::Cuda(cuda_dev) = indices.device() else {
             candle::bail!("expert dispatch: expected a CUDA device")
         };
         let (num_tokens, _) = indices.dims2()?;
-        let reserved = self.before(tx, stager, row, num_tokens)?;
-        let ys = self.record(reserved, acts, weights, indices, decode, out_dtype, wave)?;
+        // The hops voted for, `1 ..= voted_hops`, each by exactly one part.
+        let voted_hops = look_ahead
+            .iter()
+            .map(|l| l.first_hop + l.hops - 1)
+            .max()
+            .unwrap_or(0);
+        let covered: usize = look_ahead.iter().map(|l| l.hops).sum();
+        if voted_hops > HOPS || covered != voted_hops || look_ahead.iter().any(|l| l.first_hop == 0)
+        {
+            candle::bail!(
+                "expert dispatch: look-ahead parts must cover hops 1..=n once each, n ≤ {HOPS}"
+            );
+        }
+        let reserved = self.before(tx, stager, row, num_tokens, voted_hops)?;
+        let ys = self.record(
+            reserved, acts, weights, indices, decode, out_dtype, wave, look_ahead,
+        )?;
         self.after(cuda_dev)?;
         Ok(ys)
     }
@@ -610,7 +757,11 @@ impl Dispatch {
         stager: &mpsc::Sender<StagerMsg>,
         row: usize,
         num_tokens: usize,
+        voted_hops: usize,
     ) -> Result<Reserved> {
+        // A faulted forward not yet failed: nothing is launched on top of it,
+        // and refusing before the reservation leaves the protocol untouched.
+        self.fault.check()?;
         let (seq, pass) = self.begin_invocation(row)?;
         let ticket = seq + 1;
         let slot = (seq % SUMMARY_RING as u64) as usize;
@@ -634,6 +785,7 @@ impl Dispatch {
             summary_word: word,
             ticket,
             prefill_width: num_tokens > PREFILL_LAUNCH_TOKENS,
+            voted_hops,
             submitted_at: profile_now(),
         }))
         .map_err(|_| candle::Error::Msg("expert pipeline thread died — channel closed".into()))?;
@@ -643,11 +795,25 @@ impl Dispatch {
 
     /// Submit what [`Self::record`] queued. Both host threads wait on the
     /// summary word bucketize writes, and nothing on the forward thread
-    /// synchronizes, so on WDDM nothing else would flush it. Inside a wave
-    /// capture this is where a segment ends: the recorded launches, bucketize
-    /// among them, are launched as one graph before the query.
+    /// synchronizes, so on WDDM nothing else would flush it. Issued eagerly,
+    /// every invocation is submitted. Inside a wave capture this is where a
+    /// segment ends — once it holds the invocations the flush schedule gives
+    /// its ordinal (`flush_schedule`): the recorded launches, bucketize among them, are
+    /// launched as one graph before the query.
     fn after(&self, device: &CudaDevice) -> Result<()> {
-        device.flush_launches()
+        let flush = match device.recording_segment() {
+            None => true,
+            Some((wave, ordinal)) => self
+                .forward
+                .lock()
+                .map_err(|_| candle::Error::Msg("expert dispatch: forward state poisoned".into()))?
+                .fill
+                .record(wave, ordinal),
+        };
+        if flush {
+            device.flush_launches()?;
+        }
+        Ok(())
     }
 
     /// The launches of one reserved invocation, and nothing else: bucketize,
@@ -662,6 +828,7 @@ impl Dispatch {
         decode: &DecodeRows,
         out_dtype: DType,
         wave: Option<&'w WaveGeneration>,
+        look_ahead: &[LookAhead<'_>],
     ) -> Result<LiveTensor<'w>> {
         let device = indices.device().clone();
         let Device::Cuda(cuda_dev) = &device else {
@@ -686,7 +853,7 @@ impl Dispatch {
         // at ×8–×16 25–33%.
         let n_sub = grouped_int8_n_sub(
             (num_tokens * k) / n_experts.max(1),
-            gate_dtype.is_ko() && down_dtype.is_ko(),
+            &[gate_dtype, down_dtype],
         );
         let tile_w = 16 * n_sub;
         let compute = cuda_dev.cuda_stream();
@@ -700,6 +867,37 @@ impl Dispatch {
         let remote = self.remote.device_ptr(&compute).0;
         let counters = self.counters.device_ptr(&compute).0;
         let remote_dst = self.remote_dst.device_ptr(&compute).0;
+        // Without read-ahead the walk runs only for a launch with remote
+        // experts to claim for, and reads none of the ring's listings.
+        let reads_ahead = self.read_ahead.pays();
+        let ahead = self
+            .ahead
+            .as_ref()
+            .filter(|_| reads_ahead)
+            .map(|a| ReadAhead {
+                row_layout: a.row_layout.device_ptr(&compute).0,
+                rows: table.n_rows() as i32,
+                items: a.items.device_ptr(&compute).0,
+                done: a.done.device_ptr(&compute).0,
+            });
+        // The next rows' votes, ahead of bucketize: its summary word is the
+        // store the pipeline thread waits on, so the votes are in its slot by
+        // then (`votes`).
+        let n = (k + LOOK_AHEAD_MARGIN).min(n_experts);
+        let (words, mass) = self.votes.dev_slot(slot);
+        for la in look_ahead {
+            let at = ((la.first_hop - 1) * n_experts * 4) as u64;
+            moe_predict_votes(
+                la.rows,
+                la.first_col,
+                la.hops,
+                n_experts,
+                k,
+                n,
+                words + at,
+                mass + at,
+            )?;
+        }
         let g = gpu_span("moe:bucketize", &device);
         moe_bucketize(
             indices,
@@ -727,6 +925,10 @@ impl Dispatch {
                 started_rows: self.clock.started_ptr(),
                 ticket: seq + 1,
                 owner: self.owner.check,
+                // The ring's read-ahead: what this launch's misses leave of the
+                // layer's link window goes to the vetted experts predicted for
+                // the rows after the next, copied by the gate launch's workers.
+                ahead,
             }),
             decode,
         )?;
@@ -740,6 +942,7 @@ impl Dispatch {
         let hp = ws.header.device_ptr(&compute).0;
         let live = |proj: Proj| MoeLive {
             abort: self.abort.ptr(),
+            fault: self.fault.ptr(),
             live_row: table.row_ptr(proj, row),
             remote,
             remote_dst,
@@ -749,11 +952,17 @@ impl Dispatch {
             slot_bytes: self.slot_bytes as u64,
             dst_offset: table.offset(proj, row),
             #[cfg(feature = "profile")]
-            stall: self.stall.device_ptr(&compute).0 + (row * 5 * 8) as u64,
+            stall: self.stall.device_ptr(&compute).0 + (row * STALL_WORDS * 8) as u64,
             #[cfg(not(feature = "profile"))]
             stall: 0,
+            // The gate launch is the layer's first over the remote experts —
+            // its workers wait on the cold ones while the link is free — so it
+            // carries the read-ahead.
+            ahead: ahead.filter(|_| proj == Proj::Gate).map_or(0, |a| a.items),
+            ahead_done: ahead.filter(|_| proj == Proj::Gate).map_or(0, |a| a.done),
             spin_limit_ns: SPIN_LIMIT_NS,
             workers: workers_for(num_tokens) as i32,
+            row: row as i32,
         };
 
         #[cfg(feature = "tensor-assert")]
@@ -905,5 +1114,71 @@ impl Dispatch {
             cuda_dev,
         )?;
         Ok(ys)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row's read-ahead layout is its three projection offsets and its image
+    /// size rounded up to the 16-byte copy unit.
+    #[test]
+    fn the_row_layout_is_the_offsets_and_the_rounded_image() {
+        let t = LiveTable::host_only(2, 4, [0x40, 0x1040, 0x2040]);
+        assert_eq!(
+            row_layout(&t, &[0x3000, 0x2f01]),
+            vec![0x40, 0x1040, 0x2040, 0x3000, 0x40, 0x1040, 0x2040, 0x2f10]
+        );
+    }
+
+    /// Store `word` where bucketize stores a slot's sequence word.
+    fn write_word(ring: &SummaryRing, slot: usize, word: u32) {
+        // SAFETY: the word is inside the mapped ring, after the slot's counts.
+        unsafe { std::ptr::write_volatile(ring.host_slot_ptr(slot).add(ring.n_experts), word) };
+    }
+
+    /// The waiter's idle work runs every `WAIT_IDLE_EVERY` polls while the word
+    /// is outstanding — here it is what finally writes the word — and not once
+    /// when the word is already there.
+    #[test]
+    fn a_wait_runs_its_idle_work_until_the_word_arrives() {
+        let Ok(_device) = candle::Device::new_cuda(0) else {
+            return;
+        };
+        let ring = SummaryRing::new(8).unwrap();
+        let mut calls = 0u32;
+        ring.wait(3, 77, || {
+            calls += 1;
+            if calls == 5 {
+                write_word(&ring, 3, 77);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 5);
+        assert!(ring.ready(3, 77));
+
+        let mut late = 0u32;
+        ring.wait(3, 77, || {
+            late += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(late, 0, "a word already written needs no idle work");
+    }
+
+    /// An error from the idle work ends the wait with that error.
+    #[test]
+    fn an_idle_error_ends_the_wait() {
+        let Ok(_device) = candle::Device::new_cuda(0) else {
+            return;
+        };
+        let ring = SummaryRing::new(8).unwrap();
+        let e = ring
+            .wait(1, 9, || candle::bail!("copier stopped"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("copier stopped"), "{e}");
     }
 }

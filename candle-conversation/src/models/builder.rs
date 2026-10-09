@@ -1997,6 +1997,7 @@ fn cached_repo_file(
 /// alternative is what was there before: the convention written down in `zend::download`
 /// and nowhere else, so the daemon could open a prepared checkpoint and nothing below it
 /// could.
+#[cfg(any(feature = "hub", test))]
 pub fn model_cache_dir() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -2011,6 +2012,7 @@ pub fn model_cache_dir() -> PathBuf {
 /// What differs is the miss: there is no URL to fall back to, because the name was never
 /// published — so a miss is reported as the build step it actually is, rather than as a
 /// 404 on a file nobody ever uploaded.
+#[cfg(feature = "hub")]
 pub fn prepared_artifact_path(repo: &str, filename: &str) -> crate::Result<PathBuf> {
     let path = model_cache_dir()
         .join(repo.replace('/', "--"))

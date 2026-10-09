@@ -21,6 +21,7 @@ mod claim_cost_tests;
 mod compress_tests;
 mod decode_slot_resync_tests;
 pub mod dump_reader;
+mod frontier_rank_tests;
 mod gather_r16_tests;
 mod gpu_chunks_tests;
 mod io_tests;

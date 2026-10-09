@@ -1462,6 +1462,10 @@ cache's hard floor, 1,415 MiB — never by the hold. Four things were buying:
 
 **The design as built (S13–S16).**
 
+> Superseded in part by §4.11.14: claims and the tier's placement buy their own
+> ground again, admission judges without buying, and the relief ladder stands
+> (without a quantize rung). The store and section rules below still hold.
+
 * **A store is materialised at admission, never at open.** Opening records a
   `RecurrentSeed` — the checkpoint payload, the parent, or `Neutral` — and
   `claim_recurrent` resolves it through `materialise_recurrent`: the slot's own
@@ -1530,6 +1534,11 @@ Three things, each visible in the log:
    widen the gap.
 
 **The design as built (S26).**
+
+> Superseded by §4.11.14: `buy_kv_ground`, `publish_tier_budget`, the fixed tier
+> margin and the refusal streak are gone. The placement buys its own shortfall,
+> and a placement the weight side cannot cover fails the forward with the
+> partition named (`place_transient`).
 
 * **A refusal drops the wave.** `note_tier_refusal` resets the held group
   (members, cursor, residual) before requeueing, so the next build reads the
@@ -1907,6 +1916,121 @@ the worst case" is not inert. `fallback_plan` was documented as covering *"tests
 the migration helpers"*, and a production forward reached it through a race —
 where it did not merely waste 912 MiB, it refused the wave outright. A fallback
 that no correct path should reach wants an assertion, not a plausible number.
+
+### 4.11.14 Who buys, who judges, and what a finished turn owes (2026-10-09)
+
+§4.11.7 and §4.11.8 describe a design in which admission was the only buyer:
+`claim_region` refused on exhaustion, `place_transient` refused, and
+`Scheduler::buy_kv_ground` / `publish_tier_budget` bought between forwards. None
+of that is the code any more, and the relief ladder those sections call deleted is
+standing. This section is the design as it is, measured against Strata's
+single-session benchmark run through the engine on Flash-Next (RTX PRO 5000,
+`kv_fragmentation::qwen38_flash_next_strata`) beside the same requests on the bare
+forward path (`strata_bench`).
+
+**Admission judges; placement buys.**
+
+* `AdmitPass::peek` prices a turn whole: all of its K/V, and the tier of its
+  **deepest** chunk — a full-width chunk ending at the turn's last token
+  (`deepest_chunk_offset`), through `ManagedBatchedModel::wave_tier_bytes`, the
+  function the tier is placed from. On Flash-Next that includes the sparse
+  selection's carve (`Qwen4ExpBatched::wave_tier_bytes` →
+  `select_layer_bytes` over fresh indexes), which was priced at zero: the bound
+  on the scoring tiles of an 8,192-row chunk ending at 128K is 4.2 GB on the
+  attention phase (`a_fresh_deep_chunk_prices_every_score_tile`), where the
+  turn's first chunk scores through the paged tables in kilobytes.
+* Nothing is bought at admission. A forward's KV claims buy `KV_BUY_STEP` on
+  exhaustion (`claim_region`), and its placement buys exactly the shortfall it
+  measured (`place_transient`, up to four purchases while they land) and refuses
+  by name when the weight side will give no more. Buying the whole turn up front
+  was tried and measured worse: on a 128K turn it conceded 6,650 slots at once,
+  the first forwards' expert hit rate fell from 95% to 77%, and prefill fell 3.9%
+  (4,592 → 4,414 t/s); at 4K, 3.4%. Ground bought forward by forward lets the
+  experts the later chunks dislodge keep serving the earlier ones.
+* The ground between two of a turn's forwards is protected by the growth
+  policy, not by a purchase: the weight side's growth leaves the last forward's
+  tier free (`Occupancy::last_tier_bytes`). Before it, a compaction between
+  forwards let the zone grow back 1,631 slots that the next placement conceded
+  again (1,877), twice per 128K turn.
+
+**The relief ladder stands, without a quantize rung, at the target growth
+leaves.** `relieve_vram_pressure` releases empty arenas, evicts cold galleries,
+packs the pools, evicts warm-backed turns and only then takes weight ground —
+and no rung quantizes: a finished turn's float→quant rewrite is the persistence
+thread's hot→warm migrate. Run from relief it landed inside the decode window
+that called it, 0.65–2.4 s inside a 128K decode on Flash-Next. The setpoint it
+defends is published to the pool (`set_kv_free_target`, `FreeRegionTarget`), and
+growth leaves at least what relief frees to: with the two disagreeing (growth's
+32-region slack against a 50-region setpoint) they traded the same regions on
+every decode step, 277 boundary moves in one Strata run.
+
+**A finished turn leaves the device in staging-sized batches.** The hot→warm
+migrate groups a turn's sealed bands across layers into batches that fit the
+64 MiB staging span (`cross_layer_staging_groups`; a layer wider than the span is
+split by runs), so a 128K turn migrates in one pass with no per-layer
+fail-and-retry. A migrate that fails signals VRAM starvation and stops — it is not
+retried layer by layer.
+
+**Between requests, the engine settles — and only then.** When the loop goes idle
+after a wave that ran forwards, it ends the standing tier, forgets the last
+forward's tier (the growth policy otherwise keeps that ground free for a forward
+that is not coming — a turn that ended on a deep prefill chunk held the weight side
+back by its whole tier while idle), releases empty arenas, packs the frontier until
+a pass stops lowering it, and grows the weight side back until two negotiations in
+a row return nothing (`Scheduler::settle_device`). None of it is budgeted, so it
+never runs from the request drain beside live decodes: a `SchedulerRequest::Settle`
+queues its reply, and the idle settle answers it. The Strata harness waits for that
+(`ConversationEngine::settle_evicted_timeline`), off every clock — the idle time a
+daemon has between one user's requests — and prints the settled frontier and each
+run's boundary tally (growth refusals by cause, regions granted, slots gained), so a
+run that inherits another's KV is visible rather than inferred. Before it, a 128K
+turn ratcheted: 4,426 → 3,547 → 2,092 t/s prefill and 81 → 47 → 22 t/s decode over
+three runs; after it, 4,628 / 4,594 / 4,590 and 102 / 98 / 94.
+
+**Compaction runs only when it can release ground.** A pass is offered only when
+the frontier's holder can move it far enough to pay (`PoolShape::frontier_pass`): a
+KV arena at the frontier — counting one emptied and not yet swept, which still holds
+its region — with at least `MIN_FREEABLE_ARENAS` holes or sparse arenas beneath, or a
+span tenant at the frontier over at least that many holes. A span-tenant pass is
+whole-block copies; offered on a single hole it lowered the frontier a region at a
+time, never stalled, and reran at the gate's pace. A pass that released nothing
+stalls the gate for **that kind of pass** until something is freed beneath the
+frontier — growth alone reopens nothing — and the other kind stays open, since a
+tenant that could not move says nothing about a KV arena placed above it.
+
+**Decode through the engine matches the forward bench.** Measured back to back on
+the RTX PRO 5000, medians at 4K / 32K / 128K:
+
+| | prefill t/s | decode t/s | ms/step |
+|---|---|---|---|
+| forward bench | 5,783 / 5,192 / 4,583 | 147.7 / 154.8 / 135.7 | 18.2–18.8 / 18.3–19.9 / 22.1–22.9 |
+| engine | 5,903 / 5,251 / 4,700 | 153.2 / 148.5 / 138.7 | 17.5–19.1 / 19.3–19.6 / 21.2–21.6 |
+
+The 32K median difference is step count, not step cost: the engine's KV is F16 and
+the bench's BF16, so their texts part late in some runs and accept differently. What
+closed the gap, from 124.6 / 129.0 / 98.1 t/s:
+
+* *Sampling.* The engine harness sampled on the conversation's own config made
+  greedy, which kept Flash-Next's `repeat_penalty 1.1`; a penalised argmax is a
+  different reply, and the MTP drafter, which predicts the raw argmax, had its
+  drafts rejected wherever the penalty moved the pick. Strata's requests are scored
+  on the raw argmax, and the harness now samples that way (`strata_sampling`).
+* *Framing.* The forward bench rendered an empty system turn ahead of the request;
+  it now renders the user turn alone, as Strata's requests are written.
+* *The first reprojection re-seated the whole user turn.* An empty section is no
+  longer projected, and a turn opened on an empty parent starts with that parent's
+  identity (`turn_start_identity`), so a reprojection that selects nothing keeps the
+  slot instead of rebuilding it — ~330 ms at 128K.
+* *Rollback resync.* A partial accept's rollback marked the decode slot buffer stale
+  from the writer boundary — chunk 0 for a turn written from its first token — so
+  every rollback re-serialised the whole sequence on every attention layer, 1.6 ms a
+  layer at 128K, and decode went host-bound. It now marks from the chunk it trimmed.
+* *The accept walk.* It dispatched the sampler once per block position, each a
+  launch and a readback with the GPU idle. Every position is now scored in one
+  dispatch against the history its drafts would leave and committed position by
+  position (`BatchedSampler::score_rows` / `commit_row`), which commits exactly what
+  the per-position walk does; the sample phase went from 1.1–1.9 ms a step to a flat
+  ~1.1 ms.
 
 ## 5. Plan
 

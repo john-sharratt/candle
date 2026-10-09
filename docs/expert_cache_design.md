@@ -101,8 +101,10 @@ free                       237
 Those 237 free slots are simultaneously:
 
 - the **churn depth** of the swap pipeline — a swap is evict-then-load, and
-  `evict_for_prefetch_batch` is asked for as many experts as a layer is short
-  (up to 128), with prefetch running a layer ahead
+  the prefetch's make-room eviction (since replaced by the promotion ring's
+  lazy victims, `docs/moe_live_dispatch_design.md` §0.7.4) was asked for as
+  many experts as a layer was short (up to 128), with prefetch running a layer
+  ahead
 - the **entire budget** for the elastic VRAM boundary
   (`docs/archived/elastic_vram_partition.md`) to retract
 

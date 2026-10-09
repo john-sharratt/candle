@@ -164,17 +164,21 @@ pub(crate) trait Ground {
     /// the expensive work is never the cheapest.
     fn peek(&mut self, kind: Kind, prio: DecodePriority) -> Option<Cost>;
 
-    /// Admit the candidate [`Self::peek`] just priced at `cost`, buying and
-    /// claiming its ground. `false` when the allocators refused it after all.
+    /// Admit the candidate [`Self::peek`] just priced at `cost`. `false` when the
+    /// allocators refused it after all.
     ///
-    /// **This is the one place the weight boundary is asked to move toward
-    /// K/V.** The gate has already said the price stays above the residency the
-    /// engine defends, so what the K/V side does not hold free of that price is
-    /// bought from the weight side here, before the wave — never by a claim
-    /// that runs out mid-wave, never by the tier's placement, never by a
-    /// forward's own arithmetic. Every one of those bought outside the gate's
-    /// accounting, and between them took the zone to its floor with nothing
-    /// admitted.
+    /// **The judgement is made on the whole turn; the ground is bought as the
+    /// turn runs.** The gate has already said the turn's price — all of its K/V
+    /// and the tier its deepest chunk stands — stays above the residency the
+    /// engine defends. What admission does *not* do is buy that price up front:
+    /// each forward's placement concedes its own tier and claims between forwards
+    /// (before the forward opens; the boundary refuses to move while one is), so
+    /// the experts the later chunks will dislodge keep serving the earlier ones.
+    /// Measured on Flash-Next's 128K Strata prefill, buying the whole turn at
+    /// admission conceded 6,650 slots at once, the first forwards' hit rate fell
+    /// from 95% to 77%, and prefill fell 3.9% (4,592 → 4,414 t/s); at 4K, 3.4%.
+    /// Ground the turn's next forward needs is kept from the weight side's
+    /// growth in the meantime by the last forward's tier (`GrowthPolicy::spare`).
     fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool;
 
     /// The rate model has judged that more prefill rows will not make the

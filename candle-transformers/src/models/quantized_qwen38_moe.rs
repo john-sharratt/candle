@@ -2227,7 +2227,13 @@ mod tests {
             .with_suppress_thinking(true)
             .with_print_outputs(true)
             .with_int8mode(int8mode)
-            .with_timeout_secs(3600);
+            .with_timeout_secs(3600)
+            // Each config's routing, for replaying residency and prediction
+            // policies offline (`expert_lre::replay`).
+            .with_routing_trace_dir(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../target/routing_traces/qwen38_flash_next"),
+            );
 
         let configs = batched_forward_configs(&device);
 
@@ -2265,6 +2271,51 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
+        let merged = engine_gguf()?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
+            .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_suppress_thinking(true)
+            .with_int8mode(int8mode)
+            .with_timeout_secs(3600);
+        let one = || TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 1,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        };
+        let configs = vec![one(), one(), one(), one()];
+        params.run(configs, || {
+            let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+            Qwen4ExpBatched::new(gpu)
+        })
+    }
+
+    /// **The host side of a decode step, alone.** The same four runs as
+    /// [`profile_single_session_decode`] with the GPU event spans sampled on
+    /// no forward at all (`set_gpu_span_period(u32::MAX)`), so the step runs as
+    /// the release build runs it — an event pair per span per layer is itself
+    /// most of the profiled build's slowdown — while the host timers
+    /// (`q4e:host:*`, `moe:hold_ring`, `spec:*`) still fill. Read
+    /// `q4e:host:layers` per step against the step's wall time: a layer loop
+    /// that takes the whole step is the step's bound, unless the hold on the
+    /// summary ring (`moe:hold_ring`) is where it spends that time, which is
+    /// the forward thread waiting for the GPU.
+    #[test]
+    #[ignore = "profiling run: loads this card's engine artifact. Run with: cargo test \
+                --release --features cuda,profile -p candle-transformers --lib \
+                quantized_qwen38_moe::tests::profile_single_session_decode_host_issue \
+                -- --ignored --nocapture --test-threads=1"]
+    fn profile_single_session_decode_host_issue() -> Result<()> {
+        use crate::models::batch_test::utils::TestParams;
+        use crate::models::dialect::Dialect;
+        use crate::models::profile::set_gpu_span_period;
+        use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+        use candle::quantized::Int8Mode;
+
+        set_gpu_span_period(u32::MAX);
         let merged = engine_gguf()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);

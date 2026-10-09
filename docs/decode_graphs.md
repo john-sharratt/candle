@@ -87,7 +87,8 @@ it needs neither the key nor the combination.
 | `CudaDevice::cuda_stream` | `device.rs` | The **launch stream**: the capture stream on the thread that is recording, the compute stream otherwise. Every launcher takes it. |
 | `CudaDevice::compute_stream` | same | The legacy null stream. Anything that outlives the call — a slice's home stream, an event, a readback, a registry key — uses this. |
 | `Device::eager` / `CudaDevice::pause_capture` | `eager.rs`, `device.rs` | Suspend recording until the guard drops; see §2.2. |
-| `CudaDevice::flush_launches` | `device.rs` | End the segment, launch it, `cuStreamQuery` the compute stream, resume. |
+| `CudaDevice::flush_launches` | `device.rs` | End the segment, launch it, free what it retired, `cuStreamQuery` the compute stream, resume — with no cross-stream hand-off: a flush runs no eager section, so the event pairs a pause records order nothing there. |
+| `CudaDevice::recording_segment` | `device.rs` | The `(wave, segment ordinal)` this thread is recording into, or `None` when its launches run eagerly — what the MoE dispatch's flush schedule keys on. |
 | `CudaDevice::retire` | `device.rs`, `hub.rs` | Free device memory after the segment that may still read it has been launched — whichever thread releases it. |
 | `CudaDevice::upload_raw` | `device.rs`, `staging.rs` | A host upload that, while recording, is staged and recorded instead of ending the segment. |
 | `GraphExec::{instantiate_audited, try_fold}` | `exec.rs` | Instantiate and upload an audited recapture; or fold one in place with `cuGraphExecUpdate_v2`, reporting when the driver refuses it as a different topology. |
@@ -108,9 +109,12 @@ drive_wave
       eager section (host protocol) ....... segment k ends and is launched;
                                             the section runs in issue order behind it;
                                             recording resumes as segment k+1
-      MoE: before() / record() / after()    after() = flush_launches: the segment
-                                            holding bucketize is launched, the
-                                            compute stream queried for WDDM
+      MoE: before() / record() / after()    after() = flush_launches once the
+                                            segment holds its share of MoE
+                                            invocations (1, 1, 2, 4, 8, 16, then
+                                            32): the segment holding bucketize is
+                                            launched, the compute stream queried
+                                            for WDDM
     head ................................ recorded
   finish()                        last segment launched
   logits readback                 the wave's one host wait, after the chain
@@ -174,7 +178,11 @@ What does **not** end a segment:
   the wave's pinned, device-mapped ring and a `copy_bytes` from the ring is recorded. Its
   grid comes from a power-of-two ladder rather than from the size, so a table that grows a
   little from one wave to the next — a slot-state buffer gaining a chunk — keeps its
-  segment's shape and folds in place. Two rings alternate by wave, each fenced by an event
+  segment's shape and folds in place. A slot-state buffer gaining a chunk uploads only its
+  tail: its records sit past room for its slot class's capacity, so an append moves no
+  entry already written and the sync serialises from the previous writer — or from the
+  first chunk a pending commit filled — onward (`GpuChunksGuard::extend_decode`); only an
+  append past the class rebuilds. Two rings alternate by wave, each fenced by an event
   recorded when its wave finishes, so staged bytes outlive every replay that reads them. A
   full ring falls back to an eager upload.
 - **cuBLAS.** `CudaDevice::cublas()` rebinds the handle to the launch stream on every call and
@@ -309,9 +317,11 @@ engine (12,700 copy-engine promotions, 16 GiB). In order of discovery:
 2. **Copy-engine promotions issued off the pipeline thread** (`copier.rs`). The real cause of
    the dry ring: on WDDM, issuing a `cuMemcpyHtoDAsync` from pinned memory stalled the pipeline
    thread for 157–189 ms once per step — the rest of the forward the GPU was running — and the
-   ring it restocks every layer ran dry behind it. A copier thread now issues those copies and
-   reports completions; the pipeline thread's per-layer work is host memory and mapped words
-   only. Unslotted misses went from ~12,300 to ~0.
+   ring it restocks every layer ran dry behind it. A copier thread then issued those copies and
+   reported completions, and unslotted misses went from ~12,300 to ~0. The copy-engine prefetch
+   is gone since: the GEMM workers read ahead into ring slots and publish the entries
+   themselves (`moe_live_dispatch_design.md` §0.7.3), so the pipeline thread issues no copy at
+   all and its per-layer work is host memory and mapped words only.
 3. **Verify rows scored as decode** (`DecodeRows`, `models/residency_rows.rs`). Residency
    scoring weights a decode row's routing above a prompt row's, and bucketize's decode bit
    covered only the leading decode rows. Flash-Next decodes entirely through verify waves,
@@ -376,9 +386,11 @@ green.
 **A segment per layer.** That sweep's layers meet the host nowhere, so recorded whole it ran
 as one segment a wave, and the GPU sat idle until the host had recorded every layer where eager
 launches had it start on the first: decode fell 5–9% under eager. It hands each layer to the
-device as it is recorded (`Device::flush_launches`). A layer that ends its own segment —
-Qwen3-30B-A3B's MoE, whose host protocol flushes the segment holding its bucketize
-(`BatchedAttentionLayer::ends_a_segment`) — gets no second cut, which cost that model 3–6%.
+device as it is recorded (`Device::flush_launches`), the MoE layers of Qwen3-30B-A3B and the
+Qwen3.5/3.6 MoE checkpoints included: the expert dispatch flushes only on
+`expert_lre::flush_schedule`'s doubling cadence (§5), measured for Flash-Next's sweep, so these
+sweeps keep their own per-layer cut. A layer whose dispatch has just flushed adds an empty cut,
+which launches nothing.
 
 **An in-place cast that read ahead of itself.** `to_dtype_mut` — the MoE's BF16→F16 narrowing
 on Qwen3-30B-A3B's F16 and quantized-KV rows — copied its result into the retyped buffer with a
@@ -446,7 +458,6 @@ The expert pipeline's pieces, `-p candle-core --lib` and `-p candle-transformers
 | `cuda_moe_bucketize_live_table_orders_remote_first` (extended) | The decode bit follows arbitrary token ranges, not only a prefix. |
 | `decode_rows::tests::*` | Ranges merge when they touch, a range past the kernel bound is left out, the bound mirrors the kernel's. |
 | `reclaim::tests::*` | Reuse keys on the started word; a queued, unbegun invocation holds no slot; a later start on any row completes every earlier invocation; an enqueued, unbegun row is upcoming. |
-| `copier::tests::copies_land_their_bytes_and_report_every_id` | The copier lands every byte and reports each id once; a flush waits for all of them. |
 | `residency_rows::tests::*` | A wave's decode rows, verify segments and prompts' last rows, as ranges. |
 | `cuda_moe_bucketize_promotes_remote_experts_from_the_ring` (extended) | A prompt-only expert takes no slot without room for it, none while the stock is at the reserve, and none when there is no reserve word; a decode expert takes the reserved slot. |
 | `cache::tests::a_decode_miss_earns_the_decode_credit_but_no_reuse`, `decode_reuse_decays_on_its_own_slower_clock`, `a_one_off_decode_miss_is_evicted_before_a_reused_expert`, `a_prefill_elevation_keeps_the_experts_decode_reuse` | §3.2 item 6's two-term score. |
@@ -468,14 +479,21 @@ per segment, in-place updates, instantiations — and is unit-tested on its text
    `BatchedAttentionLayer::ffn_residual`, but it passes the decode prefix only: scoring its
    verify segments and prompts' last rows as decode, as Flash-Next does, measured lower
    prefill on its one-sequence rows.
-3. **Fewer segments.** About 52 per Qwen3.6 wave: 40 MoE flushes, which the dispatch host
-   protocol needs, and what is left of the attention layers' header builds. The headers
-   themselves no longer cut — the slot-state upload is recorded (§2.3) and the
-   post-prefill slot priming is gone — so a layer cuts only when its slot-state
-   buffer needs a device call a recording cannot make: a full ring, a fence, a slab claim.
-4. **Fuse MoE layers whose experts are all resident.** The host protocol is the only thing
-   that cuts an MoE chain; a configuration that drops it (not built) would let several layers
-   share a segment.
+3. **Fewer segments — done for the MoE flushes.** The dispatch's host readers poll the
+   summary word bucketize writes *when it executes*, so launching each MoE invocation's
+   segment at once bought nothing past the start of a wave, where the GPU must not idle
+   while the host records. `expert_lre::flush_schedule` now launches a wave's segments at
+   1, 1, 2, 4, 8, 16, then 32 MoE invocations (keyed on the hub's segment ordinal, so it
+   restarts every wave and a segment some other cut began counts from its own start), and a
+   flush no longer records the pause's two cross-stream hand-offs. On Flash-Next's
+   single-session Strata benchmark segments per wave fell 19.5 → 4.4 and, with the
+   bucketize and restock changes of the same round, decode rose 148.9 → 156.1 t/s at 4K and
+   121.9 → 134.2 at 128K (RTX PRO 5000, 2026-10-09). What remains of the attention layers'
+   header builds cuts only when its slot-state buffer needs a device call a recording cannot
+   make: a full ring, a fence, a slab claim.
+4. **Fuse MoE layers whose experts are all resident.** With the flush schedule a segment
+   already spans up to 32 MoE layers; what is left is the host protocol's per-invocation
+   bookkeeping (`before`), not a segment cut.
 
 ---
 

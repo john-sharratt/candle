@@ -167,6 +167,8 @@ use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
+/// The greedy pick, many blocks to a row.
+pub mod argmax_rows;
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
 mod device;
@@ -676,7 +678,8 @@ impl Map1 for Im2Col1D {
             unsafe {
                 kernels::simple::conv::run_im2col1d(
                     dtype,
-                    threads * self.l_k, // dst_numel
+                    // One thread per column, each writing its `l_k` elements.
+                    threads,
                     l_out,
                     self.l_k,
                     self.stride,

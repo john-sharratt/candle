@@ -35,6 +35,18 @@
 //!
 //! Prefill shapes never qualify — their unsplit grid already fills the card — and neither does a
 //! shape whose partials would not fit the fixed scratch; both run unsplit, with the same bits.
+//!
+//! # The narrow launch
+//!
+//! At up to eight rows a shape that splits runs the **narrow** kernel instead
+//! ([`q8a128_dense_plan`]): one block per 8-row output tile, K walked by the block's warps and
+//! summed in shared memory — the same tile-ordered chain, so the same bits, with no partials in
+//! global memory, no counters and no last-block tail. It runs at the most warps per block
+//! ([`narrow_warps`]) at which every block is resident in one wave; a shape for which not even
+//! four warps give one wave — or whose fold slots (one per K tile past the first warp's range)
+//! would not fit [`NARROW_SMEM_CAP`] — stays split-K.
+
+use super::GgmlDType;
 
 /// The mode-1 token tile the split kernel shares.
 const M_TILE: usize = 16;
@@ -94,11 +106,198 @@ pub fn q8a128_dense_k_splits(m: usize, n: usize, k: usize, sm_count: usize) -> u
     dense_k_split_depth(k, target.div_ceil(base))
 }
 
+/// The most rows a narrow launch carries: the int8 MMA's first eight token rows.
+pub const NARROW_MAX_ROWS: usize = 8;
+
+/// The dynamic shared memory a narrow launch may use, mirroring `NARROW_SMEM_CAP` in
+/// `quantized/narrow_layout.cuh`.
+pub const NARROW_SMEM_CAP: usize = 96 * 1024;
+
+/// The widest weight ring one narrow warp keeps, across every format it runs: Q8_KO's four
+/// 1,056-byte chunks (`narrow_ahead` in `narrow_layout.cuh` keeps every other format at or
+/// under it).
+const NARROW_RING_BYTES_PER_WARP: usize = 4 * 1056;
+
+/// Bytes of one K tile's fold slot: a float2 per lane.
+const NARROW_SLOT_BYTES_PER_TILE: usize = 32 * 8;
+
+/// The most dynamic shared memory a narrow launch of a `k`-wide contraction at `warps` warps
+/// uses, in any format: the weight rings, and a fold slot per K tile past warp 0's range.
+pub fn narrow_smem_bound(k: usize, warps: usize) -> usize {
+    let tiles = dense_k_tiles(k);
+    let per = tiles.div_ceil(warps.max(1));
+    warps * NARROW_RING_BYTES_PER_WARP + tiles.saturating_sub(per) * NARROW_SLOT_BYTES_PER_TILE
+}
+
+/// How one dense int8 matmul launches. Every plan produces the same bits — each sums K one
+/// tile's fold at a time, in tile order — so the plan is purely a speed decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DensePlan {
+    /// The tile grid over the whole of K, one block per (token tile, 32 rows).
+    Unsplit,
+    /// K cut into this many slices across blocks, partials summed by the last block.
+    SplitK(usize),
+    /// One block per 8 output rows, K across its `warps` warps, summed in shared memory.
+    Narrow { warps: usize },
+}
+
+/// The fewest and the most warps a narrow block runs at; the most mirrors `NARROW_MAX_WARPS`
+/// in `quantized/narrow_layout.cuh`.
+pub const NARROW_MIN_WARPS: usize = 4;
+pub const NARROW_MAX_WARPS: usize = 16;
+
+/// Shared memory one SM gives its resident blocks, on every part the kernels are built for
+/// (sm_86, sm_89 and sm_120 all carry 100 KiB).
+const SM_SMEM_BYTES: usize = 100 * 1024;
+
+/// Shared memory the runtime reserves for each resident block on those parts.
+const SMEM_RESERVED_PER_BLOCK: usize = 1024;
+
+/// Narrow warps one SM holds at once: the kernel compiles to at most 64 registers a thread
+/// (60–64 across the formats and parts), so the 64K-register file holds 32 warps of it.
+const NARROW_WARPS_PER_SM: usize = 32;
+
+/// Narrow blocks of a `k`-wide contraction at `warps` warps one SM holds at once: the lesser
+/// of what its shared memory and its register file admit.
+pub fn narrow_blocks_per_sm(k: usize, warps: usize) -> usize {
+    let smem = narrow_smem_bound(k, warps) + SMEM_RESERVED_PER_BLOCK;
+    (SM_SMEM_BYTES / smem).min(NARROW_WARPS_PER_SM / warps.max(1))
+}
+
+/// The warps of a narrow launch over an `n`-wide output and a `k`-wide contraction on
+/// `sm_count` SMs: the most — between [`NARROW_MIN_WARPS`] and [`NARROW_MAX_WARPS`], and no
+/// more than K has tiles — at which every one of the `n / 8` blocks is resident in the same
+/// wave and the shared memory fits [`NARROW_SMEM_CAP`]. `None` when not even the fewest warps
+/// give one wave: the narrow kernel's blocks walk their K in one pass, so a second wave would
+/// pay the whole latency chain again, and that shape stays split-K.
+///
+/// Measured with `bench_narrow_against_split_on_decode_projections` (RTX PRO 5000, 110 SMs):
+/// more warps keep more weight chunks in flight and win until the blocks stop fitting one
+/// wave — the 52-block hyper-connection `down` is fastest at 12–16 warps, while the 320-block
+/// out-projections lose 10–30% going from a one-wave count to a two-wave one.
+pub fn narrow_warps(n: usize, k: usize, sm_count: usize) -> Option<usize> {
+    let blocks = n.div_ceil(8);
+    let top = dense_k_tiles(k).clamp(NARROW_MIN_WARPS, NARROW_MAX_WARPS);
+    (NARROW_MIN_WARPS..=top).rev().find(|&w| {
+        narrow_smem_bound(k, w) <= NARROW_SMEM_CAP
+            && narrow_blocks_per_sm(k, w) * sm_count >= blocks
+    })
+}
+
+/// Warps of a narrow launch whose blocks cannot all be resident in one wave, for the weight
+/// formats that run narrow there ([`narrow_past_one_wave`]).
+///
+/// Measured with `bench_narrow_against_split_on_decode_projections` (RTX PRO 5000, 110 SMs,
+/// weights rotated past the L2) on the 4,096- and 6,144-wide projections at one, five and
+/// eight rows: six warps beat split-K in every cell for Q4_KO, Q5_KO and Q6_KO — Q6 `o`
+/// 14.1 against 16.6 µs, `qkv` 20.0 against 24.1, `down` 43.0 against 48.9 at one row — and
+/// no count is the best everywhere, while six is never more than 10% off the best.
+pub const NARROW_MULTI_WAVE_WARPS: usize = 6;
+
+/// Whether a narrow launch beats split-K for `weight` even when its blocks take more than one
+/// wave. The sub-8-bit affine twins it was measured on do; Q8_KO ties or loses there (`o`
+/// 17.5 against 16.6 µs), and the other formats are unmeasured, so both keep split-K.
+fn narrow_past_one_wave(weight: GgmlDType) -> bool {
+    matches!(
+        weight,
+        GgmlDType::Q4_KO | GgmlDType::Q5_KO | GgmlDType::Q6_KO
+    )
+}
+
+/// How the dense int8 matmul of `[m, k] × [n, k]ᵀ` launches on `sm_count` SMs. `per_tile`
+/// is whether the weight format folds one K tile at a time (every affine KO format; not
+/// MXFP4, whose per-sub fold has no per-tile partial) — only those split or run narrow.
+/// A shape that splits runs narrow instead at up to [`NARROW_MAX_ROWS`] rows, when
+/// [`narrow_warps`] finds a one-wave launch for it, or — for a `weight` that
+/// [`narrow_past_one_wave`] — at [`NARROW_MULTI_WAVE_WARPS`] when it fits the shared-memory cap.
+pub fn q8a128_dense_plan(
+    m: usize,
+    n: usize,
+    k: usize,
+    sm_count: usize,
+    per_tile: bool,
+    weight: GgmlDType,
+) -> DensePlan {
+    if !per_tile {
+        return DensePlan::Unsplit;
+    }
+    let splits = q8a128_dense_k_splits(m, n, k, sm_count);
+    if splits == 1 {
+        return DensePlan::Unsplit;
+    }
+    if m <= NARROW_MAX_ROWS {
+        if let Some(warps) = narrow_warps(n, k, sm_count) {
+            return DensePlan::Narrow { warps };
+        }
+        if narrow_past_one_wave(weight)
+            && narrow_smem_bound(k, NARROW_MULTI_WAVE_WARPS) <= NARROW_SMEM_CAP
+        {
+            return DensePlan::Narrow {
+                warps: NARROW_MULTI_WAVE_WARPS,
+            };
+        }
+    }
+    DensePlan::SplitK(splits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SM: usize = 110; // RTX PRO 5000 Blackwell.
+    const Q8: GgmlDType = GgmlDType::Q8_KO;
+
+    /// The 4,096- and 6,144-wide projections cannot hold every narrow block in one wave; up
+    /// to eight rows the sub-8-bit twins run narrow at six warps there, and Q8 stays split.
+    #[test]
+    fn sub_8_bit_twins_run_narrow_past_one_wave() {
+        for (n, k) in [(4096usize, 4096usize), (6144, 4096), (4096, 12_288)] {
+            assert_eq!(
+                narrow_warps(n, k, SM),
+                None,
+                "{n}×{k} has no one-wave launch"
+            );
+            for weight in [GgmlDType::Q4_KO, GgmlDType::Q5_KO, GgmlDType::Q6_KO] {
+                for m in [1usize, 5, 8] {
+                    assert_eq!(
+                        q8a128_dense_plan(m, n, k, SM, true, weight),
+                        DensePlan::Narrow { warps: 6 },
+                        "{weight:?} {m}×{n}×{k}"
+                    );
+                }
+            }
+            for weight in [Q8, GgmlDType::Q2_KO, GgmlDType::Q3_KO] {
+                assert!(
+                    matches!(
+                        q8a128_dense_plan(5, n, k, SM, true, weight),
+                        DensePlan::SplitK(_)
+                    ),
+                    "{weight:?} {n}×{k}"
+                );
+            }
+            // Past eight rows the narrow kernel does not apply, whatever the format.
+            assert!(matches!(
+                q8a128_dense_plan(10, n, k, SM, true, GgmlDType::Q6_KO),
+                DensePlan::SplitK(_)
+            ));
+        }
+    }
+
+    /// A one-wave shape keeps its one-wave warp count whatever the format: the Flash-Next
+    /// projections decide exactly as before.
+    #[test]
+    fn a_one_wave_shape_ignores_the_format() {
+        for weight in [Q8, GgmlDType::Q4_KO, GgmlDType::Q6_KO, GgmlDType::Q2_KO] {
+            assert_eq!(
+                q8a128_dense_plan(5, 416, 10_240, SM, true, weight),
+                DensePlan::Narrow { warps: 16 }
+            );
+            assert_eq!(
+                q8a128_dense_plan(5, 2560, 6144, SM, true, weight),
+                DensePlan::Narrow { warps: 5 }
+            );
+        }
+    }
 
     #[test]
     fn the_split_depth_never_launches_an_empty_slice() {
@@ -162,6 +361,164 @@ mod tests {
     fn degenerate_shapes_do_not_split() {
         assert_eq!(q8a128_dense_k_splits(0, 416, 10_240, SM), 1);
         assert_eq!(q8a128_dense_k_splits(1, 416, 10_240, 0), 1);
+    }
+
+    /// The narrow kernel's shared-memory bound: a Q8_KO ring of 4,224 bytes per warp, and 256
+    /// bytes per K tile past the first warp's range.
+    #[test]
+    fn the_narrow_smem_bound_counts_rings_and_slotted_tiles() {
+        // 80 tiles: 20 per warp at 4 warps (60 slotted), 10 at 8 (70 slotted).
+        assert_eq!(narrow_smem_bound(10_240, 4), 4 * 4224 + 60 * 256);
+        assert_eq!(narrow_smem_bound(10_240, 8), 8 * 4224 + 70 * 256);
+        // 5 tiles at 4 warps: 2 per warp, 3 slotted; at 8: 1 per warp, 4 slotted.
+        assert_eq!(narrow_smem_bound(640, 4), 4 * 4224 + 3 * 256);
+        assert_eq!(narrow_smem_bound(640, 8), 8 * 4224 + 4 * 256);
+        // One warp slots nothing.
+        assert_eq!(narrow_smem_bound(10_240, 1), 4224);
+        // The largest K a narrow launch takes at eight warps: 192 tiles → 168 slotted, 76,800
+        // bytes; 256 tiles → 224 slotted, 91,136 — both under the cap; 384 tiles is over it.
+        assert!(narrow_smem_bound(24_576, 8) <= NARROW_SMEM_CAP);
+        assert!(narrow_smem_bound(32_768, 8) <= NARROW_SMEM_CAP);
+        assert!(narrow_smem_bound(49_152, 8) > NARROW_SMEM_CAP);
+    }
+
+    /// How many narrow blocks one SM holds: shared memory against 100 KiB (1 KiB reserved per
+    /// block), and the register file's 32 warps.
+    #[test]
+    fn narrow_residency_is_the_lesser_of_smem_and_registers() {
+        // 16 warps over 80 tiles: 86,784 + 1,024 bytes → one block (and two by registers).
+        assert_eq!(narrow_blocks_per_sm(10_240, 16), 1);
+        // 5 warps over 48 tiles: 30,848 + 1,024 → three blocks (six by registers).
+        assert_eq!(narrow_blocks_per_sm(6144, 5), 3);
+        // 6 warps over 48 tiles: 35,584 + 1,024 → two.
+        assert_eq!(narrow_blocks_per_sm(6144, 6), 2);
+        // 4 warps over 5 tiles: 17,664 + 1,024 → five by memory, eight by registers.
+        assert_eq!(narrow_blocks_per_sm(640, 4), 5);
+        // One tile slots nothing: 16 rings (67,584 + 1,024) hold one block, 4 rings five.
+        assert_eq!(narrow_blocks_per_sm(128, 16), 1);
+        assert_eq!(narrow_blocks_per_sm(128, 4), 5);
+    }
+
+    /// The Flash-Next decode projections at five rows on the 110-SM card: each shape that
+    /// splits runs narrow, at the most warps whose blocks all fit one wave.
+    #[test]
+    fn decode_width_projections_run_narrow() {
+        // Hyper-connection `down`: 52 blocks, one per SM at 16 warps.
+        assert_eq!(
+            q8a128_dense_plan(5, 416, 10_240, SM, true, Q8),
+            DensePlan::Narrow { warps: 16 }
+        );
+        // 320 blocks need three per SM: the DeltaNet out-proj (48 tiles) fits five warps, the
+        // attention out-proj (32 tiles) six, and the shared-expert down has five tiles to give.
+        for (k, warps) in [(6144usize, 5usize), (4096, 6), (640, 5)] {
+            assert_eq!(
+                q8a128_dense_plan(5, 2560, k, SM, true, Q8),
+                DensePlan::Narrow { warps },
+                "K = {k}"
+            );
+        }
+        // The stacked router | shared gate_up | gate: 1,824 rows → 228 blocks, three per SM
+        // at six warps.
+        assert_eq!(
+            q8a128_dense_plan(5, 1824, 2560, SM, true, Q8),
+            DensePlan::Narrow { warps: 6 }
+        );
+        for m in 1..=NARROW_MAX_ROWS {
+            assert_eq!(
+                q8a128_dense_plan(m, 416, 10_240, SM, true, Q8),
+                DensePlan::Narrow { warps: 16 },
+                "{m} rows"
+            );
+        }
+    }
+
+    /// A shape whose narrow blocks cannot all be resident at once stays split-K: 512 blocks of
+    /// a 4,096-wide output need five per SM, and four warps over 32 tiles give four.
+    #[test]
+    fn a_shape_past_one_narrow_wave_stays_split() {
+        assert_eq!(narrow_warps(4096, 4096, SM), None);
+        assert_eq!(
+            q8a128_dense_plan(5, 4096, 4096, SM, true, Q8),
+            DensePlan::SplitK(4)
+        );
+    }
+
+    /// Past eight rows a shape that splits stays split-K, at the depth the split rule picks.
+    #[test]
+    fn wider_decode_waves_split() {
+        for m in [9usize, 16] {
+            assert_eq!(
+                q8a128_dense_plan(m, 416, 10_240, SM, true, Q8),
+                DensePlan::SplitK(27),
+                "{m} rows"
+            );
+        }
+        assert_eq!(
+            q8a128_dense_plan(32, 416, 10_240, SM, true, Q8),
+            DensePlan::SplitK(16)
+        );
+    }
+
+    /// A shape that does not split today does not run narrow either, and a format without a
+    /// per-tile fold (MXFP4) runs unsplit whatever its shape.
+    #[test]
+    fn narrow_needs_a_shape_that_splits_and_a_per_tile_format() {
+        assert_eq!(
+            q8a128_dense_plan(1, 10_240, 384, SM, true, Q8),
+            DensePlan::Unsplit
+        );
+        assert_eq!(
+            q8a128_dense_plan(1, 416, 128, SM, true, Q8),
+            DensePlan::Unsplit
+        );
+        assert_eq!(
+            q8a128_dense_plan(512, 416, 10_240, SM, true, Q8),
+            DensePlan::Unsplit
+        );
+        assert_eq!(
+            q8a128_dense_plan(5, 416, 10_240, SM, false, Q8),
+            DensePlan::Unsplit
+        );
+        assert_eq!(
+            q8a128_dense_plan(0, 416, 10_240, SM, true, Q8),
+            DensePlan::Unsplit
+        );
+    }
+
+    /// A K whose fold slots would not fit the cap even at four warps stays split-K: 512 tiles
+    /// (384 slotted, 98,304 bytes, plus the rings) at five rows of a 416-wide output.
+    #[test]
+    fn a_k_past_the_narrow_cap_stays_split() {
+        let k = 65_536;
+        assert!(narrow_smem_bound(k, NARROW_MIN_WARPS) > NARROW_SMEM_CAP);
+        assert!(dense_k_split_fits(5, 416, k));
+        assert_eq!(
+            q8a128_dense_plan(5, 416, k, SM, true, Q8),
+            DensePlan::SplitK(q8a128_dense_k_splits(5, 416, k, SM))
+        );
+    }
+
+    /// Every narrow plan the rule picks fits the shared-memory cap, carries at most eight rows,
+    /// and puts every block in one wave — swept over M, N, K and part size.
+    #[test]
+    fn every_narrow_plan_fits() {
+        for sm in [46usize, 76, 82, 110, 170] {
+            for m in 1..=MAX_SPLIT_ROWS {
+                for n in (32..=16_384).step_by(32) {
+                    for k in [128usize, 384, 1024, 2560, 10_240, 65_536] {
+                        if let DensePlan::Narrow { warps } =
+                            q8a128_dense_plan(m, n, k, sm, true, Q8)
+                        {
+                            assert!(m <= NARROW_MAX_ROWS);
+                            assert!((NARROW_MIN_WARPS..=NARROW_MAX_WARPS).contains(&warps));
+                            assert!(narrow_smem_bound(k, warps) <= NARROW_SMEM_CAP);
+                            assert!(narrow_blocks_per_sm(k, warps) * sm >= n.div_ceil(8));
+                            assert!(q8a128_dense_k_splits(m, n, k, sm) > 1);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Every shape that splits fits the fixed scratch and launches no empty slice — swept over

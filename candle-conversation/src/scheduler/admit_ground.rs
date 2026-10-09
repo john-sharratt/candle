@@ -41,7 +41,7 @@ use std::time::Instant;
 use super::admission::prefill_cost_bytes;
 use super::admit::{Budget, Cost, Ground, Headroom, Kind};
 use super::interleave;
-use super::{Scheduler, SequenceId};
+use super::{Scheduler, SequenceId, WaveMember};
 use crate::projection::DecodePriority;
 use candle_nn::kv_cache::CHUNK_SIZE;
 
@@ -79,6 +79,13 @@ pub(super) const PREFILL_MIN_ADVANCE: usize = 128;
 /// nothing to defend, so admission is bounded only by what the allocators give.
 fn residency_now(standing_tier: usize) -> u64 {
     interleave::effective_weight_zone_bytes(standing_tier).unwrap_or(u64::MAX)
+}
+
+/// The first position of a `rows`-wide chunk ending at the last token of a
+/// `turn`-token prefill that starts at `depth` — the deepest chunk the turn
+/// runs at that width. A turn no wider than one chunk is its own deepest.
+fn deepest_chunk_offset(depth: usize, turn: usize, rows: usize) -> usize {
+    depth + turn.saturating_sub(rows)
 }
 
 /// A priority's slot in the per-band cursors. Three bands, in the order
@@ -178,12 +185,28 @@ impl<'a> AdmitPass<'a> {
         }
     }
 
-    /// The tier a chunk of `rows` would need, or zero when the model cannot
-    /// price one.
-    fn tier_for(&self, rows: usize) -> u64 {
+    /// The tier the **deepest** chunk of a `turn`-token prefill from sequence
+    /// `seq` needs, fed `rows` at a time, or zero when the model cannot price
+    /// one.
+    ///
+    /// The deepest, not the first: the terms that follow depth — the
+    /// pre-stage up to its key-chunk bound, and on a sparse-selection model
+    /// the scoring over every candidate block the deepest row can see — grow
+    /// as the turn advances, so a 128K turn's last chunk costs a tier its first
+    /// does not. A full-width chunk ending at the turn's last token bounds
+    /// every chunk the turn will run: none is wider, and none reaches deeper.
+    fn tier_for(&self, rows: usize, turn: usize, seq: SequenceId) -> u64 {
+        let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
+        let deepest = deepest_chunk_offset(depth, turn, rows);
         self.sched
             .model
-            .wave_tier_bytes(rows, 1, self.sched.session.activation_dtype())
+            .wave_tier_bytes(
+                rows,
+                1,
+                &[rows],
+                &[deepest],
+                self.sched.session.activation_dtype(),
+            )
             .unwrap_or(0)
     }
 
@@ -191,14 +214,15 @@ impl<'a> AdmitPass<'a> {
     /// carries one sequence more. The tier is superlinear in sequences — the span
     /// tables hold an entry per span — so a join is not free even though it adds
     /// no row, and pricing it at zero lets a forward widen to the sequence cap on
-    /// a tier admission never charged.
+    /// a tier admission never charged. It stages nothing: it brings no rows
+    /// into this forward, and the forwards that give it rows price it standing.
     fn join_tier(&self, rows: usize) -> u64 {
         let dtype = self.sched.session.activation_dtype();
         let seqs = self.sched.running_prefills();
         let tier = |n: usize| {
             self.sched
                 .model
-                .wave_tier_bytes(rows, n, dtype)
+                .wave_tier_bytes(rows, n, &[], &[], dtype)
                 .unwrap_or(0)
         };
         tier(seqs + 1).saturating_sub(tier(seqs))
@@ -334,7 +358,7 @@ impl Ground for AdmitPass<'_> {
         let activations = if rows == 0 {
             self.join_tier(rows_in_forward)
         } else {
-            self.tier_for(rows)
+            self.tier_for(rows, w.tokens.len(), w.sequence_id)
         };
         Some(Cost {
             // The whole turn's K/V, not this chunk's: admitting the turn commits
@@ -459,12 +483,21 @@ impl Scheduler {
     /// that places the tier, which is what makes it follow the model's geometry
     /// instead of being a byte count to re-derive per card.
     pub(super) fn min_forward_tier_bytes(&self) -> u64 {
+        // The least advance is a few chunks, far below the rows a launch
+        // pre-stages for, so it stages nothing.
         self.model
-            .wave_tier_bytes(PREFILL_MIN_ADVANCE, 1, self.session.activation_dtype())
+            .wave_tier_bytes(
+                PREFILL_MIN_ADVANCE,
+                1,
+                &[],
+                &[],
+                self.session.activation_dtype(),
+            )
             .unwrap_or(0)
     }
 
-    /// The tier the wave already in flight reserves — the held creep group.
+    /// The tier the wave already in flight reserves — the held creep group,
+    /// its members' pre-stage at each one's own depth included.
     ///
     /// A fact this decision reads, not an output it feeds back into itself: the
     /// tier each *new* admission adds is charged separately, through
@@ -473,8 +506,24 @@ impl Scheduler {
     pub(super) fn standing_tier_bytes(&self) -> usize {
         let rows = self.standing_rows();
         let seqs = self.wave_prefill_members.len().max(1);
+        let (advances, depths): (Vec<usize>, Vec<usize>) = self
+            .wave_prefill_members
+            .iter()
+            .map(|m| match m {
+                WaveMember::Prefill { seq_id, advance }
+                | WaveMember::Section { seq_id, advance } => {
+                    (*advance, self.session.sequence_offset(*seq_id).unwrap_or(0))
+                }
+            })
+            .unzip();
         self.model
-            .wave_tier_bytes(rows, seqs, self.session.activation_dtype())
+            .wave_tier_bytes(
+                rows,
+                seqs,
+                &advances,
+                &depths,
+                self.session.activation_dtype(),
+            )
             .unwrap_or(0) as usize
     }
 
@@ -576,8 +625,16 @@ impl Scheduler {
     /// resident the hit rate was 0.65, a coefficient of ~1.73 against a seed of
     /// 0.7 — a decode's copy priced two and a half times too dear, which the
     /// wave pays for by refusing decodes that would have fitted.
+    ///
+    /// **Read unsettled, once per decode forward.** Settling the expert
+    /// pipeline (`expert_stats`) waits for the device to reach the forward's
+    /// last MoE layer and for the pipeline thread to serve every layer queued
+    /// behind it — on Qwen3.8-Flash-Next single-session decode (RTX PRO 5000)
+    /// reading unsettled took a 4K step from 23.6 to 19.9 ms. The interval it
+    /// folds needs no exact boundary: a tally that trails by the layers still
+    /// queued counts them in the next interval instead.
     pub(super) fn observe_expert_hit_rate(&mut self) {
-        let Some(stats) = self.model.expert_stats() else {
+        let Some((total_hits, total_misses)) = self.model.expert_hit_counts() else {
             return;
         };
         // **The interval, not the lifetime.** Nothing in the daemon calls
@@ -589,11 +646,11 @@ impl Scheduler {
         // residency converts into hits. The sample count goes on rising, so the
         // telemetry reads healthy while the estimate has stopped moving.
         let (hits, misses) = (
-            stats.expert_hits.saturating_sub(self.expert_hits_seen),
-            stats.expert_misses.saturating_sub(self.expert_misses_seen),
+            total_hits.saturating_sub(self.expert_hits_seen),
+            total_misses.saturating_sub(self.expert_misses_seen),
         );
-        self.expert_hits_seen = stats.expert_hits;
-        self.expert_misses_seen = stats.expert_misses;
+        self.expert_hits_seen = total_hits;
+        self.expert_misses_seen = total_misses;
         let routed = hits + misses;
         if routed == 0 {
             return;
@@ -610,5 +667,25 @@ impl Scheduler {
     pub(super) fn decode_priority_or_high(&self, id: SequenceId) -> DecodePriority {
         self.decode_layer_priority(id)
             .unwrap_or(DecodePriority::High)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deepest_chunk_offset;
+
+    #[test]
+    fn the_deepest_chunk_ends_at_the_turns_last_token() {
+        // A 128,000-token turn fed 8,192 rows at a time from a fresh sequence:
+        // its deepest full-width chunk starts at 119,808 and ends at 128,000.
+        assert_eq!(deepest_chunk_offset(0, 128_000, 8_192), 119_808);
+        // The same turn appended behind 4,096 standing tokens.
+        assert_eq!(deepest_chunk_offset(4_096, 128_000, 8_192), 123_904);
+    }
+
+    #[test]
+    fn a_turn_no_wider_than_a_chunk_is_its_own_deepest() {
+        assert_eq!(deepest_chunk_offset(0, 4_096, 8_192), 0);
+        assert_eq!(deepest_chunk_offset(300, 8_192, 8_192), 300);
     }
 }

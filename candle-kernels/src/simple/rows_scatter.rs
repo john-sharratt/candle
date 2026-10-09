@@ -48,6 +48,9 @@ extern "C" {
     ///   host_desc: the same words, host-side, or null
     ///   max_elems: the widest run's `words`, for the column axis
     ///   max_rows:  the longest run's `rows`, for the row axis
+    ///
+    /// Returns the launch's `cudaGetLastError` code: 0 on success (and for an
+    /// empty set, which launches nothing).
     pub fn run_rows_scatter(
         desc: *const i64,
         host_desc: *const i64,
@@ -55,5 +58,5 @@ extern "C" {
         max_elems: i32,
         max_rows: i32,
         stream: *mut c_void,
-    );
+    ) -> i32;
 }

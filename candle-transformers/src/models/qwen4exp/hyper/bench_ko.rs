@@ -31,7 +31,8 @@ use std::time::Instant;
 
 use candle::quantized::cuda::{produce_q8a128, to_dynamic, DynamicTensor};
 use candle::quantized::int8_split_k::{
-    dense_k_split_depth, dense_k_split_fits, q8a128_dense_k_splits,
+    dense_k_split_depth, dense_k_split_fits, narrow_smem_bound, q8a128_dense_plan, DensePlan,
+    NARROW_MAX_ROWS, NARROW_SMEM_CAP,
 };
 use candle::quantized::{Int8Mode, SumScale};
 use candle::{DType, Device, Result, Tensor};
@@ -308,9 +309,9 @@ struct Gemm {
     bytes: f64,
 }
 
-/// The `down` and `up` GEMMs alone — operands quantized once, outside the timing — unsplit and
-/// split into K's slices, the two forms gated equal bit for bit (they sum in one order)
-/// before either is timed.
+/// The `down` and `up` GEMMs alone — operands quantized once, outside the timing — unsplit,
+/// split into K's slices and, up to eight rows, narrow at four and eight warps; every form gated
+/// equal to the unsplit one bit for bit (they all sum in one order) before it is timed.
 fn sweep_splits(
     dev: &Device,
     ko: &[HcWeightsKo],
@@ -323,7 +324,10 @@ fn sweep_splits(
     };
     let sm = cuda.multiprocessor_count()?;
     let (_, _, mode) = ko[0].matmuls();
-    println!("\nsplit-K sweep — GEMM only, µs per call (GB/s of weights), * = the rule's choice");
+    println!(
+        "\nsplit-K / narrow sweep — GEMM only, µs per call (GB/s of weights), * = the rule's \
+         choice; `s:` slices (1 = unsplit), `nW:` narrow at W warps"
+    );
     for Gemm { name, k, n, bytes } in gemms {
         for &t in widths {
             let x = lcg(&[t, k], 0x700 + t as u64, 2.0, dev)?;
@@ -336,41 +340,71 @@ fn sweep_splits(
                     u
                 }
             };
-            let want = pick(0).forward_dynamic_split_k(acts.as_dynamic(), DType::F32, 1)?;
+            let want = pick(0).inner().forward_dynamic_plan(
+                acts.as_dynamic(),
+                DType::F32,
+                DensePlan::Unsplit,
+            )?;
             let want = want.flatten_all()?.to_vec1::<f32>()?;
-            let rule = q8a128_dense_k_splits(t, n, k, sm);
+            let weight = pick(0)
+                .inner()
+                .qtensor()
+                .ok_or_else(|| candle::Error::Msg("a KO weight".into()))?
+                .dtype();
+            let rule = q8a128_dense_plan(t, n, k, sm, true, weight);
             let mut row = format!("{name:>4} {t:>5} rows |");
             // Split forms only where the fixed scratch holds them — the launcher refuses the
             // rest, and the rule never picks them. Each asked-for depth is launched at the
             // count that covers K with no empty slice.
-            let mut tried = vec![1usize];
+            let mut tried = vec![DensePlan::Unsplit];
             if dense_k_split_fits(t, n, k) {
-                for want in [8usize, 16, 27, 40] {
-                    let d = dense_k_split_depth(k, want);
-                    if d > 1 && !tried.contains(&d) {
-                        tried.push(d);
+                let mut depths: Vec<usize> = [8usize, 16, 27, 40]
+                    .iter()
+                    .map(|&want| dense_k_split_depth(k, want))
+                    .collect();
+                if let DensePlan::SplitK(s) = rule {
+                    depths.push(s);
+                }
+                depths.sort_unstable();
+                depths.dedup();
+                tried.extend(depths.into_iter().filter(|&d| d > 1).map(DensePlan::SplitK));
+            }
+            // Narrow forms where a launch carries the rows and its shared memory fits.
+            if t <= NARROW_MAX_ROWS {
+                for warps in [4usize, 8, 16] {
+                    if narrow_smem_bound(k, warps) <= NARROW_SMEM_CAP {
+                        tried.push(DensePlan::Narrow { warps });
                     }
                 }
-                if rule > 1 && !tried.contains(&rule) {
+                if matches!(rule, DensePlan::Narrow { .. }) && !tried.contains(&rule) {
                     tried.push(rule);
                 }
-                tried.sort_unstable();
             }
-            for &s in &tried {
-                let got = pick(0).forward_dynamic_split_k(acts.as_dynamic(), DType::F32, s)?;
+            for &plan in &tried {
+                let got =
+                    pick(0)
+                        .inner()
+                        .forward_dynamic_plan(acts.as_dynamic(), DType::F32, plan)?;
                 if got.flatten_all()?.to_vec1::<f32>()? != want {
                     candle::bail!(
-                        "split sweep: {name} at {t} rows, {s} slices, differs from unsplit — \
-                         the two must sum in one order"
+                        "split sweep: {name} at {t} rows, {plan:?}, differs from unsplit — \
+                         every plan must sum in one order"
                     );
                 }
                 let us = time_rotating(dev, MODULES, iters, |m| {
-                    pick(m).forward_dynamic_split_k(acts.as_dynamic(), DType::F32, s)?;
+                    pick(m)
+                        .inner()
+                        .forward_dynamic_plan(acts.as_dynamic(), DType::F32, plan)?;
                     Ok(())
                 })?;
-                let mark = if s == rule { "*" } else { " " };
+                let mark = if plan == rule { "*" } else { " " };
+                let label = match plan {
+                    DensePlan::Unsplit => "1".to_string(),
+                    DensePlan::SplitK(s) => s.to_string(),
+                    DensePlan::Narrow { warps } => format!("n{warps}"),
+                };
                 row.push_str(&format!(
-                    " {s}:{us:.1}({:.0}){mark}",
+                    " {label}:{us:.1}({:.0}){mark}",
                     bytes / (us * 1e-6) / 1e9
                 ));
             }

@@ -987,6 +987,8 @@ extern "C" __global__ void moe_route_bf16(const __nv_bfloat16*, uint32_t*, float
 extern "C" __global__ void moe_route_f32_x512(const float*, uint32_t*, float*, int, int, int, int, int);
 extern "C" __global__ void moe_route_f16_x512(const __half*, uint32_t*, float*, int, int, int, int, int);
 extern "C" __global__ void moe_route_bf16_x512(const __nv_bfloat16*, uint32_t*, float*, int, int, int, int, int);
+// Router look-ahead: per-hop top-k votes of later layers' routers.
+extern "C" __global__ void moe_predict_votes_f32(const float*, uint32_t*, float*, int, int, int, int, int, int);
 // Deterministic scatter (sequential per-token reduce, no atomicAdd, variable k via prefix sum)
 extern "C" __global__ void deterministic_scatter_bf16(__nv_bfloat16*, const __nv_bfloat16*, const uint32_t*, const float*, const uint32_t*, const int*, int, int);
 extern "C" __global__ void deterministic_scatter_f16(__half*, const __half*, const uint32_t*, const float*, const uint32_t*, const int*, int, int);
@@ -1580,6 +1582,20 @@ void run_moe_route(int32_t dtype, const void* logits, uint32_t* out_idx, float* 
             else      moe_route_bf16<<<blocks, tpb, 0, stream>>>((const __nv_bfloat16*)logits, out_idx, out_weights, num_tokens, n_experts, row_stride, k, norm_topk);
             break;
     }
+}
+
+// Router look-ahead votes (`moe_scatter.cu`): one block per hop, a warp per
+// token, `out` [hops][n_experts] u32 words of `(tokens routing it in their top
+// k) << 16 | (tokens reaching it only in ranks k+1 … n)`, and `mass` [hops]
+// [n_experts] f32 the softmax probability those picks carried. The hops' logits are
+// `n_experts`-wide column runs from `first_col` of `row_stride`-wide f32 rows.
+void run_moe_predict_votes(const float* logits, uint32_t* out, float* mass, int num_tokens,
+                           int n_experts, int row_stride, int first_col, int hops, int k, int n,
+                           cudaStream_t stream) {
+    if (hops <= 0 || n_experts <= 0 || n_experts > 512) return;
+    const int warps = num_tokens < 1 ? 1 : (num_tokens < 8 ? num_tokens : 8);
+    moe_predict_votes_f32<<<hops, warps * 32, 0, stream>>>(
+        logits, out, mass, num_tokens, n_experts, row_stride, first_col, k, n);
 }
 
 // Deterministic MoE scatter: sequential per-token reduce, no atomicAdd.

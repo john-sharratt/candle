@@ -14,6 +14,9 @@
 //!   cargo run -p candle-transformers --example delta_net_bench \
 //!       --features cuda --release -- [tokens] [seqs] [iters]
 //!
+//! The single-sequence long-prefill shapes the Strata profile runs are
+//! `4096 1` and `7500 1` (one ~7.5K-row prefill chunk per layer).
+//!
 //! Profile one kernel of the scan (the setup launches are excluded by name):
 //!   ncu -k delta_net_prefill_state_f32_kernel --launch-count 3 --set full \
 //!       target/release/examples/delta_net_bench 4096 2 2

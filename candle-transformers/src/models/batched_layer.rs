@@ -398,14 +398,6 @@ pub trait BatchedAttentionLayer {
         wave: Option<&'w WaveGeneration>,
     ) -> Result<()>;
 
-    /// Whether this layer hands its recorded launches to the device itself —
-    /// an MoE's host protocol ends the segment holding its bucketize — so a
-    /// forward recorded as a chain of graphs needs no cut of its own after it
-    /// (`docs/decode_graphs.md`). `false` for a dense layer.
-    fn ends_a_segment(&self) -> bool {
-        false
-    }
-
     /// Project Q/K/V over the producer-prepared `DynamicActs` (the fused `attention_norm`), folding
     /// in any Q/K/V bias and q/k-norm. q/k/v share the single quantize (B1).
     ///

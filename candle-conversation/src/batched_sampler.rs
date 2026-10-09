@@ -32,6 +32,88 @@ struct PendingAllowList {
     pending: PendingSample,
 }
 
+/// What [`SequenceSamplingState::mark`] saves: every field an advance changes
+/// except the dense counts, which [`SequenceSamplingState::rewind`] walks back
+/// from the tokens recorded instead of copying a vocabulary.
+struct SamplingMark {
+    counted_len: usize,
+    recent_tokens: Vec<i32>,
+    current_len: i32,
+    in_segment: bool,
+    segment_len: i32,
+    dry_span_len: i32,
+    close_script_pos: Option<usize>,
+    degenerate_run: u32,
+    rng_offset: u64,
+}
+
+/// The state a row was scored against, as [`SequenceSamplingState::row_key`]
+/// reads it. A row commits only onto a state with the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowKey {
+    counted: usize,
+    current_len: i32,
+    in_segment: bool,
+    segment_len: i32,
+    dry_span_len: i32,
+    dry_suppressed: bool,
+    in_tool_call: bool,
+    writing_call: bool,
+    close_script_pos: Option<usize>,
+    degenerate_run: u32,
+    rng_offset: u64,
+    last: Option<i32>,
+}
+
+/// One row of a dispatch ([`BatchedSampler::score_rows`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RowSpec<'a> {
+    /// The sequence it samples: an index into the dispatch's states.
+    pub seq: usize,
+    /// The row of the logits block it reads.
+    pub logits_row: usize,
+    /// The proposal a speculative verify row tests.
+    pub draft: Option<u32>,
+    /// The tokens the sequence commits before this row within the step —
+    /// empty for its first row. A sequence's rows each extend the previous
+    /// one's by a token.
+    pub ahead: &'a [u32],
+}
+
+/// How a row's token is committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    /// Sampled over the vocabulary, then resolved — segment close, the EOS
+    /// failsafes — and tracked for segment edges.
+    Free,
+    /// Forced or drawn from a grammar's allow-list: recorded as it stands.
+    Constrained,
+}
+
+/// A row's pick, scored and not yet committed
+/// ([`BatchedSampler::commit_row`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Scored {
+    raw: u32,
+    kind: RowKind,
+    rng_after: u64,
+    key: RowKey,
+}
+
+/// Why [`BatchedSampler::resolve`] committed what it did, for the log line
+/// the commit writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    Sampled,
+    SegmentClose,
+    CloseBeforeCall,
+    Degenerate,
+    WritingCall,
+    ForcedEos,
+    NoBoundaryTokens,
+    GracefulEos,
+}
+
 /// Per-sequence sampling state.
 ///
 /// Tracks token counts and recent history for penalty calculations.
@@ -573,6 +655,65 @@ impl SequenceSamplingState {
         }
     }
 
+    /// Everything a hypothetical advance through a block's drafts changes,
+    /// saved so [`Self::rewind`] can undo it exactly.
+    fn mark(&self) -> SamplingMark {
+        SamplingMark {
+            counted_len: self.counted.len(),
+            recent_tokens: self.recent_tokens.clone(),
+            current_len: self.current_len,
+            in_segment: self.in_segment,
+            segment_len: self.segment_len,
+            dry_span_len: self.dry_span_len,
+            close_script_pos: self.close_script_pos,
+            degenerate_run: self.degenerate_run,
+            rng_offset: self.rng_offset,
+        }
+    }
+
+    /// Undo every advance since `mark`, given the tokens those advances
+    /// recorded.
+    ///
+    /// The dense counts are not saved, only walked back: each recorded token
+    /// had its count raised by one, and a token first seen since the mark was
+    /// appended to `counted` past the length the mark kept — so lowering the
+    /// counts and truncating the list restores both exactly.
+    fn rewind(&mut self, mark: SamplingMark, recorded: &[u32]) {
+        for &t in recorded {
+            if let Some(c) = self.token_counts.get_mut(t as usize) {
+                *c -= 1;
+            }
+        }
+        self.counted.truncate(mark.counted_len);
+        self.recent_tokens = mark.recent_tokens;
+        self.current_len = mark.current_len;
+        self.in_segment = mark.in_segment;
+        self.segment_len = mark.segment_len;
+        self.dry_span_len = mark.dry_span_len;
+        self.close_script_pos = mark.close_script_pos;
+        self.degenerate_run = mark.degenerate_run;
+        self.rng_offset = mark.rng_offset;
+    }
+
+    /// The fields a row's dispatch inputs and its commit read, as they stand.
+    /// Two states with the same key score and commit a row identically.
+    fn row_key(&self) -> RowKey {
+        RowKey {
+            counted: self.counted.len(),
+            current_len: self.current_len,
+            in_segment: self.in_segment,
+            segment_len: self.segment_len,
+            dry_span_len: self.dry_span_len,
+            dry_suppressed: self.dry_suppressed,
+            in_tool_call: self.in_tool_call,
+            writing_call: self.writing_call,
+            close_script_pos: self.close_script_pos,
+            degenerate_run: self.degenerate_run,
+            rng_offset: self.rng_offset,
+            last: self.recent_tokens.last().copied(),
+        }
+    }
+
     /// True when the most recent token ends a sentence (`.`, `!`, `?`) or a
     /// line. The graceful EOS waits for this, so an answer is not cut
     /// mid-sentence.
@@ -790,163 +931,345 @@ impl BatchedSampler {
     ///
     /// # Returns
     /// Sampled token IDs for each sequence. States are updated in place.
+    ///
+    /// One row per sequence, scored in one dispatch and committed — the plain
+    /// case of [`Self::score_rows`] and [`Self::commit_row`], which a
+    /// speculative step drives directly.
     pub fn sample_batch(
         &self,
         logits: &Tensor,
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
     ) -> candle::Result<Vec<u32>> {
-        self.sample_rows(logits, states, configs, None)
-    }
-
-    /// [`Self::sample_batch`] for speculative verify rows: `drafts[i]` is the
-    /// proposal row `i` tests (`None` on a bonus row), committed instead of the
-    /// row's sample when `typical` accepts it. A row under a stencil samples
-    /// its allow-list exactly as a plain row does and tests nothing.
-    pub fn sample_verify_rows(
-        &self,
-        logits: &Tensor,
-        states: &mut [&mut SequenceSamplingState],
-        configs: &[&SamplingConfig],
-        drafts: &[Option<u32>],
-        typical: TypicalAcceptance,
-    ) -> candle::Result<Vec<u32>> {
-        if drafts.len() != states.len() {
-            candle::bail!(
-                "sample_verify_rows: {} drafts for {} rows",
-                drafts.len(),
-                states.len()
-            );
-        }
-        self.sample_rows(logits, states, configs, Some((drafts, typical)))
-    }
-
-    fn sample_rows(
-        &self,
-        logits: &Tensor,
-        states: &mut [&mut SequenceSamplingState],
-        configs: &[&SamplingConfig],
-        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
-    ) -> candle::Result<Vec<u32>> {
         let batch_size = states.len();
         if batch_size == 0 {
             return Ok(Vec::new());
         }
         let logits2d = self.flatten_to_2d(logits)?;
-        let mut results = vec![0u32; batch_size];
-
-        // Split rows by stencil constraint.  Constrained rows take cheap CPU paths
-        // — a forced token (allow-list of one) needs no logits, a small allow-list
-        // is a tiny gather + sample — so only UNCONSTRAINED rows go to the
-        // full-vocab device kernel.  When nothing is constrained (the common wave)
-        // every row is a kernel row.
-        let mut kernel_idx: Vec<usize> = Vec::new();
-        let mut kernel_states: Vec<&mut SequenceSamplingState> = Vec::new();
-        let mut kernel_configs: Vec<&SamplingConfig> = Vec::new();
-        // Small allow-lists: every such row's device work is enqueued in this
-        // pass and read back after the kernel rows below, so the rows share one
-        // pipeline drain instead of each draining it for its own handful of
-        // logits.
-        let mut allow_rows: Vec<(usize, PendingAllowList, &mut SequenceSamplingState)> = Vec::new();
-        for (i, slot) in states.iter_mut().enumerate() {
-            let state: &mut SequenceSamplingState = slot;
-            let config = configs[i];
-            match config.stencil.as_slice() {
-                // Forced: the single allowed token, decided without logits.
-                [forced] => {
-                    let token = *forced as u32;
-                    state.record_token(token, self.max_recent_len);
-                    state.advance_rng();
-                    results[i] = token;
-                }
-                // Small allow-list: a tiny gather + sample over just the allowed
-                // logits.
-                [_, _, ..] => {
-                    let pending = self.issue_allow_list(&logits2d, i, config, state)?;
-                    allow_rows.push((i, pending, state));
-                }
-                // Unconstrained: defer to the device kernel below. Collected in
-                // this same pass — a second walk filtering on `kernel_idx` would
-                // re-scan it per row, on a path that runs once per decode step.
-                [] => {
-                    kernel_idx.push(i);
-                    kernel_states.push(state);
-                    kernel_configs.push(config);
-                }
-            }
+        let rows: Vec<RowSpec<'_>> = (0..batch_size)
+            .map(|i| RowSpec {
+                seq: i,
+                logits_row: i,
+                draft: None,
+                ahead: &[],
+            })
+            .collect();
+        let scored = self.score_rows(&logits2d, states, configs, &rows, None)?;
+        let mut results = Vec::with_capacity(batch_size);
+        for (i, scored) in scored.into_iter().enumerate() {
+            let scored = scored.ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "sample_batch: row {i} has nothing ahead of it and was still scored unreachable"
+                ))
+            })?;
+            results.push(self.commit_row(&logits2d, i, &mut *states[i], configs[i], scored)?);
         }
-
-        // **Each row samples on its OWN dials.** Temperature, top-k/top-p, the
-        // repetition and DRY penalties, the EOS ramp and the segment-close ramp
-        // are packed per row into the `SeqDials` array (`SeqDials::from_config`
-        // below) and the kernel reads `seq_dials[row]`, so a wave that mixes
-        // dials — a `ThinkMode::Off` ingest summary at
-        // `SamplingConfig::compression()` beside a dialogue turn, or a narrator
-        // beside a deliberating reflection — samples each row correctly instead
-        // of collapsing the whole launch onto row 0's config. This is the
-        // per-sequence-array shape `banned_tokens_per_seq` already uses, not
-        // host-side regrouping (splitting into one launch per distinct config
-        // would be ~one launch per sequence, since `zend` randomises `seed` per
-        // turn — the batching the engine exists to do, thrown away).
-        //
-        // The remaining scalars — `eos_token_id`, `vocab_size`, the shared
-        // banned/suppress token *lists* — are genuinely model-wide and stay
-        // scalar. And anything resolved per row on the HOST still reads
-        // `configs[i]` directly (the segment-close budget and EOS failsafes in
-        // the post-kernel loop), never row 0.
-        if !kernel_idx.is_empty() {
-            // The kernel reads its rows out of the whole block in place, each
-            // named by its index (`SeqDials::logits_row`). No compacted copy of
-            // the kernel rows is made: the block sits on the wave's head span,
-            // and a copy would claim a second block of logits there that the
-            // wave never priced.
-            let kernel_verify = verify.map(|(drafts, typical)| {
-                let rows: Vec<Option<u32>> = kernel_idx.iter().map(|&i| drafts[i]).collect();
-                (rows, typical)
-            });
-            let tokens = self.sample_full_vocab(
-                &logits2d,
-                &kernel_idx,
-                &mut kernel_states,
-                &kernel_configs,
-                kernel_verify.as_ref().map(|(r, t)| (r.as_slice(), *t)),
-            )?;
-            for (k, &i) in kernel_idx.iter().enumerate() {
-                results[i] = tokens[k];
-            }
-        }
-        for (i, pending, state) in allow_rows {
-            results[i] = self.finish_allow_list(pending, state)?;
-        }
-
-        // A row that has just crossed the degenerate bar gets its logits
-        // described, once, in the log. `resolve_final_token` can only say the
-        // row was unusable — it never sees the logits — so without this the
-        // operator is left with the guard's own guess ("all-equal or
-        // non-finite") and no way to tell a dead forward from a NaN one. This
-        // reads one row off the device and runs only on the step the bar is
-        // crossed, so it costs nothing until something is already wrong.
-        for (i, state) in states.iter().enumerate() {
-            if state.degenerate_run == DEGENERATE_TOKEN_RUN {
-                let stencil = &configs[i].stencil;
-                match describe_logit_row(&logits2d, i) {
-                    Ok(desc) => tracing::error!(
-                        target: "candle_conversation::eos",
-                        row = i,
-                        stencil_len = stencil.len(),
-                        stencil_head = ?stencil.iter().take(4).collect::<Vec<_>>(),
-                        "degenerate decode: {desc}"
-                    ),
-                    Err(e) => tracing::error!(
-                        target: "candle_conversation::eos",
-                        row = i,
-                        "degenerate decode: logits row unreadable ({e})"
-                    ),
-                }
-            }
-        }
-
         Ok(results)
+    }
+
+    /// Score `rows` against the logits block `logits2d` in one dispatch, and
+    /// leave every state exactly as it was.
+    ///
+    /// **A row is priced against the history it would be reached with.** A
+    /// speculative step's row `p` is reached only once the sequence has
+    /// committed its first `p` drafts, so its penalties, RNG offset and
+    /// segment edges are those of the state the commits of `row.ahead` leave.
+    /// Each sequence is advanced through its rows' `ahead` tokens here exactly
+    /// as [`Self::commit_row`] would advance it, each row's inputs are read off
+    /// the state as it then stands, and the sequence is rewound once its rows
+    /// are read. Every row then goes to the kernel together — one launch and
+    /// one readback for the step, where scoring each position after the last
+    /// was committed costs both per position, serialised.
+    ///
+    /// A row the `ahead` tokens cannot reach — the resolution of an earlier
+    /// one would commit something other than its draft — scores as `None`.
+    ///
+    /// Forced rows need no logits; an allow-list row's device work is enqueued
+    /// beside the kernel's and read back after it, so every row of the
+    /// dispatch shares one drain.
+    pub fn score_rows(
+        &self,
+        logits2d: &Tensor,
+        states: &mut [&mut SequenceSamplingState],
+        configs: &[&SamplingConfig],
+        rows: &[RowSpec<'_>],
+        typical: Option<TypicalAcceptance>,
+    ) -> candle::Result<Vec<Option<Scored>>> {
+        if configs.len() != states.len() {
+            candle::bail!(
+                "score_rows: {} configs for {} sequences",
+                configs.len(),
+                states.len()
+            );
+        }
+        for (r, row) in rows.iter().enumerate() {
+            if row.seq >= states.len() {
+                candle::bail!(
+                    "score_rows: row {r} names sequence {} of {}",
+                    row.seq,
+                    states.len()
+                );
+            }
+            if row.draft.is_some() && typical.is_none() {
+                candle::bail!("score_rows: row {r} tests a draft with no acceptance rule");
+            }
+        }
+        if let Some(path) = &self.penalty_log_path {
+            let presence = configs.first().map_or(0.0, |c| c.presence_penalty);
+            if let Err(e) = self.write_penalty_log(path, states, presence) {
+                tracing::warn!("Failed to write penalty log: {}", e);
+            }
+        }
+        let on_cuda = matches!(self.device, Device::Cuda(_));
+        // The cross-turn table is read only when a full-vocabulary row carries
+        // the penalty, so it is only gathered then.
+        let cross_turn = rows.iter().any(|r| {
+            let c = configs[r.seq];
+            c.stencil.is_empty() && c.cross_turn_penalty != 0.0
+        });
+
+        let n_seq = states.len();
+        let mut marks: Vec<Option<SamplingMark>> = (0..n_seq).map(|_| None).collect();
+        let mut recorded: Vec<Vec<u32>> = vec![Vec::new(); n_seq];
+        let mut ahead_of: Vec<&[u32]> = vec![&[][..]; n_seq];
+        let mut reachable = vec![true; n_seq];
+        let mut out: Vec<Option<Scored>> = vec![None; rows.len()];
+        let mut kernel = KernelRows::new(self.vocab_size, self.max_recent_len, cross_turn);
+        let mut allow: Vec<(usize, PendingAllowList, RowKey)> = Vec::new();
+
+        let gathered = (|| -> candle::Result<()> {
+            for (r, row) in rows.iter().enumerate() {
+                let s = row.seq;
+                let config = configs[s];
+                let state = &mut *states[s];
+                let done = recorded[s].len();
+                // Marked only when a row is about to advance it: a plain decode
+                // step's rows have nothing ahead, and copying each sequence's
+                // window to restore it unchanged would be the whole cost.
+                if marks[s].is_none() && row.ahead.len() > done {
+                    marks[s] = Some(state.mark());
+                }
+                if row.ahead.len() < done || row.ahead[..done] != ahead_of[s][..done] {
+                    candle::bail!(
+                        "score_rows: row {r}'s committed prefix does not extend the one \
+                         sequence {s}'s previous row was scored after"
+                    );
+                }
+                for &t in &row.ahead[done..] {
+                    let (recorded_token, reaches) = self.advance(state, config, t);
+                    recorded[s].push(recorded_token);
+                    reachable[s] &= reaches;
+                }
+                ahead_of[s] = row.ahead;
+                if !reachable[s] {
+                    continue;
+                }
+                let key = state.row_key();
+                match config.stencil.as_slice() {
+                    // Forced: the single allowed token, decided without logits.
+                    [forced] => {
+                        out[r] = Some(Scored {
+                            raw: *forced as u32,
+                            kind: RowKind::Constrained,
+                            rng_after: state.rng_offset.wrapping_add(1),
+                            key,
+                        });
+                    }
+                    // Small allow-list: a tiny gather + sample over just the
+                    // allowed logits.
+                    [_, _, ..] => {
+                        let pending =
+                            self.issue_allow_list(logits2d, row.logits_row, config, state)?;
+                        allow.push((r, pending, key));
+                    }
+                    [] if on_cuda => kernel.push(r, state, config, row, typical, key),
+                    [] => {
+                        let raw = self.sample_row_cpu(logits2d, row, state, config, typical)?;
+                        out[r] = Some(Scored {
+                            raw,
+                            kind: RowKind::Free,
+                            rng_after: state.rng_offset.wrapping_add(1),
+                            key,
+                        });
+                    }
+                }
+            }
+            Ok(())
+        })();
+        for (s, mark) in marks.into_iter().enumerate() {
+            if let Some(mark) = mark {
+                states[s].rewind(mark, &recorded[s]);
+            }
+        }
+        gathered?;
+
+        if !kernel.is_empty() {
+            let (tokens, rngs) = self.launch_rows(logits2d, &kernel)?;
+            for (k, &(r, key)) in kernel.scored.iter().enumerate() {
+                out[r] = Some(Scored {
+                    raw: tokens[k],
+                    kind: RowKind::Free,
+                    rng_after: rngs[k],
+                    key,
+                });
+            }
+        }
+        for (r, pending, key) in allow {
+            out[r] = Some(Scored {
+                raw: self.finish_allow_list(pending)?,
+                kind: RowKind::Constrained,
+                rng_after: key.rng_offset.wrapping_add(1),
+                key,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Commit a scored row onto `state`: resolve a free row's pick (segment
+    /// close, the EOS failsafes), record the token, take the row's RNG offset
+    /// and track segment edges. `logits_row` of `logits2d` is the row it was
+    /// scored from, described in the log if the commit crosses the degenerate
+    /// bar.
+    ///
+    /// **The state must be the one the row was scored against.** A row of a
+    /// speculative step was priced against the state its earlier positions'
+    /// drafts would leave; committing it onto any other would hand the
+    /// sequence a token drawn under rules it does not stand under, so a
+    /// mismatch is refused rather than committed.
+    pub fn commit_row(
+        &self,
+        logits2d: &Tensor,
+        logits_row: usize,
+        state: &mut SequenceSamplingState,
+        config: &SamplingConfig,
+        scored: Scored,
+    ) -> candle::Result<u32> {
+        let live = state.row_key();
+        if live != scored.key {
+            candle::bail!(
+                "commit_row: row {logits_row} was scored against {:?} and commits onto {:?} — \
+                 the sampler's advance through the step's drafts and the committed path \
+                 disagree",
+                scored.key,
+                live
+            );
+        }
+        let token = match scored.kind {
+            RowKind::Constrained => scored.raw,
+            RowKind::Free => {
+                // One-shot: the dynamic EOS boost ramp begins as `current_len`
+                // reaches `eos_ramp_start` (it increments by one, so this fires
+                // exactly once per turn). After this point EOS pressure builds
+                // toward the graceful/hard caps.
+                if config.eos_boost != 0.0 && state.current_len == config.eos_ramp_start {
+                    tracing::debug!(
+                        target: "candle_conversation::eos",
+                        row = logits_row,
+                        current_len = state.current_len,
+                        eos_ramp_start = config.eos_ramp_start,
+                        eos_ramp_len = config.eos_ramp_len,
+                        graceful_eos_after = config.graceful_eos_after,
+                        forced_eos_after = config.forced_eos_after,
+                        "EOS boost ramp entered",
+                    );
+                }
+                let (token, why) = self.resolve(scored.raw, state, config);
+                self.log_resolution(logits_row, why, state, config);
+                token
+            }
+        };
+        state.record_token(token, self.max_recent_len);
+        state.rng_offset = scored.rng_after;
+        if scored.kind == RowKind::Free {
+            state.update_segment_state(
+                token,
+                config.segment_open_token_id,
+                config.segment_close_token_id,
+            );
+        }
+        // A row that has just crossed the degenerate bar gets its logits
+        // described, once, in the log. The resolution can only say the row was
+        // unusable — it never sees the logits — so without this the operator is
+        // left with the guard's own guess ("all-equal or non-finite") and no way
+        // to tell a dead forward from a NaN one. This reads one row off the
+        // device and runs only on the step the bar is crossed, so it costs
+        // nothing until something is already wrong.
+        if state.degenerate_run == DEGENERATE_TOKEN_RUN {
+            let stencil = &config.stencil;
+            match describe_logit_row(logits2d, logits_row) {
+                Ok(desc) => tracing::error!(
+                    target: "candle_conversation::eos",
+                    row = logits_row,
+                    stencil_len = stencil.len(),
+                    stencil_head = ?stencil.iter().take(4).collect::<Vec<_>>(),
+                    "degenerate decode: {desc}"
+                ),
+                Err(e) => tracing::error!(
+                    target: "candle_conversation::eos",
+                    row = logits_row,
+                    "degenerate decode: logits row unreadable ({e})"
+                ),
+            }
+        }
+        Ok(token)
+    }
+
+    /// Advance `state` as [`Self::commit_row`] would on committing a row whose
+    /// pick was `token`. Answers with the token the advance recorded, and
+    /// whether a commit could record `token` itself — which is what reaching
+    /// the next row takes. Nothing is logged: the row is not being committed,
+    /// only priced past.
+    fn advance(
+        &self,
+        state: &mut SequenceSamplingState,
+        config: &SamplingConfig,
+        token: u32,
+    ) -> (u32, bool) {
+        match config.stencil.as_slice() {
+            [forced] => {
+                let committed = *forced as u32;
+                state.record_token(committed, self.max_recent_len);
+                state.advance_rng();
+                (committed, committed == token)
+            }
+            [_, _, ..] => {
+                state.record_token(token, self.max_recent_len);
+                state.advance_rng();
+                // An allow-list draws only allowed tokens.
+                (token, config.stencil.contains(&(token as i32)))
+            }
+            [] => {
+                let step = self.free_rng_step(state, config);
+                let (committed, _) = self.resolve(token, state, config);
+                state.record_token(committed, self.max_recent_len);
+                state.rng_offset = state.rng_offset.wrapping_add(step);
+                state.update_segment_state(
+                    committed,
+                    config.segment_open_token_id,
+                    config.segment_close_token_id,
+                );
+                (committed, committed == token)
+            }
+        }
+    }
+
+    /// How far a full-vocabulary row moves its sequence's RNG offset. The
+    /// kernel draws, and advances the offset, only when the row samples — its
+    /// temperature, raised inside a segment by `segment_temp_boost`, above
+    /// zero — and returns the argmax untouched otherwise. The host sampler
+    /// draws on every row.
+    fn free_rng_step(&self, state: &SequenceSamplingState, config: &SamplingConfig) -> u64 {
+        if !matches!(self.device, Device::Cuda(_)) {
+            return 1;
+        }
+        let boosted = state.in_segment && state.segment_len > 0;
+        let temperature = config.temperature
+            + if boosted {
+                config.segment_temp_boost
+            } else {
+                0.0
+            };
+        u64::from(temperature > 0.0)
     }
 
     /// Flatten logits of rank 1/2/3 to `[batch, vocab]` (taking the last
@@ -963,36 +1286,10 @@ impl BatchedSampler {
         }
     }
 
-    /// Dispatch the unconstrained (full-vocab) rows to the device sampler.
-    /// `rows[i]` is the row of the `[batch, vocab]` block `logits` that
-    /// `states[i]` samples.
-    fn sample_full_vocab(
-        &self,
-        logits: &Tensor,
-        rows: &[usize],
-        states: &mut [&mut SequenceSamplingState],
-        configs: &[&SamplingConfig],
-        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
-    ) -> candle::Result<Vec<u32>> {
-        if rows.len() != states.len() {
-            candle::bail!(
-                "sample_full_vocab: {} rows for {} sampling states",
-                rows.len(),
-                states.len()
-            );
-        }
-        if matches!(self.device, Device::Cuda(_)) {
-            self.sample_batch_cuda(logits, rows, states, configs, verify)
-        } else {
-            self.sample_batch_cpu(logits, rows, states, configs, verify)
-        }
-    }
-
     /// The device half of a row constrained to its stencil allow-list: gather
     /// just the allowed logits (a handful) and enqueue the row's strategy over
-    /// them. `O(allow-list)`, never the full vocab. Nothing is read back here
-    /// and the row's state is not advanced — [`Self::finish_allow_list`] does
-    /// both.
+    /// them. `O(allow-list)`, never the full vocab. Nothing is read back here —
+    /// [`Self::finish_allow_list`] does that.
     fn issue_allow_list(
         &self,
         logits2d: &Tensor,
@@ -1014,81 +1311,56 @@ impl BatchedSampler {
         })
     }
 
-    /// The host half: read the row's result back, map it to its allowed token
-    /// and advance the row.
-    fn finish_allow_list(
-        &self,
-        row: PendingAllowList,
-        state: &mut SequenceSamplingState,
-    ) -> candle::Result<u32> {
+    /// The host half: read the row's result back and map it to its allowed
+    /// token. Committing it is [`Self::commit_row`]'s.
+    fn finish_allow_list(&self, row: PendingAllowList) -> candle::Result<u32> {
         let PendingAllowList {
             allow,
             mut processor,
             pending,
         } = row;
         let local = processor.sample_finish(pending)? as usize;
-        let token = allow[local];
-        state.record_token(token, self.max_recent_len);
-        state.advance_rng();
-        Ok(token)
+        Ok(allow[local])
     }
 
     /// Resolve a raw sampled token into the token the sequence actually commits.
     ///
     /// Applies, in priority order: the segment-close override (authoritative for
     /// the step), the degenerate-decode abort, then the EOS length failsafes.
-    /// `row` names the batch row for the logs. `state` is taken by `&mut` for
-    /// `segment_close_override`, which flips `in_segment` as it closes a
-    /// segment; nothing here records the committed token, which stays with the
-    /// caller that owns the advance.
+    /// `state` is taken by `&mut` for `segment_close_override`, which steps a
+    /// closer script as it plays; nothing here records the committed token,
+    /// which stays with the caller that owns the advance, and nothing is
+    /// logged — [`Self::log_resolution`] does that for a row really committed,
+    /// not one a speculative step is only priced past.
     ///
-    /// Both sampling paths resolve through here because the two copies of this
-    /// logic drifted once already: the degenerate-decode abort was written into
-    /// the CPU fallback alone, and `sample_full_vocab` sends every unconstrained
-    /// row to the kernel whenever the device is CUDA — which is every
-    /// deployment that matters. A forward producing unusable logits therefore
-    /// ran to the length cap instead of stopping at
-    /// [`DEGENERATE_TOKEN_RUN`], writing hundreds of `!` into the conversation
-    /// and into the substrate, where the turn's signatures then polluted
-    /// retrieval. One authority means a guard added here holds on whichever
-    /// path the device selects.
-    fn resolve_final_token(
+    /// Every row resolves through here because two copies of this logic
+    /// drifted once already: the degenerate-decode abort was written into the
+    /// CPU sampler alone, while every unconstrained row went to the kernel on a
+    /// CUDA device — which is every deployment that matters. A forward
+    /// producing unusable logits therefore ran to the length cap instead of
+    /// stopping at [`DEGENERATE_TOKEN_RUN`], writing hundreds of `!` into the
+    /// conversation and into the substrate, where the turn's signatures then
+    /// polluted retrieval. One authority means a guard added here holds on
+    /// whichever path the device selects.
+    fn resolve(
         &self,
-        row: usize,
         sampled: u32,
         state: &mut SequenceSamplingState,
         config: &SamplingConfig,
-    ) -> u32 {
+    ) -> (u32, Resolution) {
         let eos_token_id = self.eos_tokens.iter().copied().next().unwrap_or(0);
-
-        // One-shot: the dynamic EOS boost ramp begins as `current_len` reaches
-        // `eos_ramp_start` (it increments by one, so this fires exactly once per
-        // turn).  After this point EOS pressure builds toward the graceful/hard
-        // caps below.
-        if config.eos_boost != 0.0 && state.current_len == config.eos_ramp_start {
-            tracing::debug!(
-                target: "candle_conversation::eos",
-                row,
-                current_len = state.current_len,
-                eos_ramp_start = config.eos_ramp_start,
-                eos_ramp_len = config.eos_ramp_len,
-                graceful_eos_after = config.graceful_eos_after,
-                forced_eos_after = config.forced_eos_after,
-                "EOS boost ramp entered",
-            );
-        }
 
         // Segment-close override: force the close token when the segment budget
         // is exhausted.  Authoritative for the step — the EOS failsafes must not
         // clobber the close token or a closer-script token (they fire on a later
         // step, once the segment is closed).
         if let Some(t) = segment_close_override(config, state) {
-            return t;
+            return (t, Resolution::SegmentClose);
         }
 
         // A tool call opened inside the reasoning block closes the block first.
         if let Some(t) = close_before_call(config, state, sampled) {
-            return t;
+            return (t, Resolution::CloseBeforeCall);
         }
 
         if state.degenerate_run >= DEGENERATE_TOKEN_RUN {
@@ -1097,8 +1369,51 @@ impl BatchedSampler {
             // logit row. Left alone this runs to the length cap and lands
             // hundreds of `!` in the conversation AND in the substrate, where
             // the turn's signatures then pollute retrieval. Stop at the first
-            // sign of it and say so loudly — this is a fault, not an answer.
-            tracing::error!(
+            // sign of it — this is a fault, not an answer.
+            return (eos_token_id, Resolution::Degenerate);
+        }
+
+        // A call being written is bounded by its grammar, not by the answer's
+        // length budget — see `SequenceSamplingState::writing_call`.
+        if state.writing_call {
+            return (sampled, Resolution::WritingCall);
+        }
+
+        if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
+            // Hard stop: unconditionally force EOS regardless of sentence position.
+            return (eos_token_id, Resolution::ForcedEos);
+        }
+
+        if config.graceful_eos_after > 0 && state.current_len >= config.graceful_eos_after {
+            if config.sentence_end_token_ids.is_empty() && config.line_end_token_ids.is_empty() {
+                // No sentence-end tokens resolved (e.g. model loaded without
+                // tokenizer resolution): hard stop at the graceful threshold.
+                return (eos_token_id, Resolution::NoBoundaryTokens);
+            }
+            // Graceful stop: emit EOS only when the last token ended a sentence
+            // (`.`, `!`, `?`) or a line.  This lets the current
+            // sentence complete before termination, preventing mid-sentence
+            // truncation.  `forced_eos_after` is the hard backstop if no boundary
+            // is ever seen.
+            if state.at_sentence_end(config) {
+                return (eos_token_id, Resolution::GracefulEos);
+            }
+        }
+
+        (sampled, Resolution::Sampled)
+    }
+
+    /// The log line for a committed row's resolution. `row` names its logits
+    /// row; `state` is the sequence before the token is recorded.
+    fn log_resolution(
+        &self,
+        row: usize,
+        why: Resolution,
+        state: &SequenceSamplingState,
+        config: &SamplingConfig,
+    ) {
+        match why {
+            Resolution::Degenerate => tracing::error!(
                 target: "candle_conversation::eos",
                 row,
                 current_len = state.current_len,
@@ -1107,180 +1422,131 @@ impl BatchedSampler {
                  forcing EOS. The forward pass produced unusable logits \
                  (all-equal or non-finite); the turn is truncated here.",
                 state.degenerate_run,
-            );
-            return eos_token_id;
-        }
-
-        // A call being written is bounded by its grammar, not by the answer's
-        // length budget — see `SequenceSamplingState::writing_call`.
-        if state.writing_call {
-            return sampled;
-        }
-
-        if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
-            // Hard stop: unconditionally force EOS regardless of sentence position.
-            tracing::debug!(
+            ),
+            Resolution::ForcedEos => tracing::debug!(
                 target: "candle_conversation::eos",
                 row,
                 current_len = state.current_len,
                 forced_eos_after = config.forced_eos_after,
                 "hard EOS forced (length cap)",
-            );
-            return eos_token_id;
+            ),
+            Resolution::NoBoundaryTokens => tracing::debug!(
+                target: "candle_conversation::eos",
+                row,
+                current_len = state.current_len,
+                graceful_eos_after = config.graceful_eos_after,
+                "hard EOS forced (no sentence-end tokens)",
+            ),
+            Resolution::GracefulEos => tracing::debug!(
+                target: "candle_conversation::eos",
+                row,
+                current_len = state.current_len,
+                graceful_eos_after = config.graceful_eos_after,
+                "soft EOS forced (sentence boundary)",
+            ),
+            Resolution::Sampled
+            | Resolution::SegmentClose
+            | Resolution::CloseBeforeCall
+            | Resolution::WritingCall => {}
         }
-
-        if config.graceful_eos_after > 0 && state.current_len >= config.graceful_eos_after {
-            if config.sentence_end_token_ids.is_empty() && config.line_end_token_ids.is_empty() {
-                // No sentence-end tokens resolved (e.g. model loaded without
-                // tokenizer resolution): fall back to hard stop at the graceful
-                // threshold.
-                tracing::debug!(
-                    target: "candle_conversation::eos",
-                    row,
-                    current_len = state.current_len,
-                    graceful_eos_after = config.graceful_eos_after,
-                    "hard EOS forced (no sentence-end tokens)",
-                );
-                return eos_token_id;
-            }
-            // Graceful stop: emit EOS only when the last token ended a sentence
-            // (`.`, `!`, `?`) or a line.  This lets the current
-            // sentence complete before termination, preventing mid-sentence
-            // truncation.  `forced_eos_after` is the hard backstop if no boundary
-            // is ever seen.
-            if state.at_sentence_end(config) {
-                tracing::debug!(
-                    target: "candle_conversation::eos",
-                    row,
-                    current_len = state.current_len,
-                    graceful_eos_after = config.graceful_eos_after,
-                    "soft EOS forced (sentence boundary)",
-                );
-                return eos_token_id;
-            }
-        }
-
-        sampled
     }
 
-    /// CPU fallback implementation using candle's built-in sampling.  Receives
-    /// only unconstrained (full-vocab) rows; stencil rows are resolved by
-    /// `sample_batch` before this is called.
-    fn sample_batch_cpu(
+    /// The host sampler's pick for one unconstrained (full-vocab) row, against
+    /// `state` as it stands — candle's built-in sampling, for a sampler that
+    /// is not on a CUDA device. Committing it is [`Self::commit_row`]'s.
+    fn sample_row_cpu(
         &self,
         logits: &Tensor,
-        rows: &[usize],
-        states: &mut [&mut SequenceSamplingState],
-        configs: &[&SamplingConfig],
-        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
-    ) -> candle::Result<Vec<u32>> {
-        let batch_size = states.len();
-        let mut results = Vec::with_capacity(batch_size);
+        row: &RowSpec<'_>,
+        state: &SequenceSamplingState,
+        config: &SamplingConfig,
+        typical: Option<TypicalAcceptance>,
+    ) -> candle::Result<u32> {
+        // This sequence's row of the block.
+        let seq_logits = logits.i(row.logits_row)?;
 
-        for (i, (state, &config)) in states.iter_mut().zip(configs.iter()).enumerate() {
-            // This sequence's row of the block.
-            let seq_logits = logits.i(rows[i])?;
+        // Apply this row's banned tokens (a small deny-list, e.g. a few EOS
+        // ids) by setting just those values to `-inf`.  Cheap on CPU — only the
+        // banned values change (apply_banned copies the row to host F32 to do
+        // it); a no-op when the list is empty.
+        let seq_logits = apply_banned(&seq_logits, config)?;
 
-            // Apply this row's banned tokens (a small deny-list, e.g. a few EOS
-            // ids) by setting just those values to `-inf`.  Cheap on CPU — only the
-            // banned values change (apply_banned copies the row to host F32 to do
-            // it); a no-op when the list is empty.
-            let seq_logits = apply_banned(&seq_logits, config)?;
+        // Structural: ban the think-close token while outside a think block —
+        // there is nothing for it to close there, and a stray one derails the
+        // turn (see `think_close_ban_active`).
+        let seq_logits = if think_close_ban_active(config, state) {
+            let dtype = seq_logits.dtype();
+            let dims = seq_logits.dims().to_vec();
+            let mut v: Vec<f32> = seq_logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            ban(&mut v, config.segment_close_token_id as u32);
+            Tensor::from_vec(v, dims, seq_logits.device())?.to_dtype(dtype)?
+        } else {
+            seq_logits
+        };
 
-            // Structural: ban the think-close token while outside a think block —
-            // there is nothing for it to close there, and a stray one derails the
-            // turn (see `think_close_ban_active`).
-            let seq_logits = if think_close_ban_active(config, state) {
-                let dtype = seq_logits.dtype();
-                let dims = seq_logits.dims().to_vec();
-                let mut v: Vec<f32> = seq_logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                ban(&mut v, config.segment_close_token_id as u32);
-                Tensor::from_vec(v, dims, seq_logits.device())?.to_dtype(dtype)?
-            } else {
-                seq_logits
-            };
+        // Token suppression: while inside a segment, subtract the per-turn
+        // penalty from each suppress-token logit. Mirrors the kernel's
+        // in-segment gate, so tokens outside the segment are never touched.
+        let seq_logits = if state.in_segment
+            && config.segment_suppress_penalty != 0.0
+            && !config.segment_suppress_tokens.is_empty()
+        {
+            apply_suppression(&seq_logits, config)?
+        } else {
+            seq_logits
+        };
+        // The checkpoint's padded tail is not a token.
+        let seq_logits = seq_logits.narrow(0, 0, self.live_vocab)?;
 
-            // Token suppression: while inside a segment, subtract the per-turn
-            // penalty from each suppress-token logit. Mirrors the kernel's
-            // in-segment gate, so tokens outside the segment are never touched.
-            let seq_logits = if state.in_segment
-                && config.segment_suppress_penalty != 0.0
-                && !config.segment_suppress_tokens.is_empty()
-            {
-                apply_suppression(&seq_logits, config)?
-            } else {
-                seq_logits
-            };
-            // The checkpoint's padded tail is not a token.
-            let seq_logits = seq_logits.narrow(0, 0, self.live_vocab)?;
-
-            // In-segment steering: while this sequence is inside a segment,
-            // sample a touch hotter (temperature + segment_temp_boost).
-            // Mirrors the kernel's per-seq gate so tokens outside the segment
-            // stay at the base temperature.  DRY is GPU-only — the CPU
-            // LogitsProcessor has no DRY path, so there is nothing to gate here for it.
-            let temperature = if state.in_segment {
-                config.temperature + config.segment_temp_boost
-            } else {
-                config.temperature
-            };
-            let sampling = if state.in_segment && config.segment_temp_boost != 0.0 {
-                let mut boosted = config.clone();
-                boosted.temperature += config.segment_temp_boost;
-                config_to_sampling(&boosted)
-            } else {
-                config_to_sampling(config)
-            };
-            let seed = config.seed.wrapping_add(state.rng_offset);
-            let mut processor = LogitsProcessor::from_sampling(seed, sampling);
-            let mut sampled = processor.sample(&seq_logits)?;
-            // A verify row's draft, accepted on the typical-acceptance rule over
-            // the same top-k/nucleus distribution the kernel measures it on.
-            if let Some((drafts, typical)) = verify {
-                if let Some(draft) = drafts[i].filter(|_| temperature > 0.0) {
-                    let row: Vec<f32> = seq_logits.to_dtype(DType::F32)?.to_vec1()?;
-                    if typical_accepts_row(
-                        &row,
-                        temperature,
-                        config.top_k,
-                        config.top_p,
-                        draft,
-                        typical,
-                    ) {
-                        sampled = draft;
-                    }
+        // In-segment steering: while this sequence is inside a segment,
+        // sample a touch hotter (temperature + segment_temp_boost).
+        // Mirrors the kernel's per-seq gate so tokens outside the segment
+        // stay at the base temperature.  DRY is GPU-only — the CPU
+        // LogitsProcessor has no DRY path, so there is nothing to gate here for it.
+        let temperature = if state.in_segment {
+            config.temperature + config.segment_temp_boost
+        } else {
+            config.temperature
+        };
+        let sampling = if state.in_segment && config.segment_temp_boost != 0.0 {
+            let mut boosted = config.clone();
+            boosted.temperature += config.segment_temp_boost;
+            config_to_sampling(&boosted)
+        } else {
+            config_to_sampling(config)
+        };
+        let seed = config.seed.wrapping_add(state.rng_offset);
+        let mut processor = LogitsProcessor::from_sampling(seed, sampling);
+        let mut sampled = processor.sample(&seq_logits)?;
+        // A verify row's draft, accepted on the typical-acceptance rule over
+        // the same top-k/nucleus distribution the kernel measures it on.
+        if let (Some(draft), Some(typical)) = (row.draft, typical) {
+            if temperature > 0.0 {
+                let values: Vec<f32> = seq_logits.to_dtype(DType::F32)?.to_vec1()?;
+                if typical_accepts_row(
+                    &values,
+                    temperature,
+                    config.top_k,
+                    config.top_p,
+                    draft,
+                    typical,
+                ) {
+                    sampled = draft;
                 }
             }
-
-            // Segment close, degenerate-decode abort and the EOS failsafes all
-            // resolve in `resolve_final_token`, shared with the CUDA path.
-            let token = self.resolve_final_token(i, sampled, state, config);
-
-            // Record the token and advance RNG
-            state.record_token(token, self.max_recent_len);
-            state.update_segment_state(
-                token,
-                config.segment_open_token_id,
-                config.segment_close_token_id,
-            );
-            state.advance_rng();
-
-            results.push(token);
         }
-
-        Ok(results)
+        Ok(sampled)
     }
 
-    /// CUDA kernel implementation.
-    fn sample_batch_cuda(
+    /// Run the kernel over every row `rows` gathered — one launch and one
+    /// readback for the dispatch — answering with each row's pick and the RNG
+    /// offset it leaves. `logits` is the `[rows, vocab]` block the rows name.
+    fn launch_rows(
         &self,
         logits: &Tensor,
-        logits_rows: &[usize],
-        states: &mut [&mut SequenceSamplingState],
-        configs: &[&SamplingConfig],
-        verify: Option<(&[Option<u32>], TypicalAcceptance)>,
-    ) -> candle::Result<Vec<u32>> {
-        let batch_size = states.len();
+        rows: &KernelRows<'_>,
+    ) -> candle::Result<(Vec<u32>, Vec<u64>)> {
+        let batch_size = rows.len();
 
         // Determine dtype from logits
         let dtype = logits.dtype();
@@ -1296,19 +1562,7 @@ impl BatchedSampler {
             }
         };
 
-        // Flatten logits to [batch_size, vocab_size]
-        let logits_flat = match logits.dims().len() {
-            1 => logits.unsqueeze(0)?,
-            2 => logits.clone(),
-            3 => {
-                // [batch, seq_len, vocab] -> take last position
-                let seq_len = logits.dim(1)?;
-                logits.i((.., seq_len - 1, ..))?
-            }
-            n => return Err(candle::Error::Msg(format!("unexpected logits rank: {}", n))),
-        };
-
-        let logits_vocab_size = logits_flat.dim(1)? as i32;
+        let logits_vocab_size = logits.dim(1)? as i32;
 
         // Validate that our penalty buffer vocab_size matches the logits.
         // A mismatch means token_counts is undersized and the kernel would
@@ -1323,12 +1577,12 @@ impl BatchedSampler {
         let vocab_size = logits_vocab_size;
 
         // This path only ever receives unconstrained (full-vocab) rows —
-        // stencil-constrained rows are resolved by `sample_batch` before the
-        // kernel and never reach here. `config` (the first row's) supplies the
-        // scalar FFI arguments below, but those are only the null-fallback
-        // defaults: the kernel reads its real per-row dials from the `seq_dials`
-        // array built further down, so no row inherits row 0's dials.
-        let config = configs[0];
+        // stencil-constrained rows are resolved beside it and never reach
+        // here. `config` (the first row's) supplies the scalar FFI arguments
+        // below, but those are only the null-fallback defaults: the kernel reads
+        // its real per-row dials from the `seq_dials` array, so no row inherits
+        // row 0's dials.
+        let config = rows.configs[0];
 
         // Get DRY params
         let (dry_multiplier, dry_base, dry_allowed_length, dry_range) =
@@ -1338,38 +1592,12 @@ impl BatchedSampler {
                 (0.0, 1.75, 2, 0)
             };
 
-        // Build penalty buffers from states
-        let build_span = profile::span("sample:build");
-        // The kernel prices each row on its own dials, so the cross-turn table
-        // is needed when ANY row carries the penalty, not only row 0.
-        let cross_turn = configs.iter().any(|c| c.cross_turn_penalty != 0.0);
-        let (token_counts, cross_turn_counts, recent_tokens, recent_lens, current_lens) = self
-            .build_penalty_buffers_from_states(
-                states,
-                config.presence_penalty,
-                config.repeat_last_n,
-                dry_range,
-                cross_turn,
-            )?;
-
         // Get EOS token
         let eos_token_id = self.eos_tokens.iter().copied().next().unwrap_or(0);
 
-        // Build banned tokens buffer — each row's OWN deny-list, plus the
-        // structural think-close ban for rows outside a block
-        // (`think_close_ban_active` — a `</think>` outside a think block is
-        // never valid output). Unlike the scalar dials above, a ban is
-        // row-specific: the answer that closes a stuck tool loop bans
-        // `<tool_call>` for itself alone. See `banned_rows`.
-        let rows: Vec<(&[i32], Option<i32>)> = states
-            .iter()
-            .zip(configs.iter())
-            .map(|(s, c)| {
-                let close = think_close_ban_active(c, s).then_some(c.segment_close_token_id);
-                (c.banned_tokens.as_slice(), close)
-            })
-            .collect();
-        let (banned_tokens, num_banned, banned_per_seq) = banned_buffer(&rows);
+        // Each row's OWN deny-list, plus the structural think-close ban for rows
+        // outside a block (see `KernelRows::push`).
+        let (banned_tokens, num_banned, banned_per_seq) = banned_buffer(&rows.banned);
         let banned_tokens = &banned_tokens;
 
         // No stencil here — constrained rows were resolved before the kernel.
@@ -1378,9 +1606,7 @@ impl BatchedSampler {
 
         // Allocate output buffer
         let mut output_tokens = vec![0u32; batch_size];
-
-        // Build RNG offsets from states
-        let mut rng_offsets: Vec<u64> = states.iter().map(|s| s.rng_offset).collect();
+        let mut rng_offsets = rows.rng_offsets.clone();
 
         // Compute EOS ramp params
         let (eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier) = if config.dynamic_eos_boost {
@@ -1393,29 +1619,14 @@ impl BatchedSampler {
             (0, 0, 0.0)
         };
 
-        // Compute segment-close params
-        // Only active when segment_close_boost > 0, segment_close_token_id >= 0, and at least one sequence is inside a segment
-        let segment_lens: Vec<i32> = states
-            .iter()
-            .map(|s| if s.in_segment { s.segment_len } else { 0 })
-            .collect();
-        // DRY span lengths (the kernel's `dry_lens`): the current structural
-        // span's generated-token count, or 0 while suppressed inside a tool call.
-        // This gates and scopes DRY independently of the think segment.
-        let dry_lens: Vec<i32> = states
-            .iter()
-            .map(|s| if s.dry_suppressed { 0 } else { s.dry_span_len })
-            .collect();
         // Token suppression (the in-segment ceiling lever).
         // The token list is shared across the batch (config[0]); the penalty is
         // per-sequence (large = HARD ban, moderate = SOFT, 0.0 = off). Activate
         // only when the list is non-empty AND at least one sequence has a nonzero
         // penalty — otherwise pass null/0 so the kernel skips it entirely.
-        let suppress_penalties: Vec<f32> =
-            configs.iter().map(|c| c.segment_suppress_penalty).collect();
         let suppress_tokens: Vec<i32> = config.segment_suppress_tokens.clone();
         let suppress_active =
-            !suppress_tokens.is_empty() && suppress_penalties.iter().any(|&p| p != 0.0);
+            !suppress_tokens.is_empty() && rows.suppress_penalties.iter().any(|&p| p != 0.0);
 
         let segment_close_active =
             config.segment_close_boost != 0.0 && config.segment_close_token_id >= 0;
@@ -1437,26 +1648,6 @@ impl BatchedSampler {
             (0.0, -1, 0, 0, 0.0)
         };
 
-        // **Per-sequence dials — every row samples on its own config.** Built
-        // from each row's config (not `configs[0]`), so the kernel's scalar
-        // arguments below are only the null-fallback defaults; the kernel reads
-        // its dials from this array instead. This is what stops one row's EOS
-        // ramp (or temperature, or penalties) bleeding into another in a wave
-        // that mixes configs.
-        // A verify row also carries the draft it tests (see `SeqDials`).
-        let seq_dials: Vec<SeqDials> = configs
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let dials = SeqDials::from_config(c, logits_rows[i]);
-                match verify {
-                    Some((drafts, typical)) => dials.with_draft(drafts[i], typical),
-                    None => dials,
-                }
-            })
-            .collect();
-        build_span.end();
-
         let stamp_span = profile::span("sample:stamp");
         let mut tables = self
             .penalty_tables
@@ -1464,12 +1655,9 @@ impl BatchedSampler {
             .map_err(|_| candle::Error::Msg("sampler count tables poisoned".into()))?;
         let token_table = tables
             .tokens
-            .stamp(&self.device, batch_size, &token_counts)?;
-        let cross_table = if cross_turn {
-            match tables
-                .cross
-                .stamp(&self.device, batch_size, &cross_turn_counts)
-            {
+            .stamp(&self.device, batch_size, &rows.counts)?;
+        let cross_table = if rows.cross_turn {
+            match tables.cross.stamp(&self.device, batch_size, &rows.cross) {
                 Ok(stamped) => Some(stamped),
                 Err(e) => {
                     // The token table is already stamped; leave it zero.
@@ -1485,7 +1673,7 @@ impl BatchedSampler {
         // Invoke the CUDA kernel
         let launch_span = profile::span("sample:launch_readback");
         let launched = self.invoke_cuda_kernel(
-            &logits_flat,
+            logits,
             batch_size as i32,
             vocab_size,
             dtype_enum,
@@ -1506,30 +1694,30 @@ impl BatchedSampler {
             eos_boost_max_multiplier,
             config.cross_turn_penalty,
             cross_table.as_ref().map(|t| t.table()),
-            &current_lens,
+            &rows.current_lens,
             segment_close_boost,
             segment_close_token_id,
             segment_close_ramp_start,
             segment_close_ramp_len,
             segment_close_max_multiplier,
-            &segment_lens,
-            &dry_lens,
+            &rows.segment_lens,
+            &rows.dry_lens,
             config.segment_temp_boost,
             &suppress_tokens,
-            &suppress_penalties,
+            &rows.suppress_penalties,
             suppress_active,
             token_table.table(),
             banned_tokens,
             num_banned,
             banned_per_seq,
-            &recent_tokens,
-            &recent_lens,
+            &rows.recent_tokens,
+            &rows.recent_lens,
             stencil,
             stencil_size,
             &mut output_tokens,
             config.seed,
             &mut rng_offsets,
-            &seq_dials,
+            &rows.seq_dials,
         );
         launch_span.end();
         // Both cleared whether or not the launch succeeded, and the second
@@ -1546,150 +1734,7 @@ impl BatchedSampler {
         launched?;
         tokens_cleared?;
         cross_cleared?;
-
-        // Update states with sampled tokens and new RNG offsets.
-        // Apply post-sampler EOS failsafe overrides: if the sequence has exceeded
-        // the configured length limits, replace the sampled token with EOS.
-        //
-        // **Each row resolves against ITS OWN config, not the shared `config`.**
-        // The `configs[0]` collapse above is the *kernel's* constraint — one set
-        // of scalar params per launch — and it does not extend to this host-side
-        // loop, which visits every row individually. Reading `config` here made a
-        // wave's row 0 govern every other row's segment-close budget, EOS
-        // failsafes, and think-token ids, so a sequence's own limits applied only
-        // when it happened to sort first.
-        //
-        // That is not hypothetical: it is why a `ThinkMode::Off` ingest summary
-        // (`force_segment_close_after == 1`, a forced empty `<think></think>`)
-        // closed its block only when it led the wave. Measured over one repo_map
-        // pass — 22 summaries opened a block, 7 closed, and all 7 closed at
-        // exactly token 2, the forced close firing. The other 15 shared a wave
-        // with a dialogue-budget row (a `force_segment_close_after` in the thousands),
-        // inherited its budget, and burned the whole 200-token summary allowance
-        // on reasoning that was then stored as the summary. The CPU path
-        // (`sample_batch_cpu`) always zipped configs per row, so CPU tests could
-        // not see it.
-        for (i, state) in states.iter_mut().enumerate() {
-            let row_config = configs[i];
-            // Segment close, degenerate-decode abort and the EOS failsafes all
-            // resolve in `resolve_final_token`, shared with the CPU path.
-            let token = self.resolve_final_token(i, output_tokens[i], state, row_config);
-
-            output_tokens[i] = token;
-
-            state.record_token(token, self.max_recent_len);
-            state.rng_offset = rng_offsets[i];
-            // Detect segment open/close transitions for the segment-close boost.
-            state.update_segment_state(
-                token,
-                row_config.segment_open_token_id,
-                row_config.segment_close_token_id,
-            );
-        }
-
-        Ok(output_tokens)
-    }
-
-    /// Build penalty buffers from states.
-    fn build_penalty_buffers_from_states(
-        &self,
-        states: &[&mut SequenceSamplingState],
-        presence_penalty: f32,
-        repeat_last_n: i32,
-        dry_range: i32,
-        cross_turn: bool,
-    ) -> candle::Result<(SparseCounts, SparseCounts, Vec<i32>, Vec<i32>, Vec<i32>)> {
-        let batch_size = states.len();
-
-        // Inside a TOOL CALL, all repetition penalties are suppressed, not just
-        // DRY.  Tool-call arguments legitimately reproduce content verbatim from
-        // the prompt or an earlier span — the query's numbers, file paths,
-        // identifiers — so frequency/presence/repeat penalties (which see the
-        // `<think>`/prior-span tokens via `token_counts` and `recent_tokens`)
-        // would demote exactly those tokens, corrupting the value.  This mirrors
-        // the DRY gate but is scoped to tool calls only (`in_tool_call`), so the
-        // think block keeps full repetition control.  Presenting empty penalty
-        // state for these rows is the per-row equivalent of turning them off:
-        // the row stamps nothing, so its table row reads zero.
-        let token_counts = SparseCounts::gather(
-            self.vocab_size,
-            states
-                .iter()
-                .map(|s| (!s.in_tool_call).then_some((&s.counted[..], &s.token_counts[..]))),
-        );
-        // The cross-turn table is read only when the penalty is on, so it is
-        // only gathered then.
-        let cross_turn_counts = if cross_turn {
-            SparseCounts::gather(
-                self.vocab_size,
-                states.iter().map(|s| {
-                    (!s.in_tool_call).then_some((&s.cross_counted[..], &s.cross_turn_counts[..]))
-                }),
-            )
-        } else {
-            SparseCounts::default()
-        };
-
-        // Log penalty state if a log path is configured
-        if let Some(ref log_path) = self.penalty_log_path {
-            if let Err(e) = self.write_penalty_log(log_path, states, presence_penalty) {
-                tracing::warn!("Failed to write penalty log: {}", e);
-            }
-        }
-
-        // Flatten recent tokens: [batch_size * max_recent_len].
-        //
-        // The window must be large enough for BOTH penalties that use this buffer:
-        //   • Repeat penalty needs `repeat_last_n` tokens.
-        //   • DRY penalty needs `dry_range` tokens (kernel line:
-        //       search_start = recent_len - dry_range when dry_range < recent_len).
-        // Using only `repeat_last_n` here would silently cap DRY to that smaller
-        // window even when dry_range >> repeat_last_n, causing cross-turn phrases
-        // to slide out of view before the model reaches the position where it
-        // repeats them.  Take the max of both requirements so each penalty sees
-        // the context depth it was configured for.
-        let mut recent_tokens = Vec::with_capacity(batch_size * self.max_recent_len);
-        let mut recent_lens = Vec::with_capacity(batch_size);
-
-        for state in states.iter() {
-            let total = state.recent_tokens.len();
-            let repeat_win = if repeat_last_n > 0 {
-                repeat_last_n as usize
-            } else {
-                self.max_recent_len
-            };
-            let dry_win = if dry_range > 0 {
-                (dry_range as usize).min(self.max_recent_len)
-            } else {
-                0
-            };
-            let window = repeat_win.max(dry_win).min(total);
-            // Copy the newest `window` tokens (tail of the oldest-first buffer)
-            let start = total - window;
-            // Inside a tool call, present a zero-length repeat window so the repeat
-            // penalty sees no history (DRY is already gated via `dry_lens`).  Tool
-            // arguments must be free to reproduce the query's numbers/paths/names
-            // verbatim. The buffer is still padded to keep the batch stride fixed.
-            recent_lens.push(if state.in_tool_call { 0 } else { window as i32 });
-            recent_tokens.extend_from_slice(&state.recent_tokens[start..]);
-            recent_tokens.extend(std::iter::repeat_n(0, self.max_recent_len - window));
-        }
-
-        // Current generated lengths (for dynamic EOS ramp). A sequence writing
-        // a tool call reports 0, which holds its ramp at zero boost — see
-        // `SequenceSamplingState::writing_call`.
-        let current_lens: Vec<i32> = states
-            .iter()
-            .map(|s| if s.writing_call { 0 } else { s.current_len })
-            .collect();
-
-        Ok((
-            token_counts,
-            cross_turn_counts,
-            recent_tokens,
-            recent_lens,
-            current_lens,
-        ))
+        Ok((output_tokens, rng_offsets))
     }
 
     fn write_penalty_log(
@@ -2082,6 +2127,179 @@ fn think_close_ban_active(config: &SamplingConfig, state: &SequenceSamplingState
     config.segment_close_token_id >= 0 && !state.in_segment
 }
 
+/// The full-vocabulary rows of one dispatch, each read off its sequence's
+/// state as it stood when the row was scored ([`BatchedSampler::score_rows`]),
+/// in the arrays the kernel takes.
+struct KernelRows<'a> {
+    vocab: usize,
+    max_recent_len: usize,
+    /// Whether the cross-turn table is gathered: some row carries the penalty.
+    cross_turn: bool,
+    /// Each row's index in the dispatch's output and the state it was read
+    /// from.
+    scored: Vec<(usize, RowKey)>,
+    configs: Vec<&'a SamplingConfig>,
+    counts: SparseCounts,
+    cross: SparseCounts,
+    recent_tokens: Vec<i32>,
+    recent_lens: Vec<i32>,
+    current_lens: Vec<i32>,
+    segment_lens: Vec<i32>,
+    dry_lens: Vec<i32>,
+    banned: Vec<(&'a [i32], Option<i32>)>,
+    rng_offsets: Vec<u64>,
+    suppress_penalties: Vec<f32>,
+    seq_dials: Vec<SeqDials>,
+}
+
+impl<'a> KernelRows<'a> {
+    fn new(vocab: usize, max_recent_len: usize, cross_turn: bool) -> Self {
+        Self {
+            vocab,
+            max_recent_len,
+            cross_turn,
+            scored: Vec::new(),
+            configs: Vec::new(),
+            counts: SparseCounts::default(),
+            cross: SparseCounts::default(),
+            recent_tokens: Vec::new(),
+            recent_lens: Vec::new(),
+            current_lens: Vec::new(),
+            segment_lens: Vec::new(),
+            dry_lens: Vec::new(),
+            banned: Vec::new(),
+            rng_offsets: Vec::new(),
+            suppress_penalties: Vec::new(),
+            seq_dials: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.scored.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.scored.is_empty()
+    }
+
+    /// Read `row`'s inputs off `state` as it stands. `out` is the row's index
+    /// in the dispatch's output and `key` the state's.
+    fn push(
+        &mut self,
+        out: usize,
+        state: &SequenceSamplingState,
+        config: &'a SamplingConfig,
+        row: &RowSpec<'_>,
+        typical: Option<TypicalAcceptance>,
+        key: RowKey,
+    ) {
+        let r = self.len();
+        // Inside a TOOL CALL, all repetition penalties are suppressed, not just
+        // DRY.  Tool-call arguments legitimately reproduce content verbatim from
+        // the prompt or an earlier span — the query's numbers, file paths,
+        // identifiers — so frequency/presence/repeat penalties (which see the
+        // `<think>`/prior-span tokens via `token_counts` and `recent_tokens`)
+        // would demote exactly those tokens, corrupting the value.  This mirrors
+        // the DRY gate but is scoped to tool calls only (`in_tool_call`), so the
+        // think block keeps full repetition control.  Presenting empty penalty
+        // state for these rows is the per-row equivalent of turning them off:
+        // the row stamps nothing, so its table row reads zero.
+        if !state.in_tool_call {
+            self.counts
+                .push_row(self.vocab, r, &state.counted, &state.token_counts);
+            if self.cross_turn {
+                self.cross.push_row(
+                    self.vocab,
+                    r,
+                    &state.cross_counted,
+                    &state.cross_turn_counts,
+                );
+            }
+        }
+
+        // The recent-token window, `max_recent_len` wide per row.
+        //
+        // The window must be large enough for BOTH penalties that use this buffer:
+        //   • Repeat penalty needs `repeat_last_n` tokens.
+        //   • DRY penalty needs `dry_range` tokens (kernel line:
+        //       search_start = recent_len - dry_range when dry_range < recent_len).
+        // Using only `repeat_last_n` here would silently cap DRY to that smaller
+        // window even when dry_range >> repeat_last_n, causing cross-turn phrases
+        // to slide out of view before the model reaches the position where it
+        // repeats them.  Take the max of both requirements so each penalty sees
+        // the context depth it was configured for. Both are the dispatch's first
+        // row's, as the kernel's scalar defaults are.
+        let first = self.configs.first().copied().unwrap_or(config);
+        let dry_range = first.dry.as_ref().map_or(0, |d| d.range);
+        let repeat_win = if first.repeat_last_n > 0 {
+            first.repeat_last_n as usize
+        } else {
+            self.max_recent_len
+        };
+        let dry_win = if dry_range > 0 {
+            (dry_range as usize).min(self.max_recent_len)
+        } else {
+            0
+        };
+        let total = state.recent_tokens.len();
+        let window = repeat_win.max(dry_win).min(total);
+        // Inside a tool call, present a zero-length repeat window so the repeat
+        // penalty sees no history (DRY is already gated via `dry_lens`).  Tool
+        // arguments must be free to reproduce the query's numbers/paths/names
+        // verbatim. The buffer is still padded to keep the batch stride fixed.
+        self.recent_lens
+            .push(if state.in_tool_call { 0 } else { window as i32 });
+        self.recent_tokens
+            .extend_from_slice(&state.recent_tokens[total - window..]);
+        self.recent_tokens
+            .extend(std::iter::repeat_n(0, self.max_recent_len - window));
+
+        // Current generated length (for dynamic EOS ramp). A sequence writing a
+        // tool call reports 0, which holds its ramp at zero boost — see
+        // `SequenceSamplingState::writing_call`.
+        self.current_lens.push(if state.writing_call {
+            0
+        } else {
+            state.current_len
+        });
+        self.segment_lens.push(if state.in_segment {
+            state.segment_len
+        } else {
+            0
+        });
+        // DRY span length (the kernel's `dry_lens`): the current structural
+        // span's generated-token count, or 0 while suppressed inside a tool
+        // call. This gates and scopes DRY independently of the think segment.
+        self.dry_lens.push(if state.dry_suppressed {
+            0
+        } else {
+            state.dry_span_len
+        });
+        // The row's OWN deny-list, plus the structural think-close ban for a row
+        // outside a block (`think_close_ban_active` — a `</think>` outside a
+        // think block is never valid output). A ban is row-specific: the answer
+        // that closes a stuck tool loop bans `<tool_call>` for itself alone. See
+        // `banned_rows`.
+        let close = think_close_ban_active(config, state).then_some(config.segment_close_token_id);
+        self.banned.push((config.banned_tokens.as_slice(), close));
+        self.rng_offsets.push(state.rng_offset);
+        self.suppress_penalties
+            .push(config.segment_suppress_penalty);
+        // **Per-sequence dials — every row samples on its own config.** The
+        // kernel's scalar arguments are only the null-fallback defaults; it reads
+        // its dials from this array, which is what stops one row's EOS ramp (or
+        // temperature, or penalties) bleeding into another in a wave that mixes
+        // configs. A verify row also carries the draft it tests.
+        let dials = SeqDials::from_config(config, row.logits_row);
+        self.seq_dials.push(match typical {
+            Some(typical) => dials.with_draft(row.draft, typical),
+            None => dials,
+        });
+        self.configs.push(config);
+        self.scored.push((out, key));
+    }
+}
+
 /// Subtract the suppression penalty from each `segment_suppress_tokens` logit.
 /// The CPU mirror of the kernel's in-segment ceiling lever; the caller has
 /// already confirmed the sequence is inside a segment and the penalty is
@@ -2350,14 +2568,14 @@ mod tests {
     /// The degenerate-decode abort must live on the resolver BOTH sampling
     /// paths run through, not in one path's copy of the overrides.
     ///
-    /// It was written into `sample_batch_cpu` alone, and `sample_full_vocab`
-    /// sends every unconstrained row to the CUDA kernel whenever the device is
-    /// CUDA — so on the only configuration production runs, the guard was dead:
-    /// a forward emitting token 0 forever ran to the length cap instead of
+    /// It was once written into the CPU sampler alone, while every
+    /// unconstrained row went to the CUDA kernel whenever the device was CUDA —
+    /// so on the only configuration production runs, the guard was dead: a
+    /// forward emitting token 0 forever ran to the length cap instead of
     /// stopping at `DEGENERATE_TOKEN_RUN`, writing hundreds of `!` into the
     /// conversation and into the substrate, where the turn's signatures then
-    /// polluted retrieval. Asserting on `resolve_final_token` is what keeps the
-    /// guard device-independent: there is no second copy to be missing from.
+    /// polluted retrieval. Asserting on `resolve` is what keeps the guard
+    /// device-independent: there is no second copy to be missing from.
     #[test]
     fn degenerate_run_forces_eos_on_the_resolver_both_paths_share() {
         let sampler = make_sampler();
@@ -2369,7 +2587,7 @@ mod tests {
             state.record_token(0, MAX_RECENT);
         }
         assert_eq!(
-            sampler.resolve_final_token(0, 7, &mut state, &config),
+            sampler.resolve(7, &mut state, &config).0,
             7,
             "below the bar the sampler's own token stands"
         );
@@ -2377,7 +2595,7 @@ mod tests {
         // The next consecutive zero crosses it, and the turn is cut short.
         state.record_token(0, MAX_RECENT);
         assert_eq!(
-            sampler.resolve_final_token(0, 7, &mut state, &config),
+            sampler.resolve(7, &mut state, &config).0,
             EOS_TOKEN,
             "a degenerate run must force EOS whichever path sampled the row"
         );
@@ -2385,7 +2603,7 @@ mod tests {
         // A real token clears the run, and decoding resumes normally — the
         // guard fires on a consecutive run, never on token 0 being frequent.
         state.record_token(42, MAX_RECENT);
-        assert_eq!(sampler.resolve_final_token(0, 7, &mut state, &config), 7);
+        assert_eq!(sampler.resolve(7, &mut state, &config).0, 7);
     }
 
     /// **A call being written is not cut by the answer's length budget.** Past
@@ -2403,31 +2621,27 @@ mod tests {
             state.record_token(42, MAX_RECENT);
         }
         assert_eq!(
-            sampler.resolve_final_token(0, 7, &mut state, &config),
+            sampler.resolve(7, &mut state, &config).0,
             EOS_TOKEN,
             "a prose turn past its budget is ended"
         );
 
         state.writing_call = true;
         assert_eq!(
-            sampler.resolve_final_token(0, 7, &mut state, &config),
+            sampler.resolve(7, &mut state, &config).0,
             7,
             "a call past the same budget keeps its token"
         );
-        let (_, _, _, _, current_lens) = sampler
-            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0, false)
-            .unwrap();
-        assert_eq!(current_lens, vec![0], "the EOS ramp sees no length");
+        let window = window_16();
+        let rows = gather(&sampler, &[&state], &window, false);
+        assert_eq!(rows.current_lens, vec![0], "the EOS ramp sees no length");
 
         // The degenerate-decode guard is a fault check, not a budget: it still
         // fires inside a call.
         for _ in 0..DEGENERATE_TOKEN_RUN {
             state.record_token(0, MAX_RECENT);
         }
-        assert_eq!(
-            sampler.resolve_final_token(0, 7, &mut state, &config),
-            EOS_TOKEN
-        );
+        assert_eq!(sampler.resolve(7, &mut state, &config).0, EOS_TOKEN);
     }
 
     fn make_sampler() -> BatchedSampler {
@@ -2606,7 +2820,7 @@ mod tests {
         let mut config = closer_config();
         config.tool_call_open_token_id = 70;
         let mut state = in_segment_state(3, 42);
-        assert_eq!(sampler.resolve_final_token(0, 70, &mut state, &config), 90);
+        assert_eq!(sampler.resolve(70, &mut state, &config).0, 90);
     }
 
     #[test]
@@ -2711,30 +2925,28 @@ mod tests {
             thinking.record_token(42, MAX_RECENT);
         }
 
-        let (token_counts, cross_turn_counts, _recent, recent_lens, _cur) = sampler
-            .build_penalty_buffers_from_states(&[&mut in_call, &mut thinking], 0.0, 16, 0, true)
-            .expect("buffers");
+        let config = window_16();
+        let rows = gather(&sampler, &[&in_call, &thinking], &config, true);
 
         // Row 0 (tool call) stamps nothing, so its table rows read zero — the
         // model is free to reproduce the query's tokens verbatim in the
         // arguments. Row 1 (think block) keeps full repetition control.
         let row1_42 = VOCAB_SIZE as u32 + 42;
         assert_eq!(
-            token_counts,
+            rows.counts,
             SparseCounts {
                 offsets: vec![row1_42],
                 values: vec![5],
             }
         );
         assert_eq!(
-            cross_turn_counts,
+            rows.cross,
             SparseCounts {
                 offsets: vec![row1_42],
                 values: vec![5],
             }
         );
-        assert_eq!(recent_lens[0], 0);
-        assert_eq!(recent_lens[1], 10);
+        assert_eq!(rows.recent_lens, vec![0, 10]);
     }
 
     /// With the cross-turn penalty off, the cross table is never read, so
@@ -2745,10 +2957,36 @@ mod tests {
         let mut state = make_state();
         state.record_token(7, MAX_RECENT);
         state.end_turn(0);
-        let (_, cross, _, _, _) = sampler
-            .build_penalty_buffers_from_states(&[&mut state], 0.0, 16, 0, false)
-            .expect("buffers");
-        assert_eq!(cross, SparseCounts::default());
+        let config = window_16();
+        let rows = gather(&sampler, &[&state], &config, false);
+        assert_eq!(rows.cross, SparseCounts::default());
+    }
+
+    /// A config whose repeat window is 16 tokens.
+    fn window_16() -> SamplingConfig {
+        let mut c = SamplingConfig::argmax();
+        c.repeat_last_n = 16;
+        c
+    }
+
+    /// The kernel inputs `states` gather into at `config`, a row each.
+    fn gather<'a>(
+        sampler: &BatchedSampler,
+        states: &[&SequenceSamplingState],
+        config: &'a SamplingConfig,
+        cross_turn: bool,
+    ) -> KernelRows<'a> {
+        let mut rows = KernelRows::new(sampler.vocab_size, sampler.max_recent_len, cross_turn);
+        for (r, state) in states.iter().enumerate() {
+            let spec = RowSpec {
+                seq: r,
+                logits_row: r,
+                draft: None,
+                ahead: &[],
+            };
+            rows.push(r, state, config, &spec, None, state.row_key());
+        }
+        rows
     }
 
     /// The sparse indexes name exactly the nonzero dense entries, through
@@ -3098,6 +3336,193 @@ mod tests {
         devices
     }
 
+    /// `n` rows that each spread their mass over tokens 40..45, ranked
+    /// differently per row, so a sampled walk wanders and the penalties move
+    /// its picks.
+    fn walk_logits(n: usize) -> Tensor {
+        let mut data = vec![-20.0f32; n * VOCAB_SIZE];
+        for r in 0..n {
+            for k in 0..5 {
+                data[r * VOCAB_SIZE + 40 + k] = 5.0 - 0.3 * ((k + r) % 5) as f32;
+            }
+        }
+        Tensor::from_vec(data, (n, VOCAB_SIZE), &Device::Cpu).expect("logits")
+    }
+
+    /// Sampled, with every history-reading penalty on.
+    fn penalised(seed: u64) -> SamplingConfig {
+        SamplingConfig {
+            temperature: 0.8,
+            top_k: 20,
+            top_p: 1.0,
+            repeat_penalty: 1.3,
+            frequency_penalty: 0.4,
+            presence_penalty: 0.5,
+            seed,
+            ..SamplingConfig::argmax()
+        }
+    }
+
+    /// A sequence some way into its turn.
+    fn walked_state() -> SequenceSamplingState {
+        let mut s = make_state();
+        for t in [40, 41, 40] {
+            s.record_token(t, MAX_RECENT);
+        }
+        s
+    }
+
+    /// Row `p` of a block whose committed token is followed by `drafts`.
+    fn block_specs(drafts: &[u32], rows: usize) -> Vec<RowSpec<'_>> {
+        (0..rows)
+            .map(|p| RowSpec {
+                seq: 0,
+                logits_row: p,
+                draft: drafts.get(p).copied(),
+                ahead: &drafts[..p],
+            })
+            .collect()
+    }
+
+    /// **One dispatch over a whole block commits exactly what scoring it a
+    /// position at a time does.** The reference walks five rows one dispatch
+    /// each, every row committed before the next is scored; its picks become
+    /// the block's drafts. Scored together, against the history each position
+    /// would be reached with, the same rows commit the same tokens and leave
+    /// the same state — counts, window, RNG — with every penalty that reads
+    /// history on and sampling at temperature 0.8. Scoring alone leaves the
+    /// state untouched.
+    #[test]
+    fn a_block_scored_in_one_dispatch_commits_what_a_walk_does() {
+        const ROWS: usize = 5;
+        for device in devices() {
+            let sampler = make_sampler_on(&device, VOCAB_SIZE);
+            let block = walk_logits(ROWS).to_device(&device).expect("logits");
+            for seed in 0..12 {
+                let config = penalised(seed);
+                let mut walked = walked_state();
+                let mut picks = Vec::new();
+                for p in 0..ROWS {
+                    let row = block.narrow(0, p, 1).expect("row");
+                    picks.push(
+                        sampler
+                            .sample_batch(&row, &mut [&mut walked], &[&config])
+                            .expect("sample")[0],
+                    );
+                }
+
+                let mut batched = walked_state();
+                let before = (batched.row_key(), batched.token_counts.clone());
+                let drafts = &picks[..ROWS - 1];
+                let specs = block_specs(drafts, ROWS);
+                let scored = sampler
+                    .score_rows(
+                        &block,
+                        &mut [&mut batched],
+                        &[&config],
+                        &specs,
+                        Some(TypicalAcceptance::MEDUSA),
+                    )
+                    .expect("score");
+                assert_eq!(
+                    (batched.row_key(), batched.token_counts.clone()),
+                    before,
+                    "{device:?} seed {seed}: scoring moved the state"
+                );
+                let committed: Vec<u32> = scored
+                    .into_iter()
+                    .enumerate()
+                    .map(|(p, s)| {
+                        sampler
+                            .commit_row(&block, p, &mut batched, &config, s.expect("reached"))
+                            .expect("commit")
+                    })
+                    .collect();
+                assert_eq!(committed, picks, "{device:?} seed {seed}");
+                assert_eq!(
+                    batched.row_key(),
+                    walked.row_key(),
+                    "{device:?} seed {seed}"
+                );
+                assert_eq!(batched.token_counts, walked.token_counts);
+                assert_eq!(batched.recent_tokens, walked.recent_tokens);
+            }
+        }
+    }
+
+    /// A rejected draft ends the walk where scoring a position at a time ends
+    /// it: the row that tests it commits the model's own pick, and the state is
+    /// the one that pick leaves.
+    #[test]
+    fn a_rejected_draft_stops_the_block_where_the_walk_stops() {
+        for device in devices() {
+            let sampler = make_sampler_on(&device, VOCAB_SIZE);
+            let block = walk_logits(3).to_device(&device).expect("logits");
+            let config = penalised(7);
+            let mut walked = walked_state();
+            let mut picks = Vec::new();
+            for p in 0..2 {
+                let row = block.narrow(0, p, 1).expect("row");
+                picks.push(
+                    sampler
+                        .sample_batch(&row, &mut [&mut walked], &[&config])
+                        .expect("sample")[0],
+                );
+            }
+            // Token 9 sits at -20 on every row: never sampled, never accepted.
+            let drafts = [picks[0], 9];
+            let mut batched = walked_state();
+            let specs = block_specs(&drafts, 3);
+            let scored = sampler
+                .score_rows(
+                    &block,
+                    &mut [&mut batched],
+                    &[&config],
+                    &specs,
+                    Some(TypicalAcceptance::MEDUSA),
+                )
+                .expect("score");
+            let mut committed = Vec::new();
+            for (p, s) in scored.into_iter().enumerate().take(2) {
+                committed.push(
+                    sampler
+                        .commit_row(&block, p, &mut batched, &config, s.expect("reached"))
+                        .expect("commit"),
+                );
+            }
+            assert_eq!(committed, picks, "{device:?}");
+            assert_ne!(committed[1], 9, "{device:?}: the walk stops here");
+            assert_eq!(batched.row_key(), walked.row_key(), "{device:?}");
+        }
+    }
+
+    /// A position whose earlier draft a resolution would replace cannot be
+    /// reached, and scores as `None`. With the hard EOS three tokens past the
+    /// state's length, the third draft would be committed as EOS, so the rows
+    /// after it are unreachable.
+    #[test]
+    fn a_position_behind_a_forced_token_scores_unreachable() {
+        let sampler = make_sampler();
+        let mut config = penalised(3);
+        let mut state = walked_state();
+        config.forced_eos_after = state.current_len + 2;
+        let drafts = [40, 41, 42, 43];
+        let block = walk_logits(5);
+        let scored = sampler
+            .score_rows(
+                &block,
+                &mut [&mut state],
+                &[&config],
+                &block_specs(&drafts, 5),
+                Some(TypicalAcceptance::MEDUSA),
+            )
+            .expect("score");
+        assert_eq!(
+            scored.iter().map(Option::is_some).collect::<Vec<_>>(),
+            vec![true, true, true, false, false]
+        );
+    }
+
     /// **A draft the distribution gives enough mass is committed whatever the
     /// sample.** `p(7) = 0.2` clears the 0.09 bar, so every seed commits 7 —
     /// including the ~80% whose sample lands on 5. The sample is still drawn,
@@ -3109,16 +3534,8 @@ mod tests {
             let logits = verify_row_logits().to_device(&device).expect("logits");
             for seed in 0..16 {
                 let mut state = make_state();
-                let tokens = sampler
-                    .sample_verify_rows(
-                        &logits,
-                        &mut [&mut state],
-                        &[&sampled_config(seed)],
-                        &[Some(7)],
-                        TypicalAcceptance::MEDUSA,
-                    )
-                    .expect("sample");
-                assert_eq!(tokens, vec![7], "{device:?} seed {seed}");
+                let token = verify_row(&sampler, &logits, &mut state, &sampled_config(seed), 7);
+                assert_eq!(token, 7, "{device:?} seed {seed}");
                 assert_eq!(state.rng_offset, 1, "{device:?} seed {seed}");
             }
         }
@@ -3136,20 +3553,9 @@ mod tests {
             let mut seen = HashSet::new();
             for seed in 0..32 {
                 let mut state = make_state();
-                let tokens = sampler
-                    .sample_verify_rows(
-                        &logits,
-                        &mut [&mut state],
-                        &[&sampled_config(seed)],
-                        &[Some(9)],
-                        TypicalAcceptance::MEDUSA,
-                    )
-                    .expect("sample");
-                assert!(
-                    tokens[0] == 5 || tokens[0] == 7,
-                    "{device:?} seed {seed}: {tokens:?}"
-                );
-                seen.insert(tokens[0]);
+                let token = verify_row(&sampler, &logits, &mut state, &sampled_config(seed), 9);
+                assert!(token == 5 || token == 7, "{device:?} seed {seed}: {token}");
+                seen.insert(token);
             }
             assert_eq!(seen.len(), 2, "{device:?}: corrections {seen:?}");
         }
@@ -3164,17 +3570,38 @@ mod tests {
             let sampler = make_sampler_on(&device, VOCAB_SIZE);
             let logits = verify_row_logits().to_device(&device).expect("logits");
             let mut state = make_state();
-            let tokens = sampler
-                .sample_verify_rows(
-                    &logits,
-                    &mut [&mut state],
-                    &[&SamplingConfig::argmax()],
-                    &[Some(7)],
-                    TypicalAcceptance::MEDUSA,
-                )
-                .expect("sample");
-            assert_eq!(tokens, vec![5], "{device:?}");
+            let token = verify_row(&sampler, &logits, &mut state, &SamplingConfig::argmax(), 7);
+            assert_eq!(token, 5, "{device:?}");
         }
+    }
+
+    /// One verify row testing `draft`, scored and committed as the accept walk
+    /// does.
+    fn verify_row(
+        sampler: &BatchedSampler,
+        logits: &Tensor,
+        state: &mut SequenceSamplingState,
+        config: &SamplingConfig,
+        draft: u32,
+    ) -> u32 {
+        let spec = [RowSpec {
+            seq: 0,
+            logits_row: 0,
+            draft: Some(draft),
+            ahead: &[],
+        }];
+        let scored = sampler
+            .score_rows(
+                logits,
+                &mut [&mut *state],
+                &[config],
+                &spec,
+                Some(TypicalAcceptance::MEDUSA),
+            )
+            .expect("score");
+        sampler
+            .commit_row(logits, 0, state, config, scored[0].expect("reached"))
+            .expect("commit")
     }
 
     /// **The padded tail of a row is never a token.** The sampler's live
@@ -3195,19 +3622,8 @@ mod tests {
             assert_eq!(greedy, vec![5], "{device:?}");
             for seed in 0..16 {
                 let mut state = make_state();
-                let tokens = sampler
-                    .sample_verify_rows(
-                        &logits,
-                        &mut [&mut state],
-                        &[&sampled_config(seed)],
-                        &[Some(60)],
-                        TypicalAcceptance::MEDUSA,
-                    )
-                    .expect("sample");
-                assert!(
-                    tokens[0] == 5 || tokens[0] == 7,
-                    "{device:?} seed {seed}: {tokens:?}"
-                );
+                let token = verify_row(&sampler, &logits, &mut state, &sampled_config(seed), 60);
+                assert!(token == 5 || token == 7, "{device:?} seed {seed}: {token}");
             }
         }
     }
@@ -3577,9 +3993,9 @@ mod tests {
     /// wrong fix: reading `configs[0]` satisfies the first, reading the last
     /// row's config satisfies the second.
     ///
-    /// Runs on CUDA, which is the only path that had the defect —
-    /// `sample_batch_cpu` always zipped configs per row, so a CPU-only test
-    /// could never have caught it.
+    /// Runs on CUDA, which is the only path that had the defect — the CPU
+    /// sampler always read configs per row, so a CPU-only test could never have
+    /// caught it.
     #[test]
     fn each_row_of_a_wave_honours_its_own_segment_budget() {
         let Ok(device) = candle::Device::new_cuda(0) else {
