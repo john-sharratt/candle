@@ -35,8 +35,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, prefill_kv_stage_positions,
-    LayerPhase, WavePlan, WaveWidth,
+    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase,
+    PrefillKvStageLayout, PrefillLaunchBounds, WavePlan, WaveWidth,
 };
 
 use super::batched::HybridBatched;
@@ -687,6 +687,14 @@ impl ManagedBatchedModel for HybridBatched {
         }
     }
 
+    /// Let the weight side — experts or streamed layers — take back KV ground
+    /// standing free, between forwards. The wave asks at its own head; this is the
+    /// scheduler asking after a compaction or a settle, which would otherwise wait
+    /// for the next forward and find it buying ground instead.
+    fn reclaim_spare_ground(&self) {
+        HybridBatched::reclaim_spare_ground(self);
+    }
+
     /// Dense tensors **plus** whatever experts are resident, which is what the
     /// trait asks for and what the whole-card decomposition subtracts the expert
     /// half back out of. Reporting only the experts made the dense half cancel
@@ -945,7 +953,8 @@ fn sweep_layers(
     #[cfg(feature = "cuda")]
     if total_rows > 0 {
         if let Device::Cuda(d) = dev {
-            let plan = WavePlan::new(model.wave_geometry(embed_dtype));
+            let geometry = model.wave_geometry(embed_dtype);
+            let plan = WavePlan::new(geometry);
             // **Scored rows are not all rows.** The head runs every decode row
             // and the LAST row of each prefill span — a verifying span excepted,
             // where each row is a prediction to compare a proposal against.
@@ -1005,9 +1014,16 @@ fn sweep_layers(
                 // needs (measured: `wave-ffn … exceeds the 0 B budget`).
                 staged_rows: staged.map_or(0, |(rows, _)| rows),
                 staged_spans: staged.map_or(0, |(_, spans)| spans),
-                // The prefill launch's pre-staged K/V: every position of each
-                // bulk chunk's sequence.
-                kv_stage_positions: prefill_kv_stage_positions(pre_q, pre_off),
+                // The prefill launch's carve: up to one key chunk of each bulk
+                // chunk's sequence, and the carry beside it.
+                kv_stage: PrefillKvStageLayout::new(
+                    pre_q,
+                    pre_off,
+                    geometry.n_head,
+                    geometry.n_kv_head,
+                    geometry.head_dim,
+                    PrefillLaunchBounds::PRODUCTION,
+                ),
             };
             let per_phase = [
                 plan.phase_bytes(LayerPhase::Attention, width),

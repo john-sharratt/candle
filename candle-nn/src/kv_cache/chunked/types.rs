@@ -498,8 +498,11 @@ pub(crate) enum DecodeGpuChunksSyncKind {
     /// The live buffer served as it stood.
     Reuse,
     /// A commit outside the decode kernel had marked the writer region stale,
-    /// and it was re-serialised before the live buffer was handed back.
-    Resync,
+    /// and its `entries` were re-serialised before the live buffer was handed
+    /// back — from the first chunk a pending commit changed to the writer.
+    Resync {
+        entries: usize,
+    },
     /// Chunks had been appended, and the buffer was brought up to them by
     /// serialising `entries` of its tail — from the previous writer, or from
     /// the first chunk a pending commit filled when that is earlier.
@@ -1084,25 +1087,28 @@ impl SequenceState {
     /// sync per layer. A missing buffer is left for the sync's full rebuild; a
     /// shape mismatch (defensive) falls back to full invalidation, which the
     /// same sync then rebuilds.
+    ///
+    /// Answers with the entries re-serialised: zero when there was no buffer to
+    /// bring up to date or it was invalidated instead.
     fn resync_decode_writer_region(
         &mut self,
         from: usize,
         n_kv_head: usize,
         head_dim: usize,
         arena_info: &[ResolvedArenaInfo],
-    ) -> candle::Result<()> {
+    ) -> candle::Result<usize> {
         let gpu_n = self.gpu_chunks.n_chunks();
         if gpu_n == 0 {
-            return Ok(());
+            return Ok(0);
         }
         if gpu_n != self.chunks.len() {
             self.invalidate_gpu_chunks();
-            return Ok(());
+            return Ok(0);
         }
         let wi = self.decode_write_chunk_idx();
         if wi >= gpu_n {
             self.invalidate_gpu_chunks();
-            return Ok(());
+            return Ok(0);
         }
         // Every chunk a prefill can have written, not only the writer:
         // `set_len` fills consecutive chunks, so the chunks it filled on the
@@ -1114,7 +1120,8 @@ impl SequenceState {
         let start = from.min(wi);
         // One guard for the whole region: one upload, not one per chunk.
         let region: Vec<usize> = (start..=wi).collect();
-        self.update_gpu_chunks_bulk(&region, n_kv_head, head_dim, arena_info)
+        self.update_gpu_chunks_bulk(&region, n_kv_head, head_dim, arena_info)?;
+        Ok(region.len())
     }
 
     /// Re-serialise the GPU buffer slot at `blk` from the current host state
@@ -1536,13 +1543,15 @@ impl SequenceState {
                 self.rebuild_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?;
             return Ok((rebuilt, DecodeGpuChunksSyncKind::Rebuild));
         }
-        let resynced = self.decode_stale_from.is_some();
+        let mut resynced = None;
         if let Some(from) = self.decode_stale_from {
             // Cleared only once the region is current: a resync that fails
             // leaves the mark for the next sync, not a buffer that reads as up
             // to date and is not.
-            self.resync_decode_writer_region(from, n_kv_head, head_dim, arena_info)?;
+            let entries =
+                self.resync_decode_writer_region(from, n_kv_head, head_dim, arena_info)?;
             self.decode_stale_from = None;
+            resynced = Some(entries);
         }
         let host_n = self.chunks.len();
         if host_n == 0 {
@@ -1581,10 +1590,9 @@ impl SequenceState {
         Self::slot_counts_agree(host_n, self.gpu_chunks.n_chunks())?;
         let wi = self.decode_write_chunk_idx();
         let ptr = self.gpu_chunks.raw_device_ptr();
-        let kind = if resynced {
-            DecodeGpuChunksSyncKind::Resync
-        } else {
-            DecodeGpuChunksSyncKind::Reuse
+        let kind = match resynced {
+            Some(entries) => DecodeGpuChunksSyncKind::Resync { entries },
+            None => DecodeGpuChunksSyncKind::Reuse,
         };
         Ok(((ptr, host_n as u32, wi as u32), kind))
     }

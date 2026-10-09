@@ -23,8 +23,9 @@ use candle::cuda_backend::cudarc::driver::result::stream::launch_host_function;
 use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use candle::{DType, Device, Tensor};
 
+use crate::kv_cache::arena_table::N_PALETTE;
 use crate::kv_cache::chunked::gpu_test_lock::gpu_serial;
-use crate::kv_cache::{ChunkedKvBacking, DecodeGpuChunkSyncStats, KvCache};
+use crate::kv_cache::{ChunkedKvBacking, DecodeGpuChunkSyncStats, KvCache, KvFormat};
 
 const N_KV_HEAD: usize = 2;
 const HEAD_DIM: usize = 32;
@@ -72,8 +73,9 @@ fn device_lens(dev: &Device, backing: &ChunkedKvBacking, seq: usize, offset: usi
 fn live_slot(backing: &ChunkedKvBacking, seq: usize, offset: usize) -> (u64, usize) {
     backing.ensure_for_offset(seq, offset, 1).unwrap();
     let info = backing.resolve_arena_info().unwrap();
+    let generation = backing.begin_stager_generation_required();
     let (ptrs, _, _) = backing
-        .sync_decode_gpu_chunks(&[(seq, offset)], &info)
+        .sync_decode_gpu_chunks(&[(seq, offset)], &info, &generation)
         .unwrap();
     let (ptr, n_slices, _) = ptrs[0];
     (ptr, n_slices as usize)
@@ -283,9 +285,24 @@ fn a_fence_inside_a_recording_wave_leaves_the_capture_intact() {
     };
     let (backing, mut cache, seq) = setup(&dev);
 
-    // Outside any wave, so the rebuild's upload is staged and leaves an event.
+    // Outside any wave, a block re-gid — the cold-load and quantize-swap
+    // refresh, which uploads on its own rather than through a sync's batch — so
+    // its upload is staged and leaves an event.
     write_outside_decode(&mut cache, &dev, 0, 8);
     live_slot(&backing, seq, 8);
+    let fmts = vec![KvFormat::Float(DType::F16); N_KV_HEAD * N_PALETTE];
+    backing
+        .alloc_sealed_block(
+            seq,
+            0,
+            &fmts,
+            &fmts,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        )
+        .unwrap();
 
     let capture = cuda.begin_wave_capture().unwrap();
     cuda.record_launches().unwrap();
@@ -405,10 +422,10 @@ fn a_queued_upload_keeps_its_bytes_and_the_next_sync_does_not_wait() {
     );
 }
 
-/// Two uploads queued behind unfinished work, and a third commit's sync behind
-/// them: the third finds both staging buffers still read by queued copies and
-/// waits for the older one — and every reader still sees exactly the bytes its
-/// upload was issued with.
+/// Three syncs' uploads queued behind unfinished work, a reader behind each of
+/// the first two: every batched upload carries the bytes its sync packed into
+/// the staging generation, so every reader sees exactly the lengths its sync
+/// issued, and the last sync lands its own.
 #[test]
 fn every_queued_upload_keeps_its_bytes_when_both_staging_buffers_are_in_flight() {
     let _gpu = gpu_serial();
@@ -440,8 +457,8 @@ fn every_queued_upload_keeps_its_bytes_when_both_staging_buffers_are_in_flight()
         // and the copy is ordered on the stream every slot-state upload uses.
         unsafe { memcpy_dtod_async(probe_ptr, ptr, bytes, stream.cu_stream()) }.unwrap();
     }
-    // The third sync waits for the first upload, which is behind the gate:
-    // open it from another thread once that wait has begun.
+    // The gate opens from another thread while the third sync queues its own
+    // upload behind the first two.
     let opener = gate.open_after(Duration::from_millis(200));
     cache.commit_written_tokens(16, 4).unwrap();
     assert_eq!(live_slot(&backing, seq, 20), (ptr, n_slices));
@@ -536,7 +553,10 @@ fn a_boundary_moved_after_a_commit_does_not_shrink_the_resync() {
     // Synced directly: an ensure would push a fresh writer past the sealed
     // boundary and rebuild the buffer, hiding the region under test.
     let info = backing.resolve_arena_info().unwrap();
-    let (ptrs, _, stats) = backing.sync_decode_gpu_chunks(&[(seq, 34)], &info).unwrap();
+    let generation = backing.begin_stager_generation_required();
+    let (ptrs, _, stats) = backing
+        .sync_decode_gpu_chunks(&[(seq, 34)], &info, &generation)
+        .unwrap();
     assert_eq!(
         (stats.rebuilds, stats.resyncs),
         (0, 1),
@@ -656,8 +676,9 @@ fn sync_at(
 ) -> (u64, usize, DecodeGpuChunkSyncStats) {
     backing.ensure_for_offset(seq, offset, 1).unwrap();
     let info = backing.resolve_arena_info().unwrap();
+    let generation = backing.begin_stager_generation_required();
     let (ptrs, _, stats) = backing
-        .sync_decode_gpu_chunks(&[(seq, offset)], &info)
+        .sync_decode_gpu_chunks(&[(seq, offset)], &info, &generation)
         .unwrap();
     (ptrs[0].0, ptrs[0].1 as usize, stats)
 }
@@ -694,6 +715,68 @@ fn a_chunk_boundary_extends_the_buffer_to_a_rebuilds_bytes() {
     );
 
     let (ptr, n, _) = sync_at(&backing, seq, 240);
+    let rec = inline_record_bytes(&dev, ptr);
+    let extended = slot_image(&dev, ptr, n, rec);
+    let expected: Vec<(u16, u16, u32)> = (0..8)
+        .map(|i| (0, if i < 7 { 32 } else { 16 }, 32 * i))
+        .collect();
+    assert_eq!(
+        extended
+            .iter()
+            .map(|e| (e.offset, e.len, e.rope))
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    backing.invalidate_decode_slot(seq);
+    let (ptr, n, stats) = sync_at(&backing, seq, 240);
+    assert_eq!(stats.rebuilds, 1);
+    assert_eq!(extended, slot_image(&dev, ptr, n, rec));
+}
+
+/// [`sync_at`] through the decode metadata build's own sync, the live-pointer
+/// rows of `sync_decode_gpu_chunks_snapshot`.
+fn sync_metadata_at(
+    backing: &ChunkedKvBacking,
+    seq: usize,
+    offset: usize,
+) -> (u64, usize, DecodeGpuChunkSyncStats) {
+    backing.ensure_for_offset(seq, offset, 1).unwrap();
+    let info = backing.resolve_arena_info().unwrap();
+    let generation = backing.begin_stager_generation_required();
+    let (ptrs, stats) = backing
+        .sync_decode_gpu_chunks_snapshot(&[(seq, offset)], &info, &generation, &[false])
+        .unwrap();
+    (ptrs[0].0, ptrs[0].1 as usize, stats)
+}
+
+/// **The metadata build's batched upload lands a rebuild's bytes.** The boundary
+/// walk of [`a_chunk_boundary_extends_the_buffer_to_a_rebuilds_bytes`], synced
+/// the way the decode metadata build syncs: every extend's ranges are deferred
+/// into the batch and copied by one scatter at its flush. The slot then holds,
+/// entry for entry and record for record, what a rebuild from the host state
+/// writes.
+#[test]
+fn a_metadata_sync_extend_lands_a_rebuilds_bytes() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    let (ptr, n, stats) = sync_metadata_at(&backing, seq, 8);
+    assert_eq!((n, stats.rebuilds, stats.extends), (1, 1, 0));
+
+    let mut extends = 0;
+    for offset in (8..240).step_by(8) {
+        write_outside_decode(&mut cache, &dev, offset, 8);
+        let (p, _, stats) = sync_metadata_at(&backing, seq, offset + 8);
+        assert_eq!(p, ptr, "offset {offset}: the buffer left its slot");
+        extends += stats.extends;
+    }
+    assert_eq!(extends, 7, "every boundary from 32 to 224 extends");
+
+    let (ptr, n, _) = sync_metadata_at(&backing, seq, 240);
+    dev.synchronize().unwrap();
     let rec = inline_record_bytes(&dev, ptr);
     let extended = slot_image(&dev, ptr, n, rec);
     let expected: Vec<(u16, u16, u32)> = (0..8)
@@ -750,6 +833,64 @@ fn a_commit_at_depth_extends_from_the_chunk_it_filled_first() {
     backing.invalidate_decode_slot(seq);
     let (ptr, n, _) = sync_at(&backing, seq, 352);
     assert_eq!(extended, slot_image(&dev, ptr, n, rec));
+}
+
+/// **A partial accept's rollback re-serialises the chunk it trimmed, not the
+/// sequence.** Eight full chunks are serialised, a four-token verify block is
+/// committed into the writer at 256, and two of its tokens are rejected. The
+/// trim stays inside the writer, so the sync after it re-serialises that one
+/// entry — where falling back to the writer boundary (chunk 0, for a sequence
+/// written from its first token) re-serialised all nine, on every layer of
+/// every partial-accept step. The buffer is still byte-for-byte a rebuild's.
+#[test]
+fn a_partial_accept_rollback_resyncs_only_the_landing_chunk() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let backing = ChunkedKvBacking::new(1, N_KV_HEAD, HEAD_DIM, DType::F16, &dev, 1024).unwrap();
+    let seq = backing.alloc_sequence().unwrap();
+    let mut cache = KvCache::new(2, 1024);
+    cache.set_chunked_backing(&backing, seq, None).unwrap();
+
+    for offset in (0..256).step_by(32) {
+        write_outside_decode(&mut cache, &dev, offset, 32);
+        sync_at(&backing, seq, offset + 32);
+    }
+    let (_, n, _) = sync_at(&backing, seq, 256);
+    assert_eq!(n, 9, "eight full chunks and the writer pushed at 256");
+
+    write_outside_decode(&mut cache, &dev, 256, 4);
+    backing.truncate_sequence_to_tokens(seq, 258).unwrap();
+    let info = backing.resolve_arena_info().unwrap();
+    let generation = backing.begin_stager_generation_required();
+    let (ptrs, _, stats) = backing
+        .sync_decode_gpu_chunks(&[(seq, 258)], &info, &generation)
+        .unwrap();
+    assert_eq!(
+        (
+            stats.rebuilds,
+            stats.extends,
+            stats.resyncs,
+            stats.resync_entries
+        ),
+        (0, 0, 1, 1),
+        "the rollback's resync re-serialised more than the writer it trimmed"
+    );
+
+    let (ptr, n) = (ptrs[0].0, ptrs[0].1 as usize);
+    let rec = inline_record_bytes(&dev, ptr);
+    let resynced = slot_image(&dev, ptr, n, rec);
+    assert_eq!(
+        resynced
+            .iter()
+            .map(|e| (e.offset, e.len, e.rope))
+            .collect::<Vec<_>>(),
+        (0..9)
+            .map(|i| (0, if i < 8 { 32 } else { 2 }, 32 * i))
+            .collect::<Vec<_>>()
+    );
+    backing.invalidate_decode_slot(seq);
+    let (ptr, n, _) = sync_at(&backing, seq, 258);
+    assert_eq!(resynced, slot_image(&dev, ptr, n, rec));
 }
 
 /// An append past the layout's capacity rebuilds — the records cannot move

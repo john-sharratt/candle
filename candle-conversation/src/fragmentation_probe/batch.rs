@@ -163,7 +163,7 @@ pub struct StoryBatch {
 /// stays as the model ships it and only the randomness goes. `temperature = 0` is
 /// argmax; `top_k = 1` and `top_p = 1` remove the two ways a nucleus could still
 /// widen the choice.
-fn greedy_sampling(config: SequenceConfig) -> SamplingConfig {
+pub(super) fn greedy_sampling(config: SequenceConfig) -> SamplingConfig {
     SamplingConfig {
         temperature: 0.0,
         segment_temp_boost: 0.0,
@@ -266,28 +266,32 @@ fn unstreamed(i: usize, streamed: &[u32], generated: &[u32], stopped: bool) -> O
     ))
 }
 
-/// One turn as its reader saw it: the reply, every streamed token with its arrival,
-/// and when the turn ended.
-struct ClockedTurn {
-    resp: TurnResponse,
-    streamed: Vec<u32>,
-    token_times: Vec<Duration>,
-    done: Duration,
+/// One turn as its reader saw it: the text the engine framed and prefilled, the
+/// reply, every streamed token with its arrival, and when the turn ended.
+pub(super) struct ClockedTurn {
+    pub(super) prefilled: String,
+    pub(super) resp: TurnResponse,
+    pub(super) streamed: Vec<u32>,
+    pub(super) token_times: Vec<Duration>,
+    pub(super) done: Duration,
 }
 
 /// Read one turn's events until it settles, stamping every token's arrival and the
 /// turn's end against `t0`.
-fn clock_turn(handle: &TurnHandle, t0: Instant) -> Result<ClockedTurn, String> {
+pub(super) fn clock_turn(handle: &TurnHandle, t0: Instant) -> Result<ClockedTurn, String> {
+    let mut prefilled = String::new();
     let mut streamed = Vec::new();
     let mut token_times = Vec::new();
     for event in handle.stream() {
         match event {
+            TurnEvent::Prefill(text) => prefilled = text,
             TurnEvent::Token(id) => {
                 streamed.push(id);
                 token_times.push(t0.elapsed());
             }
             TurnEvent::Done(resp) => {
                 return Ok(ClockedTurn {
+                    prefilled,
                     resp,
                     streamed,
                     token_times,
@@ -387,6 +391,7 @@ pub fn run_story_batch(
                 streamed,
                 token_times,
                 done,
+                ..
             }) => {
                 // Every token the turn generated reaches its stream, but the EOS
                 // that closes it: a client reads the reply off the stream, and

@@ -869,7 +869,19 @@ impl PinnedStager {
         // fired. This is where the reset actually happens in the steady state —
         // by the time the next generation starts, the prior one's work is
         // normally long done, so the query succeeds and costs nothing.
-        inner.try_reclaim();
+        //
+        // Not on a thread recording a wave: querying an event there is host
+        // protocol, and it invalidates the whole capture. The arena then keeps
+        // bump-allocating — into an overflow slab if it fills — exactly as it
+        // does while a generation is live, and the next generation begun
+        // outside the recording collects the reset.
+        let recording = inner
+            .dev
+            .as_ref()
+            .is_some_and(|d| d.recording_segment().is_some());
+        if !recording {
+            inner.try_reclaim();
+        }
         inner.live_generations += 1;
         inner.epoch += 1;
         let epoch = inner.epoch;

@@ -1,7 +1,9 @@
 use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, ThrottleReason};
-use super::prefill::VramPhase;
+use super::prefill::{VramPhase, LOAD_TARGET};
 use super::*;
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
+use candle::DeviceLocation;
+use candle_nn::kv_cache::set_kv_free_target;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
@@ -410,6 +412,13 @@ impl Scheduler {
         // admission defending nothing at all. A first pass that is too tight
         // self-corrects at the first idle; one that defends nothing does not.
         super::interleave::reseed_achievable_weight();
+        // **The weight side leaves what relief frees to.** Relief defends
+        // `LOAD_TARGET` free regions by conceding weight ground; a weight side that
+        // grew back below it would take those regions again on the next forward,
+        // and the two would trade them every step.
+        if let DeviceLocation::Cuda { gpu_id } = self.session.device().location() {
+            set_kv_free_target(gpu_id, LOAD_TARGET);
+        }
         // One-time snapshot of the governor's budget partition (capacity C, KV
         // floor, ladder thresholds, per-class reserved, live headroom) so a run's
         // starting VRAM state is visible in the log before any waves.
@@ -569,6 +578,17 @@ impl Scheduler {
                 && self.active_section_ingests.is_empty()
                 && self.deferred_glue_fires.is_empty()
             {
+                // **Settle once on falling idle after work.** The wave loop packs
+                // and grows the weight side a little per iteration, paced against
+                // the forwards beside it; with none left, what the finished work
+                // freed is handed back whole before the loop parks — otherwise it
+                // waits, owed, inside the next request's first forwards.
+                if std::mem::take(&mut self.settle_owed) {
+                    let report = self.settle_device();
+                    for waiter in self.settle_waiters.drain(..) {
+                        let _ = waiter.send(report);
+                    }
+                }
                 // Nothing is in flight, so everything resident is permanent:
                 // the one moment the achievable weight residency is exact.
                 super::interleave::reseed_achievable_weight();
@@ -810,6 +830,7 @@ impl Scheduler {
                 if let Some(rate) = self.wave_rate.as_mut() {
                     rate.observe_overhead(per_forward);
                 }
+                self.settle_owed = true;
             }
             self.wave_forwards = 0;
             self.wave_overhead_us = 0;

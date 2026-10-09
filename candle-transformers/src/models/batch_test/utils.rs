@@ -413,7 +413,17 @@ impl TestParams {
     /// This function gets the system prompt for the test based on an index, this
     /// will use the prompt_system and replace {INSERT_NAME} with the indexed name
     /// then feed it through the tokenizer to get token IDs
+    ///
+    /// **No system text is no system turn.** A chat template writes a system
+    /// block only when there is something to put in it — Strata's server, which
+    /// the Strata benchmark reproduces, renders a user-only request as the user
+    /// turn alone — so an empty prompt yields the document token (where the
+    /// dialect has one) and nothing else, never an empty
+    /// `<|im_start|>system\n<|im_end|>\n` the request did not ask for.
     pub fn system_prompt_tokens(&self, index: usize) -> Vec<u32> {
+        if self.prompt_system.is_empty() {
+            return self.begin_document_token.into_iter().collect();
+        }
         let name = &self.names[index % self.names.len()];
         let prompt = format!(
             "{}{}{}",
@@ -1480,6 +1490,15 @@ impl TestParams {
             std::collections::HashMap::new();
         for (token_len, group) in by_length {
             let seq_idxs: Vec<usize> = group.iter().map(|(idx, _)| *idx).collect();
+            // A session with no system turn has nothing to prefill here. Its run
+            // takes a placeholder the prompt phase overwrites with the logits it
+            // actually samples from, as every run's are.
+            if token_len == 0 {
+                for &seq_idx in &seq_idxs {
+                    logits_map.insert(seq_idx, Tensor::zeros(1, DType::F32, &Device::Cpu)?);
+                }
+                continue;
+            }
             let tensors: Vec<Tensor> = group.into_iter().map(|(_, t)| t).collect();
 
             let nl = model.num_layers();

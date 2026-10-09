@@ -17,12 +17,12 @@
 //! - **One short warm-up request first**, excluded, then three runs at each length
 //!   in increasing order on the same loaded engine, reported as the median.
 //!
-//! Two differences are this harness's own and are stated in the output. The
-//! harness prefills a system turn before every user turn, so the system turn is
-//! left empty and its marker tokens are counted toward the target: the prompt
-//! is the same length as Strata's, a handful of those tokens are an empty system
-//! turn's. The warm-up decodes the same 256 tokens as the measured runs rather
-//! than Strata's 16; it is excluded either way.
+//! The request renders as Strata's server renders it: the user turn alone — no
+//! system turn, since the request carries no system message and the template
+//! writes none for an empty one — then the assistant header and the closed
+//! reasoning block `reasoning_effort: "none"` selects. One difference is this
+//! harness's own: the warm-up decodes the same 256 tokens as the measured runs
+//! rather than Strata's 16; it is excluded either way.
 
 use candle::{Device, Result};
 
@@ -108,7 +108,7 @@ pub fn fit_prompt(
 
 /// The median of a length's runs, as Python's `statistics.median` gives it,
 /// and every run in order, e.g. `103.1 (99.4, 103.1, 115.5)`.
-fn median_of(xs: &[f64]) -> String {
+pub fn median_of(xs: &[f64]) -> String {
     let mut sorted = xs.to_vec();
     sorted.sort_by(f64::total_cmp);
     let n = sorted.len();
@@ -155,7 +155,7 @@ pub fn strata_bench<M: ManagedBatchedModel>(
         }
     }
     println!(
-        "  (the system turn is empty and counted: {} of each prompt's tokens)\n",
+        "  (no system turn: {} system tokens per prompt, as Strata renders a user-only request)\n",
         params.system_prompt_tokens(0).len()
     );
     params = params
@@ -279,6 +279,44 @@ mod tests {
         let f = filler();
         // Steps of 128 from 50: the nearest under 4,096 is 4,018, 78 short.
         assert!(fit_prompt(&f, 4_096, 1, |p| (p.len() / 128) * 128 + 50).is_err());
+    }
+
+    /// A word-level tokenizer holding ChatML's markers and a few words, enough to
+    /// render a turn without a downloaded vocabulary.
+    const MARKER_TOKENIZER: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [
+            {"id": 0, "content": "<|im_start|>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true},
+            {"id": 1, "content": "<|im_end|>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": false, "special": true}
+        ],
+        "normalizer": null, "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "unk_token": "[UNK]", "vocab": {
+            "<|im_start|>": 0, "<|im_end|>": 1, "system": 2, "user": 3,
+            "assistant": 4, "hello": 5, "be": 6, "brief": 7, "[UNK]": 8}}
+    }"#;
+
+    /// **A request with no system message renders no system turn** — Strata's
+    /// server writes the user turn alone — so the Strata benchmark prefills
+    /// nothing before it and counts nothing for it. A request that does carry
+    /// system text still opens with its system turn.
+    #[test]
+    fn no_system_text_renders_no_system_turn() {
+        let base = TestParams::new(4, MARKER_TOKENIZER, Dialect::qwen35()).unwrap();
+        let bare = base.with_system_prompt("");
+        assert_eq!(bare.system_prompt_tokens(0), Vec::<u32>::new());
+        assert_eq!(
+            bare.prefill_token_count("hello"),
+            bare.user_content_tokens("hello").len() + bare.user_suffix_tokens().len()
+        );
+        let framed = TestParams::new(4, MARKER_TOKENIZER, Dialect::qwen35())
+            .unwrap()
+            .with_system_prompt("be brief");
+        let system = framed.system_prompt_tokens(0);
+        assert_eq!(system.first(), Some(&0), "opens with <|im_start|>");
+        assert!(system.contains(&2) && system.contains(&1));
     }
 
     #[test]

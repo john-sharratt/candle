@@ -7056,6 +7056,7 @@ pub(crate) fn dense_qmatmul_stacked<'w>(
         op.cols,
         cached_sm_count(device),
         one_format && dtype != GgmlDType::MXFP4_KO && segments.len() <= SPLITK_MAX_SEGS,
+        dtype,
     );
     let segs = || -> Vec<(u64, usize)> { segments.iter().map(|&(p, _, n)| (p, n)).collect() };
     match plan {
@@ -7195,6 +7196,7 @@ pub fn dense_qmatmul_with_plan<'w>(
                     op.cols,
                     sm,
                     weight_dtype != GgmlDType::MXFP4_KO,
+                    weight_dtype,
                 )
             });
             match plan {

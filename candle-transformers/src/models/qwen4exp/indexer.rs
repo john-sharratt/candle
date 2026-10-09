@@ -121,6 +121,75 @@ impl TailRoute {
     }
 }
 
+/// The query side of a scoring bound: `t` query rows whose deepest sees
+/// `cand_max` candidate blocks, scored by `heads` heads of width `d`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScoreRows {
+    pub t: usize,
+    pub cand_max: usize,
+    pub heads: usize,
+    pub d: usize,
+}
+
+/// The most bytes [`IndexCache::score_rows`] carves for `rows` over a cache whose
+/// placed pages span `page_cols` candidate columns in `page_chunks()` descriptor
+/// chunks and whose live tail holds `live_blocks` blocks once the wave's appends
+/// land — each carve rounded up to `align`, so the sum is a bound.
+///
+/// One formula for a cache that exists ([`IndexCache::score_bound`]) and for one
+/// that does not yet ([`fresh_score_bound`]), so a wave priced before its
+/// sequence has run is priced by the same arithmetic as the wave itself. Mirrors
+/// the two routes: the paged scorer's page, offset and count tables, and — when
+/// the live tail goes to cuBLAS — the rotated tail, its page table and every
+/// tile's scoring product (a bump never rewinds within a phase, so the tiles add
+/// up). `page_chunks` is asked only when the paged scorer runs.
+pub fn score_bound_for(
+    page_cols: usize,
+    page_chunks: impl FnOnce() -> Result<usize>,
+    live_blocks: usize,
+    rows: ScoreRows,
+    align: usize,
+) -> Result<usize> {
+    use candle_kernels::simple::qsa_score_paged::PAGE_WORDS;
+
+    let ScoreRows {
+        t,
+        cand_max,
+        heads,
+        d,
+    } = rows;
+    let a = |b: usize| b.div_ceil(align) * align;
+    let live_cols = cand_max.saturating_sub(page_cols);
+    let tail_in_paged = live_cols > 0 && TailRoute::for_span(t, live_cols) == TailRoute::Paged;
+    let paged_cols = if tail_in_paged { cand_max } else { page_cols };
+    let mut bytes = 0usize;
+    if paged_cols > 0 {
+        let mut chunks = page_chunks()?;
+        if tail_in_paged {
+            chunks += live_blocks.div_ceil(PAGE_BLOCKS);
+        }
+        bytes += a(chunks * PAGE_WORDS * 8) + a((chunks + 1) * 4) + a(t * 4);
+    }
+    if !tail_in_paged && live_cols > 0 {
+        bytes += a(live_cols.div_ceil(PAGE_BLOCKS) * 8) + a(live_cols * d * 4);
+        let per_tile = (SCORE_TILE_BYTES / (heads * live_cols * 4)).clamp(1, t);
+        let (full, rem) = (t / per_tile, t % per_tile);
+        bytes += full * a(per_tile * heads * live_cols * 4);
+        if rem > 0 {
+            bytes += a(rem * heads * live_cols * 4);
+        }
+    }
+    Ok(bytes)
+}
+
+/// [`score_bound_for`] over a cache with no placed pages whose live tail holds
+/// `live_blocks` blocks once the wave's appends land — the bound for a sequence
+/// that forwards its whole prefix and has no cache yet to ask.
+pub fn fresh_score_bound(live_blocks: usize, rows: ScoreRows, align: usize) -> usize {
+    score_bound_for(0, || Ok(0), live_blocks, rows, align)
+        .expect("a cache with no placed pages has no descriptor to fail on")
+}
+
 /// One sequence's index cache for one full-attention layer.
 #[derive(Debug)]
 pub struct IndexCache {
@@ -376,34 +445,24 @@ impl IndexCache {
         d: usize,
         align: usize,
     ) -> Result<usize> {
-        use candle_kernels::simple::qsa_score_paged::PAGE_WORDS;
-
-        let a = |b: usize| b.div_ceil(align) * align;
-        let page_cols = self.page_row_span();
-        let live_cols = cand_max.saturating_sub(page_cols);
-        let tail_in_paged = live_cols > 0 && TailRoute::for_span(t, live_cols) == TailRoute::Paged;
-        let paged_cols = if tail_in_paged { cand_max } else { page_cols };
-        let mut bytes = 0usize;
-        if paged_cols > 0 {
-            let mut chunks = 0usize;
-            for placed in &self.pages {
-                chunks += placed.page.descriptors()?.len();
-            }
-            if tail_in_paged {
-                chunks += (self.n_blocks + appended).div_ceil(PAGE_BLOCKS);
-            }
-            bytes += a(chunks * PAGE_WORDS * 8) + a((chunks + 1) * 4) + a(t * 4);
-        }
-        if !tail_in_paged && live_cols > 0 {
-            bytes += a(live_cols.div_ceil(PAGE_BLOCKS) * 8) + a(live_cols * d * 4);
-            let per_tile = (SCORE_TILE_BYTES / (heads * live_cols * 4)).clamp(1, t);
-            let (full, rem) = (t / per_tile, t % per_tile);
-            bytes += full * a(per_tile * heads * live_cols * 4);
-            if rem > 0 {
-                bytes += a(rem * heads * live_cols * 4);
-            }
-        }
-        Ok(bytes)
+        score_bound_for(
+            self.page_row_span(),
+            || {
+                let mut chunks = 0usize;
+                for placed in &self.pages {
+                    chunks += placed.page.descriptors()?.len();
+                }
+                Ok(chunks)
+            },
+            self.n_blocks + appended,
+            ScoreRows {
+                t,
+                cand_max,
+                heads,
+                d,
+            },
+            align,
+        )
     }
 
     /// Blocks the live tail has completed.
@@ -2557,6 +2616,39 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// **A fresh 128K turn's deepest chunk prices its cuBLAS scoring tile by
+    /// tile.** 8,192 rows over 32,000 live blocks is past the GEMM crossover:
+    /// the tail's page table (1,000 B → 1,024), the rotated tail (16,384,000 B),
+    /// thirty-one 262-row tiles of 134,144,000 B and a 70-row remainder of
+    /// 35,840,000 B — 4.2 GB, the term admission must not price at zero.
+    #[test]
+    fn a_fresh_deep_chunk_prices_every_score_tile() {
+        let rows = ScoreRows {
+            t: 8_192,
+            cand_max: 32_000,
+            heads: 4,
+            d: 128,
+        };
+        assert_eq!(
+            fresh_score_bound(32_000 + 8_192 / 4 + 1, rows, 256),
+            4_210_689_024
+        );
+    }
+
+    /// Under the crossover the fresh tail rides the paged scorer: four page
+    /// descriptors (128 B → 256), five offsets (20 B → 256) and the row counts
+    /// (512 B).
+    #[test]
+    fn a_fresh_shallow_chunk_prices_the_paged_tables() {
+        let rows = ScoreRows {
+            t: 128,
+            cand_max: 1_000,
+            heads: 4,
+            d: 128,
+        };
+        assert_eq!(fresh_score_bound(1_001, rows, 256), 1_024);
     }
 
     /// **A compaction pass moves buffers, never their contents.** Three caches

@@ -40,10 +40,10 @@ use candle::quantized::pinned_staging::{Generation, GpuBuf, PinnedBuf, PinnedSta
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     quantize_sealed_in_place, ArenaFormatTag, ChunkedKvBacking, CompressionPolicy, KvCache,
-    QuantFormat, CHUNK_SIZE, N_PALETTE,
+    PrefillKvStageLayout, PrefillLaunchBounds, QuantFormat, CHUNK_SIZE, N_PALETTE,
 };
 use candle_transformers::models::prefill_utils::{
-    paged_decode_attn, paged_prefill_batched, paged_prefill_kv_stage,
+    paged_decode_attn, paged_prefill_batched, paged_prefill_batched_bounded, paged_prefill_kv_stage,
 };
 use candle_transformers::models::qsa_selection::QsaSelection;
 use candle_transformers::models::qwen4exp::qsa_select::{entry_block, pack_entry, DENSE_ROW};
@@ -2194,13 +2194,45 @@ fn prefill_bits(
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Vec<f32>> {
+    prefill_bits_bounded(
+        g,
+        backing,
+        cache,
+        slot,
+        history,
+        q_len,
+        seed,
+        sel,
+        rope,
+        stager,
+        device,
+        PrefillLaunchBounds::PRODUCTION,
+    )
+}
+
+/// [`prefill_bits`] with the launch cut by `bounds`.
+#[allow(clippy::too_many_arguments)]
+fn prefill_bits_bounded(
+    g: Geom,
+    backing: &ChunkedKvBacking,
+    cache: &mut KvCache,
+    slot: usize,
+    history: usize,
+    q_len: usize,
+    seed: u64,
+    sel: Option<&QsaSelection>,
+    rope: &RopeRungs,
+    stager: &PinnedStager,
+    device: &Device,
+    bounds: PrefillLaunchBounds,
+) -> Result<Vec<f32>> {
     let (q, k, v) = make_qkv_at(g, history, q_len, seed, &[], device)?;
     backing.truncate_sequence_to_tokens(slot, history)?;
     backing.ensure_for_batch_entries(&[(slot, history)], q_len)?;
     let generation = stager.begin_generation();
     let out = {
         let mut caches_arr: [&mut KvCache; 1] = [cache];
-        paged_prefill_batched(
+        paged_prefill_batched_bounded(
             None,
             &mut caches_arr[..],
             &[history],
@@ -2218,6 +2250,7 @@ fn prefill_bits(
             &generation,
             &std::cell::RefCell::new(None),
             sel,
+            bounds,
         )?
     };
     let out = bits(&out.to_owned_tensor()?)?;
@@ -2260,6 +2293,59 @@ fn assert_golden(what: &str, out: &[f32], want: u64) {
     );
 }
 
+/// A cut forced onto a launch: `chunk` key positions per window, `group`
+/// query tokens per row group.
+fn cut(chunk: usize, group: usize) -> PrefillLaunchBounds {
+    PrefillLaunchBounds {
+        chunk_positions: chunk,
+        row_group_tokens: group,
+    }
+}
+
+/// `bounds` cuts a one-sequence launch of `q_len` rows after `history` into
+/// exactly `windows` key windows per row group, and carries exactly when the
+/// sequence is deeper than one window — so a golden re-taken under it
+/// exercises the cut it names rather than passing as one uncut launch.
+fn assert_cut(g: Geom, history: usize, q_len: usize, bounds: PrefillLaunchBounds, windows: &[u32]) {
+    let layout = PrefillKvStageLayout::new(
+        &[q_len],
+        &[history],
+        g.n_head,
+        g.n_kv_head,
+        g.head_dim,
+        bounds,
+    );
+    assert_eq!(
+        layout.group_chunks(&[q_len], &[history]),
+        windows,
+        "the windows {bounds:?} cuts {q_len} rows after {history} into"
+    );
+    assert_eq!(
+        layout.carry_tokens > 0,
+        history + q_len > bounds.chunk_positions,
+        "whether {bounds:?} carries"
+    );
+}
+
+/// The golden `want`, re-taken under each forced cut: a launch cut into row
+/// groups and key windows must answer the uncut launch's bits exactly.
+fn assert_golden_under_cuts(
+    what: &str,
+    g: Geom,
+    history: usize,
+    q_len: usize,
+    want: u64,
+    cuts: &[(PrefillLaunchBounds, &[u32])],
+    mut run: impl FnMut(PrefillLaunchBounds) -> Result<Vec<f32>>,
+) -> Result<()> {
+    for &(bounds, windows) in cuts {
+        assert_cut(g, history, q_len, bounds, windows);
+        let out = run(bounds)?;
+        assert_golden(&format!("{what}, cut {bounds:?}"), &out, want);
+    }
+    Ok(())
+}
+
 /// A prompt prefilled from position 0: 4,096 rows, every row dense, so every
 /// block walks the causal prefix tile by tile.
 #[test]
@@ -2273,11 +2359,31 @@ fn prefill_output_golden_prefix0_dense_4k() -> Result<()> {
     let stager = PinnedStager::new_from_device(&device);
     let rope = rope_of(g, &device)?;
     let (backing, mut cache) = empty_slot(g, Q_LEN, &device)?;
+    const GOLDEN: u64 = 0x84ed_1dd9_2712_32ed;
     let out = prefill_bits(
         g, &backing, &mut cache, 0, 0, Q_LEN, 0x6A01, None, &rope, &stager, &device,
     )?;
-    assert_golden("prefix 0, 4,096 dense rows", &out, 0x84ed_1dd9_2712_32ed);
-    Ok(())
+    assert_golden("prefix 0, 4,096 dense rows", &out, GOLDEN);
+    // Eight carrying groups whose horizons cross one to four windows; a cut
+    // under which nothing carries, which is one launch over the whole grid
+    // however small its row group; one group walked through eight windows.
+    assert_golden_under_cuts(
+        "prefix 0, 4,096 dense rows",
+        g,
+        0,
+        Q_LEN,
+        GOLDEN,
+        &[
+            (cut(1024, 512), &[1, 1, 2, 2, 3, 3, 4, 4]),
+            (cut(4096, 1024), &[1]),
+            (cut(512, 1 << 20), &[8]),
+        ],
+        |bounds| {
+            prefill_bits_bounded(
+                g, &backing, &mut cache, 0, 0, Q_LEN, 0x6A01, None, &rope, &stager, &device, bounds,
+            )
+        },
+    )
 }
 
 /// A prefix off the four-position grid, dense: the quad of columns that holds
@@ -2302,11 +2408,27 @@ fn prefill_output_golden_odd_prefix_dense() -> Result<()> {
         &stager,
         &device,
     )?;
+    const GOLDEN: u64 = 0xf8ee_6633_206b_04dc;
     let out = prefill_bits(
         g, &backing, &mut cache, 0, HISTORY, Q_LEN, 0x6A02, None, &rope, &stager, &device,
     )?;
-    assert_golden("history 1,002, 512 dense rows", &out, 0xf8ee_6633_206b_04dc);
-    Ok(())
+    assert_golden("history 1,002, 512 dense rows", &out, GOLDEN);
+    // Windows cut at 512 and 1,024 — the second just past the prefix's end,
+    // inside the quad the prefix shares with the chunk.
+    assert_golden_under_cuts(
+        "history 1,002, 512 dense rows",
+        g,
+        HISTORY,
+        Q_LEN,
+        GOLDEN,
+        &[(cut(512, 128), &[3, 3, 3, 3]), (cut(1024, 256), &[2, 2])],
+        |bounds| {
+            prefill_bits_bounded(
+                g, &backing, &mut cache, 0, HISTORY, Q_LEN, 0x6A02, None, &rope, &stager, &device,
+                bounds,
+            )
+        },
+    )
 }
 
 /// A 2,048-row chunk over 8K of history through the released budget.
@@ -2344,12 +2466,33 @@ fn prefill_output_golden_8k_selected() -> Result<()> {
         &stager,
         &device,
     )?;
-    assert_golden(
+    const GOLDEN: u64 = 0x47d0_50ae_5abe_eca8;
+    assert_golden("history 8K, 2,048 selected rows", &out, GOLDEN);
+    // Window ends cut through the rows' sparse selections.
+    assert_golden_under_cuts(
         "history 8K, 2,048 selected rows",
-        &out,
-        0x47d0_50ae_5abe_eca8,
-    );
-    Ok(())
+        g,
+        HISTORY,
+        Q_LEN,
+        GOLDEN,
+        &[(cut(1024, 512), &[9, 9, 10, 10]), (cut(4096, 2048), &[3])],
+        |bounds| {
+            prefill_bits_bounded(
+                g,
+                &backing,
+                &mut cache,
+                0,
+                HISTORY,
+                Q_LEN,
+                0x6A03,
+                Some(&sel),
+                &rope,
+                &stager,
+                &device,
+                bounds,
+            )
+        },
+    )
 }
 
 /// A 2,048-row chunk over 32K of history through the released budget.
@@ -2387,12 +2530,32 @@ fn prefill_output_golden_32k_selected() -> Result<()> {
         &stager,
         &device,
     )?;
-    assert_golden(
+    const GOLDEN: u64 = 0xd5f4_92f1_cf87_1eae;
+    assert_golden("history 32K, 2,048 selected rows", &out, GOLDEN);
+    assert_golden_under_cuts(
         "history 32K, 2,048 selected rows",
-        &out,
-        0xd5f4_92f1_cf87_1eae,
-    );
-    Ok(())
+        g,
+        HISTORY,
+        Q_LEN,
+        GOLDEN,
+        &[(cut(4096, 1024), &[9, 9])],
+        |bounds| {
+            prefill_bits_bounded(
+                g,
+                &backing,
+                &mut cache,
+                0,
+                HISTORY,
+                Q_LEN,
+                0x6A04,
+                Some(&sel),
+                &rope,
+                &stager,
+                &device,
+                bounds,
+            )
+        },
+    )
 }
 
 /// The 8K case over the history the session seals at depth: quant palettes,
@@ -2435,12 +2598,32 @@ fn prefill_output_golden_8k_sealed_selected() -> Result<()> {
         &stager,
         &device,
     )?;
-    assert_golden(
+    const GOLDEN: u64 = 0x8f28_b195_e505_1b95;
+    assert_golden("sealed history 8K, 2,048 selected rows", &out, GOLDEN);
+    assert_golden_under_cuts(
         "sealed history 8K, 2,048 selected rows",
-        &out,
-        0x8f28_b195_e505_1b95,
-    );
-    Ok(())
+        g,
+        HISTORY,
+        Q_LEN,
+        GOLDEN,
+        &[(cut(1024, 1024), &[9, 10])],
+        |bounds| {
+            prefill_bits_bounded(
+                g,
+                &backing,
+                &mut sealed,
+                1,
+                HISTORY,
+                Q_LEN,
+                0x6A05,
+                Some(&sel),
+                &rope,
+                &stager,
+                &device,
+                bounds,
+            )
+        },
+    )
 }
 
 /// A bulk chunk through a page layout whose pieces end in short blocks, so
@@ -2486,12 +2669,35 @@ fn prefill_output_golden_paged_bulk() -> Result<()> {
         &stager,
         &device,
     )?;
-    assert_golden(
+    const GOLDEN: u64 = 0xe6de_568c_7761_a93b;
+    assert_golden("paged history 2,044, 256 selected rows", &out, GOLDEN);
+    // Window ends through a page layout whose blocks sit off the quad grid:
+    // the walk resumes mid-page, and tiles straddling a window's end decode
+    // their far columns.
+    assert_golden_under_cuts(
         "paged history 2,044, 256 selected rows",
-        &out,
-        0xe6de_568c_7761_a93b,
-    );
-    Ok(())
+        g,
+        HISTORY,
+        Q_LEN,
+        GOLDEN,
+        &[(cut(512, 64), &[5, 5, 5, 5]), (cut(1024, 256), &[3])],
+        |bounds| {
+            prefill_bits_bounded(
+                g,
+                &backing,
+                &mut cache,
+                0,
+                HISTORY,
+                Q_LEN,
+                0x6A06,
+                Some(&sel),
+                &rope,
+                &stager,
+                &device,
+                bounds,
+            )
+        },
+    )
 }
 
 /// What a verify-window golden reads its history through.
@@ -2818,6 +3024,107 @@ fn ragged_bulk_launch_matches_single_launches() -> Result<()> {
                 joint[start..start + Q_LEN[s] * row_len] == alone[..],
                 "sequence {s} (selected: {selected}) answered differently in the ragged launch \
                  than alone"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// **A ragged launch cut into row groups and key windows answers the uncut
+/// launch bit for bit.**
+///
+/// Three sequences: a staged one deep enough to carry through seven windows,
+/// a staged one that fits the first window (its blocks finish there and sit
+/// out the rest), and one too short to stage, which runs whole in its group's
+/// first window. Every group but the first holds rows of only some of them.
+#[test]
+fn ragged_launch_under_cuts_matches_the_uncut_launch() -> Result<()> {
+    let _guard = gpu_serial();
+    let Some(device) = cuda_device() else {
+        return Ok(());
+    };
+    let g = FLASH_NEXT_HPG12;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    const HISTORY: [usize; 3] = [3000, 102, 2001];
+    const Q_LEN: [usize; 3] = [300, 260, 40];
+    const SEED: [u64; 3] = [0x6C01, 0x6C02, 0x6C03];
+    let blocks = MAX_BLOCKS.max((HISTORY[0] + Q_LEN[0]).div_ceil(CHUNK_SIZE) + 2);
+    let backing = ChunkedKvBacking::new(4, g.n_kv_head, g.head_dim, DType::BF16, &device, blocks)?;
+    let mut c0 = history_on_slot(g, &backing, 0, HISTORY[0], SEED[0], &rope, &stager, &device)?;
+    let mut c1 = history_on_slot(g, &backing, 1, HISTORY[1], SEED[1], &rope, &stager, &device)?;
+    let mut c2 = history_on_slot(g, &backing, 2, HISTORY[2], SEED[2], &rope, &stager, &device)?;
+    let parts = (0..3)
+        .map(|s| make_qkv_at(g, HISTORY[s], Q_LEN[s], SEED[s], &[], &device))
+        .collect::<Result<Vec<_>>>()?;
+    let q = Tensor::cat(&[&parts[0].0, &parts[1].0, &parts[2].0], 0)?;
+    let k = Tensor::cat(&[&parts[0].1, &parts[1].1, &parts[2].1], 0)?;
+    let v = Tensor::cat(&[&parts[0].2, &parts[1].2, &parts[2].2], 0)?;
+    let sel_rows: Vec<Vec<u32>> = (0..3)
+        .flat_map(|s| {
+            (0..Q_LEN[s]).map(move |t| budget_row(HISTORY[s] + t + 1, GOLDEN_TOP_K / 4, t & 1).0)
+        })
+        .collect();
+
+    // Seven windows in each of three groups; one to two-and-more in five.
+    let cuts: [(PrefillLaunchBounds, &[u32]); 2] = [
+        (cut(512, 128), &[7, 7, 7]),
+        (cut(1024, 64), &[3, 4, 4, 4, 4]),
+    ];
+    for (bounds, windows) in cuts {
+        let layout =
+            PrefillKvStageLayout::new(&Q_LEN, &HISTORY, g.n_head, g.n_kv_head, g.head_dim, bounds);
+        assert_eq!(layout.group_chunks(&Q_LEN, &HISTORY), windows, "{bounds:?}");
+        // Only the deep sequence carries.
+        assert_eq!(layout.carry_tokens, Q_LEN[0].min(layout.group_tokens()));
+    }
+
+    let mut launch =
+        |bounds: PrefillLaunchBounds, sel: Option<&QsaSelection>| -> Result<Vec<f32>> {
+            for (s, (&history, &q_len)) in HISTORY.iter().zip(&Q_LEN).enumerate() {
+                backing.truncate_sequence_to_tokens(s, history)?;
+                backing.ensure_for_batch_entries(&[(s, history)], q_len)?;
+            }
+            let generation = stager.begin_generation();
+            let mut caches_arr: [&mut KvCache; 3] = [&mut c0, &mut c1, &mut c2];
+            let out = paged_prefill_batched_bounded(
+                None,
+                &mut caches_arr[..],
+                &HISTORY,
+                &q,
+                &k,
+                &v,
+                3,
+                &Q_LEN,
+                g.n_head,
+                g.n_kv_head,
+                g.head_dim,
+                None,
+                &rope,
+                false,
+                &generation,
+                &std::cell::RefCell::new(None),
+                sel,
+                bounds,
+            )?;
+            bits(&out.to_owned_tensor()?)
+        };
+    for selected in [false, true] {
+        let sel = if selected {
+            Some(selection(&sel_rows, &device)?)
+        } else {
+            None
+        };
+        let uncut = launch(PrefillLaunchBounds::PRODUCTION, sel.as_ref())?;
+        assert!(uncut.iter().all(|x| x.is_finite()), "a non-finite output");
+        for (bounds, _) in cuts {
+            let got = launch(bounds, sel.as_ref())?;
+            assert!(
+                got == uncut,
+                "the ragged launch (selected: {selected}) cut by {bounds:?} answered \
+                 {:#018x}, the uncut launch {:#018x}",
+                fnv1a(&got),
+                fnv1a(&uncut)
             );
         }
     }

@@ -57,9 +57,23 @@
  *    long prefix) stage nothing: they touch too few positions to pay for
  *    staging every one.
  *
+ *  - A BOUNDED CUT (`PrefillCut`): the launcher runs the grid in ROW GROUPS
+ *    — contiguous ranges of grid-x blocks, every sequence of the batch — and
+ *    each row group in KEY CHUNKS: one key window per launch, staged ahead of
+ *    it, so the stage holds one window per staged sequence whatever the
+ *    depth. A block whose walk reaches the window's end stops at a TILE
+ *    boundary (never inside one: the V requant's scale is per tile), leaves
+ *    its FP32 online-softmax state and its walk bound in the carry, and the
+ *    next window's launch reloads both and re-walks from that bound — the
+ *    same tiles, the same arithmetic, in the same order, so the result is the
+ *    uncut launch's bit for bit. Columns of a tile past the window decode
+ *    from their source, which is the same bytes the stage would hold. A
+ *    sequence too short to stage runs whole in its group's first window.
+ *
  *  - FRESH TOKENS FROM THE INPUTS: the q_len new tokens are staged straight
  *    from the packed q/k/v tensors (never read back from the arena); the
- *    arena write of their K/V is an independent pre-pass (z == 0 only).
+ *    arena write of their K/V is an independent pre-pass (z == 0 of a row
+ *    group's first key window only).
  *
  * Quantization grid (independent of the arena's palette routing):
  *    Q:  int8 per (M-row, 32-dim window)   — natural dim order
@@ -174,6 +188,49 @@ __host__ __device__ constexpr int i8_smem_budget(int head_dim) {
 }
 
 // ============================================================================
+// The cut: which blocks a launch runs, and where a key chunk's state carries
+// ============================================================================
+
+/// One launch's place in the cut (see the header). The key window itself
+/// travels in `PrefillKvStage` (`chunk_lo`, `chunk_hi`), which the
+/// pre-staging pass and the attention kernel share.
+///
+/// `carry` holds one record `[o; HEAD_DIM] ++ [m, l]` (FP32) per (query token,
+/// head) of every staged sequence deeper than `chunk_positions`, up to one row
+/// group of tokens each; `resume` one `{bound, tile_ord}` per block of the
+/// same sequences' row group, per KV head. Both are packed in batch order over
+/// those sequences only, and written in full before they are read: a block
+/// reads them only in the launch after the one that left them.
+struct PrefillCut {
+    int blk_lo;          // first grid-x block of this launch's row group
+    int group_blocks;    // grid-x blocks per row group
+    int chunk_positions; // key positions per chunk: a deeper staged sequence carries
+    int last_chunk;      // nonzero on the row group's last key window
+    float* carry;
+    uint2* resume;
+};
+
+/// Where a carrying sequence's carry rows and resume entries start: the
+/// carrying sequences before `b`'s row-group tokens and blocks. Called only by
+/// blocks that carry, once on the way in and once on the way out.
+__device__ __forceinline__ void i8_carry_base(
+    const uint32_t* __restrict__ q_lens, const uint32_t* __restrict__ kv_lens,
+    int b, int min_q_len, const PrefillCut& cut, int block_m_tok,
+    int64_t& tok_base, int& blk_base)
+{
+    const int group_tok = cut.group_blocks * block_m_tok;
+    tok_base = 0;
+    blk_base = 0;
+    for (int i = 0; i < b; ++i) {
+        const int qi = (int)q_lens[i];
+        if (qi >= min_q_len && (int)kv_lens[i] > cut.chunk_positions) {
+            tok_base += min(qi, group_tok);
+            blk_base += min((qi + block_m_tok - 1) / block_m_tok, cut.group_blocks);
+        }
+    }
+}
+
+// ============================================================================
 // The kernel
 // ============================================================================
 
@@ -215,7 +272,8 @@ paged_prefill_int8_kernel(
     int num_splits,
     float* __restrict__ partials,
     QsaSel sel,
-    const PrefillKvStage stage
+    const PrefillKvStage stage,
+    const PrefillCut cut
 ) {
     static_assert(HEAD_DIM % 64 == 0 && HEAD_DIM >= 64 && HEAD_DIM <= 256,
                   "int8 prefill: HEAD_DIM must be a multiple of 64 in [64, 256]");
@@ -258,17 +316,44 @@ paged_prefill_int8_kernel(
     if (hpg > I8_M_ROWS) return; // unsupported (production hpg = 8)
     const int block_m_tok = I8_M_ROWS / hpg; // tokens covered per block
     const int rows_used = block_m_tok * hpg; // ≤ I8_M_ROWS; rows beyond are idle
-    const int t0 = (int)blockIdx.x * block_m_tok;
+    const int t0 = (cut.blk_lo + (int)blockIdx.x) * block_m_tok;
     if (t0 >= q_len) return;
     const int first_q_head = kv_head_idx * hpg;
 
+    // The block's causal horizon: no row it serves attends at or past this
+    // position. A dense row's walk would otherwise propose every position up
+    // to `kv_len` — in a prompt prefilled from zero, four tiles in five of a
+    // dense block's walk — each staged, multiplied and then masked to nothing.
+    // A tile is skipped only when its FIRST block starts past the horizon: a
+    // tile straddling it is kept whole, because the V requant's per-dim scale
+    // is taken over every column of the tile, masked or not, and cutting the
+    // tile short would move it.
+    const int blk_horizon = min(kv_len, prefix_len + min(t0 + block_m_tok, q_len));
+
     // Whether this block's sequence was pre-staged, and where its rows start
     // in each head's run of the stage. Block-uniform.
+    //
+    // A staged block attends this launch's key window: tiles whose first block
+    // starts in `[stage.chunk_lo, stage.chunk_hi)`, so it stops at the window's
+    // end exactly as at its horizon (`tile_stop`). It has nothing to do in a
+    // window that starts at or past its horizon — an earlier window finalised
+    // it. An unstaged block reads every column from its source and runs whole
+    // in its row group's first window.
     bool staged = false;
     int64_t stage_base = 0;
+    int tile_stop = blk_horizon;
     if constexpr (PRESTAGED) {
         staged = q_len >= stage.min_q_len;
-        if (staged) stage_base = kv_stage_seq_base(q_lens, kv_lens, batch_idx, stage.min_q_len);
+        if (staged) {
+            if (blk_horizon <= stage.chunk_lo) return;
+            // The last window reaches every block's horizon; a block that
+            // would carry past it would never be finalised.
+            if (cut.last_chunk && blk_horizon > stage.chunk_hi) __trap();
+            tile_stop = min(blk_horizon, stage.chunk_hi);
+            stage_base = kv_stage_seq_base(q_lens, kv_lens, batch_idx, stage);
+        } else if (stage.chunk_lo > 0) {
+            return;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -411,12 +496,15 @@ paged_prefill_int8_kernel(
     }
 
     // ------------------------------------------------------------------
-    // Arena write pre-pass (split 0 only): seal this block's fresh tokens
-    // into the writer chunks (unrotated K + Q-capture, straight from the
-    // packed inputs — identical semantics to the FP16 kernel's writeback,
-    // hoisted out of the tile loop). Writer chunks use the identity palette.
+    // Arena write pre-pass (split 0 of the row group's first key window only):
+    // seal this block's fresh tokens into the writer chunks (unrotated K +
+    // Q-capture, straight from the packed inputs — identical semantics to the
+    // FP16 kernel's writeback, hoisted out of the tile loop). Writer chunks
+    // use the identity palette.
     // ------------------------------------------------------------------
-    if (split_idx == 0) {
+    bool writes_arena = split_idx == 0;
+    if constexpr (PRESTAGED) writes_arena = writes_arena && stage.chunk_lo == 0;
+    if (writes_arena) {
         const int tok_end = min(t0 + block_m_tok, q_len);
         for (int tok = t0; tok < tok_end; ++tok) {
             int w_slice, w_in_blk;
@@ -547,15 +635,44 @@ paged_prefill_int8_kernel(
     // Visited-tile ordinal, for split-KV round-robin; under `dealt_seek`, the
     // ordinal of this shard's next tile.
     int tile_ord = dealt_seek ? split_idx : 0;
-    // The block's causal horizon: no row it serves attends at or past this
-    // position. A dense row's walk would otherwise propose every position up
-    // to `kv_len` — in a prompt prefilled from zero, four tiles in five of a
-    // dense block's walk — each staged, multiplied and then masked to nothing.
-    // A tile is skipped only when its FIRST block starts past the horizon: a
-    // tile straddling it is kept whole, because the V requant's per-dim scale
-    // is taken over every column of the tile, masked or not, and cutting the
-    // tile short would move it.
-    const int blk_horizon = min(kv_len, prefix_len + min(t0 + block_m_tok, q_len));
+
+    // A staged block past its first key window resumes where the previous
+    // window's launch left it: the softmax state, exact, and the walk's bound
+    // — the bound the stopping tile's walk began from, so the first tile here
+    // is packed from the same blocks it would have been. A sparse walk seeks
+    // its cursors to that bound, which is where consuming every entry below
+    // it one step at a time would have left them; a dense walk steps from the
+    // bound whatever came before. Only live rows carry: a dead row's slot
+    // would alias another sequence's rows.
+    if constexpr (PRESTAGED) {
+        if (stage.chunk_lo > 0) {
+            int64_t tok_base;
+            int blk_base;
+            i8_carry_base(q_lens, kv_lens, batch_idx, stage.min_q_len, cut, block_m_tok,
+                          tok_base, blk_base);
+            const uint2 at = cut.resume[(int64_t)(blk_base + (int)blockIdx.x) * n_kv_head + kv_head_idx];
+            bound = (int)at.x;
+            tile_ord = (int)at.y;
+            if (qsa_active(sel)) walk.seek(bound);
+            constexpr int REC = HEAD_DIM + 2; // [o[HD], m, l]
+            const int group_t0 = cut.blk_lo * block_m_tok;
+            #pragma unroll
+            for (int row = 0; row < 2; ++row) {
+                if (!row_live(row)) continue;
+                const float* rec = cut.carry
+                    + ((tok_base + row_tok(row) - group_t0) * n_head + row_head(row)) * REC;
+                #pragma unroll
+                for (int s = 0; s < PV_H; ++s) {
+                    const int dim = dim_base + s * 8 + n0;
+                    o_acc[s][row * 2] = rec[dim];
+                    o_acc[s][row * 2 + 1] = rec[dim + 1];
+                }
+                m_run[row] = rec[HEAD_DIM];
+                l_run[row] = rec[HEAD_DIM + 1];
+            }
+        }
+    }
+
     for (;;) {
         if (dealt_seek) bound = tile_ord * I8_TILE_TOK;
         // ---- WALK (every warp, identical): the tile's blocks ----
@@ -571,7 +688,9 @@ paged_prefill_int8_kernel(
             uint32_t mk[WALK_ROWS];
             int step_end;
             const int q = walk.next(bound, mk, step_end);
-            if (q >= kv_len || q >= split_end || (b == 0 && q >= blk_horizon)) break;
+            // A tile stops at the horizon or the key window's end by its FIRST
+            // block only, and leaves `bound` where this step began.
+            if (q >= kv_len || q >= split_end || (b == 0 && q >= tile_stop)) break;
             #pragma unroll
             for (int h = 0; h < WALK_ROWS; ++h) rm[h] |= mk[h] << (b * QB);
             if (b == my_blk) my_q = q;
@@ -599,7 +718,11 @@ paged_prefill_int8_kernel(
         const int pos0 = (my_q == QSA_WALK_END) ? kv_len : my_q + my_to;
         const int j0 = warp * I8_COLS_PER_WARP;
         bool from_stage = false;
-        if constexpr (PRESTAGED) from_stage = staged && (pos0 & 3) == 0; // warp-uniform
+        // Warp-uniform. The window's ends are multiples of 32, so an aligned
+        // quad that starts inside the window lies wholly inside it.
+        if constexpr (PRESTAGED)
+            from_stage = staged && (pos0 & 3) == 0 && pos0 >= stage.chunk_lo
+                      && pos0 < stage.chunk_hi;
         if (from_stage) {
             // The staged quad at pos0 — what `i8_stage_quad` below would
             // write for these four positions, copied in 16-byte pieces. A
@@ -609,7 +732,8 @@ paged_prefill_int8_kernel(
             constexpr int V_CHUNKS = HEAD_DIM * 2 / 16; // … of an FP16 V row
             constexpr int S_BYTES = N_WIN * 2;          // a K row's window scales
             const int live = kv_len - pos0;             // columns inside the sequence
-            const int64_t row0 = (int64_t)kv_head_idx * stage.positions + stage_base + pos0;
+            const int64_t row0 =
+                (int64_t)kv_head_idx * stage.positions + stage_base + (pos0 - stage.chunk_lo);
             const int8_t* kc = kv_stage_k<HEAD_DIM>(stage, n_kv_head) + row0 * HEAD_DIM;
             const __half* ks = kv_stage_k_scale<HEAD_DIM>(stage, n_kv_head) + row0 * N_WIN;
             const __half* vv = kv_stage_v<HEAD_DIM>(stage, n_kv_head) + row0 * HEAD_DIM;
@@ -870,6 +994,45 @@ paged_prefill_int8_kernel(
     }
 
     // ------------------------------------------------------------------
+    // A staged block whose horizon lies past this key window carries: its
+    // un-normalized state and the bound its walk stopped at go to the carry
+    // for the next window's launch, and nothing is written to `out`. The
+    // records are [o[HD], m, l] like the split partials; every warp of a
+    // row-tile group holds identical m/l (duplicated QK), so the dim_part==0
+    // warp's quad leader writes them.
+    // ------------------------------------------------------------------
+    if constexpr (PRESTAGED) {
+        if (staged && min(kv_len, prefix_len + min(t0 + block_m_tok, q_len)) > stage.chunk_hi) {
+            int64_t tok_base;
+            int blk_base;
+            i8_carry_base(q_lens, kv_lens, batch_idx, stage.min_q_len, cut, block_m_tok,
+                          tok_base, blk_base);
+            if (tid == 0)
+                cut.resume[(int64_t)(blk_base + (int)blockIdx.x) * n_kv_head + kv_head_idx] =
+                    make_uint2((uint32_t)bound, (uint32_t)tile_ord);
+            constexpr int REC = HEAD_DIM + 2;
+            const int group_t0 = cut.blk_lo * block_m_tok;
+            #pragma unroll
+            for (int row = 0; row < 2; ++row) {
+                if (!row_live(row)) continue;
+                float* rec = cut.carry
+                    + ((tok_base + row_tok(row) - group_t0) * n_head + row_head(row)) * REC;
+                #pragma unroll
+                for (int s = 0; s < PV_H; ++s) {
+                    const int dim = dim_base + s * 8 + n0;
+                    rec[dim] = o_acc[s][row * 2];
+                    rec[dim + 1] = o_acc[s][row * 2 + 1];
+                }
+                if (dim_part == 0 && (lane & 3) == 0) {
+                    rec[HEAD_DIM] = m_run[row];
+                    rec[HEAD_DIM + 1] = l_run[row];
+                }
+            }
+            return;
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Epilogue. num_splits == 1: normalize and store O directly (natural
     // dims — no permute needed). Otherwise: emit the un-normalized
     // (ΣpV, m, l) partial for this shard; the combine kernel merges.
@@ -1005,10 +1168,21 @@ inline void launch_paged_prefill_int8(
     // The pre-staged K/V (`kv_stage.cuh`): `stage.buf == nullptr` stages
     // nothing and every column is read from its source; otherwise every
     // sequence with `q_len >= stage.min_q_len` is staged into `stage.buf`
-    // (`stage_bytes` long) ahead of the kernel, `stage_max_kv` the deepest.
+    // (`stage_bytes` long) ahead of each launch, one key window at a time,
+    // `stage_max_kv` the deepest. The window fields are set per launch here.
     const PrefillKvStage stage,
     int64_t stage_bytes,
-    int32_t stage_max_kv
+    int32_t stage_max_kv,
+    // The cut (see the header): `n_groups` row groups of `group_blocks`
+    // grid-x blocks, group g running `group_chunks[g]` key windows of
+    // `chunk_positions` (a HOST array); `carry` / `resume` as `PrefillCut`
+    // describes them, unused when no group runs more than one window.
+    const uint32_t* group_chunks,
+    int32_t n_groups,
+    int32_t group_blocks,
+    int32_t chunk_positions,
+    float* carry,
+    uint2* resume
 ) {
     // The tile packs 32 / ratio selection blocks, so the ratio must divide
     // the tile. A selection built at any other ratio is a host bug, not a
@@ -1024,6 +1198,26 @@ inline void launch_paged_prefill_int8(
     if (block_m_tok <= 0) block_m_tok = 1;
     uint32_t grid_x = (uint32_t)((max_q_len + block_m_tok - 1) / block_m_tok);
     if (grid_x == 0) grid_x = 1;
+
+    // The cut is the host's plan (`PrefillKvStageLayout`); one that does not
+    // tile this grid, chunks a launch with no stage, or carries with nowhere
+    // to carry to is a host bug — refuse it rather than leave rows unwritten.
+    bool chunked = false;
+    if (group_chunks != nullptr && group_blocks > 0) {
+        for (int g = 0; g < n_groups; ++g) chunked = chunked || group_chunks[g] > 1u;
+    }
+    if (group_chunks == nullptr || group_blocks <= 0
+        || (int64_t)n_groups * group_blocks < (int64_t)grid_x
+        || (int64_t)(n_groups - 1) * group_blocks >= (int64_t)grid_x
+        || chunk_positions <= 0 || chunk_positions % I8_TILE_TOK != 0
+        || (chunked && (stage.buf == nullptr || carry == nullptr || resume == nullptr))) {
+        fprintf(stderr,
+                "PAGED PREFILL INT8: a cut of %d groups × %d blocks (chunks %d positions, "
+                "chunked %d, stage %p, carry %p, resume %p) for a grid of %u blocks\n",
+                n_groups, group_blocks, chunk_positions, (int)chunked, (void*)stage.buf,
+                (void*)carry, (void*)resume, grid_x);
+        abort();
+    }
 
     // Split-KV factor: fan the tile walk across grid.z shards up to this
     // head dim's residency limit. The short-q/long-prefix regime otherwise
@@ -1050,6 +1244,12 @@ inline void launch_paged_prefill_int8(
         if (num_splits < 1) num_splits = 1;
         if (num_splits > I8_MAX_SPLITS) num_splits = I8_MAX_SPLITS;
     }
+    // Decided over the WHOLE grid, so a row group of an unchunked launch keeps
+    // the split the uncut launch would have had — and with it the same bits.
+    // A launch that carries runs unsplit: the carry holds one softmax state
+    // per row, and a split's shards each hold a partial one that only the
+    // combine can merge.
+    if (chunked) num_splits = 1;
 
     // Persistent grow-on-demand partial pool (same idiom as the decode
     // split-KV pool: single-stream, grown with `grow_scratch`, which is safe
@@ -1066,7 +1266,6 @@ inline void launch_paged_prefill_int8(
         if (partials == nullptr) num_splits = 1; // OOM fallback: direct store
     }
 
-    dim3 grid(grid_x, (uint32_t)n_kv_head, (uint32_t)(batch_size * num_splits));
     dim3 block(I8_THREADS, 1, 1);
 
     // Clear any error left sticky on this thread by a PRIOR launch so the
@@ -1075,26 +1274,45 @@ inline void launch_paged_prefill_int8(
     // launch config is valid and its output correct.
     (void)cudaGetLastError();
 
-    if (stage.buf != nullptr) {
-        launch_paged_prefill_kv_prestage<QT, HEAD_DIM>(
-            k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
-            batch_size, n_kv_head, stage_max_kv, rungs, rope_interleaved,
-            stage, stage_bytes, stream);
-        paged_prefill_int8_kernel<QT, HEAD_DIM, true><<<grid, block, 0, stream>>>(
-            (const QT*)q_ptr, (const QT*)k_ptr, (const QT*)v_ptr,
-            headers_ptr, cu_seqlens_q, q_lens, kv_lens,
-            (QT*)o_ptr, (int)batch_size, (int)n_head, (int)n_kv_head,
-            softmax_scale, rungs, (int)rope_interleaved,
-            num_splits, partials, sel, stage);
-    } else {
-        paged_prefill_int8_kernel<QT, HEAD_DIM, false><<<grid, block, 0, stream>>>(
-            (const QT*)q_ptr, (const QT*)k_ptr, (const QT*)v_ptr,
-            headers_ptr, cu_seqlens_q, q_lens, kv_lens,
-            (QT*)o_ptr, (int)batch_size, (int)n_head, (int)n_kv_head,
-            softmax_scale, rungs, (int)rope_interleaved,
-            num_splits, partials, sel, stage);
+    // Row groups outer, key windows inner, all on one stream: a window's
+    // pre-staging overwrites the stage only after the previous window's
+    // attention has read it, and a window's launch reads the carry the
+    // previous one left. Each group's blocks are a slice of the whole grid.
+    dim3 grid(grid_x, (uint32_t)n_kv_head, (uint32_t)(batch_size * num_splits));
+    for (int g = 0; g < n_groups; ++g) {
+        const int blk_lo = g * group_blocks;
+        grid.x = (uint32_t)min(group_blocks, (int)grid_x - blk_lo);
+        const int chunks = (int)group_chunks[g];
+        for (int k = 0; k < chunks; ++k) {
+            const PrefillCut cut{blk_lo, group_blocks, chunk_positions, (int)(k + 1 == chunks),
+                                 carry, resume};
+            PrefillKvStage window = stage;
+            window.chunk_lo = k * chunk_positions;
+            window.chunk_hi = (k + 1) * chunk_positions;
+            window.tok_lo = blk_lo * block_m_tok;
+            if (stage.buf != nullptr) {
+                launch_paged_prefill_kv_prestage<QT, HEAD_DIM>(
+                    k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
+                    batch_size, n_kv_head, stage_max_kv, rungs, rope_interleaved,
+                    window, stage_bytes, stream);
+                paged_prefill_int8_kernel<QT, HEAD_DIM, true><<<grid, block, 0, stream>>>(
+                    (const QT*)q_ptr, (const QT*)k_ptr, (const QT*)v_ptr,
+                    headers_ptr, cu_seqlens_q, q_lens, kv_lens,
+                    (QT*)o_ptr, (int)batch_size, (int)n_head, (int)n_kv_head,
+                    softmax_scale, rungs, (int)rope_interleaved,
+                    num_splits, partials, sel, window, cut);
+            } else {
+                paged_prefill_int8_kernel<QT, HEAD_DIM, false><<<grid, block, 0, stream>>>(
+                    (const QT*)q_ptr, (const QT*)k_ptr, (const QT*)v_ptr,
+                    headers_ptr, cu_seqlens_q, q_lens, kv_lens,
+                    (QT*)o_ptr, (int)batch_size, (int)n_head, (int)n_kv_head,
+                    softmax_scale, rungs, (int)rope_interleaved,
+                    num_splits, partials, sel, window, cut);
+            }
+        }
     }
 
+    // One combine over every row: the groups' partial rows are disjoint.
     if (num_splits > 1) {
         int64_t total_rows = (int64_t)total_q * n_head;
         dim3 cgrid((uint32_t)total_rows);

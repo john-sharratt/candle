@@ -35,9 +35,9 @@ use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
     arena_regions, begin_forward, begin_wave, end_wave_transient, ffn_work_dtype,
-    plan_wave_transient, prefill_kv_stage_positions, region_stats, DeltaNetWidths, HyperWidths,
-    KvCache, LayerPhase, ModelGeometry, SharedExpertWidths, SlotTenant, SpanRegion, WavePlan,
-    WaveWidth, REGION_BYTES, WAVE_SPAN_BYTES,
+    plan_wave_transient, region_stats, DeltaNetWidths, HyperWidths, KvCache, LayerPhase,
+    ModelGeometry, PrefillKvStageLayout, PrefillLaunchBounds, SharedExpertWidths, SlotTenant,
+    SpanRegion, WavePlan, WaveWidth, REGION_BYTES, WAVE_SPAN_BYTES,
 };
 
 use super::kv_row::kv_factors_for;
@@ -1658,6 +1658,38 @@ impl Qwen4ExpBatched {
             .index
             .read()
             .map_err(|_| candle::Error::Msg("index lock poisoned".into()))?;
+        self.qsa_bytes_over(&spans, offsets, &idx, layer_start, layer_end)
+    }
+
+    /// [`Self::wave_qsa_bytes`] for sequences that have not run yet — prefills of
+    /// `q_lens[i]` rows from `offsets[i]` against fresh contiguous indexes, over
+    /// the whole stack. What a turn's admission prices its chunks' tiers with,
+    /// through the same `select_layer_bytes` the wave itself carves by (a sequence
+    /// with no cache is priced there as one live tail from position zero).
+    fn fresh_qsa_bytes(&self, q_lens: &[usize], offsets: &[usize]) -> Result<usize> {
+        // Ids no live sequence holds: slot ids are small indices.
+        let seqs: Vec<usize> = (0..q_lens.len()).map(|i| usize::MAX - i).collect();
+        let spans = seq_spans(&seqs, q_lens)?;
+        self.qsa_bytes_over(
+            &spans,
+            offsets,
+            &HashMap::new(),
+            0,
+            self.model.cfg.num_layers,
+        )
+    }
+
+    /// The widest selection carve any KV layer of `[layer_start, layer_end)` makes
+    /// over `spans`, given the sequences' caches in `idx` — the draft head's layer
+    /// included when the range reaches the head.
+    fn qsa_bytes_over(
+        &self,
+        spans: &[SeqSpan],
+        offsets: &[usize],
+        idx: &HashMap<usize, Vec<IndexCache>>,
+        layer_start: usize,
+        layer_end: usize,
+    ) -> Result<usize> {
         let cfg = &self.model.cfg;
         let mut worst = 0usize;
         let mut kv = 0usize;
@@ -1667,9 +1699,9 @@ impl Qwen4ExpBatched {
                     worst = worst.max(select_layer_bytes(
                         kv,
                         *compress_ratio,
-                        &spans,
+                        spans,
                         offsets,
-                        &idx,
+                        idx,
                         &cfg.indexer,
                     )?);
                 }
@@ -1682,9 +1714,9 @@ impl Qwen4ExpBatched {
                     worst = worst.max(select_layer_bytes(
                         kv,
                         *compress_ratio,
-                        &spans,
+                        spans,
                         offsets,
-                        &idx,
+                        idx,
                         &cfg.indexer,
                     )?);
                 }
@@ -1824,6 +1856,55 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             // The multi-stream head is the one `HyperWidths` states.
             mtp_head: false,
         }
+    }
+
+    /// The generic pricing plus **the sparse selection's carve**, the one term
+    /// of this model's tier that follows context depth past the pre-stage's
+    /// key-chunk bound: the score buffer and the scoring products are as wide
+    /// as the candidate blocks the deepest row can see. Left to the generic
+    /// pricing it is zero, and admission priced a 128K turn's deepest chunk at
+    /// the tier of its first.
+    ///
+    /// Priced through the same `select_layer_bytes` the wave places its tier
+    /// by, over fresh contiguous indexes ([`Self::fresh_qsa_bytes`]) — the shape
+    /// a sequence prefilling its whole prompt has. With no chunk list the rows
+    /// are priced as one chunk from position zero.
+    fn wave_tier_bytes(
+        &self,
+        rows: usize,
+        sequences: usize,
+        stage_q_lens: &[usize],
+        stage_offsets: &[usize],
+        act_dtype: DType,
+    ) -> Option<u64> {
+        let geometry = self.wave_geometry(act_dtype);
+        let (q_lens, offsets) = if stage_q_lens.is_empty() {
+            (vec![rows], vec![0])
+        } else {
+            (stage_q_lens.to_vec(), stage_offsets.to_vec())
+        };
+        let qsa_bytes = match self.fresh_qsa_bytes(&q_lens, &offsets) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // The wave this would price refuses by the same error at
+                // placement; admission says why it charged no tier.
+                tracing::warn!(error = %e, rows, "qwen4exp: selection carve unpriceable");
+                return None;
+            }
+        };
+        let width = WaveWidth {
+            kv_stage: PrefillKvStageLayout::new(
+                stage_q_lens,
+                stage_offsets,
+                geometry.n_head,
+                geometry.n_kv_head,
+                geometry.head_dim,
+                PrefillLaunchBounds::PRODUCTION,
+            ),
+            qsa_bytes,
+            ..WaveWidth::prefill(rows, sequences.max(1))
+        };
+        Some(WavePlan::new(geometry).tier_bytes(width) as u64)
     }
 
     /// The widest prefill **this card** can place: the rows whose whole tier —
@@ -2375,6 +2456,23 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         self.model.experts.reset_expert_stats();
     }
 
+    /// Buy `regions` of expert-zone ground for the KV side, between forwards — the
+    /// scheduler's half of the boundary. See `ExpertCache::request_kv_ground`.
+    fn request_kv_ground(&self, regions: usize) -> u64 {
+        self.model.experts.request_kv_ground(regions)
+    }
+
+    /// Let the expert zone take back KV ground standing free, between forwards.
+    ///
+    /// The wave asks this at the head of every forward, but a scheduler that has
+    /// just packed the pools or watched a turn leave the device has to be able to
+    /// ask too: left to the next forward, the question lands in a prefill that is
+    /// buying ground and is refused, so the zone stayed down at its 128K low from
+    /// one Strata run to the next — 24,914 → 23,430 → 21,953 slots.
+    fn reclaim_spare_ground(&self) {
+        self.model.experts.reclaim_spare_ground();
+    }
+
     /// The expert pipeline thread's spans — where its time goes serving each
     /// routed layer, which decides how far behind the GPU it runs.
     fn snapshot_profiles(&self) -> ProfileSnapshot {
@@ -2628,7 +2726,8 @@ impl WaveSweep for Qwen4ExpBatched {
         #[cfg(feature = "cuda")]
         if total_rows > 0 {
             if let Device::Cuda(d) = &m.device {
-                let plan = WavePlan::new(self.wave_geometry(tier_act_dtype));
+                let geometry = self.wave_geometry(tier_act_dtype);
+                let plan = WavePlan::new(geometry);
                 // The wave's composition, not just its row count: the chains
                 // price a prefill row, a decode row and a scored row
                 // differently, and the Gated Residual's streams are carried by
@@ -2702,9 +2801,16 @@ impl WaveSweep for Qwen4ExpBatched {
                         layer_start,
                         layer_end,
                     )?,
-                    // The prefill launch's pre-staged K/V: every position of
-                    // each bulk chunk's sequence.
-                    kv_stage_positions: prefill_kv_stage_positions(pre_q, pre_off),
+                    // The prefill launch's carve: up to one key chunk of each
+                    // bulk chunk's sequence, and the carry beside it.
+                    kv_stage: PrefillKvStageLayout::new(
+                        pre_q,
+                        pre_off,
+                        geometry.n_head,
+                        geometry.n_kv_head,
+                        geometry.head_dim,
+                        PrefillLaunchBounds::PRODUCTION,
+                    ),
                 };
                 let per_phase = [
                     plan.phase_bytes(LayerPhase::Attention, width),

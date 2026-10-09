@@ -16,6 +16,10 @@
 //! 3. **Did the weight side take what the KV side released?** Lowering the frontier only
 //!    makes it *possible* for `weight_floor` to move left; something has to move it.
 //!
+//! Beside the probe sits [`run_strata`]: Strata's single-session benchmark delivered
+//! through the same engine, so the forward bench's ceiling has a delivered row to be
+//! read against.
+//!
 //! # Adding a model
 //!
 //! Add a [`ModelProfile`] row to [`profile::profiles`] and a test case naming it.
@@ -36,8 +40,10 @@ mod grow_window;
 mod probe;
 mod profile;
 mod run;
+mod strata;
 
 pub use batch::{run_story_batch, BatchTiming, SessionClock, StoryBatch};
 pub use probe::{BaselineRow, Probe, ProbeOutcome};
 pub use profile::{names, profile, profiles, ModelProfile, StoryGate};
 pub use run::{run, run_baseline, run_on_model};
+pub use strata::{run_strata, StrataRun};

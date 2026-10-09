@@ -34,34 +34,24 @@ pub(crate) struct SparseCounts {
 }
 
 impl SparseCounts {
-    /// Gather each row's nonzero entries, rows in dispatch order.
-    ///
-    /// A row is `None` when its penalties are off for this dispatch (a row
-    /// writing a tool call), which leaves its table row reading zero. Otherwise
-    /// it is the tokens that may hold a nonzero count and the dense counts they
-    /// index; a listed token whose count is zero contributes nothing.
-    pub fn gather<'a>(
-        vocab: usize,
-        rows: impl IntoIterator<Item = Option<(&'a [u32], &'a [i32])>>,
-    ) -> Self {
-        let mut out = Self::default();
-        for (r, row) in rows.into_iter().enumerate() {
-            let Some((tokens, counts)) = row else {
-                continue;
-            };
-            for &t in tokens {
-                debug_assert!(
-                    (t as usize) < vocab,
-                    "token {t} is outside the {vocab}-entry vocabulary"
-                );
-                let c = counts[t as usize];
-                if c > 0 {
-                    out.offsets.push((r * vocab) as u32 + t);
-                    out.values.push(c as u32);
-                }
+    /// Append row `r`'s nonzero entries: the tokens that may hold a nonzero
+    /// count, and the dense counts they index; a listed token whose count is
+    /// zero contributes nothing. A row whose penalties are off for the
+    /// dispatch (a row writing a tool call) is simply not pushed, which leaves
+    /// its table row reading zero. A row is read when it is pushed, so a caller
+    /// can read one state at several points in its history, a row each.
+    pub fn push_row(&mut self, vocab: usize, r: usize, tokens: &[u32], counts: &[i32]) {
+        for &t in tokens {
+            debug_assert!(
+                (t as usize) < vocab,
+                "token {t} is outside the {vocab}-entry vocabulary"
+            );
+            let c = counts[t as usize];
+            if c > 0 {
+                self.offsets.push((r * vocab) as u32 + t);
+                self.values.push(c as u32);
             }
         }
-        out
     }
 
     /// The offsets followed by the values, as the one buffer a dispatch uploads.
@@ -322,13 +312,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gather_flattens_each_rows_nonzero_entries_and_skips_switched_off_rows() {
+    fn pushed_rows_flatten_their_nonzero_entries_and_an_unpushed_row_reads_zero() {
         let row0 = [0, 3, 0, 1, 0];
         let row2 = [2, 0, 0, 0, 7];
-        let rows: [Option<(&[u32], &[i32])>; 3] =
-            [Some((&[3, 1], &row0)), None, Some((&[4, 0, 2], &row2))];
-        let got = SparseCounts::gather(5, rows);
-        // Row 1 is off; row 2 lists token 2, whose count is zero.
+        let mut got = SparseCounts::default();
+        got.push_row(5, 0, &[3, 1], &row0);
+        // Row 1 is off and pushes nothing; row 2 lists token 2, whose count is
+        // zero.
+        got.push_row(5, 2, &[4, 0, 2], &row2);
         assert_eq!(
             got,
             SparseCounts {

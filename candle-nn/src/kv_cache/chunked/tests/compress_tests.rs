@@ -484,6 +484,101 @@ fn migrate_layers_batched_matches_per_layer_bytes() {
     );
 }
 
+/// The same A/B with the staging span shrunk to three chunk-sides (one chunk's K or
+/// V, every band of it) — half of what each three-chunk layer holds — so the groups
+/// split mid-layer and straddle layer boundaries: the shape of a 128K turn's migrate
+/// against the 64 MiB span. Each layer's warm bytes must still be the per-layer
+/// path's, bit for bit.
+#[test]
+fn migrate_layers_split_below_a_layer_matches_per_layer_bytes() {
+    let Some((device, _gpu)) = cuda_device_or_skip() else {
+        return;
+    };
+    let policy = CompressionPolicy::new(5);
+    let copy_stream = cuda_stream(&device);
+    let n_layers = 3usize;
+    let n_tokens = 96usize; // 3 full chunks
+
+    let mut backings: Vec<ChunkedKvBacking> = Vec::new();
+    let mut gpu_seqs: Vec<SealedSequence> = Vec::new();
+    for layer in 0..n_layers {
+        let backing = cuda_backing_with_policy(&device, &policy);
+        let src = seed_f16_sealed(&backing, &device, n_tokens, (layer as u32 + 7) * 300);
+        let mut pinned: Option<PinnedBuf> = None;
+        let warm = quantize_sealed_in_place(
+            &backing,
+            &[&src],
+            &policy,
+            &device,
+            &copy_stream,
+            &mut pinned,
+        )
+        .expect("quantize");
+        gpu_seqs.push(warm.into_iter().next().expect("one sequence"));
+        backings.push(backing);
+    }
+
+    let read_bytes =
+        |backing: &ChunkedKvBacking, seq: &SealedSequence| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let n = seq.chunks.len();
+            let slot = backing.alloc_sequence().unwrap();
+            backing.inject_sealed_at_tail(slot, seq).expect("inject");
+            (0..n)
+                .map(|blk| backing.read_raw_sealed_chunk(slot, blk).expect("read raw"))
+                .collect()
+        };
+    let warm_to_bytes =
+        |backing: &ChunkedKvBacking, warm: &SealedSequence| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let mut pin: Option<PinnedBuf> = None;
+            let round = backing
+                .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pin, &[warm])
+                .expect("elevate warm → gpu");
+            device.synchronize().unwrap();
+            read_bytes(backing, &round[0])
+        };
+
+    let bytes_a: Vec<_> = (0..n_layers)
+        .map(|l| {
+            let mut pin: Option<PinnedBuf> = None;
+            let warm = backings[l]
+                .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pin, &[&gpu_seqs[l]])
+                .expect("per-layer migrate");
+            device.synchronize().unwrap();
+            warm_to_bytes(&backings[l], &warm[0])
+        })
+        .collect();
+
+    // Three chunk-sides against a layer of six: no group can take a whole layer.
+    let widest_side = bytes_a
+        .iter()
+        .flatten()
+        .map(|(k, v)| k.len().max(v.len()))
+        .max()
+        .expect("chunks to copy");
+    let backing_refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
+    let per_layer_refs: Vec<Vec<&SealedSequence>> = gpu_seqs.iter().map(|s| vec![s]).collect();
+    let mut pinned: Option<PinnedBuf> = None;
+    let warm_b = ChunkedKvBacking::migrate_sealed_layers_to_cpu_batch_in(
+        &backing_refs,
+        &device,
+        &copy_stream,
+        &mut pinned,
+        &per_layer_refs,
+        3 * widest_side,
+    )
+    .expect("batched cross-layer migrate, split below a layer");
+    device.synchronize().unwrap();
+    let bytes_b: Vec<_> = (0..n_layers)
+        .map(|l| warm_to_bytes(&backings[l], &warm_b[l][0]))
+        .collect();
+
+    assert_eq!(
+        bytes_a, bytes_b,
+        "a migrate staged below a layer's width produced different warm bytes than the \
+         per-layer path"
+    );
+}
+
 /// An empty input list is a clean no-op.
 #[test]
 fn quantize_to_cpu_empty_input_is_noop() {

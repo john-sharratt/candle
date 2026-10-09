@@ -46,6 +46,8 @@
 //! four warps give one wave — or whose fold slots (one per K tile past the first warp's range)
 //! would not fit [`NARROW_SMEM_CAP`] — stays split-K.
 
+use super::GgmlDType;
+
 /// The mode-1 token tile the split kernel shares.
 const M_TILE: usize = 16;
 /// The output tile: rows per block.
@@ -182,17 +184,39 @@ pub fn narrow_warps(n: usize, k: usize, sm_count: usize) -> Option<usize> {
     })
 }
 
+/// Warps of a narrow launch whose blocks cannot all be resident in one wave, for the weight
+/// formats that run narrow there ([`narrow_past_one_wave`]).
+///
+/// Measured with `bench_narrow_against_split_on_decode_projections` (RTX PRO 5000, 110 SMs,
+/// weights rotated past the L2) on the 4,096- and 6,144-wide projections at one, five and
+/// eight rows: six warps beat split-K in every cell for Q4_KO, Q5_KO and Q6_KO — Q6 `o`
+/// 14.1 against 16.6 µs, `qkv` 20.0 against 24.1, `down` 43.0 against 48.9 at one row — and
+/// no count is the best everywhere, while six is never more than 10% off the best.
+pub const NARROW_MULTI_WAVE_WARPS: usize = 6;
+
+/// Whether a narrow launch beats split-K for `weight` even when its blocks take more than one
+/// wave. The sub-8-bit affine twins it was measured on do; Q8_KO ties or loses there (`o`
+/// 17.5 against 16.6 µs), and the other formats are unmeasured, so both keep split-K.
+fn narrow_past_one_wave(weight: GgmlDType) -> bool {
+    matches!(
+        weight,
+        GgmlDType::Q4_KO | GgmlDType::Q5_KO | GgmlDType::Q6_KO
+    )
+}
+
 /// How the dense int8 matmul of `[m, k] × [n, k]ᵀ` launches on `sm_count` SMs. `per_tile`
 /// is whether the weight format folds one K tile at a time (every affine KO format; not
 /// MXFP4, whose per-sub fold has no per-tile partial) — only those split or run narrow.
 /// A shape that splits runs narrow instead at up to [`NARROW_MAX_ROWS`] rows, when
-/// [`narrow_warps`] finds a one-wave launch for it.
+/// [`narrow_warps`] finds a one-wave launch for it, or — for a `weight` that
+/// [`narrow_past_one_wave`] — at [`NARROW_MULTI_WAVE_WARPS`] when it fits the shared-memory cap.
 pub fn q8a128_dense_plan(
     m: usize,
     n: usize,
     k: usize,
     sm_count: usize,
     per_tile: bool,
+    weight: GgmlDType,
 ) -> DensePlan {
     if !per_tile {
         return DensePlan::Unsplit;
@@ -205,6 +229,13 @@ pub fn q8a128_dense_plan(
         if let Some(warps) = narrow_warps(n, k, sm_count) {
             return DensePlan::Narrow { warps };
         }
+        if narrow_past_one_wave(weight)
+            && narrow_smem_bound(k, NARROW_MULTI_WAVE_WARPS) <= NARROW_SMEM_CAP
+        {
+            return DensePlan::Narrow {
+                warps: NARROW_MULTI_WAVE_WARPS,
+            };
+        }
     }
     DensePlan::SplitK(splits)
 }
@@ -214,6 +245,59 @@ mod tests {
     use super::*;
 
     const SM: usize = 110; // RTX PRO 5000 Blackwell.
+    const Q8: GgmlDType = GgmlDType::Q8_KO;
+
+    /// The 4,096- and 6,144-wide projections cannot hold every narrow block in one wave; up
+    /// to eight rows the sub-8-bit twins run narrow at six warps there, and Q8 stays split.
+    #[test]
+    fn sub_8_bit_twins_run_narrow_past_one_wave() {
+        for (n, k) in [(4096usize, 4096usize), (6144, 4096), (4096, 12_288)] {
+            assert_eq!(
+                narrow_warps(n, k, SM),
+                None,
+                "{n}×{k} has no one-wave launch"
+            );
+            for weight in [GgmlDType::Q4_KO, GgmlDType::Q5_KO, GgmlDType::Q6_KO] {
+                for m in [1usize, 5, 8] {
+                    assert_eq!(
+                        q8a128_dense_plan(m, n, k, SM, true, weight),
+                        DensePlan::Narrow { warps: 6 },
+                        "{weight:?} {m}×{n}×{k}"
+                    );
+                }
+            }
+            for weight in [Q8, GgmlDType::Q2_KO, GgmlDType::Q3_KO] {
+                assert!(
+                    matches!(
+                        q8a128_dense_plan(5, n, k, SM, true, weight),
+                        DensePlan::SplitK(_)
+                    ),
+                    "{weight:?} {n}×{k}"
+                );
+            }
+            // Past eight rows the narrow kernel does not apply, whatever the format.
+            assert!(matches!(
+                q8a128_dense_plan(10, n, k, SM, true, GgmlDType::Q6_KO),
+                DensePlan::SplitK(_)
+            ));
+        }
+    }
+
+    /// A one-wave shape keeps its one-wave warp count whatever the format: the Flash-Next
+    /// projections decide exactly as before.
+    #[test]
+    fn a_one_wave_shape_ignores_the_format() {
+        for weight in [Q8, GgmlDType::Q4_KO, GgmlDType::Q6_KO, GgmlDType::Q2_KO] {
+            assert_eq!(
+                q8a128_dense_plan(5, 416, 10_240, SM, true, weight),
+                DensePlan::Narrow { warps: 16 }
+            );
+            assert_eq!(
+                q8a128_dense_plan(5, 2560, 6144, SM, true, weight),
+                DensePlan::Narrow { warps: 5 }
+            );
+        }
+    }
 
     #[test]
     fn the_split_depth_never_launches_an_empty_slice() {
@@ -321,14 +405,14 @@ mod tests {
     fn decode_width_projections_run_narrow() {
         // Hyper-connection `down`: 52 blocks, one per SM at 16 warps.
         assert_eq!(
-            q8a128_dense_plan(5, 416, 10_240, SM, true),
+            q8a128_dense_plan(5, 416, 10_240, SM, true, Q8),
             DensePlan::Narrow { warps: 16 }
         );
         // 320 blocks need three per SM: the DeltaNet out-proj (48 tiles) fits five warps, the
         // attention out-proj (32 tiles) six, and the shared-expert down has five tiles to give.
         for (k, warps) in [(6144usize, 5usize), (4096, 6), (640, 5)] {
             assert_eq!(
-                q8a128_dense_plan(5, 2560, k, SM, true),
+                q8a128_dense_plan(5, 2560, k, SM, true, Q8),
                 DensePlan::Narrow { warps },
                 "K = {k}"
             );
@@ -336,12 +420,12 @@ mod tests {
         // The stacked router | shared gate_up | gate: 1,824 rows → 228 blocks, three per SM
         // at six warps.
         assert_eq!(
-            q8a128_dense_plan(5, 1824, 2560, SM, true),
+            q8a128_dense_plan(5, 1824, 2560, SM, true, Q8),
             DensePlan::Narrow { warps: 6 }
         );
         for m in 1..=NARROW_MAX_ROWS {
             assert_eq!(
-                q8a128_dense_plan(m, 416, 10_240, SM, true),
+                q8a128_dense_plan(m, 416, 10_240, SM, true, Q8),
                 DensePlan::Narrow { warps: 16 },
                 "{m} rows"
             );
@@ -354,7 +438,7 @@ mod tests {
     fn a_shape_past_one_narrow_wave_stays_split() {
         assert_eq!(narrow_warps(4096, 4096, SM), None);
         assert_eq!(
-            q8a128_dense_plan(5, 4096, 4096, SM, true),
+            q8a128_dense_plan(5, 4096, 4096, SM, true, Q8),
             DensePlan::SplitK(4)
         );
     }
@@ -364,13 +448,13 @@ mod tests {
     fn wider_decode_waves_split() {
         for m in [9usize, 16] {
             assert_eq!(
-                q8a128_dense_plan(m, 416, 10_240, SM, true),
+                q8a128_dense_plan(m, 416, 10_240, SM, true, Q8),
                 DensePlan::SplitK(27),
                 "{m} rows"
             );
         }
         assert_eq!(
-            q8a128_dense_plan(32, 416, 10_240, SM, true),
+            q8a128_dense_plan(32, 416, 10_240, SM, true, Q8),
             DensePlan::SplitK(16)
         );
     }
@@ -380,20 +464,23 @@ mod tests {
     #[test]
     fn narrow_needs_a_shape_that_splits_and_a_per_tile_format() {
         assert_eq!(
-            q8a128_dense_plan(1, 10_240, 384, SM, true),
-            DensePlan::Unsplit
-        );
-        assert_eq!(q8a128_dense_plan(1, 416, 128, SM, true), DensePlan::Unsplit);
-        assert_eq!(
-            q8a128_dense_plan(512, 416, 10_240, SM, true),
+            q8a128_dense_plan(1, 10_240, 384, SM, true, Q8),
             DensePlan::Unsplit
         );
         assert_eq!(
-            q8a128_dense_plan(5, 416, 10_240, SM, false),
+            q8a128_dense_plan(1, 416, 128, SM, true, Q8),
             DensePlan::Unsplit
         );
         assert_eq!(
-            q8a128_dense_plan(0, 416, 10_240, SM, true),
+            q8a128_dense_plan(512, 416, 10_240, SM, true, Q8),
+            DensePlan::Unsplit
+        );
+        assert_eq!(
+            q8a128_dense_plan(5, 416, 10_240, SM, false, Q8),
+            DensePlan::Unsplit
+        );
+        assert_eq!(
+            q8a128_dense_plan(0, 416, 10_240, SM, true, Q8),
             DensePlan::Unsplit
         );
     }
@@ -406,7 +493,7 @@ mod tests {
         assert!(narrow_smem_bound(k, NARROW_MIN_WARPS) > NARROW_SMEM_CAP);
         assert!(dense_k_split_fits(5, 416, k));
         assert_eq!(
-            q8a128_dense_plan(5, 416, k, SM, true),
+            q8a128_dense_plan(5, 416, k, SM, true, Q8),
             DensePlan::SplitK(q8a128_dense_k_splits(5, 416, k, SM))
         );
     }
@@ -419,7 +506,9 @@ mod tests {
             for m in 1..=MAX_SPLIT_ROWS {
                 for n in (32..=16_384).step_by(32) {
                     for k in [128usize, 384, 1024, 2560, 10_240, 65_536] {
-                        if let DensePlan::Narrow { warps } = q8a128_dense_plan(m, n, k, sm, true) {
+                        if let DensePlan::Narrow { warps } =
+                            q8a128_dense_plan(m, n, k, sm, true, Q8)
+                        {
                             assert!(m <= NARROW_MAX_ROWS);
                             assert!((NARROW_MIN_WARPS..=NARROW_MAX_WARPS).contains(&warps));
                             assert!(narrow_smem_bound(k, warps) <= NARROW_SMEM_CAP);

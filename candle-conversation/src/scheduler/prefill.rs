@@ -4,17 +4,15 @@ use super::admission::{
 };
 use super::admit;
 use super::admit_ground::AdmitPass;
-use super::compaction_stall::{PassOutcome, PoolShape};
+use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
 use super::first_sample::{contiguous_runs, FirstSample, FirstSampled, PrefillEnd};
 use super::phase_split::cobatched_decode_rows;
 use super::wave_logits::WaveLogits;
 use super::*;
-use crate::persistence::thread::effective_turn_policy;
 use crate::recorded_reply::replayed_step;
 use crate::stats::streams_committed;
-use crate::substrate::ConvCompression;
 use crate::token_buffer::TokenBuffer;
-use candle_nn::kv_cache::{end_wave_transient, is_device_oom};
+use candle_nn::kv_cache::{end_wave_transient, is_device_oom, FreeRegionTarget};
 use candle_transformers::models::batched_inference::PendingGlue;
 use candle_transformers::models::window_residuals::WindowResiduals;
 use std::collections::{HashMap, HashSet};
@@ -31,61 +29,39 @@ use std::collections::{HashMap, HashSet};
 /// there enough free regions to absorb the work already admitted?
 ///
 /// Scaled to the span rather than fixed, so the same numbers hold on a 3.6 GiB
-/// KV side and on the workstation's. Step 6 tunes both terms against the
-/// observed claim rate; the floors are what keeps a small card from setting a
-/// setpoint of two regions and stalling mid-seal.
-const LOAD_SETPOINT_DIVISOR: usize = 8;
-const LOAD_SETPOINT_FLOOR_REGIONS: usize = 24;
+/// KV side and on the workstation's; the floors are what keeps a small card from
+/// setting a setpoint of two regions and stalling mid-seal. Relief frees
+/// [`RELIEF_OVERSHOOT_REGIONS`] past it.
+///
+/// **The weight side is told this target** (`set_kv_free_target`, at scheduler
+/// start), and its growth leaves the relieved count free. Without that the two
+/// sides of the boundary traded the same regions every decode step — see
+/// [`FreeRegionTarget`].
+pub(super) const LOAD_TARGET: FreeRegionTarget =
+    FreeRegionTarget::new(8, 24, RELIEF_OVERSHOOT_REGIONS);
 /// Decode's setpoint is half of load's: a decode step advances one token per
 /// sequence, so KV grows by ~one chunk per sequence per 32 steps — orders of
 /// magnitude slower than a prefill's upload, and the whole point of unbounded
 /// context is to leave KV resident rather than evict it defensively.
-const DECODE_SETPOINT_DIVISOR: usize = 16;
-const DECODE_SETPOINT_FLOOR_REGIONS: usize = 8;
-
-/// What one [`Scheduler::compress_pending_turns`] pass achieved.
-///
-/// The two fields answer different questions and the caller needs both:
-/// `compressed == 0` alone cannot distinguish "there was nothing pending" from
-/// "the rung ran and the pool refused it ground", and those want opposite
-/// responses — the first is a quiet pass, the second is the compress-to-free
-/// rung failing at the moment compression is what would relieve the pressure.
-#[derive(Default)]
-pub(super) struct CompressPass {
-    /// Turns whose hot copy was replaced by its quantized form.
-    compressed: usize,
-    /// The pass stopped early because a quantize destination could not be
-    /// allocated, rather than because it ran out of work or hit its budget.
-    refused: bool,
-}
-
-fn env_regions(var: &str) -> Option<usize> {
-    std::env::var(var)
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-}
+const DECODE_TARGET: FreeRegionTarget = FreeRegionTarget::new(16, 8, RELIEF_OVERSHOOT_REGIONS);
 
 /// The region quantum in bytes.
 fn region_bytes() -> u64 {
     candle_nn::kv_cache::REGION_BYTES as u64
 }
 
+/// The free-region target `phase` defends.
+fn phase_target(phase: VramPhase) -> FreeRegionTarget {
+    match phase {
+        VramPhase::Load => LOAD_TARGET,
+        VramPhase::Decode => DECODE_TARGET,
+    }
+}
+
 /// The free-region setpoint for `phase`, in regions, given a KV side of
 /// `total` regions. Pure — unit-tested in isolation.
 fn setpoint_regions(phase: VramPhase, total: usize) -> usize {
-    let (divisor, floor) = match phase {
-        VramPhase::Load => (LOAD_SETPOINT_DIVISOR, LOAD_SETPOINT_FLOOR_REGIONS),
-        VramPhase::Decode => (DECODE_SETPOINT_DIVISOR, DECODE_SETPOINT_FLOOR_REGIONS),
-    };
-    let floor = match phase {
-        VramPhase::Load => env_regions("CANDLE_KV_FREE_REGIONS_LOAD").unwrap_or(floor),
-        VramPhase::Decode => env_regions("CANDLE_KV_FREE_REGIONS_DECODE").unwrap_or(floor),
-    };
-    // Never ask for more than half the span: on a card too small to hold the
-    // setpoint, demanding it would mean permanent pressure and an eviction pass
-    // per wave that can never succeed.
-    (total / divisor).max(floor).min(total / 2)
+    phase_target(phase).setpoint(total)
 }
 
 /// The phase a VRAM pressure decision is made in. Both phases read the same
@@ -178,29 +154,6 @@ fn ingest_hot_window() -> usize {
     })
 }
 
-/// Max float bytes the synchronous compress-to-free rung brings forward per relief
-/// episode. Bounds the per-episode stall: a large accumulated backlog drains over
-/// several episodes (plus the background persistence thread) instead of one
-/// multi-second blocking compression of *everything* pending. This is a WORK/time
-/// budget — compression cost scales with turns × chunks × layers (~model
-/// dependent, not card capacity) — so it is an absolute MB, env-tunable. 1 GiB.
-const DEFAULT_VRAM_COMPRESS_MAX_MB: usize = 1024;
-/// The rung compresses `want × this` per episode (clamped to the max above), so
-/// it overshoots the immediate shortfall a little and coasts rather than
-/// re-tripping on the very next wave.
-const VRAM_COMPRESS_HYSTERESIS: u64 = 4;
-fn vram_compress_max() -> u64 {
-    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        (std::env::var("CANDLE_VRAM_COMPRESS_MAX_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&mb| mb > 0)
-            .unwrap_or(DEFAULT_VRAM_COMPRESS_MAX_MB) as u64)
-            * 1024
-            * 1024
-    })
-}
 /// Safety cap on the synchronous substrate-offload flush under pressure. The
 /// pass migrates hot→warm *before* its cold-disk writes, so the warm copies
 /// the eviction needs exist well before this fires — a timeout only clips the
@@ -260,70 +213,98 @@ impl Scheduler {
         {
             return 0;
         }
-        if self.kv_pass_shape().is_none() {
-            return 0;
+        match self.frontier_pass() {
+            None => 0,
+            Some((shape, FrontierPass::SpanTenants)) => {
+                self.pack_span_tenants_judged(shape);
+                0
+            }
+            Some((_, FrontierPass::Kv)) => self.pack_until_settled(),
         }
-        self.compact_span_tenants();
-        self.pack_until_settled()
     }
 
-    /// The pools' shape when the KV side is fragmented enough to be worth a pass —
-    /// holes below the frontier, or arenas a pack would empty — and a pass on that
-    /// shape has not already shown it cannot improve it. `None` otherwise.
+    /// The pass that could lower the frontier now, and the pools' shape it would
+    /// start from — `None` when no pass could, or when the last one on this ground
+    /// already showed it could not.
+    ///
+    /// **Who stands at the frontier decides it** ([`PoolShape::frontier_pass`]). A KV
+    /// arena there is the KV pass's to move, given enough air below it; a span tenant's
+    /// region is the span tenants' pass, given enough holes to move into. Packing the KV pools
+    /// beneath a region another tenant holds lowers nothing — on Flash-Next's 128K
+    /// prefill every such pass moved 4,560 chunks for no region — and its quiesce
+    /// drained the device ahead of every forward.
     ///
     /// **A cheap gate, because this is consulted every wave.** `kv_ground_lost` is not
     /// cheap — it sums `packed_arenas` across the ladder, which is the census — so it
     /// cannot be the thing that decides whether to census. The hole count is a handful
-    /// of field reads behind one lock; the sparsity sum takes a read lock per rung of
-    /// the ladder and walks that pool's arena map.
+    /// of field reads behind one lock; the sparsity sum and the KV pools' top rank take
+    /// a read lock per rung of the ladder and walk that pool's arena map.
     ///
-    /// Both halves of the loss, because either alone misses the other's regime. Holes —
-    /// free regions stranded below the frontier — are self-correcting under allocation,
-    /// so a steadily-loaded pool reads zero holes with tens of sparse arenas beneath it;
-    /// gating on holes alone ran 16 passes over 110 s of churn and left the pools at
-    /// 82%. Sparsity alone would miss the burst, where a mass eviction strands the
-    /// frontier over ground that is genuinely free.
+    /// Both halves of the KV side's loss count, because either alone misses the other's
+    /// regime. Holes — free regions stranded below the frontier — are self-correcting
+    /// under allocation, so a steadily-loaded pool reads zero holes with tens of sparse
+    /// arenas beneath it; gating on holes alone ran 16 passes over 110 s of churn and
+    /// left the pools at 82%. Sparsity alone would miss the burst, where a mass eviction
+    /// strands the frontier over ground that is genuinely free.
     ///
-    /// **And not again on a shape the last pass could not improve.** The fragmentation
-    /// test can stay open over a pool no pass can pack — a pinned arena holding the
-    /// frontier — and re-running the identical pass every wave stalls decode for
-    /// nothing. See `compaction_stall`.
+    /// **And not again over ground the same pass could not improve** — until something
+    /// is freed beneath the frontier. See `compaction_stall`.
     ///
-    /// **A closed gate stands down** the hold a previous refusal put on the persistence
-    /// thread. A refused pass tells migrates to step aside for it; if the gate has since
-    /// closed, that promise has to be withdrawn or hot→warm defers for a pass that is
-    /// never coming.
-    fn kv_pass_shape(&self) -> Option<PoolShape> {
-        /// Regions recoverable before a pass is worth its sync and its copies.
-        const MIN_FREEABLE_ARENAS: usize = 8;
-        let shape = self.session.kv_region_stats().and_then(|stats| {
-            let holes = stats.live_watermark.saturating_sub(stats.live);
-            let sparse = self.session.kv_sparse_arenas();
-            let worth = holes >= MIN_FREEABLE_ARENAS || holes + sparse >= MIN_FREEABLE_ARENAS;
+    /// **A gate that will not run a KV pass stands down** the hold a previous refusal
+    /// put on the persistence thread. A refused pass tells migrates to step aside for
+    /// it; if no KV pass is coming, that promise has to be withdrawn or hot→warm defers
+    /// for a pass that never runs.
+    pub(super) fn frontier_pass(&self) -> Option<(PoolShape, FrontierPass)> {
+        let pass = self.session.kv_region_stats().and_then(|stats| {
             let shape = PoolShape {
                 live: stats.live,
                 frontier: stats.live_watermark,
-                sparse,
+                sparse: self.session.kv_sparse_arenas(),
             };
-            (worth && !self.kv_compaction_stall.holds(shape)).then_some(shape)
+            let pass = shape.frontier_pass(self.session.kv_top_rank())?;
+            (!self.kv_compaction_stall.holds(pass, shape)).then_some((shape, pass))
         });
-        if shape.is_none() {
+        if !matches!(pass, Some((_, FrontierPass::Kv))) {
             candle_nn::kv_cache::clear_compaction_waiting();
         }
-        shape
+        pass
     }
 
-    /// Pack the span tenants that are not KV pools — the recurrent state store and the
-    /// provenance gallery — in the same gap and for the same holes.
+    /// [`Self::compact_span_tenants`], judged like a KV pass: one that left the
+    /// frontier where it found it stalls the gate on `shape` until something is freed
+    /// beneath it, so a tenant that cannot move is not asked again every wave.
+    pub(super) fn pack_span_tenants_judged(&mut self, shape: PoolShape) {
+        self.compact_span_tenants();
+        let after = self
+            .session
+            .kv_region_stats()
+            .map_or(shape.frontier, |s| s.live_watermark);
+        self.kv_compaction_stall.record(
+            FrontierPass::SpanTenants,
+            shape,
+            PassOutcome {
+                reclaimed_regions: shape.frontier.saturating_sub(after),
+                frontier_before: shape.frontier,
+                frontier_after: after,
+                clipped: false,
+            },
+        );
+        self.last_kv_compaction = Some(std::time::Instant::now());
+    }
+
+    /// Pack the span tenants that are not KV pools — the recurrent state store, the
+    /// QSA index pages and the provenance gallery — when one of them holds the
+    /// frontier over enough holes to be worth moving into
+    /// ([`super::compaction_stall::MIN_FREEABLE_ARENAS`]).
     ///
-    /// **Once per wave-loop consideration, never in the follow-ups or relief.** Each is
-    /// a batch of device copies of whole blocks (a recurrent state is ~3 MiB) bounded by
-    /// a move count rather than the KV pass's clock, and repeating it does not converge
-    /// faster. Run from every relief episode and every follow-up pass as well, it ran
-    /// twice a second on Qwen3.8-Flash-Next, moving hundreds of states a time for a
-    /// region or none, beside forwards already slowed by streamed experts — and the
-    /// probe's efficiency gate fell from 98–99% to 76–87%.
-    fn compact_span_tenants(&mut self) {
+    /// **Never in the follow-ups or relief.** Each is a batch of device copies of whole
+    /// blocks (a recurrent state is ~3 MiB) bounded by a move count rather than the KV
+    /// pass's clock, and repeating it does not converge faster. Run from every relief
+    /// episode and every follow-up pass as well, it ran twice a second on
+    /// Qwen3.8-Flash-Next, moving hundreds of states a time for a region or none, beside
+    /// forwards already slowed by streamed experts — and the probe's efficiency gate
+    /// fell from 98–99% to 76–87%.
+    pub(super) fn compact_span_tenants(&mut self) {
         /// Layer states one recurrent pass may move. Each is one device copy of a few
         /// MiB, so this bounds the pass at a few hundred MiB of copy — well under the
         /// KV pass's budget — while letting a badly scattered arena set converge in a
@@ -420,7 +401,7 @@ impl Scheduler {
     /// long, at 70%, while the forwards in between bought ground from the weight side
     /// against it. Back to back, the passes cost up to ~80 ms each, and only when a
     /// pass clipped; an iteration with nothing to pack still costs one gate.
-    fn pack_until_settled(&mut self) -> usize {
+    pub(super) fn pack_until_settled(&mut self) -> usize {
         /// Passes one rung may run back to back.
         const MAX_PASSES: usize = 4;
         let mut released = 0;
@@ -467,7 +448,7 @@ impl Scheduler {
         /// what has to be matched, and clipping every pass means it never is.
         const BUDGET: std::time::Duration = std::time::Duration::from_millis(80);
 
-        let Some(shape) = self.kv_pass_shape() else {
+        let Some((shape, FrontierPass::Kv)) = self.frontier_pass() else {
             return Some(PackPass::default());
         };
 
@@ -531,6 +512,7 @@ impl Scheduler {
         // lost" is a diagnosis and "compaction was refused" is not.
         if let Ok(report) = &outcome {
             self.kv_compaction_stall.record(
+                FrontierPass::Kv,
                 shape,
                 PassOutcome {
                     reclaimed_regions: report.regions_reclaimed(),
@@ -679,20 +661,19 @@ impl Scheduler {
     ///  2. **Evict resident galleries.** Belief-scan pages rebuild on demand
     ///     from the substrate blob, so dropping one costs only the rebuild.
     ///     They go before model KV for exactly that reason.
-    ///  3. **Compress to free.** Bring forward the float→quant the persistence
-    ///     thread would do anyway. A shrink in place rather than a move: the
-    ///     turn stays resident and attended-over, and only its float working
-    ///     set goes. Cheaper than eviction, which has to be reloaded if the
-    ///     turn is re-attended.
-    ///  4. **Pack the pools.** A KV compaction pass: arenas held by a few live
+    ///  3. **Pack the pools.** A KV compaction pass: arenas held by a few live
     ///     chunks are emptied into lower ones and handed back. One budgeted
     ///     device pass, and nothing resident is lost — which the two rungs after
     ///     it cannot say.
-    ///  5. **Evacuate.** Flush the pending hot→warm so just-sealed turns have a
+    ///  4. **Evacuate.** Flush the pending hot→warm so just-sealed turns have a
     ///     warm copy — only warm-backed turns are evictable — then drop the hot
     ///     copies of the oldest ones. This is §3.8's evict-as-evacuation, and
     ///     it runs through the demotion path the tiering already owns.
-    ///  6. **Take ground from the weight side**, which costs expert residency.
+    ///  5. **Take ground from the weight side**, which costs expert residency.
+    ///
+    /// Nothing here quantizes: a finished turn's float→quant rewrite belongs to
+    /// the persistence thread's hot→warm migrate, never to the wave that called
+    /// relief.
     ///
     /// This ordering used to be the VRAM governor's relief ladder, each step a
     /// numbered `Criticality` rung with the governor re-measuring driver
@@ -733,8 +714,6 @@ impl Scheduler {
 
         let mut released = self.session.release_empty_arenas().unwrap_or(0);
         let mut gallery_freed = 0u64;
-        let mut compressed = 0usize;
-        let mut compress_refused = false;
         let mut flushed = false;
         let mut evicted = crate::substrate::EvictionReport { count: 0, bytes: 0 };
 
@@ -763,36 +742,25 @@ impl Scheduler {
             }
         }
 
-        if self.vram_under_pressure_for(phase) {
-            // Bound the batch so a large backlog drains over several episodes
-            // rather than one multi-second blocking pass over everything
-            // pending; the persistence thread is working the same queue.
-            let budget = want
-                .saturating_mul(VRAM_COMPRESS_HYSTERESIS)
-                .min(vram_compress_max());
-            let pass = self.compress_pending_turns(budget);
-            compressed = pass.compressed;
-            compress_refused = pass.refused;
-            released += self.session.release_empty_arenas().unwrap_or(0);
-        }
-
         // **Pack the pools before taking anything from anyone.** Ground the KV side
         // holds as air — arenas kept alive by a handful of live chunks — is ground
         // a compaction hands back without evicting a turn or an expert, and both
         // rungs below cost one of those. Without this rung relief reached for them
         // with the pools a third air: measured on Qwen3-30B-A3B, the weight zone
         // conceded 193, 240 and 290 MiB in two seconds while 287 arenas held what
-        // 185 would, and the efficiency gate read 51–64% through it. After
-        // compression, because a compressed turn's float working set leaves exactly
-        // that air behind — and **whenever compression ran, relieved or not**: the
-        // air it leaves is the weight side's ground either way, and left for the
-        // wave loop's next pass it stood for seconds (a 30B probe sample at 58%, 244
-        // arenas holding what 142 would, with nothing retired).
+        // 185 would, and the efficiency gate read 51–64% through it.
         //
         // Unpaced: the interval bounds the census on iterations with nothing at stake,
         // and here the alternative is an eviction.
+        //
+        // **No rung quantizes a turn.** A finished turn's float → quant rewrite is
+        // the persistence thread's, as part of its hot→warm migrate, between this
+        // thread's forwards. Run from here it landed inside whatever wave called
+        // relief — 0.65–2.4 s inside a 128K decode window on Flash-Next — and
+        // freed nothing for a turn the decode was still attending, whose block
+        // table keeps the float chunks alive until the slot goes.
         let mut packed = 0usize;
-        if compressed > 0 || self.vram_under_pressure_for(phase) {
+        if self.vram_under_pressure_for(phase) {
             packed = self.pack_until_settled();
         }
 
@@ -854,12 +822,8 @@ impl Scheduler {
         }
 
         let still = self.vram_under_pressure_for(phase);
-        let acted = released > 0
-            || gallery_freed > 0
-            || compressed > 0
-            || packed > 0
-            || evicted.count > 0
-            || conceded > 0;
+        let acted =
+            released > 0 || gallery_freed > 0 || packed > 0 || evicted.count > 0 || conceded > 0;
         if acted {
             relief_trace::note("sched", "relieve", want, evicted.bytes);
         }
@@ -877,8 +841,6 @@ impl Scheduler {
                     relief_ms = t.elapsed().as_millis() as u64,
                     warm_flushed = flushed,
                     gallery_freed_mib = gallery_freed / (1 << 20),
-                    turns_compressed = compressed,
-                    compress_refused,
                     arenas_packed = packed,
                     turns_evicted = evicted.count,
                     evicted_mib = evicted.bytes / (1 << 20),
@@ -891,13 +853,7 @@ impl Scheduler {
                 )
             };
         }
-        // A refused compression is not an action, but it *is* an event: the rung
-        // that shrinks a resident turn in place was asked to run and could not
-        // get the ground to run in. Left at DEBUG it reads as `turns_compressed=0`,
-        // identical to a pass with nothing to compress — which is how the
-        // feedback loop running backwards (compression is what relieves the
-        // pressure that refuses it) stayed invisible through the whole wedge.
-        if acted || compress_refused {
+        if acted {
             emit!(info);
         } else {
             emit!(trace);
@@ -1455,12 +1411,14 @@ impl Scheduler {
     /// plus [`RELIEF_OVERSHOOT_REGIONS`]. `None` when there is no pressure, so
     /// a relief call on a healthy cache costs one counter read.
     fn relief_shortfall_bytes(&self, phase: VramPhase) -> Option<u64> {
-        let (free, setpoint) = self.kv_region_state(phase)?;
-        if free >= setpoint {
+        let stats = self.kv_regions()?;
+        let free = stats.free + stats.blocked;
+        let target = phase_target(phase);
+        if free >= target.setpoint(stats.total) {
             return None;
         }
-        let target = setpoint.saturating_add(RELIEF_OVERSHOOT_REGIONS);
-        Some((target.saturating_sub(free) as u64).saturating_mul(region_bytes()))
+        let relieved = target.relieved(stats.total);
+        Some((relieved.saturating_sub(free) as u64).saturating_mul(region_bytes()))
     }
 
     /// Shed least-recently-used hot turn KV to the warm (RAM) tier across the
@@ -1774,219 +1732,6 @@ impl Scheduler {
             report.bytes += r.bytes;
         }
         report
-    }
-
-    /// Compress-to-free: bring forward the quantization of completed, still-
-    /// float turns under VRAM pressure. Mirrors the persistence thread's
-    /// hot→warm quantize (same [`quantize_sealed_in_place`], same per-
-    /// [`ConvCompression`] policy grouping) but installs **only** the quantized
-    /// hot — it does not write the warm (RAM) copy.
-    ///
-    /// This is a deliberate division of labor: the pass runs on the scheduler
-    /// thread to reclaim float VRAM *now* — for a turn NOT currently attended,
-    /// the source float arenas free the instant the old hot `Arc`s drop under
-    /// the write lock (the substrate held the only reference). For a turn the
-    /// active decode IS attending over, the block-table GID clones keep the
-    /// float chunks alive until the next reprojection rebuilds the table from the
-    /// new quant `hot` — so its float reclaim lands one reproject later, still
-    /// safe (a live forward never reads freed memory). Meanwhile the persistence
-    /// thread still owns the warm/cold DtoH writes on its own tick (the
-    /// compressed turns remain in `snapshot_pending_warm`, warm-absent, so it
-    /// still picks them up and lands their bytes).
-    ///
-    /// A net shrink, not a move: the turn stays resident and attended-over, so
-    /// there is no reload or hit-rate cost, and no *extra* quality loss — these
-    /// turns get quantized on seal regardless; pressure only pulls it earlier.
-    /// Turns whose hot is already quant (a prior pass, or persistence, beat us
-    /// to them) are skipped via [`sealed_has_compressible_chunk`] so an undrained
-    /// warm backlog doesn't re-walk finished turns.
-    ///
-    /// [`sealed_has_compressible_chunk`]: candle_nn::kv_cache::ChunkedKvBacking::sealed_has_compressible_chunk
-    /// Bring forward the quantization of up to `budget_bytes` of completed float
-    /// turns (estimated by their float footprint), oldest-conversation-first.
-    /// **Bounded** so a large accumulated backlog is drained over several relief
-    /// episodes — a few seconds each — rather than one multi-second blocking
-    /// compression of *everything* pending (a 697-turn / 23 GiB / 66 s stall was
-    /// the symptom). The background persistence thread drains the rest.
-    fn compress_pending_turns(&mut self, budget_bytes: u64) -> CompressPass {
-        // Need an engine-wide turn policy to compress against; without one turns
-        // stay native float (lossless capture) and there is nothing to bring
-        // forward.
-        let base = match self.session.compression_policy() {
-            Some(p) => p,
-            None => return CompressPass::default(),
-        };
-        let n_layers = self.session.num_layers();
-        let device = self.session.device().clone();
-        let copy_stream = match &device {
-            Device::Cuda(d) => d.cuda_stream(),
-            _ => return CompressPass::default(),
-        };
-        // Bound `backings`' immutable borrow of `self.session` to a disjoint
-        // field from `self.elevate_pinned_scratch` (the `&mut` below), exactly
-        // like `quantize_section_batch`.
-        let backings = self.session.backings();
-
-        let convs = self.distinct_substrates();
-        let mut compressed = 0usize;
-        let mut refused = false;
-        // Estimated float bytes queued for compression so far — the bound.
-        let mut collected: u64 = 0;
-        'convs: for conv in convs {
-            if collected >= budget_bytes {
-                break; // Budget met — the rest drains next episode / in the background.
-            }
-            // Snapshot still-float turns (hot present, warm absent) grouped by
-            // their per-conversation compression override — as the persistence
-            // thread does — under a brief read lock, filtered to those whose hot
-            // is still GPU-float so an undrained warm backlog can't make us
-            // re-walk already-quant turns. Stop collecting once the byte budget is
-            // reached so a big backlog doesn't compress all at once.
-            let groups: HashMap<
-                Option<ConvCompression>,
-                Vec<(ResidenceIndex, Vec<SealedSequence>)>,
-            > = {
-                let view = conv.read();
-                let mut g: HashMap<_, Vec<_>> = HashMap::new();
-                for (idx, hot, cc) in view.snapshot_pending_warm() {
-                    if hot.len() != n_layers {
-                        continue;
-                    }
-                    // Layer 0 is representative: a turn's layers seal and
-                    // compress together, so if layer 0 is still float, all are.
-                    if !backings[0].sealed_has_compressible_chunk(&hot[0]) {
-                        continue;
-                    }
-                    collected += sealed_total_bytes(&hot);
-                    g.entry(cc).or_default().push((idx, hot));
-                    if collected >= budget_bytes {
-                        break;
-                    }
-                }
-                g
-            };
-
-            for (cc, group) in groups {
-                let policy = match effective_turn_policy(Some(&base), cc) {
-                    Some(p) => p,
-                    None => continue, // lossless capture: nothing to bring forward
-                };
-                // Per-residence quantized hot accumulator, one SealedSequence per
-                // layer, filled positionally across the per-layer batched launches
-                // (`quantize_sealed_in_place` returns one output per input in order).
-                let mut q_per: Vec<Vec<SealedSequence>> = (0..group.len())
-                    .map(|_| Vec::with_capacity(n_layers))
-                    .collect();
-                let mut ok = vec![true; group.len()];
-                for layer in 0..n_layers {
-                    let inputs: Vec<&SealedSequence> =
-                        group.iter().map(|(_, hot)| &hot[layer]).collect();
-                    match quantize_sealed_in_place(
-                        &backings[layer],
-                        &inputs,
-                        &policy,
-                        &device,
-                        &copy_stream,
-                        &mut self.elevate_pinned_scratch,
-                    ) {
-                        Ok(out) => {
-                            for (slot, qi) in out.into_iter().enumerate() {
-                                q_per[slot].push(qi);
-                            }
-                        }
-                        Err(e) if is_device_oom(&e) => {
-                            // **The pool refused a quantize destination.** This
-                            // rung cannot fix that: the ground it needs comes
-                            // from the rungs below (evict a cold tail) or from
-                            // the boundary (`request_kv_ground`), and both of
-                            // them run after this returns. Every remaining group
-                            // would be refused for the same reason, so stop the
-                            // pass rather than burn a kernel launch per group
-                            // rediscovering it.
-                            //
-                            // Reported, not retried and not waited on. Waiting
-                            // here would deadlock: this runs on the scheduler
-                            // thread, and the scheduler thread is what would
-                            // release the ground — both the rung below and the
-                            // next wave's `end_wave_transient` are further down
-                            // this same call stack's future.
-                            tracing::debug!(
-                                "compress_pending_turns: layer {layer} was refused a quantize \
-                                 destination, stopping the pass: {e}"
-                            );
-                            refused = true;
-                            ok.fill(false);
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "compress_pending_turns: layer {layer} quantize failed: {e} (last CUDA kernel: {})",
-                                candle::last_cuda_kernel_launch()
-                            );
-                            ok.fill(false);
-                            break;
-                        }
-                    }
-                }
-                // Device-wide sync before the swap: the quantize kernels leave the
-                // new Q-arenas' K/V writes in flight (including V work that can
-                // retire on a stream a primary-stream-only sync misses — the
-                // multi-turn V-duplication window), and the very next reproject on
-                // THIS thread reads them. Mirrors the persistence thread's
-                // post-batch `device.synchronize()`.
-                let sync_failed = if let Err(e) = device.synchronize() {
-                    tracing::warn!(
-                        "compress_pending_turns: device sync failed: {e:?} — skipping this group's installs"
-                    );
-                    true
-                } else {
-                    false
-                };
-                // Leaving **after** the sync, not at the refusal. The layers that
-                // quantized before it left kernels in flight writing into
-                // `q_per`'s destination arenas, and dropping those handles
-                // returns their regions to the pool — so an early exit would
-                // hand a region back while a kernel was still writing into it.
-                // `ok` is all-false for this group, so the swap below is a no-op
-                // for it either way.
-                //
-                // **Before the sync's own bail-out**, because that one only skips
-                // a group: leaving the refusal check behind it means a failed sync
-                // resumes the pass and launches quantizes for every remaining
-                // group, each of which the pool refuses for the same reason the
-                // first one was refused.
-                if refused {
-                    break 'convs;
-                }
-                if sync_failed {
-                    continue;
-                }
-                // Atomic swap under one write lock: replace each residence's hot
-                // with its quantized form. Dropping the old (float) hot `Vec`s
-                // after the lock releases returns the source float chunks' arena
-                // slots to the pool — the VRAM this rung exists to reclaim. Warm
-                // stays untouched: the persistence thread still owes the DtoH.
-                {
-                    let mut view = conv.write();
-                    for (i, (residence, _float)) in group.into_iter().enumerate() {
-                        if !ok[i] || q_per[i].len() != n_layers {
-                            continue;
-                        }
-                        view.replace_section_hot(residence, std::mem::take(&mut q_per[i]));
-                        compressed += 1;
-                    }
-                }
-            }
-        }
-        if compressed > 0 {
-            // Wake the persistence thread so it lands the warm/cold copies of the
-            // turns we just compressed without waiting for its 5 s tick.
-            self.persist_trigger.fire();
-        }
-        CompressPass {
-            compressed,
-            refused,
-        }
     }
 
     /// Continuous-fair-wave prefill throttle: how many transformer layers a
@@ -2578,7 +2323,7 @@ impl Scheduler {
         prefill_gidxs: &[usize],
         err: &candle::Error,
     ) {
-        if candle_nn::kv_cache::is_device_oom(err) {
+        if is_device_oom(err) {
             self.handle_prefill_oom(prefill_gidxs, err);
         } else {
             let msg = format!("wave group forward failed: {err}");

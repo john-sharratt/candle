@@ -20,12 +20,17 @@
 //   K scales  fp16  [HD / 32]   the windows' absmax / 127
 //   V         fp16  [HD]        natural dim order
 //
-// `positions` is the sum of the staged sequences' kv lengths; a sequence's
-// rows start at the sum of the staged kv lengths before it in the batch. The
-// first two planes are rounded up to 256 bytes so every plane starts on the
-// bump alignment. The byte count is stated once on the host as well
-// (`candle_nn::kv_cache::prefill_kv_stage_bytes`), and the launcher refuses a
-// buffer shorter than the layout here.
+// A launch stages one KEY WINDOW `[chunk_lo, chunk_hi)` of each staged
+// sequence that has a query token in its row group (a token at or past
+// `tok_lo`): a sequence's rows are its positions in the window, and they start
+// at the sum of the window rows of the staged sequences before it in the
+// batch. `positions` is the planes' row count per head — the widest window
+// any launch over the batch stages — so the plane offsets are the same for
+// every launch. An uncut launch's window is `[0, KV_STAGE_UNBOUNDED)`, which
+// stages every sequence whole. The first two planes are rounded up to 256
+// bytes so every plane starts on the bump alignment. The byte count is stated
+// once on the host as well (`candle_nn::kv_cache::prefill_kv_stage_bytes`),
+// and the launcher refuses a buffer shorter than the layout here.
 // ============================================================================
 
 #include <cuda_fp16.h>
@@ -33,12 +38,20 @@
 
 namespace prefill_int8 {
 
+/// A key window with no upper end.
+constexpr int KV_STAGE_UNBOUNDED = 0x7fffffff;
+
 /// The pre-staged K/V a launch reads, or `buf == nullptr` for a launch that
-/// stages nothing. A sequence is staged iff its `q_len >= min_q_len`.
+/// stages nothing. A sequence is staged iff its `q_len >= min_q_len`; this
+/// launch stages its key positions in `[chunk_lo, chunk_hi)` iff it also has a
+/// query token at or past `tok_lo`.
 struct PrefillKvStage {
     uint8_t* buf;
     int64_t positions;
     int min_q_len;
+    int chunk_lo;
+    int chunk_hi;
+    int tok_lo;
 };
 
 constexpr int64_t KV_STAGE_ALIGN = 256;
@@ -86,16 +99,26 @@ __device__ __forceinline__ __half* kv_stage_v(const PrefillKvStage& s, int n_kv_
                                            + kv_stage_scale_bytes<HEAD_DIM>(s.positions, n_kv_head));
 }
 
-/// Row `pos` of sequence `b`'s staged positions within one head's run: the
-/// staged kv lengths of the sequences before it. A batch is at most a wave's
-/// sequences, so the walk is a handful of cached loads per block.
+/// Rows a sequence of `kv_len` positions stages in `s`'s window.
+__host__ __device__ __forceinline__ int64_t kv_stage_seq_rows(int kv_len, const PrefillKvStage& s) {
+    const int64_t n = (int64_t)kv_len - s.chunk_lo;
+    const int64_t w = (int64_t)s.chunk_hi - s.chunk_lo;
+    return n < 0 ? 0 : (n > w ? w : n);
+}
+
+/// Where sequence `b`'s window rows start within one head's run: the window
+/// rows of the staged sequences before it that have a token in the row group.
+/// A batch is at most a wave's sequences, so the walk is a handful of cached
+/// loads per block.
 __device__ __forceinline__ int64_t kv_stage_seq_base(
     const uint32_t* __restrict__ q_lens, const uint32_t* __restrict__ kv_lens,
-    int b, int min_q_len)
+    int b, const PrefillKvStage& s)
 {
     int64_t base = 0;
-    for (int i = 0; i < b; ++i)
-        if ((int)q_lens[i] >= min_q_len) base += (int64_t)kv_lens[i];
+    for (int i = 0; i < b; ++i) {
+        const int qi = (int)q_lens[i];
+        if (qi >= s.min_q_len && qi > s.tok_lo) base += kv_stage_seq_rows((int)kv_lens[i], s);
+    }
     return base;
 }
 

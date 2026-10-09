@@ -116,6 +116,7 @@ mod tests {
     use super::super::super::int8_matmul_mode::q8a128_dense_tile;
     use super::super::super::int8_split_k::{
         dense_k_split_depth, dense_k_tiles, q8a128_dense_k_splits, q8a128_dense_plan, DensePlan,
+        NARROW_MAX_ROWS,
     };
     use super::super::super::{GgmlDType, Int8Mode, QMatMul, QStorage, QTensor, SumScale};
     use super::super::graph_bench::{time_graph, Rotation};
@@ -347,7 +348,7 @@ mod tests {
         let (w, wide) = operands(&dev, GgmlDType::Q8_0, 40, n, k, 11)?;
         let wide_out = f32_bits(&dev, &w, &wide, DensePlan::Unsplit)?;
         for m in [1usize, 5, 8] {
-            let plan = q8a128_dense_plan(m, n, k, sm, true);
+            let plan = q8a128_dense_plan(m, n, k, sm, true, weight(&w).2);
             assert!(
                 matches!(plan, DensePlan::Narrow { .. }),
                 "{m} rows run narrow, not {plan:?}"
@@ -387,7 +388,14 @@ mod tests {
         assert!(f32_bits(&dev, &mx, &mx_x, four).is_err());
         // MXFP4's own plan is the unsplit kernel.
         assert_eq!(
-            q8a128_dense_plan(1, 416, 2048, dev.multiprocessor_count()?, false),
+            q8a128_dense_plan(
+                1,
+                416,
+                2048,
+                dev.multiprocessor_count()?,
+                false,
+                GgmlDType::MXFP4_KO
+            ),
             DensePlan::Unsplit
         );
         Ok(())
@@ -413,6 +421,19 @@ mod tests {
             // Wider outputs that still split but cannot hold every narrow block in one wave.
             ("qwen3-8b o q8", GgmlDType::Q8_0, 4096, 4096),
             ("qwen3-8b qkv q8", GgmlDType::Q8_0, 6144, 4096),
+            // The dense models' own projections in their checkpoint formats: Qwen3-8B (Q6_K),
+            // Qwen3-30B-A3B's attention (Q4_K) and Qwen2-0.5B (Q4_0).
+            ("qwen3-8b o q6", GgmlDType::Q6_K, 4096, 4096),
+            ("qwen3-8b qkv q6", GgmlDType::Q6_K, 6144, 4096),
+            ("qwen3-8b down q6", GgmlDType::Q6_K, 4096, 12_288),
+            ("qwen3-8b down q8", GgmlDType::Q8_0, 4096, 12_288),
+            ("4096 o q5", GgmlDType::Q5_K, 4096, 4096),
+            ("4096 down q5", GgmlDType::Q5_K, 4096, 12_288),
+            ("4096 o q4", GgmlDType::Q4_K, 4096, 4096),
+            ("4096 down q4", GgmlDType::Q4_K, 4096, 12_288),
+            ("qwen3-30b o q4", GgmlDType::Q4_K, 2048, 4096),
+            ("qwen2-0.5b o q4", GgmlDType::Q4_0, 896, 896),
+            ("qwen2-0.5b down q4", GgmlDType::Q4_0, 896, 4864),
         ];
         let warp_counts = [4usize, 5, 6, 8, 10, 12, 16];
         let mut header = format!(
@@ -425,7 +446,7 @@ mod tests {
         println!("{header}  (device µs per launch)");
         let out_code = out_dtype_code(DType::BF16)?;
         for (label, src, n, k) in shapes {
-            let (w, x_all) = operands(&dev, src, 8, n, k, (n + k) as u64)?;
+            let (w, x_all) = operands(&dev, src, 32, n, k, (n + k) as u64)?;
             let (_, len, dtype, _) = weight(&w);
             let qtype = dtype_to_qtype(dtype)? as i32;
             let (w_ptr, _, _, _) = weight(&w);
@@ -435,22 +456,25 @@ mod tests {
             // One output and one split scratch, allocated outside the timing; the counters
             // start at zero and every split launch returns them there.
             // SAFETY: fully written by every launch before it is read.
-            let dst = unsafe { dev.alloc::<u16>(8 * n)? };
+            let dst = unsafe { dev.alloc::<u16>(32 * n)? };
             // SAFETY: every partial is written by its slice before the last block reads it.
-            let ws = unsafe { dev.alloc::<f32>(dense_k_tiles(k) * 8 * n)? };
-            let counters = dev.alloc_zeros::<u32>(n.div_ceil(32))?;
+            let ws = unsafe { dev.alloc::<f32>(dense_k_tiles(k) * 32 * n)? };
+            // One counter per (token tile, row tile): two token tiles at 32 rows.
+            let counters = dev.alloc_zeros::<u32>(2 * n.div_ceil(32))?;
             let stream = dev.cuda_stream();
             let (dst_p, _dg) = dst.device_ptr(&stream);
             let (ws_p, _wg) = ws.device_ptr(&stream);
             let (ctr_p, _cg) = counters.device_ptr(&stream);
-            for m in [1usize, 5, 8] {
+            // Every width the split rule serves: the narrow kernel's (up to eight rows) and the
+            // wider decode and verify waves that split without it.
+            for m in [1usize, 5, 8, 10, 16, 32] {
                 let x = x_all.narrow(0, 0, m)?.contiguous()?;
                 let acts = to_dynamic(&x, Int8Mode::Performance, &dev, SumScale::Raw)?;
                 let DynamicActs::Int8(op) = &acts else {
                     unreachable!("an int8 mode quantizes")
                 };
                 let sum_norm = op.sum_scale.as_code();
-                let rule = q8a128_dense_plan(m, n, k, sm, true);
+                let rule = q8a128_dense_plan(m, n, k, sm, true, dtype);
                 let splits = q8a128_dense_k_splits(m, n, k, sm).max(dense_k_split_depth(k, 2));
                 let tile = q8a128_dense_tile(m, n, k, sm).code();
                 let row = op.with_device_ptr(&dev, |act| {
@@ -516,6 +540,9 @@ mod tests {
                     })?;
                     let mut narrow = Vec::new();
                     for warps in warp_counts {
+                        if m > NARROW_MAX_ROWS {
+                            break;
+                        }
                         narrow.push(time_graph(&dev, &weights, |w, cs| {
                             let wp = [w as *const c_void];
                             // SAFETY: as above.

@@ -32,10 +32,19 @@ extern "C" void run_paged_prefill_int8_bf16(
     int64_t stage_bytes,
     int64_t stage_positions,
     int32_t stage_min_q_len,
-    int32_t stage_max_kv
+    int32_t stage_max_kv,
+    const uint32_t* group_chunks,
+    int32_t n_groups,
+    int32_t group_blocks,
+    int32_t chunk_positions,
+    float* carry,
+    uint32_t* resume_words
 ) {
     const QsaSel sel{sel_entries, sel_cnt, sel_pages, sel_page_win, sel_stride, sel_ratio};
-    const prefill_int8::PrefillKvStage stage{stage_buf, stage_positions, stage_min_q_len};
+    // The launcher sets the key window per launch.
+    const prefill_int8::PrefillKvStage stage{
+        stage_buf, stage_positions, stage_min_q_len, 0, prefill_int8::KV_STAGE_UNBOUNDED, 0};
+    uint2* resume = reinterpret_cast<uint2*>(resume_words);
     using prefill_int8::launch_paged_prefill_int8;
     switch (head_dim) {
         case 64:
@@ -43,21 +52,24 @@ extern "C" void run_paged_prefill_int8_bf16(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
                 softmax_scale, rungs, rope_interleaved, stream, sel,
-                stage, stage_bytes, stage_max_kv);
+                stage, stage_bytes, stage_max_kv,
+                group_chunks, n_groups, group_blocks, chunk_positions, carry, resume);
             break;
         case 128:
             launch_paged_prefill_int8<__nv_bfloat16, 128>(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
                 softmax_scale, rungs, rope_interleaved, stream, sel,
-                stage, stage_bytes, stage_max_kv);
+                stage, stage_bytes, stage_max_kv,
+                group_chunks, n_groups, group_blocks, chunk_positions, carry, resume);
             break;
         case 256:
             launch_paged_prefill_int8<__nv_bfloat16, 256>(
                 q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,
                 o_ptr, total_q, batch_size, n_head, n_kv_head, max_q_len,
                 softmax_scale, rungs, rope_interleaved, stream, sel,
-                stage, stage_bytes, stage_max_kv);
+                stage, stage_bytes, stage_max_kv,
+                group_chunks, n_groups, group_blocks, chunk_positions, carry, resume);
             break;
         default:
             fprintf(stderr, "run_paged_prefill_int8_bf16: unsupported head_dim %d\n", head_dim);
@@ -85,7 +97,9 @@ extern "C" void run_paged_prefill_kv_stage_bf16(
     int32_t stage_min_q_len,
     int32_t stage_max_kv
 ) {
-    const prefill_int8::PrefillKvStage stage{stage_buf, stage_positions, stage_min_q_len};
+    // Every staged sequence whole: the uncut window.
+    const prefill_int8::PrefillKvStage stage{
+        stage_buf, stage_positions, stage_min_q_len, 0, prefill_int8::KV_STAGE_UNBOUNDED, 0};
     using prefill_int8::launch_paged_prefill_kv_stage_only;
     switch (head_dim) {
         case 64:

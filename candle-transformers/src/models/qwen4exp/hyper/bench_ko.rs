@@ -346,7 +346,12 @@ fn sweep_splits(
                 DensePlan::Unsplit,
             )?;
             let want = want.flatten_all()?.to_vec1::<f32>()?;
-            let rule = q8a128_dense_plan(t, n, k, sm, true);
+            let weight = pick(0)
+                .inner()
+                .qtensor()
+                .ok_or_else(|| candle::Error::Msg("a KO weight".into()))?
+                .dtype();
+            let rule = q8a128_dense_plan(t, n, k, sm, true, weight);
             let mut row = format!("{name:>4} {t:>5} rows |");
             // Split forms only where the fixed scratch holds them — the launcher refuses the
             // rest, and the rule never picks them. Each asked-for depth is launched at the

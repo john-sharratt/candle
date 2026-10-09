@@ -115,9 +115,19 @@ The tier is the tenant with the shortest life and the strictest placement rule.
 
 1. **Admit.** Every KV claim a forward needs is made *before* the forward, in the
    admit phase (`wave_admit`). A region claim creates an arena, and an arena may
-   only be created between forwards.
+   only be created between forwards. A claim that finds no region below the
+   boundary buys `KV_BUY_STEP` from the weight side (`claim_region`) — outside a
+   wave, running out is a price, not a wall.
 2. **Place.** The tier is anchored at the **arena frontier** and sized to what
-   *this* forward needs (`plan_wave_transient`), not to the worst case.
+   *this* forward needs (`plan_wave_transient`), not to the worst case. When live
+   arenas reach into its footprint, the placement buys exactly the shortfall it
+   measured (`place_transient`, up to four purchases while they keep landing),
+   and when the weight side will give no more it **refuses by name** — span,
+   floor, frontier, live regions and what was conceded — rather than placing over
+   anything. The turn's whole price (all of its K/V and the tier of its deepest
+   chunk, `ManagedBatchedModel::wave_tier_bytes`) is *judged* at admission
+   (`docs/wave_feeder.md` §4.11.14); the ground is *bought* here, forward by
+   forward.
 3. **Run.** Every sweep of the forward uses fixed offsets inside the placed tier.
 4. **Release.** The tier's lifetime ends with its forward.
 
@@ -202,6 +212,23 @@ wrong: it lands below `912 + 320`, so every forward would retract the weight sid
 to place its tier and then regrow it — layer slots traded for boundary churn on
 the hot path.)
 
+**Growing back leaves what the KV side's relief defends.** The weight side takes
+free ground back between forwards (`GrowthPolicy::spare`), leaving a slack; the
+scheduler's relief concedes weight ground whenever the KV side's free regions fall
+below its setpoint. Those are one quantity seen from two sides, so the scheduler
+states its target to the pool at start (`set_kv_free_target`, a `FreeRegionTarget`:
+span/8, at least 24 regions, freed 8 past) and growth leaves at least what relief frees
+to. With the two disagreeing — a 32-region slack against a setpoint of 50 — they traded
+the same twelve regions on every decode step of a 128K turn, 277 boundary moves in one
+Strata run, each behind two device-wide quiesces. Every concession is also recorded as
+the KV side's demand, whoever asked for it, so the negotiation straight after one does
+not read the ground just conceded as spare. And growth leaves **the last forward's
+tier** free on top of that target: a prefill's next chunk places a tier at least as
+wide, so ground sold back between two of its forwards is bought straight back by the
+next placement — measured mid-prefill on a 128K Flash-Next turn as 1,631 expert slots
+(~4 GiB) grown back after a compaction and 1,877 conceded again by the very next
+forward.
+
 **A captured device address does not survive a boundary move.** A concession
 evicts the slots at the frontier, and the zone may then *grow back* — so capacity
 and floor read exactly as they did at load while the conceded slots hold something
@@ -246,6 +273,25 @@ The result is a ratchet:
    tenant that forced the concession.
 
 Nothing lowers the watermark again, so step 5 is one-way.
+
+**The same ratchet runs across requests, and settling is what breaks it.** A finished
+turn's KV leaves the device only when the persistence thread has quantized it and
+landed its warm copy, and it needs the gaps between forwards to create the arenas that
+takes. A request arriving on the same instant fills those gaps with its own prefill,
+so the last turn stood under it — measured on Flash-Next's Strata runs, 5 GB of the
+previous 128K turn's float KV under each of the next two, the zone 24,914 → 23,430 →
+21,953 slots and prefill 4,426 → 3,547 → 2,092 t/s. Two things close it:
+
+- **The scheduler settles when it falls idle** (`Scheduler::settle_device`): it sweeps
+  the empty arenas, runs whichever compaction pass can lower the frontier until none
+  can, and offers the weight side ground until it stops taking it — all with nothing
+  in flight, so to completion rather than to a per-wave budget.
+- **A caller that evicts a timeline can wait for it to leave**
+  (`ConversationEngine::settle_evicted_timeline`): it drives the persistence thread
+  until no turn of the timeline holds a device copy, then asks the scheduler to
+  settle (`SchedulerRequest::Settle`). The Strata harness does, standing in for a
+  daemon's idle time between one user's requests; with it the three 128K runs read
+  the same.
 
 ### Measured, on the 5-hour daemon run of 2026-09-25
 
@@ -362,25 +408,49 @@ it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
   and the first batch of claims is unconditional so a pass that planned always moves
   something. A clipped pass is not a broken one: everything below the cursor is
   packed and nothing moved upward, so the next pass resumes closer.
-- **Considered every wave, run on a cheap signal.** The gate is an interval floor,
-  then the region pool's hole count, then a sparsity sum from the refcount tables'
-  live counters — no bitmap walked. Both halves are needed: holes self-correct under
+- **Considered every wave, run only when it can lower the frontier.** The gate is an
+  interval floor, then *who stands at the frontier*
+  (`compaction_stall::PoolShape::frontier_pass`): the region pool's frontier against
+  the highest region any KV arena holds (`ChunkedKvBacking::kv_top_rank`). A KV arena
+  there is the KV pass's to move, given enough air — the hole count plus a sparsity
+  sum from the refcount tables' live counters, no bitmap walked, at least eight
+  regions' worth. A span tenant's region there (recurrent state, the QSA index pages,
+  the gallery) is the span tenants' pass, given a hole to move into. Packing the KV
+  pools beneath another tenant's region moves holes about and lowers nothing: on
+  Flash-Next's 128K prefill, with the index pages on top, every KV pass moved the same
+  4,560 chunks, reclaimed nothing and drained the device for 0.26–1.8 s ahead of the
+  next forward. Both halves of the KV gate are needed: holes self-correct under
   allocation, so a steadily-loaded pool reads zero holes with tens of sparse arenas
-  beneath it (gating on holes alone: 16 passes over 110 s, pools at 82%), and
-  sparsity alone misses the burst. **A pass that clips is followed at once**, in the
-  same gap, until one finishes inside its budget (at most four): the next chance is the
-  next wave-loop iteration, which spans a decode quantum and its housekeeping, and a
+  beneath it (gating on holes alone: 16 passes over 110 s, pools at 82%), and sparsity
+  alone misses the burst. **A pass that clips is followed at once**, in the same gap,
+  until one finishes inside its budget (at most four): the next chance is the next
+  wave-loop iteration, which spans a decode quantum and its housekeeping, and a
   burst's remainder stood that long at 70% on the 30B probe.
+- **And not again over ground the last pass could not improve.** A pass — either
+  kind — that ends with the frontier where it began holds the gate shut until
+  something is freed beneath the frontier: a new hole, or an arena gone sparser
+  (`CompactionStall`). Growth alone reopens nothing; it used to reopen on any change
+  of occupancy, and a prefill changes occupancy every forward, so the guard never
+  held while a turn grew.
 - **And a rung of KV pressure relief, ahead of anything that costs a turn or an
-  expert.** `relieve_vram_pressure` packs after compression — whose float→quant rewrite
-  empties float arenas by the tens at once — and again after eviction, before it asks
-  the weight side for ground, the same pass-until-settled. Without it relief conceded expert residency with the pools a third air:
-  193, 240 and 290 MiB in two seconds on the 30B while 287 arenas held what 185 would.
-  Relief runs between forwards, at the same seam as the wave loop's pass.
+  expert.** `relieve_vram_pressure` packs before it evicts and again after, before it
+  asks the weight side for ground, the same pass-until-settled. Without it relief
+  conceded expert residency with the pools a third air: 193, 240 and 290 MiB in two
+  seconds on the 30B while 287 arenas held what 185 would. Relief runs between
+  forwards, at the same seam as the wave loop's pass, and **no rung of it quantizes a
+  turn**: a finished turn's float→quant rewrite is the persistence thread's hot→warm
+  migrate. Run from relief it landed inside whatever wave called it — 0.65–2.4 s
+  inside a 128K decode — and freed nothing for a turn the decode still attended,
+  whose block table keeps the float chunks alive until the slot goes.
 - **Lowering the watermark is followed by lowering the floor.** A non-empty pass
   calls `reclaim_spare_ground()` in the same method, while no wave generation is
   live. The two are one method and not two precisely because either alone buys
-  nothing.
+  nothing. Every model family answers it — `ManagedBatchedModel::reclaim_spare_ground`
+  and `request_kv_ground` reach the expert cache on the qwen4exp, qwen35 and
+  latent-MoE stacks as well as the blanket `BatchedModel` one; where they were the
+  trait's no-op, Flash-Next's zone could regrow only at the head of its next forward,
+  and from one 128K Strata run to the next it stayed down at 24,914 → 23,430 → 21,953
+  slots.
 - **Every holder of a relocated identity is rewritten, structurally.** A chunk's gid
   *is* its location, so moving bytes changes identity. The holders span three crates
   — the backings' block tables, the substrate's residences, the projection caches —

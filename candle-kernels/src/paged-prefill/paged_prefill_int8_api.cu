@@ -17,7 +17,8 @@ extern "C" void run_paged_prefill_int8_fp16(
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
     float, const RopeRungs, int32_t, cudaStream_t,
     const uint32_t*, const uint32_t*, const uint2*, const uint2*, int32_t, int32_t,
-    uint8_t*, int64_t, int64_t, int32_t, int32_t);
+    uint8_t*, int64_t, int64_t, int32_t, int32_t,
+    const uint32_t*, int32_t, int32_t, int32_t, float*, uint32_t*);
 
 extern "C" void run_paged_prefill_int8_bf16(
     const void*, const void*, const void*, const uint8_t*,
@@ -25,7 +26,8 @@ extern "C" void run_paged_prefill_int8_bf16(
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
     float, const RopeRungs, int32_t, cudaStream_t,
     const uint32_t*, const uint32_t*, const uint2*, const uint2*, int32_t, int32_t,
-    uint8_t*, int64_t, int64_t, int32_t, int32_t);
+    uint8_t*, int64_t, int64_t, int32_t, int32_t,
+    const uint32_t*, int32_t, int32_t, int32_t, float*, uint32_t*);
 
 extern "C" void run_paged_prefill_kv_stage_fp16(
     const void*, const void*, const uint8_t*,
@@ -69,7 +71,13 @@ extern "C" void run_paged_prefill_int8(
     int64_t stage_bytes,
     int64_t stage_positions,
     int32_t stage_min_q_len,
-    int32_t stage_max_kv
+    int32_t stage_max_kv,
+    const uint32_t* group_chunks,
+    int32_t n_groups,
+    int32_t group_blocks,
+    int32_t chunk_positions,
+    float* carry,
+    uint32_t* resume
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
     switch (q_dtype) {
@@ -80,7 +88,8 @@ extern "C" void run_paged_prefill_int8(
                 max_q_len, softmax_scale, rungs,
                 rope_interleaved, stream, sel_entries, sel_cnt, sel_pages, sel_page_win,
                 sel_stride, sel_ratio,
-                stage_buf, stage_bytes, stage_positions, stage_min_q_len, stage_max_kv);
+                stage_buf, stage_bytes, stage_positions, stage_min_q_len, stage_max_kv,
+                group_chunks, n_groups, group_blocks, chunk_positions, carry, resume);
             break;
         case ArenaFormat::BF16:
             run_paged_prefill_int8_bf16(
@@ -89,7 +98,8 @@ extern "C" void run_paged_prefill_int8(
                 max_q_len, softmax_scale, rungs,
                 rope_interleaved, stream, sel_entries, sel_cnt, sel_pages, sel_page_win,
                 sel_stride, sel_ratio,
-                stage_buf, stage_bytes, stage_positions, stage_min_q_len, stage_max_kv);
+                stage_buf, stage_bytes, stage_positions, stage_min_q_len, stage_max_kv,
+                group_chunks, n_groups, group_blocks, chunk_positions, carry, resume);
             break;
         default:
             fprintf(stderr, "run_paged_prefill_int8: unsupported q_dtype %d\n", q_dtype);

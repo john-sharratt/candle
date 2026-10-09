@@ -2101,6 +2101,22 @@ impl Substrate {
         residences.len()
     }
 
+    /// How many of `timeline`'s turn residences still hold a device (hot) copy.
+    ///
+    /// What a caller that evicted a timeline polls to learn when its KV has left
+    /// the device: [`Self::mark_timeline_evict_when_cold`] drops the hot copy of
+    /// every warm-backed turn at once, and the persistence thread drops the rest
+    /// as each one's warm copy lands. Zero for an unknown timeline.
+    pub fn timeline_hot_residences(&self, timeline: TimelineId) -> usize {
+        self.timelines.get(&timeline).map_or(0, |entry| {
+            entry
+                .turns
+                .values()
+                .filter(|t| self.residence[t.content.residence.0].hot.is_some())
+                .count()
+        })
+    }
+
     /// Flag a SINGLE turn's residence for full eviction once its KV is durable —
     /// see [`Self::mark_timeline_evict_when_cold`]. Set at splice time (while the
     /// turn is still hot, before the hot→warm migrate) so the migrate's
@@ -9021,6 +9037,30 @@ mod tests {
 
         // Unknown timeline → no-op.
         assert_eq!(sub.mark_timeline_evict_when_cold(alloc.next()), 0);
+    }
+
+    /// `timeline_hot_residences` counts exactly the named timeline's turns that
+    /// still hold a hot copy, and reads zero once the eviction has dropped them.
+    #[test]
+    fn timeline_hot_residences_counts_that_timelines_hot_turns() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let evicted = alloc.next();
+        let live = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(evicted, layer, group);
+        sub.register_timeline(live, layer, group);
+        install_hot_and_warm(&mut sub, evicted, 10);
+        install_hot_and_warm(&mut sub, evicted, 10);
+        install_hot_and_warm(&mut sub, live, 10);
+
+        assert_eq!(sub.timeline_hot_residences(evicted), 2);
+        assert_eq!(sub.timeline_hot_residences(live), 1);
+        sub.mark_timeline_evict_when_cold(evicted);
+        assert_eq!(sub.timeline_hot_residences(evicted), 0);
+        assert_eq!(sub.timeline_hot_residences(live), 1);
+        assert_eq!(sub.timeline_hot_residences(alloc.next()), 0);
     }
 
     /// A residence pinned into the current wave's working set is NOT evicted by

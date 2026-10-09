@@ -2182,6 +2182,14 @@ impl ChunkedKvBacking {
                     // the next verify's full 43-layer re-serialisation — the
                     // mark is what lets a partial-accept step keep
                     // plain-wave-cost metadata.
+                    //
+                    // **From the landing chunk, which is the one that changed.**
+                    // Left unnamed, the mark falls back to the writer boundary —
+                    // chunk 0 for a turn written from its first token, so every
+                    // rollback re-serialised the whole sequence on every layer:
+                    // 1.6 ms a layer at 128K, enough to leave the GPU waiting on
+                    // the host for most of each verify step.
+                    slot.note_fill_from(i);
                     patch_writer = true;
                 } else {
                     // Chunks were freed: the serialized chunk count is wrong

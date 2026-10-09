@@ -1043,6 +1043,20 @@ impl ManagedBatchedModel for BatchedEngine {
         self.engine.experts().reset_expert_stats();
     }
 
+    /// Buy `regions` of expert-zone ground for the KV side, between forwards — the
+    /// scheduler's half of the boundary. See `ExpertCache::request_kv_ground`.
+    fn request_kv_ground(&self, regions: usize) -> u64 {
+        self.engine.experts().request_kv_ground(regions)
+    }
+
+    /// Let the expert zone take back KV ground standing free, between forwards.
+    /// The wave asks at its own head; this is the scheduler asking after a
+    /// compaction or a settle, which would otherwise wait for the next forward and
+    /// find it buying ground instead.
+    fn reclaim_spare_ground(&self) {
+        self.engine.experts().reclaim_spare_ground();
+    }
+
     fn snapshot_profiles(&self) -> ProfileSnapshot {
         // Drain the expert pipeline thread's `pipe_*` spans and, in a profile
         // build, the expert GEMMs' worker counters (copy and cold-wait time) so

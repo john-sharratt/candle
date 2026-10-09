@@ -41,13 +41,26 @@ extern "C" {
         // The pre-staged K/V (`src/paged-prefill/kv_stage.cuh`): null stages
         // nothing; otherwise every sequence with `q_len >= stage_min_q_len`
         // is staged into `stage_buf` (`stage_bytes` long; `stage_positions`
-        // the sum of those sequences' kv lengths, `stage_max_kv` the deepest)
-        // ahead of the attention kernel, which reads its columns from there.
+        // the planes' rows per head — the widest key window any launch
+        // stages — and `stage_max_kv` the deepest sequence) one key window at
+        // a time ahead of the attention kernel, which reads its columns from
+        // there.
         stage_buf: *mut u8,
         stage_bytes: i64,
         stage_positions: i64,
         stage_min_q_len: i32,
         stage_max_kv: i32,
+        // The cut (`PrefillCut` in `paged_prefill_int8_kernel.cuh`):
+        // `n_groups` row groups of `group_blocks` grid-x blocks, group g
+        // running `group_chunks[g]` key windows of `chunk_positions` — a HOST
+        // array — and the online-softmax carry and resume table the windows
+        // hand on, null when no group runs more than one window.
+        group_chunks: *const u32,
+        n_groups: i32,
+        group_blocks: i32,
+        chunk_positions: i32,
+        carry: *mut f32,
+        resume: *mut u32,
     );
 
     /// The pre-staging pass of [`run_paged_prefill_int8`] alone, into

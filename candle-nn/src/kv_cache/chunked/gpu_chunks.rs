@@ -9,9 +9,11 @@
 //! entries before it stay valid as they stand: a sequence crossing a 32-token
 //! boundary serialises its new tail ([`GpuChunksGuard::extend_decode`]), not its
 //! whole history. Dirty chunk indices accumulate on the [`GpuChunksGuard`]; on drop
-//! the guard coalesces adjacent indices into runs, packs each run's two ranges (the
-//! headers range + the records range) into a pinned staging buffer, and uploads
-//! them from there.
+//! the guard coalesces adjacent indices into runs of two ranges each (the headers
+//! range + the records range). Inside a slot sync, which has a
+//! [`super::slot_upload_batch`] open, the ranges join the batch and every slot the
+//! sync touched is copied by one scatter; anywhere else they are packed into a
+//! pinned staging buffer and uploaded from there.
 //!
 //! **No copy ever reads the host copy.** An upload runs when the stream reaches
 //! it, not when it is issued, so a copy sourced from the live bytes would carry
@@ -23,6 +25,7 @@
 use super::head_gids::HeadGids;
 use super::meta_pool::MetaGid;
 use super::slot_state_arena::{self, SlotStateSlot};
+use super::slot_upload_batch;
 use super::types::ChunkWindow;
 use crate::kv_cache::arena_table::ResolvedArenaInfo;
 #[cfg(test)]
@@ -361,8 +364,13 @@ impl GpuChunks {
     /// a copy already in flight whose DESTINATION is this slot. Handing that
     /// slot to another sequence lets the pending transfer land in a buffer it
     /// does not own.
+    ///
+    /// Copies into it still pending in this thread's open upload batch are
+    /// dropped: they were this sequence's bytes, and the slot's next tenant
+    /// writes its own.
     fn release_slot(&mut self) {
         if let (Some(slot), Some(device)) = (self.slot.take(), self.device.as_ref()) {
+            slot_upload_batch::forget(slot.ptr);
             slot_state_arena::release(device, slot);
         }
     }
@@ -1022,6 +1030,13 @@ impl Drop for GpuChunksGuard<'_> {
 
         let rec_bytes = chunk_byte_size - SLICE_HEADER_BYTES;
         let all = upload_ranges(&self.dirty_chunks, n_chunks, self.inner.capacity, rec_bytes);
+
+        // **Deferred into the open batch**, where a decode metadata build has
+        // one: every slot the build brings up to date is copied by one launch
+        // when it flushes, rather than by its own driver calls here.
+        if slot_upload_batch::defer(&device, slot_ptr, &all, &self.inner.host) {
+            return;
+        }
 
         // **Recorded where the thread is recording a wave**: the bytes go into
         // the wave's ring and the copy into its segment, so bringing the slot up

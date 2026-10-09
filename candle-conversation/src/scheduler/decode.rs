@@ -1,11 +1,11 @@
 use super::block_guard::BlockGuard;
 use super::named_tool::steer_to_named_tool;
-use super::spec_chooser::SpecChooser;
+use super::spec_chooser::{locate_rows, SpecChooser};
 use super::*;
 use crate::recorded_reply::{departure, replayed_step};
 use crate::stats::streams_committed;
 use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
-use candle_transformers::models::speculative_choice::{AcceptWalk, TokenChooser};
+use candle_transformers::models::speculative_choice::AcceptWalk;
 
 /// The leading tokens of a healed token, waiting to be forwarded.
 ///
@@ -971,15 +971,18 @@ impl Scheduler {
 
         // ── Accept walk ──────────────────────────────────────────────────────
         //
-        // One sampler dispatch per block position over the sequences still
-        // alive. Sampling each row — rather than taking its argmax — is what
-        // draws each row from the distribution plain decoding would: every
-        // drafter here proposes greedily, so the textbook accept/reject rule
-        // collapses to "sample the row, accept the proposal iff the sample
-        // agrees" (see `candle_transformers::models::speculative_choice`). On
-        // top of that rule the chooser commits a draft the sample missed when
-        // the model's typical-acceptance thresholds pass it, inside the same
-        // dispatch — the one place a sampled step departs from plain decoding.
+        // Every block position of every sequence is scored in ONE sampler
+        // dispatch, each priced against the history its earlier positions'
+        // drafts would leave, and the walk then commits position by position
+        // from those picks (`SpecChooser`). Sampling each row — rather than
+        // taking its argmax — is what draws each row from the distribution plain
+        // decoding would: every drafter here proposes greedily, so the textbook
+        // accept/reject rule collapses to "sample the row, accept the proposal
+        // iff the sample agrees" (see `candle_transformers::models::
+        // speculative_choice`). On top of that rule the chooser commits a draft
+        // the sample missed when the model's typical-acceptance thresholds pass
+        // it, inside the same dispatch — the one place a sampled step departs
+        // from plain decoding.
         let t_sample = std::time::Instant::now();
         let (state_ids, states): (Vec<SequenceId>, Vec<SequenceSamplingState>) =
             removed_states.into_iter().unzip();
@@ -989,6 +992,19 @@ impl Scheduler {
             configs,
             self.model.typical_acceptance(),
         );
+        let scored = {
+            let _g = profile::span("decode:score");
+            locate_rows(&held.rows, &rows_of)
+                .and_then(|(block, positions)| chooser.score(block, &positions, &blocks))
+        };
+        if let Err(e) = scored {
+            for (id, state) in state_ids.into_iter().zip(chooser.into_states()) {
+                self.sampling_states.insert(id, state);
+            }
+            self.model.abort_verify(&spec_seqs);
+            self.fail_all_decodes(&seq_ids, &format!("sampling failed: {e}"));
+            return;
+        }
         let mut emitted: Vec<Vec<u32>> = vec![Vec::new(); blocks.len()];
         // How many more tokens each sequence may generate. The sinks apply only
         // this and EOS — the cheap half of the stop policy, which bounds how much
@@ -1014,22 +1030,7 @@ impl Scheduler {
             let mut ruled = vec![false; blocks.len()];
             while !walk.finished() {
                 let rows = walk.rows();
-                let picked: Vec<Tensor> = walk
-                    .alive()
-                    .iter()
-                    .map(|&i| rows_of[i][walk.position()].clone())
-                    .collect();
-                let cat_span = profile::span("walk:cat");
-                let stacked = Tensor::cat(&picked, 0);
-                cat_span.end();
-                let stacked = match stacked {
-                    Ok(t) => t,
-                    Err(e) => {
-                        failure = Some(e);
-                        break;
-                    }
-                };
-                let tokens = match chooser.choose(&stacked, &rows) {
+                let tokens = match chooser.commit(&rows) {
                     Ok(t) => t,
                     Err(e) => {
                         failure = Some(e);

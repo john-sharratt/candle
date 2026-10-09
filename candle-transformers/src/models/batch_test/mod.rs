@@ -39,8 +39,11 @@ pub mod span_report;
 /// is. Pure string work with no test-only dependencies.
 pub mod story_normalize;
 /// Strata's published single-session speed benchmark, rebuilt request for
-/// request and run through the harness. Test-only, like [`utils`].
-#[cfg(test)]
+/// request and run through the harness.
+///
+/// Outside `#[cfg(test)]` beside [`utils`], for the same reason: the engine one
+/// crate up delivers the *same* requests (`fragmentation_probe::run_strata`), and
+/// it can only send byte-identical ones if it builds them with these functions.
 pub mod strata_bench;
 #[cfg(test)]
 pub mod test_helpers;

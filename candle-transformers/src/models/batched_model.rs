@@ -44,8 +44,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, prefill_kv_stage_positions,
-    LayerPhase, ModelGeometry, WavePlan, WaveWidth,
+    begin_forward, begin_wave, end_wave_transient, plan_wave_transient, LayerPhase, ModelGeometry,
+    PrefillKvStageLayout, PrefillLaunchBounds, WavePlan, WaveWidth,
 };
 use candle_nn::Module;
 
@@ -363,10 +363,11 @@ pub trait BatchedModelCore {
     }
 
     /// The wave transient tier a prefill of `rows` rows across `sequences`
-    /// would need, in bytes, with `stage_positions` key positions pre-staged by
-    /// its attention (`candle_nn::kv_cache::prefill_kv_stage_positions` over
-    /// the wave's chunks and their depths — the one quantity in the tier that
-    /// grows with context rather than with width).
+    /// would need, in bytes, with its attention launch carving the pre-stage,
+    /// carry and resume table of chunks of `stage_q_lens` rows at
+    /// `stage_offsets` (`candle_nn::kv_cache::PrefillKvStageLayout` — the one
+    /// quantity in the tier that follows context depth rather than width, up
+    /// to its key-chunk bound).
     ///
     /// **The same function the tier is actually placed from**, not an estimate
     /// of it: admission judges an offer on the residency it dislodges, and the
@@ -380,7 +381,8 @@ pub trait BatchedModelCore {
         &self,
         _rows: usize,
         _sequences: usize,
-        _stage_positions: usize,
+        _stage_q_lens: &[usize],
+        _stage_offsets: &[usize],
         _act_dtype: DType,
     ) -> Option<u64> {
         None
@@ -867,7 +869,8 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             let rows = n_decode + pre_rows + glue_rows;
             if rows > 0 {
                 if let Device::Cuda(d) = self.model.device() {
-                    let plan = WavePlan::new(self.model.wave_geometry(embed_dtype));
+                    let geometry = self.model.wave_geometry(embed_dtype);
+                    let plan = WavePlan::new(geometry);
                     // The plan prices all three phases from the wave's
                     // composition, the forward one included — it knows what the
                     // head's logits cost because the geometry carries `vocab`.
@@ -896,10 +899,17 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                         accept_rows: if accept_in_place { scored_rows } else { 0 },
                         // This stack's attention is dense: no sparse selection.
                         qsa_bytes: 0,
-                        // The prefill launch's pre-staged K/V: every position
-                        // of each bulk chunk's sequence. Glue rows take their
-                        // own kernel, which stages nothing.
-                        kv_stage_positions: prefill_kv_stage_positions(pre_q, pre_off),
+                        // The prefill launch's carve: up to one key chunk of
+                        // each bulk chunk's sequence, and the carry beside it.
+                        // Glue rows take their own kernel, which stages nothing.
+                        kv_stage: PrefillKvStageLayout::new(
+                            pre_q,
+                            pre_off,
+                            geometry.n_head,
+                            geometry.n_kv_head,
+                            geometry.head_dim,
+                            PrefillLaunchBounds::PRODUCTION,
+                        ),
                     };
                     let per_phase = [
                         plan.phase_bytes(LayerPhase::Attention, width),

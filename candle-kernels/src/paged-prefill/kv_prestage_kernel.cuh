@@ -11,9 +11,10 @@
 // that same four-aligned quad, so a staged column carries the bits a decoded
 // one would.
 //
-// Grid: x over 32-position groups (8 warps × 4) of the deepest staged
-// sequence, y = KV head, z = sequence. A sequence too short to stage, and a
-// warp past its sequence's kv length, exit at once.
+// Grid: x over 32-position groups (8 warps × 4) of the launch's key window up
+// to the deepest staged sequence, y = KV head, z = sequence. A sequence too
+// short to stage or with no token in the row group, and a warp past its
+// sequence's kv length or the window, exit at once.
 // ============================================================================
 
 #include <cuda.h>
@@ -52,24 +53,28 @@ paged_prefill_kv_prestage_kernel(
     const int kv_head_idx = (int)blockIdx.y;
 
     const int q_len = (int)q_lens[b];
-    if (q_len < stage.min_q_len) return; // block-uniform: not a staged sequence
+    // Block-uniform: not a staged sequence, or none of its tokens in the group.
+    if (q_len < stage.min_q_len || q_len <= stage.tok_lo) return;
     const int kv_len = (int)kv_lens[b];
-    const int pos0 = ((int)blockIdx.x * KV_PRESTAGE_WARPS + warp) * 4;
-    if (pos0 >= kv_len) return; // warp-uniform: nothing below `__syncwarp` scope
+    const int pos0 = stage.chunk_lo + ((int)blockIdx.x * KV_PRESTAGE_WARPS + warp) * 4;
+    // Warp-uniform: nothing below `__syncwarp` scope. The window's end is a
+    // multiple of 32, so a quad that starts inside it ends inside it.
+    if (pos0 >= kv_len || pos0 >= stage.chunk_hi) return;
     int prefix_len = kv_len - q_len;
     if (prefix_len < 0) prefix_len = 0;
 
-    const int64_t seq_base = kv_stage_seq_base(q_lens, kv_lens, b, stage.min_q_len);
+    const int64_t seq_base = kv_stage_seq_base(q_lens, kv_lens, b, stage);
     // The host sized the planes from its own lengths; a device length that
     // reaches past them would write another sequence's rows, or past the
     // buffer. Refuse rather than stage over them.
-    if (seq_base + kv_len > stage.positions) __trap();
+    if (seq_base + kv_stage_seq_rows(kv_len, stage) > stage.positions) __trap();
 
     const SlotHeader& slot_hdr = get_slot_header(headers_ptr, b);
     const RopeView rope = rope_view(rungs, slot_hdr.rope_rung);
     const int q_start = (int)cu_seqlens_q[b];
 
-    const int64_t row0 = (int64_t)kv_head_idx * stage.positions + seq_base + pos0;
+    const int64_t row0 =
+        (int64_t)kv_head_idx * stage.positions + seq_base + (pos0 - stage.chunk_lo);
     int8_t* const kc = kv_stage_k<HEAD_DIM>(stage, n_kv_head) + row0 * HEAD_DIM;
     __half* const ks = kv_stage_k_scale<HEAD_DIM>(stage, n_kv_head) + row0 * N_WIN;
     __half* const vv = kv_stage_v<HEAD_DIM>(stage, n_kv_head) + row0 * HEAD_DIM;
@@ -90,10 +95,11 @@ paged_prefill_kv_prestage_kernel(
         });
 }
 
-/// Stage every position of the launch's sequences with `q_len >=
-/// stage.min_q_len` into `stage`. `max_kv_len` is the deepest of them, which
-/// sizes the grid; `stage_bytes` is the buffer's length, refused when the
-/// planes for `stage.positions` do not fit it.
+/// Stage the key window of the launch's sequences with `q_len >=
+/// stage.min_q_len` and a token in the row group into `stage`. `max_kv_len` is
+/// the deepest of them, which with the window sizes the grid; `stage_bytes` is
+/// the buffer's length, refused when the planes for `stage.positions` do not
+/// fit it. A window that starts past every sequence stages nothing.
 template <typename QT, int HEAD_DIM>
 inline void launch_paged_prefill_kv_prestage(
     const void* k_ptr,
@@ -120,7 +126,9 @@ inline void launch_paged_prefill_kv_prestage(
                 (long long)stage_bytes, (void*)stage.buf);
         abort();
     }
-    dim3 grid((uint32_t)((max_kv_len + KV_PRESTAGE_POSITIONS - 1) / KV_PRESTAGE_POSITIONS),
+    const int64_t window = kv_stage_seq_rows(max_kv_len, stage);
+    if (window <= 0) return;
+    dim3 grid((uint32_t)((window + KV_PRESTAGE_POSITIONS - 1) / KV_PRESTAGE_POSITIONS),
               (uint32_t)n_kv_head, (uint32_t)batch_size);
     paged_prefill_kv_prestage_kernel<QT, HEAD_DIM><<<grid, KV_PRESTAGE_THREADS, 0, stream>>>(
         (const QT*)k_ptr, (const QT*)v_ptr, headers_ptr, cu_seqlens_q, q_lens, kv_lens,

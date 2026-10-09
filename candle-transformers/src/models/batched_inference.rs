@@ -44,7 +44,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     fragmentation, plan_pool, ArenaKey, ArenaLocation, ChunkedKvBacking, CompressionPolicy,
     Fragmentation, GpuArenaClassStats, GroundLost, HeadGids, KvCache, KvFormat, ModelGeometry,
-    QuantFormat, SizeClass, WavePlan, WaveWidth, WAVE_FFN_BYTES,
+    PrefillKvStageLayout, PrefillLaunchBounds, QuantFormat, SizeClass, WavePlan, WaveWidth,
+    WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -1288,10 +1289,15 @@ impl BatchedInferenceSession {
             slot_shape.push((n_ch as u32, wi as u32));
         }
 
-        let mut slot_rebuild_time = std::time::Duration::ZERO;
-        let mut slot_reuse_time = std::time::Duration::ZERO;
-        let mut saw_slot_rebuild = false;
-        let mut saw_slot_reuse = false;
+        // Each sync kind's host time and slot count over the group's layers: a
+        // reuse hands out the live buffer, a resync first re-serialises its stale
+        // writer region, an extend its appended tail, a rebuild the whole slot.
+        let mut slot_reuse = (std::time::Duration::ZERO, 0u64);
+        let mut slot_resync = (std::time::Duration::ZERO, 0u64);
+        let mut slot_extend = (std::time::Duration::ZERO, 0u64);
+        let mut slot_rebuild = (std::time::Duration::ZERO, 0u64);
+        // The one batched upload per layer that copies every slot re-serialised.
+        let mut slot_upload = (std::time::Duration::ZERO, 0u64);
 
         for (slot, backing) in group.iter().enumerate() {
             // Capacity for the upcoming write is ensured for EVERY layer of the
@@ -1318,14 +1324,18 @@ impl BatchedInferenceSession {
                 generation,
                 &snapshot_mask,
             )?;
-            // A resync is a reuse that first patched the writer region, and an
-            // extend one that first serialised its appended tail, so decode
-            // reads both as one.
-            slot_reuse_time +=
-                sync_stats.reuse_time + sync_stats.resync_time + sync_stats.extend_time;
-            slot_rebuild_time += sync_stats.rebuild_time;
-            saw_slot_reuse |= sync_stats.reuses + sync_stats.resyncs + sync_stats.extends > 0;
-            saw_slot_rebuild |= sync_stats.rebuilds > 0;
+            slot_reuse.0 += sync_stats.reuse_time;
+            slot_reuse.1 += sync_stats.reuses;
+            slot_resync.0 += sync_stats.resync_time;
+            slot_resync.1 += sync_stats.resyncs;
+            slot_extend.0 += sync_stats.extend_time;
+            slot_extend.1 += sync_stats.extends;
+            slot_rebuild.0 += sync_stats.rebuild_time;
+            slot_rebuild.1 += sync_stats.rebuilds;
+            if sync_stats.resyncs + sync_stats.extends + sync_stats.rebuilds > 0 {
+                slot_upload.0 += sync_stats.upload_time;
+                slot_upload.1 += 1;
+            }
 
             // Append this layer's headers (one `SlotHeader` per sequence; the
             // position map field is 0 — see `slot_shape` above).
@@ -1360,16 +1370,17 @@ impl BatchedInferenceSession {
             }
         }
 
-        pipeline_record_duration(
-            "decode:slot_reuse",
-            slot_reuse_time,
-            u64::from(saw_slot_reuse),
-        );
-        pipeline_record_duration(
-            "decode:slot_rebuild",
-            slot_rebuild_time,
-            u64::from(saw_slot_rebuild),
-        );
+        for (name, (time, count)) in [
+            ("decode:slot_reuse", slot_reuse),
+            ("decode:slot_resync", slot_resync),
+            ("decode:slot_extend", slot_extend),
+            ("decode:slot_rebuild", slot_rebuild),
+            ("decode:slot_upload", slot_upload),
+        ] {
+            if count > 0 {
+                pipeline_record_duration(name, time, count);
+            }
+        }
 
         // The group's headers go to DEVICE memory in one pinned → GPU copy.
         // Every block of every attention launch opens on its slot header and
@@ -2283,6 +2294,14 @@ impl BatchedInferenceSession {
                 held.saturating_sub(packed)
             })
             .sum()
+    }
+
+    /// The highest region any KV arena of this session's device holds, band and
+    /// record pools together — see [`ChunkedKvBacking::kv_top_rank`]. Read beside
+    /// [`Self::kv_region_stats`]'s frontier, it says whether a KV arena is what
+    /// stands at the frontier, and so whether a KV compaction could lower it.
+    pub fn kv_top_rank(&self) -> Option<usize> {
+        self.backings.first().and_then(|b| b.kv_top_rank())
     }
 
     /// The region pool's own counters for this session's device.
@@ -4147,17 +4166,17 @@ pub trait ManagedBatchedModel {
     }
 
     /// The wave transient tier a prefill of `rows` rows across `sequences`
-    /// would need, in bytes, with `stage_positions` key positions pre-staged
-    /// ([`WaveWidth::kv_stage_positions`]).
+    /// would need, in bytes, with its attention launch carving for chunks of
+    /// `stage_q_lens` rows at `stage_offsets` ([`WaveWidth::kv_stage`]).
     ///
     /// **The same function the tier is actually placed from**, not an estimate
     /// of it: admission judges an offer on the residency it dislodges, and the
     /// tier dislodges weights exactly as a region claim does. Pricing it any
     /// other way lets the two figures drift, and the one that drifts is the one
-    /// the placement then refuses. The pre-stage is the one buffer priced by
-    /// depth rather than width — at 296K tokens of Flash-Next history ~460 MB a
-    /// layer's launch — so its positions come from the caller, who knows the
-    /// sequences' depths.
+    /// the placement then refuses. The launch's carve is the one buffer priced
+    /// by depth rather than width — until a sequence passes one key chunk, past
+    /// which it is the same ~153 MB a launch on Flash-Next at any depth — so
+    /// the chunks and their depths come from the caller, who knows them.
     ///
     /// The tier is superlinear in *spans*, not only in rows — the mixer's span
     /// tables hold an entry per span and the prefill scan's transients turn on
@@ -4168,14 +4187,23 @@ pub trait ManagedBatchedModel {
         &self,
         rows: usize,
         sequences: usize,
-        stage_positions: usize,
+        stage_q_lens: &[usize],
+        stage_offsets: &[usize],
         act_dtype: DType,
     ) -> Option<u64> {
+        let geometry = self.wave_geometry(act_dtype);
         let width = WaveWidth {
-            kv_stage_positions: stage_positions,
+            kv_stage: PrefillKvStageLayout::new(
+                stage_q_lens,
+                stage_offsets,
+                geometry.n_head,
+                geometry.n_kv_head,
+                geometry.head_dim,
+                PrefillLaunchBounds::PRODUCTION,
+            ),
             ..WaveWidth::prefill(rows, sequences.max(1))
         };
-        Some(WavePlan::new(self.wave_geometry(act_dtype)).tier_bytes(width) as u64)
+        Some(WavePlan::new(geometry).tier_bytes(width) as u64)
     }
 
     /// Rows the KV side has room to admit, or `None` when it cannot say.

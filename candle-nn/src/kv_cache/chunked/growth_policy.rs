@@ -112,12 +112,73 @@ pub fn kv_grow_step(spare: usize, min_grant: usize) -> usize {
     (spare / 2).max(min_grant).min(spare)
 }
 
+/// The free regions a KV side keeps in hand, as its scheduler defines them: below
+/// [`Self::setpoint`] it is under pressure, and its relief frees to
+/// [`Self::relieved`].
+///
+/// **One definition for both sides of the boundary.** The scheduler's relief
+/// concedes weight ground until the KV side holds the relieved count free; the
+/// weight side's growth takes free ground back down to its own slack. When the
+/// two disagree they trade the same regions forever: on Flash-Next's 128K decode
+/// the weight side left 32 regions free against a relief setpoint of 50, so every
+/// decode step bought 12 regions back from the zone and the next forward's growth
+/// took them again — 277 boundary moves in one Strata run, each behind two
+/// device-wide quiesces. So the pool is told the target (`set_kv_free_target`) and
+/// the growth policy leaves at least what relief aims for.
+///
+/// `divisor == 0` is no target at all: a span with no scheduler defending it, such
+/// as the bare forward harness, leaves only the growth slack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FreeRegionTarget {
+    /// The setpoint is the KV side's region count over this.
+    pub divisor: usize,
+    /// …but never fewer than this many regions.
+    pub floor: usize,
+    /// Regions relief frees past the setpoint, so a pass that just clears
+    /// pressure does not re-trip on the next wave.
+    pub overshoot: usize,
+}
+
+impl FreeRegionTarget {
+    pub const fn new(divisor: usize, floor: usize, overshoot: usize) -> Self {
+        Self {
+            divisor,
+            floor,
+            overshoot,
+        }
+    }
+
+    /// Free regions below which a KV side of `total` regions is under pressure:
+    /// `total / divisor`, at least `floor`, and never more than half the span —
+    /// on a card too small for the floor, demanding it would be permanent
+    /// pressure that no relief pass could ever clear.
+    pub fn setpoint(&self, total: usize) -> usize {
+        if self.divisor == 0 {
+            return 0;
+        }
+        (total / self.divisor).max(self.floor).min(total / 2)
+    }
+
+    /// The free regions relief frees to — the setpoint plus the overshoot — and
+    /// so what the weight side must leave free.
+    pub fn relieved(&self, total: usize) -> usize {
+        match self.setpoint(total) {
+            0 => 0,
+            s => s + self.overshoot,
+        }
+    }
+}
+
 /// What the pool measures for one negotiation.
 ///
 /// Gathered at phase 0, where the present is knowable exactly: the tier has been
 /// released, no wave generation is open, and empty arenas have just been swept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Occupancy {
+    /// Regions the KV side holds in all — live, free and tier-blocked.
+    pub total: usize,
+    /// The free regions the KV side's scheduler keeps in hand.
+    pub kv_target: FreeRegionTarget,
     /// Regions held by an arena, empty or not.
     pub live: usize,
     /// Regions on the free list below the tier ceiling — claimable right now.
@@ -138,6 +199,19 @@ pub struct Occupancy {
     pub free_above_live: usize,
     /// The transient tier's current footprint, bytes.
     pub tier_bytes: usize,
+    /// The tier the most recent forward stood, bytes — what the next forward's is
+    /// expected to need again, and so ground the negotiation leaves free.
+    ///
+    /// **The next forward's tier, by its best predictor.** A prefill runs as a run
+    /// of forwards a chunk apart, each tier a little wider than the last; the
+    /// negotiation between two of them used to read the first one's released ground
+    /// as spare, hand it to the weight side, and the second forward's placement
+    /// bought it straight back. Measured on Flash-Next's 128K prefill: a compaction
+    /// between forwards lowered the live count, the negotiation granted 1,631 slots,
+    /// and the next placement conceded 1,877 — twice per turn, each a pair of
+    /// boundary moves. A decode's tier is a few regions, so once the prefill is done
+    /// the weight side grows back into everything the prefill's tier held.
+    pub last_tier_bytes: usize,
     /// The widest tier this process has stood, bytes.
     ///
     /// The high-water rather than the live figure, because the live one is zero
@@ -260,25 +334,28 @@ impl GrowthPolicy {
         // That matters because the comment here used to argue the opposite: that
         // the tier need not be deducted since `ceiling_blocked` *is* the tier's
         // ground. It is, during a wave — and never at the one moment this runs.
-        // So the next wave's tier is genuinely unaccounted for, and the honest
-        // statement is that this offers ground the tier may then have to buy
-        // back through `set_ground_broker`, at the cost of churn rather than
-        // failure.
         //
-        // Deducting `transient_high_water` was tried and is worse: it is the
-        // widest tier the process ever stood (up to the full reservation), not
-        // the next one's price, and on the 27B it cut applied grants from 17 to 4
-        // and cost five layers of residency. The right term is this wave's
-        // planned tier, which `WavePlan` knows and this signature does not — so
-        // it is left undeducted deliberately, and named.
+        // **So the next forward's tier is deducted, by the last forward's**
+        // (`last_tier_bytes`). Deducting `transient_high_water` was tried and is
+        // worse: it is the widest tier the process ever stood (up to the full
+        // reservation), not the next one's price, and on the 27B it cut applied
+        // grants from 17 to 4 and cost five layers of residency. The last tier is
+        // the next one's price within a prefill, and a few regions once decoding.
+        //
+        // **What stays free besides is the slack or the KV side's relief target,
+        // whichever is larger** — see [`FreeRegionTarget`]. Taking the KV side below
+        // what its own relief frees to is taking ground relief will buy straight
+        // back.
+        let keep = slack.max(occ.kv_target.relieved(occ.total))
+            + occ.last_tier_bytes.div_ceil(region_bytes.max(1));
         let by_occupancy = occ.free_below_ceiling + occ.ceiling_blocked;
-        if by_occupancy.saturating_sub(slack) == 0 {
+        if by_occupancy.saturating_sub(keep) == 0 {
             return Err(Refusal::Occupied);
         }
         // **Only the frontier gap is takeable.** The free count includes holes
         // below live regions, which the floor cannot cross; the grant is the gap
-        // less the slack, whatever the free list says.
-        match by_occupancy.min(occ.free_above_live).saturating_sub(slack) {
+        // less what stays free, whatever the free list says.
+        match by_occupancy.min(occ.free_above_live).saturating_sub(keep) {
             0 => Err(Refusal::Fragmented),
             n => Ok(n),
         }
@@ -294,13 +371,77 @@ mod tests {
     /// A packed KV side: every free region sits above the live ones.
     fn steady(live: usize, free: usize) -> Occupancy {
         Occupancy {
+            total: live + free,
+            kv_target: FreeRegionTarget::default(),
             live,
             free_below_ceiling: free,
             ceiling_blocked: 0,
             free_above_live: free,
             tier_bytes: 0,
+            last_tier_bytes: 0,
             tier_high_water: 0,
         }
+    }
+
+    /// **The prefill churn, closed.** Between two prefill forwards the first
+    /// one's tier has been released, and its ground read as spare; the weight
+    /// side took it and the next placement bought it back. The last forward's
+    /// tier is left free, and only what lies beyond it is offered.
+    #[test]
+    fn the_last_forwards_tier_is_left_free() {
+        let mut p = GrowthPolicy::new();
+        let occ = Occupancy {
+            last_tier_bytes: 300 * R,
+            ..steady(100, 400)
+        };
+        let _ = p.spare(occ, 32, R);
+        let _ = p.spare(occ, 32, R);
+        assert_eq!(p.spare(occ, 32, R), Ok(400 - 300 - 32));
+        // A tier wider than the gap leaves nothing to take.
+        let wide = Occupancy {
+            last_tier_bytes: 380 * R,
+            ..steady(100, 400)
+        };
+        assert_eq!(p.spare(wide, 32, R), Err(Refusal::Occupied));
+    }
+
+    /// The relief target the scheduler defends at load: span/8, at least 24
+    /// regions, freed 8 past.
+    const LOAD: FreeRegionTarget = FreeRegionTarget::new(8, 24, 8);
+
+    #[test]
+    fn the_setpoint_scales_with_the_span_floors_and_clamps_to_half() {
+        assert_eq!(LOAD.setpoint(800), 100, "span/8 once it clears the floor");
+        assert_eq!(LOAD.setpoint(100), 24, "the floor below that");
+        assert_eq!(LOAD.setpoint(32), 16, "never more than half the span");
+        assert_eq!(LOAD.relieved(800), 108);
+        assert_eq!(LOAD.relieved(0), 0, "no span, no demand");
+        assert_eq!(FreeRegionTarget::default().relieved(800), 0, "no target");
+    }
+
+    /// **The oscillation, closed.** A weight side that took the KV side down to its
+    /// 32-region slack left it below a relief setpoint of 50, and relief bought the
+    /// ground straight back. With the target in the occupancy, the grant stops at
+    /// what relief frees to.
+    #[test]
+    fn the_weight_side_leaves_what_relief_frees_to() {
+        let mut p = GrowthPolicy::new();
+        let occ = Occupancy {
+            kv_target: LOAD,
+            ..steady(330, 70)
+        };
+        let _ = p.spare(occ, 32, R);
+        let _ = p.spare(occ, 32, R);
+        // 400 regions: setpoint 50, relieved 58 — 70 free leaves 12 to take,
+        // where the slack alone would have offered 38.
+        assert_eq!(p.spare(occ, 32, R), Ok(70 - 58));
+        // And a KV side at the relief target has nothing to give.
+        let at_target = Occupancy {
+            kv_target: LOAD,
+            ..steady(342, 58)
+        };
+        let _ = p.spare(at_target, 32, R);
+        assert_eq!(p.spare(at_target, 32, R), Err(Refusal::Occupied));
     }
 
     /// The first negotiation never grants, whatever the card looks like — a span
@@ -340,11 +481,14 @@ mod tests {
     fn tier_blocked_ground_counts_as_available() {
         let mut p = GrowthPolicy::new();
         let occ = Occupancy {
+            total: 200,
+            kv_target: FreeRegionTarget::default(),
             live: 100,
             free_below_ceiling: 20,
             ceiling_blocked: 80,
             free_above_live: 100,
             tier_bytes: 0,
+            last_tier_bytes: 0,
             tier_high_water: 57 * R,
         };
         let _ = p.spare(occ, 32, R);
@@ -371,11 +515,14 @@ mod tests {
     fn only_the_frontier_gap_is_offered() {
         let mut p = GrowthPolicy::new();
         let occ = Occupancy {
+            total: 587,
+            kv_target: FreeRegionTarget::default(),
             live: 150,
             free_below_ceiling: 437,
             ceiling_blocked: 0,
             free_above_live: 587 - 199,
             tier_bytes: 0,
+            last_tier_bytes: 0,
             tier_high_water: 0,
         };
         let _ = p.spare(occ, 32, R);
@@ -389,11 +536,14 @@ mod tests {
     fn free_ground_below_a_live_region_refuses_as_fragmented() {
         let mut p = GrowthPolicy::new();
         let occ = Occupancy {
+            total: 400,
+            kv_target: FreeRegionTarget::default(),
             live: 100,
             free_below_ceiling: 300,
             ceiling_blocked: 0,
             free_above_live: 20,
             tier_bytes: 0,
+            last_tier_bytes: 0,
             tier_high_water: 0,
         };
         let _ = p.spare(occ, 32, R);

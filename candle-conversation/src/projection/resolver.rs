@@ -3720,6 +3720,12 @@ impl Conversation {
         self.write().mark_timeline_evict_when_cold(timeline)
     }
 
+    /// How many of `timeline`'s turns still hold a device copy — see
+    /// [`crate::substrate::Substrate::timeline_hot_residences`].
+    pub fn timeline_hot_residences(&self, timeline: TimelineId) -> usize {
+        self.read().timeline_hot_residences(timeline)
+    }
+
     /// Rewrite every residence's gids through a KV compaction's map — the
     /// substrate's half of the sweep. See
     /// [`crate::substrate::Substrate::rewrite_for_compaction`].
