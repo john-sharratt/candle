@@ -1610,8 +1610,8 @@ impl InferenceState {
             // the catalog, each a full think block and call.
             // **A tool's questions are ONE submission, not one each.** They are
             // short, uniform, and all carry the same tool tag and the same
-            // pinned selection, so they stuff into a single prefill grid and are
-            // carved back into one turn apiece
+            // pinned selection, so they go in as one turn group — prefilled
+            // together, each masked to itself, sealed one turn apiece
             // (`Conversation::submit_prefilled_turn_group`). That takes the
             // corpus from 2,998 submissions to 859 without changing a single
             // exemplar's content.
@@ -1625,8 +1625,8 @@ impl InferenceState {
             // this engine works to avoid.
             //
             // Trajectories stay one per submission: they are ~95% think block
-            // and call, long and irregular, so stuffing buys little and the
-            // per-case padding to a block boundary buys less. A bare-prompt
+            // and call, long and irregular, and each is staged at its own
+            // projection points, which a group's cases do not carry. A bare-prompt
             // example has no trajectory and joins the question group
             // (`ToolDef::calibration_questions`), so nothing in this phase is
             // decoded live on the tool files' account.
@@ -1875,18 +1875,6 @@ impl InferenceState {
             let assistant_start = conv_config.dialect.assistant_start;
             let user_end = conv_config.dialect.user_end;
             let mut to_run_iter = to_run.into_iter();
-            // Fills each stuffed case out to its block boundary. The dialect's
-            // turn terminator rather than an arbitrary id: it is a token the
-            // model has seen in exactly this position ten thousand times, so a
-            // run of them is the most inert tail available. It lands in the
-            // assistant half, outside every phase span — see
-            // `candle_conversation::stuffed_grid`.
-            let calib_pad_token = engine
-                .tokenizer()
-                .encode(conv_config.dialect.assistant_end, false)
-                .ok()
-                .and_then(|e| e.get_ids().last().copied())
-                .unwrap_or(0);
             let mut warmed = false;
             // Timelines of archived (retired) calibration cases, awaiting hot→warm
             // demotion. Their sealed K/V is never attended again — only the
@@ -2042,9 +2030,9 @@ impl InferenceState {
                         |t| &mut t.submit,
                         || match case {
                             // ALL of this tool's question exemplars in ONE
-                            // prefill, carved back into one turn each. They
-                            // share this submission's pinned selection, which is
-                            // correct precisely because a group is one tool's.
+                            // turn group, sealed one turn each. They share this
+                            // submission's pinned selection, which is correct
+                            // precisely because a group is one tool's.
                             CalibCase::Questions { questions, .. } => {
                                 // A question exemplar's assistant half is empty —
                                 // the routing happens on the question.
@@ -2056,7 +2044,6 @@ impl InferenceState {
                                     conv.submit_prefilled_turn_group(
                                         &group,
                                         opts.selection.clone(),
-                                        calib_pad_token,
                                     )
                                     .map(|(handle, _)| handle),
                                     true,

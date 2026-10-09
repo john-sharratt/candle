@@ -1,9 +1,11 @@
 # The Vault
 
-The Makers work in a building. Six levels, joined by one lift. A Maker comes up
+The Makers work in a building. Seven levels, joined by one lift. A Maker comes up
 to the command level for orders, rides the lift down to the level that holds the
 job, walks to a console, and works. Sixteen of them, at once, and every working level can
-hold all sixteen.
+hold all sixteen. Work on the past starts on the seventh, the time level: a time
+machine sets the year the Maker works in, and nothing after it reaches its recall
+until the work is reported.
 
 **The building is data, not prose.** It lives as YAML in `npc-map/maps/`,
 deployed to `<mind>/map/`. The description an NPC carries is generated from it,
@@ -398,7 +400,8 @@ single posts, never banks of desks, so no standing order can queue the crew
 behind them.
 
 **The enquiry room is the only room that faces outward.** Every other room
-consumes work from the standing list. This one takes a question from somebody
+consumes work from the standing list — which the command table now writes for
+itself, from what the record lacks: see [`mission_generator.md`](mission_generator.md). This one takes a question from somebody
 downstream of the whole building, phrased in their words rather than the vault's,
 and the ones that cannot be answered are the valuable ones: an unanswerable
 enquiry names a hole nobody inside had noticed. It is a second source of work

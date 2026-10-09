@@ -253,6 +253,26 @@ that includes the one not written.
 (`JournalState::strand`) **before** it clears the window, so a day's last stretch
 is still waiting afterwards and the guardian asks about it like any other.
 
+**Chapters: a new conversation with each mission.** A mission closed — reported,
+rejected or called off — turns the body's chapter (`Missions::chapter`, kept with
+the missions), and the conversation is named by day *and* chapter
+(`npc-<id>-day-<d>-chapter-<c>`), so the turn after a hand-in opens a new one;
+the window is not cleared, so the closing stretch is still journaled. Before that
+turn's persona is built, `Runtime::turn_chapter` keeps a **closing entry** written
+by the engine from the mission's record (`journal::closing`): what was asked, the
+document, how it was reported and the year it was worked in, as `Did:` lines. It
+is kept beside any draft in flight (`JournalState::keep_closing`). The journal is
+then what carries the work into the new conversation. A conversation that ran for
+hours had Makers telling each other there was nothing left to report, and every
+turn re-read it; the chapter ends with the work.
+
+**Nothing is kept twice** (`journal::repeats`). Between the check and the keep, a
+claim or intention that nearly repeats one held in the journal or earlier in the
+same entry (≥ 70% of their distinct words shared), or a new open item that repeats
+one still open, is dropped; an entry with nothing left is not kept and covers its
+stretch as a gate `no` would. The same "Did: I have written the draft" had been
+kept entry after entry and read back four times a turn.
+
 ## 6. Persistence and injection
 
 The journal is a **section collection of the character's own conversation**,

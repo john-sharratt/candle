@@ -33,6 +33,7 @@ use candle_conversation::stencil::ToolSpec;
 
 use crate::engine::journal::ask;
 use crate::engine::journal::entry::{Entry, Item};
+use crate::engine::journal::repeats;
 use crate::engine::journal::section::JournalPrompt;
 use crate::engine::journal::state::{JournalState, Span};
 use crate::engine::journal::tools;
@@ -162,7 +163,27 @@ async fn write<D: Desk>(
         let reason = match tools::parse(&answer) {
             Err(reason) => reason,
             Ok(written) => match verify(written, span, open, world) {
-                Ok(verified) => return keep(desk, state, verified, round).await,
+                Ok(verified) => {
+                    // What the journal already says is not kept again; an
+                    // entry of nothing else covers its stretch as a gate's
+                    // "no" would.
+                    let held: Vec<Entry> = hold(state).entries().cloned().collect();
+                    let (entry, dropped) = repeats::drop_repeats(verified.entry, &held, open);
+                    if !repeats::says_anything(&entry) {
+                        hold(state).nothing_to_write(span);
+                        return Outcome::Nothing {
+                            why: format!(
+                                "everything it would have said ({dropped} line(s)) is already in \
+                                 the journal"
+                            ),
+                        };
+                    }
+                    let verified = Verified {
+                        entry,
+                        notes: verified.notes,
+                    };
+                    return keep(desk, state, verified, round).await;
+                }
                 Err(refusal) => refusal.reason(),
             },
         };

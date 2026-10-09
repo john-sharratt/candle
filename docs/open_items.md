@@ -38,6 +38,12 @@ changes**. Tests: `a_regions_turn_pins_every_token_its_blocks_hold` (raw expecte
 `validate_tiling`), and `phase_spans_land_on_real_tokens_and_never_on_padding` now built
 through `CarvedRegion::layout`.
 
+**Since superseded:** the stuffed grid is gone. It also ran attention and the recurrent state
+straight through every case, so a case's K/V and window were computed over its predecessors.
+A group's cases now prefill each on its own view of the projection and seal from it
+(`candle_conversation::turn_group`, `scheduler/turn_group.rs`) — no padding, and each case's
+`token_ids` are exactly its K/V.
+
 **Verified end-to-end:** with the full tool catalog it passed in 241.5 s, daemon stopped,
 and the dev-profile assert no longer fires on any seal — of that, 170.9 s was the model load
 and 24.9 s tool-section prefill. The test is now `#[ignore]`d (it boots the production model)

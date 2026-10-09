@@ -684,9 +684,9 @@ pub const LIFT_CALL: Tool = Tool {
     category: "Movement",
     plane: Plane::World,
     availability: Availability::AtLift,
-    description: "Bring the lift to the floor you are standing on. It takes a moment to arrive, \
-                  and its doors open when it does — then you can get in and ride it. Only worth \
-                  doing when the lift is on another floor; when it is already here, `lift_use` it.",
+    description: "Bring the lift to the floor you are standing on, to meet somebody off it. To go \
+                  somewhere in it, `lift_use` naming the level instead — that calls it and waits \
+                  for you.",
     params: &[],
     examples: &[Example {
         situation: "You are at the lift, and the car is on another level.",
@@ -698,19 +698,20 @@ pub const LIFT_CALL: Tool = Tool {
 
 /// Ride the lift to another level.
 ///
-/// Offered only while you are in the car — at the shaft with its doors open on
-/// your floor. The floor is named from the levels the lift serves, never the one
-/// you are on.
+/// Offered while you are at the shaft, wherever the car is: open here, you get
+/// in and go; elsewhere, it is called and you wait on the landing and ride it
+/// when it comes. The floor is named from the levels the lift serves, never the
+/// one you are on.
 pub const LIFT_USE: Tool = Tool {
     name: "lift_use",
     at: &[],
     category: "Movement",
     plane: Plane::World,
-    availability: Availability::InLift,
+    availability: Availability::AtLanding,
     description:
-        "Ride the lift to another level. You are in it — its doors are open on your floor \
-                  — so name the level to go to and it carries you there, setting you down when it \
-                  arrives.",
+        "Ride the lift to another level. Name the level and it carries you there, setting you \
+                  down when it arrives — if the car is on another floor it is called, and you wait \
+                  here and ride it when it comes.",
     params: &[Param {
         name: "floor",
         ty: "string",

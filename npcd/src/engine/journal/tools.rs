@@ -130,8 +130,9 @@ pub fn write_spec(citable: &[u64], open: &[Item]) -> Option<ToolSpec> {
     })
 }
 
-/// The call's name and arguments, from whichever shape was written.
-fn arguments(answer: &str) -> Option<(String, Map<String, Value>)> {
+/// The call's name and arguments, from whichever shape was written. Also how
+/// the mission generator reads its answer (`engine::mission_gen::answer`).
+pub(crate) fn arguments(answer: &str) -> Option<(String, Map<String, Value>)> {
     json_call(answer).or_else(|| element_call(answer))
 }
 

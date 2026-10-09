@@ -39,6 +39,7 @@ use serde_json::{Map, Value};
 use npc_map::world::{Refused, Voice, Where};
 
 use crate::engine::act::Act;
+use crate::engine::tools::CATALOG;
 use crate::world::Hosted;
 
 /// What came of an act.
@@ -112,6 +113,52 @@ pub const ANSWERS: &[&str] = &[
 /// Whether this act's product is the line it answers with.
 pub fn answers(tool: &str) -> bool {
     ANSWERS.contains(&tool)
+}
+
+/// Whether this act is a composition — written in a sitting of its own under
+/// the mind's writing voice, so enacted by the runtime, which holds the
+/// engine, and not by [`perform`]. See [`crate::engine::compose`].
+pub fn composes(tool: &str) -> bool {
+    tool == "compose"
+}
+
+/// The catalog category of the acts that work on documents at a desk.
+const BENCH: &str = "Bench";
+
+/// Whether `act` is work on a document — a bench act by name, or an `invoke`
+/// of one of the bench's verbs at a device.
+pub fn document_work(act: &Act) -> bool {
+    let verb = match is_device(act.tool) {
+        true => act
+            .args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .and_then(|url| url.rsplit('/').next())
+            .unwrap_or_default(),
+        false => act.tool,
+    };
+    CATALOG
+        .iter()
+        .any(|t| t.name == verb && t.category == BENCH)
+}
+
+/// Whether what came of `act` is something the character must get a turn to
+/// act on at once, rather than whenever the world next happens to wake it.
+///
+/// - **What answers** ([`ANSWERS`]): a read's contents are in its outcome and
+///   nowhere else.
+/// - **A refusal**, of any act: the world said no and why, and that is the
+///   next thing to act on — the corrected call, or something else. Left until
+///   the room next woke it, a refused Maker at a quiet desk stood for minutes
+///   holding the reason.
+/// - **Work on a document**: the bench says what the work is now and what the
+///   step after it is — written, committed, short of its length.
+///
+/// Not speech, and not a gesture. A free turn after saying something is the
+/// treadmill: a character that speaks and is at once asked again speaks
+/// again, into the same silence, until its window holds only its own voice.
+pub fn continues(act: &Act, landed: bool) -> bool {
+    answers(act.tool) || !landed || document_work(act)
 }
 
 /// Whether this tool is one a body performs.
@@ -571,6 +618,17 @@ fn thing_here_called(hosted: &Hosted, body: &str, want: &str) -> Option<String> 
 /// a list that named sixty rooms would be a list nobody could read.
 pub fn destinations(hosted: &Hosted, body: &str) -> Vec<(String, Where)> {
     hosted.read(|w| {
+        // **Nowhere, while it rides the lift.** A rider waits on its landing
+        // until the car opens at its floor, and it is offered turns while it
+        // waits — and a `move_to` taken then walks it off the landing and
+        // abandons the ride. Measured: a Keeper on a mission to the casting
+        // level boarded, set off, and walked back to the command room on the
+        // next turn, five times running, until the cast agreed the lift was
+        // broken. A body that has boarded has chosen; it goes nowhere else until
+        // it is set down.
+        if w.riding(body).is_some() {
+            return Vec::new();
+        }
         // **From where the body began deciding, while it is deciding.** The
         // grammar offers these names before a decode that outlasts a step of
         // the metronome, and the act chosen from them is answered after it.
@@ -861,6 +919,37 @@ mod tests {
                 "`{tool}` answers but never reaches a world"
             );
         }
+    }
+
+    /// **What the world answered gets a turn; what the character said does
+    /// not.** A read, a refusal of anything, and work on a document — directly
+    /// or through a device — come straight back. A word that landed waits for
+    /// the world.
+    #[test]
+    fn what_the_world_answered_gets_a_turn_and_speech_does_not() {
+        let a = |tool: &'static str, args: serde_json::Value| Act {
+            tool,
+            args: args.as_object().unwrap().clone(),
+        };
+        let read = a("file_read", serde_json::json!({"path": "layers/eras/x.md"}));
+        let write = a(
+            "file_write",
+            serde_json::json!({"path": "layers/eras/x.md", "content": "x"}),
+        );
+        let committed = a(
+            "invoke",
+            serde_json::json!({"url": "http://local/bench/desk~1/bench_commit"}),
+        );
+        let told = a("tell", serde_json::json!({"to": "Pax", "intent": "hello"}));
+        let walked = a("move_to", serde_json::json!({"destination": "the lift"}));
+
+        assert!(continues(&read, true));
+        assert!(continues(&write, true));
+        assert!(continues(&committed, true));
+        assert!(!continues(&told, true), "speech is the treadmill");
+        assert!(!continues(&walked, true), "the arrival is what wakes it");
+        assert!(continues(&told, false), "a refusal is an answer");
+        assert!(continues(&walked, false), "a refusal is an answer");
     }
 
     fn vault() -> Hosted {
@@ -1240,6 +1329,12 @@ mod tests {
         let dest_name = h.read(|w| w.floor_name(dest).unwrap().to_string());
         let out = perform(&h, "m1", &act("lift_use", json!({ "floor": dest_name })));
         assert!(out.happened(), "the ride was refused: {out:?}");
+        // Boarded, it is offered nowhere to walk: a `move_to` now would step it
+        // off the landing and abandon the ride.
+        assert!(
+            destinations(&h, "m1").is_empty(),
+            "a rider was offered somewhere to walk off to"
+        );
 
         let dest_core = shaft[dest].clone();
         for _ in 0..80 {
@@ -1255,6 +1350,49 @@ mod tests {
             dest_core,
             "the rider was not set down on the level they chose"
         );
+        assert!(
+            !destinations(&h, "m1").is_empty(),
+            "set down, it can walk again"
+        );
+    }
+
+    /// **Asking to ride with the car away is waiting for it.** One act: the car
+    /// is called, the body waits on the landing with nowhere offered to walk
+    /// off to, and is carried to the level it named.
+    #[test]
+    fn riding_with_the_car_away_calls_it_and_carries_the_body() {
+        let h = vault();
+        let shaft: Vec<Where> = h.read(|w| w.shaft().to_vec());
+        let (from, dest) = (shaft.len() - 1, 0);
+        h.with(|w| {
+            w.enter("m1", "Maker-01", shaft[from].clone()).unwrap();
+        });
+        h.delta("m1");
+        assert!(
+            !h.read(|w| w.lift().unwrap().boardable_at(from)),
+            "the car starts elsewhere"
+        );
+        let dest_name = h.read(|w| w.floor_name(dest).unwrap().to_string());
+        let out = perform(&h, "m1", &act("lift_use", json!({ "floor": dest_name })));
+        assert!(
+            out.line()
+                .unwrap()
+                .starts_with("The lift is on another floor. You call it and wait"),
+            "{out:?}"
+        );
+        assert!(
+            destinations(&h, "m1").is_empty(),
+            "a waiting rider wandered"
+        );
+        for _ in 0..160 {
+            if h.read(|w| w.actor("m1").unwrap().at.clone()) == shaft[dest] {
+                break;
+            }
+            h.with(|w| {
+                w.tick();
+            });
+        }
+        assert_eq!(h.read(|w| w.actor("m1").unwrap().at.clone()), shaft[dest]);
     }
 
     /// Riding the lift from off the shaft, or with the car away, is refused with

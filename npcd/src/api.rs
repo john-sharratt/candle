@@ -830,8 +830,8 @@ async fn post_dream(
             // Stringified for the same reason every id on the wire is: a u64
             // past 2^53 does not survive a JavaScript client exact.
             "timeline": kept.timeline.to_string(),
-            "lines": kept.lines,
-            "text": kept.lines.join("\n"),
+            "passages": kept.passages,
+            "text": kept.passages.join("\n\n"),
         }))
         .into_response(),
         Err(e) => err(
@@ -3353,6 +3353,15 @@ mod tests {
                 // character, so admin.
                 ("/v1/pulse/guardian", "admin"),
                 ("/v1/pulse/missions/cancel", "admin"),
+                ("/v1/pulse/missions/generate", "admin"),
+                ("/v1/pulse/missions/pool", "admin"),
+                // The table's operations — admin, like the table itself.
+                ("/v1/pulse/operations", "admin"),
+                ("/v1/pulse/operations/:wid/:oid", "admin"),
+                ("/v1/pulse/operations/:wid/:oid/cancel", "admin"),
+                ("/v1/pulse/operations/:wid/:oid/read-again", "admin"),
+                ("/v1/pulse/operations/:wid/:oid/check", "admin"),
+                ("/v1/pulse/operations/:wid/:oid/document", "admin"),
                 // Generation on the resident model, over the caller's own cast.
                 ("/v1/generate/description", "user"),
                 ("/v1/generate/description/stream", "user"),

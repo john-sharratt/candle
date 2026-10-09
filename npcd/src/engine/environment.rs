@@ -39,6 +39,7 @@
 use npc_map::delta::Delta;
 use npc_map::world::{Happening, World};
 
+use crate::engine::at_work;
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::perceived::{digest, situation, Perceived};
 use crate::engine::reach;
@@ -92,7 +93,12 @@ pub fn carried(world: &World, sim: &crate::sim::Sim, delta: &Delta) -> Vec<Perce
         }
         out.push(situation(text));
     }
-    out.extend(digest(world, &delta.events));
+    // A Maker at work at its desk is not handed the building's atmosphere —
+    // it wrote the vault's tape and plastic into its stories (`at_work`).
+    out.extend(digest(
+        world,
+        &at_work::heard(world, sim, &delta.who, &delta.events),
+    ));
     out
 }
 

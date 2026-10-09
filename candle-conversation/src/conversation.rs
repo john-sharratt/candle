@@ -25,17 +25,17 @@ use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::projection_assembler::materialize_conversation;
 use crate::scheduler::{
-    note_branch_checkpoint_computed, note_branch_checkpoint_installed, CarvedTurn,
-    ProjectionInputs, ReprojectionPolicy, SchedulerRequest, SealedProbe, TurnContent,
+    note_branch_checkpoint_computed, note_branch_checkpoint_installed, ProjectionInputs,
+    ReprojectionPolicy, SchedulerRequest, SealedProbe, TurnContent,
 };
 use crate::sealed_turn::{SealedPages, SealedTurn};
 use crate::sequence_handle::{BlockCount, SequenceId};
-use crate::stuffed_grid::{plan_stuffed_grid_with_indices, CaseGrid};
 use crate::substrate::ProjectionScores;
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
 use crate::tree::{ConversationTree, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
+use crate::turn_group::{plan_cases, CaseGrid};
 use crate::turn_layout::TurnLayout;
 use crate::working_set::marks::gather_tags;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
@@ -2489,15 +2489,18 @@ impl Sequence {
         Ok(handle)
     }
 
-    /// Prefill MANY calibration turns in ONE forward and seal each to its own
-    /// block range.
+    /// Prefill MANY turns together, each as if it were alone, and seal each as
+    /// a turn of its own.
     ///
     /// The batched form of [`Self::submit_prefilled_turn`]. Each case is a
     /// prefilled turn — a user half and an assistant half, either of which may
-    /// be empty — and
-    /// they are laid end to end by [`crate::stuffed_grid`], every case starting
-    /// on a block boundary so no two share a block and no exemplar's `sign(Q)`
-    /// window carries its neighbour's tokens.
+    /// be empty. The scheduler projects the conversation once and prefills every
+    /// case on its own view of that projection, all of them in the same waves
+    /// ([`crate::turn_group`]): a case attends to the projection and to itself,
+    /// never to a sibling, and a hybrid's recurrent state starts every case from
+    /// the projection's. Each sealed turn — its K/V, its `sign(Q)` window, its
+    /// recurrent snapshot — is what a lone [`Self::submit_prefilled_turn`] of
+    /// that case would have sealed.
     ///
     /// **Why.** One case per forward runs the model deep in the launch-overhead
     /// regime: 353 tokens across 2.4 sequences in a 1,095 ms forward, 263 t/s,
@@ -2520,21 +2523,15 @@ impl Sequence {
     /// Each case is `(user, assistant, tags)`: the user half, the assistant half
     /// (empty for a question exemplar, the prefilled body for a dream line), and
     /// that case's tags. Returns the streaming handle plus, for each sealed
-    /// region, the index of the case it came from — a case with no tokens on
-    /// either half claims no region, so the two are not 1:1.
+    /// turn in order, the index of the case it came from — a case with no
+    /// tokens on either half is not submitted, so the two are not 1:1.
     ///
-    /// **Every case is masked to itself.** A stuffed grid is block-diagonal, not
-    /// causal across cases: region N does not attend to regions before it, which
-    /// is exactly what keeps one exemplar's `sign(Q)` window off its neighbour's
-    /// tokens. A caller wanting each turn to see the ones before it (a running
-    /// dialogue) must submit them one at a time; a caller whose cases are
-    /// independent memories signed against the substrate (calibration exemplars,
-    /// the lines of a dream) gets them all in one forward.
+    /// The handle hears the opening projection and one `Done` for the whole
+    /// group, whose seal is the last case's.
     pub fn submit_prefilled_turn_group(
         &mut self,
         cases: &[(String, String, Vec<String>)],
         selection: SelectionState,
-        pad_token: u32,
     ) -> crate::Result<(TurnHandle, Vec<usize>)> {
         if self.turn_in_flight {
             return Err(ConversationError::TurnInFlight {
@@ -2547,9 +2544,9 @@ impl Sequence {
 
         // Each case's grid is the whole turn a lone prefill would lay down —
         // opener, user body, the user/assistant join, and the closing marker —
-        // because a stuffed case is sealed as a complete turn and must carry its
-        // own brackets. `submit_prefill_unit` bakes those ends for a single
-        // turn; here every case needs its own pair, so they are built directly.
+        // because each case is sealed as a complete turn and must carry its own
+        // brackets. `submit_prefill_unit` bakes those ends for a single turn;
+        // here every case needs its own pair, so they are built directly.
         let head = self.turn_head_text(false);
         let user_end = self.config.dialect.user_end;
         let assistant_start = self.config.dialect.assistant_start;
@@ -2579,52 +2576,42 @@ impl Sequence {
             });
         }
 
-        let (grid, sources) = plan_stuffed_grid_with_indices(&grids, pad_token);
-        if grid.regions.is_empty() {
+        let planned = plan_cases(&grids);
+        if planned.is_empty() {
             return Err(ConversationError::Channel(
                 "submit_prefilled_turn_group: no case produced any tokens".into(),
             ));
         }
 
-        // One `CarvedTurn` per region: its block range, and the content the
-        // substrate pins on the turn it becomes. The layout is built from the
-        // region's CASE-relative bounds — a turn records its spans against its
-        // own token run, and `turn_layout::phase_span_of` reads them back against
-        // the turn's own signature window, so rebasing them into the grid would
-        // put every span past the end of its window and make the offline
-        // phase analysis read nothing.
+        // One `TurnContent` per case: what the substrate pins on the turn it
+        // becomes, and — its `token_ids` — the whole of what the case prefills.
         let im_end_len = self.tokenize(user_end)?.len() as u32;
         let assistant_start_len = self.tokenize(assistant_start)?.len() as u32;
         let trailing_len = self.tokenize(assistant_end)?.len() as u32;
         // The opener is the same text for every case, so it is measured once
-        // rather than per case; `CarvedRegion::layout` clamps it against each
-        // region's user end. The opener is baked into every case's grid, so the
+        // rather than per case; `PlannedCase::layout` clamps it against each
+        // case's user end. The opener is baked into every case's grid, so the
         // user body starts past it — the non-zero start is what tells the layout
         // the grid reserves room for a real opener.
         let head_len = self.tokenize(&head)?.len() as u32;
-        let mut turns: Vec<CarvedTurn> = Vec::with_capacity(grid.regions.len());
-        for (region, &src) in grid.regions.iter().zip(&sources) {
+        let mut turns: Vec<TurnContent> = Vec::with_capacity(planned.len());
+        let mut sources: Vec<usize> = Vec::with_capacity(planned.len());
+        for (src, case) in planned {
             let (question, answer, tags) = &cases[src];
-            turns.push(CarvedTurn {
-                region: *region,
-                content: TurnContent {
-                    role: Role::User,
-                    tags: tags.clone(),
-                    layout: region.layout(
-                        head_len,
-                        im_end_len,
-                        assistant_start_len,
-                        trailing_len,
-                        question.clone(),
-                        answer.clone(),
-                    ),
-                    // Every token the region's blocks hold, padding included:
-                    // the seal persists the whole block range, and `token_ids`
-                    // must align 1:1 with that K/V. See
-                    // `CarvedRegion::sealed_range`.
-                    token_ids: TokenBuffer::from(grid.tokens[region.sealed_range()].to_vec()),
-                },
+            turns.push(TurnContent {
+                role: Role::User,
+                tags: tags.clone(),
+                layout: case.layout(
+                    head_len,
+                    im_end_len,
+                    assistant_start_len,
+                    trailing_len,
+                    question.clone(),
+                    answer.clone(),
+                ),
+                token_ids: TokenBuffer::from(std::mem::take(&mut grids[src].tokens)),
             });
+            sources.push(src);
         }
 
         let (event_tx, event_rx) = flume::unbounded();
@@ -2633,12 +2620,11 @@ impl Sequence {
                 sequence_id: self.id,
                 projection_inputs: Some(self.projection_inputs()),
                 prefill_text: String::new(),
-                prefill_tokens: TokenBuffer::from(grid.tokens.clone()),
+                // Each case prefills its own tokens, on its own view.
+                prefill_tokens: TokenBuffer::new(),
                 user_text: String::new(),
-                // The grid's own openers and closers are already baked per case,
-                // so the single-turn boundary baking must not run again: a zero
-                // `user_content_start` is what tells `submit_prefill_unit`'s
-                // successor there is no head to add.
+                // Every case's openers and closers are baked into its own
+                // tokens, so the single-turn boundary baking must not run.
                 user_content_start: 0,
                 user_content_end: 0,
                 assistant_content_start: 0,
@@ -2646,7 +2632,7 @@ impl Sequence {
                 tags: Vec::new(),
                 projection_offsets: Vec::new(),
                 prefill_assistant_text: String::new(),
-                // Every case closed its own bracket inside the grid.
+                // Every case closed its own bracket inside its own tokens.
                 post_decode_tokens: TokenBuffer::new(),
                 max_decode_tokens: 0,
                 sampling: self.config.sampling.clone(),
@@ -2654,12 +2640,12 @@ impl Sequence {
                 reprojection: None,
                 disable_reprojection: self.config.disable_reprojection,
                 triggers: Arc::new(TriggerRegistry::new()),
-                // Every case's assistant half is supplied in the grid, so there
-                // is nothing to constrain and nothing to exempt.
+                // Every case's assistant half is supplied in its tokens, so
+                // there is nothing to constrain and nothing to exempt.
                 turn_grammar: None,
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
-                seal_group: Some(Arc::new(turns)),
+                seal_group: Some(turns),
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         self.turn_in_flight = true;

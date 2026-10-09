@@ -2917,7 +2917,11 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
         )
         .unwrap();
         install_warm_from_hot(&conv, &backings, &device, &main_stream, &mut pinned, key);
-        evict_from_hot(&conv, &[], &[]);
+        let purged = evict_from_hot(&conv, &[], &[]);
+        assert_eq!(
+            purged.count, 1,
+            "hot must be evictable to exercise warm→hot"
+        );
         let report = elevate_to_hot(
             &conv,
             &backings,

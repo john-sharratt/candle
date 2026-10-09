@@ -1,0 +1,13 @@
+id: time-machine
+kind: station
+name: time machine
+binds: one year
+short: >
+  A time machine names the year a Maker works in, and nothing written after
+  that year can reach whoever stands at one.
+long: >
+  A Maker standing at it names a year of the world's history and works in that
+  year until the work is reported. The storyline after it and the stories set
+  after it fall silent: what the Maker recalls is the world as it stood then,
+  not as it came to be. Walking away does not undo it — reporting the work
+  does, and the Maker is back in the present.

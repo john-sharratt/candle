@@ -27,12 +27,15 @@
 //! no clock and no randomness, so an assertion about *exactly which* names an
 //! argument admits is a real assertion rather than a hopeful one.
 
-use npc_map::world::Where;
+use npc_map::witness;
+use npc_map::world::{Happening, Where};
 use npcd::engine::act::Act;
 use npcd::engine::body::{perform, Outcome};
-use npcd::engine::mission::{Mission, Origin, Todo};
+use npcd::engine::mission::{Mission, Origin, Stage, Todo, Work};
 use npcd::engine::tools::{self, specs_within, Mode, Within};
+use npcd::engine::witnessed;
 use npcd::sim::field::Resource;
+use npcd::sim::record::{Item, Kind as RecordKind, State};
 use npcd::sim::seed;
 use npcd::world::Hosted;
 use serde_json::{json, Value};
@@ -159,6 +162,208 @@ fn refused(o: &Outcome) -> &str {
     }
 }
 
+// ── the bench, on an operation ──────────────────────────────────────────────
+
+/// **A Maker on an operation is not handed the bench's working-set verbs** —
+/// at the desk, as acts of their own, not only behind `invoke`. Reviewers
+/// stashed their own mend and logged round and round with them in reach.
+#[test]
+fn an_operation_takes_the_working_set_verbs_off_the_desk() {
+    let h = vault();
+    stand(&h, "m1", "vault-story", "first-room");
+    let at_desk = offered(&h, "m1");
+    assert!(at_desk.contains(&"bench_stash".to_string()), "{at_desk:?}");
+
+    h.with_sim(|s| {
+        s.missions.assign(
+            "m1",
+            Mission::new(
+                "draft the event",
+                vec![Todo::new("the one step")],
+                Origin::Generated {
+                    generator: "life-event".into(),
+                    target: "life:keeper".into(),
+                    operation: 1,
+                    stage: Stage::Draft,
+                },
+            ),
+        )
+    });
+    let on_operation = offered(&h, "m1");
+    for verb in ["bench_stash", "bench_stash_pop", "bench_log", "bench_diff"] {
+        assert!(
+            !on_operation.contains(&verb.to_string()),
+            "{verb}: {on_operation:?}"
+        );
+    }
+    assert!(
+        on_operation.contains(&"bench_commit".to_string()),
+        "{on_operation:?}"
+    );
+}
+
+// ── the time machine ────────────────────────────────────────────────────────
+
+/// **A time machine sets the year the work is done in, and signs off the step
+/// that sent the Maker there.** Nothing to work on is nothing to stand in a
+/// year for; the year ends with the mission.
+#[test]
+fn a_time_machine_sets_the_year_the_mission_is_worked_in() {
+    let h = vault();
+    stand(&h, "m1", "vault-time", "first-time-room");
+    // With no year to stand in, the act is not offered at all.
+    assert!(!offered(&h, "m1").contains(&"time_travel".to_string()));
+
+    let travel = |year: &str| perform(&h, "m1", &act("time_travel", json!({"year": year})));
+    assert!(refused(&travel("2950")).contains("carry no work"));
+
+    h.with_sim(|s| {
+        s.missions.assign(
+            "m1",
+            Mission::new(
+                "write the life",
+                vec![
+                    Todo::new(npcd::engine::mission::time_step_text(2950)),
+                    Todo::new("write layers/life/keeper/2950 The Archive.md and commit it"),
+                ],
+                Origin::Generated {
+                    generator: "life-event".into(),
+                    target: "life:keeper".into(),
+                    operation: 1,
+                    stage: Stage::Draft,
+                },
+            ),
+        )
+    });
+    // **The year is the mission's, bound in the grammar** — a Maker left to
+    // write it sent an empty string.
+    assert_eq!(
+        admits(&h, "m1", "time_travel", "year"),
+        Some(vec!["2950".to_string()])
+    );
+    // And a call that names none is told the year its mission asks for.
+    let empty = refused(&travel("")).to_string();
+    assert!(
+        empty.contains("Your mission asks you to work in 2950"),
+        "{empty}"
+    );
+    // A year sent as a number is a year.
+    assert!(did(&perform(
+        &h,
+        "m1",
+        &act("time_travel", json!({"year": 2949}))
+    ))
+    .contains("2949"));
+    assert!(did(&travel("2950")).contains("You work in 2950 now"));
+    let (year, first_done) = h.sim(|s| {
+        (
+            s.missions.year_of("m1"),
+            s.missions.active("m1").map(|m| m.todo[0].done),
+        )
+    });
+    assert_eq!(year, Some(2950));
+    assert_eq!(
+        first_done,
+        Some(true),
+        "the step that sent it there is done"
+    );
+
+    // Handed in at the command table, the Maker is back in the world's time.
+    stand(&h, "m1", "vault-command", "command-room");
+    let stuck = || {
+        perform(
+            &h,
+            "m1",
+            &act(
+                "report_stuck",
+                json!({"why": "The keeper's archive in 2950 is not in any record I can read."}),
+            ),
+        )
+    };
+    // The writing step's desks can be reached, so the report is turned away
+    // with the way there — twice — and taken the third time.
+    for _ in 0..2 {
+        assert!(refused(&stuck()).contains("The desks are on"));
+    }
+    let handed_in = stuck();
+    assert!(
+        did(&handed_in).contains("back in the world's present"),
+        "{handed_in:?}"
+    );
+    assert_eq!(h.sim(|s| s.missions.year_of("m1")), None);
+}
+
+/// What `body` has seen `actor` do, as each deed reads.
+fn seen_doing(h: &Hosted, body: &str, actor: &str) -> Vec<String> {
+    h.read(|w| {
+        witness::since(w, body)
+            .into_iter()
+            .filter(|e| e.actor == actor)
+            .filter_map(|e| match e.what {
+                Happening::Did { what, .. } => Some(what),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// **A machine that refuses a Maker refuses it in front of the room.** The
+/// Makers stuck at the time machine each read their refusal alone, and told
+/// one another what they took it to mean; a colleague who can see the machine
+/// say no can say what was wrong. A refused walk is nobody else's to watch.
+#[test]
+fn a_refusal_at_a_machine_is_seen_by_the_room() {
+    let h = vault();
+    h.with(|w| {
+        w.enter(
+            "m2",
+            "Sila Vane",
+            Where::new("vault-time", "first-time-room"),
+        )
+        .unwrap()
+    });
+    stand(&h, "m1", "vault-time", "first-time-room");
+    let travel = act("time_travel", json!({"year": "2950"}));
+    let why = refused(&perform(&h, "m1", &travel)).to_string();
+    witnessed::show(&h, "m1", &travel, &why);
+
+    let walk = act("move_to", json!({"destination": "nowhere at all"}));
+    let lost = refused(&perform(&h, "m1", &walk)).to_string();
+    witnessed::show(&h, "m1", &walk, &lost);
+
+    let seen = seen_doing(&h, "m2", "m1");
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0].starts_with("works the time machine, and it refuses: You carry no work"),
+        "{seen:?}"
+    );
+}
+
+/// **Work on a document is refused in private.** Overheard, a colleague's
+/// refused edit was taken for the hearer's own, and copied into a story word
+/// for word.
+#[test]
+fn a_refused_edit_at_a_desk_is_not_shown_to_the_room() {
+    let h = vault();
+    h.with(|w| {
+        w.enter("m2", "Sila Vane", Where::new("vault-story", "first-room"))
+            .unwrap()
+    });
+    stand(&h, "m1", "vault-story", "first-room");
+    let edit = act(
+        "file_edit",
+        json!({"path": "layers/eras/no-such-era.md", "old_str": "a flood", "new_str": "a fire"}),
+    );
+    let why = refused(&perform(&h, "m1", &edit)).to_string();
+    witnessed::show(&h, "m1", &edit, &why);
+    let commit = act("bench_commit", json!({"why": "nothing yet"}));
+    let nothing = refused(&perform(&h, "m1", &commit)).to_string();
+    witnessed::show(&h, "m1", &commit, &nothing);
+
+    let seen = seen_doing(&h, "m2", "m1");
+    assert!(seen.is_empty(), "{seen:?}");
+}
+
 // ── the two directions agree ────────────────────────────────────────────────
 
 /// **Everything offered can be performed, and everything performed is offered.**
@@ -213,6 +418,12 @@ fn every_act_in_the_catalog_reaches_an_implementation() {
     let mut unreached: Vec<&str> = Vec::new();
 
     for tool in tools::CATALOG.iter() {
+        // A composition is written by the character's own mind on a fork of
+        // its conversation, so the runtime enacts it — it holds the minds — and
+        // its own tests cover it (`runtime::tests::compose_*`).
+        if npcd::engine::body::composes(tool.name) {
+            continue;
+        }
         let example = tool.examples.first().expect("every act carries one");
         let args: Value = serde_json::from_str(example.call)
             .unwrap_or_else(|e| panic!("`{}` example is not JSON: {e}", tool.name));
@@ -1539,6 +1750,85 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
         )
     )
     .happened());
+    for name in offered(&vault, "m1") {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+
+    // `orders_report_done` is offered only to a body holding an order — the
+    // table offers nothing a body cannot do there — so it is reachable once
+    // one is in its hands.
+    vault.with_sim(|s| {
+        s.ledger.set_order("sweep the archive", "m2", None);
+        s.ledger
+            .hand_to("sweep the archive", "m1")
+            .expect("the order is handed over");
+    });
+    stand(&vault, "m1", "vault-command", "command-room");
+    for name in offered(&vault, "m1") {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+
+    // `time_travel` is offered only to a body whose mission names a year to
+    // work in, at a time machine.
+    vault.with_sim(|s| {
+        s.missions.assign(
+            "m1",
+            Mission::new(
+                "write the life",
+                vec![Todo::new(npcd::engine::mission::time_step_text(2950))],
+                Origin::Random {
+                    routine: "walk-the-halls".into(),
+                },
+            ),
+        )
+    });
+    stand(&vault, "m1", "vault-time", "first-time-room");
+    for name in offered(&vault, "m1") {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+
+    // `creator_present` is offered only to a body with finished work of its
+    // own to present — a filed document its mission wrote — at the chair.
+    let filed = "layers/stories/the-first-city-opens.md";
+    vault.with_sim(|s| {
+        s.record.put(
+            Item::new("doc_first_city", "the first city opens", RecordKind::Story)
+                .in_state(State::Filed)
+                .at_path(filed),
+        );
+        s.missions.assign(
+            "m1",
+            Mission::new(
+                "tell the first city",
+                vec![Todo::new(format!("write {filed} and commit it"))],
+                Origin::Random {
+                    routine: "walk-the-halls".into(),
+                },
+            )
+            .with_work(Work {
+                writes: filed.into(),
+                reads: Vec::new(),
+                min_words: 0,
+                edit_optional: false,
+                anew: false,
+            }),
+        )
+    });
+    stand(&vault, "m1", "vault-command", "command-room");
+    for name in offered(&vault, "m1") {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+    // `compose` is offered at a desk to a body whose mission writes a document
+    // — the one just assigned.
+    stand(&vault, "m1", "vault-story", "first-room");
     for name in offered(&vault, "m1") {
         if !seen.contains(&name) {
             seen.push(name);

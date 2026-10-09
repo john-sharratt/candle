@@ -141,6 +141,12 @@ impl Lift {
         self.open_floor() == Some(floor)
     }
 
+    /// Whether the car has `floor` among the stops it still has to reach — it
+    /// has been called there, and is on its way.
+    pub fn called_to(&self, floor: usize) -> bool {
+        self.stops.contains(&floor)
+    }
+
     /// Add `floor` to the car's stops — a call from a landing or a choice from
     /// inside; the car does not know the difference and does not need to.
     /// Off-the-shaft floors are ignored, and a call to the floor the car is

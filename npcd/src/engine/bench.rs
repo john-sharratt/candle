@@ -50,8 +50,9 @@ const BENCHES: &[&str] = &[
     "map-table",
 ];
 
-/// Where working files are actually made. A story desk accumulates scratch
-/// nobody else has to see; a settling table never does.
+/// Where a working file can be thrown away. A story desk accumulates scratch
+/// nobody else has to see; the other benches write the record, and a document
+/// there is retired with a reason (`record_let_go`) rather than deleted.
 const SCRATCH: &[&str] = &["story-desk"];
 
 /// A bench act with no arguments — it acts on what you are working on.
@@ -263,15 +264,19 @@ pub const FILE_READ: Tool = Tool {
     }],
 };
 
+/// **At every bench, not only the story desk.** A life is written at a character
+/// terminal and an era corrected at a chronicle terminal, and a document can only
+/// be new where `file_write` is offered — held to the story desk, a mission to
+/// write a year of somebody's life sent its Maker to the wrong level to write it.
 pub const FILE_WRITE: Tool = Tool {
     name: "file_write",
-    at: SCRATCH,
+    at: BENCHES,
     category: "Bench",
     plane: Plane::World,
     availability: Availability::AtPart,
-    description:
-        "Write a document whole — for something new, or for a rewrite that keeps nothing. \
-                  What you write is yours and unseen until you commit.",
+    description: "Write a document whole — something new, or a rewrite of a piece: all of it, as \
+                  it is to stand, whatever you keep of the old. What you write is yours and \
+                  unseen until you commit.",
     params: &[
         Param {
             name: "path",
@@ -291,8 +296,9 @@ pub const FILE_WRITE: Tool = Tool {
     examples: &[Example {
         situation: "You are making something that does not exist yet.",
         call: r#"{"path":"stories/the-third-silence.md","content":"A night at the gate, and nobody came through it."}"#,
-        because: "Whole-document writing is for a new thing. Changing part of an existing one is \
-                  `file_edit`, which cannot silently lose the rest.",
+        because: "Whole-document writing is for a new thing, or for reworking most of one. \
+                  Changing one passage of an existing one is `file_edit`, which cannot silently \
+                  lose the rest.",
     }],
 };
 
@@ -302,9 +308,11 @@ pub const FILE_EDIT: Tool = Tool {
     category: "Bench",
     plane: Plane::World,
     availability: Availability::AtPart,
-    description: "Change one part of a document, leaving the rest exactly as it is. What you are \
-                  replacing has to appear exactly once — if it appears twice you will be told how \
-                  many, rather than have the wrong one changed.",
+    description: "Change one passage of a document, leaving the rest exactly as it is. What you \
+                  are replacing is copied from the document as it says now — not from an earlier \
+                  version of it — and has to appear exactly once; if it appears twice you will be \
+                  told how many, rather than have the wrong one changed. To rewrite the piece, or \
+                  most of it, write it whole again — `compose` it, when your mission writes it.",
     params: &[
         Param {
             name: "path",
@@ -316,14 +324,15 @@ pub const FILE_EDIT: Tool = Tool {
             name: "old_str",
             ty: "string",
             required: true,
-            description: "The text to replace, exactly as the document has it. Give enough of \
-                          what surrounds it to pick out one place and not three.",
+            description: "The passage to replace, copied exactly from the document as it says \
+                          now. Give enough of what surrounds it to pick out one place and not \
+                          three.",
         },
         Param {
             name: "new_str",
             ty: "string",
             required: true,
-            description: "What stands there instead.",
+            description: "What stands in that passage's place instead.",
         },
     ],
     examples: &[Example {
@@ -337,7 +346,7 @@ pub const FILE_EDIT: Tool = Tool {
 
 pub const FILE_LIST: Tool = bench_on!(
     "file_list",
-    SCRATCH,
+    BENCHES,
     "See what documents are actually in a place — including the ones you have made and not \
      committed, and without the ones you have taken out. What exists, rather than what anything \
      says exists.",
@@ -360,8 +369,23 @@ pub const FILE_DELETE: Tool =
     "Named apart from retiring on purpose. One is a decision about the record; this is tidying."
 );
 
+/// Sit down and write the piece the mission asks for — see
+/// [`crate::engine::compose`]. Offered only to a Maker whose mission writes a
+/// document (`mission_acts::offered`).
+pub const COMPOSE: Tool = bench!(
+    "compose",
+    BENCHES,
+    "Sit down and write the piece your mission asks for, in one sitting: your brief and every \
+     document you were sent to read open in front of you, and nothing else. It goes into your \
+     working copy as a whole draft; read it back, mend what is wrong, then commit it.",
+    "You have read what your mission sent you to read and it is time to write the piece.",
+    "Writing a whole piece is done with the sources open and your mind on it, not one line \
+     between other things."
+);
+
 /// Everything in this module, in the order it is offered.
 pub const BENCH_ACTS: &[Tool] = &[
+    COMPOSE,
     BENCH_BRANCH,
     BENCH_DIFF,
     BENCH_STASH,

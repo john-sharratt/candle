@@ -290,6 +290,34 @@ export const LiveAPI = {
    * record a restart rebuilds from. Answers the journal as it now reads. */
   forgetJournalEntry: (id, entry) => j('/v1/npc/' + id + '/journal/' + entry, { method: 'DELETE' }),
 
+  /* The command table's operations: each an objective carried out as a draft by
+   * one Maker and a review by another. Every world's, newest first. */
+  operations: () => j('/v1/pulse/operations'),
+  /* Rename an operation, restate its objective, or rewrite the brief of its
+   * mission still waiting at the table. Answers the operation as it now reads. */
+  editOperation: (wid, oid, body) =>
+    j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid, { method: 'PATCH', body }),
+  cancelOperation: (wid, oid, why) =>
+    j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/cancel',
+      { method: 'POST', body: why ? { why } : {} }),
+  /* Send an operation's review, still waiting at the table, back to be read
+   * again by the table. */
+  readOperationAgain: (wid, oid) =>
+    j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/read-again', { method: 'POST' }),
+  /* Send a passed life event or story to be checked against the main
+   * storyline. */
+  checkOperation: (wid, oid) =>
+    j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/check', { method: 'POST' }),
+  /* The document an operation wrote — `{path, where, words, text}`, `where`
+   * being `record` or `rejected` — or a 404 when it was never committed. */
+  operationDocument: (wid, oid) =>
+    j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/document'),
+  /* Put a document already on the record through the table's reading and a
+   * Maker's review. */
+  reviewDocument: (path) => j('/v1/pulse/operations', { method: 'POST', body: { path } }),
+  /* Open or shut the command table. Open calls the cast to it. */
+  commandTable: (open) => j('/v1/pulse/command-table', { method: 'POST', body: { open } }),
+
   /* The authored corpus.
    *
    * `id` is an ADDRESS — `canon/ammo/bolt` — not a path. Nothing here knows
