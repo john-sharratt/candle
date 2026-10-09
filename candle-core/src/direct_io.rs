@@ -429,6 +429,7 @@ fn pread_exact(file: &File, offset: u64, dest: &mut [u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn tmp_path(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -504,6 +505,123 @@ mod tests {
         assert_eq!(dest, payload.as_slice());
         drop(df);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The largest expert pack under the zend model cache, if one exists — a
+    /// multi-GB file on the drive the expert cache reads in production.
+    fn largest_pack() -> Option<PathBuf> {
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+        let root = Path::new(&home).join(".cache/zend/models");
+        let mut stack = vec![root];
+        let mut best: Option<(u64, PathBuf)> = None;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.to_string_lossy().ends_with(".experts.pack") {
+                    let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    if best.as_ref().is_none_or(|(l, _)| len > *l) {
+                        best = Some((len, p));
+                    }
+                }
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
+    /// **The drive's ceiling for the expert cache's read shape.** Random
+    /// whole-record reads of `record` bytes at queue depths 1–16 (one thread
+    /// and one handle per outstanding read, as the stager's readers), and the
+    /// same record split into 4 concurrent quarter reads — which says whether a
+    /// single expert lands faster striped than whole. Prints GB/s and the
+    /// mean per-read latency; asserts only that every read succeeded.
+    ///
+    /// `cargo test --release -p candle-core --lib direct_io::tests::queue_depth_sweep -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reads a multi-GB expert pack off the real drive for ~30 s"]
+    fn queue_depth_sweep() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+        let Some(path) = largest_pack() else {
+            eprintln!("no *.experts.pack under ~/.cache/zend/models — nothing to measure");
+            return;
+        };
+        let len = std::fs::metadata(&path).unwrap().len();
+        let df = DirectFile::open(&path).unwrap();
+        // Flash-Next's Q2_KO record, rounded to a sector.
+        let record = round_up_sector(1_384_448);
+        let records = (len / record as u64).saturating_sub(1);
+        eprintln!(
+            "{} — {:.1} GiB, {records} records of {record} B",
+            path.display(),
+            len as f64 / (1u64 << 30) as f64
+        );
+        let window = Duration::from_secs(3);
+        // (threads, pieces per record): pieces > 1 splits each record into
+        // that many concurrent reads, one thread each.
+        for &(qd, pieces) in &[
+            (1, 1),
+            (2, 1),
+            (4, 1),
+            (8, 1),
+            (16, 1),
+            (1, 4),
+            (2, 4),
+            (4, 4),
+        ] {
+            let bytes = AtomicU64::new(0);
+            let reads = AtomicU64::new(0);
+            let busy_ns = AtomicU64::new(0);
+            let piece = record / pieces;
+            let t0 = Instant::now();
+            std::thread::scope(|s| {
+                for w in 0..qd {
+                    let (df, bytes, reads, busy_ns) = (&df, &bytes, &reads, &busy_ns);
+                    s.spawn(move || {
+                        let mut scratch = AlignedScratch::new();
+                        scratch.ensure(record).unwrap();
+                        // A cheap LCG: distinct random records per thread.
+                        let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (w as u64 + 1);
+                        while t0.elapsed() < window {
+                            x = x
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add(1442695040888963407);
+                            let at = (x >> 16) % records * record as u64;
+                            let t = Instant::now();
+                            if pieces == 1 {
+                                df.read_at_with_handle(w, at, scratch.as_mut_slice(record))
+                                    .unwrap();
+                            } else {
+                                let dest = scratch.as_mut_slice(record);
+                                std::thread::scope(|ps| {
+                                    for (i, chunk) in dest.chunks_mut(piece).enumerate() {
+                                        let off = at + (i * piece) as u64;
+                                        let h = w * pieces + i;
+                                        ps.spawn(move || {
+                                            df.read_at_with_handle(h, off, chunk).unwrap()
+                                        });
+                                    }
+                                });
+                            }
+                            busy_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            bytes.fetch_add(record as u64, Ordering::Relaxed);
+                            reads.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            let secs = t0.elapsed().as_secs_f64();
+            let n = reads.load(Ordering::Relaxed).max(1);
+            eprintln!(
+                "  records in flight {qd:>2} × {pieces} piece(s): {:>6.2} GB/s, {:>6.2} ms per record, {n} records",
+                bytes.load(Ordering::Relaxed) as f64 / secs / 1e9,
+                busy_ns.load(Ordering::Relaxed) as f64 / n as f64 / 1e6,
+            );
+        }
     }
 
     /// Concurrent multi-stripe read: split a file into N non-overlapping

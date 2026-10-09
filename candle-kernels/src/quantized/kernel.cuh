@@ -70,6 +70,7 @@ struct YTiles {
 #include "../fast_exp.cuh"           // the SiLU the fused-activation loader applies
 #include "../quantize/q8a128_tile.cuh" // the one q8a128 quantization, for that loader
 #include "moe_live.cuh"                 // the grouped entry's workers over a live expert table
+#include "../moe_read_ahead.cuh"        // the gate launch's read-ahead items
 #include "splitk_segs.cuh"              // the split-K dense entry's weight segments
 #include "pdl.cuh"                      // programmatic dependent launch: prefetch, then wait
 
@@ -1650,12 +1651,27 @@ __device__ void tc16_kernel(
 //   image) also has each slice the workers copy stored there, at the
 //   projection's offset (`dst_offset`): once the layer's three launches are
 //   done the slot holds the whole expert, and the host points its entry there.
+// - The gate launch's workers then READ AHEAD (`ahead`, `moe_read_ahead.cuh`):
+//   past the launch's own items come `AHEAD_CHUNKS` pieces of each item
+//   bucketize claimed for a later row's predicted expert. A piece is a plain
+//   byte copy of the expert's warm-slot image into its claimed slot — no
+//   compute, no layer geometry. The worker that finishes an item's last piece
+//   publishes it: the slot's owner tag, the up and down entries, a system
+//   fence, then gate. A later bucketize then finds the expert in VRAM without
+//   the host having done anything; the host books it when it collects the
+//   claim from the ring log. Demand items come first, so read-ahead only ever
+//   fills time the launch's own experts left over.
 //
 // Only workers wait, and what they wait on is a host store — never a submitted
 // copy or any other driver call, which a thread blocked in the driver (a lazy
 // kernel load behind this launch) could hold back. `abort` (a mapped host word)
-// and `spin_limit_ns` end a wait in `__trap()`, a sticky error the next
-// synchronising call reports, so no result computed from the layer is returned.
+// and `spin_limit_ns` end a wait without the expert: the worker claims `fault`
+// (a mapped host word naming the row, the expert and the wait) and gives the
+// item up; any other cold wait that sees the word set gives its expert up at
+// once. The host reads it once the forward has synchronised and fails the
+// forward, so no result computed from the layer is returned, and the context is
+// left usable. A given-up item writes nothing — not its output, and not the
+// promotion slot it was copying into, which the host therefore never installs.
 //
 // `stall` is the profile build's per-row counter block, null otherwise:
 //   stall[0] cold_wait_ns     — workers' time spent waiting for a cold expert
@@ -1663,8 +1679,11 @@ __device__ void tc16_kernel(
 //   stall[2] bytes            — bytes workers copied into scratch
 //   stall[3] copy_ns          — workers' time in the copy (mini loop)
 //   stall[4] launches         — live launches (one per projection per layer)
+//   stall[5] ahead_items      — read-ahead items published
+//   stall[6] ahead_bytes      — bytes read ahead
 //
 // The struct itself is in `moe_live.cuh`, shared with the launcher.
+#define MOE_LIVE_STALL_WORDS 7
 
 __device__ __forceinline__ unsigned long long moe_live_now() {
     unsigned long long t;
@@ -1697,8 +1716,32 @@ __device__ __forceinline__ uint4 moe_live_ld16(const uint8_t* p) {
 // off to tens of microseconds so the polls never compete with the copies.
 #define MOE_LIVE_MAX_SLEEP_NS 32768u
 
+// 16-byte loads each worker thread keeps in flight in a slice copy. Eight measured
+// level with four on Flash-Next decode (RTX 4090 Laptop, 32 workers): with that
+// many workers, the round trips of one are hidden by the others.
+#define MOE_LIVE_LOADS 4
+
+// The fault word's fields (`MoeLive::fault`; `api.rs`'s `MOE_FAULT_*`): bit 63
+// set when the wait ended on the abort word, the row in bits 48-62, the expert
+// in bits 32-47, the microseconds waited in bits 0-31, saturating.
+#define MOE_FAULT_ABORTED (1ull << 63)
+#define MOE_FAULT_ROW_SHIFT 48
+#define MOE_FAULT_EXPERT_SHIFT 32
+
+// Whether a worker of any launch has claimed the fault word. A forward that
+// faulted is failed by the host, so a cold wait that sees the word gives its
+// expert up at once instead of waiting out the spin limit. Read only inside a
+// wait, which polls the link anyway: an item whose expert is already published
+// pays nothing for it.
+__device__ __forceinline__ bool moe_live_faulted(const MoeLive& live) {
+    return *reinterpret_cast<const volatile unsigned long long*>(live.fault) != 0ull;
+}
+
 // Thread 0 of a worker: the live entry of a cold `expert`, waited for while it
-// is 0. Returns the time spent waiting.
+// is 0. Returns the time spent waiting. A wait that ends without the expert —
+// the abort word raised, or past `spin_limit_ns` — claims the fault word with
+// what it waited on and leaves `*src` 0: the worker gives the item up rather
+// than trapping, so the context survives and the host fails only the forward.
 __device__ __forceinline__ unsigned long long moe_live_source(
     int expert, const MoeLive& live, unsigned long long* src)
 {
@@ -1711,9 +1754,19 @@ __device__ __forceinline__ unsigned long long moe_live_source(
     const unsigned long long t0 = moe_live_now();
     unsigned int ns = 32;
     while (p == 0) {
-        if (*reinterpret_cast<const volatile unsigned int*>(live.abort) != 0u ||
-            moe_live_now() - t0 > live.spin_limit_ns) {
-            __trap();
+        const unsigned int aborted = *reinterpret_cast<const volatile unsigned int*>(live.abort);
+        const unsigned long long waited = moe_live_now() - t0;
+        if (aborted != 0u || waited > live.spin_limit_ns || moe_live_faulted(live)) {
+            const unsigned long long us = waited / 1000ull;
+            const unsigned long long code =
+                (aborted != 0u ? MOE_FAULT_ABORTED : 0ull) |
+                ((unsigned long long)(live.row & 0x7fff) << MOE_FAULT_ROW_SHIFT) |
+                ((unsigned long long)(expert & 0xffff) << MOE_FAULT_EXPERT_SHIFT) |
+                (us < 0xffffffffull ? us : 0xffffffffull);
+            atomicCAS(live.fault, 0ull, code);
+            __threadfence_system();
+            *src = 0;
+            return waited;
         }
 #if __CUDA_ARCH__ >= 700
         __nanosleep(ns);
@@ -2799,6 +2852,58 @@ static __device__ void quantized_matmul_dense_splitk_entry_int8(
     }
 }
 
+// Piece `c` of read-ahead item `a` (`moe_read_ahead.cuh`): the item's bytes
+// `[c · piece, min(bytes, (c + 1) · piece))` from its warm-slot image into its
+// claimed slot, every thread four 16-byte loads in flight, then their stores.
+// Each thread fences its own stores before the block counts the piece done, so
+// the worker that counts an item's last piece publishes an expert whose every
+// byte is written; it stores the owner tag, up, down, a system fence, then
+// gate. Called by every thread of the block.
+static __device__ void moe_live_ahead_piece(const MoeLive& live, int a, int c, int tid) {
+    const unsigned long long* item = live.ahead + 1 + (size_t)a * AHEAD_ITEM_WORDS;
+    const unsigned long long bytes = item[2];
+    const unsigned long long piece = ahead_piece_bytes(bytes);
+    const unsigned long long lo = (unsigned long long)c * piece;
+    const unsigned long long hi = lo + piece < bytes ? lo + piece : bytes;
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(item[0]));
+    uint8_t* dst = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(item[1]));
+    const long long units = lo < hi ? (long long)((hi - lo) / 16ull) : 0ll;
+    for (long long b = tid; b < units; b += NUM_THREADS * 4) {
+        uint4 v[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const long long idx = b + (long long)u * NUM_THREADS;
+            if (idx < units) {
+                v[u] = moe_live_ld16(src + lo + (size_t)idx * 16);
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const long long idx = b + (long long)u * NUM_THREADS;
+            if (idx < units) {
+                *reinterpret_cast<uint4*>(dst + lo + (size_t)idx * 16) = v[u];
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0 && atomicAdd(&live.ahead_done[a], 1u) == AHEAD_CHUNKS - 1u) {
+        __threadfence();
+        if (item[9] != 0ull) {
+            *reinterpret_cast<volatile unsigned int*>(static_cast<uintptr_t>(item[9])) =
+                (unsigned int)item[10];
+        }
+        *reinterpret_cast<volatile unsigned long long*>(static_cast<uintptr_t>(item[4])) = item[7];
+        *reinterpret_cast<volatile unsigned long long*>(static_cast<uintptr_t>(item[5])) = item[8];
+        __threadfence_system();
+        *reinterpret_cast<volatile unsigned long long*>(static_cast<uintptr_t>(item[3])) = item[6];
+        if (live.stall != nullptr) {
+            atomicAdd(&live.stall[5], 1ull);
+            atomicAdd(&live.stall[6], bytes);
+        }
+    }
+}
+
 // A worker of a live launch (see "A live expert table" above): items
 // `(remote expert r, row tile j)` off the launch's counter until none are left.
 // Per item: the expert's entry (waited for while cold); the row tile's slice
@@ -2833,6 +2938,8 @@ static __device__ void moe_live_worker(
     const int row_tiles = nrows_x / N_TILE;
     const int units = (ncols_x / K_TILE) * UNITS_PER_PIECE;
     const int n_items = live.header[3] * row_tiles;
+    // The launch's own items, then the read-ahead pieces.
+    const int n_all = n_items + (live.ahead != nullptr ? (int)live.ahead[0] * AHEAD_CHUNKS : 0);
     uint8_t* slot = live.scratch + (size_t)worker * live.slot_bytes;
     if (live.stall != nullptr && worker == 0 && tid == 0) {
         atomicAdd(&live.stall[4], 1ull);
@@ -2843,8 +2950,14 @@ static __device__ void moe_live_worker(
         }
         __syncthreads();
         const int it = s_item;
-        if (it >= n_items) {
+        if (it >= n_all) {
             return;
+        }
+        if (it >= n_items) {
+            // Read-ahead pieces never wait on a cold expert, so a fault does not
+            // touch them: each publishes an expert its own copy completes.
+            moe_live_ahead_piece(live, (it - n_items) / AHEAD_CHUNKS, (it - n_items) % AHEAD_CHUNKS, tid);
+            continue;
         }
         const int r = it / row_tiles;
         const int j = it - r * row_tiles;
@@ -2860,6 +2973,10 @@ static __device__ void moe_live_worker(
             }
         }
         __syncthreads();
+        // The wait gave the expert up (the fault word names it): skip the item.
+        if (s_src == 0ull) {
+            continue;
+        }
         const uint8_t* src = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(s_src));
         // A promotion slot is the copy's ONLY destination: the slice lands at its
         // place in the slot image — the source's own layout — and the tile is
@@ -2872,12 +2989,14 @@ static __device__ void moe_live_worker(
                              ? nullptr
                              : reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(promo_base + live.dst_offset));
         const unsigned long long t_copy = moe_live_now();
-        // The mini loop: every thread four 16-byte loads in flight, then their stores.
-        for (int b = tid; b < units; b += NUM_THREADS * 4) {
-            uint4 v[4];
-            size_t at[4];
+        // The mini loop: every thread `MOE_LIVE_LOADS` 16-byte loads in flight, then
+        // their stores. A slice is a few PCIe round trips, so loads in flight per
+        // round trip are what the worker's rate is.
+        for (int b = tid; b < units; b += NUM_THREADS * MOE_LIVE_LOADS) {
+            uint4 v[MOE_LIVE_LOADS];
+            size_t at[MOE_LIVE_LOADS];
             #pragma unroll
-            for (int u = 0; u < 4; ++u) {
+            for (int u = 0; u < MOE_LIVE_LOADS; ++u) {
                 const int idx = b + u * NUM_THREADS;
                 if (idx < units) {
                     const int k = idx / UNITS_PER_PIECE;
@@ -2887,7 +3006,7 @@ static __device__ void moe_live_worker(
                 }
             }
             #pragma unroll
-            for (int u = 0; u < 4; ++u) {
+            for (int u = 0; u < MOE_LIVE_LOADS; ++u) {
                 const int idx = b + u * NUM_THREADS;
                 if (idx < units) {
                     if (promo != nullptr) {

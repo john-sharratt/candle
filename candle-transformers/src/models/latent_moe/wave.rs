@@ -1039,6 +1039,14 @@ impl ManagedBatchedModel for BatchedEngine {
         Some(self.engine.experts().expert_stats())
     }
 
+    fn expert_hit_counts(&self) -> Option<(usize, usize)> {
+        Some(self.engine.experts().hit_counts())
+    }
+
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        self.engine.experts().hit_references()
+    }
+
     fn reset_expert_stats(&self) {
         self.engine.experts().reset_expert_stats();
     }
@@ -1261,6 +1269,12 @@ impl ManagedBatchedModel for BatchedEngine {
 impl WaveSweep for BatchedEngine {
     fn device(&self) -> &Device {
         self.engine.engine_device()
+    }
+
+    fn take_device_fault(&self) -> Result<()> {
+        self.engine
+            .experts()
+            .take_segment_fault(self.engine.engine_device())
     }
 
     fn num_layers(&self) -> usize {
@@ -3191,22 +3205,27 @@ impl BatchedEngine {
         // Lossless either way — K shapes cost and acceptance ceiling, never
         // output. K ≥ 1 keeps probes meaningful; the τ confidence schedule
         // below can still shorten the block further on its own signal.
+        //
+        // The tallies are read unsettled (`ExpertCache::hit_counts`): a settle
+        // waits for the device to reach the last queued MoE layer and for the
+        // pipeline thread to serve the backlog, once per draft, and an EMA
+        // needs no exact interval boundary.
         let miss_ema = {
-            let st = self.engine.experts().expert_stats();
+            let (hits, misses) = self.engine.experts().hit_counts();
             let mut g = self
                 .spec_miss
                 .write()
                 .map_err(|_| candle::Error::Msg("spec_miss lock poisoned".into()))?;
             let (last_hits, last_misses, ema) = *g;
-            let dh = st.expert_hits.saturating_sub(last_hits);
-            let dm = st.expert_misses.saturating_sub(last_misses);
+            let dh = hits.saturating_sub(last_hits);
+            let dm = misses.saturating_sub(last_misses);
             let ema = if dh + dm > 0 {
                 let rate = dm as f32 / (dh + dm) as f32;
                 SPEC_EMA_ALPHA * rate + (1.0 - SPEC_EMA_ALPHA) * ema
             } else {
                 ema
             };
-            *g = (st.expert_hits, st.expert_misses, ema);
+            *g = (hits, misses, ema);
             ema
         };
         let k_accept = (accept_ema + 1.0).ceil() as usize;

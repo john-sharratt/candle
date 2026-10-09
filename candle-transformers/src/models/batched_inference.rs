@@ -49,6 +49,7 @@ use candle_nn::kv_cache::{
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
@@ -5578,6 +5579,27 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// The expert cache's `(hits, misses)` tallies so far, unsettled
+    /// (`ExpertCache::hit_counts`) — the per-step read, where
+    /// [`Self::expert_stats`] waits for the pipeline thread to serve every
+    /// queued layer.
+    fn expert_hit_counts(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// The expert cache's residency references over the interval the counters
+    /// cover, `(lru, min)` (`ExpertCache::hit_references`), if the model has
+    /// one. A replay of the interval — for reports, not for a step.
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        None
+    }
+
+    /// Write the expert cache's routing trace to `path`
+    /// (`ExpertCache::write_routing_trace`); nothing for a model without one.
+    fn write_expert_routing_trace(&self, _path: &Path) -> Result<()> {
+        Ok(())
+    }
+
     /// Snapshot the row-cache counters of a disk-resident embedding tier, if
     /// this model has one.
     ///
@@ -5860,6 +5882,14 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         self.model().expert_stats()
     }
 
+    fn expert_hit_counts(&self) -> Option<(usize, usize)> {
+        self.model().expert_hit_counts()
+    }
+
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        self.model().expert_hit_references()
+    }
+
     // `row_cache_stats` keeps the trait's `None`: no model reached through
     // `BatchedInference<M>` serves an embedding tier from disk. The one that
     // does (Qwen3.8-Flash-Next's PLE table) implements `ManagedBatchedModel`
@@ -6064,6 +6094,10 @@ fn reconcile_sealed_prefix(
 impl<M: BatchedModelCore> WaveSweep for BatchedInference<M> {
     fn device(&self) -> &Device {
         self.model().device()
+    }
+
+    fn take_device_fault(&self) -> Result<()> {
+        self.model().take_device_fault()
     }
 
     fn num_layers(&self) -> usize {

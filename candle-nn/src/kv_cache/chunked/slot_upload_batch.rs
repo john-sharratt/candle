@@ -13,8 +13,25 @@
 //! ranges instead, and [`SlotUploadBatch::flush`] packs every one into the
 //! stager generation's device-mapped arena and copies them all with ONE
 //! `rows_scatter` launch on the compute stream (hot-path invariant 2b: a
-//! descriptor table, not a copy per destination). A thread recording a wave
-//! defers nothing: its uploads are recorded into the wave's ring (see [`defer`]).
+//! descriptor table, not a copy per destination).
+//!
+//! # Inside a recorded wave
+//!
+//! The scatter is recorded into the segment like any launch, and for a batch
+//! of many slots that is what keeps the segment's shape: one node however many
+//! slots crossed a boundary this step, where a copy per range made the node
+//! count follow the step's boundaries and every change of it a reshaped fold.
+//! Qwen3.6-35B-A3B's gate (RTX PRO 5000), whose decode metadata build brings
+//! every attention layer's slot up to date in one batch, measured 92–101
+//! reshaped folds a config with a copy per range against 6–10 with the scatter,
+//! and decode 2–4% faster with the scatter at every width.
+//!
+//! A batch of ONE slot keeps a copy per range, recorded into the wave's ring
+//! as an unbatched upload is ([`into_the_ring`]): its node count does not
+//! change from step to step, so the scatter saves no fold, and it adds the
+//! staging and its own launch on every layer of a recorded verify —
+//! Qwen3.8-Flash-Next's single-session decode, whose verify brings one slot up
+//! to date per attention layer, ran 10% slower through the scatter.
 //!
 //! # Why deferring is safe
 //!
@@ -118,15 +135,8 @@ thread_local! {
 /// Defer the upload of `ranges` of a slot's host copy `host` into the device
 /// slot at `slot`, when a batch is open on this thread. `false` — nothing
 /// taken — when none is, for the caller to upload eagerly.
-///
-/// Also `false` on a thread recording a wave: there the caller records each
-/// range into the wave's ring, a copy-engine node of the segment, where the
-/// scatter would be a kernel reading the staged bytes over PCIe on the GPU's
-/// critical path — measured as Flash-Next's verify losing 4–7% of decode,
-/// once per attention layer per step.
 pub(crate) fn defer(device: &CudaDevice, slot: u64, ranges: &[Range<usize>], host: &[u8]) -> bool {
     PENDING.with(|p| match p.borrow_mut().as_mut() {
-        Some(_) if device.recording_segment().is_some() => false,
         Some(pending) => {
             pending.device.get_or_insert_with(|| device.clone());
             pending.capture(slot, ranges, host);
@@ -189,6 +199,13 @@ impl Drop for SlotUploadBatch<'_> {
     }
 }
 
+/// Whether a batch's `runs` go into the recording wave's ring, one recorded
+/// copy each, rather than into one scatter: on a `recording` thread, when they
+/// are all one slot's (see the module docs).
+fn into_the_ring(runs: &[Run], recording: bool) -> bool {
+    recording && runs.windows(2).all(|w| w[0].slot == w[1].slot)
+}
+
 /// Take this thread's pending copies and launch them.
 fn flush_pending(generation: &Generation) -> Result<()> {
     let Some(pending) = PENDING.with(|p| p.borrow_mut().take()) else {
@@ -197,16 +214,30 @@ fn flush_pending(generation: &Generation) -> Result<()> {
     let (Some(device), false) = (pending.device.as_ref(), pending.runs.is_empty()) else {
         return Ok(());
     };
+    // Recorded into the ring until it has no room; what it refuses is scattered.
+    let runs: Vec<Run> = if into_the_ring(&pending.runs, device.recording_segment().is_some()) {
+        pending
+            .runs
+            .iter()
+            .copied()
+            .skip_while(|r| device.record_upload(r.dst, &pending.bytes[r.src..r.src + r.len]))
+            .collect()
+    } else {
+        pending.runs
+    };
+    if runs.is_empty() {
+        return Ok(());
+    }
     let bytes = stage(generation, &pending.bytes)?;
-    let desc = descriptors(&pending.runs, bytes.dev_ptr())?;
+    let desc = descriptors(&runs, bytes.dev_ptr())?;
     // Few runs ride in the kernel's parameters and the device table is never
     // read; more are read from the generation's arena in place.
-    let table = if pending.runs.len() > ROWS_SCATTER_INLINE_MAX {
+    let table = if runs.len() > ROWS_SCATTER_INLINE_MAX {
         Some(stage(generation, as_bytes(&desc))?)
     } else {
         None
     };
-    let max_words = pending.runs.iter().map(|r| r.len / 4).max().unwrap_or(0);
+    let max_words = runs.iter().map(|r| r.len / 4).max().unwrap_or(0);
     let stream = device.cuda_stream();
     // SAFETY: every descriptor names a source inside the staged bytes, which
     // the generation keeps alive past the launch, and a destination inside a
@@ -218,7 +249,7 @@ fn flush_pending(generation: &Generation) -> Result<()> {
                 .as_ref()
                 .map_or(std::ptr::null(), |t| t.dev_ptr() as *const i64),
             desc.as_ptr(),
-            pending.runs.len() as i32,
+            runs.len() as i32,
             max_words as i32,
             1,
             stream.cu_stream() as *mut std::ffi::c_void,
@@ -413,17 +444,38 @@ mod tests {
         PENDING.with(|p| assert!(p.borrow().is_none()));
     }
 
-    /// The bytes of a flushed batch land at their destinations: 40 bytes into the
-    /// start of one buffer and 8 bytes into the middle of another, the rest of
-    /// both left as they were. On a thread recording a wave nothing is deferred —
-    /// the caller records its ranges into the wave's ring — and a batch opened
-    /// there flushes nothing, with the capture intact.
+    fn run(slot: u64) -> Run {
+        Run {
+            slot,
+            dst: slot,
+            src: 0,
+            len: 16,
+        }
+    }
+
+    /// Inside a recording one slot's runs go to the ring and several slots' to
+    /// the scatter; outside one, everything is scattered.
+    #[test]
+    fn only_a_recorded_batch_of_one_slot_goes_to_the_ring() {
+        let one = [run(0x1000), run(0x1000)];
+        let two = [run(0x1000), run(0x2000)];
+        assert!(into_the_ring(&one, true));
+        assert!(into_the_ring(&[run(0x1000)], true));
+        assert!(!into_the_ring(&two, true));
+        assert!(!into_the_ring(&one, false));
+    }
+
+    /// The bytes of a flushed batch land at their destinations, eager or
+    /// recorded: 40 bytes into the start of one buffer and 8 bytes into the
+    /// middle of another — two slots, one scatter — the rest of both left as
+    /// they were. A recorded batch of the first buffer alone goes through the
+    /// ring, and lands the same.
     #[test]
     fn a_flushed_batch_lands_every_range() {
         let _gpu = crate::kv_cache::chunked::gpu_test_lock::gpu_serial();
         let dev = CudaDevice::new(0).unwrap();
         let stager = PinnedStager::new(&dev);
-        for recording in [false, true] {
+        for (recording, both) in [(false, true), (true, true), (true, false)] {
             let a = dev.memcpy_stod(&[0xAAu8; 64]).unwrap();
             let b = dev.memcpy_stod(&[0xBBu8; 64]).unwrap();
             let stream = dev.cuda_stream();
@@ -438,8 +490,10 @@ mod tests {
             let generation = stager.begin_generation();
             let batch = SlotUploadBatch::open(&generation).unwrap();
             assert_eq!(dev.recording_segment().is_some(), recording);
-            assert_eq!(defer(&dev, pa, &[0..40], &h), !recording);
-            assert_eq!(defer(&dev, pb, &[16..24], &h), !recording);
+            assert!(defer(&dev, pa, &[0..40], &h));
+            if both {
+                assert!(defer(&dev, pb, &[16..24], &h));
+            }
             batch.flush().unwrap();
             drop(generation);
             if let Some(c) = capture {
@@ -450,12 +504,12 @@ mod tests {
             let got_b = dev.memcpy_dtov(&b).unwrap();
             let mut want_a = vec![0xAAu8; 64];
             let mut want_b = vec![0xBBu8; 64];
-            if !recording {
-                want_a[..40].copy_from_slice(&h[..40]);
+            want_a[..40].copy_from_slice(&h[..40]);
+            if both {
                 want_b[16..24].copy_from_slice(&h[16..24]);
             }
-            assert_eq!(got_a, want_a, "recording {recording}");
-            assert_eq!(got_b, want_b, "recording {recording}");
+            assert_eq!(got_a, want_a, "recording {recording}, both {both}");
+            assert_eq!(got_b, want_b, "recording {recording}, both {both}");
         }
     }
 

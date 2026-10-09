@@ -6,27 +6,30 @@
 //!
 //! ## Eviction policy
 //!
-//! Frequency-dominated, layer-aware, with pinning.  In brief:
+//! Evict behind the wave, frequency within. In brief:
 //!
-//! 1. **Ranked victims, taken by the caller** — a promotion that finds no free
-//!    slot asks [`ExpertCacheInner::rank_victims`] for its best victims in one
-//!    scan, scored at the promoting row, and takes only those the reclaim rule
-//!    lets go. A demand miss never takes a slot: the expert kernels' worker
-//!    blocks serve it from pinned memory, and the cache learns of it only
-//!    through the promotion that follows. Eviction is a retarget (the cold
-//!    pack holds every expert; the warm tier is immutable), so there is no
+//! 1. **Ranked victims, taken by the caller** — the promotion ring's lazy
+//!    victims are ranked by [`ExpertCacheInner::rank_victims`] in one scan,
+//!    scored at the row the pipeline is serving, and a claim — a demand miss
+//!    or a read-ahead copy — takes the next one. Eviction is a retarget (the
+//!    cold pack holds every expert; the warm tier is immutable), so there is no
 //!    copy to hide and nothing to do ahead of time.
-//! 2. **Behind-window preference** — a demand-driven promotion scores the
-//!    [`PREFETCH_EVICT_WINDOW`] layers just behind the wave at half their
-//!    frequency, so a just-executed layer's expert goes first.
+//! 2. **Behind the wave first, fading** — each resident's frequency is scaled
+//!    by how far behind the wave its layer lies ([`behind_protection`]): L−1
+//!    by [`FADE_FLOOR`], each layer further back a little more, wrapping round
+//!    to the layers about to run, which keep nearly their whole score. At the
+//!    start of a pass the eviction front is the previous pass's last layers;
+//!    as the wave advances it moves to the early layers it has just left.
 //! 3. **Early-layer pinning** — the first [`PINNED_LAYERS`] layers are never
 //!    evicted (they run first every pass with no compute to hide a reload).
-//! 4. **Windowed prefetch eviction** — speculative prefetch makes room only
-//!    from the furthest-behind layers ([`PREFETCH_EVICT_WINDOW`]).
-//! 5. **Reload-tier passes** — each of the above runs over the warm-backed
-//!    experts first and over the NVMe-pack-only experts only for what that
-//!    pass could not free ([`EVICTION_PASSES`]). With no warm tier, or with
-//!    one holding everything, there is one class and the policy is unchanged.
+//! 4. **Eviction-class passes** — the residents fall into four classes,
+//!    reload tier (warm-backed or NVMe-pack-only) × whether their row routed
+//!    them on its last visit, and each of the above runs over one class at a
+//!    time, a later class only for what the earlier could not free. The
+//!    classes run cheapest expected miss cost first
+//!    ([`ExpertCacheInner::set_eviction_costs`]: regret rate × restore cost),
+//!    and in [`EVICTION_PASSES`]'s order — warm-backed first, stale before
+//!    just-routed — until those costs are measured.
 //!
 //! ## Score table
 //!
@@ -48,6 +51,7 @@
 //! experts the current decode steps are routing, and a long one that keeps the
 //! experts decode keeps coming back to.
 
+use super::regret::class_index;
 #[cfg(feature = "tensor-assert")]
 use super::slot_owners::SlotOwners;
 use super::types::ExpertSlot;
@@ -115,8 +119,7 @@ pub const PREFILL_HIT_SCORE: f32 = 0.1;
 /// is backwards. Each eviction key therefore goes through
 /// [`ExpertCacheInner::protected_by`], which divides below zero; that also keeps
 /// the sign a hard tier, so an elevated expert outranks nothing in its pass
-/// whatever its factors — `slot_eviction_score`'s `position_factor` and the
-/// batch scans' `window_factor` alike.
+/// however far behind or ahead of the wave it lies ([`behind_protection`]).
 pub const PREFILL_ELEVATE_PENALTY: f32 = -0.1;
 
 /// Per-pass decay of the recency-weighted score: a memory of about ten passes.
@@ -200,9 +203,11 @@ pub fn minimum_resident_slots(experts_per_layer: usize) -> usize {
 /// hit rate — it decides where the misses land. Every slot VRAM spends on a
 /// warm-backed expert leaves one more pack-only expert to miss on disk (a
 /// 2.9 MB page-cache-bypassing read near a millisecond, against ~116 µs H2D
-/// from pinned host memory). So every eviction runs its policy in
-/// [`EVICTION_PASSES`] order: over the warm-backed experts first, and over the
-/// pack-only experts only for whatever the first pass could not free.
+/// from pinned host memory). So every eviction runs its policy one reload tier
+/// at a time — warm-backed first by default ([`EVICTION_PASSES`]), and in the
+/// order of each class's measured expected miss cost once that is known
+/// ([`ExpertCacheInner::set_eviction_costs`]), which prices exactly this
+/// difference in restore cost.
 ///
 /// Measured on Flash-Next at 16 GB against the single-pass policy: pack share
 /// of loads 68 % → 61 / 63 / 50 % (BF16×1 / BF16×8 / C5×2), decode 16.2 /
@@ -220,8 +225,36 @@ enum ReloadTier {
     Nvme,
 }
 
-/// The order eviction passes visit the reload tiers in.
-const EVICTION_PASSES: [ReloadTier; 2] = [ReloadTier::Warm, ReloadTier::Nvme];
+/// The order eviction passes visit residents in until their costs are measured
+/// ([`ExpertCacheInner::set_eviction_costs`]): each reload tier, and within it
+/// first the experts their row did **not** route on its last visit, then the
+/// ones it did (`hit_last`).
+///
+/// **Recency is a pass, not a weight.** Decode routing carries over from one
+/// step to the next: of the experts a row routed on its last visit, 37–63% are
+/// routed again on its next (Qwen3.8-Flash-Next, RTX 4090 Laptop, decode ×1 to
+/// ×8), against 10–21% of the rest. The decayed frequency score cannot see
+/// that — a demand miss just installed scores about 1, a resident hit a few
+/// passes ago still 2–3 — so ranked by score alone those just-hit experts were
+/// 54% of the victims at ×1 and 82% at ×8, and accounted for most of the
+/// evictions their rows then missed. As a pass they go only once every other
+/// resident of the tier has.
+///
+/// **Inside the reload tier, not above it**, because the costs say so: a warm
+/// miss reloads in ~116 µs and a pack-only one in ~1 ms, so a warm just-hit
+/// victim (37–63% back × 116 µs) is still cheaper than a pack-only cold one
+/// (10–21% × 1 ms).
+const EVICTION_PASSES: [(ReloadTier, bool); 4] = [
+    (ReloadTier::Warm, false),
+    (ReloadTier::Warm, true),
+    (ReloadTier::Nvme, false),
+    (ReloadTier::Nvme, true),
+];
+
+/// A pass's eviction class, as the ledger indexes them (`regret`).
+fn pass_class((tier, hit): (ReloadTier, bool)) -> usize {
+    class_index(hit, tier == ReloadTier::Warm)
+}
 
 /// One eviction candidate as the batch scans rank it within a pass.
 #[derive(Clone, Copy)]
@@ -246,13 +279,35 @@ impl VictimKey {
     }
 }
 
-/// How many of the furthest (just-behind) layers are eligible as prefetch
-/// make-room victims. Caps how far back eviction reaches from the current layer
-/// (`current-1 .. current-PREFETCH_EVICT_WINDOW`), keeping it off the
-/// near-future layers about to be used; it never wraps past the pass's start.
-/// See [`ExpertCacheInner::evict_for_prefetch_batch`].
-#[cfg(any(feature = "cuda", test))]
-pub(crate) const PREFETCH_EVICT_WINDOW: usize = 5;
+/// How well a resident at wrapped forward distance `dist` from the wave is
+/// protected, of `n` layers: [`FADE_FLOOR`] plus the rest in proportion to the
+/// layers it lies *behind* the wave, `(n − dist) / n`. L−1 (`dist = n − 1`) is
+/// protected least, each layer further back a little more, through the wrap,
+/// up to the layers about to run (L+1) and the one being computed (1).
+///
+/// The layer just executed is the one whose next use is furthest away — a full
+/// pass — so it is evicted first, and the preference fades the further back a
+/// layer is. Wrapping is what moves the eviction front with the wave: at the
+/// start of a pass the layers just behind are the previous pass's last, and as
+/// the wave advances it evicts from the early layers it has just left.
+fn behind_protection(dist: usize, n: usize) -> f32 {
+    FADE_FLOOR + (1.0 - FADE_FLOOR) * (n - dist) as f32 / n as f32
+}
+
+/// The least protection [`behind_protection`] gives, at L−1: the fade spans
+/// about `1 / FADE_FLOOR` (~4×) from the layer just behind to the one about to
+/// run, so distance steers eviction without overruling frequency.
+///
+/// Measured on Qwen3.8-Flash-Next (RTX 4090 Laptop), as the share of evicted
+/// experts their row routed again at its next visit (decode ×1 / ×4 / ×8 /
+/// C5×8, two rounds each): a floor of 0 — the full `1/n … 1` fade, ~48× — rose
+/// to 26.3 / 38.4 / 58.6 / 54.5% from the flat 2× window's 25.8 / 36.8 / 55.6 /
+/// 51.3%, evicting hot experts just behind that the next pass needed; 0.5 gave
+/// 26.3 / 37.6 / 54.3 / 50.6%, and 0.25 25.5 / 36.4 / 54.3 / 49.5%, the least.
+/// Against the flat window, order-balanced over four rounds, 0.25 decodes level
+/// on every row but C5×8, where it runs ~7% slower (83.1 → 77.4 t/s) with ~40%
+/// more read-ahead claims.
+const FADE_FLOOR: f32 = 0.25;
 
 /// Mutable bookkeeping owned exclusively by the pipeline thread.
 ///
@@ -321,6 +376,13 @@ pub struct ExpertCacheInner {
     /// immutable, which is what lets the eviction policy treat this as a
     /// property of the expert rather than something to re-check.
     pub(crate) warm_backed: Vec<bool>,
+    /// Flat `layer * experts_per_layer + expert` → did this expert's row route
+    /// it on the row's last visit? Rewritten per row as each is served
+    /// ([`Self::mark_visit`]); the recency half of [`EVICTION_PASSES`].
+    hit_last: Vec<bool>,
+    /// The order the eviction passes run in: [`EVICTION_PASSES`] until
+    /// [`Self::set_eviction_costs`] orders them by expected miss cost.
+    passes: [(ReloadTier, bool); 4],
     /// The slot-tenancy tags bucketize's owner check reads, once a device
     /// cache has attached them ([`Self::attach_owners`]); every tenant a slot
     /// gains after that is written through.
@@ -348,6 +410,8 @@ impl ExpertCacheInner {
             experts_per_layer,
             pinned_layers: pinned_layer_count(num_moe_layers),
             warm_backed: vec![false; num_moe_layers * experts_per_layer],
+            hit_last: vec![false; num_moe_layers * experts_per_layer],
+            passes: EVICTION_PASSES,
             #[cfg(feature = "tensor-assert")]
             owners: None,
         }
@@ -386,8 +450,47 @@ impl ExpertCacheInner {
         }
     }
 
+    /// Row `layer` was served, routing `routed`: those of its experts are now
+    /// the ones it hit on its last visit, and no others.
+    pub(crate) fn mark_visit(&mut self, layer: usize, routed: &[usize]) {
+        let row = layer * self.experts_per_layer;
+        self.hit_last[row..row + self.experts_per_layer].fill(false);
+        for &e in routed {
+            self.hit_last[row + e] = true;
+        }
+    }
+
+    /// Order the eviction passes by each class's expected miss cost, cheapest
+    /// first: `cost[hit * 2 + warm]` is how often a victim of that class is
+    /// routed again at its row's next visit times what restoring it costs.
+    /// Ties keep [`EVICTION_PASSES`]'s order, which takes the warm-backed
+    /// first.
+    ///
+    /// Restoring a pack-only expert costs the drive read *and* the copy that
+    /// follows, against the copy alone for a warm-backed one, so pack-only
+    /// classes are protected by that ratio — about an order of magnitude on an
+    /// NVMe pack — and an eviction takes one only when it is that much less
+    /// likely to be wanted back.
+    pub(crate) fn set_eviction_costs(&mut self, cost: [f64; 4]) {
+        let mut passes = EVICTION_PASSES;
+        passes.sort_by(|&a, &b| cost[pass_class(a)].total_cmp(&cost[pass_class(b)]));
+        self.passes = passes;
+    }
+
+    /// Whether `layer`'s row routed `expert` on its last visit.
+    #[inline]
+    pub(crate) fn hit_last_visit(&self, layer: usize, expert: usize) -> bool {
+        self.hit_last[layer * self.experts_per_layer + expert]
+    }
+
+    /// Whether a warm (host) copy backs `(layer, expert)` — its cheap reload.
+    #[inline]
+    pub(crate) fn is_warm_backed(&self, layer: usize, expert: usize) -> bool {
+        self.reload_tier(layer, expert) == ReloadTier::Warm
+    }
+
     /// Where `(layer, expert)` reloads from after an eviction — see
-    /// [`ReloadTier`] for why every eviction runs one pass per tier.
+    /// [`ReloadTier`] for why eviction passes split by tier.
     #[inline]
     fn reload_tier(&self, layer: usize, expert: usize) -> ReloadTier {
         let idx = layer * self.experts_per_layer + expert;
@@ -401,20 +504,19 @@ impl ExpertCacheInner {
     /// Apply a protection factor to a base score, so that "larger factor ⇒
     /// better protected" holds on both sides of zero.
     ///
-    /// Both factors in this module — `position_factor` and `window_factor` —
-    /// mean "how much this slot is worth protecting", so a larger one must
-    /// always raise the key. A plain multiply only does that above zero.
-    /// [`PREFILL_ELEVATE_PENALTY`] drives a freshly prefill-loaded expert
-    /// *below* zero on purpose, and multiplying a negative base by a protection
-    /// factor makes it more negative: the far-ahead slot would be taken before
-    /// the near one — exactly backwards, and invisible, because the result is a
-    /// plausible number in the wrong order.
+    /// [`behind_protection`] means "how much this slot is worth protecting", so
+    /// a larger one must always raise the key. A plain multiply only does that
+    /// above zero. [`PREFILL_ELEVATE_PENALTY`] drives a freshly prefill-loaded
+    /// expert *below* zero on purpose, and multiplying a negative base by a
+    /// protection factor makes it more negative: the slot about to run would be
+    /// taken before the one just behind — exactly backwards, and invisible,
+    /// because the result is a plausible number in the wrong order.
     ///
     /// Dividing below zero fixes the direction while keeping the sign a hard
-    /// tier: whatever its factors, an elevated expert still sorts below every
+    /// tier: whatever its protection, an elevated expert still sorts below every
     /// scored one in its pass, which is the separation
     /// [`PREFILL_ELEVATE_PENALTY`] exists to create. `protect` is always in
-    /// `[0.5, 1.0]`, so this never divides by zero.
+    /// `[FADE_FLOOR, 1]`, so this never divides by zero.
     #[inline]
     fn protected_by(base: f32, protect: f32) -> f32 {
         if base < 0.0 {
@@ -680,8 +782,8 @@ impl ExpertCacheInner {
     }
 
     /// Up to `count` batch victims, ranked by [`VictimKey::order`] within each
-    /// [`EVICTION_PASSES`] tier: the warm-backed pass first, and the pack-only
-    /// pass only for what it could not supply. Best victim first.
+    /// [`EVICTION_PASSES`] pass: a later pass only for what the earlier ones
+    /// could not supply. Best victim first.
     ///
     /// `weight(slot_idx, moe_layer, dist)` admits a non-pinned occupied slot
     /// by returning the protection factor its frequency is scaled by (through
@@ -694,7 +796,7 @@ impl ExpertCacheInner {
         weight: impl Fn(usize, usize, usize) -> Option<f32>,
     ) -> Vec<usize> {
         let mut victims = Vec::with_capacity(count);
-        for tier in EVICTION_PASSES {
+        for (tier, hit) in self.passes {
             let need = count - victims.len();
             if need == 0 {
                 break;
@@ -705,7 +807,10 @@ impl ExpertCacheInner {
                 .enumerate()
                 .filter_map(|(idx, key)| {
                     let (layer, expert) = (*key)?;
-                    if layer < self.pinned_layers || self.reload_tier(layer, expert) != tier {
+                    if layer < self.pinned_layers
+                        || self.reload_tier(layer, expert) != tier
+                        || self.hit_last_visit(layer, expert) != hit
+                    {
                         return None;
                     }
                     let dist = self.forward_distance(layer, current_layer);
@@ -734,55 +839,49 @@ impl ExpertCacheInner {
     /// rule: an expert whose row is still being computed cannot give up its
     /// slot) and evicts the ones it takes with [`Self::evict`].
     ///
-    /// ## Victim key: `frequency × window_factor`, per reload tier
+    /// ## Victim key: `frequency × behind_protection`, per reload tier
     ///
-    /// Lowest key first. For a demand-driven promotion (`behind_only` false) the
-    /// window factor is 0.5 for slots in the [`PREFETCH_EVICT_WINDOW`] layers
-    /// directly behind the wave (wrapped forward distance
-    /// `>= n - PREFETCH_EVICT_WINDOW` from `current_layer` — the just-executed
-    /// layers, whose next use is a full pass away: Belady's choice) and 1.0
-    /// everywhere else, so the behind-window preference is worth a 2× frequency
-    /// handicap.
+    /// Lowest key first. The protection fades with how far behind the wave a
+    /// layer is ([`behind_protection`]): L−1 is scaled by [`FADE_FLOOR`] and
+    /// each layer further back a little more, wrapping round to the layers about
+    /// to run, which keep nearly their whole score. So the wave protects what
+    /// is ahead of it at the expense of what is behind, and an expert just
+    /// behind survives one about to run only with about `1 / FADE_FLOOR` its
+    /// score — enough to steer churn behind the wave, not enough to evict a hot
+    /// expert the next pass needs for a cold one ahead.
     ///
-    /// For a speculative promotion (`behind_only` true) only those window layers
-    /// are eligible at all, and only rows **behind** `current_layer`, never the
-    /// wrapped tail of the pass: near-future layers are structurally out of a
-    /// misprediction's reach.
+    /// Demand and read-ahead claims spend the same ranked offers, so a read-ahead
+    /// copy for a row ahead is bought from the layers the wave has left, not
+    /// from the ones it is about to route.
     ///
-    /// The policy runs once per [`EVICTION_PASSES`] tier: over the warm-backed
-    /// experts first, and over the pack-only experts only for the shortfall.
-    /// So the window never outranks the reload tier — a warm-backed expert
-    /// ahead of the wave is evicted before a pack-only one just behind it. A
-    /// HARD window tier was measured here and tripled cold pack reads
-    /// (2.8k→8.2k at config-8, bulk −9%) precisely because it let window
-    /// membership override the cold shield.
+    /// The policy runs once per eviction pass — a reload tier × whether the
+    /// row routed the expert on its last visit — cheapest expected miss cost
+    /// first ([`Self::set_eviction_costs`]), and a later pass only for the
+    /// shortfall. So neither distance nor frequency outranks a pass: a
+    /// warm-backed expert ahead of the wave goes before a pack-only one just
+    /// behind it, and a stale hot expert before one its row just routed,
+    /// whenever the measured costs order the passes that way. A hard
+    /// distance tier across the reload tiers was measured here and tripled cold
+    /// pack reads (2.8k→8.2k at config-8, bulk −9%) precisely because it let
+    /// position override the cold shield.
     ///
-    /// Ties break farther-first then LRU, so repeated calls spread churn
-    /// across the trailing layers instead of draining one. Pinned layers are
-    /// never candidates. `admit(slot, layer)` refuses a slot outright.
+    /// Ties break farther-first then LRU, so a never-used expert goes from the
+    /// layer just behind first. Pinned layers are never candidates.
+    /// `admit(slot, layer)` refuses a slot outright.
     ///
     /// One O(slots) scan + an O(n) `select_nth` partition per tier pass.
     pub(crate) fn rank_victims(
         &self,
         current_layer: usize,
         count: usize,
-        behind_only: bool,
         admit: impl Fn(usize, usize) -> bool,
     ) -> Vec<usize> {
         if count == 0 {
             return Vec::new();
         }
-        let min_dist = self.num_moe_layers.saturating_sub(PREFETCH_EVICT_WINDOW);
+        let n = self.num_moe_layers;
         self.batch_victims(current_layer, count, |idx, layer, dist| {
-            if !admit(idx, layer) {
-                None
-            } else if behind_only {
-                (dist >= min_dist && layer < current_layer).then_some(1.0)
-            } else if dist >= min_dist {
-                Some(0.5)
-            } else {
-                Some(1.0)
-            }
+            admit(idx, layer).then(|| behind_protection(dist, n))
         })
     }
 
@@ -992,7 +1091,7 @@ mod tests {
         count: usize,
         protect: &[usize],
     ) -> Vec<(usize, usize)> {
-        let victims = inner.rank_victims(current, count, false, |s, _| !protect.contains(&s));
+        let victims = inner.rank_victims(current, count, |s, _| !protect.contains(&s));
         victims
             .into_iter()
             .map(|s| {
@@ -1003,16 +1102,6 @@ mod tests {
             .collect()
     }
 
-    /// The speculative choice — behind the wave only: `(slot, evicted key)`.
-    fn evict_for_prefetch_batch(
-        inner: &mut ExpertCacheInner,
-        current: usize,
-        count: usize,
-    ) -> Vec<(usize, Option<(usize, usize)>)> {
-        let victims = inner.rank_victims(current, count, true, |_, _| true);
-        victims.into_iter().map(|s| (s, inner.evict(s))).collect()
-    }
-
     /// The single best demand victim, `(slot, key)`, if there is one.
     fn best_victim(
         inner: &ExpertCacheInner,
@@ -1020,7 +1109,7 @@ mod tests {
         protect: &[usize],
     ) -> Option<(usize, (usize, usize))> {
         let s = *inner
-            .rank_victims(current, 1, false, |s, _| !protect.contains(&s))
+            .rank_victims(current, 1, |s, _| !protect.contains(&s))
             .first()?;
         Some((
             s,
@@ -1135,24 +1224,33 @@ mod tests {
         assert_eq!(inner.score(10, 100), -0.1);
     }
 
+    /// The protection, raw, for 48 layers: the floor plus 0.75 × 1/48
+    /// (= 1/64) per layer behind, from L−1 through the wrap to the layer being
+    /// computed.
+    #[test]
+    fn protection_fades_from_the_layer_just_behind() {
+        let n = 48;
+        assert_eq!(behind_protection(47, n), 0.265625, "L-1");
+        assert_eq!(behind_protection(45, n), 0.296875, "L-3");
+        assert_eq!(behind_protection(24, n), 0.625, "half a pass behind");
+        assert_eq!(behind_protection(1, n), 0.984375, "L+1");
+        assert_eq!(behind_protection(0, n), 1.0, "the layer being computed");
+    }
+
     /// **A prefill-lifted expert is evicted before any decode-scored one of its
     /// reload tier, at every position.** This is what keeps the cache hot for
     /// decode: a prefill sweep touches most of the table roughly once, so what
     /// it drags in must not displace the working set decode actually reuses.
-    /// Checked at the extremes of the protection factor rather than at one
-    /// convenient layer, because the ordering has to hold across the whole
-    /// range — the least-evictable prefill lift (nearest layer) against the
-    /// most-evictable decode hit (farthest layer, inside the behind-wave
-    /// window).
+    /// Checked at the extremes of the protection rather than at one convenient
+    /// layer, because the ordering has to hold across the whole range — the
+    /// least-evictable prefill lift (the layer being computed) against the
+    /// most-evictable decode hit (L−1).
     #[test]
     fn a_prefill_lift_sorts_below_every_decode_hit_at_both_extremes() {
         let n = 48usize;
-        let worst_protect = 0.5f32; // farthest layer, or the behind-wave window
-        let best_protect = 1.0f32; // the layer about to be routed
-        assert!(
-            1.0 - 0.5 * ((n - 1) as f32 / n as f32) < 0.52,
-            "position_factor's floor moved; the bounds below assume [0.5, 1.0]"
-        );
+        let worst_protect = behind_protection(n - 1, n); // L-1
+        let best_protect = behind_protection(0, n); // the layer being computed
+        assert_eq!((worst_protect, best_protect), (0.265625, 1.0));
         // The least-evictable a prefill lift can be, and the most-evictable a
         // decode hit can be.
         let softest_lift = PREFILL_ELEVATE_PENALTY / best_protect;
@@ -1192,25 +1290,6 @@ mod tests {
         );
     }
 
-    /// Two elevated experts in the prefetch window, one warm and one pack-only:
-    /// the warm pass supplies the victim before the pack-only pass is consulted.
-    #[test]
-    fn a_prefetch_batch_does_not_evict_the_pack_only_elevated_expert_first() {
-        let mut inner = cache(2);
-        occupy(&mut inner, 0, 10, 100, 1, 0.0);
-        occupy(&mut inner, 1, 10, 101, 2, 0.0);
-        inner.record_prefill_elevate(10, 100);
-        inner.record_prefill_elevate(10, 101);
-        inner.set_warm_backed(&[(10, 100)]);
-        // current=15, n=48 → dist 43 = min_dist, so both are in the window.
-        let evicted = evict_for_prefetch_batch(&mut inner, 15, 1);
-        assert_eq!(
-            evicted,
-            vec![(0, Some((10, 100)))],
-            "the warm-backed expert is the cheaper victim"
-        );
-    }
-
     /// The same in `demand_eviction`: the elevated pack-only expert is in the
     /// second pass, which is never reached while the warm pass can supply.
     #[test]
@@ -1229,16 +1308,16 @@ mod tests {
         );
     }
 
-    /// **`window_factor` must not invert either, and that one reaches ahead of
-    /// the wave.** Two elevated warm-backed experts: layer 10 is behind the wave
-    /// (in-window, next use a full pass away) and layer 20 is five layers ahead
-    /// of it. Multiplying gave the in-window slot −0.05 and the upcoming one
-    /// −0.1, so the scan evicted the expert the wave was about to route to and
-    /// kept the one it had just left.
+    /// **The protection must not invert an elevated score onto a layer ahead.**
+    /// Two elevated warm-backed experts: layer 10 is five layers behind the wave
+    /// (protection 0.328) and layer 20 five ahead of it (0.922). Multiplying
+    /// would give the one behind −0.033 and the one ahead −0.092, evicting the
+    /// expert the wave is about to route to and keeping the one it has just
+    /// left; dividing gives −0.305 and −0.108.
     #[test]
-    fn the_window_factor_does_not_invert_an_elevated_score_onto_an_upcoming_layer() {
+    fn the_protection_does_not_invert_an_elevated_score_onto_an_upcoming_layer() {
         let mut inner = cache(2);
-        occupy(&mut inner, 0, 10, 100, 1, 0.0); // dist 43 → in window
+        occupy(&mut inner, 0, 10, 100, 1, 0.0); // dist 43 → five behind
         occupy(&mut inner, 1, 20, 101, 2, 0.0); // dist 5 → about to be used
         inner.record_prefill_elevate(10, 100);
         inner.record_prefill_elevate(20, 101);
@@ -1280,32 +1359,17 @@ mod tests {
         );
     }
 
-    /// The same zero-key tie in the prefetch window.
-    #[test]
-    fn a_prefetch_batch_keeps_the_pack_only_expert_among_never_used_ones() {
-        let mut inner = cache(2);
-        occupy(&mut inner, 0, 10, 100, 5, 0.0); // warm, most recently used
-        occupy(&mut inner, 1, 10, 101, 1, 0.0); // pack-only, least recently used
-        inner.set_warm_backed(&[(10, 100)]);
-        let evicted = evict_for_prefetch_batch(&mut inner, 15, 1);
-        assert_eq!(
-            evicted,
-            vec![(0, Some((10, 100)))],
-            "the reload tier outranks LRU among equal scores"
-        );
-    }
-
     /// **The sign stays a hard tier within a pass in the batch paths too.** An
-    /// elevated expert in the window's least-evictable position must still be
-    /// taken before one with a single decode hit in the most-evictable one.
-    /// This is what `protected_by`'s divide preserves and what a
-    /// shift-then-multiply scheme would lose. Both are pack-only, so the two
-    /// share a pass and only the key decides.
+    /// elevated expert ahead of the wave must still be taken before one with a
+    /// single decode hit behind it: −0.1 / 0.922 against 1.0 × 0.328. This is
+    /// what `protected_by`'s divide preserves and what a shift-then-multiply
+    /// scheme would lose. Both are pack-only, so the two share a pass and only
+    /// the key decides.
     #[test]
     fn an_elevated_expert_outranks_nothing_scored_in_a_demand_batch() {
         let mut inner = cache(2);
-        occupy(&mut inner, 0, 20, 100, 1, 0.0); // ahead of the wave: factor 1.0
-        occupy(&mut inner, 1, 10, 101, 2, 1.0); // one decode hit, in the window
+        occupy(&mut inner, 0, 20, 100, 1, 0.0); // five ahead of the wave
+        occupy(&mut inner, 1, 10, 101, 2, 1.0); // one decode hit, five behind
         inner.record_prefill_elevate(20, 100);
         let evicted = demand_eviction(&mut inner, 15, 1, &[]);
         assert_eq!(
@@ -1331,19 +1395,19 @@ mod tests {
     }
 
     #[test]
-    fn demand_eviction_prefers_behind_window() {
-        // current=35, n=48, window=5 → behind-window layers 30..34. The window
-        // factor (0.5) is a 2× frequency handicap: a just-behind expert (layer
-        // 30, dist 43) is evicted BEFORE a slightly-colder mid-distance one
-        // (layer 20), steering demand churn onto the layers the wave just left.
+    fn demand_eviction_prefers_the_layers_just_behind() {
+        // current=35, n=48. Layer 30 is five behind (key 0.5 × 0.328 = 0.164),
+        // layer 20 fifteen behind (0.4 × 0.484 = 0.194): the warmer expert just
+        // behind goes BEFORE the colder one further back, steering churn onto
+        // the layers the wave just left.
         let mut inner = cache(4);
         occupy(&mut inner, 0, 1, 100, 1, 0.1); // pinned (layer < PINNED_LAYERS)
         occupy(&mut inner, 1, 10, 101, 2, 5.0);
-        occupy(&mut inner, 2, 20, 102, 3, 0.4); // colder, but out of window (key 1.6·cost)
-        occupy(&mut inner, 3, 30, 103, 4, 0.5); // in window (key 0.25·cost) → victim
+        occupy(&mut inner, 2, 20, 102, 3, 0.4); // colder, further back
+        occupy(&mut inner, 3, 30, 103, 4, 0.5); // just behind → victim
 
         let evicted = demand_eviction(&mut inner, 35, 1, &[]);
-        assert_eq!(evicted, vec![(30, 103)], "behind-window expert goes first");
+        assert_eq!(evicted, vec![(30, 103)], "just-behind expert goes first");
         assert!(inner.key_to_slot.contains_key(&(10, 101)));
         assert!(inner.key_to_slot.contains_key(&(20, 102)));
         assert!(
@@ -1354,27 +1418,27 @@ mod tests {
     }
 
     #[test]
-    fn demand_eviction_frequency_ordered_within_window() {
-        // Two behind-window candidates (layers 33 and 31 from current=35):
-        // the least-used goes first, whatever its distance — the same
-        // frequency-dominated order as the prefetch window.
+    fn demand_eviction_lets_frequency_outweigh_a_few_layers() {
+        // Three candidates just behind current=35: a cold expert four back
+        // (0.3 × 0.3125 = 0.094) goes before a warm one at L-1 (2.0 × 0.266 =
+        // 0.53) and a hot one at L-2 (6.0 × 0.281 = 1.69).
         let mut inner = cache(3);
-        occupy(&mut inner, 0, 33, 100, 1, 6.0); // in window, hot
-        occupy(&mut inner, 1, 31, 101, 2, 0.3); // in window, coldest → victim
-        occupy(&mut inner, 2, 34, 102, 3, 2.0); // in window, warm
+        occupy(&mut inner, 0, 33, 100, 1, 6.0); // L-2, hot
+        occupy(&mut inner, 1, 31, 101, 2, 0.3); // L-4, coldest → victim
+        occupy(&mut inner, 2, 34, 102, 3, 2.0); // L-1, warm
         let evicted = demand_eviction(&mut inner, 35, 1, &[]);
         assert_eq!(evicted, vec![(31, 101)]);
     }
 
     #[test]
-    fn demand_eviction_cold_shield_outranks_the_window() {
-        // The reload tier dominates the 2× window preference: a warm-backed
-        // expert AHEAD of the wave (cheap RAM reload) is evicted before an
-        // equally-used cold-only one just behind it (whose reload is a pack
-        // read), because the warm pass runs first. A hard window tier inverted
-        // this trade and tripled cold pack reads.
+    fn demand_eviction_cold_shield_outranks_distance() {
+        // The reload tier dominates the distance: a warm-backed expert AHEAD of
+        // the wave (cheap RAM reload) is evicted before an equally-used
+        // cold-only one just behind it (whose reload is a pack read), because
+        // the warm pass runs first. A hard distance tier across the reload
+        // tiers inverted this trade and tripled cold pack reads.
         let mut inner = cache(2);
-        occupy(&mut inner, 0, 32, 100, 1, 1.0); // in window, cold-only
+        occupy(&mut inner, 0, 32, 100, 1, 1.0); // just behind, cold-only
         occupy(&mut inner, 1, 40, 101, 2, 1.0); // ahead, warm-backed
         inner.set_warm_backed(&[(40, 101)]);
         let evicted = demand_eviction(&mut inner, 35, 1, &[]);
@@ -1389,12 +1453,12 @@ mod tests {
     #[test]
     fn demand_eviction_protects_the_layer_hits() {
         // A protected slot (the caller lists the current layer's hits) is
-        // spared even when it is the coldest in-window candidate on the card;
-        // the eviction takes the next-coldest window member instead.
+        // spared even when it is the best victim on the card; the eviction
+        // takes the next one instead.
         let mut inner = cache(3);
-        occupy(&mut inner, 0, 30, 100, 1, 0.1); // in window, coldest — but a HIT, protected
+        occupy(&mut inner, 0, 30, 100, 1, 0.1); // best victim — but a HIT, protected
         occupy(&mut inner, 1, 10, 101, 2, 5.0);
-        occupy(&mut inner, 2, 33, 102, 3, 0.4); // in window, next-coldest → victim
+        occupy(&mut inner, 2, 33, 102, 3, 0.4); // L-2, next best → victim
         let evicted = demand_eviction(&mut inner, 35, 1, &[0]);
         assert_eq!(evicted, vec![(33, 102)], "protected hit slot spared");
         assert!(inner.key_to_slot.contains_key(&(30, 100)));
@@ -1407,7 +1471,7 @@ mod tests {
         // the eviction takes the next candidate instead.
         let mut inner = cache(3);
         occupy(&mut inner, 0, 36, 100, 1, 0.0); // in-flight install for L+1, protected
-        occupy(&mut inner, 1, 20, 101, 2, 0.5); // out-of-window fallback → victim
+        occupy(&mut inner, 1, 20, 101, 2, 0.5); // fifteen behind → victim
         occupy(&mut inner, 2, 37, 102, 3, 4.0);
         let evicted = demand_eviction(&mut inner, 35, 1, &[0]);
         assert_eq!(evicted, vec![(20, 101)], "in-flight install spared");
@@ -1448,104 +1512,52 @@ mod tests {
         assert_eq!(best_victim(&inner, 35, &[]), Some((1, (45, 101))));
     }
 
+    /// **At equal scores the order is the walk backwards from the wave**: L−1,
+    /// then L−3, then L+1 — the layer about to run last of all.
     #[test]
-    fn prefetch_evict_is_frequency_dominated_in_window() {
-        // current=10, n=48, window=5 → eligible layers 5..9 (the 5 just-behind).
-        // A never-used expert at L-3 (layer 7) is evicted before a hot expert at
-        // the furthest L-1 (layer 9): usage dominates distance.
-        let mut inner = cache(4);
-        occupy(&mut inner, 0, 9, 100, 5, 8.0); // L-1, furthest, but hot
-        occupy(&mut inner, 1, 7, 102, 5, 0.0); // L-3, never used
-        occupy(&mut inner, 2, 30, 103, 5, 9.0); // out of window (dist 20)
-        let (slot, key) = evict_for_prefetch_batch(&mut inner, 10, 1)
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(key, Some((7, 102)), "never-used L-3 evicted over hot L-1");
-        assert_eq!(slot, 1);
+    fn equal_scores_go_from_the_layer_just_behind_backwards() {
+        let mut inner = cache(3);
+        occupy(&mut inner, 0, 11, 100, 1, 1.0); // L+1
+        occupy(&mut inner, 1, 7, 101, 2, 1.0); // L-3
+        occupy(&mut inner, 2, 9, 102, 3, 1.0); // L-1
+        assert_eq!(inner.rank_victims(10, 3, |_, _| true), vec![2, 1, 0]);
     }
 
+    /// **The eviction front moves with the wave, through the wrap.** At the
+    /// start of a pass (current=2 of 48) the layers just behind are the
+    /// previous pass's last: layer 47 (three behind) goes before layer 10
+    /// (forty behind — about to run). Well into the pass (current=30) the order
+    /// turns over: layer 10 is twenty behind and layer 47 seventeen ahead.
     #[test]
-    fn prefetch_evict_prefers_farther_among_equally_cold() {
-        // Two never-used experts in-window → the farther (L-1) goes first.
-        let mut inner = cache(4);
-        occupy(&mut inner, 0, 9, 100, 5, 0.0); // L-1 (dist 47), cold
-        occupy(&mut inner, 1, 6, 101, 5, 0.0); // L-4 (dist 44), cold
-        let (_, key) = evict_for_prefetch_batch(&mut inner, 10, 1)
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(key, Some((9, 100)), "farther of two cold experts evicted");
+    fn the_eviction_front_wraps_with_the_wave() {
+        let mut inner = cache(2);
+        occupy(&mut inner, 0, 47, 100, 1, 1.0);
+        occupy(&mut inner, 1, 10, 101, 2, 1.0);
+        assert_eq!(inner.rank_victims(2, 2, |_, _| true), vec![0, 1]);
+        assert_eq!(inner.rank_victims(30, 2, |_, _| true), vec![1, 0]);
     }
 
+    /// **Distance steers, frequency decides.** A hot expert just behind the
+    /// wave (9.0 × 0.266 = 2.39) outlasts a near-cold one about to run (0.2 ×
+    /// 0.984 = 0.197): the next pass needs the hot one. Between two experts of
+    /// like temperature the one just behind goes — 1.0 × 0.266 against 0.3 ×
+    /// 0.984 = 0.295 — and a never-used one goes first wherever it sits.
     #[test]
-    fn prefetch_evict_protects_near_future_even_if_unused() {
-        // current=10, window=5: a never-used near-future expert (layer 12, dist 2)
-        // is OUT of window and must be protected; only the in-window (hot) expert
-        // is eligible.
-        let mut inner = cache(4);
-        occupy(&mut inner, 0, 12, 200, 5, 0.0); // near-future, never used — protected
-        occupy(&mut inner, 1, 8, 201, 5, 9.0); // L-2, in window, hot
-        let (_, key) = evict_for_prefetch_batch(&mut inner, 10, 1)
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(
-            key,
-            Some((8, 201)),
-            "near-future layer never evicted for prefetch"
-        );
-    }
+    fn frequency_ranks_within_the_fade() {
+        let mut inner = cache(2);
+        occupy(&mut inner, 0, 29, 100, 1, 9.0); // L-1, hot
+        occupy(&mut inner, 1, 31, 101, 2, 0.2); // L+1, near cold
+        assert_eq!(inner.rank_victims(30, 1, |_, _| true), vec![1]);
 
-    /// **Prefetch never evicts from the pass's tail.** At current=2 (n=62,
-    /// window 5) the window's L-1..L-5 are layers 1, 0 and — wrapping — 61, 60,
-    /// 59. The first two are pinned and the rest are rows the pass has still to
-    /// reach: with the forward thread running ahead, layer 61's bucketize may
-    /// already be reading the entry a clear would zero. So nothing is eligible,
-    /// and the near-future layer stays protected as before.
-    #[test]
-    fn prefetch_evict_never_wraps_into_the_pass_tail() {
-        let mut inner = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, 4, 4, 0), 62, 128);
-        occupy(&mut inner, 0, 61, 100, 5, 1.0); // tail: ahead of the wave this pass
-        occupy(&mut inner, 1, 5, 101, 5, 0.0); // near-future (dist 3), protected
-        assert!(
-            evict_for_prefetch_batch(&mut inner, 2, 1).is_empty(),
-            "no prefetch victim from a row the pass has yet to reach"
-        );
-        // Three rows later the tail is still ahead, layer 4 is behind.
-        occupy(&mut inner, 2, 4, 102, 5, 1.0);
-        let (_, key) = evict_for_prefetch_batch(&mut inner, 5, 1)
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(key, Some((4, 102)), "a row behind the wave is eligible");
-    }
+        let mut inner = cache(2);
+        occupy(&mut inner, 0, 29, 100, 1, 1.0); // L-1
+        occupy(&mut inner, 1, 31, 101, 2, 0.3); // L+1
+        assert_eq!(inner.rank_victims(30, 1, |_, _| true), vec![0]);
 
-    #[test]
-    fn prefetch_evict_batch_returns_victims_in_priority_order() {
-        // One scan yields multiple victims, best-first: equally-cold L-1 then L-2;
-        // the hot L-3 is left resident. Exercises the dense double-buffer path.
-        let mut inner = cache(4);
-        occupy(&mut inner, 0, 9, 100, 5, 0.0); // L-1, cold
-        occupy(&mut inner, 1, 8, 101, 5, 0.0); // L-2, cold
-        occupy(&mut inner, 2, 7, 102, 5, 5.0); // L-3, hot — kept
-        let victims = evict_for_prefetch_batch(&mut inner, 10, 2);
-        assert_eq!(victims.len(), 2);
-        assert_eq!(victims[0].1, Some((9, 100)));
-        assert_eq!(victims[1].1, Some((8, 101)));
-        assert!(inner.key_to_slot.contains_key(&(7, 102)), "hot expert kept");
-    }
-
-    /// A cache holding nothing but pinned-layer experts offers the prefetcher no
-    /// victims — sized off [`PINNED_LAYERS`] so it stays the "all pinned" case
-    /// if the depth ever changes.
-    #[test]
-    fn prefetch_evict_none_when_all_pinned() {
-        let mut inner = cache(PINNED_LAYERS);
-        for layer in 0..PINNED_LAYERS {
-            occupy(&mut inner, layer, layer, 100 + layer, layer as u32 + 1, 0.0);
-        }
-        assert!(evict_for_prefetch_batch(&mut inner, 5, 1).is_empty());
+        let mut inner = cache(2);
+        occupy(&mut inner, 0, 10, 100, 1, 4.0); // L-20, hot
+        occupy(&mut inner, 1, 31, 101, 2, 0.0); // L+1, never used
+        assert_eq!(inner.rank_victims(30, 1, |_, _| true), vec![1]);
     }
 
     #[test]
@@ -1608,22 +1620,22 @@ mod tests {
 
     /// The batch path takes what the warm pass can supply, then runs the same
     /// policy over the pack-only experts for the shortfall — each pass in its
-    /// own frequency × window order.
+    /// own frequency × protection order.
     #[test]
     fn demand_eviction_runs_the_pack_pass_only_for_the_shortfall() {
         let mut inner = cache(5);
-        occupy(&mut inner, 0, 10, 50, 1, 6.0); // warm
-        occupy(&mut inner, 1, 11, 51, 2, 3.0); // warm
-        occupy(&mut inner, 2, 12, 52, 3, 0.5); // pack-only, coldest on the card
-        occupy(&mut inner, 3, 13, 53, 4, 2.0); // pack-only
-        occupy(&mut inner, 4, 32, 54, 5, 3.0); // pack-only, in window: key 1.5
+        occupy(&mut inner, 0, 10, 50, 1, 6.0); // warm, 25 behind: 3.84
+        occupy(&mut inner, 1, 11, 51, 2, 3.0); // warm, 24 behind: 1.875
+        occupy(&mut inner, 2, 12, 52, 3, 0.5); // pack-only, 23 behind: 0.305
+        occupy(&mut inner, 3, 13, 53, 4, 2.0); // pack-only, 22 behind: 1.19
+        occupy(&mut inner, 4, 32, 54, 5, 3.0); // pack-only, 3 behind: 0.891
         inner.set_warm_backed(&[(10, 50), (11, 51)]);
 
         let evicted = demand_eviction(&mut inner, 35, 4, &[]);
         assert_eq!(
             evicted,
             vec![(11, 51), (10, 50), (12, 52), (32, 54)],
-            "both warm (by frequency), then the two best pack-only (0.5, then 1.5 over 2.0)"
+            "both warm (by key), then the two best pack-only (0.305, then 0.891)"
         );
         assert!(inner.key_to_slot.contains_key(&(13, 53)));
         assert_eq!(inner.free_len(), 4);
@@ -1636,7 +1648,7 @@ mod tests {
         let mut inner = cache(3);
         occupy(&mut inner, 0, 10, 50, 1, 6.0);
         occupy(&mut inner, 1, 20, 51, 2, 0.5);
-        occupy(&mut inner, 2, 33, 52, 3, 0.8); // in window: key 0.4
+        occupy(&mut inner, 2, 33, 52, 3, 0.8); // L-2: key 0.225, under 20's 0.242
         let evicted = demand_eviction(&mut inner, 35, 2, &[]);
         assert_eq!(evicted, vec![(33, 52), (20, 51)]);
     }
@@ -1682,23 +1694,9 @@ mod tests {
         assert_eq!(plan.evict, vec![5]);
     }
 
-    /// The prefetch make-room path weighs it too — it is the same choice.
-    #[test]
-    fn prefetch_eviction_also_prefers_the_warm_backed_victim() {
-        let mut inner = cache(2);
-        occupy(&mut inner, 0, 9, 100, 5, 1.0); // L-1, warm-backed
-        occupy(&mut inner, 1, 9, 101, 5, 1.0); // L-1, cold-only
-        inner.set_warm_backed(&[(9, 100)]);
-        let (_, key) = evict_for_prefetch_batch(&mut inner, 10, 1)
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(key, Some((9, 100)));
-    }
-
     #[test]
     fn hot_expert_survives_a_cold_one() {
-        // Same layer (same position factor): the frequently-used expert is kept
+        // Same layer (same protection): the frequently-used expert is kept
         // and the cold one evicted — the cache is frequency-dominated.
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 50, 9, 9.0);
@@ -1711,13 +1709,78 @@ mod tests {
         );
     }
 
+    /// **An expert its row just routed goes only after every one it did not,**
+    /// whatever their scores: here a just-hit expert scored 1.0 outlasts a
+    /// stale one at 3.0, until the row's next visit routes it no more.
+    #[test]
+    fn a_just_hit_expert_outlasts_every_stale_one_of_its_tier() {
+        let mut inner = cache(3);
+        occupy(&mut inner, 0, 10, 50, 1, 1.0); // just hit
+        occupy(&mut inner, 1, 10, 51, 2, 3.0); // stale, hot
+        occupy(&mut inner, 2, 20, 52, 3, 5.0); // stale, hotter
+        inner.mark_visit(10, &[50]);
+        assert_eq!(inner.rank_victims(30, 3, |_, _| true), vec![1, 2, 0]);
+        inner.mark_visit(10, &[51]);
+        assert_eq!(inner.rank_victims(30, 1, |_, _| true), vec![0]);
+    }
+
+    /// The reload tier still comes first: a warm-backed expert just hit goes
+    /// before a pack-only stale one.
+    #[test]
+    fn recency_sits_inside_the_reload_tier() {
+        let mut inner = cache(2);
+        occupy(&mut inner, 0, 10, 50, 1, 1.0); // warm, just hit
+        occupy(&mut inner, 1, 10, 51, 2, 0.0); // pack-only, stale
+        inner.set_warm_backed(&[(10, 50)]);
+        inner.mark_visit(10, &[50]);
+        assert_eq!(inner.rank_victims(30, 2, |_, _| true), vec![0, 1]);
+    }
+
+    /// **Measured costs order the passes.** Classes, `hit * 2 + warm`: a
+    /// pack-only stale expert (6% back × 2.2 ms) costs more to evict than a
+    /// warm just-hit one (37% × 0.2 ms), so the warm just-hit one goes first;
+    /// where a pack-only class is the cheaper, it goes first; ties keep the
+    /// warm-backed ahead.
+    #[test]
+    fn measured_costs_order_the_eviction_passes() {
+        let mut inner = cache(4);
+        occupy(&mut inner, 0, 10, 50, 1, 0.0); // warm, stale
+        occupy(&mut inner, 1, 10, 51, 2, 0.0); // warm, just hit
+        occupy(&mut inner, 2, 10, 52, 3, 0.0); // pack, stale
+        occupy(&mut inner, 3, 10, 53, 4, 0.0); // pack, just hit
+        inner.set_warm_backed(&[(10, 50), (10, 51)]);
+        inner.mark_visit(10, &[51, 53]);
+        // [cold pack, cold warm, hit pack, hit warm]
+        inner.set_eviction_costs([0.06 * 2.2, 0.16 * 0.2, 0.05 * 2.2, 0.37 * 0.2]);
+        assert_eq!(inner.rank_victims(30, 4, |_, _| true), vec![0, 1, 3, 2]);
+        // A pack-only class cheap enough goes first.
+        inner.set_eviction_costs([0.01, 0.5, 0.9, 0.9]);
+        assert_eq!(inner.rank_victims(30, 4, |_, _| true), vec![2, 0, 1, 3]);
+        // Equal costs keep the default: warm stale, warm hit, pack stale, pack hit.
+        inner.set_eviction_costs([1.0; 4]);
+        assert_eq!(inner.rank_victims(30, 4, |_, _| true), vec![0, 1, 2, 3]);
+    }
+
+    /// A visit marks exactly the experts it routed in its row, clearing the
+    /// row's previous visit and leaving other rows alone.
+    #[test]
+    fn a_visit_marks_its_routed_experts_and_clears_the_rest() {
+        let mut inner = cache(1);
+        inner.mark_visit(10, &[3, 7]);
+        inner.mark_visit(11, &[3]);
+        inner.mark_visit(10, &[7, 9]);
+        let row10: Vec<usize> = (0..12).filter(|&e| inner.hit_last_visit(10, e)).collect();
+        let row11: Vec<usize> = (0..12).filter(|&e| inner.hit_last_visit(11, e)).collect();
+        assert_eq!((row10, row11), (vec![7, 9], vec![3]));
+    }
+
     /// Ranking evicts nothing: the caller decides per victim.
     #[test]
     fn ranking_leaves_the_tables_alone() {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 50, 5, 5.0);
         occupy(&mut inner, 1, 30, 51, 0, 0.0);
-        assert_eq!(inner.rank_victims(20, 2, false, |_, _| true), vec![1, 0]);
+        assert_eq!(inner.rank_victims(20, 2, |_, _| true), vec![1, 0]);
         assert!(inner.key_to_slot.contains_key(&(10, 50)));
         assert!(inner.key_to_slot.contains_key(&(30, 51)));
         assert_eq!(inner.free_len(), 0);

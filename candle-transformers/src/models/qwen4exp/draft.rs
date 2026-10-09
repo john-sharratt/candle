@@ -544,11 +544,13 @@ impl Qwen4ExpBatched {
         // the trunk's are. A draft head only ever runs behind a decode step —
         // there is no prefill/prompt traffic through one — so all `n` rows are
         // decode-attributed.
+        // The head is the last MoE row: there are no rows after it to predict.
         let parts = head.block.moe.forward_parts(
             acts,
             DType::F32,
             &DecodeRows::prefix(n),
             Some(&ffn_wave),
+            &[],
         )?;
         let routed = parts.routed.reshape((n, n_embd))?;
         hc_combine_gated(&mut res, &routed, &parts.shared, &inject2)?;

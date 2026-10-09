@@ -697,6 +697,42 @@ mod tests {
         assert_packed(&arenas, &plan);
     }
 
+    /// **A capped plan is the top of the pool.** The pass caps each pool's plan at
+    /// what it can claim, and that is only sound because the walk takes sources off
+    /// the right cursor: the moves a cap keeps empty the highest arenas — the ones
+    /// holding the frontier — and the ones it drops are the low tail. Three sparse
+    /// arenas, a pack of three moves: capped at two, both sources are the top
+    /// arena's highest slots, each landing in the lowest free slot.
+    #[test]
+    fn a_capped_plan_empties_the_highest_arena_first() {
+        let arenas = vec![
+            arena(10, 0, 4, &[0]),
+            arena(11, 1, 4, &[0, 1]),
+            arena(12, 2, 4, &[0, 1, 3]),
+        ];
+        assert_eq!(
+            plan_pool(&arenas, gpu(), 0).map(|p| p.moves.len()),
+            Some(3),
+            "the full pack is three moves"
+        );
+        let plan = plan_pool(&arenas, gpu(), 2).expect("gaps below live chunks");
+        assert!(plan.clipped, "the cap stopped the walk short of a pack");
+        assert_eq!(
+            plan.moves,
+            vec![
+                ChunkMove {
+                    from: (12, 3),
+                    to: (10, 1)
+                },
+                ChunkMove {
+                    from: (12, 1),
+                    to: (10, 2)
+                },
+            ],
+            "the top arena (rank 2) empties first, into the lowest free slots"
+        );
+    }
+
     /// The cap is honoured exactly, and a cap wider than the work is not clipping.
     #[test]
     fn a_cap_wider_than_the_work_does_not_clip() {

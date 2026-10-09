@@ -24,8 +24,9 @@
 //     expert e) gives the bucket offsets, the tile order (pinned, cold, VRAM,
 //     each ascending) and the remote list at once; each routed expert writes
 //     its tiles and its list entry, and thread e expert e's summary word.
-//   * then thread 0 runs the promotion walk (only with a remote expert routed)
-//     and publishes the summary's sequence word behind its system fence.
+//   * then thread 0 runs the promotion walk (only with a remote expert routed
+//     or read-ahead asked for) and publishes the summary's sequence word behind
+//     its system fence.
 //
 // The scratch tables `inv` and `scan` are not written: they exist for the
 // general kernel's phases and nothing else reads them.
@@ -245,8 +246,11 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
     }
 
     // ── The promotion walk, then the summary's sequence word ──
+    // With no remote expert routed and no read-ahead there is nothing to claim,
+    // so the ring is not read and `head` is not republished.
     const int32_t n_remote = r_pinned + r_cold;
-    const bool walk = remote != nullptr && remote_dst != nullptr && n_remote > 0;
+    const bool walk = remote != nullptr && remote_dst != nullptr &&
+                      (n_remote > 0 || ahead_items != nullptr);
     if (!walk && summary == nullptr) {
         return;
     }
@@ -270,7 +274,11 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
         promotion_walk(n_remote, claiming, sh_remote_e, sh_marked, sh_dec, sh_counts, gate_row,
                        table_plane, n_experts, row, summary_seq, promo_slots, promo_log, promo_head,
                        promo_tail, promo_cap, promo_marks, promo_reserve, promo_sweep, promo_victims,
-                       promo_retarget, remote_dst);
+                       promo_retarget, remote_dst,
+                       ReadAhead{ahead_window, ahead_depth, ahead_n, ahead_list, ahead_src, ahead_cap,
+                                 rows, row_layout, ahead_items, ahead_done},
+                       ZoneRanges{pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi, slot_owner,
+                                  zone_end, zone_slot_bytes, zone_slots});
     }
     // The sequence word is the host's signal: it lands only after every summary
     // word, the promotion log and its head are visible system-wide.

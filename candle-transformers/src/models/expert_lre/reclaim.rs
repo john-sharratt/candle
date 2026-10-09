@@ -36,14 +36,17 @@
 //!   the GPU is actually inside, whatever is queued behind it. What is queued
 //!   still matters to *which* victims are taken — a row about to run gives up
 //!   its experts last — and is kept for that alone ([`ReclaimClock::upcoming`]).
-//! - **An entry goes to 0 only while its row is quiet** ([`ReclaimClock::quiet`]):
-//!   no invocation of it begun and unfinished. A cold expert's workers read the
-//!   LIVE entry (that is how they learn it was staged), so a 0 written under an
-//!   in-flight invocation that had already classified the expert cold would
-//!   never be undone. A row that was quiet at the check and begins an invocation
-//!   before the store lands is harmless: that invocation's bucketize reads the
-//!   old address into its snapshot (the slot then waits on the retire key) or
-//!   reads 0 and classifies the expert cold, and the stager stages it again.
+//! - **An entry goes to 0 only while its row is quiet**: no invocation of it
+//!   begun and unfinished (`reclaimable(retire_key(row))`). A cold expert's
+//!   workers read the LIVE entry (that is how they learn it was staged), so a 0
+//!   written under an in-flight invocation that had already classified the
+//!   expert cold would never be undone. A row that was quiet at the check and
+//!   begins an invocation before the store lands is harmless to the entry: that
+//!   invocation's bucketize reads the old address into its snapshot or reads 0
+//!   and classifies the expert cold, and the stager stages it again. The slot
+//!   behind the old address is another matter — a snapshot may still read it —
+//!   so it is overwritten only once the retire key read after the store is
+//!   reclaimable; otherwise the entry is restored (`Stager::evict`).
 //!
 //! The stager has one wider window of its own (Rule R′, `stager.rs`): while it
 //! holds an unpublished cold expert of invocation `T`, the GPU is inside `T`'s
@@ -86,7 +89,7 @@ impl ReclaimClock {
     /// the GPU is about to read the row's experts. Never a question of safety —
     /// an invocation not yet begun reads whatever entry it finds
     /// (`retire_key`) — but evicting one of them buys a miss within the pass,
-    /// so victims come from other rows first (`take_slots`).
+    /// so victims come from other rows first (`pipeline`'s lazy victims).
     pub(crate) fn upcoming(&self, row: usize) -> bool {
         self.enqueued[row].load(Ordering::Acquire) > self.started.load(row)
     }
@@ -122,6 +125,26 @@ impl ReclaimClock {
         self.started.latest()
     }
 
+    /// The latest invocation of `row` the device has begun, 0 before any —
+    /// where the device is on the row, for a host-side question that is not a
+    /// reclaim key (a read-ahead listing is written only while its reader is
+    /// still to come, `read_ahead::listing_readable`). No fence: a stale answer
+    /// costs a listing nobody reads, never a slot.
+    pub(crate) fn begun(&self, row: usize) -> u64 {
+        self.started.load(row)
+    }
+
+    /// The ticket every reader of a mapped word the host has just rewritten
+    /// must finish past, read after a full fence — call it after the stores.
+    /// Any row's bucketize may read it (the read-ahead lists), so the key is
+    /// the latest invocation begun on any row: one begun later stored its
+    /// started word before its first read, so it reads the new value — the
+    /// same store/load pairing as [`Self::retire_key`].
+    pub(crate) fn readers_key(&self) -> u64 {
+        fence(Ordering::SeqCst);
+        self.started.latest()
+    }
+
     /// Whether every invocation up to ticket `key` has completed: `key` is
     /// below a ticket whose summary word was seen, or below one the device has
     /// begun on any row — its bucketize runs after every earlier kernel on the
@@ -135,54 +158,6 @@ impl ReclaimClock {
         self.progress.fetch_max(latest, Ordering::SeqCst);
         key < latest
     }
-
-    /// Whether `row` has no invocation in flight.
-    pub(crate) fn quiet(&self, row: usize) -> bool {
-        self.reclaimable(self.retire_key(row))
-    }
-}
-
-/// Slots whose old tenant's readers may still be running, each held until the
-/// ticket it waits past is below the observed one.
-pub(crate) struct RetireList<T> {
-    held: Vec<(u64, T)>,
-}
-
-impl<T> RetireList<T> {
-    pub(crate) fn new() -> Self {
-        Self { held: Vec::new() }
-    }
-
-    pub(crate) fn push(&mut self, key: u64, item: T) {
-        self.held.push((key, item));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.held.len()
-    }
-
-    /// Everything held, in the order it was retired, whatever it waits past.
-    /// For a moment when every reader is known to be done regardless of what
-    /// the host has observed — the device synchronized under the pass lock.
-    pub(crate) fn drain_all(&mut self) -> Vec<T> {
-        self.held.drain(..).map(|(_, item)| item).collect()
-    }
-
-    /// Everything now reclaimable under `clock`, in the order it was retired.
-    pub(crate) fn drain(&mut self, clock: &ReclaimClock) -> Vec<T> {
-        let mut out = Vec::new();
-        let mut kept = Vec::with_capacity(self.held.len());
-        for (key, item) in self.held.drain(..) {
-            if clock.reclaimable(key) {
-                out.push(item);
-            } else {
-                kept.push((key, item));
-            }
-        }
-        self.held = kept;
-        out
-    }
 }
 
 #[cfg(test)]
@@ -193,20 +168,29 @@ mod tests {
         ReclaimClock::new(StartedRows::host(rows))
     }
 
+    /// Whether `row` has no invocation in flight: a slot retired from it now
+    /// is reusable at once.
+    fn quiet(c: &ReclaimClock, row: usize) -> bool {
+        c.reclaimable(c.retire_key(row))
+    }
+
     /// A row the device never began is quiet; one it began is in flight until a
     /// later ticket's summary word is seen — its own word is not enough, since
     /// that is written by its bucketize, before its GEMMs run.
     #[test]
     fn a_row_is_quiet_once_a_later_ticket_is_observed() {
         let c = clock(4);
-        assert!(c.quiet(2), "never begun");
+        assert!(quiet(&c, 2), "never begun");
         c.started.store(2, 5);
-        assert!(!c.quiet(2), "begun, nothing observed");
+        assert!(!quiet(&c, 2), "begun, nothing observed");
         c.observe(5);
-        assert!(!c.quiet(2), "its own summary word: its GEMMs may still run");
+        assert!(
+            !quiet(&c, 2),
+            "its own summary word: its GEMMs may still run"
+        );
         c.observe(6);
-        assert!(c.quiet(2), "a later invocation has started");
-        assert!(c.quiet(1), "other rows are untouched");
+        assert!(quiet(&c, 2), "a later invocation has started");
+        assert!(quiet(&c, 1), "other rows are untouched");
     }
 
     /// An invocation the forward thread has queued but the device has not begun
@@ -225,7 +209,7 @@ mod tests {
         assert!(c.upcoming(0) && c.upcoming(1) && c.upcoming(2));
         assert_eq!(c.retire_key(1), 3);
         assert!(c.reclaimable(c.retire_key(1)));
-        assert!(c.quiet(0) && c.quiet(1) && c.quiet(2));
+        assert!(quiet(&c, 0) && quiet(&c, 1) && quiet(&c, 2));
     }
 
     /// The device beginning a later invocation on any row completes every
@@ -242,8 +226,8 @@ mod tests {
         c.started.store(3, 23);
         assert!(c.reclaimable(5) && c.reclaimable(22));
         assert!(!c.reclaimable(23), "the invocation the device is inside");
-        assert!(c.quiet(1));
-        assert!(!c.quiet(3));
+        assert!(quiet(&c, 1));
+        assert!(!quiet(&c, 3));
         assert_eq!(c.observed(), 5);
     }
 
@@ -256,13 +240,32 @@ mod tests {
         assert!(!c.upcoming(1), "nothing enqueued");
         c.enqueued(1, 7);
         assert!(c.upcoming(1));
-        assert!(c.quiet(1), "not begun, so nothing holds its slots");
+        assert!(quiet(&c, 1), "not begun, so nothing holds its slots");
         c.started.store(1, 7);
         assert!(!c.upcoming(1), "begun");
         c.enqueued(1, 12);
         c.started.store(1, 9);
         assert!(c.upcoming(1), "a later invocation still waits");
         assert!(!c.upcoming(0) && !c.upcoming(2));
+    }
+
+    /// A rewritten word's readers are every invocation begun so far, on any
+    /// row: the key waits for the latest of them, and none before any began.
+    #[test]
+    fn a_rewritten_words_readers_are_every_invocation_begun() {
+        let c = clock(3);
+        assert_eq!(c.readers_key(), 0);
+        assert!(
+            c.reclaimable(c.readers_key()),
+            "nothing begun, nothing reads"
+        );
+        c.started.store(0, 4);
+        c.started.store(2, 9);
+        let key = c.readers_key();
+        assert_eq!(key, 9);
+        assert!(!c.reclaimable(key), "invocation 9 may be reading");
+        c.started.store(1, 10);
+        assert!(c.reclaimable(key), "a later start completes it");
     }
 
     /// The latest start is the highest word on any row, 0 before any.
@@ -274,6 +277,18 @@ mod tests {
         c.started.store(0, 12);
         c.started.store(3, 11);
         assert_eq!(c.latest_started(), 12);
+    }
+
+    /// Where the device is on a row is its started word: 0 before any, and
+    /// unmoved by what the forward thread has merely enqueued.
+    #[test]
+    fn begun_is_the_rows_started_word() {
+        let c = clock(3);
+        assert_eq!(c.begun(1), 0);
+        c.started.store(1, 7);
+        c.enqueued(1, 12);
+        assert_eq!(c.begun(1), 7, "enqueued is not begun");
+        assert_eq!(c.begun(0), 0, "other rows are untouched");
     }
 
     /// Observation only moves forward, whichever thread reports first.
@@ -298,39 +313,5 @@ mod tests {
         c.observe(4);
         assert!(!c.reclaimable(10));
         assert!(c.reclaimable(3));
-    }
-
-    /// The retire list hands back exactly the items whose key is below the
-    /// observed ticket, in retirement order, and keeps the rest.
-    #[test]
-    fn the_retire_list_drains_what_is_behind_the_observed_ticket() {
-        let c = clock(1);
-        let mut r = RetireList::new();
-        r.push(7, 'a');
-        r.push(3, 'b');
-        r.push(12, 'c');
-        r.push(0, 'd');
-        c.observe(8);
-        assert_eq!(r.drain(&c), vec!['a', 'b', 'd']);
-        assert_eq!(r.len(), 1);
-        c.observe(12);
-        assert!(r.drain(&c).is_empty(), "12 is not below 12");
-        c.observe(13);
-        assert_eq!(r.drain(&c), vec!['c']);
-        assert_eq!(r.len(), 0);
-    }
-
-    /// With the device idle every retiree is releasable, including one whose
-    /// ticket the host has not yet observed, and the list is left empty.
-    #[test]
-    fn draining_all_releases_what_the_observed_ticket_has_not_reached() {
-        let c = clock(1);
-        let mut r = RetireList::new();
-        r.push(7, 'a');
-        r.push(40, 'b');
-        c.observe(8);
-        assert_eq!(r.drain_all(), vec!['a', 'b']);
-        assert_eq!(r.len(), 0);
-        assert!(r.drain(&c).is_empty());
     }
 }

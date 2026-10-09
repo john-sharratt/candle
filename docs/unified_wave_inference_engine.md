@@ -722,4 +722,4 @@ throughput/latency probes for steps 5–6.
 | Ingest skips projection (unbounded ctx) | `repo_scan/mod.rs:48` (`disable_reprojection`), `scheduler/mod.rs:1699` (`skip_projection`), whole-parent borrow `:1975-2013`/`:2009` |
 | `scopes` top_k / window (inactive in ingest) | `prompts/projection.yaml:244` (`top_k k:8`), layer window `:176` |
 | Dormant rolling-window field | `config.rs:1345` (`context_window_turns`, default 0), `conversation.rs:2232` (`window_state`) |
-| Expert affinity / prefetch (for §4.6) | `expert_lre/transition.rs` (`predict_prefetch`, `observe`) |
+| Expert affinity / prefetch (for §4.6) | `expert_lre/transition.rs` (`predict_hop`, `observe`) |

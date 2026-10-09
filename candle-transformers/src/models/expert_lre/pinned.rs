@@ -258,6 +258,23 @@ pub(crate) fn stratified_membership(
     out
 }
 
+/// Whether an expert can ever be cold — in neither VRAM nor pinned host
+/// memory, so that a worker waits for the stager to read it, and can give it
+/// up (`fault`). Never when every expert fits in VRAM; and never when the warm
+/// tier's `members` — at most one slot per expert of the `evictable` set
+/// ([`stratified_membership`]), filled once at startup and never repurposed —
+/// cover that whole set with no slot `paged`: an expert evicted from VRAM is
+/// then always read from pinned memory.
+#[cfg(feature = "cuda")]
+pub(crate) fn can_go_cold(
+    all_resident: bool,
+    members: usize,
+    evictable: usize,
+    paged: usize,
+) -> bool {
+    !all_resident && (members < evictable || paged > 0)
+}
+
 /// SplitMix64 — the fixed-increment generator, used here for a reproducible
 /// draw and nothing else.
 ///
@@ -655,9 +672,21 @@ unsafe impl Sync for WarmPool {}
 #[cfg(test)]
 mod tests {
     use super::stratified_membership;
-    use super::{step_down, step_up, WarmPool};
+    use super::{can_go_cold, step_down, step_up, WarmPool};
     use cudarc::driver::DevicePtr;
     use std::collections::HashSet;
+
+    /// Flash-Next on the RTX PRO 5000: 24,064 warm slots, all pinned, for the
+    /// 47 evictable layers of 512 — nothing can go cold. One slot short, or
+    /// one slot pageable, and something can; a cache holding every expert in
+    /// VRAM never can, whatever its warm tier.
+    #[test]
+    fn only_a_short_or_pageable_warm_tier_leaves_an_expert_cold() {
+        assert!(!can_go_cold(false, 24_064, 47 * 512, 0));
+        assert!(can_go_cold(false, 24_063, 47 * 512, 0));
+        assert!(can_go_cold(false, 24_064, 47 * 512, 1));
+        assert!(!can_go_cold(true, 0, 47 * 512, 0));
+    }
 
     /// A refusal costs 512 MiB of slots, rounded up to whole slots: 388 slots
     /// of Flash-Next's 1,384,448-byte stride (536,870,912 / 1,384,448 =

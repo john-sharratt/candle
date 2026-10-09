@@ -993,9 +993,14 @@ impl Scheduler {
                     fmt,
                     (reserved_mib, total_mib, free_mib, weights_mib),
                     slots,
-                    self.model
-                        .expert_stats()
-                        .map(|s| (s.expert_hits, s.expert_misses, s.promotions, s.worker_cold)),
+                    self.model.expert_stats().map(|s| {
+                        (
+                            s.expert_hits,
+                            s.expert_misses,
+                            s.worker_promotions,
+                            s.worker_cold,
+                        )
+                    }),
                     match &self.device {
                         Device::Cuda(d) => Some(d.capture_stats()),
                         _ => None,

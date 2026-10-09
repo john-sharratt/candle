@@ -78,13 +78,18 @@ forward thread (null stream)            stager thread (new)              pipelin
 router → route
 bucketize ── reads the live gate row,   polls summary word n             polls summary word n
    classifies VRAM / pinned / cold,     cold experts of row n:           stats, scores, Markov observe
-   orders tiles pinned → VRAM → cold,     pad slot ← pack read           promotion: copy engine pinned → VRAM,
-   writes summary[n] + word n             publish pad address              then retarget entry to VRAM
-gather                                    (host stores: up, down,        speculative prefetch: predicted pinned
-gate GEMM ── W worker blocks copy each    fence, gate)                     experts → VRAM; predicted cold experts
-   miss slice to scratch and compute    then: speculative staging          → stager (pack → pad, ahead)
-   it; hit blocks compute from VRAM       requests from the pipeline     VRAM eviction: retarget entry to its
-up, SwiGLU, down (same), scatter                                            pinned copy (or 0), reclaim slot
+   orders tiles pinned → VRAM → cold,     pad slot ← pack read           ring: offers slots (empty, lazy
+   claims ring slots for its misses,      publish pad address              victims); collects claims, lands
+   then for later rows' predicted         (host stores: up, down,          them once their invocation is done
+   warm experts (read-ahead, §0.7.3);     fence, gate)                   predictions: warm → the ring's
+   writes summary[n] + word n           then: speculative staging          read-ahead lists; cold → stager
+gather                                    requests from the pipeline       (pack → pad, ahead)
+gate GEMM ── W worker blocks copy each                                    VRAM eviction: retarget entry to its
+   miss slice and compute it, then                                          pinned copy (or 0)
+   copy the read-ahead images and
+   publish them; hit blocks compute
+   from VRAM
+up, SwiGLU, down (same), scatter
 next layer …
 ```
 
@@ -98,7 +103,8 @@ next layer …
   thread's asynchronous promotion — a later pass hits.
 - **The pipeline thread leaves the critical path entirely.** It owns policy —
   scores, the Markov transition matrix, which experts live in VRAM — and moves
-  bytes with the copy engine, but no GPU wait depends on any of it.
+  no bytes itself: the GEMM workers fill the slots it offers, for misses and
+  for read-ahead alike, and no GPU wait depends on anything it does.
 - **Bit-identical results.** A warm slot and a pad slot hold the pack record,
   which is the VRAM slot image (`slot_offsets`, `pipeline.rs:666`): the kernel
   reads the same bytes whichever address the entry names, and the scatter's
@@ -279,18 +285,19 @@ Changed:
   the link anyway, so the workers write it into a VRAM slot the pipeline thread
   provided, and the pipeline thread points the entry there once the invocation
   is done. No copy-engine traffic of its own.
-- **Speculative promotion** (prefetch, below) uses the copy engine: take a
-  VRAM slot (free or a Rule-R victim), copy from the expert's pinned source
-  (warm slot, or pad slot — pinned against pad eviction for the copy's
-  duration, a counter in `Residency`), record an event, and retarget the entry
-  to VRAM **when the event is observed complete**. It polls completion with
-  `cuEventQuery` between messages; a delayed completion (a lazy load holding
-  the driver) only delays the promotion.
-- **Speculative prefetch** keeps its policy (Markov, `PREFETCH_DEPTH_MAX`,
-  precision floor): a predicted expert with a pinned copy is promoted exactly as
-  above; a predicted **cold** expert is sent to the stager as a staging request
-  (pack → pad, ahead of the router), and promoted from the pad if the policy
-  still wants it in VRAM.
+- **Speculative promotion is read-ahead by the workers** (§0.7.3): the
+  pipeline thread writes each row's predicted experts into the promotion ring,
+  and a later launch claims offers for the predicted ones with a pinned copy
+  the host vetted (warm, or a pad slot it pinned) with the link
+  time its own misses leave; its gate launch's workers copy them into the slots
+  and publish their entries. There is no copy-engine prefetch: a copy issued
+  from the host could not be published before the next row's bucketize, so
+  66–97% of them landed late, after the workers had fetched the same expert
+  (Qwen3.8-Flash-Next, RTX 4090 Laptop, decode ×1–×8).
+- **Prediction** (Markov chain over adjacent rows; a row routing most of its
+  experts predicts the next rows' scored ones): a predicted warm expert goes
+  into its row's read-ahead list; a predicted **cold** expert is sent to the
+  stager as a staging request (pack → pad, ahead of the router).
 - **Eviction** from VRAM retargets the entry to the expert's pinned or pad copy
   (or 0) and frees the slot by Rule R. Demand eviction (`demand_eviction`,
   `cache.rs:839`, Rule D) is deleted: demand never takes a slot.
@@ -413,9 +420,9 @@ offers, `reserve` and `sweep`, the device `head` and the log:
    that could promote the same expert again. Each claimed slot lands once its
    invocation's ticket (from the logged word) is below the observed one — the
    invocation, all three launches, has completed: install the views, set the
-   entry to VRAM. An expert promoted twice (two invocations, or the copy engine
-   too) keeps one slot; the other goes back to the zone, never having been
-   named by any entry.
+   entry to VRAM. An expert promoted twice (two invocations claiming it before
+   the first landed) keeps one slot; the other goes back to the zone, never
+   having been named by any entry.
 
 5. **One promotion in flight per expert.** `bucketize` sets the expert's mark
    (`u32 marks[rows][E]`, mapped, after the counters) when it hands out a slot
@@ -428,8 +435,8 @@ offers, `reserve` and `sweep`, the device `head` and the log:
    had just read: on Qwen3.8-Flash-Next (16 GB card) re-sending a prefill
    launch's decode-scored misses was 0.6–1.1 GiB per prefill row, read while
    the launch's workers saturated the link, and prefill ran 2–10% behind
-   workers that promoted into ring slots once. The copy engine promotes only
-   predictions (speculative prefetch), never a miss.
+   workers that promoted into ring slots once. What else crosses the link is
+   read-ahead (§0.7.3), within the link time a launch's own misses leave.
 
 7. **The owner check** (`tensor-assert`). Each zone slot carries a mapped tag of
    the expert last installed there (`expert_lre::slot_owners`), written on an
@@ -444,8 +451,14 @@ A boundary move drains the ring with the device synchronized: lands what was
 taken, takes back what was not — an empty offer to the zone, a victim to plain
 residency — and sets `tail = head`.
 
-**Worker count by launch width.** `W` = 8 reaches the link's rate and is all a
-decode launch needs (a token tile per remote expert). A prefill launch's remote
+**Worker count by launch width.** A worker's slice copy is a few PCIe round
+trips followed by its compute, so one worker is latency-bound and the link fills
+only with many. Decode launches take 32 (`dispatch::WORKERS_DECODE`): on
+Qwen3.8-Flash-Next (RTX 4090 Laptop) 8 → 16 raised decode by a third (×8 68 →
+89 t/s, ×1 22 → 29), 32 a few percent more, and 64 measured level with 32;
+eight loads in flight per thread instead of four measured level too. (The
+§0.10.1 measurement of `W` = 8 saturating the link was a pure copy with no
+compute between slices.) A prefill launch's remote
 experts carry several token tiles each, all computed by the workers, so 8 made
 the cold prefill compute-bound: 814 t/s at 8, 1,083 at 32, no better at 64 —
 while every surplus worker is a block launched to exit on every decode launch
@@ -466,6 +479,166 @@ and they would have moved them at the same cost. On Flash-Next ×16 prefill the
 look-ahead issued 40,823 copy-engine promotions, 52.6 GiB, nearly all late:
 845 t/s with it, 1,075 without. A many-sequence decode step leaves the link room
 and keeps it.
+
+### 0.7.3 Read-ahead by the workers
+
+One copy engine moves experts into VRAM: the promotion ring and the GEMM
+workers. Besides a launch's own misses (§0.7.1) it reads ahead for later rows,
+with no copy issued by the host and no landing waited for.
+
+1. **Predictions.** When the pipeline thread serves row `r`'s summary it
+   predicts rows `r + 1 … r + 5` (`transition::HOPS`), each hop's candidates
+   in order of evidence: the **router look-ahead** — a decode launch's stacked
+   router projection also applies rows `r + 1 … r + 5`'s routers to row `r`'s
+   input (their own stacked launches of at most three, `forward_parts`), and
+   `moe_predict_votes` counts, per hop, the tokens whose top `k` names each
+   expert into a mapped vote ring beside the summary (`votes`), which the
+   pipeline thread copies out with the summary — then, for a narrow launch, a
+   direct Markov table from row `r`'s own decode routing to row `r + h`'s
+   arrivals (one table per hop, learned from decode launches only), then the
+   target row's non-resident experts decode routed recently; up to 32 experts
+   a row (rows `r + 1, r + 2` only stage — too near to read ahead). Measured
+   look-ahead precision by hop 1 → 5 on Flash-Next: 65/54/43/39/34% at ×1,
+   84/75/64/60/55% at ×8. Each row's prediction, filtered
+   to experts whose device-readable copy is pinned host memory — a **warm**
+   slot, or a pad slot the stager has staged it into — replaces
+   that row's list in the ring (`u32 window | u32 depth | u32 ahead_n[rows] |
+   u32 ahead_list[rows][AHEAD_CAP]`, after the retarget entries) — while a
+   launch that reads the list has yet to begin: a launch at `L` reads the lists
+   of `L + 2 … L + depth`, so a row's last reader is the launch two rows before
+   it, and the list is written only while that row lies past the served row
+   and the device has begun no invocation of it this pass — its started word
+   is at most the served ticket (`read_ahead::listing_readable`). Predicted
+   cold experts go to the stager, which stages them into the pad ahead of
+   their row and reports each as it lands (`landed_ahead`); the pipeline
+   thread, which drains the reports while it waits for the next summary, then
+   lists the row again from its latest prediction, now with the staged expert
+   from the pad, while a launch can still read it.
+   Each listed expert carries the slot image the host **vetted** as its source
+   (`u64 ahead_src[rows][AHEAD_CAP]`, after the lists): a warm slot as it is,
+   since it never changes; a pad slot only once the host has **pinned** it for
+   the listing (`ahead_pins`), since the stager may otherwise evict and reuse it
+   under another row's launch — its own reuse rules (Rule R′, the reclaim
+   clock) guard the pad's row's invocations, not the reader's. A relisting
+   keeps the pins it lists again; a pin it drops is released once every
+   invocation that could have read the old listing has finished — the latest
+   invocation begun on any row when the list was rewritten (`readers_key`: the
+   host writes, fences, reads the started words; a bucketize stores its started
+   word before it reads a list). Read-ahead pins hold at most an eighth of the
+   pad, beside the lazy victims' quarter.
+2. **The window.** A launch at row `L` reads ahead for rows `L + 2 … L +
+   depth` (wrapping into the next pass), spending `window − n_remote` offers,
+   at most `AHEAD_MAX` (64): `window` is slot images the link moves in one
+   layer at a share of ½ — the link's rate, measured at startup by a pinned →
+   VRAM copy on the copy stream (`link_rate`, ~12 GB/s on the 4090 Laptop's
+   Gen4 ×8, ~half that on the 3090 box's PCIe 3.0 host), times the median
+   interval between consecutive rows' summaries over the previous pass. The
+   share bounds the feedback of read-ahead lengthening the layers its window is
+   measured from: with `a` read-ahead images, `n` misses, base layer time `T0`
+   and image time `c`, `a = (s·T0/c − n)/(1 − s)`, finite for any `s < 1`. A
+   prefill launch's misses use up its window; a sweep reads nothing ahead.
+3. **The claim** (bucketize, thread 0, after its own misses' walk): for each
+   listed expert whose three entries still point at its vetted image, in
+   pinned memory, and whose mark is clear, take the next offer exactly as a
+   miss does — a victim of this row that this launch routes is skipped, any
+   other victim's entries retargeted first — set its mark, log it with its
+   **target row** and `AHEAD_FLAG` set in the expert field, and write an item
+   (`moe_read_ahead.cuh`): its image, the claimed slot, the image's bytes, the
+   three entries' addresses and the values to publish, and the slot's owner
+   tag. An expert whose entry has moved since it was vetted — staged into the
+   pad after a warm listing, promoted, evicted — is passed over: the device
+   reads only what the host vetted. A list read mid-rewrite may pair an expert
+   with the source listed beside the one it replaced; a source still readable
+   through a list is a warm slot or a pinned pad slot, neither of which can
+   come to hold another expert, so the mismatch is passed over the same way.
+4. **The copy.** The gate launch's workers — the layer's first launch over its
+   remote experts, whose workers wait on its cold experts while the link is
+   free — take the items' `AHEAD_CHUNKS` (16) pieces after their own items.
+   A piece is a byte copy of the warm image into the slot; no layer geometry,
+   so a row of another dtype or layout is copied the same way.
+5. **The publish.** The worker that counts an item's last piece writes the
+   slot's owner tag (with the owner check), the up and down entries, a system
+   fence, then gate — the host's order. Every later bucketize then finds the
+   expert in VRAM; nothing reads the target row's entries concurrently (later
+   rows run after this launch in stream order).
+6. **The host books it** when it collects the claim from the log: like a
+   miss's claim, the victim's eviction at once and the slot's install once the
+   invocation is done, when `set_vram` publishes the value the device already
+   wrote. The row's routing judges the prediction (precision). A boundary move
+   drains the ring with the device synchronized, as for any claim.
+
+Measured on Qwen3.8-Flash-Next (RTX 4090 Laptop, 16 GB, warm tier 26% of the
+experts, 2026-10-08): every config passes; decode read-ahead claims 3,700–4,600
+per config at 61–90% precision, with windows of 16 (×1) to 64 images per layer.
+Decode throughput is level with the copy-engine prefetch it replaces (×8 64.3
+t/s): volume, not timing, limited it — the chained Markov predictor proposed at
+most eight experts a row, about 1.5 claims a layer against 26 misses, which is
+what the per-hop tables, the look-ahead and the recency candidates above widen.
+
+**What read-ahead buys, measured (2026-10-09, same card, 32 workers).** The
+copies run inside the gate launch, on the link the launch's own misses are
+already using, so an image read ahead costs its link time now and saves it
+later only if its row routes it — at 30–55% precision that is a loss unless the
+link would otherwise be idle (a worker waiting on a cold expert). A share of 1
+(a window twice today's) raised the decode hit rate to 73% and cut decode to
+×1 19 / ×8 80 t/s; a share of 0 (no read-ahead) decoded ×1 28.3 / ×8 95.7
+against ×1 27.4 / ×8 94.8 at ½ — level within this laptop's noise. The share
+stays at ½; the copies that would pay are ones placed in idle link time only.
+
+### 0.7.4 Victim ranking — evict behind the wave, by expected miss cost
+
+Every eviction — a demand miss's claim and a read-ahead copy's alike — takes a
+lazy victim the pipeline thread ranked into the promotion ring, and the device
+retargets the victim's entries before it writes the slot (§0.7.1), so *safety*
+never depends on where the victim sits. *Which* victim is taken does. The
+ranking (`ExpertCacheInner::rank_victims`) supersedes revision 1's Rule S
+(§6.2):
+
+- **Behind the wave, fading, with the wrap.** Each resident's frequency is
+  scaled by how far behind the wave its layer lies, `f + (1 − f)·(n − dist)/n`
+  for wrapped forward distance `dist` and floor `f = 0.25`
+  (`cache::behind_protection`, `cache::FADE_FLOOR`). L−1, the layer just
+  executed and the one whose next use is a full pass away, is protected least;
+  each layer further back a little more; the fade wraps, so at the start of a
+  pass the layers just behind are the previous pass's last, and as the wave
+  advances the eviction front moves onto the early layers it has left. The
+  layers about to run keep nearly their whole score, so a read-ahead copy for
+  a row ahead is bought from the layers the wave has left.
+- **Distance steers, frequency decides.** The fade spans about `1/f` (4×): a
+  hot expert just behind outlasts a cold one about to run, because the next
+  pass needs it. The full fade (`f = 0`, `n×`) evicted exactly those and raised
+  the share of victims routed again at their next visit by 3–4 points at ×8
+  (`FADE_FLOOR` records the measurement).
+- **Passes by eviction class.** The residents fall into four classes — reload
+  tier (warm-backed or pack-only) × whether the row routed the expert on its
+  last decode visit (`ExpertCacheInner::mark_visit`) — and the ranking runs
+  over one class at a time, a later class only for the shortfall. Decode
+  routing carries over step to step — 37–63% of a row's just-routed experts are
+  routed on its next visit, against 10–21% of the rest — which a decayed
+  frequency score cannot see: ranked by it, just-routed experts were 54–82% of
+  all victims.
+- **Cheapest expected miss cost first** (`ExpertCacheInner::set_eviction_costs`):
+  each class's running regret rate (`regret::ClassRates`, the share of its
+  victims routed again at their row's next decode visit) times its restore
+  cost — the copy over the link for a warm-backed expert, and the measured
+  pack read the layer then waits on plus that copy for a pack-only one.
+  Restoring a pack-only expert costs about an order of magnitude more, so
+  pack-only classes are protected by that ratio and evicted only when that
+  much less likely to come back. Putting recency above the reload tier
+  outright halved regret at ×1–×4 (25 → 15%, 37 → 18%) but turned cheap warm
+  misses into pack reads (+23–58%) and decoded no faster; the measured costs
+  decide that trade per class, per width, per drive. Repriced at every pass
+  boundary; until a pack read is measured the passes run warm-backed first,
+  stale before just-routed. The pinned head layers are never candidates.
+- **Learned from decode only.** A prompt launch routes most of a row, so it
+  neither judges claims nor marks a visit: it would count nearly every victim
+  routed again and mark nearly every resident just hit.
+
+Tests: `cache.rs` (fade values, the walk backwards from L−1, the front
+wrapping with the wave, frequency within the fade, recency passes, cost-ordered
+passes), `regret.rs` (judging by ticket, class rates, pricing, tags).
+Measured (`regret`'s counters in the gate's decode table): regret at ×8 55 →
+50% with the recency passes, BF16×8 decode ~+7%.
 
 ### 0.7.2 Measured — the qwen36 gate (RTX 3090, PCIe 3.0, WDDM)
 
@@ -809,13 +982,39 @@ carries over.
 ### 0.12 Failure and abort
 
 - **The abort word** (mapped) is raised by the pipeline thread's and the stager's
-  `DeadFlagGuard`s and by any error on either thread; a spinning worker traps on
-  its next poll, the sticky error surfaces at the next synchronize, and no token
-  computed from the layer is returned (as §8).
+  `DeadFlagGuard`s and by any error on either thread. A spinning worker sees it
+  on its next poll and gives its expert up.
 - **A pack read that fails** (I/O error, short read) is an abort, not a retry:
   the worker waiting on that expert cannot be released any other way.
-- **The spin limit** (1.5 s per wait) is the backstop for a stager that is alive
-  but stuck (a drive that stopped answering).
+- **The spin limit** (1 s per wait) is the backstop for a stager that is alive
+  but stuck (a drive that stopped answering); a wait past it gives its expert
+  up the same way.
+- **Giving an expert up is a failed forward, not a trap** (`expert_lre::fault`).
+  The worker claims a mapped fault word — aborted or timed out, the row, the
+  expert, the microseconds waited — and skips the item, writing neither its
+  output nor its promotion slot. Any other cold wait that sees the word set
+  gives its expert up at once; the word is read only inside a wait, so an item
+  whose expert is already readable pays nothing for it. Read-ahead pieces never
+  wait on a cold expert and run to the end. `drive_wave` synchronises after
+  every segment, residual or logits, and reads the word
+  (`WaveSweep::take_device_fault` — required of every sweep, so a model gaining
+  an expert cache cannot skip it); a fault fails the segment with an error
+  naming the expert and rolls it back as a failed sweep, so a faulted segment
+  never commits its KV or hands its residual on. Until the word is taken,
+  nothing builds on the faulted forward: the dispatch refuses every launch
+  (`FaultWord::check`; the wave driver takes the fault on that error path
+  too, so a refusal never outlives the fault), and the pipeline thread lands
+  no demand promotion — a given-up item's slot was never written. Taking the
+  fault sends the drop of every pending demand promotion down the pipeline
+  thread's channel and clears the word only once it is done, so a landing
+  still queued behind the faulted forward never reads the word clear; a
+  boundary move with a fault pending drops them as well, before the zone can
+  retract under their slots. The stager's eviction stores the entry and then
+  checks the row's retire key even under Rule R′, which a forward that
+  faulted and moved on no longer satisfies; a demand whose `T` the GPU has
+  left is abandoned. A trap was a sticky error that poisoned the CUDA
+  context for the whole process; the context now survives, and the
+  scheduler's retry is a retry.
 - **A hit tile whose entry changed under it** (VRAM-evicted between `bucketize`
   and its block's start) still reads the VRAM address from the snapshot, and
   Rule R keeps that slot unreclaimed until the invocation is done.
@@ -861,6 +1060,15 @@ Kernel side (`candle-core`):
    warm and cold remote experts, output bit-identical to an all-VRAM launch.
 5. **Cold release with the forward thread in a module load** — §0.10.2 D with the
    real launch; must finish, bit-identical.
+5a. **Read-ahead claims** (§0.7.3) —
+   `cuda_moe_bucketize_reads_ahead_into_offers_within_the_window`: only the
+   vetted (a pinned pad slot included), unmarked predictions of rows `L + 2 …
+   L + depth`, in list order, within the window; a stale vetting passed over;
+   a victim the launch routes skipped, another retargeted; every item word, the
+   log entries and the marks raw; a window of 0 reads nothing.
+5b. **Read-ahead copy and publish** — `cuda_live_gate_launch_reads_ahead_and_publishes`:
+   images landed byte for byte, entries and owner tag published, every piece
+   counted once, the launch's own output bit-identical to the all-VRAM one.
 
 Host side (`candle-transformers`, host-only, raw expected values):
 
@@ -873,6 +1081,26 @@ Host side (`candle-transformers`, host-only, raw expected values):
    order, bytes equal to the record; pageable warm slots staged by `memcpy`; a
    one-layer pad serving a row whose whole routed set is cold.
 9. **Pad scores** — credit, decay, victim order.
+10. **Listing readability** — `read_ahead::listing_readable`: a row's list is
+    written only while the launch two rows before it has yet to begin, judged
+    by that row's started word against the served ticket, across a pass
+    boundary too.
+11. **A lost cold expert fails the forward, not the context** —
+    `candle-core/tests/moe_live_abort.rs`: an aborted wait and a wait past the
+    spin limit each claim the fault word (abort bit, row, expert, wait — raw
+    bits) and leave the next synchronise and later work running;
+    `expert_lre::fault` decodes the word into the forward's error.
+12. **Router look-ahead votes** — `votes::ranked` (most votes first, ties by
+    expert, zero votes left out), and `qkv_segmented_refuses_a_fourth_segment`:
+    a stacked launch that does not split K takes at most three weights.
+13. **Residency references** — `belady`, `routing_trace`: Belady's MIN and LRU
+    over a recorded routing, raw hit counts, and the trace's file format byte
+    for byte; `replay` replays scored policies over a written trace.
+14. **Read-ahead pins** — `ahead_pins`: pad candidates pinned under the cap and
+    dropped past it, a relisting carrying the pins it keeps, dropped pins
+    released only once their readers' key has passed, a pending release still
+    counting against the cap, and a row listing a pad expert from its commit
+    until a relisting drops it.
 
 ### 0.16 Acceptance
 
@@ -904,6 +1132,13 @@ the non-evicting `rank_victims` the reclaim rule filters; and
 `slot_image.rs`, `startup.rs`, `boundary.rs` and `pipeline.rs`, beside the new
 `reclaim.rs`, `residency.rs`, `pad.rs` and `stager.rs`.
 
+Read-ahead (§0.7.3) deleted the copy-engine prefetch that preceded it: the
+copier thread (`copier.rs`) and its promotions, `take_slots`, the retire list
+the pipeline and the stager parked evicted slots on (`RetireList`), the
+adaptive prefetch depth and its late-load and copy-bandwidth signals
+(`adapt_prefetch_depth`, `late_loads`), and the `promotions` /
+`promotion_bytes` counters.
+
 ### 0.18 Documentation to update
 
 As §18's audit, plus: `docs/expert_cache_design.md` (warm tier no longer the
@@ -918,8 +1153,9 @@ only pinned tier; demand misses no longer load), CLAUDE.md hot-path invariant 3
 | Question | Decision |
 |---|---|
 | Kernel side | §0.10: workers in the same launch, mini-loop copy + one sync, the unmodified impl over a scratch slot |
-| `W` | 8 for a decode launch, 32 over 64 tokens (§0.7.1) |
-| Promotion of misses | by the workers into ring slots; copy engine only for prefetch; a miss with no slot is claimed on its next launch, never re-sent (§0.7.1) |
+| `W` | 32 for a decode launch, 64 over 64 tokens (§0.7.1) |
+| Promotion of misses | by the workers into ring slots; a miss with no slot is claimed on its next launch, never re-sent (§0.7.1) |
+| Prefetch | read-ahead by the gate launch's workers into ring slots, published by the device, within the link window a launch's misses leave; from host-vetted sources — warm slots, and pad slots pinned for the listing (§0.7.3) |
 | Scratch | `W` slots of the largest projection slice — ~410 KB for qwen36 |
 | Pad size | one full layer, the floor that never needs a GPU→host "consumed" signal; anything above it is a pinned-budget split left at zero in this revision |
 | Promotion policy | every miss is a promotion candidate, admitted by the pipeline's existing score policy (today's behaviour minus the critical path) |
@@ -1142,12 +1378,10 @@ __syncthreads(); weights = s_w;
 - **Weights are read through `cp.async.cg`**, which bypasses L1
   (`kernel.cuh:1970`), and the first read of the slot follows the acquire of
   its pointer, so a block cannot hold stale cached bytes of a previous tenant.
-- **`__trap()` is the error path.** It turns an abort or an overrun into a
-  sticky launch error, which the existing machinery already treats as
-  context-fatal (`cuda_backend/error.rs:107-119`, `gpu_poison.rs`) and which
-  surfaces at the next synchronizing call — the sampler's
-  (`batched_sampler.rs:1777`) in every driver — before any token computed from
-  the layer is returned. §8.
+- **The fault word is the error path** (§0.12). An abort or an overrun gives
+  the expert up and claims the word; the host fails the forward once it has
+  synchronised, before any token computed from the layer is returned, and the
+  context survives. §8.
 
 ### 4.3 Why tile order changes nothing numerically
 
@@ -1325,6 +1559,9 @@ covers every victim choice the current policy can make, including the
 ahead-of-the-wave ones (`cache.rs:704-712, 885-916`).
 
 **Rule S (speculative evictions only from rows behind, in the current pass).**
+*Superseded by §0.7.4: revision 2 has no host speculative clears — every
+eviction is a ring claim the device retargets before its write, ranked behind
+the wave with the wrap.*
 Prefetch and whole-layer streaming are issued while processing `Routed(n)` whether
 or not `n` had misses, so the GPU may be anywhere past bucketize(`n`). Their
 victims must therefore come from rows whose readers are known complete and which
@@ -1433,6 +1670,7 @@ issues the prefetch had demand misses, queue its speculative clears *before* its
 demand fills. The GPU is then held at that row's gate GEMM until those clears
 have landed, so the tail rows' next bucketize must see them. That is a change
 to the order in which one thread enqueues on one stream, nothing more.
+(Revision 2 restores the wrap, §0.7.4.)
 
 What it does not change, and so does not regress:
 - **Prefetch lead time.** Today a prefetch for row `L+1` overlapped the forward
@@ -1475,20 +1713,18 @@ blocks" (`quantized_qwen3_moe.rs:312-333`, `types.rs:409-419`,
 
 ## 8. Failure
 
-There is no host path to retreat to, so a miss that cannot be served is fatal,
-exactly as a device fault is:
+There is no host path to retreat to, so a miss that cannot be served fails the
+forward that needed it (§0.12):
 
-- **A load fails** on the pipeline thread (NVMe error, staging failure) → it
-  writes the abort word (one pinned-constant H2D on a dedicated non-blocking
-  **abort stream**, then `cuStreamQuery`) and stops serving. Every spinning
-  block `__trap()`s; the sticky error surfaces at the sampler's synchronize and
-  takes the existing poison path. No token computed from the aborted layer is
-  returned.
-- **The pipeline thread dies** → `DeadFlagGuard` (`pipeline.rs:3498-3509`) writes
-  the abort word in its drop, before setting the flag. `pipeline_dead` stops
-  gating dispatch.
-- **A spin overruns `SPIN_LIMIT_NS`** (a bug, a stuck copy) → `__trap()`, same
-  path, before the TDR would reset the device.
+- **A load fails** on the stager (NVMe error, short read) → it raises the abort
+  word (a plain host store to mapped memory) and stops serving. Every waiting
+  worker gives its expert up and claims the fault word; the wave driver reads
+  it after the segment's synchronise and fails the segment. No token computed
+  from the aborted layer is returned.
+- **The pipeline thread or the stager dies** → its guard raises the abort word
+  in its drop, before setting the flag. `pipeline_dead` stops gating dispatch.
+- **A spin overruns `SPIN_LIMIT_NS`** (a bug, a stalled drive) → the same give-up,
+  well before the TDR would reset the device.
 
 Errors that are recoverable today because they surface synchronously through
 `submit_moe_work` were all one of these. The one that was not — "cannot evict
@@ -1640,15 +1876,16 @@ Kernel, `candle-core/src/quantized/cuda_tests.rs`:
    `cuda_grouped_qmatmul_dev_matches_host_tables` (`:9659-9772`) over a
    resident-first table set, bit-exact against the ascending order.
 
-Integration, each in its own test binary because a `__trap` poisons the context
-for the process:
+Integration, each in its own test binary so a launch left waiting cannot hold
+up another test's device:
 
 4. **spin released by a copy** — a gate launch over a table whose entries are
    zero, released by fills on a non-blocking stream after a host delay; output
    bit-exact against the pre-filled launch; no synchronize issued between launch
    and fills (this is also the WDDM flush test).
-5. **abort traps** — the abort word set while a launch spins; the next
-   synchronize returns the sticky error.
+5. **abort gives up** — the abort word set while a launch spins; the launch
+   completes, the fault word names the row and the expert, and the context
+   stays usable (`candle-core/tests/moe_live_abort.rs`).
 6. **ordering stress** — a free-running forward over a cache sized to the floor
    with demand and speculative eviction on every layer, run for minutes with
    `readonly_regions` armed over resident slots; it is the instrument for Rules
@@ -1838,14 +2075,13 @@ Wait block-time                  ms/tok
 Gate GEMM excl. stall            ms/call
 Up / down GEMM (control)         ms/call
 Copy busy — demand               ms/tok  @ GB/s
-Copy busy — prefetch             ms/tok  @ GB/s
+Read-ahead                       images / GiB (worker counters)
 Copy busy — stream               ms/tok  @ GB/s
 Copy hidden                      %
 Miss service (GPU)               avg / max ms
   of which routed wait           avg / max ms
   of which cold read             avg / max ms
 Pass-start wait                  ms/tok
-Late loads                       n
 ```
 
 `kv_fragmentation`'s `print_pipeline_profile` and `/v1/profile` get the same
@@ -1868,7 +2104,7 @@ Counting from the routing summary fixes that by construction.
 
 | What moved | Means |
 |---|---|
-| stall ↑; gate excl. stall, up, down flat | streaming fell behind — look at hit rate, late loads, copy GB/s, cold reads |
+| stall ↑; gate excl. stall, up, down flat | streaming fell behind — look at hit rate, read-ahead claims and precision, copy GB/s, cold reads |
 | stall flat; gate excl. stall and up/down ↑ | the expert kernels got slower |
 | copy GB/s ↓ | the bus or the source — `cold_read` and `cold_acquire` say which |
 | miss service ↑, copy busy flat | the pipeline thread's host side — `pipe_inbound`, `pipe_routed_wait`, `cl_classify` |

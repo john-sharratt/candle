@@ -81,11 +81,11 @@
 // holds more than its `reserve` (a mapped word the host sets; a null address
 // means never). Where the zone has room for prompts the host sets it to 0 and a
 // prompt takes any stocked slot; where it has not, the host sets it to the
-// ring's whole stock target, which it stocks to and no further, so the stock
-// is decode's and a prompt — which sweeps the table about once — is served by
-// the workers' copies instead of evicting decode's working set. Only the brief
-// window after the target shrinks, before the host trims the surplus, lets a
-// prompt-only expert through there.
+// stock decode's misses want, so a prompt — which sweeps the table about once —
+// is served by the workers' copies instead of evicting decode's working set.
+// What stands above the reserve is the read-ahead window and the zone's empty
+// slots: prompt-only experts and read-ahead (below) share it, and read-ahead
+// never takes the stock below the reserve.
 //
 // A PROMPT-ONLY expert takes only an EMPTY offer — a prompt fills the zone's
 // holes and never evicts. When the next offer holds a victim, it stays in its
@@ -118,6 +118,29 @@
 // second slot by a later invocation that finds it still remote. The grouped
 // GEMMs' workers write every slice they copy into that slot, so once the layer
 // is done the expert is whole in VRAM and the host points its entry there.
+//
+// READ-AHEAD (`ahead_items`, optional; `moe_read_ahead.cuh` is the item
+// contract): after its own misses, a launch that claims at all spends what is
+// left of the layer's link window on experts predicted for the rows after the
+// next — `row + 2 … row + depth` (wrapping into the next pass), the host's
+// prediction lists in `ahead_list[t][..ahead_n[t]]`, each expert with the slot
+// image the host vetted as its source in `ahead_src[t][..]`. The budget is the
+// mapped `window` word (slot images the link moves in one layer) less this
+// launch's remote experts, at most AHEAD_MAX. A predicted expert is read ahead
+// only while its entries still point at that vetted image, in pinned memory: a
+// VRAM expert needs nothing, a cold one is the stager's to stage, and an image
+// the host did not vet may be a pad slot nobody pinned — the stager may evict
+// it while this launch reads it, since the pad's reuse rules guard the pad's
+// own row's invocations, not this one. The host vets a warm slot as it is (it
+// never changes) and a pad slot only once it has pinned it, and keeps the pin
+// until every launch that could read the listing has finished. An unmarked
+// vetted expert takes the next offer exactly as a miss does (a victim of this row that this
+// launch routes is skipped; a claimed victim is retargeted first), is logged
+// `summary_seq << 32 | t << 16 | AHEAD_FLAG | expert` and marked, and gets an
+// item: the gate launch's workers copy its image into the slot and the last of
+// them publishes its entries, so a later row's bucketize finds it in VRAM with
+// no host step between. A row's prediction is a hint, never a correctness
+// input: a wrong one costs a slot and the link time the budget allowed.
 //
 // OWNER CHECK (`slot_owner`, optional): the zone's slots, each tagged with the
 // expert last installed there as `(row + 1) << 16 | expert`. Every VRAM entry
@@ -228,7 +251,23 @@ extern "C" __global__ void moe_bucketize_kernel(
     // `started_rows[row]` before any live entry is read — the host's reclaim
     // rule pairs its retarget-then-read with this store-then-read.
     uint64_t* started_rows,
-    const uint64_t ticket)
+    const uint64_t ticket,
+    // READ-AHEAD, or null `ahead_items` (requires the ring). Mapped: the
+    // `window` and `depth` words and the per-row prediction lists
+    // `ahead_n[rows]`, `ahead_list[rows][ahead_cap]` and the vetted source
+    // images `ahead_src[rows][ahead_cap]`. Device: `row_layout`
+    // `u64[rows][4]` (gate, up, down offset in a slot image, image bytes), the
+    // item buffer and its per-item piece counters (`moe_read_ahead.cuh`).
+    const uint32_t* ahead_window,
+    const uint32_t* ahead_depth,
+    const uint32_t* ahead_n,
+    const uint32_t* ahead_list,
+    const uint64_t* ahead_src,
+    const uint32_t ahead_cap,
+    const int32_t rows,
+    const uint64_t* row_layout,
+    uint64_t* ahead_items,
+    uint32_t* ahead_done)
 {
     const int tid = (int)threadIdx.x;
     const int a_ub = n_tokens * k;
@@ -449,14 +488,21 @@ extern "C" __global__ void moe_bucketize_kernel(
         // slot while the ring has one. Serial because each grant moves the head
         // the next one is judged against — but over the remote list alone, which
         // a decode step whose experts are all resident leaves empty. With no
-        // remote expert there is nothing to claim, so the ring is not read and
-        // `head` is not republished: its two system fences and the round of
-        // mapped loads are a decode step's most common avoidable wait.
-        if (tid == 0 && remote != nullptr && remote_dst != nullptr && r_pinned + r_cold > 0) {
+        // remote expert and no read-ahead there is nothing to claim, so the ring
+        // is not read and `head` is not republished: its two system fences and
+        // the round of mapped loads are a decode step's most common avoidable
+        // wait. Read-ahead runs even with every routed expert resident — that
+        // is when the layer's link window is free.
+        if (tid == 0 && remote != nullptr && remote_dst != nullptr &&
+            (r_pinned + r_cold > 0 || ahead_items != nullptr)) {
             promotion_walk(r_pinned + r_cold, claiming, sh_remote_e, sh_marked, sh_dec, sh_counts,
                            gate_row, table_plane, n_experts, row, summary_seq, promo_slots,
                            promo_log, promo_head, promo_tail, promo_cap, promo_marks,
-                           promo_reserve, promo_sweep, promo_victims, promo_retarget, remote_dst);
+                           promo_reserve, promo_sweep, promo_victims, promo_retarget, remote_dst,
+                           ReadAhead{ahead_window, ahead_depth, ahead_n, ahead_list, ahead_src,
+                                     ahead_cap, rows, row_layout, ahead_items, ahead_done},
+                           ZoneRanges{pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi, slot_owner,
+                                      zone_end, zone_slot_bytes, zone_slots});
         }
     }
     __syncthreads();
@@ -723,8 +769,25 @@ extern "C" int32_t run_moe_bucketize(
     void* remote_dst,
     void* started_rows,
     uint64_t ticket,
+    const void* ahead_window,
+    const void* ahead_depth,
+    const void* ahead_n,
+    const void* ahead_list,
+    const void* ahead_src,
+    uint32_t ahead_cap,
+    int32_t rows,
+    const void* row_layout,
+    void* ahead_items,
+    void* ahead_done,
     void* stream)
 {
+    if (ahead_items != nullptr &&
+        (promo_slots == nullptr || remote == nullptr || ahead_window == nullptr ||
+         ahead_depth == nullptr || ahead_n == nullptr || ahead_list == nullptr ||
+         ahead_src == nullptr || ahead_cap == 0 ||
+         rows <= 0 || row >= rows || row_layout == nullptr || ahead_done == nullptr)) {
+        return 1;
+    }
     if (n_tokens <= 0 || k <= 0 || k > MAX_TOPK || n_experts <= 0 ||
         n_experts > MAX_EXPERTS || tile_w <= 0 || (gate_row != nullptr && snap == nullptr) ||
         (promo_slots != nullptr && (promo_cap == 0 || promo_log == nullptr ||
@@ -772,7 +835,11 @@ extern "C" int32_t run_moe_bucketize(
         (const uint32_t*)promo_reserve, (const uint32_t*)promo_sweep,
         (const uint64_t*)promo_victims, (const uint64_t*)promo_retarget,
         (const uint32_t*)slot_owner, zone_end, zone_slot_bytes, zone_slots, row,
-        (uint64_t*)remote_dst, (uint64_t*)started_rows, ticket);
+        (uint64_t*)remote_dst, (uint64_t*)started_rows, ticket,
+        (const uint32_t*)ahead_window, (const uint32_t*)ahead_depth, (const uint32_t*)ahead_n,
+        (const uint32_t*)ahead_list, (const uint64_t*)ahead_src, ahead_cap, rows,
+        (const uint64_t*)row_layout,
+        (uint64_t*)ahead_items, (uint32_t*)ahead_done);
     cudaError_t launched = cudaPeekAtLastError();
     if (launched != cudaSuccess) {
         fprintf(stderr, "moe_bucketize: launch failed: %s\n", cudaGetErrorString(launched));

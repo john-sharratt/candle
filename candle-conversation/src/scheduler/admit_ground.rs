@@ -625,8 +625,16 @@ impl Scheduler {
     /// resident the hit rate was 0.65, a coefficient of ~1.73 against a seed of
     /// 0.7 — a decode's copy priced two and a half times too dear, which the
     /// wave pays for by refusing decodes that would have fitted.
+    ///
+    /// **Read unsettled, once per decode forward.** Settling the expert
+    /// pipeline (`expert_stats`) waits for the device to reach the forward's
+    /// last MoE layer and for the pipeline thread to serve every layer queued
+    /// behind it — on Qwen3.8-Flash-Next single-session decode (RTX PRO 5000)
+    /// reading unsettled took a 4K step from 23.6 to 19.9 ms. The interval it
+    /// folds needs no exact boundary: a tally that trails by the layers still
+    /// queued counts them in the next interval instead.
     pub(super) fn observe_expert_hit_rate(&mut self) {
-        let Some(stats) = self.model.expert_stats() else {
+        let Some((total_hits, total_misses)) = self.model.expert_hit_counts() else {
             return;
         };
         // **The interval, not the lifetime.** Nothing in the daemon calls
@@ -638,11 +646,11 @@ impl Scheduler {
         // residency converts into hits. The sample count goes on rising, so the
         // telemetry reads healthy while the estimate has stopped moving.
         let (hits, misses) = (
-            stats.expert_hits.saturating_sub(self.expert_hits_seen),
-            stats.expert_misses.saturating_sub(self.expert_misses_seen),
+            total_hits.saturating_sub(self.expert_hits_seen),
+            total_misses.saturating_sub(self.expert_misses_seen),
         );
-        self.expert_hits_seen = stats.expert_hits;
-        self.expert_misses_seen = stats.expert_misses;
+        self.expert_hits_seen = total_hits;
+        self.expert_misses_seen = total_misses;
         let routed = hits + misses;
         if routed == 0 {
             return;

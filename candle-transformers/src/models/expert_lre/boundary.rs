@@ -10,10 +10,13 @@
 
 use super::pipeline::PipelineState;
 use super::slot_image::{build_slot_view, slot_offsets};
+use super::types::BoundaryAsk;
 use candle::cuda_backend::graph::try_without_recording;
 use candle::{Device, Result};
 use candle_nn::kv_cache::{kv_spare_regions, set_weight_floor, wave_is_live, weight_floor_after};
+use cudarc::driver::CudaStream;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Regions the weight side leaves above the KV side's recent high-water mark.
 ///
@@ -69,10 +72,33 @@ pub fn grow_tally() -> [u64; 8] {
     std::array::from_fn(|i| GROW_TALLY[i].load(Ordering::Relaxed))
 }
 
+/// The growth question, asked by the thread between forwards: the regions the
+/// KV side holds spare that this cache could take, 0 for none.
+///
+/// **Asked here, not on the pipeline thread.** The answer is the region pool's
+/// present occupancy, knowable right after the wave's transient tier is handed
+/// back and the empty arenas are swept — which is where the caller stands. The
+/// pipeline thread answers its messages in order, so asked there the question
+/// first waited for every routed layer still queued: the device to reach the
+/// forward's last MoE layer, then the thread to serve the backlog — on
+/// Qwen3.8-Flash-Next single-session decode (RTX PRO 5000) 2–3 ms a forward,
+/// nearly always to learn there was nothing spare. Only a non-zero answer goes
+/// to the pipeline thread ([`BoundaryAsk::Take`]), which owns the move.
+pub(crate) fn spare_for_growth(stream: &Arc<CudaStream>) -> Result<usize> {
+    grow_note(GrowOutcome::Asked);
+    let spare = kv_spare_regions(stream, KV_REGION_SLACK, EXPERT_MIN_GRANT_REGIONS)?;
+    grow_note(if spare == 0 {
+        GrowOutcome::NoSpare
+    } else {
+        GrowOutcome::SpareOffered(spare)
+    });
+    Ok(spare)
+}
+
 impl PipelineState {
     /// Move the boundary if it may move now, deciding before anything is
     /// touched, and answer with the bytes conceded.
-    pub(crate) fn renegotiate_if_quiet(&mut self, want: Option<usize>) -> Result<u64> {
+    pub(crate) fn renegotiate_if_quiet(&mut self, ask: BoundaryAsk) -> Result<u64> {
         let Device::Cuda(cd) = &self.device else {
             return Ok(0);
         };
@@ -87,10 +113,10 @@ impl PipelineState {
             // tier that cannot be placed fails its wave — so it says which gate
             // closed. The give-back direction is refused this way every forward
             // and stays quiet.
-            if want.is_some_and(|w| w > 0) {
+            if let BoundaryAsk::Sell(wanted) = ask {
                 tracing::info!(
                     target: "candle_transformers::expert_lre",
-                    wanted = want,
+                    wanted,
                     wave_live = live,
                     invocation_unserved = unserved,
                     "weight side refused a KV purchase: the boundary moves only between \
@@ -108,7 +134,7 @@ impl PipelineState {
         // failed, and the expert pipeline aborted. Held for the whole move, so no
         // recording can begin between the two quiesces; refused, it concedes
         // nothing now and the next negotiation asks again.
-        let conceded = match try_without_recording(|| self.renegotiate_boundary(want)) {
+        let conceded = match try_without_recording(|| self.renegotiate_boundary(ask)) {
             Some(conceded) => conceded,
             None => {
                 tracing::debug!(
@@ -122,11 +148,10 @@ impl PipelineState {
         conceded
     }
 
-    /// Move the weight/KV boundary. `want` is regions the KV side is asking for;
-    /// `None` or `Some(0)` asks the opposite question — how much it is holding
-    /// free that the weight side could take back.
+    /// Move the weight/KV boundary: sell the regions the KV side is asking for,
+    /// or take back the regions it is holding spare.
     ///
-    /// **`want` is stated by the caller, never inferred here.** A running count
+    /// **Both quantities are stated by the caller, never inferred here.** A running count
     /// of refused claims was once spent as regions: one failed drain left 4,436
     /// behind it against a KV side 28 regions short, and the retraction that
     /// followed evicted the zone below its own pinned working set.
@@ -141,26 +166,16 @@ impl PipelineState {
     ///
     /// Answers with the **bytes conceded to the KV side** — zero when the
     /// boundary held or moved the other way.
-    fn renegotiate_boundary(&mut self, want: Option<usize>) -> Result<u64> {
+    fn renegotiate_boundary(&mut self, ask: BoundaryAsk) -> Result<u64> {
         let Device::Cuda(cd) = &self.device else {
             return Ok(0);
         };
         let stream = cd.cuda_stream();
-        let growing = matches!(want, Some(0) | None);
-        if growing {
-            grow_note(GrowOutcome::Asked);
-        }
-        let delta = match want {
-            Some(0) | None => {
-                let spare = kv_spare_regions(&stream, KV_REGION_SLACK, EXPERT_MIN_GRANT_REGIONS)?;
-                if spare == 0 {
-                    grow_note(GrowOutcome::NoSpare);
-                    return Ok(0);
-                }
-                grow_note(GrowOutcome::SpareOffered(spare));
-                -(spare as isize)
-            }
-            Some(wanted) => wanted as isize,
+        let growing = matches!(ask, BoundaryAsk::Take(_));
+        let delta = match ask {
+            BoundaryAsk::Take(0) | BoundaryAsk::Sell(0) => return Ok(0),
+            BoundaryAsk::Take(spare) => -(spare as isize),
+            BoundaryAsk::Sell(wanted) => wanted as isize,
         };
         let floor = weight_floor_after(&stream, delta)?;
         let before = self.inner.zone.capacity();
@@ -235,9 +250,7 @@ impl PipelineState {
         // lock is held), so every entry may change at once: nothing can read
         // the table until the move is done.
         self.quiesce_before_handover()?;
-        self.finish_promotions()?;
         self.drain_ring(self.routed_served.load(Ordering::Acquire))?;
-        self.release_retired();
 
         // The zone decides who moves and who goes; this performs it. A
         // displaced survivor is evicted first: the relocation into its slot

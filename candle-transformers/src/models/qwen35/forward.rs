@@ -637,6 +637,31 @@ impl ManagedBatchedModel for HybridBatched {
         }
     }
 
+    fn expert_hit_counts(&self) -> Option<(usize, usize)> {
+        #[cfg(feature = "cuda")]
+        {
+            self.model().experts.as_ref().map(|c| c.hit_counts())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        #[cfg(feature = "cuda")]
+        {
+            self.model()
+                .experts
+                .as_ref()
+                .and_then(|c| c.hit_references())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
     fn weight_plan(&self) -> WeightPlanning {
         // A dense checkpoint of this lineage has no expert cache, which is `Dense` and
         // not a broken gauge set — see `WeightPlanning`.
@@ -761,6 +786,14 @@ impl WaveSweep for HybridBatched {
 
     fn kv_layer_range(&self, layer_start: usize, layer_end: usize) -> (usize, usize) {
         HybridBatched::kv_layer_range(self, layer_start, layer_end)
+    }
+
+    fn take_device_fault(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Some(c) = self.model().experts.as_ref() {
+            c.take_segment_fault(HybridBatched::device(self))?;
+        }
+        Ok(())
     }
 
     /// Open the wave's recurrent state, sweep, then commit or roll back.

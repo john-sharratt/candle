@@ -317,9 +317,11 @@ engine (12,700 copy-engine promotions, 16 GiB). In order of discovery:
 2. **Copy-engine promotions issued off the pipeline thread** (`copier.rs`). The real cause of
    the dry ring: on WDDM, issuing a `cuMemcpyHtoDAsync` from pinned memory stalled the pipeline
    thread for 157–189 ms once per step — the rest of the forward the GPU was running — and the
-   ring it restocks every layer ran dry behind it. A copier thread now issues those copies and
-   reports completions; the pipeline thread's per-layer work is host memory and mapped words
-   only. Unslotted misses went from ~12,300 to ~0.
+   ring it restocks every layer ran dry behind it. A copier thread then issued those copies and
+   reported completions, and unslotted misses went from ~12,300 to ~0. The copy-engine prefetch
+   is gone since: the GEMM workers read ahead into ring slots and publish the entries
+   themselves (`moe_live_dispatch_design.md` §0.7.3), so the pipeline thread issues no copy at
+   all and its per-layer work is host memory and mapped words only.
 3. **Verify rows scored as decode** (`DecodeRows`, `models/residency_rows.rs`). Residency
    scoring weights a decode row's routing above a prompt row's, and bucketize's decode bit
    covered only the leading decode rows. Flash-Next decodes entirely through verify waves,
@@ -456,7 +458,6 @@ The expert pipeline's pieces, `-p candle-core --lib` and `-p candle-transformers
 | `cuda_moe_bucketize_live_table_orders_remote_first` (extended) | The decode bit follows arbitrary token ranges, not only a prefix. |
 | `decode_rows::tests::*` | Ranges merge when they touch, a range past the kernel bound is left out, the bound mirrors the kernel's. |
 | `reclaim::tests::*` | Reuse keys on the started word; a queued, unbegun invocation holds no slot; a later start on any row completes every earlier invocation; an enqueued, unbegun row is upcoming. |
-| `copier::tests::copies_land_their_bytes_and_report_every_id` | The copier lands every byte and reports each id once; a flush waits for all of them. |
 | `residency_rows::tests::*` | A wave's decode rows, verify segments and prompts' last rows, as ranges. |
 | `cuda_moe_bucketize_promotes_remote_experts_from_the_ring` (extended) | A prompt-only expert takes no slot without room for it, none while the stock is at the reserve, and none when there is no reserve word; a decode expert takes the reserved slot. |
 | `cache::tests::a_decode_miss_earns_the_decode_credit_but_no_reuse`, `decode_reuse_decays_on_its_own_slower_clock`, `a_one_off_decode_miss_is_evicted_before_a_reused_expert`, `a_prefill_elevation_keeps_the_experts_decode_reuse` | §3.2 item 6's two-term score. |

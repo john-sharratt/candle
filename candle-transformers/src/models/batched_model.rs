@@ -362,6 +362,28 @@ pub trait BatchedModelCore {
         None
     }
 
+    /// The expert cache's `(hits, misses)` tallies so far, unsettled
+    /// (`ExpertCache::hit_counts`) — the per-step read, where
+    /// [`Self::expert_stats`] waits for the pipeline thread.
+    fn expert_hit_counts(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// The expert cache's residency references over the interval the counters
+    /// cover, `(lru, min)` (`ExpertCache::hit_references`), if this model has
+    /// one.
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        None
+    }
+
+    /// Fail the segment just swept if the expert cache's workers gave a cold
+    /// expert up (`WaveSweep::take_device_fault`, through
+    /// `ExpertCache::take_segment_fault`, which waits for the device only when
+    /// the cache can fault); `Ok` for a model without one, which has nothing the
+    /// device can give up. Required, so a model gaining an expert cache states
+    /// it.
+    fn take_device_fault(&self) -> Result<()>;
+
     /// The wave transient tier a prefill of `rows` rows across `sequences`
     /// would need, in bytes, with its attention launch carving the pre-stage,
     /// carry and resume table of chunks of `stage_q_lens` rows at

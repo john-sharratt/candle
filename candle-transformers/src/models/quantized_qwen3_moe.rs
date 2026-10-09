@@ -20,7 +20,7 @@ use super::dense_span;
 use super::expert_lre::ExpertCacheSetup;
 #[cfg(feature = "cuda")]
 use super::expert_lre::{layer_geometries, minimum_resident_slots, slot_bytes_for};
-use super::expert_lre::{ExpertCache, MmapExpertRef, PipelineStats, ProfileSnapshot};
+use super::expert_lre::{ExpertCache, LookAhead, MmapExpertRef, PipelineStats, ProfileSnapshot};
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
 #[cfg(feature = "cuda")]
 use super::profile::{pipeline_record, profile_now};
@@ -216,13 +216,14 @@ impl SparseMoeBlock {
             .gate
             .forward_dynamic(acts.as_dynamic(), out_dtype)?
             .reshape((num_tokens, ()))?;
-        self.forward_with_logits(router_logits, acts, out_dtype, decode, wave)
+        self.forward_with_logits(router_logits, acts, out_dtype, decode, wave, &[])
     }
 
     /// [`Self::forward_dynamic`] from router logits the caller already projected —
     /// `[num_tokens, n_experts]`, rows at any pitch with unit-stride columns, so a router
     /// that shared its launch with other projections of the same activation hands over
-    /// its columns of the wider row in place.
+    /// its columns of the wider row in place. `look_ahead`, when given, is the next
+    /// rows' routers from the same launch ([`ExpertCache::forward_routed`]).
     #[cfg(feature = "cuda")]
     pub(crate) fn forward_with_logits<'w>(
         &self,
@@ -231,6 +232,7 @@ impl SparseMoeBlock {
         out_dtype: DType,
         decode: &DecodeRows,
         wave: Option<&'w WaveGeneration>,
+        look_ahead: &[LookAhead<'_>],
     ) -> Result<LiveTensor<'w>> {
         let (b_size, seq_len, hidden_dim) = match &acts {
             DynamicActs::Float(t) => t.dims3()?,
@@ -285,6 +287,7 @@ impl SparseMoeBlock {
             decode,
             out_dtype,
             wave,
+            look_ahead,
         )?;
         debug_assert_eq!(ys.dim(1)?, hidden_dim);
         ys.reshape((b_size, seq_len, hidden_dim))
@@ -648,6 +651,24 @@ impl BatchedModelCore for ModelWeights {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.expert_cache.as_ref().map(|cache| cache.expert_stats())
+    }
+
+    fn expert_hit_counts(&self) -> Option<(usize, usize)> {
+        self.expert_cache.as_ref().map(|cache| cache.hit_counts())
+    }
+
+    fn expert_hit_references(&self) -> Option<(f64, f64)> {
+        self.expert_cache
+            .as_ref()
+            .and_then(|cache| cache.hit_references())
+    }
+
+    fn take_device_fault(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Some(cache) = self.expert_cache.as_ref() {
+            cache.take_segment_fault(self.device())?;
+        }
+        Ok(())
     }
 
     fn request_kv_ground(&self, regions: usize) -> u64 {

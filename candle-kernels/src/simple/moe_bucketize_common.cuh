@@ -58,7 +58,10 @@ struct DecodeRanges {
     const uint64_t* promo_victims, const uint64_t* promo_retarget,                            \
     const uint32_t* slot_owner, const uint64_t zone_end, const uint64_t zone_slot_bytes,      \
     const uint32_t zone_slots, const int32_t row, uint64_t* __restrict__ remote_dst,          \
-    uint64_t* started_rows, const uint64_t ticket
+    uint64_t* started_rows, const uint64_t ticket, const uint32_t* ahead_window,              \
+    const uint32_t* ahead_depth, const uint32_t* ahead_n, const uint32_t* ahead_list,         \
+    const uint64_t* ahead_src, const uint32_t ahead_cap, const int32_t rows,                  \
+    const uint64_t* row_layout, uint64_t* ahead_items, uint32_t* ahead_done
 
 // The tile order's rank of each class: pinned, then cold, then VRAM.
 __device__ __forceinline__ int class_rank(uint8_t cls) {
