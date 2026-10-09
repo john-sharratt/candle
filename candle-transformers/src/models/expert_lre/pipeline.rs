@@ -32,6 +32,7 @@
 //! the [`Residency`] lock, which also writes the live table.
 
 use super::ahead_pins::{AheadPins, Candidate};
+use super::blend::{cell_axes, gather, CellTable, MARKOV_MIN_CONF};
 use super::cache::{ExpertCacheInner, DECODE_RECENCY_DECAY};
 use super::dispatch::{AbortWord, PassState, SummaryRing};
 use super::fault::FaultWord;
@@ -39,13 +40,14 @@ use super::pinned::LayerGeometry;
 use super::promo::{ticket_from_word, PromotionRing, Victim, AHEAD_CAP};
 use super::read_ahead::{listing_readable, median, read_ahead_window, READ_AHEAD_DEPTH};
 use super::reclaim::ReclaimClock;
+use super::regret::{eviction_costs, just_ahead, prediction_band, RegretLedger, VictimTag, TAGS};
 use super::residency::{Fallback, Residency};
 use super::routing_trace::RoutingTrace;
 use super::slot_image::{build_slot_view, slot_offsets};
 use super::stager::StagerMsg;
 use super::transition::{TransitionMatrix, HOPS};
 use super::types::{PipelineMessage, PipelineStats, RoutedLayer};
-use super::votes::{ranked, VoteRing};
+use super::votes::{ranked, VoteRing, Votes};
 use crate::models::profile::{profile_now, ProfileAccumulator};
 use candle::{Device, Result};
 use candle_kernels::simple::moe_bucketize::AHEAD_MAX;
@@ -197,6 +199,29 @@ fn split_ahead(pending: Vec<DevicePromotion>) -> (Vec<DevicePromotion>, Vec<Devi
     pending.into_iter().partition(|p| p.ahead)
 }
 
+/// One prediction for a row ahead, kept until that row's routing judges it: the
+/// look-ahead's own list (for its precision and recall), every candidate any
+/// predictor proposed that a copy could serve, with its cell (`blend`), the
+/// list used, which of the row's experts were held — resident or being
+/// promoted — when it was made, so the list is also judged on the experts a
+/// copy could have served, and the held experts a predictor named, with their
+/// cell: what an eviction of one of them knew it was throwing away (`regret`).
+#[derive(Clone, Debug, Default)]
+struct Prediction {
+    votes: Option<Vec<usize>>,
+    candidates: Vec<(usize, usize)>,
+    selected: Vec<usize>,
+    held: Vec<bool>,
+    held_named: Vec<(usize, usize)>,
+}
+
+/// Markov candidates proposed per row ahead — past any cap, so the cells see
+/// Markov's weaker evidence too.
+const MARKOV_CANDIDATES: usize = 64;
+
+/// Recently routed candidates proposed per row ahead, for the same reason.
+const RECENT_CANDIDATES: usize = 64;
+
 /// A slot the GPU is filling with a missed expert: whole once invocation
 /// `ticket` has completed.
 struct DevicePromotion {
@@ -244,7 +269,11 @@ const AHEAD_PIN_SHARE: usize = 8;
 /// the pad — one layer of slots, shared with every demand row — is what
 /// bounds it. A row past that is listed for read-ahead as well and takes the
 /// ring's list (`AHEAD_CAP`).
-const STAGE_CAP: usize = 32;
+///
+/// 48 so the look-ahead's margin picks (`LOOK_AHEAD_MARGIN`) reach the stager:
+/// at 32 a verify wave's routed picks alone filled the list. See the margin for
+/// what the pair measured.
+const STAGE_CAP: usize = 48;
 
 /// The score a non-resident expert needs to be predicted for its row from
 /// decode's own history (`scored_absent`): a decode routing credits 1.0 and a
@@ -331,9 +360,15 @@ pub(crate) struct PipelineState {
     /// (`ExpertCache::hit_references`).
     trace: Arc<Mutex<RoutingTrace>>,
     /// The router look-ahead's votes (`votes`), and per row and hop the latest
-    /// prediction they made for it, which the row's routing judges.
+    /// prediction made for it, which the row's routing judges.
     votes: Arc<VoteRing>,
-    voted: Vec<[Option<Vec<usize>>; HOPS]>,
+    pending: Vec<[Option<Prediction>; HOPS]>,
+    /// What each combination of evidence has been worth, per hop (`blend`).
+    cells: CellTable,
+    /// Claimed victims awaiting their row's next routing (`regret`), and the
+    /// latest measured mean pack read — what a pack-only miss waits on.
+    regret: RegretLedger,
+    pack_read_secs: Option<f64>,
     /// Timing accumulator for pipeline spans.
     pub(crate) profile: ProfileAccumulator,
     /// Shared telemetry counters (always-on).
@@ -414,7 +449,10 @@ impl PipelineState {
             landed_ahead,
             trace,
             votes,
-            voted: vec![Default::default(); num_moe_layers],
+            pending: vec![Default::default(); num_moe_layers],
+            cells: CellTable::default(),
+            regret: RegretLedger::new(num_moe_layers),
+            pack_read_secs: None,
             profile: ProfileAccumulator::new(),
             stats,
         })
@@ -437,6 +475,7 @@ impl PipelineState {
             if self.pass.is_some() {
                 self.transition_matrix.reset_pass();
                 self.set_read_ahead_window();
+                self.set_eviction_order();
             }
             self.pass = Some(msg.pass);
             self.last_summary = None;
@@ -499,6 +538,27 @@ impl PipelineState {
                 .collect();
             t.push(row, &routed, row < self.inner.pinned_layers);
         }
+        // Claims are judged, and the row's visit recorded, by decode routing
+        // alone: a prompt launch routes most of the row, so it would count
+        // nearly every victim routed again and mark nearly every resident just
+        // hit — the regret rates that order eviction (`set_eviction_order`)
+        // and the recency passes would learn the prompt, not decode.
+        if !msg.prefill_width {
+            let v = self.regret.judge(row, msg.ticket, &expert_ids);
+            if let Ok(mut s) = self.stats.lock() {
+                for k in 0..2 {
+                    s.claim_evicted[k] += v.evicted[k];
+                    s.claim_regretted[k] += v.regretted[k];
+                    s.claim_promoted[k] += v.promoted[k];
+                    s.claim_paid[k] += v.paid[k];
+                }
+                for t in 0..TAGS {
+                    s.victim_tag_evicted[t] += v.tag_evicted[t];
+                    s.victim_tag_regretted[t] += v.tag_regretted[t];
+                }
+            }
+            self.inner.mark_visit(row, &expert_ids);
+        }
 
         // ── Read-ahead precision: of the experts read ahead for this row, the
         // ones it routed ──
@@ -525,19 +585,56 @@ impl PipelineState {
         }
         self.speculative_loads.retain(|&(l, _)| l != row);
 
-        // ── The router look-ahead's latest predictions for this row, judged ──
+        // ── The latest predictions for this row, judged — by decode routing
+        // only, for the cells learn what decode's next rows route; a prompt
+        // reaching the row first discards them ──
         for hop in 1..=HOPS {
-            let Some(predicted) = self.voted[row][hop - 1].take() else {
+            let Some(p) = self.pending[row][hop - 1].take() else {
                 continue;
             };
-            let hits = predicted
+            if msg.prefill_width {
+                continue;
+            }
+            let routed = |e: &usize| expert_ids.binary_search(e).is_ok();
+            let (mut union_hits, mut markov, mut recent) = (0, (0, 0), (0, 0));
+            for &(e, cell) in &p.candidates {
+                let hit = routed(&e);
+                self.cells.record(hop, cell, hit);
+                union_hits += usize::from(hit);
+                let (_, m, r) = cell_axes(cell);
+                if m > 0 {
+                    markov.0 += 1;
+                    markov.1 += usize::from(hit);
+                }
+                if r {
+                    recent.0 += 1;
+                    recent.1 += usize::from(hit);
+                }
+            }
+            let selected_hits = p.selected.iter().filter(|e| routed(e)).count();
+            let copy_routed = expert_ids
                 .iter()
-                .filter(|e| expert_ids.binary_search(e).is_ok())
+                .filter(|&&e| !p.held.get(e).copied().unwrap_or(false))
                 .count();
             if let Ok(mut s) = self.stats.lock() {
-                s.lookahead_judged[hop - 1] += predicted.len();
-                s.lookahead_hits[hop - 1] += hits;
+                let h = hop - 1;
+                if let Some(votes) = &p.votes {
+                    s.lookahead_judged[h] += votes.len();
+                    s.lookahead_hits[h] += votes.iter().filter(|e| routed(e)).count();
+                    s.lookahead_routed[h] += expert_ids.len();
+                }
+                s.copy_routed[h] += copy_routed;
+                s.union_hits[h] += union_hits;
+                s.markov_judged[h] += markov.0;
+                s.markov_hits[h] += markov.1;
+                s.recent_judged[h] += recent.0;
+                s.recent_hits[h] += recent.1;
+                s.selected_judged[h] += p.selected.len();
+                s.selected_hits[h] += selected_hits;
             }
+        }
+        if let Ok(mut s) = self.stats.lock() {
+            s.cells = self.cells;
         }
 
         // The predictor learns from decode routing alone: a prompt launch
@@ -668,7 +765,7 @@ impl PipelineState {
             let t = profile_now();
             if !msg.prefill_width && (decode.len() == expert_ids.len() || !prompt_room) {
                 let wide = expert_ids.len() * 2 >= self.inner.experts_per_layer.max(1);
-                self.predict_rows(row, &expert_ids, votes.as_deref(), wide)?;
+                self.predict_rows(row, &expert_ids, votes.as_ref(), wide)?;
             }
             self.profile.record("pipe_prefetch", t);
         }
@@ -726,6 +823,14 @@ impl PipelineState {
                 // stager evict a pad copy it names.
                 self.residency()?.device_evicted(vr, ve);
                 self.release_offer(&offer)?;
+                let tag = self.victim_tag(vr, ve);
+                self.regret.evicted(
+                    vr,
+                    ve,
+                    logged.ahead,
+                    ticket_from_word(logged.word, near),
+                    tag,
+                );
                 claimed += 1;
             }
             taken += 1;
@@ -737,6 +842,12 @@ impl PipelineState {
                 self.speculative_loads.insert((logged.row, logged.expert));
             }
             self.promoting.insert((logged.row, logged.expert));
+            self.regret.promoted(
+                logged.row,
+                logged.expert,
+                logged.ahead,
+                ticket_from_word(logged.word, near),
+            );
             self.device_promotions.push(DevicePromotion {
                 row: logged.row,
                 expert: logged.expert,
@@ -799,13 +910,13 @@ impl PipelineState {
                 && keys[slot].is_some_and(|(r, e)| !promoting.contains(&(r, e)))
         };
         let ask = 2 * n;
-        let mut slots = self.inner.rank_victims(row, ask, false, |slot, layer| {
-            !upcoming[layer] && candidate(slot)
-        });
+        let mut slots = self
+            .inner
+            .rank_victims(row, ask, |slot, layer| !upcoming[layer] && candidate(slot));
         if slots.len() < ask {
             let more = self
                 .inner
-                .rank_victims(row, ask - slots.len(), false, |slot, layer| {
+                .rank_victims(row, ask - slots.len(), |slot, layer| {
                     upcoming[layer] && candidate(slot)
                 });
             slots.extend(more);
@@ -1021,6 +1132,7 @@ impl PipelineState {
         self.device_promotions = ahead;
         for p in demand {
             self.promoting.remove(&(p.row, p.expert));
+            self.regret.withdraw_promotion(p.row, p.expert);
             if let Some(ring) = &self.promo_ring {
                 ring.clear_mark(p.row, p.expert);
             }
@@ -1112,12 +1224,7 @@ impl PipelineState {
             let predicted = &self.predicted[row];
             let mut candidates = Vec::with_capacity(predicted.len().min(AHEAD_CAP));
             for &e in predicted {
-                let resident = self
-                    .inner
-                    .key_to_slot
-                    .get(&(row, e))
-                    .is_some_and(|&s| self.inner.slots[s].is_some());
-                if resident || self.promoting.contains(&(row, e)) {
+                if self.is_held(row, e) {
                     continue;
                 }
                 let p = places.place(row, e);
@@ -1221,6 +1328,45 @@ impl PipelineState {
         Ok(())
     }
 
+    /// What was known of `row`'s expert `e` as a claim evicts it: the best
+    /// measured probability a live prediction for the row gave it (bands below
+    /// and from one half), whether the row routed it on its last visit,
+    /// whether the row lies just ahead of the one last served, and whether a
+    /// warm copy backs it. "Last visit" and "last served" are as this thread
+    /// has processed them: while it trails the GPU, a claim from a later
+    /// invocation is tagged against the visit before.
+    fn victim_tag(&self, row: usize, e: usize) -> VictimTag {
+        let best = self.pending[row]
+            .iter()
+            .enumerate()
+            .filter_map(|(h, p)| Some((h + 1, p.as_ref()?)))
+            .flat_map(|(hop, p)| {
+                p.held_named
+                    .iter()
+                    .filter(move |&&(x, _)| x == e)
+                    .map(move |&(_, cell)| self.cells.probability(hop, cell))
+            })
+            .fold(None, |m: Option<f64>, p| Some(m.map_or(p, |m| m.max(p))));
+        let n = self.num_moe_layers;
+        let served = self.last_summary.map_or(row, |(_, r)| r);
+        VictimTag {
+            predicted: prediction_band(best),
+            hit_last: self.inner.hit_last_visit(row, e),
+            ahead: just_ahead(row, served, n),
+            warm: self.inner.is_warm_backed(row, e),
+        }
+    }
+
+    /// Whether `row`'s expert `e` is resident or being promoted: listing it
+    /// would buy no copy.
+    fn is_held(&self, row: usize, e: usize) -> bool {
+        self.inner
+            .key_to_slot
+            .get(&(row, e))
+            .is_some_and(|&s| self.inner.slots[s].is_some())
+            || self.promoting.contains(&(row, e))
+    }
+
     /// `row`'s experts not in VRAM that decode routed recently — a score of at
     /// least `min` (`RECENT_MIN_SCORE`: within the last few steps) — highest
     /// first, at most `cap`: what the zone let go of and the next step is
@@ -1243,65 +1389,90 @@ impl PipelineState {
     }
 
     /// Predict the experts the next rows will need, out to the last row a
-    /// launch reads ahead for, each hop's candidates in order of evidence up
-    /// to the hop's cap:
+    /// launch reads ahead for. Each hop's candidates come from three
+    /// predictors:
     ///
     /// 1. the router look-ahead's votes (`votes`) — that row's own router
-    ///    applied to this layer's input, most-voted first;
+    ///    applied to this layer's input, its margin picks included;
     /// 2. for a narrow launch, the Markov table from this row's routing to the
-    ///    hop's arrivals (`transition`) — a launch routing most of the row
-    ///    (`wide`) leaves it nothing specific to imply;
+    ///    hop's arrivals (`transition`), with its confidence — a launch routing
+    ///    most of the row (`wide`) leaves it nothing specific to imply;
     /// 3. the target row's experts the zone let go of that decode routed
     ///    recently (`scored_absent`) — any scored one for a wide launch, which
     ///    will route most of that row too.
     ///
+    /// The list is their union ranked by what each combination of evidence has
+    /// been worth (`blend`), cut at the hop's cap — not the predictors in turn.
+    /// In turn, the votes filled every cap and the Markov table never reached a
+    /// list, though a strong Markov prediction alone is routed more often than a
+    /// one-token vote from hop 3 on, and the two agreeing more often than
+    /// either: on Qwen3.8-Flash-Next 92% at hop 1, 86% at hop 5. Ranked by the
+    /// cells, the same candidates gave hops 3–5 recall 26/24/22 → 35/34/34% and
+    /// precision 55–63 → 84–85% at ×8, and 38/35/31 → 43/41/38% recall at ×1;
+    /// ×1 decode rose 28.5–31.6 → 35.3 t/s (warm), ×8 to 96.0 and 106.1.
+    ///
     /// A wrong prediction costs a pad slot or a ring offer and the link time
-    /// its window allowed, never correctness.
+    /// its window allowed, never correctness. Every candidate is kept to be
+    /// judged by the row's routing (`Prediction`), so the cells learn from the
+    /// whole set, not just the list.
     fn predict_rows(
         &mut self,
         row: usize,
         current: &[usize],
-        votes: Option<&[u32]>,
+        votes: Option<&Votes>,
         wide: bool,
     ) -> Result<()> {
         let width = self.inner.experts_per_layer;
-        let voted_hops = votes.map_or(0, |v| v.len() / width.max(1));
+        let voted_hops = votes.map_or(0, |v| v.hops(width));
         for hop in 1..=HOPS {
             let target = row + hop;
             if target >= self.num_moe_layers {
                 break;
             }
             let cap = prediction_cap(hop);
-            let mut predicted = Vec::with_capacity(cap);
-            let push = |e: usize, predicted: &mut Vec<usize>| {
-                if predicted.len() < cap && !predicted.contains(&e) {
-                    predicted.push(e);
-                }
+            let hop_votes = votes
+                .filter(|_| hop <= voted_hops)
+                .map(|v| v.hop(hop, width));
+            let by_votes = votes
+                .filter(|_| hop <= voted_hops)
+                .map(|v| ranked(&v.words, width, hop, cap));
+            let markov = if wide {
+                Vec::new()
+            } else {
+                self.transition_matrix.candidates(
+                    row,
+                    hop,
+                    current,
+                    MARKOV_MIN_CONF,
+                    MARKOV_CANDIDATES,
+                )
             };
-            if let Some(v) = votes.filter(|_| hop <= voted_hops) {
-                let by_votes = ranked(v, width, hop, cap);
-                self.voted[target][hop - 1] = Some(by_votes.clone());
-                by_votes.into_iter().for_each(|e| push(e, &mut predicted));
-            }
-            if !wide {
-                for e in self.transition_matrix.predict_hop(row, hop, current, cap) {
-                    push(e, &mut predicted);
-                }
-            }
             let min = if wide {
                 f32::MIN_POSITIVE
             } else {
                 RECENT_MIN_SCORE
             };
-            for e in self.scored_absent(target, min, cap) {
-                push(e, &mut predicted);
-            }
-            if predicted.is_empty() {
+            let recent = self.scored_absent(target, min, RECENT_CANDIDATES);
+            let held: Vec<bool> = (0..width).map(|e| self.is_held(target, e)).collect();
+            // Only an expert a copy could serve is listed: a held one would
+            // spend a slot of the cap and buy nothing.
+            let (named_held, candidates): (Vec<_>, Vec<_>) = gather(hop_votes, &markov, &recent)
+                .into_iter()
+                .partition(|c| held[c.expert]);
+            let selected = self.cells.select(hop, &candidates, cap);
+            self.pending[target][hop - 1] = Some(Prediction {
+                votes: by_votes,
+                candidates: candidates.iter().map(|c| (c.expert, c.cell)).collect(),
+                selected: selected.clone(),
+                held,
+                held_named: named_held.iter().map(|c| (c.expert, c.cell)).collect(),
+            });
+            if selected.is_empty() {
                 continue;
             }
             // A pinned layer's experts are all resident; `predict_ahead`
             // passes it over.
-            self.predict_ahead(target, &predicted)?;
+            self.predict_ahead(target, &selected)?;
         }
         Ok(())
     }
@@ -1321,6 +1492,32 @@ impl PipelineState {
         }
         if let Ok(mut s) = self.stats.lock() {
             s.ahead_window = self.window as usize;
+        }
+    }
+
+    /// Order the eviction passes by each class's expected miss cost — its
+    /// running regret rate (`regret`) times what restoring one costs: the copy
+    /// over the link for a warm-backed expert (one image at the measured link
+    /// rate), and the pack read the layer then waits on (the stager's mean,
+    /// latest measured) plus that copy for a pack-only one. Before the first
+    /// pack read is measured the default order stands.
+    fn set_eviction_order(&mut self) {
+        if let Ok(s) = self.stats.lock() {
+            if let Some(read) = s.pack_reads.mean_secs() {
+                self.pack_read_secs = Some(read);
+            }
+        }
+        let Some(read) = self.pack_read_secs else {
+            return;
+        };
+        if self.link_rate <= 0.0 {
+            return;
+        }
+        let copy = self.image_bytes as f64 / self.link_rate;
+        let cost = eviction_costs(self.regret.class_rates(), copy, read);
+        self.inner.set_eviction_costs(cost);
+        if let Ok(mut s) = self.stats.lock() {
+            s.eviction_cost_us = cost.map(|c| c * 1e6);
         }
     }
 

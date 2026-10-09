@@ -66,13 +66,14 @@
 //! 3.6-35B it returns 943 MiB of pinned host RAM to the evictable set — the
 //! only set that generates misses — and the same again on disk.
 //!
-//! ### Windowed prefetch eviction
+//! ### Evicting behind the wave
 //!
-//! Speculative promotion takes free slots first, and may make room only from
-//! the **furthest-behind** layers (`cache::PREFETCH_EVICT_WINDOW`), never the
-//! wrapped tail of the pass. Near-future layers are structurally out of its
-//! reach, so a mispredicted prefetch cannot displace an expert this sweep is
-//! about to need.
+//! Every promotion — a demand miss's or a read-ahead copy's — takes empty slots
+//! first, then the promotion ring's ranked victims. The ranking scales each
+//! resident's frequency by how far behind the wave its layer lies, fading from
+//! L−1 (the least protected) back round the wrap to the layers about to run
+//! (`cache::behind_protection`), so a mispredicted read-ahead is paid for from
+//! the layers the wave has left, not from the ones it is about to route.
 //!
 //! ## Transition matrix and speculative prefetch
 //!
@@ -88,14 +89,14 @@
 //! likely *non-cached* experts for the next layer: those with a pinned copy are
 //! promoted while the current layer computes, cold ones are staged into the pad.
 //!
-//! The fan-out is **not** a fixed top-`K`.  Each candidate must clear a
-//! per-source relative confidence floor, ranked by pointwise mutual
-//! information and capped at a fixed maximum, so depth tracks demand
-//! *diversity* rather than demand *width* — see [`transition`] for why the cap
-//! must not scale with the batch.
+//! The Markov tables are one of three predictors: each row ahead's list is the
+//! union of the router look-ahead's votes, the tables' candidates (with their
+//! per-source confidence) and recent decode routing, ranked by what each
+//! combination of evidence has measured to be worth and cut at a cap
+//! ([`blend`]).
 //!
 //! Correct predictions turn misses into hits.  Incorrect ones occupy a slot the
-//! windowed eviction above will reclaim, taken from layers the wave has already
+//! eviction above will reclaim, taken first from layers the wave has already
 //! left.
 //!
 //! Prediction is worth nothing at prefill width, where the next layer routes to
@@ -127,6 +128,7 @@
 //! | `startup`      | building or reusing the pack, and the startup fill |
 //! | `read_ahead`, `ahead_pins`, `link_rate` | read-ahead's window, pad pins and the link it is sized from |
 //! | `votes`        | the router look-ahead's per-hop votes, beside the summary ring |
+//! | `blend`        | one prediction list from votes, Markov and recency, ranked by learned cells |
 //! | `fault`        | the word a launch reports a lost cold expert in, and the forward's error |
 //! | `belady`, `routing_trace`, `replay` | the residency references and the offline policy replay |
 //! | [`handle`]     | `ExpertCache` public API |
@@ -136,6 +138,9 @@
 mod ahead_pins;
 /// Belady's optimal hit rate over a recorded routing — the residency ceiling.
 mod belady;
+/// One prediction list from the votes, Markov and recency, ranked by what each
+/// combination of evidence has been worth.
+mod blend;
 #[cfg(feature = "cuda")]
 mod boundary;
 mod cache;
@@ -186,6 +191,8 @@ mod read_latency;
 mod read_queue;
 #[cfg(feature = "cuda")]
 mod reclaim;
+/// Evictions their victim's row routes again at its next visit, by claim kind.
+mod regret;
 /// Offline replay of residency policies over a written routing trace.
 #[cfg(test)]
 mod replay;
@@ -220,6 +227,7 @@ mod weight_plan;
 
 // Re-exports — the public API of this module.
 pub use crate::models::profile::ProfileSnapshot;
+pub use blend::{cell_label, CellTable, CELLS};
 #[cfg(feature = "cuda")]
 pub use boundary::grow_tally;
 #[cfg(feature = "cuda")]
@@ -248,6 +256,7 @@ pub use handle::{
 #[cfg(feature = "cuda")]
 pub(crate) use pinned::layer_geometries;
 pub use read_latency::ReadLatency;
+pub use regret::{tag_label, TAGS};
 #[cfg(feature = "cuda")]
 pub(crate) use slot_image::slot_bytes_for;
 pub(crate) use transition::HOPS as LOOK_AHEAD_HOPS;

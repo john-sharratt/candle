@@ -68,18 +68,23 @@ extern "C" {
 
     /// Router look-ahead votes: for each of `hops` later layers' routers, laid
     /// side by side in `n_experts`-wide column runs from `first_col` of the f32
-    /// rows `logits` (`[num_tokens, row_stride]`), the count of tokens whose
-    /// top `k` names each expert, into `out` (`[hops, n_experts]` u32 —
-    /// mapped host memory), behind a system fence.
+    /// rows `logits` (`[num_tokens, row_stride]`), one word per expert —
+    /// `(tokens naming it in their top k) << 16 | (tokens naming it only in
+    /// ranks k+1 … n)` — into `out` (`[hops, n_experts]` u32, mapped host
+    /// memory), and the summed softmax probability of those picks into `mass`
+    /// (`[hops, n_experts]` f32, mapped), behind a system fence. `num_tokens`
+    /// must fit 16 bits.
     pub fn run_moe_predict_votes(
         logits: *const f32,
         out: *mut u32,
+        mass: *mut f32,
         num_tokens: i32,
         n_experts: i32,
         row_stride: i32,
         first_col: i32,
         hops: i32,
         k: i32,
+        n: i32,
         stream: *mut c_void,
     );
 

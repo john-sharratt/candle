@@ -571,6 +571,61 @@ link would otherwise be idle (a worker waiting on a cold expert). A share of 1
 against ×1 27.4 / ×8 94.8 at ½ — level within this laptop's noise. The share
 stays at ½; the copies that would pay are ones placed in idle link time only.
 
+### 0.7.4 Victim ranking — evict behind the wave, by expected miss cost
+
+Every eviction — a demand miss's claim and a read-ahead copy's alike — takes a
+lazy victim the pipeline thread ranked into the promotion ring, and the device
+retargets the victim's entries before it writes the slot (§0.7.1), so *safety*
+never depends on where the victim sits. *Which* victim is taken does. The
+ranking (`ExpertCacheInner::rank_victims`) supersedes revision 1's Rule S
+(§6.2):
+
+- **Behind the wave, fading, with the wrap.** Each resident's frequency is
+  scaled by how far behind the wave its layer lies, `f + (1 − f)·(n − dist)/n`
+  for wrapped forward distance `dist` and floor `f = 0.25`
+  (`cache::behind_protection`, `cache::FADE_FLOOR`). L−1, the layer just
+  executed and the one whose next use is a full pass away, is protected least;
+  each layer further back a little more; the fade wraps, so at the start of a
+  pass the layers just behind are the previous pass's last, and as the wave
+  advances the eviction front moves onto the early layers it has left. The
+  layers about to run keep nearly their whole score, so a read-ahead copy for
+  a row ahead is bought from the layers the wave has left.
+- **Distance steers, frequency decides.** The fade spans about `1/f` (4×): a
+  hot expert just behind outlasts a cold one about to run, because the next
+  pass needs it. The full fade (`f = 0`, `n×`) evicted exactly those and raised
+  the share of victims routed again at their next visit by 3–4 points at ×8
+  (`FADE_FLOOR` records the measurement).
+- **Passes by eviction class.** The residents fall into four classes — reload
+  tier (warm-backed or pack-only) × whether the row routed the expert on its
+  last decode visit (`ExpertCacheInner::mark_visit`) — and the ranking runs
+  over one class at a time, a later class only for the shortfall. Decode
+  routing carries over step to step — 37–63% of a row's just-routed experts are
+  routed on its next visit, against 10–21% of the rest — which a decayed
+  frequency score cannot see: ranked by it, just-routed experts were 54–82% of
+  all victims.
+- **Cheapest expected miss cost first** (`ExpertCacheInner::set_eviction_costs`):
+  each class's running regret rate (`regret::ClassRates`, the share of its
+  victims routed again at their row's next decode visit) times its restore
+  cost — the copy over the link for a warm-backed expert, and the measured
+  pack read the layer then waits on plus that copy for a pack-only one.
+  Restoring a pack-only expert costs about an order of magnitude more, so
+  pack-only classes are protected by that ratio and evicted only when that
+  much less likely to come back. Putting recency above the reload tier
+  outright halved regret at ×1–×4 (25 → 15%, 37 → 18%) but turned cheap warm
+  misses into pack reads (+23–58%) and decoded no faster; the measured costs
+  decide that trade per class, per width, per drive. Repriced at every pass
+  boundary; until a pack read is measured the passes run warm-backed first,
+  stale before just-routed. The pinned head layers are never candidates.
+- **Learned from decode only.** A prompt launch routes most of a row, so it
+  neither judges claims nor marks a visit: it would count nearly every victim
+  routed again and mark nearly every resident just hit.
+
+Tests: `cache.rs` (fade values, the walk backwards from L−1, the front
+wrapping with the wave, frequency within the fade, recency passes, cost-ordered
+passes), `regret.rs` (judging by ticket, class rates, pricing, tags).
+Measured (`regret`'s counters in the gate's decode table): regret at ×8 55 →
+50% with the recency passes, BF16×8 decode ~+7%.
+
 ### 0.7.2 Measured — the qwen36 gate (RTX 3090, PCIe 3.0, WDDM)
 
 `test_parallel_batched_forwarding_36_35b`, prefill / decode t/s, every session
@@ -1452,6 +1507,9 @@ covers every victim choice the current policy can make, including the
 ahead-of-the-wave ones (`cache.rs:704-712, 885-916`).
 
 **Rule S (speculative evictions only from rows behind, in the current pass).**
+*Superseded by §0.7.4: revision 2 has no host speculative clears — every
+eviction is a ring claim the device retargets before its write, ranked behind
+the wave with the wrap.*
 Prefetch and whole-layer streaming are issued while processing `Routed(n)` whether
 or not `n` had misses, so the GPU may be anywhere past bucketize(`n`). Their
 victims must therefore come from rows whose readers are known complete and which
@@ -1560,6 +1618,7 @@ issues the prefetch had demand misses, queue its speculative clears *before* its
 demand fills. The GPU is then held at that row's gate GEMM until those clears
 have landed, so the tail rows' next bucketize must see them. That is a change
 to the order in which one thread enqueues on one stream, nothing more.
+(Revision 2 restores the wrap, §0.7.4.)
 
 What it does not change, and so does not regress:
 - **Prefetch lead time.** Today a prefetch for row `L+1` overlapped the forward

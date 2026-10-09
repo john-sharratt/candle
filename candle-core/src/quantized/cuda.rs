@@ -7400,17 +7400,23 @@ pub fn moe_route<'w>(
 
 /// Router look-ahead votes: `rows` is a `[num_tokens, width]` f32 projection
 /// holding, from column `first_col`, `hops` later layers' router logits of
-/// `n_experts` columns each; for every hop, the count of tokens whose top `k`
-/// names each expert is written to `out` — `[hops, n_experts]` u32 at a device
-/// address (mapped host memory), behind a system fence. One launch, ordered on
-/// the launch stream like the projection that produced `rows`.
+/// `n_experts` columns each. For every hop, each token names its top `n`, and
+/// each expert's word is `(tokens naming it in their top k) << 16 | (tokens
+/// naming it only in ranks k+1 … n)` — written to `out`, `[hops, n_experts]`
+/// u32 at a device address (mapped host memory) — and its `mass`, the summed
+/// softmax probability of those picks, `[hops, n_experts]` f32 at another,
+/// behind a system fence. One launch, ordered on the launch stream like the
+/// projection that produced `rows`.
+#[allow(clippy::too_many_arguments)]
 pub fn moe_predict_votes(
     rows: &LiveTensor<'_>,
     first_col: usize,
     hops: usize,
     n_experts: usize,
     k: usize,
+    n: usize,
     out: u64,
+    mass: u64,
 ) -> Result<()> {
     use crate::cuda_backend::CudaStorageSlice;
 
@@ -7418,8 +7424,12 @@ pub fn moe_predict_votes(
     if hops == 0 || num_tokens == 0 {
         return Ok(());
     }
-    if n_experts > 512 || k == 0 || k > n_experts {
-        crate::bail!("moe_predict_votes: n_experts={n_experts}, k={k} out of range");
+    if n_experts > 512 || k == 0 || n < k || n > n_experts {
+        crate::bail!("moe_predict_votes: n_experts={n_experts}, k={k}, n={n} out of range");
+    }
+    // Each half of a vote word counts tokens.
+    if num_tokens > u16::MAX as usize {
+        crate::bail!("moe_predict_votes: {num_tokens} tokens overflow a 16-bit vote count");
     }
     if first_col + hops * n_experts > width {
         crate::bail!(
@@ -7451,18 +7461,20 @@ pub fn moe_predict_votes(
     let stream = device.cuda_stream();
     let v = s.slice(o1..o2);
     let (lp, _lg) = v.device_ptr(&stream);
-    // SAFETY: `lp` covers every row read; `out` is `hops × n_experts` u32 the
-    // caller owns for the launch's lifetime.
+    // SAFETY: `lp` covers every row read; `out` and `mass` are `hops ×
+    // n_experts` u32 and f32 the caller owns for the launch's lifetime.
     unsafe {
         candle_kernels::simple::moe_scatter::run_moe_predict_votes(
             lp as *const f32,
             out as *mut u32,
+            mass as *mut f32,
             num_tokens as i32,
             n_experts as i32,
             row_stride as i32,
             first_col as i32,
             hops as i32,
             k as i32,
+            n as i32,
             stream.cu_stream() as *mut std::ffi::c_void,
         );
     }

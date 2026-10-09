@@ -3,8 +3,10 @@
 //! These types are used across all submodules — cache bookkeeping, the
 //! pipeline thread's messages and telemetry, and the public API.
 
+use super::blend::CellTable;
 use super::compute::QMatMul;
 use super::read_latency::ReadLatency;
+use super::regret::TAGS;
 use super::transition::HOPS as LOOK_AHEAD_HOPS;
 use crate::models::profile::{ProfileMark, ProfileSnapshot};
 use candle::quantized::GgmlDType;
@@ -55,6 +57,10 @@ pub struct PipelineStats {
     /// Of the experts staged ahead, those their row then routed — over
     /// `staged_speculative`, the stager's lookahead precision.
     pub staged_ahead_routed: usize,
+    /// Of the reads staged ahead, those the pipeline's predictions asked for
+    /// (the rest are the stager's own lookahead), and of them the ones routed.
+    pub staged_predicted: usize,
+    pub staged_predicted_routed: usize,
     /// Of the experts staged ahead, those read-ahead listed from the pad as
     /// they landed — in time for a launch to read them ahead of their row.
     pub staged_listed: usize,
@@ -98,6 +104,45 @@ pub struct PipelineStats {
     /// routing, and of them the ones it routed.
     pub lookahead_judged: [usize; LOOK_AHEAD_HOPS],
     pub lookahead_hits: [usize; LOOK_AHEAD_HOPS],
+    /// The experts those judged rows routed — recall's denominator, so a wider
+    /// prediction shows what it catches as well as what it wastes.
+    pub lookahead_routed: [usize; LOOK_AHEAD_HOPS],
+    /// Every row ahead predicted, by hop (`blend`): the experts it routed that
+    /// were not held — resident or being promoted — when the prediction was
+    /// made, the ones a copy could serve. Recall's denominator for each list
+    /// below, which name only such experts.
+    pub copy_routed: [usize; LOOK_AHEAD_HOPS],
+    /// Of the candidates any predictor proposed that a copy could serve, the
+    /// ones routed.
+    pub union_hits: [usize; LOOK_AHEAD_HOPS],
+    /// The candidates the Markov tables proposed, and the ones routed.
+    pub markov_judged: [usize; LOOK_AHEAD_HOPS],
+    pub markov_hits: [usize; LOOK_AHEAD_HOPS],
+    /// The candidates recent decode routing proposed, and the ones routed.
+    pub recent_judged: [usize; LOOK_AHEAD_HOPS],
+    pub recent_hits: [usize; LOOK_AHEAD_HOPS],
+    /// The list actually used — the cap's cut of the candidates — and the ones
+    /// routed.
+    pub selected_judged: [usize; LOOK_AHEAD_HOPS],
+    pub selected_hits: [usize; LOOK_AHEAD_HOPS],
+    /// The promotion ring's claims judged at their row's next routing
+    /// (`regret`), by claim kind — `[demand, read-ahead]`: victims evicted and
+    /// of them the ones routed again (regretted), experts promoted and of them
+    /// the ones routed again (paid).
+    pub claim_evicted: [usize; 2],
+    pub claim_regretted: [usize; 2],
+    pub claim_promoted: [usize; 2],
+    pub claim_paid: [usize; 2],
+    /// **Gauge**: each eviction class's expected miss cost in µs — its running
+    /// regret rate times its restore cost — in class order `[stale pack, stale
+    /// warm, hit pack, hit warm]`; the passes run cheapest first (`cache`).
+    pub eviction_cost_us: [f64; 4],
+    /// The victims of both kinds by what was known of them when evicted
+    /// (`regret::VictimTag`), and of them the ones routed again.
+    pub victim_tag_evicted: [usize; TAGS],
+    pub victim_tag_regretted: [usize; TAGS],
+    /// The blend's learned cells, as the pipeline thread holds them.
+    pub cells: CellTable,
     /// Experts read ahead that their row then routed. Numerator of prediction
     /// precision.
     pub predicted_hits: usize,
@@ -208,6 +253,8 @@ impl PipelineStats {
             s.staged_speculative = 0;
             s.stage_requests = 0;
             s.staged_ahead_routed = 0;
+            s.staged_predicted = 0;
+            s.staged_predicted_routed = 0;
             s.staged_listed = 0;
             s.staged_bytes = 0;
             s.stage_read_ns = 0;
@@ -221,6 +268,21 @@ impl PipelineStats {
             s.predicted_total = 0;
             s.lookahead_judged = [0; LOOK_AHEAD_HOPS];
             s.lookahead_hits = [0; LOOK_AHEAD_HOPS];
+            s.lookahead_routed = [0; LOOK_AHEAD_HOPS];
+            s.copy_routed = [0; LOOK_AHEAD_HOPS];
+            s.union_hits = [0; LOOK_AHEAD_HOPS];
+            s.markov_judged = [0; LOOK_AHEAD_HOPS];
+            s.markov_hits = [0; LOOK_AHEAD_HOPS];
+            s.recent_judged = [0; LOOK_AHEAD_HOPS];
+            s.recent_hits = [0; LOOK_AHEAD_HOPS];
+            s.selected_judged = [0; LOOK_AHEAD_HOPS];
+            s.selected_hits = [0; LOOK_AHEAD_HOPS];
+            s.claim_evicted = [0; 2];
+            s.claim_regretted = [0; 2];
+            s.claim_promoted = [0; 2];
+            s.claim_paid = [0; 2];
+            s.victim_tag_evicted = [0; TAGS];
+            s.victim_tag_regretted = [0; TAGS];
             s.routed_messages = 0;
             s.pipeline_lag = 0;
             s.ring_taken = 0;
@@ -251,6 +313,28 @@ impl PipelineStats {
             0.0
         } else {
             100.0 * self.lookahead_hits[h - 1] as f64 / judged as f64
+        }
+    }
+
+    /// `hits / judged` in percent, 0 when nothing was judged — one hop of any
+    /// of the prediction lists above.
+    pub fn percent(hits: usize, judged: usize) -> f64 {
+        if judged == 0 {
+            0.0
+        } else {
+            100.0 * hits as f64 / judged as f64
+        }
+    }
+
+    /// The router look-ahead's recall at hop `h` (1-based), in percent: of the
+    /// experts the judged rows routed, the share it had predicted; 0 when nothing
+    /// was judged there.
+    pub fn lookahead_recall(&self, h: usize) -> f64 {
+        let routed = self.lookahead_routed[h - 1];
+        if routed == 0 {
+            0.0
+        } else {
+            100.0 * self.lookahead_hits[h - 1] as f64 / routed as f64
         }
     }
 
@@ -298,9 +382,24 @@ mod stats_tests {
                     .collect::<Vec<_>>(),
                 vec![70.0, 25.0, 0.0, 0.0, 25.0]
             );
+            s.lookahead_routed = [10, 4, 0, 0, 5];
+            assert_eq!(
+                (1..=5).map(|h| s.lookahead_recall(h)).collect::<Vec<_>>(),
+                vec![70.0, 50.0, 0.0, 0.0, 20.0]
+            );
             s.stage_read_ns = 77;
             s.pack_reads.record(250_000_000);
             s.paged_reads.record(1_000);
+            s.copy_routed = [3; 5];
+            s.selected_hits = [2; 5];
+            s.claim_evicted = [5, 6];
+            s.claim_paid = [1, 2];
+            s.victim_tag_evicted[7] = 4;
+            s.staged_predicted = 8;
+            s.staged_predicted_routed = 3;
+            s.eviction_cost_us = [1.0, 2.0, 3.0, 4.0];
+            assert_eq!(PipelineStats::percent(3, 4), 75.0);
+            assert_eq!(PipelineStats::percent(3, 0), 0.0);
         }
         PipelineStats::reset(&shared);
         let s = PipelineStats::snapshot(&shared);
@@ -322,7 +421,32 @@ mod stats_tests {
             (s.ahead_pad_claims, s.staged_listed, s.stage_requests),
             (0, 0, 0)
         );
-        assert_eq!((s.lookahead_judged, s.lookahead_hits), ([0; 5], [0; 5]));
+        assert_eq!(
+            (s.lookahead_judged, s.lookahead_hits, s.lookahead_routed),
+            ([0; 5], [0; 5], [0; 5])
+        );
+        assert_eq!(
+            (
+                s.copy_routed,
+                s.selected_hits,
+                s.claim_evicted,
+                s.claim_paid
+            ),
+            ([0; 5], [0; 5], [0; 2], [0; 2])
+        );
+        assert_eq!(
+            (
+                s.victim_tag_evicted[7],
+                s.staged_predicted,
+                s.staged_predicted_routed
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            s.eviction_cost_us,
+            [1.0, 2.0, 3.0, 4.0],
+            "a gauge survives the reset"
+        );
         assert_eq!(
             (s.pack_reads, s.paged_reads),
             (ReadLatency::default(), ReadLatency::default())

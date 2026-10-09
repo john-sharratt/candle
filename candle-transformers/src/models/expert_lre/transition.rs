@@ -27,18 +27,17 @@
 //! globally-popular (already-cached) targets in favour of experts *specifically*
 //! implied by the current routing.
 //!
-//! ## Prefetch — confidence-gated, diversity-adaptive depth
+//! ## Prediction — candidates with their confidence
 //!
-//! [`predict_hop`](TransitionMatrix::predict_hop) does not emit a fixed top-K.
-//! It keeps each candidate ranked by PMI whose *per-source-relative* confidence
-//! (its conditional normalized by its best source's strongest conditional —
-//! see `score_and_conf`) clears [`PREFETCH_REL_CONF`], capped at the caller's
-//! `max_k`. Per-source normalization keeps depth **scale- and batch-invariant**
-//! and ties it to demand *diversity*: a homogeneous batch (one prompt × N)
-//! implies a couple of sticky successors so prefetch stays shallow and precise;
-//! diverse demand implies many — each source nominates the successors it
-//! genuinely implies, without one sticky pair gating everyone else out — and
-//! the cap then bounds the volume.
+//! [`candidates`](TransitionMatrix::candidates) names, for row `L + h`, every
+//! successor ranked by PMI with its *per-source-relative* confidence (its
+//! conditional normalized by its best source's strongest conditional — see
+//! `score_and_conf`) at or above a floor. Per-source normalization keeps the
+//! confidence **scale- and batch-invariant**: each active expert's strongest
+//! successor reads 1.0 however flat its routing is, so one sticky pair cannot
+//! raise the bar for every other source. The pipeline does not gate on it — the
+//! blend (`blend`) weighs it beside the router look-ahead's votes and learns
+//! what each band of it is worth.
 //!
 //! ## Safety
 //!
@@ -59,18 +58,6 @@ const MIN_OBS: u32 = 64;
 /// past read-ahead's depth (`read_ahead::READ_AHEAD_DEPTH`), the last row a
 /// launch reads ahead for.
 pub(crate) const HOPS: usize = 5;
-
-/// Relative confidence floor for prefetch: an expert is prefetched only if some
-/// active source routes to it at ≥ this fraction of that source's *own*
-/// strongest successor rate (the per-source-relative confidence from
-/// `score_and_conf`).  Relative rather than absolute so it is invariant to the
-/// routing fan-out's scale — a top-8 router dilutes every per-source
-/// conditional, which an absolute floor would wrongly gate to nothing — and
-/// per-source so a single sticky pair cannot raise the bar for every other
-/// source's successors.  Prefetch depth then tracks demand *diversity*: a
-/// sharp per-source drop (homogeneous demand) keeps only each source's top one
-/// or two; flat routing (diverse demand) keeps more, up to the cap.
-const PREFETCH_REL_CONF: f32 = 0.5;
 
 /// The `[pairs × E × E]` co-occurrence matrix plus its row / column / group
 /// marginals, all flat and indexed by `pair`.
@@ -263,7 +250,7 @@ impl TransitionMatrix {
 
     /// Predict the top-`k` experts row `moe_layer_idx + 1` will most likely
     /// need, ranked by PMI and excluding the active set.  Fixed fan-out form used
-    /// only by the offline evaluation (production prefetch uses the gated form).
+    /// only by the offline evaluation (production reads [`Self::candidates`]).
     #[cfg(test)]
     pub(crate) fn predict_topk(
         &self,
@@ -280,27 +267,31 @@ impl TransitionMatrix {
         }
     }
 
-    /// Predict the experts worth *prefetching* for row `moe_layer_idx + hop`
-    /// from the experts active at row `moe_layer_idx`.
-    ///
-    /// The fan-out is not fixed: an expert is returned only if its
-    /// per-source-relative confidence clears [`PREFETCH_REL_CONF`], ranked by
-    /// PMI and capped at `max_k`. Depth tracks demand diversity through the
-    /// confidence gate (see the module docs); the cap is the caller's volume
-    /// control — what a pad or a link window has room for.
-    pub(crate) fn predict_hop(
+    /// The experts row `moe_layer_idx + hop` may need, each with its
+    /// per-source-relative confidence: every non-active candidate at a
+    /// confidence of at least `min_conf`, highest PMI first, at most `max_k`.
+    /// The confidence is the evidence a blend weighs (`blend`). Empty until
+    /// the hop's table is warm.
+    pub(crate) fn candidates(
         &self,
         moe_layer_idx: usize,
         hop: usize,
         expert_ids: &[usize],
+        min_conf: f32,
         max_k: usize,
-    ) -> Vec<usize> {
-        match self.score_and_conf(moe_layer_idx, hop, expert_ids) {
-            Some((scores, conf)) => {
-                top_k_gated(&scores, &conf, expert_ids, max_k, PREFETCH_REL_CONF)
-            }
-            None => vec![],
-        }
+    ) -> Vec<(usize, f32)> {
+        let Some((scores, conf)) = self.score_and_conf(moe_layer_idx, hop, expert_ids) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(usize, f32, f32)> = scores
+            .iter()
+            .enumerate()
+            .filter(|&(e, &s)| s > 0.0 && conf[e] >= min_conf && !expert_ids.contains(&e))
+            .map(|(e, &s)| (e, s, conf[e]))
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        out.truncate(max_k);
+        out.into_iter().map(|(e, _, c)| (e, c)).collect()
     }
 }
 
@@ -331,58 +322,6 @@ fn top_k_excluding(scores: &[f32], active: &[usize], k: usize) -> Vec<usize> {
     top.into_iter().map(|(idx, _)| idx).collect()
 }
 
-/// Like [`top_k_excluding`], but additionally drops any expert whose confidence
-/// `conf[idx]` is below `rel_conf` times the *most* confident candidate's.
-/// `conf` is per-source-relative (each source's argmax successor scores 1.0 —
-/// see `score_and_conf`), so the bar is effectively `rel_conf` itself and each
-/// active source's genuinely-implied successors clear it independently.  The
-/// cap `max_k` bounds the result; the relative gate is what makes the effective
-/// count adapt to how many experts the active set genuinely implies, without any
-/// dependence on the absolute confidence scale.
-fn top_k_gated(
-    scores: &[f32],
-    conf: &[f32],
-    active: &[usize],
-    max_k: usize,
-    rel_conf: f32,
-) -> Vec<usize> {
-    if max_k == 0 {
-        return vec![];
-    }
-    // The most-confident scoreable, non-active candidate sets the bar.
-    let mut max_c = 0.0f32;
-    for (idx, &s) in scores.iter().enumerate() {
-        if s > 0.0 && !active.contains(&idx) && conf[idx] > max_c {
-            max_c = conf[idx];
-        }
-    }
-    if max_c <= 0.0 {
-        return vec![];
-    }
-    let floor = rel_conf * max_c;
-
-    let better = |a: (usize, f32), b: (usize, f32)| a.1 > b.1 || (a.1 == b.1 && a.0 < b.0);
-    let mut top: Vec<(usize, f32)> = Vec::with_capacity(max_k + 1);
-    for (idx, &s) in scores.iter().enumerate() {
-        if s <= 0.0 || conf[idx] < floor || active.contains(&idx) {
-            continue;
-        }
-        if top.len() < max_k {
-            top.push((idx, s));
-        } else if better((idx, s), top[max_k - 1]) {
-            top[max_k - 1] = (idx, s);
-        } else {
-            continue;
-        }
-        let mut j = top.len() - 1;
-        while j > 0 && better(top[j], top[j - 1]) {
-            top.swap(j, j - 1);
-            j -= 1;
-        }
-    }
-    top.into_iter().map(|(idx, _)| idx).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +331,19 @@ mod tests {
 
     /// The production cap for the tests below — wide enough never to bind.
     const K: usize = 8;
+
+    /// The confidence the tests read the learned tables at: a successor at
+    /// least half as strong as its source's strongest.
+    const GATE: f32 = 0.5;
+
+    /// Row `row + hop`'s candidates at [`GATE`] or above, experts only, highest
+    /// PMI first, at most `k`.
+    fn gated(m: &TransitionMatrix, row: usize, hop: usize, ids: &[usize], k: usize) -> Vec<usize> {
+        m.candidates(row, hop, ids, GATE, k)
+            .into_iter()
+            .map(|(e, _)| e)
+            .collect()
+    }
 
     /// Drive `from`-at-`l` → `to`-at-`l+1` through `observe` `reps` times,
     /// resetting the pass each rep so it is a clean two-layer transition.
@@ -418,9 +370,9 @@ mod tests {
         // Prefetch stays on the capped, confidence-gated Markov path at all
         // densities — a cold model predicts nothing (no prefetch-all shortcut).
         let m = TransitionMatrix::new(4, E);
-        assert!(m.predict_hop(0, 1, &[1, 2], K).is_empty());
+        assert!(gated(&m, 0, 1, &[1, 2], K).is_empty());
         let dense: Vec<usize> = (0..E).collect();
-        assert!(m.predict_hop(0, 1, &dense, K).is_empty());
+        assert!(gated(&m, 0, 1, &dense, K).is_empty());
     }
 
     #[test]
@@ -449,6 +401,29 @@ mod tests {
         train(&mut m, 0, &[1], &[9], 20);
         train(&mut m, 0, &[1], &[11], 20);
         assert_eq!(m.predict_topk(0, &[1], 3), vec![7, 9, 11]);
+    }
+
+    /// The blend's view: every candidate over the confidence floor with its
+    /// per-source confidence, highest PMI first — 7 is its source's strongest
+    /// successor (1.0), 9 and 11 a quarter of it — the active set left out.
+    #[test]
+    fn candidates_carry_their_confidence_above_a_floor() {
+        let mut m = TransitionMatrix::new(L, E);
+        train(&mut m, 0, &[1], &[7], 80);
+        train(&mut m, 0, &[1], &[9], 20);
+        train(&mut m, 0, &[1], &[11], 20);
+        assert_eq!(
+            m.candidates(0, 1, &[1], 0.25, 8),
+            vec![(7, 1.0), (9, 0.25), (11, 0.25)]
+        );
+        assert_eq!(m.candidates(0, 1, &[1], 0.3, 8), vec![(7, 1.0)]);
+        assert_eq!(m.candidates(0, 1, &[1], 0.25, 2), vec![(7, 1.0), (9, 0.25)]);
+        assert_eq!(
+            m.candidates(0, 1, &[1, 7], 0.25, 8),
+            vec![(9, 0.25), (11, 0.25)],
+            "an active expert is not a candidate"
+        );
+        assert!(m.candidates(L - 1, 1, &[1], 0.25, 8).is_empty());
     }
 
     #[test]
@@ -483,31 +458,28 @@ mod tests {
         let mut m = TransitionMatrix::new(L, E);
         // Row 0 routes {1}, row 1 {2, 9}, row 2 {7, 9}, row 3 {4}.
         train_pass(&mut m, &[&[1], &[2, 9], &[7, 9], &[4]], 80);
-        assert_eq!(m.predict_hop(0, 1, &[1], K), vec![2, 9]);
+        assert_eq!(gated(&m, 0, 1, &[1], K), vec![2, 9]);
         assert_eq!(
-            m.predict_hop(0, 2, &[1], K),
+            gated(&m, 0, 2, &[1], K),
             vec![7, 9],
             "direct: 9 is new to row 0"
         );
-        assert_eq!(m.predict_hop(0, 3, &[1], K), vec![4]);
+        assert_eq!(gated(&m, 0, 3, &[1], K), vec![4]);
         assert_eq!(
-            m.predict_hop(1, 1, &[2, 9], K),
+            gated(&m, 1, 1, &[2, 9], K),
             vec![7],
             "9 is resident at row 1"
         );
-        assert_eq!(m.predict_hop(1, 2, &[2], K), vec![4]);
+        assert_eq!(gated(&m, 1, 2, &[2], K), vec![4]);
         assert!(
-            m.predict_hop(0, 2, &[2], K).is_empty(),
+            gated(&m, 0, 2, &[2], K).is_empty(),
             "2 was never a source at row 0"
         );
         assert!(
-            m.predict_hop(0, 4, &[1], K).is_empty(),
+            gated(&m, 0, 4, &[1], K).is_empty(),
             "row 4 was never observed"
         );
-        assert!(
-            m.predict_hop(0, 0, &[1], K).is_empty()
-                && m.predict_hop(0, HOPS + 1, &[1], K).is_empty()
-        );
+        assert!(gated(&m, 0, 0, &[1], K).is_empty() && gated(&m, 0, HOPS + 1, &[1], K).is_empty());
         assert_eq!(
             m.tables.iter().map(|t| t.grp.len()).collect::<Vec<_>>(),
             vec![5, 4, 3, 2, 1],
@@ -520,15 +492,15 @@ mod tests {
     fn each_hops_table_warms_on_its_own_arrivals() {
         let mut m = TransitionMatrix::new(L, E);
         train_pass(&mut m, &[&[1], &[2], &[3]], 70);
-        assert_eq!(m.predict_hop(0, 1, &[1], K), vec![2]);
-        assert_eq!(m.predict_hop(0, 2, &[1], K), vec![3]);
+        assert_eq!(gated(&m, 0, 1, &[1], K), vec![2]);
+        assert_eq!(gated(&m, 0, 2, &[1], K), vec![3]);
         let mut n = TransitionMatrix::new(L, E);
         train_pass(&mut n, &[&[1], &[2], &[3]], 60);
         // Row 1 → 2 also gets 60 arrivals from the (1, 2) pair — every hop-1
         // table is one table, so it crosses 64 together with (0, 1).
-        assert_eq!(n.predict_hop(0, 1, &[1], K), vec![2]);
+        assert_eq!(gated(&n, 0, 1, &[1], K), vec![2]);
         assert!(
-            n.predict_hop(0, 2, &[1], K).is_empty(),
+            gated(&n, 0, 2, &[1], K).is_empty(),
             "60 two-hop arrivals: not warm"
         );
     }
@@ -544,14 +516,14 @@ mod tests {
             m.observe(0, &[5]);
             m.observe(1, &[6]);
         }
-        assert_eq!(m.predict_hop(0, 1, &[1], K), vec![2]);
-        assert_eq!(m.predict_hop(0, 1, &[5], K), vec![6]);
+        assert_eq!(gated(&m, 0, 1, &[1], K), vec![2]);
+        assert_eq!(gated(&m, 0, 1, &[5], K), vec![6]);
         assert!(
-            m.predict_hop(0, 2, &[1], K).is_empty(),
+            gated(&m, 0, 2, &[1], K).is_empty(),
             "row 0 after row 1 restarts the pass"
         );
         assert!(
-            m.predict_hop(1, 1, &[2], K).is_empty(),
+            gated(&m, 1, 1, &[2], K).is_empty(),
             "1 → 0 is no transition"
         );
     }
@@ -579,7 +551,7 @@ mod tests {
         train(&mut m, 0, &[1], &[7], 90);
         train(&mut m, 0, &[1], &[9], 5);
         assert_eq!(m.predict_topk(0, &[1], 8), vec![7, 9]);
-        assert_eq!(m.predict_hop(0, 1, &[1], K), vec![7]);
+        assert_eq!(gated(&m, 0, 1, &[1], K), vec![7]);
     }
 
     #[test]
@@ -591,8 +563,8 @@ mod tests {
         train(&mut m, 0, &[1], &[7], 80);
         train(&mut m, 0, &[2], &[8], 80);
         train(&mut m, 0, &[3], &[9], 80);
-        assert_eq!(m.predict_hop(0, 1, &[1], K), vec![7]);
-        assert_eq!(m.predict_hop(0, 1, &[1, 2, 3], K), vec![7, 8, 9]);
+        assert_eq!(gated(&m, 0, 1, &[1], K), vec![7]);
+        assert_eq!(gated(&m, 0, 1, &[1, 2, 3], K), vec![7, 8, 9]);
     }
 
     #[test]
@@ -605,15 +577,15 @@ mod tests {
         for &s in &sources {
             train(&mut m, 0, &[s], &[s + 15], 80); // distinct target per source
         }
-        assert_eq!(m.predict_hop(0, 1, &sources, K).len(), K);
-        assert_eq!(m.predict_hop(0, 1, &sources, 3).len(), 3);
+        assert_eq!(gated(&m, 0, 1, &sources, K).len(), K);
+        assert_eq!(gated(&m, 0, 1, &sources, 3).len(), 3);
 
         // Narrow demand with many implied successors is bounded the same way.
         let mut m2 = TransitionMatrix::new(L, 32);
         for t in 16..=25 {
             train(&mut m2, 0, &[1], &[t], 20); // ten equal-confidence targets
         }
-        assert_eq!(m2.predict_hop(0, 1, &[1], K).len(), K);
+        assert_eq!(gated(&m2, 0, 1, &[1], K).len(), K);
     }
 
     #[test]
@@ -629,7 +601,7 @@ mod tests {
         train(&mut m, 0, &[2], &[8], 30);
         train(&mut m, 0, &[2], &[9], 30);
         train(&mut m, 0, &[2], &[10], 30);
-        let got = m.predict_hop(0, 1, &[1, 2], K);
+        let got = gated(&m, 0, 1, &[1, 2], K);
         for want in [7, 8, 9, 10] {
             assert!(got.contains(&want), "missing {want} in {got:?}");
         }
@@ -646,7 +618,7 @@ mod tests {
             train(&mut m, 0, &[s], &[9], 10);
             train(&mut m, 0, &[s], &[s + 10], 90);
         }
-        assert!(!m.predict_hop(0, 1, &[1], K).contains(&9));
-        assert!(!m.predict_hop(0, 1, &[1, 2, 3, 4, 5], K).contains(&9));
+        assert!(!gated(&m, 0, 1, &[1], K).contains(&9));
+        assert!(!gated(&m, 0, 1, &[1, 2, 3, 4, 5], K).contains(&9));
     }
 }

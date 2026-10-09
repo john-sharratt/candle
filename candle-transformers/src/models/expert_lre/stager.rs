@@ -34,9 +34,10 @@
 //!
 //! **Speculative staging** runs beside the demand row, so the drive keeps
 //! reading the layers ahead while a layer's workers wait on its own cold set.
-//! Its requests come from two places: the pipeline thread's predictor
-//! (confident layer-to-layer transitions, a few experts per layer), and the
-//! stager's own lookahead — when it begins a row, the next rows' highest-scored
+//! Its requests come from two places: the pipeline thread's predictions for
+//! the rows within two (`blend`'s list, router votes, Markov and recent
+//! routing ranked together), and the stager's own lookahead — when it begins
+//! a row, the next rows' highest-scored
 //! experts in its pad score table, which is what recent passes routed there. A
 //! lookahead read may only evict a slot scoring below the candidate. A
 //! speculative read never delays a demand read: the readers take demand jobs
@@ -76,6 +77,11 @@ pub(crate) const NVME_QD: usize = 8;
 /// waits for more than the reads already in flight on the other half. Three
 /// quarters measured ~4% slower on Flash-Next decode (RTX 4090 Laptop): the
 /// extra speculative reads lengthened the demand reads queued behind them.
+/// One measured worse the other way, though only 12–32% of speculative reads
+/// are then routed: the mean pack read fell ~1.04 → 0.76 ms, but the reads
+/// that do land are pack misses that never happen, and without them decode's
+/// pack misses rose 25–54% (×1–×8) and its pack-miss time with them (×8:
+/// ~15.9 → 20.5 s per interval).
 const SPEC_IN_FLIGHT: usize = NVME_QD / 2;
 
 /// Rows ahead of the one just begun that the stager's lookahead stages for.
@@ -132,14 +138,16 @@ struct ReadJob {
     source: Source,
 }
 
-/// A queued speculative read: `(row, expert)`, and the score a victim must sit
-/// below — infinite for the pipeline predictor's confident transitions, the
-/// candidate's own pad score for the stager's lookahead.
+/// A queued speculative read: `(row, expert)`, the score a victim must sit
+/// below — infinite for the pipeline's predictions (its blended list for the
+/// rows within two), the candidate's own pad score for the stager's
+/// lookahead — and which of the two asked for it.
 #[derive(Clone, Copy)]
 struct SpecRead {
     row: usize,
     expert: usize,
     floor: f32,
+    predicted: bool,
 }
 
 /// One routed row with cold experts still unpublished.
@@ -189,6 +197,9 @@ struct Stager {
     /// at most [`SPEC_IN_FLIGHT`]. One the demand row routes is promoted and
     /// leaves this map.
     spec_loads: HashMap<(usize, usize), usize>,
+    /// Speculative reads issued at the pipeline's request rather than the
+    /// lookahead's, until their row settles — to judge the two apart.
+    predicted_ahead: HashSet<(usize, usize)>,
     /// The speculative queue's head found no slot it may take: wait for the
     /// next message (a landing, a routed row, a prediction) before looking
     /// again, instead of spinning on the same answer.
@@ -262,6 +273,7 @@ pub(crate) fn spawn_stager(
         loading: HashSet::new(),
         in_flight: 0,
         spec_loads: HashMap::new(),
+        predicted_ahead: HashSet::new(),
         spec_stalled: false,
         last_row: None,
         disconnected: false,
@@ -376,11 +388,11 @@ impl Stager {
                 summary_word,
                 ticket,
             } => self.routed.push_back((row, slot, summary_word, ticket)),
-            // The pipeline's predictor is confident in a transition: its
-            // prediction may evict any slot a speculative read may.
+            // The pipeline's prediction for a row within two: it may evict
+            // any slot a speculative read may.
             StagerMsg::Stage { row, experts } => {
                 for e in experts {
-                    self.queue_spec(row, e, f32::INFINITY);
+                    self.queue_spec(row, e, f32::INFINITY, true);
                 }
             }
             StagerMsg::Landed {
@@ -467,16 +479,22 @@ impl Stager {
         }
         // The wave has reached this row: what was staged ahead for it is no
         // longer ahead, and a prediction for it not yet read is its demand's.
-        let hits = self
+        let hit: Vec<usize> = self
             .book
             .settle_row(row)
             .into_iter()
             .filter(|&e| routed[e])
+            .collect();
+        let predicted_hits = hit
+            .iter()
+            .filter(|&&e| self.predicted_ahead.contains(&(row, e)))
             .count();
+        self.predicted_ahead.retain(|&(r, _)| r != row);
         self.spec.retain(|s| s.row != row);
         self.look_ahead(row);
         if let Ok(mut s) = self.ctx.stats.lock() {
-            s.staged_ahead_routed += hits;
+            s.staged_ahead_routed += hit.len();
+            s.staged_predicted_routed += predicted_hits;
         }
         // A speculative read already in flight for one of them counts as its
         // demand read — promoted ahead of the speculative queue if no reader
@@ -528,10 +546,27 @@ impl Stager {
     }
 
     /// Queue a speculative read of `(row, expert)` unless one is queued; it may
-    /// evict only a slot scoring below `floor`.
-    fn queue_spec(&mut self, row: usize, expert: usize, floor: f32) {
-        if !self.spec.iter().any(|s| s.row == row && s.expert == expert) {
-            self.spec.push_back(SpecRead { row, expert, floor });
+    /// evict only a slot scoring below `floor`. A pipeline prediction for a
+    /// read the lookahead already queued takes it over — its floor and its
+    /// source — so it is neither dropped as not worth a slot nor counted as
+    /// the lookahead's.
+    fn queue_spec(&mut self, row: usize, expert: usize, floor: f32, predicted: bool) {
+        if let Some(s) = self
+            .spec
+            .iter_mut()
+            .find(|s| s.row == row && s.expert == expert)
+        {
+            if predicted {
+                s.floor = s.floor.max(floor);
+                s.predicted = true;
+            }
+        } else {
+            self.spec.push_back(SpecRead {
+                row,
+                expert,
+                floor,
+                predicted,
+            });
         }
     }
 
@@ -555,7 +590,7 @@ impl Stager {
                 .book
                 .top_scored(target, LOOKAHEAD_MIN_SCORE, LOOKAHEAD_PER_ROW)
             {
-                self.queue_spec(target, e, score);
+                self.queue_spec(target, e, score, false);
             }
         }
     }
@@ -698,6 +733,7 @@ impl Stager {
                 row,
                 expert: e,
                 floor,
+                predicted,
             }) = self.spec.front()
             else {
                 break;
@@ -755,8 +791,12 @@ impl Stager {
             };
             self.spec.pop_front();
             self.issue(slot, row, e, Priority::Speculative)?;
+            if predicted {
+                self.predicted_ahead.insert((row, e));
+            }
             if let Ok(mut s) = self.ctx.stats.lock() {
                 s.staged_speculative += 1;
+                s.staged_predicted += usize::from(predicted);
             }
             progressed = true;
         }

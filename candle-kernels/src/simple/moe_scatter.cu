@@ -416,24 +416,44 @@ MOE_ROUTE_ENTRY(moe_route_bf16_x512, __nv_bfloat16, 16)
 // the next. The look-ahead logits come out of the layer's own stacked
 // projection — `hops` routers of `n_experts` columns each, the first at column
 // `first_col` of a `row_stride`-wide row — and this kernel turns them into one
-// vote count per expert and hop: how many of the launch's tokens put the expert
-// in their top `k`. Block `h` takes hop `h`; one warp owns one token at a time,
-// its top `k` found exactly as `moe_route_impl` finds it (warp argmax rounds,
-// lowest index on a tie), the winners counted in shared memory. The counts go
-// to `out[h][n_experts]` — mapped host memory the expert pipeline reads beside
-// the layer's routing summary — behind a system fence, so a reader that has
-// seen any later store of the stream (the summary word) sees them.
+// vote word per expert and hop. Each token names its top `n` (`n ≥ k`): a pick
+// in its top `k` — what it would route — adds `1 << 16`, a pick in ranks
+// `k+1 … n` adds 1. The word is then the count of tokens routing the expert
+// above the count only reaching it in the margin, so ranking by the word puts
+// every routed pick before every margin pick, and a budget that cuts the list
+// from the bottom cuts the margin first. The margin is the look-ahead's reach
+// past the router's own top `k`: its input is a layer stale, so the experts the
+// next layer routes sit just below the cut more often than the cut admits.
+// Block `h` takes hop `h`; one warp owns one token at a time, its picks found
+// exactly as `moe_route_impl` finds them (warp argmax rounds, lowest index on a
+// tie), counted in shared memory. Each half counts at most a launch's tokens
+// (≤ 65,535, which `moe_predict_votes` checks), so neither carries into the
+// other. The words go to
+// `out[h][n_experts]` — mapped host memory the expert pipeline reads beside the
+// layer's routing summary — behind a system fence, so a reader that has seen
+// any later store of the stream (the summary word) sees them.
+//
+// Beside each word, `mass[h][n_experts]` sums the router's softmax probability
+// of every pick the word counts (over all `n_experts`, as the router's own
+// weights are before top-k renormalisation): a count says how many tokens named
+// the expert, the mass how firmly — a pick at 0.30 and one at 0.02 are one vote
+// each, and the mass tells them apart.
 #define MOE_VOTE_MAX_EXPERTS 512
 #define MOE_VOTE_SLOTS (MOE_VOTE_MAX_EXPERTS / 32)
 
 extern "C" __global__ void moe_predict_votes_f32(
     const float* __restrict__ logits, // [num_tokens, row_stride]
     uint32_t* __restrict__ out,       // [hops, n_experts], mapped
-    int num_tokens, int n_experts, int row_stride, int first_col, int k
+    float* __restrict__ mass,         // [hops, n_experts], mapped
+    int num_tokens, int n_experts, int row_stride, int first_col, int k, int n
 ) {
     __shared__ uint32_t votes[MOE_VOTE_MAX_EXPERTS];
+    __shared__ float mass_sh[MOE_VOTE_MAX_EXPERTS];
     const int hop = (int)blockIdx.x;
-    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) votes[e] = 0u;
+    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
+        votes[e] = 0u;
+        mass_sh[e] = 0.f;
+    }
     __syncthreads();
 
     const unsigned FULL = 0xffffffffu;
@@ -449,7 +469,19 @@ extern "C" __global__ void moe_predict_votes_f32(
             const int e = lane + 32 * j;
             v[j] = e < n_experts ? row[e] : -INFINITY;
         }
-        for (int p = 0; p < k; ++p) {
+        // The softmax's max and normaliser, as `moe_route_impl` takes them.
+        float gmax = -INFINITY;
+        #pragma unroll
+        for (int j = 0; j < MOE_VOTE_SLOTS; ++j) gmax = fmaxf(gmax, v[j]);
+        for (int off = 16; off > 0; off >>= 1) gmax = fmaxf(gmax, __shfl_xor_sync(FULL, gmax, off));
+        float z = 0.f;
+        #pragma unroll
+        for (int j = 0; j < MOE_VOTE_SLOTS; ++j) {
+            if (v[j] > -INFINITY) z += __expf(v[j] - gmax);
+        }
+        for (int off = 16; off > 0; off >>= 1) z += __shfl_xor_sync(FULL, z, off);
+        const float inv_z = z > 0.f ? 1.f / z : 0.f;
+        for (int p = 0; p < n; ++p) {
             float bv = -INFINITY;
             int bi = n_experts;
             #pragma unroll
@@ -463,7 +495,10 @@ extern "C" __global__ void moe_predict_votes_f32(
                 if (obv > bv || (obv == bv && obi < bi)) { bv = obv; bi = obi; }
             }
             if (bi >= n_experts) break;
-            if (lane == 0) atomicAdd(&votes[bi], 1u);
+            if (lane == 0) {
+                atomicAdd(&votes[bi], p < k ? (1u << 16) : 1u);
+                atomicAdd(&mass_sh[bi], __expf(bv - gmax) * inv_z);
+            }
             #pragma unroll
             for (int j = 0; j < MOE_VOTE_SLOTS; ++j) {
                 if (lane + 32 * j == bi) v[j] = -INFINITY;
@@ -472,8 +507,10 @@ extern "C" __global__ void moe_predict_votes_f32(
     }
     __syncthreads();
     uint32_t* dst = out + (size_t)hop * (size_t)n_experts;
+    float* mdst = mass + (size_t)hop * (size_t)n_experts;
     for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
         ((volatile uint32_t*)dst)[e] = votes[e];
+        ((volatile float*)mdst)[e] = mass_sh[e];
     }
     __threadfence_system();
 }

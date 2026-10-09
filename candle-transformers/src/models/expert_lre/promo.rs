@@ -51,6 +51,11 @@ use cudarc::driver::sys;
 use std::sync::atomic::{fence, Ordering};
 
 /// Predictions the ring holds per row for read-ahead.
+///
+/// 32, not more: on Qwen3.8-Flash-Next (4090 Laptop) 48 raised ×1 hop 3–5
+/// recall 38/35/31 → 49/46/40% but cut the list's precision 47/45/42 →
+/// 39/38/36%, and the extra copies took link time from demand misses — the ×2
+/// rows lost 3–11% decode and C5×8 ~8%, with ×1 flat.
 pub(crate) const AHEAD_CAP: usize = 32;
 
 pub(crate) struct PromotionRing {

@@ -74,6 +74,26 @@ pub(crate) const PIPELINE_CHANNEL_BOUND: usize = SUMMARY_RING;
 /// stager is not delivering.
 pub(crate) const SPIN_LIMIT_NS: u64 = 1_000_000_000;
 
+/// Ranks past the router's own top `k` each token names in the look-ahead's
+/// votes (`moe_predict_votes`).
+///
+/// The look-ahead applies a later layer's router to this layer's input, a layer
+/// stale, so the experts that layer actually routes sit just below its top `k`
+/// more often than the cut admits — at ×1 about four of the ten. The margin
+/// predicts past the cut at the cost of copies that may go unused. It needs no
+/// schedule by width: the margin picks rank below every routed pick
+/// (`votes::ranked`), and the per-row caps, the read-ahead window and the
+/// stager's in-flight limit all cut a list from the bottom — so at ×1 the margin
+/// fills the room one token's ten leave, and at ×8 the routed picks fill it.
+///
+/// Measured on Qwen3.8-Flash-Next (RTX 4090 Laptop, two alternating pairs
+/// against a margin of 0): hop-1 recall 51 → 65% at ×1 and 32 → 45% at ×8, ×8
+/// decode +1.5–2.5% (94.9 → 96.3, 97.1 → 98.8 t/s; C5×8 99.3 → 100.7), ×8 cold
+/// misses −5–6%, ×1 level. It pays only with room in the staging list: at a
+/// `STAGE_CAP` of 32 the routed picks of a five-token verify wave already filled
+/// it, and the margin moved recall one point.
+pub(crate) const LOOK_AHEAD_MARGIN: usize = 6;
+
 /// Worker blocks per expert launch, by its width.
 ///
 /// A worker's copy of a slice is a few PCIe round trips, then its compute: a
@@ -822,9 +842,20 @@ impl Dispatch {
         // The next rows' votes, ahead of bucketize: its summary word is the
         // store the pipeline thread waits on, so the votes are in its slot by
         // then (`votes`).
+        let n = (k + LOOK_AHEAD_MARGIN).min(n_experts);
+        let (words, mass) = self.votes.dev_slot(slot);
         for la in look_ahead {
-            let out = self.votes.dev_slot(slot) + ((la.first_hop - 1) * n_experts * 4) as u64;
-            moe_predict_votes(la.rows, la.first_col, la.hops, n_experts, k, out)?;
+            let at = ((la.first_hop - 1) * n_experts * 4) as u64;
+            moe_predict_votes(
+                la.rows,
+                la.first_col,
+                la.hops,
+                n_experts,
+                k,
+                n,
+                words + at,
+                mass + at,
+            )?;
         }
         let g = gpu_span("moe:bucketize", &device);
         moe_bucketize(

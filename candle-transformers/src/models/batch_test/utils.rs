@@ -32,9 +32,34 @@ use crate::models::batched_inference::{
 };
 use crate::models::dialect::Dialect;
 use crate::models::draft_depth::DraftDepth;
-use crate::models::expert_lre::{PipelineStats, ReadLatency};
+use crate::models::expert_lre::{cell_label, tag_label, PipelineStats, ReadLatency, CELLS, TAGS};
+use crate::models::profile::{
+    gpu_drain_blocking, pipeline_record, pipeline_snapshot_and_reset, profile_now, ProfileSnapshot,
+};
 use crate::models::speculative_choice::GreedyChooser;
 use candle::vram::process_ram::ProcessRam;
+use std::cmp::Reverse;
+
+/// One prediction figure per hop as `a/b/c/d/e` percentages — `hits / of` each
+/// hop — or `-` when nothing was judged.
+fn per_hop(hits: &[usize], of: &[usize]) -> String {
+    if of.iter().all(|&n| n == 0) {
+        return "-".to_string();
+    }
+    hits.iter()
+        .zip(of)
+        .map(|(&h, &n)| format!("{:.0}", PipelineStats::percent(h, n)))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A share of judged claims as `p% of n`, or `-` when none were judged.
+fn regret(hits: usize, judged: usize) -> String {
+    if judged == 0 {
+        return "-".to_string();
+    }
+    format!("{:.1}% of {judged}", PipelineStats::percent(hits, judged))
+}
 
 /// How a run decides its draft budget.
 ///
@@ -62,9 +87,6 @@ impl DraftBudget {
         }
     }
 }
-use crate::models::profile::{
-    gpu_drain_blocking, pipeline_record, pipeline_snapshot_and_reset, profile_now, ProfileSnapshot,
-};
 
 /// The story a [`TestMode::StoryRewrite`] prompt asks the model to reproduce
 /// with its character renamed.
@@ -996,18 +1018,18 @@ pub fn prefill_replay_probe<M: ManagedBatchedModel>(
     Ok(dirty)
 }
 
-/// One read source's cell in the expert-pipeline table: reads, the slowest,
-/// and how many were slow.
+/// One read source's cell in the expert-pipeline table: reads, the mean, the
+/// slowest, and how many were slow.
 fn read_latency_cell(l: &ReadLatency) -> String {
-    if l.reads == 0 {
-        "-".to_string()
-    } else {
-        format!(
-            "{} · max {:.1} ms · {} slow",
+    match l.mean_secs() {
+        None => "-".to_string(),
+        Some(mean) => format!(
+            "{} · mean {:.2} ms · max {:.1} ms · {} slow",
             l.reads,
+            mean * 1e3,
             l.max().as_secs_f64() * 1e3,
             l.slow
-        )
+        ),
     }
 }
 
@@ -2968,7 +2990,80 @@ impl TestParams {
         // boundary, and the gauges in the prefill table are what decode inherits.
         Self::print_expert_phase_table("prefill", results, |r| r.prefill_expert_stats.as_ref());
         Self::print_expert_phase_table("decode", results, |r| r.expert_stats.as_ref());
+        Self::print_blend_cells(results);
+        Self::print_victim_tags(results);
         self.print_row_cache_report(results);
+    }
+
+    /// The prediction blend's learned cells (`expert_lre::blend`), as the last
+    /// config left them — the learner runs across the whole gate — one line per
+    /// hop: each judged cell's measured probability and its candidate count,
+    /// most probable first.
+    fn print_blend_cells(results: &[TestResults]) {
+        let Some(s) = results.iter().rev().find_map(|r| r.expert_stats.as_ref()) else {
+            return;
+        };
+        let cells = &s.cells;
+        if cells.preds.iter().all(|h| h.iter().all(|&n| n == 0)) {
+            return;
+        }
+        println!("\n=== Prediction cells (v votes 0-3, m Markov 0-3, r recent) ===");
+        for hop in 1..=cells.preds.len() {
+            let mut judged: Vec<(f64, usize, u32)> = (0..CELLS)
+                .filter(|&c| cells.preds[hop - 1][c] > 0)
+                .map(|c| (cells.probability(hop, c), c, cells.preds[hop - 1][c]))
+                .collect();
+            judged.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let line: Vec<String> = judged
+                .iter()
+                .map(|&(p, c, n)| format!("{} {:.0}%/{n}", cell_label(c), 100.0 * p))
+                .collect();
+            println!("  hop {hop}: {}", line.join("  "));
+        }
+    }
+
+    /// Decode's evicted victims by what was known of them when evicted
+    /// (`expert_lre::regret`), one line per config: each tag's share routed
+    /// again at its row's next visit and its count, most frequent first.
+    fn print_victim_tags(results: &[TestResults]) {
+        let any = results.iter().any(|r| {
+            r.expert_stats
+                .as_ref()
+                .is_some_and(|s| s.victim_tag_evicted.iter().any(|&n| n > 0))
+        });
+        if !any {
+            return;
+        }
+        println!(
+            "\n=== Decode victims by tag (p prediction band, hit on last visit, place, reload): regret%/n ==="
+        );
+        for (i, r) in results.iter().enumerate() {
+            let Some(s) = r.expert_stats.as_ref() else {
+                continue;
+            };
+            let mut tags: Vec<(usize, usize)> = (0..TAGS)
+                .filter(|&t| s.victim_tag_evicted[t] > 0)
+                .map(|t| (t, s.victim_tag_evicted[t]))
+                .collect();
+            tags.sort_by_key(|&(_, n)| Reverse(n));
+            let line: Vec<String> = tags
+                .iter()
+                .map(|&(t, n)| {
+                    format!(
+                        "{} {:.0}%/{n}",
+                        tag_label(t),
+                        PipelineStats::percent(s.victim_tag_regretted[t], n)
+                    )
+                })
+                .collect();
+            println!(
+                "  #{} {:?}×{}: {}",
+                i + 1,
+                r.config.mode,
+                r.config.num_contexts,
+                line.join("  ")
+            );
+        }
     }
 
     /// One phase's expert pipeline table: rows = metrics, columns = configs.
@@ -3118,6 +3213,24 @@ impl TestParams {
                 "  then routed",
                 Box::new(|s: &PipelineStats| format!("{}", s.staged_ahead_routed)),
             ),
+            // The same split by who asked: the pipeline's predictions, then
+            // the stager's own lookahead — reads, and of them routed.
+            (
+                "  predicted: routed",
+                Box::new(|s: &PipelineStats| {
+                    format!("{} of {}", s.staged_predicted_routed, s.staged_predicted)
+                }),
+            ),
+            (
+                "  lookahead: routed",
+                Box::new(|s: &PipelineStats| {
+                    format!(
+                        "{} of {}",
+                        s.staged_ahead_routed - s.staged_predicted_routed,
+                        s.staged_speculative - s.staged_predicted
+                    )
+                }),
+            ),
             (
                 "  listed on landing",
                 Box::new(|s: &PipelineStats| format!("{}", s.staged_listed)),
@@ -3129,6 +3242,37 @@ impl TestParams {
             (
                 "Evictions",
                 Box::new(|s: &PipelineStats| format!("{}", s.evictions)),
+            ),
+            // The ring's claims judged at their row's next routing, by claim
+            // kind: the share of victims routed again (regret) beside the
+            // share of promoted experts routed again (paid) — a claim gains
+            // only while the second exceeds the first.
+            (
+                "  regret (demand)",
+                Box::new(|s: &PipelineStats| regret(s.claim_regretted[0], s.claim_evicted[0])),
+            ),
+            (
+                "  paid (demand)",
+                Box::new(|s: &PipelineStats| regret(s.claim_paid[0], s.claim_promoted[0])),
+            ),
+            (
+                "  regret (ahead)",
+                Box::new(|s: &PipelineStats| regret(s.claim_regretted[1], s.claim_evicted[1])),
+            ),
+            (
+                "  evict cost µs",
+                Box::new(|s: &PipelineStats| {
+                    let c = s.eviction_cost_us;
+                    if c.iter().all(|&x| x == 0.0) {
+                        "-".to_string()
+                    } else {
+                        format!("{:.0}/{:.0}/{:.0}/{:.0}", c[0], c[1], c[2], c[3])
+                    }
+                }),
+            ),
+            (
+                "  paid (ahead)",
+                Box::new(|s: &PipelineStats| regret(s.claim_paid[1], s.claim_promoted[1])),
             ),
             // Read-ahead: the slots the GPU claimed for experts predicted for
             // later rows, of them those copied from the pad, how many the rows
@@ -3164,6 +3308,46 @@ impl TestParams {
                             .join("/")
                     }
                 }),
+            ),
+            // Of the experts the judged rows routed, the share the votes had
+            // predicted — what a wider prediction buys, beside what it wastes.
+            (
+                "  recall",
+                Box::new(|s: &PipelineStats| {
+                    if s.lookahead_routed.iter().all(|&r| r == 0) {
+                        "-".to_string()
+                    } else {
+                        (1..=s.lookahead_routed.len())
+                            .map(|h| format!("{:.0}", s.lookahead_recall(h)))
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    }
+                }),
+            ),
+            // The list each row ahead was actually given (`expert_lre::blend`),
+            // by hop — only experts a copy could serve, those not already held:
+            // its precision, its recall of the routed experts not held, and the
+            // recall of every such candidate any predictor proposed — the
+            // ceiling a ranking can reach.
+            (
+                "List precision",
+                Box::new(|s: &PipelineStats| per_hop(&s.selected_hits, &s.selected_judged)),
+            ),
+            (
+                "  recall",
+                Box::new(|s: &PipelineStats| per_hop(&s.selected_hits, &s.copy_routed)),
+            ),
+            (
+                "  union recall",
+                Box::new(|s: &PipelineStats| per_hop(&s.union_hits, &s.copy_routed)),
+            ),
+            (
+                "Markov precision",
+                Box::new(|s: &PipelineStats| per_hop(&s.markov_hits, &s.markov_judged)),
+            ),
+            (
+                "Recency precision",
+                Box::new(|s: &PipelineStats| per_hop(&s.recent_hits, &s.recent_judged)),
             ),
             (
                 "  window (images)",

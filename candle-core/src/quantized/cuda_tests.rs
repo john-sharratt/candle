@@ -9367,6 +9367,74 @@ fn qkv_segmented_refuses_a_fourth_segment() -> Result<()> {
     Ok(())
 }
 
+/// **The look-ahead's vote word puts every routed pick above every margin pick.**
+/// Two tokens over eight experts, one hop, `k = 2`, `n = 4`. Token 0's logits
+/// descend, so it routes e0, e1 and reaches e2, e3 in the margin; token 1 routes
+/// e0, e2 and reaches e3, e1. Each word is `routed << 16 | margin`, raw:
+/// e0 routed twice; e1 and e2 routed once and reached once; e3 reached twice;
+/// the rest nothing.
+#[test]
+fn cuda_moe_predict_votes_counts_routed_picks_above_margin_picks() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let logits: Vec<f32> = vec![
+        8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, // token 0
+        8.0, 1.0, 7.0, 6.0, 0.0, 0.0, 0.0, 0.0, // token 1
+    ];
+    let rows = crate::Tensor::from_vec(logits, (2, 8), &device)?;
+    let out = dev.alloc_zeros::<u32>(8)?;
+    let mass = dev.alloc_zeros::<f32>(8)?;
+    let stream = dev.cuda_stream();
+    let (op, _g) = out.device_ptr(&stream);
+    let (mp, _gm) = mass.device_ptr(&stream);
+    moe_predict_votes(&rows, 0, 1, 8, 2, 4, op, mp)?;
+    assert_eq!(
+        dev.memcpy_dtov(&out)?,
+        vec![2 << 16, (1 << 16) | 1, (1 << 16) | 1, 2, 0, 0, 0, 0]
+    );
+    // Margin width zero is the plain top-k count, one routed pick per token.
+    let plain = dev.alloc_zeros::<u32>(8)?;
+    let (pp, _g2) = plain.device_ptr(&stream);
+    moe_predict_votes(&rows, 0, 1, 8, 2, 2, pp, mp)?;
+    assert_eq!(
+        dev.memcpy_dtov(&plain)?,
+        vec![2 << 16, 1 << 16, 1 << 16, 0, 0, 0, 0, 0]
+    );
+    Ok(())
+}
+
+/// **Beside each vote word, the softmax probability its picks carried.** Two
+/// tokens over eight experts, `k = 2`, `n = 4`, with logits of 0 or −∞ so every
+/// probability is exact: token 0 spreads evenly over e0–e3 (0.25 each, routing
+/// e0, e1 and reaching e2, e3), token 1 over e0 and e2 (0.5 each, routing both
+/// and naming nothing past its two finite experts). Raw words and masses.
+#[test]
+fn cuda_moe_predict_votes_sums_each_picks_router_probability() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let x = f32::NEG_INFINITY;
+    let logits: Vec<f32> = vec![
+        0.0, 0.0, 0.0, 0.0, x, x, x, x, // token 0
+        0.0, x, 0.0, x, x, x, x, x, // token 1
+    ];
+    let rows = crate::Tensor::from_vec(logits, (2, 8), &device)?;
+    let out = dev.alloc_zeros::<u32>(8)?;
+    let mass = dev.alloc_zeros::<f32>(8)?;
+    let stream = dev.cuda_stream();
+    let (op, _g) = out.device_ptr(&stream);
+    let (mp, _gm) = mass.device_ptr(&stream);
+    moe_predict_votes(&rows, 0, 1, 8, 2, 4, op, mp)?;
+    assert_eq!(
+        dev.memcpy_dtov(&out)?,
+        vec![2 << 16, 1 << 16, (1 << 16) | 1, 1, 0, 0, 0, 0]
+    );
+    assert_eq!(
+        dev.memcpy_dtov(&mass)?,
+        vec![0.75, 0.25, 0.75, 0.25, 0.0, 0.0, 0.0, 0.0]
+    );
+    Ok(())
+}
+
 /// Fused qkv segmented int8 matmul must be FLOAT-IDENTICAL to running q/k/v as three separate
 /// dense int8 matmuls — with MIXED KO formats (q=Q4_KO, k/v=Q6_KO, the real GQA case) over the
 /// shared q8a128 activation — and faster (one occupied launch vs three, the tiny k/v no longer

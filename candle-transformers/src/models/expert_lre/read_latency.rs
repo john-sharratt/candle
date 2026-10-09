@@ -37,10 +37,12 @@ impl ReadSource {
     }
 }
 
-/// One source's reads: how many, the slowest, and how many were slow.
+/// One source's reads: how many, their total time, the slowest, and how many
+/// were slow.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadLatency {
     pub reads: usize,
+    pub total_ns: u64,
     pub max_ns: u64,
     pub slow: usize,
 }
@@ -50,6 +52,7 @@ impl ReadLatency {
     #[cfg(any(feature = "cuda", test))]
     pub(crate) fn record(&mut self, ns: u64) -> bool {
         self.reads += 1;
+        self.total_ns += ns;
         self.max_ns = self.max_ns.max(ns);
         let slow = ns > SLOW_READ_NS;
         if slow {
@@ -61,6 +64,11 @@ impl ReadLatency {
     /// The slowest read, for a report.
     pub fn max(&self) -> Duration {
         Duration::from_nanos(self.max_ns)
+    }
+
+    /// The mean read, in seconds — none before the first.
+    pub fn mean_secs(&self) -> Option<f64> {
+        (self.reads > 0).then(|| self.total_ns as f64 / self.reads as f64 / 1e9)
     }
 }
 
@@ -79,10 +87,16 @@ mod tests {
             l,
             ReadLatency {
                 reads: 4,
+                total_ns: 202_900_001,
                 max_ns: 100_000_001,
                 slow: 1
             }
         );
         assert_eq!(l.max(), Duration::from_nanos(100_000_001));
+        assert_eq!(ReadLatency::default().mean_secs(), None);
+        let mut m = ReadLatency::default();
+        m.record(1_000_000);
+        m.record(3_000_000);
+        assert_eq!(m.mean_secs(), Some(0.002));
     }
 }
