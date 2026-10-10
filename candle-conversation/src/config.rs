@@ -100,7 +100,22 @@ pub struct SamplingConfig {
     // ── DRY Penalty (Don't Repeat Yourself) ────────────────────────────
     /// DRY penalty configuration. Detects and penalizes n-gram repetitions.
     /// Set to `None` to disable.
+    ///
+    /// **Scoped to a free-text value of a grammar.** It applies only while a
+    /// stencil is decoding a free-text span outside the think block, and its
+    /// look-back is that span's own tokens: it starts empty at every value and
+    /// ends with it. Nowhere else — not in reasoning, not on the grammar's
+    /// structure, not in unconstrained prose, and not in a tool call whose
+    /// caller freed it from the penalties.
     pub dry: Option<DryConfig>,
+
+    /// The repeat penalty while DRY is live, in place of
+    /// [`Self::repeat_penalty`]. `None` keeps `repeat_penalty` there too.
+    ///
+    /// A repeat penalty tuned to stand in for DRY where DRY is off would be
+    /// stacked on top of it where DRY is on; this is the value that applies
+    /// there instead.
+    pub dry_repeat_penalty: Option<f32>,
 
     // ── Repeat window ──────────────────────────────────────────────────
     /// Window size for repeat/frequency/DRY penalties.
@@ -254,6 +269,13 @@ pub struct SamplingConfig {
     /// Empty = no constraint.
     pub stencil: Vec<i32>,
 
+    /// This step samples without the repetition penalties — no presence,
+    /// frequency, repeat, cross-turn or DRY history for its row. Set on one
+    /// step's own copy of the config, by the grammar, where a token's having
+    /// been written before says nothing about whether the model is repeating
+    /// itself: see the decode loop's `step_configs`.
+    pub unpenalized_step: bool,
+
     // ── RNG ────────────────────────────────────────────────────────────
     /// RNG seed for reproducible sampling.
     pub seed: u64,
@@ -305,6 +327,7 @@ impl Default for SamplingConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             dry: None,
+            dry_repeat_penalty: None,
             repeat_last_n: 0,
             cross_turn_penalty: 0.0,
             cross_turn_window: 0,
@@ -329,6 +352,7 @@ impl Default for SamplingConfig {
             forced_eos_after: 0,
             banned_tokens: Vec::new(),
             stencil: Vec::new(),
+            unpenalized_step: false,
             seed: 42,
             mode_sampling: None,
             think_mode: None,
@@ -418,17 +442,26 @@ impl SamplingConfig {
     /// missing backstop does not fail, it produces an empty answer after a full-length
     /// decode.
     fn with_qwen_thinking_steering(self) -> Self {
-        // DRY is span-scoped: the kernel gates and windows it on `dry_lens[seq]` —
-        // the current structural span (reset at
-        // `<think>`/`</think>`/`<tool_call>`/`</tool_call>`, off inside tool calls).
-        // So it runs in both thinking AND the answer but only ever sees the current
-        // span's own tokens. That is what makes it safe on the answer: it breaks a
-        // repeating loop without penalizing verbatim reproduction of numbers,
-        // identifiers, or code lifted from the prompt or an earlier span — those live
-        // outside the span DRY can see. The thinking-only temperature boost lets
-        // reasoning sample a touch hotter while the answer stays at the reference temp.
+        // **DRY runs only inside a free-text value of a grammar** — see
+        // [`SamplingConfig::dry`]. Its window is the value being written and
+        // nothing else: it starts empty at each value, so a name or a path the
+        // value repeats from the prompt costs nothing, and it is off in the
+        // think block and on the grammar's own structure. Unscoped, it ran over
+        // the reasoning and spelled one loop a new way each time ("Keeper…
+        // The.Keeper… Kepper"); without it at all, a `reflect` repeated "I am
+        // standing in the catalogue." to the turn's 16k-token cap.
+        //
+        // **A run of four tokens repeats freely.** Counted in tokens, a name or
+        // a place ("Kepler Station", "the command level") is three or four, so
+        // at an allowed length of 2 a value naming somebody twice was pushed off
+        // the second spelling partway through. At 4 a repeated name costs
+        // nothing, and a sentence said again — "I am standing in the
+        // catalogue." is seven — is priced out partway through its second time.
+        //
+        // The thinking-only temperature boost lets reasoning sample a touch
+        // hotter while the answer stays at the reference temp.
         self.with_segment_temp_boost(0.05)
-            .with_dry_penalty(0.8, 1.75, 2, 512)
+            .with_dry_penalty(0.8, 1.75, 4, 512)
             .with_repeat_last_n(128)
             // EOT ramp: nudge </think> after 200 thinking tokens, full boost by 400
             // (segment_close_ramp_len is the ramp's absolute end, not a span).  zend overrides
@@ -515,10 +548,21 @@ impl SamplingConfig {
             // `qwen38*` spellings are listed against the day it stops doing that: the
             // cost of a string nobody emits is one alternation, and the cost of a
             // missing one is the paragraph above.
+            //
+            // **The repeat penalty is 1.05 where DRY is off, and the card's 1.0
+            // where it is on.** Without DRY, the reasoning block rehearses its
+            // answer until the budget closes it — "All good. Generating. [Output
+            // Generation] → *Proceeds*" — and the table's reading was cut at its
+            // budget in 26 of 32 replays. A gentle multiplicative penalty over the
+            // recent window is what breaks that rehearsal (zend's coding row,
+            // measured on "Output matches. ✅ Proceeds." 45 times over) without
+            // forbidding a word that must repeat. Inside a free-text value DRY
+            // carries that load, so the value samples on the card's own 1.0.
             "qwen35" | "qwen35moe" | "qwen36" | "qwen36moe" | "qwen38" | "qwen38moe" => {
                 Self::top_k_top_p(20, Self::QWEN35_THINKING.1, Self::QWEN35_THINKING.0)
                     .with_presence_penalty(1.5)
-                    .with_repeat_penalty(1.0)
+                    .with_repeat_penalty(1.05)
+                    .with_dry_repeat_penalty(1.0)
                     .with_mode_sampling(ModeSampling {
                         thinking: Self::QWEN35_THINKING,
                         instruct: Self::QWEN35_INSTRUCT,
@@ -717,6 +761,21 @@ impl SamplingConfig {
             range,
         });
         self
+    }
+
+    /// Set the repeat penalty that applies while DRY is live
+    /// ([`Self::dry_repeat_penalty`]).
+    pub fn with_dry_repeat_penalty(mut self, penalty: f32) -> Self {
+        self.dry_repeat_penalty = Some(penalty);
+        self
+    }
+
+    /// The repeat penalty for a step, by whether DRY is live on it.
+    pub fn repeat_penalty_for(&self, dry_live: bool) -> f32 {
+        match (dry_live, self.dry_repeat_penalty) {
+            (true, Some(p)) => p,
+            _ => self.repeat_penalty,
+        }
     }
 
     /// Set the repeat window (last N tokens considered for penalties).
@@ -2122,16 +2181,50 @@ mod sampling_config_tests {
                 cfg.segment_temp_boost, 0.05,
                 "{arch} should set segment_temp_boost to 0.05"
             );
-            // DRY is re-enabled (kernel-gated to <think> blocks).
-            let dry = cfg
-                .dry
-                .as_ref()
-                .unwrap_or_else(|| panic!("{arch} should enable DRY"));
-            assert_eq!(dry.multiplier, 0.8);
-            assert_eq!(dry.base, 1.75);
-            assert_eq!(dry.allowed_length, 2);
-            assert_eq!(dry.range, 512);
         }
+    }
+
+    /// **Every Qwen reasoning family carries DRY at (0.8, 1.75, 4, 512)**, for
+    /// its free-text values; the families without the steering carry none.
+    #[test]
+    fn the_qwen_reasoning_families_carry_dry_for_free_text() {
+        for arch in [
+            "qwen3",
+            "qwen3moe",
+            "qwen2moe",
+            "qwen35",
+            "qwen35moe",
+            "qwen36moe",
+        ] {
+            let dry = SamplingConfig::for_gguf_architecture(arch)
+                .dry
+                .unwrap_or_else(|| panic!("{arch} should enable DRY"));
+            assert_eq!(
+                (dry.multiplier, dry.base, dry.allowed_length, dry.range),
+                (0.8, 1.75, 4, 512),
+                "{arch}"
+            );
+        }
+        for arch in ["qwen2", "llama"] {
+            assert!(
+                SamplingConfig::for_gguf_architecture(arch).dry.is_none(),
+                "{arch}"
+            );
+        }
+    }
+
+    /// **The repeat penalty flips with DRY.** Qwen3.5 onwards samples a
+    /// free-text value on the card's 1.0 under DRY, and everything else on the
+    /// 1.05 tuned for where DRY is off; Qwen3 has one value for both.
+    #[test]
+    fn the_repeat_penalty_flips_with_dry() {
+        let qwen36 = SamplingConfig::for_gguf_architecture("qwen36moe");
+        assert_eq!(qwen36.presence_penalty, 1.5);
+        assert_eq!(qwen36.repeat_penalty_for(false), 1.05);
+        assert_eq!(qwen36.repeat_penalty_for(true), 1.0);
+        let qwen3 = SamplingConfig::for_gguf_architecture("qwen3");
+        assert_eq!(qwen3.repeat_penalty_for(false), 1.1);
+        assert_eq!(qwen3.repeat_penalty_for(true), 1.1);
     }
 
     /// **Every ramp must actually ramp.**

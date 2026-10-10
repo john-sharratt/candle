@@ -3454,9 +3454,8 @@ impl Scheduler {
                 // BOTH cases the sampler's `in_segment` must flip — it gates the
                 // reflection-marker suppression, the thinking temperature boost,
                 // and the `</think>` EOT ramp (all keyed off `segment_len`, which
-                // only advances while `in_segment`).  (DRY is no longer gated
-                // here — it has its own `dry_span_len`/`dry_suppressed` scope,
-                // reset at `<think>`/`</think>` via `enter_segment`/`exit_segment`.)
+                // only advances while `in_segment`) — and it keeps DRY off for
+                // the block, which applies only to a free-text value outside it.
                 // Flipping it only for the prefilled case left the sampler's flag
                 // stuck false for a model-opened block, silently disabling every
                 // one of those controls for its whole duration even though the

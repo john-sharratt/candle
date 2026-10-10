@@ -56,7 +56,7 @@ use candle_transformers::models::dialect::{CallStyle, Dialect};
 use super::error::BuildError;
 use super::spec::{NodeSpec, SpecId, TreeSpec};
 use super::terminator::Terminator;
-use super::tree::FreeTextLimits;
+use super::tree::{FreeTextLimits, MAX_STRING_VALUE_TOKENS};
 
 /// A parameter's value type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -92,6 +92,10 @@ pub struct Param {
     /// this many elements, so an array that must not be empty cannot be.
     #[serde(default)]
     pub min_items: usize,
+    /// `array`: the schema's `maxItems`. A guided array offers only its close
+    /// after this many elements; `None` bounds it at [`MAX_ARRAY_ELEMENTS`].
+    #[serde(default)]
+    pub max_items: Option<usize>,
     /// `object`: its fields, ordered as a tool's own parameters are. `None`
     /// leaves the object a free JSON value; `Some` of an empty list is `{}`.
     /// `ParamType::Object` refined into a typed sub-object rather than left as
@@ -106,6 +110,11 @@ pub struct Param {
     /// no `-`; absent or negative, the value may be signed.
     #[serde(default)]
     pub minimum: Option<f64>,
+    /// `string`: the most tokens the value may run to before the grammar closes
+    /// it — the schema's `maxLength`, counted in tokens. Bounds the value below
+    /// the envelope's [`ToolCallEnvelope::max_string_tokens`], never above it.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     /// A required enum field: the fields of the same object each value
     /// requires beyond the object's own `required` list, as `(value, fields)`
     /// — the schema's `if`/`then` ([`value_requirements`]). The grammar writes
@@ -288,9 +297,11 @@ fn merge_variants(arms: &[&Value], root: &Value, depth: usize) -> Option<Param> 
         enum_values: None,
         items: None,
         min_items: 0,
+        max_items: None,
         properties: Some(merged),
         nullable: false,
         minimum: None,
+        max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),
     })
@@ -426,6 +437,12 @@ fn param_of(schema: &Value, root: &Value) -> Param {
         _ => None,
     };
     let guided_min = if items.is_some() { min_items } else { 0 };
+    let guided_max = items.as_ref().and(
+        schema
+            .get("maxItems")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize),
+    );
     let properties = match (ty, schema.get("properties")) {
         (ParamType::Object, Some(Value::Object(_))) => Some(fields_of(schema, root)),
         _ => None,
@@ -437,9 +454,15 @@ fn param_of(schema: &Value, root: &Value) -> Param {
         enum_values,
         items,
         min_items: guided_min,
+        max_items: guided_max,
         properties,
         nullable,
         minimum: schema.get("minimum").and_then(Value::as_f64),
+        // Characters bound tokens from above: no token is shorter than one.
+        max_tokens: schema
+            .get("maxLength")
+            .and_then(Value::as_u64)
+            .map(|n| n.min(u32::MAX as u64) as u32),
         requires: Vec::new(),
         shapes: Vec::new(),
     }
@@ -532,9 +555,43 @@ pub struct ToolCallEnvelope {
     /// offered only that or the turn terminator, the model ends the turn — a
     /// grammar permitting four calls would produce one.
     pub between_calls: String,
+    /// The most tokens one free string value may run to before the grammar
+    /// closes it as written — [`MAX_STRING_VALUE_TOKENS`] unless a caller asks
+    /// for less.
+    ///
+    /// **A field that has said what it holds is closed, not left to wander.**
+    /// The default is sized for a whole file a call writes. An answer whose
+    /// fields are sentences wants far less: a table's `checked`, its finding
+    /// stated, went on "I am iron. I am steel. I am copper…" to the turn's cap
+    /// and was lost with the call around it. Bounded, the value is closed where
+    /// it stands and the call completes.
+    pub max_string_tokens: u32,
 }
 
 impl ToolCallEnvelope {
+    /// The same envelope with its free string values bounded at `tokens` — see
+    /// [`Self::max_string_tokens`].
+    pub fn with_max_string_tokens(mut self, tokens: u32) -> Self {
+        self.max_string_tokens = tokens;
+        self
+    }
+
+    /// The span limits a free string value of `p` is decoded under: the
+    /// envelope's bound, or the field's own where it is tighter.
+    ///
+    /// **A field sized for a sentence is closed at a sentence's length.** One
+    /// bound for every value of a call is sized for its longest: a table's
+    /// one-sentence `event` went "datethe is datethe" for 1,800 tokens under a
+    /// bound sized for its whole reading, and the call was refused for it.
+    fn string_limits(&self, p: &Param) -> FreeTextLimits {
+        FreeTextLimits {
+            forced_after: p
+                .max_tokens
+                .map_or(self.max_string_tokens, |m| m.min(self.max_string_tokens)),
+            ..FreeTextLimits::json_string()
+        }
+    }
+
     /// The Qwen3 ChatML tool-call envelope.  `args_open` deliberately does NOT
     /// start with the name's closing `"` — that quote is appended to each name
     /// branch arm so a name that is a prefix of another (e.g. `ssh_session_exec`
@@ -551,6 +608,7 @@ impl ToolCallEnvelope {
             param_open: String::new(),
             param_name_close: String::new(),
             param_close: "",
+            max_string_tokens: MAX_STRING_VALUE_TOKENS,
         }
     }
 
@@ -606,6 +664,7 @@ impl ToolCallEnvelope {
             // A delimiter has to be something the model either wrote or did
             // not. Layout is not that.
             param_close: "</parameter>",
+            max_string_tokens: MAX_STRING_VALUE_TOKENS,
         }
     }
 
@@ -1427,7 +1486,7 @@ impl<'a> ToolTreeBuilder<'a> {
                     marker: self.env.param_close,
                 },
                 eos_ends: false,
-                limits: FreeTextLimits::json_string(),
+                limits: self.env.string_limits(p),
                 close_token: None,
                 suppress_close: false,
                 next,
@@ -1454,7 +1513,7 @@ impl<'a> ToolTreeBuilder<'a> {
             let span = self.spec.push(NodeSpec::FreeText {
                 term: Terminator::JsonStringValue,
                 eos_ends: false,
-                limits: FreeTextLimits::json_string(),
+                limits: self.env.string_limits(p),
                 close_token: None,
                 suppress_close: false,
                 next,
@@ -1514,7 +1573,7 @@ impl<'a> ToolTreeBuilder<'a> {
                 let span = self.spec.push(NodeSpec::FreeText {
                     term: Terminator::JsonString,
                     eos_ends: false,
-                    limits: FreeTextLimits::json_string(),
+                    limits: self.env.string_limits(p),
                     close_token: None,
                     suppress_close: false,
                     next,
@@ -1532,7 +1591,7 @@ impl<'a> ToolTreeBuilder<'a> {
             (None, ParamType::Array) => match p.items.as_deref() {
                 Some(item) if self.array_depth == 0 && guided_element(item) => {
                     self.array_depth += 1;
-                    let built = self.build_array(item, p.min_items, next);
+                    let built = self.build_array(item, p.min_items, p.max_items, next);
                     self.array_depth -= 1;
                     vec![("[".into(), built?)]
                 }
@@ -1692,21 +1751,30 @@ impl<'a> ToolTreeBuilder<'a> {
     /// while the model's reasoning named the branch it meant to push: offered
     /// the close beside the first element, it took the close.
     ///
-    /// Unrolled to [`MAX_ARRAY_ELEMENTS`] and built back to front, as
-    /// [`compile_action_loop`] builds its levels: each level's continuation
-    /// points at the next, so the deepest exists first.
+    /// **After `max_items` elements only the close is offered**, so the
+    /// schema's `maxItems` holds too. A list the model went round in — a
+    /// table's faults, the same two passages again and again — ran to the
+    /// unrolled bound, sixty-four entries and three thousand words, where its
+    /// schema wanted eight.
+    ///
+    /// Unrolled to `max_items`, or [`MAX_ARRAY_ELEMENTS`] when the schema sets
+    /// none or more, and built back to front, as [`compile_action_loop`] builds
+    /// its levels: each level's continuation points at the next, so the deepest
+    /// exists first.
     fn build_array(
         &mut self,
         item: &Param,
         min_items: usize,
+        max_items: Option<usize>,
         next: SpecId,
     ) -> Result<SpecId, BuildError> {
+        let levels = max_items.map_or(MAX_ARRAY_ELEMENTS, |m| m.min(MAX_ARRAY_ELEMENTS));
         // After the last admitted element, only the close remains.
         let mut after = self.spec.push(NodeSpec::Static {
             text: "]".to_string(),
             next,
         });
-        for level in (0..MAX_ARRAY_ELEMENTS).rev() {
+        for level in (0..levels).rev() {
             let opens = self
                 .value_arms(item, after)?
                 .expect("`build_array` is reached only for a guided element");
@@ -2020,6 +2088,79 @@ mod tests {
         assert!(all.contains(", \"arguments\": {"));
         assert!(all.contains("}}\n</tool_call>"));
         assert!(!all.contains("<parameter="), "{all}");
+    }
+
+    /// **A bounded envelope bounds every free string value**, in both call
+    /// styles; the default leaves them at the file-sized guard.
+    #[test]
+    fn an_envelope_bounds_its_string_values() {
+        let forced = |env: &ToolCallEnvelope| -> Vec<u32> {
+            compile_tool_call_tree(&catalog(), env)
+                .unwrap()
+                .nodes
+                .iter()
+                .filter_map(|n| match n {
+                    NodeSpec::FreeText {
+                        term:
+                            Terminator::JsonString
+                            | Terminator::JsonStringValue
+                            | Terminator::Until { .. },
+                        limits,
+                        ..
+                    } => Some(limits.forced_after),
+                    _ => None,
+                })
+                .collect()
+        };
+        for env in [ToolCallEnvelope::qwen3(), ToolCallEnvelope::qwen35()] {
+            let open = forced(&env);
+            assert!(!open.is_empty(), "the catalog has a free string");
+            assert!(
+                open.iter().all(|&f| f == MAX_STRING_VALUE_TOKENS),
+                "{open:?}"
+            );
+            let bounded = forced(&env.clone().with_max_string_tokens(900));
+            assert!(bounded.iter().all(|&f| f == 900), "{bounded:?}");
+        }
+    }
+
+    /// **A field's own bound holds beneath the envelope's**, and never lifts a
+    /// value above it.
+    #[test]
+    fn a_field_bounds_its_own_value() {
+        let tools = parse_tools(
+            r#"[{"name":"reading","params":[
+                  {"name":"event","type":"string","required":true,"max_tokens":200},
+                  {"name":"checked","type":"string","required":true},
+                  {"name":"long","type":"string","required":true,"max_tokens":5000}
+            ]}]"#,
+        )
+        .unwrap();
+        // Sorted: the builder pushes a call's fields back to front.
+        let forced = |env: &ToolCallEnvelope| -> Vec<u32> {
+            let mut f: Vec<u32> = compile_tool_call_tree(&tools, env)
+                .unwrap()
+                .nodes
+                .iter()
+                .filter_map(|n| match n {
+                    NodeSpec::FreeText {
+                        term: Terminator::JsonStringValue | Terminator::Until { .. },
+                        limits,
+                        ..
+                    } => Some(limits.forced_after),
+                    _ => None,
+                })
+                .collect();
+            f.sort();
+            f
+        };
+        for env in [ToolCallEnvelope::qwen3(), ToolCallEnvelope::qwen35()] {
+            assert_eq!(
+                forced(&env.clone().with_max_string_tokens(900)),
+                [200, 900, 900]
+            );
+            assert_eq!(forced(&env), [200, 5000, MAX_STRING_VALUE_TOKENS]);
+        }
     }
 
     /// The envelope the action loop uses: `close` carries no turn terminator,
@@ -2631,6 +2772,28 @@ mod tests {
         assert_eq!(past.min_items, 0);
     }
 
+    /// **A guided array honours `maxItems`**: it is unrolled to the maximum,
+    /// so it offers one `]` per level it may close at and none past it — and a
+    /// maximum past the unrolled bound is the bound.
+    #[test]
+    fn a_guided_array_offers_no_element_past_its_maximum() {
+        let closes = |min: u64, max: Option<u64>| {
+            let mut array = json!({"type": "array", "items": {"type": "boolean"}, "minItems": min});
+            if let Some(max) = max {
+                array["maxItems"] = json!(max);
+            }
+            let schema = json!({"type": "object", "properties": {"v": array}, "required": ["v"]});
+            let tool = ToolSpec::from_json_schema("t", &schema);
+            assert_eq!(tool.params[0].max_items, max.map(|m| m as usize));
+            let spec = compile_tool_call_tree(&[tool], &ToolCallEnvelope::qwen3()).unwrap();
+            arms(&spec).into_iter().filter(|a| a == "]").count()
+        };
+        assert_eq!(closes(0, Some(8)), 8);
+        assert_eq!(closes(2, Some(8)), 6);
+        assert_eq!(closes(0, Some(1000)), MAX_ARRAY_ELEMENTS);
+        assert_eq!(closes(0, None), MAX_ARRAY_ELEMENTS);
+    }
+
     /// `git_push`'s real schema — `pushes` an array of `$ref`'d objects with
     /// `minItems: 1` — compiles with its first element required.
     #[test]
@@ -2649,15 +2812,12 @@ mod tests {
         });
         let tool = ToolSpec::from_json_schema("git_push", &schema);
         let pushes = tool.params.iter().find(|p| p.name == "pushes").unwrap();
-        assert_eq!(pushes.min_items, 1);
+        assert_eq!((pushes.min_items, pushes.max_items), (1, Some(50)));
         let spec = compile_tool_call_tree(&[tool], &ToolCallEnvelope::qwen3()).unwrap();
-        // Every level but the first may close: the first element is written.
+        // Unrolled to its fifty, every level but the first may close: the
+        // first element is written.
         let closes = arms(&spec).into_iter().filter(|a| a == "]").count();
-        assert_eq!(
-            closes,
-            MAX_ARRAY_ELEMENTS - 1,
-            "an empty push list is offered"
-        );
+        assert_eq!(closes, 50 - 1, "an empty push list is offered");
     }
 
     /// A mode-switched request, `git_commit`'s shape: `from` decides which of

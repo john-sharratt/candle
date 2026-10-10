@@ -55,6 +55,7 @@ pub mod relief_trace;
 mod run;
 mod sample;
 mod seal_scan;
+mod segment_rearm;
 mod settle;
 mod spec_chooser;
 #[cfg(test)]
@@ -70,6 +71,7 @@ use crate::config::{DecodeHealthConfig, SamplingConfig};
 use crate::conversation::slice_per_layer_sealed;
 use crate::decode_health::DecodeHealthState;
 use crate::decoded_text::{decode_turn_text, TagIds};
+use crate::dry_reference::reference_flags;
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
 use crate::index_pages::{self, StoredPages};
@@ -3655,7 +3657,8 @@ impl Scheduler {
             max_recent_len,
             eos_tokens.clone(),
             penalty_log_path,
-        );
+        )
+        .with_reference_flags(reference_flags(&tokenizer, vocab_size));
 
         let chunk_size = CHUNK_SIZE;
         // Before the tokenizer moves into `Self`. A multi-token spelling yields

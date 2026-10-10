@@ -1228,6 +1228,81 @@ fn dry_penalty_is_span_scoped() {
     );
 }
 
+/// **DRY never pushes a reference off its second spelling.** The repeated
+/// n-gram and its continuation are the same in both rows; only the per-token
+/// flags differ. With no flags DRY penalises the continuation as in
+/// `dry_penalty_is_span_scoped`. With the continuation's word marked a
+/// reference — here the continuation joins a reference token before it, as
+/// the `402` in `npc-402…` does — it stays the argmax: a number or an id is
+/// only right when it repeats exactly.
+#[test]
+fn dry_leaves_a_repeated_reference_alone() {
+    let stream = test_stream();
+    let vocab = 64usize;
+    let rlen = 20usize;
+
+    let a_tok = 30usize; // a word
+    let b_tok = 31usize; // a reference token: a separator or a digit run
+    let loop_tok = 40usize; // continues B inside the same word
+    let alt_tok = 41usize;
+
+    let mut logits = vec![-20.0f32; vocab];
+    logits[loop_tok] = 5.0;
+    logits[alt_tok] = 3.0;
+
+    let mut recent_row: Vec<i32> = (0..rlen).map(|i| 100 + i as i32).collect();
+    recent_row[5] = a_tok as i32;
+    recent_row[6] = b_tok as i32;
+    recent_row[7] = loop_tok as i32;
+    recent_row[18] = a_tok as i32;
+    recent_row[19] = b_tok as i32;
+    let recent_tokens = [recent_row.clone(), recent_row].concat();
+
+    // Fillers (ids 100+) sit past the vocabulary, so the table covers them too.
+    let mut flags = vec![0u8; 128];
+    const REFERENCE: u8 = 1;
+    const JOINS: u8 = 2;
+    flags[b_tok] = REFERENCE | JOINS;
+    flags[loop_tok] = JOINS;
+
+    let base = SamplingParams {
+        logits_f32: [logits.clone(), logits].concat(),
+        batch_size: 2,
+        vocab_size: vocab as i32,
+        temperature: 0.0,
+        repeat_penalty: 1.0,
+        recent_tokens,
+        recent_lens: vec![rlen as i32; 2],
+        max_recent_len: rlen as i32,
+        dry_multiplier: 2.0,
+        dry_base: 1.75,
+        dry_allowed_length: 1,
+        dry_range: 0,
+        dry_lens: vec![rlen as i32; 2],
+        ..Default::default()
+    };
+
+    let plain = run_gpu(&stream, &base);
+    assert_eq!(
+        plain,
+        vec![alt_tok as u32; 2],
+        "without flags DRY fires on both rows"
+    );
+
+    let flagged = run_gpu(
+        &stream,
+        &SamplingParams {
+            dry_ref_flags: flags,
+            ..base
+        },
+    );
+    assert_eq!(
+        flagged,
+        vec![loop_tok as u32; 2],
+        "a continuation inside a reference is never penalised"
+    );
+}
+
 /// Token suppression is gated to (and only fires inside) the active segment,
 /// mirroring `dry_penalty_is_segment_scoped`.
 ///

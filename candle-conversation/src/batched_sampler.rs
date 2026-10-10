@@ -56,7 +56,7 @@ pub struct RowKey {
     in_segment: bool,
     segment_len: i32,
     dry_span_len: i32,
-    dry_suppressed: bool,
+    in_free_text: bool,
     in_tool_call: bool,
     writing_call: bool,
     close_script_pos: Option<usize>,
@@ -376,24 +376,21 @@ pub struct SequenceSamplingState {
     /// ramp).  Reset to 0 when the segment opens or closes.
     pub segment_len: i32,
 
-    /// Tokens generated in the current DRY span — the structural span bounded by
-    /// `<think>` / `</think>` / `<tool_call>` / `</tool_call>`.  Reset at each of
-    /// those boundaries and at turn start; drives the kernel's `dry_lens` (DRY's
-    /// own look-back window, independent of the think segment).
+    /// Tokens written so far in the free-text value being decoded — DRY's
+    /// look-back window, the kernel's `dry_lens`. Zero outside a value.
     pub dry_span_len: i32,
 
-    /// True while this sequence is inside ANY stencil-steered span (think block
-    /// OR tool call).  DRY is suppressed (`dry_lens` forced to 0) because the
-    /// grammar is already steered.
-    pub dry_suppressed: bool,
+    /// True while a grammar is decoding a free-text value, outside the think
+    /// block — the only place DRY applies ([`crate::SamplingConfig::dry`]).
+    /// Synced from the stencil each decode step ([`Self::set_free_text`]).
+    pub in_free_text: bool,
 
     /// True while this sequence is inside a TOOL CALL specifically (not the think
     /// block).  The remaining repetition penalties (repeat/frequency/presence)
     /// are suppressed for these rows: a tool call's arguments legitimately
     /// reproduce prompt content verbatim — the query's numbers, file paths,
     /// identifiers — which those penalties would otherwise demote, corrupting the
-    /// value.  Kept distinct from `dry_suppressed` so reasoning (the think block)
-    /// retains full repetition control.
+    /// value.  Reasoning (the think block) retains full repetition control.
     pub in_tool_call: bool,
 
     /// True while the tool-call stencil is steering this sequence — it is
@@ -447,7 +444,7 @@ impl SequenceSamplingState {
             in_segment: false,
             segment_len: 0,
             dry_span_len: 0,
-            dry_suppressed: false,
+            in_free_text: false,
             in_tool_call: false,
             writing_call: false,
             close_script_pos: None,
@@ -482,10 +479,11 @@ impl SequenceSamplingState {
             self.segment_len += 1;
         }
 
-        // Advance the DRY span. It is reset at every structural boundary
-        // (`<think>`/`</think>`/`<tool_call>`/`</tool_call>`) and at turn start,
-        // so it always counts exactly the current span's generated tokens.
-        self.dry_span_len += 1;
+        // Advance the DRY window while a free-text value is being written, so it
+        // counts exactly that value's tokens.
+        if self.in_free_text {
+            self.dry_span_len += 1;
+        }
 
         // Maintain fixed-size sliding window
         if self.recent_tokens.len() > max_recent_len {
@@ -527,7 +525,7 @@ impl SequenceSamplingState {
         self.in_segment = false;
         self.segment_len = 0;
         self.dry_span_len = 0;
-        self.dry_suppressed = false;
+        self.in_free_text = false;
         self.in_tool_call = false;
         self.writing_call = false;
         self.close_script_pos = None;
@@ -582,10 +580,10 @@ impl SequenceSamplingState {
         self.token_counts.fill(0);
         self.counted.clear();
         self.current_len = 0;
-        // A new turn starts a fresh DRY span; any tool-call suppression, open
-        // segment, or in-flight closer script from the prior turn is cleared.
+        // A new turn is in no value yet; any open segment or in-flight closer
+        // script from the prior turn is cleared.
         self.dry_span_len = 0;
-        self.dry_suppressed = false;
+        self.in_free_text = false;
         self.writing_call = false;
         self.in_segment = false;
         self.segment_len = 0;
@@ -600,40 +598,38 @@ impl SequenceSamplingState {
     }
 
     /// Open a segment (the caller signals this when the segment-open token is
-    /// sampled), restarting the per-segment length.  The `<think>` boundary also
-    /// starts a fresh DRY span.
+    /// sampled), restarting the per-segment length.
     pub fn enter_segment(&mut self) {
         self.in_segment = true;
         self.segment_len = 0;
-        self.dry_span_len = 0;
         // A fresh segment cannot inherit a closer script from a previous one.
         self.close_script_pos = None;
     }
 
     /// Close the segment (the caller signals this when the segment-close token is
-    /// sampled).  The `</think>` boundary starts a fresh DRY span for the prose.
+    /// sampled).
     pub fn exit_segment(&mut self) {
         self.in_segment = false;
         self.segment_len = 0;
-        self.dry_span_len = 0;
         // The segment is closed; any in-flight closer script is finished or moot.
         self.close_script_pos = None;
     }
 
-    /// Enter a tool call (the caller signals this when the `<tool_call>` trigger
-    /// fires and the stencil starts driving).  DRY is suppressed for the duration
-    /// because the grammar is already steered; the span is reset so prose after
-    /// the tool call does not see the tool-call tokens.
-    pub fn enter_tool_call(&mut self) {
-        self.dry_suppressed = true;
-        self.dry_span_len = 0;
-    }
-
-    /// Exit a tool call (the caller signals this when the stencil driver
-    /// completes, `</tool_call>`).  DRY resumes over a fresh prose span.
-    pub fn exit_tool_call(&mut self) {
-        self.dry_suppressed = false;
-        self.dry_span_len = 0;
+    /// Whether a grammar is decoding a free-text value now, as the stencil
+    /// stands after the token just committed — which [`Self::record_token`]
+    /// has already counted.
+    ///
+    /// **Each value is its own window.** Entering one starts DRY's look-back
+    /// at the one token that opened it; leaving it empties the window. A
+    /// value never sees the structure around it, the reasoning before it, or
+    /// the value before it.
+    pub fn set_free_text(&mut self, live: bool) {
+        match (self.in_free_text, live) {
+            (false, true) => self.dry_span_len = 1,
+            (_, false) => self.dry_span_len = 0,
+            (true, true) => {}
+        }
+        self.in_free_text = live;
     }
 
     /// Advance the segment state for a sampled token: open it on `segment_open_id`,
@@ -704,7 +700,7 @@ impl SequenceSamplingState {
             in_segment: self.in_segment,
             segment_len: self.segment_len,
             dry_span_len: self.dry_span_len,
-            dry_suppressed: self.dry_suppressed,
+            in_free_text: self.in_free_text,
             in_tool_call: self.in_tool_call,
             writing_call: self.writing_call,
             close_script_pos: self.close_script_pos,
@@ -888,6 +884,15 @@ pub struct BatchedSampler {
     /// allocates nothing; the readback that ends each dispatch is what lets the
     /// next one overwrite it.
     args: Mutex<Option<CudaSlice<u32>>>,
+
+    /// One byte per token naming what DRY leaves alone — see
+    /// [`crate::dry_reference`]. Empty when no tokenizer was given, and then
+    /// no token is exempt.
+    reference_flags: Vec<u8>,
+
+    /// [`Self::reference_flags`] on the device, uploaded at the first dispatch
+    /// and read by every one after.
+    reference_flags_dev: Mutex<Option<CudaSlice<u8>>>,
 }
 
 impl BatchedSampler {
@@ -909,7 +914,17 @@ impl BatchedSampler {
             penalty_log_path,
             penalty_tables: Mutex::new(PenaltyTables::new(vocab_size)),
             args: Mutex::new(None),
+            reference_flags: Vec::new(),
+            reference_flags_dev: Mutex::new(None),
         }
+    }
+
+    /// The per-token flags DRY reads to leave a repeated reference alone,
+    /// built from the tokenizer with [`crate::dry_reference::reference_flags`]
+    /// at `vocab_size` entries.
+    pub fn with_reference_flags(mut self, flags: Vec<u8>) -> Self {
+        self.reference_flags = flags;
+        self
     }
 
     /// Get the vocabulary size.
@@ -1919,6 +1934,17 @@ impl BatchedSampler {
         stream
             .memcpy_htod(words, &mut packed.slice_mut(..words.len()))
             .map_err(|e| candle::Error::Msg(format!("failed to upload sampling args: {e}")))?;
+        let mut reference = self
+            .reference_flags_dev
+            .lock()
+            .map_err(|_| candle::Error::Msg("sampler reference flags poisoned".into()))?;
+        if reference.is_none() && !self.reference_flags.is_empty() {
+            *reference = Some(
+                stream
+                    .memcpy_stod(&self.reference_flags)
+                    .map_err(|e| candle::Error::Msg(format!("DRY reference flags: {e}")))?,
+            );
+        }
 
         // Get device pointers and call kernel in a scoped block
         // so guards are dropped before download
@@ -1942,6 +1968,10 @@ impl BatchedSampler {
             let output_ptr = at(output_at);
             let rng_ptr = at(rng_at);
             let seq_dials_ptr = at(seq_dials_at);
+            let reference_view = reference.as_ref().map(|flags| flags.device_ptr(&stream));
+            let reference_ptr = reference_view
+                .as_ref()
+                .map_or(std::ptr::null(), |(ptr, _)| *ptr as *const u8);
 
             // Helper closure to call kernel with logits pointer
             let call_kernel = |logits_ptr: *const std::ffi::c_void| unsafe {
@@ -1979,6 +2009,7 @@ impl BatchedSampler {
                     segment_close_max_multiplier,
                     segment_lens_ptr as *const i32,
                     dry_lens_ptr as *const i32,
+                    reference_ptr,
                     segment_temp_boost,
                     if suppress_active {
                         suppress_tok_ptr as *const i32
@@ -2203,8 +2234,11 @@ impl<'a> KernelRows<'a> {
         // the DRY gate but is scoped to tool calls only (`in_tool_call`), so the
         // think block keeps full repetition control.  Presenting empty penalty
         // state for these rows is the per-row equivalent of turning them off:
-        // the row stamps nothing, so its table row reads zero.
-        if !state.in_tool_call {
+        // the row stamps nothing, so its table row reads zero. A step the
+        // grammar marks unpenalized (`SamplingConfig::unpenalized_step`) is
+        // lifted the same way, for that step alone.
+        let lifted = state.in_tool_call || config.unpenalized_step;
+        if !lifted {
             self.counts
                 .push_row(self.vocab, r, &state.counted, &state.token_counts);
             if self.cross_turn {
@@ -2248,7 +2282,7 @@ impl<'a> KernelRows<'a> {
         // arguments must be free to reproduce the query's numbers/paths/names
         // verbatim. The buffer is still padded to keep the batch stride fixed.
         self.recent_lens
-            .push(if state.in_tool_call { 0 } else { window as i32 });
+            .push(if lifted { 0 } else { window as i32 });
         self.recent_tokens
             .extend_from_slice(&state.recent_tokens[total - window..]);
         self.recent_tokens
@@ -2267,14 +2301,13 @@ impl<'a> KernelRows<'a> {
         } else {
             0
         });
-        // DRY span length (the kernel's `dry_lens`): the current structural
-        // span's generated-token count, or 0 while suppressed inside a tool
-        // call. This gates and scopes DRY independently of the think segment.
-        self.dry_lens.push(if state.dry_suppressed {
-            0
-        } else {
-            state.dry_span_len
-        });
+        // DRY's window (the kernel's `dry_lens`): the free-text value being
+        // written, and 0 — DRY off — anywhere else or on a lifted row.
+        // Live only where the config has DRY at all: a config that cleared it
+        // (zend's coding row) keeps the repeat penalty it tuned for no DRY.
+        let dry_live = state.in_free_text && !lifted && config.has_dry();
+        self.dry_lens
+            .push(if dry_live { state.dry_span_len } else { 0 });
         // The row's OWN deny-list, plus the structural think-close ban for a row
         // outside a block (`think_close_ban_active` — a `</think>` outside a
         // think block is never valid output). A ban is row-specific: the answer
@@ -2290,7 +2323,12 @@ impl<'a> KernelRows<'a> {
         // its dials from this array, which is what stops one row's EOS ramp (or
         // temperature, or penalties) bleeding into another in a wave that mixes
         // configs. A verify row also carries the draft it tests.
-        let dials = SeqDials::from_config(config, row.logits_row);
+        // The repeat penalty flips with DRY: where DRY is live it is the
+        // config's own value for that ([`SamplingConfig::repeat_penalty_for`]).
+        let dials = SeqDials {
+            repeat_penalty: config.repeat_penalty_for(dry_live),
+            ..SeqDials::from_config(config, row.logits_row)
+        };
         self.seq_dials.push(match typical {
             Some(typical) => dials.with_draft(row.draft, typical),
             None => dials,
@@ -2947,6 +2985,130 @@ mod tests {
             }
         );
         assert_eq!(rows.recent_lens, vec![0, 10]);
+    }
+
+    /// **An unpenalized step is priced by no history, for that step alone**:
+    /// the same state, gathered under a config that marks the step and under
+    /// one that does not, stamps nothing the first time and its counts, window
+    /// and DRY span the second.
+    #[test]
+    fn an_unpenalized_step_reads_no_history_and_the_next_step_does() {
+        let sampler = make_sampler();
+        let mut state = make_state();
+        // Five tokens of one free-text value: the first opens it.
+        state.record_token(42, MAX_RECENT);
+        state.set_free_text(true);
+        for _ in 0..4 {
+            state.record_token(42, MAX_RECENT);
+        }
+        let plain = window_16().with_dry_penalty(0.8, 1.75, 4, 512);
+        let lifted = SamplingConfig {
+            unpenalized_step: true,
+            ..plain.clone()
+        };
+        let mut rows = KernelRows::new(sampler.vocab_size, sampler.max_recent_len, false);
+        let spec = |r: usize| RowSpec {
+            seq: r,
+            logits_row: r,
+            draft: None,
+            ahead: &[],
+        };
+        rows.push(0, &state, &lifted, &spec(0), None, state.row_key());
+        rows.push(1, &state, &plain, &spec(1), None, state.row_key());
+        assert_eq!(
+            rows.counts,
+            SparseCounts {
+                offsets: vec![VOCAB_SIZE as u32 + 42],
+                values: vec![5],
+            }
+        );
+        assert_eq!(rows.recent_lens, vec![0, 5]);
+        assert_eq!(rows.dry_lens, vec![0, 5]);
+    }
+
+    /// **DRY's window is one free-text value.** Outside a value it is empty;
+    /// entering one starts it at the token that opened it; it counts only that
+    /// value's tokens; leaving empties it, and the next value starts afresh.
+    #[test]
+    fn dry_sees_only_the_value_being_written() {
+        let sampler = make_sampler();
+        let config = window_16().with_dry_penalty(0.8, 1.75, 4, 512);
+        let mut state = make_state();
+        // Structure and reasoning before the value: no window.
+        for _ in 0..7 {
+            state.record_token(42, MAX_RECENT);
+        }
+        state.set_free_text(false);
+        assert_eq!(
+            gather(&sampler, &[&state], &config, false).dry_lens,
+            vec![0]
+        );
+        // The value's first token, then three more.
+        state.record_token(5, MAX_RECENT);
+        state.set_free_text(true);
+        assert_eq!(
+            gather(&sampler, &[&state], &config, false).dry_lens,
+            vec![1]
+        );
+        for t in [6, 7, 8] {
+            state.record_token(t, MAX_RECENT);
+            state.set_free_text(true);
+        }
+        assert_eq!(
+            gather(&sampler, &[&state], &config, false).dry_lens,
+            vec![4]
+        );
+        // The value closes; the structure after it is outside any window.
+        state.record_token(9, MAX_RECENT);
+        state.set_free_text(false);
+        state.record_token(10, MAX_RECENT);
+        assert_eq!(
+            gather(&sampler, &[&state], &config, false).dry_lens,
+            vec![0]
+        );
+        // The next value starts at one, not where the last left off.
+        state.record_token(11, MAX_RECENT);
+        state.set_free_text(true);
+        assert_eq!(
+            gather(&sampler, &[&state], &config, false).dry_lens,
+            vec![1]
+        );
+        // A tool call freed from the penalties is outside DRY even mid-value.
+        state.in_tool_call = true;
+        assert_eq!(
+            gather(&sampler, &[&state], &config, false).dry_lens,
+            vec![0]
+        );
+    }
+
+    /// **The repeat penalty flips with DRY**: a row inside a free-text value
+    /// samples on the config's DRY-time penalty, any other row on its own.
+    #[test]
+    fn the_repeat_penalty_a_row_samples_on_flips_with_dry() {
+        let sampler = make_sampler();
+        let config = SamplingConfig {
+            repeat_penalty: 1.05,
+            ..window_16()
+        }
+        .with_dry_penalty(0.8, 1.75, 2, 512)
+        .with_dry_repeat_penalty(1.0);
+        let outside = make_state();
+        let mut inside = make_state();
+        inside.record_token(5, MAX_RECENT);
+        inside.set_free_text(true);
+        let rows = gather(&sampler, &[&outside, &inside], &config, false);
+        let repeat: Vec<f32> = rows.seq_dials.iter().map(|d| d.repeat_penalty).collect();
+        assert_eq!(repeat, vec![1.05, 1.0]);
+
+        // A config that cleared DRY keeps its own penalty inside a value too:
+        // it has nothing standing in for the 1.05.
+        let no_dry = SamplingConfig {
+            dry: None,
+            ..config
+        };
+        let rows = gather(&sampler, &[&inside], &no_dry, false);
+        assert_eq!(rows.seq_dials[0].repeat_penalty, 1.05);
+        assert_eq!(rows.dry_lens, vec![0]);
     }
 
     /// With the cross-turn penalty off, the cross table is never read, so

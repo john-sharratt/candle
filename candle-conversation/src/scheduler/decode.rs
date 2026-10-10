@@ -1,5 +1,6 @@
 use super::block_guard::BlockGuard;
 use super::named_tool::steer_to_named_tool;
+use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{locate_rows, SpecChooser};
 use super::*;
 use crate::recorded_reply::{departure, replayed_step};
@@ -394,14 +395,26 @@ impl Scheduler {
                     Some(StepMask::Branch(set)) => {
                         configs[i].stencil = set.tokens().iter().map(|&t| t as i32).collect();
                     }
-                    Some(StepMask::Free { .. }) => {
-                        // A free-text span decodes normally — nothing is banned.  A
-                        // think-steer span's `</think>` and EOS are both intercepted
-                        // by the session's `observe` (the suppressed close drops the
-                        // token and prefills a continuation; the final span injects
-                        // the closing tag), and tool-call value spans close on a byte
-                        // delimiter — so the sampler just runs free here.
+                    Some(StepMask::Free { opens_value, .. }) => {
+                        // A free-text span decodes normally.  A think-steer span's
+                        // `</think>` and EOS are both intercepted by the session's
+                        // `observe` (the suppressed close drops the token and
+                        // prefills a continuation; the final span injects the
+                        // closing tag), and tool-call value spans close on a byte
+                        // delimiter — so the sampler runs free here, but for the
+                        // first token of a call's value, where the model chooses
+                        // how the value opens: an end token there is the turn
+                        // ending and not the value, so it is barred, and the
+                        // repetition penalties are lifted
+                        // (`StencilSession::free_decode_action`). The config is
+                        // this step's own copy, so neither goes further.
                         configs[i].stencil.clear();
+                        if opens_value {
+                            configs[i]
+                                .banned_tokens
+                                .extend(self.eos_tokens.iter().map(|&t| t as i32));
+                            configs[i].unpenalized_step = true;
+                        }
                     }
                     Some(StepMask::Done) => {
                         if let Some(d) = &state.stencil {
@@ -1494,9 +1507,18 @@ impl Scheduler {
         // close.  `</think>` already zeroed `segment_len` via `exit_segment`, but
         // an EOS close did not (EOS isn't the eot token), so reset unconditionally:
         // each span gets its own budget regardless of how it closed.
+        //
+        // Only a dropped close of the segment re-arms it — see `segment_rearm`.
         for (i, &was_dropped) in dropped.iter().enumerate() {
             if was_dropped {
+                let close = self
+                    .active_decodes
+                    .get(&seq_ids[i])
+                    .map(|s| s.sampling_config.segment_close_token_id);
                 if let Some(ss) = self.sampling_states.get_mut(&seq_ids[i]) {
+                    if !drop_rearms_segment(next_tokens[i], close.unwrap_or(-1), ss.in_segment) {
+                        continue;
+                    }
                     if ss.segment_len > 0 {
                         tracing::debug!(
                             target: "candle_conversation::eot",
@@ -1511,23 +1533,25 @@ impl Scheduler {
             }
         }
 
-        // Sync per-sequence DRY suppression to tool-call (stencil) state.  This
-        // is the single chokepoint every stencil open/close passes through,
-        // regardless of which path changed it (trigger start, completed,
-        // terminal, dropped, error).  On each edge the DRY span resets, so prose
-        // before and after a tool call never shares a DRY window with the call —
-        // and while the call runs DRY is off entirely (the grammar is steered).
+        // Sync each sequence's penalty scope to its stencil as it stands after
+        // this token. This is the single chokepoint every stencil open/close
+        // passes through, regardless of which path changed it (trigger start,
+        // completed, terminal, dropped, error).
         for &seq_id in seq_ids.iter() {
-            // `in_stencil` covers ANY steered span (think or tool call) and gates
-            // DRY, as before.  `in_tool_call` is the tool call specifically (by
-            // tree label) and gates the remaining repetition penalties — reasoning
-            // keeps full repetition control, only tool-call arguments are freed to
-            // reproduce the prompt's numbers/paths verbatim.
-            let label: Option<&str> = self
+            // `in_tool_call` is the tool call specifically (by tree label) and
+            // gates the repetition penalties — reasoning keeps full repetition
+            // control, only tool-call arguments are freed to reproduce the
+            // prompt's numbers/paths verbatim.
+            let stencil = self
                 .active_decodes
                 .get(&seq_id)
-                .and_then(|s| s.stencil.as_ref())
-                .map(|d| d.tree().label());
+                .and_then(|s| s.stencil.as_ref());
+            let label: Option<&str> = stencil.map(|d| d.tree().label());
+            // DRY's scope: a free-text value the grammar is writing. Each value
+            // is its own window — `set_free_text` starts it at the value's first
+            // token and empties it when the value closes — and the think block,
+            // the grammar's structure and unconstrained prose are outside it.
+            let mid_value = stencil.is_some_and(|d| d.mid_free_span());
             // **Only when the schema asked for it.** Lifting the penalties suits
             // a caller whose tool arguments are quotations — paths, identifiers,
             // numbers that are only correct if they repeat. It is the opposite
@@ -1539,15 +1563,10 @@ impl Scheduler {
                 .active_decodes
                 .get(&seq_id)
                 .is_some_and(|s| s.free_tool_calls_from_penalties);
-            let in_stencil = freed && label.is_some();
             let writing_call = label == Some(super::TOOL_CALL_TREE_LABEL);
             let in_tool_call = freed && writing_call;
             if let Some(ss) = self.sampling_states.get_mut(&seq_id) {
-                if in_stencil && !ss.dry_suppressed {
-                    ss.enter_tool_call();
-                } else if !in_stencil && ss.dry_suppressed {
-                    ss.exit_tool_call();
-                }
+                ss.set_free_text(mid_value && !ss.in_segment);
                 ss.in_tool_call = in_tool_call;
                 // Unconditional, unlike the penalty lift: the length budget is
                 // a prose answer's and never a call's, whoever the caller is.

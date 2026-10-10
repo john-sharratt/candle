@@ -2,7 +2,7 @@
 //! with a gentle repeat penalty and every other repetition penalty off.
 //!
 //! The per-model preset zend receives is Qwen's *general-task* row — for the
-//! Qwen3.5/3.6 MoE checkpoints temperature 1.0, presence penalty 1.5, plus DRY.
+//! Qwen3.5/3.6 MoE checkpoints temperature 1.0 and presence penalty 1.5.
 //! The same model cards publish a separate row for precise coding (temperature
 //! 0.6, top_p 0.95, top_k 20, presence 0), and a coding assistant's output is
 //! exactly what those penalties damage: paths, identifiers and boilerplate that
@@ -77,7 +77,6 @@ mod tests {
     fn the_general_row_becomes_the_coding_row() {
         let before = general_row();
         assert_eq!(before.presence_penalty, 1.5, "the preset this replaces");
-        assert!(before.dry.is_some(), "the preset this replaces");
 
         let mut s = before;
         apply(&mut s);

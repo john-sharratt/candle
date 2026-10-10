@@ -58,6 +58,7 @@ mod conversation;
 pub mod conversation_log;
 mod decode_health;
 pub mod decoded_text;
+mod dry_reference;
 mod engine;
 mod error;
 /// The KV-fragmentation probe: the specification for the compaction pass, and the gate
