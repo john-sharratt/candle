@@ -1,28 +1,21 @@
 /* Operations — the objectives the command table holds.
  *
- * Each operation is one piece of the world's storyline carried out as a chain
- * of missions: a Maker drafts it, the table reads the draft, a different Maker
- * reviews it — mending what it can, then passing it or rejecting it — and a
- * life event or story is then checked against the main storyline by a third.
- * Nothing stands in the record until every stage passes it.
+ * Each operation is one piece of the world's storyline carried through a
+ * workflow from the mind's missions.yaml: steps taken by Makers and by the
+ * table, each step's outcome choosing the next, until one leads to done or
+ * failed. Nothing stands in the record until its workflow says it does.
  *
- * Running operations are shown open, with where each stands in that chain and
- * who is carrying it; finished ones fold away below. An operation can be
+ * Running operations are shown open, with where each stands in its workflow
+ * and who is carrying it; finished ones fold away below. An operation can be
  * renamed, its objective restated, the brief of its waiting mission rewritten,
- * or called off. The page polls, and holds its paint while you are editing. */
+ * sent to any step of its workflow, or called off. The page polls, and holds
+ * its paint while you are editing. */
 
 import { API } from '../lib/api.js';
 import { h, mount, fmtNum } from '../lib/dom.js';
 import { disclosure } from '../lib/lazy.js';
 
-/* The chain an operation runs through, in order, and the phases that end it. */
-const CHAIN = [
-  ['drafting', 'Draft'],
-  ['reading', 'Table reads'],
-  ['reviewing', 'Review'],
-  ['reviewed', 'Reviewed'],
-  ['checking', 'Canon check'],
-];
+/* How an operation ended. */
 const ENDS = {
   succeeded: ['Passed', 'ok'],
   failed: ['Failed', 'warn'],
@@ -86,9 +79,9 @@ export async function render(_params, _q) {
   el.appendChild(h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, 'Operations'),
       h('div', { class: 'sub' },
-        'What the command table is having written. Each operation is drafted by one Maker, read by '
-        + 'the table, reviewed by a different Maker and, for a life or a story, checked against '
-        + 'the main storyline by a third, before it stands in the record.')),
+        'What the command table is having written. Each operation runs a workflow from the '
+        + "mind's missions.yaml — written, read by the table, reviewed and checked by other "
+        + 'Makers — before it stands in the record.')),
     h('div', { class: 'row wrap', style: 'gap:6px' }, openBtn, reviewPath, reviewBtn)));
   el.appendChild(h('div', { style: 'margin:-6px 0 12px' }, note));
   el.appendChild(kpiHost);
@@ -101,27 +94,33 @@ export async function render(_params, _q) {
       h('div', { class: 'val' }, fmtNum(val)));
   }
 
-  /* Where the operation stands, as the chain drawn left to right. */
+  /* Where the operation stands: its workflow's steps left to right, those
+   * taken this far marked, the one it waits on lit. */
   function chain(op) {
-    const at = CHAIN.findIndex(([p]) => p === op.phase);
-    const steps = CHAIN.map(([p, label], i) => {
-      const cls = op.finished || i < at ? 'chip ok' : i === at ? 'chip accent' : 'chip';
-      return h('span', { class: cls, title: p }, label);
+    const taken = new Set((op.history || []).map((t) => t.step));
+    const steps = (op.steps || []).map((s) => {
+      const cls = s.name === op.step ? 'chip accent' : taken.has(s.name) ? 'chip ok' : 'chip';
+      return h('span', { class: cls, title: s.table ? 'the table takes it' : 'a Maker takes it' }, s.name);
     });
     if (op.finished) {
-      const [label, cls] = ENDS[op.phase] || [op.phase, ''];
+      const [label, cls] = ENDS[op.state] || [op.state, ''];
       steps.push(h('span', { class: 'chip ' + cls }, label));
     }
     return h('div', { class: 'row wrap', style: 'gap:4px' },
+      h('span', { class: 'tiny dim mono', style: 'margin-right:4px' }, op.workflow),
       ...steps.flatMap((s, i) => (i ? [h('span', { class: 'tiny dim' }, '→'), s] : [s])));
   }
 
   function who(op) {
     const name = (n, id) => n || id || '—';
+    // Each Maker who took a step, once, in the order they came to it.
+    const makers = [];
+    for (const t of op.history || []) {
+      if (t.by !== 'table' && !makers.some((m) => m.by === t.by)) makers.push(t);
+    }
     return h('div', { class: 'row wrap tiny', style: 'gap:12px;margin-top:6px' },
-      h('span', {}, 'drafted by ', h('b', {}, name(op.writer_name, op.writer))),
-      h('span', {}, 'reviewed by ', h('b', {}, name(op.reviewer_name, op.reviewer))),
-      h('span', {}, 'checked by ', h('b', {}, name(op.checker_name, op.checker))),
+      ...makers.map((t) => h('span', {}, `${t.step} by `, h('b', {}, name(t.by_name, t.by)))),
+      op.round ? h('span', { class: 'dim' }, `round ${op.round + 1} · sent back ${op.send_backs}×`) : null,
       op.carrying ? h('span', { class: 'chip accent' }, 'carried now by ' + name(op.carrying_name, op.carrying)) : null,
       op.waiting_brief ? h('span', { class: 'chip' }, 'waiting at the table') : null);
   }
@@ -174,9 +173,10 @@ export async function render(_params, _q) {
   }
 
   function details(world, op) {
-    const log = (op.log || []).map((e) => h('li', {},
-      h('span', { class: 'mono tiny' }, `${e.stage} · ${e.by} · ${e.outcome}`),
-      e.notes ? h('div', { class: 'tiny dim', style: 'white-space:pre-wrap' }, e.notes) : null));
+    const log = (op.history || []).map((t) => h('li', {},
+      h('span', { class: 'mono tiny' },
+        `${t.step} · ${t.by_name || t.by}${t.outcome ? ' · ' + t.outcome : ''} → ${t.to}`),
+      t.notes ? h('div', { class: 'tiny dim', style: 'white-space:pre-wrap' }, t.notes) : null));
     const doc = op.document ? docView(world, op) : null;
     return h('div', {},
       h('div', { class: 'tiny row wrap', style: 'margin:6px 0;gap:6px;align-items:center' }, 'Document ',
@@ -185,7 +185,6 @@ export async function render(_params, _q) {
         h('span', { class: 'tiny dim' }, ` · ${op.generator} · ${op.target}`)),
       doc ? doc.panel : null,
       op.why ? h('div', { class: 'tiny st-warn', style: 'margin:6px 0' }, op.why) : null,
-      op.reading ? section(`${keyOf(world, op)}:reading`, "The table's reading", op.reading) : null,
       op.waiting_brief
         ? section(`${keyOf(world, op)}:brief`, 'The waiting brief', op.waiting_brief)
         : null,
@@ -193,33 +192,33 @@ export async function render(_params, _q) {
       actions(world, op));
   }
 
+  /* Send it to a step of its workflow — read again by the table, checked
+   * again against the storyline — while nobody carries its step. */
+  function sendTo(world, op) {
+    if (op.carrying || !(op.steps || []).length) return null;
+    const pick = h('select', { class: 'input', 'aria-label': 'step to send it to' },
+      ...op.steps.map((s) => h('option', { value: s.name, selected: s.name === op.step || null }, s.name)));
+    return h('span', { class: 'row', style: 'gap:4px' },
+      pick,
+      h('button', {
+        class: 'btn sm ghost',
+        title: 'Send it to this step of its workflow, in a new round',
+        onClick: async () => {
+          try {
+            await API.stepOperation(world, op.id, pick.value);
+            say(`${op.name} goes to ${pick.value}.`);
+            paint();
+          } catch (e) { say(e.message || String(e), true); }
+        },
+      }, 'Send to step'));
+  }
+
   /* Edit and call off — the form replaces the buttons while it is open. */
   function actions(world, op) {
     const host = h('div', { class: 'row wrap', style: 'gap:6px;margin-top:8px' });
     const buttons = () => mount(host,
       h('button', { class: 'btn sm ghost', onClick: form }, 'Edit'),
-      op.phase === 'reviewing' && op.waiting_brief ? h('button', {
-        class: 'btn sm ghost',
-        title: "Send the waiting review back to the table's reading, so it is set again",
-        onClick: async () => {
-          try {
-            await API.readOperationAgain(world, op.id);
-            say(`${op.name} goes back to the table's reading.`);
-            paint();
-          } catch (e) { say(e.message || String(e), true); }
-        },
-      }, 'Read again') : null,
-      op.phase === 'succeeded' && /^layers\/(life|stories)\//.test(op.document) ? h('button', {
-        class: 'btn sm ghost',
-        title: 'Send it to be checked against the main storyline',
-        onClick: async () => {
-          try {
-            await API.checkOperation(world, op.id);
-            say(`${op.name} goes to be checked against the storyline.`);
-            paint();
-          } catch (e) { say(e.message || String(e), true); }
-        },
-      }, 'Check against storyline') : null,
+      sendTo(world, op),
       op.finished ? null : h('button', {
         class: 'btn sm ghost',
         onClick: async () => {
@@ -276,7 +275,7 @@ export async function render(_params, _q) {
   }
 
   function finishedCard(world, op) {
-    const [label, cls] = ENDS[op.phase] || [op.phase, ''];
+    const [label, cls] = ENDS[op.state] || [op.state, ''];
     const key = keyOf(world, op);
     const card = disclosure({
       dense: true,
@@ -307,7 +306,7 @@ export async function render(_params, _q) {
     const all = Object.entries(data.worlds || {}).flatMap(([w, ops]) => ops.map((op) => [w, op]));
     const active = all.filter(([, o]) => !o.finished);
     const done = all.filter(([, o]) => o.finished);
-    const count = (phase) => done.filter(([, o]) => o.phase === phase).length;
+    const count = (state) => done.filter(([, o]) => o.state === state).length;
     mount(kpiHost,
       stat('running', active.length),
       stat('passed', count('succeeded')),

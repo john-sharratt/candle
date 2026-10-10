@@ -300,14 +300,11 @@ export const LiveAPI = {
   cancelOperation: (wid, oid, why) =>
     j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/cancel',
       { method: 'POST', body: why ? { why } : {} }),
-  /* Send an operation's review, still waiting at the table, back to be read
-   * again by the table. */
-  readOperationAgain: (wid, oid) =>
-    j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/read-again', { method: 'POST' }),
-  /* Send a passed life event or story to be checked against the main
-   * storyline. */
-  checkOperation: (wid, oid) =>
-    j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/check', { method: 'POST' }),
+  /* Send an operation to a step of its workflow, in a new round: a running one
+   * leaves what it waited on, a finished one is reopened there. */
+  stepOperation: (wid, oid, step) =>
+    j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/step',
+      { method: 'POST', body: { step } }),
   /* The document an operation wrote — `{path, where, words, text}`, `where`
    * being `record` or `rejected` — or a 404 when it was never committed. */
   operationDocument: (wid, oid) =>

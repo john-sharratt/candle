@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use super::fingerprint::Fingerprint;
+use super::glossary::{self, Term};
 use crate::engine::life;
 
 /// How many years apart two written events must be for the years between them
@@ -106,6 +107,8 @@ pub struct Corpus {
     /// By personality id.
     pub lives: Vec<Life>,
     pub stories: Vec<Story>,
+    /// The world's own terms, from `layers/world/` ([`glossary`]).
+    pub terms: Vec<Term>,
 }
 
 impl Corpus {
@@ -179,6 +182,7 @@ impl Corpus {
             eras,
             lives,
             stories,
+            terms: glossary::terms(root),
         }
     }
 
@@ -209,6 +213,20 @@ impl Corpus {
     /// is written after it.
     pub fn present(&self) -> Option<u32> {
         self.eras.iter().filter_map(|e| e.year).max()
+    }
+
+    /// The years `era` covers: from its opening to the year before the next
+    /// era opens — `None` for the last, which runs to the present.
+    pub fn span(&self, era: &Era) -> Option<(u32, Option<u32>)> {
+        let from = era.year?;
+        let to = self
+            .eras
+            .iter()
+            .filter_map(|e| e.year)
+            .filter(|&y| y > from)
+            .min()
+            .map(|y| y - 1);
+        Some((from, to))
     }
 
     /// The era a year falls in: the last that opened on or before it.
@@ -344,6 +362,10 @@ pub(crate) mod tests {
         w(
             "worlds/test.yaml",
             "id: test\nsetting: >-\n  A world of towers after the sky went out.\n",
+        );
+        w(
+            "layers/world/tower.md",
+            "# Tower\n\nA [tower](/tower) is a mobile fortress the minds live in.\n",
         );
         dir
     }

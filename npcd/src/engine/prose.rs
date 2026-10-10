@@ -37,7 +37,8 @@ use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::{Builder, GroupId, LayerId, Reserved, SectionId};
 use candle_conversation::stencil::{
-    compile_tool_call_tree, StencilTree, StencilTreeBuilder, ToolCallEnvelope, ToolSpec,
+    compile_action_loop, compile_think_tree, compile_tool_call_tree, StencilTree,
+    StencilTreeBuilder, ThinkMode, ThinkSteerEnvelope, ToolCallEnvelope, ToolSpec,
 };
 use candle_conversation::{
     ConversationEngine, Sequence, SequenceConfig, TokenDecoder, TurnEvent, TurnOptions,
@@ -81,6 +82,7 @@ pub async fn decode(
         prefill,
         max_tokens: request.max_tokens as usize,
         temperature: request.temperature,
+        think: None,
     };
     let (text, tokens) = framed(
         engine,
@@ -111,27 +113,75 @@ pub struct CallAsk<'a> {
     /// `None` keeps the checkpoint's own.
     pub temperature: Option<f32>,
     pub seed: u64,
+    /// How much the answer is thought through before the call is written.
+    /// [`ThinkMode::Off`] opens straight into the call.
+    pub think: ThinkMode,
 }
 
 /// Decode an answer held to one of `ask.calls`, and return the call as written.
 ///
-/// **The answer is the call, not prose about it.** The turn opens inside the
-/// dialect's call envelope and every argument closes on its own terminator —
-/// the reflection's mechanism (`reflect::call_tree`) — so what comes back is a
-/// call the caller reads with [`crate::engine::journal::tools::arguments`].
+/// **The answer is the call, not prose about it.** Every argument closes on its
+/// own terminator — the reflection's mechanism (`reflect::call_tree`) — so what
+/// comes back is a call the caller reads with
+/// [`crate::engine::journal::tools::arguments`].
+///
+/// **A thinking model is given somewhere to think.** Opened straight into the
+/// call, it thought in the call's first free field instead: a reading's `notes`
+/// ran "I will output the answer. I am done thinking. I will output…" to the
+/// token cap, and its `checked` the same, because a field has no `</think>` to
+/// end on. With `ask.think` set the turn opens a reasoning block the stencil
+/// closes on its budget, and the call follows it as one grammar; what comes back
+/// is the call alone.
 pub async fn decode_call(
     engine: &Arc<Mutex<ConversationEngine>>,
     base: &SequenceConfig,
     ask: &CallAsk<'_>,
 ) -> anyhow::Result<String> {
-    let tree = compile_tool_call_tree(ask.calls, &ToolCallEnvelope::for_dialect(&base.dialect))
-        .map_err(|e| anyhow::anyhow!("the answer grammar would not build: {e:#}"))?;
-    let tree = engine.lock().unwrap().compile_stencil(&tree)?;
+    let whole = decode_call_thought(engine, base, ask).await?;
+    Ok(past_thinking(&whole).to_string())
+}
+
+/// [`decode_call`]'s turn as written, its reasoning block with it — what a
+/// caller weighing how the call was arrived at reads.
+pub async fn decode_call_thought(
+    engine: &Arc<Mutex<ConversationEngine>>,
+    base: &SequenceConfig,
+    ask: &CallAsk<'_>,
+) -> anyhow::Result<String> {
+    // **No one field may take the whole answer.** One that runs on is closed
+    // where it stands with room left for the rest of the call, which the
+    // caller's own checks then judge; unbounded, it ran to the turn's cap and
+    // the call around it was lost.
+    let env = ToolCallEnvelope::for_dialect(&base.dialect)
+        .with_max_string_tokens((ask.max_tokens * 3 / 4) as u32);
+    let (spec, prefill) = match ask.think {
+        ThinkMode::Off => (compile_tool_call_tree(ask.calls, &env), None),
+        mode => {
+            let steer = think_steer(engine, base)?;
+            let prelude = compile_think_tree(mode, &steer);
+            let close_turn = ToolCallEnvelope::turn_close(&base.dialect);
+            (
+                compile_action_loop(ask.calls, &env, 1, &close_turn, Some(&prelude)),
+                Some("<think>".to_string()),
+            )
+        }
+    };
+    let spec = spec.map_err(|e| anyhow::anyhow!("the answer grammar would not build: {e:#}"))?;
+    let tree = engine.lock().unwrap().compile_stencil(&spec)?;
+    // **The thinking is budgeted on top of the answer, not out of it.** Given
+    // the answer's 2400 tokens for both, a generation that thought at length
+    // came back as a call cut off before it closed — "that was not a call" — or
+    // written in a hurry with a field left empty.
+    let max_tokens = match ask.think {
+        ThinkMode::Off => ask.max_tokens,
+        mode => mode.eos_budget(ask.max_tokens as i32).2 as usize,
+    };
     let held = Held {
         turn_grammar: Some(Arc::new(tree)),
-        prefill: None,
-        max_tokens: ask.max_tokens,
+        prefill,
+        max_tokens,
         temperature: ask.temperature,
+        think: (ask.think != ThinkMode::Off).then_some((ask.think, ask.max_tokens)),
     };
     let (text, _) = framed(
         engine,
@@ -146,12 +196,48 @@ pub async fn decode_call(
     Ok(text)
 }
 
+/// The token ids a reasoning block is steered by, from this checkpoint.
+fn think_steer(
+    engine: &Arc<Mutex<ConversationEngine>>,
+    base: &SequenceConfig,
+) -> anyhow::Result<ThinkSteerEnvelope> {
+    let e = engine.lock().unwrap();
+    let tok = e.tokenizer();
+    let (Some(think_open), Some(think_close)) =
+        (tok.token_to_id("<think>"), tok.token_to_id("</think>"))
+    else {
+        anyhow::bail!("this checkpoint's tokenizer has no single <think> token to steer by");
+    };
+    Ok(ThinkSteerEnvelope {
+        think_open,
+        think_close,
+        eos: tok
+            .token_to_id(base.dialect.assistant_end.trim_end())
+            .unwrap_or(0),
+        // Spliced onto the call grammar, so the join is a node edge already.
+        after_close: "",
+    })
+}
+
+/// What a turn wrote after its reasoning block closed — all of it when it had
+/// none. A thought may hold a brace, and the call is read from the first one.
+fn past_thinking(text: &str) -> &str {
+    match text.rfind("</think>") {
+        Some(at) => text[at + "</think>".len()..].trim_start(),
+        None => text,
+    }
+}
+
 /// What one job's turn is held to.
 struct Held {
     turn_grammar: Option<Arc<StencilTree>>,
     prefill: Option<String>,
     max_tokens: usize,
     temperature: Option<f32>,
+    /// The reasoning block's dial and the answer's own budget after it, when
+    /// the turn opens one: its close budget is programmed into the sampling the
+    /// way an acting turn's is.
+    think: Option<(ThinkMode, usize)>,
 }
 
 /// One turn under `system`, in a conversation opened for it and then thrown
@@ -173,6 +259,7 @@ async fn framed(
         prefill,
         max_tokens,
         temperature,
+        think,
     } = held;
 
     let formatted = base.dialect.format_system_prompt(system);
@@ -195,12 +282,20 @@ async fn framed(
     // only a drop guard to run the tombstone.
     let _retired = Throwaway::new(engine, timeline, "prose");
 
-    let mut sampling = base
-        .sampling
-        .clone()
-        .with_seed(seed)
-        .with_graceful_segment_close_after(0)
-        .with_force_segment_close_after(1);
+    let mut sampling = match think {
+        // The block is closed on its dial's budget, as an acting turn's is.
+        Some((mode, answer)) => base
+            .sampling
+            .clone()
+            .with_seed(seed)
+            .with_think_mode(mode, answer),
+        None => base
+            .sampling
+            .clone()
+            .with_seed(seed)
+            .with_graceful_segment_close_after(0)
+            .with_force_segment_close_after(1),
+    };
     if let Some(t) = temperature {
         sampling.temperature = t;
     }
@@ -476,6 +571,20 @@ mod tests {
         p.advance("I don ");
         assert_eq!(p.advance("I don't"), Some("'t".into()));
         assert_eq!(p.advance("I don't know"), Some(" know".into()));
+    }
+
+    /// **The call is read past the thinking**, which may hold a brace of its
+    /// own; an answer with no block is all call.
+    #[test]
+    fn a_call_is_read_past_its_thinking() {
+        let call = "<tool_call>\n{\"name\": \"reading\", \"arguments\": {}}\n</tool_call>";
+        assert_eq!(
+            past_thinking(&format!(
+                "\nThe {{draft}} is set in 2805.\n</think>\n\n{call}"
+            )),
+            call
+        );
+        assert_eq!(past_thinking(call), call);
     }
 
     /// The shared prefix is measured in whole characters.

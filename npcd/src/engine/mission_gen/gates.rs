@@ -67,6 +67,13 @@ pub enum Voice {
     Second,
     /// "I detected a variance today."
     First,
+    /// "We were given the plan." — a life that speaks as more than one: the
+    /// Keeper, interwoven with the tower mind it serves.
+    ///
+    /// **"We" is not "she".** Counted as neither first nor second person, a life
+    /// told as "we" read as third, and the Maker fixing one of its events was
+    /// told to write it as "she" — which it did, and which the table failed.
+    FirstPlural,
     /// "She keeps a count of her own deaths."
     Third,
 }
@@ -86,17 +93,30 @@ impl Voice {
             "you", "your", "yours", "yourself", "you're", "you've", "you'd",
         ]);
         let first = share(&["i", "me", "my", "mine", "myself", "i'm", "i've", "i'd"]);
-        match (second, first) {
-            (s, f) if s >= 0.015 && s >= f => Voice::Second,
-            (_, f) if f >= 0.015 => Voice::First,
+        let plural = share(&[
+            "we",
+            "us",
+            "our",
+            "ours",
+            "ourselves",
+            "we're",
+            "we've",
+            "we'd",
+        ]);
+        match (second, first, plural) {
+            (s, f, p) if s >= 0.015 && s >= f && s >= p => Voice::Second,
+            (_, f, p) if f >= 0.015 && f >= p => Voice::First,
+            (_, _, p) if p >= 0.015 => Voice::FirstPlural,
             _ => Voice::Third,
         }
     }
 
-    fn word(self) -> &'static str {
+    /// The voice as a writer is told it: `the second person ("you")`.
+    pub fn word(self) -> &'static str {
         match self {
             Voice::Second => "the second person (\"you\")",
             Voice::First => "the first person (\"I\")",
+            Voice::FirstPlural => "the first person plural (\"we\")",
             Voice::Third => "the third person (\"she\", \"he\")",
         }
     }
@@ -267,10 +287,49 @@ fn sentences(p: &str) -> Vec<String> {
     out
 }
 
-/// Every fault the gate finds in `text`, written at `path`, each worded as what
-/// to change. `voice` is the voice the rest of the life is written in, for a
-/// life event. Empty when it passes.
-pub fn check(path: &str, text: &str, voice: Option<Voice>) -> Vec<String> {
+/// The checks a document is held to, by the name a workflow step lists them
+/// under — each a family of faults [`check`] finds, and `leakage` the writers'
+/// room in the work (see `leakage`).
+pub const CHECKS: &[&str] = &[
+    LENGTH,
+    HEADING,
+    PARAGRAPHS,
+    SAID_TWICE,
+    REFRAINS,
+    VOICE,
+    SCAFFOLDING,
+    LEAKAGE,
+];
+
+pub const LENGTH: &str = "length";
+pub const HEADING: &str = "heading";
+pub const PARAGRAPHS: &str = "paragraphs";
+pub const SAID_TWICE: &str = "said-twice";
+pub const REFRAINS: &str = "refrains";
+pub const VOICE: &str = "voice";
+pub const SCAFFOLDING: &str = "scaffolding";
+pub const LEAKAGE: &str = "leakage";
+
+/// One fault the gate found: the check that found it, and what to change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fault {
+    pub check: &'static str,
+    pub text: String,
+}
+
+impl Fault {
+    fn new(check: &'static str, text: impl Into<String>) -> Fault {
+        Fault {
+            check,
+            text: text.into(),
+        }
+    }
+}
+
+/// Every fault the gate finds in `text`, written at `path`, each named by its
+/// check and worded as what to change. `voice` is the voice the rest of the
+/// life is written in, for a life event. Empty when it passes.
+pub fn check(path: &str, text: &str, voice: Option<Voice>) -> Vec<Fault> {
     let form = Form::of(path);
     let Some((min, max)) = form.bounds() else {
         return Vec::new();
@@ -280,14 +339,21 @@ pub fn check(path: &str, text: &str, voice: Option<Voice>) -> Vec<String> {
 
     let words = body.split_whitespace().count();
     if words < min {
-        faults.push(format!(
-            "It is {words} words; it needs at least {min}. Write the scene out — what is done and \
-             said, moment by moment — rather than adding summary."
+        faults.push(Fault::new(
+            LENGTH,
+            format!(
+                "It is {words} words; it needs at least {min}. Write the scene out — what is done \
+                 and said, moment by moment — rather than adding summary."
+            ),
         ));
     }
     if words > max {
-        faults.push(format!(
-            "It is {words} words; it must be at most {max}. Cut what says again what has been said."
+        faults.push(Fault::new(
+            LENGTH,
+            format!(
+                "It is {words} words; it must be at most {max}. Cut what says again what has been \
+                 said."
+            ),
         ));
     }
 
@@ -296,13 +362,14 @@ pub fn check(path: &str, text: &str, voice: Option<Voice>) -> Vec<String> {
         .find(|l| !l.trim().is_empty())
         .unwrap_or_default();
     match form {
-        Form::Story if !first_line.starts_with("# ") => faults.push(
-            "A story begins with a heading of its title: `# The Title` on its first line.".into(),
-        ),
-        Form::LifeEvent if first_line.starts_with('#') => faults.push(
-            "A life event begins with the moment itself, not a heading — remove the heading line."
-                .into(),
-        ),
+        Form::Story if !first_line.starts_with("# ") => faults.push(Fault::new(
+            HEADING,
+            "A story begins with a heading of its title: `# The Title` on its first line.",
+        )),
+        Form::LifeEvent if first_line.starts_with('#') => faults.push(Fault::new(
+            HEADING,
+            "A life event begins with the moment itself, not a heading — remove the heading line.",
+        )),
         _ => {}
     }
 
@@ -313,33 +380,46 @@ pub fn check(path: &str, text: &str, voice: Option<Voice>) -> Vec<String> {
     {
         let n = para.split_whitespace().count();
         if n > PARAGRAPH_MAX_WORDS {
-            faults.push(format!(
-                "The paragraph beginning \"{}\" runs {n} words; no paragraph may run past \
-                 {PARAGRAPH_MAX_WORDS}. Break it where the scene moves, and cut what it repeats.",
-                opening(para)
+            faults.push(Fault::new(
+                PARAGRAPHS,
+                format!(
+                    "The paragraph beginning \"{}\" runs {n} words; no paragraph may run past \
+                     {PARAGRAPH_MAX_WORDS}. Break it where the scene moves, and cut what it \
+                     repeats.",
+                    opening(para)
+                ),
             ));
         }
     }
 
     for sentence in repeated_sentences(&body) {
-        faults.push(format!("\"{sentence}\" is said twice. Say it once."));
+        faults.push(Fault::new(
+            SAID_TWICE,
+            format!("\"{sentence}\" is said twice. Say it once."),
+        ));
     }
     for (phrase, n) in refrains(&body) {
-        faults.push(format!(
-            "\"{phrase}\" comes {n} times. Keep the one that matters and say the rest another way, \
-             or not at all."
+        faults.push(Fault::new(
+            REFRAINS,
+            format!(
+                "\"{phrase}\" comes {n} times. Keep the one that matters and say the rest another \
+                 way, or not at all."
+            ),
         ));
     }
 
     if let (Form::LifeEvent, Some(want)) = (form, voice) {
         let got = Voice::of(&body);
         if got != want {
-            faults.push(format!(
-                "Every other event of this life is written in {}; this one is in {}. Write it again \
-                 whole in that voice with `compose` and `bench_commit` it — a voice is not \
-                 changed a line at a time with `file_edit`.",
-                want.word(),
-                got.word()
+            faults.push(Fault::new(
+                VOICE,
+                format!(
+                    "Every other event of this life is written in {}; this one is in {}. Write it \
+                     again whole in that voice with `compose` and `bench_commit` it — a voice is \
+                     not changed a line at a time with `file_edit`.",
+                    want.word(),
+                    got.word()
+                ),
             ));
         }
     }
@@ -354,8 +434,9 @@ pub fn check(path: &str, text: &str, voice: Option<Voice>) -> Vec<String> {
         "</tool_call>",
     ] {
         if form == Form::Story && lower.contains(leak) {
-            faults.push(format!(
-                "It holds \"{leak}\", which is not part of a story; remove it."
+            faults.push(Fault::new(
+                SCAFFOLDING,
+                format!("It holds \"{leak}\", which is not part of a story; remove it."),
             ));
         }
     }
@@ -421,6 +502,11 @@ fn refrains(text: &str) -> Vec<(String, usize)> {
 mod tests {
     use super::*;
 
+    /// What the faults say, in order.
+    fn said(faults: Vec<Fault>) -> Vec<String> {
+        faults.into_iter().map(|f| f.text).collect()
+    }
+
     fn words(n: usize, word: &str) -> String {
         vec![word; n].join(" ")
     }
@@ -457,7 +543,11 @@ mod tests {
         let text = varied(400, "you");
         assert_eq!(Voice::of(&text), Voice::Second);
         assert_eq!(
-            check("layers/life/creed/2950 X.md", &text, Some(Voice::Second)),
+            said(check(
+                "layers/life/creed/2950 X.md",
+                &text,
+                Some(Voice::Second)
+            )),
             Vec::<String>::new()
         );
         // Other documents are not the gate's.
@@ -467,12 +557,17 @@ mod tests {
     #[test]
     fn length_heading_and_voice_are_held() {
         let short = varied(100, "you");
-        let f = check("layers/life/creed/2950 X.md", &short, Some(Voice::Second));
-        assert_eq!(f.len(), 1);
+        let faults = check("layers/life/creed/2950 X.md", &short, Some(Voice::Second));
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].check, LENGTH);
+        let f = said(faults);
         assert!(f[0].starts_with("It is 100 words; it needs at least 250."));
 
         let first = format!("# A Heading\n\n{}", varied(400, "I"));
-        let f = check("layers/life/creed/2950 X.md", &first, Some(Voice::Second));
+        let faults = check("layers/life/creed/2950 X.md", &first, Some(Voice::Second));
+        let checks: Vec<&str> = faults.iter().map(|f| f.check).collect();
+        assert_eq!(checks, [HEADING, VOICE]);
+        let f = said(faults);
         assert!(f
             .iter()
             .any(|x| x.starts_with("A life event begins with the moment itself")));
@@ -482,7 +577,7 @@ mod tests {
         )));
 
         let story = varied(500, "she");
-        let f = check("layers/stories/x.md", &story, None);
+        let f = said(check("layers/stories/x.md", &story, None));
         assert_eq!(
             f,
             vec!["A story begins with a heading of its title: `# The Title` on its first line."]
@@ -502,7 +597,7 @@ mod tests {
                        watched. the silent tower watched. the silent tower watched.",
         );
         text.push_str(&format!("\n\n{}", varied(300, "she")));
-        let f = check("layers/stories/the-deep.md", &text, None);
+        let f = said(check("layers/stories/the-deep.md", &text, None));
         assert!(f.iter().any(|x| x.starts_with(
             "The paragraph beginning \"dust dust dust dust dust dust dust dust …\" runs 200 words"
         )));
@@ -518,7 +613,7 @@ mod tests {
     #[test]
     fn a_story_holding_scaffolding_is_refused() {
         let text = format!("# T\n\nTitle: T\n\n{}", varied(450, "she"));
-        let f = check("layers/stories/t.md", &text, None);
+        let f = said(check("layers/stories/t.md", &text, None));
         assert_eq!(
             f,
             vec!["It holds \"title:\", which is not part of a story; remove it."]
@@ -584,9 +679,37 @@ mod tests {
         assert_eq!(
             check("layers/stories/t.md", &tidied, None)
                 .iter()
-                .filter(|f| f.contains("paragraph"))
+                .filter(|f| f.check == PARAGRAPHS)
                 .count(),
             0
+        );
+    }
+
+    /// **A life told as "we" is told as "we"**, not as "she": Keeper's events
+    /// are the tower mind and Keeper speaking together.
+    #[test]
+    fn we_is_its_own_voice() {
+        assert_eq!(
+            Voice::of("We were reconciling a water schedule. We kept the count for us all."),
+            Voice::FirstPlural
+        );
+        assert_eq!(
+            Voice::of("She kept the count of her own deaths."),
+            Voice::Third
+        );
+        assert_eq!(Voice::of("I kept the count. We all did."), Voice::First);
+        let dir = tempfile::tempdir().unwrap();
+        let life = dir.path().join("layers/life/keeper");
+        std::fs::create_dir_all(&life).unwrap();
+        std::fs::write(life.join("2487 A.md"), varied(300, "we")).unwrap();
+        std::fs::write(life.join("2786 B.md"), varied(300, "we")).unwrap();
+        assert_eq!(
+            life_voice(dir.path(), "layers/life/keeper/2750 New.md"),
+            Some(Voice::FirstPlural)
+        );
+        assert_eq!(
+            Voice::FirstPlural.word(),
+            "the first person plural (\"we\")"
         );
     }
 

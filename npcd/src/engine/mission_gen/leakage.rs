@@ -42,29 +42,48 @@ const SHORTEST: usize = 4;
 
 /// The writers' vocabulary in `world`: the names of its levels, rooms and
 /// parts, and of the people standing in it — each lower case, without a
-/// leading article.
+/// leading article, but for a place or thing named in one word, which keeps
+/// it: `the stacks`, `the lift`.
+///
+/// **One word names the vault only as the vault's own.** "The stacks" is a
+/// room the Makers walk through; "stacks of requisition forms" in a logistics
+/// office is English. Matched bare, a story set over a quartermaster's paper
+/// was refused for "stacks" at every report, composed again, and refused
+/// again. A name of two words — "light ring", "air handler" — is the vault's
+/// however it is used, and so is a person's name.
 pub fn vocabulary(world: &World) -> Vec<String> {
     let map = world.map();
-    let mut terms: Vec<String> = Vec::new();
+    let mut named: Vec<String> = Vec::new();
     for area in map.areas() {
-        terms.push(area.name.clone());
+        named.push(area.name.clone());
         for node in &area.nodes {
-            terms.push(node.name.clone());
-            terms.extend(map.parts_at(node).map(|(part, _)| part.name.clone()));
+            named.push(node.name.clone());
+            named.extend(map.parts_at(node).map(|(part, _)| part.name.clone()));
         }
     }
-    for actor in world.actors() {
-        terms.push(actor.name.clone());
-        if let Some(first) = actor.name.split_whitespace().next() {
-            terms.push(first.to_string());
-        }
-    }
-    terms.extend(WRITING.iter().map(|w| w.to_string()));
-    let mut terms: Vec<String> = terms
+    let mut terms: Vec<String> = named
         .iter()
         .map(|t| bare(t))
         .filter(|t| t.chars().count() >= SHORTEST)
+        .map(|t| match t.contains(' ') {
+            true => t,
+            false => format!("the {t}"),
+        })
         .collect();
+    let mut people: Vec<String> = Vec::new();
+    for actor in world.actors() {
+        people.push(actor.name.clone());
+        if let Some(first) = actor.name.split_whitespace().next() {
+            people.push(first.to_string());
+        }
+    }
+    people.extend(WRITING.iter().map(|w| w.to_string()));
+    terms.extend(
+        people
+            .iter()
+            .map(|t| bare(t))
+            .filter(|t| t.chars().count() >= SHORTEST),
+    );
     terms.sort();
     terms.dedup();
     terms
@@ -110,12 +129,13 @@ fn gather(dir: &Path, into: &mut String) {
 }
 
 /// The writers' terms `text` holds that the lore never uses, in the order of
-/// `vocabulary`.
+/// `vocabulary`. The lore is asked about the word itself, article or none: a
+/// lore that ever speaks of stacks has made them the world's.
 pub fn leaks(text: &str, vocabulary: &[String], lore: &str) -> Vec<String> {
     let text = text.to_lowercase();
     vocabulary
         .iter()
-        .filter(|t| has_term(&text, t) && !has_term(lore, t))
+        .filter(|t| has_term(&text, t) && !has_term(lore, &bare(t)))
         .cloned()
         .collect()
 }
@@ -178,9 +198,40 @@ mod tests {
     /// A term is a whole word: "silage" is not "sila", nor "lifted" "lift".
     #[test]
     fn a_term_is_matched_as_whole_words() {
-        let vocabulary = words(&["sila", "lift"]);
+        let vocabulary = words(&["sila", "the lift"]);
         assert!(leaks("The silage lifted in the wind.", &vocabulary, "").is_empty());
-        assert_eq!(leaks("The lift sighed.", &vocabulary, ""), ["lift"]);
+        assert_eq!(leaks("The lift sighed.", &vocabulary, ""), ["the lift"]);
+    }
+
+    /// **A one-word place is the vault's only as a place**: "the stacks" is
+    /// the room, "stacks of forms" is English; and a lore that names the word
+    /// at all has made it the world's.
+    #[test]
+    fn a_one_word_place_leaks_only_as_the_place() {
+        let vocabulary = words(&["the stacks", "light ring"]);
+        assert!(leaks(
+            "Stacks of requisition forms covered the desk.",
+            &vocabulary,
+            ""
+        )
+        .is_empty());
+        assert_eq!(
+            leaks("She walked into the stacks.", &vocabulary, ""),
+            ["the stacks"]
+        );
+        assert!(
+            leaks(
+                "She walked into the stacks.",
+                &vocabulary,
+                "ammunition in stacks"
+            )
+            .is_empty(),
+            "the lore's own word"
+        );
+        assert_eq!(
+            leaks("A light ring hummed.", &vocabulary, ""),
+            ["light ring"]
+        );
     }
 
     #[test]

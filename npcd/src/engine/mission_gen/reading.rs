@@ -13,45 +13,115 @@
 //! Zen dated four years after the Awakening that says "three centuries have
 //! passed" among them — so `checked` is its own field and never empty.
 
-use candle_conversation::stencil::ToolSpec;
+use candle_conversation::stencil::{Param as CallParam, ParamType, ToolSpec};
+use serde_json::{Map, Value};
 
-use super::answer::{choice, contains, quotes_in, single_quoted, text, Desk, Fields};
+use super::answer::{choice, contains, quotes_in, single_quoted, text, text_within, Fields};
 use super::corpus::Corpus;
-use super::gates::{Form, LIFE_MIN_WORDS, STORY_MIN_WORDS};
 use crate::engine::journal::tools::arguments;
-use crate::engine::mission::{Mission, Origin, Stage, Todo, Work};
-use crate::engine::work::what_happens;
 use crate::sim::operations::Operation;
 
 /// The call the table reads a draft with.
 pub const READING: &str = "reading";
 
-/// The reading call: the reader's working, what was checked, what is wrong,
-/// and the table's verdict.
+/// The reading call: what happens, what was checked, what is wrong, and the
+/// table's verdict.
 ///
-/// **The working has its own place.** The call opens straight into its first
-/// field, so a reading that had dates to set against the eras worked them out
-/// in `checked` — twelve hundred words of "I need to re-read the eras
-/// carefully" — and was refused for length three times running, leaving the
-/// reviewer nothing. `notes` is where the reading thinks; it is not kept and
-/// the reviewer never sees it.
+/// **The working is done before the call, not in it.** Opened straight into
+/// its first field, a reading that had dates to set against the eras worked
+/// them out in `checked` — twelve hundred words of "I need to re-read the eras
+/// carefully". Given a `notes` field to work in, it worked there and could not
+/// stop, one sentence going round until the cap. The reading thinks in its
+/// reasoning block (`decode_call`'s `think`) and the call holds what it found.
 ///
 /// **What happens is said before the verdict.** The table read a life event as
 /// sound in which a door was opened on an empty room and closed again — the
 /// prompt's "no event" was one item in a list, and nothing made the reading
 /// say what the event was. `event` is that sentence, `none` when there is
 /// none, and a draft in which nothing happens is not sound.
+///
+/// **Each field is closed at its own length.** Bounded only by the whole
+/// reading's budget, a one-sentence `event` went "datethe is datethe" for
+/// eighteen hundred tokens before the call could close.
 pub fn specs() -> Vec<ToolSpec> {
     vec![ToolSpec {
         name: READING.into(),
         params: vec![
-            text("notes"),
-            text("event"),
-            text("checked"),
-            text("faults"),
+            text_within("event", EVENT_WORDS),
+            text_within("checked", CHECKED_WORDS),
+            fault_list(),
             choice("verdict", &["sound", "mend", "fail"]),
         ],
     }]
+}
+
+/// The caps a reading's fields are checked against, in words.
+const EVENT_WORDS: usize = 80;
+const CHECKED_WORDS: usize = 700;
+/// The most faults one reading lists. **A good reading is long** — one that
+/// caught a date contradicted by the document's own arithmetic, a human motive
+/// in a machine's mouth, a clash with the era and a paragraph going round in
+/// circles named four — and a list past this is going round itself: one ran
+/// to sixty-four entries, the same two passages again and again.
+const FAULTS_MOST: usize = 8;
+/// A fault's quote: the draft's own words, a phrase to a few sentences.
+const QUOTE_WORDS: usize = 80;
+/// What is wrong with the quoted words, and what they should say.
+const FAULT_WORDS: usize = 120;
+
+/// The faults: a list of the draft's words, each with what is wrong with them.
+///
+/// **The quote is its own field.** Asked for faults as text "quoting the
+/// draft's sentence between double quotes", readings quoted in double quotes,
+/// single quotes, after a dash, or bare before one, and four in thirty-two
+/// were refused for not quoting what they had quoted. Held apart, the quote is
+/// the draft's words and nothing else, and the engine puts the marks round it.
+fn fault_list() -> CallParam {
+    CallParam {
+        ty: ParamType::Array,
+        items: Some(Box::new(CallParam {
+            name: String::new(),
+            ty: ParamType::Object,
+            properties: Some(vec![
+                text_within("quote", QUOTE_WORDS),
+                text_within("fault", FAULT_WORDS),
+            ]),
+            ..text("")
+        })),
+        max_items: Some(FAULTS_MOST),
+        ..text("faults")
+    }
+}
+
+/// A reading's faults as the reviewer reads them: each `"quote" — fault`, a
+/// line each, the same one written twice kept once.
+pub(super) fn faults_of(args: &Map<String, Value>) -> String {
+    let entry = |v: &Value| -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.trim().to_string()),
+            Value::Object(o) => {
+                let get = |k: &str| o.get(k).and_then(Value::as_str).unwrap_or_default().trim();
+                let quote = get("quote").trim_matches(['"', '“', '”', '\'']).trim();
+                Some(match quote {
+                    "" => get("fault").to_string(),
+                    q => format!("\"{q}\" — {}", get("fault")),
+                })
+            }
+            _ => None,
+        }
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let entries: Vec<String> = match args.get("faults") {
+        Some(Value::Array(list)) => list.iter().filter_map(entry).collect(),
+        Some(v) => entry(v).into_iter().collect(),
+        None => Vec::new(),
+    };
+    for e in entries {
+        if !e.is_empty() && !seen.contains(&e) {
+            seen.push(e);
+        }
+    }
+    seen.join("\n")
 }
 
 /// The table's verdict on a draft.
@@ -66,6 +136,16 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// The verdict as the call names it, and as a workflow's reading step
+    /// routes on it: `sound`, `mend` or `fail`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Verdict::Sound => "sound",
+            Verdict::Mend => "mend",
+            Verdict::Fail => "fail",
+        }
+    }
+
     fn said(self) -> &'static str {
         match self {
             Verdict::Sound => "sound — the table found nothing worth mending",
@@ -125,8 +205,8 @@ pub fn check(raw: &str, path: &str, corpus: &Corpus, strict: bool) -> Result<Rea
     // same length again and was cut off again.
     let (name, args) = arguments(raw).ok_or_else(|| match raw.contains("<tool_call>") {
         true => format!(
-            "Your answer was cut off before the `{READING}` call closed: it ran too long. Keep \
-             `notes` to a few short lines and `checked` under four hundred words."
+            "Your answer was cut off before the `{READING}` call closed: it ran too long. Think \
+             before the call, and keep `checked` under four hundred words."
         ),
         false => format!("That was not a call; answer with `{READING}`."),
     })?;
@@ -136,23 +216,20 @@ pub fn check(raw: &str, path: &str, corpus: &Corpus, strict: bool) -> Result<Rea
         ));
     }
     let field = Fields(&args);
-    let event = field.words(
+    let event = field.words_kept(
         "event",
         1,
-        80,
+        EVENT_WORDS,
         "what happens in the draft, in a sentence — who does what, and how it ends differently \
          than it began; `none` if nothing does",
     )?;
-    let checked = field.words(
+    let checked = field.words_kept(
         "checked",
         20,
-        700,
+        CHECKED_WORDS,
         "what you checked in the draft and what you found — its year and era, its facts, its voice",
     )?;
-    // **A good reading is long.** One that caught a date contradicted by the
-    // document's own arithmetic, a human motive in a machine's mouth, a clash
-    // with the era and a paragraph going round in circles ran to 369 words.
-    let faults = field.words("faults", 0, 600, "what is wrong with the draft")?;
+    let faults = faults_of(&args);
     let verdict = match field.get("verdict").as_str() {
         "sound" => Verdict::Sound,
         "mend" => Verdict::Mend,
@@ -188,6 +265,12 @@ pub fn check(raw: &str, path: &str, corpus: &Corpus, strict: bool) -> Result<Rea
         true => String::new(),
         false => faults,
     };
+    // A draft in which nothing happens has that for its fault.
+    let faults =
+        match verdict != Verdict::Sound && faults.trim().is_empty() && nothing_happens(&event) {
+            true => NO_EVENT.to_string(),
+            false => faults,
+        };
     // **A fault is quoted from the draft.** One that cannot point at the
     // sentences it objects to is an opinion of the draft's general quality, and
     // the reviewer given it would rewrite what was right along with what was
@@ -295,7 +378,7 @@ fn quoted_from(text: &str, q: &str) -> bool {
 /// life event, the era its year falls in and the nearest other event of that
 /// life; for a story, the era it tells; for a correction, the document it was
 /// corrected against.
-fn context(op: &Operation, corpus: &Corpus) -> Vec<String> {
+pub(super) fn context(op: &Operation, corpus: &Corpus) -> Vec<String> {
     let doc = op.document.as_str();
     let mut reads = Vec::new();
     if let Some(era) = op.target.strip_prefix("era:") {
@@ -335,119 +418,11 @@ fn context(op: &Operation, corpus: &Corpus) -> Vec<String> {
     reads
 }
 
-/// The review mission for operation `op`, carrying the table's `reading`.
-/// `mend` is whether the table's reading found faults: when it did, the review
-/// carries a repair step — the draft changed and committed — that both
-/// verdicts wait for.
-///
-/// **Repair before verdict.** Left to judge a draft the table had found
-/// faults in, reviewers rejected every one — nine of nine, three of them for
-/// the wrong voice they had tried and failed to change a line at a time. A
-/// reviewer that must first mend the draft, rewriting it whole when its voice
-/// is wrong, saves what can be saved, and rejects only what its mending could
-/// not.
-///
-/// **A failed draft is written anew.** Where the table's verdict is `fail` its
-/// faults run through all of it, and a reviewer composing with that draft in
-/// front of it wrote the same piece back — the vault's light rings and air
-/// handlers in a story of the Final Battle. So the review carries `anew`, and
-/// the reviewer writes the piece again from what it was to tell.
-pub fn review_mission(
-    op: &Operation,
-    reading: &str,
-    verdict: Option<Verdict>,
-    corpus: &Corpus,
-    desk: Option<&Desk>,
-) -> Mission {
-    let mend = verdict != Some(Verdict::Sound);
-    let anew = verdict == Some(Verdict::Fail);
-    let doc = &op.document;
-    let mut reads = vec![doc.clone()];
-    reads.extend(context(op, corpus));
-    let mut todo = Vec::new();
-    if let Some(d) = desk {
-        todo.push(Todo::new(format!("go to {} on {}", d.room, d.level)));
-    }
-    for r in &reads {
-        todo.push(Todo::new(format!("read {r}")));
-    }
-    if mend {
-        todo.push(Todo::new(format!(
-            "change {doc} and commit it, mending what the table found"
-        )));
-    }
-    todo.push(Todo::report("go back to the table and report your verdict"));
-    let repair = match (anew, mend) {
-        (true, _) => {
-            "First, write it anew. The table found its faults run through all of it, so it is \
-                 not mended a line at a time: sit down with `compose` and write the piece again \
-                 whole, from what it was to tell — the operation's aim above, the era and the \
-                 documents you read — as a scene in that world, keeping nothing of the failed \
-                 draft but what the table found right in it. Then `bench_commit` it. A draft \
-                 that can be saved is saved by you; that is the work."
-        }
-        (false, true) => {
-            "First, mend it. Put right every fault the table found, in the draft itself: a \
-                 wrong date or fact with `file_edit`; a line said twice, cut; a paragraph that \
-                 runs on, broken where the scene moves. If it is told in the wrong voice, or a \
-                 scene is summary, write it again whole with `compose` — the same events, in \
-                 the right voice, as a scene — keeping everything that is right in it. Then \
-                 `bench_commit` it. A draft that can be saved is saved by you; that is the work."
-        }
-        (false, false) => {
-            "The table found nothing to mend. Read it for yourself; if you find something, \
-                  mend it with `file_edit` and `bench_commit` it."
-        }
-    };
-    // **The review answers to what the draft was to tell.** Given only the
-    // operation's one-line aim and the table's reading, a reviewer writing a
-    // life event anew wrote a mood about a door: the event its brief named was
-    // nowhere in front of it.
-    let told = match what_happens(&op.brief) {
-        Some(h) => format!("What it was to tell, from its brief — What happens: {h}\n\n"),
-        None => String::new(),
-    };
-    let brief = format!(
-        "{name} — {objective}.\n\n\
-         Another Maker drafted `{doc}`. You are its second reader: nothing of it stands in the \
-         record until you pass it.\n\n\
-         {told}\
-         {reading}\n\n\
-         {repair}\n\n\
-         Then give your verdict at the table. When it stands, `report_done` with what you \
-         checked and what you changed. Only if your mending could not save it — the events \
-         themselves set in the wrong era, or nothing of the subject in it at all — \
-         `report_rejected` with why. A rejected draft leaves the record.",
-        name = op.name,
-        objective = op.objective,
-    );
-    Mission::new(
-        brief,
-        todo,
-        Origin::Generated {
-            generator: op.generator.clone(),
-            target: op.target.clone(),
-            operation: op.id,
-            stage: Stage::Review,
-        },
-    )
-    .with_work(Work {
-        writes: doc.clone(),
-        reads: reads.clone(),
-        min_words: match Form::of(doc) {
-            Form::LifeEvent => LIFE_MIN_WORDS,
-            Form::Story => STORY_MIN_WORDS,
-            Form::Other => 0,
-        },
-        edit_optional: !mend,
-        anew,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::mission_gen::corpus::tests::mind;
+    use crate::sim::operations::tests::workflows;
     use crate::sim::operations::Operations;
 
     fn call(args: serde_json::Value) -> String {
@@ -457,27 +432,95 @@ mod tests {
         )
     }
 
+    /// **The call holds what was found, not the working**: the reading thinks
+    /// before it, and a field the model would work in is not offered.
     #[test]
-    fn the_reading_works_first_and_the_reviewer_never_sees_it() {
+    fn the_reading_holds_what_was_found_and_no_working() {
         let names: Vec<String> = specs()[0].params.iter().map(|p| p.name.clone()).collect();
-        assert_eq!(names, ["notes", "event", "checked", "faults", "verdict"]);
+        assert_eq!(names, ["event", "checked", "faults", "verdict"]);
+    }
+
+    /// **Each field is closed at its own length**, the sentence well before
+    /// the account; the verdict is a choice and needs no bound.
+    #[test]
+    fn each_field_is_bounded_at_its_own_length() {
+        let params = &specs()[0].params;
+        let bounds: Vec<Option<u32>> = [&params[0], &params[1], &params[3]]
+            .iter()
+            .map(|p| p.max_tokens)
+            .collect();
+        assert_eq!(bounds, [Some(176), Some(1416), None]);
+        let fault = params[2].items.as_ref().unwrap();
+        let fields: Vec<(&str, Option<u32>)> = fault
+            .properties
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|p| (p.name.as_str(), p.max_tokens))
+            .collect();
+        assert_eq!(fields, [("quote", Some(176)), ("fault", Some(256))]);
+    }
+
+    /// **The faults are a list of quotes and what is wrong with each**, at
+    /// most [`FAULTS_MOST`]; the engine marks each quote, and a fault written
+    /// twice is kept once.
+    #[test]
+    fn the_faults_are_quotes_each_with_what_is_wrong() {
+        let faults = &specs()[0].params[2];
+        assert_eq!(
+            (
+                faults.name.as_str(),
+                faults.ty,
+                faults.min_items,
+                faults.max_items
+            ),
+            ("faults", ParamType::Array, 0, Some(FAULTS_MOST))
+        );
         let dir = mind();
-        let corpus = Corpus::read(dir.path(), "test");
-        let working = "I need to re-read the eras carefully. ".repeat(200);
+        let c = Corpus::read(dir.path(), "test");
+        let told = serde_json::json!({
+            "quote": "We were given the plan.", "fault": "It is told, not shown."
+        });
         let r = check(
             &call(serde_json::json!({
-                "notes": working,
-                "event": EVENT,
-                "checked": CHECKED,
-                "faults": "",
-                "verdict": "sound"
+                "event": EVENT, "checked": CHECKED,
+                "faults": [
+                    {"quote": "'We were given the plan.'", "fault": "It says nothing of who."},
+                    told,
+                    told,
+                    {"quote": "", "fault": "The voice drifts."}
+                ],
+                "verdict": "mend"
             })),
             DOC,
-            &corpus,
+            &c,
             true,
         )
         .unwrap();
-        assert!(!r.render().contains("re-read the eras"));
+        assert_eq!(
+            r.faults,
+            "\"We were given the plan.\" — It says nothing of who.\n\"We were given the plan.\" — \
+             It is told, not shown.\nThe voice drifts."
+        );
+        assert!(r.quoted);
+    }
+
+    /// **An `event` cut off mid-loop is kept to its sentence.**
+    #[test]
+    fn a_runaway_event_is_kept_to_its_sentence() {
+        let dir = mind();
+        let c = Corpus::read(dir.path(), "test");
+        let runaway = format!("{EVENT} {}", "datethe is ".repeat(60));
+        let r = check(
+            &call(serde_json::json!({
+                "event": runaway, "checked": CHECKED, "faults": "", "verdict": "sound"
+            })),
+            DOC,
+            &c,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.event, EVENT);
     }
 
     const CHECKED: &str = "It is set in 2786, in the Retreat; it says the plan was given, which \
@@ -575,6 +618,17 @@ mod tests {
              retreat.\n\nWhat the table checked: It is set in 2786"
         ));
         assert!(r(CHECKED, "", "keep").unwrap_err().contains("`verdict`"));
+        // One in which nothing happens has that for its fault.
+        let none = check(
+            &call(serde_json::json!({
+                "event": "none", "checked": CHECKED, "faults": "", "verdict": "fail"
+            })),
+            DOC,
+            &c,
+            true,
+        )
+        .unwrap();
+        assert_eq!(none.faults, NO_EVENT);
         // A failing reading whose faults say "Nothing." has none listed.
         let denied = check(
             &call(serde_json::json!({
@@ -637,118 +691,45 @@ mod tests {
         );
     }
 
-    /// **The review reads the draft and what it answers to, may leave it as it
-    /// is, and is the operation's review stage.**
+    /// **A review reads what the document answers to**: for a life event, the
+    /// era its year falls in and the nearest other event of the life; for a
+    /// story, the era it tells.
     #[test]
-    fn a_review_mission_reads_the_draft_and_its_context() {
+    fn what_a_review_reads_beside_the_document() {
         let dir = mind();
         let c = Corpus::read(dir.path(), "test");
         let mut ops = Operations::default();
-        let id = ops.open("life-event", "life:keeper", "Keeper's charge", DOC);
-        let m = review_mission(
-            ops.get(id).unwrap(),
-            "The table's verdict: sound.",
-            Some(Verdict::Sound),
-            &c,
-            None,
-        );
-        let steps: Vec<&str> = m.todo.iter().map(|t| t.text.as_str()).collect();
+        ops.set_workflows(workflows());
+        let id = ops
+            .open(
+                "life-event",
+                None,
+                "life-event",
+                "life:keeper",
+                "Keeper's charge",
+                DOC,
+            )
+            .unwrap();
         assert_eq!(
-            steps,
+            context(ops.get(id).unwrap(), &c),
             [
-                "read layers/life/keeper/2786 The Charge.md",
-                "read layers/eras/the-retreat.md",
-                "read layers/life/keeper/2487-03-08 The Second the Sky Went Out.md",
-                "go back to the table and report your verdict",
+                "layers/eras/the-retreat.md",
+                "layers/life/keeper/2487-03-08 The Second the Sky Went Out.md",
             ]
         );
-        assert_eq!(m.operation(), Some((id, Stage::Review)));
-        let w = m.work.as_ref().unwrap();
-        assert!(w.edit_optional);
-        assert_eq!(w.min_words, LIFE_MIN_WORDS);
-        assert!(m.written_up(), "a review need not change the draft");
-        assert!(m
-            .prompt
-            .starts_with("Operation Iron Lantern — Keeper's charge."));
-
-        let sid = ops.open(
-            "untold",
-            "era:layers/eras/the-fall.md",
-            "a story",
-            "layers/stories/x.md",
-        );
-        let m = review_mission(ops.get(sid).unwrap(), "r", Some(Verdict::Sound), &c, None);
+        let sid = ops
+            .open(
+                "story",
+                None,
+                "untold",
+                "era:layers/eras/the-fall.md",
+                "a story",
+                "layers/stories/x.md",
+            )
+            .unwrap();
         assert_eq!(
-            m.work.unwrap().reads,
-            ["layers/stories/x.md", "layers/eras/the-fall.md"]
-        );
-    }
-
-    /// **A draft the table found faults in is mended before the verdict**:
-    /// the review carries a repair step, and nothing is reported until the
-    /// draft is committed.
-    #[test]
-    fn a_faulted_draft_is_mended_before_its_verdict() {
-        let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
-        let mut ops = Operations::default();
-        let id = ops.open("life-event", "life:keeper", "Keeper's charge", DOC);
-        let mut m = review_mission(
-            ops.get(id).unwrap(),
-            "to be mended",
-            Some(Verdict::Mend),
-            &c,
-            None,
-        );
-        assert_eq!(
-            m.todo[m.todo.len() - 2].text,
-            "change layers/life/keeper/2786 The Charge.md and commit it, mending what the table \
-             found"
-        );
-        assert!(!m.work.as_ref().unwrap().edit_optional);
-        assert!(!m.work.as_ref().unwrap().anew);
-        assert!(!m.written_up(), "not until it is committed");
-        assert!(m.prompt.contains("First, mend it."));
-        assert!(m.committed(&[DOC.to_string()]));
-        assert!(m.written_up());
-
-        // A reading that would not come still sets a mending review.
-        let m = review_mission(ops.get(id).unwrap(), "unread", None, &c, None);
-        assert!(m.prompt.contains("First, mend it."));
-        assert!(!m.work.unwrap().anew);
-    }
-
-    /// **A draft the table failed is written anew**: the review carries `anew`,
-    /// so the writer is not shown the failed text, and says to write it again.
-    #[test]
-    fn a_failed_draft_is_written_anew() {
-        let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
-        let mut ops = Operations::default();
-        let id = ops.open("life-event", "life:keeper", "Keeper's charge", DOC);
-        ops.briefed(
-            id,
-            "Write Keeper's charge.\n\nWhat happens: Keeper gives the order to charge, and the \
-             line breaks.\n\nGo to a desk.",
-        );
-        let m = review_mission(
-            ops.get(id).unwrap(),
-            "failing",
-            Some(Verdict::Fail),
-            &c,
-            None,
-        );
-        let w = m.work.as_ref().unwrap();
-        assert!(w.anew);
-        assert!(!w.edit_optional);
-        assert!(m.prompt.contains("First, write it anew."), "{}", m.prompt);
-        assert!(
-            m.prompt.contains(
-                "What it was to tell, from its brief — What happens: Keeper gives the order to \
-                 charge, and the line breaks.\n\n"
-            ),
-            "{}",
-            m.prompt
+            context(ops.get(sid).unwrap(), &c),
+            ["layers/eras/the-fall.md"]
         );
     }
 }

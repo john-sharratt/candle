@@ -74,7 +74,7 @@ const LADDER_MAX_TOKENS: u32 = 1200;
 /// so a long answer walks into one and stays: a 1,400-token story rung came back
 /// as its own opening paragraph, word for word, thirteen times.
 ///
-/// Everything else that fixes — the repeat penalty, DRY, the truncation they
+/// Everything else that fixes — the repetition penalties, the truncation they
 /// need to be safe — is the architecture's own configuration, which the guest
 /// now takes wholesale. This is the one value the ladder has an opinion about,
 /// set a little above the chat default because a narrator wants more range than

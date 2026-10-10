@@ -1,100 +1,197 @@
-//! What the command table's generator is configured to do: `<mind>/missions.yaml`.
+//! What the command table is configured to do: `<mind>/missions.yaml`.
 //!
-//! The file is authored content, like `projection.yaml`, so how a mission is
-//! asked for can change without touching the engine. It names the generators —
-//! each a kind of work and the prompt that writes one mission of it — how
-//! heavily each is drawn, and how many generated missions wait at the table.
+//! The file is authored content, like `projection.yaml`, so how work is found,
+//! asked for and carried can change without touching the engine. It names the
+//! shared prompts, the **generators** — each a table call that proposes one
+//! piece of work, the prompt that asks for it, how heavily it is drawn and the
+//! workflow its accepted proposals open — and the **workflows** operations run
+//! on ([`crate::engine::workflow`]); and how many missions wait at the table.
 //!
-//! **No template slots.** A prompt is the instruction alone; the engine appends
-//! what the mission is about (the character, its life so far, the documents in
-//! question) under headings of its own — see [`super::material`]. A slot in the
-//! prompt would be a second place the material's shape is decided, and the two
-//! would drift.
+//! **Every name is one the engine has.** A step's `call`, its `checks`, its
+//! `context` and its `tools`, and a workflow's `year`, name Rust: a name the
+//! engine does not implement is refused when the file is read, not discovered
+//! when an operation reaches it.
 
-use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use serde::Deserialize;
-
+use super::copied::BRIEF_COPIED;
+use super::gates::CHECKS;
 use super::target::Kind;
+use crate::engine::workflow::{parse_missions, By, Workflow};
 
-/// The file a mind configures its generator in.
+/// The file a mind configures its table in.
 pub const FILE: &str = "missions.yaml";
 
 /// How many generated missions wait at the table when the file does not say.
 const DEFAULT_KEEP: usize = 4;
 
-/// One configured generator: a kind of work and the prompt that asks for it.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The table calls a workflow step may run.
+pub const READING: &str = "reading";
+
+/// The checks a step's result may be held to beyond the gate's own
+/// ([`CHECKS`]): its document committed, changed from what the step found,
+/// not its brief copied ([`BRIEF_COPIED`]), and a rejection's evidence.
+pub const COMMITTED: &str = "committed";
+pub const CHANGED: &str = "changed";
+pub const REJECTION_QUOTES: &str = "rejection-quotes-the-draft";
+pub const REJECTION_NAMES_AN_ERA: &str = "rejection-names-an-era";
+
+/// The sections a Maker's step may put before its prompt.
+pub const MAKER_CONTEXT: &[&str] = &[
+    "world-then",
+    "worlds-words",
+    "reads",
+    "anchor",
+    "voice-example",
+    "storyline",
+];
+
+/// The sections the table's reading may be shown — see
+/// [`super::material::draft`].
+pub const READING_CONTEXT: &[&str] = &[
+    "draft",
+    "when-set",
+    "era-it-tells",
+    "whose-life",
+    "other-events",
+    "voice-example",
+    "era-it-falls-in",
+    "worlds-words",
+    "world-now",
+    "timeline",
+    "told",
+];
+
+/// The sections a generator's proposal may be shown — see
+/// [`super::material::render`].
+pub const PROPOSAL_CONTEXT: &[&str] = &[
+    "whose-life",
+    "life-story",
+    "events-written",
+    "latest-event",
+    "timeline",
+    "where-it-belongs",
+    "how-dated",
+    "document-a",
+    "document-b",
+    "era",
+    "stories-told",
+    "names-taken",
+];
+
+/// The acts a step may add to a Maker's own.
+pub const TOOLS: &[&str] = &["report_rejected"];
+
+/// When a workflow's work is done: the year its event falls in, or the year
+/// the era its story tells opens — both what `canon::set_in` works out.
+pub const YEARS: &[&str] = &["event-year", "era-opens"];
+
+/// One configured generator: the call that proposes its work, the prompt that
+/// asks for it, and the workflow its proposals open.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Generator {
-    /// Its name — what a generated mission's origin and the ledger carry.
+    /// Its name — what an operation's origin and the ledger carry.
     pub id: String,
-    /// What it finds work in, which decides the material it is handed.
+    /// What it finds work in, which decides the material it is handed and the
+    /// call it answers with.
     pub kind: Kind,
     /// How often it is drawn against the others. Zero switches it off.
-    #[serde(default = "one")]
     pub weight: u32,
-    /// What the model is asked, before the material.
+    /// What the model is asked, after the material.
     pub prompt: String,
-}
-
-fn one() -> u32 {
-    1
+    /// The sections of material it is shown ([`PROPOSAL_CONTEXT`]).
+    pub context: Vec<String>,
+    /// The workflow an accepted proposal opens.
+    pub workflow: String,
 }
 
 /// The whole configuration.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    /// The voice every generator writes in.
+    /// The table's own voice when it proposes work.
     pub system: String,
+    /// The table's voice when it reads a document — a reader's, not a
+    /// proposer's: told it sets work, a reading answered "nothing here worth
+    /// doing" and called the draft sound.
+    pub reader: String,
     /// How many generated missions to keep waiting at the table.
-    #[serde(default = "default_keep")]
     pub keep: usize,
-    /// What the table is asked when it reads a draft, before a review is set —
-    /// see [`super::reading`].
+    /// What the table is asked when it reads a document — see
+    /// [`super::reading`].
     pub reading: String,
     /// The voice a Maker writes a piece in when it sits down to compose —
     /// see [`crate::engine::compose`].
     pub writing: String,
     pub generators: Vec<Generator>,
+    pub workflows: Vec<Workflow>,
 }
 
-fn default_keep() -> usize {
-    DEFAULT_KEEP
+/// The kind of work a generator's `call` proposes.
+fn kind_of(call: &str) -> Option<Kind> {
+    match call {
+        "life_event" => Some(Kind::LifeEvent),
+        "correction" => Some(Kind::Contradiction),
+        "story" => Some(Kind::Gap),
+        _ => None,
+    }
 }
 
 impl Config {
     /// Parse and check a configuration.
     pub fn parse(yaml: &str) -> Result<Config, String> {
-        let c: Config = serde_yaml::from_str(yaml).map_err(|e| format!("{FILE}: {e}"))?;
-        if c.system.trim().is_empty() {
-            return Err(format!("{FILE}: `system` is empty"));
-        }
-        if c.reading.trim().is_empty() {
-            return Err(format!("{FILE}: `reading` is empty"));
-        }
-        if c.writing.trim().is_empty() {
-            return Err(format!("{FILE}: `writing` is empty"));
-        }
-        if c.generators.is_empty() {
+        let m = parse_missions(yaml).map_err(|e| format!("{FILE}: {e}"))?;
+        let prompt = |name: &str| -> Result<String, String> {
+            m.prompts
+                .get(name)
+                .filter(|p| !p.trim().is_empty())
+                .cloned()
+                .ok_or_else(|| format!("{FILE}: the shared prompt `{name}` is missing or empty"))
+        };
+        let (system, reader) = (prompt("table")?, prompt("reader")?);
+        let (reading, writing) = (prompt("reading")?, prompt("writing")?);
+        if m.generators.is_empty() {
             return Err(format!("{FILE}: no generators"));
         }
-        let mut seen = BTreeSet::new();
-        for g in &c.generators {
-            if g.id.trim().is_empty() || g.prompt.trim().is_empty() {
-                return Err(format!("{FILE}: a generator needs an `id` and a `prompt`"));
-            }
-            if !seen.insert(g.id.as_str()) {
-                return Err(format!("{FILE}: generator `{}` is named twice", g.id));
-            }
+        let mut generators = Vec::new();
+        for g in &m.generators {
+            let kind = kind_of(&g.call).ok_or_else(|| {
+                format!(
+                    "{FILE}: generator `{}` names the call `{}`; the calls that propose are \
+                     `life_event`, `correction` and `story`",
+                    g.id, g.call
+                )
+            })?;
+            known(
+                &format!("generator `{}`", g.id),
+                "context",
+                &g.context,
+                PROPOSAL_CONTEXT,
+            )?;
+            generators.push(Generator {
+                id: g.id.clone(),
+                kind,
+                weight: g.weight,
+                prompt: g.prompt.clone(),
+                context: g.context.clone(),
+                workflow: g.workflow.clone(),
+            });
         }
-        if c.generators.iter().all(|g| g.weight == 0) {
+        if generators.iter().all(|g| g.weight == 0) {
             return Err(format!("{FILE}: every generator has weight 0"));
         }
-        Ok(c)
+        for w in &m.workflows {
+            check_workflow(w)?;
+        }
+        Ok(Config {
+            system,
+            reader,
+            keep: m.keep.map_or(DEFAULT_KEEP, |k| k as usize),
+            reading,
+            writing,
+            generators,
+            workflows: m.workflows,
+        })
     }
 
     /// Read `<mind>/missions.yaml`. `Ok(None)` when the mind has none — a mind
@@ -111,6 +208,11 @@ impl Config {
     /// The generator by name.
     pub fn generator(&self, id: &str) -> Option<&Generator> {
         self.generators.iter().find(|g| g.id == id)
+    }
+
+    /// The workflow by name.
+    pub fn workflow(&self, name: &str) -> Option<&Workflow> {
+        self.workflows.iter().find(|w| w.name == name)
     }
 
     /// The generators in the order the `turn`th draw tries them: weighted
@@ -134,83 +236,161 @@ impl Config {
     }
 }
 
+/// Refuse a workflow naming anything the engine does not implement.
+fn check_workflow(w: &Workflow) -> Result<(), String> {
+    let at = |step: &str| format!("workflow `{}` step `{step}`", w.name);
+    if let Some(year) = w.year.as_deref().filter(|y| !YEARS.contains(y)) {
+        return Err(format!(
+            "{FILE}: workflow `{}` has the year `{year}`; the years are {}",
+            w.name,
+            list(YEARS)
+        ));
+    }
+    let checks: Vec<&str> = CHECKS
+        .iter()
+        .copied()
+        .chain([
+            COMMITTED,
+            CHANGED,
+            BRIEF_COPIED,
+            REJECTION_QUOTES,
+            REJECTION_NAMES_AN_ERA,
+        ])
+        .collect();
+    for s in &w.steps {
+        known(&at(&s.name), "checks", &s.checks, &checks)?;
+        known(&at(&s.name), "tools", &s.tools, TOOLS)?;
+        match (s.by, s.call.as_deref()) {
+            (By::Table, Some(READING)) => {
+                known(&at(&s.name), "context", &s.context, READING_CONTEXT)?
+            }
+            (By::Table, Some(call)) => {
+                return Err(format!(
+                    "{FILE}: {} runs the call `{call}`; a step's call is `{READING}`",
+                    at(&s.name)
+                ))
+            }
+            _ => known(&at(&s.name), "context", &s.context, MAKER_CONTEXT)?,
+        }
+    }
+    Ok(())
+}
+
+/// Refuse any of `names` not among `known`.
+fn known(whose: &str, what: &str, names: &[String], known: &[&str]) -> Result<(), String> {
+    match names.iter().find(|n| !known.contains(&n.as_str())) {
+        Some(n) => Err(format!(
+            "{FILE}: {whose} lists the {what} `{n}`, which the engine does not have; it has {}",
+            list(known)
+        )),
+        None => Ok(()),
+    }
+}
+
+fn list(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const YAML: &str = "\
-system: You set work.
-keep: 3
-reading: Read the draft.
-writing: You write for the record.
-generators:
-  - id: lives
-    kind: life_event
-    weight: 2
-    prompt: Find the next event.
-  - id: boundaries
-    kind: contradiction
-    prompt: Find what disagrees.
-  - id: off
-    kind: gap
-    weight: 0
-    prompt: Never drawn.
-";
+    /// The template npcd's own mind is written to.
+    const TEMPLATE: &str = include_str!("../../../../docs/npcd_workflows_current.yaml");
 
+    /// **The template is a configuration the engine runs**: its generators
+    /// bound to their workflows, its shared prompts the table's voices, and
+    /// every name it gives one the engine has.
     #[test]
-    fn a_configuration_parses_with_its_defaults() {
-        let c = Config::parse(YAML).unwrap();
-        assert_eq!(c.keep, 3);
-        assert_eq!(c.generators.len(), 3);
-        assert_eq!(c.generators[0].kind, Kind::LifeEvent);
-        assert_eq!(c.generators[1].weight, 1, "weight defaults to one");
-        assert_eq!(c.generator("boundaries").unwrap().kind, Kind::Contradiction);
+    fn the_template_parses_as_the_engines_configuration() {
+        let c = Config::parse(TEMPLATE).unwrap();
+        assert_eq!(c.keep, 4);
+        let generators: Vec<(&str, Kind, &str, u32)> = c
+            .generators
+            .iter()
+            .map(|g| (g.id.as_str(), g.kind, g.workflow.as_str(), g.weight))
+            .collect();
+        assert_eq!(
+            generators,
+            [
+                ("life-event", Kind::LifeEvent, "life-event", 3),
+                ("contradiction", Kind::Contradiction, "correction", 2),
+                ("untold", Kind::Gap, "story", 1),
+            ]
+        );
+        assert!(c.system.starts_with("You set work for the Makers"));
+        assert!(c.reader.starts_with("You read what the Makers write"));
+        assert!(c.reading.starts_with("Above is a draft a Maker wrote"));
+        assert!(c.writing.starts_with("You write this world's record"));
+        assert!(c.workflow("story").is_some() && c.workflow("nothing").is_none());
     }
 
     /// **Drawn by weight, never the one switched off, and every other as a
-    /// fallback.** Over three turns `lives` (weight 2) leads twice and
-    /// `boundaries` once.
+    /// fallback.** Over six turns `life-event` (weight 3) leads three times,
+    /// `contradiction` twice and `untold` once.
     #[test]
     fn the_draw_order_follows_the_weights() {
-        let c = Config::parse(YAML).unwrap();
-        let firsts: Vec<&str> = (0..3).map(|t| c.order(t)[0].id.as_str()).collect();
-        assert_eq!(firsts, ["lives", "lives", "boundaries"]);
-        let ids: Vec<&str> = c.order(2).iter().map(|g| g.id.as_str()).collect();
-        assert_eq!(ids, ["boundaries", "lives"]);
+        let c = Config::parse(TEMPLATE).unwrap();
+        let firsts: Vec<&str> = (0..6).map(|t| c.order(t)[0].id.as_str()).collect();
+        assert_eq!(
+            firsts,
+            [
+                "life-event",
+                "life-event",
+                "life-event",
+                "contradiction",
+                "contradiction",
+                "untold"
+            ]
+        );
+        let ids: Vec<&str> = c.order(5).iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(ids, ["untold", "life-event", "contradiction"]);
     }
 
+    /// **A name the engine does not have is refused when the file is read**,
+    /// naming where it is and what the engine has instead.
     #[test]
-    fn a_broken_configuration_is_refused_with_why() {
-        for (yaml, why) in [
-            ("system: ''\nreading: r\nwriting: w\ngenerators: []\n", "`system` is empty"),
-            ("system: x\nreading: ' '\nwriting: w\ngenerators: []\n", "`reading` is empty"),
-            ("system: x\nreading: r\nwriting: ' '\ngenerators: []\n", "`writing` is empty"),
-            ("system: x\nwriting: w\ngenerators: []\n", "missing field `reading`"),
-            ("system: x\nreading: r\ngenerators: []\n", "missing field `writing`"),
-            ("system: x\nreading: r\nwriting: w\ngenerators: []\n", "no generators"),
+    fn a_name_the_engine_does_not_have_is_refused() {
+        for (from, to, why) in [
+            ("call: story\n", "call: saga\n", "names the call `saga`"),
             (
-                "system: x\nreading: r\nwriting: w\ngenerators:\n  - {id: a, kind: gap, prompt: p}\n  - {id: a, kind: gap, prompt: q}\n",
-                "named twice",
+                "          - heading\n",
+                "          - spelling\n",
+                "the checks `spelling`",
             ),
             (
-                "system: x\nreading: r\nwriting: w\ngenerators:\n  - {id: a, kind: gap, weight: 0, prompt: p}\n",
-                "weight 0",
+                "          - storyline\n",
+                "          - gossip\n",
+                "the context `gossip`",
             ),
             (
-                "system: x\nreading: r\nwriting: w\ngenerators:\n  - {id: a, kind: review, prompt: p}\n",
-                "unknown variant",
+                "          - report_rejected\n",
+                "          - report_lost\n",
+                "the tools `report_lost`",
             ),
+            (
+                "year: era-opens\n",
+                "year: tomorrow\n",
+                "has the year `tomorrow`",
+            ),
+            ("call: reading\n", "call: skim\n", "runs the call `skim`"),
         ] {
-            let e = Config::parse(yaml).unwrap_err();
-            assert!(e.contains(why), "{e}");
+            let e = Config::parse(&TEMPLATE.replacen(from, to, 1)).unwrap_err();
+            assert!(e.contains(why), "{from:?}: {e}");
         }
+        let e = Config::parse(&TEMPLATE.replacen("  writing: |", "  written: |", 1)).unwrap_err();
+        assert!(e.contains("the shared prompt `writing` is missing"), "{e}");
     }
 
     #[test]
     fn a_mind_with_no_file_has_no_generator() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(Config::load(dir.path()), Ok(None));
-        std::fs::write(dir.path().join(FILE), YAML).unwrap();
+        std::fs::write(dir.path().join(FILE), TEMPLATE).unwrap();
         assert!(Config::load(dir.path()).unwrap().is_some());
     }
 }
