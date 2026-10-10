@@ -7,8 +7,10 @@ use super::admit_ground::AdmitPass;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
 use super::first_sample::{contiguous_runs, FirstSample, FirstSampled, PrefillEnd};
 use super::phase_split::cobatched_decode_rows;
+use super::priority_pause::rank;
 use super::wave_logits::WaveLogits;
 use super::*;
+use crate::projection::DecodePriority;
 use crate::recorded_reply::replayed_step;
 use crate::stats::streams_committed;
 use crate::token_buffer::TokenBuffer;
@@ -56,6 +58,31 @@ fn phase_target(phase: VramPhase) -> FreeRegionTarget {
         VramPhase::Load => LOAD_TARGET,
         VramPhase::Decode => DECODE_TARGET,
     }
+}
+
+/// The decode-to-prefill airtime ratio `R` that work of priority `work` yields
+/// to, given the priorities of the decodes running beside it: the highest ratio
+/// among the decodes that **outrank** it, or 1 when none does.
+///
+/// Only an outranking decode is protected. The throttle exists so background
+/// work runs underneath an interactive decode; a second conversation's prompt is
+/// not background to the first, and holding it to one layer a wave behind a
+/// `High` decode kept a 26-token prompt waiting 57 s for another conversation's
+/// whole tool round to finish.
+fn throttle_ratio(work: DecodePriority, decodes: impl IntoIterator<Item = DecodePriority>) -> u32 {
+    decodes
+        .into_iter()
+        .filter(|&d| rank(d) > rank(work))
+        .map(DecodePriority::ratio)
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Layers a creep advances per wave, out of `n`, at airtime ratio `ratio`:
+/// `ceil(n / ratio)`, never zero.
+fn creep_layer_budget(n: usize, ratio: u32) -> usize {
+    n.div_ceil(ratio.max(1) as usize).max(1)
 }
 
 /// The free-region setpoint for `phase`, in regions, given a KV side of
@@ -1746,37 +1773,37 @@ impl Scheduler {
         report
     }
 
-    /// Continuous-fair-wave prefill throttle: how many transformer layers a
-    /// background prefill/glue cohort advances **per wave**
-    /// (`docs/continuous_fair_waves.md`).
+    /// `R` for co-batched work of priority `work`: the decode-to-prefill airtime
+    /// ratio of the active foreground decodes that **outrank** it
+    /// (`docs/continuous_fair_waves.md` §3). The creep advances `ceil(N / R)`
+    /// layers a wave, and the decode quantum owes decode that share of a
+    /// co-batched step.
     ///
-    /// `budget = ceil(N / R)`, where `R` is the decode-to-prefill airtime ratio
-    /// of the interactive work to protect:
-    /// - **No foreground decode active** → `R = 1` → `budget = N`: the prefill
-    ///   clears every layer in one wave (nothing to shield → full speed).
-    /// - **Decode active** → `R` = the max `decode_priority` ratio over the active
-    ///   foreground decodes (default `High` when a layer can't be resolved) → the
-    ///   prefill creeps `~N/R` layers per wave while decode keeps its experts hot.
-    pub(super) fn wave_prefill_layer_budget(&self) -> usize {
-        let n = self.model.num_layers().max(1);
-        if self.foreground_decode_width() == 0 {
-            return n;
-        }
-        n.div_ceil(self.decode_airtime_ratio() as usize).max(1)
+    /// Each decode counts at its target layer's `decode_priority`, `High` where
+    /// that does not resolve — the band [`Self::priority_paused`] gates it in.
+    pub(super) fn airtime_ratio_over(&self, work: DecodePriority) -> u32 {
+        throttle_ratio(
+            work,
+            self.foreground_decodes()
+                .map(|sid| self.decode_priority_or_high(sid)),
+        )
     }
 
-    /// `R`, the decode-to-prefill airtime ratio the active decodes ask for: the
-    /// max `decode_priority` ratio over them (`High` where a layer cannot be
-    /// resolved), never below 1. The prefill throttle divides the layers by it,
-    /// and the decode quantum owes decode that share of a co-batched step.
-    pub(super) fn decode_airtime_ratio(&self) -> u32 {
-        self.active_decodes
-            .keys()
-            .filter_map(|sid| self.decode_layer_priority(*sid))
-            .map(|p| p.ratio())
-            .max()
-            .unwrap_or_else(|| crate::projection::DecodePriority::High.ratio())
-            .max(1)
+    /// The band a creep group runs at: its highest-ranked dialogue prefill, or
+    /// `Low` for a group of section chunks alone. A section chunk is background
+    /// ingest whatever slot it lands in; it rides at the speed of the prefill
+    /// it joined.
+    fn creep_priority(&self, members: &[WaveMember]) -> DecodePriority {
+        members
+            .iter()
+            .filter_map(|m| match m {
+                WaveMember::Prefill { seq_id, .. } => {
+                    Some(self.decode_priority_or_high(SequenceId(*seq_id)))
+                }
+                WaveMember::Section { .. } => None,
+            })
+            .max_by_key(|&p| rank(p))
+            .unwrap_or(DecodePriority::Low)
     }
 
     /// Resolve the `decode_priority` of a decode slot's target layer, or `None`
@@ -2616,11 +2643,9 @@ impl Scheduler {
         // drives segments 1 and 3. With neither, only the creep runs (seg 2).
         let has_fullsweep = n_dec > 0 || has_glue;
 
-        let budget = self.wave_prefill_layer_budget();
         // Not `let`: a residual/group mismatch below restarts the creep at layer 0
         // in place (see the check after `creep_tok`), which moves both.
         let mut cursor = self.wave_prefill_cursor;
-        let mut win_end = (cursor + budget).min(n);
 
         // Form/resume the creep group (dialogue prefills + section chunks) unless it
         // was already advanced this wave. A fresh group folds section chunks in to
@@ -2637,6 +2662,18 @@ impl Scheduler {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
         self.wave_cobatched = has_glue || !seq_ids.is_empty();
+
+        // The creep yields only to the decodes that outrank it. Without a creep
+        // the step co-batches glue and section chunks, which are background.
+        let work = if seq_ids.is_empty() {
+            DecodePriority::Low
+        } else {
+            self.creep_priority(&members)
+        };
+        let ratio = self.airtime_ratio_over(work);
+        self.wave_step_ratio = ratio;
+        let budget = creep_layer_budget(n, ratio);
+        let mut win_end = (cursor + budget).min(n);
 
         // No creep group → one full-sweep [0, N) forward folding decode + a
         // standalone section chunk (if pending) + glue. All full-sweep, no residual
@@ -4592,12 +4629,56 @@ mod turn_view_release_tests {
 }
 
 #[cfg(test)]
+mod creep_throttle_tests {
+    use super::{creep_layer_budget, throttle_ratio};
+    use crate::projection::DecodePriority::{High, Low, Normal};
+
+    /// Work yields only to a decode that outranks it, at that decode's ratio.
+    #[test]
+    fn work_yields_only_to_an_outranking_decode() {
+        assert_eq!(throttle_ratio(High, []), 1, "nothing decoding");
+        assert_eq!(
+            throttle_ratio(High, [High]),
+            1,
+            "a second conversation beside the first"
+        );
+        assert_eq!(throttle_ratio(High, [High, Normal, Low]), 1);
+        assert_eq!(
+            throttle_ratio(Low, [Low]),
+            1,
+            "an ingest beside its own turns"
+        );
+        assert_eq!(throttle_ratio(Low, [High]), 64);
+        assert_eq!(throttle_ratio(Low, [Normal]), 16);
+        assert_eq!(
+            throttle_ratio(Low, [Normal, High]),
+            64,
+            "the highest outranking ratio"
+        );
+        assert_eq!(throttle_ratio(Normal, [High, Low]), 64);
+        assert_eq!(throttle_ratio(Normal, [Normal, Low]), 1);
+    }
+
+    /// `ceil(n / R)` layers a wave, never zero.
+    #[test]
+    fn the_layer_budget_is_the_layers_over_the_ratio_rounded_up() {
+        assert_eq!(creep_layer_budget(48, 1), 48);
+        assert_eq!(creep_layer_budget(48, 16), 3);
+        assert_eq!(creep_layer_budget(40, 16), 3);
+        assert_eq!(creep_layer_budget(48, 64), 1);
+        assert_eq!(creep_layer_budget(1, 64), 1);
+        assert_eq!(creep_layer_budget(48, 0), 48, "a zero ratio reads as 1");
+    }
+}
+
+#[cfg(test)]
 mod priority_admission_tests {
     use std::sync::Arc;
 
-    use super::super::tests::make_test_scheduler;
+    use super::super::tests::{boundary_state, make_test_scheduler};
     use super::super::*;
     use super::wave_chunk_tests::dialogue_prefill;
+    use crate::projection::DecodePriority;
 
     const YAML: &str = r#"
 system_prompt:
@@ -4716,6 +4797,104 @@ layers:
             "never paused: it counts as High"
         );
         assert!(!sched.priority_paused(ingest), "and it pauses nothing");
+    }
+
+    /// **A second conversation's prompt is not held back by the first's
+    /// decode.** Both are dialogue, so the creep carrying the new prompt runs
+    /// every layer in one wave; an ingest prompt beside the same decode still
+    /// creeps at the dialogue's ratio.
+    #[test]
+    fn a_dialogue_prompt_beside_a_dialogue_decode_is_not_throttled() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let decoding = SequenceId(sched.session.create_sequence().expect("create"));
+        let second = SequenceId(sched.session.create_sequence().expect("create"));
+        let ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, decoding, "dialogue", 1);
+        bind(&mut sched, &builder, second, "dialogue", 2);
+        bind(&mut sched, &builder, ingest, "ingest", 3);
+        let (state, _rx) = boundary_state();
+        sched.active_decodes.insert(decoding, state);
+
+        let creep = [WaveMember::Prefill {
+            seq_id: second.0,
+            advance: 26,
+        }];
+        let band = sched.creep_priority(&creep);
+        assert_eq!(band, DecodePriority::High);
+        assert_eq!(sched.airtime_ratio_over(band), 1);
+
+        let creep = [WaveMember::Prefill {
+            seq_id: ingest.0,
+            advance: 26,
+        }];
+        let band = sched.creep_priority(&creep);
+        assert_eq!(band, DecodePriority::Low);
+        assert_eq!(sched.airtime_ratio_over(band), 64);
+    }
+
+    /// A section chunk is background whatever slot carries it: alone it runs
+    /// at `Low`, and beside a dialogue prompt it rides at the prompt's band.
+    #[test]
+    fn a_creep_runs_at_its_highest_prompt_and_sections_alone_are_low() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let prompt = SequenceId(sched.session.create_sequence().expect("create"));
+        let ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let section = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, prompt, "dialogue", 1);
+        bind(&mut sched, &builder, ingest, "ingest", 2);
+
+        let alone = [WaveMember::Section {
+            seq_id: section.0,
+            advance: 32,
+        }];
+        assert_eq!(sched.creep_priority(&alone), DecodePriority::Low);
+
+        let mixed = [
+            WaveMember::Prefill {
+                seq_id: ingest.0,
+                advance: 32,
+            },
+            WaveMember::Prefill {
+                seq_id: prompt.0,
+                advance: 32,
+            },
+            WaveMember::Section {
+                seq_id: section.0,
+                advance: 32,
+            },
+        ];
+        assert_eq!(sched.creep_priority(&mixed), DecodePriority::High);
+    }
+
+    /// A decode whose priority does not resolve (the titler, a summary probe)
+    /// is protected as `High` — the band it is gated in — so it holds ingest
+    /// back and yields nothing to a dialogue prompt.
+    #[test]
+    fn an_unresolvable_decode_counts_as_high() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let probe = SequenceId(sched.session.create_sequence().expect("create"));
+        let (state, _rx) = boundary_state();
+        sched.active_decodes.insert(probe, state);
+
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::Low), 64);
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::High), 1);
+    }
+
+    /// A finished decode and a compression pass protect nothing: only a
+    /// foreground decode still generating holds work back.
+    #[test]
+    fn only_a_running_foreground_decode_holds_work_back() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let done = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, done, "dialogue", 1);
+        let (mut state, _rx) = boundary_state();
+        state.finished = true;
+        sched.active_decodes.insert(done, state);
+
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::Low), 1);
     }
 }
 

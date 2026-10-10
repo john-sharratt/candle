@@ -91,6 +91,22 @@
       // turn ran at. Deliberately not the composer's defaults, so adopting them
       // on open is visible.
       const dials = { effort: 3, verbosity: 1, think: true, tools: 1 };
+      // Under `__ZEND_MOCK_DAEMON_TURNS__` a conversation that has taken a
+      // turn reads as the daemon stores it: the turns so far, ending at the
+      // question while its reply is still running, and `live` until it ends.
+      const stored = window.__ZEND_MOCK_DAEMON_TURNS__ && this._daemonConvs && this._daemonConvs[String(id)];
+      if (stored) {
+        return {
+          id: String(id),
+          title: stored.title,
+          dials,
+          archived: false,
+          updated_ms: Date.now(),
+          turn_count: stored.history.filter((m) => m.role === 'user').length,
+          history: stored.history.slice(),
+          live: !!(this._liveTurns && this._liveTurns[String(id)]),
+        };
+      }
       if (seed && seed.history && seed.history.length) {
         return Object.assign({}, seed, { dials });
       }
@@ -489,12 +505,85 @@
     // result is prefilled with progress (`prefill` events) before the answer.
     // The mock keeps no reply running between requests, so there is never one
     // to follow: the stored conversation is always complete.
+    // With `window.__ZEND_MOCK_DAEMON_TURNS__` set, a reply runs as the
+    // daemon runs one (`daemonTurn`) and an unfinished one is followed from
+    // its first frame.
     followConversation(id, handlers) {
+      const turn = window.__ZEND_MOCK_DAEMON_TURNS__ && this._liveTurns && this._liveTurns[String(id)];
+      if (turn) {
+        const t = setTimeout(() => {
+          if (turn.done) { if (handlers.onGone) handlers.onGone(); return; }
+          turn.frames.forEach(([k, args]) => { if (handlers[k]) handlers[k](...args); });
+          turn.clients.push(handlers);
+        }, 34);
+        return { cancel: () => { clearTimeout(t); this.letGo(turn, handlers); } };
+      }
       const t = setTimeout(() => { if (handlers.onGone) handlers.onGone(); }, 34);
       return { cancel: () => clearTimeout(t) };
     },
 
     streamChatCompletion(conv, text, opts, handlers) {
+      if (window.__ZEND_MOCK_DAEMON_TURNS__) return this.daemonTurn(conv, text, opts, handlers);
+      return this.runReply(conv, text, opts, handlers);
+    },
+
+    // A reply as the daemon runs one: to the end whatever its client does,
+    // recorded frame by frame for a client that comes back, and stored with the
+    // conversation when it ends. The question is stored at once, so the
+    // conversation reads as the daemon's does mid-reply — ending at its question,
+    // `live` — until the answer joins it.
+    daemonTurn(conv, text, opts, client) {
+      const id = String(conv.id);
+      const stored = this.storedConv(id, text);
+      stored.history = stored.history.concat([{ role: 'user', content: text }]);
+      const turn = { frames: [], clients: [client], content: '', done: false };
+      this._liveTurns = this._liveTurns || {};
+      this._liveTurns[id] = turn;
+      const fan = { onError: () => {} };
+      ['onStatus', 'onToken', 'onProjection', 'onTool', 'onThink', 'onPrefill', 'onLog'].forEach((k) => {
+        fan[k] = (...args) => {
+          if (k === 'onToken') turn.content += args[0];
+          turn.frames.push([k, args]);
+          turn.clients.forEach((c) => { if (c[k]) c[k](...args); });
+        };
+      });
+      fan.onDone = () => {
+        stored.history = stored.history.concat([{ role: 'assistant', content: turn.content }]);
+        turn.done = true;
+        delete this._liveTurns[id];
+        const clients = turn.clients;
+        turn.clients = [];
+        clients.forEach((c) => c.onDone());
+      };
+      this.runReply(conv, text, opts, fan);
+      return { cancel: () => this.letGo(turn, client) };
+    },
+
+    // A client leaves a daemon turn: the reply goes on without it. Its end is
+    // reported later, as an aborted fetch reports it, never inside `cancel`.
+    letGo(turn, client) {
+      const i = turn.clients.indexOf(client);
+      if (i < 0) return;
+      turn.clients.splice(i, 1);
+      setTimeout(() => client.onDone(), 0);
+    },
+
+    // The conversation a daemon turn is stored in, started from the seeded
+    // history where there is one.
+    storedConv(id, text) {
+      this._daemonConvs = this._daemonConvs || {};
+      if (!this._daemonConvs[id]) {
+        const seed = (this._convs || []).find((c) => c.id === id);
+        this._daemonConvs[id] = {
+          id,
+          title: seed ? seed.title : text,
+          history: seed && seed.history ? seed.history.slice() : [],
+        };
+      }
+      return this._daemonConvs[id];
+    },
+
+    runReply(conv, text, opts, handlers) {
       const timers = [];
       let cancelled = false;
       const later = (ms, fn) => { timers.push(setTimeout(() => { if (!cancelled) fn(); }, ms)); };

@@ -35,7 +35,9 @@ use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::profile::set_gpu_span_period;
 use candle_conversation::relief_trace;
 use clap::Parser;
+use tokio::sync::watch;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use web::tls::{self_signed, Entrance};
 
 use zend::access;
 use zend::api;
@@ -78,6 +80,13 @@ struct Cli {
     /// TCP port to listen on.
     #[arg(long, default_value_t = 8080)]
     port: u16,
+
+    /// Also serve HTTPS — HTTP/3 over UDP, HTTP/2 and HTTP/1.1 over TCP — on
+    /// this port of the same address, with a self-signed certificate made at
+    /// startup. For the hop from the `web` gateway (`self_signed: true` on its
+    /// route); a browser will not trust the certificate.
+    #[arg(long)]
+    tls_port: Option<u16>,
 
     /// Increase log verbosity.  -v = DEBUG, -vv = TRACE.
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -661,6 +670,33 @@ async fn main() -> anyhow::Result<()> {
                — web: http://{addr}/",
     );
 
+    // One shutdown signal for both entrances: the plain one drains on it, and
+    // the HTTPS one is told through this channel.
+    let (stopping_tx, mut stopping) = watch::channel(false);
+
+    // The HTTPS entrance, beside the plain one and serving the same router. Its
+    // certificate is made now and lives only in memory: a restart is a new key,
+    // which is what the gateway's `self_signed` route expects.
+    let tls_entrance = match cli.tls_port {
+        Some(port) => {
+            let tls_addr = SocketAddr::new(bind_ip, port);
+            let names = vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                bind_ip.to_string(),
+            ];
+            let entrance = Entrance::bind(tls_addr, self_signed(&names)?).await?;
+            tracing::info!(
+                addr = %tls_addr,
+                "https — HTTP/3 over udp, HTTP/2 and HTTP/1.1 over tcp, self-signed for {names:?}",
+            );
+            Some(tokio::spawn(entrance.serve(router.clone(), async move {
+                let _ = stopping.changed().await;
+            })))
+        }
+        None => None,
+    };
+
     // ── Serve, with graceful shutdown ─────────────────────────────────────────
     //
     // On Ctrl-C / SIGTERM the server stops accepting connections and drains
@@ -678,8 +714,17 @@ async fn main() -> anyhow::Result<()> {
     // wait on the peer's delayed ACK — the same stall the `web` gateway's
     // client side had (see `web/src/server.rs`).
     .tcp_nodelay(true)
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = stopping_tx.send(true);
+    })
     .await?;
+    // The HTTPS entrance drains on the same signal — the gateway's connections
+    // arrive there — and the substrate is flushed only once it has: no request
+    // starts a turn during the flush, and none in flight is cut off.
+    if let Some(task) = tls_entrance {
+        task.await??;
+    }
 
     tracing::info!("draining complete — flushing substrate…");
     shutdown_session.shutdown().await;

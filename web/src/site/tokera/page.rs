@@ -494,17 +494,39 @@ pub fn foot() -> String {
 /// footer pinned below a pane that scrolls is a strip of dead space stealing
 /// height from the thing you are reading; put it at the end of the document and
 /// it arrives when the document does.
+///
+/// The index sits behind a fold that only a phone shows. Below the two-pane
+/// width the index stacks above the document, and listing every entry there
+/// pushes the document off the first screen — so it collapses to one control
+/// that names what it opens. A checkbox and its label rather than `<details>`:
+/// the same markup has to be open on a wide screen and closed on a narrow one,
+/// which a stylesheet can do to a checkbox's siblings and cannot do to a
+/// `<details>` without script.
 pub fn split(m: &Meta, index: &str, view: &str) -> String {
     format!(
         "{open}<main class=\"split\">\n\
-         <aside class=\"pane-index\">{index}</aside>\n\
+         <aside class=\"pane-index\">\
+         <input type=\"checkbox\" id=\"pane-fold\" class=\"pane-fold-box\">\
+         <label for=\"pane-fold\" class=\"pane-fold\">{fold}</label>\
+         <div class=\"pane-body\">{index}</div>\
+         </aside>\n\
          <section class=\"pane-view\"><div class=\"pane-inner\">{view}\n{footer}</div></section>\n\
          </main>\n</body>\n</html>\n",
         open = doc_open(m),
+        fold = fold_label(m.nav),
         index = index,
         view = view,
         footer = footer(),
     )
+}
+
+/// What the folded index on a phone says it opens.
+fn fold_label(nav: Nav) -> &'static str {
+    match nav {
+        Nav::Blog => "All posts",
+        Nav::Papers => "All papers",
+        Nav::Home => "Index",
+    }
 }
 
 /// Escape for HTML text and for a double-quoted attribute value.
@@ -607,6 +629,46 @@ mod tests {
                 "{name}: beacon is not gated on the public host"
             );
         }
+    }
+
+    /// On a phone the index folds behind one control instead of stacking every
+    /// entry above the document, and the control names what it opens. The
+    /// toggle precedes its label and the index, because the stylesheet opens
+    /// the fold with sibling selectors from the toggle.
+    #[test]
+    fn a_split_page_folds_its_index_behind_one_labelled_control() {
+        let blog = split(
+            &Meta {
+                width: Width::Split,
+                ..meta()
+            },
+            "<ul class=\"pane-list\"></ul>",
+            "<p>doc</p>",
+        );
+        let toggle = blog
+            .find("<input type=\"checkbox\" id=\"pane-fold\" class=\"pane-fold-box\">")
+            .expect("fold toggle");
+        let label = blog
+            .find("<label for=\"pane-fold\" class=\"pane-fold\">All posts</label>")
+            .expect("fold label");
+        let body = blog
+            .find("<div class=\"pane-body\"><ul class=\"pane-list\"></ul></div>")
+            .expect("index inside the fold");
+        assert!(toggle < label && label < body, "{blog}");
+
+        let papers = split(
+            &Meta {
+                nav: Nav::Papers,
+                width: Width::Split,
+                ..meta()
+            },
+            "",
+            "",
+        );
+        assert!(
+            papers.contains("<label for=\"pane-fold\" class=\"pane-fold\">All papers</label>"),
+            "{papers}"
+        );
     }
 
     #[test]
