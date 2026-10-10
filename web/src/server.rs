@@ -26,18 +26,21 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use tower::Service;
 
+use crate::acme::{Challenges, Manager};
 use crate::asset;
 use crate::auth::Auth;
 use crate::config::{Config, Site, Upstream};
 use crate::content::{self, Roots};
 use crate::errors::{self, Problem};
 use crate::health::Health;
-use crate::proxy::{self, HttpClient};
+use crate::proxy;
+use crate::tls::{Entrance, Resolver, SecureEntrance};
+use crate::upstream_tls::Clients;
 
 #[derive(Clone)]
 struct App {
     cfg: Arc<Config>,
-    client: HttpClient,
+    clients: Clients,
     health: Health,
     /// Sign-in, if this deployment has any. Shared by every site: one account
     /// across the estate is the whole point of the gateway owning it.
@@ -68,6 +71,9 @@ pub struct Builder {
     local: HashMap<String, Router>,
     auth: Option<Arc<Auth>>,
     behind_gateway: bool,
+    /// HTTP-01 answers, set by the ACME manager and served on every hostname.
+    /// Empty — every token a 404 — where there is no TLS entrance.
+    challenges: Challenges,
 }
 
 impl Builder {
@@ -85,6 +91,7 @@ impl Builder {
             local: HashMap::new(),
             auth: None,
             behind_gateway: false,
+            challenges: Challenges::default(),
         };
 
         // Sites this crate is itself the backend for — tokera.com is documents,
@@ -149,6 +156,12 @@ impl Builder {
         self
     }
 
+    /// The HTTP-01 answers this server publishes — the map the ACME manager
+    /// writes and the challenge route reads.
+    pub fn challenges(&self) -> Challenges {
+        self.challenges.clone()
+    }
+
     /// The API answering this site's routes whose upstream is `local`.
     pub fn local_api(mut self, site: &str, router: Router) -> Self {
         self.local.insert(site.to_string(), router);
@@ -171,7 +184,7 @@ impl Builder {
 
     pub fn router(self) -> Router {
         let health = Health::new(self.cfg.server.backoff);
-        let client = proxy::client(Duration::from_millis(self.cfg.server.connect_timeout_ms));
+        let clients = Clients::new(Duration::from_millis(self.cfg.server.connect_timeout_ms));
         // Ahead of the fallback, so `/auth/*` is reached on every hostname —
         // including a site that proxies `/` and would otherwise swallow it.
         // Sign-in belongs to the estate, not to whichever daemon a name points
@@ -180,9 +193,13 @@ impl Builder {
             Some(a) => a.clone().router(),
             None => crate::auth::unconfigured_router(),
         };
+        // The same reasoning for the CA's challenges: asked for on every name,
+        // including one that redirects or proxies `/`, and answered by the
+        // gateway rather than by whichever site the name belongs to.
+        let challenge_routes = self.challenges.router();
         let app = App {
             cfg: Arc::new(self.cfg),
-            client,
+            clients,
             health,
             auth: self.auth,
             behind_gateway: self.behind_gateway,
@@ -196,6 +213,7 @@ impl Builder {
             .fallback(handle)
             .with_state(app)
             .merge(auth_routes)
+            .merge(challenge_routes)
             // Outermost, so it sees every answer — files, proxied and local
             // APIs, sign-in, error pages — and compresses whatever arrived
             // uncompressed. See `compress`.
@@ -204,10 +222,34 @@ impl Builder {
 
     pub async fn serve(self) -> anyhow::Result<()> {
         let addr = self.cfg.server.bind;
+        let tls = self.cfg.server.tls.clone();
+        let groups = crate::acme::names::groups(&self.cfg);
+        let challenges = self.challenges();
         announce(&self.cfg, &self.roots, &self.local);
         let router = self.router();
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!("web listening on http://{addr}");
+        // Bound before anything is served, so a store that does not load or a
+        // port that is taken stops the start rather than leaving the plain
+        // entrance up without it. The stored certificates are installed first,
+        // so a restart serves what it has without waiting on the CA.
+        let tls_task = match tls {
+            Some(tls) => {
+                let resolver = Resolver::new();
+                let manager = Manager::new(tls.acme.clone(), groups, challenges, resolver.clone());
+                manager.install_stored()?;
+                let entrance = Entrance::bind(tls.bind, resolver).await?;
+                tracing::info!(
+                    "web listening on https://{} — HTTP/3 over udp, HTTP/2 and HTTP/1.1 over tcp",
+                    entrance.local_addr()?
+                );
+                tokio::spawn(manager.run());
+                Some(tokio::spawn(entrance.serve(router.clone(), async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })))
+            }
+            None => None,
+        };
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -223,6 +265,11 @@ impl Builder {
             tracing::info!("shutting down");
         })
         .await?;
+        // The TLS entrance drains on the same signal; its requests in flight
+        // are answered before the process ends.
+        if let Some(task) = tls_task {
+            task.await??;
+        }
         Ok(())
     }
 }
@@ -370,6 +417,11 @@ async fn handle(
         req.extensions_mut().insert(id);
     }
 
+    // A request over the TLS entrance is https by construction; anything else
+    // is https only where the deployment says its public entrance is.
+    let secure = req.extensions().get::<SecureEntrance>().is_some()
+        || app.auth.as_ref().is_some_and(|a| a.is_secure());
+
     if let Some(route) = site.route_for(&path) {
         let want_html = errors::wants_html(&path, req.headers());
         return match &route.upstream {
@@ -399,7 +451,7 @@ async fn handle(
             Upstream::Url(url) => {
                 proxy::forward(
                     proxy::Forward {
-                        client: &app.client,
+                        client: app.clients.for_route(route.self_signed),
                         health: &app.health,
                         upstream: url,
                         rewrite_host: route.rewrite_host,
@@ -407,7 +459,7 @@ async fn handle(
                         want_html,
                         identity: identity.as_ref(),
                         assertion: assertion.as_deref(),
-                        secure: app.auth.as_ref().is_some_and(|a| a.is_secure()),
+                        secure,
                         // Applied only where the upstream said nothing — a
                         // daemon that states its own policy keeps it.
                         cache: app.cfg.server.cache,
@@ -484,6 +536,60 @@ async fn serve_files(app: &App, site: &Site, path: &str, headers: &header::Heade
         Problem::not_found(format!("no such file in site `{}`", site.name)),
         want_html,
     )
+}
+
+#[cfg(test)]
+mod challenge_routing_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    const YAML: &str = r#"
+sites:
+  - name: home
+    default: true
+    roots: ["."]
+  - name: alt
+    hosts: ["www.example.net"]
+    redirect: "https://example.net"
+  - name: proxied
+    hosts: ["code.example.net"]
+    api:
+      - prefix: /
+        upstream: "http://127.0.0.1:9"
+"#;
+
+    async fn ask(router: &Router, host: &str, path: &str) -> (StatusCode, String) {
+        let req = Request::get(path)
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap();
+        let res = router.clone().call(req).await.unwrap();
+        let status = res.status();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// **The CA's challenge is the gateway's to answer, on every name.** A
+    /// redirect site would otherwise answer `301` and a site proxying `/`
+    /// would hand the path to a daemon that has never heard of the token.
+    #[tokio::test]
+    async fn the_challenge_is_answered_ahead_of_redirects_and_proxies() {
+        let b = Builder::new(Config::from_yaml(YAML, std::path::Path::new(".")).unwrap());
+        b.challenges().set("tok", "tok.thumb");
+        let router = b.router();
+        for host in ["example.net", "www.example.net", "code.example.net"] {
+            assert_eq!(
+                ask(&router, host, "/.well-known/acme-challenge/tok").await,
+                (StatusCode::OK, "tok.thumb".to_string()),
+                "{host}"
+            );
+        }
+        // Everything else on the redirect site still redirects.
+        assert_eq!(
+            ask(&router, "www.example.net", "/other").await.0,
+            StatusCode::MOVED_PERMANENTLY
+        );
+    }
 }
 
 #[cfg(test)]

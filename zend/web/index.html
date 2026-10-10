@@ -451,6 +451,11 @@ import { estateSwitcher } from './common/lib/estate.js';
     hydrating: {},          // conv id → true while its first fetch is in flight (the pane shows it loading)
     hydrateGen: {},         // conv id → the newest history fetch asked for; an older one landing late is dropped
     reattempts: {},         // conv id → reconnects made to a reply whose stream broke; cleared when one finishes
+    // conv id → true for a reply still in flight on the daemon that this page is
+    // not following. The page follows one reply at a time — the one in view — so
+    // another conversation's stream is let go rather than ended; opening it
+    // picks the reply up again from the daemon (`reattachConv`).
+    detached: {},
     loadError: {},          // conv id → why its first fetch failed (the pane offers a retry)
     convMenuOpen: false,    // the open conversation's actions menu, under its title
     narrow: (typeof window !== 'undefined' && window.innerWidth < NARROW_W),
@@ -511,6 +516,10 @@ import { estateSwitcher } from './common/lib/estate.js';
   };
 
   let chatEl = null, logEl = null, promptEl = null, filesListEl = null, substrateEl = null;
+  // The one reply stream the page holds. One, whatever number of conversations
+  // are answering: a stream keeps its connection for the whole turn, and over
+  // plain HTTP/1.1 a browser allows six per origin across every tab, so a
+  // stream per conversation starves the status poll and every fetch behind it.
   let stream = null, logUnsub = null, hlTimer = null;
   // Identifies the stream `startStream` last opened; its handlers act only
   // while it is still this one.
@@ -1157,13 +1166,21 @@ import { estateSwitcher } from './common/lib/estate.js';
     writeHashConv(id);
     // Before the render, so the first frame already shows the conversation
     // loading — not the home page its still-empty history would draw.
-    hydrateIfNeeded(id);
+    openConv(id);
     // A conversation already hydrated this session gets its dials here: no
     // hydrate will land to do it. A first open adopts them in `hydrateConv`,
     // once the daemon has said what they are.
     const conv = S.conversations.find((c) => c.id === id);
     if (conv) adoptDials(conv.dials);
     setState({ activeId: id, sidebarDrawer: false, convMenuOpen: false }, () => { scrollChat(); if (!S.narrow) focusPrompt(); });
+  }
+  // Bring a conversation the page is about to show up to date: a detached
+  // reply is picked up again, a conversation never loaded is loaded. Every way
+  // of landing on a conversation goes through here — one that went straight to
+  // `hydrateIfNeeded` showed a detached reply frozen where the page let go of it.
+  function openConv(id) {
+    if (S.detached[id]) reattachConv(id);
+    else hydrateIfNeeded(id);
   }
   function hydrateIfNeeded(id) {
     const conv = S.conversations.find((c) => c.id === id);
@@ -1172,6 +1189,16 @@ import { estateSwitcher } from './common/lib/estate.js';
     hydrateConv(id, true);
   }
   function retryLoad(id) { S.loaded[id] = false; delete S.loadError[id]; hydrateIfNeeded(id); render(); }
+  // Pick a detached reply up again. What the page last saw of it is stale — the
+  // daemon kept answering — so the stored conversation replaces it, and the
+  // hydrate follows the reply if it is still running (`followIfLive`) or shows
+  // it complete if it has finished.
+  function reattachConv(id) {
+    delete S.detached[id];
+    S.conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, { streaming: false }) : c);
+    S.loaded[id] = true;
+    hydrateConv(id, true);
+  }
   // A failed turn's button. `resend` sends the same question again into the
   // same bubble: the request never reached the daemon, so it holds nothing of
   // it. `reload` takes the conversation as the daemon stored it.
@@ -1277,7 +1304,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     S.conversations = conversations;
     // The conversation it lands on may never have been opened: load it, rather
     // than show its empty history as the home page.
-    if (activeId) hydrateIfNeeded(activeId);
+    if (activeId) openConv(activeId);
     setState({ activeId, confirm: null, convMenuOpen: false }, focusPrompt);
   }
   function toggleArchived() {
@@ -1391,7 +1418,7 @@ import { estateSwitcher } from './common/lib/estate.js';
   // background summariser is monopolising GPU slots and the decode never
   // starts) — without it a hung stream would lock the conversation permanently.
   function stopStream() {
-    if (stream) { try { stream.cancel(); } catch (_) {} }
+    if (stream && streamConv === S.activeId) { try { stream.cancel(); } catch (_) {} }
   }
   // `follow`: the reply is already in flight on the daemon (the page reloaded
   // or lost its connection mid-turn) — attach to it instead of sending, and
@@ -1399,10 +1426,12 @@ import { estateSwitcher } from './common/lib/estate.js';
   function startStream(convId, userText, follow) {
     if (stream) {
       stream.cancel();
-      // The cancelled stream's own end is ignored below, so a turn it was
-      // still streaming in another conversation is ended here.
-      if (streamConv !== null && streamConv !== convId) endStreaming(streamConv);
+      // A reply streaming in another conversation is still running on the
+      // daemon: it is let go, not ended, and stays "answering" until it is
+      // opened again. The cancelled stream's own end is ignored below.
+      if (streamConv !== null && streamConv !== convId) S.detached[streamConv] = true;
     }
+    delete S.detached[convId];
     retireHydrates(convId);
     // Set by `onError`, read by `onDone`: a failed turn has nothing persisted to
     // hydrate from, and hydrating would replace the error bubble with an empty
@@ -1426,6 +1455,7 @@ import { estateSwitcher } from './common/lib/estate.js';
       // the stored conversation now holds all of it.
       onGone: () => {
         ended = true;
+        releaseStream();
         endStreaming(convId);
         S.loaded[convId] = true;
         hydrateConv(convId);
@@ -1477,6 +1507,7 @@ import { estateSwitcher } from './common/lib/estate.js';
       },
       onDone: () => {
         ended = true;
+        releaseStream();
         endStreaming(convId);
         if (failed) {
           // The daemon had the turn and runs it to the end whatever happened to
@@ -1505,17 +1536,26 @@ import { estateSwitcher } from './common/lib/estate.js';
     streamConv = convId;
   }
   // The stored conversation says a reply is in flight: show it streaming and
-  // follow it. Not while another conversation streams — the page runs one
-  // stream at a time, and following would cancel the user's own reply there;
-  // that conversation's next open follows instead.
+  // follow it. The page holds one stream, and the conversation in view has the
+  // claim on it — following this one lets go of another conversation's reply
+  // (`startStream` detaches it). A conversation out of view does not take the
+  // stream from one that holds it: it is left detached, answering, and its
+  // next open follows it.
   function followIfLive(id, live) {
     if (!live) return;
-    if (S.conversations.some((c) => c.streaming)) return;
+    if (stream && streamConv === id) return;
     const conv = S.conversations.find((c) => c.id === id);
     if (!conv) return;
     conv.history = conv.history.concat([{ role: 'assistant', content: '', streaming: true, status: '' }]);
     conv.streaming = true;
+    if (stream && id !== S.activeId) { S.detached[id] = true; return; }
     startStream(id, null, true);
+  }
+  // The stream has ended: nothing holds it, so the next one opened takes it
+  // from no one.
+  function releaseStream() {
+    stream = null;
+    streamConv = null;
   }
   // `handlers` with each one passed through `own`.
   function ownHandlers(own, handlers) {

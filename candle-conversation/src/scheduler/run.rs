@@ -104,18 +104,19 @@ fn cleanup_due(
 }
 
 /// The decode time a quantum owes after a step that also carried the prefill
-/// creep, given that step's duration and the airtime ratio `R` the decodes ask
-/// for: never less than a [`WAVE_SLICE`], and at least the step's own length over
-/// `R`.
+/// creep, given that step's duration and the airtime ratio `R` the creep yielded
+/// to (the ratio of the decodes that outrank it): never less than a
+/// [`WAVE_SLICE`], and at least the step's own length over `R`.
 ///
 /// **A co-batched step must not use up the slice it ran in.** The creep folds
-/// into a quantum's first step, and at `R = 1` (a `Low`-priority decode — an
-/// ingest's own turns) it takes every layer of an 8K-token chunk: 4.2 s at depth,
-/// past a 2 s slice, so the quantum returned after that one step and the next one
-/// co-batched again. Measured in zend: 24 of 135 steps carried the creep and took
-/// 100 s of a 120 s window — eight sessions decoding ~14% of the time where `R = 1`
-/// means equal airtime. Owing the step's length over `R` restores that ratio; a
-/// throttled creep (`Normal`, `High`) is a few layers, its step is short, and the
+/// into a quantum's first step, and at `R = 1` (nothing outranks it — an ingest
+/// beside its own turns, or a second conversation beside the first) it takes
+/// every layer of an 8K-token chunk: 4.2 s at depth, past a 2 s slice, so the
+/// quantum returned after that one step and the next one co-batched again.
+/// Measured in zend: 24 of 135 steps carried the creep and took 100 s of a 120 s
+/// window — eight sessions decoding ~14% of the time where `R = 1` means equal
+/// airtime. Owing the step's length over `R` restores that ratio; a creep held
+/// back by an outranking decode is a few layers, its step is short, and the
 /// slice it gets is the one it always had.
 fn decode_owed_after_cobatched(step: Duration, ratio: u32) -> Duration {
     WAVE_SLICE.max(step / ratio.max(1))
@@ -139,12 +140,19 @@ impl Scheduler {
     /// dialogue prefills (they're off the critical path — background work that
     /// co-batches opportunistically).
     pub(super) fn foreground_decode_width(&self) -> usize {
+        self.foreground_decodes().count()
+    }
+
+    /// The active foreground decodes themselves — the set
+    /// [`Self::foreground_decode_width`] counts, and the decodes the prefill
+    /// throttle protects (`airtime_ratio_over`).
+    pub(super) fn foreground_decodes(&self) -> impl Iterator<Item = SequenceId> + '_ {
         self.active_decodes
             .iter()
             .filter(|(_, s)| {
                 !s.finished && !matches!(s.seal_action, super::SealAction::CompressionPass { .. })
             })
-            .count()
+            .map(|(&id, _)| id)
     }
 
     /// Run decode steps until the `WAVE_SLICE` deadline or decode is empty.
@@ -229,7 +237,7 @@ impl Scheduler {
                 // The creep's share of a co-batched step is prefill airtime, not
                 // the decode's — see `decode_owed_after_cobatched`.
                 if self.wave_cobatched {
-                    let owed = decode_owed_after_cobatched(step, self.decode_airtime_ratio());
+                    let owed = decode_owed_after_cobatched(step, self.wave_step_ratio);
                     deadline = deadline.max(Instant::now() + owed);
                 }
             }

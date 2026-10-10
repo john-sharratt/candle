@@ -208,6 +208,42 @@ test.describe('1.3b a failed send', () => {
   });
 });
 
+// Two conversations answering at once. The page follows one reply — the one in
+// view — and a reply it lets go of keeps running on the daemon
+// (`__ZEND_MOCK_DAEMON_TURNS__` runs the mock's replies that way). Starting a
+// second conversation used to end the first one's reply on the page: going back
+// showed it cut off, with no further updates, until a reload.
+test.describe('1.3c a reply runs on while another conversation answers', () => {
+  const END = 'writes the assistant turn once';
+
+  test('going back to the first conversation follows its reply to the end', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_DAEMON_TURNS__ = true; });
+    await boot(page);
+    const ta = page.locator('#zend-prompt');
+    const reply = page.locator('[data-msg]').last().locator('.zmd');
+
+    await ta.fill('How does a request flow?');
+    await ta.press('Enter');
+    await expect(page.locator('.zcursor')).toBeVisible({ timeout: 5000 });
+
+    await page.getByTitle('New conversation').first().click();
+    await ta.fill('And the second question');
+    await ta.press('Enter');
+    await expect(page.locator('.zcursor')).toBeVisible({ timeout: 5000 });
+
+    await page.getByTitle('Expand sidebar').click();
+    await page.getByText('How does a request flow?').click();
+    await expect(reply).toContainText(END, { timeout: 15000 });
+    await expect(page.locator('.zcursor')).toHaveCount(0, { timeout: 5000 });
+    await expect(page.locator('.zerr')).toHaveCount(0);
+
+    // The second reply was let go of in turn; it is whole when opened again.
+    await page.getByText('And the second question').click();
+    await expect(reply).toContainText(END, { timeout: 15000 });
+    await expect(page.locator('.zerr')).toHaveCount(0);
+  });
+});
+
 test.describe('1.5b dials follow the conversation', () => {
   // The dials are asserted through the composer buttons, which carry the level
   // name — the state object is deliberately not exposed to the page, and a hook

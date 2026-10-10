@@ -38,7 +38,7 @@ pub const COOLDOWN: Duration = Duration::from_secs(15);
 pub const PAUSED_POLL: Duration = Duration::from_millis(250);
 
 /// A band's rank: higher outranks lower.
-fn rank(p: DecodePriority) -> usize {
+pub(super) fn rank(p: DecodePriority) -> usize {
     match p {
         DecodePriority::Low => 0,
         DecodePriority::Normal => 1,
