@@ -70,7 +70,7 @@ as its working directory. cf-ddns is the exception — see below.
 
 | Service | Machine | Listens | Build | Stop by default in `/down` |
 |---|---|---|---|---|
-| web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:8443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml` — 443 is `rdp-tunnel-server`'s) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
+| web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:9443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml` — `rdp-tunnel-server` holds 443 and 8443) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
 | zend | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the gateway's upstream | `cargo build --release -p zend` | yes |
 | npcd | .6 | `0.0.0.0:8081` | `cargo build --release -p npcd` | yes |
 | cf-ddns | .5 | — (outbound only) | scheduled task, see below | **never** |
