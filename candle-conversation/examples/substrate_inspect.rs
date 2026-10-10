@@ -18,7 +18,7 @@
 //!                         section-tree's branch variants were sealed distinctly)
 //!   chunks  <stream-id>   KV chunk records for a stream (format, sizes, bytes)
 //!   tokens  <stream-id>   decode a stream's Tokens record to token ids
-//!   meta                  the live ModelSpec / Template payloads
+//!   meta                  the live ModelKey / Template payloads
 //!   recover               what a recovery walk reconstructs (streams + tail)
 //!   projections [stream]  per-decode projection composition (the GUI panel data)
 //!   tree                  per-timeline summary forest from TreeMetadata records
@@ -771,7 +771,7 @@ enum Cmd {
         #[arg(long)]
         ids: bool,
     },
-    /// The live `ModelSpec` / `Template` payloads.
+    /// The live `ModelKey` / `Template` payloads.
     Meta,
     /// What a recovery walk reconstructs — stream counts + tail state.
     Recover,
@@ -5318,8 +5318,8 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     );
     println!("live chunks       {live_chunks}");
     println!(
-        "model spec        {}",
-        present(manifest.model_spec.is_some())
+        "model key         {}",
+        present(manifest.model_key.is_some())
     );
     println!("template          {}", present(manifest.template.is_some()));
     println!(
@@ -6064,8 +6064,8 @@ fn meta(log: &mut LogFile) -> Result<()> {
     let manifest = build_manifest(log)?;
     print_singleton(
         log,
-        "model spec",
-        manifest.model_spec.map(|l| (l.offset, l.record_size)),
+        "model key",
+        manifest.model_key.map(|l| (l.offset, l.record_size)),
     )?;
     print_singleton(
         log,
@@ -6111,7 +6111,7 @@ fn recover_view(log: &mut LogFile) -> Result<()> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const ALL_TYPES: [RecordType; 19] = [
-    RecordType::ModelSpec,
+    RecordType::ModelKey,
     RecordType::Template,
     RecordType::StreamDecl,
     RecordType::Chunk,

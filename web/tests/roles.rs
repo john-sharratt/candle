@@ -10,8 +10,15 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::Request;
 use axum::routing::{get, post};
 use axum::Router;
+use http_body_util::BodyExt;
+use tokio::net::TcpStream;
+use tower::ServiceExt;
+use web::auth::Gateways;
 use web::{Builder, Config};
 
 /// Serve a router on an ephemeral port and return its address. The task is
@@ -39,10 +46,7 @@ struct Res {
 /// A minimal HTTP/1.1 client. Using `hyper` directly rather than the crate's
 /// own proxy client keeps the test from passing because both sides share a bug.
 async fn get_with(addr: SocketAddr, path: &str, host: &str, accept: &str) -> Res {
-    use http_body_util::BodyExt;
-    use hyper::Request;
-
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
     tokio::spawn(async move {
@@ -53,7 +57,7 @@ async fn get_with(addr: SocketAddr, path: &str, host: &str, accept: &str) -> Res
         .uri(path)
         .header("host", host)
         .header("accept", accept)
-        .body(axum::body::Body::empty())
+        .body(Body::empty())
         .unwrap();
     let res = sender.send_request(req).await.unwrap();
     let status = res.status().as_u16();
@@ -78,9 +82,7 @@ async fn fetch(addr: SocketAddr, path: &str) -> Res {
 /// The response headers, lowercased, for assertions about what the gateway
 /// stamps on its own answers.
 async fn head_of(addr: SocketAddr, path: &str, host: &str) -> Vec<(String, String)> {
-    use hyper::Request;
-
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
     tokio::spawn(async move {
@@ -90,7 +92,7 @@ async fn head_of(addr: SocketAddr, path: &str, host: &str) -> Vec<(String, Strin
         .uri(path)
         .header("host", host)
         .header("accept", "text/html")
-        .body(axum::body::Body::empty())
+        .body(Body::empty())
         .unwrap();
     let res = sender.send_request(req).await.unwrap();
     res.headers()
@@ -145,10 +147,7 @@ fn fake_api() -> Router {
 
 /// A `GET` carrying caller-chosen headers, for the forgery test below.
 async fn get_with_headers(addr: SocketAddr, path: &str, extra: &[(&str, &str)]) -> Res {
-    use http_body_util::BodyExt;
-    use hyper::Request;
-
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
     tokio::spawn(async move {
@@ -163,7 +162,7 @@ async fn get_with_headers(addr: SocketAddr, path: &str, extra: &[(&str, &str)]) 
         req = req.header(*k, *v);
     }
     let res = sender
-        .send_request(req.body(axum::body::Body::empty()).unwrap())
+        .send_request(req.body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = res.status().as_u16();
@@ -235,13 +234,14 @@ async fn a_client_cannot_forge_identity_headers_into_a_local_api() {
 /// in-process boundary as a request extension and a network boundary as these
 /// headers, so a daemon on another box has nothing else to read. Clearing them
 /// for everyone makes the documented contract unimplementable; clearing them
-/// for everyone who has not declared `behind_gateway` makes it safe by default
-/// and possible on purpose.
+/// for every peer the daemon has not named with `trust` makes it safe by
+/// default and possible on purpose. The client here is loopback, which `trust`
+/// always believes.
 #[tokio::test]
 async fn a_daemon_behind_the_gateway_reads_the_identity_it_is_sent() {
     let addr = spawn(
         Builder::new(cfg(AUTHORITATIVE))
-            .behind_gateway()
+            .trust(Gateways::default())
             .local_api("npcd", fake_api())
             .router(),
     )
@@ -260,6 +260,50 @@ async fn a_daemon_behind_the_gateway_reads_the_identity_it_is_sent() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(r.body.contains(r#""user":"google-1""#), "{}", r.body);
     assert!(r.body.contains("wren@example.com"), "{}", r.body);
+}
+
+/// **Trust is by peer, not by server.** A daemon that trusts its gateway still
+/// clears the headers a machine sends when it reaches the port directly — the
+/// LAN is not the gateway — and believes the ones from the address it named.
+#[tokio::test]
+async fn a_trusting_daemon_believes_only_the_peers_it_named() {
+    let router = Builder::new(cfg(AUTHORITATIVE))
+        .trust(Gateways::new(
+            "192.168.0.5".parse().unwrap(),
+            &["10.0.0.9".parse().unwrap()],
+        ))
+        .local_api("npcd", fake_api())
+        .router();
+
+    let ask = |peer: &str| {
+        let router = router.clone();
+        let peer: SocketAddr = peer.parse().unwrap();
+        async move {
+            let mut req = Request::get("/v1/saw-identity")
+                .header("host", "127.0.0.1")
+                .header("x-tokera-user", "google-1")
+                .header("x-tokera-email", "admin@tokera.com")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let res = router.oneshot(req).await.unwrap();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8_lossy(&body).into_owned()
+        }
+    };
+
+    for forger in ["192.168.0.77:5000", "10.0.0.8:5000"] {
+        let body = ask(forger).await;
+        assert!(!body.contains("admin@tokera.com"), "{forger}: {body}");
+    }
+    for gateway in [
+        "192.168.0.5:5000",
+        "10.0.0.9:5000",
+        "[::ffff:192.168.0.5]:5000",
+    ] {
+        let body = ask(gateway).await;
+        assert!(body.contains("admin@tokera.com"), "{gateway}: {body}");
+    }
 }
 
 /// The declaration is opt-in, so the safe behaviour is what you get by
@@ -781,7 +825,7 @@ async fn a_websocket_upgrade_becomes_a_byte_tunnel() {
     let up = spawn_upgrading_echo().await;
     let addr = spawn(Builder::new(proxy_cfg(up)).router()).await;
 
-    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut sock = TcpStream::connect(addr).await.unwrap();
     sock.write_all(
         b"GET /v1/socket HTTP/1.1\r\n\
           host: npcd.test\r\n\

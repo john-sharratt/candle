@@ -1,0 +1,174 @@
+//! The process's own settings — where it listens and whom it believes — as
+//! command-line flags (`zend`) and as the `host:` section of `tokerad.yaml`. One
+//! struct for both, so a setting means the same thing whichever binary reads
+//! it.
+
+use std::net::IpAddr;
+
+use clap::{ArgAction, Args};
+use serde::Deserialize;
+
+use crate::server::Listen;
+
+/// The process's flags.
+#[derive(Args, Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HostArgs {
+    /// Address to bind the HTTP server to. Loopback by default — reachable from
+    /// this machine alone. Pass a LAN address or `0.0.0.0` to serve the
+    /// network; identity is still believed only from loopback, this address
+    /// and each `--gateway`.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// TCP port to listen on.
+    #[arg(long, default_value_t = 8080)]
+    pub port: u16,
+
+    /// Also serve HTTPS — HTTP/3 over UDP, HTTP/2 and HTTP/1.1 over TCP — on
+    /// this port of the same address, with a self-signed certificate made at
+    /// startup. For the hop from the `web` gateway (`self_signed: true` on its
+    /// route); a browser will not trust the certificate.
+    #[arg(long)]
+    pub tls_port: Option<u16>,
+
+    /// Address of a gateway whose `x-tokera-*` identity headers are believed,
+    /// in addition to loopback and the `--host` address (repeatable). Identity
+    /// from any other peer is cleared, and the caller is anonymous.
+    #[arg(long = "gateway", value_name = "IP")]
+    pub gateways: Vec<IpAddr>,
+
+    /// Recognize a loopback caller that sends no `x-tokera-*` headers as this
+    /// email, resolved against the estate's role table — for running a daemon
+    /// directly, with no gateway in front of it, and still being seen as an
+    /// admin or creator on this machine. Never applies to a request that
+    /// carries a forwarded identity, or to a peer that is not genuine loopback.
+    /// Refused together with `--gateway`: a daemon with a gateway in front of
+    /// it has one to sign people in. Off by default: any other local process or
+    /// account on this machine — and anything that relays remote traffic onto
+    /// loopback, such as a tunnel or a proxy on this box — is also recognized as
+    /// this email while it is set.
+    #[arg(long, value_name = "EMAIL")]
+    pub local_signin: Option<String>,
+
+    /// Increase log verbosity. -v = DEBUG, -vv = TRACE.
+    #[arg(short, long, action = ArgAction::Count)]
+    pub verbose: u8,
+}
+
+impl Default for HostArgs {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 8080,
+            tls_port: None,
+            gateways: Vec::new(),
+            local_signin: None,
+            verbose: 0,
+        }
+    }
+}
+
+impl HostArgs {
+    /// Where to listen, the address parsed. `--local-signin` beside a
+    /// `--gateway` is refused.
+    pub fn listen(&self) -> anyhow::Result<Listen> {
+        if self.local_signin.is_some() && !self.gateways.is_empty() {
+            anyhow::bail!(
+                "--local-signin stands in for a gateway that is not there, and --gateway names \
+                 one that is: a caller the gateway forwards without an identity would be signed \
+                 in as the local email. Use one or the other"
+            );
+        }
+        let bind: IpAddr = match self.host.as_str() {
+            "localhost" => IpAddr::from([127, 0, 0, 1]),
+            h => h.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid --host {h:?}: expected an IP address, e.g. 127.0.0.1 or 0.0.0.0"
+                )
+            })?,
+        };
+        Ok(Listen {
+            bind,
+            port: self.port,
+            tls_port: self.tls_port,
+            gateways: self.gateways.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        host: HostArgs,
+    }
+
+    /// The flags and the YAML read the same settings, with the same defaults.
+    #[test]
+    fn flags_and_yaml_agree() {
+        let flags = Cli::try_parse_from([
+            "x",
+            "--host",
+            "192.168.0.5",
+            "--port",
+            "8081",
+            "--tls-port",
+            "8444",
+            "--gateway",
+            "10.0.0.9",
+            "-v",
+        ])
+        .unwrap()
+        .host;
+        let yaml: HostArgs = serde_yaml::from_str(
+            "host: 192.168.0.5\nport: 8081\ntls_port: 8444\ngateways: [10.0.0.9]\nverbose: 1\n",
+        )
+        .unwrap();
+        assert_eq!(flags, yaml);
+        assert_eq!(
+            Cli::try_parse_from(["x"]).unwrap().host,
+            HostArgs::default()
+        );
+        assert_eq!(
+            serde_yaml::from_str::<HostArgs>("{}").unwrap(),
+            HostArgs::default()
+        );
+        assert!(serde_yaml::from_str::<HostArgs>("bind: 1.2.3.4").is_err());
+    }
+
+    #[test]
+    fn localhost_is_loopback_and_a_name_is_refused() {
+        let named = |host: &str| HostArgs {
+            host: host.into(),
+            ..HostArgs::default()
+        };
+        assert_eq!(
+            named("localhost").listen().unwrap().bind,
+            IpAddr::from([127, 0, 0, 1])
+        );
+        assert!(named("zend.local").listen().is_err());
+    }
+
+    /// `--local-signin` is for a daemon with no gateway; beside one it is
+    /// refused, and alone it is accepted.
+    #[test]
+    fn local_signin_with_a_gateway_is_refused() {
+        let args = |gateways: Vec<IpAddr>| HostArgs {
+            gateways,
+            local_signin: Some("me@example.com".into()),
+            ..HostArgs::default()
+        };
+        assert!(args(Vec::new()).listen().is_ok());
+        let err = args(vec![IpAddr::from([192, 168, 0, 5])])
+            .listen()
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("--local-signin stands in"), "{err}");
+    }
+}

@@ -3904,8 +3904,8 @@ mod tests {
     /// `verify_block` that is not yet a wall-clock win (verify runs one wave per
     /// block token), but tokens/step > 1 is the ACCEPTANCE signal a batched
     /// verify converts into speedup on this launch-bound decode — measured by
-    /// [`wave_speculative_speedup_with_drafter`]. Skips when the drafter
-    /// checkpoint is absent (`zend --download-deepseek`). `--ignored`.
+    /// [`wave_speculative_speedup_with_drafter`]. Skips when the target or the
+    /// drafter checkpoint is absent from the folder below. `--ignored`.
     #[test]
     #[ignore]
     fn wave_speculative_step_with_drafter_is_lossless() -> Result<()> {

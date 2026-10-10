@@ -601,10 +601,10 @@ impl Scheduler {
 
         // ── Warm tier ───────────────────────────────────────────────────────
         let warm = WarmSection {
-            resident_count: self.persist_trigger.warm_resident_count() as usize,
-            pending_warm_bytes: self.persist_trigger.pending_warm_bytes(),
-            pinned_undrainable_bytes: self.persist_trigger.pinned_undrainable_bytes(),
-            resident_bytes: self.persist_trigger.warm_resident_bytes(),
+            resident_count: self.persist_triggers.warm_resident_count() as usize,
+            pending_warm_bytes: self.persist_triggers.pending_warm_bytes(),
+            pinned_undrainable_bytes: self.persist_triggers.pinned_undrainable_bytes(),
+            resident_bytes: self.persist_triggers.warm_resident_bytes(),
         };
 
         // ── Host RAM ────────────────────────────────────────────────────────
@@ -617,9 +617,9 @@ impl Scheduler {
             .unwrap_or((0, 0));
         let budget = candle::vram::host_ram_budget(total);
         let warm_usage = self
-            .persist_trigger
+            .persist_triggers
             .warm_resident_bytes()
-            .saturating_add(self.persist_trigger.pending_warm_bytes());
+            .saturating_add(self.persist_triggers.pending_warm_bytes());
         let perf = candle::vram::host_perf();
         let host = HostSection {
             total_bytes: total,

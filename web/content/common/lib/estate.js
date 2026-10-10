@@ -7,20 +7,20 @@
  * element every page already has in the same corner — makes the answer to
  * "where am I" and "where else is there" the same click.
  *
- * # This list exists three times
+ * # This list exists twice
  *
- * Rust renders it for tokera.com, this module renders it for the npcd console,
- * and `zend/web/common/lib/estate.js` is a copy for zend, which embeds its own
- * assets and cannot read this directory. Three copies of one list is the thing
- * that drifts, so two tests pin it: `web/src/site/tokera/page.rs` compares the
- * Rust constant against this file, and `zend`'s copy is compared byte for byte.
- * Edit this file first and let the tests tell you what else to change.
+ * Rust renders it for tokera.com, and this module renders it for zend's UI and
+ * the npcd console — the host serves this directory to both at `/common/`. Two
+ * copies of one list is the thing that drifts, so `web/src/site/tokera/page.rs`
+ * compares the Rust constant against this file. Edit this file first and let
+ * the test tell you what else to change.
  *
  * # The icons are served by whichever site is showing the menu
  *
- * `/brand/<id>` on every host, from copies this switcher owns, rather than each
- * site's own favicon by absolute URL. That was the first design and it was
- * wrong twice over:
+ * `/brand/<id>` on every host, from copies this switcher owns (`brand/` beside
+ * this library — the gateway serves it at tokera.com's root, the host at
+ * `/brand/` for its UIs), rather than each site's own favicon by absolute URL.
+ * That was the first design and it was wrong twice over:
  *
  *   - **A site's icon was unreachable exactly when it mattered.** zend's came
  *     from `code.tokera.com`, so the moment zend was down its row lost its
@@ -33,7 +33,7 @@
  *
  * A copy is a second file to keep current, so the copies are pinned: the tests
  * in `web/src/site/tokera/page.rs` compare each one against the favicon it was
- * taken from, and against zend's set.
+ * taken from.
  */
 
 export const SITES = [

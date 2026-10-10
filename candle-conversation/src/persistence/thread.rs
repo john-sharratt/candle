@@ -13,9 +13,11 @@
 //!  │    `migrate_sealed_to_cpu` per layer, install warm.              │
 //!  │                                                                  │
 //!  │ 2. Phase warm→cold                                               │
-//!  │    Walk `warm_lru`, find slots with `cold = None`, gather GPU    │
+//!  │    Walk `warm_lru`, find slots with `cold = None`, gather warm   │
 //!  │    bytes to a `TurnChunkGrid`, append `Chunk` records to the     │
 //!  │    redo log, capture the per-chunk log offsets, install cold.    │
+//!  │    Sections follow, gathered off the device a bounded group at   │
+//!  │    a time under a chunk-location hold.                           │
 //!  │                                                                  │
 //!  │ 3. Phase fsync                                                   │
 //!  │    `commit_if_pending` — group-fsyncs whatever the previous      │
@@ -38,11 +40,15 @@ use std::time::{Duration, Instant};
 use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::Device;
-use candle_nn::kv_cache::{ChunkedKvBacking, CompressionPolicy, SealedSequence};
+use candle_nn::kv_cache::{
+    try_hold_chunk_locations, ChunkedKvBacking, CompressionPolicy, SealedSequence,
+};
 use crossbeam::channel::{self, Receiver, Sender};
 
 use super::cold_load::preallocate_pinned_scratch;
+use super::held_groups::{drain_in_held_groups, HeldDrain};
 use super::resume::TurnChunkGrid;
+use super::streams::StreamId;
 use super::transfer::seal_to_chunk_images;
 use crate::projection::Conversation;
 use crate::scheduler::relief_trace;
@@ -1245,9 +1251,9 @@ fn run_pass(
     // internal `Mutex`, so they serialise within this loop — that's
     // intentional, every Chunk record gets a unique log offset.
     //
-    // `snapshot_pending_cold` returns hot bytes (gather operates on
-    // GPU sealed); the same payload as warm, only its device backing
-    // differs.
+    // `snapshot_pending_cold` returns each residence's **warm** bytes —
+    // the stored form, CPU arenas — so the gather here reads host memory,
+    // and nothing it holds is ground a KV compaction relocates.
     //
     // A read-only substrate has no cold tier to write: its turns stay warm,
     // and Phases 2, 2.5, 3 and 4 have nothing to do. Phase 1 above and the
@@ -1311,68 +1317,65 @@ fn run_pass(
     // by the time we read it here.  The persistence thread's job is
     // purely to gather those final bytes off GPU and append them to the
     // redo log — no mutation of substrate state.
-    let pending_section_cold = if read_only {
-        Vec::new()
-    } else {
-        conversation.read().snapshot_pending_section_cold()
-    };
+    //
+    // **Gathered a bounded group at a time under a chunk-location hold, and no clone
+    // of a section's hot form outlives it** — the rule Phase 1 follows, for the same
+    // reason. A section's hot bytes are device chunks a KV compaction relocates, and
+    // this thread's locals are not among the holders a compaction sweeps. Snapshotted
+    // up front and held across every section's gather and redo-log write, the clones
+    // kept each relocated section's source slots alive after its residence had moved
+    // on, so pass after pass planned them again and found nobody to move onto the copy:
+    // ~180,000 of ~190,000 relocated slots `unwitnessed` per pass on the Qwen3-30B,
+    // for the seconds the 109-section tool catalog took to reach the log after a base
+    // conversation was built. Under the hold a group's gather reads exactly what the
+    // residences name; the write that follows carries host bytes only.
+    const MAX_GROUP_SECTIONS: usize = 8;
     let mut section_to_cold_bytes: u64 = 0;
     let mut section_to_cold_count: usize = 0;
-    if !pending_section_cold.is_empty() {
-        let mut section_cold_installs: Vec<(ResidenceIndex, Vec<StoredSequence>, u64)> =
-            Vec::with_capacity(pending_section_cold.len());
-        for (idx, stream_id, hot) in pending_section_cold {
-            if hot.len() != n_layers {
-                tracing::warn!(
-                    "persist: section {idx:?} hot has {} layers, expected {n_layers} — skipping",
-                    hot.len()
-                );
-                continue;
-            }
-            let grid = match build_grid(&hot, backings, device) {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!("persist: section gather failed for {idx:?}: {e}");
-                    continue;
+    let section_drain = if read_only {
+        HeldDrain::default()
+    } else {
+        drain_in_held_groups(
+            MAX_GROUP_SECTIONS,
+            try_hold_chunk_locations,
+            || {
+                conversation
+                    .read()
+                    .snapshot_pending_section_cold()
+                    .into_iter()
+                    .map(|(idx, stream_id, hot)| (idx, (stream_id, hot)))
+                    .collect()
+            },
+            |idx, (stream_id, hot)| {
+                if hot.len() != n_layers {
+                    tracing::warn!(
+                        "persist: section {idx:?} hot has {} layers, expected {n_layers} — \
+                         skipping",
+                        hot.len()
+                    );
+                    return None;
                 }
-            };
-            let stored = match conversation.persist_turn_chunks_capture(stream_id, &grid) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("persist: section write failed for {idx:?}: {e}");
-                    continue;
+                match build_grid(&hot, backings, device) {
+                    Ok(grid) => Some((stream_id, grid)),
+                    Err(e) => {
+                        tracing::warn!("persist: section gather failed for {idx:?}: {e}");
+                        None
+                    }
                 }
-            };
-            if stored.is_empty() {
-                continue;
-            }
-            let total_chunks: usize = stored.iter().map(|s| s.chunks.len()).sum();
-            let through = (total_chunks.max(1) - 1) as u64;
-            if let Err(e) = conversation.commit_stream_through(stream_id, through) {
-                tracing::warn!("persist: section commit_stream for {idx:?} failed: {e}");
-            }
-            let bytes_for_item: u64 = stored
-                .iter()
-                .flat_map(|s| s.chunks.iter())
-                .map(|c| c.record_len)
-                .sum();
-            tracing::trace!(
-                target: "candle_conversation::persistence::tier",
-                residence = idx.0,
-                stream_id = stream_id.0,
-                bytes = bytes_for_item,
-                "persisted section (redo-log append)"
-            );
-            section_cold_installs.push((idx, stored, bytes_for_item));
-        }
-        if !section_cold_installs.is_empty() {
-            let mut view = conversation.write();
-            for (idx, stored, bytes) in section_cold_installs {
+            },
+            |gathered| {
+                let (bytes, count) = persist_section_group(conversation, gathered);
                 section_to_cold_bytes = section_to_cold_bytes.saturating_add(bytes);
-                section_to_cold_count += 1;
-                view.install_cold(idx, stored);
-            }
-        }
+                section_to_cold_count += count;
+            },
+        )
+    };
+    if section_drain.deferred {
+        tracing::debug!(
+            target: "candle_conversation::persistence::tier",
+            groups = section_drain.groups,
+            "section persist deferred: a KV compaction is relocating chunks",
+        );
     }
 
     // ── Phase 2.6: warm-tier RAM purge ─────────────────────────────────
@@ -1480,6 +1483,61 @@ fn run_pass(
 /// Gather every layer's `SealedSequence` into a [`TurnChunkGrid`]
 /// (CPU-side). Each per-layer entry is a `Vec<ChunkImage>` produced by
 /// the existing GPU gather helper.
+/// Append one gathered group of sections to the redo log, commit each stream, and
+/// install the cold references under one write lock. Answers the bytes and the count
+/// installed.
+///
+/// Takes host bytes only: by the time a group reaches here its snapshots of the
+/// sections' device K/V are gone, so a slow write holds nothing a KV compaction has to
+/// account for.
+fn persist_section_group(
+    conversation: &Conversation,
+    gathered: Vec<(ResidenceIndex, (StreamId, TurnChunkGrid))>,
+) -> (u64, usize) {
+    let mut installs: Vec<(ResidenceIndex, Vec<StoredSequence>, u64)> =
+        Vec::with_capacity(gathered.len());
+    for (idx, (stream_id, grid)) in gathered {
+        let stored = match conversation.persist_turn_chunks_capture(stream_id, &grid) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("persist: section write failed for {idx:?}: {e}");
+                continue;
+            }
+        };
+        if stored.is_empty() {
+            continue;
+        }
+        let total_chunks: usize = stored.iter().map(|s| s.chunks.len()).sum();
+        let through = (total_chunks.max(1) - 1) as u64;
+        if let Err(e) = conversation.commit_stream_through(stream_id, through) {
+            tracing::warn!("persist: section commit_stream for {idx:?} failed: {e}");
+        }
+        let bytes_for_item: u64 = stored
+            .iter()
+            .flat_map(|s| s.chunks.iter())
+            .map(|c| c.record_len)
+            .sum();
+        tracing::trace!(
+            target: "candle_conversation::persistence::tier",
+            residence = idx.0,
+            stream_id = stream_id.0,
+            bytes = bytes_for_item,
+            "persisted section (redo-log append)"
+        );
+        installs.push((idx, stored, bytes_for_item));
+    }
+    let mut bytes = 0u64;
+    let count = installs.len();
+    if !installs.is_empty() {
+        let mut view = conversation.write();
+        for (idx, stored, b) in installs {
+            bytes = bytes.saturating_add(b);
+            view.install_cold(idx, stored);
+        }
+    }
+    (bytes, count)
+}
+
 pub(crate) fn build_grid(
     sealed_per_layer: &[SealedSequence],
     backings: &[ChunkedKvBacking],

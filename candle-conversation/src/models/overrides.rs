@@ -336,4 +336,15 @@ mod tests {
         );
         assert!(Model::from_override_key("NoSuchModel").is_none());
     }
+
+    /// The prescribed fine-tune is a preset like any other, addressable by its
+    /// name wherever a preset is.
+    #[test]
+    fn the_antiloop_styletune_fine_tune_is_a_preset() {
+        use super::super::Model;
+        assert!(matches!(
+            Model::from_override_key("Qwen36_35B_A3B_AntiLoop_StyleTune"),
+            Some(Model::Qwen36_35B_A3B_AntiLoop_StyleTune)
+        ));
+    }
 }

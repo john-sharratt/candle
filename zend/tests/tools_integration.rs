@@ -73,9 +73,9 @@ mod tool_scenarios {
     use candle_conversation::models::Model;
     use candle_conversation::projection::{SectionLoads, SystemItem};
     use candle_conversation::{SamplingConfig, SelectionState};
+    use host::MODEL as PRODUCTION;
     use zend::api::chat::{apply_tools_dial, dial_selection};
-    use zend::config::{DaemonConfig, ModelChoice};
-    use zend::log_broadcast::LogBus;
+    use zend::config::DaemonConfig;
     use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role, ToolMode};
 
@@ -137,7 +137,7 @@ mod tool_scenarios {
         if let Some(session) = shared.as_ref() {
             return Arc::clone(session);
         }
-        let session = boot(workspace(), ModelChoice::Preset(Box::new(MODEL))).await;
+        let session = boot(workspace(), MODEL).await;
         shutdown_at_exit();
         *shared = Some(Arc::clone(&session));
         session
@@ -307,15 +307,14 @@ mod tool_scenarios {
 
     /// Boot a ZendSession on `model` over `workspace` and wait for every startup
     /// step to finish.
-    async fn boot(workspace: PathBuf, model: ModelChoice) -> Arc<ZendSession> {
+    async fn boot(workspace: PathBuf, model: Model) -> Arc<ZendSession> {
         let compact_substrate = needs_compaction(&workspace);
         let config = DaemonConfig {
-            port: 0,
             model,
             compact_substrate,
             ..DaemonConfig::new(served(&workspace))
         };
-        let session = Arc::new(ZendSession::new(config, LogBus::new()));
+        let session = Arc::new(ZendSession::new(config));
         session.start_loading();
         while session.status_snapshot().loading.is_some() {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -340,7 +339,7 @@ mod tool_scenarios {
             Rig::Small => small_session().await,
             Rig::Production => {
                 release_shared_session().await;
-                boot(production_workspace(), ModelChoice::MeasuredVram).await
+                boot(production_workspace(), PRODUCTION).await
             }
         };
 
@@ -521,7 +520,7 @@ mod tool_scenarios {
             // deadline and blame the session under test.
             let pinned_before = settled_pinned().await;
 
-            let session = boot(workspace(), ModelChoice::Preset(Box::new(MODEL))).await;
+            let session = boot(workspace(), MODEL).await;
             let first = section_loads_of(&session);
             session.shutdown().await;
             // **A shut-down session releases what it pinned.** A full boot and
@@ -546,7 +545,7 @@ mod tool_scenarios {
 
             // The second boot is the daemon the scenarios share: it has been
             // booted, so it is kept.
-            let session = boot(workspace(), ModelChoice::Preset(Box::new(MODEL))).await;
+            let session = boot(workspace(), MODEL).await;
             let second = section_loads_of(&session);
             keep_as_shared(session).await;
             (first, second)

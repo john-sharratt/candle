@@ -1,10 +1,9 @@
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -16,6 +15,7 @@ use futures::{Stream, StreamExt};
 use candle_conversation::{
     FinishReason, OptionalState, SelectionState, NO_THINK_SELECTOR, TOOL_ROUND_SELECTOR,
 };
+use host::access::role;
 
 use super::chat_frames::{call_id, finish_reason, Framer, Framing};
 use crate::access;
@@ -87,11 +87,9 @@ pub fn tool_round_selection(selection: &SelectionState) -> SelectionState {
 /// `POST /v1/chat/completions`
 pub async fn completions(
     State(session): State<Arc<ZendSession>>,
-    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    let peer = peer.map(|ConnectInfo(a)| a.ip());
     let model = req.model.clone().unwrap_or_else(|| "zen-code".into());
     let id = format!("chatcmpl-{}", unix_ms());
     let created = unix_secs();
@@ -123,13 +121,7 @@ pub async fn completions(
     // projects, and whether its file tools change the disk. Resolved against
     // the caller's role (`crate::access`): absent is the role's default, and a
     // mode above the role runs as Restricted.
-    let role = access::role(
-        &headers,
-        peer,
-        session.gateways(),
-        session.roles(),
-        session.local_signin(),
-    );
+    let role = role(&headers, session.roles());
     let tools_mode = access::effective_mode(role, req.tools.as_ref().and_then(RequestTools::mode));
     // A client that runs its own tools sends their definitions instead.
     let client_tools = match req.tools {

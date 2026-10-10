@@ -23,6 +23,8 @@
 //! `phase12_recovers_from_substrate_restart` extends this to the
 //! cross-restart path.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -33,7 +35,8 @@ use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::projection;
 use candle_conversation::stencil::ThinkMode;
-use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, TurnEvent, TurnOptions};
+use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, TurnEvent};
+use common::quiet_turn;
 use tempfile::TempDir;
 use tracing::Level;
 
@@ -326,16 +329,16 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     LoadedDaemon { engine, dialogue }
 }
 
-fn ask(seq: &mut Sequence, prompt: &str) -> String {
+/// The reply's token budget: a file path, not a working-out.
+const ANSWER_TOKENS: usize = 80;
+
+/// Ask `daemon`'s dialogue `prompt` with thinking off ([`quiet_turn`]): a reply
+/// that reasons first spends the whole budget before it names a file.
+fn ask(daemon: &mut LoadedDaemon, prompt: &str) -> String {
+    let options = quiet_turn(&daemon.engine, ANSWER_TOKENS);
+    let seq = &mut daemon.dialogue;
     let handle = seq
-        .submit_turn_with_options(
-            prompt,
-            TurnOptions {
-                max_tokens: Some(80),
-                sampling: Some(SamplingConfig::argmax()),
-                ..Default::default()
-            },
-        )
+        .submit_turn_with_options(prompt, options)
         .expect("submit_turn");
     let mut response = String::new();
     let mut done = None;
@@ -365,7 +368,7 @@ fn phase12_recalls_a_known_function_in_the_test_fixture() {
         "Which file in this codebase defines the function `{PLANTED_FN_NAME}`? \
          Reply with just the file path."
     );
-    let answer = ask(&mut daemon.dialogue, &prompt);
+    let answer = ask(&mut daemon, &prompt);
     eprintln!("=== answer ===\n{answer}\n=== end answer ===");
 
     // The response should mention the file path that contains the
@@ -387,7 +390,7 @@ fn phase12_recovers_from_substrate_restart() {
     // First load — populates the substrate redo log.
     {
         let mut daemon = load_daemon(&workspace);
-        let _ = ask(&mut daemon.dialogue, "Say hi briefly.");
+        let _ = ask(&mut daemon, "Say hi briefly.");
         // Drop the daemon — drives a shutdown checkpoint via Drop on
         // the engine, then the redo log is durable.
     }
@@ -400,7 +403,7 @@ fn phase12_recovers_from_substrate_restart() {
         "Which file in this codebase defines `{PLANTED_FN_NAME}`? \
          File path only."
     );
-    let answer = ask(&mut daemon.dialogue, &prompt);
+    let answer = ask(&mut daemon, &prompt);
     eprintln!("=== answer after restart ===\n{answer}\n=== end answer ===");
     assert!(
         answer.contains(PLANTED_FILE) || answer.contains("probe.rs"),

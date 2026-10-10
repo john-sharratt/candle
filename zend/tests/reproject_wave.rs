@@ -23,7 +23,6 @@ mod wave {
     use futures::StreamExt;
 
     use zend::config::DaemonConfig;
-    use zend::log_broadcast::LogBus;
     use zend::session::{StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
@@ -199,9 +198,7 @@ mod wave {
     }
 
     async fn run(workspace: PathBuf, needs_priming: bool) {
-        let log = LogBus::new();
         let config = DaemonConfig {
-            port: 0,
             disabled_layers: ["repo_map", "code_reading"]
                 .iter()
                 .map(|s| s.to_string())
@@ -210,7 +207,7 @@ mod wave {
                 zend::workspace::single_repo(&workspace, "project").expect("workspace"),
             )
         };
-        let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
+        let session = Arc::new(ZendSession::new(config));
         session.start_loading();
 
         if needs_priming {

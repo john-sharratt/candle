@@ -201,10 +201,11 @@ pub struct SegmentedLog {
     /// in production; a field (not the bare const) so tests can drive rotation
     /// with a tiny target instead of writing multiple GiB.
     target_bytes: u64,
-    /// Opened by [`SegmentedLog::open_read_only_with_sink`]: every handle is
-    /// read-only, every sealed segment is held open, and every operation that
-    /// would create, rename, delete, truncate or write a file refuses with
-    /// [`PersistenceError::ReadOnly`].
+    /// Every operation that would create, rename, delete, truncate or write a
+    /// file refuses with [`PersistenceError::ReadOnly`]. Set from the start by
+    /// [`SegmentedLog::open_read_only_with_sink`] (which also opens every handle
+    /// read-only and holds every sealed segment open), or later by
+    /// [`SegmentedLog::close_for_writing`] when a writer hands the directory on.
     read_only: bool,
 }
 
@@ -229,8 +230,8 @@ pub struct OpenedSegments {
 /// segment's singletons in ascending id order so the highest-id occurrence
 /// wins (last-writer-wins recency).
 fn merge_singletons(into: &mut Manifest, from: &Manifest) {
-    if from.model_spec.is_some() {
-        into.model_spec = from.model_spec;
+    if from.model_key.is_some() {
+        into.model_key = from.model_key;
     }
     if from.template.is_some() {
         into.template = from.template;
@@ -532,10 +533,18 @@ impl SegmentedLog {
         self.active_id
     }
 
-    /// Whether this segment set was opened by
-    /// [`Self::open_read_only_with_sink`].
+    /// Whether this segment set refuses writes — opened by
+    /// [`Self::open_read_only_with_sink`], or closed by
+    /// [`Self::close_for_writing`].
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Refuse every write from now on. The handles stay open, so the segments
+    /// go on reading — and a sealed one another writer deletes stays readable
+    /// through them, as for a read-only open.
+    pub fn close_for_writing(&mut self) {
+        self.read_only = true;
     }
 
     /// Sealed segment ids on disk, ascending. Excludes the active.

@@ -2,11 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use candle_conversation::models::{Model, StrataTokens};
+use candle_conversation::EngineSource;
+use host::MODEL;
 use web::auth::Roles;
 use zend_tools::state::Secrets;
 use zend_vfs::Workspace;
 
-use crate::access::Gateways;
+use crate::tenant::requires;
 
 /// Runtime configuration for the zend daemon.
 #[derive(Clone, Debug)]
@@ -19,8 +21,6 @@ pub struct DaemonConfig {
     /// at launch from `~/.zend/secrets.yaml` or the file `--secrets` names
     /// ([`crate::secrets::load`]). Every context the daemon builds shares it.
     pub secrets: Arc<Secrets>,
-    /// TCP port the HTTP server listens on.
-    pub port: u16,
     /// Projection layers taken OUT OF SERVICE (`--disable-layer <name>`,
     /// repeatable). A disabled layer still exists in the schema, but it is
     /// inert: not ingested from the branches, **excluded from the provenance
@@ -76,9 +76,15 @@ pub struct DaemonConfig {
     /// reconcile and the background ingest worker — do not run. For a
     /// tool that reads a substrate the running daemon owns, beside it.
     pub read_only_substrate: bool,
-    /// Which model the daemon runs (`--model <PRESET>`). Defaults to the
-    /// measured-VRAM ladder in `model_choice`.
-    pub model: ModelChoice,
+    /// Which model the daemon runs: the host's prescribed one
+    /// ([`host::MODEL`]). A test harness names a small preset instead; the
+    /// daemon has no flag for it.
+    pub model: Model,
+    /// Where the engine comes from: built by the highest-ranked tenant of the
+    /// process with every tenant's requests merged, or attached to it
+    /// (`candle_conversation::EngineSlot`). A daemon on its own — and every
+    /// harness — has a slot of its own.
+    pub engine: EngineSource,
     /// `--qsa-selection-budget <N>`: run the QSA selection with `N` positions in
     /// place of the checkpoint's own budget (`ModelBuilder::qsa_selection_budget`);
     /// `None` keeps the checkpoint's. A budget of at least the checkpoint's
@@ -106,28 +112,21 @@ pub struct DaemonConfig {
     /// the user's next tool round waited behind it — 18 s on one conversation,
     /// most of a minute on another.
     pub summarize: bool,
-    /// Who is an admin — the table [`crate::access`] resolves a caller's tools
-    /// modes from. Empty (nobody) unless the daemon supplies one, so a harness
-    /// that builds a default config grants no admin mode over HTTP.
+    /// Who is an admin — the table a caller's tools modes resolve from
+    /// ([`crate::access`]). The host's estate table in the daemon; empty
+    /// (nobody) by default, so a harness that builds a default config grants no
+    /// admin mode over HTTP.
     pub roles: Roles,
-    /// The peers whose identity headers are believed — see
-    /// [`crate::access::Gateways`]. Loopback only unless the daemon names more.
-    pub gateways: Gateways,
-    /// `--local-signin <email>`: the identity a loopback caller with no
-    /// forwarded `x-tokera-*` headers is recognized as — see
-    /// [`crate::access::role`]. `None` unless the daemon was started with it.
-    pub local_signin: Option<String>,
 }
 
 impl DaemonConfig {
     /// A config serving `workspace` with every flag at its default: no
-    /// secrets, port 0, no layer flags, no depth bound, the measured-VRAM
-    /// model, nobody an admin, loopback the only trusted peer.
+    /// secrets, no layer flags, no depth bound, the prescribed model on an
+    /// engine of its own, nobody an admin.
     pub fn new(workspace: Workspace) -> Self {
         Self {
             workspace,
             secrets: Arc::new(Secrets::empty()),
-            port: 0,
             disabled_layers: HashSet::new(),
             wiped_layers: HashSet::new(),
             ingest_dirs: HashMap::new(),
@@ -135,13 +134,12 @@ impl DaemonConfig {
             compact_substrate: false,
             self_check: SelfCheck::Off,
             read_only_substrate: false,
-            model: ModelChoice::default(),
+            model: MODEL,
+            engine: EngineSource::solo("zend", requires()),
             qsa_selection_budget: None,
             qsa_strata: StrataTokens::DEFAULT,
             summarize: false,
             roles: Roles::default(),
-            gateways: Gateways::default(),
-            local_signin: None,
         }
     }
 }
@@ -156,17 +154,4 @@ pub enum SelfCheck {
     DryRun,
     /// Every conversation asked, and the corrupt ones tombstoned.
     Tombstone,
-}
-
-/// Which model a daemon runs.
-#[derive(Clone, Debug, Default)]
-pub enum ModelChoice {
-    /// Pick from the card's measured VRAM — `model_choice`'s ladder. What a
-    /// daemon launched without `--model` runs.
-    #[default]
-    MeasuredVram,
-    /// Run this preset whatever the card. Boxed because `Model` carries a whole
-    /// `ModelSpec` in its `Custom` variant, which would otherwise size every
-    /// `DaemonConfig` to it.
-    Preset(Box<Model>),
 }

@@ -4,10 +4,12 @@ use std::sync::Arc;
 use candle_nn::kv_cache::{KvFormat, QuantFormat};
 use candle_transformers::models::batched_inference::BatchedConfig;
 
+use crate::cancel::CancelToken;
 use crate::line_ends::line_end_token_ids;
 use crate::models::Dialect;
-use crate::persistence::SharedSubstrate;
+use crate::persistence::BoundSubstrate;
 use crate::projection::{CorruptTurnPolicy, LayerId};
+use crate::tenant_rank::TenantRank;
 use crate::token_buffer::TokenBuffer;
 use crate::tree::ConversationTreeConfig;
 
@@ -1559,49 +1561,21 @@ pub struct EngineConfig {
     /// `health.enabled == true`. Safe to set unconditionally.
     pub health: DecodeHealthConfig,
 
-    /// Workspace root whose `substrate/` directory backs the persistence
-    /// redo log. When `None`, the engine opens the substrate under the
-    /// process working directory (`SubstratePersistence::open`).
-    ///
-    /// Unread when [`Self::substrate`] carries an already-open one.
-    pub workspace_path: Option<std::path::PathBuf>,
+    /// The substrate the engine persists to, already bound to the model it
+    /// runs ([`BoundSubstrate::bind`]): the engine never opens one itself, so it
+    /// cannot run on a substrate another model wrote. `ModelBuilder` opens and
+    /// binds it before any weight is loaded.
+    pub substrate: BoundSubstrate,
 
-    /// A substrate the host process opened and goes on writing to itself.
-    ///
-    /// `None` — the ordinary case — and the engine opens
-    /// [`Self::workspace_path`] itself. `Some` is for a host with its own
-    /// record classes in the same log: one `substrate/` admits exactly one
-    /// writable handle per process, and a second silently loses records rather
-    /// than failing. See [`SharedSubstrate`].
-    pub substrate: Option<SharedSubstrate>,
+    /// The substrate's ingest-cancel latch — the daemon's, handed over through
+    /// `ModelBuilder::cancel_token` so a shutdown reaches its ingest from
+    /// before the engine exists. A fresh token by default.
+    pub cancel: CancelToken,
 
-    /// Open the workspace's substrate read-only
-    /// ([`SharedSubstrate::open_in_read_only`]) instead of read-write.
-    ///
-    /// For a tool that reads a workspace another process — the daemon — may be
-    /// appending to at the same time. The store must already exist, and nothing
-    /// under `substrate/` is created, renamed, deleted, truncated, grown or
-    /// written from engine start through shutdown. Everything in RAM works as it
-    /// does on a writable substrate — seals update the substrate mirror; labels,
-    /// tombstones and projection events apply — and a turn that would have gone
-    /// cold stays warm. The model spec is not recorded, and a tokenizer the log
-    /// records is still checked against [`Self::tokenizer`].
-    ///
-    /// Unread when [`Self::substrate`] carries an already-open one: that
-    /// handle's own mode rules. `false` by default.
-    pub read_only_substrate: bool,
-
-    /// Serialized model identity (HF repo / filename / arch / context length).
-    /// Written to the substrate's `ModelSpec` record at engine startup via
-    /// compare-and-insert, so the log is a self-contained, reloadable image.
-    /// `None` skips the write.
-    pub model_spec: Option<Vec<u8>>,
-
-    /// The model's `tokenizer.json` bytes. Written to the substrate's
-    /// `Tokenizer` record at engine startup via compare-and-insert so the log
-    /// can detokenize offline without a separate tokenizer file. `None` skips
-    /// the write.
-    pub tokenizer: Option<Vec<u8>>,
+    /// The rank of the tenant the substrate belongs to — where its sequences
+    /// stand against another tenant's attached to the same engine.
+    /// [`TenantRank::FIRST`] by default.
+    pub tenant_rank: TenantRank,
 
     /// The model's chat dialect — the structural-token strings the
     /// engine needs to know about for inter-turn boundary handling.
@@ -1623,7 +1597,7 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
-    pub fn new(eos_tokens: TokenBuffer) -> Self {
+    pub fn new(eos_tokens: TokenBuffer, substrate: BoundSubstrate) -> Self {
         let r16 = KvFormat::Quantized(QuantFormat::R16);
         Self {
             batched_config: BatchedConfig {
@@ -1642,11 +1616,9 @@ impl EngineConfig {
             show_special_tokens: false,
             penalty_log_path: None,
             health: DecodeHealthConfig::default(),
-            workspace_path: None,
-            substrate: None,
-            read_only_substrate: false,
-            model_spec: None,
-            tokenizer: None,
+            substrate,
+            cancel: CancelToken::new(),
+            tenant_rank: TenantRank::FIRST,
             dialect: Dialect::chat_ml(),
             layer_corrupt_turn: HashMap::new(),
         }

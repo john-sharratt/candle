@@ -6,8 +6,8 @@
 //! The consoles have **no build step**. `app.js` is served under that name for
 //! ever, so a long `max-age` is a promise that a *changed* file will not be
 //! fetched — a cached page talking to a newer API, and the end of the editing
-//! loop the daemons are run in, where `--content` serves the console from disk
-//! and a refresh is how a change is seen.
+//! loop the daemons are run in, where the console is served from disk and a
+//! refresh is how a change is seen.
 //!
 //! This went too far the other way first. `no-store` forbade keeping a copy at
 //! all, so every refresh re-downloaded the whole console — two hundred
@@ -50,7 +50,7 @@ pub(crate) const MIN_COMPRESS: usize = 860;
 ///
 /// - Code and documents get the **short** one, because a page running last
 ///   minute's JavaScript against this minute's API is the failure the whole
-///   policy exists to bound, and because `--content` serves them from disk so a
+///   policy exists to bound, and because they are served from disk so a
 ///   refresh can show an edit.
 /// - Images and fonts get the **long** one. A stale picture is a slightly old
 ///   picture.

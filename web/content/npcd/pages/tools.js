@@ -2,7 +2,7 @@
  * uncalibrated tool is a mysteriously bad NPC. */
 
 import { API } from '../lib/api.js';
-import { h } from '../lib/dom.js';
+import { h } from '/common/lib/dom.js';
 import { toast, modal, only, empty } from '../lib/ui.js';
 
 const MODE_SHORT = { physical: 'phys', instant_message: 'im' };

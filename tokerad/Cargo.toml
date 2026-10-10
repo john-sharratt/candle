@@ -1,0 +1,29 @@
+[package]
+name = "tokerad"
+version = "0.1.0"
+edition = "2021"
+description = "zend and npcd in one process, on one model"
+
+[[bin]]
+name = "tokerad"
+path = "src/main.rs"
+
+# The one crate that links both daemons (`docs/shared_model_host.md` §3.7):
+# `host` depends on neither, so `zend` and `npcd` each build without the other.
+[dependencies]
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+serde      = { workspace = true }
+serde_yaml = "0.9"
+host       = { path = "../host" }
+zend       = { path = "../zend" }
+npcd       = { path = "../npcd" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+web      = { path = "../web" }
+
+[features]
+default = []
+# Zero-cost scoped timing of the hot path; `/v1/profile` reports it.
+profile = ["host/profile", "zend/profile"]

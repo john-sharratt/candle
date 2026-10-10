@@ -37,6 +37,7 @@
 
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Names an *engine-internal* projection-id category — a "well-known" kind
@@ -425,6 +426,18 @@ impl Default for TimelineAllocator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The process's one timeline allocator.
+///
+/// Every substrate opened in the process mints from it, so a timeline id minted
+/// on one substrate is never minted on another attached to the same engine —
+/// which is what lets the scheduler key its maps by timeline alone. Ids a
+/// substrate already holds are checked against every other attached substrate's
+/// when it attaches (`ConversationEngine::attach`).
+pub fn process_timeline_allocator() -> Arc<TimelineAllocator> {
+    static ALLOCATOR: OnceLock<Arc<TimelineAllocator>> = OnceLock::new();
+    Arc::clone(ALLOCATOR.get_or_init(|| Arc::new(TimelineAllocator::new())))
 }
 
 /// Fully self-describing turn identifier.

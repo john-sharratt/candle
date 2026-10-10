@@ -1,22 +1,22 @@
-//! Read-only substrate viewer API (`/substrate.html`). A lazy hierarchy — the
-//! overview is deliberately lightweight (storage + counts + layer metadata), and
-//! each drill-down level is its own endpoint the page fetches only when the user
-//! expands that node:
+//! zend's substrate viewer API (`/substrate.html`). A lazy hierarchy — the
+//! overview is deliberately lightweight (storage + counts + layer metadata) and
+//! is the host's (`GET /v1/substrate`, zend's line built by `crate::tenant`), as
+//! is the tool catalog (`GET /v1/tools`); each drill-down level is its own
+//! endpoint the page fetches only when the user expands that node:
 //!
-//! - `GET /v1/substrate`                     — storage footprint, counts, layers.
-//! - `GET /v1/substrate/system-prompt`       — the target layer's framing.
-//! - `GET /v1/substrate/tools`               — the live tool catalog.
-//! - `GET /v1/substrate/layer/{name}`        — the conversations in one layer.
-//! - `GET /v1/substrate/timeline/{tl}`       — one conversation's summary forest.
-//! - `GET /v1/substrate/timeline/{tl}/selection` — its most recent score-density
-//!   selection: which nodes made the slot, why, and the pending/token/budget
-//!   counters around it. Unlike the other routes this is NOT a substrate read —
-//!   it is in-memory, last-write-wins per timeline, and empties on restart.
+//! - `GET /v1/substrate/zend/system-prompt`       — the target layer's framing.
+//! - `GET /v1/substrate/zend/layer/{name}`        — the conversations in one layer.
+//! - `GET /v1/substrate/zend/timeline/{tl}`       — one conversation's summary forest.
+//! - `GET /v1/substrate/zend/timeline/{tl}/selection` — its most recent
+//!   score-density selection: which nodes made the slot, why, and the
+//!   pending/token/budget counters around it. Unlike the other routes this is
+//!   NOT a substrate read — it is in-memory, last-write-wins per timeline, and
+//!   empties on restart.
 //!
 //! All read the daemon's live `Substrate` through a cloned `Conversation` handle
 //! (engine lock released immediately, only the substrate read guard held for the
 //! walk), never a rebuild from the multi-GB redo log, and return `503` until the
-//! model is loaded. They never mutate.
+//! model is loaded.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,27 +34,11 @@ use candle_conversation::turn_layout::TurnLayout;
 
 use crate::session::ZendSession;
 
-pub async fn overview(
-    State(session): State<Arc<ZendSession>>,
-) -> Result<Json<SubstrateOverview>, StatusCode> {
-    session
-        .substrate_overview()
-        .map(Json)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
-}
-
 pub async fn system_prompt(
     State(session): State<Arc<ZendSession>>,
 ) -> Result<Json<SystemPromptView>, StatusCode> {
     session
         .substrate_system_prompt()
-        .map(Json)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
-}
-
-pub async fn tools(State(session): State<Arc<ZendSession>>) -> Result<Json<ToolsView>, StatusCode> {
-    session
-        .substrate_tools()
         .map(Json)
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
@@ -69,7 +53,7 @@ pub async fn layer(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// `POST /v1/substrate/layer/:name/toggle` — flip a layer's runtime projection
+/// `POST /v1/substrate/zend/layer/:name/toggle` — flip a layer's runtime projection
 /// kill switch (in-memory, non-persistent). Excluding a populated layer from
 /// assembly lets you A/B whether it's the source of an incoherent response.
 pub async fn toggle_layer(
@@ -117,7 +101,7 @@ pub async fn timeline(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// `GET /v1/substrate/timeline/{tl}/selection` — see the module doc.
+/// `GET /v1/substrate/zend/timeline/{tl}/selection` — see the module doc.
 pub async fn selection(
     State(session): State<Arc<ZendSession>>,
     Path(tl): Path<String>,
@@ -131,7 +115,7 @@ pub async fn selection(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// `DELETE /v1/substrate/timeline/{tl}` — tombstone one timeline by its RAW id.
+/// `DELETE /v1/substrate/zend/timeline/{tl}` — tombstone one timeline by its RAW id.
 ///
 /// The conversation-scoped `DELETE /v1/conversations/{id}` cannot reach these.
 /// It derives the timeline as `hash(conv_id)`, which only addresses dialogue
@@ -169,7 +153,7 @@ pub async fn delete_timeline(
     }
 }
 
-/// What `DELETE /v1/substrate/system-prompt` retired.
+/// What `DELETE /v1/substrate/zend/system-prompt` retired.
 #[derive(Debug, Serialize)]
 pub struct SystemPromptRetired {
     /// Persisted section streams whose generation was ended — prefilled fresh
@@ -181,7 +165,7 @@ pub struct SystemPromptRetired {
     pub unregistered_sections: usize,
 }
 
-/// `DELETE /v1/substrate/system-prompt` — retire the persisted copy of every
+/// `DELETE /v1/substrate/zend/system-prompt` — retire the persisted copy of every
 /// dialogue system-prompt section so the next start prefills them fresh.
 ///
 /// A persisted section is keyed by its content, not by how it was compressed,
@@ -202,9 +186,10 @@ pub async fn retire_system_prompt(
     }
 }
 
-/// `GET /v1/substrate` — the lightweight top of the tree. No conversations,
-/// section text, or tool catalog: those are fetched per-expansion so init and
-/// the periodic refresh stay cheap regardless of corpus size.
+/// zend's line in `GET /v1/substrate` — the lightweight top of the tree. No
+/// conversations, section text, or tool catalog: those are fetched
+/// per-expansion so init and the periodic refresh stay cheap regardless of
+/// corpus size.
 #[derive(Serialize)]
 pub struct SubstrateOverview {
     pub storage: Storage,
@@ -239,19 +224,21 @@ pub struct SegmentView {
     pub bytes: u64,
 }
 
+/// The substrate's totals. A count is always `*_count`
+/// (`docs/shared_model_host.md` §3.5).
 #[derive(Serialize)]
 pub struct Counts {
-    pub timelines: usize,
-    pub conversations: usize,
-    pub sections: usize,
+    pub timeline_count: usize,
+    pub conversation_count: usize,
+    pub section_count: usize,
     /// Tokens sealed in the substrate: every live timeline's turns and the shared
     /// sections, each counted once. The layers' `tokens` sum to this less the
     /// sections and any timeline no layer lists.
-    pub tokens: usize,
+    pub token_count: usize,
 }
 
 /// One projection layer's schema config plus a conversation count (the list
-/// itself is fetched from `/v1/substrate/layer/{name}` on expand).
+/// itself is fetched from `/v1/substrate/zend/layer/{name}` on expand).
 #[derive(Serialize)]
 pub struct LayerView {
     pub name: String,
@@ -266,7 +253,7 @@ pub struct LayerView {
     /// `"<selector> = <option>"` labels. Empty inherits the section-tree defaults.
     pub dials: Vec<String>,
     /// Number of conversations targeting this layer.
-    pub conv_count: usize,
+    pub conversation_count: usize,
     /// Total sealed tokens across every conversation in this layer.
     pub tokens: usize,
     /// Runtime projection kill switch: `true` while this layer is toggled OFF
@@ -280,7 +267,7 @@ pub struct GroupView {
     pub selection: String,
 }
 
-/// `GET /v1/substrate/layer/{name}` — the conversations in one layer.
+/// `GET /v1/substrate/zend/layer/{name}` — the conversations in one layer.
 #[derive(Serialize)]
 pub struct LayerConversations {
     pub conversations: Vec<ConvView>,
@@ -302,7 +289,7 @@ pub struct ConvView {
     pub archived: bool,
     pub group: String,
     /// Turn count including summary nodes.
-    pub turns: u32,
+    pub turn_count: u32,
     /// The timeline's own sealed turn tokens — never the shared sections, which
     /// every conversation projects and none owns.
     pub tokens: usize,
@@ -319,7 +306,7 @@ pub struct ConvView {
     pub commit: String,
 }
 
-/// `GET /v1/substrate/system-prompt` — the single shared system prompt. Fetched
+/// `GET /v1/substrate/zend/system-prompt` — the single shared system prompt. Fetched
 /// when the "system prompt" card expands.
 #[derive(Serialize)]
 pub struct SystemPromptView {
@@ -344,8 +331,7 @@ pub struct SectionView {
     pub content: String,
 }
 
-/// `GET /v1/substrate/tools` — the live tool catalog. Fetched when the tools
-/// collection expands.
+/// zend's live tool catalog, as its entries in `GET /v1/tools`.
 #[derive(Serialize)]
 pub struct ToolsView {
     pub tools: Vec<ToolView>,
@@ -364,7 +350,7 @@ pub struct ToolView {
     pub parameters: Value,
 }
 
-/// `GET /v1/substrate/timeline/{tl}` body — one conversation's forest.
+/// `GET /v1/substrate/zend/timeline/{tl}` body — one conversation's forest.
 #[derive(Serialize)]
 pub struct TimelineDetail {
     pub timeline: String,
@@ -387,6 +373,8 @@ pub struct TimelineDetail {
     /// Turn indices that open a coupled exchange (a tool-call turn joined with
     /// its response turn) — the `from` side of each `TurnCoupling`.
     pub couplings: Vec<u32>,
+    /// How many turns `turns` holds.
+    pub turn_count: usize,
     /// Every turn in append order.
     pub turns: Vec<TurnView>,
 }
@@ -417,7 +405,7 @@ pub struct TurnView {
     pub layout: Option<TurnLayout>,
 }
 
-/// `GET /v1/substrate/timeline/{tl}/selection` body — the most recent
+/// `GET /v1/substrate/zend/timeline/{tl}/selection` body — the most recent
 /// score-density selection recorded for this timeline.
 #[derive(Serialize)]
 pub struct SelectionView {
@@ -442,13 +430,13 @@ pub struct SelectedNodeView {
     pub effective_score: Option<f32>,
 }
 
-/// `POST /v1/substrate/project` request — the typed query to project.
+/// `POST /v1/substrate/zend/project` request — the typed query to project.
 #[derive(Deserialize)]
 pub struct ProjectReq {
     pub text: String,
 }
 
-/// `POST /v1/substrate/project` body — what the query would retrieve, as tiles.
+/// `POST /v1/substrate/zend/project` body — what the query would retrieve, as tiles.
 #[derive(Serialize)]
 pub struct ProjectView {
     /// Query token count (the probe's wide-Q window length).

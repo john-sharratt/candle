@@ -29,11 +29,11 @@
  * you pause. Single flight is the throttle. */
 
 import { API } from '../lib/api.js';
-import { h, mount, fmtNum, fmtK } from '../lib/dom.js';
-import { link } from '../lib/router.js';
+import { h, mount, fmtNum, fmtK } from '/common/lib/dom.js';
+import { link } from '/common/lib/router.js';
 import { layerColor, empty, modal, toast } from '../lib/ui.js';
-import { singleFlight } from '../lib/live.js';
-import { copyText } from '../lib/clip.js';
+import { singleFlight } from '/common/lib/live.js';
+import { copyText } from '/common/lib/clip.js';
 
 const KIND_LABEL = {
   turn: 'turn', summary: 'summary', belief: 'belief',

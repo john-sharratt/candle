@@ -72,7 +72,7 @@ as its working directory. cf-ddns is the exception — see below.
 |---|---|---|---|---|
 | web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:9443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml` — `rdp-tunnel-server` holds 443 and 8443) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
 | zend | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the gateway's upstream | `cargo build --release -p zend` | yes |
-| npcd | .6 | `0.0.0.0:8081` | `cargo build --release -p npcd` | yes |
+| npcd | .6 | `0.0.0.0:8081` (`--host 0.0.0.0 --port 8081`) | `cargo build --release -p npcd` | yes |
 | cf-ddns | .5 | — (outbound only) | scheduled task, see below | **never** |
 
 ### Launch lines
@@ -85,7 +85,7 @@ Paths are relative to the repo root.
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
 | .5 | zend | `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --tls-port 8444 --max-depth 2 -v` | 2026-10-10 — the workspace is `D:\prog`, whose `workspace.yaml` lists the repositories (`candle`, `battle-cities`); its substrate is `D:\prog\substrate`. `repo_map` and `code_reading` ingest to two path components below each repository's root; what was ingested deeper is retained while a branch holds it; `--tls-port 8444` is the gateway's upstream (`self_signed: true` in `web/web.yaml`); `-v` (DEBUG) |
-| .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`) |
+| .6 | npcd | `target\release\npcd.exe --host 0.0.0.0 --port 8081 --gateway 192.168.0.5 --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`). Rewritten 2026-10-10 for the host's flags (not yet run): `--bind` became `--host`/`--port`, `--content` is gone, and `--gateway 192.168.0.5` is new — without it every signed-in visitor is anonymous |
 
 Notes on the arguments:
 
@@ -103,14 +103,39 @@ Notes on the arguments:
   npcd refuses to start on a directory without `projection.yaml`, and without `--mind` it
   runs the bundled placeholder with no content. Its startup log names the directory it
   resolved: `projection schema: … (collections resolve under <dir>)`.
-- **`--content`** (npcd) serves the console from `web/content/npcd` on disk instead of the
-  compiled-in copy, so a console edit is live on a refresh.
+- **The consoles are served from disk, always** (`docs/shared_model_host.md` §3.4): a
+  saved file is served on the next request and an open page reloads itself on its next
+  status poll. npcd's `--content` is gone with its compiled-in copy — a recorded npcd
+  line carrying it must drop it — and the directory is `--ui` (default
+  `web/content/npcd`; zend's, `zend/web`).
+- **`--gateway <ip>`** (zend and npcd) names a gateway whose identity headers are
+  believed; loopback and the bound address always are. npcd believed them from anyone
+  before; it now clears them from any other peer, so an npcd behind the gateway on
+  another machine needs `--gateway 192.168.0.5` to see who is signed in.
+- **`--model`** (zend) is gone: every daemon runs the prescribed model (`host::MODEL`).
+  A substrate written under another model refuses to open, naming both — start on a new
+  `--working-dir`, or move the old substrate aside.
 - **Wiping flags** — `--forget-conversations` (npcd) and `--wipe-substrate` (zend) destroy
   state. `/up` replays one only when the recorded line has it (the last run wiped) or the
   user asks for a wipe in that run, and says so before launching. It never adds one on its
-  own.
+  own. A self-heal relaunch never replays one (`ZendArgs::ONE_SHOT`,
+  `NpcdArgs::ONE_SHOT`), and `tokerad.yaml` cannot hold one: run the single binary with
+  the flag once.
+- **The process's flags are the same in every binary** (`host::HostArgs`): `--host`,
+  `--port`, `--tls-port`, `--gateway`, `--local-signin`, `-v`. `--local-signin` is
+  refused beside `--gateway`.
 - **Every flag must exist in the binary.** `/up` checks each recorded flag against `<exe> --help` and asks rather than
   dropping one silently, because clap refuses to start on an unknown flag.
+
+### tokerad (not deployed)
+
+`tokerad` runs zend and npcd in one process on one model
+(`docs/shared_model_host.md`): `cargo build --release -p tokerad`, then
+`target\release\tokerad.exe --config tokerad\tokerad.yaml` from the repo root. The
+config holds the process's settings under `host:` and each daemon's under its name, in
+the same shape as that daemon's own flags. It serves both on zend's ports; the gateway
+then points `bot.tokera.com` at `https://192.168.0.5:8444` beside `code.tokera.com`,
+and the host picks each UI by name. Its log is `tokerad.log` beside zend's substrate.
 
 ### cf-ddns
 
@@ -140,7 +165,7 @@ and then **flushes the substrate** (demotes every hot turn to disk and fsyncs th
 before exiting. So a stop is Ctrl-C first, delivered to the detached process's console, and
 a forced kill only if it does not exit in time. A forced kill of zend skips the flush.
 
-## Self-healing (zend only)
+## Self-healing
 
 None of these daemons runs under a service manager or a restart-on-exit wrapper — see
 "Services" above — with the single exception of cf-ddns's scheduled-task supervisor. That
@@ -149,16 +174,18 @@ failing forever) served nothing for 40+ minutes before anyone noticed, because n
 watching, and the old GPU-poison watchdog only exited cleanly "for a supervisor to relaunch"
 — a supervisor that does not exist here.
 
-zend now relaunches itself instead. `candle::gpu_poison` flags the CUDA context poisoned on
-a sticky fault (illegal address, launch failure, device assert, ECC) **or** on an
+Every daemon now relaunches itself instead — the watchdog is the host's (`host::self_heal`),
+so zend, npcd and tokerad all carry it. `candle::gpu_poison` flags the CUDA context poisoned
+on a sticky fault (illegal address, launch failure, device assert, ECC) **or** on an
 out-of-memory streak that has run for 60 s straight with no successful device operation in
 between (`candle_core::gpu_poison::OOM_STICKY_AFTER`) — a single large-request OOM is not
-sticky on its own and is left to admission control. On either, `zend/src/self_heal.rs`:
+sticky on its own and is left to admission control. On either, the watchdog:
 
 1. logs the root fault (plus the recent-kernel-launch breadcrumb);
-2. drops a marker next to `substrate/zend.log` so the relaunch **appends** instead of the
-   ordinary fresh-boot truncate — the whole point is to keep the evidence readable across the
-   restart, in one file;
+2. drops a marker next to the process's log (`<binary>.log` beside the highest-ranked
+   tenant's substrate — `substrate/zend.log` for zend) so the relaunch **appends** instead
+   of the ordinary fresh-boot truncate — the whole point is to keep the evidence readable
+   across the restart, in one file;
 3. spawns an identical process — same executable, same argv (captured from its own launch,
    not reconstructed from parsed flags), same working directory;
 4. exits with code 75 (distinct from clean shutdown 0 and Ctrl-C 130).
@@ -169,15 +196,15 @@ line so the boundary is visible when reading the file. The substrate redo log is
 so the abrupt exit loses nothing durable.
 
 **Relaunching is capped at 5 consecutive fast poisonings** (one within 5 minutes of the
-relaunched process's own start) — `zend/src/self_heal.rs`'s `relaunch_decision`, count
-persisted in `substrate/.self_heal_attempts`. Past the cap it stays down and exits 76
+relaunched process's own start) — `host::self_heal`'s `relaunch_decision`, count
+persisted in `.self_heal_attempts` beside the log. Past the cap it stays down and exits 76
 instead of relaunching again: a genuinely broken card or driver poisons every fresh process
 within moments, and an uncapped watchdog would crash-loop on that forever rather than
 surfacing "a human needs to look at this machine." A poisoning after a healthy multi-minute
 uptime resets the count — it's a fresh occurrence, not a continuation of the same fault.
 
-**npcd has no equivalent yet** — it does not link `self_heal`, so the same class of stuck
-device would still need a human to notice and restart it by hand.
+A binary built before the host (the npcd running on `.6` until it is rebuilt) has no
+watchdog of its own, so the same class of stuck device still needs a human there.
 
 ## Health checks
 
@@ -186,8 +213,8 @@ Expected results, as measured 2026-09-13:
 
 | Check | How | Healthy |
 |---|---|---|
-| zend on the LAN | `curl http://192.168.0.5:8081/v1/status` | `"state":"ready"` — it answers `200` with `"state":"loading"` throughout startup |
-| npcd on the LAN | `curl http://192.168.0.6:8081/v1/status` | `200` |
+| zend on the LAN | `curl http://192.168.0.5:8081/v1/status` | `"state":"ready"` — it answers `200` with `"state":"loading"` throughout startup; a host-built zend also carries `"tenants":{"zend":{"state":"ready",…}}` |
+| npcd on the LAN | `curl http://192.168.0.6:8081/v1/status` | `200`; a host-built npcd answers with `"tenants":{"npcd":…}` |
 | gateway config | `target\release\web.exe --config web/web.yaml --check` | exit 0 |
 | gateway routing | `curl -H "Host: <name>" http://127.0.0.1/` for `tokera.com`, `code.tokera.com`, `bot.tokera.com` | `200` / `30x` / `401`; `503` = that upstream is down |
 | from the internet | `curl https://<name>/` for `tokera.com`, `www.tokera.com`, `battlecities.net`, `code.tokera.com`, `bot.tokera.com` | not `5xx`, not `000` |

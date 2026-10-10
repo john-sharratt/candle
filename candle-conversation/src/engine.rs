@@ -1,15 +1,21 @@
 //! The conversation engine: entry point, spawns the scheduler thread.
 
+use crate::cancel::CancelToken;
 use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
 use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
+use crate::engine_attachments::Attachments;
 use crate::error::ConversationError;
 use crate::handle::{TokenDecoder, TurnEvent};
 use crate::ingest_warmer::IngestWarmer;
+use crate::models::identity::ModelKey;
+use crate::models::Dialect;
 use crate::persistence::manifest::ConvState;
 use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
+use crate::persistence::triggers::FIRST_ATTACHMENT;
 use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
-use crate::persistence::SharedSubstrate;
+use crate::persistence::BoundSubstrate;
+use crate::projection::CorruptTurnPolicy;
 use crate::projection::{
     Builder, CollectionWarm, Conversation, GalleryPreload, GroupId, LayerId, PlainPromptFrames,
     ProjectionTarget, Reserved, Schema, SectionId, TimelineId, TurnIndex, WorkingSetShare,
@@ -21,6 +27,7 @@ use crate::stencil::{
     ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
     MAX_TOOL_CALLS_PER_TURN,
 };
+use crate::tenant_rank::TenantRank;
 // `ChannelProbeRunner` is deliberately not imported: the summariser is
 // disconnected, so nothing constructs a runner.
 use crate::substrate::ConvCompression;
@@ -30,12 +37,14 @@ use crate::turn_text::literal_tokenizer;
 use crate::working_set::{Limits, Refusal, WorkingSet};
 
 use candle::quantized::pinned_staging::release_recycled_wc;
+use candle::Device;
+use candle_nn::kv_cache::{ChunkedKvBacking, CompressionPolicy};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use candle_transformers::models::delta_net::release_seal_readback;
 use flume::{Receiver, Sender};
-use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -218,52 +227,68 @@ enum Resumed {
 /// println!("{}", response.text);
 /// ```
 pub struct ConversationEngine {
+    /// What this handle shares with every other substrate attached to the
+    /// same engine: the scheduler and the model it owns.
+    core: Arc<EngineCore>,
+
+    /// This attachment's id — how the scheduler knows its persistence trigger.
+    attachment: u64,
+
+    /// The frame sections handed out to plain-prompt conversations, and the
+    /// claim on each — see [`Self::plain_prompt_section`]. Sections live in a
+    /// substrate, so the frames are this attachment's.
+    plain_frames: Mutex<PlainPromptFrames>,
+
+    /// This attachment's `Conversation` handle on its substrate: holds per-turn
+    /// metadata (token counts, scores, sig entries, sealed-sequence handles)
+    /// across every `Sequence` allocated from this engine handle. Each
+    /// `Sequence` receives a clone.
+    conversation: Conversation,
+
+    /// The substrate's persistence thread — owns its redo-log write path.
+    /// Wakes on a 5-second tick or on triggers from the scheduler; joined on
+    /// [`Self::shutdown`] (or drop) after a final drain pass.
+    persist_thread: PersistenceThread,
+
+    /// Progress of this substrate's reload, written by the scheduler thread
+    /// and polled by the daemon's load-state machine for the GUI.
+    substrate_reload_status: Arc<SubstrateReloadStatus>,
+
+    /// Set once [`Self::shutdown`] has run, so it runs once.
+    detached: AtomicBool,
+}
+
+/// What every substrate attached to one engine shares
+/// (`docs/shared_model_host.md` §3.2): the scheduler thread and the model it
+/// owns, the tokenizer, the co-resident guests, the model's identity, and what
+/// a later attachment needs to start a persistence thread of its own.
+struct EngineCore {
     /// Channel to submit work to the scheduler thread.
     scheduler_tx: Sender<SchedulerRequest>,
 
-    /// Handle to the scheduler thread (joined on drop or on explicit shutdown).
-    /// Wrapped in `Mutex<Option>` so `shutdown()` can be called via `&self`,
-    /// enabling clean teardown from a `&'static ConversationEngine` reference
-    /// (e.g. from a thread-local drop guard in tests).
+    /// Handle to the scheduler thread, joined when the last attachment shuts
+    /// down. `Mutex<Option>` so shutdown can run through `&self`.
     scheduler_handle: Mutex<Option<JoinHandle<()>>>,
 
     /// Tokenizer (shared, immutable, safe to clone into conversations).
     tokenizer: Arc<tokenizers::Tokenizer>,
 
-    /// The frame sections handed out to plain-prompt conversations, and the
-    /// claim on each — see [`Self::plain_prompt_section`].
-    plain_frames: Mutex<PlainPromptFrames>,
     /// [`Self::tokenizer`] reading every chat tag as plain characters, for the
     /// literal pieces of a turn — see [`crate::turn_text`]. Built once here: it
     /// is a copy of the whole vocabulary.
     literal_tokenizer: Arc<tokenizers::Tokenizer>,
 
-    /// Engine-wide configuration.
-    #[allow(dead_code)]
-    config: EngineConfig,
-
-    /// Workspace-shared `Conversation` handle: holds per-turn
-    /// metadata (token counts, scores, sig entries, sealed-sequence
-    /// handles) across every `Sequence` allocated from this engine.
-    /// Each `Sequence` receives a clone.
-    conversation: Conversation,
-
-    /// Substrate persistence thread — owns the redo-log write path.
-    /// Wakes on a 5-second tick or on triggers from the scheduler;
-    /// joined on engine drop (or via [`Self::shutdown`]) after a final
-    /// drain pass. `PersistenceThread::shutdown` is `&self`-callable —
-    /// no `Option`/`Mutex` shuffle at this layer.
-    persist_thread: PersistenceThread,
+    /// The model's end-of-sequence tokens, vocabulary size and dialect — what
+    /// the stencil compilers read.
+    eos_tokens: TokenBuffer,
+    vocab_size: usize,
+    dialect: Dialect,
 
     /// Async summariser thread — **always the disabled handle.** It would drain
     /// the per-turn pending queue, run §6 probes and build the per-timeline AVL
     /// summary tree; none of that happens, because the summariser is
-    /// disconnected (see [`Self::new`]) and no timeline enqueues. Kept as a field
-    /// so the lifecycle calls below stay honest no-ops rather than disappearing.
-    /// Mirrors [`PersistenceThread`]'s lifecycle (trigger / tick /
-    /// shutdown).  Spawned alongside the scheduler at engine startup;
-    /// [`Self::shutdown`] joins it after the persistence thread has
-    /// drained, and `Drop` falls through to the same path.
+    /// disconnected (see [`ConversationEngine::new`]) and no timeline enqueues.
+    /// Kept so the lifecycle calls stay honest no-ops rather than disappearing.
     summariser_thread: SummariserThread,
 
     /// The co-resident models that borrow the card between waves.
@@ -271,16 +296,27 @@ pub struct ConversationEngine {
     /// Shared with the scheduler, which polls the queue once per pass and
     /// drains it between forwards. Held here because the *registry* is a
     /// deployment decision made before the engine starts, and the *queue* is
-    /// what callers submit to from any thread — see [`Self::submit_guest`] and
-    /// [`crate::guest`].
+    /// what callers submit to from any thread — see
+    /// [`ConversationEngine::submit_guest`] and [`crate::guest`].
     guests: Arc<crate::guest::Guests>,
 
     /// Static model properties captured before the model moves to the scheduler thread.
     model_core: ModelCoreProperties,
 
-    /// Progress of the startup substrate reload, written by the scheduler
-    /// thread and polled by the daemon's load-state machine for the GUI.
-    substrate_reload_status: Arc<SubstrateReloadStatus>,
+    /// The model every attached substrate must be bound to.
+    model_key: ModelKey,
+
+    /// What [`ConversationEngine::attach`] hands a new persistence thread
+    /// beside the backings ([`Attachments::persist_with`]): the device and the
+    /// compression policy.
+    device: Device,
+    compression_policy: Option<CompressionPolicy>,
+
+    /// Every attached substrate, and the backings while the core runs.
+    attachments: Mutex<Attachments>,
+
+    /// The id the next attachment takes.
+    next_attachment: AtomicU64,
 }
 
 impl ConversationEngine {
@@ -371,50 +407,12 @@ impl ConversationEngine {
         // Workspace-shared `Conversation`: holds per-turn metadata
         // (the substrate handle).  Every `Sequence` we hand out gets a
         // clone of this handle, so they all attach to the same shared
-        // substrate.
-        //
-        // Mandatory substrate persistence — the redo log under the
-        // workspace's `substrate/` directory (or the process CWD).
-        // Open persistence and drive every record straight into the
-        // substrate's in-RAM state in one walker pass — no manifest
-        // mirror, no `reconstruct → collected_*` second pass.
-        //
-        // A host that writes its own record classes into this same log opens it
-        // first and hands the open pair over ([`SharedSubstrate`]) — one
-        // `substrate/` admits exactly one writable handle per process. Everyone
-        // else names a directory and the engine opens it here. Resolved once,
-        // into the same pair either way, so nothing downstream knows which.
-        let open_start = std::time::Instant::now();
-        let adopted = config.substrate.is_some();
-        let shared = match config.substrate.clone() {
-            Some(shared) => shared,
-            None => {
-                let workspace_dir: std::path::PathBuf = match config.workspace_path.as_ref() {
-                    Some(p) => AsRef::<std::path::Path>::as_ref(p).to_path_buf(),
-                    None => {
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    }
-                };
-                // A read-only open writes nothing under `substrate/` and
-                // requires the store to exist — see
-                // `EngineConfig::read_only_substrate`.
-                let opened = if config.read_only_substrate {
-                    SharedSubstrate::open_in_read_only(&workspace_dir)
-                } else {
-                    SharedSubstrate::open_in(&workspace_dir)
-                };
-                opened.map_err(|e| {
-                    ConversationError::from(candle::Error::Msg(format!(
-                        "substrate persistence: {e}"
-                    )))
-                })?
-            }
-        };
+        // substrate — the one the builder opened and bound to this model
+        // before loading it.
+        let shared = config.substrate.shared().clone();
         {
             let persistence = shared.persistence.lock().unwrap_or_else(|e| e.into_inner());
             tracing::info!(
-                open_ms = open_start.elapsed().as_millis() as u64,
-                adopted,
                 read_only = persistence.is_read_only(),
                 log_bytes = persistence.write_offset(),
                 records = persistence.recovered_record_count(),
@@ -425,52 +423,12 @@ impl ConversationEngine {
                     .unwrap_or_else(|e| e.into_inner())
                     .all_streams()
                     .count(),
-                "substrate persistence opened"
+                "substrate attached"
             );
         }
-        // Persist the model identity into the substrate's `ModelSpec` record —
-        // compare-and-insert, so it only appends when the model differs from
-        // what the log already records. Makes the log a self-contained image.
-        // A read-only substrate appends neither record: `set_model_spec`
-        // reports nothing written, and `set_tokenizer` still refuses a
-        // tokenizer other than the one the log records.
-        let singletons_start = std::time::Instant::now();
-        let mut persistence = shared.persistence.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(spec) = &config.model_spec {
-            let wrote = persistence.set_model_spec(spec).map_err(|e| {
-                ConversationError::from(candle::Error::Msg(format!("persist model spec: {e}")))
-            })?;
-            if wrote {
-                persistence.commit().map_err(|e| {
-                    ConversationError::from(candle::Error::Msg(format!("commit model spec: {e}")))
-                })?;
-            }
-        }
-        // Bind the substrate to this model's tokenizer.json, so the log can
-        // detokenize offline and so no second vocabulary can ever be written
-        // over turns sealed under the first. ~11 MB for Qwen3, written at most
-        // once per substrate; identical bytes are a no-op, and different bytes
-        // are refused rather than appended.
-        if let Some(tok) = &config.tokenizer {
-            let wrote = persistence.set_tokenizer(tok).map_err(|e| {
-                ConversationError::Tokenizer(format!(
-                    "{e}\n\nThe substrate at this working directory belongs to a different \
-                     model. Start this one against its own working directory (--working-dir), \
-                     or discard this substrate with --wipe-substrate."
-                ))
-            })?;
-            if wrote {
-                persistence.commit().map_err(|e| {
-                    ConversationError::from(candle::Error::Msg(format!("commit tokenizer: {e}")))
-                })?;
-            }
-        }
-        drop(persistence);
-        tracing::info!(
-            singletons_ms = singletons_start.elapsed().as_millis() as u64,
-            "model spec + tokenizer records reconciled"
-        );
-        let conversation = Conversation::from_shared(shared);
+        let conversation = Conversation::from_shared(shared)
+            .with_cancel(config.cancel.clone())
+            .with_tenant_rank(config.tenant_rank);
 
         // Register per-layer corrupt-turn policies (from the projection schema)
         // BEFORE the reload thread is spawned, so the startup reconstruct applies
@@ -486,13 +444,14 @@ impl ConversationEngine {
         // device for hot→warm migration and warm→cold gather. Spawn it
         // **before** the scheduler thread so the trigger handle can be
         // handed in.
-        let backings: Arc<Vec<candle_nn::kv_cache::ChunkedKvBacking>> =
-            Arc::new(session.backings().to_vec());
-        let persist_thread = crate::persistence::thread::PersistenceThread::spawn(
+        let backings: Arc<Vec<ChunkedKvBacking>> = Arc::new(session.backings().to_vec());
+        let device = session.device().clone();
+        let compression_policy = config.batched_config.compression_policy();
+        let persist_thread = PersistenceThread::spawn(
             conversation.clone(),
             Arc::clone(&backings),
-            session.device().clone(),
-            config.batched_config.compression_policy(),
+            device.clone(),
+            compression_policy,
         );
         let persist_trigger = persist_thread.trigger_handle();
 
@@ -577,22 +536,174 @@ impl ConversationEngine {
                 ConversationError::Channel(format!("failed to spawn scheduler thread: {e}"))
             })?;
 
-        Ok(Self {
+        let core = EngineCore {
             scheduler_tx: tx,
             scheduler_handle: Mutex::new(Some(handle)),
             literal_tokenizer: Arc::new(literal_tokenizer(&tokenizer)),
             tokenizer: Arc::new(tokenizer),
-            plain_frames: Mutex::new(PlainPromptFrames::default()),
-            config,
-            model_core,
-            conversation,
-            persist_thread,
+            eos_tokens: config.eos_tokens.clone(),
+            vocab_size: config.vocab_size,
+            dialect: config.dialect.clone(),
             summariser_thread,
             guests,
+            model_core,
+            model_key: config.substrate.model_key().clone(),
+            device,
+            compression_policy,
+            attachments: Mutex::new(Attachments::first(
+                FIRST_ATTACHMENT,
+                conversation.clone(),
+                backings,
+            )),
+            next_attachment: AtomicU64::new(FIRST_ATTACHMENT + 1),
+        };
+        Ok(Self {
+            core: Arc::new(core),
+            attachment: FIRST_ATTACHMENT,
+            plain_frames: Mutex::new(PlainPromptFrames::default()),
+            conversation,
+            persist_thread,
             substrate_reload_status,
+            detached: AtomicBool::new(false),
         })
     }
 
+    /// Attach another substrate to this engine — a second tenant on the same
+    /// loaded model and scheduler (`docs/shared_model_host.md` §3.2).
+    ///
+    /// The substrate must be bound to the model this engine runs; one already
+    /// attached, or one holding a timeline id another attached substrate holds,
+    /// is refused, because the scheduler keys its maps by timeline and two
+    /// substrates naming one timeline would share its state. The attachment
+    /// gets its own persistence thread and is reloaded from its redo log on
+    /// the scheduler thread; poll [`Self::substrate_reload_status`] on the
+    /// returned handle. Conversations created through the returned handle live
+    /// on the attached substrate.
+    pub fn attach(
+        &self,
+        substrate: BoundSubstrate,
+        cancel: CancelToken,
+        tenant_rank: TenantRank,
+        layer_corrupt_turn: HashMap<LayerId, CorruptTurnPolicy>,
+    ) -> crate::Result<ConversationEngine> {
+        self.attacher()
+            .attach(substrate, cancel, tenant_rank, layer_corrupt_turn)
+    }
+
+    /// A handle that attaches further substrates to this engine without
+    /// holding this one — what a tenant on another thread is given
+    /// (`crate::engine_slot`).
+    pub fn attacher(&self) -> EngineAttacher {
+        EngineAttacher {
+            core: Arc::clone(&self.core),
+        }
+    }
+
+    /// How many substrates are attached to this engine.
+    pub fn attached_count(&self) -> usize {
+        self.core
+            .attachments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .list
+            .len()
+    }
+
+    /// The model this engine runs.
+    pub fn model_key(&self) -> &ModelKey {
+        &self.core.model_key
+    }
+
+    /// The model's chat dialect.
+    pub fn dialect(&self) -> &Dialect {
+        &self.core.dialect
+    }
+}
+
+/// Attaches substrates to an engine — a cheap clone of its shared core, so the
+/// engine's own handle can stay with the tenant that built it.
+#[derive(Clone)]
+pub struct EngineAttacher {
+    core: Arc<EngineCore>,
+}
+
+impl EngineAttacher {
+    /// The model the engine runs — what a substrate attached to it must be
+    /// bound to.
+    pub fn model_key(&self) -> &ModelKey {
+        &self.core.model_key
+    }
+
+    /// See [`ConversationEngine::attach`].
+    pub fn attach(
+        &self,
+        substrate: BoundSubstrate,
+        cancel: CancelToken,
+        tenant_rank: TenantRank,
+        layer_corrupt_turn: HashMap<LayerId, CorruptTurnPolicy>,
+    ) -> crate::Result<ConversationEngine> {
+        if !substrate.model_key().same_model(&self.core.model_key) {
+            return Err(ConversationError::Other(format!(
+                "the substrate at {} is bound to {}, and this engine runs {}",
+                substrate.dir().display(),
+                substrate.model_key().describe(),
+                self.core.model_key.describe()
+            )));
+        }
+        let conversation = Conversation::from_shared(substrate.shared().clone())
+            .with_cancel(cancel)
+            .with_tenant_rank(tenant_rank);
+        // Registered before the reload, as `new` does, so the reload applies
+        // each layer's policy.
+        for (&layer, &policy) in &layer_corrupt_turn {
+            conversation.set_layer_corrupt_turn_policy(layer, policy);
+        }
+        // The checks, the scheduler's request and the registration under one
+        // hold of the lock: two attaches racing cannot both pass the checks,
+        // and none lands on a core whose last attachment has stopped it.
+        let mut attached = self
+            .core
+            .attachments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let backings = attached.admit(&conversation, &substrate.dir())?;
+        let persist_thread = PersistenceThread::spawn(
+            conversation.clone(),
+            backings,
+            self.core.device.clone(),
+            self.core.compression_policy,
+        );
+        let id = self.core.next_attachment.fetch_add(1, Ordering::Relaxed);
+        let status = Arc::new(SubstrateReloadStatus::default());
+        self.core
+            .scheduler_tx
+            .send(SchedulerRequest::AttachSubstrate {
+                id,
+                trigger: persist_thread.trigger_handle(),
+                conversation: conversation.clone(),
+                status: Arc::clone(&status),
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        attached.list.push((id, conversation.clone()));
+        drop(attached);
+        tracing::info!(
+            attachment = id,
+            dir = %substrate.dir().display(),
+            "substrate attached to the engine"
+        );
+        Ok(ConversationEngine {
+            core: Arc::clone(&self.core),
+            attachment: id,
+            plain_frames: Mutex::new(PlainPromptFrames::default()),
+            conversation,
+            persist_thread,
+            substrate_reload_status: status,
+            detached: AtomicBool::new(false),
+        })
+    }
+}
+
+impl ConversationEngine {
     /// Queue work for a co-resident model and get a handle on its answer.
     ///
     /// The scheduler picks it up between two of its waves, evicts what it needs
@@ -619,7 +730,7 @@ impl ConversationEngine {
         request: crate::guest::GuestRequest,
         sink: crate::guest::GuestSink,
     ) -> Result<crate::guest::GuestReceipt, crate::guest::GuestError> {
-        let receipt = self.guests.queue.submit_watched(request, sink)?;
+        let receipt = self.core.guests.queue.submit_watched(request, sink)?;
         // **Wake the scheduler.** It parks in `rx.recv()` when there is nothing
         // to do, and the guest queue is the one producer that does not arrive
         // through that channel — so on an idle daemon a submitted job sat in
@@ -630,18 +741,18 @@ impl ConversationEngine {
         // its own next pass or is woken to find it. There is no ordering in
         // which both miss: the channel buffers, so a wake that arrives while
         // the loop is still running is waiting for it when it parks.
-        let _ = self.scheduler_tx.send(SchedulerRequest::Wake);
+        let _ = self.core.scheduler_tx.send(SchedulerRequest::Wake);
         Ok(receipt)
     }
 
     /// The guests this deployment configured, for a status view.
     pub fn configured_guests(&self) -> Vec<crate::guest::Guest> {
-        self.guests.registry.configured()
+        self.core.guests.registry.configured()
     }
 
     /// How many guest jobs are waiting.
     pub fn guest_backlog(&self) -> usize {
-        self.guests.queue.depth()
+        self.core.guests.queue.depth()
     }
 
     /// Shared handle to the startup substrate-reload progress. The daemon's
@@ -658,6 +769,7 @@ impl ConversationEngine {
     pub fn reload_substrate(&self) -> Arc<SubstrateReloadStatus> {
         let status = Arc::new(SubstrateReloadStatus::default());
         let _ = self
+            .core
             .scheduler_tx
             .send(SchedulerRequest::ReconstructSubstrate {
                 conversation: self.conversation.clone(),
@@ -684,6 +796,7 @@ impl ConversationEngine {
     pub fn live_memory_count(&self) -> usize {
         let (tx, rx) = flume::bounded(1);
         if self
+            .core
             .scheduler_tx
             .send(crate::scheduler::SchedulerRequest::CountRecurrentMemories { response_tx: tx })
             .is_err()
@@ -747,7 +860,7 @@ impl ConversationEngine {
     /// no receiver, so the send fails silently. Callers (the ingest pipeline
     /// kicks it after a scope lands) need no knowledge of that.
     pub fn trigger_summariser(&self) {
-        self.summariser_thread.trigger();
+        self.core.summariser_thread.trigger();
     }
 
     /// Test-harness diagnostic — the most recent score-density
@@ -843,7 +956,7 @@ impl ConversationEngine {
     pub fn ingest_warmer(&self) -> IngestWarmer {
         IngestWarmer {
             conversation: self.conversation.clone(),
-            scheduler_tx: self.scheduler_tx.clone(),
+            scheduler_tx: self.core.scheduler_tx.clone(),
         }
     }
 
@@ -882,6 +995,7 @@ impl ConversationEngine {
     pub fn warm_collection_normalization(&self, schema: &Schema) -> CollectionWarm {
         let (tx, rx) = flume::bounded(1);
         if self
+            .core
             .scheduler_tx
             .send(SchedulerRequest::WarmCollectionNormalization {
                 conversation: self.conversation.clone(),
@@ -903,6 +1017,7 @@ impl ConversationEngine {
     pub fn preload_galleries(&self, schema: &Schema) -> GalleryPreload {
         let (tx, rx) = flume::bounded(1);
         if self
+            .core
             .scheduler_tx
             .send(SchedulerRequest::PreloadGalleries {
                 conversation: self.conversation.clone(),
@@ -1267,10 +1382,13 @@ impl ConversationEngine {
         if sections.is_empty() {
             return;
         }
-        let _ = self.scheduler_tx.send(SchedulerRequest::RetireSections {
-            conversation: self.conversation.clone(),
-            sections,
-        });
+        let _ = self
+            .core
+            .scheduler_tx
+            .send(SchedulerRequest::RetireSections {
+                conversation: self.conversation.clone(),
+                sections,
+            });
     }
 
     /// Tombstone one turn of a live timeline — see
@@ -1407,7 +1525,8 @@ impl ConversationEngine {
             return Ok(0);
         }
         let (response_tx, response_rx) = flume::bounded(1);
-        self.scheduler_tx
+        self.core
+            .scheduler_tx
             .send(SchedulerRequest::DemoteTimelinesHot {
                 conversation: self.conversation.clone(),
                 timelines: timelines.to_vec(),
@@ -1501,7 +1620,8 @@ impl ConversationEngine {
             }
         }
         let (response_tx, response_rx) = flume::bounded(1);
-        self.scheduler_tx
+        self.core
+            .scheduler_tx
             .send(SchedulerRequest::Settle { response_tx })
             .map_err(|_| ConversationError::SchedulerGone)?;
         response_rx
@@ -1555,6 +1675,7 @@ impl ConversationEngine {
     /// [`Self::transient_prompt_section`] instead, which leaves nothing behind.
     pub fn plain_prompt_section(&self, prompt_text: &str) -> crate::Result<SectionId> {
         let encoding = self
+            .core
             .tokenizer
             .encode(prompt_text, false)
             .map_err(|e| ConversationError::Tokenizer(e.to_string()))?;
@@ -1585,6 +1706,7 @@ impl ConversationEngine {
     /// conversation that used the frame has been dropped.
     pub fn transient_prompt_section(&self, prompt_text: &str) -> crate::Result<SectionId> {
         let encoding = self
+            .core
             .tokenizer
             .encode(prompt_text, false)
             .map_err(|e| ConversationError::Tokenizer(e.to_string()))?;
@@ -1617,10 +1739,13 @@ impl ConversationEngine {
     pub fn release_prompt_section(&self, section: SectionId) {
         let last = self.plain_frames.lock().unwrap().release(section);
         if last {
-            let _ = self.scheduler_tx.send(SchedulerRequest::RetireSections {
-                conversation: self.conversation.clone(),
-                sections: vec![section],
-            });
+            let _ = self
+                .core
+                .scheduler_tx
+                .send(SchedulerRequest::RetireSections {
+                    conversation: self.conversation.clone(),
+                    sections: vec![section],
+                });
         }
     }
 
@@ -1648,16 +1773,16 @@ impl ConversationEngine {
     /// [`Self::compile_tool_stencil`] builds.
     pub fn compile_stencil(&self, spec: &crate::stencil::TreeSpec) -> crate::Result<StencilTree> {
         let vocab = HfVocab::new(
-            (*self.tokenizer).clone(),
-            &self.config.eos_tokens,
-            self.config.vocab_size as u64,
+            (*self.core.tokenizer).clone(),
+            &self.core.eos_tokens,
+            self.core.vocab_size as u64,
         );
         compile(spec, &vocab)
             .map_err(|e| ConversationError::from(candle::Error::Msg(format!("stencil: {e}"))))
     }
 
     pub fn compile_tool_stencil(&self, tools: &[ToolSpec]) -> crate::Result<Arc<TriggerRegistry>> {
-        let Some(trigger) = self.tokenizer.token_to_id("<tool_call>") else {
+        let Some(trigger) = self.core.tokenizer.token_to_id("<tool_call>") else {
             tracing::warn!(
                 "tokenizer has no single <tool_call> token — tool-call stencils are inactive \
                  (the model will free-decode tool calls)"
@@ -1690,8 +1815,8 @@ impl ConversationEngine {
         // the close ending exactly ON that terminator — see
         // [`ToolCallEnvelope::for_assistant_turn`] for why the trailing newline
         // in `assistant_end` cannot be allowed to ride along.
-        let envelope = ToolCallEnvelope::for_assistant_calls(&self.config.dialect);
-        let close_turn = ToolCallEnvelope::turn_close(&self.config.dialect);
+        let envelope = ToolCallEnvelope::for_assistant_calls(&self.core.dialect);
+        let close_turn = ToolCallEnvelope::turn_close(&self.core.dialect);
         let started = std::time::Instant::now();
         let spec = compile_tool_call_loop(tools, &envelope, MAX_TOOL_CALLS_PER_TURN, &close_turn)
             .map_err(|e| {
@@ -1699,9 +1824,9 @@ impl ConversationEngine {
         })?;
         let spec_ms = started.elapsed().as_millis() as u64;
         let vocab = HfVocab::new(
-            (*self.tokenizer).clone(),
-            &self.config.eos_tokens,
-            self.config.vocab_size as u64,
+            (*self.core.tokenizer).clone(),
+            &self.core.eos_tokens,
+            self.core.vocab_size as u64,
         );
         let vocab_ms = started.elapsed().as_millis() as u64 - spec_ms;
         let tree = compile(&spec, &vocab).map_err(|e| {
@@ -1742,8 +1867,8 @@ impl ConversationEngine {
     /// `stencil::think` for the measured case.
     pub fn compile_think_steering(&self) -> crate::Result<Option<Arc<ThinkSteering>>> {
         let (Some(think_open), Some(think_close)) = (
-            self.tokenizer.token_to_id("<think>"),
-            self.tokenizer.token_to_id("</think>"),
+            self.core.tokenizer.token_to_id("<think>"),
+            self.core.tokenizer.token_to_id("</think>"),
         ) else {
             tracing::warn!(
                 "tokenizer has no single <think>/</think> token — think steering is inactive \
@@ -1751,7 +1876,7 @@ impl ConversationEngine {
             );
             return Ok(None);
         };
-        let eos = self.config.eos_tokens.iter().next().copied().unwrap_or(0);
+        let eos = self.core.eos_tokens.iter().next().copied().unwrap_or(0);
         let env = ThinkSteerEnvelope {
             think_open,
             think_close,
@@ -1763,9 +1888,9 @@ impl ConversationEngine {
         // Every end token, so a think span intercepts whichever one the model
         // samples — the canonical `eos` above is only what the tree writes.
         let vocab = HfVocab::new(
-            (*self.tokenizer).clone(),
-            &self.config.eos_tokens,
-            self.config.vocab_size as u64,
+            (*self.core.tokenizer).clone(),
+            &self.core.eos_tokens,
+            self.core.vocab_size as u64,
         );
         let compile_mode = |mode: ThinkMode| -> crate::Result<Arc<StencilTree>> {
             let spec = compile_think_tree(mode, &env);
@@ -2051,7 +2176,8 @@ impl ConversationEngine {
                 response_tx,
             },
         };
-        self.scheduler_tx
+        self.core
+            .scheduler_tx
             .send(request)
             .map_err(|_| ConversationError::SchedulerGone)?;
 
@@ -2075,20 +2201,21 @@ impl ConversationEngine {
         // about.
         let free_slot = || {
             let _ = self
+                .core
                 .scheduler_tx
                 .send(SchedulerRequest::FreeSequence { sequence_id });
         };
         let (conv, pending) = Sequence::new_with_projection(
-            self.scheduler_tx.clone(),
+            self.core.scheduler_tx.clone(),
             sequence_id,
-            Arc::clone(&self.tokenizer),
-            Arc::clone(&self.literal_tokenizer),
+            Arc::clone(&self.core.tokenizer),
+            Arc::clone(&self.core.literal_tokenizer),
             system_prompt,
             builder,
             target,
             config,
             CHUNK_SIZE,
-            self.model_core,
+            self.core.model_core,
             self.conversation.clone(),
             section_progress,
             // **Primed on both paths, resume included.** Priming injects the
@@ -2101,7 +2228,8 @@ impl ConversationEngine {
         .inspect_err(|_| free_slot())?;
         // A group of one — the same install path the batch create takes.
         let pending: Vec<_> = pending.into_iter().collect();
-        if let Err(e) = install_branch_states(&self.scheduler_tx, &pending, &self.conversation) {
+        if let Err(e) = install_branch_states(&self.core.scheduler_tx, &pending, &self.conversation)
+        {
             // `conv` owns the slot by now and would free it on drop, but it is
             // dropped here without being returned, so say what happened rather
             // than letting a silent drop stand in for an error.
@@ -2191,7 +2319,7 @@ impl ConversationEngine {
                 timeline,
             };
             let (response_tx, rx) = flume::bounded(1);
-            match self.scheduler_tx.send(SchedulerRequest::NewSequence {
+            match self.core.scheduler_tx.send(SchedulerRequest::NewSequence {
                 conversation: self.conversation.clone(),
                 target: Some(target),
                 // Resume by timeline: the snapshot read in `create_sequence` is
@@ -2236,16 +2364,16 @@ impl ConversationEngine {
                         .map_err(|_| ConversationError::SchedulerGone)??;
                 wait += t_wait.elapsed();
                 let (conv, p) = Sequence::new_with_projection(
-                    self.scheduler_tx.clone(),
+                    self.core.scheduler_tx.clone(),
                     sequence_id,
-                    Arc::clone(&self.tokenizer),
-                    Arc::clone(&self.literal_tokenizer),
+                    Arc::clone(&self.core.tokenizer),
+                    Arc::clone(&self.core.literal_tokenizer),
                     system_prompt,
                     builder.clone(),
                     f.target,
                     config.clone(),
                     CHUNK_SIZE,
-                    self.model_core,
+                    self.core.model_core,
                     self.conversation.clone(),
                     None,
                     // Pipelined batch: skip the per-sequence priming round-trip
@@ -2263,7 +2391,8 @@ impl ConversationEngine {
         // it can return is `SchedulerGone`. Swallowing it would hand back a full
         // batch of `Ok(Sequence)` values bound to a dead scheduler; this function
         // reports per entry, so every entry fails.
-        if let Err(e) = install_branch_states(&self.scheduler_tx, &pending, &self.conversation) {
+        if let Err(e) = install_branch_states(&self.core.scheduler_tx, &pending, &self.conversation)
+        {
             let msg = format!("batch branch-state install failed: {e}");
             return (0..n)
                 .map(|_| Err(ConversationError::Channel(msg.clone())))
@@ -2285,12 +2414,12 @@ impl ConversationEngine {
 
     /// Get the shared tokenizer.
     pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
-        &self.tokenizer
+        &self.core.tokenizer
     }
 
     /// Static model properties captured at engine construction.
     pub fn model_core_properties(&self) -> ModelCoreProperties {
-        self.model_core
+        self.core.model_core
     }
 
     /// Low-level helper used by benchmarks (e.g. RULER): create a fresh
@@ -2306,7 +2435,8 @@ impl ConversationEngine {
     ) -> crate::Result<String> {
         // 1. Allocate a sequence.
         let (resp_tx, resp_rx) = flume::bounded(1);
-        self.scheduler_tx
+        self.core
+            .scheduler_tx
             .send(SchedulerRequest::NewSequence {
                 conversation: self.conversation.clone(),
                 // Raw RULER eval path: no projection, no substrate
@@ -2326,7 +2456,8 @@ impl ConversationEngine {
         //    borrows nothing and decoded blocks transfer back on
         //    finalize.
         let (event_tx, event_rx) = flume::unbounded();
-        self.scheduler_tx
+        self.core
+            .scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
                 // One turn, and it is the slot's tail.
                 seal_group: None,
@@ -2379,6 +2510,7 @@ impl ConversationEngine {
         //    sample and never reuses it, so without this the KV pool leaks
         //    until OOM.
         let _ = self
+            .core
             .scheduler_tx
             .send(SchedulerRequest::FreeSequence { sequence_id });
 
@@ -2390,7 +2522,8 @@ impl ConversationEngine {
         }
 
         // Fallback: decode whatever tokens we collected.
-        self.tokenizer
+        self.core
+            .tokenizer
             .decode(&collected, true)
             .map_err(|e| ConversationError::Channel(format!("decode failed: {e}")))
     }
@@ -2399,7 +2532,7 @@ impl ConversationEngine {
     ///
     /// The decoder is cheap to clone and can be used across threads.
     pub fn token_decoder(&self) -> TokenDecoder {
-        TokenDecoder::new(Arc::clone(&self.tokenizer))
+        TokenDecoder::new(Arc::clone(&self.core.tokenizer))
     }
 
     /// Durably flush the substrate redo log — the group-commit point.
@@ -2427,23 +2560,76 @@ impl ConversationEngine {
         Ok(self.conversation.compact_substrate(progress)?)
     }
 
-    /// Shut down the scheduler, releasing all GPU resources.
+    /// Detach this handle's substrate from the engine, and stop the engine
+    /// with the last one.
     ///
     /// Safe to call multiple times (idempotent). Takes `&self` so it can be
     /// called from a `&'static ConversationEngine` reference (e.g. a TLS drop
     /// guard in tests), which is necessary because Rust statics are never
     /// dropped and we must ensure the CUDA scheduler thread exits before the
     /// CUDA driver's atexit handler fires.
+    ///
+    /// While another substrate stays attached, the scheduler frees this one's
+    /// slots and forgets it, and then its persistence thread drains and its
+    /// writer flushes; the scheduler and the model go on serving the others.
+    /// The last attachment stops the scheduler and releases the GPU.
+    ///
+    /// Either way the substrate's writer lock is released last, so the
+    /// workspace can be opened again while this handle is still held.
     pub fn shutdown(&self) -> crate::Result<()> {
-        // **Before the scheduler is asked to stop.** A caller blocked in
-        // `GuestReceipt::wait` is blocked on the scheduler thread; once that
-        // thread joins there is nobody left to answer, and the caller waits for
-        // the life of the process with its HTTP request still open. Closing
-        // first also refuses anything submitted during the teardown, so no job
-        // lands in a queue nothing will drain.
-        self.guests.queue.close();
-        let _ = self.scheduler_tx.send(SchedulerRequest::Shutdown);
+        if self.detached.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // The request goes out under the lock that changed the list, so a
+        // detach is always queued ahead of the `Shutdown` the last attachment
+        // sends — and the scheduler answers it before it stops.
+        let detached = {
+            let mut attached = self
+                .core
+                .attachments
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            attached.list.retain(|(id, _)| *id != self.attachment);
+            if attached.list.is_empty() {
+                // The core's hold on the backings goes with it; the scheduler
+                // and the persistence thread release theirs as they join.
+                attached.persist_with = None;
+                // **Before the scheduler is asked to stop.** A caller blocked
+                // in `GuestReceipt::wait` is blocked on the scheduler thread;
+                // once that thread joins there is nobody left to answer, and
+                // the caller waits for the life of the process with its HTTP
+                // request still open. Closing first also refuses anything
+                // submitted during the teardown, so no job lands in a queue
+                // nothing will drain.
+                self.core.guests.queue.close();
+                let _ = self.core.scheduler_tx.send(SchedulerRequest::Shutdown);
+                None
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let sent = self
+                    .core
+                    .scheduler_tx
+                    .send(SchedulerRequest::DetachSubstrate {
+                        id: self.attachment,
+                        conversation: self.conversation.clone(),
+                        response_tx: tx,
+                    });
+                Some(sent.ok().map(|()| rx))
+            }
+        };
+        if let Some(reply) = detached {
+            if let Some(rx) = reply {
+                let _ = rx.recv();
+            }
+            // Nothing on the scheduler refers to this substrate any more, so
+            // the drain captures its last work.
+            self.persist_thread.shutdown();
+            self.conversation.flush_writer();
+            self.conversation.release_writer()?;
+            return Ok(());
+        }
         let handle = self
+            .core
             .scheduler_handle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2464,7 +2650,7 @@ impl ConversationEngine {
         // any in-flight probe request hangs forever — shutdown
         // signals the loop to exit on its next select rather than
         // wait for a probe response that will never arrive.
-        self.summariser_thread.shutdown();
+        self.core.summariser_thread.shutdown();
         // Terminal durability step: every enqueuer has now stopped (the
         // scheduler's seal path, the persistence thread's final hot→warm→cold
         // drain, and the summariser), so drain the off-thread writer's queue to
@@ -2481,6 +2667,9 @@ impl ConversationEngine {
         // only thread that sealed.
         release_recycled_wc();
         release_seal_readback();
+        // Everything durable has landed, so the workspace is handed on: a
+        // successor may open it while this engine is still held somewhere.
+        self.conversation.release_writer()?;
         Ok(())
     }
 }

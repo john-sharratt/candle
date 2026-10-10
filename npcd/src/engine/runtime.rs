@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use futures::executor::block_on;
+use tokio::runtime::{Builder as RuntimeBuilder, Handle};
 use tokio::sync::oneshot;
 
 use candle_conversation::guest::resolve_seed;
@@ -112,9 +113,14 @@ use crate::sim::missions::Missions;
 use crate::sim::Sim;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
+use candle_conversation::EngineSource;
+use host::download::ensure_model;
+use host::process::fatal;
+use host::MODEL;
 use npc_map::schema::NodeKind;
 use npc_map::world::Where;
 use npc_map::{describe, perceive, route};
+use tokio::sync::watch;
 
 /// Tokens one prefill forward carries when the model can take them — the
 /// scheduler's per-forward *target*.
@@ -481,7 +487,7 @@ pub struct Runtime {
     /// Captured at construction when one is ambient — the daemon constructs
     /// its `Runtime` inside `#[tokio::main]` — and genuinely absent in the
     /// unit tests that exercise scheduling data without spawning anything.
-    spawner: Option<tokio::runtime::Handle>,
+    spawner: Option<Handle>,
     /// One running task per character, keyed by id — the supervisor's roster.
     ///
     /// A task is spawned when the character wakes into the scheduler and
@@ -879,7 +885,7 @@ impl Runtime {
             cooldowns: crate::engine::cooldown::Cooldowns::new(),
             loop_guards: crate::engine::loopguard::LoopGuards::new(),
             stopping: AtomicBool::new(false),
-            spawner: tokio::runtime::Handle::try_current().ok(),
+            spawner: Handle::try_current().ok(),
             tasks: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
         })
@@ -3653,10 +3659,32 @@ impl Runtime {
     pub fn stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)
     }
+
+    /// Shut the engine down, when it has been published: drain its persistence
+    /// thread and writer, detach this substrate — and stop the scheduler when
+    /// this is the engine's last attachment — then release the substrate's
+    /// writer lock. Blocking: it joins threads. Run after
+    /// [`Runtime::stop_characters`], so nothing of the cast still submits.
+    pub fn shutdown_engine(&self) -> anyhow::Result<()> {
+        let minds = self.minds.read().unwrap().clone();
+        let Some(minds) = minds else {
+            return Ok(());
+        };
+        let engine = minds.engine();
+        let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine
+            .shutdown()
+            .map_err(|e| anyhow::anyhow!("engine shutdown: {e}"))
+    }
 }
 
 /// What the loader needs that is not on the [`Runtime`].
 pub struct LoadPlan {
+    /// Where the engine comes from: built here, with every tenant's requests
+    /// merged, when npcd ranks highest of the tenants that arrive; otherwise
+    /// npcd's substrate is attached to the engine a higher one built
+    /// (`candle_conversation::EngineSlot`).
+    pub engine: EngineSource,
     /// The characters to wake, each with the world it belongs to and the room
     /// it was last standing in. From the substrate's character store.
     ///
@@ -3672,8 +3700,9 @@ pub struct LoadPlan {
     /// A world's biographies exist whether or not anyone has cast them.
     pub characters: Vec<String>,
     /// Who each personality, character and world *is*, for the projection's
-    /// identity collections. Read in `main` where the registries live and
-    /// installed on the loader thread — see [`crate::engine::identity`].
+    /// identity collections. Read in the tenant's start, where the registries
+    /// live, and installed on the loader thread — see
+    /// [`crate::engine::identity`].
     pub authored: identity::Authored,
     /// Retire every character's conversation before the cast wakes, so each
     /// opens a fresh one — `--forget-conversations`. See
@@ -3691,32 +3720,32 @@ pub struct LoadPlan {
     pub wipe_conversations: bool,
 }
 
-/// Begin loading, on its own thread. Returns immediately.
-///
-/// The HTTP server is already bound by the time this is called, so
-/// `GET /v1/status` answers with a loading snapshot from the first request
-/// onward rather than from whenever the model finished.
+/// Begin loading, on its own thread. Returns immediately, so the host's
+/// server comes up while the model loads and `GET /v1/status` answers with a
+/// loading snapshot rather than nothing until the model has finished.
 pub fn start(rt: Arc<Runtime>, plan: LoadPlan) {
-    let handle = tokio::runtime::Handle::try_current().ok();
+    let handle = Handle::try_current().ok();
     std::thread::Builder::new()
         .name("npcd-loader".into())
         .spawn(move || {
-            if let Err(e) = load(&rt, &plan, handle) {
-                // Fatal, and it has to be: a daemon that answers requests with
-                // a half-loaded engine shows the console something present and
-                // broken, which is harder to diagnose than something absent.
-                tracing::error!("engine load failed: {e:#}");
-                std::process::exit(1);
+            let Err(e) = load(&rt, &plan, handle) else {
+                return;
+            };
+            // A load the process is stopping underneath — its engine shut down
+            // mid-ingest — is the stop, not a failure.
+            if rt.stopping() {
+                tracing::info!("engine load ended by the stop: {e:#}");
+                return;
             }
+            // Fatal, and it has to be: a daemon that answers requests with a
+            // half-loaded engine shows the console something present and
+            // broken, which is harder to diagnose than something absent.
+            fatal("npcd", &format!("engine load failed: {e:#}"));
         })
         .expect("spawn the loader thread");
 }
 
-fn load(
-    rt: &Arc<Runtime>,
-    plan: &LoadPlan,
-    rt_handle: Option<tokio::runtime::Handle>,
-) -> anyhow::Result<()> {
+fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow::Result<()> {
     let p = &rt.progress;
     let spec = model::spec();
 
@@ -3731,9 +3760,6 @@ fn load(
         spec.repo
     );
 
-    // The download is async; the load is not. A local current-thread runtime
-    // does the fetch and is dropped before the model load, exactly as zend
-    // does — a nested `block_on` inside the ambient runtime would panic.
     let device = candle::Device::new_cuda(0)
         .map_err(|e| anyhow::anyhow!("no CUDA device: {e}. npcd needs a GPU to run an engine."))?;
     // A prefill forward carries 8 192 tokens here, not the 2 048 default.
@@ -3776,7 +3802,7 @@ fn load(
     // conversation layer falls back to the *process working directory*, so a
     // daemon launched from the repo root wrote its redo log to
     // `candle/substrate` while the character store sat correctly under
-    // `--data`. `/v1/substrate/storage` reports on `--data` and showed 65 MB
+    // `--data`. The storage view reports on `--data` and showed 65 MB
     // while the real log reached **190 GB** across a morning of re-ingests. It
     // filled the disk, and surfaced as a linker error.
     //
@@ -3788,10 +3814,53 @@ fn load(
              `Runtime::set_substrate` with `Npcs::substrate()` first"
         )
     })?;
-    let mut builder = model::model()
+    // The mind's real projection, parsed once. Everything written from here on
+    // is written under it — which is what gives a document something to gather
+    // from and therefore a provenance signature. `None` falls back to a
+    // synthetic schema that cannot gather, and says so.
+    //
+    // Parsed before the engine is built, because the engine takes each layer's
+    // corrupt-turn policy from it and applies them in its startup reload.
+    let mut projection = schema::build(rt.mind.as_deref(), "battle-cities");
+    if projection.is_none() && rt.mind.is_some() {
+        tracing::warn!(
+            "no usable projection schema — documents will be written but will produce \
+             no provenance signatures, so nothing will gather them"
+        );
+    }
+    let corrupt_turn = projection
+        .as_ref()
+        .map(|p| schema::corrupt_turn_policies(&p.builder))
+        .unwrap_or_default();
+    // The model's files, through the host's download — the same resolution
+    // every tenant uses, so the file fetched and the model built are one. The
+    // download is async and the load is not: a local current-thread runtime
+    // does the fetch and is dropped before the load, since a nested `block_on`
+    // inside the ambient runtime would panic.
+    let (model_path, tokenizer_path) = {
+        let download = RuntimeBuilder::new_current_thread().enable_all().build()?;
+        let (status, mut said) = watch::channel(String::new());
+        let fetched = download.block_on(async {
+            let echo = async {
+                while said.changed().await.is_ok() {
+                    p.set_detail(said.borrow().clone());
+                }
+            };
+            tokio::select! {
+                got = ensure_model(&MODEL, &status) => got,
+                () = echo => unreachable!("the sender outlives the download"),
+            }
+        });
+        drop(download);
+        fetched?
+    };
+    let mut builder = MODEL
         .builder()
+        .model_path(model_path)
+        .tokenizer_path(tokenizer_path)
         .guests(guests)
         .prefill_pass_tokens(PREFILL_PASS_TOKENS)
+        .corrupt_turn_policies(corrupt_turn)
         .substrate(shared);
     // The checkpoint's own dialect and sampling. Captured before the builder is
     // consumed, and handed to every conversation — a second opinion about either
@@ -3816,27 +3885,21 @@ fn load(
     // The numbers themselves were right and now live where they belong, beside the
     // architecture that publishes them.
     let conv_config = builder.conversation_config();
-    let engine = {
-        // The download is async (hf-hub, reqwest); the load that follows is not.
-        // A local current-thread runtime does the fetch and is dropped before
-        // the load — a nested `block_on` inside the ambient runtime would panic.
-        let download = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let built = download.block_on(async {
-            builder.engine_with_progress(
-                &device,
-                // Per transformer block, which is what makes the bar move
-                // during the part of startup that actually takes the time.
-                Some(&|loaded, total| p.set_progress(loaded as u64, total as u64)),
-            )
-        });
-        drop(download);
-        built?
-    };
 
-    // Back into the ambient runtime so anything spawned below has a context.
+    // Back into the ambient runtime — after the download's own runtime is gone
+    // — so anything spawned from here has a context.
     let _guard = rt_handle.as_ref().map(|h| h.enter());
+
+    // The engine, from the process's slot: built here with every tenant's
+    // requests merged, or this substrate attached to the one a higher-ranked
+    // tenant built.
+    let engine = plan.engine.ticket().engine_with_progress(
+        &mut builder,
+        &device,
+        // Per transformer block, which is what makes the bar move during the
+        // part of startup that actually takes the time.
+        Some(&|loaded, total| p.set_progress(loaded as u64, total as u64)),
+    )?;
 
     // ── the substrate ──────────────────────────────────────────────────────
     //
@@ -3892,17 +3955,6 @@ fn load(
     // This phase used to walk the tree, count what it found and write nothing,
     // under a label that said "Ingesting mind layers" over a world whose
     // sixty-six documents no character could ever reach.
-    // The mind's real projection, parsed once. Everything written from here on
-    // is written under it — which is what gives a document something to gather
-    // from and therefore a provenance signature. `None` falls back to a
-    // synthetic schema that cannot gather, and says so.
-    let mut projection = schema::build(rt.mind.as_deref(), "battle-cities");
-    if projection.is_none() && rt.mind.is_some() {
-        tracing::warn!(
-            "no usable projection schema — documents will be written but will produce \
-             no provenance signatures, so nothing will gather them"
-        );
-    }
 
     // ── the acts ───────────────────────────────────────────────────────────
     //
@@ -5890,9 +5942,8 @@ mod tests {
     /// working directory*, so a runtime that does not carry `--data` cannot pass
     /// it on and the redo log lands wherever the daemon was launched from. That
     /// happened: the character store sat correctly in `npcd/substrate` at 65 MB
-    /// while the real log grew to **190 GB** in the repo root, invisible to
-    /// `/v1/substrate/storage`, until it filled the disk and surfaced as a
-    /// linker error.
+    /// while the real log grew to **190 GB** in the repo root, invisible to the
+    /// storage view, until it filled the disk and surfaced as a linker error.
     #[test]
     fn the_runtime_knows_where_the_daemon_writes() {
         let data = std::env::temp_dir().join("npcd-data-probe");

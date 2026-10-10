@@ -23,7 +23,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json,
 };
-// Only the test-only `router` builds one directly; `main` goes through `api`.
+// Only the test-only `router` builds one directly; the tenant goes through `api`.
 #[cfg(test)]
 use axum::Router;
 use serde::Deserialize;
@@ -38,7 +38,6 @@ use crate::accounts::{self, Accounts, NameError, PatchError};
 use crate::clock::{self, Clock};
 use crate::collections::{self, Libraries};
 use crate::engine::runtime::Runtime;
-use crate::guard::Api;
 use crate::guest_routes;
 use crate::identity::require;
 use crate::images::{ImageError, Images};
@@ -52,9 +51,11 @@ use crate::mind::{
 };
 use crate::npcs::{self, Filter, NpcError, Npcs};
 use crate::portrait;
+use crate::projection::BUNDLED;
 use crate::prose;
 use crate::registry::{self, PutError, Registry};
 use crate::visibility;
+use host::guard::Api;
 
 /// Both authored collections, shared with the HTTP layer.
 ///
@@ -130,7 +131,7 @@ impl Authored {
     /// were authored with. Bundling them into a struct to satisfy an arity
     /// threshold would be the same nine fields written twice, named once for the
     /// builder and once here, with a second place for them to disagree. Called
-    /// exactly once, from `main`.
+    /// exactly once, from the tenant's start.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         worlds: Registry,
@@ -196,14 +197,14 @@ impl Authored {
 /// The routes this daemon owns, to be layered over the mock.
 ///
 /// Every line names the role it needs, because [`Api`] has no method that adds
-/// a route without one — see [`crate::guard`]. The check runs there, not in the
+/// a route without one — see `host::guard`. The check runs there, not in the
 /// handlers, so there is exactly one place per route where the answer lives.
 ///
 /// Paths whose methods differ in role are registered twice, which axum merges:
 /// reading a world is open and writing one is an admin's, and one line each is
 /// what makes that visible.
-pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
-    Api::new(state.roles.clone())
+pub fn api(roles: Roles) -> Api<Arc<Authored>> {
+    Api::new(roles)
         // Authored content. Anyone may read it; only an admin may change a file
         // on disk. The mind is not under version control, so a bad write is not
         // a row to restore — it is prose somebody wrote, gone.
@@ -349,9 +350,9 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         // key — see [`crate::mind::section`].
         .route("/v1/mind/fields", Role::User, get(mind_fields))
         .route("/v1/mind/fields", Role::Admin, put(put_mind_fields))
-        // The nine layers, from the mind's own schema rather than from a second
-        // copy of them — see [`schema_layers`].
-        .route("/v1/schema/layers", Role::User, get(schema_layers))
+        // The nine layers are the host's `/v1/schema/layers`, which reads them
+        // from npcd through [`schema_layers`].
+        //
         // The cast. These replace the console's fixture: a character here is a
         // record in the substrate owned by the signed-in account. `User` is the
         // bar; *ownership* is the rest of the answer and is checked per-record
@@ -425,8 +426,8 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         .route("/v1/image/:iid", Role::User, get(get_image))
         // An account and its profile are the caller's own, so `User` and then
         // the record is keyed by their subject — there is no id in these paths
-        // to belong to somebody else.
-        .route("/v1/me", Role::User, get(me))
+        // to belong to somebody else. `/v1/me` itself is the host's, which
+        // reads the account from npcd through [`account`].
         .route(
             "/v1/me/profile",
             Role::User,
@@ -450,17 +451,17 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         .route("/v1/me/unique-name", Role::User, put(put_unique_name))
 }
 
-/// The finished router, for tests. `main` builds it from [`api`] so it can read
-/// the route table on the way past.
+/// The finished router, for tests. The tenant builds it from [`api`] so the
+/// host can read the route table on the way past.
 #[cfg(test)]
 pub fn router(state: Arc<Authored>) -> Router {
-    api(state.clone()).into_router(state)
+    api(state.roles.clone()).into_routes(state).router
 }
 
 /// The caller's identity, on a route the registration already put behind
 /// [`Role::User`].
 ///
-/// The role bar is not re-checked here — [`crate::guard`] enforced it before
+/// The role bar is not re-checked here — `host::guard` enforced it before
 /// the handler ran. What this does is *retrieve* the identity, which handlers
 /// need for the part a role cannot express: which records are yours. The
 /// `require` call is how it gets one safely, and it doubles as a backstop if a
@@ -1426,33 +1427,17 @@ async fn delete_npc(
     }
 }
 
-/// Who the caller is here, creating the local account on first sight.
-async fn me(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
-    let id = match caller(&s, &headers) {
-        Ok(id) => id,
-        Err(r) => return *r,
-    };
-    match s.accounts.write().await.upsert(&id, now_ms()) {
-        // The role travels with the account, because the console has to know
-        // it: a page that offers a Save the server will refuse is a page that
-        // teaches its user the product is broken. It is reported, never
-        // accepted — this is the same value the server already decided with,
-        // not a claim the client gets to make.
-        Ok(mut me) => {
-            if let Some(map) = me.as_object_mut() {
-                map.insert("role".to_string(), json!(s.roles.of(Some(&id))));
-            }
-            Json(me).into_response()
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "account upsert failed");
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "account_write_failed",
-                "could not write the account record",
-            )
-        }
-    }
+/// The caller's account here, creating the record on first sight — npcd's
+/// share of the host's `/v1/me`. The host states the role beside it, from the
+/// same table this daemon decides with.
+///
+/// `Err` is the failed write, said once in the log; the host's answer then
+/// carries no account rather than a fabricated one.
+pub async fn account(s: &Authored, id: &Identity) -> Result<Value, String> {
+    s.accounts.write().await.upsert(id, now_ms()).map_err(|e| {
+        tracing::error!(error = %e, "account upsert failed");
+        e.to_string()
+    })
 }
 
 async fn get_profile(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
@@ -1865,51 +1850,32 @@ async fn put_mind_entry(
 /// `gather_scope`, `budget`, `groups` — rather than translated into a shape of
 /// this route's own. A translation is one more place for the two to disagree,
 /// and the author's words are the ones the editor shows.
-async fn schema_layers(State(s): State<Arc<Authored>>) -> Response {
-    let Some(root) = s.mind.root() else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "no_mind",
-            "this daemon has no mind directory, so it declares no layers",
-        );
-    };
+///
+/// npcd's share of the host's `/v1/schema/layers`. A daemon with no mind runs
+/// the bundled schema ([`BUNDLED`]), so that is the one listed — the layers the
+/// engine is actually projecting, not an empty list beside a running nine.
+/// Anything that stops the schema being read is the `Err`.
+pub fn schema_layers(s: &Authored) -> Result<Vec<Value>, String> {
     // The address, and the keys that say where its parts live. Asking the
-    // address rather than writing `layers` here keeps this route honest if the
-    // schema is ever held under a different key.
+    // address rather than writing `layers` here keeps this honest if the schema
+    // is ever held under a different key.
     let addr = match Address::parse("settings/projection") {
         Ok(Some(a)) => a,
-        _ => {
-            tracing::error!("the projection schema has no address");
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "io_error",
-                "could not address the projection schema",
-            );
-        }
+        _ => return Err("could not address the projection schema".into()),
     };
     let Some((list_key, id_key)) = addr.parts() else {
-        tracing::error!("the projection schema declares no parts");
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "io_error",
-            "the projection schema declares no layers",
-        );
+        return Err("the projection schema declares no parts".into());
     };
-    let doc = match mind_catalog::read(root, &addr) {
-        Ok(d) => d,
-        Err(e) => return doc_err(e),
+    let text = match s.mind.root() {
+        Some(root) => {
+            mind_catalog::read(root, &addr)
+                .map_err(|e| format!("{e:?}"))?
+                .text
+        }
+        None => BUNDLED.to_string(),
     };
-    match mind_parts::list(&doc.text, list_key, id_key) {
-        Ok(items) => Json(json!({
-            "layers": items.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
-        }))
-        .into_response(),
-        Err(e) => err(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "malformed_schema",
-            &e.to_string(),
-        ),
-    }
+    let items = mind_parts::list(&text, list_key, id_key).map_err(|e| e.to_string())?;
+    Ok(items.into_iter().map(|(_, v)| v).collect())
 }
 
 /// An entry as editable fields, rather than as its text.
@@ -2435,6 +2401,9 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    use crate::engine::api as engine_api;
+    use crate::projection::Source;
+
     /// A directory of this test's own.
     ///
     /// The tag names it and a counter keeps it unique. It used to be the tag
@@ -2528,9 +2497,10 @@ mod tests {
     ///
     /// This is the whole authentication story on this side: the gateway
     /// resolved a session cookie and named the caller. `npcd` believes it
-    /// because `web` clears these on ingress unless the server declared
-    /// `behind_gateway`, which is asserted in `web/tests/roles.rs` rather than
-    /// here — an in-process router cannot observe its own ingress.
+    /// because the server clears these on ingress from every peer it does not
+    /// trust (`web::Builder::trust`), which is asserted in `web/tests/roles.rs`
+    /// and `host/src/server.rs` rather than here — an in-process router cannot
+    /// observe its own ingress.
     fn signed_in(sub: &str) -> Vec<(&'static str, String)> {
         vec![
             ("x-tokera-user", sub.to_owned()),
@@ -2595,30 +2565,40 @@ mod tests {
         (status, bytes.to_vec())
     }
 
+    /// Sign `sub` in as the host's `/v1/me` does for npcd: its account,
+    /// created on first sight.
+    async fn sign_in(state: &Arc<Authored>, sub: &str) -> Value {
+        let mut headers = HeaderMap::new();
+        for (k, v) in signed_in(sub) {
+            headers.insert(k, v.parse().unwrap());
+        }
+        let id = crate::identity::identify(&headers).expect("signed in");
+        account(state, &id).await.expect("the account is written")
+    }
+
     #[tokio::test]
     async fn a_signed_caller_gets_an_account_created_on_first_sight() {
-        let (status, me) = call(app(), get("/v1/me", Some("google-1"))).await;
-        assert_eq!(status, StatusCode::OK);
+        let me = sign_in(&state(tmp("first-sight")), "google-1").await;
         assert_eq!(me["email"], "wren@example.com");
         assert_eq!(me["display"], "Wren S");
         assert!(me["user_id"].as_str().unwrap().starts_with("u_"));
     }
 
-    /// A caller the gateway did not name is anonymous, and stays that way.
+    /// The account is the caller's own: profile routes need a signed-in caller.
     #[tokio::test]
     async fn without_the_gateways_headers_nobody_is_signed_in() {
-        let (status, body) = call(app(), get("/v1/me", None)).await;
+        let (status, body) = call(app(), get("/v1/me/profile", None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"], "unauthorized");
     }
 
     /// The subject is the account key, so a caller who sends everything *but*
-    /// a subject must not become an account — least of all the one their email
+    /// a subject must not reach an account — least of all the one their email
     /// happens to name.
     #[tokio::test]
     async fn a_caller_with_no_subject_cannot_borrow_an_email_to_become_someone() {
         let req = Request::builder()
-            .uri("/v1/me")
+            .uri("/v1/me/profile")
             .header("x-tokera-email", "admin@tokera.com")
             .header("x-tokera-name", "Admin")
             .body(Body::empty())
@@ -2632,9 +2612,8 @@ mod tests {
         let state = state(tmp("profile"));
         let a = "google-1";
 
-        // `/v1/me` is what creates the record.
-        let (s, _) = call(router(state.clone()), get("/v1/me", Some(a))).await;
-        assert_eq!(s, StatusCode::OK);
+        // Signing in is what creates the record.
+        sign_in(&state, a).await;
 
         let req = send(
             "/v1/me/profile",
@@ -2682,7 +2661,7 @@ mod tests {
     async fn a_restored_revision_comes_back_as_a_new_one() {
         let state = state(tmp("restore"));
         let a = "google-1";
-        call(router(state.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&state, a).await;
 
         for text in ["Surveyor.", "Ex-surveyor.", "Something else."] {
             let req = send("/v1/me/profile", "PUT", a, json!({ "description": text }));
@@ -2735,8 +2714,8 @@ mod tests {
     async fn revisions_belong_to_the_caller_and_nobody_else() {
         let state = state(tmp("revowner"));
         let (a1, a2) = ("google-1", "google-2");
-        call(router(state.clone()), get("/v1/me", Some(a1))).await;
-        call(router(state.clone()), get("/v1/me", Some(a2))).await;
+        sign_in(&state, a1).await;
+        sign_in(&state, a2).await;
 
         let req = send("/v1/me/profile", "PUT", a1, json!({"description": "mine"}));
         call(router(state.clone()), req).await;
@@ -2778,8 +2757,8 @@ mod tests {
         let state = state(tmp("two"));
         let (a1, a2) = ("google-1", "google-2");
 
-        call(router(state.clone()), get("/v1/me", Some(a1))).await;
-        call(router(state.clone()), get("/v1/me", Some(a2))).await;
+        sign_in(&state, a1).await;
+        sign_in(&state, a2).await;
 
         let req = send("/v1/me/profile", "PUT", a1, json!({"description": "mine"}));
         call(router(state.clone()), req).await;
@@ -2803,7 +2782,7 @@ mod tests {
     async fn a_unique_name_is_the_authors_to_set_and_survives_the_next_sign_in() {
         let state = state(tmp("uname"));
         let a = "google-1";
-        call(router(state.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&state, a).await;
 
         let (s, me) = call(router(state.clone()), set_name(a, "ridge-walker")).await;
         assert_eq!(s, StatusCode::OK);
@@ -2811,7 +2790,7 @@ mod tests {
 
         // The provider re-asserts `Wren S` on every sign-in; the chosen name
         // must not be reverted by it.
-        let (_, me) = call(router(state), get("/v1/me", Some(a))).await;
+        let me = sign_in(&state, a).await;
         assert_eq!(me["unique_name"], "ridge-walker");
         assert_eq!(me["display"], "Wren S");
     }
@@ -2822,8 +2801,8 @@ mod tests {
     async fn two_authors_cannot_share_one_name() {
         let state = state(tmp("clash"));
         let (a1, a2) = ("google-1", "google-2");
-        call(router(state.clone()), get("/v1/me", Some(a1))).await;
-        call(router(state.clone()), get("/v1/me", Some(a2))).await;
+        sign_in(&state, a1).await;
+        sign_in(&state, a2).await;
 
         let (s, _) = call(router(state.clone()), set_name(a1, "ridge-walker")).await;
         assert_eq!(s, StatusCode::OK);
@@ -2843,7 +2822,7 @@ mod tests {
     async fn a_malformed_name_is_refused_with_a_reason_worth_showing() {
         let state = state(tmp("shape"));
         let a = "google-1";
-        call(router(state.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&state, a).await;
 
         let too_long = "w".repeat(25);
         for bad in ["x", "-wren", "wren-", "wren s", "wrén", too_long.as_str()] {
@@ -2864,7 +2843,7 @@ mod tests {
     async fn gender_takes_only_the_values_a_character_can_read() {
         let state = state(tmp("gender"));
         let a = "google-1";
-        call(router(state.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&state, a).await;
 
         for good in ["Male", "Female", ""] {
             let req = send("/v1/me/profile", "PUT", a, json!({ "gender": good }));
@@ -2897,7 +2876,7 @@ mod tests {
     async fn a_wrong_typed_field_is_refused_and_changes_nothing() {
         let state = state(tmp("types"));
         let a = "google-1";
-        call(router(state.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&state, a).await;
 
         let seed = send(
             "/v1/me/profile",
@@ -2931,7 +2910,7 @@ mod tests {
     async fn a_body_that_is_not_an_object_is_refused() {
         let state = state(tmp("shape2"));
         let a = "google-1";
-        call(router(state.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&state, a).await;
 
         for body in [json!([]), json!("x"), json!(3), json!(null)] {
             let req = send("/v1/me/profile", "PUT", a, body.clone());
@@ -3000,7 +2979,7 @@ mod tests {
     async fn a_character_may_only_name_documents_that_exist() {
         let state = state(tmp("refs"));
         let a = "google-1";
-        call(router(state.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&state, a).await;
         author(&state).await;
 
         let ok = send(
@@ -3151,7 +3130,7 @@ mod tests {
     /// or `delete` among them.
     #[test]
     fn the_route_table_is_what_we_think_it_is() {
-        let api = api(state(tmp("table")));
+        let api = api(Roles::default());
         let got: Vec<(&str, &str)> = api
             .declared()
             .iter()
@@ -3217,10 +3196,6 @@ mod tests {
                 ("/v1/mind/entry", "admin"),
                 ("/v1/mind/fields", "user"),
                 ("/v1/mind/fields", "admin"),
-                // The schema's own layers, read from the mind. `user` for the
-                // same reason the three rows above are: it is a reading of the
-                // corpus, and reading the corpus is a signed-in act.
-                ("/v1/schema/layers", "user"),
                 // The cast: signed in, then ownership per record.
                 ("/v1/npc", "user"),
                 // The whole cast in and out as records, for backup/restore —
@@ -3253,8 +3228,7 @@ mod tests {
                 // character they just made.
                 ("/v1/npc/:nid/portrait/generate", "user"),
                 ("/v1/image/:iid", "user"),
-                // The caller's own account.
-                ("/v1/me", "user"),
+                // The caller's own account. `/v1/me` itself is the host's.
                 ("/v1/me/profile", "user"),
                 ("/v1/me/profile/history", "user"),
                 ("/v1/me/profile/history/:rev", "user"),
@@ -3266,18 +3240,18 @@ mod tests {
 
     /// The same whole-table assertion, for the engine's routes.
     ///
-    /// **These are merged into the router separately** (`main.rs` builds
-    /// `engine::api(..)` and `.merge`s it), so the table above — which is built
-    /// from this crate's `api(..)` alone — never saw them, and the three routes
-    /// that reach a character somebody else owns (`/simulate`, `/pulse/broadcast`,
-    /// `/tools/calibrate`, all `admin`) had no guard test at all. This closes
-    /// that: read the `user` rows against their ownership checks, and the two
+    /// **These are merged into the router separately** (the tenant builds
+    /// `engine::api(..)` and merges it), so the table above — which is built
+    /// from this crate's `api(..)` alone — never saw them, and the routes that
+    /// reach a character somebody else owns (`/simulate`, `/pulse/broadcast`,
+    /// both `admin`) had no guard test at all. This closes that: read the
+    /// `user` rows against their ownership checks, and the two
     /// `creator` rows (the world channel's write side and a world posting)
     /// against the fact that they reach a whole world at once, which ownership
     /// cannot express.
     #[test]
     fn the_engine_route_table_is_what_we_think_it_is() {
-        let api = crate::engine::api(state(tmp("engine_table")));
+        let api = engine_api(Roles::default());
         let got: Vec<(&str, &str)> = api
             .declared()
             .iter()
@@ -3323,10 +3297,8 @@ mod tests {
                 ("/v1/world/:wid/channel", "user"),
                 ("/v1/world/:wid/channel", "creator"),
                 ("/v1/world/:wid/posting", "creator"),
-                // The act vocabulary. Reading the catalog and the command list
-                // is a user's; calibrating an act spends the engine, so admin.
-                ("/v1/tools", "user"),
-                ("/v1/tools/calibrate", "admin"),
+                // The command list is a user's. The catalog and its
+                // calibration are the host's `/v1/tools`.
                 ("/v1/commands", "user"),
                 // Pulse: the cast's loop as an instrument, and reaching into it.
                 ("/v1/pulse", "user"),
@@ -3445,7 +3417,7 @@ mod tests {
         let dir = tmp("cast");
         let st = state(dir.clone());
         let a = "google-1";
-        call(router(st.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&st, a).await;
         author(&st).await;
 
         // Create.
@@ -3520,6 +3492,10 @@ mod tests {
         assert_eq!(npc["hidden"], true);
 
         // **Reopen the store.** Everything above must come back off the log.
+        // The first handle closes first, as a restarting daemon's does: a
+        // substrate takes one writer, and a second open beside a live one is
+        // refused.
+        drop(st);
         let again = state(dir);
         let (s, back) = call(
             router(again.clone()),
@@ -3567,8 +3543,8 @@ mod tests {
     async fn tags_and_hidden_belong_to_the_owner() {
         let st = state(tmp("own-edit"));
         let (a, b) = ("google-1", "google-2");
-        call(router(st.clone()), get("/v1/me", Some(a))).await;
-        call(router(st.clone()), get("/v1/me", Some(b))).await;
+        sign_in(&st, a).await;
+        sign_in(&st, b).await;
         author(&st).await;
 
         let (_, npc) = call(
@@ -4538,7 +4514,7 @@ layers:
     async fn the_authoring_plane_is_written_and_kept() {
         let st = state(tmp("authoring"));
         let a = "google-1";
-        call(router(st.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&st, a).await;
         author(&st).await;
 
         let (s, npc) = call(
@@ -4719,7 +4695,7 @@ layers:
     async fn a_portrait_can_be_asked_for_and_the_refusal_is_legible() {
         let st = state(tmp("portrait-generate"));
         let a = "google-1";
-        call(router(st.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&st, a).await;
         author(&st).await;
 
         let (s, npc) = call(
@@ -4799,7 +4775,7 @@ layers:
         // Admin, with the rest of `/v1/life`: this route writes prose into the
         // substrate that a character will believe it remembers.
         let a = ADMIN;
-        call(router(st.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&st, a).await;
         author(&st).await;
 
         // An ordinary user cannot reach it at all.
@@ -5021,9 +4997,10 @@ layers:
         assert!(cols.iter().all(|c| c["name"] != "doctrine"));
     }
 
-    /// **`/v1/schema/layers` is the schema, not a copy of it.**
+    /// **npcd's layers in `/v1/schema/layers` are the schema, not a copy of
+    /// it.**
     ///
-    /// It used to be answered by the console's fixture, with the nine layers
+    /// They used to be answered by the console's fixture, with the nine layers
     /// written out a second time — and they drifted: the fixture had `action`
     /// at budget priority 95 where the schema said 100. Nothing compared them,
     /// so nothing could report it. Reading the same document the editor writes
@@ -5034,13 +5011,7 @@ layers:
         seed_projection(&base);
         let st = mind_state(base.clone());
 
-        let (s, v) = call(
-            router(st.clone()),
-            get("/v1/schema/layers", Some("google-1")),
-        )
-        .await;
-        assert_eq!(s, StatusCode::OK);
-        let layers = v["layers"].as_array().expect("layers");
+        let layers = schema_layers(&st).expect("the schema reads");
         assert_eq!(layers.len(), 2);
         // The schema's own vocabulary, verbatim — not translated into a shape
         // this route invented, which would be the second copy all over again.
@@ -5074,10 +5045,47 @@ layers:
         )
         .await;
         assert_eq!(s, StatusCode::OK);
-        let (_, v) = call(router(st), get("/v1/schema/layers", Some("google-1"))).await;
         assert_eq!(
-            v["layers"][0]["window"], 12345,
-            "the route kept its own copy"
+            schema_layers(&st).expect("the schema reads")[0]["window"],
+            12345,
+            "the reader kept its own copy"
+        );
+    }
+
+    /// **With no mind, the layers listed are the bundled schema's** — the ones
+    /// the engine runs — not an empty list beside nine running layers.
+    #[test]
+    fn a_daemon_with_no_mind_lists_the_bundled_layers() {
+        let base = tmp("schema-layers-bundled");
+        let st = Arc::new(Authored::new(
+            Registry::load("world", base.join("worlds")).unwrap(),
+            Registry::load("personality", base.join("personalities")).unwrap(),
+            Accounts::load(base.join("accounts")).unwrap(),
+            Npcs::load(&base).unwrap(),
+            serde_yaml::from_str(&format!("admins:\n  - sub: {ADMIN}\n")).unwrap(),
+            Libraries::load(&Source::resolve(None).unwrap()),
+            Mind::new(None),
+            Images::new(&base),
+            BTreeMap::new(),
+        ));
+        let names: Vec<String> = schema_layers(&st)
+            .expect("the bundled schema reads")
+            .iter()
+            .map(|l| l["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "perception",
+                "action",
+                "interaction",
+                "memory",
+                "world",
+                "environment",
+                "agency",
+                "relationships",
+                "beliefs",
+            ]
         );
     }
 
@@ -5262,18 +5270,6 @@ layers:
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
-    /// The role is reported on the account so the console can hide a control
-    /// the server would refuse — and it is the server's answer, never a claim
-    /// the client makes.
-    #[tokio::test]
-    async fn the_account_carries_the_role_the_server_decided() {
-        let state = state(tmp("role-me"));
-        let (_, me) = call(router(state.clone()), get("/v1/me", Some(ADMIN))).await;
-        assert_eq!(me["role"], "admin");
-        let (_, me) = call(router(state), get("/v1/me", Some("google-1"))).await;
-        assert_eq!(me["role"], "user");
-    }
-
     /// A server-side write failure must not hand back the absolute path of a
     /// file on this machine. The author's own mistakes still come back in full,
     /// because the message is the useful part.
@@ -5339,7 +5335,7 @@ layers:
     async fn the_listings_count_the_characters_that_name_them() {
         let state = state(tmp("counts"));
         let a = "google-1";
-        call(router(state.clone()), get("/v1/me", Some(a))).await;
+        sign_in(&state, a).await;
         author(&state).await;
 
         let (_, w) = call(router(state.clone()), get("/v1/world", Some(a))).await;

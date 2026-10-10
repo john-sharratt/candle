@@ -1,78 +1,122 @@
-//! Cooperative ingest cancellation — an engine-layer concern.
+//! Cooperative ingest cancellation, one latch per substrate.
 //!
 //! The startup ingest, the background reconcile, and uploads all drive the same
 //! engine (scheduler + persistence). A graceful shutdown mid-ingest must stop
 //! that ingest at a safe boundary so the persistence thread can drain the tier
-//! tail hot→warm→cold instead of losing it. This flag is the signal.
+//! tail hot→warm→cold instead of losing it. A [`CancelToken`] is the signal.
 //!
-//! It lives HERE (not in the app/daemon) for two reasons: the ingest and the
-//! summary-decode wait it needs to interrupt are engine internals
-//! ([`crate::Sequence::ingest_scope_roundtrip_indices`]), and the flag must be
-//! reachable while the engine is still being constructed on the loader thread —
-//! before any [`ConversationEngine`](crate::ConversationEngine) handle is
-//! published — which a free function (no engine reference) provides.
-//!
-//! **Scope & lifecycle.** The flag is process-scoped (one latch for the whole
-//! process, not per-engine), so a caller that runs more than one engine — or the
-//! test binary, which runs many — must treat it as shared. It is **resettable**:
-//! [`reset_ingest_cancel`] clears it at the start of a load so a fresh load (or
-//! the next test) never inherits a prior run's cancel, and an embedder can
-//! re-arm ingest after a cancelled one.
+//! **Scope.** One token per substrate: each [`crate::projection::Conversation`]
+//! carries the token its engine attachment was built with, so stopping one
+//! tenant's ingest leaves another tenant on the same engine running. A daemon
+//! creates its token before the engine exists and hands it to the builder
+//! ([`crate::models::ModelBuilder::cancel_token`]), so a shutdown that arrives
+//! while the engine is still loading reaches the ingest the load is about to
+//! start. The token is **resettable** ([`CancelToken::reset`]) so a fresh load
+//! never inherits a prior run's cancel.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-static INGEST_CANCEL: AtomicBool = AtomicBool::new(false);
+/// A cancellation latch shared by clones.
+#[derive(Clone, Default)]
+pub struct CancelToken {
+    inner: Arc<Latch>,
+}
 
-/// Every async waiter parked on the latch, keyed by its future's identity so a
-/// re-poll replaces the stored waker instead of accumulating clones, and a
-/// dropped future removes its own entry instead of leaking its task reference
-/// for the life of the process.
-static CANCEL_WAKERS: Mutex<Vec<(u64, Waker)>> = Mutex::new(Vec::new());
-static NEXT_WAITER: AtomicU64 = AtomicU64::new(0);
+#[derive(Default)]
+struct Latch {
+    cancelled: AtomicBool,
+    /// Every async waiter parked on the latch, keyed by its future's identity
+    /// so a re-poll replaces the stored waker instead of accumulating clones,
+    /// and a dropped future removes its own entry instead of leaking its task
+    /// reference for the life of the token.
+    wakers: Mutex<Vec<(u64, Waker)>>,
+    next_waiter: AtomicU64,
+}
 
-/// Ask every in-flight ingest to stop at its next file / cluster / scope-chunk
-/// boundary (and the in-flight summary decode to abandon its wait). Idempotent.
-pub fn request_ingest_cancel() {
-    INGEST_CANCEL.store(true, Ordering::SeqCst);
-    // After the store, so a waiter woken here re-reads the flag as latched —
-    // and woken OUTSIDE the registry lock, because a wake may synchronously
-    // drop or re-poll another waiter, and both of those take the same lock.
-    let woken: Vec<(u64, Waker)> = CANCEL_WAKERS.lock().unwrap().drain(..).collect();
-    for (_, w) in woken {
-        w.wake();
+impl std::fmt::Debug for CancelToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
     }
 }
 
-/// Resolves when [`request_ingest_cancel`] latches — the awaitable face of the
-/// same latch [`ingest_cancelled`] polls, for the async ingest waits that have
-/// no timer to poll it on ([`crate::TurnHandle::wait_cancellable_async`]).
-/// Already-latched resolves immediately.
-pub fn ingest_cancel_wait() -> IngestCancelWait {
-    IngestCancelWait {
-        id: NEXT_WAITER.fetch_add(1, Ordering::Relaxed),
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask every in-flight ingest on this token to stop at its next file /
+    /// cluster / scope-chunk boundary (and the in-flight summary decode to
+    /// abandon its wait). Idempotent.
+    pub fn request(&self) {
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+        // After the store, so a waiter woken here re-reads the flag as latched
+        // — and woken OUTSIDE the registry lock, because a wake may
+        // synchronously drop or re-poll another waiter, and both of those take
+        // the same lock.
+        let woken: Vec<(u64, Waker)> = self
+            .inner
+            .wakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for (_, w) in woken {
+            w.wake();
+        }
+    }
+
+    /// Clear the latch so a new load starts un-cancelled.
+    pub fn reset(&self) {
+        self.inner.cancelled.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether a shutdown has asked ingest on this token to stop. A `Relaxed`
+    /// load is sufficient — this is a one-way latch (until [`Self::reset`]),
+    /// not a synchronisation point.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Resolves when [`Self::request`] latches — the awaitable face of the
+    /// latch, for the async ingest waits that have no timer to poll it on
+    /// ([`crate::TurnHandle::wait_cancellable_async`]). Already latched
+    /// resolves immediately.
+    pub fn wait(&self) -> CancelWait {
+        CancelWait {
+            token: self.clone(),
+            id: self.inner.next_waiter.fetch_add(1, Ordering::Relaxed),
+        }
     }
 }
 
-/// See [`ingest_cancel_wait`].
-pub struct IngestCancelWait {
+/// See [`CancelToken::wait`].
+pub struct CancelWait {
+    token: CancelToken,
     id: u64,
 }
 
-impl Future for IngestCancelWait {
+impl Future for CancelWait {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if ingest_cancelled() {
+        if self.token.is_cancelled() {
             return Poll::Ready(());
         }
-        let mut wakers = CANCEL_WAKERS.lock().unwrap();
+        let mut wakers = self
+            .token
+            .inner
+            .wakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Re-check under the lock: a cancel between the read above and this
         // registration has already drained the list, so registering after it
         // would park this waiter forever.
-        if ingest_cancelled() {
+        if self.token.is_cancelled() {
             return Poll::Ready(());
         }
         match wakers.iter_mut().find(|(id, _)| *id == self.id) {
@@ -83,105 +127,72 @@ impl Future for IngestCancelWait {
     }
 }
 
-impl Drop for IngestCancelWait {
+impl Drop for CancelWait {
     fn drop(&mut self) {
-        CANCEL_WAKERS
+        self.token
+            .inner
+            .wakers
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|(id, _)| *id != self.id);
     }
-}
-
-/// Clear the cancel latch so a new load starts un-cancelled. Called at the start
-/// of a load (and usable by tests / embedders to re-arm ingest after a prior
-/// cancel), since the flag is process-scoped and would otherwise persist across
-/// loads within one process.
-pub fn reset_ingest_cancel() {
-    INGEST_CANCEL.store(false, Ordering::SeqCst);
-}
-
-/// Whether a shutdown has asked ingest to stop. Polled in the ingest item loops
-/// and the interruptible decode-wait. A `Relaxed` load is sufficient — this is a
-/// one-way latch (until [`reset_ingest_cancel`]), not a synchronisation point.
-pub fn ingest_cancelled() -> bool {
-    INGEST_CANCEL.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The flag — and `CANCEL_WAKERS` — are process-scoped, so these tests
-    /// share them with each other, and Rust's default test harness runs every
-    /// test in this binary on its own thread, concurrently. `a_parked_waiter`
-    /// spinning on "`CANCEL_WAKERS` is non-empty" cannot tell its own waiter
-    /// apart from another test's — `a_dropped_waiter`'s raw `poll` registers
-    /// one too — so it can read a sibling's entry as its own, latch the cancel
-    /// on that mistaken signal, and only then have its actual spawned thread
-    /// register: a registration the one `request_ingest_cancel` call already
-    /// missed, parked with nothing left to ever wake it. Measured: reliably
-    /// live under a full unthrottled `cargo test`, hanging (not failing) for
-    /// as long as the run is left to sit — no amount of waiting resolves it.
-    ///
-    /// A lock serialising this module's tests removes the interleaving these
-    /// three depend on not having, rather than trying to make the shared
-    /// latch itself safe for concurrent test ownership — which is not what it
-    /// is for: exactly one process-wide shutdown latches it for real, and
-    /// these tests are the only callers that ever contend over it at all.
-    static TEST_SERIAL: Mutex<()> = Mutex::new(());
-
-    /// Recovers a poisoned lock rather than propagating the poison: a prior
-    /// test's panic while holding `TEST_SERIAL` must not fail every test
-    /// after it with "lock poisoned" instead of its own assertion.
-    fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
-        TEST_SERIAL
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
-
     #[test]
     fn an_already_latched_cancel_resolves_immediately() {
-        let _serial = lock_tests();
-        request_ingest_cancel();
-        futures::executor::block_on(ingest_cancel_wait());
-        reset_ingest_cancel();
+        let token = CancelToken::new();
+        token.request();
+        futures::executor::block_on(token.wait());
     }
 
     #[test]
     fn a_parked_waiter_is_woken_by_the_cancel() {
-        let _serial = lock_tests();
-        reset_ingest_cancel();
-        let waited = std::thread::spawn(|| {
-            futures::executor::block_on(ingest_cancel_wait());
+        let token = CancelToken::new();
+        let waiting = token.clone();
+        let waited = std::thread::spawn(move || {
+            futures::executor::block_on(waiting.wait());
         });
         // Let the waiter park before latching — registration is what is under
-        // test. Held exclusively via `TEST_SERIAL` now, so the only other
-        // thread that can touch `CANCEL_WAKERS` here is `waited` itself.
-        while CANCEL_WAKERS.lock().unwrap().is_empty() && !waited.is_finished() {
+        // test, and this token's registry is nobody else's.
+        while token.inner.wakers.lock().unwrap().is_empty() && !waited.is_finished() {
             std::thread::yield_now();
         }
-        request_ingest_cancel();
+        token.request();
         waited.join().expect("the waiter returned");
-        reset_ingest_cancel();
     }
 
     #[test]
     fn a_dropped_waiter_leaves_no_waker_behind() {
-        let _serial = lock_tests();
-        reset_ingest_cancel();
-        let wait = ingest_cancel_wait();
-        let id = wait.id;
+        let token = CancelToken::new();
+        let wait = token.wait();
         {
             // Park it once so it registers.
             let mut wait = Box::pin(wait);
             let waker = futures::task::noop_waker();
             let mut cx = Context::from_waker(&waker);
             assert!(wait.as_mut().poll(&mut cx).is_pending());
-            assert!(CANCEL_WAKERS.lock().unwrap().iter().any(|(i, _)| *i == id));
+            assert_eq!(token.inner.wakers.lock().unwrap().len(), 1);
         }
         assert!(
-            !CANCEL_WAKERS.lock().unwrap().iter().any(|(i, _)| *i == id),
+            token.inner.wakers.lock().unwrap().is_empty(),
             "the drop did not unregister the waker"
         );
+    }
+
+    /// Two substrates' tokens are independent: stopping one tenant's ingest
+    /// does not stop the other's.
+    #[test]
+    fn one_tokens_cancel_does_not_reach_another() {
+        let zend = CancelToken::new();
+        let npcd = CancelToken::new();
+        zend.request();
+        assert!(zend.is_cancelled());
+        assert!(!npcd.is_cancelled());
+        zend.reset();
+        assert!(!zend.is_cancelled());
     }
 }

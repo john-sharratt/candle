@@ -1,12 +1,12 @@
 /* npcd shell — boot, theme, nav, routing. */
 
 import { API, BACKEND } from './lib/api.js';
-import { definePage, navFor, navOwner, start, go, path, link, setViewerRole, can } from './lib/router.js';
-import { h, mount } from './lib/dom.js';
+import { definePage, navFor, navOwner, start, go, path, link, setViewerRole, can } from '/common/lib/router.js';
+import { h, mount } from '/common/lib/dom.js';
 import { toast } from './lib/ui.js';
-import { checkBuild, takeReloadState } from './lib/build.js';
-import { state as vp, onBreakpoint } from './lib/viewport.js';
-import { estateSwitcher } from './lib/estate.js';
+import { checkBuild, takeReloadState } from '/common/lib/build.js';
+import { state as vp, onBreakpoint } from '/common/lib/viewport.js';
+import { estateSwitcher } from '/common/lib/estate.js';
 
 // ── page registry ───────────────────────────────────────────────────────────
 // Adding a page touches exactly one entry here plus one file. Nav is derived.
@@ -24,8 +24,9 @@ import { estateSwitcher } from './lib/estate.js';
  * **Each role here mirrors the API route the page actually calls.** That is the
  * property worth protecting — a page shown to somebody whose every request 403s
  * is worse than no page, and a page hidden from somebody the API would have
- * served is a feature quietly withdrawn. The daemon's table is in `api::api`
- * and `ops::api`; when one moves, this moves.
+ * served is a feature quietly withdrawn. npcd's table is in `api::api` and
+ * `engine::api`, the host's shared endpoints in `host::endpoints::routes`;
+ * when one moves, this moves.
  *
  *   /            → GET  /v1/npc                     user
  *   /npc/*       → GET  /v1/npc/:nid                user
@@ -34,7 +35,7 @@ import { estateSwitcher } from './lib/estate.js';
  *   /personality/:aid/life → GET /v1/life/:who      admin
  *   /performance → GET  /v1/telemetry, /v1/memory   user
  *   /operations  → GET  /v1/pulse/operations        admin
- *   /substrate   → GET  /v1/substrate/storage       admin
+ *   /substrate   → GET  /v1/substrate               admin
  *   /logs        → WS   /ws/logs                    admin
  */
 definePage({ path: '/', role: 'user', nav: { section: 'main', order: 10, label: 'My NPCs' },
@@ -93,7 +94,7 @@ definePage({ path: '/pulse', role: 'user', nav: { section: 'main', order: 45, la
 // operation's missions are carried by the whole cast.
 definePage({ path: '/operations', role: 'admin', nav: { section: 'main', order: 47, label: 'Operations' },
   load: () => import('./pages/operations.js') });
-// Names the redo log's absolute path, so it matches `/v1/substrate/storage`.
+// Names the redo log's absolute path, so it matches `/v1/substrate`.
 definePage({ path: '/substrate', role: 'admin', nav: { section: 'main', order: 50, label: 'Substrate' },
   load: () => import('./pages/substrate.js') });
 definePage({ path: '/performance', role: 'user', nav: { section: 'main', order: 60, label: 'Performance' },
@@ -344,9 +345,9 @@ function syncRailButton() {
 
 // ── boot ────────────────────────────────────────────────────────────────────
 
-/* Sign-in is real. `/v1/me` answers only for a caller the gateway named, so
- * being signed in is not something this page can decide — it is something it
- * discovers.
+/* Sign-in is real. `/v1/me` names whoever the gateway named — and answers a
+ * caller it named nobody as `role: "unauthenticated"` — so being signed in is
+ * not something this page can decide; it is something it discovers.
  *
  * The gateway owns the flow. `/auth/login` is served on every hostname ahead of
  * site routing, and the cookie it issues is on `.tokera.com`, which is what
@@ -435,6 +436,16 @@ function paintLoading(loading, detail) {
   }
 }
 
+/* This console's own line in `/v1/status`. The host serves npcd beside other
+ * tenants, so the top-level `loading` may be another tenant's — its steps are
+ * not the ones this overlay lists — and the process is not `ready` for npcd
+ * until npcd is. */
+const mine = (status) => (status && status.tenants && status.tenants.npcd) || {};
+
+/* The caller, or `null` when nobody is signed in: `/v1/me` answers a signed-out
+ * caller with its role rather than a refusal, and that role is not an account. */
+const signedIn = (me) => (me && me.role && me.role !== 'unauthenticated' ? me : null);
+
 async function boot() {
   document.documentElement.setAttribute('data-theme', readTheme());
   const detail = document.getElementById('boot-detail');
@@ -462,9 +473,9 @@ async function boot() {
   for (let i = 0; i < 3000; i++) {
     try {
       status = await API.getStatus();
-      if (status.state === 'ready') break;
+      if (mine(status).state === 'ready') break;
       waited = true;
-      paintLoading(status.loading, detail);
+      paintLoading(mine(status).loading, detail);
     } catch (e) {
       waited = true;
       if (e && (e.status === 401 || e.status === 403)) {
@@ -478,10 +489,10 @@ async function boot() {
     await new Promise((r) => setTimeout(r, 400));
   }
 
-  // A 401 here means signed out, which is the only thing this daemon can say
-  // about identity — it does not run sign-in and has no configuration of its
-  // own that could be missing.
-  ME = waited ? await API.getMe().catch(() => null) : await earlyMe;
+  // `role: "unauthenticated"` means signed out, which is the only thing this
+  // daemon can say about identity — it does not run sign-in and has no
+  // configuration of its own that could be missing.
+  ME = signedIn(waited ? await API.getMe().catch(() => null) : await earlyMe);
   // Hand the router the server's answer, once. Everything role-shaped — which
   // nav links appear, which pages open, which controls are writable — reads
   // through this one function, so there is a single place that can be wrong
@@ -500,8 +511,8 @@ async function boot() {
     const el = document.getElementById(id);
     if (el) { el.textContent = text; if (title) el.title = title; }
   };
-  st('st-state', (status && status.state) === 'ready' ? '● ready' : '○ ' + ((status && status.state) || 'offline'));
-  st('st-mode', (status && status.mode) || '');
+  st('st-state', mine(status).state === 'ready' ? '● ready' : '○ ' + (mine(status).state || 'offline'));
+  st('st-mode', (status && status.model && status.model.name) || '');
   st('st-backend', 'backend: ' + BACKEND, 'add ?mock=1 to run without a daemon');
   st('st-build', (status && status.build) || '');
 
@@ -569,9 +580,10 @@ async function boot() {
     document.body.classList.toggle('logged-out', !ME);
   });
 
-  // The web assets are embedded in the binary, so a hot rebuild would leave this
-  // page running against a newer API — they disagree on the surface and break
-  // silently. Watch the build id and reload, carrying the route across.
+  // The console is served from disk and `build` hashes it with the binary's
+  // version, so an edited file or a rebuilt daemon changes it — and a page left
+  // running against either would disagree with it silently. Watch the build id
+  // and reload, carrying the route across.
   const restored = takeReloadState();
   if (restored && restored.hash) location.replace(restored.hash);
   setInterval(async () => {

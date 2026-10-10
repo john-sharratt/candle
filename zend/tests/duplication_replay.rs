@@ -37,7 +37,6 @@ mod replay {
 
     use crate::common::{needs_compaction, production_workspace, served};
     use zend::config::DaemonConfig;
-    use zend::log_broadcast::LogBus;
     use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::ToolMode;
     use zend::types::{ChatMessage, Role};
@@ -70,10 +69,8 @@ mod replay {
         // the user's live one and would take this test's 13 turns.
         let workspace = production_workspace();
 
-        let log = LogBus::new();
         let config = DaemonConfig {
             compact_substrate: needs_compaction(&workspace),
-            port: 0,
             // Bring the daemon up without the workspace ingest sweep — this test
             // exercises decode replay, not retrieval.
             disabled_layers: ["repo_map", "code_reading"]
@@ -85,7 +82,7 @@ mod replay {
         // NOTE: caller must invoke `session.start_loading()` from WITHIN the Tokio
         // runtime (inside `block_on`) — the workspace watcher spawns onto the
         // ambient runtime and panics if none is current.
-        Arc::new(ZendSession::new(config, Arc::clone(&log)))
+        Arc::new(ZendSession::new(config))
     }
 
     /// Submit one user turn on `conv_id` (argmax sampling) and return the

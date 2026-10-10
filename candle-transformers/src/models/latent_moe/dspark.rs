@@ -1045,8 +1045,8 @@ mod tests {
     /// On-device validation against the REAL DSpark drafter weights: the loader parses the
     /// `dflash` config, loads every tensor, and the encoder + sequential sampler run on the GPU
     /// with the actual `fc`/`markov`/`conf_proj` shapes. Skips when the drafter GGUF is absent
-    /// (fetch it with `zend --download-deepseek`). This is the real-weight, on-GPU counterpart
-    /// to the synthetic unit tests above.
+    /// (bartowski's `dspark-*.gguf`, placed beside the main quant in the folder below). This is
+    /// the real-weight, on-GPU counterpart to the synthetic unit tests above.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
@@ -1055,7 +1055,10 @@ mod tests {
             r"D:\models\deepseek-v4-flash-mxfp4\dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf",
         );
         if !path.exists() {
-            eprintln!("[skip] DSpark drafter absent — run `zend --download-deepseek`");
+            eprintln!(
+                "[skip] DSpark drafter absent — place bartowski's dspark GGUF at {}",
+                path.display()
+            );
             return Ok(());
         }
         let device = Device::new_cuda(0)?;

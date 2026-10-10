@@ -6,9 +6,7 @@ use super::{Model, ModelArch, RopePreset};
 /// names a schedule the builder can build, never `Lineage`.
 #[test]
 fn every_preset_names_a_schedule_its_arch_runs() {
-    let mut all = Model::PRESETS.to_vec();
-    all.push(Model::Qwen36_35B_A3B_AntiLoop_StyleTune);
-    for m in all {
+    for m in Model::PRESETS {
         let s = m.clone().preset_spec();
         let lineage = s.arch.file_rope() == RopePreset::Lineage;
         assert_eq!(

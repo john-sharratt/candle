@@ -622,6 +622,9 @@ pub struct BatchedInferenceSession {
     backings: Vec<ChunkedKvBacking>,
     /// Per-sequence state, indexed by sequence index.
     sequences: Vec<Option<SequenceState>>,
+    /// Slot ids held out of the free pool with no state — see
+    /// [`Self::reserve_sequence`].
+    reserved: HashSet<usize>,
     /// Configuration used to create this session.
     config: BatchedConfig,
     /// Number of layers in the model.
@@ -729,6 +732,7 @@ impl BatchedInferenceSession {
         Ok(Self {
             backings,
             sequences: Vec::new(),
+            reserved: HashSet::new(),
             config,
             num_layers,
             stream_layers: layers.stream,
@@ -836,6 +840,7 @@ impl BatchedInferenceSession {
         Self {
             backings,
             sequences: Vec::new(),
+            reserved: HashSet::new(),
             config,
             num_layers,
             // Every backing handed in is a stream layer: a sibling session
@@ -962,11 +967,13 @@ impl BatchedInferenceSession {
         let idx = if let Some(backing) = self.backings.first() {
             backing.first_free_slot()?
         } else {
-            // No backing — fall back to scanning our own sequences vector.
-            self.sequences
-                .iter()
-                .position(|s| s.is_none())
-                .unwrap_or(self.sequences.len())
+            // No backing — fall back to scanning our own sequences vector,
+            // passing over a reserved id.
+            (0..)
+                .find(|i| {
+                    self.sequences.get(*i).is_none_or(|s| s.is_none()) && !self.reserved.contains(i)
+                })
+                .expect("an unbounded range has a free index")
         };
 
         // Ensure slot is allocated in all backings
@@ -1396,10 +1403,34 @@ impl BatchedInferenceSession {
         Ok((Some(gpu_buf), header_stride as u64))
     }
 
-    /// Free a sequence, returning its resources to the pool.
+    /// Hold slot `idx` out of the free pool, holding no KV — a slot whose state
+    /// has been freed while a handle that names it may still be alive. Until
+    /// that handle's own [`Self::free_sequence`] releases it, no new sequence
+    /// takes the id, so a request the handle sends can never land on someone
+    /// else's sequence. The backings mark it allocated too, so a sibling
+    /// session sharing their pool passes over it as well.
+    pub fn reserve_sequence(&mut self, idx: usize) -> Result<()> {
+        if self.sequences.get(idx).is_some_and(|s| s.is_some()) {
+            candle::bail!("reserve_sequence: sequence {idx} still holds state");
+        }
+        for backing in &self.backings {
+            backing.ensure_sequence_allocated(idx)?;
+        }
+        self.reserved.insert(idx);
+        Ok(())
+    }
+
+    /// Whether `idx` is held by [`Self::reserve_sequence`].
+    pub fn is_reserved(&self, idx: usize) -> bool {
+        self.reserved.contains(&idx)
+    }
+
+    /// Free a sequence, returning its resources to the pool — and releasing a
+    /// [`Self::reserve_sequence`] hold on it.
     ///
     /// The sequence index should not be used after this call.
     pub fn free_sequence(&mut self, idx: usize) -> Result<()> {
+        self.reserved.remove(&idx);
         if idx >= self.sequences.len() {
             candle::bail!("invalid sequence index {}", idx);
         }

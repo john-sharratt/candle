@@ -3,9 +3,10 @@
 //! The gateway resolves its session cookie on every request and forwards the
 //! result on `X-Tokera-User` / `-Provider` / `-Email` / `-Name` / `-Picture`,
 //! having first cleared whatever the client sent under those names
-//! ([`crate::proxy`]). A daemon reads them here and believes them — sound for
-//! exactly as long as the daemon is reachable only through the gateway, which
-//! is a property of the deployment rather than of this code.
+//! ([`crate::proxy`]). A daemon reads them here and believes them, because its
+//! server has already cleared them from every socket peer it does not trust
+//! ([`crate::server::Builder::trust`]) — whatever reaches this parser was sent
+//! by a trusted gateway or is absent.
 //!
 //! One parser for every daemon, because the rules are the security boundary:
 //! what counts as an account, and what counts as nobody. Two copies of those

@@ -4,9 +4,9 @@
  * rewrites. An NPC's memory of who you were when you spoke stays true. */
 
 import { API } from '../lib/api.js';
-import { h, mount, ago } from '../lib/dom.js';
+import { h, mount, ago } from '/common/lib/dom.js';
 import { toast, empty } from '../lib/ui.js';
-import { go } from '../lib/router.js';
+import { go } from '/common/lib/router.js';
 import { AUTH_UNAVAILABLE, faceOf } from '../app.js';
 
 export async function render() {

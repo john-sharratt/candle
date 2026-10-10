@@ -41,17 +41,12 @@ const HOP_BY_HOP: [header::HeaderName; 7] = [
 /// survived would let anyone be anyone. They are cleared unconditionally and
 /// re-set only from a session this gateway itself verified.
 ///
-/// The daemons are behind the gateway on private addresses, so trusting the
-/// headers is sound. A daemon that would rather verify than trust can check
-/// `X-Tokera-Assertion` — the signed session token itself — against the same
-/// key the gateway signs with.
+/// Cleared from every inbound request on ingress (`server::handle`) unless it
+/// comes from a peer [`Builder::trust`] names — a client that sets one is
+/// otherwise claiming to be someone — and set again here only from an identity
+/// this gateway itself resolved.
 ///
-/// Cleared from every inbound request on ingress (`server::dispatch`) unless
-/// [`Builder::behind_gateway`] declares the network makes that unnecessary — a
-/// client that sets one is otherwise claiming to be someone — and set again here
-/// only from an identity this gateway itself resolved.
-///
-/// [`Builder::behind_gateway`]: crate::server::Builder::behind_gateway
+/// [`Builder::trust`]: crate::server::Builder::trust
 pub(crate) const IDENTITY_HEADERS: [&str; 6] = [
     "x-tokera-user",
     // The issuer half of the account key. In this list because it decides

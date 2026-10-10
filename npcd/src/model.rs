@@ -1,6 +1,9 @@
-//! Which model this daemon runs — the single place npcd decides.
+//! The model npcd runs, as its console describes it.
 //!
-//! npcd runs **a hybrid of two Qwen3.6-35B-A3B fine-tunes**: AntiLoop's weights —
+//! The model itself is the host's to name — one prescribed model for every
+//! tenant of the process ([`host::MODEL`], `docs/shared_model_host.md` §5). It
+//! is the one npcd chose before there was a host: **a hybrid of two
+//! Qwen3.6-35B-A3B fine-tunes**: AntiLoop's weights —
 //! a tune trained against the repetition loops a cast falls into — under
 //! StyleTune's output head, which is where that tune's prose lives. It is the
 //! routed member of the hybrid lineage, 35 B total with about 3 B active per
@@ -34,26 +37,19 @@
 //! there, and Precision was preferred over the faster Performance twin for its
 //! accuracy.
 
-use candle_conversation::models::Model;
+use host::MODEL;
 
-/// The model npcd runs.
-///
-/// # A deployment may be running something else
-///
-/// Which checkpoint serves a given deployment is that deployment's decision, and
-/// often a private one: a fine-tune somebody has no right to redistribute is a
-/// legitimate thing to run and a bad thing to commit. So it is named in
-/// `models.override.yaml` at the workspace root, which is gitignored and
-/// replaces a preset's coordinates and its adapters under the preset's own name.
-/// See `candle_conversation::models::overrides`.
-///
-/// This function returns the *variant*; `Model::spec()` applies the override. So
-/// the tests below assert what is true either way — the architecture, the
-/// tokenizer lineage, the context — and never the repository's coordinates,
-/// which an override is entitled to change.
-pub fn model() -> Model {
-    Model::Qwen36_35B_A3B_AntiLoop_StyleTune
-}
+// # A deployment may be running something else
+//
+// Which checkpoint serves a given deployment is that deployment's decision, and
+// often a private one: a fine-tune somebody has no right to redistribute is a
+// legitimate thing to run and a bad thing to commit. So it is named in
+// `models.override.yaml` at the workspace root, which is gitignored and
+// replaces a preset's coordinates and its adapters under the preset's own name.
+// See `candle_conversation::models::overrides`. `MODEL` is the *variant*;
+// `Model::spec()` applies the override. So the tests below assert what is true
+// either way — the architecture, the tokenizer lineage, the context — and
+// never the repository's coordinates, which an override is entitled to change.
 
 /// What the console shows about the selection, before anything is loaded.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -99,7 +95,7 @@ fn quant_of(filename: &str) -> &'static str {
 /// own. An operator debugging a model that is behaving unexpectedly reads this
 /// page first, so it has to describe the checkpoint that actually loaded.
 pub fn spec() -> ModelSpec {
-    let s = model().spec();
+    let s = MODEL.spec();
     // `Box::leak` runs once per call on a handful of bytes at startup; the
     // alternative is owned `String`s through a `Copy` struct the console holds.
     let filename: &'static str = Box::leak(s.model_filename.into_boxed_str());
@@ -132,9 +128,9 @@ mod tests {
     #[test]
     fn npcd_runs_the_routed_member_of_the_lineage() {
         assert!(
-            matches!(model().spec().arch, ModelArch::Qwen35Hybrid),
+            matches!(MODEL.spec().arch, ModelArch::Qwen35Hybrid),
             "arch {:?} routes to a loader that refuses a routed checkpoint",
-            model().spec().arch
+            MODEL.spec().arch
         );
     }
 
@@ -142,7 +138,7 @@ mod tests {
     /// override is entitled to change the file — what is asserted is what the repository ships.
     #[test]
     fn the_preset_is_the_hybrid_at_q4_k_m() {
-        let s = model().preset_spec();
+        let s = MODEL.preset_spec();
         assert_eq!(quant_of(&s.model_filename), "Q4_K_M");
         assert_eq!(s.tensor_overrides.len(), 1, "one tensor from a second file");
         let head = &s.tensor_overrides[0];
@@ -161,7 +157,7 @@ mod tests {
     #[test]
     fn the_console_figures_come_from_the_registry() {
         let s = spec();
-        let registry = model().spec();
+        let registry = MODEL.spec();
         assert_eq!(s.repo, registry.model_repo);
         assert_eq!(s.filename, registry.model_filename);
         assert_eq!(s.bytes, registry.model_bytes);
@@ -180,8 +176,8 @@ mod tests {
     /// loader fetches something else.
     #[test]
     fn the_console_reports_whatever_the_override_left() {
-        let resolved = model().spec();
-        let preset = model().preset_spec();
+        let resolved = MODEL.spec();
+        let preset = MODEL.preset_spec();
         let console = spec();
 
         assert_eq!(console.repo, resolved.model_repo);
@@ -238,8 +234,8 @@ mod tests {
     /// its checkpoint, with nothing in the repository changed to explain it.
     #[test]
     fn an_override_cannot_move_npcd_off_the_routed_arch() {
-        assert!(matches!(model().spec().arch, ModelArch::Qwen35Hybrid));
-        assert_eq!(model().spec().arch, model().preset_spec().arch);
+        assert!(matches!(MODEL.spec().arch, ModelArch::Qwen35Hybrid));
+        assert_eq!(MODEL.spec().arch, MODEL.preset_spec().arch);
     }
 
     /// Every adapter the resolved spec carries is named and pinned.
@@ -249,7 +245,7 @@ mod tests {
     /// what its characters say when the upstream repo moves.
     #[test]
     fn every_declared_adapter_is_named_and_pinned() {
-        for l in &model().spec().loras {
+        for l in &MODEL.spec().loras {
             assert!(
                 !l.name.is_empty(),
                 "an unnamed adapter cannot be opted into"

@@ -6,9 +6,9 @@
  * the character earned. */
 
 import { API } from '../lib/api.js';
-import { h, mount, fmtNum, fmtK, ago, worldTime } from '../lib/dom.js';
-import { go, link } from '../lib/router.js';
-import { state as vp } from '../lib/viewport.js';
+import { h, mount, fmtNum, fmtK, ago, worldTime } from '/common/lib/dom.js';
+import { go, link } from '/common/lib/router.js';
+import { state as vp } from '/common/lib/viewport.js';
 import {
   avatar, stateDot, bandChip, pending, empty, toast, kv, bar, lineChart,
   // `modal` was missing, and `authorBelief` calls it — so "Author a belief"
@@ -95,7 +95,7 @@ export async function render(params) {
     // Counted in conversations — a day, a dream, a file — because that is what
     // the layer view lists.
     declared.map((l) => railItem(l, l[0].toUpperCase() + l.slice(1),
-      layerCounts[l].conversations, layerColor(l))),
+      layerCounts[l].conversation_count, layerColor(l))),
 
     h('div', { class: 'rail-sec' }, 'instruments'),
     railItem('projection', 'Projection'),
@@ -752,12 +752,13 @@ export async function render(params) {
     mount(bodyHost,
       h('div', { class: 'panel', style: 'margin-bottom:12px' },
         h('div', { class: 'row', style: 'gap:18px;flex-wrap:wrap' },
-          stat('conversations', fmtNum(info.conversations)), stat('turns', fmtNum(info.turns)),
+          stat('conversations', fmtNum(info.conversation_count)),
+          stat('turns', fmtNum(info.turn_count)),
           stat('window', fmtK(info.window)))),
       convs.length
         ? h('div', {}, convs.map((c) => conversationPanel(layer, c)),
           r.more ? h('div', { class: 'tiny dim', style: 'margin-top:6px' },
-            `The newest ${convs.length} of ${fmtNum(info.conversations)}.`) : null)
+            `The newest ${convs.length} of ${fmtNum(info.conversation_count)}.`) : null)
         : empty('◌', r.engine_connected === false ? 'The engine is not running' : 'Nothing in this layer yet'));
   }
 

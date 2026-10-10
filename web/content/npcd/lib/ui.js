@@ -5,9 +5,9 @@
  * this site, so the server finds it in `common/`. The URL space is one
  * tree even though the files live in two directories. */
 
-import { h } from './dom.js';
-import { can } from './router.js';
-export * from './ui-base.js';
+import { h } from '/common/lib/dom.js';
+import { can } from '/common/lib/router.js';
+export * from '/common/lib/ui-base.js';
 
 /* ── Access, in the shape a page needs it ──────────────────────────────────
  *

@@ -37,7 +37,7 @@
  * so it is the thing shown.
  */
 
-import { h, mount } from './dom.js';
+import { h, mount } from '/common/lib/dom.js';
 
 /* Grows to its content, so a long turn is read rather than scrolled. Capped so
  * one enormous example cannot push everything else off the screen. */

@@ -33,7 +33,6 @@ use regex::Regex;
 use tracing_subscriber::EnvFilter;
 use zend::api::chat::{apply_tools_dial, dial_selection};
 use zend::config::DaemonConfig;
-use zend::log_broadcast::LogBus;
 use zend::session::{
     Demonstration, ReplayOutcome, ReplaySampling, ReplaySpec, TurnComparison, ZendSession,
 };
@@ -228,7 +227,7 @@ async fn main() -> anyhow::Result<()> {
         qsa_selection_budget: args.qsa_selection_budget,
         ..DaemonConfig::new(zend::workspace::open(&args.workspace)?)
     };
-    let session = Arc::new(ZendSession::new(config, LogBus::new()));
+    let session = Arc::new(ZendSession::new(config));
     session.start_loading();
     session.wait_ready().await;
 

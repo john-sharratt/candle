@@ -1,6 +1,6 @@
 //! The device surface's auth: a bearer token, and nothing else.
 //!
-//! This is the parallel to [`crate::guard::Api`], and it exists because that one
+//! This is the parallel to `host::guard::Api`, and it exists because that one
 //! cannot be reused: `Api::route` hardcodes the operator role check over the
 //! gateway's `x-tokera-*` headers, with no escape hatch by design. The effector
 //! surface has a different notion of *who is acting* — a character resolved from
@@ -13,7 +13,7 @@
 //! the token must resolve in [`Tokens`], and that resolution *is* the caller.
 //! No roles, no ownership, and — critically — **`x-tokera-*` is never read**.
 //! Two hazards make that non-negotiable, both from the surface sitting behind a
-//! gateway that npcd trusts (`behind_gateway`):
+//! gateway whose `x-tokera-*` npcd believes (`web::Builder::trust`):
 //!
 //! - The in-process fast path builds a request and stamps the token; it must
 //!   never also carry an `x-tokera-*`, or the operator middleware elsewhere

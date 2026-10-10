@@ -1013,8 +1013,8 @@ pub async fn commands() -> Response {
     .into_response()
 }
 
-/// `GET /v1/tools` — the act vocabulary, with its calibration examples.
-/// The act vocabulary, in the shape the console reads it.
+/// The act vocabulary, with its calibration examples, in the shape the console
+/// reads it (the host's `GET /v1/tools`, through [`catalog`]).
 ///
 /// **Not the catalog serialised raw.** It used to be, and three of the table's
 /// five columns were therefore blank: `Tool` has no `modes`, no `source` and no
@@ -1096,7 +1096,9 @@ fn where_it_is(at: &[&str], names: &PartNames) -> Option<String> {
     })
 }
 
-pub async fn tools(State(s): State<Arc<Authored>>) -> Response {
+/// The act vocabulary as the console reads it, with each station named from
+/// the worlds this daemon hosts — npcd's share of the host's `/v1/tools`.
+pub fn catalog(s: &Authored) -> Value {
     let mut part_names = PartNames::new();
     if let Some(rt) = s.runtime.as_ref() {
         for world_id in rt.hosted.ids() {
@@ -1115,7 +1117,7 @@ pub async fn tools(State(s): State<Arc<Authored>>) -> Response {
             }
         }
     }
-    Json(describe_catalog(&part_names)).into_response()
+    describe_catalog(&part_names)
 }
 
 /// The catalogue as the console reads it.

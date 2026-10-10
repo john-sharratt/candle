@@ -1,0 +1,24 @@
+# Who holds a role on this estate — every tenant of the host reads this one
+# table (`docs/shared_model_host.md` §3.5).
+#
+# Four levels — unauthenticated, user, admin, creator. Reading is open; only an
+# admin may change authored content on disk (npcd's worlds and personalities)
+# or use zend's Comprehensive tools mode (the network, code, the git writers,
+# programs on this host). `creators` outranks `admins`, so anybody listed there
+# does not also need listing here. It is the one role npcd's fiction reads: a
+# creator messaging a character is addressed inside the world as "(The
+# Creator)" — see `web/src/auth/role.rs`.
+#
+# Compiled in (`host::access::ROLES`): there is no API that grants a role, and
+# whoever can edit this file and restart the process already holds what the
+# roles grant.
+#
+# An entry names `sub` or `email`, never both. Matched on `email` and not `sub`,
+# deliberately, because THIS REPOSITORY IS PUBLIC: a subject id is a stable
+# identifier for a real Google account, and committed here it would be
+# published permanently. The email is already public — it is the author address
+# on every commit — so naming it costs nothing it has not already spent.
+admins:
+  - email: johnathan.sharratt@gmail.com
+creators:
+  - email: johnathan.sharratt@gmail.com

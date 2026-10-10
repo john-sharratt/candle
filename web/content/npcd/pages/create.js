@@ -15,10 +15,10 @@
  * character (§30). */
 
 import { API } from '../lib/api.js';
-import { h, mount } from '../lib/dom.js';
+import { h, mount } from '/common/lib/dom.js';
 import { pngBlob } from '../lib/img.js';
-import { disclosure } from '../lib/lazy.js';
-import { can, go } from '../lib/router.js';
+import { disclosure } from '/common/lib/lazy.js';
+import { can, go } from '/common/lib/router.js';
 import { onReveal, revealing } from '../lib/reveal.js';
 import { toast, empty } from '../lib/ui.js';
 

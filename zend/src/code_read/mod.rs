@@ -149,13 +149,17 @@ fn scan_ingest_chains(engine: &Mutex<ConversationEngine>) -> IngestChains {
         .conversations_with_metadata_key(CONTENT_KEY)
         .into_iter()
         .collect();
+    // Both lookups lock the substrate themselves, so they are taken before
+    // the read guard below: a second read of the same lock while one is held
+    // waits behind any queued writer, which is waiting for this guard.
+    let paths = eng.conversations_with_metadata_key(PATH_KEY);
     let conv = eng.conversation();
     let substrate = conv.read();
     let mut out = IngestChains {
         finished: Vec::new(),
         broken: Vec::new(),
     };
-    for (timeline, path) in eng.conversations_with_metadata_key(PATH_KEY) {
+    for (timeline, path) in paths {
         let Some(key) = keys.get(&timeline) else {
             continue;
         };
@@ -567,7 +571,7 @@ pub fn ingest_jobs(
                 // Stop pulling new files on first-error abort OR a shutdown cancel.
                 // The current file finishes (the scheduler is still live), so no
                 // half-ingested file; the loader thread then drains the engine.
-                if failures.aborted() || candle_conversation::ingest_cancelled() {
+                if failures.aborted() || crate::ingest_cancel::cancelled() {
                     return;
                 }
                 let idx = cursor.fetch_add(1, Ordering::Relaxed);
@@ -866,7 +870,7 @@ fn process_one_file(
             // has erased the variant, so the global flag is the source of truth.
             // Don't record it against the failure cap; the partial was just
             // tombstoned, so the file re-ingests next run.
-            if candle_conversation::ingest_cancelled() {
+            if crate::ingest_cancel::cancelled() {
                 tracing::debug!(
                     target: "zend::code_read::ingest",
                     file = %file.path,
@@ -1024,7 +1028,7 @@ fn run_file_conversation(
     let mut current_message: TurnText = TurnText::from(opening_prompt(path, lines));
     let mut closing = false;
     for round in 0..=MAX_FILE_READ_ROUNDS {
-        if candle_conversation::ingest_cancelled() {
+        if crate::ingest_cancel::cancelled() {
             anyhow::bail!("shutdown cancelled mid-file");
         }
         if round == MAX_FILE_READ_ROUNDS {
@@ -1061,7 +1065,7 @@ fn run_file_conversation(
             .submit_turn_with_options(current_message, options)
             .map_err(|e| anyhow::anyhow!("submit_turn: {e}"))?;
         let resp = handle
-            .wait_cancellable()
+            .wait_cancellable(crate::ingest_cancel::token())
             .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
         let steps = tool_round::plan(&resp.answer);
         let call_idx = resp.seal.as_ref().and_then(|s| s.turn_index);

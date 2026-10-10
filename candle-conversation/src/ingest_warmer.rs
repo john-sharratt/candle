@@ -17,7 +17,6 @@ use std::time::Instant;
 
 use flume::Sender;
 
-use crate::cancel::ingest_cancelled;
 use crate::projection::{Conversation, GroupId, LayerId, Schema, TimelineId};
 use crate::scheduler::SchedulerRequest;
 
@@ -45,7 +44,7 @@ impl IngestWarmer {
         let mut warmed = 0usize;
         for (layer, group, timelines) in self.conversation.ingest_warm_work(&schema) {
             for slice in timelines.chunks(WARM_SLICE_TIMELINES) {
-                if ingest_cancelled() {
+                if self.conversation.ingest_cancelled() {
                     return;
                 }
                 match self.warm_slice(&schema, layer, group, slice) {

@@ -9,8 +9,8 @@
  * changes how every character in the world thinks. */
 
 import { API } from '../lib/api.js';
-import { h, mount, fmtK, worldTime } from '../lib/dom.js';
-import { go } from '../lib/router.js';
+import { h, mount, fmtK, worldTime } from '/common/lib/dom.js';
+import { go } from '/common/lib/router.js';
 import { empty, toast, confirmDialog, layerColor, bar, mayEdit, ro, roChip, only, roNote } from '../lib/ui.js';
 
 /* The filter box and the world selector, together.

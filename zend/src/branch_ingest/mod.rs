@@ -86,7 +86,7 @@ impl BranchIngest {
         let mut corpora: HashMap<IngestScope, (Corpus, Vec<String>)> = HashMap::new();
         let mut changed = false;
         for layer in layers {
-            if candle_conversation::ingest_cancelled() {
+            if crate::ingest_cancel::cancelled() {
                 break;
             }
             let (corpus, failed) = corpora

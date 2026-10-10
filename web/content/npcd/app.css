@@ -1,6 +1,6 @@
 /* npcd — surfaces specific to the console. The design system, shell,
- * controls, modal, disclosure and responsive layer live in /base.css,
- * which is shared with every other site this server hosts. */
+ * controls, modal, disclosure and responsive layer live in
+ * /common/base.css, which is shared with every other UI this server hosts. */
 
 /* ── roster ──────────────────────────────────────────────────────────────── */
 

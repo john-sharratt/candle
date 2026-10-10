@@ -36,10 +36,12 @@ use serde_json::json;
 
 pub mod cookie;
 pub mod forwarded;
+pub mod gateways;
 pub mod oidc;
 pub mod role;
 pub mod session;
 
+pub use gateways::Gateways;
 pub use role::{Principal, Role, Roles};
 pub use session::Identity;
 

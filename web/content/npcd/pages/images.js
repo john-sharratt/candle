@@ -64,10 +64,10 @@
  */
 
 import { API } from '../lib/api.js';
-import { h, mount } from '../lib/dom.js';
-import { can } from '../lib/router.js';
+import { h, mount } from '/common/lib/dom.js';
+import { can } from '/common/lib/router.js';
 import { empty, toast } from '../lib/ui.js';
-import { copyText, flash } from '../lib/clip.js';
+import { copyText, flash } from '/common/lib/clip.js';
 import { copyImage, download, pngBlob } from '../lib/img.js';
 
 /* Offered sizes. Square first because it is what most artwork here wants, then

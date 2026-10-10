@@ -2,12 +2,12 @@
 //! records into a fresh segment (`docs/archived/segmented_substrate_log.md`).
 //!
 //! An append-only store only grows: every superseded partial-tail snapshot,
-//! every stale `ModelSpec` / `Template`, every chunk of a deleted stream is
+//! every stale `ModelKey` / `Template`, every chunk of a deleted stream is
 //! dead weight the skip-load walk still steps over. Compaction keeps only the
 //! live records — the winners under last-writer-wins that the manifest and the
 //! substrate index already resolve.
 //!
-//! [`collect_live_records`] plans the live set in dependency order (`ModelSpec`,
+//! [`collect_live_records`] plans the live set in dependency order (`ModelKey`,
 //! `Template`, then per stream its `StreamDecl`, `Chunk`s, `Tokens`, `Commit`)
 //! **without any disk reads** — read-back records (`Chunk` / `Tokens` /
 //! singletons) carry their source location, resident metadata carries its
@@ -96,7 +96,7 @@ impl CompactItem {
     }
 }
 
-/// Header for a singleton (`ModelSpec` / `Template` / `Tokenizer`) staged
+/// Header for a singleton (`ModelKey` / `Template` / `Tokenizer`) staged
 /// verbatim — `payload_len` from its manifest location, every other field zero.
 fn singleton_header(rt: RecordType, payload_len: u64) -> RecordHeader {
     RecordHeader {
@@ -156,7 +156,7 @@ fn branch_checkpoints_to_keep(substrate: &Substrate) -> Vec<(StreamId, RecordLoc
 }
 
 /// Collect every **live** record, in dependency order, as [`CompactItem`]s —
-/// planning only, **no disk reads**. `ModelSpec` / `Template` / `Tokenizer` /
+/// planning only, **no disk reads**. `ModelKey` / `Template` / `Tokenizer` /
 /// `Chunk` / `Tokens` become `Raw` items carrying their source `(segment,
 /// offset, record_size)` and a header synthesized from the substrate/manifest
 /// index; every resident record (`StreamDecl`, `Commit`, `Label`, `ConvState`,
@@ -243,7 +243,7 @@ pub fn collect_live_records(
 
     // Singletons — staged verbatim from wherever they physically live.
     for (rt, loc) in [
-        (RecordType::ModelSpec, manifest.model_spec),
+        (RecordType::ModelKey, manifest.model_key),
         (RecordType::Template, manifest.template),
         (RecordType::Tokenizer, manifest.tokenizer),
     ] {
@@ -893,7 +893,7 @@ pub fn write_compacted_log(
                             record_size: sz as u64,
                         };
                         match header.record_type {
-                            RecordType::ModelSpec => manifest.model_spec = Some(loc),
+                            RecordType::ModelKey => manifest.model_key = Some(loc),
                             RecordType::Template => manifest.template = Some(loc),
                             RecordType::Tokenizer => manifest.tokenizer = Some(loc),
                             _ => {}
@@ -998,9 +998,9 @@ mod tests {
     fn collect_keeps_only_the_live_winners() {
         use crate::persistence::streams::{StreamDecl, TurnDecl};
         let mut blob = Vec::new();
-        // A stale ModelSpec, then the live one.
-        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model-v1-stale"));
-        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model-v2-live"));
+        // A stale ModelKey, then the live one.
+        blob.extend_from_slice(&record(RecordType::ModelKey, 0, 0, b"model-v1-stale"));
+        blob.extend_from_slice(&record(RecordType::ModelKey, 0, 0, b"model-v2-live"));
         // The stream's decl — without it the chunk is an orphan and is reclaimed.
         let decl5 = StreamDecl::Turn(TurnDecl {
             timeline_id: 5,
@@ -1026,21 +1026,21 @@ mod tests {
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
         let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
-        // Exactly: 1 ModelSpec + 1 StreamDecl + 1 Chunk = 3 (LWW keeps one of each).
+        // Exactly: 1 ModelKey + 1 StreamDecl + 1 Chunk = 3 (LWW keeps one of each).
         assert_eq!(live.len(), 3);
         // Each read-back item points at the live winner's on-disk location — the
         // manifest / substrate index already resolved last-writer-wins — so the
-        // stale ModelSpec and the dead partial chunk are never staged. Read the
+        // stale ModelKey and the dead partial chunk are never staged. Read the
         // chosen source bytes back to prove which record was selected.
         let model = live
             .iter()
-            .find(|it| it.header().record_type == RecordType::ModelSpec)
+            .find(|it| it.header().record_type == RecordType::ModelKey)
             .unwrap();
         let (off, size) = raw_loc(model);
         assert_eq!(
             read_record_at(&mut mem, off, size).unwrap().payload,
             b"model-v2-live",
-            "the stale ModelSpec is dropped"
+            "the stale ModelKey is dropped"
         );
         let chunk = live
             .iter()
@@ -1066,9 +1066,9 @@ mod tests {
     fn orphan_stream_without_decl_is_reclaimed() {
         let mut blob = Vec::new();
         // Two orphan streams: one with a chunk, one with a chunk + tokens. No
-        // StreamDecl for either. Plus a legit ModelSpec singleton to prove only
+        // StreamDecl for either. Plus a legit ModelKey singleton to prove only
         // the orphans are dropped.
-        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model"));
+        blob.extend_from_slice(&record(RecordType::ModelKey, 0, 0, b"model"));
         blob.extend_from_slice(&chunk_record(9001, 0, b"orphan-kv-a"));
         blob.extend_from_slice(&chunk_record(9002, 0, b"orphan-kv-b"));
         blob.extend_from_slice(&record(RecordType::Tokens, 9002, 0, b"orphan-tokens"));
@@ -1086,15 +1086,15 @@ mod tests {
             "an orphan stream's tokens are reclaimed with it",
         );
         // The legit singleton survives — only orphan streams are dropped.
-        assert!(has_type(&live, RecordType::ModelSpec));
+        assert!(has_type(&live, RecordType::ModelKey));
     }
 
     #[test]
     fn compacted_log_recovers_to_an_identical_live_set() {
         use crate::persistence::streams::{StreamDecl, TurnDecl};
         let mut blob = Vec::new();
-        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"m1"));
-        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"m2"));
+        blob.extend_from_slice(&record(RecordType::ModelKey, 0, 0, b"m1"));
+        blob.extend_from_slice(&record(RecordType::ModelKey, 0, 0, b"m2"));
         // The stream's decl — without it the chunks are orphans and are reclaimed.
         let decl7 = StreamDecl::Turn(TurnDecl {
             timeline_id: 7,
@@ -2430,7 +2430,7 @@ mod tests {
 
         let mut blob = Vec::new();
         // Singletons.
-        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model"));
+        blob.extend_from_slice(&record(RecordType::ModelKey, 0, 0, b"model"));
         blob.extend_from_slice(&record(RecordType::Template, 0, 0, b"template"));
         blob.extend_from_slice(&record(RecordType::Tokenizer, 0, 0, b"tokenizer"));
         // A live turn, with every per-stream record it can carry.

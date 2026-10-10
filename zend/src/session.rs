@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -35,15 +36,16 @@ use candle_conversation::RecoveredMessage;
 use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
-    ConversationEngine, GlueMarkers, OptionalState, ProjectionEvent, SamplingConfig,
+    ConversationEngine, EngineSource, GlueMarkers, OptionalState, ProjectionEvent, SamplingConfig,
     SelectionState, Sequence, ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse,
 };
+use host::download::ensure_model;
+use host::process::fatal;
 use serde_json::Value;
 use web::auth::Roles;
 use zend_tools::state::Secrets;
 use zend_vfs::{RepoFiles, Workspace};
 
-use crate::access::Gateways;
 use crate::api::chat::{
     apply_tools_dial, dial_selection, tool_round_selection, EFFORT_OPTIONS,
     RESPONSE_LENGTH_OPTIONS, TOOL_EXAMPLE_SELECTOR,
@@ -68,8 +70,6 @@ use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
-use crate::log_broadcast::LogBus;
-use crate::model_choice;
 use crate::origin_watch::OriginWatch;
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
@@ -98,7 +98,7 @@ pub use replay::{
     TurnComparison,
 };
 
-const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
+pub const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
 
 /// Bound on the titler queue. A backlog beyond this many un-started titles
 /// means the worker can't keep up; further jobs are dropped (labels are
@@ -1043,6 +1043,7 @@ impl InferenceState {
     fn load(
         mut proj_builder: Builder,
         model: Model,
+        engine_source: EngineSource,
         model_path: PathBuf,
         tokenizer_path: PathBuf,
         workspace: Workspace,
@@ -1246,6 +1247,7 @@ impl InferenceState {
             .tokenizer_path(tokenizer_path)
             .workspace_path(root.clone())
             .read_only_substrate(read_only_substrate)
+            .cancel_token(crate::ingest_cancel::token().clone())
             .qsa_selection_budget(qsa_selection_budget)
             .qsa_strata(qsa_strata)
             // The schema's `rope: min_yarn_factor:` — engine-wide, so it is
@@ -1282,15 +1284,19 @@ impl InferenceState {
         let model_hook = move |done: usize, total: usize| {
             model_progress.set_step_progress(done as u64, total as u64);
         };
-        // `engine_with_progress` loads the model weights (blocking, per-layer
-        // hook above) AND spawns the scheduler thread, which kicks off the
-        // substrate reload (redo-log replay) to run CONCURRENTLY in the
+        // The engine comes from the process's slot: built here, with every
+        // tenant's requests merged, when zend ranks highest of the tenants that
+        // arrive; otherwise zend's substrate is bound and attached to the engine
+        // the higher one built. Building loads the model weights (blocking,
+        // per-layer hook above) AND spawns the scheduler thread, which kicks off
+        // the substrate reload (redo-log replay) to run CONCURRENTLY in the
         // background. So this timing is the model-weight load; the reload's cost
         // shows up as the `LoadStep::Substrate` wait below (its overhang past the
         // weight load) — the two together are the opaque "Loading model" span.
         let t_engine = Instant::now();
-        let engine = builder
-            .engine_with_progress(&device, Some(&model_hook))
+        let engine = engine_source
+            .ticket()
+            .engine_with_progress(&mut builder, &device, Some(&model_hook))
             .map_err(|e| anyhow::anyhow!("engine build: {e}"))?;
         tracing::info!(
             elapsed_ms = t_engine.elapsed().as_millis() as u64,
@@ -2461,7 +2467,7 @@ impl InferenceState {
         // publishing an engine, and `ZendSession::shutdown` (joining this thread)
         // sees `inference` still `None` and knows the drain already happened. The
         // turns ingested so far are durable; the rest re-ingest on the next start.
-        if candle_conversation::ingest_cancelled() {
+        if crate::ingest_cancel::cancelled() {
             tracing::warn!(
                 "shutdown during startup ingest — draining the engine on the loader thread"
             );
@@ -2651,7 +2657,7 @@ impl InferenceState {
             // a Ctrl-C during a post-`ready` re-ingest stops promptly (the per-file
             // worker pool also polls the same cancel). `shutdown` then drains the
             // engine via the ready path.
-            if candle_conversation::ingest_cancelled() {
+            if crate::ingest_cancel::cancelled() {
                 break;
             }
             if il.mode != IngestMode::Raw {
@@ -4720,8 +4726,6 @@ async fn generate_one_title(
 pub struct ZendSession {
     config: DaemonConfig,
     projection_builder: Builder,
-    #[allow(dead_code)] // read by api/ws_logs.rs in the bin target
-    pub(crate) log: Arc<LogBus>,
     /// Fires `true` once the daemon transitions to fully-ready (every
     /// load step complete). Used by submit-flow tasks waiting for the
     /// engine to come up.
@@ -4858,18 +4862,17 @@ impl ZendSession {
         &self.config.roles
     }
 
-    /// The peers whose identity headers are believed — see
-    /// [`crate::access::Gateways`].
-    pub fn gateways(&self) -> &Gateways {
-        &self.config.gateways
+    /// The projection schema this session runs — its layers, as parsed.
+    pub fn projection_builder(&self) -> &Builder {
+        &self.projection_builder
     }
 
-    /// `--local-signin`'s email, if set — see [`crate::access::role`].
-    pub fn local_signin(&self) -> Option<&str> {
-        self.config.local_signin.as_deref()
+    /// The workspace folder — where `substrate/` lives.
+    pub fn workspace_root(&self) -> &Path {
+        self.config.workspace.root()
     }
 
-    pub fn new(config: DaemonConfig, log: Arc<LogBus>) -> Self {
+    pub fn new(config: DaemonConfig) -> Self {
         let projection_builder = build_projection_builder(config.workspace.root());
         tracing::info!(
             workspace = %config.workspace.root().display(),
@@ -4887,7 +4890,6 @@ impl ZendSession {
             inference: Arc::new(RwLock::new(None)),
             config,
             projection_builder,
-            log,
             ready_tx,
             status_tx,
             load_progress: Arc::new(LoadProgress::new()),
@@ -5031,7 +5033,7 @@ impl ZendSession {
         Some(conv.section_loads())
     }
 
-    /// Force one background-maintenance op now — the `POST /v1/debug/maintenance`
+    /// Force one background-maintenance op now — the `POST /v1/substrate/zend/maintenance`
     /// test trigger. Seals the active segment (so a conversation archived this
     /// session, whose now-dead records sit in the active, becomes eligible) and
     /// compacts a dead-carrying sealed segment, waiving the age/ratio gates. Runs
@@ -5083,10 +5085,10 @@ impl ZendSession {
         let s = &*read;
 
         let counts = Counts {
-            timelines: s.timeline_count(),
-            conversations: s.conversation_count(),
-            sections: s.section_count(),
-            tokens: s.corpus_token_total(),
+            timeline_count: s.timeline_count(),
+            conversation_count: s.conversation_count(),
+            section_count: s.section_count(),
+            token_count: s.corpus_token_total(),
         };
 
         // Layer metadata only — each layer carries a conversation COUNT, never
@@ -5098,7 +5100,7 @@ impl ZendSession {
             .layers
             .iter()
             .map(|l| {
-                let (conv_count, tokens) = layer_totals(s, &l.groups, titler);
+                let (conversation_count, tokens) = layer_totals(s, &l.groups, titler);
                 LayerView {
                     name: l.name.clone(),
                     description: l.description.trim().to_string(),
@@ -5117,11 +5119,9 @@ impl ZendSession {
                         .iter()
                         .map(|(sel, opt)| format!("{sel} = {opt}"))
                         .collect(),
-                    conv_count,
+                    conversation_count,
                     tokens,
-                    disabled: candle_conversation::projection::layer_toggle::is_layer_disabled(
-                        &l.name,
-                    ),
+                    disabled: s.is_layer_disabled(&l.name),
                 }
             })
             .collect();
@@ -5154,12 +5154,12 @@ impl ZendSession {
         if !known {
             return None;
         }
-        Some(candle_conversation::projection::layer_toggle::toggle_layer(
-            name,
-        ))
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let conv = { state.engine.lock().unwrap().conversation() };
+        Some(conv.toggle_layer(name))
     }
 
-    /// `GET /v1/substrate/layer/{name}` — the conversations (timelines) that
+    /// `GET /v1/substrate/zend/layer/{name}` — the conversations (timelines) that
     /// target one layer. Fetched when the layer card expands. `None` when the
     /// model isn't loaded or the layer name is unknown.
     pub fn substrate_layer(&self, name: &str) -> Option<LayerConversations> {
@@ -5179,7 +5179,7 @@ impl ZendSession {
         })
     }
 
-    /// `GET /v1/substrate/system-prompt` — the target (dialogue) layer's framing:
+    /// `GET /v1/substrate/zend/system-prompt` — the target (dialogue) layer's framing:
     /// its ordered item labels, its always-emit sections with authored text +
     /// materialized token cost, and the live tool-catalog size (the catalog
     /// itself loads from `substrate_tools`). Fetched when the system-prompt card
@@ -5220,7 +5220,7 @@ impl ZendSession {
         })
     }
 
-    /// `GET /v1/substrate/tools` — the live tool catalog projected into the
+    /// zend's entries in `GET /v1/tools` — the live tool catalog projected into the
     /// dialogue layer's `tools` collection. Sourced from the bundled tool
     /// definitions (`src/prompts/tools/`, embedded); the schema YAML declares the
     /// collection empty and tools install at daemon start. Fetched when the tools
@@ -5240,7 +5240,7 @@ impl ZendSession {
         })
     }
 
-    /// `GET /v1/substrate/timeline/{tl}` — one conversation's full summary forest,
+    /// `GET /v1/substrate/zend/timeline/{tl}` — one conversation's full summary forest,
     /// every turn decoded. `tl` is the raw timeline id. `None` when the model
     /// isn't loaded or no such timeline exists.
     pub fn substrate_timeline(&self, tl_raw: u64) -> Option<TimelineDetail> {
@@ -5329,11 +5329,12 @@ impl ZendSession {
                 p
             },
             couplings: coupling_list,
+            turn_count: turns.len(),
             turns,
         })
     }
 
-    /// `GET /v1/substrate/timeline/{tl}/selection` — the most recent
+    /// `GET /v1/substrate/zend/timeline/{tl}/selection` — the most recent
     /// score-density selection diagnostic recorded for this timeline. `None`
     /// when the model isn't loaded, `tl` isn't a real timeline, or no
     /// projection has run for it yet (or it used the rule-based path, which
@@ -5365,7 +5366,7 @@ impl ZendSession {
         })
     }
 
-    /// `POST /v1/substrate/project` — project a typed query against the substrate.
+    /// `POST /v1/substrate/zend/project` — project a typed query against the substrate.
     /// Prefills `text` under the base conversation's system prompt (no seal, no
     /// belief mutation), then resolves the selected turns + scored section members
     /// into score-sorted tiles. `None` until the model is loaded.
@@ -5667,7 +5668,7 @@ impl ZendSession {
     /// [`Self::tombstone_conversation`], which can only address timelines whose
     /// id is `hash(conv_id)`.
     ///
-    /// Backs `DELETE /v1/substrate/timeline/{tl}`. Nothing is removed from the
+    /// Backs `DELETE /v1/substrate/zend/timeline/{tl}`. Nothing is removed from the
     /// dialogue conversation map, because a derived-layer timeline was never in
     /// it: these are `repo_map` / `code_reading` ingests, addressed only by the
     /// id the substrate views print.
@@ -5686,7 +5687,7 @@ impl ZendSession {
     /// section-tree variant) and each tools mode's catalog summary — so the next
     /// start prefills them fresh under the current compression thresholds.
     ///
-    /// Backs `DELETE /v1/substrate/system-prompt`. The running daemon keeps
+    /// Backs `DELETE /v1/substrate/zend/system-prompt`. The running daemon keeps
     /// serving from its resident copies
     /// ([`candle_conversation::Conversation::retire_section_generation`]); the
     /// rebuild happens on restart. Ingest frames are not touched: a sealed
@@ -6127,15 +6128,15 @@ impl ZendSession {
         let qsa_selection_budget = self.config.qsa_selection_budget;
         let qsa_strata = self.config.qsa_strata;
         let summarize = self.config.summarize;
-        // Resolved once, here, and handed to both the downloader and the engine
-        // builder, so the artifact fetched and the model built are the same one.
-        let model = model_choice::resolve(&self.config.model);
-        // Re-arm the process-scoped ingest-cancel latch for this load: it's shared
-        // across the process (and the test binary), so clear any cancel left by a
-        // prior load/shutdown before this one's ingest starts polling it. The
-        // startup ingest and background reconcile check `ingest_cancelled()`;
-        // `shutdown` sets it via `request_ingest_cancel()`.
-        candle_conversation::reset_ingest_cancel();
+        // Handed to both the downloader and the engine builder, so the artifact
+        // fetched and the model built are the same one.
+        let model = self.config.model.clone();
+        let engine_source = self.config.engine.clone();
+        // Re-arm zend's ingest-cancel latch for this load: clear any cancel left
+        // by a prior load/shutdown before this one's ingest starts polling it.
+        // The startup ingest and background reconcile poll
+        // `ingest_cancel::cancelled()`; `shutdown` latches it.
+        crate::ingest_cancel::token().reset();
         // Handle to the ambient Tokio runtime (if any). The loader runs on a
         // plain OS thread and drops its temporary download runtime before the
         // model load, so the ingest worker's `tokio::spawn` would otherwise
@@ -6166,21 +6167,19 @@ impl ZendSession {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        tracing::error!("local tokio runtime for download failed: {e:#}; exiting");
                         status_tx.send(format!("Runtime build failed: {e}")).ok();
-                        std::process::exit(1);
+                        fatal("zend", &format!("local tokio runtime for download failed: {e:#}"));
                     }
                 };
                 let (model_path, tok_path) =
-                    match download_runtime.block_on(crate::download::ensure_model(&model, &status_tx)) {
+                    match download_runtime.block_on(ensure_model(&model, &status_tx)) {
                         Ok(p) => p,
                         Err(e) => {
                             // A missing model is fatal — the daemon cannot serve
                             // anything without it. Fail hard rather than limping
                             // into a fake-ready state that errors on first submit.
-                            tracing::error!("model download failed: {e:#}; exiting");
                             status_tx.send(format!("Download failed: {e}")).ok();
-                            std::process::exit(1);
+                            fatal("zend", &format!("model download failed: {e:#}"));
                         }
                     };
                 // Drop the runtime; the model load below is sync.
@@ -6206,6 +6205,7 @@ impl ZendSession {
                 match InferenceState::load(
                     proj_builder,
                     model,
+                    engine_source,
                     model_path,
                     tok_path,
                     workspace,
@@ -6355,9 +6355,8 @@ impl ZendSession {
                         );
                     }
                     Err(e) => {
-                        tracing::error!("inference engine failed to load: {e:#}; exiting");
                         status_tx.send(format!("Load failed: {e}")).ok();
-                        std::process::exit(1);
+                        fatal("zend", &format!("inference engine failed to load: {e:#}"));
                     }
                 }
             })
@@ -6376,12 +6375,12 @@ impl ZendSession {
     pub async fn shutdown(&self) {
         // 1. Signal any in-flight ingest — the blocking `raw` ingest inside
         //    `InferenceState::load` AND the background ingest worker's current
-        //    pass — to stop submitting. Both poll this process-scoped flag
+        //    pass — to stop submitting. Both poll zend's ingest-cancel latch
         //    cooperatively (as do the deep shared ingest hot paths — per-file
         //    worker pool, cluster scan, raw docs), so no thread is torn down
         //    mid-turn; they break at a safe boundary. `start_loading` clears it
         //    before each load.
-        candle_conversation::request_ingest_cancel();
+        crate::ingest_cancel::token().request();
         // 2. Join the loader thread. If a load is IN PROGRESS, it breaks its ingest
         //    and drains the engine on that thread (the `Ok(None)` path in
         //    `start_loading`), and the join returns only once that drain is done.
@@ -6858,7 +6857,7 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
                 repo,
                 archived: s.is_archived(tl),
                 group: g.name.clone(),
-                turns: s.turn_count(tl),
+                turn_count: s.turn_count(tl),
                 tokens: s.timeline_token_total(tl),
                 summary_nodes,
                 branches,
@@ -6867,7 +6866,7 @@ fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -
         }
     }
     // Largest first — the most substantial timelines lead each layer.
-    conversations.sort_by_key(|c| std::cmp::Reverse(c.turns));
+    conversations.sort_by_key(|c| Reverse(c.turn_count));
     conversations
 }
 

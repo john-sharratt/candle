@@ -1,7 +1,7 @@
 //! Model-gated retrieval eval for the `code_read` layer — HTTP driver.
 //!
 //! Drives a **running** zend daemon over its HTTP API (`POST
-//! /v1/substrate/project`), so it reuses the daemon's already-loaded model and
+//! /v1/substrate/zend/project`), so it reuses the daemon's already-loaded model and
 //! adds **no extra VRAM** — the safe way to measure retrieval quality while a
 //! corpus is resident. `substrate_project` captures each query's live decode-Q,
 //! scores it against the substrate, and returns the selected projection tiles,
@@ -22,13 +22,17 @@
 //!     --limit 40 --html target/provenance_eval.html --wait-ready
 //! ```
 //! The daemon serves the projection API only once fully loaded; `--wait-ready`
-//! polls `/v1/status` until it leaves the `loading` state before running.
+//! polls `/v1/status` until it leaves the `loading` state before running. The
+//! route is an admin's: run the daemon with `--local-signin <an admin's email>`
+//! and point `--url` at its loopback address, which is the one peer that flag
+//! signs in.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use reqwest::StatusCode;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -188,11 +192,23 @@ async fn main() -> Result<()> {
     let mut unavailable = 0usize;
     for (i, case) in cases.iter().enumerate() {
         let resp = client
-            .post(format!("{url}/v1/substrate/project"))
+            .post(format!("{url}/v1/substrate/zend/project"))
             .json(&serde_json::json!({ "text": case.query }))
             .send()
             .await
             .with_context(|| format!("POST project for {}", case.id))?;
+        // Any refusal but "still loading" is the run's setup, not the query's:
+        // a 401/403 is an unsigned caller, a 404 a daemon without the route.
+        // Every query would answer the same, so the run stops on the first.
+        if !resp.status().is_success() && resp.status() != StatusCode::SERVICE_UNAVAILABLE {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "POST /v1/substrate/zend/project answered HTTP {status}: {body} — the route is \
+                 an admin's; run the daemon with --local-signin <an admin's email> and point \
+                 --url at its loopback address"
+            );
+        }
         // The daemon answers 503 while it is still loading (the projection API
         // only serves once fully loaded). Record unavailable queries and carry on
         // so the run still produces a report rather than aborting on the first one.

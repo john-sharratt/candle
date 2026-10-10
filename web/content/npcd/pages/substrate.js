@@ -10,11 +10,11 @@
  * whatever the operator has open and throw away its fetched sub-tree. */
 
 import { API } from '../lib/api.js';
-import { h, mount, fmtNum, fmtK } from '../lib/dom.js';
-import { go } from '../lib/router.js';
+import { h, mount, fmtNum, fmtK } from '/common/lib/dom.js';
+import { go } from '/common/lib/router.js';
 import { layerColor, empty, toast } from '../lib/ui.js';
-import { disclosure, stillOpen, spinner, cache } from '../lib/lazy.js';
-import { copyText } from '../lib/clip.js';
+import { disclosure, stillOpen, spinner, cache } from '/common/lib/lazy.js';
+import { copyText } from '/common/lib/clip.js';
 
 export async function render(_params, q) {
   // `subs` scopes this page's styling — see the block in `app.css`.
@@ -49,8 +49,8 @@ export async function render(_params, q) {
 
   function paintKpis(sub, schema) {
     const layers = sub.layers || [];
-    const totConvs = layers.reduce((a, l) => a + (l.conversations || 0), 0);
-    const totTurns = layers.reduce((a, l) => a + (l.turns || 0), 0);
+    const totConvs = layers.reduce((a, l) => a + (l.conversation_count || 0), 0);
+    const totTurns = layers.reduce((a, l) => a + (l.turn_count || 0), 0);
     mount(kpiHost,
       // `gather_scope`, the schema's own word. This read `l.masking ===
       // 'cross-timeline'`, which was the fixture's vocabulary and matched
@@ -77,9 +77,9 @@ export async function render(_params, q) {
    *
    * Daemon-scoped rather than per-character, and the one part of this page that
    * does not wait on the engine: a segmented append-only log is a directory of
-   * files, so `/v1/substrate/storage` reads it straight off disk. The layer
-   * tree below is still the console's fixture until an engine opens a
-   * substrate; this is not. */
+   * files, so npcd's line in the host's `/v1/substrate` reads it straight off
+   * disk, with the live-chunk count and reclaimable fraction beside it once
+   * the engine holds the substrate open. */
   async function paintStorage() {
     let s;
     try {
@@ -155,7 +155,7 @@ export async function render(_params, q) {
       API.getSubstrate(npcId).catch(() => ({ layers: [] })),
       API.getLayerSchema().catch(() => ({ layers: [] })),
     ]);
-    lastShape = JSON.stringify((sub.layers || []).map((l) => [l.layer, l.turns]));
+    lastShape = JSON.stringify((sub.layers || []).map((l) => [l.layer, l.turn_count]));
     paintKpis(sub, schema);
     // Keyed by `name` — the schema names a layer that way; the occupancy rows
     // from the substrate call the same thing `layer`.
@@ -171,8 +171,8 @@ export async function render(_params, q) {
         s.gather_scope === 'shared'
           ? h('span', { class: 'chip warn' }, 'cross-timeline')
           : h('span', { class: 'chip' }, 'self-local'),
-        h('span', { class: 'chip' }, fmtNum(l.conversations) + ' conversations'),
-        h('span', { class: 'chip' }, fmtNum(l.turns) + ' turns')),
+        h('span', { class: 'chip' }, fmtNum(l.conversation_count) + ' conversations'),
+        h('span', { class: 'chip' }, fmtNum(l.turn_count) + ' turns')),
     ];
     return disclosure({
       accent: layerColor(l.layer),
@@ -216,7 +216,7 @@ export async function render(_params, q) {
         h('span', { class: 'disc-title mono' }, c.name || 'conversation ' + c.timeline),
         h('div', { class: 'disc-meta' },
           meta.map(([k, v]) => h('span', { class: 'chip', title: k }, `${k}: ${v}`)),
-          h('span', { class: 'chip' }, fmtNum(turns.length) + ' turns')),
+          h('span', { class: 'chip' }, fmtNum(c.turn_count) + ' turns')),
       ],
       body: (host) => {
         const copyBtn = h('button', { class: 'btn sm ghost' }, 'Copy');
@@ -237,7 +237,7 @@ export async function render(_params, q) {
     try {
       const [sub, schema] = await Promise.all([API.getSubstrate(npcId), API.getLayerSchema()]);
       paintKpis(sub, schema);
-      const shape = JSON.stringify((sub.layers || []).map((l) => [l.layer, l.turns]));
+      const shape = JSON.stringify((sub.layers || []).map((l) => [l.layer, l.turn_count]));
       if (shape !== lastShape) {
         // Do NOT rebuild: it would collapse everything the operator has open and
         // discard its fetched sub-tree. Offer the reload instead.

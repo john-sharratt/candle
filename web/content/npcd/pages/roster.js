@@ -10,8 +10,8 @@
  * while they are trying to click something. */
 
 import { API } from '../lib/api.js';
-import { h, mount, ago } from '../lib/dom.js';
-import { go, link } from '../lib/router.js';
+import { h, mount, ago } from '/common/lib/dom.js';
+import { go, link } from '/common/lib/router.js';
 import { avatar, stateDot, bandChip, pending, empty, STATE_LABEL, MODE_LABEL, MODE_ICON } from '../lib/ui.js';
 import * as sessions from '../lib/sessions.js';
 
@@ -198,9 +198,9 @@ export async function render() {
   await refresh();
 
   /* Paint what this page load already knows about, then again once the daemon
-   * has confirmed the ids carried across a reload — the console's assets are
-   * embedded in the binary, so a rebuild reloads the page out from under a
-   * conversation that is still running. */
+   * has confirmed the ids carried across a reload — a saved UI edit or a
+   * rebuild reloads the page out from under a conversation that is still
+   * running. */
   paintTalking(sessions.list());
   const unwatchTalking = sessions.subscribe(paintTalking);
   sessions.restore();

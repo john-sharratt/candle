@@ -187,9 +187,11 @@
           ingest_backlog = { processed: n, total, last_item: files[(n - 1) % files.length] };
         }
       }
+      // The host's shape: the process's status, with zend's own line under
+      // `tenants.zend`.
       return Promise.resolve({
-        state: 'ready', started_at_ms: 0, detail: '', loading: null, maintenance: null,
-        ingest_backlog, build: 'mock',
+        state: 'ready', started_at_ms: 0, loading: null, build: 'mock',
+        tenants: { zend: { state: 'ready', loading: null, maintenance: null, ingest_backlog } },
       });
     },
 
@@ -203,8 +205,8 @@
         : { role: 'user', tool_modes: ['none', 'restricted'], default_tools: 'restricted' });
     },
 
-    // GET /v1/substrate/tools — argument schemas for the tools the seeded
-    // conversations call.
+    // GET /v1/tools — argument schemas for the tools the seeded conversations
+    // call.
     getToolSchemas() {
       return Promise.resolve({
         read_file: {

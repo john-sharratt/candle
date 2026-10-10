@@ -187,7 +187,7 @@ async function kick(){
   P.inflight=true; P.pending=false;
   setStatus('busy', 'projecting…');
   try{
-    const res = MOCK ? mockProject(text) : await postJSON('/v1/substrate/project', { text }, REQUEST_TIMEOUT_MS);
+    const res = MOCK ? mockProject(text) : await postJSON('/v1/substrate/zend/project', { text }, REQUEST_TIMEOUT_MS);
     render(res);
     setStatus('ok', 'ready');
   }catch(e){

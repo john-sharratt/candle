@@ -364,77 +364,6 @@ mod tests {
         }
     }
 
-    /// The shared library is mirrored into `zend/web/common/`, and the two
-    /// copies must not drift.
-    ///
-    /// They have before: a fix went into one and the other kept the bug, which
-    /// is invisible until somebody opens the console that has the stale copy.
-    /// Both are checked in, so this is a comparison rather than a build step.
-    ///
-    /// Line endings are not part of it. The two trees are checked out with
-    /// different ones — the estate's copies are CRLF and zend's are LF — and
-    /// failing on that would report drift on every file while hiding the one
-    /// that actually said something different.
-    #[test]
-    fn the_shared_console_library_is_the_same_in_both_trees() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let web = root.join("../web/content/common");
-        let zend = root.join("../zend/web/common");
-        // The whole tree, not just `lib/`. `base.css` sits at the top of it and
-        // was outside the walk when this only looked one directory down — which
-        // is exactly where a fix landed in one copy and not the other.
-        let mut queue = vec![PathBuf::new()];
-        let mut compared = 0;
-        while let Some(rel) = queue.pop() {
-            let dir = web.join(&rel);
-            for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{dir:?}: {e}")) {
-                let path = entry.expect("readable").path();
-                let name = path.file_name().expect("named").to_owned();
-                // Hidden entries are not the library. The daemon writes its own
-                // folder metadata (`.substrate.yaml`) into every folder it maps,
-                // and each copy names its own folder's path — comparing them
-                // reported drift between two libraries that were identical.
-                if name.to_string_lossy().starts_with('.') {
-                    continue;
-                }
-                let here = rel.join(&name);
-                if path.is_dir() {
-                    queue.push(here);
-                    continue;
-                }
-                let name = here.to_string_lossy().replace('\\', "/");
-                let mirror = zend.join(&here);
-                if !mirror.exists() {
-                    // A file only the estate serves is not drift.
-                    continue;
-                }
-                let a = std::fs::read_to_string(&path).expect("utf-8");
-                let b = std::fs::read_to_string(&mirror).expect("utf-8");
-                // The first line that differs, rather than both files: a
-                // whole-file `assert_eq!` on a two-hundred-line module prints
-                // both and names neither.
-                let (mut al, mut bl) = (a.lines(), b.lines());
-                let mut n = 0;
-                loop {
-                    n += 1;
-                    match (al.next(), bl.next()) {
-                        (None, None) => break,
-                        (x, y) if x == y => continue,
-                        (x, y) => panic!(
-                            "common/{name} differs at line {n} — the two trees have drifted\n\
-                             web:  {x:?}\n zend: {y:?}"
-                        ),
-                    }
-                }
-                compared += 1;
-            }
-        }
-        assert!(
-            compared > 9,
-            "only compared {compared} files — the walk is wrong"
-        );
-    }
-
     /// **`hidden` has to actually hide.**
     ///
     /// The shell hides three elements with the attribute alone, and the
@@ -460,22 +389,17 @@ mod tests {
             "expected the shell to hide several elements, found {hidden:?}"
         );
 
-        for css in [
-            "../web/content/common/base.css",
-            "../zend/web/common/base.css",
-        ] {
-            let text =
-                std::fs::read_to_string(root.join(css)).unwrap_or_else(|e| panic!("{css}: {e}"));
-            let guarded = text.lines().any(|l| {
-                let l = l.trim();
-                l.starts_with("[hidden]") && l.contains("display") && l.contains("!important")
-            });
-            assert!(
-                guarded,
-                "{css} has no `[hidden] {{ display: none !important }}` — every element the \
-                 shell hides reappears the moment a rule sets `display` on it"
-            );
-        }
+        let css = "../web/content/common/base.css";
+        let text = std::fs::read_to_string(root.join(css)).unwrap_or_else(|e| panic!("{css}: {e}"));
+        let guarded = text.lines().any(|l| {
+            let l = l.trim();
+            l.starts_with("[hidden]") && l.contains("display") && l.contains("!important")
+        });
+        assert!(
+            guarded,
+            "{css} has no `[hidden] {{ display: none !important }}` — every element the \
+             shell hides reappears the moment a rule sets `display` on it"
+        );
     }
 
     /// **The preload list is the shell's module graph, and stays it.**
@@ -506,59 +430,89 @@ mod tests {
             preloaded.len()
         );
 
+        // The file a URL names: the shared front-end at `/common/`, the
+        // console's own files at the root.
+        let file_of = |url: &str| match url.strip_prefix("/common/") {
+            Some(rel) => root.join("common").join(rel),
+            None => npcd.join(url.trim_start_matches('/')),
+        };
+
         // Every one of them is a file this console serves.
         for href in &preloaded {
-            let rel = href.trim_start_matches('/');
             assert!(
-                npcd.join(rel).exists() || root.join("common").join(rel).exists(),
-                "index.html preloads `{href}`, which no site root has"
+                file_of(href).exists(),
+                "index.html preloads `{href}`, which nothing serves"
             );
         }
 
         // And every module the shell reaches statically is one of them. Walked
-        // from `app.js`, because the graph is what matters and not the list.
+        // from `app.js` by URL, the way a browser resolves an import — a module
+        // is one module per URL, so `/common/lib/dom.js` reached two ways is one
+        // module and two spellings of it would be two.
         let mut seen: Vec<String> = Vec::new();
-        let mut queue = vec!["app.js".to_string()];
-        while let Some(rel) = queue.pop() {
-            if seen.contains(&rel) {
+        let mut queue = vec!["/app.js".to_string()];
+        while let Some(url) = queue.pop() {
+            if seen.contains(&url) {
                 continue;
             }
-            seen.push(rel.clone());
-            let path = if npcd.join(&rel).exists() {
-                npcd.join(&rel)
-            } else {
-                root.join("common").join(&rel)
-            };
-            let Ok(source) = std::fs::read_to_string(&path) else {
+            seen.push(url.clone());
+            let Ok(source) = std::fs::read_to_string(file_of(&url)) else {
                 continue;
             };
             for line in source.lines() {
-                // Static imports only: a dynamic `await import(…)` is deferred
-                // on purpose, and preloading it would undo that.
-                if !line.starts_with("import ") {
+                // Static imports and re-exports only: a dynamic `await import(…)`
+                // is deferred on purpose, and preloading it would undo that.
+                if !(line.starts_with("import ") || line.starts_with("export * from")) {
                     continue;
                 }
                 let Some(spec) = quoted_attr(line, "from").or_else(|| single_quoted(line)) else {
                     continue;
                 };
-                let child = spec.trim_start_matches("./").trim_start_matches('/');
-                let child = if rel.starts_with("lib/") && !child.starts_with("lib/") {
-                    format!("lib/{child}")
-                } else {
-                    child.to_string()
-                };
-                queue.push(child);
+                queue.push(resolve(&url, &spec));
             }
         }
 
-        for module in seen.iter().filter(|m| *m != "app.js") {
-            let href = format!("/{module}");
+        for module in seen.iter().filter(|m| *m != "/app.js") {
             assert!(
-                preloaded.contains(&href),
-                "the shell imports `{href}` but index.html does not preload it — \
+                preloaded.contains(module),
+                "the shell imports `{module}` but index.html does not preload it — \
                  it arrives a round trip later than it needs to"
             );
         }
+    }
+
+    /// `spec` imported from the module at `from`, as a URL path.
+    fn resolve(from: &str, spec: &str) -> String {
+        if spec.starts_with('/') {
+            return spec.to_string();
+        }
+        let mut parts: Vec<&str> = from.split('/').collect();
+        parts.pop(); // the importing file itself
+        for seg in spec.split('/') {
+            match seg {
+                "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s),
+            }
+        }
+        parts.join("/")
+    }
+
+    #[test]
+    fn imports_resolve_like_a_browser() {
+        assert_eq!(resolve("/app.js", "./lib/api.js"), "/lib/api.js");
+        assert_eq!(resolve("/lib/api.js", "./api.live.js"), "/lib/api.live.js");
+        assert_eq!(
+            resolve("/lib/ui.js", "/common/lib/dom.js"),
+            "/common/lib/dom.js"
+        );
+        assert_eq!(
+            resolve("/common/lib/ui-base.js", "./dom.js"),
+            "/common/lib/dom.js"
+        );
+        assert_eq!(resolve("/pages/npc.js", "../lib/scene.js"), "/lib/scene.js");
     }
 
     /// The value of `attr="…"` or `attr '…'` on a line.
@@ -575,34 +529,37 @@ mod tests {
 
     /// **The daemon does not fall back to the console's fixture.**
     ///
-    /// It used to. `main.rs` ended in
-    /// `fallback_service(guard::behind(…, web::mock::npcd::router()))`, so every
-    /// path the real routes had not claimed was answered by invented data —
-    /// correctly shaped, plausible, and wrong. A character's beliefs came back
-    /// for ids that did not exist.
+    /// A daemon whose routes ended in
+    /// `fallback_service(…, web::mock::npcd::router())` would answer every path
+    /// the real routes had not claimed with invented data — correctly shaped,
+    /// plausible, and wrong: a character's beliefs coming back for ids that do
+    /// not exist.
     ///
-    /// This is the one-line check that it stays gone. The fixture is still
-    /// built and still served by `web --authoritative`, which is what it is
-    /// for; what it must not do is stand behind a daemon that means it.
+    /// This is the one-line check that no such fallback is wired. The fixture
+    /// is built and served by `web --authoritative`, which is what it is for;
+    /// what it must not do is stand behind a daemon that means it.
     #[test]
     fn the_daemon_has_no_fixture_behind_it() {
-        let main =
-            std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"))
-                .expect("main.rs");
-        for line in main.lines() {
-            // Comments explaining the removal are the point; code is not.
-            let code = line.trim_start();
-            if code.starts_with("//") || code.starts_with('*') || code.starts_with("/*") {
-                continue;
+        // `main.rs` parses the flags; `tenant.rs` assembles the routes.
+        for file in ["src/main.rs", "src/tenant.rs"] {
+            let source =
+                std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file))
+                    .expect(file);
+            for line in source.lines() {
+                // Comments explaining the removal are the point; code is not.
+                let code = line.trim_start();
+                if code.starts_with("//") || code.starts_with('*') || code.starts_with("/*") {
+                    continue;
+                }
+                assert!(
+                    !code.contains("fallback"),
+                    "{file} installs a fallback again: {line}"
+                );
+                assert!(
+                    !code.contains("mock::npcd"),
+                    "{file} reaches for the console's fixture again: {line}"
+                );
             }
-            assert!(
-                !code.contains("fallback_service"),
-                "main.rs installs a fallback again: {line}"
-            );
-            assert!(
-                !code.contains("mock::npcd"),
-                "main.rs reaches for the console's fixture again: {line}"
-            );
         }
     }
 

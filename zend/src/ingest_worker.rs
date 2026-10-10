@@ -52,7 +52,7 @@ pub fn spawn(
         let mut first = true;
         loop {
             wake_loop.notified().await;
-            if stop_loop.load(Ordering::Relaxed) || candle_conversation::ingest_cancelled() {
+            if stop_loop.load(Ordering::Relaxed) || crate::ingest_cancel::cancelled() {
                 break;
             }
             let started = std::time::Instant::now();
@@ -73,7 +73,7 @@ pub fn spawn(
                 // that arrives during the warm-up is stored as a `Notify`
                 // permit and serviced once this returns. Skipped on a
                 // shutdown cancel so Ctrl-C isn't held up by a 1-2 minute scan.
-                if !stop_loop.load(Ordering::Relaxed) && !candle_conversation::ingest_cancelled() {
+                if !stop_loop.load(Ordering::Relaxed) && !crate::ingest_cancel::cancelled() {
                     let w = Arc::clone(&after_first_pass);
                     let _ = tokio::task::spawn_blocking(move || w()).await;
                 }
@@ -97,7 +97,7 @@ impl IngestWorker {
     /// minting conversations and writing turns — breaking the daemon
     /// shutdown's "the drain runs on the loader thread OR here, never both"
     /// invariant. The pools already stop cooperatively at a unit boundary on
-    /// `candle_conversation::ingest_cancelled()` (the caller is expected to
+    /// `crate::ingest_cancel::cancelled()` (the caller is expected to
     /// have raised that before calling `stop`), which is what bounds this
     /// await.
     pub async fn stop(self) {

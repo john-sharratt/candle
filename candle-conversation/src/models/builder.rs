@@ -3,15 +3,20 @@
 
 use super::gguf_rope::gguf_rope;
 use super::{Model, ModelArch, ModelSpec, RopePreset};
+use crate::cancel::CancelToken;
 use crate::config::{
     pick_max_hot_turns, DecodeHealthConfig, EngineConfig, SamplingConfig, SchedulerConfig,
     SequenceConfig,
 };
+use crate::engine::{ConversationEngine, EngineAttacher};
+use crate::engine_slot::CoreRequests;
 use crate::error::ConversationError;
 use crate::guest::checkpoint::gguf_header;
+use crate::models::identity::{rope_key, ModelIdentity, WeightFiles};
 use crate::models::DialectType;
-use crate::persistence::SharedSubstrate;
+use crate::persistence::{BoundSubstrate, SharedSubstrate};
 use crate::projection::{CorruptTurnPolicy, LayerId};
+use crate::tenant_rank::TenantRank;
 use crate::tree::ConversationTreeConfig;
 use crate::ManagedBatchedModel;
 use candle::quantized::Int8Mode;
@@ -23,6 +28,15 @@ use candle_transformers::models::qwen35::TensorOverride;
 use candle_transformers::models::selection_strata::StrataTokens;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// A checkpoint [`ModelBuilder::prepare`] resolved and read: its files, its
+/// tokenizer, and the vocabulary size its header states.
+struct Prepared {
+    model_path: PathBuf,
+    tokenizer_path: PathBuf,
+    tokenizer: tokenizers::Tokenizer,
+    gguf_vocab_size: Option<usize>,
+}
 
 /// A model [`ModelBuilder::load_model`] loaded, with the int8 mode it was
 /// loaded in — the value a report on the model names, never re-derived.
@@ -147,9 +161,16 @@ pub struct ModelBuilder {
     /// handle to one `substrate/` silently drops records; see
     /// [`SharedSubstrate`].
     substrate: Option<SharedSubstrate>,
-    /// Open the workspace's substrate read-only — forwarded to
-    /// [`EngineConfig::read_only_substrate`]. `false` by default.
+    /// Open the workspace's substrate read-only
+    /// ([`SharedSubstrate::open_in_read_only`]) — for a tool reading a workspace
+    /// another process may be appending to. `false` by default.
     read_only_substrate: bool,
+    /// The substrate's ingest-cancel latch, forwarded to
+    /// [`EngineConfig::cancel`]. See [`ModelBuilder::cancel_token`].
+    cancel: CancelToken,
+    /// The rank of the tenant the engine's first substrate belongs to,
+    /// forwarded to [`EngineConfig::tenant_rank`].
+    tenant_rank: TenantRank,
     /// Per-layer corrupt-turn policy (from the projection schema), forwarded to
     /// [`EngineConfig::layer_corrupt_turn`] so the startup reload drops the whole
     /// conversation (ingest layers) or just the turn (dialogue) per layer. Empty
@@ -157,8 +178,9 @@ pub struct ModelBuilder {
     layer_corrupt_turn: HashMap<LayerId, CorruptTurnPolicy>,
     /// Directory for the persistent repacked expert pack.
     ///
-    /// `None` (the default) uses a temp file, unlinked as soon as it is open, so
-    /// nothing is left on disk and the repack is paid on every start.
+    /// `None` (the default): the Qwen3.5/3.6 hybrid puts the pack beside the
+    /// checkpoint; the Qwen3-MoE loader uses a temp file, unlinked as soon as it
+    /// is open, so nothing is left on disk and the repack is paid on every start.
     expert_pack_dir: Option<PathBuf>,
     /// Override for [`SchedulerConfig::large_prefill_max_tokens`].
     ///
@@ -210,6 +232,8 @@ impl ModelBuilder {
             workspace_path: None,
             substrate: None,
             read_only_substrate: false,
+            cancel: CancelToken::new(),
+            tenant_rank: TenantRank::FIRST,
             layer_corrupt_turn: HashMap::new(),
             expert_pack_dir: None,
             prefill_pass_tokens: None,
@@ -351,9 +375,25 @@ impl ModelBuilder {
     /// `substrate/` from start through shutdown. The store must already exist.
     ///
     /// Has no effect once [`Self::substrate`] has handed over an open one —
-    /// that handle's own mode rules. See [`EngineConfig::read_only_substrate`].
+    /// that handle's own mode rules.
     pub fn read_only_substrate(mut self, read_only: bool) -> Self {
         self.read_only_substrate = read_only;
+        self
+    }
+
+    /// The latch that stops this substrate's ingest — the daemon's own, made
+    /// before the engine so a shutdown during the load still reaches the ingest
+    /// the load starts. Every conversation on the engine's substrate carries it.
+    pub fn cancel_token(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Rank the engine's first substrate as tenant `rank` — where its
+    /// sequences stand against a substrate attached later
+    /// ([`crate::ConversationEngine::attach`]). [`TenantRank::FIRST`] unless set.
+    pub fn tenant_rank(mut self, rank: TenantRank) -> Self {
+        self.tenant_rank = rank;
         self
     }
 
@@ -790,13 +830,15 @@ impl ModelBuilder {
         }
     }
 
-    /// Build an [`EngineConfig`] from the builder's settings, a tokenizer, and the
+    /// Build an [`EngineConfig`] from the builder's settings, a tokenizer, the
     /// device the engine will run on — which sizes the prefill forward to the card
-    /// unless [`Self::prefill_pass_tokens`] chose it.
+    /// unless [`Self::prefill_pass_tokens`] chose it — and the substrate
+    /// [`Self::bind_substrate`] bound to this model.
     pub fn engine_config(
         &self,
         tokenizer: &tokenizers::Tokenizer,
         device: &Device,
+        substrate: BoundSubstrate,
     ) -> EngineConfig {
         let mut eos_tokens = Vec::new();
         // The spec's dialect is the source of truth for the model family's
@@ -857,7 +899,9 @@ impl ModelBuilder {
             vocab_size
         );
 
-        let mut ret = EngineConfig::new(eos_tokens.into());
+        let mut ret = EngineConfig::new(eos_tokens.into(), substrate);
+        ret.cancel = self.cancel.clone();
+        ret.tenant_rank = self.tenant_rank;
         ret.layer_corrupt_turn = self.layer_corrupt_turn.clone();
         // **Sized to the card here, where every engine config is made**, so an
         // engine assembled from this config directly — the fragmentation probe,
@@ -907,31 +951,110 @@ impl ModelBuilder {
         ret.show_special_tokens = self.show_special_tokens;
         ret.penalty_log_path = self.penalty_log_path.clone();
         ret.health = self.health_config.clone();
-        ret.workspace_path = self.workspace_path.clone();
-        ret.substrate = self.substrate.clone();
-        ret.read_only_substrate = self.read_only_substrate;
-        ret.model_spec = Some(self.model_spec_blob());
         // The engine uses the model's dialect to pre-tokenise the
         // inter-turn boundary markers once at scheduler construction.
         ret.dialect = self.spec.dialect.clone();
         ret
     }
 
-    /// A stable serialized identity for the substrate's `ModelSpec` record —
-    /// enough to re-load the same weights and tokenizer from HuggingFace.
-    fn model_spec_blob(&self) -> Vec<u8> {
-        let s = &self.spec;
-        format!(
-            "candle-conversation model-spec v1\n\
-             arch={:?}\n\
-             chat_format={:?}\n\
-             model_repo={}\n\
-             model_filename={}\n\
-             tokenizer_repo={}\n\
-             max_seq_len={}\n",
-            s.arch, s.chat_format, s.model_repo, s.model_filename, s.tokenizer_repo, s.max_seq_len,
+    /// Every file this model's weights are loaded from: the checkpoint, and —
+    /// for the lineage whose loader reads them — its tensor overrides, the
+    /// gate donor when the checkpoint needs one, and its adapters. Resolved once
+    /// and handed to both [`Self::model_identity`] and [`Self::load_model`], so
+    /// the key names exactly what was loaded.
+    pub fn weight_files(&self, model_path: &Path) -> crate::Result<WeightFiles> {
+        let reads_other_checkpoints = matches!(
+            self.spec.arch,
+            ModelArch::Qwen35Hybrid | ModelArch::Qwen35Dense
+        );
+        // **Only the qwen35 loader reads a tensor from another checkpoint.** A spec naming one
+        // for any other arch would load the primary's own copy and serve a model nobody asked
+        // for under this spec's name, so it is refused rather than served.
+        if !self.spec.tensor_overrides.is_empty() && !reads_other_checkpoints {
+            return Err(ConversationError::Other(format!(
+                "{:?} cannot take tensors from another checkpoint, and this spec names {}",
+                self.spec.arch,
+                self.spec.tensor_overrides.len()
+            )));
+        }
+        let (tensor_overrides, gate_donor) = if reads_other_checkpoints {
+            (self.tensor_overrides()?, self.gate_donor_path(model_path)?)
+        } else {
+            (Vec::new(), None)
+        };
+        // Adapters load into the dense lineage only.
+        let adapters = if matches!(self.spec.arch, ModelArch::Qwen35Dense) {
+            self.resolve_loras()?
+        } else {
+            Vec::new()
+        };
+        Ok(WeightFiles {
+            primary: model_path.to_path_buf(),
+            tensor_overrides,
+            gate_donor,
+            adapters,
+        })
+    }
+
+    /// The identity of the model loaded from `weights` with the vocabulary at
+    /// `tokenizer_path` — what a substrate is bound to. Reads each weight
+    /// file's header and a sample of its data, and the whole tokenizer; no
+    /// weight is loaded. A tokenizer that cannot be read refuses the start: a
+    /// model whose key cannot be computed cannot be checked against a
+    /// substrate.
+    pub fn model_identity(
+        &self,
+        weights: &WeightFiles,
+        tokenizer_path: &Path,
+    ) -> crate::Result<ModelIdentity> {
+        let tokenizer_json = std::fs::read(tokenizer_path).map_err(|e| {
+            ConversationError::Tokenizer(format!(
+                "read {} to identify the model: {e}",
+                tokenizer_path.display()
+            ))
+        })?;
+        let digest = weights.digest().map_err(|e| {
+            ConversationError::Other(format!(
+                "identify the weights at {}: {e}",
+                weights.primary.display()
+            ))
+        })?;
+        ModelIdentity::new(
+            format!("{:?}", self.spec.arch),
+            self.spec.model_repo.clone(),
+            self.spec.model_filename.clone(),
+            digest,
+            tokenizer_json,
+            rope_key(&self.spec.rope, self.min_rope_factor),
         )
-        .into_bytes()
+        .map_err(ConversationError::Other)
+    }
+
+    /// Open this builder's substrate — the one [`Self::substrate`] handed over,
+    /// or the one under [`Self::workspace_path`] (the process working directory
+    /// when unset), read-only when [`Self::read_only_substrate`] says so — and
+    /// bind it to `identity`. A substrate another model wrote is refused here,
+    /// before anything is loaded onto the device.
+    pub fn bind_substrate(&self, identity: &ModelIdentity) -> crate::Result<BoundSubstrate> {
+        let shared = match &self.substrate {
+            Some(shared) => shared.clone(),
+            None => {
+                let dir = match &self.workspace_path {
+                    Some(p) => p.clone(),
+                    None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                };
+                // A read-only open writes nothing under `substrate/` and
+                // requires the store to exist.
+                let opened = if self.read_only_substrate {
+                    SharedSubstrate::open_in_read_only(&dir)
+                } else {
+                    SharedSubstrate::open_in(&dir)
+                };
+                opened
+                    .map_err(|e| ConversationError::Other(format!("substrate persistence: {e}")))?
+            }
+        };
+        BoundSubstrate::bind(shared, identity).map_err(|e| ConversationError::Other(e.to_string()))
     }
 
     /// Wrap a GQA checkpoint in the RoPE schedule its preset names over the
@@ -1007,12 +1130,12 @@ impl ModelBuilder {
     /// asking again afterwards can name a mode the model was not loaded in.
     pub fn load_model(
         &self,
-        model_path: &Path,
+        weights: &WeightFiles,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> crate::Result<LoadedModel> {
-        let int8_mode = self.int8_mode(device, model_path);
-        let mut model = self.load_arch(model_path, device, int8_mode, progress)?;
+        let int8_mode = self.int8_mode(device, &weights.primary);
+        let mut model = self.load_arch(weights, device, int8_mode, progress)?;
         // After `load_arch` has applied the budget: a selecting model checks
         // the strata against its kernel under the budget it will run with.
         model
@@ -1037,31 +1160,17 @@ impl ModelBuilder {
         Ok(LoadedModel { model, int8_mode })
     }
 
-    /// The model `spec.arch` names, loaded from `model_path` in `int8mode` —
+    /// The model `spec.arch` names, loaded from `weights` in `int8mode` —
     /// every architecture's own loader.
     fn load_arch(
         &self,
-        model_path: &Path,
+        weights: &WeightFiles,
         device: &Device,
         int8mode: Int8Mode,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> crate::Result<Box<dyn ManagedBatchedModel + Send>> {
         let max_seq = self.max_seq_len;
-        // **Only the qwen35 loader reads a tensor from another checkpoint.** A spec naming one
-        // for any other arch would load the primary's own copy and serve a model nobody asked
-        // for under this spec's name, so it is refused rather than served.
-        if !self.spec.tensor_overrides.is_empty()
-            && !matches!(
-                self.spec.arch,
-                ModelArch::Qwen35Hybrid | ModelArch::Qwen35Dense
-            )
-        {
-            return Err(ConversationError::Other(format!(
-                "{:?} cannot take tensors from another checkpoint, and this spec names {}",
-                self.spec.arch,
-                self.spec.tensor_overrides.len()
-            )));
-        }
+        let model_path = weights.primary.as_path();
         // **Only a selecting architecture takes a selection budget.** Any other
         // would load, ignore it, and report a dense control that was never run.
         if let Some(positions) = self.qsa_selection_budget {
@@ -1192,8 +1301,8 @@ impl ModelBuilder {
                             .clone()
                             .or_else(|| model_path.parent().map(Path::to_path_buf)),
                         int8mode: Some(int8mode),
-                        gate_donor_path: self.gate_donor_path(model_path)?,
-                        tensor_overrides: self.tensor_overrides()?,
+                        gate_donor_path: weights.gate_donor.clone(),
+                        tensor_overrides: weights.tensor_overrides.clone(),
                         ..Default::default()
                     },
                 )
@@ -1216,8 +1325,8 @@ impl ModelBuilder {
                     device,
                     Qwen35LoadOptions {
                         int8mode: Some(int8mode),
-                        gate_donor_path: self.gate_donor_path(model_path)?,
-                        tensor_overrides: self.tensor_overrides()?,
+                        gate_donor_path: weights.gate_donor.clone(),
+                        tensor_overrides: weights.tensor_overrides.clone(),
                         ..Default::default()
                     },
                 )
@@ -1236,9 +1345,9 @@ impl ModelBuilder {
                     .arch
                     .native_activation_dtype()
                     .unwrap_or(candle::DType::F16);
-                for (name, dir) in self.resolve_loras()? {
+                for (name, dir) in &weights.adapters {
                     model
-                        .load_adapter(&name, &dir, act)
+                        .load_adapter(name, dir, act)
                         .map_err(ConversationError::Model)?;
                 }
                 Ok(Box::new(model))
@@ -1252,7 +1361,7 @@ impl ModelBuilder {
     /// (or [`model_dir`](Self::model_dir)) have been set, those local files
     /// are used. Otherwise, the files are downloaded from HuggingFace
     /// (requires the `hub` crate feature).
-    pub fn engine(&mut self, device: &Device) -> crate::Result<crate::ConversationEngine> {
+    pub fn engine(&mut self, device: &Device) -> crate::Result<ConversationEngine> {
         self.engine_with_progress(device, None)
     }
 
@@ -1265,7 +1374,83 @@ impl ModelBuilder {
         &mut self,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
-    ) -> crate::Result<crate::ConversationEngine> {
+    ) -> crate::Result<ConversationEngine> {
+        let prepared = self.prepare()?;
+        self.engine_from_prepared(prepared, device, progress)
+    }
+
+    /// Attach this builder's substrate to an engine another tenant built
+    /// (`crate::engine_slot`): resolve and read the checkpoint exactly as a
+    /// build would — so this builder's sampling, thinking and context settings
+    /// are the ones the model states — then bind the substrate to the model and
+    /// attach it. No weight is loaded.
+    ///
+    /// The substrate is bound under the engine's RoPE schedule, not this
+    /// builder's: the engine rotates every key this substrate will hold, and a
+    /// shared engine's schedule is every tenant's merged. The model itself is
+    /// checked against the engine's before the substrate is touched, so a
+    /// different model leaves a fresh substrate unbound.
+    pub fn attach_to(&mut self, attacher: &EngineAttacher) -> crate::Result<ConversationEngine> {
+        let prepared = self.prepare()?;
+        let weights = self.weight_files(&prepared.model_path)?;
+        let engine_key = attacher.model_key();
+        let identity = self
+            .model_identity(&weights, &prepared.tokenizer_path)?
+            .under_rope(engine_key.rope.clone());
+        if !identity.key().same_model(engine_key) {
+            return Err(ConversationError::Other(format!(
+                "this tenant resolves {}, and the engine it would attach to runs {}",
+                identity.key().describe(),
+                engine_key.describe()
+            )));
+        }
+        let substrate = self.bind_substrate(&identity)?;
+        attacher.attach(
+            substrate,
+            self.cancel.clone(),
+            self.tenant_rank,
+            self.layer_corrupt_turn.clone(),
+        )
+    }
+
+    /// Give up the engine-wide settings this builder asks for, for the slot to
+    /// merge with other tenants' (`crate::engine_slot::CoreRequests`). The
+    /// guests move out; [`Self::apply_core_requests`] gives the merge back.
+    pub fn take_core_requests(&mut self) -> CoreRequests {
+        CoreRequests {
+            prefill_pass_tokens: self.prefill_pass_tokens,
+            min_rope_factor: self.min_rope_factor,
+            qsa_selection_budget: self.qsa_selection_budget,
+            qsa_strata: self.qsa_strata,
+            max_response_tokens: self.max_response_tokens,
+            max_concurrent: self.max_concurrent,
+            thinking: self.thinking,
+            guests: std::mem::take(&mut self.guests),
+        }
+    }
+
+    /// Build with `merged` — every tenant's engine-wide settings — in place of
+    /// this builder's own.
+    pub fn apply_core_requests(&mut self, merged: CoreRequests) {
+        self.prefill_pass_tokens = merged.prefill_pass_tokens;
+        self.min_rope_factor = merged.min_rope_factor;
+        self.qsa_selection_budget = merged.qsa_selection_budget;
+        self.qsa_strata = merged.qsa_strata;
+        self.max_response_tokens = merged.max_response_tokens;
+        self.max_concurrent = merged.max_concurrent;
+        self.thinking = merged.thinking;
+        self.guests = merged.guests;
+    }
+
+    /// Rank this builder's substrate as tenant `rank` — [`Self::tenant_rank`]
+    /// through a reference, for the engine slot.
+    pub(crate) fn set_tenant_rank(&mut self, rank: TenantRank) {
+        self.tenant_rank = rank;
+    }
+
+    /// Resolve the checkpoint and tokenizer, and take what the checkpoint
+    /// states — architecture, context, sampling, thinking — into this builder.
+    fn prepare(&mut self) -> crate::Result<Prepared> {
         let (model_path, tokenizer_path) = self.resolve_paths()?;
 
         // ── Read GGUF metadata ──────────────────────────────────────────
@@ -1373,19 +1558,37 @@ impl ModelBuilder {
             nt.resolve_thinking_tokens(&tokenizer);
         }
         self.health_config.resolve_structural_tokens(&tokenizer);
+        Ok(Prepared {
+            model_path,
+            tokenizer_path,
+            tokenizer,
+            gguf_vocab_size,
+        })
+    }
 
-        let mut config = self.engine_config(&tokenizer, device);
+    /// Build the engine from a [`Self::prepare`]d checkpoint.
+    fn engine_from_prepared(
+        &mut self,
+        prepared: Prepared,
+        device: &Device,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> crate::Result<ConversationEngine> {
+        let Prepared {
+            model_path,
+            tokenizer_path,
+            tokenizer,
+            gguf_vocab_size,
+        } = prepared;
 
-        // Embed the raw `tokenizer.json` so the substrate log is a
-        // self-contained, offline-detokenizable image. Written once per
-        // distinct model via compare-and-insert at engine startup.
-        match std::fs::read(&tokenizer_path) {
-            Ok(bytes) => config.tokenizer = Some(bytes),
-            Err(e) => tracing::warn!(
-                "could not read tokenizer.json ({}) for persistence: {e}",
-                tokenizer_path.display()
-            ),
-        }
+        // ── Bind the substrate before a weight is loaded ───────────────
+        // The model's identity comes from its files' headers, a sample of
+        // their data and the tokenizer — seconds. A substrate another model
+        // wrote is refused here, not after a load measured in minutes.
+        let weights = self.weight_files(&model_path)?;
+        let identity = self.model_identity(&weights, &tokenizer_path)?;
+        let substrate = self.bind_substrate(&identity)?;
+
+        let mut config = self.engine_config(&tokenizer, device, substrate);
 
         // Override vocab_size with the authoritative value from GGUF metadata
         // if available.  Models often pad vocab to a power-of-2 / multiple of
@@ -1426,7 +1629,7 @@ impl ModelBuilder {
             tracing::info!("  Max response tokens: {}", self.max_response_tokens);
         }
 
-        let model = self.load_model(&model_path, device, progress)?.model;
+        let model = self.load_model(&weights, device, progress)?.model;
 
         // Hand the load's pool high-water back before serving starts — it is
         // several GiB held outside the KV reservation and never used again.
@@ -1469,7 +1672,7 @@ impl ModelBuilder {
             );
         }
 
-        let engine = crate::ConversationEngine::new(model, tokenizer, config, self.guests.clone())?;
+        let engine = ConversationEngine::new(model, tokenizer, config, self.guests.clone())?;
         Ok(engine)
     }
 
@@ -1821,14 +2024,13 @@ impl ModelBuilder {
     /// reads as protection.
     #[cfg(feature = "hub")]
     fn download_or_fail(&self) -> crate::Result<(PathBuf, PathBuf)> {
-        // **A prepared artifact is never downloaded, and this resolver used to try
-        // anyway.** `ModelSpec::prepared_from_source` marks a checkpoint this codebase
-        // *builds* from a repository's published files — Flash-Next's merged GGUF is the
-        // case — and its own documentation says resolution therefore skips the network and
-        // looks in the local cache. That was implemented in `zend::download` and nowhere
-        // else, so the daemon loaded such a model and everything below it got a 404 on a
-        // filename that was never published. Any harness in this crate was simply unable
-        // to open the one architecture that carries per-sequence state outside the K/V.
+        // **A prepared artifact is never downloaded.** `ModelSpec::prepared_from_source`
+        // marks a checkpoint this codebase *builds* from a repository's published files —
+        // Flash-Next's merged GGUF is the case — so resolution skips the network and looks
+        // in the local cache, here as in the hosts' download (`host::download`). A fetch
+        // would be a 404 on a filename that was never published, and every harness in
+        // this crate unable to open the one architecture that carries per-sequence state
+        // outside the K/V.
         let model_path = if self.spec.prepared_from_source {
             prepared_artifact_path(&self.spec.model_repo, &self.spec.model_filename)?
         } else {
@@ -1993,10 +2195,9 @@ fn cached_repo_file(
 /// The cache directory prepared and downloaded artifacts share.
 ///
 /// `~/.cache/zend/models`, so a prepared artifact sits beside the published ones and one
-/// layout covers both. Defined here, in the crate every loader goes through, because the
-/// alternative is what was there before: the convention written down in `zend::download`
-/// and nowhere else, so the daemon could open a prepared checkpoint and nothing below it
-/// could.
+/// layout covers both. Defined here, in the crate every loader goes through, so the hosts'
+/// download (`host::download`) and every harness below it agree on where a prepared
+/// checkpoint is.
 #[cfg(any(feature = "hub", test))]
 pub fn model_cache_dir() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
@@ -2178,11 +2379,129 @@ mod header_read_tests {
 }
 
 #[cfg(test)]
-mod selection_budget_tests {
+mod identity_tests {
+    use std::fs::File;
+    use std::io::Write;
     use std::path::Path;
 
+    use candle::quantized::gguf_file::{self, Value};
+    use candle::quantized::{GgmlDType, QTensor};
+    use candle::{Device, Tensor};
+
+    use crate::error::ConversationError;
+    use crate::models::identity::WeightFiles;
+    use crate::models::Model;
+
+    /// **A tokenizer that cannot be read refuses the start.** The key a
+    /// substrate is checked against hashes the vocabulary, so a model without
+    /// one has nothing to check — opening the substrate anyway is how a
+    /// different tokenizer's KV came to be served. The tokenizer is read before
+    /// any weight file, so the checkpoint path is never touched.
+    #[test]
+    fn an_unreadable_tokenizer_refuses_the_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("tokenizer.json");
+        let err = Model::Qwen35_0_8B_Q8
+            .builder()
+            .model_identity(&WeightFiles::single("never-read.gguf"), &missing)
+            .expect_err("a model whose tokenizer cannot be read must not be identified");
+        let ConversationError::Tokenizer(message) = err else {
+            panic!("refused for the wrong reason: {err}");
+        };
+        let expected = format!("read {} to identify the model: ", missing.display());
+        assert!(
+            message.starts_with(&expected),
+            "the refusal must name the tokenizer it could not read: {message}"
+        );
+    }
+
+    /// One F32 tensor named `w` holding `values`.
+    fn write_gguf(path: &Path, values: &[f32]) {
+        let t = Tensor::from_slice(values, values.len(), &Device::Cpu).unwrap();
+        let q = QTensor::quantize(&t, GgmlDType::F32).unwrap();
+        let arch = Value::String("fixture".into());
+        let mut f = File::create(path).unwrap();
+        gguf_file::write(&mut f, &[("general.architecture", &arch)], &[("w", &q)]).unwrap();
+        f.flush().unwrap();
+    }
+
+    /// **A fine-tune swapped in under the same name and vocabulary is refused.**
+    /// The tokenizer check alone passed exactly this case: same file name, same
+    /// `tokenizer.json`, different weights — and every stored K/V was the other
+    /// model's. The refusal comes at bind, before any weight is loaded, and
+    /// leaves the substrate bound to the model that wrote it.
+    #[test]
+    fn a_checkpoint_with_the_same_tokenizer_cannot_open_anothers_substrate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, br#"{"model":{"vocab":{"a":0}}}"#).unwrap();
+        let base = dir.path().join("base.gguf");
+        let tuned = dir.path().join("tuned.gguf");
+        write_gguf(&base, &[1.0, 2.0, 3.0, 4.0]);
+        write_gguf(&tuned, &[1.0, 2.0, 3.0, 4.5]);
+        let workspace = dir.path().join("workspace");
+        let builder = Model::Qwen35_0_8B_Q8.builder().workspace_path(&workspace);
+
+        let first = builder
+            .model_identity(&WeightFiles::single(&base), &tokenizer)
+            .unwrap();
+        let bound = builder
+            .bind_substrate(&first)
+            .expect("a new substrate binds");
+        drop(bound);
+
+        let second = builder
+            .model_identity(&WeightFiles::single(&tuned), &tokenizer)
+            .unwrap();
+        assert_eq!(first.key().tokenizer, second.key().tokenizer);
+        assert_ne!(first.key().weights, second.key().weights);
+        let err = builder
+            .bind_substrate(&second)
+            .expect_err("another checkpoint's weights must not open this substrate");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "belongs to {}, not {}",
+                first.key().describe(),
+                second.key().describe()
+            )),
+            "the refusal must name both models: {message}"
+        );
+
+        let reopened = builder
+            .bind_substrate(&first)
+            .expect("the model that wrote the substrate still opens it");
+        assert_eq!(reopened.model_key(), first.key());
+    }
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use crate::models::Model;
+
+    /// **The core's `thinking(true)` leaves a tenant that asked for nothing
+    /// exactly where it was.** A shared core turns thinking on when any tenant
+    /// does (`CoreRequests::merge`), so npcd — which sets nothing — runs under
+    /// zend's `true`. That is only safe because the switch does one thing:
+    /// `false` suppresses thinking for every turn; `true` and unset both leave
+    /// each turn's own think mode to decide.
+    #[test]
+    fn only_an_explicit_false_suppresses_thinking() {
+        let unset = Model::Qwen35_0_8B_Q8.builder();
+        assert!(!unset.should_suppress_thinking());
+        assert!(!unset.thinking(true).should_suppress_thinking());
+        assert!(Model::Qwen35_0_8B_Q8
+            .builder()
+            .thinking(false)
+            .should_suppress_thinking());
+    }
+}
+
+#[cfg(test)]
+mod selection_budget_tests {
     use candle::Device;
 
+    use crate::models::identity::WeightFiles;
     use crate::models::Model;
 
     /// **A selection budget is refused where nothing selects.** Accepted, it
@@ -2194,7 +2513,7 @@ mod selection_budget_tests {
         let err = Model::Qwen35_0_8B_Q8
             .builder()
             .qsa_selection_budget(Some(1 << 20))
-            .load_model(Path::new("never-read.gguf"), &Device::Cpu, None)
+            .load_model(&WeightFiles::single("never-read.gguf"), &Device::Cpu, None)
             .err()
             .expect("a model whose attention does not select must refuse a budget");
         assert_eq!(

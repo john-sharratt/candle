@@ -88,7 +88,7 @@ pub fn run_folder_conversation(
     let mut tokens = 0usize;
 
     for round in 0..=MAX_FOLDER_ROUNDS {
-        if candle_conversation::ingest_cancelled() {
+        if crate::ingest_cancel::cancelled() {
             anyhow::bail!("shutdown cancelled mid-directory");
         }
         let closing = round == MAX_FOLDER_ROUNDS;

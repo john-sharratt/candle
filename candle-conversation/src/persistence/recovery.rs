@@ -57,7 +57,7 @@ pub struct Recovered {
 ///
 /// `Chunk` / `Tokens` payloads are stored by reference —
 /// `Substrate::apply_walker_entry` keeps only their `(offset, len)` — and
-/// the `ModelSpec` / `Template` / `Tokenizer` singleton payloads are read
+/// the `ModelKey` / `Template` / `Tokenizer` singleton payloads are read
 /// back individually after recovery from their manifest locations.
 /// `HeaderIndex` payloads are consumed only by the chain reader, never
 /// by replay.
@@ -66,7 +66,7 @@ fn payload_needed(rt: RecordType) -> bool {
         rt,
         RecordType::Chunk
             | RecordType::Tokens
-            | RecordType::ModelSpec
+            | RecordType::ModelKey
             | RecordType::Template
             | RecordType::Tokenizer
             | RecordType::HeaderIndex
@@ -449,9 +449,9 @@ mod tests {
             record(RecordType::Chunk, 7, 0, &vec![0xAB; 9000]),
             record(RecordType::Chunk, 7, 1, b"c1"),
             record(RecordType::Tokens, 7, 0, b"tok-bytes"),
-            record(RecordType::ModelSpec, 0, 0, b"model-v1"),
+            record(RecordType::ModelKey, 0, 0, b"model-v1"),
             record(RecordType::Chunk, 8, 0, b"other-stream"),
-            record(RecordType::ModelSpec, 0, 0, b"model-v2"),
+            record(RecordType::ModelKey, 0, 0, b"model-v2"),
         ]
     }
 
@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(sub_a.live_chunk_count(), sub_b.live_chunk_count());
         assert_eq!(sub_a.live_chunk_count(), 3);
         // LWW singleton resolved identically (v2 wins on both paths).
-        assert_eq!(rec_a.manifest.model_spec, rec_b.manifest.model_spec);
+        assert_eq!(rec_a.manifest.model_key, rec_b.manifest.model_key);
     }
 
     /// The un-indexed tail (records after the hinted index) is walked

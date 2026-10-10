@@ -159,8 +159,10 @@ fn main() -> anyhow::Result<()> {
     let (model_path, tokenizer_path) = builder.resolve_paths_pub()?;
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    let model = builder.load_model(&model_path, &device, None)?.model;
-    let mut engine_config = builder.engine_config(&tokenizer, &device);
+    let weights = builder.weight_files(&model_path)?;
+    let substrate = builder.bind_substrate(&builder.model_identity(&weights, &tokenizer_path)?)?;
+    let model = builder.load_model(&weights, &device, None)?.model;
+    let mut engine_config = builder.engine_config(&tokenizer, &device, substrate);
     engine_config.batched_config = batched_config;
 
     let engine = Arc::new(ConversationEngine::new(

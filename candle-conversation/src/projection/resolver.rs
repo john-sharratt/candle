@@ -5,13 +5,17 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::belief_files::{assemble_file_scans, scan_file_scans};
-use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
+use super::ids::{
+    process_timeline_allocator, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId,
+    TurnIndex, TurnKey,
+};
 use super::owned_sections::OwnedSection;
 use super::project::ProjectionTarget;
 use super::schema::{
@@ -21,7 +25,7 @@ use super::schema::{
 use super::warm_pool;
 use super::working_set_observe::{working_set_config, working_set_fresh};
 use super::working_set_pick::{Standing, WorkingSetMembers};
-use crate::cancel::ingest_cancelled;
+use crate::cancel::CancelToken;
 use crate::error::ConversationError;
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
 use crate::persistence::chunk_window_integrity::{first_divergent_chunk, WindowDivergence};
@@ -58,6 +62,7 @@ use crate::substrate::{
 };
 use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
+use crate::tenant_rank::TenantRank;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::TurnLayout;
@@ -286,6 +291,24 @@ pub struct GalleryPreload {
 /// names slots that do not exist, or mean another member, in the other.
 type GalleryKey = (String, Vec<String>, Vec<String>);
 
+/// A substrate named without being kept alive — see
+/// [`Conversation::substrate_ref`].
+#[derive(Clone)]
+pub(crate) struct SubstrateRef(Weak<RwLock<Substrate>>);
+
+impl SubstrateRef {
+    /// Whether `conversation` is a handle on this substrate.
+    pub(crate) fn is(&self, conversation: &Conversation) -> bool {
+        ptr::eq(self.0.as_ptr(), Arc::as_ptr(&conversation.inner))
+    }
+
+    /// Whether every handle on the substrate has gone, so nothing can name it
+    /// again.
+    pub(crate) fn is_gone(&self) -> bool {
+        self.0.strong_count() == 0
+    }
+}
+
 // ── Conversation ──────────────────────────────────────────────────────────────
 
 /// Workspace-shared, lock-protected handle to the per-turn record store.
@@ -309,7 +332,17 @@ type GalleryKey = (String, Vec<String>, Vec<String>);
 #[derive(Clone)]
 pub struct Conversation {
     inner: Arc<RwLock<Substrate>>,
+    /// The process's one timeline allocator ([`process_timeline_allocator`]),
+    /// so a timeline id minted on one substrate is never minted on another
+    /// attached to the same engine.
     allocator: Arc<TimelineAllocator>,
+    /// This substrate's ingest-cancel latch — see [`crate::cancel`]. Its own,
+    /// so a shutdown of one tenant's ingest leaves another's running.
+    cancel: CancelToken,
+    /// The rank of the tenant this substrate belongs to — where its sequences
+    /// stand against another tenant's on the same scheduler
+    /// ([`crate::tenant_rank`]).
+    tenant_rank: TenantRank,
     /// The mandatory persistence layer — every turn is recorded into its
     /// redo log (`docs/archived/kv_tier_migration.md` §13.6).
     persistence: Arc<PersistenceLock>,
@@ -529,7 +562,9 @@ impl Conversation {
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
         Self {
             inner,
-            allocator: Arc::new(TimelineAllocator::new()),
+            allocator: process_timeline_allocator(),
+            cancel: CancelToken::new(),
+            tenant_rank: TenantRank::FIRST,
             maintenance,
             persistence,
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
@@ -579,7 +614,9 @@ impl Conversation {
             // drop would delete the substrate rather than a temp file.
             ephemeral_dir: None,
             inner,
-            allocator: Arc::new(TimelineAllocator::new()),
+            allocator: process_timeline_allocator(),
+            cancel: CancelToken::new(),
+            tenant_rank: TenantRank::FIRST,
             maintenance,
             persistence,
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
@@ -606,6 +643,41 @@ impl Conversation {
     /// in-RAM state changes as usual and nothing is written to disk.
     pub fn is_read_only_substrate(&self) -> bool {
         self.read_only
+    }
+
+    /// This handle, cancelled through `cancel` — the token the daemon that
+    /// owns the substrate holds. Clones share it.
+    pub fn with_cancel(self, cancel: CancelToken) -> Self {
+        Self { cancel, ..self }
+    }
+
+    /// This substrate's ingest-cancel latch.
+    pub fn cancel_token(&self) -> &CancelToken {
+        &self.cancel
+    }
+
+    /// This handle, ranked as tenant `rank` on the engine it serves. Clones
+    /// share it.
+    pub fn with_tenant_rank(self, tenant_rank: TenantRank) -> Self {
+        Self {
+            tenant_rank,
+            ..self
+        }
+    }
+
+    /// The rank of the tenant this substrate belongs to.
+    pub fn tenant_rank(&self) -> TenantRank {
+        self.tenant_rank
+    }
+
+    /// Whether this substrate's owner has asked its ingest to stop.
+    pub fn ingest_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Every timeline this substrate holds.
+    pub fn timeline_ids(&self) -> Vec<TimelineId> {
+        self.inner.read().unwrap().timeline_ids()
     }
 
     /// The persistence handle for a best-effort durable write — the reload's
@@ -1714,7 +1786,7 @@ impl Conversation {
                 }];
                 let mut raw = Vec::with_capacity(queries.len());
                 for batch in queries.chunks(WARM_GPU_PROBE_BATCH) {
-                    if ingest_cancelled() {
+                    if self.ingest_cancelled() {
                         return None;
                     }
                     match arena.scan_weighted(&segments, batch, weights) {
@@ -1762,7 +1834,7 @@ impl Conversation {
                 let gallery: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
                 let mut raw = Vec::with_capacity(queries.len());
                 for query in &queries {
-                    if ingest_cancelled() {
+                    if self.ingest_cancelled() {
                         return None;
                     }
                     raw.push(score_slots_fused(
@@ -1955,7 +2027,7 @@ impl Conversation {
     ) -> usize {
         for &tl in timelines {
             // A shutdown ends the warm-up here too, not one timeline at a time.
-            if ingest_cancelled() {
+            if self.ingest_cancelled() {
                 break;
             }
             self.warm_timeline(group, tl, arena);
@@ -2007,7 +2079,7 @@ impl Conversation {
             .filter(|(_, sig)| !sig.is_empty())
             .map(|(source, sig)| (*source, sig.as_slice()))
             .collect();
-        if probes.is_empty() || ingest_cancelled() {
+        if probes.is_empty() || self.ingest_cancelled() {
             return;
         }
         let probe_refs: Vec<&[WideQSig]> = probes.iter().map(|(_, p)| *p).collect();
@@ -3024,14 +3096,15 @@ impl Conversation {
         n_layers: usize,
     ) -> candle::Result<Option<crate::persistence::resume::TurnChunkGrid>> {
         use crate::persistence::resume::{recover_turn_grid, recovered_turn_decls};
-        let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
         let mut p = self.persistence.lock().unwrap();
         // We need the turn's `StreamDecl` to drive `recover_turn_grid`.
         // Walk the substrate's persisted decls and pick the one matching
         // this (timeline, index). The decl set is small and rebuilt once
-        // at restart, so a linear scan is fine.
-        let substrate_read = self.read();
-        let decls = recovered_turn_decls(&substrate_read);
+        // at restart, so a linear scan is fine. One read guard serves both:
+        // a second read of the same lock while this one is held waits behind
+        // any queued writer, which is waiting for this guard.
+        let substrate = self.read();
+        let decls = recovered_turn_decls(&substrate);
         let decl = match decls
             .into_iter()
             .find(|d| d.timeline_id == timeline.raw() && d.turn_index == index.0)
@@ -3039,13 +3112,11 @@ impl Conversation {
             Some(d) => d,
             None => return Ok(None),
         };
-        let substrate = self.read();
         let grid = recover_turn_grid(&mut p, &substrate, &decl, n_layers)
             .map_err(|e| candle::Error::Msg(format!("recover_turn_chunks: {e}")))?;
         if grid.is_empty() {
             return Ok(None);
         }
-        let _ = stream_id; // (computed for diagnostics if needed later)
         Ok(Some(grid))
     }
 
@@ -3780,6 +3851,13 @@ impl Conversation {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    /// A handle that names this substrate without keeping it alive — what a
+    /// record of a substrate that has gone away holds, so the record costs no
+    /// memory and is never mistaken for a substrate allocated later.
+    pub(crate) fn substrate_ref(&self) -> SubstrateRef {
+        SubstrateRef(Arc::downgrade(&self.inner))
+    }
+
     /// Set the substrate-side resume key (`debug_id`) for `timeline`
     /// and persist a `RecordType::DebugId` record to the redo log.
     /// Last-write-wins on replay.  Idempotent: if the substrate
@@ -4432,6 +4510,19 @@ impl Conversation {
         self.writer.shutdown();
     }
 
+    /// Give the substrate directory up to the next writer
+    /// ([`SubstratePersistence::release_writer`]): commit, refuse every write
+    /// from here on, and drop the directory's lock while this conversation is
+    /// still alive. The last step of an engine's shutdown, after
+    /// [`Self::flush_writer`].
+    pub fn release_writer(&self) -> candle::Result<()> {
+        self.persistence
+            .lock()
+            .unwrap()
+            .release_writer()
+            .map_err(|e| candle::Error::Msg(format!("persist release: {e}")))
+    }
+
     /// Like [`Self::commit_persistence`] but a no-op when nothing is
     /// staged. Returns `Ok(true)` when an `fsync` actually happened.
     /// Used by the daemon's 5-second flush task so a quiescent
@@ -4476,7 +4567,7 @@ impl Conversation {
     }
 
     /// Force one maintenance op **now**, waiving the age/ratio gates — the manual
-    /// `POST /v1/debug/maintenance` trigger. Seals the active segment first, so a
+    /// `POST /v1/substrate/zend/maintenance` trigger. Seals the active segment first, so a
     /// conversation just archived/distilled this session (whose now-dead records
     /// sit in the active, which maintenance never touches) moves into a sealed
     /// segment and gets compacted away. Uses the same phased locking, so it never
@@ -4525,7 +4616,7 @@ impl Conversation {
         //    plan is known to the relocation below.
         //
         //    One op at a time: an op releases this lock between its batches, so
-        //    a second pass — the forced `POST /v1/debug/maintenance` beside the
+        //    a second pass — the forced `POST /v1/substrate/zend/maintenance` beside the
         //    background thread's — can arrive mid-op. It plans nothing and
         //    leaves the status alone: the op in flight owns `running`.
         let t_plan = Instant::now();
@@ -4680,21 +4771,6 @@ impl Conversation {
         let p = self.persistence.lock().unwrap();
         f(p.manifest())
     }
-
-    /// Run `f` with a read view of the in-memory substrate and exclusive access to
-    /// the live persistence layer — for offline-style scans (e.g. the noise
-    /// calibration) that read sealed stream chunks/tokens back from the log.
-    /// Locks `inner` (read) then `persistence`, matching the write path's order.
-    /// Callers should `checkpoint_persistence` first so the records being read are
-    /// durable on disk at their recorded offsets.
-    pub fn with_substrate_and_persistence<R>(
-        &self,
-        f: impl FnOnce(&Substrate, &mut SubstratePersistence) -> R,
-    ) -> R {
-        let substrate = self.inner.read().unwrap();
-        let mut persistence = self.persistence.lock().unwrap();
-        f(&substrate, &mut persistence)
-    }
 }
 
 // ── TargetedRead ──────────────────────────────────────────────────────────────
@@ -4763,6 +4839,14 @@ impl<'a> std::ops::Deref for TargetedRead<'a> {
 }
 
 impl<'a> ContentResolver for TargetedRead<'a> {
+    fn any_layer_disabled(&self) -> bool {
+        self.read.any_layer_disabled()
+    }
+
+    fn layer_disabled(&self, name: &str) -> bool {
+        self.read.is_layer_disabled(name)
+    }
+
     /// Target group → only `target.timeline` (sibling conversations of the same
     /// shape stay masked, so a slot never sees another chat's history). Every
     /// other group → **all** its active conversations: `code_reading` declares

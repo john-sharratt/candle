@@ -431,6 +431,13 @@ pub struct Substrate {
     /// same survival the other resident metadata gets.
     custom_objects: HashMap<u64, CustomObjectPayload>,
 
+    /// Layers toggled out of projection assembly by name — a diagnostic kill
+    /// switch flipped live and forgotten on restart (see
+    /// [`crate::projection::layer_toggle`]). This substrate's own, so a toggle in
+    /// one tenant never reaches another tenant's layer of the same name. Never
+    /// persisted.
+    disabled_layers: HashSet<String>,
+
     /// Layers whose conversations are **append-only ingest trunks** (code_reading,
     /// repo_map) rather than interactive dialogue. A projection whose *target* is
     /// on such a layer is scored/selected **self-local**: every belief group is
@@ -1119,6 +1126,19 @@ pub trait ContentResolver {
     /// couplings has no round-trips to keep whole.
     fn group_exchanges(&self, keys: &[TurnKey]) -> Vec<Vec<TurnKey>> {
         keys.iter().map(|key| vec![*key]).collect()
+    }
+
+    /// Whether any layer is toggled out of projection assembly — the
+    /// diagnostic kill switch the substrate holds
+    /// ([`Substrate::toggle_layer`]). Default: a resolver with no substrate
+    /// behind it has nothing toggled.
+    fn any_layer_disabled(&self) -> bool {
+        false
+    }
+
+    /// Whether layer `name` is toggled out of projection assembly.
+    fn layer_disabled(&self, _name: &str) -> bool {
+        false
     }
 
     /// Token count for a turn.  Stable across projection calls.
@@ -3045,6 +3065,37 @@ impl Substrate {
         let id = allocator.next();
         self.register_timeline(id, layer, group);
         id
+    }
+
+    /// Every timeline this substrate holds, in no particular order.
+    pub fn timeline_ids(&self) -> Vec<TimelineId> {
+        self.timelines.keys().copied().collect()
+    }
+
+    /// Flip the diagnostic toggle on layer `name`; returns the new state
+    /// (`true` = now excluded from projection assembly).
+    pub fn toggle_layer(&mut self, name: &str) -> bool {
+        if self.disabled_layers.remove(name) {
+            false
+        } else {
+            self.disabled_layers.insert(name.to_string());
+            true
+        }
+    }
+
+    /// Whether layer `name` is toggled out of projection assembly.
+    pub fn is_layer_disabled(&self, name: &str) -> bool {
+        !self.disabled_layers.is_empty() && self.disabled_layers.contains(name)
+    }
+
+    /// Whether any layer is toggled out — the check a per-layer walk hoists.
+    pub fn any_layer_disabled(&self) -> bool {
+        !self.disabled_layers.is_empty()
+    }
+
+    /// Every layer currently toggled out.
+    pub fn disabled_layers(&self) -> HashSet<String> {
+        self.disabled_layers.clone()
     }
 
     pub fn timeline_target(&self, timeline: TimelineId) -> Option<(LayerId, GroupId)> {
@@ -5009,7 +5060,7 @@ impl Substrate {
     /// in-RAM state.  The dispatch lives here (not on `Manifest`)
     /// because per-entity records — chunks, stream decls, labels,
     /// tree metadata, debug ids — are substrate state, not manifest
-    /// state.  The manifest only sees singletons (`ModelSpec`,
+    /// state.  The manifest only sees singletons (`ModelKey`,
     /// `Template`, `Tokenizer`, `ToolSummary`).
     ///
     /// Called from `SubstratePersistence::recover_with_substrate_sink`
@@ -5155,7 +5206,7 @@ impl Substrate {
             }
             // Singletons go to the manifest, not the substrate; the
             // header-index chain is consumed by recovery, never here.
-            RecordType::ModelSpec
+            RecordType::ModelKey
             | RecordType::Template
             | RecordType::Tokenizer
             | RecordType::HeaderIndex
@@ -6751,6 +6802,14 @@ impl ContentResolver for Substrate {
             .collect()
     }
 
+    fn any_layer_disabled(&self) -> bool {
+        Substrate::any_layer_disabled(self)
+    }
+
+    fn layer_disabled(&self, name: &str) -> bool {
+        self.is_layer_disabled(name)
+    }
+
     fn turn_token_count(&self, turn: TurnKey) -> usize {
         self.turn(turn.timeline, turn.index)
             .map_or(0, |e| e.content.token_count)
@@ -6871,6 +6930,14 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
             .collect()
     }
 
+    fn any_layer_disabled(&self) -> bool {
+        self.substrate.any_layer_disabled()
+    }
+
+    fn layer_disabled(&self, name: &str) -> bool {
+        self.substrate.is_layer_disabled(name)
+    }
+
     fn turn_token_count(&self, turn: TurnKey) -> usize {
         self.substrate
             .turn(turn.timeline, turn.index)
@@ -6985,6 +7052,14 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
                     .map(move |i| TurnKey::new(tl, TurnIndex(i)))
             })
             .collect()
+    }
+
+    fn any_layer_disabled(&self) -> bool {
+        self.guard.any_layer_disabled()
+    }
+
+    fn layer_disabled(&self, name: &str) -> bool {
+        self.guard.is_layer_disabled(name)
     }
 
     fn turn_token_count(&self, turn: TurnKey) -> usize {

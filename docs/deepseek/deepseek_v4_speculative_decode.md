@@ -7,8 +7,7 @@ them in one main-model forward, and commit the prefix that converges. Turns our 
 decode floor into ~2.4+ tokens per forward with no change to the output distribution.
 
 **The entire drafter is implemented and GPU-validated on the real 10.9 GB weights**
-(`latent_moe/dspark.rs`, `latent_moe/attention.rs`, `latent_moe/transformer.rs`,
-`zend/src/download.rs`): automatic drafter+model download (`zend --download-deepseek`); the
+(`latent_moe/dspark.rs`, `latent_moe/attention.rs`, `latent_moe/transformer.rs`): the
 `dflash` config; the complete loader (every tensor); the context encoder `encode_context`
 (Eq. 2); the bit-exact Markov bias + confidence math (Eqs. 5, 7); the **backbone**
 (`Attention::forward_injected` — non-causal latent MLA with `Hctx` injected via `wkv`;
@@ -364,15 +363,11 @@ Phasing:
 ## 5. Acquisition + loading the DSpark drafter — **IMPLEMENTED**
 
 The drafter is a **separate GGUF** (`dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf`, 10.9 GB, at
-the root of `bartowski/DeepSeek-V4-Flash-0731-GGUF`), not part of the main quant. Both the
-acquisition and the load are done and tested:
+the root of `bartowski/DeepSeek-V4-Flash-0731-GGUF`), not part of the main quant. It is
+placed by hand beside the main quant (`D:\models\deepseek-v4-flash-mxfp4\` on the dev
+machines, where the gated tests look): no daemon runs DeepSeek, so the hosts' model download
+(`host::download`) fetches only the prescribed model. The load is done and tested:
 
-- **Automatic download** (`zend/src/download.rs`, `zend --download-deepseek [--model-dir DIR]`).
-  `ensure_deepseek` resolves the 4 main MXFP4 splits (mapping the repo's
-  `DeepSeek-V4-Flash-0731-MXFP4/` subfolder → flat local names) **and** the DSpark drafter,
-  downloading only what's missing (an existing main-model install pulls just the drafter). Same
-  automatic HF path as the model download — no manual `curl`. Pure URL/path logic is unit-tested
-  against the verified resolve endpoints.
 - **Config + loader** (`latent_moe/dspark.rs`). `DsparkConfig::from_gguf` parses the `dflash.*`
   metadata through the existing `config_from_gguf` (arch = `dflash` ⇒ `n_layers` =
   `dflash.block_count` = 3) plus `block_size` and `target_layers`. `DsparkDrafter::load` loads
@@ -453,8 +448,7 @@ pieces, not tolerances.
 
 ## 8. Phasing
 
-1. **Phase 1 — acquisition + loader + math. ✅ DONE.** Automatic download
-   (`zend --download-deepseek`), `dflash` config + `DsparkDrafter::load`, and the bit-exact
+1. **Phase 1 — loader + math. ✅ DONE.** `dflash` config + `DsparkDrafter::load`, and the bit-exact
    Markov/confidence math with gate test 1 (§5, §6.1). Nothing wired into decode yet.
 2. **Phase 2 — verify path.** Fourth `verify` row-group reusing the prefill kernel, hidden
    readout (incl. the `target_layers` capture for `Hctx`), batched logits over `d+1` rows;

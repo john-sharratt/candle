@@ -16,19 +16,25 @@ use std::collections::BTreeMap;
 
 use candle_conversation::projection::{Builder, GroupId, TimelineId};
 use candle_conversation::ConversationEngine;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
-/// How much of one layer a character can read.
+/// How much of one layer a character can read. Counts are `*_count`, the one
+/// meaning every substrate view gives the name (`docs/shared_model_host.md`
+/// §3.5): a bare `conversations` or `turns` is the list itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LayerCount {
     pub layer: String,
-    pub conversations: usize,
-    pub turns: u64,
+    pub conversation_count: usize,
+    pub turn_count: u64,
 }
 
 /// One conversation in a layer, as the console shows it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Held {
+    /// The timeline id, as a decimal **string**: a u64 does not survive a
+    /// JavaScript number, which rounds it past 2^53 to an id that is not this
+    /// conversation's.
+    #[serde(serialize_with = "decimal")]
     pub timeline: u64,
     /// The name it was written under — a day's conversation, a dream, an
     /// ingested file. `None` for one that was never named.
@@ -36,6 +42,13 @@ pub struct Held {
     /// What it was written with: a dream's assumption, an ingest's hash.
     pub metadata: BTreeMap<String, String>,
     pub turns: Vec<HeldTurn>,
+    /// `turns.len()`, beside the list as every substrate view carries it.
+    pub turn_count: usize,
+}
+
+/// A u64 as its decimal string.
+fn decimal<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&v.to_string())
 }
 
 /// One turn, both halves, verbatim as stored.
@@ -135,8 +148,8 @@ pub fn counts(
                 readable_in(engine, builder, live_group, npc_id, &l.name).unwrap_or_default();
             LayerCount {
                 layer: l.name.clone(),
-                conversations: held.len(),
-                turns: held.iter().map(|&tl| engine.timeline_turn_count(tl)).sum(),
+                conversation_count: held.len(),
+                turn_count: held.iter().map(|&tl| engine.timeline_turn_count(tl)).sum(),
             }
         })
         .collect()
@@ -157,15 +170,19 @@ pub fn page(
     let conversations = held
         .into_iter()
         .take(limit)
-        .map(|tl| Held {
-            timeline: tl.raw(),
-            name: engine.conversation_conv_id(tl),
-            metadata: engine.conversation_metadata(tl).unwrap_or_default(),
-            turns: engine
+        .map(|tl| {
+            let turns: Vec<HeldTurn> = engine
                 .conversation_texts(tl)
                 .into_iter()
                 .map(|(user, assistant)| HeldTurn { user, assistant })
-                .collect(),
+                .collect();
+            Held {
+                timeline: tl.raw(),
+                name: engine.conversation_conv_id(tl),
+                metadata: engine.conversation_metadata(tl).unwrap_or_default(),
+                turn_count: turns.len(),
+                turns,
+            }
         })
         .collect();
     Some(Page {

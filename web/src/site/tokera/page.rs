@@ -162,11 +162,9 @@ pub const LINKS: [(&str, &str, Nav); 3] = [
 /// mark, leaving a red triskelion on a red square.
 ///
 /// **This list exists twice** — here, and in `content/common/lib/estate.js` for
-/// every page that renders the menu in JavaScript. zend has a whole copy of
-/// `content/common` under `zend/web/common/`, because it embeds its assets with
-/// `include_dir!` and cannot reach this crate's content directory; that copy is
-/// pinned wholesale by [`tests::zend_carries_the_shared_framework_unchanged`].
-/// Two copies of one list is exactly the thing that drifts, so
+/// every page that renders the menu in JavaScript: zend's and npcd's, which the
+/// host serves `content/common` to at `/common/` (`host::ui`). Two copies of
+/// one list is exactly the thing that drifts, so
 /// [`tests::the_estate_list_matches_the_shared_module`] compares this against
 /// the JavaScript rather than trusting them to stay level.
 pub const ESTATE: [(&str, &str, &str, &str); 4] = [
@@ -731,14 +729,13 @@ mod tests {
         );
     }
 
-    /// The estate list exists three times and must say the same thing in all
-    /// three.
+    /// The estate list exists twice and must say the same thing in both.
     ///
-    /// Rust renders it here, `content/common/lib/estate.js` renders it for the
-    /// npcd console, and `zend/web/common/lib/estate.js` is a copy because zend embeds
-    /// its own assets. Nothing forces them to agree, and a switcher that offers
-    /// a different set of sites depending on which site you opened it from is
-    /// worse than no switcher — so the copies are compared rather than trusted.
+    /// Rust renders it here, and `content/common/lib/estate.js` renders it for
+    /// zend's UI and the npcd console. Nothing forces them to agree, and a
+    /// switcher that offers a different set of sites depending on which site
+    /// you opened it from is worse than no switcher — so the two are compared
+    /// rather than trusted.
     #[test]
     fn the_estate_list_matches_the_shared_module() {
         let shared = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -811,74 +808,9 @@ mod tests {
         }
     }
 
-    /// zend carries the whole shared framework, byte for byte.
-    ///
-    /// It is a copy because zend embeds `zend/web` with `include_dir!` and
-    /// cannot reach this crate's content directory — a deployment fact rather
-    /// than a choice. What is left is to make divergence impossible to land, so
-    /// this compares the *directory* rather than a hand-written list of files:
-    /// a list is one more thing to remember, and the failure it misses is a new
-    /// module that zend silently does not have.
-    ///
-    /// `/brand` sits at zend's web root rather than under `common/`, because
-    /// the switcher addresses icons as `/brand/<id>` on every host and that
-    /// path has to resolve the same way here.
-    /// Bytes with `\r\n` collapsed to `\n`, so a comparison sees content rather
-    /// than the line endings a checkout happened to produce.
-    fn nolf(bytes: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(bytes.len());
-        for &b in bytes {
-            if b != b'\r' {
-                out.push(b);
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn zend_carries_the_shared_framework_unchanged() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let shared = root.join("content").join("common");
-        let zend_web = root.join("..").join("zend").join("web");
-
-        let mut checked = 0;
-        for entry in walk(&shared) {
-            let rel = entry.strip_prefix(&shared).expect("under the shared root");
-            // `brand/` is the one part that lives at zend's root instead.
-            let mine = match rel.starts_with("brand") {
-                true => zend_web.join(rel),
-                false => zend_web.join("common").join(rel),
-            };
-            let a = std::fs::read(&entry).unwrap();
-            let b = std::fs::read(&mine).unwrap_or_else(|e| {
-                panic!(
-                    "zend is missing {} ({e}) — copy `web/content/common` into `zend/web/common`",
-                    rel.display()
-                )
-            });
-            // Compared with line endings normalised, because a `\r\n` here is
-            // not drift — it is `core.autocrlf`. Git stores these files with
-            // LF and checks them out with CRLF on Windows, so whether two
-            // copies agree byte-for-byte in the working tree depends on the
-            // developer's git config and on whether each file happens to be
-            // tracked yet. That is a property of the checkout, not of the code,
-            // and it made this test fail for a reason it does not exist to
-            // catch. Any real difference in content still fails.
-            assert_eq!(
-                nolf(&a),
-                nolf(&b),
-                "zend's copy of {} has drifted",
-                rel.display()
-            );
-            checked += 1;
-        }
-        assert!(
-            checked > 8,
-            "only {checked} files compared — walk is broken"
-        );
-    }
-
-    /// Every asset zend's pages ask for exists in the directory it embeds.
+    /// Every asset zend's pages ask for exists where the host serves it from:
+    /// `zend/web/`, or the shared front-end (`content/common/`) for a path
+    /// under `common/`.
     ///
     /// zend cannot be compiled on every machine that touches this repo — it
     /// pulls in `candle-kernels`, which needs a CUDA toolchain — so its pages
@@ -887,6 +819,7 @@ mod tests {
     /// nothing says why. This is the cheapest thing that catches it.
     #[test]
     fn zends_pages_only_reference_files_it_ships() {
+        let content = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("content");
         let web = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("zend")
@@ -907,10 +840,15 @@ mod tests {
                     {
                         continue;
                     }
-                    let target = web.join(reference.trim_start_matches("./"));
+                    let rel = reference.trim_start_matches("./");
+                    let target = match rel.strip_prefix("common/") {
+                        Some(shared) => content.join("common").join(shared),
+                        None => web.join(rel),
+                    };
                     assert!(
                         target.is_file(),
-                        "{name} references `{reference}`, which is not in zend/web"
+                        "{name} references `{reference}`, which neither zend/web nor the \
+                         shared front-end has"
                     );
                 }
                 pages += 1;

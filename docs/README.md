@@ -106,6 +106,8 @@ web UI.
 |---|---|
 | [`web_gateway_design.md`](web_gateway_design.md) | **Built.** The `web` crate: one front door for the estate. Host→site→upstream routing with layered content roots, tokera.com rendered from markdown (blog and the papers, read live from this directory), OIDC sign-in whose parent-domain cookie carries one account across `code.` and `bot.`, per-upstream backoff with readable error pages, and websocket tunnelling. Read before touching anything under `web/`. |
 | [`npc_api_gui_design.md`](npc_api_gui_design.md) | The NPC engine's HTTP surface and console. §2 and §8.1 defer to the gateway doc above. |
+| [`shared_model_host.md`](shared_model_host.md) | **Built.** One host process for every daemon: the `host` crate's startup, server, shared endpoints and identity rule; zend and npcd as its tenants on one engine core, each with its own substrate bound to the prescribed model; `tokerad`, both in one process. Read before touching `host/`, a tenant's routes, or how a daemon starts. |
+| [`deployment.md`](deployment.md) | Which machine runs what, the recorded launch lines `/up` replays, the gateway's TLS entrance, and the health checks. |
 
 ## Hardware & measured results
 

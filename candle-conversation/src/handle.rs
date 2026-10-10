@@ -1,3 +1,4 @@
+use crate::cancel::CancelToken;
 use crate::error::ConversationError;
 use crate::token_buffer::TokenBuffer;
 use crate::turn_text::TurnText;
@@ -54,9 +55,10 @@ impl TurnHandle {
     }
 
     /// Block until the turn completes, but abandon the wait if a graceful
-    /// shutdown latches [`crate::ingest_cancelled`]. Used by the ingest
-    /// decode-waits ([`crate::Sequence::ingest_scope_roundtrip_indices`]) so a
-    /// Ctrl-C mid-ingest doesn't have to wait out the in-flight summary decode.
+    /// shutdown latches `cancel` — the token of the substrate the turn belongs
+    /// to. Used by the ingest decode-waits
+    /// ([`crate::Sequence::ingest_scope_roundtrip_indices`]) so a Ctrl-C
+    /// mid-ingest doesn't have to wait out the in-flight summary decode.
     ///
     /// On cancel this returns [`ConversationError::IngestCancelled`] WITHOUT
     /// consuming the handle; the caller drops it, and the scheduler — seeing the
@@ -65,7 +67,7 @@ impl TurnHandle {
     /// after the flag flips the wait returns; it does not busy-spin, since
     /// `recv_timeout` still delivers `Done`/`Token`/etc. events the moment they
     /// arrive.
-    pub fn wait_cancellable(&self) -> crate::Result<TurnResponse> {
+    pub fn wait_cancellable(&self, cancel: &CancelToken) -> crate::Result<TurnResponse> {
         let poll = std::time::Duration::from_millis(100);
         loop {
             match self.rx.recv_timeout(poll) {
@@ -75,7 +77,7 @@ impl TurnHandle {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if crate::ingest_cancelled() {
+                    if cancel.is_cancelled() {
                         return Err(ConversationError::IngestCancelled);
                     }
                 }
@@ -111,8 +113,8 @@ impl TurnHandle {
     /// the handle and is aborted drops it, the scheduler sees the closed
     /// channel, and decode stops at its next step (see the type-level docs).
     /// Dropping only this future while the handle lives abandons nothing —
-    /// exactly as returning early from a blocking `wait` would not. The
-    /// process-wide ingest shutdown latch is a different cancellation, and
+    /// exactly as returning early from a blocking `wait` would not. A
+    /// substrate's ingest shutdown latch is a different cancellation, and
     /// [`Self::wait_cancellable_async`] is the wait that honours it.
     pub async fn wait_async(&self) -> crate::Result<TurnResponse> {
         loop {
@@ -147,19 +149,22 @@ impl TurnHandle {
 
     /// [`Self::wait_cancellable`]'s async counterpart: await the turn, but
     /// resolve with [`ConversationError::IngestCancelled`] the moment a
-    /// graceful shutdown latches [`crate::ingest_cancelled`] — woken by the
-    /// latch itself rather than found on a poll cadence, because the executors
-    /// that drive the ingest waits (`futures::executor::block_on` on a loader
-    /// or worker thread) have no timer to poll it on.
+    /// graceful shutdown latches `cancel` — woken by the latch itself rather
+    /// than found on a poll cadence, because the executors that drive the
+    /// ingest waits (`futures::executor::block_on` on a loader or worker
+    /// thread) have no timer to poll it on.
     ///
     /// On cancel the handle is NOT consumed; the caller drops it, and the
     /// scheduler — seeing the closed channel — stops decode at its next step.
-    pub async fn wait_cancellable_async(&self) -> crate::Result<TurnResponse> {
+    pub async fn wait_cancellable_async(
+        &self,
+        cancel: &CancelToken,
+    ) -> crate::Result<TurnResponse> {
         use std::future::Future;
         use std::task::Poll;
         loop {
             let mut recv = std::pin::pin!(self.rx.recv_async());
-            let mut cancel = std::pin::pin!(crate::cancel::ingest_cancel_wait());
+            let mut cancel = std::pin::pin!(cancel.wait());
             // The event wins a tie: a decode that finished as the shutdown
             // arrived is a real response, and taking it leaves nothing in
             // flight to unwind.

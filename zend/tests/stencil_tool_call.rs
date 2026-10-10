@@ -1498,7 +1498,10 @@ fn a_repo_enum_then_a_path_drives_the_live_grammar() {
         r#"{"name": "file_list", "arguments": {"repo": "battle-cities", "path": "crates"}}"#,
         r#"{"name": "file_list", "arguments": {"repo": "battle-cities"}}"#,
         r#"{"name": "file_list", "arguments": {"repo": "mind", "path": "personalities", "page": 1}}"#,
-        r#"{"name": "file_list", "arguments": {"repo": "*"}}"#,
+        // `*` as the last argument: the model writes its closing quote and the
+        // object's braces as one token. `file_list` names one repository, so
+        // the all-repositories value is a search's.
+        r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "*"}}"#,
         r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "*"}}"#,
         r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "candle", "prefix": "zend/"}}"#,
         r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "battle-cities"}}"#,
@@ -1536,7 +1539,7 @@ fn natural_calls_drive_the_live_grammar() {
     let (tree, tok) = live_tree();
     let calls = [
         r#"{"name": "file_list", "arguments": {"repo": "candle", "path": ""}}"#,
-        r#"{"name": "file_list", "arguments": {"repo": "*"}}"#,
+        r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "*"}}"#,
         r#"{"name": "file_list", "arguments": {"repo": "candle", "path": "zend/src"}}"#,
         r#"{"name": "file_read", "arguments": {"repo": "candle", "path": "src/main.rs", "page": 0}}"#,
         r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "*", "prefix": "zend/"}}"#,

@@ -23,6 +23,7 @@ use axum::Router;
 use npcd::accounts::Accounts;
 use npcd::api::Authored;
 use npcd::collections::Libraries;
+use npcd::engine::api;
 use npcd::engine::runtime::Runtime;
 use npcd::images::Images;
 use npcd::mind::Mind;
@@ -109,7 +110,7 @@ impl Rig {
             Default::default(),
         )
         .with_runtime(rt.clone());
-        let app = npcd::engine::api(state.clone()).into_router(state);
+        let app = api(state.roles.clone()).into_routes(state).router;
         Self { app, rt, wire, nid }
     }
 

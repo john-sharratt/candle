@@ -89,7 +89,7 @@ pub fn survival(rt: RecordType) -> Survival {
         // never in RAM here, located through `VfsIndex`.
         RecordType::VfsEvent => Survival::Relocated,
         // Workspace singletons, located through the manifest.
-        RecordType::ModelSpec | RecordType::Template | RecordType::Tokenizer => Survival::Relocated,
+        RecordType::ModelKey | RecordType::Template | RecordType::Tokenizer => Survival::Relocated,
 
         // ── Re-encoded from substrate RAM ───────────────────────────────────
         // Per-stream metadata.
@@ -141,7 +141,7 @@ pub fn survival(rt: RecordType) -> Survival {
 /// Kept as an explicit list rather than derived from a range so that a tag gap
 /// (tag 8 is retired) does not silently become a hole in the tests below.
 pub const WRITTEN_RECORD_TYPES: &[RecordType] = &[
-    RecordType::ModelSpec,
+    RecordType::ModelKey,
     RecordType::Template,
     RecordType::StreamDecl,
     RecordType::Chunk,
@@ -249,7 +249,7 @@ impl RecordCensus {
 /// `Debug` ever changes and greppable without matching Rust identifiers.
 pub fn type_label(rt: RecordType) -> &'static str {
     match rt {
-        RecordType::ModelSpec => "model_spec",
+        RecordType::ModelKey => "model_key",
         RecordType::Template => "template",
         RecordType::StreamDecl => "stream_decl",
         RecordType::Chunk => "chunk",

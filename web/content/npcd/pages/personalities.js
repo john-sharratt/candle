@@ -25,8 +25,8 @@
  * the mind disagree about what exists. */
 
 import { API } from '../lib/api.js';
-import { h, mount } from '../lib/dom.js';
-import { go } from '../lib/router.js';
+import { h, mount } from '/common/lib/dom.js';
+import { go } from '/common/lib/router.js';
 import { onReveal, revealing } from '../lib/reveal.js';
 import { empty, confirmDialog, toast, mayEdit, ro, roChip, only, roNote } from '../lib/ui.js';
 

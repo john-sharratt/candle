@@ -67,8 +67,8 @@ pub struct ChunkLoc {
 /// to reconstruct" pattern.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Manifest {
-    /// Latest `ModelSpec` record.
-    pub model_spec: Option<RecordLoc>,
+    /// Latest `ModelKey` record.
+    pub model_key: Option<RecordLoc>,
     /// Latest `Template` record.
     pub template: Option<RecordLoc>,
     /// Latest `Tokenizer` record.
@@ -207,7 +207,7 @@ impl Manifest {
             record_size: size,
         };
         match h.record_type {
-            RecordType::ModelSpec => self.model_spec = Some(loc),
+            RecordType::ModelKey => self.model_key = Some(loc),
             RecordType::Template => self.template = Some(loc),
             RecordType::Tokenizer => self.tokenizer = Some(loc),
             // Per-entity records flow to the substrate via the walker
@@ -370,7 +370,7 @@ mod tests {
             debug_name: "sec".to_string(),
         });
         let mut blob = Vec::new();
-        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"model-v1"));
+        blob.extend_from_slice(&record(RecordType::ModelKey, 0, 0, b"model-v1"));
         blob.extend_from_slice(&record(RecordType::StreamDecl, 7, 0, &decl.encode()));
         blob.extend_from_slice(&record(RecordType::Chunk, 7, 0, b"chunk0"));
         blob.extend_from_slice(&record(RecordType::Chunk, 7, 1, b"chunk1"));
@@ -380,7 +380,7 @@ mod tests {
         let (manifest, substrate, outcome) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
         assert!(!outcome.torn);
-        assert!(manifest.model_spec.is_some());
+        assert!(manifest.model_key.is_some());
         let s = substrate.stream_of(StreamId(7)).unwrap();
         assert_eq!(s.chunks.len(), 2);
         assert_eq!(s.committed_through, Some(1));
@@ -405,12 +405,12 @@ mod tests {
     #[test]
     fn latest_singleton_wins() {
         let mut blob = Vec::new();
-        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"v1"));
-        blob.extend_from_slice(&record(RecordType::ModelSpec, 0, 0, b"v2-newer"));
+        blob.extend_from_slice(&record(RecordType::ModelKey, 0, 0, b"v1"));
+        blob.extend_from_slice(&record(RecordType::ModelKey, 0, 0, b"v2-newer"));
         let mut mem = MemLog::with_records(&blob);
         let (manifest, _) = Manifest::build_from_walk(&mut mem, SUPERBLOCK_SIZE).unwrap();
         assert_eq!(
-            manifest.model_spec.unwrap().payload_len,
+            manifest.model_key.unwrap().payload_len,
             "v2-newer".len() as u64
         );
     }

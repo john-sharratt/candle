@@ -59,6 +59,7 @@ pub mod conversation_log;
 mod decode_health;
 pub mod decoded_text;
 mod engine;
+mod engine_attachments;
 mod error;
 /// The KV-fragmentation probe: the specification for the compaction pass, and the gate
 /// that keeps it honest. Reachable from both the integration tests and the
@@ -88,6 +89,7 @@ pub mod profile {
         pipeline_snapshot_and_reset, set_gpu_span_period, ProfileSnapshot,
     };
 }
+pub mod engine_slot;
 pub mod prompts;
 pub mod provenance;
 mod recorded_reply;
@@ -104,6 +106,7 @@ pub mod stencil;
 pub mod store;
 pub mod substrate;
 pub mod summary_tree;
+pub mod tenant_rank;
 pub mod think_strip;
 mod time_source;
 pub mod token_bias;
@@ -115,7 +118,7 @@ pub mod turn_layout;
 pub mod turn_text;
 pub mod working_set;
 
-pub use cancel::{ingest_cancelled, request_ingest_cancel, reset_ingest_cancel};
+pub use cancel::{CancelToken, CancelWait};
 pub use config::{
     pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, ModeSampling, SamplingConfig,
     SchedulerConfig, SequenceConfig,
@@ -124,7 +127,8 @@ pub use conversation::{
     ChainRound, GlueMarkers, PieceKind, PromptDump, PromptPiece, SectionRef, SectionState,
     Sequence, UnsealedAsker,
 };
-pub use engine::{ConversationEngine, SubstrateReloadStatus, ThinkSteering};
+pub use engine::{ConversationEngine, EngineAttacher, SubstrateReloadStatus, ThinkSteering};
+pub use engine_slot::{Capabilities, EngineSlot, EngineSource, EngineTicket};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use ingest_warmer::IngestWarmer;
@@ -143,6 +147,7 @@ pub use scheduler::SettleReport;
 pub use sealed_turn::{SealedPages, SealedTurn};
 pub use sequence_handle::SequenceId;
 pub use stats::{FinishReason, TurnStats};
+pub use tenant_rank::TenantRank;
 pub use token_buffer::TokenBuffer;
 pub use tree::TokenizedText;
 pub use turn::{Role, Turn, TurnId, TurnOptions};

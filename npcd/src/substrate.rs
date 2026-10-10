@@ -1,14 +1,10 @@
-//! `GET /v1/substrate/storage` — the redo log on disk.
+//! The redo log on disk — npcd's line in the host's `GET /v1/substrate`.
 //!
-//! The counterpart of the `Storage` block in `zend/src/api/substrate.rs`, and
-//! the one part of the substrate view this daemon can answer truthfully today:
-//! a segmented append-only log is a directory of files, and a directory of
-//! files can be read without opening the substrate that wrote them.
-//!
-//! Everything else on that page — layer occupancy, the summary forest, what a
-//! projection selected — lives inside `candle-conversation`, which means
-//! `candle`, CUDA and a twenty-minute build. Those stay behind the engine. This
-//! does not, because it is genuinely just `readdir` plus `len()`.
+//! The counterpart of the `Storage` block in `zend/src/api/substrate.rs`: a
+//! segmented append-only log is a directory of files, and a directory of files
+//! can be read without opening the substrate that wrote them. The live-chunk
+//! count and the reclaimable fraction live in the substrate's in-memory index,
+//! and [`crate::reports`] fills them in once the engine holds it open.
 //!
 //! # Absent is a normal answer
 //!
@@ -65,6 +61,7 @@ pub struct Storage {
 }
 
 /// Where the substrate lives, resolved once from the daemon's data directory.
+#[derive(Debug, Clone)]
 pub struct SubstrateDir(PathBuf);
 
 impl SubstrateDir {

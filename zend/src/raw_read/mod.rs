@@ -174,7 +174,7 @@ fn ingest_raw_into_sink<S: InsertTurnSink>(
     let mut state = RawState::default();
     for (i, (rel, content)) in files.iter().enumerate() {
         // Cooperative shutdown: stop before the next file so the engine can drain.
-        if candle_conversation::ingest_cancelled() {
+        if crate::ingest_cancel::cancelled() {
             break;
         }
         let turns = records_to_turns(parse_chatml_records(content));

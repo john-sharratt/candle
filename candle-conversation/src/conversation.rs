@@ -1981,7 +1981,7 @@ impl Sequence {
                 match rx.recv_timeout(poll) {
                     Ok(_) | Err(flume::RecvTimeoutError::Disconnected) => break,
                     Err(flume::RecvTimeoutError::Timeout) => {
-                        if crate::ingest_cancelled() {
+                        if self.substrate.ingest_cancelled() {
                             return;
                         }
                     }
@@ -3205,7 +3205,7 @@ impl Sequence {
             triggers,
             closing,
         )?;
-        let response = handle.wait_cancellable();
+        let response = handle.wait_cancellable(self.substrate.cancel_token());
         let (indices, tokens, answer) =
             self.ingest_chain_settle(indices, prefill_tokens, handle, response)?;
         // Couple every turn except the last: each prefilled turn belongs with the
@@ -3265,7 +3265,7 @@ impl Sequence {
         // in-flight summary decode. Dropping `handle` on that early return stops
         // the scheduler's decode at its next step. The ingest caller unwinds this
         // as "cancelled", not a decode failure.
-        let response = handle.wait_cancellable();
+        let response = handle.wait_cancellable(self.substrate.cancel_token());
         let (indices, tokens, _) =
             self.ingest_chain_settle(indices, prefill_tokens, handle, response)?;
         Ok((indices, tokens))
@@ -3297,8 +3297,9 @@ impl Sequence {
         // future drops the handle (the decode winds down scheduler-side) and
         // must also clear the fork's in-flight guard, or the abandoned fork
         // rejects every later turn with `TurnInFlight`.
+        let cancel = self.substrate.cancel_token().clone();
         let armed = CancelClearsInFlight::arm(self);
-        let response = handle.wait_cancellable_async().await;
+        let response = handle.wait_cancellable_async(&cancel).await;
         let (indices, tokens, _) =
             armed
                 .disarm()
