@@ -5862,6 +5862,9 @@ impl Substrate {
             // holds no opinion about them either.
             | RecordType::VfsEvent
             | RecordType::VfsTombstone
+            // What this member has applied of other origins is the persistence
+            // layer's to keep (`persistence::replica`).
+            | RecordType::Replica
             | RecordType::Unknown => {}
         }
     }

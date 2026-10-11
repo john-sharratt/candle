@@ -125,6 +125,9 @@ pub fn survival(rt: RecordType) -> Survival {
         // by compaction with the tombstones it expired, by maintenance as it
         // stands.
         RecordType::Deleted => Survival::Resident,
+        // The applied and deferred sets, held by the persistence layer and
+        // rewritten whole by both paths.
+        RecordType::Replica => Survival::Resident,
 
         // ── Maintained, not compacted ───────────────────────────────────────
         // Kills file events by sequence number; located through `VfsIndex`.
@@ -170,6 +173,7 @@ pub const WRITTEN_RECORD_TYPES: &[RecordType] = &[
     RecordType::VfsEvent,
     RecordType::VfsTombstone,
     RecordType::CustomObject,
+    RecordType::Replica,
     RecordType::Deleted,
 ];
 
@@ -280,6 +284,7 @@ pub fn type_label(rt: RecordType) -> &'static str {
         RecordType::VfsTombstone => "vfs_tombstone",
         RecordType::CustomObject => "custom_object",
         RecordType::Deleted => "deleted",
+        RecordType::Replica => "replica",
         RecordType::Unknown => "unknown",
     }
 }

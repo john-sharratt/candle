@@ -847,7 +847,7 @@ impl SubstratePersistence {
         // the re-emit→looks-dead→compact churn (see `need_resident_reemit`).
         let t_resident = Instant::now();
         let resident = if self.need_resident_reemit(&op.targets(), &carried) {
-            gather_resident_set(substrate, &self.marker_ids, self.node())
+            self.resident_set(substrate)
         } else {
             Vec::new()
         };
@@ -1459,6 +1459,10 @@ impl SubstratePersistence {
         // segment names bytes that are gone.
         self.resident_locs
             .retain(|_, loc| !targets.contains(&loc.segment));
+        // And for a record found by its identity: one still located in a
+        // dropped segment was not carried forward, so this member no longer
+        // holds it.
+        self.locations.forget_segments(&targets);
         let unix = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1466,6 +1470,24 @@ impl SubstratePersistence {
         self.last_maintenance = Some((plan.op.label(), unix));
         tracing::trace!(op = ?plan.op, "substrate maintenance op applied");
         Ok(())
+    }
+
+    /// The whole resident set an op re-emits: the substrate's
+    /// ([`gather_resident_set`]) and this handle's own — the `Replica` record,
+    /// when the member has applied anything of another origin or deferred
+    /// anything.
+    fn resident_set(&self, substrate: &Substrate) -> Vec<Resident> {
+        let mut out = gather_resident_set(substrate, &self.marker_ids, self.node());
+        if !self.replica.is_empty() {
+            out.push(Resident {
+                rt: RecordType::Replica,
+                stream_id: 0,
+                chunk_index: 0,
+                payload: self.replica.encode(),
+                id: RecordIdentity::NONE,
+            });
+        }
+        out
     }
 
     /// Test/forced-op convenience: run all phases inline for a specific op under
@@ -1481,7 +1503,7 @@ impl SubstratePersistence {
         }
         let carried = self.liveness_and_carry(substrate).1;
         let resident = if self.need_resident_reemit(&op.targets(), &carried) {
-            gather_resident_set(substrate, &self.marker_ids, self.node())
+            self.resident_set(substrate)
         } else {
             Vec::new()
         };
@@ -1692,8 +1714,8 @@ impl SubstratePersistence {
     /// to consult — it is host-defined resident state like the cast in
     /// `npc_locs`. Gating it on `carried` (which never holds a key hash) would
     /// count its segment dead and let a drop take its only current copy. The
-    /// `Deleted` record is always carried for the same reason: it belongs to no
-    /// stream, and it is the only record of the timelines it names.
+    /// `Deleted` and `Replica` records are always carried for the same reason:
+    /// each belongs to no stream, and is the only record of what it holds.
     fn carried_metadata<'a>(
         &'a self,
         carried: &'a CarriedStreams,
@@ -1701,7 +1723,10 @@ impl SubstratePersistence {
         self.metadata_locs
             .iter()
             .filter_map(move |(&(rt, stream_id, writer), loc)| {
-                if matches!(rt, RecordType::CustomObject | RecordType::Deleted) {
+                if matches!(
+                    rt,
+                    RecordType::CustomObject | RecordType::Deleted | RecordType::Replica
+                ) {
                     return Some((rt, loc));
                 }
                 let keep_sig = *carried.get(&(stream_id, writer))?;

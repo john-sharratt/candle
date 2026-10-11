@@ -18,7 +18,8 @@
 //! `origin`, `oseq` as `u64`s; `u32` swept count, then each swept timeline as a
 //! `u64`.
 
-use super::{PersistenceError, Result};
+use super::le_reader::LeReader;
+use super::Result;
 
 /// One expired timeline tombstone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -54,7 +55,7 @@ impl DeletedPayload {
     }
 
     pub fn decode(buf: &[u8]) -> Result<DeletedPayload> {
-        let mut r = Reader { buf, at: 0 };
+        let mut r = LeReader::new(buf, "Deleted");
         let entries = r.u32()? as usize;
         let mut timelines = Vec::with_capacity(entries.min(buf.len() / 24));
         for _ in 0..entries {
@@ -69,38 +70,8 @@ impl DeletedPayload {
         for _ in 0..swept_n {
             swept.push(r.u64()?);
         }
-        if r.at != buf.len() {
-            return Err(PersistenceError::Corrupt(format!(
-                "Deleted payload has {} trailing bytes",
-                buf.len() - r.at
-            )));
-        }
+        r.finish()?;
         Ok(DeletedPayload { timelines, swept })
-    }
-}
-
-/// A little-endian cursor over a payload.
-struct Reader<'a> {
-    buf: &'a [u8],
-    at: usize,
-}
-
-impl Reader<'_> {
-    fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
-        let bytes = self
-            .buf
-            .get(self.at..self.at + N)
-            .ok_or_else(|| PersistenceError::Corrupt("Deleted payload truncated".into()))?;
-        self.at += N;
-        Ok(bytes.try_into().expect("a slice of N bytes"))
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        self.take::<4>().map(u32::from_le_bytes)
-    }
-
-    fn u64(&mut self) -> Result<u64> {
-        self.take::<8>().map(u64::from_le_bytes)
     }
 }
 

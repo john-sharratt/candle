@@ -14,6 +14,7 @@ use super::log_file::{MemLog, SUPERBLOCK_SIZE};
 use super::maintenance::gather_resident_set;
 use super::manifest::{encode_label_payload, Manifest};
 use super::record::{encode_record, RecordHeader, RecordType, TombstonePayload};
+use super::replica::ReplicaPayload;
 use super::stamped_locs::StampedLocs;
 use super::streams::{StreamDecl, TurnDecl};
 use super::tombstone_expiry::TombstoneExpiry;
@@ -117,6 +118,7 @@ fn compact(store: &Store, now_ms: u64) -> Vec<(RecordType, u64, Vec<u8>, RecordI
             now_ms,
             retention: Duration::from_secs(30 * 24 * 60 * 60),
         },
+        &ReplicaPayload::default(),
     )
     .into_iter()
     .map(|item| match item {

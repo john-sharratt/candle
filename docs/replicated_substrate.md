@@ -1535,6 +1535,10 @@ with no identity at all (every identity field zero).
     commit in which it changed. Compaction keeps the latest. On open the set is the last
     `Replica` **plus** the `(origin, oseq)` of every record the walk meets, so records
     appended after the last `Replica` are never lost from it.
+  - A member's **own** origin is not in it: its own `oseq`s so far are all applied, and
+    the walk recovers the next one. So a member that never applies another origin's
+    record writes no `Replica` at all. `Replica` is local housekeeping, never
+    replicated, and carries no identity (`persistence/replica/`).
   - A catch-up cut short by a disconnect or a restart resumes from the last `Replica`,
     never from the beginning.
   - `oseq`s a catch-up learned exist nowhere any more (§7.2) are recorded in it too.
@@ -1544,7 +1548,9 @@ with no identity at all (every identity field zero).
   by the same walk. Maintenance relocates records, so the sender reads an event it
   owes, and an answerer reads a fetched record, through this index. A location captured
   earlier would be stale. An `oseq` whose record maintenance dropped is gone, and its
-  own origin knows it.
+  own origin knows it. An origin's `oseq`s are dense, so the index is a vector per
+  origin of one word per record: the segment and the record's offset in 4 KiB blocks,
+  the record's size read from its header when it is read.
 - **A substrate written before this design** has no origins. Opening one with `--cluster`
   runs the existing full `compact()` (`persistence/mod.rs:2169-2344`) once, which
   rewrites every record with this node's origin and fresh `oseq`s. There is no mixed
@@ -1687,8 +1693,10 @@ replaying it at the next start meets records in an order no writer chose.
    holds, so the record would be appended unread and later deleted. Marking it applied
    would be worse, because no catch-up would ever fetch it again, even after this member
    is upgraded.
-   - So the record is not written and not marked applied. Its `(origin, oseq)` and tag
-     go in a **deferred** set, kept in `Replica` beside the applied set (§6.2).
+   - So the record is not written and not marked applied. Its `(origin, oseq)` and its
+     type, as its header names it, go in a **deferred** set, kept in `Replica` beside
+     the applied set (§6.2). The name, not a numeric tag: a header names its type, and
+     a build that does not know the type has no tag for it either.
    - A catch-up does not ask for a deferred `oseq`, so the record is not fetched over
      and over on a build that cannot read it.
    - When a build that knows the tag opens the substrate, it moves those entries back to

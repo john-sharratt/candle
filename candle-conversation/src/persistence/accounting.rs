@@ -159,12 +159,13 @@ impl RecordAccounting {
             // `stream_id` and is written whole every time, so the newest record
             // supersedes the last by the same rule.
             | RecordType::ConvState => (header.record_type, header.stream_id, 0),
-            // The deleted set is one record, rewritten whole by each compaction
-            // — a singleton like these.
+            // The deleted set and the applied set are one record each,
+            // rewritten whole — singletons like these.
             RecordType::ModelKey
             | RecordType::Template
             | RecordType::Tokenizer
-            | RecordType::Deleted => (header.record_type, 0, 0),
+            | RecordType::Deleted
+            | RecordType::Replica => (header.record_type, 0, 0),
             // Payload-keyed metadata records — excluded (see module doc).
             // `HeaderIndex` records are excluded too: they're derived
             // data with no supersession key, reclaimed wholesale at

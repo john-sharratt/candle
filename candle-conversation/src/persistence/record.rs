@@ -50,6 +50,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{from_value, Value};
 use sha2::{Digest, Sha256};
 
 use super::content_hash::{ContentHash, ContentHasher};
@@ -294,6 +295,13 @@ pub enum RecordType {
     /// substrate holds the live set in RAM and re-emits it on compaction, so it
     /// survives like the other resident metadata. See [`CustomObjectPayload`].
     CustomObject = 27,
+    /// What this member has applied of every other origin, and the records it
+    /// deferred because it does not decode their type
+    /// (`docs/replicated_substrate.md` §6.2, §6.5). Payload
+    /// [`super::replica::ReplicaPayload`]. Local housekeeping — written at a
+    /// commit in which it changed and carried by every rewrite, never
+    /// replicated, with no identity.
+    Replica = 28,
     /// A member's **deleted set** (`docs/replicated_substrate.md` §6.8): every
     /// timeline whose tombstone expired, shrunk to its entry, and the
     /// tombstones a complete compaction has run past. Payload
@@ -314,6 +322,13 @@ impl RecordType {
     /// fixed-width digest entries.
     pub fn tag(self) -> u8 {
         self as u8
+    }
+
+    /// The type a header names `name` — `"chunk"`, `"stream_decl"` — or
+    /// [`RecordType::Unknown`] for a name this build does not know, by the
+    /// header's own rule.
+    pub fn from_name(name: &str) -> RecordType {
+        from_value(Value::String(name.to_string())).unwrap_or(RecordType::Unknown)
     }
 
     /// Inverse of [`RecordType::tag`]. Unrecognised tags decode to
@@ -346,6 +361,7 @@ impl RecordType {
             25 => RecordType::VfsEvent,
             26 => RecordType::VfsTombstone,
             27 => RecordType::CustomObject,
+            28 => RecordType::Replica,
             31 => RecordType::Deleted,
             _ => RecordType::Unknown,
         }

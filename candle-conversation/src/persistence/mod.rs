@@ -42,6 +42,7 @@ mod held_groups;
 pub mod identity;
 pub mod inherit;
 pub mod integrity;
+mod le_reader;
 pub mod liveness_audit;
 pub mod log_file;
 pub mod maintenance;
@@ -53,6 +54,9 @@ pub mod priority_lock;
 pub mod record;
 pub mod recovery;
 pub mod relocation_watch;
+pub mod replica;
+#[cfg(test)]
+mod replica_tests;
 pub mod resume;
 pub mod sealed_reader;
 pub mod segment;
@@ -94,11 +98,13 @@ use manifest::{ChunkLoc, Manifest, RecordLoc};
 pub use model_binding::{BoundSubstrate, ModelBinding};
 pub use priority_lock::PersistenceLock;
 use record::{
-    decode_header, decode_record, encode_record_written, ChunkPayload, CustomObjectPayload,
-    DebugIdPayload, NpcPayload, RecordHeader, RecordType, SectionGeneration,
-    SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
+    decode_header, decode_record, encode_record_written, padded_record_len, ChunkPayload,
+    CustomObjectPayload, DebugIdPayload, NpcPayload, Record, RecordHeader, RecordType,
+    SectionGeneration, SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
+    HEADER_PROBE_SIZE,
 };
 use relocation_watch::RelocationWatch;
+use replica::{DeferredRecord, Located, LocationIndex, ReplicaPayload};
 use sealed_reader::SealedReader;
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
@@ -485,6 +491,18 @@ pub struct SubstratePersistence {
     /// How long a timeline tombstone is kept before a compaction may shrink it
     /// to its deleted-set entry (`--tombstone-retention`, §6.8).
     tombstone_retention: Duration,
+    /// What this member has applied of every other origin, and the records it
+    /// deferred for a type this build does not decode (§6.2, §6.5). Its own
+    /// records are covered by its own `oseq`s ([`Self::applied_through`]).
+    /// Rebuilt at open from the last `Replica` record and every record the walk
+    /// meets.
+    replica: ReplicaPayload,
+    /// The replica changed since a `Replica` record last said what it holds:
+    /// the next commit writes one.
+    replica_dirty: bool,
+    /// Where every record with an identity is, kept current through every
+    /// append, relocation and rewrite (§6.2).
+    locations: LocationIndex,
 }
 
 /// What [`SubstratePersistence::metadata_locs`] keys a record by: its type, the
@@ -498,7 +516,7 @@ pub(crate) type MetadataKey = (RecordType, u64, u64);
 /// The [`MetadataKey`] of a record with header `h`.
 fn metadata_key(h: &RecordHeader) -> MetadataKey {
     let writer = match h.record_type {
-        RecordType::CustomObject | RecordType::Deleted => 0,
+        RecordType::CustomObject | RecordType::Deleted | RecordType::Replica => 0,
         _ => h.origin,
     };
     (h.record_type, h.stream_id, writer)
@@ -522,6 +540,7 @@ fn is_tracked_metadata(rt: RecordType) -> bool {
             | RecordType::Commit
             | RecordType::CustomObject
             | RecordType::Deleted
+            | RecordType::Replica
     )
 }
 
@@ -558,6 +577,50 @@ fn record_metadata_loc(map: &mut StampedLocs<MetadataKey>, entry: &walker::WalkE
     if is_tracked_metadata(h.record_type) {
         map.offer(metadata_key(h), Some(walked_loc(entry)), h.identity());
     }
+}
+
+/// Take one walked record into the replica and the location index: every
+/// record with an identity is located, another origin's is applied, and a
+/// `Replica` record's sets join what is held. Both only grow, so the order the
+/// walk meets them in does not matter.
+fn observe_replica(
+    replica: &mut ReplicaPayload,
+    locations: &mut LocationIndex,
+    node: u64,
+    entry: &walker::WalkEntry,
+) {
+    let h = &entry.record.header;
+    let id = h.identity();
+    if !id.is_none() {
+        locations.insert(
+            id.origin,
+            id.oseq,
+            Located {
+                segment: entry.segment,
+                offset: entry.offset,
+            },
+        );
+        if id.origin != node {
+            replica.applied.insert(id.origin, id.oseq);
+        }
+    }
+    if h.record_type == RecordType::Replica {
+        if let Ok(held) = ReplicaPayload::decode(&entry.record.payload) {
+            replica.applied.merge(&held.applied);
+            replica.deferred.extend(held.deferred);
+        }
+    }
+}
+
+/// Take off the deferred set every record whose type this build decodes: it is
+/// wanted again, so the next catch-up fetches it (§6.5). Returns whether any
+/// was.
+fn release_known_deferred(replica: &mut ReplicaPayload) -> bool {
+    let before = replica.deferred.len();
+    replica
+        .deferred
+        .retain(|d| RecordType::from_name(&d.record_type) == RecordType::Unknown);
+    replica.deferred.len() != before
 }
 
 /// Offer one walked record to the NPC-location map — the greatest stamp per
@@ -808,6 +871,8 @@ impl SubstratePersistence {
         };
         let mut origination = Origination::new(node);
         let mut own_sections = OwnSections::default();
+        let mut replica = ReplicaPayload::default();
+        let mut locations = LocationIndex::default();
         let mut marker_ids = MarkerIds::new();
         let mut inherited_subs = Vec::with_capacity(inherited.len());
         for path in inherited {
@@ -830,6 +895,7 @@ impl SubstratePersistence {
             let h = &entry.record.header;
             origination.observe(&h.identity());
             own_sections.observe(node, h, &entry.record.payload);
+            observe_replica(&mut replica, &mut locations, node, entry);
             marker_ids.record(
                 h.record_type,
                 h.stream_id,
@@ -916,6 +982,9 @@ impl SubstratePersistence {
             node_source,
             marker_ids,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
+            replica_dirty: release_known_deferred(&mut replica) && !read_only,
+            replica,
+            locations,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -1233,6 +1302,7 @@ impl SubstratePersistence {
         if let Some(watch) = self.relocation_watch.as_mut() {
             watch.record(&header, payload);
         }
+        self.track_identity(&header, segment, offset);
         self.accounting.record(&header, payload, size);
         self.track_metadata_loc(&header, segment, offset, size);
         self.track_resident_loc(&header, payload, segment, offset, size);
@@ -1287,6 +1357,9 @@ impl SubstratePersistence {
         let header = &header;
         let (segment, offset) = self.segments.stage(raw);
         let size = raw.len() as u64;
+        // The copy keeps the record's identity, so it is now where the record
+        // is.
+        self.track_identity(header, segment, offset);
         // Maintenance relocates verbatim only records the accounting keys by
         // header alone — never a section tombstone, which it re-emits.
         self.accounting.record(header, &[], size);
@@ -1393,6 +1466,124 @@ impl SubstratePersistence {
             payload_len: h.payload_len,
             record_size: size,
         }
+    }
+
+    /// The runtime twin of [`observe_replica`]: a record just placed at
+    /// `(segment, offset)` is where its identity is now, and another origin's
+    /// record is applied.
+    fn track_identity(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64) {
+        let id = h.identity();
+        if id.is_none() {
+            return;
+        }
+        self.locations
+            .insert(id.origin, id.oseq, Located { segment, offset });
+        if id.origin != self.node() && self.replica.applied.insert(id.origin, id.oseq) {
+            self.replica_dirty = true;
+        }
+    }
+
+    /// Every `oseq` of `origin` up to this one is applied here or known gone —
+    /// where a catch-up of `origin` starts (§7.2). This node's own records are
+    /// all its own `oseq`s so far.
+    pub fn applied_through(&self, origin: u64) -> u64 {
+        if origin == self.node() {
+            self.minter.origination().next_oseq() - 1
+        } else {
+            self.replica.applied.through(origin)
+        }
+    }
+
+    /// Whether `(origin, oseq)` is applied here or known gone.
+    pub fn is_applied(&self, origin: u64, oseq: u64) -> bool {
+        if origin == self.node() {
+            oseq != 0 && oseq < self.minter.origination().next_oseq()
+        } else {
+            self.replica.applied.contains(origin, oseq)
+        }
+    }
+
+    /// Record `start..=end` of `origin` as gone — `oseq`s a catch-up learned
+    /// no member holds any more (§7.2). The next commit persists it.
+    pub fn mark_gone(&mut self, origin: u64, start: u64, end: u64) {
+        if origin != self.node() && self.replica.applied.insert_range(origin, start, end) {
+            self.replica_dirty = true;
+        }
+    }
+
+    /// Defer a record this build does not decode: it is neither written nor
+    /// applied, and a catch-up does not ask for it again until a build that
+    /// knows its type opens the substrate (§6.5). The next commit persists it.
+    pub fn defer(&mut self, deferred: DeferredRecord) {
+        if self.replica.deferred.insert(deferred) {
+            self.replica_dirty = true;
+        }
+    }
+
+    /// Whether `(origin, oseq)` is deferred.
+    pub fn is_deferred(&self, origin: u64, oseq: u64) -> bool {
+        self.replica
+            .deferred
+            .iter()
+            .any(|d| d.origin == origin && d.oseq == oseq)
+    }
+
+    /// What this member has applied of other origins, and what it deferred.
+    pub fn replica(&self) -> &ReplicaPayload {
+        &self.replica
+    }
+
+    /// Where `(origin, oseq)` is, if this member holds it.
+    pub fn location_of(&self, origin: u64, oseq: u64) -> Option<Located> {
+        self.locations.get(origin, oseq)
+    }
+
+    /// Read the record `(origin, oseq)` from wherever maintenance has moved
+    /// it, or `None` when this member does not hold it — what a member reads
+    /// to send an event it owes, or to answer a fetch (§6.2, §7.2).
+    pub fn read_by_identity(&mut self, origin: u64, oseq: u64) -> Result<Option<Record>> {
+        let Some(at) = self.locations.get(origin, oseq) else {
+            return Ok(None);
+        };
+        if self.segments.pending_len() > 0 {
+            self.segments.flush()?;
+        }
+        let mut probe = vec![0u8; HEADER_PROBE_SIZE];
+        self.segments.read_into(at.segment, at.offset, &mut probe)?;
+        let (header, header_bytes) = decode_header(&probe)?;
+        let size = padded_record_len(header_bytes - 1, header.payload_len) as u64;
+        let record = self.segments.read_record_at(at.segment, at.offset, size)?;
+        let id = record.header.identity();
+        if (id.origin, id.oseq) != (origin, oseq) {
+            return Err(PersistenceError::Corrupt(format!(
+                "the location index names {:x}/{oseq} at {:?}+{} but the record there is \
+                 {:x}/{}",
+                origin, at.segment, at.offset, id.origin, id.oseq
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    /// Write the replica when it changed since it was last written — at a
+    /// commit, before the sync that makes it durable. Local housekeeping: it
+    /// carries no identity and is never replicated.
+    fn write_replica_if_changed(&mut self) -> Result<()> {
+        if !self.replica_dirty {
+            return Ok(());
+        }
+        let payload = self.replica.encode();
+        self.append_carried(
+            RecordType::Replica,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &payload,
+            RecordIdentity::NONE,
+        )?;
+        self.replica_dirty = false;
+        Ok(())
     }
 
     /// The runtime twin of [`record_resident_loc`]: offer where a just-appended
@@ -2169,6 +2360,7 @@ impl SubstratePersistence {
         if self.is_read_only() {
             return Ok(());
         }
+        self.write_replica_if_changed()?;
         self.segments.commit()?;
         self.maybe_rotate_active()
     }
@@ -2194,9 +2386,10 @@ impl SubstratePersistence {
     /// synced. Returns `Ok(true)` when a flush+fsync actually happened,
     /// `Ok(false)` for the no-op idle path. Cheap to call on a tight timer.
     pub fn commit_if_pending(&mut self) -> Result<bool> {
-        if !self.segments.needs_commit() {
+        if self.is_read_only() || (!self.segments.needs_commit() && !self.replica_dirty) {
             return Ok(false);
         }
+        self.write_replica_if_changed()?;
         self.segments.commit()?;
         self.maybe_rotate_active()?;
         Ok(true)
@@ -2454,6 +2647,7 @@ impl SubstratePersistence {
                 now_ms: now_ms(),
                 retention: self.tombstone_retention,
             },
+            &self.replica,
         );
         // What this compaction is carrying forward, by type, against what the
         // store held when it opened. A class present at open and absent here is
@@ -2577,6 +2771,10 @@ impl SubstratePersistence {
         // kept its own, so the rebuilt table holds what the old one did for
         // every marker still live, and nothing for one the compaction dropped.
         self.marker_ids = MarkerIds::new();
+        // Every record moved, so every location is rebuilt; the applied set
+        // only grows, and the rewrite carried it whole.
+        self.locations.clear();
+        let node = self.node();
         let accounting = &mut self.accounting;
         let metadata_locs = &mut self.metadata_locs;
         let resident_locs = &mut self.resident_locs;
@@ -2584,7 +2782,10 @@ impl SubstratePersistence {
         let npc_locs = &mut self.npc_locs;
         let vfs_index = &mut self.vfs_index;
         let marker_ids = &mut self.marker_ids;
+        let replica = &mut self.replica;
+        let locations = &mut self.locations;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
+            observe_replica(replica, locations, node, entry);
             let h = &entry.record.header;
             marker_ids.record(
                 h.record_type,

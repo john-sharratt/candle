@@ -240,6 +240,7 @@ impl Manifest {
             | RecordType::BranchCheckpoint
             | RecordType::CustomObject
             | RecordType::Deleted
+            | RecordType::Replica
             | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }
