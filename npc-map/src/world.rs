@@ -59,7 +59,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-use crate::lift::{Lift, Moment};
+use serde::{Deserialize, Serialize};
+
+use crate::lift::{Doors, Lift, Moment};
 use crate::load::MapSet;
 use crate::mutate::MapEdit;
 use crate::part::PartKind;
@@ -166,7 +168,8 @@ pub struct Actor {
 /// stops a body getting where it is going — no locked doors, no crowding in a
 /// corridor — so a walk that fails failed because its owner changed its mind,
 /// and the reason names which way it changed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Lost {
     /// Set off somewhere else instead.
     Diverted,
@@ -196,7 +199,8 @@ impl fmt::Display for Lost {
 /// bystander sees is a person leaving a room and a person coming into one,
 /// which is [`Left`](Happening::Left) and [`Arrived`](Happening::Arrived).
 /// [`crate::witness`] enforces that; the record keeps all of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Happening {
     Arrived,
     Left,
@@ -321,7 +325,8 @@ impl Happening {
 /// the world records what happened in full and [`crate::witness`] narrows it on
 /// the way out: a whisper is a thing everybody in the room saw happen and one
 /// person heard.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Voice {
     /// An ordinary voice. Everybody in the room hears it; nobody outside does.
     Said,
@@ -333,7 +338,10 @@ pub enum Voice {
     Whispered,
 }
 
-#[derive(Clone, Debug)]
+/// Something that happened, as the log keeps it. Serialisable so a world's
+/// authority can send what happened to the members following it, which take
+/// it into their own logs ([`World::witness`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub at: Tick,
     pub actor: String,
@@ -816,6 +824,33 @@ impl World {
     /// answered from the company it decided with.
     pub fn end_decision(&mut self, id: &str) {
         self.deciding.remove(id);
+    }
+
+    /// The decision `id` is making, as a world elsewhere would take it in: the
+    /// place it decided from and the ids of the company it decided with.
+    ///
+    /// What a body acting in a world it does not run carries with its act, so
+    /// the world that runs it answers the act from the company the body was
+    /// offered — [`World::restore_decision`] puts it back.
+    pub fn deliberation(&self, id: &str) -> Option<(Where, Vec<String>)> {
+        self.deciding
+            .get(id)
+            .map(|d| (d.at.clone(), d.company.iter().cloned().collect()))
+    }
+
+    /// Take in a decision `id` began in another copy of this world: from `at`,
+    /// with `company`. Replaces any decision it was making here, as a second
+    /// [`World::begin_decision`] would.
+    pub fn restore_decision(&mut self, id: &str, at: Where, company: Vec<String>) {
+        if self.actors.contains_key(id) {
+            self.deciding.insert(
+                id.into(),
+                Deliberation {
+                    at,
+                    company: company.into_iter().collect(),
+                },
+            );
+        }
     }
 
     /// Where `id` stood when it began deciding, while it is deciding.
@@ -1518,6 +1553,71 @@ impl World {
         Ok(())
     }
 
+    /// Take in what happened in this world elsewhere — on the member that is
+    /// its authority — so the bodies here perceive it as they would anything
+    /// done in front of them. Each event is stamped with a tick of this
+    /// world's own clock, so readers' cursors here order it among the rest.
+    /// Returns the tick the last one took.
+    pub fn witness(&mut self, events: impl IntoIterator<Item = Event>) -> Tick {
+        for mut event in events {
+            self.now += 1;
+            event.at = self.now;
+            self.log.push(event);
+        }
+        self.forget_old_events();
+        self.now
+    }
+
+    /// Set `id` where a record of the world says it stands, ending any walk.
+    /// Nothing is logged: the moves a body makes are told as they happen
+    /// ([`Self::witness`]), and this only settles where it ended up.
+    pub fn restore_place(&mut self, id: &str, to: Where) -> Done {
+        if self.node(&to).is_none() {
+            return Err(Refused::NoSuchPlace(to));
+        }
+        let actor = self
+            .actors
+            .get_mut(id)
+            .ok_or(Refused::NoSuchActor(id.into()))?;
+        actor.at = to;
+        actor.walk = None;
+        // Moved by other means than the lift, as `land` has it: no ride is
+        // pending any more.
+        self.riders.remove(id);
+        self.waiting.remove(id);
+        Ok(())
+    }
+
+    /// Set the lift where a record of it says it was ([`Lift::restore`]).
+    /// Nothing is logged: nobody in the building did anything. Whether the
+    /// world has a lift.
+    pub fn restore_lift(&mut self, at: usize, doors: Doors, stops: &[usize]) -> bool {
+        match self.lift.as_mut() {
+            Some(lift) => {
+                lift.restore(at, doors, stops);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set what `id` is holding where a record of it says — the station
+    /// `part`, and the subject it claimed — or nothing. Nothing is logged:
+    /// this is the world being told where it stood, not a body sitting down.
+    pub fn restore_hold(&mut self, id: &str, hold: Option<(String, Option<String>)>) -> Done {
+        let now = self.now;
+        let actor = self
+            .actors
+            .get_mut(id)
+            .ok_or(Refused::NoSuchActor(id.into()))?;
+        actor.hold = hold.map(|(part, subject)| Hold {
+            subject,
+            part,
+            since: now,
+        });
+        Ok(())
+    }
+
     /// Get up, and let go of whatever was claimed.
     pub fn release(&mut self, id: &str) -> Done {
         self.now += 1;
@@ -1778,6 +1878,68 @@ mod tests {
 
     fn at(node: &str) -> Where {
         Where::new("vault-casting", node)
+    }
+
+    // ── following a world kept elsewhere ────────────────────────────────────
+
+    /// **What the authority's world did reaches the bodies here.** An event
+    /// sent as JSON and witnessed is heard by a body in the room as if spoken
+    /// here, stamped on this world's clock.
+    #[test]
+    fn a_witnessed_event_is_heard_like_a_local_one() {
+        let mut authority = one_speaker();
+        authority.say("m1", "from the other machine").unwrap();
+        let sent = serde_json::to_string(authority.log().last().unwrap()).unwrap();
+
+        let mut here = one_speaker();
+        here.enter("m2", "Maker-02", at("green-room")).unwrap();
+        here.mark_seen("m2");
+        let before = here.now;
+        let event: Event = serde_json::from_str(&sent).unwrap();
+        let stamped = here.witness([event]);
+        assert!(stamped > before);
+        let heard = crate::witness::since(&here, "m2");
+        assert!(heard.iter().any(|x| matches!(&x.what,
+            Happening::Said { words, .. } if words == "from the other machine")));
+    }
+
+    /// A record's place settles a body silently, ending its walk.
+    #[test]
+    fn a_restored_place_moves_nobody_audibly() {
+        let mut w = one_speaker();
+        w.enter("m2", "Maker-02", at("band-one")).unwrap();
+        w.set_off("m2", at("green-room")).unwrap();
+        let logged = w.log().len();
+        w.restore_place("m2", at("green-room")).unwrap();
+        assert_eq!(w.log().len(), logged, "nothing logged");
+        assert_eq!(w.actor("m2").unwrap().at, at("green-room"));
+        assert!(w.actor("m2").unwrap().walk.is_none());
+        assert!(w.restore_place("m2", at("no-such-room")).is_err());
+    }
+
+    /// A decision begun in one copy of a world, carried to another, lets a
+    /// line be called after somebody who left the room there.
+    #[test]
+    fn a_decision_carried_over_calls_after_the_same_company() {
+        let mut replica = one_speaker();
+        replica.enter("m2", "Maker-02", at("green-room")).unwrap();
+        replica.begin_decision("m1");
+        let (from, company) = replica.deliberation("m1").unwrap();
+        assert_eq!(
+            (from.clone(), company.clone()),
+            (at("green-room"), vec!["m2".to_string()])
+        );
+
+        let mut authority = one_speaker();
+        authority.enter("m2", "Maker-02", at("band-one")).unwrap();
+        authority.restore_decision("m1", from, company);
+        assert!(authority
+            .call_after("m1", "m2", "wait for me", Voice::Said)
+            .is_ok());
+        authority.end_decision("m1");
+        assert!(authority.deliberation("m1").is_none());
+        authority.restore_decision("nobody", at("green-room"), vec![]);
+        assert!(authority.deliberation("nobody").is_none(), "no such body");
     }
 
     // ── the event window ────────────────────────────────────────────────────

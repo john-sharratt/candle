@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use super::catchup::Purpose;
+use super::lease::LeaseEvent;
 use super::replicator::Replicator;
 
 /// What a drain handed back.
@@ -32,21 +33,23 @@ impl Replicator {
     /// `oseq`, which the next holder waits for (§9.6).
     pub fn release_leases(self: &Arc<Self>, through: u64) -> usize {
         let now = self.now();
-        let outs = {
+        let (outs, keys) = {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
             let held = p.held(now);
             let mut outs = Vec::new();
-            for key in held {
-                match p.release(&key, through, now) {
+            for key in &held {
+                match p.release(key, through, now) {
                     Ok(o) => outs.extend(o),
                     Err(e) => tracing::error!(node = self.node, "the vote journal failed: {e}"),
                 }
             }
-            outs
+            (outs, held)
         };
-        let released = outs.len();
         self.dispatch(outs);
-        released
+        for key in &keys {
+            let _ = self.leases.send(LeaseEvent::Lost { key: key.clone() });
+        }
+        keys.len()
     }
 
     /// Stop taking work, staying connected.

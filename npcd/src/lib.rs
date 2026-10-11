@@ -24,6 +24,7 @@
 
 pub mod accounts;
 pub mod api;
+pub mod authority;
 pub mod clock;
 pub mod collections;
 pub mod compliance;
@@ -53,3 +54,4 @@ pub mod substrate;
 pub mod tenant;
 pub mod visibility;
 pub mod world;
+pub mod world_state;

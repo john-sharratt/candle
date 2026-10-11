@@ -779,7 +779,7 @@ pub(super) fn gather_resident_set(
     // in `Substrate::custom_objects` and carried forward from RAM. The key's
     // hash rides in the header `stream_id` so supersession accounting is
     // mechanical (see the twin block in `compaction::collect_live_records`).
-    for (obj, id) in substrate.live_custom_objects() {
+    for (obj, id) in substrate.held_custom_objects() {
         out.push(Resident {
             rt: RecordType::CustomObject,
             stream_id: obj.stream_id(),

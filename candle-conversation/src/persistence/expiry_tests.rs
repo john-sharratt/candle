@@ -3,17 +3,20 @@
 //! A timeline tombstone is kept by every compaction until a complete
 //! compaction has finished after it **and** it is older than the retention;
 //! then it shrinks to its entry in the `Deleted` record, and the timeline stays
-//! dead for good.
+//! dead for good. A keyed value's tombstone does the same, its entry keeping
+//! the stamp a later write must exceed.
 
 use std::time::Duration;
 
 use super::compaction::{collect_live_records, CompactItem, Housekeeping};
-use super::deleted::{DeletedPayload, DeletedTimeline};
+use super::deleted::{DeletedKey, DeletedPayload, DeletedTimeline};
 use super::identity::{MarkerIds, RecordIdentity, COUNTER_BITS};
 use super::log_file::{MemLog, SUPERBLOCK_SIZE};
 use super::maintenance::gather_resident_set;
 use super::manifest::{encode_label_payload, Manifest};
-use super::record::{encode_record, RecordHeader, RecordType, TombstonePayload};
+use super::record::{
+    encode_record, CustomObjectPayload, RecordHeader, RecordType, TombstonePayload,
+};
 use super::stamped_locs::StampedLocs;
 use super::streams::{StreamDecl, TurnDecl};
 use super::tombstone_expiry::TombstoneExpiry;
@@ -198,8 +201,8 @@ fn a_tombstone_shrinks_only_once_swept_and_old() {
     assert_eq!(
         of_type(&first, RecordType::Deleted),
         vec![DeletedPayload {
-            timelines: Vec::new(),
             swept: vec![DEAD],
+            ..DeletedPayload::default()
         }
         .encode()]
     );
@@ -227,7 +230,7 @@ fn a_tombstone_shrinks_only_once_swept_and_old() {
             origin: A,
             oseq: 7,
         }],
-        swept: Vec::new(),
+        ..DeletedPayload::default()
     }
     .encode();
     assert_eq!(of_type(&expired, RecordType::Deleted), vec![entry.clone()]);
@@ -300,6 +303,113 @@ fn a_deleted_timeline_stays_dead_whatever_arrives() {
             "an expired tombstone is not carried as itself"
         );
     }
+}
+
+const ENDED: &str = "world/w1/mission/m1";
+const KEPT: &str = "world/w1/body/a";
+
+fn object(
+    obj: CustomObjectPayload,
+    id: RecordIdentity,
+) -> (RecordType, u64, Vec<u8>, RecordIdentity) {
+    (RecordType::CustomObject, obj.stream_id(), obj.encode(), id)
+}
+
+/// A world's entity that ceased: its value (day 9) and its tombstone (day 10),
+/// beside one that lives on.
+fn keyed() -> Vec<(RecordType, u64, Vec<u8>, RecordIdentity)> {
+    vec![
+        object(
+            CustomObjectPayload::new(ENDED, serde_json::json!({"step": 2})),
+            at(1, 9 * DAY_MS),
+        ),
+        object(
+            CustomObjectPayload::new(KEPT, serde_json::json!({"at": "hall/door"})),
+            at(2, 9 * DAY_MS),
+        ),
+        object(CustomObjectPayload::ceased(ENDED), at(3, 10 * DAY_MS)),
+    ]
+}
+
+/// **A keyed tombstone hides its key and expires like a timeline's.** It is
+/// carried until a complete compaction has run past it and it is old, then
+/// shrinks to an entry keeping its stamp; the live entity beside it is
+/// carried throughout.
+#[test]
+fn a_keyed_tombstone_shrinks_once_swept_and_old() {
+    let hash = CustomObjectPayload::stream_id_for(ENDED);
+    let store = open(&keyed());
+    assert!(
+        store.substrate.custom_object(ENDED).is_none(),
+        "hidden by its tombstone"
+    );
+    assert!(store.substrate.custom_object(KEPT).is_some());
+
+    let first = compact(&store, 100 * DAY_MS);
+    assert_eq!(
+        of_type(&first, RecordType::CustomObject).len(),
+        2,
+        "the tombstone and the live entity"
+    );
+    assert_eq!(
+        of_type(&first, RecordType::Deleted),
+        vec![DeletedPayload {
+            swept_keys: vec![hash],
+            ..DeletedPayload::default()
+        }
+        .encode()]
+    );
+
+    let expired = compact(&open(&first), 100 * DAY_MS);
+    let objects = of_type(&expired, RecordType::CustomObject);
+    assert_eq!(objects.len(), 1, "only the live entity");
+    assert_eq!(CustomObjectPayload::decode(&objects[0]).unwrap().key, KEPT);
+    let entry = DeletedKey::of(hash, at(3, 10 * DAY_MS));
+    assert_eq!(
+        of_type(&expired, RecordType::Deleted),
+        vec![DeletedPayload {
+            keys: vec![entry],
+            ..DeletedPayload::default()
+        }
+        .encode()]
+    );
+    let after = open(&expired);
+    assert_eq!(after.substrate.deleted_key(hash), Some(entry));
+    assert!(after.substrate.custom_object(ENDED).is_none());
+}
+
+/// **The entry outranks writes below its tombstone, and not above.** A write
+/// replicated late from before the tombstone stays dead in either order with
+/// the entry; one stamped after it — the entity coming back — stands.
+#[test]
+fn a_keyed_entry_holds_against_earlier_writes_only() {
+    let expired = compact(&open(&compact(&open(&keyed()), 100 * DAY_MS)), 100 * DAY_MS);
+    let late = object(
+        CustomObjectPayload::new(ENDED, serde_json::json!({"step": 1})),
+        at(4, 8 * DAY_MS),
+    );
+    let back = object(
+        CustomObjectPayload::new(ENDED, serde_json::json!({"step": 9})),
+        at(5, 200 * DAY_MS),
+    );
+    for records in [
+        expired
+            .iter()
+            .cloned()
+            .chain([late.clone()])
+            .collect::<Vec<_>>(),
+        [late.clone()]
+            .into_iter()
+            .chain(expired.iter().cloned())
+            .collect(),
+    ] {
+        assert!(open(&records).substrate.custom_object(ENDED).is_none());
+    }
+    let returned = open(&expired.iter().cloned().chain([back]).collect::<Vec<_>>());
+    assert_eq!(
+        returned.substrate.custom_object(ENDED).unwrap().blob,
+        serde_json::json!({"step": 9})
+    );
 }
 
 /// **The retention reaches compaction.** Through the real store: a tombstone

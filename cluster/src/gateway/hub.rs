@@ -43,6 +43,7 @@ use super::status::{
     AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
 };
 use super::traffic::Traffic;
+use super::worlds_view::{disconnected, worlds};
 use crate::clock::now_ms;
 use crate::close::{Close, CloseCode};
 use crate::coord::CoordState;
@@ -94,6 +95,8 @@ pub(super) struct Socket {
     /// dropped at its cap.
     pub skipped: u64,
     pub dropped: u64,
+    /// `PULSE`s not queued for it under pressure (§9.1).
+    pub pulses_dropped: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -327,6 +330,7 @@ impl Hub {
                     acks: Vec::new(),
                     skipped: 0,
                     dropped: 0,
+                    pulses_dropped: 0,
                 },
             );
             if let Some(old) = replaced {
@@ -531,8 +535,8 @@ impl Hub {
             | Frame::Fetch(_)
             | Frame::Done(_)
             | Frame::Have(_)) => self.relay_substrate(app, node, f),
-            // What this gateway neither keeps nor relays: build traffic and
-            // world pulses.
+            f @ Frame::Pulse(_) => self.relay_pulse(app, node, f),
+            // What this gateway neither keeps nor relays: build traffic.
             _ => {}
         }
         Ok(())
@@ -656,6 +660,7 @@ impl Hub {
                         catchup_bytes: x.handle.gauges().catchup(),
                         skipped: x.skipped,
                         dropped: x.dropped,
+                        pulses_dropped: x.pulses_dropped,
                     },
                 });
                 members.push(MemberRow::of(
@@ -686,6 +691,8 @@ impl Hub {
             draining: s.draining,
             apps: APPS.iter().map(|a| app_view(&s, a)).collect(),
             faults,
+            worlds: worlds(&members),
+            disconnected: disconnected(&members),
             members,
             claims,
             refusals: s.refusals.iter().cloned().collect(),

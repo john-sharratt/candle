@@ -1466,6 +1466,11 @@ among the members of the app.
   own substrate.
 - **The quorum is `⌊max_members / 2⌋ + 1`.** A member cut off from its peers cannot
   reach it on its own. That is what stops a partition's minority from deciding anything.
+- **A proposer counts every ready member it sees as well.** Its quorum is a majority of
+  `max_members` or of the ready members visible now, whichever is greater. The stored
+  value rises only on the next once-a-second read, and a member arriving in a group
+  still counted as one would otherwise make a majority of one with itself, in that
+  second, and take a lease another member holds.
 - **Raises and lowers resolve in any order.**
   - The value is the latest *set* by version stamp (§6.2), raised to the greatest raise
     stamped after it.
@@ -1541,7 +1546,15 @@ round.
 - A `PROMISE` carrying another member's unexpired lease stops a proposer, which routes
   to that holder instead. One carrying the proposer's *own* lease does not stop it, and
   that is renewal.
-- `RELEASE { key, ballot }` makes acceptors drop the lease at once.
+- `RELEASE { key, ballot, through }` makes acceptors drop the lease at once. Every
+  member hears it, with the releasing member and how far its writes reach, so the next
+  holder can wait for them (§9.6).
+- **A lease is asked for again when the group grows.** One granted under a smaller
+  quorum was accepted by a majority of the smaller group, and the members that joined
+  since never saw it: a majority of the larger group made of them could grant it a
+  second time. So a holder whose quorum rises above the one a held lease was last
+  granted under renews that lease at once, and a majority of the group as it stands
+  knows it (`replicate/lease.rs`, `reaffirm_leases`).
 - Because the acceptors are durable, a restarting member resumes its promises from its
   substrate, and needs no sit-out period for decisions. A lease it had accepted before
   the restart counts as present for one full `ttl` from the restart. Its monotonic clock
@@ -1556,6 +1569,13 @@ once.
 **Who proposes.** For a lease, the member that weighted rendezvous names (§9.5).
 Rendezvous only keeps members from duelling over ballots; Paxos decides. For a decision,
 whichever member needs it first.
+
+**A proposer never asks for a lease its holder still holds.** While the member holding
+it is in the group — known from its claim on the lease's key, which every member
+receives with its admission before it may propose, or from a round that came back
+`LeaseBusy` — the proposer waits for it to be handed over. Asking again would only raise
+the ballot under the holder's renewals, back them off, and run a live holder's lease
+out.
 
 **Duelling proposers back off.** Two members whose views of the membership differ can
 both think rendezvous names them, and out-ballot each other in turn. So a proposer that
@@ -2520,34 +2540,63 @@ opens `/ws/logs` on every member, and interleaves their lines, each tagged with 
 
 ### 9.1 World state is persisted; transient events are broadcast
 
-**Today**, a hosted world's live state is RAM on one machine (`Sim`,
-`npcd/src/world/mod.rs:113-134`, `npcd/src/sim/mod.rs:83`). That covers bodies and
-positions, the lift, benches, missions and operations. A 500 ms metronome
-(`runtime.rs:979-995`) checkpoints it as three whole-world CustomObjects:
-`missions/<world>`, `benches/<world>` and `command-table` (`runtime.rs:621-629`,
-`:2936-2985`). A character's place is also kept on its `Npc` record
-(`NpcPayload.at`, `record.rs:1065-1163`). Everything else is lost on restart.
+**Before this design**, a hosted world's live state was RAM on one machine (`Sim`,
+`npcd/src/world/mod.rs`, `npcd/src/sim/mod.rs`): bodies and positions, the lift,
+benches, missions and operations. A 500 ms metronome checkpointed three whole-world
+CustomObjects — `missions/<world>`, `benches/<world>` and `command-table` — and a
+character's place was kept on its `Npc` record (`NpcPayload.at`). Everything else was
+lost on restart. A world kept that way is taken in once, from those objects and those
+places, and its old objects are tombstoned once it has written its own records
+(`npcd/src/world_state/legacy.rs`, §15.1).
 
 **In this design the world is split into two kinds of thing**, and only one of them is
 persisted:
 
 | Kind | Examples | Persisted | Travels as |
 |---|---|---|---|
-| **State**: what the world *is* | each body's place (area and node) and posture; the lift car's floor and doors; each bench's working set; each mission and operation; the command table; who holds each NPC lease (§9.3) | **yes**, one keyed record per entity: `world/<wid>/<kind>/<id>` | `EVENT`, replicated, caught up and compacted like any record (§6) |
-| **Transient**: what the world is *doing* | the steps of a walk between nodes; the lift moving between floors; a line spoken in a room; a passer-by perceived; the metronome's beat | **never** | `PULSE`, broadcast to the app's other members with no `oseq`, no retransmit and no catch-up |
+| **State**: what the world *is* | each body's place (area and node) and the station it holds; the lift car's floor, doors and stops; everything the world's `Sim` holds — each bench's working set, each mission and operation, each body's pack, each device, each phone thread, each posting, the command table; who holds each NPC lease (§9.3) | **yes**, one keyed record per entity: `world/<wid>/<entity>` | `EVENT`, replicated, caught up and compacted like any record (§6) |
+| **Transient**: what the world is *doing* | the steps of a walk between nodes; the lift moving between floors; a line spoken in a room; a passer-by perceived; the metronome's beat; what the world tells a character that runs elsewhere | **never** | `PULSE`, broadcast to the app's other members with no `oseq`, no retransmit and no catch-up |
+
+**The records** (`npcd/src/world_state/`), named under `world/<wid>/`:
+
+- `body/<body>` for each body standing still: its place and the station it holds. A body
+  walking has none; its record is written where it stops.
+- `lift`: the car's floor, doors and stops.
+- `sim/<map>/<key>` for each entry of the `Sim`'s entity maps (`SIM_MAPS`: packs, the
+  benches' working sets, devices, the field, the ledger's per-body cursors, missions,
+  operations, the record's items, phone threads, postings), and `sim/meta` for the rest
+  of it.
+- `npclease/<nid>` for each character's lease (§9.3).
+
+What a machine keeps of its own is not in them — where its benches' documents live, and
+the workflows its mind's operations run on — and a world taking its records in keeps
+its own (`Sim::take_in`). A world with no records is as its map seeds it, its command
+table open.
+
+**Two pulses** (`npcd/src/authority/{pulse,told}.rs`):
+
+- `events`: the world's events since the last pulse. A member following the world takes
+  them into its own log, renumbered onto its clock, and its characters perceive them
+  as they would its own (`World::witness`).
+- `told`: what the authority hands a character that runs elsewhere — a message off a
+  handset, a mission withdrawn, a standing task the table sets. The member running the
+  character puts each into its inbox. Like any pulse it is lost if missed; the threads
+  and missions it tells of are state, and the next turn reads them.
 
 **The rules that keep the two apart:**
 
-- **Only the world's authority writes state** (§9.2). It writes a state record when an
-  entity's state changes, at most once per entity per beat. The whole world is no
-  longer re-checkpointed every beat, as the three CustomObjects are today.
+- **Only the world's authority writes state** (§9.2). Each beat it compares the world
+  with what it last wrote, and writes the entities that changed, in one commit, at most
+  once per entity per beat. The whole world is never re-checkpointed.
 - **A transient never changes persisted state.** It is what a state change looks like
   while it happens. A member that misses a `PULSE` misses only that animation, and the
   next state record settles the world.
 - **Staleness is a tombstone.** An entity that ceases gets a tombstone on its key: a body
   that leaves the world, a mission closed, a bench put away. Compaction can then drop
   its records, and the tombstone itself expires by §6.8's rule. A world that is removed
-  gets one tombstone covering its whole `world/<wid>/` prefix.
+  is stopped, and every record under its `world/<wid>/` prefix is tombstoned in one
+  commit, stamped above every epoch the world was written under, so no write from
+  before it brings an entity back (`Runtime::remove_world`).
 - **State records are ordinary keyed values** (§6.5). The greatest stamp wins in any
   arrival order. Each carries the world lease's epoch (§9.2), so a former authority can
   never overwrite its successor.
@@ -2579,29 +2628,47 @@ before any acceptor lets another proposer in.
 - **Losing a gateway decides nothing.** Members joined to the other clusters still reach
   each other, and acceptor state is in their substrates, not in any gateway.
 
-**The lease epoch** `(ms, node)` (§5.4) is set when a member first gains a world. It
-rises above every epoch it has seen for that world, and is stamped on every state
-record the authority writes. Paxos decides *who* holds a world, and the epoch orders
-what successive holders wrote (§6.5).
+**The lease epoch** `(ms, node)` (§5.4) is set when a member first gains a world: its
+clock, or one above every epoch the world's records carry if its clock is behind them.
+It is stamped on every state record the authority writes. Paxos decides *who* holds a
+world, and the epoch orders what successive holders wrote (§6.5). A daemon with no
+cluster takes each world it hosts the same way.
+
+**Gaining a world** (`npcd/src/authority/driver.rs`): the member reloads it from its
+records — scrapping whatever its own copy became — sets its epoch, claims the world's
+id so the world's routes come to it (§9.6), and from its next beat writes and pulses
+the world and lends its cast. **Losing it** — its term run out unrenewed — it stops
+writing at once, and runs the world locally if characters of it run there (§9.4).
 
 ### 9.3 NPC leases: lent by the world's authority, held where they are lent
 
 **Each character runs on one machine, the holder of its NPC lease.** The holder runs the
-character's autonomy loop (`npcd/src/engine/tick.rs`, `character_loop` at
-`runtime.rs:5268`) and writes its turns, beliefs and journal. One writer per character's
+character's autonomy loop (`npcd/src/engine/tick.rs`, `character_loop` in
+`runtime.rs`) and writes its turns, beliefs and journal. One writer per character's
 memory means its records are never contested.
 
+**Every member embodies every character.** Each member hosts every world, and its copy
+of each has a body for every character in it; only the minds of the characters it holds
+think there (`npcd/src/authority/cast.rs`). The cast replicates as `Npc` records, and
+every member reads it again every 2 s for characters made, changed or deleted on another
+member, so each world's authority knows every character it lends.
+
 **The world's authority lends NPC leases**, as state records:
-`world/<wid>/npclease/<nid> = { holder, expires_hlc }`.
+`world/<wid>/npclease/<nid> = { holder, expires_ms, next, after }` —
+`next` the member rendezvous names now, while the holder still has the character, and
+`after` the writes of the member that handed it back, `{ origin, through }`, which its
+new holder applies before it wakes the character there.
 
 - It lends them across the npcd members by weighted rendezvous over `npc_id` (§9.5),
   from the start, not only when a cast outgrows one machine. Losing any one member,
   the authority included, removes only that member's share of the cast.
 - Characters lent away from the authority send their world-changing acts to it as
   requests (below). That is the price of the spread, and it is one request per act.
-- It renews a lease while the holder is joined. When membership changes and rendezvous
-  names a new holder for a character, the lease moves only at that character's next
-  turn boundary, after its current holder hands it back.
+- It renews a lease while the holder is joined, once less than half its 60 s term is
+  left. When membership changes and rendezvous names a new holder for a character, the
+  lease names it as `next`, and moves only at that character's next turn boundary,
+  after its current holder hands it back (`hand_back`, below). A character waiting for
+  an engine is between turns.
 
 **A lease is held until it expires *and* its holder reconnects.**
 
@@ -2616,15 +2683,34 @@ memory means its records are never contested.
   stamp.
 
 **A character away from its world's authority** keeps a *replica* of the world: the
-state records and the `PULSE`s, enough to perceive it. An act that changes the world
-goes to the authority as a request on the cluster (`Owner(world)`, an internal
-`POST /v1/world/:wid/act`). The authority applies it, writes the state, and broadcasts
-the transient. An act that changes only the character's own mind stays local.
+state records and the `PULSE`s, enough to perceive it. **Everything that writes the
+world goes to the authority** as a request on the cluster, `POST /v1/world/:wid/op`
+(`Owner(world)`), answered only over a cluster socket and only from a member — the
+gateway stamps `x-tokera-from-member` on a request a member sends up, and strips it from
+everyone else's — and only by the world's authority (`npcd/src/authority/{ops,perform,routes}.rs`):
+
+| Op | What it writes |
+|---|---|
+| `begin` | a turn's opening: what the character's arrival signed off, the mission compass, what the table it stands at hands it |
+| `act` | one act of a turn, as the call line it was made as, with the decision it was made in — where it stood and the company it was offered — so a line called after somebody who walked out is called after them there too |
+| `message`, `enter_beside`, `leave`, `place` | a person messaging a character; standing beside it, leaving, and following it as it moves |
+| `lodge`, `step`, `cancel` | a mission lodged or carried at once, a step ticked off or added, a mission called off |
+| `channel`, `posting` | a person speaking on the world's open channel, or leaving words on something in it |
+| `hand_back`, `release` | a character handed back at its turn boundary, its holder's writes reaching `through`; an admin freeing a lease |
+
+The authority makes each with the same code a member running the world makes it with in
+place, and answers with what came of it — an act's line for the feed and for the
+character, and whether it moved the character's mission. What changes only the
+character's own mind — a reflection, a mood, a journal entry — stays where the character
+is. A world that does not answer is told to the character as a refusal, and it tries
+again. Leases change only at the authority: a member running the world cut off answers
+neither a hand-back nor a release.
 
 ### 9.4 Disconnected mode
 
 A member that loses every socket for the app, or whose world lease lapses, switches each
-world it has characters in to **disconnected mode**:
+world it has characters in to **disconnected mode** (a world it has none in it only
+follows, and stops writing):
 
 - **It runs a local world engine** for that world, seeded from the last state records
   and pulses it holds.
@@ -2658,6 +2744,10 @@ world it has characters in to **disconnected mode**:
 3. It reloads the world from the authoritative state records.
 4. It resumes as a replica, or as the authority if it wins the world's lease (§9.2). Its characters'
    bodies return to where the world remembers them.
+
+It is back for a world once it is joined and caught up, and another member claims the
+world (§9.6) — or once it takes the world itself, rendezvous naming it. Until then it
+keeps the world it lived in.
 
 **A network partition partitions the characters.** Each side carries on: the cluster in
 the authoritative world, and each cut-off machine in a local world holding only its own
@@ -2701,10 +2791,12 @@ proposer:
 
 1. The authority finishes the beat, writes every pending state record, and sends
    `RELEASE { key, ballot, through }` to every member (§5.9). `through` is its `oseq`
-   after those writes, and each member, as acceptor, discards the accepted lease.
-2. The new proposer waits until it has applied the old authority's records through
-   `through`. It then runs a round (§9.2), gains a majority's acceptance, hosts the world
-   from the state records (`Runtime::host`, `runtime.rs:923-998`), and starts lending
+   after those writes, and each member, as acceptor, discards the accepted lease. It
+   lets its claim on the world go, and follows the world from then on.
+2. The new proposer — which has not asked while the holder was in the group (§5.9) —
+   hears the release (`LeaseEvent::Released`) and waits until it has applied the old
+   authority's records through `through`. It then runs a round (§9.2), gains a
+   majority's acceptance, reloads the world from the state records, and starts lending
    NPC leases.
 
 An authority that is partitioned away cannot renew, so its lease simply runs out
@@ -3079,6 +3171,7 @@ writes the differences to the coordination log (`gateway/coord_log.rs`).
 | `deferred` | records it holds back because its build does not decode their type, by type and origin (§6.5) |
 | `clusters` | every `--cluster` it was given, with each one's socket state, so every gateway can show the others' view |
 | `paxos` | for each key it proposes for, holds, or has voted on: the round in progress, its ballot and phase, the members that promised or accepted it, and the higher ballot a `NACK` beat it with; a lease's remaining term on its own clock; and as acceptor, its promised and accepted ballots. With them its `max_members` and quorum (§5.9) |
+| `worlds` | each world it hosts: its role there — authority, replica or disconnected — with its epoch as authority and since when; the handover it waits on, `<origin> through <oseq>`; and, as the world's authority, every lease it lends (§9.2–§9.4) |
 | `npc_leases` | the NPC leases it holds, by world, with expiry (§9.3) |
 | `claims` | the sticky keys it holds, with epochs (§5.4) |
 | `applied` | per origin: `applied_through`, gaps, and the origin's announced `high_water`, so a lag shows as a number (§7.1) |
@@ -3140,7 +3233,11 @@ key:
 - `max_members` raised, or set lower and by whom (§5.9);
 - a member entering fault mode (reason, free space, what it gave up) and leaving it
   (§7.7);
-- an NPC lease lent, renewed, held while away, or force-released (§9.3);
+- an NPC lease lent, its move to another member asked and made, or force-released
+  (§9.3); renewals are not logged, and a lease held while its holder is away shows in
+  the NPC leases block;
+- a world's authority gained, handed over or lost, and a handover waited on (§9.2,
+  §9.6);
 - a member cut off, rejoining (each step), waiting for a quorum, and the generation it
   took (§6.7); a reload and its cause (§6.6);
 - a member admitted to upgrade below the floor, and how its install ended (§3.5); a
@@ -3715,8 +3812,24 @@ help. Every command runs through the gateway and on a member's own listener alik
 - Disconnected mode (§9.4).
 - Handover and routing (§9.6).
 
+- The cast followed across members, every member embodying every character (§9.3).
+- The World leases, NPC leases and Disconnected worlds blocks, from `COORD`'s `worlds`
+  and `npc_leases` (§12.1, §12.2).
+- The one-time conversion of a world kept before world records (§15.1, step 3).
+
 **Tests.** The world-state, NPC-lease and disconnected-mode tables (§14.1), with npcd
-running against two in-process members.
+running against two and three in-process members behind the web gateway's own router
+(`npcd/tests/worlds.rs`): one authority and its cast spread, an act made on a replica
+by the authority and heard back as a pulse, a message told to a character on another
+member; a world and its characters moving to the member rendezvous names, handed back
+and waited for; a cut-off member running its world locally, writing nothing of it, its
+characters not lent again, and scrapping that world on return; and a world keeping one
+authority across the loss of its authority, a watcher asserting no two members are ever
+its authority at once. The lease tests in `cluster/tests/leases.rs` (one holder, the
+release and its `through`, a member arriving before the quorum rises, a lease taken
+alone made known to the group it grows into), and the unit tests of
+`npcd::world_state::*`, `npcd::authority::*`, `npc_map::world` (witnessing, restored
+places and decisions) and `cluster::gateway::{world_log, worlds_view}`.
 
 **Exit.** A world keeps one authority across a member's loss and a partition, its
 characters run on the machines rendezvous lends them to, and a disconnected world

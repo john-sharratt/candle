@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use super::resolver::Conversation;
-use crate::persistence::deleted::{DeletedPayload, DeletedTimeline};
+use crate::persistence::deleted::{DeletedEntry, DeletedPayload};
 use crate::persistence::identity::{MintGeneration, VersionStamp};
 use crate::persistence::listing::ListedRecord;
 use crate::persistence::record::{decode_header, CustomObjectPayload};
@@ -27,7 +27,7 @@ pub struct HeldRange {
     pub records: Vec<ListedRecord>,
     /// The `oseq`s in the range no record holds any more, each one that was an
     /// expired tombstone with the deleted-set entry it left (§6.8).
-    pub gone: Vec<(u64, Option<DeletedTimeline>)>,
+    pub gone: Vec<(u64, Option<DeletedEntry>)>,
 }
 
 /// A generation the group has decided, handed to the rejoin that fixes what
@@ -80,37 +80,44 @@ impl Conversation {
     pub fn list_held(&self, origin: u64, from: u64, to: u64) -> PersistenceResult<HeldRange> {
         let listing = self.persistence.lock().unwrap().list(origin, from, to)?;
         let view = self.read();
-        let entries: Vec<DeletedTimeline> = view
+        let in_range = |e: &DeletedEntry| e.origin() == origin && (from..=to).contains(&e.oseq());
+        let entries: Vec<DeletedEntry> = view
             .deleted_entries()
-            .filter(|e| e.origin == origin && (from..=to).contains(&e.oseq))
+            .map(DeletedEntry::Timeline)
+            .chain(view.deleted_keys().map(DeletedEntry::Key))
+            .filter(in_range)
             .collect();
         Ok(HeldRange {
             records: listing.records,
             gone: listing
                 .gone
                 .into_iter()
-                .map(|oseq| (oseq, entries.iter().copied().find(|e| e.oseq == oseq)))
+                .map(|oseq| (oseq, entries.iter().copied().find(|e| e.oseq() == oseq)))
                 .collect(),
         })
     }
 
     /// `oseq`s of `origin` a catch-up learned are gone. A deleted-set entry
     /// among them is applied, and made durable, before anything else: the
-    /// timeline it names is dead here from now on (§6.8, §7.2).
+    /// timeline it names is dead here from now on, and the key it names holds
+    /// against every write below its tombstone (§6.8, §7.2).
     pub fn record_gone(
         &self,
         origin: u64,
-        gone: &[(u64, Option<DeletedTimeline>)],
+        gone: &[(u64, Option<DeletedEntry>)],
     ) -> PersistenceResult<()> {
-        let entries: Vec<DeletedTimeline> = gone.iter().filter_map(|(_, e)| *e).collect();
+        let mut learned = DeletedPayload::default();
+        for entry in gone.iter().filter_map(|(_, e)| *e) {
+            match entry {
+                DeletedEntry::Timeline(t) => learned.timelines.push(t),
+                DeletedEntry::Key(k) => learned.keys.push(k),
+            }
+        }
         let mut p = self.persistence.lock().unwrap();
-        if !entries.is_empty() {
+        if learned != DeletedPayload::default() {
             let deleted = {
                 let mut view = self.write();
-                view.apply_deleted(&DeletedPayload {
-                    timelines: entries,
-                    swept: Vec::new(),
-                });
+                view.apply_deleted(&learned);
                 view.deleted_payload()
             };
             if let Some(deleted) = deleted {
@@ -173,9 +180,8 @@ impl Conversation {
     /// record that holds it.
     pub fn cluster_objects(&self) -> Vec<(String, Value, VersionStamp)> {
         self.read()
-            .live_custom_objects()
+            .custom_objects_under(CLUSTER_PREFIX)
             .into_iter()
-            .filter(|(obj, _)| obj.key.starts_with(CLUSTER_PREFIX))
             .map(|(obj, id)| (obj.key, obj.blob, id.stamp()))
             .collect()
     }

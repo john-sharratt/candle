@@ -1118,6 +1118,16 @@ pub struct CustomObjectPayload {
     pub metadata: BTreeMap<String, String>,
     /// The object itself, as arbitrary JSON.
     pub blob: serde_json::Value,
+    /// A tombstone on the key: what the object was is gone, such as a world
+    /// entity that ceased (`docs/replicated_substrate.md` §6.8, §9.1). It wins
+    /// by stamp like any write, hides the key, and expires to an entry in the
+    /// deleted set. Omitted on the wire when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ceased: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl CustomObjectPayload {
@@ -1127,6 +1137,17 @@ impl CustomObjectPayload {
             key: key.into(),
             metadata: BTreeMap::new(),
             blob,
+            ceased: false,
+        }
+    }
+
+    /// The tombstone that ends `key`.
+    pub fn ceased(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            metadata: BTreeMap::new(),
+            blob: serde_json::Value::Null,
+            ceased: true,
         }
     }
 
@@ -1264,9 +1285,9 @@ pub struct NpcPayload {
     /// station yet, and a field for it would be a guess at a shape.
     ///
     /// `None` for a character that has never been embodied, or whose world has
-    /// no map. Written by the tick driver on a bounded cadence rather than per
-    /// move — see `npcd`'s `Npcs::remember_place`, which explains why a record
-    /// per doorway would be the wrong trade.
+    /// no map. Written by daemons from before a world kept its bodies' places
+    /// as its own state records (`docs/replicated_substrate.md` §9.1), and read
+    /// now only to take such a world in, once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
 

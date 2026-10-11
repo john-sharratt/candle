@@ -83,11 +83,11 @@ pub struct Sim {
     #[serde(default)]
     pub missions: Missions,
     /// Whether the command table is open — handing out missions and calling
-    /// characters with none to come and take one. The runtime default is set as
-    /// a world is hosted, not here: a fresh world comes up **open** so its cast
-    /// has work, and only an operator's explicit shut (durable, `TABLE_OPEN_KEY`)
-    /// keeps it closed across a reboot — see [`crate::engine::runtime`]'s host
-    /// path. `serde(default)` covers a saved world from before the field existed.
+    /// characters with none to come and take one. The default is set as a world
+    /// is hosted, not here: a fresh world comes up **open** so its cast has work,
+    /// and an operator's shut, being world state, is in the world's records and
+    /// keeps it closed across a reboot — see [`crate::authority::beat`].
+    /// `serde(default)` covers a saved world from before the field existed.
     #[serde(default)]
     pub table_open: bool,
     /// What the world is made of, as the Makers hold it — see [`record`].
@@ -735,6 +735,21 @@ impl Sim {
         // never heard of.
         self.record.index_canon(&root);
         self.bench.set_root(root);
+    }
+
+    /// Take `other` in as this world's state, keeping what is this machine's
+    /// own rather than the world's: where its benches' documents live, and the
+    /// workflows the mind's operations run on. What a world's authority writes
+    /// is the world; those two are read here, from this machine's mind.
+    ///
+    /// The record is taken as `other` holds it, not re-indexed from this
+    /// machine's documents: what the world has been told is what it knows.
+    pub fn take_in(&mut self, mut other: Sim) {
+        if let Some(root) = self.bench.mind_root() {
+            other.bench.set_root(root.to_path_buf());
+        }
+        other.missions.adopt_workflows(&mut self.missions);
+        *self = other;
     }
 
     /// Put a resource into the tower's stockpile, which is where a gathered

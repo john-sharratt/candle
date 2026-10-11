@@ -9,6 +9,7 @@ use serde::{Serialize, Serializer};
 use super::log::Entry;
 use super::registry::MemberView;
 use super::traffic::TrafficView;
+use super::worlds_view::{DisconnectedRow, WorldView};
 use crate::coord::{CoordState, FaultView};
 use crate::frame::{BuildId, MemberState};
 
@@ -23,6 +24,10 @@ pub struct HubStatus {
     pub faults: Vec<FaultRow>,
     pub members: Vec<MemberRow>,
     pub claims: Vec<ClaimView>,
+    /// The World leases and NPC leases blocks (§9.2, §9.3).
+    pub worlds: Vec<WorldView>,
+    /// The Disconnected worlds block (§9.4).
+    pub disconnected: Vec<DisconnectedRow>,
     pub refusals: Vec<Refusal>,
     pub traffic: TrafficView,
     pub log: Vec<Entry>,
@@ -121,6 +126,8 @@ pub struct Queues {
     pub skipped: u64,
     /// Catch-up frames dropped at its cap.
     pub dropped: u64,
+    /// `PULSE`s dropped under pressure (§9.1).
+    pub pulses_dropped: u64,
 }
 
 /// What the gateway knows of a member's socket beyond the registry.

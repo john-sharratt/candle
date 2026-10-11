@@ -144,6 +144,21 @@ select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   <div class="scroll"><table id="consensus"></table></div>
 </section>
 
+<section aria-labelledby="h-worlds">
+  <h2 id="h-worlds">World leases</h2>
+  <div class="scroll"><table id="worlds"></table></div>
+</section>
+
+<section aria-labelledby="h-npc-leases">
+  <h2 id="h-npc-leases">NPC leases</h2>
+  <div class="scroll"><table id="npc-leases"></table></div>
+</section>
+
+<section aria-labelledby="h-disconnected">
+  <h2 id="h-disconnected">Disconnected worlds</h2>
+  <div class="scroll"><table id="disconnected"></table></div>
+</section>
+
 <section aria-labelledby="h-replication">
   <h2 id="h-replication">Replication</h2>
   <div class="scroll"><table id="replication"></table></div>
@@ -309,6 +324,32 @@ function render(s, earlier) {
       `<td class="mono">${esc(k.promised || "—")}</td>`,
       `<td class="mono">${esc(k.accepted || "—")}</td>`,
     ])), "no Paxos key is known to any member");
+  table($("worlds"), ["App", "World", "Authority", "Epoch", "Term left", "Proposer", "No authority because", "Handover"],
+    s.worlds.map((w) => [
+      `<td>${esc(w.app)}</td>`, `<td class="mono">${esc(w.world)}</td>`,
+      `<td class="mono">${esc(w.authority || "—")}</td>`,
+      `<td class="mono">${w.epoch != null ? when(w.epoch) : "—"}</td>`,
+      `<td class="mono">${w.term_left_ms != null ? (w.term_left_ms / 1000).toFixed(1) + " s" : "—"}</td>`,
+      `<td class="mono ${w.proposer_flagged ? "warn" : ""}">${esc(w.proposer || "—")}${w.proposer_flagged && w.authority ? " — not the authority" : ""}</td>`,
+      `<td class="wrap ${w.no_holder ? "warn" : ""}">${esc(w.no_holder || "—")}</td>`,
+      `<td class="wrap">${esc(w.handover || "—")}</td>`,
+    ]), "no member hosts a world");
+  table($("npc-leases"), ["App", "World", "Character", "Holder", "Expires", "Moving to", ""],
+    s.worlds.flatMap((w) => w.lent.map((l) => [
+      `<td>${esc(w.app)}</td>`, `<td class="mono">${esc(w.world)}</td>`,
+      `<td class="mono">${l.npc}</td>`,
+      `<td class="mono">${l.holder ? esc(l.holder) : `<span class="warn">freed by an admin</span>`}</td>`,
+      `<td class="mono">${l.expires_ms ? when(l.expires_ms) : "—"}</td>`,
+      `<td class="mono">${esc(l.next || "—")}</td>`,
+      `<td>${w.away.includes(l.npc) ? `<span class="pill warn">holder away: not lent again until it returns</span>` : ""}</td>`,
+    ])), "no world's authority lends a character");
+  table($("disconnected"), ["App", "Member", "Host", "World", "Since", "Characters"],
+    s.disconnected.map((d) => [
+      `<td>${esc(d.app)}</td>`, node(d.node), `<td>${esc(d.host)}</td>`,
+      `<td class="mono">${esc(d.world)}</td>`,
+      `<td class="mono">${ago(d.since_ms, s.now_ms)}</td>`,
+      `<td class="mono">${d.characters.join(", ") || "none"}</td>`,
+    ]), "no member is running a world cut off");
   table($("replication"), ["App", "Member", "Origin", "Applied through", "High water", "Behind", "Missing below the top"],
     reported.flatMap((m) => m.coord.applied.map((a) => {
       const behind = Math.max(0, a.high_water - a.through);
@@ -319,7 +360,7 @@ function render(s, earlier) {
         `<td class="mono ${a.missing ? "warn" : ""}">${a.missing}</td>`,
       ];
     })), "nothing applied yet");
-  table($("queues"), ["App", "Member", "Unsent", "In flight", "Live queued", "Catch-up queued", "Live skipped", "Catch-up dropped"],
+  table($("queues"), ["App", "Member", "Unsent", "In flight", "Live queued", "Catch-up queued", "Live skipped", "Catch-up dropped", "Pulses dropped"],
     s.members.map((m) => [
       `<td>${esc(m.app)}</td>`, node(m.node),
       `<td class="mono">${m.coord ? m.coord.outbox.unsent : "—"}</td>`,
@@ -328,6 +369,7 @@ function render(s, earlier) {
       `<td class="mono">${bytes(m.catchup_bytes)}</td>`,
       `<td class="mono">${m.skipped}</td>`,
       `<td class="mono">${m.dropped}</td>`,
+      `<td class="mono">${m.pulses_dropped}</td>`,
     ]), "no member is connected");
   table($("recovery"), ["App", "Member", "Applied", "Refused", "Catch-ups asked", "Answered for others", "Fetched for others", "Retransmitted", "Reloads"],
     reported.map((m) => {

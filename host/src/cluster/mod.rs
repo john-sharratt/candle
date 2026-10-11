@@ -14,6 +14,7 @@
 //! | [`store`] | a tenant's substrate as replication drives it (§6, §7) |
 //! | [`disk`] | the volume a substrate is on, for fault mode (§7.7) |
 //! | [`leave`] | draining and sending before the process stops (§12.4) |
+//! | [`up`] | requests between members, and the stamp naming the sender (§9.3) |
 //! | [`view`] | the `cluster` block of `/v1/status`, and the `connecting` and `catchup` steps |
 //!
 //! The protocol — handshake, sessions, claims, reconnects, replication — is
@@ -28,6 +29,7 @@ pub mod listener;
 pub mod serve;
 pub mod sticky;
 pub mod store;
+pub mod up;
 pub mod view;
 
 use std::collections::BTreeMap;

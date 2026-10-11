@@ -22,12 +22,12 @@
 //! [`SubstratePersistence::compact`]: super::SubstratePersistence::compact
 //! [`SubstratePersistence::should_compact`]: super::SubstratePersistence::should_compact
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::adoption::Adoption;
 use super::content_hash::snapshot_stream_id;
-use super::deleted::{DeletedPayload, DeletedTimeline};
+use super::deleted::{DeletedKey, DeletedPayload, DeletedTimeline};
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use super::identity::MarkerIds;
 use super::log_file::LogFile;
@@ -220,6 +220,8 @@ pub fn collect_live_records(
     housekeeping: &Housekeeping,
 ) -> Vec<CompactItem> {
     let mut out: Vec<CompactItem> = Vec::new();
+    // Keyed tombstones this compaction expires, by key hash: not carried.
+    let mut expired_keys: HashSet<u64> = HashSet::new();
 
     if !housekeeping.replica.is_empty() {
         out.push(local_record(
@@ -687,10 +689,31 @@ pub fn collect_live_records(
         ));
     }
     deleted.sort_unstable();
-    if !deleted.is_empty() || !swept.is_empty() {
+    // A keyed value's tombstone expires the same way: once a complete
+    // compaction has run past it and it is old, it shrinks to an entry that
+    // keeps its stamp. The custom objects below skip what expires here.
+    let mut keys: Vec<DeletedKey> = substrate.deleted_keys().collect();
+    let mut swept_keys: Vec<u64> = Vec::new();
+    for (obj, id) in substrate.held_custom_objects() {
+        if !obj.ceased {
+            continue;
+        }
+        let hash = obj.stream_id();
+        if substrate.is_key_tombstone_swept(hash) && expiry.is_old(id.hlc) {
+            keys.push(DeletedKey::of(hash, id));
+            expired_keys.insert(hash);
+        } else {
+            swept_keys.push(hash);
+        }
+    }
+    keys.sort_unstable();
+    swept_keys.sort_unstable();
+    if !deleted.is_empty() || !swept.is_empty() || !keys.is_empty() || !swept_keys.is_empty() {
         let payload = DeletedPayload {
             timelines: deleted,
             swept,
+            keys,
+            swept_keys,
         }
         .encode();
         out.push(CompactItem::synth(
@@ -938,10 +961,14 @@ pub fn collect_live_records(
             bytes,
         ));
     }
-    // Generic keyed custom objects — re-emitted from the live in-RAM set so
+    // Generic keyed custom objects — re-emitted from the held in-RAM set so
     // the winning object outlives the compaction pass, keyed on the same
-    // stable key-hash `stream_id` it was written under.
-    for (obj, id) in substrate.live_custom_objects() {
+    // stable key-hash `stream_id` it was written under; a tombstone among
+    // them is carried until it expired above.
+    for (obj, id) in substrate.held_custom_objects() {
+        if expired_keys.contains(&obj.stream_id()) {
+            continue;
+        }
         let bytes = obj.encode();
         out.push(CompactItem::synth(
             RecordHeader {
@@ -3088,7 +3115,7 @@ mod tests {
                     origin: 0xA,
                     oseq: 4,
                 }],
-                swept: Vec::new(),
+                ..DeletedPayload::default()
             }
             .encode(),
         ));

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use applied_set::AppliedSet;
-use candle_conversation::persistence::deleted::DeletedTimeline;
+use candle_conversation::persistence::deleted::{DeletedEntry, DeletedKey, DeletedTimeline};
 use candle_conversation::persistence::identity::VersionStamp;
 use candle_conversation::persistence::record::decode_header;
 use candle_conversation::persistence::remote::RemoteOutcome;
@@ -88,25 +88,39 @@ impl ConversationStore {
     }
 }
 
-/// A deleted-set entry as a `HEADERS` gone entry carries it: `timeline`,
-/// `origin`, `oseq`, little-endian.
-pub fn encode_entry(e: &DeletedTimeline) -> Vec<u8> {
-    [e.timeline, e.origin, e.oseq]
-        .iter()
-        .flat_map(|w| w.to_le_bytes())
-        .collect()
+/// A deleted-set entry as a `HEADERS` gone entry carries it: a kind byte —
+/// `0` a timeline's, `1` a keyed value's — then its words, little-endian:
+/// `timeline`, `origin`, `oseq`; or `key`, `gen`, `epoch`, `hlc`, `origin`,
+/// `oseq`.
+pub fn encode_entry(e: &DeletedEntry) -> Vec<u8> {
+    let (kind, words): (u8, Vec<u64>) = match e {
+        DeletedEntry::Timeline(t) => (0, vec![t.timeline, t.origin, t.oseq]),
+        DeletedEntry::Key(k) => (1, vec![k.key, k.gen, k.epoch, k.hlc, k.origin, k.oseq]),
+    };
+    let mut out = vec![kind];
+    out.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+    out
 }
 
-pub fn decode_entry(b: &[u8]) -> Option<DeletedTimeline> {
-    if b.len() != 24 {
-        return None;
+pub fn decode_entry(b: &[u8]) -> Option<DeletedEntry> {
+    let (&kind, rest) = b.split_first()?;
+    let word = |i: usize| u64::from_le_bytes(rest[i * 8..i * 8 + 8].try_into().unwrap());
+    match (kind, rest.len()) {
+        (0, 24) => Some(DeletedEntry::Timeline(DeletedTimeline {
+            timeline: word(0),
+            origin: word(1),
+            oseq: word(2),
+        })),
+        (1, 48) => Some(DeletedEntry::Key(DeletedKey {
+            key: word(0),
+            gen: word(1),
+            epoch: word(2),
+            hlc: word(3),
+            origin: word(4),
+            oseq: word(5),
+        })),
+        _ => None,
     }
-    let word = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
-    Some(DeletedTimeline {
-        timeline: word(0),
-        origin: word(1),
-        oseq: word(2),
-    })
 }
 
 impl Store for ConversationStore {
@@ -205,7 +219,7 @@ impl Store for ConversationStore {
     }
 
     fn gone(&self, origin: u64, gone: &[Gone]) {
-        let gone: Vec<(u64, Option<DeletedTimeline>)> = gone
+        let gone: Vec<(u64, Option<DeletedEntry>)> = gone
             .iter()
             .map(|g| (g.oseq, g.deleted_entry.as_deref().and_then(decode_entry)))
             .collect();
@@ -341,17 +355,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_deleted_entry_is_24_bytes_and_back() {
-        let e = DeletedTimeline {
+    fn a_timelines_entry_is_a_kind_byte_and_24_bytes() {
+        let e = DeletedEntry::Timeline(DeletedTimeline {
             timeline: 0x0102,
             origin: 0xA,
             oseq: 7,
-        };
-        let mut want = vec![0x02, 0x01, 0, 0, 0, 0, 0, 0];
+        });
+        let mut want = vec![0, 0x02, 0x01, 0, 0, 0, 0, 0, 0];
         want.extend([0x0A, 0, 0, 0, 0, 0, 0, 0]);
         want.extend([7, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(encode_entry(&e), want);
         assert_eq!(decode_entry(&want), Some(e));
-        assert_eq!(decode_entry(&want[..23]), None);
+        assert_eq!(decode_entry(&want[..24]), None);
+    }
+
+    #[test]
+    fn a_keyed_entry_is_a_kind_byte_and_48_bytes() {
+        let e = DeletedEntry::Key(DeletedKey {
+            key: 0x55,
+            gen: 1,
+            epoch: 2,
+            hlc: 3,
+            origin: 0xB,
+            oseq: 9,
+        });
+        let mut want = vec![1];
+        for w in [0x55u8, 1, 2, 3, 0x0B, 9] {
+            want.extend([w, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        assert_eq!(encode_entry(&e), want);
+        assert_eq!(decode_entry(&want), Some(e));
+        assert_eq!(decode_entry(&[2, 0]), None, "an unknown kind");
+        assert_eq!(decode_entry(&[]), None);
     }
 }

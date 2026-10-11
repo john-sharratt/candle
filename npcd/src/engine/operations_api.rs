@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use crate::api::{err, owner_of, Authored};
 use crate::engine::mission_gen::gates::Form;
 use crate::engine::no_engine;
+use crate::engine::runtime::Runtime;
 use crate::engine::workflow::{Taker, Where, Workflow};
 use crate::sim::operations::Operation;
 use crate::world::Hosted;
@@ -202,6 +203,10 @@ pub async fn review(
         if body.world.as_deref().is_some_and(|w| w != id) {
             continue;
         }
+        // Each member opens it in the worlds it runs.
+        if !rt.standing.writes(&id) {
+            continue;
+        }
         let Some(hosted) = rt.hosted.get(&id) else {
             continue;
         };
@@ -238,6 +243,28 @@ pub struct EditBody {
     brief: Option<String>,
 }
 
+/// World `wid`, when this member runs it: an operation is the world's, and only
+/// its authority changes one (`docs/replicated_substrate.md` §9.2). A member
+/// that only follows the world refuses, `409`, and the gateway sends the next
+/// one to the authority.
+fn run_here(rt: &Runtime, wid: &str) -> Result<Arc<Hosted>, Box<Response>> {
+    let Some(hosted) = rt.hosted.get(wid) else {
+        return Err(Box::new(err(
+            StatusCode::NOT_FOUND,
+            "no_world",
+            "no such world is running",
+        )));
+    };
+    if !rt.standing.writes(wid) {
+        return Err(Box::new(err(
+            StatusCode::CONFLICT,
+            "run_elsewhere",
+            "another member is this world's authority now — ask again",
+        )));
+    }
+    Ok(hosted)
+}
+
 /// `PATCH /v1/pulse/operations/:wid/:oid` — rename an operation, restate what
 /// it is for, or rewrite the brief of its waiting mission.
 pub async fn edit(
@@ -252,12 +279,9 @@ pub async fn edit(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("editing an operation");
     };
-    let Some(hosted) = rt.hosted.get(&wid) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "no_world",
-            "no such world is running",
-        );
+    let hosted = match run_here(rt, &wid) {
+        Ok(h) => h,
+        Err(r) => return *r,
     };
     let edited = hosted.with_sim(|sim| {
         sim.missions
@@ -305,12 +329,9 @@ pub async fn step(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("moving an operation");
     };
-    let Some(hosted) = rt.hosted.get(&wid) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "no_world",
-            "no such world is running",
-        );
+    let hosted = match run_here(rt, &wid) {
+        Ok(h) => h,
+        Err(r) => return *r,
     };
     let step = body.step.trim();
     match hosted.with_sim(|sim| sim.missions.send_to_step(oid, step)) {
@@ -426,12 +447,9 @@ pub async fn cancel(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("calling off an operation");
     };
-    let Some(hosted) = rt.hosted.get(&wid) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "no_world",
-            "no such world is running",
-        );
+    let hosted = match run_here(rt, &wid) {
+        Ok(h) => h,
+        Err(r) => return *r,
     };
     let why = body
         .and_then(|Json(b)| b.why)

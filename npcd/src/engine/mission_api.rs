@@ -20,11 +20,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::{err, owner_of, Authored};
+use crate::authority::ops::{OpReply, WorldOp};
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::mission::{Mission, Origin, StepOutcome, Todo};
 use crate::engine::mission_gen::config::Config;
 use crate::engine::mission_gen::run;
-use crate::engine::{no_engine, owned, owned_by, speaking_as};
+use crate::engine::{no_engine, owned, owned_by, speaking_as, world_unreached};
 use npc_map::route;
 
 #[derive(Debug, Deserialize)]
@@ -131,22 +132,16 @@ pub async fn lodge(
     );
 
     let start = body.start;
-    // When carried at once, read the rendered standing task back so the same
-    // text can be put on the character's inbox to rouse it now — otherwise it
-    // would sit unread until the next idle nudge, up to a minute and a half off.
-    let now_text = hosted.with_sim(|sim| {
-        if start {
-            sim.missions.assign(&character, mission);
-            sim.missions.active(&character).map(|m| m.standing_text())
-        } else {
-            sim.missions.lodge(&character, mission);
-            None
-        }
-    });
-    if let Some(text) = now_text {
-        let world_ms = s.world_ms(nid).await;
-        rt.scheduler
-            .deliver(nid, world_ms, Salience::URGENT, EventKind::Nudge { text });
+    // Made where the world runs. When carried at once, the rendered standing
+    // task goes on the character's inbox to rouse it now — otherwise it would
+    // sit unread until the next idle nudge, up to a minute and a half off.
+    let op = WorldOp::Lodge {
+        npc: nid,
+        mission: Box::new(mission),
+        start,
+    };
+    if let Err(e) = rt.world_write(hosted.id(), op).await {
+        return world_unreached(&e);
     }
 
     Json(json!({
@@ -235,7 +230,7 @@ pub async fn step(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("changing a mission's steps");
     };
-    let Some((hosted, character)) = rt.body_of(nid) else {
+    let Some((hosted, _)) = rt.body_of(nid) else {
         return err(
             StatusCode::CONFLICT,
             "not_in_a_world",
@@ -249,18 +244,19 @@ pub async fn step(
             "say a step to tick off with `done`, or a step to add with `add`",
         );
     }
-    let (ticked, added) = hosted.with_sim(|sim| {
-        let ticked = body.done.as_deref().map(|step| {
-            let outcome = body.outcome.unwrap_or(StepOutcome::Achieved);
-            sim.missions.check_off(&character, step, outcome)
-        });
-        let added = body
-            .add
-            .as_deref()
-            .map(|step| sim.missions.add_todo(&character, step));
-        (ticked, added)
-    });
-    Json(json!({ "ticked": ticked, "added": added })).into_response()
+    let op = WorldOp::Step {
+        npc: nid,
+        done: body.done,
+        outcome: body.outcome,
+        add: body.add,
+    };
+    match rt.world_write(hosted.id(), op).await {
+        Ok(OpReply::Stepped { ticked, added }) => {
+            Json(json!({ "ticked": ticked, "added": added })).into_response()
+        }
+        Ok(other) => world_unreached(&anyhow::anyhow!("the world answered {other:?}")),
+        Err(e) => world_unreached(&e),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,9 +330,14 @@ pub async fn cancel_all(State(s): State<Arc<Authored>>, headers: HeaderMap) -> R
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("cancelling missions");
     };
+    // Every character of every world this member runs, wherever each one
+    // thinks: the missions are the world's, and each member cancels the
+    // missions of the worlds it runs.
     let mut when: HashMap<u64, u64> = HashMap::new();
-    for c in rt.scheduler.census() {
-        when.insert(c.npc_id, s.world_ms(c.npc_id).await);
+    for world in rt.hosted.ids() {
+        for (npc_id, _) in rt.bodies.in_world(&world) {
+            when.insert(npc_id, s.world_ms(npc_id).await);
+        }
     }
     let cancelled = rt.cancel_all_missions(|id| when.get(&id).copied().unwrap_or(0));
     Json(json!({ "cancelled": cancelled })).into_response()
@@ -355,8 +356,17 @@ pub async fn cancel(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("cancelling a mission");
     };
-    let world_ms = s.world_ms(nid).await;
-    Json(json!({ "cancelled": rt.cancel_mission(nid, world_ms) })).into_response()
+    let Some((hosted, _)) = rt.body_of(nid) else {
+        return Json(json!({ "cancelled": false })).into_response();
+    };
+    match rt
+        .world_write(hosted.id(), WorldOp::Cancel { npc: nid })
+        .await
+    {
+        Ok(OpReply::Done { ok }) => Json(json!({ "cancelled": ok })).into_response(),
+        Ok(other) => world_unreached(&anyhow::anyhow!("the world answered {other:?}")),
+        Err(e) => world_unreached(&e),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -404,6 +414,10 @@ pub async fn generate(
     let mut out = Vec::new();
     for id in rt.hosted.ids() {
         if body.world.as_deref().is_some_and(|w| w != id) {
+            continue;
+        }
+        // Each member writes for the worlds it runs.
+        if !rt.standing.writes(&id) {
             continue;
         }
         let Some(hosted) = rt.hosted.get(&id) else {
@@ -467,7 +481,12 @@ pub async fn discard_pool(
         return no_engine("clearing the pool");
     };
     let (mut discarded, mut forgotten) = (0, 0);
-    for hosted in rt.hosted.ids().iter().filter_map(|id| rt.hosted.get(id)) {
+    let run_here = rt
+        .hosted
+        .ids()
+        .into_iter()
+        .filter(|id| rt.standing.writes(id));
+    for hosted in run_here.filter_map(|id| rt.hosted.get(&id)) {
         hosted.with_sim(|sim| {
             discarded += sim.missions.discard_pool();
             if q.ledger {

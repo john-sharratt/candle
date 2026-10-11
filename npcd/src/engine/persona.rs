@@ -125,6 +125,8 @@ pub fn of(n: &NpcPayload, world: &str, anchor: &str) -> OwnedPersona {
         // world's setting to in the projection.
         personality: n.personality_id.clone(),
         world_id: n.world_id.clone(),
+        // The personality's, which the caller supplies when it has it.
+        home: None,
         manner: String::new(),
         beliefs: n.beliefs.iter().map(believe).collect(),
         relationships: n.relationships.iter().map(know).collect(),

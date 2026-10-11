@@ -130,3 +130,6 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # `tower` (for `ServiceExt::oneshot`, used to drive routers in tests without a
 # port) is a regular dependency now, because the effector fast path needs it in
 # production too — see the `[dependencies]` entry.
+# The daemon's own log lines in a failing multi-member test's output, so a
+# failure says what each member did rather than only what it ended as.
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

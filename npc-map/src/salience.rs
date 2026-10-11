@@ -30,6 +30,8 @@
 //!   poor: you can see a body move and a console light, never what either is
 //!   doing. There is nothing in that to act on urgently.
 
+use serde::{Deserialize, Serialize};
+
 use crate::witness::Witnessed;
 use crate::world::Happening;
 
@@ -37,7 +39,8 @@ use crate::world::Happening;
 ///
 /// Ordered ascending, so `>=` reads the way it looks and
 /// [`Weight::PREEMPTS`] is a comparison rather than a list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Weight {
     /// Somewhere else. Worth having in the working set, worth nothing else.
     Ambient,

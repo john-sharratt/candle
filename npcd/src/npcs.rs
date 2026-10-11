@@ -31,10 +31,11 @@
 //! superseding record: the id stays taken, because the acts it already
 //! committed still name it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use candle_conversation::models::identity::LegacySpec;
+use candle_conversation::persistence::identity::RecordIdentity;
 use candle_conversation::persistence::record::{
     AuthoredBelief, AuthoredRelationship, AuthoredStrategy, Modulation, NpcPayload, RecordType,
 };
@@ -91,25 +92,6 @@ const MAX_TAG: usize = 48;
 const MAX_BELIEFS: usize = 128;
 const MAX_RELATIONSHIPS: usize = 128;
 const MAX_STRATEGIES: usize = 128;
-
-/// The shortest interval between two durable records of where a character is.
-///
-/// **Not a tuning knob — the difference between a bounded write rate and an
-/// unbounded one.** A world's metronome runs at `driver::EVERY` (500 ms), and a
-/// walking body covers a leg per tick, so a character crossing the building
-/// changes room twice a second. Writing the record on each of those would append
-/// the whole payload — persona description and all, up to several kilobytes —
-/// twice a second per moving character, and supersede the previous copy each
-/// time. That is megabytes a minute of dead weight for a cast of two, to record
-/// something that is soft state.
-///
-/// So position is *checkpointed*: written when it has actually changed and at
-/// most this often. The cost is that a hard kill can lose up to this much
-/// movement and a character reconstructs a room or two behind — which is
-/// acceptable for state whose whole purpose is to avoid starting everybody at
-/// the front door, and which is the truth about where they were within the last
-/// half minute.
-const PLACE_CHECKPOINT_MS: u64 = 30_000;
 
 /// What the roster's filter bar asks for.
 ///
@@ -173,8 +155,10 @@ impl Filter<'_> {
 pub struct Casting {
     pub npc_id: u64,
     pub world_id: String,
-    /// Where it was last standing, as `area/node`. `None` for a character that
-    /// has never been embodied — it starts at the way in.
+    /// Where its record said it was last standing, as `area/node`, from before
+    /// a world kept its bodies' places as its own records
+    /// (`docs/replicated_substrate.md` §9.1). Read once, for a world taken in
+    /// from what was kept then; every other world places its bodies itself.
     pub at: Option<String>,
     /// The register it was last in, by mood id. `None` for one that has never
     /// said — which is a different fact from being calm, and is left absent
@@ -200,13 +184,9 @@ pub struct Npcs {
     /// **The daemon's only handle to the substrate**, shared with the engine
     /// rather than opened twice. See [`Npcs::substrate`].
     shared: SharedSubstrate,
-    /// When each character's place was last written durably.
-    ///
-    /// In memory only, and deliberately: it is the debounce for
-    /// [`PLACE_CHECKPOINT_MS`], not a fact about the character. A restart
-    /// forgetting it means the first move after boot checkpoints immediately,
-    /// which is the behaviour you want anyway.
-    place_written_ms: BTreeMap<u64, u64>,
+    /// The record each character was last read from, so [`Self::refresh`]
+    /// reads only what changed since.
+    read_as: HashMap<u64, RecordIdentity>,
 }
 
 impl Npcs {
@@ -257,87 +237,57 @@ impl Npcs {
             dir.join(SUBSTRATE_DIR).display()
         );
 
+        let read_as = by_id
+            .keys()
+            .filter_map(|id| Some((*id, persistence.npc_locs().identity(id)?)))
+            .collect();
         Ok(Self {
             by_id,
             shared: SharedSubstrate::new(substrate, persistence),
-            place_written_ms: BTreeMap::new(),
+            read_as,
         })
     }
 
-    /// Where a character was last standing, as `area/node`.
-    ///
-    /// What the runtime puts a body back at on a restart, in place of the
-    /// world's arrival door. `None` for a character that has never been
-    /// embodied — or whose recorded room the map no longer has, which the
-    /// caller resolves, not this.
-    pub fn place_of(&self, npc_id: u64) -> Option<&str> {
-        self.by_id
-            .get(&npc_id)
-            .filter(|n| !n.is_tombstoned())
-            .and_then(|n| n.at.as_deref())
-    }
-
-    /// Record where a character is, if it has moved and enough time has passed.
-    ///
-    /// Returns whether a record was written. Called from the tick driver every
-    /// moment a body moves, so **the two gates are what make it affordable**:
-    /// nothing is written for a character standing still, and a character
-    /// walking across the building writes at most once per
-    /// [`PLACE_CHECKPOINT_MS`] rather than twice a second.
-    ///
-    /// Fsynced like any other write, and affordable **because** of the gates
-    /// above: at one record per thirty seconds per moving character, the cost of
-    /// making the checkpoint durable is nothing, and a staged one would be worth
-    /// very little. The failure this exists to prevent is a daemon restart, and
-    /// a restart that took the log's un-flushed tail with it would put the
-    /// character back at the door — the exact outcome the record is for.
-    pub fn remember_place(&mut self, npc_id: u64, at: &str, now_ms: u64) -> bool {
-        let Some(npc) = self.by_id.get(&npc_id).filter(|n| !n.is_tombstoned()) else {
-            return false;
-        };
-        if npc.at.as_deref() == Some(at) {
-            return false;
-        }
-        // A character with no place yet is checkpointed at once: it has just
-        // been embodied, and the whole point is that a restart finds it there.
-        if npc.at.is_some() {
-            let last = self.place_written_ms.get(&npc_id).copied().unwrap_or(0);
-            if now_ms.saturating_sub(last) < PLACE_CHECKPOINT_MS {
-                return false;
+    /// Take in characters written since this registry last looked — created,
+    /// edited or deleted on another member, and replicated here
+    /// (`docs/replicated_substrate.md` §9.3). Each character whose current
+    /// record is not the one it was read from is read again. Returns the ids
+    /// whose record changed.
+    pub fn refresh(&mut self) -> Vec<u64> {
+        let mut p = self
+            .shared
+            .persistence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let current: Vec<(u64, RecordIdentity)> = p
+            .npc_locs()
+            .iter()
+            .filter_map(|(id, _)| Some((*id, p.npc_locs().identity(id)?)))
+            .collect();
+        let mut changed = Vec::new();
+        for (id, identity) in current {
+            if self.read_as.get(&id) == Some(&identity) {
+                continue;
+            }
+            match p.read_npc(id) {
+                Ok(Some(npc)) => {
+                    if self.by_id.get(&id) != Some(&npc) {
+                        self.by_id.insert(id, npc);
+                        changed.push(id);
+                    }
+                    self.read_as.insert(id, identity);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("character {id}'s record would not read: {e}"),
             }
         }
-
-        let mut npc = npc.clone();
-        npc.at = Some(at.to_string());
-        // **No revision bump and no `updated_ms`.** Those describe authored
-        // change — what somebody edited, and what the console shows as the last
-        // time this character was worked on. A body walking through a door is
-        // neither, and counting it would make every roster sort by "recently
-        // edited" report whoever happens to be walking.
-        let write = {
-            let mut p = self
-                .shared
-                .persistence
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            p.write_npc(&npc).and_then(|_| p.commit())
-        };
-        if let Err(e) = write {
-            // Not fatal and not propagated: this is a checkpoint of soft state
-            // on a driver thread with nobody to report to. The character keeps
-            // walking; the next checkpoint tries again.
-            tracing::warn!("could not record where {npc_id} is: {e}");
-            return false;
-        }
-        self.place_written_ms.insert(npc_id, now_ms);
-        self.by_id.insert(npc_id, npc);
-        true
+        changed
     }
 
     /// The register a character last said it was in.
     ///
     /// What the persona reads back to it on the next turn, so a mood survives a
-    /// restart the way a position does.
+    /// restart.
     pub fn mood_of(&self, npc_id: u64) -> Option<&str> {
         self.by_id
             .get(&npc_id)
@@ -347,15 +297,16 @@ impl Npcs {
 
     /// Record the register a character has named for itself.
     ///
-    /// Returns whether a record was written. **No cadence gate, unlike
-    /// [`Self::remember_place`]**, and the difference is in what produces them:
-    /// a body writes a position twice a second while it walks, where a mood is
-    /// named only by a character stopping to say so — at most once every couple
-    /// of minutes, and usually the same word as last time. The change check
-    /// alone is the whole of the cost control.
+    /// Returns whether a record was written. A mood is named only by a
+    /// character stopping to say so — at most once every couple of minutes, and
+    /// usually the same word as last time — so the change check alone is the
+    /// whole of the cost control.
     ///
-    /// Not an authoring act: no revision bump, no `updated_ms`. See
-    /// [`Self::remember_place`] for why.
+    /// **Not an authoring act: no revision bump and no `updated_ms`.** Those
+    /// describe authored change — what somebody edited, and what the console
+    /// shows as the last time this character was worked on — and a roster
+    /// sorted by "recently edited" would otherwise report whoever happened to
+    /// be feeling something.
     pub fn remember_mood(&mut self, npc_id: u64, mood: &str) -> bool {
         let Some(npc) = self.by_id.get(&npc_id).filter(|n| !n.is_tombstoned()) else {
             return false;
@@ -1502,42 +1453,7 @@ mod tests {
         ));
     }
 
-    /// **Where a character is survives a restart, so the world can be rebuilt
-    /// from the cast.**
-    ///
-    /// The world is not persisted — who stands where lives in RAM and goes with
-    /// the process — so this record is what stops everybody re-entering at the
-    /// arrival door. Two Makers who had spent an hour finding each other were
-    /// returned to the front room as strangers, with their own transcripts
-    /// saying otherwise.
-    #[test]
-    fn where_a_character_is_survives_a_restart() {
-        let dir = tmp();
-        let id: u64 = {
-            let mut n = Npcs::load(&dir).unwrap();
-            let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
-            assert_eq!(n.place_of(id), None, "a new character stands nowhere yet");
-
-            assert!(
-                n.remember_place(id, "vault-casting/green-room", 10_000),
-                "the first place is recorded at once, not after a delay"
-            );
-            assert_eq!(n.place_of(id), Some("vault-casting/green-room"));
-            id
-        };
-
-        let back = Npcs::load(&dir).unwrap();
-        assert_eq!(
-            back.place_of(id),
-            Some("vault-casting/green-room"),
-            "the room did not survive the restart"
-        );
-        // And it rides along with the cast, which is what the loader reads.
-        let casting = back.cast().into_iter().find(|c| c.npc_id == id).unwrap();
-        assert_eq!(casting.at.as_deref(), Some("vault-casting/green-room"));
-    }
-
-    /// **How a character feels survives a restart, the same as where it is.**
+    /// **How a character feels survives a restart.**
     ///
     /// A mood is what a character *is* between one thought and the next, and it
     /// otherwise lives only in the window — which a restart empties. Without
@@ -1576,11 +1492,9 @@ mod tests {
         assert_eq!(casting.mood.as_deref(), Some("cornered"));
     }
 
-    /// Feeling something is not an authoring act.
-    ///
-    /// The same rule `at` follows: a revision bump and an `updated_ms` describe
-    /// what somebody *edited*, and a roster that sorted by "recently edited"
-    /// would report whoever happened to be feeling something.
+    /// Feeling something is not an authoring act: a revision bump and an
+    /// `updated_ms` describe what somebody *edited*, and a roster that sorted by
+    /// "recently edited" would report whoever happened to be feeling something.
     #[test]
     fn feeling_something_is_not_an_edit() {
         let dir = tmp();
@@ -1599,54 +1513,6 @@ mod tests {
             after.updated_ms, before.updated_ms,
             "a mood counted as an edit"
         );
-    }
-
-    /// **A moving body is checkpointed, not transcribed.**
-    ///
-    /// A world's metronome runs at 500 ms and a walking body covers a leg per
-    /// tick, so recording every room change would append the whole record —
-    /// persona description and all — twice a second per moving character, and
-    /// supersede the previous copy each time. The two gates are what make the
-    /// driver able to call this every moment: unchanged is free, and changed is
-    /// bounded by [`PLACE_CHECKPOINT_MS`].
-    #[test]
-    fn a_moving_body_is_checkpointed_rather_than_written_every_step() {
-        let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
-        let id: u64 = nid(&n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap());
-
-        assert!(n.remember_place(id, "vault-command/command-room", 1_000));
-        // Standing still costs nothing, however often it is asked.
-        assert!(!n.remember_place(id, "vault-command/command-room", 99_000));
-        // Moving again inside the window is held back...
-        assert!(!n.remember_place(id, "vault-command/anteroom", 2_000));
-        assert!(!n.remember_place(id, "vault-command/dispatch-room", 3_000));
-        assert_eq!(
-            n.place_of(id),
-            Some("vault-command/command-room"),
-            "a checkpoint inside the window must not have been written"
-        );
-        // ...and the next one past it records wherever the body ended up.
-        assert!(n.remember_place(id, "vault-casting/green-room", 1_000 + PLACE_CHECKPOINT_MS));
-        assert_eq!(n.place_of(id), Some("vault-casting/green-room"));
-    }
-
-    /// A checkpoint is not an edit. `revision` and `updated_ms` describe what
-    /// somebody authored, and a body walking through a door is neither — a
-    /// roster sorted by "recently edited" would otherwise rank whoever happens
-    /// to be walking.
-    #[test]
-    fn walking_does_not_count_as_editing_the_character() {
-        let dir = tmp();
-        let mut n = Npcs::load(&dir).unwrap();
-        let made = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
-        let id: u64 = nid(&made);
-
-        n.remember_place(id, "vault-casting/green-room", 50_000);
-
-        let after = n.get(id, ME).unwrap();
-        assert_eq!(after["revision"], made["revision"]);
-        assert_eq!(after["updated_ms"], made["updated_ms"]);
     }
 
     /// An edit supersedes rather than accumulating: the reopened registry sees

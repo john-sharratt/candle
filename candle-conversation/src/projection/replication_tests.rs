@@ -9,7 +9,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use super::{Conversation, GroupId, LayerId};
-use crate::persistence::deleted::DeletedTimeline;
+use crate::persistence::deleted::{DeletedEntry, DeletedTimeline};
 use crate::persistence::identity::GEN_DETACHED;
 use crate::persistence::record::decode_header;
 use crate::persistence::SubstratePersistence;
@@ -139,8 +139,15 @@ fn what_a_catch_up_learns_is_gone_is_kept() {
         origin: 0xA,
         oseq: 7,
     };
-    conv.record_gone(0xA, &[(5, None), (6, None), (7, Some(entry))])
-        .unwrap();
+    conv.record_gone(
+        0xA,
+        &[
+            (5, None),
+            (6, None),
+            (7, Some(DeletedEntry::Timeline(entry))),
+        ],
+    )
+    .unwrap();
     assert!(conv.applied_set().contains(0xA, 6));
     assert_eq!(conv.read().deleted_entry(timeline), Some(entry));
     drop(conv);

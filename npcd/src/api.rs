@@ -1032,12 +1032,18 @@ async fn create_npc(
             // idempotent, so doing it here costs nothing on the startup path.
             if let Some(rt) = s.runtime.as_ref() {
                 if let Some(id) = v.get("npc_id").and_then(npc_id_of) {
-                    let world_ms = s.world_ms(id).await;
-                    rt.scheduler.wake(id, 0, world_ms);
-                    // And its task with it — waking puts the inbox in the
-                    // scheduler; the task is what waits on it and thinks.
-                    rt.spawn_character(id);
-                    tracing::info!("npc {id}: created and woken");
+                    // **Woken here when it runs here.** Under a cluster a
+                    // character runs on the member its world's authority lends
+                    // it to (`docs/replicated_substrate.md` §9.3), which wakes
+                    // it there; a daemon with no cluster runs them all.
+                    if rt.standing.runs(id) {
+                        let world_ms = s.world_ms(id).await;
+                        rt.scheduler.wake(id, 0, world_ms);
+                        // And its task with it — waking puts the inbox in the
+                        // scheduler; the task is what waits on it and thinks.
+                        rt.spawn_character(id);
+                        tracing::info!("npc {id}: created and woken");
+                    }
 
                     // And given a body, if its world has anywhere to stand. A
                     // character whose world is authored but unmapped is a
@@ -1564,8 +1570,13 @@ async fn delete_npc(
                 // for ever and can never discharge, because there is nobody in
                 // the room answering to that name. That is the exact shape of
                 // defect the obligation was added to remove.
+                // The world's to forget, so its authority does: here when this
+                // member runs the world, and on the authority as it takes the
+                // deletion in (`Runtime::follow_cast`) when it does not.
                 if let Some((hosted, body)) = rt.body_of(npc_id) {
-                    hosted.with_sim(|s| s.ledger.forget_questions(&body));
+                    if rt.standing.writes(hosted.id()) {
+                        hosted.with_sim(|s| s.ledger.forget_questions(&body));
+                    }
                 }
                 let minds = rt.minds.read().unwrap().clone();
                 if let Some(minds) = minds {
@@ -2404,8 +2415,16 @@ async fn put_world(
     save(&s.worlds, "world_id", &wid, body).await
 }
 
+/// Delete a world: its document, and the world running from it — stopped, and
+/// its state records tombstoned (`docs/replicated_substrate.md` §9.1).
 async fn delete_world(State(s): State<Arc<Authored>>, Path(wid): Path<String>) -> Response {
-    remove(&s.worlds, "world_not_found", &wid).await
+    let removed = remove(&s.worlds, "world_not_found", &wid).await;
+    if removed.status().is_success() {
+        if let Some(rt) = s.runtime.as_ref() {
+            rt.remove_world(&wid);
+        }
+    }
+    removed
 }
 
 /// Every personality, minus the hidden ones the filter has not named.
@@ -3482,8 +3501,14 @@ mod tests {
                 ("/v1/pulse/guardian", "admin"),
                 ("/v1/pulse/missions/cancel", "admin"),
                 ("/v1/pulse/missions/generate", "admin"),
+                // The pool's read and its clearing are registered apart for
+                // their dispatch: any member reads it, every member clears the
+                // worlds it runs.
                 ("/v1/pulse/missions/pool", "admin"),
-                // The table's operations — admin, like the table itself.
+                ("/v1/pulse/missions/pool", "admin"),
+                // The table's operations — admin, like the table itself. The
+                // list and a review are registered apart, as the pool is.
+                ("/v1/pulse/operations", "admin"),
                 ("/v1/pulse/operations", "admin"),
                 ("/v1/pulse/operations/:wid/:oid", "admin"),
                 ("/v1/pulse/operations/:wid/:oid/cancel", "admin"),

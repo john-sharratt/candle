@@ -23,6 +23,10 @@ pub struct CoordState {
     /// Every `--cluster` it was given, and its socket there.
     pub clusters: Vec<ClusterLine>,
     pub paxos: PaxosView,
+    /// Each world of the app, as this member stands to it (§9.2–§9.4).
+    pub worlds: Vec<WorldLine>,
+    /// The NPC leases it holds (§9.3).
+    pub npc_leases: Vec<NpcLeaseLine>,
     pub claims: Vec<ClaimLine>,
     /// Per origin: how far it has applied, its gaps, and the origin's
     /// announced `high_water` (§7.1).
@@ -112,6 +116,44 @@ pub struct KeyLine {
     /// Its acceptor's promised and accepted ballots.
     pub promised: Option<String>,
     pub accepted: Option<String>,
+}
+
+/// One world, as a member stands to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldLine {
+    pub world: String,
+    /// `authority`, `replica` or `disconnected`.
+    pub role: String,
+    /// The lease epoch it writes the world's state under, as its authority.
+    pub epoch: Option<u64>,
+    /// When it took this role, in wall-clock milliseconds.
+    pub since_ms: u64,
+    /// A handover it waits on before it runs the world: the records of the
+    /// member that handed it back, `<origin> through <oseq>` (§9.6).
+    pub waiting: Option<String>,
+    /// As the world's authority: every character's lease it lends.
+    pub lent: Vec<NpcLeaseLine>,
+}
+
+/// One character's NPC lease.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpcLeaseLine {
+    pub world: String,
+    pub npc: u64,
+    /// The member that runs it; empty when an admin freed it.
+    pub holder: String,
+    pub expires_ms: u64,
+    /// The member rendezvous names now, waiting for the holder to hand it
+    /// back.
+    pub next: Option<String>,
+}
+
+/// What the app adds to its member's report: its worlds and the NPC leases it
+/// holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppCoord {
+    pub worlds: Vec<WorldLine>,
+    pub npc_leases: Vec<NpcLeaseLine>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,7 +250,8 @@ mod tests {
         let want = concat!(
             r#"{"mode":"joined","detached":false,"fault":null,"#,
             r#""gen":{"current":2,"last_rejoin":null,"decided":2},"deferred":[],"clusters":[],"#,
-            r#""paxos":{"max_members":3,"quorum":2,"keys":[]},"claims":[],"applied":[],"#,
+            r#""paxos":{"max_members":3,"quorum":2,"keys":[]},"worlds":[],"npc_leases":[],"#,
+            r#""claims":[],"applied":[],"#,
             r#""outbox":{"unsent":1,"in_flight":4},"catchups":[],"#,
             r#""tombstones":{"held":0,"waiting_age":0,"deleted":0},"#,
             r#""disk":{"free":0,"total":0,"floor":0},"#,

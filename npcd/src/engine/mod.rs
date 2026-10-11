@@ -130,6 +130,7 @@ use serde_json::{json, Value};
 use web::auth::{Identity, Role, Roles};
 
 use crate::api::{err, owner_of, Authored};
+use crate::authority::ops::{OpReply, WorldOp};
 use crate::engine::interaction::Interlocutor;
 use crate::engine::mind::Minds;
 use crate::npcs;
@@ -146,6 +147,17 @@ pub fn no_engine(what: &str) -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         "no_engine",
         &format!("{what} needs an inference engine, and this daemon is not running one"),
+    )
+}
+
+/// A write to a world that runs on another member did not reach it
+/// (`docs/replicated_substrate.md` §9.3): `502`, naming why, since the request
+/// was right and the world will be back.
+pub fn world_unreached(e: &anyhow::Error) -> Response {
+    err(
+        StatusCode::BAD_GATEWAY,
+        "world_unreached",
+        &format!("the world this character stands in did not answer: {e:#}"),
     )
 }
 
@@ -446,14 +458,17 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             each(),
             get(guardian_api::records),
         )
-        // The mission board and the operations on it are a world's, and go to
-        // its authority; a route that names no world goes to the best member.
+        // The mission board and the operations on it are a world's, and only
+        // its authority changes them (§9.2): a route naming one world goes to
+        // its authority, and one naming none goes to every member, each acting
+        // on the worlds it runs. Reading them is any member's: every member
+        // holds every world's state.
         //
         // Clear the whole board's missions at once.
         .route(
             "/v1/pulse/missions/cancel",
             Role::Admin,
-            world(),
+            each(),
             post(mission_api::cancel_all),
         )
         // The table's generator: write one mission now, and read or clear what
@@ -462,14 +477,20 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/pulse/missions/generate",
             Role::Admin,
-            world(),
+            each(),
             post(mission_api::generate),
         )
         .route(
             "/v1/pulse/missions/pool",
             Role::Admin,
-            world(),
-            get(mission_api::pool).delete(mission_api::discard_pool),
+            Dispatch::Any,
+            get(mission_api::pool),
+        )
+        .route(
+            "/v1/pulse/missions/pool",
+            Role::Admin,
+            each(),
+            delete(mission_api::discard_pool),
         )
         // Operations: the objectives the table holds, each a draft and a review
         // by two Makers. Read every world's, put a document through review,
@@ -477,8 +498,14 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/pulse/operations",
             Role::Admin,
-            world(),
-            get(operations_api::list).post(operations_api::review),
+            Dispatch::Any,
+            get(operations_api::list),
+        )
+        .route(
+            "/v1/pulse/operations",
+            Role::Admin,
+            each(),
+            post(operations_api::review),
         )
         .route(
             "/v1/pulse/operations/:wid/:oid",
@@ -905,20 +932,31 @@ async fn open_interaction(
         .map(|(hosted, _)| hosted.id().to_string());
     let ix = rt
         .interactions
-        .open(npc_id, mode, who.clone(), world, now, world_ms);
+        .open(npc_id, mode, who.clone(), world.clone(), now, world_ms);
 
     // **Physical means physical.** The person walks into the room the character
     // is standing in, so it appears in `Within::company` — which is what turns
     // `tell`, `ask`, `give`, `touch` and `gesture` back on. Without a body it
     // heard you and could not answer you, and went on waiting for somebody to
     // arrive while you were talking to it.
-    let standing = match mode == crate::engine::tools::Mode::Physical {
-        true => rt.enter_world_beside(npc_id, &ix.body, &who.display),
-        false => None,
+    let standing = match (mode == crate::engine::tools::Mode::Physical, &world) {
+        (true, Some(world)) => {
+            let op = WorldOp::EnterBeside {
+                npc: npc_id,
+                visitor: ix.body.clone(),
+                name: who.display.clone(),
+            };
+            match rt.world_write(world, op).await {
+                Ok(OpReply::Placed { at }) => at,
+                Ok(_) => None,
+                Err(e) => return world_unreached(&e),
+            }
+        }
+        _ => None,
     };
     let mut wire = ix.wire(now);
     if let Some(at) = standing {
-        wire["you_are_at"] = json!(at.to_string());
+        wire["you_are_at"] = json!(at);
     }
     Json(wire).into_response()
 }
@@ -950,7 +988,18 @@ async fn end_interaction(State(s): State<Arc<Authored>>, Path(ix): Path<String>)
     // gone, and a room that still lists them is a room where a character is
     // told it has company that is not there.
     let left = match session {
-        Some(was) if was.mode == crate::engine::tools::Mode::Physical => rt.leave_world(&was.body),
+        Some(was) if was.mode == crate::engine::tools::Mode::Physical => match &was.world {
+            Some(world) => {
+                let op = WorldOp::Leave {
+                    visitor: was.body.clone(),
+                };
+                matches!(
+                    rt.world_write(world, op).await,
+                    Ok(OpReply::Done { ok: true })
+                )
+            }
+            None => rt.leave_world(&was.body),
+        },
         _ => false,
     };
     Json(json!({ "interaction_id": ix, "state": "ended", "left_the_world": left })).into_response()
@@ -1107,12 +1156,25 @@ async fn post_message(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("messaging a character");
     };
-    let Some(sent) = rt.message_npc(npc_id, &me, text) else {
-        return err(
+    let not_in_a_world = || {
+        err(
             StatusCode::CONFLICT,
             "not_in_a_world",
             "that character has no body in a world, so there is nothing to reach it on",
-        );
+        )
+    };
+    let Some((hosted, _)) = rt.body_of(npc_id) else {
+        return not_in_a_world();
+    };
+    let op = WorldOp::Message {
+        npc: npc_id,
+        from: me.clone(),
+        text: text.to_string(),
+    };
+    let sent = match rt.world_write(hosted.id(), op).await {
+        Ok(OpReply::Sent { sent: Some(sent) }) => sent,
+        Ok(_) => return not_in_a_world(),
+        Err(e) => return world_unreached(&e),
     };
     Json(json!({
         "sent": text,
@@ -1200,7 +1262,18 @@ async fn post_posting(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("posting into a world");
     };
-    let Some(lines) = rt.post_in_world(&wid, &at, &on, &me, &text) else {
+    let op = WorldOp::Posting {
+        at: at.clone(),
+        on: on.clone(),
+        by: me.clone(),
+        text: text.clone(),
+    };
+    let lines = match rt.world_write(&wid, op).await {
+        Ok(OpReply::Posted { lines }) => lines,
+        Ok(_) => None,
+        Err(e) => return world_unreached(&e),
+    };
+    let Some(lines) = lines else {
         return err(
             StatusCode::NOT_FOUND,
             "no_such_place",
@@ -1290,7 +1363,16 @@ async fn post_channel(
     let Some(rt) = s.runtime.as_ref() else {
         return no_engine("speaking on a world's channel");
     };
-    let Some(heard) = rt.say_on_channel(&wid, &me, text) else {
+    let op = WorldOp::Channel {
+        from: me.clone(),
+        text: text.to_string(),
+    };
+    let heard = match rt.world_write(&wid, op).await {
+        Ok(OpReply::Heard { by }) => by,
+        Ok(_) => None,
+        Err(e) => return world_unreached(&e),
+    };
+    let Some(heard) = heard else {
         return err(
             StatusCode::NOT_FOUND,
             "no_such_world",

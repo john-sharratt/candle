@@ -111,7 +111,7 @@ pub fn survival(rt: RecordType) -> Survival {
         RecordType::TurnCoupling => Survival::Resident,
         // Host-defined keyed state (e.g. npcd's command-table open flag), held
         // in `Substrate::custom_objects` and re-emitted from
-        // `live_custom_objects`.
+        // `held_custom_objects`, tombstones among them until they expire.
         RecordType::CustomObject => Survival::Resident,
         // The deleted set, held in `Substrate::deleted` and rewritten whole —
         // by compaction with the tombstones it expired, by maintenance as it

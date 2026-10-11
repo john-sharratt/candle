@@ -67,7 +67,7 @@ use crate::conversation::window_sealed_tokens;
 use crate::index_pages::{self, StoredPages};
 use crate::normalization::Phase;
 use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
-use crate::persistence::deleted::{DeletedPayload, DeletedTimeline};
+use crate::persistence::deleted::{DeletedKey, DeletedPayload, DeletedTimeline};
 use crate::persistence::identity::RecordIdentity;
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
@@ -480,6 +480,9 @@ pub struct Substrate {
     /// old one (last-writer-wins). Held in RAM and re-emitted on compaction, the
     /// same survival the other resident metadata gets.
     custom_objects: HashMap<u64, CustomObjectPayload>,
+    /// Moves whenever a custom object is taken or dropped
+    /// ([`Self::custom_objects_version`]).
+    custom_objects_version: u64,
 
     /// Layers toggled out of projection assembly by name — a diagnostic kill
     /// switch flipped live and forgotten on restart (see
@@ -4219,6 +4222,10 @@ impl Substrate {
         self.snapshot_ids.clear();
         self.branch_checkpoint_ids.clear();
         self.custom_object_ids.clear();
+        // An expired keyed tombstone is not carried (§6.8), so the objects
+        // shrink as well, and are rebuilt from what was.
+        self.custom_objects.clear();
+        self.custom_objects_version += 1;
         self.pending.clear();
         for tl in self.timelines.values_mut() {
             tl.label = None;
@@ -4833,11 +4840,20 @@ impl Substrate {
 
     /// Apply custom-object record `id` — on replay and on the runtime write
     /// path. Keyed by the stable hash of its `key`, and the greatest stamp per
-    /// key holds it.
+    /// key holds it. A key whose tombstone expired holds against every write
+    /// stamped below that tombstone (§6.8).
     pub fn apply_custom_object(&mut self, obj: CustomObjectPayload, id: RecordIdentity) {
         let key = obj.stream_id();
+        if self
+            .deleted
+            .key_entry(key)
+            .is_some_and(|e| id.stamp() <= e.stamp())
+        {
+            return;
+        }
         if take(self.custom_object_ids.entry(key).or_default(), id) {
             self.custom_objects.insert(key, obj);
+            self.custom_objects_version += 1;
         }
     }
 
@@ -4849,19 +4865,56 @@ impl Substrate {
             .unwrap_or_default()
     }
 
-    /// The live custom object stored under `key`, if any.
+    /// The live custom object stored under `key`, if any: none for a key whose
+    /// winning record is its tombstone.
     pub fn custom_object(&self, key: &str) -> Option<&CustomObjectPayload> {
         self.custom_objects
             .get(&CustomObjectPayload::stream_id_for(key))
+            .filter(|obj| !obj.ceased)
     }
 
-    /// Every live custom object with the record behind it — the set the
-    /// compaction pass re-emits so they survive it.
-    pub fn live_custom_objects(&self) -> Vec<(CustomObjectPayload, RecordIdentity)> {
+    /// Every live custom object whose key starts with `prefix`, with the
+    /// record behind it, in key order.
+    pub fn custom_objects_under(&self, prefix: &str) -> Vec<(CustomObjectPayload, RecordIdentity)> {
+        let mut out: Vec<(CustomObjectPayload, RecordIdentity)> = self
+            .custom_objects
+            .iter()
+            .filter(|(_, obj)| !obj.ceased && obj.key.starts_with(prefix))
+            .map(|(key, obj)| (obj.clone(), self.custom_object_id(*key)))
+            .collect();
+        out.sort_by(|a, b| a.0.key.cmp(&b.0.key));
+        out
+    }
+
+    /// A count that moves whenever a custom object is taken: what a reader of
+    /// a prefix compares to know whether to read it again.
+    pub fn custom_objects_version(&self) -> u64 {
+        self.custom_objects_version
+    }
+
+    /// Every custom object this substrate holds, tombstones included, with the
+    /// record behind it — the set the compaction pass re-emits so they
+    /// survive it.
+    pub fn held_custom_objects(&self) -> Vec<(CustomObjectPayload, RecordIdentity)> {
         self.custom_objects
             .iter()
             .map(|(key, obj)| (obj.clone(), self.custom_object_id(*key)))
             .collect()
+    }
+
+    /// The entry a keyed value's expired tombstone left, if it expired.
+    pub fn deleted_key(&self, key_hash: u64) -> Option<DeletedKey> {
+        self.deleted.key_entry(key_hash).copied()
+    }
+
+    /// Whether a complete compaction has run past the tombstone on `key_hash`.
+    pub fn is_key_tombstone_swept(&self, key_hash: u64) -> bool {
+        self.deleted.is_key_swept(key_hash)
+    }
+
+    /// Every expired keyed tombstone's entry, in key order.
+    pub fn deleted_keys(&self) -> impl Iterator<Item = DeletedKey> + '_ {
+        self.deleted.key_entries()
     }
 
     /// Apply a decoded [`TombstonePayload`].  Works whether or not
@@ -4930,6 +4983,19 @@ impl Substrate {
         for entry in &payload.timelines {
             if let Some(timeline) = TimelineId::from_raw(entry.timeline) {
                 self.mark_timeline_dead(timeline);
+            }
+        }
+        // A key's entry outranks whatever this substrate held of it from at or
+        // below its tombstone, as the tombstone did.
+        for entry in &payload.keys {
+            let held_below = self
+                .custom_object_ids
+                .get(&entry.key)
+                .is_some_and(|id| id.stamp() <= entry.stamp());
+            if held_below {
+                self.custom_objects.remove(&entry.key);
+                self.custom_object_ids.remove(&entry.key);
+                self.custom_objects_version += 1;
             }
         }
     }

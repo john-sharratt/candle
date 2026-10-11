@@ -19,19 +19,21 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
 use super::catchup::{Progress, Purpose, Requester};
 use super::fault::Fault;
+use super::lease::{LeaseEvent, Term, EVENTS_KEPT};
+use super::pulse::PULSES_KEPT;
 use super::store::Store;
 use super::watch::GapWatch;
 use crate::consensus::votes::VoteStore;
 use crate::consensus::{Config, Millis, Paxos};
-use crate::coord::CommandLine;
+use crate::coord::{AppCoord, CommandLine};
 use crate::delivery::Outbox;
 use crate::fragment::Whole;
-use crate::frame::{Admit, Catchup, Done, Frame, Headers, Members};
+use crate::frame::{Admit, Catchup, Done, Frame, Headers, Members, Pulse};
 use crate::member::AppMember;
 use crate::session::SessionHandle;
 
@@ -224,7 +226,20 @@ pub struct Replicator {
     pub(super) member: Weak<AppMember>,
     /// The maintenance commands run lately, for `COORD` (§12.4).
     pub(super) commands: Mutex<VecDeque<CommandLine>>,
+    /// What becomes of the leases this member asks for (§9.2).
+    pub(super) leases: broadcast::Sender<LeaseEvent>,
+    /// Each lease this member asked for: its term and the quorum counted, so
+    /// one held under a smaller quorum is asked for again as the group grows.
+    pub(super) terms: Mutex<BTreeMap<Vec<u8>, Term>>,
+    /// The world pulses other members broadcast (§9.1).
+    pub(super) pulses: broadcast::Sender<Pulse>,
+    /// What the app adds to `COORD`: its worlds and NPC leases (§12.1).
+    pub(super) app_coord: Mutex<Option<AppCoordFn>>,
 }
+
+/// How the app reports its worlds and NPC leases for `COORD`. Called once a
+/// second off the ticker, so it reads state and never waits.
+pub type AppCoordFn = Box<dyn Fn() -> AppCoord + Send + Sync>;
 
 impl Replicator {
     /// `replication` for the member `member`, over `clusters` sockets.
@@ -290,6 +305,10 @@ impl Replicator {
             epoch,
             member,
             commands: Mutex::new(VecDeque::new()),
+            leases: broadcast::channel(EVENTS_KEPT).0,
+            terms: Mutex::new(BTreeMap::new()),
+            pulses: broadcast::channel(PULSES_KEPT).0,
+            app_coord: Mutex::new(None),
             store,
         });
         let tap = Arc::downgrade(&r);
@@ -437,6 +456,7 @@ impl Replicator {
             Frame::Catchup(asked) => self.answer_catchup(c, asked),
             Frame::Fetch(f) => self.answer_fetch(c, f),
             Frame::Have(h) => self.offered(c, h),
+            Frame::Pulse(p) => self.pulsed(p),
             f @ (Frame::Prepare(_)
             | Frame::Promise(_)
             | Frame::Nack(_)
@@ -534,5 +554,20 @@ impl Replicator {
     /// The member this replicates for, while it lives.
     pub(super) fn member(&self) -> Option<Arc<AppMember>> {
         self.member.upgrade()
+    }
+
+    /// Install what the app adds to `COORD`.
+    pub fn set_app_coord(&self, report: AppCoordFn) {
+        *self.app_coord.lock().unwrap_or_else(|e| e.into_inner()) = Some(report);
+    }
+
+    /// What the app reports now; nothing before it installs its report.
+    pub(super) fn app_coord(&self) -> AppCoord {
+        self.app_coord
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_default()
     }
 }

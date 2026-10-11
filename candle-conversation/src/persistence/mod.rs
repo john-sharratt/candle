@@ -105,7 +105,7 @@ use content_hash::snapshot_stream_id;
 use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use identity::{
     load_or_mint, now_ms, read_node, MarkerIds, MintGeneration, Minter, NodeSource, Origination,
-    OwnSections, RecordIdentity, Stamped, GEN_DETACHED,
+    OwnSections, RecordIdentity, Stamped, VersionStamp, GEN_DETACHED,
 };
 use inherit::InheritedSubstrate;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
@@ -366,10 +366,58 @@ impl SharedSubstrate {
     }
 
     /// Read the live [`CustomObjectPayload`] for `key`, or `None` if none was
-    /// ever written (or the last write for the key was tombstoned by a newer
-    /// one — the winner is whatever [`Self::put_custom_object`] stored last).
+    /// ever written, or its winning record is its tombstone
+    /// ([`CustomObjectPayload::ceased`]).
     pub fn custom_object(&self, key: &str) -> Option<CustomObjectPayload> {
         self.substrate.read().unwrap().custom_object(key).cloned()
+    }
+
+    /// Store `objs` — values and tombstones alike — under the lease epoch
+    /// `epoch`, in one commit (`docs/replicated_substrate.md` §9.1): a world's
+    /// authority writes every entity that changed in a beat at once, each
+    /// stamped with its lease's epoch so no earlier holder's write outranks it.
+    pub fn put_custom_objects_under(
+        &self,
+        objs: Vec<CustomObjectPayload>,
+        epoch: u64,
+    ) -> Result<()> {
+        if objs.is_empty() {
+            return Ok(());
+        }
+        let ids = {
+            let mut p = self.persistence.lock().unwrap();
+            let mut ids = Vec::with_capacity(objs.len());
+            for obj in &objs {
+                let id = p.mint_under(epoch);
+                p.write_custom_object(obj, id)?;
+                ids.push(id);
+            }
+            p.commit()?;
+            ids
+        };
+        let mut s = self.substrate.write().unwrap();
+        for (obj, id) in objs.into_iter().zip(ids) {
+            s.apply_custom_object(obj, id);
+        }
+        Ok(())
+    }
+
+    /// Every live custom object whose key starts with `prefix`, in key order,
+    /// with the stamp of the record that holds it.
+    pub fn custom_objects_under(&self, prefix: &str) -> Vec<(CustomObjectPayload, VersionStamp)> {
+        self.substrate
+            .read()
+            .unwrap()
+            .custom_objects_under(prefix)
+            .into_iter()
+            .map(|(obj, id)| (obj, id.stamp()))
+            .collect()
+    }
+
+    /// A count that moves whenever a custom object changes: read a prefix
+    /// again only when it has.
+    pub fn custom_objects_version(&self) -> u64 {
+        self.substrate.read().unwrap().custom_objects_version()
     }
 }
 
@@ -1175,6 +1223,12 @@ impl SubstratePersistence {
     /// The identity of the next record this substrate originates.
     pub fn mint(&self) -> RecordIdentity {
         self.minter.mint(0)
+    }
+
+    /// The identity of the next record this substrate originates under the
+    /// claim or lease epoch `epoch` (§6.2, §9.2).
+    pub fn mint_under(&self, epoch: u64) -> RecordIdentity {
+        self.minter.mint(epoch)
     }
 
     /// The identity of the next record of type `rt` this substrate writes

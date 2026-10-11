@@ -317,10 +317,11 @@ it through one `file_edit` with the vault in it again; a
 composed draft rewritten by hand afterwards lost what the composing gave it ("I am writing this from
 the chronicle level, where the light ring hums").
 
-A Maker's uncommitted working copy outlives a reboot: each world's benches are written to the
-substrate as `benches/<world>` beside `missions/<world>` whenever they change, and restored under
-the mind the restarted daemon was given (`Benches::restore`). Saved without them, every restart
-sent each Maker back to an empty working set, and one that had composed its piece composed it again.
+A Maker's uncommitted working copy outlives a reboot: each body's working set is one of its
+world's state records, `world/<wid>/sim/bench/open/<body>`, written by the world's authority
+whenever it changes and taken back in under the mind the restarted daemon was given
+(`docs/replicated_substrate.md` §9.1, `Sim::take_in`). Saved without them, every restart sent each
+Maker back to an empty working set, and one that had composed its piece composed it again.
 While the working copy holds the piece at its floor, the compass says to read it back and commit
 it, not to write it. A commit collides only with somebody else's: a body's own earlier commit is
 no collision, and the table's clerical tidy before a reading rebases every open working copy of

@@ -14,6 +14,8 @@ mod registry;
 mod relay;
 mod status;
 mod traffic;
+mod world_log;
+mod worlds_view;
 
 pub use admission::{Admission, Admitted, MAX_SKEW_MS};
 pub use claims::Claims;
@@ -27,3 +29,4 @@ pub use status::{
     state_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
 };
 pub use traffic::{Class, Failure, OpenStream, Traffic, TrafficView};
+pub use worlds_view::{disconnected, proposer_key, worlds, DisconnectedRow, WorldView};

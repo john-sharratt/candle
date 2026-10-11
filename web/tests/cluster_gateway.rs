@@ -113,6 +113,7 @@ fn member_api(node: u64, app: Arc<AppMember>) -> Router {
                     "hop": header(&headers, "x-tokera-hop"),
                     "cookie": header(&headers, "cookie"),
                     "email": header(&headers, "x-tokera-email"),
+                    "from_member": header(&headers, "x-tokera-from-member"),
                 }))
             }),
         )
@@ -683,6 +684,47 @@ async fn the_endpoint_refuses_what_cannot_be_a_member() {
     assert_eq!(fetch(gw, "/v1/cluster/other").await.status, 404);
     // A plain GET with no upgrade is refused by the WebSocket handshake.
     assert_eq!(fetch(gw, "/v1/cluster/zend").await.status, 400);
+}
+
+/// **Which member a request came from** (§9.3): a request a member's own
+/// stream carried reaches the member it is routed to naming the sender; a
+/// client claiming to be a member is not believed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_a_members_own_stream_names_it() {
+    let dumb = spawn(dumb_daemon()).await;
+    let (gw, hub) = gateway(dumb).await;
+    let m = member(gw, 3, 100);
+    until("joined", || hub.status(0).members.len() == 1).await;
+    until("clustered", || hub.clustered("zend")).await;
+
+    let forged = ask(
+        gw,
+        "GET",
+        "/v1/where",
+        &[("x-tokera-from-member", "00000000000000aa")],
+        "",
+    )
+    .await;
+    assert_eq!(forged.json()["from_member"], "", "{}", forged.body);
+
+    let conn = m.app.open_up().expect("a socket to open a stream on");
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(conn))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let res = sender
+        .send_request(
+            Request::get("/v1/where")
+                .header("host", "code.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let got: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(got["from_member"], "0000000000000003");
+    m.leave();
 }
 
 /// **A member dialling the real endpoint** over a real WebSocket is joined.

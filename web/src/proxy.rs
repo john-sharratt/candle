@@ -68,7 +68,7 @@ pub const HOP_BY_HOP: [header::HeaderName; 7] = [
 /// this gateway itself resolved.
 ///
 /// [`Builder::trust`]: crate::server::Builder::trust
-pub const IDENTITY_HEADERS: [&str; 6] = [
+pub const IDENTITY_HEADERS: [&str; 7] = [
     "x-tokera-user",
     // The issuer half of the account key. In this list because it decides
     // *which* account a subject resolves to: a client able to set it could pick
@@ -79,7 +79,16 @@ pub const IDENTITY_HEADERS: [&str; 6] = [
     "x-tokera-name",
     "x-tokera-picture",
     "x-tokera-assertion",
+    // The member a request came from, when another member sent it: what a
+    // member's internal routes believe (§9.3). Set only from a stream the
+    // member itself opened, so a client claiming it is claiming to be one.
+    FROM_MEMBER,
 ];
+
+/// The header naming the member a request came from, its node in hex — set by
+/// the gateway on a request that arrived on a stream a member opened (§5.8),
+/// and on nothing else.
+pub const FROM_MEMBER: &str = "x-tokera-from-member";
 
 /// What a visitor is told when a daemon behind the gateway is not answering.
 ///
@@ -125,6 +134,8 @@ pub struct Forward<'a> {
     /// The cache policy to apply **only where the upstream stated none** — see
     /// [`crate::asset::relay_cache`].
     pub cache: Cache,
+    /// The member that opened the stream this request came on, if one did.
+    pub from_member: Option<u64>,
 }
 
 /// Set the identity headers that name `id`, as every request this gateway
@@ -244,6 +255,11 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
         // serves reads a cookie (§5.1).
         To::Member { .. } => {
             headers.remove(header::COOKIE);
+            if let Some(node) = f.from_member {
+                if let Ok(v) = HeaderValue::from_str(&format!("{node:016x}")) {
+                    headers.insert(HeaderName::from_static(FROM_MEMBER), v);
+                }
+            }
         }
     }
     if is_upgrade {

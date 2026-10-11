@@ -636,8 +636,15 @@ pub fn spawn(rt: Arc<Runtime>) {
                     continue;
                 };
                 // The workflows as the mind's file has them now: an edit to
-                // `missions.yaml` applies to every operation's next step.
+                // `missions.yaml` applies to every operation's next step. Every
+                // member reads them, for the worlds it follows as well as the
+                // ones it runs — they are the mind's, not the world's.
                 hosted.with_sim(|s| s.missions.set_workflows(config.workflows.clone()));
+                // The table is the world's authority's to keep: a member that
+                // only follows the world takes its missions from the records.
+                if !rt.standing.role(&id).is_authority() {
+                    continue;
+                }
                 // **Every failed operation's document is settled here**, however
                 // it failed — rejected, read and found wanting past the limit,
                 // or stuck — as its workflow's `on-failed` says: a draft set

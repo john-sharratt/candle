@@ -147,6 +147,21 @@ impl Lift {
         self.stops.contains(&floor)
     }
 
+    /// Every stop the car still has to reach, lowest first.
+    pub fn stops(&self) -> Vec<usize> {
+        self.stops.iter().copied().collect()
+    }
+
+    /// Set the car where a record of it says it was: its floor, its doors and
+    /// its stops. A floor off the shaft is clamped to the last one, and a stop
+    /// off the shaft dropped, so a record from before the building changed
+    /// still leaves a car that can move.
+    pub fn restore(&mut self, at: usize, doors: Doors, stops: &[usize]) {
+        self.at = at.min(self.floors - 1);
+        self.doors = doors;
+        self.stops = stops.iter().copied().filter(|f| *f < self.floors).collect();
+    }
+
     /// Add `floor` to the car's stops — a call from a landing or a choice from
     /// inside; the car does not know the difference and does not need to.
     /// Off-the-shaft floors are ignored, and a call to the floor the car is
@@ -237,6 +252,22 @@ mod tests {
     #[should_panic(expected = "off the end")]
     fn a_car_parked_off_the_shaft_is_a_bug() {
         Lift::new(3, 3);
+    }
+
+    /// A car set where a record says it was carries on from there; a floor
+    /// or stop off the shaft is clamped or dropped.
+    #[test]
+    fn a_restored_car_carries_on_from_its_record() {
+        let mut lift = Lift::new(4, 0);
+        lift.restore(2, Doors::Closed, &[3, 9]);
+        assert_eq!(
+            (lift.floor(), lift.doors(), lift.stops()),
+            (2, Doors::Closed, vec![3])
+        );
+        assert_eq!(lift.step(), vec![Moment::Arrived(3)]);
+        lift.restore(7, Doors::Open, &[]);
+        assert_eq!(lift.floor(), 3);
+        assert!(lift.is_idle());
     }
 
     #[test]

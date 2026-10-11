@@ -8,3 +8,7 @@ description = "Places an NPC can be, and the memory it carries of them"
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+
+[dev-dependencies]
+# An event round-trips as the JSON a world's pulse carries it in.
+serde_json = { workspace = true }

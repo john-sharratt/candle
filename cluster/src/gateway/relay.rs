@@ -1,8 +1,8 @@
-//! What a gateway relays of the substrate (§4.3, §4.4, §7.2, §7.5): live
+//! What a gateway relays of the substrate (§4.3, §4.4, §7.2, §7.5, §9.1): live
 //! events to the app's other members, catch-up traffic to the one member it
-//! answers, the `RECEIPT`s that tell a sender what has been relayed, and the
-//! lagging state of a member that cannot keep up. The gateway never decodes a
-//! record; it moves bytes between sockets.
+//! answers, the `RECEIPT`s that tell a sender what has been relayed, the
+//! lagging state of a member that cannot keep up, and world pulses. The
+//! gateway never decodes a record; it moves bytes between sockets.
 
 use std::time::Instant;
 
@@ -90,6 +90,32 @@ impl Hub {
                 hex(n),
                 format!("lagging: over {} MiB of live events unsent", LAG_CAP >> 20),
             );
+        }
+    }
+
+    /// A `PULSE` from `from` (§9.1): to every other member of the app on the
+    /// ordered lane, except one whose lane holds more than half its lag cap —
+    /// a transient is never queued behind pressure, it is dropped and
+    /// counted, since the next state record settles the world anyway.
+    pub(super) fn relay_pulse(&self, app: &str, from: u64, frame: Frame) {
+        let targets: Vec<SessionHandle> = {
+            let mut guard = self.state();
+            let s = &mut *guard;
+            let mut targets = Vec::new();
+            for ((a, n), x) in s.sockets.iter_mut() {
+                if a != app || *n == from {
+                    continue;
+                }
+                if x.handle.gauges().live() > LAG_CAP / 2 {
+                    x.pulses_dropped += 1;
+                    continue;
+                }
+                targets.push(x.handle.clone());
+            }
+            targets
+        };
+        for handle in targets {
+            let _ = handle.ordered(frame.clone());
         }
     }
 

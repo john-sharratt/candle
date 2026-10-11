@@ -90,6 +90,7 @@ impl Replicator {
                     .collect()
             })
             .unwrap_or_default();
+        let app = self.app_coord();
         let s = self.state();
         let mut high: BTreeMap<u64, u64> = BTreeMap::new();
         for m in s.members.iter().flatten().flat_map(|m| m.members.iter()) {
@@ -126,6 +127,8 @@ impl Replicator {
                 quorum: s.max_members as usize / 2 + 1,
                 keys,
             },
+            worlds: app.worlds,
+            npc_leases: app.npc_leases,
             claims,
             applied: applied
                 .origins()

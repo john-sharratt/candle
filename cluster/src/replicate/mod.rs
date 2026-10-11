@@ -12,7 +12,9 @@ mod consensus;
 mod coord;
 mod drain;
 mod fault;
+mod lease;
 mod memory;
+mod pulse;
 mod receive;
 mod replicator;
 mod send;
@@ -27,8 +29,11 @@ pub use consensus::{REJOIN_RETRY, REJOIN_WAIT};
 pub use coord::{COMMANDS_KEPT, COORD_EVERY};
 pub use drain::HandedBack;
 pub use fault::{floor, judge, Fault, Verdict, FLOOR_MIN};
+pub use lease::{LeaseEvent, LEASE_TTL, RENEW_EVERY};
 pub use memory::{digest, MemoryRecord, MemoryStore, Stamp};
-pub use replicator::{CatchupView, Phase, Replication, ReplicationView, Replicator, Stats};
+pub use replicator::{
+    AppCoordFn, CatchupView, Phase, Replication, ReplicationView, Replicator, Stats,
+};
 pub use send::{FLUSH_WAIT, GRACE};
 pub use store::{Applied, Disk, Listing, Store, Tap, Tombstones, GEN_DETACHED};
 pub use tick::QUIET;

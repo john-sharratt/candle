@@ -50,6 +50,8 @@ pub struct Context<'a> {
     pub secure: bool,
     pub cache: Cache,
     pub roles: &'a Roles,
+    /// The member that opened the stream this request came on, if one did.
+    pub from_member: Option<u64>,
 }
 
 /// The routing's outcome.
@@ -211,6 +213,7 @@ pub async fn forward(
             assertion: None,
             secure: ctx.secure,
             cache: ctx.cache,
+            from_member: ctx.from_member,
         },
         req,
     )

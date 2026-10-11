@@ -4,6 +4,7 @@
 //! HTTP server as streams. The host asks it whether the app is joined, for a
 //! stream up to a gateway, and whether a sticky key may be served here.
 
+use std::collections::BTreeMap;
 use std::future::pending;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -20,8 +21,8 @@ use crate::close::{Close, CloseCode};
 use crate::dial::{dial, Attempt, Connect, Stopped};
 use crate::dispatch::RouteTable;
 use crate::frame::{
-    Admit, BuildId, Capacity, Claim, Epoch, Frame, Hello, MemberState, Members, ModelId, Routes,
-    Unclaim,
+    Admit, BuildId, Capacity, Claim, Epoch, Frame, Hello, MemberInfo, MemberState, Members,
+    ModelId, Routes, Unclaim,
 };
 use crate::handshake::{GroupKey, HandshakeError, PROTO};
 use crate::replicate::{Phase, Replication, Replicator};
@@ -470,9 +471,55 @@ impl AppMember {
         gone.len()
     }
 
+    /// The live member holding `key`'s claim, if one does — without claiming
+    /// it.
+    pub fn holder_of(&self, key: &[u8]) -> Option<u64> {
+        let holder = lock(&self.claims).holder(key)?;
+        self.live(holder).then_some(holder)
+    }
+
     /// The claims this member holds, by key.
     pub fn own_claims(&self) -> Vec<(Vec<u8>, Epoch)> {
         lock(&self.claims).own()
+    }
+
+    /// Every member of the app this member sees across its clusters — the
+    /// union of their `MEMBERS` lists, one entry per node, in node order. What
+    /// rendezvous weighs (§9.5).
+    pub fn group(&self) -> Vec<MemberInfo> {
+        let mut by_node: BTreeMap<u64, MemberInfo> = BTreeMap::new();
+        for m in lock(&self.members).iter().flatten() {
+            for info in &m.members {
+                by_node.entry(info.node).or_insert_with(|| info.clone());
+            }
+        }
+        by_node.into_values().collect()
+    }
+
+    /// Route `key` here, for a lease this member holds (§9.6): its claim is
+    /// taken and announced on every socket once, and kept until
+    /// [`Self::let_go`].
+    pub fn hold(&self, key: &[u8]) {
+        let taken = lock(&self.claims).hold(key, now_ms(), Instant::now());
+        if let Some(epoch) = taken {
+            self.announce(Frame::Claim(Claim {
+                key: key.to_vec(),
+                epoch,
+            }));
+        }
+    }
+
+    /// Stop routing `key` here, its lease gone; `through` is this member's own
+    /// `oseq`, which the next holder waits for.
+    pub fn let_go(&self, key: &[u8], through: u64) {
+        let Some(epoch) = lock(&self.claims).let_go(key) else {
+            return;
+        };
+        self.announce(Frame::Unclaim(Unclaim {
+            key: key.to_vec(),
+            epoch,
+            through,
+        }));
     }
 
     /// Hand back every claim this member holds — it is about to stop taking

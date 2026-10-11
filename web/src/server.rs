@@ -619,6 +619,7 @@ async fn handle(
                             secure,
                             cache: app.cfg.server.cache,
                             roles: &app.cfg.roles,
+                            from_member: origin.as_ref().map(|o| o.node),
                         };
                         match route::route(gw, cluster_app, ctx, req).await {
                             Routed::Answered(res) => return res,
@@ -643,6 +644,7 @@ async fn handle(
                         // Applied only where the upstream said nothing — a
                         // daemon that states its own policy keeps it.
                         cache: app.cfg.server.cache,
+                        from_member: None,
                     },
                     req,
                 )

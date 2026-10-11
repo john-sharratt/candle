@@ -7,7 +7,7 @@
 //! that has left every cluster — is claimed before serving, at an epoch above
 //! every epoch this member has seen for the key, whatever its clock says.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::frame::Epoch;
@@ -32,6 +32,9 @@ pub struct MemberClaims {
     seen: HashMap<Vec<u8>, u64>,
     /// This member's own claims, and when each last served.
     own: HashMap<Vec<u8>, (Epoch, Instant)>,
+    /// Of those, the ones a lease stands behind (§9.6): never let go for
+    /// idleness, only when the lease is.
+    held: HashSet<Vec<u8>>,
 }
 
 impl MemberClaims {
@@ -41,7 +44,37 @@ impl MemberClaims {
             table: Claims::new(),
             seen: HashMap::new(),
             own: HashMap::new(),
+            held: HashSet::new(),
         }
+    }
+
+    /// Claim `key` for a lease this member now holds, whoever the table names:
+    /// Paxos has already decided it is this member's. At an epoch above every
+    /// one seen for the key. `Some` with the epoch to announce when it is
+    /// newly taken; `None` when it was held already.
+    pub fn hold(&mut self, key: &[u8], now_ms: u64, now: Instant) -> Option<Epoch> {
+        if self.held.contains(key) && self.own.contains_key(key) {
+            return None;
+        }
+        let floor = self.seen.get(key).map_or(0, |ms| ms + 1);
+        let epoch = Epoch {
+            ms: now_ms.max(floor),
+            node: self.node,
+        };
+        self.saw(key, epoch);
+        self.table.claim(key, epoch);
+        self.own.insert(key.to_vec(), (epoch, now));
+        self.held.insert(key.to_vec());
+        Some(epoch)
+    }
+
+    /// Let go of `key`'s claim, its lease gone; the epoch to announce as
+    /// `UNCLAIM`, if this member held it.
+    pub fn let_go(&mut self, key: &[u8]) -> Option<Epoch> {
+        self.held.remove(key);
+        let (epoch, _) = self.own.remove(key)?;
+        self.table.unclaim(key, epoch);
+        Some(epoch)
     }
 
     fn saw(&mut self, key: &[u8], epoch: Epoch) {
@@ -55,7 +88,11 @@ impl MemberClaims {
     pub fn heard(&mut self, key: &[u8], epoch: Epoch) -> bool {
         self.saw(key, epoch);
         let took = self.table.claim(key, epoch);
-        took && epoch.node != self.node && self.own.remove(key).is_some()
+        let lost = took && epoch.node != self.node && self.own.remove(key).is_some();
+        if lost {
+            self.held.remove(key);
+        }
+        lost
     }
 
     /// A release announced by any member.
@@ -96,11 +133,12 @@ impl MemberClaims {
     }
 
     /// This member's claims that served nothing for `idle`, let go here; each
-    /// is announced as `UNCLAIM`.
+    /// is announced as `UNCLAIM`. A claim a lease stands behind is not idle.
     pub fn idle(&mut self, now: Instant, idle: Duration) -> Vec<(Vec<u8>, Epoch)> {
         let gone: Vec<(Vec<u8>, Epoch)> = self
             .own
             .iter()
+            .filter(|(k, _)| !self.held.contains(*k))
             .filter(|(_, (_, served))| now.duration_since(*served) >= idle)
             .map(|(k, (e, _))| (k.clone(), *e))
             .collect();
@@ -167,6 +205,23 @@ mod tests {
         assert!(c.heard(b"k", e(100, 2)));
         assert_eq!(c.holder(b"k"), Some(2));
         assert!(c.own().is_empty());
+    }
+
+    /// A lease's claim is taken whoever the table names, above every epoch
+    /// seen; idleness never lets it go, its lease does.
+    #[test]
+    fn a_leases_claim_is_held_until_let_go() {
+        let t = Instant::now();
+        let mut c = MemberClaims::new(ME);
+        c.heard(b"w1", e(900, 2));
+        assert_eq!(c.hold(b"w1", 500, t), Some(e(901, ME)));
+        assert_eq!(c.holder(b"w1"), Some(ME));
+        assert_eq!(c.hold(b"w1", 700, t), None, "held already");
+        let gone = c.idle(t + Duration::from_secs(3600), Duration::from_secs(600));
+        assert!(gone.is_empty(), "a lease's claim is never idle");
+        assert_eq!(c.let_go(b"w1"), Some(e(901, ME)));
+        assert_eq!(c.holder(b"w1"), None);
+        assert_eq!(c.let_go(b"w1"), None);
     }
 
     /// A claim idle past the timeout is let go and reported; a served one

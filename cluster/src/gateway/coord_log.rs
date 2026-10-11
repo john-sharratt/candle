@@ -3,8 +3,10 @@
 //! reports — a mode change, entering and leaving fault mode, the generation a
 //! rejoin took, a reload, catch-ups starting and finishing, a lease held and
 //! let go, `max_members` moving, retransmits, tombstones expiring, and the
-//! maintenance commands run on it.
+//! maintenance commands run on it; and what changed of its worlds
+//! ([`world_log`]).
 
+use super::world_log;
 use crate::coord::{CommandLine, CoordState};
 use crate::replicate::{CatchupView, Purpose};
 
@@ -70,6 +72,7 @@ pub fn changes(before: Option<&CoordState>, after: &CoordState) -> Vec<String> {
                 .map(|k| format!("rejoined: took generation {k}")),
         );
         lines.extend(command_lines(&[], &after.commands));
+        lines.extend(world_log::first(&after.worlds));
         return lines;
     };
     let mut lines = Vec::new();
@@ -157,6 +160,7 @@ pub fn changes(before: Option<&CoordState>, after: &CoordState) -> Vec<String> {
         lines.push(format!("{expired} tombstones expired"));
     }
     lines.extend(command_lines(&before.commands, &after.commands));
+    lines.extend(world_log::changes(&before.worlds, &after.worlds));
     lines
 }
 

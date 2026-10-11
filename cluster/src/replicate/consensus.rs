@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::lease::LeaseEvent;
 use super::replicator::{Phase, Rejoin, Replicator};
 use crate::consensus::Out;
 use crate::frame::{Frame, MemberState};
@@ -35,6 +36,17 @@ fn generation_key(k: u64) -> Vec<u8> {
 impl Replicator {
     /// A Paxos frame from another member.
     pub(super) fn paxos_frame(self: &Arc<Self>, frame: &Frame) {
+        // Another member handing a lease back says how far its writes reach,
+        // for whoever takes the lease next (§9.6).
+        if let Frame::Release(r) = frame {
+            if r.ballot.node != self.node {
+                let _ = self.leases.send(LeaseEvent::Released {
+                    key: r.key.clone(),
+                    by: r.ballot.node,
+                    through: r.through,
+                });
+            }
+        }
         let now = self.now();
         let outs = {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
@@ -56,8 +68,16 @@ impl Replicator {
                     }
                 }
                 Out::Decided { key, value } => self.decided(key, value),
-                // Leases are the worlds' (§9.2); no lease is asked for here.
-                Out::LeaseHeld { .. } | Out::LeaseBusy { .. } | Out::LeaseLost { .. } => {}
+                // Leases are the app's (§9.2): it follows them as events.
+                Out::LeaseHeld { key, .. } => {
+                    let _ = self.leases.send(LeaseEvent::Held { key });
+                }
+                Out::LeaseBusy { key, holder } => {
+                    let _ = self.leases.send(LeaseEvent::Busy { key, holder });
+                }
+                Out::LeaseLost { key } => {
+                    let _ = self.leases.send(LeaseEvent::Lost { key });
+                }
             }
         }
     }
@@ -181,9 +201,15 @@ impl Replicator {
         self.send_wake.notify_one();
     }
 
-    /// A majority of `max_members` (§5.9), as last read from the substrate.
+    /// A majority of `max_members` (§5.9), as last read from the substrate —
+    /// or of the ready members seen now, when more are seen than that. A
+    /// member arriving in a group still counted as smaller would otherwise
+    /// make a majority of one with itself in the second before `max_members`
+    /// rises, and take a lease another member holds.
     pub(super) fn quorum(&self) -> usize {
-        self.state().max_members as usize / 2 + 1
+        let held = self.state().max_members;
+        let seen = self.ready_members();
+        held.max(seen) as usize / 2 + 1
     }
 
     /// The once-a-tick consensus work: the engine's timers, the quorum, and a
@@ -200,6 +226,7 @@ impl Replicator {
             Ok(outs) => self.dispatch(outs),
             Err(e) => tracing::error!(node = self.node, "the vote journal failed: {e}"),
         }
+        self.reaffirm_leases();
 
         let expired = {
             let mut s = self.state();

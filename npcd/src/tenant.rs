@@ -35,6 +35,7 @@ use web::auth::Roles;
 
 use crate::accounts::Accounts;
 use crate::api::{self, Authored};
+use crate::authority;
 use crate::clock;
 use crate::collections::Libraries;
 use crate::effector::router::{router as effector_router, Local};
@@ -409,10 +410,21 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     runtime.set_effector_router(local_router.clone());
 
     install_sinks(&runtime, &authored, feelings);
+    // A member follows each world it hosts until its lease says otherwise
+    // (`docs/replicated_substrate.md` §9.2): known before the first is hosted.
+    if ctx.cluster.is_some() {
+        runtime.standing.set_clustered();
+    }
     host_worlds(&runtime, &authored, &authored_dir).await;
 
     // ── the routes ─────────────────────────────────────────────────────────
-    let routes = routes(&authored, roles.clone(), local_router, args.log_identity)?;
+    let routes = routes(
+        &authored,
+        &runtime,
+        roles.clone(),
+        local_router,
+        args.log_identity,
+    )?;
 
     // ── start the engine ───────────────────────────────────────────────────
     //
@@ -528,12 +540,20 @@ async fn stop(
     }
 }
 
-/// npcd's three route tables: the authored corpus and the cast, the engine's
-/// surface, and the effector device under `/v1/local`.
-fn tables(
-    roles: &Roles,
-    effector_router: Router,
-) -> (Api<Arc<Authored>>, Api<Arc<Authored>>, Api<()>) {
+/// npcd's route tables, each over the state it reads.
+struct Tables {
+    /// The authored corpus and the cast.
+    api: Api<Arc<Authored>>,
+    /// The engine's surface.
+    engine: Api<Arc<Authored>>,
+    /// The effector device, under `/v1/local`.
+    effector: Api<()>,
+    /// The worlds' authority, which members write to
+    /// (`docs/replicated_substrate.md` §9.3).
+    authority: Api<Arc<Runtime>>,
+}
+
+fn tables(roles: &Roles, effector_router: Router) -> Tables {
     // The effector device authenticates by its own device token, never the
     // operator roles: a client may send both a token and `x-tokera-*`, and
     // only the token is read. Its paths name no key a gateway could route by,
@@ -543,28 +563,36 @@ fn tables(
         Dispatch::Best,
         effector_router,
     );
-    (
-        api::api(roles.clone()),
-        engine::api(roles.clone()),
+    Tables {
+        api: api::api(roles.clone()),
+        engine: engine::api(roles.clone()),
         effector,
-    )
+        authority: authority::routes::api(roles.clone()),
+    }
 }
 
-/// The three tables as one, refused when two of them overlap.
-fn merged(api: Routes, engine: Routes, effector: Routes) -> anyhow::Result<Routes> {
+/// The tables as one, refused when two of them overlap.
+fn merged(
+    api: Routes,
+    engine: Routes,
+    effector: Routes,
+    authority: Routes,
+) -> anyhow::Result<Routes> {
     api.merge("npcd api", engine, "npcd engine")?
-        .merge("npcd", effector, "npcd effector")
+        .merge("npcd", effector, "npcd effector")?
+        .merge("npcd", authority, "npcd authority")
 }
 
 /// Every route npcd serves, and the role each needs — the table the host
 /// merges with its own and the other tenants' at start, read without standing
 /// npcd up.
 pub fn declared(roles: &Roles) -> anyhow::Result<Vec<Guarded>> {
-    let (api_table, engine_table, effector) = tables(roles, Router::new());
+    let t = tables(roles, Router::new());
     let all = merged(
-        Routes::table(api_table.declared()),
-        Routes::table(engine_table.declared()),
-        Routes::table(effector.declared()),
+        Routes::table(t.api.declared()),
+        Routes::table(t.engine.declared()),
+        Routes::table(t.effector.declared()),
+        Routes::table(t.authority.declared()),
     )?;
     Ok(all.declared)
 }
@@ -572,15 +600,17 @@ pub fn declared(roles: &Roles) -> anyhow::Result<Vec<Guarded>> {
 /// npcd's routes, over its state.
 fn routes(
     authored: &Arc<Authored>,
+    runtime: &Arc<Runtime>,
     roles: Roles,
     effector_router: Router,
     log_identity_on: bool,
 ) -> anyhow::Result<Routes> {
-    let (api_table, engine_table, effector) = tables(&roles, effector_router);
+    let t = tables(&roles, effector_router);
     let mut all = merged(
-        api_table.into_routes(authored.clone()),
-        engine_table.into_routes(authored.clone()),
-        effector.into_routes(()),
+        t.api.into_routes(authored.clone()),
+        t.engine.into_routes(authored.clone()),
+        t.effector.into_routes(()),
+        t.authority.into_routes(runtime.clone()),
     )?;
     if log_identity_on {
         tracing::info!(
@@ -653,36 +683,21 @@ fn install_sinks(runtime: &Arc<Runtime>, authored: &Arc<Authored>, feelings: Vec
                     .map(str::to_owned)
             })
             .unwrap_or_default();
-        // The personality's anchor, as prose — a reflection has no gather.
-        let anchor = persona_state
-            .personalities
-            .blocking_read()
-            .get(&payload.personality_id)
-            .and_then(|r| {
-                r.body
-                    .get("anchor")
-                    .and_then(|a| a.as_str())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_default();
-        Some(engine::persona::of(payload, &world, &anchor))
+        // The personality's anchor, as prose — a reflection has no gather —
+        // and where its characters belong.
+        let personalities = persona_state.personalities.blocking_read();
+        let personality = personalities.get(&payload.personality_id);
+        let field = |k: &str| {
+            personality.and_then(|r| r.body.get(k).and_then(|a| a.as_str()).map(str::to_owned))
+        };
+        let anchor = field("anchor").unwrap_or_default();
+        let mut persona = engine::persona::of(payload, &world, &anchor);
+        persona.home = field("home");
+        Some(persona)
     }));
 
-    // Where bodies are, recorded so a restart can put them back.
-    let place_state = authored.clone();
-    runtime.set_place_sink(Arc::new(move |npc_id: u64, at: &str| {
-        let state = place_state.clone();
-        let at = at.to_string();
-        run_sink(move || {
-            state
-                .npcs
-                .blocking_write()
-                .remember_place(npc_id, &at, now_ms_i64() as u64);
-        });
-    }));
-
-    // And how it feels: a mood is what a character *is* between one thought
-    // and the next.
+    // How it feels: a mood is what a character *is* between one thought and
+    // the next.
     let mood_state = authored.clone();
     runtime.set_mood_sink(Arc::new(move |npc_id: u64, mood: &str| {
         let state = mood_state.clone();

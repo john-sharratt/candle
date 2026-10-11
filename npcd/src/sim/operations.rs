@@ -143,6 +143,11 @@ impl Operations {
         self.workflows = workflows.into_iter().map(|w| (w.name.clone(), w)).collect();
     }
 
+    /// Take `from`'s workflows in place of these.
+    pub fn adopt_workflows(&mut self, from: &mut Operations) {
+        self.workflows = std::mem::take(&mut from.workflows);
+    }
+
     /// The workflow called `name`, when loaded.
     pub fn workflow(&self, name: &str) -> Option<&Workflow> {
         self.workflows.get(name)

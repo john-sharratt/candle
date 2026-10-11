@@ -32,7 +32,6 @@ use tokio::runtime::{Builder as RuntimeBuilder, Handle};
 use tokio::sync::oneshot;
 
 use candle_conversation::guest::resolve_seed;
-use candle_conversation::persistence::record::CustomObjectPayload;
 use candle_conversation::persistence::SharedSubstrate;
 use candle_conversation::projection::{
     Builder, GroupId, LayerId, ProjectionEvent, SelectionState, TimelineId,
@@ -59,9 +58,13 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::Request as HttpRequest;
 use axum::http::StatusCode;
 use axum::Router;
+use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, json, to_string, to_vec, Value};
 use tower::ServiceExt;
 
+use crate::authority::ops::WorldOp;
+use crate::authority::told::Told;
+use crate::authority::Standing;
 use crate::effector::auth::PinnedStandpoint;
 use crate::effector::router::address_of;
 use crate::effector::station;
@@ -72,7 +75,7 @@ use crate::engine::bearings;
 use crate::engine::body::{self, Outcome};
 use crate::engine::compose;
 use crate::engine::driver::{self, Metronome};
-use crate::engine::environment;
+use crate::engine::environment::{self, Reach};
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::guardian::view::Reply;
 use crate::engine::guardian::GuardianLog;
@@ -109,11 +112,10 @@ use crate::engine::work;
 use crate::mind::Mind;
 use crate::model;
 use crate::npcs::{Casting, Npcs};
-use crate::sim::bench::Benches;
-use crate::sim::missions::Missions;
 use crate::sim::Sim;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
+use crate::world_state::{place_of, sim_of, store};
 use candle_conversation::EngineSource;
 use cluster::member::{ClusterView, Link};
 use host::cluster::store::ConversationStore;
@@ -237,6 +239,10 @@ pub struct OwnedPersona {
     /// [`crate::engine::identity`].
     pub personality: String,
     pub world_id: String,
+    /// Where in its world a character of its personality belongs — the
+    /// personality's `home` — and so where its body first enters. Never
+    /// rendered.
+    pub home: Option<String>,
     pub identity: String,
     /// The personality's anchor — the floor every character of it reads.
     ///
@@ -299,25 +305,17 @@ impl OwnedPersona {
 /// Resolves a character's authored state at tick time.
 pub type PersonaSource = Arc<dyn Fn(u64) -> Option<OwnedPersona> + Send + Sync>;
 
-/// Records where a character is, so a restart can put it back there.
+/// Records the register a character has named for itself, so it survives a
+/// restart.
 ///
 /// A sink rather than a handle to the registry, for the same reason the clock
 /// and the persona are functions: the registry lives in the authored state,
 /// which needs this runtime to answer its own routes. One of the two has to
 /// exist first, and it is this one.
 ///
-/// Called from a world's metronome thread, so it must never block on anything
-/// slow — the registry's own checkpoint gates make it a map lookup on almost
-/// every call.
-pub type PlaceSink = Arc<dyn Fn(u64, &str) + Send + Sync>;
-
-/// Records the register a character has named for itself, so it survives a
-/// restart the way its position does.
-///
-/// A sink for the same reason [`PlaceSink`] is one, and called from the tick
-/// thread — so it must never block on anything slow. The registry writes only
-/// when the register has actually changed, which makes almost every call a map
-/// lookup.
+/// Called from the tick thread, so it must never block on anything slow. The
+/// registry writes only when the register has actually changed, which makes
+/// almost every call a map lookup.
 pub type MoodSink = Arc<dyn Fn(u64, &str) + Send + Sync>;
 
 /// The live engine, once loaded.
@@ -390,13 +388,6 @@ pub struct Runtime {
     /// a persona captured at startup would keep the character as it was when the
     /// process began.
     persona: RwLock<Option<PersonaSource>>,
-    /// Where to record a body's room, so a restart reconstructs the world.
-    ///
-    /// Installed after construction, like the clock and the persona, and for
-    /// the same reason. Absent until then, and a world that moves before it is
-    /// installed simply is not checkpointed — nothing is lost that was not
-    /// already going to be.
-    place_sink: RwLock<Option<PlaceSink>>,
     /// Where a named register goes to be remembered. Absent until installed,
     /// and a character that names one before then simply is not recorded.
     mood_sink: RwLock<Option<MoodSink>>,
@@ -438,12 +429,10 @@ pub struct Runtime {
     /// [`npc_map::describe::places`] order. The same text for every character
     /// standing in one, and it never changes.
     places: Mutex<BTreeMap<String, Vec<(String, String)>>>,
-    /// Each world's missions as last written to the substrate, so a beat that
-    /// changed nothing writes nothing.
-    missions_saved: Mutex<BTreeMap<String, Missions>>,
-    /// Each world's benches — the uncommitted working sets — as last written
-    /// to the substrate, for the same reason.
-    benches_saved: Mutex<BTreeMap<String, Benches>>,
+    /// What this daemon is to each world it hosts — its authority, a replica
+    /// following it, or cut off from it — and which characters it runs
+    /// (`docs/replicated_substrate.md` §9). See [`crate::authority`].
+    pub standing: Standing,
     /// Each character's mission compass as last told to it — see
     /// [`Runtime::mission_compass`] — so it is told again only when it changes.
     compass_told: Mutex<HashMap<u64, String>>,
@@ -620,23 +609,6 @@ pub const MISSION_WITHDRAWN: &str = "The errand you were on has been withdrawn. 
                                      down, and do not carry its subject into what you do next \
                                      unless somebody raises it again.";
 
-/// Substrate key for the durable command-table open flag — see
-/// [`Runtime::set_table_open`], which writes it, and [`Runtime::host`], which
-/// reads it back as a world loads. One key for the daemon: `set_table_open`
-/// drives every loaded world identically, so the flag is a single daemon-wide
-/// state rather than per-world.
-pub const TABLE_OPEN_KEY: &str = "command-table";
-
-/// Substrate key for one world's missions — see [`Runtime::checkpoint_missions`].
-fn missions_key(world: &str) -> String {
-    format!("missions/{world}")
-}
-
-/// Substrate key for one world's benches — see [`Runtime::checkpoint_benches`].
-fn benches_key(world: &str) -> String {
-    format!("benches/{world}")
-}
-
 /// How many words of the mission's document `body`'s working copy holds,
 /// uncommitted, when `doc` is the step that writes it and that is up to the
 /// mission's floor — see [`doc_compass`].
@@ -667,25 +639,28 @@ fn written_up_to_floor(s: &Sim, body: &str, mission: &Mission, doc: &DocStep) ->
 }
 
 /// The mind paths of every document an operation in `worlds` has not finished
-/// with — drafting, reading, reviewing or checking it — read from the missions
-/// each world saved,
-/// because the worlds themselves are not loaded until the cast wakes, after the
-/// mind is ingested.
+/// with — drafting, reading, reviewing or checking it — read from each world
+/// as it is hosted, or from its state records for one that is not.
 fn held_drafts<'a>(rt: &Runtime, worlds: impl Iterator<Item = &'a str>) -> HashSet<String> {
-    let Some(shared) = rt.substrate.read().unwrap().clone() else {
-        return HashSet::new();
+    let unsettled = |s: &Sim| -> Vec<String> {
+        s.missions
+            .operations()
+            .all()
+            .filter(|o| !o.settled())
+            .map(|o| o.document.clone())
+            .collect()
     };
+    let shared = rt.substrate();
     let worlds: HashSet<&str> = worlds.collect();
     worlds
         .into_iter()
-        .filter_map(|w| shared.custom_object(&missions_key(w)))
-        .filter_map(|o| serde_json::from_value::<Missions>(o.blob).ok())
-        .flat_map(|m| {
-            m.operations()
-                .all()
-                .filter(|o| !o.settled())
-                .map(|o| o.document.clone())
-                .collect::<Vec<_>>()
+        .flat_map(|w| match rt.hosted.get(w) {
+            Some(hosted) => hosted.sim(unsettled),
+            None => shared
+                .as_ref()
+                .and_then(|shared| sim_of(&store::read(shared, w)))
+                .map(|s| unsettled(&s))
+                .unwrap_or_default(),
         })
         .collect()
 }
@@ -835,7 +810,7 @@ pub const IN_COMPANY: &str = "Nothing has been asked of you, and you are not alo
                               or answer what they asked you. Address them exactly as written.";
 
 /// What came of saying something to a character on its handset.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageSent {
     /// What the character is called, by the world.
     pub with: String,
@@ -873,7 +848,6 @@ impl Runtime {
             npcs: RwLock::new(None),
             minds: RwLock::new(None),
             persona: RwLock::new(None),
-            place_sink: RwLock::new(None),
             mood_sink: RwLock::new(None),
             tokens: RwLock::new(None),
             effector: RwLock::new(None),
@@ -882,8 +856,7 @@ impl Runtime {
             bodies: Bindings::new(),
             metronomes: Mutex::new(BTreeMap::new()),
             places: Mutex::new(BTreeMap::new()),
-            missions_saved: Mutex::new(BTreeMap::new()),
-            benches_saved: Mutex::new(BTreeMap::new()),
+            standing: Standing::new(false),
             compass_told: Mutex::new(HashMap::new()),
             chapters: Mutex::new(HashMap::new()),
             dreaming: Mutex::new(HashSet::new()),
@@ -932,54 +905,7 @@ impl Runtime {
             anyhow::bail!("no async runtime to beat `{id}`'s metronome on");
         };
         let world = self.hosted.load(id, dir)?;
-        // **The command table opens by default.** A world that hands out no
-        // missions leaves its whole cast with nothing asked of it, drifting — so
-        // a fresh world comes up open and its characters take up work. The one
-        // exception is a world an operator has explicitly shut: that choice is
-        // durable (`TABLE_OPEN_KEY`) and survives a reboot, so a stood-down cast
-        // stays stood down. Absent the flag — a new world, or one from before it
-        // existed — the table is open. See [`Self::set_table_open`].
-        let open = self
-            .substrate
-            .read()
-            .unwrap()
-            .clone()
-            .and_then(|shared| {
-                shared
-                    .custom_object(TABLE_OPEN_KEY)
-                    .and_then(|obj| obj.blob.get("open").and_then(|v| v.as_bool()))
-            })
-            .unwrap_or(true);
-        let restored = self.substrate.read().unwrap().clone().and_then(|shared| {
-            let obj = shared.custom_object(&missions_key(id))?;
-            serde_json::from_value::<Missions>(obj.blob).ok()
-        });
-        if let Some(missions) = &restored {
-            self.missions_saved
-                .lock()
-                .unwrap()
-                .insert(id.to_string(), missions.clone());
-        }
-        let benches = self.substrate.read().unwrap().clone().and_then(|shared| {
-            let obj = shared.custom_object(&benches_key(id))?;
-            serde_json::from_value::<Benches>(obj.blob).ok()
-        });
-        world.with_sim(|s| {
-            s.table_open = open;
-            if let Some(missions) = restored {
-                s.missions = missions;
-            }
-            if let Some(benches) = benches {
-                s.bench.restore(benches);
-            }
-        });
-        // What was just restored is what the substrate holds: the first beat
-        // writes only what has changed since.
-        let restored_benches = world.with_sim(|s| s.bench.clone());
-        self.benches_saved
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), restored_benches);
+        self.restore(&world);
         let back = Arc::downgrade(self);
         let name = id.to_string();
         let moving = world.clone();
@@ -990,15 +916,7 @@ impl Runtime {
             if rt.stopping.load(Ordering::Relaxed) {
                 return;
             }
-            // Only when somebody actually covered a leg. Most moments move
-            // nobody — that is what makes a large cast affordable — and a
-            // checkpoint on a still world would be a world read per 500 ms per
-            // world for an answer that cannot have changed.
-            if rt.moment(&moving).moved > 0 {
-                rt.checkpoint_places(&moving);
-            }
-            rt.checkpoint_missions(&moving);
-            rt.checkpoint_benches(&moving);
+            rt.beat(&moving);
         });
         self.metronomes.lock().unwrap().insert(name, beat);
         Ok(world)
@@ -1628,7 +1546,7 @@ impl Runtime {
 
     /// Let the room see that something standing in it refused this character.
     /// See [`witnessed::show`].
-    fn show_refusal(&self, npc_id: u64, act: &Act, answer: &str) {
+    pub(crate) fn show_refusal(&self, npc_id: u64, act: &Act, answer: &str) {
         if let Some((hosted, body)) = self.body_of(npc_id) {
             witnessed::show(&hosted, &body, act, answer);
         }
@@ -1690,36 +1608,34 @@ impl Runtime {
         }
     }
 
-    /// Open or shut the command table on every loaded world.
+    /// Open or shut the command table on every world this daemon runs.
     ///
     /// The state the standing task ([`TO_THE_TABLE`]) and `collect_mission` read.
     /// Opening it does not itself call anyone — [`Self::call_to_table`] sends the
     /// tannoy and the chat-channel line that do.
     ///
-    /// The flag is durable: it is written to the substrate as a `CustomObject`
-    /// under [`TABLE_OPEN_KEY`] so a reboot restores it. The sim itself is in-RAM
-    /// and rebuilt each boot, so without this the table shut on every restart and
-    /// the missions stopped flowing until someone re-opened it. A world hosted
-    /// after a reboot reads the flag back as it loads — see [`Self::host`].
+    /// The flag is world state: each world's authority writes it with the rest
+    /// of the world's records on its next beat, so a reboot, and every member
+    /// following the world, finds it as it was left. A world this daemon only
+    /// follows is its authority's to open or shut.
     pub fn set_table_open(&self, open: bool) {
         for id in self.hosted.ids() {
+            if !self.standing.writes(&id) {
+                continue;
+            }
             if let Some(hosted) = self.hosted.get(&id) {
                 hosted.with_sim(|s| s.table_open = open);
             }
         }
-        if let Some(shared) = self.substrate.read().unwrap().clone() {
-            let obj = CustomObjectPayload::new(TABLE_OPEN_KEY, serde_json::json!({ "open": open }));
-            if let Err(e) = shared.put_custom_object(obj) {
-                tracing::warn!("persisting command-table state failed: {e}");
-            }
-        }
     }
 
-    /// Post one line to every loaded world's standing chat channel, as the
-    /// command table — the channel half of a call to the table.
+    /// Post one line to the standing chat channel of every world this daemon
+    /// runs, as the command table — the channel half of a call to the table.
     pub fn say_to_all_channels(&self, from: &str, text: &str) {
         for id in self.hosted.ids() {
-            let _ = self.say_on_channel(&id, from, text);
+            if self.standing.writes(&id) {
+                let _ = self.say_on_channel(&id, from, text);
+            }
         }
     }
 
@@ -1733,7 +1649,7 @@ impl Runtime {
             .body_of(npc_id)
             .is_some_and(|(hosted, body)| hosted.with_sim(|s| s.missions.cancel(&body)));
         if cancelled {
-            self.scheduler.deliver(
+            self.tell(
                 npc_id,
                 world_ms,
                 Salience::URGENT,
@@ -1745,13 +1661,16 @@ impl Runtime {
         cancelled
     }
 
-    /// Cancel every character's open mission, each noticed at the world time
-    /// `world_ms` gives for it. Returns how many were cancelled.
+    /// Cancel the open mission of every character in every world this daemon
+    /// runs, each noticed at the world time `world_ms` gives for it. Returns
+    /// how many were cancelled.
     pub fn cancel_all_missions(&self, world_ms: impl Fn(u64) -> u64) -> usize {
-        self.scheduler
-            .census()
+        self.hosted
+            .ids()
             .into_iter()
-            .filter(|c| self.cancel_mission(c.npc_id, world_ms(c.npc_id)))
+            .filter(|id| self.standing.writes(id))
+            .flat_map(|id| self.bodies.in_world(&id))
+            .filter(|(npc_id, _)| self.cancel_mission(*npc_id, world_ms(*npc_id)))
             .count()
     }
 
@@ -1965,29 +1884,54 @@ impl Runtime {
     /// Runs in the sweep, after journeys advance, so a visitor follows to where
     /// the character ended up rather than where it set out from.
     fn keep_visitors_with_their_hosts(&self, hosted: &Hosted) {
-        let now = crate::api::now_ms();
-        let following: Vec<(String, u64)> = self
-            .interactions
-            .visiting(hosted.id(), now)
-            .into_iter()
-            .collect();
-        if following.is_empty() {
-            return;
-        }
-        for (visitor, npc_id) in following {
-            let Some((_, body)) = self.body_of(npc_id) else {
-                continue;
-            };
+        for (visitor, theirs) in self.visitors_astray(hosted) {
             hosted.with(|w| {
-                let Some(theirs) = w.actor(&body).map(|a| a.at.clone()) else {
-                    return;
-                };
-                let mine = w.actor(&visitor).map(|a| a.at.clone());
-                if mine.as_ref() != Some(&theirs) {
-                    let _ = w.place(&visitor, theirs);
-                }
+                let _ = w.place(&visitor, theirs);
             });
         }
+    }
+
+    /// [`Self::keep_visitors_with_their_hosts`] for a world this daemon
+    /// follows: the placings are the authority's to make, so they go to it,
+    /// each once until the world shows it made.
+    pub(crate) fn follow_visitors(self: &Arc<Self>, hosted: &Hosted) {
+        let Some(handle) = self.spawner() else {
+            return;
+        };
+        for (visitor, theirs) in self.visitors_astray(hosted) {
+            let at = theirs.to_string();
+            let key = format!("place {visitor} {at}");
+            if !self.standing.begin_sending(&key) {
+                continue;
+            }
+            let rt = Arc::clone(self);
+            let world = hosted.id().to_string();
+            handle.spawn(async move {
+                let op = WorldOp::Place { visitor, at };
+                if let Err(e) = rt.world_write(&world, op).await {
+                    tracing::warn!("world `{world}`: a visitor was not placed: {e:#}");
+                }
+                rt.standing.end_sending(&key);
+            });
+        }
+    }
+
+    /// Every visitor in `hosted` not standing where the character it came to
+    /// see is, with where that is.
+    fn visitors_astray(&self, hosted: &Hosted) -> Vec<(String, Where)> {
+        let now = crate::api::now_ms();
+        self.interactions
+            .visiting(hosted.id(), now)
+            .into_iter()
+            .filter_map(|(visitor, npc_id)| {
+                let (_, body) = self.body_of(npc_id)?;
+                hosted.read(|w| {
+                    let theirs = w.actor(&body)?.at.clone();
+                    let mine = w.actor(&visitor).map(|a| a.at.clone());
+                    (mine.as_ref() != Some(&theirs)).then(|| (visitor.clone(), theirs))
+                })
+            })
+            .collect()
     }
 
     /// One moment of world time, and everything a moment entails.
@@ -2003,18 +1947,28 @@ impl Runtime {
     ///
     /// The order matters: journeys first, so a visitor follows to where the
     /// character ended up rather than where it set out from.
-    pub fn moment(&self, hosted: &Hosted) -> environment::Moment {
-        let moment = environment::advance(hosted, &self.bodies, &self.scheduler, &|id| {
-            self.world_ms(id)
-        });
-        for (npc_id, _) in self.bodies.in_world(hosted.id()) {
-            self.standing_task(npc_id);
-        }
+    pub fn moment(self: &Arc<Self>, hosted: &Hosted) -> environment::Moment {
+        let here = |npc_id: u64| self.standing.runs(npc_id);
+        let elsewhere = |npc_id: u64, at_ms: u64, salience: Salience, kind: EventKind| {
+            self.tell(npc_id, at_ms, salience, kind)
+        };
+        let reach = Reach {
+            here: &here,
+            elsewhere: &elsewhere,
+        };
+        let moment = environment::advance_for(
+            hosted,
+            &self.bodies,
+            &self.scheduler,
+            &|id| self.world_ms(id),
+            &reach,
+        );
+        self.standing_tasks(hosted);
         // Whoever an operation called off has stood down is told, whatever
         // called it off — see [`crate::sim::missions::Missions::take_stood_down`].
         for body in hosted.with_sim(|s| s.missions.take_stood_down()) {
             if let Some(npc_id) = self.bodies.mind_of(hosted.id(), &body) {
-                self.scheduler.deliver(
+                self.tell(
                     npc_id,
                     self.world_ms(npc_id),
                     Salience::URGENT,
@@ -2027,6 +1981,36 @@ impl Runtime {
         self.keep_visitors_with_their_hosts(hosted);
         self.show_out_the_expired();
         moment
+    }
+
+    /// Restate the standing task of every character in `hosted` that runs
+    /// here. It is a reading of the world and a delivery to the character's
+    /// own inbox, so the member running the character asks it, from its own
+    /// copy of the world.
+    pub(crate) fn standing_tasks(&self, hosted: &Hosted) {
+        for (npc_id, _) in self.bodies.in_world(hosted.id()) {
+            if self.standing.runs(npc_id) {
+                self.standing_task(npc_id);
+            }
+        }
+    }
+
+    /// Hand a character something, wherever it runs: into its inbox when it
+    /// runs here, and as a `told` pulse from a world this daemon is the
+    /// authority of when it runs on another member (§9.3). A world run cut off
+    /// reaches only the characters that run here.
+    pub(crate) fn tell(&self, npc_id: u64, at_ms: u64, salience: Salience, kind: EventKind) {
+        if self.standing.runs(npc_id) {
+            self.scheduler.deliver(npc_id, at_ms, salience, kind);
+            return;
+        }
+        let Some(at) = self.bodies.bound(npc_id) else {
+            return;
+        };
+        if self.standing.role(&at.world).is_authority() {
+            self.standing
+                .tell(&at.world, Told::new(npc_id, at_ms, salience, kind));
+        }
     }
 
     /// What this character is set on, restated when it has gone quiet.
@@ -2099,10 +2083,18 @@ impl Runtime {
     /// nothing whatever to an actor standing in a room — so without this a
     /// visitor who closed the tab stays in the vault for ever, and the
     /// character goes on being told it has company.
-    fn show_out_the_expired(&self) {
+    pub(crate) fn show_out_the_expired(self: &Arc<Self>) {
         for gone in self.interactions.take_expired(crate::api::now_ms()) {
-            if gone.mode == tools::Mode::Physical {
-                self.leave_world(&gone.body);
+            if gone.mode != tools::Mode::Physical {
+                continue;
+            }
+            match gone.world.as_deref() {
+                Some(world) if !self.standing.writes(world) => {
+                    self.send_op(world, WorldOp::Leave { visitor: gone.body })
+                }
+                _ => {
+                    self.leave_world(&gone.body);
+                }
             }
         }
     }
@@ -2302,7 +2294,7 @@ impl Runtime {
     /// many of its steps are done — or `None` with none. Two reads either side
     /// of an act that differ mean the act moved the mission: a step signed off,
     /// a mission taken up or handed in.
-    fn mission_mark(&self, npc_id: u64) -> Option<(String, usize)> {
+    pub(crate) fn mission_mark(&self, npc_id: u64) -> Option<(String, usize)> {
         let (hosted, body) = self.body_of(npc_id)?;
         hosted.sim(|s| {
             s.missions
@@ -2505,12 +2497,6 @@ impl Runtime {
     /// character does.
     pub fn feelings(&self) -> Vec<String> {
         self.feelings.read().unwrap().clone()
-    }
-
-    /// Supply the sink that records where bodies are. Called once at startup,
-    /// before the driver runs.
-    pub fn set_place_sink(&self, sink: PlaceSink) {
-        *self.place_sink.write().unwrap() = Some(sink);
     }
 
     /// Supply the sink that records how characters feel. Called once at
@@ -2958,81 +2944,17 @@ impl Runtime {
         }
     }
 
-    /// Checkpoint every bound body's room after a moment that moved somebody.
-    ///
-    /// Reads the world once, under its own lock, and hands each `(character,
-    /// place)` to the sink — which decides whether that is worth a record. The
-    /// decision lives there rather than here because it is about the durable
-    /// record, and this is a driver thread that should not know what a record
-    /// costs.
-    fn checkpoint_places(&self, hosted: &Hosted) {
-        let Some(sink) = self.place_sink.read().unwrap().clone() else {
-            return;
-        };
-        let bound = self.bodies.in_world(hosted.id());
-        let standing: Vec<(u64, String)> = hosted.read(|w| {
-            bound
-                .iter()
-                .filter_map(|(npc_id, body)| Some((*npc_id, w.actor(body)?.at.to_string())))
-                .collect()
-        });
-        for (npc_id, at) in standing {
-            sink(npc_id, &at);
-        }
+    /// The async runtime character tasks and world work run on; `None` in a
+    /// test that stood the runtime up outside one.
+    pub(crate) fn spawner(&self) -> Option<Handle> {
+        self.spawner.clone()
     }
 
-    /// Write a world's missions to the substrate when they differ from what was
-    /// last written, so a reboot finds every character's mission, its steps and
-    /// the queue behind it as they stood.
-    fn checkpoint_missions(&self, hosted: &Hosted) {
-        let Some(shared) = self.substrate.read().unwrap().clone() else {
-            return;
-        };
-        let now = hosted.with_sim(|s| s.missions.clone());
-        let mut saved = self.missions_saved.lock().unwrap();
-        if saved.get(hosted.id()) == Some(&now) {
-            return;
-        }
-        let blob = match serde_json::to_value(&now) {
-            Ok(blob) => blob,
-            Err(e) => {
-                tracing::warn!("encoding missions failed: {e}");
-                return;
-            }
-        };
-        match shared.put_custom_object(CustomObjectPayload::new(missions_key(hosted.id()), blob)) {
-            Ok(()) => {
-                saved.insert(hosted.id().to_string(), now);
-            }
-            Err(e) => tracing::warn!("persisting missions failed: {e}"),
-        }
-    }
-
-    /// Write a world's benches to the substrate when they differ from what was
-    /// last written, so a reboot finds every body's uncommitted working set as
-    /// it stood — see [`Benches::restore`].
-    fn checkpoint_benches(&self, hosted: &Hosted) {
-        let Some(shared) = self.substrate.read().unwrap().clone() else {
-            return;
-        };
-        let now = hosted.with_sim(|s| s.bench.clone());
-        let mut saved = self.benches_saved.lock().unwrap();
-        if saved.get(hosted.id()) == Some(&now) {
-            return;
-        }
-        let blob = match serde_json::to_value(&now) {
-            Ok(blob) => blob,
-            Err(e) => {
-                tracing::warn!("encoding benches failed: {e}");
-                return;
-            }
-        };
-        match shared.put_custom_object(CustomObjectPayload::new(benches_key(hosted.id()), blob)) {
-            Ok(()) => {
-                saved.insert(hosted.id().to_string(), now);
-            }
-            Err(e) => tracing::warn!("persisting benches failed: {e}"),
-        }
+    /// The daemon's substrate, once it has been handed one — see
+    /// [`Self::set_substrate`]. A runtime stood up without one keeps its
+    /// worlds in memory alone.
+    pub(crate) fn substrate(&self) -> Option<SharedSubstrate> {
+        self.substrate.read().unwrap().clone()
     }
 
     /// Supply the already-open substrate for the engine to adopt. Called once
@@ -3567,7 +3489,7 @@ impl Runtime {
     /// a character or reflection task runs it on the blocking pool rather than
     /// panicking on `blocking_read`. Placing the body afterwards reads only the
     /// runtime's own (non-async) world state, so it stays on the task.
-    async fn persona_of_async(&self, npc_id: u64) -> Option<OwnedPersona> {
+    pub(crate) async fn persona_of_async(&self, npc_id: u64) -> Option<OwnedPersona> {
         let src = self.persona.read().unwrap().clone()?;
         let who = tokio::task::spawn_blocking(move || src(npc_id))
             .await
@@ -4040,6 +3962,11 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         if rt.stopping() {
             anyhow::bail!("the process stopped while connecting to the cluster");
         }
+        // The worlds' leases, their pulses and the characters lent here are
+        // followed from now on (§9.2–§9.4).
+        if let Some(member) = join.link().member() {
+            rt.join_cluster(Arc::clone(member));
+        }
     }
 
     // ── the mind's layers ──────────────────────────────────────────────────
@@ -4415,7 +4342,13 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         let id = casting.npc_id;
         let world = &casting.world_id;
         let world_ms = rt.world_ms(id);
-        rt.scheduler.wake(id, now, world_ms);
+        // **Every character has a body in every member's copy of its world;
+        // only the ones this member is lent think here** (§9.3). The rest
+        // are woken where their lease is held, and here if it moves.
+        let runs = rt.standing.runs(id);
+        if runs {
+            rt.scheduler.wake(id, now, world_ms);
+        }
         // Back into the body it had. Entering one that is already there is not
         // an error, so this is the same call the create path makes and the two
         // do not have to agree about anything beyond the id.
@@ -4423,20 +4356,34 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             .persona_of(id)
             .map(|p| p.name)
             .unwrap_or_else(|| Runtime::body_id(id));
+        // Where the world's records last saw its body standing — or, in a
+        // world taken in this boot from the objects kept before world records,
+        // where its own record said, once.
+        let remembered =
+            place_of(&rt.standing.written(world), &Runtime::body_id(id)).or_else(|| {
+                rt.standing
+                    .from_legacy(world)
+                    .then(|| casting.at.clone())
+                    .flatten()
+            });
         // No home named here: the personality knows where its characters
         // belong, and the persona source does not carry it. The room the
         // character was last in is consulted first anyway, so the door is only
         // reached for one that has none — and the create path, which does know
         // the home, named it then.
-        match rt.embody_in_world(id, world, None, &name, casting.at.as_deref(), now) {
+        match rt.embody_in_world(id, world, None, &name, remembered.as_deref(), now) {
             Ok(true) => {
                 embodied += 1;
-                if casting.at.is_some() {
+                if remembered.is_some() {
                     recalled += 1;
                 }
             }
             Ok(false) => {}
             Err(e) => tracing::error!("npc {id}: no body in `{world}` — {e:#}"),
+        }
+        if !runs {
+            p.set_progress(i as u64 + 1, plan.cast.len() as u64);
+            continue;
         }
         // **And back into the register it was in.** A mood is what a character
         // *is* between one thought and the next, and it lives in the window —
@@ -5366,6 +5313,16 @@ fn device_path(url: &str) -> String {
     }
 }
 
+/// A character's turn, from its start to wherever it ends: a hand-back waits
+/// for the end of one in progress.
+struct Turning<'a>(&'a Standing, u64);
+
+impl Drop for Turning<'_> {
+    fn drop(&mut self) {
+        self.0.end_turn(self.1);
+    }
+}
+
 async fn character_loop(rt: Arc<Runtime>, id: u64) {
     // Whether this character's kept entries have been read back from the
     // substrate. Done once, on the first turn the engine is there to ask, and
@@ -5432,6 +5389,15 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 tokio::time::sleep(UNREADY_RETRY).await;
                 continue;
             };
+            // **A turn begins here, and a character being handed back to its
+            // world takes none**: the member it moves to runs its next one
+            // (§9.3). Marked only from here, so a character waiting for an
+            // engine is between turns and can be handed back meanwhile.
+            if !rt.standing.begin_turn(id) {
+                tokio::time::sleep(UNREADY_RETRY).await;
+                continue;
+            }
+            let _turning = Turning(&rt.standing, id);
             let day = crate::clock::day_of(world_ms);
             // What the grammar is built from this turn: the acts that
             // are reachable from where this character stands, and the
@@ -5463,11 +5429,13 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 rt.end_decision(id);
                 continue;
             };
+            // What the world opens the turn with, from wherever it runs.
+            let opening = rt.begin_turn(id).await;
             // A journey on its mission that ends where it now stands is done, and
             // it is told so, with what comes next — in this tick, so it reads its
             // progress the turn it arrives rather than an unticked step that sends
             // it back to the table to begin again.
-            if let Some(text) = rt.mark_arrival(id) {
+            if let Some(text) = opening.arrival {
                 start.events.push(Event::new(
                     rt.scheduler.next_seq(),
                     world_ms,
@@ -5477,7 +5445,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             }
             // The mission compass — the next step and where whoever it names is
             // now — whenever that has changed since it was last told.
-            if let Some(text) = rt.compass_news(id) {
+            if let Some(text) = opening.compass {
                 start.events.push(Event::new(
                     rt.scheduler.next_seq(),
                     world_ms,
@@ -5496,7 +5464,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // it, and a Maker that reached the table and was told nothing new
             // wandered back out. It stops the instant it holds a mission
             // (`at_table_summons` returns `None`).
-            if let Some(text) = rt.at_table_summons(id) {
+            if let Some(text) = opening.summons {
                 start.events.push(Event::new(
                     rt.scheduler.next_seq(),
                     world_ms,
@@ -5584,31 +5552,18 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                         // reflection answers.
                         let mut reflecting: Option<(Owed, [String; 3])> = None;
                         for a in &t.parsed.acts {
-                            // A device call (`invoke`) is enacted on
-                            // the async effector fast path rather than through
-                            // the synchronous `record_act`/`body::perform`
-                            // path — the effector router is an async tower
-                            // service. Both produce a `Recorded`, so the feed,
-                            // the answer, and everything downstream are one
-                            // shape. See `Runtime::enact_device`.
-                            let before = rt.mission_mark(id);
-                            let r = if body::is_device(a.tool) {
-                                rt.enact_device(id, a, pinned_at.as_ref()).await
-                            } else if body::composes(a.tool) {
-                                rt.compose(id, a).await
-                            } else {
-                                rt.record_act(id, a)
-                            };
+                            // Made in the world the character stands in,
+                            // wherever that world runs — see
+                            // `Runtime::perform`. A device call, a sitting to
+                            // write and a body's act each produce a
+                            // `Recorded`, so the feed, the answer, and
+                            // everything downstream are one shape.
+                            let performed = rt.perform(id, a, pinned_at.as_ref()).await;
+                            let r = performed.recorded;
                             // An act that moved the mission is answered by
                             // what comes next, and that is read at once.
-                            let moved = rt.mission_mark(id) != before;
-                            // A machine that refused is refused in front of
-                            // the room, so a colleague can see what went
-                            // wrong rather than hear what it was taken for.
+                            let moved = performed.moved;
                             let took = r.landed;
-                            if !took {
-                                rt.show_refusal(id, a, &r.answer);
-                            }
                             // Intent-carrying acts read back a narration of
                             // what they did, not the bare "You tell X." the
                             // world hands them — and the same line shows in
@@ -7390,11 +7345,11 @@ mod tests {
         );
     }
 
-    /// **Uncommitted work outlives a restart.** A body's working copy,
-    /// checkpointed to the substrate, is open again in the world a fresh
+    /// **Uncommitted work outlives a restart.** A body's working copy, written
+    /// with the world's state on its beat, is open again in the world a fresh
     /// runtime hosts over the same substrate.
     #[tokio::test]
-    async fn working_copies_are_checkpointed_and_restored_on_the_next_boot() {
+    async fn working_copies_are_written_and_restored_on_the_next_boot() {
         use crate::npcs::Npcs;
 
         let dir = std::env::temp_dir().join(format!(
@@ -7426,7 +7381,7 @@ mod tests {
                 )
                 .unwrap();
         });
-        first.checkpoint_benches(&hosted);
+        first.beat(&hosted);
 
         let second = rt();
         second.set_substrate(npcs.substrate());
@@ -7441,11 +7396,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **A mission outlives a restart.** Checkpointed to the substrate, a world
-    /// hosted by a fresh runtime over the same substrate comes up carrying the
-    /// same open mission, its steps and the queue behind it.
+    /// **A mission outlives a restart.** Written with the world's state on its
+    /// beat, a world hosted by a fresh runtime over the same substrate comes up
+    /// carrying the same open mission, its steps and the queue behind it.
     #[tokio::test]
-    async fn missions_are_checkpointed_and_restored_on_the_next_boot() {
+    async fn missions_are_written_and_restored_on_the_next_boot() {
         use crate::engine::mission::bank::Facts;
         use crate::engine::mission::{Mission, Origin, Outcome, Todo};
         use crate::npcs::Npcs;
@@ -7479,7 +7434,7 @@ mod tests {
             s.missions.assign("m1", ask("Read the record."));
             s.missions.lodge("m1", ask("Then the ledger."));
         });
-        first.checkpoint_missions(&hosted);
+        first.beat(&hosted);
 
         let second = rt();
         second.set_substrate(npcs.substrate());

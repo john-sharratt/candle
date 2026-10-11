@@ -344,6 +344,13 @@ impl Missions {
         self.operations.set_workflows(workflows);
     }
 
+    /// Take `from`'s workflows in place of these: they are the mind's, not
+    /// the world's, and a world taken in from elsewhere keeps the ones this
+    /// machine loaded.
+    pub fn adopt_workflows(&mut self, from: &mut Missions) {
+        self.operations.adopt_workflows(&mut from.operations);
+    }
+
     /// Record what operation `id`'s document said when its step was taken up.
     pub fn found(&mut self, id: u64, text: String) {
         if let Some(o) = self.operations.get_mut(id) {
