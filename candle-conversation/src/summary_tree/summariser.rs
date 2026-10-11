@@ -35,7 +35,6 @@ use std::time::Duration;
 use crossbeam::channel::{self, Receiver as TriggerReceiver, Sender as TriggerSender};
 use flume::Sender;
 
-use crate::persistence::record::TreeMetadataPayload;
 use crate::projection::{Conversation, TimelineId, TurnIndex};
 use crate::scheduler::SchedulerRequest;
 use crate::substrate::TreeNodeMeta;
@@ -547,7 +546,8 @@ fn seal_leaf(
     normal_children: Vec<TurnIndex>,
 ) -> Result<(), ProbeError> {
     let leaf_idx = sealed.sealed_turn;
-    conversation.write().set_tree_meta(
+    record_tree_meta(
+        conversation,
         timeline,
         leaf_idx,
         TreeNodeMeta {
@@ -556,7 +556,6 @@ fn seal_leaf(
             tree_height: 1,
         },
     );
-    persist_tree_meta(conversation, timeline, leaf_idx);
     Ok(())
 }
 
@@ -599,7 +598,8 @@ fn build_sos(
         height: level,
     };
     let idx = runner.run(probe)?.sealed_turn;
-    conversation.write().set_tree_meta(
+    record_tree_meta(
+        conversation,
         timeline,
         idx,
         TreeNodeMeta {
@@ -608,7 +608,6 @@ fn build_sos(
             tree_height: level,
         },
     );
-    persist_tree_meta(conversation, timeline, idx);
     Ok(idx)
 }
 
@@ -637,25 +636,15 @@ fn reconcile_pass(
     Ok(())
 }
 
-/// Persist one node's `TreeMetadata` redo-log record from its current
-/// (immutable) substrate meta.
-fn persist_tree_meta(conversation: &Conversation, timeline: TimelineId, idx: TurnIndex) {
-    let meta = match conversation.read().tree_meta_of(timeline, idx).cloned() {
-        Some(m) => m,
-        None => return,
-    };
-    let payload = TreeMetadataPayload {
-        timeline_id: timeline.raw(),
-        turn_index: idx.0,
-        kind: match meta.kind {
-            TurnKind::Normal => 0,
-            TurnKind::SummaryOfTurns => 1,
-            TurnKind::SummaryOfSummaries => 2,
-        },
-        tree_height: meta.tree_height,
-        children: meta.children.iter().map(|c| c.0).collect(),
-    };
-    if let Err(e) = conversation.write_tree_metadata(payload) {
+/// Set one node's (immutable) meta, in the substrate and as its
+/// `TreeMetadata` redo-log record.
+fn record_tree_meta(
+    conversation: &Conversation,
+    timeline: TimelineId,
+    idx: TurnIndex,
+    meta: TreeNodeMeta,
+) {
+    if let Err(e) = conversation.record_tree_meta(timeline, idx, meta) {
         tracing::warn!(
             target: "candle_conversation::summariser",
             "write_tree_metadata failed for {idx}: {e}"
@@ -823,6 +812,7 @@ impl ProbeRunner for MockProbeRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::identity::RecordIdentity;
     use crate::projection::{Conversation, TimelineId, TurnIndex};
     use crate::summary_tree::tree::MERGE_FANOUT;
     use TurnKind;
@@ -1038,7 +1028,8 @@ mod tests {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
         let call = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        conv.write().couple_turn(timeline, call.0);
+        conv.write()
+            .couple_turn(timeline, call.0, RecordIdentity::NONE);
         let response = conv.write().append_with_blocks(timeline, 10, 1, 2);
         // A trailing turn settles the [call, response] exchange (otherwise it is
         // the deferred frontier).
@@ -1076,7 +1067,8 @@ mod tests {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
         let call = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        conv.write().couple_turn(timeline, call.0);
+        conv.write()
+            .couple_turn(timeline, call.0, RecordIdentity::NONE);
         // The response turn does not exist yet — the tools are still running.
         assert_eq!(conv.pending_summary_len(timeline), 1);
 

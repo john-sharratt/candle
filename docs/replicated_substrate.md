@@ -1518,6 +1518,15 @@ with no identity at all (every identity field zero).
   `(gen, epoch, hlc, origin)` is the record's **version stamp**: a total order every
   member computes the same way. §6.5 uses it wherever two records compete for one key,
   and §6.6 orders a timeline's turns by it.
+- **A value and its record carry one identity from the start.** A runtime write that
+  changes the substrate in memory and hands the record to the persistence writer thread
+  mints the identity *when it changes the value*, through the minter the persistence
+  layer shares (`persistence/identity/minter.rs`), and the writer appends the record
+  under it (`append_carried`). The in-memory value is applied by the same stamped rule
+  as any other record, so two local writes that reach the log in the opposite order to
+  their minting still leave the substrate holding the greater one, as a replay will.
+  Records whose value lands in the substrate only after the append — `Tokens`, the
+  recurrent records, K/V chunks — are minted by the append itself.
 - **The applied set is also where the catch-up is up to.** It is a per-origin version
   vector: `applied_through` plus the ranges above it already held. `oseq` only ever
   grows, so one number per origin says how far this member has caught up on that
@@ -1664,7 +1673,7 @@ replaying it at the next start meets records in an order no writer chose.
 | conversation order (`conv_order`, `substrate.rs:6015-6031`) | Taken from the `hlc` of the record that first named the `conv_id`, not from a counter that counts arrivals. |
 | `TurnCoupling`, VFS kills, applied-set gaps | Set inserts, which commute already. |
 | **Turn streams** (`Chunk`, `Tokens`, `WideQSig`, `TurnIndexPage` under a turn's stream id) | **Indexed per writer.** The index keys a turn stream `(stream_id, origin)`, so two writers' turn *N*, which share `turn_stream_id(timeline, N)`, never overwrite each other's entries. A lookup by stream id, which is all any caller does, resolves to the turn that holds that index in the timeline's stamp order (§6.6). That is decided by the stamps, not by which arrived last. |
-| **Records that need a parent**: `TreeMetadata`, `DebugId`, `TurnCoupling`, `Label`, `ConvState`, and every timeline-scoped value | **Wait for the parent.** A record whose timeline is not registered yet is held in a pending map keyed by timeline, as `Label` and `ConvState` already are (`substrate.rs:4243-4271`), and applied by the decl that registers it. Nothing is dropped for arriving early. |
+| **Records that need a parent**: `TreeMetadata`, `DebugId`, `TurnCoupling`, `Label`, `ConvState`, and every timeline-scoped value | **Wait for the parent.** A record whose timeline is not registered yet is held, with its identity, in a pending map keyed by timeline (`substrate/pending.rs`), and applied by the decl that registers it. Nothing is dropped for arriving early. A stream's own records (`Chunk`, `Tokens`, `WideQSig`, `TurnIndexPage`, `ProjectionEvents`, `Commit`) need no holding: they are indexed under their stream as they arrive, and a stream another origin wrote is not an orphan for want of a decl (§6.8). |
 | **Timeline `Tombstone`** | **Dominates.** It is a fact about the timeline, not a value. Once applied, every later record for that timeline is skipped at apply, and `register_timeline` refuses it. Every earlier one is dead at read, as today. A `Snapshot` arriving after it is not re-inserted. Compaction **keeps** timeline tombstones as resident records (today it drops them, `persistence/compaction.rs:541-546`), because a record replicated late, say by a member that was cut off, must still find the tombstone and die. A tombstone **expires** once a complete compaction has run since it and it is more than *N* days old (§6.8). |
 | Turn `Tombstone` | Dominates its turn the same way; it already commutes with the timeline tombstone (`substrate.rs:4353-4363`). |
 | **Section generations** | A section's **generation** is the version stamp of the `StreamDecl::PromptSection` that started it. Every record of the section carries its generation in the header's `epoch`. A `SectionTombstone` names the generation it ends. The live generation is the decl with the greatest stamp that no tombstone names, and records of any other generation are ignored at read. That replaces "a later decl lifts the tombstone" (`substrate.rs:4116-4118`), which only worked in append order. |
@@ -1908,10 +1917,23 @@ replicated record is an ordinary record.
   the member can say so when a catch-up asks (§7.2).
 - **What was seen is remembered.** The `Replica` vector says what has been seen even
   after the record that carried it is gone.
-- **Two exceptions** are kept that today's compaction would drop:
+- **Exceptions** are kept that today's compaction would drop:
   - timeline tombstones, kept resident until they expire (below);
   - every committed turn, whatever its place in the order: two writers' turns at one
-    index are both the conversation's turns (§6.6), never one superseding the other.
+    index are both the conversation's turns (§6.6), never one superseding the other;
+  - a stream **another origin** wrote whose declaration has not arrived yet. A
+    declaration is written before its stream's records, so a decl-less stream this
+    member wrote — or one whose records carry no identity — lost its decl and is an
+    orphan, dropped as before; but another origin's records can arrive ahead of their
+    decl, and dropping them would lose them for good, since they are already applied
+    (`StreamRuntime::is_orphan`);
+  - records held for a timeline not registered yet (§6.5), for the same reason;
+  - a snapshot **retraction** that is a stream's current record. It is a value: dropping
+    it would let an older snapshot arriving later become the tail again.
+- **A label is carried as the records that hold it.** Each field keeps the greatest
+  record that set it (§6.5), so a rewrite writes one `Label` per winning identity,
+  holding the fields it won, plus the least record that named the conversation's
+  `conv_id`, which is its place in creation order.
 
 **When a tombstone record expires.** A tombstone record, 4 KiB with its padding, is
 shrunk by a compaction only when **both** of these hold:

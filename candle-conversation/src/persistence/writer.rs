@@ -34,6 +34,7 @@ use std::thread::JoinHandle;
 
 use crossbeam::channel::{self, Receiver, Sender};
 
+use super::identity::{RecordIdentity, Stamped};
 use super::manifest::RecordLoc;
 use super::record::{BranchCheckpointPayload, RecordType, SnapshotPayload};
 use super::resume::{self, TurnChunkGrid};
@@ -64,11 +65,22 @@ const MAX_PENDING_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BATCH: usize = 512;
 
 /// A queued redo-log write.
+///
+/// A job whose value the enqueuer has already applied in memory carries the
+/// `identity` it was applied under — minted when the value changed — and the
+/// record is written with it, so the value and its record never disagree on
+/// which write they are. A job whose value lands in the substrate only after
+/// the append (`Tokens`, the recurrent records, KV-cold chunks) is stamped by
+/// the append, and the writer applies it under that stamp.
 pub(crate) enum WriteJob {
     /// Phase 1: a stream-decl (turn / section) metadata mirror. `stream_id` is the
     /// pure `decl.stream_id().0`, `payload` is `decl.encode()`; already applied
     /// in-memory by the enqueuer.
-    StreamDecl { stream_id: u64, payload: Vec<u8> },
+    StreamDecl {
+        stream_id: u64,
+        payload: Vec<u8>,
+        identity: RecordIdentity,
+    },
     /// Phase 1: a turn/section `Tokens` record. Disk-only — the in-memory token
     /// buffer is already set at record time, so this is purely the durable copy
     /// for reload. Enqueued from the seal path so it never blocks on the
@@ -83,6 +95,7 @@ pub(crate) enum WriteJob {
     WideQSigs {
         stream_id: StreamId,
         payload: Vec<u8>,
+        identity: RecordIdentity,
     },
     /// A turn's QSA index page (`TurnIndexPage` record). Mirrored in RAM by the
     /// enqueuer — this turn's own projections read it immediately — so this
@@ -90,6 +103,7 @@ pub(crate) enum WriteJob {
     TurnIndexPage {
         stream_id: StreamId,
         payload: Vec<u8>,
+        identity: RecordIdentity,
     },
     /// Phase 2: a warm→cold KV migration. The GPU gather already produced `grid`;
     /// the writer appends its chunks, folds their locations into the substrate
@@ -132,11 +146,12 @@ pub(crate) enum WriteJob {
     ProjectionEvents {
         stream_id: StreamId,
         payload: Vec<u8>,
+        identity: RecordIdentity,
     },
-    /// A pre-encoded conversation-metadata record — `Label` (the full ConvMeta:
-    /// conv_id + label + custom bag) or `Distilled`. Both are small,
-    /// last-writer-wins on replay, and need no index registration after the
-    /// append, so one job kind carries either.
+    /// A pre-encoded conversation-metadata record — `Label` (the fields of a
+    /// ConvMeta the write sets: conv_id, label, custom keys) or `Distilled`.
+    /// Both are small and need no index registration after the append, so one
+    /// job kind carries either.
     ///
     /// The payload is encoded by the enqueuer, which is the point: these used to
     /// be written by taking the persistence mutex on the calling thread and
@@ -146,11 +161,16 @@ pub(crate) enum WriteJob {
     ConvMeta {
         record: RecordType,
         payload: Vec<u8>,
+        identity: RecordIdentity,
     },
     /// A conversation's whole state (`ConvState` record), keyed in the header
-    /// by its timeline so the newest supersedes the last. Encoded by the
-    /// enqueuer, like [`WriteJob::ConvMeta`].
-    ConvState { timeline: u64, payload: Vec<u8> },
+    /// by its timeline so the greatest stamp supersedes the rest. Encoded by
+    /// the enqueuer, like [`WriteJob::ConvMeta`].
+    ConvState {
+        timeline: u64,
+        payload: Vec<u8>,
+        identity: RecordIdentity,
+    },
     /// Drain everything queued, fsync, ack, and stop the thread.
     Shutdown(Sender<()>),
 }
@@ -364,10 +384,22 @@ fn process_one(
 ) -> Option<Sender<()>> {
     match job {
         WriteJob::Shutdown(ack) => return Some(ack),
-        WriteJob::StreamDecl { stream_id, payload } => {
+        WriteJob::StreamDecl {
+            stream_id,
+            payload,
+            identity,
+        } => {
             let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = p.append_record(RecordType::StreamDecl, 0, stream_id, 0, 0, 0, &payload)
-            {
+            if let Err(e) = p.append_carried(
+                RecordType::StreamDecl,
+                0,
+                stream_id,
+                0,
+                0,
+                0,
+                &payload,
+                identity,
+            ) {
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     "stream-decl append failed: {e}"
@@ -406,7 +438,7 @@ fn process_one(
                 Ok(loc) => substrate
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
-                    .apply_tokens_loc(stream_id, loc),
+                    .apply_tokens_loc(stream_id, loc.value, loc.id),
                 Err(e) => tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
@@ -414,9 +446,13 @@ fn process_one(
                 ),
             }
         }
-        WriteJob::WideQSigs { stream_id, payload } => {
+        WriteJob::WideQSigs {
+            stream_id,
+            payload,
+            identity,
+        } => {
             let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = p.append_wide_q_sigs(stream_id, &payload) {
+            if let Err(e) = p.append_wide_q_sigs(stream_id, &payload, identity) {
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
@@ -424,9 +460,13 @@ fn process_one(
                 );
             }
         }
-        WriteJob::TurnIndexPage { stream_id, payload } => {
+        WriteJob::TurnIndexPage {
+            stream_id,
+            payload,
+            identity,
+        } => {
             let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = p.append_turn_index_page(stream_id, &payload) {
+            if let Err(e) = p.append_turn_index_page(stream_id, &payload, identity) {
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
@@ -435,9 +475,13 @@ fn process_one(
                 );
             }
         }
-        WriteJob::ProjectionEvents { stream_id, payload } => {
+        WriteJob::ProjectionEvents {
+            stream_id,
+            payload,
+            identity,
+        } => {
             let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = p.append_projection_events(stream_id, &payload) {
+            if let Err(e) = p.append_projection_events(stream_id, &payload, identity) {
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
@@ -445,9 +489,13 @@ fn process_one(
                 );
             }
         }
-        WriteJob::ConvMeta { record, payload } => {
+        WriteJob::ConvMeta {
+            record,
+            payload,
+            identity,
+        } => {
             let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = p.append_record(record, 0, 0, 0, 0, 0, &payload) {
+            if let Err(e) = p.append_carried(record, 0, 0, 0, 0, 0, &payload, identity) {
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     ?record,
@@ -455,9 +503,22 @@ fn process_one(
                 );
             }
         }
-        WriteJob::ConvState { timeline, payload } => {
+        WriteJob::ConvState {
+            timeline,
+            payload,
+            identity,
+        } => {
             let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = p.append_record(RecordType::ConvState, 0, timeline, 0, 0, 0, &payload) {
+            if let Err(e) = p.append_carried(
+                RecordType::ConvState,
+                0,
+                timeline,
+                0,
+                0,
+                0,
+                &payload,
+                identity,
+            ) {
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     timeline,
@@ -477,7 +538,7 @@ fn process_one(
                 Ok(loc) => substrate
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
-                    .apply_snapshot_loc(stream_id, loc),
+                    .apply_snapshot_loc(stream_id, loc.value, loc.id),
                 Err(e) => retract_failed_snapshot(substrate, persistence, stream_id, &e),
             }
         }
@@ -493,7 +554,7 @@ fn process_one(
                 Ok(loc) => substrate
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
-                    .apply_branch_checkpoint_loc(stream_id, loc),
+                    .apply_branch_checkpoint_loc(stream_id, loc.value, loc.id),
                 Err(e) => tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
@@ -547,7 +608,7 @@ fn write_kv_cold(
     }
     let mut view = substrate.write().unwrap_or_else(|e| e.into_inner());
     for (flat, loc) in locs {
-        view.apply_chunk_loc(stream_id, flat, loc);
+        view.apply_chunk_loc(stream_id, flat, loc.value, loc.id);
     }
     view.install_cold(residence, stored);
     Ok(())
@@ -558,7 +619,7 @@ fn append_snapshot(
     persistence: &Arc<PersistenceLock>,
     stream_id: StreamId,
     payload: &SnapshotPayload,
-) -> Result<RecordLoc> {
+) -> Result<Stamped<RecordLoc>> {
     // Fault injection (test-helpers): a stream armed via
     // [`fault::fail_next_snapshot`] has this append fail, as a full or failing
     // disk would fail it.
@@ -592,16 +653,22 @@ fn retract_failed_snapshot(
     stream_id: StreamId,
     error: &PersistenceError,
 ) {
-    substrate
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .drop_snapshot_loc(stream_id);
     let retracted = persistence
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retract_snapshot(stream_id);
+    // Dropped from the in-RAM index whether or not the retraction landed: the
+    // tail is stale either way. When it landed, its identity also refuses any
+    // older snapshot that reaches the substrate later.
+    {
+        let mut sub = substrate.write().unwrap_or_else(|e| e.into_inner());
+        match &retracted {
+            Ok(id) => sub.retract_snapshot(stream_id, *id),
+            Err(_) => sub.drop_snapshot_loc(stream_id),
+        }
+    }
     match retracted {
-        Ok(()) => tracing::error!(
+        Ok(_) => tracing::error!(
             target: "candle_conversation::persistence::writer",
             stream_id = stream_id.0,
             "snapshot append failed: {error} — the stream's snapshot is retracted, \
@@ -708,6 +775,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use super::{fault, SubstrateWriter, WriteJob};
+    use crate::persistence::identity::RecordIdentity;
     use crate::persistence::record::{RecordType, SnapshotPayload};
     use crate::persistence::streams::StreamId;
     use crate::persistence::{dir_fingerprint, PersistenceLock, SubstratePersistence};
@@ -809,7 +877,7 @@ mod tests {
         {
             let mut substrate = Substrate::new();
             let mut p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            p.write_debug_id(1, "seed").unwrap();
+            p.write_debug_id(1, "seed", p.mint()).unwrap();
             p.commit().unwrap();
         }
         let before = dir_fingerprint(&dir);
@@ -824,6 +892,7 @@ mod tests {
         writer.enqueue(WriteJob::StreamDecl {
             stream_id: stream.0,
             payload: vec![1, 2, 3],
+            identity: RecordIdentity::NONE,
         });
         writer.enqueue(WriteJob::Tokens {
             stream_id: stream,
@@ -832,6 +901,7 @@ mod tests {
         writer.enqueue(WriteJob::ConvMeta {
             record: RecordType::Label,
             payload: vec![4, 5],
+            identity: RecordIdentity::NONE,
         });
         writer.enqueue(WriteJob::Snapshot {
             stream_id: stream,

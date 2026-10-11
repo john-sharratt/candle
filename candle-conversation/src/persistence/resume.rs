@@ -22,7 +22,8 @@
 //! in `transfer.rs` — `candle-conversation` is CUDA-only so there is no
 //! non-CUDA half.
 
-use super::manifest::ChunkLoc;
+use super::identity::Stamped;
+use super::manifest::{ChunkLoc, RecordLoc};
 use super::record::{ChunkPayload, RecordType};
 use super::streams::{StreamDecl, StreamId, TurnDecl};
 use super::{PersistenceError, Result, SubstratePersistence};
@@ -230,20 +231,20 @@ pub fn persist_turn_chunks(
 /// [`StoredChunk`] reference is exact. Used by the persistence thread's
 /// warm→cold phase.
 ///
-/// Also returns the `(flat_chunk_index, ChunkLoc)` pairs the caller must
-/// fold into the substrate's authoritative chunk index (`apply_chunk_loc`).
-/// Without that, `stream.chunks` is only repopulated by the walker on reload,
-/// so an in-process cold→hot elevation (a turn evicted then re-accessed within
-/// the same session) would `plan_chunked_read` an empty index and recover
-/// nothing.
+/// Also returns the `(flat_chunk_index, ChunkLoc)` pairs, each with the
+/// identity its record was written with, that the caller must fold into the
+/// substrate's authoritative chunk index (`apply_chunk_loc`). Without that,
+/// `stream.chunks` is only repopulated by the walker on reload, so an
+/// in-process cold→hot elevation (a turn evicted then re-accessed within the
+/// same session) would `plan_chunked_read` an empty index and recover nothing.
 pub fn persist_turn_chunks_capture(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
     layers: &TurnChunkGrid,
-) -> Result<(Vec<StoredSequence>, Vec<(u64, ChunkLoc)>)> {
+) -> Result<(Vec<StoredSequence>, Vec<(u64, Stamped<ChunkLoc>)>)> {
     let chunks_per_layer = layers.chunks_per_layer();
     let mut out = Vec::with_capacity(layers.n_layers());
-    let mut locs: Vec<(u64, ChunkLoc)> = Vec::new();
+    let mut locs: Vec<(u64, Stamped<ChunkLoc>)> = Vec::new();
     for (layer_idx, layer) in layers.iter_layers().enumerate() {
         if layer.len() != chunks_per_layer {
             return Err(PersistenceError::Corrupt(format!(
@@ -258,7 +259,7 @@ pub fn persist_turn_chunks_capture(
             let header_fmt = image.payload.k_formats.first().copied().unwrap_or(0);
             let encoded = image.payload.encode();
             let payload_len = encoded.len() as u64;
-            let (segment, log_offset, record_len) = p.append_record(
+            let at = p.append_record(
                 RecordType::Chunk,
                 header_fmt,
                 stream_id.0,
@@ -268,22 +269,25 @@ pub fn persist_turn_chunks_capture(
                 &encoded,
             )?;
             stored.push(StoredChunk {
-                log_offset,
-                record_len,
+                log_offset: at.offset,
+                record_len: at.size,
                 token_count: image.token_count,
             });
             locs.push((
                 flat,
-                ChunkLoc {
-                    // The active segment this chunk's record landed in — a
-                    // rotation mid-turn can land later chunks in a newer
-                    // segment, so each chunk carries its own id.
-                    segment,
-                    offset: log_offset,
-                    payload_len,
-                    record_size: record_len,
-                    token_count: image.token_count as u64,
-                    format: header_fmt,
+                Stamped {
+                    value: ChunkLoc {
+                        // The active segment this chunk's record landed in — a
+                        // rotation mid-turn can land later chunks in a newer
+                        // segment, so each chunk carries its own id.
+                        segment: at.segment,
+                        offset: at.offset,
+                        payload_len,
+                        record_size: at.size,
+                        token_count: image.token_count as u64,
+                        format: header_fmt,
+                    },
+                    id: at.identity,
                 },
             ));
             layer_token_count += image.token_count as usize;
@@ -323,7 +327,7 @@ pub fn persist_tokens_only(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
     token_ids: &[u32],
-) -> Result<super::manifest::RecordLoc> {
+) -> Result<Stamped<RecordLoc>> {
     // Return the written record's location so the CALLER can fold it into the
     // substrate index (`apply_tokens_loc`). Without that, `entry.tokens` stays
     // `None`, and both the maintenance relocation (`gather_relocations`) and the
@@ -333,12 +337,10 @@ pub fn persist_tokens_only(
     // locations; tokens must too). This is why turn-0 (prefilled/adopted) tokens
     // vanished during idle maintenance while KV survived.
     let encoded = encode_token_ids(token_ids);
-    let (segment, offset, record_size) = p.append_tokens(stream_id, &encoded)?;
-    Ok(super::manifest::RecordLoc {
-        segment,
-        offset,
-        payload_len: encoded.len() as u64,
-        record_size,
+    let at = p.append_tokens(stream_id, &encoded)?;
+    Ok(Stamped {
+        value: at.loc(encoded.len() as u64),
+        id: at.identity,
     })
 }
 
@@ -1047,7 +1049,8 @@ mod tests {
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
-            sp.append_projection_events(stream_id, &payload).unwrap();
+            sp.append_projection_events(stream_id, &payload, sp.mint())
+                .unwrap();
             sp.commit().unwrap();
         }
         // Reopen — a simulated daemon restart — and recover the timeline.
@@ -1087,7 +1090,8 @@ mod tests {
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
-            sp.append_wide_q_sigs(stream_id, &payload).unwrap();
+            sp.append_wide_q_sigs(stream_id, &payload, sp.mint())
+                .unwrap();
             sp.commit().unwrap();
         }
         // Reopen — simulated daemon restart — and recover the window.
@@ -1126,7 +1130,8 @@ mod tests {
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
-            sp.append_turn_index_page(stream_id, &payload).unwrap();
+            sp.append_turn_index_page(stream_id, &payload, sp.mint())
+                .unwrap();
             sp.commit().unwrap();
         }
         {
@@ -1165,7 +1170,8 @@ mod tests {
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             sp.declare_stream(&decl).unwrap();
-            sp.append_turn_index_page(stream_id, &payload).unwrap();
+            sp.append_turn_index_page(stream_id, &payload, sp.mint())
+                .unwrap();
             sp.commit().unwrap();
         }
         {
@@ -1393,8 +1399,9 @@ mod tests {
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
-            sp.append_turn_index_page(stream_id, b"first-page").unwrap();
-            sp.append_turn_index_page(stream_id, b"second-page")
+            sp.append_turn_index_page(stream_id, b"first-page", sp.mint())
+                .unwrap();
+            sp.append_turn_index_page(stream_id, b"second-page", sp.mint())
                 .unwrap();
             sp.commit().unwrap();
         }
@@ -1541,7 +1548,7 @@ mod tests {
             sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
             let loc = persist_tokens_only(&mut sp, stream_id, &[7, 8, 9]).unwrap();
             sp.commit().unwrap();
-            loc
+            loc.value
         };
         assert!(live_loc.offset > 0, "offset past the file-start header");
         assert!(live_loc.record_size > 0, "padded record_size populated");

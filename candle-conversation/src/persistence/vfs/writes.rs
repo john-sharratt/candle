@@ -70,14 +70,9 @@ impl SubstratePersistence {
                 kills: kill.kills.clone(),
             }
             .encode();
-            let (segment, offset, size) =
-                self.append_record(RecordType::VfsTombstone, 0, timeline, seq, 0, 0, &payload)?;
-            let loc = RecordLoc {
-                segment,
-                offset,
-                payload_len: payload.len() as u64,
-                record_size: size,
-            };
+            let loc = self
+                .append_record(RecordType::VfsTombstone, 0, timeline, seq, 0, 0, &payload)?
+                .loc(payload.len() as u64);
             for killed in self
                 .vfs_index
                 .record_tombstone(timeline, seq, loc, &kill.kills)
@@ -101,18 +96,10 @@ impl SubstratePersistence {
                 body: event.body.clone(),
             }
             .encode();
-            let (segment, offset, size) =
-                self.append_record(RecordType::VfsEvent, 0, timeline, seq, 0, 0, &payload)?;
-            self.vfs_index.record_event(
-                timeline,
-                seq,
-                RecordLoc {
-                    segment,
-                    offset,
-                    payload_len: payload.len() as u64,
-                    record_size: size,
-                },
-            );
+            let loc = self
+                .append_record(RecordType::VfsEvent, 0, timeline, seq, 0, 0, &payload)?
+                .loc(payload.len() as u64);
+            self.vfs_index.record_event(timeline, seq, loc);
             seqs.push(seq);
         }
         Ok(seqs)

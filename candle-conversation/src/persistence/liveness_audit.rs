@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
+use super::identity::RecordIdentity;
 use super::log_file::{LogFile, SUPERBLOCK_SIZE};
 use super::maintenance::gather_resident_set;
 use super::manifest::{decode_conv_state_payload, decode_label_payload};
@@ -33,13 +34,21 @@ use super::walker::walk_filtered;
 use super::{Result, SubstratePersistence};
 use crate::substrate::Substrate;
 
-/// The identity a resident record supersedes by: a newer record with the same
-/// key replaces the older on reload.
+/// The identity a resident record supersedes by: a record with the same key
+/// and a greater stamp replaces it on reload.
+///
+/// A `Label` record is its own key — `(timeline, origin, oseq)` — because a
+/// timeline's label is assembled field by field from every record that won a
+/// field (§6.5), so several are live at once and none supersedes another by
+/// key. A label written before identities existed keys by its timeline alone,
+/// and the last of those replaces the rest, as it always has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResidentKey {
     pub record_type: RecordType,
     pub id: u64,
     pub sub: u64,
+    /// The writing origin, for a key that is one record; zero otherwise.
+    pub origin: u64,
 }
 
 /// Resident types whose key is in the payload rather than the header — the
@@ -58,14 +67,20 @@ pub fn keyed_by_payload(rt: RecordType) -> bool {
     )
 }
 
-/// The supersession key of a resident record, or `None` for a type maintenance
-/// does not re-emit (or a payload that does not decode).
-pub fn resident_key(rt: RecordType, stream_id: u64, payload: &[u8]) -> Option<ResidentKey> {
+/// The supersession key of resident record `record`, or `None` for a type
+/// maintenance does not re-emit (or a payload that does not decode).
+pub fn resident_key(
+    rt: RecordType,
+    stream_id: u64,
+    payload: &[u8],
+    record: &RecordIdentity,
+) -> Option<ResidentKey> {
     let key = |id: u64, sub: u64| {
         Some(ResidentKey {
             record_type: rt,
             id,
             sub,
+            origin: 0,
         })
     };
     match rt {
@@ -77,7 +92,12 @@ pub fn resident_key(rt: RecordType, stream_id: u64, payload: &[u8]) -> Option<Re
         | RecordType::SectionTombstone
         | RecordType::CustomObject => key(stream_id, 0),
         RecordType::ConvState => key(decode_conv_state_payload(payload).ok()?.0, 0),
-        RecordType::Label => key(decode_label_payload(payload).ok()?.0, 0),
+        RecordType::Label => Some(ResidentKey {
+            record_type: rt,
+            id: decode_label_payload(payload).ok()?.0,
+            sub: record.oseq,
+            origin: record.origin,
+        }),
         RecordType::TreeMetadata => {
             let p = TreeMetadataPayload::decode(payload).ok()?;
             key(p.timeline_id, p.turn_index as u64)
@@ -186,25 +206,34 @@ impl SubstratePersistence {
             carried.insert((r.loc.segment, r.loc.offset));
         }
         // What the resident re-emission writes, by key.
-        let emitted: HashSet<ResidentKey> = gather_resident_set(substrate)
-            .iter()
-            .filter_map(|r| resident_key(r.rt, r.stream_id, &r.payload))
-            .collect();
+        let emitted: HashSet<ResidentKey> =
+            gather_resident_set(substrate, self.marker_ids(), self.node())
+                .iter()
+                .filter_map(|r| resident_key(r.rt, r.stream_id, &r.payload, &r.id))
+                .collect();
 
-        // One walk: tally every record, and find each resident key's newest copy.
+        // One walk: tally every record, and find each resident key's current
+        // copy — the greatest stamp, and of equal stamps the later copy.
         let mut seen: Vec<(SegmentId, u64, RecordType, u64)> = Vec::new();
-        let mut newest: HashMap<ResidentKey, (SegmentId, u64)> = HashMap::new();
+        let mut current: HashMap<ResidentKey, (RecordIdentity, SegmentId, u64)> = HashMap::new();
         for &seg in &segments {
-            walk_segment(self.dir(), seg, |rt, stream_id, offset, size, payload| {
-                seen.push((seg, offset, rt, size));
-                if let Some(k) = resident_key(rt, stream_id, payload) {
-                    newest.insert(k, (seg, offset));
-                }
-            })?;
+            walk_segment(
+                self.dir(),
+                seg,
+                |rt, stream_id, offset, size, payload, id| {
+                    seen.push((seg, offset, rt, size));
+                    if let Some(k) = resident_key(rt, stream_id, payload, &id) {
+                        let held = current.get(&k).map(|(held, ..)| *held).unwrap_or_default();
+                        if id.supersedes(&held) {
+                            current.insert(k, (id, seg, offset));
+                        }
+                    }
+                },
+            )?;
         }
-        for (k, at) in &newest {
+        for (k, (_, seg, offset)) in &current {
             if emitted.contains(k) {
-                carried.insert(*at);
+                carried.insert((*seg, *offset));
             }
         }
 
@@ -235,11 +264,12 @@ impl SubstratePersistence {
 }
 
 /// Visit every record of one segment: its type, header stream id, offset,
-/// padded size, and — for a payload-keyed resident type only — its payload.
+/// padded size, — for a payload-keyed resident type only — its payload, and
+/// its identity.
 fn walk_segment(
     dir: &Path,
     seg: SegmentId,
-    mut visit: impl FnMut(RecordType, u64, u64, u64, &[u8]),
+    mut visit: impl FnMut(RecordType, u64, u64, u64, &[u8], RecordIdentity),
 ) -> Result<()> {
     let mut log = LogFile::open_read_only(&segment_path(dir, seg))?;
     walk_filtered(&mut log, seg, SUPERBLOCK_SIZE, keyed_by_payload, |e| {
@@ -250,6 +280,7 @@ fn walk_segment(
             e.offset,
             e.size,
             &e.record.payload,
+            h.identity(),
         );
     })?;
     Ok(())
@@ -290,8 +321,8 @@ mod tests {
             let mut substrate = Substrate::new();
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
-            sp.declare_stream(&decl).unwrap();
-            substrate.apply_stream_decl(decl.stream_id(), decl.clone());
+            let declared = sp.declare_stream(&decl).unwrap();
+            substrate.apply_stream_decl(declared.value, decl.clone(), declared.id);
             sp.append_record(RecordType::Label, 0, 0, 0, 0, 0, &label)
                 .unwrap();
             sp.commit().unwrap();
@@ -314,9 +345,35 @@ mod tests {
 
     #[test]
     fn header_keyed_records_key_on_their_stream() {
-        let k = resident_key(RecordType::WideQSig, 42, &[]).unwrap();
-        assert_eq!((k.id, k.sub), (42, 0));
-        assert!(resident_key(RecordType::Chunk, 42, &[]).is_none());
+        let none = RecordIdentity::NONE;
+        let k = resident_key(RecordType::WideQSig, 42, &[], &none).unwrap();
+        assert_eq!((k.id, k.sub, k.origin), (42, 0, 0));
+        assert!(resident_key(RecordType::Chunk, 42, &[], &none).is_none());
+    }
+
+    /// Each stamped label record is a key of its own, so two that won
+    /// different fields of one timeline are both live; unstamped labels share
+    /// their timeline's key.
+    #[test]
+    fn a_stamped_label_is_its_own_key() {
+        let label = encode_label_payload(9, "c", "t", &BTreeMap::new());
+        let at = |origin, oseq| RecordIdentity {
+            origin,
+            oseq,
+            gen: 0,
+            epoch: 0,
+            hlc: oseq << 16,
+        };
+        let a = resident_key(RecordType::Label, 0, &label, &at(5, 1)).unwrap();
+        let b = resident_key(RecordType::Label, 0, &label, &at(5, 2)).unwrap();
+        let c = resident_key(RecordType::Label, 0, &label, &at(6, 1)).unwrap();
+        assert!(a != b && a != c && b != c);
+        assert_eq!((a.id, a.sub, a.origin), (9, 1, 5));
+        let none = RecordIdentity::NONE;
+        assert_eq!(
+            resident_key(RecordType::Label, 0, &label, &none),
+            resident_key(RecordType::Label, 0, &label, &none)
+        );
     }
 
     #[test]
@@ -333,8 +390,9 @@ mod tests {
             reason: None,
         }
         .encode();
-        let a = resident_key(RecordType::Tombstone, 0, &whole).unwrap();
-        let b = resident_key(RecordType::Tombstone, 0, &turn).unwrap();
+        let none = RecordIdentity::NONE;
+        let a = resident_key(RecordType::Tombstone, 0, &whole, &none).unwrap();
+        let b = resident_key(RecordType::Tombstone, 0, &turn, &none).unwrap();
         assert_ne!(a, b);
         assert_eq!((a.id, a.sub, b.sub), (9, 0, 1));
     }

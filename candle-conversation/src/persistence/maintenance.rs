@@ -62,8 +62,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Instant, SystemTime};
 
+use super::appended::Appended;
 use super::content_hash::section_stream_id;
-use super::identity::RecordIdentity;
+use super::identity::{MarkerIds, RecordIdentity};
 use super::manifest::{encode_conv_state_payload, encode_label_payload, ChunkLoc, RecordLoc};
 use super::record::{
     DebugIdPayload, DistillMode, DistillPayload, RecordType, SectionTombstonePayload,
@@ -284,12 +285,15 @@ fn dead_turns_of(substrate: &Substrate) -> HashSet<(u64, u32)> {
 
 /// A resident record snapshotted from the substrate for re-emission — carries
 /// no on-disk location (the substrate holds its decoded state), so it is
-/// rebuilt from live state rather than read back.
+/// rebuilt from live state rather than read back, under `id`: the identity of
+/// the record holding the value when the snapshot was taken, which the copy
+/// keeps.
 pub(super) struct Resident {
     pub(super) rt: RecordType,
     pub(super) stream_id: u64,
     pub(super) chunk_index: u64,
     pub(super) payload: Vec<u8>,
+    pub(super) id: RecordIdentity,
 }
 
 /// One already-encoded record to relocate verbatim from a source segment: its
@@ -312,7 +316,7 @@ pub struct MaintenancePlan {
     /// each with the identity of the record holding its value when the plan was
     /// made — which the copy keeps. A write made since the plan is carried
     /// after it under its own ([`RelocationWatch`]).
-    resident: Vec<(Resident, RecordIdentity)>,
+    resident: Vec<Resident>,
     /// The active segment when the plan was made, recorded as the drop-safety
     /// floor once the resident set is re-emitted (`None` when the plan re-emits
     /// nothing). Taken at the plan rather than at the first append: a record
@@ -404,16 +408,29 @@ impl MaintenanceResult {
     /// residence refs. **Supersession guard:** a record whose index entry no
     /// longer points at `old_loc` was rewritten since the plan was made, so its
     /// relocated copy is dead (reclaimed by a later pass) and skipped — the
-    /// newer copy wins. Held under a brief substrate write lock only.
+    /// newer copy wins. One that still does is the record the copy was taken
+    /// from, so the copy is applied under that record's identity, which it
+    /// kept. Held under a brief substrate write lock only.
     pub fn apply_to_substrate(&self, substrate: &mut Substrate) {
         for (sid, idx, old, new) in &self.chunk_updates {
-            if substrate.stream_of(*sid).and_then(|s| s.chunks.get(idx)) == Some(old) {
-                substrate.apply_chunk_loc(*sid, *idx, *new);
+            let held = substrate.stream_of(*sid).and_then(|s| {
+                let id = s.ids.chunks.get(idx).copied().unwrap_or_default();
+                s.chunks.get(idx).map(|loc| (*loc, id))
+            });
+            if let Some((loc, id)) = held {
+                if loc == *old {
+                    substrate.apply_chunk_loc(*sid, *idx, *new, id);
+                }
             }
         }
         for (sid, old, new) in &self.token_updates {
-            if substrate.stream_of(*sid).and_then(|s| s.tokens.as_ref()) == Some(old) {
-                substrate.apply_tokens_loc(*sid, *new);
+            let held = substrate
+                .stream_of(*sid)
+                .and_then(|s| s.tokens.map(|loc| (loc, s.ids.tokens)));
+            if let Some((loc, id)) = held {
+                if loc == *old {
+                    substrate.apply_tokens_loc(*sid, *new, id);
+                }
             }
         }
         for (sid, old, new) in &self.snapshot_updates {
@@ -421,12 +438,14 @@ impl MaintenanceResult {
             // since the plan was made keeps its newer location; the relocated
             // copy of the old one is dead and reclaimed by a later pass.
             if substrate.recurrent_snapshot_loc(*sid) == Some(*old) {
-                substrate.apply_snapshot_loc(*sid, *new);
+                let id = substrate.snapshot_id(*sid);
+                substrate.apply_snapshot_loc(*sid, *new, id);
             }
         }
         for (sid, old, new) in &self.branch_checkpoint_updates {
             if substrate.branch_checkpoint_loc(*sid) == Some(*old) {
-                substrate.apply_branch_checkpoint_loc(*sid, *new);
+                let id = substrate.branch_checkpoint_id(*sid);
+                substrate.apply_branch_checkpoint_loc(*sid, *new, id);
             }
         }
         substrate.refresh_cold_refs();
@@ -445,7 +464,15 @@ impl MaintenanceResult {
 /// and the `npc_relocs` worklist). Every class must be in exactly one of those
 /// two sets: a class in neither is deleted by the first op that touches its
 /// segment, silently. `Npc` and `TurnCoupling` were each in neither.
-pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
+///
+/// Each record carries the identity of the record holding its value: a value's
+/// from the substrate, which keeps it beside the value, and a marker's from
+/// `markers`.
+pub(super) fn gather_resident_set(
+    substrate: &Substrate,
+    markers: &MarkerIds,
+    node: u64,
+) -> Vec<Resident> {
     let tombstoned: HashSet<u64> = substrate
         .tombstoned_timelines()
         .iter()
@@ -478,12 +505,13 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
         if shed.dropped_wholesale() {
             continue;
         }
-        // Orphan (no decl): re-emit nothing — its StreamDecl is gone, so its
-        // sig/projection records are unreachable dead weight. Re-emitting them
-        // would keep the orphan's metadata immortal on the incremental path.
-        // (The `if let Some(decl)` below already skips the StreamDecl; this also
-        // skips the sig/projection re-emit.) Mirrors the other orphan gates.
-        if entry.decl.is_none() {
+        // Orphan (no decl, and none coming): re-emit nothing — its StreamDecl
+        // is gone, so its sig/projection records are unreachable dead weight.
+        // Re-emitting them would keep the orphan's metadata immortal on the
+        // incremental path. (The `if let Some(decl)` below already skips the
+        // StreamDecl; this also skips the sig/projection re-emit.) Mirrors the
+        // other orphan gates.
+        if entry.is_orphan(node) {
             continue;
         }
         // A retired turn keeps only its `StreamDecl` placeholder; its sig and
@@ -496,6 +524,7 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
                 stream_id: stream_id.0,
                 chunk_index: 0,
                 payload: decl.encode(),
+                id: entry.ids.decl,
             });
         }
         if keep_sig {
@@ -505,6 +534,7 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
                     stream_id: stream_id.0,
                     chunk_index: 0,
                     payload: p.clone(),
+                    id: entry.ids.projection_events,
                 });
             }
             if let Some(p) = &entry.wide_q_sigs {
@@ -513,6 +543,7 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
                     stream_id: stream_id.0,
                     chunk_index: 0,
                     payload: p.clone(),
+                    id: entry.ids.wide_q_sigs,
                 });
             }
             // The index page rides with the turn's K/V: a turn that survives
@@ -524,6 +555,7 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
                     stream_id: stream_id.0,
                     chunk_index: 0,
                     payload: p.bytes().to_vec(),
+                    id: entry.ids.index_page,
                 });
             }
         }
@@ -533,10 +565,11 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
                 stream_id: stream_id.0,
                 chunk_index: through,
                 payload: Vec::new(),
+                id: entry.ids.commit,
             });
         }
     }
-    for (tl, conv, label, custom) in substrate.live_conv_meta() {
+    for (tl, meta, id) in substrate.live_label_records() {
         // A tombstoned timeline that is ALSO distilled is the provenance corpus
         // (calibration exemplars: archived, distilled, then tombstoned out of the
         // live gather while their signatures keep answering the belief scan).
@@ -550,12 +583,40 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             rt: RecordType::Label,
             stream_id: 0,
             chunk_index: 0,
-            payload: encode_label_payload(tl, &conv, &label, &custom),
+            payload: encode_label_payload(tl, &meta.conv_id, &meta.label, &meta.custom),
+            id,
+        });
+    }
+    // A snapshot retraction carries no payload and so has no location to
+    // relocate from, but it is the stream's value: re-emitted, so a drop never
+    // takes the record that refuses an older snapshot arriving later.
+    for (stream_id, id) in substrate.retracted_snapshots() {
+        out.push(Resident {
+            rt: RecordType::Snapshot,
+            stream_id: stream_id.0,
+            chunk_index: 0,
+            payload: Vec::new(),
+            id,
+        });
+    }
+    // Records about a timeline not registered yet — durable like any other,
+    // and carried so a drop never takes the only copy.
+    for (tl, rt, payload, id) in substrate.pending_records() {
+        if tombstoned.contains(&tl) {
+            continue;
+        }
+        let stream_id = if rt == RecordType::ConvState { tl } else { 0 };
+        out.push(Resident {
+            rt,
+            stream_id,
+            chunk_index: 0,
+            payload,
+            id,
         });
     }
     // The whole conversation state, keyed in the header by timeline — see
     // `ConvState`. Same retirement rule as the labels above.
-    for (tl, state) in substrate.live_conv_states() {
+    for (tl, state, id) in substrate.live_conv_states() {
         if tombstoned.contains(&tl) && !distilled.contains_key(&tl) {
             continue;
         }
@@ -564,9 +625,10 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             stream_id: tl,
             chunk_index: 0,
             payload: encode_conv_state_payload(tl, &state),
+            id,
         });
     }
-    for p in substrate.live_tree_metadata_payloads() {
+    for (p, id) in substrate.live_tree_metadata_payloads() {
         if tombstoned.contains(&p.timeline_id) {
             continue;
         }
@@ -575,24 +637,10 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             stream_id: 0,
             chunk_index: 0,
             payload: p.encode(),
+            id,
         });
     }
-    for (tl, from_turn) in substrate.live_couplings() {
-        if tombstoned.contains(&tl) {
-            continue;
-        }
-        out.push(Resident {
-            rt: RecordType::TurnCoupling,
-            stream_id: 0,
-            chunk_index: 0,
-            payload: TurnCouplingPayload {
-                timeline_id: tl,
-                from_turn,
-            }
-            .encode(),
-        });
-    }
-    for (tl, id) in substrate.live_debug_ids() {
+    for (tl, debug_id, id) in substrate.live_debug_ids() {
         if tombstoned.contains(&tl) {
             continue;
         }
@@ -602,39 +650,46 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
             chunk_index: 0,
             payload: DebugIdPayload {
                 timeline_id: tl,
-                debug_id: id,
+                debug_id,
             }
             .encode(),
+            id,
         });
     }
+    // A marker's identity is the persistence side's, not the substrate's.
+    let marker = |rt: RecordType, stream_id: u64, payload: Vec<u8>| Resident {
+        rt,
+        stream_id,
+        chunk_index: 0,
+        id: markers.identity_for(rt, stream_id, &payload),
+        payload,
+    };
     // Re-emitted for tombstoned timelines too: the marker is what exempts a
     // distilled turn from the integrity verdict, and a distilled turn has
     // legitimately shed its tokens/KV. Losing it condemns the provenance corpus
     // as "corrupt" on the next reload.
     for (&tl, &mode) in &distilled {
-        out.push(Resident {
-            rt: RecordType::Distilled,
-            stream_id: 0,
-            chunk_index: 0,
-            payload: DistillPayload {
+        out.push(marker(
+            RecordType::Distilled,
+            0,
+            DistillPayload {
                 timeline_id: tl,
                 mode,
             }
             .encode(),
-        });
+        ));
     }
     for t in substrate.tombstoned_timelines() {
-        out.push(Resident {
-            rt: RecordType::Tombstone,
-            stream_id: 0,
-            chunk_index: 0,
-            payload: TombstonePayload {
+        out.push(marker(
+            RecordType::Tombstone,
+            0,
+            TombstonePayload {
                 timeline_id: t.raw(),
                 turn_index: None,
                 reason: None,
             }
             .encode(),
-        });
+        ));
     }
     // **And the turn-scoped ones, or retirement does not survive a sweep.**
     //
@@ -666,17 +721,16 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
         if tombstoned.contains(&tl.raw()) {
             continue;
         }
-        out.push(Resident {
-            rt: RecordType::Tombstone,
-            stream_id: 0,
-            chunk_index: 0,
-            payload: TombstonePayload {
+        out.push(marker(
+            RecordType::Tombstone,
+            0,
+            TombstonePayload {
                 timeline_id: tl.raw(),
                 turn_index: Some(turn_index),
                 reason: None,
             }
             .encode(),
-        });
+        ));
     }
     // Tombstoned section streams — the section counterpart of the two
     // `Tombstone` loops above, and the incremental path's half of the same
@@ -688,18 +742,17 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
     // section as merely absent, and the next ingest would re-persist and
     // eventually re-corrupt the same content address.
     for &stream_id in substrate.tombstoned_sections() {
-        out.push(Resident {
-            rt: RecordType::SectionTombstone,
-            stream_id: stream_id.0,
-            chunk_index: 0,
-            payload: SectionTombstonePayload { reason: None }.encode(),
-        });
+        out.push(marker(
+            RecordType::SectionTombstone,
+            stream_id.0,
+            SectionTombstonePayload { reason: None }.encode(),
+        ));
     }
     // Tool-round-trip couplings — see the twin loop in
     // `compaction::collect_live_records`. Payload-keyed, so no supersession
     // accounting protects them and no location map relocates them; re-emitting
     // from the substrate's live set is the only thing that carries them.
-    for (timeline_id, from_turn) in substrate.live_couplings() {
+    for (timeline_id, from_turn, id) in substrate.live_couplings() {
         if tombstoned.contains(&timeline_id) {
             continue;
         }
@@ -712,6 +765,7 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
                 from_turn,
             }
             .encode(),
+            id,
         });
     }
     // Host-defined keyed state — the npcd command-table flag and anything else
@@ -720,12 +774,13 @@ pub(super) fn gather_resident_set(substrate: &Substrate) -> Vec<Resident> {
     // in `Substrate::custom_objects` and carried forward from RAM. The key's
     // hash rides in the header `stream_id` so supersession accounting is
     // mechanical (see the twin block in `compaction::collect_live_records`).
-    for obj in substrate.live_custom_objects() {
+    for (obj, id) in substrate.live_custom_objects() {
         out.push(Resident {
             rt: RecordType::CustomObject,
             stream_id: obj.stream_id(),
             chunk_index: 0,
             payload: obj.encode(),
+            id,
         });
     }
     out
@@ -797,7 +852,7 @@ impl SubstratePersistence {
         // the re-emit→looks-dead→compact churn (see `need_resident_reemit`).
         let t_resident = Instant::now();
         let resident = if self.need_resident_reemit(&op.targets(), &carried) {
-            self.with_resident_identities(gather_resident_set(substrate))
+            gather_resident_set(substrate, &self.marker_ids, self.node())
         } else {
             Vec::new()
         };
@@ -822,7 +877,7 @@ impl SubstratePersistence {
         // most a few times a minute), and the summary string is built only for
         // the line itself.
         let mut resident_census = RecordCensus::new();
-        for (r, _) in &resident {
+        for r in &resident {
             resident_census.record(r.rt);
         }
         // Why the op ran: its targets' sizes, so a store that keeps compacting
@@ -1045,7 +1100,7 @@ impl SubstratePersistence {
     ) -> Result<()> {
         let mut bytes = 0u64;
         while run.resident_cursor < plan.resident.len() && (bytes == 0 || bytes < budget_bytes) {
-            let (r, planned_id) = &plan.resident[run.resident_cursor];
+            let r = &plan.resident[run.resident_cursor];
             run.resident_cursor += 1;
             let verdict = watch.map_or(Reemit::Carry, |w| w.reemit(r.rt, r.stream_id, &r.payload));
             let newer = match verdict {
@@ -1054,37 +1109,15 @@ impl SubstratePersistence {
                 Reemit::CarryThen(newer) => newer,
             };
             bytes += self
-                .append_carried(
-                    r.rt,
-                    0,
-                    r.stream_id,
-                    r.chunk_index,
-                    0,
-                    0,
-                    &r.payload,
-                    *planned_id,
-                )?
-                .2;
+                .append_carried(r.rt, 0, r.stream_id, r.chunk_index, 0, 0, &r.payload, r.id)?
+                .size;
             for (chunk_index, payload, id) in &newer {
                 bytes += self
                     .append_carried(r.rt, 0, r.stream_id, *chunk_index, 0, 0, payload, *id)?
-                    .2;
+                    .size;
             }
         }
         Ok(())
-    }
-
-    /// Pair each planned resident record with the identity of the record that
-    /// holds its value now, for its copy to keep.
-    fn with_resident_identities(&self, set: Vec<Resident>) -> Vec<(Resident, RecordIdentity)> {
-        set.into_iter()
-            .map(|r| {
-                let id = self
-                    .resident_ids
-                    .identity_for(r.rt, r.stream_id, &r.payload);
-                (r, id)
-            })
-            .collect()
     }
 
     /// Relocate the next run of the plan's chunks — up to `budget_bytes` of
@@ -1133,16 +1166,16 @@ impl SubstratePersistence {
                 })
                 .collect();
             let new = self.relocate_raw_from_segment(source, &items)?;
-            for ((sid, idx, old), (segment, offset, record_size)) in recs.into_iter().zip(new) {
+            for ((sid, idx, old), at) in recs.into_iter().zip(new) {
                 run.chunk_updates.push((
                     sid,
                     idx,
                     old,
                     ChunkLoc {
-                        segment,
-                        offset,
+                        segment: at.segment,
+                        offset: at.offset,
                         payload_len: old.payload_len,
-                        record_size,
+                        record_size: at.size,
                         token_count: old.token_count,
                         format: old.format,
                     },
@@ -1200,8 +1233,8 @@ impl SubstratePersistence {
         let token_updates = self.relocate_stream_records(&live_tokens)?;
 
         // Snapshots — the same verbatim path, behind a supersession check.
-        // Snapshot records are last-writer-wins by append order (keyed
-        // `(Snapshot, stream_id)`), and the seal thread's writer can append a
+        // Snapshot records are keyed `(Snapshot, stream_id)`, the greatest
+        // stamp holding, and the seal thread's writer can append a
         // NEWER tail for a planned stream between plan and execute (the plan
         // holds no lock across that window). Relocating the planned — now
         // stale — copy would append it physically AFTER the newer record, so
@@ -1306,13 +1339,8 @@ impl SubstratePersistence {
                 })
                 .collect();
             let new = self.relocate_raw_from_segment(source, &items)?;
-            for (r, (segment, offset, record_size)) in recs.into_iter().zip(new) {
-                let moved = RecordLoc {
-                    segment,
-                    offset,
-                    payload_len: r.loc.payload_len,
-                    record_size,
-                };
+            for (r, at) in recs.into_iter().zip(new) {
+                let moved = at.loc(r.loc.payload_len);
                 if r.rt == RecordType::VfsEvent {
                     self.vfs_index
                         .repoint_event(r.timeline, r.seq, r.loc, moved);
@@ -1337,20 +1365,26 @@ impl SubstratePersistence {
     /// Relocate a set of already-encoded records from `source` into the active
     /// via **coalesced stripe reads + verbatim staging**. Records are sorted by
     /// offset and adjacent ones read in a single I/O; each is staged byte-for-
-    /// byte (its CRC preserved — no re-encode). Returns the new
-    /// `(segment, offset, size)` per item, in input order.
+    /// byte (its CRC and identity preserved — no re-encode). Returns where each
+    /// item landed, in input order.
     fn relocate_raw_from_segment(
         &mut self,
         source: SegmentId,
         items: &[RawReloc],
-    ) -> Result<Vec<(SegmentId, u64, u64)>> {
+    ) -> Result<Vec<Appended>> {
         let mut order: Vec<usize> = (0..items.len()).collect();
         order.sort_unstable_by_key(|&i| items[i].offset);
         let spans: Vec<(u64, u64)> = order
             .iter()
             .map(|&k| (items[k].offset, items[k].record_size))
             .collect();
-        let mut new_locs = vec![(source, 0u64, 0u64); items.len()];
+        let unplaced = Appended {
+            segment: source,
+            offset: 0,
+            size: 0,
+            identity: RecordIdentity::NONE,
+        };
+        let mut new_locs = vec![unplaced; items.len()];
         let mut buf: Vec<u8> = Vec::new();
         for (i, j) in stripes(&spans, MAX_STRIPE_BYTES) {
             let start = spans[i].0;
@@ -1392,17 +1426,8 @@ impl SubstratePersistence {
                 })
                 .collect();
             let new = self.relocate_raw_from_segment(source, &items)?;
-            for ((sid, old), (segment, offset, record_size)) in recs.into_iter().zip(new) {
-                updates.push((
-                    sid,
-                    old,
-                    RecordLoc {
-                        segment,
-                        offset,
-                        payload_len: old.payload_len,
-                        record_size,
-                    },
-                ));
+            for ((sid, old), at) in recs.into_iter().zip(new) {
+                updates.push((sid, old, at.loc(old.payload_len)));
             }
         }
         Ok(updates)
@@ -1459,7 +1484,7 @@ impl SubstratePersistence {
         }
         let carried = self.liveness_and_carry(substrate).1;
         let resident = if self.need_resident_reemit(&op.targets(), &carried) {
-            self.with_resident_identities(gather_resident_set(substrate))
+            gather_resident_set(substrate, &self.marker_ids, self.node())
         } else {
             Vec::new()
         };
@@ -1573,6 +1598,7 @@ impl SubstratePersistence {
             .map(|s| s.0)
             .collect();
         let in_target = |seg: SegmentId| targets.contains(&seg);
+        let node = self.node();
 
         let mut chunks: Vec<(StreamId, u64, ChunkLoc)> = Vec::new();
         let mut tokens: Vec<(StreamId, RecordLoc)> = Vec::new();
@@ -1594,13 +1620,14 @@ impl SubstratePersistence {
             if shed.dropped_wholesale() {
                 continue;
             }
-            // Orphan (no decl): its records are unreachable on reload, so DON'T
-            // relocate them — segment_liveness excludes them from live weight, so
-            // relocating (instead of dropping) would move the orphan KV forward
-            // every compact while the dead-ratio never improves: perpetual churn
-            // and the bloat is never reclaimed. Dropping the source segment
-            // reclaims it. Mirrors the collect_live_records / segment_liveness gate.
-            if entry.decl.is_none() {
+            // Orphan (no decl, and none coming): its records are unreachable on
+            // reload, so DON'T relocate them — segment_liveness excludes them
+            // from live weight, so relocating (instead of dropping) would move
+            // the orphan KV forward every compact while the dead-ratio never
+            // improves: perpetual churn and the bloat is never reclaimed.
+            // Dropping the source segment reclaims it. Mirrors the
+            // collect_live_records / segment_liveness gate.
+            if entry.is_orphan(node) {
                 continue;
             }
             // **A retired turn is not relocated.** Moving it forward would carry
@@ -1765,12 +1792,13 @@ impl SubstratePersistence {
         //
         // A stream missing from the map carries nothing: a timeline dropped
         // wholesale (tombstoned and undistilled), or an orphan with no
-        // `StreamDecl` (its decl was lost in a prior generation, so its turn can
-        // never be rebuilt on reload — mirroring the `collect_live_records`
-        // orphan gate — and the segments holding only its records become
-        // reclaimable instead of pinned forever).
+        // `StreamDecl` and none coming (its decl was lost in a prior
+        // generation, so its turn can never be rebuilt on reload — mirroring
+        // the `collect_live_records` orphan gate — and the segments holding
+        // only its records become reclaimable instead of pinned forever).
         let mut carried: CarriedStreams = HashMap::new();
         let dead_turns = dead_turns_of(substrate);
+        let node = self.node();
         for (sid, entry) in substrate.all_streams() {
             let shed = classify(
                 &entry.decl,
@@ -1779,7 +1807,7 @@ impl SubstratePersistence {
                 &dead_turns,
                 &tombstoned_sections,
             );
-            if shed.dropped_wholesale() || entry.decl.is_none() {
+            if shed.dropped_wholesale() || entry.is_orphan(node) {
                 continue;
             }
             // A turn-dead stream keeps its `StreamDecl` — the compactor emits it
@@ -1818,19 +1846,22 @@ impl SubstratePersistence {
         // timeline's label and state are not re-emitted; neither are a
         // tombstoned timeline's summary nodes, couplings or debug id, or its
         // turn tombstones (the timeline's own tombstone covers them).
-        // A timeline whose metadata is all default writes no `Label` on
-        // re-emission — there is nothing to restore — so its last one is dead.
-        let labelled: HashSet<u64> = substrate
-            .live_conv_meta()
+        // A `Label` record is live while the substrate holds a field it won
+        // (or it is the record that first named the conversation) — exactly the
+        // records `live_label_records` re-emits. One that won nothing, and a
+        // timeline whose metadata is all default, re-emit nothing, so they are
+        // dead.
+        let label_records: HashSet<(u64, u64, u64)> = substrate
+            .live_label_records()
             .into_iter()
-            .map(|(tl, ..)| tl)
+            .map(|(tl, _, id)| (tl, id.origin, id.oseq))
             .collect();
-        for (key, loc) in &self.resident_locs {
+        for (key, loc) in self.resident_locs.iter() {
             let tl = key.id;
             let gone = tombstoned.contains(&tl);
             let kept = !gone || distilled.contains_key(&tl);
             let carried_record = match key.record_type {
-                RecordType::Label => kept && labelled.contains(&tl),
+                RecordType::Label => kept && label_records.contains(&(tl, key.origin, key.sub)),
                 RecordType::ConvState => kept,
                 RecordType::TreeMetadata | RecordType::TurnCoupling | RecordType::DebugId => !gone,
                 RecordType::Tombstone => key.sub == 0 || !gone,
@@ -1906,6 +1937,7 @@ impl CountedRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::identity::Stamped;
     use crate::persistence::record::ChunkPayload;
     use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
     use crate::persistence::{SubstratePersistence, SUBSTRATE_DIR};
@@ -1975,10 +2007,10 @@ mod tests {
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             let dead_before = sp.accounting.dead_bytes();
-            let loc_a = sp.write_snapshot(sid, &[&payload(1, 0x11)]).unwrap();
-            substrate.apply_snapshot_loc(sid, loc_a);
-            let loc_b = sp.write_snapshot(sid, &[&payload(2, 0x22)]).unwrap();
-            substrate.apply_snapshot_loc(sid, loc_b);
+            let a = sp.write_snapshot(sid, &[&payload(1, 0x11)]).unwrap();
+            substrate.apply_snapshot_loc(sid, a.value, a.id);
+            let b = sp.write_snapshot(sid, &[&payload(2, 0x22)]).unwrap();
+            substrate.apply_snapshot_loc(sid, b.value, b.id);
             assert!(
                 sp.accounting.dead_bytes() > dead_before,
                 "the superseded snapshot must be credited as dead bytes"
@@ -2071,14 +2103,14 @@ mod tests {
         let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
         // Two tails in seg 1: turn 1 is superseded (the segment's dead
         // weight), turn 2 is the live tail the compact must carry forward.
-        let loc_a = sp
+        let Stamped { value: loc_a, id } = sp
             .write_snapshot(sid, &[&snapshot_payload(timeline, 1, 0x11)])
             .unwrap();
-        substrate.apply_snapshot_loc(sid, loc_a);
-        let loc_b = sp
+        substrate.apply_snapshot_loc(sid, loc_a, id);
+        let Stamped { value: loc_b, id } = sp
             .write_snapshot(sid, &[&snapshot_payload(timeline, 2, 0x22)])
             .unwrap();
-        substrate.apply_snapshot_loc(sid, loc_b);
+        substrate.apply_snapshot_loc(sid, loc_b, id);
         sp.commit().unwrap();
         sp.seal_active().unwrap(); // seg 1 sealed; active is seg 2
         assert_eq!(
@@ -2150,14 +2182,14 @@ mod tests {
 
         let mut substrate = Substrate::new();
         let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-        let loc_a = sp
+        let Stamped { value: loc_a, id } = sp
             .write_snapshot(sid, &[&snapshot_payload(timeline, 1, 0x11)])
             .unwrap();
-        substrate.apply_snapshot_loc(sid, loc_a);
-        let loc_b = sp
+        substrate.apply_snapshot_loc(sid, loc_a, id);
+        let Stamped { value: loc_b, id } = sp
             .write_snapshot(sid, &[&snapshot_payload(timeline, 2, 0x22)])
             .unwrap();
-        substrate.apply_snapshot_loc(sid, loc_b);
+        substrate.apply_snapshot_loc(sid, loc_b, id);
         sp.commit().unwrap();
         sp.seal_active().unwrap(); // seg 1 sealed (turn-1 dead, turn-2 the tail)
 
@@ -2170,10 +2202,10 @@ mod tests {
 
         // RACE: before execute, the writer appends a newer turn-3 tail into
         // the active segment and installs it in the substrate index.
-        let loc_c = sp
+        let Stamped { value: loc_c, id } = sp
             .write_snapshot(sid, &[&snapshot_payload(timeline, 3, 0x33)])
             .unwrap();
-        substrate.apply_snapshot_loc(sid, loc_c);
+        substrate.apply_snapshot_loc(sid, loc_c, id);
         sp.commit().unwrap();
         assert_eq!(
             loc_c.segment,
@@ -2253,14 +2285,14 @@ mod tests {
 
         let mut substrate = Substrate::new();
         let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-        let loc_a = sp
+        let Stamped { value: loc_a, id } = sp
             .write_snapshot(sid, &[&snapshot_payload(timeline, 1, 0x11)])
             .unwrap();
-        substrate.apply_snapshot_loc(sid, loc_a);
-        let loc_b = sp
+        substrate.apply_snapshot_loc(sid, loc_a, id);
+        let Stamped { value: loc_b, id } = sp
             .write_snapshot(sid, &[&snapshot_payload(timeline, 2, 0x22)])
             .unwrap();
-        substrate.apply_snapshot_loc(sid, loc_b);
+        substrate.apply_snapshot_loc(sid, loc_b, id);
         sp.commit().unwrap();
         sp.seal_active().unwrap();
 
@@ -2568,8 +2600,9 @@ mod tests {
             // seg 1: the object, beside a chunk a later write supersedes — the
             // dead weight is what draws maintenance to this segment.
             let obj = CustomObjectPayload::new(key, serde_json::json!({ "open": true }));
-            sp.write_custom_object(&obj).unwrap();
-            substrate.apply_custom_object(obj);
+            let id = sp.mint();
+            sp.write_custom_object(&obj, id).unwrap();
+            substrate.apply_custom_object(obj, id);
             sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(1))
                 .unwrap();
             sp.commit().unwrap();
@@ -2641,9 +2674,9 @@ mod tests {
             crate::projection::LayerId::from_raw(1).unwrap(),
             crate::projection::GroupId::from_raw(1).unwrap(),
         );
-        substrate.couple_turn(TimelineId::from_raw(9).unwrap(), 4);
+        substrate.couple_turn(TimelineId::from_raw(9).unwrap(), 4, RecordIdentity::NONE);
 
-        let resident = gather_resident_set(&substrate);
+        let resident = gather_resident_set(&substrate, &MarkerIds::new(), 0);
         let coupling = resident
             .iter()
             .find(|r| r.rt == RecordType::TurnCoupling)
@@ -2670,7 +2703,7 @@ mod tests {
         substrate.tombstone_turn(tl, 7);
         substrate.tombstone_turn(tl, 8);
 
-        let residents = gather_resident_set(&substrate);
+        let residents = gather_resident_set(&substrate, &MarkerIds::new(), 0);
         let turn_marks: Vec<u32> = residents
             .iter()
             .filter(|r| r.rt == RecordType::Tombstone)
@@ -2689,7 +2722,7 @@ mod tests {
     #[test]
     fn a_dead_timeline_leaves_no_turn_marks_to_carry_forward() {
         let turn_marks = |substrate: &Substrate, raw: u64| {
-            gather_resident_set(substrate)
+            gather_resident_set(substrate, &MarkerIds::new(), 0)
                 .iter()
                 .filter(|r| r.rt == RecordType::Tombstone)
                 .filter_map(|r| TombstonePayload::decode(&r.payload).ok())
@@ -2767,9 +2800,9 @@ mod tests {
         // The decl is written as a real record: its liveness comes from the
         // on-disk metadata map, not from the in-RAM index, and it is what must
         // survive the turn being retired.
-        sp.declare_stream(&decl).unwrap();
+        let declared = sp.declare_stream(&decl).unwrap();
         sp.commit().unwrap();
-        substrate.apply_stream_decl(sid, decl.clone());
+        substrate.apply_stream_decl(sid, decl.clone(), declared.id);
         // The index entries a written turn leaves behind — what `segment_liveness`
         // actually reads. Placed directly so the test is about the liveness rule
         // rather than about the append path.
@@ -2784,6 +2817,7 @@ mod tests {
                 token_count: 32,
                 format: 4,
             },
+            RecordIdentity::NONE,
         );
 
         let before: u64 = sp.segment_liveness(&substrate).values().sum();
@@ -2813,12 +2847,12 @@ mod tests {
         let mut substrate = Substrate::new();
         let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
         let sid = StreamId(0xB4A9C4);
-        let loc = sp
+        let Stamped { value: loc, id } = sp
             .write_branch_checkpoint(sid, &[&[7u8; 10_000][..]])
             .unwrap();
         sp.commit().unwrap();
         let before: u64 = sp.segment_liveness(&substrate).values().sum();
-        substrate.apply_branch_checkpoint_loc(sid, loc);
+        substrate.apply_branch_checkpoint_loc(sid, loc, id);
         let after: u64 = sp.segment_liveness(&substrate).values().sum();
         assert_eq!(after - before, loc.record_size);
         std::fs::remove_dir_all(&dir).ok();
@@ -2855,9 +2889,9 @@ mod tests {
             let mut substrate = Substrate::new();
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            sp.declare_stream(&decl).unwrap();
-            substrate.apply_stream_decl(sid, decl.clone());
-            sp.append_wide_q_sigs(sid, b"wide-q-signature-bytes")
+            let declared = sp.declare_stream(&decl).unwrap();
+            substrate.apply_stream_decl(sid, decl.clone(), declared.id);
+            sp.append_wide_q_sigs(sid, b"wide-q-signature-bytes", sp.mint())
                 .unwrap();
             sp.commit().unwrap();
             let live: u64 = sp.segment_liveness(&substrate).values().sum();
@@ -2867,16 +2901,16 @@ mod tests {
             );
             // Superseding it leaves exactly one live copy (LWW) — liveness stays
             // bounded, it does not accumulate per re-write.
-            sp.append_wide_q_sigs(sid, b"newer-wide-q-signature")
+            sp.append_wide_q_sigs(sid, b"newer-wide-q-signature", sp.mint())
                 .unwrap();
             sp.commit().unwrap();
             assert_eq!(
                 sp.metadata_locs
-                    .keys()
-                    .filter(|(rt, s)| *rt == RecordType::WideQSig && *s == sid.0)
+                    .iter()
+                    .filter(|((rt, s), _)| *rt == RecordType::WideQSig && *s == sid.0)
                     .count(),
                 1,
-                "last-writer-wins: one current metadata location per (type, stream)"
+                "the greatest stamp: one current metadata location per (type, stream)"
             );
         }
         // Rebuilt from the walk on reload.
@@ -2923,9 +2957,9 @@ mod tests {
         };
         let corpus = decl(9001);
         let sid = corpus.stream_id();
-        sp.declare_stream(&corpus).unwrap();
-        substrate.apply_stream_decl(sid, corpus.clone());
-        sp.append_wide_q_sigs(sid, &[7u8; 4096]).unwrap();
+        let declared = sp.declare_stream(&corpus).unwrap();
+        substrate.apply_stream_decl(sid, corpus.clone(), declared.id);
+        sp.append_wide_q_sigs(sid, &[7u8; 4096], sp.mint()).unwrap();
         sp.commit().unwrap();
         let with_sig = live_of(&sp, &substrate);
 
@@ -2949,9 +2983,10 @@ mod tests {
         // An undistilled tombstone carries nothing.
         let retired = decl(9002);
         let retired_sid = retired.stream_id();
-        sp.declare_stream(&retired).unwrap();
-        substrate.apply_stream_decl(retired_sid, retired);
-        sp.append_wide_q_sigs(retired_sid, &[9u8; 4096]).unwrap();
+        let declared = sp.declare_stream(&retired).unwrap();
+        substrate.apply_stream_decl(retired_sid, retired, declared.id);
+        sp.append_wide_q_sigs(retired_sid, &[9u8; 4096], sp.mint())
+            .unwrap();
         sp.commit().unwrap();
         substrate.tombstone_timeline(TimelineId::from_raw(9002).unwrap());
         assert_eq!(
@@ -2999,7 +3034,7 @@ mod tests {
             "orphan chunks must not be relocated (would perpetuate the bloat + churn)",
         );
         // gather_resident_set must not re-emit any record for the orphan stream.
-        let residents = gather_resident_set(&substrate);
+        let residents = gather_resident_set(&substrate, &MarkerIds::new(), 0);
         assert!(
             residents.iter().all(|r| r.stream_id != sid.0),
             "orphan metadata must not be re-emitted",
@@ -3051,7 +3086,9 @@ mod tests {
         // metadata record (here a StreamDecl in seg 5, BELOW the floor) must
         // force a re-emit — the floor heuristic alone would wrongly skip it and
         // the drop would delete the live turn's decl (the silent-loss bug).
-        sp.metadata_locs.insert((RecordType::StreamDecl, 42), at(5));
+        let none = RecordIdentity::NONE;
+        sp.metadata_locs
+            .offer((RecordType::StreamDecl, 42), Some(at(5)), none);
         assert!(
             sp.need_resident_reemit(&[SegmentId(5)], &carried),
             "a target holding a current StreamDecl must force a re-emit even below the floor",
@@ -3061,18 +3098,22 @@ mod tests {
 
         // A stream maintenance does not carry pins nothing: its decl is not
         // re-emitted by a re-emission, so it cannot justify one.
-        sp.metadata_locs.insert((RecordType::StreamDecl, 44), at(6));
+        sp.metadata_locs
+            .offer((RecordType::StreamDecl, 44), Some(at(6)), none);
         assert!(
             !sp.need_resident_reemit(&[SegmentId(6)], &carried),
             "a tombstoned stream's decl forced a re-emit of the whole resident set",
         );
         // Nor does a signature the stream's carry sheds — only its decl counts.
-        sp.metadata_locs.insert((RecordType::WideQSig, 43), at(7));
+        sp.metadata_locs
+            .offer((RecordType::WideQSig, 43), Some(at(7)), none);
         assert!(!sp.need_resident_reemit(&[SegmentId(7)], &carried));
-        sp.metadata_locs.insert((RecordType::StreamDecl, 43), at(7));
+        sp.metadata_locs
+            .offer((RecordType::StreamDecl, 43), Some(at(7)), none);
         assert!(sp.need_resident_reemit(&[SegmentId(7)], &carried));
         // A carried stream's signature does count.
-        sp.metadata_locs.insert((RecordType::WideQSig, 42), at(8));
+        sp.metadata_locs
+            .offer((RecordType::WideQSig, 42), Some(at(8)), none);
         assert!(sp.need_resident_reemit(&[SegmentId(8)], &carried));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3304,16 +3345,8 @@ mod tests {
             assert!(sp.relocation_in_flight());
             let mut run = sp.begin_maintenance(&plan).unwrap();
             sp.write_section_tombstone(ssid.0, None).unwrap();
-            let (seg, off, size) = sp.append_tokens(tsid, b"turn-new").unwrap();
-            substrate.apply_tokens_loc(
-                tsid,
-                RecordLoc {
-                    segment: seg,
-                    offset: off,
-                    payload_len: b"turn-new".len() as u64,
-                    record_size: size,
-                },
-            );
+            let at = sp.append_tokens(tsid, b"turn-new").unwrap();
+            substrate.apply_tokens_loc(tsid, at.loc(b"turn-new".len() as u64), at.identity);
             sp.commit().unwrap();
             while sp.relocate_batch(&plan, &mut run, 1).unwrap() {}
             let result = sp.complete_maintenance(&plan, run).unwrap();
@@ -3384,7 +3417,7 @@ mod tests {
                 &label("conv-606", "original"),
             )
             .unwrap();
-            sp.write_debug_id(606, "first").unwrap();
+            sp.write_debug_id(606, "first", sp.mint()).unwrap();
             sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(10))
                 .unwrap();
             sp.write_chunk(sid, 1, 32, 4, None, &chunk_payload(1))
@@ -3412,7 +3445,7 @@ mod tests {
             );
             sp.watch_relocation();
             let mut run = sp.begin_maintenance(&plan).unwrap();
-            sp.write_debug_id(606, "second").unwrap();
+            sp.write_debug_id(606, "second", sp.mint()).unwrap();
             sp.append_record(RecordType::Label, 0, 0, 0, 0, 0, &label("", "renamed"))
                 .unwrap();
             sp.commit().unwrap();
@@ -3491,7 +3524,7 @@ mod tests {
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             sp.declare_stream(&decl).unwrap();
-            sp.write_debug_id(607, "first").unwrap();
+            sp.write_debug_id(607, "first", sp.mint()).unwrap();
             sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(10))
                 .unwrap();
             sp.write_chunk(sid, 1, 32, 4, None, &chunk_payload(1))
@@ -3530,7 +3563,7 @@ mod tests {
             sp.watch_relocation();
             let mut run = sp.begin_maintenance(&plan).unwrap();
             second_oseq = sp.origination().next_oseq();
-            sp.write_debug_id(607, "second").unwrap();
+            sp.write_debug_id(607, "second", sp.mint()).unwrap();
             sp.commit().unwrap();
             while sp.relocate_batch(&plan, &mut run, 1).unwrap() {}
             let result = sp.complete_maintenance(&plan, run).unwrap();
@@ -3792,7 +3825,7 @@ mod tests {
             // Both couplings land in seg 1, alongside a chunk that seg 2 will
             // supersede — so seg 1 carries dead weight and qualifies to compact.
             for from_turn in [0u32, 1] {
-                sp.write_turn_coupling(tid, from_turn).unwrap();
+                sp.write_turn_coupling(tid, from_turn, sp.mint()).unwrap();
             }
             sp.write_chunk(sid0, 0, 32, 4, None, &chunk_payload(1))
                 .unwrap();

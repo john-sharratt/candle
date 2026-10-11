@@ -26,6 +26,7 @@
 //! [`SubstratePersistence`] is the public API tying them together.
 
 pub mod accounting;
+pub mod appended;
 pub mod chunk_plan;
 pub mod chunk_window_integrity;
 pub mod cold_load;
@@ -53,6 +54,7 @@ pub mod resume;
 pub mod sealed_reader;
 pub mod segment;
 pub mod segmented_log;
+pub mod stamped_locs;
 pub mod streams;
 mod stripes;
 pub mod survival;
@@ -64,7 +66,6 @@ pub mod walker;
 pub mod writer;
 pub mod writer_lock;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -73,12 +74,13 @@ use thiserror::Error;
 use crate::substrate::Substrate;
 
 use accounting::RecordAccounting;
+use appended::Appended;
 use candle::direct_io::DirectFile;
 use chunk_plan::ChunkedReadPlan;
 use content_hash::snapshot_stream_id;
 use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use identity::{
-    load_or_mint, now_ms, read_node, NodeSource, Origination, RecordIdentity, ResidentIds,
+    load_or_mint, read_node, MarkerIds, Minter, NodeSource, Origination, RecordIdentity, Stamped,
 };
 use inherit::InheritedSubstrate;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
@@ -94,6 +96,7 @@ use relocation_watch::RelocationWatch;
 use sealed_reader::SealedReader;
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
+use stamped_locs::StampedLocs;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use survival::RecordCensus;
 use vfs::VfsIndex;
@@ -309,19 +312,21 @@ impl SharedSubstrate {
 
     /// Store a keyed [`CustomObjectPayload`] — durably and in RAM in one call.
     ///
-    /// A later write with the same key supersedes this one (last-writer-wins):
-    /// the header carries the key's hash as its `stream_id`, so supersession is
-    /// mechanical on replay, and the in-RAM [`Substrate`] holds only the winner
-    /// so compaction re-emits it. This is the write half of the durable host
-    /// state (e.g. npcd's command-table open flag); [`Self::custom_object`]
-    /// reads it back.
+    /// A later write with the same key supersedes this one (the greater stamp
+    /// wins): the header carries the key's hash as its `stream_id`, and the
+    /// in-RAM [`Substrate`] holds only the winner, under the identity its
+    /// record carries, so compaction re-emits it. This is the write half of the
+    /// durable host state (e.g. npcd's command-table open flag);
+    /// [`Self::custom_object`] reads it back.
     pub fn put_custom_object(&self, obj: CustomObjectPayload) -> Result<()> {
-        {
+        let id = {
             let mut p = self.persistence.lock().unwrap();
-            p.write_custom_object(&obj)?;
+            let id = p.mint();
+            p.write_custom_object(&obj, id)?;
             p.commit()?;
-        }
-        self.substrate.write().unwrap().apply_custom_object(obj);
+            id
+        };
+        self.substrate.write().unwrap().apply_custom_object(obj, id);
         Ok(())
     }
 
@@ -396,18 +401,18 @@ pub struct SubstratePersistence {
     relocation_watch: Option<RelocationWatch>,
     /// On-disk location of each stream's CURRENT per-stream metadata record —
     /// `StreamDecl` / `ProjectionEvents` / `WideQSig` / `Commit` — keyed by
-    /// `(record_type, stream_id)`, last-writer-wins. The substrate index caches
+    /// `(record_type, stream_id)`, the greatest stamp. The substrate index caches
     /// these payloads but not their locations, so without this map
     /// [`segment_liveness`](SubstratePersistence::segment_liveness) would count
     /// them as dead — making the segment that holds the live metadata perpetually
     /// look reclaimable and get "compacted" (re-emitted forward) on every
     /// maintenance pass. Counting them as live via this map is what actually
     /// halts that churn. Populated on every append and rebuilt on load / compact.
-    metadata_locs: HashMap<(RecordType, u64), RecordLoc>,
+    metadata_locs: StampedLocs<(RecordType, u64)>,
     /// On-disk location of the CURRENT copy of each resident record keyed by
     /// its payload rather than its header — `Label`, `ConvState`,
     /// `TreeMetadata`, `TurnCoupling`, `DebugId`, `Tombstone`, `Distilled` —
-    /// keyed by [`ResidentKey`], last-writer-wins.
+    /// keyed by [`ResidentKey`], the greatest stamp.
     ///
     /// The twin of `metadata_locs` for the types it cannot key. Maintenance
     /// re-emits all of them on every op, and with no location to count they
@@ -415,22 +420,22 @@ pub struct SubstratePersistence {
     /// weight in the segment it wrote, so that segment looked reclaimable and
     /// the next op re-emitted them again. Populated on every append and rebuilt
     /// on load / compact, like `metadata_locs`.
-    resident_locs: HashMap<ResidentKey, RecordLoc>,
+    resident_locs: StampedLocs<ResidentKey>,
     /// On-disk location of each conversation's CURRENT recurrent-state
-    /// `Snapshot` record, keyed by snapshot stream id — last-writer-wins, the
+    /// `Snapshot` record, keyed by snapshot stream id — the greatest stamp, the
     /// persistence-side twin of the substrate's `recurrent_snapshots` index.
-    /// Snapshot records are superseded by append order, and the seal thread's
+    /// Snapshot records are superseded by stamp, and the seal thread's
     /// writer can append a newer tail between a maintenance plan and its
     /// execute — so the execute phase (which runs WITHOUT the substrate lock)
     /// consults this map to skip relocating a planned snapshot that is no
     /// longer the stream's live tail. A timeline tombstone removes its entry
     /// (a dead conversation has no live tail). Populated on every append
     /// (both encode and verbatim paths) and rebuilt on load / compact.
-    snapshot_locs: HashMap<u64, RecordLoc>,
+    snapshot_locs: StampedLocs<u64>,
 
     /// On-disk location of each character's CURRENT [`RecordType::Npc`] record,
-    /// keyed by `npc_id` (which the header carries as its `stream_id`) —
-    /// last-writer-wins.
+    /// keyed by `npc_id` (which the header carries as its `stream_id`) — the
+    /// greatest stamp.
     ///
     /// This map is what keeps characters alive. NPC payloads do not live in the
     /// substrate's RAM — the substrate holds no opinion about a character, and
@@ -439,7 +444,7 @@ pub struct SubstratePersistence {
     /// the winner is relocated verbatim, exactly as `Snapshot` is, and this map
     /// says which record that is. Without it, `collect_live_records` would omit
     /// every NPC and the first compaction would delete the entire cast.
-    npc_locs: HashMap<u64, RecordLoc>,
+    npc_locs: StampedLocs<u64>,
 
     /// Where every conversation's live file events and tombstones are —
     /// `docs/zend_vfs_events.md`. Their bodies belong to the daemon above and
@@ -460,15 +465,16 @@ pub struct SubstratePersistence {
     writer_lock: Option<WriterLock>,
     /// What this substrate stamps on the records it originates — its node, the
     /// next `oseq`, its clock and its generation — primed at open from every
-    /// record the walk met (`docs/replicated_substrate.md` §6.2).
-    origination: Origination,
+    /// record the walk met (`docs/replicated_substrate.md` §6.2). Shared with
+    /// the runtime write paths, which mint as they change the substrate.
+    minter: Minter,
     /// How the node came to be this handle's: kept from the directory, minted
     /// fresh, or re-minted because the directory was copied (§3.7). `None` on a
     /// read-only handle, which mints nothing.
     node_source: Option<NodeSource>,
-    /// The identity of each resident value's current record, which a rewrite's
-    /// re-emission carries. Built by the open walk and kept by every append.
-    resident_ids: ResidentIds,
+    /// The identity of each marker record a rewrite writes back — see
+    /// [`MarkerIds`]. Built by the open walk and kept by every append.
+    marker_ids: MarkerIds,
 }
 
 /// Whether a record type is a per-stream metadata record whose current-copy
@@ -491,91 +497,77 @@ fn is_tracked_metadata(rt: RecordType) -> bool {
     )
 }
 
-/// Populate `map` with a walked payload-keyed resident record's location
-/// (LWW). The load / compact walk uses this; the runtime append path uses
-/// [`SubstratePersistence::track_resident_loc`].
-fn record_resident_loc(map: &mut HashMap<ResidentKey, RecordLoc>, entry: &walker::WalkEntry) {
+/// The location of a walked record.
+fn walked_loc(entry: &walker::WalkEntry) -> RecordLoc {
+    RecordLoc {
+        segment: entry.segment,
+        offset: entry.offset,
+        payload_len: entry.record.header.payload_len,
+        record_size: entry.size,
+    }
+}
+
+/// Offer a walked payload-keyed resident record's location to `map` — the
+/// greatest stamp per key holds it. The load / compact walk uses this; the
+/// runtime append path uses [`SubstratePersistence::track_resident_loc`].
+fn record_resident_loc(map: &mut StampedLocs<ResidentKey>, entry: &walker::WalkEntry) {
     let h = &entry.record.header;
     if !keyed_by_payload(h.record_type) {
         return;
     }
-    if let Some(key) = resident_key(h.record_type, h.stream_id, &entry.record.payload) {
-        map.insert(
-            key,
-            RecordLoc {
-                segment: entry.segment,
-                offset: entry.offset,
-                payload_len: h.payload_len,
-                record_size: entry.size,
-            },
-        );
+    let id = h.identity();
+    if let Some(key) = resident_key(h.record_type, h.stream_id, &entry.record.payload, &id) {
+        map.offer(key, Some(walked_loc(entry)), id);
     }
 }
 
-/// Populate `map` with a walked record's metadata location (LWW). The load /
-/// compact walk uses this before the `SubstratePersistence` exists; the runtime
-/// append path uses [`SubstratePersistence::track_metadata_loc`].
-fn record_metadata_loc(map: &mut HashMap<(RecordType, u64), RecordLoc>, entry: &walker::WalkEntry) {
+/// Offer a walked record's metadata location to `map` — the greatest stamp per
+/// key holds it. The load / compact walk uses this before the
+/// `SubstratePersistence` exists; the runtime append path uses
+/// [`SubstratePersistence::track_metadata_loc`].
+fn record_metadata_loc(map: &mut StampedLocs<(RecordType, u64)>, entry: &walker::WalkEntry) {
     let h = &entry.record.header;
     if is_tracked_metadata(h.record_type) {
-        map.insert(
+        map.offer(
             (h.record_type, h.stream_id),
-            RecordLoc {
-                segment: entry.segment,
-                offset: entry.offset,
-                payload_len: h.payload_len,
-                record_size: entry.size,
-            },
+            Some(walked_loc(entry)),
+            h.identity(),
         );
     }
 }
 
-/// Mirror one walked record into the snapshot-location map (LWW): a
-/// `Snapshot` record installs its location; a timeline-scoped `Tombstone`
-/// removes the timeline's entry, so a snapshot record replayed before its
-/// timeline's tombstone never reads as live. The load / compact walk uses
-/// this before the `SubstratePersistence` exists; the runtime append path
-/// uses [`SubstratePersistence::track_snapshot_loc`] plus the removal in
-/// [`SubstratePersistence::write_tombstone`].
-/// Mirror one walked record into the NPC-location map (LWW). Keyed by the
-/// header's `stream_id`, which for an `Npc` record is the `npc_id` — so the
-/// walk never has to decode a payload to know which character it belongs to.
+/// Offer one walked record to the NPC-location map — the greatest stamp per
+/// character holds it. Keyed by the header's `stream_id`, which for an `Npc`
+/// record is the `npc_id` — so the walk never has to decode a payload to know
+/// which character it belongs to.
 ///
 /// A tombstoned character keeps its entry: `state: "tombstoned"` is a
 /// superseding record like any other, and the id must stay taken so the acts
 /// that already name it still resolve. Dropping it here would let a later
 /// character reuse the id.
-fn record_npc_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEntry) {
+fn record_npc_loc(map: &mut StampedLocs<u64>, entry: &walker::WalkEntry) {
     let h = &entry.record.header;
     if h.record_type == RecordType::Npc {
-        map.insert(
-            h.stream_id,
-            RecordLoc {
-                segment: entry.segment,
-                offset: entry.offset,
-                payload_len: h.payload_len,
-                record_size: entry.size,
-            },
-        );
+        map.offer(h.stream_id, Some(walked_loc(entry)), h.identity());
     }
 }
 
-fn record_snapshot_loc(map: &mut HashMap<u64, RecordLoc>, entry: &walker::WalkEntry) {
+/// Mirror one walked record into the snapshot-location map: a `Snapshot`
+/// record offers its location and a retraction withdraws it, the greatest
+/// stamp per stream holding; a timeline-scoped `Tombstone` removes the
+/// timeline's entry, so a snapshot record replayed before its timeline's
+/// tombstone never reads as live. The load / compact walk uses this before
+/// the `SubstratePersistence` exists; the runtime append path uses
+/// [`SubstratePersistence::track_snapshot_loc`] plus the removal in
+/// [`SubstratePersistence::write_tombstone`].
+fn record_snapshot_loc(map: &mut StampedLocs<u64>, entry: &walker::WalkEntry) {
     let h = &entry.record.header;
     match h.record_type {
         RecordType::Snapshot if h.retracts_snapshot() => {
-            map.remove(&h.stream_id);
+            map.offer(h.stream_id, None, h.identity());
         }
         RecordType::Snapshot | RecordType::BranchCheckpoint => {
-            map.insert(
-                h.stream_id,
-                RecordLoc {
-                    segment: entry.segment,
-                    offset: entry.offset,
-                    payload_len: h.payload_len,
-                    record_size: entry.size,
-                },
-            );
+            map.offer(h.stream_id, Some(walked_loc(entry)), h.identity());
         }
         RecordType::Tombstone => {
             if let Ok(p) = TombstonePayload::decode(&entry.record.payload) {
@@ -791,7 +783,7 @@ impl SubstratePersistence {
             (node, Some(source))
         };
         let mut origination = Origination::new(node);
-        let mut resident_ids = ResidentIds::new();
+        let mut marker_ids = MarkerIds::new();
         let mut inherited_subs = Vec::with_capacity(inherited.len());
         for path in inherited {
             inherited_subs.push(InheritedSubstrate::load(path)?);
@@ -801,10 +793,10 @@ impl SubstratePersistence {
         // dead-weight accounting and the caller's sink in the same pass that
         // builds the combined singleton manifest.
         let mut accounting = RecordAccounting::new();
-        let mut metadata_locs: HashMap<(RecordType, u64), RecordLoc> = HashMap::new();
-        let mut resident_locs: HashMap<ResidentKey, RecordLoc> = HashMap::new();
-        let mut snapshot_locs: HashMap<u64, RecordLoc> = HashMap::new();
-        let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
+        let mut metadata_locs = StampedLocs::new();
+        let mut resident_locs = StampedLocs::new();
+        let mut snapshot_locs = StampedLocs::new();
+        let mut npc_locs = StampedLocs::new();
         let mut vfs_index = VfsIndex::new();
         // What the store actually holds, by type. One array increment per record
         // in a walk that already visits every record — see `RecordCensus`.
@@ -812,7 +804,7 @@ impl SubstratePersistence {
         let mut walk = |entry: &WalkEntry| {
             let h = &entry.record.header;
             origination.observe(&h.identity());
-            resident_ids.record(
+            marker_ids.record(
                 h.record_type,
                 h.stream_id,
                 &entry.record.payload,
@@ -894,9 +886,9 @@ impl SubstratePersistence {
             vfs_index,
             open_census: census,
             writer_lock,
-            origination,
+            minter: Minter::new(origination),
             node_source,
-            resident_ids,
+            marker_ids,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -925,7 +917,7 @@ impl SubstratePersistence {
     /// This substrate's node — the origin of every record it writes (§3.7).
     /// Zero on a read-only handle over a directory that never had one.
     pub fn node(&self) -> u64 {
-        self.origination.node()
+        self.minter.node()
     }
 
     /// How this handle came by its node; `None` on a read-only handle.
@@ -933,10 +925,26 @@ impl SubstratePersistence {
         self.node_source
     }
 
-    /// The writer's identity state: the next `oseq`, the clock, the
-    /// generation.
-    pub fn origination(&self) -> &Origination {
-        &self.origination
+    /// The writer's identity state as it stands: the next `oseq`, the clock,
+    /// the generation.
+    pub fn origination(&self) -> Origination {
+        self.minter.origination()
+    }
+
+    /// The shared handle the runtime write paths mint through, so a value set
+    /// in memory holds from the start the identity its record will carry.
+    pub fn minter(&self) -> Minter {
+        self.minter.clone()
+    }
+
+    /// The identity of the next record this substrate originates.
+    pub fn mint(&self) -> RecordIdentity {
+        self.minter.mint(0)
+    }
+
+    /// The identity of each marker record a rewrite writes back.
+    pub fn marker_ids(&self) -> &MarkerIds {
+        &self.marker_ids
     }
 
     /// The logical end of what is written to the active segment — synced only
@@ -1004,10 +1012,11 @@ impl SubstratePersistence {
     }
 
     /// Append one record to the active segment, updating the in-RAM manifest.
-    /// Returns the `(segment, offset, size)` the record occupies — callers
-    /// that index the record (cold-load, chunk persistence) need the segment
-    /// so the read routes back to the right file, plus the padded on-disk
-    /// size for the bytes-on-disk footprint.
+    /// Returns where it landed and the identity it carries — callers that
+    /// index the record (cold-load, chunk persistence) need the segment so the
+    /// read routes back to the right file, the padded on-disk size for the
+    /// bytes-on-disk footprint, and the identity the substrate keeps beside
+    /// the value.
     ///
     /// A read-only handle refuses with [`PersistenceError::ReadOnly`] and
     /// stages nothing.
@@ -1026,14 +1035,14 @@ impl SubstratePersistence {
         token_count: u64,
         golden: u32,
         payload: &[u8],
-    ) -> Result<(SegmentId, u64, u64)> {
+    ) -> Result<Appended> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
         let identity = if record_type == RecordType::HeaderIndex {
             RecordIdentity::NONE
         } else {
-            self.origination.mint(now_ms(), 0)
+            self.minter.mint(0)
         };
         self.append_carried(
             record_type,
@@ -1047,10 +1056,12 @@ impl SubstratePersistence {
         )
     }
 
-    /// [`Self::append_record`] for a record that already has an identity: a
-    /// resident value re-encoded from RAM by a rewrite, or a singleton carried
-    /// forward. The copy keeps `identity`, so every member still recognises it
-    /// as the record it copies and it ranks where that record did.
+    /// [`Self::append_record`] for a record whose identity is already decided:
+    /// a resident value re-encoded from RAM by a rewrite, a singleton carried
+    /// forward, or a runtime write whose identity was minted when the value
+    /// changed in memory ([`Self::minter`]). The record keeps `identity`, so a
+    /// copy is recognised everywhere as the record it copies and ranks where
+    /// that record did.
     pub fn append_carried(
         &mut self,
         record_type: RecordType,
@@ -1061,7 +1072,7 @@ impl SubstratePersistence {
         golden: u32,
         payload: &[u8],
         identity: RecordIdentity,
-    ) -> Result<(SegmentId, u64, u64)> {
+    ) -> Result<Appended> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
@@ -1109,7 +1120,12 @@ impl SubstratePersistence {
         let (segment, offset) = self.segments.stage(&bytes);
         let size = bytes.len() as u64;
         self.account_appended(&written, payload, segment, offset, size)?;
-        Ok((segment, offset, size))
+        Ok(Appended {
+            segment,
+            offset,
+            size,
+            identity,
+        })
     }
 
     /// Append a recurrent-state record — a [`RecordType::Snapshot`] or a
@@ -1125,7 +1141,7 @@ impl SubstratePersistence {
         record_type: RecordType,
         stream_id: u64,
         parts: &[&[u8]],
-    ) -> Result<(SegmentId, u64, u64)> {
+    ) -> Result<Appended> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
@@ -1146,14 +1162,19 @@ impl SubstratePersistence {
             token_count: 0,
             ..RecordHeader::NONE
         }
-        .with_identity(self.origination.mint(now_ms(), 0));
+        .with_identity(self.minter.mint(0));
         let head = record::record_head(&header, parts);
         let (segment, offset) = self.segments.append_parts(&head.line, parts, head.pad)?;
         let size = (head.line.len() + header.payload_len as usize + head.pad) as u64;
         // The hooks key these types by header alone, so the payload they are
         // handed is never read.
         self.account_appended(&head.header, &[], segment, offset, size)?;
-        Ok((segment, offset, size))
+        Ok(Appended {
+            segment,
+            offset,
+            size,
+            identity: header.identity(),
+        })
     }
 
     /// Everything an append records once its bytes are placed: the relocation
@@ -1174,7 +1195,7 @@ impl SubstratePersistence {
         self.accounting.record(&header, size);
         self.track_metadata_loc(&header, segment, offset, size);
         self.track_resident_loc(&header, payload, segment, offset, size);
-        self.resident_ids.record(
+        self.marker_ids.record(
             header.record_type,
             header.stream_id,
             payload,
@@ -1217,7 +1238,7 @@ impl SubstratePersistence {
     /// The bookkeeping reads the header out of `raw` — one JSON line — so the
     /// copy is indexed with the identity and digest it was written with, which
     /// no location map holds.
-    pub fn append_raw_record(&mut self, raw: &[u8]) -> Result<(SegmentId, u64, u64)> {
+    pub fn append_raw_record(&mut self, raw: &[u8]) -> Result<Appended> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
@@ -1246,7 +1267,12 @@ impl SubstratePersistence {
         }
         // Last, as in `append_record`.
         self.write_through_if_over_stage()?;
-        Ok((segment, offset, size))
+        Ok(Appended {
+            segment,
+            offset,
+            size,
+            identity: header.identity(),
+        })
     }
 
     /// Flush the accumulated digests as `HeaderIndex` record(s) chained
@@ -1264,9 +1290,8 @@ impl SubstratePersistence {
             let take = self.pending_index.len().min(INDEX_FLUSH_ENTRIES);
             let batch: Vec<IndexEntry> = self.pending_index.drain(..take).collect();
             let payload = encode_index_payload(self.last_index.unwrap_or((0, 0)), &batch);
-            let (_seg, offset, size) =
-                self.append_record(RecordType::HeaderIndex, 0, 0, 0, 0, 0, &payload)?;
-            self.last_index = Some((offset, size));
+            let at = self.append_record(RecordType::HeaderIndex, 0, 0, 0, 0, 0, &payload)?;
+            self.last_index = Some((at.offset, at.size));
         }
         self.segments.commit()?;
         if let Some(li) = self.last_index {
@@ -1301,23 +1326,29 @@ impl SubstratePersistence {
     }
 
     /// Declare a stream — append its `StreamDecl` record. Returns the
-    /// stream's derived id.
-    pub fn declare_stream(&mut self, decl: &StreamDecl) -> Result<StreamId> {
-        let id = decl.stream_id();
-        self.append_record(RecordType::StreamDecl, 0, id.0, 0, 0, 0, &decl.encode())?;
-        Ok(id)
+    /// stream's derived id and the identity the record was written with.
+    pub fn declare_stream(&mut self, decl: &StreamDecl) -> Result<Stamped<StreamId>> {
+        let stream = decl.stream_id();
+        let at =
+            self.append_record(RecordType::StreamDecl, 0, stream.0, 0, 0, 0, &decl.encode())?;
+        Ok(Stamped {
+            value: stream,
+            id: at.identity,
+        })
     }
 
-    /// Record the on-disk location of a per-stream metadata record
-    /// (`StreamDecl` / `ProjectionEvents` / `WideQSig` / `Commit`) so
-    /// [`segment_liveness`](Self::segment_liveness) counts the current copy as
-    /// live weight. Last-writer-wins per `(record_type, stream_id)`: a re-write
-    /// (or maintenance re-emission) supersedes the prior location, which then
-    /// reads as dead. A no-op for every other record type. Called from
-    /// [`append_record`](Self::append_record) (runtime writes) and the
-    /// load / compact walk so the map covers both.
-    /// The runtime twin of [`record_resident_loc`]: record where a just-appended
-    /// payload-keyed resident record landed.
+    /// The location of a record just placed at `(segment, offset)`.
+    fn placed_loc(h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) -> RecordLoc {
+        RecordLoc {
+            segment,
+            offset,
+            payload_len: h.payload_len,
+            record_size: size,
+        }
+    }
+
+    /// The runtime twin of [`record_resident_loc`]: offer where a just-appended
+    /// payload-keyed resident record landed — the greatest stamp per key holds.
     fn track_resident_loc(
         &mut self,
         h: &RecordHeader,
@@ -1329,56 +1360,51 @@ impl SubstratePersistence {
         if !keyed_by_payload(h.record_type) {
             return;
         }
-        if let Some(key) = resident_key(h.record_type, h.stream_id, payload) {
-            self.resident_locs.insert(
-                key,
-                RecordLoc {
-                    segment,
-                    offset,
-                    payload_len: h.payload_len,
-                    record_size: size,
-                },
-            );
+        let id = h.identity();
+        if let Some(key) = resident_key(h.record_type, h.stream_id, payload, &id) {
+            self.resident_locs
+                .offer(key, Some(Self::placed_loc(h, segment, offset, size)), id);
         }
     }
 
+    /// Offer the on-disk location of a per-stream metadata record
+    /// (`StreamDecl` / `ProjectionEvents` / `WideQSig` / `Commit`) so
+    /// [`segment_liveness`](Self::segment_liveness) counts the current copy as
+    /// live weight. The greatest stamp per `(record_type, stream_id)` holds: a
+    /// re-write supersedes the prior location, which then reads as dead, and a
+    /// maintenance re-emission keeps the identity and moves it. A no-op for
+    /// every other record type. Called from
+    /// [`append_record`](Self::append_record) (runtime writes) and the
+    /// load / compact walk so the map covers both.
     fn track_metadata_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
         if is_tracked_metadata(h.record_type) {
-            self.metadata_locs.insert(
+            self.metadata_locs.offer(
                 (h.record_type, h.stream_id),
-                RecordLoc {
-                    segment,
-                    offset,
-                    payload_len: h.payload_len,
-                    record_size: size,
-                },
+                Some(Self::placed_loc(h, segment, offset, size)),
+                h.identity(),
             );
         }
     }
 
-    /// Record the on-disk location of a `Snapshot` record in
-    /// [`snapshot_locs`](Self::snapshot_locs) — last-writer-wins per snapshot
-    /// stream, so the map always names the stream's current tail. A no-op for
-    /// every other record type. Called from both append paths
-    /// ([`append_record`](Self::append_record) and
+    /// Offer the on-disk location of a `Snapshot` record to
+    /// [`snapshot_locs`](Self::snapshot_locs) — a retraction withdraws it, and
+    /// the greatest stamp per snapshot stream holds, so the map always names
+    /// the stream's current tail. A no-op for every other record type. Called
+    /// from both append paths ([`append_record`](Self::append_record) and
     /// [`append_raw_record`](Self::append_raw_record)) so runtime snapshot
     /// writes AND maintenance relocations keep the map current; the load /
     /// compact walk uses the free-function mirror [`record_snapshot_loc`].
     fn track_snapshot_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
         if h.retracts_snapshot() {
-            self.snapshot_locs.remove(&h.stream_id);
+            self.snapshot_locs.offer(h.stream_id, None, h.identity());
         } else if matches!(
             h.record_type,
             RecordType::Snapshot | RecordType::BranchCheckpoint
         ) {
-            self.snapshot_locs.insert(
+            self.snapshot_locs.offer(
                 h.stream_id,
-                RecordLoc {
-                    segment,
-                    offset,
-                    payload_len: h.payload_len,
-                    record_size: size,
-                },
+                Some(Self::placed_loc(h, segment, offset, size)),
+                h.identity(),
             );
         }
     }
@@ -1412,14 +1438,10 @@ impl SubstratePersistence {
     /// The runtime-append twin of [`record_npc_loc`].
     fn track_npc_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
         if h.record_type == RecordType::Npc {
-            self.npc_locs.insert(
+            self.npc_locs.offer(
                 h.stream_id,
-                RecordLoc {
-                    segment,
-                    offset,
-                    payload_len: h.payload_len,
-                    record_size: size,
-                },
+                Some(Self::placed_loc(h, segment, offset, size)),
+                h.identity(),
             );
         }
     }
@@ -1434,20 +1456,24 @@ impl SubstratePersistence {
     ///
     /// Writes are expected to be rare: the payload is durable configuration
     /// only, so a character that is merely *running* never writes at all.
-    pub fn write_npc(&mut self, npc: &NpcPayload) -> Result<()> {
+    pub fn write_npc(&mut self, npc: &NpcPayload) -> Result<RecordIdentity> {
         let bytes = npc.encode();
-        self.append_record(RecordType::Npc, 0, npc.npc_id, 0, 0, 0, &bytes)?;
-        Ok(())
+        let at = self.append_record(RecordType::Npc, 0, npc.npc_id, 0, 0, 0, &bytes)?;
+        Ok(at.identity)
     }
 
-    /// Append a [`RecordType::CustomObject`] record. The header's `stream_id` is
-    /// the key's stable hash, so a later write with the same key supersedes this
-    /// one on replay (last-writer-wins). Caller applies it to the in-RAM
-    /// [`Substrate`] too so it re-emits on compaction — see
+    /// Append custom-object record `id`. The header's `stream_id` is the key's
+    /// stable hash, so of two writes with the same key the greater stamp is the
+    /// object on replay. The caller applies it to the in-RAM [`Substrate`]
+    /// under the same identity, so it re-emits on compaction — see
     /// [`SharedSubstrate::put_custom_object`].
-    pub fn write_custom_object(&mut self, obj: &CustomObjectPayload) -> Result<()> {
+    pub fn write_custom_object(
+        &mut self,
+        obj: &CustomObjectPayload,
+        id: RecordIdentity,
+    ) -> Result<()> {
         let bytes = obj.encode();
-        self.append_record(
+        self.append_carried(
             RecordType::CustomObject,
             0,
             obj.stream_id(),
@@ -1455,6 +1481,7 @@ impl SubstratePersistence {
             0,
             0,
             &bytes,
+            id,
         )?;
         Ok(())
     }
@@ -1469,7 +1496,7 @@ impl SubstratePersistence {
     /// Locations rather than payloads, because the payloads are not held here —
     /// the registry that owns them lives in the daemon. Compaction and segment
     /// liveness both read this to know which bytes are still worth keeping.
-    pub fn npc_locs(&self) -> &HashMap<u64, RecordLoc> {
+    pub fn npc_locs(&self) -> &StampedLocs<u64> {
         &self.npc_locs
     }
 
@@ -1489,23 +1516,24 @@ impl SubstratePersistence {
         Ok(Some(NpcPayload::decode(&record.payload)?))
     }
 
-    /// Append a stream's `Tokens` record, returning `(segment, offset,
-    /// record_size)` of the written record. The caller MUST fold this location
-    /// into the substrate index (`apply_tokens_loc`) — otherwise the in-RAM index
-    /// has no record of the tokens, and a subsequent segment compaction / relocation
-    /// can't carry them forward and reclaims them (the KV path already registers its
-    /// chunk locations; tokens must too, or a live turn silently loses its text).
-    pub fn append_tokens(
-        &mut self,
-        stream_id: StreamId,
-        tokens: &[u8],
-    ) -> Result<(SegmentId, u64, u64)> {
+    /// Append a stream's `Tokens` record. The caller MUST fold its location and
+    /// identity into the substrate index (`apply_tokens_loc`) — otherwise the
+    /// in-RAM index has no record of the tokens, and a subsequent segment
+    /// compaction / relocation can't carry them forward and reclaims them (the
+    /// KV path already registers its chunk locations; tokens must too, or a
+    /// live turn silently loses its text).
+    pub fn append_tokens(&mut self, stream_id: StreamId, tokens: &[u8]) -> Result<Appended> {
         self.append_record(RecordType::Tokens, 0, stream_id.0, 0, 0, 0, tokens)
     }
 
-    /// Append a turn's `ProjectionEvents` record (opaque JSON payload).
-    pub fn append_projection_events(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
-        self.append_record(
+    /// Append a turn's `ProjectionEvents` record `id` (opaque JSON payload).
+    pub fn append_projection_events(
+        &mut self,
+        stream_id: StreamId,
+        payload: &[u8],
+        id: RecordIdentity,
+    ) -> Result<()> {
+        self.append_carried(
             RecordType::ProjectionEvents,
             0,
             stream_id.0,
@@ -1513,23 +1541,45 @@ impl SubstratePersistence {
             0,
             0,
             payload,
+            id,
         )?;
         Ok(())
     }
 
-    /// Append a turn's `WideQSig` record (opaque wide-Q window payload), keyed by stream id.
-    pub fn append_wide_q_sigs(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
-        self.append_record(RecordType::WideQSig, 0, stream_id.0, 0, 0, 0, payload)?;
+    /// Append a turn's `WideQSig` record `id` (opaque wide-Q window payload),
+    /// keyed by stream id.
+    pub fn append_wide_q_sigs(
+        &mut self,
+        stream_id: StreamId,
+        payload: &[u8],
+        id: RecordIdentity,
+    ) -> Result<()> {
+        self.append_carried(RecordType::WideQSig, 0, stream_id.0, 0, 0, 0, payload, id)?;
         Ok(())
     }
 
-    /// Append a turn's QSA index page (opaque payload), keyed by stream id.
+    /// Append a turn's QSA index page, record `id` (opaque payload), keyed by
+    /// stream id.
     ///
     /// The counterpart of [`Self::append_wide_q_sigs`]: both carry a blob that
     /// belongs to a turn and that no amount of re-reading the turn's K/V can
     /// reconstruct, because it was computed from hidden states.
-    pub fn append_turn_index_page(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
-        self.append_record(RecordType::TurnIndexPage, 0, stream_id.0, 0, 0, 0, payload)?;
+    pub fn append_turn_index_page(
+        &mut self,
+        stream_id: StreamId,
+        payload: &[u8],
+        id: RecordIdentity,
+    ) -> Result<()> {
+        self.append_carried(
+            RecordType::TurnIndexPage,
+            0,
+            stream_id.0,
+            0,
+            0,
+            0,
+            payload,
+            id,
+        )?;
         Ok(())
     }
 
@@ -1542,7 +1592,11 @@ impl SubstratePersistence {
     /// The payload comes as its parts ([`record::SnapshotPayload::parts`]) and is
     /// written from them, so the state reaches the file without being copied
     /// into one buffer first.
-    pub fn write_snapshot(&mut self, stream_id: StreamId, payload: &[&[u8]]) -> Result<RecordLoc> {
+    pub fn write_snapshot(
+        &mut self,
+        stream_id: StreamId,
+        payload: &[&[u8]],
+    ) -> Result<Stamped<RecordLoc>> {
         self.write_recurrent_record(RecordType::Snapshot, stream_id, payload)
     }
 
@@ -1551,9 +1605,10 @@ impl SubstratePersistence {
     /// reload ([`RecordHeader::retracts_snapshot`]). The writer appends one
     /// when a seal's snapshot fails to land, because the previous snapshot
     /// would otherwise stay the tail while the turn's records land behind it.
-    pub fn retract_snapshot(&mut self, stream_id: StreamId) -> Result<()> {
-        self.append_record(RecordType::Snapshot, 0, stream_id.0, 0, 0, 0, &[])?;
-        Ok(())
+    /// Returns the retraction's identity, which outranks the tail it withdraws.
+    pub fn retract_snapshot(&mut self, stream_id: StreamId) -> Result<RecordIdentity> {
+        let at = self.append_record(RecordType::Snapshot, 0, stream_id.0, 0, 0, 0, &[])?;
+        Ok(at.identity)
     }
 
     /// Append a prompt branch's recurrent checkpoint — the same single-tail
@@ -1563,7 +1618,7 @@ impl SubstratePersistence {
         &mut self,
         stream_id: StreamId,
         payload: &[&[u8]],
-    ) -> Result<RecordLoc> {
+    ) -> Result<Stamped<RecordLoc>> {
         self.write_recurrent_record(RecordType::BranchCheckpoint, stream_id, payload)
     }
 
@@ -1572,30 +1627,36 @@ impl SubstratePersistence {
         record_type: RecordType,
         stream_id: StreamId,
         payload: &[&[u8]],
-    ) -> Result<RecordLoc> {
-        let (segment, offset, size) =
-            self.append_recurrent_parts(record_type, stream_id.0, payload)?;
-        Ok(RecordLoc {
-            segment,
-            offset,
-            payload_len: payload.iter().map(|p| p.len() as u64).sum(),
-            record_size: size,
+    ) -> Result<Stamped<RecordLoc>> {
+        let at = self.append_recurrent_parts(record_type, stream_id.0, payload)?;
+        Ok(Stamped {
+            value: at.loc(payload.iter().map(|p| p.len() as u64).sum()),
+            id: at.identity,
         })
     }
 
     /// Append a `Commit` record marking `stream_id` durable through
-    /// `through_index`.
-    pub fn commit_stream(&mut self, stream_id: StreamId, through_index: u64) -> Result<()> {
-        self.append_record(RecordType::Commit, 0, stream_id.0, through_index, 0, 0, &[])?;
-        Ok(())
+    /// `through_index`. Returns the identity it was written with.
+    pub fn commit_stream(
+        &mut self,
+        stream_id: StreamId,
+        through_index: u64,
+    ) -> Result<RecordIdentity> {
+        let at =
+            self.append_record(RecordType::Commit, 0, stream_id.0, through_index, 0, 0, &[])?;
+        Ok(at.identity)
     }
 
-    /// Append a `TreeMetadata` record for one `(timeline_id,
-    /// turn_index)` summary-tree node.  Last-writer-wins on replay.
-    /// Callers check idempotency against substrate state.
-    pub fn write_tree_metadata(&mut self, payload: TreeMetadataPayload) -> Result<()> {
+    /// Append `TreeMetadata` record `id` for one `(timeline_id, turn_index)`
+    /// summary-tree node — the greatest stamp per node on replay. Callers
+    /// check idempotency against substrate state.
+    pub fn write_tree_metadata(
+        &mut self,
+        payload: TreeMetadataPayload,
+        id: RecordIdentity,
+    ) -> Result<()> {
         let bytes = payload.encode();
-        self.append_record(RecordType::TreeMetadata, 0, 0, 0, 0, 0, &bytes)?;
+        self.append_carried(RecordType::TreeMetadata, 0, 0, 0, 0, 0, &bytes, id)?;
         Ok(())
     }
 
@@ -1670,32 +1731,42 @@ impl SubstratePersistence {
     /// Written before the response turn is submitted — the one window where the
     /// round-trip is certain — so replay can never observe the response turn
     /// without its coupling. Idempotent: duplicates replay into the same set.
-    pub fn write_turn_coupling(&mut self, timeline_id: u64, from_turn: u32) -> Result<()> {
+    pub fn write_turn_coupling(
+        &mut self,
+        timeline_id: u64,
+        from_turn: u32,
+        id: RecordIdentity,
+    ) -> Result<()> {
         let payload = record::TurnCouplingPayload {
             timeline_id,
             from_turn,
         };
         let bytes = payload.encode();
-        self.append_record(RecordType::TurnCoupling, 0, 0, 0, 0, 0, &bytes)?;
+        self.append_carried(RecordType::TurnCoupling, 0, 0, 0, 0, 0, &bytes, id)?;
         Ok(())
     }
 
-    /// Append a `DebugId` record for `timeline_id`.  Last-writer-wins
-    /// on replay.  Callers check idempotency against substrate state.
-    pub fn write_debug_id(&mut self, timeline_id: u64, debug_id: &str) -> Result<()> {
+    /// Append `DebugId` record `id` for `timeline_id` — the greatest stamp per
+    /// timeline on replay. Callers check idempotency against substrate state.
+    pub fn write_debug_id(
+        &mut self,
+        timeline_id: u64,
+        debug_id: &str,
+        id: RecordIdentity,
+    ) -> Result<()> {
         let payload = DebugIdPayload {
             timeline_id,
             debug_id: debug_id.to_string(),
         };
         let bytes = payload.encode();
-        self.append_record(RecordType::DebugId, 0, 0, 0, 0, 0, &bytes)?;
+        self.append_carried(RecordType::DebugId, 0, 0, 0, 0, 0, &bytes, id)?;
         Ok(())
     }
 
     /// Append a `Chunk` record — one sealed or partial KV chunk's bytes and
     /// quantization metadata. `token_count` is 32 for a sealed chunk, less
-    /// for a partial tail; `format` is the `KvFormat` tag. Returns the
-    /// file offset of the record.
+    /// for a partial tail; `format` is the `KvFormat` tag. Returns where the
+    /// record landed and its identity.
     pub fn write_chunk(
         &mut self,
         stream_id: StreamId,
@@ -1704,13 +1775,13 @@ impl SubstratePersistence {
         format: u8,
         golden: Option<u32>,
         payload: &ChunkPayload,
-    ) -> Result<u64> {
+    ) -> Result<Appended> {
         // `Some(g)` is the seal path's GPU-computed golden (Fletcher-32 over the
         // arena bytes before the DtoH copy). `None` means no precomputed golden
         // is available, so take it host-side over these bytes now — the same
         // host-truth the CPU gather path uses.
         let golden = golden.unwrap_or_else(|| candle::fletcher::fletcher32(&payload.kv_bytes));
-        let (_seg, offset, _) = self.append_record(
+        self.append_record(
             RecordType::Chunk,
             format,
             stream_id.0,
@@ -1718,8 +1789,7 @@ impl SubstratePersistence {
             token_count,
             golden,
             &payload.encode(),
-        )?;
-        Ok(offset)
+        )
     }
 
     /// Read one chunk's payload — from the active log, else any inherited
@@ -2316,7 +2386,8 @@ impl SubstratePersistence {
             substrate,
             &self.npc_locs,
             &self.vfs_index,
-            &self.resident_ids,
+            &self.marker_ids,
+            self.node(),
         );
         // What this compaction is carrying forward, by type, against what the
         // store held when it opened. A class present at open and absent here is
@@ -2436,20 +2507,20 @@ impl SubstratePersistence {
         self.snapshot_locs.clear();
         self.npc_locs.clear();
         self.vfs_index.clear();
-        // The identities are rebuilt the same way: every carried record kept its
-        // own, so the rebuilt table holds what the old one did for every value
-        // still live, and nothing for a value the compaction dropped.
-        self.resident_ids = ResidentIds::new();
+        // The marker identities are rebuilt the same way: every carried marker
+        // kept its own, so the rebuilt table holds what the old one did for
+        // every marker still live, and nothing for one the compaction dropped.
+        self.marker_ids = MarkerIds::new();
         let accounting = &mut self.accounting;
         let metadata_locs = &mut self.metadata_locs;
         let resident_locs = &mut self.resident_locs;
         let snapshot_locs = &mut self.snapshot_locs;
         let npc_locs = &mut self.npc_locs;
         let vfs_index = &mut self.vfs_index;
-        let resident_ids = &mut self.resident_ids;
+        let marker_ids = &mut self.marker_ids;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
             let h = &entry.record.header;
-            resident_ids.record(
+            marker_ids.record(
                 h.record_type,
                 h.stream_id,
                 &entry.record.payload,
@@ -2537,10 +2608,10 @@ mod tests {
         let payload = vec![7u8; 1024 * 1024];
         let mut record = 0;
         for chunk in 0..70u64 {
-            let (_, _, size) = sp
+            let at = sp
                 .append_record(RecordType::Tokens, 0, 9, chunk, 0, 0, &payload)
                 .unwrap();
-            record = size as usize;
+            record = at.size as usize;
             assert!(sp.pending_bytes() < STAGE_FLUSH_BYTES + record);
         }
         assert!(sp.write_offset() > start);
@@ -2569,10 +2640,10 @@ mod tests {
             let payload = vec![7u8; 1024 * 1024];
             let mut record = 0;
             for chunk in 0..70u64 {
-                let (_, _, size) = sp
+                let at = sp
                     .append_record(RecordType::Tokens, 0, 9, chunk, 0, 0, &payload)
                     .unwrap();
-                record = size;
+                record = at.size;
             }
             assert!(
                 sp.write_offset() > start,
@@ -2847,11 +2918,11 @@ mod tests {
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             for (idx, seq) in [(0u32, 1u32), (1, 2)] {
-                let id = sp.declare_stream(&turn(idx, seq)).unwrap();
+                let id = sp.declare_stream(&turn(idx, seq)).unwrap().value;
                 sp.append_tokens(id, b"token-bytes").unwrap();
                 sp.commit_stream(id, 0).unwrap();
             }
-            sp.write_turn_coupling(1, 0).unwrap();
+            sp.write_turn_coupling(1, 0, sp.mint()).unwrap();
             sp.commit().unwrap();
         }
 
@@ -3231,7 +3302,7 @@ mod tests {
         let turn_id;
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
-            turn_id = sp.declare_stream(&turn).unwrap();
+            turn_id = sp.declare_stream(&turn).unwrap().value;
             sp.append_tokens(turn_id, b"token-bytes").unwrap();
             sp.commit_stream(turn_id, 0).unwrap();
             sp.commit().unwrap();

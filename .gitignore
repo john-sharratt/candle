@@ -67,10 +67,12 @@ candle-kernels/build_tool/
 # subtree as its own workspace). The glob covers renamed copies too: a
 # substrate set aside before a model change (`substrate.qwen3-30b-a3b/`) is
 # hundreds of gigabytes and is exactly as unwelcome in a commit as the live
-# one. No source directory in this tree is named `substrate`, so the pattern
-# is left unanchored on purpose — if one is ever added, anchor this instead.
+# one. The pattern is left unanchored on purpose, because a workspace can be
+# rooted anywhere; the one source directory of that name — the `substrate`
+# module's submodules — is re-included by name below.
 substrate/
 substrate.*/
+!candle-conversation/src/substrate/
 # The same log under its hidden name, which a crate's tests have left behind in
 # the crate's own folder (`npcd/.substrate/` at 4 GB).
 .substrate/

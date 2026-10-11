@@ -59,6 +59,25 @@ impl RecordIdentity {
             origin: self.origin,
         }
     }
+
+    /// Whether a record with this identity replaces a value `current` holds
+    /// (§6.5): its stamp is at least as great.
+    ///
+    /// Equal stamps are one record — two stamped records never tie — so a
+    /// relocated or re-emitted copy, which keeps its identity, moves the value
+    /// to where the copy lives. Records written before identities existed all
+    /// carry the zero stamp, so among them the later in the log wins, as it
+    /// always has, and every stamped record outranks them.
+    pub fn supersedes(&self, current: &RecordIdentity) -> bool {
+        self.stamp() >= current.stamp()
+    }
+}
+
+/// A value and the identity of the record that holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamped<T> {
+    pub value: T,
+    pub id: RecordIdentity,
 }
 
 /// The order of two records competing for one key: `(gen, epoch, hlc,
@@ -128,5 +147,19 @@ mod tests {
     fn no_identity_ranks_lowest() {
         assert!(RecordIdentity::NONE.is_none());
         assert!(id(0, 0, 1, 1).stamp() > RecordIdentity::NONE.stamp());
+    }
+
+    /// A greater stamp and the same record replace a value; a lesser stamp
+    /// does not; and among unstamped records the later one does.
+    #[test]
+    fn supersession_is_stamp_order_with_ties_to_the_newcomer() {
+        let older = id(1, 0, 5, 1);
+        let newer = id(1, 0, 6, 1);
+        assert!(newer.supersedes(&older));
+        assert!(!older.supersedes(&newer));
+        assert!(older.supersedes(&older), "a relocated copy moves the value");
+        assert!(RecordIdentity::NONE.supersedes(&RecordIdentity::NONE));
+        assert!(older.supersedes(&RecordIdentity::NONE));
+        assert!(!RecordIdentity::NONE.supersedes(&older));
     }
 }

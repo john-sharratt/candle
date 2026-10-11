@@ -27,7 +27,7 @@ use std::path::Path;
 
 use super::content_hash::snapshot_stream_id;
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
-use super::identity::ResidentIds;
+use super::identity::MarkerIds;
 use super::log_file::LogFile;
 use super::manifest::{encode_conv_state_payload, Manifest, RecordLoc};
 use super::record::{
@@ -36,6 +36,7 @@ use super::record::{
     TurnCouplingPayload,
 };
 use super::segment::{SegmentId, FIRST_SEGMENT};
+use super::stamped_locs::StampedLocs;
 use super::streams::StreamId;
 use super::stripes::{stripes, MAX_STRIPE_BYTES};
 use super::vfs::{carried, VfsIndex};
@@ -178,9 +179,10 @@ fn branch_checkpoints_to_keep(substrate: &Substrate) -> Vec<(StreamId, RecordLoc
 pub fn collect_live_records(
     manifest: &Manifest,
     substrate: &Substrate,
-    npc_locs: &HashMap<u64, RecordLoc>,
+    npc_locs: &StampedLocs<u64>,
     vfs_index: &VfsIndex,
-    resident_ids: &ResidentIds,
+    marker_ids: &MarkerIds,
+    node: u64,
 ) -> Vec<CompactItem> {
     let mut out: Vec<CompactItem> = Vec::new();
 
@@ -272,7 +274,7 @@ pub fn collect_live_records(
         .iter()
         .map(|t| t.raw())
         .collect();
-    let distilled: std::collections::HashMap<u64, DistillMode> = substrate
+    let distilled: HashMap<u64, DistillMode> = substrate
         .distilled_timelines()
         .iter()
         .map(|(t, m)| (t.raw(), *m))
@@ -330,6 +332,27 @@ pub fn collect_live_records(
             loc.record_size,
         ));
     }
+    // A stream whose current record is a retraction keeps it: the retraction
+    // is the value, and it is what refuses an older snapshot arriving later.
+    for (stream_id, id) in substrate.retracted_snapshots() {
+        if snapshot_drop.contains(&stream_id.0) {
+            continue;
+        }
+        out.push(CompactItem::synth(
+            RecordHeader {
+                record_type: RecordType::Snapshot,
+                format: 0,
+                payload_len: 0,
+                crc: 0,
+                stream_id: stream_id.0,
+                chunk_index: 0,
+                token_count: 0,
+                ..RecordHeader::NONE
+            }
+            .with_identity(id),
+            Vec::new(),
+        ));
+    }
 
     // Prompt branch checkpoints, **capped**.
     //
@@ -373,14 +396,16 @@ pub fn collect_live_records(
         // gallery reads only the sig), TextOnly also drops sig + projections
         // (keep tokens — a plain read-only text record). Tombstoned timelines
         // drop entirely, as before.
-        // A stream with no StreamDecl is an ORPHAN: its turn/section cannot be
-        // reconstructed on reload (reload rebuilds turns from their decl), so
-        // every record it still owns — chunks, tokens, sig, projections — is
-        // unreachable dead weight. Drop the whole stream so compaction reclaims
-        // the orphaned KV instead of copying it forward on every pass forever.
-        // Without this gate a decl lost in a prior generation leaves its (huge)
-        // KV chunks immortal on disk.
-        if entry.decl.is_none() {
+        // An ORPHAN stream — no StreamDecl, and none coming — cannot have its
+        // turn/section reconstructed on reload (reload rebuilds turns from
+        // their decl), so every record it still owns — chunks, tokens, sig,
+        // projections — is unreachable dead weight. Drop the whole stream so
+        // compaction reclaims the orphaned KV instead of copying it forward on
+        // every pass forever. Without this gate a decl lost in a prior
+        // generation leaves its (huge) KV chunks immortal on disk. A stream
+        // another origin wrote is not an orphan for want of a decl: its decl
+        // is still on its way (`StreamRuntime::is_orphan`).
+        if entry.is_orphan(node) {
             continue;
         }
         if tombstoned_sections.contains(&stream_id.0) {
@@ -435,7 +460,8 @@ pub fn collect_live_records(
                     chunk_index: 0,
                     token_count: 0,
                     ..RecordHeader::NONE
-                },
+                }
+                .with_identity(entry.ids.decl),
                 payload,
             ));
         }
@@ -492,7 +518,8 @@ pub fn collect_live_records(
                         chunk_index: 0,
                         token_count: 0,
                         ..RecordHeader::NONE
-                    },
+                    }
+                    .with_identity(entry.ids.projection_events),
                     payload.clone(),
                 ));
             }
@@ -512,7 +539,8 @@ pub fn collect_live_records(
                         chunk_index: 0,
                         token_count: 0,
                         ..RecordHeader::NONE
-                    },
+                    }
+                    .with_identity(entry.ids.wide_q_sigs),
                     payload.clone(),
                 ));
             }
@@ -533,7 +561,8 @@ pub fn collect_live_records(
                     chunk_index: 0,
                     token_count: 0,
                     ..RecordHeader::NONE
-                },
+                }
+                .with_identity(entry.ids.index_page),
                 payload.bytes().to_vec(),
             ));
         }
@@ -548,7 +577,8 @@ pub fn collect_live_records(
                     chunk_index: through,
                     token_count: 0,
                     ..RecordHeader::NONE
-                },
+                }
+                .with_identity(entry.ids.commit),
                 Vec::new(),
             ));
         }
@@ -569,6 +599,7 @@ pub fn collect_live_records(
             reason: None,
         }
         .encode();
+        let id = marker_ids.identity_for(RecordType::Tombstone, 0, &payload);
         out.push(CompactItem::synth(
             RecordHeader {
                 record_type: RecordType::Tombstone,
@@ -579,7 +610,8 @@ pub fn collect_live_records(
                 chunk_index: 0,
                 token_count: 0,
                 ..RecordHeader::NONE
-            },
+            }
+            .with_identity(id),
             payload,
         ));
     }
@@ -593,6 +625,7 @@ pub fn collect_live_records(
     // older segment still holding them.
     for &stream_id in substrate.tombstoned_sections() {
         let payload = SectionTombstonePayload { reason: None }.encode();
+        let id = marker_ids.identity_for(RecordType::SectionTombstone, stream_id.0, &payload);
         out.push(CompactItem::synth(
             RecordHeader {
                 record_type: RecordType::SectionTombstone,
@@ -603,15 +636,16 @@ pub fn collect_live_records(
                 chunk_index: 0,
                 token_count: 0,
                 ..RecordHeader::NONE
-            },
+            }
+            .with_identity(id),
             payload,
         ));
     }
     // Per-timeline Label / ConvState records — synthesised from
-    // the substrate's live state.  Tombstoned timelines are
-    // skipped so retired conversations don't leave dangling
-    // sidebar entries on disk.
-    for (timeline_id, conv_id, label, custom) in substrate.live_conv_meta() {
+    // the substrate's live state, one `Label` per record that holds a field.
+    // Tombstoned timelines are skipped so retired conversations don't leave
+    // dangling sidebar entries on disk.
+    for (timeline_id, meta, id) in substrate.live_label_records() {
         // A tombstoned timeline that is ALSO distilled is the provenance corpus
         // (calibration exemplars: archived, distilled, then tombstoned out of the
         // live gather while their signatures keep answering the belief scan).
@@ -621,7 +655,12 @@ pub fn collect_live_records(
         if tombstoned.contains(&timeline_id) && !distilled.contains_key(&timeline_id) {
             continue;
         }
-        let payload = super::manifest::encode_label_payload(timeline_id, &conv_id, &label, &custom);
+        let payload = super::manifest::encode_label_payload(
+            timeline_id,
+            &meta.conv_id,
+            &meta.label,
+            &meta.custom,
+        );
         out.push(CompactItem::synth(
             RecordHeader {
                 record_type: RecordType::Label,
@@ -632,14 +671,15 @@ pub fn collect_live_records(
                 chunk_index: 0,
                 token_count: 0,
                 ..RecordHeader::NONE
-            },
+            }
+            .with_identity(id),
             payload,
         ));
     }
     // Per-timeline conversation state — the whole state, archived flag and
     // branches alike, keyed in the header by timeline like every other
     // `ConvState` record. Same retirement rule as the labels above.
-    for (timeline_id, state) in substrate.live_conv_states() {
+    for (timeline_id, state, id) in substrate.live_conv_states() {
         if tombstoned.contains(&timeline_id) && !distilled.contains_key(&timeline_id) {
             continue;
         }
@@ -654,13 +694,14 @@ pub fn collect_live_records(
                 chunk_index: 0,
                 token_count: 0,
                 ..RecordHeader::NONE
-            },
+            }
+            .with_identity(id),
             payload,
         ));
     }
     // Per-(timeline, turn) summary-tree metadata — emit one record
     // per live tree node directly from substrate state.
-    for payload in substrate.live_tree_metadata_payloads() {
+    for (payload, id) in substrate.live_tree_metadata_payloads() {
         if tombstoned.contains(&payload.timeline_id) {
             continue;
         }
@@ -675,8 +716,36 @@ pub fn collect_live_records(
                 chunk_index: 0,
                 token_count: 0,
                 ..RecordHeader::NONE
-            },
+            }
+            .with_identity(id),
             bytes,
+        ));
+    }
+    // Records about a timeline not registered yet, held until its first turn
+    // declaration arrives. They are durable state like any other: dropping one
+    // here would lose it for good, since its `oseq` was already applied.
+    for (timeline_id, rt, payload, id) in substrate.pending_records() {
+        if tombstoned.contains(&timeline_id) {
+            continue;
+        }
+        let stream_id = if rt == RecordType::ConvState {
+            timeline_id
+        } else {
+            0
+        };
+        out.push(CompactItem::synth(
+            RecordHeader {
+                record_type: rt,
+                format: 0,
+                payload_len: payload.len() as u64,
+                crc: 0,
+                stream_id,
+                chunk_index: 0,
+                token_count: 0,
+                ..RecordHeader::NONE
+            }
+            .with_identity(id),
+            payload,
         ));
     }
     // Per-(timeline, turn) tool round-trip couplings.
@@ -690,7 +759,7 @@ pub fn collect_live_records(
     // round-trip apart. Nothing failed — a timeline with no couplings is a
     // legitimate state (nothing ever called a tool there) and reads as intact,
     // which is exactly why this went unnoticed.
-    for (timeline_id, from_turn) in substrate.live_couplings() {
+    for (timeline_id, from_turn, id) in substrate.live_couplings() {
         if tombstoned.contains(&timeline_id) {
             continue;
         }
@@ -709,18 +778,19 @@ pub fn collect_live_records(
                 chunk_index: 0,
                 token_count: 0,
                 ..RecordHeader::NONE
-            },
+            }
+            .with_identity(id),
             payload,
         ));
     }
     // Per-timeline debug_id.
-    for (timeline_id, id) in substrate.live_debug_ids() {
+    for (timeline_id, debug_id, id) in substrate.live_debug_ids() {
         if tombstoned.contains(&timeline_id) {
             continue;
         }
         let payload = DebugIdPayload {
             timeline_id,
-            debug_id: id,
+            debug_id,
         };
         let bytes = payload.encode();
         out.push(CompactItem::synth(
@@ -733,14 +803,15 @@ pub fn collect_live_records(
                 chunk_index: 0,
                 token_count: 0,
                 ..RecordHeader::NONE
-            },
+            }
+            .with_identity(id),
             bytes,
         ));
     }
-    // Generic keyed custom objects — re-emitted from the live in-RAM set so a
-    // last-writer-wins object outlives the compaction pass, keyed on the same
+    // Generic keyed custom objects — re-emitted from the live in-RAM set so
+    // the winning object outlives the compaction pass, keyed on the same
     // stable key-hash `stream_id` it was written under.
-    for obj in substrate.live_custom_objects() {
+    for (obj, id) in substrate.live_custom_objects() {
         let bytes = obj.encode();
         out.push(CompactItem::synth(
             RecordHeader {
@@ -752,7 +823,8 @@ pub fn collect_live_records(
                 chunk_index: 0,
                 token_count: 0,
                 ..RecordHeader::NONE
-            },
+            }
+            .with_identity(id),
             bytes,
         ));
     }
@@ -770,6 +842,7 @@ pub fn collect_live_records(
     // distilled".
     for (&timeline_id, &mode) in &distilled {
         let payload = DistillPayload { timeline_id, mode }.encode();
+        let id = marker_ids.identity_for(RecordType::Distilled, 0, &payload);
         out.push(CompactItem::synth(
             RecordHeader {
                 record_type: RecordType::Distilled,
@@ -780,20 +853,16 @@ pub fn collect_live_records(
                 chunk_index: 0,
                 token_count: 0,
                 ..RecordHeader::NONE
-            },
+            }
+            .with_identity(id),
             payload,
         ));
     }
-    // Every re-encoded record keeps the identity of the record that holds its
-    // value now: the same origin and `oseq`, so every member still recognises
-    // it, and the same stamp, so it still ranks where it did. A read-back record
-    // keeps its own — `write_compacted_log` indexes it from its copied header.
-    for item in &mut out {
-        if let CompactItem::Synth { header, payload } = item {
-            let id = resident_ids.identity_for(header.record_type, header.stream_id, payload);
-            *header = header.with_identity(id);
-        }
-    }
+    // Every re-encoded record above kept the identity of the record that holds
+    // its value now — the same origin and `oseq`, so every member still
+    // recognises it, and the same stamp, so it still ranks where it did. A
+    // read-back record keeps its own: `write_compacted_log` indexes it from its
+    // copied header.
     out
 }
 
@@ -971,6 +1040,7 @@ pub fn write_compacted_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::identity::RecordIdentity;
     use crate::persistence::log_file::{read_record_at, LogSource, MemLog, SUPERBLOCK_SIZE};
     use crate::persistence::manifest::ConvState;
     use crate::persistence::record::encode_record;
@@ -1069,9 +1139,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         // Exactly: 1 ModelKey + 1 StreamDecl + 1 Chunk = 3 (LWW keeps one of each).
         assert_eq!(live.len(), 3);
@@ -1126,9 +1197,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         assert!(
             !has_type(&live, RecordType::Chunk),
@@ -1176,9 +1248,10 @@ mod tests {
         let live = collect_live_records(
             &before,
             &before_sub,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         let path = std::env::temp_dir().join(format!(
             "kvtier_compact_{}.log",
@@ -1282,9 +1355,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         // The marker survives, at its mode — without it the exemption is lost.
@@ -1416,9 +1490,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         let has_label = |needle: &str| {
@@ -1522,9 +1597,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         // The dead timeline's records are physically gone from the live set.
@@ -1595,9 +1671,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         assert!(
@@ -1642,9 +1719,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         assert!(
@@ -1705,9 +1783,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         // The declaration and the sig survive — the belief gallery still finds it.
@@ -1833,9 +1912,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         assert!(
@@ -1887,9 +1967,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         assert!(
             !has_type(&live, RecordType::Snapshot),
@@ -1949,9 +2030,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         assert!(
             !has_type(&live, RecordType::Snapshot),
@@ -1976,9 +2058,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         assert!(has_type(&live, RecordType::Snapshot));
     }
@@ -2021,9 +2104,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         let kept: Vec<u64> = live
@@ -2098,9 +2182,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         assert!(
@@ -2138,9 +2223,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         let snaps: Vec<_> = live
@@ -2214,9 +2300,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
 
         assert!(
@@ -2286,17 +2373,18 @@ mod tests {
     fn collect_carries_the_live_cast_forward() {
         let (manifest, substrate) = empty_store();
         // What the persistence layer tracks after a walk: one location per
-        // character, already resolved last-writer-wins.
-        let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
-        npc_locs.insert(701, loc_at(4_096, 256));
-        npc_locs.insert(700, loc_at(8_192, 320));
+        // character, already resolved to its greatest stamp.
+        let mut npc_locs = StampedLocs::new();
+        npc_locs.offer(701, Some(loc_at(4_096, 256)), RecordIdentity::NONE);
+        npc_locs.offer(700, Some(loc_at(8_192, 320)), RecordIdentity::NONE);
 
         let live = collect_live_records(
             &manifest,
             &substrate,
             &npc_locs,
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         let npcs: Vec<&CompactItem> = live
             .iter()
@@ -2321,9 +2409,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         assert!(!has_type(&live, RecordType::Npc));
     }
@@ -2334,15 +2423,16 @@ mod tests {
     #[test]
     fn collect_carries_a_tombstoned_character_forward_too() {
         let (manifest, substrate) = empty_store();
-        let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
-        npc_locs.insert(900, loc_at(4_096, 192));
+        let mut npc_locs = StampedLocs::new();
+        npc_locs.offer(900, Some(loc_at(4_096, 192)), RecordIdentity::NONE);
 
         let live = collect_live_records(
             &manifest,
             &substrate,
             &npc_locs,
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         assert!(
             live.iter().any(
@@ -2419,9 +2509,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &vfs,
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         let events: Vec<(u64, u64, (u64, u64))> = live
             .iter()
@@ -2492,7 +2583,11 @@ mod tests {
         // Precondition: the walk really installed them, so a failure below is
         // compaction dropping them rather than replay never loading them.
         assert_eq!(
-            substrate.live_couplings(),
+            substrate
+                .live_couplings()
+                .into_iter()
+                .map(|(t, from, _)| (t, from))
+                .collect::<Vec<_>>(),
             vec![(tl, 0), (tl, 1)],
             "replay must install both couplings",
         );
@@ -2500,9 +2595,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         for from_turn in [0u32, 1] {
             assert!(
@@ -2555,9 +2651,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         assert!(!has_type(&live, RecordType::TurnCoupling));
     }
@@ -2759,15 +2856,15 @@ mod tests {
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
         // Characters are tracked persistence-side, not in the substrate.
-        let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
-        npc_locs.insert(8812, loc_at(4_096, 256));
+        let mut npc_locs = StampedLocs::new();
+        npc_locs.offer(8812, Some(loc_at(4_096, 256)), RecordIdentity::NONE);
         // So are a conversation's file events and their tombstones.
         let mut vfs = VfsIndex::new();
         vfs.record_event(live_tl, 0, loc_at(8_192, 128));
         vfs.record_tombstone(live_tl, 1, loc_at(12_288, 64), &[]);
 
         let live =
-            collect_live_records(&manifest, &substrate, &npc_locs, &vfs, &ResidentIds::new());
+            collect_live_records(&manifest, &substrate, &npc_locs, &vfs, &MarkerIds::new(), 0);
 
         for &rt in WRITTEN_RECORD_TYPES {
             match survival(rt) {
@@ -2837,9 +2934,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         assert!(
             has_synth(
@@ -2888,9 +2986,10 @@ mod tests {
         let live = collect_live_records(
             &manifest,
             &substrate,
-            &HashMap::new(),
+            &StampedLocs::new(),
             &VfsIndex::new(),
-            &ResidentIds::new(),
+            &MarkerIds::new(),
+            0,
         );
         // The reason is diagnostic only and is not re-derived at compaction
         // time — the same rule the turn-scoped tombstone's re-emit follows —

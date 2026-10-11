@@ -32,6 +32,7 @@ use crate::persistence::chunk_window_integrity::{first_divergent_chunk, WindowDi
 use crate::persistence::content_hash::{
     branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
 };
+use crate::persistence::identity::Minter;
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
 use crate::persistence::maintenance::RELOCATION_BATCH_BYTES;
 use crate::persistence::manifest::{self, ConvState, RecordLoc};
@@ -58,7 +59,7 @@ use crate::scheduler::note_persistence_maint_us;
 use crate::scheduler::profile;
 use crate::substrate::{
     ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, StreamRuntime, Substrate,
-    SubstrateRead, SubstrateWrite, TurnPartWrite,
+    SubstrateRead, SubstrateWrite, TreeNodeMeta, TurnPartWrite,
 };
 use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
@@ -346,6 +347,12 @@ pub struct Conversation {
     /// The mandatory persistence layer — every turn is recorded into its
     /// redo log (`docs/archived/kv_tier_migration.md` §13.6).
     persistence: Arc<PersistenceLock>,
+    /// The substrate's identity minter, shared with `persistence`. A write
+    /// that changes the substrate in memory and hands its record to the writer
+    /// thread mints here first, so the value and its record carry one identity
+    /// (`docs/replicated_substrate.md` §6.2) — and minting never waits on the
+    /// persistence lock a compaction may hold.
+    minter: Minter,
     /// Runtime, in-memory score normalization (per-scope hit levels). NOT
     /// persisted — rebuilt from the substrate's existing turns on first use, then
     /// evolved as new turns seal. Shared across clones of this handle so learning
@@ -557,6 +564,7 @@ impl Conversation {
             .expect("ephemeral SubstratePersistence");
         let maintenance = Arc::new(Mutex::new((persistence.segment_count(), None, false)));
         let sealed = persistence.sealed_reader();
+        let minter = persistence.minter();
         let inner = Arc::new(RwLock::new(substrate));
         let persistence = Arc::new(PersistenceLock::new(persistence));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
@@ -567,6 +575,7 @@ impl Conversation {
             tenant_rank: TenantRank::FIRST,
             maintenance,
             persistence,
+            minter,
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
@@ -602,9 +611,14 @@ impl Conversation {
             substrate: inner,
             persistence,
         } = shared;
-        let (segments, read_only, sealed) = {
+        let (segments, read_only, sealed, minter) = {
             let p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            (p.segment_count(), p.is_read_only(), p.sealed_reader())
+            (
+                p.segment_count(),
+                p.is_read_only(),
+                p.sealed_reader(),
+                p.minter(),
+            )
         };
         let maintenance = Arc::new(Mutex::new((segments, None, false)));
         let writer = Arc::new(SubstrateWriter::spawn(inner.clone(), persistence.clone()));
@@ -619,6 +633,7 @@ impl Conversation {
             tenant_rank: TenantRank::FIRST,
             maintenance,
             persistence,
+            minter,
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             writer,
@@ -2623,10 +2638,12 @@ impl Conversation {
         // lost on crash yields an absent turn, never corruption.
         let stream_id = decl.stream_id();
         let payload = decl.encode();
-        self.write().apply_stream_decl(stream_id, decl);
+        let identity = self.minter.mint(0);
+        self.write().apply_stream_decl(stream_id, decl, identity);
         self.writer.enqueue(WriteJob::StreamDecl {
             stream_id: stream_id.0,
             payload,
+            identity,
         });
         Ok(stream_id)
     }
@@ -3052,7 +3069,7 @@ impl Conversation {
         let n_sections = read.section_count();
         let n_timelines = read.timeline_count();
         let n_conversations = read.conversation_count();
-        let orphan_chunk_streams = read.orphan_chunk_stream_count();
+        let orphan_chunk_streams = read.orphan_chunk_stream_count(self.minter.node());
         drop(read);
         tracing::info!(
             sections = n_sections,
@@ -3213,21 +3230,21 @@ impl Conversation {
         self.read().conv_id_of(timeline).map(|s| s.to_string())
     }
 
-    /// Persist a sidebar label for `timeline`. Last-write-wins on the
-    /// underlying `RecordType::Label`; this writes the same record the
-    /// titler writes, preserving whatever `conv_id` is already known
-    /// for this timeline.
+    /// Persist a sidebar label for `timeline`, as a `Label` record that sets
+    /// the label field alone: every other field keeps whatever record set it
+    /// (§6.5), so a rename never restates — and never rolls back — a tag
+    /// another write set meanwhile.
     pub fn set_conversation_label(&self, timeline: TimelineId, label: &str) -> candle::Result<()> {
         if label.is_empty() {
             return Ok(());
         }
-        let conv_id = self.conv_id_of(timeline).unwrap_or_default();
-        let custom = self.read().custom_of(timeline).cloned().unwrap_or_default();
-        let payload = manifest::encode_label_payload(timeline.raw(), &conv_id, label, &custom);
-        self.write().set_label(timeline, label);
+        let payload = manifest::encode_label_payload(timeline.raw(), "", label, &BTreeMap::new());
+        let identity = self.minter.mint(0);
+        self.write().set_label(timeline, label, identity);
         self.writer.enqueue(WriteJob::ConvMeta {
             record: RecordType::Label,
             payload,
+            identity,
         });
         Ok(())
     }
@@ -3254,7 +3271,8 @@ impl Conversation {
     /// Merge several `(key, value)` pairs into `timeline`'s `custom`
     /// metadata in a single persisted Label record (cheaper than one
     /// `set_conversation_metadata` per key when tagging a conversation
-    /// with several fields at once).
+    /// with several fields at once). The record sets these keys alone; every
+    /// other field keeps the record that set it (§6.5).
     pub fn set_conversation_metadata_many(
         &self,
         timeline: TimelineId,
@@ -3263,30 +3281,18 @@ impl Conversation {
         if kv.is_empty() {
             return Ok(());
         }
-        let conv_id = self.conv_id_of(timeline).unwrap_or_default();
-        // Sibling fields and the merged bag under ONE read guard: the Label
-        // record carries the full ConvMeta, so a partial write would drop the
-        // others on reload/compaction.
-        let mut custom = {
-            let view = self.read();
-            let label = view.label_of(timeline).unwrap_or("").to_string();
-            let custom = view.custom_of(timeline).cloned().unwrap_or_default();
-            (label, custom)
-        };
-        for (k, v) in kv {
-            custom.1.insert(k.clone(), v.clone());
-        }
-        // Encode on this thread, append on the writer's. The record is small and
-        // last-writer-wins, so it carries the same crash-loss window as every
-        // other enqueued metadata record: the in-RAM merge below is what this
-        // session reads, and a record that never lands leaves the tag absent on
-        // the next load rather than wrong.
-        let payload =
-            manifest::encode_label_payload(timeline.raw(), &conv_id, &custom.0, &custom.1);
-        self.write().merge_custom(timeline, kv);
+        // Encode on this thread, append on the writer's. The record is small,
+        // so it carries the same crash-loss window as every other enqueued
+        // metadata record: the in-RAM merge below is what this session reads,
+        // and a record that never lands leaves the tag absent on the next load
+        // rather than wrong.
+        let payload = manifest::encode_label_payload(timeline.raw(), "", "", kv);
+        let identity = self.minter.mint(0);
+        self.write().merge_custom(timeline, kv, identity);
         self.writer.enqueue(WriteJob::ConvMeta {
             record: RecordType::Label,
             payload,
+            identity,
         });
         Ok(())
     }
@@ -3331,32 +3337,27 @@ impl Conversation {
         self.read().timelines_with_metadata_key(key)
     }
 
-    /// Persist the client-supplied `conv_id` for `timeline`. Idempotent;
-    /// the typical caller is the daemon's chat handler, invoking this on
-    /// every submit so the conv_id reaches the redo log immediately
-    /// (well before the titler completes). The current `label` is
-    /// preserved, so this can be called freely at any point in the
-    /// conversation's lifecycle.
+    /// Persist the client-supplied `conv_id` for `timeline`. Idempotent: the
+    /// typical caller is the daemon's chat handler, invoking this on every
+    /// submit so the conv_id reaches the redo log immediately (well before the
+    /// titler completes), and a conv_id the substrate already holds writes
+    /// nothing. The record sets the conv_id alone; the label and tags keep the
+    /// records that set them (§6.5).
     pub fn set_conversation_conv_id(
         &self,
         timeline: TimelineId,
         conv_id: &str,
     ) -> candle::Result<()> {
-        if conv_id.is_empty() {
+        if conv_id.is_empty() || self.conv_id_of(timeline).as_deref() == Some(conv_id) {
             return Ok(());
         }
-        let (label, custom) = {
-            let view = self.read();
-            (
-                view.label_of(timeline).unwrap_or("").to_string(),
-                view.custom_of(timeline).cloned().unwrap_or_default(),
-            )
-        };
-        let payload = manifest::encode_label_payload(timeline.raw(), conv_id, &label, &custom);
-        self.write().set_conv_id(timeline, conv_id);
+        let payload = manifest::encode_label_payload(timeline.raw(), conv_id, "", &BTreeMap::new());
+        let identity = self.minter.mint(0);
+        self.write().set_conv_id(timeline, conv_id, identity);
         self.writer.enqueue(WriteJob::ConvMeta {
             record: RecordType::Label,
             payload,
+            identity,
         });
         Ok(())
     }
@@ -3464,12 +3465,16 @@ impl Conversation {
             .conv_state_writes
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let state = {
+        let (state, identity) = {
             let mut sub = self.write();
             if !change(&mut sub) {
                 return;
             }
-            sub.conv_state(timeline)
+            // Minted only for a change that will be written: an identity minted
+            // and never written is a hole in this node's sequence.
+            let identity = self.minter.mint(0);
+            sub.stamp_conv_state(timeline, identity);
+            (sub.conv_state(timeline), identity)
         };
         let Some(state) = state else {
             return;
@@ -3480,6 +3485,7 @@ impl Conversation {
         self.writer.enqueue(WriteJob::ConvState {
             timeline: timeline.raw(),
             payload: manifest::encode_conv_state_payload(timeline.raw(), &state),
+            identity,
         });
     }
 
@@ -3759,12 +3765,13 @@ impl Conversation {
     /// what stops the summariser observing half an exchange and freezing a leaf
     /// over it. On a read-only substrate the in-RAM coupling is all there is.
     pub fn couple_turn(&self, timeline: TimelineId, from_turn: u32) -> candle::Result<()> {
-        self.write().couple_turn(timeline, from_turn);
+        let identity = self.minter.mint(0);
+        self.write().couple_turn(timeline, from_turn, identity);
         if self.read_only {
             return Ok(());
         }
         let mut p = self.persistence.lock().unwrap();
-        p.write_turn_coupling(timeline.raw(), from_turn)
+        p.write_turn_coupling(timeline.raw(), from_turn, identity)
             .map_err(|e| candle::Error::Msg(format!("write_turn_coupling: {e}")))?;
         Ok(())
     }
@@ -3789,6 +3796,7 @@ impl Conversation {
         self.writer.enqueue(WriteJob::ConvMeta {
             record: RecordType::Distilled,
             payload,
+            identity: self.minter.mint(0),
         });
         Ok(())
     }
@@ -3871,12 +3879,13 @@ impl Conversation {
         if debug_id.is_empty() {
             return Ok(());
         }
-        self.write().set_debug_id(timeline, debug_id);
+        let identity = self.minter.mint(0);
+        self.write().set_debug_id(timeline, debug_id, identity);
         if self.read_only {
             return Ok(());
         }
         let mut p = self.persistence.lock().unwrap();
-        p.write_debug_id(timeline.raw(), debug_id)
+        p.write_debug_id(timeline.raw(), debug_id, identity)
             .map_err(|e| candle::Error::Msg(format!("write_debug_id: {e}")))?;
         Ok(())
     }
@@ -3904,17 +3913,33 @@ impl Conversation {
         self.read().last_selection_of(timeline).cloned()
     }
 
-    /// Persist a per-`(timeline, turn_index)` summary-tree metadata
-    /// record to the redo log.  Idempotent: skips the append when the
-    /// in-memory manifest already records the same payload.  Called
-    /// by the summariser thread after every atomic tree mutation
-    /// (§7.2).
-    pub fn write_tree_metadata(&self, payload: TreeMetadataPayload) -> candle::Result<()> {
+    /// Set one `(timeline, turn)` summary-tree node — in RAM and as a
+    /// `TreeMetadata` record, under one identity. Called by the summariser
+    /// thread after every atomic tree mutation (§7.2).
+    pub fn record_tree_meta(
+        &self,
+        timeline: TimelineId,
+        idx: TurnIndex,
+        meta: TreeNodeMeta,
+    ) -> candle::Result<()> {
+        let payload = TreeMetadataPayload {
+            timeline_id: timeline.raw(),
+            turn_index: idx.0,
+            kind: match meta.kind {
+                TurnKind::Normal => 0,
+                TurnKind::SummaryOfTurns => 1,
+                TurnKind::SummaryOfSummaries => 2,
+            },
+            tree_height: meta.tree_height,
+            children: meta.children.iter().map(|c| c.0).collect(),
+        };
+        let identity = self.minter.mint(0);
+        self.write().set_tree_meta(timeline, idx, meta, identity);
         if self.read_only {
             return Ok(());
         }
         let mut p = self.persistence.lock().unwrap();
-        p.write_tree_metadata(payload)
+        p.write_tree_metadata(payload, identity)
             .map_err(|e| candle::Error::Msg(format!("write_tree_metadata: {e}")))
     }
 
@@ -3965,7 +3990,7 @@ impl Conversation {
         {
             let mut view = self.write();
             for (flat, loc) in locs {
-                view.apply_chunk_loc(stream_id, flat, loc);
+                view.apply_chunk_loc(stream_id, flat, loc.value, loc.id);
             }
         }
         Ok(stored)
@@ -3994,7 +4019,7 @@ impl Conversation {
             crate::persistence::resume::persist_tokens_only(&mut p, stream_id, token_ids)
                 .map_err(|e| candle::Error::Msg(format!("persist tokens: {e}")))?
         };
-        self.write().apply_tokens_loc(stream_id, loc);
+        self.write().apply_tokens_loc(stream_id, loc.value, loc.id);
         Ok(())
     }
 
@@ -4012,6 +4037,7 @@ impl Conversation {
         }
         let mut p = self.persistence.lock().unwrap();
         p.commit_stream(stream_id, through_index)
+            .map(|_| ())
             .map_err(|e| candle::Error::Msg(format!("commit stream: {e}")))
     }
 
@@ -4080,22 +4106,28 @@ impl Conversation {
     /// The payload is moved, not copied — the encode already happened on the
     /// caller's side, and the in-RAM mirror and the queued job share it.
     pub fn persist_projection_events(&self, stream_id: StreamId, payload: Vec<u8>) {
+        let identity = self.minter.mint(0);
         self.write()
-            .set_projection_events_blob(stream_id, payload.clone());
-        self.writer
-            .enqueue(WriteJob::ProjectionEvents { stream_id, payload });
+            .apply_projection_events(stream_id, payload.clone(), identity);
+        self.writer.enqueue(WriteJob::ProjectionEvents {
+            stream_id,
+            payload,
+            identity,
+        });
     }
 
     /// Persist a turn's encoded wide-Q signature window to the redo log (`WideQSig`
-    /// record, last-writer-wins per stream) and mirror it into the in-RAM substrate.
+    /// record, the greatest stamp per stream) and mirror it into the in-RAM
+    /// substrate under the same identity.
     pub fn persist_wide_q_sigs(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
+        let identity = self.minter.mint(0);
         self.write()
-            .set_wide_q_sigs_blob(stream_id, payload.to_vec());
+            .apply_wide_q_sigs(stream_id, payload.to_vec(), identity);
         if self.read_only {
             return Ok(());
         }
         let mut p = self.persistence.lock().unwrap();
-        p.append_wide_q_sigs(stream_id, payload)
+        p.append_wide_q_sigs(stream_id, payload, identity)
             .map_err(|e| candle::Error::Msg(format!("persist wide-Q sigs: {e}")))
     }
 
@@ -4107,13 +4139,13 @@ impl Conversation {
     /// restart, and every cold-loaded turn then hands a slot keys it cannot
     /// index.
     pub fn persist_index_page(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
-        self.write()
-            .set_index_page_blob(stream_id, payload.to_vec());
+        let identity = self.minter.mint(0);
+        self.write().apply_index_page(stream_id, payload, identity);
         if self.read_only {
             return Ok(());
         }
         let mut p = self.persistence.lock().unwrap();
-        p.append_turn_index_page(stream_id, payload)
+        p.append_turn_index_page(stream_id, payload, identity)
             .map_err(|e| candle::Error::Msg(format!("persist index page: {e}")))
     }
 
@@ -4140,19 +4172,28 @@ impl Conversation {
     /// the durable redo-log append onto the off-thread writer — so the seal never
     /// blocks on the persistence lock. Same crash-safety as [`Self::enqueue_tokens`].
     pub fn enqueue_wide_q_sigs(&self, stream_id: StreamId, payload: Vec<u8>) {
+        let identity = self.minter.mint(0);
         self.write()
-            .set_wide_q_sigs_blob(stream_id, payload.clone());
-        self.writer
-            .enqueue(WriteJob::WideQSigs { stream_id, payload });
+            .apply_wide_q_sigs(stream_id, payload.clone(), identity);
+        self.writer.enqueue(WriteJob::WideQSigs {
+            stream_id,
+            payload,
+            identity,
+        });
     }
 
     /// Enqueue a turn's or a prompt section's QSA index page under its stream
     /// id, mirroring it in RAM first so this session's own projections can
     /// borrow the piece immediately.
     pub fn enqueue_index_page(&self, stream_id: StreamId, payload: Vec<u8>) {
-        self.write().set_index_page_blob(stream_id, payload.clone());
-        self.writer
-            .enqueue(WriteJob::TurnIndexPage { stream_id, payload });
+        let identity = self.minter.mint(0);
+        self.write()
+            .apply_index_page(stream_id, payload.as_slice(), identity);
+        self.writer.enqueue(WriteJob::TurnIndexPage {
+            stream_id,
+            payload,
+            identity,
+        });
     }
 
     /// Enqueue a conversation's recurrent-state snapshot (the encoded
@@ -5364,7 +5405,7 @@ mod tests {
         {
             let mut substrate = Substrate::new();
             let mut p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            p.write_debug_id(7, "seed").unwrap();
+            p.write_debug_id(7, "seed", p.mint()).unwrap();
             p.commit().unwrap();
         }
         let before = dir_fingerprint(&dir);
@@ -5721,7 +5762,7 @@ mod recurrent_snapshot_read_tests {
             }
             loc
         };
-        conv.write().apply_snapshot_loc(stream, loc);
+        conv.write().apply_snapshot_loc(stream, loc.value, loc.id);
     }
 
     /// **The admission read completes while a compaction holds the persistence

@@ -448,7 +448,8 @@ fn score_belief_groups_scores_a_coupled_pair_as_one_exchange() {
             .expect("persist sigs");
     }
     // Couple turn 0 → turn 1: they are the two halves of one round-trip.
-    conv.write().couple_turn(timeline, 0);
+    conv.couple_turn(timeline, 0)
+        .expect("couple turn 0 to its response");
 
     // Probe = the CALL turn's window. Its response (turn 1) is the complement, so
     // pre-exchange it would score near zero; grouping must lift it to turn 0's.

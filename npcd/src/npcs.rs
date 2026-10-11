@@ -307,7 +307,7 @@ impl Npcs {
                 .persistence
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            p.write_npc(&npc).and_then(|()| p.commit())
+            p.write_npc(&npc).and_then(|_| p.commit())
         };
         if let Err(e) = write {
             // Not fatal and not propagated: this is a checkpoint of soft state
@@ -358,7 +358,7 @@ impl Npcs {
                 .persistence
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            p.write_npc(&npc).and_then(|()| p.commit())
+            p.write_npc(&npc).and_then(|_| p.commit())
         };
         if let Err(e) = write {
             // Not fatal and not propagated, for the reason a place checkpoint

@@ -355,6 +355,10 @@ mod tests {
     /// naming where it is and what the engine has instead.
     #[test]
     fn a_name_the_engine_does_not_have_is_refused() {
+        // The edits below are written with `\n` endings; a checkout that ends
+        // its lines `\r\n` would otherwise match none of them and leave the
+        // template, which parses, untouched.
+        let template = TEMPLATE.replace("\r\n", "\n");
         for (from, to, why) in [
             ("call: story\n", "call: saga\n", "names the call `saga`"),
             (
@@ -379,10 +383,13 @@ mod tests {
             ),
             ("call: reading\n", "call: skim\n", "runs the call `skim`"),
         ] {
-            let e = Config::parse(&TEMPLATE.replacen(from, to, 1)).unwrap_err();
+            assert!(template.contains(from), "the template has no {from:?}");
+            let e = Config::parse(&template.replacen(from, to, 1))
+                .err()
+                .unwrap_or_else(|| panic!("{from:?} → {to:?} was accepted"));
             assert!(e.contains(why), "{from:?}: {e}");
         }
-        let e = Config::parse(&TEMPLATE.replacen("  writing: |", "  written: |", 1)).unwrap_err();
+        let e = Config::parse(&template.replacen("  writing: |", "  written: |", 1)).unwrap_err();
         assert!(e.contains("the shared prompt `writing` is missing"), "{e}");
     }
 

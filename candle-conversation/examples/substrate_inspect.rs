@@ -1424,8 +1424,13 @@ fn scan_bench(
     // eviction must leave the rest of the gallery cached, so re-assembly stays
     // warm — a global-clear invalidation would re-decode all of it here.
     use candle_conversation::persistence::content_hash::turn_stream_id;
+    use candle_conversation::persistence::identity::RecordIdentity;
     use candle_conversation::provenance::encode_wide_sigs;
-    substrate.set_wide_q_sigs_blob(turn_stream_id(u64::MAX, 0), encode_wide_sigs(&[]));
+    substrate.apply_wide_q_sigs(
+        turn_stream_id(u64::MAX, 0),
+        encode_wide_sigs(&[]),
+        RecordIdentity::NONE,
+    );
     let t_churn = Instant::now();
     let _ = assemble(&substrate);
     let churn_ms = t_churn.elapsed().as_secs_f64() * 1e3;
@@ -6272,6 +6277,7 @@ fn compaction_hint(ratio: f32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{is_transient_by_design, TRANSIENT_BY_DESIGN_KEYS};
+    use candle_conversation::persistence::identity::RecordIdentity;
     use candle_conversation::projection::{GroupId, LayerId, TimelineId};
     use candle_conversation::substrate::Substrate;
     use std::collections::BTreeMap;
@@ -6302,7 +6308,7 @@ mod tests {
 
         let mut custom = BTreeMap::new();
         custom.insert(TRANSIENT_BY_DESIGN_KEYS[0].to_string(), "aes_gcm/3".into());
-        sub.merge_custom(marked, &custom);
+        sub.merge_custom(marked, &custom, RecordIdentity::NONE);
 
         assert!(
             is_transient_by_design(&sub, marked),
@@ -6324,7 +6330,7 @@ mod tests {
         let mut custom = BTreeMap::new();
         custom.insert("identity".to_string(), "req-1".into());
         custom.insert("hash".to_string(), "deadbeef".into());
-        sub.merge_custom(tl, &custom);
+        sub.merge_custom(tl, &custom, RecordIdentity::NONE);
         assert!(!is_transient_by_design(&sub, tl));
     }
 

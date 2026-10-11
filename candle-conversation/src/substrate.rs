@@ -40,6 +40,13 @@
 //! return a plain `f32`). Scores default to zero until the reprojection's belief
 //! scan populates them.
 
+mod label_records;
+#[cfg(test)]
+mod order_independence_tests;
+mod pending;
+mod replicated_state;
+mod stamps;
+
 use std::sync::{Mutex, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ahash::{AHashMap, AHashSet};
@@ -53,6 +60,7 @@ use crate::conversation::window_sealed_tokens;
 use crate::index_pages::{self, StoredPages};
 use crate::normalization::Phase;
 use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
+use crate::persistence::identity::RecordIdentity;
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
@@ -78,6 +86,10 @@ use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnSegment}
 use crate::working_set::marks::is_dialogue;
 use crate::working_set::{Candidate, Limits, Refusal, WorkingSet};
 use crate::ConversationError;
+use label_records::label_records;
+use pending::{PendingChild, PendingChildren};
+use stamps::{take, take_keyed};
+pub use stamps::{StreamIds, TimelineIds};
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
@@ -164,12 +176,12 @@ pub struct Substrate {
     /// role, text, token ids). Does **not** hold KV bytes; those live
     /// in [`Self::residence`] addressed by [`TurnEntryData::residence`].
     timelines: HashMap<TimelineId, TimelineEntry>,
-    /// Monotonic counter stamped onto a [`TimelineEntry::order`] the first time
-    /// its `conv_id` is set. Because the redo log replays in append order and a
-    /// conversation's `conv_id` is written once at creation, ordering the
-    /// sidebar by `order` reproduces creation order across recovery and live
-    /// sessions — the conversation ids themselves are random u64s and carry no
-    /// time information.
+    /// The creation rank given to a conversation named by a record that
+    /// carries no identity — one written before identities existed — counted
+    /// in the order the walk meets them, which for such a log is the order they
+    /// were written. A conversation named by a stamped record ranks by that
+    /// record's clock reading instead ([`TimelineEntry::order`]), which every
+    /// member reads the same way and which sorts after every counted rank.
     conv_order_counter: u64,
     /// Monotonic counter stamped onto a [`TimelineEntry::active`] each time the
     /// conversation is used ([`Self::touch_conversation`]). Unlike `order`, the
@@ -327,17 +339,19 @@ pub struct Substrate {
     /// pattern (§10.4 of `docs/archived/infinite_conversations.md`).
     timeline_by_debug_id: HashMap<String, TimelineId>,
 
-    /// Walker scratch: `Label` / `ConvState` payloads decoded for a
-    /// timeline that hasn't yet been registered.  Zend writes the
-    /// `Label` (carrying conv_id) immediately on conversation
-    /// creation, before any TurnDecl exists, so the walker hits the
-    /// Label record first and the TurnDecl second.  Stashing here
-    /// lets `register_timeline` drain and apply pending meta when
-    /// the timeline finally registers — otherwise restored
-    /// conversations would vanish from the sidebar listing because
-    /// their `conv_id` would never reach the TimelineEntry.
-    pending_conv_meta: HashMap<u64, ConvMeta>,
-    pending_conv_state: HashMap<u64, ConvState>,
+    /// Records about a timeline that is not registered yet — its label, state,
+    /// summary nodes, debug id and couplings — held with their identities until
+    /// the turn declaration that registers it, then applied. Zend writes a
+    /// conversation's `Label` before its first turn, and records from another
+    /// member arrive in any order; see [`PendingChildren`].
+    pending: PendingChildren,
+    /// The record behind each snapshot stream's tail, retracted or not — a
+    /// retraction is a record and outranks the snapshot it withdraws.
+    snapshot_ids: HashMap<StreamId, RecordIdentity>,
+    /// The record behind each prompt branch's checkpoint.
+    branch_checkpoint_ids: HashMap<StreamId, RecordIdentity>,
+    /// The record behind each custom object, by its key's hash.
+    custom_object_ids: HashMap<u64, RecordIdentity>,
 
     /// Timelines flagged by [`RecordType::Tombstone`] as logically
     /// deleted.  [`Self::active_timelines_for_group`] filters them
@@ -1350,9 +1364,12 @@ pub struct TimelineEntry {
     /// this conversation, persisted at first-submit time alongside any
     /// label as a `RecordType::Label` record.
     pub conv_id: Option<String>,
-    /// Creation-order rank, stamped from [`Substrate::conv_order_counter`] the
-    /// first time `conv_id` is set. `0` until then. Higher = created later; the
-    /// daemon sidebar orders conversations with the same [`Self::active`] by it.
+    /// Creation-order rank: the clock reading of the least record that named a
+    /// `conv_id`, or for a conversation named only by records without an
+    /// identity, a count in the order the walk met them
+    /// ([`Substrate::conv_order_counter`]). `0` until named. Higher = created
+    /// later; the daemon sidebar orders conversations with the same
+    /// [`Self::active`] by it.
     pub order: u64,
     /// Free-form key/value metadata, persisted in the same
     /// `RecordType::Label` record as `label`/`conv_id` and merged
@@ -1441,6 +1458,8 @@ pub struct TimelineEntry {
     /// model's response.  Test-harness diagnostic only; production
     /// daemons can ignore it.
     pub last_selection: Option<SelectionDiagnostics>,
+    /// The record behind each of this timeline's replicated values.
+    pub ids: TimelineIds,
 }
 
 /// Tree-bookkeeping metadata stored alongside every substrate turn.
@@ -1537,8 +1556,43 @@ pub struct StreamRuntime {
     /// digest per projection were most of what re-injecting a turn cost. See
     /// [`StoredPages`].
     pub index_page: Option<Arc<StoredPages>>,
-    /// Highest chunk index the stream is durably committed through.
+    /// Highest chunk index the stream is durably committed through — the
+    /// greatest any `Commit` record stated.
     pub committed_through: Option<u64>,
+    /// The record behind each of the values above.
+    pub ids: StreamIds,
+}
+
+impl StreamRuntime {
+    /// Whether this stream is an **orphan** to node `node`: it has no
+    /// declaration, and never will, so nothing can rebuild its turn or section
+    /// and every record it holds is dead weight.
+    ///
+    /// A declaration is written before the records of its stream, so a stream
+    /// this node wrote without one lost it — in a crash, or in a rewrite that
+    /// predates this rule — and so did a stream of records that carry no
+    /// identity. A stream another origin wrote is different: its records can
+    /// reach this node before its declaration does (§6.5), and dropping them
+    /// would lose them for good, since they were already applied. Such a
+    /// stream waits for its declaration.
+    pub fn is_orphan(&self, node: u64) -> bool {
+        if self.decl.is_some() {
+            return false;
+        }
+        let ids = &self.ids;
+        let foreign = |id: &RecordIdentity| !id.is_none() && id.origin != node;
+        !([
+            &ids.decl,
+            &ids.tokens,
+            &ids.projection_events,
+            &ids.wide_q_sigs,
+            &ids.index_page,
+            &ids.commit,
+        ]
+        .into_iter()
+        .any(foreign)
+            || ids.chunks.values().any(foreign))
+    }
 }
 
 impl TimelineEntry {
@@ -1562,6 +1616,7 @@ impl TimelineEntry {
             summarize: false,
             needs_reconcile: false,
             last_selection: None,
+            ids: TimelineIds::default(),
         }
     }
 
@@ -3037,22 +3092,31 @@ impl Substrate {
             .entry(group)
             .or_default()
             .push(timeline);
-        // Drain any walker-stashed conv meta / state that arrived
-        // before this timeline registered.  Sidebar listing depends
-        // on the conv_id landing on the TimelineEntry.
-        if let Some(meta) = self.pending_conv_meta.remove(&timeline.raw()) {
-            if !meta.conv_id.is_empty() {
-                self.set_conv_id(timeline, &meta.conv_id);
+        // Apply every record that arrived before this timeline registered —
+        // the sidebar listing depends on the conv_id landing on the entry.
+        // Each goes through the same stamped apply it would have met on
+        // arrival, so the order they were held in does not matter.
+        for (child, id) in self.pending.release(timeline.raw()) {
+            let raw = timeline.raw();
+            match child {
+                PendingChild::Label(meta) => self.apply_conv_meta(raw, &meta, id),
+                PendingChild::State(state) => self.apply_conv_state(raw, state, id),
+                PendingChild::TreeMeta(p) => self.apply_tree_metadata_payload(&p, id),
+                PendingChild::DebugId(debug_id) => self.apply_debug_id_payload(
+                    &DebugIdPayload {
+                        timeline_id: raw,
+                        debug_id,
+                    },
+                    id,
+                ),
+                PendingChild::Coupling(from_turn) => self.apply_turn_coupling(
+                    &TurnCouplingPayload {
+                        timeline_id: raw,
+                        from_turn,
+                    },
+                    id,
+                ),
             }
-            if !meta.label.is_empty() {
-                self.set_label(timeline, &meta.label);
-            }
-            if !meta.custom.is_empty() {
-                self.merge_custom(timeline, &meta.custom);
-            }
-        }
-        if let Some(state) = self.pending_conv_state.remove(&timeline.raw()) {
-            self.replace_conv_state(timeline, state);
         }
     }
 
@@ -3496,24 +3560,38 @@ impl Substrate {
 
     // ── tool-round-trip couplings ───────────────────────────────────────────
 
-    /// Couple `from_turn` to the tool response that follows it.
+    /// Couple `from_turn` to the tool response that follows it, as
+    /// `TurnCoupling` record `id`.
     ///
-    /// Idempotent — replaying the same record, or coupling twice in a live
-    /// session, is a no-op. A coupling naming an unregistered timeline is
-    /// dropped: with no turns to group it could only describe a round-trip that
-    /// does not exist.
-    pub fn couple_turn(&mut self, timeline: TimelineId, from_turn: u32) {
-        if let Some(tl) = self.timelines.get_mut(&timeline) {
-            tl.couplings.insert(from_turn);
-        }
+    /// Idempotent — replaying the same record, or coupling twice, adds nothing;
+    /// of the records stating one coupling, the greatest stamp is the one a
+    /// rewrite writes back. A coupling naming a timeline not registered yet is
+    /// held until it is.
+    pub fn couple_turn(&mut self, timeline: TimelineId, from_turn: u32, id: RecordIdentity) {
+        self.apply_turn_coupling(
+            &TurnCouplingPayload {
+                timeline_id: timeline.raw(),
+                from_turn,
+            },
+            id,
+        );
     }
 
-    /// Replay a persisted [`TurnCouplingPayload`].
-    pub fn apply_turn_coupling(&mut self, payload: &TurnCouplingPayload) {
+    /// Apply `TurnCoupling` record `id` — a set insert, which commutes.
+    pub fn apply_turn_coupling(&mut self, payload: &TurnCouplingPayload, id: RecordIdentity) {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
         };
-        self.couple_turn(timeline, payload.from_turn);
+        let Some(tl) = self.timelines.get_mut(&timeline) else {
+            self.pending.hold(
+                payload.timeline_id,
+                PendingChild::Coupling(payload.from_turn),
+                id,
+            );
+            return;
+        };
+        tl.couplings.insert(payload.from_turn);
+        take_keyed(&mut tl.ids.couplings, payload.from_turn, id);
     }
 
     /// The turns on `timeline` coupled to the tool response that follows them.
@@ -3528,13 +3606,29 @@ impl Substrate {
 
     // ── debug_id resume keys ────────────────────────────────────────────────
 
-    /// Set the substrate-side resume key for a timeline.  Replaces any
-    /// previous mapping for the same `id`; clears the old mapping if
-    /// the timeline already had a different debug_id.  Used by the
-    /// test harness's `find_or_create(debug_id)` path (§10.4) and
-    /// reconstructed on cold-load from the timeline's record stream.
-    pub fn set_debug_id(&mut self, timeline: TimelineId, id: impl Into<String>) {
-        let id = id.into();
+    /// Set the substrate-side resume key for a timeline, as `DebugId` record
+    /// `id` — see [`Self::apply_debug_id_payload`]. Used by the test harness's
+    /// `find_or_create(debug_id)` path (§10.4) and reconstructed on cold-load
+    /// from the timeline's record stream.
+    pub fn set_debug_id(
+        &mut self,
+        timeline: TimelineId,
+        debug_id: impl Into<String>,
+        id: RecordIdentity,
+    ) {
+        self.apply_debug_id_payload(
+            &DebugIdPayload {
+                timeline_id: timeline.raw(),
+                debug_id: debug_id.into(),
+            },
+            id,
+        );
+    }
+
+    /// Index `timeline`'s resume key. Replaces any previous mapping for the
+    /// same key; clears the old mapping if the timeline already had a
+    /// different debug_id.
+    fn index_debug_id(&mut self, timeline: TimelineId, id: String) {
         if let Some(tl) = self.timelines.get_mut(&timeline) {
             if let Some(old) = tl.debug_id.take() {
                 if old != id {
@@ -3568,13 +3662,22 @@ impl Substrate {
             .and_then(|tl| tl.tree_meta.get(&idx))
     }
 
-    /// Overwrite a turn's [`TreeNodeMeta`].  The summariser thread calls this
-    /// once, to promote a turn into the forest (Normal sub-leaf → SummaryOfTurns
-    /// leaf, or to record a fresh SummaryOfSummaries internal).  Nodes are
-    /// immutable: an existing summary node is never rewritten.
-    pub fn set_tree_meta(&mut self, timeline: TimelineId, idx: TurnIndex, meta: TreeNodeMeta) {
+    /// Set a turn's [`TreeNodeMeta`], as `TreeMetadata` record `id` — the
+    /// greatest stamp per turn holds. The summariser thread calls this once, to
+    /// promote a turn into the forest (Normal sub-leaf → SummaryOfTurns leaf,
+    /// or to record a fresh SummaryOfSummaries internal). Nodes are immutable:
+    /// an existing summary node is never rewritten.
+    pub fn set_tree_meta(
+        &mut self,
+        timeline: TimelineId,
+        idx: TurnIndex,
+        meta: TreeNodeMeta,
+        id: RecordIdentity,
+    ) {
         if let Some(tl) = self.timelines.get_mut(&timeline) {
-            tl.tree_meta.insert(idx, meta);
+            if take_keyed(&mut tl.ids.tree_meta, idx, id) {
+                tl.tree_meta.insert(idx, meta);
+            }
         }
     }
 
@@ -3967,15 +4070,16 @@ impl Substrate {
         self.streams.values().map(|s| s.chunks.len()).sum()
     }
 
-    /// Streams that hold KV chunks but have NO `StreamDecl` — orphans. Their
-    /// turn cannot be reconstructed (reload rebuilds turns from their decl), so
-    /// the chunks are unreachable and the turn is silently lost. Surfaced at
-    /// reload so this loss is VISIBLE rather than silent, and reclaimed by
-    /// compaction (see `collect_live_records`). A healthy substrate reports 0.
-    pub fn orphan_chunk_stream_count(&self) -> usize {
+    /// Streams that hold KV chunks but have NO `StreamDecl` and none coming —
+    /// orphans to node `node` ([`StreamRuntime::is_orphan`]). Their turn cannot
+    /// be reconstructed (reload rebuilds turns from their decl), so the chunks
+    /// are unreachable and the turn is silently lost. Surfaced at reload so
+    /// this loss is VISIBLE rather than silent, and reclaimed by compaction
+    /// (see `collect_live_records`). A healthy substrate reports 0.
+    pub fn orphan_chunk_stream_count(&self, node: u64) -> usize {
         self.streams
             .values()
-            .filter(|s| s.decl.is_none() && !s.chunks.is_empty())
+            .filter(|s| s.is_orphan(node) && !s.chunks.is_empty())
             .count()
     }
 
@@ -4005,6 +4109,14 @@ impl Substrate {
         // relocation walk can match the entry too.
         self.branch_checkpoints.clear();
         self.recurrent_snapshots.clear();
+        // The identities go with the values: the replay re-applies every carried
+        // record under the identity it kept, so each value and its identity come
+        // back together. Records held for an unregistered timeline are carried
+        // too, and the replay holds them again.
+        self.snapshot_ids.clear();
+        self.branch_checkpoint_ids.clear();
+        self.custom_object_ids.clear();
+        self.pending.clear();
         for tl in self.timelines.values_mut() {
             tl.label = None;
             tl.conv_id = None;
@@ -4014,43 +4126,35 @@ impl Substrate {
             tl.tree_meta.clear();
             tl.pending_summary_queue.clear();
             tl.needs_reconcile = false;
+            tl.ids = TimelineIds::default();
         }
     }
 
-    /// Emit `(timeline_id, conv_id, label, custom)` tuples for every timeline
-    /// that holds non-default values.  Used by compaction to re-emit live
-    /// `Label` records; the `ConvState` side is [`Self::live_conv_states`].
-    pub fn live_conv_meta(&self) -> Vec<(u64, String, String, BTreeMap<String, String>)> {
-        // Emit in creation `order`, not `timelines` (HashMap) iteration order:
-        // the compactor writes these as `Label` records, and reload re-derives
-        // each timeline's `order` from the order its `conv_id` Label replays
-        // (see `set_conv_id`). A nondeterministic order here would scramble the
-        // sidebar's creation-order sort on every compaction. `order` is 0 for
-        // timelines that never got a conv_id (label/custom only); they sort
-        // first and their relative order is immaterial.
-        let mut out: Vec<(u64, u64, String, String, BTreeMap<String, String>)> = self
-            .timelines
-            .iter()
-            .filter_map(|(tid, tl)| {
-                let conv_id = tl.conv_id.clone().unwrap_or_default();
-                let label = tl.label.clone().unwrap_or_default();
-                if conv_id.is_empty() && label.is_empty() && tl.custom.is_empty() {
-                    None
-                } else {
-                    Some((tl.order, tid.raw(), conv_id, label, tl.custom.clone()))
-                }
+    /// Every timeline's label as the `Label` records that hold it — one per
+    /// winning identity, with the fields it won ([`label_records`]). Used by
+    /// both rewrite paths to re-emit live `Label` records; the `ConvState` side
+    /// is [`Self::live_conv_states`].
+    ///
+    /// In creation `order`, then timeline, then stamp: the output is a function
+    /// of the substrate, so two compactions of one store write the same file. A
+    /// timeline with no label fields writes nothing.
+    pub fn live_label_records(&self) -> Vec<(u64, ConvMeta, RecordIdentity)> {
+        let mut timelines: Vec<(&TimelineId, &TimelineEntry)> = self.timelines.iter().collect();
+        timelines.sort_by_key(|(tid, tl)| (tl.order, tid.raw()));
+        timelines
+            .into_iter()
+            .flat_map(|(tid, tl)| {
+                label_records(tl)
+                    .into_iter()
+                    .map(move |(meta, id)| (tid.raw(), meta, id))
             })
-            .collect();
-        out.sort_by_key(|(order, tid, ..)| (*order, *tid));
-        out.into_iter()
-            .map(|(_, tid, conv_id, label, custom)| (tid, conv_id, label, custom))
             .collect()
     }
 
     /// Emit one `TreeMetadataPayload` per live tree node across every
-    /// timeline.  Used by compaction to re-emit live `TreeMetadata`
-    /// records.
-    pub fn live_tree_metadata_payloads(&self) -> Vec<TreeMetadataPayload> {
+    /// timeline, with the record behind it. Used by compaction to re-emit live
+    /// `TreeMetadata` records.
+    pub fn live_tree_metadata_payloads(&self) -> Vec<(TreeMetadataPayload, RecordIdentity)> {
         let mut out = Vec::new();
         for (tid, tl) in &self.timelines {
             for (idx, meta) in &tl.tree_meta {
@@ -4059,16 +4163,25 @@ impl Substrate {
                     TurnKind::SummaryOfTurns => 1,
                     TurnKind::SummaryOfSummaries => 2,
                 };
-                out.push(TreeMetadataPayload {
-                    timeline_id: tid.raw(),
-                    turn_index: idx.0,
-                    kind,
-                    tree_height: meta.tree_height,
-                    children: meta.children.iter().map(|c| c.0).collect(),
-                });
+                out.push((
+                    TreeMetadataPayload {
+                        timeline_id: tid.raw(),
+                        turn_index: idx.0,
+                        kind,
+                        tree_height: meta.tree_height,
+                        children: meta.children.iter().map(|c| c.0).collect(),
+                    },
+                    tl.ids.tree_meta.get(idx).copied().unwrap_or_default(),
+                ));
             }
         }
         out
+    }
+
+    /// Every record held for a timeline not registered yet, as a rewrite
+    /// writes it back — see [`PendingChildren::records`].
+    pub fn pending_records(&self) -> Vec<(u64, RecordType, Vec<u8>, RecordIdentity)> {
+        self.pending.records()
     }
 
     /// Emit `(timeline_id, from_turn)` for every coupling on every timeline —
@@ -4086,43 +4199,46 @@ impl Substrate {
     /// Sorted, because a rewrite's output must be a function of its input: an
     /// unordered walk of a per-timeline set produces a different file from the
     /// same store on every pass, which makes two generations impossible to diff.
-    pub fn live_couplings(&self) -> Vec<(u64, u32)> {
-        let mut out: Vec<(u64, u32)> = self
+    pub fn live_couplings(&self) -> Vec<(u64, u32, RecordIdentity)> {
+        let mut out: Vec<(u64, u32, RecordIdentity)> = self
             .timelines
             .iter()
-            .flat_map(|(tid, tl)| tl.couplings.iter().map(move |&from| (tid.raw(), from)))
+            .flat_map(|(tid, tl)| {
+                tl.couplings.iter().map(move |&from| {
+                    let id = tl.ids.couplings.get(&from).copied().unwrap_or_default();
+                    (tid.raw(), from, id)
+                })
+            })
             .collect();
-        out.sort_unstable();
+        out.sort_unstable_by_key(|(tl, from, _)| (*tl, *from));
         out
     }
 
-    /// Emit `(timeline_id, debug_id)` for every timeline that has one
+    /// Emit `(timeline_id, debug_id, record)` for every timeline that has one
     /// set.  Used by compaction to re-emit live `DebugId` records.
-    pub fn live_debug_ids(&self) -> Vec<(u64, String)> {
+    pub fn live_debug_ids(&self) -> Vec<(u64, String, RecordIdentity)> {
         self.timelines
             .iter()
-            .filter_map(|(tid, tl)| tl.debug_id.as_ref().map(|id| (tid.raw(), id.clone())))
+            .filter_map(|(tid, tl)| {
+                tl.debug_id
+                    .as_ref()
+                    .map(|d| (tid.raw(), d.clone(), tl.ids.debug_id))
+            })
             .collect()
     }
 
-    /// Install a stream declaration.  Idempotent: subsequent decls for
-    /// the same stream overwrite (last-writer-wins).
+    /// Install a stream declaration written as record `id`. The declaration
+    /// with the greatest stamp is the stream's (§6.5); one ranked below the
+    /// declaration held changes nothing.
     ///
     /// A section declaration on a tombstoned stream starts the stream's next
     /// generation: the tombstone emptied the index for it
     /// ([`Self::reset_tombstoned_stream`]), and this lifts the flag so the
     /// fresh prefill's records read as persisted again.
-    pub fn apply_stream_decl(&mut self, stream_id: StreamId, decl: StreamDecl) {
-        if matches!(decl, StreamDecl::PromptSection(_)) {
-            self.tombstoned_sections.remove(&stream_id);
-        }
-        // Turn decls implicitly register their timeline.  The walker
-        // pass applies records in log order; without this, a `Label`
-        // record carrying the conv_id (written after `NewConversation`
-        // but typically before any TurnDecl) would land before the
-        // timeline exists in `self.timelines` and `set_conv_id`
-        // would silently no-op.  Net effect was that restored
-        // conversations vanished from the sidebar listing.
+    pub fn apply_stream_decl(&mut self, stream_id: StreamId, decl: StreamDecl, id: RecordIdentity) {
+        // Turn decls register their timeline whether or not they win the
+        // stream: registration is a set insert, so it holds in any order, and
+        // the records held for the timeline until now are applied by it.
         if let StreamDecl::Turn(t) = &decl {
             if let (Some(timeline), Some(layer), Some(group)) = (
                 TimelineId::from_raw(t.timeline_id),
@@ -4131,6 +4247,13 @@ impl Substrate {
             ) {
                 self.register_timeline(timeline, layer, group);
             }
+        }
+        let entry = self.streams.entry(stream_id).or_default();
+        if !take(&mut entry.ids.decl, id) {
+            return;
+        }
+        if matches!(decl, StreamDecl::PromptSection(_)) {
+            self.tombstoned_sections.remove(&stream_id);
         }
         match &decl {
             StreamDecl::Turn(t) if !is_dialogue(&t.tags) => {
@@ -4153,27 +4276,47 @@ impl Substrate {
             .filter_map(|sid| self.streams.get(sid).map(|e| (*sid, e)))
     }
 
-    /// Record a chunk location for `stream_id` at chunk index `idx`.
-    /// Last-writer-wins on `idx`.
-    pub fn apply_chunk_loc(&mut self, stream_id: StreamId, idx: u64, loc: ChunkLoc) {
-        self.streams
-            .entry(stream_id)
-            .or_default()
-            .chunks
-            .insert(idx, loc);
+    /// Record the location of chunk `idx` of `stream_id`, written as record
+    /// `id`: the greatest stamp holds the index, and a copy of the record that
+    /// holds it (a relocation keeps its identity) moves it.
+    pub fn apply_chunk_loc(
+        &mut self,
+        stream_id: StreamId,
+        idx: u64,
+        loc: ChunkLoc,
+        id: RecordIdentity,
+    ) {
+        let entry = self.streams.entry(stream_id).or_default();
+        if take_keyed(&mut entry.ids.chunks, idx, id) {
+            entry.chunks.insert(idx, loc);
+        }
     }
 
-    /// Record the latest `Tokens` record location for `stream_id`.
-    pub fn apply_tokens_loc(&mut self, stream_id: StreamId, loc: RecordLoc) {
-        self.streams.entry(stream_id).or_default().tokens = Some(loc);
+    /// Record the location of `stream_id`'s `Tokens` record `id` — the greatest
+    /// stamp holds it.
+    pub fn apply_tokens_loc(&mut self, stream_id: StreamId, loc: RecordLoc, id: RecordIdentity) {
+        let entry = self.streams.entry(stream_id).or_default();
+        if take(&mut entry.ids.tokens, id) {
+            entry.tokens = Some(loc);
+        }
     }
 
-    /// Record the latest recurrent-state snapshot location for a snapshot
-    /// stream. Last-writer-wins: the previous location (if any) is simply
-    /// replaced — its bytes were already credited dead by the accounting
-    /// layer when the newer record appended.
-    pub fn apply_snapshot_loc(&mut self, stream_id: StreamId, loc: RecordLoc) {
-        self.recurrent_snapshots.insert(stream_id, loc);
+    /// Record the location of a snapshot stream's recurrent-state record `id`
+    /// — the greatest stamp is the stream's tail. The location it replaces was
+    /// credited dead by the accounting layer when this one appended.
+    pub fn apply_snapshot_loc(&mut self, stream_id: StreamId, loc: RecordLoc, id: RecordIdentity) {
+        if take(self.snapshot_ids.entry(stream_id).or_default(), id) {
+            self.recurrent_snapshots.insert(stream_id, loc);
+        }
+    }
+
+    /// A snapshot retraction, record `id`: when it outranks the stream's tail
+    /// the tail is gone, and every snapshot it outranks that arrives later is
+    /// refused (§6.5 — an empty payload is a value meaning *retracted*).
+    pub fn retract_snapshot(&mut self, stream_id: StreamId, id: RecordIdentity) {
+        if take(self.snapshot_ids.entry(stream_id).or_default(), id) {
+            self.recurrent_snapshots.remove(&stream_id);
+        }
     }
 
     /// The live snapshot for a snapshot stream, if one exists. The caller
@@ -4184,10 +4327,29 @@ impl Substrate {
         self.recurrent_snapshots.get(&stream_id).copied()
     }
 
-    /// Drop a timeline's snapshot entry (timeline tombstone path, and a
-    /// snapshot retraction).
+    /// Forget a snapshot stream entirely, its tail and the record behind it —
+    /// what a timeline tombstone or a distillation does to the conversation's
+    /// recurrent state, and what a retraction that could not be written leaves.
+    /// A retraction that was written goes through [`Self::retract_snapshot`]
+    /// instead, which keeps its identity.
     pub fn drop_snapshot_loc(&mut self, stream_id: StreamId) {
         self.recurrent_snapshots.remove(&stream_id);
+        self.snapshot_ids.remove(&stream_id);
+    }
+
+    /// Every snapshot stream whose current record is a retraction, with the
+    /// retraction's identity, by stream id. A retraction is a value (§6.5): a
+    /// rewrite carries it, so a snapshot it outranks that arrives later is
+    /// still refused.
+    pub fn retracted_snapshots(&self) -> Vec<(StreamId, RecordIdentity)> {
+        let mut out: Vec<(StreamId, RecordIdentity)> = self
+            .snapshot_ids
+            .iter()
+            .filter(|(sid, _)| !self.recurrent_snapshots.contains_key(sid))
+            .map(|(sid, id)| (*sid, *id))
+            .collect();
+        out.sort_unstable_by_key(|(sid, _)| sid.0);
+        out
     }
 
     /// Every live snapshot `(stream id, location)` — the compactor's source
@@ -4196,10 +4358,33 @@ impl Substrate {
         self.recurrent_snapshots.iter().map(|(k, v)| (*k, *v))
     }
 
-    /// Record the latest checkpoint location for a **prompt branch**.
-    /// Last-writer-wins, exactly as for a conversation snapshot.
-    pub fn apply_branch_checkpoint_loc(&mut self, stream_id: StreamId, loc: RecordLoc) {
-        self.branch_checkpoints.insert(stream_id, loc);
+    /// Record the location of a **prompt branch**'s checkpoint record `id` —
+    /// the greatest stamp holds the branch, exactly as for a snapshot.
+    pub fn apply_branch_checkpoint_loc(
+        &mut self,
+        stream_id: StreamId,
+        loc: RecordLoc,
+        id: RecordIdentity,
+    ) {
+        if take(self.branch_checkpoint_ids.entry(stream_id).or_default(), id) {
+            self.branch_checkpoints.insert(stream_id, loc);
+        }
+    }
+
+    /// The record behind a prompt branch's checkpoint.
+    pub fn branch_checkpoint_id(&self, stream_id: StreamId) -> RecordIdentity {
+        self.branch_checkpoint_ids
+            .get(&stream_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The record behind a snapshot stream's tail.
+    pub fn snapshot_id(&self, stream_id: StreamId) -> RecordIdentity {
+        self.snapshot_ids
+            .get(&stream_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The live checkpoint for a prompt branch, if one exists. The caller
@@ -4213,62 +4398,148 @@ impl Substrate {
         self.branch_checkpoints.iter().map(|(k, v)| (*k, *v))
     }
 
-    /// Record the highest chunk index the stream is durably committed
-    /// through.  Last-writer-wins.
-    pub fn apply_commit_through(&mut self, stream_id: StreamId, through_index: u64) {
-        self.streams.entry(stream_id).or_default().committed_through = Some(through_index);
-    }
-
-    // ── Per-timeline LWW payload applicators (decode + dispatch) ────────
-
-    /// Apply a decoded `ConvMeta` (Label payload).  When the
-    /// timeline isn't registered yet (Label record written before
-    /// the first TurnDecl — the common zend pattern), the meta is
-    /// stashed in `pending_conv_meta` and drained by
-    /// `register_timeline` once the matching TurnDecl arrives.
-    pub fn apply_conv_meta(&mut self, timeline_raw: u64, meta: &ConvMeta) {
-        let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
-            return;
-        };
-        if self.timelines.contains_key(&timeline) {
-            if !meta.conv_id.is_empty() {
-                self.set_conv_id(timeline, &meta.conv_id);
+    /// Record that the stream is durably committed through `through_index`,
+    /// by `Commit` record `id`. The greatest index stated holds — a max, never
+    /// an overwrite (§6.5) — and of the records stating it, the greatest stamp
+    /// is the one a rewrite writes back.
+    pub fn apply_commit_through(
+        &mut self,
+        stream_id: StreamId,
+        through_index: u64,
+        id: RecordIdentity,
+    ) {
+        let entry = self.streams.entry(stream_id).or_default();
+        match entry.committed_through {
+            Some(held) if through_index < held => {}
+            Some(held) if through_index == held => {
+                take(&mut entry.ids.commit, id);
             }
-            if !meta.label.is_empty() {
-                self.set_label(timeline, &meta.label);
-            }
-            if !meta.custom.is_empty() {
-                self.merge_custom(timeline, &meta.custom);
-            }
-        } else {
-            // Merge into any prior pending entry so an earlier
-            // partial Label (conv_id only) plus a later partial
-            // (label only) both survive registration.
-            let slot = self.pending_conv_meta.entry(timeline_raw).or_default();
-            if !meta.conv_id.is_empty() {
-                slot.conv_id = meta.conv_id.clone();
-            }
-            if !meta.label.is_empty() {
-                slot.label = meta.label.clone();
-            }
-            for (k, v) in &meta.custom {
-                slot.custom.insert(k.clone(), v.clone());
+            _ => {
+                entry.committed_through = Some(through_index);
+                entry.ids.commit = id;
             }
         }
     }
 
-    /// Apply a decoded `ConvState` payload — the whole state, replacing
-    /// whatever an earlier record set. Same stash-and-drain pattern as
-    /// [`Self::apply_conv_meta`] for unregistered timelines, except that a
-    /// later stashed state replaces an earlier one rather than merging.
-    pub fn apply_conv_state(&mut self, timeline_raw: u64, state: ConvState) {
+    /// Record `stream_id`'s projection events, record `id` — the greatest
+    /// stamp holds them.
+    pub fn apply_projection_events(
+        &mut self,
+        stream_id: StreamId,
+        payload: Vec<u8>,
+        id: RecordIdentity,
+    ) {
+        let entry = self.streams.entry(stream_id).or_default();
+        if !take(&mut entry.ids.projection_events, id) {
+            return;
+        }
+        entry.projection_events = Some(payload);
+        self.gallery_epoch += 1;
+        // Drop this stream's memoized seams so an apply after the seam cache
+        // warmed cannot serve stale ones.
+        self.events_cache
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&stream_id);
+    }
+
+    /// Record `stream_id`'s wide-Q signature window, record `id` — the greatest
+    /// stamp holds it.
+    pub fn apply_wide_q_sigs(&mut self, stream_id: StreamId, payload: Vec<u8>, id: RecordIdentity) {
+        let entry = self.streams.entry(stream_id).or_default();
+        if !take(&mut entry.ids.wide_q_sigs, id) {
+            return;
+        }
+        entry.wide_q_sigs = Some(payload);
+        self.gallery_epoch += 1;
+        self.evict_decoded_wide_sig(stream_id);
+    }
+
+    /// Record the QSA index page of a turn or a prompt section, record `id` —
+    /// the greatest stamp holds it.
+    pub fn apply_index_page(
+        &mut self,
+        stream_id: StreamId,
+        payload: impl Into<Arc<[u8]>>,
+        id: RecordIdentity,
+    ) {
+        let entry = self.streams.entry(stream_id).or_default();
+        if take(&mut entry.ids.index_page, id) {
+            entry.index_page = Some(Arc::new(StoredPages::new(payload)));
+        }
+    }
+
+    // ── Per-timeline LWW payload applicators (decode + dispatch) ────────
+
+    /// Apply `Label` record `id` — a timeline's `conv_id`, `label` and `custom`
+    /// keys, any of which it may leave empty. **Each field keeps the value of
+    /// the greatest record that set it** (§6.5), so two members renaming a
+    /// conversation and tagging it at once both land, whatever order their
+    /// records arrive in. A timeline not registered yet holds the record until
+    /// its first turn declaration arrives.
+    pub fn apply_conv_meta(&mut self, timeline_raw: u64, meta: &ConvMeta, id: RecordIdentity) {
         let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
             return;
         };
-        if self.timelines.contains_key(&timeline) {
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            self.pending
+                .hold(timeline_raw, PendingChild::Label(meta.clone()), id);
+            return;
+        };
+        if !meta.conv_id.is_empty() {
+            if take(&mut entry.ids.conv_id, id) {
+                entry.conv_id = Some(meta.conv_id.clone());
+            }
+            Self::note_named(entry, id, &meta.conv_id, &mut self.conv_order_counter);
+        }
+        if !meta.label.is_empty() && take(&mut entry.ids.label, id) {
+            entry.label = Some(meta.label.clone());
+        }
+        for (k, v) in &meta.custom {
+            if take_keyed(&mut entry.ids.custom, k.clone(), id) {
+                entry.custom.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    /// A record `id` named `entry`'s `conv_id`: rank the conversation by the
+    /// least record that did. A stamped record ranks by its clock reading,
+    /// which every member reads the same; a conversation named only by records
+    /// without an identity is counted in the order the walk met them, which
+    /// for such a log is the order they were written.
+    fn note_named(entry: &mut TimelineEntry, id: RecordIdentity, conv_id: &str, counter: &mut u64) {
+        match entry.ids.named {
+            None => {
+                entry.order = if id.is_none() {
+                    *counter += 1;
+                    *counter
+                } else {
+                    id.hlc
+                };
+            }
+            Some(held) if !id.is_none() && (held.is_none() || id.stamp() < held.stamp()) => {
+                entry.order = id.hlc;
+            }
+            Some(_) => return,
+        }
+        entry.ids.named = Some(id);
+        entry.ids.named_conv_id = conv_id.to_string();
+    }
+
+    /// Apply `ConvState` record `id` — the whole state, so the greatest stamp
+    /// holds all of it. A timeline not registered yet holds the record until
+    /// its first turn declaration arrives.
+    pub fn apply_conv_state(&mut self, timeline_raw: u64, state: ConvState, id: RecordIdentity) {
+        let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
+            return;
+        };
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            self.pending
+                .hold(timeline_raw, PendingChild::State(state), id);
+            return;
+        };
+        if take(&mut entry.ids.state, id) {
             self.replace_conv_state(timeline, state);
-        } else {
-            self.pending_conv_state.insert(timeline_raw, state);
         }
     }
 
@@ -4282,13 +4553,26 @@ impl Substrate {
         }
     }
 
-    /// Apply a decoded `TreeMetadataPayload` — sets the turn's per-node forest
-    /// meta (kind / children / level).  The peak set is derived, so there is no
-    /// root marker to apply.
-    pub fn apply_tree_metadata_payload(&mut self, payload: &TreeMetadataPayload) {
+    /// Apply `TreeMetadata` record `id` — the turn's per-node forest meta
+    /// (kind / children / level), the greatest stamp per turn. The peak set is
+    /// derived, so there is no root marker to apply. A timeline not registered
+    /// yet holds the record until it is.
+    pub fn apply_tree_metadata_payload(
+        &mut self,
+        payload: &TreeMetadataPayload,
+        id: RecordIdentity,
+    ) {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
         };
+        if !self.timelines.contains_key(&timeline) {
+            self.pending.hold(
+                payload.timeline_id,
+                PendingChild::TreeMeta(payload.clone()),
+                id,
+            );
+            return;
+        }
         let kind = match payload.kind {
             0 => TurnKind::Normal,
             1 => TurnKind::SummaryOfTurns,
@@ -4300,22 +4584,44 @@ impl Substrate {
             children: payload.children.iter().map(|c| TurnIndex(*c)).collect(),
             tree_height: payload.tree_height,
         };
-        self.set_tree_meta(timeline, TurnIndex(payload.turn_index), meta);
+        self.set_tree_meta(timeline, TurnIndex(payload.turn_index), meta, id);
     }
 
-    /// Apply a decoded `DebugIdPayload`.
-    pub fn apply_debug_id_payload(&mut self, payload: &DebugIdPayload) {
+    /// Apply `DebugId` record `id` — the greatest stamp holds the timeline's
+    /// resume key. A timeline not registered yet holds the record until it is.
+    pub fn apply_debug_id_payload(&mut self, payload: &DebugIdPayload, id: RecordIdentity) {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
         };
-        self.set_debug_id(timeline, payload.debug_id.clone());
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            self.pending.hold(
+                payload.timeline_id,
+                PendingChild::DebugId(payload.debug_id.clone()),
+                id,
+            );
+            return;
+        };
+        if take(&mut entry.ids.debug_id, id) {
+            self.index_debug_id(timeline, payload.debug_id.clone());
+        }
     }
 
-    /// Apply a custom object — on replay and on the runtime write path. Keyed by
-    /// the stable hash of its `key`, so a re-write with the same key replaces the
-    /// old one (last-writer-wins).
-    pub fn apply_custom_object(&mut self, obj: CustomObjectPayload) {
-        self.custom_objects.insert(obj.stream_id(), obj);
+    /// Apply custom-object record `id` — on replay and on the runtime write
+    /// path. Keyed by the stable hash of its `key`, and the greatest stamp per
+    /// key holds it.
+    pub fn apply_custom_object(&mut self, obj: CustomObjectPayload, id: RecordIdentity) {
+        let key = obj.stream_id();
+        if take(self.custom_object_ids.entry(key).or_default(), id) {
+            self.custom_objects.insert(key, obj);
+        }
+    }
+
+    /// The record behind the custom object keyed `key_hash`.
+    pub fn custom_object_id(&self, key_hash: u64) -> RecordIdentity {
+        self.custom_object_ids
+            .get(&key_hash)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The live custom object stored under `key`, if any.
@@ -4324,10 +4630,13 @@ impl Substrate {
             .get(&CustomObjectPayload::stream_id_for(key))
     }
 
-    /// Every live custom object — the set the compaction pass re-emits so they
-    /// survive it.
-    pub fn live_custom_objects(&self) -> Vec<CustomObjectPayload> {
-        self.custom_objects.values().cloned().collect()
+    /// Every live custom object with the record behind it — the set the
+    /// compaction pass re-emits so they survive it.
+    pub fn live_custom_objects(&self) -> Vec<(CustomObjectPayload, RecordIdentity)> {
+        self.custom_objects
+            .iter()
+            .map(|(key, obj)| (obj.clone(), self.custom_object_id(*key)))
+            .collect()
     }
 
     /// Apply a decoded [`TombstonePayload`].  Works whether or not
@@ -4885,8 +5194,7 @@ impl Substrate {
         // They did: full compaction gated, incremental maintenance did not, and
         // a production store carried 766 distilled tails of ~116 MiB each —
         // ~89 GB of a 120 GB log — forward on every pass.
-        self.recurrent_snapshots
-            .remove(&snapshot_stream_id(timeline.raw()));
+        self.drop_snapshot_loc(snapshot_stream_id(timeline.raw()));
         self.release_distilled_kv(timeline);
     }
 
@@ -5070,15 +5378,16 @@ impl Substrate {
     pub fn apply_walker_entry(&mut self, entry: &WalkEntry) {
         let h = &entry.record.header;
         let stream_id = StreamId(h.stream_id);
+        let id = h.identity();
         match h.record_type {
             RecordType::StreamDecl => {
                 if let Ok(decl) = StreamDecl::decode(&entry.record.payload) {
-                    self.apply_stream_decl(stream_id, decl);
+                    self.apply_stream_decl(stream_id, decl, id);
                 }
             }
             RecordType::TurnCoupling => {
                 if let Ok(payload) = TurnCouplingPayload::decode(&entry.record.payload) {
-                    self.apply_turn_coupling(&payload);
+                    self.apply_turn_coupling(&payload, id);
                 }
             }
             RecordType::Chunk => {
@@ -5096,6 +5405,7 @@ impl Substrate {
                         token_count: h.token_count,
                         format: h.format,
                     },
+                    id,
                 );
             }
             RecordType::Tokens => {
@@ -5107,13 +5417,14 @@ impl Substrate {
                         payload_len: h.payload_len,
                         record_size: entry.size,
                     },
+                    id,
                 );
             }
             RecordType::Commit => {
-                self.apply_commit_through(stream_id, h.chunk_index);
+                self.apply_commit_through(stream_id, h.chunk_index, id);
             }
             RecordType::Snapshot if h.retracts_snapshot() => {
-                self.drop_snapshot_loc(stream_id);
+                self.retract_snapshot(stream_id, id);
             }
             RecordType::Snapshot => {
                 self.apply_snapshot_loc(
@@ -5124,6 +5435,7 @@ impl Substrate {
                         payload_len: h.payload_len,
                         record_size: entry.size,
                     },
+                    id,
                 );
             }
             RecordType::BranchCheckpoint => {
@@ -5135,31 +5447,32 @@ impl Substrate {
                         payload_len: h.payload_len,
                         record_size: entry.size,
                     },
+                    id,
                 );
             }
             RecordType::Label => {
                 if let Ok((tl, meta)) = decode_label_payload(&entry.record.payload) {
-                    self.apply_conv_meta(tl, &meta);
+                    self.apply_conv_meta(tl, &meta, id);
                 }
             }
             RecordType::ConvState => {
                 if let Ok((tl, state)) = decode_conv_state_payload(&entry.record.payload) {
-                    self.apply_conv_state(tl, state);
+                    self.apply_conv_state(tl, state, id);
                 }
             }
             RecordType::TreeMetadata => {
                 if let Ok(payload) = TreeMetadataPayload::decode(&entry.record.payload) {
-                    self.apply_tree_metadata_payload(&payload);
+                    self.apply_tree_metadata_payload(&payload, id);
                 }
             }
             RecordType::DebugId => {
                 if let Ok(payload) = DebugIdPayload::decode(&entry.record.payload) {
-                    self.apply_debug_id_payload(&payload);
+                    self.apply_debug_id_payload(&payload, id);
                 }
             }
             RecordType::CustomObject => {
                 if let Ok(payload) = CustomObjectPayload::decode(&entry.record.payload) {
-                    self.apply_custom_object(payload);
+                    self.apply_custom_object(payload, id);
                 }
             }
             RecordType::Tombstone => {
@@ -5179,30 +5492,17 @@ impl Substrate {
             }
             RecordType::ProjectionEvents => {
                 // Opaque JSON bytes — the projection layer decodes them on read.
-                // Last-writer-wins per turn stream id.
-                self.streams.entry(stream_id).or_default().projection_events =
-                    Some(entry.record.payload.clone());
-                self.gallery_epoch += 1;
-                // Mirror the `WideQSig` arm: drop this stream's memoized seams so a
-                // replay/apply after the seam cache warmed can't serve stale seams.
-                self.events_cache
-                    .get_mut()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&stream_id);
+                self.apply_projection_events(stream_id, entry.record.payload.clone(), id);
             }
             RecordType::WideQSig => {
-                // Opaque wide-Q window bytes (provenance::wide_sig), last-writer-wins
-                // per turn stream id — each (re)projection overwrites the window.
-                self.streams.entry(stream_id).or_default().wide_q_sigs =
-                    Some(entry.record.payload.clone());
-                self.gallery_epoch += 1;
-                self.evict_decoded_wide_sig(stream_id);
+                // Opaque wide-Q window bytes (provenance::wide_sig) — each
+                // (re)projection writes the window again.
+                self.apply_wide_q_sigs(stream_id, entry.record.payload.clone(), id);
             }
             RecordType::TurnIndexPage => {
-                // Opaque QSA index-page bytes, last-writer-wins per stream id —
-                // a turn's or a prompt section's; a re-seal replaces the page.
-                self.streams.entry(stream_id).or_default().index_page =
-                    Some(Arc::new(StoredPages::new(entry.record.payload.as_slice())));
+                // Opaque QSA index-page bytes — a turn's or a prompt section's; a
+                // re-seal writes the page again.
+                self.apply_index_page(stream_id, entry.record.payload.as_slice(), id);
             }
             // Singletons go to the manifest, not the substrate; the
             // header-index chain is consumed by recovery, never here.
@@ -5988,16 +6288,15 @@ impl Substrate {
             .and_then(|e| e.label.as_deref())
     }
 
-    /// Set a timeline's sidebar label. Empty values are ignored (so the
-    /// first-submit placeholder doesn't clobber a real title written
-    /// earlier). No-op if the timeline isn't registered.
-    pub fn set_label(&mut self, timeline: TimelineId, label: &str) {
-        if label.is_empty() {
-            return;
-        }
-        if let Some(entry) = self.timelines.get_mut(&timeline) {
-            entry.label = Some(label.to_string());
-        }
+    /// Set a timeline's sidebar label, as `Label` record `id` — a label-only
+    /// [`Self::apply_conv_meta`]. Empty values are ignored (so the first-submit
+    /// placeholder doesn't clobber a real title written earlier).
+    pub fn set_label(&mut self, timeline: TimelineId, label: &str, id: RecordIdentity) {
+        let meta = ConvMeta {
+            label: label.to_string(),
+            ..ConvMeta::default()
+        };
+        self.apply_conv_meta(timeline.raw(), &meta, id);
     }
 
     /// The client-supplied `conv_id` string for `timeline`, or `None`
@@ -6008,41 +6307,30 @@ impl Substrate {
             .and_then(|e| e.conv_id.as_deref())
     }
 
-    /// Set a timeline's `conv_id`. Empty values are ignored. No-op if
-    /// the timeline isn't registered. Distinct from [`Self::set_label`]
-    /// only because the two fields are written at different points in
-    /// the conversation lifecycle.
-    pub fn set_conv_id(&mut self, timeline: TimelineId, conv_id: &str) {
-        if conv_id.is_empty() {
-            return;
-        }
-        // Stamp creation order the first time this timeline gets a conv_id.
-        // During recovery this runs in redo-log (creation) order; live, a new
-        // conversation's first Label bumps the counter last → highest rank.
-        let stamp = self.conv_order_counter + 1;
-        if let Some(entry) = self.timelines.get_mut(&timeline) {
-            let first = entry.conv_id.is_none();
-            entry.conv_id = Some(conv_id.to_string());
-            if first {
-                entry.order = stamp;
-                self.conv_order_counter = stamp;
-            }
-        }
+    /// Set a timeline's `conv_id`, as `Label` record `id` — a conv_id-only
+    /// [`Self::apply_conv_meta`], which also places the conversation in
+    /// creation order. Empty values are ignored.
+    pub fn set_conv_id(&mut self, timeline: TimelineId, conv_id: &str, id: RecordIdentity) {
+        let meta = ConvMeta {
+            conv_id: conv_id.to_string(),
+            ..ConvMeta::default()
+        };
+        self.apply_conv_meta(timeline.raw(), &meta, id);
     }
 
-    /// Merge key/value pairs into a timeline's `custom` metadata bag
-    /// (last-write-wins per key). No-op if the timeline isn't registered;
-    /// the caller (handle setter) stages it in `pending_conv_meta` first
-    /// so pre-registration writes survive, mirroring label/conv_id.
-    pub fn merge_custom(&mut self, timeline: TimelineId, kv: &BTreeMap<String, String>) {
-        if kv.is_empty() {
-            return;
-        }
-        if let Some(entry) = self.timelines.get_mut(&timeline) {
-            for (k, v) in kv {
-                entry.custom.insert(k.clone(), v.clone());
-            }
-        }
+    /// Merge key/value pairs into a timeline's `custom` metadata bag, as
+    /// `Label` record `id` — each key keeps the greatest stamp that set it.
+    pub fn merge_custom(
+        &mut self,
+        timeline: TimelineId,
+        kv: &BTreeMap<String, String>,
+        id: RecordIdentity,
+    ) {
+        let meta = ConvMeta {
+            custom: kv.clone(),
+            ..ConvMeta::default()
+        };
+        self.apply_conv_meta(timeline.raw(), &meta, id);
     }
 
     /// The `custom` metadata bag for `timeline`, or `None` if unregistered.
@@ -6244,19 +6532,29 @@ impl Substrate {
         true
     }
 
+    /// Record that `timeline`'s state, just changed in place by
+    /// [`Self::set_archived`], [`Self::touch_conversation`] or
+    /// [`Self::set_branch`], is carried by `ConvState` record `id` — minted
+    /// for the change, so it outranks every state the timeline held.
+    pub fn stamp_conv_state(&mut self, timeline: TimelineId, id: RecordIdentity) {
+        if let Some(entry) = self.timelines.get_mut(&timeline) {
+            take(&mut entry.ids.state, id);
+        }
+    }
+
     /// Every live timeline's conversation state that differs from an
-    /// untouched one, as `(timeline_id, state)` in timeline order — what
-    /// compaction and maintenance re-emit as `ConvState` records.
-    pub fn live_conv_states(&self) -> Vec<(u64, ConvState)> {
-        let mut out: Vec<(u64, ConvState)> = self
+    /// untouched one, as `(timeline_id, state, record)` in timeline order —
+    /// what compaction and maintenance re-emit as `ConvState` records.
+    pub fn live_conv_states(&self) -> Vec<(u64, ConvState, RecordIdentity)> {
+        let mut out: Vec<(u64, ConvState, RecordIdentity)> = self
             .timelines
-            .keys()
-            .filter_map(|tl| {
+            .iter()
+            .filter_map(|(tl, entry)| {
                 let state = self.conv_state(*tl)?;
-                (!state.is_default()).then_some((tl.raw(), state))
+                (!state.is_default()).then_some((tl.raw(), state, entry.ids.state))
             })
             .collect();
-        out.sort_by_key(|(tl, _)| *tl);
+        out.sort_by_key(|(tl, ..)| *tl);
         out
     }
 
@@ -6347,20 +6645,6 @@ impl Substrate {
         self.gallery_epoch += 1;
     }
 
-    /// Store a turn's projection-event record payload (opaque JSON bytes) on its
-    /// stream runtime, keyed by the turn's `stream_id`. Called at write time
-    /// and on redo-log replay.
-    pub fn set_projection_events_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
-        self.streams.entry(stream_id).or_default().projection_events = Some(payload);
-        self.gallery_epoch += 1;
-        // Incremental invalidation: evict only this stream's decoded seams so a
-        // single seal doesn't force a full-gallery JSON re-parse on the next scan.
-        self.events_cache
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&stream_id);
-    }
-
     /// The stored projection-event record payload for a turn, if any.
     pub fn projection_events_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
         self.streams
@@ -6368,26 +6652,11 @@ impl Substrate {
             .and_then(|s| s.projection_events.as_deref())
     }
 
-    /// Cache a turn's encoded wide-Q signature window, last-writer-wins.
-    pub fn set_wide_q_sigs_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
-        self.streams.entry(stream_id).or_default().wide_q_sigs = Some(payload);
-        self.gallery_epoch += 1;
-        // Incremental invalidation: evict only this stream's decoded window so a
-        // single seal doesn't force a full-gallery re-decode on the next scan.
-        self.evict_decoded_wide_sig(stream_id);
-    }
-
     /// The stored wide-Q signature window payload for a turn, if any.
     pub fn wide_q_sigs_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
         self.streams
             .get(&turn_stream_id(timeline.raw(), index.0))
             .and_then(|s| s.wide_q_sigs.as_deref())
-    }
-
-    /// Cache a turn's QSA index page, last-writer-wins.
-    pub fn set_index_page_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
-        self.streams.entry(stream_id).or_default().index_page =
-            Some(Arc::new(StoredPages::new(payload)));
     }
 
     /// The stored QSA index page for a turn, if any.
@@ -7151,6 +7420,19 @@ mod tests {
     };
     use crate::token_buffer::TokenBuffer;
 
+    /// Blob writes for tests about what the substrate does with the bytes,
+    /// not about which of two records wins: every write carries no identity,
+    /// so the last one holds.
+    impl Substrate {
+        fn set_wide_q_sigs_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
+            self.apply_wide_q_sigs(stream_id, payload, RecordIdentity::NONE);
+        }
+
+        fn set_projection_events_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
+            self.apply_projection_events(stream_id, payload, RecordIdentity::NONE);
+        }
+    }
+
     /// A timeline id no allocator in a test can also mint. Allocators are
     /// microsecond clocks, so two fresh ones asked in the same microsecond
     /// return the same id — two "different" timelines then share their turns.
@@ -7201,7 +7483,7 @@ mod tests {
             Substrate::FORKED_FROM_KEY.to_string(),
             parent.raw().to_string(),
         );
-        sub.merge_custom(child, &kv);
+        sub.merge_custom(child, &kv, RecordIdentity::NONE);
     }
 
     // ── retrieval scope ─────────────────────────────────────────────────────
@@ -7503,7 +7785,7 @@ mod tests {
         let (_layer, _group, tl, mut sub) = make_timeline();
         let mut kv = BTreeMap::new();
         kv.insert(Substrate::FORKED_FROM_KEY.to_string(), "999999".to_string());
-        sub.merge_custom(tl, &kv);
+        sub.merge_custom(tl, &kv, RecordIdentity::NONE);
         assert_eq!(sub.parent_timeline(tl), None);
         assert_eq!(sub.inherited_chain(tl), vec![tl]);
     }
@@ -7516,7 +7798,7 @@ mod tests {
             Substrate::FORKED_FROM_KEY.to_string(),
             "not-a-timeline".to_string(),
         );
-        sub.merge_custom(tl, &kv);
+        sub.merge_custom(tl, &kv, RecordIdentity::NONE);
         assert_eq!(sub.parent_timeline(tl), None);
     }
 
@@ -7635,7 +7917,7 @@ mod tests {
             children: vec![TurnIndex(99)],
             tree_height: 1,
         };
-        sub.set_tree_meta(timeline, idx, meta.clone());
+        sub.set_tree_meta(timeline, idx, meta.clone(), RecordIdentity::NONE);
         assert_eq!(sub.tree_meta_of(timeline, idx), Some(&meta));
         let leaves = sub.summary_leaves_chrono(timeline);
         assert_eq!(leaves, vec![idx]);
@@ -7656,6 +7938,7 @@ mod tests {
                     children: vec![idx],
                     tree_height: 1,
                 },
+                RecordIdentity::NONE,
             );
             leaves.push(idx);
         }
@@ -7675,6 +7958,7 @@ mod tests {
                 children: leaves.clone(),
                 tree_height: 2,
             },
+            RecordIdentity::NONE,
         );
         assert_eq!(sub.peaks_of(timeline), vec![(sos, 2)]);
         assert_eq!(sub.reconcile_next(timeline), None);
@@ -7684,11 +7968,11 @@ mod tests {
     fn debug_id_round_trip_and_lookup() {
         let (_, _, timeline, mut sub) = make_timeline();
         assert_eq!(sub.lookup_by_debug_id("foo"), None);
-        sub.set_debug_id(timeline, "coherent-50");
+        sub.set_debug_id(timeline, "coherent-50", RecordIdentity::NONE);
         assert_eq!(sub.lookup_by_debug_id("coherent-50"), Some(timeline));
         assert_eq!(sub.debug_id_of(timeline), Some("coherent-50"));
         // Replacing supersedes — old key disappears.
-        sub.set_debug_id(timeline, "two-topics-100");
+        sub.set_debug_id(timeline, "two-topics-100", RecordIdentity::NONE);
         assert_eq!(sub.lookup_by_debug_id("coherent-50"), None);
         assert_eq!(sub.lookup_by_debug_id("two-topics-100"), Some(timeline));
     }
@@ -7709,6 +7993,7 @@ mod tests {
                     children: vec![leaf],
                     tree_height: 1,
                 },
+                RecordIdentity::NONE,
             );
         }
         // A legacy binary SoS (2 children) — not canonical under MERGE_FANOUT.
@@ -7721,6 +8006,7 @@ mod tests {
                 children: vec![leaf_a, leaf_b],
                 tree_height: 2,
             },
+            RecordIdentity::NONE,
         );
         assert!(sub.tree_meta_of(timeline, bin).is_some());
         sub.mark_for_reconcile(timeline);
@@ -8309,6 +8595,7 @@ mod tests {
                 address: ContentAddress::default(),
                 debug_name: "conv/1/a".to_string(),
             }),
+            RecordIdentity::NONE,
         );
         assert!(sub.section_exists(again));
     }
@@ -8333,6 +8620,7 @@ mod tests {
                     address: ContentAddress::default(),
                     debug_name: name.to_string(),
                 }),
+                RecordIdentity::NONE,
             );
         }
         let one = owner(1);
@@ -9726,8 +10014,8 @@ mod tests {
         install_blocked_turn(&mut sub, intact, 3);
         let broken = install_blocked_turn(&mut sub, damaged, 3);
         let hash_meta = |v: &str| BTreeMap::from([("content_sha256".to_string(), v.to_string())]);
-        sub.merge_custom(intact, &hash_meta("aaa"));
-        sub.merge_custom(damaged, &hash_meta("bbb"));
+        sub.merge_custom(intact, &hash_meta("aaa"), RecordIdentity::NONE);
+        sub.merge_custom(damaged, &hash_meta("bbb"), RecordIdentity::NONE);
 
         assert!(sub.timeline_kv_intact(intact));
         assert!(sub.timeline_kv_intact(damaged));
@@ -9806,6 +10094,7 @@ mod tests {
                 Substrate::FORKED_FROM_KEY.to_string(),
                 ancestor.raw().to_string(),
             )]),
+            RecordIdentity::NONE,
         );
         assert_eq!(
             sub.parent_timeline(child),
@@ -9905,6 +10194,7 @@ mod tests {
                 children: vec![TurnIndex(7)],
                 tree_height: 1,
             },
+            RecordIdentity::NONE,
         );
 
         // The reconstruct loop then restores turn 0.
@@ -10018,7 +10308,7 @@ mod tests {
             format: 4,
         };
         for flat in 0..(n_layers * chunks_per_layer) as u64 {
-            sub.apply_chunk_loc(stream_id, flat, old_loc(flat));
+            sub.apply_chunk_loc(stream_id, flat, old_loc(flat), RecordIdentity::NONE);
         }
         let cold: Vec<StoredSequence> = (0..n_layers)
             .map(|l| StoredSequence {
@@ -10078,7 +10368,7 @@ mod tests {
             format: 4,
         };
         for flat in 0..(n_layers * chunks_per_layer) as u64 {
-            sub.apply_chunk_loc(stream_id, flat, new_loc(flat));
+            sub.apply_chunk_loc(stream_id, flat, new_loc(flat), RecordIdentity::NONE);
         }
         sub.refresh_cold_refs();
 
@@ -10204,23 +10494,31 @@ mod tests {
             timeline_id: timeline.raw(),
             from_turn: 4,
         };
-        sub.apply_turn_coupling(&payload);
-        sub.apply_turn_coupling(&payload); // duplicate — must not change the set
+        sub.apply_turn_coupling(&payload, RecordIdentity::NONE);
+        // A duplicate — must not change the set.
+        sub.apply_turn_coupling(&payload, RecordIdentity::NONE);
         assert_eq!(sub.couplings_of(timeline), [4u32].into_iter().collect());
     }
 
-    /// A coupling naming a timeline that was never registered describes a
-    /// round-trip that cannot exist — it must be dropped, not conjure an entry.
+    /// A coupling naming a timeline not registered yet conjures no entry, and
+    /// is not dropped either: it waits for the timeline's first turn
+    /// declaration and lands when that arrives (§6.5).
     #[test]
-    fn turn_coupling_for_an_unknown_timeline_is_dropped() {
+    fn turn_coupling_for_an_unregistered_timeline_waits_for_it() {
         let mut sub = Substrate::new();
         let alloc = crate::projection::TimelineAllocator::new();
         let timeline = alloc.next();
-        sub.apply_turn_coupling(&TurnCouplingPayload {
-            timeline_id: timeline.raw(),
-            from_turn: 1,
-        });
+        sub.apply_turn_coupling(
+            &TurnCouplingPayload {
+                timeline_id: timeline.raw(),
+                from_turn: 1,
+            },
+            RecordIdentity::NONE,
+        );
         assert!(sub.couplings_of(timeline).is_empty());
+        assert!(sub.timeline_entry(timeline).is_none());
+        sub.register_timeline(timeline, LayerId::for_test(1), GroupId::for_test(1));
+        assert_eq!(sub.couplings_of(timeline), [1u32].into_iter().collect());
     }
 
     /// A timeline that never called a tool has no couplings, so every turn is its
@@ -10261,7 +10559,7 @@ mod tests {
         let dead_sid = turn_stream_id(7, 0);
         let live_sid = turn_stream_id(8, 0);
         for (sid, tl) in [(dead_sid, 7u64), (live_sid, 8u64)] {
-            sub.apply_stream_decl(sid, decl_for(tl));
+            sub.apply_stream_decl(sid, decl_for(tl), RecordIdentity::NONE);
             sub.apply_chunk_loc(
                 sid,
                 0,
@@ -10273,6 +10571,7 @@ mod tests {
                     token_count: 32,
                     format: 4,
                 },
+                RecordIdentity::NONE,
             );
             sub.apply_tokens_loc(
                 sid,
@@ -10282,6 +10581,7 @@ mod tests {
                     payload_len: 64,
                     record_size: 4096,
                 },
+                RecordIdentity::NONE,
             );
         }
         assert_eq!(sub.tombstoned_stream_bytes(), 0, "nothing tombstoned yet");
@@ -10319,7 +10619,7 @@ mod tests {
         let dead_sid = dead_decl.stream_id();
         let live_sid = live_decl.stream_id();
         for (sid, decl) in [(dead_sid, dead_decl), (live_sid, live_decl)] {
-            sub.apply_stream_decl(sid, decl);
+            sub.apply_stream_decl(sid, decl, RecordIdentity::NONE);
             sub.apply_chunk_loc(
                 sid,
                 0,
@@ -10331,6 +10631,7 @@ mod tests {
                     token_count: 32,
                     format: 4,
                 },
+                RecordIdentity::NONE,
             );
             sub.apply_tokens_loc(
                 sid,
@@ -10340,6 +10641,7 @@ mod tests {
                     payload_len: 64,
                     record_size: 4096,
                 },
+                RecordIdentity::NONE,
             );
         }
         sub.tombstone_section(dead_sid);
@@ -10355,7 +10657,7 @@ mod tests {
             "sections are the accounting's"
         );
 
-        sub.apply_stream_decl(dead_sid, decl_for(7));
+        sub.apply_stream_decl(dead_sid, decl_for(7), RecordIdentity::NONE);
         sub.apply_chunk_loc(
             dead_sid,
             1,
@@ -10367,6 +10669,7 @@ mod tests {
                 token_count: 32,
                 format: 4,
             },
+            RecordIdentity::NONE,
         );
         assert!(
             !sub.is_section_tombstoned(dead_sid),
@@ -10601,18 +10904,19 @@ mod tests {
             turn_stream_id(2, 0),
             turn_stream_id(3, 0),
         );
-        sub.apply_stream_decl(tool, decl(1, &["tool"]));
-        sub.apply_stream_decl(chat, decl(2, &[]));
-        sub.apply_stream_decl(marked, decl(3, &["working_set:release"]));
+        let none = RecordIdentity::NONE;
+        sub.apply_stream_decl(tool, decl(1, &["tool"]), none);
+        sub.apply_stream_decl(chat, decl(2, &[]), none);
+        sub.apply_stream_decl(marked, decl(3, &["working_set:release"]), none);
         assert_eq!(tagged(&sub), vec![tool]);
 
-        sub.apply_stream_decl(chat, decl(2, &["tool"]));
-        sub.apply_stream_decl(tool, decl(1, &[]));
+        sub.apply_stream_decl(chat, decl(2, &["tool"]), none);
+        sub.apply_stream_decl(tool, decl(1, &[]), none);
         assert_eq!(tagged(&sub), vec![chat]);
 
         sub.reset_tombstoned_stream(chat);
         assert!(tagged(&sub).is_empty());
-        sub.apply_stream_decl(tool, decl(1, &["tool"]));
+        sub.apply_stream_decl(tool, decl(1, &["tool"]), none);
         sub.clear_walker_state();
         assert!(tagged(&sub).is_empty());
     }
@@ -10686,8 +10990,8 @@ mod tests {
     #[test]
     fn known_conversations_exposes_archived_flag() {
         let (_, _, timeline, mut sub) = make_timeline();
-        sub.set_conv_id(timeline, "abc");
-        sub.set_label(timeline, "tour");
+        sub.set_conv_id(timeline, "abc", RecordIdentity::NONE);
+        sub.set_label(timeline, "tour", RecordIdentity::NONE);
         sub.set_archived(timeline, true);
 
         let convs = sub.known_conversations();
@@ -10709,8 +11013,8 @@ mod tests {
     #[test]
     fn a_tombstoned_conversation_is_not_listed() {
         let (_, _, timeline, mut sub) = make_timeline();
-        sub.set_conv_id(timeline, "abc");
-        sub.set_label(timeline, "tour");
+        sub.set_conv_id(timeline, "abc", RecordIdentity::NONE);
+        sub.set_label(timeline, "tour", RecordIdentity::NONE);
         assert_eq!(sub.known_conversations().len(), 1);
 
         sub.tombstone_timeline(timeline);
@@ -10739,13 +11043,13 @@ mod tests {
     #[test]
     fn a_conv_id_prefix_lookup_finds_only_live_matches() {
         let (layer, group, first, mut sub) = make_timeline();
-        sub.set_conv_id(first, "npc-7-day-1");
+        sub.set_conv_id(first, "npc-7-day-1", RecordIdentity::NONE);
 
         let alloc = TimelineAllocator::new();
         let add = |sub: &mut Substrate, conv_id: &str| {
             let tl = alloc.next();
             sub.register_timeline(tl, layer, group);
-            sub.set_conv_id(tl, conv_id);
+            sub.set_conv_id(tl, conv_id, RecordIdentity::NONE);
             tl
         };
         add(&mut sub, "npc-7-day-2");
@@ -10775,7 +11079,7 @@ mod tests {
     #[test]
     fn live_timelines_include_the_unnamed_and_exclude_the_retired() {
         let (layer, group, named, mut sub) = make_timeline();
-        sub.set_conv_id(named, "npc-7-day-1");
+        sub.set_conv_id(named, "npc-7-day-1", RecordIdentity::NONE);
 
         let alloc = TimelineAllocator::new();
         let unnamed = alloc.next();
@@ -10814,8 +11118,12 @@ mod tests {
             label: String::new(),
             custom: Default::default(),
         };
-        sub.apply_conv_meta(timeline.raw(), &meta);
-        sub.apply_conv_state(timeline.raw(), super::ConvState::default());
+        sub.apply_conv_meta(timeline.raw(), &meta, RecordIdentity::NONE);
+        sub.apply_conv_state(
+            timeline.raw(),
+            super::ConvState::default(),
+            RecordIdentity::NONE,
+        );
         assert!(
             sub.known_conversations().is_empty(),
             "pre-registration: meta stashed, not visible yet"
@@ -10847,6 +11155,7 @@ mod tests {
                 label: String::new(),
                 custom: Default::default(),
             },
+            RecordIdentity::NONE,
         );
         sub.apply_conv_meta(
             timeline.raw(),
@@ -10855,6 +11164,7 @@ mod tests {
                 label: "tour".into(),
                 custom: Default::default(),
             },
+            RecordIdentity::NONE,
         );
         sub.register_timeline(timeline, layer, group);
 
@@ -10864,12 +11174,11 @@ mod tests {
         assert_eq!(convs[0].2, "tour");
     }
 
-    /// `order` is stamped in creation sequence on first `conv_id` and is stable:
-    /// re-setting a conv_id doesn't re-stamp, and `live_conv_meta` (the compactor's
-    /// Label source) emits in that order so a reload re-derives the same sequence
-    /// instead of scrambling the sidebar on every compaction. Production timeline
-    /// ids are content hashes with no time information, so this ordinal is the only
-    /// creation-order signal.
+    /// `order` for labels written before identities existed is counted in the
+    /// sequence their first `conv_id` replays in, and is stable: re-setting a
+    /// conv_id doesn't re-stamp, and `live_label_records` (the compactor's Label
+    /// source) emits in that order so a reload re-derives the same sequence
+    /// instead of scrambling the sidebar on every compaction.
     #[test]
     fn conv_order_stamps_creation_sequence_and_emits_stably() {
         let layer = LayerId::for_test(1);
@@ -10880,7 +11189,7 @@ mod tests {
         let (a, b, c) = (alloc.next(), alloc.next(), alloc.next());
         for (tl, id) in [(a, "a"), (b, "b"), (c, "c")] {
             sub.register_timeline(tl, layer, group);
-            sub.set_conv_id(tl, id);
+            sub.set_conv_id(tl, id, RecordIdentity::NONE);
         }
 
         let order_of = |sub: &Substrate, want: &str| {
@@ -10895,17 +11204,109 @@ mod tests {
         assert_eq!(order_of(&sub, "c"), 3);
 
         // Re-setting the same conv_id must not bump the counter or re-stamp.
-        sub.set_conv_id(a, "a");
+        sub.set_conv_id(a, "a", RecordIdentity::NONE);
         assert_eq!(order_of(&sub, "a"), 1);
         assert_eq!(order_of(&sub, "c"), 3, "counter untouched by a re-set");
 
         // The compactor's Label source emits in creation order, so reload is stable.
         let emitted: Vec<String> = sub
-            .live_conv_meta()
+            .live_label_records()
             .into_iter()
-            .map(|(_, cid, ..)| cid)
+            .map(|(_, meta, _)| meta.conv_id)
             .collect();
         assert_eq!(emitted, ["a", "b", "c"]);
+    }
+
+    /// **A stamped conversation ranks by the clock reading of the least record
+    /// that named it**, so every member orders it the same whatever order the
+    /// records arrived in, and the record that named it first survives a
+    /// rewrite even when a later one holds the `conv_id` field.
+    #[test]
+    fn a_stamped_conversation_ranks_by_its_first_naming_record() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let at = |hlc: u64| RecordIdentity {
+            origin: 5,
+            oseq: hlc,
+            gen: 0,
+            epoch: 0,
+            hlc,
+        };
+        let tl = alloc.next();
+        for order in [[30u64, 10, 20], [10, 20, 30], [20, 30, 10]] {
+            let mut sub = Substrate::new();
+            sub.register_timeline(tl, layer, group);
+            for hlc in order {
+                sub.set_conv_id(tl, &format!("c{hlc}"), at(hlc));
+            }
+            let entry = sub.timeline_entry(tl).unwrap();
+            assert_eq!(entry.order, 10, "order {order:?}");
+            assert_eq!(entry.conv_id.as_deref(), Some("c30"), "order {order:?}");
+            let records = sub.live_label_records();
+            let carried: Vec<(String, u64)> = records
+                .iter()
+                .map(|(_, m, id)| (m.conv_id.clone(), id.hlc))
+                .collect();
+            assert_eq!(
+                carried,
+                vec![("c10".to_string(), 10), ("c30".to_string(), 30)],
+                "the first namer and the field's holder are both carried"
+            );
+        }
+    }
+
+    /// **Each label field keeps the greatest record that set it**, so a rename
+    /// and a tag written by two members at once both land, in any order, and a
+    /// stale restatement does not roll either back.
+    #[test]
+    fn label_fields_merge_by_stamp_in_any_order() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let tl = alloc.next();
+        let at = |origin: u64, hlc: u64| RecordIdentity {
+            origin,
+            oseq: hlc,
+            gen: 0,
+            epoch: 0,
+            hlc,
+        };
+        let meta = |label: &str, k: Option<(&str, &str)>| super::ConvMeta {
+            conv_id: String::new(),
+            label: label.to_string(),
+            custom: k
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        let records = [
+            (meta("old title", Some(("k", "v1"))), at(1, 10)),
+            (meta("renamed", None), at(2, 20)),
+            (meta("", Some(("k", "v2"))), at(3, 30)),
+            (meta("stale", None), at(1, 15)),
+        ];
+        let mut first: Option<(Option<String>, BTreeMap<String, String>)> = None;
+        for perm in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1]] {
+            let mut sub = Substrate::new();
+            sub.register_timeline(tl, layer, group);
+            for i in perm {
+                let (m, id) = &records[i];
+                sub.apply_conv_meta(tl.raw(), m, *id);
+            }
+            let entry = sub.timeline_entry(tl).unwrap();
+            let got = (entry.label.clone(), entry.custom.clone());
+            assert_eq!(got.0.as_deref(), Some("renamed"), "perm {perm:?}");
+            assert_eq!(
+                got.1.get("k").map(String::as_str),
+                Some("v2"),
+                "perm {perm:?}"
+            );
+            match &first {
+                None => first = Some(got),
+                Some(f) => assert_eq!(f, &got, "perm {perm:?}"),
+            }
+        }
     }
 
     // ── Custom metadata (content-addressed cache) ──────────────────────
@@ -10923,7 +11324,7 @@ mod tests {
         kv.insert("kind".to_string(), "code_read".to_string());
         kv.insert("path".to_string(), "src/lib.rs".to_string());
         kv.insert("content_sha256".to_string(), "abc123".to_string());
-        sub.merge_custom(tl, &kv);
+        sub.merge_custom(tl, &kv, RecordIdentity::NONE);
 
         let got = sub
             .custom_of(tl)
@@ -10945,13 +11346,16 @@ mod tests {
             .is_empty());
         assert!(sub.timelines_with_metadata("absent_key", "x").is_empty());
 
-        // live_conv_meta carries custom so compaction can re-emit it.
-        let live = sub.live_conv_meta();
+        // live_label_records carries custom so compaction can re-emit it.
+        let live = sub.live_label_records();
         let entry = live
             .iter()
             .find(|e| e.0 == tl.raw())
             .expect("timeline in live meta");
-        assert_eq!(entry.3.get("path").map(String::as_str), Some("src/lib.rs"));
+        assert_eq!(
+            entry.1.custom.get("path").map(String::as_str),
+            Some("src/lib.rs")
+        );
     }
 
     // ── Conversation state (archived + branches) ────────────────────────
@@ -10997,11 +11401,14 @@ mod tests {
         };
         assert_eq!(
             sub.live_conv_states(),
-            vec![(a.raw(), a_state), (b.raw(), b_state)]
+            vec![
+                (a.raw(), a_state, RecordIdentity::NONE),
+                (b.raw(), b_state, RecordIdentity::NONE)
+            ]
         );
 
         // A replayed record replaces the state whole.
-        sub.apply_conv_state(a.raw(), super::ConvState::default());
+        sub.apply_conv_state(a.raw(), super::ConvState::default(), RecordIdentity::NONE);
         assert_eq!(sub.conv_state(a), Some(super::ConvState::default()));
         assert_eq!(sub.live_conv_states().len(), 1, "a is untouched again");
     }
@@ -11033,8 +11440,8 @@ mod tests {
         let mut replayed = Substrate::new();
         replayed.register_timeline(a, layer, group);
         replayed.register_timeline(b, layer, group);
-        for (tl, state) in states.into_iter().rev() {
-            replayed.apply_conv_state(tl, state);
+        for (tl, state, id) in states.into_iter().rev() {
+            replayed.apply_conv_state(tl, state, id);
         }
         assert_eq!(replayed.conv_state(a).unwrap().active, 3);
         assert_eq!(replayed.conv_state(b).unwrap().active, 2);
@@ -11061,6 +11468,7 @@ mod tests {
                 label: String::new(),
                 custom: m1,
             },
+            RecordIdentity::NONE,
         );
         let mut m2 = std::collections::BTreeMap::new();
         m2.insert("content_sha256".to_string(), "h1".to_string());
@@ -11071,6 +11479,7 @@ mod tests {
                 label: String::new(),
                 custom: m2,
             },
+            RecordIdentity::NONE,
         );
 
         assert!(
@@ -11112,7 +11521,7 @@ mod tests {
             sub.register_timeline(t, layer, group);
             let mut m = std::collections::BTreeMap::new();
             m.insert("calib".to_string(), "marker-1".to_string());
-            sub.merge_custom(t, &m);
+            sub.merge_custom(t, &m, RecordIdentity::NONE);
         }
         // `corpus` is the provenance corpus: distilled AND tombstoned.
         sub.distill_timeline(corpus, DistillMode::ProvenanceOnly);
@@ -11148,8 +11557,8 @@ mod tests {
         ma.insert("path".to_string(), "x.rs".to_string());
         let mut mb = std::collections::BTreeMap::new();
         mb.insert("path".to_string(), "y.rs".to_string());
-        sub.merge_custom(a, &ma);
-        sub.merge_custom(b, &mb);
+        sub.merge_custom(a, &ma, RecordIdentity::NONE);
+        sub.merge_custom(b, &mb, RecordIdentity::NONE);
 
         assert_eq!(sub.timelines_with_metadata("path", "x.rs"), vec![a]);
         assert_eq!(sub.timelines_with_metadata("path", "y.rs"), vec![b]);

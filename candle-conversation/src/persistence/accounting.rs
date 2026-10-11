@@ -1,11 +1,12 @@
 //! Live/dead byte accounting for the redo log.
 //!
-//! The log is append-only and last-writer-wins: every re-append of the
-//! same key (a partial-tail re-snapshot, a re-written `Tokens` record, a
-//! superseded singleton) leaves the previous record behind as
-//! unreachable dead weight on disk. This module tracks that dead weight
-//! incrementally — O(1) per append — so the automatic compaction
-//! trigger never has to walk the log to measure it.
+//! The log is append-only, and per key the record with the greatest version
+//! stamp is the live one: every superseded record of a key (a partial-tail
+//! re-snapshot, a re-written `Tokens` record, a superseded singleton) is left
+//! behind as unreachable dead weight on disk — the older one when they arrive
+//! in stamp order, the newcomer itself when it arrives after a greater one.
+//! This module tracks that dead weight incrementally — O(1) per append — so
+//! the automatic compaction trigger never has to walk the log to measure it.
 //!
 //! Keys are derived from the record header alone: `Chunk` is keyed by
 //! `(stream_id, chunk_index)`; the per-stream last-writer-wins types
@@ -26,15 +27,29 @@
 //! that on top. A **section tombstone** names its stream in the header, so it
 //! retires that stream's records here directly — see [`RecordAccounting::record`].
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
+use super::identity::RecordIdentity;
 use super::record::{RecordHeader, RecordType};
 
-/// Incremental last-writer-wins byte accounting over appended records.
+/// The current record of one key: its padded on-disk size and its identity.
+/// A snapshot retraction is current with size zero — it names nothing to
+/// carry, and still outranks every older snapshot that arrives after it.
+#[derive(Debug, Clone, Copy)]
+struct Live {
+    size: u64,
+    id: RecordIdentity,
+}
+
+/// Incremental byte accounting over appended records: per key, the record with
+/// the greatest version stamp is live (`docs/replicated_substrate.md` §6.5).
+/// Records reach the log in arrival order, so one ranked below the record a
+/// key already holds is dead the moment it lands.
 #[derive(Debug, Default)]
 pub struct RecordAccounting {
-    /// Padded on-disk size of the current live record per key.
-    live_sizes: HashMap<(RecordType, u64, u64), u64>,
+    /// The current live record per key.
+    live_sizes: HashMap<(RecordType, u64, u64), Live>,
     /// Total padded bytes of superseded (dead) records.
     dead_bytes: u64,
 }
@@ -59,10 +74,18 @@ impl RecordAccounting {
         if header.record_type == RecordType::SectionTombstone {
             self.retire_stream(header.stream_id);
         }
-        // A snapshot retraction kills the stream's tail and is itself never
-        // carried forward, so both are dead the moment it lands.
+        // A snapshot retraction kills the stream's tail when it outranks it,
+        // and is itself never carried forward, so it is dead the moment it
+        // lands — but it stays the key's current record, so an older snapshot
+        // arriving later is dead too.
         if header.retracts_snapshot() {
-            self.retire(RecordType::Snapshot, header.stream_id, 0);
+            self.offer(
+                (RecordType::Snapshot, header.stream_id, 0),
+                Live {
+                    size: 0,
+                    id: header.identity(),
+                },
+            );
             self.dead_bytes += padded_size;
             return;
         }
@@ -125,8 +148,30 @@ impl RecordAccounting {
             | RecordType::HeaderIndex
             | RecordType::Unknown => return,
         };
-        if let Some(old) = self.live_sizes.insert(key, padded_size) {
-            self.dead_bytes += old;
+        self.offer(
+            key,
+            Live {
+                size: padded_size,
+                id: header.identity(),
+            },
+        );
+    }
+
+    /// `incoming` becomes `key`'s live record when it supersedes the one held,
+    /// which turns dead; otherwise `incoming` is dead on arrival.
+    fn offer(&mut self, key: (RecordType, u64, u64), incoming: Live) {
+        match self.live_sizes.entry(key) {
+            Entry::Occupied(mut held) => {
+                if incoming.id.supersedes(&held.get().id) {
+                    self.dead_bytes += held.get().size;
+                    held.insert(incoming);
+                } else {
+                    self.dead_bytes += incoming.size;
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(incoming);
+            }
         }
     }
 
@@ -135,8 +180,8 @@ impl RecordAccounting {
     /// tombstone named, or whose timeline was tombstoned. A key not live is
     /// left alone, so retiring twice counts once.
     pub fn retire(&mut self, rt: RecordType, stream_id: u64, index: u64) {
-        if let Some(size) = self.live_sizes.remove(&(rt, stream_id, index)) {
-            self.dead_bytes += size;
+        if let Some(live) = self.live_sizes.remove(&(rt, stream_id, index)) {
+            self.dead_bytes += live.size;
         }
     }
 
@@ -146,7 +191,7 @@ impl RecordAccounting {
     /// ids of their own.
     fn retire_stream(&mut self, stream_id: u64) {
         let mut retired = 0u64;
-        self.live_sizes.retain(|&(rt, sid, _), size| {
+        self.live_sizes.retain(|&(rt, sid, _), live| {
             let owned = sid == stream_id
                 && matches!(
                     rt,
@@ -159,7 +204,7 @@ impl RecordAccounting {
                         | RecordType::TurnIndexPage
                 );
             if owned {
-                retired += *size;
+                retired += live.size;
             }
             !owned
         });
@@ -210,6 +255,54 @@ mod tests {
         // The next real snapshot is live again, superseding nothing.
         acc.record(&snapshot, 4096);
         assert_eq!(acc.dead_bytes(), 4096 + 64);
+    }
+
+    /// **A record that arrives after a greater one is dead on arrival**, and
+    /// the greater one stays live: what counts is the stamp, not the order the
+    /// two reached the log in.
+    #[test]
+    fn an_older_record_arriving_late_is_dead_on_arrival() {
+        let stamped = |hlc: u64| RecordHeader {
+            hlc,
+            origin: 3,
+            oseq: hlc,
+            ..header(RecordType::Tokens, 9, 0)
+        };
+        let mut acc = RecordAccounting::new();
+        acc.record(&stamped(20), 4096);
+        acc.record(&stamped(10), 8192);
+        assert_eq!(acc.dead_bytes(), 8192, "the late, older record is dead");
+        acc.record(&stamped(30), 4096);
+        assert_eq!(acc.dead_bytes(), 8192 + 4096, "the newer one supersedes 20");
+        // A relocated copy of the live record keeps its identity: the old
+        // copy is dead and the copy is live.
+        acc.record(&stamped(30), 4096);
+        assert_eq!(acc.dead_bytes(), 8192 + 4096 + 4096);
+    }
+
+    /// A retraction outranks the snapshot before it and every older one that
+    /// arrives after it.
+    #[test]
+    fn a_retraction_refuses_an_older_snapshot_arriving_late() {
+        let at = |hlc: u64, len: u64| RecordHeader {
+            hlc,
+            origin: 3,
+            oseq: hlc,
+            payload_len: len,
+            ..header(RecordType::Snapshot, 7, 0)
+        };
+        let mut acc = RecordAccounting::new();
+        acc.record(&at(10, 1000), 4096);
+        acc.record(&at(20, 0), 64);
+        assert_eq!(acc.dead_bytes(), 4096 + 64);
+        acc.record(&at(15, 1000), 4096);
+        assert_eq!(
+            acc.dead_bytes(),
+            4096 + 64 + 4096,
+            "older than the retraction"
+        );
+        acc.record(&at(25, 1000), 4096);
+        assert_eq!(acc.dead_bytes(), 4096 + 64 + 4096, "newer: live again");
     }
 
     #[test]
