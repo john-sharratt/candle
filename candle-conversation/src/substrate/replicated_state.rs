@@ -13,7 +13,9 @@
 //! So is everything a timeline tombstone has killed. A tombstoned timeline that
 //! is not distilled is dead at read — no projection, listing or rewrite ever
 //! sees its records again — and a member may hold them or may have refused
-//! them on arrival (§6.5), so what remains of it is its tombstone.
+//! them on arrival (§6.5), so what remains of it is its tombstone. A turn a
+//! tombstone retired is the same, less its declaration, which every member
+//! holds.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -59,6 +61,12 @@ impl Substrate {
             );
             if let Some(decl) = &s.decl {
                 let _ = writeln!(out, "  decl {} {:?}", id(&ids.decl), decl);
+            }
+            // A retired turn's values are dead at read like a dead timeline's:
+            // a member may hold them or may have refused them on arrival, and
+            // what remains of the turn is its declaration (§6.5).
+            if matches!(&s.decl, Some(StreamDecl::Turn(t)) if self.is_turn_stream_retired(key, t)) {
+                continue;
             }
             for (idx, loc) in &s.chunks {
                 let cid = ids.chunks.get(idx).copied().unwrap_or_default();

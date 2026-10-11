@@ -35,6 +35,8 @@ pub mod chunk_window_integrity;
 pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
+#[cfg(test)]
+mod convergence_tests;
 pub mod deleted;
 pub mod elevate;
 #[cfg(test)]
