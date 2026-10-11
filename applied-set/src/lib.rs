@@ -24,9 +24,30 @@ impl OriginApplied {
         self.through
     }
 
+    /// The highest covered `oseq`: the top of the last range above
+    /// [`Self::through`], or `through` itself.
+    pub fn top(&self) -> u64 {
+        self.above
+            .iter()
+            .next_back()
+            .map_or(self.through, |(_, end)| *end)
+    }
+
     /// The covered ranges above [`Self::through`], in order.
     pub fn ranges_above(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.above.iter().map(|(s, e)| (*s, *e))
+    }
+
+    /// The uncovered ranges below [`Self::top`], in order, as inclusive
+    /// `(start, end)`.
+    pub fn gaps(&self) -> Vec<(u64, u64)> {
+        let mut gaps = Vec::with_capacity(self.above.len());
+        let mut next = self.through + 1;
+        for (s, e) in self.ranges_above() {
+            gaps.push((next, s - 1));
+            next = e + 1;
+        }
+        gaps
     }
 
     pub fn contains(&self, oseq: u64) -> bool {
@@ -90,6 +111,50 @@ impl OriginApplied {
         }
         o
     }
+
+    /// One origin's coverage as its top and the gaps below it — the form a
+    /// `HAVE` carries.
+    pub fn from_top_and_gaps(
+        top: u64,
+        gaps: impl IntoIterator<Item = (u64, u64)>,
+    ) -> OriginApplied {
+        let mut o = OriginApplied::default();
+        let mut next = 1;
+        for (s, e) in gaps {
+            if s > next {
+                o.insert_range(next, s - 1);
+            }
+            next = e.saturating_add(1);
+        }
+        if top >= next {
+            o.insert_range(next, top);
+        }
+        o
+    }
+
+    /// Whether this coverage holds an `oseq` `other` does not.
+    pub fn holds_beyond(&self, other: &OriginApplied) -> bool {
+        if self.top() == 0 {
+            return false;
+        }
+        if !other.contains_range(1, self.through) {
+            return true;
+        }
+        self.ranges_above()
+            .any(|(s, e)| !other.contains_range(s, e))
+    }
+
+    /// Whether every `oseq` in `start..=end` is covered.
+    pub fn contains_range(&self, start: u64, end: u64) -> bool {
+        if start > end || end <= self.through {
+            return true;
+        }
+        let start = start.max(self.through + 1);
+        self.above
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(s, e)| *s <= start && *e >= end)
+    }
 }
 
 /// Every origin's coverage.
@@ -128,6 +193,11 @@ impl AppliedSet {
         self.origins.get(&origin).map_or(0, OriginApplied::through)
     }
 
+    /// `origin`'s coverage, when this set holds any of it.
+    pub fn origin(&self, origin: u64) -> Option<&OriginApplied> {
+        self.origins.get(&origin)
+    }
+
     /// Every origin's coverage, in origin order.
     pub fn origins(&self) -> impl Iterator<Item = (u64, &OriginApplied)> + '_ {
         self.origins.iter().map(|(o, a)| (*o, a))
@@ -147,6 +217,18 @@ impl AppliedSet {
     /// Set `origin`'s coverage outright — what a persisted record says.
     pub fn set_origin(&mut self, origin: u64, applied: OriginApplied) {
         self.origins.insert(origin, applied);
+    }
+
+    /// The origins of which this set holds an `oseq` `other` does not, in
+    /// origin order: what a member holding `other` catches up on from the
+    /// member holding this one (§7.5).
+    pub fn origins_beyond(&self, other: &AppliedSet) -> Vec<u64> {
+        let empty = OriginApplied::default();
+        self.origins
+            .iter()
+            .filter(|(origin, mine)| mine.holds_beyond(other.origins.get(origin).unwrap_or(&empty)))
+            .map(|(origin, _)| *origin)
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -227,5 +309,41 @@ mod tests {
         assert_eq!(ab.through(7), 6);
         assert!(ab.contains(7, 9) && !ab.contains(7, 8));
         assert!(ab.contains(8, 2) && !ab.contains(8, 1));
+    }
+
+    /// Top and gaps are the coverage seen from above, and round-trip.
+    #[test]
+    fn top_and_gaps_describe_the_same_coverage() {
+        let o = OriginApplied::from_parts(3, [(6, 7), (10, 10)]);
+        assert_eq!(o.top(), 10);
+        assert_eq!(o.gaps(), vec![(4, 5), (8, 9)]);
+        assert_eq!(OriginApplied::from_top_and_gaps(10, o.gaps()), o);
+        let full = OriginApplied::from_parts(4, []);
+        assert_eq!(full.gaps(), vec![]);
+        assert_eq!(OriginApplied::from_top_and_gaps(4, []), full);
+        assert_eq!(
+            OriginApplied::from_top_and_gaps(0, []),
+            OriginApplied::default()
+        );
+        let leading = OriginApplied::from_top_and_gaps(5, [(1, 2)]);
+        assert_eq!(parts(&leading), (0, vec![(3, 5)]));
+    }
+
+    /// Comparing two sets names exactly the origins one holds more of.
+    #[test]
+    fn origins_beyond_names_what_the_other_lacks() {
+        let mut restarted = AppliedSet::default();
+        restarted.insert_range(1, 1, 10);
+        restarted.insert_range(2, 1, 5);
+        restarted.insert(3, 7);
+        restarted.insert_range(4, 1, 2);
+        let mut peer = AppliedSet::default();
+        peer.insert_range(1, 1, 12);
+        peer.insert_range(2, 1, 4);
+        peer.insert_range(3, 1, 6);
+        peer.insert_range(4, 1, 2);
+        assert_eq!(restarted.origins_beyond(&peer), vec![2, 3]);
+        assert_eq!(peer.origins_beyond(&restarted), vec![1, 3]);
+        assert_eq!(peer.origins_beyond(&peer), Vec::<u64>::new());
     }
 }

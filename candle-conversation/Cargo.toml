@@ -14,6 +14,9 @@ license.workspace = true
 # The candle stack is forced into cuda mode through these dep features;
 # there is no longer a `cuda` Cargo feature on this crate.
 ahash = { workspace = true }
+# What a member holds of every origin — shared with the `cluster` protocol,
+# which packs it for `CATCHUP` and `HAVE`.
+applied-set = { path = "../applied-set" }
 base64 = { workspace = true }
 candle = { workspace = true, features = ["cuda"] }
 candle-kernels = { workspace = true }

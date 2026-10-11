@@ -1,0 +1,11 @@
+[package]
+name = "applied-set"
+version = "0.1.0"
+edition = "2021"
+description = "Which (origin, oseq)s a substrate member holds: per origin a version vector with gaps"
+
+# No dependencies: the substrate and the cluster protocol both name this type,
+# and neither may pull the other in — `candle-conversation` is a CUDA build, and
+# `cluster` is rebuilt whenever the workspace's sources change (its build
+# version), which nothing below it should inherit.
+[dependencies]

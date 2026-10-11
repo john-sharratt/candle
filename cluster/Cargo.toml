@@ -1,0 +1,25 @@
+[package]
+name = "cluster"
+version = "0.1.0"
+edition = "2021"
+description = "The cluster socket: frames, handshake, multiplexed streams and delivery bookkeeping (docs/replicated_substrate.md §3–§4)"
+build = "build.rs"
+
+# No candle and no CUDA: the gateway links this crate, and record bytes stay
+# opaque to it.
+[dependencies]
+applied-set = { path = "../applied-set" }
+hmac        = "0.12"
+sha2        = "0.10"
+rand        = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { version = "1", features = ["sync", "rt", "time", "macros", "io-util"] }
+
+[build-dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `test-util` for `#[tokio::test(start_paused = true)]`: the backoff and
+# keep-alive schedules are asserted on a paused clock.
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "macros", "io-util", "test-util"] }

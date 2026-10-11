@@ -14,9 +14,10 @@
 
 use std::collections::BTreeSet;
 
+use applied_set::{AppliedSet, OriginApplied};
+
 use super::super::le_reader::LeReader;
 use super::super::Result;
-use super::applied_set::{AppliedSet, OriginApplied};
 
 /// A record not written because this build does not decode its type: its
 /// identity, and its type as the header names it. A build that knows the type

@@ -1,6 +1,8 @@
 # Replicated substrate: zend, npcd and agents as members of the gateway
 
-**Status:** design, not built. **Scope:** a zend or npcd daemon started with
+**Status:** being built in §15's order. Chunk 1 (substrate identity and
+order-independent apply) and chunk 2 (the `cluster` crate's wire protocol) are built;
+chunks 3–10 are not. **Scope:** a zend or npcd daemon started with
 `--cluster https://<host or ip>` — and a new kind of member, the *agent*, a CPU machine
 that runs command-line work inside repositories — dials that web gateway over one
 WebSocket per app, proves it holds the estate's group key, and while connected *is* that
@@ -294,7 +296,8 @@ its cluster again. The member's other sockets are unaffected. Delay `d` starts a
 8 s**; each wait is drawn uniformly from `[d/2, d]` so a gateway restart does not
 reconnect every member in the same millisecond. An admission resets `d`. Keep-alive: a
 `PING` every 15 s each way; 45 s without any frame from the peer closes the socket as
-dead (Cloudflare's idle timeout is far longer than 15 s).
+dead, with 1001 (Cloudflare's idle timeout is far longer than 15 s). The handshake
+holds to the same 45 s: a peer silent that long mid-handshake is closed 4400.
 
 ### 3.3 Handshake
 
@@ -365,7 +368,14 @@ rebuild` — which the member shows on its loading page and in `/v1/status`.
   The build script reruns on `.git/HEAD`, the refs `HEAD` and `origin/main` name,
   `.git/packed-refs`, and every workspace crate's `src/`, `Cargo.toml` and the UI
   directories, but not `target/`. So `local` is accurate to the build: a binary built
-  from edited sources always says so.
+  from edited sources always says so. `local` is the first 16 hex digits of a SHA-256
+  over the three inputs; a tree with no git or no `origin/main` is count 0, hash
+  `none`, and a local build (`cluster/src/version/compute.rs`).
+
+  The version therefore changes with any edit in the workspace, and every crate that
+  links `cluster` rebuilds with it. Nothing below the daemons may link it for that
+  reason: the applied set both the substrate and the protocol name lives in its own
+  dependency-free crate, `applied-set`.
 - **A build with `local` set is a *local build*** (§3.10). The floor, the grace period
   and the upgrades compare `count` only.
 - **The floor is per app.** Other apps are untouched (D1).
@@ -877,12 +887,12 @@ u8 kind | u8 flags | u32 stream (LE) | body…        (WebSocket supplies the le
 | `CAPACITY` | `{ state, power, idle, slots_free, decodes, prefill_backlog, vram_free_mib, cores, load }` every 1 s or on change | control |
 | `PING` / `PONG` | 8-byte nonce | control |
 | `ROUTES` | the member's dispatch table (§5.2) | control |
-| `CLAIM` / `UNCLAIM` | `{ key, epoch }` — this member serves `key` (a sticky key or a lease), or has let it go (§5.4, §9) | control |
+| `CLAIM` / `UNCLAIM` | `{ key, epoch }` / `{ key, epoch, through }` — this member serves `key` (a sticky key or a lease), or has let it go with its own `oseq` at `through` (§5.4, §9) | control |
 | `PREPARE` / `PROMISE` / `NACK` | `{ key, ballot }` / `{ key, ballot, accepted, reply_to }` / `{ key, promised, reply_to }` — Paxos phase 1 between members: a proposer asking, each member answering as an acceptor (§5.9) | control |
 | `PROPOSE` / `ACCEPTED` | `{ key, ballot, value }` / `{ key, ballot, reply_to }` — Paxos phase 2 | control |
 | `RELEASE` | `{ key, ballot, through }` — a lease holder handing the lease back (§5.9, §9.6) | control |
 | `BUILD_OFFER` / `BUILD_HAVE` | `{ build, artifacts: [{ kind, platform, size, sha256 }] }` — a candidate offering its build, and a member that has verified an artifact offering it in turn (§3.9) | control |
-| `BUILD_FETCH` / `BUILD_CHUNK` | `{ artifact, offset, reply_to }` / `{ artifact, offset, bytes ≤ 1 MiB }` — resumable artifact transfer | control / catch-up |
+| `BUILD_FETCH` / `BUILD_CHUNK` | `{ artifact, offset, from_node, reply_to }` / `{ artifact, offset, reply_to, bytes ≤ 1 MiB }` — resumable artifact transfer from the member `from_node` names | control / catch-up |
 | `VERDICT` | `{ build, result: pass \| fail \| no_opinion, figures }` — gateway → candidate: this gateway's certification verdict (§3.8) | control |
 | `PULSE` | `{ world, kind, body }` — a transient world event: never persisted, no `oseq`, no retransmit (§9.1) | ordered, dropped first under pressure |
 | `COORD` | the member's coordination state, for the status page: mode, generation, grants, leases, claims, catch-up, outbox, tombstones, clock (§12.1) | control |
@@ -905,6 +915,61 @@ codec (`record.rs:777-914`); a record inside `EVENT` is carried as the record's 
 encoded header line and payload, unpadded. The codec lives in the new `cluster` crate (no
 CUDA): the gateway never decodes a record — `web` cannot link `candle-conversation`
 without becoming a CUDA build — so the record bytes stay opaque to it.
+
+**Frame bodies, exactly** (`cluster/src/frame/`). Primitives: integers little-endian;
+`blob` = `u32` length + bytes; `str` = a blob of UTF-8; `list<T>` = `u32` count + items;
+`opt<T>` = `u8` 0, or 1 and the value; `bool` = `u8` 0 or 1. Anything else — a short body,
+a byte past the end, a `bool` of 2, an unknown kind, a stream id on a kind that takes
+none (or none on one that does), a flag on any kind but `EVENT` — is refused, never
+misread, and on an admitted socket closes it 4400.
+
+| Kind | Tag | Body |
+|---|---|---|
+| `HELLO` | 1 | `u16 proto` · `str app` · `u64 node` · `str host` · `build` · `opt<model>` · `u32 power` · `list<str> repos` · `u64 now_ms` · `[32] nonce` |
+| `CHALLENGE` | 2 | `[32] nonce` · `[32] proof` |
+| `PROVE` | 3 | `[32] proof` |
+| `ADMIT` | 4 | `u64 session` · `list<member>` · `list<claim>` · `u32 floor_count` · `str floor_hash` · `bool routes_wanted` · `u64 own_applied_through` |
+| `MEMBERS` | 10 | `u64 epoch` · `list<member>` |
+| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` |
+| `PING` / `PONG` | 12 / 13 | `[8] nonce` |
+| `ROUTES` | 14 | `blob table` (§5.2's encoding) |
+| `CLAIM` | 15 | `blob key` · `epoch` |
+| `UNCLAIM` | 16 | `blob key` · `epoch` · `u64 through` |
+| `COORD` | 17 | `blob state` (§12.1's encoding) |
+| `PREPARE` | 20 | `blob key` · `ballot` |
+| `PROMISE` | 21 | `blob key` · `ballot` · `opt<ballot · blob value>` accepted · `u64 reply_to` |
+| `NACK` | 22 | `blob key` · `ballot promised` · `u64 reply_to` |
+| `PROPOSE` | 23 | `blob key` · `ballot` · `blob value` |
+| `ACCEPTED` | 24 | `blob key` · `ballot` · `u64 reply_to` |
+| `RELEASE` | 25 | `blob key` · `ballot` · `u64 through` |
+| `BUILD_OFFER` / `BUILD_HAVE` | 30 / 31 | `build` · `list<str kind · str platform · u64 size · [32] sha256>` |
+| `BUILD_FETCH` | 32 | `[32] artifact` · `u64 offset` · `u64 from_node` · `u64 reply_to` |
+| `BUILD_CHUNK` | 33 | `[32] artifact` · `u64 offset` · `u64 reply_to` · `blob bytes` (≤ 1 MiB) |
+| `VERDICT` | 34 | `build` · `u8 result` (0 pass, 1 fail, 2 no opinion) · `blob figures` |
+| `PULSE` | 40 | `str world` · `str kind` · `blob body` |
+| `OPEN` | 50 | `str target` |
+| `DATA` | 51 | the bytes, unprefixed, 1 to 64 KiB |
+| `WINDOW` | 52 | `u32 credit` (nonzero) |
+| `FIN` / `RESET` | 53 / 54 | — |
+| `EVENT` | 60 | `u64 origin` · `u64 oseq` · `u32 total` · `u32 offset` · [`u64 reply_to` when `ADDRESSED`] · the fragment's bytes, 1 B to 1 MiB, never past `total` |
+| `RECEIPT` | 61 | `u64 through` |
+| `ACK` | 62 | `list<u64 origin · u64 applied_through>` |
+| `CATCHUP` | 63 | `u64 request` · `u64 reply_to` · `opt<u64> to` · `applied` since |
+| `HEADERS` | 64 | `u64 request` · `u64 reply_to` · `u64 origin` · `u64 from` · `u64 to` · `list<u64 oseq · opt<blob> deleted_entry>` gone · `list<record header>`; every `oseq` within `from..=to` |
+| `FETCH` | 65 | `u64 request` · `u64 reply_to` · `u64 from_node` · `u64 origin` · `list<u64> oseqs` |
+| `DONE` | 66 | `u64 request` · `u64 reply_to` |
+| `HAVE` | 67 | `u64 request` · `u64 reply_to` · `applied` |
+
+where `build` = `u32 count · str hash · str local`; `model` = `str arch · [32] weights ·
+[32] tokenizer · str rope · str describe`; `member` = `u64 node · str host · str app ·
+build · u32 weight · u8 state · u64 high_water`, the state 0 loading, 1 ready,
+2 upgrading, 3 fault, 4 draining; `claim` = `blob key · epoch`; `epoch` = `u64 ms ·
+u64 node`; `ballot` = `u64 round · u64 node`; a record header = `u64 oseq · u8 type ·
+u64 stream_id · u64 chunk_index · u32 len · [16] digest` (45 bytes); and `applied` is
+§7.5's packing. `EVENT`'s flags are `CATCHUP` = `0x01` and `ADDRESSED` = `0x02`. The
+stream field is chosen by whoever opens the stream: odd ids for the gateway, even for a
+member, so the two never pick the same one. A stream's reader returns credit in a
+`WINDOW` once 64 KiB of it is consumed.
 
 ### 4.2 Interleaving
 
@@ -2244,10 +2309,17 @@ directions, and does so **only on the first admission after the process starts**
 
    ```
    u16 n_origins
-   repeat: u64 origin | varint applied_through | varint n_gaps | n_gaps × (varint start_delta, varint len)
+   repeat: u64 origin | varint top | varint n_gaps | n_gaps × (varint start_delta, varint len)
    ```
 
-   A member that is caught up sends about 10 bytes per origin.
+   `top` is the origin's highest covered `oseq` and the gaps are the uncovered ranges
+   below it, ascending; `start_delta` is a gap's start less the end of the gap before
+   it (zero before the first), and both it and `len` are at least one. Varints are
+   unsigned LEB128, minimal. Origins ascend and none repeats, so one set has one
+   spelling and any other is refused. A member that is caught up sends about 10 bytes
+   per origin. `CATCHUP.since` is packed the same way. The type both ends hold — a
+   `through` and the covered ranges above it — is the `applied-set` crate, shared by
+   the substrate and the `cluster` crate.
 3. **Each other member catches up from it.** A member that receives the `HAVE` compares
    it with its own applied set. For any origin where the restarted member holds more,
    it runs §7.2's exchange against the restarted member directly: a `CATCHUP` with

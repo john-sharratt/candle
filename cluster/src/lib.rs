@@ -1,0 +1,27 @@
+//! The cluster socket (`docs/replicated_substrate.md` §3–§4): what members and
+//! gateways say to each other, and how one WebSocket carries all of it.
+//!
+//! - [`frame`]: every frame kind, encoded to exact bytes, and the applied set's
+//!   packing.
+//! - [`handshake`]: the mutual HMAC challenge over the group key.
+//! - [`session`]: one admitted socket — the three-lane writer, virtual
+//!   connections with flow control, `EVENT` reassembly and keep-alive.
+//! - [`dial`] and [`backoff`]: a member's reconnect loop.
+//! - [`delivery`]: the sender's outbox (unsent, in flight, received) and the
+//!   frame counting `RECEIPT`s refer to.
+//! - [`version`]: this build's `count`, `hash` and `local`.
+//!
+//! No candle and no CUDA: the gateway links this crate, and a record inside an
+//! `EVENT` stays opaque bytes here.
+
+pub mod backoff;
+pub mod close;
+pub mod delivery;
+pub mod dial;
+pub mod fragment;
+pub mod frame;
+pub mod handshake;
+pub mod pipe;
+pub mod session;
+pub mod version;
+pub mod wire;

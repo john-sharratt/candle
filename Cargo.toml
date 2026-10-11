@@ -1,6 +1,8 @@
 [workspace]
 members = [
+    "applied-set",
     "candle-conversation",
+    "cluster",
     "candle-core",
     "zend",
     "candle-datasets",
@@ -203,6 +205,15 @@ debug = true
 # unoptimised — measured: 28.8s unoptimised, 14.9s with `dev` alone, 4.2s with
 # both.
 [profile.dev.package.candle-core]
+opt-level = 2
+
+# The cluster socket's codec and multiplexer: its burst harnesses
+# (`docs/replicated_substrate.md` §14.2) measure throughput, and at
+# `opt-level = 0` they would measure rustc instead.
+[profile.dev.package.cluster]
+opt-level = 2
+
+[profile.test.package.cluster]
 opt-level = 2
 
 [profile.dev.package.candle-nn]

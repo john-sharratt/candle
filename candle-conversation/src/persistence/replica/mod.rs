@@ -9,7 +9,6 @@
 //! - The **location index** ([`LocationIndex`]) finds a record by its
 //!   identity, wherever maintenance has moved it.
 
-mod applied_set;
 mod location_index;
 mod payload;
 
