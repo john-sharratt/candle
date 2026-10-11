@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::adoption::Adoption;
 use super::content_hash::snapshot_stream_id;
 use super::deleted::{DeletedPayload, DeletedTimeline};
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
@@ -33,14 +34,14 @@ use super::log_file::LogFile;
 use super::manifest::{encode_conv_state_payload, Manifest, RecordLoc};
 use super::rebase::RebaseMap;
 use super::record::{
-    decode_header, encode_record, encode_record_written, DebugIdPayload, DistillMode,
-    DistillPayload, RecordHeader, RecordType, SectionTombstonePayload, TombstonePayload,
-    TurnCouplingPayload,
+    decode_header, decode_record, encode_record, encode_record_written, DebugIdPayload,
+    DistillMode, DistillPayload, RecordHeader, RecordType, SectionTombstonePayload,
+    TombstonePayload, TurnCouplingPayload,
 };
 use super::replica::ReplicaPayload;
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::stamped_locs::StampedLocs;
-use super::streams::StreamId;
+use super::streams::{StreamDecl, StreamId};
 use super::stripes::{stripes, MAX_STRIPE_BYTES};
 use super::tombstone_expiry::TombstoneExpiry;
 use super::vfs::{carried, VfsIndex};
@@ -441,7 +442,18 @@ pub fn collect_live_records(
     // Per-stream live records — sourced from the substrate's in-RAM
     // stream index, the authoritative source. Every writer's stream is
     // carried: two members' turn N share a stream id and are both kept.
-    for (key, entry) in substrate.all_physical_streams() {
+    //
+    // In a fixed order — each timeline's turns in turn order, then every
+    // other stream by id — so two compactions of one store write the same
+    // file, and an adoption (`super::adoption`), which stamps records in the
+    // order they are written, stamps a timeline's declarations rising with
+    // the index they were written at: every turn keeps its position.
+    let mut streams: Vec<_> = substrate.all_physical_streams().collect();
+    streams.sort_by_key(|(key, entry)| match &entry.decl {
+        Some(StreamDecl::Turn(t)) => (0, t.timeline_id, t.turn_index, *key),
+        _ => (1, 0, 0, *key),
+    });
+    for (key, entry) in streams {
         let stream_id = key.stream_id;
         // Distillation degree for this turn's timeline (None = not distilled).
         // Both modes drop the KV chunks (the bulk of the on-disk cost);
@@ -462,38 +474,37 @@ pub fn collect_live_records(
             continue;
         }
         let mut turn_dead = false;
-        let distill: Option<DistillMode> =
-            if let Some(crate::persistence::streams::StreamDecl::Turn(t)) = &entry.decl {
-                // A tombstoned timeline's records go wholesale — UNLESS it is
-                // also distilled. That pair is the provenance corpus: calibration
-                // exemplars are archived, distilled `ProvenanceOnly`, and then
-                // tombstoned so they leave the live gather, while their
-                // `WideQSig`s and projection events keep answering the belief
-                // scan. Dropping them here erased the very records the tombstone
-                // exists to preserve, and — because the `Distilled` marker went
-                // with them — the next reload saw a content-declaring turn with
-                // no KV and no distill exemption, i.e. `TurnIntegrity::MissingKv`.
-                // Integrity repair then tombstoned it "for corruption", the
-                // calibration resume filter could no longer see it, and the case
-                // regenerated: ~196 exemplars rebuilt per boot, forever.
-                //
-                // So distilled timelines fall through to the per-mode retention
-                // below whether or not they are tombstoned; only an undistilled
-                // tombstone is dropped outright.
-                if tombstoned.contains(&t.timeline_id) && !distilled.contains_key(&t.timeline_id) {
-                    continue;
-                }
-                // A turn-scoped tombstone on a LIVE timeline sheds the turn's
-                // bulk records (chunks/tokens/sig/projections) but keeps its
-                // StreamDecl: the reload restores the turn as an empty
-                // placeholder from the decl, preserving the timeline's turn
-                // indexing (a fully-dropped decl would renumber every later
-                // turn away from its persisted stream ids).
-                turn_dead = substrate.is_turn_stream_retired(key, t);
-                distilled.get(&t.timeline_id).copied()
-            } else {
-                None
-            };
+        let distill: Option<DistillMode> = if let Some(StreamDecl::Turn(t)) = &entry.decl {
+            // A tombstoned timeline's records go wholesale — UNLESS it is
+            // also distilled. That pair is the provenance corpus: calibration
+            // exemplars are archived, distilled `ProvenanceOnly`, and then
+            // tombstoned so they leave the live gather, while their
+            // `WideQSig`s and projection events keep answering the belief
+            // scan. Dropping them here erased the very records the tombstone
+            // exists to preserve, and — because the `Distilled` marker went
+            // with them — the next reload saw a content-declaring turn with
+            // no KV and no distill exemption, i.e. `TurnIntegrity::MissingKv`.
+            // Integrity repair then tombstoned it "for corruption", the
+            // calibration resume filter could no longer see it, and the case
+            // regenerated: ~196 exemplars rebuilt per boot, forever.
+            //
+            // So distilled timelines fall through to the per-mode retention
+            // below whether or not they are tombstoned; only an undistilled
+            // tombstone is dropped outright.
+            if tombstoned.contains(&t.timeline_id) && !distilled.contains_key(&t.timeline_id) {
+                continue;
+            }
+            // A turn-scoped tombstone on a LIVE timeline sheds the turn's
+            // bulk records (chunks/tokens/sig/projections) but keeps its
+            // StreamDecl: the reload restores the turn as an empty
+            // placeholder from the decl, preserving the timeline's turn
+            // indexing (a fully-dropped decl would renumber every later
+            // turn away from its persisted stream ids).
+            turn_dead = substrate.is_turn_stream_retired(key, t);
+            distilled.get(&t.timeline_id).copied()
+        } else {
+            None
+        };
         let keep_chunks = !turn_dead && distill.is_none();
         let keep_tokens = !turn_dead && distill != Some(DistillMode::ProvenanceOnly);
         let keep_sig = !turn_dead && distill != Some(DistillMode::TextOnly);
@@ -996,10 +1007,15 @@ pub fn collect_live_records(
 /// flushed incrementally so the whole new log is never resident at once.
 /// Returns the open [`LogFile`] and its (singleton-only) manifest. `path` is
 /// removed first if it already exists.
+///
+/// With `adoption`, a record with no identity is stamped as it is written
+/// ([`Adoption::restamp`]) — a read-back one decoded and encoded again under
+/// its new header — and every other record is written as without.
 pub fn write_compacted_log(
     path: &Path,
     items: &[CompactItem],
     read_into: &mut dyn FnMut(SegmentId, u64, &mut [u8]) -> Result<()>,
+    mut adoption: Option<&mut Adoption>,
 ) -> Result<(LogFile, Manifest)> {
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -1043,7 +1059,14 @@ pub fn write_compacted_log(
             CompactItem::Synth { header, payload } => {
                 let mut h = *header;
                 h.payload_len = payload.len() as u64;
-                let (written, bytes) = encode_record_written(&h, payload);
+                let stamped = match adoption.as_deref_mut() {
+                    Some(a) => a.restamp(&h, payload)?,
+                    None => None,
+                };
+                let (written, bytes) = match &stamped {
+                    Some((h, payload)) => encode_record_written(h, payload),
+                    None => encode_record_written(&h, payload),
+                };
                 let offset = log.stage(&bytes);
                 pending.push(IndexEntry::from_header(
                     &written,
@@ -1102,14 +1125,26 @@ pub fn write_compacted_log(
                         let CompactItem::Raw { record_size, .. } = it else {
                             unreachable!("a Raw run holds only Raw items");
                         };
-                        let sz = *record_size as usize;
-                        let raw = &buf[within..within + sz];
+                        let read = *record_size as usize;
+                        let raw = &buf[within..within + read];
+                        within += read;
                         // Indexed from the copied record's own header, so the copy
-                        // keeps the identity and digest it was written with.
+                        // keeps the identity and digest it was written with — or,
+                        // adopted, the identity it is stamped with here.
                         let (header, _) = decode_header(raw)?;
+                        let stamped = match adoption.as_deref_mut() {
+                            Some(a) if header.identity().is_none() => {
+                                let (_, payload, _) = decode_record(raw)?;
+                                a.restamp(&header, payload)?
+                                    .map(|(h, p)| encode_record_written(&h, &p))
+                            }
+                            _ => None,
+                        };
+                        let (header, staged, sz) = match &stamped {
+                            Some((written, bytes)) => (*written, log.stage(bytes), bytes.len()),
+                            None => (header, log.stage(raw), read),
+                        };
                         let header = &header;
-                        let staged = log.stage(raw);
-                        within += sz;
                         // Singletons resolve from the manifest (the substrate
                         // replay never rebuilds them); `Chunk` / `Tokens` are
                         // substrate-indexed and never enter the manifest.
@@ -1394,9 +1429,13 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let (mut new_log, _after_manifest) =
-            write_compacted_log(&path, &live, &mut |_s, off, dest| mem.read_into(off, dest))
-                .unwrap();
+        let (mut new_log, _after_manifest) = write_compacted_log(
+            &path,
+            &live,
+            &mut |_s, off, dest| mem.read_into(off, dest),
+            None,
+        )
+        .unwrap();
 
         // The compacted log re-walked into a substrate has the same
         // live streams + chunks as the source.

@@ -1552,10 +1552,25 @@ with no identity at all (every identity field zero).
   own origin knows it. An origin's `oseq`s are dense, so the index is a vector per
   origin of one word per record: the segment and the record's offset in 4 KiB blocks,
   the record's size read from its header when it is read.
-- **A substrate written before this design** has no origins. Opening one with `--cluster`
-  runs the existing full `compact()` (`persistence/mod.rs:2169-2344`) once, which
-  rewrites every record with this node's origin and fresh `oseq`s. There is no mixed
-  mode. **Two substrates that were once copies of each other must not both be adopted
+- **A substrate written before this design** has no origins. Its first writable open
+  runs the full `compact()` once, stamping as it writes (`persistence/adoption.rs`):
+  every record an origin writes takes this node's origin, a fresh `oseq`, the current
+  generation and a clock reading. There is no mixed mode — a record with no identity
+  cannot be named, fetched or ordered against another member's, and the file events'
+  payloads changed form with their naming (§6.2, VFS) — so adoption does not wait for
+  `--cluster`: it runs before anything is served, and the store opens again.
+  - The rewrite writes each timeline's turns in turn order and labels in creation
+    order, so the stamps keep every ranking the store had: each turn stays at its
+    index, and each conversation at its place in the listing.
+  - A section's records take its declaration's new `oseq` as their generation; a turn
+    tombstone names this node as the turn's writer; file events and their tombstones
+    gain this node as their writer.
+  - Local housekeeping keeps no identity: the header index, the model binding, the
+    branch-checkpoint cache, and the member's `Replica`, `Deleted` and `Rebase`
+    records.
+  - The trigger is a record an origin writes that carries no identity. A tombstone
+    without one is not a trigger: this member writes its repair tombstones that way
+    (§6.5). **Two substrates that were once copies of each other must not both be adopted
   this way.** Each would claim the shared history as its own, and every member would
   hold that history twice under two origins. A machine joins from a fresh substrate and
   fetches the group's history by catch-up (§7.3). Only the first member of a group

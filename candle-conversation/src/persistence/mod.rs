@@ -26,6 +26,9 @@
 //! [`SubstratePersistence`] is the public API tying them together.
 
 pub mod accounting;
+pub mod adoption;
+#[cfg(test)]
+mod adoption_tests;
 pub mod appended;
 pub mod chunk_plan;
 pub mod chunk_window_integrity;
@@ -89,6 +92,7 @@ use thiserror::Error;
 use crate::substrate::{Substrate, TurnMark};
 
 use accounting::RecordAccounting;
+use adoption::Adoption;
 use appended::Appended;
 use candle::direct_io::DirectFile;
 use chunk_plan::ChunkedReadPlan;
@@ -515,6 +519,9 @@ pub struct SubstratePersistence {
     /// The generations fixed for what this node wrote cut off (§6.7), applied
     /// to its own records wherever it reads them back.
     rebases: RebaseMap,
+    /// The open met a record written before identities: the store is to be
+    /// adopted ([`adoption`]).
+    predates_identities: bool,
 }
 
 /// What [`SubstratePersistence::metadata_locs`] keys a record by: its type, the
@@ -792,13 +799,36 @@ impl SubstratePersistence {
     /// afterwards because the manifest's per-entity fields are
     /// `#[serde(skip)]` and the substrate is the authoritative
     /// in-RAM index.
+    ///
+    /// A store written before identities is adopted here, once ([`adoption`]).
     pub fn open_in_with_substrate(
         dir: &Path,
         substrate: &mut Substrate,
     ) -> Result<SubstratePersistence> {
-        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], false, |entry| {
-            substrate.apply_walker_entry(entry)
-        })
+        Self::open_adopting(&dir.join(SUBSTRATE_DIR), substrate, |_| {})
+    }
+
+    /// The writable open with a substrate: walk the store into `substrate`
+    /// and `sink`, and when it was written before identities, adopt it and
+    /// open it again into a fresh substrate. `sink` sees the walk once: the
+    /// adoption changes record headers and the payloads that name a writer —
+    /// turn tombstones and file events — and leaves every other payload as it
+    /// was.
+    fn open_adopting<F>(dir: &Path, substrate: &mut Substrate, mut sink: F) -> Result<Self>
+    where
+        F: FnMut(&WalkEntry),
+    {
+        let mut sp = Self::from_dir_with_sink(dir, &[], false, |entry| {
+            substrate.apply_walker_entry(entry);
+            sink(entry);
+        })?;
+        if !sp.predates_identities {
+            return Ok(sp);
+        }
+        sp.adopt(substrate)?;
+        drop(sp);
+        *substrate = Substrate::new();
+        Self::from_dir_with_sink(dir, &[], false, |entry| substrate.apply_walker_entry(entry))
     }
 
     /// As [`Self::open_in_with_substrate`], but **read-only**: the segment set
@@ -832,19 +862,18 @@ impl SubstratePersistence {
     /// character where this costs none: the bytes are already in hand.
     ///
     /// The sink sees records in log order, so last-writer-wins is simply the
-    /// last value the sink is handed for a key.
+    /// last value the sink is handed for a key. A store written before
+    /// identities is adopted here, once, after the sink has seen it
+    /// ([`Self::open_adopting`]).
     pub fn open_in_with_substrate_and_sink<F>(
         dir: &Path,
         substrate: &mut Substrate,
-        mut sink: F,
+        sink: F,
     ) -> Result<SubstratePersistence>
     where
         F: FnMut(&WalkEntry),
     {
-        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], false, |entry| {
-            substrate.apply_walker_entry(entry);
-            sink(entry);
-        })
+        Self::open_adopting(&dir.join(SUBSTRATE_DIR), substrate, sink)
     }
 
     /// Open over an ordered list of paths. The last entry is the active,
@@ -929,8 +958,10 @@ impl SubstratePersistence {
         let rebases = RefCell::new(RebaseMap::default());
         let held: RefCell<Vec<WalkEntry>> = RefCell::new(Vec::new());
         let draining = Cell::new(false);
+        let mut predates = false;
         let mut walk = |entry: &WalkEntry| {
             let h = &entry.record.header;
+            predates |= adoption::predates_identities(h);
             if h.record_type == RecordType::Rebase {
                 if let Ok(map) = RebaseMap::decode(&entry.record.payload) {
                     rebases.borrow_mut().merge(&map);
@@ -1054,6 +1085,7 @@ impl SubstratePersistence {
             replica,
             locations,
             rebases,
+            predates_identities: predates,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -2807,6 +2839,37 @@ impl SubstratePersistence {
         substrate: &mut Substrate,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<()> {
+        self.rewrite(substrate, progress, None)
+    }
+
+    /// Adopt a store written before identities (§6.2, [`adoption`]): one
+    /// compaction stamps every record that carries none as this node's own.
+    /// Run by the first writable open of such a store, which then opens it
+    /// again; a no-op on a store that needs none.
+    fn adopt(&mut self, substrate: &mut Substrate) -> Result<()> {
+        if !self.predates_identities {
+            return Ok(());
+        }
+        tracing::info!(
+            target: "candle_conversation::persistence::identity",
+            node = format!("{:016x}", self.node()),
+            dir = %self.dir().display(),
+            "this store was written before records carried an identity — rewriting it once, \
+             with every record stamped as this node's own"
+        );
+        let mut adoption = Adoption::new(self.minter.clone());
+        self.rewrite(substrate, None, Some(&mut adoption))?;
+        self.predates_identities = false;
+        Ok(())
+    }
+
+    /// [`Self::compact`], stamping as it writes when `adoption` is given.
+    fn rewrite(
+        &mut self,
+        substrate: &mut Substrate,
+        progress: Option<&dyn Fn(usize, usize)>,
+        adoption: Option<&mut Adoption>,
+    ) -> Result<()> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
@@ -2889,9 +2952,12 @@ impl SubstratePersistence {
         let scratch = dir.join(".compact");
         let (new_log, new_manifest) = {
             let segments = &mut self.segments;
-            compaction::write_compacted_log(&scratch, &live, &mut |seg, off, dest| {
-                segments.read_into(seg, off, dest)
-            })?
+            compaction::write_compacted_log(
+                &scratch,
+                &live,
+                &mut |seg, off, dest| segments.read_into(seg, off, dest),
+                adoption,
+            )?
         };
         report(3);
         self.segments.adopt_compacted(new_log, &scratch)?;

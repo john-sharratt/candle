@@ -21,9 +21,11 @@ pub use writes::{VfsAppend, VfsKill, VfsWrite};
 use std::num::NonZeroU64;
 
 use super::accounting::RecordAccounting;
+use super::adoption::unnamed_tombstone_kills;
 use super::manifest::RecordLoc;
-use super::record::{RecordType, TombstonePayload};
+use super::record::{RecordHeader, RecordType, TombstonePayload};
 use super::walker::WalkEntry;
+use super::Result;
 use crate::projection::TimelineId;
 use crate::substrate::Substrate;
 
@@ -78,9 +80,9 @@ pub(super) fn record_vfs_loc(
                 accounting.retire(RecordType::VfsEvent, h.stream_id, id);
             }
         }
-        RecordType::VfsTombstone => match VfsTombstonePayload::decode(&entry.record.payload) {
-            Ok(p) => {
-                for killed in index.record_tombstone(h.stream_id, id, loc, &p.kills) {
+        RecordType::VfsTombstone => match kills_of(h, &entry.record.payload) {
+            Ok(kills) => {
+                for killed in index.record_tombstone(h.stream_id, id, loc, &kills) {
                     accounting.retire(RecordType::VfsEvent, h.stream_id, killed);
                 }
             }
@@ -99,6 +101,17 @@ pub(super) fn record_vfs_loc(
             }
         }
         _ => {}
+    }
+}
+
+/// The events the file-event tombstone `h` heads kills. One written before
+/// events were named by writer, which carries no identity, names them as the
+/// store does until its adoption rewrites it (`super::adoption`).
+fn kills_of(h: &RecordHeader, payload: &[u8]) -> Result<Vec<VfsEventId>> {
+    match VfsTombstonePayload::decode(payload) {
+        Ok(p) => Ok(p.kills),
+        Err(e) if h.identity().is_none() => unnamed_tombstone_kills(payload).ok_or(e),
+        Err(e) => Err(e),
     }
 }
 
