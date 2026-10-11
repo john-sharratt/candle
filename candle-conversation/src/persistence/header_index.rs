@@ -24,7 +24,7 @@
 //! u64  prev_offset        (file offset of the previous HeaderIndex; 0 = chain start)
 //! u64  prev_size          (padded on-disk size of that record; 0 = chain start)
 //! u32  n_entries
-//! n × 38-byte entry:
+//! n × 94-byte entry:
 //!   u8   record_type tag  (RecordType::tag)
 //!   u8   format
 //!   u32  token_count
@@ -33,8 +33,21 @@
 //!   u64  offset           (file offset of the digested record)
 //!   u32  record_size      (padded on-disk size)
 //!   u32  payload_len      (unpadded payload length)
+//!   u64  origin           (the record's identity — RecordIdentity)
+//!   u64  oseq
+//!   u64  gen
+//!   u64  epoch
+//!   u64  hlc
+//!   u64  digest.lo        (ContentHash over the payload)
+//!   u64  digest.hi
 //! ```
+//!
+//! The identity rides in the digest because recovery replays a digested
+//! record without reading it: a replayed record must know who wrote it and
+//! where it ranks exactly as a walked one does
+//! (`docs/replicated_substrate.md` §6.2).
 
+use super::content_hash::ContentHash;
 use super::record::{Record, RecordHeader, RecordType};
 use super::segment::SegmentId;
 use super::walker::WalkEntry;
@@ -42,11 +55,12 @@ use super::{PersistenceError, Result};
 
 /// Version stamp of the `HeaderIndex` payload encoding. A reader that
 /// sees a different version falls back to the forward walk rather
-/// than guessing at the layout.
-pub const INDEX_PAYLOAD_VERSION: u32 = 1;
+/// than guessing at the layout — so a chain written before identities is
+/// walked once, and the next segment rotation or compaction writes it anew.
+pub const INDEX_PAYLOAD_VERSION: u32 = 2;
 
 /// Byte size of one encoded digest entry.
-pub const INDEX_ENTRY_BYTES: usize = 38;
+pub const INDEX_ENTRY_BYTES: usize = 94;
 
 /// Number of digests the writer accumulates before flushing a mid-segment
 /// `HeaderIndex` record.
@@ -79,6 +93,13 @@ pub struct IndexEntry {
     pub record_size: u32,
     /// Unpadded payload length of the digested record.
     pub payload_len: u32,
+    /// The digested record's identity and digest, as its header carries them.
+    pub origin: u64,
+    pub oseq: u64,
+    pub gen: u64,
+    pub epoch: u64,
+    pub hlc: u64,
+    pub digest: ContentHash,
 }
 
 impl IndexEntry {
@@ -93,6 +114,12 @@ impl IndexEntry {
             offset,
             record_size: record_size as u32,
             payload_len: header.payload_len as u32,
+            origin: header.origin,
+            oseq: header.oseq,
+            gen: header.gen,
+            epoch: header.epoch,
+            hlc: header.hlc,
+            digest: header.digest,
         }
     }
 
@@ -114,6 +141,12 @@ impl IndexEntry {
                     stream_id: self.stream_id,
                     chunk_index: self.chunk_index,
                     token_count: self.token_count as u64,
+                    origin: self.origin,
+                    oseq: self.oseq,
+                    gen: self.gen,
+                    epoch: self.epoch,
+                    hlc: self.hlc,
+                    digest: self.digest,
                 },
                 payload: Vec::new(),
             },
@@ -140,6 +173,17 @@ pub fn encode_index_payload(prev: (u64, u64), entries: &[IndexEntry]) -> Vec<u8>
         out.extend_from_slice(&e.offset.to_le_bytes());
         out.extend_from_slice(&e.record_size.to_le_bytes());
         out.extend_from_slice(&e.payload_len.to_le_bytes());
+        for v in [
+            e.origin,
+            e.oseq,
+            e.gen,
+            e.epoch,
+            e.hlc,
+            e.digest.lo,
+            e.digest.hi,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
     }
     out
 }
@@ -171,15 +215,25 @@ pub fn decode_index_payload(payload: &[u8]) -> Result<((u64, u64), Vec<IndexEntr
     let mut entries = Vec::with_capacity(n);
     for _ in 0..n {
         let e = take(&mut pos, INDEX_ENTRY_BYTES)?;
+        let word = |at: usize| u64::from_le_bytes(e[at..at + 8].try_into().unwrap());
         entries.push(IndexEntry {
             record_type: RecordType::from_tag(e[0]),
             format: e[1],
             token_count: u32::from_le_bytes(e[2..6].try_into().unwrap()),
-            stream_id: u64::from_le_bytes(e[6..14].try_into().unwrap()),
-            chunk_index: u64::from_le_bytes(e[14..22].try_into().unwrap()),
-            offset: u64::from_le_bytes(e[22..30].try_into().unwrap()),
+            stream_id: word(6),
+            chunk_index: word(14),
+            offset: word(22),
             record_size: u32::from_le_bytes(e[30..34].try_into().unwrap()),
             payload_len: u32::from_le_bytes(e[34..38].try_into().unwrap()),
+            origin: word(38),
+            oseq: word(46),
+            gen: word(54),
+            epoch: word(62),
+            hlc: word(70),
+            digest: ContentHash {
+                lo: word(78),
+                hi: word(86),
+            },
         });
     }
     if pos != payload.len() {
@@ -205,6 +259,15 @@ mod tests {
             offset: 4096 + seed * 8192,
             record_size: 8192,
             payload_len: 5000,
+            origin: 0xABCD,
+            oseq: seed + 1,
+            gen: 2,
+            epoch: 3,
+            hlc: seed << 16,
+            digest: ContentHash {
+                lo: seed,
+                hi: !seed,
+            },
         }
     }
 
@@ -221,10 +284,19 @@ mod tests {
             offset: 0x3132_3334_3536_3738,
             record_size: 0x4142_4344,
             payload_len: 0x5152_5354,
+            origin: 0x6162_6364_6566_6768,
+            oseq: 0x7172_7374_7576_7778,
+            gen: 0x8182_8384_8586_8788,
+            epoch: 0x9192_9394_9596_9798,
+            hlc: 0xA1A2_A3A4_A5A6_A7A8,
+            digest: ContentHash {
+                lo: 0xB1B2_B3B4_B5B6_B7B8,
+                hi: 0xC1C2_C3C4_C5C6_C7C8,
+            },
         };
         let bytes = encode_index_payload((0xAABB, 0x1000), &[e]);
         let mut expected = Vec::new();
-        expected.extend_from_slice(&1u32.to_le_bytes()); // version
+        expected.extend_from_slice(&2u32.to_le_bytes()); // version
         expected.extend_from_slice(&0xAABBu64.to_le_bytes()); // prev_offset
         expected.extend_from_slice(&0x1000u64.to_le_bytes()); // prev_size
         expected.extend_from_slice(&1u32.to_le_bytes()); // n_entries
@@ -236,6 +308,13 @@ mod tests {
         expected.extend_from_slice(&0x3132_3334_3536_3738u64.to_le_bytes());
         expected.extend_from_slice(&0x4142_4344u32.to_le_bytes());
         expected.extend_from_slice(&0x5152_5354u32.to_le_bytes());
+        expected.extend_from_slice(&0x6162_6364_6566_6768u64.to_le_bytes()); // origin
+        expected.extend_from_slice(&0x7172_7374_7576_7778u64.to_le_bytes()); // oseq
+        expected.extend_from_slice(&0x8182_8384_8586_8788u64.to_le_bytes()); // gen
+        expected.extend_from_slice(&0x9192_9394_9596_9798u64.to_le_bytes()); // epoch
+        expected.extend_from_slice(&0xA1A2_A3A4_A5A6_A7A8u64.to_le_bytes()); // hlc
+        expected.extend_from_slice(&0xB1B2_B3B4_B5B6_B7B8u64.to_le_bytes()); // digest.lo
+        expected.extend_from_slice(&0xC1C2_C3C4_C5C6_C7C8u64.to_le_bytes()); // digest.hi
         assert_eq!(bytes, expected);
         assert_eq!(bytes.len(), 4 + 8 + 8 + 4 + INDEX_ENTRY_BYTES);
     }
@@ -257,9 +336,16 @@ mod tests {
         assert!(decoded.is_empty());
     }
 
+    /// A chain written before identities (version 1) is refused, so recovery
+    /// walks those records instead of replaying them with no identity.
     #[test]
     fn unknown_version_is_rejected() {
         let mut bytes = encode_index_payload((0, 0), &[entry(1)]);
+        bytes[0] = 1;
+        assert!(matches!(
+            decode_index_payload(&bytes),
+            Err(PersistenceError::Corrupt(_))
+        ));
         bytes[0] = 99;
         assert!(matches!(
             decode_index_payload(&bytes),
@@ -277,7 +363,7 @@ mod tests {
     }
 
     /// A digest replays as exactly the WalkEntry a payload-skipping
-    /// walk would have produced for the same record.
+    /// walk would have produced for the same record — identity included.
     #[test]
     fn digest_round_trips_through_walk_entry() {
         let header = RecordHeader {
@@ -288,6 +374,12 @@ mod tests {
             stream_id: 42,
             chunk_index: 191, // through_index
             token_count: 0,
+            origin: 0x51,
+            oseq: 9,
+            gen: 1,
+            epoch: 4,
+            hlc: 77 << 16,
+            digest: ContentHash { lo: 5, hi: 6 },
         };
         let e = IndexEntry::from_header(&header, 20_480, 4096);
         let w = e.to_walk_entry(crate::persistence::segment::FIRST_SEGMENT);

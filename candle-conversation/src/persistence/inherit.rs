@@ -182,6 +182,7 @@ mod tests {
             stream_id: sid.0,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
         log.stage(&encode_record(&header, &decl.encode()));
         log.commit().unwrap();

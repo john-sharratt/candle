@@ -38,6 +38,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::identity::RecordIdentity;
 use super::manifest::decode_label_payload;
 use super::record::{
     DebugIdPayload, DistillPayload, RecordHeader, RecordType, TreeMetadataPayload,
@@ -100,9 +101,9 @@ fn stream_keyed(rt: RecordType) -> bool {
 }
 
 /// One record written since the plan, as the re-emission appends it again:
-/// the header's `chunk_index` (a `Commit` carries its mark there) and the
-/// payload.
-pub type Rewrite = (u64, Vec<u8>);
+/// the header's `chunk_index` (a `Commit` carries its mark there), the
+/// payload, and the identity it was written with, which its copy keeps.
+pub type Rewrite = (u64, Vec<u8>, RecordIdentity);
 
 /// What a planned resident record's re-emission should do.
 #[derive(Debug, PartialEq, Eq)]
@@ -154,10 +155,11 @@ impl RelocationWatch {
             _ => {}
         }
         if let Some(k) = key(rt, header.stream_id, payload) {
-            self.rewrites
-                .entry(k)
-                .or_default()
-                .push((header.chunk_index, payload.to_vec()));
+            self.rewrites.entry(k).or_default().push((
+                header.chunk_index,
+                payload.to_vec(),
+                header.identity(),
+            ));
         }
     }
 
@@ -202,6 +204,8 @@ mod tests {
     use crate::persistence::manifest::encode_label_payload;
     use crate::persistence::record::TombstonePayload;
 
+    /// A header stamped with identity `oseq` of origin 9, so a test can tell
+    /// which write a carried copy took its identity from.
     fn header(record_type: RecordType, stream_id: u64, chunk_index: u64) -> RecordHeader {
         RecordHeader {
             record_type,
@@ -211,6 +215,21 @@ mod tests {
             stream_id,
             chunk_index,
             token_count: 0,
+            ..RecordHeader::NONE
+        }
+    }
+
+    fn stamped(header: RecordHeader, oseq: u64) -> RecordHeader {
+        header.with_identity(id(oseq))
+    }
+
+    fn id(oseq: u64) -> RecordIdentity {
+        RecordIdentity {
+            origin: 9,
+            oseq,
+            gen: 0,
+            epoch: 0,
+            hlc: oseq << 16,
         }
     }
 
@@ -314,13 +333,14 @@ mod tests {
     #[test]
     fn a_rewritten_record_follows_only_its_own_key() {
         let mut w = RelocationWatch::default();
-        w.record(&header(RecordType::Commit, 7, 3), &[]);
+        w.record(&stamped(header(RecordType::Commit, 7, 3), 11), &[]);
         w.record(&header(RecordType::DebugId, 0, 0), &debug_id(5, "new"));
         w.record(&header(RecordType::TreeMetadata, 0, 0), &tree_node(5, 2, 1));
 
         assert_eq!(
             w.reemit(RecordType::Commit, 7, &[]),
-            Reemit::CarryThen(vec![(3, Vec::new())])
+            Reemit::CarryThen(vec![(3, Vec::new(), id(11))]),
+            "the newer write is carried with the identity it was written under"
         );
         assert_eq!(w.reemit(RecordType::Commit, 8, &[]), Reemit::Carry);
         assert_eq!(
@@ -330,7 +350,7 @@ mod tests {
         );
         assert_eq!(
             w.reemit(RecordType::DebugId, 0, &debug_id(5, "old")),
-            Reemit::CarryThen(vec![(0, debug_id(5, "new"))])
+            Reemit::CarryThen(vec![(0, debug_id(5, "new"), RecordIdentity::NONE)])
         );
         assert_eq!(
             w.reemit(RecordType::DebugId, 0, &debug_id(6, "old")),
@@ -338,7 +358,7 @@ mod tests {
         );
         assert_eq!(
             w.reemit(RecordType::TreeMetadata, 0, &tree_node(5, 2, 0)),
-            Reemit::CarryThen(vec![(0, tree_node(5, 2, 1))])
+            Reemit::CarryThen(vec![(0, tree_node(5, 2, 1), RecordIdentity::NONE)])
         );
         assert_eq!(
             w.reemit(RecordType::TreeMetadata, 0, &tree_node(5, 3, 0)),
@@ -353,11 +373,11 @@ mod tests {
         let mut w = RelocationWatch::default();
         let first = label(5, "", "renamed");
         let second = label(5, "", "renamed again");
-        w.record(&header(RecordType::Label, 0, 0), &first);
-        w.record(&header(RecordType::Label, 0, 0), &second);
+        w.record(&stamped(header(RecordType::Label, 0, 0), 1), &first);
+        w.record(&stamped(header(RecordType::Label, 0, 0), 2), &second);
         assert_eq!(
             w.reemit(RecordType::Label, 0, &label(5, "conv-5", "original")),
-            Reemit::CarryThen(vec![(0, first), (0, second)])
+            Reemit::CarryThen(vec![(0, first, id(1)), (0, second, id(2))])
         );
         assert_eq!(
             w.reemit(RecordType::Label, 0, &label(6, "conv-6", "other")),

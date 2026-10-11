@@ -358,6 +358,7 @@ mod tests {
                 stream_id,
                 chunk_index,
                 token_count: if rt == RecordType::Chunk { 32 } else { 0 },
+                ..RecordHeader::NONE
             },
             payload,
         )

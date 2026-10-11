@@ -63,9 +63,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Instant, SystemTime};
 
 use super::content_hash::section_stream_id;
+use super::identity::RecordIdentity;
 use super::manifest::{encode_conv_state_payload, encode_label_payload, ChunkLoc, RecordLoc};
 use super::record::{
-    DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType, SectionTombstonePayload,
+    DebugIdPayload, DistillMode, DistillPayload, RecordType, SectionTombstonePayload,
     TombstonePayload, TurnCouplingPayload,
 };
 use super::relocation_watch::{Reemit, RelocationWatch};
@@ -292,12 +293,12 @@ pub(super) struct Resident {
 }
 
 /// One already-encoded record to relocate verbatim from a source segment: its
-/// on-disk `(offset, record_size)` plus a synthesized header for the accounting
-/// / header-index bookkeeping (no decode needed).
+/// on-disk `(offset, record_size)`. The copy's bookkeeping reads the header
+/// out of the copied bytes ([`SubstratePersistence::append_raw_record`]), so it
+/// carries the record's identity and digest exactly as written.
 struct RawReloc {
     offset: u64,
     record_size: u64,
-    header: RecordHeader,
 }
 
 /// A planned maintenance op with everything the execute phase needs, gathered
@@ -307,8 +308,11 @@ struct RawReloc {
 /// locked). See [`SubstratePersistence::plan_maintenance`].
 pub struct MaintenancePlan {
     op: MaintenanceOp,
-    /// The full resident set to re-emit (the drop-safety net, §6 module doc).
-    resident: Vec<Resident>,
+    /// The full resident set to re-emit (the drop-safety net, §6 module doc),
+    /// each with the identity of the record holding its value when the plan was
+    /// made — which the copy keeps. A write made since the plan is carried
+    /// after it under its own ([`RelocationWatch`]).
+    resident: Vec<(Resident, RecordIdentity)>,
     /// The active segment when the plan was made, recorded as the drop-safety
     /// floor once the resident set is re-emitted (`None` when the plan re-emits
     /// nothing). Taken at the plan rather than at the first append: a record
@@ -793,7 +797,7 @@ impl SubstratePersistence {
         // the re-emit→looks-dead→compact churn (see `need_resident_reemit`).
         let t_resident = Instant::now();
         let resident = if self.need_resident_reemit(&op.targets(), &carried) {
-            gather_resident_set(substrate)
+            self.with_resident_identities(gather_resident_set(substrate))
         } else {
             Vec::new()
         };
@@ -818,7 +822,7 @@ impl SubstratePersistence {
         // most a few times a minute), and the summary string is built only for
         // the line itself.
         let mut resident_census = RecordCensus::new();
-        for r in &resident {
+        for (r, _) in &resident {
             resident_census.record(r.rt);
         }
         // Why the op ran: its targets' sizes, so a store that keeps compacting
@@ -1041,7 +1045,7 @@ impl SubstratePersistence {
     ) -> Result<()> {
         let mut bytes = 0u64;
         while run.resident_cursor < plan.resident.len() && (bytes == 0 || bytes < budget_bytes) {
-            let r = &plan.resident[run.resident_cursor];
+            let (r, planned_id) = &plan.resident[run.resident_cursor];
             run.resident_cursor += 1;
             let verdict = watch.map_or(Reemit::Carry, |w| w.reemit(r.rt, r.stream_id, &r.payload));
             let newer = match verdict {
@@ -1050,15 +1054,37 @@ impl SubstratePersistence {
                 Reemit::CarryThen(newer) => newer,
             };
             bytes += self
-                .append_record(r.rt, 0, r.stream_id, r.chunk_index, 0, 0, &r.payload)?
+                .append_carried(
+                    r.rt,
+                    0,
+                    r.stream_id,
+                    r.chunk_index,
+                    0,
+                    0,
+                    &r.payload,
+                    *planned_id,
+                )?
                 .2;
-            for (chunk_index, payload) in &newer {
+            for (chunk_index, payload, id) in &newer {
                 bytes += self
-                    .append_record(r.rt, 0, r.stream_id, *chunk_index, 0, 0, payload)?
+                    .append_carried(r.rt, 0, r.stream_id, *chunk_index, 0, 0, payload, *id)?
                     .2;
             }
         }
         Ok(())
+    }
+
+    /// Pair each planned resident record with the identity of the record that
+    /// holds its value now, for its copy to keep.
+    fn with_resident_identities(&self, set: Vec<Resident>) -> Vec<(Resident, RecordIdentity)> {
+        set.into_iter()
+            .map(|r| {
+                let id = self
+                    .resident_ids
+                    .identity_for(r.rt, r.stream_id, &r.payload);
+                (r, id)
+            })
+            .collect()
     }
 
     /// Relocate the next run of the plan's chunks — up to `budget_bytes` of
@@ -1101,18 +1127,9 @@ impl SubstratePersistence {
         for (source, recs) in by_seg {
             let items: Vec<RawReloc> = recs
                 .iter()
-                .map(|&(sid, idx, old)| RawReloc {
+                .map(|&(_, _, old)| RawReloc {
                     offset: old.offset,
                     record_size: old.record_size,
-                    header: RecordHeader {
-                        record_type: RecordType::Chunk,
-                        format: old.format,
-                        payload_len: old.payload_len,
-                        crc: 0,
-                        stream_id: sid.0,
-                        chunk_index: idx,
-                        token_count: old.token_count,
-                    },
                 })
                 .collect();
             let new = self.relocate_raw_from_segment(source, &items)?;
@@ -1180,7 +1197,7 @@ impl SubstratePersistence {
             })
             .copied()
             .collect();
-        let token_updates = self.relocate_stream_records(RecordType::Tokens, &live_tokens)?;
+        let token_updates = self.relocate_stream_records(&live_tokens)?;
 
         // Snapshots — the same verbatim path, behind a supersession check.
         // Snapshot records are last-writer-wins by append order (keyed
@@ -1203,8 +1220,7 @@ impl SubstratePersistence {
             .filter(|(sid, old)| self.snapshot_locs.get(&sid.0) == Some(old))
             .copied()
             .collect();
-        let snapshot_updates =
-            self.relocate_stream_records(RecordType::Snapshot, &live_snapshots)?;
+        let snapshot_updates = self.relocate_stream_records(&live_snapshots)?;
 
         // Branch checkpoints relocate by the same rule and under their own
         // record type — writing them back as `Snapshot` would re-type a cache
@@ -1215,8 +1231,7 @@ impl SubstratePersistence {
             .filter(|(sid, old)| self.snapshot_locs.get(&sid.0) == Some(old))
             .copied()
             .collect();
-        let branch_updates =
-            self.relocate_stream_records(RecordType::BranchCheckpoint, &live_branch)?;
+        let branch_updates = self.relocate_stream_records(&live_branch)?;
 
         // Singletons — few (≤3); the encoding append repoints them via
         // `manifest.ingest`.
@@ -1224,7 +1239,7 @@ impl SubstratePersistence {
             let rec = self
                 .segments
                 .read_record_at(old.segment, old.offset, old.record_size)?;
-            self.append_record(rt, 0, 0, 0, 0, 0, &rec.payload)?;
+            self.append_carried(rt, 0, 0, 0, 0, 0, &rec.payload, rec.header.identity())?;
         }
 
         // Characters — carried verbatim off the target, grouped by source for
@@ -1253,18 +1268,9 @@ impl SubstratePersistence {
         for (source, recs) in npcs_by_seg {
             let items: Vec<RawReloc> = recs
                 .iter()
-                .map(|&(npc_id, loc)| RawReloc {
+                .map(|&(_, loc)| RawReloc {
                     offset: loc.offset,
                     record_size: loc.record_size,
-                    header: RecordHeader {
-                        record_type: RecordType::Npc,
-                        format: 0,
-                        payload_len: loc.payload_len,
-                        crc: 0,
-                        stream_id: npc_id,
-                        chunk_index: 0,
-                        token_count: 0,
-                    },
                 })
                 .collect();
             self.relocate_raw_from_segment(source, &items)?;
@@ -1297,15 +1303,6 @@ impl SubstratePersistence {
                 .map(|r| RawReloc {
                     offset: r.loc.offset,
                     record_size: r.loc.record_size,
-                    header: RecordHeader {
-                        record_type: r.rt,
-                        format: 0,
-                        payload_len: r.loc.payload_len,
-                        crc: 0,
-                        stream_id: r.timeline,
-                        chunk_index: r.seq,
-                        token_count: 0,
-                    },
                 })
                 .collect();
             let new = self.relocate_raw_from_segment(source, &items)?;
@@ -1367,20 +1364,18 @@ impl SubstratePersistence {
                 let it = &items[k];
                 let within = (it.offset - start) as usize;
                 let raw = &buf[within..within + it.record_size as usize];
-                new_locs[k] = self.append_raw_record(&it.header, raw)?;
+                new_locs[k] = self.append_raw_record(raw)?;
             }
         }
         Ok(new_locs)
     }
 
-    /// Relocate per-stream `RecordLoc`-shaped records (`Tokens` / `Snapshot`)
-    /// verbatim into the active segment — grouped by source segment for
-    /// coalesced stripe reads — returning `(stream, old_loc, new_loc)` per
-    /// input record. The two types share the same header shape (format 0,
-    /// chunk_index 0, token_count 0); only `record_type` differs.
+    /// Relocate per-stream `RecordLoc`-shaped records (`Tokens` / `Snapshot` /
+    /// `BranchCheckpoint`) verbatim into the active segment — grouped by source
+    /// segment for coalesced stripe reads — returning `(stream, old_loc,
+    /// new_loc)` per input record.
     fn relocate_stream_records(
         &mut self,
-        record_type: RecordType,
         relocs: &[(StreamId, RecordLoc)],
     ) -> Result<Vec<(StreamId, RecordLoc, RecordLoc)>> {
         let mut updates = Vec::with_capacity(relocs.len());
@@ -1391,18 +1386,9 @@ impl SubstratePersistence {
         for (source, recs) in by_seg {
             let items: Vec<RawReloc> = recs
                 .iter()
-                .map(|&(sid, old)| RawReloc {
+                .map(|&(_, old)| RawReloc {
                     offset: old.offset,
                     record_size: old.record_size,
-                    header: RecordHeader {
-                        record_type,
-                        format: 0,
-                        payload_len: old.payload_len,
-                        crc: 0,
-                        stream_id: sid.0,
-                        chunk_index: 0,
-                        token_count: 0,
-                    },
                 })
                 .collect();
             let new = self.relocate_raw_from_segment(source, &items)?;
@@ -1473,7 +1459,7 @@ impl SubstratePersistence {
         }
         let carried = self.liveness_and_carry(substrate).1;
         let resident = if self.need_resident_reemit(&op.targets(), &carried) {
-            gather_resident_set(substrate)
+            self.with_resident_identities(gather_resident_set(substrate))
         } else {
             Vec::new()
         };
@@ -3473,6 +3459,123 @@ mod tests {
             );
             assert_eq!(sp.read_chunk(&substrate, sid, 1).unwrap(), chunk_payload(2));
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every record on disk in append order: its type, stream, chunk index and
+    /// identity.
+    fn identities_on_disk(dir: &std::path::Path) -> Vec<(RecordType, u64, u64, RecordIdentity)> {
+        let mut seen = Vec::new();
+        let mut substrate = Substrate::new();
+        SubstratePersistence::open_in_with_substrate_and_sink(dir, &mut substrate, |entry| {
+            let h = &entry.record.header;
+            seen.push((h.record_type, h.stream_id, h.chunk_index, h.identity()));
+        })
+        .unwrap();
+        seen
+    }
+
+    /// **Maintenance moves records; it never originates one.** A segment
+    /// compacted with a resident set re-emitted around a newer write leaves
+    /// every record carrying either the identity it had before the run or the
+    /// identity the newer write was minted with — the relocated chunk, the
+    /// re-emitted declaration and the re-appended newer debug id alike — and
+    /// only the index records carry none.
+    #[test]
+    fn maintenance_keeps_every_moved_records_identity() {
+        let dir = tmp_dir("reemit_identity");
+        let decl = turn_decl(607, 0);
+        let sid = decl.stream_id();
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            sp.write_debug_id(607, "first").unwrap();
+            sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(10))
+                .unwrap();
+            sp.write_chunk(sid, 1, 32, 4, None, &chunk_payload(1))
+                .unwrap();
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+            sp.write_chunk(sid, 1, 32, 4, None, &chunk_payload(2))
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        let before = identities_on_disk(&dir);
+        let mut known: Vec<RecordIdentity> = before
+            .iter()
+            .map(|r| r.3)
+            .filter(|id| !id.is_none())
+            .collect();
+        let chunk0 = before
+            .iter()
+            .find(|r| r.0 == RecordType::Chunk && r.1 == sid.0 && r.2 == 0)
+            .unwrap()
+            .3;
+        let decl_id = before
+            .iter()
+            .find(|r| r.0 == RecordType::StreamDecl && r.1 == sid.0)
+            .unwrap()
+            .3;
+        let node;
+        let second_oseq;
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            node = sp.node();
+            let plan = sp.plan_maintenance(&substrate, true).unwrap().unwrap();
+            assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
+            sp.watch_relocation();
+            let mut run = sp.begin_maintenance(&plan).unwrap();
+            second_oseq = sp.origination().next_oseq();
+            sp.write_debug_id(607, "second").unwrap();
+            sp.commit().unwrap();
+            while sp.relocate_batch(&plan, &mut run, 1).unwrap() {}
+            let result = sp.complete_maintenance(&plan, run).unwrap();
+            result.apply_to_substrate(&mut substrate);
+            sp.finish_maintenance(&plan).unwrap();
+            assert!(!sealed_log(&dir, 1).exists(), "seg 1 was compacted away");
+            assert_eq!(
+                sp.origination().next_oseq(),
+                second_oseq + 1,
+                "the run minted nothing beyond the one write made beside it"
+            );
+        }
+        let after = identities_on_disk(&dir);
+        let second = after
+            .iter()
+            .rev()
+            .find(|r| r.0 == RecordType::DebugId)
+            .unwrap()
+            .3;
+        assert_eq!((second.origin, second.oseq), (node, second_oseq));
+        known.push(second);
+        for (rt, stream, chunk, id) in &after {
+            if *rt == RecordType::HeaderIndex {
+                assert!(id.is_none(), "an index record carries no identity");
+                continue;
+            }
+            assert!(
+                known.contains(id),
+                "{rt:?} stream {stream} chunk {chunk} carries {id:?}, minted by the run"
+            );
+        }
+        let last = |rt: RecordType, idx: u64| {
+            after
+                .iter()
+                .rev()
+                .find(|r| r.0 == rt && r.1 == sid.0 && r.2 == idx)
+                .unwrap()
+                .3
+        };
+        assert_eq!(last(RecordType::Chunk, 0), chunk0, "the relocated chunk");
+        assert_eq!(
+            last(RecordType::StreamDecl, 0),
+            decl_id,
+            "the re-emitted decl"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

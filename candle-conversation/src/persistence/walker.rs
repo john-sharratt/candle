@@ -243,6 +243,7 @@ mod tests {
                 stream_id,
                 chunk_index,
                 token_count: 32,
+                ..RecordHeader::NONE
             },
             payload,
         )
@@ -281,6 +282,7 @@ mod tests {
                 stream_id: 0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             payload,
         )

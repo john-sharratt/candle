@@ -27,11 +27,13 @@ use std::path::Path;
 
 use super::content_hash::snapshot_stream_id;
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
+use super::identity::ResidentIds;
 use super::log_file::LogFile;
 use super::manifest::{encode_conv_state_payload, Manifest, RecordLoc};
 use super::record::{
-    encode_record, DebugIdPayload, DistillMode, DistillPayload, RecordHeader, RecordType,
-    SectionTombstonePayload, TombstonePayload, TurnCouplingPayload,
+    decode_header, encode_record, encode_record_written, DebugIdPayload, DistillMode,
+    DistillPayload, RecordHeader, RecordType, SectionTombstonePayload, TombstonePayload,
+    TurnCouplingPayload,
 };
 use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::streams::StreamId;
@@ -107,6 +109,7 @@ fn singleton_header(rt: RecordType, payload_len: u64) -> RecordHeader {
         stream_id: 0,
         chunk_index: 0,
         token_count: 0,
+        ..RecordHeader::NONE
     }
 }
 
@@ -177,6 +180,7 @@ pub fn collect_live_records(
     substrate: &Substrate,
     npc_locs: &HashMap<u64, RecordLoc>,
     vfs_index: &VfsIndex,
+    resident_ids: &ResidentIds,
 ) -> Vec<CompactItem> {
     let mut out: Vec<CompactItem> = Vec::new();
 
@@ -197,6 +201,7 @@ pub fn collect_live_records(
                     stream_id: timeline,
                     chunk_index: seq,
                     token_count: 0,
+                    ..RecordHeader::NONE
                 },
                 loc.segment,
                 loc.offset,
@@ -234,6 +239,7 @@ pub fn collect_live_records(
                 stream_id: *npc_id,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             loc.segment,
             loc.offset,
@@ -317,6 +323,7 @@ pub fn collect_live_records(
                 stream_id: stream_id.0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             loc.segment,
             loc.offset,
@@ -349,6 +356,7 @@ pub fn collect_live_records(
                 stream_id: stream_id.0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             loc.segment,
             loc.offset,
@@ -426,6 +434,7 @@ pub fn collect_live_records(
                     stream_id: stream_id.0,
                     chunk_index: 0,
                     token_count: 0,
+                    ..RecordHeader::NONE
                 },
                 payload,
             ));
@@ -441,6 +450,7 @@ pub fn collect_live_records(
                         stream_id: stream_id.0,
                         chunk_index: idx,
                         token_count: loc.token_count,
+                        ..RecordHeader::NONE
                     },
                     loc.segment,
                     loc.offset,
@@ -459,6 +469,7 @@ pub fn collect_live_records(
                         stream_id: stream_id.0,
                         chunk_index: 0,
                         token_count: 0,
+                        ..RecordHeader::NONE
                     },
                     loc.segment,
                     loc.offset,
@@ -480,6 +491,7 @@ pub fn collect_live_records(
                         stream_id: stream_id.0,
                         chunk_index: 0,
                         token_count: 0,
+                        ..RecordHeader::NONE
                     },
                     payload.clone(),
                 ));
@@ -499,6 +511,7 @@ pub fn collect_live_records(
                         stream_id: stream_id.0,
                         chunk_index: 0,
                         token_count: 0,
+                        ..RecordHeader::NONE
                     },
                     payload.clone(),
                 ));
@@ -519,6 +532,7 @@ pub fn collect_live_records(
                     stream_id: stream_id.0,
                     chunk_index: 0,
                     token_count: 0,
+                    ..RecordHeader::NONE
                 },
                 payload.bytes().to_vec(),
             ));
@@ -533,6 +547,7 @@ pub fn collect_live_records(
                     stream_id: stream_id.0,
                     chunk_index: through,
                     token_count: 0,
+                    ..RecordHeader::NONE
                 },
                 Vec::new(),
             ));
@@ -563,6 +578,7 @@ pub fn collect_live_records(
                 stream_id: 0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             payload,
         ));
@@ -586,6 +602,7 @@ pub fn collect_live_records(
                 stream_id: stream_id.0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             payload,
         ));
@@ -614,6 +631,7 @@ pub fn collect_live_records(
                 stream_id: 0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             payload,
         ));
@@ -635,6 +653,7 @@ pub fn collect_live_records(
                 stream_id: timeline_id,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             payload,
         ));
@@ -655,6 +674,7 @@ pub fn collect_live_records(
                 stream_id: 0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             bytes,
         ));
@@ -688,6 +708,7 @@ pub fn collect_live_records(
                 stream_id: 0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             payload,
         ));
@@ -711,6 +732,7 @@ pub fn collect_live_records(
                 stream_id: 0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             bytes,
         ));
@@ -729,6 +751,7 @@ pub fn collect_live_records(
                 stream_id: obj.stream_id(),
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             bytes,
         ));
@@ -756,9 +779,20 @@ pub fn collect_live_records(
                 stream_id: 0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             payload,
         ));
+    }
+    // Every re-encoded record keeps the identity of the record that holds its
+    // value now: the same origin and `oseq`, so every member still recognises
+    // it, and the same stamp, so it still ranks where it did. A read-back record
+    // keeps its own — `write_compacted_log` indexes it from its copied header.
+    for item in &mut out {
+        if let CompactItem::Synth { header, payload } = item {
+            let id = resident_ids.identity_for(header.record_type, header.stream_id, payload);
+            *header = header.with_identity(id);
+        }
     }
     out
 }
@@ -798,6 +832,7 @@ pub fn write_compacted_log(
                 stream_id: 0,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             };
             let bytes = encode_record(&h, &payload);
             let offset = log.stage(&bytes);
@@ -820,9 +855,13 @@ pub fn write_compacted_log(
             CompactItem::Synth { header, payload } => {
                 let mut h = *header;
                 h.payload_len = payload.len() as u64;
-                let bytes = encode_record(&h, payload);
+                let (written, bytes) = encode_record_written(&h, payload);
                 let offset = log.stage(&bytes);
-                pending.push(IndexEntry::from_header(&h, offset, bytes.len() as u64));
+                pending.push(IndexEntry::from_header(
+                    &written,
+                    offset,
+                    bytes.len() as u64,
+                ));
                 i += 1;
             }
             CompactItem::Raw {
@@ -872,16 +911,16 @@ pub fn write_compacted_log(
                     read_into(seg, from, &mut buf[..len])?;
                     let mut within = 0usize;
                     for it in &run[a..b] {
-                        let CompactItem::Raw {
-                            header,
-                            record_size,
-                            ..
-                        } = it
-                        else {
+                        let CompactItem::Raw { record_size, .. } = it else {
                             unreachable!("a Raw run holds only Raw items");
                         };
                         let sz = *record_size as usize;
-                        let staged = log.stage(&buf[within..within + sz]);
+                        let raw = &buf[within..within + sz];
+                        // Indexed from the copied record's own header, so the copy
+                        // keeps the identity and digest it was written with.
+                        let (header, _) = decode_header(raw)?;
+                        let header = &header;
+                        let staged = log.stage(raw);
                         within += sz;
                         // Singletons resolve from the manifest (the substrate
                         // replay never rebuilds them); `Chunk` / `Tokens` are
@@ -958,6 +997,7 @@ mod tests {
                 stream_id,
                 chunk_index,
                 token_count: if rt == RecordType::Chunk { 32 } else { 0 },
+                ..RecordHeader::NONE
             },
             payload,
         )
@@ -989,6 +1029,7 @@ mod tests {
                 stream_id,
                 chunk_index,
                 token_count: 32,
+                ..RecordHeader::NONE
             },
             &payload,
         )
@@ -1025,7 +1066,13 @@ mod tests {
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         // Exactly: 1 ModelKey + 1 StreamDecl + 1 Chunk = 3 (LWW keeps one of each).
         assert_eq!(live.len(), 3);
         // Each read-back item points at the live winner's on-disk location — the
@@ -1076,7 +1123,13 @@ mod tests {
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         assert!(
             !has_type(&live, RecordType::Chunk),
             "orphan chunks (no StreamDecl) must be reclaimed, not kept forever",
@@ -1120,7 +1173,13 @@ mod tests {
         let (before, before_sub, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&before, &before_sub, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &before,
+            &before_sub,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         let path = std::env::temp_dir().join(format!(
             "kvtier_compact_{}.log",
             std::time::SystemTime::now()
@@ -1220,7 +1279,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         // The marker survives, at its mode — without it the exemption is lost.
         assert!(
@@ -1348,7 +1413,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         let has_label = |needle: &str| {
             live.iter().any(|it| {
@@ -1448,7 +1519,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         // The dead timeline's records are physically gone from the live set.
         // Chunks are read-back (`Raw`) items keyed by stream id; the dead
@@ -1515,7 +1592,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         assert!(
             has_synth(&live, RecordType::ProjectionEvents, &proj_payload),
@@ -1556,7 +1639,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         assert!(
             has_synth(&live, RecordType::WideQSig, &wide_payload),
@@ -1613,7 +1702,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         // The declaration and the sig survive — the belief gallery still finds it.
         assert!(
@@ -1735,7 +1830,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         assert!(
             !has_type(&live, RecordType::Snapshot),
@@ -1783,7 +1884,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         assert!(
             !has_type(&live, RecordType::Snapshot),
             "a tombstoned timeline's recurrent snapshot survived compaction"
@@ -1839,7 +1946,13 @@ mod tests {
              incremental maintenance will relocate it forward forever",
         );
         // And therefore also absent from the full-compaction live set.
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         assert!(
             !has_type(&live, RecordType::Snapshot),
             "a distilled timeline's recurrent snapshot survived compaction",
@@ -1860,7 +1973,13 @@ mod tests {
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
         assert_eq!(substrate.recurrent_snapshot_entries().count(), 1);
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         assert!(has_type(&live, RecordType::Snapshot));
     }
 
@@ -1899,7 +2018,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         let kept: Vec<u64> = live
             .iter()
@@ -1970,7 +2095,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         assert!(
             !has_type(&live, RecordType::Snapshot),
@@ -2004,7 +2135,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         let snaps: Vec<_> = live
             .iter()
@@ -2074,7 +2211,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
 
         assert!(
             has_type(&live, RecordType::StreamDecl),
@@ -2148,7 +2291,13 @@ mod tests {
         npc_locs.insert(701, loc_at(4_096, 256));
         npc_locs.insert(700, loc_at(8_192, 320));
 
-        let live = collect_live_records(&manifest, &substrate, &npc_locs, &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &npc_locs,
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         let npcs: Vec<&CompactItem> = live
             .iter()
             .filter(|it| it.header().record_type == RecordType::Npc)
@@ -2169,7 +2318,13 @@ mod tests {
     #[test]
     fn collect_emits_nothing_for_an_empty_cast() {
         let (manifest, substrate) = empty_store();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         assert!(!has_type(&live, RecordType::Npc));
     }
 
@@ -2182,7 +2337,13 @@ mod tests {
         let mut npc_locs: HashMap<u64, RecordLoc> = HashMap::new();
         npc_locs.insert(900, loc_at(4_096, 192));
 
-        let live = collect_live_records(&manifest, &substrate, &npc_locs, &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &npc_locs,
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         assert!(
             live.iter().any(
                 |it| it.header().record_type == RecordType::Npc && it.header().stream_id == 900
@@ -2255,7 +2416,13 @@ mod tests {
         }
         vfs.record_tombstone(live_tl, 2, loc_at(90_000, 64), &[0]);
 
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &vfs);
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &vfs,
+            &ResidentIds::new(),
+        );
         let events: Vec<(u64, u64, (u64, u64))> = live
             .iter()
             .filter(|it| it.header().record_type == RecordType::VfsEvent)
@@ -2330,7 +2497,13 @@ mod tests {
             "replay must install both couplings",
         );
 
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         for from_turn in [0u32, 1] {
             assert!(
                 has_synth(
@@ -2379,7 +2552,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         assert!(!has_type(&live, RecordType::TurnCoupling));
     }
 
@@ -2587,7 +2766,8 @@ mod tests {
         vfs.record_event(live_tl, 0, loc_at(8_192, 128));
         vfs.record_tombstone(live_tl, 1, loc_at(12_288, 64), &[]);
 
-        let live = collect_live_records(&manifest, &substrate, &npc_locs, &vfs);
+        let live =
+            collect_live_records(&manifest, &substrate, &npc_locs, &vfs, &ResidentIds::new());
 
         for &rt in WRITTEN_RECORD_TYPES {
             match survival(rt) {
@@ -2654,7 +2834,13 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
         let (manifest, substrate, _) =
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         assert!(
             has_synth(
                 &live,
@@ -2699,7 +2885,13 @@ mod tests {
             "replay must mark the stream tombstoned",
         );
 
-        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &HashMap::new(),
+            &VfsIndex::new(),
+            &ResidentIds::new(),
+        );
         // The reason is diagnostic only and is not re-derived at compaction
         // time — the same rule the turn-scoped tombstone's re-emit follows —
         // so only the marker's presence (not its original reason text) is

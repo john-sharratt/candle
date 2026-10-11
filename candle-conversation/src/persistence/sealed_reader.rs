@@ -153,6 +153,7 @@ mod tests {
                 stream_id,
                 chunk_index: 0,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             payload,
         )

@@ -901,6 +901,7 @@ mod tests {
                 stream_id,
                 chunk_index,
                 token_count: 0,
+                ..RecordHeader::NONE
             },
             payload,
         )

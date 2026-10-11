@@ -35,6 +35,7 @@ pub mod elevate;
 pub mod flush;
 pub mod header_index;
 mod held_groups;
+pub mod identity;
 pub mod inherit;
 pub mod integrity;
 pub mod liveness_audit;
@@ -76,14 +77,18 @@ use candle::direct_io::DirectFile;
 use chunk_plan::ChunkedReadPlan;
 use content_hash::snapshot_stream_id;
 use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
+use identity::{
+    load_or_mint, now_ms, read_node, NodeSource, Origination, RecordIdentity, ResidentIds,
+};
 use inherit::InheritedSubstrate;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 pub use model_binding::{BoundSubstrate, ModelBinding};
 pub use priority_lock::PersistenceLock;
 use record::{
-    decode_record, encode_record, ChunkPayload, CustomObjectPayload, DebugIdPayload, NpcPayload,
-    RecordHeader, RecordType, SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
+    decode_header, decode_record, encode_record_written, ChunkPayload, CustomObjectPayload,
+    DebugIdPayload, NpcPayload, RecordHeader, RecordType, SectionTombstonePayload,
+    TombstonePayload, TreeMetadataPayload,
 };
 use relocation_watch::RelocationWatch;
 use sealed_reader::SealedReader;
@@ -453,6 +458,17 @@ pub struct SubstratePersistence {
     /// ([`WriterLock`]) until it drops or [`Self::release_writer`] hands the
     /// directory on; `None` on a read-only handle.
     writer_lock: Option<WriterLock>,
+    /// What this substrate stamps on the records it originates — its node, the
+    /// next `oseq`, its clock and its generation — primed at open from every
+    /// record the walk met (`docs/replicated_substrate.md` §6.2).
+    origination: Origination,
+    /// How the node came to be this handle's: kept from the directory, minted
+    /// fresh, or re-minted because the directory was copied (§3.7). `None` on a
+    /// read-only handle, which mints nothing.
+    node_source: Option<NodeSource>,
+    /// The identity of each resident value's current record, which a rewrite's
+    /// re-emission carries. Built by the open walk and kept by every append.
+    resident_ids: ResidentIds,
 }
 
 /// Whether a record type is a per-stream metadata record whose current-copy
@@ -755,6 +771,27 @@ impl SubstratePersistence {
         } else {
             Some(WriterLock::acquire(dir)?)
         };
+        // The node, once the directory is ours: a read-only handle takes the
+        // one the directory names, if any, and mints nothing.
+        let (node, node_source) = if read_only {
+            (read_node(dir)?.unwrap_or(0), None)
+        } else {
+            let (node, source) = load_or_mint(dir)?;
+            if let NodeSource::Reminted { previous } = source {
+                tracing::warn!(
+                    target: "candle_conversation::persistence::identity",
+                    previous = format!("{previous:016x}"),
+                    node = format!("{node:016x}"),
+                    dir = %dir.display(),
+                    "this substrate was minted in another directory or on another machine — \
+                     it writes under a fresh node from here on, so it can never issue a \
+                     record its original also issues"
+                );
+            }
+            (node, Some(source))
+        };
+        let mut origination = Origination::new(node);
+        let mut resident_ids = ResidentIds::new();
         let mut inherited_subs = Vec::with_capacity(inherited.len());
         for path in inherited {
             inherited_subs.push(InheritedSubstrate::load(path)?);
@@ -773,6 +810,14 @@ impl SubstratePersistence {
         // in a walk that already visits every record — see `RecordCensus`.
         let mut census = RecordCensus::new();
         let mut walk = |entry: &WalkEntry| {
+            let h = &entry.record.header;
+            origination.observe(&h.identity());
+            resident_ids.record(
+                h.record_type,
+                h.stream_id,
+                &entry.record.payload,
+                h.identity(),
+            );
             accounting.record(&entry.record.header, entry.size);
             census.record(entry.record.header.record_type);
             record_metadata_loc(&mut metadata_locs, entry);
@@ -849,6 +894,9 @@ impl SubstratePersistence {
             vfs_index,
             open_census: census,
             writer_lock,
+            origination,
+            node_source,
+            resident_ids,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -872,6 +920,23 @@ impl SubstratePersistence {
     /// without each call site re-deriving the list.
     pub fn inherited_substrates(&self) -> &[Arc<InheritedSubstrate>] {
         &self.inherited
+    }
+
+    /// This substrate's node — the origin of every record it writes (§3.7).
+    /// Zero on a read-only handle over a directory that never had one.
+    pub fn node(&self) -> u64 {
+        self.origination.node()
+    }
+
+    /// How this handle came by its node; `None` on a read-only handle.
+    pub fn node_source(&self) -> Option<NodeSource> {
+        self.node_source
+    }
+
+    /// The writer's identity state: the next `oseq`, the clock, the
+    /// generation.
+    pub fn origination(&self) -> &Origination {
+        &self.origination
     }
 
     /// The logical end of what is written to the active segment — synced only
@@ -946,6 +1011,12 @@ impl SubstratePersistence {
     ///
     /// A read-only handle refuses with [`PersistenceError::ReadOnly`] and
     /// stages nothing.
+    ///
+    /// **The record is this substrate's own**: it is stamped with a fresh
+    /// identity — this node as origin, the next `oseq`, the current generation
+    /// and a clock reading (`docs/replicated_substrate.md` §6.2) — except a
+    /// `HeaderIndex`, which no origin writes. A copy of an existing record goes
+    /// through [`Self::append_carried`] instead and keeps the identity it has.
     pub fn append_record(
         &mut self,
         record_type: RecordType,
@@ -955,6 +1026,41 @@ impl SubstratePersistence {
         token_count: u64,
         golden: u32,
         payload: &[u8],
+    ) -> Result<(SegmentId, u64, u64)> {
+        if self.is_read_only() {
+            return Err(PersistenceError::ReadOnly);
+        }
+        let identity = if record_type == RecordType::HeaderIndex {
+            RecordIdentity::NONE
+        } else {
+            self.origination.mint(now_ms(), 0)
+        };
+        self.append_carried(
+            record_type,
+            format,
+            stream_id,
+            chunk_index,
+            token_count,
+            golden,
+            payload,
+            identity,
+        )
+    }
+
+    /// [`Self::append_record`] for a record that already has an identity: a
+    /// resident value re-encoded from RAM by a rewrite, or a singleton carried
+    /// forward. The copy keeps `identity`, so every member still recognises it
+    /// as the record it copies and it ranks where that record did.
+    pub fn append_carried(
+        &mut self,
+        record_type: RecordType,
+        format: u8,
+        stream_id: u64,
+        chunk_index: u64,
+        token_count: u64,
+        golden: u32,
+        payload: &[u8],
+        identity: RecordIdentity,
     ) -> Result<(SegmentId, u64, u64)> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
@@ -971,7 +1077,9 @@ impl SubstratePersistence {
             stream_id,
             chunk_index,
             token_count,
-        };
+            ..RecordHeader::NONE
+        }
+        .with_identity(identity);
         // Write-boundary validation: recompute the chunk's golden over the host
         // bytes we are about to write and compare against the golden the seal
         // computed on the GPU (before the DtoH copy). A mismatch means the copy
@@ -997,10 +1105,10 @@ impl SubstratePersistence {
                 ),
             }
         }
-        let bytes = encode_record(&header, payload);
+        let (written, bytes) = encode_record_written(&header, payload);
         let (segment, offset) = self.segments.stage(&bytes);
         let size = bytes.len() as u64;
-        self.account_appended(&header, payload, segment, offset, size)?;
+        self.account_appended(&written, payload, segment, offset, size)?;
         Ok((segment, offset, size))
     }
 
@@ -1036,13 +1144,15 @@ impl SubstratePersistence {
             stream_id,
             chunk_index: 0,
             token_count: 0,
-        };
-        let (head, pad) = record::record_head(&header, parts);
-        let (segment, offset) = self.segments.append_parts(&head, parts, pad)?;
-        let size = (head.len() + header.payload_len as usize + pad) as u64;
+            ..RecordHeader::NONE
+        }
+        .with_identity(self.origination.mint(now_ms(), 0));
+        let head = record::record_head(&header, parts);
+        let (segment, offset) = self.segments.append_parts(&head.line, parts, head.pad)?;
+        let size = (head.line.len() + header.payload_len as usize + head.pad) as u64;
         // The hooks key these types by header alone, so the payload they are
         // handed is never read.
-        self.account_appended(&header, &[], segment, offset, size)?;
+        self.account_appended(&head.header, &[], segment, offset, size)?;
         Ok((segment, offset, size))
     }
 
@@ -1064,6 +1174,12 @@ impl SubstratePersistence {
         self.accounting.record(&header, size);
         self.track_metadata_loc(&header, segment, offset, size);
         self.track_resident_loc(&header, payload, segment, offset, size);
+        self.resident_ids.record(
+            header.record_type,
+            header.stream_id,
+            payload,
+            header.identity(),
+        );
         self.track_snapshot_loc(&header, segment, offset, size);
         self.retire_snapshot_on_distill(&header, payload);
         self.track_npc_loc(&header, segment, offset, size);
@@ -1091,20 +1207,22 @@ impl SubstratePersistence {
     /// Append an **already-encoded** record verbatim to the active segment —
     /// the same accounting + header-index bookkeeping as [`Self::append_record`]
     /// but with **no** re-encode: the caller supplies the raw 4 KB-aligned
-    /// record bytes (read verbatim from another segment) plus a header for the
-    /// bookkeeping. Used by background maintenance to relocate `Chunk`/`Tokens`
-    /// records with no decode/CRC-verify/re-encode round trip. Returns
-    /// `(segment, offset, size)`. Not for singletons — those go through
-    /// [`Self::append_record`] so `manifest.ingest` repoints them. A read-only
-    /// handle refuses with [`PersistenceError::ReadOnly`].
-    pub fn append_raw_record(
-        &mut self,
-        header: &RecordHeader,
-        raw: &[u8],
-    ) -> Result<(SegmentId, u64, u64)> {
+    /// record bytes, read verbatim from another segment. Used by background
+    /// maintenance to relocate `Chunk`/`Tokens` records with no
+    /// decode/CRC-verify/re-encode round trip. Returns `(segment, offset,
+    /// size)`. Not for singletons — those go through [`Self::append_carried`]
+    /// so `manifest.ingest` repoints them. A read-only handle refuses with
+    /// [`PersistenceError::ReadOnly`].
+    ///
+    /// The bookkeeping reads the header out of `raw` — one JSON line — so the
+    /// copy is indexed with the identity and digest it was written with, which
+    /// no location map holds.
+    pub fn append_raw_record(&mut self, raw: &[u8]) -> Result<(SegmentId, u64, u64)> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
+        let (header, _) = decode_header(raw)?;
+        let header = &header;
         let (segment, offset) = self.segments.stage(raw);
         let size = raw.len() as u64;
         self.accounting.record(header, size);
@@ -2198,6 +2316,7 @@ impl SubstratePersistence {
             substrate,
             &self.npc_locs,
             &self.vfs_index,
+            &self.resident_ids,
         );
         // What this compaction is carrying forward, by type, against what the
         // store held when it opened. A class present at open and absent here is
@@ -2317,13 +2436,25 @@ impl SubstratePersistence {
         self.snapshot_locs.clear();
         self.npc_locs.clear();
         self.vfs_index.clear();
+        // The identities are rebuilt the same way: every carried record kept its
+        // own, so the rebuilt table holds what the old one did for every value
+        // still live, and nothing for a value the compaction dropped.
+        self.resident_ids = ResidentIds::new();
         let accounting = &mut self.accounting;
         let metadata_locs = &mut self.metadata_locs;
         let resident_locs = &mut self.resident_locs;
         let snapshot_locs = &mut self.snapshot_locs;
         let npc_locs = &mut self.npc_locs;
         let vfs_index = &mut self.vfs_index;
+        let resident_ids = &mut self.resident_ids;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
+            let h = &entry.record.header;
+            resident_ids.record(
+                h.record_type,
+                h.stream_id,
+                &entry.record.payload,
+                h.identity(),
+            );
             accounting.record(&entry.record.header, entry.size);
             record_metadata_loc(metadata_locs, entry);
             record_resident_loc(resident_locs, entry);

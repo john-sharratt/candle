@@ -1492,8 +1492,12 @@ records and recurrent `Snapshot` records included (D5). Not events:
 | `BranchCheckpoint` | a content-keyed cache; any member can rebuild it |
 | maintenance relocations (`append_raw_record`), maintenance re-emissions, full `compact()` | housekeeping of records that already have an identity |
 
-`append_record` gains a `Provenance` argument — `Origin`, `Remote` or `Housekeeping` —
-and only `Origin` appends are tapped.
+Provenance is the entry point, not a flag. `append_record` and `append_recurrent_parts`
+**originate**: they mint the record's identity (§6.2). `append_carried` writes a record
+under the identity it is handed — a maintenance re-emission, a compaction, and a remote
+apply (§6.5). `append_raw_record` stages a record's bytes verbatim, header and identity
+included. Only originating appends are tapped. `HeaderIndex` is the one record written
+with no identity at all (every identity field zero).
 
 ### 6.2 Identity
 
@@ -1507,7 +1511,7 @@ and only `Origin` appends are tapped.
   | `origin: u64` | the writing substrate's node (§3.7) |
   | `oseq: u64` | that origin's event count, from 1 |
   | `gen: u64` | the generation (§6.7): the writer's current generation, or ⊤ for a record written while cut off, until a local `Rebase` fixes it |
-  | `hlc: u64` | a hybrid logical clock: `max(now_ms, the highest hlc this member has seen) + 1` per record, so causally later records always carry a later `hlc`, whatever the wall clocks say |
+  | `hlc: u64` | a hybrid logical clock reading, `(wall_ms << 16) \| counter`: each record takes `now_ms << 16` when that passes every reading this member has taken or seen, and the highest such reading + 1 otherwise. Causally later records always carry a later `hlc`, whatever the wall clocks say, and the high 48 bits still read as milliseconds for tombstone ages (§6.8) |
   | `epoch` | the claim or lease epoch (§5.4) the record was written under; zero for records no claim governs |
   | `digest: u128` | the existing `ContentHash` (`persistence/content_hash.rs:1-24`) over the whole payload. It covers what the `crc` does not: a `Chunk`'s metadata, and every other payload |
 

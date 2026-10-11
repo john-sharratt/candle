@@ -676,6 +676,7 @@ mod tests {
             stream_id,
             chunk_index,
             token_count: 0,
+            ..RecordHeader::NONE
         };
         encode_record(&header, payload)
     }
@@ -729,14 +730,15 @@ mod tests {
             stream_id: 2,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
         let parts: [&[u8]; 3] = [b"abc", b"", b"defghijk"];
         let joined = encode_record(&header, b"abcdefghijk");
         {
             let mut log = LogFile::create(&path).unwrap();
             log.stage(&staged);
-            let (head, pad) = record_head(&header, &parts);
-            let at = log.append_parts(&head, &parts, pad).unwrap();
+            let head = record_head(&header, &parts);
+            let at = log.append_parts(&head.line, &parts, head.pad).unwrap();
             assert_eq!(at, SUPERBLOCK_SIZE + staged.len() as u64);
             assert_eq!(log.pending_len(), 0, "the staged record went first");
             assert_eq!(

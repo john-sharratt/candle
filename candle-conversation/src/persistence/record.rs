@@ -52,7 +52,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::content_hash::ContentHash;
+use super::content_hash::{ContentHash, ContentHasher};
+use super::identity::RecordIdentity;
 use super::payload_parts::PayloadParts;
 use super::{PersistenceError, Result};
 
@@ -369,9 +370,79 @@ pub struct RecordHeader {
     /// Token count of a `Chunk` (`32` sealed, `<32` partial tail).
     #[serde(default)]
     pub token_count: u64,
+    /// The node of the substrate that wrote the record — its origin
+    /// ([`RecordIdentity`], `docs/replicated_substrate.md` §6.2). Zero on a
+    /// record written before identities, and on the header index.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub origin: u64,
+    /// The record's place in its origin's sequence, from 1.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub oseq: u64,
+    /// The generation its writer stood in (§6.7).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gen: u64,
+    /// The claim or lease epoch it was written under; zero when nothing governs
+    /// it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub epoch: u64,
+    /// The hybrid logical clock reading it was written at.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hlc: u64,
+    /// [`ContentHash`] over the whole payload — what the `crc` does not cover:
+    /// a `Chunk`'s metadata, and every other payload's content as one value
+    /// two copies can be compared by.
+    #[serde(default, skip_serializing_if = "content_hash_is_zero")]
+    pub digest: ContentHash,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+fn content_hash_is_zero(h: &ContentHash) -> bool {
+    *h == ContentHash::ZERO
 }
 
 impl RecordHeader {
+    /// Every field zero, of the never-written [`RecordType::Unknown`] — the
+    /// base a header literal completes with `..RecordHeader::NONE`.
+    pub const NONE: RecordHeader = RecordHeader {
+        record_type: RecordType::Unknown,
+        payload_len: 0,
+        crc: 0,
+        format: 0,
+        stream_id: 0,
+        chunk_index: 0,
+        token_count: 0,
+        origin: 0,
+        oseq: 0,
+        gen: 0,
+        epoch: 0,
+        hlc: 0,
+        digest: ContentHash::ZERO,
+    };
+
+    /// The record's identity.
+    pub fn identity(&self) -> RecordIdentity {
+        RecordIdentity {
+            origin: self.origin,
+            oseq: self.oseq,
+            gen: self.gen,
+            epoch: self.epoch,
+            hlc: self.hlc,
+        }
+    }
+
+    /// This header carrying `id`.
+    pub fn with_identity(mut self, id: RecordIdentity) -> RecordHeader {
+        self.origin = id.origin;
+        self.oseq = id.oseq;
+        self.gen = id.gen;
+        self.epoch = id.epoch;
+        self.hlc = id.hlc;
+        self
+    }
+
     /// A `Snapshot` record with no payload: the stream's snapshot is retracted
     /// and nothing for it is live. See [`RecordType::Snapshot`].
     pub fn retracts_snapshot(&self) -> bool {
@@ -395,16 +466,26 @@ pub fn padded_record_len(header_line_len: usize, payload_len: u64) -> usize {
     raw.div_ceil(ALIGN) * ALIGN
 }
 
-/// A record's framing around a payload given as `parts`: the header line with
-/// its trailing newline, and the count of zero bytes that pad the record to its
-/// [`ALIGN`]ed span. The on-disk record is `head`, then the parts in order,
-/// then the padding — [`encode_record`] lays exactly that into one buffer, and
-/// a large record is written from the parts directly.
+/// A record's framing, as [`record_head`] builds it.
+pub struct RecordHead {
+    /// The header as written: the caller's, with `crc` and `digest` filled in
+    /// from the payload.
+    pub header: RecordHeader,
+    /// The header line with its trailing newline.
+    pub line: Vec<u8>,
+    /// The count of zero bytes that pad the record to its [`ALIGN`]ed span.
+    pub pad: usize,
+}
+
+/// A record's framing around a payload given as `parts`. The on-disk record is
+/// `line`, then the parts in order, then `pad` zero bytes — [`encode_record`]
+/// lays exactly that into one buffer, and a large record is written from the
+/// parts directly.
 ///
 /// Panics if `header.payload_len` disagrees with the parts' total length, if
 /// the resulting JSON header would exceed [`MAX_HEADER_LINE`] bytes, or if
 /// `header.record_type` is [`RecordType::Unknown`].
-pub fn record_head(header: &RecordHeader, parts: &[&[u8]]) -> (Vec<u8>, usize) {
+pub fn record_head(header: &RecordHeader, parts: &[&[u8]]) -> RecordHead {
     let payload_len: usize = parts.iter().map(|p| p.len()).sum();
     assert_eq!(
         header.payload_len as usize, payload_len,
@@ -429,6 +510,13 @@ pub fn record_head(header: &RecordHeader, parts: &[&[u8]]) -> (Vec<u8>, usize) {
             .fold(crc32_init(), |crc, part| crc32_update(crc, part));
         effective.crc = crc32_finish(crc);
     }
+    // The digest is always the payload's, whatever the caller passed: a copy
+    // carrying another record's digest would read as content-equal to it.
+    let mut hasher = ContentHasher::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    effective.digest = hasher.finish();
 
     let mut head = serde_json::to_string(&effective)
         .expect("RecordHeader serialization is infallible for the supported field set")
@@ -442,22 +530,32 @@ pub fn record_head(header: &RecordHeader, parts: &[&[u8]]) -> (Vec<u8>, usize) {
     let total = padded_record_len(head.len(), effective.payload_len);
     head.push(b'\n');
     let pad = total - head.len() - payload_len;
-    (head, pad)
+    RecordHead {
+        header: effective,
+        line: head,
+        pad,
+    }
 }
 
 /// Encode a record into its padded on-disk byte image.
 ///
 /// Panics as [`record_head`] does.
 pub fn encode_record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
-    let (head, pad) = record_head(header, &[payload]);
+    encode_record_written(header, payload).1
+}
+
+/// [`encode_record`], with the header as written beside the image — `crc` and
+/// `digest` filled in — for the bookkeeping that indexes the record.
+pub fn encode_record_written(header: &RecordHeader, payload: &[u8]) -> (RecordHeader, Vec<u8>) {
+    let head = record_head(header, &[payload]);
     // Built by appending, not by zero-filling and overwriting: only the sector
     // padding tail is genuinely zero-valued, and `resize` writes just that.
-    let total = head.len() + payload.len() + pad;
+    let total = head.line.len() + payload.len() + head.pad;
     let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&head);
+    out.extend_from_slice(&head.line);
     out.extend_from_slice(payload);
     out.resize(total, 0);
-    out
+    (head.header, out)
 }
 
 /// Decode the header at the start of `probe` without touching the
@@ -1950,13 +2048,14 @@ mod snapshot_payload_tests {
             stream_id: 4,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
-        let (head, pad) = record_head(&header, &slices);
-        let mut framed = head;
+        let head = record_head(&header, &slices);
+        let mut framed = head.line;
         for s in &slices {
             framed.extend_from_slice(s);
         }
-        framed.resize(framed.len() + pad, 0);
+        framed.resize(framed.len() + head.pad, 0);
         assert_eq!(framed, encode_record(&header, &p.encode()));
     }
 
@@ -2208,6 +2307,7 @@ mod turn_coupling_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::super::content_hash::hash_bytes;
     use super::*;
 
     #[test]
@@ -2238,6 +2338,7 @@ mod tests {
             stream_id: 0,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
         let frame = encode_record(&header, &bytes);
         let (hdr2, payload2, _total) = decode_record(&frame).unwrap();
@@ -2423,6 +2524,7 @@ mod tests {
             stream_id: 0,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
         let frame = encode_record(&header, &bytes);
         let (hdr, payload, _total) = decode_record(&frame).unwrap();
@@ -2496,6 +2598,7 @@ mod tests {
             stream_id: 0,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
         let js = serde_json::to_string(&h).unwrap();
         // The header serialises the discriminant as `type`, not `record_type`.
@@ -2516,6 +2619,7 @@ mod tests {
             stream_id: 0,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
         let line = serde_json::to_string(&h).unwrap();
         let back: RecordHeader = serde_json::from_str(&line).unwrap();
@@ -2542,6 +2646,7 @@ mod tests {
             stream_id: 0,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
         let js = serde_json::to_string(&h).unwrap();
         assert!(js.contains(r#""type":"model_spec""#), "{js}");
@@ -2573,6 +2678,7 @@ mod tests {
             stream_id: 0xDEAD_BEEF_0000_0001,
             chunk_index: 5,
             token_count: 32,
+            ..RecordHeader::NONE
         }
     }
 
@@ -2614,12 +2720,57 @@ mod tests {
     fn encode_decode_roundtrip() {
         let payload: Vec<u8> = (0..5000u32).map(|i| (i % 256) as u8).collect();
         let header = sample_header(payload.len() as u64, &payload);
-        let bytes = encode_record(&header, &payload);
+        let (written, bytes) = encode_record_written(&header, &payload);
 
+        // The written header is the caller's, with the payload's digest set.
+        assert_eq!(
+            written,
+            RecordHeader {
+                digest: hash_bytes(&payload),
+                ..header
+            }
+        );
         let (got_header, got_payload, consumed) = decode_record(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
-        assert_eq!(got_header, header);
+        assert_eq!(got_header, written);
         assert_eq!(got_payload, payload.as_slice());
+    }
+
+    /// Identity fields round-trip, and a digest the caller passed is replaced
+    /// by the payload's own: a copy may not claim another record's content.
+    #[test]
+    fn identity_round_trips_and_the_digest_is_always_the_payloads() {
+        let payload = b"identity payload".to_vec();
+        let header = RecordHeader {
+            digest: ContentHash { lo: 7, hi: 9 },
+            ..sample_header(payload.len() as u64, &payload).with_identity(RecordIdentity {
+                origin: 0x1122_3344_5566_7788,
+                oseq: 42,
+                gen: 3,
+                epoch: 5,
+                hlc: (1_700_000_000_000 << 16) | 2,
+            })
+        };
+        let (written, bytes) = encode_record_written(&header, &payload);
+        assert_eq!(written.digest, hash_bytes(&payload));
+        let (got_header, _, _) = decode_record(&bytes).unwrap();
+        assert_eq!(got_header, written);
+        assert_eq!(got_header.identity(), header.identity());
+    }
+
+    /// A header with no identity writes none of the identity keys, so a
+    /// record without one is byte-for-byte what it was before identity existed.
+    #[test]
+    fn a_header_with_no_identity_writes_no_identity_keys() {
+        let payload = b"x".to_vec();
+        let header = sample_header(payload.len() as u64, &payload);
+        let (_, bytes) = encode_record_written(&header, &payload);
+        let line_end = bytes.iter().position(|&b| b == b'\n').unwrap();
+        let line = std::str::from_utf8(&bytes[..line_end]).unwrap();
+        for key in ["\"origin\"", "\"oseq\"", "\"gen\"", "\"epoch\"", "\"hlc\""] {
+            assert!(!line.contains(key), "{key} written in {line}");
+        }
+        assert!(line.contains("\"digest\""), "digest missing from {line}");
     }
 
     #[test]
@@ -2632,11 +2783,13 @@ mod tests {
             stream_id: 42,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
-        let bytes = encode_record(&header, &[]);
+        let (written, bytes) = encode_record_written(&header, &[]);
+        assert_eq!(written.digest, hash_bytes(&[]));
         let (got_header, got_payload, consumed) = decode_record(&bytes).unwrap();
         assert_eq!(consumed, ALIGN);
-        assert_eq!(got_header, header);
+        assert_eq!(got_header, written);
         assert!(got_payload.is_empty());
     }
 
@@ -2739,6 +2892,7 @@ mod tests {
             stream_id: 1,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
         let mut bytes = encode_record(&header, &payload);
         // Flip a byte inside the payload — find it just after the header newline.
@@ -2806,6 +2960,7 @@ mod tests {
             stream_id: 1,
             chunk_index: 0,
             token_count: 32,
+            ..RecordHeader::NONE
         };
         assert!(verify_record_crc(&header, &payload).is_ok());
     }
@@ -2972,6 +3127,7 @@ mod tests {
             stream_id: 0,
             chunk_index: 0,
             token_count: 0,
+            ..RecordHeader::NONE
         };
         encode_record(&header, &[]);
     }
