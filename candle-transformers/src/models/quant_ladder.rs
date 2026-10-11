@@ -12,17 +12,17 @@
 //! # Two things this ladder is not, both worth saying out loud
 //!
 //! **Below `Q4_KO` it is a REQUANTIZATION, not a repack.** The `Q4_KO` rung
-//! re-encodes an existing 4-bit grid and loses nothing; every rung under it
-//! re-quantizes 4-bit weights to 3 or 2 bits and loses something real.
-//! [`GgmlDType::to_ko`]'s own note prices the floor: `Q2_KO`'s four levels
-//! "floor at `rel_l2 ≈ 0.325`, a quality loss rather than a repack". A caller
+//! re-encodes an existing 4-bit grid and loses nothing; the rung under it
+//! re-quantizes 4-bit weights to 3 bits and loses something real. A caller
 //! dropping a rung is buying residency with accuracy, and should know it.
 //!
-//! **There is no `Q1_KO`.** The KO family is `Q2_KO … Q8_KO` plus `MXFP4_KO`,
-//! so a card under the `Q2_KO` rung has no narrower format to fall to. This
-//! returns `Q2_KO` there and says so rather than inventing one, because the
-//! honest answer to "this card cannot hold the model at any supported width" is
-//! a refusal at load, not a silently worse weight.
+//! **The floor is `Q3_KO`, by choice.** `Q2_KO` exists and is narrower, but
+//! [`GgmlDType::to_ko`]'s own note prices it: its four levels "floor at
+//! `rel_l2 ≈ 0.325`, a quality loss rather than a repack". The expert cache
+//! streams what does not fit (VRAM → pinned RAM → NVMe), so a narrower format
+//! buys speed on a small card, never feasibility — and that is not worth a
+//! third of the weights' signal. Every card under the `Q4_KO` rung takes
+//! `Q3_KO`; [`below_narrowest_rung`] names the cards too small for any rung.
 
 use candle::quantized::GgmlDType;
 use candle::{Device, Result};
@@ -31,18 +31,14 @@ use candle::{Device, Result};
 /// takes the format above it, so the search is "first rung whose floor this card
 /// clears".
 ///
-/// Read as: under 86 GiB take `Q4_KO`, under 64 take `Q3_KO`, under 32 take
-/// `Q2_KO`. Above 86 GiB nothing is forced and the source's own width stands.
-const LADDER: &[(u64, GgmlDType)] = &[
-    (86, GgmlDType::Q4_KO),
-    (64, GgmlDType::Q3_KO),
-    (32, GgmlDType::Q2_KO),
-];
+/// Read as: under 86 GiB take `Q4_KO`, under 64 take `Q3_KO`. Above 86 GiB
+/// nothing is forced and the source's own width stands.
+const LADDER: &[(u64, GgmlDType)] = &[(86, GgmlDType::Q4_KO), (64, GgmlDType::Q3_KO)];
 
-/// The narrowest KO format that exists. Named rather than inlined because the
-/// `< 12 GiB` rung the ladder was asked for would need something below it, and
-/// there is nothing below it.
-pub const NARROWEST_KO: GgmlDType = GgmlDType::Q2_KO;
+/// The narrowest format the ladder hands out — its last rung, and every card
+/// under 64 GiB. Not the narrowest KO format that exists; see the module docs
+/// for why the ladder stops above `Q2_KO`.
+pub const FLOOR_KO: GgmlDType = GgmlDType::Q3_KO;
 
 /// The expert format for a card of `vram_gib`, or `None` to leave the source's
 /// own width alone.
@@ -64,7 +60,7 @@ pub fn expert_format(vram_gib: u64) -> Option<GgmlDType> {
 /// A draft head looks like the place to give width up — it is one block against
 /// forty-eight, and its only job is to propose tokens the target then checks, so
 /// a worse proposal costs a rejected slot rather than a wrong answer. That
-/// argument is why this used to return [`NARROWEST_KO`], and it is wrong here
+/// argument is why this used to return the narrowest KO format, and it is wrong here
 /// for a reason particular to how the expert zone is laid out.
 ///
 /// **Slots are uniformly sized to the widest layer** — `slot_bytes_for` takes a
@@ -86,12 +82,12 @@ pub fn drafter_format(vram_gib: u64) -> Option<GgmlDType> {
     expert_format(vram_gib)
 }
 
-/// Whether this card is under every rung the KO family can serve.
+/// Whether this card is under every rung the ladder serves.
 ///
 /// The ladder was specified with a `< 12 GiB → Q1_KO` rung and there is no
-/// `Q1_KO`; a caller at that size is asking for a width that does not exist.
-/// [`expert_format`] still answers [`NARROWEST_KO`], so this is the predicate a
-/// loader uses to refuse rather than to quietly under-serve.
+/// `Q1_KO`; a caller at that size is asking for a width the ladder does not
+/// hand out. [`expert_format`] still answers [`FLOOR_KO`], so this is the
+/// predicate a loader uses to refuse rather than to quietly under-serve.
 pub fn below_narrowest_rung(vram_gib: u64) -> bool {
     vram_gib < 12
 }
@@ -106,8 +102,8 @@ pub fn device_vram_gib(device: &Device) -> Result<u64> {
 ///
 /// **Rounded, not floored.** The driver reports a little under the nominal
 /// size — the RTX 4090 Mobile reads 16,375.5 MiB of its 16 GiB — so flooring
-/// puts every card one GiB below its own rung: a 32 GiB card would read 31 and
-/// fall to the `Q2_KO` rung the ladder gives 24 GiB cards.
+/// puts every card one GiB below its own rung: a 64 GiB card would read 63 and
+/// fall to the `Q3_KO` rung the ladder gives 32 GiB cards.
 pub fn nominal_gib(total_bytes: u64) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     (total_bytes + GIB / 2) / GIB
@@ -141,12 +137,12 @@ mod tests {
         // what the bit-exact W4A16 re-encoding already produces. The big card
         // pays nothing for the ladder existing.
         assert_eq!(expert_format(72), Some(GgmlDType::Q4_KO));
-        // 2× RTX 5090, 32 GiB each — clears the 32 floor, so Q3_KO.
+        // 2× RTX 5090, 32 GiB each — under 64, so Q3_KO.
         assert_eq!(expert_format(32), Some(GgmlDType::Q3_KO));
-        // RTX 3090, 24 GiB — under 32, so Q2_KO.
-        assert_eq!(expert_format(24), Some(GgmlDType::Q2_KO));
-        // RTX 4090 Mobile, 16 GiB — likewise Q2_KO, the floor.
-        assert_eq!(expert_format(16), Some(GgmlDType::Q2_KO));
+        // RTX 3090, 24 GiB — likewise Q3_KO.
+        assert_eq!(expert_format(24), Some(GgmlDType::Q3_KO));
+        // RTX 4090 Mobile, 16 GiB — likewise Q3_KO, the floor.
+        assert_eq!(expert_format(16), Some(GgmlDType::Q3_KO));
         // Above every rung: leave the source alone rather than requantize for
         // no reason.
         assert_eq!(expert_format(96), None);
@@ -160,8 +156,6 @@ mod tests {
         assert_eq!(expert_format(85), Some(GgmlDType::Q4_KO));
         assert_eq!(expert_format(64), Some(GgmlDType::Q4_KO));
         assert_eq!(expert_format(63), Some(GgmlDType::Q3_KO));
-        assert_eq!(expert_format(32), Some(GgmlDType::Q3_KO));
-        assert_eq!(expert_format(31), Some(GgmlDType::Q2_KO));
     }
 
     /// The drafter takes the trunk's width on every card, because slots are
@@ -178,21 +172,15 @@ mod tests {
         }
     }
 
-    /// There is no rung under `Q2_KO`, so the sub-12 GiB case is a refusal
-    /// rather than a format. This pins that the floor is what it is.
+    /// The ladder stops at `Q3_KO`: every small card takes it, and the sub-12
+    /// GiB case is a refusal rather than a narrower format.
     #[test]
-    fn there_is_nothing_below_the_narrowest_rung() {
+    fn nothing_is_handed_out_below_the_floor() {
         assert!(below_narrowest_rung(8));
         assert!(!below_narrowest_rung(12));
-        assert_eq!(NARROWEST_KO, GgmlDType::Q2_KO);
-        // The KO family really does stop there — if a narrower one is ever
-        // added this fails and the ladder gains a rung.
-        for narrower in [GgmlDType::Q2_K, GgmlDType::Q3_K] {
-            assert!(
-                !narrower.is_ko(),
-                "{narrower:?} is a source quant, not a KO twin"
-            );
+        assert_eq!(FLOOR_KO, GgmlDType::Q3_KO);
+        for gib in [8, 12, 16, 24, 31, 32, 63] {
+            assert_eq!(expert_format(gib), Some(FLOOR_KO), "{gib} GiB");
         }
-        assert_eq!(expert_format(8), Some(GgmlDType::Q2_KO));
     }
 }

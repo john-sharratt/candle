@@ -20,17 +20,25 @@
 //! has found — in hand, done, stuck, or found to need nothing — so the same work
 //! is not set twice and settled work waits until what it is about changes.
 //!
-//! Every generated mission is one stage of an **operation** the table holds
-//! ([`super::operations`]): a draft, then a review by another Maker. A target is
-//! settled when its operation is, not when its draft is reported.
+//! Every generated mission carries one step of an **operation** the table holds
+//! ([`super::operations`]), run on a workflow from the mind's `missions.yaml`.
+//! A target is settled when its operation is, not when one of its steps is
+//! reported.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::operations::{AfterReading, Operation, Operations, Phase};
+use super::operations::{Operation, Operations};
 use crate::engine::mission::bank::{self, Duty, Facts};
-use crate::engine::mission::{Mission, Origin, Outcome, Stage, StepOutcome};
+use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome};
+use crate::engine::workflow::{Next, Taker, Where, Workflow, STUCK};
+
+/// The outcome a Maker's `report_done` reports on a step that offers a choice.
+pub const PASS: &str = "pass";
+
+/// The outcome a Maker's `report_rejected` reports.
+pub const REJECT: &str = "reject";
 
 /// What the world offers a routine, owned: [`Sim::mission_material`]'s answer,
 /// which a caller borrows as [`Facts`] while it draws.
@@ -325,122 +333,120 @@ impl Missions {
         if let Some(entry) = target_of(&mission).and_then(|k| self.targets.get_mut(k)) {
             entry.state = Settled::Carried;
         }
-        if let Some((id, stage)) = mission.operation() {
-            self.operations.taken(id, stage, body);
+        if let Some((id, _)) = mission.operation() {
+            self.operations.taken(id, body, None);
         }
         Some(mission)
     }
 
-    /// Open an operation for a generated draft mission and put the draft on the
-    /// table, for `fingerprint` of its target. `objective` says in a line what
-    /// the operation is for; `before` is what its document says now, when the
-    /// record already holds it. Returns the operation's id.
+    /// Set the workflows operations run on — see [`Operations::set_workflows`].
+    pub fn set_workflows(&mut self, workflows: Vec<Workflow>) {
+        self.operations.set_workflows(workflows);
+    }
+
+    /// Record what operation `id`'s document said when its step was taken up.
+    pub fn found(&mut self, id: u64, text: String) {
+        if let Some(o) = self.operations.get_mut(id) {
+            o.found = Some(text);
+        }
+    }
+
+    /// Open an operation on `workflow` for a generator's accepted proposal,
+    /// for `fingerprint` of its target, waiting on the workflow's first step —
+    /// set on the table by the engine's loop like every other step.
+    ///
+    /// `objective` says in a line what it is for, `brief` what its document is
+    /// to tell, `fields` the proposal's own, which every step's prompt is filled
+    /// from, and `reads` what its work reads; `before` is what its document
+    /// says now, when the record already holds it. Returns its id.
+    #[allow(clippy::too_many_arguments)]
     pub fn launch(
         &mut self,
-        mut mission: Mission,
+        workflow: &str,
+        generator: &str,
+        target: &str,
         fingerprint: u64,
         objective: &str,
+        document: &str,
+        brief: &str,
+        fields: BTreeMap<String, String>,
+        reads: Vec<String>,
         before: Option<&str>,
-    ) -> u64 {
-        let (generator, target) = match &mission.origin {
-            Origin::Generated {
-                generator, target, ..
-            } => (generator.clone(), target.clone()),
-            _ => (String::new(), String::new()),
-        };
-        let document = mission
-            .work
-            .as_ref()
-            .map(|w| w.writes.clone())
-            .unwrap_or_default();
+    ) -> Result<u64, String> {
         let id = self
             .operations
-            .open(&generator, &target, objective, &document);
-        self.operations.briefed(id, &mission.prompt);
+            .open(workflow, None, generator, target, objective, document)?;
+        self.operations.briefed(id, brief, fields, reads);
         if let Some(text) = before {
             self.operations.kept_before(id, text);
         }
+        let stuck = self
+            .targets
+            .get(target)
+            .filter(|e| e.fingerprint == fingerprint)
+            .map_or(0, |e| e.stuck);
+        self.targets.insert(
+            target.to_string(),
+            Ledgered {
+                state: Settled::Pooled,
+                fingerprint,
+                generator: generator.to_string(),
+                note: objective.to_string(),
+                stuck,
+                writes: Some(document.to_string()),
+            },
+        );
+        Ok(id)
+    }
+
+    /// Put `mission` on the table as the step operation `id` waits on.
+    pub fn offer_step(&mut self, id: u64, mut mission: Mission) {
+        let step = self
+            .operations
+            .get(id)
+            .and_then(|o| o.step())
+            .unwrap_or_default()
+            .to_string();
         if let Origin::Generated {
-            operation, stage, ..
+            operation,
+            step: carried,
+            ..
         } = &mut mission.origin
         {
             *operation = id;
-            *stage = Stage::Draft;
+            *carried = step;
         }
-        self.offer(mission, fingerprint);
-        id
-    }
-
-    /// The table has read operation `id`'s document — `sound` or not — and
-    /// `mission` is the review to set if one is due: put on the table, carrying
-    /// the `reading`, when it is; the target settled when the reading decides
-    /// the operation outright. See [`Operations::table_read`].
-    pub fn offer_review(
-        &mut self,
-        id: u64,
-        mut mission: Mission,
-        reading: &str,
-        sound: bool,
-    ) -> AfterReading {
-        let next = self.operations.table_read(id, sound, reading);
-        match next {
-            AfterReading::Review => {
-                if let Origin::Generated {
-                    operation, stage, ..
-                } = &mut mission.origin
-                {
-                    *operation = id;
-                    *stage = Stage::Review;
-                }
-                self.pool.push(mission);
-            }
-            AfterReading::Stands => {
-                if self.operations.get(id).map(|o| o.phase) == Some(Phase::Succeeded) {
-                    self.settle_operation(id, Outcome::Pass, reading);
-                }
-            }
-            AfterReading::Failed => self.settle_operation(id, Outcome::Fail, reading),
-        }
-        next
-    }
-
-    /// Put an operation's check against the main storyline on the table.
-    pub fn offer_check(&mut self, id: u64, mut mission: Mission) {
-        if let Origin::Generated {
-            operation, stage, ..
-        } = &mut mission.origin
-        {
-            *operation = id;
-            *stage = Stage::Canon;
-        }
-        self.operations.checking(id);
+        self.operations.offered(id);
         self.pool.push(mission);
     }
 
-    /// Put a generated mission on the table for `fingerprint` of its target.
-    fn offer(&mut self, mission: Mission, fingerprint: u64) {
-        if let Origin::Generated {
-            generator, target, ..
-        } = &mission.origin
-        {
-            let stuck = self
-                .targets
-                .get(target)
-                .filter(|e| e.fingerprint == fingerprint)
-                .map_or(0, |e| e.stuck);
-            self.targets.insert(
-                target.clone(),
-                Ledgered {
-                    state: Settled::Pooled,
-                    fingerprint,
-                    generator: generator.clone(),
-                    note: mission.mission_text(),
-                    stuck,
-                    writes: mission.work.as_ref().map(|w| w.writes.clone()),
-                },
-            );
+    /// The table took the step operation `id` waits on — one of its call's
+    /// verdicts, `outcome`, with what it found — and the operation moves on;
+    /// its target is settled once it is over.
+    pub fn table_took(&mut self, id: u64, outcome: &str, found: &str) -> Result<Where, String> {
+        let at = self
+            .operations
+            .advance(id, &Taker::Table, Some(outcome), found)?;
+        self.settle_if_over(id);
+        Ok(at)
+    }
+
+    /// Settle operation `id`'s target, and stand its carriers down, once the
+    /// operation is over: done is the target done; failed, stuck; called off,
+    /// free to be found again.
+    fn settle_if_over(&mut self, id: u64) {
+        let Some(o) = self.operations.get(id) else {
+            return;
+        };
+        let (target, at) = (o.target.clone(), o.run.at.clone());
+        match at {
+            Where::NextStep(_) => {}
+            Where::Done => self.settle_target(Some(target), Outcome::Pass, "it stands"),
+            Where::Failed(why) => self.settle_target(Some(target), Outcome::Fail, &why),
+            Where::Cancelled(_) => {
+                self.targets.remove(&target);
+            }
         }
-        self.pool.push(mission);
     }
 
     /// Record that a generator looked at a target and found nothing to do.
@@ -468,47 +474,79 @@ impl Missions {
         &self.operations
     }
 
-    /// Send succeeded lore to be checked against the main storyline — see
-    /// [`Operations::recheck`].
-    pub fn recheck(&mut self, id: u64) -> bool {
-        self.operations.recheck(id)
+    /// Put settled operation `id` back on `step` of its workflow, in a new
+    /// round — succeeded lore sent to be checked again, say.
+    pub fn reopen(&mut self, id: u64, step: &str) -> Result<(), String> {
+        self.operations.reopen(id, step)?;
+        if let Some(o) = self.operations.get(id) {
+            if let Some(entry) = self.targets.get_mut(&o.target) {
+                entry.state = Settled::Pooled;
+            }
+        }
+        Ok(())
     }
 
-    /// Record that failed operation `id`'s draft has been retired from memory.
+    /// Send operation `id` to `step` of its workflow: moved there when it is
+    /// running ([`Self::move_to`]), reopened there when it is over
+    /// ([`Self::reopen`]).
+    pub fn send_to_step(&mut self, id: u64, step: &str) -> Result<(), String> {
+        let settled = self
+            .operations
+            .get(id)
+            .map(Operation::settled)
+            .ok_or("no such operation")?;
+        match settled {
+            true => self.reopen(id, step),
+            false => self.move_to(id, step),
+        }
+    }
+
+    /// Move unsettled operation `id` to `step`, whatever it waited on: a step
+    /// waiting at the table leaves it, and the operation goes on from `step` in
+    /// a new round. `false` when it is settled or carried.
+    pub fn move_to(&mut self, id: u64, step: &str) -> Result<(), String> {
+        if self.carrying(id).is_some() {
+            return Err("its step is being carried".into());
+        }
+        let target = self
+            .operations
+            .get(id)
+            .map(|o| o.target.clone())
+            .ok_or("no such operation")?;
+        if !self.operations.cancel(id, "moved by hand") {
+            return Err("it is over".into());
+        }
+        self.pool
+            .retain(|m| m.operation().map(|(i, _)| i) != Some(id));
+        self.operations.reopen(id, step)?;
+        if let Some(entry) = self.targets.get_mut(&target) {
+            entry.state = Settled::Pooled;
+        }
+        Ok(())
+    }
+
+    /// Record that failed operation `id`'s document has been settled.
     pub fn mark_retired(&mut self, id: u64) {
         self.operations.mark_retired(id);
     }
 
-    /// Send operation `id`'s review, still waiting at the table, back to the
-    /// table's reading, so it is set again from a fresh reading. `false` when
-    /// the operation is not reviewing or its review has been taken up.
-    pub fn read_again(&mut self, id: u64) -> bool {
-        let waiting = self
-            .pool
-            .iter()
-            .position(|m| m.operation() == Some((id, Stage::Review)));
-        match waiting {
-            Some(at) if self.operations.back_to_reading(id) => {
-                self.pool.remove(at);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Open an operation that only reviews `document`, which already stands —
-    /// an operator putting a document through the table's reading and a
-    /// Maker's review. Returns its id.
-    pub fn review_document(&mut self, document: &str) -> u64 {
-        let id = self.operations.open(
+    /// Open an operation on `workflow` that starts at `step` with `document`,
+    /// which already stands — an operator putting a document through the
+    /// table's reading and a Maker's review. Returns its id.
+    pub fn review_document(
+        &mut self,
+        workflow: &str,
+        step: &str,
+        document: &str,
+    ) -> Result<u64, String> {
+        self.operations.open(
+            workflow,
+            Some(step),
             "operator",
             &format!("doc:{document}"),
             &format!("Review {document}"),
             document,
-        );
-        self.operations
-            .drafted(id, "operator", "put through review by hand");
-        id
+        )
     }
 
     /// Call operation `id` off: its waiting mission leaves the table and a
@@ -590,6 +628,47 @@ impl Missions {
     /// The generated missions waiting at the table.
     pub fn pooled(&self) -> &[Mission] {
         &self.pool
+    }
+
+    /// Whether the table holds enough: at least `keep` missions, and something
+    /// each of `makers` may take — up to `keep` more than there are Makers,
+    /// past which nothing more is written however the pool falls.
+    ///
+    /// **Stock is per Maker, not per table.** With four missions waiting the
+    /// table counted as stocked while every one of them was a stage its one
+    /// free Maker had already carried: it drew routine after routine — the
+    /// pressure door, read six times in twenty minutes — and no new work was
+    /// ever written for it.
+    pub fn stocked_for(&self, makers: &[String], keep: usize) -> bool {
+        let n = self.pool.len();
+        n >= keep + makers.len() || (n >= keep && makers.iter().all(|m| self.has_pooled_for(m)))
+    }
+
+    /// Strike, from every mission carried, waiting at the table or lodged, each
+    /// read of a document `holds` says the record no longer has — see
+    /// [`Mission::strike_gone_reads`]. Returns each body or the pool (`None`)
+    /// with the paths struck from it.
+    pub fn strike_gone_reads(
+        &mut self,
+        holds: &dyn Fn(&str) -> bool,
+    ) -> Vec<(Option<String>, Vec<String>)> {
+        let carried = self
+            .active
+            .iter_mut()
+            .chain(
+                self.lodged
+                    .iter_mut()
+                    .flat_map(|(b, q)| q.iter_mut().map(move |m| (b, m))),
+            )
+            .map(|(b, m)| (Some(b.clone()), m.strike_gone_reads(holds)));
+        let pooled = self
+            .pool
+            .iter_mut()
+            .map(|m| (None, m.strike_gone_reads(holds)));
+        carried
+            .chain(pooled)
+            .filter(|(_, gone)| !gone.is_empty())
+            .collect()
     }
 
     /// Call off every operation whose next mission waits at the table for a
@@ -802,81 +881,79 @@ impl Missions {
         notes: &str,
         answer: Option<String>,
     ) -> Option<Mission> {
+        // **The target is settled when its operation is.** A step reported is
+        // the operation moved on: where to is its workflow's.
+        //
+        // **A report the workflow will not take still closes the mission.**
+        // Kept open, its Maker would carry a step nobody can hand in — the
+        // operation called off under it, or its step moved by hand — and stand
+        // at the table with it for good. The step, if it still waits, goes
+        // back on offer.
+        if let Some((id, step)) = self.active.get(body)?.operation() {
+            let step = step.to_string();
+            let said = match outcome {
+                Outcome::Pass => self.forward(id),
+                Outcome::Fail => Some(STUCK),
+            };
+            if let Err(e) =
+                self.operations
+                    .advance(id, &Taker::Actor(body.to_string()), said, notes)
+            {
+                tracing::warn!(operation = id, %step, "a report the workflow refused: {e}");
+                let held = self.operations.get(id).and_then(|o| o.holder.as_deref());
+                if held == Some(body) {
+                    self.operations.released(id);
+                }
+            }
+        }
         let mut mission = self.active.remove(body)?;
         mission.complete(outcome, notes, answer);
-        // **The target is settled when its operation is.** A draft reported
-        // done is half the work: it is read and reviewed before it counts.
-        let settles = match (mission.operation(), outcome) {
-            (Some((id, Stage::Draft)), Outcome::Pass) => {
-                self.operations.drafted(id, body, notes);
-                None
-            }
-            (Some((id, Stage::Draft)), Outcome::Fail) => {
-                self.operations.draft_stuck(id, body, notes);
-                Some(Outcome::Fail)
-            }
-            (Some((id, Stage::Review)), Outcome::Pass) => {
-                match self.operations.passed(id, body, notes) {
-                    true => Some(Outcome::Pass),
-                    // Lore goes on to its check against the storyline.
-                    false => None,
-                }
-            }
-            (Some((id, Stage::Review)), Outcome::Fail) => {
-                match self.operations.review_stuck(id, body, notes) {
-                    true => None,
-                    false => Some(Outcome::Fail),
-                }
-            }
-            (Some((id, Stage::Canon)), Outcome::Pass) => {
-                self.operations.canon_passed(id, body, notes);
-                Some(Outcome::Pass)
-            }
-            (Some((id, Stage::Canon)), Outcome::Fail) => {
-                match self.operations.canon_stuck(id, body, notes) {
-                    true => None,
-                    false => Some(Outcome::Fail),
-                }
-            }
-            (None, o) => Some(o),
-        };
-        if let Some(settled) = settles {
-            self.settle(&mission, settled, notes);
+        match mission.operation() {
+            Some((id, _)) => self.settle_if_over(id),
+            None => self.settle(&mission, outcome, notes),
         }
         self.done.insert(body.to_string(), mission.clone());
         self.close(body, &mission);
         Some(mission)
     }
 
-    /// Reject the work the body is reviewing: its review mission closes as
-    /// failed and the operation fails for `why`. Returns the closed mission,
-    /// or `None` when the body is not reviewing.
+    /// The outcome a report of done is, on the step operation `id` waits on: a
+    /// plain completion where the step has one result, [`PASS`] where it
+    /// offers a choice.
+    fn forward(&self, id: u64) -> Option<&'static str> {
+        let o = self.operations.get(id)?;
+        let step = self.operations.workflow_of(o)?.step(o.step()?)?;
+        match step.next {
+            Next::Single(_) => None,
+            Next::Outcomes(_) => Some(PASS),
+        }
+    }
+
+    /// Send back the work the body's step judges: its mission closes as failed
+    /// and the operation goes where the step's [`REJECT`] leads — in the
+    /// workflows npcd runs, to be fixed. Returns the closed mission, or `None`
+    /// when the body's step may not reject.
     pub fn reject(&mut self, body: &str, why: &str) -> Option<Mission> {
-        let (id, stage) = self.active.get(body)?.operation()?;
-        if !stage.judges() {
+        let m = self.active.get(body)?;
+        if !m.may_reject() {
             return None;
         }
+        let (id, _) = m.operation()?;
+        self.operations
+            .advance(id, &Taker::Actor(body.to_string()), Some(REJECT), why)
+            .ok()?;
         let mut mission = self.active.remove(body)?;
         mission.complete(Outcome::Fail, why, None);
-        self.operations.rejected(id, stage, body, why);
-        self.settle(&mission, Outcome::Fail, why);
+        self.settle_if_over(id);
         self.done.insert(body.to_string(), mission.clone());
         self.close(body, &mission);
         Some(mission)
     }
 
-    /// Settle the ledger entry of the target `mission` is about.
+    /// Settle the ledger entry of the target a mission that is not an
+    /// operation's is about.
     fn settle(&mut self, mission: &Mission, outcome: Outcome, notes: &str) {
-        let key = match mission.operation() {
-            Some((id, _)) => self.operations.get(id).map(|o| o.target.clone()),
-            None => target_of(mission).map(str::to_string),
-        };
-        self.settle_target(key, outcome, notes);
-    }
-
-    /// Settle the ledger entry of operation `id`'s target.
-    fn settle_operation(&mut self, id: u64, outcome: Outcome, notes: &str) {
-        let key = self.operations.get(id).map(|o| o.target.clone());
+        let key = target_of(mission).map(str::to_string);
         self.settle_target(key, outcome, notes);
     }
 
@@ -903,11 +980,14 @@ fn target_of(m: &Mission) -> Option<&str> {
 }
 
 #[cfg(test)]
+#[path = "missions_operation_tests.rs"]
+mod operation_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::{Missions, Settled};
+    use super::Missions;
     use crate::engine::mission::bank::Facts;
-    use crate::engine::mission::{Mission, Origin, Outcome, Stage, StepOutcome, Todo, Work};
-    use crate::sim::operations::Phase;
+    use crate::engine::mission::{Mission, Origin, Outcome, StepOutcome, Todo};
 
     fn a_mission(prompt: &str) -> Mission {
         Mission::new(
@@ -1048,299 +1128,38 @@ mod tests {
         assert!(matches!(drawn.origin, Origin::Random { .. }));
     }
 
-    fn generated(target: &str) -> Mission {
-        Mission::new(
-            format!("Write the next event for {target}."),
-            vec![Todo::new("write it")],
-            Origin::Generated {
-                generator: "lives".into(),
-                target: target.into(),
-                operation: 0,
-                stage: Stage::Draft,
-            },
-        )
-        .with_work(Work {
-            writes: format!("layers/x/{target}.md"),
-            reads: vec![],
-            min_words: 0,
-            edit_optional: false,
-            anew: false,
-        })
-    }
-
-    fn review_of(target: &str) -> Mission {
-        let mut r = generated(target);
-        r.prompt = format!("Review the draft for {target}.");
-        r
-    }
-
-    /// **An operation runs draft → reading → review by somebody else, and only
-    /// then settles its target.** Lodged work still comes first; the pool before
-    /// the bank; and a done target is free again only once what it is about has
-    /// changed.
+    /// A read struck wherever a mission stands — carried, lodged or pooled —
+    /// and each place it was struck named.
     #[test]
-    fn an_operation_moves_its_target_through_the_ledger() {
-        let mut m = Missions::default();
-        let facts = Facts::default();
-        let id = m.launch(generated("life:keeper"), 7, "Keeper's next year", None);
-        assert!(m.blocks("life:keeper", 7), "pooled is in hand");
-        assert!(m.blocks("life:keeper", 8), "whatever it holds");
-        m.lodge("bram", a_mission("lodged first"));
-        assert_eq!(m.collect("bram", &facts).prompt, "lodged first");
-        m.cancel("bram");
-
-        let taken = m.collect("bram", &facts).clone();
-        assert_eq!(taken.prompt, "Write the next event for life:keeper.");
-        assert_eq!(taken.operation(), Some((id, Stage::Draft)));
-        assert_eq!(m.targets()["life:keeper"].state, Settled::Carried);
-
-        m.report("bram", Outcome::Pass, "written", None);
-        assert_eq!(
-            m.targets()["life:keeper"].state,
-            Settled::Carried,
-            "drafted is not done"
-        );
-        assert_eq!(m.operations().awaiting_reading(), vec![id]);
-
-        m.offer_review(id, review_of("life:keeper"), "the table's reading", true);
-        // The writer draws past its own review, to the bank.
-        assert!(matches!(
-            m.collect("bram", &facts).origin,
-            Origin::Random { .. }
-        ));
-        let review = m.collect("yen", &facts).clone();
-        assert_eq!(review.operation(), Some((id, Stage::Review)));
-        m.report("yen", Outcome::Pass, "mended one line", None);
-        assert_eq!(m.targets()["life:keeper"].state, Settled::Done);
-        assert_eq!(m.operations().get(id).unwrap().phase, Phase::Succeeded);
-        assert!(m.blocks("life:keeper", 7), "done, and nothing has changed");
-        assert!(!m.blocks("life:keeper", 8), "the life has a new event");
-    }
-
-    /// **A life event passed on review is checked against the storyline by a
-    /// third Maker before its target settles**, and the check may reject it.
-    #[test]
-    fn lore_is_checked_against_the_storyline_before_it_stands() {
-        let mut m = Missions::default();
-        let facts = Facts::default();
-        let mut lore = generated("life:keeper");
-        lore.work.as_mut().unwrap().writes = "layers/life/keeper/2488 X.md".into();
-        let id = m.launch(lore, 1, "Keeper's year", None);
-        m.collect("wren", &facts);
-        m.report("wren", Outcome::Pass, "written", None);
-        m.offer_review(id, review_of("life:keeper"), "sound", true);
-        m.collect("pax", &facts);
-        m.report("pax", Outcome::Pass, "checked", None);
-        assert_eq!(m.operations().get(id).unwrap().phase, Phase::Reviewed);
-        assert_eq!(
-            m.targets()["life:keeper"].state,
-            Settled::Carried,
-            "not yet"
-        );
-
-        m.offer_check(id, review_of("life:keeper"));
-        for maker in ["wren", "pax"] {
-            assert!(
-                matches!(m.collect(maker, &facts).origin, Origin::Random { .. }),
-                "{maker} has carried a stage"
-            );
-            m.cancel(maker);
-        }
-        assert_eq!(
-            m.collect("bram", &facts).operation(),
-            Some((id, Stage::Canon))
-        );
-        assert!(m.reject("bram", "the Houses did not win the war").is_some());
-        assert_eq!(m.operations().get(id).unwrap().phase, Phase::Failed);
-        assert_eq!(m.targets()["life:keeper"].state, Settled::Stuck);
-    }
-
-    /// **A stage nobody may take is called off, not left at the table.** With
-    /// two Makers, the one who drafted cannot review and the one who reviewed
-    /// cannot check — so the check waits for a Maker who does not exist.
-    #[test]
-    fn a_stage_no_maker_may_take_is_called_off() {
-        let mut m = Missions::default();
-        let facts = Facts::default();
-        let lore = generated("life:keeper");
-        let id = m.launch(lore, 1, "Keeper's year", None);
-        m.collect("wren", &facts);
-        m.report("wren", Outcome::Pass, "written", None);
-        m.offer_review(id, review_of("life:keeper"), "sound", true);
-        m.collect("pax", &facts);
-        m.report("pax", Outcome::Pass, "checked", None);
-        m.offer_check(id, review_of("life:keeper"));
-
-        assert!(
-            m.call_off_untakeable(&[]).is_empty(),
-            "nobody bound yet is not nobody left"
-        );
-        let cast = ["wren".to_string(), "pax".to_string()];
-        assert_eq!(m.call_off_untakeable(&cast), vec![id]);
-        assert!(m.pooled().is_empty(), "still waiting at the table");
-        assert_eq!(m.operations().get(id).unwrap().phase, Phase::Cancelled);
-        assert!(!m.blocks("life:keeper", 1), "its target is still blocked");
-
-        // With a third Maker who has not touched it, it waits for them.
-        let id = m.launch(generated("life:other"), 2, "Another year", None);
-        m.collect("wren", &facts);
-        m.report("wren", Outcome::Pass, "written", None);
-        m.offer_review(id, review_of("life:other"), "sound", true);
-        let cast = ["wren".to_string(), "pax".to_string()];
-        assert!(m.call_off_untakeable(&cast).is_empty(), "pax may review it");
-    }
-
-    /// **A review can reject the draft**: the operation fails and the target
-    /// counts a stuck, so a fresh operation may try it — up to the limit.
-    #[test]
-    fn a_rejected_review_fails_the_operation() {
-        let mut m = Missions::default();
-        let facts = Facts::default();
-        let id = m.launch(generated("era:x"), 1, "a story", None);
-        m.collect("wren", &facts);
-        m.report("wren", Outcome::Pass, "written", None);
-        assert!(m.reject("wren", "not reviewing").is_none());
-        m.offer_review(id, review_of("era:x"), "reading", true);
-        m.collect("pax", &facts);
-        let closed = m.reject("pax", "the scene is summary throughout").unwrap();
-        assert_eq!(closed.report.unwrap().outcome, Outcome::Fail);
-        let op = m.operations().get(id).unwrap();
-        assert_eq!(op.phase, Phase::Failed);
-        assert_eq!(
-            (op.writer.as_deref(), op.reviewer.as_deref()),
-            (Some("wren"), Some("pax"))
-        );
-        assert_eq!(m.targets()["era:x"].state, Settled::Stuck);
-        assert!(!m.blocks("era:x", 1), "stuck once is tried again");
-    }
-
-    /// **An operation can be edited while it runs, and called off.** The brief
-    /// edits only while its mission waits at the table.
-    #[test]
-    fn an_operation_is_edited_and_cancelled() {
-        let mut m = Missions::default();
-        let id = m.launch(generated("era:y"), 1, "a story", None);
-        let op = m
-            .edit_operation(
-                id,
-                Some("Operation Long Watch"),
-                Some("Tell the siege"),
-                Some("New brief."),
+    fn a_gone_read_is_struck_from_every_mission_wherever_it_waits() {
+        let gone = "layers/stories/gone.md";
+        let with_read = |p: &str| {
+            Mission::new(
+                p,
+                vec![Todo::new(format!("read {gone}")), Todo::report("report")],
+                Origin::Random {
+                    routine: "r".into(),
+                },
             )
-            .unwrap();
-        assert_eq!(op.name, "Operation Long Watch");
-        assert_eq!(m.waiting_brief(id), Some("New brief."));
-        m.collect("wren", &Facts::default());
-        assert_eq!(m.carrying(id), Some("wren"));
-        assert!(m.edit_operation(id, None, None, Some("too late")).is_err());
-        assert!(m.cancel_operation(id, "not wanted"));
-        assert!(!m.is_on_mission("wren"), "stood down");
-        // And it is to be told so, once, and the chapter it was in is closed.
-        assert_eq!(m.take_stood_down(), vec!["wren".to_string()]);
-        assert!(m.take_stood_down().is_empty(), "told twice");
-        assert!(m.last_closed("wren").is_some(), "no chapter closed");
-        assert!(!m.blocks("era:y", 1));
-        assert_eq!(m.operations().get(id).unwrap().phase, Phase::Cancelled);
-        assert!(!m.cancel_operation(id, "again"));
-
-        let r = m.review_document("layers/stories/old.md");
-        assert_eq!(m.operations().awaiting_reading(), vec![r]);
-
-        // A review still waiting can be sent back to be read again; one taken
-        // up cannot.
-        m.offer_review(r, review_of("doc:old"), "old reading", true);
-        assert!(m.read_again(r));
-        assert!(m.pooled().is_empty());
-        assert_eq!(m.operations().awaiting_reading(), vec![r]);
-        assert!(!m.read_again(r), "no longer reviewing");
-        m.offer_review(r, review_of("doc:old"), "new reading", true);
-        m.collect("pax", &Facts::default());
-        assert!(!m.read_again(r), "taken up");
-    }
-
-    /// **Stuck is retried, but not for ever**; nothing-to-do holds until the
-    /// target changes; a called-off mission frees its target; and discarding the
-    /// pool releases every target in it.
-    #[test]
-    fn stuck_nothing_cancel_and_discard_each_settle_a_target_their_own_way() {
+        };
         let mut m = Missions::default();
-        let facts = Facts::default();
-        for round in 1..=2 {
-            m.launch(generated("pair:a|b"), 3, "compare", None);
-            m.collect("wren", &facts);
-            m.report("wren", Outcome::Fail, "no way to the desk", None);
-            assert_eq!(m.targets()["pair:a|b"].stuck, round);
+        m.assign("vespera", with_read("carried"));
+        m.lodge("sila", with_read("lodged"));
+        m.pool.push(with_read("pooled"));
+        m.assign("paxon", a_mission("reads nothing"));
+        let struck = m.strike_gone_reads(&|p| p != gone);
+        assert_eq!(
+            struck,
+            [
+                (Some("vespera".to_string()), vec![gone.to_string()]),
+                (Some("sila".to_string()), vec![gone.to_string()]),
+                (None, vec![gone.to_string()]),
+            ]
+        );
+        for mission in [&m.active["vespera"], &m.lodged["sila"][0], &m.pool[0]] {
+            assert_eq!(mission.todo.len(), 1, "{}", mission.prompt);
+            assert!(mission.todo[0].reports);
         }
-        assert!(m.blocks("pair:a|b", 3), "stuck twice on the same text");
-        assert!(!m.blocks("pair:a|b", 4));
-
-        m.decline("pair:c|d", "boundaries", 5, "They agree.");
-        assert!(m.blocks("pair:c|d", 5));
-        assert!(!m.blocks("pair:c|d", 6));
-
-        m.launch(generated("era:x"), 1, "a story", None);
-        m.collect("pax", &facts);
-        assert!(m.cancel("pax"));
-        assert!(!m.blocks("era:x", 1), "called off is not settled");
-
-        m.launch(generated("era:y"), 1, "a story", None);
-        m.launch(generated("era:z"), 1, "a story", None);
-        assert_eq!(m.discard_pool(), 2);
-        assert!(!m.blocks("era:y", 1));
-
-        // Forgetting the settled leaves what is in hand.
-        m.launch(generated("era:w"), 1, "a story", None);
-        assert_eq!(m.forget_settled(), 2, "the stuck pair and the declined one");
-        assert!(m.blocks("era:w", 1));
-        assert!(!m.blocks("pair:a|b", 3));
-        assert_eq!(m.next_draw(), 0);
-        assert_eq!(m.next_draw(), 1);
-    }
-
-    /// **A reserved target is held against a second generation, and let go
-    /// when nothing comes of it**; an operator's mission put over a generated
-    /// one releases the generated one's target.
-    #[test]
-    fn reserving_and_replacing_hold_and_release_targets() {
-        let mut m = Missions::default();
-        assert!(m.reserve("life:keeper", "lives", 1));
-        assert!(!m.reserve("life:keeper", "lives", 1), "held");
-        m.release("life:keeper");
-        assert!(m.reserve("life:keeper", "lives", 1), "released");
-        m.launch(generated("life:keeper"), 1, "the next year", None);
-        m.release("life:keeper");
-        assert!(m.blocks("life:keeper", 1), "offered is not released");
-
-        m.collect("wren", &Facts::default());
-        assert_eq!(m.targets()["life:keeper"].state, Settled::Carried);
-        m.assign("wren", a_mission("an operator's"));
-        assert!(!m.blocks("life:keeper", 1), "replaced, so released");
-    }
-
-    /// **A stuck target released after a failed generation stays stuck**, its
-    /// count kept, so it still reaches the limit.
-    #[test]
-    fn releasing_a_stuck_target_keeps_its_count() {
-        let mut m = Missions::default();
-        let facts = Facts::default();
-        m.launch(generated("pair:a|b"), 3, "compare", None);
-        m.collect("wren", &facts);
-        m.report("wren", Outcome::Fail, "no way to the desk", None);
-        assert!(
-            m.reserve("pair:a|b", "boundaries", 3),
-            "stuck once is retried"
-        );
-        m.release("pair:a|b");
-        assert_eq!(m.targets()["pair:a|b"].state, Settled::Stuck);
-        assert_eq!(m.targets()["pair:a|b"].stuck, 1);
-
-        m.launch(generated("pair:a|b"), 3, "compare", None);
-        m.collect("wren", &facts);
-        m.report("wren", Outcome::Fail, "no way to the desk", None);
-        assert!(
-            m.blocks("pair:a|b", 3),
-            "the second stuck reaches the limit"
-        );
     }
 
     #[test]

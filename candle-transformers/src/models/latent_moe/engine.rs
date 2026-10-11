@@ -12,20 +12,19 @@
 //! The reference forward (`streaming.rs` / `transformer.rs`) remains the correctness oracle:
 //! the engine output is validated against it (same "Paris"), then measured for speed.
 
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::quantized::decode_rows::DecodeRows;
-use candle::quantized::{get_vram_info, gguf_file, Int8Mode, MmapRegistration, SumScale};
+use candle::quantized::{get_vram_info, Int8Mode, MmapRegistration, SumScale};
 use candle::{DType, Device, Result, Tensor, D};
-use memmap2::MmapOptions;
 
+use crate::models::expert_lre::section::{geometries_of, open_section};
 use crate::models::expert_lre::{
-    layer_geometries, minimum_resident_slots, slot_bytes_for, ExpertCache, ExpertCacheSetup,
-    MmapExpertRef,
+    minimum_resident_slots, slot_bytes_for, ExpertCache, ExpertCacheSetup,
 };
+use crate::models::model_pack::ModelPack;
 use crate::models::profile::span;
 use candle_nn::kv_cache::WeightZone;
 
@@ -78,25 +77,19 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Load the merged single-file GGUF into the resident engine model.
+    /// Load a model pack into the resident engine model.
     ///
-    /// Non-expert weights load to `device` (VRAM); the routed experts are registered as
-    /// byte-ranges into the mmap and served by the `ExpertCache`'s three tiers (VRAM slots
-    /// leased from the span's weight zone / pinned warm bank / the repacked `.experts.pack`
-    /// on NVMe; int8-KO when `int8mode` is enabled — the 2×-FP16 grouped GEMM path).
-    /// Load a model of architecture `arch` from its merged GGUF.
+    /// Non-expert weights load to `device` (VRAM) from the pack's GGUF part; the routed
+    /// experts are served by the `ExpertCache`'s tiers (VRAM slots leased from the span's
+    /// weight zone / pinned warm bank / the pack's expert section on NVMe), as the int8-KO
+    /// twins the pack was built for. Load a model of architecture `arch`.
     ///
     /// `arch` is what makes the engine model-agnostic: it supplies the config
     /// defaults, metadata namespace, and tensor names. Pass
     /// [`deepseek4::DEEPSEEK_V4`](crate::models::deepseek4::DEEPSEEK_V4) for
     /// DeepSeek-V4-Flash.
-    pub fn load(
-        merged_path: &Path,
-        arch: &'static dyn Arch,
-        device: &Device,
-        int8mode: Int8Mode,
-    ) -> Result<Self> {
-        Ok(Self::load_with_drafter(merged_path, None, arch, device, int8mode)?.0)
+    pub fn load(pack_path: &Path, arch: &'static dyn Arch, device: &Device) -> Result<Self> {
+        Ok(Self::load_with_drafter(pack_path, None, arch, device)?.0)
     }
 
     /// [`Self::load`], with the DSpark speculative-decode drafter loaded as part of the
@@ -111,14 +104,16 @@ impl Engine {
     /// Returns the drafter alongside the engine; attach it with
     /// [`super::wave::BatchedEngine::with_drafter`].
     pub fn load_with_drafter(
-        merged_path: &Path,
+        pack_path: &Path,
         dspark_path: Option<&Path>,
         arch: &'static dyn Arch,
         device: &Device,
-        int8mode: Int8Mode,
     ) -> Result<(Self, Option<super::dspark::DsparkDrafter>)> {
-        // GgufModel handles config + convenient loading of the resident (non-expert) tensors.
-        let mut gguf = GgufModel::open(std::slice::from_ref(&merged_path.to_path_buf()))?;
+        let pack = ModelPack::open(pack_path)?;
+        let int8mode = pack.int8_mode;
+        // GgufModel handles config + convenient loading of the resident (non-expert) tensors;
+        // the pack's GGUF part is an ordinary GGUF to it.
+        let mut gguf = GgufModel::open(&[pack_path.to_path_buf()])?;
         let cfg = loader::config_from_gguf(&gguf, arch)?;
 
         // Refuse a model/host/kernel geometry disagreement before any arena is laid
@@ -128,60 +123,38 @@ impl Engine {
         // the four declarations that have to agree.
         paged::assert_geometry(&cfg)?;
 
-        // A raw mmap + its Content give the expert byte-offsets for the ExpertCache. We deliberately
-        // do NOT `register_mmap_cuda` here: that page-locks the ENTIRE model file (~156 GB), and the
-        // CUDA path already repacks every expert into the page-locked `PinnedPool` (~100 GB) and
-        // loads from THERE (`load_from_pinned`), never DMAing native bytes from the mmap. Registering
-        // the mmap on top double-locks the experts (156 + 100 GB > host RAM) → `cuMemAllocHost` OOM.
-        // Staging reads the mmap via ordinary CPU access (pageable page cache), which needs no pin.
-        let file = File::open(merged_path)?;
-        let mmap = Arc::new(unsafe { MmapOptions::new().map(&file)? });
+        // The pack's GGUF part, mapped, held for the life of the engine. Deliberately NOT
+        // `register_mmap_cuda`: that would page-lock the whole part non-pageable, competing with
+        // the page-locked expert tiers, while nothing on the forward DMAs out of it.
+        let mmap = pack.mmap.clone();
         let reg: Option<MmapRegistration> = None;
-        let ct = gguf_file::Content::read(&mut std::io::Cursor::new(&mmap[..]))?;
 
-        // ── Build the ExpertCache from the 3D-merged MXFP4 routed experts ──
+        // ── The expert section: every routed layer's records, in block order ──
         let n_expert = cfg.n_routed_experts;
-        let moe_layers: Vec<usize> = (0..cfg.n_layers)
-            .filter(|&i| {
-                ct.tensor_infos
-                    .contains_key(&cfg.arch.weight(i, Weight::RoutedExperts(Ffn::Gate)))
-            })
+        let Some(at) = pack.experts else {
+            candle::bail!("{}: the pack has no expert section", pack_path.display());
+        };
+        let Device::Cuda(cuda) = device else {
+            candle::bail!("latent_moe engine: the expert cache is a CUDA-only path");
+        };
+        let section = open_section(&pack.path, at.offset, cuda)?;
+        if section.header().experts_per_layer as usize != n_expert {
+            candle::bail!(
+                "the expert section holds {} experts per layer, the config declares {n_expert}",
+                section.header().experts_per_layer
+            );
+        }
+        let moe_layers: Vec<usize> = section
+            .header()
+            .layers
+            .iter()
+            .map(|l| l.block as usize)
             .collect();
-        let mut all_host_refs: Vec<Vec<MmapExpertRef>> = Vec::with_capacity(moe_layers.len());
-        for &i in &moe_layers {
-            let get = |f: Ffn| -> Result<&gguf_file::TensorInfo> {
-                let name = cfg.arch.weight(i, Weight::RoutedExperts(f));
-                ct.tensor_infos
-                    .get(&name)
-                    .ok_or_else(|| candle::Error::msg(format!("missing {name}")))
-            };
-            let (gi, ui, di) = (get(Ffn::Gate)?, get(Ffn::Up)?, get(Ffn::Down)?);
-            // Per-expert byte length (product of dims after the expert axis), per-projection dtype.
-            let ebytes = |info: &gguf_file::TensorInfo| {
-                info.shape.dims()[1..].iter().product::<usize>() / info.ggml_dtype.block_size()
-                    * info.ggml_dtype.type_size()
-            };
-            let (gb, ub, db) = (ebytes(gi), ebytes(ui), ebytes(di));
-            let base =
-                |info: &gguf_file::TensorInfo| (ct.tensor_data_offset + info.offset) as usize;
-            let (gbase, ubase, dbase) = (base(gi), base(ui), base(di));
-            let refs = (0..n_expert)
-                .map(|j| MmapExpertRef {
-                    gate_offset: gbase + j * gb,
-                    gate_len: gb,
-                    up_offset: ubase + j * ub,
-                    up_len: ub,
-                    down_offset: dbase + j * db,
-                    down_len: db,
-                    gate_shape: gi.shape.dims()[1..].to_vec(),
-                    up_shape: ui.shape.dims()[1..].to_vec(),
-                    down_shape: di.shape.dims()[1..].to_vec(),
-                    gate_dtype: gi.ggml_dtype,
-                    up_dtype: ui.ggml_dtype,
-                    down_dtype: di.ggml_dtype,
-                })
-                .collect();
-            all_host_refs.push(refs);
+        if moe_layers.iter().any(|&i| i >= cfg.n_layers) {
+            candle::bail!(
+                "the expert section names blocks {moe_layers:?}, past the model's {} layers",
+                cfg.n_layers
+            );
         }
 
         // ── VRAM governor ──
@@ -385,7 +358,7 @@ impl Engine {
                 initial_weight_bytes, set_weight_floor, span_end, weight_capacity_bytes,
             };
             let stream = cuda_dev.cuda_stream();
-            let geoms = layer_geometries(&all_host_refs, int8mode)?;
+            let geoms = geometries_of(section.header())?;
             let slot_bytes = slot_bytes_for(&geoms);
             let limit_bytes = weight_capacity_bytes(&stream)?;
             let initial_bytes = initial_weight_bytes(&stream)?;
@@ -420,18 +393,14 @@ impl Engine {
         let zone_slot_bytes = zone.slot_bytes();
 
         let experts = Arc::new(ExpertCache::new(ExpertCacheSetup {
-            mmap: mmap.clone(),
-            host_refs: all_host_refs,
+            pack: section,
             zone,
             device,
             experts_per_layer: n_expert,
             experts_used: cfg.n_activated_experts,
-            gguf_path: merged_path,
-            // Persistent pack beside the GGUF: written once on first boot
-            // (repacked kernel-layout records), authoritative cold tier after.
-            expert_pack_dir: merged_path.parent(),
             progress: None,
             int8mode,
+            mapped_bytes: pack.gguf_len(),
             offloaded_bytes: 0,
         })?);
         #[cfg(feature = "cuda")]
@@ -884,13 +853,19 @@ fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
 mod tests {
     use super::*;
     // End-to-end gates against the real DeepSeek-V4-Flash checkpoint.
-    use crate::models::deepseek4::DEEPSEEK_V4;
+    use crate::models::deepseek4::{gate_packs, DEEPSEEK_V4};
 
-    fn merged() -> std::path::PathBuf {
-        std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            // Pre-repacked MXFP4_KO file (offline `prepare_ko_gguf`): experts are already the
-            // lane-major KO twin, so staging skips the runtime repack entirely (fast load).
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf")
+    /// The engine over the merged checkpoint's pack, or `None` when this machine
+    /// has neither.
+    fn merged(device: &Device) -> Result<Option<Engine>> {
+        let Some(pack) = gate_packs::target(device)? else {
+            eprintln!("[skip] merged file absent");
+            return Ok(None);
+        };
+        let t0 = std::time::Instant::now();
+        let engine = Engine::load(&pack, &DEEPSEEK_V4, device)?;
+        eprintln!("[engine] load {:.1}s", t0.elapsed().as_secs_f32());
+        Ok(Some(engine))
     }
 
     /// RUNG 3 — the step-4 milestone: the engine answers "Paris" with the
@@ -900,15 +875,10 @@ mod tests {
     #[test]
     #[ignore]
     fn engine_generate_paris_kernel() -> Result<()> {
-        let path = merged();
-        if !path.exists() {
-            eprintln!("[skip] merged file absent");
-            return Ok(());
-        }
         let device = Device::new_cuda(0)?;
-        let t0 = std::time::Instant::now();
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
-        eprintln!("[kernel] load {:.1}s", t0.elapsed().as_secs_f32());
+        let Some(engine) = merged(&device)? else {
+            return Ok(());
+        };
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
             "deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -957,13 +927,10 @@ mod tests {
     #[test]
     #[ignore]
     fn engine_conversation_prompt_ab() -> Result<()> {
-        let path = merged();
-        if !path.exists() {
-            eprintln!("[skip] merged file absent");
-            return Ok(());
-        }
         let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        let Some(engine) = merged(&device)? else {
+            return Ok(());
+        };
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
             "deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -1013,13 +980,10 @@ mod tests {
     fn indexer_recall_sweep_real_traces() -> Result<()> {
         use super::super::gallery::{bdp_recall, sign_pack, topm_select};
 
-        let path = merged();
-        if !path.exists() {
-            eprintln!("[skip] merged file absent");
-            return Ok(());
-        }
         let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        let Some(engine) = merged(&device)? else {
+            return Ok(());
+        };
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
             "deepseek-ai/DeepSeek-V4-Flash-0731",
             hf_hub::RepoType::Model,
@@ -1122,18 +1086,13 @@ mod tests {
     #[test]
     #[ignore]
     fn engine_generate_paris_fast() -> Result<()> {
-        let path = merged();
-        if !path.exists() {
-            eprintln!("[skip] merged file absent");
-            return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let t0 = std::time::Instant::now();
         // MXFP4 experts repack to the exponent-collapse int8 twin MXFP4_KO: an exact 4-bit
         // byte-reorder (no F32 requant), so the 147 GB stays ~156 GB and fits VRAM(72)+RAM(189)
         // where the old Q6_KO/Q8_KO requant blew past RAM. The int8 grouped GEMM reads it directly.
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
-        eprintln!("[engine] load {:.1}s", t0.elapsed().as_secs_f32());
+        let device = Device::new_cuda(0)?;
+        let Some(engine) = merged(&device)? else {
+            return Ok(());
+        };
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
             "deepseek-ai/DeepSeek-V4-Flash-0731",

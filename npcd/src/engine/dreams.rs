@@ -88,13 +88,10 @@ const DREAM_MIN_WORDS: usize = 150;
 /// see [`finished`]. A refrain stays well under it; a loop is most of the dream.
 const DREAM_MAX_REPEATED: f32 = 0.3;
 
-/// How hard the dream decode's DRY penalty pushes against a repeated run —
-/// under the 0.8 the acting turns use. See [`dream`].
-const DREAM_DRY_MULTIPLIER: f32 = 0.5;
-
-/// The longest repeated run, in tokens, a dream may carry unpenalised: a short
-/// refrain like "The light is steady." fits; a loop does not.
-const DREAM_DRY_ALLOWED: i32 = 4;
+/// The multiplicative repeat penalty a dream decodes under, over the recent
+/// window — gentle enough that a refrain or a named object can come back,
+/// firm enough to break a loop. See [`dream`].
+const DREAM_REPEAT_PENALTY: f32 = 1.05;
 
 /// The fewest sentences a passage holds — see [`passages`].
 const MIN_SENTENCES: usize = 2;
@@ -271,26 +268,26 @@ pub async fn dream(
     selection.select(STANCE_SELECTOR, Stance::Dreaming.id());
     // **A dream is prose, and the act sampling ruins it.**
     //
-    // `base_config.sampling` carries the checkpoint's repetition penalties — a
-    // DRY penalty (base 1.75), plus presence and any cross-turn penalty. Over a
-    // seven-hundred-token dream those forbid the natural word
-    // the moment it would repeat — parallel phrasing, a refrain, the same object
-    // named twice — so the vocabulary is pushed ever further from what the
-    // sentence wanted, and the dream that opens cleanly reaches for stranger and
-    // stranger synonyms as it goes. So presence and cross-turn come off, and only
-    // the reasoning suppression stays (a `<think>` opened inside a dream is the
-    // model planning it in the dreamer's voice — see the reflection).
+    // `base_config.sampling` carries the checkpoint's presence penalty and any
+    // cross-turn penalty. Over a seven-hundred-token dream those forbid the
+    // natural word the moment it would repeat — parallel phrasing, a refrain,
+    // the same object named twice — so the vocabulary is pushed ever further
+    // from what the sentence wanted, and the dream that opens cleanly reaches
+    // for stranger and stranger synonyms as it goes. So presence and cross-turn
+    // come off, and only the reasoning suppression stays (a `<think>` opened
+    // inside a dream is the model planning it in the dreamer's voice — see the
+    // reflection).
     //
-    // **DRY stays, lightly, and only past a refrain's length.** With none at all
-    // a dream could fall into a loop and run its budget out in it — measured:
-    // twenty-five sentences of "I am the bird. / I am the sky. / I am the stars…",
-    // and a corridor of "I pass the fourth door. / It is closed." repeated door
-    // by door. A short refrain ([`DREAM_DRY_ALLOWED`] tokens) costs nothing; a
-    // longer repeated run is penalised gently and more the longer it runs.
+    // **A gentle repeat penalty takes their place.** With no penalty at all a
+    // dream could fall into a loop and run its budget out in it — measured:
+    // twenty-five sentences of "I am the bird. / I am the sky. / I am the
+    // stars…", and a corridor of "I pass the fourth door. / It is closed."
+    // repeated door by door. [`DREAM_REPEAT_PENALTY`] over the recent window
+    // leans on a run that keeps coming back without forbidding any one word.
     let sampling = base_config
         .sampling
         .clone()
-        .with_dry_penalty(DREAM_DRY_MULTIPLIER, 1.75, DREAM_DRY_ALLOWED, 512)
+        .with_repeat_penalty(DREAM_REPEAT_PENALTY)
         .with_presence_penalty(0.0)
         .with_cross_turn_penalty(0.0)
         .with_graceful_segment_close_after(0)
@@ -330,8 +327,8 @@ pub async fn dream(
 ///   next reflection asks for another.
 /// - **It loops.** One decode cycled a handful of clauses — "the light ring
 ///   flickers", "I am standing there", "and I am not" — for seven paragraphs,
-///   each sentence differing only in the order of the same pieces, so the DRY
-///   penalty on repeated runs never saw it. More than [`DREAM_MAX_REPEATED`] of
+///   each sentence differing only in the order of the same pieces, which no
+///   penalty on repeated tokens sees. More than [`DREAM_MAX_REPEATED`] of
 ///   its clauses being repeats is not kept.
 fn finished(story: &str) -> anyhow::Result<String> {
     let story = through_last_sentence(story.trim());

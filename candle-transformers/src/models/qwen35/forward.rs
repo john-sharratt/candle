@@ -1674,17 +1674,37 @@ fn embed_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::batch_test::test_helpers::hf_get;
+    use crate::models::batch_test::test_helpers::{gate_pack, hf_get};
     use crate::models::batch_test::utils::TestParams;
     use crate::models::batched_inference::BatchedConfig;
     use crate::models::dialect::Dialect;
-    use crate::models::quantized_qwen35::from_gguf_path;
+    use crate::models::model_pack::{PackFamily, PackRequest};
+    use crate::models::quantized_qwen35::{from_pack, TOKENIZER_REPO, TOKENIZER_REV};
     use crate::models::qwen35::loader::load_reference_model;
-    use crate::models::qwen35::quantized_loader::Qwen35LoadOptions;
     use candle::quantized::gguf_file::Content;
     use candle::quantized::Int8Mode;
     use hf_hub::RepoType;
     use std::io::{BufReader, Seek, SeekFrom};
+
+    /// The BF16 0.8B these oracles compare against: the checkpoint the F32
+    /// reference reads, packed for the wave at `Int8Mode::Off` so both sides do
+    /// the same arithmetic on the same weights.
+    const BF16_0_8B: (&str, &str, &str) = (
+        "unsloth/Qwen3.5-0.8B-GGUF",
+        "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+        "Qwen3.5-0.8B-BF16.gguf",
+    );
+
+    /// [`BF16_0_8B`] loaded through its pack.
+    fn bf16_wave_model(device: &Device) -> Result<HybridBatched> {
+        let request = PackRequest::of(
+            PackFamily::Qwen35,
+            BF16_0_8B,
+            (TOKENIZER_REPO, TOKENIZER_REV),
+            Some(Int8Mode::Off),
+        );
+        from_pack(&gate_pack(&request, device)?, device)
+    }
 
     /// **The wave's oracle.** Prefill the same tokens through the F32
     /// reference — which is token-identical to llama.cpp — and through
@@ -1706,16 +1726,12 @@ mod tests {
                 cargo test --release --features cuda --lib -p candle-transformers \
                 qwen35::forward::tests::wave_matches_the_reference -- --ignored --nocapture"]
     fn wave_matches_the_reference() -> Result<()> {
-        let path = hf_get(
-            "unsloth/Qwen3.5-0.8B-GGUF",
-            RepoType::Model,
-            "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
-            "Qwen3.5-0.8B-BF16.gguf",
-        )?;
+        let (repo, rev, file) = BF16_0_8B;
+        let path = hf_get(repo, RepoType::Model, rev, file)?;
         let tok_path = hf_get(
-            "Qwen/Qwen3.5-0.8B",
+            TOKENIZER_REPO,
             RepoType::Model,
-            "2fc06364715b967f1860aea9cf38778875588b17",
+            TOKENIZER_REV,
             "tokenizer.json",
         )?;
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
@@ -1809,17 +1825,7 @@ mod tests {
 
         // ── The production wave, on the GPU ──
         let device = Device::new_cuda(0)?;
-        let model = from_gguf_path(
-            &path,
-            &device,
-            Qwen35LoadOptions {
-                int8mode: Some(Int8Mode::Off),
-                expert_pack_dir: None,
-                mtp_path: None,
-                gate_donor_path: None,
-                tensor_overrides: Vec::new(),
-            },
-        )?;
+        let model = bf16_wave_model(&device)?;
         let mut session = model.create_batched_session(BatchedConfig::default())?;
         let seq = session.create_sequence()?;
         let ids = Tensor::from_vec(tokens.clone(), (1, tokens.len()), &device)?;
@@ -2032,16 +2038,10 @@ mod tests {
                 cargo test --release --features cuda --lib -p candle-transformers \
                 qwen35::forward::tests::wave_one_shot_equals_segmented -- --ignored --nocapture"]
     fn wave_one_shot_equals_segmented() -> Result<()> {
-        let path = hf_get(
-            "unsloth/Qwen3.5-0.8B-GGUF",
-            RepoType::Model,
-            "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
-            "Qwen3.5-0.8B-BF16.gguf",
-        )?;
         let tok_path = hf_get(
-            "Qwen/Qwen3.5-0.8B",
+            TOKENIZER_REPO,
             RepoType::Model,
-            "2fc06364715b967f1860aea9cf38778875588b17",
+            TOKENIZER_REV,
             "tokenizer.json",
         )?;
         let params = TestParams::new(4, &std::fs::read_to_string(&tok_path)?, Dialect::qwen35())
@@ -2052,17 +2052,7 @@ mod tests {
         tokens.truncate(200);
 
         let device = Device::new_cuda(0)?;
-        let model = from_gguf_path(
-            &path,
-            &device,
-            Qwen35LoadOptions {
-                int8mode: Some(Int8Mode::Off),
-                expert_pack_dir: None,
-                mtp_path: None,
-                gate_donor_path: None,
-                tensor_overrides: Vec::new(),
-            },
-        )?;
+        let model = bf16_wave_model(&device)?;
 
         // One forward over `[0, n)`, optionally split at `cut`.
         let run = |cut: Option<usize>| -> Result<Tensor> {
@@ -2125,7 +2115,10 @@ mod tests {
         // The same split through the F32 reference. It shares the mixer core
         // (`delta_net_mix`) with the production path but none of the paged KV,
         // so a split it survives and the wave does not is attention-side, and
-        // one they both fail is the recurrence composing wrongly.
+        // one they both fail is the recurrence composing wrongly. It reads the
+        // checkpoint itself: the pack holds the streamed projections repacked.
+        let (repo, rev, file) = BF16_0_8B;
+        let path = hf_get(repo, RepoType::Model, rev, file)?;
         let file = std::fs::File::open(&path)?;
         let mut reader = BufReader::new(file);
         let content = Content::read(&mut reader)?;

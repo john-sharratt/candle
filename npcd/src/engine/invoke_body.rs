@@ -117,9 +117,11 @@ fn body_of(tool: &Tool, within: &Within) -> StencilParam {
         enum_values: None,
         items: None,
         min_items: 0,
+        max_items: None,
         properties: Some(stencil_params(tool, within)),
         nullable: false,
         minimum: None,
+        max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),
     }

@@ -10,16 +10,20 @@
 
 use std::path::Path;
 
+use super::config::{REJECTION_NAMES_AN_ERA, REJECTION_QUOTES};
 use super::corpus::{era_year, heading};
 use super::reading::quotes_draft;
-use crate::engine::mission::{Stage, Work};
+use crate::engine::mission::Work;
 
 /// Why a rejection of `work` with `why` is refused, for the Maker to read and
-/// answer; `None` when it shows what it must. `root` is the mind the documents
-/// are read from. A draft no longer on the record needs no quote.
-pub fn unsupported(root: &Path, work: &Work, stage: Stage, why: &str) -> Option<String> {
+/// answer; `None` when it shows what its step's checks ask — the draft quoted
+/// (`rejection-quotes-the-draft`), the era it contradicts named
+/// (`rejection-names-an-era`). `root` is the mind the documents are read from.
+/// A draft no longer on the record needs no quote.
+pub fn unsupported(root: &Path, work: &Work, why: &str) -> Option<String> {
+    let checks = |name: &str| work.checks.iter().any(|c| c == name);
     let draft = std::fs::read_to_string(root.join(&work.writes)).ok()?;
-    if !quotes_draft(why, &draft) {
+    if checks(REJECTION_QUOTES) && !quotes_draft(why, &draft) {
         return Some(format!(
             "Your reason does not quote {doc}. Copy the words of it that cannot stand, exactly, \
              between double quotes — \"<the draft's sentence>\" — and say what is wrong with \
@@ -27,7 +31,7 @@ pub fn unsupported(root: &Path, work: &Work, stage: Stage, why: &str) -> Option<
             doc = work.writes
         ));
     }
-    if stage != Stage::Canon {
+    if !checks(REJECTION_NAMES_AN_ERA) {
         return None;
     }
     let eras: Vec<(String, Option<u32>)> = work
@@ -62,6 +66,17 @@ mod tests {
     const DRAFT: &str = "The Hart interviewer wanted to know what the room was and you could not \
                          tell her. The floor just shakes.";
 
+    /// A review's checks on a rejection, and a canon check's.
+    const REVIEW: &[&str] = &[REJECTION_QUOTES];
+    const CANON: &[&str] = &[REJECTION_QUOTES, REJECTION_NAMES_AN_ERA];
+
+    fn checked(work: &Work, checks: &[&str]) -> Work {
+        Work {
+            checks: checks.iter().map(|c| c.to_string()).collect(),
+            ..work.clone()
+        }
+    }
+
     fn mind() -> (tempfile::TempDir, Work) {
         let dir = tempfile::tempdir().unwrap();
         let write = |rel: &str, text: &str| {
@@ -88,6 +103,8 @@ mod tests {
             min_words: 0,
             edit_optional: true,
             anew: false,
+            checks: Vec::new(),
+            tools: vec!["report_rejected".into()],
         };
         (dir, work)
     }
@@ -97,14 +114,20 @@ mod tests {
     #[test]
     fn a_rejection_quotes_the_draft_it_rejects() {
         let (dir, work) = mind();
+        let review = checked(&work, REVIEW);
         let carried = "The draft is structurally broken — it loops endlessly on the same \
                        description of the room.";
-        let refused = unsupported(dir.path(), &work, Stage::Review, carried).unwrap();
+        let refused = unsupported(dir.path(), &review, carried).unwrap();
         assert!(refused
             .starts_with("Your reason does not quote layers/life/cadence/2900 The Shelf.md."));
         let quoted = "\"The Hart interviewer wanted to know what the room was\" — no such \
                       interviewer exists before the towers.";
-        assert_eq!(unsupported(dir.path(), &work, Stage::Review, quoted), None);
+        assert_eq!(unsupported(dir.path(), &review, quoted), None);
+        assert_eq!(
+            unsupported(dir.path(), &work, carried),
+            None,
+            "a step that does not check rejections takes any reason"
+        );
     }
 
     /// **Against the storyline, a rejection names the era it contradicts**, by
@@ -112,14 +135,20 @@ mod tests {
     #[test]
     fn a_canon_rejection_names_its_era() {
         let (dir, work) = mind();
+        let canon = checked(&work, CANON);
         let unnamed = "\"The floor just shakes.\" is wrong.";
-        assert!(unsupported(dir.path(), &work, Stage::Canon, unnamed)
+        assert!(unsupported(dir.path(), &canon, unnamed)
             .unwrap()
             .contains("Name the era it contradicts — The Final Battle, The Tower Age —"));
+        assert_eq!(
+            unsupported(dir.path(), &checked(&work, REVIEW), unnamed),
+            None,
+            "a review need not name an era"
+        );
         let titled = "\"The floor just shakes.\" — the final battle era has nobody left there.";
-        assert_eq!(unsupported(dir.path(), &work, Stage::Canon, titled), None);
+        assert_eq!(unsupported(dir.path(), &canon, titled), None);
         let dated = "\"The floor just shakes.\" — by 2937 the shelf is a tower footing.";
-        assert_eq!(unsupported(dir.path(), &work, Stage::Canon, dated), None);
+        assert_eq!(unsupported(dir.path(), &canon, dated), None);
     }
 
     /// A draft already gone from the record has nothing left to quote.
@@ -130,8 +159,7 @@ mod tests {
         assert_eq!(
             unsupported(
                 dir.path(),
-                &work,
-                Stage::Review,
+                &checked(&work, CANON),
                 "It is not on the record any more."
             ),
             None

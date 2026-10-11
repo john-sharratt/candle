@@ -47,9 +47,11 @@ fn field(name: &str, ty: ParamType, required: bool) -> CallParam {
         enum_values: None,
         items: None,
         min_items: 0,
+        max_items: None,
         properties: None,
         nullable: false,
         minimum: None,
+        max_tokens: None,
         requires: Vec::new(),
         shapes: Vec::new(),
     }

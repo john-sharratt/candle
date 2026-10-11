@@ -28,14 +28,15 @@
 //! ```
 #![cfg(feature = "cuda")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use candle::quantized::Int8Mode;
 use candle::{Device, IndexOp, Result, Tensor};
 use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
 };
 use candle_transformers::models::quantized_qwen38_moe::{
-    prepared_engine_gguf, TOKENIZER_REPO, TOKENIZER_REV,
+    prepared_engine_pack, TOKENIZER_REPO, TOKENIZER_REV,
 };
 use candle_transformers::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
 use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -46,21 +47,33 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 const IM_END: u32 = 248_046;
 const ENDOFTEXT: u32 = 248_044;
 
-/// The checkpoint's own tokenizer, from the same repo + pinned revision the
-/// engine's tests use — the GGUF directory carries no `tokenizer.json`.
-fn tokenizer() -> Result<tokenizers::Tokenizer> {
-    let repo = Repo::with_revision(
-        TOKENIZER_REPO.to_string(),
-        RepoType::Model,
-        TOKENIZER_REV.to_string(),
-    );
-    let p = Api::new()
+/// `tokenizer.json` of `repo` at `rev`, through the hub cache.
+fn tokenizer_path(repo: &str, rev: &str) -> Result<PathBuf> {
+    let repo = Repo::with_revision(repo.to_string(), RepoType::Model, rev.to_string());
+    Api::new()
         .map_err(|e| candle::Error::Msg(format!("hf api: {e}")))?
         .repo(repo)
         .get("tokenizer.json")
-        .map_err(|e| candle::Error::Msg(format!("fetch tokenizer.json: {e}")))?;
-    tokenizers::Tokenizer::from_file(&p)
+        .map_err(|e| candle::Error::Msg(format!("fetch tokenizer.json: {e}")))
+}
+
+/// The checkpoint's own tokenizer, from the same repo + pinned revision the
+/// engine's tests use.
+fn tokenizer() -> Result<tokenizers::Tokenizer> {
+    tokenizers::Tokenizer::from_file(tokenizer_path(TOKENIZER_REPO, TOKENIZER_REV)?)
         .map_err(|e| candle::Error::Msg(format!("load tokenizer: {e}")))
+}
+
+/// This card's engine at the mode the card picks, from its model pack — which
+/// is resolved, or built from an artifact already prepared, but never prepared
+/// here (`prepared_engine_pack`).
+fn engine(device: &Device) -> Result<Qwen4ExpGpu> {
+    let tokenizer_json = |repo: &str, rev: &str| -> Result<String> {
+        let p = tokenizer_path(repo, rev)?;
+        std::fs::read_to_string(&p).map_err(|e| candle::Error::Msg(format!("read {p:?}: {e}")))
+    };
+    let pack = prepared_engine_pack(device, Some(Int8Mode::auto(device)), &tokenizer_json)?;
+    Qwen4ExpGpu::load(&pack, device)
 }
 
 /// The daemon's own assembled prompt for "hi - how are you?", ending exactly at
@@ -365,11 +378,10 @@ fn flat_run(
 /// "They said 'Okay'" misattribution. If it does not, the opener is exonerated
 /// and the fault is elsewhere in the prompt.
 #[test]
-#[ignore = "needs the merged engine GGUF and a CUDA device"]
+#[ignore = "needs this card's engine pack and a CUDA device"]
 fn no_forced_opener_control() -> Result<()> {
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
-    let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
+    let mut gpu = engine(&device)?;
     gpu.mtp = None;
     gpu.cfg.num_mtp_layers = 0;
     let model = Qwen4ExpBatched::new(gpu)?;
@@ -443,11 +455,10 @@ fn no_forced_opener_control() -> Result<()> {
 /// or was the `Okay,` the entire defect? A result near the control means the
 /// stencil can keep its structural control over the block for free.
 #[test]
-#[ignore = "needs the merged engine GGUF and a CUDA device"]
+#[ignore = "needs this card's engine pack and a CUDA device"]
 fn think_open_only_prefill() -> Result<()> {
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
-    let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
+    let mut gpu = engine(&device)?;
     gpu.mtp = None;
     gpu.cfg.num_mtp_layers = 0;
     let model = Qwen4ExpBatched::new(gpu)?;
@@ -528,11 +539,10 @@ fn think_open_only_prefill() -> Result<()> {
 /// forced opener causes it — which is the whole question. Full text is printed,
 /// untruncated, so the prose can actually be read.
 #[test]
-#[ignore = "needs the merged engine GGUF and a CUDA device"]
+#[ignore = "needs this card's engine pack and a CUDA device"]
 fn forced_okay_named_failures() -> Result<()> {
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
-    let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
+    let mut gpu = engine(&device)?;
     gpu.mtp = None;
     gpu.cfg.num_mtp_layers = 0;
     let model = Qwen4ExpBatched::new(gpu)?;
@@ -651,11 +661,10 @@ fn classify_think(gen_think: &str) -> &'static str {
 /// flat test is the iteration loop. If contiguous stays clean and only the split
 /// derails, the forced-emit boundary is the cause.
 #[test]
-#[ignore = "needs the merged engine GGUF and a CUDA device"]
+#[ignore = "needs this card's engine pack and a CUDA device"]
 fn reproduce_run4_greeting_collapse() -> Result<()> {
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
-    let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
+    let mut gpu = engine(&device)?;
     gpu.mtp = None;
     gpu.cfg.num_mtp_layers = 0;
     let model = Qwen4ExpBatched::new(gpu)?;
@@ -793,11 +802,10 @@ fn reproduce_run4_greeting_collapse() -> Result<()> {
 }
 
 #[test]
-#[ignore = "needs the merged engine GGUF and a CUDA device"]
+#[ignore = "needs this card's engine pack and a CUDA device"]
 fn forced_okay_temperature_sweep() -> Result<()> {
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
-    let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
+    let mut gpu = engine(&device)?;
     gpu.mtp = None;
     gpu.cfg.num_mtp_layers = 0;
     let model = Qwen4ExpBatched::new(gpu)?;
@@ -866,11 +874,10 @@ fn forced_okay_temperature_sweep() -> Result<()> {
 }
 
 #[test]
-#[ignore = "needs the merged engine GGUF and a CUDA device"]
+#[ignore = "needs this card's engine pack and a CUDA device"]
 fn flat_prefill_of_a_refused_prompt() -> Result<()> {
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
-    let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
+    let mut gpu = engine(&device)?;
 
     // **Is the MTP draft head responsible?** It is a real KV layer (the last),
     // written on every wave where `layer_end == num_layers` — which is every
@@ -1440,11 +1447,10 @@ fn flat_prefill_of_a_refused_prompt() -> Result<()> {
 /// alignment work would be wasted; if the injected arm sits well below, the hole
 /// is worth removing.
 #[test]
-#[ignore = "needs the merged engine GGUF and a CUDA device"]
+#[ignore = "needs this card's engine pack and a CUDA device"]
 fn what_the_injection_hole_costs_at_the_daemons_own_split() -> Result<()> {
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
-    let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
+    let mut gpu = engine(&device)?;
     gpu.mtp = None;
     gpu.cfg.num_mtp_layers = 0;
     let model = Qwen4ExpBatched::new(gpu)?;
@@ -1632,11 +1638,10 @@ fn what_the_injection_hole_costs_at_the_daemons_own_split() -> Result<()> {
 /// an expert-routing flip amplifying a tiny input change, which would say the
 /// crossing is numerically benign and the model merely sits on a knife edge.
 #[test]
-#[ignore = "needs the merged engine GGUF and a CUDA device"]
+#[ignore = "needs this card's engine pack and a CUDA device"]
 fn which_layer_a_chunk_boundary_crossing_first_changes() -> Result<()> {
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
-    let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
+    let mut gpu = engine(&device)?;
     gpu.mtp = None;
     gpu.cfg.num_mtp_layers = 0;
     let model = Qwen4ExpBatched::new(gpu)?;
@@ -1809,11 +1814,10 @@ fn which_layer_a_chunk_boundary_crossing_first_changes() -> Result<()> {
 /// the decode reads something different after the push, and the sign of the
 /// change says whether the crossing broke a good state or repaired a bad one.
 #[test]
-#[ignore = "needs the merged engine GGUF and a CUDA device"]
+#[ignore = "needs this card's engine pack and a CUDA device"]
 fn a_chunk_boundary_crossing_during_decode_against_a_fresh_prefill() -> Result<()> {
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
-    let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
+    let mut gpu = engine(&device)?;
     gpu.mtp = None;
     gpu.cfg.num_mtp_layers = 0;
     let model = Qwen4ExpBatched::new(gpu)?;
@@ -2012,11 +2016,10 @@ fn argmax_continue(
 /// - divergence only at unaligned cuts ⇒ it is the partial-chunk seam, and the
 ///   position/window derivation over a padded chunk is where to look.
 #[test]
-#[ignore = "needs the merged engine GGUF and a CUDA device"]
+#[ignore = "needs this card's engine pack and a CUDA device"]
 fn borrowed_kv_against_the_same_seam_computed_in_place() -> Result<()> {
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
-    let mut gpu = Qwen4ExpGpu::load(&merged, &device, candle::quantized::Int8Mode::auto(&device))?;
+    let mut gpu = engine(&device)?;
     // Same reason as the first probe: the MTP head is a real KV layer written on
     // every wave, so it participates even without a speculative verify. Held out
     // so a difference here is the trunk's.

@@ -67,7 +67,7 @@ pub fn dense_destination_for(
 /// holds its ground for the life of the process. That is right for a resident
 /// tensor and wrong for one the caller is only materialising in order to copy it
 /// somewhere else — the layer-streaming pack build
-/// (`docs/qwen38_layer_streaming.md` §12.2) repacks each layer, writes its
+/// (`docs/archived/qwen38_layer_streaming.md` §12.2) repacks each layer, writes its
 /// record and lets it go, and claiming span ground for all 64 would defeat the
 /// point: the model does not fit, which is why the pack exists.
 ///
@@ -93,7 +93,7 @@ pub enum WeightResidency {
 ///   so [`Self::int8mode`] — not the mode the caller asked for — is what a consumer must dispatch
 ///   on.
 /// - [`Int8Mode::Off`] and CPU/Metal: standard GGML kernels. Off is the
-///   diagnostic mode (`INT8MODE=off`) — correctness over speed; the FP-GEMX
+///   diagnostic mode — correctness over speed; the FP-GEMX
 ///   fast path it used to take was deleted when production went int8-only
 ///   (nothing but Off-mode runs exercised it, and it had rotted to NaN).
 /// - For BF16/F16 inputs, casts through F32 for the standard kernels and restores the dtype.

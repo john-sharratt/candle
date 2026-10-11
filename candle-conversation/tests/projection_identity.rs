@@ -72,68 +72,34 @@
 //! `--release` matters: a debug build trips a pre-existing gallery-arena
 //! geometry assert on the second turn.
 
+use candle::Device;
 use candle_conversation::{
     models::{Model, ModelBuilder},
     ConversationEngine, SamplingConfig, SequenceConfig,
 };
+use candle_transformers::models::quant_ladder;
 use tempfile::TempDir;
 
 /// The stack whose projection this exercises: gated DeltaNet + QSA index, the
 /// only lineage that carries per-position state a projection has to move.
 /// A dense model would pass this test without touching any of it.
-const TEST_MODEL: Model = Model::Qwen38_FlashNext_Q4KO;
-
-/// Where the merged engine artifact lives.
 ///
-/// This model is **built locally** (`prepared_from_source`), not published —
-/// `qwen4exp::convert` merges the trunk and the MTP head into one GGUF, so
-/// asking the hub for it returns 404. The path is deployment config, not a
-/// feature switch: it selects which file to open and changes no code path.
-/// Only the tokenizer still resolves from `tokenizer_repo`, exactly as the
-/// daemon does — the directory holds no `tokenizer.json`, so `model_dir` would
-/// point at one that is not there.
-fn engine_gguf() -> std::path::PathBuf {
-    std::env::var("QWEN38_FLASH_NEXT_GGUF")
-        .unwrap_or_else(|_| {
-            format!(
-                "D:/Models/qwen38-flash-next/{}",
-                TEST_MODEL.spec().model_filename
-            )
-        })
-        .into()
-}
-
-/// The tokenizer, from the hub cache at the revision the model spec pins.
-///
-/// Setting `model_path` obliges us to set this too — the loader takes both or
-/// neither, so that a locally built artifact can never be paired with a
-/// tokenizer resolved from somewhere else. Derived from
-/// `TOKENIZER_REPO`/`TOKENIZER_REV` rather than written out, so it follows the
-/// pin if the pin moves; this vocabulary is not Qwen3's and pairing the wrong
-/// one would decode plausible nonsense rather than fail.
-fn tokenizer_json() -> std::path::PathBuf {
-    use candle_transformers::models::quantized_qwen38_moe::{TOKENIZER_REPO, TOKENIZER_REV};
-    if let Ok(p) = std::env::var("QWEN38_FLASH_NEXT_TOKENIZER") {
-        return p.into();
-    }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .expect("no home directory to resolve the hub cache from");
-    std::path::PathBuf::from(home)
-        .join(".cache/huggingface/hub")
-        .join(format!("models--{}", TOKENIZER_REPO.replace('/', "--")))
-        .join("snapshots")
-        .join(TOKENIZER_REV)
-        .join("tokenizer.json")
+/// The Flash-Next preset of this card's rung: every machine holds only its own
+/// rung's engine pack, built from the artifact the forward gate prepares, and
+/// carrying the tokenizer the gate verified against it.
+fn test_model() -> Model {
+    let device = Device::new_cuda(0).expect("CUDA device");
+    let gib = quant_ladder::device_vram_gib(&device).expect("the card's VRAM");
+    let experts = quant_ladder::expert_format(gib);
+    Model::qwen38_flash_next_for(experts)
+        .unwrap_or_else(|| panic!("a {gib} GiB card's rung ({experts:?}) has no Flash-Next preset"))
 }
 
 /// Argmax and a fixed seed: the comparison is token-for-token, so any sampling
 /// entropy would make a passing run meaningless and a failing one unreadable.
 fn test_builder() -> ModelBuilder {
-    TEST_MODEL
+    test_model()
         .builder()
-        .model_path(engine_gguf())
-        .tokenizer_path(tokenizer_json())
         .sampling(SamplingConfig::argmax())
         .seed(42)
         .max_response_tokens(96)
@@ -240,9 +206,8 @@ fn private_workspace() -> TempDir {
 
 fn engine(workspace: &std::path::Path) -> ConversationEngine {
     init_tracing();
-    let device =
-        candle::Device::cuda_if_available(0).expect("CUDA device required for integration tests");
-    eprintln!("\n=== Loading {TEST_MODEL} ===");
+    let device = Device::cuda_if_available(0).expect("CUDA device required for integration tests");
+    eprintln!("\n=== Loading {} ===", test_model());
     let start = std::time::Instant::now();
     let e = test_builder()
         .workspace_path(workspace)

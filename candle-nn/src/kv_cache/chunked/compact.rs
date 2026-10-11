@@ -1016,15 +1016,19 @@ impl super::backing::ChunkedKvBacking {
         // answered 8/8. `map.len()` is the upper bound on mints, so this over-provisions
         // by design.
         if let Some(m) = mint.as_mut() {
-            // **Bounded by the chunk count, not the move count.** One record per relocated
-            // chunk, and a chunk covers `n_kv_head · n_palette · 2` bands — so `map.len()`
-            // over-provisions by up to that factor, and every extra arena is a *region*
-            // claimed from the same free list. With no hole below the frontier that claim
-            // lands above it and raises the number the pass exists to lower, which is
-            // exactly why `provision_low_arenas` stops in the same situation. Rounded
-            // up, and at least one, so a small pass still provisions.
-            let bands_per_chunk = (self.n_kv_head() * self.n_palette() * 2).max(1);
-            let want = map.len().div_ceil(bands_per_chunk).max(1);
+            // **Bounded by the move count: one record per move is the most a pass can mint.**
+            // A record is minted per relocated *chunk*, and a chunk covers up to
+            // `n_kv_head · n_palette · 2` bands — but only some of them move when a pass
+            // drains the arenas at the frontier, so dividing the moves by that factor
+            // under-counts the chunks. Sized that way on Qwen3-30B-A3B, passes of ~115,000
+            // moves touched ~8,000 chunks against a reservation for ~3,600, declined
+            // thousands of records each, and left the frontier where it stood for a dozen
+            // passes in a row.
+            //
+            // Over-provisioning cannot raise the frontier: `reserve_record_slots` claims a
+            // region only while a hole stands below it, so a surplus arena lands in ground
+            // already free, and an arena no mint reaches is released when the pass ends.
+            let want = map.len().max(1);
             if let Err(e) = m.reserve(self, want, record_sources, &mut fresh) {
                 tracing::error!(
                     target: "candle_nn::kv_cache::compact",

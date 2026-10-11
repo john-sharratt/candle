@@ -20,7 +20,7 @@ use candle_nn::kv_cache::QWEN35_MOE_KV_FACTORS;
 
 use crate::models::draft_ladder::QWEN35_35B_A3B_DRAFT;
 
-use super::qwen35::{load_hybrid_gguf, HybridBatched, Qwen35LoadOptions};
+use super::qwen35::{load_hybrid_pack, HybridBatched};
 
 /// Pinned checkpoint (repo, revision, file) — revision-pinned so an upstream
 /// re-upload fails the gate loudly instead of drifting under it.
@@ -28,8 +28,8 @@ use super::qwen35::{load_hybrid_gguf, HybridBatched, Qwen35LoadOptions};
 /// **The `-MTP-` repo**, because the plain conversion drops the NextN tensors
 /// and a model without them cannot speculate. On this checkpoint the head is a
 /// full routed block — `blk.40`, its own router, 256 experts and shared expert
-/// at the trunk's geometry — which is why the expert cache carries one layer
-/// more than the trunk has (`expert_host_refs`).
+/// at the trunk's geometry — which is why the expert section carries one layer
+/// more than the trunk has.
 ///
 /// **The quant moved with the repo**: `Q4_K_M` → `UD-Q4_K_M`, because the MTP
 /// repo publishes only the UD variants. That is a different quantization of the
@@ -43,21 +43,17 @@ pub const QWEN35_35B_A3B: (&str, &str, &str) = (
     "Qwen3.5-35B-A3B-UD-Q4_K_M.gguf",
 );
 
-/// Load the routed Qwen3.5 checkpoint and wrap it for the scheduler.
+/// Load the routed Qwen3.5 model pack and wrap it for the scheduler.
 ///
-/// The 35B's concrete entry: refuses a dense checkpoint (which loaded through
-/// this entry would silently skip the expert cache the caller sized VRAM
-/// around) and constructs the lineage's [`HybridBatched`] with the 35B's own
-/// derived KV threshold factor row.
-pub fn from_gguf_path(
-    file_path: &Path,
-    device: &Device,
-    options: Qwen35LoadOptions,
-) -> Result<HybridBatched> {
-    let model = load_hybrid_gguf(file_path, device, options)?;
+/// The 35B's concrete entry: refuses a dense model (which loaded through this
+/// entry would silently skip the expert cache the caller sized VRAM around) and
+/// constructs the lineage's [`HybridBatched`] with the 35B's own derived KV
+/// threshold factor row.
+pub fn from_pack(path: &Path, device: &Device) -> Result<HybridBatched> {
+    let model = load_hybrid_pack(path, device)?;
     if model.cfg.moe.is_none() {
         candle::bail!(
-            "quantized_qwen35_moe: {file_path:?} is a dense checkpoint — \
+            "quantized_qwen35_moe: {path:?} is a dense model — \
              load it through quantized_qwen35 instead"
         );
     }
@@ -67,20 +63,37 @@ pub fn from_gguf_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::batch_test::test_helpers::hf_get;
+    use crate::models::batch_test::test_helpers::{gate_pack, hf_get};
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
     use crate::models::dialect::Dialect;
-    use crate::models::quantized_qwen35::tokenizer_json;
+    use crate::models::model_pack::{PackFamily, PackRequest};
+    use crate::models::quantized_qwen35::{tokenizer_json, TOKENIZER_REPO, TOKENIZER_REV};
     use candle::quantized::Int8Mode;
     use hf_hub::RepoType;
+    use std::path::PathBuf;
 
-    fn pinned() -> Result<std::path::PathBuf> {
+    /// The pinned checkpoint itself, for the tests that read its tensors
+    /// directly rather than through the engine.
+    fn pinned() -> Result<PathBuf> {
         hf_get(
             QWEN35_35B_A3B.0,
             RepoType::Model,
             QWEN35_35B_A3B.1,
             QWEN35_35B_A3B.2,
+        )
+    }
+
+    /// The pinned checkpoint's model pack at `mode`.
+    fn pinned_pack(device: &Device, mode: Int8Mode) -> Result<PathBuf> {
+        gate_pack(
+            &PackRequest::of(
+                PackFamily::Qwen35,
+                QWEN35_35B_A3B,
+                (TOKENIZER_REPO, TOKENIZER_REV),
+                Some(mode),
+            ),
+            device,
         )
     }
 
@@ -96,7 +109,6 @@ mod tests {
                 the card if cargo runs them concurrently)"]
     fn test_parallel_batched_forwarding_35b() -> Result<()> {
         println!("\n=== Qwen3.5-35B-A3B hybrid MoE batched forwarding ===\n");
-        let model_path = pinned()?;
         let device = Device::new_cuda(0)?;
 
         // One value for both the loader and the table's `int8` column — the
@@ -264,21 +276,9 @@ mod tests {
             }));
         }
 
+        let pack = pinned_pack(&device, int8mode)?;
         let load = || {
-            // Keep the pack beside the checkpoint: the gate reloads once per
-            // invocation while iterating, and a persistent pack turns the
-            // repack into a read.
-            let m = from_gguf_path(
-                &model_path,
-                &device,
-                Qwen35LoadOptions {
-                    int8mode: Some(int8mode),
-                    expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
-                    mtp_path: None,
-                    gate_donor_path: None,
-                    tensor_overrides: Vec::new(),
-                },
-            )?;
+            let m = from_pack(&pack, &device)?;
             println!("✓ Model loaded\n");
             Ok(m)
         };
@@ -297,9 +297,9 @@ mod tests {
     fn long_context_35b() -> Result<()> {
         use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
 
-        let model_path = pinned()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::Performance;
+        let pack = pinned_pack(&device, int8mode)?;
         long_context_gate(
             "Qwen3.5-35B-A3B (hybrid MoE)",
             int8mode,
@@ -318,19 +318,7 @@ mod tests {
             64,
             DepthTask::Coherence,
             &device,
-            || {
-                from_gguf_path(
-                    &model_path,
-                    &device,
-                    Qwen35LoadOptions {
-                        int8mode: Some(int8mode),
-                        expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
-                        mtp_path: None,
-                        gate_donor_path: None,
-                        tensor_overrides: Vec::new(),
-                    },
-                )
-            },
+            || from_pack(&pack, &device),
         )
     }
 
@@ -436,8 +424,8 @@ mod tests {
     #[test]
     #[ignore = "reads the pinned Qwen3.5-35B GGUF header from the HF cache (22 GB)"]
     fn expert_refs_tile_the_merged_tensors() -> Result<()> {
+        use crate::models::model_pack::experts::{expert_refs, qwen_expert_blocks};
         use crate::models::qwen35::config::Qwen35Config;
-        use crate::models::qwen35::expert_loader::expert_host_refs;
         use crate::models::qwen35::loader::detect_arch;
         use candle::quantized::gguf_file::Content;
         use std::io::BufReader;
@@ -447,9 +435,10 @@ mod tests {
         let content = Content::read(&mut reader)?;
         let arch = detect_arch(&content);
         let cfg = Qwen35Config::from_gguf_metadata(&arch, &content.metadata)?;
-        let refs = expert_host_refs(&content, &cfg)?;
+        let (refs, n_expert) = expert_refs(&content, &qwen_expert_blocks(&content))?;
 
         let moe = cfg.moe.expect("35B declares experts");
+        assert_eq!(n_expert, moe.n_experts);
         // Every trunk layer routes, and so does the MTP draft head at
         // `blk.{num_layers}` — its experts are the LAST entry, which is what
         // puts them at the `moe_layer_idx` its router asks the cache for.
@@ -529,10 +518,10 @@ mod tests {
         use crate::models::quantized_qwen35::tests::speculative_gate;
         use crate::models::qwen35::mtp::MTP_MAX_DRAFT;
 
-        let model_path = pinned()?;
         let int8mode = Int8Mode::Performance;
         let tok = tokenizer_json()?;
         let device = Device::new_cuda(0)?;
+        let pack = pinned_pack(&device, int8mode)?;
         speculative_gate(
             "Qwen3.5-35B-A3B",
             int8mode,
@@ -542,17 +531,7 @@ mod tests {
             &device,
             move || {
                 let device = Device::new_cuda(0)?;
-                let m = from_gguf_path(
-                    &model_path,
-                    &device,
-                    Qwen35LoadOptions {
-                        int8mode: Some(int8mode),
-                        expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
-                        mtp_path: None,
-                        gate_donor_path: None,
-                        tensor_overrides: Vec::new(),
-                    },
-                )?;
+                let m = from_pack(&pack, &device)?;
                 // A gate that silently fell back to plain decode would still pass
                 // — speculation is lossless, so the only symptom is the speedup
                 // going away. Assert the drafter is really there.

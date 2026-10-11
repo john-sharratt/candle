@@ -218,8 +218,9 @@ pub fn head_wave_pass(
         }
     }
 
-    // The two norms, their concatenation and `eh_proj` each inherit the pass
-    // from their operands (`MtpEmbedNorm` … `MtpInput`).
+    // The two norms, their concatenation, the q8a128 operand an int8 `eh_proj`
+    // quantizes it into, and `eh_proj`'s result each land on the pass
+    // (`MtpEmbedNorm` … `MtpInput`).
     let x = head.input.forward(&embed, &shifted, ticket)?;
     let xt = TensorCat::from_cat_tensor(x.reshape((1, rows, hidden))?, 0)?;
 
@@ -356,9 +357,11 @@ pub fn draft_cohort(
     // A step's forward phase carries what a wave's head does — its embeddings,
     // the closing norm, the logits — **plus** the head's input assembly, which
     // a wave runs on the head pass's attention generation (`Chain::HeadPass`)
-    // and a step runs here; so it is covered for both. The assembly's trunk
-    // norm and shift, which a step does not carve, are the room its two
-    // quantized operands take instead.
+    // and a step runs here; so it is covered for both, `eh_proj`'s q8a128
+    // operand included (`WaveBuffer::MtpInputOperand`). The assembly's trunk
+    // norm and shift, which a step does not carve, are the room its closing
+    // norm takes in the dense form the LM head then quantizes from — the
+    // forward phase prices that norm only in the head's packed encoding.
     if let Device::Cuda(d) = dev {
         let plan = WavePlan::new(model.wave_geometry(act_dtype));
         let width = WaveWidth::decode(n);
@@ -512,25 +515,21 @@ mod tests {
                 qwen35::draft::tests::a_draft_leaves_the_head_at_the_trunk_s_length \
                 -- --ignored --nocapture"]
     fn a_draft_leaves_the_head_at_the_trunk_s_length() -> Result<()> {
-        use super::super::quantized_loader::Qwen35LoadOptions;
-        use crate::models::batch_test::test_helpers::hf_get;
-        use crate::models::quantized_qwen35::from_gguf_path;
+        use crate::models::batch_test::test_helpers::gate_pack;
+        use crate::models::model_pack::{PackFamily, PackRequest};
+        use crate::models::quantized_qwen35::{
+            from_pack, QWEN35_9B, TOKENIZER_REPO, TOKENIZER_REV,
+        };
         use candle::quantized::Int8Mode;
 
-        let spec = crate::models::quantized_qwen35::QWEN35_9B;
-        let path = hf_get(spec.0, hf_hub::RepoType::Model, spec.1, spec.2)?;
         let device = Device::new_cuda(0)?;
-        let model = from_gguf_path(
-            &path,
-            &device,
-            Qwen35LoadOptions {
-                int8mode: Some(Int8Mode::Off),
-                expert_pack_dir: None,
-                mtp_path: None,
-                gate_donor_path: None,
-                tensor_overrides: Vec::new(),
-            },
-        )?;
+        let request = PackRequest::of(
+            PackFamily::Qwen35,
+            QWEN35_9B,
+            (TOKENIZER_REPO, TOKENIZER_REV),
+            Some(Int8Mode::Off),
+        );
+        let model = from_pack(&gate_pack(&request, &device)?, &device)?;
         assert!(model.has_drafter(), "the pinned 9B carries an MTP head");
         let head_kv = model.mtp_kv_layer().expect("a head means a head KV layer");
 

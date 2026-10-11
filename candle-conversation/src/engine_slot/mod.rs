@@ -155,7 +155,7 @@ impl EngineTicket {
                 let attacher = engine.attacher();
                 Ok((engine, attacher))
             },
-            |attacher| builder_cell.borrow_mut().attach_to(&attacher),
+            |attacher| builder_cell.borrow_mut().attach_to(&attacher, device),
         )?;
         let builder = builder_cell.into_inner();
         source

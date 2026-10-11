@@ -428,7 +428,8 @@ fn pread_exact(file: &File, offset: u64, dest: &mut [u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use crate::quantized::gguf_file::Content;
+    use std::io::{Seek, SeekFrom, Write};
     use std::path::PathBuf;
 
     fn tmp_path(tag: &str) -> std::path::PathBuf {
@@ -507,13 +508,29 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// The largest expert pack under the zend model cache, if one exists — a
-    /// multi-GB file on the drive the expert cache reads in production.
-    fn largest_pack() -> Option<PathBuf> {
+    /// Where a model pack's expert section sits: `(path, offset, len)`.
+    type ExpertSection = (PathBuf, u64, u64);
+
+    /// The expert section of `path`, when it is a model pack that has one —
+    /// read from the pack's own `zen.pack.experts.*` metadata.
+    fn expert_section(path: &Path) -> Option<ExpertSection> {
+        let mut f = File::open(path).ok()?;
+        let content = Content::read(&mut f).ok()?;
+        let key = |k: &str| content.metadata.get(k)?.to_u64().ok();
+        Some((
+            path.to_path_buf(),
+            key("zen.pack.experts.offset")?,
+            key("zen.pack.experts.len")?,
+        ))
+    }
+
+    /// The largest expert section under the zend model cache, if one exists — a
+    /// multi-GB span of the drive the expert cache reads in production.
+    fn largest_pack() -> Option<ExpertSection> {
         let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
         let root = Path::new(&home).join(".cache/zend/models");
         let mut stack = vec![root];
-        let mut best: Option<(u64, PathBuf)> = None;
+        let mut best: Option<ExpertSection> = None;
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -522,15 +539,16 @@ mod tests {
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if p.to_string_lossy().ends_with(".experts.pack") {
-                    let len = e.metadata().map(|m| m.len()).unwrap_or(0);
-                    if best.as_ref().is_none_or(|(l, _)| len > *l) {
-                        best = Some((len, p));
+                } else if p.to_string_lossy().ends_with(".pack.gguf") {
+                    if let Some(s) = expert_section(&p) {
+                        if best.as_ref().is_none_or(|b| s.2 > b.2) {
+                            best = Some(s);
+                        }
                     }
                 }
             }
         }
-        best.map(|(_, p)| p)
+        best
     }
 
     /// **The drive's ceiling for the expert cache's read shape.** Random
@@ -544,19 +562,42 @@ mod tests {
     #[test]
     #[ignore = "reads a multi-GB expert pack off the real drive for ~30 s"]
     fn queue_depth_sweep() {
+        use std::io::Read;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{Duration, Instant};
-        let Some(path) = largest_pack() else {
-            eprintln!("no *.experts.pack under ~/.cache/zend/models — nothing to measure");
+        let Some((path, base, len)) = largest_pack() else {
+            eprintln!("no model pack with an expert section under ~/.cache/zend/models");
             return;
         };
-        let len = std::fs::metadata(&path).unwrap().len();
         let df = DirectFile::open(&path).unwrap();
-        // Flash-Next's Q2_KO record, rounded to a sector.
-        let record = round_up_sector(1_384_448);
+        // The section's own record stride (its header's bytes 24..32, already a
+        // whole number of sectors), so the sweep reads the shape this rung's
+        // experts actually have. The section starts sector-aligned, so every
+        // `base + k × stride` is a legal direct-I/O offset.
+        let mut head = [0u8; 32];
+        let mut f = File::open(&path).unwrap();
+        f.seek(SeekFrom::Start(base)).unwrap();
+        f.read_exact(&mut head).unwrap();
+        assert_eq!(
+            &head[..8],
+            b"CNDLXPK2",
+            "{} has no expert section",
+            path.display()
+        );
+        let record = u64::from_le_bytes(head[24..32].try_into().unwrap()) as usize;
+        assert_eq!(
+            record,
+            round_up_sector(record),
+            "the stride is sector-aligned"
+        );
+        assert_eq!(
+            base,
+            round_up_sector(base as usize) as u64,
+            "the section is sector-aligned"
+        );
         let records = (len / record as u64).saturating_sub(1);
         eprintln!(
-            "{} — {:.1} GiB, {records} records of {record} B",
+            "{} — {:.1} GiB section, {records} records of {record} B",
             path.display(),
             len as f64 / (1u64 << 30) as f64
         );
@@ -590,7 +631,7 @@ mod tests {
                             x = x
                                 .wrapping_mul(6364136223846793005)
                                 .wrapping_add(1442695040888963407);
-                            let at = (x >> 16) % records * record as u64;
+                            let at = base + (x >> 16) % records * record as u64;
                             let t = Instant::now();
                             if pieces == 1 {
                                 df.read_at_with_handle(w, at, scratch.as_mut_slice(record))

@@ -2,7 +2,10 @@
 //! [`ConversationEngine`](crate::ConversationEngine).
 
 use super::gguf_rope::gguf_rope;
-use super::{Model, ModelArch, ModelSpec, RopePreset};
+#[cfg(not(feature = "hub"))]
+use super::pack_source::NoFetch;
+use super::pack_source::{is_pack, resolve_local, resolve_spec, ResolvedModel};
+use super::{ModelArch, ModelSpec, RopePreset};
 use crate::cancel::CancelToken;
 use crate::config::{
     pick_max_hot_turns, DecodeHealthConfig, EngineConfig, SamplingConfig, SchedulerConfig,
@@ -24,16 +27,18 @@ use candle::{DType, Device};
 use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_model::{BatchedInference, BatchedModelCore};
-use candle_transformers::models::qwen35::TensorOverride;
+use candle_transformers::models::model_pack::keys::TOKENIZER_JSON;
+#[cfg(feature = "hub")]
+use candle_transformers::models::model_pack::HubFetch;
+use candle_transformers::models::model_pack::{ModelPack, SourceFetch};
 use candle_transformers::models::selection_strata::StrataTokens;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// A checkpoint [`ModelBuilder::prepare`] resolved and read: its files, its
+/// A model pack [`ModelBuilder::prepare`] resolved and read: its path, its
 /// tokenizer, and the vocabulary size its header states.
 struct Prepared {
-    model_path: PathBuf,
-    tokenizer_path: PathBuf,
+    pack: PathBuf,
     tokenizer: tokenizers::Tokenizer,
     gguf_vocab_size: Option<usize>,
 }
@@ -111,11 +116,13 @@ pub struct ModelBuilder {
     /// costs one atomic load per scheduler pass and nothing else. See
     /// [`Self::with_guest`] and [`crate::guest`].
     guests: crate::guest::GuestRegistry,
-    /// Override: local GGUF model path (skips HF download).
+    /// Override: a local model pack, or a local checkpoint to pack (skips the
+    /// spec's sources).
     model_path: Option<PathBuf>,
     /// Override: system prompt text
     system_prompt: Option<String>,
-    /// Override: local tokenizer.json path (skips HF download).
+    /// Override: the `tokenizer.json` a local checkpoint is packed with. A
+    /// pack carries its own.
     tokenizer_path: Option<PathBuf>,
     /// Sampling configuration (initialised from [`ModelSpec::default_sampling`]).
     sampling: SamplingConfig,
@@ -176,12 +183,6 @@ pub struct ModelBuilder {
     /// conversation (ingest layers) or just the turn (dialogue) per layer. Empty
     /// by default ⇒ every layer defaults to `DropConversation`.
     layer_corrupt_turn: HashMap<LayerId, CorruptTurnPolicy>,
-    /// Directory for the persistent repacked expert pack.
-    ///
-    /// `None` (the default): the Qwen3.5/3.6 hybrid puts the pack beside the
-    /// checkpoint; the Qwen3-MoE loader uses a temp file, unlinked as soon as it
-    /// is open, so nothing is left on disk and the repack is paid on every start.
-    expert_pack_dir: Option<PathBuf>,
     /// Override for [`SchedulerConfig::large_prefill_max_tokens`].
     ///
     /// `None` sizes it to the card at engine start
@@ -235,7 +236,6 @@ impl ModelBuilder {
             cancel: CancelToken::new(),
             tenant_rank: TenantRank::FIRST,
             layer_corrupt_turn: HashMap::new(),
-            expert_pack_dir: None,
             prefill_pass_tokens: None,
             loras: Vec::new(),
             qsa_selection_budget: None,
@@ -312,27 +312,6 @@ impl ModelBuilder {
     /// own per-forward ceiling, which the scheduler clamps to.
     pub fn prefill_pass_tokens(mut self, tokens: usize) -> Self {
         self.prefill_pass_tokens = Some(tokens);
-        self
-    }
-
-    /// Keep the repacked expert pack in `dir` instead of a temp file.
-    ///
-    /// The pack is the expert cache's cold tier: every expert, in the layout the
-    /// kernels consume, so an eviction from VRAM can be a drop rather than a
-    /// copy (`docs/expert_cache_design.md`). It is a pure function of the
-    /// checkpoint, so a persistent one lets a restart skip the ~42 s repack and
-    /// map straight to serving.
-    ///
-    /// The natural argument is the GGUF's own directory: one pack is then shared
-    /// by every workspace using that checkpoint, it survives a substrate wipe,
-    /// and it is deleted by the same act that deletes the model. Unset, the pack
-    /// goes to a temp file that is unlinked the moment it is open — an embedder,
-    /// an example or a test must never have a 16.6 GiB file appear beside its
-    /// model without asking.
-    ///
-    /// MoE-only; the other architectures have no expert cache and ignore it.
-    pub fn expert_pack_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.expert_pack_dir = Some(dir.into());
         self
     }
 
@@ -446,13 +425,17 @@ impl ModelBuilder {
 
     // ── File overrides ─────────────────────────────────────────────────
 
-    /// Override the GGUF model file path (skips HF download).
+    /// Load a local file instead of the spec's: a model pack as it is, or a
+    /// checkpoint, which is packed into the model cache with the
+    /// [`Self::tokenizer_path`] it then needs — never beside the file, and the
+    /// file is never deleted.
     pub fn model_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.model_path = Some(path.into());
         self
     }
 
-    /// Override the tokenizer.json file path (skips HF download).
+    /// The `tokenizer.json` a local checkpoint ([`Self::model_path`]) is packed
+    /// with.
     pub fn tokenizer_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.tokenizer_path = Some(path.into());
         self
@@ -883,15 +866,15 @@ impl ModelBuilder {
         // Qwen3 (and several other models) ship a tokenizer vocab smaller
         // than the model's output projection (e.g. 151_669 vs 151_936).
         // The model's logits dimension is authoritative — read it from the
-        // GGUF header when we can resolve the model path; fall back to the
+        // model file's header when this builder names one; fall back to the
         // tokenizer length otherwise.
-        let vocab_size = if let Ok((mp, _)) = self.resolve_paths_pub() {
-            match Self::detect_sampling_from_gguf(&mp) {
-                Ok(info) => info.vocab_size.unwrap_or(tok_vocab).max(tok_vocab),
-                Err(_) => tok_vocab,
-            }
-        } else {
-            tok_vocab
+        let vocab_size = match self
+            .model_path
+            .as_deref()
+            .map(Self::detect_sampling_from_gguf)
+        {
+            Some(Ok(info)) => info.vocab_size.unwrap_or(tok_vocab).max(tok_vocab),
+            _ => tok_vocab,
         };
         tracing::info!(
             "Vocab size: tokenizer={} -> using={}",
@@ -957,66 +940,47 @@ impl ModelBuilder {
         ret
     }
 
-    /// Every file this model's weights are loaded from: the checkpoint, and —
-    /// for the lineage whose loader reads them — its tensor overrides, the
-    /// gate donor when the checkpoint needs one, and its adapters. Resolved once
-    /// and handed to both [`Self::model_identity`] and [`Self::load_model`], so
-    /// the key names exactly what was loaded.
-    pub fn weight_files(&self, model_path: &Path) -> crate::Result<WeightFiles> {
-        let reads_other_checkpoints = matches!(
-            self.spec.arch,
-            ModelArch::Qwen35Hybrid | ModelArch::Qwen35Dense
-        );
-        // **Only the qwen35 loader reads a tensor from another checkpoint.** A spec naming one
-        // for any other arch would load the primary's own copy and serve a model nobody asked
-        // for under this spec's name, so it is refused rather than served.
-        if !self.spec.tensor_overrides.is_empty() && !reads_other_checkpoints {
-            return Err(ConversationError::Other(format!(
-                "{:?} cannot take tensors from another checkpoint, and this spec names {}",
-                self.spec.arch,
-                self.spec.tensor_overrides.len()
-            )));
-        }
-        let (tensor_overrides, gate_donor) = if reads_other_checkpoints {
-            (self.tensor_overrides()?, self.gate_donor_path(model_path)?)
-        } else {
-            (Vec::new(), None)
-        };
-        // Adapters load into the dense lineage only.
+    /// Every file this model's weights are loaded from: its model pack, which
+    /// already holds any tensor overrides and gate donor, and — for the dense
+    /// lineage — its adapters. Resolved once and handed to both
+    /// [`Self::model_identity`] and [`Self::load_model`], so the key names
+    /// exactly what was loaded.
+    pub fn weight_files(&self, pack: &Path) -> crate::Result<WeightFiles> {
         let adapters = if matches!(self.spec.arch, ModelArch::Qwen35Dense) {
             self.resolve_loras()?
         } else {
             Vec::new()
         };
         Ok(WeightFiles {
-            primary: model_path.to_path_buf(),
-            tensor_overrides,
-            gate_donor,
+            pack: pack.to_path_buf(),
             adapters,
         })
     }
 
-    /// The identity of the model loaded from `weights` with the vocabulary at
-    /// `tokenizer_path` — what a substrate is bound to. Reads each weight
-    /// file's header and a sample of its data, and the whole tokenizer; no
-    /// weight is loaded. A tokenizer that cannot be read refuses the start: a
-    /// model whose key cannot be computed cannot be checked against a
-    /// substrate.
-    pub fn model_identity(
-        &self,
-        weights: &WeightFiles,
-        tokenizer_path: &Path,
-    ) -> crate::Result<ModelIdentity> {
-        let tokenizer_json = std::fs::read(tokenizer_path).map_err(|e| {
-            ConversationError::Tokenizer(format!(
-                "read {} to identify the model: {e}",
-                tokenizer_path.display()
-            ))
-        })?;
+    /// The identity of the model loaded from `weights` — what a substrate is
+    /// bound to. Reads the pack's header, which records its sources' digests and
+    /// carries its `tokenizer.json`; no weight is loaded. A pack whose sources
+    /// or tokenizer cannot be read refuses the start: a model whose key cannot
+    /// be computed cannot be checked against a substrate.
+    pub fn model_identity(&self, weights: &WeightFiles) -> crate::Result<ModelIdentity> {
+        let tokenizer_json = ModelPack::read_header(&weights.pack)
+            .and_then(|h| {
+                h.metadata
+                    .get(TOKENIZER_JSON)
+                    .ok_or_else(|| candle::Error::Msg(format!("no {TOKENIZER_JSON}")))?
+                    .to_string()
+                    .map(|t| t.as_bytes().to_vec())
+            })
+            .map_err(|e| {
+                ConversationError::Tokenizer(format!(
+                    "read the tokenizer of {} to identify the model: {e}",
+                    weights.pack.display()
+                ))
+            })?;
         let digest = weights.digest().map_err(|e| {
             ConversationError::Other(format!(
                 "identify the weights at {}: {e}",
-                weights.primary.display()
+                weights.pack.display()
             ))
         })?;
         ModelIdentity::new(
@@ -1091,50 +1055,23 @@ impl ModelBuilder {
         )?)
     }
 
-    /// The int8 numeric mode [`Self::load_model`] loads `model_path` in on
-    /// `device` — the one value every arch's loader is handed, and returned
-    /// with the model as [`LoadedModel::int8_mode`].
-    ///
-    /// - **The routed hybrid and Flash-Next take `auto`**, not the size-weighed
-    ///   default. `auto_sized` asks whether the file fits in 70% of free VRAM,
-    ///   which is a dense model's question: a routed checkpoint pages its
-    ///   experts through the three-tier cache, so its file size is not its
-    ///   resident size — and the question answers `Performance` for a 21.7 GB
-    ///   file on a 24 GB card that runs `Precision` with every gate row valid.
-    /// - **DeepSeek-V4 is pinned to `Performance`**, the mode its engine is
-    ///   measured at.
-    /// - **Llama and Qwen2 take `auto`**, their loaders' own default.
-    /// - **The rest take `auto_sized`**: the stepped-up twin only where the
-    ///   weights leave headroom.
-    fn int8_mode(&self, device: &Device, model_path: &Path) -> Int8Mode {
-        match self.spec.arch {
-            ModelArch::DeepSeekV4 => Int8Mode::Performance,
-            ModelArch::Qwen35Hybrid | ModelArch::Qwen4Exp | ModelArch::Llama | ModelArch::Qwen2 => {
-                Int8Mode::auto(device)
-            }
-            ModelArch::Qwen3 | ModelArch::Qwen3Moe | ModelArch::Qwen35Dense => {
-                let model_bytes = std::fs::metadata(model_path)
-                    .map(|m| m.len() as usize)
-                    .unwrap_or(0);
-                Int8Mode::auto_sized(device, model_bytes)
-            }
-        }
-    }
-
-    /// Load quantised model weights from a local GGUF file.
+    /// Load a model from its model pack ([`Self::resolve_model`]).
     ///
     /// Uses the builder's `max_seq_len` for KV cache sizing, and raises the
     /// model's RoPE floor to the builder's [`Self::min_rope_factor`] before any
-    /// session opens. The int8 mode is chosen once, here, and returned with the
-    /// model: `auto_sized` reads free VRAM, which the load itself changes, so
-    /// asking again afterwards can name a mode the model was not loaded in.
+    /// session opens. The int8 mode is the one the pack was built for — chosen
+    /// once, when it was resolved — and is returned with the model, never
+    /// re-derived: `auto_sized` reads free VRAM, which the load itself changes.
     pub fn load_model(
         &self,
         weights: &WeightFiles,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> crate::Result<LoadedModel> {
-        let int8_mode = self.int8_mode(device, &weights.primary);
+        self.refuse_unsupported_settings()?;
+        let int8_mode = ModelPack::open(&weights.pack)
+            .map_err(ConversationError::Model)?
+            .int8_mode;
         let mut model = self.load_arch(weights, device, int8_mode, progress)?;
         // After `load_arch` has applied the budget: a selecting model checks
         // the strata against its kernel under the budget it will run with.
@@ -1160,17 +1097,24 @@ impl ModelBuilder {
         Ok(LoadedModel { model, int8_mode })
     }
 
-    /// The model `spec.arch` names, loaded from `weights` in `int8mode` —
-    /// every architecture's own loader.
-    fn load_arch(
-        &self,
-        weights: &WeightFiles,
-        device: &Device,
-        int8mode: Int8Mode,
-        progress: Option<&dyn Fn(usize, usize)>,
-    ) -> crate::Result<Box<dyn ManagedBatchedModel + Send>> {
-        let max_seq = self.max_seq_len;
-        let model_path = weights.primary.as_path();
+    /// Refuse a setting this spec's architecture cannot honour — before anything
+    /// is read, so a model is never loaded only to ignore what it was asked.
+    fn refuse_unsupported_settings(&self) -> crate::Result<()> {
+        // **Only the qwen35 pack build reads a tensor from another checkpoint.** A spec naming
+        // one for any other arch would load the primary's own copy and serve a model nobody
+        // asked for under this spec's name, so it is refused rather than served.
+        if !self.spec.tensor_overrides.is_empty()
+            && !matches!(
+                self.spec.arch,
+                ModelArch::Qwen35Hybrid | ModelArch::Qwen35Dense
+            )
+        {
+            return Err(ConversationError::Other(format!(
+                "{:?} cannot take tensors from another checkpoint, and this spec names {}",
+                self.spec.arch,
+                self.spec.tensor_overrides.len()
+            )));
+        }
         // **Only a selecting architecture takes a selection budget.** Any other
         // would load, ignore it, and report a dense control that was never run.
         if let Some(positions) = self.qsa_selection_budget {
@@ -1192,6 +1136,22 @@ impl ModelBuilder {
                 self.spec.arch, self.spec.rope
             )));
         }
+        Ok(())
+    }
+
+    /// The model `spec.arch` names, loaded from its model pack and adapters —
+    /// every architecture's own loader. `int8mode` is the pack's, for the
+    /// loaders of a plain pack, which is an ordinary GGUF to them and repacks at
+    /// load.
+    fn load_arch(
+        &self,
+        weights: &WeightFiles,
+        device: &Device,
+        int8mode: Int8Mode,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> crate::Result<Box<dyn ManagedBatchedModel + Send>> {
+        let max_seq = self.max_seq_len;
+        let model_path = weights.pack.as_path();
         match self.spec.arch {
             ModelArch::Qwen3 => {
                 use candle_transformers::models::quantized_qwen3::ModelWeights;
@@ -1204,20 +1164,8 @@ impl ModelBuilder {
                 Ok(Box::new(self.wrap_gqa(raw, inv, model_path, device)?))
             }
             ModelArch::Qwen3Moe => {
-                use candle_transformers::models::quantized_qwen3_moe::{
-                    GgufLoadOptions, ModelWeights,
-                };
-                // The only arch with an expert cache, so the only one the pack
-                // directory reaches.
-                let raw = ModelWeights::from_gguf_with_options(
-                    model_path,
-                    device,
-                    progress,
-                    GgufLoadOptions {
-                        int8mode: Some(int8mode),
-                        expert_pack_dir: self.expert_pack_dir.clone(),
-                    },
-                )?;
+                use candle_transformers::models::quantized_qwen3_moe::ModelWeights;
+                let raw = ModelWeights::from_pack(model_path, device, progress)?;
                 let inv = stated_inv_freq(raw.rope_inv_freq())?;
                 Ok(Box::new(self.wrap_gqa(raw, inv, model_path, device)?))
             }
@@ -1250,7 +1198,7 @@ impl ModelBuilder {
                 // Per-layer progress not yet wired for this arch.
                 let _ = progress;
                 let _ = max_seq; // window/corpus budgets are model-derived
-                let engine = Engine::load(model_path, &DEEPSEEK_V4, device, int8mode)
+                let engine = Engine::load(model_path, &DEEPSEEK_V4, device)
                     .map_err(ConversationError::Model)?;
                 Ok(Box::new(
                     BatchedEngine::new(engine).map_err(ConversationError::Model)?,
@@ -1261,12 +1209,10 @@ impl ModelBuilder {
                 // KV is allocated per ATTENTION layer (12 of 48) and the window
                 // budget is config-derived, exactly as the hybrid's is.
                 let _ = max_seq;
-                // `model_path` is the merged KO artifact, not the vendor's
-                // split: the engine takes one mmap and one `Content`, and the
-                // expert pack is sized from a live span measurement at load.
-                // `progress` reports the expert repack, which is the bulk of a
-                // cold load's wall time.
-                let gpu = Qwen4ExpGpu::load_with_progress(model_path, device, int8mode, progress)
+                // The pack of the merged KO artifact, not of the vendor's
+                // split; `progress` reports the pinned layers' fill, the bulk of
+                // a load's wall time.
+                let gpu = Qwen4ExpGpu::load_with_progress(model_path, device, progress)
                     .map_err(ConversationError::Model)?;
                 let mut model = Qwen4ExpBatched::new(gpu).map_err(ConversationError::Model)?;
                 if let Some(positions) = self.qsa_selection_budget {
@@ -1278,59 +1224,27 @@ impl ModelBuilder {
             }
             ModelArch::Qwen35Hybrid => {
                 use candle_transformers::models::quantized_qwen36_moe;
-                use candle_transformers::models::qwen35::Qwen35LoadOptions;
                 // Per-layer progress not yet wired for this arch.
                 let _ = progress;
                 // KV is allocated per ATTENTION layer, not per transformer layer,
                 // and the window budget is derived from the config — see
                 // `qwen35::engine::create_session`.
                 let _ = max_seq;
-                let model = quantized_qwen36_moe::from_gguf_path(
-                    model_path,
-                    device,
-                    Qwen35LoadOptions {
-                        // Beside the checkpoint unless the caller named a
-                        // directory. Without one the pack is EPHEMERAL — written
-                        // to the system temp dir and unlinked as soon as it is
-                        // published — so every boot repacks all 41 layers (53 s
-                        // measured on the 3.6-35B). Beside the file it is shared
-                        // by every caller of this checkpoint and read on every
-                        // boot after the first, which is where zend puts it too.
-                        expert_pack_dir: self
-                            .expert_pack_dir
-                            .clone()
-                            .or_else(|| model_path.parent().map(Path::to_path_buf)),
-                        int8mode: Some(int8mode),
-                        gate_donor_path: weights.gate_donor.clone(),
-                        tensor_overrides: weights.tensor_overrides.clone(),
-                        ..Default::default()
-                    },
-                )
-                .map_err(ConversationError::Model)?;
+                // The gate donor and tensor overrides were folded in when the
+                // pack was built (`pack_source::resolve_spec`).
+                let model = quantized_qwen36_moe::from_pack(model_path, device)
+                    .map_err(ConversationError::Model)?;
                 Ok(Box::new(model))
             }
             ModelArch::Qwen35Dense => {
                 use candle_transformers::models::quantized_qwen35;
-                use candle_transformers::models::qwen35::Qwen35LoadOptions;
                 // Per-layer progress not yet wired for this arch.
                 let _ = progress;
                 // KV is allocated per ATTENTION layer, not per transformer
                 // layer, and the window budget is derived from the config.
                 let _ = max_seq;
-                // No `expert_pack_dir`: a dense checkpoint has no experts to
-                // pack, so there is nothing for a pack directory to hold and an
-                // empty one beside the model would only confuse.
-                let mut model = quantized_qwen35::from_gguf_path(
-                    model_path,
-                    device,
-                    Qwen35LoadOptions {
-                        int8mode: Some(int8mode),
-                        gate_donor_path: weights.gate_donor.clone(),
-                        tensor_overrides: weights.tensor_overrides.clone(),
-                        ..Default::default()
-                    },
-                )
-                .map_err(ConversationError::Model)?;
+                let mut model = quantized_qwen35::from_pack(model_path, device)
+                    .map_err(ConversationError::Model)?;
                 // Adapters load after the base weights and before the model is
                 // handed to the scheduler, in the activation width the stack
                 // computes in — PEFT stores them F32, and converting per
@@ -1355,12 +1269,13 @@ impl ModelBuilder {
         }
     }
 
-    /// Resolve file paths, load model and tokenizer, and build the engine.
+    /// Resolve the model pack, load the model and its tokenizer, and build the
+    /// engine.
     ///
     /// If [`model_path`](Self::model_path) / [`tokenizer_path`](Self::tokenizer_path)
     /// (or [`model_dir`](Self::model_dir)) have been set, those local files
-    /// are used. Otherwise, the files are downloaded from HuggingFace
-    /// (requires the `hub` crate feature).
+    /// are used. Otherwise the spec's pack is taken from the model cache, or
+    /// built from its sources (requires the `hub` crate feature).
     pub fn engine(&mut self, device: &Device) -> crate::Result<ConversationEngine> {
         self.engine_with_progress(device, None)
     }
@@ -1375,27 +1290,32 @@ impl ModelBuilder {
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> crate::Result<ConversationEngine> {
-        let prepared = self.prepare()?;
+        let prepared = self.prepare(device)?;
         self.engine_from_prepared(prepared, device, progress)
     }
 
     /// Attach this builder's substrate to an engine another tenant built
-    /// (`crate::engine_slot`): resolve and read the checkpoint exactly as a
+    /// (`crate::engine_slot`): resolve and read the model pack exactly as a
     /// build would — so this builder's sampling, thinking and context settings
     /// are the ones the model states — then bind the substrate to the model and
-    /// attach it. No weight is loaded.
+    /// attach it. No weight is loaded. `device` is the engine's: a pack is
+    /// resolved for the card it runs on.
     ///
     /// The substrate is bound under the engine's RoPE schedule, not this
     /// builder's: the engine rotates every key this substrate will hold, and a
     /// shared engine's schedule is every tenant's merged. The model itself is
     /// checked against the engine's before the substrate is touched, so a
     /// different model leaves a fresh substrate unbound.
-    pub fn attach_to(&mut self, attacher: &EngineAttacher) -> crate::Result<ConversationEngine> {
-        let prepared = self.prepare()?;
-        let weights = self.weight_files(&prepared.model_path)?;
+    pub fn attach_to(
+        &mut self,
+        attacher: &EngineAttacher,
+        device: &Device,
+    ) -> crate::Result<ConversationEngine> {
+        let prepared = self.prepare(device)?;
+        let weights = self.weight_files(&prepared.pack)?;
         let engine_key = attacher.model_key();
         let identity = self
-            .model_identity(&weights, &prepared.tokenizer_path)?
+            .model_identity(&weights)?
             .under_rope(engine_key.rope.clone());
         if !identity.key().same_model(engine_key) {
             return Err(ConversationError::Other(format!(
@@ -1448,10 +1368,14 @@ impl ModelBuilder {
         self.tenant_rank = rank;
     }
 
-    /// Resolve the checkpoint and tokenizer, and take what the checkpoint
-    /// states — architecture, context, sampling, thinking — into this builder.
-    fn prepare(&mut self) -> crate::Result<Prepared> {
-        let (model_path, tokenizer_path) = self.resolve_paths()?;
+    /// Resolve the model pack for `device`, and take what the model states —
+    /// architecture, context, sampling, thinking — into this builder.
+    fn prepare(&mut self, device: &Device) -> crate::Result<Prepared> {
+        let resolved = self.resolve_model(device)?;
+        let model_path = resolved.pack.clone();
+        // From here on this builder names the pack itself, so whatever reads the
+        // model file afterwards (`engine_config`'s vocabulary width) reads it.
+        self.model_path = Some(model_path.clone());
 
         // ── Read GGUF metadata ──────────────────────────────────────────
         // Always read the GGUF header for arch, vocab_size, context_length,
@@ -1519,7 +1443,7 @@ impl ModelBuilder {
             }
         }
 
-        let tokenizer = Model::load_tokenizer(&tokenizer_path)?;
+        let tokenizer = resolved.tokenizer()?;
 
         // Before anything reads a token id: the checkpoint is the authority on
         // what its own ids mean, so hold the tokenizer against it here rather
@@ -1559,14 +1483,13 @@ impl ModelBuilder {
         }
         self.health_config.resolve_structural_tokens(&tokenizer);
         Ok(Prepared {
-            model_path,
-            tokenizer_path,
+            pack: model_path,
             tokenizer,
             gguf_vocab_size,
         })
     }
 
-    /// Build the engine from a [`Self::prepare`]d checkpoint.
+    /// Build the engine from a [`Self::prepare`]d model pack.
     fn engine_from_prepared(
         &mut self,
         prepared: Prepared,
@@ -1574,18 +1497,17 @@ impl ModelBuilder {
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> crate::Result<ConversationEngine> {
         let Prepared {
-            model_path,
-            tokenizer_path,
+            pack,
             tokenizer,
             gguf_vocab_size,
         } = prepared;
 
         // ── Bind the substrate before a weight is loaded ───────────────
-        // The model's identity comes from its files' headers, a sample of
-        // their data and the tokenizer — seconds. A substrate another model
-        // wrote is refused here, not after a load measured in minutes.
-        let weights = self.weight_files(&model_path)?;
-        let identity = self.model_identity(&weights, &tokenizer_path)?;
+        // The model's identity comes from the pack's header — its sources'
+        // digests and its tokenizer — in milliseconds. A substrate another
+        // model wrote is refused here, not after a load measured in minutes.
+        let weights = self.weight_files(&pack)?;
+        let identity = self.model_identity(&weights)?;
         let substrate = self.bind_substrate(&identity)?;
 
         let mut config = self.engine_config(&tokenizer, device, substrate);
@@ -1842,26 +1764,17 @@ impl ModelBuilder {
             _ => None,
         };
 
-        // Read context_length from `{arch}.context_length` metadata.
-        // Fall back to config.json `max_position_embeddings` if the GGUF key is absent.
+        // Read context_length from `{arch}.context_length` metadata — the model
+        // pack is the model's only file, so there is no `config.json` beside it
+        // to fall back to.
         let context_length_key = format!("{}.context_length", arch_str);
-        let gguf_context_length = ct
+        let context_length = ct
             .metadata
             .get(&context_length_key)
             .and_then(|v| v.to_u32().ok())
             .map(|v| v as usize);
-        let cfg_json_context_length: Option<usize> = model_path.parent().and_then(|d| {
-            let text = std::fs::read_to_string(d.join("config.json")).ok()?;
-            let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-            v.get("max_position_embeddings")?
-                .as_u64()
-                .map(|n| n as usize)
-        });
-        let context_length = gguf_context_length.or(cfg_json_context_length);
-        if let Some(ctx) = gguf_context_length {
+        if let Some(ctx) = context_length {
             tracing::info!("GGUF {}: {}", context_length_key, ctx);
-        } else if let Some(ctx) = cfg_json_context_length {
-            tracing::info!("config.json max_position_embeddings: {ctx}");
         }
 
         // Read vocab_size from the output projection tensor shape: [vocab_size, hidden_size].
@@ -1889,165 +1802,50 @@ impl ModelBuilder {
         })
     }
 
-    // ── Internal ───────────────────────────────────────────────────────
+    // ── Resolution ─────────────────────────────────────────────────────
 
-    fn resolve_paths(&self) -> crate::Result<(PathBuf, PathBuf)> {
-        self.resolve_paths_pub()
-    }
-
-    /// Public accessor for the same path-resolution logic as
-    /// [`Self::resolve_paths`]. Used by external benchmarks (e.g. the RULER
-    /// streamer) that need the resolved tokenizer path before calling
-    /// [`Self::build`].
-    pub fn resolve_paths_pub(&self) -> crate::Result<(PathBuf, PathBuf)> {
+    /// The model pack this builder loads, with its tokenizer — fetching and
+    /// building through `fetch` when the model cache does not hold it.
+    ///
+    /// - A [`Self::model_path`] that is a pack is taken as it is.
+    /// - One that is a checkpoint is packed with its [`Self::tokenizer_path`]
+    ///   into the model cache, never beside it, and is never deleted.
+    /// - Otherwise the spec's pack: every coordinate pinned, the revisions
+    ///   included — a pin nothing consults reads as protection while the
+    ///   weights move under it.
+    pub fn resolve_model_with(
+        &self,
+        device: &Device,
+        fetch: &dyn SourceFetch,
+    ) -> crate::Result<ResolvedModel> {
         match (&self.model_path, &self.tokenizer_path) {
-            (Some(m), Some(t)) => Ok((m.clone(), t.clone())),
-            (Some(_), None) | (None, Some(_)) => Err(ConversationError::Download(
-                "set both model_path and tokenizer_path, or neither (to auto-download)".into(),
-            )),
-            (None, None) => self.download_or_fail(),
-        }
-    }
-
-    /// Resolve a repo file, **preferring the local cache over the network**.
-    ///
-    /// `Api::get` consults the cache too, but only after asking the hub which
-    /// revision it should be holding — so a checkpoint sitting complete on disk
-    /// still cannot be opened while the hub is unreachable, and an unanswered
-    /// socket stalls the load for as long as the HTTP client will wait rather
-    /// than failing. These are pinned files: one filename in one repo, whose
-    /// exact length the spec records. A cache hit is the answer, and asking
-    /// anyway only makes startup depend on the network.
-    #[cfg(feature = "hub")]
-    /// A file from a repository, at `rev` when one is pinned.
-    ///
-    /// An empty `rev` resolves `main`, which is right for a local custom model and a gap
-    /// anywhere else — see [`ModelSpec::model_rev`].
-    fn resolve_repo_file(&self, repo: &str, rev: &str, filename: &str) -> crate::Result<PathBuf> {
-        use hf_hub::api::sync::Api;
-        use hf_hub::{Cache, Repo, RepoType};
-
-        if let Some(hit) = cached_repo_file(&Cache::default(), repo, rev, filename) {
-            return Ok(hit);
-        }
-        let api = Api::new().map_err(|e| ConversationError::Download(e.to_string()))?;
-        let got = match rev {
-            "" => api.model(repo.to_string()).get(filename),
-            r => api
-                .repo(Repo::with_revision(
-                    repo.to_owned(),
-                    RepoType::Model,
-                    r.to_owned(),
-                ))
-                .get(filename),
-        };
-        got.map_err(|e| ConversationError::Download(e.to_string()))
-    }
-
-    /// The base checkpoint to read the DeltaNet recurrent gates from, if this one needs it.
-    ///
-    /// **Fetched only when the primary is actually defective**, which is what makes recording
-    /// a donor on every override free: the ordinary case reads one header and returns `None`,
-    /// and the second checkpoint — several gigabytes — is downloaded only for a fine-tune that
-    /// cannot run without it.
-    ///
-    /// `None` covers three different situations that all mean "load the primary as it is":
-    /// no override is in effect, the primary stores its gates at F32, or the file is not of a
-    /// lineage that has gates at all.
-    #[cfg(feature = "hub")]
-    fn gate_donor_path(&self, model_path: &Path) -> crate::Result<Option<PathBuf>> {
-        use candle_transformers::models::qwen35::quantized_weights::undersized_gates;
-
-        let Some((repo, rev, filename)) = self.spec.gate_donor.clone() else {
-            return Ok(None);
-        };
-        let mut f = std::fs::File::open(model_path)?;
-        let content = candle::quantized::gguf_file::Content::read(&mut f)
-            .map_err(ConversationError::Model)?;
-        let bad = undersized_gates(&content);
-        if bad.is_empty() {
-            return Ok(None);
-        }
-        tracing::warn!(
-            "this checkpoint stores {} DeltaNet recurrent gates below F32 (`{}` is {:?}); \
-             reading them from the base checkpoint {repo} instead, which is what this \
-             override replaced",
-            bad.len(),
-            bad[0].0,
-            bad[0].1,
-        );
-        Ok(Some(self.resolve_repo_file(&repo, &rev, &filename)?))
-    }
-
-    #[cfg(not(feature = "hub"))]
-    fn gate_donor_path(&self, _: &Path) -> crate::Result<Option<PathBuf>> {
-        Ok(None)
-    }
-
-    /// The spec's [`ModelSpec::tensor_overrides`], each resolved to a local file at its pinned
-    /// revision.
-    ///
-    /// Unlike the gate donor these are fetched unconditionally: the spec names them because the
-    /// model it describes is made of them, not as a repair held in reserve.
-    #[cfg(feature = "hub")]
-    fn tensor_overrides(&self) -> crate::Result<Vec<TensorOverride>> {
-        self.spec
-            .tensor_overrides
-            .iter()
-            .map(|t| {
-                let path = self.resolve_repo_file(&t.repo, &t.revision, &t.filename)?;
-                Ok(TensorOverride::new(t.tensor.clone(), path))
-            })
-            .collect()
-    }
-
-    /// Without the hub there is nowhere to fetch an override from, and loading without it would
-    /// serve a different model under this spec's name — so a spec that names one is refused.
-    #[cfg(not(feature = "hub"))]
-    fn tensor_overrides(&self) -> crate::Result<Vec<TensorOverride>> {
-        match self.spec.tensor_overrides.first() {
-            None => Ok(Vec::new()),
-            Some(t) => Err(ConversationError::Download(format!(
-                "`{}` is read from {}, and this build has no `hub` feature to fetch it with",
-                t.tensor, t.repo
+            (Some(p), _) if is_pack(p) => ResolvedModel::open(p.clone()),
+            (Some(m), Some(t)) => resolve_local(&self.spec, m, t, device, fetch),
+            (Some(m), None) => Err(ConversationError::Download(format!(
+                "{} is a checkpoint, not a model pack, and packing it needs its tokenizer.json \
+                 — set tokenizer_path too",
+                m.display()
             ))),
+            (None, Some(_)) => Err(ConversationError::Download(
+                "a tokenizer_path is the tokenizer of a local checkpoint — set model_path too, \
+                 or neither to load the spec's model"
+                    .into(),
+            )),
+            (None, None) => resolve_spec(&self.spec, device, fetch),
         }
     }
 
-    /// The checkpoint and the tokenizer, each at its pinned revision.
-    ///
-    /// **Both revisions are passed, and until recently neither was.** `tokenizer_rev` was
-    /// added to stop the vocabulary moving under a substrate — the field was set by every
-    /// preset and then never read here, so resolution still fell through to `main` and the pin
-    /// existed only on paper. `model_rev` arrived with the same job and would have inherited
-    /// the same fate one line below. A pin that nothing consults is worse than no pin: it
-    /// reads as protection.
+    /// [`Self::resolve_model_with`] over the HuggingFace hub, cache first.
     #[cfg(feature = "hub")]
-    fn download_or_fail(&self) -> crate::Result<(PathBuf, PathBuf)> {
-        // **A prepared artifact is never downloaded.** `ModelSpec::prepared_from_source`
-        // marks a checkpoint this codebase *builds* from a repository's published files —
-        // Flash-Next's merged GGUF is the case — so resolution skips the network and looks
-        // in the local cache, here as in the hosts' download (`host::download`). A fetch
-        // would be a 404 on a filename that was never published, and every harness in
-        // this crate unable to open the one architecture that carries per-sequence state
-        // outside the K/V.
-        let model_path = if self.spec.prepared_from_source {
-            prepared_artifact_path(&self.spec.model_repo, &self.spec.model_filename)?
-        } else {
-            self.resolve_repo_file(
-                &self.spec.model_repo,
-                &self.spec.model_rev,
-                &self.spec.model_filename,
-            )?
-        };
-        // The tokenizer is published even when the checkpoint is not, and it comes from
-        // its own repository — so it resolves normally either way.
-        let tokenizer_path = self.resolve_repo_file(
-            &self.spec.tokenizer_repo,
-            &self.spec.tokenizer_rev,
-            "tokenizer.json",
-        )?;
-        Ok((model_path, tokenizer_path))
+    pub fn resolve_model(&self, device: &Device) -> crate::Result<ResolvedModel> {
+        self.resolve_model_with(device, &HubFetch)
+    }
+
+    /// [`Self::resolve_model_with`] with nowhere to fetch from: everything the
+    /// pack needs must be on disk already.
+    #[cfg(not(feature = "hub"))]
+    pub fn resolve_model(&self, device: &Device) -> crate::Result<ResolvedModel> {
+        self.resolve_model_with(device, &NoFetch)
     }
 
     /// Every adapter this build should load, as `(name, directory)`.
@@ -2094,20 +1892,13 @@ impl ModelBuilder {
     /// from a GGUF's, where a single filename is the whole answer.
     #[cfg(feature = "hub")]
     fn resolve_lora_repo(&self, repo: &str, revision: &str) -> crate::Result<PathBuf> {
-        use hf_hub::api::sync::Api;
-        use hf_hub::{Cache, Repo, RepoType};
+        use candle_transformers::models::hub_download::repo_file;
+        use hf_hub::{Repo, RepoType};
 
         let r = Repo::with_revision(repo.to_owned(), RepoType::Model, revision.to_owned());
         let mut dirs = Vec::new();
         for f in ["adapter_config.json", "adapter_model.safetensors"] {
-            let path = match Cache::default().repo(r.clone()).get(f) {
-                Some(hit) => hit,
-                None => Api::new()
-                    .map_err(|e| ConversationError::Download(e.to_string()))?
-                    .repo(r.clone())
-                    .get(f)
-                    .map_err(|e| ConversationError::Download(e.to_string()))?,
-            };
+            let path = repo_file(&r, f).map_err(|e| ConversationError::Download(e.to_string()))?;
             let dir = path
                 .parent()
                 .ok_or_else(|| {
@@ -2135,178 +1926,6 @@ impl ModelBuilder {
             "this model declares the LoRA adapter {repo:?}, which has to be downloaded — \
              enable the 'hub' feature, or use ModelBuilder::lora with a local directory"
         )))
-    }
-
-    #[cfg(not(feature = "hub"))]
-    fn download_or_fail(&self) -> crate::Result<(PathBuf, PathBuf)> {
-        Err(ConversationError::Download(
-            "local paths not set; enable the 'hub' feature to download from HuggingFace, \
-             or call .model_path()/.tokenizer_path() / .model_dir()"
-                .into(),
-        ))
-    }
-}
-
-/// A repo file's path in `cache`, or `None` if it is not there.
-///
-/// Split out from [`ModelBuilder::resolve_repo_file`] so the cache-first rule
-/// can be tested against a temporary cache instead of the machine's real one —
-/// the rule is what keeps a daemon startable when the hub is unreachable, and
-/// it is worth a test that does not depend on what happens to be downloaded.
-/// # A pinned revision does not live behind a ref
-///
-/// `CacheRepo::get` resolves in one way only: read the commit hash out of
-/// `refs/<revision>`, then look under `snapshots/<hash>/`. That is right for a
-/// branch or a tag, which is what a ref *is* — and wrong for a revision pinned
-/// to a commit, because the hub writes `refs/<branch>` and never
-/// `refs/<sha>`. Asked for a sha it reads a path that cannot exist, returns
-/// `None`, and the caller falls through to the network — so the cache-first
-/// rule silently did nothing for exactly the checkpoints that were pinned
-/// because pinning mattered, and a pinned model still could not be opened with
-/// the hub unreachable.
-///
-/// So: the ref lookup first, since a branch has to keep resolving through the
-/// ref it is named by, and the snapshot directly when that finds nothing. A
-/// revision the cache genuinely does not hold misses both and is still a miss.
-#[cfg(feature = "hub")]
-fn cached_repo_file(
-    cache: &hf_hub::Cache,
-    repo: &str,
-    rev: &str,
-    filename: &str,
-) -> Option<PathBuf> {
-    use hf_hub::{Repo, RepoType};
-    let Some(rev) = Some(rev).filter(|r| !r.is_empty()) else {
-        return cache.model(repo.to_string()).get(filename);
-    };
-    let pinned = Repo::with_revision(repo.to_owned(), RepoType::Model, rev.to_owned());
-    if let Some(found) = cache.repo(pinned).get(filename) {
-        return Some(found);
-    }
-    let snapshot = cache
-        .path()
-        .join(Repo::model(repo.to_owned()).folder_name())
-        .join("snapshots")
-        .join(rev)
-        .join(filename);
-    snapshot.is_file().then_some(snapshot)
-}
-
-/// The cache directory prepared and downloaded artifacts share.
-///
-/// `~/.cache/zend/models`, so a prepared artifact sits beside the published ones and one
-/// layout covers both. Defined here, in the crate every loader goes through, so the hosts'
-/// download (`host::download`) and every harness below it agree on where a prepared
-/// checkpoint is.
-#[cfg(any(feature = "hub", test))]
-pub fn model_cache_dir() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".cache").join("zend").join("models")
-}
-
-/// Locate an artifact this codebase **prepares** rather than downloads.
-///
-/// Layout is `<cache>/<repo-with-dashes>/<file>`, matching every downloaded artifact.
-/// What differs is the miss: there is no URL to fall back to, because the name was never
-/// published — so a miss is reported as the build step it actually is, rather than as a
-/// 404 on a file nobody ever uploaded.
-#[cfg(feature = "hub")]
-pub fn prepared_artifact_path(repo: &str, filename: &str) -> crate::Result<PathBuf> {
-    let path = model_cache_dir()
-        .join(repo.replace('/', "--"))
-        .join(filename);
-    if path.is_file() {
-        return Ok(path);
-    }
-    Err(ConversationError::Download(format!(
-        "{filename} is prepared from {repo}'s published files, not published under that \
-         name, and it is not in the cache at {}. Run the prepare step that builds it \
-         (for Flash-Next, `candle_transformers::models::qwen4exp::prepare`, which the \
-         `quantized_qwen38_moe` forward gate runs for this card's rung) — there is no \
-         download for this file.",
-        path.display(),
-    )))
-}
-
-/// **The gap, named, so a green run cannot be read as a covered one.**
-///
-/// `cached_repo_file` needs `hf-hub`, so its test can only exist with the `hub`
-/// feature — and `cargo test -p candle-conversation` does not enable it, which
-/// meant the suite reported `1253 filtered out` and passed. The test was not
-/// passing; it was not being built. It only appeared when another crate in the
-/// same invocation unified the feature in, so the same test both passed and
-/// failed depending on which `-p` flags were on the command line, and a real
-/// failure was written off as flakiness.
-///
-/// An ignored test compiles unconditionally and is *counted* in the summary, so
-/// the absence is now a line of output rather than nothing at all.
-#[cfg(all(test, not(feature = "hub")))]
-mod cache_first_tests {
-    #[test]
-    #[ignore = "the cache-first lookup is only compiled with --features hub"]
-    fn the_cache_first_lookup_is_not_covered_without_the_hub_feature() {}
-}
-
-#[cfg(all(test, feature = "hub"))]
-mod cache_first_tests {
-    use super::cached_repo_file;
-
-    /// **A cached file resolves without the network, and a miss says so.**
-    ///
-    /// `Api::get` ends at the cache too, but only after asking the hub which
-    /// revision it should be holding — so before this, a checkpoint sitting
-    /// complete on disk could not be opened while the hub was unreachable, and
-    /// an unanswered socket stalled the load for as long as the HTTP client
-    /// would wait. That is not hypothetical: it cost an 18-minute hang on 20
-    /// seconds of CPU, with the model never opened.
-    #[test]
-    fn a_cached_file_is_found_without_touching_the_network() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cache = hf_hub::Cache::new(tmp.path().to_path_buf());
-        let repo = "acme/widget-GGUF";
-
-        assert!(
-            cached_repo_file(&cache, repo, "", "widget.gguf").is_none(),
-            "an empty cache must report a miss, not a phantom hit"
-        );
-
-        // Lay the file down the way hf-hub itself does — a ref pointing at a
-        // commit, and the file under that commit's snapshot — so this exercises
-        // the real lookup rather than a re-implementation of its path rules.
-        let commit = "0123456789abcdef0123456789abcdef01234567";
-        let repo_cache = cache.model(repo.to_string());
-        repo_cache.create_ref(commit).expect("create ref");
-        let snapshot = tmp
-            .path()
-            .join(hf_hub::Repo::model(repo.to_string()).folder_name())
-            .join("snapshots")
-            .join(commit);
-        std::fs::create_dir_all(&snapshot).expect("mkdir");
-        std::fs::write(snapshot.join("widget.gguf"), b"weights").expect("write");
-
-        assert_eq!(
-            cached_repo_file(&cache, repo, "", "widget.gguf"),
-            Some(snapshot.join("widget.gguf")),
-            "a file already in the cache must resolve from it"
-        );
-
-        // **A pinned revision resolves to that revision's snapshot, not to
-        // whatever the ref happens to point at.** The pin exists because an
-        // upstream re-upload silently invalidated a threshold tuning; a
-        // cache-first lookup that ignored it would hand back the moving
-        // checkpoint from disk and never consult the pin at all.
-        assert_eq!(
-            cached_repo_file(&cache, repo, commit, "widget.gguf"),
-            Some(snapshot.join("widget.gguf")),
-            "the pinned commit's own snapshot did not resolve"
-        );
-        assert!(
-            cached_repo_file(&cache, repo, "cafebabe", "widget.gguf").is_none(),
-            "a revision the cache does not hold reported a hit — the pin is being ignored"
-        );
     }
 }
 
@@ -2380,49 +1999,60 @@ mod header_read_tests {
 
 #[cfg(test)]
 mod identity_tests {
-    use std::fs::File;
-    use std::io::Write;
     use std::path::Path;
 
-    use candle::quantized::gguf_file::{self, Value};
-    use candle::quantized::{GgmlDType, QTensor};
-    use candle::{Device, Tensor};
+    use candle::quantized::gguf_file::Value;
+    use candle_transformers::models::model_pack::keys::TOKENIZER_JSON;
+    use candle_transformers::models::model_pack::SourceRecord;
 
     use crate::error::ConversationError;
-    use crate::models::identity::WeightFiles;
+    use crate::models::identity::{write_pack_header, WeightFiles};
     use crate::models::Model;
 
-    /// **A tokenizer that cannot be read refuses the start.** The key a
-    /// substrate is checked against hashes the vocabulary, so a model without
-    /// one has nothing to check — opening the substrate anyway is how a
-    /// different tokenizer's KV came to be served. The tokenizer is read before
-    /// any weight file, so the checkpoint path is never touched.
+    const TOKENIZER: &str = r#"{"model":{"vocab":{"a":0}}}"#;
+
+    /// A pack header built from one checkpoint whose whole-file SHA-256 is
+    /// `sha` repeated, carrying `tokenizer` when given.
+    fn pack(path: &Path, sha: char, tokenizer: Option<&str>) {
+        let source = SourceRecord {
+            role: "checkpoint".into(),
+            repo: "org/m".into(),
+            rev: "r1".into(),
+            file: "m.gguf".into(),
+            len: 4096,
+            sha256: sha.to_string().repeat(64),
+        };
+        let extra: Vec<(&str, Value)> = tokenizer
+            .map(|t| (TOKENIZER_JSON, Value::String(t.into())))
+            .into_iter()
+            .collect();
+        write_pack_header(path, &[source], &extra);
+    }
+
+    /// **A pack without a tokenizer refuses the start.** The key a substrate is
+    /// checked against hashes the vocabulary, so a model without one has
+    /// nothing to check — opening the substrate anyway is how a different
+    /// tokenizer's KV came to be served.
     #[test]
-    fn an_unreadable_tokenizer_refuses_the_start() {
+    fn a_pack_without_a_tokenizer_refuses_the_start() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let missing = dir.path().join("tokenizer.json");
+        let path = dir.path().join("m.pack.gguf");
+        pack(&path, 'a', None);
         let err = Model::Qwen35_0_8B_Q8
             .builder()
-            .model_identity(&WeightFiles::single("never-read.gguf"), &missing)
+            .model_identity(&WeightFiles::single(&path))
             .expect_err("a model whose tokenizer cannot be read must not be identified");
         let ConversationError::Tokenizer(message) = err else {
             panic!("refused for the wrong reason: {err}");
         };
-        let expected = format!("read {} to identify the model: ", missing.display());
+        let expected = format!(
+            "read the tokenizer of {} to identify the model: ",
+            path.display()
+        );
         assert!(
             message.starts_with(&expected),
-            "the refusal must name the tokenizer it could not read: {message}"
+            "the refusal must name the pack it could not read: {message}"
         );
-    }
-
-    /// One F32 tensor named `w` holding `values`.
-    fn write_gguf(path: &Path, values: &[f32]) {
-        let t = Tensor::from_slice(values, values.len(), &Device::Cpu).unwrap();
-        let q = QTensor::quantize(&t, GgmlDType::F32).unwrap();
-        let arch = Value::String("fixture".into());
-        let mut f = File::create(path).unwrap();
-        gguf_file::write(&mut f, &[("general.architecture", &arch)], &[("w", &q)]).unwrap();
-        f.flush().unwrap();
     }
 
     /// **A fine-tune swapped in under the same name and vocabulary is refused.**
@@ -2433,25 +2063,21 @@ mod identity_tests {
     #[test]
     fn a_checkpoint_with_the_same_tokenizer_cannot_open_anothers_substrate() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let tokenizer = dir.path().join("tokenizer.json");
-        std::fs::write(&tokenizer, br#"{"model":{"vocab":{"a":0}}}"#).unwrap();
-        let base = dir.path().join("base.gguf");
-        let tuned = dir.path().join("tuned.gguf");
-        write_gguf(&base, &[1.0, 2.0, 3.0, 4.0]);
-        write_gguf(&tuned, &[1.0, 2.0, 3.0, 4.5]);
+        let base = dir.path().join("base.pack.gguf");
+        let tuned = dir.path().join("tuned.pack.gguf");
+        pack(&base, 'a', Some(TOKENIZER));
+        pack(&tuned, 'b', Some(TOKENIZER));
         let workspace = dir.path().join("workspace");
         let builder = Model::Qwen35_0_8B_Q8.builder().workspace_path(&workspace);
 
-        let first = builder
-            .model_identity(&WeightFiles::single(&base), &tokenizer)
-            .unwrap();
+        let first = builder.model_identity(&WeightFiles::single(&base)).unwrap();
         let bound = builder
             .bind_substrate(&first)
             .expect("a new substrate binds");
         drop(bound);
 
         let second = builder
-            .model_identity(&WeightFiles::single(&tuned), &tokenizer)
+            .model_identity(&WeightFiles::single(&tuned))
             .unwrap();
         assert_eq!(first.key().tokenizer, second.key().tokenizer);
         assert_ne!(first.key().weights, second.key().weights);

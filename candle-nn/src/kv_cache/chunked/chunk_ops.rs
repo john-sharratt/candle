@@ -37,7 +37,7 @@ use candle::quantized::cuda::SELECT_FMT_F16;
 use candle::quantized::pinned_staging::PinnedBuf;
 #[cfg(feature = "cuda")]
 use candle::Device;
-use candle::{Result, Tensor};
+use candle::Result;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -571,8 +571,7 @@ impl ChunkedKvBacking {
                     .arenas_mut()
                     .get_mut(&ai)
                     .ok_or_else(|| candle::Error::Msg(format!("{side} arena {ai} not found")))?;
-                let host = Tensor::from_slice(slice, slice.len(), arena.byte_data().device())?;
-                arena.write_slot_bytes(gid.chunk_idx(), &host)
+                arena.write_slot_from_bytes(gid.chunk_idx(), slice)
             };
 
         for h in 0..n_kv_head {
@@ -1674,7 +1673,13 @@ impl ChunkedKvBacking {
         let mut new_gids: Vec<HashMap<i64, ChunkGid>> =
             (0..backings.len()).map(|_| HashMap::new()).collect();
         let domain = bump_arena::persistence_domain(copy_stream)?;
+        // The copy's two halves, timed apart: the device side (gather, DtoH and
+        // the sync) and the host side (dest gids and the scatter into CPU arenas).
+        let mut transfer = std::time::Duration::ZERO;
+        let mut scatter = std::time::Duration::ZERO;
+        let mut bands = 0usize;
         for group in &groups {
+            let t_transfer = std::time::Instant::now();
             // One generation per group: dropping it fences the copy stream and
             // rewinds the cursor, so the next group reuses the same bytes. The
             // range below borrows it, so it cannot outlive the generation.
@@ -1725,6 +1730,8 @@ impl ChunkedKvBacking {
                 copy_stream.synchronize().w()?;
             }
             drop(staging_gen);
+            transfer += t_transfer.elapsed();
+            let t_scatter = std::time::Instant::now();
 
             // ── Scatter this group's bands into fresh CPU arenas ───────────
             let scratch_ref = pinned_scratch
@@ -1736,15 +1743,24 @@ impl ChunkedKvBacking {
                 let resolve = &layers[run.layer];
                 let raws = &resolve.unique_raws[run.start..run.end];
                 let gids = &mut new_gids[run.layer];
-                // Allocate dest CPU GIDs (one state.write per run).
+                // Allocate dest CPU GIDs (one state.write per run), one bulk claim
+                // per destination format rather than one claim per band: the per-band
+                // claim was most of the scatter's ~1.4 µs a band.
                 {
                     let _state = backing
                         .state
                         .write()
                         .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+                    let mut by_key: HashMap<ArenaKey, Vec<i64>> = HashMap::new();
                     for &raw in raws {
-                        let cpu_key = resolve.src_keys[&raw].at(ArenaLocation::Cpu);
-                        gids.insert(raw, backing.alloc_chunk_for_key(cpu_key)?);
+                        by_key
+                            .entry(resolve.src_keys[&raw].at(ArenaLocation::Cpu))
+                            .or_default()
+                            .push(raw);
+                    }
+                    for (cpu_key, keyed) in by_key {
+                        let claimed = backing.alloc_chunks_for_key_bulk(cpu_key, keyed.len())?;
+                        gids.extend(keyed.into_iter().zip(claimed));
                     }
                 }
                 // Write this run's slice of the group blob → CPU arena.
@@ -1766,8 +1782,19 @@ impl ChunkedKvBacking {
                     Ok(())
                 })?;
                 run_off += raws.iter().map(|r| resolve.src[r].1).sum::<usize>();
+                bands += raws.len();
             }
+            scatter += t_scatter.elapsed();
         }
+        tracing::debug!(
+            target: "candle_nn::kv_cache::migrate",
+            groups = groups.len(),
+            bands,
+            mib = grand_total >> 20,
+            transfer_ms = transfer.as_millis() as u64,
+            scatter_ms = scatter.as_millis() as u64,
+            "hot→warm copy: device transfer and host scatter"
+        );
 
         // ── Rebuild each layer's SealedSequences with its mapped CPU GIDs ──
         // A layer with no bands carried no GPU bytes and is handed back as it
@@ -1809,9 +1836,8 @@ impl ChunkedKvBacking {
     }
 
     /// Write one chunk-slot's worth of raw bytes into a CPU `Arena::Float`
-    /// at `(arena_idx, chunk_idx)`. The bytes are interpreted as the
-    /// arena's element dtype; a temp CPU [`Tensor`] is constructed over
-    /// them and `slice_set` writes it into the dest chunk slot.
+    /// at `(arena_idx, chunk_idx)`, copied straight into the slab
+    /// ([`Arena::write_slot_from_bytes`]).
     ///
     /// `Arena::Quantized` is not supported here — see the module-level
     /// caveat on [`Self::migrate_sealed_to_cpu_batch_async`].
@@ -1835,10 +1861,9 @@ impl ChunkedKvBacking {
             ))
         })?;
         // The gather pulled exactly one PAYLOAD per slot into pinned scratch,
-        // and slot `n` starts at `n * slot_stride` — `write_slot_bytes` keeps
-        // those two lengths apart (invariant 8).
-        let host = Tensor::from_slice(bytes, bytes.len(), &Device::Cpu)?;
-        arena.write_slot_bytes(chunk_idx, &host)
+        // and slot `n` starts at `n * slot_stride` — `write_slot_from_bytes`
+        // keeps those two lengths apart (invariant 8).
+        arena.write_slot_from_bytes(chunk_idx, bytes)
     }
 
     /// **Fully-batched** RAM→VRAM migration — the symmetric inverse of

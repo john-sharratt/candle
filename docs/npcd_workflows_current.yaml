@@ -1,0 +1,845 @@
+# npcd's operation workflows, as the hardcoded pipeline runs them today, in
+# the workflow format. This is the target the engine is wired to: loaded from
+# a mind's missions.yaml, it reproduces today's behaviour with one deliberate
+# change, marked [changed] below.
+#
+# ── The format ───────────────────────────────────────────────────────────────
+#
+# generators   what proposes work: each names the table `call` that proposes,
+#              the `workflow` an accepted proposal opens, its `weight`, and its
+#              `prompt`. A declined or refused proposal opens nothing.
+#
+# workflows    named; each has:
+#   send-backs  how many times work may be routed back to an earlier step
+#               before the operation fails (today's FIX_LIMIT)
+#   desk        where its work is done: the bench its steps send a Maker to
+#   year        when its work is done: the time machine is set to it
+#   on-failed   set-aside (moved out of the record, retired from memory) |
+#               restore (put back as it was) | keep
+#   steps       in order; the first is where an operation starts
+#
+# step keys — no others:
+#   by          maker | another (nobody who acted this round) | table
+#   call        table steps only: the Rust decode that answers, and whose
+#               verdicts are the step's outcomes
+#   edits       new | change | optional — what the actor does to the document:
+#               write it whole (compose), change it (a commit is required),
+#               or leave it unless it finds a fault
+#   next        a step name for one result, or a map of outcome → step;
+#               done and failed end the operation (cancelled is the engine's)
+#   stuck       where a `stuck` report leads once `stuck-limit` are made this
+#               round; until then the step is offered to someone else
+#   tools       acts this step adds to the Maker's own
+#   checks      Rust checks the step's result must pass; a failed check
+#               refuses the result, says why, and the actor tries again.
+#               `committed`: the document committed this step; `changed`: on a
+#               step whose edits are `change`, the document differs from what
+#               the step found; `brief-copied`: no run of ten or more of
+#               the brief's own words set down in it; `rejection-quotes-the-draft`,
+#               `rejection-names-an-era`: what a rejection must give; and the
+#               gate's own — length, heading, voice, paragraphs, said-twice,
+#               refrains, scaffolding, leakage.
+#   context     sections the engine puts before the prompt
+#   prompt      the text, or a map keyed by the outcome that led here
+#               (start for the first step, default for any other)
+#
+# A route to an earlier step (or the same one) is a send-back: it opens a new
+# round, and `another` is judged within the round — so whoever sent the work
+# back does not take the fix, and the writer of an earlier round may review.
+#
+# Placeholders: {name} {objective} {document} {findings} {told} {eras}, and the
+# fields of the proposal that opened the operation ({title} {when} {where}
+# {who} {happens} {turns} {quote} {date} {grain} {agrees} {leaves} {a} {b}
+# {qa} {qb} {wrong} {right} {why} {change}). {findings} is what the step that
+# routed here found. A prompt may include a shared prompt — {elsewhere} — or
+# another step's — {story.read.prompt} — resolved at load.
+
+keep: 4
+
+prompts:
+
+  # The system prompt of the table's readings.
+  reader: |
+    You read what the Makers write for this world's record, before any of it
+    stands there. You are an editor who knows the record: you check a draft
+    against the eras, the lives and the world it must agree with, and you say
+    exactly what is wrong with it, quoting its own words, or that nothing is.
+    You never set work and never answer that there is nothing to do: every
+    draft you are shown is read, and every reading says what you checked.
+
+    You answer with exactly one call, `reading`.
+
+  # The system prompt of every table call that proposes work.
+  table: |
+    You set work for the Makers — the writers who keep this world's record and
+    finish its story. You are shown one part of the record and asked what it
+    most needs. Your answer becomes a mission a Maker carries out at a desk, so
+    every field must be specific, grounded in what is already written, and true
+    to it.
+
+    You answer with exactly one call. When there is honestly nothing here worth
+    doing, answer `no_mission` and say what you checked. Never invent a problem
+    to have something to say.
+
+  # The system prompt `compose` writes under.
+  writing: |
+    You write this world's record: its history, the stories it passes over,
+    and the lives of the people in it, one significant event at a time. What
+    you write stands in the record as true, beside everything already written,
+    so it must fit what the record says — the eras, the dates, who was where,
+    what existed then.
+
+    Every piece is a scene, not a summary and not a mood: someone wants
+    something, does something about it, and the moment ends differently than it
+    began. Show it moment by moment — what is done, what is said, what it costs
+    — in the people, places and things of its own time, taken from the
+    documents you are given. Give the people in it names and natures the record
+    already has, or that fit it.
+
+    Write what a witness standing there would see and hear — what people do,
+    what they say in their own words, the particular thing in someone's hand,
+    the sound in that room — and let the reader feel it. Never name a feeling or
+    explain what the moment means: not "he felt", not "fear", "resolve" or "the
+    weight of the decision", not what it "meant" or what it "would shape". No
+    questions to the reader, no lesson drawn at the end, no stock phrases.
+    Every sentence is one only this moment, in this world, could have. End on
+    what is done or said, not on a reflection about it.
+
+    A life is told in its subject's own voice and nature, as its other events
+    tell it. Nothing in a piece is about writing, recording, archives being
+    typed into, or the people who keep the record: the record is about the
+    world, not about its writers.
+
+    You answer with exactly one call, `draft`, its `text` the whole piece and
+    nothing but the piece.
+
+  elsewhere: |
+    You write this from the vault, and nothing of the vault belongs in it: not
+    its rooms or machines, not the Makers, not the writing of it. Nobody in it
+    is writing a record. Tell it from inside its own world, in its own time,
+    from what the record says was there.
+
+  # The table's reading of a draft — the `reading` call's prompt.
+  reading: |
+    Above is a draft a Maker wrote for the record, and what it has to answer
+    to: whose life it is or what world it is set in, how the rest of that life
+    is written, the era it falls in.
+
+    Read it as an editor who cares about this world. First: what year is it
+    set in, which era is that, and does everything it says about the world fit
+    what that era says was true then? Then look for what is actually wrong,
+    sentence by sentence:
+    - facts it gets wrong against the era or the other events — a date, who
+      was where, what existed then, how much time has passed;
+    - a voice that is not its subject's — a machine that speaks like a person,
+      a character who suddenly sounds like somebody else, the writer's own
+      concerns put in the subject's mouth, a life told as "I" where the rest of
+      it says "you";
+    - anything this world does not have;
+    - a person who changes from one sentence to the next — "he" in one line
+      and "she" in another, a name spelled two ways;
+    - the moment explained instead of shown: a paragraph that stops the scene
+      to set out how the world works, or a last line that says what it meant;
+    - summary where there should be a scene, a mood restated paragraph after
+      paragraph, or the same thing said over and over;
+    - the prose itself slipping: a past-tense story that drops into the
+      present, speech set down without its quotation marks, a sentence that
+      does not parse;
+    - no event — nothing happens and nothing ends differently than it began;
+    - every year it names, placed against the eras;
+    - for a life, what the subject's anchor says they are — a body or no body,
+      how they speak, what they notice — and what their other events have
+      already established;
+    - the writers' world in the story.
+
+    Work it out first, in your own thinking — set each year against the eras,
+    compare the facts — and then answer with `reading`, which holds only what
+    you found:
+    - `event`: what happens in the draft, in one sentence, or `none`.
+    - `checked`: what you checked and what of that holds — never more than four
+      hundred words. Whatever is wrong goes in `faults`.
+    - `faults`: every fault you found, one entry each: `quote`, the draft's own
+      words that are wrong, copied exactly; and `fault`, what is wrong with them
+      and what they should say instead. Each fault once.
+    - `verdict`: `sound` if nothing in it needs mending, `mend` if its faults can
+      be put right in place, `fail` if they run through all of it.
+
+    Judge real faults, not taste: a draft that could be written differently is
+    not a draft that is wrong.
+
+  review: |
+    {name} — {objective}.
+
+    Another Maker drafted `{document}`. You are its second reader: nothing of
+    it stands in the record until you pass it.
+
+    What it was to tell, from its brief — What happens: {told}
+
+    {findings}
+
+  verdict: |
+    Then give your verdict at the table. When it stands, `report_done` with what
+    you checked and what you changed. Only if your mending could not save it —
+    the events themselves set in the wrong era, or nothing of the subject in it
+    at all — `report_rejected` with why. A rejected draft goes back to be fixed,
+    with your reasons.
+
+  fix: |
+    {name} — {objective}. A fix.
+
+    `{document}` was written for this operation and did not stand: {findings}
+
+    What it is to tell, from its brief — What happens: {told}
+
+    Fix it forward. Read it as it stands and what it answers to, then put right
+    what was found — every fault, in the document itself — and keep everything
+    in it that is right. Where the faults run through all of it, write it again
+    whole with `compose`, the same events told right. Then `bench_commit` it and
+    report it at the table: it is read and reviewed again before it stands.
+
+  canon: |
+    {name} — {objective}.
+
+    `{document}` has been written and passed on review by two other Makers.
+    Before it stands in the record, check it against the main storyline: the
+    eras of this world, which everything else must agree with. Read the draft,
+    then read the storyline around it — {eras} — before you decide anything.
+
+    Look for major contradictions only: a date the eras put elsewhere — check
+    every year it names, and every claim about how things stood then ("the war
+    is over", "the gates are open", who ruled, who was gone) against the era
+    that year falls in — a war or a battle with a different outcome, somebody
+    somewhere the storyline says they could not be, something that did not
+    exist yet or no longer did, an order of events the eras reverse. Its style
+    and voice have been reviewed already; leave them.
+
+    Then decide.
+    - It agrees with the storyline: `report_done`, saying what you checked it
+      against.
+    - A contradiction an edit can put right: put it right with `file_edit`,
+      `bench_commit` it, then `report_done` saying what you changed and why.
+    - The contradiction runs through it — the events themselves could not have
+      happened as told: `report_rejected`, saying which era it contradicts and
+      how. A rejected draft goes back to be fixed, with your reasons.
+
+generators:
+
+  - id: life-event
+    call: life_event
+    workflow: life-event
+    weight: 3
+    context:
+      - whose-life
+      - life-story
+      - events-written
+      - latest-event
+      - timeline
+      - where-it-belongs
+      - how-dated
+    prompt: |
+      Above is one character's life as the record holds it: who they are, what
+      is known of them, the events already written, and the eras of the world
+      they lived through.
+
+      Choose the next significant event of this life that has not been written —
+      a day or a year that changed them: something they did, lost, decided,
+      refused, or could not forget. It falls where "Where the next event
+      belongs" says, inside this character's life and no later than the latest
+      era (the world's present), and fits what the world was doing then
+      according to the eras. Prefer an event the written ones point at but
+      never tell.
+
+      Answer with `life_event`:
+      - `date`: when it happened — `YYYY`, `YYYY-MM` or `YYYY-MM-DD`.
+      - `title`: what the event is called, a few words.
+      - `leaves`: what the event leaves the character believing, wanting or
+        meaning to do, in one sentence.
+      - `agrees_with`: the facts already written that it must not contradict,
+        each naming where it is written.
+      - `turns`: the act the moment turns on, in one sentence — who does what
+        that cannot be taken back, and what is different after it. Never
+        waiting, remembering, sitting or feeling: somebody acts.
+      - `happens`: what happens, concretely — who is there, where, what is done
+        and said, what it costs, leading to that turn. Sixty to two hundred
+        words, in the third person, about the character.
+
+      What makes an event worth writing: something happens and it ends
+      differently than it began; it is in this world; it is this character —
+      what their anchor says they are is how they act in it.
+
+  - id: contradiction
+    call: correction
+    workflow: correction
+    weight: 2
+    context:
+      - document-a
+      - document-b
+      - timeline
+    prompt: |
+      Above are two documents from the record that touch the same ground. Read
+      them against each other, line by line.
+
+      A contradiction is two statements that cannot both be true: a date, a
+      number, an order of events, who was where, who did what, what was
+      possible at the time. A difference of emphasis, a detail one has and the
+      other lacks, two different events on two different dates, or a different
+      tone is not a contradiction. Most pairs agree; that is the normal answer.
+
+      If they contradict, answer with `correction`:
+      - `quote_a`: the clashing sentence from Document A, copied exactly.
+      - `quote_b`: the clashing sentence from Document B, copied exactly.
+      - `wrong`: `A` or `B` — which one must change. The world's eras outrank a
+        single life, and what more of the record depends on stands.
+      - `why`: why that one is wrong, in a sentence or two.
+      - `change`: the smallest edit that makes it agree.
+
+      If you cannot copy one sentence from each that clash, answer `no_mission`
+      and say what you compared.
+
+  - id: untold
+    call: story
+    workflow: story
+    weight: 1
+    context:
+      - era
+      - timeline
+      - stories-told
+      - names-taken
+    prompt: |
+      Above is one era of the world's history, the eras around it, and the
+      stories already told.
+
+      An era summarises: it names battles, places, decisions and people it never
+      shows. Choose one moment it passes over that nobody has told — a single
+      scene somebody could have witnessed, on a particular day, with people in
+      it — that would make the era more real to stand in.
+
+      Answer with `story`:
+      - `title`: the story's title.
+      - `when`: the day or season it happens, as exactly as the era allows.
+      - `where`: the place.
+      - `who`: the people in it — invented ordinary people are fine; named
+        characters only as the record allows.
+      - `agrees_with`: the era's own words the story must agree with, copied
+        exactly between double quotes.
+      - `turns`: the act the story turns on, in one sentence — who does what
+        that cannot be taken back, and what is different after it.
+      - `happens`: what happens in it, from the start of the scene to its end,
+        leading to that turn, sixty to two hundred words.
+
+      What makes a moment worth telling: something happens in it and it ends
+      differently than it began, in a place of this era, with people of this
+      era, using only what this era had. Nobody in it is a writer or keeps a
+      record unless the era itself says so.
+
+workflows:
+
+  # ── A story the record passes over ────────────────────────────────────────
+  story:
+    send-backs: 3
+    desk: story-desk
+    year: era-opens
+    on-failed: set-aside
+    steps:
+
+      write:
+        by: maker
+        edits: new
+        next: read
+        stuck: failed
+        checks:
+          - committed
+          - length
+          - heading
+          - paragraphs
+          - said-twice
+          - brief-copied
+          - refrains
+          - scaffolding
+          - leakage
+        context:
+          - world-then
+          - worlds-words
+          - reads
+        prompt: |
+          Tell a story the record passes over: "{title}".
+
+          When: {when}
+          Where: {where}
+          Who is there: {who}
+
+          What happens: {happens}
+
+          It turns on: {turns}
+
+          It must agree with the era, which says: "{quote}"
+
+          Write it as a story — past tense, six hundred to a thousand words,
+          beginning with a heading of its title. Show it as it happens: what the
+          people in it do and say, moment by moment, in the place itself. Never
+          summarise what the era already says; the story is what the era leaves
+          out.
+
+          {elsewhere}
+
+      # Listed before the reading, so every route here — a rejection, a
+      # reading that fails it again, a stuck review — is a send-back: a new
+      # round, in which the writer may fix it and whoever sent it back may not.
+      fix:
+        by: another
+        edits: change
+        next: read
+        stuck: failed
+        checks:
+          - committed
+          - length
+          - heading
+          - paragraphs
+          - said-twice
+          - brief-copied
+          - refrains
+          - scaffolding
+          - leakage
+        context:
+          - reads
+        prompt: |
+          {fix}
+
+      read:
+        by: table
+        call: reading
+        next:
+          sound: review
+          mend: review
+          fail: review
+          unread: review
+        context:
+          - draft
+          - when-set
+          - era-it-tells
+          - worlds-words
+          - world-now
+          - timeline
+          - told
+        prompt: |
+          {reading}
+
+      review:
+        by: another
+        edits:
+          sound: optional
+          mend: change
+          fail: new
+          unread: change
+        next:
+          pass: reread
+          reject: fix
+        stuck: fix
+        stuck-limit: 2
+        tools:
+          - report_rejected
+        checks:
+          - changed
+          - length
+          - heading
+          - paragraphs
+          - said-twice
+          - brief-copied
+          - refrains
+          - scaffolding
+          - leakage
+          - rejection-quotes-the-draft
+        context:
+          - reads
+        prompt:
+          sound: |
+            {review}
+            The table found nothing to mend. Read it for yourself; if you find
+            something, mend it with `file_edit` and `bench_commit` it.
+
+            {verdict}
+          mend: |
+            {review}
+            First, mend it. Put right every fault the table found, in the draft
+            itself: a wrong date or fact with `file_edit`; a line said twice,
+            cut; a paragraph that runs on, broken where the scene moves. If it is
+            told in the wrong voice, or a scene is summary, write it again whole
+            with `compose` — the same events, in the right voice, as a scene —
+            keeping everything that is right in it. Then `bench_commit` it. A
+            draft that can be saved is saved by you; that is the work.
+
+            {verdict}
+          fail: |
+            {review}
+            First, write it anew. The table found its faults run through all of
+            it, so it is not mended a line at a time: sit down with `compose`
+            and write the piece again whole, from what it was to tell — the
+            operation's aim above, the era and the documents you read — as a
+            scene in that world, keeping nothing of the failed draft but what
+            the table found right in it. Then `bench_commit` it. A draft that
+            can be saved is saved by you; that is the work.
+
+            {verdict}
+          unread: |
+            {review}
+            The table could not read it; read it wholly for yourself, and mend
+            what you find with `file_edit`, or `compose` where it runs through
+            all of it. Then `bench_commit` it.
+
+            {verdict}
+
+      # [changed] Today a review that passed a sound reading goes straight to
+      # the canon check; here every pass is read again, so a review that
+      # changed nothing is caught the same way as one that broke something.
+      reread:
+        by: table
+        call: reading
+        next:
+          sound: canon
+          mend: review
+          fail: fix
+          unread: canon
+        context:
+          - draft
+          - when-set
+          - era-it-tells
+          - worlds-words
+          - world-now
+          - timeline
+          - told
+        prompt: |
+          {reading}
+
+      canon:
+        by: another
+        edits: optional
+        next:
+          pass: done
+          reject: fix
+        stuck: fix
+        stuck-limit: 2
+        tools:
+          - report_rejected
+        checks:
+          - length
+          - heading
+          - paragraphs
+          - said-twice
+          - brief-copied
+          - refrains
+          - scaffolding
+          - leakage
+          - rejection-quotes-the-draft
+          - rejection-names-an-era
+        context:
+          - storyline
+          - reads
+        prompt: |
+          {canon}
+
+  # ── The next event of a character's life ──────────────────────────────────
+  life-event:
+    send-backs: 3
+    desk: character-terminal
+    year: event-year
+    on-failed: set-aside
+    steps:
+
+      write:
+        by: maker
+        edits: new
+        next: read
+        stuck: failed
+        checks:
+          - committed
+          - length
+          - heading
+          - voice
+          - paragraphs
+          - said-twice
+          - brief-copied
+          - refrains
+          - leakage
+        context:
+          - anchor
+          - voice-example
+          - world-then
+          - worlds-words
+          - reads
+        prompt: |
+          Write {subject}'s life where the record has nothing: the {grain}
+          {date}, "{title}".
+
+          What happens: {happens}
+
+          It turns on: {turns}
+
+          It must agree with: {agrees}
+
+          What it leaves {subject} with: {leaves}
+
+          Write it in {voice}, the way every event of {subject}'s life is told.
+          Not as yourself, and not with a heading: one scene, moment by moment,
+          of about four hundred words, in short paragraphs, ending on what it
+          left {subject} believing or meaning to do.
+
+          {elsewhere}
+
+      fix:
+        by: another
+        edits: change
+        next: read
+        stuck: failed
+        checks:
+          - committed
+          - length
+          - heading
+          - voice
+          - paragraphs
+          - said-twice
+          - brief-copied
+          - refrains
+          - leakage
+        context:
+          - reads
+        prompt: |
+          {fix}
+
+      read:
+        by: table
+        call: reading
+        next:
+          sound: review
+          mend: review
+          fail: review
+          unread: review
+        context:
+          - draft
+          - when-set
+          - whose-life
+          - other-events
+          - voice-example
+          - era-it-falls-in
+          - worlds-words
+          - world-now
+          - timeline
+          - told
+        prompt: |
+          {reading}
+
+      review:
+        by: another
+        edits:
+          sound: optional
+          mend: change
+          fail: new
+          unread: change
+        next:
+          pass: reread
+          reject: fix
+        stuck: fix
+        stuck-limit: 2
+        tools:
+          - report_rejected
+        checks:
+          - changed
+          - length
+          - heading
+          - voice
+          - paragraphs
+          - said-twice
+          - brief-copied
+          - refrains
+          - leakage
+          - rejection-quotes-the-draft
+        context:
+          - reads
+        prompt:
+          sound: |
+            {story.review.prompt.sound}
+          mend: |
+            {story.review.prompt.mend}
+          fail: |
+            {story.review.prompt.fail}
+          unread: |
+            {story.review.prompt.unread}
+
+      reread:
+        by: table
+        call: reading
+        next:
+          sound: canon
+          mend: review
+          fail: fix
+          unread: canon
+        context:
+          - draft
+          - when-set
+          - whose-life
+          - other-events
+          - voice-example
+          - era-it-falls-in
+          - worlds-words
+          - world-now
+          - timeline
+          - told
+        prompt: |
+          {reading}
+
+      canon:
+        by: another
+        edits: optional
+        next:
+          pass: done
+          reject: fix
+        stuck: fix
+        stuck-limit: 2
+        tools:
+          - report_rejected
+        checks:
+          - length
+          - heading
+          - voice
+          - paragraphs
+          - said-twice
+          - brief-copied
+          - refrains
+          - leakage
+          - rejection-quotes-the-draft
+          - rejection-names-an-era
+        context:
+          - storyline
+          - reads
+        prompt: |
+          {canon}
+
+  # ── Two documents that cannot both be true ────────────────────────────────
+  # No canon check: a correction changes the record to agree with itself.
+  correction:
+    send-backs: 3
+    desk: chronicle-terminal
+    on-failed: restore
+    steps:
+
+      write:
+        by: maker
+        edits: change
+        next: read
+        stuck: failed
+        checks:
+          - committed
+        context:
+          - reads
+        prompt: |
+          Two documents of the record contradict each other, and one must
+          change.
+
+          `{a}` says: "{qa}"
+
+          `{b}` says: "{qb}"
+
+          `{wrong}` is the one that is wrong: {why}
+
+          The change: {change}
+
+          Make it with `file_edit` — the clashing words replaced, nothing else
+          in `{wrong}` touched — so that it agrees with `{right}`.
+
+      fix:
+        by: another
+        edits: change
+        next: read
+        stuck: failed
+        checks:
+          - committed
+        context:
+          - reads
+        prompt: |
+          {fix}
+
+      read:
+        by: table
+        call: reading
+        next:
+          sound: review
+          mend: review
+          fail: review
+          unread: review
+        context:
+          - draft
+          - worlds-words
+          - world-now
+          - timeline
+          - told
+        prompt: |
+          {reading}
+
+      review:
+        by: another
+        edits:
+          sound: optional
+          mend: change
+          fail: change
+          unread: change
+        next:
+          pass: reread
+          reject: fix
+        stuck: fix
+        stuck-limit: 2
+        tools:
+          - report_rejected
+        checks:
+          - changed
+          - rejection-quotes-the-draft
+        context:
+          - reads
+        prompt:
+          sound: |
+            {story.review.prompt.sound}
+          mend: |
+            {story.review.prompt.mend}
+          fail: |
+            {story.review.prompt.mend}
+          unread: |
+            {story.review.prompt.unread}
+
+      reread:
+        by: table
+        call: reading
+        next:
+          sound: done
+          mend: review
+          fail: fix
+          unread: done
+        context:
+          - draft
+          - worlds-words
+          - world-now
+          - timeline
+          - told
+        prompt: |
+          {reading}
+
+# ── Engine rules — not configured, true of every workflow ───────────────────
+#
+# - The table proposes, reads and retries: a call is asked up to three times,
+#   each refusal fed back with the answer it refused. A proposal refused three
+#   times, or declined with `no_mission`, settles its target as nothing to do;
+#   no operation opens. A reading refused three times has the outcome `unread`.
+# - A `reading` that comes back sound is read once more; a second reading that
+#   is not sound is the one that counts.
+# - A document is tidied (headings, run-on paragraphs) before every reading
+#   and every report.
+# - A draft is held out of memory until its operation is done.
+# - Reads of documents gone from the record are struck; an operation whose
+#   document is gone is cancelled; one no Maker may take is cancelled.
+# - Every Maker step's mission sends the Maker to the workflow's `desk`, sets
+#   the time machine to its `year`, reads its `reads`, writes or changes its
+#   document as `edits` says, and reports at the order table: `report_done`
+#   (the step's forward outcome — `pass`, or `next` for a step with one),
+#   `report_rejected` (the outcome `reject`, offered only where `tools` lists
+#   it), `report_stuck` (the outcome `stuck`).
+# - A report is held to the step's `checks`, to the steps still undone, and to
+#   an account of at least four words.
+# - The table is kept stocked with `keep` waiting missions, and more while a
+#   Maker has nothing it may take; generators are drawn by weight.

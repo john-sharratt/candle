@@ -5,7 +5,7 @@
 // =============================================================================
 // Q3_KO is `Q3_K`'s same-width twin, and it exists because there was none: `to_ko` used to
 // round Q3_K *up* to Q4_KO, which costs nothing while weights are resident and is PCIe bytes on
-// every forward once they stream (`docs/qwen38_layer_streaming.md` §2.3).
+// every forward once they stream (`docs/archived/qwen38_layer_streaming.md` §2.3).
 //
 // It carries NO `ql` plane. A 3-bit value is spent across the two auxiliary planes the other
 // twins already define, and this trait is literally their two reads composed:

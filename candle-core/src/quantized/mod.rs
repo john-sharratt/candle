@@ -11,6 +11,7 @@ mod dummy_cuda;
 mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
+pub mod gguf_writer;
 #[cfg(test)]
 mod int8_block_codec_tests;
 pub mod int8_matmul_mode;
@@ -687,7 +688,7 @@ impl Int8Mode {
     /// VRAM-aware [`Int8Mode::auto`]: on an int8-MMA-capable CUDA device, picks
     /// [`Int8Mode::Precision`] (the accurate, but *larger* stepped-up weight
     /// twin) only when the weights leave comfortable headroom — the model is at
-    /// most ~70% of free VRAM, so the KV cache, activations, and (MoE) hot
+    /// most ~70% of the card's VRAM, so the KV cache, activations, and (MoE) hot
     /// experts still fit — and otherwise drops to [`Int8Mode::Performance`] (the
     /// smaller same-width twin) so a tight model still fits. `Off` (FP16) on CPU
     /// / non-int8 devices, or [`Int8Mode::Performance`] if VRAM can't be queried.
@@ -696,21 +697,35 @@ impl Int8Mode {
     /// the smaller twin costs accuracy on some models (see [`Int8Mode::auto`]),
     /// and is worth it only when the accurate twin would not fit at all.
     ///
+    /// **Judged against the card's total, not what is free right now.** The
+    /// answer names a model pack (`{stem}.{mode}.pack.gguf`), so it has to be the
+    /// same on every load on the same card: judged against free VRAM, another
+    /// process holding a few GiB turned a Precision card into a Performance one,
+    /// and the load built a second pack — downloading its sources again — beside
+    /// the one that already served it.
+    ///
     /// `model_bytes` is the on-disk quantized weight size (e.g. the GGUF length).
-    // `model_bytes` is only weighed against free VRAM, which is a CUDA query;
-    // every other device answers `Off` without consulting it.
+    // `model_bytes` is only weighed against the card's VRAM, which is a CUDA
+    // query; every other device answers `Off` without consulting it.
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     pub fn auto_sized(device: &crate::Device, model_bytes: usize) -> Self {
         match device {
             #[cfg(feature = "cuda")]
             crate::Device::Cuda(d) if d.supports_int8_mma() => match device.mem_get_info() {
-                // model / free <= 7/10  ⇒  fits with headroom  ⇒  Precision.
-                Ok((free, _)) if model_bytes.saturating_mul(10) <= free.saturating_mul(7) => {
-                    Self::Precision
-                }
-                _ => Self::Performance,
+                Ok((_, total)) => Self::sized_for_card(model_bytes, total),
+                Err(_) => Self::Performance,
             },
             _ => Self::Off,
+        }
+    }
+
+    /// [`Int8Mode::auto_sized`]'s choice on an int8-capable card of
+    /// `card_bytes`: Precision when `model / card ≤ 7/10`, Performance otherwise.
+    pub fn sized_for_card(model_bytes: usize, card_bytes: usize) -> Self {
+        if model_bytes.saturating_mul(10) <= card_bytes.saturating_mul(7) {
+            Self::Precision
+        } else {
+            Self::Performance
         }
     }
 }
@@ -915,7 +930,7 @@ impl GgmlDType {
     /// inflation respectively, invisible while weights were resident and paid VRAM once. Under
     /// layer streaming a weight's width is PCIe bytes on *every forward*, and on the 27B at
     /// Q3_K_M the `Q3_K → Q4_KO` upcast alone inflated the layer pack by 12.8%
-    /// (`docs/qwen38_layer_streaming.md` §2.3). Rounding *down* was never the alternative:
+    /// (`docs/archived/qwen38_layer_streaming.md` §2.3). Rounding *down* was never the alternative:
     /// `Q2_KO`'s four levels floor at `rel_l2 ≈ 0.325`, a quality loss rather than a repack.
     ///
     /// [`Int8Mode::Precision`] steps the source one notch up the ladder
@@ -3224,6 +3239,39 @@ impl QMatMul {
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         self.forward_live(xs)
+    }
+}
+
+#[cfg(test)]
+mod int8_mode_sizing_tests {
+    use super::Int8Mode;
+
+    const GIB: usize = 1 << 30;
+
+    /// On the 16 GB card the 30B-A3B Q4_K_M (17.8 GB) and an 8B Q6_K (6.7 GB)
+    /// fall either side of the 7/10 line.
+    #[test]
+    fn the_card_total_decides_the_mode() {
+        let card = 16 * GIB;
+        assert_eq!(
+            Int8Mode::sized_for_card(17_817_403_392, card),
+            Int8Mode::Performance
+        );
+        assert_eq!(
+            Int8Mode::sized_for_card(6_700_000_000, card),
+            Int8Mode::Precision
+        );
+    }
+
+    /// The line itself is Precision; one byte past it is Performance.
+    #[test]
+    fn the_seven_tenths_line_is_inclusive() {
+        let card = 10 * GIB;
+        assert_eq!(Int8Mode::sized_for_card(7 * GIB, card), Int8Mode::Precision);
+        assert_eq!(
+            Int8Mode::sized_for_card(7 * GIB + 1, card),
+            Int8Mode::Performance
+        );
     }
 }
 

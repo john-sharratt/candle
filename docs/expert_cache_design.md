@@ -139,7 +139,7 @@ always be answerable is the wrong model.
 ## 3. The shape
 
 ```text
-cold    <gguf dir>/<model>.<id>.experts.pack   authoritative, write-once, all 6144
+cold    the model pack's expert section        authoritative, write-once, all 6144
 warm    pinned host RAM                        static, immutable, stratified subset
 hot     VRAM                                   dynamic cache, eviction = drop
 ```
@@ -259,83 +259,52 @@ miss. Records are padded to a 4 KiB sector because the reads bypass the page
 cache (§12.1), which also makes the warm pool's slots the right size to be read
 into directly.
 
-### 5.2 Where it lives — and why not `substrate/`
+### 5.2 Where it lives — the model pack
 
-**Not under `substrate/`.** The pack is a pure function of the *checkpoint*; the
-substrate directory holds conversation state, which is a different thing with a
-different lifetime. Putting it there gets two things wrong at once:
+**Superseded by `docs/self_contained_model_packs.md`.** The expert records are
+the *expert section* of the model's pack: one file per model and numeric mode,
+holding every tensor, the tokenizer and the provenance, under
+`~/.cache/zend/models/<repo>/`. The checkpoint is released once the pack is
+built, so there is no GGUF for the pack to live beside.
 
-- **`--wipe-substrate` would delete it.** That flag is used on nearly every
-  iteration run, and it would silently cost 42 s of repack plus a 16.6 GiB write
-  on every restart — for a file whose contents the wipe has no opinion about.
-- **One copy per workspace.** Two workspaces on the same model would each carry
-  their own 16.6 GiB, for byte-identical content.
+Two properties of the old placement carry over, for a stronger reason — the pack
+*is* the model:
 
-The pack belongs **beside the checkpoint it is derived from** — `<gguf
-dir>/<model-hash>.experts.pack` — where it is shared by every workspace using
-that model, survives substrate wipes, and is deleted by the same act that deletes
-the model. The hub cache is user-writable in both the HF-download and
-`--model-dir` cases. The exposure is that a hub-cache cleaning tool may remove
-it, which costs a repack and nothing else.
+- **Not under `substrate/`.** `--wipe-substrate`, used on nearly every iteration
+  run, must not cost a rebuild for a file whose contents the wipe has no opinion
+  about.
+- **One copy per model, not per workspace.** Every workspace on a model reads
+  the same pack.
 
-**When there is no persistent location, it is a temp file unlinked at exit.**
-That is the default: an embedder, an example, or a test must never have a
-16.6 GiB file appear beside its model without asking.
+There is no temp-file pack any more: nothing is written beside a caller's file,
+and a caller-supplied checkpoint is packed into the model cache instead
+(`self_contained_model_packs.md` §5.4).
 
-### 5.3 How the choice reaches the cache
+### 5.3 How the pack reaches the cache
 
-The store is a **builder parameter on the conversation engine**, defaulting to
-`None`:
-
-```rust
-impl ModelBuilder {
-    /// Directory for the persistent repacked expert pack. `None` (default) uses
-    /// a temp file unlinked at exit, paying the repack on every start.
-    pub fn expert_pack_dir(mut self, dir: impl Into<PathBuf>) -> Self { .. }
-}
-```
-
-It reaches `ExpertCache::new` down the path the model loader already takes:
+The loaders take the pack's path. `ModelBuilder::resolve_model` finds or builds
+it (`candle-conversation/src/models/pack_source.rs`), `load_model` opens it, and
+each loader opens the expert section at the offset the pack records:
 
 ```text
-ModelBuilder::expert_pack_dir            builder.rs
-  → ModelBuilder::load_model             takes &self already — no signature change
-    → ModelWeights::from_gguf_by_path    quantized_qwen3_moe.rs
-      → ExpertCache::new                 the only consumer
+ModelBuilder::resolve_model              pack_source.rs → model_pack::model_pack
+  → ModelBuilder::load_model             the pack's own int8 mode
+    → ModelWeights::from_pack            quantized_qwen3_moe.rs (and each routed model's own)
+      → expert_lre::section::open_section
+        → ExpertCache::new               the only consumer
 ```
-
-Three notes on that path:
-
-1. **`load_model` needs no new argument.** It takes `&self`, so it reads the
-   field directly, the same way it reads `max_seq_len`.
-2. **The `_with_int8` pair collapses.** `from_gguf_by_path` and
-   `from_gguf_by_path_with_int8` already exist as a pair for one load-time knob;
-   a second knob would make a third variant. They become a single entry point
-   taking a `GgufLoadOptions { int8mode, expert_pack }`, which is also where the
-   next load-time decision goes instead of a fourth function.
-3. **It is MoE-only.** Only the `Qwen3Moe` arm of `load_model` has an expert
-   cache; the `Qwen3`, `Qwen2` and `Llama` arms ignore the field entirely. The
-   parameter is on the builder rather than the arch because it configures the
-   engine, but it is inert for three of the four arches.
-
-`zend` passes the GGUF's parent directory, so its packs persist by default; every
-other caller gets a temp file unless it opts in.
 
 ### 5.4 It makes restart cheap
 
-The pack is a pure function of the checkpoint. Stamped with the model's hash and
-the repack format version, **a restart can skip the 42-second repack entirely**
-and map straight to serving. That is a material quality-of-life win on a daemon
-that gets restarted while iterating, and it is free — the file has to exist
-anyway. It is also the entire reason §5.2 fights for a location that survives a
-substrate wipe: a pack that is deleted every iteration delivers none of this.
+The pack is built once. A restart opens it and maps straight to serving — no
+repack, and no read of a checkpoint that is no longer on disk. It is also the
+reason §5.2 keeps it out of `substrate/`: a pack deleted every iteration would
+deliver none of this.
 
 ### 5.5 What it costs
 
-16.6 GiB on disk, and a first boot that pays the repack *and* the write before
-serving. Both are one-time; neither is free. In the temp-file case they are paid
-on *every* boot, which is the price of not writing to someone's model directory
-uninvited.
+The pack's size on disk, and a first boot that pays the source download, the
+repack and the write before serving. All one-time.
 
 ---
 
@@ -353,27 +322,29 @@ A version constant does not close this, because it depends on whoever changed
 the formula remembering to bump it — and the failure of that memory is exactly
 the case worth defending against. **So the check runs the formula instead.**
 
-At startup, a fixed table of `(source dtype → target dtype)` pairs is swept: every
-quantisation an expert weight can arrive as, repacked every way the engine can
-repack it — straight to the gemx K/128 layout, and to each of the KO twins the
-two int8 modes select. Each pair gets a deterministic reference matrix; the
-outputs are hashed together into `repack_fp`, which the header carries and every
-open compares.
+**Per format, since the pack became the model's only file**
+(`docs/self_contained_model_packs.md` §4.2). The section header carries a table
+of the `(source dtype → repacked dtype)` pairs its own records use, read off its
+geometry, each with `pair_fingerprint`: the hash of what this build's repack
+produces for that pair over a deterministic reference matrix
+(`models/repack_fingerprint.rs`). An open recomputes exactly those pairs, and
+any mismatch makes the pack stale — so a repack change rebuilds the packs that
+contain that format and no others. A model-wide sweep was right while a stale
+pack cost a local repack; once the source is released it would cost
+re-downloading every model.
 
-Three properties make it worth its ~36 small repacks:
+Two properties carry over from the sweep:
 
-- **The inventory is part of the hash.** Adding a dtype, removing one, or
-  changing which twin a mode selects moves the fingerprint even when every byte
-  of every repack is unchanged. A pair the repack *refuses* hashes as a refusal,
-  so gaining support for a type invalidates old packs too.
-- **It covers types this model does not contain.** The sweep is a property of the
-  build, not the run. A binary that repacks Q5_K differently is stale whether or
-  not today's checkpoint has a Q5_K tensor in it — which matters because the next
-  checkpoint might.
+- **A refusal hashes as a refusal.** A pair the repack refuses gets a fingerprint
+  of its own, so gaining support for a type invalidates the packs that hold it.
 - **The reference data cannot go NaN.** Every byte of the pattern is ≤ 60, so no
   `f16` scale read out of it can have an all-ones exponent. A
   dequantise-requantise path would otherwise hash NaN payload bits, which are not
   guaranteed stable, and the fingerprint would drift on its own.
+
+And one is given up on purpose: a binary that repacks a format differently no
+longer invalidates a pack that holds no records of that format. The table is
+read from the file, so it cannot be missing a format the file holds.
 
 ### 5.7 Records carry a checksum, checked in bulk
 

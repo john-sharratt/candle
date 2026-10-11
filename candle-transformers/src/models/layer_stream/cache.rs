@@ -244,6 +244,7 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
         mode: Int8Mode,
         pack: LayerPack,
         plan: &ZonePlan,
+        pinned: usize,
         warm_budget_slots: usize,
         assemble: A,
     ) -> Result<Self>
@@ -251,7 +252,7 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
         A: SlotAssembler<T>,
     {
         let num_layers = images.len();
-        let pinned = pack.pinned_layers();
+        let pinned = pinned.min(num_layers);
         let stride = pack.stride();
 
         // **The staging ring is claimed first, and that ordering is the point.**
@@ -328,41 +329,49 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
         cache.views = (0..cache.slots.len()).map(|_| None).collect();
         cache.fences = (0..num_layers).map(|_| None).collect();
         cache.fill_warm(&members)?;
-        cache.build_pinned_views()?;
+        cache.fill_pinned()?;
         Ok(cache)
     }
 
-    /// Build the views over the pinned head's slots.
+    /// Upload the pinned head into its slots and build the views over them.
     ///
     /// The pinned layers are the one set that never passes through
-    /// [`Self::issue`] — they have no pack record and are never loaded — so
-    /// nothing else would ever build their views, and the first `ensure(0)`
-    /// would find a resident layer whose slot has no matmuls over it. That is
-    /// what the residency placing them in [`LayerResidency::new`] leaves for
-    /// this to finish.
+    /// [`Self::issue`] — they are resident for the life of the cache and never
+    /// loaded on demand — so nothing else would ever fill their slots or build
+    /// their views, and the first `ensure(0)` would find a resident layer whose
+    /// slot has no matmuls over it. [`LayerResidency::new`] places them; this
+    /// finishes the job, from the pack like every other layer, one record at a
+    /// time through the staging ring and synchronously, at load.
     ///
-    /// A view is geometry over an address, so it is built here even though the
-    /// bytes are not in the slot yet: **the caller must upload the pinned
-    /// layers' images into `slot_base[0..pinned]` before the first `ensure`**.
-    /// That is the loader's job, because the pinned head is the part of the
-    /// model that comes straight from the checkpoint and never round-trips
-    /// through a tier.
-    fn build_pinned_views(&mut self) -> Result<()> {
+    /// **The whole image is copied, zeros included.** The pack writer zeroes
+    /// each record before placing its payloads, so the gaps the GGML kernels
+    /// read past each row (`MATRIX_ROW_PADDING`) arrive as defined zeros rather
+    /// than whatever the zone last held there.
+    fn fill_pinned(&mut self) -> Result<()> {
+        let stride = self.pack.stride();
         for layer in 0..self.residency.pinned() {
             let Some(slot) = self.residency.residence(layer).slot() else {
                 continue;
             };
-            // SAFETY: `slot_base[slot]` names a slot the zone handed out, and
-            // the caller's upload puts this layer's image at these offsets
-            // before any kernel reads it.
-            let view = unsafe {
-                build_layer_view(
-                    &self.images[layer],
-                    &self.device,
-                    self.slots[slot].base,
-                    self.mode,
-                )
-            }?;
+            if self.staging.num_slots() == 0 {
+                candle::bail!(
+                    "layer cache: the staging ring is empty, so the pinned head has nowhere to \
+                     land — the host could not pin a single {stride}-byte buffer"
+                );
+            }
+            let base = self.slots[slot].base;
+            let bytes = self.images[layer].total;
+            let dest = self.staging.slot_mut(0, stride);
+            self.pack.read_into(layer, dest)?;
+            let src = self.staging.slot_ref(0, bytes);
+            self.upload(src, base)?;
+            // The ring slot is refilled by the next layer's read, which is a
+            // host write: the upload out of it has to have landed first.
+            self.copy.synchronize().map_err(candle::Error::wrap)?;
+            // SAFETY: `base` names a slot the zone handed out, and the upload
+            // above put this layer's image at these offsets.
+            let view =
+                unsafe { build_layer_view(&self.images[layer], &self.device, base, self.mode) }?;
             self.views[slot] = Some(Arc::new(self.assemble.assemble(view, layer)?));
         }
         Ok(())
@@ -803,7 +812,7 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
 
     /// Adopt a new zone layout — the boundary move, in either direction.
     ///
-    /// **Between forwards only** (`docs/qwen38_layer_streaming.md` §6): the
+    /// **Between forwards only** (`docs/archived/qwen38_layer_streaming.md` §6): the
     /// caller has already established that no wave is open.
     ///
     /// One entry point rather than a retract and a grow, because with a nested
@@ -850,70 +859,9 @@ fn slot_table(plan: &ZonePlan) -> Vec<LayerPlacement> {
     homed
 }
 
-/// The pack path for a checkpoint, beside it rather than in the workspace.
-///
-/// Same placement rule as the expert pack: several workspaces on one machine
-/// share a checkpoint, and rebuilding a 15 GiB pack per workspace is the cost
-/// that placement avoids.
-///
-/// **`narrow` is in the name because it is in the bytes.** The streaming
-/// narrowing schedule is chosen from the card's total VRAM, and it changes the
-/// twin dtype — and so the record length — of `ffn_down`, `attn_q` and
-/// `attn_qkv`. Two cards of different size sharing one checkpoint directory is
-/// the case the placement rule above exists for, so without this the 16 GB box
-/// and the 72 GB box each find the other's pack, `check_geometry` rejects it on
-/// the per-projection dtype, and both rebuild a multi-GiB pack on every start,
-/// forever. Named apart, the two packs simply coexist.
-pub fn pack_path_for(
-    gguf: &std::path::Path,
-    int8mode: Int8Mode,
-    narrow: Option<usize>,
-) -> std::path::PathBuf {
-    match narrow {
-        Some(n) => gguf.with_extension(format!("layers.{}.n{n}.pack", int8mode as u32)),
-        None => gguf.with_extension(format!("layers.{}.pack", int8mode as u32)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_pack_sits_beside_the_checkpoint() {
-        let p = pack_path_for(
-            std::path::Path::new("/models/Qwen3.8-27B-Q4_K_M.gguf"),
-            Int8Mode::Performance,
-            None,
-        );
-        assert_eq!(p.parent(), Some(std::path::Path::new("/models")));
-        assert!(p.to_string_lossy().ends_with(".pack"));
-    }
-
-    #[test]
-    fn the_numeric_mode_is_part_of_the_pack_name() {
-        // Two modes target different KO twins, so one checkpoint has two packs
-        // and neither may be mistaken for the other.
-        let gguf = std::path::Path::new("/models/m.gguf");
-        assert_ne!(
-            pack_path_for(gguf, Int8Mode::Performance, None),
-            pack_path_for(gguf, Int8Mode::Precision, None)
-        );
-    }
-
-    #[test]
-    fn the_narrowing_schedule_is_part_of_the_pack_name() {
-        // A narrowed build writes different record lengths, so a card that
-        // narrows and a card that does not must not contend for one file —
-        // otherwise each rejects the other's geometry and rebuilds forever.
-        let gguf = std::path::Path::new("/models/m.gguf");
-        let wide = pack_path_for(gguf, Int8Mode::Performance, None);
-        let narrow = pack_path_for(gguf, Int8Mode::Performance, Some(64));
-        assert_ne!(wide, narrow);
-        // And two different schedules are two different packs.
-        assert_ne!(narrow, pack_path_for(gguf, Int8Mode::Performance, Some(48)));
-        assert!(narrow.to_string_lossy().ends_with(".pack"));
-    }
 
     // ── The stack, end to end, on the real device ────────────────────────
     //
@@ -929,12 +877,15 @@ mod tests {
     // that is joined too late, a slot handed to two layers, or an eviction of
     // something still in flight all show up here as the wrong bytes.
 
-    use super::super::pack::{header_for, LayerPack, PackIdentity, PackWriter};
+    use super::super::pack::{header_for, LayerPack, PackWriter};
     use crate::models::layer_stream::descriptor::{
         layer_image, FfnForm, LayerTensor, MixKind, Projection,
     };
     use candle::cuda_backend::cudarc::driver::CudaSlice;
     use candle::quantized::GgmlDType;
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+    use std::path::PathBuf;
 
     const TEST_LAYERS: usize = 64;
     const TEST_PINNED: usize = 2;
@@ -994,6 +945,40 @@ mod tests {
     fn payload(layer: usize, idx: usize, len: usize) -> Vec<u8> {
         let tag = 1 + ((layer * 7 + idx) % 254) as u8;
         vec![tag; len]
+    }
+
+    /// A layer section holding every fixture layer, the pinned head included,
+    /// written into a temp file at a sector offset as a model pack holds it.
+    /// Returns the file to remove afterwards, and the open section.
+    fn test_pack(tag: &str, images: &[LayerImage]) -> (PathBuf, LayerPack) {
+        let path = std::env::temp_dir().join(format!(
+            "candle_layer_{tag}_{}.pack.gguf",
+            std::process::id()
+        ));
+        let mut out = BufWriter::new(File::create(&path).unwrap());
+        out.write_all(&[0u8; 4096]).unwrap();
+        let header = header_for(
+            images,
+            &|_, _| GgmlDType::Q4_K,
+            Int8Mode::Performance as u32,
+            &|_, _| 0xFEED,
+        );
+        let mut w = PackWriter::new(&mut out, header).unwrap();
+        for (li, img) in images.iter().enumerate() {
+            let bufs: Vec<Vec<u8>> = img
+                .placements
+                .iter()
+                .enumerate()
+                .map(|(i, p)| payload(li, i, p.bytes))
+                .collect();
+            let refs: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
+            w.write_layer(li, &refs).unwrap();
+        }
+        w.finish().unwrap();
+        out.flush().unwrap();
+        drop(out);
+        let pack = LayerPack::open_section(&path, 4096, |_, _| 0xFEED).unwrap();
+        (path, pack)
     }
 
     #[test]
@@ -1117,30 +1102,8 @@ mod tests {
 
         let images = test_images();
         let slot_bytes = crate::models::layer_stream::slot_bytes_for_layers(&images);
-        let identity = PackIdentity {
-            source_len: 4242,
-            source_sum: 0x1234_5678,
-            int8_mode: Int8Mode::Performance as u32,
-            repack_fp: 0xFEED_FACE_CAFE_BEEF,
-        };
-
-        let dir = std::env::temp_dir().join(format!("candle_layer_cold_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("synthetic.layers.pack");
-        let header = header_for(&images, identity, TEST_PINNED, slot_bytes);
-        let mut w = PackWriter::create(&path, header).unwrap();
-        for (li, img) in images.iter().enumerate().skip(TEST_PINNED) {
-            let bufs: Vec<Vec<u8>> = img
-                .placements
-                .iter()
-                .enumerate()
-                .map(|(i, p)| payload(li, i, p.bytes))
-                .collect();
-            let refs: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
-            w.write_layer(li, &refs).unwrap();
-        }
-        let path = w.finish().unwrap();
-        let pack = LayerPack::open(&path, identity, &images, TEST_PINNED).unwrap();
+        let tag = if recorded { "cold_recorded" } else { "cold" };
+        let (path, pack) = test_pack(tag, &images);
 
         // One contiguous arena, as the span is: the plan lays layers down inside
         // it at their own sizes, so the addresses under test are the ones
@@ -1155,6 +1118,7 @@ mod tests {
             Int8Mode::Performance,
             pack,
             &plan,
+            TEST_PINNED,
             0,
             |view, _layer| Ok(view),
         )
@@ -1211,12 +1175,9 @@ mod tests {
              a stale buffer can never be reused"
         );
 
-        // Every slot still holding a layer must hold *that* layer's bytes.
-        //
-        // The pinned head is excluded because this fixture never places it: it
-        // has no pack record by construction, so the loader uploads it by hand
-        // and there is nothing here for a cold read to have got wrong.
-        for layer in TEST_PINNED..TEST_LAYERS {
+        // Every slot still holding a layer must hold *that* layer's bytes — the
+        // pinned head included, which the cache filled from the pack at load.
+        for layer in 0..TEST_LAYERS {
             if !cache.residency().residence(layer).is_readable() {
                 continue;
             }
@@ -1230,7 +1191,8 @@ mod tests {
                 }
             }
         }
-        std::fs::remove_dir_all(&dir).ok();
+        drop(cache);
+        std::fs::remove_file(&path).ok();
         Some(wrong)
     }
 
@@ -1299,41 +1261,12 @@ mod tests {
         };
 
         let images = test_images();
-        let slot_bytes = crate::models::layer_stream::slot_bytes_for_layers(&images);
-        let identity = PackIdentity {
-            source_len: 4242,
-            source_sum: 0x1234_5678,
-            int8_mode: Int8Mode::Performance as u32,
-            repack_fp: 0xFEED_FACE_CAFE_BEEF,
-        };
 
         // ── the cold tier ──
-        let dir = std::env::temp_dir().join(format!(
-            "candle_layer_cache_{}_{budget}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("synthetic.layers.pack");
-        let header = header_for(&images, identity, TEST_PINNED, slot_bytes);
-        let mut w = PackWriter::create(&path, header).unwrap();
-        for (li, img) in images.iter().enumerate().skip(TEST_PINNED) {
-            let bufs: Vec<Vec<u8>> = img
-                .placements
-                .iter()
-                .enumerate()
-                .map(|(i, p)| payload(li, i, p.bytes))
-                .collect();
-            let refs: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
-            w.write_layer(li, &refs).unwrap();
-        }
-        let path = w.finish().unwrap();
-        let pack = LayerPack::open(&path, identity, &images, TEST_PINNED).unwrap();
+        let (path, pack) = test_pack(&format!("sweep_{budget}"), &images);
 
         // ── the hot tier ──
-        // Held by value and written through `&mut`: `CudaSlice::clone` is a
-        // deep copy in cudarc, so cloning to get a writable handle would upload
-        // into a temporary and leave the real ground untouched.
-        let (mut arena, base, plan) = arena_for(cuda, &images, budget);
+        let (arena, base, plan) = arena_for(cuda, &images, budget);
 
         // The identity assembler: this test is about bytes and residency, not
         // about any model's layer type, so a slot is presented as its own
@@ -1347,22 +1280,11 @@ mod tests {
             Int8Mode::Performance,
             pack,
             &plan,
+            TEST_PINNED,
             20,
             |view, _layer| Ok(view),
         )
         .unwrap();
-        // The pinned head must be placed by hand: the pack holds no record for
-        // it, which is the point of pinning.
-        for (li, img) in images.iter().enumerate().take(TEST_PINNED) {
-            let mut image = vec![0u8; img.total];
-            for (i, p) in img.placements.iter().enumerate() {
-                image[p.offset..p.offset + p.bytes].copy_from_slice(&payload(li, i, p.bytes));
-            }
-            let off = (cache.slot_base_of(li).unwrap() - base) as usize;
-            cuda.cuda_stream()
-                .memcpy_htod(&image, &mut arena.slice_mut(off..off + image.len()))
-                .unwrap();
-        }
 
         // ── two full forwards, so the wrap is exercised as well as the sweep ──
         let mut checked = 0usize;
@@ -1402,7 +1324,8 @@ mod tests {
             "a layer was skipped rather than checked"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
+        drop(cache);
+        std::fs::remove_file(&path).ok();
         Some(s)
     }
 }

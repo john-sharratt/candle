@@ -198,10 +198,10 @@ extern "C" {
     ///
     /// # Parameters
     /// - `dtype`: Data type (see ConvDType enum values)
-    /// - `columns`: `b · l_out · c_in` — one thread each, writing that
-    ///   column's `l_k` elements, so `dst` holds `columns · l_k`. Not the
-    ///   destination's element count: a launch sized by that runs `l_k` times
-    ///   the threads and writes past the end of `dst`.
+    /// - `numel`: `b · l_out · c_in · l_k`, the destination's element count —
+    ///   one thread per element. Sized by the column count instead, only the
+    ///   first `1 / l_k` of `dst` is written and the rest keeps whatever its
+    ///   uninitialised allocation held.
     /// - `l_out`: Output length
     /// - `l_k`: Kernel length
     /// - `stride`: Convolution stride
@@ -212,7 +212,7 @@ extern "C" {
     /// - `dst`: Destination tensor
     pub fn run_im2col1d(
         dtype: i32,
-        columns: usize,
+        numel: usize,
         l_out: usize,
         l_k: usize,
         stride: usize,

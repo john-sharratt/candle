@@ -53,6 +53,7 @@
 //! read lands, the stager reports it to the pipeline thread (`landed_ahead`),
 //! which lists the expert from the pad for the device's read-ahead.
 
+use super::cache::pinned_layer_count;
 use super::dispatch::{AbortWord, SummaryRing, SPIN_LIMIT_NS};
 use super::pack::ExpertPack;
 use super::pad::{Fresh, Pad, PadBook, PadSlot};
@@ -576,11 +577,10 @@ impl Stager {
     /// expert already readable by the device is dropped when its turn comes
     /// (`serve_spec`). Each may evict only a lower-scored slot, so the
     /// lookahead never trades a copy the pad's own history rates higher.
-    /// Rows the pack holds no record for (the permanently resident prefix)
-    /// are skipped.
+    /// The permanently resident prefix never misses, so its rows are skipped.
     fn look_ahead(&mut self, row: usize) {
         let rows = self.ctx.rows;
-        let pinned = self.ctx.pack.pinned_layers();
+        let pinned = pinned_layer_count(rows);
         for hop in 1..=LOOKAHEAD_ROWS {
             let target = (row + hop) % rows;
             if target < pinned {

@@ -152,6 +152,9 @@ impl PagedSlots {
         unsafe { std::slice::from_raw_parts(self.base.add(i * self.slot_size), len) }
     }
 
+    /// One slot, writable — the fill writes the whole tier through
+    /// [`WarmTier::slots_mut`]; this is the tests' way in to a single one.
+    #[cfg(test)]
     fn slot_mut(&mut self, i: usize, len: usize) -> &mut [u8] {
         assert!(
             i < self.num_slots && len <= self.slot_size,
@@ -244,13 +247,6 @@ impl WarmTier {
         match i.checked_sub(self.pinned.num_slots()) {
             None => self.pinned.slot_ref(i, len),
             Some(p) => self.paged.slot(p, len),
-        }
-    }
-
-    pub(crate) fn slot_mut(&mut self, i: usize, len: usize) -> &mut [u8] {
-        match i.checked_sub(self.pinned.num_slots()) {
-            None => self.pinned.slot_mut(i, len),
-            Some(p) => self.paged.slot_mut(p, len),
         }
     }
 

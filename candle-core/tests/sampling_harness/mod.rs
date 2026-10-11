@@ -565,6 +565,11 @@ pub struct SamplingParams {
     /// Per-sequence DRY span length (gates + windows DRY, independent of the
     /// segment). Empty => null => DRY off for every row.
     pub dry_lens: Vec<i32>,
+    /// Per-token DRY reference flags (`[vocab_size]`, bit 1 reference, bit 2
+    /// joins the word before). Empty => null => no token exempt. The CPU
+    /// reference does not model the exemption, so a test comparing against it
+    /// leaves this empty.
+    pub dry_ref_flags: Vec<u8>,
     pub segment_temp_boost: f32,
 
     /// Shared token IDs suppressed while inside a segment.
@@ -620,6 +625,7 @@ impl Default for SamplingParams {
             segment_close_max_multiplier: 0.0,
             segment_lens: vec![],
             dry_lens: vec![],
+            dry_ref_flags: vec![],
             segment_temp_boost: 0.0,
             segment_suppress_tokens: vec![],
             segment_suppress_penalties: vec![],
@@ -669,6 +675,7 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
     let current_lens_gpu = upload(stream, &p.current_lens);
     let segment_lens_gpu = upload(stream, &p.segment_lens);
     let dry_lens_gpu = upload(stream, &p.dry_lens);
+    let dry_ref_gpu = upload(stream, &p.dry_ref_flags);
     let suppress_tokens_gpu = upload(stream, &p.segment_suppress_tokens);
     let suppress_penalties_gpu = upload(stream, &p.segment_suppress_penalties);
     let banned_gpu = upload(stream, &p.banned_tokens);
@@ -757,6 +764,13 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
                 p as *const i32
             })
             .unwrap_or(std::ptr::null());
+        let dry_ref_ptr = dry_ref_gpu
+            .as_ref()
+            .map(|s| {
+                let (p, _) = s.device_ptr(stream);
+                p as *const u8
+            })
+            .unwrap_or(std::ptr::null());
         let ban_ptr = banned_gpu
             .as_ref()
             .map(|s| {
@@ -818,6 +832,7 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
                 p.segment_close_max_multiplier,
                 segment_lens_ptr,
                 dry_lens_ptr,
+                dry_ref_ptr,
                 p.segment_temp_boost,
                 suppress_tok_ptr,
                 suppress_count,
@@ -992,6 +1007,7 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
     let current_lens_gpu = upload(stream, &p.current_lens);
     let segment_lens_gpu = upload(stream, &p.segment_lens);
     let dry_lens_gpu = upload(stream, &p.dry_lens);
+    let dry_ref_gpu = upload(stream, &p.dry_ref_flags);
     let suppress_tokens_gpu = upload(stream, &p.segment_suppress_tokens);
     let suppress_penalties_gpu = upload(stream, &p.segment_suppress_penalties);
     let banned_gpu = upload(stream, &p.banned_tokens);
@@ -1080,6 +1096,13 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
                 p as *const i32
             })
             .unwrap_or(std::ptr::null());
+        let dry_ref_ptr = dry_ref_gpu
+            .as_ref()
+            .map(|s| {
+                let (p, _) = s.device_ptr(stream);
+                p as *const u8
+            })
+            .unwrap_or(std::ptr::null());
         let ban_ptr = banned_gpu
             .as_ref()
             .map(|s| {
@@ -1141,6 +1164,7 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
                 p.segment_close_max_multiplier,
                 segment_lens_ptr,
                 dry_lens_ptr,
+                dry_ref_ptr,
                 p.segment_temp_boost,
                 suppress_tok_ptr,
                 suppress_count,

@@ -737,6 +737,12 @@ pub fn config_from_gguf(m: &GgufModel, arch: &'static dyn Arch) -> Result<Config
     Ok(cfg)
 }
 
+/// The block count [`config_from_gguf`] reads from `metadata`: the file's value
+/// under the arch's key, or the arch's default when the file does not state it.
+pub fn block_count(metadata: &HashMap<String, Value>, arch: &dyn Arch) -> usize {
+    uget(metadata.get(&arch.meta(Meta::BlockCount))).unwrap_or(arch.defaults().n_layers)
+}
+
 /// An unsigned metadata value, whichever integer width it was written at.
 /// `None` when the key is absent or holds something else, which leaves the
 /// arch's default in place.

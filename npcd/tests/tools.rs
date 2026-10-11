@@ -31,7 +31,7 @@ use npc_map::witness;
 use npc_map::world::{Happening, Where};
 use npcd::engine::act::Act;
 use npcd::engine::body::{perform, Outcome};
-use npcd::engine::mission::{Mission, Origin, Stage, Todo, Work};
+use npcd::engine::mission::{Mission, Origin, Todo, Work};
 use npcd::engine::tools::{self, specs_within, Mode, Within};
 use npcd::engine::witnessed;
 use npcd::sim::field::Resource;
@@ -184,7 +184,7 @@ fn an_operation_takes_the_working_set_verbs_off_the_desk() {
                     generator: "life-event".into(),
                     target: "life:keeper".into(),
                     operation: 1,
-                    stage: Stage::Draft,
+                    step: "write".into(),
                 },
             ),
         )
@@ -230,7 +230,7 @@ fn a_time_machine_sets_the_year_the_mission_is_worked_in() {
                     generator: "life-event".into(),
                     target: "life:keeper".into(),
                     operation: 1,
-                    stage: Stage::Draft,
+                    step: "write".into(),
                 },
             ),
         )
@@ -1817,6 +1817,8 @@ fn every_act_in_the_catalog_is_reachable_somewhere_in_a_shipped_world() {
                 min_words: 0,
                 edit_optional: false,
                 anew: false,
+                checks: Vec::new(),
+                tools: Vec::new(),
             }),
         )
     });

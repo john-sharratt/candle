@@ -183,6 +183,19 @@ impl Devices {
             .find(|d| d.at == place && (d.name.to_lowercase() == want || d.id == want))
     }
 
+    /// Find a device anywhere in the world by the name a character used for it,
+    /// with or without its article — "the coolant valve" is the coolant valve.
+    pub fn by_name(&self, name: &str) -> Option<&Device> {
+        let bare = |s: &str| {
+            let s = s.trim().to_lowercase();
+            s.strip_prefix("the ").map(str::to_string).unwrap_or(s)
+        };
+        let want = bare(name);
+        self.devices
+            .values()
+            .find(|d| bare(&d.name) == want || d.id == want)
+    }
+
     /// The mutable half of [`Self::by_name_at`], for the act that changes it.
     pub fn by_name_at_mut(&mut self, place: &str, name: &str) -> Option<&mut Device> {
         let want = name.trim().to_lowercase();

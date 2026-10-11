@@ -10,13 +10,8 @@
 //! use candle_transformers::models::deepseek4::DEEPSEEK_V4;
 //! use candle_transformers::models::latent_moe::{BatchedEngine, Engine};
 //! # fn main() -> candle::Result<()> {
-//! # let (path, device) = (std::path::Path::new("model.gguf"), candle::Device::Cpu);
-//! let engine = Engine::load(
-//!     path,
-//!     &DEEPSEEK_V4,
-//!     &device,
-//!     candle::quantized::Int8Mode::Performance,
-//! )?;
+//! # let (pack, device) = (std::path::Path::new("model.pack.gguf"), candle::Device::Cpu);
+//! let engine = Engine::load(pack, &DEEPSEEK_V4, &device)?;
 //! let model = BatchedEngine::new(engine)?;
 //! # let _ = model;
 //! # Ok(())
@@ -299,6 +294,63 @@ impl Arch for DFlash {
 
     fn global(&self, g: Global) -> &'static str {
         DEEPSEEK_V4.global(g)
+    }
+}
+
+/// The model packs the end-to-end gates load, built from the merged checkpoint
+/// and the DSpark drafter on this machine's model drive.
+///
+/// Neither file is on the hub — the target is the offline `prepare_ko_gguf`
+/// merge, the drafter its companion — so the sources are local
+/// (`LocalFetch`) and are never released. Each answers `None` when its source
+/// is absent and no pack was built from it before, which is how a gate skips
+/// on a machine without the 156 GB model.
+#[cfg(test)]
+pub(crate) mod gate_packs {
+    use super::DEEPSEEK_V4;
+    use crate::models::model_pack::{
+        cache_root, local_rev, model_pack, HubFetch, LocalFetch, PackFamily, PackRequest,
+    };
+    use candle::quantized::Int8Mode;
+    use candle::{Device, Result};
+    use std::path::{Path, PathBuf};
+
+    const DIR: &str = r"D:\models\deepseek-v4-flash-mxfp4";
+    /// The pack directory's label: the sources are local, and the provenance
+    /// says so rather than naming a repo they did not come from.
+    const REPO: &str = "local/deepseek-v4-flash-mxfp4";
+    const TOKENIZER: (&str, &str) = ("deepseek-ai/DeepSeek-V4-Flash-0731", "main");
+    const TARGET: &str = "DeepSeek-V4-Flash-0731-MXFP4_KO.gguf";
+    const DRAFTER: &str = "dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf";
+
+    fn pack(family: PackFamily, file: &str, device: &Device) -> Result<Option<PathBuf>> {
+        let rev = local_rev(&Path::new(DIR).join(file));
+        let request = PackRequest::of(
+            family,
+            (REPO, &rev, file),
+            TOKENIZER,
+            Some(Int8Mode::Performance),
+        );
+        let fetch = LocalFetch {
+            repo: REPO.into(),
+            dir: PathBuf::from(DIR),
+            other: &HubFetch,
+        };
+        match model_pack(&request, &cache_root(), device, &fetch) {
+            Ok(path) => Ok(Some(path)),
+            Err(_) if !Path::new(DIR).join(file).exists() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The target's pack: its experts as the int8-KO twins the engine serves.
+    pub fn target(device: &Device) -> Result<Option<PathBuf>> {
+        pack(PackFamily::Latent(&DEEPSEEK_V4), TARGET, device)
+    }
+
+    /// The DSpark drafter's pack — an all-resident model, so a plain pack.
+    pub fn drafter(device: &Device) -> Result<Option<PathBuf>> {
+        pack(PackFamily::Plain, DRAFTER, device)
     }
 }
 
@@ -636,13 +688,11 @@ mod tests {
         use candle::Device;
 
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
+        let device = Device::new_cuda(0)?;
+        let Some(pack) = super::gate_packs::target(&device)? else {
             eprintln!("[skip] merged file absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
+        };
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
             "deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -671,8 +721,7 @@ mod tests {
         // spilling transients to host at ~0 free VRAM) is gone by construction:
         // the pool cushion for activations is carved out before the span, not
         // fought over after it.
-        let dspark = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf");
+        let dspark = super::gate_packs::drafter(&device)?;
         let params = TestParams::new(64, &tokenizer_json, Dialect::deepseek())
             .map_err(|e| candle::Error::msg(format!("TestParams: {e}")))?
             .with_suppress_thinking(true) // strip <think>…</think> before validation
@@ -707,13 +756,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         let load_model = || {
-            let (engine, drafter) = Engine::load_with_drafter(
-                &path,
-                dspark.exists().then_some(dspark.as_path()),
-                &DEEPSEEK_V4,
-                &device,
-                Int8Mode::Performance,
-            )?;
+            let (engine, drafter) =
+                Engine::load_with_drafter(&pack, dspark.as_deref(), &DEEPSEEK_V4, &device)?;
             let model = BatchedEngine::new(engine)?;
             match drafter {
                 Some(d) => model.with_drafter(d),
@@ -745,12 +789,10 @@ mod tests {
         use candle::Device;
 
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
-            candle::bail!("merged DeepSeek-V4-Flash GGUF absent");
-        }
         let device = Device::new_cuda(0)?;
+        let Some(pack) = super::gate_packs::target(&device)? else {
+            candle::bail!("merged DeepSeek-V4-Flash GGUF absent");
+        };
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
             "deepseek-ai/DeepSeek-V4-Flash-0731",
             hf_hub::RepoType::Model,
@@ -793,14 +835,7 @@ mod tests {
                 // which the ladder gate covers; what a depth row reports is the
                 // per-token cost of prefill and decode against cache size, and
                 // the drafter only subtracts room from that.
-                let (engine, _) = Engine::load_with_drafter(
-                    &path,
-                    None,
-                    &DEEPSEEK_V4,
-                    &device,
-                    Int8Mode::Performance,
-                )?;
-                BatchedEngine::new(engine)
+                BatchedEngine::new(Engine::load(&pack, &DEEPSEEK_V4, &device)?)
             },
         )
     }

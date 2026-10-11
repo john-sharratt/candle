@@ -685,6 +685,18 @@ mod tests {
         crate::persistence::content_hash::turn_stream_id(1, n as u32)
     }
 
+    /// Held by every test that builds a gallery on the card.
+    ///
+    /// **The galleries on one device share one slot pool**, and a compaction
+    /// plans over the whole pool: run beside another test's gallery, a packed
+    /// gallery found that gallery's holes and planned moves, and a scattered
+    /// one found its holes filled. One gallery at a time makes each test's
+    /// pool its own.
+    pub(super) fn gallery_pool() -> std::sync::MutexGuard<'static, ()> {
+        static POOL: Mutex<()> = Mutex::new(());
+        POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Round-trip: upload a turn, read its pages back, verify the group-major
     /// transpose survived the H2D exactly (raw bytes, not a threshold).
     #[test]
@@ -693,6 +705,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return, // no GPU — skip
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let sigs: Vec<WideQSig> = (0..40).map(|t| sig((t as u64) << 40)).collect(); // 2 pages
         let fp = 0xDEADBEEF;
@@ -728,6 +741,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let sigs: Vec<WideQSig> = (0..64).map(|t| sig(t as u64)).collect(); // 2 pages
         arena.ensure_resident(sid(0), &sigs, 1).unwrap();
@@ -749,6 +763,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let sigs: Vec<WideQSig> = (0..10).map(|t| sig(t as u64)).collect();
         let a1 = arena.ensure_resident(sid(0), &sigs, 7).unwrap();
@@ -767,6 +782,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let sigs: Vec<WideQSig> = (0..10).map(|t| sig(t as u64)).collect();
         let _ = arena.ensure_resident(sid(0), &sigs, 1).unwrap();
@@ -788,6 +804,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         for t in 0..4u64 {
             let sigs: Vec<WideQSig> = (0..32).map(|k| sig(t * 1000 + k)).collect(); // 1 page each
@@ -832,6 +849,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         // Runs of different lengths, so the freed holes are ragged.
         let sigs = |t: u64, n: usize| -> Vec<WideQSig> {
@@ -886,6 +904,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let rows: Vec<WideQSig> = (0..64).map(sig).collect();
         for t in 0..4u64 {
@@ -927,6 +946,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let rows: Vec<WideQSig> = (0..32).map(sig).collect();
         for t in 0..3u64 {

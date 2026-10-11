@@ -206,7 +206,7 @@ cargo clippy --workspace --tests --examples -- -D warnings
 | Model | Size | Notes |
 |---|---|---|
 | DeepSeek-V4-Flash-0731 | 284B / 13B active | native-sparse latent attention, MXFP4 experts |
-| Qwen3.8-Flash-Next | 180B / 6B active | hybrid + MoE with MTP drafter; Q2_KO experts on 16 GB |
+| Qwen3.8-Flash-Next | 180B / 6B active | hybrid + MoE with MTP drafter; Q3_KO experts under 64 GB |
 | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B | 35B / 3B active | DeltaNet hybrid + MoE |
 | Qwen3-30B-A3B | 30B / 3B active | MoE |
 | Qwen3.8-27B | 27B dense | hybrid |

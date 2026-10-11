@@ -28,8 +28,11 @@
 //! run side by side refused each other's conversations mid-setup. The slot runs
 //! them one at a time whatever the thread count.
 //!
+//! Ignored by default: it loads a model on the card, and with a daemon holding
+//! the card one run took over fifteen minutes. Run it on its own:
+//!
 //! ```text
-//! cargo test -p zend --features cuda --test restart_turn_recovery
+//! cargo test --release -p zend --features cuda --test restart_turn_recovery -- --ignored
 //! ```
 
 mod common;
@@ -68,6 +71,7 @@ fn shut_down_and_read(engine: &ConversationEngine, conv: &Sequence) -> Sealed {
 }
 
 #[test]
+#[ignore = "loads a model on the card; run with --ignored, see the module doc"]
 fn a_restart_recovers_every_sealed_turn_and_every_section() {
     let _slot = exclusive_engine_slot();
     let device = Device::new_cuda(0).expect("cuda");

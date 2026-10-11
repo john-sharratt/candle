@@ -770,6 +770,7 @@ impl GalleryArena {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::gallery_pool;
     use super::*;
     use crate::persistence::content_hash::turn_stream_id;
     use crate::provenance::gpu::{BatchedGpuGallery, SegmentInput};
@@ -805,6 +806,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let a: Vec<WideQSig> = (0..40).map(|t| sig(0x5000 + t)).collect();
         let b: Vec<WideQSig> = (0..9).map(|t| sig(0x6000 + t)).collect();
@@ -940,6 +942,7 @@ mod tests {
         let question = vec![sig(0x8000 + 2), sig(0x7000 + 3)];
         let weights = [1.0f32, 0.5, 2.0];
 
+        let _pool = gallery_pool();
         let warm = GalleryArena::new(&device, 24, 3).unwrap();
         warm.scan_weighted(&segs(), &[first.as_slice()], &weights)
             .unwrap();
@@ -973,6 +976,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
 
         // Turns (whole windows), owned so both paths can borrow them.
@@ -1123,6 +1127,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
 
         let t0: Vec<WideQSig> = (0..50).map(|t| sig(0xA00 + t)).collect(); // 2 pages
@@ -1202,6 +1207,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
 
         // Two distinct "groups" — different turns/files → different fingerprints.
@@ -1264,6 +1270,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let a: Vec<WideQSig> = (0..20).map(|t| sig(0xA00 + t)).collect();
         let seg_a = vec![PagedSegment {
@@ -1325,6 +1332,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         // Several turns of differing length, so the runs are ragged.
         let turns: Vec<Vec<WideQSig>> = (0..5u64)
@@ -1404,6 +1412,7 @@ mod tests {
             Ok(d) => d,
             Err(_) => return,
         };
+        let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let (has_bmma, has_imma) = arena.tensor_caps();
         if !has_bmma || !has_imma {

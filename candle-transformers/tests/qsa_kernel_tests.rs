@@ -220,6 +220,16 @@ fn build_history_slot(
     // it writes into the cache are the history (see [`make_kv_at`]).
     let (k, v) = make_kv_at(g, 0, history, seed, alt, device)?;
     let q = Tensor::zeros((history, g.n_head, g.head_dim), DType::BF16, device)?;
+    // **Each row attends its own tail block and nothing else.** The output is
+    // dropped and the K and V the launch writes do not depend on what its rows
+    // read, so a full causal walk here was `history²` of attention for nothing:
+    // at 128K it was 45 s of a 45 s test. Read through one block per row, the
+    // build is linear in depth and leaves the same cache, bit for bit — every
+    // card-independent golden in this file reads a history built this way.
+    let tail_only: Vec<Vec<u32>> = (0..history)
+        .map(|t| budget_row(t + 1, RATIO, 0).0)
+        .collect();
+    let tail_only = selection(&tail_only, device)?;
     backing.ensure_for_batch_entries(&[(0, 0)], history)?;
     let generation = stager.begin_generation();
     {
@@ -241,7 +251,7 @@ fn build_history_slot(
             false,
             &generation,
             &std::cell::RefCell::new(None),
-            None,
+            Some(&tail_only),
         )?;
     }
     cache.set_current_seq_len(history)?;

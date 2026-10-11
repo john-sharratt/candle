@@ -25,9 +25,15 @@ use crate::models::batch_test::utils::{TestConfig, TestMode};
 #[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
 use crate::models::batched_inference::InferenceMode;
 
+#[cfg(feature = "cuda")]
+use super::model_pack::model_pack;
+use super::model_pack::{cache_root, PackFamily, PackRequest};
 use super::quant_ladder;
-use super::qwen4exp::prepare::{ExpertSource, Recipe, SourceFile, SourceRole};
+#[cfg(feature = "cuda")]
+use super::qwen4exp::prepare::EngineFetch;
+use super::qwen4exp::prepare::{ExpertSource, Recipe, SourceFile, SourceRole, SourceStore};
 use super::qwen4exp::{load_oracle_model, Qwen4ExpModel};
+use candle::quantized::Int8Mode;
 
 /// The tokenizer, pinned to the canonical base repo.
 pub const TOKENIZER_REPO: &str = "Qwen/Qwen3.8-Flash-Next";
@@ -208,42 +214,113 @@ pub fn engine_recipe_at(experts: Option<GgmlDType>) -> Recipe {
     }
 }
 
-/// Where engine artifacts live: zend's model cache, under this repo's folder —
-/// the directory `zend`'s prepared-artifact resolution reads.
-///
-/// The root follows `candle_conversation::models::builder::model_cache_dir`
-/// exactly — USERPROFILE, then HOME, and nothing else — because that is what
-/// every loader resolves a prepared preset through. A different rule here builds
-/// the artifact where the engine probe and the daemon never look. That crate sits
-/// above this one, so it holds the test that pins the two together.
+/// Where engine artifacts are prepared, and their packs live: the model cache,
+/// under this repo's folder.
 pub fn engine_artifact_dir() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join(".cache")
-        .join("zend")
-        .join("models")
-        .join(QWEN4EXP_REPO.replace('/', "--"))
+    cache_root().join(QWEN4EXP_REPO.replace('/', "--"))
 }
 
-/// This card's engine artifact from [`engine_artifact_dir`] — resolved, never
-/// built. A build fetches ~190 GB of pinned sources, which a probe must not
-/// start as a side effect of asking for a path; the gate
-/// (`tests::test_parallel_batched_forwarding`) is what builds it.
-#[cfg(feature = "cuda")]
-pub fn prepared_engine_gguf() -> Result<PathBuf> {
-    let device = Device::new_cuda(0)?;
-    let recipe = engine_recipe(quant_ladder::device_vram_gib(&device)?);
-    let dir = engine_artifact_dir();
-    super::qwen4exp::prepare::prepared(&recipe, &dir)?.ok_or_else(|| {
-        candle::Error::Msg(format!(
-            "{} is not in {} — the Flash-Next gate builds it \
+/// The model-pack request for the engine whose routed experts are at `experts`
+/// (`None` for the split's own `Q8_0`) and whose sections are packed for
+/// `mode` (`None` for the mode this card picks).
+///
+/// The checkpoint is the recipe's artifact, and its "revision" is the recipe's
+/// digest — so a pack built from another recipe is another pack.
+pub fn engine_request(experts: Option<GgmlDType>, mode: Option<Int8Mode>) -> PackRequest {
+    let recipe = engine_recipe_at(experts);
+    PackRequest::of(
+        PackFamily::Routed,
+        (QWEN4EXP_REPO, &recipe.digest(), &recipe.artifact_name()),
+        (TOKENIZER_REPO, TOKENIZER_REV),
+        mode,
+    )
+}
+
+/// A recipe store that fetches nothing: an artifact missing from the model
+/// cache is reported as the build step it is, never downloaded.
+struct PreparedOnly;
+
+impl SourceStore for PreparedOnly {
+    fn fetch(&self, file: &SourceFile) -> Result<PathBuf> {
+        candle::bail!(
+            "the Flash-Next engine is not prepared on this machine and {} is not here to \
+             prepare it from — the Flash-Next gate builds it \
              (quantized_qwen38_moe::tests::test_parallel_batched_forwarding)",
-            recipe.artifact_name(),
-            dir.display()
-        ))
-    })
+            file.path
+        )
+    }
+
+    fn cached_copies(&self, _: &SourceFile) -> Vec<PathBuf> {
+        Vec::new()
+    }
+}
+
+/// This card's engine pack — resolved, or built from an artifact already
+/// prepared here, but **never prepared**: that fetches ~190 GB of pinned
+/// sources, which a probe must not start as a side effect of asking for a path.
+/// The gate (`tests::test_parallel_batched_forwarding`) is what prepares it.
+#[cfg(feature = "cuda")]
+pub fn prepared_engine_pack(
+    device: &Device,
+    mode: Option<Int8Mode>,
+    tokenizer: &dyn Fn(&str, &str) -> Result<String>,
+) -> Result<PathBuf> {
+    let experts = quant_ladder::expert_format(quant_ladder::device_vram_gib(device)?);
+    let fetch = EngineFetch {
+        recipe: engine_recipe_at(experts),
+        dir: engine_artifact_dir(),
+        store: &PreparedOnly,
+        tokenizer,
+        device,
+    };
+    model_pack(
+        &engine_request(experts, mode),
+        &cache_root(),
+        device,
+        &fetch,
+    )
+}
+
+/// This card's engine pack at `mode`, from the model cache — prepared from the
+/// pinned sources when neither the pack nor the artifact is there.
+///
+/// **An artifact already prepared is only resolved.** `prepare_engine`
+/// releases the recipe's sources whenever its store can find them, which is
+/// right for a build and wrong here: the oracle gates read the same ~188 GB
+/// Q8_0 split, so a gate that only needed the artifact would delete the split
+/// and the next oracle gate would download it again. A store that fetches
+/// nothing also releases nothing.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn engine_pack(device: &Device, mode: Option<Int8Mode>) -> Result<PathBuf> {
+    use crate::models::batch_test::test_helpers::{hf_get, HfSourceStore};
+    use crate::models::qwen4exp::prepare::prepared;
+    use hf_hub::RepoType;
+
+    let experts = quant_ladder::expert_format(quant_ladder::device_vram_gib(device)?);
+    let recipe = engine_recipe_at(experts);
+    let dir = engine_artifact_dir();
+    let store: &dyn SourceStore = if prepared(&recipe, &dir)?.is_some() {
+        &PreparedOnly
+    } else {
+        &HfSourceStore
+    };
+    let tokenizer = |repo: &str, rev: &str| -> Result<String> {
+        let p = hf_get(repo, RepoType::Model, rev, "tokenizer.json")?;
+        std::fs::read_to_string(&p).map_err(|e| candle::Error::Msg(format!("read {p:?}: {e}")))
+    };
+    let fetch = EngineFetch {
+        recipe,
+        dir,
+        store,
+        tokenizer: &tokenizer,
+        device,
+    };
+    model_pack(
+        &engine_request(experts, mode),
+        &cache_root(),
+        device,
+        &fetch,
+    )
 }
 
 /// Load the reference (oracle) model from the pinned split's first shard
@@ -382,24 +459,10 @@ mod tests {
             .collect()
     }
 
-    /// This card's engine artifact: resolved from zend's model cache, or built
-    /// there from the pinned sources (`qwen4exp::prepare::prepare_engine`).
-    ///
-    /// **An artifact already there is only resolved.** `prepare_engine` also
-    /// releases the recipe's sources on every resolve, which is right for the
-    /// daemon and wrong here: the oracle gates read the same ~188 GB Q8_0 split
-    /// through [`pinned_shards`], so each gate that touched the artifact would
-    /// delete it and the next oracle gate would download it again.
-    fn engine_gguf() -> Result<PathBuf> {
-        use crate::models::batch_test::test_helpers::HfSourceStore;
-        use crate::models::qwen4exp::prepare::{prepare_engine, prepared};
+    /// This card's engine pack at the mode this card picks.
+    fn engine() -> Result<PathBuf> {
         let device = Device::new_cuda(0)?;
-        let recipe = engine_recipe(quant_ladder::device_vram_gib(&device)?);
-        let dir = engine_artifact_dir();
-        if let Some(path) = prepared(&recipe, &dir)? {
-            return Ok(path);
-        }
-        prepare_engine(&recipe, &dir, &HfSourceStore, &device)
+        engine_pack(&device, Some(Int8Mode::auto(&device)))
     }
 
     /// The pin table and the shard-name function describe the same six files.
@@ -422,8 +485,8 @@ mod tests {
     #[test]
     fn each_rung_has_its_own_recipe() {
         let laptop = engine_recipe(16);
-        assert_eq!(laptop.experts, GgmlDType::Q2_KO);
-        assert_eq!(laptop.head_experts, GgmlDType::Q2_KO);
+        assert_eq!(laptop.experts, GgmlDType::Q3_KO);
+        assert_eq!(laptop.head_experts, GgmlDType::Q3_KO);
         assert_eq!(laptop.expert_source, ExpertSource::Requantized);
         assert_eq!(laptop.trunk, GgmlDType::Q8_0);
         assert_eq!(laptop.head_dense, GgmlDType::Q8_0);
@@ -431,9 +494,10 @@ mod tests {
         assert_eq!(laptop.sources_of(SourceRole::DraftHead).len(), 1);
         assert!(laptop.sources_of(SourceRole::ExpertImport).is_empty());
 
-        let workstation = engine_recipe(32);
-        assert_eq!(workstation.experts, GgmlDType::Q3_KO);
-        assert_eq!(workstation.expert_source, ExpertSource::Requantized);
+        // Every card under 64 GiB shares the floor rung, and so its artifact.
+        for gib in [24, 32] {
+            assert_eq!(engine_recipe(gib), laptop, "{gib} GiB");
+        }
 
         let blackwell = engine_recipe(72);
         assert_eq!(blackwell.experts, GgmlDType::Q4_KO);
@@ -444,42 +508,38 @@ mod tests {
         assert_eq!(above.experts, GgmlDType::Q8_0);
         assert_eq!(above.expert_source, ExpertSource::Verbatim);
 
-        let names: HashSet<String> = [&laptop, &workstation, &blackwell, &above]
+        let names: HashSet<String> = [&laptop, &blackwell, &above]
             .iter()
             .map(|r| r.artifact_name())
             .collect();
-        assert_eq!(names.len(), 4, "two rungs share an artifact name");
+        assert_eq!(names.len(), 3, "two rungs share an artifact name");
     }
 
-    /// **The 16 GB rung's recipe names the artifact the laptop already holds.**
-    /// The digest covers every pin and every build choice, so this is the check
+    /// **The floor rung's recipe names the artifact the small cards hold.** The
+    /// digest covers every pin and every build choice, so this is the check
     /// that the recipe here is byte-for-byte the one that artifact was built
     /// from — a drift in any pin would name a different file and force a
-    /// rebuild of all 88 GiB.
+    /// rebuild of the whole artifact.
     #[test]
-    fn the_laptop_rung_names_its_built_artifact() {
+    fn the_floor_rung_names_its_built_artifact() {
         assert_eq!(
             engine_recipe(16).artifact_name(),
-            "Qwen3.8-Flash-Next-Q2_KOEXP-130076148f33.gguf"
+            "Qwen3.8-Flash-Next-Q3_KOEXP-503c2f2d6ead.gguf"
         );
     }
 
-    /// **The prepared artifact's head block and top-level tensors**, from its
-    /// header alone — no source is read, so this runs on a machine whose
-    /// sources were released after the build.
+    /// **The engine pack's head block and top-level tensors**, from its GGUF
+    /// part's header alone — no source is read, so this runs on a machine whose
+    /// sources were released after the build. The routed experts are in the
+    /// pack's expert section, not in this header.
     ///
     ///   cargo test -p candle-transformers --features cuda --release --lib \
     ///     the_engine_artifact_head_inventory -- --ignored --nocapture
     #[test]
-    #[ignore = "reads the prepared engine artifact's header"]
+    #[ignore = "reads the engine pack's header"]
     fn the_engine_artifact_head_inventory() -> Result<()> {
-        use crate::models::qwen4exp::prepare::prepared;
-        let device = Device::new_cuda(0)?;
-        let recipe = engine_recipe(quant_ladder::device_vram_gib(&device)?);
-        let path = prepared(&recipe, &engine_artifact_dir())?.ok_or_else(|| {
-            candle::Error::Msg(format!("{} is not prepared", recipe.artifact_name()))
-        })?;
-        let content = Content::read(&mut File::open(&path)?)?;
+        let pack = engine()?;
+        let content = Content::read(&mut File::open(&pack)?)?;
         let mut names: Vec<&String> = content
             .tensor_infos
             .keys()
@@ -505,11 +565,11 @@ mod tests {
     ///   cargo test -p candle-transformers --features cuda --release --lib \
     ///     the_checkpoint_draft_head_inventory -- --ignored --nocapture
     #[test]
-    #[ignore = "reads the engine artifact's header"]
+    #[ignore = "reads the engine pack's header"]
     fn the_checkpoint_draft_head_inventory() -> Result<()> {
         use crate::models::latent_moe::GgufModel;
-        let merged = engine_gguf()?;
-        let gguf = GgufModel::open(&[merged])?;
+        let pack = engine()?;
+        let gguf = GgufModel::open(&[pack])?;
         let mut meta: Vec<String> = gguf
             .metadata
             .iter()
@@ -562,7 +622,7 @@ mod tests {
         }
         println!("highest blk.N present: {max_blk} (engine loads 48)");
 
-        // The merged file is a CONVERTED artifact, so a head could have been
+        // The pack is built over a CONVERTED artifact, so a head could have been
         // dropped on the way. Ask the pinned upstream Q8_0 split too — that is
         // the released checkpoint, and its answer is the one that decides
         // whether a shipped draft head exists at all.
@@ -598,7 +658,7 @@ mod tests {
         Ok(())
     }
 
-    /// GPU engine smoke: load the merged Q4KOEXP artifact onto the card, run
+    /// GPU engine smoke: load this card's engine pack onto the card, run
     /// the probe prompt through `forward_wave` (prefill + greedy decode), and
     /// require the oracle's own continuation. The first run of the wave path
     /// end to end: embed → GR → GDN spans → paged attention → 512-expert MoE
@@ -609,13 +669,12 @@ mod tests {
     fn test_engine_wave_paris_smoke() -> Result<()> {
         use crate::models::batched_inference::BatchedConfig;
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
-        use candle::quantized::Int8Mode;
         use candle::IndexOp;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let t0 = std::time::Instant::now();
-        let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
+        let gpu = Qwen4ExpGpu::load(&pack, &device)?;
         println!("✓ engine loaded in {:.0}s", t0.elapsed().as_secs_f32());
         let model = Qwen4ExpBatched::new(gpu)?;
 
@@ -737,12 +796,11 @@ mod tests {
     fn test_draft_head_proposes_the_trunks_tokens() -> Result<()> {
         use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
-        use candle::quantized::Int8Mode;
         use candle::IndexOp;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
-        let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
+        let gpu = Qwen4ExpGpu::load(&pack, &device)?;
         let model = Qwen4ExpBatched::new(gpu)?;
         let tok = tokenizer()?;
         let ids: Vec<u32> = tok
@@ -866,7 +924,6 @@ mod tests {
     fn test_engine_stops_on_end_of_turn() -> Result<()> {
         use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
-        use candle::quantized::Int8Mode;
         use candle::IndexOp;
 
         /// `<|im_end|>` — the end of an assistant TURN.
@@ -879,9 +936,9 @@ mod tests {
         /// is not mistaken for one that stopped.
         const MAX_NEW: usize = 48;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
-        let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
+        let gpu = Qwen4ExpGpu::load(&pack, &device)?;
         let model = Qwen4ExpBatched::new(gpu)?;
         let tok = tokenizer()?;
 
@@ -1036,13 +1093,12 @@ mod tests {
     fn test_engine_qsa_at_depth() -> Result<()> {
         use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
-        use candle::quantized::Int8Mode;
         use candle::IndexOp;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let t0 = std::time::Instant::now();
-        let mut gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
+        let mut gpu = Qwen4ExpGpu::load(&pack, &device)?;
         let released_top_k = gpu.cfg.indexer.top_k;
         let width = released_top_k + 4 - 1;
         println!(
@@ -1282,11 +1338,10 @@ mod tests {
     fn test_engine_wave_nan_bisect() -> Result<()> {
         use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
-        use candle::quantized::Int8Mode;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
-        let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
+        let gpu = Qwen4ExpGpu::load(&pack, &device)?;
         let model = Qwen4ExpBatched::new(gpu)?;
         let tok = tokenizer()?;
         let ids: Vec<u32> = tok
@@ -1484,7 +1539,7 @@ mod tests {
         use candle::quantized::Int8Mode;
 
         println!("\n=== Qwen3.8-Flash-Next: speculative ladder (production budget) ===\n");
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
 
@@ -1501,7 +1556,7 @@ mod tests {
             .with_timeout_secs(7200);
 
         params.run(speculative_ladder(), || {
-            let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+            let gpu = Qwen4ExpGpu::load(&pack, &device)?;
             let m = Qwen4ExpBatched::new(gpu)?;
             // A ladder that silently fell back to plain decode would still pass
             // — speculation is lossless, so the only symptom is the speedup
@@ -1550,12 +1605,12 @@ mod tests {
         use candle::quantized::Int8Mode;
         use candle_nn::kv_cache::QuantFormat;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
         let model = account_model_load(&device, || {
-            let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+            let gpu = Qwen4ExpGpu::load(&pack, &device)?;
             Qwen4ExpBatched::new(gpu)
         })?;
 
@@ -1627,12 +1682,11 @@ mod tests {
     fn test_drafter_c5_vs_c6() -> Result<()> {
         use crate::models::batched_inference::{BatchedConfig, InferenceMode, ManagedBatchedModel};
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
-        use candle::quantized::Int8Mode;
         use candle::IndexOp;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
-        let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
+        let gpu = Qwen4ExpGpu::load(&pack, &device)?;
         let model = Qwen4ExpBatched::new(gpu)?;
         let tok = tokenizer()?;
         let head_kv = model
@@ -1815,12 +1869,12 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
         let model = account_model_load(&device, || {
-            let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+            let gpu = Qwen4ExpGpu::load(&pack, &device)?;
             Qwen4ExpBatched::new(gpu)
         })?;
 
@@ -1895,7 +1949,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -1909,7 +1963,7 @@ mod tests {
             &device,
             || {
                 let device = Device::new_cuda(0)?;
-                let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+                let gpu = Qwen4ExpGpu::load(&pack, &device)?;
                 Qwen4ExpBatched::new(gpu)
             },
         )
@@ -1935,7 +1989,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -1958,7 +2012,7 @@ mod tests {
             DepthTask::Coherence,
             &device,
             || {
-                let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+                let gpu = Qwen4ExpGpu::load(&pack, &device)?;
                 Qwen4ExpBatched::new(gpu)
             },
         )
@@ -1994,7 +2048,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -2017,7 +2071,7 @@ mod tests {
             DepthTask::Coherence,
             &device,
             || {
-                let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+                let gpu = Qwen4ExpGpu::load(&pack, &device)?;
                 Qwen4ExpBatched::new(gpu)
             },
         )
@@ -2040,7 +2094,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -2057,7 +2111,7 @@ mod tests {
             DepthTask::Essay,
             &device,
             || {
-                let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+                let gpu = Qwen4ExpGpu::load(&pack, &device)?;
                 Qwen4ExpBatched::new(gpu)
             },
         )
@@ -2081,7 +2135,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -2102,7 +2156,7 @@ mod tests {
             DepthTask::Essay,
             &device,
             || {
-                let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+                let gpu = Qwen4ExpGpu::load(&pack, &device)?;
                 Qwen4ExpBatched::new(gpu)
             },
         )
@@ -2125,7 +2179,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         strata_bench(
@@ -2136,7 +2190,7 @@ mod tests {
             InferenceMode::BF16,
             &device,
             || {
-                let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+                let gpu = Qwen4ExpGpu::load(&pack, &device)?;
                 Qwen4ExpBatched::new(gpu)
             },
         )
@@ -2168,7 +2222,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let tok = tokenizer_json()?;
@@ -2193,7 +2247,7 @@ mod tests {
             DepthTask::Rewrite,
             &device,
             || {
-                let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+                let gpu = Qwen4ExpGpu::load(&pack, &device)?;
                 Qwen4ExpBatched::new(gpu)
             },
         )
@@ -2211,7 +2265,7 @@ mod tests {
         use candle::quantized::Int8Mode;
 
         println!("\n=== Qwen3.8-Flash-Next (qwen4exp) batched forwarding ===\n");
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
 
@@ -2238,7 +2292,7 @@ mod tests {
         let configs = batched_forward_configs(&device);
 
         let load = || {
-            let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+            let gpu = Qwen4ExpGpu::load(&pack, &device)?;
             // The checkpoint must still be the geometry this engine was
             // validated for — a silent architecture change fails here, not in
             // a kernel.
@@ -2271,7 +2325,7 @@ mod tests {
         use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
         use candle::quantized::Int8Mode;
 
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
@@ -2288,7 +2342,7 @@ mod tests {
         };
         let configs = vec![one(), one(), one(), one()];
         params.run(configs, || {
-            let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+            let gpu = Qwen4ExpGpu::load(&pack, &device)?;
             Qwen4ExpBatched::new(gpu)
         })
     }
@@ -2316,7 +2370,7 @@ mod tests {
         use candle::quantized::Int8Mode;
 
         set_gpu_span_period(u32::MAX);
-        let merged = engine_gguf()?;
+        let pack = engine()?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
         let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
@@ -2333,7 +2387,7 @@ mod tests {
         };
         let configs = vec![one(), one(), one(), one()];
         params.run(configs, || {
-            let gpu = Qwen4ExpGpu::load(&merged, &device, int8mode)?;
+            let gpu = Qwen4ExpGpu::load(&pack, &device)?;
             Qwen4ExpBatched::new(gpu)
         })
     }

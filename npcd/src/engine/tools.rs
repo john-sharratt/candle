@@ -1334,6 +1334,19 @@ pub fn show_within(selection: &mut SelectionState, mode: Mode, within: &Within) 
 /// a test rather than a machine.
 pub const ACTS_PER_TURN: usize = 2;
 
+/// The most tokens one argument of an act may run to before the grammar closes
+/// it where it stands.
+///
+/// **A runaway value must end inside the turn, with its call.** Unbounded, a
+/// `reflect` whose `situation` fell into "I am standing in the catalogue." over
+/// and over ran to the turn's 16k-token cap, the call never closed, and the
+/// character was told only that it had not written a call — every turn, for
+/// twelve hours, each one sixteen thousand tokens long. An act's argument is a
+/// sentence or a passage; a document is written whole through `compose`, which
+/// has its own budget. Bounded here, the value closes, the call lands, and the
+/// character reads back what it actually did.
+pub const ACT_VALUE_TOKENS: u32 = 1024;
+
 /// The whole catalog as constrained-decoding specs.
 ///
 /// **This is what makes a required parameter actually required.** Compiled into
@@ -2141,9 +2154,11 @@ pub(super) fn stencil_params(t: &Tool, within: &Within) -> Vec<StencilParam> {
             // be null.
             items: None,
             min_items: 0,
+            max_items: None,
             properties: None,
             nullable: false,
             minimum: minimum_of(t.name, p.name),
+            max_tokens: (p.ty == "string").then_some(ACT_VALUE_TOKENS),
             requires: value_requirements(t.name, p.name),
             // **What each address carries is decided by which address it is.**
             // Only `invoke`'s `url` brings fields of its own: the typed body its
@@ -2396,6 +2411,28 @@ mod tests {
         // free-decodes, which is silent.
         compile_tool_call_tree(&specs, &ToolCallEnvelope::qwen3())
             .expect("the act catalog must compile into a stencil");
+    }
+
+    /// Every free string an act takes closes at [`ACT_VALUE_TOKENS`], and
+    /// nothing else is bounded: a runaway `reflect` ran to the turn's cap and the
+    /// call around it was lost.
+    #[test]
+    fn every_string_an_act_takes_is_bounded() {
+        let specs = specs_within(Mode::Physical, &Within::among(&["Perrin Vastwood"]));
+        let reflect = specs.iter().find(|s| s.name == "reflect").unwrap();
+        let situation = reflect
+            .params
+            .iter()
+            .find(|p| p.name == "situation")
+            .unwrap();
+        assert_eq!(situation.max_tokens, Some(1024));
+        for p in specs.iter().flat_map(|s| s.params.iter()) {
+            let bound = match p.ty {
+                ParamType::String => Some(ACT_VALUE_TOKENS),
+                _ => None,
+            };
+            assert_eq!(p.max_tokens, bound, "`{}`", p.name);
+        }
     }
 
     /// Every parameter in the catalog has a stencil type. `param_type` refuses

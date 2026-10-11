@@ -3301,12 +3301,11 @@ mod tests {
     // These are end-to-end gates against the real DeepSeek-V4-Flash checkpoint, so
     // they name the concrete architecture. The engine's model-independent tests
     // run against `arch::test_arch` instead.
-    use crate::models::deepseek4::DEEPSEEK_V4;
+    use crate::models::deepseek4::{gate_packs, DEEPSEEK_V4};
     use crate::models::gpu_test_lock::gpu_serial;
     // Lossless gates: they assert speculation reproduces plain GREEDY decode
     // token for token, so they choose greedily.
     use crate::models::speculative_choice::GreedyChooser;
-    use candle::quantized::Int8Mode;
     use candle::IndexOp;
 
     // Full-model integration tests serialize on the CRATE-WIDE
@@ -3332,14 +3331,12 @@ mod tests {
     #[ignore]
     fn wave_prefill_then_decode_end_to_end() -> Result<()> {
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
+        let device = Device::new_cuda(0)?;
+        let Some(pack) = gate_packs::target(&device)? else {
             eprintln!("[skip] merged file absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        };
+        let engine = Engine::load(&pack, &DEEPSEEK_V4, &device)?;
         let model = BatchedEngine::new(engine)?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
@@ -3472,14 +3469,12 @@ mod tests {
     #[ignore]
     fn wave_failed_sweep_leaves_no_corpus_trace() -> Result<()> {
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
+        let device = Device::new_cuda(0)?;
+        let Some(pack) = gate_packs::target(&device)? else {
             eprintln!("[skip] merged file absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        };
+        let engine = Engine::load(&pack, &DEEPSEEK_V4, &device)?;
         let model = BatchedEngine::new(engine)?;
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
             "deepseek-ai/DeepSeek-V4-Flash-0731",
@@ -3650,14 +3645,12 @@ mod tests {
         use crate::models::batch_test::utils::decode_reproducibility;
 
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
+        let device = Device::new_cuda(0)?;
+        let Some(pack) = gate_packs::target(&device)? else {
             eprintln!("[skip] merged file absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        };
+        let engine = Engine::load(&pack, &DEEPSEEK_V4, &device)?;
         let model = BatchedEngine::new(engine)?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
@@ -3719,14 +3712,12 @@ mod tests {
         use crate::models::batch_test::utils::{decode_replay_probe, prefill_replay_probe};
 
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
+        let device = Device::new_cuda(0)?;
+        let Some(pack) = gate_packs::target(&device)? else {
             eprintln!("[skip] merged file absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        };
+        let engine = Engine::load(&pack, &DEEPSEEK_V4, &device)?;
         let model = BatchedEngine::new(engine)?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
@@ -3786,14 +3777,12 @@ mod tests {
     #[ignore]
     fn wave_speculative_step_is_lossless() -> Result<()> {
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
+        let device = Device::new_cuda(0)?;
+        let Some(pack) = gate_packs::target(&device)? else {
             eprintln!("[skip] merged file absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        };
+        let engine = Engine::load(&pack, &DEEPSEEK_V4, &device)?;
         let model = BatchedEngine::new(engine)?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
@@ -3910,25 +3899,18 @@ mod tests {
     #[ignore]
     fn wave_speculative_step_with_drafter_is_lossless() -> Result<()> {
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        let dspark = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf");
-        if !path.exists() || !dspark.exists() {
+        let device = Device::new_cuda(0)?;
+        let (Some(pack), Some(dspark)) =
+            (gate_packs::target(&device)?, gate_packs::drafter(&device)?)
+        else {
             eprintln!("[skip] target or DSpark drafter absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
+        };
         // Combined load: the drafter lands in the DENSE tier (before the span
         // reservation), so the elastic boundary balances target-experts vs KV
         // around it — see `Engine::load_with_drafter`.
-        let (engine, drafter) = Engine::load_with_drafter(
-            &path,
-            Some(&dspark),
-            &DEEPSEEK_V4,
-            &device,
-            Int8Mode::Performance,
-        )?;
+        let (engine, drafter) =
+            Engine::load_with_drafter(&pack, Some(&dspark), &DEEPSEEK_V4, &device)?;
         let model =
             BatchedEngine::new(engine)?.with_drafter(drafter.expect("dspark path given"))?;
 
@@ -4041,22 +4023,15 @@ mod tests {
     #[ignore]
     fn wave_speculative_speedup_with_drafter() -> Result<()> {
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        let dspark = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf");
-        if !path.exists() || !dspark.exists() {
+        let device = Device::new_cuda(0)?;
+        let (Some(pack), Some(dspark)) =
+            (gate_packs::target(&device)?, gate_packs::drafter(&device)?)
+        else {
             eprintln!("[skip] target or DSpark drafter absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let (engine, drafter) = Engine::load_with_drafter(
-            &path,
-            Some(&dspark),
-            &DEEPSEEK_V4,
-            &device,
-            Int8Mode::Performance,
-        )?;
+        };
+        let (engine, drafter) =
+            Engine::load_with_drafter(&pack, Some(&dspark), &DEEPSEEK_V4, &device)?;
         let model =
             BatchedEngine::new(engine)?.with_drafter(drafter.expect("dspark path given"))?;
 
@@ -4234,22 +4209,15 @@ mod tests {
     #[ignore]
     fn wave_speculative_realtext_acceptance() -> Result<()> {
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        let dspark = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("dspark-DeepSeek-V4-Flash-0731-MXFP4.gguf");
-        if !path.exists() || !dspark.exists() {
+        let device = Device::new_cuda(0)?;
+        let (Some(pack), Some(dspark)) =
+            (gate_packs::target(&device)?, gate_packs::drafter(&device)?)
+        else {
             eprintln!("[skip] target or DSpark drafter absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let (engine, drafter) = Engine::load_with_drafter(
-            &path,
-            Some(&dspark),
-            &DEEPSEEK_V4,
-            &device,
-            Int8Mode::Performance,
-        )?;
+        };
+        let (engine, drafter) =
+            Engine::load_with_drafter(&pack, Some(&dspark), &DEEPSEEK_V4, &device)?;
         let model =
             BatchedEngine::new(engine)?.with_drafter(drafter.expect("dspark path given"))?;
 
@@ -4368,14 +4336,12 @@ mod tests {
     #[ignore]
     fn wave_decode_only_absorption_bisect() -> Result<()> {
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
+        let device = Device::new_cuda(0)?;
+        let Some(pack) = gate_packs::target(&device)? else {
             eprintln!("[skip] merged file absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        };
+        let engine = Engine::load(&pack, &DEEPSEEK_V4, &device)?;
         let model = BatchedEngine::new(engine)?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
@@ -4452,14 +4418,12 @@ mod tests {
     #[ignore]
     fn wave_prefill_residual_divergence() -> Result<()> {
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
+        let device = Device::new_cuda(0)?;
+        let Some(pack) = gate_packs::target(&device)? else {
             eprintln!("[skip] merged file absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        };
+        let engine = Engine::load(&pack, &DEEPSEEK_V4, &device)?;
         let model = BatchedEngine::new(engine)?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
@@ -4579,14 +4543,12 @@ mod tests {
     #[ignore]
     fn wave_prefill_state_matches_decode_steps() -> Result<()> {
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
+        let device = Device::new_cuda(0)?;
+        let Some(pack) = gate_packs::target(&device)? else {
             eprintln!("[skip] merged file absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        };
+        let engine = Engine::load(&pack, &DEEPSEEK_V4, &device)?;
         let model = BatchedEngine::new(engine)?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(
@@ -4747,14 +4709,12 @@ mod tests {
     #[ignore]
     fn wave_chat_template_oracle() -> Result<()> {
         let _gpu = gpu_serial();
-        let path = std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-            .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf");
-        if !path.exists() {
+        let device = Device::new_cuda(0)?;
+        let Some(pack) = gate_packs::target(&device)? else {
             eprintln!("[skip] merged file absent");
             return Ok(());
-        }
-        let device = Device::new_cuda(0)?;
-        let engine = Engine::load(&path, &DEEPSEEK_V4, &device, Int8Mode::Performance)?;
+        };
+        let engine = Engine::load(&pack, &DEEPSEEK_V4, &device)?;
         let model = BatchedEngine::new(engine)?;
 
         let tok_path = crate::models::batch_test::test_helpers::hf_get(

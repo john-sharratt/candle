@@ -72,6 +72,22 @@ impl PersistenceTriggers {
         all
     }
 
+    /// [`Self::flush_blocking`] answered by each thread once `bytes` are installed
+    /// warm there, or its backlog is, rather than after its whole backlog: what
+    /// relief, short by a known amount, waits for. The shortfall is one figure for
+    /// the shared VRAM pool and no thread can say which substrate's turns will
+    /// cover it, so each is asked for all of it; a thread whose backlog is smaller
+    /// answers once that backlog is warm.
+    pub fn flush_at_least(&self, bytes: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut all = true;
+        for (_, t) in &self.members {
+            let left = deadline.saturating_duration_since(Instant::now());
+            all &= t.flush_at_least(bytes, left);
+        }
+        all
+    }
+
     /// The hot→warm drain backlog across every substrate, in bytes.
     pub fn pending_warm_bytes(&self) -> u64 {
         self.members
@@ -130,6 +146,16 @@ mod tests {
         t.attach(1, PersistenceTrigger::noop());
         let started = Instant::now();
         assert!(!t.flush_blocking(Duration::from_millis(50)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// The sized flush shares the same overall deadline and reports the same way.
+    #[test]
+    fn a_sized_flush_no_thread_acknowledges_reports_false() {
+        let mut t = PersistenceTriggers::new(0, PersistenceTrigger::noop());
+        t.attach(1, PersistenceTrigger::noop());
+        let started = Instant::now();
+        assert!(!t.flush_at_least(1 << 20, Duration::from_millis(50)));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 

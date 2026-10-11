@@ -23,18 +23,19 @@
 //! table of `unsloth/Qwen3.8-Flash-Next-GGUF` verbatim, the MTP draft head
 //! (`MTP/` of the same repo) folded in as `blk.{num_layers}`, and the routed
 //! experts at the width of the card's rung — `Q4_KO` imported bit-exactly from
-//! `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`, or `Q3_KO` / `Q2_KO` requantized from
-//! the `Q8_0` split (`candle_transformers::models::quant_ladder`). The result is
-//! one mmap and one `Content`, which is what the engine's loader takes, named by
-//! its recipe's digest (`qwen4exp::prepare`).
+//! `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`, or `Q3_KO` requantized from the
+//! `Q8_0` split (`candle_transformers::models::quant_ladder`). The artifact is
+//! named by its recipe's digest (`qwen4exp::prepare`), and the engine loads the
+//! model pack built from it — which releases the artifact once it holds it.
 //!
 //! Each rung is its own preset because each is its own artifact: the file a
 //! preset names is the one its recipe builds, so a machine loads exactly what
 //! its rung's recipe produced and nothing older.
 //!
-//! [`ModelSpec::prepared_from_source`] marks that, so resolution looks locally
-//! and reports the prepare step instead of asking the hub for a filename nobody
-//! published.
+//! [`ModelSpec::prepared_from_source`] marks that, so resolution builds the
+//! pack only from an artifact already prepared on this machine
+//! (`quantized_qwen38_moe::prepared_engine_pack`) instead of asking the hub for
+//! a filename nobody published.
 
 use super::{ModelArch, ModelSpec, RopePreset};
 use crate::{config::SamplingConfig, models::DialectType};
@@ -60,15 +61,10 @@ pub(super) fn qwen38_flash_next_q4ko() -> ModelSpec {
     flash_next(GgmlDType::Q4_KO)
 }
 
-/// Qwen3.8-Flash-Next, `Q3_KO` experts — the rung for 32–63 GiB cards.
+/// Qwen3.8-Flash-Next, `Q3_KO` experts — the rung for every card under 64 GiB,
+/// the 16 GB laptop and the 24 GB RTX 3090 among them.
 pub(super) fn qwen38_flash_next_q3ko() -> ModelSpec {
     flash_next(GgmlDType::Q3_KO)
-}
-
-/// Qwen3.8-Flash-Next, `Q2_KO` experts — the rung for cards under 32 GiB, the
-/// 16 GB laptop among them.
-pub(super) fn qwen38_flash_next_q2ko() -> ModelSpec {
-    flash_next(GgmlDType::Q2_KO)
 }
 
 /// The preset whose artifact carries `experts`.
@@ -124,32 +120,30 @@ fn flash_next(experts: GgmlDType) -> ModelSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::builder::model_cache_dir;
+    use candle_transformers::models::model_pack::cache_root;
 
-    /// **Each rung names the artifact its own recipe builds**, and the three
-    /// are distinct files — a card never loads another rung's experts.
+    /// **Each rung names the artifact its own recipe builds**, and the two are
+    /// distinct files — a card never loads another rung's experts.
     #[test]
     fn each_rung_names_its_recipes_artifact() {
-        let q2 = qwen38_flash_next_q2ko().model_filename;
         let q3 = qwen38_flash_next_q3ko().model_filename;
         let q4 = qwen38_flash_next_q4ko().model_filename;
-        assert_eq!(q2, "Qwen3.8-Flash-Next-Q2_KOEXP-130076148f33.gguf");
-        assert!(q3.starts_with("Qwen3.8-Flash-Next-Q3_KOEXP-"), "{q3}");
+        assert_eq!(q3, "Qwen3.8-Flash-Next-Q3_KOEXP-503c2f2d6ead.gguf");
         assert!(q4.starts_with("Qwen3.8-Flash-Next-Q4_KOEXP-"), "{q4}");
-        assert!(q2 != q3 && q3 != q4 && q2 != q4);
+        assert!(q3 != q4);
     }
 
-    /// **The gate builds where the loader looks.** `quantized_qwen38_moe` sits
-    /// below this crate and cannot call [`model_cache_dir`], so it repeats the
-    /// rule; this pins the two to the same directory. They once disagreed — the
-    /// gate honoured `XDG_CACHE_HOME` and the loader did not — so an artifact
-    /// built by the gate could be reported missing by the probe beside it.
+    /// **The gate prepares where the loader looks**: the artifact lands in the
+    /// model cache's directory for its source repo, the one the engine pack is
+    /// filed under. They once disagreed — the gate honoured `XDG_CACHE_HOME` and
+    /// the loader did not — so an artifact built by the gate could be reported
+    /// missing by the probe beside it.
     #[test]
     fn the_gates_artifact_dir_is_the_loaders() {
-        let spec = qwen38_flash_next_q2ko();
+        let spec = qwen38_flash_next_q3ko();
         assert_eq!(
             quantized_qwen38_moe::engine_artifact_dir(),
-            model_cache_dir().join(spec.model_repo.replace('/', "--"))
+            cache_root().join(spec.model_repo.replace('/', "--"))
         );
     }
 }

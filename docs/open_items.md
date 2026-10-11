@@ -109,8 +109,8 @@ scenarios (below). None of the slow ones loaded a model; they were **unoptimised
 - **`tools_integration` runs on `Qwen35_0_8B_Q8`**, a preset (the gate's own pinned 0.8B,
   same lineage/dialect/tool-call style as production), set on `DaemonConfig::model` — the
   field a harness uses in place of the prescribed `host::MODEL`, which every daemon runs and
-  no flag changes. `host::download::ensure_model` and the session build from that one
-  model. Scenarios run thinking-off (`api::chat::dial_selection`, now `pub`),
+  no flag changes. `host::download::ensure_model_pack` and the session build from that one
+  model's pack. Scenarios run thinking-off (`api::chat::dial_selection`, now `pub`),
   one at a time, on a persistent `target/tmp/tools_integration_ws` whose calibration is paid
   once, force-compacted past 2 GiB. **9/10 pass in the default suite at ~20–30 s each**;
   `hash_compute` (the 0.8B answered a decimal integer) runs on the production model + live

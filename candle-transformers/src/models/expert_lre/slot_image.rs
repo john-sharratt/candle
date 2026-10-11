@@ -109,54 +109,6 @@ pub(crate) unsafe fn build_slot_view(
     })
 }
 
-/// Build an `ExpertSlot` from already-repacked host bytes, uploading them into
-/// the weight-zone slot at `slot_base` on the device's default stream.
-///
-/// # Safety
-///
-/// `slot_base` must name a slot the zone has handed out and not reclaimed, of at
-/// least `slot_offsets(geom).3` bytes.
-pub(crate) unsafe fn build_slot_from_repacked_with_device(
-    gate_bytes: &[u8],
-    up_bytes: &[u8],
-    down_bytes: &[u8],
-    geom: &LayerGeometry,
-    cuda_dev: &candle::CudaDevice,
-    slot_base: u64,
-) -> Result<ExpertSlot> {
-    let (gate_off, up_off, down_off, _) = slot_offsets(geom);
-    let stream = cuda_dev.cuda_stream();
-    let gate_storage = candle::quantized::load_repacked_into(
-        cuda_dev,
-        &stream,
-        slot_base + gate_off as u64,
-        gate_bytes,
-        geom.gate_dtype,
-    )?;
-    let up_storage = candle::quantized::load_repacked_into(
-        cuda_dev,
-        &stream,
-        slot_base + up_off as u64,
-        up_bytes,
-        geom.up_dtype,
-    )?;
-    let down_storage = candle::quantized::load_repacked_into(
-        cuda_dev,
-        &stream,
-        slot_base + down_off as u64,
-        down_bytes,
-        geom.down_dtype,
-    )?;
-    let gate_qt = candle::quantized::QTensor::new(gate_storage, geom.gate_shape.clone())?;
-    let up_qt = candle::quantized::QTensor::new(up_storage, geom.up_shape.clone())?;
-    let down_qt = candle::quantized::QTensor::new(down_storage, geom.down_shape.clone())?;
-    Ok(ExpertSlot {
-        gate_proj: QMatMul::from_qtensor_repacked(gate_qt)?,
-        up_proj: QMatMul::from_qtensor_repacked(up_qt)?,
-        down_proj: QMatMul::from_qtensor_repacked(down_qt)?,
-    })
-}
-
 /// Bytes of a slot image from the gate's start to the down projection's end —
 /// what one copy of the image moves.
 pub(crate) fn image_extent(layout: RecordLayout) -> usize {
@@ -169,8 +121,9 @@ pub(crate) fn image_extent(layout: RecordLayout) -> usize {
 ///
 /// # Safety
 ///
-/// As [`build_slot_from_repacked_with_device`]; `record` must stay unwritten
-/// until the copy on `stream` has landed.
+/// `slot_base` must name a slot the zone has handed out and not reclaimed, of at
+/// least `slot_offsets(geom).3` bytes; `record` must stay unwritten until the
+/// copy on `stream` has landed.
 pub(crate) unsafe fn build_slot_from_record_on_stream(
     record: &[u8],
     layout: RecordLayout,
@@ -196,24 +149,6 @@ pub(crate) unsafe fn build_slot_from_record_on_stream(
     )
     .map_err(candle::Error::wrap)?;
     build_slot_view(geom, cuda_dev, slot_base)
-}
-
-/// Lay one expert's three projections into a record buffer at their spans.
-///
-/// The gaps between projections are alignment padding the kernels never read;
-/// they are zeroed so a record is a deterministic function of its expert, which
-/// is what lets the pack file be compared byte for byte between builds.
-pub(crate) fn write_record(
-    dst: &mut [u8],
-    layout: RecordLayout,
-    gate: &[u8],
-    up: &[u8],
-    down: &[u8],
-) {
-    dst.fill(0);
-    for (span, src) in [(layout.gate, gate), (layout.up, up), (layout.down, down)] {
-        dst[span.offset..span.offset + src.len()].copy_from_slice(src);
-    }
 }
 
 /// GPU-repack one expert's three projections from GGML to K/128 format.

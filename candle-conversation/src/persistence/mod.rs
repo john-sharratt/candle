@@ -32,6 +32,7 @@ pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
 pub mod elevate;
+pub mod flush;
 pub mod header_index;
 mod held_groups;
 pub mod inherit;

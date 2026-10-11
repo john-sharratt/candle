@@ -8,16 +8,18 @@
 //! refuses to open under any other (`docs/shared_model_host.md` §4).
 //!
 //! The key is computed before a single weight is loaded: the weights are named
-//! by a fingerprint of each file's header and a sample of its tensor data
-//! ([`gguf_fingerprint`]), so a refused start costs seconds rather than a model
-//! load.
+//! by the whole-file SHA-256 of every source their model pack records
+//! ([`WeightFiles::digest`]), read from the pack's header, so a refused start
+//! costs milliseconds rather than a model load.
 
 mod fingerprint;
 mod key;
 mod rope_key;
 mod weight_files;
 
-pub use fingerprint::{file_digest, gguf_fingerprint, SAMPLE_BYTES, SAMPLE_COUNT};
+pub use fingerprint::file_digest;
 pub use key::{LegacySpec, ModelIdentity, ModelKey, RecordedModel};
 pub use rope_key::rope_key;
+#[cfg(test)]
+pub(crate) use weight_files::write_pack_header;
 pub use weight_files::WeightFiles;

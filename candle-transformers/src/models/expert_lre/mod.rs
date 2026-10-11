@@ -54,17 +54,14 @@
 //! run first every pass with no compute ahead of them to overlap a DMA
 //! against, so evicting them guarantees a cold miss at maximum stall.
 //!
-//! The depth is a **constant**, not a function of capacity, because these are
-//! also the experts that have no copy anywhere else: [`pack`] writes no record
-//! for them and the warm tier's draw skips them, so a cache that unpinned one
-//! under pressure would strand it with nowhere to reload from.  What guarantees
-//! the cache can always pay for them is the zone's floor —
+//! The depth is a **constant**, not a function of capacity. The warm tier's
+//! draw skips these layers — they never miss, so a host copy would serve
+//! nothing — and on the 3.6-35B that returns 943 MiB of pinned host RAM to the
+//! evictable set, the only set that generates misses. Their records are in the
+//! pack like every other layer's, which is where the startup fill reads them
+//! from. What guarantees the cache can always hold them is the zone's floor —
 //! `cache::minimum_resident_slots` prices the pinned set plus a full working
 //! layer, and the elastic boundary may not retract below it.
-//!
-//! Dropping their host and disk copies is the point, not a side effect: on the
-//! 3.6-35B it returns 943 MiB of pinned host RAM to the evictable set — the
-//! only set that generates misses — and the same again on disk.
 //!
 //! ### Evicting behind the wave
 //!
@@ -111,7 +108,8 @@
 //! | [`cache`]      | `ExpertCacheInner` — VRAM slots and the eviction policy |
 //! | [`compute`]    | `QMatMul` re-export |
 //! | [`transition`] | `TransitionMatrix` — online-learned routing predictor |
-//! | [`pack`]       | `ExpertPack` — the authoritative cold tier on disk |
+//! | [`pack`]       | `ExpertPack` — the authoritative cold tier, a section of the model pack |
+//! | `section`      | building the expert section from a checkpoint; opening it; its geometry |
 //! | [`pinned`]     | `WarmPool` — pinned host memory slots, and the warm draw |
 //! | [`warm_tier`]  | `WarmTier` — the warm tier: pinned up to the page-lock ceiling, pageable past it |
 //! | `pad`          | `Pad` — the mutable pinned tier cold experts are staged into |
@@ -125,7 +123,7 @@
 //! | `promo`        | the promotion ring the GPU fills missed experts into |
 //! | `boundary`     | the elastic weight/KV boundary move |
 //! | `slot_image`   | one expert's slot image: offsets, views, uploads |
-//! | `startup`      | building or reusing the pack, and the startup fill |
+//! | `startup`      | the startup fill, from the pack |
 //! | `read_ahead`, `ahead_pins`, `link_rate` | read-ahead's window, pad pins and the link it is sized from |
 //! | `votes`        | the router look-ahead's per-hop votes, beside the summary ring |
 //! | `blend`        | one prediction list from votes, Markov and recency, ranked by learned cells |
@@ -165,8 +163,8 @@ mod link_rate;
 mod live_table;
 #[cfg(all(test, feature = "cuda"))]
 mod matmul_baseline;
-/// `pub(crate)` so the layer pack shares this one's repack fingerprint rather
-/// than growing a second definition of the same sweep — the two packs hold
+/// `pub(crate)` so the layer pack shares this one's per-pair repack fingerprint
+/// rather than growing a second definition of it — the two sections hold
 /// weights repacked by identical code, so a change that invalidates one must
 /// invalidate the other.
 pub(crate) mod pack;
@@ -207,6 +205,9 @@ mod replay;
 mod residency;
 /// The routing the pipeline thread served, kept for the residency ceiling.
 mod routing_trace;
+/// The expert section of a model pack: built from a checkpoint, opened at load.
+#[cfg(feature = "cuda")]
+pub(crate) mod section;
 #[cfg(feature = "cuda")]
 mod slot_image;
 /// Fletcher-32 fingerprints of the resident expert weights, taken once after
@@ -255,13 +256,6 @@ pub use handle::{
     last_warm_tier_sizing, WarmTierSizing, CEILING_AVAILABLE, CEILING_HOST_BUDGET, CEILING_NONE,
     CEILING_PINNABLE, WARM_TIER_HEADROOM,
 };
-/// What the weight zone must be carved into to hold one expert.
-///
-/// The model loader needs this **before** the cache exists: the zone's slot size
-/// decides its capacity, its capacity decides where the weight boundary sits,
-/// and the boundary has to be placed before a single expert is uploaded into it.
-#[cfg(feature = "cuda")]
-pub(crate) use pinned::layer_geometries;
 pub use read_latency::ReadLatency;
 pub use regret::{tag_label, TAGS};
 #[cfg(feature = "cuda")]

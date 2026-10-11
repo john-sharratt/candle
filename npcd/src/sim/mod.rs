@@ -56,6 +56,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::mission::bank::Duty;
 use crate::engine::mission_acts::COLLECT_MISSION;
+use crate::engine::workflow::OnFailed;
 use bench::Benches;
 use device::Devices;
 use field::{Field, Resource};
@@ -261,22 +262,22 @@ impl Sim {
         out
     }
 
-    /// What becomes of a failed operation's document: a draft is moved out of
-    /// the record to `rejected/` ([`Operation::leaves_on_failure`]); a document
-    /// the record already held is put back to what it said when the operation
-    /// opened, so a rejected correction does not stand — unless a later
-    /// operation on it has since succeeded, whose accepted text that would
-    /// overwrite. Returns where the document is now, or why it could not be
-    /// settled; `None` when there was nothing to do.
+    /// What becomes of a failed operation's document, by its workflow's
+    /// `on-failed`: `set-aside` moves it out of the record to `rejected/`;
+    /// `restore` puts it back to what it said when the operation opened, so a
+    /// rejected correction does not stand — unless a later operation on it has
+    /// since succeeded, whose accepted text that would overwrite; `keep` leaves
+    /// it. Returns where the document is now, or why it could not be settled;
+    /// `None` when there was nothing to do.
     pub fn set_aside_failed(&mut self, op: &Operation) -> Option<Result<String, String>> {
-        match (op.leaves_on_failure(), &op.before) {
-            (true, _) => {
+        match (self.missions.operations().on_failed(op), &op.before) {
+            (OnFailed::SetAside, _) => {
                 let to = op.name.to_lowercase().replace(' ', "-");
                 Some(self.bench.retire(&op.document, &to))
             }
-            (false, Some(_)) if self.missions.operations().succeeded_after(op) => None,
-            (false, Some(before)) => Some(self.bench.put_back(&op.document, before)),
-            (false, None) => None,
+            (OnFailed::Restore, Some(_)) if self.missions.operations().succeeded_after(op) => None,
+            (OnFailed::Restore, Some(before)) => Some(self.bench.put_back(&op.document, before)),
+            (OnFailed::Restore, None) | (OnFailed::Keep, _) => None,
         }
     }
 
@@ -753,11 +754,12 @@ impl Sim {
 mod tests {
     use super::*;
     use item::{Item, Kind};
+    use operations::tests::workflows;
     use operations::Operations;
 
-    /// **A failed correction is undone; a failed draft leaves.** The era a
-    /// correction worked on goes back to what it said when the operation
-    /// opened; a story drafted new is moved to `rejected/`.
+    /// **A failed operation's document is settled as its workflow says**: a
+    /// correction's (`restore`) goes back to what it said when the operation
+    /// opened; a story's (`set-aside`) is moved to `rejected/`.
     #[test]
     fn a_failed_operation_sets_its_document_aside_by_what_it_was() {
         let root = tempfile::tempdir().unwrap();
@@ -767,9 +769,20 @@ mod tests {
         std::fs::write(root.path().join("layers/stories/s.md"), "a weak story").unwrap();
         let mut sim = Sim::default();
         sim.set_bench_root(root.path());
+        sim.missions.set_workflows(workflows());
         let mut ops = Operations::default();
+        ops.set_workflows(workflows());
 
-        let fix = ops.open("contradiction", "pair:a|b", "fix", "layers/eras/a.md");
+        let fix = ops
+            .open(
+                "correction",
+                None,
+                "contradiction",
+                "pair:a|b",
+                "fix",
+                "layers/eras/a.md",
+            )
+            .unwrap();
         ops.kept_before(fix, "the era as it was");
         let put = sim.set_aside_failed(ops.get(fix).unwrap());
         assert_eq!(put, Some(Ok("layers/eras/a.md".to_string())));
@@ -778,12 +791,16 @@ mod tests {
             "the era as it was"
         );
 
-        let story = ops.open(
-            "untold",
-            "era:layers/eras/a.md",
-            "tell",
-            "layers/stories/s.md",
-        );
+        let story = ops
+            .open(
+                "story",
+                None,
+                "untold",
+                "era:layers/eras/a.md",
+                "tell",
+                "layers/stories/s.md",
+            )
+            .unwrap();
         let moved = sim.set_aside_failed(ops.get(story).unwrap());
         let to = moved.expect("a draft is set aside").expect("and moved");
         assert!(to.starts_with("rejected/") && to.ends_with("/s.md"), "{to}");
@@ -837,6 +854,8 @@ mod tests {
                 min_words: 0,
                 edit_optional: false,
                 anew: false,
+                checks: Vec::new(),
+                tools: Vec::new(),
             }),
         );
         assert_eq!(s.presentable("m1"), ["the first city opens"]);

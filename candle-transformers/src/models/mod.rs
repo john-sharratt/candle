@@ -98,6 +98,8 @@ pub mod kv_cache_utils;
 pub mod kv_collect_utils;
 // The sparse-latent MoE engine: paged latent attention, the provenance gallery
 // and the wave scheduler are all kernel wrappers.
+#[cfg(any(test, feature = "hub"))]
+pub mod hub_download;
 #[cfg(feature = "cuda")]
 pub mod latent_moe;
 pub mod layer_parallel;
@@ -119,6 +121,7 @@ pub mod mmdit;
 pub mod mobileclip;
 pub mod mobilenetv4;
 pub mod mobileone;
+pub mod model_pack;
 pub mod modernbert;
 pub mod moondream;
 pub mod mpt;
@@ -203,6 +206,11 @@ pub mod qwen35;
 pub mod qwen3_moe;
 #[cfg(feature = "cuda")]
 pub mod qwen4exp;
+/// The per-pair repack fingerprint both model-pack sections record. Producing
+/// one needs the device; the hashing and the check are compiled everywhere so
+/// the section formats' tests run without a GPU.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) mod repack_fingerprint;
 /// Which of a wave's rows the expert cache scores as decode. Its consumers,
 /// the wave forwards, are CUDA-only.
 #[cfg(feature = "cuda")]

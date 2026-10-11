@@ -278,7 +278,7 @@ const QWEN36_35B_A3B_BRACKETS: &[(usize, usize)] = &[(8, 4), (16, 2)];
 /// touched one resident block — roughly 45:1, so depth was close to free.
 ///
 /// **That argument no longer applies, and the depth is kept on new evidence
-/// rather than on it.** The two-tier weight zone (`docs/qwen38_layer_streaming.md`
+/// rather than on it.** The two-tier weight zone (`docs/archived/qwen38_layer_streaming.md`
 /// §14) holds all 64 layers resident on the 16 GB card, so a verify forward moves
 /// no weight bytes at all and the 45:1 is gone. Re-measured resident, tokens/sec
 /// at 1 / 4 contexts over two sweeps:

@@ -62,7 +62,7 @@ mod tests {
     use npc_map::MapSet;
 
     use super::*;
-    use crate::engine::mission::{Mission, Origin, Stage, Todo, Work};
+    use crate::engine::mission::{Mission, Origin, Todo, Work};
     use crate::sim::seed;
 
     fn vault() -> (World, Sim) {
@@ -82,7 +82,7 @@ mod tests {
                 generator: "life-event".into(),
                 target: "life:conan".into(),
                 operation: 1,
-                stage: Stage::Draft,
+                step: "write".into(),
             },
         )
         .with_work(Work {
@@ -91,6 +91,8 @@ mod tests {
             min_words: 250,
             edit_optional: false,
             anew: false,
+            checks: Vec::new(),
+            tools: Vec::new(),
         })
     }
 

@@ -20,16 +20,46 @@
 
 #![cfg(all(feature = "cuda", feature = "ruler-bench"))]
 
-use candle::Device;
+use std::path::{Path, PathBuf};
+
+use candle::quantized::Int8Mode;
+use candle::{Device, Result};
 use candle_transformers::models::batch_test::ruler_gen::{
     generate_ruler_samples, run_ruler_eval, score_ruler_sample, RulerSample, RulerTask,
 };
 use candle_transformers::models::deepseek4::DEEPSEEK_V4;
 use candle_transformers::models::latent_moe::{BatchedEngine, Engine};
+use candle_transformers::models::model_pack::{
+    cache_root, local_rev, model_pack, HubFetch, LocalFetch, ModelPack, PackFamily, PackRequest,
+};
 
-fn ko_gguf() -> std::path::PathBuf {
-    std::path::PathBuf::from(r"D:\models\deepseek-v4-flash-mxfp4")
-        .join("DeepSeek-V4-Flash-0731-MXFP4_KO.gguf")
+const KO_DIR: &str = r"D:\models\deepseek-v4-flash-mxfp4";
+const KO_FILE: &str = "DeepSeek-V4-Flash-0731-MXFP4_KO.gguf";
+/// The pack's repo label: the source is local, and the provenance says so.
+const KO_LABEL: &str = "local/deepseek-v4-flash-mxfp4";
+const TOKENIZER_REPO: &str = "deepseek-ai/DeepSeek-V4-Flash-0731";
+
+/// The merged checkpoint's model pack, or `None` when this machine has neither
+/// the pack nor the file it is built from. The source is local; the hub is
+/// asked for the tokenizer alone.
+fn ko_pack(device: &Device) -> Result<Option<PathBuf>> {
+    let rev = local_rev(&Path::new(KO_DIR).join(KO_FILE));
+    let request = PackRequest::of(
+        PackFamily::Latent(&DEEPSEEK_V4),
+        (KO_LABEL, &rev, KO_FILE),
+        (TOKENIZER_REPO, "main"),
+        Some(Int8Mode::Performance),
+    );
+    let fetch = LocalFetch {
+        repo: KO_LABEL.into(),
+        dir: PathBuf::from(KO_DIR),
+        other: &HubFetch,
+    };
+    match model_pack(&request, &cache_root(), device, &fetch) {
+        Ok(path) => Ok(Some(path)),
+        Err(_) if !Path::new(KO_DIR).join(KO_FILE).exists() => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Re-frame a Qwen-ChatML RULER sample into the DeepSeek dialect. The haystack
@@ -63,17 +93,13 @@ fn deepseek_niah_single_recall() -> candle::Result<()> {
             return Ok(());
         }
     };
-    let gguf = ko_gguf();
-    if !gguf.exists() {
-        eprintln!("[skip] KO gguf absent: {}", gguf.display());
+    let Some(pack) = ko_pack(&device)? else {
+        eprintln!("[skip] KO gguf absent: {KO_DIR}\\{KO_FILE}");
         return Ok(());
-    }
-    let tok_path = hf_hub::api::sync::Api::new()
-        .map_err(|e| candle::Error::msg(format!("hf api: {e}")))?
-        .model("deepseek-ai/DeepSeek-V4-Flash-0731".to_string())
-        .get("tokenizer.json")
-        .map_err(|e| candle::Error::msg(format!("tokenizer fetch: {e}")))?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+    };
+    // The tokenizer the pack was built with, from inside it.
+    let opened = ModelPack::open(&pack)?;
+    let tokenizer = tokenizers::Tokenizer::from_bytes(opened.tokenizer_json()?.as_bytes())
         .map_err(|e| candle::Error::msg(format!("tokenizer load: {e}")))?;
     let eos = tokenizer
         .token_to_id("<｜end▁of▁sentence｜>")
@@ -92,12 +118,7 @@ fn deepseek_niah_single_recall() -> candle::Result<()> {
         })
         .collect();
 
-    let engine = Engine::load(
-        &gguf,
-        &DEEPSEEK_V4,
-        &device,
-        candle::quantized::Int8Mode::Performance,
-    )?;
+    let engine = Engine::load(&pack, &DEEPSEEK_V4, &device)?;
     let model = BatchedEngine::new(engine)?;
 
     let t0 = std::time::Instant::now();

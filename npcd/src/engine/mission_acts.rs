@@ -83,15 +83,19 @@ pub const COLLECT_MISSION: Tool = desk!(
      standing idle where the work is."
 );
 
+/// **What was found is called `found`.** Named `account`, the field read —
+/// inside an `invoke` body, where only its name is in front of the writer — as
+/// whose account it was, and Makers filed their own names there turn after
+/// turn while shouting the reading they had to the room.
 pub const REPORT_DONE: Tool = desk_on!(
     "report_done",
     "Back at the command table, report the mission you were carrying as done, and say what you \
      found or concluded. This closes it and files your answer, which is how anyone else learns \
      what came of it — and it frees you to take up the next.",
-    "account",
+    "found",
     "What you found, made, or concluded — the answer the mission was for.",
     "You have carried out your mission and come back to the table to say what came of it.",
-    r#"{"account":"I read the coolant valve and the breaker panel: the valve is open and the breaker is tripped"}"#,
+    r#"{"found":"I read the coolant valve and the breaker panel: the valve is open and the breaker is tripped"}"#,
     "Work nobody reported is work nobody can build on, and the answer is the point of having gone."
 );
 
@@ -147,11 +151,10 @@ pub struct Carrying {
 /// What `body` is carrying in `s`.
 pub fn carrying(s: &Sim, body: &str) -> Carrying {
     let mission = s.missions.active(body);
-    let stage = mission.and_then(|m| m.operation()).map(|(_, stage)| stage);
     Carrying {
         mission: mission.is_some(),
-        review: stage.is_some_and(|s| s.judges()),
-        operation: stage.is_some(),
+        review: mission.is_some_and(|m| m.may_reject()),
+        operation: mission.is_some_and(|m| m.operation().is_some()),
         order: !s.ledger.held_by(body).is_empty(),
         drafts: mission
             .and_then(|m| m.work.as_ref())

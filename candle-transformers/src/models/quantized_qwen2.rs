@@ -520,7 +520,7 @@ impl ModelWeights {
         Self::from_gguf_by_path_with_options(file_path, device, None, Int8Mode::auto(device))
     }
 
-    /// Like from_gguf_by_path but with an explicit int8mode (test path selects from INT8MODE).
+    /// Like from_gguf_by_path but with an explicit int8mode.
     pub fn from_gguf_by_path_with_int8(
         file_path: &std::path::Path,
         device: &Device,
@@ -1248,14 +1248,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Slow without CUDA. Run with: cargo test --release --features cuda -- --ignored test_parallel_batched_forwarding
+    #[ignore] // Run with: cargo test --release --features cuda -- --ignored test_parallel_batched_forwarding
+    #[cfg(feature = "cuda")]
     fn test_parallel_batched_forwarding() -> Result<()> {
-        #[cfg(not(all(feature = "cuda")))]
-        println!("⚠ WARNING: This test should be run with --features cuda for optimal performance");
-        #[cfg(not(all(feature = "cuda")))]
-        println!(
-            "⚠ Current build is missing performance-critical features. Results may be slower.\n"
-        );
+        use crate::models::batch_test::test_helpers::plain_pack;
 
         println!("\n=== Setting up Test Parameters (Qwen2) ===\n");
 
@@ -1263,22 +1259,23 @@ mod tests {
         // Qwen2 is NOT a thinking model - use plain ChatML (no_think is for Qwen3)
         let dialect = Dialect::chat_ml();
 
-        // Download tokenizer.json (Qwen2) from HuggingFace.
-        let api = crate::models::batch_test::test_helpers::api()
-            .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
-        let tok_repo = api.model("Qwen/Qwen2-0.5B-Instruct".to_string());
-        let tokenizer_path = tok_repo.get("tokenizer.json").map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to download tokenizer.json: {}. This test requires internet access.",
-                e
-            ))
-        })?;
-        let tokenizer_json = std::fs::read_to_string(&tokenizer_path).map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to read tokenizer.json from {:?}: {}",
-                tokenizer_path, e
-            ))
-        })?;
+        let device = Device::new_cuda(0)?;
+        println!("Using device: {:?}\n", device);
+        let int8mode = candle::quantized::Int8Mode::Performance;
+        println!("int8 mode = {int8mode:?}\n");
+
+        // The checkpoint's model pack, with the tokenizer inside it.
+        let (model_path, tokenizer_json) = plain_pack(
+            (
+                "Qwen/Qwen2-0.5B-Instruct-GGUF",
+                "main",
+                "qwen2-0_5b-instruct-q4_0.gguf",
+            ),
+            ("Qwen/Qwen2-0.5B-Instruct", "main"),
+            int8mode,
+            &device,
+        )?;
+        println!("Model pack: {:?}", model_path);
 
         let make_params = || {
             TestParams::new(num_generate_tokens, &tokenizer_json, dialect.clone())
@@ -1297,28 +1294,6 @@ mod tests {
         };
 
         println!("\n=== Loading Model (Qwen2) ===\n");
-
-        let repo = api.repo(hf_hub::Repo::with_revision(
-            "Qwen/Qwen2-0.5B-Instruct-GGUF".to_string(),
-            hf_hub::RepoType::Model,
-            "main".to_string(),
-        ));
-        let model_path = repo.get("qwen2-0_5b-instruct-q4_0.gguf").map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to download model: {}. This test requires internet access.",
-                e
-            ))
-        })?;
-
-        println!("Model downloaded to: {:?}", model_path);
-
-        let device = Device::new_cuda(0).map_err(|e| {
-            candle::Error::Msg(format!(
-                "CUDA required for this test: {}. Use --features cuda",
-                e
-            ))
-        })?;
-        println!("Using device: {:?}\n", device);
 
         // Then run the full harness including batched configs.
         // Qwen2 batched correctness is known-broken; we want the loop + perf table in place.
@@ -1410,15 +1385,6 @@ mod tests {
         let params = make_params()?;
 
         // Sequential (non-batched) callbacks - access inner model via .model()
-        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
-            Some("off") => candle::quantized::Int8Mode::Off,
-            Some("prec") | Some("precision") => candle::quantized::Int8Mode::Precision,
-            _ => candle::quantized::Int8Mode::Performance,
-        };
-        println!(
-            "int8 mode = {int8mode:?}
-"
-        );
         let load_model = || {
             let model = ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, int8mode)?;
             println!("✓ Model loaded\n");

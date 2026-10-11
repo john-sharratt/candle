@@ -132,22 +132,20 @@ fn timelines_of(conversations: &[Sequence]) -> HashSet<u64> {
 pub fn run_attached(probe: &Probe, width: usize) -> anyhow::Result<AttachedOutcome> {
     let device = Device::new_cuda(probe.device)?;
     let builder = probe.builder();
-    let (model_path, tokenizer_path) = builder.resolve_paths_pub()?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    println!("Loading {model_path:?} …");
+    let resolved = builder.resolve_model(&device)?;
+    let tokenizer = resolved.tokenizer()?;
+    println!("Loading {:?} …", resolved.pack);
     let model = builder
-        .load_model(&builder.weight_files(&model_path)?, &device, None)?
+        .load_model(&builder.weight_files(&resolved.pack)?, &device, None)?
         .model;
-    let (own_scratch, own) = start_engine(probe, &device, &tokenizer, model)?;
+    let (own_scratch, own) = start_engine(probe, &device, &resolved.pack, &tokenizer, model)?;
 
     // The second substrate, bound to the same model and attached ranked after
     // the first, as a second tenant's is.
     let other_scratch = ScratchSubstrate::new()?;
     println!("attached substrate: {:?}", other_scratch.path());
     let other_builder = probe.builder().workspace_path(other_scratch.path());
-    let identity =
-        other_builder.model_identity(&other_builder.weight_files(&model_path)?, &tokenizer_path)?;
+    let identity = other_builder.model_identity(&other_builder.weight_files(&resolved.pack)?)?;
     let bound = other_builder.bind_substrate(&identity)?;
     let rank = TenantRank::nth(1).expect("a second tenant has a rank");
     let attached = Arc::new(own.attach(bound, CancelToken::new(), rank, HashMap::new())?);

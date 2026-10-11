@@ -1,66 +1,76 @@
 //! Every file a model's weights are loaded from, and their joint digest.
 //!
-//! A model is not always one file. The AntiLoop + StyleTune fine-tune reads its
-//! trunk from one checkpoint and its `output.weight` from another; a fine-tune
-//! that stored its recurrent gates too narrow reads them from the base
-//! checkpoint; a dense Qwen3.5 can carry adapters. The builder resolves exactly
-//! the files its loader will read into a [`WeightFiles`], and the same value
-//! feeds both the load and the key, so the key names what was loaded.
+//! A model loads from its model pack (`docs/self_contained_model_packs.md`),
+//! which already holds every checkpoint the model is made of — the trunk, the
+//! tensors an override takes from another checkpoint, a gate donor — and
+//! records each one's whole-file SHA-256. Adapters stay outside it. The
+//! builder resolves exactly what its loader will read into a [`WeightFiles`],
+//! and the same value feeds both the load and the key, so the key names what
+//! was loaded.
 
 use std::io;
+#[cfg(test)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use candle_transformers::models::qwen35::TensorOverride;
+#[cfg(test)]
+use candle::quantized::gguf_file::{self, Value};
+#[cfg(test)]
+use candle_transformers::models::model_pack::keys::{VERSION, VERSION_KEY};
+use candle_transformers::models::model_pack::provenance::from_metadata;
+#[cfg(test)]
+use candle_transformers::models::model_pack::provenance::to_metadata;
+use candle_transformers::models::model_pack::ModelPack;
+#[cfg(test)]
+use candle_transformers::models::model_pack::SourceRecord;
 use sha2::{Digest, Sha256};
 
-use super::fingerprint::{file_digest, gguf_fingerprint};
+use super::fingerprint::file_digest;
 
 /// The files a model is loaded from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightFiles {
-    /// The checkpoint itself.
-    pub primary: PathBuf,
-    /// Tensors read from another checkpoint instead of the primary, in the
-    /// order the spec names them.
-    pub tensor_overrides: Vec<TensorOverride>,
-    /// The base checkpoint the recurrent gates are read from, when the primary
-    /// stores them below F32.
-    pub gate_donor: Option<PathBuf>,
+    /// The model pack.
+    pub pack: PathBuf,
     /// Adapters, as `(name, directory)`.
     pub adapters: Vec<(String, PathBuf)>,
 }
 
 impl WeightFiles {
-    /// A model loaded from one checkpoint and nothing else.
-    pub fn single(primary: impl Into<PathBuf>) -> Self {
+    /// A model loaded from its pack and nothing else.
+    pub fn single(pack: impl Into<PathBuf>) -> Self {
         Self {
-            primary: primary.into(),
-            tensor_overrides: Vec::new(),
-            gate_donor: None,
+            pack: pack.into(),
             adapters: Vec::new(),
         }
     }
 
-    /// The digest of the weights: SHA-256 over the tag `weights v1\0`, then
-    /// each part tagged with its role — `primary\0` and the primary's
-    /// [`gguf_fingerprint`]; per override `override\0<tensor>\0` and its
-    /// file's fingerprint; `gate-donor\0` and the donor's; per adapter
-    /// `adapter\0<name>\0`, then each regular file in its directory, by name,
-    /// as `<file name>\0` and its [`file_digest`].
+    /// The digest of the weights: SHA-256 over the tag `weights v2\0`, then per
+    /// source the pack records, in its order, `source\0<role>\0<sha256>\0`; then
+    /// per adapter `adapter\0<name>\0`, then each regular file in its directory,
+    /// by name, as `<file name>\0` and its [`file_digest`].
+    ///
+    /// **The sources, not the pack's bytes.** A pack is built per card — its
+    /// int8 mode and its sections' layout differ between machines — while the
+    /// model it holds does not, and a substrate written on one machine must open
+    /// on the others. Only the header is read, so this costs milliseconds.
     pub fn digest(&self) -> io::Result<[u8; 32]> {
+        let invalid = |e: candle::Error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {e}", self.pack.display()),
+            )
+        };
+        let header = ModelPack::read_header(&self.pack).map_err(invalid)?;
+        let sources = from_metadata(&header.metadata).map_err(invalid)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"weights v1\0");
-        hasher.update(b"primary\0");
-        hasher.update(gguf_fingerprint(&self.primary)?);
-        for o in &self.tensor_overrides {
-            hasher.update(b"override\0");
-            hasher.update(o.tensor.as_bytes());
+        hasher.update(b"weights v2\0");
+        for s in &sources {
+            hasher.update(b"source\0");
+            hasher.update(s.role.as_bytes());
             hasher.update(b"\0");
-            hasher.update(gguf_fingerprint(&o.path)?);
-        }
-        if let Some(donor) = &self.gate_donor {
-            hasher.update(b"gate-donor\0");
-            hasher.update(gguf_fingerprint(donor)?);
+            hasher.update(s.sha256.as_bytes());
+            hasher.update(b"\0");
         }
         for (name, dir) in &self.adapters {
             hasher.update(b"adapter\0");
@@ -90,81 +100,122 @@ fn adapter_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// A pack header holding `sources`, and `extra` metadata beside them — enough
+/// for [`WeightFiles::digest`], which reads nothing else.
+#[cfg(test)]
+pub(crate) fn write_pack_header(path: &Path, sources: &[SourceRecord], extra: &[(&str, Value)]) {
+    let mut entries: Vec<(String, Value)> = vec![(VERSION_KEY.to_string(), Value::U32(VERSION))];
+    entries.extend(to_metadata(sources));
+    entries.extend(extra.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    let refs: Vec<(&str, &Value)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let mut f = std::fs::File::create(path).unwrap();
+    gguf_file::write(&mut f, &refs, &[]).unwrap();
+    f.flush().unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::fs::File;
-    use std::io::Write;
+    use candle_transformers::models::model_pack::keys::INT8_MODE;
 
-    use candle::quantized::gguf_file::{self, Value};
-    use candle::quantized::{GgmlDType, QTensor};
-    use candle::{Device, Tensor};
-
-    fn write_gguf(path: &Path, values: &[f32]) {
-        let t = Tensor::from_slice(values, values.len(), &Device::Cpu).unwrap();
-        let q = QTensor::quantize(&t, GgmlDType::F32).unwrap();
-        let arch = Value::String("fixture".into());
-        let mut f = File::create(path).unwrap();
-        gguf_file::write(&mut f, &[("general.architecture", &arch)], &[("w", &q)]).unwrap();
-        f.flush().unwrap();
+    fn source(role: &str, sha: char) -> SourceRecord {
+        SourceRecord {
+            role: role.into(),
+            repo: "org/m".into(),
+            rev: "r1".into(),
+            file: format!("{role}.gguf"),
+            len: 4096,
+            sha256: sha.to_string().repeat(64),
+        }
     }
 
-    /// Each part of a model counts: an override's file, the donor and an
-    /// adapter's bytes each move the digest, and so does which tensor an
-    /// override replaces.
+    fn hex(d: &[u8; 32]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The digest of a fixed pack is a fixed value: the definition is pinned, so
+    /// a change to it shows here before it makes every substrate refuse its own
+    /// model.
     #[test]
-    fn every_file_a_model_is_made_of_moves_the_digest() {
+    fn a_fixed_packs_digest_is_a_fixed_value() {
         let dir = tempfile::tempdir().unwrap();
-        let primary = dir.path().join("trunk.gguf");
-        let head = dir.path().join("head.gguf");
-        let head2 = dir.path().join("head2.gguf");
-        write_gguf(&primary, &[1.0, 2.0]);
-        write_gguf(&head, &[3.0, 4.0]);
-        write_gguf(&head2, &[3.0, 5.0]);
+        let pack = dir.path().join("m.pack.gguf");
+        write_pack_header(&pack, &[source("checkpoint", 'a')], &[]);
+        assert_eq!(
+            hex(&WeightFiles::single(&pack).digest().unwrap()),
+            "173f3104b7bc4a947a9f8a3e6e838fc95cd7f8cda280677e13e861abf2035791",
+        );
+    }
 
-        let base = WeightFiles::single(&primary);
-        let d0 = base.digest().unwrap();
-
-        let with_head = WeightFiles {
-            tensor_overrides: vec![TensorOverride::new("output.weight", &head)],
-            ..base.clone()
+    /// Every source the model is made of counts — a different file under a role,
+    /// and the role a file plays — and so does an adapter's every byte.
+    #[test]
+    fn every_part_of_a_model_moves_the_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |name: &str, sources: &[SourceRecord]| {
+            let p = dir.path().join(name);
+            write_pack_header(&p, sources, &[]);
+            WeightFiles::single(p).digest().unwrap()
         };
-        let d1 = with_head.digest().unwrap();
-        assert_ne!(d1, d0);
+        let base = at("base", &[source("checkpoint", 'a')]);
+        let other_trunk = at("trunk", &[source("checkpoint", 'b')]);
+        let with_head = at(
+            "head",
+            &[
+                source("checkpoint", 'a'),
+                source("override:output.weight", 'c'),
+            ],
+        );
+        let as_donor = at(
+            "donor",
+            &[source("checkpoint", 'a'), source("gate-donor", 'c')],
+        );
+        assert_ne!(other_trunk, base);
+        assert_ne!(with_head, base);
+        assert_ne!(as_donor, with_head, "the role a file plays is part of it");
 
-        let other_head = WeightFiles {
-            tensor_overrides: vec![TensorOverride::new("output.weight", &head2)],
-            ..base.clone()
-        };
-        assert_ne!(other_head.digest().unwrap(), d1);
-
-        let other_tensor = WeightFiles {
-            tensor_overrides: vec![TensorOverride::new("token_embd.weight", &head)],
-            ..base.clone()
-        };
-        assert_ne!(other_tensor.digest().unwrap(), d1);
-
-        let with_donor = WeightFiles {
-            gate_donor: Some(head.clone()),
-            ..base.clone()
-        };
-        assert_ne!(with_donor.digest().unwrap(), d0);
-
+        let pack = dir.path().join("base");
         let adapter = dir.path().join("lora");
         std::fs::create_dir(&adapter).unwrap();
         std::fs::write(adapter.join("adapter_config.json"), b"{}").unwrap();
         std::fs::write(adapter.join("adapter_model.safetensors"), b"v1").unwrap();
         let with_adapter = WeightFiles {
+            pack: pack.clone(),
             adapters: vec![("style".into(), adapter.clone())],
-            ..base.clone()
         };
-        let d2 = with_adapter.digest().unwrap();
-        assert_ne!(d2, d0);
+        let d = with_adapter.digest().unwrap();
+        assert_ne!(d, base);
         std::fs::write(adapter.join("adapter_model.safetensors"), b"v2").unwrap();
-        assert_ne!(with_adapter.digest().unwrap(), d2);
+        assert_ne!(with_adapter.digest().unwrap(), d);
 
-        // And the digest is a function of the files: computed again, the same.
-        assert_eq!(base.digest().unwrap(), d0);
+        // And a function of the files: computed again, the same.
+        assert_eq!(WeightFiles::single(&pack).digest().unwrap(), base);
+    }
+
+    /// **A pack built for another card is the same model.** Its int8 mode and
+    /// layout are the card's, not the model's, so they leave the digest alone —
+    /// which is what lets one machine's substrate open on another's.
+    #[test]
+    fn what_a_card_decides_leaves_the_digest_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = [source("checkpoint", 'a')];
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        write_pack_header(&a, &sources, &[(INT8_MODE, Value::U64(1))]);
+        write_pack_header(&b, &sources, &[(INT8_MODE, Value::U64(2))]);
+        assert_eq!(
+            WeightFiles::single(&a).digest().unwrap(),
+            WeightFiles::single(&b).digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_pack_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.gguf");
+        std::fs::write(&path, b"plain text").unwrap();
+        let err = WeightFiles::single(&path).digest().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

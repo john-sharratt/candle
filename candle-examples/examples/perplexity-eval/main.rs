@@ -20,13 +20,17 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
+use std::path::Path;
+
 use candle::quantized::gguf_file;
 use candle::{Device, Result, Tensor};
+use candle_examples::model_pack::pack_checkpoint;
 use candle_transformers::model_overrides::{self, Checkpoint};
 use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
 };
 use candle_transformers::models::batched_model::BatchedInference;
+use candle_transformers::models::model_pack::PackFamily;
 use candle_transformers::models::rope_schedule::{DeclaredScaling, RopePreset, RopeSchedule};
 use candle_transformers::models::{
     quantized_llama, quantized_qwen2, quantized_qwen3, quantized_qwen3_moe,
@@ -292,11 +296,19 @@ fn gguf_rope_theta(content: &gguf_file::Content) -> Result<f32> {
 }
 
 impl Model {
-    fn load(arch: &ModelArch, model_path: &std::path::Path, device: &Device) -> Result<Self> {
+    /// `tokenizer_repo` is what a routed model's pack records with its
+    /// checkpoint, which it is built from on first use (`pack_checkpoint`).
+    fn load(
+        arch: &ModelArch,
+        model_path: &Path,
+        tokenizer_repo: &str,
+        device: &Device,
+    ) -> Result<Self> {
         match arch {
             ModelArch::Qwen3Moe => {
-                let m =
-                    quantized_qwen3_moe::ModelWeights::from_gguf_by_path(model_path, device, None)?;
+                let pack =
+                    pack_checkpoint(PackFamily::Routed, model_path, tokenizer_repo, None, device)?;
+                let m = quantized_qwen3_moe::ModelWeights::from_pack(&pack, device, None)?;
                 Ok(Model::Qwen3Moe(m))
             }
             _ => {
@@ -741,7 +753,7 @@ fn run_model_all_modes(
     // Baseline pass (none mode)
     if has_baseline {
         println!("\n  [{}] mode=none", family.name());
-        let model = Model::load(&family.arch(), &model_path, device)?;
+        let model = Model::load(&family.arch(), &model_path, family.tokenizer_repo(), device)?;
         let batched = BatchedModel::from_model(model, device)?;
         match eval_compressed(
             &batched,
@@ -774,7 +786,7 @@ fn run_model_all_modes(
             return Ok(results);
         }
         println!("\n  [{}] loading for compressed modes...", family.name());
-        let model = Model::load(&family.arch(), &model_path, device)?;
+        let model = Model::load(&family.arch(), &model_path, family.tokenizer_repo(), device)?;
         let batched = BatchedModel::from_model(model, device)?;
 
         for mode_arg in &compressed_modes {
@@ -983,7 +995,12 @@ fn main() -> anyhow::Result<()> {
                 println!("\n  === mode={} ===", mode_arg.label());
                 if matches!(mode_arg, CompressionArg::None) {
                     for (ri, &ctx) in args.sweep_contexts.iter().enumerate() {
-                        let baseline_model = Model::load(&family.arch(), &model_path, &device)?;
+                        let baseline_model = Model::load(
+                            &family.arch(),
+                            &model_path,
+                            family.tokenizer_repo(),
+                            &device,
+                        )?;
                         let baseline_batched = BatchedModel::from_model(baseline_model, &device)?;
                         match eval_compressed(
                             &baseline_batched,
@@ -1009,7 +1026,12 @@ fn main() -> anyhow::Result<()> {
                 let mode = mode_arg.to_inference_mode().unwrap();
                 for (ri, &ctx) in args.sweep_contexts.iter().enumerate() {
                     println!("  ctx={} mode={}", ctx, mode_arg.label());
-                    let model = Model::load(&family.arch(), &model_path, &device)?;
+                    let model = Model::load(
+                        &family.arch(),
+                        &model_path,
+                        family.tokenizer_repo(),
+                        &device,
+                    )?;
                     let batched = BatchedModel::from_model(model, &device)?;
                     match eval_compressed(&batched, mode, &tokens, Some(ctx), ctx, &device) {
                         Ok((nll, count)) => {
@@ -1127,7 +1149,12 @@ fn main() -> anyhow::Result<()> {
         model_family.gguf_filename(),
     )?;
     println!("Loading model from {:?}...", model_path);
-    let model = Model::load(&model_family.arch(), &model_path, &device)?;
+    let model = Model::load(
+        &model_family.arch(),
+        &model_path,
+        model_family.tokenizer_repo(),
+        &device,
+    )?;
     println!("Model loaded.");
 
     let stride = args.stride.unwrap_or(args.context_size);
