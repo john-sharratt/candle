@@ -250,7 +250,7 @@ daemon code reports it outside logs.
 | D15 | **Maintenance runs as admin commands on members, from the gateway page**: drain, restart, shutdown, compact, maintain, audit, catch-up, resync and others (§12.4). **Ctrl-C runs `shutdown`**: drain, wait for the outbox, flush, close; a second Ctrl-C aborts. They are routes on the member, so they work through the cluster and on a member's own listener alike. | Maintenance without SSH or launch-line juggling; every command is logged with who ran it. |
 | D16 | **Gateways peer with each other** over group-key-authenticated sockets. They share ACME challenges, issued certificates and keys, and the order ledger. Rendezvous over the connected gateways names who orders each site, with no consensus; a gateway partition can cost one duplicate certificate. They refuse to peer when their session keys or OAuth clients differ (§13.4). Peer links carry nothing else: no requests, members or claims (§4.3). | Active-active gateways answer the same names: any of them must answer a challenge and serve the certificate, and a cookie from one must work on the other. A duplicate order is harmless within the CA's limits, so it is not worth a Paxos group among gateways. |
 | D17 | **Every member holds a full copy, with no encryption at rest beyond what the disk provides; this design includes no backup and no key rotation** (§16). | Kept simple by decision. Replication is not backup: a mistake replicates. |
-| D18 | **A/B upgrades.** A higher build loads untouched. Once ready, it is certified against the older members, on a share of live traffic and on mirrored calls to read-only routes, compared statistically. Its binaries and UI are distributed to the older members, resumably and peer to peer. At the grace deadline, if certified, the members upgrade themselves one at a time: drain, swap the binary at the same path, relaunch with the same arguments in the same working directory, with the old process as watchdog. A failed certification faults the candidate and aborts the upgrade (§3.8, §3.9). | Upgrading the estate is building one machine. A bad build is caught on a sliver of traffic before it replaces anything, and a bad install puts itself back. |
+| D18 | **A/B upgrades.** A higher build loads untouched. Once ready, it is certified against the older members, on a share of live traffic and on mirrored calls to read-only routes, compared statistically. Its binaries and UI are distributed to the older members, resumably and peer to peer. At the grace deadline, if certified, the members upgrade themselves one at a time: drain, swap the binary at the same path, relaunch with the same arguments in the same working directory, watched by a separate watchdog process that loads no model, so the old daemon has exited and released its VRAM before the new one loads. A failed certification faults the candidate and aborts the upgrade (§3.8, §3.9). | Upgrading the estate is building one machine. A bad build is caught on a sliver of traffic before it replaces anything, and a bad install puts itself back. |
 | D19 | **A local build** — commits not on `origin/main`, or uncommitted edits, measured exactly by the build's `local` digest — **serves its own listener locally and never takes part in upgrades**: never a candidate, never auto-installed, never closed for being behind. Otherwise it is a full member: its writes replicate, the gateway routes to it, it holds leases and votes (§3.10). | Work-in-progress can be tested on a cluster machine through its own port, while the gateway and the upgrade machinery carry on untouched. |
 | D20 | **Every member keeps its last *N* builds** (`--keep-builds`, default 5), **and an admin can force any build onto an app from any member that holds it** (`rollout`, §3.11). A forced rollout skips grace and certification, moves the floor in either direction, and is a Paxos decision, so every gateway applies it. A downgrade rejects the builds it leaves. A build is installed only where it can open the member's substrate: same log format, every record type known, same model (§3.9). | Rolling back is a swap from each member's own disk, with no transfer, so it is as fast as a restart. Deciding by Paxos keeps active-active gateways and a restarted gateway on the same rollout. The checks keep a downgrade from hiding, and then compacting away, data an older build cannot read. |
 
@@ -3221,94 +3221,287 @@ The total is 19 s.
 
 ## 15. Build order
 
-1. **`cluster` crate.** The codec, multiplexer, handshake, backoff, receipts and the
-   unsent / in-flight tracker, the applied-set packing, rendezvous, claims and dispatch
-   types. The build version is in its `build.rs`. Unit
-   tests and H1, H2, H5 and H7 come with it.
-2. **Gateway.** The `/v1/cluster/:app` endpoint, membership, build floor and model lock.
-   The `cluster:` key on routes, with dumb and clustered modes and the switch between
-   them (§5.7), with the `x-tokera-hop: dumb` mark on every request proxied to a
-   configured upstream (§5.8). The transport swap in `proxy::forward`. Dispatch, the
-   claim table and aggregates. `RECEIPT`s, and picking a catch-up answerer round robin.
-   One session per node, a newer one replacing the old (§3.3). The lagging state in
-   place of closing a slow member (§4.4). Failing in-flight exchanges when a socket
-   drops (§5.6). Then queues and counters, then the status page
-   with its commands (§12.4), and `drain-gateway`. H3, H6 and H8.
-3. **Members.** `--cluster` (repeatable), one socket per app per cluster,
-   `ClusterListener` into `host::server`, `ClusterPeer` trust, forwarding the own
-   listener up while joined and serving locally while cut off or when the dumb-mode mark
-   is set, and starting cut off when no cluster answers (§5.8), `Dispatch` on
-   every route, `CAPACITY`, claims, the `connecting` and `catchup` loading steps, the
-   `cluster` status block, fault mode (§7.7), and the maintenance command routes, with
-   zend's maintenance route moved into the host (§12.4). `shutdown_signal` runs the
-   drain-first shutdown under `--cluster`. The aggregate-aware perf and loading UIs.
-4. **Substrate**, starting with the **order-independence** test (§14.1) and built until it
-   passes:
-   - **Identity.** The header's `origin`, `oseq`, `gen`, `hlc`, `epoch` and `digest`;
-     `Provenance`; `Replica` and the location index; node re-minting on a copied
-     directory (§3.7); the `TimelineId` format and passthrough timeline ids.
-   - **Apply.** Every apply rewritten to §6.5's rules: stamped maxes, the pending-parent
-     map, dominating tombstones, their expiry into the `Deleted` record and the deleted
-     set's entries in catch-up headers (§6.8), section generations, and the deferred set
-     for record types the build does not decode. The stream
-     index keyed `(stream_id, origin)`, with a timeline's turns in stamp order and
-     `turn_stream_id` lookups resolved to the turn at that index; VFS keys carry the
-     origin. Detached events, the rejoin's catch-up-then-take-a-generation order and
-     the local `Rebase` (§6.7), and the drain-and-reload when a turn arrives ranked
-     below one held (§6.6). All of it in the persistence layer
-     and the substrate's indexes, none of it on the hot path.
-   - **Remote turns.** Applied by the cluster client under the substrate write lock, with
-     `adopt_remote_turn` on complete turns only;
-     incomplete remote turns pending, never `Corrupt`; repair tombstones local.
-   - **Emission.** The tap with round-robin and request-bound emission, reading events
-     back through the index for retransmit, and `WriteTicket`.
-   - **Catch-up.** Coverage-honest headers out of the log, the `digest` compare, windowed
-     fetches, `reply_to` addressing, `high_water` gap detection, and `Replica` as the
-     persisted position.
-   - **Recovery.** The full resync after a restart, and the one-time origin compaction.
+**This section is the anchor for building the design.** The work is ten chunks, in
+dependency order:
 
-   H4 covers this phase.
-5. **Consensus** (§5.9). Paxos among the members in the `cluster` crate, with the
-   gateways relaying its frames: durable acceptor state in the preallocated vote journal
-   (`substrate/VOTES`), leases
-   and decisions, `cluster/max_members` with automatic raises, the
-   `--cluster-quorum-max` flag and `PUT /v1/cluster/quorum`, the randomised backoff
-   after a `NACK`, and the generation decisions `gen/<k>` a rejoin takes (§6.7). Until
-   this step lands, step 4's rejoin cannot take a generation, so step 4's tests drive
-   the decision through a test double of this service. H7.
-6. **npcd worlds.** World state as per-entity state records in place of the three
-   whole-world CustomObjects, and `PULSE` for transients (§9.1). The world lease on §5.9,
-   and the authority's term handling (§9.2). NPC leases lent by the authority, and acts
-   forwarded to it (§9.3). Disconnected mode (§9.4). Handover and routing (§9.6).
-7. **Agents.** `tokera-agent` and the job API. zend's executor goes through agents under
-   `--cluster`, and so do the git writers.
-8. **File state.** zend uploads into VFS. npcd gets operation stores read and written by
-   every step's mission and by the table's checks; the bench committing into them; the
-   removal of `held_drafts`, `Operation::before` and the on-disk set-aside and restore,
-   with `on-failed` taking `discard` or `keep`; the workflow format's step `desk`, the
-   `publish` step with its `published` check, and the load rule that only a publish step
-   leads to `done`; the `vault-archive` floor and merge table with `merge_status`,
-   `merge_publish` and `merge_sync`, which marks conflicts for the Maker to resolve at the
-   bench; `retry_at` and the 30-minute retry of an unreachable publish; publishing in
-   disconnected mode through the in-process agent; authoring stores and Publish; accounts
-   as CustomObjects; and images as `Blob` records.
-9. **A/B upgrades** (§3.8, §3.9). `--build-info` on every binary; the loading gate on
-   the grace period; certification at the gateway (live share, mirror modes on every
-   route, the statistics, `VERDICT` frames and the candidate's `certify/<app>/<build>`
-   decision); `BUILD_OFFER` / `FETCH` / `CHUNK` / `HAVE` with resumable part files; the
-   one-at-a-time install under `upgrade/<app>`, the in-place swap, the
-   `--upgrade-watchdog` process and the relaunch through `LaunchSpec`, and the restore;
-   the upgrading state for members admitted below the floor (§3.5); the upgrade
-   commands and status block. Kept builds in `builds/` with
-   `--keep-builds`, the build compatibility checks, and forced rollouts and rollback
-   (§3.11) as `rollout/<app>/<n>` decisions.
-10. **Deployment.** `docs/deployment.md`: the group key on each machine, and `--cluster`
-   for every gateway on every daemon and agent. The `cluster:` keys on `web.yaml`'s
-   zend and npcd routes, which keep their upstream URLs for dumb mode. A second gateway
-   behind the public names, with `cluster.peers` on each, the same `session.key` and
-   OAuth client, and gateway peering (§13.4) built before it: challenge sharing,
-   certificate push, the shared ledger and the rendezvous orderer with
-   `ACME_ORDERING`.
+- **Foundation first.** Chunks 1–3 depend on nothing else in this design, touch nothing
+  that serves traffic, and can be built in parallel. Each is proven by CPU-only tests on
+  its own before anything is built on it.
+- **Every later chunk builds only on chunks already finished**, and ends at an exit bar
+  that is a test result, not a judgement.
+- **Nothing is half-built.** A chunk lands complete, or it does not land (`CLAUDE.md`).
+
+| Chunk | Builds on | Deliverable |
+|---|---|---|
+| 1. Substrate identity and order-independent apply | — | every log replays the same in any order; two substrates converge in-process |
+| 2. The wire protocol | — | the `cluster` crate's frames, multiplexer and handshake |
+| 3. Consensus | — | Paxos leases and decisions over an abstract transport |
+| 4. Members behind the gateway, without replication | 2 | **the first deployable milestone** |
+| 5. Live replication | 1, 3, 4 | two members sharing conversations |
+| 6. Operating the cluster | 5 | fault mode, maintenance, drain, the full status page |
+| 7. npcd worlds | 3, 5 | worlds and characters across members |
+| 8. Agents and file state | 1 (operation stores), 4 (agents over the cluster) | agents, VFS uploads, npcd operation stores and publishing |
+| 9. Builds | 3, 4 | certification, distribution, install, rollouts |
+| 10. The second gateway and the migration | everything | active-active gateways; today's deployment moved over |
+
+### Chunk 1: substrate identity and order-independent apply
+
+**In `candle-conversation` only.** No socket, no gateway, no host change. This chunk is
+first because everything that replicates rests on it, and because it is the riskiest:
+it changes how *every* log is replayed, today's single-machine ones included.
+
+- **Identity (§6.2, §3.7).**
+  - The header's `origin`, `oseq`, `gen`, `hlc`, `epoch` and `digest`, preserved
+    through relocation, re-emission and `compact()`.
+  - `Provenance` on `append_record`.
+  - `substrate/NODE`, with re-minting on a copied directory.
+  - `Replica` (tag 28), with the applied set and the `(origin, oseq)` location index.
+  - The `TimelineId` format, passthrough timelines as `hash(conversation_key)`, and VFS
+    keys carrying the origin.
+- **Apply (§6.5).** Every apply path rewritten to the rules:
+  - stamped maxes, with `Label` merged per field and `Commit` as a max;
+  - the pending-parent map;
+  - dominating tombstones;
+  - section generations;
+  - the stream index keyed `(stream_id, origin)`, with a timeline's turns in stamp order
+    and `turn_stream_id` lookups resolved to the turn at that index. The 34 call sites
+    are untouched;
+  - the deferred set for record types the build does not decode.
+- **Tombstone expiry (§6.8).** The `Deleted` record (tag 31), and expiry after a
+  complete compaction and *N* days.
+- **Remote records (§6.5).** Applying a record from another origin under the substrate
+  write lock:
+  - `adopt_remote_turn` for complete turns only, with incomplete remote turns pending,
+    never `Corrupt`;
+  - repair tombstones kept local;
+  - the duplicate, dominated and content-equal skips.
+- **Generations, locally (§6.7).** Detached events at ⊤ and the local `Rebase` (tag 30).
+  The generation number itself comes through a `MintGeneration` trait. Chunk 5 plugs
+  chunk 3's decision into it; here the tests use an in-process minter.
+- **The one-time origin compaction** that adopts a substrate written before this design
+  (§6.2).
+
+**Tests.**
+- The order-independence permutation test, and the apply, identity and
+  tombstone-expiry tables (§14.1).
+- **A two-substrate convergence harness.** Two substrates in one process write
+  conversations, sections, tombstones and VFS events. Every record of each is shipped to
+  the other in a random order, with duplicates and a reopen part-way through. The test
+  asserts the two end byte-identical in every index, value, stamp and turn order.
+
+**Exit.**
+- The permutation test and the convergence harness pass.
+- **Every existing `candle-conversation`, zend and npcd test is still green**, and the
+  model gates and engine probes pass under `/sweep` — the apply rewrite runs on every
+  log at open.
+- A copy of the live zend substrate opens through the one-time origin compaction and
+  reopens to the same turns, labels and conversations.
+
+### Chunk 2: the wire protocol
+
+**The new `cluster` crate**, with no CUDA and nothing wired into the gateway or a host.
+
+- The frame codec, every kind of §4.1.
+- The three-lane writer, with per-stream credit and `WINDOW` (§4.2).
+- Virtual connections as `AsyncRead + AsyncWrite`, with `OPEN`, `DATA`, `FIN` and
+  `RESET`.
+- The handshake, with HMAC proofs and the direction labels (§3.3).
+- Reconnect backoff (§3.2).
+- The frame counter and `RECEIPT` tracking, and the unsent / in-flight / received states
+  of §6.3, as data structures.
+- Applied-set packing for `CATCHUP` and `HAVE` (§7.5).
+- `EVENT` fragmentation and reassembly.
+- The build version: `count`, `hash` and `local`, from its `build.rs` (§3.5).
+
+**Tests.**
+- Unit tests asserting exact bytes for every frame, the proofs, the backoff schedule and
+  the packing.
+- H1 (codec) and H2 (multiplexer), and the handshake half of H5, over in-memory pipes.
+
+**Exit.** Every frame round-trips byte-exact. A truncated or unknown frame is refused.
+1,000 streams and a 63 MB event share one pipe within H2's bounds.
+
+### Chunk 3: consensus
+
+**Paxos in the `cluster` crate (§5.9)**, over an abstract transport, with no gateway.
+
+- Leases and one-time decisions, with durable acceptors in the preallocated vote journal
+  (`VOTES`, written in place to alternating halves).
+- Lease terms counted on the monotonic clock, and the restart rule.
+- `max_members` with automatic raises and stamped sets, and the quorum.
+- The randomised backoff after a `NACK`.
+- Rendezvous (§9.5).
+
+**Tests.**
+- The consensus, lease, quorum and rendezvous tables (§14.1).
+- H7, against a simulated network that drops, duplicates, reorders and partitions
+  frames, with members restarting mid-round.
+
+**Exit.** Across every interleaving the tests drive, no decision ever changes, no two
+lease holders overlap, and a minority decides nothing. A vote survives a torn write.
+
+### Chunk 4: members behind the gateway, without replication
+
+**Builds on chunk 2.** The gateway and the hosts learn to carry API traffic over the
+socket. Nothing replicates yet.
+
+- **Gateway (§3.1–§3.6, §5).**
+  - The `/v1/cluster/:app` endpoint and admission: proofs, the build floor on `count`
+    alone (§3.5), the model lock, the clock-skew check, and one session per node.
+  - The `cluster:` key on routes, dumb and clustered modes, and the `x-tokera-hop: dumb`
+    mark.
+  - The transport swap in `proxy::forward`, dispatch on every route, claims, aggregates
+    and UI pinning.
+  - Failing in-flight exchanges when a socket drops (§5.6).
+- **Members (§3.2, §5.1, §5.8).**
+  - `--cluster`, `--cluster-name` and `--group-key`, with one socket per app per
+    cluster.
+  - `ClusterListener` into `host::server`, and `ClusterPeer` trust.
+  - `Dispatch` on every route, and `CAPACITY`.
+  - The member's own listener: forwarding up when joined, serving locally when cut off or
+    when the dumb-mode mark is set, and starting cut off when no cluster answers.
+  - The `connecting` loading step and the `cluster` status block.
+- **A first status page (§12).** The Apps and Members blocks, Refusals and Traffic,
+  and the coordination log.
+
+**Tests.** The close-code, backoff, model-lock, UI-pinning, dispatch, mode, claim,
+socket-drop and own-listener tables (§14.1); H5 and H6.
+
+**Exit, and the first deployment.** One member per app behind the gateway behaves
+exactly as today's fixed upstream, and a second member of an app takes routed traffic.
+That configuration can go live and be watched before anything replicates.
+
+### Chunk 5: live replication
+
+**Builds on chunks 1, 3 and 4.**
+
+- **Emission (§6.3, §6.4).** The tap, round-robin and request-bound emission,
+  `WriteTicket`, and reading owed events back through the location index.
+- **The relay (§4.3).** `RECEIPT`s, retransmit on a dropped socket, and the lagging state
+  (§4.4).
+- **Apply on arrival**, through chunk 1.
+- **Catch-up (§7).** Headers first with coverage-honest ranges, the `digest` compare,
+  windowed fetches, `reply_to` addressing, `high_water` gap detection, deleted-set
+  entries in gone headers, and the full resync after a restart.
+- **The `catchup` loading step**, and readiness gating clustered mode (§7.2, §7.6).
+- **Cut-off and rejoin (§6.7).** The generation comes from chunk 3's `gen/<k>` decision.
+  The rejoin waits for a quorum. A turn arriving ranked below one held makes the member
+  drain and reload (§6.6).
+
+**Tests.** The emission, retransmit, catch-up, full-resync, cluster, generation and
+lagging tables (§14.1); H3, H4 and H8.
+
+**Exit.** Two zend machines behind one gateway share conversations: either serves any of
+them, a conversation moves between them with its K/V intact, and a machine cut off and
+reconnected ends byte-identical to the other.
+
+### Chunk 6: operating the cluster
+
+**Builds on chunk 5.**
+
+- Fault mode for a full disk, with voting from the vote journal (§7.7).
+- The maintenance commands and their job stream (§12.4), with zend's maintenance route
+  moved into the host.
+- Ctrl-C draining first.
+- `COORD` and every status-page block (§12.1–§12.3).
+- The quorum admin call.
+
+**Tests.** The fault-mode, command, quorum and status-page tables (§14.1).
+
+**Exit.** A member whose disk fills stays connected and voting and recovers without
+help. Every command runs through the gateway and on a member's own listener alike.
+
+### Chunk 7: npcd worlds
+
+**Builds on chunks 3 and 5.**
+
+- World state as per-entity state records in place of the three whole-world
+  CustomObjects, and `PULSE` for transients (§9.1).
+- The world lease, and the authority's term handling (§9.2).
+- NPC leases spread by rendezvous, and acts forwarded to the authority (§9.3).
+- Disconnected mode (§9.4).
+- Handover and routing (§9.6).
+
+**Tests.** The world-state, NPC-lease and disconnected-mode tables (§14.1), with npcd
+running against two in-process members.
+
+**Exit.** A world keeps one authority across a member's loss and a partition, its
+characters run on the machines rendezvous lends them to, and a disconnected world
+rejoins without corrupting the authoritative one.
+
+### Chunk 8: agents and file state
+
+**Agents build on chunk 4.** **The npcd operation stores need only chunk 1**, because
+they work on one machine with no cluster at all, so they can be brought forward when the
+npcd work wants them sooner.
+
+- **Agents (§11).**
+  - `tokera-agent` and the job API.
+  - `tokerad --agent`, and the in-process agent a cut-off member reaches.
+  - zend's executor and git writers going through agents under `--cluster`.
+- **zend (§10.1, §10.2).** Uploads as VFS events.
+- **npcd (§10.3).**
+  - Operation stores read and written by every step's mission and by the table's checks,
+    and the bench committing into them.
+  - The removal of `held_drafts`, `Operation::before` and the on-disk set-aside and
+    restore, with `on-failed` taking `discard` or `keep`.
+  - The workflow format's step `desk`, the `publish` step with its `published` check,
+    and the load rule that only a publish step leads to `done`.
+  - The `vault-archive` floor and merge table, with `merge_status`, `merge_publish` and
+    `merge_sync`, and conflicts solved at the bench.
+  - `retry_at` and the 30-minute retry of an unreachable publish, including from a
+    disconnected world.
+  - Authoring stores and Publish, accounts as records, and images as `Blob` records.
+- **§10.4.** Ingest once, deduplicated by unit.
+
+**Tests.** The VFS-scoping and agent-selection tables (§14.1), with a local git
+repository standing in for `origin`.
+
+**Exit.** An npcd story written, read, reviewed and checked reaches the mind repository
+only through its publish step, and a conflict is solved at the bench. A zend tool runs on
+an agent.
+
+### Chunk 9: builds
+
+**Builds on chunks 3 and 4.** Chunk 2 already stamps every binary with its version, and
+chunk 4 already enforces the floor. This chunk is the machinery on top:
+
+- `--build-info` with its compatibility fields (§3.9).
+- The loading gate on the grace period.
+- Certification at the gateway: the live share, the mirror modes on every route, the
+  statistics, and `VERDICT` with the candidate's `certify/<app>/<build>` decision (§3.8).
+- Distribution with resumable part files.
+- The one-at-a-time install under `upgrade/<app>`, the in-place swap, the
+  `--upgrade-watchdog` process, and the restore.
+- Kept builds in `builds/` (§3.9).
+- The upgrading state for members admitted below the floor (§3.5).
+- Forced rollouts and rollback as `rollout/<app>/<n>` decisions (§3.11).
+- Local builds (§3.10).
+- The Upgrades block and its commands.
+
+**Tests.** The build-floor, build-identity, local-build, certification, distribution,
+install, kept-build, compatibility and forced-rollout tables (§14.1). The process spawn
+is asserted on, never run.
+
+**Exit.** A pushed build rebuilt on one machine certifies, reaches the others, and
+installs itself one member at a time. A bad install restores itself, and a rollback swaps
+from each member's own disk.
+
+### Chunk 10: the second gateway and the migration
+
+**Builds on everything.**
+
+- Gateway peering: challenge sharing, certificate push, the shared ledger and the
+  rendezvous orderer with `ACME_ORDERING` (§13.4).
+- `docs/deployment.md`: the group key on each machine, `--cluster` for every gateway on
+  every daemon and agent, the `cluster:` keys on `web.yaml`'s routes, and a second
+  gateway behind the public names with the same `session.key` and OAuth client.
+- The migration of today's deployment (§15.1).
+
+**Tests.** The gateway-peering table (§14.1), against a local test double of the ACME CA.
+
+**Exit.** Two gateways serve the same names, either one's loss costs only its requests
+in flight, and today's zend and npcd run as members with their histories intact.
 
 ### 15.1 Migrating today's deployment
 
