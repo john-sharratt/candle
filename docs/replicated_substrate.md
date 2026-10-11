@@ -1440,7 +1440,8 @@ round.
    as a replicated record, so every member reads the decision from its substrate. The
    record is a `CustomObject` keyed `cluster/<key>` (`record.rs:1027-1040`), so it needs
    no new record type. Paxos guarantees one value per key, so two members that both
-   write the decision write the same value, and the copies are content-equal (§6.5).
+   write the decision write the same value; the key holds the greater stamp, which every
+   member agrees on (§6.5).
 
 **Leases add a term.** A lease value is `(holder, ttl)`.
 
@@ -1703,16 +1704,34 @@ replaying it at the next start meets records in an order no writer chose.
      wanted, and its first catch-up fetches them from a member that holds them. The
      origin always does.
 1. **Duplicate:** `(origin, oseq)` is already in the applied set. Skip without writing.
-2. **Dominated:** a tombstone covers the record's timeline or turn here. Skip it, and
-   mark it applied.
-3. **Content-equal:** the record's key is live here with the same `digest` (§6.2). Skip
-   it, and mark it applied. This catches the same record re-sent under a different
-   path, never two members' prefills of one section: those differ in their bytes
-   (§1.3), and both are kept, the greater stamp read.
+2. **Dominated:** a tombstone covers the record's timeline or turn, or its section
+   generation has ended, here (`Substrate::dominates`). Skip it, and mark it applied.
+   - **A turn's declaration is the exception: it is written, dead at read.** It is the
+     one record of a turn that names the timeline; a turn stream's own records name
+     only their stream. Written, it makes every record of the stream arriving after it
+     dominated too. Skipped, those records would arrive as records of no timeline and
+     be kept for a declaration that never comes (§6.8).
+   - A stream's own record arriving *ahead of* its declaration cannot be judged, and is
+     written. The declaration's arrival makes it dead at read like the rest.
+3. **Superseded:** the value the record sets is held here under a greater stamp
+   (`Substrate::outranks`). It would lose on arrival and be dropped by the next
+   rewrite, so skip it and mark it applied. The test is the stamp, never the `digest`:
+   two copies of the same bytes under different stamps are two values, and every member
+   must hold the greater. A third record ranked between them wins against one and loses
+   against the other, so members that kept different stamps for one value would
+   diverge on it. A `Label` merges field by field and a `Commit` takes the greatest
+   mark, so neither is ever superseded whole; a set insert never is.
 4. **Otherwise** verify the `digest`, and the golden or CRC (`record.rs:550`), then
    append it locally as `Remote`, with padding added back and every header field kept.
    That gives it a local location. A record that fails verification is refused and
    fetched again.
+
+A record is also refused, never written and never applied, when it carries no identity,
+when it is a type that never leaves its writer (§6.1: `HeaderIndex`, `ModelKey`,
+`Tokenizer`, `Template`, `BranchCheckpoint`, `Replica`, `Deleted`), or when it is this
+member's own record past every `oseq` it issued — another member holding what this one
+lost. The member's clock observes every record it applies or skips, so what it writes
+next ranks above it (`persistence/remote/`).
 
 **Taking the substrate lock.** Apply takes the substrate write lock once per batch and
 never nests a read inside a held guard. Windows SRW locks deadlock on that
@@ -1722,14 +1741,23 @@ never nests a read inside a held guard. Windows SRW locks deadlock on that
 
 - **Index state.** The record goes through `apply_walker_entry` (`substrate.rs:5070-5226`),
   rewritten to the rules above. It already works on a live substrate.
-- **Turns.** A new `Substrate::adopt_remote_turn` creates the turn entry once the turn is
-  **complete**: its `StreamDecl`, its `Tokens`, and every `Chunk` the decl's block range
-  calls for (`n_layers × (block_end − block_start)`, the count
+- **Turns.** The batch adopts each turn it completed (`persistence/remote/adopt.rs`)
+  once the turn is **complete**: its `StreamDecl`, its `Tokens`, and every `Chunk` the
+  decl's block range calls for (`n_layers × (block_end − block_start)`, the count
   `persistence/resume.rs:524-531` checks), in any order of arrival. A `Commit` is not
-  enough on its own.
-  - The turn goes in the slot its stamp gives it in the timeline's order (§6.6). A gap
-    below is filled with placeholders, as reconstruction already does
-    (`projection/resolver.rs:2768-2797`).
+  enough on its own. A turn whose declaration claims no K/V — a summary node — holds
+  nothing more than its declaration, and a distilled timeline's turns were shed on
+  purpose, so either is complete as declared (`persistence/remote/completeness.rs`).
+  - The turn goes in the slot its stamp gives it in the timeline's order (§6.6). A
+    position below it that holds nothing is a **gap**: an empty placeholder the
+    substrate records as one (`substrate/turn_placement.rs`). Reconstruction fills a
+    lost declaration's position with a gap too.
+  - **A turn that completes later takes its gap in place.** Catch-up delivers a
+    timeline's turns in any order, so turn *N + 1* is often adopted before turn *N*;
+    filling *N*'s gap moves no index, and needs no reload. Only a turn ranked below a
+    turn this member *holds* — one that moves it — does (§6.6): the declaration's
+    placement reports the positions it moved turns off, and a held turn among them
+    flags the batch for a reload, which then adopts nothing.
   - Its residence is created **cold**: the cold refs point at the local copies, and K/V
     loads on first use through the existing `elevate_to_hot`. Tree metadata, the gallery
     epoch and the summariser queue are touched as `restore_turn` touches them.
@@ -1739,10 +1767,15 @@ never nests a read inside a held guard. Windows SRW locks deadlock on that
   turn whose pieces are still arriving that would be fatal, and the tombstone would
   replicate.
   - So a remote turn short of pieces, at runtime or at open, is *pending*: it is left
-    out of the projection, and its missing `oseq`s are wanted by the next catch-up.
-  - Integrity repair tombstones stay what they are, a local judgement about local bytes.
-    They are written `Housekeeping`, never replicated, and a member repairs a corrupt
-    turn by fetching it again.
+    out of the projection, its position holds a gap, and its missing `oseq`s are wanted
+    by the next catch-up. A remote turn whose records are all here but unreadable is
+    the same: this member's bytes are at fault, not the conversation, and a tombstone
+    here would refuse the copy that repairs it.
+  - Integrity repair tombstones stay what they are, a local judgement about this
+    member's own turns. They are written `Housekeeping` — with no identity
+    (`write_repair_tombstone`, `write_repair_turn_tombstone`), so no `oseq` is spent on
+    them and no member is ever sent one — and a member repairs a corrupt remote turn by
+    fetching it again.
 - **Sections.** A remote section becomes a cold section residence the same way, under
   its live generation.
 
@@ -3246,7 +3279,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | disconnected mode | a cut-off member's characters keep acting on each other in a local world; no world-state record is written while cut off; the characters' turns are written as detached events; on reconnect the local world is scrapped and reloaded from state records; an operation finished in the local world publishes through the member's in-process agent, and without one waits 30 minutes and tries again; a publish landed while disconnected is kept on reconnect, and the authoritative world's copy of the operation carries on |
 | rendezvous | ownership is deterministic, minimal movement on joins and leaves, and the weighted share tends to the weights |
 | **order independence** (`candle-conversation`, CPU substrate) | **the central test.** Generated event sets cover every record type, two and three origins, competing writes to one key, tombstones before and after their targets, children before parents, section generations ended and restarted, two writers' turns at one index, and events with fixed generations from a cut-off member. **Every permutation** of each set (exhaustive up to 7 events, 5,000 seeded random shuffles beyond) is applied to a fresh substrate, and the resulting state — every index, value, stamp, tombstone, lease and turn order — is byte-identical across all of them. The same holds after a compaction and a reopen part-way through. |
-| apply (`candle-conversation`, CPU substrate) | a record of an unknown type is neither written nor marked applied, goes in the deferred set, and is not asked for by a catch-up; a build that knows the type moves it back to wanted on open, and its first catch-up fetches it; duplicates are not written; dominated records are not written; a same-`digest` record is skipped; a record failing its `digest` is refused; a turn is adopted only when complete, and an incomplete remote turn is pending, never `Corrupt`, at runtime and at open; repair tombstones are never replicated; placeholders fill gaps; a child record waits for its parent and is applied when it comes; `Commit` takes the max; a timeline tombstone survives compaction and kills a record arriving after it |
+| apply (`candle-conversation`, CPU substrate) | a record of an unknown type is neither written nor marked applied, goes in the deferred set, and is not asked for by a catch-up; a build that knows the type moves it back to wanted on open, and its first catch-up fetches it; duplicates are not written; dominated records are not written, but for a turn's declaration, which is written dead and dominates its stream's later records; a record ranked below the value held is skipped, whatever its `digest`; a record failing its `digest` is refused; a turn is adopted only when complete, in every order of arrival, and an incomplete remote turn is pending, never `Corrupt`, at runtime and at open; repair tombstones carry no identity and are never replicated; placeholders fill gaps, and a turn completing later takes its gap without a reload; a turn ranked below a held turn flags a reload; a child record waits for its parent and is applied when it comes; `Commit` takes the max; a timeline tombstone survives compaction and kills a record arriving after it |
 | tombstone expiry | a tombstone record is kept by every compaction until a complete `compact()` has finished after it **and** its `hlc` is more than *N* days old, and is then replaced by its entry in the `Deleted` record; neither condition alone shrinks it; with paused time, a record for a deleted timeline arriving a year after expiry dies in every arrival order, and a register of that timeline leaves it dead; a keyed entry kills lower-stamped writes and yields to a greater stamp; a catch-up's gone header for an expired tombstone carries its entry, and a member returning after any absence drops the timelines it names and its unsent writes to them die everywhere; `Deleted` survives compaction and reopen byte-exact |
 | identity | the `TimelineId` layout and monotonicity; `hlc` is monotonic and passes every `hlc` seen; `(origin, oseq)`, stamp and `digest` preserved through relocation, re-emission and `compact()`; the applied set and the location index rebuild from the last `Replica` plus the walk; a substrate copied to another directory or machine re-mints its node; passthrough timelines are `hash(conversation_key)` |
 | VFS scoping | the writer's, reviewer's and checker's missions of one operation see one store, and a draft written in one step is read in the next, on another in-process member too; two operations over one base see different files; a character with no mission reads the tip; the table's reading and checks read the store; nothing an operation writes reaches the mind folder before its publish step; a failed run's store is discarded under `discard` and kept under `keep`, and `reopen` resumes a kept one; a workflow with a route to `done` from anything but a publish step is a load error; a clean publish lands the store and settles the run `done`; a conflict refuses the publish with the paths named, `merge_sync` marks the overlapping hunks in the store, and once the Maker has resolved and committed them at the bench the publish lands and the run settles `done` without going back through verification; the `published` check holds the step open until then; a Maker that reports `stuck` hands the step to another; publishing the same text twice merges as a no-op; in disconnected mode a step's edits write no `VfsEvent`; with `origin` or every agent unreachable, a publish settles nothing, counts toward neither send-backs nor stuck, and under paused time is offered again exactly 30 minutes later with the store intact |
@@ -3332,7 +3365,7 @@ it changes how *every* log is replayed, today's single-machine ones included.
   - `adopt_remote_turn` for complete turns only, with incomplete remote turns pending,
     never `Corrupt`;
   - repair tombstones kept local;
-  - the duplicate, dominated and content-equal skips.
+  - the duplicate, dominated and superseded skips.
 - **Generations, locally (§6.7).** Detached events at ⊤ and the local `Rebase` (tag 30).
   The generation number itself comes through a `MintGeneration` trait. Chunk 5 plugs
   chunk 3's decision into it; here the tests use an in-process minter.

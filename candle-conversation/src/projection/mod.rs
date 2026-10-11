@@ -222,6 +222,8 @@ mod working_set_pick;
 mod yaml;
 
 #[cfg(test)]
+mod remote_turn_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod turn_order_tests;

@@ -54,6 +54,7 @@ pub mod priority_lock;
 pub mod record;
 pub mod recovery;
 pub mod relocation_watch;
+pub mod remote;
 pub mod replica;
 #[cfg(test)]
 mod replica_tests;
@@ -97,6 +98,7 @@ use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 pub use model_binding::{BoundSubstrate, ModelBinding};
 pub use priority_lock::PersistenceLock;
+use record::verify_record_crc;
 use record::{
     decode_header, decode_record, encode_record_written, padded_record_len, ChunkPayload,
     CustomObjectPayload, DebugIdPayload, NpcPayload, Record, RecordHeader, RecordType,
@@ -1538,22 +1540,19 @@ impl SubstratePersistence {
         self.locations.get(origin, oseq)
     }
 
-    /// Read the record `(origin, oseq)` from wherever maintenance has moved
-    /// it, or `None` when this member does not hold it — what a member reads
-    /// to send an event it owes, or to answer a fetch (§6.2, §7.2).
-    pub fn read_by_identity(&mut self, origin: u64, oseq: u64) -> Result<Option<Record>> {
+    /// The bytes of record `(origin, oseq)` as the log holds them — header
+    /// line, payload and padding — from wherever maintenance has moved it, or
+    /// `None` when this member does not hold it. What a member sends for an
+    /// event it owes, or to answer a fetch (§6.2, §6.3, §7.2).
+    pub fn read_event(&mut self, origin: u64, oseq: u64) -> Result<Option<Vec<u8>>> {
         let Some(at) = self.locations.get(origin, oseq) else {
             return Ok(None);
         };
-        if self.segments.pending_len() > 0 {
-            self.segments.flush()?;
-        }
+        self.flush_staged()?;
         let mut probe = vec![0u8; HEADER_PROBE_SIZE];
         self.segments.read_into(at.segment, at.offset, &mut probe)?;
         let (header, header_bytes) = decode_header(&probe)?;
-        let size = padded_record_len(header_bytes - 1, header.payload_len) as u64;
-        let record = self.segments.read_record_at(at.segment, at.offset, size)?;
-        let id = record.header.identity();
+        let id = header.identity();
         if (id.origin, id.oseq) != (origin, oseq) {
             return Err(PersistenceError::Corrupt(format!(
                 "the location index names {:x}/{oseq} at {:?}+{} but the record there is \
@@ -1561,7 +1560,32 @@ impl SubstratePersistence {
                 origin, at.segment, at.offset, id.origin, id.oseq
             )));
         }
-        Ok(Some(record))
+        let mut bytes = vec![0u8; padded_record_len(header_bytes - 1, header.payload_len)];
+        self.segments.read_into(at.segment, at.offset, &mut bytes)?;
+        Ok(Some(bytes))
+    }
+
+    /// Write what is staged to its segment, so a read by location finds it —
+    /// a record appended a moment ago is in the staging buffer, not the file.
+    /// Not a commit: nothing is made durable.
+    fn flush_staged(&mut self) -> Result<()> {
+        if self.segments.pending_len() > 0 {
+            self.segments.flush()?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::read_event`], decoded and checked against its CRC.
+    pub fn read_by_identity(&mut self, origin: u64, oseq: u64) -> Result<Option<Record>> {
+        let Some(bytes) = self.read_event(origin, oseq)? else {
+            return Ok(None);
+        };
+        let (header, payload, _) = decode_record(&bytes)?;
+        verify_record_crc(&header, payload)?;
+        Ok(Some(Record {
+            header,
+            payload: payload.to_vec(),
+        }))
     }
 
     /// Write the replica when it changed since it was last written — at a
@@ -1907,6 +1931,25 @@ impl SubstratePersistence {
     /// note (e.g. the corrupt-reload detail) recorded in the payload; pass
     /// `None` for an ordinary deletion.
     pub fn write_tombstone(&mut self, timeline_id: u64, reason: Option<&str>) -> Result<()> {
+        let id = self.minter.mint(0);
+        self.append_timeline_tombstone(timeline_id, reason, id)
+    }
+
+    /// [`Self::write_tombstone`] for a **repair**: this member's judgement
+    /// about its own bytes — a turn it finds incomplete or unreadable at
+    /// reload — not a deletion. Housekeeping, written with no identity, so it
+    /// is never sent to another member, which may hold the conversation whole
+    /// (§6.5).
+    pub fn write_repair_tombstone(&mut self, timeline_id: u64, reason: &str) -> Result<()> {
+        self.append_timeline_tombstone(timeline_id, Some(reason), RecordIdentity::NONE)
+    }
+
+    fn append_timeline_tombstone(
+        &mut self,
+        timeline_id: u64,
+        reason: Option<&str>,
+        id: RecordIdentity,
+    ) -> Result<()> {
         let payload = TombstonePayload {
             timeline_id,
             turn_index: None,
@@ -1914,7 +1957,7 @@ impl SubstratePersistence {
             reason: reason.map(str::to_string),
         };
         let bytes = payload.encode();
-        self.append_record(RecordType::Tombstone, 0, 0, 0, 0, 0, &bytes)?;
+        self.append_carried(RecordType::Tombstone, 0, 0, 0, 0, 0, &bytes, id)?;
         // A dead conversation has no live snapshot tail: drop its entry from
         // the persistence-side map so a maintenance execute planned before
         // this tombstone skips relocating the (now dead) snapshot record —
@@ -1935,6 +1978,22 @@ impl SubstratePersistence {
     /// by retention. The mark names the turn as its writer wrote it
     /// ([`Substrate::tombstone_turn`] returns it).
     pub fn write_turn_tombstone(&mut self, mark: TurnMark, reason: Option<&str>) -> Result<()> {
+        let id = self.minter.mint(0);
+        self.append_turn_tombstone(mark, reason, id)
+    }
+
+    /// [`Self::write_turn_tombstone`] for a **repair** — see
+    /// [`Self::write_repair_tombstone`].
+    pub fn write_repair_turn_tombstone(&mut self, mark: TurnMark, reason: &str) -> Result<()> {
+        self.append_turn_tombstone(mark, Some(reason), RecordIdentity::NONE)
+    }
+
+    fn append_turn_tombstone(
+        &mut self,
+        mark: TurnMark,
+        reason: Option<&str>,
+        id: RecordIdentity,
+    ) -> Result<()> {
         let payload = TombstonePayload {
             timeline_id: mark.timeline.raw(),
             turn_index: Some(mark.turn_index),
@@ -1942,7 +2001,7 @@ impl SubstratePersistence {
             reason: reason.map(str::to_string),
         };
         let bytes = payload.encode();
-        self.append_record(RecordType::Tombstone, 0, 0, 0, 0, 0, &bytes)?;
+        self.append_carried(RecordType::Tombstone, 0, 0, 0, 0, 0, &bytes, id)?;
         Ok(())
     }
 

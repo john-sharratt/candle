@@ -22,7 +22,6 @@ use super::Substrate;
 use crate::persistence::content_hash::hash_bytes;
 use crate::persistence::identity::RecordIdentity;
 use crate::persistence::streams::StreamDecl;
-use crate::projection::TimelineId;
 
 /// `origin/oseq@gen.epoch.hlc`.
 fn id(i: &RecordIdentity) -> String {
@@ -41,19 +40,12 @@ impl Substrate {
         out
     }
 
-    /// Whether `timeline` is dead: tombstoned and not distilled.
-    fn is_dead(&self, timeline: u64) -> bool {
-        TimelineId::from_raw(timeline).is_some_and(|tl| {
-            self.tombstoned_timelines.contains(&tl) && !self.distilled_timelines.contains_key(&tl)
-        })
-    }
-
     fn render_streams(&self, out: &mut String) {
         let mut streams: Vec<_> = self
             .streams
             .iter_physical()
             .filter(|(_, s)| match &s.decl {
-                Some(StreamDecl::Turn(t)) => !self.is_dead(t.timeline_id),
+                Some(StreamDecl::Turn(t)) => !self.is_timeline_dead(t.timeline_id),
                 _ => true,
             })
             .collect();
@@ -110,7 +102,7 @@ impl Substrate {
         let mut timelines: Vec<u64> = self
             .streams
             .timelines()
-            .filter(|tl| !self.is_dead(*tl))
+            .filter(|tl| !self.is_timeline_dead(*tl))
             .collect();
         timelines.sort_unstable();
         for tl in timelines {
@@ -130,7 +122,7 @@ impl Substrate {
             .timelines
             .keys()
             .copied()
-            .filter(|t| !self.is_dead(t.raw()))
+            .filter(|t| !self.is_timeline_dead(t.raw()))
             .collect();
         tls.sort_unstable_by_key(|t| t.raw());
         for tl in tls {
@@ -168,9 +160,12 @@ impl Substrate {
             if let Some(d) = &e.debug_id {
                 let _ = writeln!(out, "  debug_id {} {d}", id(&ids.debug_id));
             }
-            for (idx, meta) in &e.tree_meta {
-                let mid = ids.tree_meta.get(idx).copied().unwrap_or_default();
-                let _ = writeln!(out, "  tree {} {} {:?}", idx.0, id(&mid), meta);
+            // Only what a record set: a restored turn seeds a default entry of
+            // its own, which is derived, not replicated.
+            for (idx, mid) in &ids.tree_meta {
+                if let Some(meta) = e.tree_meta.get(idx) {
+                    let _ = writeln!(out, "  tree {} {} {:?}", idx.0, id(mid), meta);
+                }
             }
             let couplings: BTreeSet<u32> = e.couplings.iter().copied().collect();
             for from in couplings {
@@ -179,7 +174,7 @@ impl Substrate {
             }
         }
         for (tl, rt, payload, rid) in self.pending.records() {
-            if self.is_dead(tl) {
+            if self.is_timeline_dead(tl) {
                 continue;
             }
             let _ = writeln!(

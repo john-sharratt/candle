@@ -41,6 +41,7 @@
 //! scan populates them.
 
 mod deleted_set;
+mod dominance;
 mod ended_sections;
 mod label_records;
 #[cfg(test)]
@@ -49,7 +50,9 @@ mod pending;
 mod replicated_state;
 mod stamps;
 mod stream_index;
+mod supersession;
 mod tombstones;
+mod turn_placement;
 
 use std::sync::{Mutex, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -98,9 +101,10 @@ use label_records::label_records;
 use pending::{PendingChild, PendingChildren};
 use stamps::{take, take_keyed};
 pub use stamps::{StreamIds, TimelineIds};
-use stream_index::StreamIndex;
+use stream_index::{Declared, StreamIndex};
 pub use stream_index::{StreamKey, TurnStream};
 pub use tombstones::TurnMark;
+pub use turn_placement::RestoredTurn;
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
@@ -357,6 +361,11 @@ pub struct Substrate {
     /// conversation's `Label` before its first turn, and records from another
     /// member arrive in any order; see [`PendingChildren`].
     pending: PendingChildren,
+    /// A declaration ranked below turns this member holds moved one of them
+    /// to another index, so the timeline's indices changed under the hot path
+    /// and the member must reload (§6.6). Read and cleared by
+    /// [`Self::take_reload_due`].
+    reload_due: bool,
     /// The record behind each snapshot stream's tail, retracted or not — a
     /// retraction is a record and outranks the snapshot it withdraws.
     snapshot_ids: HashMap<StreamId, RecordIdentity>,
@@ -1423,6 +1432,11 @@ pub struct TimelineEntry {
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
     pub turns: BTreeMap<TurnIndex, TurnEntryData>,
+    /// The indices of `turns` that hold an empty placeholder for a position no
+    /// turn here fills yet — a declaration lost in a crash, or another
+    /// member's turn still arriving (§6.5). A turn completed later takes its
+    /// gap in place, so the turns above it never move.
+    pub gaps: BTreeSet<TurnIndex>,
     /// Per-turn tree metadata for the immutable summary forest
     /// (`docs/archived/immutable_summary_forest.md`).  Parallel to `turns`: every
     /// recorded turn carries exactly one [`TreeNodeMeta`] entry (defaults to a
@@ -1647,6 +1661,7 @@ impl TimelineEntry {
             branches: BTreeMap::new(),
             active: 0,
             turns: BTreeMap::new(),
+            gaps: BTreeSet::new(),
             tree_meta: BTreeMap::new(),
             debug_id: None,
             pending_summary_queue: std::collections::VecDeque::new(),
@@ -3987,6 +4002,12 @@ impl Substrate {
         self.streams.physical(key)
     }
 
+    /// One writer's stream as the declared turn it is, at its position; `None`
+    /// for a stream that is not a declared turn.
+    pub fn turn_at(&self, key: StreamKey) -> Option<TurnStream<'_>> {
+        self.streams.turn(key)
+    }
+
     /// Where a declared turn's stream sits in its timeline — the turn index
     /// callers address it by. `None` for a stream that is not a declared turn.
     pub fn turn_position(&self, key: StreamKey) -> Option<TurnIndex> {
@@ -4342,9 +4363,25 @@ impl Substrate {
         if section && !id.is_none() && self.ended_sections.is_ended(stream_id, generation) {
             return;
         }
-        let Some(mut moved) = self.streams.declare(key, decl, id) else {
+        let Some(Declared {
+            changed: mut moved,
+            displaced,
+        }) = self.streams.declare(key, decl, id)
+        else {
             return;
         };
+        if let Some(timeline) = self
+            .streams
+            .turn(key)
+            .and_then(|t| TimelineId::from_raw(t.decl.timeline_id))
+        {
+            if displaced
+                .iter()
+                .any(|&old| self.holds_turn(timeline, TurnIndex(old)))
+            {
+                self.reload_due = true;
+            }
+        }
         if section {
             if id.is_none() {
                 self.ended_sections.lift_unstamped(stream_id);

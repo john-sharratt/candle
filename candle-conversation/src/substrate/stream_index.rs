@@ -83,6 +83,18 @@ struct TurnRank {
     writer: u64,
 }
 
+/// What installing a declaration changed ([`StreamIndex::declare`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Declared {
+    /// The logical ids whose stream changed, which every memo keyed by
+    /// logical id must drop.
+    pub changed: Vec<StreamId>,
+    /// The positions of the declared turn's timeline that a turn already
+    /// placed was moved off — what a declaration ranked below turns already
+    /// held does to them (§6.6).
+    pub displaced: Vec<u32>,
+}
+
 /// See the module documentation.
 #[derive(Debug, Default)]
 pub struct StreamIndex {
@@ -140,15 +152,14 @@ impl StreamIndex {
     }
 
     /// Install `decl` on `key`'s stream, written as record `id`, when it
-    /// supersedes the declaration held. `None` when it does not; otherwise the
-    /// logical ids whose stream changed, which every memo keyed by logical id
-    /// must drop.
+    /// supersedes the declaration held. `None` when it does not; otherwise
+    /// what it changed.
     pub fn declare(
         &mut self,
         key: StreamKey,
         decl: StreamDecl,
         id: RecordIdentity,
-    ) -> Option<Vec<StreamId>> {
+    ) -> Option<Declared> {
         let rt = self.entry(key);
         if !take(&mut rt.ids.decl, id) {
             return None;
@@ -158,9 +169,10 @@ impl StreamIndex {
             StreamDecl::PromptSection(_) => None,
         };
         rt.decl = Some(decl);
-        let mut changed = Vec::new();
-        if let Some((timeline, rank)) = self.unrank(key, &mut changed) {
-            changed.extend(self.place(timeline, rank));
+        let mut out = Declared::default();
+        if let Some((timeline, rank)) = self.unrank(key, &mut out.changed) {
+            out.changed
+                .extend(self.place(timeline, rank, &mut out.displaced));
         }
         if let Some((timeline, turn_index)) = turn {
             let rank = TurnRank {
@@ -171,11 +183,14 @@ impl StreamIndex {
             self.ranks.insert(key, (timeline, rank));
             let order = self.timelines.entry(timeline).or_default();
             order.insert(rank, key);
-            changed.extend(self.place(timeline, rank));
+            out.changed
+                .extend(self.place(timeline, rank, &mut out.displaced));
         }
-        changed.sort_unstable();
-        changed.dedup();
-        Some(changed)
+        out.changed.sort_unstable();
+        out.changed.dedup();
+        out.displaced.sort_unstable();
+        out.displaced.dedup();
+        Some(out)
     }
 
     /// Take `key`'s declaration away, returning the logical ids whose stream
@@ -183,7 +198,7 @@ impl StreamIndex {
     pub fn undeclare(&mut self, key: StreamKey) -> Vec<StreamId> {
         let mut changed = vec![key.stream_id];
         if let Some((timeline, rank)) = self.unrank(key, &mut changed) {
-            changed.extend(self.place(timeline, rank));
+            changed.extend(self.place(timeline, rank, &mut Vec::new()));
         }
         if let Some(rt) = self
             .streams
@@ -282,7 +297,7 @@ impl StreamIndex {
         }
         let mut changed = vec![key.stream_id];
         if let Some((timeline, rank)) = self.unrank(key, &mut changed) {
-            changed.extend(self.place(timeline, rank));
+            changed.extend(self.place(timeline, rank, &mut Vec::new()));
         }
         changed.sort_unstable();
         changed.dedup();
@@ -312,14 +327,15 @@ impl StreamIndex {
 
     /// Recompute the positions of `timeline`'s turns from rank `from` up — a
     /// turn was inserted there or taken out — returning the logical ids whose
-    /// stream changed.
+    /// stream changed, and pushing onto `displaced` every position a placed
+    /// turn moved off.
     ///
     /// A turn's position depends only on the position of the turn before it,
     /// so the first turn past `from` that keeps its place ends the walk: every
     /// turn above it keeps its place too. One writer's turns never move, so an
     /// open that meets a timeline's declarations in any order places each in
     /// constant work.
-    fn place(&mut self, timeline: u64, from: TurnRank) -> Vec<StreamId> {
+    fn place(&mut self, timeline: u64, from: TurnRank, displaced: &mut Vec<u32>) -> Vec<StreamId> {
         let mut changed = Vec::new();
         let Some(order) = self.timelines.get(&timeline) else {
             return changed;
@@ -340,6 +356,9 @@ impl StreamIndex {
                 break;
             }
             if let Some(old) = self.positions.insert(*key, pos) {
+                if old != pos {
+                    displaced.push(old);
+                }
                 let old_sid = turn_stream_id(timeline, old);
                 if self.logical.get(&old_sid) == Some(key) {
                     self.logical.remove(&old_sid);
@@ -648,14 +667,20 @@ mod tests {
         };
         index.entry(early).committed_through = Some(901);
         assert_eq!(mark_at(&index, 1), Some(901));
-        let changed = index.declare(early, turn(1), id(9, 20)).unwrap();
-        assert_eq!(changed, vec![sid(1)]);
+        let declared = index.declare(early, turn(1), id(9, 20)).unwrap();
+        assert_eq!(
+            declared,
+            Declared {
+                changed: vec![sid(1)],
+                displaced: Vec::new(),
+            }
+        );
         assert_eq!(order(&index), vec![(0, 0, 5), (1, 1, 9)]);
         assert_eq!(mark_at(&index, 1), Some(901));
     }
 
-    /// A turn arriving ranked below one already placed moves it up, and the
-    /// ids whose stream changed are reported.
+    /// A turn arriving ranked below one already placed moves it up: the ids
+    /// whose stream changed are reported, and the position it was moved off.
     #[test]
     fn a_turn_ranked_below_reports_every_moved_id() {
         let mut index = StreamIndex::default();
@@ -665,11 +690,36 @@ mod tests {
             stream_id: sid(1),
             writer: 5,
         };
-        let changed = index.declare(key, turn(1), id(5, 20)).unwrap();
+        let declared = index.declare(key, turn(1), id(5, 20)).unwrap();
         let mut want = vec![sid(1), sid(2)];
         want.sort_unstable();
-        assert_eq!(changed, want);
+        assert_eq!(declared.changed, want);
+        assert_eq!(declared.displaced, vec![1]);
         assert_eq!(mark_at(&index, 2), Some(901));
+    }
+
+    /// A turn placed above every turn held, or into a gap, moves nothing.
+    #[test]
+    fn a_turn_above_or_in_a_gap_displaces_nothing() {
+        let mut index = StreamIndex::default();
+        write(&mut index, 0, 5, 10, 100);
+        write(&mut index, 2, 5, 30, 102);
+        let above = StreamKey {
+            stream_id: sid(3),
+            writer: 9,
+        };
+        let declared = index.declare(above, turn(3), id(9, 40)).unwrap();
+        assert_eq!(declared.displaced, Vec::<u32>::new());
+        let gap = StreamKey {
+            stream_id: sid(1),
+            writer: 5,
+        };
+        let declared = index.declare(gap, turn(1), id(5, 20)).unwrap();
+        assert_eq!(declared.displaced, Vec::<u32>::new());
+        assert_eq!(
+            order(&index),
+            vec![(0, 0, 5), (1, 1, 5), (2, 2, 5), (3, 3, 9)]
+        );
     }
 
     /// A declaration ranked below the one held changes nothing.

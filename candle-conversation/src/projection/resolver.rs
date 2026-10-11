@@ -40,6 +40,7 @@ use crate::persistence::record::{
     BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SectionGeneration,
     SnapshotPayload, TreeMetadataPayload,
 };
+use crate::persistence::remote::{turn_is_complete, RemoteBatch};
 use crate::persistence::resume::{read_persisted_section_windows, TurnChunkGrid};
 use crate::persistence::sealed_reader::{SealedReader, SEALED_READ_ATTEMPTS};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
@@ -704,6 +705,22 @@ impl Conversation {
             return None;
         }
         self.persistence.lock().ok()
+    }
+
+    /// Apply a batch of records other members wrote
+    /// ([`SubstratePersistence::apply_remote`], `docs/replicated_substrate.md`
+    /// §6.5). Takes the persistence lock and then the substrate's write lock —
+    /// the order a reload takes them in — once each for the whole batch, so a
+    /// projection sees the batch whole or not at all and no read nests inside
+    /// the held guard.
+    pub fn apply_remote(
+        &self,
+        records: &[&[u8]],
+        n_layers: usize,
+    ) -> PersistenceResult<RemoteBatch> {
+        let mut p = self.persistence.lock().unwrap();
+        let mut view = self.write();
+        p.apply_remote(&mut view, records, n_layers)
     }
 
     /// Allocate a fresh [`TimelineId`] and register it against
@@ -2724,10 +2741,11 @@ impl Conversation {
         Ok(idx)
     }
 
-    /// Restore an empty placeholder at every position of `decl`'s timeline
-    /// below `decl.turn_index` that no turn holds yet. `restore_turn` assigns
+    /// Restore a gap at every position of `decl`'s timeline below
+    /// `decl.turn_index` that no turn holds yet. `restore_turn` assigns
     /// indices densely, so without it a turn above a lost decl would land one
-    /// index low, away from the streams its index resolves to.
+    /// index low, away from the streams its index resolves to; a turn that
+    /// arrives for the position later takes the gap in place.
     fn fill_turn_gap(&self, decl: &TurnDecl) {
         let Some(timeline) = TimelineId::from_raw(decl.timeline_id) else {
             return;
@@ -2743,16 +2761,43 @@ impl Conversation {
             view.register_timeline(timeline, layer, group);
         }
         while view.turn_count(timeline) < decl.turn_index {
-            view.restore_turn(
-                timeline,
-                TurnLayout::new(Vec::new()),
-                TokenBuffer::default(),
-                0,
-                None,
-                0,
-                0,
-            );
+            view.restore_gap_turn(timeline);
         }
+    }
+
+    /// Whether `decl`'s turn, at the position its `turn_index` names, is
+    /// another member's. A turn of this member's own, or one written before
+    /// identities, is not.
+    fn is_remote_turn(&self, decl: &TurnDecl) -> bool {
+        let Some(timeline) = TimelineId::from_raw(decl.timeline_id) else {
+            return false;
+        };
+        let writer = self.read().turn_mark(timeline, decl.turn_index).writer;
+        writer != 0 && writer != self.minter.node()
+    }
+
+    /// Whether every record `decl`'s turn calls for is here (§6.5).
+    fn is_turn_complete(&self, decl: &TurnDecl, n_layers: usize) -> bool {
+        let read = self.read();
+        let distilled = TimelineId::from_raw(decl.timeline_id)
+            .is_some_and(|timeline| read.distill_mode(timeline).is_some());
+        read.stream_of(turn_stream_id(decl.timeline_id, decl.turn_index))
+            .is_some_and(|stream| turn_is_complete(decl, stream, n_layers, distilled))
+    }
+
+    /// Hold `decl`'s position with a gap, registering its timeline first.
+    fn restore_pending_turn(&self, decl: &TurnDecl) {
+        let Some(timeline) = TimelineId::from_raw(decl.timeline_id) else {
+            return;
+        };
+        let mut view = self.write();
+        if let (Some(layer), Some(group)) = (
+            LayerId::from_raw(decl.layer_id),
+            GroupId::from_raw(decl.group_id),
+        ) {
+            view.register_timeline(timeline, layer, group);
+        }
+        view.restore_gap_turn(timeline);
     }
 
     /// Rebuild the in-RAM [`Substrate`] from the persistence redo log — the
@@ -2800,6 +2845,7 @@ impl Conversation {
         );
         let mut restored = 0usize;
         let mut skipped_corrupt = 0usize;
+        let mut pending_remote = 0usize;
         // Startup integrity repair (`persistence::integrity`): completeness is
         // judged here — and only here — because reconstruct is the one moment
         // with no live writer, so on-disk state is final and a half-written
@@ -2848,6 +2894,17 @@ impl Conversation {
                     continue;
                 }
             }
+            // Another member's turn still arriving is pending, not corrupt: a
+            // gap holds its position, the rest of it is wanted by the next
+            // catch-up, and the runtime adopts it into the gap once it is all
+            // here. Judging it corrupt would tombstone a conversation that is
+            // whole on the member that wrote it.
+            let remote = self.is_remote_turn(&decl);
+            if remote && !self.is_turn_complete(&decl, n_layers) {
+                pending_remote += 1;
+                self.restore_pending_turn(&decl);
+                continue;
+            }
             // Per-turn fault isolation.  A single turn whose
             // persisted state is inconsistent (e.g. a daemon was
             // killed between chunk writes and the final TurnDecl
@@ -2879,6 +2936,21 @@ impl Conversation {
             };
             let (recovered, cold_refs) = match recover_result {
                 Ok(pair) => pair,
+                // Another member's turn that cannot be read here is this
+                // member's bytes at fault, not the conversation: it is held as
+                // a gap until it is fetched again, never tombstoned — a
+                // tombstone here would refuse the copy that repairs it.
+                Err(e) if remote => {
+                    tracing::warn!(
+                        timeline_id = decl.timeline_id,
+                        turn_index = decl.turn_index,
+                        "another member's turn is unreadable here and waits to be fetched \
+                         again: {e}",
+                    );
+                    pending_remote += 1;
+                    self.restore_pending_turn(&decl);
+                    continue;
+                }
                 Err(e) => {
                     tracing::warn!(
                         timeline_id = decl.timeline_id,
@@ -2905,7 +2977,7 @@ impl Conversation {
                                 // `process_one_file` rebuilds it).
                                 self.write().tombstone_timeline(timeline);
                                 if let Some(mut p) = self.writable_persistence() {
-                                    match p.write_tombstone(timeline.raw(), Some(&reason)) {
+                                    match p.write_repair_tombstone(timeline.raw(), &reason) {
                                         Ok(_) => tracing::debug!(
                                             timeline_id = decl.timeline_id,
                                             turn_index = decl.turn_index,
@@ -2926,7 +2998,7 @@ impl Conversation {
                                 // rest of the conversation live.
                                 let mark = self.write().tombstone_turn(timeline, decl.turn_index);
                                 if let Some(mut p) = self.writable_persistence() {
-                                    match p.write_turn_tombstone(mark, Some(&reason)) {
+                                    match p.write_repair_turn_tombstone(mark, &reason) {
                                         Ok(_) => tracing::debug!(
                                             timeline_id = decl.timeline_id,
                                             turn_index = decl.turn_index,
@@ -3010,7 +3082,7 @@ impl Conversation {
                         );
                         self.write().tombstone_timeline(timeline);
                         if let Some(mut p) = self.writable_persistence() {
-                            match p.write_tombstone(timeline.raw(), Some(&reason)) {
+                            match p.write_repair_tombstone(timeline.raw(), &reason) {
                                 Ok(_) => tracing::info!(
                                     timeline_id = decl.timeline_id,
                                     turn_index = decl.turn_index,
@@ -3108,6 +3180,7 @@ impl Conversation {
             conversations = n_conversations,
             turns = restored,
             skipped_corrupt = skipped_corrupt,
+            pending_remote = pending_remote,
             repaired_integrity = repaired_integrity,
             orphan_chunk_streams = orphan_chunk_streams,
             reconstruct_ms = t_reconstruct.elapsed().as_millis() as u64,
