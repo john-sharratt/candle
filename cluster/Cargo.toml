@@ -8,7 +8,12 @@ build = "build.rs"
 # No candle and no CUDA: the gateway links this crate, and record bytes stay
 # opaque to it.
 [dependencies]
+# Paxos keeps several maps keyed by short byte strings, each touched for every
+# frame; SipHash dominated them.
+ahash       = { workspace = true }
 applied-set = { path = "../applied-set" }
+# The vote journal's per-half checksum.
+crc32fast   = "1.5"
 hmac        = "0.12"
 sha2        = "0.10"
 rand        = { workspace = true }

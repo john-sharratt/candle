@@ -254,6 +254,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                     ballot: Ballot { round: 2, node: 1 },
                     value: b"v".to_vec(),
                 }),
+                from: 4,
                 reply_to: 6,
             }),
             B::header(21, 0, 0)
@@ -266,6 +267,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u64(1)
                 .u32(1)
                 .raw(b"v")
+                .u64(4)
                 .u64(6)
                 .0,
         ),
@@ -273,9 +275,17 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
             Frame::Nack(Nack {
                 key: b"w".to_vec(),
                 promised: ballot(),
+                from: 4,
                 reply_to: 6,
             }),
-            B::header(22, 0, 0).u32(1).raw(b"w").u64(3).u64(9).u64(6).0,
+            B::header(22, 0, 0)
+                .u32(1)
+                .raw(b"w")
+                .u64(3)
+                .u64(9)
+                .u64(4)
+                .u64(6)
+                .0,
         ),
         (
             Frame::Propose(Propose {
@@ -296,9 +306,17 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
             Frame::Accepted(Accepted {
                 key: b"w".to_vec(),
                 ballot: ballot(),
+                from: 4,
                 reply_to: 6,
             }),
-            B::header(24, 0, 0).u32(1).raw(b"w").u64(3).u64(9).u64(6).0,
+            B::header(24, 0, 0)
+                .u32(1)
+                .raw(b"w")
+                .u64(3)
+                .u64(9)
+                .u64(4)
+                .u64(6)
+                .0,
         ),
         (
             Frame::Release(Release {

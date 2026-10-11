@@ -1,8 +1,8 @@
 # Replicated substrate: zend, npcd and agents as members of the gateway
 
-**Status:** being built in §15's order. Chunk 1 (substrate identity and
-order-independent apply) and chunk 2 (the `cluster` crate's wire protocol) are built;
-chunks 3–10 are not. **Scope:** a zend or npcd daemon started with
+**Status:** being built in §15's order. Chunks 1–3 are built: substrate identity and
+order-independent apply, the `cluster` crate's wire protocol, and consensus. Chunks
+4–10 are not. **Scope:** a zend or npcd daemon started with
 `--cluster https://<host or ip>` — and a new kind of member, the *agent*, a CPU machine
 that runs command-line work inside repositories — dials that web gateway over one
 WebSocket per app, proves it holds the estate's group key, and while connected *is* that
@@ -888,8 +888,8 @@ u8 kind | u8 flags | u32 stream (LE) | body…        (WebSocket supplies the le
 | `PING` / `PONG` | 8-byte nonce | control |
 | `ROUTES` | the member's dispatch table (§5.2) | control |
 | `CLAIM` / `UNCLAIM` | `{ key, epoch }` / `{ key, epoch, through }` — this member serves `key` (a sticky key or a lease), or has let it go with its own `oseq` at `through` (§5.4, §9) | control |
-| `PREPARE` / `PROMISE` / `NACK` | `{ key, ballot }` / `{ key, ballot, accepted, reply_to }` / `{ key, promised, reply_to }` — Paxos phase 1 between members: a proposer asking, each member answering as an acceptor (§5.9) | control |
-| `PROPOSE` / `ACCEPTED` | `{ key, ballot, value }` / `{ key, ballot, reply_to }` — Paxos phase 2 | control |
+| `PREPARE` / `PROMISE` / `NACK` | `{ key, ballot }` / `{ key, ballot, accepted, from, reply_to }` / `{ key, promised, from, reply_to }` — Paxos phase 1 between members: a proposer asking, each member answering as an acceptor (§5.9). A request's sender is its ballot's node; a reply names its acceptor in `from`, so a quorum counts distinct acceptors however many clusters a reply came through | control |
+| `PROPOSE` / `ACCEPTED` | `{ key, ballot, value }` / `{ key, ballot, from, reply_to }` — Paxos phase 2 | control |
 | `RELEASE` | `{ key, ballot, through }` — a lease holder handing the lease back (§5.9, §9.6) | control |
 | `BUILD_OFFER` / `BUILD_HAVE` | `{ build, artifacts: [{ kind, platform, size, sha256 }] }` — a candidate offering its build, and a member that has verified an artifact offering it in turn (§3.9) | control |
 | `BUILD_FETCH` / `BUILD_CHUNK` | `{ artifact, offset, from_node, reply_to }` / `{ artifact, offset, reply_to, bytes ≤ 1 MiB }` — resumable artifact transfer from the member `from_node` names | control / catch-up |
@@ -937,10 +937,10 @@ misread, and on an admitted socket closes it 4400.
 | `UNCLAIM` | 16 | `blob key` · `epoch` · `u64 through` |
 | `COORD` | 17 | `blob state` (§12.1's encoding) |
 | `PREPARE` | 20 | `blob key` · `ballot` |
-| `PROMISE` | 21 | `blob key` · `ballot` · `opt<ballot · blob value>` accepted · `u64 reply_to` |
-| `NACK` | 22 | `blob key` · `ballot promised` · `u64 reply_to` |
+| `PROMISE` | 21 | `blob key` · `ballot` · `opt<ballot · blob value>` accepted · `u64 from` · `u64 reply_to` |
+| `NACK` | 22 | `blob key` · `ballot promised` · `u64 from` · `u64 reply_to` |
 | `PROPOSE` | 23 | `blob key` · `ballot` · `blob value` |
-| `ACCEPTED` | 24 | `blob key` · `ballot` · `u64 reply_to` |
+| `ACCEPTED` | 24 | `blob key` · `ballot` · `u64 from` · `u64 reply_to` |
 | `RELEASE` | 25 | `blob key` · `ballot` · `u64 through` |
 | `BUILD_OFFER` / `BUILD_HAVE` | 30 / 31 | `build` · `list<str kind · str platform · u64 size · [32] sha256>` |
 | `BUILD_FETCH` | 32 | `[32] artifact` · `u64 offset` · `u64 from_node` · `u64 reply_to` |
@@ -1496,7 +1496,16 @@ round.
        half-written one.
      - A key that has not been touched for one `ttl` past its last lease frees its slot.
      - A key whose decision has been written as a replicated record frees its slot
-       too.
+       too. The acceptor then answers for that key from the decision: a `PROMISE`
+       carrying it as accepted at a ballot above every other, so every proposer
+       adopts it, and a `NACK` for a proposal of anything else.
+     - The layout (`cluster/src/consensus/votes/file.rs`): a slot is two 1 KiB halves,
+       so 64 MiB holds 32,768 keys at once. A half is `magic "VOTE" · u64 seq · u16
+       key_len · [128] key · promised ballot · u8 accepted · accepted ballot · u16
+       value_len · [800] value`, zero-padded, ending in a CRC-32 of the rest. A key is
+       at most 128 bytes and a value at most 800.
+     - A value is `u8` tag then, for a decision, its bytes, or for a lease `u64
+       holder · u64 ttl_ms`.
 2. **Propose.** With promises from a quorum, it proposes the value of the highest-ballot
    accepted value among them, or its own if there is none, as `PROPOSE { key, ballot,
    value }`. Acceptors accept, durably, unless they have promised higher, and reply
@@ -1539,6 +1548,15 @@ receives a `NACK` waits a random time, drawn uniformly from 0 to the key's `ttl`
 for a decision), before preparing again with a ballot above the one that beat it. One of
 them then completes a round while the other waits, and the other learns the result
 from its next `PROMISE`.
+
+- Only a promise *above* the round's ballot beats it. A `NACK` naming the round's own
+  ballot answers one of the proposer's earlier rounds, delayed, from an acceptor that
+  has since promised this one, and is ignored.
+- A phase that gathers no quorum within 2 s backs off the same way: frames can be
+  lost, and a round must not wait on them forever.
+- A member that rendezvous stops naming for a key abandons its round for it, so it
+  does not keep duelling the member that is named now. A lease it holds is unaffected;
+  it runs out or is released.
 
 ---
 

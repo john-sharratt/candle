@@ -7,6 +7,8 @@
 //! - [`session`]: one admitted socket — the three-lane writer, virtual
 //!   connections with flow control, `EVENT` reassembly and keep-alive.
 //! - [`dial`] and [`backoff`]: a member's reconnect loop.
+//! - [`consensus`]: Paxos among an app's members — leases, decisions, the
+//!   vote journal, the quorum and rendezvous.
 //! - [`delivery`]: the sender's outbox (unsent, in flight, received) and the
 //!   frame counting `RECEIPT`s refer to.
 //! - [`version`]: this build's `count`, `hash` and `local`.
@@ -16,6 +18,7 @@
 
 pub mod backoff;
 pub mod close;
+pub mod consensus;
 pub mod delivery;
 pub mod dial;
 pub mod fragment;

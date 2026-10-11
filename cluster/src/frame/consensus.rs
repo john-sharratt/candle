@@ -47,12 +47,15 @@ impl AcceptedValue {
     }
 }
 
-/// An acceptor's promise, with what it has already accepted.
+/// An acceptor's promise, with what it has already accepted. `from` is the
+/// acceptor: a quorum counts distinct acceptors, and a reply that reached the
+/// proposer through two clusters is one vote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Promise {
     pub key: Vec<u8>,
     pub ballot: Ballot,
     pub accepted: Option<AcceptedValue>,
+    pub from: u64,
     pub reply_to: u64,
 }
 
@@ -61,6 +64,7 @@ impl Promise {
         w.blob(&self.key);
         self.ballot.write(w);
         w.option(self.accepted.as_ref(), |w, a| a.write(w))
+            .u64(self.from)
             .u64(self.reply_to);
     }
 
@@ -69,6 +73,7 @@ impl Promise {
             key: r.blob_vec()?,
             ballot: Ballot::read(r)?,
             accepted: r.option(AcceptedValue::read)?,
+            from: r.u64()?,
             reply_to: r.u64()?,
         })
     }
@@ -79,6 +84,7 @@ impl Promise {
 pub struct Nack {
     pub key: Vec<u8>,
     pub promised: Ballot,
+    pub from: u64,
     pub reply_to: u64,
 }
 
@@ -86,13 +92,14 @@ impl Nack {
     pub fn write(&self, w: &mut Writer) {
         w.blob(&self.key);
         self.promised.write(w);
-        w.u64(self.reply_to);
+        w.u64(self.from).u64(self.reply_to);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
         Ok(Self {
             key: r.blob_vec()?,
             promised: Ballot::read(r)?,
+            from: r.u64()?,
             reply_to: r.u64()?,
         })
     }
@@ -122,11 +129,12 @@ impl Propose {
     }
 }
 
-/// An acceptor accepted `ballot` for `key`.
+/// The acceptor `from` accepted `ballot` for `key`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accepted {
     pub key: Vec<u8>,
     pub ballot: Ballot,
+    pub from: u64,
     pub reply_to: u64,
 }
 
@@ -134,13 +142,14 @@ impl Accepted {
     pub fn write(&self, w: &mut Writer) {
         w.blob(&self.key);
         self.ballot.write(w);
-        w.u64(self.reply_to);
+        w.u64(self.from).u64(self.reply_to);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
         Ok(Self {
             key: r.blob_vec()?,
             ballot: Ballot::read(r)?,
+            from: r.u64()?,
             reply_to: r.u64()?,
         })
     }
