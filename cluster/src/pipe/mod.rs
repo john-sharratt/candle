@@ -3,10 +3,14 @@
 //! sender also reports how many bytes it has handed the transport that the
 //! peer has not yet taken, which gates the catch-up lane (§4.2).
 //!
-//! [`memory::pair`] is the in-memory pipe the tests and harnesses run on; the
-//! WebSocket adapter implements the same two traits.
+//! [`memory::pair`] is the in-memory pipe the tests and harnesses run on;
+//! [`socket::split`] puts the same two traits over a WebSocket, whose library's
+//! messages a [`socket::Codec`] maps — [`tungstenite::Tungstenite`] for a
+//! member's dialled socket.
 
 pub mod memory;
+pub mod socket;
+pub mod tungstenite;
 
 use std::future::Future;
 

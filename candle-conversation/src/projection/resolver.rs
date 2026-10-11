@@ -686,6 +686,18 @@ impl Conversation {
         self.tenant_rank
     }
 
+    /// This substrate's node: the origin of every record it writes
+    /// (`docs/replicated_substrate.md` §3.7).
+    pub fn node(&self) -> u64 {
+        self.minter.node()
+    }
+
+    /// The `oseq` of the last record this node originated; zero before its
+    /// first.
+    pub fn last_oseq(&self) -> u64 {
+        self.minter.origination().next_oseq() - 1
+    }
+
     /// Whether this substrate's owner has asked its ingest to stop.
     pub fn ingest_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
@@ -5218,6 +5230,18 @@ mod tests {
 
     fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A conversation names its substrate's node and the last `oseq` it
+    /// originated — what a cluster member says in `HELLO` and `UNCLAIM`.
+    #[test]
+    fn a_conversation_reports_its_node_and_last_oseq() {
+        let conv = Conversation::ephemeral();
+        assert_ne!(conv.node(), 0);
+        let before = conv.last_oseq();
+        let id = conv.minter.mint(0);
+        assert_eq!((id.origin, id.oseq), (conv.node(), before + 1));
+        assert_eq!(conv.last_oseq(), id.oseq);
     }
 
     /// **A forked conversation's "own history" spans its lineage.**

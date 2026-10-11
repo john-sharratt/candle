@@ -5,6 +5,7 @@ use std::time::Duration;
 use candle_conversation::models::{Model, StrataTokens};
 use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::EngineSource;
+use host::cluster::Join;
 use host::MODEL;
 use web::auth::Roles;
 use zend_tools::state::Secrets;
@@ -123,6 +124,10 @@ pub struct DaemonConfig {
     /// (nobody) by default, so a harness that builds a default config grants no
     /// admin mode over HTTP.
     pub roles: Roles,
+    /// The cluster the process joins with `--cluster`
+    /// (`docs/replicated_substrate.md` §3.2): the load connects through it in
+    /// its `connecting` step, once the substrate is open. `None` standalone.
+    pub cluster: Option<Join>,
 }
 
 impl DaemonConfig {
@@ -147,6 +152,7 @@ impl DaemonConfig {
             summarize: false,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
             roles: Roles::default(),
+            cluster: None,
         }
     }
 }

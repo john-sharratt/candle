@@ -335,6 +335,17 @@ pub fn snapshot_waves() -> Vec<WaveSnapshot> {
         .collect()
 }
 
+/// The newest wave, without copying the ring: what a cluster member reads its
+/// idle capacity from every second.
+pub fn latest_wave() -> Option<WaveSnapshot> {
+    let q = WAVES.get()?.lock().unwrap();
+    let w = q.back()?;
+    Some(WaveSnapshot {
+        age_s: Instant::now().saturating_duration_since(w.at).as_secs_f64(),
+        sample: *w,
+    })
+}
+
 pub fn snapshot_migrates() -> Vec<MigrateSnapshot> {
     let Some(ring) = MIGRATES.get() else {
         return Vec::new();

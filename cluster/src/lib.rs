@@ -17,13 +17,17 @@
 //! `EVENT` stays opaque bytes here.
 
 pub mod backoff;
+pub mod clock;
 pub mod close;
 pub mod consensus;
 pub mod delivery;
 pub mod dial;
+pub mod dispatch;
 pub mod fragment;
 pub mod frame;
+pub mod gateway;
 pub mod handshake;
+pub mod member;
 pub mod pipe;
 pub mod session;
 pub mod version;

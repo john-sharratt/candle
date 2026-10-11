@@ -4,10 +4,13 @@
 //! it.
 
 use std::net::IpAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{ArgAction, Args};
 use serde::Deserialize;
 
+use crate::cluster::ClusterSettings;
 use crate::server::Listen;
 
 /// The process's flags.
@@ -51,6 +54,29 @@ pub struct HostArgs {
     #[arg(long, value_name = "EMAIL")]
     pub local_signin: Option<String>,
 
+    /// A gateway to join as a cluster member (`docs/replicated_substrate.md`
+    /// §3.2): `https://code.tokera.com`, or `https://192.168.0.5:9443` with
+    /// `--cluster-name`. Repeatable, one per gateway. Each tenant dials each
+    /// one, and while joined its requests are routed by the cluster. Absent,
+    /// the daemon runs standalone and opens no socket.
+    #[arg(long = "cluster", value_name = "URL")]
+    pub clusters: Vec<String>,
+
+    /// The name a gateway's certificate is verified against when a `--cluster`
+    /// names an address; by default the URL's host.
+    #[arg(long, value_name = "HOST")]
+    pub cluster_name: Option<String>,
+
+    /// The group key file (64 hex digits) a member proves it holds. Required
+    /// with `--cluster`.
+    #[arg(long, value_name = "FILE")]
+    pub group_key: Option<PathBuf>,
+
+    /// How long, in minutes, a conversation's claim lives on this member
+    /// without serving a request before it is released (§5.4).
+    #[arg(long, value_name = "MINUTES", default_value_t = 10)]
+    pub cluster_affinity_idle: u64,
+
     /// Increase log verbosity. -v = DEBUG, -vv = TRACE.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -64,6 +90,10 @@ impl Default for HostArgs {
             tls_port: None,
             gateways: Vec::new(),
             local_signin: None,
+            clusters: Vec::new(),
+            cluster_name: None,
+            group_key: None,
+            cluster_affinity_idle: 10,
             verbose: 0,
         }
     }
@@ -94,6 +124,18 @@ impl HostArgs {
             tls_port: self.tls_port,
             gateways: self.gateways.clone(),
         })
+    }
+
+    /// The cluster this process joins, if any `--cluster` is given; its
+    /// machine name is `host`.
+    pub fn cluster(&self, host: String) -> anyhow::Result<Option<ClusterSettings>> {
+        ClusterSettings::parse(
+            &self.clusters,
+            self.cluster_name.as_deref(),
+            self.group_key.as_deref(),
+            Duration::from_secs(self.cluster_affinity_idle * 60),
+            host,
+        )
     }
 }
 
@@ -153,6 +195,59 @@ mod tests {
             IpAddr::from([127, 0, 0, 1])
         );
         assert!(named("zend.local").listen().is_err());
+    }
+
+    /// The cluster flags read the same from the command line and from YAML; a
+    /// cluster needs its key and a key needs a cluster; each `--cluster`
+    /// becomes a target verified by `--cluster-name`.
+    #[test]
+    fn cluster_flags_parse_and_need_their_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = tmp.path().join("group.key");
+        std::fs::write(&key, "ab".repeat(32)).unwrap();
+        let key_arg = key.to_string_lossy().to_string();
+        let flags = Cli::try_parse_from([
+            "x",
+            "--cluster",
+            "https://code.tokera.com",
+            "--cluster",
+            "https://192.168.0.5:9443",
+            "--cluster-name",
+            "code.tokera.com",
+            "--group-key",
+            &key_arg,
+            "--cluster-affinity-idle",
+            "5",
+        ])
+        .unwrap()
+        .host;
+        let yaml: HostArgs = serde_yaml::from_str(&format!(
+            "clusters: [\"https://code.tokera.com\", \"https://192.168.0.5:9443\"]\n\
+             cluster_name: code.tokera.com\ngroup_key: '{key_arg}'\ncluster_affinity_idle: 5\n"
+        ))
+        .unwrap();
+        assert_eq!(flags, yaml);
+        let settings = flags.cluster("m5".into()).unwrap().expect("a cluster");
+        assert_eq!(settings.targets.len(), 2);
+        assert_eq!(
+            settings.targets[1].tls_name.as_deref(),
+            Some("code.tokera.com")
+        );
+        assert_eq!(settings.affinity_idle, Duration::from_secs(300));
+        assert_eq!(settings.host, "m5");
+
+        assert!(HostArgs::default().cluster("m".into()).unwrap().is_none());
+        let keyless = HostArgs {
+            clusters: vec!["https://code.tokera.com".into()],
+            ..HostArgs::default()
+        };
+        let err = keyless.cluster("m".into()).unwrap_err().to_string();
+        assert!(err.contains("--group-key"), "{err}");
+        let clusterless = HostArgs {
+            group_key: Some(key),
+            ..HostArgs::default()
+        };
+        assert!(clusterless.cluster("m".into()).is_err());
     }
 
     /// `--local-signin` is for a daemon with no gateway; beside one it is

@@ -115,6 +115,9 @@ use crate::sim::Sim;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
 use candle_conversation::EngineSource;
+use cluster::member::{ClusterView, Link};
+use host::cluster::view::{admitted, connecting_detail, model_id};
+use host::cluster::Join;
 use host::download::ensure_model_pack;
 use host::process::fatal;
 use host::MODEL;
@@ -3730,6 +3733,9 @@ pub struct LoadPlan {
     /// npcd's substrate is attached to the engine a higher one built
     /// (`candle_conversation::EngineSlot`).
     pub engine: EngineSource,
+    /// The cluster the process joins with `--cluster`, connected once the
+    /// substrate is open; `None` standalone.
+    pub cluster: Option<Join>,
     /// The characters to wake, each with the world it belongs to and the room
     /// it was last standing in. From the substrate's character store.
     ///
@@ -3984,6 +3990,40 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             .keeping_turns(keep_turns)
             .asking(reflection),
     ));
+
+    // ── the cluster ────────────────────────────────────────────────────────
+    //
+    // With `--cluster`, joined now that the substrate — and the node it carries
+    // — is open, and before the load writes anything the group would share
+    // (`docs/replicated_substrate.md` §7.6). A gateway that refuses this build
+    // for good holds the load here, the reason on the loading page, until the
+    // process stops.
+    if let Some(join) = &plan.cluster {
+        p.set_step(LoadStep::Connecting);
+        let (node, model, writer) = {
+            let e = engine.lock().unwrap();
+            let conv = e.conversation();
+            (conv.node(), model_id(e.model_key()), conv.clone())
+        };
+        let report = |views: &[ClusterView]| {
+            p.set_progress(admitted(views), views.len() as u64);
+            p.set_detail(connecting_detail(views));
+        };
+        let stopping = || rt.stopping();
+        let link = join.connect(
+            node,
+            Some(model),
+            move || writer.last_oseq(),
+            stopping,
+            report,
+        );
+        if let Link::Stopped(_) = link {
+            join.hold(stopping, report);
+        }
+        if rt.stopping() {
+            anyhow::bail!("the process stopped while connecting to the cluster");
+        }
+    }
 
     // ── the mind's layers ──────────────────────────────────────────────────
     //

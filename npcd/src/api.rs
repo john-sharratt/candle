@@ -20,9 +20,10 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
     Json,
 };
+use cluster::dispatch::{Dispatch, Merge};
+use host::guard::{delete, get, post, put};
 // Only the test-only `router` builds one directly; the tenant goes through `api`.
 #[cfg(test)]
 use axum::Router;
@@ -203,48 +204,76 @@ impl Authored {
 /// Paths whose methods differ in role are registered twice, which axum merges:
 /// reading a world is open and writing one is an admin's, and one line each is
 /// what makes that visible.
+///
+/// Under a cluster (`docs/replicated_substrate.md` §5.2) authored content is
+/// read from any member and written on the best one; a character's routes go to
+/// the member holding its lease, and a life's to the member that claimed it, so
+/// a generation and the job that reports on it are on one machine.
 pub fn api(roles: Roles) -> Api<Arc<Authored>> {
+    let character = || Dispatch::owner_path("nid");
+    let life = || Dispatch::sticky_path("who");
     Api::new(roles)
         // Authored content. Anyone may read it; only an admin may change a file
         // on disk. The mind is not under version control, so a bad write is not
         // a row to restore — it is prose somebody wrote, gone.
-        .route("/v1/world", Role::Unauthenticated, get(list_worlds))
-        .route("/v1/world/:wid", Role::Unauthenticated, get(get_world))
+        .route(
+            "/v1/world",
+            Role::Unauthenticated,
+            Dispatch::Any,
+            get(list_worlds),
+        )
+        .route(
+            "/v1/world/:wid",
+            Role::Unauthenticated,
+            Dispatch::Any,
+            get(get_world),
+        )
         // The response and mood libraries, read from the mind. This used to
         // fall through to the fixture, which answered with six invented
         // templates where the mind holds 596 — see [`crate::collections`].
         .route(
             "/v1/world/:wid/collections",
             Role::Unauthenticated,
+            Dispatch::Any,
             get(world_collections),
         )
         .route(
             "/v1/world/:wid",
             Role::Admin,
+            Dispatch::Best,
             put(put_world).delete(delete_world),
         )
         // The narrative clock. Admin for the same reason the document is: every
         // character in the world dates what they remember by it.
-        .route("/v1/world/:wid/time", Role::Admin, put(put_world_time))
+        .route(
+            "/v1/world/:wid/time",
+            Role::Admin,
+            Dispatch::Best,
+            put(put_world_time),
+        )
         .route(
             "/v1/personality",
             Role::Unauthenticated,
+            Dispatch::Any,
             get(list_personalities),
         )
         .route(
             "/v1/personality/:aid",
             Role::Unauthenticated,
+            Dispatch::Any,
             get(get_personality),
         )
         .route(
             "/v1/personality/:aid",
             Role::Admin,
+            Dispatch::Best,
             put(put_personality).delete(delete_personality),
         )
         // The anchor, the facets and the doctrine, from the document itself.
         .route(
             "/v1/personality/:aid/collections",
             Role::Unauthenticated,
+            Dispatch::Any,
             get(personality_collections),
         )
         // A character's life: the plan, the strata, and generating them.
@@ -280,51 +309,90 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/image/cutout",
             Role::User,
+            Dispatch::Best,
             post(guest_routes::post_cutout),
         )
-        .route("/v1/guest", Role::Admin, get(guest_routes::get_guests))
+        // The guests each member is running.
+        .route(
+            "/v1/guest",
+            Role::Admin,
+            Dispatch::Aggregate(Merge::Envelope),
+            get(guest_routes::get_guests),
+        )
         .route(
             "/v1/guest/image",
             Role::Admin,
+            Dispatch::Best,
             post(guest_routes::post_image),
         )
-        .route("/v1/generate/prose", Role::Admin, post(prose::post_prose))
+        .route(
+            "/v1/generate/prose",
+            Role::Admin,
+            Dispatch::Best,
+            post(prose::post_prose),
+        )
         // One stratum of a life, rewritten in the narrator's voice. The ladder
         // (`/generate`) is the right shape for a five-hundred-node fan-out; this
         // is the other case — one node, on demand.
         .route(
             "/v1/life/:who/node/:key/narrate",
             Role::Admin,
+            life(),
             post(lifegen_narrate::post_narrate),
         )
-        .route("/v1/life/catalog", Role::Admin, get(lifegen::get_catalog))
-        .route("/v1/life/:who", Role::Admin, get(lifegen::get_life))
-        .route("/v1/life/:who/seed", Role::Admin, put(lifegen::put_seed))
+        .route(
+            "/v1/life/catalog",
+            Role::Admin,
+            Dispatch::Any,
+            get(lifegen::get_catalog),
+        )
+        .route("/v1/life/:who", Role::Admin, life(), get(lifegen::get_life))
+        .route(
+            "/v1/life/:who/seed",
+            Role::Admin,
+            life(),
+            put(lifegen::put_seed),
+        )
         .route(
             "/v1/life/:who/node/:key",
             Role::Admin,
+            life(),
             put(lifegen::put_node),
         )
-        .route("/v1/life/:who/day", Role::Admin, post(lifegen::post_day))
+        .route(
+            "/v1/life/:who/day",
+            Role::Admin,
+            life(),
+            post(lifegen::post_day),
+        )
         .route(
             "/v1/life/:who/day/:date",
             Role::Admin,
+            life(),
             delete(lifegen::delete_day),
         )
         .route(
             "/v1/life/:who/day/:date/consequences",
             Role::Admin,
+            life(),
             put(lifegen::put_consequences),
         )
         .route(
             "/v1/life/:who/generate",
             Role::Admin,
+            life(),
             post(lifegen::post_generate),
         )
-        .route("/v1/life/:who/job", Role::Admin, get(lifegen::get_job))
+        .route(
+            "/v1/life/:who/job",
+            Role::Admin,
+            life(),
+            get(lifegen::get_job),
+        )
         .route(
             "/v1/life/:who/cancel",
             Role::Admin,
+            life(),
             post(lifegen::post_cancel),
         )
         // The authored corpus — canon, craft, characters, settings. Addressed
@@ -337,19 +405,30 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         // corpus a level at a time, which is exactly the browsing the `hidden`
         // flag exists to prevent. The console is a signed-in tool, so this
         // costs nothing that was available anyway.
-        .route("/v1/mind/list", Role::User, get(mind_list))
-        .route("/v1/mind/entry", Role::User, get(mind_entry))
+        .route("/v1/mind/list", Role::User, Dispatch::Any, get(mind_list))
+        .route("/v1/mind/entry", Role::User, Dispatch::Any, get(mind_entry))
         .route(
             "/v1/mind/entry",
             Role::Admin,
+            Dispatch::Best,
             put(put_mind_entry).delete(delete_mind_entry),
         )
         // The same entry as fields rather than as text, so it can be edited by
         // somebody who does not know YAML. A save patches the values into the
         // document that is there, keeping the authoring comments above every
         // key — see [`crate::mind::section`].
-        .route("/v1/mind/fields", Role::User, get(mind_fields))
-        .route("/v1/mind/fields", Role::Admin, put(put_mind_fields))
+        .route(
+            "/v1/mind/fields",
+            Role::User,
+            Dispatch::Any,
+            get(mind_fields),
+        )
+        .route(
+            "/v1/mind/fields",
+            Role::Admin,
+            Dispatch::Best,
+            put(put_mind_fields),
+        )
         // The nine layers are the host's `/v1/schema/layers`, which reads them
         // from npcd through [`schema_layers`].
         //
@@ -357,15 +436,27 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         // record in the substrate owned by the signed-in account. `User` is the
         // bar; *ownership* is the rest of the answer and is checked per-record
         // in the handler, because a role cannot express "yours" (§8.2).
-        .route("/v1/npc", Role::User, get(list_npcs).post(create_npc))
+        .route("/v1/npc", Role::User, Dispatch::Any, get(list_npcs))
+        .route("/v1/npc", Role::User, Dispatch::Best, post(create_npc))
         // Backup and restore the whole cast, for a substrate wipe-and-rebuild.
         // Admin-only: export carries every character's record regardless of
         // owner, and import writes them verbatim into a fresh substrate.
-        .route("/v1/npcs/export", Role::Admin, get(export_npcs))
-        .route("/v1/npcs/import", Role::Admin, post(import_npcs))
+        .route(
+            "/v1/npcs/export",
+            Role::Admin,
+            Dispatch::Any,
+            get(export_npcs),
+        )
+        .route(
+            "/v1/npcs/import",
+            Role::Admin,
+            Dispatch::Best,
+            post(import_npcs),
+        )
         .route(
             "/v1/npc/:nid",
             Role::User,
+            character(),
             get(get_npc).patch(patch_npc).delete(delete_npc),
         )
         // Two fields with routes of their own, because the console edits them
@@ -373,41 +464,85 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         // and a checkbox, each saving on the spot. They are `PATCH` underneath
         // — same validation, same record, same supersession — and exist so the
         // console does not have to send a whole character to add one tag.
-        .route("/v1/npc/:nid/tags", Role::User, put(put_npc_tags))
-        .route("/v1/npc/:nid/hidden", Role::User, put(put_npc_hidden))
+        .route(
+            "/v1/npc/:nid/tags",
+            Role::User,
+            character(),
+            put(put_npc_tags),
+        )
+        .route(
+            "/v1/npc/:nid/hidden",
+            Role::User,
+            character(),
+            put(put_npc_hidden),
+        )
         // The authoring plane (§16). `User` is the bar; ownership is the rest
         // of the answer and is checked per record.
-        .route("/v1/npc/:nid/beliefs", Role::User, get(get_beliefs))
+        .route(
+            "/v1/npc/:nid/beliefs",
+            Role::User,
+            character(),
+            get(get_beliefs),
+        )
         .route(
             "/v1/npc/:nid/beliefs/:bid",
             Role::User,
+            character(),
             put(put_belief).delete(delete_belief),
         )
         .route(
             "/v1/npc/:nid/relationships",
             Role::User,
+            character(),
             get(get_relationships),
         )
         .route(
             "/v1/npc/:nid/relationships/:eid",
             Role::User,
+            character(),
             put(put_relationship),
         )
-        .route("/v1/npc/:nid/agency", Role::User, get(get_agency))
-        .route("/v1/npc/:nid/agency/:sid", Role::User, put(put_strategy))
+        .route(
+            "/v1/npc/:nid/agency",
+            Role::User,
+            character(),
+            get(get_agency),
+        )
+        .route(
+            "/v1/npc/:nid/agency/:sid",
+            Role::User,
+            character(),
+            put(put_strategy),
+        )
         // Stops the character, runs the reflection's decodes, throws the
         // conversation away.
         // `User` for the same reason the portrait route is: it is *your own*
         // character, and the handler refuses one that is not.
-        .route("/v1/npc/:nid/reflect", Role::User, post(post_reflect))
-        .route("/v1/npc/:nid/dream", Role::User, post(post_dream))
+        .route(
+            "/v1/npc/:nid/reflect",
+            Role::User,
+            character(),
+            post(post_reflect),
+        )
+        .route(
+            "/v1/npc/:nid/dream",
+            Role::User,
+            character(),
+            post(post_dream),
+        )
         .route(
             "/v1/npc/:nid/modulation",
             Role::User,
+            character(),
             get(get_modulation).put(put_modulation),
         )
         // A portrait is a file, and needs no engine — see [`crate::images`].
-        .route("/v1/npc/:nid/portrait", Role::User, put(put_portrait))
+        .route(
+            "/v1/npc/:nid/portrait",
+            Role::User,
+            character(),
+            put(put_portrait),
+        )
         // Drawing one does need an engine, and stops every character thinking
         // while it runs. `User` rather than `Admin` all the same: it is a
         // portrait of *your own* character, the route refuses anything you do
@@ -416,6 +551,7 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/npc/:nid/portrait/generate",
             Role::User,
+            character(),
             post(portrait::post_generate),
         )
         // `/v1/image/models` and `/v1/generate/description` are **not** here.
@@ -423,7 +559,7 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         // was written against, and that is where their real implementations now
         // live — a second registration is not an override, it is an
         // "overlapping method route" panic at startup.
-        .route("/v1/image/:iid", Role::User, get(get_image))
+        .route("/v1/image/:iid", Role::User, Dispatch::Best, get(get_image))
         // An account and its profile are the caller's own, so `User` and then
         // the record is keyed by their subject — there is no id in these paths
         // to belong to somebody else. `/v1/me` itself is the host's, which
@@ -431,24 +567,39 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/me/profile",
             Role::User,
-            get(get_profile).put(put_profile),
+            Dispatch::Any,
+            get(get_profile),
+        )
+        .route(
+            "/v1/me/profile",
+            Role::User,
+            Dispatch::Best,
+            put(put_profile),
         )
         .route(
             "/v1/me/profile/history",
             Role::User,
+            Dispatch::Any,
             get(get_profile_history),
         )
         .route(
             "/v1/me/profile/history/:rev",
             Role::User,
+            Dispatch::Any,
             get(get_profile_revision),
         )
         .route(
             "/v1/me/profile/restore/:rev",
             Role::User,
+            Dispatch::Best,
             post(restore_profile),
         )
-        .route("/v1/me/unique-name", Role::User, put(put_unique_name))
+        .route(
+            "/v1/me/unique-name",
+            Role::User,
+            Dispatch::Best,
+            put(put_unique_name),
+        )
 }
 
 /// The finished router, for tests. The tenant builds it from [`api`] so the
@@ -3196,7 +3347,10 @@ mod tests {
                 ("/v1/mind/entry", "admin"),
                 ("/v1/mind/fields", "user"),
                 ("/v1/mind/fields", "admin"),
-                // The cast: signed in, then ownership per record.
+                // The cast: signed in, then ownership per record. Two
+                // registrations because the listing reads anywhere and the
+                // create goes to the best member.
+                ("/v1/npc", "user"),
                 ("/v1/npc", "user"),
                 // The whole cast in and out as records, for backup/restore —
                 // `admin`, a full-estate read and a bulk write.
@@ -3228,7 +3382,9 @@ mod tests {
                 // character they just made.
                 ("/v1/npc/:nid/portrait/generate", "user"),
                 ("/v1/image/:iid", "user"),
-                // The caller's own account. `/v1/me` itself is the host's.
+                // The caller's own account. `/v1/me` itself is the host's. The
+                // read and the write are registered apart for their dispatch.
+                ("/v1/me/profile", "user"),
                 ("/v1/me/profile", "user"),
                 ("/v1/me/profile/history", "user"),
                 ("/v1/me/profile/history/:rev", "user"),

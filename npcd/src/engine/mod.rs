@@ -123,8 +123,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
 use axum::Json;
+use cluster::dispatch::{Dispatch, Merge};
+use host::guard::{delete, get, patch, post};
 use serde_json::{json, Value};
 use web::auth::{Identity, Role, Roles};
 
@@ -148,60 +149,111 @@ pub fn no_engine(what: &str) -> Response {
     )
 }
 
+/// The engine's routes. Under a cluster (`docs/replicated_substrate.md` §5.2)
+/// a character's go to the member holding its lease, an interaction's to the
+/// member holding its character (the id is `<nid>-<n>`), a world's live state
+/// to its authority, the cast-wide instruments to every member, and generation
+/// to the best one.
 pub fn api(roles: Roles) -> Api<Arc<Authored>> {
+    let character = || Dispatch::owner_path("nid");
+    let interaction_owner = || Dispatch::owner_path("ix");
+    let world = || Dispatch::owner_path("wid");
+    let each = || Dispatch::Aggregate(Merge::Envelope);
     Api::new(roles)
         // ── the substrate, as it actually is ────────────────────────────────
-        .route("/v1/npc/:nid/substrate", Role::User, get(substrate))
+        .route(
+            "/v1/npc/:nid/substrate",
+            Role::User,
+            character(),
+            get(substrate),
+        )
         .route(
             "/v1/npc/:nid/substrate/layer/:layer",
             Role::User,
+            character(),
             get(layer),
         )
         .route(
             "/v1/npc/:nid/substrate/turn/:layer/:turn",
             Role::User,
+            character(),
             get(turn),
         )
-        .route("/v1/npc/:nid/memory", Role::User, get(memory))
+        .route("/v1/npc/:nid/memory", Role::User, character(), get(memory))
         // ── the scenario harness ────────────────────────────────────────────
         //
         // Put a situation to a character that does not exist and report
         // everything about what came back. Admin, because it spends the one
         // card's time and reports the daemon's own prompt.
-        .route("/v1/simulate", Role::Admin, post(simulate::run))
+        .route(
+            "/v1/simulate",
+            Role::Admin,
+            Dispatch::Best,
+            post(simulate::run),
+        )
         // ── instruments ─────────────────────────────────────────────────────
-        .route("/v1/npc/:nid/projection", Role::User, get(projection_now))
+        .route(
+            "/v1/npc/:nid/projection",
+            Role::User,
+            character(),
+            get(projection_now),
+        )
         .route(
             "/v1/npc/:nid/projection/:tick",
             Role::User,
+            character(),
             get(projection_at),
         )
         .route(
             "/v1/npc/:nid/system-prompt",
             Role::User,
+            character(),
             get(pulse::system_prompt),
         )
         .route(
             "/v1/npc/:nid/prompt-tokens",
             Role::User,
+            character(),
             get(pulse::prompt_tokens),
         )
-        .route("/v1/npc/:nid/monitor", Role::User, get(monitor))
-        .route("/v1/npc/:nid/project", Role::User, post(probe))
-        .route("/v1/npc/:nid/perceive", Role::User, post(perceive))
+        .route(
+            "/v1/npc/:nid/monitor",
+            Role::User,
+            character(),
+            get(monitor),
+        )
+        .route("/v1/npc/:nid/project", Role::User, character(), post(probe))
+        .route(
+            "/v1/npc/:nid/perceive",
+            Role::User,
+            character(),
+            post(perceive),
+        )
         // ── interactions ────────────────────────────────────────────────────
         .route(
             "/v1/npc/:nid/interaction",
             Role::User,
+            character(),
             get(list_interactions).post(open_interaction),
         )
         .route(
             "/v1/interaction/:ix",
             Role::User,
+            interaction_owner(),
             get(interaction).delete(end_interaction),
         )
-        .route("/v1/interaction/:ix/inject", Role::User, post(inject))
-        .route("/v1/interaction/:ix/stream", Role::User, get(stream))
+        .route(
+            "/v1/interaction/:ix/inject",
+            Role::User,
+            interaction_owner(),
+            post(inject),
+        )
+        .route(
+            "/v1/interaction/:ix/stream",
+            Role::User,
+            interaction_owner(),
+            get(stream),
+        )
         // ── messaging a character ───────────────────────────────────────────
         //
         // **Real, and the same handset the characters use.** Not a private
@@ -213,6 +265,7 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/npc/:nid/message",
             Role::User,
+            character(),
             get(get_messages).post(post_message),
         )
         // ── missions ────────────────────────────────────────────────────────
@@ -223,28 +276,37 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/npc/:nid/mission",
             Role::User,
+            character(),
             get(mission_api::status).post(mission_api::lodge),
         )
         // Call off one owned character's mission.
         .route(
             "/v1/npc/:nid/mission/cancel",
             Role::User,
+            character(),
             post(mission_api::cancel),
         )
         // Tick off or add a step on one owned character's open mission.
         .route(
             "/v1/npc/:nid/mission/step",
             Role::User,
+            character(),
             post(mission_api::step),
         )
         // ── looking inside a character, and steering it ─────────────────────
         //
         // Ask it a question and force an answer; put a thought in its head. Both
         // write to one owned character, so `User` plus the ownership check.
-        .route("/v1/npc/:nid/ask", Role::User, post(ask_api::ask))
+        .route(
+            "/v1/npc/:nid/ask",
+            Role::User,
+            character(),
+            post(ask_api::ask),
+        )
         .route(
             "/v1/npc/:nid/mind_control",
             Role::User,
+            character(),
             post(ask_api::mind_control),
         )
         // ── the world's open channel ────────────────────────────────────────
@@ -255,66 +317,125 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         // `User`'s, and speaking on it is a `Creator`'s, because it reaches
         // every character in a world at once and ownership cannot express that.
         // See [`post_channel`].
-        .route("/v1/world/:wid/channel", Role::User, get(get_channel))
-        .route("/v1/world/:wid/channel", Role::Creator, post(post_channel))
+        .route(
+            "/v1/world/:wid/channel",
+            Role::User,
+            world(),
+            get(get_channel),
+        )
+        .route(
+            "/v1/world/:wid/channel",
+            Role::Creator,
+            world(),
+            post(post_channel),
+        )
         // Words left on something in a world, for whoever comes to it — the
         // world's half of `post_notice`. Creator for the same reason the
         // channel's write side is: it writes into a world rather than into a
         // character somebody owns.
-        .route("/v1/world/:wid/posting", Role::Creator, post(post_posting))
+        .route(
+            "/v1/world/:wid/posting",
+            Role::Creator,
+            world(),
+            post(post_posting),
+        )
         // ── the act vocabulary ──────────────────────────────────────────────
         //
         // Real: the catalog and the `/` command list are compiled in, and both
         // are served rather than duplicated in the console so the two cannot
         // drift. The catalog is the host's `/v1/tools`, which reads it from
         // npcd through [`pulse::catalog`].
-        .route("/v1/commands", Role::User, get(pulse::commands))
+        .route(
+            "/v1/commands",
+            Role::User,
+            Dispatch::Any,
+            get(pulse::commands),
+        )
         // ── Pulse: the cast's loop, as an instrument ────────────────────────
-        .route("/v1/pulse", Role::User, get(pulse::feed))
-        .route("/v1/pulse/census", Role::User, get(pulse::census))
+        .route("/v1/pulse", Role::User, each(), get(pulse::feed))
+        .route("/v1/pulse/census", Role::User, each(), get(pulse::census))
         // Where everybody is standing. The one question the feed and the window
         // between them cannot answer — see [`pulse::world`].
         //
         // Under `/v1/pulse`, not `/v1/world`: that one is the authored world
         // registry, which is a different thing entirely — the documents an
         // author wrote, not the simulation running from them.
-        .route("/v1/pulse/world", Role::User, get(pulse::world))
-        .route("/v1/npc/:nid/pulse", Role::User, post(pulse::inject))
+        .route("/v1/pulse/world", Role::User, each(), get(pulse::world))
+        .route(
+            "/v1/npc/:nid/pulse",
+            Role::User,
+            character(),
+            post(pulse::inject),
+        )
         // A line spoken straight into a character's world, from any in-world
         // voice at a chosen loudness — the influence primitive under the
         // console's `/` notation. `User` plus the ownership check inside, like
         // `pulse`: it reaches only a character the caller owns.
-        .route("/v1/npc/:nid/direct", Role::User, post(pulse::direct))
-        .route("/v1/npc/:nid/window", Role::User, get(pulse::window))
+        .route(
+            "/v1/npc/:nid/direct",
+            Role::User,
+            character(),
+            post(pulse::direct),
+        )
+        .route(
+            "/v1/npc/:nid/window",
+            Role::User,
+            character(),
+            get(pulse::window),
+        )
         // What the character's `scan` tells it, as prose and as the data behind it.
-        .route("/v1/npc/:nid/scan", Role::User, get(pulse::scan))
+        .route(
+            "/v1/npc/:nid/scan",
+            Role::User,
+            character(),
+            get(pulse::scan),
+        )
         // The character's journal and what its drafts have been doing, and a way
         // to draft one now. `User` plus the ownership check inside, like `window`.
-        .route("/v1/npc/:nid/journal", Role::User, get(pulse::journal))
+        .route(
+            "/v1/npc/:nid/journal",
+            Role::User,
+            character(),
+            get(pulse::journal),
+        )
         .route(
             "/v1/npc/:nid/journal/draft",
             Role::User,
+            character(),
             post(pulse::journal_draft),
         )
         // Forget one entry: out of the character's memory and its prompt.
         .route(
             "/v1/npc/:nid/journal/:eid",
             Role::User,
+            character(),
             delete(pulse::journal_forget),
         )
         // Admin: it reaches characters the caller does not own, which every
-        // other route on this daemon refuses to do.
-        .route("/v1/pulse/broadcast", Role::Admin, post(pulse::broadcast))
+        // other route on this daemon refuses to do — on every member, each to
+        // the characters it runs.
+        .route(
+            "/v1/pulse/broadcast",
+            Role::Admin,
+            each(),
+            post(pulse::broadcast),
+        )
         // A plain announcement to the whole world at URGENT — the announcement-
         // shaped sibling of `broadcast`. Admin for the same reason: it reaches
         // every character, including ones the caller does not own.
-        .route("/v1/pulse/announce", Role::Admin, post(pulse::announce))
+        .route(
+            "/v1/pulse/announce",
+            Role::Admin,
+            each(),
+            post(pulse::announce),
+        )
         // The command table: open it to call the cast to take up missions, shut
         // it to stand them down. Admin — it reaches the whole cast, and drives
         // every character, including ones the caller does not own.
         .route(
             "/v1/pulse/command-table",
             Role::Admin,
+            each(),
             post(mission_api::command_table),
         )
         // What the guardian has found and done. Admin: it names every
@@ -322,12 +443,17 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/pulse/guardian",
             Role::Admin,
+            each(),
             get(guardian_api::records),
         )
+        // The mission board and the operations on it are a world's, and go to
+        // its authority; a route that names no world goes to the best member.
+        //
         // Clear the whole board's missions at once.
         .route(
             "/v1/pulse/missions/cancel",
             Role::Admin,
+            world(),
             post(mission_api::cancel_all),
         )
         // The table's generator: write one mission now, and read or clear what
@@ -336,11 +462,13 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/pulse/missions/generate",
             Role::Admin,
+            world(),
             post(mission_api::generate),
         )
         .route(
             "/v1/pulse/missions/pool",
             Role::Admin,
+            world(),
             get(mission_api::pool).delete(mission_api::discard_pool),
         )
         // Operations: the objectives the table holds, each a draft and a review
@@ -349,32 +477,38 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/pulse/operations",
             Role::Admin,
+            world(),
             get(operations_api::list).post(operations_api::review),
         )
         .route(
             "/v1/pulse/operations/:wid/:oid",
             Role::Admin,
+            world(),
             patch(operations_api::edit),
         )
         .route(
             "/v1/pulse/operations/:wid/:oid/cancel",
             Role::Admin,
+            world(),
             post(operations_api::cancel),
         )
         .route(
             "/v1/pulse/operations/:wid/:oid/step",
             Role::Admin,
+            world(),
             post(operations_api::step),
         )
         .route(
             "/v1/pulse/operations/:wid/:oid/document",
             Role::Admin,
+            world(),
             get(operations_api::document),
         )
         // ── generation ──────────────────────────────────────────────────────
         .route(
             "/v1/generate/description",
             Role::User,
+            Dispatch::Best,
             post(gen_description),
         )
         // The same generation, arriving a token at a time. Both, because they
@@ -382,18 +516,44 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         .route(
             "/v1/generate/description/stream",
             Role::User,
+            Dispatch::Best,
             post(gen_description_stream),
         )
         // Named before described: the create form fills the name field the
         // moment it opens, and the description is then written about that
         // person rather than inventing a second one.
-        .route("/v1/generate/name", Role::User, post(gen_name))
-        .route("/v1/generate/attributes", Role::User, post(gen_attributes))
-        .route("/v1/image/generate", Role::User, post(gen_image))
-        .route("/v1/image/models", Role::User, get(image_models))
-        .route("/v1/image/queue", Role::User, get(image_queue))
+        .route(
+            "/v1/generate/name",
+            Role::User,
+            Dispatch::Best,
+            post(gen_name),
+        )
+        .route(
+            "/v1/generate/attributes",
+            Role::User,
+            Dispatch::Best,
+            post(gen_attributes),
+        )
+        .route(
+            "/v1/image/generate",
+            Role::User,
+            Dispatch::Best,
+            post(gen_image),
+        )
+        .route(
+            "/v1/image/models",
+            Role::User,
+            Dispatch::Best,
+            get(image_models),
+        )
+        .route(
+            "/v1/image/queue",
+            Role::User,
+            Dispatch::Best,
+            get(image_queue),
+        )
         // ── the push stream ─────────────────────────────────────────────────
-        .route("/ws/events", Role::User, get(events))
+        .route("/ws/events", Role::User, Dispatch::Any, get(events))
 }
 
 /// Live character state — ticks, monitor bands, inbox depth.

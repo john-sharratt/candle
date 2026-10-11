@@ -31,6 +31,13 @@ hyper          = { version = "1", features = ["client", "server", "http1", "http
 hyper-util     = { version = "0.1", features = ["client", "client-legacy", "server", "server-auto", "server-graceful", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
 bytes          = "1"
+# The cluster's members (`docs/replicated_substrate.md`): the socket each one
+# dials in on, admission, and which member a request goes to. No CUDA.
+cluster        = { path = "../cluster" }
+# A merged aggregate (`/ws/logs`) opens a WebSocket to each member over its
+# stream; the handshake is the only feature it needs.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util      = "0.3"
 
 # The TLS entrance: HTTP/3 over QUIC, with HTTP/2 and HTTP/1.1 over TCP for a
 # client that cannot reach UDP. `ring` throughout, explicitly — the aws-lc
@@ -76,10 +83,9 @@ base64  = { workspace = true }
 rand    = { workspace = true }
 
 [dev-dependencies]
-# A real websocket client for the `/ws/*` tests: the frames the console reads
-# must survive framing, not merely leave the handler.
-tokio-tungstenite = "0.24"
-futures-util      = "0.3"
+# A real websocket client for the `/ws/*` tests, which dial over TCP: the
+# frames the console reads must survive framing, not merely leave the handler.
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
 # `test-util`, for `#[tokio::test(start_paused = true)]`. Tokio's `full` leaves
 # it out on purpose, so the dependency above cannot supply it. The mock console
 # streams on a 1.4s/2.6s cadence chosen so a human can read the pane, and a test

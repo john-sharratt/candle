@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut b = Builder::new(cfg).with_auth()?;
+    let mut b = Builder::new(cfg).with_auth()?.with_cluster()?;
     if cli.authoritative {
         tracing::info!("authoritative: APIs answered from the built-in mocks, nothing forwarded");
         let sites: Vec<String> = b.sites().map(str::to_owned).collect();

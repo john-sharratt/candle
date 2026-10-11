@@ -17,11 +17,12 @@ mod waves;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::routing::{get, post};
+use cluster::dispatch::{Dispatch, Merge};
 use web::auth::{Role, Roles};
 use web::Roots;
 
-use crate::guard::{Api, Guarded, Routes};
+use crate::cluster::Cluster;
+use crate::guard::{get, post, Api, Guarded, Routes};
 use crate::logs::LogBus;
 use crate::model::ModelView;
 use crate::telemetry::Telemetry;
@@ -46,6 +47,9 @@ pub struct Shared {
     pub telemetry: Arc<Telemetry>,
     /// The estate's role table, for `/v1/me`.
     pub roles: Roles,
+    /// The cluster this process joined with `--cluster`, for `/v1/status`'s
+    /// `cluster` block; `None` standalone.
+    pub cluster: Option<Arc<Cluster>>,
 }
 
 impl Shared {
@@ -76,41 +80,93 @@ pub fn declared(roles: Roles) -> Vec<Guarded> {
     all
 }
 
-/// The shared endpoints, graded by the estate's table.
+/// The shared endpoints, graded by the estate's table. What one machine
+/// reports about itself is every member's under a cluster — an envelope of
+/// each (`docs/replicated_substrate.md` §5.2, §5.5); what every member answers
+/// alike goes to any of them.
 fn shared_table(roles: Roles) -> Api<Arc<Shared>> {
+    let each = || Dispatch::Aggregate(Merge::Envelope);
     Api::new(roles)
         // The liveness probe both consoles poll at boot, before they know who is
         // looking — the one route that must answer a caller nobody has named.
-        .route("/v1/status", Role::Unauthenticated, get(status::status))
+        .route(
+            "/v1/status",
+            Role::Unauthenticated,
+            each(),
+            get(status::status),
+        )
         // Signed out is an answer (`role: "unauthenticated"`), not an error: a
         // page reads the role and decides what to offer.
-        .route("/v1/me", Role::Unauthenticated, get(me::me))
+        .route("/v1/me", Role::Unauthenticated, Dispatch::Any, get(me::me))
         // Hardware and engine readings: a signed-in operator watching the card
         // is the system page working; nothing here maps anybody's data.
-        .route("/v1/telemetry", Role::User, get(telemetry::telemetry))
-        .route("/v1/memory", Role::User, get(telemetry::memory))
-        .route("/v1/phases", Role::User, get(waves::phases))
-        .route("/v1/promotes", Role::User, get(waves::promotes))
+        .route(
+            "/v1/telemetry",
+            Role::User,
+            each(),
+            get(telemetry::telemetry),
+        )
+        .route("/v1/memory", Role::User, each(), get(telemetry::memory))
+        .route("/v1/phases", Role::User, each(), get(waves::phases))
+        .route("/v1/promotes", Role::User, each(), get(waves::promotes))
         // Reading resets the counters, so two calls bracket a window — an
         // operator's, which a reader passing by must not be able to wipe.
-        .route("/v1/profile", Role::Admin, get(profile::profile))
+        .route("/v1/profile", Role::Admin, each(), get(profile::profile))
         // The chat page is open to everyone, and it reads the catalog to show
         // what a tool call left out and the defaults it took. The catalog
         // describes what the tools take, nothing anybody has stored.
-        .route("/v1/tools", Role::Unauthenticated, get(catalog::tools))
-        .route("/v1/tools/calibrate", Role::Admin, post(catalog::calibrate))
-        .route("/v1/schema/layers", Role::User, get(catalog::layers))
+        .route(
+            "/v1/tools",
+            Role::Unauthenticated,
+            Dispatch::Any,
+            get(catalog::tools),
+        )
+        // Each member calibrates its own catalog.
+        .route(
+            "/v1/tools/calibrate",
+            Role::Admin,
+            each(),
+            post(catalog::calibrate),
+        )
+        .route(
+            "/v1/schema/layers",
+            Role::User,
+            Dispatch::Any,
+            get(catalog::layers),
+        )
         // Both of these hand a reader absolute filesystem paths — the redo log's
         // directory, and every write the log reports.
-        .route("/v1/substrate", Role::Admin, get(catalog::substrate))
-        .route("/ws/logs", Role::Admin, get(logs::logs))
+        .route(
+            "/v1/substrate",
+            Role::Admin,
+            each(),
+            get(catalog::substrate),
+        )
+        // Every member's lines, on one socket.
+        .route(
+            "/ws/logs",
+            Role::Admin,
+            Dispatch::Aggregate(Merge::Lines),
+            get(logs::logs),
+        )
 }
 
-/// The shared front-end: open to everyone, as any page's assets are.
+/// The shared front-end: open to everyone, as any page's assets are, and
+/// served by the member the page came from.
 fn front_end_table() -> Api<Roots> {
     Api::new(Roles::default())
-        .route("/common/*path", Role::Unauthenticated, get(ui::common))
-        .route("/brand/*path", Role::Unauthenticated, get(ui::brand))
+        .route(
+            "/common/*path",
+            Role::Unauthenticated,
+            Dispatch::Ui,
+            get(ui::common),
+        )
+        .route(
+            "/brand/*path",
+            Role::Unauthenticated,
+            Dispatch::Ui,
+            get(ui::brand),
+        )
 }
 
 #[cfg(test)]
@@ -207,6 +263,7 @@ pub(crate) mod test_support {
                 .collect(),
             log: LogBus::new(&["zend", "npcd"]),
             telemetry: Telemetry::new(ModelView::of_prescribed()),
+            cluster: None,
         })
     }
 

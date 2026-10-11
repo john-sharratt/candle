@@ -14,11 +14,23 @@ ahash       = { workspace = true }
 applied-set = { path = "../applied-set" }
 # The vote journal's per-half checksum.
 crc32fast   = "1.5"
+# A WebSocket is a `Sink + Stream`; the pipe adapter splits it.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hmac        = "0.12"
+http        = "1"
+# The gateway matches request paths against a member's dispatch table with the
+# matcher axum itself uses, so a pattern means the same on both sides.
+matchit     = "0.7"
+serde_json  = { workspace = true }
 sha2        = "0.10"
 rand        = { workspace = true }
+# The status page's data, as JSON.
+serde       = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { version = "1", features = ["sync", "rt", "time", "macros", "io-util"] }
+# A member's socket. No TLS and no connector here: the host that dials picks
+# its own, and the gateway's socket is axum's.
+tokio-tungstenite = { version = "0.24", default-features = false }
 
 [build-dependencies]
 sha2 = "0.10"

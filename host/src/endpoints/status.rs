@@ -22,6 +22,7 @@ use serde_json::{json, Map, Value};
 use tokio::task::spawn_blocking;
 
 use super::Shared;
+use crate::cluster::view::status_block;
 use crate::tenant::TenantStatus;
 use crate::ui::build_id;
 
@@ -70,6 +71,7 @@ fn assemble(s: &Shared, build: &str, tenants: Vec<(&str, TenantStatus)>) -> Valu
         "detail": detail,
         "loading": loading,
         "tenants": lines,
+        "cluster": s.cluster.as_deref().map(status_block),
     })
 }
 
@@ -130,6 +132,7 @@ mod tests {
                     "zend": {"state": "ready", "loading": null, "maintenance": null},
                     "npcd": {"state": "ready", "loading": null, "maintenance": null},
                 },
+                "cluster": null,
             })
         );
     }

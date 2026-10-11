@@ -9,14 +9,35 @@
 //!   * **Backoff** — a down upstream is not retried on every request. See
 //!     [`crate::health`]; requests inside the window fail fast, and one probe
 //!     is released when it expires.
+//!
+//! The request goes one of two ways ([`To`]): to the route's configured URL,
+//! marked `x-tokera-hop: dumb` so the daemon there serves it rather than
+//! forwarding it back up; or to a cluster member, over a stream on its socket
+//! (`docs/replicated_substrate.md` §5.1). The header rewriting, streaming and
+//! upgrade splice are the same either way. A member's socket that drops fails
+//! what rides it (§5.6): `503` before the response head, an aborted body after,
+//! `1011` on a tunnelled WebSocket.
 
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{header, HeaderValue, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::Response;
+use cluster::clock::now_ms;
+use cluster::gateway::{Failure, Hub};
+use cluster::member::{DUMB_HOP, DUMB_HOP_VALUE};
+use http_body_util::BodyExt;
+use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
+use tokio::io::copy_bidirectional;
 
+use crate::asset::relay_cache;
+use crate::auth::Identity;
+use crate::cluster::{transport, tunnel};
+use crate::config::Cache;
 use crate::errors::{self, Problem};
 use crate::health::{Gate, Health};
 use crate::upstream_tls::HttpClient;
@@ -24,7 +45,7 @@ use crate::upstream_tls::HttpClient;
 /// Hop-by-hop headers belong to one connection and are never forwarded
 /// (RFC 9110 §7.6.1). `Upgrade` is handled explicitly rather than stripped —
 /// tunnelling is the whole point for `/ws`.
-const HOP_BY_HOP: [header::HeaderName; 7] = [
+pub const HOP_BY_HOP: [header::HeaderName; 7] = [
     header::CONNECTION,
     header::PROXY_AUTHENTICATE,
     header::PROXY_AUTHORIZATION,
@@ -47,7 +68,7 @@ const HOP_BY_HOP: [header::HeaderName; 7] = [
 /// this gateway itself resolved.
 ///
 /// [`Builder::trust`]: crate::server::Builder::trust
-pub(crate) const IDENTITY_HEADERS: [&str; 6] = [
+pub const IDENTITY_HEADERS: [&str; 6] = [
     "x-tokera-user",
     // The issuer half of the account key. In this list because it decides
     // *which* account a subject resolves to: a client able to set it could pick
@@ -68,15 +89,29 @@ pub(crate) const IDENTITY_HEADERS: [&str; 6] = [
 const UPSTREAM_DOWN: &str =
     "The service this page needs is not responding. It may be restarting or briefly offline.";
 
+/// Where a request is sent.
+pub enum To<'a> {
+    /// The route's configured upstream.
+    Url {
+        client: &'a HttpClient,
+        health: &'a Health,
+        url: &'a str,
+    },
+    /// Member `node` of `app`, over its socket.
+    Member {
+        hub: &'a Arc<Hub>,
+        app: &'a str,
+        node: u64,
+    },
+}
+
 pub struct Forward<'a> {
-    pub client: &'a HttpClient,
-    pub health: &'a Health,
-    pub upstream: &'a str,
+    pub to: To<'a>,
     pub rewrite_host: bool,
     pub peer: Option<IpAddr>,
     pub want_html: bool,
     /// Who the gateway decided this request is, if anyone.
-    pub identity: Option<&'a crate::auth::Identity>,
+    pub identity: Option<&'a Identity>,
     /// The signed session token, for a daemon that verifies rather than trusts.
     pub assertion: Option<&'a str>,
     /// Whether the public entrance to this gateway is https, for
@@ -89,30 +124,57 @@ pub struct Forward<'a> {
     pub secure: bool,
     /// The cache policy to apply **only where the upstream stated none** — see
     /// [`crate::asset::relay_cache`].
-    pub cache: crate::config::Cache,
+    pub cache: Cache,
 }
+
+/// Set the identity headers that name `id`, as every request this gateway
+/// forwards carries them.
+pub fn name_caller(headers: &mut HeaderMap, id: &Identity) {
+    for (name, value) in [
+        ("x-tokera-user", id.sub.as_str()),
+        ("x-tokera-provider", id.provider.as_str()),
+        ("x-tokera-email", id.email.as_str()),
+        ("x-tokera-name", id.name.as_str()),
+        ("x-tokera-picture", id.picture.as_str()),
+    ] {
+        // A name can hold anything a provider allows, including bytes no
+        // header may carry. Skipping one field is the right failure: it must
+        // never be able to inject a second header.
+        if let Ok(v) = HeaderValue::from_str(value) {
+            headers.insert(HeaderName::from_static(name), v);
+        }
+    }
+}
+
+/// How long a browser is told to wait before retrying a request a member's
+/// dropped socket failed: it lands on another member, or the configured
+/// upstream, as soon as it comes back.
+const MEMBER_RETRY: Duration = Duration::from_secs(1);
 
 pub async fn forward(f: Forward<'_>, req: Request) -> Response {
     // Fail fast while the backoff window is open — never hold a socket against
     // a machine we already know is not answering.
-    if let Gate::Blocked {
-        retry_after,
-        last_error,
-    } = f.health.gate(f.upstream)
-    {
-        // The visitor is told what is happening; the address it is happening to
-        // stays in the log. This page is served to the internet, and it used to
-        // name the host and port of whichever daemon was down.
-        let internal = match last_error {
-            Some(e) => format!("{} is not answering ({e})", f.upstream),
-            None => format!("{} is not answering", f.upstream),
-        };
-        return errors::respond(
-            Problem::backing_off(UPSTREAM_DOWN, retry_after)
-                .with_cap(f.health.max_backoff())
-                .because(internal),
-            f.want_html,
-        );
+    if let To::Url { health, url, .. } = &f.to {
+        if let Gate::Blocked {
+            retry_after,
+            last_error,
+        } = health.gate(url)
+        {
+            // The visitor is told what is happening; the address it is
+            // happening to stays in the log. This page is served to the
+            // internet, and it used to name the host and port of whichever
+            // daemon was down.
+            let internal = match last_error {
+                Some(e) => format!("{url} is not answering ({e})"),
+                None => format!("{url} is not answering"),
+            };
+            return errors::respond(
+                Problem::backing_off(UPSTREAM_DOWN, retry_after)
+                    .with_cap(health.max_backoff())
+                    .because(internal),
+                f.want_html,
+            );
+        }
     }
 
     let (mut parts, body) = req.into_parts();
@@ -121,7 +183,12 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
-    let target = format!("{}{pq}", f.upstream.trim_end_matches('/'));
+    // A member is sent the origin form over a stream of its own; an upstream
+    // URL is dialled by the pooled client, which takes the absolute form.
+    let target = match &f.to {
+        To::Url { url, .. } => format!("{}{pq}", url.trim_end_matches('/')),
+        To::Member { .. } => pq.to_string(),
+    };
     let uri: Uri = match target.parse() {
         Ok(u) => u,
         Err(e) => {
@@ -136,7 +203,7 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
     let is_upgrade = parts.headers.contains_key(header::UPGRADE);
     // Take the client's upgrade handle BEFORE the parts are consumed, or the
     // 101 arrives with nothing to tunnel to.
-    let client_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
+    let client_upgrade = parts.extensions.remove::<OnUpgrade>();
     let orig_host = parts
         .headers
         .get(header::HOST)
@@ -154,22 +221,29 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
         headers.remove(name);
     }
     if let Some(id) = f.identity {
-        for (name, value) in [
-            ("x-tokera-user", id.sub.as_str()),
-            ("x-tokera-provider", id.provider.as_str()),
-            ("x-tokera-email", id.email.as_str()),
-            ("x-tokera-name", id.name.as_str()),
-            ("x-tokera-picture", id.picture.as_str()),
-        ] {
-            // A name can hold anything a provider allows, including bytes no
-            // header may carry. Skipping one field is the right failure: it
-            // must never be able to inject a second header.
-            if let Ok(v) = HeaderValue::from_str(value) {
-                headers.insert(header::HeaderName::from_static(name), v);
-            }
-        }
-        if let Some(v) = f.assertion.and_then(|t| HeaderValue::from_str(t).ok()) {
+        name_caller(&mut headers, id);
+        // Not to a member: no daemon reads it, and it is a replayable session
+        // token (§5.1).
+        if let (To::Url { .. }, Some(v)) = (
+            &f.to,
+            f.assertion.and_then(|t| HeaderValue::from_str(t).ok()),
+        ) {
             headers.insert(header::HeaderName::from_static("x-tokera-assertion"), v);
+        }
+    }
+    match &f.to {
+        // The daemon at the configured URL serves this itself, whatever its
+        // own link to the cluster says (§5.8).
+        To::Url { .. } => {
+            headers.insert(
+                header::HeaderName::from_static(DUMB_HOP),
+                HeaderValue::from_static(DUMB_HOP_VALUE),
+            );
+        }
+        // The session cookie is the same replayable token, and nothing a member
+        // serves reads a cookie (§5.1).
+        To::Member { .. } => {
+            headers.remove(header::COOKIE);
         }
     }
     if is_upgrade {
@@ -214,37 +288,64 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
         .expect("parts came from a valid request");
     *up_req.headers_mut() = headers;
 
-    let mut up_res = match f.client.request(up_req).await {
-        Ok(r) => r,
-        Err(e) => {
-            let retry = f.health.on_failure(f.upstream, &e.to_string());
-            return errors::respond(
-                Problem::upstream_down(UPSTREAM_DOWN, Some(retry))
-                    .with_cap(f.health.max_backoff())
-                    .because(format!("{} is not answering: {e}", f.upstream)),
-                f.want_html,
-            );
-        }
+    let mut up_res = match &f.to {
+        To::Url {
+            client,
+            health,
+            url,
+        } => match client.request(up_req).await {
+            // Reaching the upstream at all counts — a 500 from a live daemon is
+            // the daemon's answer to pass through, not a reason to take the
+            // route out of service. Only transport failures open the window.
+            Ok(r) => {
+                health.on_success(url);
+                r
+            }
+            Err(e) => {
+                let retry = health.on_failure(url, &e.to_string());
+                return errors::respond(
+                    Problem::upstream_down(UPSTREAM_DOWN, Some(retry))
+                        .with_cap(health.max_backoff())
+                        .because(format!("{url} is not answering: {e}")),
+                    f.want_html,
+                );
+            }
+        },
+        To::Member { hub, app, node } => match transport::send(hub, app, *node, up_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                hub.traffic.failed(Failure::BeforeHead, now_ms());
+                return errors::respond(
+                    Problem::upstream_down(UPSTREAM_DOWN, Some(MEMBER_RETRY))
+                        .because(format!("{app} member {node:016x}: {e}")),
+                    f.want_html,
+                );
+            }
+        },
     };
-    // Reaching the upstream at all counts — a 500 from a live daemon is the
-    // daemon's answer to pass through, not a reason to take the route out of
-    // service. Only transport failures open the window.
-    f.health.on_success(f.upstream);
 
     if up_res.status() == StatusCode::SWITCHING_PROTOCOLS {
-        let upstream_upgrade = up_res
-            .extensions_mut()
-            .remove::<hyper::upgrade::OnUpgrade>();
+        let upstream_upgrade = up_res.extensions_mut().remove::<OnUpgrade>();
+        let member_hub = match &f.to {
+            To::Member { hub, .. } => Some(Arc::clone(hub)),
+            To::Url { .. } => None,
+        };
         match (client_upgrade, upstream_upgrade) {
             (Some(cu), Some(uu)) => {
                 tokio::spawn(async move {
                     match tokio::try_join!(cu, uu) {
                         Ok((c, u)) => {
-                            let mut c = hyper_util::rt::TokioIo::new(c);
-                            let mut u = hyper_util::rt::TokioIo::new(u);
-                            // A websocket ending is routine, so this is debug.
-                            if let Err(e) = tokio::io::copy_bidirectional(&mut c, &mut u).await {
-                                tracing::debug!(error = %e, "tunnel closed");
+                            let mut c = TokioIo::new(c);
+                            let mut u = TokioIo::new(u);
+                            match member_hub {
+                                Some(hub) => tunnel::splice(c, u, hub).await,
+                                None => {
+                                    // A websocket ending is routine, so this
+                                    // is debug.
+                                    if let Err(e) = copy_bidirectional(&mut c, &mut u).await {
+                                        tracing::debug!(error = %e, "tunnel closed");
+                                    }
+                                }
                             }
                         }
                         Err(e) => tracing::warn!(error = %e, "upgrade handshake failed"),
@@ -257,7 +358,20 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
 
     let upgraded = up_res.status() == StatusCode::SWITCHING_PROTOCOLS;
     let (rp, rb) = up_res.into_parts();
-    let mut out = Response::from_parts(rp, Body::new(rb)); // piped, not collected
+    // Piped, not collected. A member's body that fails part-way is counted, and
+    // its error carried on, so the client sees a truncated response rather than
+    // a short one that looks complete (§5.6).
+    let body = match &f.to {
+        To::Url { .. } => Body::new(rb),
+        To::Member { hub, .. } => {
+            let hub = Arc::clone(hub);
+            Body::new(rb.map_err(move |e| {
+                hub.traffic.failed(Failure::MidBody, now_ms());
+                e
+            }))
+        }
+    };
+    let mut out = Response::from_parts(rp, body);
     for h in HOP_BY_HOP {
         out.headers_mut().remove(&h);
     }
@@ -276,7 +390,7 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
         out.headers_mut()
             .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
     } else {
-        crate::asset::relay_cache(out.headers_mut(), f.cache);
+        relay_cache(out.headers_mut(), f.cache);
     }
     out
 }

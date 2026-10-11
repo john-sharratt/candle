@@ -15,14 +15,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_conversation::profile::set_gpu_span_period;
 use candle_conversation::{EngineSlot, TenantRank};
-use tokio::runtime::Builder as RuntimeBuilder;
+use sysinfo::System;
+use tokio::runtime::{Builder as RuntimeBuilder, Handle};
 use web::Roots;
 
 use crate::access::{roles, LocalSignin};
 use crate::cli::HostArgs;
+use crate::cluster::{watch_readiness, Cluster, Join};
 use crate::ctrl_c::accept_ctrl_c;
-use crate::endpoints::{routes, Shared};
-use crate::guard::Routes;
+use crate::endpoints::{declared, routes, Shared};
+use crate::guard::{dispatch_table, Routes};
 use crate::logs::LogBus;
 use crate::model::{ModelView, MODEL};
 use crate::process::{init_logging, install_panic_hook, shutdown_signal};
@@ -195,6 +197,23 @@ async fn serve_tenants(
     let telemetry = Telemetry::new(model.clone());
     telemetry.spawn_sampler();
     let roles = roles();
+    let names: Vec<&'static str> = uis.iter().map(|(n, _)| *n).collect();
+    let machine = System::host_name().unwrap_or_else(|| listen.bind.to_string());
+    let cluster = match cfg.args.cluster(machine)? {
+        Some(settings) => {
+            tracing::info!(
+                clusters = %settings.targets.iter().map(|t| t.url.as_str()).collect::<Vec<_>>().join(", "),
+                "joining the cluster as a member",
+            );
+            Some(Cluster::new(
+                settings,
+                &names,
+                Arc::clone(&telemetry),
+                Handle::current(),
+            )?)
+        }
+        None => None,
+    };
 
     // Every tenant takes its engine from one slot: the highest-ranked builds it
     // with every tenant's requests merged, the rest attach their substrates.
@@ -216,6 +235,9 @@ async fn serve_tenants(
             log: Arc::clone(&bus),
             roles: roles.clone(),
             telemetry: Arc::clone(&telemetry),
+            cluster: cluster
+                .as_ref()
+                .and_then(|c| Join::new(Arc::clone(c), name)),
         };
         match tenant.start(ctx).await {
             Ok(started) => {
@@ -232,6 +254,26 @@ async fn serve_tenants(
         }
     }
 
+    if let Some(c) = &cluster {
+        // Each app's dispatch table: the host's routes and its tenant's (§5.2).
+        let host_routes = declared(roles.clone());
+        let mut watched = Vec::new();
+        for ((name, r), (_, reports)) in tenant_routes.iter().zip(&reports) {
+            let Some(link) = c.link(name) else { continue };
+            let mut all = host_routes.clone();
+            all.extend(r.declared.iter().cloned());
+            match dispatch_table(&all) {
+                Ok(table) => link.set_routes(table),
+                Err(e) => {
+                    stop_all(stops).await;
+                    return Err(e.context(format!("{name}: the dispatch table")));
+                }
+            }
+            watched.push((Arc::clone(link), Arc::clone(reports)));
+        }
+        watch_readiness(watched);
+    }
+
     let mut content_dirs: Vec<PathBuf> = uis.iter().map(|(_, ui)| ui.content.clone()).collect();
     content_dirs.push(common.clone());
     let shared = Arc::new(Shared {
@@ -245,6 +287,7 @@ async fn serve_tenants(
         log: bus,
         telemetry,
         roles,
+        cluster: cluster.clone(),
     });
     let all = match merge_routes(routes(shared, Roots::disk(&[common])), tenant_routes) {
         Ok(all) => all,
@@ -259,7 +302,18 @@ async fn serve_tenants(
     }
 
     accept_ctrl_c();
-    let served = serve(&listen, &uis, all.router, local_signin, shutdown_signal()).await;
+    let served = serve(
+        &listen,
+        &uis,
+        all.router,
+        local_signin,
+        cluster.clone(),
+        shutdown_signal(),
+    )
+    .await;
+    if let Some(c) = &cluster {
+        c.close_all("the member is shutting down");
+    }
     stop_all(stops).await;
     served
 }

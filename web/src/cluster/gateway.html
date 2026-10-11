@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gateway status</title>
+<style>
+:root {
+  --ground: #f6f7f9;
+  --panel: #ffffff;
+  --ink: #1c2230;
+  --muted: #5d6677;
+  --rule: #dfe3ea;
+  --accent: #2f5fb3;
+  --good: #1f7a4a;
+  --warn: #a8670a;
+  --bad: #b3261e;
+  --mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground: #12151b;
+    --panel: #1a1e26;
+    --ink: #e3e7ef;
+    --muted: #97a0b3;
+    --rule: #2b313d;
+    --accent: #7ea6ec;
+    --good: #5cc28c;
+    --warn: #e0a63c;
+    --bad: #f08079;
+  }
+}
+:root[data-theme="dark"] {
+  --ground: #12151b;
+  --panel: #1a1e26;
+  --ink: #e3e7ef;
+  --muted: #97a0b3;
+  --rule: #2b313d;
+  --accent: #7ea6ec;
+  --good: #5cc28c;
+  --warn: #e0a63c;
+  --bad: #f08079;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font: 14px/1.45 var(--sans);
+  padding: 20px 16px 48px;
+}
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; margin-bottom: 18px; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; }
+.meta { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+section { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; margin-bottom: 16px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+td.mono, .mono { font-family: var(--mono); font-size: 12.5px; }
+td.wrap { white-space: normal; min-width: 18em; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid currentColor; }
+.ok { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); } .dim { color: var(--muted); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 20px; }
+.figure b { display: block; font-size: 22px; font-family: var(--mono); }
+.figure span { color: var(--muted); font-size: 12px; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+input { font: inherit; padding: 4px 8px; border: 1px solid var(--rule); border-radius: 4px; background: var(--ground); color: var(--ink); }
+input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.empty { color: var(--muted); font-style: italic; }
+#error { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Gateway status</h1>
+  <span class="meta" id="gateway"></span>
+  <span class="meta" id="updated"></span>
+  <span id="error" role="status"></span>
+</header>
+
+<section aria-labelledby="h-apps">
+  <h2 id="h-apps">Apps</h2>
+  <div class="scroll"><table id="apps"></table></div>
+</section>
+
+<section aria-labelledby="h-members">
+  <h2 id="h-members">Members</h2>
+  <div class="scroll"><table id="members"></table></div>
+</section>
+
+<section aria-labelledby="h-traffic">
+  <h2 id="h-traffic">Traffic</h2>
+  <div class="grid" id="traffic"></div>
+</section>
+
+<section aria-labelledby="h-failures">
+  <h2 id="h-failures">Failures, last hour</h2>
+  <div class="grid" id="failures"></div>
+</section>
+
+<section aria-labelledby="h-claims">
+  <h2 id="h-claims">Claims</h2>
+  <div class="scroll"><table id="claims"></table></div>
+</section>
+
+<section aria-labelledby="h-refusals">
+  <h2 id="h-refusals">Refusals</h2>
+  <div class="scroll"><table id="refusals"></table></div>
+</section>
+
+<section aria-labelledby="h-log">
+  <h2 id="h-log">Coordination log</h2>
+  <div class="filters">
+    <input id="f-app" placeholder="app" aria-label="Filter by app">
+    <input id="f-subject" placeholder="member or key" aria-label="Filter by member or key">
+  </div>
+  <div class="scroll"><table id="log"></table></div>
+</section>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;"}[c]));
+const when = (ms) => ms ? new Date(ms).toLocaleTimeString() : "—";
+const ago = (ms, now) => {
+  if (!ms) return "—";
+  const s = Math.max(0, Math.round((now - ms) / 1000));
+  if (s < 90) return s + " s";
+  if (s < 5400) return Math.round(s / 60) + " min";
+  return Math.round(s / 3600) + " h";
+};
+const build = (b) => b ? `${b.count} (${esc(b.hash)})${b.local ? ` <span class="warn">local ${esc(b.local)}</span>` : ""}` : "—";
+const stateClass = (s) => ({ready: "ok", loading: "warn", upgrading: "warn", draining: "warn", fault: "bad"}[s] || "dim");
+
+function table(el, head, rows, empty) {
+  if (!rows.length) { el.innerHTML = `<tr><td class="empty">${esc(empty)}</td></tr>`; return; }
+  el.innerHTML = `<tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr>` +
+    rows.map((r) => `<tr>${r.join("")}</tr>`).join("");
+}
+
+function figures(el, items) {
+  el.innerHTML = items.map(([v, label]) => `<div class="figure"><b>${esc(v)}</b><span>${esc(label)}</span></div>`).join("");
+}
+
+// The last reading, and the one before it: request rates are their difference.
+let last = null, before = null;
+
+function render(s, earlier) {
+  $("gateway").textContent = s.gateway;
+  $("updated").textContent = "updated " + when(s.now_ms);
+  table($("apps"), ["App", "Mode", "Since", "Floor", "Set by", "Model lock", "Members", "Ready"],
+    s.apps.map((a) => [
+      `<td>${esc(a.app)}</td>`,
+      `<td><span class="pill ${a.mode === "clustered" ? "ok" : "dim"}">${esc(a.mode)}</span></td>`,
+      `<td class="mono">${a.since_ms ? ago(a.since_ms, s.now_ms) : "—"}</td>`,
+      `<td class="mono">${build(a.floor)}</td>`,
+      `<td class="mono">${esc(a.floor_set_by || "—")}</td>`,
+      `<td class="wrap">${esc(a.model_lock || "—")}</td>`,
+      `<td class="mono">${a.members}</td>`,
+      `<td class="mono">${a.ready}</td>`,
+    ]), "no apps");
+  table($("members"), ["App", "Node", "Host", "Build", "State", "Power", "Weight", "Idle", "Free slots", "Session", "Connected", "Last close"],
+    s.members.map((m) => [
+      `<td>${esc(m.app)}</td>`,
+      `<td class="mono">${esc(m.node)}</td>`,
+      `<td>${esc(m.host)}</td>`,
+      `<td class="mono">${build(m.build)}</td>`,
+      `<td><span class="pill ${stateClass(m.state)}">${esc(m.state)}</span></td>`,
+      `<td class="mono">${m.power ?? "—"}</td>`,
+      `<td class="mono">${m.weight}</td>`,
+      `<td>${m.idle == null ? "—" : m.idle ? "yes" : "no"}</td>`,
+      `<td class="mono">${m.slots_free ?? "—"}</td>`,
+      `<td class="mono">${m.session}</td>`,
+      `<td class="mono">${ago(m.connected_ms, s.now_ms)}</td>`,
+      `<td class="wrap">${esc(m.last_close || "—")}</td>`,
+    ]), "no member is connected — every app is dumb");
+  const t = s.traffic;
+  const prev = earlier && earlier.traffic;
+  const span = earlier ? Math.max(1, (s.now_ms - earlier.now_ms) / 1000) : 1;
+  const rate = (i) => prev ? ((t.requests[i][1] - prev.requests[i][1]) / span).toFixed(1) : "—";
+  figures($("traffic"), [
+    [t.open_streams, "open streams"],
+    ...t.requests.map(([name, n], i) => [`${n} · ${rate(i)}/s`, name]),
+    [t.aggregates, "aggregates"],
+    [t.members_past_deadline, "members past deadline"],
+    [t.holder_elsewhere, "409 → 503"],
+  ]);
+  figures($("failures"), [
+    [t.failed_before_head, "before the response head"],
+    [t.aborted_mid_body, "aborted mid-body"],
+    [t.tunnels_closed, "tunnels closed 1011"],
+  ]);
+  table($("claims"), ["App", "Key", "Holder", "Epoch"],
+    s.claims.map((c) => [
+      `<td>${esc(c.app)}</td>`, `<td class="mono">${esc(c.key)}</td>`,
+      `<td class="mono">${esc(c.node)}</td>`, `<td class="mono">${when(c.epoch_ms)}</td>`,
+    ]), "no claims");
+  table($("refusals"), ["At", "App", "Code", "Node", "Host", "From", "Reason"],
+    s.refusals.map((r) => [
+      `<td class="mono">${when(r.at_ms)}</td>`, `<td>${esc(r.app)}</td>`,
+      `<td class="mono bad">${r.code}</td>`, `<td class="mono">${esc(r.node || "—")}</td>`,
+      `<td>${esc(r.host || "—")}</td>`, `<td class="mono">${esc(r.ip)}</td>`,
+      `<td class="wrap">${esc(r.reason)}</td>`,
+    ]), "no refusals");
+  const fa = $("f-app").value.trim(), fs = $("f-subject").value.trim();
+  table($("log"), ["At", "Gateway", "App", "Subject", "Decision"],
+    s.log.filter((e) => (!fa || e.app === fa) && (!fs || e.subject.includes(fs))).map((e) => [
+      `<td class="mono">${when(e.at_ms)}</td>`, `<td class="mono">${esc(e.gateway)}</td>`,
+      `<td>${esc(e.app)}</td>`, `<td class="mono">${esc(e.subject || "—")}</td>`,
+      `<td class="wrap">${esc(e.text)}</td>`,
+    ]), "nothing logged");
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/gateway/status.json", {cache: "no-store"});
+    if (!r.ok) throw new Error((await r.json()).detail || r.status);
+    const s = await r.json();
+    render(s, last);
+    before = last;
+    last = s;
+    $("error").textContent = "";
+  } catch (e) {
+    $("error").textContent = String(e.message || e);
+  }
+  setTimeout(poll, 1000);
+}
+for (const id of ["f-app", "f-subject"]) $(id).addEventListener("input", () => last && render(last, before));
+poll();
+</script>
+</body>
+</html>

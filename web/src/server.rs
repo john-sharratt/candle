@@ -30,14 +30,21 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tower::Service;
 
+use axum::middleware;
+use cluster::gateway::Class;
+
 use crate::acme::{Challenges, Manager};
 use crate::asset;
+use crate::auth::forwarded::identify;
 use crate::auth::{Auth, Gateways};
+use crate::cluster::route::{self, Routed};
+use crate::cluster::{endpoint, page, ClusterPeer, Gateway, MemberOrigin};
+use crate::compress;
 use crate::config::{Config, Site, Upstream};
 use crate::content::{self, Roots};
 use crate::errors::{self, Problem};
 use crate::health::Health;
-use crate::proxy;
+use crate::proxy::{self, To};
 use crate::tls::{Entrance, Resolver, SecureEntrance};
 use crate::upstream_tls::Clients;
 
@@ -66,6 +73,8 @@ struct App {
     /// zend's beside it, and a single shared router would answer whichever
     /// site's path it happened to recognise.
     local: Arc<HashMap<String, Router>>,
+    /// The cluster this gateway runs, when its config has a `cluster:` block.
+    cluster: Option<Arc<Gateway>>,
 }
 
 /// Builds a server that is either authoritative, a proxy, or both.
@@ -78,7 +87,14 @@ pub struct Builder {
     /// HTTP-01 answers, set by the ACME manager and served on every hostname.
     /// Empty — every token a 404 — where there is no TLS entrance.
     challenges: Challenges,
+    cluster: Option<Arc<Gateway>>,
+    /// Applied to the finished router, outermost: a daemon's own listener
+    /// rules (`host::cluster::listener`).
+    wrap: Option<Wrap>,
 }
+
+/// A layer a daemon puts around the whole router.
+pub type Wrap = Box<dyn FnOnce(Router) -> Router + Send>;
 
 impl Builder {
     pub fn new(cfg: Config) -> Self {
@@ -96,6 +112,8 @@ impl Builder {
             auth: None,
             trusted: None,
             challenges: Challenges::default(),
+            cluster: None,
+            wrap: None,
         };
 
         // Sites this crate is itself the backend for — tokera.com is documents,
@@ -126,6 +144,30 @@ impl Builder {
             self.auth = Some(Arc::new(Auth::new(cfg)?));
         }
         Ok(self)
+    }
+
+    /// Run the cluster the config's `cluster:` block names: read its group key
+    /// and take member sockets at `/v1/cluster/:app`
+    /// (`docs/replicated_substrate.md` §3). Fallible for the same reason as
+    /// [`with_auth`](Self::with_auth): a key file that does not load stops the
+    /// start rather than leaving a gateway no member can join.
+    pub fn with_cluster(mut self) -> anyhow::Result<Self> {
+        if let Some(cfg) = self.cfg.cluster.clone() {
+            self.cluster = Some(Gateway::new(&cfg, self.cfg.server.bind)?);
+        }
+        Ok(self)
+    }
+
+    /// Run `gateway` as this server's cluster.
+    pub fn cluster(mut self, gateway: Arc<Gateway>) -> Self {
+        self.cluster = Some(gateway);
+        self
+    }
+
+    /// Put `wrap` around the finished router, outside everything else.
+    pub fn wrap(mut self, wrap: Wrap) -> Self {
+        self.wrap = Some(wrap);
+        self
     }
 
     /// Serve this site's files from embedded directories instead of disk.
@@ -203,6 +245,17 @@ impl Builder {
         // including one that redirects or proxies `/`, and answered by the
         // gateway rather than by whichever site the name belongs to.
         let challenge_routes = self.challenges.router();
+        // The cluster's socket and status page, on every host, like `/auth/*`.
+        let cluster_routes = match &self.cluster {
+            Some(gw) => endpoint::router(gw.clone()).merge(page::router(
+                gw.clone(),
+                self.auth.clone(),
+                self.cfg.roles.clone(),
+            )),
+            None => Router::new(),
+        };
+        let cluster = self.cluster.clone();
+        let wrap = self.wrap;
         let app = App {
             cfg: Arc::new(self.cfg),
             clients,
@@ -211,19 +264,30 @@ impl Builder {
             trusted: self.trusted,
             roots: Arc::new(self.roots),
             local: Arc::new(self.local),
+            cluster: self.cluster,
         };
         // `/auth/*` are explicit routes and the site handler is the fallback,
         // so the merge order does not decide which wins — axum prefers the
         // explicit match either way.
-        Router::new()
+        let router = Router::new()
             .fallback(handle)
             .with_state(app)
             .merge(auth_routes)
             .merge(challenge_routes)
+            .merge(cluster_routes)
             // Outermost, so it sees every answer — files, proxied and local
             // APIs, sign-in, error pages — and compresses whatever arrived
             // uncompressed. See `compress`.
-            .layer(axum::middleware::from_fn(crate::compress::layer))
+            .layer(middleware::from_fn(compress::layer));
+        let router = match wrap {
+            Some(wrap) => wrap(router),
+            None => router,
+        };
+        // Requests members forward up are served by this same router.
+        if let Some(gw) = cluster {
+            gw.set_router(router.clone());
+        }
+        router
     }
 
     /// Serve until Ctrl-C, with the TLS entrance the config's `tls:` asks for —
@@ -262,12 +326,17 @@ impl Builder {
     pub async fn bind(self) -> anyhow::Result<Bound> {
         let addr = self.cfg.server.bind;
         announce(&self.cfg, &self.roots, &self.local);
+        let cluster = self.cluster.clone();
         let router = self.router();
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding {addr}"))?;
         tracing::info!("web listening on http://{addr}");
-        Ok(Bound { listener, router })
+        Ok(Bound {
+            listener,
+            router,
+            cluster,
+        })
     }
 }
 
@@ -275,6 +344,8 @@ impl Builder {
 pub struct Bound {
     listener: TcpListener,
     router: Router,
+    /// The cluster this gateway runs, whose members are told when it stops.
+    cluster: Option<Arc<Gateway>>,
 }
 
 impl Bound {
@@ -290,7 +361,11 @@ impl Bound {
         entrance: Option<Entrance>,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
-        let Bound { listener, router } = self;
+        let Bound {
+            listener,
+            router,
+            cluster,
+        } = self;
         // One signal for both entrances: the plain one drains on it, and the
         // TLS one is told through this channel.
         let (stopping_tx, mut stopping) = watch::channel(false);
@@ -319,6 +394,12 @@ impl Bound {
         .with_graceful_shutdown(async move {
             shutdown.await;
             tracing::info!("shutting down");
+            // A member's socket is an upgraded connection the drain does not
+            // wait for: each is told, so it carries on through its other
+            // clusters rather than finding the socket gone.
+            if let Some(gw) = &cluster {
+                gw.hub.close_all("the gateway is shutting down");
+            }
             let _ = stopping_tx.send(true);
         })
         .await?;
@@ -418,7 +499,13 @@ async fn handle(
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let site = app.cfg.site_for(host.as_deref());
+    // A request a member forwarded up is its app's, whatever `Host` it was
+    // sent to on the member's own listener (§5.8).
+    let origin = req.extensions().get::<MemberOrigin>().cloned();
+    let site = origin
+        .as_ref()
+        .and_then(|o| app.cfg.site_for_app(&o.app))
+        .unwrap_or_else(|| app.cfg.site_for(host.as_deref()));
     let path = req.uri().path().to_owned();
 
     /* A redirected host is answered before anything else happens to the
@@ -455,10 +542,16 @@ async fn handle(
     // unimplementable rather than safe. Declared, never inferred — "has no
     // `auth:` block" is not evidence of it, and an authoritative instance
     // without sign-in is still an entrance.
-    let believed = match (&app.trusted, &peer) {
-        (Some(gateways), Some(ConnectInfo(addr))) => gateways.trusts(addr.ip()),
-        _ => false,
-    };
+    //
+    // A request on a stream a member opened is believed too: the member
+    // proved the group key, and vouches for whoever reached its own listener
+    // by the same rules it would have served them by (§13.2).
+    let believed = origin.is_some()
+        || req.extensions().get::<ClusterPeer>().is_some()
+        || match (&app.trusted, &peer) {
+            (Some(gateways), Some(ConnectInfo(addr))) => gateways.trusts(addr.ip()),
+            _ => false,
+        };
     if !believed {
         for name in proxy::IDENTITY_HEADERS {
             req.headers_mut().remove(name);
@@ -468,8 +561,13 @@ async fn handle(
     // Resolve who this is once, before anything downstream can see the request.
     // A local router reads it from the extensions; a proxied daemon reads it
     // from the headers the proxy sets. Both get the same answer from the same
-    // check — the session cookie, which the strip above does not touch.
-    let identity = app.auth.as_ref().and_then(|a| a.identity(req.headers()));
+    // check — the session cookie, which the strip above does not touch — or,
+    // for a request a member forwarded up, the identity it carries.
+    let identity = app
+        .auth
+        .as_ref()
+        .and_then(|a| a.identity(req.headers()))
+        .or_else(|| origin.as_ref().and_then(|_| identify(req.headers()).ok()));
     let assertion = app
         .auth
         .as_ref()
@@ -511,13 +609,33 @@ async fn handle(
                 ),
             },
             Upstream::Url(url) => {
+                let peer_ip = peer.as_ref().map(|ConnectInfo(a)| a.ip());
+                if let (Some(cluster_app), Some(gw)) = (&route.cluster, &app.cluster) {
+                    if gw.hub.clustered(cluster_app) {
+                        let ctx = route::Context {
+                            want_html,
+                            peer: peer_ip,
+                            identity: identity.as_ref(),
+                            secure,
+                            cache: app.cfg.server.cache,
+                            roles: &app.cfg.roles,
+                        };
+                        match route::route(gw, cluster_app, ctx, req).await {
+                            Routed::Answered(res) => return res,
+                            Routed::Dumb(back) => req = back,
+                        }
+                    }
+                    gw.hub.traffic.request(Class::Configured);
+                }
                 proxy::forward(
                     proxy::Forward {
-                        client: app.clients.for_route(route.self_signed),
-                        health: &app.health,
-                        upstream: url,
+                        to: To::Url {
+                            client: app.clients.for_route(route.self_signed),
+                            health: &app.health,
+                            url,
+                        },
                         rewrite_host: route.rewrite_host,
-                        peer: peer.map(|ConnectInfo(a)| a.ip()),
+                        peer: peer_ip,
                         want_html,
                         identity: identity.as_ref(),
                         assertion: assertion.as_deref(),

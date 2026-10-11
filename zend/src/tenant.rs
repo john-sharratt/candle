@@ -85,6 +85,7 @@ impl Tenant for ZendTenant {
             let mut config = self.config;
             config.engine = ctx.engine;
             config.roles = ctx.roles.clone();
+            config.cluster = ctx.cluster;
             tracing::info!(
                 workspace = %config.workspace.root().display(),
                 repos = %config.workspace.names().join(", "),

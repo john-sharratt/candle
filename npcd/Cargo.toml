@@ -51,6 +51,9 @@ axum       = { version = "0.7", features = ["macros", "ws"] }
 # The process npcd runs in: logging, the model, the HTTP server, the shared
 # endpoints (`docs/shared_model_host.md`). npcd is one of its tenants.
 host       = { path = "../host" }
+# How each route is dispatched under a cluster (`docs/replicated_substrate.md`
+# §5.2).
+cluster    = { path = "../cluster" }
 # Hashing a provider's subject id into a file name that is valid whatever shape
 # the provider chose. Not a security boundary — the subject inside the file is
 # authoritative — but it has to be total over every possible input.

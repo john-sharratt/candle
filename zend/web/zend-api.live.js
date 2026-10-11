@@ -152,7 +152,9 @@
       };
       fetch('/v1/chat/completions', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        // The conversation, named where a cluster's gateway reads it without
+        // buffering the body (docs/replicated_substrate.md §5.2).
+        headers: { 'content-type': 'application/json', 'x-tokera-conversation': String(conv.id) },
         body: JSON.stringify(payload),
         signal: controller.signal,
       }).then((resp) => {

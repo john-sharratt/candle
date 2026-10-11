@@ -9,8 +9,9 @@
 //! Selected by the request's `model` ([`PASSTHROUGH_MODEL`]), so a client that
 //! sends a system message to the daemon's own conversations is unaffected.
 //!
-//! A conversation is identified by its system prompt and first user message
-//! ([`conversation_key`]). Each call's history is matched against the exchanges
+//! A conversation is identified by its opening — its system messages, its tools
+//! and every message before the first reply ([`Transcript::key`]), the key a
+//! cluster's gateway routes it by. Each call's history is matched against the exchanges
 //! the conversation already holds ([`extends`]) and only the unmatched tail is
 //! prefilled. A history that no longer extends what is held — the client edited
 //! or trimmed it — opens a new conversation: a hybrid's recurrent state cannot be
@@ -25,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use cluster::dispatch::conversation_key;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
@@ -41,7 +43,7 @@ use crate::types::{ChatMessage, Role};
 /// The `model` a request names to run as a passthrough.
 pub const PASSTHROUGH_MODEL: &str = "passthrough";
 
-/// Timeline metadata key holding a passthrough conversation's [`conversation_key`].
+/// Timeline metadata key holding a passthrough conversation's [`Transcript::key`].
 pub const METADATA_KEY: &str = "passthrough";
 
 /// A passthrough conversation's `conv_id` is this prefix and its timeline id —
@@ -83,6 +85,18 @@ pub struct Transcript {
     /// The client's tool definitions: listed in the system prompt, and the
     /// source of the grammar its calls are held to ([`LiveConv::tool_stencil`]).
     pub tools: Vec<Value>,
+    /// The conversation's identity — see [`Self::key`].
+    key: String,
+}
+
+/// A message's role as an OpenAI request spells it.
+fn role_name(role: &Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
 }
 
 impl Transcript {
@@ -124,6 +138,16 @@ impl Transcript {
         if user.is_empty() {
             return Err("the last message must be a user message or a tool result".into());
         }
+        // The opening, as a gateway names the conversation from the same
+        // request: every system message, the tools, and each message before
+        // the first reply (`cluster::dispatch::passthrough_key`).
+        let opening: Vec<(&str, &str)> = messages
+            .iter()
+            .take_while(|m| m.role != Role::Assistant)
+            .filter(|m| m.role != Role::System)
+            .map(|m| (role_name(&m.role), m.content.as_str()))
+            .collect();
+        let key = conversation_key(&system, tools, &opening);
         let mut system = system.join("\n\n");
         if !tools.is_empty() {
             if !system.is_empty() {
@@ -136,6 +160,7 @@ impl Transcript {
             history,
             message: TurnText::join(user, "\n\n"),
             tools: tools.to_vec(),
+            key,
         })
     }
 
@@ -146,9 +171,12 @@ impl Transcript {
             .map_or_else(|| self.message.text(), |e| e.user.text())
     }
 
-    /// See [`conversation_key`].
+    /// The conversation's identity: its system messages, its tools, and every
+    /// message before the first reply — the same on every call of it, and the
+    /// key a cluster's gateway routes it by (`docs/replicated_substrate.md`
+    /// §5.2), computed by the one function both use.
     pub fn key(&self) -> String {
-        conversation_key(&self.system, &self.first_user())
+        self.key.clone()
     }
 }
 
@@ -166,20 +194,6 @@ fn assistant_text(m: &ChatMessage) -> String {
             .map(|c| openai_tools::render_call(&c.function.name, &c.function.arguments)),
     );
     parts.join("\n")
-}
-
-/// A conversation's identity: its system prompt and first user message. Hex of
-/// the first 16 bytes of their SHA-256, the system prompt length-prefixed so the
-/// boundary between the two cannot shift.
-pub fn conversation_key(system: &str, first_user: &str) -> String {
-    let mut h = Sha256::new();
-    h.update((system.len() as u64).to_le_bytes());
-    h.update(system.as_bytes());
-    h.update(first_user.as_bytes());
-    h.finalize()[..16]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// The timeline of the `n`-th conversation opened under `key` — derived, not
@@ -414,7 +428,7 @@ pub fn open(
     })
 }
 
-/// The live passthrough conversations, keyed by [`conversation_key`].
+/// The live passthrough conversations, keyed by [`Transcript::key`].
 pub struct PassthroughCache {
     slots: Mutex<HashMap<String, Arc<Slot>>>,
     sweeping: AtomicBool,
@@ -502,6 +516,8 @@ impl PassthroughCache {
 mod tests {
     use super::*;
     use crate::types::{FunctionCall, MessageToolCall};
+    use cluster::dispatch::passthrough_key;
+    use serde_json::json;
 
     /// The listed id carries the timeline, and no other id is mistaken for one.
     #[test]
@@ -666,34 +682,69 @@ mod tests {
         assert!(first.history.is_empty());
     }
 
+    /// **zend names a conversation exactly as a gateway routes it**: the key a
+    /// transcript carries is the one `cluster::dispatch::passthrough_key` reads
+    /// from the same request body, so the member a conversation is routed to is
+    /// the member that holds it. Every later call names the same key; another
+    /// opening, prompt or tool list another.
     #[test]
-    fn the_key_names_the_prompt_and_the_opening_message() {
-        let a = conversation_key("sys", "task");
-        assert_eq!(a.len(), 32);
-        assert_eq!(a, conversation_key("sys", "task"));
-        assert_ne!(a, conversation_key("sys", "other task"));
-        assert_ne!(a, conversation_key("other sys", "task"));
-        // The length prefix fixes the boundary between the two.
-        assert_ne!(conversation_key("ab", "c"), conversation_key("a", "bc"));
+    fn the_key_is_the_one_the_gateway_routes_by() {
+        let tools = vec![json!({"type": "function", "function": {"name": "read_files"}})];
+        let calls = [
+            vec![msg(Role::System, "sys"), msg(Role::User, "task")],
+            vec![
+                msg(Role::System, "sys"),
+                msg(Role::User, "task"),
+                calling("Reading.", "read_files", r#"{"paths":["a.md"]}"#),
+                msg(Role::Tool, "body"),
+            ],
+        ];
+        let mut keys = Vec::new();
+        for messages in &calls {
+            let t = Transcript::from_messages(messages, &tools).unwrap();
+            let body = json!({
+                "model": PASSTHROUGH_MODEL,
+                "tools": tools,
+                "messages": messages,
+            });
+            assert_eq!(t.key(), passthrough_key(&body).unwrap());
+            keys.push(t.key());
+        }
+        assert_eq!(keys[0], keys[1]);
+        let other = Transcript::from_messages(
+            &[msg(Role::System, "sys"), msg(Role::User, "other")],
+            &tools,
+        )
+        .unwrap();
+        assert_ne!(other.key(), keys[0]);
+        let toolless = fold(&[msg(Role::System, "sys"), msg(Role::User, "task")]).unwrap();
+        assert_ne!(toolless.key(), keys[0]);
+        // With no tools, the key is the fixed value the cluster crate pins.
+        assert_eq!(toolless.key(), "6078c7d9d2e19a5e71cd77652ec4fa2d");
     }
 
     /// A key and an opening count name one timeline, the same on every member:
-    /// the value is pinned, and each later opening, and each other key, names
-    /// another.
+    /// the value is pinned (computed independently, over the documented
+    /// framing), and each later opening, and each other key, names another.
     #[test]
     fn a_key_names_one_timeline_per_opening() {
-        let key = conversation_key("sys", "task");
+        let key = fold(&[msg(Role::System, "sys"), msg(Role::User, "task")])
+            .unwrap()
+            .key();
         assert_eq!(
             conversation_timeline(&key, 0).raw(),
-            5_711_072_684_217_358_730
+            3_697_237_399_084_523_956
         );
         assert_ne!(
             conversation_timeline(&key, 0),
             conversation_timeline(&key, 1)
         );
+        let other = fold(&[msg(Role::System, "sys"), msg(Role::User, "other task")])
+            .unwrap()
+            .key();
         assert_ne!(
             conversation_timeline(&key, 0),
-            conversation_timeline(&conversation_key("sys", "other task"), 0)
+            conversation_timeline(&other, 0)
         );
     }
 

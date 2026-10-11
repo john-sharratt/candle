@@ -1,0 +1,299 @@
+//! A member host and a gateway, over real sockets (`docs/replicated_substrate.md`
+//! §5.8, §14.1 "own listener"): the member's own listener forwards a request
+//! up while joined — carrying the identity it resolved — and the cluster routes
+//! it back down its socket; `/v1/status` and a request a gateway marked dumb
+//! are answered where they arrive; a member that reaches no cluster serves
+//! locally; a sticky key is claimed by the member that serves it.
+
+use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use axum::extract::{Path as UrlPath, Request};
+use axum::Router;
+use cluster::dispatch::{Dispatch, Merge};
+use cluster::frame::{BuildId, ModelId};
+use cluster::gateway::Hub;
+use cluster::handshake::GroupKey;
+use cluster::member::Link;
+use host::access::LocalSignin;
+use host::cluster::dial::Target;
+use host::cluster::{Cluster, ClusterSettings, Join};
+use host::guard::{dispatch_table, get, Api};
+use host::model::ModelView;
+use host::server::{builder, Listen};
+use host::telemetry::Telemetry;
+use host::TenantUi;
+use http_body_util::BodyExt;
+use hyper_util::rt::TokioIo;
+use serde_json::{json, Value};
+use tokio::net::TcpStream;
+use tokio::runtime::Handle;
+use tokio::task::spawn_blocking;
+use tokio::time::sleep;
+use web::auth::Role;
+use web::cluster::{ClusterPeer, Gateway};
+use web::{Builder, Config};
+
+fn key() -> GroupKey {
+    GroupKey::from_bytes([9; 32])
+}
+
+async fn spawn(router: Router) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    addr
+}
+
+/// A port nothing listens on.
+async fn closed_port() -> SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.local_addr().unwrap()
+}
+
+/// The member's API: each route says whether it was reached over a socket,
+/// and who it was told the caller is.
+fn api() -> Api<()> {
+    let seen = |req: Request| async move {
+        let email = req
+            .headers()
+            .get("x-tokera-email")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        axum::Json(json!({
+            "socket": req.extensions().get::<ClusterPeer>().is_some(),
+            "email": email,
+        }))
+    };
+    Api::new(Default::default())
+        .route(
+            "/v1/where",
+            Role::Unauthenticated,
+            Dispatch::Best,
+            get(seen),
+        )
+        .route(
+            "/v1/status",
+            Role::Unauthenticated,
+            Dispatch::Aggregate(Merge::Envelope),
+            get(seen),
+        )
+        .route(
+            "/v1/conversations/:id",
+            Role::Unauthenticated,
+            Dispatch::sticky_path("id"),
+            get(|UrlPath(id): UrlPath<String>| async move { format!("served {id}") }),
+        )
+}
+
+struct Member {
+    addr: SocketAddr,
+    cluster: Arc<Cluster>,
+    join: Join,
+}
+
+async fn member(gateway: SocketAddr, node: u64, ui: &Path) -> Member {
+    let settings = ClusterSettings {
+        targets: vec![Target::parse(&format!("http://{gateway}"), None).unwrap()],
+        key: key(),
+        affinity_idle: Duration::from_secs(600),
+        host: format!("m{node}"),
+        build: BuildId {
+            count: 7,
+            hash: "h7".into(),
+            local: String::new(),
+        },
+    };
+    let cluster = Cluster::new(
+        settings,
+        &["zend"],
+        Telemetry::new(ModelView::of_prescribed()),
+        Handle::current(),
+    )
+    .unwrap();
+    let routes = api();
+    let table = dispatch_table(routes.declared()).unwrap();
+    cluster.link("zend").unwrap().set_routes(table);
+    let uis = vec![(
+        "zend",
+        TenantUi {
+            hosts: vec![],
+            content: ui.to_path_buf(),
+            default: true,
+        },
+    )];
+    let listen = Listen {
+        bind: IpAddr::from([127, 0, 0, 1]),
+        port: 0,
+        tls_port: None,
+        gateways: vec![],
+    };
+    let router = builder(
+        &listen,
+        &uis,
+        routes.into_routes(()).router,
+        LocalSignin::default(),
+        Some(cluster.clone()),
+    )
+    .unwrap()
+    .router();
+    let addr = spawn(router).await;
+    let join = Join::new(cluster.clone(), "zend").unwrap();
+    Member {
+        addr,
+        cluster,
+        join,
+    }
+}
+
+impl Member {
+    /// Connect as `node`, as the tenant's loader does, and say it is ready.
+    async fn connect(&self, node: u64) -> Link {
+        let join = self.join.clone();
+        let link = spawn_blocking(move || {
+            join.connect(
+                node,
+                Some(ModelId {
+                    arch: "Qwen4Exp".into(),
+                    weights: [1; 32],
+                    tokenizer: [2; 32],
+                    rope: "yarn".into(),
+                    describe: "Flash-Next".into(),
+                }),
+                || 0,
+                || false,
+                |_| {},
+            )
+        })
+        .await
+        .unwrap();
+        self.cluster.link("zend").unwrap().set_ready(true);
+        link
+    }
+}
+
+async fn gateway(upstream: &str) -> (SocketAddr, Arc<Hub>) {
+    let yaml = format!(
+        r#"
+cluster: {{group_key_file: "unused.key"}}
+sites:
+  - name: zend
+    default: true
+    api:
+      - {{prefix: /, upstream: "{upstream}", cluster: zend}}
+"#
+    );
+    let cfg = Config::from_yaml(&yaml, Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let hub = Hub::new(key(), "gw-member-test");
+    let router = Builder::new(cfg)
+        .cluster(Gateway::with_hub(hub.clone()))
+        .router();
+    (spawn(router).await, hub)
+}
+
+async fn ask(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let mut req = hyper::Request::get(path).header("host", "code.test");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let res = sender
+        .send_request(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn ask_json(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Value {
+    let (status, body) = ask(addr, path, headers).await;
+    assert_eq!(status, 200, "{path}: {body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ok() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// **Joined**: a request on the member's own listener goes up to the gateway
+/// with the identity the listener believed, and the cluster routes it back
+/// down the member's socket; `/v1/status` and a request an allowlisted gateway
+/// marked dumb are answered on the listener; a sticky key is claimed by the
+/// member that serves it, and the gateway learns the claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joined_member_forwards_its_listeners_requests_up() {
+    let ui = tempfile::TempDir::new().unwrap();
+    std::fs::write(ui.path().join("index.html"), "<p>zend</p>").unwrap();
+    let dumb = closed_port().await;
+    let (gw, hub) = gateway(&format!("http://{dumb}")).await;
+    let m = member(gw, 1, ui.path()).await;
+    assert_eq!(m.connect(1).await, Link::Joined);
+    until("clustered", || hub.clustered("zend")).await;
+
+    // Loopback is believed, so the identity set here is the one carried up.
+    let signed_in = [
+        ("x-tokera-user", "g-1"),
+        ("x-tokera-provider", "google"),
+        ("x-tokera-email", "boss@example.com"),
+    ];
+    let up = ask_json(m.addr, "/v1/where", &signed_in).await;
+    assert_eq!(up, json!({"socket": true, "email": "boss@example.com"}));
+    // Through the gateway directly, the same member answers off its socket.
+    assert_eq!(ask_json(gw, "/v1/where", &[]).await["socket"], true);
+    // The status route never forwards.
+    assert_eq!(ask_json(m.addr, "/v1/status", &[]).await["socket"], false);
+    // A request a gateway sent here in dumb mode is never sent back up.
+    let dumb_hop = ask_json(m.addr, "/v1/where", &[("x-tokera-hop", "dumb")]).await;
+    assert_eq!(dumb_hop["socket"], false);
+
+    // A conversation reached on the listener is claimed where it is served.
+    let (status, body) = ask(m.addr, "/v1/conversations/c-9", &[]).await;
+    assert_eq!((status, body.as_str()), (200, "served c-9"));
+    until("the claim reached the gateway", || {
+        hub.status(0)
+            .claims
+            .iter()
+            .any(|c| c.key == "c-9" && c.node == "0000000000000001")
+    })
+    .await;
+    m.cluster.close_all("test over");
+}
+
+/// **Cut off**: a member whose every cluster has failed one attempt serves its
+/// listener's requests itself, at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_that_reaches_no_cluster_serves_locally() {
+    let ui = tempfile::TempDir::new().unwrap();
+    std::fs::write(ui.path().join("index.html"), "<p>zend</p>").unwrap();
+    let nowhere = closed_port().await;
+    let m = member(nowhere, 2, ui.path()).await;
+    let started = Instant::now();
+    assert_eq!(m.connect(2).await, Link::CutOff);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let local = ask_json(m.addr, "/v1/where", &[]).await;
+    assert_eq!(local["socket"], false);
+}

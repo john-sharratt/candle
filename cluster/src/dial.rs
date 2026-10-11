@@ -5,6 +5,7 @@
 //! to act on.
 
 use std::future::Future;
+use std::time::Duration;
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -54,13 +55,14 @@ impl Attempt {
 
 /// Dial until a terminal close. `hello` builds each attempt's `HELLO`;
 /// `serve` runs an admitted session and returns how it ended; `attempted`
-/// sees every attempt's outcome (for the loading page, §7.6).
+/// sees every attempt's outcome and how long the loop waits before the next,
+/// `None` when it stops (for the loading page, §7.6).
 pub async fn dial<C, H, S, F>(
     mut connector: C,
     key: GroupKey,
     mut hello: H,
     mut serve: S,
-    mut attempted: impl FnMut(&Attempt) + Send,
+    mut attempted: impl FnMut(&Attempt, Option<Duration>) + Send,
 ) -> Stopped
 where
     C: Connect,
@@ -82,9 +84,10 @@ where
                 }
             },
         };
-        attempted(&attempt);
         let (after, close) = attempt.after();
-        match backoff.after(after, &mut rng) {
+        let wait = backoff.after(after, &mut rng);
+        attempted(&attempt, wait);
+        match wait {
             Some(wait) => sleep(wait).await,
             None => {
                 let close = close.expect("only a close stops a socket");
@@ -101,7 +104,6 @@ where
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use tokio::time::Instant;
 
@@ -171,10 +173,16 @@ mod tests {
             let (m, g) = pair(1 << 20);
             tokio::spawn(async move {
                 let (mut tx, mut rx) = (g.tx, g.rx);
-                let _ = admit(&mut tx, &mut rx, &key(), |_| match gate {
-                    Gate::Close(code) => Err(Close::new(code, "scripted")),
-                    _ => Ok(admission()),
-                })
+                let _ = admit(
+                    &mut tx,
+                    &mut rx,
+                    &key(),
+                    |_| {},
+                    |_| match gate {
+                        Gate::Close(code) => Err(Close::new(code, "scripted")),
+                        _ => Ok(admission()),
+                    },
+                )
                 .await;
                 // An admitted session is dropped at once: the member sees the
                 // socket go.
@@ -196,7 +204,7 @@ mod tests {
             key(),
             hello,
             |_, s: Session| async move { s.ended.await.unwrap_or(Ended::Dropped) },
-            move |a| seen.lock().unwrap().push(a.clone()),
+            move |a, _| seen.lock().unwrap().push(a.clone()),
         )
         .await;
         let times = dialled.lock().unwrap().clone();

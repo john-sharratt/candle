@@ -11,6 +11,7 @@
 //! | [`run`] | the one startup path, and the exit |
 //! | [`tenant`] | the contract a daemon implements |
 //! | [`server`] | one `web::Builder`: the shared and tenant APIs, the UIs by host name |
+//! | [`cluster`] | with `--cluster`, each tenant's app as a cluster member |
 //! | [`endpoints`] | `/v1/status`, `/v1/me`, `/v1/telemetry`, `/ws/logs`, … served once |
 //! | [`guard`] | routes that cannot forget their role, and the path-overlap refusal |
 //! | [`access`] | the estate's role table and `--local-signin` |
@@ -21,6 +22,7 @@
 
 pub mod access;
 pub mod cli;
+pub mod cluster;
 pub mod ctrl_c;
 pub mod download;
 pub mod endpoints;

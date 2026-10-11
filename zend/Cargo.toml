@@ -30,6 +30,9 @@ include_dir  = { version = "0.7" }
 # The process zend runs in: logging, the model, the HTTP server, the shared
 # endpoints (`docs/shared_model_host.md`). zend is one of its tenants.
 host         = { path = "../host" }
+# How each route is dispatched under a cluster, and the passthrough key the
+# gateway routes a conversation by (`docs/replicated_substrate.md` §5.2).
+cluster      = { path = "../cluster" }
 # The gateway's own types, where zend reads them: who a caller is
 # (`web::auth`) and how a file goes on the wire (`web::asset` — entity tag,
 # conditional answer, gzip, cache tier), one implementation shared with the

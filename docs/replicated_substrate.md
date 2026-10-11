@@ -1,8 +1,8 @@
 # Replicated substrate: zend, npcd and agents as members of the gateway
 
-**Status:** being built in §15's order. Chunks 1–3 are built: substrate identity and
-order-independent apply, the `cluster` crate's wire protocol, and consensus. Chunks
-4–10 are not. **Scope:** a zend or npcd daemon started with
+**Status:** being built in §15's order. Chunks 1–4 are built: substrate identity and
+order-independent apply, the `cluster` crate's wire protocol, consensus, and members
+behind the gateway without replication. Chunks 5–10 are not. **Scope:** a zend or npcd daemon started with
 `--cluster https://<host or ip>` — and a new kind of member, the *agent*, a CPU machine
 that runs command-line work inside repositories — dials that web gateway over one
 WebSocket per app, proves it holds the estate's group key, and while connected *is* that
@@ -1095,8 +1095,13 @@ daemon reads the assertion (`npcd/src/identity.rs:17-22`), and it is a replayabl
 
 ### 5.2 Every route declares its dispatch
 
-`Api::route(path, min, method)` becomes `Api::route(path, min, dispatch, method)`
-(`host/src/guard.rs:165-183`), and `Guarded` gains `dispatch`.
+`Api::route(path, min, method)` becomes `Api::route(path, min, dispatch, methods)`
+(`host/src/guard.rs`), and `Guarded` gains `dispatch` and the methods it answers.
+The handlers are built with `host::guard`'s `get`, `post`, `put`, `delete` and `patch`,
+which record each method beside the handler — a `GET` answers `HEAD` too, as axum does —
+so a read and a write of one path are two registrations, each with its own dispatch:
+`GET /v1/world/:wid` goes `Any` and `PUT` `Best`. A mount (`nest_self_authenticating`)
+names one dispatch for its path and everything under it.
 
 A route also declares its **mirror mode** for certifying a new build: `Exact` with its
 volatile fields, `Shape`, or `None` (§3.8). It defaults to `None`, so a route that writes
@@ -1148,20 +1153,23 @@ Routes by group (the full table is in each crate's `declared`):
 |---|---|
 | UI files (`/`, `/common/*`, `/brand/*`, every page and asset) | `Ui`: one member per page load (below) |
 | `GET /v1/models`, `/v1/tools`, `/v1/schema/layers`, `/v1/me` | `Any` |
-| zend `POST /v1/chat/completions` | `Sticky(Body("conv_id"))`, with `Header("x-tokera-conversation")` taking precedence — the zend GUI sends it so the gateway never buffers a chat body. A passthrough request carries no `conv_id`: its key is `Derived(passthrough)`, the same `conversation_key` zend computes from the system prompt and first user message (`zend/src/passthrough.rs:174-183`), implemented once in the `cluster` crate that both gateway and member link |
+| zend `POST /v1/chat/completions` | `Sticky(Body("conv_id"))`, with `Header("x-tokera-conversation")` taking precedence — the zend GUI sends it so the gateway never buffers a chat body. A passthrough request carries no `conv_id`: its key is `Derived(passthrough)`, the conversation's opening — every system message, the client's tools, and each message before the first reply, length-prefixed under SHA-256 (`cluster::dispatch::conversation_key`). It is implemented once in the `cluster` crate, which the gateway links to route by it and zend links to name the conversation by it (`Transcript::key`), so the two cannot disagree |
 | zend `/v1/conversations/:id*` | `Sticky(Path("id"))` |
 | zend `/v1/conversations` (list), `/v1/repo_map`, `/v1/substrate/zend/*` reads | `Any` — replicated state |
+| zend `/v1/substrate/zend/*` writes (retiring the system prompt, tombstoning a timeline, a projection probe) | `Best` |
 | zend `/v1/substrate/zend/timeline/:tl/selection` | `Aggregate(FirstFound)` — in memory on whichever member last projected it |
+| zend `/v1/substrate/zend/layer/:name/toggle`, `/v1/substrate/zend/maintenance` | `Aggregate(Envelope)` — each member's own kill switch and log |
 | npcd `/v1/npc/:nid/*` | `Owner(Path("nid"))` |
 | npcd `/v1/interaction/:ix*` | `Owner(Path("ix"))` — interaction ids are minted as `<nid>-<n>`, so the owner is in the id |
-| npcd `/v1/world/:wid/*` live state (channel, posting, the internal `act` route), `/v1/pulse/operations*`, `/v1/pulse/missions*` | `Owner(Path("wid"))`, the world's authority (§9.2) |
-| npcd `/v1/simulate`, `/v1/generate/*`, `/v1/image/*` | `Best` |
-| npcd authored reads (`/v1/world`, `/v1/personality`, `/v1/mind/*`) | `Any` |
+| npcd `/v1/world/:wid/*` live state (channel, posting, the internal `act` route), `/v1/pulse/operations*`, `/v1/pulse/missions*` | `Owner(Path("wid"))`, the world's authority (§9.2); a route among them that names no world goes `Best` |
+| npcd `/v1/life/:who/*` | `Sticky(Path("who"))` — a generation and the job reporting on it stay on one member |
+| npcd `/v1/simulate`, `/v1/generate/*`, `/v1/image/*`, `/v1/guest/image`, the effector mount `/v1/local/*` | `Best` |
+| npcd authored reads (`/v1/world`, `/v1/personality`, `/v1/mind/*`, `/v1/npc` list, `/v1/me/profile*`, `/v1/life/catalog`) | `Any` |
 | npcd authored writes | `Best` — they become VFS events (§10.3) |
-| `/v1/status`, `/v1/telemetry`, `/v1/memory`, `/v1/phases`, `/v1/promotes`, `/v1/profile`, `/v1/substrate`, npcd `/v1/pulse`, `/v1/pulse/census`, `/v1/pulse/world` | `Aggregate(Envelope)` |
-| `/ws/logs` | `Aggregate(Merge)` — one browser socket, every member's lines interleaved, each tagged with its node |
+| `/v1/status`, `/v1/telemetry`, `/v1/memory`, `/v1/phases`, `/v1/promotes`, `/v1/profile`, `/v1/substrate`, `/v1/tools/calibrate`, npcd `/v1/pulse`, `/v1/pulse/census`, `/v1/pulse/world`, `/v1/pulse/broadcast`, `/v1/pulse/announce`, `/v1/pulse/command-table`, `/v1/pulse/guardian`, `/v1/guest` | `Aggregate(Envelope)` — what each member holds or does for the characters it runs |
+| `/ws/logs` | `Aggregate(Lines)` — one browser socket, every member's lines interleaved, each tagged with its node and host |
 | `POST /v1/cluster/command/:name`, `GET /v1/cluster/command/job/:id`, `PUT /v1/cluster/quorum` | admin only; sent with `x-tokera-node` to one member, or once per member for "all" (§12.4) |
-| npcd `/ws/events` | `Any` |
+| npcd `/ws/events`, `/v1/commands` | `Any` |
 
 ### 5.3 Power and idle capacity
 
@@ -1209,7 +1217,8 @@ epoch in the stamp, so the epoch does not need to say whether a claim was taken 
 
 - A gateway routes a key to its claim holder whenever that member is connected to it.
 - When the holder is not connected to this gateway, the request goes `Best`. The member
-  it reaches knows the claim from its relayed copy and answers `409` naming the holder.
+  it reaches knows the claim from its relayed copy and answers `409` naming the holder
+  in `x-tokera-holder`.
   The gateway answers the browser `503` with `Retry-After`, because the holder is
   reachable only through another cluster and the next attempt may land on one.
 
@@ -1663,7 +1672,8 @@ with no identity at all (every identity field zero).
   millisecond grain and makes a collision between members need the same millisecond and
   the same 20 bits. The new ids are above 2^60, above every microsecond id already
   written, so old and new never meet. zend dialogue ids stay `hash(conv_id)`.
-- **zend passthrough timelines become `hash(conversation_key, n)`**, like dialogue ids,
+- **zend passthrough timelines become `hash(conversation key, n)`** — the key §5.2
+  routes it by — like dialogue ids,
   in place of an allocated id (`passthrough::conversation_timeline`). Two members that
   serve the same passthrough conversation then name one timeline, not two. `n` counts
   the conversations already opened under the key: a client that edits its history

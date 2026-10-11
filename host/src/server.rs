@@ -14,6 +14,7 @@ use std::env::current_dir;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::sync::Arc;
 
 use axum::middleware;
 use axum::Router;
@@ -23,6 +24,8 @@ use web::tls::{self_signed, Entrance};
 use web::{Builder, Config};
 
 use crate::access::LocalSignin;
+use crate::cluster::listener::{self, Listener};
+use crate::cluster::Cluster;
 use crate::tenant::TenantUi;
 
 /// The path prefixes the one router answers on every site: the API, the
@@ -84,11 +87,16 @@ pub fn site_table(
 /// The server for `uis` answering `router`, as `listen` describes: the site
 /// table, the trusted peers, and `--local-signin`. Paths resolve against the
 /// working directory.
+///
+/// A member of `cluster` puts its own listener's rules around the whole
+/// router (`cluster::listener`): forward up while joined, serve while cut off.
+/// That router is also what serves the requests its gateways send.
 pub fn builder(
     listen: &Listen,
     uis: &[(&str, TenantUi)],
     router: Router,
     local_signin: LocalSignin,
+    cluster: Option<Arc<Cluster>>,
 ) -> anyhow::Result<Builder> {
     let addr = SocketAddr::new(listen.bind, listen.port);
     let cfg = site_table(uis, addr, &current_dir()?)?;
@@ -99,12 +107,26 @@ pub fn builder(
     );
     // `--local-signin` runs after the server has cleared untrusted identity
     // headers, so it writes onto a request that carries only what is believed.
+    let signin = local_signin.clone();
     let router = router.layer(middleware::from_fn(move |req, next| {
-        local_signin.clone().layer(req, next)
+        signin.clone().layer(req, next)
     }));
-    let mut builder = Builder::new(cfg).trust(gateways);
+    let mut builder = Builder::new(cfg).trust(gateways.clone());
     for (name, _) in uis {
         builder = builder.local_api(name, router.clone());
+    }
+    if let Some(cluster) = cluster {
+        let listener = Arc::new(Listener {
+            cluster: cluster.clone(),
+            sites: Arc::new(site_table(uis, addr, &current_dir()?)?),
+            gateways,
+            local_signin,
+        });
+        builder = builder.wrap(Box::new(move |router: Router| {
+            let router = router.layer(middleware::from_fn_with_state(listener, listener::layer));
+            cluster.set_router(router.clone());
+            router
+        }));
     }
     Ok(builder)
 }
@@ -116,6 +138,7 @@ pub async fn serve(
     uis: &[(&str, TenantUi)],
     router: Router,
     local_signin: LocalSignin,
+    cluster: Option<Arc<Cluster>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     if !listen.bind.is_loopback() {
@@ -125,7 +148,9 @@ pub async fn serve(
              believed only from the trusted peers",
         );
     }
-    let bound = builder(listen, uis, router, local_signin)?.bind().await?;
+    let bound = builder(listen, uis, router, local_signin, cluster)?
+        .bind()
+        .await?;
     let entrance = match listen.tls_port {
         Some(port) => {
             let tls_addr = SocketAddr::new(listen.bind, port);
@@ -304,6 +329,7 @@ mod tests {
             &u.uis,
             api,
             LocalSignin::new(local_signin).unwrap(),
+            None,
         )
         .unwrap()
         .router()

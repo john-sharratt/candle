@@ -79,6 +79,7 @@ async fn boot() -> Harness {
         log: Arc::clone(&log),
         telemetry: Telemetry::new(ModelView::of_prescribed()),
         roles: roles.clone(),
+        cluster: None,
     });
     let all = merge_routes(
         routes(shared, Roots::disk(&[common])),
@@ -95,9 +96,15 @@ async fn boot() -> Harness {
         tls_port: None,
         gateways: Vec::new(),
     };
-    let app = builder(&listen, &[("zend", ui)], all.router, LocalSignin::default())
-        .expect("the site table builds")
-        .router();
+    let app = builder(
+        &listen,
+        &[("zend", ui)],
+        all.router,
+        LocalSignin::default(),
+        None,
+    )
+    .expect("the site table builds")
+    .router();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

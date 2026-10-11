@@ -113,6 +113,30 @@ impl Problem {
         }
     }
 
+    pub fn forbidden(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+            title: "Not allowed".into(),
+            detail: detail.into(),
+            retry_after: None,
+            retry_cap: None,
+            internal: None,
+        }
+    }
+
+    pub fn too_large(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "too_large",
+            title: "Too large".into(),
+            detail: detail.into(),
+            retry_after: None,
+            retry_cap: None,
+            internal: None,
+        }
+    }
+
     pub fn bad_request(detail: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

@@ -29,21 +29,33 @@
 //! every tenant and from its own endpoints, and refuses to start when two of
 //! them register the same path ([`Routes::merge`]) — an overlap is a shared
 //! endpoint the host should serve once (`docs/shared_model_host.md` §3.4).
+//!
+//! # Every route says how a cluster dispatches it
+//!
+//! A registration also names the route's [`Dispatch`]
+//! (`docs/replicated_substrate.md` §5.2) and is built from this module's
+//! [`get`], [`post`], [`put`], [`delete`] and [`patch`], which record the
+//! methods it answers. The table a member sends its gateways ([`Guarded::route`])
+//! is the declared table with both, so a read and a write of one path can be
+//! dispatched differently, each by its own registration.
 
 use std::fmt;
 
 use axum::extract::Request;
+use axum::handler::Handler;
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::MethodRouter;
+use axum::routing::{self, MethodRouter};
 use axum::{Json, Router};
+use cluster::dispatch::{Dispatch, Mirror, Route, RouteTable};
 use serde_json::json;
 use web::auth::{Role, Roles};
 
 use crate::access::role;
 
-/// One registered route, for the startup log and the route-table tests.
+/// One registered route, for the startup log, the route-table tests and the
+/// dispatch table a member sends its gateways.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guarded {
     pub path: &'static str,
@@ -51,6 +63,10 @@ pub struct Guarded {
     /// A mounted router ([`Api::nest_self_authenticating`]): it answers every
     /// path under `path`, not `path` alone.
     pub nested: bool,
+    /// The methods it answers, upper case; empty for a mount, which answers
+    /// every method.
+    pub methods: Vec<&'static str>,
+    pub dispatch: Dispatch,
 }
 
 impl fmt::Display for Guarded {
@@ -60,7 +76,76 @@ impl fmt::Display for Guarded {
     }
 }
 
+/// A route's handlers, with the methods they answer recorded.
+pub struct Methods<S> {
+    router: MethodRouter<S>,
+    names: Vec<&'static str>,
+}
+
+macro_rules! method {
+    ($name:ident, $upper:literal $(, $also:literal)*) => {
+        /// Answer
+        #[doc = $upper]
+        /// with `handler`.
+        pub fn $name<H, T, S>(handler: H) -> Methods<S>
+        where
+            H: Handler<T, S>,
+            T: 'static,
+            S: Clone + Send + Sync + 'static,
+        {
+            Methods {
+                router: routing::$name(handler),
+                names: vec![$upper $(, $also)*],
+            }
+        }
+
+        impl<S> Methods<S>
+        where
+            S: Clone + Send + Sync + 'static,
+        {
+            /// Also answer
+            #[doc = $upper]
+            /// with `handler`.
+            pub fn $name<H, T>(mut self, handler: H) -> Self
+            where
+                H: Handler<T, S>,
+                T: 'static,
+            {
+                self.router = self.router.$name(handler);
+                self.names.extend([$upper $(, $also)*]);
+                self
+            }
+        }
+    };
+}
+
+// axum answers `HEAD` from a `GET` handler, so a `GET` route answers both.
+method!(get, "GET", "HEAD");
+method!(post, "POST");
+method!(put, "PUT");
+method!(delete, "DELETE");
+method!(patch, "PATCH");
+
 impl Guarded {
+    /// This route as a member's dispatch table lists it (§5.2): one entry, or
+    /// for a mount its own path and everything beneath.
+    pub fn routes(&self) -> Vec<Route> {
+        let route = |path: String| Route {
+            methods: self.methods.iter().map(|m| m.to_string()).collect(),
+            path,
+            dispatch: self.dispatch.clone(),
+            mirror: Mirror::None,
+        };
+        if self.nested {
+            vec![
+                route(self.path.to_string()),
+                route(format!("{}/*rest", self.path.trim_end_matches('/'))),
+            ]
+        } else {
+            vec![route(self.path.to_string())]
+        }
+    }
+
     /// The prefix this route answers everything under, when it answers more
     /// than its own path: a mount, or a catch-all (`/common/*path` answers
     /// everything under `/common`).
@@ -156,15 +241,22 @@ where
         }
     }
 
-    /// Register a route behind `min`.
+    /// Register a route behind `min`, dispatched by a cluster as `dispatch`.
     ///
-    /// A path whose methods need *different* roles is registered twice — once
-    /// per role — which axum merges. `/v1/world/:wid` is the case: reading a
-    /// world is open and writing one is an admin's, and splitting the
-    /// registration is what lets each say so on its own line.
-    pub fn route(mut self, path: &'static str, min: Role, methods: MethodRouter<S>) -> Self {
+    /// A path whose methods need *different* roles, or a different dispatch,
+    /// is registered twice — once per role or dispatch — which axum merges.
+    /// `/v1/world/:wid` is the case: reading a world is open and writing one is
+    /// an admin's, and splitting the registration is what lets each say so on
+    /// its own line.
+    pub fn route(
+        mut self,
+        path: &'static str,
+        min: Role,
+        dispatch: Dispatch,
+        methods: Methods<S>,
+    ) -> Self {
         let roles = self.roles.clone();
-        let guarded = methods.route_layer(middleware::from_fn(move |req: Request, next: Next| {
+        let check = middleware::from_fn(move |req: Request, next: Next| {
             let roles = roles.clone();
             async move {
                 match require(req.headers(), &roles, min) {
@@ -172,11 +264,14 @@ where
                     Err(refusal) => *refusal,
                 }
             }
-        }));
+        });
+        let guarded = methods.router.route_layer(check);
         self.declared.push(Guarded {
             path,
             min,
             nested: false,
+            methods: methods.names,
+            dispatch,
         });
         self.router = self.router.route(path, guarded);
         self
@@ -185,12 +280,20 @@ where
     /// Mount `router` under `path`, unguarded by role: for a surface that
     /// authenticates its callers itself (npcd's effector API, which reads a
     /// device token and never `x-tokera-*`). Recorded in the table at
-    /// [`Role::Unauthenticated`], which is what the host's role check grants it.
-    pub fn nest_self_authenticating(mut self, path: &'static str, router: Router<S>) -> Self {
+    /// [`Role::Unauthenticated`], which is what the host's role check grants it,
+    /// and dispatched as `dispatch` whatever the path beneath.
+    pub fn nest_self_authenticating(
+        mut self,
+        path: &'static str,
+        dispatch: Dispatch,
+        router: Router<S>,
+    ) -> Self {
         self.declared.push(Guarded {
             path,
             min: Role::Unauthenticated,
             nested: true,
+            methods: Vec::new(),
+            dispatch,
         });
         self.router = self.router.nest(path, router);
         self
@@ -216,6 +319,13 @@ impl<S> Api<S> {
 pub struct Routes {
     pub router: Router,
     pub declared: Vec<Guarded>,
+}
+
+/// The dispatch table a member of an app sends its gateways (§5.2): every
+/// route in `declared`, with its methods and dispatch.
+pub fn dispatch_table(declared: &[Guarded]) -> anyhow::Result<RouteTable> {
+    RouteTable::new(declared.iter().flat_map(Guarded::routes).collect())
+        .map_err(|e| anyhow::anyhow!("the dispatch table: {e}"))
 }
 
 impl Routes {
@@ -264,7 +374,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use axum::routing::get;
+    use cluster::dispatch::Merge;
     use tower::ServiceExt;
 
     fn roles() -> Roles {
@@ -273,7 +383,7 @@ mod tests {
 
     fn app(min: Role) -> Router {
         Api::<()>::new(roles())
-            .route("/x", min, get(|| async { "ok" }))
+            .route("/x", min, Dispatch::Any, get(|| async { "ok" }))
             .into_routes(())
             .router
     }
@@ -318,9 +428,19 @@ mod tests {
     #[test]
     fn every_registration_is_recorded_with_its_role() {
         let api = Api::<()>::new(roles())
-            .route("/a", Role::Unauthenticated, get(|| async { "" }))
-            .route("/b", Role::Admin, get(|| async { "" }))
-            .nest_self_authenticating("/c", Router::new());
+            .route(
+                "/a",
+                Role::Unauthenticated,
+                Dispatch::Any,
+                get(|| async { "" }),
+            )
+            .route(
+                "/b",
+                Role::Admin,
+                Dispatch::sticky_path("id"),
+                post(|| async { "" }).delete(|| async { "" }),
+            )
+            .nest_self_authenticating("/c", Dispatch::Best, Router::new());
         assert_eq!(
             api.declared(),
             [
@@ -328,19 +448,64 @@ mod tests {
                     path: "/a",
                     min: Role::Unauthenticated,
                     nested: false,
+                    methods: vec!["GET", "HEAD"],
+                    dispatch: Dispatch::Any,
                 },
                 Guarded {
                     path: "/b",
                     min: Role::Admin,
                     nested: false,
+                    methods: vec!["POST", "DELETE"],
+                    dispatch: Dispatch::sticky_path("id"),
                 },
                 Guarded {
                     path: "/c",
                     min: Role::Unauthenticated,
                     nested: true,
+                    methods: vec![],
+                    dispatch: Dispatch::Best,
                 },
             ]
         );
+    }
+
+    /// **The dispatch table is the declared one** (§5.2): a read and a write
+    /// of one path dispatch as each registration says, and a mount dispatches
+    /// everything beneath it; a path nothing declares is a UI file.
+    #[test]
+    fn the_dispatch_table_is_the_declared_one() {
+        let api = Api::<()>::new(roles())
+            .route(
+                "/v1/world/:wid",
+                Role::Unauthenticated,
+                Dispatch::Any,
+                get(|| async { "" }),
+            )
+            .route(
+                "/v1/world/:wid",
+                Role::Admin,
+                Dispatch::Best,
+                put(|| async { "" }).delete(|| async { "" }),
+            )
+            .route(
+                "/v1/status",
+                Role::Unauthenticated,
+                Dispatch::Aggregate(Merge::Envelope),
+                get(|| async { "" }),
+            )
+            .nest_self_authenticating("/v1/local", Dispatch::Best, Router::new());
+        let table = dispatch_table(api.declared()).unwrap();
+        assert_eq!(table.dispatch("GET", "/v1/world/w1"), Dispatch::Any);
+        assert_eq!(table.dispatch("HEAD", "/v1/world/w1"), Dispatch::Any);
+        assert_eq!(table.dispatch("PUT", "/v1/world/w1"), Dispatch::Best);
+        assert_eq!(table.dispatch("DELETE", "/v1/world/w1"), Dispatch::Best);
+        assert_eq!(
+            table.dispatch("GET", "/v1/status"),
+            Dispatch::Aggregate(Merge::Envelope)
+        );
+        assert_eq!(table.dispatch("POST", "/v1/local/tick/now"), Dispatch::Best);
+        assert_eq!(table.dispatch("GET", "/v1/local"), Dispatch::Best);
+        assert_eq!(table.dispatch("GET", "/index.html"), Dispatch::Ui);
     }
 
     fn g(path: &'static str, nested: bool) -> Guarded {
@@ -348,6 +513,8 @@ mod tests {
             path,
             min: Role::Unauthenticated,
             nested,
+            methods: vec![],
+            dispatch: Dispatch::Any,
         }
     }
 
@@ -374,7 +541,12 @@ mod tests {
         let routes = |paths: &[&'static str]| {
             let mut api = Api::<()>::new(roles());
             for p in paths {
-                api = api.route(p, Role::Unauthenticated, get(|| async { "" }));
+                api = api.route(
+                    p,
+                    Role::Unauthenticated,
+                    Dispatch::Any,
+                    get(|| async { "" }),
+                );
             }
             api.into_routes(())
         };
@@ -387,7 +559,7 @@ mod tests {
         assert!(err.contains("/v1/status and npcd serves"), "{err}");
 
         let mounted = Api::<()>::new(roles())
-            .nest_self_authenticating("/v1/local", Router::new())
+            .nest_self_authenticating("/v1/local", Dispatch::Best, Router::new())
             .into_routes(());
         assert!(routes(&["/v1/local/tick"])
             .merge("zend", mounted, "npcd")

@@ -33,6 +33,10 @@ pub enum LoadStep {
     Model,
     /// Replay the redo log at `substrate/` into the in-RAM substrate.
     Substrate,
+    /// With `--cluster`, join the gateways (`docs/replicated_substrate.md`
+    /// §7.6): dial each until one admits this member, every one has failed an
+    /// attempt, or ten seconds have passed. Skipped standalone.
+    Connecting,
     /// Install every act into the schema's `tools` collection, one member each,
     /// so a turn can show the ones it is able to take. See `engine::tools::install`.
     ///
@@ -60,6 +64,7 @@ impl LoadStep {
     pub const ALL: &'static [LoadStep] = &[
         LoadStep::Model,
         LoadStep::Substrate,
+        LoadStep::Connecting,
         LoadStep::Tools,
         LoadStep::Layers,
         LoadStep::Waking,
@@ -70,6 +75,7 @@ impl LoadStep {
         match self {
             LoadStep::Model => "model",
             LoadStep::Substrate => "substrate",
+            LoadStep::Connecting => "connecting",
             LoadStep::Tools => "tools",
             LoadStep::Layers => "layers",
             LoadStep::Waking => "waking",
@@ -81,6 +87,7 @@ impl LoadStep {
         match self {
             LoadStep::Model => "Loading model",
             LoadStep::Substrate => "Replaying substrate",
+            LoadStep::Connecting => "Connecting to the cluster",
             LoadStep::Layers => "Ingesting mind layers",
             LoadStep::Tools => "Installing tools",
             LoadStep::Waking => "Waking the cast",
@@ -94,6 +101,7 @@ impl LoadStep {
         match self {
             LoadStep::Model => "layers",
             LoadStep::Substrate => "turns",
+            LoadStep::Connecting => "clusters",
             LoadStep::Layers => "files",
             LoadStep::Tools => "tools",
             LoadStep::Waking => "characters",
@@ -336,7 +344,12 @@ mod tests {
         let s = p.snapshot().expect("loading");
         assert_eq!(
             s.completed,
-            vec![LoadStep::Model, LoadStep::Substrate, LoadStep::Tools]
+            vec![
+                LoadStep::Model,
+                LoadStep::Substrate,
+                LoadStep::Connecting,
+                LoadStep::Tools
+            ]
         );
     }
 
@@ -359,6 +372,10 @@ mod tests {
         // that reads them.
         assert!(pos(LoadStep::Substrate) < pos(LoadStep::Tools));
         assert!(pos(LoadStep::Layers) < pos(LoadStep::Waking));
+        // The cluster is joined once the substrate — and the node it carries —
+        // is open, and before anything is written that the group would share.
+        assert!(pos(LoadStep::Substrate) < pos(LoadStep::Connecting));
+        assert!(pos(LoadStep::Connecting) < pos(LoadStep::Tools));
     }
 
     #[test]
@@ -409,7 +426,7 @@ mod tests {
         }
         assert_eq!(
             LoadStep::ALL.len(),
-            5,
+            6,
             "a step was added without a decision"
         );
     }

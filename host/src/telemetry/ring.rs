@@ -175,14 +175,15 @@ impl Ring {
         }
     }
 
-    /// The newest sample, for the cards that show a current value.
-    ///
-    /// Unused in production for the same reason as [`Ring::len`] — the reading
-    /// the console shows comes from the serialised window — and kept for the
-    /// same one: it is how a test says which sample won.
-    #[allow(dead_code)]
+    /// The newest sample: the card's memory as a cluster's `CAPACITY` reports
+    /// it, and how a test says which sample won.
     pub fn latest(&self) -> Option<&Sample> {
         self.samples.back()
+    }
+
+    /// The greatest value `f` reads across the window, if it read any.
+    pub fn peak(&self, f: impl Fn(&Sample) -> Option<f64>) -> Option<f64> {
+        self.samples.iter().filter_map(f).reduce(f64::max)
     }
 }
 

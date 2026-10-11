@@ -77,6 +77,16 @@ pub struct Reading {
     pub uptime_s: u64,
 }
 
+/// The card as a cluster ranks it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CardReading {
+    /// The highest aggregate decode rate in the last hour; `None` before the
+    /// engine has decoded.
+    pub peak_decode_tps: Option<f64>,
+    pub vram_total_mib: Option<u64>,
+    pub vram_free_mib: Option<u64>,
+}
+
 /// The live store: a driver handle, an hour of history, and the tenants'
 /// contributions.
 pub struct Telemetry {
@@ -176,6 +186,18 @@ impl Telemetry {
                 }
             }
         });
+    }
+
+    /// What a cluster's `CAPACITY` reads (`docs/replicated_substrate.md` §5.3):
+    /// the hour's peak aggregate decode rate, and the card's memory now.
+    pub fn capacity(&self) -> CardReading {
+        let ring = self.ring.lock().unwrap();
+        let vram = ring.latest().map(|s| s.vram.clone());
+        CardReading {
+            peak_decode_tps: ring.peak(|s| s.eng(|e| e.decode_tps)),
+            vram_total_mib: vram.as_ref().and_then(|v| v.total_mib),
+            vram_free_mib: vram.and_then(|v| v.free_mib),
+        }
     }
 
     pub fn read(&self) -> Reading {

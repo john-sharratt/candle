@@ -58,8 +58,29 @@ async fn run(
     let (mut mtx, mut mrx, mut gtx, mut grx) = ends();
     tokio::join!(
         join(&mut mtx, &mut mrx, &member_key, hello),
-        admit(&mut gtx, &mut grx, &gateway_key, decide)
+        admit(&mut gtx, &mut grx, &gateway_key, |_| {}, decide)
     )
+}
+
+/// The `HELLO` is shown as it arrives, before its proof is checked — so a
+/// refused member can be named.
+#[tokio::test]
+async fn the_hello_is_seen_before_the_proof() {
+    let (mut mtx, mut mrx, mut gtx, mut grx) = ends();
+    let mut seen = None;
+    let other = GroupKey::from_bytes([8; 32]);
+    let k = key();
+    let _ = tokio::join!(
+        join(&mut mtx, &mut mrx, &other, hello(5)),
+        admit(
+            &mut gtx,
+            &mut grx,
+            &k,
+            |h| seen = Some((h.node, h.host.clone())),
+            |_| panic!("never admitted")
+        )
+    );
+    assert_eq!(seen, Some((5, ".5".to_string())));
 }
 
 #[tokio::test]
@@ -110,7 +131,7 @@ async fn a_forged_member_proof_is_closed_4401_by_the_gateway() {
     let k = key();
     let (m, g) = tokio::join!(
         member,
-        admit(&mut gtx, &mut grx, &k, |_| panic!("never admitted"))
+        admit(&mut gtx, &mut grx, &k, |_| {}, |_| panic!("never admitted"))
     );
     assert!(matches!(m, Err(HandshakeError::Closed(c)) if c.code == 4401));
     assert!(matches!(g, Err(HandshakeError::Refused(c)) if c.code == 4401));
@@ -171,7 +192,7 @@ async fn a_non_handshake_frame_before_admit_is_closed_4400() {
         let k = key();
         let (m, g) = tokio::join!(
             member,
-            admit(&mut gtx, &mut grx, &k, |_| panic!("never admitted"))
+            admit(&mut gtx, &mut grx, &k, |_| {}, |_| panic!("never admitted"))
         );
         assert!(matches!(m, Err(HandshakeError::Closed(c)) if c.code == 4400));
         let Err(HandshakeError::Refused(close)) = g else {

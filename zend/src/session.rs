@@ -10,12 +10,15 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use cluster::member::{ClusterView, Link};
 use futures::executor::block_on;
 use futures::future::select_all;
 use futures::{Stream, StreamExt};
+use host::cluster::view::{admitted, connecting_detail, model_id};
+use host::cluster::Join;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as ConvLock;
-use tokio::sync::{Notify, OwnedMutexGuard};
+use tokio::sync::{watch, Notify, OwnedMutexGuard};
 use tokio::task::JoinHandle as TaskHandle;
 
 use candle::{vram, Device};
@@ -1055,6 +1058,8 @@ impl InferenceState {
         qsa_strata: StrataTokens,
         summarize: bool,
         tombstone_retention: Duration,
+        cluster: Option<Join>,
+        status_tx: watch::Sender<String>,
         progress: Arc<LoadProgress>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         // The workspace folder: where the substrate, the schema override and a
@@ -1415,6 +1420,38 @@ impl InferenceState {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+        }
+
+        // With `--cluster`, join the gateways now that the substrate — and the
+        // node it carries — is open (`docs/replicated_substrate.md` §7.6). A
+        // gateway that refuses this build for good leaves the daemon here, on
+        // its loading page with the reason, until it is stopped.
+        if let Some(join) = &cluster {
+            progress.set_step(LoadStep::Connecting);
+            let conv = engine.conversation();
+            let writer = conv.clone();
+            let report = |views: &[ClusterView]| {
+                progress.set_step_progress(admitted(views), views.len() as u64);
+                status_tx.send(connecting_detail(views)).ok();
+            };
+            let link = join.connect(
+                conv.node(),
+                Some(model_id(engine.model_key())),
+                move || writer.last_oseq(),
+                crate::ingest_cancel::cancelled,
+                report,
+            );
+            if let Link::Stopped(_) = link {
+                join.hold(crate::ingest_cancel::cancelled, report);
+            }
+            if crate::ingest_cancel::cancelled() {
+                tracing::warn!("shutdown while connecting to the cluster — draining the engine");
+                if let Err(e) = engine.shutdown() {
+                    tracing::error!("shutdown-while-connecting drain failed: {e}");
+                }
+                return Ok(None);
+            }
+            status_tx.send(String::new()).ok();
         }
 
         let formatted_prompt = builder.format_system_prompt();
@@ -6119,6 +6156,7 @@ impl ZendSession {
         let qsa_strata = self.config.qsa_strata;
         let summarize = self.config.summarize;
         let tombstone_retention = self.config.tombstone_retention;
+        let cluster = self.config.cluster.clone();
         // Handed to both the downloader and the engine builder, so the artifact
         // fetched and the model built are the same one.
         let model = self.config.model.clone();
@@ -6221,6 +6259,8 @@ impl ZendSession {
                     qsa_strata,
                     summarize,
                     tombstone_retention,
+                    cluster,
+                    status_tx.clone(),
                     load_progress_for_blocking,
                 ) {
                     Ok(Some(state)) => {

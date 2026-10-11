@@ -1,0 +1,167 @@
+//! Modes, dispatch, claims and UI pinning over a registry of members.
+
+use super::*;
+use crate::dispatch::{KeySource, Merge};
+use crate::frame::Epoch;
+
+fn capacity(state: MemberState, power: u32, idle: bool, slots_free: u32) -> Capacity {
+    Capacity {
+        state,
+        power,
+        idle,
+        slots_free,
+        decodes: 0,
+        prefill_backlog: 0,
+        vram_free_mib: 0,
+        cores: 8,
+        load_milli: 0,
+    }
+}
+
+fn member(node: u64, session: u64) -> MemberView {
+    MemberView {
+        node,
+        host: format!("m{node}"),
+        app: "zend".into(),
+        build: BuildId {
+            count: 1,
+            hash: "h".into(),
+            local: String::new(),
+        },
+        weight: 1,
+        session,
+        capacity: None,
+        routes: None,
+        high_water: 0,
+    }
+}
+
+/// Three ready members: power 100 (idle), 300 (busy), 200 (idle).
+fn three() -> Registry {
+    let mut r = Registry::new();
+    for (node, power, idle, slots) in [(1, 100, true, 2), (2, 300, false, 5), (3, 200, true, 1)] {
+        r.join(member(node, node));
+        r.capacity(
+            "zend",
+            node,
+            capacity(MemberState::Ready, power, idle, slots),
+        );
+    }
+    r
+}
+
+fn sticky() -> Dispatch {
+    Dispatch::Sticky(vec![KeySource::Body("conv_id".into())])
+}
+
+/// A route with a cluster goes to its configured URL until a member is ready,
+/// switches when one is, and reverts when the last leaves.
+#[test]
+fn the_mode_follows_ready_members() {
+    let mut r = Registry::new();
+    assert_eq!(r.pick("zend", &Dispatch::Any, None, None), Pick::Configured);
+    r.join(member(1, 1));
+    assert!(!r.clustered("zend"), "admitted but loading");
+    assert_eq!(r.pick("zend", &Dispatch::Any, None, None), Pick::Configured);
+    r.capacity("zend", 1, capacity(MemberState::Ready, 1, true, 1));
+    assert!(r.clustered("zend"));
+    assert_eq!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(1));
+    assert!(r.leave("zend", 1, 1));
+    assert_eq!(r.pick("zend", &Dispatch::Any, None, None), Pick::Configured);
+    assert!(!r.clustered("npcd"), "another app is untouched");
+}
+
+#[test]
+fn best_takes_the_highest_idle_power_else_the_most_free_slots() {
+    let mut r = three();
+    assert_eq!(r.pick("zend", &Dispatch::Best, None, None), Pick::Member(3));
+    r.capacity("zend", 1, capacity(MemberState::Ready, 100, false, 2));
+    r.capacity("zend", 3, capacity(MemberState::Ready, 200, false, 1));
+    assert_eq!(r.pick("zend", &Dispatch::Best, None, None), Pick::Member(2));
+    // A member in fault mode or upgrading is not ready, and takes nothing.
+    r.capacity("zend", 2, capacity(MemberState::Fault, 300, true, 9));
+    assert_eq!(r.pick("zend", &Dispatch::Best, None, None), Pick::Member(1));
+}
+
+#[test]
+fn any_goes_round_robin() {
+    let mut r = three();
+    let picks: Vec<Pick> = (0..4)
+        .map(|_| r.pick("zend", &Dispatch::Any, None, None))
+        .collect();
+    assert_eq!(
+        picks,
+        [
+            Pick::Member(1),
+            Pick::Member(2),
+            Pick::Member(3),
+            Pick::Member(1)
+        ]
+    );
+}
+
+/// A claimed key goes to its holder; an unclaimed one goes Best; one held by a
+/// member not here goes Best too, and that member names the holder.
+#[test]
+fn a_sticky_key_follows_its_claim() {
+    let mut r = three();
+    r.claims("zend").claim(b"c-1", Epoch { ms: 1, node: 1 });
+    assert_eq!(
+        r.pick("zend", &sticky(), Some("c-1"), None),
+        Pick::Member(1)
+    );
+    assert_eq!(
+        r.pick("zend", &sticky(), Some("c-2"), None),
+        Pick::Member(3)
+    );
+    r.claims("zend").claim(b"c-3", Epoch { ms: 1, node: 9 });
+    assert_eq!(
+        r.pick("zend", &sticky(), Some("c-3"), None),
+        Pick::Member(3)
+    );
+    assert_eq!(r.pick("zend", &sticky(), None, None), Pick::Member(3));
+}
+
+/// A page's files come from one member: a new page is pinned round robin, and
+/// every request carrying the pin reaches that member while it is ready; a
+/// pinned member that leaves is replaced.
+#[test]
+fn ui_files_come_from_the_pinned_member() {
+    let mut r = three();
+    let Pick::Pinned(first) = r.pick("zend", &Dispatch::Ui, None, None) else {
+        panic!()
+    };
+    for _ in 0..3 {
+        assert_eq!(
+            r.pick("zend", &Dispatch::Ui, None, Some(first)),
+            Pick::Member(first)
+        );
+    }
+    r.leave("zend", first, first);
+    assert!(matches!(
+        r.pick("zend", &Dispatch::Ui, None, Some(first)),
+        Pick::Pinned(n) if n != first
+    ));
+}
+
+#[test]
+fn an_aggregate_reaches_every_ready_member() {
+    let mut r = three();
+    r.capacity("zend", 2, capacity(MemberState::Loading, 1, true, 1));
+    assert_eq!(
+        r.pick("zend", &Dispatch::Aggregate(Merge::Envelope), None, None),
+        Pick::All(vec![1, 3])
+    );
+}
+
+/// A node's older session leaving does not remove its newer one.
+#[test]
+fn a_replaced_session_leaving_removes_nothing() {
+    let mut r = Registry::new();
+    r.join(member(5, 1));
+    r.join(member(5, 2));
+    assert!(!r.leave("zend", 5, 1));
+    assert!(r.member("zend", 5).is_some());
+    let (epoch, listed) = r.listing("zend");
+    assert_eq!((epoch, listed.len()), (2, 1));
+}

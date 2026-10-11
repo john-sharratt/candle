@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use axum::routing::{get, post};
-use host::guard::{Api, Guarded, Routes};
+use cluster::dispatch::{Derived, Dispatch, KeySource, Merge};
+use host::guard::{delete, get, post, Api, Guarded, Routes};
 use web::auth::{Role, Roles};
 
 use crate::session::ZendSession;
@@ -43,98 +43,147 @@ pub fn declared(roles: Roles) -> Vec<Guarded> {
     table(roles).declared().to_vec()
 }
 
+/// The header the zend GUI names its conversation in, so a gateway routes a
+/// chat without buffering its body (`docs/replicated_substrate.md` §5.2).
+pub const CONVERSATION_HEADER: &str = "x-tokera-conversation";
+
 /// zend's route table.
 ///
 /// The chat and conversation routes are open: an OpenAI client (Continue)
 /// sends no identity, and the tools dial resolves the caller's role itself
 /// ([`crate::access`]). The substrate views are an admin's: they read every
 /// conversation and name paths on this host.
+///
+/// Under a cluster a conversation is served by the member holding its claim;
+/// the substrate's replicated state is read from any member, and what lives in
+/// one member's memory — a layer's kill switch, a projection's selection, a
+/// maintenance pass — is asked of each.
 fn table(roles: Roles) -> Api<Arc<ZendSession>> {
+    let conversation = || Dispatch::sticky_path("id");
+    let each = || Dispatch::Aggregate(Merge::Envelope);
     Api::new(roles)
         .route(
             "/v1/chat/completions",
             Role::Unauthenticated,
+            Dispatch::Sticky(vec![
+                KeySource::Header(CONVERSATION_HEADER.into()),
+                KeySource::Body("conv_id".into()),
+                KeySource::Derived(Derived::Passthrough),
+            ]),
             post(chat::completions),
         )
-        .route("/v1/models", Role::Unauthenticated, get(models::list))
+        .route(
+            "/v1/models",
+            Role::Unauthenticated,
+            Dispatch::Any,
+            get(models::list),
+        )
         .route(
             "/v1/repo_map",
             Role::Unauthenticated,
+            Dispatch::Any,
             get(repo_map::completeness),
         )
         .route(
             "/v1/substrate/zend/system-prompt",
             Role::Admin,
-            get(substrate::system_prompt).delete(substrate::retire_system_prompt),
+            Dispatch::Any,
+            get(substrate::system_prompt),
+        )
+        .route(
+            "/v1/substrate/zend/system-prompt",
+            Role::Admin,
+            Dispatch::Best,
+            delete(substrate::retire_system_prompt),
         )
         .route(
             "/v1/substrate/zend/layer/:name",
             Role::Admin,
+            Dispatch::Any,
             get(substrate::layer),
         )
         .route(
             "/v1/substrate/zend/layer/:name/toggle",
             Role::Admin,
+            each(),
             post(substrate::toggle_layer),
         )
         .route(
             "/v1/substrate/zend/timeline/:tl",
             Role::Admin,
-            get(substrate::timeline).delete(substrate::delete_timeline),
+            Dispatch::Any,
+            get(substrate::timeline),
+        )
+        .route(
+            "/v1/substrate/zend/timeline/:tl",
+            Role::Admin,
+            Dispatch::Best,
+            delete(substrate::delete_timeline),
         )
         .route(
             "/v1/substrate/zend/timeline/:tl/selection",
             Role::Admin,
+            Dispatch::Aggregate(Merge::FirstFound),
             get(substrate::selection),
         )
         .route(
             "/v1/substrate/zend/project",
             Role::Admin,
+            Dispatch::Best,
             post(substrate::project),
         )
         .route(
             "/v1/substrate/zend/maintenance",
             Role::Admin,
+            each(),
             post(maintenance::force_maintenance),
         )
         .route(
             "/v1/conversations",
             Role::Unauthenticated,
+            Dispatch::Any,
             get(conversations::list),
         )
         .route(
             "/v1/conversations/:id",
             Role::Unauthenticated,
+            conversation(),
             get(conversations::get).delete(conversations::delete),
         )
         .route(
             "/v1/conversations/:id/files",
             Role::Unauthenticated,
+            conversation(),
             get(files::list).post(files::upload),
         )
         .route(
             "/v1/conversations/:id/files/:file_id",
             Role::Unauthenticated,
+            conversation(),
             get(files::content).delete(files::delete),
         )
         .route(
             "/v1/conversations/:id/archive",
             Role::Unauthenticated,
+            conversation(),
             post(conversations::archive),
         )
         .route(
             "/v1/conversations/:id/live",
             Role::Unauthenticated,
+            conversation(),
             get(conversations::live),
         )
         .route(
             "/v1/conversations/:id/projections/:turn/:event",
             Role::Unauthenticated,
+            conversation(),
             get(projections::get),
         )
         .route(
             "/v1/conversations/:id/projection-context",
             Role::Unauthenticated,
+            conversation(),
             post(projections::context),
         )
 }
@@ -159,8 +208,10 @@ mod tests {
                 ("/v1/models", "unauthenticated"),
                 ("/v1/repo_map", "unauthenticated"),
                 ("/v1/substrate/zend/system-prompt", "admin"),
+                ("/v1/substrate/zend/system-prompt", "admin"),
                 ("/v1/substrate/zend/layer/:name", "admin"),
                 ("/v1/substrate/zend/layer/:name/toggle", "admin"),
+                ("/v1/substrate/zend/timeline/:tl", "admin"),
                 ("/v1/substrate/zend/timeline/:tl", "admin"),
                 ("/v1/substrate/zend/timeline/:tl/selection", "admin"),
                 ("/v1/substrate/zend/project", "admin"),
@@ -181,5 +232,59 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// **Every route dispatches as §5.2 says**, method by method: a
+    /// conversation by its claim, a chat by its header ahead of its body, the
+    /// substrate's reads anywhere and its writes to one member.
+    #[test]
+    fn zends_dispatch_table_follows_the_design() {
+        let table = host::guard::dispatch_table(table(Roles::default()).declared()).unwrap();
+        let conversation = Dispatch::sticky_path("id");
+        assert_eq!(
+            table.dispatch("POST", "/v1/chat/completions"),
+            Dispatch::Sticky(vec![
+                KeySource::Header("x-tokera-conversation".into()),
+                KeySource::Body("conv_id".into()),
+                KeySource::Derived(Derived::Passthrough),
+            ])
+        );
+        for (method, path) in [
+            ("GET", "/v1/conversations/c-1"),
+            ("DELETE", "/v1/conversations/c-1"),
+            ("POST", "/v1/conversations/c-1/files"),
+            ("GET", "/v1/conversations/c-1/files/f-2"),
+            ("POST", "/v1/conversations/c-1/archive"),
+            ("GET", "/v1/conversations/c-1/live"),
+            ("GET", "/v1/conversations/c-1/projections/3/4"),
+            ("POST", "/v1/conversations/c-1/projection-context"),
+        ] {
+            assert_eq!(
+                table.dispatch(method, path),
+                conversation,
+                "{method} {path}"
+            );
+        }
+        for (method, path, want) in [
+            ("GET", "/v1/conversations", Dispatch::Any),
+            ("GET", "/v1/models", Dispatch::Any),
+            ("GET", "/v1/repo_map", Dispatch::Any),
+            ("GET", "/v1/substrate/zend/timeline/7", Dispatch::Any),
+            ("DELETE", "/v1/substrate/zend/timeline/7", Dispatch::Best),
+            ("GET", "/v1/substrate/zend/system-prompt", Dispatch::Any),
+            ("DELETE", "/v1/substrate/zend/system-prompt", Dispatch::Best),
+            (
+                "GET",
+                "/v1/substrate/zend/timeline/7/selection",
+                Dispatch::Aggregate(Merge::FirstFound),
+            ),
+            (
+                "POST",
+                "/v1/substrate/zend/maintenance",
+                Dispatch::Aggregate(Merge::Envelope),
+            ),
+        ] {
+            assert_eq!(table.dispatch(method, path), want, "{method} {path}");
+        }
     }
 }

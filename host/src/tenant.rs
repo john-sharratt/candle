@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 use web::auth::session::Identity;
 use web::auth::{Role, Roles};
 
+use crate::cluster::Join;
 use crate::guard::Routes;
 use crate::loading::LoadingView;
 use crate::logs::LogBus;
@@ -57,6 +58,10 @@ pub struct TenantContext {
     /// The host's telemetry, for a tenant's own columns
     /// ([`Telemetry::add_source`]).
     pub telemetry: Arc<Telemetry>,
+    /// The tenant's app in the cluster the process joins with `--cluster`:
+    /// once its substrate is open, the tenant connects through it in its
+    /// `connecting` loading step. `None` for a standalone daemon.
+    pub cluster: Option<Join>,
 }
 
 /// How a started tenant is drained: stop its background work, flush and detach

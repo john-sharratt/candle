@@ -4,14 +4,15 @@
 //!
 //! 1. **Model** — fetch and load the GGUF weights.
 //! 2. **Substrate** — replay the redo log into the in-RAM substrate.
-//! 3. **Sections** — prefill the projection schema's pinned sections, then
+//! 3. **Connecting** — with `--cluster`, join the gateways.
+//! 4. **Sections** — prefill the projection schema's pinned sections, then
 //!    calibrate them.
-//! 4. **Self-check** — with `--self-check`, ask every stored conversation
+//! 5. **Self-check** — with `--self-check`, ask every stored conversation
 //!    whether it is intact (`crate::self_check`).
-//! 5. **Priming** — read the priming chain the base conversation descends
+//! 6. **Priming** — read the priming chain the base conversation descends
 //!    from (`crate::branch_ingest::prime`).
-//! 6. **Normalizing** — relearn the tool catalog's score-normalization levels.
-//! 7. **Preloading** — decode and place on the GPU what a projection's belief
+//! 7. **Normalizing** — relearn the tool catalog's score-normalization levels.
+//! 8. **Preloading** — decode and place on the GPU what a projection's belief
 //!    scan reads, so the first question asked does not pay for it.
 //!
 //! `LoadProgress` is the single source of truth; the daemon advances it
@@ -30,6 +31,10 @@ pub enum LoadStep {
     /// Forced whole-store redo-log compaction (`--compact-substrate`). Skipped
     /// unless the flag is set — reclaim is normally incremental/background.
     Compacting,
+    /// Joining the cluster (`--cluster`, `docs/replicated_substrate.md` §7.6):
+    /// dialling every gateway until one admits this member, every one has
+    /// failed an attempt, or ten seconds have passed. Skipped standalone.
+    Connecting,
     Sections,
     CalibratingSections,
     /// Every stored conversation asked whether it is intact (`--self-check`).
@@ -62,6 +67,7 @@ impl LoadStep {
         LoadStep::Model,
         LoadStep::Substrate,
         LoadStep::Compacting,
+        LoadStep::Connecting,
         LoadStep::Sections,
         LoadStep::CalibratingSections,
         LoadStep::SelfCheck,
@@ -76,6 +82,7 @@ impl LoadStep {
             LoadStep::Model => "model",
             LoadStep::Substrate => "substrate",
             LoadStep::Compacting => "compacting",
+            LoadStep::Connecting => "connecting",
             LoadStep::Sections => "sections",
             LoadStep::CalibratingSections => "calibrating_sections",
             LoadStep::SelfCheck => "self_check",
@@ -91,6 +98,7 @@ impl LoadStep {
             LoadStep::Model => "Loading model",
             LoadStep::Substrate => "Loading substrate",
             LoadStep::Compacting => "Compacting substrate",
+            LoadStep::Connecting => "Connecting to the cluster",
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
             LoadStep::SelfCheck => "Checking conversations",
@@ -115,6 +123,7 @@ impl LoadStep {
             LoadStep::Model => "",
             LoadStep::Substrate => "turns",
             LoadStep::Compacting => "",
+            LoadStep::Connecting => "clusters",
             LoadStep::Sections => "",
             LoadStep::CalibratingSections => "",
             LoadStep::SelfCheck => "conversations",
@@ -406,7 +415,12 @@ mod tests {
         assert_eq!(snap.current, LoadStep::Sections);
         assert_eq!(
             snap.completed,
-            vec![LoadStep::Model, LoadStep::Substrate, LoadStep::Compacting]
+            vec![
+                LoadStep::Model,
+                LoadStep::Substrate,
+                LoadStep::Compacting,
+                LoadStep::Connecting
+            ]
         );
     }
 
@@ -486,6 +500,7 @@ mod tests {
                 "model",
                 "substrate",
                 "compacting",
+                "connecting",
                 "sections",
                 "calibrating_sections",
                 "self_check",

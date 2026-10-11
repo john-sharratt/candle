@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use cluster::gateway::APPS;
 use serde::Deserialize;
 
 use crate::auth::Roles;
@@ -59,9 +60,26 @@ pub struct Config {
     /// than a user record, and why an entry names `sub` or `email` explicitly.
     #[serde(default)]
     pub roles: Roles,
+    /// The cluster this gateway runs (`docs/replicated_substrate.md` §3): the
+    /// group key members prove they hold. Absent, no member can join and every
+    /// route goes to its configured upstream, as it always has.
+    #[serde(default)]
+    pub cluster: Option<Cluster>,
     /// Directory the config was loaded from; relative roots resolve against it.
     #[serde(skip)]
     pub base: PathBuf,
+}
+
+/// The `cluster:` block.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Cluster {
+    /// The group key's file (§13.1), resolved against this config. A file,
+    /// never an inline value, like every other secret here.
+    pub group_key_file: PathBuf,
+    /// This gateway's name in the coordination log; default its bind address.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// OpenID Connect sign-in, owned by the gateway.
@@ -356,6 +374,11 @@ pub struct Route {
     /// verified against the Mozilla roots built into the binary.
     #[serde(default)]
     pub self_signed: bool,
+    /// The app whose members serve this route once one of them is ready on
+    /// this gateway — `zend`, `npcd` or `agent` (§5.7). Until then, and again
+    /// when the last leaves, the configured `upstream` serves it.
+    #[serde(default)]
+    pub cluster: Option<String>,
 }
 
 /// Where a prefix is answered.
@@ -559,6 +582,11 @@ impl Config {
                 }
             }
         }
+        if let Some(cluster) = &mut self.cluster {
+            if cluster.group_key_file.is_relative() {
+                cluster.group_key_file = base.join(&cluster.group_key_file);
+            }
+        }
 
         for site in &mut self.sites {
             for root in &site.roots {
@@ -615,6 +643,34 @@ impl Config {
                         r.prefix
                     );
                 }
+                if let Some(app) = &r.cluster {
+                    if !APPS.contains(&app.as_str()) {
+                        bail!(
+                            "site `{}`: `cluster: {app}` on `{}` names no app — one of {}",
+                            site.name,
+                            r.prefix,
+                            APPS.join(", ")
+                        );
+                    }
+                    // The configured upstream is what the route falls back to
+                    // with no member ready; a route with none has nowhere to go.
+                    if r.upstream.url().is_none() {
+                        bail!(
+                            "site `{}`: `cluster: {app}` on `{}` needs an upstream URL to serve \
+                             it while no member is ready",
+                            site.name,
+                            r.prefix
+                        );
+                    }
+                    if self.cluster.is_none() {
+                        bail!(
+                            "site `{}`: `cluster: {app}` on `{}`, and no `cluster:` block names \
+                             the group key members prove they hold",
+                            site.name,
+                            r.prefix
+                        );
+                    }
+                }
             }
             // A site with no roots is a pure gateway — legal, and how a proxy
             // that owns no content is expressed. A redirected one owns nothing
@@ -646,6 +702,14 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// The site whose routes `app`'s members serve: where a request a member
+    /// forwards up for `app` is routed (§5.8).
+    pub fn site_for_app(&self, app: &str) -> Option<&Site> {
+        self.sites
+            .iter()
+            .find(|s| s.api.iter().any(|r| r.cluster.as_deref() == Some(app)))
     }
 
     pub fn site_for(&self, host: Option<&str>) -> &Site {
@@ -749,6 +813,34 @@ sites:
         for bad in [
             "sites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"http://10.0.0.5:8081\", self_signed: true}\n",
             "sites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: local, self_signed: true}\n",
+        ] {
+            assert!(Config::from_yaml(bad, Path::new(".")).is_err(), "{bad}");
+        }
+    }
+
+    /// A route's `cluster:` names one of the three apps, keeps an upstream URL
+    /// for while no member is ready, and needs a `cluster:` block naming the
+    /// group key; the key's path resolves against the config.
+    #[test]
+    fn a_cluster_route_needs_an_app_an_upstream_and_a_key() {
+        let ok = "cluster: {group_key_file: \"secrets/group.key\"}\nsites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"http://10.0.0.5:8081\", cluster: zend}\n";
+        let c = Config::from_yaml(ok, Path::new("/srv/web")).expect("valid");
+        assert_eq!(c.sites[0].api[0].cluster.as_deref(), Some("zend"));
+        assert_eq!(
+            c.cluster.unwrap().group_key_file,
+            Path::new("/srv/web").join("secrets/group.key")
+        );
+        assert_eq!(
+            c.sites[0].route_for("/x").unwrap().cluster.as_deref(),
+            Some("zend")
+        );
+        for bad in [
+            // No such app.
+            "cluster: {group_key_file: k}\nsites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"http://10.0.0.5:8081\", cluster: other}\n",
+            // Nowhere to go while no member is ready.
+            "cluster: {group_key_file: k}\nsites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: local, cluster: zend}\n",
+            // No key for a member to prove.
+            "sites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"http://10.0.0.5:8081\", cluster: zend}\n",
         ] {
             assert!(Config::from_yaml(bad, Path::new(".")).is_err(), "{bad}");
         }

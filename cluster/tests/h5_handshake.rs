@@ -1,16 +1,21 @@
-//! H5, the handshake half (§14.2, chunk 2): 500 handshakes — valid, wrong key,
-//! another protocol version, and a member that speaks out of turn — end in
-//! exact codes, and the gateway sends nothing but `CHALLENGE` before `ADMIT`.
-//! The build-floor, model-lock and duplicate-node half runs against the
-//! gateway's admission. Budget 2 s.
+//! H5 (§14.2): handshake storms. The handshake half — valid, wrong key,
+//! another protocol version, and a member that speaks out of turn — runs the
+//! bare handshake; the admission half runs the same cases and a build below the
+//! floor, another model and a duplicate node against a live gateway hub. Every
+//! one ends in its exact code, the gateway sends nothing but `CHALLENGE` before
+//! `ADMIT`, and the floor and lock stand as the first member set them. Budget
+//! 2 s each.
 
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use cluster::clock::now_ms;
 use cluster::close::Close;
-use cluster::frame::{Admit, BuildId, Done, Frame, Hello, Kind};
+use cluster::frame::{Admit, BuildId, Done, Frame, Hello, Kind, ModelId};
+use cluster::gateway::Hub;
 use cluster::handshake::{admit, join, GroupKey, HandshakeError, PROTO};
-use cluster::pipe::memory::{pair, MemoryTx};
+use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
 use cluster::pipe::{Message, PipeClosed, PipeRx, PipeTx};
 
 const HANDSHAKES: usize = 500;
@@ -116,7 +121,15 @@ async fn one(case: Case, node: u64) -> (u16, u16, Vec<u8>) {
         }
     };
     let gateway = async {
-        match admit(&mut gtx, &mut grx, &gateway_key, |h| admission(h.node)).await {
+        match admit(
+            &mut gtx,
+            &mut grx,
+            &gateway_key,
+            |_| {},
+            |h| admission(h.node),
+        )
+        .await
+        {
             Ok(_) => 0,
             Err(HandshakeError::Closed(c)) | Err(HandshakeError::Refused(c)) => c.code,
             Err(e) => panic!("{e}"),
@@ -168,4 +181,212 @@ async fn h5_handshake_storm() {
     println!("H5 (handshake half): {HANDSHAKES} handshakes, {admitted} admitted, in {elapsed:?}");
     assert_eq!(admitted, HANDSHAKES / 4);
     assert!(elapsed <= BUDGET, "took {elapsed:?}");
+}
+
+// ── the admission half, against a live hub ──────────────────────────────────
+
+const FLOOR: u32 = 100;
+
+fn model(weights: u8) -> ModelId {
+    ModelId {
+        arch: "Qwen4Exp".into(),
+        weights: [weights; 32],
+        tokenizer: [1; 32],
+        rope: "yarn".into(),
+        describe: format!("model {weights}"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    Valid,
+    WrongKey,
+    OtherProtocol,
+    OutOfTurn,
+    LowBuild,
+    WrongModel,
+    /// A second session of a node already connected: admitted, and the first
+    /// closed 4409.
+    Duplicate,
+}
+
+/// Connect to `hub` as the member at `ip`, its sends tapped: what the gateway
+/// sent before `ADMIT` is in `kinds`.
+fn dial(hub: &Arc<Hub>, ip: IpAddr) -> (MemoryTx, MemoryRx, Arc<Mutex<Vec<u8>>>) {
+    let (m, g) = pair(1 << 16);
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let gtx = Tap {
+        inner: g.tx,
+        kinds: kinds.clone(),
+    };
+    let hub = hub.clone();
+    tokio::spawn(async move { hub.serve("zend", ip, gtx, g.rx, |_| {}).await });
+    (m.tx, m.rx, kinds)
+}
+
+fn member_hello(node: u64, count: u32, weights: u8, proto: u16) -> Hello {
+    let mut h = hello(node, proto);
+    h.build.count = count;
+    h.model = Some(model(weights));
+    h.now_ms = now_ms();
+    h
+}
+
+async fn joined(tx: &mut MemoryTx, rx: &mut MemoryRx, key: &GroupKey, h: Hello) -> u16 {
+    match join(tx, rx, key, h).await {
+        Ok(_) => 0,
+        Err(HandshakeError::Closed(c)) | Err(HandshakeError::Refused(c)) => c.code,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// What the gateway sent before `ADMIT`, or everything when there was none.
+fn before_admit(kinds: &[u8]) -> Vec<u8> {
+    kinds
+        .iter()
+        .take_while(|k| **k != Kind::Admit.tag())
+        .copied()
+        .collect()
+}
+
+async fn admission_case(hub: Arc<Hub>, case: Admission, i: u64) -> (Admission, Vec<u16>) {
+    let key = GroupKey::from_bytes([1; 32]);
+    let ip = IpAddr::from([10, (i >> 16) as u8, (i >> 8) as u8, i as u8]);
+    let node = 1_000 + i;
+    let (mut tx, mut rx, kinds) = dial(&hub, ip);
+    let code = match case {
+        Admission::Valid => {
+            joined(&mut tx, &mut rx, &key, member_hello(node, FLOOR, 1, PROTO)).await
+        }
+        Admission::WrongKey => {
+            let other = GroupKey::from_bytes([2; 32]);
+            joined(
+                &mut tx,
+                &mut rx,
+                &other,
+                member_hello(node, FLOOR, 1, PROTO),
+            )
+            .await
+        }
+        Admission::OtherProtocol => {
+            joined(
+                &mut tx,
+                &mut rx,
+                &key,
+                member_hello(node, FLOOR, 1, PROTO + 1),
+            )
+            .await
+        }
+        Admission::OutOfTurn => {
+            let done = Frame::Done(Done {
+                request: 1,
+                reply_to: node,
+            });
+            tx.send(Message::Frame(done.encode())).await.unwrap();
+            match rx.recv().await {
+                Some(Message::Close(c)) => c.code,
+                other => panic!("{other:?}"),
+            }
+        }
+        Admission::LowBuild => {
+            joined(
+                &mut tx,
+                &mut rx,
+                &key,
+                member_hello(node, FLOOR - 1, 1, PROTO),
+            )
+            .await
+        }
+        Admission::WrongModel => {
+            joined(&mut tx, &mut rx, &key, member_hello(node, FLOOR, 2, PROTO)).await
+        }
+        Admission::Duplicate => {
+            let first = joined(&mut tx, &mut rx, &key, member_hello(node, FLOOR, 1, PROTO)).await;
+            let (mut tx2, mut rx2, _) = dial(&hub, ip);
+            let second = joined(
+                &mut tx2,
+                &mut rx2,
+                &key,
+                member_hello(node, FLOOR, 1, PROTO),
+            )
+            .await;
+            // The first session is closed 4409, once frames it was already
+            // sent are read past.
+            let replaced = loop {
+                match rx.recv().await {
+                    Some(Message::Close(c)) => break c.code,
+                    Some(Message::Frame(_)) => continue,
+                    None => panic!("the first session dropped without a close"),
+                }
+            };
+            assert_eq!((first, second), (0, 0), "{case:?}");
+            replaced
+        }
+    };
+    let sent = kinds.lock().unwrap().clone();
+    let early = before_admit(&sent);
+    assert!(
+        early.iter().all(|k| *k == Kind::Challenge.tag()),
+        "{case:?}: {sent:?}"
+    );
+    // Valid members stay connected, holding the lock against the wrong model.
+    if case == Admission::Valid {
+        tokio::spawn(async move {
+            let _keep = tx;
+            while rx.recv().await.is_some() {}
+        });
+    }
+    (case, vec![code])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h5_admission_storm() {
+    let started = Instant::now();
+    let hub = Hub::new(GroupKey::from_bytes([1; 32]), "gw-h5");
+    // The first member sets the floor and the lock, and stays.
+    let (mut tx, mut rx, _) = dial(&hub, IpAddr::from([10, 255, 0, 1]));
+    let key = GroupKey::from_bytes([1; 32]);
+    assert_eq!(
+        joined(&mut tx, &mut rx, &key, member_hello(1, FLOOR, 1, PROTO)).await,
+        0
+    );
+    let cases = [
+        Admission::Valid,
+        Admission::WrongKey,
+        Admission::OtherProtocol,
+        Admission::OutOfTurn,
+        Admission::LowBuild,
+        Admission::WrongModel,
+        Admission::Duplicate,
+    ];
+    let mut runs = Vec::new();
+    for i in 0..HANDSHAKES as u64 {
+        let case = cases[i as usize % cases.len()];
+        runs.push(tokio::spawn(admission_case(hub.clone(), case, i)));
+    }
+    for r in runs {
+        let (case, codes) = r.await.unwrap();
+        let want = match case {
+            Admission::Valid => 0,
+            Admission::WrongKey => 4401,
+            Admission::OtherProtocol => 4426,
+            Admission::OutOfTurn => 4400,
+            Admission::LowBuild => 4410,
+            Admission::WrongModel => 4412,
+            Admission::Duplicate => 4409,
+        };
+        assert_eq!(codes, vec![want], "{case:?}");
+    }
+    let status = hub.status(0);
+    let zend = status.apps.iter().find(|a| a.app == "zend").unwrap();
+    assert_eq!(zend.floor.as_ref().map(|b| b.count), Some(FLOOR));
+    assert_eq!(zend.model_lock.as_deref(), Some("model 1"));
+    let refused: Vec<u16> = status.refusals.iter().map(|r| r.code).collect();
+    for code in [4401, 4426, 4400, 4410, 4412] {
+        assert!(refused.contains(&code), "{code} not listed in {refused:?}");
+    }
+    let elapsed = started.elapsed();
+    println!("H5 (admission half): {HANDSHAKES} handshakes in {elapsed:?}");
+    assert!(elapsed <= BUDGET, "took {elapsed:?}");
+    drop((tx, rx));
 }

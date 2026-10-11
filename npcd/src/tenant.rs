@@ -21,6 +21,7 @@ use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENT
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::Capabilities;
 use clap::Args;
+use cluster::dispatch::Dispatch;
 use futures::future::BoxFuture;
 use host::guard::{Api, Guarded, Routes};
 use host::{OneShot, Running, Tenant, TenantContext, TenantUi};
@@ -432,6 +433,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         runtime.clone(),
         LoadPlan {
             engine: ctx.engine,
+            cluster: ctx.cluster,
             forget_conversations: args.forget_conversations,
             forget_dreams: args.forget_dreams,
             forget_journal: args.forget_journal,
@@ -534,9 +536,13 @@ fn tables(
 ) -> (Api<Arc<Authored>>, Api<Arc<Authored>>, Api<()>) {
     // The effector device authenticates by its own device token, never the
     // operator roles: a client may send both a token and `x-tokera-*`, and
-    // only the token is read.
-    let effector =
-        Api::<()>::new(roles.clone()).nest_self_authenticating("/v1/local", effector_router);
+    // only the token is read. Its paths name no key a gateway could route by,
+    // so a cluster sends it to the best member.
+    let effector = Api::<()>::new(roles.clone()).nest_self_authenticating(
+        "/v1/local",
+        Dispatch::Best,
+        effector_router,
+    );
     (
         api::api(roles.clone()),
         engine::api(roles.clone()),
