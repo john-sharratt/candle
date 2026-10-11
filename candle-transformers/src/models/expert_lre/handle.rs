@@ -101,7 +101,18 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// immediately after a warm pool sized against *total* RAM took every free page
 /// on a machine with 12 GB already in use by other processes.
 ///
-/// **4 GiB, and that figure is measured rather than reasoned.** The run's
+/// **3 GiB, sized by the hungriest gate, measured on the 16 GB box** (31.5 GiB
+/// host). With the wave's transients on the span's bump tiers, Flash-Next's own
+/// transient after pinning is ~1.06 GiB (free RAM low-water 2.94 GiB under a
+/// 4 GiB headroom), and its Q3_KO rung — the tier under a third of the experts,
+/// prefill bound by the bytes read off the drive — gains from every slot: 3 GiB
+/// took the tier to 8,932 experts and BF16×8 prefill to 570.5 t/s (528.4 at
+/// 4 GiB), low-water 2.17 GiB. Qwen3.6-35B-A3B's transient is ~2 GiB larger: at
+/// 2 GiB its free RAM bottomed at **0.03 GiB**, at 3 GiB at 0.88 GiB. The history
+/// below is what the figure was before, when the tier was past its knee and the
+/// transient was larger.
+///
+/// **4 GiB, and that figure was measured rather than reasoned.** The run's
 /// non-pinned transient — everything the process takes after the tier is
 /// pinned — is **3.30 GiB** on the 3.6-35B gate: launch 16.45 GiB, tier 12.14,
 /// other pinned 0.62, and a free-RAM low-water of 0.39 GiB
@@ -123,7 +134,7 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// 14,283 experts and pack reads fell ~9%, but free RAM bottomed at 2.05 GiB and
 /// the run paid for it: decode 13.8 / 67.6 / 26.8 → 13.5 / 64.7 / 22.8 t/s
 /// (BF16×1 / BF16×8 / C5×2), prefill 269.5 → 256.0 on C5. At 4 GiB the low
-/// point is 3.57 GiB. Warm KV does not come out of this: it has a pageable
+/// point was 3.57 GiB. Warm KV does not come out of this: it has a pageable
 /// floor of its own (`vram::KV_WARM_FLOOR`) that the OS pages rather than
 /// refusing.
 ///
@@ -141,7 +152,7 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// not the common case, and belongs in the exception's own code —
 /// `zend::session`'s calibration loop backs its concurrency window off directly
 /// against live free RAM instead. See `zend_run_iteration_traps.md` §4.
-pub const WARM_TIER_HEADROOM: u64 = 4 * 1024 * 1024 * 1024;
+pub const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
 
 use candle::vram::PAGEABLE_RESERVE;
 

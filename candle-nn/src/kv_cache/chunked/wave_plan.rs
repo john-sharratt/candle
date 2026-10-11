@@ -449,6 +449,14 @@ pub struct HyperWidths {
     /// Whether the stack's per-layer n-gram embedding block runs in the
     /// forward, ahead of its layer's mixer ([`Chain::Ple`]).
     pub ple: bool,
+    /// What an attention mixer carves its projections and per-head
+    /// intermediates in: the wave's own dtype. Only the residual is F32 the
+    /// whole way round, so pricing the mixer in
+    /// [`ModelGeometry::act_dtype`] — F32 on this stack — doubles every Q, gate
+    /// and context buffer: measured on Qwen3.8-Flash-Next at BF16 ×4, an
+    /// attention phase priced at 1,122,580,736 B whose widest generation carved
+    /// 983,476,480 B. See [`WaveBuffer::is_mixer_carve`].
+    pub mixer_dtype: DType,
 }
 
 /// Which generation a buffer lives in.
@@ -1232,22 +1240,21 @@ pub enum WaveBuffer {
     // as a trunk attention layer does — see [`Chain::HeadPass`]. Priced zero on
     // a stack without a head.
     //
-    // **The embedding half is the forward phase's.** The rows' embeddings live
-    // on the forward span ([`Self::HeadRowEmbeds`]), and a norm whose input
-    // already carries an arena stays in that arena whatever root it is handed —
-    // so the embedding norm, its operand and its projection carve there, beside
-    // the rows they read, and not on the head's attention phase.
+    // **The embedding half is the head's attention phase's too.** The rows'
+    // embeddings live on the forward span ([`Self::HeadRowEmbeds`]), but the
+    // assembly hands the embedding norm the attention phase's ticket as its
+    // root, so the norm, its operand and its projection carve there: measured
+    // on Qwen3.8-Flash-Next at BF16 ×4, all three in the head pass's attention
+    // generation and none in the forward one.
     /// The shifted residual, `[rows, streams · hidden]` F32.
     HeadShift,
     /// Its grouped norm, the same width.
     HeadHiddenNorm,
-    /// The rows' embeddings normed, `[rows, hidden]` F32 — on the forward phase.
+    /// The rows' embeddings normed, `[rows, hidden]` F32.
     HeadEmbedNorm,
-    /// That norm quantized for `eh_proj`'s embedding half — int8 sessions only,
-    /// on the forward phase.
+    /// That norm quantized for `eh_proj`'s embedding half — int8 sessions only.
     HeadEmbedOperand,
-    /// The embedding half's projection, `[rows, hidden]` F32 — on the forward
-    /// phase.
+    /// The embedding half's projection, `[rows, hidden]` F32.
     HeadEmbedProj,
     /// The hidden norm quantized for `eh_proj`'s hidden half, one row per
     /// stream — int8 sessions only.
@@ -1503,7 +1510,7 @@ impl WaveBuffer {
             | Self::MtpInputOperand
             | Self::MtpInput => Chain::HeadPass,
             Self::MtpRowEmbeds => Chain::Forward,
-            Self::HeadEmbedNorm | Self::HeadEmbedOperand | Self::HeadEmbedProj => Chain::Forward,
+            Self::HeadEmbedNorm | Self::HeadEmbedOperand | Self::HeadEmbedProj => Chain::HeadPass,
             Self::PleRows | Self::PleKeyValue | Self::PleNormalized | Self::PleSpanTable => {
                 Chain::Ple
             }
@@ -1577,6 +1584,9 @@ impl WaveBuffer {
             | Self::HeadHiddenOperand
             | Self::HeadHiddenProj
             | Self::HeadInput
+            | Self::HeadEmbedNorm
+            | Self::HeadEmbedOperand
+            | Self::HeadEmbedProj
             | Self::MtpTrunkNorm
             | Self::MtpShift
             | Self::MtpEmbedNorm
@@ -1666,9 +1676,6 @@ impl WaveBuffer {
             | Self::HeadRowEmbeds
             | Self::HeadScoredResidual
             | Self::HeadScoredRows
-            | Self::HeadEmbedNorm
-            | Self::HeadEmbedOperand
-            | Self::HeadEmbedProj
             | Self::MtpRowEmbeds
             | Self::PrefillCuSeqlens
             | Self::PrefillQLens
@@ -1729,6 +1736,7 @@ impl WaveBuffer {
             low_rank: 0,
             draft_head: false,
             ple: false,
+            mixer_dtype: g.act_dtype,
         });
         let hyper_rows = if g.hyper.is_some() { rows } else { 0 };
         let hyper_scored = if g.hyper.is_some() { w.scored_rows } else { 0 };
@@ -1801,6 +1809,10 @@ impl WaveBuffer {
             // fused projection's `qkv_cols` row, or a gated lineage's
             // interleaved `[q | gate]`. With neither, `wq`'s output is already
             // the tensor Q wants.
+            // A hyper-connection stack loads its q/k/v stacked into one
+            // projection, so `split_group` scatters the whole group into one
+            // carve rather than narrowing Q alone out of it.
+            Self::QSplit if g.hyper.is_some() => dense(rows, g.qkv_cols(), g.act_dtype),
             Self::QSplit if g.fused_qkv || g.gated_qkv => dense(rows, g.attn_cols(), g.act_dtype),
             Self::QSplit => dense(0, 0, g.act_dtype),
             Self::QNormOut if g.head_qk_norm => dense(rows, g.attn_cols(), g.act_dtype),
@@ -1810,6 +1822,12 @@ impl WaveBuffer {
             // `seq == 1` makes moot, so the decode chain carves none of them.
             // The decode census confirms it: nine carves, and these four are
             // not among them.
+            // Q is a strided narrow out of the interleaved `[q | gate]` rows the
+            // stacked split wrote, so flattening it for the norm copies it, on
+            // every row.
+            Self::QNormIn if g.hyper.is_some() && g.head_qk_norm && g.gated_qkv => {
+                dense(rows, g.attn_cols(), g.act_dtype)
+            }
             Self::QNormIn | Self::QHeadsPacked if g.head_qk_norm && g.head_norm_reshapes => {
                 dense(w.prefill_rows, g.attn_cols(), g.act_dtype)
             }
@@ -2229,8 +2247,7 @@ impl WaveBuffer {
             Self::HeadShift | Self::HeadHiddenNorm | Self::HeadInput => {
                 dense(rows, hc_dim, DType::F32)
             }
-            // The embedding half rides the forward phase, which only a wave
-            // that reaches the head prices.
+            // The embedding half, only on a wave that reaches the head.
             Self::HeadEmbedNorm | Self::HeadEmbedOperand | Self::HeadEmbedProj
                 if w.scored_rows == 0 =>
             {
@@ -2280,7 +2297,26 @@ impl WaveBuffer {
 
     /// Bytes this buffer needs for a wave of width `w`.
     pub fn bytes(&self, g: &ModelGeometry, w: WaveWidth) -> usize {
-        self.shape(g, w).bytes()
+        match g.hyper {
+            Some(hyper) if self.is_mixer_carve() => self
+                .shape(
+                    &ModelGeometry {
+                        act_dtype: hyper.mixer_dtype,
+                        ..*g
+                    },
+                    w,
+                )
+                .bytes(),
+            _ => self.shape(g, w).bytes(),
+        }
+    }
+
+    /// Whether a hyper-connection stack carves this buffer in its
+    /// [`HyperWidths::mixer_dtype`] rather than the F32 its residual carries:
+    /// every attention-chain buffer but `o_proj`'s output, which is the
+    /// mixer's contribution to that residual and is written in F32.
+    pub fn is_mixer_carve(&self) -> bool {
+        self.chain() == Chain::Attention && *self != Self::OProjOutput
     }
 }
 
@@ -2683,6 +2719,7 @@ mod tests {
                 low_rank: 320,
                 draft_head: false,
                 ple: false,
+                mixer_dtype: DType::F32,
             }),
             ..moe()
         }
@@ -2723,6 +2760,7 @@ mod tests {
                 low_rank: 320,
                 draft_head: true,
                 ple: true,
+                mixer_dtype: DType::F32,
             }),
             ..hyper_moe()
         }
@@ -2732,17 +2770,23 @@ mod tests {
     /// carve. On its attention phase: the shift, the hidden norm and the sum
     /// (each 100 × 10240 × 4 = 4,096,000), the hidden operand (one row per
     /// stream: 8,000 tiles → 1,000 blocks × 1,152 = 1,152,000) and the hidden
-    /// projection (400 × 2560 × 4 = 4,096,000). On the forward phase, beside
-    /// the embeddings they read: the embedding norm and its projection (each
-    /// 100 × 2560 × 4 = 1,024,000) and the embedding operand (2,000 tiles → 250
-    /// blocks × 1,152 = 288,000). Every carve starts on a 256 boundary, so each
-    /// walk is its sum.
+    /// projection (400 × 2560 × 4 = 4,096,000) — 17,536,000 — and, on the same
+    /// phase, the embedding norm and its projection (each 100 × 2560 × 4 =
+    /// 1,024,000) and the embedding operand (2,000 tiles → 250 blocks × 1,152 =
+    /// 288,000). Every carve starts on a 256 boundary, so the walk is the sum.
     #[test]
     fn the_head_pass_prices_its_assembly() {
         let g = hyper_moe_full();
         let p = WavePlan::new(g);
         let wide = WaveWidth::prefill(100, 1);
-        assert_eq!(p.chain_bytes(Chain::HeadPass, wide), 17_536_000);
+        assert_eq!(p.chain_bytes(Chain::HeadPass, wide), 19_872_000);
+        for b in [
+            WaveBuffer::HeadEmbedNorm,
+            WaveBuffer::HeadEmbedOperand,
+            WaveBuffer::HeadEmbedProj,
+        ] {
+            assert_eq!(b.phase(), LayerPhase::Attention, "{b:?}");
+        }
         assert_eq!(
             WavePlan::new(hyper_moe()).chain_bytes(Chain::HeadPass, wide),
             0
@@ -2772,7 +2816,7 @@ mod tests {
         let p = WavePlan::new(hyper_moe_full());
         let wide = WaveWidth::prefill(100, 1);
         let head = p.walk_chain(
-            p.walk_chain(17_536_000, Chain::HyperAttn, wide),
+            p.walk_chain(19_872_000, Chain::HyperAttn, wide),
             Chain::Attention,
             wide,
         );
@@ -2781,6 +2825,45 @@ mod tests {
             .max(p.walk_chain(10_731_776, Chain::DeltaNet, wide));
         assert_eq!(p.phase_bytes(LayerPhase::Attention, wide), head.max(trunk));
         assert!(head > p.walk_chain(10_731_776, Chain::Attention, wide));
+    }
+
+    /// A hyper stack's attention mixer carves in the wave's dtype, its residual
+    /// in F32. At 100 rows over q|k|v = (32 + 2·4) × 128 = 5,120 columns: the
+    /// projection and the stacked split at two bytes (100 × 5,120 × 2 =
+    /// 1,024,000 each), where an F32 mixer pays twice that; `o_proj`'s output
+    /// is the residual's (100 × 2,560 × 4 = 1,024,000) under either; and the
+    /// residual-side chains do not move.
+    #[test]
+    fn a_hyper_stack_prices_its_attention_mixer_in_the_wave_dtype() {
+        let f32 = hyper_moe_full();
+        let bf16 = ModelGeometry {
+            hyper: f32.hyper.map(|h| HyperWidths {
+                mixer_dtype: DType::BF16,
+                ..h
+            }),
+            ..f32
+        };
+        let wide = WaveWidth::prefill(100, 1);
+        assert_eq!(WaveBuffer::QkvProjection.bytes(&bf16, wide), 1_024_000);
+        assert_eq!(WaveBuffer::QSplit.bytes(&bf16, wide), 1_024_000);
+        assert_eq!(WaveBuffer::QkvProjection.bytes(&f32, wide), 2_048_000);
+        assert_eq!(WaveBuffer::QSplit.bytes(&f32, wide), 2_048_000);
+        assert_eq!(WaveBuffer::OProjOutput.bytes(&bf16, wide), 1_024_000);
+        assert_eq!(WaveBuffer::OProjOutput.bytes(&f32, wide), 1_024_000);
+        let (a, b) = (WavePlan::new(f32), WavePlan::new(bf16));
+        for chain in [
+            Chain::HyperAttn,
+            Chain::DeltaNet,
+            Chain::HeadPass,
+            Chain::Ffn,
+        ] {
+            assert_eq!(
+                a.chain_bytes(chain, wide),
+                b.chain_bytes(chain, wide),
+                "{chain:?}"
+            );
+        }
+        assert!(b.chain_bytes(Chain::Attention, wide) < a.chain_bytes(Chain::Attention, wide));
     }
 
     /// The PLE block at 100 rows over one sequence: the table rows

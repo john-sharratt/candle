@@ -1063,22 +1063,36 @@ fn prefill_pass_fits<M: ManagedBatchedModel + ?Sized>(
     seqs: &[usize],
     takes: &[usize],
 ) -> bool {
+    prefill_pass_cost(model, session, seqs, takes).is_none_or(|c| c.tier + c.kv <= c.ground)
+}
+
+/// What a prefill pass costs against the ground it can reach, in bytes.
+struct PassCost {
+    tier: usize,
+    kv: usize,
+    ground: usize,
+}
+
+/// [`prefill_pass_fits`]'s three figures, or `None` when the model cannot price
+/// the wave.
+fn prefill_pass_cost<M: ManagedBatchedModel + ?Sized>(
+    model: &M,
+    session: &BatchedInferenceSession,
+    seqs: &[usize],
+    takes: &[usize],
+) -> Option<PassCost> {
     let act = session.activation_dtype();
-    let Some(ground) = model.prefill_ground_bytes() else {
-        return true;
-    };
+    let ground = model.prefill_ground_bytes()?;
     let offsets: Vec<usize> = seqs
         .iter()
         .map(|&s| session.sequence_offset(s).unwrap_or(0))
         .collect();
     let rows: usize = takes.iter().sum();
-    let Some(tier) = model.wave_tier_bytes(rows, seqs.len(), takes, &offsets, act) else {
-        return true;
-    };
+    let tier = model.wave_tier_bytes(rows, seqs.len(), takes, &offsets, act)? as usize;
     let kv = model.kv_bytes_per_row(act).map_or(0, |per_row| {
         rows.saturating_mul(per_row).div_ceil(REGION_BYTES) * REGION_BYTES
     });
-    (tier as usize).saturating_add(kv) <= ground
+    Some(PassCost { tier, kv, ground })
 }
 
 /// The expert pipeline's tallies for the interval just ended, with its
@@ -1785,10 +1799,21 @@ impl TestParams {
                 .map(|t| t.dims().last().copied().unwrap_or(0))
                 .collect();
             let total: usize = lens.iter().sum();
-            let whole = prefill_pass_fits(model, &session, &sequence_indices, &lens);
+            let cost = prefill_pass_cost(model, &session, &sequence_indices, &lens);
+            let whole = cost.as_ref().is_none_or(|c| c.tier + c.kv <= c.ground);
             if repeat == 0 {
+                // The composed wave's price beside the ground it can reach, so a
+                // sliced prefill says by how much it missed.
+                let priced = cost.as_ref().map_or(String::new(), |c| {
+                    format!(
+                        " (tier {} + KV {} of {} MiB ground)",
+                        c.tier >> 20,
+                        c.kv >> 20,
+                        c.ground >> 20
+                    )
+                });
                 println!(
-                    "  - prefill: {total} rows across {} sequences, cap {cap} rows per wave{}",
+                    "  - prefill: {total} rows across {} sequences, cap {cap} rows per wave{priced}{}",
                     lens.len(),
                     if whole { "" } else { " — sliced" }
                 );

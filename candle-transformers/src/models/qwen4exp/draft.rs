@@ -426,9 +426,9 @@ impl Qwen4ExpBatched {
             candle::bail!("qwen4exp draft: the head's block is not full-attention");
         };
 
-        // The forward phase holds the step's embeddings — and with them the
-        // embedding half of the head's input, which a norm keeps beside the rows
-        // it reads — and, at the end, the shared head's logits.
+        // The forward phase holds the step's embeddings and, at the end, the
+        // shared head's logits; the head's input assembly carves on the
+        // attention phase below.
         let fwd_wave = begin_wave(&stream, LayerPhase::Forward)?;
         let fwd_ticket = Some(fwd_wave.ticket());
         // Fully written by the lookup (invariant 6), in the head's F32.

@@ -1791,9 +1791,10 @@ impl Qwen4ExpBatched {
 }
 
 impl ManagedBatchedModel for Qwen4ExpBatched {
-    fn wave_geometry(&self, _act_dtype: DType) -> ModelGeometry {
+    fn wave_geometry(&self, wave_dtype: DType) -> ModelGeometry {
         // The Gated Residual carries F32 throughout, so the wave's own dtype is
-        // not what the spans are priced in.
+        // not what the spans are priced in — except the attention mixer's own
+        // carves, which run in it (`HyperWidths::mixer_dtype`).
         let act_dtype = DType::F32;
         let cfg = &self.model.cfg;
         let int8 = self.model.lm_head.int8mode().is_int8();
@@ -1856,6 +1857,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
                 low_rank: cfg.hc.low_rank,
                 draft_head: self.model.mtp.is_some(),
                 ple: true,
+                mixer_dtype: wave_dtype,
             }),
             // The multi-stream head is the one `HyperWidths` states.
             mtp_head: false,
