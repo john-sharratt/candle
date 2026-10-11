@@ -388,8 +388,10 @@ pub fn collect_live_records(
     }
 
     // Per-stream live records — sourced from the substrate's in-RAM
-    // stream index, the authoritative source.
-    for (stream_id, entry) in substrate.all_streams() {
+    // stream index, the authoritative source. Every writer's stream is
+    // carried: two members' turn N share a stream id and are both kept.
+    for (key, entry) in substrate.all_physical_streams() {
+        let stream_id = key.stream_id;
         // Distillation degree for this turn's timeline (None = not distilled).
         // Both modes drop the KV chunks (the bulk of the on-disk cost);
         // ProvenanceOnly also drops tokens (keep sig + projections — the belief
@@ -438,9 +440,11 @@ pub fn collect_live_records(
                 // StreamDecl: the reload restores the turn as an empty
                 // placeholder from the decl, preserving the timeline's turn
                 // indexing (a fully-dropped decl would renumber every later
-                // turn away from its persisted stream ids).
+                // turn away from its persisted stream ids). The tombstone names
+                // the turn's position, not the index its writer gave it.
                 turn_dead = TimelineId::from_raw(t.timeline_id)
-                    .is_some_and(|tl| substrate.tombstoned_turns().contains(&(tl, t.turn_index)));
+                    .zip(substrate.turn_position(key))
+                    .is_some_and(|(tl, pos)| substrate.tombstoned_turns().contains(&(tl, pos.0)));
                 distilled.get(&t.timeline_id).copied()
             } else {
                 None

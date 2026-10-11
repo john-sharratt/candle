@@ -11,7 +11,10 @@
 //! Keys are derived from the record header alone: `Chunk` is keyed by
 //! `(stream_id, chunk_index)`; the per-stream last-writer-wins types
 //! (`Tokens`, `StreamDecl`, `Commit`, `ProjectionEvents`, `WideQSig`)
-//! by `stream_id`; the workspace singletons by type. `ConvState` carries its
+//! by `stream_id`; the workspace singletons by type. A stream's own records
+//! are keyed by their writer's origin too: two members' turn *N* share a
+//! stream id and are two streams (`docs/replicated_substrate.md` §6.6), so
+//! neither supersedes the other. `ConvState` carries its
 //! timeline in the header's `stream_id` and is keyed by it. The other
 //! timeline-keyed metadata types (`Label`, `TreeMetadata`, `DebugId`,
 //! `Tombstone`) carry their key inside the payload, which the header
@@ -42,6 +45,26 @@ struct Live {
     id: RecordIdentity,
 }
 
+/// One record key: its type, the header's `stream_id`, a sub-key (a chunk's
+/// index, a file event's sequence number), and the writer's origin for a
+/// stream's own records ([`stream_owned`]), zero for every other.
+type Key = (RecordType, u64, u64, u64);
+
+/// The record types a stream owns — written by the member that declared the
+/// stream, under its id.
+fn stream_owned(rt: RecordType) -> bool {
+    matches!(
+        rt,
+        RecordType::Chunk
+            | RecordType::Tokens
+            | RecordType::StreamDecl
+            | RecordType::Commit
+            | RecordType::ProjectionEvents
+            | RecordType::WideQSig
+            | RecordType::TurnIndexPage
+    )
+}
+
 /// Incremental byte accounting over appended records: per key, the record with
 /// the greatest version stamp is live (`docs/replicated_substrate.md` §6.5).
 /// Records reach the log in arrival order, so one ranked below the record a
@@ -49,7 +72,7 @@ struct Live {
 #[derive(Debug, Default)]
 pub struct RecordAccounting {
     /// The current live record per key.
-    live_sizes: HashMap<(RecordType, u64, u64), Live>,
+    live_sizes: HashMap<Key, Live>,
     /// Total padded bytes of superseded (dead) records.
     dead_bytes: u64,
 }
@@ -80,7 +103,7 @@ impl RecordAccounting {
         // arriving later is dead too.
         if header.retracts_snapshot() {
             self.offer(
-                (RecordType::Snapshot, header.stream_id, 0),
+                (RecordType::Snapshot, header.stream_id, 0, 0),
                 Live {
                     size: 0,
                     id: header.identity(),
@@ -89,7 +112,7 @@ impl RecordAccounting {
             self.dead_bytes += padded_size;
             return;
         }
-        let key = match header.record_type {
+        let (rt, stream_id, sub) = match header.record_type {
             RecordType::Chunk => (RecordType::Chunk, header.stream_id, header.chunk_index),
             // A conversation's file events and tombstones are keyed by timeline
             // and sequence number, each unique: nothing supersedes one. An
@@ -148,8 +171,9 @@ impl RecordAccounting {
             | RecordType::HeaderIndex
             | RecordType::Unknown => return,
         };
+        let writer = if stream_owned(rt) { header.origin } else { 0 };
         self.offer(
-            key,
+            (rt, stream_id, sub, writer),
             Live {
                 size: padded_size,
                 id: header.identity(),
@@ -159,7 +183,7 @@ impl RecordAccounting {
 
     /// `incoming` becomes `key`'s live record when it supersedes the one held,
     /// which turns dead; otherwise `incoming` is dead on arrival.
-    fn offer(&mut self, key: (RecordType, u64, u64), incoming: Live) {
+    fn offer(&mut self, key: Key, incoming: Live) {
         match self.live_sizes.entry(key) {
             Entry::Occupied(mut held) => {
                 if incoming.id.supersedes(&held.get().id) {
@@ -180,29 +204,19 @@ impl RecordAccounting {
     /// tombstone named, or whose timeline was tombstoned. A key not live is
     /// left alone, so retiring twice counts once.
     pub fn retire(&mut self, rt: RecordType, stream_id: u64, index: u64) {
-        if let Some(live) = self.live_sizes.remove(&(rt, stream_id, index)) {
+        if let Some(live) = self.live_sizes.remove(&(rt, stream_id, index, 0)) {
             self.dead_bytes += live.size;
         }
     }
 
-    /// Count every live record `stream_id` owns as dead — its chunks and its
-    /// per-stream records. Keyed only on the stream-owned types, since
-    /// `Snapshot`, `Npc` and `ConvState` reuse the header's `stream_id` for
-    /// ids of their own.
+    /// Count every live record `stream_id` owns as dead, every writer's — its
+    /// chunks and its per-stream records. Keyed only on the stream-owned
+    /// types, since `Snapshot`, `Npc` and `ConvState` reuse the header's
+    /// `stream_id` for ids of their own.
     fn retire_stream(&mut self, stream_id: u64) {
         let mut retired = 0u64;
-        self.live_sizes.retain(|&(rt, sid, _), live| {
-            let owned = sid == stream_id
-                && matches!(
-                    rt,
-                    RecordType::Chunk
-                        | RecordType::Tokens
-                        | RecordType::StreamDecl
-                        | RecordType::Commit
-                        | RecordType::ProjectionEvents
-                        | RecordType::WideQSig
-                        | RecordType::TurnIndexPage
-                );
+        self.live_sizes.retain(|&(rt, sid, _, _), live| {
+            let owned = sid == stream_id && stream_owned(rt);
             if owned {
                 retired += live.size;
             }
@@ -303,6 +317,27 @@ mod tests {
         );
         acc.record(&at(25, 1000), 4096);
         assert_eq!(acc.dead_bytes(), 4096 + 64 + 4096, "newer: live again");
+    }
+
+    /// Two writers' chunk 0 of one stream id are two streams' records: neither
+    /// supersedes the other, whatever their stamps.
+    #[test]
+    fn two_writers_records_of_one_stream_id_are_both_live() {
+        let by = |origin: u64, hlc: u64| RecordHeader {
+            hlc,
+            origin,
+            oseq: hlc,
+            ..header(RecordType::Chunk, 5, 0)
+        };
+        let mut acc = RecordAccounting::new();
+        acc.record(&by(3, 10), 4096);
+        acc.record(&by(8, 20), 4096);
+        assert_eq!(acc.dead_bytes(), 0);
+        acc.record(&by(3, 30), 4096);
+        assert_eq!(acc.dead_bytes(), 4096, "the first writer's re-write");
+        // A section tombstone ends the stream for every writer.
+        acc.record(&header(RecordType::SectionTombstone, 5, 0), 64);
+        assert_eq!(acc.dead_bytes(), 4096 * 3);
     }
 
     #[test]

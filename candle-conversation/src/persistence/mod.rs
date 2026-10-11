@@ -401,14 +401,14 @@ pub struct SubstratePersistence {
     relocation_watch: Option<RelocationWatch>,
     /// On-disk location of each stream's CURRENT per-stream metadata record —
     /// `StreamDecl` / `ProjectionEvents` / `WideQSig` / `Commit` — keyed by
-    /// `(record_type, stream_id)`, the greatest stamp. The substrate index caches
+    /// [`MetadataKey`], the greatest stamp. The substrate index caches
     /// these payloads but not their locations, so without this map
     /// [`segment_liveness`](SubstratePersistence::segment_liveness) would count
     /// them as dead — making the segment that holds the live metadata perpetually
     /// look reclaimable and get "compacted" (re-emitted forward) on every
     /// maintenance pass. Counting them as live via this map is what actually
     /// halts that churn. Populated on every append and rebuilt on load / compact.
-    metadata_locs: StampedLocs<(RecordType, u64)>,
+    metadata_locs: StampedLocs<MetadataKey>,
     /// On-disk location of the CURRENT copy of each resident record keyed by
     /// its payload rather than its header — `Label`, `ConvState`,
     /// `TreeMetadata`, `TurnCoupling`, `DebugId`, `Tombstone`, `Distilled` —
@@ -477,6 +477,23 @@ pub struct SubstratePersistence {
     marker_ids: MarkerIds,
 }
 
+/// What [`SubstratePersistence::metadata_locs`] keys a record by: its type, the
+/// header's `stream_id`, and the writer's origin for a stream's own records —
+/// two members' turn *N* share a stream id and are two streams
+/// (`docs/replicated_substrate.md` §6.6). A `CustomObject` carries its key's
+/// hash in `stream_id`, and any writer's record of a key competes for it, so
+/// its writer is zero.
+pub(crate) type MetadataKey = (RecordType, u64, u64);
+
+/// The [`MetadataKey`] of a record with header `h`.
+fn metadata_key(h: &RecordHeader) -> MetadataKey {
+    let writer = match h.record_type {
+        RecordType::CustomObject => 0,
+        _ => h.origin,
+    };
+    (h.record_type, h.stream_id, writer)
+}
+
 /// Whether a record type is a per-stream metadata record whose current-copy
 /// location is tracked in [`SubstratePersistence::metadata_locs`] so it counts
 /// as live weight (see that field). These are the records the maintenance
@@ -525,14 +542,10 @@ fn record_resident_loc(map: &mut StampedLocs<ResidentKey>, entry: &walker::WalkE
 /// key holds it. The load / compact walk uses this before the
 /// `SubstratePersistence` exists; the runtime append path uses
 /// [`SubstratePersistence::track_metadata_loc`].
-fn record_metadata_loc(map: &mut StampedLocs<(RecordType, u64)>, entry: &walker::WalkEntry) {
+fn record_metadata_loc(map: &mut StampedLocs<MetadataKey>, entry: &walker::WalkEntry) {
     let h = &entry.record.header;
     if is_tracked_metadata(h.record_type) {
-        map.offer(
-            (h.record_type, h.stream_id),
-            Some(walked_loc(entry)),
-            h.identity(),
-        );
+        map.offer(metadata_key(h), Some(walked_loc(entry)), h.identity());
     }
 }
 
@@ -1370,7 +1383,7 @@ impl SubstratePersistence {
     /// Offer the on-disk location of a per-stream metadata record
     /// (`StreamDecl` / `ProjectionEvents` / `WideQSig` / `Commit`) so
     /// [`segment_liveness`](Self::segment_liveness) counts the current copy as
-    /// live weight. The greatest stamp per `(record_type, stream_id)` holds: a
+    /// live weight. The greatest stamp per [`MetadataKey`] holds: a
     /// re-write supersedes the prior location, which then reads as dead, and a
     /// maintenance re-emission keeps the identity and moves it. A no-op for
     /// every other record type. Called from
@@ -1379,7 +1392,7 @@ impl SubstratePersistence {
     fn track_metadata_loc(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64, size: u64) {
         if is_tracked_metadata(h.record_type) {
             self.metadata_locs.offer(
-                (h.record_type, h.stream_id),
+                metadata_key(h),
                 Some(Self::placed_loc(h, segment, offset, size)),
                 h.identity(),
             );

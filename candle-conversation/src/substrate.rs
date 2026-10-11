@@ -46,6 +46,7 @@ mod order_independence_tests;
 mod pending;
 mod replicated_state;
 mod stamps;
+mod stream_index;
 
 use std::sync::{Mutex, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -90,6 +91,8 @@ use label_records::label_records;
 use pending::{PendingChild, PendingChildren};
 use stamps::{take, take_keyed};
 pub use stamps::{StreamIds, TimelineIds};
+use stream_index::StreamIndex;
+pub use stream_index::{StreamKey, TurnStream};
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
@@ -292,13 +295,14 @@ pub struct Substrate {
     wave_epoch: u64,
 
     /// Per-stream in-RAM index of where each chunk / tokens record /
-    /// committed-through watermark sits on disk.
+    /// committed-through watermark sits on disk, kept per writer and read
+    /// through the logical view [`StreamIndex`] gives (§6.6).
     /// Built by replaying the redo log on startup (and updated on
     /// every fresh append).  Cold-load and seal-time persistence read
     /// this directly; the manifest holds only the workspace
-    /// singletons.  The per-stream `BTreeMap` only ever sits in
-    /// memory — reload rebuilds it from record headers.
-    streams: HashMap<StreamId, StreamRuntime>,
+    /// singletons.  It only ever sits in memory — reload rebuilds it
+    /// from record headers.
+    streams: StreamIndex,
 
     /// The streams of `streams` whose declaration is a turn in a gather scope —
     /// one carrying a tag that is not a working-set mark — kept in step with
@@ -309,7 +313,7 @@ pub struct Substrate {
     /// every turn and chunk stream ingest has written. Walking all of `streams`
     /// to find them was ~115 ms, paid on the first reprojection after every
     /// seal anywhere in the workspace.
-    tagged_turns: BTreeSet<StreamId>,
+    tagged_turns: BTreeSet<StreamKey>,
 
     /// Bumped whenever anything a collection's belief gallery is assembled from
     /// changes — a stream declared, a signature or projection-event blob
@@ -3937,16 +3941,49 @@ impl Substrate {
     // ── Per-stream runtime state (was Manifest.streams) ─────────────────
 
     /// Read the in-RAM runtime state for `stream_id` — chunk index +
-    /// latest tokens location + committed-through watermark + decl.
+    /// latest tokens location + committed-through watermark + decl. A turn's
+    /// id names the turn at that position in its timeline, whoever wrote it
+    /// (§6.6).
     pub fn stream_of(&self, stream_id: StreamId) -> Option<&StreamRuntime> {
-        self.streams.get(&stream_id)
+        self.streams.get(stream_id)
+    }
+
+    /// One writer's stream, whatever position it holds.
+    pub fn stream_at(&self, key: StreamKey) -> Option<&StreamRuntime> {
+        self.streams.physical(key)
+    }
+
+    /// Where a declared turn's stream sits in its timeline — the turn index
+    /// callers address it by. `None` for a stream that is not a declared turn.
+    pub fn turn_position(&self, key: StreamKey) -> Option<TurnIndex> {
+        self.streams.position(key).map(TurnIndex)
+    }
+
+    /// `timeline`'s declared turns in turn order, each at its position. A
+    /// position no turn holds is a gap: a declaration lost in a crash.
+    pub fn turn_streams_of(
+        &self,
+        timeline: u64,
+    ) -> impl Iterator<Item = (TurnIndex, StreamKey, &StreamRuntime)> + '_ {
+        self.streams.turns_of(timeline).filter_map(|(pos, key)| {
+            self.streams
+                .physical(key)
+                .map(|rt| (TurnIndex(pos), key, rt))
+        })
+    }
+
+    /// Every timeline with a declared turn.
+    pub fn timelines_with_turns(&self) -> impl Iterator<Item = u64> + '_ {
+        self.streams.timelines()
     }
 
     /// Whether ANY indexed stream carries KV chunk records. `false` means this
     /// workspace never persists KV (e.g. `compression_policy = None`), so the
     /// startup integrity check must not treat chunk absence as damage.
     pub fn any_stream_has_chunks(&self) -> bool {
-        self.streams.values().any(|s| !s.chunks.is_empty())
+        self.streams
+            .iter_physical()
+            .any(|(_, s)| !s.chunks.is_empty())
     }
 
     /// The belief-gallery epoch: unchanged while nothing a collection's gallery
@@ -3980,7 +4017,7 @@ impl Substrate {
         // (harmless — the value is identical, insert is last-writer-wins).
         let decoded = self
             .streams
-            .get(&stream_id)
+            .get(stream_id)
             .and_then(|e| e.wide_q_sigs.as_ref())
             .and_then(|b| decode_wide_sigs_for_scoring(b))
             .filter(|w| !w.is_empty())
@@ -4037,7 +4074,7 @@ impl Substrate {
         // on the same stream just decodes twice — harmless, the value is identical.
         let events = self
             .streams
-            .get(&stream_id)
+            .get(stream_id)
             .and_then(|e| e.projection_events.as_deref())
             .map(decode_events)
             .unwrap_or_default();
@@ -4049,25 +4086,36 @@ impl Substrate {
         digest
     }
 
-    /// True iff the substrate has any record of `stream_id`.
+    /// True iff `stream_id` names a stream the substrate holds a record of.
     pub fn has_stream(&self, stream_id: StreamId) -> bool {
-        self.streams.contains_key(&stream_id)
+        self.streams.get(stream_id).is_some()
     }
 
-    /// All stream ids known to the substrate.
+    /// Every stream id that names a stream ([`Self::all_streams`]).
     pub fn all_stream_ids(&self) -> impl Iterator<Item = StreamId> + '_ {
-        self.streams.keys().copied()
+        self.streams.iter_logical().map(|(sid, _)| sid)
     }
 
-    /// Iterate `(stream_id, &StreamRuntime)` pairs.
+    /// Iterate `(stream_id, &StreamRuntime)` pairs: every stream an id names,
+    /// under that id — each declared turn under its position's, the way
+    /// [`Self::stream_of`] reaches it.
     pub fn all_streams(&self) -> impl Iterator<Item = (StreamId, &StreamRuntime)> + '_ {
-        self.streams.iter().map(|(k, v)| (*k, v))
+        self.streams.iter_logical()
+    }
+
+    /// Every writer's stream, each turn whatever position it holds — what a
+    /// rewrite carries.
+    pub fn all_physical_streams(&self) -> impl Iterator<Item = (StreamKey, &StreamRuntime)> + '_ {
+        self.streams.iter_physical()
     }
 
     /// Total live chunk count across all streams.  Used by the
     /// compaction dead-ratio calculation.
     pub fn live_chunk_count(&self) -> usize {
-        self.streams.values().map(|s| s.chunks.len()).sum()
+        self.streams
+            .iter_physical()
+            .map(|(_, s)| s.chunks.len())
+            .sum()
     }
 
     /// Streams that hold KV chunks but have NO `StreamDecl` and none coming —
@@ -4078,8 +4126,8 @@ impl Substrate {
     /// (see `collect_live_records`). A healthy substrate reports 0.
     pub fn orphan_chunk_stream_count(&self, node: u64) -> usize {
         self.streams
-            .values()
-            .filter(|s| s.is_orphan(node) && !s.chunks.is_empty())
+            .iter_physical()
+            .filter(|(_, s)| s.is_orphan(node) && !s.chunks.is_empty())
             .count()
     }
 
@@ -4248,32 +4296,56 @@ impl Substrate {
                 self.register_timeline(timeline, layer, group);
             }
         }
-        let entry = self.streams.entry(stream_id).or_default();
-        if !take(&mut entry.ids.decl, id) {
+        let key = StreamKey::of(stream_id, &id);
+        let tagged = matches!(&decl, StreamDecl::Turn(t) if !is_dialogue(&t.tags));
+        let section = matches!(decl, StreamDecl::PromptSection(_));
+        let Some(moved) = self.streams.declare(key, decl, id) else {
             return;
-        }
-        if matches!(decl, StreamDecl::PromptSection(_)) {
+        };
+        if section {
             self.tombstoned_sections.remove(&stream_id);
         }
-        match &decl {
-            StreamDecl::Turn(t) if !is_dialogue(&t.tags) => {
-                self.tagged_turns.insert(stream_id);
-            }
-            _ => {
-                self.tagged_turns.remove(&stream_id);
-            }
+        if tagged {
+            self.tagged_turns.insert(key);
+        } else {
+            self.tagged_turns.remove(&key);
         }
-        self.streams.entry(stream_id).or_default().decl = Some(decl);
+        self.forget_memos(&moved);
         self.gallery_epoch += 1;
     }
 
-    /// Every stream declared as a turn in a gather scope, with its runtime —
-    /// the members a tagged collection's gallery is drawn from. See the
-    /// `tagged_turns` field.
-    pub fn tagged_turn_streams(&self) -> impl Iterator<Item = (StreamId, &StreamRuntime)> + '_ {
+    /// Drop the decoded memos of `ids`: what they name has changed, by a
+    /// declaration placing a turn there or moving one away.
+    fn forget_memos(&mut self, ids: &[StreamId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let sigs = self.sig_cache.get_mut().unwrap_or_else(|e| e.into_inner());
+        for sid in ids {
+            sigs.remove(sid);
+        }
+        let events = self
+            .events_cache
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner());
+        for sid in ids {
+            events.remove(sid);
+        }
+    }
+
+    /// Every stream declared as a turn in a gather scope — the members a
+    /// tagged collection's gallery is drawn from. See the `tagged_turns` field.
+    pub fn tagged_turn_streams(&self) -> impl Iterator<Item = TurnStream<'_>> + '_ {
         self.tagged_turns
             .iter()
-            .filter_map(|sid| self.streams.get(sid).map(|e| (*sid, e)))
+            .filter_map(|key| self.streams.turn(*key))
+    }
+
+    /// Every declared turn, each at its position in its timeline.
+    pub fn all_turn_streams(&self) -> impl Iterator<Item = TurnStream<'_>> + '_ {
+        self.streams
+            .iter_physical()
+            .filter_map(|(key, _)| self.streams.turn(key))
     }
 
     /// Record the location of chunk `idx` of `stream_id`, written as record
@@ -4286,7 +4358,7 @@ impl Substrate {
         loc: ChunkLoc,
         id: RecordIdentity,
     ) {
-        let entry = self.streams.entry(stream_id).or_default();
+        let entry = self.streams.entry(StreamKey::of(stream_id, &id));
         if take_keyed(&mut entry.ids.chunks, idx, id) {
             entry.chunks.insert(idx, loc);
         }
@@ -4295,7 +4367,7 @@ impl Substrate {
     /// Record the location of `stream_id`'s `Tokens` record `id` — the greatest
     /// stamp holds it.
     pub fn apply_tokens_loc(&mut self, stream_id: StreamId, loc: RecordLoc, id: RecordIdentity) {
-        let entry = self.streams.entry(stream_id).or_default();
+        let entry = self.streams.entry(StreamKey::of(stream_id, &id));
         if take(&mut entry.ids.tokens, id) {
             entry.tokens = Some(loc);
         }
@@ -4408,7 +4480,7 @@ impl Substrate {
         through_index: u64,
         id: RecordIdentity,
     ) {
-        let entry = self.streams.entry(stream_id).or_default();
+        let entry = self.streams.entry(StreamKey::of(stream_id, &id));
         match entry.committed_through {
             Some(held) if through_index < held => {}
             Some(held) if through_index == held => {
@@ -4429,7 +4501,8 @@ impl Substrate {
         payload: Vec<u8>,
         id: RecordIdentity,
     ) {
-        let entry = self.streams.entry(stream_id).or_default();
+        let key = StreamKey::of(stream_id, &id);
+        let entry = self.streams.entry(key);
         if !take(&mut entry.ids.projection_events, id) {
             return;
         }
@@ -4437,22 +4510,25 @@ impl Substrate {
         self.gallery_epoch += 1;
         // Drop this stream's memoized seams so an apply after the seam cache
         // warmed cannot serve stale ones.
+        let logical = self.streams.logical_id(key);
         self.events_cache
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&stream_id);
+            .remove(&logical);
     }
 
     /// Record `stream_id`'s wide-Q signature window, record `id` — the greatest
     /// stamp holds it.
     pub fn apply_wide_q_sigs(&mut self, stream_id: StreamId, payload: Vec<u8>, id: RecordIdentity) {
-        let entry = self.streams.entry(stream_id).or_default();
+        let key = StreamKey::of(stream_id, &id);
+        let entry = self.streams.entry(key);
         if !take(&mut entry.ids.wide_q_sigs, id) {
             return;
         }
         entry.wide_q_sigs = Some(payload);
         self.gallery_epoch += 1;
-        self.evict_decoded_wide_sig(stream_id);
+        let logical = self.streams.logical_id(key);
+        self.evict_decoded_wide_sig(logical);
     }
 
     /// Record the QSA index page of a turn or a prompt section, record `id` —
@@ -4463,7 +4539,7 @@ impl Substrate {
         payload: impl Into<Arc<[u8]>>,
         id: RecordIdentity,
     ) {
-        let entry = self.streams.entry(stream_id).or_default();
+        let entry = self.streams.entry(StreamKey::of(stream_id, &id));
         if take(&mut entry.ids.index_page, id) {
             entry.index_page = Some(Arc::new(StoredPages::new(payload)));
         }
@@ -4925,8 +5001,9 @@ impl Substrate {
     /// new decl + records` rebuilds exactly the new generation.
     fn reset_tombstoned_stream(&mut self, stream_id: StreamId) {
         self.tombstoned_sections.insert(stream_id);
-        self.streams.remove(&stream_id);
-        self.tagged_turns.remove(&stream_id);
+        let moved = self.streams.remove(stream_id);
+        self.tagged_turns.retain(|key| key.stream_id != stream_id);
+        self.forget_memos(&moved);
         self.gallery_epoch += 1;
     }
 
@@ -5121,14 +5198,14 @@ impl Substrate {
         let prefix = format!("conv/{}/", owner.raw());
         let mut found: Vec<StreamId> = self
             .streams
-            .iter()
+            .iter_logical()
             .filter_map(|(id, stream)| match &stream.decl {
                 Some(StreamDecl::PromptSection(d)) => {
                     let named = match &exact {
                         Some(exact) => d.debug_name == *exact,
                         None => d.debug_name.starts_with(&prefix),
                     };
-                    named.then_some(*id)
+                    named.then_some(id)
                 }
                 _ => None,
             })
@@ -5301,17 +5378,20 @@ impl Substrate {
             return 0;
         }
         self.streams
-            .values()
-            .filter(|s| match &s.decl {
+            .iter_physical()
+            .filter(|(key, s)| match &s.decl {
                 Some(StreamDecl::Turn(t)) => {
                     TimelineId::from_raw(t.timeline_id).is_some_and(|tl| {
                         self.tombstoned_timelines.contains(&tl)
-                            || self.tombstoned_turns.contains(&(tl, t.turn_index))
+                            || self
+                                .streams
+                                .position(*key)
+                                .is_some_and(|pos| self.tombstoned_turns.contains(&(tl, pos)))
                     })
                 }
                 Some(StreamDecl::PromptSection(_)) | None => false,
             })
-            .map(|s| {
+            .map(|(_, s)| {
                 s.chunks.values().map(|c| c.record_size).sum::<u64>()
                     + s.tokens.map_or(0, |l| l.record_size)
             })
@@ -5343,7 +5423,7 @@ impl Substrate {
         let streams = &self.streams;
         for slot in &mut self.residence {
             let Some(cold) = &mut slot.cold else { continue };
-            let Some(stream) = streams.get(&slot.stream_id) else {
+            let Some(stream) = streams.get(slot.stream_id) else {
                 continue;
             };
             let n_layers = cold.len();
@@ -6648,14 +6728,14 @@ impl Substrate {
     /// The stored projection-event record payload for a turn, if any.
     pub fn projection_events_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
         self.streams
-            .get(&turn_stream_id(timeline.raw(), index.0))
+            .get(turn_stream_id(timeline.raw(), index.0))
             .and_then(|s| s.projection_events.as_deref())
     }
 
     /// The stored wide-Q signature window payload for a turn, if any.
     pub fn wide_q_sigs_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
         self.streams
-            .get(&turn_stream_id(timeline.raw(), index.0))
+            .get(turn_stream_id(timeline.raw(), index.0))
             .and_then(|s| s.wide_q_sigs.as_deref())
     }
 
@@ -6666,7 +6746,7 @@ impl Substrate {
     /// will hold tokens no cache accounts for.
     pub fn index_page_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
         self.streams
-            .get(&turn_stream_id(timeline.raw(), index.0))
+            .get(turn_stream_id(timeline.raw(), index.0))
             .and_then(|s| s.index_page.as_deref())
             .map(StoredPages::bytes)
     }
@@ -6679,7 +6759,7 @@ impl Substrate {
         index: TurnIndex,
     ) -> Option<Arc<StoredPages>> {
         self.streams
-            .get(&turn_stream_id(timeline.raw(), index.0))
+            .get(turn_stream_id(timeline.raw(), index.0))
             .and_then(|s| s.index_page.clone())
     }
 
@@ -6689,7 +6769,7 @@ impl Substrate {
     /// hands the model in place of the page its prefill would have sealed.
     pub fn section_index_page(&self, stream_id: StreamId) -> Option<&[u8]> {
         self.streams
-            .get(&stream_id)
+            .get(stream_id)
             .and_then(|s| s.index_page.as_deref())
             .map(StoredPages::bytes)
     }
@@ -6697,7 +6777,7 @@ impl Substrate {
     /// [`Self::section_index_page`] as held, with its key.
     pub fn section_index_page_shared(&self, stream_id: StreamId) -> Option<Arc<StoredPages>> {
         self.streams
-            .get(&stream_id)
+            .get(stream_id)
             .and_then(|s| s.index_page.clone())
     }
 
@@ -6708,7 +6788,7 @@ impl Substrate {
     /// an untagged dialogue turn does not. Empty for an untagged turn and for a
     /// turn that is not present.
     pub fn turn_tags(&self, timeline: TimelineId, index: TurnIndex) -> Vec<String> {
-        let Some(stream) = self.streams.get(&turn_stream_id(timeline.raw(), index.0)) else {
+        let Some(stream) = self.streams.get(turn_stream_id(timeline.raw(), index.0)) else {
             return Vec::new();
         };
         match &stream.decl {
@@ -6739,7 +6819,7 @@ impl Substrate {
         stream_id: StreamId,
         phase: Phase,
     ) -> Option<std::ops::Range<usize>> {
-        let stream = self.streams.get(&stream_id)?;
+        let stream = self.streams.get(stream_id)?;
         let Some(StreamDecl::Turn(decl)) = &stream.decl else {
             return None;
         };
@@ -10895,7 +10975,7 @@ mod tests {
         };
         let tagged = |sub: &Substrate| {
             sub.tagged_turn_streams()
-                .map(|(s, _)| s)
+                .map(|t| t.stream_id)
                 .collect::<Vec<_>>()
         };
         let mut sub = Substrate::new();

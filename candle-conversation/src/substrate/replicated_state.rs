@@ -35,12 +35,15 @@ impl Substrate {
     }
 
     fn render_streams(&self, out: &mut String) {
-        let mut sids: Vec<_> = self.streams.keys().copied().collect();
-        sids.sort_unstable_by_key(|s| s.0);
-        for sid in sids {
-            let s = &self.streams[&sid];
+        let mut streams: Vec<_> = self.streams.iter_physical().collect();
+        streams.sort_unstable_by_key(|(key, _)| *key);
+        for (key, s) in streams {
             let ids = &s.ids;
-            let _ = writeln!(out, "stream {:016x}", sid.0);
+            let _ = writeln!(
+                out,
+                "stream {:016x} writer {:x}",
+                key.stream_id.0, key.writer
+            );
             if let Some(decl) = &s.decl {
                 let _ = writeln!(out, "  decl {} {:?}", id(&ids.decl), decl);
             }
@@ -79,6 +82,20 @@ impl Substrate {
             }
             if let Some(through) = s.committed_through {
                 let _ = writeln!(out, "  committed {through} {}", id(&ids.commit));
+            }
+        }
+        // Each timeline's turn order: the position every declared turn holds,
+        // and whose stream holds it.
+        let mut timelines: Vec<u64> = self.streams.timelines().collect();
+        timelines.sort_unstable();
+        for tl in timelines {
+            let _ = writeln!(out, "turns {tl:016x}");
+            for (pos, key) in self.streams.turns_of(tl) {
+                let _ = writeln!(
+                    out,
+                    "  {pos} {:016x} writer {:x}",
+                    key.stream_id.0, key.writer
+                );
             }
         }
     }

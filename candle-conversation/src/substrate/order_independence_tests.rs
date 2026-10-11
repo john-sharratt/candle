@@ -5,8 +5,9 @@
 //! replicated state ([`Substrate::replicated_state`]) must come out identical
 //! every time. The sets cover competing writes to one key from two and three
 //! origins, a label assembled field by field, children before their parent,
-//! commits as a maximum, a retraction overtaking the snapshot it retracts, and
-//! records held for a timeline not registered yet.
+//! commits as a maximum, a retraction overtaking the snapshot it retracts,
+//! records held for a timeline not registered yet, and two writers' turn *N*
+//! placed in their timeline by stamp.
 //!
 //! The same state must also survive the log: written in an arbitrary order,
 //! reopened, compacted and reopened again.
@@ -72,11 +73,15 @@ fn event(
 }
 
 fn turn_decl(timeline_id: u64) -> StreamDecl {
+    turn_decl_at(timeline_id, 0)
+}
+
+fn turn_decl_at(timeline_id: u64, turn_index: u32) -> StreamDecl {
     StreamDecl::Turn(TurnDecl {
         timeline_id,
-        turn_index: 0,
+        turn_index,
         turn_id_day: 0,
-        turn_id_seq: 1,
+        turn_id_seq: turn_index + 1,
         role: 2,
         block_start: 0,
         block_end: 1,
@@ -90,7 +95,11 @@ fn turn_decl(timeline_id: u64) -> StreamDecl {
 }
 
 fn decl(timeline_id: u64, id: RecordIdentity) -> Event {
-    let d = turn_decl(timeline_id);
+    decl_at(timeline_id, 0, id)
+}
+
+fn decl_at(timeline_id: u64, turn_index: u32, id: RecordIdentity) -> Event {
+    let d = turn_decl_at(timeline_id, turn_index);
     event(RecordType::StreamDecl, d.stream_id().0, 0, d.encode(), id)
 }
 
@@ -206,18 +215,36 @@ fn labels_and_state() -> Vec<Event> {
     ]
 }
 
-/// A turn's keyed values: competing chunk bodies, a commit as a maximum, its
-/// tokens and its signature.
+/// A turn's keyed values: a chunk re-sealed, a commit as a maximum (the
+/// greater mark written first), its tokens and its signature.
 fn stream_values() -> Vec<Event> {
     let sid = turn_decl(T2).stream_id();
     vec![
         decl(T2, at(A, 1)),
         chunk(sid, 0, 1, at(A, 2)),
-        chunk(sid, 0, 2, at(B, 3)),
+        chunk(sid, 0, 2, at(A, 3)),
         blob(RecordType::Tokens, sid.0, b"tokens-a", at(A, 4)),
-        commit(sid, 3, at(A, 5)),
-        commit(sid, 7, at(B, 6)),
-        blob(RecordType::WideQSig, sid.0, b"sig-a", at(C, 7)),
+        commit(sid, 7, at(A, 5)),
+        commit(sid, 3, at(A, 6)),
+        blob(RecordType::WideQSig, sid.0, b"sig-a", at(A, 7)),
+    ]
+}
+
+const T5: u64 = 0x1000_0005;
+
+/// Two writers' turn 1 of one timeline (§6.6): one stream id, two streams,
+/// each with its own chunk and tokens, placed by their declarations' stamps —
+/// and a later turn of the first writer placed above both.
+fn two_writers_turn_n() -> Vec<Event> {
+    let sid1 = turn_decl_at(T5, 1).stream_id();
+    vec![
+        decl_at(T5, 0, at(A, 1)),
+        decl_at(T5, 1, at(A, 2)),
+        decl_at(T5, 1, at(B, 3)),
+        chunk(sid1, 0, 3, at(A, 4)),
+        chunk(sid1, 0, 4, at(B, 5)),
+        blob(RecordType::Tokens, sid1.0, b"tokens-b", at(B, 6)),
+        decl_at(T5, 2, at(A, 7)),
     ]
 }
 
@@ -335,8 +362,48 @@ fn a_label_assembled_from_three_origins_is_the_same_in_every_order() {
 #[test]
 fn a_turns_values_are_the_same_in_every_order() {
     let state = assert_order_free(&stream_values());
-    assert!(state.contains("chunk 0 b/3@0.0.3"), "{state}");
-    assert!(state.contains("committed 7 b/6@0.0.6"), "{state}");
+    assert!(state.contains("chunk 0 a/3@0.0.3"), "{state}");
+    assert!(state.contains("committed 7 a/5@0.0.5"), "{state}");
+}
+
+#[test]
+fn two_writers_turn_n_is_the_same_in_every_order() {
+    let state = assert_order_free(&two_writers_turn_n());
+    let sid = |n: u32| turn_decl_at(T5, n).stream_id().0;
+    let order = format!(
+        "turns {T5:016x}\n  0 {:016x} writer a\n  1 {:016x} writer a\n  2 {:016x} writer b\n  3 {:016x} writer a\n",
+        sid(0),
+        sid(1),
+        sid(1),
+        sid(2)
+    );
+    assert!(state.contains(&order), "{state}");
+    // Both writers' chunk 0 of the shared stream id are kept.
+    assert!(state.contains("chunk 0 a/4@0.0.4"), "{state}");
+    assert!(state.contains("chunk 0 b/5@0.0.5"), "{state}");
+}
+
+/// Every lookup by a turn's id reaches the turn at that position: the second
+/// writer's turn 1 is reached as turn 2, with its own tokens, and the first
+/// writer's turn 2 as turn 3.
+#[test]
+fn a_lookup_by_turn_index_reaches_the_turn_at_that_position() {
+    let events = two_writers_turn_n();
+    let mut sub = Substrate::new();
+    for (position, e) in events.iter().enumerate().rev() {
+        sub.apply_walker_entry(&walked(e, position));
+    }
+    let at_index = |n: u32| sub.stream_of(turn_decl_at(T5, n).stream_id()).unwrap();
+    assert_eq!(at_index(1).ids.decl, at(A, 2));
+    assert_eq!(at_index(2).ids.decl, at(B, 3));
+    assert_eq!(at_index(2).ids.tokens, at(B, 6));
+    assert!(at_index(1).tokens.is_none());
+    assert_eq!(at_index(3).ids.decl, at(A, 7));
+    let StreamDecl::Turn(d) = at_index(3).decl.as_ref().unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(d.turn_index, 2, "the decl is as its writer wrote it");
+    assert!(sub.stream_of(turn_decl_at(T5, 4).stream_id()).is_none());
 }
 
 #[test]
@@ -366,6 +433,7 @@ fn all_events() -> Vec<Event> {
     all.extend(stream_values());
     all.extend(children_first());
     all.extend(recurrent_and_blobs());
+    all.extend(two_writers_turn_n());
     all
 }
 

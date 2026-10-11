@@ -58,8 +58,8 @@ use crate::provenance::{
 use crate::scheduler::note_persistence_maint_us;
 use crate::scheduler::profile;
 use crate::substrate::{
-    ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, StreamRuntime, Substrate,
-    SubstrateRead, SubstrateWrite, TreeNodeMeta, TurnPartWrite,
+    ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, Substrate, SubstrateRead,
+    SubstrateWrite, TreeNodeMeta, TurnPartWrite, TurnStream,
 };
 use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
@@ -913,22 +913,20 @@ impl Conversation {
         // A tagged collection admits only turns in a gather scope, which the
         // substrate indexes; an untagged one admits dialogue, which is every
         // other turn, so it walks them all.
-        let streams: Box<dyn Iterator<Item = (StreamId, &StreamRuntime)>> = if tags.is_empty() {
-            Box::new(sub.all_streams())
+        let streams: Box<dyn Iterator<Item = TurnStream<'_>>> = if tags.is_empty() {
+            Box::new(sub.all_turn_streams())
         } else {
             Box::new(sub.tagged_turn_streams())
         };
-        for (sid, e) in streams {
-            let Some(StreamDecl::Turn(d)) = &e.decl else {
-                continue;
-            };
+        for turn in streams {
+            let (sid, d) = (turn.stream_id, turn.decl);
             // A tombstoned turn (or timeline) must not keep voting in
             // retrieval: its walker-replayed sig blob still exists, but the
             // turn itself is a dead placeholder whose KV can never
             // materialise — selecting it would point projection at content
             // that cannot be elevated.
             if let Some(tl) = TimelineId::from_raw(d.timeline_id) {
-                if sub.is_tombstoned(tl) || sub.is_turn_tombstoned(tl, d.turn_index) {
+                if sub.is_tombstoned(tl) || sub.is_turn_tombstoned(tl, turn.index.0) {
                     continue;
                 }
             }
@@ -1507,19 +1505,17 @@ impl Conversation {
         }
         let mut probes: Vec<(u64, u32, Vec<WideQSig>)> = {
             let sub = self.inner.read().unwrap();
-            sub.all_streams()
-                .filter_map(|(_sid, e)| {
-                    let Some(StreamDecl::Turn(d)) = e.decl.as_ref() else {
-                        return None;
-                    };
-                    if !is_dialogue(&d.tags) {
+            sub.all_turn_streams()
+                .filter_map(|turn| {
+                    if !is_dialogue(&turn.decl.tags) {
                         return None;
                     }
-                    let sig = e
+                    let sig = turn
+                        .runtime
                         .wide_q_sigs
                         .as_ref()
                         .and_then(|b| decode_wide_sigs_for_scoring(b))?;
-                    (!sig.is_empty()).then_some((d.timeline_id, d.turn_index, sig))
+                    (!sig.is_empty()).then_some((turn.decl.timeline_id, turn.index.0, sig))
                 })
                 .collect()
         };
@@ -1669,14 +1665,13 @@ impl Conversation {
             // signatures it discards.
             let plan = {
                 let sub = self.inner.read().unwrap();
-                let decls = sub
-                    .all_streams()
-                    .filter_map(|(_sid, e)| match e.decl.as_ref() {
-                        Some(StreamDecl::Turn(d)) => {
-                            Some((d.tags.as_slice(), d.timeline_id, d.turn_index))
-                        }
-                        _ => None,
-                    });
+                let decls = sub.all_turn_streams().map(|turn| {
+                    (
+                        turn.decl.tags.as_slice(),
+                        turn.decl.timeline_id,
+                        turn.index.0,
+                    )
+                });
                 collection_warm_plan(
                     &member_names,
                     &coll.policy.tags,
@@ -2724,6 +2719,37 @@ impl Conversation {
         Ok(idx)
     }
 
+    /// Restore an empty placeholder at every position of `decl`'s timeline
+    /// below `decl.turn_index` that no turn holds yet. `restore_turn` assigns
+    /// indices densely, so without it a turn above a lost decl would land one
+    /// index low, away from the streams its index resolves to.
+    fn fill_turn_gap(&self, decl: &TurnDecl) {
+        let Some(timeline) = TimelineId::from_raw(decl.timeline_id) else {
+            return;
+        };
+        if self.read().turn_count(timeline) >= decl.turn_index {
+            return;
+        }
+        let mut view = self.write();
+        if let (Some(layer), Some(group)) = (
+            LayerId::from_raw(decl.layer_id),
+            GroupId::from_raw(decl.group_id),
+        ) {
+            view.register_timeline(timeline, layer, group);
+        }
+        while view.turn_count(timeline) < decl.turn_index {
+            view.restore_turn(
+                timeline,
+                TurnLayout::new(Vec::new()),
+                TokenBuffer::default(),
+                0,
+                None,
+                0,
+                0,
+            );
+        }
+    }
+
     /// Rebuild the in-RAM [`Substrate`] from the persistence redo log — the
     /// §5.6 / §16.12 substrate-reload path run on daemon restart.
     ///
@@ -2782,6 +2808,10 @@ impl Conversation {
             if let Some(p) = progress {
                 p(i, total);
             }
+            // A position below this turn that no decl holds is a decl lost in
+            // a crash (`recovered_turn_decls`): an empty placeholder holds it,
+            // so this turn lands at the index its streams resolve by.
+            self.fill_turn_gap(&decl);
             // A turn already dropped by a prior `drop_turn` tombstone is dead —
             // restore it as an EMPTY PLACEHOLDER (no recover attempt, no warn)
             // instead of skipping. The placeholder matters: `restore_turn`
@@ -3179,9 +3209,17 @@ impl Conversation {
                 let Some(StreamDecl::Turn(decl)) = &stream.decl else {
                     return (key, Ok(None));
                 };
+                // The load addresses the turn by its index, and the decl
+                // carries the index its writer gave it, which another
+                // writer's turn may have moved it above (§6.6).
+                let decl = TurnDecl {
+                    turn_index: key.index.0,
+                    ..decl.clone()
+                };
                 let kv_bytes_total: u64 = stream.chunks.values().map(|loc| loc.payload_len).sum();
-                let result = load_turn_into_hot(backings, device, &mut p, &substrate, decl, stager)
-                    .map(|sealed| Some((sealed, kv_bytes_total)));
+                let result =
+                    load_turn_into_hot(backings, device, &mut p, &substrate, &decl, stager)
+                        .map(|sealed| Some((sealed, kv_bytes_total)));
                 (key, result)
             })
             .collect()

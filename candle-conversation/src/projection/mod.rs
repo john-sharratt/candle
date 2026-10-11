@@ -224,6 +224,8 @@ mod yaml;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod turn_order_tests;
+#[cfg(test)]
 mod working_set_tests;
 
 // ── Public surface ────────────────────────────────────────────────────────────

@@ -1563,8 +1563,9 @@ with no identity at all (every identity field zero).
   serve the same passthrough conversation then name one timeline, not two. Its routes
   are `Sticky` on the same key (§5.2).
 - **npcd interaction ids** become `<nid>-<counter>` (§5.2).
-- **Turn stream ids** include the writer's origin (§6.6), so two members' turns at one
-  index never share a record key. **VFS events** are keyed `(timeline, origin, seq)`
+- **Turn streams are indexed per writer** (§6.6): the stream id is unchanged, and the
+  index keys each stream `(stream_id, origin)`, so two members' turns at one index never
+  share a record key. **VFS events** are keyed `(timeline, origin, seq)`
   with `seq` per origin, and a `VfsTombstone` kills `(origin, seq)` pairs, so two
   writers' events never collide either (`persistence/vfs/index.rs:16-26`).
 
@@ -1766,11 +1767,25 @@ corruption, not a conflict.
 
 - Every committed turn of a timeline is in it, ordered by its decl's version stamp
   `(gen, epoch, hlc, origin)` (§6.2).
-- The turn at index *N* is the *N*-th in that order. The order is the same whatever
-  order the decls arrived in.
+- The turn at index *N* is the *N*-th in that order, counting the gaps below. The order
+  is the same whatever order the decls arrived in.
 - A lookup by `turn_stream_id(timeline, N)` resolves, through the index, to the
   `(stream_id, origin)` entries of that *N*-th turn. The index keeps that map beside
-  itself, so callers stay as they are.
+  itself, so callers stay as they are (`substrate/stream_index.rs`).
+- **A turn never sits below the index its writer gave it.** A declaration lost in a crash
+  leaves a gap, and the turns above it stay where they were written. So each turn's
+  position is `max(previous + 1, its own index)` down the stamp order: for one writer
+  exactly the indices it wrote, for two the interleaving the stamps give. Reload fills a
+  gap with an empty placeholder (`projection/resolver.rs` `fill_turn_gap`). A writer's
+  next turn therefore always takes an index no stream of its own holds.
+- A declared turn is reached only through its position. An id whose position holds no
+  turn names nothing, even when another writer's turn further up was written under it.
+- **Sections are indexed per writer too.** Two members' prefills of one section share its
+  content-addressed id and differ in their bytes. Both are kept, and the id resolves to
+  the declaration with the greatest stamp.
+- Everything keyed by a stream's own records is keyed by the writer as well: the
+  dead-byte accounting, the metadata locations, maintenance's carry and its relocation
+  watch. Neither writer's record supersedes the other's.
 
 For a single writer this is the order it wrote in: its stamps rise with every turn. Two
 writers' turns interleave by stamp:

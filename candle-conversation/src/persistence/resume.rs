@@ -686,18 +686,33 @@ pub fn read_persisted_section_windows(
     Ok(Some(per_layer))
 }
 
-/// Every turn stream in the recovered manifest, in `(timeline_id, turn_index)`
+/// Every declared turn in the recovered index, in `(timeline_id, turn_index)`
 /// order — the deterministic replay order a substrate reload walks.
+///
+/// Each decl's `turn_index` is the position the turn holds in its timeline's
+/// stamp order (`docs/replicated_substrate.md` §6.6), which is the index
+/// [`turn_stream_id`](super::content_hash::turn_stream_id) lookups resolve
+/// through. For a timeline one member wrote it is the index the decl was
+/// written with; for two writers' turn *N* it is where the stamps place each.
+/// A position no decl holds is a gap the caller fills with a placeholder.
 pub fn recovered_turn_decls(substrate: &Substrate) -> Vec<TurnDecl> {
-    let mut turns: Vec<TurnDecl> = substrate
-        .all_streams()
-        .filter_map(|(_, s)| match &s.decl {
-            Some(StreamDecl::Turn(t)) => Some(t.clone()),
-            _ => None,
+    let mut timelines: Vec<u64> = substrate.timelines_with_turns().collect();
+    timelines.sort_unstable();
+    timelines
+        .into_iter()
+        .flat_map(|tl| {
+            substrate
+                .turn_streams_of(tl)
+                .filter_map(|(pos, _, s)| match &s.decl {
+                    Some(StreamDecl::Turn(t)) => Some(TurnDecl {
+                        turn_index: pos.0,
+                        ..t.clone()
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
         })
-        .collect();
-    turns.sort_by_key(|t| (t.timeline_id, t.turn_index));
-    turns
+        .collect()
 }
 
 /// The layer count `L` this substrate's turns were sealed with, read off the

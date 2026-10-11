@@ -84,13 +84,19 @@ pub fn resident_key(
         })
     };
     match rt {
+        // A stream's own records, one per writer: two members' turn N share a
+        // stream id and are two streams (§6.6).
         RecordType::StreamDecl
         | RecordType::ProjectionEvents
         | RecordType::WideQSig
         | RecordType::TurnIndexPage
-        | RecordType::Commit
-        | RecordType::SectionTombstone
-        | RecordType::CustomObject => key(stream_id, 0),
+        | RecordType::Commit => Some(ResidentKey {
+            record_type: rt,
+            id: stream_id,
+            sub: 0,
+            origin: record.origin,
+        }),
+        RecordType::SectionTombstone | RecordType::CustomObject => key(stream_id, 0),
         RecordType::ConvState => key(decode_conv_state_payload(payload).ok()?.0, 0),
         RecordType::Label => Some(ResidentKey {
             record_type: rt,
@@ -192,9 +198,8 @@ impl SubstratePersistence {
         carried.extend(chunks.iter().map(|(_, _, l)| (l.segment, l.offset)));
         for loc in tokens
             .iter()
-            .chain(&snapshots)
-            .chain(&branches)
             .map(|(_, l)| l)
+            .chain(snapshots.iter().chain(&branches).map(|(_, l)| l))
             .chain(singletons.iter().map(|(_, l)| l))
         {
             carried.insert((loc.segment, loc.offset));

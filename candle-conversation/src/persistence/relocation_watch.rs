@@ -35,6 +35,10 @@
 //! op's presence: a handle runs one maintenance op at a time, and a second
 //! plan while one is in flight would relocate out of segments the first is
 //! about to unlink.
+//!
+//! A stream's own records are watched per writer: two members' turn *N* share
+//! a stream id and are two streams (`docs/replicated_substrate.md` §6.6), so a
+//! chunk one of them re-seals supersedes nothing of the other's.
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,28 +52,28 @@ use super::record::{
 /// merges into) another of the same type on replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Key {
-    /// Keyed by the header's `stream_id`: one record of this type per stream
-    /// (or, for `ConvState` and `CustomObject`, per timeline / object key,
-    /// which they carry in the same field).
-    Header(RecordType, u64),
+    /// Keyed by the header's `stream_id` and the writer: one record of this
+    /// type per writer's stream (or, for `ConvState` and `CustomObject`, per
+    /// timeline / object key, which they carry in the same field, with writer
+    /// zero).
+    Header(RecordType, u64, u64),
     /// Keyed by the timeline named in the payload.
     Timeline(RecordType, u64),
     /// A summary-forest node, keyed by `(timeline, turn)`.
     TreeNode(u64, u32),
 }
 
-/// The key a resident record of type `rt` replays under, or `None` for a
-/// record no later write replaces (a timeline or turn tombstone, a coupling —
-/// each only ever adds) or that is not resident at all.
-fn key(rt: RecordType, stream_id: u64, payload: &[u8]) -> Option<Key> {
+/// The key a resident record of type `rt` written by `writer` replays under,
+/// or `None` for a record no later write replaces (a timeline or turn
+/// tombstone, a coupling — each only ever adds) or that is not resident at all.
+fn key(rt: RecordType, stream_id: u64, writer: u64, payload: &[u8]) -> Option<Key> {
     match rt {
         RecordType::StreamDecl
         | RecordType::ProjectionEvents
         | RecordType::WideQSig
         | RecordType::TurnIndexPage
-        | RecordType::Commit
-        | RecordType::ConvState
-        | RecordType::CustomObject => Some(Key::Header(rt, stream_id)),
+        | RecordType::Commit => Some(Key::Header(rt, stream_id, writer)),
+        RecordType::ConvState | RecordType::CustomObject => Some(Key::Header(rt, stream_id, 0)),
         RecordType::Label => decode_label_payload(payload)
             .ok()
             .map(|(timeline, _)| Key::Timeline(rt, timeline)),
@@ -123,10 +127,10 @@ pub enum Reemit {
 /// re-emission must step around.
 #[derive(Debug, Default)]
 pub struct RelocationWatch {
-    /// `(stream_id, chunk_index)` of every `Chunk` appended.
-    chunks: HashSet<(u64, u64)>,
-    /// Every stream whose `Tokens` record was appended.
-    tokens: HashSet<u64>,
+    /// `(stream_id, chunk_index, writer)` of every `Chunk` appended.
+    chunks: HashSet<(u64, u64, u64)>,
+    /// `(stream_id, writer)` of every `Tokens` record appended.
+    tokens: HashSet<(u64, u64)>,
     /// Every section stream a `SectionTombstone` retired.
     retired: HashSet<u64>,
     /// Every stream a `StreamDecl` was appended for.
@@ -141,10 +145,11 @@ impl RelocationWatch {
         let rt = header.record_type;
         match rt {
             RecordType::Chunk => {
-                self.chunks.insert((header.stream_id, header.chunk_index));
+                self.chunks
+                    .insert((header.stream_id, header.chunk_index, header.origin));
             }
             RecordType::Tokens => {
-                self.tokens.insert(header.stream_id);
+                self.tokens.insert((header.stream_id, header.origin));
             }
             RecordType::SectionTombstone => {
                 self.retired.insert(header.stream_id);
@@ -154,7 +159,7 @@ impl RelocationWatch {
             }
             _ => {}
         }
-        if let Some(k) = key(rt, header.stream_id, payload) {
+        if let Some(k) = key(rt, header.stream_id, header.origin, payload) {
             self.rewrites.entry(k).or_default().push((
                 header.chunk_index,
                 payload.to_vec(),
@@ -163,21 +168,21 @@ impl RelocationWatch {
         }
     }
 
-    /// Whether the planned copy of chunk `index` of `stream` is still the one
-    /// to carry forward.
-    pub fn keeps_chunk(&self, stream: u64, index: u64) -> bool {
-        !self.chunks.contains(&(stream, index)) && !self.retired.contains(&stream)
+    /// Whether the planned copy of chunk `index` of `writer`'s `stream` is
+    /// still the one to carry forward.
+    pub fn keeps_chunk(&self, stream: u64, index: u64, writer: u64) -> bool {
+        !self.chunks.contains(&(stream, index, writer)) && !self.retired.contains(&stream)
     }
 
-    /// Whether the planned copy of `stream`'s `Tokens` is still the one to
-    /// carry forward.
-    pub fn keeps_tokens(&self, stream: u64) -> bool {
-        !self.tokens.contains(&stream) && !self.retired.contains(&stream)
+    /// Whether the planned copy of `writer`'s `stream`'s `Tokens` is still the
+    /// one to carry forward.
+    pub fn keeps_tokens(&self, stream: u64, writer: u64) -> bool {
+        !self.tokens.contains(&(stream, writer)) && !self.retired.contains(&stream)
     }
 
     /// What to do with a planned resident record of type `rt`, header stream
-    /// `stream_id`, carrying `payload`.
-    pub fn reemit(&self, rt: RecordType, stream_id: u64, payload: &[u8]) -> Reemit {
+    /// `stream_id`, written by `writer`, carrying `payload`.
+    pub fn reemit(&self, rt: RecordType, stream_id: u64, writer: u64, payload: &[u8]) -> Reemit {
         if stream_keyed(rt) && self.retired.contains(&stream_id) {
             return Reemit::Skip;
         }
@@ -189,7 +194,7 @@ impl RelocationWatch {
         if self.rewrites.is_empty() {
             return Reemit::Carry;
         }
-        match key(rt, stream_id, payload).and_then(|k| self.rewrites.get(&k)) {
+        match key(rt, stream_id, writer, payload).and_then(|k| self.rewrites.get(&k)) {
             Some(newer) => Reemit::CarryThen(newer.clone()),
             None => Reemit::Carry,
         }
@@ -259,11 +264,11 @@ mod tests {
     #[test]
     fn an_unwatched_record_is_carried() {
         let w = RelocationWatch::default();
-        assert!(w.keeps_chunk(7, 0));
-        assert!(w.keeps_tokens(7));
-        assert_eq!(w.reemit(RecordType::StreamDecl, 7, &[]), Reemit::Carry);
+        assert!(w.keeps_chunk(7, 0, 0));
+        assert!(w.keeps_tokens(7, 0));
+        assert_eq!(w.reemit(RecordType::StreamDecl, 7, 0, &[]), Reemit::Carry);
         assert_eq!(
-            w.reemit(RecordType::DebugId, 0, &debug_id(3, "a")),
+            w.reemit(RecordType::DebugId, 0, 0, &debug_id(3, "a")),
             Reemit::Carry
         );
     }
@@ -273,12 +278,35 @@ mod tests {
     fn a_rewritten_chunk_drops_only_that_chunk() {
         let mut w = RelocationWatch::default();
         w.record(&header(RecordType::Chunk, 7, 2), &[]);
-        assert!(!w.keeps_chunk(7, 2));
-        assert!(w.keeps_chunk(7, 1));
-        assert!(w.keeps_chunk(8, 2));
+        assert!(!w.keeps_chunk(7, 2, 0));
+        assert!(w.keeps_chunk(7, 1, 0));
+        assert!(w.keeps_chunk(8, 2, 0));
         assert!(
-            w.keeps_tokens(7),
+            w.keeps_tokens(7, 0),
             "a chunk write leaves the stream's tokens alone"
+        );
+    }
+
+    /// Two writers' records of one stream id are two streams': one writer's
+    /// re-sealed chunk and tokens leave the other's planned copies to carry,
+    /// and its re-written decl is not appended after the other's.
+    #[test]
+    fn one_writers_rewrite_leaves_the_others_stream_alone() {
+        let mut w = RelocationWatch::default();
+        w.record(&stamped(header(RecordType::Chunk, 7, 2), 1), &[]);
+        w.record(&stamped(header(RecordType::Tokens, 7, 0), 2), &[]);
+        w.record(&stamped(header(RecordType::StreamDecl, 7, 0), 3), b"decl");
+        assert!(!w.keeps_chunk(7, 2, 9));
+        assert!(w.keeps_chunk(7, 2, 4), "the other writer's chunk 2");
+        assert!(!w.keeps_tokens(7, 9));
+        assert!(w.keeps_tokens(7, 4));
+        assert_eq!(
+            w.reemit(RecordType::StreamDecl, 7, 4, b"theirs"),
+            Reemit::Carry
+        );
+        assert_eq!(
+            w.reemit(RecordType::StreamDecl, 7, 9, b"older"),
+            Reemit::CarryThen(vec![(0, b"decl".to_vec(), id(3))])
         );
     }
 
@@ -287,28 +315,28 @@ mod tests {
     fn rewritten_tokens_drop_that_streams_tokens() {
         let mut w = RelocationWatch::default();
         w.record(&header(RecordType::Tokens, 7, 0), &[]);
-        assert!(!w.keeps_tokens(7));
-        assert!(w.keeps_tokens(8));
+        assert!(!w.keeps_tokens(7, 0));
+        assert!(w.keeps_tokens(8, 0));
         assert!(
-            w.keeps_chunk(7, 0),
+            w.keeps_chunk(7, 0, 0),
             "a tokens write leaves the stream's chunks alone"
         );
     }
 
     /// A retired section carries none of its old generation past the
-    /// tombstone — every chunk, its tokens, and its stream-keyed metadata.
+    /// tombstone — every writer's chunks, tokens, and stream-keyed metadata.
     #[test]
     fn a_retired_section_drops_its_whole_old_generation() {
         let mut w = RelocationWatch::default();
         w.record(&header(RecordType::SectionTombstone, 40, 0), &[]);
-        assert!(!w.keeps_chunk(40, 0));
-        assert!(!w.keeps_chunk(40, 9));
-        assert!(!w.keeps_tokens(40));
-        assert_eq!(w.reemit(RecordType::StreamDecl, 40, &[]), Reemit::Skip);
-        assert_eq!(w.reemit(RecordType::WideQSig, 40, &[]), Reemit::Skip);
-        assert!(w.keeps_chunk(41, 0));
-        assert!(w.keeps_tokens(41));
-        assert_eq!(w.reemit(RecordType::StreamDecl, 41, &[]), Reemit::Carry);
+        assert!(!w.keeps_chunk(40, 0, 0));
+        assert!(!w.keeps_chunk(40, 9, 4));
+        assert!(!w.keeps_tokens(40, 0));
+        assert_eq!(w.reemit(RecordType::StreamDecl, 40, 0, &[]), Reemit::Skip);
+        assert_eq!(w.reemit(RecordType::WideQSig, 40, 4, &[]), Reemit::Skip);
+        assert!(w.keeps_chunk(41, 0, 0));
+        assert!(w.keeps_tokens(41, 0));
+        assert_eq!(w.reemit(RecordType::StreamDecl, 41, 0, &[]), Reemit::Carry);
     }
 
     /// A section declared again since the plan has started its next
@@ -318,11 +346,11 @@ mod tests {
         let mut w = RelocationWatch::default();
         w.record(&header(RecordType::StreamDecl, 40, 0), b"decl");
         assert_eq!(
-            w.reemit(RecordType::SectionTombstone, 40, &[]),
+            w.reemit(RecordType::SectionTombstone, 40, 0, &[]),
             Reemit::Skip
         );
         assert_eq!(
-            w.reemit(RecordType::SectionTombstone, 41, &[]),
+            w.reemit(RecordType::SectionTombstone, 41, 0, &[]),
             Reemit::Carry
         );
     }
@@ -338,30 +366,30 @@ mod tests {
         w.record(&header(RecordType::TreeMetadata, 0, 0), &tree_node(5, 2, 1));
 
         assert_eq!(
-            w.reemit(RecordType::Commit, 7, &[]),
+            w.reemit(RecordType::Commit, 7, 9, &[]),
             Reemit::CarryThen(vec![(3, Vec::new(), id(11))]),
             "the newer write is carried with the identity it was written under"
         );
-        assert_eq!(w.reemit(RecordType::Commit, 8, &[]), Reemit::Carry);
+        assert_eq!(w.reemit(RecordType::Commit, 8, 9, &[]), Reemit::Carry);
         assert_eq!(
-            w.reemit(RecordType::WideQSig, 7, &[]),
+            w.reemit(RecordType::WideQSig, 7, 9, &[]),
             Reemit::Carry,
             "a commit mark is followed by no other record of its stream"
         );
         assert_eq!(
-            w.reemit(RecordType::DebugId, 0, &debug_id(5, "old")),
+            w.reemit(RecordType::DebugId, 0, 0, &debug_id(5, "old")),
             Reemit::CarryThen(vec![(0, debug_id(5, "new"), RecordIdentity::NONE)])
         );
         assert_eq!(
-            w.reemit(RecordType::DebugId, 0, &debug_id(6, "old")),
+            w.reemit(RecordType::DebugId, 0, 0, &debug_id(6, "old")),
             Reemit::Carry
         );
         assert_eq!(
-            w.reemit(RecordType::TreeMetadata, 0, &tree_node(5, 2, 0)),
+            w.reemit(RecordType::TreeMetadata, 0, 0, &tree_node(5, 2, 0)),
             Reemit::CarryThen(vec![(0, tree_node(5, 2, 1), RecordIdentity::NONE)])
         );
         assert_eq!(
-            w.reemit(RecordType::TreeMetadata, 0, &tree_node(5, 3, 0)),
+            w.reemit(RecordType::TreeMetadata, 0, 0, &tree_node(5, 3, 0)),
             Reemit::Carry
         );
     }
@@ -376,11 +404,11 @@ mod tests {
         w.record(&stamped(header(RecordType::Label, 0, 0), 1), &first);
         w.record(&stamped(header(RecordType::Label, 0, 0), 2), &second);
         assert_eq!(
-            w.reemit(RecordType::Label, 0, &label(5, "conv-5", "original")),
+            w.reemit(RecordType::Label, 0, 0, &label(5, "conv-5", "original")),
             Reemit::CarryThen(vec![(0, first, id(1)), (0, second, id(2))])
         );
         assert_eq!(
-            w.reemit(RecordType::Label, 0, &label(6, "conv-6", "other")),
+            w.reemit(RecordType::Label, 0, 0, &label(6, "conv-6", "other")),
             Reemit::Carry
         );
     }
@@ -398,8 +426,8 @@ mod tests {
         .encode();
         w.record(&header(RecordType::Tombstone, 0, 0), &tomb);
         w.record(&header(RecordType::Snapshot, 7, 0), &[]);
-        assert_eq!(w.reemit(RecordType::Tombstone, 0, &tomb), Reemit::Carry);
-        assert!(w.keeps_chunk(7, 0));
-        assert!(w.keeps_tokens(7));
+        assert_eq!(w.reemit(RecordType::Tombstone, 0, 0, &tomb), Reemit::Carry);
+        assert!(w.keeps_chunk(7, 0, 0));
+        assert!(w.keeps_tokens(7, 0));
     }
 }
