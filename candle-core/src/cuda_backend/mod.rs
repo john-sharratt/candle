@@ -678,7 +678,8 @@ impl Map1 for Im2Col1D {
             unsafe {
                 kernels::simple::conv::run_im2col1d(
                     dtype,
-                    // One thread per destination element.
+                    // One thread per destination element: every one is
+                    // written, so the uninitialised allocation is fully set.
                     dst_numel,
                     l_out,
                     self.l_k,
@@ -3709,6 +3710,32 @@ impl CudaStorage {
                 Ok(data[offset])
             }
         }
+    }
+
+    /// Elements `start..end` copied to the host, and nothing else of the
+    /// storage — what a readback of a contiguous view needs, where
+    /// [`BackendStorage::to_cpu_storage`] copies everything the view was cut
+    /// from.
+    pub fn to_cpu_storage_range(&self, start: usize, end: usize) -> Result<CpuStorage> {
+        // A readback must see everything recorded before it.
+        let _eager = self.device.pause_capture()?;
+        macro_rules! range {
+            ($slice:expr, $variant:ident) => {{
+                let view = $slice.slice(start..end);
+                CpuStorage::$variant($slice.stream().memcpy_dtov(&view).w()?)
+            }};
+        }
+        Ok(match &self.slice {
+            CudaStorageSlice::U8(s) => range!(s, U8),
+            CudaStorageSlice::U32(s) => range!(s, U32),
+            CudaStorageSlice::I64(s) => range!(s, I64),
+            CudaStorageSlice::BF16(s) => range!(s, BF16),
+            CudaStorageSlice::F16(s) => range!(s, F16),
+            CudaStorageSlice::F32(s) => range!(s, F32),
+            CudaStorageSlice::F64(s) => range!(s, F64),
+            CudaStorageSlice::F8E4M3(s) => range!(s, F8E4M3),
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
+        })
     }
 
     /// Transfer a single scalar element from GPU to CPU (type-erased version).

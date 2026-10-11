@@ -3030,28 +3030,52 @@ impl<'w> LiveTensor<'w> {
             }
             .bt())?
         }
-        let from_cpu_storage = |cpu_storage: &crate::CpuStorage| {
+        let from_cpu_storage = |cpu_storage: &crate::CpuStorage, span: Option<(usize, usize)>| {
             let data = S::cpu_storage_as_slice(cpu_storage)?;
-            let data = match self.layout.contiguous_offsets() {
+            let data = match span {
                 Some((o1, o2)) => data[o1..o2].to_vec(),
                 None => self.strided_index().map(|i| data[i]).collect(),
             };
             Ok::<Vec<_>, Error>(data)
         };
         match &*self.storage() {
-            Storage::Cpu(storage) => from_cpu_storage(storage),
-            Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
-            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Cpu(storage) => from_cpu_storage(storage, self.layout.contiguous_offsets()),
+            Storage::Cuda(storage) => {
+                let (host, span) = self.cuda_readback(storage)?;
+                from_cpu_storage(&host, span)
+            }
+            Storage::Metal(storage) => {
+                from_cpu_storage(&storage.to_cpu_storage()?, self.layout.contiguous_offsets())
+            }
+        }
+    }
+
+    /// What a readback of this tensor copies off the card, and the span of it
+    /// the tensor's elements occupy — `None` for a strided view, read through
+    /// [`Self::strided_index`] over the whole storage.
+    ///
+    /// **A contiguous view copies itself, not its storage.** A view's storage
+    /// is everything it was cut from, so copying that to read a 32-row band of
+    /// a KV arena moved the whole arena across the bus for each band: 5 ms a
+    /// band, and 0.85 s to read back a 145-token prefix that is a few
+    /// kilobytes.
+    fn cuda_readback(
+        &self,
+        storage: &crate::CudaStorage,
+    ) -> Result<(crate::CpuStorage, Option<(usize, usize)>)> {
+        match self.layout.contiguous_offsets() {
+            Some((o1, o2)) => Ok((storage.to_cpu_storage_range(o1, o2)?, Some((0, o2 - o1)))),
+            None => Ok((storage.to_cpu_storage()?, None)),
         }
     }
 
     /// Returns the data contained in a 2D tensor as a vector of vector of scalar values.
     pub fn to_vec2<S: crate::WithDType>(&self) -> Result<Vec<Vec<S>>> {
         let (dim1, dim2) = self.dims2()?;
-        let from_cpu_storage = |cpu_storage: &crate::CpuStorage| {
+        let from_cpu_storage = |cpu_storage: &crate::CpuStorage, span: Option<(usize, usize)>| {
             let data = S::cpu_storage_as_slice(cpu_storage)?;
             let mut rows = vec![];
-            match self.layout.contiguous_offsets() {
+            match span {
                 Some((o1, o2)) => {
                     let data = &data[o1..o2];
                     for idx_row in 0..dim1 {
@@ -3070,19 +3094,24 @@ impl<'w> LiveTensor<'w> {
             Ok(rows)
         };
         match &*self.storage() {
-            Storage::Cpu(storage) => from_cpu_storage(storage),
-            Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
-            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Cpu(storage) => from_cpu_storage(storage, self.layout.contiguous_offsets()),
+            Storage::Cuda(storage) => {
+                let (host, span) = self.cuda_readback(storage)?;
+                from_cpu_storage(&host, span)
+            }
+            Storage::Metal(storage) => {
+                from_cpu_storage(&storage.to_cpu_storage()?, self.layout.contiguous_offsets())
+            }
         }
     }
 
     /// Returns the data contained in a 3D tensor.
     pub fn to_vec3<S: crate::WithDType>(&self) -> Result<Vec<Vec<Vec<S>>>> {
         let (dim1, dim2, dim3) = self.dims3()?;
-        let from_cpu_storage = |cpu_storage: &crate::CpuStorage| {
+        let from_cpu_storage = |cpu_storage: &crate::CpuStorage, span: Option<(usize, usize)>| {
             let data = S::cpu_storage_as_slice(cpu_storage)?;
             let mut top_rows = vec![];
-            match self.layout.contiguous_offsets() {
+            match span {
                 Some((o1, o2)) => {
                     let data = &data[o1..o2];
                     let dim23 = dim2 * dim3;
@@ -3111,9 +3140,14 @@ impl<'w> LiveTensor<'w> {
             Ok(top_rows)
         };
         match &*self.storage() {
-            Storage::Cpu(storage) => from_cpu_storage(storage),
-            Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
-            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Cpu(storage) => from_cpu_storage(storage, self.layout.contiguous_offsets()),
+            Storage::Cuda(storage) => {
+                let (host, span) = self.cuda_readback(storage)?;
+                from_cpu_storage(&host, span)
+            }
+            Storage::Metal(storage) => {
+                from_cpu_storage(&storage.to_cpu_storage()?, self.layout.contiguous_offsets())
+            }
         }
     }
 

@@ -13,6 +13,27 @@ fn zeros(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// **A readback of a view reads the view.** Contiguous views cut from the
+/// middle of a larger tensor read back their own elements at every rank, and
+/// a strided one reads its elements in order.
+fn readback_of_a_view(device: &Device) -> Result<()> {
+    let t = Tensor::arange(0u32, 60, device)?.reshape((5, 3, 4))?;
+    assert_eq!(
+        t.narrow(0, 2, 1)?.flatten_all()?.to_vec1::<u32>()?,
+        (24..36).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        t.i(3)?.to_vec2::<u32>()?,
+        [[36, 37, 38, 39], [40, 41, 42, 43], [44, 45, 46, 47]]
+    );
+    assert_eq!(
+        t.narrow(0, 4, 1)?.to_vec3::<u32>()?,
+        [[[48, 49, 50, 51], [52, 53, 54, 55], [56, 57, 58, 59]]]
+    );
+    assert_eq!(t.i((1, .., 2))?.to_vec1::<u32>()?, [14, 18, 22]);
+    Ok(())
+}
+
 fn ones(device: &Device) -> Result<()> {
     assert_eq!(
         Tensor::ones((2, 3), DType::U8, device)?.to_vec2::<u8>()?,
@@ -2349,6 +2370,12 @@ fn zero_dim(device: &Device) -> Result<()> {
 }
 
 test_device!(zeros, zeros_cpu, zeros_gpu, zeros_metal);
+test_device!(
+    readback_of_a_view,
+    readback_of_a_view_cpu,
+    readback_of_a_view_gpu,
+    readback_of_a_view_metal
+);
 test_device!(ones, ones_cpu, ones_gpu, ones_metal);
 test_device!(full, full_cpu, full_gpu, full_metal);
 test_device!(const_set, cs_cpu, cs_gpu, cs_metal);
