@@ -42,6 +42,7 @@ use candle_nn::kv_cache::{ChunkedKvBacking, CompressionPolicy, SealedSequence};
 use crossbeam::channel::{self, Receiver, Sender};
 
 use super::cold_load::preallocate_pinned_scratch;
+use super::flush::{FlushRequest, PassFlush};
 use super::resume::TurnChunkGrid;
 use super::transfer::seal_to_chunk_images;
 use crate::projection::Conversation;
@@ -74,9 +75,9 @@ const SHUTDOWN_DRAIN_MAX_PASSES: usize = 32;
 #[derive(Clone)]
 pub struct PersistenceTrigger {
     tx: Sender<()>,
-    /// Carries a one-shot ack sender into the loop: the next pass runs the
-    /// hot→warm migration and replies on the ack once pending_warm is drained.
-    flush_tx: Sender<Sender<()>>,
+    /// Carries a one-shot flush into the loop: the next pass runs the hot→warm
+    /// migration and answers once the request is met (see [`FlushRequest`]).
+    flush_tx: Sender<FlushRequest>,
     /// Live drain gauges, stamped by the persistence loop each pass. The
     /// scheduler polls them to throttle admission off a leading signal.
     backlog: BacklogGauge,
@@ -144,7 +145,23 @@ impl PersistenceTrigger {
     /// safety cap against a wedged thread, not the expected path).
     pub fn flush_blocking(&self, timeout: Duration) -> bool {
         let (ack_tx, ack_rx) = channel::bounded::<()>(1);
-        if self.flush_tx.try_send(ack_tx).is_err() {
+        if self.flush_tx.try_send(FlushRequest::drain(ack_tx)).is_err() {
+            return false;
+        }
+        ack_rx.recv_timeout(timeout).is_ok()
+    }
+
+    /// [`Self::flush_blocking`] answered as soon as `bytes` are installed warm,
+    /// not once the whole backlog is: what a caller that needs that much
+    /// evictable — relief, short by a known amount — waits for. Same `false`
+    /// cases.
+    pub fn flush_at_least(&self, bytes: u64, timeout: Duration) -> bool {
+        let (ack_tx, ack_rx) = channel::bounded::<()>(1);
+        if self
+            .flush_tx
+            .try_send(FlushRequest::at_least(ack_tx, bytes))
+            .is_err()
+        {
             return false;
         }
         ack_rx.recv_timeout(timeout).is_ok()
@@ -207,7 +224,7 @@ impl PersistenceTrigger {
 pub struct PersistenceThread {
     handle: Mutex<Option<JoinHandle<()>>>,
     trigger_tx: Sender<()>,
-    flush_tx: Sender<Sender<()>>,
+    flush_tx: Sender<FlushRequest>,
     shutdown_tx: Sender<()>,
     /// Shared with the loop (which stamps them) and every [`PersistenceTrigger`]
     /// handed out (which reads them) — the live drain gauges.
@@ -233,7 +250,7 @@ impl PersistenceThread {
         compression_policy: Option<CompressionPolicy>,
     ) -> Self {
         let (trigger_tx, trigger_rx) = channel::bounded::<()>(1);
-        let (flush_tx, flush_rx) = channel::bounded::<Sender<()>>(1);
+        let (flush_tx, flush_rx) = channel::bounded::<FlushRequest>(1);
         let (shutdown_tx, shutdown_rx) = channel::bounded::<()>(1);
         let backlog = BacklogGauge::default();
         let loop_backlog = backlog.clone();
@@ -323,7 +340,7 @@ fn run_loop(
     copy_stream: Arc<CudaStream>,
     compression_policy: Option<CompressionPolicy>,
     trigger_rx: Receiver<()>,
-    flush_rx: Receiver<Sender<()>>,
+    flush_rx: Receiver<FlushRequest>,
     shutdown_rx: Receiver<()>,
     backlog: BacklogGauge,
 ) {
@@ -353,19 +370,23 @@ fn run_loop(
     let mut last_maintenance = Instant::now()
         .checked_sub(MAINTENANCE_INTERVAL)
         .unwrap_or_else(Instant::now);
+    // A full drain the last pass took up mid-pass, owed to this one.
+    let mut carried: Option<FlushRequest> = None;
     loop {
         // Wait for trigger, shutdown, or the periodic tick — whichever
         // fires first. The `default` arm fires after `DEFAULT_TICK` if
-        // nothing else has woken the thread.
+        // nothing else has woken the thread. A carried drain runs at once.
         let mut shutting_down = false;
-        // One-shot ack for a blocking flush request (scheduler under VRAM
-        // pressure): reply once this pass has drained the hot→warm migration.
-        let mut flush_ack: Option<Sender<()>> = None;
-        crossbeam::channel::select! {
-            recv(trigger_rx) -> _ => {}
-            recv(flush_rx) -> ack => { flush_ack = ack.ok(); }
-            recv(shutdown_rx) -> _ => { shutting_down = true; }
-            default(DEFAULT_TICK) => {}
+        // A blocking flush request (scheduler under VRAM pressure), answered by
+        // this pass once its hot→warm migration has moved what it asked for.
+        let mut flush_ack: Option<FlushRequest> = carried.take();
+        if flush_ack.is_none() {
+            crossbeam::channel::select! {
+                recv(trigger_rx) -> _ => {}
+                recv(flush_rx) -> ack => { flush_ack = ack.ok(); }
+                recv(shutdown_rx) -> _ => { shutting_down = true; }
+                default(DEFAULT_TICK) => {}
+            }
         }
 
         // Stamp the backlog this pass is about to face (pre-drain). Held high
@@ -385,6 +406,9 @@ fn run_loop(
         if run_maintenance {
             last_maintenance = Instant::now();
         }
+        // Answered by the pass as soon as what it asks for is warm; a request sent
+        // while the pass runs is taken up at its next group.
+        let mut flush = PassFlush::new(flush_ack, Some(&flush_rx));
         run_pass(
             &conversation,
             &backings,
@@ -394,17 +418,13 @@ fn run_loop(
             &mut pinned_scratch,
             run_maintenance,
             &backlog,
+            &mut flush,
         );
+        carried = flush.carried();
 
         // Re-stamp the residual backlog (post-drain) so the signal decays as
         // soon as the pass installs warm, letting admission reopen promptly.
         backlog.stamp_warm(conversation.read().pending_warm_bytes());
-
-        // run_pass migrates all pending hot→warm before returning, so by here
-        // the just-sealed turns hold a warm copy — signal the waiting flush.
-        if let Some(ack) = flush_ack {
-            let _ = ack.send(());
-        }
 
         if shutting_down {
             // A read-only substrate has no durable tier to drain into: its
@@ -499,6 +519,8 @@ fn run_loop(
                     // backlog, and leaving the gauge holding its pre-shutdown
                     // reading would publish a deficit that never clears.
                     &backlog,
+                    // Nothing waits on the shutdown drain's passes.
+                    &mut PassFlush::new(None, None),
                 );
                 passes += 1;
             }
@@ -869,6 +891,7 @@ fn run_pass(
     pinned_scratch: &mut Option<PinnedBuf>,
     run_maintenance: bool,
     backlog: &BacklogGauge,
+    flush: &mut PassFlush<'_>,
 ) {
     let t_pass = std::time::Instant::now();
 
@@ -1140,6 +1163,10 @@ fn run_pass(
             hot_to_warm_count += count;
             drop(group);
             drop(group_guard);
+            // A sized flush is answered the moment enough is warm — including
+            // one sent while this pass was already running — and the rest of the
+            // backlog moves on without a caller waiting on it.
+            flush.at_group(hot_to_warm_bytes);
             // Nothing installed means the group could not move this pass, and
             // re-snapshotting would hand back the same residences.
             if !more || count == 0 {
@@ -1223,6 +1250,12 @@ fn run_pass(
         // pin discount fall back to zero as soon as the working set releases —
         // a gauge that only ever rises would throttle admission forever.
         backlog.stamp(db, pb);
+        // A waiting flush is answered here, once the hot→warm installs are
+        // done: that is the work it waits for — the just-sealed turns now hold
+        // a warm copy and may be evicted from VRAM. The cold writes and the
+        // maintenance below are durability and housekeeping, and the scheduler,
+        // blocked in relief, used to wait through them as well.
+        flush.finish();
         if pc > 0 {
             tracing::trace!(
                 target: "candle_conversation::persistence::tier",

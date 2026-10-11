@@ -401,6 +401,35 @@ mod tests {
             assert!(arena.copy_slot_bytes(1, &mut too_long).is_err());
         }
 
+        /// **A host slot takes a byte write in place**, at the slot's own offset,
+        /// leaving its neighbours and the rest of its stride alone — and a write
+        /// past the stride is refused as `write_slot_bytes` refuses it.
+        #[test]
+        fn a_host_slot_takes_bytes_in_place() {
+            let class = small();
+            let mut arena = slab(class, ArenaLocation::Cpu, 0);
+            let stride = class.bytes();
+            let fill = |v: u8| Tensor::full(v, stride, &Device::Cpu).unwrap();
+            arena.write_slot_bytes(0, &fill(0xAA)).unwrap();
+            arena.write_slot_bytes(1, &fill(0xBB)).unwrap();
+            arena.write_slot_bytes(2, &fill(0xCC)).unwrap();
+
+            arena.write_slot_from_bytes(1, &[1, 2, 3]).unwrap();
+
+            let mut slot = vec![0u8; stride];
+            arena.copy_slot_bytes(1, &mut slot).unwrap();
+            assert_eq!(&slot[..3], &[1, 2, 3]);
+            assert!(slot[3..].iter().all(|&b| b == 0xBB));
+            arena.copy_slot_bytes(0, &mut slot).unwrap();
+            assert!(slot.iter().all(|&b| b == 0xAA));
+            arena.copy_slot_bytes(2, &mut slot).unwrap();
+            assert!(slot.iter().all(|&b| b == 0xCC));
+
+            assert!(arena
+                .write_slot_from_bytes(1, &vec![0u8; stride + 1])
+                .is_err());
+        }
+
         /// **Zero-on-recycle covers the whole stride, not the payload.** The
         /// next tenant may be any format that fits, so a partial wipe would
         /// leave the previous tenant's bytes readable past the new one's

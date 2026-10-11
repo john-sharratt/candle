@@ -636,6 +636,24 @@ impl Arena {
         Ok(())
     }
 
+    /// Write `bytes` into the head of slot `chunk_idx`.
+    ///
+    /// The write side of [`Self::copy_slot_bytes`]: a host slab takes the bytes
+    /// in place, one bounds-checked copy into its own storage. Through
+    /// [`Self::write_slot_bytes`] every band first became a tensor of its own,
+    /// and a hot→warm migrate scatters hundreds of thousands of them — ~1.4 µs
+    /// a band, ~290 ms of every 120 MiB staging group on Qwen3-30B-A3B. A device
+    /// slab still goes through `write_slot_bytes`, which is its one host-to-device
+    /// copy.
+    pub(crate) fn write_slot_from_bytes(&mut self, chunk_idx: usize, bytes: &[u8]) -> Result<()> {
+        let off = self.slot_offset(chunk_idx, bytes.len())?;
+        if self.data.device().is_cpu() {
+            return self.data.write_host_bytes(off, bytes);
+        }
+        let src = Tensor::from_slice(bytes, bytes.len(), self.data.device())?;
+        self.write_slot_bytes(chunk_idx, &src)
+    }
+
     /// Write `src` (a 1-D `U8` tensor on this arena's device) into the head of
     /// slot `chunk_idx`.
     pub(crate) fn write_slot_bytes(&mut self, chunk_idx: usize, src: &Tensor) -> Result<()> {

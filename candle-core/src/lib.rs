@@ -160,6 +160,7 @@ mod tensor;
 #[cfg(feature = "tensor-assert")]
 pub mod tensor_assert;
 mod tensor_cat;
+mod tensor_host_bytes;
 pub mod test_utils;
 pub mod utils;
 mod variable;

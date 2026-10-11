@@ -167,6 +167,34 @@ const VRAM_OFFLOAD_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::fro
 pub(super) struct PackPass {
     pub(super) released: usize,
     pub(super) clipped: bool,
+    /// Whether the pass handed ground back: the frontier fell, or it released more
+    /// arenas than it created. A pass creates destination arenas ahead of its moves
+    /// and releases whichever it did not fill, so `released` alone counts its own
+    /// churn as progress.
+    pub(super) gained: bool,
+}
+
+/// Run `pass` back to back until the pools are settled, answering the arenas the
+/// passes released.
+///
+/// **Ends on the first pass that stops short of more work or gains nothing.** A pass
+/// that was turned away (`None`) or finished its plan inside the budget leaves no
+/// more to do now. A pass that clipped but handed no ground back is not followed
+/// either: the next would plan the same moves from the same ground. It is judged on
+/// ground, not on `released`, because a pass releases the fresh arenas it created
+/// and never filled — on Qwen3-30B-A3B a dozen passes in a row each "released" 3–40
+/// arenas with the frontier pinned at 400 regions, at ~250 ms a pass. Every pass the
+/// loop continues past lowered the frontier or the pools' arena count, so the loop
+/// ends within as many passes as there are KV arenas.
+fn settle_passes(mut pass: impl FnMut() -> Option<PackPass>) -> usize {
+    let mut released = 0;
+    while let Some(p) = pass() {
+        released += p.released;
+        if !p.clipped || !p.gained {
+            break;
+        }
+    }
+    released
 }
 
 impl Scheduler {
@@ -401,20 +429,16 @@ impl Scheduler {
     /// long, at 70%, while the forwards in between bought ground from the weight side
     /// against it. Back to back, the passes cost up to ~80 ms each, and only when a
     /// pass clipped; an iteration with nothing to pack still costs one gate.
+    ///
+    /// **Bounded by what the passes free, not by a count of them.** Each pass plans
+    /// at most `PLANNED_MOVES_PER_POOL` moves a pool (`compact.rs`), which on the 30B
+    /// probe is ~75,000 moves and 12–16 arenas a pass. A fixed four passes therefore
+    /// stopped ~52 regions into a burst of 75–120, and the remainder stood through the
+    /// next forward and the publish after it: worst sustained efficiency read 66–75%
+    /// with every pass reporting `plan_capped` and none clipped by the clock. See
+    /// [`settle_passes`] for why the loop ends.
     pub(super) fn pack_until_settled(&mut self) -> usize {
-        /// Passes one rung may run back to back.
-        const MAX_PASSES: usize = 4;
-        let mut released = 0;
-        for _ in 0..MAX_PASSES {
-            let Some(pass) = self.pack_kv_pools() else {
-                break;
-            };
-            released += pass.released;
-            if !pass.clipped {
-                break;
-            }
-        }
-        released
+        settle_passes(|| self.pack_kv_pools())
     }
 
     /// One KV compaction pass if the pools are fragmented enough to be worth it, then
@@ -533,13 +557,19 @@ impl Scheduler {
             super::profile::record("compact:publish", t.publish);
         }
         let pass = match &outcome {
-            Ok(r) => Some(PackPass {
-                released: r.arenas_released,
-                // Another pass right away when this one ran out of budget, or capped a
-                // pool's plan and still handed regions back. A capped pass that freed
-                // nothing is not pursued: re-running it would plan the same moves.
-                clipped: r.clipped || (r.plan_capped && r.arenas_released > 0),
-            }),
+            Ok(r) => {
+                let gained =
+                    r.frontier_after < r.frontier_before || r.arenas_released > r.fresh_arenas;
+                Some(PackPass {
+                    released: r.arenas_released,
+                    // Another pass right away when this one ran out of budget, or capped
+                    // a pool's plan and still handed ground back. A capped pass that
+                    // gained nothing is not pursued: re-running it would plan the same
+                    // moves.
+                    clipped: r.clipped || (r.plan_capped && gained),
+                    gained,
+                })
+            }
             Err(
                 candle_nn::kv_cache::CompactionRefused::WaveInFlight
                 | candle_nn::kv_cache::CompactionRefused::MigrateInFlight,
@@ -772,26 +802,39 @@ impl Scheduler {
         // freed nothing for a turn the decode was still attending, whose block
         // table keeps the float chunks alive until the slot goes.
         let mut packed = 0usize;
+        // Where relief spends its time, stage by stage, for its log line.
+        let (mut pack_ms, mut evict_ms, mut flush_ms) = (0u64, 0u64, 0u64);
+        let t_stage = std::time::Instant::now();
         if self.vram_under_pressure_for(phase) {
             packed = self.pack_until_settled();
         }
 
+        pack_ms += t_stage.elapsed().as_millis() as u64;
         if self.vram_under_pressure_for(phase) {
+            let t_evict = std::time::Instant::now();
             evicted = self.evict_cold_tail(want);
+            evict_ms += t_evict.elapsed().as_millis() as u64;
             if evicted.bytes < want {
                 // The blocking flush is only paid when the already-warm turns
                 // were not enough: under sustained pressure there are usually
-                // plenty of them, and this wait is measured in seconds.
+                // plenty of them. It waits for the shortfall, not the backlog —
+                // answered once that much is warm and evictable.
+                let short = want.saturating_sub(evicted.bytes);
+                let t_flush = std::time::Instant::now();
                 flushed = super::timed_wait(|| {
                     self.persist_trigger
-                        .flush_blocking(VRAM_OFFLOAD_FLUSH_TIMEOUT)
+                        .flush_at_least(short, VRAM_OFFLOAD_FLUSH_TIMEOUT)
                 });
+                flush_ms = t_flush.elapsed().as_millis() as u64;
+                let t_evict = std::time::Instant::now();
                 let more = self.evict_cold_tail(want.saturating_sub(evicted.bytes));
+                evict_ms += t_evict.elapsed().as_millis() as u64;
                 evicted.count += more.count;
                 evicted.bytes += more.bytes;
             }
             released += self.session.release_empty_arenas().unwrap_or(0);
         }
+        let t_stage = std::time::Instant::now();
 
         // **Pack again before the weight side pays.** The evictions just above left air
         // of their own, and a pass the first rung could not get in for has had the
@@ -802,6 +845,7 @@ impl Scheduler {
         if evicted.count > 0 || self.vram_under_pressure_for(phase) {
             packed += self.pack_until_settled();
         }
+        pack_ms += t_stage.elapsed().as_millis() as u64;
 
         // **Last resort, and the only one that adds ground rather than
         // recycling it.** Everything above reclaims KV the engine already owns —
@@ -827,11 +871,13 @@ impl Scheduler {
         // put the zone under its pinned working set, after which nothing ran.
         // The number was in this function the whole time; it just was not sent.
         let mut conceded = 0u64;
+        let t_stage = std::time::Instant::now();
         if self.vram_under_pressure_for(phase) {
             conceded = self
                 .model
                 .request_kv_ground(want.div_ceil(region_bytes()) as usize);
         }
+        let concede_ms = t_stage.elapsed().as_millis() as u64;
 
         let still = self.vram_under_pressure_for(phase);
         let acted =
@@ -851,6 +897,12 @@ impl Scheduler {
                     whence,
                     want_mib = want / (1 << 20),
                     relief_ms = t.elapsed().as_millis() as u64,
+                    // Where it went: both packing rungs, the evictions, the wait
+                    // for the persistence thread, and the weight side's concession.
+                    pack_ms,
+                    evict_ms,
+                    flush_ms,
+                    concede_ms,
                     warm_flushed = flushed,
                     gallery_freed_mib = gallery_freed / (1 << 20),
                     arenas_packed = packed,
@@ -4385,6 +4437,70 @@ mod setpoint_tests {
             0,
             "no span, no demand"
         );
+    }
+}
+
+#[cfg(test)]
+mod settle_passes_tests {
+    use super::{settle_passes, PackPass};
+
+    fn run(passes: &[Option<PackPass>]) -> (usize, usize) {
+        let mut it = passes.iter().copied();
+        let mut calls = 0;
+        let released = settle_passes(|| {
+            calls += 1;
+            it.next()
+                .expect("the loop asked for a pass past the script")
+        });
+        (released, calls)
+    }
+
+    fn capped(released: usize) -> Option<PackPass> {
+        Some(PackPass {
+            released,
+            clipped: true,
+            gained: released > 0,
+        })
+    }
+
+    /// The 30B probe's burst: ~13 arenas a capped pass, 120 regions of air. Every
+    /// pass is followed until one finishes its plan — nine passes, not four.
+    #[test]
+    fn a_burst_is_packed_until_a_pass_finishes_its_plan() {
+        let mut script = vec![capped(13); 8];
+        script.push(Some(PackPass {
+            released: 16,
+            clipped: false,
+            gained: true,
+        }));
+        assert_eq!(run(&script), (8 * 13 + 16, 9));
+    }
+
+    /// A clipped pass that released nothing ends the loop: the next would plan the
+    /// same moves from the same ground.
+    #[test]
+    fn a_clipped_pass_that_frees_nothing_ends_it() {
+        assert_eq!(run(&[capped(12), capped(0)]), (12, 2));
+    }
+
+    /// A pass that released only the fresh arenas it created itself gained no
+    /// ground, whatever its `released` count: the loop stops there rather than
+    /// running the same fruitless pass again.
+    #[test]
+    fn a_pass_that_only_churns_its_own_arenas_ends_it() {
+        let churn = Some(PackPass {
+            released: 22,
+            clipped: true,
+            gained: false,
+        });
+        assert_eq!(run(&[capped(9), churn, capped(30)]), (9 + 22, 2));
+    }
+
+    /// Turned away by a forward or a migrate: nothing more to do now.
+    #[test]
+    fn a_refused_pass_ends_it() {
+        assert_eq!(run(&[capped(5), None]), (5, 2));
+        assert_eq!(run(&[None]), (0, 1));
     }
 }
 
