@@ -657,7 +657,7 @@ impl Map1 for Im2Col1D {
         let shape = layout.shape();
         let dims = shape.dims();
         let l_out = self.l_out(dims[2]);
-        let threads = dims[0] * l_out * dims[1];
+        let dst_numel = dims[0] * l_out * dims[1] * self.l_k;
         let ds = dev.info_table(&[dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
 
@@ -669,7 +669,7 @@ impl Map1 for Im2Col1D {
 
         let stream = dev.cuda_stream();
         // SAFETY: Set later by running the kernel.
-        let (dst, out_backing) = unsafe { alloc_inheriting::<T>(dev, threads * self.l_k, origin)? };
+        let (dst, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_numel, origin)? };
         {
             let (ds_ptr, _ds_guard) = ds.device_ptr(&stream);
             let (src_ptr, _src_guard) = src.device_ptr(&stream);
@@ -678,8 +678,8 @@ impl Map1 for Im2Col1D {
             unsafe {
                 kernels::simple::conv::run_im2col1d(
                     dtype,
-                    // One thread per column, each writing its `l_k` elements.
-                    threads,
+                    // One thread per destination element.
+                    dst_numel,
                     l_out,
                     self.l_k,
                     self.stride,
