@@ -221,6 +221,10 @@ pub struct WaveWidth {
     /// [`PREFILL_KV_STAGE_MIN_Q_LEN`](super::prefill_kv_stage::PREFILL_KV_STAGE_MIN_Q_LEN)
     /// rows.
     pub kv_stage: PrefillKvStageLayout,
+    /// Later rows' routers a MoE layer also applies to its input, for the expert
+    /// cache's look-ahead votes: each is `n_experts` more F32 columns of
+    /// [`WaveBuffer::LookAheadLogits`]. Zero on a stack that votes on nothing.
+    pub look_ahead_hops: usize,
 }
 
 impl WaveWidth {
@@ -246,6 +250,7 @@ impl WaveWidth {
             accept_rows: 0,
             qsa_bytes: 0,
             kv_stage: PrefillKvStageLayout::NONE,
+            look_ahead_hops: 0,
         }
     }
 
@@ -262,6 +267,7 @@ impl WaveWidth {
             accept_rows: 0,
             qsa_bytes: 0,
             kv_stage: PrefillKvStageLayout::NONE,
+            look_ahead_hops: 0,
         }
     }
 
@@ -283,6 +289,7 @@ impl WaveWidth {
             accept_rows: 0,
             qsa_bytes: 0,
             kv_stage: PrefillKvStageLayout::NONE,
+            look_ahead_hops: 0,
         }
     }
 
@@ -1000,6 +1007,11 @@ pub enum WaveBuffer {
     SharedGatedOut,
     /// The router's per-token logits over every expert. Both paths.
     RouterLogits,
+    /// The look-ahead routers' logits — later rows' routers applied to this
+    /// layer's input in launches of their own, F32, `n_experts` columns a hop
+    /// ([`WaveWidth::look_ahead_hops`]) — that the expert cache's votes are
+    /// counted from.
+    LookAheadLogits,
     /// Top-k routing weights, in F32. Both paths.
     RouteWeights,
     /// Top-k expert ids, as u32. Both paths.
@@ -1641,6 +1653,7 @@ impl WaveBuffer {
             | Self::SharedGateSigmoid
             | Self::SharedGatedOut
             | Self::RouterLogits
+            | Self::LookAheadLogits
             | Self::RouteWeights
             | Self::RouteIndices
             | Self::RoutingTokenIds
@@ -2103,6 +2116,7 @@ impl WaveBuffer {
             | Self::DownGemm
             | Self::MoeGather
             | Self::RouterLogits
+            | Self::LookAheadLogits
             | Self::RouteWeights
             | Self::RouteIndices
             | Self::RoutingTokenIds
@@ -2122,6 +2136,7 @@ impl WaveBuffer {
             Self::FfnNorm if g.hyper.is_some() && !g.packed_norm => dense(0, 0, g.act_dtype),
             Self::FfnNorm => norm(rows),
             Self::RouterLogits => dense(rows, g.n_experts, g.act_dtype),
+            Self::LookAheadLogits => dense(rows, g.n_experts * w.look_ahead_hops, DType::F32),
             Self::RouteWeights => dense(rows, g.experts_per_tok, DType::F32),
             Self::RouteIndices => dense(rows, g.experts_per_tok, DType::U32),
             Self::RoutingTokenIds | Self::RoutingWeightIds | Self::RoutingPermutation => {
@@ -2825,6 +2840,23 @@ mod tests {
             .max(p.walk_chain(10_731_776, Chain::DeltaNet, wide));
         assert_eq!(p.phase_bytes(LayerPhase::Attention, wide), head.max(trunk));
         assert!(head > p.walk_chain(10_731_776, Chain::Attention, wide));
+    }
+
+    /// Each look-ahead hop is one router's logits in F32, whatever the session's
+    /// dtype: 100 rows × 128 experts × 4 bytes = 51,200 a hop, nothing without
+    /// one, and the router's own logits (BF16 here) unchanged.
+    #[test]
+    fn a_look_ahead_hop_prices_one_routers_f32_logits() {
+        let g = moe();
+        let plain = WaveWidth::prefill(100, 1);
+        let voting = |hops| WaveWidth {
+            look_ahead_hops: hops,
+            ..plain
+        };
+        assert_eq!(WaveBuffer::LookAheadLogits.bytes(&g, plain), 0);
+        assert_eq!(WaveBuffer::LookAheadLogits.bytes(&g, voting(1)), 51_200);
+        assert_eq!(WaveBuffer::LookAheadLogits.bytes(&g, voting(5)), 256_000);
+        assert_eq!(WaveBuffer::RouterLogits.bytes(&g, voting(5)), 25_600);
     }
 
     /// A hyper stack's attention mixer carves in the wave's dtype, its residual
@@ -3678,6 +3710,7 @@ mod tests {
                             g.head_dim,
                             PrefillLaunchBounds::PRODUCTION,
                         ),
+                        look_ahead_hops: rows,
                     };
                     let s = b.shape(&g, width);
                     if conditional {

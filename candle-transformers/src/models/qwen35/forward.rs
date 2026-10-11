@@ -1026,6 +1026,8 @@ fn sweep_layers(
                 accept_rows: if accept_in_place { scored_rows } else { 0 },
                 // This lineage's attention is dense: no sparse selection.
                 qsa_bytes: 0,
+                // Its MoE layers apply no look-ahead routers.
+                look_ahead_hops: 0,
                 // A one-row prefill group takes the decode kernels, so it carves
                 // no span-table entry and, alone, no scan transient.
                 prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),

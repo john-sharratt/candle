@@ -215,8 +215,27 @@ struct Stager {
     /// next message (a landing, a routed row, a prediction) before looking
     /// again, instead of spinning on the same answer.
     spec_stalled: bool,
+    /// The row last begun was wide ([`wide_row`]): a prefill's, whose next row
+    /// is read ahead whole and whose speculative reads may use every reader.
+    wide: bool,
     last_row: Option<usize>,
     disconnected: bool,
+}
+
+/// The share of a layer's experts a row's cold set must reach to count as
+/// wide (`1 / WIDE_ROW_SHARE`).
+const WIDE_ROW_SHARE: usize = 4;
+
+/// Whether a row whose cold set is `cold` of a layer's `n_experts` is a wide
+/// one — a prefill wave's, which routes to nearly every expert, so the next
+/// row's whole non-resident set is what that row will need.
+///
+/// A decode row routes a few experts per token and finds most of them resident;
+/// a prefill row of a few hundred tokens or more misses on every expert the
+/// device does not hold. Reading the next layer whole is right for the second
+/// and a waste of the drive for the first, which keeps its scored lookahead.
+fn wide_row(cold: usize, n_experts: usize) -> bool {
+    n_experts > 0 && cold * WIDE_ROW_SHARE >= n_experts
 }
 
 /// Whether an evicted pad slot of `row`, whose entry is already emptied, may be
@@ -286,6 +305,7 @@ pub(crate) fn spawn_stager(
         spec_loads: HashMap::new(),
         predicted_ahead: HashSet::new(),
         spec_stalled: false,
+        wide: false,
         last_row: None,
         disconnected: false,
     };
@@ -566,6 +586,7 @@ impl Stager {
             .count();
         self.predicted_ahead.retain(|&(r, _)| r != row);
         self.spec.retain(|s| s.row != row);
+        self.wide = wide_row(cold.len(), self.ctx.n_experts);
         self.look_ahead(row);
         if let Ok(mut s) = self.ctx.stats.lock() {
             s.staged_ahead_routed += hit.len();
@@ -828,7 +849,11 @@ impl Stager {
             return Ok(false);
         }
         let mut progressed = false;
-        while self.spec_loads.len() < SPEC_IN_FLIGHT {
+        // A wide row's read-ahead is the next layer whole, and the readers
+        // still take demand jobs first, so it may use every reader; decode's
+        // scored lookahead keeps half of them free for demand.
+        let cap = if self.wide { NVME_QD } else { SPEC_IN_FLIGHT };
+        while self.spec_loads.len() < cap {
             let Some(&SpecRead {
                 row,
                 expert: e,
@@ -906,7 +931,18 @@ impl Stager {
 
 #[cfg(test)]
 mod tests {
-    use super::{demand_left_behind, overwritable};
+    use super::{demand_left_behind, overwritable, wide_row};
+
+    /// A quarter of the layer cold is wide; less is not, and an empty layer
+    /// never is.
+    #[test]
+    fn a_row_is_wide_from_a_quarter_of_its_layer_cold() {
+        assert!(wide_row(128, 512));
+        assert!(wide_row(512, 512));
+        assert!(!wide_row(127, 512));
+        assert!(!wide_row(10, 512));
+        assert!(!wide_row(0, 0));
+    }
 
     /// The demand stands while the GPU is inside its invocation or behind it
     /// (the stager can be ahead of the device), and is left behind only once a

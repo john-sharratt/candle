@@ -143,9 +143,31 @@ pub(crate) fn ranked(votes: &[u32], n_experts: usize, hop: usize, cap: usize) ->
     v.into_iter().map(|(_, e)| e).collect()
 }
 
+/// The experts some token put in its top `k` — a word's high half — in
+/// ascending order: what a prefill launch's next row will route. The margin
+/// picks (the low half, ranks `k+1 …`) are left out: a wide launch routes
+/// nearly every expert that any token ranks in its top `k`, and the margin
+/// would only add reads the row never makes.
+pub(crate) fn voted_set(words: &[u32]) -> Vec<usize> {
+    words
+        .iter()
+        .enumerate()
+        .filter(|&(_, &w)| w >> 16 > 0)
+        .map(|(e, _)| e)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Top-`k` votes name an expert; margin votes alone do not.
+    #[test]
+    fn the_voted_set_is_the_top_k_picks_in_order() {
+        let words = [0, 3 << 16, 5, (1 << 16) | 2, 0, 9 << 16];
+        assert_eq!(voted_set(&words), vec![1, 3, 5]);
+        assert!(voted_set(&[0, 7, 1]).is_empty());
+    }
 
     /// A hop's experts, most votes first, ties by expert, zero votes left out,
     /// capped.

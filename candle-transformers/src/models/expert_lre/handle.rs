@@ -156,6 +156,17 @@ pub const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
 
 use candle::vram::PAGEABLE_RESERVE;
 
+/// Layers of pad slots the stager owns: the layer a wave is computing, and the
+/// next one, which a prefill launch's router votes stage into while the
+/// current one computes (`PipelineState::stage_voted`). With one layer the next
+/// layer's reads could not start until every slot of the current one was
+/// released — a prefill row routes about half its layer, and Rule R′ protects
+/// all of it — so the drive idled through each layer's up and down
+/// projections. A third layer, staging two rows ahead, measured no faster on
+/// Flash-Next's ×8 prefill (16 GB laptop: 805.8 against 812.5 t/s) while its
+/// pinned RAM cost the warm tier ~540 experts.
+pub(crate) const PAD_LAYERS: usize = 2;
+
 /// How many warm slots to ask for: **every expert the machine will actually
 /// give room for.**
 ///
@@ -633,16 +644,17 @@ impl ExpertCache {
                 // any warm size, including zero.
                 let stride = candle::direct_io::round_up_sector(slot_bytes);
                 // **The pad before the warm tier, not after.** It is mandatory —
-                // it is what makes a cold expert computable — and one layer of
-                // slots; the warm tier is elastic and pins up to the driver's
-                // page-lock ceiling, so anything pinned after it lands on an
-                // exhausted budget. The startup fill borrows the pad as its
-                // landing ring before the stager takes it over.
+                // it is what makes a cold expert computable — and
+                // [`PAD_LAYERS`] layers of slots; the warm tier is elastic and
+                // pins up to the driver's page-lock ceiling, so anything pinned
+                // after it lands on an exhausted budget. The startup fill
+                // borrows the pad as its landing ring before the stager takes it
+                // over.
                 let pad = Pad::new(
                     if all_resident {
                         STARTUP_RING_SLOTS
                     } else {
-                        experts_per_layer.max(STARTUP_RING_SLOTS)
+                        (PAD_LAYERS * experts_per_layer).max(STARTUP_RING_SLOTS)
                     },
                     stride,
                 )?;

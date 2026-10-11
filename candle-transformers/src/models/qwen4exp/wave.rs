@@ -1790,6 +1790,20 @@ impl Qwen4ExpBatched {
     }
 }
 
+/// Later rows a MoE layer's router look-ahead votes on, for a wave of
+/// `total_rows`: [`LOOK_AHEAD_HOPS`] at decode width, for the device's
+/// read-ahead, and the next row alone at prefill width, whose voted set the
+/// expert stager reads off the drive (`PipelineState::stage_voted`). One answer
+/// for the forward that builds the routers and the plan that prices their
+/// columns ([`WaveWidth::look_ahead_hops`]).
+fn look_ahead_hops(total_rows: usize) -> usize {
+    if total_rows <= LOOK_AHEAD_MAX_TOKENS {
+        LOOK_AHEAD_HOPS
+    } else {
+        1
+    }
+}
+
 impl ManagedBatchedModel for Qwen4ExpBatched {
     fn wave_geometry(&self, wave_dtype: DType) -> ModelGeometry {
         // The Gated Residual carries F32 throughout, so the wave's own dtype is
@@ -1908,6 +1922,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
                 PrefillLaunchBounds::PRODUCTION,
             ),
             qsa_bytes,
+            look_ahead_hops: look_ahead_hops(rows),
             ..WaveWidth::prefill(rows, sequences.max(1))
         };
         Some(WavePlan::new(geometry).tier_bytes(width) as u64)
@@ -2856,6 +2871,7 @@ impl WaveSweep for Qwen4ExpBatched {
                         geometry.head_dim,
                         PrefillLaunchBounds::PRODUCTION,
                     ),
+                    look_ahead_hops: look_ahead_hops(total_rows),
                 };
                 let per_phase = [
                     plan.phase_bytes(LayerPhase::Attention, width),
@@ -3936,19 +3952,21 @@ impl Qwen4ExpBatched {
             let g_moe = crate::models::profile::gpu_span(moe_span, dev);
             // The next rows' routers, applied to this layer's input in its own
             // stacked projection: their votes predict those rows' experts for the
-            // expert cache's read-ahead and staging. Decode-width launches only —
-            // a prompt routes most of every row, which leaves nothing to predict —
-            // and only while the cache copies experts often enough to repay them
-            // (`ExpertCache::reads_ahead`).
-            let look_ahead: Vec<&QMatMul> =
-                if total_rows <= LOOK_AHEAD_MAX_TOKENS && layer.moe.routed.cache.reads_ahead() {
-                    m.layers[li + 1..(li + 1 + LOOK_AHEAD_HOPS).min(num_layers)]
-                        .iter()
-                        .map(|l| &l.moe.routed.gate)
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+            // expert cache's read-ahead and staging, while the cache copies
+            // experts often enough to repay them (`ExpertCache::reads_ahead`).
+            // A decode-width launch votes [`LOOK_AHEAD_HOPS`] rows ahead for the
+            // device's read-ahead; a prefill-width one votes on the next row
+            // only, whose voted set the stager reads off the drive while this
+            // layer computes — a prompt routes about half of every row, not all
+            // of it, so the next row's own router is what says which half.
+            let look_ahead: Vec<&QMatMul> = if layer.moe.routed.cache.reads_ahead() {
+                m.layers[li + 1..(li + 1 + look_ahead_hops(total_rows)).min(num_layers)]
+                    .iter()
+                    .map(|l| &l.moe.routed.gate)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // The layer's output in its three parts: the shared expert's gate is
             // applied by the combine below, which reads the block output anyway,
             // rather than by three launches of its own.
