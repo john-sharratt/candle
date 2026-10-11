@@ -192,7 +192,7 @@ impl ExpertPack {
     ///
     /// It is checked on [`Self::read_many`] — the startup fill, where thousands
     /// of records move at once, the cores are idle waiting on the drive, and the
-    /// work parallelises. It is **not** checked on [`Self::read_into_with_handle`],
+    /// work parallelises. It is **not** checked on [`Self::read_run_with_handle`],
     /// the stager's per-miss path, and that is a measured decision rather than
     /// an oversight: a `fletcher32` over 2.9 MB costs about as much as the read
     /// it follows, in front of a worker that is waiting for it. On the miss path
@@ -237,28 +237,43 @@ impl ExpertPack {
             })
     }
 
-    /// [`Self::read_into`] on file handle `handle` of the pool, so concurrent
-    /// readers each keep their own kernel I/O queue — the stager's reader
-    /// threads, one handle each.
-    pub(crate) fn read_into_with_handle(
+    /// `layer`'s records `first, first + 1, …` — as many as `dest` holds whole
+    /// strides — in **one** positioned direct read on file handle `handle` of the
+    /// pool, so concurrent readers each keep their own kernel I/O queue (the
+    /// stager's reader threads, one handle each). `dest` must be 4 KiB-aligned.
+    ///
+    /// One read rather than one per record because the request is what the
+    /// drive charges for: measured on the 16 GB laptop's SN810, random reads
+    /// of a record's 1.9 MiB ran at 3.9 GB/s however many were in flight, and
+    /// 4 MiB reads at 4.7 GB/s — a fixed ~0.15 ms per request beside ~5.7 GB/s
+    /// of transfer. The run stays inside one layer: the records are laid out
+    /// layer-major, but the next layer's first expert is a different row's.
+    pub(crate) fn read_run_with_handle(
         &self,
         handle: usize,
         layer: usize,
-        expert: usize,
+        first: usize,
         dest: &mut [u8],
     ) -> Result<()> {
-        if dest.len() != self.stride {
+        let count = dest.len() / self.stride;
+        if count == 0 || dest.len() != count * self.stride {
             candle::bail!(
-                "expert pack read wants a {}-byte destination, got {}",
+                "expert pack read wants whole {}-byte records, got {} bytes",
                 self.stride,
                 dest.len()
             );
         }
+        if first + count > self.experts_per_layer {
+            candle::bail!(
+                "expert pack run L{layer}E{first}+{count} crosses the layer's {} experts",
+                self.experts_per_layer
+            );
+        }
         self.reader
-            .read_at_with_handle(handle, self.offset_of(layer, expert)?, dest)
+            .read_at_with_handle(handle, self.offset_of(layer, first)?, dest)
             .map_err(|e| {
                 candle::Error::Msg(format!(
-                    "expert pack read L{layer}E{expert} from {}: {e}",
+                    "expert pack read L{layer}E{first}+{count} from {}: {e}",
                     self.path.display()
                 ))
             })
@@ -771,12 +786,44 @@ mod tests {
         );
         let dest = scratch.as_mut_slice(stride);
         dest.fill(0xEE);
-        pack.read_into_with_handle(3, 1, 1, dest).unwrap();
+        pack.read_run_with_handle(3, 1, 1, dest).unwrap();
         assert_eq!(
             scratch.as_slice(stride),
             zeroed.as_slice(),
-            "read_into_with_handle served a remembered copy"
+            "read_run_with_handle served a remembered copy"
         );
+        drop(pack);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **A run is the records one at a time, back to back** — one read for a
+    /// layer's adjacent experts returns exactly what reading each would, and a
+    /// run that would cross into the next layer, or a destination that is not
+    /// whole records, is refused rather than read.
+    #[test]
+    fn a_run_read_is_its_records_back_to_back() {
+        let (path, base) = build("run", 4096);
+        let pack = open(&path, base);
+        let stride = pack.stride();
+        let mut one = AlignedScratch::new();
+        one.ensure(stride).unwrap();
+        let mut expect = Vec::new();
+        for e in 0..2 {
+            pack.read_into(1, e, one.as_mut_slice(stride)).unwrap();
+            expect.extend_from_slice(one.as_slice(stride));
+        }
+        assert_ne!(expect[..stride], expect[stride..], "fixture records differ");
+        let mut run = AlignedScratch::new();
+        run.ensure(2 * stride).unwrap();
+        pack.read_run_with_handle(0, 1, 0, run.as_mut_slice(2 * stride))
+            .unwrap();
+        assert_eq!(run.as_slice(2 * stride), expect.as_slice());
+        assert!(pack
+            .read_run_with_handle(0, 0, 1, run.as_mut_slice(2 * stride))
+            .is_err());
+        assert!(pack
+            .read_run_with_handle(0, 1, 0, run.as_mut_slice(stride + 1))
+            .is_err());
         drop(pack);
         std::fs::remove_file(&path).ok();
     }

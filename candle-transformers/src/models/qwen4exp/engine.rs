@@ -502,8 +502,11 @@ impl Qwen4ExpGpu {
             }
         };
 
-        let gguf = Arc::new(gguf);
-        let ple_table = open_cached_ple(gguf, &cfg, device)?;
+        // The PLE table reads through direct-I/O handles of its own; the GGUF
+        // reader — a buffered handle on the pack — closes here, so nothing holds
+        // a cached view of the file the expert stager reads (`DiskPleFetch`).
+        let ple_table = open_cached_ple(&gguf, &cfg, device)?;
+        drop(gguf);
 
         Ok(Self {
             cfg,

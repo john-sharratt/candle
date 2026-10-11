@@ -73,6 +73,10 @@ pub struct PipelineStats {
     /// stalled cold wait was waiting on.
     pub pack_reads: ReadLatency,
     pub paged_reads: ReadLatency,
+    /// Requests the pack reads above went to the drive in: a reader serves a
+    /// queued run of adjacent records in one, so records over requests is how
+    /// well the cold reads coalesce.
+    pub pack_requests: usize,
     /// Pad slots the stager took back from a staged expert.
     pub pad_evictions: usize,
     /// **Gauge**, not a tally: experts the warm tier holds, of the model's
@@ -265,6 +269,7 @@ impl PipelineStats {
             s.stage_read_ns = 0;
             s.pack_reads = ReadLatency::default();
             s.paged_reads = ReadLatency::default();
+            s.pack_requests = 0;
             s.pad_evictions = 0;
             s.ahead_claims = 0;
             s.ahead_bytes = 0;

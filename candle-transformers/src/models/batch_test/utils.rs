@@ -3508,6 +3508,17 @@ impl TestParams {
                 "  pack reads",
                 Box::new(|s: &PipelineStats| read_latency_cell(&s.pack_reads)),
             ),
+            // Records per request: how far the readers' runs coalesce them.
+            (
+                "    requests",
+                Box::new(|s: &PipelineStats| match s.pack_requests {
+                    0 => "-".to_string(),
+                    n => format!(
+                        "{n} · {:.2} records each",
+                        s.pack_reads.reads as f64 / n as f64
+                    ),
+                }),
+            ),
             (
                 "  pageable reads",
                 Box::new(|s: &PipelineStats| read_latency_cell(&s.paged_reads)),

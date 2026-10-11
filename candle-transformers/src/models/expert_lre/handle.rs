@@ -1643,22 +1643,23 @@ mod warm_sizing_tests {
         let s = warm_sizing_from(SLOT, EVICTABLE, 64 * GIB, 6 * GIB, 6 * GIB, 0, LOOSE_BUDGET);
         assert_eq!(s.bound_by, CEILING_AVAILABLE);
 
-        // Pinnable half lowest — and it leaves the headroom like the others, so
-        // an 8 GiB machine offers a 4 GiB pinnable region of which the tier may
-        // take 1 GiB.
+        // Pinnable region lowest — and it leaves the headroom like the others, so
+        // a 16 GiB machine offers what is left after the pageable reserve, less
+        // the headroom.
         let s = warm_sizing_from(
             SLOT,
             EVICTABLE,
-            8 * GIB,
+            16 * GIB,
             60 * GIB,
             60 * GIB,
             0,
             LOOSE_BUDGET,
         );
         assert_eq!(s.bound_by, CEILING_PINNABLE);
+        assert!(s.slots > 0, "a 16 GiB machine leaves the tier some room");
         assert_eq!(
             s.slots,
-            ((4 * GIB - WARM_TIER_HEADROOM) / SLOT as u64) as usize
+            ((16 * GIB - PAGEABLE_RESERVE - WARM_TIER_HEADROOM) / SLOT as u64) as usize
         );
 
         // Nothing binds: the tier covers every evictable expert.

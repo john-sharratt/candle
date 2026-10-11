@@ -15,6 +15,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use candle::direct_io::{round_up_sector, AlignedScratch, DirectFile, DIRECT_IO_SECTOR};
 use candle::quantized::ggml_file::qtensor_from_ggml;
 use candle::quantized::gguf_file::{Content, TensorInfo, Value};
 use candle::quantized::ko_quant::dequant_ko;
@@ -146,10 +147,20 @@ impl ExpertSource for DiskExperts {
     }
 }
 
-/// The PLE table's disk half: a positioned read of one row's quantized
-/// record — what the row cache calls on a miss.
+/// The PLE table's disk half: one row's quantized record, read with direct I/O
+/// — what the row cache calls on a miss.
+///
+/// **Direct, on handles of its own, never through the loader's buffered one.**
+/// The table lives in the model pack beside the expert section, and on Windows
+/// a file with any cached view open — a buffered handle that has read, or a
+/// mapping — has its unbuffered reads served one at a time: measured on the
+/// 16 GB laptop (`direct_io::tests::read_method_sweep`), the stager's expert
+/// reads ran 6.5 GB/s on the pack alone and 4.1 GB/s beside a buffered handle
+/// that had read its header. This fetch held the loader's `GgufModel` — and its
+/// buffered handle — for the model's lifetime, which pinned every Flash-Next
+/// prefill to the slower figure.
 struct DiskPleFetch {
-    gguf: Arc<GgufModel>,
+    file: DirectFile,
     slab: DiskSlab,
 }
 
@@ -158,11 +169,20 @@ impl PleRowFetch for DiskPleFetch {
         if id as usize >= self.slab.dims[0] {
             candle::bail!("ple: row {id} past the {}-row table", self.slab.dims[0]);
         }
-        self.gguf.read_at(
-            self.slab.split,
-            self.slab.offset + id as u64 * self.slab.outer_bytes as u64,
-            dst,
-        )
+        // The sectors holding the record: direct I/O reads whole, aligned
+        // sectors, and a record is a few hundred bytes anywhere in one or two.
+        let at = self.slab.offset + id as u64 * self.slab.outer_bytes as u64;
+        let sector = DIRECT_IO_SECTOR as u64;
+        let start = at / sector * sector;
+        let span = round_up_sector((at - start) as usize + dst.len());
+        let mut window = AlignedScratch::new();
+        window.ensure(span).map_err(candle::Error::wrap)?;
+        self.file
+            .read_at(start, window.as_mut_slice(span))
+            .map_err(|e| candle::Error::Msg(format!("ple: row {id} read: {e}")))?;
+        let from = (at - start) as usize;
+        dst.copy_from_slice(&window.as_slice(span)[from..from + dst.len()]);
+        Ok(())
     }
 }
 
@@ -430,8 +450,8 @@ pub fn load_oracle_model(one_split: &Path, device: &Device) -> Result<Qwen4ExpMo
         device,
     )?;
 
+    let ple_table = open_cached_ple(&gguf, &cfg, device)?;
     let gguf = Arc::new(gguf);
-    let ple_table = open_cached_ple(gguf.clone(), &cfg, device)?;
     Ok(Qwen4ExpModel {
         embed,
         layers,
@@ -450,14 +470,16 @@ pub fn load_oracle_model(one_split: &Path, device: &Device) -> Result<Qwen4ExpMo
 }
 
 /// Open the §0.1 PLE source — the 320M-row table behind the bounded RAM row
-/// cache — over an already-open GGUF. Shared by the oracle above and the GPU
-/// engine, so both consume identical quantized records.
+/// cache — located through an open GGUF and read through direct-I/O handles of
+/// its own ([`DiskPleFetch`]), so the caller's GGUF reader can be dropped once
+/// loading is done. Shared by the oracle above and the GPU engine, so both
+/// consume identical quantized records.
 pub(crate) fn open_cached_ple(
-    gguf: Arc<GgufModel>,
+    gguf: &GgufModel,
     cfg: &Qwen4ExpConfig,
     device: &Device,
 ) -> Result<Box<dyn PleSource>> {
-    let ple_slab = DiskSlab::locate(&gguf, PLE_TABLE)?;
+    let ple_slab = DiskSlab::locate(gguf, PLE_TABLE)?;
     if ple_slab.dims[1] != cfg.ple.head_dim {
         candle::bail!(
             "qwen4exp: PLE table width {} != embedding_length_per_layer_input {}",
@@ -495,13 +517,14 @@ pub(crate) fn open_cached_ple(
         }
     }
     let ple_record_bytes = ple_slab.outer_bytes;
+    let file = DirectFile::open(&gguf.paths()[ple_slab.split]).map_err(candle::Error::wrap)?;
     Ok(Box::new(CachedPle {
         dtype: ple_slab.dtype,
         head_dim: cfg.ple.head_dim,
         device: device.clone(),
         cache: PleRowCache::new(
             DiskPleFetch {
-                gguf,
+                file,
                 slab: ple_slab,
             },
             ple_record_bytes,
