@@ -13,7 +13,7 @@ use crate::models::identity::ModelKey;
 use crate::persistence::header_index::INDEX_FLUSH_ENTRIES;
 use crate::persistence::record::{ChunkPayload, RecordType};
 use crate::persistence::streams::{StreamDecl, TurnDecl};
-use crate::persistence::{test_npc, SubstratePersistence};
+use crate::persistence::{test_npc, Admit, SubstratePersistence};
 use crate::substrate::Substrate;
 
 fn turn(timeline_id: u64) -> StreamDecl {
@@ -64,10 +64,15 @@ type Seen = (RecordType, u64, u64, RecordIdentity);
 fn on_disk(dir: &Path) -> Vec<Seen> {
     let mut seen = Vec::new();
     let mut substrate = Substrate::new();
-    SubstratePersistence::open_in_with_substrate_and_sink(dir, &mut substrate, |entry| {
-        let h = &entry.record.header;
-        seen.push((h.record_type, h.stream_id, h.chunk_index, h.identity()));
-    })
+    SubstratePersistence::open_in_with_substrate_and_sink(
+        dir,
+        &mut substrate,
+        Admit::Unbound,
+        |entry| {
+            let h = &entry.record.header;
+            seen.push((h.record_type, h.stream_id, h.chunk_index, h.identity()));
+        },
+    )
     .unwrap();
     seen
 }

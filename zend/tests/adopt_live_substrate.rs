@@ -1,9 +1,10 @@
-//! **A copy of the live substrate adopts and keeps its state**
-//! (`docs/replicated_substrate.md` §15, chunk 1's exit): the store this
-//! daemon has been writing since before records carried an identity opens
-//! through the one-time adoption, and reopens to the same conversations, the
-//! same labels and the same turns at the same indices, with every record an
-//! origin writes stamped as this node's own.
+//! **A copy of the live substrate keeps its state through a writable open**
+//! (`docs/replicated_substrate.md` §15, chunk 1's exit): the store this daemon
+//! serves reopens to the same conversations, the same labels and the same turns
+//! at the same indices, with every record an origin writes stamped as this
+//! node's own. A store written before records carried an identity is adopted by
+//! that open; the live one was, at the daemon's first start on this build
+//! (2026-10-11), and this test ran the adoption on a copy of it first.
 //!
 //! The live store is the one this checkout's daemon serves: its workspace is
 //! the directory that holds the checkout. The copy is taken while the daemon
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use candle_conversation::persistence::record::RecordType;
 use candle_conversation::persistence::resume::{derive_layer_count, recovered_turn_decls};
 use candle_conversation::persistence::writer_lock::LOCK_FILE;
-use candle_conversation::persistence::SubstratePersistence;
+use candle_conversation::persistence::{Admit, SubstratePersistence};
 use candle_conversation::projection::{Conversation, TurnIndex};
 use candle_conversation::substrate::Substrate;
 
@@ -136,24 +137,29 @@ fn a_copy_of_the_live_substrate_adopts_and_keeps_its_state() {
     // further open adopts nothing.
     let mut substrate = Substrate::new();
     let mut unstamped = Vec::new();
-    let mut sp = SubstratePersistence::open_in_with_substrate_and_sink(&ws, &mut substrate, |e| {
-        let h = &e.record.header;
-        let housekeeping = matches!(
-            h.record_type,
-            RecordType::HeaderIndex
-                | RecordType::ModelKey
-                | RecordType::Template
-                | RecordType::Tokenizer
-                | RecordType::BranchCheckpoint
-                | RecordType::Replica
-                | RecordType::Deleted
-                | RecordType::Rebase
-                | RecordType::Tombstone
-        );
-        if h.identity().is_none() && !housekeeping {
-            unstamped.push(h.record_type);
-        }
-    })
+    let mut sp = SubstratePersistence::open_in_with_substrate_and_sink(
+        &ws,
+        &mut substrate,
+        Admit::Unbound,
+        |e| {
+            let h = &e.record.header;
+            let housekeeping = matches!(
+                h.record_type,
+                RecordType::HeaderIndex
+                    | RecordType::ModelKey
+                    | RecordType::Template
+                    | RecordType::Tokenizer
+                    | RecordType::BranchCheckpoint
+                    | RecordType::Replica
+                    | RecordType::Deleted
+                    | RecordType::Rebase
+                    | RecordType::Tombstone
+            );
+            if h.identity().is_none() && !housekeeping {
+                unstamped.push(h.record_type);
+            }
+        },
+    )
     .unwrap();
     assert!(
         unstamped.is_empty(),

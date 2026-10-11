@@ -100,9 +100,12 @@ impl Telemetry {
         let devices = Devices::open();
         let (_, vram) = devices.sample_gpu();
         tracing::info!(
-            "model: {} ({:.1} GB) — {}",
+            "model: {} ({}) — {}",
             model.name,
-            model.bytes as f64 / 1e9,
+            match model.bytes {
+                Some(b) => format!("{:.1} GB", b as f64 / 1e9),
+                None => "prepared locally".to_owned(),
+            },
             match vram.total_mib {
                 Some(m) => format!("{:.1} GiB of card memory", m as f64 / 1024.0),
                 None => "no card detected".to_owned(),
@@ -220,7 +223,8 @@ mod tests {
         let t = Telemetry::new(view());
         let json = serde_json::to_value(t.read()).unwrap();
         assert_eq!(json["model"]["repo"], view().repo);
-        assert!(json["model"]["bytes"].as_u64().unwrap() > 0);
+        assert_eq!(json["model"]["name"], view().name);
+        assert_eq!(json["model"]["bytes"].as_u64(), view().bytes);
     }
 
     /// Uptime is the one thing that is always true, and it has to move.

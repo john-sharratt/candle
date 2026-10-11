@@ -17,7 +17,7 @@ use crate::error::ConversationError;
 use crate::guest::checkpoint::gguf_header;
 use crate::models::identity::{rope_key, ModelIdentity, WeightFiles};
 use crate::models::DialectType;
-use crate::persistence::{BoundSubstrate, SharedSubstrate};
+use crate::persistence::{Admit, BoundSubstrate, SharedSubstrate};
 use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::tenant_rank::TenantRank;
 use crate::tree::ConversationTreeConfig;
@@ -1025,11 +1025,12 @@ impl ModelBuilder {
                     None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 };
                 // A read-only open writes nothing under `substrate/` and
-                // requires the store to exist.
+                // requires the store to exist. A writable one refuses a store
+                // this model cannot open before it rewrites anything.
                 let opened = if self.read_only_substrate {
                     SharedSubstrate::open_in_read_only(&dir)
                 } else {
-                    SharedSubstrate::open_in(&dir)
+                    SharedSubstrate::open_in(&dir, Admit::Key(identity.key()))
                 };
                 opened
                     .map_err(|e| ConversationError::Other(format!("substrate persistence: {e}")))?

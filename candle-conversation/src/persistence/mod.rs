@@ -108,7 +108,7 @@ use identity::{
 use inherit::InheritedSubstrate;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
 use manifest::{ChunkLoc, Manifest, RecordLoc};
-pub use model_binding::{BoundSubstrate, ModelBinding};
+pub use model_binding::{Admit, BoundSubstrate, ModelBinding};
 pub use priority_lock::PersistenceLock;
 use rebase::{RebaseEntry, RebaseMap};
 use record::verify_record_crc;
@@ -315,11 +315,16 @@ impl SharedSubstrate {
         }
     }
 
-    /// Open the substrate under `dir` and share it. The one-liner for a host
-    /// with no records of its own to collect on the walk.
-    pub fn open_in(dir: &Path) -> Result<Self> {
+    /// Open the substrate under `dir` for `admit`'s model and share it. The
+    /// one-liner for a host with no records of its own to collect on the walk.
+    pub fn open_in(dir: &Path, admit: Admit<'_>) -> Result<Self> {
         let mut substrate = Substrate::new();
-        let persistence = SubstratePersistence::open_in_with_substrate(dir, &mut substrate)?;
+        let persistence = SubstratePersistence::open_adopting(
+            &dir.join(SUBSTRATE_DIR),
+            &mut substrate,
+            admit,
+            |_| {},
+        )?;
         Ok(Self::new(substrate, persistence))
     }
 
@@ -803,20 +808,28 @@ impl SubstratePersistence {
     /// in-RAM index.
     ///
     /// A store written before identities is adopted here, once ([`adoption`]).
+    /// Opened for no model ([`Admit::Unbound`]): a host that runs one binds
+    /// through [`SharedSubstrate::open_in`].
     pub fn open_in_with_substrate(
         dir: &Path,
         substrate: &mut Substrate,
     ) -> Result<SubstratePersistence> {
-        Self::open_adopting(&dir.join(SUBSTRATE_DIR), substrate, |_| {})
+        Self::open_adopting(&dir.join(SUBSTRATE_DIR), substrate, Admit::Unbound, |_| {})
     }
 
     /// The writable open with a substrate: walk the store into `substrate`
-    /// and `sink`, and when it was written before identities, adopt it and
-    /// open it again into a fresh substrate. `sink` sees the walk once: the
-    /// adoption changes record headers and the payloads that name a writer —
-    /// turn tombstones and file events — and leaves every other payload as it
-    /// was.
-    fn open_adopting<F>(dir: &Path, substrate: &mut Substrate, mut sink: F) -> Result<Self>
+    /// and `sink`, refuse it when `admit`'s model cannot open it, and when it
+    /// was written before identities, adopt it and open it again into a fresh
+    /// substrate. The refusal comes before the adoption, so a refused store is
+    /// left as it was found. `sink` sees the walk once: the adoption changes
+    /// record headers and the payloads that name a writer — turn tombstones and
+    /// file events — and leaves every other payload as it was.
+    fn open_adopting<F>(
+        dir: &Path,
+        substrate: &mut Substrate,
+        admit: Admit<'_>,
+        mut sink: F,
+    ) -> Result<Self>
     where
         F: FnMut(&WalkEntry),
     {
@@ -824,6 +837,7 @@ impl SubstratePersistence {
             substrate.apply_walker_entry(entry);
             sink(entry);
         })?;
+        sp.admit(admit)?;
         if !sp.predates_identities {
             return Ok(sp);
         }
@@ -864,18 +878,19 @@ impl SubstratePersistence {
     /// character where this costs none: the bytes are already in hand.
     ///
     /// The sink sees records in log order, so last-writer-wins is simply the
-    /// last value the sink is handed for a key. A store written before
-    /// identities is adopted here, once, after the sink has seen it
-    /// ([`Self::open_adopting`]).
+    /// last value the sink is handed for a key. A store `admit`'s model cannot
+    /// open is refused; one written before identities is adopted here, once,
+    /// after the sink has seen it ([`Self::open_adopting`]).
     pub fn open_in_with_substrate_and_sink<F>(
         dir: &Path,
         substrate: &mut Substrate,
+        admit: Admit<'_>,
         sink: F,
     ) -> Result<SubstratePersistence>
     where
         F: FnMut(&WalkEntry),
     {
-        Self::open_adopting(&dir.join(SUBSTRATE_DIR), substrate, sink)
+        Self::open_adopting(&dir.join(SUBSTRATE_DIR), substrate, admit, sink)
     }
 
     /// Open over an ordered list of paths. The last entry is the active,
@@ -3333,11 +3348,16 @@ mod tests {
     fn cast_on_disk(dir: &Path) -> Vec<u64> {
         let mut seen = Vec::new();
         let mut substrate = Substrate::new();
-        SubstratePersistence::open_in_with_substrate_and_sink(dir, &mut substrate, |entry| {
-            if entry.record.header.record_type == RecordType::Npc {
-                seen.push(entry.record.header.stream_id);
-            }
-        })
+        SubstratePersistence::open_in_with_substrate_and_sink(
+            dir,
+            &mut substrate,
+            Admit::Unbound,
+            |entry| {
+                if entry.record.header.record_type == RecordType::Npc {
+                    seen.push(entry.record.header.stream_id);
+                }
+            },
+        )
         .unwrap();
         seen.sort_unstable();
         seen.dedup();
@@ -3504,7 +3524,7 @@ mod tests {
         }
 
         // Boot: the registry opens once, and the engine takes that same handle.
-        let shared = SharedSubstrate::open_in(&dir).unwrap();
+        let shared = SharedSubstrate::open_in(&dir, Admit::Unbound).unwrap();
         let engine = shared.clone();
 
         // Runtime: a character is created, through the registry's side.
@@ -3545,7 +3565,7 @@ mod tests {
 
         // Write once, read it straight back from the same handle.
         {
-            let shared = SharedSubstrate::open_in(&dir).unwrap();
+            let shared = SharedSubstrate::open_in(&dir, Admit::Unbound).unwrap();
             let mut obj =
                 CustomObjectPayload::new("command-table", serde_json::json!({ "open": true }));
             obj.metadata
@@ -3566,7 +3586,7 @@ mod tests {
 
         // A fresh open replays the log — the object is durable.
         {
-            let shared = SharedSubstrate::open_in(&dir).unwrap();
+            let shared = SharedSubstrate::open_in(&dir, Admit::Unbound).unwrap();
             let back = shared.custom_object("command-table").unwrap();
             assert_eq!(back.blob, serde_json::json!({ "open": true }));
 
@@ -3594,7 +3614,7 @@ mod tests {
         // Reopen after compaction: only the last value is present, and the
         // superseded first write did not resurrect.
         {
-            let shared = SharedSubstrate::open_in(&dir).unwrap();
+            let shared = SharedSubstrate::open_in(&dir, Admit::Unbound).unwrap();
             let back = shared.custom_object("command-table").unwrap();
             assert_eq!(
                 back.blob,

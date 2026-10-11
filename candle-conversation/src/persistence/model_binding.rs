@@ -11,10 +11,14 @@
 //! is checked once against the running model — architecture, repository,
 //! checkpoint name and the recorded tokenizer — and, if it matches, the key is
 //! written over it and decides from then on.
+//!
+//! A writable open checks the model it opens the store for ([`Admit`]) before
+//! anything is rewritten, so a store written before record identities that the
+//! running model would refuse is refused as it was found, not adopted first.
 
 use std::path::PathBuf;
 
-use crate::models::identity::{ModelIdentity, ModelKey, RecordedModel};
+use crate::models::identity::{LegacySpec, ModelIdentity, ModelKey, RecordedModel};
 
 use super::record::RecordType;
 use super::{PersistenceError, Result, SharedSubstrate, SubstratePersistence};
@@ -67,7 +71,71 @@ pub(super) fn decide(
     }
 }
 
+/// The model a writable open admits a store for, as far as it is known when the
+/// store opens.
+#[derive(Debug, Clone, Copy)]
+pub enum Admit<'a> {
+    /// No model: a tool or a test opening the store for itself. Every store is
+    /// admitted.
+    Unbound,
+    /// The running model's key: the whole of the binding check.
+    Key(&'a ModelKey),
+    /// The running model as its spec names it, before its pack is resolved:
+    /// compared on architecture, and against a record written before keys on
+    /// repository too. Not on the file — a record holds the checkpoint's own
+    /// `general.name`, which nothing knows before the pack is read — and a
+    /// recorded key's repository describes the model without identifying it.
+    /// The key decides the rest when the substrate is bound.
+    Spec(&'a LegacySpec),
+}
+
+impl Admit<'_> {
+    fn describe(&self) -> String {
+        match self {
+            Admit::Unbound => "no model".into(),
+            Admit::Key(key) => key.describe(),
+            Admit::Spec(spec) => format!("arch {}, from {}", spec.arch, spec.model_repo),
+        }
+    }
+}
+
+/// Whether a store recording `recorded` (and a tokenizer digest
+/// `recorded_tokenizer`) is admitted for `admit`.
+pub(super) fn admits(
+    recorded: Option<&RecordedModel>,
+    recorded_tokenizer: Option<[u8; 32]>,
+    admit: Admit<'_>,
+) -> bool {
+    match (admit, recorded) {
+        (Admit::Unbound, _) | (_, None) => true,
+        (Admit::Key(key), recorded) => {
+            decide(recorded, recorded_tokenizer, key) != Decision::Refuse
+        }
+        (Admit::Spec(spec), Some(RecordedModel::Legacy(held))) => {
+            held.arch == spec.arch && held.model_repo == spec.model_repo
+        }
+        (Admit::Spec(spec), Some(RecordedModel::Key(held))) => held.arch == spec.arch,
+    }
+}
+
 impl SubstratePersistence {
+    /// Refuse with [`PersistenceError::WrongModel`] a store `admit`'s model
+    /// cannot open. Writes nothing.
+    pub(super) fn admit(&self, admit: Admit<'_>) -> Result<()> {
+        let recorded = self
+            .recorded_model()
+            .transpose()
+            .map_err(|e| PersistenceError::Corrupt(format!("{}: {e}", self.dir().display())))?;
+        if admits(recorded.as_ref(), self.tokenizer_sha256, admit) {
+            return Ok(());
+        }
+        Err(PersistenceError::WrongModel {
+            dir: self.dir().to_path_buf(),
+            recorded: recorded.map(|r| r.describe()).unwrap_or_default(),
+            running: admit.describe(),
+        })
+    }
+
     /// The model this substrate records, decoded. `None` on a substrate no
     /// model has written yet.
     pub fn recorded_model(&self) -> Option<std::result::Result<RecordedModel, String>> {
@@ -252,5 +320,63 @@ mod tests {
     fn an_older_spec_under_another_vocabulary_is_refused() {
         let l = RecordedModel::Legacy(legacy());
         assert_eq!(decide(Some(&l), Some([2; 32]), &key()), Decision::Refuse);
+    }
+
+    /// An open with no model admits any store; a store no model has written
+    /// is admitted for any model.
+    #[test]
+    fn an_unbound_open_and_an_unwritten_store_admit_everything() {
+        let l = RecordedModel::Legacy(legacy());
+        let k = RecordedModel::Key(key());
+        assert!(admits(Some(&l), Some([9; 32]), Admit::Unbound));
+        assert!(admits(Some(&k), None, Admit::Unbound));
+        assert!(admits(None, None, Admit::Key(&key())));
+        assert!(admits(None, None, Admit::Spec(&legacy())));
+    }
+
+    /// A key is admitted exactly where it would bind.
+    #[test]
+    fn a_key_is_admitted_where_it_binds() {
+        let l = RecordedModel::Legacy(legacy());
+        assert!(admits(Some(&l), Some([1; 32]), Admit::Key(&key())));
+        assert!(!admits(Some(&l), Some([2; 32]), Admit::Key(&key())));
+        let mut other = key();
+        other.weights = [0xcd; 32];
+        assert!(!admits(
+            Some(&RecordedModel::Key(other)),
+            None,
+            Admit::Key(&key())
+        ));
+    }
+
+    /// Before its pack is resolved, a model is admitted by the architecture and
+    /// repository a store written before keys holds of it. The file is not
+    /// compared: the record holds the checkpoint's `general.name`, which the
+    /// spec does not know.
+    #[test]
+    fn a_spec_admits_the_older_spec_of_its_arch_and_repository() {
+        let l = RecordedModel::Legacy(legacy());
+        assert!(admits(Some(&l), Some([7; 32]), Admit::Spec(&legacy())));
+        let mut artifact = legacy();
+        artifact.model_filename = "Qwen3.6-35B-A3B-AntiLoop.Q4_K_M.gguf".into();
+        assert!(admits(Some(&l), None, Admit::Spec(&artifact)));
+        let mut elsewhere = legacy();
+        elsewhere.model_repo = "unsloth/Qwen3.6-35B-A3B-GGUF".into();
+        assert!(!admits(Some(&l), None, Admit::Spec(&elsewhere)));
+        let mut flash = legacy();
+        flash.arch = "Qwen4Exp".into();
+        assert!(!admits(Some(&l), None, Admit::Spec(&flash)));
+    }
+
+    /// Against a recorded key a spec can compare only the architecture.
+    #[test]
+    fn a_spec_admits_a_key_of_its_architecture() {
+        let k = RecordedModel::Key(key());
+        let mut moved = legacy();
+        moved.model_repo = "elsewhere/mirror".into();
+        assert!(admits(Some(&k), None, Admit::Spec(&moved)));
+        let mut flash = legacy();
+        flash.arch = "Qwen4Exp".into();
+        assert!(!admits(Some(&k), None, Admit::Spec(&flash)));
     }
 }

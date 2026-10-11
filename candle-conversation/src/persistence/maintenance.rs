@@ -1954,7 +1954,7 @@ mod tests {
     use crate::persistence::identity::Stamped;
     use crate::persistence::record::ChunkPayload;
     use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
-    use crate::persistence::{SubstratePersistence, SUBSTRATE_DIR};
+    use crate::persistence::{Admit, SubstratePersistence, SUBSTRATE_DIR};
     use crate::projection::TimelineId;
     use crate::substrate::Substrate;
     use std::path::PathBuf;
@@ -2579,11 +2579,16 @@ mod tests {
         // And across a restart, which is where the loss actually showed.
         let mut substrate = Substrate::new();
         let mut cast = Vec::new();
-        SubstratePersistence::open_in_with_substrate_and_sink(&dir, &mut substrate, |entry| {
-            if entry.record.header.record_type == RecordType::Npc {
-                cast.push(entry.record.header.stream_id);
-            }
-        })
+        SubstratePersistence::open_in_with_substrate_and_sink(
+            &dir,
+            &mut substrate,
+            Admit::Unbound,
+            |entry| {
+                if entry.record.header.record_type == RecordType::Npc {
+                    cast.push(entry.record.header.stream_id);
+                }
+            },
+        )
         .unwrap();
         assert_eq!(
             cast,
@@ -3526,10 +3531,15 @@ mod tests {
     fn identities_on_disk(dir: &std::path::Path) -> Vec<(RecordType, u64, u64, RecordIdentity)> {
         let mut seen = Vec::new();
         let mut substrate = Substrate::new();
-        SubstratePersistence::open_in_with_substrate_and_sink(dir, &mut substrate, |entry| {
-            let h = &entry.record.header;
-            seen.push((h.record_type, h.stream_id, h.chunk_index, h.identity()));
-        })
+        SubstratePersistence::open_in_with_substrate_and_sink(
+            dir,
+            &mut substrate,
+            Admit::Unbound,
+            |entry| {
+                let h = &entry.record.header;
+                seen.push((h.record_type, h.stream_id, h.chunk_index, h.identity()));
+            },
+        )
         .unwrap();
         seen
     }

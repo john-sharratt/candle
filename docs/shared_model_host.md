@@ -645,7 +645,7 @@ a config file read at every start cannot hold and a self-heal relaunch drops.
 pub struct ModelKey {
     pub arch: String,        // "Qwen35Hybrid", "Qwen4Exp", … — ModelArch's name
     pub repo: String,        // where it was resolved from — a description, not identity
-    pub file: String,        // the checkpoint's file name — a description too
+    pub file: String,        // the checkpoint's general.name + ".gguf" — a description too
     pub weights: [u8; 32],   // WeightFiles::digest over every file the model loads from
     pub tokenizer: [u8; 32], // SHA-256 of tokenizer.json
     pub rope: String,        // rope_key: the schedule and the minimum YaRN factor
@@ -717,7 +717,19 @@ tokenizer hash against the running model. If they match, it writes the full key 
 opens; if not, it refuses as above. From then on the key decides. This is the check
 running once against the older record, not a second format reader. It can only see
 what `ModelSpec` records: a change confined to what it leaves out — revision, tensor
-overrides, adapters, gate donor — passes this one adoption.
+overrides, adapters, gate donor — passes this one adoption. The filename on both sides
+is the checkpoint's own name — its GGUF `general.name` with `.gguf`, which the builder
+puts in the spec once it reads the pack, and which builds before keys recorded too —
+not the name of the file on disk.
+
+**The check comes before the store is rewritten.** A substrate written before record
+identities is adopted by its first writable open (`docs/replicated_substrate.md` §6.2),
+and that open first checks the model it is opening the store for
+(`persistence::model_binding::Admit`), so a refused store is left as it was found. A
+host that opens its store before its pack is resolved — npcd, whose cast is read at
+start while the model may still be downloading — passes what its spec knows: the
+architecture, and against a record written before keys the repository. The key decides
+the rest when the store is bound.
 
 ### 4.3 What it costs to change model
 
@@ -748,21 +760,26 @@ identity it would need.
 // host/src/model.rs
 /// The model every tenant runs. Changing it is a code change, and every substrate
 /// written under the previous one refuses to open (§4) until it is moved aside.
-pub const MODEL: Model = Model::Qwen36_35B_A3B_AntiLoop_StyleTune;
+pub const MODEL: Model = Model::Qwen38_FlashNext_Q4KO;
 ```
 
-This is npcd's `model()` today (`npcd/src/model.rs:54-56`), moved to the host and
-made the only model. It is the AntiLoop + StyleTune fine-tune of Qwen3.6-35B-A3B
-(`models/qwen36_moe.rs:130-169`): the AntiLoop trunk at Q4_K_M with StyleTune's
-`output.weight` and an MTP gate donor, arch `Qwen35Hybrid`, 21.7 GB tiered. It runs on
-every machine in the fleet — the expert cache streams what VRAM cannot hold — and
-needs no ladder.
+Qwen3.8-Flash-Next with `Q4_KO` experts over a `Q8_0` trunk
+(`models/qwen38_flash_next.rs`), arch `Qwen4Exp`: 250 B total, ~13 B active, its engine
+artifact prepared locally from the pinned upstream releases rather than downloaded. It
+runs on every machine in the fleet at this one quant — the expert cache streams what
+VRAM cannot hold, so a smaller card streams more experts rather than taking the
+`Q3_KO` rung — and needs no ladder.
+
+The host first prescribed the AntiLoop + StyleTune fine-tune of Qwen3.6-35B-A3B,
+npcd's model before there was a host. It moved to Flash-Next on 2026-10-11, when zend —
+which had run Flash-Next on the 72 GB card all along — first came up on this build, so
+that its substrate carried over: §4.2's one-time check admitted the Flash-Next spec it
+recorded, and zend kept every conversation.
 
 What goes:
 
 - zend's `model_choice` ladder (`zend/src/model_choice.rs`) and its `--model` flag.
-  zend runs the fine-tune on every machine, including the 72 GB card where it ran
-  Flash-Next.
+  zend runs the prescribed model on every machine.
 - npcd's own `model()`; it reads the host's.
 - `Model::PRESETS` gains `Qwen36_35B_A3B_AntiLoop_StyleTune`, which it lacks today
   (`models/mod.rs:547-564`), so the model is addressable by name everywhere a preset
@@ -837,9 +854,9 @@ Each phase lands green on its own and is useful on its own.
 | 2 | **Engine core / attachments** (§3.2) | two substrates in one engine, each with persistence, reload, cancel, toggles and corrupt-turn policies; the one-writer rule enforced | unit: attaching a substrate whose timelines overlap an attached one's is refused, as are the same substrate twice and anything after the stop; two substrates' equal section ids never share scheduler state; a detached tenant's leftover requests are dropped and its slot ids reserved; cancel on one does not reach the other; a second writable open of a held substrate — in-process or from another process — is refused, and admitted once the holder shuts down. Probe: `kv_fragmentation` with two attachments — both stories pass, each store holds its own conversations and none of the other's, and the first serves a turn after the second detaches |
 | 3 | **Host + tenants, one server** (§3.1, §3.3, §3.4, §3.7) | the `host` crate; the common code of §3.7 moved into it; `zend`, `npcd` and `tokerad` built from the workspace, the first two running through `host::run([tenant])` on the host's `web::Builder` — tenant APIs merged, UIs by host name, `/common/` once | every existing zend and npcd test; the GUI harness; `cargo build -p zend`, `-p npcd`, `-p tokerad` each green alone; unit: a path two tenants register refuses to start; `/` serves zend's UI for `code.tokera.com` and a bare IP and npcd's for `bot.tokera.com`; a file rewritten in a content directory is served changed on the next request and changes `build`, with the process untouched; a missing content directory refuses to start; an npcd turn's thinking mode is the one npcd chose, under the core's `thinking(true)`; a live restart of each |
 | 4 | **Shared endpoints** (§3.5) | the overlaps served once as their superset; one identity rule, one role table, host accounts; both UIs on the chosen field meanings | unit per endpoint with raw expected bodies — both tenants' sections present, shared parts once, `timeline` a string, signed-out `/v1/me` a 200; `/ws/logs` neither drops nor repeats a line across replay; a header from a non-gateway peer is not believed. GUI: zend's status overlay, substrate page and perf page; npcd's console sign-in, substrate, tools and system pages |
-| 5 | **The prescribed model** (§5) | `host::MODEL` for every tenant; zend's ladder and `--model` removed; the fine-tune in `PRESETS` | unit: `MODEL` passes both tenants' capabilities; a capability `MODEL` lacks is refused with the tenant's name. Live: zend on a new substrate under the fine-tune — ingest rebuilds, chat works |
+| 5 | **The prescribed model** (§5) | `host::MODEL` for every tenant; zend's ladder and `--model` removed; the fine-tune in `PRESETS` | unit: `MODEL` passes both tenants' capabilities; a capability `MODEL` lacks is refused with the tenant's name. Live: zend on a new substrate under the prescribed model — ingest rebuilds, chat works |
 | 6 | **zend outranks npcd** (§3.6) | priority ordered tenant first, band second | unit: a zend `Low` sequence with work pauses an npcd `High` one, and the pause lifts at `COOLDOWN`; an npcd `High` decode does not pause or throttle a zend `Low` prompt; a zend decode throttles an npcd prompt by its band's ratio |
-| 7 | **`tokerad` on `.5`** | `tokerad` deployed: both daemons in one process on `:8081` / `:8444`; npcd's mind and data on `.5`; the gateway points `bot.tokera.com` at `:8444` beside `code.tokera.com`. npcd's substrate was written by the fine-tune, but under npcd alone, whose schema states no minimum YaRN factor; under `tokerad` the engine runs zend's (`rope: min_yarn_factor: 2`), so that substrate's key differs and it refuses (§4.1). Either npcd's mind states the same minimum — and its substrate is valid under both — or npcd starts `tokerad` on a new `--data` | live: both GUIs through the gateway, both on the LAN, a refused start when a substrate's model is swapped |
+| 7 | **`tokerad` on `.5`** | `tokerad` deployed: both daemons in one process on `:8081` / `:8444`; npcd's mind and data on `.5`; the gateway points `bot.tokera.com` at `:8444` beside `code.tokera.com`. npcd's substrate was written by the AntiLoop + StyleTune fine-tune, which the host no longer prescribes (§5.1), so it refuses at open, before anything in it is rewritten (§4.2), and npcd starts `tokerad` on a new `--data`. The new one must also be written under the engine's minimum YaRN factor — zend's `rope: min_yarn_factor: 2` — or it refuses the first time npcd runs beside zend (§4.1) | live: both GUIs through the gateway, both on the LAN, a refused start when a substrate's model is swapped |
 
 Phase 1 is worth doing first and on its own: it closes a live corruption path in both
 daemons regardless of whether the host is built.
@@ -852,6 +869,6 @@ daemons regardless of whether the host is built.
 | 2 | yes — `EngineCore` + attachments (`engine_attachments`), `EngineAttacher`, `persistence::writer_lock` released at shutdown, the process-wide timeline allocator, per-substrate cancel and toggles, `scheduler::{detached, section_pages}` | unit: every attach refusal (`engine_attachments`); a second writable open refused and a released one admitted (`persistence`); a cancel that does not cross substrates; a detached substrate's requests dropped and slots reserved (`scheduler::detached`); section pages shared by content and released by their last holder (`scheduler::section_pages`); probe: `kv_fragmentation::qwen36_35b_a3b_q4_two_attachments` (`fragmentation_probe::attached`) |
 | 3 | yes — `host/`, `tokerad/`, `zend::tenant`, `npcd::tenant` | `host` unit tests (site table, edit-on-disk, missing directory, path overlap including catch-alls and nests, build id, one-shot flags dropped on relaunch); the core's `thinking(true)` changes nothing for a tenant that set none (`models::builder::thinking_tests`, `engine_slot::core_requests`); `zend/tests/gui_api_harness.rs` over the assembled server; `cargo build -p zend`, `-p npcd`, `-p tokerad`; zend restarted live through `host::run` |
 | 4 | yes — `host::endpoints`, `web::Builder::trust`, `host::access`, both UIs on the chosen fields | unit per endpoint with exact bodies; `/ws/logs` neither drops nor repeats across replay (`endpoints::logs`); a header from a non-gateway peer cleared, in the server and in the assembled host (`web/tests/roles.rs`, `host::server`); `--local-signin` refused beside `--gateway` |
-| 5 | yes — `host::MODEL`; zend's ladder and `--model` gone | both tenants' `requires()` against `MODEL`; `Capabilities::check` naming every lack. The live half — zend on a new substrate under the fine-tune — waits for phase 7: the running zend is still the build before this one, on its Flash-Next substrate, which the new build refuses by design |
+| 5 | yes — `host::MODEL` (Flash-Next `Q4_KO` since 2026-10-11, §5.1); zend's ladder and `--model` gone | both tenants' `requires()` against `MODEL`; `Capabilities::check` naming every lack. Live: zend under Flash-Next, 2026-10-11, on the substrate it had run on — written before keys, admitted by §4.2's check, then adopted (`docs/replicated_substrate.md` §6.2) |
 | 6 | yes — `Priority { tenant, band }` | `scheduler::priority_pause` and `scheduler::prefill` unit tests, including a first tenant's section chunk outranking a second's dialogue |
 | 7 | no | deployment, done with the operator |

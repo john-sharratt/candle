@@ -34,11 +34,15 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use candle_conversation::models::identity::LegacySpec;
 use candle_conversation::persistence::record::{
     AuthoredBelief, AuthoredRelationship, AuthoredStrategy, Modulation, NpcPayload, RecordType,
 };
-use candle_conversation::persistence::{SharedSubstrate, SubstratePersistence, SUBSTRATE_DIR};
+use candle_conversation::persistence::{
+    Admit, SharedSubstrate, SubstratePersistence, SUBSTRATE_DIR,
+};
 use candle_conversation::substrate::Substrate;
+use host::MODEL;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -219,8 +223,16 @@ impl Npcs {
         let mut substrate = Substrate::new();
         let mut by_id: BTreeMap<u64, NpcPayload> = BTreeMap::new();
 
-        let persistence =
-            SubstratePersistence::open_in_with_substrate_and_sink(dir, &mut substrate, |entry| {
+        // Opened for the model this process runs, named by its spec: the pack
+        // that would give its key is resolved later, beside the engine, and a
+        // store that model would refuse is refused here before anything in it
+        // is rewritten.
+        let model = LegacySpec::of(&MODEL.spec());
+        let persistence = SubstratePersistence::open_in_with_substrate_and_sink(
+            dir,
+            &mut substrate,
+            Admit::Spec(&model),
+            |entry| {
                 if entry.record.header.record_type != RecordType::Npc {
                     return;
                 }
@@ -233,8 +245,9 @@ impl Npcs {
                     // character out of a thousand was written by a newer build.
                     Err(e) => tracing::warn!("skipping undecodable NPC record: {e}"),
                 }
-            })
-            .map_err(|e| NpcError::Persist(e.to_string()))?;
+            },
+        )
+        .map_err(|e| NpcError::Persist(e.to_string()))?;
 
         let live = by_id.values().filter(|n| !n.is_tombstoned()).count();
         tracing::info!(

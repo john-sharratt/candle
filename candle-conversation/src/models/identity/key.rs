@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
+use crate::models::ModelSpec;
+
 /// First line of a key record.
 const KEY_HEADER: &str = "candle-conversation model-key v1";
 
@@ -24,7 +26,9 @@ pub struct ModelKey {
     /// The repository the checkpoint was resolved from — a description, not
     /// identity: the same file from a mirror is the same model.
     pub repo: String,
-    /// The checkpoint's file name — a description, like `repo`.
+    /// The checkpoint's name — its GGUF `general.name` with `.gguf`, as the
+    /// builder names the spec once it has read the pack — a description, like
+    /// `repo`.
     pub file: String,
     /// The weights: [`super::WeightFiles::digest`] over every file the model
     /// is loaded from.
@@ -91,6 +95,18 @@ pub struct LegacySpec {
 }
 
 impl LegacySpec {
+    /// The model `spec` names, before its pack is read: the architecture by the
+    /// name a key records it under, and the spec's repository and file. The
+    /// file is the spec's, not the checkpoint's `general.name` a recorded model
+    /// holds — the builder takes that from the pack.
+    pub fn of(spec: &ModelSpec) -> Self {
+        Self {
+            arch: format!("{:?}", spec.arch),
+            model_repo: spec.model_repo.clone(),
+            model_filename: spec.model_filename.clone(),
+        }
+    }
+
     /// Whether `key` is the model this spec describes, as far as the spec can
     /// say: the same architecture, repository and checkpoint name. Revision,
     /// tensor overrides, adapters and gate donor were never recorded, so a
@@ -247,6 +263,8 @@ fn unhex(s: &str) -> Result<[u8; 32], String> {
 mod tests {
     use super::*;
 
+    use crate::models::Model;
+
     fn key() -> ModelKey {
         ModelKey {
             arch: "Qwen35Hybrid".into(),
@@ -309,6 +327,21 @@ mod tests {
         let mut other = key();
         other.file = "Qwen3.6-35B-A3B.gguf".into();
         assert!(!legacy.matches(&other));
+    }
+
+    /// A spec names its model by the arch's variant name, and the repository
+    /// and the file as the spec has them.
+    #[test]
+    fn a_spec_names_its_model_by_arch_repository_and_file() {
+        let spec = Model::Qwen2_0_5B.preset_spec();
+        assert_eq!(
+            LegacySpec::of(&spec),
+            LegacySpec {
+                arch: "Qwen2".into(),
+                model_repo: spec.model_repo.clone(),
+                model_filename: spec.model_filename.clone(),
+            }
+        );
     }
 
     #[test]

@@ -10,11 +10,11 @@
 use candle_conversation::models::{Model, ModelSpec};
 use serde::Serialize;
 
-/// The model every tenant runs: the AntiLoop + StyleTune fine-tune of
-/// Qwen3.6-35B-A3B — the AntiLoop trunk at Q4_K_M with StyleTune's
-/// `output.weight` and an MTP gate donor. 21.7 GB, so it runs on every card in
-/// the fleet: the expert cache streams what VRAM cannot hold.
-pub const MODEL: Model = Model::Qwen36_35B_A3B_AntiLoop_StyleTune;
+/// The model every tenant runs: Qwen3.8-Flash-Next with Q4_KO experts over a
+/// Q8_0 trunk — 250 B total, ~13 B active, its engine artifact prepared locally
+/// from the pinned upstream releases. It runs on every card in the fleet at this
+/// one quant: the expert cache streams what VRAM cannot hold.
+pub const MODEL: Model = Model::Qwen38_FlashNext_Q4KO;
 
 /// The model as `/v1/status` and `/v1/telemetry` name it.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -23,8 +23,9 @@ pub struct ModelView {
     pub name: String,
     /// The repository it is fetched from.
     pub repo: String,
-    /// The weights' size on disk, in bytes.
-    pub bytes: u64,
+    /// The weights' published size on disk, in bytes. `None` for an artifact
+    /// prepared locally from its sources, whose size nothing publishes.
+    pub bytes: Option<u64>,
 }
 
 impl ModelView {
@@ -38,7 +39,7 @@ impl ModelView {
         Self {
             name: spec.model_filename.clone(),
             repo: spec.model_repo.clone(),
-            bytes: spec.model_bytes,
+            bytes: (!spec.prepared_from_source).then_some(spec.model_bytes),
         }
     }
 }
@@ -49,16 +50,16 @@ mod tests {
 
     use candle_conversation::models::{DialectType, ModelArch};
 
-    /// The prescribed model is the hybrid lineage, speaks the Qwen3.5 dialect
-    /// both tenants' prompts are written in, and is a named preset.
+    /// The prescribed model is Flash-Next, speaks the Qwen3.5 dialect both
+    /// tenants' prompts are written in, and is a named preset.
     #[test]
-    fn the_prescribed_model_is_the_qwen35_hybrid_fine_tune() {
+    fn the_prescribed_model_is_flash_next_at_q4_ko() {
         let spec = MODEL.spec();
-        assert!(matches!(spec.arch, ModelArch::Qwen35Hybrid));
+        assert!(matches!(spec.arch, ModelArch::Qwen4Exp));
         assert!(matches!(spec.chat_format, DialectType::Qwen35));
         assert_eq!(
             MODEL.override_key().as_deref(),
-            Some("Qwen36_35B_A3B_AntiLoop_StyleTune")
+            Some("Qwen38_FlashNext_Q4KO")
         );
     }
 
@@ -66,6 +67,16 @@ mod tests {
     fn the_view_names_the_prescribed_checkpoint() {
         let v = ModelView::of_prescribed();
         assert_eq!(v.repo, MODEL.spec().model_repo);
-        assert!(v.bytes > 0);
+        assert_eq!(v.name, MODEL.spec().model_filename);
+    }
+
+    /// A published checkpoint states its size; an artifact prepared locally
+    /// states none rather than a zero.
+    #[test]
+    fn only_a_published_checkpoint_states_its_size() {
+        let published = ModelView::of(&Model::Qwen36_35B_A3B_AntiLoop_StyleTune.preset_spec());
+        assert_eq!(published.bytes, Some(21_713_463_520));
+        let prepared = ModelView::of(&Model::Qwen38_FlashNext_Q4KO.preset_spec());
+        assert_eq!(prepared.bytes, None);
     }
 }
