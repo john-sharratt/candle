@@ -38,7 +38,7 @@
 //! design is inert under it. That half is where the measured regression was.
 //!
 //! To exercise the whole pipeline, switch [`THINKING_MODEL`] to
-//! `Model::Qwen38_FlashNext_Q4KO`. It is the architecture the design targets —
+//! `Model::Qwen38_FlashNext`. It is the architecture the design targets —
 //! index pages, page cuts, the width-based seal — at the cost of a multi-minute
 //! load, which is why it is not the default.
 //!
@@ -70,7 +70,7 @@ use candle_conversation::{ConversationEngine, SamplingConfig, SequenceConfig};
 /// Qwen3-8B by default: it has single `<think>` / `</think>` tokens — the whole
 /// requirement for the span, layout and window assertions — and loads in
 /// seconds. It seals no index pages, so the page half of the design is inert
-/// under it; see the module docs. Switch to `Model::Qwen38_FlashNext_Q4KO` to
+/// under it; see the module docs. Switch to `Model::Qwen38_FlashNext` to
 /// cover that half too.
 const THINKING_MODEL: Model = Model::Qwen3_8B_Q4;
 
@@ -257,7 +257,7 @@ fn windowing_drops_exactly_the_span_or_nothing_at_all() {
                 // branch.
                 eprintln!(
                     "the turn injected whole — {} — so the windowing half of this \
-                     test is inert; run it against Model::Qwen38_FlashNext_Q4KO to cover it",
+                     test is inert; run it against Model::Qwen38_FlashNext to cover it",
                     if kept_pages.is_none() {
                         "this model seals no index pages"
                     } else {

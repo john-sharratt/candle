@@ -220,7 +220,8 @@ mod tests {
         let t = Telemetry::new(view());
         let json = serde_json::to_value(t.read()).unwrap();
         assert_eq!(json["model"]["repo"], view().repo);
-        assert!(json["model"]["bytes"].as_u64().unwrap() > 0);
+        assert_eq!(json["model"]["name"], view().name);
+        assert_eq!(json["model"]["bytes"].as_u64(), Some(view().bytes));
     }
 
     /// Uptime is the one thing that is always true, and it has to move.

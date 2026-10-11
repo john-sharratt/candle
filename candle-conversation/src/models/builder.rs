@@ -31,6 +31,7 @@ use candle_transformers::models::model_pack::keys::TOKENIZER_JSON;
 #[cfg(feature = "hub")]
 use candle_transformers::models::model_pack::HubFetch;
 use candle_transformers::models::model_pack::{ModelPack, SourceFetch};
+use candle_transformers::models::quantized_qwen38_moe::engine_model_digest;
 use candle_transformers::models::selection_strata::StrataTokens;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -977,12 +978,18 @@ impl ModelBuilder {
                     weights.pack.display()
                 ))
             })?;
-        let digest = weights.digest().map_err(|e| {
-            ConversationError::Other(format!(
-                "identify the weights at {}: {e}",
-                weights.pack.display()
-            ))
-        })?;
+        // A prepared model is the release its artifact is built from, at
+        // whichever rung this card built it: every rung of it is one model.
+        let digest = if self.spec.prepared_from_source {
+            engine_model_digest()
+        } else {
+            weights.digest().map_err(|e| {
+                ConversationError::Other(format!(
+                    "identify the weights at {}: {e}",
+                    weights.pack.display()
+                ))
+            })?
+        };
         ModelIdentity::new(
             format!("{:?}", self.spec.arch),
             self.spec.model_repo.clone(),
@@ -2004,6 +2011,7 @@ mod identity_tests {
     use candle::quantized::gguf_file::Value;
     use candle_transformers::models::model_pack::keys::TOKENIZER_JSON;
     use candle_transformers::models::model_pack::SourceRecord;
+    use candle_transformers::models::quantized_qwen38_moe::engine_model_digest;
 
     use crate::error::ConversationError;
     use crate::models::identity::{write_pack_header, WeightFiles};
@@ -2098,6 +2106,35 @@ mod identity_tests {
             .bind_substrate(&first)
             .expect("the model that wrote the substrate still opens it");
         assert_eq!(reopened.model_key(), first.key());
+    }
+
+    /// **Flash-Next is one model at every rung.** Two cards build packs from
+    /// different artifacts — another expert width, another file — and each names
+    /// the release, so a substrate written on one opens on the other.
+    #[test]
+    fn every_flash_next_rung_opens_the_same_substrate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let q3 = dir.path().join("q3.pack.gguf");
+        let q4 = dir.path().join("q4.pack.gguf");
+        pack(&q3, 'a', Some(TOKENIZER));
+        pack(&q4, 'b', Some(TOKENIZER));
+        let workspace = dir.path().join("workspace");
+        let builder = Model::Qwen38_FlashNext.builder().workspace_path(&workspace);
+
+        let small = builder.model_identity(&WeightFiles::single(&q3)).unwrap();
+        let large = builder.model_identity(&WeightFiles::single(&q4)).unwrap();
+        assert_eq!(small.key(), large.key());
+        assert_eq!(small.key().weights, engine_model_digest());
+
+        drop(
+            builder
+                .bind_substrate(&small)
+                .expect("a new substrate binds"),
+        );
+        let reopened = builder
+            .bind_substrate(&large)
+            .expect("the other rung opens the substrate");
+        assert_eq!(reopened.model_key(), small.key());
     }
 }
 

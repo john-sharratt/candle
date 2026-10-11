@@ -52,7 +52,7 @@ mod arms {
     fn flash_next_selected() {
         run_arm(&Arm {
             name: "flash_next_selected",
-            model: Model::Qwen38_FlashNext_Q4KO,
+            model: Model::Qwen38_FlashNext,
             workspace: FLASH_NEXT_WS,
             qsa_selection_budget: None,
         });
@@ -64,7 +64,7 @@ mod arms {
     fn flash_next_dense() {
         run_arm(&Arm {
             name: "flash_next_dense",
-            model: Model::Qwen38_FlashNext_Q4KO,
+            model: Model::Qwen38_FlashNext,
             workspace: FLASH_NEXT_WS,
             qsa_selection_budget: Some(DENSE_BUDGET),
         });

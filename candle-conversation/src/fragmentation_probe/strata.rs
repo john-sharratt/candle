@@ -432,7 +432,7 @@ mod tests {
     /// the repeat penalty; the rest are layered on so each lever is seen cleared.
     #[test]
     fn strata_sampling_is_the_raw_argmax() {
-        let mut config = Model::Qwen38_FlashNext_Q4KO.conversation_config();
+        let mut config = Model::Qwen38_FlashNext.conversation_config();
         assert_eq!(config.sampling.repeat_penalty, 1.1, "the shipped row");
         config.sampling = config
             .sampling

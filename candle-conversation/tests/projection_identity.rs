@@ -77,22 +77,16 @@ use candle_conversation::{
     models::{Model, ModelBuilder},
     ConversationEngine, SamplingConfig, SequenceConfig,
 };
-use candle_transformers::models::quant_ladder;
 use tempfile::TempDir;
 
 /// The stack whose projection this exercises: gated DeltaNet + QSA index, the
 /// only lineage that carries per-position state a projection has to move.
 /// A dense model would pass this test without touching any of it.
 ///
-/// The Flash-Next preset of this card's rung: every machine holds only its own
-/// rung's engine pack, built from the artifact the forward gate prepares, and
-/// carrying the tokenizer the gate verified against it.
+/// Flash-Next, at this card's rung: the engine pack built from the artifact the
+/// forward gate prepares, carrying the tokenizer the gate verified against it.
 fn test_model() -> Model {
-    let device = Device::new_cuda(0).expect("CUDA device");
-    let gib = quant_ladder::device_vram_gib(&device).expect("the card's VRAM");
-    let experts = quant_ladder::expert_format(gib);
-    Model::qwen38_flash_next_for(experts)
-        .unwrap_or_else(|| panic!("a {gib} GiB card's rung ({experts:?}) has no Flash-Next preset"))
+    Model::Qwen38_FlashNext
 }
 
 /// Argmax and a fixed seed: the comparison is token-for-token, so any sampling

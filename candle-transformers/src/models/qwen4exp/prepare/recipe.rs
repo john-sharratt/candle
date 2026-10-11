@@ -136,6 +136,39 @@ impl Recipe {
         hex(&Sha256::digest(self.canonical().as_bytes()))
     }
 
+    /// The model the artifact holds, whatever its quantization: SHA-256 over
+    /// the tag `model v1\0` and the canonical lines of its trunk and draft-head
+    /// sources, the published weights every rung is built from. The expert
+    /// width, where the expert bytes come from and the converter are left out,
+    /// so every rung of one release names the same model while another release
+    /// — a new pin, another file — names another.
+    pub fn model_digest(&self) -> [u8; 32] {
+        let mut sources: Vec<&SourceFile> = self
+            .sources
+            .iter()
+            .filter(|s| matches!(s.role, SourceRole::Trunk | SourceRole::DraftHead))
+            .collect();
+        sources
+            .sort_by(|a, b| (a.role.name(), a.repo, a.path).cmp(&(b.role.name(), b.repo, b.path)));
+        let mut h = Sha256::new();
+        h.update(b"model v1\0");
+        for s in sources {
+            h.update(
+                format!(
+                    "source={} {}@{} {} {} {}\n",
+                    s.role.name(),
+                    s.repo,
+                    s.revision,
+                    s.path,
+                    s.bytes,
+                    s.sha256
+                )
+                .as_bytes(),
+            );
+        }
+        h.finalize().into()
+    }
+
     /// The artifact's filename: the expert width, then the digest's tag.
     pub fn artifact_name(&self) -> String {
         format!(
@@ -278,6 +311,55 @@ mod tests {
             v(&mut r);
             assert_ne!(r.digest(), base, "variant {i} left the digest unchanged");
         }
+    }
+
+    /// The model digest is pinned, and it is the release's, not the rung's: the
+    /// expert width, the expert source, the converter and an expert-import file
+    /// leave it alone, while any trunk or draft-head source moves it.
+    #[test]
+    fn the_model_digest_is_the_releases_not_the_rungs() {
+        let base = fixture().model_digest();
+        assert_eq!(
+            hex(&base),
+            "bd735648ef02c43a360ad4e17b1a69447b1f5f92d752d55bfd77696703dd718e"
+        );
+        let same: [fn(&mut Recipe); 5] = [
+            |r| r.experts = GgmlDType::Q4_KO,
+            |r| r.head_experts = GgmlDType::Q4_KO,
+            |r| r.expert_source = ExpertSource::AwqImport,
+            |r| r.converter_version = 2,
+            |r| {
+                r.sources.push(SourceFile {
+                    role: SourceRole::ExpertImport,
+                    repo: "org/awq",
+                    revision: "def",
+                    path: "model-00002.safetensors",
+                    bytes: 9,
+                    sha256: "44",
+                })
+            },
+        ];
+        for (i, v) in same.iter().enumerate() {
+            let mut r = fixture();
+            v(&mut r);
+            assert_eq!(r.model_digest(), base, "variant {i} moved the model digest");
+        }
+        let other: [fn(&mut Recipe); 4] = [
+            |r| r.sources[0].sha256 = "12",
+            |r| r.sources[1].revision = "abd",
+            |r| r.sources[2].path = "Q8_0/c.gguf",
+            |r| {
+                r.sources.pop();
+            },
+        ];
+        for (i, v) in other.iter().enumerate() {
+            let mut r = fixture();
+            v(&mut r);
+            assert_ne!(r.model_digest(), base, "variant {i} left the model digest");
+        }
+        let mut reordered = fixture();
+        reordered.sources.reverse();
+        assert_eq!(reordered.model_digest(), base);
     }
 
     #[test]

@@ -10,11 +10,12 @@
 use candle_conversation::models::{Model, ModelSpec};
 use serde::Serialize;
 
-/// The model every tenant runs: the AntiLoop + StyleTune fine-tune of
-/// Qwen3.6-35B-A3B — the AntiLoop trunk at Q4_K_M with StyleTune's
-/// `output.weight` and an MTP gate donor. 21.7 GB, so it runs on every card in
-/// the fleet: the expert cache streams what VRAM cannot hold.
-pub const MODEL: Model = Model::Qwen36_35B_A3B_AntiLoop_StyleTune;
+/// The model every tenant runs: Qwen3.8-Flash-Next — a `Q8_0` trunk with the
+/// routed experts at the card's rung (`Q3_KO` under 64 GiB, `Q4_KO` above). It
+/// runs on every card in the fleet: the expert cache streams what VRAM cannot
+/// hold, and every rung is the same model, so a substrate written on one card
+/// opens on another.
+pub const MODEL: Model = Model::Qwen38_FlashNext;
 
 /// The model as `/v1/status` and `/v1/telemetry` name it.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -23,7 +24,8 @@ pub struct ModelView {
     pub name: String,
     /// The repository it is fetched from.
     pub repo: String,
-    /// The weights' size on disk, in bytes.
+    /// The weights' published size on disk, in bytes — `0` for a model built
+    /// on this machine, which has no published length.
     pub bytes: u64,
 }
 
@@ -49,23 +51,22 @@ mod tests {
 
     use candle_conversation::models::{DialectType, ModelArch};
 
-    /// The prescribed model is the hybrid lineage, speaks the Qwen3.5 dialect
-    /// both tenants' prompts are written in, and is a named preset.
+    /// The prescribed model is Flash-Next, speaks the Qwen3.5 dialect both
+    /// tenants' prompts are written in, and is a named preset.
     #[test]
-    fn the_prescribed_model_is_the_qwen35_hybrid_fine_tune() {
+    fn the_prescribed_model_is_flash_next() {
         let spec = MODEL.spec();
-        assert!(matches!(spec.arch, ModelArch::Qwen35Hybrid));
+        assert!(matches!(spec.arch, ModelArch::Qwen4Exp));
         assert!(matches!(spec.chat_format, DialectType::Qwen35));
-        assert_eq!(
-            MODEL.override_key().as_deref(),
-            Some("Qwen36_35B_A3B_AntiLoop_StyleTune")
-        );
+        assert_eq!(MODEL.override_key().as_deref(), Some("Qwen38_FlashNext"));
     }
 
     #[test]
     fn the_view_names_the_prescribed_checkpoint() {
         let v = ModelView::of_prescribed();
-        assert_eq!(v.repo, MODEL.spec().model_repo);
-        assert!(v.bytes > 0);
+        let spec = MODEL.spec();
+        assert_eq!(v.repo, spec.model_repo);
+        assert_eq!(v.name, spec.model_filename);
+        assert_eq!(v.bytes, spec.model_bytes);
     }
 }

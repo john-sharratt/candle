@@ -1,41 +1,27 @@
 //! The model npcd runs, as its console describes it.
 //!
 //! The model itself is the host's to name — one prescribed model for every
-//! tenant of the process ([`host::MODEL`], `docs/shared_model_host.md` §5). It
-//! is the one npcd chose before there was a host: **a hybrid of two
-//! Qwen3.6-35B-A3B fine-tunes**: AntiLoop's weights —
-//! a tune trained against the repetition loops a cast falls into — under
-//! StyleTune's output head, which is where that tune's prose lives. It is the
-//! routed member of the hybrid lineage, 35 B total with about 3 B active per
-//! token: gated-DeltaNet layers carrying a recurrent state, attention layers
-//! carrying paged K/V, and 256 experts behind the three-tier expert cache. See
-//! `Model::Qwen36_35B_A3B_AntiLoop_StyleTune` for how the two files make one
-//! model.
+//! tenant of the process ([`host::MODEL`], `docs/shared_model_host.md` §5):
+//! **Qwen3.8-Flash-Next**, 250 B total with about 13 B active per token —
+//! gated-DeltaNet layers carrying a recurrent state, attention layers carrying
+//! paged K/V, and routed experts behind the three-tier expert cache. See
+//! `Model::Qwen38_FlashNext`.
 //!
 //! # What a routed model costs this daemon
 //!
 //! A routed model amortises expert loads across a wave of sessions stepping
 //! through layers together, and a cast on different concerns reaching different
-//! experts is where that amortisation is weakest. Measured on a 24 GB card the
-//! stock 3.6 at Q4 still prefilled faster than the dense 9B and decoded a single
-//! session at about three quarters of its rate, with every gate row valid — and
-//! it is by a distance the stronger model.
+//! experts is where that amortisation is weakest. The price is KV room: the
+//! expert working set takes most of a small card, with the expert cache paging
+//! the rest from host RAM and the model pack, and a resident cast's histories
+//! are what fill what is left. [`Model::Qwen35_9B_Q6`] stays in the registry for
+//! a cast large enough that the room matters more than the model.
 //!
-//! The price is KV room. The weights take most of a small card, with the expert
-//! cache paging the rest from host RAM, so a 24 GB card holds about a third of
-//! the KV regions the dense 9B at Q6_K leaves — and a resident cast's histories
-//! are what fill them. [`Model::Qwen35_9B_Q6`] stays in the registry for a cast
-//! large enough that the room matters more than the model.
+//! # The card's rung
 //!
-//! # One quant on every card
-//!
-//! Q4_K_M, whatever the card: the hybrid is assembled from two conversions at
-//! that quant, and one checkpoint everywhere keeps the KV threshold row and the
-//! C-ladder calibration the same on every machine. The int8 path is the
-//! builder's routed-arm choice, `Int8Mode::auto` — Precision on any int8-MMA
-//! card. On a 24 GB 3090 the hybrid passed every row of its forwarding gate
-//! there, and Precision was preferred over the faster Performance twin for its
-//! accuracy.
+//! The trunk is `Q8_0` on every card; the routed experts are at the card's rung
+//! — `Q3_KO` under 64 GiB, `Q4_KO` above. Every rung is the same release, so a
+//! substrate written on one card opens on another.
 
 use host::MODEL;
 
@@ -57,8 +43,9 @@ pub struct ModelSpec {
     pub name: &'static str,
     pub quant: &'static str,
     pub params_total: &'static str,
-    /// The parameters a token actually passes through — about 3 B of the 35 B,
-    /// which is what the console's two figures side by side say at a glance.
+    /// The parameters a token actually passes through — about 13 B of the
+    /// 250 B, which is what the console's two figures side by side say at a
+    /// glance.
     pub params_active: &'static str,
     pub repo: &'static str,
     pub filename: &'static str,
@@ -106,8 +93,8 @@ pub fn spec() -> ModelSpec {
     ModelSpec {
         name: Box::leak(name.into_boxed_str()),
         quant: quant_of(filename),
-        params_total: "35B",
-        params_active: "3B",
+        params_total: "250B",
+        params_active: "13B",
         repo: Box::leak(s.model_repo.into_boxed_str()),
         filename,
         bytes: s.model_bytes,
@@ -119,32 +106,26 @@ mod tests {
     use super::*;
     use candle_conversation::models::ModelArch;
 
-    /// **The routed hybrid arch.**
-    ///
-    /// The two loaders each refuse the other's checkpoint — a routed file loaded
-    /// through the dense path has no expert cache to stand up, and a dense one
-    /// through the routed path stands one up over weights that have none. The
-    /// arch is what routes the load, so it is asserted rather than assumed.
+    /// **Flash-Next's arch.** The arch is what routes the load — each loader
+    /// refuses the others' checkpoints — so it is asserted rather than assumed.
     #[test]
-    fn npcd_runs_the_routed_member_of_the_lineage() {
+    fn npcd_runs_flash_next() {
         assert!(
-            matches!(MODEL.spec().arch, ModelArch::Qwen35Hybrid),
-            "arch {:?} routes to a loader that refuses a routed checkpoint",
+            matches!(MODEL.spec().arch, ModelArch::Qwen4Exp),
+            "arch {:?} routes to a loader that refuses Flash-Next's pack",
             MODEL.spec().arch
         );
     }
 
-    /// **The hybrid, locked on Q4_K_M.** The preset rather than the resolved spec, because an
-    /// override is entitled to change the file — what is asserted is what the repository ships.
+    /// **Prepared on this machine, at the card's rung.** The preset names the
+    /// release, not a rung, so its file name carries no quant the console could
+    /// claim.
     #[test]
-    fn the_preset_is_the_hybrid_at_q4_k_m() {
+    fn the_preset_is_prepared_and_names_no_rung() {
         let s = MODEL.preset_spec();
-        assert_eq!(quant_of(&s.model_filename), "Q4_K_M");
-        assert_eq!(s.tensor_overrides.len(), 1, "one tensor from a second file");
-        let head = &s.tensor_overrides[0];
-        assert_eq!(head.tensor, "output.weight");
-        assert_eq!(quant_of(&head.filename), "Q4_K_M");
-        assert_ne!(head.repo, s.model_repo, "the head is another checkpoint's");
+        assert!(s.prepared_from_source);
+        assert_eq!(quant_of(&s.model_filename), "?");
+        assert!(s.tensor_overrides.is_empty());
     }
 
     /// **The console's figures come from the resolved spec, override and all.**
@@ -229,12 +210,12 @@ mod tests {
     ///
     /// The override file deliberately cannot reach `arch`, and this is the
     /// consequence worth asserting: whatever checkpoint a deployment substitutes
-    /// still loads through the routed hybrid path. A file that could swap the
+    /// still loads through Flash-Next's path. A file that could swap the
     /// architecture would let a local edit route npcd into a loader that refuses
     /// its checkpoint, with nothing in the repository changed to explain it.
     #[test]
-    fn an_override_cannot_move_npcd_off_the_routed_arch() {
-        assert!(matches!(MODEL.spec().arch, ModelArch::Qwen35Hybrid));
+    fn an_override_cannot_move_npcd_off_the_arch() {
+        assert!(matches!(MODEL.spec().arch, ModelArch::Qwen4Exp));
         assert_eq!(MODEL.spec().arch, MODEL.preset_spec().arch);
     }
 

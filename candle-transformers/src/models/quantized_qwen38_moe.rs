@@ -214,6 +214,14 @@ pub fn engine_recipe_at(experts: Option<GgmlDType>) -> Recipe {
     }
 }
 
+/// The model every rung's engine artifact holds, whatever its expert width:
+/// the release's trunk and draft-head sources ([`Recipe::model_digest`]). What
+/// names Flash-Next to a substrate, so one written under one rung opens under
+/// another.
+pub fn engine_model_digest() -> [u8; 32] {
+    engine_recipe_at(None).model_digest()
+}
+
 /// Where engine artifacts are prepared, and their packs live: the model cache,
 /// under this repo's folder.
 pub fn engine_artifact_dir() -> PathBuf {
