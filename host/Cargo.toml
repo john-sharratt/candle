@@ -1,0 +1,49 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition = "2021"
+description = "The process a daemon runs in: one model, one engine, one HTTP server, its tenants beside each other"
+
+[lib]
+name = "host"
+path = "src/lib.rs"
+
+# Depends on neither daemon: `zend` and `npcd` each depend on this, and only
+# `tokerad` links both (`docs/shared_model_host.md` §3.7).
+[dependencies]
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+tracing    = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures    = { workspace = true }
+
+# The same axum `web` builds its router from, so the routers unify.
+axum       = { version = "0.7", features = ["macros", "ws"] }
+tokio      = { version = "1", features = ["full"] }
+sha2       = "0.10"
+# The model download (`download`).
+reqwest    = { version = "0.12", features = ["stream"] }
+sysinfo    = { version = "0.31", default-features = false, features = ["system"] }
+# Card readings for `/v1/telemetry`: a runtime link against the installed
+# driver — see `telemetry::device`.
+nvml-wrapper = "0.12"
+
+web                 = { path = "../web" }
+candle              = { workspace = true, features = ["cuda"] }
+candle-conversation = { path = "../candle-conversation", features = ["hub"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower    = { version = "0.5" }
+tokio    = { version = "1", features = ["full", "test-util"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+[features]
+default = []
+# Zero-cost scoped timing of the hot path; `/v1/profile` reports whether it
+# was built in.
+profile = ["candle-conversation/profile"]

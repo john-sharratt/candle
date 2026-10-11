@@ -86,7 +86,14 @@ pub const MAX_HEADER_LINE: usize = ALIGN - 1;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordType {
-    ModelSpec = 1,
+    /// The model the substrate is bound to — a `ModelKey`, or on a substrate
+    /// written before keys the spec text that preceded it
+    /// (`crate::models::identity::RecordedModel`). A workspace singleton.
+    ///
+    /// The wire name is the one the spec record was written under, so an older
+    /// log's record decodes as this type and is checked, not skipped.
+    #[serde(rename = "model_spec")]
+    ModelKey = 1,
     Template = 2,
     StreamDecl = 3,
     Chunk = 4,
@@ -306,7 +313,7 @@ impl RecordType {
     /// the JSON header's `#[serde(other)]`.
     pub fn from_tag(tag: u8) -> RecordType {
         match tag {
-            1 => RecordType::ModelSpec,
+            1 => RecordType::ModelKey,
             2 => RecordType::Template,
             3 => RecordType::StreamDecl,
             4 => RecordType::Chunk,
@@ -2523,6 +2530,25 @@ mod tests {
         assert_eq!(back2.record_type, RecordType::DebugId);
     }
 
+    /// The model record keeps the wire name the spec record had, so a header
+    /// written before model keys decodes as `ModelKey` rather than `Unknown`.
+    #[test]
+    fn the_model_record_is_named_model_spec_on_the_wire() {
+        let h = RecordHeader {
+            record_type: RecordType::ModelKey,
+            format: 0,
+            payload_len: 0,
+            crc: 0,
+            stream_id: 0,
+            chunk_index: 0,
+            token_count: 0,
+        };
+        let js = serde_json::to_string(&h).unwrap();
+        assert!(js.contains(r#""type":"model_spec""#), "{js}");
+        let older: RecordHeader = serde_json::from_str(&js).unwrap();
+        assert_eq!(older.record_type, RecordType::ModelKey);
+    }
+
     #[test]
     fn padded_len_rounds_to_4k() {
         // Header line of 100 bytes + 1 newline + 0 payload = 101 → 4096.
@@ -2790,7 +2816,7 @@ mod tests {
     #[test]
     fn record_type_tags_round_trip_with_pinned_values() {
         let pinned: [(RecordType, u8); 18] = [
-            (RecordType::ModelSpec, 1),
+            (RecordType::ModelKey, 1),
             (RecordType::Template, 2),
             (RecordType::StreamDecl, 3),
             (RecordType::Chunk, 4),

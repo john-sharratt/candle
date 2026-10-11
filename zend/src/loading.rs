@@ -70,6 +70,21 @@ impl LoadStep {
         LoadStep::Preloading,
     ];
 
+    /// The step's id on the wire — what a page keys on.
+    pub fn id(self) -> &'static str {
+        match self {
+            LoadStep::Model => "model",
+            LoadStep::Substrate => "substrate",
+            LoadStep::Compacting => "compacting",
+            LoadStep::Sections => "sections",
+            LoadStep::CalibratingSections => "calibrating_sections",
+            LoadStep::SelfCheck => "self_check",
+            LoadStep::Priming => "priming",
+            LoadStep::Normalizing => "normalizing",
+            LoadStep::Preloading => "preloading",
+        }
+    }
+
     /// Human-readable label rendered in the loading overlay.
     pub fn label(self) -> &'static str {
         match self {
@@ -124,12 +139,19 @@ pub struct LoadingSnapshot {
     pub progressed: u64,
     pub total: u64,
     pub unit: String,
+    /// Milliseconds since the load began — across every step, not the
+    /// current one.
+    pub elapsed_ms: u64,
+    /// Tokens prefilled during the current step.
+    pub prefill_tokens: u64,
 }
 
 /// Shared, mutable load-progress state. `None`-snapshot means the daemon
 /// is fully ready and the frontend should show the chat view.
 pub struct LoadProgress {
     inner: Mutex<Inner>,
+    /// When the load began.
+    began: Instant,
 }
 
 enum Inner {
@@ -186,6 +208,7 @@ impl LoadProgress {
                 prefill_tokens: 0,
                 started: Instant::now(),
             }),
+            began: Instant::now(),
         }
     }
 
@@ -197,6 +220,7 @@ impl LoadProgress {
                 progressed,
                 total,
                 unit,
+                prefill_tokens,
                 ..
             } => {
                 let progress = if *total > 0 {
@@ -216,6 +240,8 @@ impl LoadProgress {
                     progressed: *progressed,
                     total: *total,
                     unit: unit.clone(),
+                    elapsed_ms: self.began.elapsed().as_millis() as u64,
+                    prefill_tokens: *prefill_tokens,
                 })
             }
             Inner::Ready => None,
@@ -436,5 +462,37 @@ mod tests {
         p.set_step(LoadStep::Substrate);
         p.set_step_progress(40, 100);
         assert_eq!(p.snapshot().unwrap().unit, "turns");
+    }
+
+    /// Prefilled tokens count within a step and reset with it.
+    #[test]
+    fn prefill_tokens_count_within_a_step() {
+        let p = LoadProgress::new();
+        p.set_step(LoadStep::Priming);
+        p.add_prefill_tokens(300);
+        p.add_prefill_tokens(200);
+        assert_eq!(p.snapshot().unwrap().prefill_tokens, 500);
+        p.set_step(LoadStep::Normalizing);
+        assert_eq!(p.snapshot().unwrap().prefill_tokens, 0);
+    }
+
+    /// Every step has its own id, in the snake case a page keys on.
+    #[test]
+    fn every_step_has_a_distinct_id() {
+        let ids: Vec<&str> = LoadStep::ALL.iter().map(|s| s.id()).collect();
+        assert_eq!(
+            ids,
+            [
+                "model",
+                "substrate",
+                "compacting",
+                "sections",
+                "calibrating_sections",
+                "self_check",
+                "priming",
+                "normalizing",
+                "preloading",
+            ]
+        );
     }
 }

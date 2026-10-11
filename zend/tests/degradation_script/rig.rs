@@ -9,8 +9,7 @@ use candle_conversation::{Role as TurnRole, SelectionState};
 use futures::StreamExt;
 use tracing_subscriber::EnvFilter;
 use zend::api::chat::{apply_tools_dial, dial_selection};
-use zend::config::{DaemonConfig, ModelChoice};
-use zend::log_broadcast::LogBus;
+use zend::config::DaemonConfig;
 use zend::session::{StreamItem, ZendSession};
 use zend::types::{ChatMessage, Role, ToolMode};
 
@@ -111,8 +110,7 @@ async fn converse(arm: &Arm) -> Vec<(String, Verdict)> {
     let ws = workspace(arm);
     let config = DaemonConfig {
         compact_substrate: needs_compaction(&ws),
-        port: 0,
-        model: ModelChoice::Preset(Box::new(arm.model.clone())),
+        model: arm.model.clone(),
         disabled_layers: ["repo_map", "code_reading"]
             .iter()
             .map(|s| s.to_string())
@@ -120,7 +118,7 @@ async fn converse(arm: &Arm) -> Vec<(String, Verdict)> {
         qsa_selection_budget: arm.qsa_selection_budget,
         ..DaemonConfig::new(served(&ws))
     };
-    let session = Arc::new(ZendSession::new(config, LogBus::new()));
+    let session = Arc::new(ZendSession::new(config));
     session.start_loading();
     session.wait_ready().await;
 

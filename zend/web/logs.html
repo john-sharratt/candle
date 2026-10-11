@@ -152,6 +152,10 @@ mount(document.getElementById('bar'),
 
 subscribe('/ws/logs', {
   onMessage: (line) => {
+    // The host's one stream carries every tenant's lines, each naming its
+    // tenant; this pane is zend's, so it shows zend's and the engine's, which
+    // name none.
+    if (line && line.tenant && line.tenant !== 'zend') return;
     if (paused) {
       held.push(line);
       // The hold is bounded by the same cap as the buffer: a pause left running

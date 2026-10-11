@@ -6,9 +6,9 @@
  * is followed only while the reader is already at the bottom. */
 
 import { API } from '../lib/api.js';
-import { h, mount } from '../lib/dom.js';
-import { ringView } from '../lib/live.js';
-import { copyText } from '../lib/clip.js';
+import { h, mount } from '/common/lib/dom.js';
+import { ringView } from '/common/lib/live.js';
+import { copyText } from '/common/lib/clip.js';
 
 const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'];
 const COLOR = {

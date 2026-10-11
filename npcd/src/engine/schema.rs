@@ -34,10 +34,11 @@
 //! the kind of divergence that shows up as a layer that gathers on some
 //! documents and not others.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use candle_conversation::models::DialectType;
-use candle_conversation::projection::{Builder, GroupId, LayerId};
+use candle_conversation::projection::{Builder, CorruptTurnPolicy, GroupId, LayerId};
 
 use crate::engine::dreams;
 
@@ -339,6 +340,21 @@ pub fn document_target(builder: &Builder, name: &str) -> Option<(LayerId, GroupI
     }
 }
 
+/// Each layer's corrupt-turn policy, as the schema declares it.
+///
+/// The engine applies these during its startup reload, so they are handed to it
+/// before it is built. Without them every layer runs the engine's default,
+/// `DropConversation`: one unrecoverable turn then tombstones a character's whole
+/// timeline on a layer whose author asked for `drop_turn`.
+pub fn corrupt_turn_policies(builder: &Builder) -> HashMap<LayerId, CorruptTurnPolicy> {
+    builder
+        .schema()
+        .layers
+        .iter()
+        .map(|l| (l.id, l.on_corrupt_turn))
+        .collect()
+}
+
 /// Everything in the system prompt before the first collection.
 ///
 /// The static prelude. What follows a collection is expanded at projection time
@@ -475,6 +491,37 @@ mod tests {
     #[test]
     fn no_mind_means_no_projection() {
         assert!(build(None, "world").is_none());
+    }
+
+    /// The bundled mind asks for `drop_turn` on its three conversation layers and
+    /// leaves the rest at the default, and that is what reaches the engine.
+    #[test]
+    fn the_bundled_minds_corrupt_turn_policies_are_its_own() {
+        let mind = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let projection = build(Some(mind), "world").expect("the bundled mind parses");
+        let policies = corrupt_turn_policies(&projection.builder);
+        let by_name: HashMap<&str, CorruptTurnPolicy> = projection
+            .builder
+            .schema()
+            .layers
+            .iter()
+            .map(|l| (l.name.as_str(), policies[&l.id]))
+            .collect();
+        let mut expected: HashMap<&str, CorruptTurnPolicy> = [
+            "memory",
+            "world",
+            "environment",
+            "agency",
+            "relationships",
+            "beliefs",
+        ]
+        .into_iter()
+        .map(|n| (n, CorruptTurnPolicy::DropConversation))
+        .collect();
+        for n in ["perception", "action", "interaction"] {
+            expected.insert(n, CorruptTurnPolicy::DropTurn);
+        }
+        assert_eq!(by_name, expected);
     }
 
     /// **The frame covers what is installed after the YAML is read**, which is

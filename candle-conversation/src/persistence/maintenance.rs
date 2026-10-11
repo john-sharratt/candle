@@ -42,7 +42,7 @@
 //! ## Why relocation is safe (no resurrection, no lost metadata)
 //!
 //! Records fall into two classes. **Read-back** records (`Chunk`, `Tokens`,
-//! `ModelSpec`/`Template`/`Tokenizer`) are indexed by `(segment, offset)`; a
+//! `ModelKey`/`Template`/`Tokenizer`) are indexed by `(segment, offset)`; a
 //! relocation re-appends them to the active and repoints the in-RAM index. Their
 //! per-segment live set is [`SubstratePersistence::segment_liveness`], with the
 //! same distill/tombstone filter [`super::compaction::collect_live_records`]
@@ -152,7 +152,7 @@ pub fn pick_maintenance_op(stats: &[SegmentStat], force: bool) -> Option<Mainten
         return Some(MaintenanceOp::Drop(s.id));
     }
     // 2. Compact the deadest segment past the ratio + settle thresholds. When
-    //    `force` is set (the manual `POST /v1/debug/maintenance` trigger) the age
+    //    `force` is set (the manual `POST /v1/substrate/zend/maintenance` trigger) the age
     //    and ratio gates are waived — any segment carrying *some* dead weight
     //    qualifies — so a just-sealed segment holding a freshly-archived
     //    conversation's now-dead records is compacted immediately.
@@ -1659,7 +1659,7 @@ impl SubstratePersistence {
         }
         let mut singletons: Vec<(RecordType, RecordLoc)> = Vec::new();
         for (rt, loc) in [
-            (RecordType::ModelSpec, self.manifest.model_spec),
+            (RecordType::ModelKey, self.manifest.model_key),
             (RecordType::Template, self.manifest.template),
             (RecordType::Tokenizer, self.manifest.tokenizer),
         ] {
@@ -1754,7 +1754,7 @@ impl SubstratePersistence {
 
         let mut live: Vec<CountedRecord> = Vec::new();
         for (rt, loc) in [
-            (RecordType::ModelSpec, self.manifest.model_spec),
+            (RecordType::ModelKey, self.manifest.model_key),
             (RecordType::Template, self.manifest.template),
             (RecordType::Tokenizer, self.manifest.tokenizer),
         ] {
@@ -2523,7 +2523,7 @@ mod tests {
             );
             // Forced, so the test does not have to wait out the settle age —
             // the same phased path the daemon runs, and the same path the
-            // `POST /v1/debug/maintenance` trigger takes.
+            // `POST /v1/substrate/zend/maintenance` trigger takes.
             let plan = sp
                 .plan_maintenance(&substrate, true)
                 .unwrap()

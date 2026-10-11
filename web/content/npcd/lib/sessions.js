@@ -178,8 +178,8 @@ let restoring = null;
 /**
  * Pick the conversations back up after a reload.
  *
- * The console's assets are embedded in the binary, so a rebuild reloads this
- * page out from under an open conversation — and the conversation is still
+ * A saved UI edit or a rebuild reloads this page (`/common/lib/build.js`) out
+ * from under an open conversation — and the conversation is still
  * running on the daemon, which is the thing that matters. Ids come from storage;
  * whether each is still live is the daemon's answer, and one that is not is
  * simply dropped.

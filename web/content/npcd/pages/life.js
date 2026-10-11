@@ -34,7 +34,7 @@
  * and tell me what it produced" but "write a day that earns these". */
 
 import { API } from '../lib/api.js';
-import { h, mount } from '../lib/dom.js';
+import { h, mount } from '/common/lib/dom.js';
 import { toast, mayEdit, roNote, empty, confirmDialog } from '../lib/ui.js';
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',

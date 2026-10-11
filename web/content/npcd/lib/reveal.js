@@ -19,7 +19,7 @@
  * deliberately not it — it opens the browser's menu bar on Windows.
  */
 
-import { can } from './router.js';
+import { can } from '/common/lib/router.js';
 
 let held = false;
 const listeners = new Set();

@@ -1,7 +1,7 @@
 /* Live implementation — talks to the daemon's /v1 surface, and to the two
  * push streams under /ws. */
 
-import { subscribe } from './ws.js';
+import { subscribe } from '/common/lib/ws.js';
 
 async function j(path, opts) {
   const r = await fetch(path, {
@@ -108,9 +108,9 @@ export const LiveAPI = {
    * been shadowed by a character's memory turns, with no error anywhere. */
   getMemoryDump: () => j('/v1/memory'),
   /* The redo log on disk. Daemon-scoped, not per-character: it is the storage
-   * every character's memory is written into, and it is real today because a
-   * segmented log is a directory of files. */
-  getSubstrateStorage: () => j('/v1/substrate/storage'),
+   * every character's memory is written into. npcd's line in the host's
+   * overview of every attached substrate. */
+  getSubstrateStorage: () => j('/v1/substrate').then((o) => ((o && o.tenants) || {}).npcd || null),
 
   /* No sign-in or sign-out here. The gateway owns both — its `/auth/*` is
    * served ahead of site routing on every hostname, and the cookie it issues is
@@ -233,18 +233,32 @@ export const LiveAPI = {
   getLifeJob:     (w) => j(`/v1/life/${w}/job`),
   cancelLife:     (w) => j(`/v1/life/${w}/cancel`, { method: 'POST' }),
 
-  getLayerSchema:          () => j('/v1/schema/layers'),
+  /* Every tenant's layers come back, each naming its tenant; this console's
+   * are npcd's. */
+  getLayerSchema: () => j('/v1/schema/layers')
+    .then((o) => ({ layers: ((o && o.layers) || []).filter((l) => l.tenant === 'npcd') })),
   getTurn:     (id, layer, turn) => j('/v1/npc/' + id + '/substrate/turn/' + layer + '/' + turn),
   probe:       (id, text) => j('/v1/npc/' + id + '/project', { method: 'POST', body: { text } }),
   getWorldCollections:     (w) => j('/v1/world/' + w + '/collections'),
   getPersonalityCollections: (a) => j('/v1/personality/' + a + '/collections'),
   /* Push streams. Both hand back `{close}`; a caller that forgets to call it
    * leaks a socket that keeps reconnecting after its page is gone. */
-  subscribeLogs:   (onLine, onState) => subscribe('/ws/logs', { onMessage: onLine, onState }),
+  /* The host's one stream carries every tenant's lines, each naming its
+   * tenant; this console shows npcd's and the engine's, which name none. */
+  subscribeLogs: (onLine, onState) => subscribe('/ws/logs', {
+    onMessage: (line) => { if (!line || !line.tenant || line.tenant === 'npcd') onLine(line); },
+    onState,
+  }),
   subscribeEvents: (onEvent, onState) => subscribe('/ws/events', { onMessage: onEvent, onState }),
 
-  listTools:      () => j('/v1/tools'),
-  calibrateTools: () => j('/v1/tools/calibrate', { method: 'POST' }),
+  /* Every tenant's catalog comes back, each tool naming its tenant, with what a
+   * tenant says of its catalog as a whole under `tenants.<name>`. This console
+   * reads npcd's, in the shape it always had. */
+  listTools: () => j('/v1/tools').then((o) => ({
+    ...(((o && o.tenants) || {}).npcd || {}),
+    tools: ((o && o.tools) || []).filter((t) => t.tenant === 'npcd'),
+  })),
+  calibrateTools: () => j('/v1/tools/calibrate?tenant=npcd', { method: 'POST' }),
   listCommands:   () => j('/v1/commands'),
 
   /* Pulse — the cast's tick loop, as an instrument.

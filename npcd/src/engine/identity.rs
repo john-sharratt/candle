@@ -261,8 +261,8 @@ in front of you is what there is.";
 /// The authored text this module installs.
 ///
 /// Plain data rather than the registries themselves, because it is assembled
-/// where they live — in `main`, before the loader thread starts — and consumed
-/// on that thread.
+/// where they live — in the tenant's start, before the loader thread starts —
+/// and consumed on that thread.
 #[derive(Debug, Default, Clone)]
 pub struct Authored {
     /// `(personality id, anchor)` — the floor every character of it reads.

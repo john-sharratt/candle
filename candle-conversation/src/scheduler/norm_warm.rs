@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use flume::Sender;
 
-use super::priority_pause::PAUSED_POLL;
+use super::priority_pause::{Priority, PAUSED_POLL};
 use super::Scheduler;
 use crate::projection::{
     Builder, Conversation, DecodePriority, GroupId, LayerId, ProjectionTarget, Schema, TimelineId,
@@ -65,25 +65,26 @@ pub(super) struct NormWarm {
     probe_windows: usize,
 }
 
-impl NormWarm {
-    /// Whether any replayed turn or ingest slice is waiting.
-    pub(super) fn pending(&self) -> bool {
-        !self.backlog.is_empty() || !self.ingest.is_empty()
-    }
-}
-
 impl Scheduler {
     /// How long an otherwise idle loop may wait for a request before it owes
     /// the warm-up its next turn: `None` with nothing queued (block as usual),
     /// zero when a turn can run now, and [`PAUSED_POLL`] while ingest-priority
     /// work is paused — so a paused replay neither spins nor delays a request.
+    ///
+    /// The next job runs at ingest priority within its own tenant — `Low`, at
+    /// the rank of the tenant whose substrate it warms.
     pub(super) fn norm_warm_wait(&self) -> Option<Duration> {
-        if !self.norm_warm.pending() {
-            return None;
-        }
-        let paused = self
-            .priority_pause
-            .paused(DecodePriority::Low, Instant::now());
+        let tenant = match self.norm_warm.backlog.front() {
+            Some(job) => job.substrate.tenant_rank(),
+            None => self.norm_warm.ingest.front()?.conversation.tenant_rank(),
+        };
+        let paused = self.priority_pause.paused(
+            Priority {
+                tenant,
+                band: DecodePriority::Low,
+            },
+            Instant::now(),
+        );
         Some(if paused { PAUSED_POLL } else { Duration::ZERO })
     }
 
@@ -113,6 +114,21 @@ impl Scheduler {
     /// ingest-priority work may run.
     pub(super) fn queue_ingest_warm_slice(&mut self, job: IngestSliceJob) {
         self.norm_warm.ingest.push_back(job);
+    }
+
+    /// Drop every queued job for `conversation`'s substrate — it has detached,
+    /// and nothing on this thread may refer to it afterwards. A dropped
+    /// slice's reply channel closes, which its warmer reads as the engine
+    /// having gone.
+    pub(super) fn forget_norm_warm(&mut self, conversation: &Conversation) {
+        let warm = &mut self.norm_warm;
+        warm.backlog
+            .retain(|job| !job.substrate.same_substrate(conversation));
+        warm.ingest
+            .retain(|slice| !slice.conversation.same_substrate(conversation));
+        if warm.backlog.is_empty() {
+            warm.started = None;
+        }
     }
 
     /// Score one queued replay turn — or, with none left, one ingest slice —
@@ -173,7 +189,7 @@ impl Scheduler {
 mod tests {
     use super::super::test_substrate::{open, record_turns, YAML};
     use super::super::tests::make_test_scheduler;
-    use super::{IngestSliceJob, PAUSED_POLL};
+    use super::{IngestSliceJob, Priority, PAUSED_POLL};
     use crate::projection::{Builder, DecodePriority};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -216,7 +232,7 @@ mod tests {
 
         sched
             .priority_pause
-            .observe(DecodePriority::High, Instant::now());
+            .observe(Priority::first_tenant(DecodePriority::High), Instant::now());
         assert_eq!(sched.norm_warm_wait(), Some(PAUSED_POLL));
         assert!(!sched.step_norm_warm(), "a dialogue holds the device");
         assert_eq!(sched.norm_warm.backlog.len(), 2);
@@ -259,7 +275,7 @@ mod tests {
 
         sched
             .priority_pause
-            .observe(DecodePriority::High, Instant::now());
+            .observe(Priority::first_tenant(DecodePriority::High), Instant::now());
         assert_eq!(sched.norm_warm_wait(), Some(PAUSED_POLL));
         assert!(!sched.step_norm_warm(), "a dialogue holds the device");
         assert!(reply_rx.try_recv().is_err(), "the warmer is still waiting");

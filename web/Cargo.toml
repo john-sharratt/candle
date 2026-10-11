@@ -56,7 +56,6 @@ rcgen            = { version = "0.14", default-features = false, features = ["cr
 # Mozilla roots built into the binary, so no platform trust store is needed —
 # and none can fail to load.
 hyper-rustls     = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "logging", "webpki-roots"] }
-include_dir    = { version = "0.7" }
 mime_guess     = { version = "2" }
 # Gzip for everything this server sends. Static files are compressed once in
 # `asset.rs`; everything else on the way out in `compress.rs`, which streams and

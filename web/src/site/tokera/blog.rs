@@ -200,9 +200,8 @@ pub async fn show(state: Arc<State>, slug: &str) -> Response {
                 return super::oops(Nav::Blog, "That post could not be read.");
             }
         },
-        // Embedded content has no path to key a cache on, and no mtime to
-        // invalidate by — it cannot change without a rebuild, so rendering it
-        // each time is the honest option rather than caching it forever.
+        // The file went between the read above and this lookup: render what
+        // was read, uncached, rather than key a cache on a file that is gone.
         None => Arc::new(crate::markdown::render(frontmatter::split(&text).1)),
     };
 

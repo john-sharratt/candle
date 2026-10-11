@@ -42,14 +42,14 @@
  * was measured from partway through the window — an engine that started four
  * minutes ago — and the chart begins where the measurements do.
  *
- * None of that is provisional. When the engine reports, `engine_connected`
+ * None of that is provisional. When the engine reports, `engine_measured`
  * flips and every panel fills in; this file does not change.
  */
 
 import { API, BACKEND } from '../lib/api.js';
-import { h, mount, fmtNum } from '../lib/dom.js';
+import { h, mount, fmtNum } from '/common/lib/dom.js';
 import { empty } from '../lib/ui.js';
-import { makeChart, makeStackChart } from '../lib/chart.js';
+import { makeChart, makeStackChart } from '/common/lib/chart.js';
 
 const POLL_MS = 4000;
 /* Memory accounting moves slowly and costs a process enumeration on the daemon,
@@ -403,7 +403,7 @@ export async function render() {
       p50: lastOf(colOf(s, 'inbox_depth_p50')),
       p99: lastOf(colOf(s, 'inbox_depth_p99')),
       active: lastOf(colOf(s, 'npcs_active')),
-      engine: t.engine_connected === true,
+      engine: t.engine_measured === true,
     };
   }
 

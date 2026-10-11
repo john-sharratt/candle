@@ -1,7 +1,7 @@
 ---
 name: up
 description: Build and start every service this machine runs (web + zend on the gateway, npcd on the npcd box) with the arguments recorded in docs/deployment.md, make sure cf-ddns is running, then health-check the LAN, the gateway, the public sites through Cloudflare, and DNS against the public IP.
-argument-hint: "[web|zend|npcd] [overrides, e.g. \"zend --model Qwen35_0_8B_Q8\"]"
+argument-hint: "[web|zend|npcd] [overrides, e.g. \"zend --max-depth 3\"]"
 disable-model-invocation: true
 ---
 
@@ -30,7 +30,7 @@ root (`git rev-parse --show-toplevel`).
 - **No arguments** — every service the doc lists for this machine.
 - **Service names** (`web`, `zend`, `npcd`) — only those.
 - **Overrides** — anything else in the arguments changes a launch line for this run, e.g.
-  `zend --model Qwen35_0_8B_Q8` adds a flag, "zend without --skip-layer" removes one,
+  `zend --max-depth 3` adds a flag, "zend without --disable-layer" removes one,
   "npcd wipe" adds `--forget-conversations`. Apply
   them to that service's recorded line. Without overrides the recorded line is used exactly.
 

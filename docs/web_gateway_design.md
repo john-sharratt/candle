@@ -196,15 +196,17 @@ request** before setting its own: anything a client sent under those names is a
 forgery attempt by construction, since only the gateway may set them.
 
 The strip runs on ingress in `web` itself, so it protects a daemon that embeds
-its API as `upstream: local` just as well as a proxied one — those two dispatch
-paths used to disagree, and the local one handed the router the client's own
-headers. A daemon opts back in with `Builder::behind_gateway`, which is the
-assertion *this bind address is reachable through the gateway and nothing else*.
-Nothing can verify that claim, so it lives at one call site beside the bind, and
-`tests/roles.rs` pins both directions.
+its API as `upstream: local` just as well as a proxied one. A daemon believes
+the headers only from the peers it names with `Builder::trust(Gateways)` —
+loopback, its own bind address, and each gateway address it is given
+(`--gateway`) — and clears them from every other **socket peer** before any
+handler sees the request, so a machine on the LAN that connects directly is
+anonymous whatever it sends. `tests/roles.rs` and `host/src/server.rs` pin
+both directions.
 
-That is sound exactly as far as the claim is true, which is why the daemons
-listen on private addresses.
+Loopback is always trusted, so anything on a daemon's own box that relays
+remote traffic onto loopback — a tunnel, a proxy pointed at `127.0.0.1` — must
+clear the headers itself.
 
 **There is deliberately no shared signing key.** An earlier design let a daemon
 verify `X-Tokera-Assertion` against the gateway's session key. Since that

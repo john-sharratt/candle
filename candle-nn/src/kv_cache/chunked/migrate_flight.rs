@@ -120,8 +120,8 @@ pub fn try_migrate_flight() -> Option<MigrateFlight> {
     })
 }
 
-/// A shared hold on chunk locations taken to **free** device chunks off the thread
-/// that compacts — see [`try_hold_chunk_locations`].
+/// A shared hold on chunk locations taken to **free** or **snapshot** device chunks
+/// off the thread that compacts — see [`try_hold_chunk_locations`].
 #[must_use = "the hold lifts on drop; bind it for the free's scope"]
 pub struct LocationHold {
     _locations: RwLockReadGuard<'static, ()>,
@@ -142,10 +142,19 @@ pub struct LocationHold {
 /// persistence and cold-writer threads inside one pass, 15,252 of its moves wasted,
 /// and the VRAM-efficiency gate failing on the samples that followed.
 ///
+/// **Holding a snapshot of them across a pass breaks it the same way.** A pass sweeps
+/// the holders it can reach, and another thread's locals are not among them: a clone of
+/// a residence's chunks keeps the source slots alive after the residence has moved on,
+/// so every later pass finds them live, plans them again, and reports the copy
+/// `unwitnessed` for as long as the clone lives. A thread that reads device chunks
+/// therefore snapshots and gathers them under this hold and drops the snapshot before
+/// it goes back — the persistence thread's section persist, ~180,000 slots a pass on
+/// the Qwen3-30B while the tool catalog reached the log.
+///
 /// The same lock and the same rule as [`try_migrate_flight`] — shared, never waits,
 /// defers to a waiting pass — without the in-flight count, which is a statement
 /// about migrate work. A caller that is refused keeps the chunks and lets a later
-/// pass of its own drop them.
+/// pass of its own drop or read them.
 pub fn try_hold_chunk_locations() -> Option<LocationHold> {
     if COMPACTION_WAITING.load(Ordering::SeqCst) {
         return None;

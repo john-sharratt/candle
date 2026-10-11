@@ -41,6 +41,7 @@ use std::time::Instant;
 use super::admission::prefill_cost_bytes;
 use super::admit::{Budget, Cost, Ground, Headroom, Kind};
 use super::interleave;
+use super::priority_pause::Priority;
 use super::{Scheduler, SequenceId, WaveMember};
 use crate::projection::DecodePriority;
 use candle_nn::kv_cache::CHUNK_SIZE;
@@ -283,13 +284,6 @@ impl Ground for AdmitPass<'_> {
         if self.sched.running_prefills() >= Scheduler::MAX_PREFILL_WIDTH {
             return None;
         }
-        // **A band paused behind higher-priority work offers nothing** — its
-        // turns wait in the queue, in order, until the running conversation's
-        // cooldown ends (see `priority_pause`). Checked per band, so a `High`
-        // turn behind paused `Low` ones is still offered.
-        if self.sched.priority_pause.paused(prio, Instant::now()) {
-            return None;
-        }
         // **Walk past what this band is not being offered.** A band is asked for
         // its own priority's next candidate, and the queue interleaves them: on
         // the shipped configuration only the dialogue layer sets `High` and every
@@ -302,9 +296,18 @@ impl Ground for AdmitPass<'_> {
         // The cursor is the pass's and this band's, so a band resumes where *it*
         // left off rather than where the previous band did, and nothing is
         // consumed by looking.
+        //
+        // **A turn paused behind higher-priority work is walked past too** — it
+        // waits in the queue, in order, until the work that outranks it has
+        // been idle for the cooldown (see `priority_pause`). Checked per turn,
+        // not per band: priority is tenant first, so one band holds turns of a
+        // tenant that is running and of one that is waiting behind it, and the
+        // first must still be offered.
         let band = band_index(prio);
+        let now = Instant::now();
         while let Some(w) = self.sched.prefill_queue.get(self.prefill_cursor[band]) {
-            if self.sched.decode_priority_or_high(w.sequence_id) == prio {
+            let p = self.sched.priority_or_high(w.sequence_id);
+            if p.band == prio && !self.sched.priority_pause.paused(p, now) {
                 break;
             }
             self.prefill_cursor[band] += 1;
@@ -667,6 +670,15 @@ impl Scheduler {
     pub(super) fn decode_priority_or_high(&self, id: SequenceId) -> DecodePriority {
         self.decode_layer_priority(id)
             .unwrap_or(DecodePriority::High)
+    }
+
+    /// A slot's [`Priority`]: its tenant's rank, and its layer's band — `High`
+    /// where that does not resolve.
+    pub(super) fn priority_or_high(&self, id: SequenceId) -> Priority {
+        Priority {
+            tenant: self.slot_tenant(id),
+            band: self.decode_priority_or_high(id),
+        }
     }
 }
 

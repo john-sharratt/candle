@@ -81,9 +81,10 @@ looks like the biggest consumer part in the fleet:
   the fast path. Do not benchmark provenance scan here and compare to the
   4090 Mobile without accounting for it.
 
-At 24 GB the 3090 crosses `Q6_MIN_TOTAL_VRAM_BYTES`, so it runs
-**Qwen3-30B-A3B Q6_K** (~25 GB, expert-LRU paged) where the 16 GB box runs
-Q4_K_M — see `zend/src/model_choice.rs`.
+Every daemon runs the one prescribed model whatever the card — `host::MODEL`
+(`host/src/model.rs`), so a substrate written on one machine opens on the
+others. A smaller card streams more of the model's experts through the
+three-tier cache (below); it does not pick a smaller quant.
 
 Reference benchmarks live in `docs/performance.md` (headline results at the
 top, every row per machine, and the published figures they are compared with);

@@ -55,6 +55,7 @@ mod builder;
 mod dialect;
 mod gguf_rope;
 mod hermes3;
+pub mod identity;
 pub mod overrides;
 mod pack_source;
 #[cfg(test)]
@@ -565,6 +566,7 @@ impl Model {
         Model::Qwen3_30B_A3B_Q4,
         Model::Qwen3_30B_A3B_Q6,
         Model::Qwen36_35B_A3B_Q4,
+        Model::Qwen36_35B_A3B_AntiLoop_StyleTune,
         Model::Qwen38_FlashNext_Q4KO,
         Model::Qwen38_FlashNext_Q3KO,
         Model::Qwen35_9B_Q6,

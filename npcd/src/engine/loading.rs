@@ -65,6 +65,17 @@ impl LoadStep {
         LoadStep::Waking,
     ];
 
+    /// The step's id on the wire — the `data-step` the console's overlay lists.
+    pub fn id(self) -> &'static str {
+        match self {
+            LoadStep::Model => "model",
+            LoadStep::Substrate => "substrate",
+            LoadStep::Tools => "tools",
+            LoadStep::Layers => "layers",
+            LoadStep::Waking => "waking",
+        }
+    }
+
     /// The line the overlay renders.
     pub fn label(self) -> &'static str {
         match self {
@@ -294,6 +305,15 @@ impl LoadProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step's id is its serialized name — one spelling on the wire, whichever
+    /// way it is reached.
+    #[test]
+    fn every_step_id_is_its_serialized_name() {
+        for step in LoadStep::ALL {
+            assert_eq!(serde_json::to_value(step).unwrap(), step.id());
+        }
+    }
 
     #[test]
     fn a_fresh_progress_is_on_the_first_step_and_not_ready() {

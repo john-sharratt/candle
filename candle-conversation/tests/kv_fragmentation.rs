@@ -39,7 +39,8 @@
 
 use candle::Device;
 use candle_conversation::fragmentation_probe::{
-    names, profile, run, run_baseline, run_on_model, run_strata, ModelProfile, Probe, ProbeOutcome,
+    names, profile, run, run_attached, run_baseline, run_on_model, run_strata, ModelProfile, Probe,
+    ProbeOutcome,
 };
 use candle_conversation::models::Model;
 use candle_conversation::ManagedBatchedModel;
@@ -142,6 +143,35 @@ fn qwen3_30b_a3b_q4() {
     let probe = Probe::new(resolved("qwen3-30b-a3b-q4"));
     let outcome = run(&probe).expect("the probe ran");
     summarise("qwen3-30b-a3b-q4", &outcome);
+    outcome.assert_passed();
+}
+
+/// **Two substrates on one engine** — the shared-model host's arrangement
+/// (`docs/shared_model_host.md` §3.2) on Qwen3.6-35B-A3B, the hybrid lineage the
+/// prescribed model belongs to: MoE, and DeltaNet layers carrying per-sequence
+/// recurrent state that each substrate's sequences hold apart. Both stories pass,
+/// each substrate persists its own conversations, and detaching the second leaves
+/// the first running.
+#[test]
+#[ignore = "loads Qwen3.6-35B-A3B (22 GB) and runs two attached story batches; needs the \
+            card to itself"]
+fn qwen36_35b_a3b_q4_two_attachments() {
+    logging();
+    let probe = Probe::new(resolved("qwen36-35b-a3b-q4"));
+    let outcome = run_attached(&probe, 4).expect("the probe ran");
+    println!(
+        "two attachments: own {}/{} ({} persisted, {} foreign), attached {}/{} ({} persisted, \
+         {} foreign), own survived the detach: {}",
+        outcome.own.story_pass,
+        outcome.own.width,
+        outcome.own.persisted,
+        outcome.own.foreign,
+        outcome.attached.story_pass,
+        outcome.attached.width,
+        outcome.attached.persisted,
+        outcome.attached.foreign,
+        outcome.own_survived_detach,
+    );
     outcome.assert_passed();
 }
 
@@ -572,8 +602,9 @@ fn ladder_rows(
     let resolved = builder.resolve_model(device).expect("model pack resolved");
     let tokenizer_json = resolved.tokenizer_json.clone();
     println!("Loading {:?} …", resolved.pack);
+    let weights = builder.weight_files(&resolved.pack).expect("weight files");
     let loaded = builder
-        .load_model(&resolved.pack, device, None)
+        .load_model(&weights, device, None)
         .expect("model loaded");
     let model = loaded.model;
 
@@ -625,8 +656,9 @@ fn ladder_and_engine(
     let tokenizer = resolved.tokenizer().expect("tokenizer");
     let tokenizer_json = resolved.tokenizer_json.clone();
     println!("Loading {:?} …", resolved.pack);
+    let weights = builder.weight_files(&resolved.pack).expect("weight files");
     let loaded = builder
-        .load_model(&resolved.pack, &device, None)
+        .load_model(&weights, &device, None)
         .expect("model loaded");
     let model = loaded.model;
 

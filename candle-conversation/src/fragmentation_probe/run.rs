@@ -317,22 +317,25 @@ pub fn run(probe: &Probe) -> anyhow::Result<ProbeOutcome> {
     let resolved = builder.resolve_model(&device)?;
     let tokenizer = resolved.tokenizer()?;
     println!("Loading {:?} …", resolved.pack);
-    let model = builder.load_model(&resolved.pack, &device, None)?.model;
+    let model = builder
+        .load_model(&builder.weight_files(&resolved.pack)?, &device, None)?
+        .model;
     run_on_model(probe, &device, &resolved.pack, tokenizer, model)
 }
 
 /// Stand up an engine on `model` over a scratch substrate.
 ///
-/// **A scratch substrate, never the workspace's own.** `EngineConfig::workspace_path`
-/// defaults to `None`, which opens the substrate under the *process working directory*
-/// — so run from the repo root this harness would append its conversations to the live
-/// `.substrate` and reload the user's real history on the way in. The returned store
+/// **A scratch substrate, never the workspace's own.** A builder with no
+/// `workspace_path` opens the substrate under the *process working directory* — so run
+/// from the repo root this harness would append its conversations to the live
+/// `substrate` and reload the user's real history on the way in. The returned store
 /// must be held for the engine's whole life; dropping it removes the store, and a
 /// previous run's corpse is swept on creation. See `scratch_substrate` for what that
-/// does and does not promise.
+/// does and does not promise. The scratch store is bound to the probe's model like any
+/// other.
 ///
 /// `pack` is the model pack `model` was loaded from — the authority on its logits
-/// width, which the engine's sampling buffers are sized to.
+/// width, which the engine's sampling buffers are sized to, and on its identity.
 pub(super) fn start_engine(
     probe: &Probe,
     device: &Device,
@@ -340,7 +343,6 @@ pub(super) fn start_engine(
     tokenizer: &tokenizers::Tokenizer,
     model: Box<dyn crate::ManagedBatchedModel + Send>,
 ) -> anyhow::Result<(ScratchSubstrate, Arc<ConversationEngine>)> {
-    let builder = probe.builder().model_path(pack);
     let scratch = ScratchSubstrate::new()?;
     if scratch.swept() > 0 {
         println!(
@@ -349,8 +351,13 @@ pub(super) fn start_engine(
         );
     }
     println!("substrate: {:?}", scratch.path());
-    let mut engine_config = builder.engine_config(tokenizer, device);
-    engine_config.workspace_path = Some(scratch.path().to_path_buf());
+    let builder = probe
+        .builder()
+        .model_path(pack)
+        .workspace_path(scratch.path());
+    let identity = builder.model_identity(&builder.weight_files(pack)?)?;
+    let substrate = builder.bind_substrate(&identity)?;
+    let engine_config = builder.engine_config(tokenizer, device, substrate);
 
     let engine = Arc::new(ConversationEngine::new(
         model,
@@ -431,7 +438,9 @@ pub fn run_baseline(probe: &Probe) -> anyhow::Result<(BaselineRow, Vec<String>)>
     let resolved = builder.resolve_model(&device)?;
     let tokenizer = resolved.tokenizer()?;
     println!("Loading {:?} …", resolved.pack);
-    let model = builder.load_model(&resolved.pack, &device, None)?.model;
+    let model = builder
+        .load_model(&builder.weight_files(&resolved.pack)?, &device, None)?
+        .model;
     let (_scratch, engine) = start_engine(probe, &device, &resolved.pack, &tokenizer, model)?;
     clean_baseline(&engine, probe)
 }
@@ -1025,7 +1034,7 @@ pub fn run_on_model(
             ..Default::default()
         };
         match keepalive.submit_turn_with_options("Say ok.", opts) {
-            Ok(h) => match h.wait_cancellable() {
+            Ok(h) => match h.wait_cancellable(keepalive.substrate.cancel_token()) {
                 Ok(resp) => {
                     let _ = keepalive.finish_turn(h, &resp);
                 }

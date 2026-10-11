@@ -578,9 +578,10 @@ effector routes register through a *parallel* wrapper (or a `Principal::Npc` pat
 build blocker for Step 1, not a detail, and two hazards make it sharp:
 
 - **The fast path** builds an `http::Request` and stamps the token (§8.1). Because
-  npcd runs `behind_gateway()` and therefore *believes* inbound `X-Tokera-*`
-  (`identity.rs:1`), that request must never carry one, or the operator middleware
-  would authenticate a character as a human — pinned by a test, both directions.
+  npcd *believes* inbound `X-Tokera-*` from the peers it trusts
+  (`web::Builder::trust`, `identity.rs:1`), that request must never carry one, or the
+  operator middleware would authenticate a character as a human — pinned by a test,
+  both directions.
 - **The external mount** (§8.2) is on the same gateway-fronted domain, so a client
   can send *both* a token and `X-Tokera-*`; the effector middleware must read only
   the token and never fall through to the role check.

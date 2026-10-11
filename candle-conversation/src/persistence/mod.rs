@@ -34,12 +34,14 @@ pub mod content_hash;
 pub mod elevate;
 pub mod flush;
 pub mod header_index;
+mod held_groups;
 pub mod inherit;
 pub mod integrity;
 pub mod liveness_audit;
 pub mod log_file;
 pub mod maintenance;
 pub mod manifest;
+mod model_binding;
 pub mod payload_parts;
 pub mod pipeline;
 pub mod priority_lock;
@@ -55,9 +57,11 @@ mod stripes;
 pub mod survival;
 pub mod thread;
 pub mod transfer;
+pub mod triggers;
 pub mod vfs;
 pub mod walker;
 pub mod writer;
+pub mod writer_lock;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -75,6 +79,7 @@ use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
 use manifest::{ChunkLoc, Manifest, RecordLoc};
+pub use model_binding::{BoundSubstrate, ModelBinding};
 pub use priority_lock::PersistenceLock;
 use record::{
     decode_record, encode_record, ChunkPayload, CustomObjectPayload, DebugIdPayload, NpcPayload,
@@ -88,6 +93,7 @@ use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use survival::RecordCensus;
 use vfs::VfsIndex;
 use walker::WalkEntry;
+use writer_lock::WriterLock;
 
 /// Errors raised by the persistence layer.
 #[derive(Debug, Error)]
@@ -117,6 +123,31 @@ pub enum PersistenceError {
     /// ([`SharedSubstrate::open_in_read_only`]). Nothing was staged.
     #[error("the substrate is open read-only; this operation would write to it")]
     ReadOnly,
+
+    /// The substrate was written by another model
+    /// ([`SubstratePersistence::bind_model`]). Nothing was read or written.
+    #[error(
+        "the substrate at {} belongs to {recorded}, not {running}. Everything \
+         model-derived in it — K/V, recurrent state, token ids — was computed by \
+         that model and is wrong under any other. Start on a new substrate, or move \
+         this one aside.",
+        dir.display()
+    )]
+    WrongModel {
+        dir: PathBuf,
+        recorded: String,
+        running: String,
+    },
+
+    /// Another writable handle holds the substrate
+    /// ([`writer_lock::WriterLock`]). Nothing was opened.
+    #[error(
+        "the substrate at {} is already open for writing — by another daemon on this \
+         workspace, or another handle in this process. A substrate takes one writer: a \
+         second would lose records at the next compaction.",
+        dir.display()
+    )]
+    Locked { dir: PathBuf },
 }
 
 /// Result type for the persistence layer.
@@ -192,21 +223,21 @@ pub(crate) fn dir_fingerprint(dir: &Path) -> Vec<(String, u64, [u8; 32])> {
 /// A substrate the host process opened, for the engine to adopt rather than
 /// open a second time.
 ///
-/// **One process, one writable handle per `substrate/`.** [`log_file::LogFile::open`]
-/// takes the file read-write and takes no lock, so a second
-/// [`SubstratePersistence`] over the same directory is a second append cursor
-/// *and* a second [`SubstratePersistence::npc_locs`] view. The two writers
-/// choose offsets neither told the other about, and — because
+/// **One writable handle per `substrate/`.** A second [`SubstratePersistence`]
+/// over the same directory would be a second append cursor *and* a second
+/// [`SubstratePersistence::npc_locs`] view. The two writers would choose offsets
+/// neither told the other about, and — because
 /// [`compaction::collect_live_records`] can only carry forward what the
-/// compacting handle's own walk recorded — a compaction drops every
-/// header-keyed record the other handle appended after it opened.
+/// compacting handle's own walk recorded — a compaction would drop every
+/// header-keyed record the other handle appended after it opened. A writable
+/// open therefore holds [`writer_lock::WriterLock`], and a second one is refused.
 ///
 /// That is not theoretical: `npcd` opened one handle for its character registry
 /// and let the engine open another for conversation turns, and every character
 /// created while the daemon ran vanished at the next restart. The ones that
 /// predated both opens survived, which made the loss look intermittent instead
 /// of mechanical. See
-/// [`tests::a_second_writable_handle_drops_the_records_it_never_saw`].
+/// [`tests::a_second_writable_handle_is_refused`].
 ///
 /// So a host that writes records of its own — `npcd` writes
 /// [`RecordType::Npc`] — opens the substrate **once** and hands this pair over,
@@ -312,7 +343,9 @@ pub struct SubstratePersistence {
     segments: SegmentedLog,
     manifest: Manifest,
     inherited: Vec<Arc<InheritedSubstrate>>,
-    model_spec: Option<Vec<u8>>,
+    /// The latest `ModelKey` record's payload — the model this substrate is
+    /// bound to ([`SubstratePersistence::bind_model`]).
+    model_record: Option<Vec<u8>>,
     template: Option<Vec<u8>>,
     /// SHA-256 of the `Tokenizer` record's payload — kept (32 bytes)
     /// instead of the full ~11 MB so [`SubstratePersistence::set_tokenizer`]
@@ -416,6 +449,10 @@ pub struct SubstratePersistence {
     /// updated: it is a *baseline*, and re-basing it after a rewrite would erase
     /// the very comparison it exists for.
     open_census: RecordCensus,
+    /// The exclusive lock a writable handle holds on its directory
+    /// ([`WriterLock`]) until it drops or [`Self::release_writer`] hands the
+    /// directory on; `None` on a read-only handle.
+    writer_lock: Option<WriterLock>,
 }
 
 /// Whether a record type is a per-stream metadata record whose current-copy
@@ -647,10 +684,10 @@ impl SubstratePersistence {
     /// Every durable operation keeps its signature and answers without
     /// touching disk: the appends refuse with [`PersistenceError::ReadOnly`]
     /// and stage nothing; `commit`, `commit_if_pending` and `seal_active`
-    /// succeed with nothing to do; `set_model_spec` and `set_template` report
-    /// that nothing was written; `set_tokenizer` still refuses a vocabulary
-    /// other than the recorded one but never records one; maintenance plans no
-    /// op and compaction refuses.
+    /// succeed with nothing to do; `set_template` reports that nothing was
+    /// written; `bind_model` and `set_tokenizer` still refuse a model or
+    /// vocabulary other than the recorded one but never record one;
+    /// maintenance plans no op and compaction refuses.
     pub fn open_in_with_substrate_read_only(
         dir: &Path,
         substrate: &mut Substrate,
@@ -711,6 +748,13 @@ impl SubstratePersistence {
     where
         F: FnMut(&walker::WalkEntry),
     {
+        // One writer per substrate: taken before a byte is read, so a refused
+        // open costs nothing. A read-only handle takes none.
+        let writer_lock = if read_only {
+            None
+        } else {
+            Some(WriterLock::acquire(dir)?)
+        };
         let mut inherited_subs = Vec::with_capacity(inherited.len());
         for path in inherited {
             inherited_subs.push(InheritedSubstrate::load(path)?);
@@ -760,8 +804,8 @@ impl SubstratePersistence {
             census.summary()
         );
 
-        let model_spec = manifest
-            .model_spec
+        let model_record = manifest
+            .model_key
             .map(|loc| {
                 segments
                     .read_record_at(loc.segment, loc.offset, loc.record_size)
@@ -788,7 +832,7 @@ impl SubstratePersistence {
             segments,
             manifest,
             inherited: inherited_subs,
-            model_spec,
+            model_record,
             tokenizer_sha256,
             template,
             accounting,
@@ -804,6 +848,7 @@ impl SubstratePersistence {
             npc_locs,
             vfs_index,
             open_census: census,
+            writer_lock,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -841,10 +886,31 @@ impl SubstratePersistence {
         self.segments.active_id()
     }
 
-    /// Whether this handle was opened read-only
-    /// ([`Self::open_in_with_substrate_read_only`]).
+    /// Whether this handle refuses writes — opened read-only
+    /// ([`Self::open_in_with_substrate_read_only`]), or released
+    /// ([`Self::release_writer`]).
     pub fn is_read_only(&self) -> bool {
         self.segments.is_read_only()
+    }
+
+    /// Commit what is staged, then stop writing and give up the directory's
+    /// [`WriterLock`], so the next writer can open it while this handle is
+    /// still alive. From here on the handle behaves as a read-only one: every
+    /// write refuses, and reads go on. Idempotent; a read-only handle has
+    /// nothing to release.
+    ///
+    /// An engine's `shutdown` ends here. The engine can outlive it — another
+    /// thread still holding it — and its successor opens the same workspace in
+    /// the meantime; nothing the shut-down engine does may reach the log the
+    /// successor writes.
+    pub fn release_writer(&mut self) -> Result<()> {
+        if self.is_read_only() {
+            return Ok(());
+        }
+        self.commit()?;
+        self.segments.close_for_writing();
+        self.writer_lock = None;
+        Ok(())
     }
 
     /// The cache-bypassing read handles for the active segment — exposed
@@ -1946,21 +2012,7 @@ impl SubstratePersistence {
         Ok(())
     }
 
-    /// Set the model spec — last-writer-wins. Appends a fresh `ModelSpec`
-    /// record only when the bytes differ from the latest on file. Returns
-    /// `true` if a record was written — never, on a read-only handle, which
-    /// keeps the recorded spec as it found it.
-    pub fn set_model_spec(&mut self, spec: &[u8]) -> Result<bool> {
-        if self.model_spec.as_deref() == Some(spec) || self.is_read_only() {
-            return Ok(false);
-        }
-        self.append_record(RecordType::ModelSpec, 0, 0, 0, 0, 0, spec)?;
-        self.model_spec = Some(spec.to_vec());
-        Ok(true)
-    }
-
-    /// Set the projection template — last-writer-wins, like
-    /// [`SubstratePersistence::set_model_spec`], and likewise never written
+    /// Set the projection template — last-writer-wins, and never written
     /// through a read-only handle.
     pub fn set_template(&mut self, template: &[u8]) -> Result<bool> {
         if self.template.as_deref() == Some(template) || self.is_read_only() {
@@ -1974,16 +2026,15 @@ impl SubstratePersistence {
     /// Bind the substrate to a model's `tokenizer.json` bytes.
     ///
     /// Writes once, on a substrate that has no tokenizer yet, and thereafter
-    /// **refuses** anything that does not hash identically. This is NOT
-    /// last-writer-wins like [`SubstratePersistence::set_model_spec`], and the
-    /// difference is deliberate: a spec is a description of the current run,
-    /// whereas the tokenizer is the vocabulary every turn already in this log
-    /// was sealed under. Token ids are only meaningful against it — accept a
-    /// second one and every stored turn silently means something else, while
-    /// the manifest points at the new record and reports success.
+    /// **refuses** anything that does not hash identically: the tokenizer is
+    /// the vocabulary every turn already in this log was sealed under. Token
+    /// ids are only meaningful against it — accept a second one and every
+    /// stored turn silently means something else, while the manifest points at
+    /// the new record and reports success.
     ///
-    /// Swapping models therefore needs a new substrate, not a new record. The
-    /// caller surfaces that as an instruction rather than a diagnosis.
+    /// [`SubstratePersistence::bind_model`] refuses a different vocabulary
+    /// first, as part of the model's key; this is the embedded copy's own
+    /// guard, so the bytes the log carries can never disagree with the key.
     ///
     /// The full bytes are the `Tokenizer` record's payload, so the log is
     /// a self-contained substrate image (§5.7) — no companion files.
@@ -2027,11 +2078,6 @@ impl SubstratePersistence {
             .segments
             .read_record_at(loc.segment, loc.offset, loc.record_size)?;
         Ok(Some(r.payload))
-    }
-
-    /// The latest model spec payload, if any.
-    pub fn model_spec(&self) -> Option<&[u8]> {
-        self.model_spec.as_deref()
     }
 
     /// The latest projection template payload, if any.
@@ -2214,7 +2260,7 @@ impl SubstratePersistence {
         self.manifest = new_manifest;
         let adopted = self.segments.active_id();
         for loc in [
-            &mut self.manifest.model_spec,
+            &mut self.manifest.model_key,
             &mut self.manifest.template,
             &mut self.manifest.tokenizer,
         ]
@@ -2223,9 +2269,9 @@ impl SubstratePersistence {
         {
             loc.segment = adopted;
         }
-        self.model_spec = self
+        self.model_record = self
             .manifest
-            .model_spec
+            .model_key
             .map(|loc| {
                 self.segments
                     .read_record_at(loc.segment, loc.offset, loc.record_size)
@@ -2302,6 +2348,7 @@ impl SubstratePersistence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::identity::{ModelKey, RecordedModel};
     use crate::projection::TimelineId;
     use log_file::{LogFile, SUPERBLOCK_SIZE};
     use segment::FIRST_SEGMENT;
@@ -2316,6 +2363,23 @@ mod tests {
         p.push(format!("kvtier_sp_{tag}_{nanos}"));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// A model key described as `file`, whose weights are `weights` repeated —
+    /// so two keys with the same `weights` are one model, whatever `file` says.
+    fn model(file: &str, weights: u8) -> ModelKey {
+        ModelKey {
+            arch: "Qwen3".into(),
+            repo: "test/repo".into(),
+            file: file.into(),
+            weights: [weights; 32],
+            tokenizer: [0; 32],
+            rope: "file-stated min=none".into(),
+        }
+    }
+
+    fn recorded(sp: &SubstratePersistence) -> Option<RecordedModel> {
+        sp.recorded_model().map(|r| r.unwrap())
     }
 
     fn section(name: &str, prefix: u64) -> StreamDecl {
@@ -2412,7 +2476,7 @@ mod tests {
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             sp.declare_stream(&section("sys", 1)).unwrap();
-            sp.set_model_spec(b"spec-a").unwrap();
+            sp.bind_model(&model("spec-a", 1)).unwrap();
             sp.set_tokenizer(b"tokenizer-a").unwrap();
             sp.commit().unwrap();
             sp.seal_active().unwrap();
@@ -2437,8 +2501,17 @@ mod tests {
         sp.commit().unwrap();
         assert!(!sp.commit_if_pending().unwrap());
         sp.seal_active().unwrap();
-        assert!(!sp.set_model_spec(b"spec-b").unwrap());
-        assert_eq!(sp.model_spec(), Some(&b"spec-a"[..]));
+        assert!(matches!(
+            sp.bind_model(&model("spec-b", 2)),
+            Err(PersistenceError::WrongModel { .. })
+        ));
+        // The same model under another description would be rewritten on a
+        // writable handle; here nothing is.
+        assert_eq!(
+            sp.bind_model(&model("spec-a-renamed", 1)).unwrap(),
+            ModelBinding::Redescribed
+        );
+        assert_eq!(recorded(&sp), Some(RecordedModel::Key(model("spec-a", 1))));
         assert!(!sp.set_template(b"template").unwrap());
         assert_eq!(sp.template(), None);
         assert!(sp.set_tokenizer(b"tokenizer-b").is_err());
@@ -2451,6 +2524,48 @@ mod tests {
         assert!(sp.has_stream(&substrate, section("sys", 1).stream_id()));
         drop(sp);
         assert_eq!(dir_fingerprint(&dir), before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A released writer hands the directory on while it is still alive.**
+    /// What it committed is on disk, it refuses every write afterwards, and the
+    /// next writable open is admitted at once rather than at its drop.
+    #[test]
+    fn a_released_writer_admits_the_next_and_refuses_writes() {
+        let dir = tmp_dir("release_writer");
+        let mut substrate = Substrate::new();
+        let mut first = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        first.write_npc(&test_npc(1, "Perrin")).unwrap();
+        let mut second_substrate = Substrate::new();
+        assert!(matches!(
+            SubstratePersistence::open_in_with_substrate(&dir, &mut second_substrate),
+            Err(PersistenceError::Locked { .. })
+        ));
+
+        first.release_writer().unwrap();
+        first.release_writer().unwrap();
+        assert!(first.is_read_only());
+        assert!(matches!(
+            first.append_record(RecordType::Tokens, 0, 9, 0, 0, 0, b"refused"),
+            Err(PersistenceError::ReadOnly)
+        ));
+        assert!(matches!(
+            first.compact(&mut substrate, None),
+            Err(PersistenceError::ReadOnly)
+        ));
+        assert_eq!(first.pending_bytes(), 0);
+
+        let mut second =
+            SubstratePersistence::open_in_with_substrate(&dir, &mut second_substrate).unwrap();
+        second.write_npc(&test_npc(2, "Wyneth")).unwrap();
+        second.commit().unwrap();
+        drop(first);
+        drop(second);
+        assert_eq!(
+            cast_on_disk(&dir),
+            vec![1, 2],
+            "the record committed at release and the successor's both survive"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2514,11 +2629,12 @@ mod tests {
     /// is why the loss presented as intermittent rather than total: it is
     /// precisely the runtime-created ones that go.
     ///
-    /// This is the failure [`SharedSubstrate`] exists to make unrepresentable —
-    /// held here as the record of *why*, and asserted in the shape the daemon
-    /// actually failed in.
+    /// This is the failure [`SharedSubstrate`] and [`writer_lock::WriterLock`]
+    /// exist to make unrepresentable — asserted in the shape the daemon actually
+    /// failed in: the second writable open is now refused, and the character
+    /// created through the one writer survives that writer's compaction.
     #[test]
-    fn a_second_writable_handle_drops_the_records_it_never_saw() {
+    fn a_second_writable_handle_is_refused() {
         let dir = tmp_dir("two_owners");
 
         // A character that predates both opens — the control.
@@ -2528,33 +2644,35 @@ mod tests {
             registry.commit().unwrap();
         }
 
-        // Boot, in the daemon's order: the registry opens, then the engine
-        // opens the same directory — the bug, reproduced deliberately.
-        let mut registry = SubstratePersistence::open_in(&dir).unwrap();
+        // Boot, in the daemon's old order: the registry opens, then the engine
+        // tries to open the same directory.
+        let mut registry_substrate = Substrate::new();
+        let mut registry =
+            SubstratePersistence::open_in_with_substrate(&dir, &mut registry_substrate).unwrap();
         let mut engine_substrate = Substrate::new();
-        let mut engine =
-            SubstratePersistence::open_in_with_substrate(&dir, &mut engine_substrate).unwrap();
+        assert!(matches!(
+            SubstratePersistence::open_in_with_substrate(&dir, &mut engine_substrate),
+            Err(PersistenceError::Locked { .. })
+        ));
+        // A read-only handle — a tool reading the workspace — still opens.
+        let mut reader_substrate = Substrate::new();
+        assert!(SubstratePersistence::open_in_with_substrate_read_only(
+            &dir,
+            &mut reader_substrate
+        )
+        .is_ok());
 
-        // Runtime: a character is created. Character records are the registry's,
-        // so it is the registry's handle that appends and fsyncs it.
+        // Runtime: a character is created through the one writer, which then
+        // runs a routine compaction.
         registry.write_npc(&test_npc(2, "Wyneth")).unwrap();
         registry.commit().unwrap();
+        registry.compact(&mut registry_substrate, None).unwrap();
+        drop(registry);
+
         assert_eq!(
             cast_on_disk(&dir),
             vec![1, 2],
-            "the new character is durable the moment it is committed"
-        );
-
-        // The engine runs a routine compaction against its own view.
-        engine.compact(&mut engine_substrate, None).unwrap();
-        drop(registry);
-        drop(engine);
-
-        assert_eq!(
-            cast_on_disk(&dir),
-            vec![1],
-            "the character created after the second handle opened is dropped by \
-             that handle's compaction — it was never in its `npc_locs`"
+            "with one writer, the character created at runtime survives its compaction"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2757,36 +2875,108 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A substrate takes the first model's key, opens again under it without
+    /// writing, rewrites the record when the same model is described anew,
+    /// and refuses another model — on the handle that bound it and on a reopen.
     #[test]
-    fn model_spec_is_last_updated() {
-        let dir = tmp_dir("modelspec");
-        let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+    fn a_substrate_is_bound_to_the_first_model_that_writes_it() {
+        let dir = tmp_dir("modelkey");
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            assert_eq!(
+                sp.bind_model(&model("qwen3-30b-a3b", 1)).unwrap(),
+                ModelBinding::New
+            );
+            let off1 = sp.manifest().model_key.unwrap().offset;
+            assert_eq!(
+                sp.bind_model(&model("qwen3-30b-a3b", 1)).unwrap(),
+                ModelBinding::Same
+            );
+            assert_eq!(
+                sp.manifest().model_key.unwrap().offset,
+                off1,
+                "the same key appends no record"
+            );
+            assert_eq!(
+                sp.bind_model(&model("qwen3-30b-a3b-mirror", 1)).unwrap(),
+                ModelBinding::Redescribed
+            );
+            assert!(sp.manifest().model_key.unwrap().offset > off1);
+            let err = sp.bind_model(&model("qwen3-235b", 2)).unwrap_err();
+            let msg = err.to_string();
+            let recorded_model = model("qwen3-30b-a3b-mirror", 1).describe();
+            let running_model = model("qwen3-235b", 2).describe();
+            assert!(
+                recorded_model.starts_with("qwen3-30b-a3b-mirror (arch Qwen3, weights 01010101…")
+                    && running_model.starts_with("qwen3-235b (arch Qwen3, weights 02020202…"),
+                "{recorded_model} / {running_model}"
+            );
+            assert!(
+                msg.contains(&format!(
+                    "belongs to {recorded_model}, not {running_model}."
+                )),
+                "the refusal names both models: {msg}"
+            );
+            sp.commit().unwrap();
+        }
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            assert_eq!(
+                recorded(&sp),
+                Some(RecordedModel::Key(model("qwen3-30b-a3b-mirror", 1)))
+            );
+            assert!(matches!(
+                sp.bind_model(&model("qwen3-235b", 2)),
+                Err(PersistenceError::WrongModel { .. })
+            ));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
-        assert!(
-            sp.set_model_spec(b"qwen3-30b-a3b").unwrap(),
-            "first write happens"
-        );
-        let off1 = sp.manifest().model_spec.unwrap().offset;
-        assert!(
-            !sp.set_model_spec(b"qwen3-30b-a3b").unwrap(),
-            "unchanged spec is a no-op"
-        );
-        assert_eq!(
-            sp.manifest().model_spec.unwrap().offset,
-            off1,
-            "no-op appends no record"
-        );
-        assert!(
-            sp.set_model_spec(b"qwen3-235b").unwrap(),
-            "changed spec writes"
-        );
-        assert!(
-            sp.manifest().model_spec.unwrap().offset > off1,
-            "changed spec appends a fresh record"
-        );
-        assert_eq!(sp.model_spec(), Some(b"qwen3-235b".as_slice()));
-
-        sp.commit().unwrap();
+    /// A substrate written before keys records the spec text. A model that
+    /// matches it is adopted — the key is written and decides from then on —
+    /// and one that does not is refused.
+    #[test]
+    fn an_older_substrate_adopts_the_key_of_the_model_its_spec_names() {
+        let spec = b"candle-conversation model-spec v1\n\
+            arch=Qwen3\n\
+            chat_format=ChatML\n\
+            model_repo=test/repo\n\
+            model_filename=qwen3-8b.gguf\n\
+            tokenizer_repo=Qwen/Qwen3-8B\n\
+            max_seq_len=40960\n";
+        let dir = tmp_dir("modelkey_legacy");
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.append_record(RecordType::ModelKey, 0, 0, 0, 0, 0, spec)
+                .unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            assert!(matches!(
+                sp.bind_model(&model("qwen3-14b.gguf", 1)),
+                Err(PersistenceError::WrongModel { .. })
+            ));
+            assert_eq!(
+                sp.bind_model(&model("qwen3-8b.gguf", 1)).unwrap(),
+                ModelBinding::Adopted
+            );
+            sp.commit().unwrap();
+        }
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            assert_eq!(
+                recorded(&sp),
+                Some(RecordedModel::Key(model("qwen3-8b.gguf", 1)))
+            );
+            // Adopted, the key decides: other weights under the same name are
+            // another model.
+            assert!(matches!(
+                sp.bind_model(&model("qwen3-8b.gguf", 2)),
+                Err(PersistenceError::WrongModel { .. })
+            ));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2870,17 +3060,20 @@ mod tests {
     }
 
     #[test]
-    fn model_spec_survives_reopen() {
+    fn model_key_survives_reopen() {
         let dir = tmp_dir("ms_reopen");
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
-            sp.set_model_spec(b"the-model").unwrap();
+            sp.bind_model(&model("the-model", 1)).unwrap();
             sp.set_template(b"the-template").unwrap();
             sp.commit().unwrap();
         }
         {
             let sp = SubstratePersistence::open_in(&dir).unwrap();
-            assert_eq!(sp.model_spec(), Some(b"the-model".as_slice()));
+            assert_eq!(
+                recorded(&sp),
+                Some(RecordedModel::Key(model("the-model", 1)))
+            );
             assert_eq!(sp.template(), Some(b"the-template".as_slice()));
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -3372,11 +3565,12 @@ mod tests {
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             sp.declare_stream(&decl).unwrap();
-            // Dead weight: superseded ModelSpecs and stale chunk-0 bodies.
+            // Dead weight: superseded model records (one model, redescribed)
+            // and stale chunk-0 bodies.
             for s in ["qwen3-8b", "qwen3-14b", "qwen3-30b"] {
-                sp.set_model_spec(s.as_bytes()).unwrap();
+                sp.bind_model(&model(s, 1)).unwrap();
             }
-            sp.set_model_spec(b"qwen3-235b-live").unwrap();
+            sp.bind_model(&model("qwen3-235b-live", 1)).unwrap();
             sp.set_template(b"the-template").unwrap();
             for seed in [97, 98, 99] {
                 sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(seed))
@@ -3404,7 +3598,10 @@ mod tests {
             sp.compact(&mut substrate, None).unwrap();
 
             // Caches and the manifest survive the swap.
-            assert_eq!(sp.model_spec(), Some(b"qwen3-235b-live".as_slice()));
+            assert_eq!(
+                recorded(&sp),
+                Some(RecordedModel::Key(model("qwen3-235b-live", 1)))
+            );
             assert_eq!(sp.template(), Some(b"the-template".as_slice()));
             assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), live_chunk);
             // `dead_ratio` is liveness-derived (consistent with the maintenance
@@ -3427,7 +3624,10 @@ mod tests {
             let mut substrate = Substrate::new();
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            assert_eq!(sp.model_spec(), Some(b"qwen3-235b-live".as_slice()));
+            assert_eq!(
+                recorded(&sp),
+                Some(RecordedModel::Key(model("qwen3-235b-live", 1)))
+            );
             assert_eq!(sp.template(), Some(b"the-template".as_slice()));
             assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), live_chunk);
         }

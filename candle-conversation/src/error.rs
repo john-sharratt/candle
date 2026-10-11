@@ -20,7 +20,7 @@ pub enum ConversationError {
     SchedulerGone,
 
     /// A graceful shutdown asked the in-flight ingest to stop while this turn's
-    /// summary decode was still running (see [`crate::request_ingest_cancel`]).
+    /// summary decode was still running (see [`crate::CancelToken::request`]).
     /// The wait was abandoned and the turn handle dropped so the scheduler stops
     /// decode at its next step. This is a cooperative stop, not a failure — the
     /// ingest caller must treat it as "cancelled", NOT count it toward any

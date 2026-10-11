@@ -1,9 +1,9 @@
 //! `web` — the front door, in two roles from one crate.
 //!
-//! * **Authoritative.** Embedded in a daemon: it serves that daemon's console
-//!   from disk or from assets compiled into the binary, and answers `/v1` from
-//!   an `axum::Router` merged into the same process. One binary, testable on
-//!   its own, no second service to run.
+//! * **Authoritative.** Inside a daemon's process: it serves that daemon's
+//!   console from disk, read per request, and answers `/v1` from an
+//!   `axum::Router` merged into the same process. One binary, testable on its
+//!   own, no second service to run.
 //!
 //! * **Proxy.** Standalone on a DMZ box: it owns whatever content it is given,
 //!   and forwards the rest by hostname to whichever machine runs that daemon —
@@ -23,15 +23,13 @@
 //! whole console works over real sockets with no daemon anywhere.
 //!
 //! ```no_run
-//! # use std::path::Path;
-//! // Inside a daemon: serve the embedded console and answer /v1 in-process.
-//! static SITE:   include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/../web/content/npcd");
-//! static COMMON: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/../web/content/common");
-//!
+//! # use std::path::{Path, PathBuf};
+//! // Inside a daemon: serve the console from disk and answer /v1 in-process.
 //! # async fn run(api: axum::Router) -> anyhow::Result<()> {
 //! let cfg = web::Config::from_yaml(include_str!("../web.yaml"), Path::new("."))?;
+//! let roots = [PathBuf::from("web/content/npcd"), PathBuf::from("web/content/common")];
 //! web::Builder::new(cfg)
-//!     .content("npcd", web::Roots::embedded(&[&SITE, &COMMON]))
+//!     .content("npcd", web::Roots::disk(&roots))
 //!     .local_api("npcd", api)
 //!     .serve()
 //!     .await
@@ -55,6 +53,6 @@ pub mod tls;
 pub mod upstream_tls;
 
 pub use config::{Backoff, Config, Route, Site, Tls, Upstream};
-pub use content::{Roots, Source};
+pub use content::Roots;
 pub use health::Health;
-pub use server::Builder;
+pub use server::{Bound, Builder};

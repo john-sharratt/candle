@@ -13,8 +13,8 @@
  *   - streamChatCompletion (token + status + think + prefill)  POST /v1/chat/completions (SSE)
  *   - followConversation (the reply in flight, same frames)    GET …/{id}/live (SSE)
  *   - subscribeLogs / seedLogs               WS /ws/logs (structured JSON frames)
- *   - getToolSchemas                         GET /v1/substrate/tools
- *   - getMe                                  GET /v1/me
+ *   - getToolSchemas                         GET /v1/tools (zend's entries)
+ *   - getMe                                  GET /v1/me (the role, and zend's share)
  *
  * A conversation's history carries its projection points light (the fields
  * the timeline draws, plus each point's `turn`/`event` address). The projection
@@ -92,35 +92,38 @@
       return panelContext(await r.json());
     },
 
-    // GET /v1/status — daemon loading state (drives the startup overlay). If the
-    // daemon isn't reachable yet, report a synthetic "connecting" loading state.
+    // GET /v1/status — the host's status: the process's, with zend's own line
+    // under `tenants.zend` (drives the startup overlay). If the daemon isn't
+    // reachable yet, report a synthetic "connecting" loading state.
     getStatus() {
       return getJSON('/v1/status').catch(() => ({
         state: 'loading',
         started_at_ms: 0,
-        detail: 'connecting to daemon…',
-        loading: { current: 'Connecting', progress: 0, completed: [] },
+        tenants: { zend: { state: 'loading', loading: { label: 'Connecting', detail: 'connecting to daemon…', progress: 0, completed: [] } } },
       }));
     },
 
-    // GET /v1/me — the caller's role, the tools modes it may choose, and the one
-    // it starts at. The gateway's sign-in decides the role; a caller the
-    // daemon cannot place gets the least.
+    // GET /v1/me — the caller's role, and zend's share for it: the tools modes
+    // it may choose and the one it starts at. The gateway's sign-in decides the
+    // role; a caller the daemon cannot place gets the least.
     getMe() {
-      return getJSON('/v1/me').catch(() => ({
-        role: 'unauthenticated',
-        tool_modes: ['none', 'restricted'],
-        default_tools: 'restricted',
-      }));
+      return getJSON('/v1/me')
+        .then((me) => Object.assign({ role: me.role }, (me.tenants || {}).zend || {}))
+        .catch(() => ({
+          role: 'unauthenticated',
+          tool_modes: ['none', 'restricted'],
+          default_tools: 'restricted',
+        }));
     },
 
-    // GET /v1/substrate/tools — each tool's argument JSON Schema, by name. The
-    // tool-call cards list every parameter from it, including the ones a call
-    // left at their defaults.
+    // GET /v1/tools — every tenant's catalog, each tool naming its tenant;
+    // zend's tools' argument JSON Schemas, by name. The tool-call cards list
+    // every parameter from them, including the ones a call left at their
+    // defaults.
     async getToolSchemas() {
-      const body = await getJSON('/v1/substrate/tools');
+      const body = await getJSON('/v1/tools');
       const out = {};
-      (body.tools || []).forEach((t) => { out[t.name] = t.parameters || null; });
+      (body.tools || []).filter((t) => t.tenant === 'zend').forEach((t) => { out[t.name] = t.parameters || null; });
       return out;
     },
 
@@ -231,7 +234,14 @@
         setStatus('wait');
         try { ws = new WebSocket(proto + '//' + location.host + '/ws/logs'); } catch (_) { schedule(); return; }
         ws.onopen = () => { retry = 1000; setStatus('ok'); };
-        ws.onmessage = (ev) => { try { onLine(JSON.parse(ev.data)); } catch (_) {} };
+        // The host's one stream carries every tenant's lines, each naming its
+        // tenant; zend's pane shows zend's and the engine's, which name none.
+        ws.onmessage = (ev) => {
+          try {
+            const line = JSON.parse(ev.data);
+            if (!line.tenant || line.tenant === 'zend') onLine(line);
+          } catch (_) {}
+        };
         ws.onclose = () => { setStatus('err'); schedule(); };  // reconnect with backoff
         ws.onerror = () => { setStatus('err'); };
       };

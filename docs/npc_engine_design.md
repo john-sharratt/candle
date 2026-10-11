@@ -877,15 +877,16 @@ shared. This is the concrete inventory.
 | `zend/src/tools.rs` | `::tools::catalog` | catalog install into a collection |
 | `zend/src/chatml.rs` | `::runtime::chatml` | ChatML rendering |
 | `zend/src/loading.rs` | `::runtime::loading` | load-state machine |
-| `zend/src/download.rs` | `::runtime::download` | model acquisition |
-| `zend/src/model_choice.rs` | `::runtime::model_choice` | VRAM-adaptive quant selection |
 | `zend/src/turn_sink.rs` | `::runtime::turn_sink` | turn sink |
 | `zend/src/projection_event.rs` | `::runtime::events` | projection events |
 | `zend/src/refresh_ctx.rs` | `::runtime::refresh` | refresh context |
-| `zend/src/log_{broadcast,file,line}.rs` | `::runtime::log` | the log bus |
 | `zend/src/conv_file{,_store}.rs` | `::runtime::files` | attachment store |
 | `InferenceState` core (`session.rs`) | `::runtime::inference` | model + sequence + streaming |
 | `IdentityBuilders` (`session.rs`) | `::projection::scope` | **generalised to `ScopeBuilders`** |
+
+Model acquisition, the log bus and the process's own setup went to the `host` crate instead,
+which both daemons run in (`docs/shared_model_host.md`); the VRAM-adaptive quant choice was
+deleted, since every daemon runs one prescribed model.
 
 `IdentityBuilders` is the most valuable of these. Generalised from a single identity name to
 a scope chain, and from two collections to an arbitrary declared set, it becomes the engine's
@@ -1001,8 +1002,8 @@ stream would destroy the property that makes the interaction read as live.
 
 ### Introspection is a first-class product surface
 
-zend already exposes `/v1/substrate`, `/v1/substrate/layer/:name`,
-`/v1/substrate/timeline/:tl` and a `project` endpoint, and the GUI renders them. For NPCs
+zend already exposes `/v1/substrate`, `/v1/substrate/zend/layer/:name`,
+`/v1/substrate/zend/timeline/:tl` and a `project` endpoint, and the GUI renders them. For NPCs
 this matters more, not less: the mind document says every open question is a calibration
 question answerable only by watching real runs, and `/v1/npc/{id}/projection` — *what did
 this NPC actually gather on that tick* — is the instrument that makes that possible.

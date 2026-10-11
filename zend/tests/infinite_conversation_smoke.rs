@@ -27,6 +27,8 @@
 //!   live in the deeper-scale harness because they need a meaningful
 //!   filler distribution.
 
+mod common;
+
 use std::path::Path;
 
 use candle::Device;
@@ -34,6 +36,7 @@ use candle_conversation::models::Model;
 use candle_conversation::projection;
 use candle_conversation::summary_tree::{NodeId, SelectionDiagnostics, SelectionOrigin};
 use candle_conversation::{ConversationEngine, SamplingConfig, Sequence};
+use common::quiet_turn;
 
 const PROJECTION_YAML: &str = include_str!("../src/prompts/projection.yaml");
 
@@ -201,7 +204,7 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
         .workspace_path(workspace)
         .sampling(SamplingConfig::argmax())
         .seed(0)
-        .max_response_tokens(40)
+        .max_response_tokens(REPLY_TOKENS)
         .thinking(false);
     let conv_config = builder.conversation_config();
     let engine = builder.engine(&device).expect("engine load");
@@ -231,6 +234,10 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
     (engine, base_conv)
 }
 
+/// A turn's reply budget: an answer, not a working-out — every turn runs with
+/// thinking off ([`quiet_turn`]).
+const REPLY_TOKENS: usize = 40;
+
 /// Smoke variant — `T_target = 2 × layer.window`.  At Qwen3-30B-A3B's
 /// dialogue window of 16K tokens that's ~50 turns of moderate length.
 /// PR-gated cadence (~5 min budget).
@@ -256,6 +263,7 @@ fn infinite_conversation_smoke() {
         .map(|p| (p.relative_depth.resolve(N), p))
         .collect();
     let timeline_id = base_conv.timeline_id();
+    let quiet = quiet_turn(&engine, REPLY_TOKENS);
     let mut conv = base_conv.fork_resuming(timeline_id).expect("fork");
     for i in 0..N {
         let plant_text = resolved
@@ -268,7 +276,9 @@ fn infinite_conversation_smoke() {
                 "Filler turn {i}: tell me about something unrelated to the previous topics."
             ),
         };
-        let response = conv.send_turn(&user_msg).expect("send_turn");
+        let response = conv
+            .send_turn_with_options(&user_msg, quiet.clone())
+            .expect("send_turn");
         if let Some(diag) = engine.last_selection_diagnostics(timeline_id) {
             eprintln!(
                 "turn {i}: selected={} pending={} budget={}",
@@ -296,7 +306,9 @@ fn infinite_conversation_smoke() {
         // fork resumes the latest substrate state of `timeline_id`
         // (so plant turns embedded above are visible).
         let mut probe_conv = base_conv.fork_resuming(timeline_id).expect("fork resuming");
-        let response = probe_conv.send_turn(plant.probe).expect("probe send");
+        let response = probe_conv
+            .send_turn_with_options(plant.probe, quiet.clone())
+            .expect("probe send");
 
         // Algorithm-level: planted turn (or some ancestor) must be in
         // the score-density selection.  Read from the substrate-side
@@ -367,15 +379,21 @@ fn infinite_conversation_negative_smoke() {
         .set_conversation_debug_id(base_conv.timeline_id(), "smoke-neg-50")
         .expect("set debug_id");
     let timeline_id = base_conv.timeline_id();
+    let quiet = quiet_turn(&engine, REPLY_TOKENS);
     let mut conv = base_conv.fork_resuming(timeline_id).expect("fork");
     // Grow 30 unrelated filler turns.
     for i in 0..30 {
         let user_msg = format!("Filler turn {i}: tell me about unrelated topic {i}.",);
-        let _ = conv.send_turn(&user_msg).expect("send_turn");
+        let _ = conv
+            .send_turn_with_options(&user_msg, quiet.clone())
+            .expect("send_turn");
     }
     // Ask about something we never discussed.
     let response = conv
-        .send_turn("What's the capital of Bolivia? Did we discuss it?")
+        .send_turn_with_options(
+            "What's the capital of Bolivia? Did we discuss it?",
+            quiet.clone(),
+        )
         .expect("send_turn");
     let lower = response.text.to_lowercase();
     let hallucinated_markers = [

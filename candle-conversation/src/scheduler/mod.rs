@@ -32,6 +32,7 @@ mod admit_ground;
 mod block_guard;
 mod compaction_stall;
 mod decode;
+mod detached;
 mod ephemeral_fork;
 pub mod exported_state;
 mod first_sample;
@@ -55,6 +56,7 @@ pub mod relief_trace;
 mod run;
 mod sample;
 mod seal_scan;
+mod section_pages;
 mod segment_rearm;
 mod settle;
 mod spec_chooser;
@@ -63,8 +65,10 @@ mod test_substrate;
 mod turn_group;
 mod wave_logits;
 
+use detached::Detached;
 use graph_window::graph_window;
 use phase_split::cobatched_shares;
+use section_pages::SectionPages;
 
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
@@ -86,6 +90,7 @@ use crate::persistence::elevate::{elevate_to_hot, sealed_total_bytes};
 use crate::persistence::record::{SnapshotLayer, SnapshotPayload};
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::persistence::thread::PersistenceTrigger;
+use crate::persistence::triggers::{PersistenceTriggers, FIRST_ATTACHMENT};
 use crate::projection::event::{group_name_of, layer_name_of_group};
 use crate::projection::Content;
 use crate::projection::{
@@ -94,7 +99,7 @@ use crate::projection::{
     ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
     TimelineId, TurnId, TurnIndex, TurnKey,
 };
-use crate::projection::{CollectionWarm, GalleryPreload, GroupId, LayerId, Schema};
+use crate::projection::{CollectionWarm, GalleryPreload, GroupId, LayerId, Schema, SubstrateRef};
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
@@ -139,6 +144,7 @@ pub use self::settle::SettleReport;
 use self::turn_group::{GroupCaseId, TurnGroup};
 use flume::{Receiver, Sender, TryRecvError};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem::take;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -631,7 +637,7 @@ pub(crate) enum SchedulerRequest {
 
     /// Drain the query wide-Q window that an ephemeral probe slot
     /// ([`Self::NewEphemeralSequence`]) gathered at its turn's completion — the
-    /// interactive projection probe (`POST /v1/substrate/project`). Fire after the
+    /// interactive projection probe (`POST /v1/substrate/zend/project`). Fire after the
     /// probe turn's `Done`; returns the belief-domain [`WideQSig`] window
     /// `score_beliefs` consumes (empty if the turn produced none). Nothing was
     /// written to the substrate.
@@ -719,6 +725,27 @@ pub(crate) enum SchedulerRequest {
     ReconstructSubstrate {
         conversation: Conversation,
         status: Arc<SubstrateReloadStatus>,
+    },
+
+    /// Attach another substrate to this engine: register its persistence
+    /// thread's trigger under attachment `id`, then reload the substrate from
+    /// its redo log, marking `status` finished when done
+    /// (`docs/shared_model_host.md` §3.2).
+    AttachSubstrate {
+        id: u64,
+        trigger: PersistenceTrigger,
+        conversation: Conversation,
+        status: Arc<SubstrateReloadStatus>,
+    },
+
+    /// Detach attachment `id`: free every slot bound to `conversation`'s
+    /// substrate, forget its timelines' scheduler state, and drop its
+    /// persistence trigger. Replies once nothing on this thread refers to the
+    /// substrate, so the caller can stop its persistence thread and flush.
+    DetachSubstrate {
+        id: u64,
+        conversation: Conversation,
+        response_tx: Sender<()>,
     },
 
     /// Warm the belief-driven section collections' hit levels from their own
@@ -833,6 +860,8 @@ impl SchedulerRequest {
             Self::CountRecurrentMemories { .. } => "req:count_recurrent_memories",
             Self::SubmitSummaryProbe { .. } => "req:submit_summary_probe",
             Self::ReconstructSubstrate { .. } => "req:reconstruct_substrate",
+            Self::AttachSubstrate { .. } => "req:attach_substrate",
+            Self::DetachSubstrate { .. } => "req:detach_substrate",
             Self::WarmCollectionNormalization { .. } => "req:warm_collection_normalization",
             Self::PreloadGalleries { .. } => "req:preload_galleries",
             Self::WarmIngestSlice { .. } => "req:warm_ingest_slice",
@@ -1783,7 +1812,7 @@ fn flush_page_cut(
     slot: SequenceId,
     state: &mut DecodeState,
 ) {
-    if !std::mem::take(&mut state.pending_page_cut) {
+    if !take(&mut state.pending_page_cut) {
         return;
     }
     let after = state.pending_page_cut_after.take();
@@ -1992,6 +2021,10 @@ pub(crate) struct TurnContent {
 /// section's current hot residence via `section_residence(section_id)`
 /// when the drain runs.
 struct PendingSectionQuantize {
+    /// The substrate the section was sealed into. Section ids are a schema's
+    /// own, so two tenants sharing the engine can each hold a section `7`;
+    /// a drain takes only the sealing substrate's entries.
+    substrate: SubstrateRef,
     section_id: SectionId,
     /// Propagated from `SealAction::Section::in_collection` — drives
     /// the drain's choice of compression policy.  Collection members
@@ -3146,19 +3179,9 @@ pub(crate) struct Scheduler {
     /// each entry's offset reaches its token count, then finalised by
     /// [`Self::finalize_done_section_ingests`].
     pub(super) active_section_ingests: Vec<ActiveSectionIngest>,
-    /// Each sealed section's per-position model state, keyed as its K/V is.
-    ///
-    /// The index page a section's own prefill produced, kept so the next
-    /// section that borrows this one's chunks can be handed the rows that go
-    /// with them — see `ManagedBatchedModel::push_positional_state`. Empty for
-    /// every model that carries no such state.
-    ///
-    /// Process-local, and that is a real limit rather than a choice: a section
-    /// recovered cold from the substrate on a later run has its K/V and not its
-    /// page, so the first ingest to borrow it warns and selects against a
-    /// prefix it never indexed. Persisting it belongs beside the section's own
-    /// records, keyed by the same stream id.
-    pub(super) section_positional: HashMap<SectionId, Arc<StoredPages>>,
+    /// Each sealed section's per-position model state, by the section's
+    /// content address — see [`section_pages`].
+    pub(super) section_positional: SectionPages,
     /// Each sealed turn's per-position model state, keyed as its K/V is.
     ///
     /// The conversation counterpart of [`Self::section_positional`], and the
@@ -3251,6 +3274,10 @@ pub(crate) struct Scheduler {
     /// many substrates concurrently.
     slot_conversations: HashMap<SequenceId, Conversation>,
 
+    /// The slots and substrates detached from this engine, whose handles'
+    /// requests are dropped — see [`detached`].
+    detached: Detached,
+
     /// Per-slot projection target — `(layer, group, timeline)` pinned at
     /// [`SchedulerRequest::NewSequence`] / [`SchedulerRequest::ResumeSequence`]
     /// time and consumed by both the
@@ -3304,10 +3331,11 @@ pub(crate) struct Scheduler {
     /// by `elevate_to_hot` (cuMemHostAlloc'd once, grown on demand).
     cold_load_stager: ColdLoadStager,
 
-    /// Trigger handle for the substrate persistence thread. Fired
-    /// after every turn-seal so the thread runs its hot→warm→cold
-    /// drain promptly instead of waiting up to 5 s on its tick.
-    persist_trigger: PersistenceTrigger,
+    /// Trigger handles for every attached substrate's persistence thread.
+    /// Fired after every turn-seal so each thread runs its hot→warm→cold
+    /// drain promptly instead of waiting up to 5 s on its tick; their gauges
+    /// are read summed — see [`PersistenceTriggers`].
+    persist_triggers: PersistenceTriggers,
 
     /// Trigger handle for the async summariser thread.  Fired after
     /// every turn-seal (`docs/archived/infinite_conversations.md` §4 step ③)
@@ -3513,9 +3541,11 @@ pub(crate) struct Scheduler {
     /// before it would otherwise block on the idle recv.
     shutdown_requested: bool,
 
-    /// Cache of `SectionId` → symbolic `debug_name`, so the promote tracker's name
-    /// lookup is O(1) after the first sighting (sections are stable).
-    section_name_cache: HashMap<SectionId, String>,
+    /// Each section's symbolic `debug_name`, by its stream id, so the promote
+    /// tracker's name lookup is O(1) after the first sighting (sections are
+    /// stable). By stream id rather than `SectionId`, which is its schema's
+    /// own and names a different section in each tenant's.
+    section_name_cache: HashMap<StreamId, String>,
 
     /// Per-slot live receiver for a compression pass's private event channel.
     /// A compression decode's `DecodeState::event_tx` reports through the job,
@@ -3736,7 +3766,7 @@ impl Scheduler {
             expert_misses_seen: 0,
             active_prefills: Vec::new(),
             active_section_ingests: Vec::new(),
-            section_positional: HashMap::new(),
+            section_positional: SectionPages::default(),
             turn_positional: HashMap::new(),
             sampler,
             show_special_tokens,
@@ -3745,6 +3775,7 @@ impl Scheduler {
             max_prefill_pass_tokens,
             rate_width: None,
             slot_conversations: HashMap::new(),
+            detached: Detached::default(),
             slot_targets: HashMap::new(),
             ephemeral_slots: std::collections::HashSet::new(),
             ephemeral_sigs: HashMap::new(),
@@ -3757,7 +3788,7 @@ impl Scheduler {
             slot_tokens: HashMap::new(),
             slot_projection_state: HashMap::new(),
             cold_load_stager: ColdLoadStager::with_preallocation(PINNED_PREALLOC_BYTES),
-            persist_trigger,
+            persist_triggers: PersistenceTriggers::new(FIRST_ATTACHMENT, persist_trigger),
             summariser_trigger,
             pending_section_quantize: Vec::new(),
             elevate_pinned_scratch: preallocate_pinned_scratch(
@@ -3876,6 +3907,24 @@ impl Scheduler {
 
     /// Handle a single request. Returns `false` if shutdown.
     fn handle_request(&mut self, req: SchedulerRequest) -> bool {
+        tracing::trace!(request = req.span_name(), slots = ?req.slots(), "scheduler request");
+        // A detached substrate's handle: its own free releases the slot id it
+        // reserved, and anything else it sends is dropped unanswered.
+        if let SchedulerRequest::FreeSequence { sequence_id } = &req {
+            if self.detached.release(*sequence_id) {
+                if let Err(e) = self.session.free_sequence(sequence_id.0) {
+                    tracing::warn!("failed to release reserved slot {}: {}", sequence_id, e);
+                }
+                return true;
+            }
+        }
+        if self.detached.names(&req) {
+            tracing::warn!(
+                request = req.span_name(),
+                "a request from a detached substrate's handle — dropped unanswered"
+            );
+            return true;
+        }
         match req {
             SchedulerRequest::NewSequence {
                 conversation,
@@ -4757,12 +4806,18 @@ impl Scheduler {
             } => {
                 // A transient section leaves the substrate here; an owned
                 // section already left it when its owner released it, and only
-                // the scheduler's tables keyed by its id remain.
+                // the scheduler's own records of it remain. Each is this
+                // substrate's alone to let go: section ids are a schema's own,
+                // and a page is kept while another substrate holds the section.
                 for id in sections {
+                    let stream = conversation.read().section_stream(id);
                     conversation.retire_section(id);
-                    self.section_positional.remove(&id);
-                    self.section_name_cache.remove(&id);
-                    self.pending_section_quantize.retain(|p| p.section_id != id);
+                    if let Some(stream) = stream {
+                        self.section_positional.release(stream, &conversation);
+                        self.section_name_cache.remove(&stream);
+                    }
+                    self.pending_section_quantize
+                        .retain(|p| p.section_id != id || !p.substrate.is(&conversation));
                 }
                 true
             }
@@ -4853,10 +4908,11 @@ impl Scheduler {
                                     );
                                 }
                             } else {
+                                // The pending sections stay queued under their
+                                // own substrate and drain at its next seal.
                                 tracing::warn!(
                                     "post-priming drain: no conversation handle for slot {sequence_id}"
                                 );
-                                self.pending_section_quantize.clear();
                             }
                         } else {
                             self.pending_section_quantize.clear();
@@ -4892,7 +4948,7 @@ impl Scheduler {
                     // between batches so the native catalog can't outrun the
                     // offload under VRAM pressure.
                     timed_wait(|| {
-                        self.persist_trigger
+                        self.persist_triggers
                             .flush_blocking(std::time::Duration::from_secs(30))
                     });
                     Ok(())
@@ -5093,6 +5149,28 @@ impl Scheduler {
                 status,
             } => {
                 self.reconstruct_substrate(&conversation, &status);
+                true
+            }
+
+            SchedulerRequest::AttachSubstrate {
+                id,
+                trigger,
+                conversation,
+                status,
+            } => {
+                self.persist_triggers.attach(id, trigger);
+                self.detached.reattached(&conversation);
+                self.reconstruct_substrate(&conversation, &status);
+                true
+            }
+
+            SchedulerRequest::DetachSubstrate {
+                id,
+                conversation,
+                response_tx,
+            } => {
+                self.detach_substrate(id, &conversation);
+                let _ = response_tx.send(());
                 true
             }
 
@@ -6489,7 +6567,7 @@ impl Scheduler {
             );
             conversation.persist_projection_events(stream_id, encode_events(&[event]));
         }
-        self.persist_trigger.fire();
+        self.persist_triggers.fire();
 
         tracing::info!(
             target: "candle_conversation::summariser",
@@ -6742,6 +6820,57 @@ impl Scheduler {
         {
             self.ingest_timelines.remove(&tgt.timeline);
         }
+    }
+
+    /// Free every slot bound to `conversation`'s substrate, forget the
+    /// scheduler-wide state held for its timelines, and drop attachment `id`'s
+    /// persistence trigger — [`SchedulerRequest::DetachSubstrate`].
+    ///
+    /// Each slot goes through the same teardown a `FreeSequence` runs, which
+    /// purges its in-flight prefill, decode and cohort state; a turn view freed
+    /// with its parent is skipped when its own turn comes. Each freed id is
+    /// then reserved until its handle frees it, and the substrate's handles'
+    /// requests are dropped from here on — see [`detached`].
+    pub(super) fn detach_substrate(&mut self, id: u64, conversation: &Conversation) {
+        let slots: Vec<SequenceId> = self
+            .slot_conversations
+            .iter()
+            .filter(|(_, c)| c.same_substrate(conversation))
+            .map(|(s, _)| *s)
+            .collect();
+        let mut freed = Vec::new();
+        for sequence_id in slots {
+            if self.slot_conversations.contains_key(&sequence_id) {
+                self.handle_request(SchedulerRequest::FreeSequence { sequence_id });
+                match self.session.reserve_sequence(sequence_id.0) {
+                    Ok(()) => freed.push(sequence_id),
+                    Err(e) => tracing::warn!(
+                        "detach: slot {} not reserved for its handle: {}",
+                        sequence_id,
+                        e
+                    ),
+                }
+            }
+        }
+        let freed_count = freed.len();
+        self.detached.record(conversation, freed);
+        self.forget_norm_warm(conversation);
+        self.section_positional.forget(conversation);
+        self.pending_section_quantize
+            .retain(|p| !p.substrate.is(conversation));
+        let timelines: HashSet<TimelineId> = conversation.timeline_ids().into_iter().collect();
+        self.timeline_projections
+            .retain(|t, _| !timelines.contains(t));
+        self.ingest_timelines.retain(|t| !timelines.contains(t));
+        self.turn_positional
+            .retain(|k, _| !timelines.contains(&k.timeline));
+        self.persist_triggers.detach(id);
+        tracing::info!(
+            attachment = id,
+            freed_slots = freed_count,
+            attached = self.persist_triggers.len(),
+            "substrate detached"
+        );
     }
 
     /// One handle per substrate the live slots are bound to.
@@ -7982,7 +8111,8 @@ impl Scheduler {
             tokens_arc,
         );
         if let Some(page) = page {
-            self.section_positional.insert(section_id, page);
+            self.section_positional
+                .insert(stream_id, conversation, page);
         }
         Ok(chunks_per_layer)
     }
@@ -8043,8 +8173,22 @@ impl Scheduler {
     /// covers fewer tokens than the slot holds, every select of the ingest
     /// refuses, and the wave step fails on each retry for as long as the daemon
     /// runs — a startup wedged in "Prefilling tool sections".
-    fn push_prefix_section_index(&self, seq: SequenceId, prefix_id: SectionId, tokens: usize) {
-        let refused = match self.section_positional.get(&prefix_id) {
+    ///
+    /// The page is keyed by the section's content address, `stream`, which the
+    /// caller resolves from the substrate read it already holds. **This takes no
+    /// lock of its own:** the caller walks the prefix under one read guard, and a
+    /// second read of the same `RwLock` taken inside it waits behind any writer
+    /// queued in between — the persistence thread commits continuously — while
+    /// that writer waits for the first guard. The scheduler then parks for good,
+    /// idle, mid-ingest.
+    fn push_prefix_section_index(
+        &self,
+        seq: SequenceId,
+        prefix_id: SectionId,
+        stream: Option<StreamId>,
+        tokens: usize,
+    ) {
+        let refused = match stream.and_then(|s| self.section_positional.get(s)) {
             Some(page) => {
                 match self
                     .model
@@ -8163,6 +8307,7 @@ impl Scheduler {
                         self.push_prefix_section_index(
                             sequence_id,
                             prefix_id,
+                            view.section_stream(prefix_id),
                             sealed[0].token_count,
                         );
                     }
@@ -8291,17 +8436,22 @@ impl Scheduler {
                 // hand a projection its index as well as its K/V.
                 match self.slot_conversations.get(&sequence_id) {
                     Some(conversation) => {
-                        conversation.enqueue_index_page(section_stream_id(address), blob.clone())
+                        let stream = section_stream_id(address);
+                        conversation.enqueue_index_page(stream, blob.clone());
+                        self.section_positional.insert(
+                            stream,
+                            conversation,
+                            Arc::new(StoredPages::new(blob)),
+                        );
                     }
                     None => tracing::warn!(
                         section = section_id.raw(),
                         seq = sequence_id.0,
-                        "section index page not persisted: the slot has no conversation, \
-                         so a restart prefills this section again instead of restoring it",
+                        "section index page neither kept nor persisted: the slot has no \
+                         conversation, so nothing that borrows this section is indexed and a \
+                         restart prefills it again instead of restoring it",
                     ),
                 }
-                self.section_positional
-                    .insert(section_id, Arc::new(StoredPages::new(blob)));
             }
             // **`None` from a model that keeps per-position state is a section
             // with no index.** It used to be swallowed, and that silence is what
@@ -8417,8 +8567,10 @@ impl Scheduler {
         if candle_nn::kv_cache::migrate_in_flight() {
             return Ok(());
         }
-        let drained: Vec<PendingSectionQuantize> =
-            std::mem::take(&mut self.pending_section_quantize);
+        let (drained, keep): (Vec<_>, Vec<_>) = take(&mut self.pending_section_quantize)
+            .into_iter()
+            .partition(|p| p.substrate.is(conversation));
+        self.pending_section_quantize = keep;
         self.quantize_section_batch(conversation, drained, boundary_policy, member_policy, false)
     }
 
@@ -8447,7 +8599,7 @@ impl Scheduler {
         let mut members: Vec<PendingSectionQuantize> = Vec::new();
         let mut keep: Vec<PendingSectionQuantize> = Vec::new();
         for p in self.pending_section_quantize.drain(..) {
-            if p.in_collection {
+            if p.in_collection && p.substrate.is(conversation) {
                 members.push(p);
             } else {
                 keep.push(p);
@@ -8605,7 +8757,7 @@ impl Scheduler {
         // every drained section, wake the persistence thread so it
         // gathers them and appends to the redo log without waiting for
         // its 5 s tick.
-        self.persist_trigger.fire();
+        self.persist_triggers.fire();
         Ok(())
     }
 
@@ -8992,10 +9144,11 @@ impl Scheduler {
                             &boundary_policy,
                             &member_policy,
                         ) {
+                            // The failed batch was this substrate's alone and has
+                            // left the queue; every other substrate's stays.
                             tracing::warn!(
                                 "turn-seal section quantize drain failed (seal continues): {e}"
                             );
-                            self.pending_section_quantize.clear();
                         }
                     } else {
                         self.pending_section_quantize.clear();
@@ -9276,7 +9429,7 @@ impl Scheduler {
                 // Wake the persistence thread so it drains the new
                 // turn (hot→warm migrate, warm→cold redo-log write,
                 // group fsync) without waiting for its 5 s tick.
-                self.persist_trigger.fire();
+                self.persist_triggers.fire();
                 // Wake the summariser thread
                 // (`docs/archived/infinite_conversations.md` §4 step ③) so the
                 // freshly-pending Normal turn gets absorbed into the immutable
@@ -9347,6 +9500,7 @@ impl Scheduler {
                 // `tests/section_quantize_real_model.rs`.
                 if policy_active {
                     self.pending_section_quantize.push(PendingSectionQuantize {
+                        substrate: conversation.substrate_ref(),
                         section_id: *section_id,
                         in_collection: *in_collection,
                     });
@@ -9368,7 +9522,7 @@ impl Scheduler {
                     // persistence trigger so the chunks land on disk in the next
                     // pass.
                     conversation.enqueue_tokens(stream_id, tokens.to_vec());
-                    self.persist_trigger.fire();
+                    self.persist_triggers.fire();
                 }
             }
             SealAction::None => unreachable!("filtered above"),
@@ -10281,21 +10435,22 @@ impl Scheduler {
                 if read.section_tier_state(sid).is_some_and(|t| t.hot) {
                     continue;
                 }
-                let name = self
-                    .section_name_cache
-                    .entry(sid)
-                    .or_insert_with(|| {
-                        // Generic auto-names (`section_<n>`) are the content /
-                        // probe sections with no schema name — meaningless
-                        // per-id on a churn leaderboard, so bucket them together
-                        // and let the named always-hot units (system prompt,
-                        // tools) stand out.
-                        match read.section_debug_name(sid) {
-                            Some(n) if !is_generic_section_name(&n) => n,
-                            _ => "(content §)".to_string(),
-                        }
-                    })
-                    .clone();
+                // Generic auto-names (`section_<n>`) are the content / probe
+                // sections with no schema name — meaningless per-id on a churn
+                // leaderboard, so bucket them together and let the named
+                // always-hot units (system prompt, tools) stand out.
+                let name_of = || match read.section_debug_name(sid) {
+                    Some(n) if !is_generic_section_name(&n) => n,
+                    _ => "(content §)".to_string(),
+                };
+                let name = match read.section_stream(sid) {
+                    Some(stream) => self
+                        .section_name_cache
+                        .entry(stream)
+                        .or_insert_with(name_of)
+                        .clone(),
+                    None => name_of(),
+                };
                 phase_ring::record_promote(&name);
                 sl.push(sid);
             }
@@ -12063,7 +12218,7 @@ mod tests {
         fn close_positional_page(&self, seq: usize) -> candle::Result<usize> {
             let mut pages = self.probe.pages.lock().unwrap();
             let entry = pages.entry(seq).or_default();
-            let width = std::mem::take(&mut entry.tail);
+            let width = take(&mut entry.tail);
             if width > 0 {
                 entry.closed.push(width);
             }
@@ -12577,19 +12732,37 @@ mod tests {
     fn a_prefix_section_the_model_cannot_index_is_advanced_over_as_a_gap() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let (good, stale, missing) = (SectionId::new(1), SectionId::new(2), SectionId::new(3));
+        // The slot's substrate registers each section against its stream, which
+        // is what the pages are keyed by.
+        let conversation = Conversation::new();
+        for (section, stream) in [(good, 11), (stale, 12), (missing, 13)] {
+            conversation.write().restore_section(
+                section,
+                StreamId(stream),
+                0,
+                Vec::new(),
+                Vec::new(),
+                Arc::new(Vec::new()),
+            );
+        }
+        let seq = SequenceId(5);
+        sched.slot_conversations.insert(seq, conversation.clone());
         let good_page = [TOY_PAGE, b"-good"].concat();
-        sched
-            .section_positional
-            .insert(good, Arc::new(StoredPages::new(good_page.clone())));
         sched.section_positional.insert(
-            stale,
+            StreamId(11),
+            &conversation,
+            Arc::new(StoredPages::new(good_page.clone())),
+        );
+        sched.section_positional.insert(
+            StreamId(12),
+            &conversation,
             Arc::new(StoredPages::new(b"\x02\x00\x00\x00rotated".to_vec())),
         );
 
-        let seq = SequenceId(5);
-        sched.push_prefix_section_index(seq, good, 40);
-        sched.push_prefix_section_index(seq, stale, 23);
-        sched.push_prefix_section_index(seq, missing, 17);
+        for (section, tokens) in [(good, 40), (stale, 23), (missing, 17)] {
+            let stream = conversation.read().section_stream(section);
+            sched.push_prefix_section_index(seq, section, stream, tokens);
+        }
 
         assert_eq!(
             probe
@@ -15501,6 +15674,35 @@ mod tests {
         assert!(distinct.iter().any(|c| c.same_substrate(&workspace)));
         assert!(distinct.iter().any(|c| c.same_substrate(&other)));
         assert!(!workspace.same_substrate(&other));
+    }
+
+    /// **Detaching a substrate frees its slots and only its slots**, and drops
+    /// its persistence trigger: the other tenant's slots and trigger are
+    /// untouched, so its conversations go on being served.
+    #[test]
+    fn detaching_a_substrate_frees_only_its_slots() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let zend = crate::projection::Conversation::new();
+        let npcd = crate::projection::Conversation::new();
+        let kept: Vec<SequenceId> = (0..2)
+            .map(|_| create_scratch_slot(&mut scheduler, &zend))
+            .collect();
+        for _ in 0..3 {
+            create_scratch_slot(&mut scheduler, &npcd);
+        }
+        scheduler
+            .persist_triggers
+            .attach(1, PersistenceTrigger::noop());
+        assert_eq!(scheduler.persist_triggers.len(), 2);
+
+        scheduler.detach_substrate(1, &npcd);
+
+        assert_eq!(scheduler.slot_conversations.len(), 2);
+        for slot in &kept {
+            assert!(scheduler.slot_conversations[slot].same_substrate(&zend));
+        }
+        assert_eq!(scheduler.distinct_substrates().len(), 1);
+        assert_eq!(scheduler.persist_triggers.len(), 1);
     }
 
     /// **A requester that gave up costs no slot.**

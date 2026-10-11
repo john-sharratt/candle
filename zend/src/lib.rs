@@ -1,10 +1,12 @@
 //! `zend` — the Zen Code daemon library: an OpenAI-compatible HTTP surface in
 //! front of a persistent `candle_conversation` substrate, plus everything that
-//! turns a workspace into that substrate's content.
+//! turns a workspace into that substrate's content. It runs as a tenant of the
+//! `host` process (`tenant`), alone in the `zend` binary or beside npcd in
+//! `tokerad`.
 //!
 //! Grouped by concern: HTTP surface (`api`, `chatml`, `session`,
-//! `log_broadcast`, `log_line`, `projection_event`); model bring-up
-//! (`loading`, `model_choice`, `download`, `config`); workspace ingestion
+//! `projection_event`); the host contract (`tenant`); model bring-up
+//! (`loading`, `config`); workspace ingestion
 //! (`ingest`, `ingest_backlog`, `ingest_report`, `ingest_worker`, `repo_scan`,
 //! `code_read`, `raw_read`, `refresh_ctx`, `turn_sink`); tool
 //! orchestration (`tools`, `tool_def`, `tool_summary`); conversation-attached
@@ -14,6 +16,7 @@ pub mod access;
 pub mod api;
 pub mod branch_ingest;
 pub mod chatml;
+pub mod cli;
 pub mod code_read;
 pub mod coding_sampling;
 pub mod config;
@@ -22,18 +25,15 @@ pub mod conv_file_store;
 pub mod conv_files;
 pub mod conv_order;
 pub mod conv_overlay;
-pub mod download;
 pub mod fast_path;
 pub mod ingest;
 pub mod ingest_backlog;
+pub mod ingest_cancel;
 pub mod ingest_report;
 pub mod ingest_worker;
 pub mod lenient_json;
 pub mod live_turn;
 pub mod loading;
-pub mod log_broadcast;
-pub mod log_line;
-pub mod model_choice;
 pub mod openai_tools;
 pub mod origin_watch;
 pub mod passthrough;
@@ -48,9 +48,11 @@ pub mod response_section;
 pub mod resume;
 pub mod retrieval_scope;
 pub mod sandbox_programs;
+pub mod schema_layers;
 pub mod secrets;
 pub mod self_check;
 pub mod session;
+pub mod tenant;
 pub mod think_budget;
 pub mod think_gate;
 pub mod think_progress;

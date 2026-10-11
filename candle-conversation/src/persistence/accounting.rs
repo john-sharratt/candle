@@ -108,7 +108,7 @@ impl RecordAccounting {
             // `stream_id` and is written whole every time, so the newest record
             // supersedes the last by the same rule.
             | RecordType::ConvState => (header.record_type, header.stream_id, 0),
-            RecordType::ModelSpec | RecordType::Template | RecordType::Tokenizer => {
+            RecordType::ModelKey | RecordType::Template | RecordType::Tokenizer => {
                 (header.record_type, 0, 0)
             }
             // Payload-keyed metadata records — excluded (see module doc).
@@ -230,8 +230,8 @@ mod tests {
         acc.record(&header(RecordType::Tokens, 2, 0), 4096);
         acc.record(&header(RecordType::Tokens, 1, 0), 4096);
         assert_eq!(acc.dead_bytes(), 4096, "streams don't shadow each other");
-        acc.record(&header(RecordType::ModelSpec, 0, 0), 4096);
-        acc.record(&header(RecordType::ModelSpec, 0, 0), 4096);
+        acc.record(&header(RecordType::ModelKey, 0, 0), 4096);
+        acc.record(&header(RecordType::ModelKey, 0, 0), 4096);
         assert_eq!(acc.dead_bytes(), 8192, "superseded singleton is dead");
     }
 

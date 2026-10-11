@@ -29,9 +29,10 @@ switcher.
 > its behavior is specified in §2.5 + Phase-1 step 1.8.
 
 ### Chosen approach (decided)
-- **Frontend stack:** vanilla, single embedded file. The rebuilt UI lives in
-  `zend/web/` and is embedded into the daemon binary via `include_dir!` exactly
-  as today. **No build step, no node, no framework** — the repo has zero JS
+- **Frontend stack:** vanilla, single file. The rebuilt UI lives in `zend/web/`
+  and the host serves it from disk, read per request — saving a file is the
+  deployment (`docs/shared_model_host.md` §3.4). **No build step, no node, no
+  framework** — the repo has zero JS
   build tooling and we are not introducing any. The design's `renderVals()` /
   `<sc-for>` / `<sc-if>` structure maps directly onto the existing render loop
   in the current `index.html`.
@@ -49,26 +50,30 @@ switcher.
 - No RAM/NVMe KV tiering work (tracked separately in `kv_tier_migration.md`).
 - No model/inference changes beyond wiring composer options into projection
   (named-section directives) + the think-channel on/off hook.
-- No authentication / multi-user surface — the daemon stays single-user on
-  `127.0.0.1`.
+- No authentication of its own — identity is the gateway's, believed only from
+  trusted peers, and the chat stays open (`docs/shared_model_host.md` §3.5).
 
 ---
 
 ## 2. What already exists (ground truth)
 
 ### 2.1 Backend (`zend/src/api/`, axum)
-Router in `zend/src/api/mod.rs` serves the embedded `web/` dir (fallback) plus:
+zend runs as a tenant of the host process (`docs/shared_model_host.md`): the host serves
+`web/` from disk — an edit is served on the next request — and the endpoints every tenant
+shares (`/v1/status`, `/v1/me`, `/v1/telemetry`, `/v1/tools`, `/v1/substrate`, `/ws/logs`)
+once, with zend's part under `tenants.zend`. zend's own routes are in
+`zend/src/api/mod.rs`:
 
 | Method & route | Handler | Returns |
 |---|---|---|
 | `GET /v1/conversations?include_archived=` | `conversations::list` | `{ conversations: ConvEntry[] }` where `ConvEntry { id, label, turn_count, archived, updated_ms }`, most recently used first |
 | `GET /v1/conversations/:id` | `conversations::get` | `{ id, messages: [{ role, content }] }` |
-| `POST /v1/conversations/:id/archive` | `conversations::archive` | `204` |
-| `POST /v1/conversations/:id/unarchive` | `conversations::unarchive` | `204` |
+| `POST /v1/conversations/:id/archive` | `conversations::archive` | `204` (there is no unarchive route; restoring an archived conversation is not served) |
 | `GET /v1/models` | `models::list` | model list |
-| `GET /v1/status` | `status::status` | `{ state: "loading"\|"ready", started_at_ms, detail, loading?, maintenance?, ingest_backlog? }` — `ingest_backlog: { processed, total, last_item } \| null` is the background repo_map/code_reading (+ upload) ingest queue, `null` when nothing is pending |
+| `GET /v1/status` | the host's `endpoints::status` | `{ state, started_at_ms, build, model, engine_connected, loading?, tenants: { zend: { state: "loading"\|"ready", loading?, maintenance?, ingest_backlog } } }` — the UI reads zend's own line: `loading { current, label, detail, progress, completed, progressed, total, unit, … }` names steps by id (`label` is the text), and `ingest_backlog: { processed, total, last_item } \| null` is the background repo_map/code_reading (+ upload) ingest queue, `null` when nothing is pending |
+| `GET /v1/me` | the host's `endpoints::me` | `{ role, …, tenants: { zend: { tool_modes, default_tools } } }`; signed out is `200` with `role: "unauthenticated"` |
 | `POST /v1/chat/completions` | `chat::completions` | SSE (`status` events + OpenAI chunk deltas + stop chunk + `[DONE]`) or one JSON body |
-| `GET /ws/logs` | `ws_logs::handler` | WebSocket: replays `session.log.recent()` backlog, then live lines |
+| `GET /ws/logs` | the host's `endpoints::logs` | WebSocket: replays the host's ring, then live lines — every tenant's, each naming its `tenant`; zend's pane shows zend's and the engine's |
 
 The SSE stream already emits two frame kinds: named `status` events
 (`{ "text": "..." }`) and standard OpenAI `chat.completion.chunk` data frames
@@ -172,10 +177,11 @@ getProjectionDetail(convId, turn, event) -> Promise<{span, glue, sectionContent,
                                                     // one recorded point in full + the panel context (live: GET :id/projections/:turn/:event)
 getProjectionContext(convId, turns) -> Promise<{glue, sectionContent, turnContent, targetLayer}>
                                                     // the panel context for a point streamed live (live: POST :id/projection-context)
-getStatus() -> Promise<{state:"loading"|"ready", started_at_ms, detail, loading?, maintenance?, ingest_backlog?, build}>
-                                                    // GET /v1/status; gates the startup overlay; `build` (assets hash) drives the hot-reload check;
+getStatus() -> Promise<{state, started_at_ms, build, tenants:{zend:{state:"loading"|"ready", loading?, maintenance?, ingest_backlog?}}}>
+                                                    // GET /v1/status; zend's line gates the startup overlay; `build` (a hash of the UI
+                                                    // files on disk and the binary's version) drives the hot-reload check;
                                                     // `ingest_backlog: {processed,total,last_item}|null` drives the under-chat background-ingest bar
-getToolSchemas() -> Promise<{[tool]: JSONSchema|null}>  // GET /v1/substrate/tools; tool-call cards list every parameter from it, defaults included
+getToolSchemas() -> Promise<{[tool]: JSONSchema|null}>  // GET /v1/tools (zend's entries); tool-call cards list every parameter from it, defaults included
 archiveConversation(id) / unarchiveConversation(id) -> Promise<void>
 streamChatCompletion(conv, text, opts, handlers) -> { cancel() }
 mkProjEvent(conv, region) -> ProjectionSpan         // mock-only synthesis helper; live ignores
@@ -564,17 +570,17 @@ content; everything survives a redo-log replay.
 
 ### 2.6 Log line format
 *Structured framing on the socket* (decision 6): `/ws/logs` sends each entry as
-JSON `{ ts, level, target, msg }` (both the `recent()` backlog and live lines),
-so the adapter does no parsing. This changes the socket contract in
-`zend/src/api/ws_logs.rs` + the `log_broadcast` producer — emit the structured
-record instead of the preformatted string. The `Lagged` notice becomes a
-structured `WARN` record too.
+JSON `{ ts, level, target, msg, tenant, seq }` (both the ring's backlog and live
+lines), so the adapter does no parsing. The socket is the host's
+(`host::endpoints::logs`, fed by `host::logs::LogBus`); a reader subscribes,
+replays the ring, and skips by `seq` what the subscription already delivered.
+The `Lagged` notice is a structured `WARN` record too.
 **Rust tests:** backlog + live frames deserialize to the `LogLine` shape; level
 and target are split out correctly; the dropped-lines notice is a well-formed
 `WARN` frame. **Gate:** spec 1.9 passes on live.
 
 ### 2.7 Cutover
-Default the embedded build to **live** (mock only via `?mock=1` / tests). Remove
+Default the served page to **live** (mock only via `?mock=1` / tests). Remove
 the "not implemented" guards. Confirm the old UI is fully gone (single
 `index.html`). Run the **entire** Playwright suite against a live daemon.
 **Gate:** full suite green on live; `cargo test -p zend` green; manual smoke on

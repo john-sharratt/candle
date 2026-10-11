@@ -18,7 +18,8 @@
 //!
 //! Beside the probe sits [`run_strata`]: Strata's single-session benchmark delivered
 //! through the same engine, so the forward bench's ceiling has a delivered row to be
-//! read against.
+//! read against; and [`run_attached`]: two substrates sharing one engine, as the
+//! shared-model host runs its tenants.
 //!
 //! # Adding a model
 //!
@@ -35,6 +36,7 @@
 //! those ends up duplicated. The example exists because the interesting runs are long
 //! and want flags; the tests exist so a model is one line to cover.
 
+mod attached;
 mod batch;
 mod grow_window;
 mod probe;
@@ -42,6 +44,7 @@ mod profile;
 mod run;
 mod strata;
 
+pub use attached::{run_attached, AttachedOutcome, AttachmentOutcome};
 pub use batch::{run_story_batch, BatchTiming, SessionClock, StoryBatch};
 pub use probe::{BaselineRow, Probe, ProbeOutcome};
 pub use profile::{names, profile, profiles, ModelProfile, StoryGate};

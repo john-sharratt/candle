@@ -12,8 +12,8 @@
  * its paint while you are editing. */
 
 import { API } from '../lib/api.js';
-import { h, mount, fmtNum } from '../lib/dom.js';
-import { disclosure } from '../lib/lazy.js';
+import { h, mount, fmtNum } from '/common/lib/dom.js';
+import { disclosure } from '/common/lib/lazy.js';
 
 /* How an operation ended. */
 const ENDS = {

@@ -12,7 +12,7 @@
 //!   character, resolvable to a body in O(1).
 //! - [`auth`] — the device-only middleware: a bearer token, and never the
 //!   gateway's `x-tokera-*`. It is the reason this surface cannot reuse
-//!   [`crate::guard::Api`], which hardcodes the operator role check.
+//!   `host::guard::Api`, which hardcodes the operator role check.
 //! - [`namespace`] — part id → world-API namespace, the one place the mapping
 //!   from a catalogue part to the path segment its routes mount under lives.
 //! - [`router`] — the `local` axum router and its near-you index, `GET

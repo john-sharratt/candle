@@ -6,15 +6,20 @@ use super::gguf_rope::gguf_rope;
 use super::pack_source::NoFetch;
 use super::pack_source::{is_pack, resolve_local, resolve_spec, ResolvedModel};
 use super::{ModelArch, ModelSpec, RopePreset};
+use crate::cancel::CancelToken;
 use crate::config::{
     pick_max_hot_turns, DecodeHealthConfig, EngineConfig, SamplingConfig, SchedulerConfig,
     SequenceConfig,
 };
+use crate::engine::{ConversationEngine, EngineAttacher};
+use crate::engine_slot::CoreRequests;
 use crate::error::ConversationError;
 use crate::guest::checkpoint::gguf_header;
+use crate::models::identity::{rope_key, ModelIdentity, WeightFiles};
 use crate::models::DialectType;
-use crate::persistence::SharedSubstrate;
+use crate::persistence::{BoundSubstrate, SharedSubstrate};
 use crate::projection::{CorruptTurnPolicy, LayerId};
+use crate::tenant_rank::TenantRank;
 use crate::tree::ConversationTreeConfig;
 use crate::ManagedBatchedModel;
 use candle::quantized::Int8Mode;
@@ -22,12 +27,21 @@ use candle::{DType, Device};
 use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_model::{BatchedInference, BatchedModelCore};
+use candle_transformers::models::model_pack::keys::TOKENIZER_JSON;
 #[cfg(feature = "hub")]
 use candle_transformers::models::model_pack::HubFetch;
 use candle_transformers::models::model_pack::{ModelPack, SourceFetch};
 use candle_transformers::models::selection_strata::StrataTokens;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// A model pack [`ModelBuilder::prepare`] resolved and read: its path, its
+/// tokenizer, and the vocabulary size its header states.
+struct Prepared {
+    pack: PathBuf,
+    tokenizer: tokenizers::Tokenizer,
+    gguf_vocab_size: Option<usize>,
+}
 
 /// A model [`ModelBuilder::load_model`] loaded, with the int8 mode it was
 /// loaded in — the value a report on the model names, never re-derived.
@@ -154,9 +168,16 @@ pub struct ModelBuilder {
     /// handle to one `substrate/` silently drops records; see
     /// [`SharedSubstrate`].
     substrate: Option<SharedSubstrate>,
-    /// Open the workspace's substrate read-only — forwarded to
-    /// [`EngineConfig::read_only_substrate`]. `false` by default.
+    /// Open the workspace's substrate read-only
+    /// ([`SharedSubstrate::open_in_read_only`]) — for a tool reading a workspace
+    /// another process may be appending to. `false` by default.
     read_only_substrate: bool,
+    /// The substrate's ingest-cancel latch, forwarded to
+    /// [`EngineConfig::cancel`]. See [`ModelBuilder::cancel_token`].
+    cancel: CancelToken,
+    /// The rank of the tenant the engine's first substrate belongs to,
+    /// forwarded to [`EngineConfig::tenant_rank`].
+    tenant_rank: TenantRank,
     /// Per-layer corrupt-turn policy (from the projection schema), forwarded to
     /// [`EngineConfig::layer_corrupt_turn`] so the startup reload drops the whole
     /// conversation (ingest layers) or just the turn (dialogue) per layer. Empty
@@ -212,6 +233,8 @@ impl ModelBuilder {
             workspace_path: None,
             substrate: None,
             read_only_substrate: false,
+            cancel: CancelToken::new(),
+            tenant_rank: TenantRank::FIRST,
             layer_corrupt_turn: HashMap::new(),
             prefill_pass_tokens: None,
             loras: Vec::new(),
@@ -331,9 +354,25 @@ impl ModelBuilder {
     /// `substrate/` from start through shutdown. The store must already exist.
     ///
     /// Has no effect once [`Self::substrate`] has handed over an open one —
-    /// that handle's own mode rules. See [`EngineConfig::read_only_substrate`].
+    /// that handle's own mode rules.
     pub fn read_only_substrate(mut self, read_only: bool) -> Self {
         self.read_only_substrate = read_only;
+        self
+    }
+
+    /// The latch that stops this substrate's ingest — the daemon's own, made
+    /// before the engine so a shutdown during the load still reaches the ingest
+    /// the load starts. Every conversation on the engine's substrate carries it.
+    pub fn cancel_token(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Rank the engine's first substrate as tenant `rank` — where its
+    /// sequences stand against a substrate attached later
+    /// ([`crate::ConversationEngine::attach`]). [`TenantRank::FIRST`] unless set.
+    pub fn tenant_rank(mut self, rank: TenantRank) -> Self {
+        self.tenant_rank = rank;
         self
     }
 
@@ -774,13 +813,15 @@ impl ModelBuilder {
         }
     }
 
-    /// Build an [`EngineConfig`] from the builder's settings, a tokenizer, and the
+    /// Build an [`EngineConfig`] from the builder's settings, a tokenizer, the
     /// device the engine will run on — which sizes the prefill forward to the card
-    /// unless [`Self::prefill_pass_tokens`] chose it.
+    /// unless [`Self::prefill_pass_tokens`] chose it — and the substrate
+    /// [`Self::bind_substrate`] bound to this model.
     pub fn engine_config(
         &self,
         tokenizer: &tokenizers::Tokenizer,
         device: &Device,
+        substrate: BoundSubstrate,
     ) -> EngineConfig {
         let mut eos_tokens = Vec::new();
         // The spec's dialect is the source of truth for the model family's
@@ -841,7 +882,9 @@ impl ModelBuilder {
             vocab_size
         );
 
-        let mut ret = EngineConfig::new(eos_tokens.into());
+        let mut ret = EngineConfig::new(eos_tokens.into(), substrate);
+        ret.cancel = self.cancel.clone();
+        ret.tenant_rank = self.tenant_rank;
         ret.layer_corrupt_turn = self.layer_corrupt_turn.clone();
         // **Sized to the card here, where every engine config is made**, so an
         // engine assembled from this config directly — the fragmentation probe,
@@ -891,31 +934,91 @@ impl ModelBuilder {
         ret.show_special_tokens = self.show_special_tokens;
         ret.penalty_log_path = self.penalty_log_path.clone();
         ret.health = self.health_config.clone();
-        ret.workspace_path = self.workspace_path.clone();
-        ret.substrate = self.substrate.clone();
-        ret.read_only_substrate = self.read_only_substrate;
-        ret.model_spec = Some(self.model_spec_blob());
         // The engine uses the model's dialect to pre-tokenise the
         // inter-turn boundary markers once at scheduler construction.
         ret.dialect = self.spec.dialect.clone();
         ret
     }
 
-    /// A stable serialized identity for the substrate's `ModelSpec` record —
-    /// enough to re-load the same weights and tokenizer from HuggingFace.
-    fn model_spec_blob(&self) -> Vec<u8> {
-        let s = &self.spec;
-        format!(
-            "candle-conversation model-spec v1\n\
-             arch={:?}\n\
-             chat_format={:?}\n\
-             model_repo={}\n\
-             model_filename={}\n\
-             tokenizer_repo={}\n\
-             max_seq_len={}\n",
-            s.arch, s.chat_format, s.model_repo, s.model_filename, s.tokenizer_repo, s.max_seq_len,
+    /// Every file this model's weights are loaded from: its model pack, which
+    /// already holds any tensor overrides and gate donor, and — for the dense
+    /// lineage — its adapters. Resolved once and handed to both
+    /// [`Self::model_identity`] and [`Self::load_model`], so the key names
+    /// exactly what was loaded.
+    pub fn weight_files(&self, pack: &Path) -> crate::Result<WeightFiles> {
+        let adapters = if matches!(self.spec.arch, ModelArch::Qwen35Dense) {
+            self.resolve_loras()?
+        } else {
+            Vec::new()
+        };
+        Ok(WeightFiles {
+            pack: pack.to_path_buf(),
+            adapters,
+        })
+    }
+
+    /// The identity of the model loaded from `weights` — what a substrate is
+    /// bound to. Reads the pack's header, which records its sources' digests and
+    /// carries its `tokenizer.json`; no weight is loaded. A pack whose sources
+    /// or tokenizer cannot be read refuses the start: a model whose key cannot
+    /// be computed cannot be checked against a substrate.
+    pub fn model_identity(&self, weights: &WeightFiles) -> crate::Result<ModelIdentity> {
+        let tokenizer_json = ModelPack::read_header(&weights.pack)
+            .and_then(|h| {
+                h.metadata
+                    .get(TOKENIZER_JSON)
+                    .ok_or_else(|| candle::Error::Msg(format!("no {TOKENIZER_JSON}")))?
+                    .to_string()
+                    .map(|t| t.as_bytes().to_vec())
+            })
+            .map_err(|e| {
+                ConversationError::Tokenizer(format!(
+                    "read the tokenizer of {} to identify the model: {e}",
+                    weights.pack.display()
+                ))
+            })?;
+        let digest = weights.digest().map_err(|e| {
+            ConversationError::Other(format!(
+                "identify the weights at {}: {e}",
+                weights.pack.display()
+            ))
+        })?;
+        ModelIdentity::new(
+            format!("{:?}", self.spec.arch),
+            self.spec.model_repo.clone(),
+            self.spec.model_filename.clone(),
+            digest,
+            tokenizer_json,
+            rope_key(&self.spec.rope, self.min_rope_factor),
         )
-        .into_bytes()
+        .map_err(ConversationError::Other)
+    }
+
+    /// Open this builder's substrate — the one [`Self::substrate`] handed over,
+    /// or the one under [`Self::workspace_path`] (the process working directory
+    /// when unset), read-only when [`Self::read_only_substrate`] says so — and
+    /// bind it to `identity`. A substrate another model wrote is refused here,
+    /// before anything is loaded onto the device.
+    pub fn bind_substrate(&self, identity: &ModelIdentity) -> crate::Result<BoundSubstrate> {
+        let shared = match &self.substrate {
+            Some(shared) => shared.clone(),
+            None => {
+                let dir = match &self.workspace_path {
+                    Some(p) => p.clone(),
+                    None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                };
+                // A read-only open writes nothing under `substrate/` and
+                // requires the store to exist.
+                let opened = if self.read_only_substrate {
+                    SharedSubstrate::open_in_read_only(&dir)
+                } else {
+                    SharedSubstrate::open_in(&dir)
+                };
+                opened
+                    .map_err(|e| ConversationError::Other(format!("substrate persistence: {e}")))?
+            }
+        };
+        BoundSubstrate::bind(shared, identity).map_err(|e| ConversationError::Other(e.to_string()))
     }
 
     /// Wrap a GQA checkpoint in the RoPE schedule its preset names over the
@@ -961,15 +1064,15 @@ impl ModelBuilder {
     /// re-derived: `auto_sized` reads free VRAM, which the load itself changes.
     pub fn load_model(
         &self,
-        pack: &Path,
+        weights: &WeightFiles,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> crate::Result<LoadedModel> {
         self.refuse_unsupported_settings()?;
-        let int8_mode = ModelPack::open(pack)
+        let int8_mode = ModelPack::open(&weights.pack)
             .map_err(ConversationError::Model)?
             .int8_mode;
-        let mut model = self.load_arch(pack, device, int8_mode, progress)?;
+        let mut model = self.load_arch(weights, device, int8_mode, progress)?;
         // After `load_arch` has applied the budget: a selecting model checks
         // the strata against its kernel under the budget it will run with.
         model
@@ -1036,17 +1139,19 @@ impl ModelBuilder {
         Ok(())
     }
 
-    /// The model `spec.arch` names, loaded from its model pack — every
-    /// architecture's own loader. `int8mode` is the pack's, for the loaders of
-    /// a plain pack, which is an ordinary GGUF to them and repacks at load.
+    /// The model `spec.arch` names, loaded from its model pack and adapters —
+    /// every architecture's own loader. `int8mode` is the pack's, for the
+    /// loaders of a plain pack, which is an ordinary GGUF to them and repacks at
+    /// load.
     fn load_arch(
         &self,
-        model_path: &Path,
+        weights: &WeightFiles,
         device: &Device,
         int8mode: Int8Mode,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> crate::Result<Box<dyn ManagedBatchedModel + Send>> {
         let max_seq = self.max_seq_len;
+        let model_path = weights.pack.as_path();
         match self.spec.arch {
             ModelArch::Qwen3 => {
                 use candle_transformers::models::quantized_qwen3::ModelWeights;
@@ -1154,9 +1259,9 @@ impl ModelBuilder {
                     .arch
                     .native_activation_dtype()
                     .unwrap_or(candle::DType::F16);
-                for (name, dir) in self.resolve_loras()? {
+                for (name, dir) in &weights.adapters {
                     model
-                        .load_adapter(&name, &dir, act)
+                        .load_adapter(name, dir, act)
                         .map_err(ConversationError::Model)?;
                 }
                 Ok(Box::new(model))
@@ -1171,7 +1276,7 @@ impl ModelBuilder {
     /// (or [`model_dir`](Self::model_dir)) have been set, those local files
     /// are used. Otherwise the spec's pack is taken from the model cache, or
     /// built from its sources (requires the `hub` crate feature).
-    pub fn engine(&mut self, device: &Device) -> crate::Result<crate::ConversationEngine> {
+    pub fn engine(&mut self, device: &Device) -> crate::Result<ConversationEngine> {
         self.engine_with_progress(device, None)
     }
 
@@ -1184,7 +1289,88 @@ impl ModelBuilder {
         &mut self,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
-    ) -> crate::Result<crate::ConversationEngine> {
+    ) -> crate::Result<ConversationEngine> {
+        let prepared = self.prepare(device)?;
+        self.engine_from_prepared(prepared, device, progress)
+    }
+
+    /// Attach this builder's substrate to an engine another tenant built
+    /// (`crate::engine_slot`): resolve and read the model pack exactly as a
+    /// build would — so this builder's sampling, thinking and context settings
+    /// are the ones the model states — then bind the substrate to the model and
+    /// attach it. No weight is loaded. `device` is the engine's: a pack is
+    /// resolved for the card it runs on.
+    ///
+    /// The substrate is bound under the engine's RoPE schedule, not this
+    /// builder's: the engine rotates every key this substrate will hold, and a
+    /// shared engine's schedule is every tenant's merged. The model itself is
+    /// checked against the engine's before the substrate is touched, so a
+    /// different model leaves a fresh substrate unbound.
+    pub fn attach_to(
+        &mut self,
+        attacher: &EngineAttacher,
+        device: &Device,
+    ) -> crate::Result<ConversationEngine> {
+        let prepared = self.prepare(device)?;
+        let weights = self.weight_files(&prepared.pack)?;
+        let engine_key = attacher.model_key();
+        let identity = self
+            .model_identity(&weights)?
+            .under_rope(engine_key.rope.clone());
+        if !identity.key().same_model(engine_key) {
+            return Err(ConversationError::Other(format!(
+                "this tenant resolves {}, and the engine it would attach to runs {}",
+                identity.key().describe(),
+                engine_key.describe()
+            )));
+        }
+        let substrate = self.bind_substrate(&identity)?;
+        attacher.attach(
+            substrate,
+            self.cancel.clone(),
+            self.tenant_rank,
+            self.layer_corrupt_turn.clone(),
+        )
+    }
+
+    /// Give up the engine-wide settings this builder asks for, for the slot to
+    /// merge with other tenants' (`crate::engine_slot::CoreRequests`). The
+    /// guests move out; [`Self::apply_core_requests`] gives the merge back.
+    pub fn take_core_requests(&mut self) -> CoreRequests {
+        CoreRequests {
+            prefill_pass_tokens: self.prefill_pass_tokens,
+            min_rope_factor: self.min_rope_factor,
+            qsa_selection_budget: self.qsa_selection_budget,
+            qsa_strata: self.qsa_strata,
+            max_response_tokens: self.max_response_tokens,
+            max_concurrent: self.max_concurrent,
+            thinking: self.thinking,
+            guests: std::mem::take(&mut self.guests),
+        }
+    }
+
+    /// Build with `merged` — every tenant's engine-wide settings — in place of
+    /// this builder's own.
+    pub fn apply_core_requests(&mut self, merged: CoreRequests) {
+        self.prefill_pass_tokens = merged.prefill_pass_tokens;
+        self.min_rope_factor = merged.min_rope_factor;
+        self.qsa_selection_budget = merged.qsa_selection_budget;
+        self.qsa_strata = merged.qsa_strata;
+        self.max_response_tokens = merged.max_response_tokens;
+        self.max_concurrent = merged.max_concurrent;
+        self.thinking = merged.thinking;
+        self.guests = merged.guests;
+    }
+
+    /// Rank this builder's substrate as tenant `rank` — [`Self::tenant_rank`]
+    /// through a reference, for the engine slot.
+    pub(crate) fn set_tenant_rank(&mut self, rank: TenantRank) {
+        self.tenant_rank = rank;
+    }
+
+    /// Resolve the model pack for `device`, and take what the model states —
+    /// architecture, context, sampling, thinking — into this builder.
+    fn prepare(&mut self, device: &Device) -> crate::Result<Prepared> {
         let resolved = self.resolve_model(device)?;
         let model_path = resolved.pack.clone();
         // From here on this builder names the pack itself, so whatever reads the
@@ -1296,13 +1482,35 @@ impl ModelBuilder {
             nt.resolve_thinking_tokens(&tokenizer);
         }
         self.health_config.resolve_structural_tokens(&tokenizer);
+        Ok(Prepared {
+            pack: model_path,
+            tokenizer,
+            gguf_vocab_size,
+        })
+    }
 
-        let mut config = self.engine_config(&tokenizer, device);
+    /// Build the engine from a [`Self::prepare`]d model pack.
+    fn engine_from_prepared(
+        &mut self,
+        prepared: Prepared,
+        device: &Device,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> crate::Result<ConversationEngine> {
+        let Prepared {
+            pack,
+            tokenizer,
+            gguf_vocab_size,
+        } = prepared;
 
-        // Embed the raw `tokenizer.json` so the substrate log is a
-        // self-contained, offline-detokenizable image. Written once per
-        // distinct model via compare-and-insert at engine startup.
-        config.tokenizer = Some(resolved.tokenizer_json.into_bytes());
+        // ── Bind the substrate before a weight is loaded ───────────────
+        // The model's identity comes from the pack's header — its sources'
+        // digests and its tokenizer — in milliseconds. A substrate another
+        // model wrote is refused here, not after a load measured in minutes.
+        let weights = self.weight_files(&pack)?;
+        let identity = self.model_identity(&weights)?;
+        let substrate = self.bind_substrate(&identity)?;
+
+        let mut config = self.engine_config(&tokenizer, device, substrate);
 
         // Override vocab_size with the authoritative value from GGUF metadata
         // if available.  Models often pad vocab to a power-of-2 / multiple of
@@ -1343,7 +1551,7 @@ impl ModelBuilder {
             tracing::info!("  Max response tokens: {}", self.max_response_tokens);
         }
 
-        let model = self.load_model(&model_path, device, progress)?.model;
+        let model = self.load_model(&weights, device, progress)?.model;
 
         // Hand the load's pool high-water back before serving starts — it is
         // several GiB held outside the KV reservation and never used again.
@@ -1386,7 +1594,7 @@ impl ModelBuilder {
             );
         }
 
-        let engine = crate::ConversationEngine::new(model, tokenizer, config, self.guests.clone())?;
+        let engine = ConversationEngine::new(model, tokenizer, config, self.guests.clone())?;
         Ok(engine)
     }
 
@@ -1790,11 +1998,136 @@ mod header_read_tests {
 }
 
 #[cfg(test)]
-mod selection_budget_tests {
+mod identity_tests {
     use std::path::Path;
 
+    use candle::quantized::gguf_file::Value;
+    use candle_transformers::models::model_pack::keys::TOKENIZER_JSON;
+    use candle_transformers::models::model_pack::SourceRecord;
+
+    use crate::error::ConversationError;
+    use crate::models::identity::{write_pack_header, WeightFiles};
+    use crate::models::Model;
+
+    const TOKENIZER: &str = r#"{"model":{"vocab":{"a":0}}}"#;
+
+    /// A pack header built from one checkpoint whose whole-file SHA-256 is
+    /// `sha` repeated, carrying `tokenizer` when given.
+    fn pack(path: &Path, sha: char, tokenizer: Option<&str>) {
+        let source = SourceRecord {
+            role: "checkpoint".into(),
+            repo: "org/m".into(),
+            rev: "r1".into(),
+            file: "m.gguf".into(),
+            len: 4096,
+            sha256: sha.to_string().repeat(64),
+        };
+        let extra: Vec<(&str, Value)> = tokenizer
+            .map(|t| (TOKENIZER_JSON, Value::String(t.into())))
+            .into_iter()
+            .collect();
+        write_pack_header(path, &[source], &extra);
+    }
+
+    /// **A pack without a tokenizer refuses the start.** The key a substrate is
+    /// checked against hashes the vocabulary, so a model without one has
+    /// nothing to check — opening the substrate anyway is how a different
+    /// tokenizer's KV came to be served.
+    #[test]
+    fn a_pack_without_a_tokenizer_refuses_the_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("m.pack.gguf");
+        pack(&path, 'a', None);
+        let err = Model::Qwen35_0_8B_Q8
+            .builder()
+            .model_identity(&WeightFiles::single(&path))
+            .expect_err("a model whose tokenizer cannot be read must not be identified");
+        let ConversationError::Tokenizer(message) = err else {
+            panic!("refused for the wrong reason: {err}");
+        };
+        let expected = format!(
+            "read the tokenizer of {} to identify the model: ",
+            path.display()
+        );
+        assert!(
+            message.starts_with(&expected),
+            "the refusal must name the pack it could not read: {message}"
+        );
+    }
+
+    /// **A fine-tune swapped in under the same name and vocabulary is refused.**
+    /// The tokenizer check alone passed exactly this case: same file name, same
+    /// `tokenizer.json`, different weights — and every stored K/V was the other
+    /// model's. The refusal comes at bind, before any weight is loaded, and
+    /// leaves the substrate bound to the model that wrote it.
+    #[test]
+    fn a_checkpoint_with_the_same_tokenizer_cannot_open_anothers_substrate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.pack.gguf");
+        let tuned = dir.path().join("tuned.pack.gguf");
+        pack(&base, 'a', Some(TOKENIZER));
+        pack(&tuned, 'b', Some(TOKENIZER));
+        let workspace = dir.path().join("workspace");
+        let builder = Model::Qwen35_0_8B_Q8.builder().workspace_path(&workspace);
+
+        let first = builder.model_identity(&WeightFiles::single(&base)).unwrap();
+        let bound = builder
+            .bind_substrate(&first)
+            .expect("a new substrate binds");
+        drop(bound);
+
+        let second = builder
+            .model_identity(&WeightFiles::single(&tuned))
+            .unwrap();
+        assert_eq!(first.key().tokenizer, second.key().tokenizer);
+        assert_ne!(first.key().weights, second.key().weights);
+        let err = builder
+            .bind_substrate(&second)
+            .expect_err("another checkpoint's weights must not open this substrate");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "belongs to {}, not {}",
+                first.key().describe(),
+                second.key().describe()
+            )),
+            "the refusal must name both models: {message}"
+        );
+
+        let reopened = builder
+            .bind_substrate(&first)
+            .expect("the model that wrote the substrate still opens it");
+        assert_eq!(reopened.model_key(), first.key());
+    }
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use crate::models::Model;
+
+    /// **The core's `thinking(true)` leaves a tenant that asked for nothing
+    /// exactly where it was.** A shared core turns thinking on when any tenant
+    /// does (`CoreRequests::merge`), so npcd — which sets nothing — runs under
+    /// zend's `true`. That is only safe because the switch does one thing:
+    /// `false` suppresses thinking for every turn; `true` and unset both leave
+    /// each turn's own think mode to decide.
+    #[test]
+    fn only_an_explicit_false_suppresses_thinking() {
+        let unset = Model::Qwen35_0_8B_Q8.builder();
+        assert!(!unset.should_suppress_thinking());
+        assert!(!unset.thinking(true).should_suppress_thinking());
+        assert!(Model::Qwen35_0_8B_Q8
+            .builder()
+            .thinking(false)
+            .should_suppress_thinking());
+    }
+}
+
+#[cfg(test)]
+mod selection_budget_tests {
     use candle::Device;
 
+    use crate::models::identity::WeightFiles;
     use crate::models::Model;
 
     /// **A selection budget is refused where nothing selects.** Accepted, it
@@ -1806,7 +2139,7 @@ mod selection_budget_tests {
         let err = Model::Qwen35_0_8B_Q8
             .builder()
             .qsa_selection_budget(Some(1 << 20))
-            .load_model(Path::new("never-read.gguf"), &Device::Cpu, None)
+            .load_model(&WeightFiles::single("never-read.gguf"), &Device::Cpu, None)
             .err()
             .expect("a model whose attention does not select must refuse a budget");
         assert_eq!(

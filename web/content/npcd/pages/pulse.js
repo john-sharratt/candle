@@ -29,7 +29,7 @@
  */
 
 import { API } from '../lib/api.js';
-import { h, mount, fmtNum } from '../lib/dom.js';
+import { h, mount, fmtNum } from '/common/lib/dom.js';
 
 /* Faster than the shortest heartbeat, so a preempted character's tick lands in
  * the feed while it is still fresh. */

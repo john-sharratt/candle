@@ -28,7 +28,6 @@ mod conversation {
 
     use crate::common::{needs_compaction, production_workspace, run_conv_id, served};
     use zend::config::DaemonConfig;
-    use zend::log_broadcast::LogBus;
     use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
@@ -90,16 +89,14 @@ mod conversation {
     }
 
     async fn run_conversation() {
-        let log = LogBus::new();
         let workspace = production_workspace();
         let config = DaemonConfig {
             compact_substrate: needs_compaction(&workspace),
-            port: 0, // not starting HTTP
             ..DaemonConfig::new(served(&workspace))
         };
         let conv_id = run_conv_id("test-conv");
 
-        let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
+        let session = Arc::new(ZendSession::new(config));
 
         // Trigger model load — this spawns the background initialisation task.
         session.start_loading();

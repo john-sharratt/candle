@@ -555,6 +555,7 @@ impl Scheduler {
             // the wait at once) or the poll interval, then look again, rather
             // than spinning through quanta that would run nothing.
             if self.all_work_paused() {
+                tracing::trace!("every sequence with work is paused; waiting for a request");
                 let t_idle = Instant::now();
                 match self.rx.recv_timeout(super::priority_pause::PAUSED_POLL) {
                     Ok(req) => {
@@ -600,6 +601,7 @@ impl Scheduler {
                 // Nothing is in flight, so everything resident is permanent:
                 // the one moment the achievable weight residency is exact.
                 super::interleave::reseed_achievable_weight();
+                tracing::trace!("idle; waiting for a request");
                 // Time ONLY the recv block (not the request handling) — this is the
                 // scheduler idle between requests, attributed to the Idle phase so it
                 // isn't mislabeled as Blocked in the GUI.
@@ -1134,8 +1136,8 @@ impl Scheduler {
                 // an atomic load — so an idle engine is not woken once per wave
                 // to find nothing. The trigger coalesces on a one-slot channel,
                 // so a pass already running or already queued absorbs this.
-                if self.persist_trigger.pending_warm_bytes() > 0 {
-                    self.persist_trigger.fire();
+                if self.persist_triggers.pending_warm_bytes() > 0 {
+                    self.persist_triggers.fire();
                 }
             }
             // Closes here, not at end of scope: the livelock guard below can sleep, and a

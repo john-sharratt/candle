@@ -7,12 +7,12 @@
 //! `X-Tokera-User` / `-Email` / `-Name` / `-Picture`, having first cleared
 //! whatever the client sent under those names.
 //!
-//! This daemon reads them and believes them. That is sound for exactly one
-//! reason, and it is a property of the deployment rather than of this code:
-//! `npcd` binds an address reachable only through the gateway, and says so by
-//! calling [`web::Builder::behind_gateway`]. Without that call `web` clears
-//! these headers on ingress, and nothing here would ever identify anybody — so
-//! the trust is declared in one greppable place rather than assumed here.
+//! This daemon reads them and believes them, because the host's server has
+//! already cleared them from every peer that is not a trusted gateway
+//! ([`web::Builder::trust`], `host::access`): what arrives here was sent by the
+//! gateway — or written by `--local-signin` for a loopback caller — or is
+//! absent. The trust is decided in one place, for every tenant, by the peer's
+//! address rather than by an assertion about the network.
 //!
 //! There is no key, no signature and no secret to distribute. An earlier design
 //! verified `X-Tokera-Assertion` against the gateway's session key, which meant
@@ -21,7 +21,11 @@
 //! estate. A verifying credential that doubles as a minting credential is worse
 //! than the header trust it replaced, so it is gone.
 
+use std::net::SocketAddr;
+
 use axum::http::HeaderMap;
+use axum::response::Response;
+use host::guard::require as host_require;
 use web::auth::forwarded::{EMAIL, NAME, PICTURE, PROVIDER, USER};
 use web::auth::session::Identity;
 use web::auth::{Role, Roles};
@@ -114,7 +118,19 @@ fn header_state(raw: Option<&axum::http::HeaderValue>) -> &'static str {
 /// The role comes from [`Caller::read`], the same call the guard makes, so the
 /// line cannot disagree with the verdict the request actually receives.
 /// See [`header_state`] for what is reported and what is deliberately not.
-pub fn log_identity(headers: &HeaderMap, roles: &Roles, method: &str, path: &str) {
+///
+/// The headers are logged as the route sees them: the server has already
+/// cleared them from any peer it does not trust (`web::Builder::trust`). So
+/// the line names the socket `peer` too — headers absent from the gateway's
+/// own address mean the gateway sent none, and absent from an address the
+/// daemon does not trust mean the daemon needs `--gateway` for it.
+pub fn log_identity(
+    headers: &HeaderMap,
+    roles: &Roles,
+    peer: Option<SocketAddr>,
+    method: &str,
+    path: &str,
+) {
     let caller = Caller::read(headers, roles);
     let mut fields = String::new();
     for (label, header) in IDENTITY_HEADERS {
@@ -125,63 +141,19 @@ pub fn log_identity(headers: &HeaderMap, roles: &Roles, method: &str, path: &str
         fields.push('=');
         fields.push_str(header_state(headers.get(header)));
     }
-    tracing::info!("{method} {path} → role={} | {fields}", caller.role);
+    let peer = peer.map_or_else(|| "unknown".to_string(), |p| p.to_string());
+    tracing::info!(
+        "{method} {path} from {peer} → role={} | {fields}",
+        caller.role
+    );
 }
 
-/// Establish the caller, or produce the refusal that says why not.
-///
-/// The two refusals are different answers and are not interchangeable:
-///
-/// - **401** — nobody is signed in. Signing in would fix it.
-/// - **403** — somebody is signed in and it is not enough. Signing in again
-///   will not fix it, and telling them to try is how an operator wastes an
-///   afternoon on a permissions problem that was never a session problem.
-///
-/// Boxed because a `Response` is large and this is the cold path.
-pub fn require(
-    headers: &HeaderMap,
-    roles: &Roles,
-    min: Role,
-) -> Result<Caller, Box<axum::response::Response>> {
-    let caller = Caller::read(headers, roles);
-    if caller.role.at_least(min) {
-        return Ok(caller);
-    }
-    Err(Box::new(refuse(caller.role, min)))
-}
-
-/// The body for a refused request.
-///
-/// It names the role required and the role held, because the alternative is an
-/// operator guessing which of the two they got wrong. Neither is a secret: the
-/// caller already knows who they signed in as, and the required level is in the
-/// documented API surface.
-fn refuse(held: Role, min: Role) -> axum::response::Response {
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    use axum::Json;
-    use serde_json::json;
-
-    let status = if held == Role::Unauthenticated {
-        StatusCode::UNAUTHORIZED
-    } else {
-        StatusCode::FORBIDDEN
-    };
-    let error = if status == StatusCode::UNAUTHORIZED {
-        "unauthorized"
-    } else {
-        "forbidden"
-    };
-    (
-        status,
-        Json(json!({
-            "error": error,
-            "detail": format!("this needs the `{min}` role; you have `{held}`"),
-            "required_role": min,
-            "role": held,
-        })),
-    )
-        .into_response()
+/// Establish the caller, or produce the refusal that says why not — the
+/// host's refusal ([`host::guard::require`]): `401` when nobody is signed in,
+/// `403` when somebody is and it is not enough, naming both roles.
+pub fn require(headers: &HeaderMap, roles: &Roles, min: Role) -> Result<Caller, Box<Response>> {
+    host_require(headers, roles, min)?;
+    Ok(Caller::read(headers, roles))
 }
 
 #[cfg(test)]

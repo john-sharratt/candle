@@ -60,7 +60,7 @@ Get-CimInstance Win32_Process -Filter "Name='zend.exe' OR Name='npcd.exe'" |
 ```
 
 Record each process's `ExecutablePath` and full `CommandLine` (every flag — e.g. zend's
-`--host`, `--port`, `--model`) in the conversation before touching it. Then:
+`--host`, `--port`, `--tls-port`) in the conversation before touching it. Then:
 
 ```powershell
 Stop-Process -Id <pid> -Force -Confirm:$false

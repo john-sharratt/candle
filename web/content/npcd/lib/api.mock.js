@@ -372,11 +372,14 @@ const mindErr = (error, detail, status) =>
   Object.assign(new Error(detail), { error, detail, status: status || 404 });
 
 export const MockAPI = {
+  /* The host's shape: the process's line at the top, npcd's own under
+   * `tenants.npcd` — which is what `app.js` waits on. */
   async getStatus() {
     await sleep(60);
-    return { state: 'ready', detail: 'client-side mock', started_at_ms: Date.now() - 3600000,
-      build: 'npcd-mock', mode: 'server-headless',
-      loading: { current: 'Ready', progress: 1, completed: ['Mock store'] } };
+    return { state: 'ready', detail: '', started_at_ms: Date.now() - 3600000,
+      build: 'npcd-mock', engine_connected: true, loading: null,
+      model: { name: 'Qwen3.6-35B-A3B-AntiLoop', quant: 'Q4_K_M' },
+      tenants: { npcd: { state: 'ready', loading: null, maintenance: null } } };
   },
   /* A synthetic hour, in the column shape the daemon serves. This one DOES
    * fabricate — that is what `?mock` is for, and the header chip says "backend:
@@ -400,7 +403,7 @@ export const MockAPI = {
       },
       host: { total_mib: 65457, free_mib: 41000, rss_mib: 820 },
       sample_period_s: period,
-      engine_connected: true,
+      engine_measured: true,
       image_queue_state: 'waiting_for_vram',
       uptime_s: 4820,
       series: {
@@ -452,8 +455,9 @@ export const MockAPI = {
     };
   },
   async getMe() {
-    if (flag('loggedout')) return null;
-    return { user_id: 'u_8812', unique_name: 'Wren', display: 'Johnathan', email: 'you@example.com',
+    if (flag('loggedout')) return { role: 'unauthenticated' };
+    return { role: 'creator', user_id: 'u_8812', unique_name: 'Wren', display: 'Johnathan',
+      email: 'you@example.com',
       // No `npc_count` — see §8.3. A total of everything you own is the figure
       // that gives your hidden characters away.
       provider: 'google',
@@ -568,16 +572,16 @@ export const MockAPI = {
 
   async getSubstrate() {
     return { engine_connected: true, layers: [
-      { layer: 'perception', conversations: 3, turns: 41, window: 16000 },
-      { layer: 'action', conversations: 3, turns: 212, window: 16000 },
-      { layer: 'agency', conversations: 1, turns: 6, window: 4000 },
-      { layer: 'relationships', conversations: 2, turns: 14, window: 4000 },
-      { layer: 'beliefs', conversations: 1, turns: 9, window: 4000 },
-      { layer: 'memory', conversations: 38, turns: 4412, window: 8000 },
-      { layer: 'interaction', conversations: 3, turns: 88, window: 16000 },
-      { layer: 'environment', conversations: 2, turns: 24, window: 6000 },
-      { layer: 'world', conversations: 11, turns: 88, window: 8000 },
-      { layer: 'dreams', conversations: 3, turns: 42, window: 4000 },
+      { layer: 'perception', conversation_count: 3, turn_count: 41, window: 16000 },
+      { layer: 'action', conversation_count: 3, turn_count: 212, window: 16000 },
+      { layer: 'agency', conversation_count: 1, turn_count: 6, window: 4000 },
+      { layer: 'relationships', conversation_count: 2, turn_count: 14, window: 4000 },
+      { layer: 'beliefs', conversation_count: 1, turn_count: 9, window: 4000 },
+      { layer: 'memory', conversation_count: 38, turn_count: 4412, window: 8000 },
+      { layer: 'interaction', conversation_count: 3, turn_count: 88, window: 16000 },
+      { layer: 'environment', conversation_count: 2, turn_count: 24, window: 6000 },
+      { layer: 'world', conversation_count: 11, turn_count: 88, window: 8000 },
+      { layer: 'dreams', conversation_count: 3, turn_count: 42, window: 4000 },
     ] };
   },
   async getLayer(_id, layer) {

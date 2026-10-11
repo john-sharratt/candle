@@ -32,7 +32,6 @@ mod persistence {
     use candle_conversation::persistence::{SubstratePersistence, SUBSTRATE_DIR};
     use candle_conversation::substrate::Substrate;
     use zend::config::DaemonConfig;
-    use zend::log_broadcast::LogBus;
     use zend::session::{StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
@@ -143,11 +142,10 @@ mod persistence {
     }
 
     async fn run_session(workspace: std::path::PathBuf) {
-        let log = LogBus::new();
         let config = DaemonConfig::new(
             zend::workspace::single_repo(&workspace, "project").expect("workspace"),
         );
-        let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
+        let session = Arc::new(ZendSession::new(config));
         session.start_loading();
 
         // Two turns on one conversation — the multi-turn continuity case.

@@ -126,14 +126,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::Json;
 use serde_json::{json, Value};
-use web::auth::{Identity, Role};
+use web::auth::{Identity, Role, Roles};
 
 use crate::api::{err, owner_of, Authored};
 use crate::engine::interaction::Interlocutor;
 use crate::engine::mind::Minds;
-use crate::guard::Api;
 use crate::npcs;
 use crate::projection;
+use host::guard::Api;
 
 /// The one refusal this module makes, worded once.
 ///
@@ -148,8 +148,8 @@ pub fn no_engine(what: &str) -> Response {
     )
 }
 
-pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
-    Api::new(state.roles.clone())
+pub fn api(roles: Roles) -> Api<Arc<Authored>> {
+    Api::new(roles)
         // ── the substrate, as it actually is ────────────────────────────────
         .route("/v1/npc/:nid/substrate", Role::User, get(substrate))
         .route(
@@ -266,9 +266,8 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
         //
         // Real: the catalog and the `/` command list are compiled in, and both
         // are served rather than duplicated in the console so the two cannot
-        // drift. Calibration still needs the engine.
-        .route("/v1/tools", Role::User, get(pulse::tools))
-        .route("/v1/tools/calibrate", Role::Admin, post(calibrate))
+        // drift. The catalog is the host's `/v1/tools`, which reads it from
+        // npcd through [`pulse::catalog`].
         .route("/v1/commands", Role::User, get(pulse::commands))
         // ── Pulse: the cast's loop, as an instrument ────────────────────────
         .route("/v1/pulse", Role::User, get(pulse::feed))
@@ -490,8 +489,8 @@ async fn substrate(
                 "window": l.get("window").cloned().unwrap_or(Value::Null),
                 // Real zeros without an engine: a character that has never
                 // run holds nothing in any layer.
-                "conversations": held.map_or(0, |c| c.conversations),
-                "turns": held.map_or(0, |c| c.turns),
+                "conversation_count": held.map_or(0, |c| c.conversation_count),
+                "turn_count": held.map_or(0, |c| c.turn_count),
             })
         }).collect::<Vec<_>>(),
         "engine_connected": live.is_some(),
@@ -1306,16 +1305,6 @@ async fn stream(
     Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
-}
-
-/// The act vocabulary.
-///
-/// Empty, and `engine_connected: false` beside it so the console can say *why*
-/// it is empty. The tools are registered by the engine with the layers each may
-/// write, and calibration is a pass it runs; there is no authored catalog in the
-/// mind to read one from instead.
-async fn calibrate() -> Response {
-    no_engine("calibrating tools")
 }
 
 /// Real: written by the prose guest, against the world's own setting.

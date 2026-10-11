@@ -185,8 +185,8 @@ fn d_connect_timeout_ms() -> u64 {
 /// The two numbers split the files by how much a stale one matters.
 ///
 /// - **`short`** — the documents and the code: HTML, JavaScript, CSS. These are
-///   edited during a session, and `--content` serves them from disk precisely so
-///   a refresh shows the change. A minute is short enough that no edit is lost
+///   edited during a session, and they are served from disk precisely so a
+///   refresh shows the change. A minute is short enough that no edit is lost
 ///   for long and long enough that clicking around costs nothing.
 /// - **`long`** — images, icons and fonts. They change rarely, and a stale one
 ///   is a slightly old picture rather than a page running code that disagrees

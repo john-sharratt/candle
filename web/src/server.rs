@@ -15,20 +15,24 @@
 //! crate with URLs instead.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tower::Service;
 
 use crate::acme::{Challenges, Manager};
 use crate::asset;
-use crate::auth::Auth;
+use crate::auth::{Auth, Gateways};
 use crate::config::{Config, Site, Upstream};
 use crate::content::{self, Roots};
 use crate::errors::{self, Problem};
@@ -45,14 +49,14 @@ struct App {
     /// Sign-in, if this deployment has any. Shared by every site: one account
     /// across the estate is the whole point of the gateway owning it.
     auth: Option<Arc<Auth>>,
-    /// Whether a trusted gateway is the only thing that can reach this server.
+    /// The peers whose inbound `x-tokera-*` headers are believed.
     ///
-    /// Set by [`Builder::behind_gateway`], and the difference between reading
-    /// the inbound `x-tokera-*` headers and clearing them. Declared rather than
-    /// inferred: "has no `auth:` block" would look like the same thing and is
-    /// not — an authoritative instance without sign-in is still an entrance a
-    /// client can reach, and would then believe whatever it was told.
-    behind_gateway: bool,
+    /// Set by [`Builder::trust`], and the difference between reading those
+    /// headers and clearing them. `None` clears them from everyone. Declared
+    /// rather than inferred: "has no `auth:` block" would look like the same
+    /// thing and is not — an authoritative instance without sign-in is still an
+    /// entrance a client can reach, and would then believe whatever it was told.
+    trusted: Option<Gateways>,
     /// Per-site content roots, keyed by site name.
     roots: Arc<HashMap<String, Roots>>,
     /// Per-site in-process APIs, for routes whose upstream is `local`.
@@ -70,7 +74,7 @@ pub struct Builder {
     roots: HashMap<String, Roots>,
     local: HashMap<String, Router>,
     auth: Option<Arc<Auth>>,
-    behind_gateway: bool,
+    trusted: Option<Gateways>,
     /// HTTP-01 answers, set by the ACME manager and served on every hostname.
     /// Empty — every token a 404 — where there is no TLS entrance.
     challenges: Challenges,
@@ -90,7 +94,7 @@ impl Builder {
             roots,
             local: HashMap::new(),
             auth: None,
-            behind_gateway: false,
+            trusted: None,
             challenges: Challenges::default(),
         };
 
@@ -137,22 +141,24 @@ impl Builder {
         self.cfg.sites.iter().map(|s| s.name.as_str())
     }
 
-    /// Declare that a trusted gateway is the only way to reach this server, so
-    /// the identity it forwards on `x-tokera-*` may be believed.
+    /// Believe the identity `gateways` forward on `x-tokera-*`, and clear it
+    /// from every other peer.
     ///
     /// This is how a daemon behind the gateway learns who is calling. Identity
     /// crosses a process boundary as headers and an in-process boundary as a
     /// request extension; a daemon on another box only ever gets the former, so
     /// a server that clears them can never identify anybody. Without this call
-    /// they are cleared on ingress, because a client that sets one is claiming
-    /// to be someone.
+    /// they are cleared on ingress from everyone, because a client that sets one
+    /// is claiming to be someone.
     ///
-    /// **It is an assertion about the network, and nothing here can check it.**
-    /// Call it only where the bind address is unreachable except through the
-    /// gateway — a private interface, a container network, a loopback tunnel.
-    /// On a public bind it hands anyone the right to be anyone.
-    pub fn behind_gateway(mut self) -> Self {
-        self.behind_gateway = true;
+    /// The check is the socket peer's address, so a machine on the LAN that
+    /// connects directly is anonymous whatever it sends. Loopback is always
+    /// among the trusted ([`Gateways`]), so anything on this box that relays
+    /// remote traffic onto loopback — a tunnel, a proxy pointed at
+    /// `127.0.0.1` — is believed as this machine would be, and must clear the
+    /// headers itself.
+    pub fn trust(mut self, gateways: Gateways) -> Self {
+        self.trusted = Some(gateways);
         self
     }
 
@@ -202,7 +208,7 @@ impl Builder {
             clients,
             health,
             auth: self.auth,
-            behind_gateway: self.behind_gateway,
+            trusted: self.trusted,
             roots: Arc::new(self.roots),
             local: Arc::new(self.local),
         };
@@ -220,32 +226,82 @@ impl Builder {
             .layer(axum::middleware::from_fn(crate::compress::layer))
     }
 
+    /// Serve until Ctrl-C, with the TLS entrance the config's `tls:` asks for —
+    /// certificates from Let's Encrypt. The gateway's way to run.
     pub async fn serve(self) -> anyhow::Result<()> {
-        let addr = self.cfg.server.bind;
         let tls = self.cfg.server.tls.clone();
         let groups = crate::acme::names::groups(&self.cfg);
         let challenges = self.challenges();
-        announce(&self.cfg, &self.roots, &self.local);
-        let router = self.router();
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!("web listening on http://{addr}");
+        // The plain entrance first: it answers the CA's HTTP-01 challenges, so
+        // it is listening before the manager can ask for a certificate.
+        let bound = self.bind().await?;
         // Bound before anything is served, so a store that does not load or a
         // port that is taken stops the start rather than leaving the plain
         // entrance up without it. The stored certificates are installed first,
         // so a restart serves what it has without waiting on the CA.
-        let tls_task = match tls {
+        let entrance = match tls {
             Some(tls) => {
                 let resolver = Resolver::new();
                 let manager = Manager::new(tls.acme.clone(), groups, challenges, resolver.clone());
                 manager.install_stored()?;
                 let entrance = Entrance::bind(tls.bind, resolver).await?;
+                tokio::spawn(manager.run());
+                Some(entrance)
+            }
+            None => None,
+        };
+        bound
+            .serve_until(entrance, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+    }
+
+    /// Bind the plain entrance on `server.bind`. Nothing is served until
+    /// [`Bound::serve_until`].
+    pub async fn bind(self) -> anyhow::Result<Bound> {
+        let addr = self.cfg.server.bind;
+        announce(&self.cfg, &self.roots, &self.local);
+        let router = self.router();
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding {addr}"))?;
+        tracing::info!("web listening on http://{addr}");
+        Ok(Bound { listener, router })
+    }
+}
+
+/// A server whose plain entrance is bound and not yet serving.
+pub struct Bound {
+    listener: TcpListener,
+    router: Router,
+}
+
+impl Bound {
+    /// Serve the plain entrance, and `entrance` beside it when there is one,
+    /// until `shutdown` resolves; then stop taking connections and return once
+    /// every request in flight on either entrance has been answered.
+    ///
+    /// The entrance is bound by the caller, so a daemon that presents its own
+    /// certificate ([`crate::tls::self_signed`]) and the gateway that presents
+    /// Let's Encrypt's serve through the same code.
+    pub async fn serve_until(
+        self,
+        entrance: Option<Entrance>,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let Bound { listener, router } = self;
+        // One signal for both entrances: the plain one drains on it, and the
+        // TLS one is told through this channel.
+        let (stopping_tx, mut stopping) = watch::channel(false);
+        let tls_task = match entrance {
+            Some(entrance) => {
                 tracing::info!(
                     "web listening on https://{} — HTTP/3 over udp, HTTP/2 and HTTP/1.1 over tcp",
                     entrance.local_addr()?
                 );
-                tokio::spawn(manager.run());
-                Some(tokio::spawn(entrance.serve(router.clone(), async {
-                    let _ = tokio::signal::ctrl_c().await;
+                Some(tokio::spawn(entrance.serve(router.clone(), async move {
+                    let _ = stopping.changed().await;
                 })))
             }
             None => None,
@@ -260,13 +316,14 @@ impl Builder {
         // round trip that capped a 150 KB response at ~20 KB/s — the GUI's page
         // and tool catalog took 7–8 s to load while the LAN path took 2 ms.
         .tcp_nodelay(true)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            shutdown.await;
             tracing::info!("shutting down");
+            let _ = stopping_tx.send(true);
         })
         .await?;
         // The TLS entrance drains on the same signal; its requests in flight
-        // are answered before the process ends.
+        // are answered before this returns.
         if let Some(task) = tls_task {
             task.await??;
         }
@@ -391,13 +448,18 @@ async fn handle(
     // strip in `proxy::forward` stays: it is on the other side of a `.await`
     // from here, and cheap.
     //
-    // The exception is a server that declared [`Builder::behind_gateway`]: it
-    // is not an entrance, and these headers are the only identity it will ever
-    // receive, because identity crossed a network hop to reach it. Stripping
-    // there would make the header contract unimplementable rather than safe.
-    // Declared, never inferred — "has no `auth:` block" is not evidence of it,
-    // and an authoritative instance without sign-in is still an entrance.
-    if !app.behind_gateway {
+    // The exception is a request from a peer the server declared it trusts
+    // ([`Builder::trust`]): the gateway, whose headers are the only identity a
+    // daemon behind it will ever receive, because identity crossed a network
+    // hop to reach it. Stripping those would make the header contract
+    // unimplementable rather than safe. Declared, never inferred — "has no
+    // `auth:` block" is not evidence of it, and an authoritative instance
+    // without sign-in is still an entrance.
+    let believed = match (&app.trusted, &peer) {
+        (Some(gateways), Some(ConnectInfo(addr))) => gateways.trusts(addr.ip()),
+        _ => false,
+    };
+    if !believed {
         for name in proxy::IDENTITY_HEADERS {
             req.headers_mut().remove(name);
         }

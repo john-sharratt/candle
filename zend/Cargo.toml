@@ -22,16 +22,18 @@ tracing    = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 axum         = { version = "0.7", features = ["macros", "ws", "multipart"] }
-tower-http   = { version = "0.5" }
 tokio        = { version = "1",   features = ["full"] }
 futures      = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
+# The built-in tool catalog's definitions, compiled in (`tool_def`).
 include_dir  = { version = "0.7" }
-mime_guess   = { version = "2" }
-# For `web::asset` only — one implementation of how a static file goes on the
-# wire (entity tag, conditional answer, gzip, cache tier), shared by the
-# gateway, `npcd` and this. Three servers agreeing by construction rather than
-# by three copies of the same intent.
+# The process zend runs in: logging, the model, the HTTP server, the shared
+# endpoints (`docs/shared_model_host.md`). zend is one of its tenants.
+host         = { path = "../host" }
+# The gateway's own types, where zend reads them: who a caller is
+# (`web::auth`) and how a file goes on the wire (`web::asset` — entity tag,
+# conditional answer, gzip, cache tier), one implementation shared with the
+# gateway and the host.
 web          = { path = "../web" }
 reqwest      = { version = "0.12", features = ["stream"] }
 
@@ -40,7 +42,6 @@ candle-conversation = { path = "../candle-conversation", features = ["hub"] }
 zend-tools          = { path = "../zend-tools" }
 zend-vfs            = { path = "../zend-vfs" }
 regex               = "1"
-sysinfo             = { version = "0.31", default-features = false, features = ["system"] }
 tokenizers          = { workspace = true }
 
 # Workspace scanning + scope-aware carving (Phase 1 & 2 ingestion).
@@ -104,7 +105,7 @@ cuda = []
 # Zero-cost scoped timing of the projection / reproject hot path. Forwards to
 # candle-conversation; emits an aggregated breakdown under
 # `candle_conversation::scheduler::profile`.
-profile = ["candle-conversation/profile"]
+profile = ["candle-conversation/profile", "host/profile"]
 # `Tensor::assert` / `QTensor::assert` — one launch per assert site, no sync and
 # no allocation. A debugging session, not a default: the launches are real work.
 tensor-assert = ["candle-conversation/tensor-assert"]

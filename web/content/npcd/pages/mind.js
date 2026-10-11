@@ -39,9 +39,9 @@
  */
 
 import { API } from '../lib/api.js';
-import { h, mount, fmtK } from '../lib/dom.js';
+import { h, mount, fmtK } from '/common/lib/dom.js';
 import { fieldsForm } from '../lib/fields.js';
-import { query } from '../lib/router.js';
+import { query } from '/common/lib/router.js';
 import { toast, empty, confirmDialog, modal, mayEdit, roNote } from '../lib/ui.js';
 
 /* A count for a collection, a length for an entry. One column, because the two

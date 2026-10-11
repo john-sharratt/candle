@@ -13,7 +13,7 @@
 //!   engine over the *same* workspace, which is the whole point of the
 //!   distinction between [`Workspace::open`] and a fresh one.
 //!
-//! ## Why `thinking` is not configurable here
+//! ## Why `thinking` is not a builder setting here
 //!
 //! `ModelBuilder::thinking(false)` is inert in this configuration and it took a
 //! confusing test output to notice: it writes `/no_think` into the *system*
@@ -22,11 +22,14 @@
 //! set explicitly — which a deterministic run always does. So the harness does
 //! not offer it. Tests that care about reasoning assert on memory, and a
 //! `<think>` block in the output is the model's choice, not a defect.
+//!
+//! A test whose budget covers an answer and nothing else turns thinking off per
+//! turn instead, the way zend does: [`quiet_turn`].
 
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle::Device;
@@ -36,9 +39,38 @@ use candle_conversation::persistence::log_file::FILE_FORMAT_VERSION;
 use candle_conversation::persistence::record::SnapshotPayload;
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::projection::{self, TimelineId};
+use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::{
-    ConversationEngine, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
+    ConversationEngine, OptionalState, SamplingConfig, SelectionState, Sequence, SequenceConfig,
+    TurnOptions, NO_THINK_SELECTOR,
 };
+
+/// A deterministic turn of at most `budget` tokens with thinking off, the way
+/// zend switches it off for a turn that must answer within a budget: `<think>`
+/// bound to `ThinkMode::Off`'s tree, which closes the block on the token after
+/// it opens; the sampler programmed to match; and the schema's no-think
+/// selector. A reply that reasons first spends a short budget inside the block,
+/// so its answer is never reached and its reasoning is what a text check reads.
+pub fn quiet_turn(engine: &ConversationEngine, budget: usize) -> TurnOptions {
+    let triggers = match engine
+        .compile_think_steering()
+        .expect("think steering compile")
+    {
+        Some(ts) => ts.registry_for(&TriggerRegistry::new(), ThinkMode::Off),
+        None => Arc::new(TriggerRegistry::new()),
+    };
+    let mut sampling = SamplingConfig::argmax();
+    sampling.apply_think_mode(ThinkMode::Off, engine.tokenizer(), budget);
+    let mut selection = SelectionState::new();
+    selection.set_optional(NO_THINK_SELECTOR, OptionalState::Present);
+    TurnOptions {
+        max_tokens: Some(budget),
+        sampling: Some(sampling),
+        selection,
+        triggers,
+        ..Default::default()
+    }
+}
 use zend_vfs::Workspace as ServedWorkspace;
 
 const PROJECTION_YAML: &str = include_str!("../../src/prompts/projection.yaml");

@@ -252,7 +252,9 @@ pub fn run_strata(
     }
 
     println!("Loading {:?} …", resolved.pack);
-    let model = builder.load_model(&resolved.pack, &device, None)?.model;
+    let model = builder
+        .load_model(&builder.weight_files(&resolved.pack)?, &device, None)?
+        .model;
     // Held for the engine's whole life — see `start_engine`.
     let (_scratch, engine) = start_engine(probe, &device, &resolved.pack, &tokenizer, model)?;
     let config = builder.conversation_config();

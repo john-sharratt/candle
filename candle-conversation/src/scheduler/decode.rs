@@ -1,5 +1,6 @@
 use super::block_guard::BlockGuard;
 use super::named_tool::steer_to_named_tool;
+use super::priority_pause::rank;
 use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{locate_rows, SpecChooser};
 use super::*;
@@ -612,11 +613,11 @@ impl Scheduler {
         // gap between its tool rounds. A paused decode stays active and resumes
         // where it stopped — pure scheduling. Among what remains, the highest
         // priority leads, so the adapter rule below keeps the dialogue's.
-        // `decode_priority_or_high` treats an unresolvable slot as `High`, so a
-        // real decode is never wrongly paused.
+        // `priority_or_high` treats an unresolvable slot as `High`, so a real
+        // decode is never wrongly paused. Priority is tenant first, band second.
         self.observe_priorities();
         seq_ids.retain(|&id| !self.priority_paused(id));
-        seq_ids.sort_by_key(|&id| std::cmp::Reverse(self.decode_priority_or_high(id).ratio()));
+        seq_ids.sort_by_key(|&id| std::cmp::Reverse(rank(self.priority_or_high(id))));
 
         // ── One adapter per wave ─────────────────────────────────────────────
         //

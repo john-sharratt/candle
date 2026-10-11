@@ -850,7 +850,7 @@ fn run_dir_pool(
                     // finishes (the scheduler is still live), so the engine can
                     // drain rather than the shutdown losing the un-drained tier
                     // tail.
-                    if failures.aborted() || candle_conversation::ingest_cancelled() {
+                    if failures.aborted() || crate::ingest_cancel::cancelled() {
                         return;
                     }
                     // Claim the unit BEFORE reserving a slot: a worker that
@@ -1130,7 +1130,7 @@ fn process_one_dir(
             // workers in flight would otherwise book 24 failures at once, trip
             // the abort, and report the pass as incomplete. The partial was just
             // tombstoned, so the directory re-ingests next run.
-            if candle_conversation::ingest_cancelled() {
+            if crate::ingest_cancel::cancelled() {
                 tracing::debug!(
                     target: "zend::repo_scan",
                     dir = %unit.dir,

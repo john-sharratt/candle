@@ -47,7 +47,7 @@ Device::new_cuda|cuda_if_available|Device::Cuda\(|new_cuda\(|ZendSession::|gpu_t
 ```
 
 A match inside production code is not a GPU test by itself — but a test that *calls* that
-production path is (e.g. `zend::model_choice`'s ladder calls `Device::new_cuda`). When a
+production path is (e.g. a test that boots a `ZendSession` reaches `Device::new_cuda`). When a
 match is in production code, check whether the crate's tests reach it. Classify
 **conservatively**: when in doubt, it goes to the GPU pass — a CPU test at one thread costs
 seconds, a GPU test at 32 threads costs the card.
@@ -94,7 +94,7 @@ The 2026-09-14 audit, for orientation only — re-derive it:
 | crate | GPU lib modules | GPU integration binaries | CPU integration binaries |
 |---|---|---|---|
 | `candle-conversation` | `persistence::transfer`, `persistence::elevate`, `batched_sampler::tests`, `provenance::gpu`, `provenance::gallery_arena` | `cold_warm_hot_path`, `compression_integration`, `conversation_tests`, `deepseek_rung4`, `narrator_integration_test`, `narrator_window_test`, `prefill_ab`, `projection_identity`, `summarization_tests`, `thinking_span`, `turn_belief_scan` | `integrity_repair`, `literal_text_real_vocab`, `live_turn_gallery`, `narrator_tests`, `selection_replay`, `staged_ingest_events`, `store_tests`, `token_bias_chatml`, `token_bias_real_vocab` |
-| `zend` | `model_choice` | `coherence_integration`, `duplication_replay`, `gui_api_harness`, `hybrid_recurrent_state`, `infinite_conversation_deep`, `infinite_conversation_smoke`, `integration`, `memory_continuity`, `persistence_integration` (ignored), `provenance_fold_real_geometry`, `recall_quality`, `reproject_control`, `reproject_wave`, `restart_turn_recovery`, `section_quantize_end_to_end`, `startup_stall_watchdog`, `tools_integration`, `zen_code_phase12_smoke` | `code_read_integration`, `repo_scan_integration`, `stencil_tool_call`, `tokenizer_special_tokens`, `tool_catalog`, `watcher_integration` — plus `--bin zend` (`main.rs`'s `wipe_tests`), which `--lib` does not reach |
+| `zend` | none | `coherence_integration`, `duplication_replay`, `hybrid_recurrent_state`, `infinite_conversation_deep`, `infinite_conversation_smoke`, `integration`, `memory_continuity`, `persistence_integration` (ignored), `provenance_fold_real_geometry`, `recall_quality`, `reproject_control`, `reproject_wave`, `restart_turn_recovery`, `section_quantize_end_to_end`, `startup_stall_watchdog`, `tools_integration`, `zen_code_phase12_smoke`, `degradation_script` | `gui_api_harness` (model-less), `repo_scan_integration`, `stencil_tool_call`, `tokenizer_special_tokens`, `tool_catalog` — plus `--bin zend` (`main.rs`'s flag tests), which `--lib` does not reach |
 | `npcd` | none (its device is constructed only on the model-load path, which no test reaches) | none | `makers`, `tools`, `vault` |
 
 **C. No CUDA in the dependency graph — CPU pass only, full width.**

@@ -30,10 +30,10 @@
  */
 
 import { API } from './api.js';
-import { h, mount } from './dom.js';
+import { h, mount } from '/common/lib/dom.js';
 import { toast } from './ui.js';
-import { parseLine, filterCommands, FREE_TEXT } from './cmd.js';
-import { sticky, selectionInside, throttled } from './live.js';
+import { parseLine, filterCommands, FREE_TEXT } from '/common/lib/cmd.js';
+import { sticky, selectionInside, throttled } from '/common/lib/live.js';
 import * as sessions from './sessions.js';
 
 /* Tools whose observable trace is somebody speaking. */

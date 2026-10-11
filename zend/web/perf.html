@@ -377,9 +377,11 @@ function paintKPIs() {
       `${fmtNum(Math.round(m.mib))} MiB · ${((100 * m.quant) / Math.max(1, m.total)).toFixed(0)}% quantize`,
       stateBy(s, LIMITS.migWarnS, LIMITS.migCritS)));
   }
-  if (HOST.total_gib > 0) {
-    cards.push(kpi('Host RAM free', HOST.free_gib.toFixed(0), 'GiB',
-      `of ${HOST.total_gib.toFixed(0)}`, 'ok', 1 - HOST.free_gib / HOST.total_gib));
+  // The host reports memory in MiB, measured or absent (`null`).
+  if (HOST.total_mib > 0 && HOST.free_mib != null) {
+    const gib = (mib) => mib / 1024;
+    cards.push(kpi('Host RAM free', gib(HOST.free_mib).toFixed(0), 'GiB',
+      `of ${gib(HOST.total_mib).toFixed(0)}`, 'ok', 1 - HOST.free_mib / HOST.total_mib));
   }
   mount(kpis, ...cards);
 }

@@ -144,7 +144,7 @@ impl BranchIngest {
         progress.set_step_progress(0, total);
         let mut end: Option<TimelineId> = None;
         for (done, link) in chain.iter().enumerate() {
-            if candle_conversation::ingest_cancelled() {
+            if crate::ingest_cancel::cancelled() {
                 break;
             }
             let read = match (link, folders, files) {

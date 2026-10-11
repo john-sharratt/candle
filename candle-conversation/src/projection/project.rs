@@ -1249,10 +1249,11 @@ pub fn run_with_sink<R: ContentResolver>(
     // on the returned `Projection` so the persisted record / GUI can show it.
     let mut selection_origins: HashMap<TurnKey, SelectionOrigin> = HashMap::new();
 
-    // Hoisted out of the per-layer loop below: the kill switch is process-global,
-    // so "is anything disabled?" has one answer for the whole assembly. Asking it
-    // per layer made this the second-hottest resolved symbol in an ingest profile.
-    let any_layer_disabled = super::layer_toggle::any_layer_disabled();
+    // Hoisted out of the per-layer loop below: the kill switch is the
+    // substrate's, so "is anything disabled?" has one answer for the whole
+    // assembly. Asking it per layer made this the second-hottest resolved symbol
+    // in an ingest profile.
+    let any_layer_disabled = resolver.any_layer_disabled();
     let tool_round = selection.optional(TOOL_ROUND_SELECTOR) == Some(OptionalState::Present);
 
     for (li, layer) in visible_layers.iter().enumerate() {
@@ -1277,10 +1278,7 @@ pub fn run_with_sink<R: ContentResolver>(
         // contributes nothing to the assembly (its groups are never scored or
         // selected). The target layer is never skipped — that would leave the
         // projection with nothing to emit. See `super::layer_toggle`.
-        if !layer_is_target
-            && any_layer_disabled
-            && super::layer_toggle::is_layer_disabled(&layer.name)
-        {
+        if !layer_is_target && any_layer_disabled && resolver.layer_disabled(&layer.name) {
             continue;
         }
         // A tool round leaves out the layers whose turns would compete with

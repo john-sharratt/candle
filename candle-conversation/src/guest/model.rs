@@ -212,6 +212,16 @@ impl GuestRegistry {
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
+
+    /// Take every guest `other` configures — the union of two tenants'
+    /// registries on one engine. A kind both name keeps `other`'s, as
+    /// [`Self::register`] does.
+    pub fn merge(&mut self, other: GuestRegistry) {
+        for slot in other.slots {
+            self.slots.retain(|s| s.guest != slot.guest);
+            self.slots.push(slot);
+        }
+    }
 }
 
 #[cfg(test)]

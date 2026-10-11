@@ -65,8 +65,8 @@ server:
   # the file changes:
   #
   #   short — HTML, JavaScript, CSS. A page running last minute's code against
-  #           this minute's API is the failure worth bounding, and `--content`
-  #           serves these from disk so a refresh can show an edit.
+  #           this minute's API is the failure worth bounding, and these are
+  #           served from disk so a refresh can show an edit.
   #   long  — images, icons, fonts. A stale one is a slightly old picture.
   #
   # Both still carry an ETag, so these say when to *ask*, not what the answer
@@ -110,10 +110,10 @@ server:
 #
 # Those headers are cleared from every inbound request first — by this gateway,
 # and again inside each daemon, since a daemon embedding its API as
-# `upstream: local` would otherwise be handed the client's own. A daemon opts
-# back in by calling `web::Builder::behind_gateway`, which asserts that its bind
-# address is reachable through the gateway and nothing else. Nothing verifies
-# that claim, so keep such a daemon on a private interface.
+# `upstream: local` would otherwise be handed the client's own. A daemon
+# believes them only from the socket peers it trusts (`web::Builder::trust`):
+# loopback, its own bind address, and each `--gateway` it is given — this box,
+# for a daemon on another machine.
 #
 # **No secret is shared with any daemon.** There is deliberately no session key
 # to copy to `npcd` or `zend`: the session cookie signs sessions for the whole

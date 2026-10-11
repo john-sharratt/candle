@@ -47,9 +47,10 @@ serde      = { workspace = true }
 # Same axum the `web` crate builds its router from — the two are layered
 # together at startup, so they must be the same version or the `Router` types
 # do not unify.
-# `ws` for `/ws/logs`: the console tails the daemon's own log lines rather than
-# polling for them.
 axum       = { version = "0.7", features = ["macros", "ws"] }
+# The process npcd runs in: logging, the model, the HTTP server, the shared
+# endpoints (`docs/shared_model_host.md`). npcd is one of its tenants.
+host       = { path = "../host" }
 # Hashing a provider's subject id into a file name that is valid whatever shape
 # the provider chose. Not a security boundary — the subject inside the file is
 # authoritative — but it has to be total over every possible input.
@@ -82,7 +83,6 @@ image      = { workspace = true }
 # for what it is and why it is not a colour algorithm.
 candle-onnx = { path = "../candle-onnx", version = "0.9.1" }
 
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio      = { version = "1", features = ["full"] }
 # `executor::block_on` for the startup loader thread, which drives the async
 # ingest writers itself: their futures wake on the engine's own channels, so a
@@ -93,11 +93,9 @@ futures    = { workspace = true }
 # a generated description reaches the page a token at a time instead of after
 # the whole drain. Already in the lockfile via axum's own dependencies.
 tokio-stream = { version = "0.1" }
-include_dir = { version = "0.7" }
 
-# The HTTP front. `npcd` supplies the console files and an API router; `web`
-# does host routing, static serving, and — in the DMZ deployment of the very
-# same crate — proxying. One binary either way.
+# Identity, roles and the route guard's types — the HTTP front itself is the
+# host's.
 web = { path = "../web" }
 # The conversation substrate — characters are durable artifacts in its redo log
 # (`RecordType::Npc`), so one outlives the process that made it.
@@ -117,16 +115,6 @@ candle-conversation = { path = "../candle-conversation", features = ["hub"] }
 # stand up an engine that runs at a rate nobody would call inference, and would
 # do it silently.
 candle = { workspace = true, features = ["cuda"] }
-# Real card and host numbers for `/v1/telemetry`, which otherwise had to invent
-# them. NVML is what `nvidia-smi` itself reads: a runtime link against the
-# installed driver, so it costs no CUDA toolkit build — pulling in `candle` for
-# this would have turned a thirty-second daemon build into a twenty-minute one
-# in order to report how much VRAM is free. An absent driver, an absent card,
-# and a machine with no NVIDIA hardware are ordinary answers here, not failures.
-nvml-wrapper = "0.12"
-# Host memory, and this process's own footprint. Pinned to the version already
-# in the workspace lockfile so npcd does not drag a second copy in.
-sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -134,9 +122,7 @@ tempfile = { workspace = true }
 # live checkpoint, and the daemon is holding it. A blocking client, because the
 # example is a script and a decode is measured in seconds.
 ureq = { version = "2.12", default-features = false }
-# `test-util` (not in `full`) for the paused clock. The telemetry sampler ticks
-# every 2s, so proving it runs unattended would otherwise mean a test that
-# genuinely sleeps for eight seconds.
+# `test-util` (not in `full`) for the paused clock.
 tokio = { version = "1", features = ["full", "test-util"] }
 # `tower` (for `ServiceExt::oneshot`, used to drive routers in tests without a
 # port) is a regular dependency now, because the effector fast path needs it in

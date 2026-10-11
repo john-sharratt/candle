@@ -265,10 +265,13 @@ function stillOpen(node){ const c = node.closest && node.closest('.grp'); return
 const S = { data:null, build:null, lastCounts:null, sp:null, toolsData:null, layerCache:{}, tlCache:{} };
 
 // ── lazy loaders (fetch-on-expand, cached) ─────────────────────────────────
-async function loadSystemPrompt(){ if(!S.sp) S.sp = MOCK?mockSystemPrompt():await getJSON('/v1/substrate/system-prompt'); return S.sp; }
-async function loadTools(){ if(!S.toolsData) S.toolsData = MOCK?mockTools():await getJSON('/v1/substrate/tools'); return S.toolsData; }
-async function loadLayer(name){ if(!S.layerCache[name]) S.layerCache[name] = MOCK?mockLayer(name):await getJSON('/v1/substrate/layer/'+encodeURIComponent(name)); return S.layerCache[name]; }
-async function loadTimeline(tl){ if(!S.tlCache[tl]) S.tlCache[tl] = MOCK?mockTimeline(tl):await getJSON('/v1/substrate/timeline/'+encodeURIComponent(tl)); return S.tlCache[tl]; }
+// zend's own substrate views live under `/v1/substrate/zend/`; the overview and
+// the tool catalog are the host's, with zend's part named by its tenant.
+const VIEWS = '/v1/substrate/zend';
+async function loadSystemPrompt(){ if(!S.sp) S.sp = MOCK?mockSystemPrompt():await getJSON(VIEWS+'/system-prompt'); return S.sp; }
+async function loadTools(){ if(!S.toolsData) S.toolsData = MOCK?mockTools():await getJSON('/v1/tools').then((b)=>({ tools:(b.tools||[]).filter((t)=>t.tenant==='zend') })); return S.toolsData; }
+async function loadLayer(name){ if(!S.layerCache[name]) S.layerCache[name] = MOCK?mockLayer(name):await getJSON(VIEWS+'/layer/'+encodeURIComponent(name)); return S.layerCache[name]; }
+async function loadTimeline(tl){ if(!S.tlCache[tl]) S.tlCache[tl] = MOCK?mockTimeline(tl):await getJSON(VIEWS+'/timeline/'+encodeURIComponent(tl)); return S.tlCache[tl]; }
 
 function setLive(cls, txt){
   const p=document.getElementById('live'); p.className='pill '+cls;
@@ -293,10 +296,10 @@ function renderKPIs(d){
     kpi('substrate size', fmtBytes(st.total_bytes), null, st.segments.length+' segment'+(st.segments.length===1?'':'s')),
     kpi('active segment', active?('#'+active.id):'—', null, active?fmtBytes(active.bytes):''),
     kpi('dead / reclaimable', dead==null?'—':(dead*100).toFixed(1), dead==null?null:'%', dead==null?'compacting…':(dead>=0.5?'compaction due':'healthy'), deadCls),
-    kpi('sealed tokens', fmtTok(c.tokens), null, 'turns + shared sections, once each'),
+    kpi('sealed tokens', fmtTok(c.token_count), null, 'turns + shared sections, once each'),
     kpi('KV chunk records', fmtN(st.live_chunks), null, '32 tokens × 1 layer each'),
-    kpi('conversations', fmtN(c.conversations), null, fmtN(c.timelines)+' timelines'),
-    kpi('prompt sections', fmtN(c.sections)),
+    kpi('conversations', fmtN(c.conversation_count), null, fmtN(c.timeline_count)+' timelines'),
+    kpi('prompt sections', fmtN(c.section_count)),
   );
 }
 
@@ -412,7 +415,7 @@ function layerCard(l, d){
     onclick: async (e)=>{
       e.stopPropagation();
       try{
-        const r = await fetch('/v1/substrate/layer/'+encodeURIComponent(l.name)+'/toggle',{method:'POST'});
+        const r = await fetch(VIEWS+'/layer/'+encodeURIComponent(l.name)+'/toggle',{method:'POST'});
         const j = await r.json();
         l.disabled = j.disabled;
         tbtn.style.background = j.disabled ? '#b04a4a' : '#2f6f4f';
@@ -424,7 +427,7 @@ function layerCard(l, d){
   const head=[
     h('span',{class:'title mono'},[document.createTextNode(l.name)]),
     h('div',{class:'meta'},[
-      l.conv_count?badge('on', l.conv_count+' conv'):badge('off','empty'),
+      l.conversation_count?badge('on', l.conversation_count+' conv'):badge('off','empty'),
       l.tokens?badge('', fmtTok(l.tokens)+' tok'):null,
       isTarget?badge('peak','target'):null,
       badge('', 'win '+fmtTok(l.window)),
@@ -442,7 +445,7 @@ function layerCard(l, d){
       body.appendChild(h('div',{class:'chips'}, l.groups.map(g=>
         h('span',{class:'chip',html:'<b>'+escapeHtml(g.name)+'</b> · '+escapeHtml(g.selection)}))));
     }
-    if(!l.conv_count){ body.appendChild(h('div',{class:'empty',text:'No conversations target this layer yet.'})); return; }
+    if(!l.conversation_count){ body.appendChild(h('div',{class:'empty',text:'No conversations target this layer yet.'})); return; }
     const listHost=h('div'); body.appendChild(listHost);
     listHost.appendChild(spinner('loading conversations…'));
     let ld; try{ ld = await loadLayer(l.name); }
@@ -485,7 +488,7 @@ function convCard(c){
     h('div',{class:'meta'},[
       c.archived?badge('arch','archived'):null,
       c.summary_nodes?badge('sum', c.summary_nodes+' summary'):null,
-      badge('', c.turns+' turns'),
+      badge('', c.turn_count+' turns'),
       badge('', fmtTok(c.tokens)+' tok'),
       c.conv_id?badge('', shortId(c.conv_id)):null,
     ].filter(Boolean)),
@@ -505,7 +508,7 @@ function renderForest(host, tl){
   const meta=h('div',{class:'chips'},[
     h('span',{class:'chip',html:'<b>'+escapeHtml(tl.layer||'—')+'</b> / '+escapeHtml(tl.group||'—')}),
     h('span',{class:'chip',html:'<b>'+fmtTok(tl.total_tokens)+'</b> tokens'}),
-    h('span',{class:'chip',html:'<b>'+tl.turns.length+'</b> turns'}),
+    h('span',{class:'chip',html:'<b>'+tl.turn_count+'</b> turns'}),
     tl.peaks.length?h('span',{class:'chip',html:'<b>'+tl.peaks.length+'</b> forest peaks'}):null,
     tl.couplings.length?h('span',{class:'chip',html:'<b>'+tl.couplings.length+'</b> exchanges'}):null,
   ].filter(Boolean));
@@ -616,8 +619,14 @@ async function refresh(){
   try{
     // The overview is intentionally light (storage + counts + layer metadata);
     // conversations, sections and the tool catalog load per-expansion. So this
-    // poll stays cheap and never loads the whole substrate up front.
-    const d = MOCK ? mockOverview() : await getJSON('/v1/substrate');
+    // poll stays cheap and never loads the whole substrate up front. It is
+    // zend's line in the host's overview of every attached substrate — `null`
+    // until zend's engine holds it open, which reads as the model loading.
+    const d = MOCK ? mockOverview() : await getJSON('/v1/substrate').then((o)=>{
+      const z = (o.tenants||{}).zend;
+      if(!z) throw new Error('503');
+      return z;
+    });
     if(!S.data){ renderAll(d); setLive('live','live'); return; }
     // Live: refresh KPIs + segment bar in place. If structure changed, offer a
     // reload rather than rebuild — rebuilding would collapse whatever the user
@@ -641,7 +650,8 @@ async function refresh(){
   }
 }
 
-// Force-reload when the daemon is rebuilt (embedded UI hash changes).
+// Force-reload when the build changes: a UI file edited on disk, or the daemon
+// rebuilt.
 async function pollBuild(){
   if(MOCK) return;
   try{
@@ -665,16 +675,16 @@ function mockOverview(){
   return {
     storage:{ segments:[{id:13,active:false,bytes:4630511616},{id:14,active:true,bytes:1966080000}],
       total_bytes:6596591616, live_chunks:537, dead_ratio:0.18 },
-    counts:{ timelines:9, conversations:5, sections:142, tokens:137250 },
+    counts:{ timeline_count:9, conversation_count:5, section_count:142, token_count:137250 },
     target_layer:'dialogue',
     layers:[
       {name:'repo_map',description:'Structural shape of the repository: directory tree, file types, line counts.',
-        window:6000,priority:5,groups:[{name:'structure',selection:'top 3'}],dials:['thinking_effort = off','response_length = terse','tools = none'],conv_count:1,tokens:14880},
+        window:6000,priority:5,groups:[{name:'structure',selection:'top 3'}],dials:['thinking_effort = off','response_length = terse','tools = none'],conversation_count:1,tokens:14880},
       {name:'code_reading',description:'Raw scope-aware code chunks. One turn per (file × scope) chunk.',
-        window:6000,priority:25,groups:[{name:'scopes',selection:'top 4'}],dials:['thinking_effort = off','response_length = terse','tools = none'],conv_count:2,tokens:10430},
+        window:6000,priority:25,groups:[{name:'scopes',selection:'top 4'}],dials:['thinking_effort = off','response_length = terse','tools = none'],conversation_count:2,tokens:10430},
       {name:'dialogue',description:'The active developer conversation served to the VS Code extension or web chat.',
         window:16000,priority:100,groups:[{name:'primary_conversation',selection:'recent 16 + top 8'}],
-        dials:[],conv_count:3,tokens:35630},
+        dials:[],conversation_count:3,tokens:35630},
     ],
   };
 }
@@ -705,17 +715,17 @@ function mockTools(){
 function mockLayer(name){
   const m={
     repo_map:[
-      {timeline:'3300220011009988776',conv_id:'',repo:'candle',label:'/',archived:false,group:'structure',turns:2,tokens:14880,summary_nodes:0,branches:['main']},
-      {timeline:'3300220011009988777',conv_id:'',repo:'candle',label:'/',archived:false,group:'structure',turns:2,tokens:14880,summary_nodes:0,branches:['cline-passthrough','hunt-snapshot','npc-engine','qwen38-moe','stencil-json-repair']},
+      {timeline:'3300220011009988776',conv_id:'',repo:'candle',label:'/',archived:false,group:'structure',turn_count:2,tokens:14880,summary_nodes:0,branches:['main']},
+      {timeline:'3300220011009988777',conv_id:'',repo:'candle',label:'/',archived:false,group:'structure',turn_count:2,tokens:14880,summary_nodes:0,branches:['cline-passthrough','hunt-snapshot','npc-engine','qwen38-moe','stencil-json-repair']},
     ],
     code_reading:[
-      {timeline:'2200110099887766554',conv_id:'',repo:'candle',label:'candle-conversation/src/substrate.rs',archived:false,group:'scopes',turns:9,tokens:6120,summary_nodes:0,branches:['main','qwen38-moe'],commit:'2122c95d9b8e4f1a3c5d7e9f0a1b2c3d4e5f6a7b'},
-      {timeline:'2200110099887766555',conv_id:'',repo:'candle',label:'zend/src/session.rs',archived:false,group:'scopes',turns:6,tokens:4310,summary_nodes:0,branches:['main'],commit:'1dda19ce4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c'},
+      {timeline:'2200110099887766554',conv_id:'',repo:'candle',label:'candle-conversation/src/substrate.rs',archived:false,group:'scopes',turn_count:9,tokens:6120,summary_nodes:0,branches:['main','qwen38-moe'],commit:'2122c95d9b8e4f1a3c5d7e9f0a1b2c3d4e5f6a7b'},
+      {timeline:'2200110099887766555',conv_id:'',repo:'candle',label:'zend/src/session.rs',archived:false,group:'scopes',turn_count:6,tokens:4310,summary_nodes:0,branches:['main'],commit:'1dda19ce4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c'},
     ],
     dialogue:[
-      {timeline:'8421990033112233445',conv_id:'a1b2c3d4e5f6',label:'Trace the substrate redo log replay',archived:false,group:'primary_conversation',turns:18,tokens:24310,summary_nodes:3},
-      {timeline:'7311882299441100223',conv_id:'99aa88bb77cc',label:'Segmented log compaction design',archived:false,group:'primary_conversation',turns:7,tokens:9120,summary_nodes:0},
-      {timeline:'5120033441122008765',conv_id:'deadbeef0001',label:'Old spike (archived)',archived:true,group:'primary_conversation',turns:4,tokens:2200,summary_nodes:0},
+      {timeline:'8421990033112233445',conv_id:'a1b2c3d4e5f6',label:'Trace the substrate redo log replay',archived:false,group:'primary_conversation',turn_count:18,tokens:24310,summary_nodes:3},
+      {timeline:'7311882299441100223',conv_id:'99aa88bb77cc',label:'Segmented log compaction design',archived:false,group:'primary_conversation',turn_count:7,tokens:9120,summary_nodes:0},
+      {timeline:'5120033441122008765',conv_id:'deadbeef0001',label:'Old spike (archived)',archived:true,group:'primary_conversation',turn_count:4,tokens:2200,summary_nodes:0},
     ],
   };
   return { conversations: m[name] || [] };
@@ -724,6 +734,7 @@ function mockTimeline(tl){
   return {
     timeline:tl, conv_id:'a1b2c3d4e5f6', label:'Trace the substrate redo log replay', archived:false,
     layer:'dialogue', group:'primary_conversation', total_tokens:24310, peaks:[8], couplings:[5],
+    turn_count:4,
     turns:[
       {index:0,kind:'normal',height:0,tokens:120,no_think:false,children:[],coupled:false,peak:false,
         user:'Trace how the substrate redo log gets replayed on daemon boot.',

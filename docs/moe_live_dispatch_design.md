@@ -2038,7 +2038,7 @@ are landing late.
 - **The pipeline thread records into the process-wide store** (`pipeline_record`)
   instead of its private `ProfileAccumulator` (`pipeline.rs:1473`), so `pipe_*`,
   `cl_*`, `cold_*`, `copy:*` reach `pipeline_snapshot*`, `/v1/profile`
-  (`zend/src/api/profile.rs`) and `kv_fragmentation`'s tables, which today never
+  (`host/src/endpoints/profile.rs`) and `kv_fragmentation`'s tables, which today never
   see them. `ExpertCache::forward_profile` and `record_profile`'s second write go
   (it double-counts every forward-thread span, `handle.rs:1916-1922`).
 - **`snapshot_profiles`** becomes: `Settle` (the pipeline thread drains its spans

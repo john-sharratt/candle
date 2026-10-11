@@ -242,8 +242,8 @@ pub use event::{
     SelectedSection, SelectedTurn, SelectionScores, SystemItem,
 };
 pub use ids::{
-    CollectionId, GroupId, LayerId, Reserved, SectionId, TimelineAllocator, TimelineId, TurnId,
-    TurnIndex, TurnKey,
+    process_timeline_allocator, CollectionId, GroupId, LayerId, Reserved, SectionId,
+    TimelineAllocator, TimelineId, TurnId, TurnIndex, TurnKey,
 };
 pub use owned_prefix::prefix_before_collection;
 pub use owned_sections::{OwnedSection, OwnedSections};
@@ -257,6 +257,7 @@ pub use project::{
     TOOLS_ENABLED_SELECTOR, TOOL_ROUND_SELECTOR,
 };
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
+pub(crate) use resolver::SubstrateRef;
 pub use resolver::{
     CollectionWarm, Conversation, GalleryPreload, Observe, SectionLoads, TargetedRead, WarmProbe,
 };

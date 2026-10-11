@@ -52,6 +52,7 @@ use crate::scheduler::piece_identity::{
 };
 use crate::scheduler::profile;
 use crate::scheduler::projection_identity::section_content_stamp;
+use crate::scheduler::section_pages::SectionPages;
 use crate::sequence_handle::SequenceId;
 use crate::substrate::Substrate;
 use crate::summary_tree::SelectionOrigin;
@@ -646,7 +647,7 @@ pub(super) struct ApplyContext<'a> {
     /// Each sealed section's per-position model state, so a borrowed section
     /// brings its index rows along with its chunks. Empty for a model that
     /// carries none — see `Scheduler::section_positional`.
-    pub(super) section_positional: &'a HashMap<SectionId, Arc<StoredPages>>,
+    pub(super) section_positional: &'a SectionPages,
     /// Each sealed turn's per-position model state — the dialogue counterpart
     /// of [`Self::section_positional`], and the one this path uses most.
     pub(super) turn_positional: &'a HashMap<TurnKey, Arc<StoredPages>>,
@@ -1489,6 +1490,10 @@ fn inject_sealed_section(
     // match-scrutinee-temporary rule would turn any future re-`read()` in an arm
     // into a recursive-read self-deadlock under the writer-priority `RwLock`.
     let sealed = ctx.conversation.read().section_sealed_of(sid);
+    // The page is keyed by the section's content address: `sid` is this
+    // substrate's schema's own id, and names another section in a tenant's.
+    let stream = ctx.conversation.read().section_stream(sid);
+    let page = stream.and_then(|s| ctx.section_positional.get(s)).cloned();
     let sealed = match sealed {
         Some(s) => s,
         None => {
@@ -1517,8 +1522,7 @@ fn inject_sealed_section(
     // entirely to restate the ordinary case. The count is not lost: the
     // `reproject (zero-copy rebuild)` line already carries `sections`, so "did
     // sections reach here" is answerable at debug without a line each.
-    let has_page = ctx.section_positional.contains_key(&sid);
-    if has_page {
+    if page.is_some() {
         tracing::trace!(
             target: "candle_conversation::scheduler::reproject",
             slot = parent_id.0,
@@ -1536,7 +1540,7 @@ fn inject_sealed_section(
     // The rows that go with those chunks. Borrowing the K/V is what makes this
     // path cheap; the index cannot be borrowed the same way, because its keys
     // come from hidden states this slot never computed.
-    if let Some(page) = ctx.section_positional.get(&sid) {
+    if let Some(page) = page {
         match ctx
             .model
             .push_positional_state(parent_id.0, page.bytes(), &page.whole_key())

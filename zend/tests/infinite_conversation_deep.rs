@@ -20,6 +20,11 @@
 //!     --test infinite_conversation_deep -- --ignored \
 //!     infinite_conversation_cruise --nocapture
 //! ```
+//!
+//! Every turn runs with thinking off ([`quiet_turn`]): at this budget a reply
+//! that reasons first never reaches its answer.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 
@@ -27,8 +32,12 @@ use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::projection;
 use candle_conversation::{ConversationEngine, SamplingConfig, Sequence};
+use common::quiet_turn;
 
 const PROJECTION_YAML: &str = include_str!("../src/prompts/projection.yaml");
+
+/// A turn's reply budget.
+const REPLY_TOKENS: usize = 40;
 
 fn cuda_device() -> Option<Device> {
     match Device::cuda_if_available(0) {
@@ -77,7 +86,7 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
         .workspace_path(workspace)
         .sampling(SamplingConfig::argmax())
         .seed(0)
-        .max_response_tokens(40)
+        .max_response_tokens(REPLY_TOKENS)
         .thinking(false);
     let conv_config = builder.conversation_config();
     let engine = builder.engine(&device).expect("engine load");
@@ -119,17 +128,23 @@ fn infinite_conversation_cruise() {
 
     const GROWTH: usize = 200;
     let timeline_id = base_conv.timeline_id();
+    let quiet = quiet_turn(&engine, REPLY_TOKENS);
     let mut conv = base_conv.fork_resuming(timeline_id).expect("fork");
     // Plant a marker turn early.
     let _ = conv
-        .send_turn("Important early marker: the safe combination is 17-42-9.  Anyway, continuing.")
+        .send_turn_with_options(
+            "Important early marker: the safe combination is 17-42-9.  Anyway, continuing.",
+            quiet.clone(),
+        )
         .expect("plant");
     for i in 1..GROWTH {
         let user_msg = format!(
             "Cruise turn {i}: tell me about unrelated topic number {}.",
             i % 32
         );
-        let _ = conv.send_turn(&user_msg).expect("send_turn");
+        let _ = conv
+            .send_turn_with_options(&user_msg, quiet.clone())
+            .expect("send_turn");
         if i % 50 == 0 {
             let diag = engine.last_selection_diagnostics(timeline_id);
             eprintln!(
@@ -144,7 +159,10 @@ fn infinite_conversation_cruise() {
     // Recall: ask for the planted marker many turns later.
     let mut probe_conv = base_conv.fork_resuming(timeline_id).expect("fork probe");
     let response = probe_conv
-        .send_turn("What was the safe combination I mentioned at the start?")
+        .send_turn_with_options(
+            "What was the safe combination I mentioned at the start?",
+            quiet.clone(),
+        )
         .expect("probe");
     eprintln!("cruise recall: {:?}", response.text);
     let recalled = response.text.contains("17-42-9");
@@ -176,13 +194,19 @@ fn infinite_conversation_stress() {
         .expect("set debug_id");
     const GROWTH: usize = 2_000;
     let timeline_id = base_conv.timeline_id();
+    let quiet = quiet_turn(&engine, REPLY_TOKENS);
     let mut conv = base_conv.fork_resuming(timeline_id).expect("fork");
     let _ = conv
-        .send_turn("Stress marker: the launch codename is BLUEBIRD.  Continuing.")
+        .send_turn_with_options(
+            "Stress marker: the launch codename is BLUEBIRD.  Continuing.",
+            quiet.clone(),
+        )
         .expect("plant");
     for i in 1..GROWTH {
         let user_msg = format!("Stress turn {i}: discuss topic {}.", i % 64);
-        let _ = conv.send_turn(&user_msg).expect("send_turn");
+        let _ = conv
+            .send_turn_with_options(&user_msg, quiet.clone())
+            .expect("send_turn");
         if i % 200 == 0 {
             eprintln!(
                 "stress: depth={i} pending={}",
@@ -193,7 +217,7 @@ fn infinite_conversation_stress() {
     conv.close().expect("close");
     let mut probe_conv = base_conv.fork_resuming(timeline_id).expect("fork probe");
     let response = probe_conv
-        .send_turn("What was the launch codename from earlier?")
+        .send_turn_with_options("What was the launch codename from earlier?", quiet.clone())
         .expect("probe");
     eprintln!("stress recall: {:?}", response.text);
     let recalled = response.text.to_lowercase().contains("bluebird");

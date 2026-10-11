@@ -41,10 +41,11 @@
 </script>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <!-- base.css is the shared design system (themes, reset, shell, controls,
-     modal, disclosure, responsive); app.css is what only the console needs.
-     Two parallel requests rather than an  chain, which would serialise. -->
-<link rel="stylesheet" href="/base.css">
-<link rel="stylesheet" href="/lib/estate.css">
+     modal, disclosure, responsive) — served once, at /common/, for every UI the
+     host serves; app.css is what only the console needs. Two parallel requests
+     rather than an  chain, which would serialise. -->
+<link rel="stylesheet" href="/common/base.css">
+<link rel="stylesheet" href="/common/lib/estate.css">
 <link rel="stylesheet" href="/app.css">
 <!-- The shell's module graph, fetched alongside the stylesheets instead of
      after them.
@@ -60,13 +61,14 @@
      and every module the shell imports must be here. -->
 <link rel="modulepreload" href="/lib/api.js">
 <link rel="modulepreload" href="/lib/api.live.js">
-<link rel="modulepreload" href="/lib/ws.js">
-<link rel="modulepreload" href="/lib/router.js">
-<link rel="modulepreload" href="/lib/dom.js">
+<link rel="modulepreload" href="/common/lib/ws.js">
+<link rel="modulepreload" href="/common/lib/router.js">
+<link rel="modulepreload" href="/common/lib/dom.js">
 <link rel="modulepreload" href="/lib/ui.js">
-<link rel="modulepreload" href="/lib/build.js">
-<link rel="modulepreload" href="/lib/viewport.js">
-<link rel="modulepreload" href="/lib/estate.js">
+<link rel="modulepreload" href="/common/lib/ui-base.js">
+<link rel="modulepreload" href="/common/lib/build.js">
+<link rel="modulepreload" href="/common/lib/viewport.js">
+<link rel="modulepreload" href="/common/lib/estate.js">
 <script>
   /* Apply the stored appearance before first paint so there is no flash.
      Each theme is a full token set on the root element (see app.css) — light

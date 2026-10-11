@@ -44,7 +44,6 @@ mod coherence {
 
     use crate::common::{needs_compaction, production_workspace, run_conv_id, served};
     use zend::config::DaemonConfig;
-    use zend::log_broadcast::LogBus;
     use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
 
@@ -104,15 +103,13 @@ mod coherence {
         max_tokens: Option<usize>,
         sampling: Option<SamplingConfig>,
     ) -> (String, usize) {
-        let log = LogBus::new();
         let workspace = production_workspace();
         let config = DaemonConfig {
             compact_substrate: needs_compaction(&workspace),
-            port: 0,
             ..DaemonConfig::new(served(&workspace))
         };
         let conv_id = run_conv_id(conv_id);
-        let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
+        let session = Arc::new(ZendSession::new(config));
         session.start_loading();
 
         let messages = vec![ChatMessage::new(Role::User, prompt)];

@@ -7,7 +7,7 @@
 //! has scrolled out of the terminal, and the daemon is still
 //! sitting on a thread that can't make progress.  This harness:
 //!
-//!   1. Drives the same boot path `main.rs` uses — `ZendSession::new`
+//!   1. Drives the same boot path the zend tenant uses — `ZendSession::new`
 //!      followed by `start_loading` — against the live candle
 //!      workspace and the production projection.yaml.
 //!   2. Polls [`ZendSession::status_snapshot`] every 500 ms while
@@ -38,7 +38,6 @@ use std::time::{Duration, Instant};
 
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use zend::config::DaemonConfig;
-use zend::log_broadcast::LogBus;
 use zend::session::ZendSession;
 use zend_vfs::{RepoSpec, Workspace};
 
@@ -164,13 +163,12 @@ fn zend_startup_completes_without_stall() {
     )
     .expect("uploads repository");
     let config = DaemonConfig::new(served);
-    let log = LogBus::new();
 
     // Build the session and kick off the loading machine the same
-    // way `main.rs` does — `Arc::new(ZendSession::new(...))` then
+    // way the tenant does — `Arc::new(ZendSession::new(...))` then
     // `start_loading` against the Arc.  start_loading spawns its
     // own background tasks; control returns immediately.
-    let session = Arc::new(ZendSession::new(config, log));
+    let session = Arc::new(ZendSession::new(config));
     let started_at = Instant::now();
     session.start_loading();
     eprintln!("  start_loading() returned, watchdog armed");

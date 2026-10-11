@@ -20,6 +20,7 @@ use std::time::Instant;
 use candle::Device;
 use candle_conversation::SequenceConfig;
 use futures::future::join_all;
+use host::MODEL;
 
 use super::answer::Fields;
 use super::config::{Config, READING_CONTEXT};
@@ -30,7 +31,6 @@ use super::run::{reading_prompt, READING_TOKENS, THINK};
 use crate::engine::journal::tools::arguments;
 use crate::engine::mind::Minds;
 use crate::engine::prose::{decode_call_thought, CallAsk};
-use crate::model;
 
 const MIND: &str = "D:/prog/mind";
 const WORLD: &str = "battle-cities";
@@ -99,7 +99,7 @@ fn the_reading_replayed_on_the_real_model() {
 
     let workspace = tempfile::tempdir().expect("a workspace for the substrate");
     let device = Device::new_cuda(0).expect("a CUDA device");
-    let mut builder = model::model().builder().workspace_path(workspace.path());
+    let mut builder = MODEL.builder().workspace_path(workspace.path());
     let conversation = builder.conversation_config();
     let engine = Arc::new(Mutex::new(
         builder.engine(&device).expect("the engine loads"),

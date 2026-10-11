@@ -5,7 +5,7 @@
  * while narration is still assembling — cannot be faked by a wrapper around
  * someone else's API, and it is visible in about four seconds. */
 
-import { h, mount } from '../lib/dom.js';
+import { h, mount } from '/common/lib/dom.js';
 import { AUTH_UNAVAILABLE } from '../app.js';
 
 const MARK = `<svg viewBox="0 0 32 32" width="100%" height="100%">
