@@ -47,14 +47,6 @@ pub enum Survival {
     /// and the copy in a retired segment is not the only one.
     Resident,
 
-    /// Relocated by maintenance, left behind by compaction — for a marker
-    /// that exists only to keep records it killed dead while copies of them
-    /// can still sit in older segments. Maintenance rewrites some segments
-    /// and leaves the rest, so the marker must follow it forward; compaction
-    /// rewrites everything and carries none of what the marker killed, so
-    /// nothing is left for it to do.
-    Maintained,
-
     /// Derived data with no supersession key. Every copy is dropped and the
     /// writer rebuilds the chain in the new file.
     Regenerated,
@@ -129,9 +121,11 @@ pub fn survival(rt: RecordType) -> Survival {
         // rewritten whole by both paths.
         RecordType::Replica => Survival::Resident,
 
-        // ── Maintained, not compacted ───────────────────────────────────────
-        // Kills file events by sequence number; located through `VfsIndex`.
-        RecordType::VfsTombstone => Survival::Maintained,
+        // Kills file events by writer and sequence number; located through
+        // `VfsIndex`. Carried when it kills another member's event, which can
+        // still arrive after it; one that killed only this member's own has
+        // nothing left to kill once compaction drops them.
+        RecordType::VfsTombstone => Survival::Relocated,
 
         // ── Rebuilt by the writer ───────────────────────────────────────────
         RecordType::HeaderIndex => Survival::Regenerated,

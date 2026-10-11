@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use super::{VfsAppend, VfsEventPayload, VfsKill, VfsWrite};
+use super::{VfsAppend, VfsEventId, VfsEventPayload, VfsKill, VfsWrite};
+use crate::persistence::identity::RecordIdentity;
 use crate::persistence::maintenance::MaintenanceOp;
+use crate::persistence::record::{encode_record, RecordHeader, RecordType};
 use crate::persistence::segment::SegmentId;
 use crate::persistence::streams::{StreamDecl, TurnDecl};
 use crate::persistence::SubstratePersistence;
@@ -62,15 +64,33 @@ fn events(key: &str, ns: &[u64]) -> VfsWrite {
     }
 }
 
-fn kill(key: &str, kills: &[u64]) -> VfsWrite {
+/// Kill the events `seqs` that `sp`'s own node wrote.
+fn kill(sp: &SubstratePersistence, key: &str, seqs: &[u64]) -> VfsWrite {
+    kill_ids(key, seqs.iter().map(|&seq| own(sp, seq)).collect())
+}
+
+fn kill_ids(key: &str, kills: Vec<VfsEventId>) -> VfsWrite {
     VfsWrite {
         tombstones: vec![VfsKill {
             repo: "candle".into(),
             key: key.into(),
-            kills: kills.to_vec(),
+            kills,
         }],
         events: Vec::new(),
     }
+}
+
+/// The event `seq` of `sp`'s own node.
+fn own(sp: &SubstratePersistence, seq: u64) -> VfsEventId {
+    VfsEventId {
+        origin: sp.node(),
+        seq,
+    }
+}
+
+/// The sequence numbers of `ids`, which `write_vfs` returned.
+fn seqs(ids: Vec<VfsEventId>) -> Vec<u64> {
+    ids.into_iter().map(|id| id.seq).collect()
 }
 
 /// `(key, seq, n)` of every live event of `timeline`.
@@ -108,10 +128,13 @@ fn events_come_back_after_a_reopen() {
     {
         let (mut sp, _) = open(&dir);
         assert_eq!(
-            sp.write_vfs(5, &events("b.rs", &[10, 11])).unwrap(),
+            seqs(sp.write_vfs(5, &events("b.rs", &[10, 11])).unwrap()),
             vec![0, 1]
         );
-        assert_eq!(sp.write_vfs(5, &events("a.rs", &[12])).unwrap(), vec![2]);
+        assert_eq!(
+            seqs(sp.write_vfs(5, &events("a.rs", &[12])).unwrap()),
+            vec![2]
+        );
         sp.commit().unwrap();
     }
     let (mut sp, _) = open(&dir);
@@ -123,7 +146,10 @@ fn events_come_back_after_a_reopen() {
             ("b.rs".into(), 1, 11)
         ]
     );
-    assert_eq!(sp.write_vfs(5, &events("a.rs", &[13])).unwrap(), vec![3]);
+    assert_eq!(
+        sp.write_vfs(5, &events("a.rs", &[13])).unwrap(),
+        vec![own(&sp, 3)]
+    );
     assert!(read(&mut sp, 6).is_empty(), "another conversation has none");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -137,12 +163,16 @@ fn a_tombstone_kills_what_it_names_for_good() {
         let (mut sp, _) = open(&dir);
         sp.write_vfs(5, &events("a.rs", &[1, 2])).unwrap();
         sp.write_vfs(5, &events("b.rs", &[3])).unwrap();
-        sp.write_vfs(5, &kill("a.rs", &[0, 1])).unwrap();
+        let tomb = kill(&sp, "a.rs", &[0, 1]);
+        sp.write_vfs(5, &tomb).unwrap();
         assert_eq!(read(&mut sp, 5), vec![("b.rs".into(), 2, 3)]);
     }
     let (mut sp, _) = open(&dir);
     assert_eq!(read(&mut sp, 5), vec![("b.rs".into(), 2, 3)]);
-    assert_eq!(sp.write_vfs(5, &events("a.rs", &[4])).unwrap(), vec![4]);
+    assert_eq!(
+        seqs(sp.write_vfs(5, &events("a.rs", &[4])).unwrap()),
+        vec![4]
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -155,12 +185,15 @@ fn a_batch_writes_events_then_tombstones() {
         let (mut sp, _) = open(&dir);
         sp.write_vfs(5, &events("a.rs", &[1])).unwrap();
         let batch = VfsWrite {
-            tombstones: kill("a.rs", &[0]).tombstones,
+            tombstones: kill(&sp, "a.rs", &[0]).tombstones,
             events: vec![append("b.rs", 2), append("b.rs", 3)],
         };
-        assert_eq!(sp.write_vfs(5, &batch).unwrap(), vec![1, 2]);
+        assert_eq!(seqs(sp.write_vfs(5, &batch).unwrap()), vec![1, 2]);
         let tl = sp.vfs_index().timeline(5).unwrap();
-        assert_eq!(tl.tombstones().keys().copied().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(
+            tl.tombstones().keys().copied().collect::<Vec<_>>(),
+            vec![own(&sp, 3)]
+        );
         sp.commit().unwrap();
     }
     let (mut sp, _) = open(&dir);
@@ -203,7 +236,8 @@ fn compaction_carries_only_live_events() {
         sp.declare_stream(&turn(5)).unwrap();
         sp.declare_stream(&turn(7)).unwrap();
         sp.write_vfs(5, &events("a.rs", &[1, 2])).unwrap();
-        sp.write_vfs(5, &kill("a.rs", &[0])).unwrap();
+        let tomb = kill(&sp, "a.rs", &[0]);
+        sp.write_vfs(5, &tomb).unwrap();
         sp.write_vfs(6, &events("a.rs", &[3])).unwrap();
         sp.write_vfs(7, &events("a.rs", &[4])).unwrap();
         sp.write_tombstone(7, None).unwrap();
@@ -235,19 +269,21 @@ fn maintenance_keeps_a_killed_event_dead() {
         sp.write_vfs(5, &events("a.rs", &[1])).unwrap();
         sp.write_vfs(5, &events("b.rs", &[2])).unwrap();
         sp.seal_active().unwrap();
-        sp.write_vfs(5, &kill("a.rs", &[0])).unwrap();
+        let tomb = kill(&sp, "a.rs", &[0]);
+        sp.write_vfs(5, &tomb).unwrap();
         sp.write_vfs(5, &events("c.rs", &[3])).unwrap();
         sp.seal_active().unwrap();
     }
     {
         let (mut sp, mut substrate) = open(&dir);
+        let (tomb, event) = (own(&sp, 2), own(&sp, 3));
         let tl = sp.vfs_index().timeline(5).unwrap();
-        assert_eq!(tl.tombstones()[&2].segment, SegmentId(2));
+        assert_eq!(tl.tombstones()[&tomb].segment, SegmentId(2));
         sp.apply_maintenance_op(&mut substrate, &MaintenanceOp::Compact(SegmentId(2)))
             .unwrap();
         let tl = sp.vfs_index().timeline(5).unwrap();
-        assert_ne!(tl.tombstones()[&2].segment, SegmentId(2), "carried off");
-        assert_ne!(tl.events()[&3].segment, SegmentId(2), "carried off");
+        assert_ne!(tl.tombstones()[&tomb].segment, SegmentId(2), "carried off");
+        assert_ne!(tl.events()[&event].segment, SegmentId(2), "carried off");
         assert_eq!(
             read(&mut sp, 5),
             vec![("b.rs".into(), 1, 2), ("c.rs".into(), 3, 3)]
@@ -258,6 +294,77 @@ fn maintenance_keeps_a_killed_event_dead() {
         read(&mut sp, 5),
         vec![("b.rs".into(), 1, 2), ("c.rs".into(), 3, 3)],
         "the event killed in segment 1 stays dead"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **A tombstone of another member's event outlives compaction**, so the
+/// event still dies when it arrives after it, however late; and **two
+/// writers' events of one key** — each numbered in its own sequence — come
+/// back in the order of their stamps.
+#[test]
+fn a_kill_of_another_members_event_outlives_compaction() {
+    const B: u64 = 0xB;
+    let theirs = |seq: u64, n: u64| -> Vec<u8> {
+        let payload = VfsEventPayload {
+            timeline_id: 5,
+            origin: B,
+            seq,
+            repo: "candle".into(),
+            key: "a.rs".into(),
+            body: json!({"kind": "delta", "n": n}),
+        }
+        .encode();
+        let header = RecordHeader {
+            record_type: RecordType::VfsEvent,
+            payload_len: payload.len() as u64,
+            stream_id: 5,
+            chunk_index: seq,
+            ..RecordHeader::NONE
+        }
+        .with_identity(RecordIdentity {
+            origin: B,
+            oseq: seq + 1,
+            gen: 0,
+            epoch: 0,
+            hlc: (seq + 1) << 16,
+        });
+        encode_record(&header, &payload)
+    };
+    let dir = tmp_dir("remote_kill");
+    {
+        let (mut sp, _) = open(&dir);
+        sp.declare_stream(&turn(5)).unwrap();
+        sp.write_vfs(5, &kill_ids("a.rs", vec![VfsEventId { origin: B, seq: 0 }]))
+            .unwrap();
+        sp.commit().unwrap();
+    }
+    {
+        let (mut sp, mut substrate) = open(&dir);
+        sp.compact(&mut substrate, None).unwrap();
+        let tl = sp.vfs_index().timeline(5).unwrap();
+        assert_eq!(tl.tombstones().len(), 1, "kept: it kills another's event");
+    }
+    {
+        let (mut sp, mut substrate) = open(&dir);
+        let late = [theirs(0, 7), theirs(1, 8)];
+        let refs: Vec<&[u8]> = late.iter().map(Vec::as_slice).collect();
+        sp.apply_remote(&mut substrate, &refs, 1).unwrap();
+        assert_eq!(read(&mut sp, 5), vec![("a.rs".into(), 1, 8)]);
+        assert_eq!(
+            seqs(sp.write_vfs(5, &events("a.rs", &[9])).unwrap()),
+            vec![1],
+            "this member's own sequence: its tombstone took 0"
+        );
+        assert_eq!(
+            read(&mut sp, 5),
+            vec![("a.rs".into(), 1, 8), ("a.rs".into(), 1, 9)]
+        );
+    }
+    let (mut sp, _) = open(&dir);
+    assert_eq!(
+        read(&mut sp, 5),
+        vec![("a.rs".into(), 1, 8), ("a.rs".into(), 1, 9)]
     );
     std::fs::remove_dir_all(&dir).ok();
 }

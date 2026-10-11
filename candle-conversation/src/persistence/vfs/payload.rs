@@ -5,16 +5,28 @@ use serde_json::Value;
 
 use crate::persistence::{PersistenceError, Result};
 
+/// Which file event of a timeline: the member that wrote it, and its place in
+/// that member's sequence for the timeline. Two members writing one
+/// conversation's files number their events independently, so the writer is
+/// half the name (`docs/replicated_substrate.md` §6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct VfsEventId {
+    pub origin: u64,
+    pub seq: u64,
+}
+
 /// One change a conversation made to a repository's files — the payload of a
 /// [`RecordType::VfsEvent`](crate::persistence::record::RecordType::VfsEvent).
 ///
 /// `repo` and `key` say what the event belongs to — a repository, and a path
 /// in it or the empty key for the store's base — and `body` what it is. The
-/// substrate reads none of the three: it keys the event by timeline and
-/// `seq`, which the record header carries too.
+/// substrate reads none of the three: it keys the event by timeline, writer
+/// and `seq`, which the record header carries too (`stream_id`, `origin`,
+/// `chunk_index`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VfsEventPayload {
     pub timeline_id: u64,
+    pub origin: u64,
     pub seq: u64,
     pub repo: String,
     pub key: String,
@@ -22,6 +34,13 @@ pub struct VfsEventPayload {
 }
 
 impl VfsEventPayload {
+    pub fn id(&self) -> VfsEventId {
+        VfsEventId {
+            origin: self.origin,
+            seq: self.seq,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("VfsEventPayload serialise infallible")
     }
@@ -36,15 +55,18 @@ impl VfsEventPayload {
 /// the last — the payload of a
 /// [`RecordType::VfsTombstone`](crate::persistence::record::RecordType::VfsTombstone).
 ///
-/// `kills` names the sequence numbers outright, so the index drops them
-/// without having read the events; `repo` and `key` say whose they were.
+/// `kills` names the events outright — whichever member wrote them — so the
+/// index drops them without having read them; `repo` and `key` say whose they
+/// were. The tombstone is itself numbered in its writer's sequence, `origin`
+/// and `seq`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VfsTombstonePayload {
     pub timeline_id: u64,
+    pub origin: u64,
     pub seq: u64,
     pub repo: String,
     pub key: String,
-    pub kills: Vec<u64>,
+    pub kills: Vec<VfsEventId>,
 }
 
 impl VfsTombstonePayload {
@@ -67,6 +89,7 @@ mod tests {
     fn an_event_encodes_to_exact_bytes_and_back() {
         let event = VfsEventPayload {
             timeline_id: 7,
+            origin: 11,
             seq: 3,
             repo: "candle".into(),
             key: "src/lib.rs".into(),
@@ -74,9 +97,10 @@ mod tests {
         };
         assert_eq!(
             event.encode(),
-            br#"{"timeline_id":7,"seq":3,"repo":"candle","key":"src/lib.rs","body":{"kind":"state","size":12,"conflict":false}}"#
+            br#"{"timeline_id":7,"origin":11,"seq":3,"repo":"candle","key":"src/lib.rs","body":{"kind":"state","size":12,"conflict":false}}"#
                 .to_vec()
         );
+        assert_eq!(event.id(), VfsEventId { origin: 11, seq: 3 });
         assert_eq!(VfsEventPayload::decode(&event.encode()).unwrap(), event);
     }
 
@@ -84,14 +108,19 @@ mod tests {
     fn a_tombstone_encodes_to_exact_bytes_and_back() {
         let tomb = VfsTombstonePayload {
             timeline_id: 7,
+            origin: 11,
             seq: 9,
             repo: "candle".into(),
             key: "".into(),
-            kills: vec![1, 4, 8],
+            kills: vec![
+                VfsEventId { origin: 11, seq: 1 },
+                VfsEventId { origin: 12, seq: 4 },
+            ],
         };
         assert_eq!(
             tomb.encode(),
-            br#"{"timeline_id":7,"seq":9,"repo":"candle","key":"","kills":[1,4,8]}"#.to_vec()
+            br#"{"timeline_id":7,"origin":11,"seq":9,"repo":"candle","key":"","kills":[{"origin":11,"seq":1},{"origin":12,"seq":4}]}"#
+                .to_vec()
         );
         assert_eq!(VfsTombstonePayload::decode(&tomb.encode()).unwrap(), tomb);
     }

@@ -30,7 +30,9 @@ pub use mirror::Mirror;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
-use candle_conversation::persistence::vfs::{VfsAppend, VfsEventPayload, VfsKill, VfsWrite};
+use candle_conversation::persistence::vfs::{
+    VfsAppend, VfsEventId, VfsEventPayload, VfsKill, VfsWrite,
+};
 use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
 use zend_vfs::RepoFiles;
@@ -60,7 +62,7 @@ pub fn save(
         return;
     }
     match engine.write_conversation_files(timeline, &write) {
-        Ok(seqs) => mirror.apply(&write, &seqs),
+        Ok(ids) => mirror.apply(&write, &ids),
         Err(e) => {
             // Some of the batch may have landed. What did is in the log, so
             // the mirror is read back from it — never guessed — and the next
@@ -191,9 +193,9 @@ fn keep_unrestored(
         engine
             .write_conversation_files(timeline, &copies)
             .map_err(|e| e.to_string())?;
-        let mut kills: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        let mut kills: BTreeMap<String, Vec<VfsEventId>> = BTreeMap::new();
         for e in &events {
-            kills.entry(e.key.clone()).or_default().push(e.seq);
+            kills.entry(e.key.clone()).or_default().push(e.id());
         }
         let originals = VfsWrite {
             tombstones: kills
@@ -238,15 +240,17 @@ mod tests {
 
     /// The events a sequence of writes leaves live, as the log would hand
     /// them back: every event, less every one a tombstone killed, in
-    /// `(repo, key, seq)` order.
-    fn live(writes: &[(VfsWrite, Vec<u64>)]) -> Vec<VfsEventPayload> {
+    /// `(repo, key, seq)` order — one writer's, so its stamps run in `seq`
+    /// order too.
+    fn live(writes: &[(VfsWrite, Vec<VfsEventId>)]) -> Vec<VfsEventPayload> {
         let mut events = Vec::new();
         let mut killed = BTreeSet::new();
-        for (write, seqs) in writes {
-            for (append, &seq) in write.events.iter().zip(seqs) {
+        for (write, ids) in writes {
+            for (append, id) in write.events.iter().zip(ids) {
                 events.push(VfsEventPayload {
                     timeline_id: 1,
-                    seq,
+                    origin: id.origin,
+                    seq: id.seq,
                     repo: append.repo.clone(),
                     key: append.key.clone(),
                     body: append.body.clone(),
@@ -256,7 +260,7 @@ mod tests {
                 killed.extend(tomb.kills.iter().copied());
             }
         }
-        events.retain(|e| !killed.contains(&e.seq));
+        events.retain(|e| !killed.contains(&e.id()));
         events.sort_by(|a, b| (&a.repo, &a.key, a.seq).cmp(&(&b.repo, &b.key, b.seq)));
         events
     }
@@ -271,13 +275,18 @@ mod tests {
         let files = RepoFiles::overlay(workspace(dir.path()));
         let mut mirror = Mirror::of(BTreeMap::new());
         let mut next = 0u64;
-        let mut writes: Vec<(VfsWrite, Vec<u64>)> = Vec::new();
+        let mut writes: Vec<(VfsWrite, Vec<VfsEventId>)> = Vec::new();
         let mut round = |files: &RepoFiles, mirror: &mut Mirror| {
             let write = mirror.diff(&files.snapshots());
-            let seqs: Vec<u64> = (0..write.events.len() as u64).map(|i| next + i).collect();
+            let ids: Vec<VfsEventId> = (0..write.events.len() as u64)
+                .map(|i| VfsEventId {
+                    origin: 0xA,
+                    seq: next + i,
+                })
+                .collect();
             next += (write.events.len() + write.tombstones.len()) as u64;
-            mirror.apply(&write, &seqs);
-            writes.push((write, seqs));
+            mirror.apply(&write, &ids);
+            writes.push((write, ids));
         };
 
         let a = files.repo("a").unwrap();

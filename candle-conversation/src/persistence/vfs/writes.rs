@@ -3,7 +3,7 @@
 use serde_json::Value;
 
 use super::index::VfsIndex;
-use super::payload::{VfsEventPayload, VfsTombstonePayload};
+use super::payload::{VfsEventId, VfsEventPayload, VfsTombstonePayload};
 use crate::persistence::manifest::RecordLoc;
 use crate::persistence::record::RecordType;
 use crate::persistence::{Result, SubstratePersistence};
@@ -28,7 +28,7 @@ impl VfsWrite {
 pub struct VfsKill {
     pub repo: String,
     pub key: String,
-    pub kills: Vec<u64>,
+    pub kills: Vec<VfsEventId>,
 }
 
 /// Append `body` to `key` in `repo`.
@@ -40,9 +40,9 @@ pub struct VfsAppend {
 }
 
 impl SubstratePersistence {
-    /// Stage `write` for `timeline`. Every record takes the timeline's next
-    /// sequence number, events first; returns the sequence numbers the events
-    /// took, in order.
+    /// Stage `write` for `timeline`. Every record takes this member's next
+    /// sequence number for the timeline, events first; returns the names the
+    /// events took, in order.
     ///
     /// Staged, not made durable: the persistence thread's group commit makes
     /// it so, with everything else staged beside it, so a tool round never
@@ -53,29 +53,47 @@ impl SubstratePersistence {
     /// A read-only handle refuses with
     /// [`PersistenceError::ReadOnly`](crate::persistence::PersistenceError::ReadOnly)
     /// and writes nothing.
-    pub fn write_vfs(&mut self, timeline: u64, write: &VfsWrite) -> Result<Vec<u64>> {
-        let seqs = self.append_vfs_events(timeline, write)?;
+    pub fn write_vfs(&mut self, timeline: u64, write: &VfsWrite) -> Result<Vec<VfsEventId>> {
+        let ids = self.append_vfs_events(timeline, write)?;
         self.append_vfs_tombstones(timeline, write)?;
-        Ok(seqs)
+        Ok(ids)
+    }
+
+    /// This member's next file record for `timeline`.
+    fn next_vfs_id(&self, timeline: u64) -> VfsEventId {
+        let origin = self.node();
+        VfsEventId {
+            origin,
+            seq: self.vfs_index.next_seq(timeline, origin),
+        }
     }
 
     fn append_vfs_tombstones(&mut self, timeline: u64, write: &VfsWrite) -> Result<()> {
         for kill in &write.tombstones {
-            let seq = self.vfs_index.next_seq(timeline);
+            let id = self.next_vfs_id(timeline);
             let payload = VfsTombstonePayload {
                 timeline_id: timeline,
-                seq,
+                origin: id.origin,
+                seq: id.seq,
                 repo: kill.repo.clone(),
                 key: kill.key.clone(),
                 kills: kill.kills.clone(),
             }
             .encode();
             let loc = self
-                .append_record(RecordType::VfsTombstone, 0, timeline, seq, 0, 0, &payload)?
+                .append_record(
+                    RecordType::VfsTombstone,
+                    0,
+                    timeline,
+                    id.seq,
+                    0,
+                    0,
+                    &payload,
+                )?
                 .loc(payload.len() as u64);
             for killed in self
                 .vfs_index
-                .record_tombstone(timeline, seq, loc, &kill.kills)
+                .record_tombstone(timeline, id, loc, &kill.kills)
             {
                 self.accounting
                     .retire(RecordType::VfsEvent, timeline, killed);
@@ -84,29 +102,33 @@ impl SubstratePersistence {
         Ok(())
     }
 
-    fn append_vfs_events(&mut self, timeline: u64, write: &VfsWrite) -> Result<Vec<u64>> {
-        let mut seqs = Vec::with_capacity(write.events.len());
+    fn append_vfs_events(&mut self, timeline: u64, write: &VfsWrite) -> Result<Vec<VfsEventId>> {
+        let mut ids = Vec::with_capacity(write.events.len());
         for event in &write.events {
-            let seq = self.vfs_index.next_seq(timeline);
+            let id = self.next_vfs_id(timeline);
             let payload = VfsEventPayload {
                 timeline_id: timeline,
-                seq,
+                origin: id.origin,
+                seq: id.seq,
                 repo: event.repo.clone(),
                 key: event.key.clone(),
                 body: event.body.clone(),
             }
             .encode();
             let loc = self
-                .append_record(RecordType::VfsEvent, 0, timeline, seq, 0, 0, &payload)?
+                .append_record(RecordType::VfsEvent, 0, timeline, id.seq, 0, 0, &payload)?
                 .loc(payload.len() as u64);
-            self.vfs_index.record_event(timeline, seq, loc);
-            seqs.push(seq);
+            self.vfs_index.record_event(timeline, id, loc);
+            ids.push(id);
         }
-        Ok(seqs)
+        Ok(ids)
     }
 
-    /// Every live event of `timeline`, read back, in `(repo, key, seq)`
-    /// order — what a resume replays.
+    /// Every live event of `timeline`, read back, in `(repo, key)` order and
+    /// within a key in the order of their records' version stamps — what a
+    /// resume replays. One writer's events are in the order it wrote them, and
+    /// two writers' interleave by stamp, as their turns do
+    /// (`docs/replicated_substrate.md` §6.6).
     ///
     /// Records still staged are not in the file yet, so whatever is staged
     /// is committed first: a conversation built again moments after its last
@@ -123,10 +145,13 @@ impl SubstratePersistence {
             let record = self
                 .segments
                 .read_record_at(loc.segment, loc.offset, loc.record_size)?;
-            out.push(VfsEventPayload::decode(&record.payload)?);
+            let stamp = record.header.identity().stamp();
+            out.push((stamp, VfsEventPayload::decode(&record.payload)?));
         }
-        out.sort_by(|a, b| (&a.repo, &a.key, a.seq).cmp(&(&b.repo, &b.key, b.seq)));
-        Ok(out)
+        out.sort_by(|(sa, a), (sb, b)| {
+            (&a.repo, &a.key, sa, a.id()).cmp(&(&b.repo, &b.key, sb, b.id()))
+        });
+        Ok(out.into_iter().map(|(_, event)| event).collect())
     }
 
     /// Where every live file event and tombstone is.

@@ -15,7 +15,7 @@ mod writes;
 mod tests;
 
 pub use index::{TimelineVfs, VfsIndex};
-pub use payload::{VfsEventPayload, VfsTombstonePayload};
+pub use payload::{VfsEventId, VfsEventPayload, VfsTombstonePayload};
 pub use writes::{VfsAppend, VfsKill, VfsWrite};
 
 use std::num::NonZeroU64;
@@ -68,16 +68,20 @@ pub(super) fn record_vfs_loc(
         payload_len: h.payload_len,
         record_size: entry.size,
     };
+    let id = VfsEventId {
+        origin: h.origin,
+        seq: h.chunk_index,
+    };
     match h.record_type {
         RecordType::VfsEvent => {
-            if !index.record_event(h.stream_id, h.chunk_index, loc) {
-                accounting.retire(RecordType::VfsEvent, h.stream_id, h.chunk_index);
+            if !index.record_event(h.stream_id, id, loc) {
+                accounting.retire(RecordType::VfsEvent, h.stream_id, id);
             }
         }
         RecordType::VfsTombstone => match VfsTombstonePayload::decode(&entry.record.payload) {
             Ok(p) => {
-                for seq in index.record_tombstone(h.stream_id, h.chunk_index, loc, &p.kills) {
-                    accounting.retire(RecordType::VfsEvent, h.stream_id, seq);
+                for killed in index.record_tombstone(h.stream_id, id, loc, &p.kills) {
+                    accounting.retire(RecordType::VfsEvent, h.stream_id, killed);
                 }
             }
             Err(e) => tracing::warn!(
@@ -106,10 +110,10 @@ pub(super) fn retire_timeline(
     timeline: u64,
 ) {
     let (events, tombstones) = index.drop_timeline(timeline);
-    for seq in events {
-        accounting.retire(RecordType::VfsEvent, timeline, seq);
+    for id in events {
+        accounting.retire(RecordType::VfsEvent, timeline, id);
     }
-    for seq in tombstones {
-        accounting.retire(RecordType::VfsTombstone, timeline, seq);
+    for id in tombstones {
+        accounting.retire(RecordType::VfsTombstone, timeline, id);
     }
 }

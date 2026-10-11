@@ -35,6 +35,7 @@ use std::collections::HashMap;
 
 use super::identity::RecordIdentity;
 use super::record::{RecordHeader, RecordType, SectionTombstonePayload};
+use super::vfs::VfsEventId;
 
 /// The current record of one key: its padded on-disk size and its identity.
 /// A snapshot retraction is current with size zero — it names nothing to
@@ -47,8 +48,15 @@ struct Live {
 
 /// One record key: its type, the header's `stream_id`, a sub-key (a chunk's
 /// index, a file event's sequence number), and the writer's origin for a
-/// stream's own records ([`stream_owned`]), zero for every other.
+/// stream's own records ([`stream_owned`]) and a timeline's file records
+/// ([`is_file_record`]), zero for every other.
 type Key = (RecordType, u64, u64, u64);
+
+/// A conversation's file records, which each writer numbers in a sequence of
+/// its own (`super::vfs`).
+fn is_file_record(rt: RecordType) -> bool {
+    matches!(rt, RecordType::VfsEvent | RecordType::VfsTombstone)
+}
 
 /// The record types a stream owns — written by the member that declared the
 /// stream, under its id.
@@ -119,10 +127,10 @@ impl RecordAccounting {
         }
         let (rt, stream_id, sub) = match header.record_type {
             RecordType::Chunk => (RecordType::Chunk, header.stream_id, header.chunk_index),
-            // A conversation's file events and tombstones are keyed by timeline
-            // and sequence number, each unique: nothing supersedes one. An
-            // event dies by a tombstone or with its timeline, and the index
-            // that sees that says so through `retire`.
+            // A conversation's file events and tombstones are keyed by
+            // timeline, writer and sequence number, each unique: nothing
+            // supersedes one. An event dies by a tombstone or with its
+            // timeline, and the index that sees that says so through `retire`.
             RecordType::VfsEvent | RecordType::VfsTombstone => {
                 (header.record_type, header.stream_id, header.chunk_index)
             }
@@ -180,7 +188,11 @@ impl RecordAccounting {
             | RecordType::HeaderIndex
             | RecordType::Unknown => return,
         };
-        let writer = if stream_owned(rt) { header.origin } else { 0 };
+        let writer = if stream_owned(rt) || is_file_record(rt) {
+            header.origin
+        } else {
+            0
+        };
         self.offer(
             (rt, stream_id, sub, writer),
             Live {
@@ -208,12 +220,12 @@ impl RecordAccounting {
         }
     }
 
-    /// Count the live record keyed `(rt, stream_id, index)` as dead — for a
-    /// record nothing supersedes but something else killed: a file event its
-    /// tombstone named, or whose timeline was tombstoned. A key not live is
-    /// left alone, so retiring twice counts once.
-    pub fn retire(&mut self, rt: RecordType, stream_id: u64, index: u64) {
-        if let Some(live) = self.live_sizes.remove(&(rt, stream_id, index, 0)) {
+    /// Count file record `id` of timeline `timeline`, of type `rt`, as dead —
+    /// a record nothing supersedes but something else killed: a file event
+    /// its tombstone named, or whose timeline was tombstoned. A key not live
+    /// is left alone, so retiring twice counts once.
+    pub fn retire(&mut self, rt: RecordType, timeline: u64, id: VfsEventId) {
+        if let Some(live) = self.live_sizes.remove(&(rt, timeline, id.seq, id.origin)) {
             self.dead_bytes += live.size;
         }
     }
@@ -420,20 +432,29 @@ mod tests {
         assert_eq!(acc.dead_bytes(), 0);
     }
 
-    /// **A file event is live until something retires it** — its sequence
-    /// number is unique, so no later record supersedes it — and retiring it
-    /// twice counts it once.
+    /// **A file event is live until something retires it** — its writer and
+    /// sequence number are unique, so no later record supersedes it, another
+    /// writer's event of the same number included — and retiring it twice
+    /// counts it once.
     #[test]
     fn a_file_event_is_live_until_retired() {
+        let ev = |origin, seq| VfsEventId { origin, seq };
         let mut acc = RecordAccounting::new();
         record(&mut acc, &header(RecordType::VfsEvent, 7, 1), 4096);
         record(&mut acc, &header(RecordType::VfsEvent, 7, 2), 8192);
-        assert_eq!(acc.dead_bytes(), 0);
-        acc.retire(RecordType::VfsEvent, 7, 2);
-        acc.retire(RecordType::VfsEvent, 7, 2);
+        let other = RecordHeader {
+            origin: 0xB,
+            ..header(RecordType::VfsEvent, 7, 2)
+        };
+        record(&mut acc, &other, 1024);
+        assert_eq!(acc.dead_bytes(), 0, "another writer's event 2 is its own");
+        acc.retire(RecordType::VfsEvent, 7, ev(0, 2));
+        acc.retire(RecordType::VfsEvent, 7, ev(0, 2));
         assert_eq!(acc.dead_bytes(), 8192);
-        acc.retire(RecordType::VfsEvent, 7, 9);
+        acc.retire(RecordType::VfsEvent, 7, ev(0, 9));
         assert_eq!(acc.dead_bytes(), 8192, "a key never live retires nothing");
+        acc.retire(RecordType::VfsEvent, 7, ev(0xB, 2));
+        assert_eq!(acc.dead_bytes(), 9216);
     }
 
     /// **A section tombstone retires its stream's records, and only its

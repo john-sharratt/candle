@@ -13,7 +13,7 @@ use crate::persistence::manifest::ConvState;
 use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
 use crate::persistence::triggers::FIRST_ATTACHMENT;
-use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
+use crate::persistence::vfs::{VfsEventId, VfsEventPayload, VfsWrite};
 use crate::persistence::BoundSubstrate;
 use crate::projection::CorruptTurnPolicy;
 use crate::projection::{
@@ -1298,14 +1298,15 @@ impl ConversationEngine {
         &self,
         timeline: TimelineId,
         write: &VfsWrite,
-    ) -> crate::Result<Vec<u64>> {
+    ) -> crate::Result<Vec<VfsEventId>> {
         self.conversation
             .write_conversation_files(timeline, write)
             .map_err(ConversationError::Model)
     }
 
-    /// Every live event of a conversation's files, in `(repo, key, seq)`
-    /// order — what building the conversation again replays.
+    /// Every live event of a conversation's files, in `(repo, key)` order and
+    /// within a key in stamp order — what building the conversation again
+    /// replays.
     pub fn conversation_files(&self, timeline: TimelineId) -> crate::Result<Vec<VfsEventPayload>> {
         self.conversation
             .conversation_files(timeline)
@@ -2005,6 +2006,53 @@ impl ConversationEngine {
             config,
             section_progress,
         )
+    }
+
+    /// [`Self::new_conversation_with_projection`] on `timeline`, which the
+    /// caller derived rather than minted: a conversation a client names, whose
+    /// id every member must derive the same way (`docs/replicated_substrate.md`
+    /// §6.2). Refuses a timeline that is not [free](Self::is_timeline_free).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_conversation_on(
+        &self,
+        timeline: TimelineId,
+        system_prompt: &str,
+        builder: Builder,
+        layer: LayerId,
+        group: GroupId,
+        config: SequenceConfig,
+    ) -> crate::Result<Sequence> {
+        if !self.is_timeline_free(timeline) {
+            return Err(ConversationError::Channel(format!(
+                "cannot open a new conversation on timeline {timeline}: it is in use or deleted",
+            )));
+        }
+        if let Some(yaml) = builder.source_yaml() {
+            if let Err(e) = self.conversation.set_template(yaml.as_bytes()) {
+                tracing::warn!("persist projection template failed: {e}");
+            }
+        }
+        self.conversation
+            .write()
+            .register_timeline(timeline, layer, group);
+        self.bind_slot_to_timeline(
+            timeline,
+            Resumed::No,
+            system_prompt,
+            builder,
+            layer,
+            group,
+            config,
+            None,
+        )
+    }
+
+    /// Whether `timeline` names nothing here yet: not registered, and not a
+    /// deleted conversation's — a tombstone or an expired one's entry keeps a
+    /// deleted id dead for good (§6.8).
+    pub fn is_timeline_free(&self, timeline: TimelineId) -> bool {
+        self.conversation.timeline_target(timeline).is_none()
+            && !self.is_timeline_tombstoned(timeline)
     }
 
     /// Open a **new GPU slot onto a conversation that already exists** in the

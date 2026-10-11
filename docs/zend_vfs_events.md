@@ -13,16 +13,16 @@ The lifecycle follows the conversation's:
 
 ## 2. Records
 
-Two record types, both keyed in the header by the conversation's timeline (`stream_id`) and a **sequence number** (`chunk_index`) from one counter per timeline. The payloads are JSON.
+Two record types, both keyed in the header by the conversation's timeline (`stream_id`), the member that wrote them (`origin`) and a **sequence number** (`chunk_index`) from one counter per timeline and writer. An event's name is `(origin, seq)` (`VfsEventId`): two members writing one conversation's files number their events independently and never name the same one (`docs/replicated_substrate.md` §6.2). The payloads are JSON.
 
 | Type | Tag | Payload | Read at open |
 |---|---|---|---|
-| `VfsEvent` | 25 | `{ timeline_id, seq, repo, key, body }` — `body` is opaque to the substrate | no — only when the conversation resumes |
-| `VfsTombstone` | 26 | `{ timeline_id, seq, repo, key, kills: [seq…] }` | yes |
+| `VfsEvent` | 25 | `{ timeline_id, origin, seq, repo, key, body }` — `body` is opaque to the substrate | no — only when the conversation resumes |
+| `VfsTombstone` | 26 | `{ timeline_id, origin, seq, repo, key, kills: [{origin, seq}…] }` | yes |
 
-`repo` names the repository; `key` names what the event belongs to inside it — a path, or the empty key for the store's base. The substrate never interprets either, nor `body`: it keys by `(timeline, seq)`, which the header carries, so opening the log never reads an event's body. A tombstone lists the sequence numbers it kills rather than naming a key and a range, for the same reason: the index can drop them without having read the events.
+`repo` names the repository; `key` names what the event belongs to inside it — a path, or the empty key for the store's base. The substrate never interprets either, nor `body`: it keys by `(timeline, origin, seq)`, which the header carries, so opening the log never reads an event's body. A tombstone lists the events it kills, by name, rather than naming a key and a range, for the same reason: the index can drop them without having read the events. It can kill any member's events.
 
-Sequence numbers are assigned by the persistence layer when a batch is written, one counter per timeline, continuing from the highest it has seen — so a tombstone's `kills` always names events written before it.
+Sequence numbers are assigned by the persistence layer when a batch is written, one counter per timeline and writer, continuing from the highest of its own it has seen — so a tombstone's `kills` always names events written, or applied here, before it.
 
 A batch writes its **events first, then its tombstones**. It is staged, not committed: the persistence thread's group commit makes it durable with everything else staged beside it, so a tool round never waits on an `fsync`. Reading a timeline's events back commits whatever is staged first, so a conversation built again moments after a save reads that save.
 
@@ -34,19 +34,19 @@ The log has no batch marker: after a crash it keeps every record written before 
 
 | Happens | Index |
 |---|---|
-| a `VfsEvent` is appended or walked | its location recorded, unless a tombstone already killed its seq or its timeline is tombstoned |
+| a `VfsEvent` is appended, applied from another member, or walked | its location recorded, unless a tombstone already killed it or its timeline is tombstoned |
 | a `VfsTombstone` is appended or walked | the events it kills dropped — their bytes counted dead — and its own location recorded |
 | a timeline `Tombstone` is appended or walked | the timeline's whole entry dropped, its events' bytes counted dead; later records for it are ignored |
 
-**Survival** (`persistence/survival.rs`): `VfsEvent` is `Relocated`, carried verbatim by location; `VfsTombstone` is `Maintained` — relocated by maintenance, left behind by compaction.
+**Survival** (`persistence/survival.rs`): `VfsEvent` and `VfsTombstone` are both `Relocated`, carried verbatim by location.
 
-- **Compaction** carries every live event of a timeline that is registered, not tombstoned and not distilled — nothing else. Tombstones are not carried: the events they killed do not survive the rewrite either, so nothing is left for them to kill. An event whose timeline never registered is an orphan and is dropped the same way.
+- **Compaction** carries every live event of a timeline that is registered, not tombstoned and not distilled. A tombstone of such a timeline is carried when it kills another member's event: that event can arrive after it — in any order, however late — and must still die. One that killed only this member's own events is not carried: those events were all here before it, so they do not survive the rewrite either and nothing is left for it to kill. An event whose timeline never registered is an orphan and is dropped the same way.
 - **Maintenance** relocates, off its target segments, the live events of live timelines and the tombstones of live timelines — each only if the index still names it where the plan found it, so a tombstone written between plan and execute is never out-run by a copy of an event it killed. A tombstone must outlive every copy of the events it killed, and those may sit in older segments the op does not touch; relocating it forward keeps it after them in log order. A tombstoned timeline's events are relocated by nothing: the timeline's own `Tombstone`, which maintenance re-emits, keeps them dead until the segments holding them are dropped.
 - **Liveness** counts the bytes of exactly what those two carry, so a segment holding only dead events reads as reclaimable.
 
 ## 4. Mirroring (zend)
 
-`zend/src/conv_overlay/`. Each conversation keeps a **mirror** beside its file stores: exactly what its live events say — per repository the base and, per path, the chain the events make — with the sequence number of every live event behind each. After every tool round, for each repository:
+`zend/src/conv_overlay/`. Each conversation keeps a **mirror** beside its file stores: exactly what its live events say — per repository the base and, per path, the chain the events make — with the name of every live event behind each. After every tool round, for each repository:
 
 - **A path whose chain only grew** — the mirrored deltas are a prefix of the store's — has its new deltas appended as `delta` events, then a `state` event (size, conflict flag). The state is written after any new delta whether or not it changed, because it is what commits them; with no new delta it is written only when it changed.
 - **A path whose chain was rewritten** — not a prefix — is written whole again, its first event marked `start`, and its old events tombstoned. So is a path a torn save left (§5): an append would be read as following the deltas replay dropped.
@@ -67,7 +67,7 @@ Event bodies (`conv_overlay/event.rs`):
 
 ## 5. Resume
 
-When a conversation's state is built, its live events are read in `(repo, key, seq)` order and replayed into one `Snapshot` per repository — the latest `base`, and each path's chain as its last `state` committed it — and restored into the fresh stores. Deltas read since a path's last state wait for the next one: a `state` commits them, extending the chain or, when they began with `start`, replacing it; a later `start` supersedes whatever waited.
+When a conversation's state is built, its live events are read in `(repo, key)` order and, within a key, in the order of their records' version stamps — one writer's in the order it wrote them, two writers' interleaved as their turns are (`docs/replicated_substrate.md` §6.6) — and replayed into one `Snapshot` per repository — the latest `base`, and each path's chain as its last `state` committed it — and restored into the fresh stores. Deltas read since a path's last state wait for the next one: a `state` commits them, extending the chain or, when they began with `start`, replacing it; a later `start` supersedes whatever waited.
 
 Deltas still waiting at the end are what a torn save left. They are dropped: the path keeps its last committed chain — intact, since the tombstones that would have killed it come after the events and never landed — and a path no state ever committed is not restored at all. The rest of the repository replays as normal: one torn path never takes the others with it. The mirror is exactly what was read, including every event a `start` superseded or a tear left uncommitted, and marks a torn path so the next save writes it whole and kills them. An event under a key it cannot be under, or a body that is no event, makes the repository's events unreplayable, never replayed into a wrong state.
 
@@ -80,7 +80,7 @@ A repository whose events do not replay, or whose snapshot the store refuses (a 
 ## 7. Testing
 
 - Payloads encode to exact bytes and round-trip (`persistence/vfs/payload.rs`).
-- The index: an event after its tombstone is dropped, one before it too; a timeline tombstone drops everything and ignores later events; sequence numbers continue past every seq seen; killed bytes are counted dead.
-- Survival: a store holding events and tombstones of a live timeline, a tombstoned one and an unregistered one — compaction carries exactly the live events; maintenance relocates live events and tombstones and nothing of the dead; reopening reads the same events.
+- The index: an event after its tombstone is dropped, one before it too; a timeline tombstone drops everything and ignores later events; each writer's sequence numbers continue past every one of its own seen, and two writers' events of one number are two events; killed bytes are counted dead.
+- Survival: a store holding events and tombstones of a live timeline, a tombstoned one and an unregistered one — compaction carries exactly the live events, and the tombstones that kill another member's events; maintenance relocates live events and tombstones and nothing of the dead; reopening reads the same events. A tombstone of another member's event outlives a compaction and a reopen, and the event dies when it arrives after; two writers' events of one key read back in stamp order.
 - Staging: a write is staged, not committed, and reads back at once.
 - zend: the mirror's difference for every case in §4 — growth (always ending with its state), a changed state, a rewrite, a dropped path, a moved base, a repository gone, a chain with no delta, a torn path — as exact batches; an unread mirror writes nothing; replay builds the snapshot a store saved, the right chain from a batch cut short between its events and tombstones, and the last committed chain from one torn inside its events — a rewrite, an append ending in a delete, a new file — without losing the repository's other paths; a `start` after a tear supersedes it; events under the wrong key or that are no event are refused; changes written over several rounds replay into stores holding exactly what the originals did, and the replayed mirror writes nothing more.

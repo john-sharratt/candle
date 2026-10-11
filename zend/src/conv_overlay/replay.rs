@@ -17,7 +17,8 @@ pub(super) struct Replayed {
     pub mirror: RepoMirror,
 }
 
-/// Replay `events` — one repository's, in `(key, seq)` order — by the rules
+/// Replay `events` — one repository's, in the order the substrate reads them
+/// back: by key, and within a key by stamp — by the rules
 /// the mirror records its own writes by. Deltas a torn save left with no
 /// state to commit them are dropped ([`RepoMirror::settle`]): each path is
 /// its last committed chain, and a path no state ever committed is not in
@@ -28,8 +29,8 @@ pub(super) fn replay_repo(events: &[VfsEventPayload]) -> Result<Replayed, String
     let mut mirror = RepoMirror::default();
     for e in events {
         let event = FileEvent::from_value(&e.body)
-            .map_err(|why| format!("event {} of {:?}: {why}", e.seq, e.key))?;
-        absorb(&mut mirror, &e.key, e.seq, event)?;
+            .map_err(|why| format!("event {:x}/{} of {:?}: {why}", e.origin, e.seq, e.key))?;
+        absorb(&mut mirror, &e.key, e.id(), event)?;
     }
     mirror.settle();
     let chains = mirror
@@ -53,7 +54,7 @@ pub(super) fn replay_repo(events: &[VfsEventPayload]) -> Result<Replayed, String
     })
 }
 
-/// `events` grouped by repository, each group still in `(key, seq)` order.
+/// `events` grouped by repository, each group still in the order given.
 pub(super) fn by_repo(events: Vec<VfsEventPayload>) -> BTreeMap<String, Vec<VfsEventPayload>> {
     let mut out: BTreeMap<String, Vec<VfsEventPayload>> = BTreeMap::new();
     for e in events {
@@ -65,6 +66,7 @@ pub(super) fn by_repo(events: Vec<VfsEventPayload>) -> BTreeMap<String, Vec<VfsE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_conversation::persistence::vfs::VfsEventId;
     use serde_json::json;
 
     const A: &str = "ce013625030ba8dba906f756967f9e9ca394464a";
@@ -73,11 +75,16 @@ mod tests {
     fn event(seq: u64, key: &str, body: serde_json::Value) -> VfsEventPayload {
         VfsEventPayload {
             timeline_id: 7,
+            origin: 0xA,
             seq,
             repo: "candle".into(),
             key: key.into(),
             body,
         }
+    }
+
+    fn seqs(ids: &[VfsEventId]) -> Vec<u64> {
+        ids.iter().map(|id| id.seq).collect()
     }
 
     fn delta(at_ns: i64, content: &str, start: bool) -> serde_json::Value {
@@ -131,9 +138,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(replayed.snapshot, expected);
-        assert_eq!(replayed.mirror.base_seqs, vec![0]);
-        assert_eq!(replayed.mirror.paths["a.rs"].seqs, vec![1, 2, 5, 6]);
-        assert_eq!(replayed.mirror.paths["gone.rs"].seqs, vec![3, 4]);
+        assert_eq!(seqs(&replayed.mirror.base_ids), vec![0]);
+        assert_eq!(seqs(&replayed.mirror.paths["a.rs"].ids), vec![1, 2, 5, 6]);
+        assert_eq!(seqs(&replayed.mirror.paths["gone.rs"].ids), vec![3, 4]);
     }
 
     /// **A batch cut short between its events and its tombstones replays
@@ -173,8 +180,8 @@ mod tests {
             serde_json::to_value(replayed.snapshot.base()).unwrap(),
             json!({"tree": B, "parents": [B]})
         );
-        assert_eq!(replayed.mirror.paths["a.rs"].seqs, vec![1, 2, 4, 5]);
-        assert_eq!(replayed.mirror.base_seqs, vec![0, 3]);
+        assert_eq!(seqs(&replayed.mirror.paths["a.rs"].ids), vec![1, 2, 4, 5]);
+        assert_eq!(seqs(&replayed.mirror.base_ids), vec![0, 3]);
     }
 
     fn state(size: Option<usize>) -> serde_json::Value {
@@ -206,7 +213,7 @@ mod tests {
         assert_eq!(chain.size, Some(3));
         let at = &replayed.mirror.paths["a.rs"];
         assert!(at.torn);
-        assert_eq!(at.seqs, vec![1, 2, 3]);
+        assert_eq!(seqs(&at.ids), vec![1, 2, 3]);
     }
 
     /// **A save torn inside an append leaves the file as it was committed** —
@@ -239,7 +246,7 @@ mod tests {
         assert!(replayed.snapshot.chains().contains_key("a.rs"));
         let b = &replayed.mirror.paths["b.rs"];
         assert!(b.torn && !b.stated);
-        assert_eq!(b.seqs, vec![3], "named, so the next save kills it");
+        assert_eq!(seqs(&b.ids), vec![3], "named, so the next save kills it");
     }
 
     /// **A chain begun again after a torn save commits cleanly**: its `start`

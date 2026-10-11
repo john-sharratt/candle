@@ -306,12 +306,17 @@ impl TurnKey {
 ///
 /// # Encoding
 ///
-/// 64-bit integer that **is** a microsecond UNIX timestamp under typical
-/// conditions.  Bursts and clock skew are absorbed by [`TimelineAllocator`]
-/// (each allocation returns `max(now_micros, last_issued + 1)`), so the
-/// stored value may run slightly ahead of real time during a burst — but
-/// the value is always strictly monotonic and unique, and the high bits
-/// always read as a recognisable timestamp in logs.
+/// `(unix_ms << 20) | r`, where `r` is 20 random bits
+/// (`docs/replicated_substrate.md` §6.2). The high bits read as the
+/// millisecond the conversation began, so ids keep time order; the random
+/// bits mean two members minting at once collide only if they draw the same
+/// 20 bits in the same millisecond. Bursts and clock skew are absorbed by
+/// [`TimelineAllocator`], which issues `max(fresh, last_issued + 1)`, so ids
+/// are strictly monotonic within a process. Every id minted this way is above
+/// 2^60, and so above every microsecond-timestamp id written before it.
+///
+/// A conversation a client names (a zend dialogue, a passthrough) takes a hash
+/// of that name instead, so every member derives the same id for it.
 ///
 /// `NonZeroU64` so `Option<TimelineId>` is pointer-sized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -355,14 +360,17 @@ impl std::fmt::Display for TimelineId {
 
 /// Workspace-scoped allocator for [`TimelineId`].
 ///
-/// Each call to [`Self::next`] returns `max(now_micros, last_issued + 1)`,
-/// which guarantees:
+/// Each call to [`Self::next`] returns `max((now_ms << 20) | r, last_issued +
+/// 1)` for 20 fresh random bits `r`, which guarantees:
 ///
 /// - **Strict monotonicity** — IDs are assigned in allocation order.
-/// - **Burst-safe uniqueness** — many allocations within the same microsecond
-///   never collide; the second through Nth get `last + 1`, `last + 2`, …
+/// - **Burst-safe uniqueness** — many allocations within the same millisecond
+///   never collide; once an id passes the fresh value, the next get `last + 1`,
+///   `last + 2`, …
 /// - **Clock-skew safety** — a backward NTP jump can't issue a duplicate
 ///   because we always advance past `last_issued`.
+/// - **Uniqueness across members** — two members that never see each other's
+///   ids collide only on the same millisecond and the same 20 random bits.
 /// - **Resume safety** — when [`crate::projection::Conversation::open`]
 ///   replays a persisted substrate, the allocator is seeded with the largest
 ///   on-disk `TimelineId` so freshly minted ids are guaranteed unique against
@@ -376,7 +384,8 @@ pub struct TimelineAllocator {
 
 impl TimelineAllocator {
     /// Create a fresh allocator that has never issued an id.  The first
-    /// [`Self::next`] call will return the current microsecond timestamp.
+    /// [`Self::next`] call returns the current millisecond and fresh random
+    /// bits.
     pub fn new() -> Self {
         Self {
             last: AtomicU64::new(0),
@@ -392,26 +401,27 @@ impl TimelineAllocator {
 
     /// Allocate the next [`TimelineId`].
     ///
-    /// Returns `max(now_micros, last_issued + 1)` and advances the
+    /// Returns `max((now_ms << 20) | r, last_issued + 1)` and advances the
     /// internal high-water mark to that value.  Lock-free.
     pub fn next(&self) -> TimelineId {
-        let now_us = SystemTime::now()
+        let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
+            .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        // CAS loop: read last, compute next = max(now, last+1), store.
+        let fresh = timeline_raw(now_ms, rand::random::<u64>());
+        // CAS loop: read last, compute next = max(fresh, last+1), store.
         let mut last = self.last.load(Ordering::Relaxed);
         loop {
-            let next = now_us.max(last.saturating_add(1));
+            let next = fresh.max(last.saturating_add(1));
             match self
                 .last
                 .compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed)
             {
                 Ok(_) => {
                     let nz = NonZeroU64::new(next).unwrap_or_else(|| {
-                        // Only reachable if `now_us == 0` AND last was 0,
-                        // which can only happen on the first allocation
-                        // when SystemTime::now() failed.  Fall back to 1.
+                        // Only reachable if the clock read zero, the random
+                        // bits were zero AND last was 0 — the first allocation
+                        // with a failed SystemTime::now(). Fall back to 1.
                         NonZeroU64::new(1).unwrap()
                     });
                     return TimelineId(nz);
@@ -426,6 +436,15 @@ impl Default for TimelineAllocator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The random low bits of a minted [`TimelineId`].
+pub const TIMELINE_RANDOM_BITS: u32 = 20;
+
+/// A timeline id's raw value for millisecond `ms` and the low
+/// [`TIMELINE_RANDOM_BITS`] of `random`.
+pub fn timeline_raw(ms: u64, random: u64) -> u64 {
+    (ms << TIMELINE_RANDOM_BITS) | (random & ((1 << TIMELINE_RANDOM_BITS) - 1))
 }
 
 /// The process's one timeline allocator.
@@ -460,4 +479,49 @@ pub struct TurnId {
     pub layer_id: LayerId,
     pub group_id: GroupId,
     pub index: TurnIndex,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The millisecond sits above the 20 random bits, and only the low 20 bits
+    /// of the random draw are kept.
+    #[test]
+    fn a_timeline_id_is_the_millisecond_over_twenty_random_bits() {
+        assert_eq!(timeline_raw(1, 0), 0x10_0000);
+        assert_eq!(timeline_raw(1, u64::MAX), 0x1F_FFFF);
+        assert_eq!(
+            timeline_raw(1_760_000_000_000, 0xABCDE),
+            1_845_493_760_000_703_710
+        );
+    }
+
+    /// A minted id carries the millisecond it was minted in, sits above every
+    /// microsecond-timestamp id, and a burst stays strictly increasing.
+    #[test]
+    fn minted_ids_are_monotonic_and_carry_their_millisecond() {
+        let alloc = TimelineAllocator::new();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let ids: Vec<u64> = (0..10_000).map(|_| alloc.next().raw()).collect();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        assert!(ids[0] >> TIMELINE_RANDOM_BITS >= before);
+        assert!(ids[0] >> TIMELINE_RANDOM_BITS <= after);
+        assert!(ids[0] > 1 << 60);
+    }
+
+    /// A seed above the clock is passed, never reissued.
+    #[test]
+    fn a_seed_is_passed() {
+        let alloc = TimelineAllocator::new();
+        alloc.seed(u64::MAX - 10);
+        assert_eq!(alloc.next().raw(), u64::MAX - 9);
+    }
 }

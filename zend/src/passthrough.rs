@@ -182,6 +182,22 @@ pub fn conversation_key(system: &str, first_user: &str) -> String {
         .collect()
 }
 
+/// The timeline of the `n`-th conversation opened under `key` — derived, not
+/// minted, so every member that serves the conversation names one timeline for
+/// it (`docs/replicated_substrate.md` §6.2). A key can open more than one: a
+/// client that edits its history opens a new conversation under the same key,
+/// and takes the first `n` whose timeline is free. The first 8 bytes of the
+/// SHA-256 of a domain label, the key, and `n`.
+pub fn conversation_timeline(key: &str, n: u64) -> TimelineId {
+    let mut h = Sha256::new();
+    h.update(b"passthrough timeline\0");
+    h.update(key.as_bytes());
+    h.update(n.to_le_bytes());
+    let digest = h.finalize();
+    let raw = u64::from_le_bytes(digest[..8].try_into().expect("a SHA-256 has 8 bytes"));
+    TimelineId::from_raw(raw.max(1)).expect("a timeline id is non-zero")
+}
+
 /// Text as compared across calls: every `<think>…</think>` block removed (the
 /// substrate keeps a reply's reasoning, and a client may or may not send it back),
 /// surrounding whitespace trimmed, and each tool call in one fixed rendering
@@ -372,8 +388,13 @@ pub fn open(
         }
     }
 
+    let timeline = (0..)
+        .map(|n| conversation_timeline(&key, n))
+        .find(|&tl| engine.is_timeline_free(tl))
+        .expect("an unbounded range has a free timeline");
     let seq = engine
-        .new_conversation_with_projection(
+        .new_conversation_on(
+            timeline,
             &prompt,
             builder(),
             LayerId::reserved(Reserved::Passthrough),
@@ -654,6 +675,26 @@ mod tests {
         assert_ne!(a, conversation_key("other sys", "task"));
         // The length prefix fixes the boundary between the two.
         assert_ne!(conversation_key("ab", "c"), conversation_key("a", "bc"));
+    }
+
+    /// A key and an opening count name one timeline, the same on every member:
+    /// the value is pinned, and each later opening, and each other key, names
+    /// another.
+    #[test]
+    fn a_key_names_one_timeline_per_opening() {
+        let key = conversation_key("sys", "task");
+        assert_eq!(
+            conversation_timeline(&key, 0).raw(),
+            5_711_072_684_217_358_730
+        );
+        assert_ne!(
+            conversation_timeline(&key, 0),
+            conversation_timeline(&key, 1)
+        );
+        assert_ne!(
+            conversation_timeline(&key, 0),
+            conversation_timeline(&conversation_key("sys", "other task"), 0)
+        );
     }
 
     #[test]

@@ -75,6 +75,7 @@ use super::streams::{StreamDecl, StreamId};
 use super::stripes::{stripes, MAX_STRIPE_BYTES};
 use super::survival::RecordCensus;
 use super::vfs::carried as vfs_carried;
+use super::vfs::VfsEventId;
 use super::{PersistenceError, Result, SubstratePersistence};
 use crate::substrate::{StreamKey, StreamRuntime, Substrate};
 
@@ -339,7 +340,7 @@ pub struct MaintenancePlan {
 pub(super) struct VfsReloc {
     pub(super) rt: RecordType,
     timeline: u64,
-    seq: u64,
+    id: VfsEventId,
     pub(super) loc: RecordLoc,
 }
 
@@ -1320,7 +1321,7 @@ impl SubstratePersistence {
                 } else {
                     tl.tombstones()
                 };
-                at.get(&r.seq) == Some(&r.loc)
+                at.get(&r.id) == Some(&r.loc)
             })
         };
         let mut vfs_by_seg: BTreeMap<SegmentId, Vec<VfsReloc>> = BTreeMap::new();
@@ -1339,11 +1340,10 @@ impl SubstratePersistence {
             for (r, at) in recs.into_iter().zip(new) {
                 let moved = at.loc(r.loc.payload_len);
                 if r.rt == RecordType::VfsEvent {
-                    self.vfs_index
-                        .repoint_event(r.timeline, r.seq, r.loc, moved);
+                    self.vfs_index.repoint_event(r.timeline, r.id, r.loc, moved);
                 } else {
                     self.vfs_index
-                        .repoint_tombstone(r.timeline, r.seq, r.loc, moved);
+                        .repoint_tombstone(r.timeline, r.id, r.loc, moved);
                 }
             }
         }
@@ -1571,12 +1571,12 @@ impl SubstratePersistence {
                 (RecordType::VfsEvent, tl.events()),
                 (RecordType::VfsTombstone, tl.tombstones()),
             ] {
-                for (&seq, &loc) in at {
+                for (&id, &loc) in at {
                     if targets.contains(&loc.segment) {
                         out.push(VfsReloc {
                             rt,
                             timeline,
-                            seq,
+                            id,
                             loc,
                         });
                     }

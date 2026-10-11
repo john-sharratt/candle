@@ -44,7 +44,7 @@ use crate::persistence::remote::{turn_is_complete, RemoteBatch};
 use crate::persistence::resume::{read_persisted_section_windows, TurnChunkGrid};
 use crate::persistence::sealed_reader::{SealedReader, SEALED_READ_ATTEMPTS};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
-use crate::persistence::vfs::{VfsEventPayload, VfsWrite};
+use crate::persistence::vfs::{VfsEventId, VfsEventPayload, VfsWrite};
 use crate::persistence::writer::{SubstrateWriter, WriteJob};
 use crate::persistence::{
     PersistenceLock, Result as PersistenceResult, SharedSubstrate, SubstratePersistence,
@@ -3532,14 +3532,14 @@ impl Conversation {
 
     /// Stage `write` — a set of `timeline`'s changes to its files — as
     /// events on the timeline, events before tombstones, for the persistence
-    /// thread's group commit to make durable. Returns the sequence numbers
-    /// the events took. A read-only substrate refuses: the
+    /// thread's group commit to make durable. Returns the names the events
+    /// took. A read-only substrate refuses: the
     /// caller mirrors what was written, and nothing was.
     pub fn write_conversation_files(
         &self,
         timeline: TimelineId,
         write: &VfsWrite,
-    ) -> candle::Result<Vec<u64>> {
+    ) -> candle::Result<Vec<VfsEventId>> {
         if self.read_only {
             return Err(candle::Error::Msg(
                 "write_conversation_files: the substrate is read-only".to_string(),
@@ -5476,7 +5476,8 @@ mod tests {
             let conv = Conversation::from_parts(substrate, p);
             conv.register_timeline(tl, layer, group);
             conv.set_conversation_branches(tl, &map(&[("candle", "main"), ("mind", "master")]));
-            assert_eq!(conv.write_conversation_files(tl, &write).unwrap(), vec![0]);
+            let ids = conv.write_conversation_files(tl, &write).unwrap();
+            assert_eq!(ids.iter().map(|id| id.seq).collect::<Vec<_>>(), vec![0]);
             conv.set_conversation_archived(tl, true).unwrap();
             conv.set_conversation_branches(tl, &map(&[("candle", "zen/work")]));
             assert_eq!(conv.conversation_state(tl), Some(expected.clone()));

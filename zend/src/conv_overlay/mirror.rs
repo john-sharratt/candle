@@ -3,7 +3,7 @@
 //!
 //! The mirror is exactly what the conversation's live events say: per
 //! repository, its base and, per path, the chain the events make, with the
-//! sequence number of every live event behind each. [`Mirror::diff`]
+//! name of every live event behind each. [`Mirror::diff`]
 //! compares it with the stores' snapshots and says what to write;
 //! [`Mirror::apply`] records what was written, by the same rules replay reads
 //! events with ([`absorb`], [`kill`]) — so the mirror after a write is the
@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use candle_conversation::persistence::vfs::{VfsAppend, VfsKill, VfsWrite};
+use candle_conversation::persistence::vfs::{VfsAppend, VfsEventId, VfsKill, VfsWrite};
 use zend_vfs::{SavedBase, SavedChain, Snapshot, TimedDelta};
 
 use super::event::{FileEvent, BASE_KEY};
@@ -39,7 +39,7 @@ pub(super) struct PathMirror {
     /// Every live event of the path — including any a later `start`
     /// superseded, or a torn save left uncommitted, whose tombstone has not
     /// landed.
-    pub seqs: Vec<u64>,
+    pub ids: Vec<VfsEventId>,
     /// The committed chain: what the last state committed.
     pub deltas: Vec<TimedDelta>,
     pub size: Option<usize>,
@@ -48,7 +48,7 @@ pub(super) struct PathMirror {
     pub stated: bool,
     /// Deltas no state has committed yet.
     pub pending: Option<Pending>,
-    /// Whether some of `seqs` are deltas a torn save left uncommitted. An
+    /// Whether some of `ids` are deltas a torn save left uncommitted. An
     /// append after them would be read as following them, so the path is
     /// written whole, `start`ed, next time.
     pub torn: bool,
@@ -60,13 +60,13 @@ pub(super) struct RepoMirror {
     /// The latest base event's base.
     pub base: Option<SavedBase>,
     /// Every live base event.
-    pub base_seqs: Vec<u64>,
+    pub base_ids: Vec<VfsEventId>,
     pub paths: BTreeMap<String, PathMirror>,
 }
 
 impl RepoMirror {
     fn is_empty(&self) -> bool {
-        self.base_seqs.is_empty() && self.paths.is_empty()
+        self.base_ids.is_empty() && self.paths.is_empty()
     }
 
     /// End a replay: every path's deltas that no state committed are what a
@@ -89,20 +89,23 @@ impl RepoMirror {
 pub(super) fn absorb(
     repo: &mut RepoMirror,
     key: &str,
-    seq: u64,
+    id: VfsEventId,
     event: FileEvent,
 ) -> Result<(), String> {
     match (key, event) {
         (BASE_KEY, FileEvent::Base { base }) => {
             repo.base = Some(base);
-            repo.base_seqs.push(seq);
+            repo.base_ids.push(id);
         }
         (BASE_KEY, _) | (_, FileEvent::Base { .. }) => {
-            return Err(format!("event {seq} is under the wrong key {key:?}"));
+            return Err(format!(
+                "event {:x}/{} is under the wrong key {key:?}",
+                id.origin, id.seq
+            ));
         }
         (path, FileEvent::Delta { delta, start }) => {
             let at = path_of(repo, path);
-            at.seqs.push(seq);
+            at.ids.push(id);
             if start {
                 // A chain begun again supersedes whatever waited, torn or not.
                 at.pending = Some(Pending {
@@ -128,7 +131,7 @@ pub(super) fn absorb(
             },
         ) => {
             let at = path_of(repo, path);
-            at.seqs.push(seq);
+            at.ids.push(id);
             let pending = at.pending.take();
             if start {
                 at.deltas.clear();
@@ -151,17 +154,17 @@ pub(super) fn absorb(
 
 /// Kill `kills` of `key` in `repo`: they are no longer live. A path, or the
 /// base, left with no live event is gone.
-pub(super) fn kill(repo: &mut RepoMirror, key: &str, kills: &[u64]) {
+pub(super) fn kill(repo: &mut RepoMirror, key: &str, kills: &[VfsEventId]) {
     if key == BASE_KEY {
-        repo.base_seqs.retain(|s| !kills.contains(s));
-        if repo.base_seqs.is_empty() {
+        repo.base_ids.retain(|s| !kills.contains(s));
+        if repo.base_ids.is_empty() {
             repo.base = None;
         }
         return;
     }
     if let Some(at) = repo.paths.get_mut(key) {
-        at.seqs.retain(|s| !kills.contains(s));
-        if at.seqs.is_empty() {
+        at.ids.retain(|s| !kills.contains(s));
+        if at.ids.is_empty() {
             repo.paths.remove(key);
         }
     }
@@ -171,7 +174,7 @@ fn path_of<'m>(repo: &'m mut RepoMirror, path: &str) -> &'m mut PathMirror {
     repo.paths
         .entry(path.to_string())
         .or_insert_with(|| PathMirror {
-            seqs: Vec::new(),
+            ids: Vec::new(),
             deltas: Vec::new(),
             size: None,
             conflict: false,
@@ -233,13 +236,13 @@ impl Mirror {
         write
     }
 
-    /// Record `write` as written — its events having taken `seqs` in order,
+    /// Record `write` as written — its events having taken `ids` in order,
     /// then its tombstones landing — exactly as a replay would read it.
-    pub fn apply(&mut self, write: &VfsWrite, seqs: &[u64]) {
-        for (append, &seq) in write.events.iter().zip(seqs) {
+    pub fn apply(&mut self, write: &VfsWrite, ids: &[VfsEventId]) {
+        for (append, &id) in write.events.iter().zip(ids) {
             if let Ok(event) = FileEvent::from_value(&append.body) {
                 let repo = self.repos.entry(append.repo.clone()).or_default();
-                let _ = absorb(repo, &append.key, seq, event);
+                let _ = absorb(repo, &append.key, id, event);
             }
         }
         for tomb in &write.tombstones {
@@ -262,8 +265,8 @@ fn diff_repo(repo: &str, held: &RepoMirror, snapshot: &Snapshot, write: &mut Vfs
                 FileEvent::Base { base: base.clone() },
             );
         }
-        if !held.base_seqs.is_empty() {
-            tomb(write, repo, BASE_KEY, held.base_seqs.clone());
+        if !held.base_ids.is_empty() {
+            tomb(write, repo, BASE_KEY, held.base_ids.clone());
         }
     }
     for (path, chain) in snapshot.chains() {
@@ -277,7 +280,7 @@ fn diff_repo(repo: &str, held: &RepoMirror, snapshot: &Snapshot, write: &mut Vfs
             }
             Some(mirrored) => {
                 write_whole(write, repo, path, chain);
-                tomb(write, repo, path, mirrored.seqs.clone());
+                tomb(write, repo, path, mirrored.ids.clone());
             }
             None => write_whole(write, repo, path, chain),
         }
@@ -285,18 +288,18 @@ fn diff_repo(repo: &str, held: &RepoMirror, snapshot: &Snapshot, write: &mut Vfs
     // Each path the store no longer holds: committed, discarded, carried away.
     for (path, mirrored) in &held.paths {
         if !snapshot.chains().contains_key(path) {
-            tomb(write, repo, path, mirrored.seqs.clone());
+            tomb(write, repo, path, mirrored.ids.clone());
         }
     }
 }
 
 /// `repo` has no changes any more: everything it held goes.
 fn forget_repo(repo: &str, held: &RepoMirror, write: &mut VfsWrite) {
-    if !held.base_seqs.is_empty() {
-        tomb(write, repo, BASE_KEY, held.base_seqs.clone());
+    if !held.base_ids.is_empty() {
+        tomb(write, repo, BASE_KEY, held.base_ids.clone());
     }
     for (path, mirrored) in &held.paths {
-        tomb(write, repo, path, mirrored.seqs.clone());
+        tomb(write, repo, path, mirrored.ids.clone());
     }
 }
 
@@ -345,7 +348,7 @@ fn append(write: &mut VfsWrite, repo: &str, key: &str, event: FileEvent) {
     });
 }
 
-fn tomb(write: &mut VfsWrite, repo: &str, key: &str, kills: Vec<u64>) {
+fn tomb(write: &mut VfsWrite, repo: &str, key: &str, kills: Vec<VfsEventId>) {
     write.tombstones.push(VfsKill {
         repo: repo.to_string(),
         key: key.to_string(),
@@ -399,6 +402,15 @@ mod tests {
 
     type Shape = (Vec<(String, serde_json::Value)>, Vec<(String, Vec<u64>)>);
 
+    /// One writer's event `seq` — every event in these tests is one writer's.
+    fn ev(seq: u64) -> VfsEventId {
+        VfsEventId { origin: 0xA, seq }
+    }
+
+    fn seqs(ids: &[VfsEventId]) -> Vec<u64> {
+        ids.iter().map(|id| id.seq).collect()
+    }
+
     /// `(key, body)` of every event, and `(key, kills)` of every tombstone.
     fn shape(write: &VfsWrite) -> Shape {
         (
@@ -410,7 +422,7 @@ mod tests {
             write
                 .tombstones
                 .iter()
-                .map(|t| (t.key.clone(), t.kills.clone()))
+                .map(|t| (t.key.clone(), seqs(&t.kills)))
                 .collect(),
         )
     }
@@ -418,9 +430,11 @@ mod tests {
     /// Write `write` into `mirror`, its events taking sequence numbers from
     /// `next`.
     fn land(mirror: &mut Mirror, write: &VfsWrite, next: &mut u64) {
-        let seqs: Vec<u64> = (0..write.events.len() as u64).map(|i| *next + i).collect();
+        let ids: Vec<VfsEventId> = (0..write.events.len() as u64)
+            .map(|i| ev(*next + i))
+            .collect();
         *next += write.events.len() as u64 + write.tombstones.len() as u64;
-        mirror.apply(write, &seqs);
+        mirror.apply(write, &ids);
     }
 
     fn delta_json(at_ns: i64, content: &str, start: bool) -> serde_json::Value {
@@ -589,16 +603,22 @@ mod tests {
             start,
         };
         let mut repo = RepoMirror::default();
-        absorb(&mut repo, BASE_KEY, 0, FileEvent::Base { base: base(A) }).unwrap();
-        absorb(&mut repo, "a.rs", 1, delta(1, "x", true)).unwrap();
+        absorb(
+            &mut repo,
+            BASE_KEY,
+            ev(0),
+            FileEvent::Base { base: base(A) },
+        )
+        .unwrap();
+        absorb(&mut repo, "a.rs", ev(1), delta(1, "x", true)).unwrap();
         let committed = FileEvent::State {
             size: Some(1),
             conflict: false,
             start: false,
         };
-        absorb(&mut repo, "a.rs", 2, committed).unwrap();
-        absorb(&mut repo, "a.rs", 3, delta(2, "xy", false)).unwrap();
-        absorb(&mut repo, "b.rs", 4, delta(3, "b", true)).unwrap();
+        absorb(&mut repo, "a.rs", ev(2), committed).unwrap();
+        absorb(&mut repo, "a.rs", ev(3), delta(2, "xy", false)).unwrap();
+        absorb(&mut repo, "b.rs", ev(4), delta(3, "b", true)).unwrap();
         repo.settle();
         assert!(repo.paths["a.rs"].torn && repo.paths["b.rs"].torn);
         let mirror = Mirror::of([("candle".to_string(), repo)].into());
@@ -679,7 +699,7 @@ mod tests {
         );
         land(&mut mirror, &write, &mut next);
         assert!(mirror.diff(&after).is_empty());
-        assert_eq!(mirror.repos["candle"].paths["a.rs"].seqs, vec![5, 6]);
+        assert_eq!(seqs(&mirror.repos["candle"].paths["a.rs"].ids), vec![5, 6]);
     }
 
     /// **A commit moves the base and lets go of what it took**: the new base
@@ -713,7 +733,7 @@ mod tests {
         );
         land(&mut mirror, &write, &mut next);
         assert!(mirror.diff(&after).is_empty());
-        assert_eq!(mirror.repos["candle"].base_seqs, vec![3]);
+        assert_eq!(seqs(&mirror.repos["candle"].base_ids), vec![3]);
     }
 
     /// **A repository with no changes left is forgotten whole.**
