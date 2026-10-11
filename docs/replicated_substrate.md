@@ -240,10 +240,10 @@ daemon code reports it outside logs.
 | D9 | **World state is persisted as state records; transient events are broadcast and never persisted** (§9.1). | A world survives restarts and moves between machines, and the log holds what the world *is*, not every step it took. |
 | D9a | **Each world has one authority, decided by a Paxos lease among the npcd members** (§5.9, §9.2). Only the authority persists world state. | Paxos's safety means two members never hold one world, so world state has one writer even across a partition, and a minority side holds no world at all. |
 | D9b | **The authority lends NPC leases, spread across the npcd members by weighted rendezvous from the start; a character runs where its lease is, until the lease expires *and* its holder reconnects** (§9.3). | A character's memory has one writer, and a partitioned machine's characters are never run a second time elsewhere. Losing one machine removes only its share of the cast. |
-| D9c | **A cut-off machine runs its characters in a local, unpersisted world, scrapped on reconnect** (§9.4). | Characters keep living through a partition, and each side's world never corrupts the authoritative one. |
+| D9c | **A cut-off machine runs its characters in a local, unpersisted world, scrapped on reconnect** (§9.4). **It may still publish an operation's verified work to git**, through its in-process agent. An unreachable `origin` or agent makes the publish wait 30 minutes and try again. If both sides of a partition publish one operation, git merges them, and a conflict is solved by the publishing NPC at the merge table (§10.3). | Characters keep living through a partition, and each side's world never corrupts the authoritative one. git sits outside the cluster, so a partition from the gateways is no reason to hold finished work back from the record. |
 | D9d | **Consensus is a general service: Paxos among each app's members, with the gateways only carrying the vote.** It offers leases and one-time decisions. The quorum is a majority of `max_members`, the largest group the app has had, persisted in the substrate and raised automatically; it can be lowered by flag or admin call (§5.9). | No configuration file sizes the group. A restarted or cut-off member knows the quorum from its own substrate, and gateways stay stateless. |
 | D10 | **Every zend ingests its own workspace and replicates it**; a unit already ingested by any member is not ingested again (§10.4). | Machines with different checkouts contribute their repositories to the shared memory. |
-| D11 | **File-backed state becomes VFS records**: zend uploads into the conversation's store, npcd's authored content into a mission-scoped store over the mind repository. Publishing is an explicit git merge run by an agent (§10). | One replication mechanism; git stays the record of published work. |
+| D11 | **File-backed state becomes VFS records**: zend uploads into the conversation's store, npcd's authored content into an operation-scoped store over the mind repository, which every step of the operation works in. Publishing is an explicit git merge run by an agent, and for npcd it is the workflow's last step, taken at the archive floor's merge table after verification has passed; only a publish step may lead to `done` (§10). | One replication mechanism; git stays the record of published work, and nothing reaches it unverified. |
 | D12 | **Agents are members of app `agent`**; command-line work and git writes run on the best idle agent (§11). | Realises `docs/zend_workspace_execution.md` §7–§8 on the same socket. |
 | D13 | **Build version = the count of `origin/main` commits HEAD contains**, plus a `local` digest of anything beyond it (§3.5); per-app floor on the count, held in gateway memory. A newer build raises the floor after a 30-minute grace period, during which older builds keep serving (§3.5). | A total order across checkouts, and rolling upgrades one machine at a time. |
 | D14 | **A member whose disk fills stays connected in fault mode** (§7.7). No requests are routed to it. It hands back every role that needs a log write, **keeps voting** from a preallocated vote journal, keeps sending what it already wrote, and catches up when space returns. | The group keeps going without it, and keeps its quorum, and the operator sees why on the gateway page, instead of a member that crashed or vanished. |
@@ -2382,11 +2382,21 @@ world it has characters in to **disconnected mode**:
 - **The characters' own records are persisted**, as detached events (§6.7): their turns,
   beliefs and journals. They are the characters' memories, written under leases this
   member holds, so nobody else writes them.
-- **Work on the world is world state, and goes with it.** That means bench and
-  mission-store edits (§10.3), missions and operations, so drafts written in
-  disconnected mode are scrapped with the local world on reconnect.
-- **Acts that reach outside the world are refused** with the reason: publishing at the
-  merge table, and agent jobs (§11).
+- **Work on the world is world state, and goes with it.** That means missions,
+  operations, and the edits a step makes to its operation's store (§10.3). In
+  disconnected mode those edits are kept as an overlay in RAM: no `VfsEvent` is written.
+  Drafts written in disconnected mode are scrapped with the local world on reconnect,
+  and the operation resumes from its last persisted step.
+- **Publishing still works.** git is outside the cluster, so a partition from the
+  gateways says nothing about whether `origin` is reachable. An operation finished in
+  the local world takes its `publish` step at the merge table as it would anywhere, and
+  its verified work reaches the record (§10.3). The push needs an agent the member can
+  reach without a gateway, which is its own in-process one (`tokerad --agent`, §11.5).
+  With none, or with `origin` down, the step waits and is tried again 30 minutes later.
+- **What was published stays published.** On reconnect the local world is scrapped as
+  below, but git is not. The authoritative world's copy of the operation carries on. If
+  it publishes too, git merges the two: identical text is a no-op, and different text is
+  a conflict its publisher solves at the bench (§10.3).
 
 **On reconnect:**
 
@@ -2487,50 +2497,174 @@ conversation's `uploads` store, the folder repository that already exists
 store's 10 MiB cap (`zend-vfs/src/vfs/mod.rs:108-113`) applies, and an upload past it is
 refused with the cap named.
 
-### 10.3 npcd: a mission-scoped store over the mind repository
+### 10.3 npcd: an operation-scoped store over the mind repository
 
 The mind folder is a git repository (`docs/the_effector.md`). npcd gains the `zend-vfs`
 store over it.
 
+**The work belongs to the operation, not to the mission.** An operation is one piece of
+work carried through a workflow (`docs/npcd_workflows.md`): a story written, read,
+reviewed, fixed and checked. The table offers its steps one at a time, and each step on
+offer is a mission of its own (`Operation::offered`, `npcd/src/sim/operations.rs:45-47`;
+`offer_step`, `npcd/src/engine/mission_gen/run.rs:577-604`). A store per mission would
+lose the draft between the writer's mission and the reviewer's. So the store is the
+operation's, and every mission that carries one of its steps works in it.
+
+**The store.**
+
+- Each **operation** owns one store. Its `TimelineId` is
+  `hash("operation" ‖ world id ‖ operation id)`, so every member names it the same way.
+  Operation ids are allocated by the world's authority alone (`Operations::open`,
+  `operations.rs:159-199`), so they are unique within a world.
+- The store's lower layer is the mind repository at the commit pinned when the operation
+  **opened**. Its upper layer holds every edit any step has made, in order.
+- The store lives as long as the operation. Its `VfsEvent`s replicate like any record,
+  so a step taken on another machine, by a character leased there, sees the edits of the
+  steps before it.
+
 **What a character reads.**
 
-- Each **mission** owns one store and is given a `TimelineId` that owns its `VfsEvent`s.
-  The store's lower layer is the mind repository at the commit pinned when the mission
-  was collected. Its upper layer holds the mission's edits.
-- A character on a mission reads and writes the mind **through its mission's store**.
-  The bench's file acts (`npcd/src/engine/bench.rs:104-387`) and every mind read under
-  `Within` are routed through it. A character with no mission reads the published mind
-  at the current `origin` tip.
-- **Changing mission changes what a character sees**, because a different mission is a
-  different store. A mission's drafts are visible to the characters working that mission
-  and to no one else.
+- A character carrying a mission reads and writes the mind **through the store of the
+  operation that mission is a step of** (`Mission::operation`,
+  `npcd/src/engine/mission.rs:241-247`). The bench's file acts
+  (`npcd/src/engine/bench.rs:104-387`) and every mind read under `Within` are routed
+  through it.
+- The table's own steps read the same store. The `reading` decode, and the `committed`
+  and `changed` checks, judge the operation's document as the store holds it, and
+  `Operation::found` is taken from the store.
+- A character with no mission reads the published mind at the current `origin` tip.
+- **Changing mission changes what a character sees** only when the new mission is a step
+  of a different operation. A writer's draft is in front of the reviewer, the fixer and
+  the checker of the same operation, and of no one else.
 
-**What changes in the bench.** `bench_commit` stops writing to disk
-(`npcd/src/sim/bench.rs:654-704`). It records the change into the mission's store, so
-the change replicates as a `VfsEvent`.
+**What changes in the bench.** `Bench::commit` stops writing to disk
+(`npcd/src/sim/bench.rs:654-704`). It records the change into the operation's store, so
+it replicates as a `VfsEvent`. Its collision check (`bench.rs:672-688`) compares against
+the store, where the operation's earlier steps are what moved the document.
 
-**Publishing is an in-world act: the merge table.**
+**Nothing unverified reaches the record.** Today every step commits straight into the
+mind folder, so three mechanisms keep half-finished work out of the way. All three go:
+
+- **`held_drafts`** (`npcd/src/engine/runtime.rs:663-685`) keeps unsettled operations'
+  documents out of memory ingest. The mind folder now holds only published work, so the
+  ingest has nothing to hold back.
+- **`on-failed: set-aside`** moves a failed draft out of the record, and **`restore`**
+  writes back what a corrected document said before (`Sim::set_aside_failed`,
+  `npcd/src/sim/mod.rs:267-281`). A failed operation never reached the record, so both
+  become *discard the store*. The workflow format's `on-failed` therefore takes
+  `discard` or `keep`:
+  - `discard`, the default, drops the store when the run fails;
+  - `keep` leaves it, unpublished, for an operator to reopen from the operations tab.
+
+  `reopen` resumes on a kept store. On a discarded one, it starts a fresh store at the
+  current tip.
+- **`Operation::before`** exists only to restore, and is removed.
+
+**Publishing is the workflow's last step, after verification.**
+
+The archive floor is where a verified piece enters the record. Publishing is an
+operation step like any other, so it runs only once the workflow's verification has
+passed:
+
+- **The step.** Each workflow that changes the record ends in a `publish` step taken at
+  the merge table:
+
+  ```yaml
+      canon:
+        by: another
+        next:
+          pass: publish          # was: done
+          reject: fix
+      publish:
+        by: maker
+        desk: merge-table
+        edits: optional          # only to resolve a conflict
+        tools: [merge_status, merge_sync, merge_publish]
+        checks: [published]      # the step stands once the store has landed on main
+        next: done
+  ```
+
+  In today's pipeline (`docs/npcd_workflows_current.yaml`), `story` and `life-event`
+  publish after `canon: pass`, and `correction`, which has no canon check, publishes
+  after its last check passes.
+- **Only a publish step leads to `done`.** That is a load error otherwise
+  (`npcd/src/engine/workflow/validate.rs`). It is what makes "after verification" a rule
+  of the format rather than a habit of whoever writes the YAML.
+- **A step may name its own `desk`.** The workflow format gains `desk` as a step key,
+  overriding the workflow's desk for that step. `offer_step` builds each step's mission
+  at the workflow's desk today (`mission_gen/run.rs:580-588`), so a step at the merge
+  table needs the key. The story is written at the story desk; its publish step sends a
+  Maker down to the archive floor.
+- **The Maker solves a conflict at the publish bench.** A conflict means the record
+  moved under the operation at lines it changed: another operation published there
+  first, or the same operation was published from the other side of a partition (§9.4).
+  The merge table is a bench like the story desk:
+  1. `merge_publish` is refused, naming the conflicting paths.
+  2. `merge_sync` brings the record's newer commit into the store, with the overlapping
+     hunks marked in the document.
+  3. The Maker reads them, edits the document at the bench until no marker is left,
+     and commits it into the store.
+  4. It publishes again.
+
+  The step's `published` check holds it open until the store lands. A Maker that cannot
+  resolve it reports `stuck`, and the step goes to another Maker, as every actor step
+  does. Nothing goes back through verification: the operation's own verified text is
+  what is being merged, and a record that moved only at other lines merges with no
+  conflict at all.
+
+**The archive floor and its acts.**
 
 - A new level, `vault-archive` (ordinal 8), joins the building through its `contains:`
   list and a lift portal (`npc-map/maps/creators-vault.yaml`).
 - Its archive room holds a station part, `merge-table`.
-- Its acts are `merge_status`, `merge_publish` and `merge_abandon`, with the namespace
-  `archive` (`npcd/src/effector/namespace.rs`). Their handlers are in
-  `npcd/src/engine/work.rs`. Adding them takes the same pieces `vault-time` and its
-  `time-machine` took: a level YAML and a part YAML under the world's map directory,
-  `Tool` consts with `at: &["merge-table"]` chained into `CATALOG`
+- Its acts, with the namespace `archive` (`npcd/src/effector/namespace.rs`), are:
+  - `merge_status`: what the operation's store changes against its base, and whether it
+    merges cleanly with the record as it stands;
+  - `merge_publish`: publish the operation's store, or refuse with the conflicting
+    paths;
+  - `merge_sync`: bring the record's newer commit into the store, with each overlapping
+    hunk marked in the document for the Maker to resolve at the bench. The bench's own
+    file acts edit and commit the result.
+
+  There is no abandon act. A failed or cancelled operation's store is discarded by the
+  engine, as `on-failed` says.
+- Their handlers are in `npcd/src/engine/work.rs`. Adding them takes the same pieces
+  `vault-time` and its `time-machine` took: a level YAML and a part YAML under the
+  world's map directory, `Tool` consts with `at: &["merge-table"]` chained into `CATALOG`
   (`npcd/src/engine/tools.rs:956-965`), and a match arm in `work::perform`
   (`work.rs:708`).
-- `merge_publish` sends the mission's store to an agent as a git job (§11.4): a commit on
-  the mission's branch, a merge into `main`, and a push under a lease.
-- **A conflict comes back as the act's refusal**, naming the paths. The character must
-  merge again at the table before it can publish, as zend's `Behind` asks for
-  `git_merge`.
+- `merge_publish` sends the operation's store to an agent as a git job (§11.4): a commit
+  on the operation's branch, `operation/<world>/<id>`, a merge into `main`, and a push
+  under a lease. The commit message names the operation and every step's taker, from its
+  run history.
 - **On success** the store's base moves to the merged commit and its published paths are
   tombstoned, which is zend's `land` behaviour (`zend-vfs/src/work/commit.rs:200-218`).
-- The world's authority's mind watcher (§9.2) then picks up the pushed change from `origin` and
-  ingests it into memory (`npcd/src/engine/watcher.rs`). Held drafts stay out of memory
-  until their operation's phase allows them (`runtime.rs:662-684`).
+  The run reaches `done`, and the store is dropped with the operation's settlement.
+- The world's authority's mind watcher (§9.2) then picks up the pushed change from
+  `origin` and ingests it into memory (`npcd/src/engine/watcher.rs`).
+
+**When git cannot be reached, the step waits and is tried again.** A publish needs
+`origin` and an agent to push with (§11.4). Either can be unreachable: `origin` is down,
+no agent is connected, or the world runs in disconnected mode on a member with no
+in-process agent (§9.4).
+
+- **The attempt fails without settling anything.** `merge_publish` answers with the
+  reason, and the run stays on `publish`. It is neither an outcome nor a stuck report,
+  so it routes nowhere and counts toward neither `send-backs` nor `stuck-limit`.
+- **The step is offered again 30 minutes later.** The operation records `retry_at`, and
+  the table does not offer its step before then. The operations tab shows the wait and
+  the last reason, and an operator can offer the step at once.
+- **The store keeps the work meanwhile.** Nothing about the operation changes but the
+  time, so a publish that fails for an hour is published intact once git is back.
+- **The wait is fixed at 30 minutes**, the same on every world and member, so a
+  disconnected world needs nothing from a gateway to keep it.
+
+**Duplicates are git's to handle.** In a partition, the same operation can be carried
+to `publish` on both sides: by the authoritative world, and by a disconnected one with
+its own copy (§9.4). Nothing tracks that.
+- If both wrote the same text, the second publish merges as a no-op.
+- If they differ, the second publisher meets a conflict and solves it at the bench like
+  any other.
 
 **Other npcd content.**
 
@@ -2615,7 +2749,7 @@ The agent's API:
 | `GET /v1/jobs/:id/log` | The log as a stream from its first byte. |
 | `DELETE /v1/jobs/:id` | Cancel, killing the process tree. |
 
-`overlay` is the conversation's or mission's store `Snapshot` (`zend-vfs/src/vfs/mod.rs:380`),
+`overlay` is the conversation's or operation's store `Snapshot` (`zend-vfs/src/vfs/mod.rs:380`),
 which the 10 MiB store cap keeps small. That answers the open question of sync
 granularity (`docs/zend_workspace_execution.md` §9.4) with a per-job overlay over a
 fetched base.
@@ -2639,6 +2773,13 @@ tool error `no_agent`, never a quiet local run.
 A machine with a GPU can also be an agent. `tokerad --agent` opens a third socket that
 serves the job API in-process at low priority, which is §8.1's "GPU nodes may register as
 low-priority build agents".
+
+**A member cut off from every cluster can still reach its own in-process agent.** Agents
+dial out and have no listener, so a member cut off from the gateways reaches no other
+agent. When it is cut off, a `tokerad --agent` sends jobs straight to the agent in its
+own process. That is how a disconnected npcd world publishes (§9.4, §10.3). A member with
+no in-process agent fails the job with `no_agent`. A zend tool reports that to the
+model; a publish waits 30 minutes and tries again.
 
 ### 11.6 Safety
 
@@ -3045,13 +3186,13 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | quorum | `cluster/max_members` rises when more members are seen together, never falls by itself; a *set* lowers it, and raises after the set raise it again, in any arrival order; `--cluster-quorum-max` and the admin call write a set; the quorum is `⌊max_members / 2⌋ + 1`; a freshly restarted member alone reads its quorum from its substrate |
 | NPC lease | the authority lends and renews `world/<wid>/npclease/<nid>`, spread by weighted rendezvous across members from the first lending; a membership change moves a character only at its turn boundary, after its holder hands it back; a holder that drops out keeps its characters, which are never lent again until it rejoins; the admin release stamps above the holder |
 | world state | only the authority writes `world/<wid>/…` records, at most once per entity per beat; a ceased entity is tombstoned; `PULSE` is never persisted, never retransmitted, and dropped under pressure; a replica that loses every pulse still ends on the same state records |
-| disconnected mode | a cut-off member's characters keep acting on each other in a local world; no world-state record is written while cut off; the characters' turns are written as detached events; on reconnect the local world is scrapped and reloaded from state records; acts that reach outside the world are refused |
+| disconnected mode | a cut-off member's characters keep acting on each other in a local world; no world-state record is written while cut off; the characters' turns are written as detached events; on reconnect the local world is scrapped and reloaded from state records; an operation finished in the local world publishes through the member's in-process agent, and without one waits 30 minutes and tries again; a publish landed while disconnected is kept on reconnect, and the authoritative world's copy of the operation carries on |
 | rendezvous | ownership is deterministic, minimal movement on joins and leaves, and the weighted share tends to the weights |
 | **order independence** (`candle-conversation`, CPU substrate) | **the central test.** Generated event sets cover every record type, two and three origins, competing writes to one key, tombstones before and after their targets, children before parents, section generations ended and restarted, two writers' turns at one index, and events with fixed generations from a cut-off member. **Every permutation** of each set (exhaustive up to 7 events, 5,000 seeded random shuffles beyond) is applied to a fresh substrate, and the resulting state — every index, value, stamp, tombstone, lease and turn order — is byte-identical across all of them. The same holds after a compaction and a reopen part-way through. |
 | apply (`candle-conversation`, CPU substrate) | a record of an unknown type is neither written nor marked applied, goes in the deferred set, and is not asked for by a catch-up; a build that knows the type moves it back to wanted on open, and its first catch-up fetches it; duplicates are not written; dominated records are not written; a same-`digest` record is skipped; a record failing its `digest` is refused; a turn is adopted only when complete, and an incomplete remote turn is pending, never `Corrupt`, at runtime and at open; repair tombstones are never replicated; placeholders fill gaps; a child record waits for its parent and is applied when it comes; `Commit` takes the max; a timeline tombstone survives compaction and kills a record arriving after it |
 | tombstone expiry | a tombstone record is kept by every compaction until a complete `compact()` has finished after it **and** its `hlc` is more than *N* days old, and is then replaced by its entry in the `Deleted` record; neither condition alone shrinks it; with paused time, a record for a deleted timeline arriving a year after expiry dies in every arrival order, and a register of that timeline is refused; a keyed entry kills lower-stamped writes and yields to a greater stamp; a catch-up's gone header for an expired tombstone carries its entry, and a member returning after any absence drops the timelines it names and its unsent writes to them die everywhere; `Deleted` survives compaction and reopen byte-exact |
 | identity | the `TimelineId` layout and monotonicity; `hlc` is monotonic and passes every `hlc` seen; `(origin, oseq)`, stamp and `digest` preserved through relocation, re-emission and `compact()`; the applied set and the location index rebuild from the last `Replica` plus the walk; a substrate copied to another directory or machine re-mints its node; passthrough timelines are `hash(conversation_key)` |
-| VFS scoping | two missions over one base see different files; leaving a mission changes the view; a merge-table conflict refuses with the paths named |
+| VFS scoping | the writer's, reviewer's and checker's missions of one operation see one store, and a draft written in one step is read in the next, on another in-process member too; two operations over one base see different files; a character with no mission reads the tip; the table's reading and checks read the store; nothing an operation writes reaches the mind folder before its publish step; a failed run's store is discarded under `discard` and kept under `keep`, and `reopen` resumes a kept one; a workflow with a route to `done` from anything but a publish step is a load error; a clean publish lands the store and settles the run `done`; a conflict refuses the publish with the paths named, `merge_sync` marks the overlapping hunks in the store, and once the Maker has resolved and committed them at the bench the publish lands and the run settles `done` without going back through verification; the `published` check holds the step open until then; a Maker that reports `stuck` hands the step to another; publishing the same text twice merges as a no-op; in disconnected mode a step's edits write no `VfsEvent`; with `origin` or every agent unreachable, a publish settles nothing, counts toward neither send-backs nor stuck, and under paused time is offered again exactly 30 minutes later with the store intact |
 | agent selection | stickiness, the spill after the wait, and the idle-core ranking with repository and toolchain filters |
 | status page | `COORD` encodes to exact bytes; every coordination decision of §12.3 — admission, refusal, mode switch, floor, lock, claim, grant, majority, NPC lease, cut-off, rejoin step, generation fixed, disconnected mode, catch-up, resync, tombstone expiry — driven through an in-process gateway lands in the log with its gateway and subject; `status.json` carries every block of §12.2, and a member reporting a gateway this one cannot see shows in both the `clusters` column and the grant counts |
 
@@ -3141,9 +3282,16 @@ The total is 19 s.
    forwarded to it (§9.3). Disconnected mode (§9.4). Handover and routing (§9.6).
 7. **Agents.** `tokera-agent` and the job API. zend's executor goes through agents under
    `--cluster`, and so do the git writers.
-8. **File state.** zend uploads into VFS. npcd gets mission stores, the
-   `vault-archive` floor and merge table, authoring stores and Publish, accounts as
-   CustomObjects, and images as `Blob` records.
+8. **File state.** zend uploads into VFS. npcd gets operation stores read and written by
+   every step's mission and by the table's checks; the bench committing into them; the
+   removal of `held_drafts`, `Operation::before` and the on-disk set-aside and restore,
+   with `on-failed` taking `discard` or `keep`; the workflow format's step `desk`, the
+   `publish` step with its `published` check, and the load rule that only a publish step
+   leads to `done`; the `vault-archive` floor and merge table with `merge_status`,
+   `merge_publish` and `merge_sync`, which marks conflicts for the Maker to resolve at the
+   bench; `retry_at` and the 30-minute retry of an unreachable publish; publishing in
+   disconnected mode through the in-process agent; authoring stores and Publish; accounts
+   as CustomObjects; and images as `Blob` records.
 9. **A/B upgrades** (§3.8, §3.9). `--build-info` on every binary; the loading gate on
    the grace period; certification at the gateway (live share, mirror modes on every
    route, the statistics, `VERDICT` frames and the candidate's `certify/<app>/<build>`
@@ -3270,9 +3418,11 @@ same configured upstreams as before.
    shared substrate.
 3. **The affinity idle timeout** (10 min) and the **catch-up hold** (30 s) are first
    values, to be measured against how long a moved conversation's K/V takes to land.
-4. **Mission-store lifetime.** When a mission closes without publishing, its store's
-   events need a policy, as zend's tombstoned conversations do implicitly
-   (`docs/zend_vfs_events.md` §1).
+4. **A kept store has no expiry.** An operation's store is dropped when it publishes, or
+   when it fails under `on-failed: discard` (§10.3). Under `keep`, the store waits for an
+   operator to reopen the operation, and nothing ever drops it unattended. Whether a
+   kept store should be dropped after some time, with the operations tab warning first,
+   is open.
 5. **Uploads larger than the 10 MiB store cap** are refused under §10.2. Whether
    uploads deserve a larger cap of their own is open.
 6. **A member joined to only some clusters.** The design assumes every member is given
@@ -3368,5 +3518,6 @@ same configured upstreams as before.
 | `docs/zend_git.md` | §9: publishing happens through agents. |
 | `docs/zend_vfs_events.md` | Events are keyed `(timeline, origin, seq)` and replicate. Uploads become VFS. |
 | `docs/archived/segmented_substrate_log.md`, `docs/archived/kv_tier_migration.md` §5 | The record header's new fields (`origin`, `oseq`, `hlc`, `epoch`, `digest`); `Replica`; the order-independent apply rules; timeline tombstones kept by compaction; incomplete remote turns pending, not `Corrupt`. |
-| `docs/the_effector.md`, `docs/vault_world.md` | The `vault-archive` floor, the merge table, and mission-scoped mind reads. |
+| `docs/the_effector.md`, `docs/vault_world.md` | The `vault-archive` floor, the merge table, and operation-scoped mind reads. |
+| `docs/npcd_workflows.md`, `docs/npcd_workflows_current.yaml` | Step key `desk`; `on-failed: discard \| keep` in place of `set-aside`, `restore` and `keep`; every workflow ends in a `publish` step after its verification, where the Maker resolves any merge conflict at the merge table; the check `published`; only a publish step leads to `done`; each step's mission works in the operation's store (§10.3). |
 | `docs/deployment.md` | The group key, `--cluster` (every gateway on every member), agents, `group:` upstreams, and more than one gateway behind the public names. |
