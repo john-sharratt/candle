@@ -1,4 +1,4 @@
-//! Standing up the layer cache for a dense checkpoint.
+//! Standing up the layer cache for a dense model pack.
 //!
 //! The layer-streaming counterpart of [`super::expert_loader`], and it runs in
 //! the same place in the load: after every resident tensor is down and the span
@@ -8,42 +8,37 @@
 //! ## The order, and why it is this order
 //!
 //! ```text
-//! images_from_gguf      geometry from the HEADER — no weight is read
-//! open or build pack    the streaming pass, only when the pack is missing
+//! open the section      the pack's layer section, checked against this build
+//! images_of             geometry from the section's HEADER — no weight is read
 //! carve the zone        slots from the ground the dense weights left
-//! residues              a few hundred KB per layer, no repack
-//! LayerCache::new       fills the warm tier, builds the pinned views
-//! upload the pinned     the one part with no record anywhere
+//! LayerCache::new       fills the warm tier and the pinned head, from the pack
+//! warm_start            fills the rest of the zone
 //! ```
 //!
-//! The first step is what makes the rest possible: `ko_repacked_bytes` is a
-//! function of a shape and a target dtype, both of which are in the tensor
-//! table, so the pack's `slot_bytes` — the max over images — is known before a
-//! single weight is touched. Without that the pack build would need one pass to
-//! measure and another to write.
+//! The pack was built (`pack_build`) by loading every trunk layer through the
+//! same `load_layer` a resident load runs, so a record is exactly what this
+//! loader would have produced — including the pinned head, which is filled from
+//! its record like any other layer.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use candle::quantized::{gguf_file, GgmlDType, Int8Mode};
 use candle::{Device, Result};
 
 use super::config::Qwen35Config;
 use super::layer_store::{sell_ground, LayerStore, StreamedLayers};
-use super::quantized_weights::{
-    load_layer, narrow_resident_twin, streaming_twin, Loader, QuantLayer, ResidentResidue,
-    RECURRENT_PATH,
-};
+use super::quantized_weights::{narrow_resident_twin, QuantLayer, ResidentResidue};
+use crate::models::delta_net::LayerKind;
 use crate::models::expert_lre::handle::warm_slots_for;
+use crate::models::expert_lre::PINNED_LAYERS;
 use crate::models::layer_stream::assemble::assemble_layer;
-use crate::models::layer_stream::build::images_from_gguf;
-use crate::models::layer_stream::cache::{pack_path_for, SlotAssembler, STAGING_SLOTS};
-use crate::models::layer_stream::descriptor::LayerImage;
-use crate::models::layer_stream::pack::{header_for, LayerPack, PackIdentity, PackWriter};
+use crate::models::layer_stream::cache::{SlotAssembler, STAGING_SLOTS};
+use crate::models::layer_stream::descriptor::{LayerImage, MixKind};
+use crate::models::layer_stream::pack::images_of;
+use crate::models::layer_stream::section::open_layer_section;
 use crate::models::layer_stream::view::StreamedLayer;
 use crate::models::layer_stream::zone::{plan_zone, ZonePlan};
 use crate::models::layer_stream::{slot_bytes_for_layers, LayerCache, LoadedLayer};
-use crate::models::quantized_matmul::WeightResidency;
+use crate::models::model_pack::ModelPack;
 
 /// The assembled cache a streamed dense model reads its layers from.
 pub type QwenLayerCache = LayerCache<QuantLayer, LayerAssembler>;
@@ -77,7 +72,7 @@ impl SlotAssembler<QuantLayer> for LayerAssembler {
 /// **Measured, not asked-and-stepped-down.** The obvious version wants every
 /// streamable layer and leans on `WarmPool::new` stepping down until
 /// `cuMemAllocHost` accepts. That converges, and to the wrong number:
-/// availability counts droppable page cache — the checkpoint's own mmap reads as
+/// availability counts droppable page cache — the pack's own mapping reads as
 /// available — so the allocator says yes to a tier that then leaves the OS
 /// paging everything else, and the step-down cannot tell "the machine is full"
 /// from "the machine will regret this". On the 27B it asks for 16 GB of
@@ -102,28 +97,16 @@ fn warm_budget(slot_bytes: usize, num_layers: usize, pinned: usize) -> usize {
     warm_slots_for(slot_bytes, num_layers.saturating_sub(pinned)).saturating_sub(STAGING_SLOTS)
 }
 
-/// Build the streamed layer store for a dense checkpoint.
+/// Build the streamed layer store for a dense model pack.
 ///
 /// `residues` were read by `load_quantized_model` inside the load window, so
 /// they are span tenants like the rest of the resident model rather than pool
 /// allocations made after the dense block was frozen.
-#[allow(clippy::too_many_arguments)]
-pub fn build_layer_cache<R: std::io::Read + std::io::Seek>(
-    content: &gguf_file::Content,
-    reader: &mut R,
+pub fn build_layer_cache(
+    pack: &ModelPack,
     device: &Device,
     cfg: &Qwen35Config,
-    mode: Int8Mode,
-    gguf_path: &Path,
-    gguf_identity: PackIdentity,
-    pinned_layers: usize,
     residues: Arc<Vec<ResidentResidue>>,
-    // The base checkpoint to read the DeltaNet recurrent path from, when this one quantized
-    // it — see `LoadInputs::gate_src`. Threaded down here because the trunk's large
-    // projections are built by this path and not by the caller's loader: without it the
-    // repair covers the small resident gates and leaves `ssm_out` reading the checkpoint's
-    // own copy, which is a half-repaired recurrence and measurably not a fix.
-    gate_src: Option<(&gguf_file::Content, &[u8])>,
 ) -> Result<LayerStore> {
     let Device::Cuda(cuda) = device else {
         candle::bail!("qwen35: the layer cache is a CUDA-only path");
@@ -135,86 +118,66 @@ pub fn build_layer_cache<R: std::io::Read + std::io::Seek>(
             cfg.num_layers
         );
     }
-
-    // ── Geometry, from the header alone ──
-    // The narrowing schedule is an input to the geometry, not just to the bytes: a slot's size
-    // is derived from the twin width, so a pack built without it would describe records the
-    // narrowed load does not fill. Decided here, from the same tight-VRAM predicate the resident
-    // weights use, so the two halves of one model are narrowed on one condition.
-    let stream_narrow = narrow_resident_twin(device, cfg, content).map(|_| cfg.num_layers);
-    let narrow = |name: &str| stream_narrow.and_then(|n| streaming_twin(name, n));
-    // The donor's dtype wherever the donor will supply the tensor, so the slot is sized for
-    // what gets written into it. Same rule as `Loader::donated`, stated once more here because
-    // the geometry is planned from the header before any loader exists.
-    let substitute = |name: &str| -> Option<GgmlDType> {
-        let (donor, _) = gate_src?;
-        if !RECURRENT_PATH.iter().any(|r| name.ends_with(r)) {
-            return None;
-        }
-        let theirs = donor.tensor_infos.get(name)?.ggml_dtype;
-        let mine = content.tensor_infos.get(name)?.ggml_dtype;
-        (theirs != mine).then_some(theirs)
+    let Some(at) = pack.layers else {
+        candle::bail!("qwen35: a dense model's pack has no layer section");
     };
-    let images = images_from_gguf(content, &cfg.layer_kinds, mode, &narrow, &substitute)?;
-    let slot_bytes = slot_bytes_for_layers(&images);
-    let pinned = pinned_layers.min(cfg.num_layers);
+    // The pack was built for one narrowing; this card must want the same, or
+    // the resident weights and the streamed ones were narrowed on different
+    // conditions. The resolver picks the pack by this rule, so a mismatch is a
+    // pack opened by path for a card it was not built for.
+    let want = narrow_resident_twin(device, cfg, pack.checkpoint_bytes).map(|_| cfg.num_layers);
+    if pack.narrow != want {
+        candle::bail!(
+            "qwen35: the pack streams its layers narrowed for {:?}, this card wants {want:?} — \
+             it was built for a card of another size",
+            pack.narrow
+        );
+    }
 
-    // ── The cold tier ──
-    let path = pack_path_for(gguf_path, mode, stream_narrow);
-    let pack = match LayerPack::open(&path, gguf_identity, &images, pinned) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::info!(
-                target: "candle_transformers::qwen35",
-                path = %path.display(),
-                "layer pack absent or stale ({e}); building it"
+    // ── The cold tier, and the geometry from its header ──
+    let section = open_layer_section(&pack.path, at.offset, cuda)?;
+    let images = images_of(section.header())?;
+    if images.len() != cfg.num_layers {
+        candle::bail!(
+            "qwen35: the layer section holds {} layers, the trunk has {}",
+            images.len(),
+            cfg.num_layers
+        );
+    }
+    for (li, (img, kind)) in images.iter().zip(&cfg.layer_kinds).enumerate() {
+        let want = match kind {
+            LayerKind::DeltaNet => MixKind::DeltaNet,
+            LayerKind::Attention => MixKind::Attention,
+        };
+        if img.kind != want {
+            candle::bail!(
+                "qwen35: layer {li} is {:?} in the pack and {want:?} in the model",
+                img.kind
             );
-            build_pack(
-                content,
-                reader,
-                device,
-                cfg,
-                mode,
-                &path,
-                gguf_identity,
-                &images,
-                pinned,
-                slot_bytes,
-                stream_narrow,
-                gate_src,
-            )?;
-            LayerPack::open(&path, gguf_identity, &images, pinned)?
         }
-    };
+    }
+    let slot_bytes = slot_bytes_for_layers(&images);
+    let pinned = PINNED_LAYERS.min(cfg.num_layers);
 
     // ── The hot tier ──
-    let mut g =
-        Loader::new(content, reader, device, mode, WeightResidency::Pool).with_gate_src(gate_src);
-    g.set_stream_narrow(stream_narrow);
     let plan = carve_zone(cuda, &images, pinned)?;
     let assembler = LayerAssembler {
         residues: residues.clone(),
         images: images.clone(),
     };
-    let cache = LayerCache::new(
+    let mut cache = LayerCache::new(
         cuda,
         images,
-        mode,
-        pack,
+        pack.int8_mode,
+        section,
         &plan,
+        pinned,
         warm_budget(slot_bytes, cfg.num_layers, pinned),
         assembler,
     )?;
 
-    // The pinned head is the one part of the model with no record in any tier —
-    // it is never loaded and never evicted — so its bytes go into slots
-    // `0..pinned` here, straight from the checkpoint. `LayerCache::new` has
-    // already built the views over those addresses and is waiting for them.
-    upload_pinned(&mut g, cfg, mode, cuda, &cache, pinned, slot_bytes)?;
-
     // Fill the rest of the zone now rather than inside the first forward — the
     // bytes move either way and this is where the wait belongs.
-    let mut cache = cache;
     cache.warm_start()?;
 
     // **Open the shop.** A KV arena claim or a transient-tier placement that
@@ -245,130 +208,12 @@ pub fn build_layer_cache<R: std::io::Read + std::io::Seek>(
     Ok(LayerStore::Streamed(StreamedLayers::new(cache, residues)))
 }
 
-/// Place the pinned head's repacked bytes into its slots.
-///
-/// Loaded one layer at a time through the same `load_layer` the pack build
-/// uses, repacked to the CUDA pool, copied slot-ward, and dropped — so the peak
-/// is one layer even here, and the pool's ground is reused by the next.
-///
-/// # The whole slot is written, zeros included
-///
-/// Assembled host-side into one `slot_bytes` buffer and sent in a single H2D,
-/// rather than a copy per projection. That is not only fewer transfers: the
-/// gaps a per-projection copy would leave are **read**. The GGML matmul kernels
-/// address `MATRIX_ROW_PADDING` elements past the end of every row, and
-/// `QCudaStorage::zeros` exists precisely so that read is a defined zero — so a
-/// slot whose padding held whatever the zone last had there would multiply
-/// activations by stale weights. Every streamed layer already gets this for
-/// free, because `PackWriter::write_layer` zeroes each record before placing
-/// the payloads; the pinned head is the one path that does not go through the
-/// pack, and it has to make the same guarantee itself.
-fn upload_pinned<R: std::io::Read + std::io::Seek>(
-    g: &mut Loader<'_, R>,
-    cfg: &Qwen35Config,
-    mode: Int8Mode,
-    cuda: &candle::CudaDevice,
-    cache: &QwenLayerCache,
-    pinned: usize,
-    slot_bytes: usize,
-) -> Result<()> {
-    let stream = cuda.cuda_stream();
-    let mut slot = vec![0u8; slot_bytes];
-    for li in 0..pinned {
-        let layer = load_layer(g, cfg, li, mode, &mut 0)?.resolve_dense()?;
-        let image = cache.image(li)?;
-        let loaded = loaded_layer(&layer, image)?;
-        let bufs = loaded.read_back(&stream)?;
-        slot.fill(0);
-        for (p, b) in image.placements.iter().zip(&bufs) {
-            if p.bytes != b.len() {
-                candle::bail!(
-                    "layer stream: pinned L{li} {:?} read back {} B against the image's {} B",
-                    p.role,
-                    b.len(),
-                    p.bytes
-                );
-            }
-            slot[p.offset..p.offset + b.len()].copy_from_slice(b);
-        }
-        let base = cache.slot_base_of(li)?;
-        // A homed slot is exactly its own image wide — the zone packs them
-        // densely, so the staging buffer's `slot_bytes` (the max over every
-        // layer) overruns any slot whose image is smaller than that max. Copy
-        // the image, not the buffer.
-        // SAFETY: `base` names `image.total` of a slot the zone handed this
-        // cache and has not reclaimed. Synchronous on the compute stream, at
-        // load, with nothing else in flight.
-        let res = unsafe {
-            candle::cuda_backend::cudarc::driver::sys::cuMemcpyHtoD_v2(
-                base,
-                slot.as_ptr() as *const _,
-                image.total,
-            )
-        };
-        if res != candle::cuda_backend::cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            candle::bail!("layer stream: pinned L{li} H2D failed: {res:?}");
-        }
-    }
-    Ok(())
-}
-
-/// The streaming pack build: one layer at a time, repacked to the pool.
-#[allow(clippy::too_many_arguments)]
-fn build_pack<R: std::io::Read + std::io::Seek>(
-    content: &gguf_file::Content,
-    reader: &mut R,
-    device: &Device,
-    cfg: &Qwen35Config,
-    mode: Int8Mode,
-    path: &Path,
-    identity: PackIdentity,
-    images: &[LayerImage],
-    pinned: usize,
-    slot_bytes: usize,
-    stream_narrow: Option<usize>,
-    gate_src: Option<(&gguf_file::Content, &[u8])>,
-) -> Result<()> {
-    let Device::Cuda(cuda) = device else {
-        candle::bail!("qwen35: the layer pack build is a CUDA-only path");
-    };
-    let stream = cuda.cuda_stream();
-    let mut w = PackWriter::create(path, header_for(images, identity, pinned, slot_bytes))?;
-    // Pool, not span: each layer here is materialised only to be read back and
-    // dropped, and the dense block never frees. See [`WeightResidency`].
-    //
-    // The donor rides along, because what this writes is *persisted*: a pack built from the
-    // checkpoint's own quantized recurrent path would be reused on every later load, and the
-    // repair would be undone by a cache hit rather than by anything visible.
-    let mut g =
-        Loader::new(content, reader, device, mode, WeightResidency::Pool).with_gate_src(gate_src);
-    g.set_stream_narrow(stream_narrow);
-
-    for (li, image) in images.iter().enumerate().take(cfg.num_layers).skip(pinned) {
-        // Loaded, read back, and dropped before the next one is touched — the
-        // peak is one layer, which is what lets a model larger than the card be
-        // packed at all.
-        let layer = load_layer(&mut g, cfg, li, mode, &mut 0)?.resolve_dense()?;
-        let loaded = loaded_layer(&layer, image)?;
-        let bufs = loaded.read_back(&stream)?;
-        let refs: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
-        w.write_layer(li, &refs)?;
-        drop(loaded);
-        drop(layer);
-    }
-    let published = w.finish()?;
-    tracing::info!(
-        target: "candle_transformers::qwen35",
-        path = %published.display(),
-        layers = cfg.num_layers - pinned,
-        slot_mib = slot_bytes >> 20,
-        "layer pack built"
-    );
-    Ok(())
-}
-
-/// Borrow a loaded layer's streamable projections in the image's order.
-fn loaded_layer<'a>(layer: &'a QuantLayer, image: &LayerImage) -> Result<LoadedLayer<'a>> {
+/// Borrow a loaded layer's streamable projections in the image's order — what
+/// the pack build reads back into a record.
+pub(crate) fn loaded_layer<'a>(
+    layer: &'a QuantLayer,
+    image: &LayerImage,
+) -> Result<LoadedLayer<'a>> {
     let mut projections = Vec::with_capacity(image.placements.len());
     for p in &image.placements {
         projections.push((p.role, layer.streamed_projection(p.role)?));

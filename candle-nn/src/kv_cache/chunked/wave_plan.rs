@@ -2278,6 +2278,33 @@ impl WaveBuffer {
 /// reaching the overflow.
 const ROW_SEARCH_CEILING: usize = 1 << 20;
 
+/// The most rows whose `cost` stays within `budget`, for a `cost` that is
+/// non-decreasing in rows; `0` when not even one row fits.
+///
+/// Bisected rather than divided: the `div_ceil` steps make every cost here a
+/// staircase, so dividing the budget by a per-row average lands inside a step
+/// and over-admits.
+fn max_rows_within_cost(budget: usize, cost: impl Fn(usize) -> usize) -> usize {
+    if cost(1) > budget {
+        return 0;
+    }
+    let mut lo = 1usize;
+    let mut hi = 2usize;
+    while hi < ROW_SEARCH_CEILING && cost(hi) <= budget {
+        lo = hi;
+        hi = hi.saturating_mul(2);
+    }
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if cost(mid) <= budget {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// Prices a wave against the model's geometry.
 ///
 /// Cheap to copy and free of interior state, so admission can hold one and call
@@ -2443,25 +2470,38 @@ impl WavePlan {
     /// staircase, so dividing the budget by a per-row average lands inside a
     /// step and over-admits.
     pub fn max_prefill_rows_for_tier(&self, budget: usize, head: WaveWidth) -> usize {
-        if self.tier_bytes(head.with_one_more_sequence(1)) > budget {
-            return 0;
-        }
-        let mut lo = 1usize;
-        let mut hi = 2usize;
-        while hi < ROW_SEARCH_CEILING && self.tier_bytes(head.with_one_more_sequence(hi)) <= budget
-        {
-            lo = hi;
-            hi = hi.saturating_mul(2);
-        }
-        while lo + 1 < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.tier_bytes(head.with_one_more_sequence(mid)) <= budget {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
+        max_rows_within_cost(budget, |rows| {
+            self.tier_bytes(head.with_one_more_sequence(rows))
+        })
+    }
+
+    /// The most **prefill** rows on top of `head` whose tier **and** the KV they
+    /// write fit in `budget` together, at `kv_row_bytes` of KV per row.
+    ///
+    /// The bound a wave must be composed against when the tier and the KV are
+    /// paid from the same ground — the KV side's free regions plus what the
+    /// weight side would concede. Admit claims the wave's KV first and the tier
+    /// is placed in what is left, so pricing each against the whole budget and
+    /// taking the smaller admits a wave whose tier comes up short by exactly its
+    /// own KV: measured on Qwen3.8-Flash-Next at BF16 ×8 on a 16 GB card, a
+    /// 4,160-row wave whose tier fell 8 regions short — the ~108 MB its prompts
+    /// wrote to the KV side.
+    ///
+    /// The KV is priced in whole regions, as arenas claim it.
+    pub fn max_prefill_rows_for_tier_and_kv(
+        &self,
+        budget: usize,
+        head: WaveWidth,
+        kv_row_bytes: usize,
+    ) -> usize {
+        max_rows_within_cost(budget, |rows| {
+            let kv = rows
+                .saturating_mul(kv_row_bytes)
+                .div_ceil(TARGET_ARENA_BYTES)
+                .saturating_mul(TARGET_ARENA_BYTES);
+            self.tier_bytes(head.with_one_more_sequence(rows))
+                .saturating_add(kv)
+        })
     }
 
     /// The widest wave that fits in `budget` bytes — a **single phase's** bound.
@@ -3082,6 +3122,31 @@ mod tests {
             loaded < empty,
             "32 decode rows must cost prefill width: {loaded} vs {empty}"
         );
+    }
+
+    /// **The tier and the KV share the budget.** With no KV the joint bound is
+    /// the tier bound; with KV it admits fewer rows, and exactly the most whose
+    /// tier plus whole-region KV fits — one row more does not.
+    #[test]
+    fn the_joint_bound_pays_tier_and_kv_from_one_budget() {
+        let p = WavePlan::new(moe());
+        let budget = 4 * WAVE_SPAN_BYTES;
+        let head = WaveWidth::prefill(0, 1);
+        assert_eq!(
+            p.max_prefill_rows_for_tier_and_kv(budget, head, 0),
+            p.max_prefill_rows_for_tier(budget, head),
+        );
+
+        // Qwen3-30B-A3B's KV per row: K and V, 4 KV heads × 128, BF16, 48 layers.
+        let kv_row = 2 * 4 * 128 * 2 * 48;
+        let rows = p.max_prefill_rows_for_tier_and_kv(budget, head, kv_row);
+        assert!(rows < p.max_prefill_rows_for_tier(budget, head));
+        let cost = |r: usize| {
+            p.tier_bytes(head.with_one_more_sequence(r))
+                + (r * kv_row).div_ceil(TARGET_ARENA_BYTES) * TARGET_ARENA_BYTES
+        };
+        assert!(cost(rows) <= budget, "the accepted width must fit");
+        assert!(cost(rows + 1) > budget, "one row more must not fit");
     }
 
     /// A budget too small for a single row answers 0, which callers must treat

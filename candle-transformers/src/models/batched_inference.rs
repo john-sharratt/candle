@@ -42,10 +42,10 @@ use candle::quantized::pinned_staging::GpuBuf;
 use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
-    fragmentation, plan_pool, ArenaKey, ArenaLocation, ChunkedKvBacking, CompressionPolicy,
-    Fragmentation, GpuArenaClassStats, GroundLost, HeadGids, KvCache, KvFormat, ModelGeometry,
-    PrefillKvStageLayout, PrefillLaunchBounds, QuantFormat, SizeClass, WavePlan, WaveWidth,
-    WAVE_FFN_BYTES,
+    fragmentation, plan_pool, region_stats, ArenaKey, ArenaLocation, ChunkedKvBacking,
+    CompressionPolicy, Fragmentation, GpuArenaClassStats, GroundLost, HeadGids, KvCache, KvFormat,
+    ModelGeometry, PrefillKvStageLayout, PrefillLaunchBounds, QuantFormat, SizeClass, WavePlan,
+    WaveWidth, REGION_BYTES, WAVE_FFN_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -4229,11 +4229,7 @@ pub trait ManagedBatchedModel {
     fn kv_width_cap(&self, act_dtype: DType) -> Option<usize> {
         let stats = candle_nn::kv_cache::region_stats(0)?;
         let free = (stats.free + stats.blocked).saturating_sub(1);
-        let per_row = 2 * self.n_kv_head() * self.head_dim() * act_dtype.size_in_bytes();
-        let per_row_all_layers = per_row.checked_mul(self.num_layers())?;
-        if per_row_all_layers == 0 {
-            return None;
-        }
+        let per_row_all_layers = self.kv_bytes_per_row(act_dtype)?;
         // Admissible KV = what stands free PLUS what the model's elastic
         // boundary would cede to a stuck claim ([`Self::reclaimable_kv_bytes`]).
         // Counting only the free regions under-reports capacity by whatever the
@@ -4252,6 +4248,35 @@ pub trait ManagedBatchedModel {
         // claim and the relief pass behind it, both of which need a forward to
         // have been attempted.
         Some(rows.max(1))
+    }
+
+    /// Bytes a forward's tier and the KV it writes can be paid from: the KV
+    /// side's free regions — counting those the standing tier blocks, which the
+    /// next forward releases first — plus what the weight side would concede
+    /// ([`Self::reclaimable_kv_bytes`]). `None` where there is no reservation
+    /// to measure.
+    ///
+    /// What a caller composing a prefill checks [`Self::wave_tier_bytes`] of
+    /// the *actual* wave against, together with its KV. The width cap cannot
+    /// answer that: it prices a one-sequence wave, and the tier grows with
+    /// sequences as well as rows.
+    fn prefill_ground_bytes(&self) -> Option<usize> {
+        let stats = region_stats(0)?;
+        Some(
+            (stats.free + stats.blocked)
+                .saturating_mul(REGION_BYTES)
+                .saturating_add(self.reclaimable_kv_bytes()),
+        )
+    }
+
+    /// KV bytes one prefill row writes: one K and one V element per KV head on
+    /// every layer that pages KV — every layer, unless a model says otherwise.
+    /// `None` when the geometry prices a row at nothing.
+    fn kv_bytes_per_row(&self, act_dtype: DType) -> Option<usize> {
+        let per_row = 2 * self.n_kv_head() * self.head_dim() * act_dtype.size_in_bytes();
+        per_row
+            .checked_mul(self.num_layers())
+            .filter(|&bytes| bytes > 0)
     }
 
     /// KV-side bytes this model's memory layout could free ON DEMAND beyond

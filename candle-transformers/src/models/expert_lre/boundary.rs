@@ -144,6 +144,14 @@ impl PipelineState {
                 Ok(0)
             }
         };
+        // **The zone's gauges follow the boundary, not only the next routed
+        // layer.** A move between forwards — a new sequence's state buying
+        // ground, the weight side taking spare regions back — changes how much
+        // the zone could still concede, and the prefill width cap reads that
+        // figure before the next forward routes anything. Left to the next
+        // layer, it priced a Qwen3.8-Flash-Next ×8 prefill against ground the
+        // zone had already sold, and the wave's tier came up short.
+        self.publish_gauges();
         drop(p);
         conceded
     }

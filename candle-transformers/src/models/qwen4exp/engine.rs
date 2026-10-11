@@ -1,5 +1,6 @@
 //! The qwen4exp production engine: GPU-resident trunk + streamed experts,
-//! loaded from the ONE merged Q4KOEXP GGUF (`convert::merge_gguf_split`).
+//! loaded from the model pack built over the prepared engine artifact
+//! (`qwen4exp::prepare`, then `model_pack`).
 //!
 //! The weight split mirrors the oracle's (`docs/qwen38_flash_next.md` §12.8),
 //! moved onto the card:
@@ -17,8 +18,8 @@
 //! - **KO at load**: every dense projection — attention q/k/v/o, the GDN
 //!   projections, routers, shared experts, the LM head — through the same
 //!   `QMatMul` repack every production model uses (Q8_0 → Q8_KO here).
-//! - **Routed experts stay Q4_KO in the `ExpertCache`**: VRAM hot slots over
-//!   pinned warm and pad RAM over the NVMe pack, the same device-side expert
+//! - **Routed experts stay KO in the `ExpertCache`**: VRAM hot slots over
+//!   pinned warm and pad RAM over the pack's expert section, the same device-side expert
 //!   forward (`ExpertCache::forward_routed`) DeepSeek-V4 and Qwen3.6-35B run
 //!   through. 512 experts is exactly `moe_bucketize`'s `MAX_EXPERTS`.
 //! - **The PLE table stays on NVMe** behind the §0.1 row cache
@@ -28,8 +29,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use candle::quantized::gguf_file::{Content, Value};
-use candle::quantized::{GgmlDType, Int8Mode, QTensor};
+use candle::quantized::gguf_file::Value;
+use candle::quantized::{GgmlDType, QTensor};
 use candle::{Device, Result, Tensor};
 
 use super::config::Qwen4ExpConfig;
@@ -44,8 +45,10 @@ use super::qsa::IndexerWeights;
 use crate::models::delta_net::{KvLayerMap, QuantDeltaNetWeights};
 use crate::models::dense_span;
 use crate::models::device_embedding::DeviceEmbedding;
+use crate::models::expert_lre::section::open_section;
 use crate::models::expert_lre::ExpertCache;
 use crate::models::latent_moe::GgufModel;
+use crate::models::model_pack::ModelPack;
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::quantized_mlp::QuantizedMlp;
 use crate::models::quantized_qwen3_moe::SparseMoeBlock;
@@ -116,32 +119,30 @@ pub struct Qwen4ExpGpu {
 }
 
 impl Qwen4ExpGpu {
-    /// Load the engine from the merged GGUF. Order is load-bearing
+    /// Load the engine from its model pack. Order is load-bearing
     /// (`docs/archived/elastic_vram_partition.md` §4): every dense tensor resident
     /// first, then the expert cache is sized from a live measurement of what
     /// they left behind.
-    pub fn load(merged: &Path, device: &Device, int8mode: Int8Mode) -> Result<Self> {
-        Self::load_with_progress(merged, device, int8mode, None)
+    pub fn load(pack: &Path, device: &Device) -> Result<Self> {
+        Self::load_with_progress(pack, device, None)
     }
 
-    /// [`Self::load`] reporting `(experts_repacked, total_experts)` as the
-    /// expert pack is built.
-    ///
-    /// That repack is the dominant span of a load — measured at 127 s of a
-    /// 167 s boot — and it is the only phase here that reports anything, the
-    /// dense tensors being mounted in one pass. A caller that does not pass a
-    /// hook shows no movement for the whole of it.
+    /// [`Self::load`] reporting `(experts_filled, total_experts)` as the expert
+    /// cache fills from the pack.
     pub fn load_with_progress(
-        merged: &Path,
+        pack_path: &Path,
         device: &Device,
-        int8mode: Int8Mode,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<Self> {
         // The KV span is sized from the governor's balloon-measured capacity;
         // without one it falls back to the small test constant and the expert
         // zone measures a floor-violating handful of slots.
         crate::models::batched_model::ensure_vram_governor(device);
-        let mut gguf = GgufModel::open(&[merged.to_path_buf()])?;
+        let pack = ModelPack::open(pack_path)?;
+        let int8mode = pack.int8_mode;
+        // The pack's GGUF part is an ordinary GGUF, so the tensor reader opens it
+        // as one; the sections after it are the expert cache's to read.
+        let mut gguf = GgufModel::open(&[pack_path.to_path_buf()])?;
         match gguf.metadata.get("general.architecture") {
             Some(Value::String(a)) if a == "qwen4exp" => {}
             other => candle::bail!(
@@ -150,15 +151,12 @@ impl Qwen4ExpGpu {
         }
         let cfg = Qwen4ExpConfig::from_gguf_metadata(&gguf.metadata)?;
         let eps = cfg.rms_norm_eps;
-        // One `Content` and one mapping of the artifact, shared by the load
-        // bracket below and the expert cache after the dense stack.
-        let content = Content::read(&mut std::fs::File::open(merged)?)?;
-        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&std::fs::File::open(merged)?)? });
+        let content = &pack.content;
         // Claim the reservation before the first tensor, so every KO weight is
         // carved into its dense block and the span is sized from the whole card
         // rather than from what a lazily-created span found free mid-load; the
         // headroom it concedes to the pool is returned at `close_load` below.
-        dense_span::open_for_load_sized(device, load_headroom_bytes(&content))?;
+        dense_span::open_for_load_sized(device, load_headroom_bytes(content))?;
 
         let f32t = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             g.qtensor(name, device)?.dequantize(device)
@@ -418,41 +416,34 @@ impl Qwen4ExpGpu {
             ),
         };
 
-        // `SparseMoeBlock::moe_layer_idx` indexes the expert cache's COMPACTED
-        // layer list: `expert_host_refs_for` skips a block carrying no expert
-        // tensors, because a mixed stack is legal for the lineage at large. The
-        // block index below is therefore the same number only while every block
-        // is MoE — which qwen4exp is, 512 experts on all of them, the head
-        // included. Check it rather than assume it: a block missing its slabs
-        // still loads its router, so nothing else would object, and every block
-        // above the gap would then compute with the previous MoE layer's
-        // experts while the last fell off the end of the list.
-        for li in 0..n_blocks {
-            let p = format!("blk.{li}");
-            let missing = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
-                .iter()
-                .any(|t| {
-                    !content
-                        .tensor_infos
-                        .contains_key(&format!("{p}.{t}.weight"))
-                });
-            if missing {
-                candle::bail!(
-                    "qwen4exp engine: blk.{li} carries no expert tensors, but every qwen4exp \
-                     block is MoE — the expert cache indexes only blocks that have experts, so \
-                     a dense block would shift every later block onto the wrong expert slab"
-                );
-            }
-        }
-        // Every block was just checked to carry its experts, and the recipe
-        // writes one format across all of them.
-        let expert_format = content.tensor_infos["blk.0.ffn_gate_exps.weight"].ggml_dtype;
+        // The routed experts' stored format — the rung the artifact was prepared
+        // at — is the checkpoint dtype the expert section records for them.
+        let Some(at) = pack.experts else {
+            candle::bail!("qwen4exp engine: the pack has no expert section");
+        };
+        let Device::Cuda(cuda) = device else {
+            candle::bail!("qwen4exp engine: the expert cache is a CUDA-only path");
+        };
+        let expert_format = open_section(&pack.path, at.offset, cuda)?
+            .header()
+            .layers
+            .first()
+            .map(|l| l.gate.src_dtype)
+            .ok_or_else(|| {
+                candle::Error::Msg("qwen4exp engine: the expert section is empty".into())
+            })?;
         // The dense stack is resident: lock the block's edge and return the
         // load's pool headroom to the span, before the expert zone below is
         // placed from the span's right edge.
         dense_span::close_load(device)?;
+        // `SparseMoeBlock::moe_layer_idx` indexes the expert section's layers,
+        // and every qwen4exp block routes — 512 experts on all of them, the head
+        // included — so the section must hold blocks `0..n_blocks` in order.
+        // `build_expert_cache_for` refuses one that does not: a missing block
+        // would have every block above the gap compute with the previous MoE
+        // layer's experts while the last fell off the end of the list.
         let experts = build_expert_cache_for(
-            &content,
+            &pack,
             cfg.moe.n_experts,
             cfg.moe.n_experts_used,
             // The head's experts join the same grid — which is the whole reason
@@ -462,36 +453,13 @@ impl Qwen4ExpGpu {
             // needs the room most.
             n_blocks,
             device,
-            merged,
-            mmap,
-            int8mode,
-            // **Beside the checkpoint, so the pack survives the process.**
-            //
-            // `None` here does not mean "no pack" — it means an EPHEMERAL one:
-            // `pack::open_or_create` puts it in the system temp directory and
-            // unlinks it the moment it is published, so the bytes live only as
-            // long as the open handle and every boot repacks from scratch.
-            // Measured on Qwen3.8-Flash-Next: 140 s of a 181 s load, every time,
-            // and a `%TEMP%` accumulating 47 GB of `.partial` files from runs
-            // that were killed before they could unlink.
-            //
-            // Derived here rather than plumbed from the caller: the pack's home
-            // is a property of the checkpoint, and `merged` is the checkpoint.
-            // `latent_moe::engine` takes the same parent for the same reason.
-            //
-            // The empty filter is not defensive: `Path::new("m.gguf").parent()`
-            // is `Some("")`, not `None`, so a bare filename would name a
-            // *relative* directory and drop a 45-74 GB pack in whatever the
-            // process's working directory happens to be. `None` comes back only
-            // for a root path.
-            merged.parent().filter(|p| !p.as_os_str().is_empty()),
             progress,
             // Nothing outside the experts is read from the host after load: the
             // n-gram table is served by its own row cache, and every other
             // tensor is resident on the card. Counted as live weight, the host
             // budget would reserve the table's 54 GB and the dense stack's
             // 5.2 GiB as page cache out of the warm tier's RAM.
-            offloaded_bytes(&content)?,
+            offloaded_bytes(content)?,
         )?
         .ok_or_else(|| candle::Error::Msg("qwen4exp engine: no expert tensors found".into()))?;
         let mut layers: Vec<GpuLayer> = trunk

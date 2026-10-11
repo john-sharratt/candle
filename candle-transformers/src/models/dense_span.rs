@@ -133,7 +133,7 @@ pub fn freeze(device: &Device) -> Result<usize> {
 /// That is not hypothetical — it was the ordering in-tree. `close_load` reclaimed
 /// here and was then called *before* `build_layers`, which repacks a whole layer
 /// at a time through `WeightResidency::Pool` to build the layer pack. Both
-/// `layer_stream::build`'s header and `docs/qwen38_layer_streaming.md` §12.2 say
+/// `layer_stream::build`'s header and `docs/archived/qwen38_layer_streaming.md` §12.2 say
 /// `peak_load_pool_bytes` is what reserves room for exactly that pass, so the
 /// invariant was stated in two places and violated in one.
 ///

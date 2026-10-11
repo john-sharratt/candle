@@ -120,7 +120,7 @@ kv-zero-check = []
 # diagnosing prompt/format/role-marker bugs; off by default because
 # the per-token recording allocates and the dump itself is large.
 context-dump = []
-hub = ["dep:hf-hub"]
+hub = ["dep:hf-hub", "candle-transformers/hub"]
 # Exposes test-introspection methods (warm_pool, warm_turn_slots,
 # hot/warm_turn_ids_sorted, tiered_store()) that are otherwise hidden from the
 # public API.  Enable with --features test-helpers in integration-test runs.

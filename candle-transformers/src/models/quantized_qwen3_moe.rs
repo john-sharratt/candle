@@ -17,11 +17,14 @@ use super::batched_layer::{add_ffn_residual, BatchedAttentionLayer, QkvProjectio
 use super::batched_model::{BatchedModelCore, WaveShapes};
 use super::dense_span;
 #[cfg(feature = "cuda")]
+use super::expert_lre::section::{geometries_of, open_section};
+#[cfg(feature = "cuda")]
 use super::expert_lre::ExpertCacheSetup;
 #[cfg(feature = "cuda")]
-use super::expert_lre::{layer_geometries, minimum_resident_slots, slot_bytes_for};
-use super::expert_lre::{ExpertCache, LookAhead, MmapExpertRef, PipelineStats, ProfileSnapshot};
+use super::expert_lre::{minimum_resident_slots, slot_bytes_for};
+use super::expert_lre::{ExpertCache, LookAhead, PipelineStats, ProfileSnapshot};
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
+use super::model_pack::ModelPack;
 #[cfg(feature = "cuda")]
 use super::profile::{pipeline_record, profile_now};
 use super::quantized_matmul::QMatMul;
@@ -723,65 +726,6 @@ impl BatchedModelCore for ModelWeights {
 }
 
 // ============================================================================
-// HuggingFace config.json support
-// ============================================================================
-
-/// Relevant fields from a HuggingFace `config.json` file placed next to a GGUF.
-///
-/// GGUFs sometimes omit optional flags (e.g. `expert_weights_norm`) that are
-/// required to match the original training setup. This struct lets callers
-/// supply the ground-truth values read from the HF config.
-#[derive(Debug, Default)]
-pub struct HFModelConfig {
-    /// `norm_topk_prob` — whether to renormalize top-k expert weights to sum to 1.
-    pub norm_topk_prob: Option<bool>,
-    /// `rope_theta` — RoPE frequency base.
-    pub rope_theta: Option<f64>,
-    /// `max_position_embeddings` — maximum context length.
-    pub max_position_embeddings: Option<usize>,
-}
-
-/// Try to read `config.json` from `model_dir` and extract relevant fields.
-///
-/// Returns `HFModelConfig::default()` silently if the file is absent, and
-/// prints a warning if the file exists but cannot be parsed.
-pub fn read_hf_config(model_dir: &std::path::Path) -> HFModelConfig {
-    let cfg_path = model_dir.join("config.json");
-    if !cfg_path.exists() {
-        return HFModelConfig::default();
-    }
-    let text = match std::fs::read_to_string(&cfg_path) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("[config.json] read error: {e}");
-            return HFModelConfig::default();
-        }
-    };
-    let v: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("[config.json] parse error: {e}");
-            return HFModelConfig::default();
-        }
-    };
-    let cfg = HFModelConfig {
-        norm_topk_prob: v.get("norm_topk_prob").and_then(|x| x.as_bool()),
-        rope_theta: v.get("rope_theta").and_then(|x| x.as_f64()),
-        max_position_embeddings: v
-            .get("max_position_embeddings")
-            .and_then(|x| x.as_u64())
-            .map(|n| n as usize),
-    };
-    tracing::debug!(
-        "[config.json] norm_topk_prob={:?}  rope_theta={:?}  max_pos={:?}",
-        cfg.norm_topk_prob,
-        cfg.rope_theta,
-        cfg.max_position_embeddings
-    );
-    cfg
-}
-
-// ============================================================================
 // VRAM budget helpers
 // ============================================================================
 
@@ -868,83 +812,26 @@ fn warm_mmap(mmap: &memmap2::Mmap) {
     );
 }
 
-/// The load-time choices a GGUF load takes that are not properties of the file.
-///
-/// There were two entry points for the first of these — `from_gguf_by_path` and
-/// `from_gguf_by_path_with_int8` — and a second knob would have made a third. A
-/// struct with defaults takes any number of them, and is where the next one
-/// goes.
-#[derive(Debug, Clone, Default)]
-pub struct GgufLoadOptions {
-    /// The numeric mode for dense projections *and* MoE experts. An int8 mode
-    /// repacks every dense weight (attention q/k/v/o, MoE router gate,
-    /// dense-MLP gate/up/down, lm_head) to its KO twin so forward runs the
-    /// q8a128 int8 tensor-core matmul, and stages each expert's gate/up/down
-    /// as their KO twins so the grouped expert matmul runs int8 too.
-    ///
-    /// [`Int8Mode::Off`] is the FP16 reference for the *dense* projections
-    /// only: the FP GEMX expert kernel no longer exists, so a routed (MoE)
-    /// model refuses `Off` at expert-cache construction — MoE checkpoints
-    /// require Precision or Performance.
-    ///
-    /// `None` picks it from the device and the checkpoint's size.
-    pub int8mode: Option<Int8Mode>,
-    /// Directory for the persistent repacked expert pack (`docs/expert_cache_design.md` §5).
-    ///
-    /// `None` — the default — uses a temp file that is unlinked as soon as it is
-    /// open, which costs the ~42 s repack on every start. A caller that will
-    /// restart often passes the GGUF's own directory, where one pack is shared by
-    /// every workspace on that checkpoint and survives a substrate wipe.
-    ///
-    /// MoE-only: the other architectures have no expert cache and ignore it.
-    pub expert_pack_dir: Option<std::path::PathBuf>,
-}
-
 impl ModelWeights {
-    /// Load model from GGUF via mmap with LRU expert cache and VRAM budget management.
+    /// Load the model from its model pack: the dense weights from the pack's
+    /// GGUF part, straight to VRAM, and the experts into the expert cache from
+    /// its expert section.
     ///
-    /// - Non-expert weights: loaded directly to VRAM (small relative to expert weights)
-    /// - Expert weights: LRU cache in VRAM (dynamic budget based on free VRAM)
-    /// - 3D merged expert tensors as primary, 2D per-expert as fallback
+    /// The numeric mode is the one the pack was built for. An int8 mode repacks
+    /// every dense weight (attention q/k/v/o, MoE router gate, dense-MLP
+    /// gate/up/down, lm_head) to its KO twin so forward runs the q8a128 int8
+    /// tensor-core matmul; the experts are already KO twins in the pack.
     ///
-    /// `progress`, when supplied, is called with `(layers_loaded, num_layers)`
-    /// after each layer's weights have been mounted — drives a UI progress
-    /// bar without coupling this loader to the daemon's progress type.
-    ///
-    /// Load-time knobs take their defaults; [`ModelWeights::from_gguf_with_options`]
-    /// sets them.
-    pub fn from_gguf_by_path(
-        file_path: &std::path::Path,
+    /// `progress`, when supplied, is called with `(units_done, units_total)`
+    /// as layers mount and the expert cache fills — drives a UI progress bar
+    /// without coupling this loader to the daemon's progress type.
+    pub fn from_pack(
+        path: &std::path::Path,
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<Self> {
-        Self::from_gguf_with_options(file_path, device, progress, GgufLoadOptions::default())
-    }
-
-    /// Like [`ModelWeights::from_gguf_by_path`] but with the load-time knobs set
-    /// explicitly rather than defaulted — see [`GgufLoadOptions`].
-    pub fn from_gguf_with_options(
-        file_path: &std::path::Path,
-        device: &Device,
-        progress: Option<&dyn Fn(usize, usize)>,
-        options: GgufLoadOptions,
-    ) -> Result<Self> {
-        use memmap2::MmapOptions;
-
-        // VRAM-aware auto when the caller did not choose: int8 Precision on
-        // int8-MMA-capable GPUs when the weights leave headroom, else
-        // Performance (smaller footprint); FP16 Off on CPU. Sized by the GGUF
-        // length.
-        let int8mode = match options.int8mode {
-            Some(m) => m,
-            None => {
-                let model_bytes = std::fs::metadata(file_path)
-                    .map(|m| m.len() as usize)
-                    .unwrap_or(0);
-                Int8Mode::auto_sized(device, model_bytes)
-            }
-        };
-        let expert_pack_dir = options.expert_pack_dir;
+        let pack = ModelPack::open(path)?;
+        let int8mode = pack.int8_mode;
 
         tracing::info!(
             "Inference int8 mode: {int8mode:?} (dense projections + MoE experts; \
@@ -952,41 +839,22 @@ impl ModelWeights {
             Int8Mode::auto(device).is_int8(),
         );
 
-        let file = std::fs::File::open(file_path)?;
-        let mmap = unsafe {
-            MmapOptions::new()
-                .map(&file)
-                .map_err(|e| candle::Error::Msg(format!("Failed to mmap file: {}", e)))?
-        };
-        let mmap = Arc::new(mmap);
-        // Feed the host-RAM budget: the budget reserves the full mmap size so
-        // warm-KV growth can never push weight pages out of RAM.
-        // One mmap per model here, so this single call IS the whole mapped size.
+        let mmap = pack.mmap.clone();
+        // Feed the host-RAM budget: the budget reserves the mapping so warm-KV
+        // growth can never push weight pages out of RAM. The mapping is the
+        // pack's GGUF part — the sections are read with direct I/O.
         candle::vram::set_weights_mmap(mmap.len() as u64);
 
-        // **The mapping is deliberately not host-registered.**
-        //
-        // `register_mmap_cuda` pins the whole file so H2D copies out of it run
-        // at full DMA bandwidth without a bounce. For a dense model that is the
-        // right trade — the mmap *is* the weight source, read for the life of
-        // the process. Here it is not: the experts move to the pack file at
-        // startup, and what remains live in the mapping is the dense tensors and
-        // the embedding table, gathered a few tokens at a time.
-        //
-        // Registering would lock all 18.6 GB of it, non-pageable, for the
-        // process lifetime — competing directly with the warm expert tier, which
-        // wants 17.8 GB of pinned RAM for the same 31.5 GB machine and is the
-        // thing that keeps expert loads off the disk. The one-time load-path
-        // speedup is not worth a permanent claim on the memory the hot path
-        // needs.
-
-        // Parse GGUF
-        let mut cursor = std::io::Cursor::new(&mmap[..]);
-        let ct = gguf_file::Content::read(&mut cursor)?;
+        // **The mapping is deliberately not host-registered.** What lives in it
+        // is the dense tensors and the embedding table, gathered a few tokens at
+        // a time; registering would lock it non-pageable for the process
+        // lifetime, competing directly with the warm expert tier, which is the
+        // thing that keeps expert loads off the disk.
+        let ct = &pack.content;
 
         // Before any tensor, so the weights are carved from the reservation
         // rather than from the CUDA pool (`dense_span`).
-        dense_span::open_for_load(device, &ct)?;
+        dense_span::open_for_load(device, ct)?;
 
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -996,8 +864,6 @@ impl ModelWeights {
         let md_opt_u32 = |k: &str| ct.metadata.get(k).and_then(|v| v.to_u32().ok());
 
         let p = detect_arch_prefix(&ct.metadata);
-        // Read config.json from the same directory as the GGUF for fallback values.
-        let hf_cfg = file_path.parent().map(read_hf_config).unwrap_or_default();
 
         let num_attention_heads = md_get(&format!("{p}.attention.head_count"))?.to_u32()? as usize;
         let num_kv_heads = md_get(&format!("{p}.attention.head_count_kv"))?.to_u32()? as usize;
@@ -1010,7 +876,6 @@ impl ModelWeights {
 
         let max_position_embeddings = md_opt_u32(&format!("{p}.context_length"))
             .map(|v| v as usize)
-            .or(hf_cfg.max_position_embeddings)
             .unwrap_or(32768);
 
         let rms_norm_eps =
@@ -1018,18 +883,17 @@ impl ModelWeights {
 
         let rope_freq_base = md_opt_f32(&format!("{p}.rope.freq_base"))
             .map(|v| v as f64)
-            .or(hf_cfg.rope_theta)
             .unwrap_or(1_000_000.0);
 
         let declared = DeclaredScaling::from_gguf(&ct.metadata, &p)?;
 
         let n_expert = md_opt_u32(&format!("{p}.expert_count")).unwrap_or(1) as usize;
         let n_expert_used = md_opt_u32(&format!("{p}.expert_used_count")).unwrap_or(1) as usize;
-        // Qwen3-MoE always uses norm_topk_prob=true. The GGUF key may be absent;
-        // config.json takes precedence, then GGUF, then we default to true.
+        // Qwen3-MoE always uses norm_topk_prob=true. The GGUF key may be absent,
+        // and the pack is the model's only file, so absent means the lineage's own
+        // `true`.
         let norm_topk_prob = md_opt_u32(&format!("{p}.expert_weights_norm"))
             .map(|v| v == 1)
-            .or(hf_cfg.norm_topk_prob)
             .unwrap_or(true);
 
         tracing::debug!("GGUF arch: {p}  layers={num_layers} hidden={hidden_size} eps={rms_norm_eps:.2e} heads={num_attention_heads}Q/{num_kv_heads}KV head_dim={head_dim} ctx={max_position_embeddings} rope_base={rope_freq_base} experts={n_expert}/{n_expert_used} norm={norm_topk_prob}");
@@ -1210,110 +1074,47 @@ impl ModelWeights {
             .collect();
         let num_moe_layers = moe_layer_indices.len();
 
-        let mut all_host_refs: Vec<Vec<MmapExpertRef>> = Vec::with_capacity(num_moe_layers);
-
-        // Determine expert shapes and byte offsets
-        if num_moe_layers > 0 {
-            for &i in &moe_layer_indices {
-                let prefix = format!("blk.{i}");
-                let mut layer_refs = Vec::with_capacity(n_expert);
-
-                // Try 3D merged tensors first
-                let gate_exps_name = format!("{prefix}.ffn_gate_exps.weight");
-                let up_exps_name = format!("{prefix}.ffn_up_exps.weight");
-                let down_exps_name = format!("{prefix}.ffn_down_exps.weight");
-
-                if let (Some(gate_info), Some(up_info), Some(down_info)) = (
-                    ct.tensor_infos.get(&gate_exps_name),
-                    ct.tensor_infos.get(&up_exps_name),
-                    ct.tensor_infos.get(&down_exps_name),
-                ) {
-                    // 3D merged: shape is (num_experts, out_dim, in_dim)
-
-                    let gate_dims = gate_info.shape.dims();
-                    let up_dims = up_info.shape.dims();
-                    let down_dims = down_info.shape.dims();
-
-                    // Per-expert element count (product of dims after first)
-                    let gate_expert_elems: usize = gate_dims[1..].iter().product();
-                    let up_expert_elems: usize = up_dims[1..].iter().product();
-                    let down_expert_elems: usize = down_dims[1..].iter().product();
-
-                    // Use per-projection dtype for correct byte calculation
-                    let gate_expert_bytes = gate_expert_elems / gate_info.ggml_dtype.block_size()
-                        * gate_info.ggml_dtype.type_size();
-                    let up_expert_bytes = up_expert_elems / up_info.ggml_dtype.block_size()
-                        * up_info.ggml_dtype.type_size();
-                    let down_expert_bytes = down_expert_elems / down_info.ggml_dtype.block_size()
-                        * down_info.ggml_dtype.type_size();
-
-                    let gate_base = (ct.tensor_data_offset + gate_info.offset) as usize;
-                    let up_base = (ct.tensor_data_offset + up_info.offset) as usize;
-                    let down_base = (ct.tensor_data_offset + down_info.offset) as usize;
-
-                    for j in 0..n_expert {
-                        layer_refs.push(MmapExpertRef {
-                            gate_offset: gate_base + j * gate_expert_bytes,
-                            gate_len: gate_expert_bytes,
-                            up_offset: up_base + j * up_expert_bytes,
-                            up_len: up_expert_bytes,
-                            down_offset: down_base + j * down_expert_bytes,
-                            down_len: down_expert_bytes,
-                            gate_shape: gate_dims[1..].to_vec(),
-                            up_shape: up_dims[1..].to_vec(),
-                            down_shape: down_dims[1..].to_vec(),
-                            gate_dtype: gate_info.ggml_dtype,
-                            up_dtype: up_info.ggml_dtype,
-                            down_dtype: down_info.ggml_dtype,
-                        });
-                    }
-                } else {
-                    // 2D per-expert fallback
-                    for j in 0..n_expert {
-                        let gate_name = format!("{prefix}.ffn_gate.{j}.weight");
-                        let up_name = format!("{prefix}.ffn_up.{j}.weight");
-                        let down_name = format!("{prefix}.ffn_down.{j}.weight");
-
-                        let gate_info = ct.tensor_infos.get(&gate_name).ok_or_else(|| {
-                            candle::Error::Msg(format!("tensor {} not found", gate_name))
-                        })?;
-                        let up_info = ct.tensor_infos.get(&up_name).ok_or_else(|| {
-                            candle::Error::Msg(format!("tensor {} not found", up_name))
-                        })?;
-                        let down_info = ct.tensor_infos.get(&down_name).ok_or_else(|| {
-                            candle::Error::Msg(format!("tensor {} not found", down_name))
-                        })?;
-
-                        let gate_bytes = gate_info.shape.elem_count()
-                            / gate_info.ggml_dtype.block_size()
-                            * gate_info.ggml_dtype.type_size();
-                        let up_bytes = up_info.shape.elem_count() / up_info.ggml_dtype.block_size()
-                            * up_info.ggml_dtype.type_size();
-                        let down_bytes = down_info.shape.elem_count()
-                            / down_info.ggml_dtype.block_size()
-                            * down_info.ggml_dtype.type_size();
-
-                        layer_refs.push(MmapExpertRef {
-                            gate_offset: (ct.tensor_data_offset + gate_info.offset) as usize,
-                            gate_len: gate_bytes,
-                            up_offset: (ct.tensor_data_offset + up_info.offset) as usize,
-                            up_len: up_bytes,
-                            down_offset: (ct.tensor_data_offset + down_info.offset) as usize,
-                            down_len: down_bytes,
-                            gate_shape: gate_info.shape.dims().to_vec(),
-                            up_shape: up_info.shape.dims().to_vec(),
-                            down_shape: down_info.shape.dims().to_vec(),
-                            gate_dtype: gate_info.ggml_dtype,
-                            up_dtype: up_info.ggml_dtype,
-                            down_dtype: down_info.ggml_dtype,
-                        });
-                    }
+        // ── The expert section: every MoE layer's records, in block order ──
+        //
+        // The pack holds the experts repacked; the GGUF part does not hold them
+        // at all. The section's layers must be exactly the blocks that route,
+        // in order, or a router's `moe_layer_idx` names another layer's experts.
+        #[cfg(feature = "cuda")]
+        let expert_section = match (num_moe_layers, pack.experts, device) {
+            (0, _, _) => None,
+            (_, None, _) => candle::bail!(
+                "{} routes but its pack has no expert section",
+                pack.path.display()
+            ),
+            (_, Some(at), Device::Cuda(cuda)) => {
+                let section = open_section(&pack.path, at.offset, cuda)?;
+                let header = section.header();
+                let blocks: Vec<usize> = header.layers.iter().map(|l| l.block as usize).collect();
+                if blocks != moe_layer_indices {
+                    candle::bail!(
+                        "the expert section holds blocks {blocks:?}, the model routes {:?}",
+                        moe_layer_indices
+                    );
                 }
-                all_host_refs.push(layer_refs);
+                if header.experts_per_layer as usize != n_expert {
+                    candle::bail!(
+                        "the expert section holds {} experts per layer, the metadata declares \
+                         {n_expert}",
+                        header.experts_per_layer
+                    );
+                }
+                Some(section)
             }
+            (_, Some(_), other) => {
+                candle::bail!("the expert cache is a CUDA-only path, the model was given {other:?}")
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        if num_moe_layers > 0 {
+            candle::bail!("the expert cache is a CUDA-only path — build with the `cuda` feature");
         }
 
-        // Combined progress denominator for the `from_gguf_by_path`
+        // Combined progress denominator for the `from_pack`
         // outer callback: the per-layer dense loop (`num_layers`) followed by
         // the expert cache uploads (`num_moe_layers × n_expert`). The bar then
         // advances continuously through both phases.
@@ -1331,7 +1132,7 @@ impl ModelWeights {
         // Only the "is there one at all" question is answered here, because a
         // model without MoE layers warms its whole mmap now and never comes
         // back to this.
-        let has_experts = !all_host_refs.is_empty() && n_expert > 0;
+        let has_experts = num_moe_layers > 0 && n_expert > 0;
         if !has_experts {
             warm_mmap(&mmap);
         }
@@ -1465,7 +1266,8 @@ impl ModelWeights {
         // those tensors were placed, unlike the driver deltas the dense loaders use.
         dense_span::close_load(device)?;
 
-        let expert_cache = if has_experts {
+        #[cfg(feature = "cuda")]
+        let expert_cache = if let Some(section) = expert_section {
             let total_experts = num_moe_layers * n_expert;
             //
             // There used to be one — `pending_dense_bytes`, summed from the GGUF
@@ -1496,7 +1298,7 @@ impl ModelWeights {
             #[cfg(feature = "cuda")]
             let zone = if let Device::Cuda(cuda_dev) = device {
                 let stream = cuda_dev.cuda_stream();
-                let geoms = layer_geometries(&all_host_refs, int8mode)?;
+                let geoms = geometries_of(section.header())?;
                 let slot_bytes = slot_bytes_for(&geoms);
                 // Two different numbers: where the boundary starts, and how far
                 // it may ever go. The zone opens at `initial` — sized to leave
@@ -1548,8 +1350,6 @@ impl ModelWeights {
                 // here would only make the failure land further from its cause.
                 WeightZone::new(0, 0, 0, 0, 0)
             };
-            #[cfg(not(feature = "cuda"))]
-            let zone = WeightZone::new(0, 0, total_experts, total_experts, 0);
             let capacity = zone.capacity();
             let slot_bytes = zone.slot_bytes();
 
@@ -1561,16 +1361,16 @@ impl ModelWeights {
             let cache_progress: Option<&dyn Fn(usize, usize)> =
                 cache_wrapper.as_ref().map(|f| f as &dyn Fn(usize, usize));
             let cache = ExpertCache::new(ExpertCacheSetup {
-                mmap: mmap.clone(),
-                host_refs: all_host_refs,
+                pack: section,
                 zone,
                 device,
                 experts_per_layer: n_expert,
                 experts_used: n_expert_used,
-                gguf_path: file_path,
-                expert_pack_dir: expert_pack_dir.as_deref(),
                 progress: cache_progress,
                 int8mode,
+                mapped_bytes: pack.gguf_len(),
+                // The embedding is copied into pinned host memory and every
+                // other tensor of the mapping is paged on demand.
                 offloaded_bytes: 0,
             })?;
             // Record the resident expert footprint with the governor. Reporting
@@ -1606,6 +1406,10 @@ impl ModelWeights {
         } else {
             None
         };
+        // A build without CUDA refused a routed model above, so there is no
+        // cache to build here.
+        #[cfg(not(feature = "cuda"))]
+        let expert_cache: Option<Arc<ExpertCache>> = None;
 
         // ── Graft the cache onto the layers ──
         let layers = pending
@@ -1955,6 +1759,26 @@ mod tests {
         )
     }
 
+    /// The Qwen3-30B-A3B-Instruct-2507 Q4_K_M model pack at `mode` — `None` for
+    /// the mode this card picks — built on first use.
+    fn instruct_2507_pack(device: &Device, mode: Option<Int8Mode>) -> Result<std::path::PathBuf> {
+        use crate::models::batch_test::test_helpers::gate_pack;
+        use crate::models::model_pack::{PackFamily, PackRequest};
+        gate_pack(
+            &PackRequest::of(
+                PackFamily::Routed,
+                (
+                    "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+                    "",
+                    "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+                ),
+                ("Qwen/Qwen3-30B-A3B-Instruct-2507", "main"),
+                mode,
+            ),
+            device,
+        )
+    }
+
     /// **Does Qwen3-MoE decode reproduce itself, run to run?**
     ///
     /// DeepSeek-V4-Flash does not (`docs/deepseek/deepseek_decode_reproducibility.md`).
@@ -1971,37 +1795,22 @@ mod tests {
     #[test]
     #[ignore]
     fn qwen3_moe_decode_is_reproducible() -> Result<()> {
-        use crate::models::batch_test::test_helpers::hf_get;
         use crate::models::batch_test::utils::decode_reproducibility;
 
         let Ok(device) = Device::new_cuda(0) else {
             eprintln!("[skip] no CUDA device");
             return Ok(());
         };
-        let model_path = match hf_get(
-            "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-            hf_hub::RepoType::Model,
-            "main",
-            "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-        ) {
+        // Loaded exactly as `test_parallel_batched_forwarding` does, so this
+        // test differs from the established path in one variable only.
+        let pack = match instruct_2507_pack(&device, Some(Int8Mode::Performance)) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[skip] model unavailable: {e}");
                 return Ok(());
             }
         };
-        // Loaded exactly as `test_parallel_batched_forwarding` does, so this
-        // test differs from the established path in one variable only. The
-        // `expert_pack_dir` keeps the ~42 s expert repack down to a read.
-        let weights = ModelWeights::from_gguf_with_options(
-            &model_path,
-            &device,
-            None,
-            GgufLoadOptions {
-                int8mode: Some(Int8Mode::Performance),
-                expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
-            },
-        )?;
+        let weights = ModelWeights::from_pack(&pack, &device, None)?;
         let model = batched(weights, INSTRUCT_2507_CONTEXT, 4096, &device)?;
 
         // Fixed pseudo-token ids: the text is irrelevant, only that every pass
@@ -2031,34 +1840,20 @@ mod tests {
     #[test]
     #[ignore]
     fn qwen3_moe_decode_replay_is_bitwise_repeatable() -> Result<()> {
-        use crate::models::batch_test::test_helpers::hf_get;
         use crate::models::batch_test::utils::{decode_replay_probe, prefill_replay_probe};
 
         let Ok(device) = Device::new_cuda(0) else {
             eprintln!("[skip] no CUDA device");
             return Ok(());
         };
-        let model_path = match hf_get(
-            "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-            hf_hub::RepoType::Model,
-            "main",
-            "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-        ) {
+        let pack = match instruct_2507_pack(&device, Some(Int8Mode::Performance)) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[skip] model unavailable: {e}");
                 return Ok(());
             }
         };
-        let weights = ModelWeights::from_gguf_with_options(
-            &model_path,
-            &device,
-            None,
-            GgufLoadOptions {
-                int8mode: Some(Int8Mode::Performance),
-                expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
-            },
-        )?;
+        let weights = ModelWeights::from_pack(&pack, &device, None)?;
         let model = batched(weights, INSTRUCT_2507_CONTEXT, 4096, &device)?;
 
         let ids: Vec<u32> = (0..24u32).map(|i| (i * 37 + 11) % 2000 + 5).collect();
@@ -2116,21 +1911,6 @@ mod tests {
 
         println!("\n=== Loading Model ===\n");
 
-        let model_path = hf_get(
-            "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-            hf_hub::RepoType::Model,
-            "main",
-            "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-        )
-        .map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to download model: {}. This test requires internet access.",
-                e
-            ))
-        })?;
-
-        println!("Model downloaded to: {:?}", model_path);
-
         let device = Device::new_cuda(0).map_err(|e| {
             candle::Error::Msg(format!(
                 "CUDA required for this test: {}. Use --features cuda",
@@ -2144,31 +1924,16 @@ mod tests {
         let configs = super::batched_forward_configs();
 
         // Inference numeric mode for the whole model — dense projections AND MoE experts (KO
-        // twins) — selected by the INT8MODE env var so a run picks a mode without recompiling.
-        // Defaults to Performance (same-width KO int8); override with "off" (FP16 reference) or
-        // "prec"/"precision" (stepped-up, near-lossless KO int8). One model load: switching mode
-        // means a fresh load, which is correct here — it keeps the Markov expert predictor from
-        // being mixed across modes.
-        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
-            Some("off") => Int8Mode::Off,
-            Some("prec") | Some("precision") => Int8Mode::Precision,
-            _ => Int8Mode::Performance,
-        };
+        // twins): Performance, the same-width KO int8 the gate is calibrated at. One model load
+        // per mode, which keeps the Markov expert predictor from being mixed across modes.
+        let int8mode = Int8Mode::Performance;
         println!("int8 mode = {int8mode:?}\n");
 
+        // The model pack, built on the first run and a read on every one after.
+        let pack = instruct_2507_pack(&device, Some(int8mode))?;
+        println!("Model pack: {:?}", pack);
         let load_model = || {
-            // Keep the pack beside the checkpoint. The gate reloads the model
-            // once per invocation while iterating, and a persistent pack turns
-            // the ~42 s repack into a read.
-            let model = ModelWeights::from_gguf_with_options(
-                &model_path,
-                &device,
-                None,
-                GgufLoadOptions {
-                    int8mode: Some(int8mode),
-                    expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
-                },
-            )?;
+            let model = ModelWeights::from_pack(&pack, &device, None)?;
             println!("✓ Model loaded\n");
             batched(model, INSTRUCT_2507_CONTEXT, 4096, &device)
         };
@@ -2201,15 +1966,9 @@ mod tests {
         .map_err(|e| candle::Error::Msg(format!("tokenizer.json: {e}")))?;
         let tokenizer_json = std::fs::read_to_string(&tokenizer_path)
             .map_err(|e| candle::Error::Msg(format!("read tokenizer.json: {e}")))?;
-        let model_path = hf_get(
-            "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-            hf_hub::RepoType::Model,
-            "main",
-            "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-        )
-        .map_err(|e| candle::Error::Msg(format!("model: {e}")))?;
         let device = Device::new_cuda(0)?;
         let int8mode = Int8Mode::auto(&device);
+        let pack = instruct_2507_pack(&device, Some(int8mode))?;
         long_context_gate(
             "Qwen3-30B-A3B-Instruct-2507 (MoE, Q4_K_M)",
             int8mode,
@@ -2230,15 +1989,7 @@ mod tests {
             DepthTask::Coherence,
             &device,
             || {
-                let model = ModelWeights::from_gguf_with_options(
-                    &model_path,
-                    &device,
-                    None,
-                    GgufLoadOptions {
-                        int8mode: Some(int8mode),
-                        expert_pack_dir: model_path.parent().map(|p| p.to_path_buf()),
-                    },
-                )?;
+                let model = ModelWeights::from_pack(&pack, &device, None)?;
                 batched(model, INSTRUCT_2507_CONTEXT, 4096, &device)
             },
         )
@@ -2264,7 +2015,6 @@ mod tests {
         }
         #[cfg(feature = "cuda")]
         {
-            use crate::models::batch_test::test_helpers::hf_get;
             use crate::models::batched_inference::{
                 BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult,
             };
@@ -2276,14 +2026,8 @@ mod tests {
                     return Ok(());
                 }
             };
-            let model_path = hf_get(
-                "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-                hf_hub::RepoType::Model,
-                "main",
-                "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-            )
-            .map_err(|e| candle::Error::Msg(format!("model download: {e}")))?;
-            let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+            let pack = instruct_2507_pack(&device, None)?;
+            let raw = ModelWeights::from_pack(&pack, &device, None)?;
             let model = batched(raw, INSTRUCT_2507_CONTEXT, 4096, &device)?;
             let mut session = model.create_batched_session(BatchedConfig::default())?;
             let n = model.num_layers();
@@ -2750,7 +2494,6 @@ mod tests {
         }
         #[cfg(feature = "cuda")]
         {
-            use crate::models::batch_test::test_helpers::hf_get;
             use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
 
             let device = match Device::new_cuda(0) {
@@ -2760,14 +2503,8 @@ mod tests {
                     return Ok(());
                 }
             };
-            let model_path = hf_get(
-                "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-                hf_hub::RepoType::Model,
-                "main",
-                "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-            )
-            .map_err(|e| candle::Error::Msg(format!("model download: {e}")))?;
-            let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+            let pack = instruct_2507_pack(&device, None)?;
+            let raw = ModelWeights::from_pack(&pack, &device, None)?;
             let model = batched(raw, INSTRUCT_2507_CONTEXT, 4096, &device)?;
             let mut session = model.create_batched_session(BatchedConfig::default())?;
             let mk = |t: &[u32]| -> Result<Tensor> { Tensor::new(t, &device)?.unsqueeze(0) };
@@ -2957,16 +2694,9 @@ mod tests {
                 .with_per_config_prompts(prompts.clone())
                 .with_stop_on_eos(eos_tokens);
 
-            let model_path = hf_get(
-                "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-                hf_hub::RepoType::Model,
-                "main",
-                "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-            )
-            .map_err(|e| candle::Error::Msg(format!("Failed to download model: {}", e)))?;
-
             let device = Device::new_cuda(0)
                 .map_err(|e| candle::Error::Msg(format!("CUDA required: {}", e)))?;
+            let pack = instruct_2507_pack(&device, None)?;
 
             // One config per prompt: BF16, single context, no validation.
             let configs: Vec<TestConfig> = (0..prompts.len())
@@ -2980,7 +2710,7 @@ mod tests {
                 .collect();
 
             let load_model = || {
-                let model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+                let model = ModelWeights::from_pack(&pack, &device, None)?;
                 batched(model, INSTRUCT_2507_CONTEXT, 4096, &device)
             };
 
@@ -3089,18 +2819,10 @@ mod tests {
                 prefill_len
             );
 
-            // Download model
-            let repo = api.repo(hf_hub::Repo::with_revision(
-                "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF".to_string(),
-                hf_hub::RepoType::Model,
-                "main".to_string(),
-            ));
-            let model_path = repo
-                .get("Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf")
-                .map_err(|e| candle::Error::Msg(format!("Failed to download model: {}", e)))?;
-            println!("Model path: {:?}", model_path);
+            let pack = instruct_2507_pack(&device, None)?;
+            println!("Model pack: {:?}", pack);
 
-            let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+            let raw = ModelWeights::from_pack(&pack, &device, None)?;
             let model = batched(raw, INSTRUCT_2507_CONTEXT, 4096, &device)?;
 
             let n_kv_head = model.n_kv_head();
@@ -3278,18 +3000,14 @@ mod tests {
         use crate::models::batch_test::ruler_gen::{
             run_ruler_benchmark, RulerBenchConfig, RulerDataSource, RulerTask, QWEN3_EOS_IDS,
         };
-        use crate::models::batch_test::test_helpers::{download_hf_gguf, load_hf_tokenizer};
+        use crate::models::batch_test::test_helpers::load_hf_tokenizer;
 
         let tokenizer = load_hf_tokenizer("Qwen/Qwen3-30B-A3B-Instruct-2507")?;
         let device =
             Device::new_cuda(0).map_err(|e| candle::Error::Msg(format!("CUDA device: {e}")))?;
-        let model_path = download_hf_gguf(
-            "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-            "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-            "main",
-        )?;
-        println!("Model path: {model_path:?}");
-        let weights = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+        let pack = instruct_2507_pack(&device, None)?;
+        println!("Model pack: {pack:?}");
+        let weights = ModelWeights::from_pack(&pack, &device, None)?;
         let model = batched(weights, INSTRUCT_2507_CONTEXT, 32_768, &device)?;
         println!("✓ Model loaded");
 

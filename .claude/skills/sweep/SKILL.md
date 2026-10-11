@@ -26,14 +26,16 @@ nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader,nouni
   and model file). Name the skipped gates in the report.
 - **Qwen3.8-Flash-Next (`qwen38-fn`) runs on every machine, full sweep or partial** — both
   its gate `quantized_qwen38_moe` and the `qwen38_flash_next` engine probe of step 4b
-  (which runs the preset for this card's rung — `Q2_KO` under 32 GiB, `Q4_KO` at 64+).
+  (which runs the preset for this card's rung — `Q3_KO` under 64 GiB, `Q4_KO` at 64+).
   Model size is not bounded by VRAM (`CLAUDE.md`): the expert cache streams VRAM → pinned
-  RAM → mmap, and on a 16 GB card it runs from the prepared Q2_KO hybrid artifact
+  RAM → mmap, and on a 16 GB card it runs from the prepared Q3_KO hybrid artifact
   (`qwen4exp::prepare`, recipe-hashed, cached under
   `~/.cache/zend/models/unsloth--Qwen3.8-Flash-Next-GGUF/`). The gate sizes its ladder from
   free VRAM itself — a rung it cannot hold on this card (×16 needs ≥ 24 GiB) is the gate's
-  to skip, not the sweep's. If the artifact is not built yet, the first run builds it
-  (~11 min, ~88 GiB on disk for Q2_KO) — check free disk before starting. A failure here —
+  to skip, not the sweep's. If the artifact is not built yet, the first run builds it,
+  fetching ~192 GB of pinned `Q8_0` sources and deleting them after the merge (the
+  `Q2_KO` artifact was ~11 min and 88 GiB; `Q3_KO`'s experts are 52 B per 128 weights
+  against 36, so expect more) — check free disk before starting. A failure here —
   OOM, a fault, a missed story — is a bug to fix forward (step 9), never a reason to skip
   the model on a smaller card.
 
@@ -154,7 +156,8 @@ reasons and only one of them is about numerics:
   `weights fully resident` instead of a percentage, and that is a pass.
 
 **KV compaction is on** (`compact_backings`, and `compact_recurrent` for the span tenants),
-so the efficiency gate is expected to pass: 2026-10-07 read 99% (30B) and 97% (Flash-Next)
+so the efficiency gate is expected to pass: 2026-10-11 read 100% (30B) and 100% (Flash-Next)
+on the 16 GB card, and 2026-10-07 read 99% (30B) and 97% (Flash-Next)
 worst sustained. A failure is a fragmentation regression to attribute, not a standing cost.
 
 **The uptake gate is a different question.** `reclaim_spare_ground` runs between forwards

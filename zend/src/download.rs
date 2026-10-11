@@ -1,6 +1,9 @@
-//! First-run model download with progress logging.
+//! Model packs, and the downloads that build them, with progress logging.
 //!
-//! `ensure_model()` resolves files in this priority order:
+//! Every model loads from its model pack (`docs/self_contained_model_packs.md`),
+//! resolved through the engine builder: from the model cache when it is there,
+//! otherwise built from its sources, which are released once the pack holds
+//! them. [`ZendFetch`] is how the daemon fetches those sources, in this order:
 //!   1. `~/.cache/zend/models/`         — our own cache
 //!   2. `~/.cache/huggingface/hub/`     — hf-hub cache (already downloaded)
 //!   3. Download from HuggingFace       — streams with 5%-step progress to log pane
@@ -11,8 +14,11 @@ use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
+use tokio::runtime::Runtime;
+use tokio::sync::watch::Sender;
 
-use candle_conversation::models::Model;
+use candle::Device;
+use candle_conversation::models::{cache_root, Fetched, Model, SourceFetch, SourceRef};
 
 // ── Model coordinates ─────────────────────────────────────────────────────────
 //
@@ -24,91 +30,110 @@ const TOK_FILE: &str = "tokenizer.json";
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Ensure the model and tokenizer are present and return their local paths.
+/// The model pack `model` loads on `device`, from the model cache — built from
+/// its sources when it is not there.
 ///
-/// Progress is published on `status` so callers can surface it to users.
-pub async fn ensure_model(
+/// Downloads run on `runtime` and report on `status`, so callers can surface
+/// them to users. A prepared artifact (Flash-Next's) is never prepared here:
+/// its pack is built only from an artifact already on this machine.
+pub fn ensure_model_pack(
     model: &Model,
-    status: &tokio::sync::watch::Sender<String>,
-) -> anyhow::Result<(PathBuf, PathBuf)> {
-    let dir = cache_dir();
-    tokio::fs::create_dir_all(&dir).await?;
-
+    device: &Device,
+    runtime: &Runtime,
+    status: &Sender<String>,
+) -> anyhow::Result<PathBuf> {
     let spec = model.clone().spec();
-    let model_path = if spec.prepared_from_source {
-        resolve_prepared(&spec.model_repo, &spec.model_filename, &dir, status)?
-    } else {
-        resolve_file(
-            &spec.model_repo,
-            // The checkpoint carries no pinned revision on the spec; its
-            // published length is what distinguishes it here.
-            "",
-            &spec.model_filename,
-            Some(spec.model_bytes),
-            &dir,
-            status,
-        )
-        .await?
-    };
-    let tok_path = resolve_file(
-        &spec.tokenizer_repo,
-        &spec.tokenizer_rev,
-        TOK_FILE,
-        None,
-        &dir,
+    let fetch = ZendFetch {
+        runtime,
         status,
-    )
-    .await?;
+        // The spec's published length, where it states one, checks the
+        // checkpoint the pack is built from.
+        expected: (spec.model_bytes > 0).then(|| (spec.model_filename.clone(), spec.model_bytes)),
+    };
+    status.send("Resolving the model pack…".into()).ok();
+    let resolved = model
+        .clone()
+        .builder()
+        .resolve_model_with(device, &fetch)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let gb = resolved.pack.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1e9;
+    tracing::info!("model pack: {} ({:.2} GB)", resolved.pack.display(), gb);
+    status
+        .send(format!("Found the model pack ({gb:.1} GB)"))
+        .ok();
+    Ok(resolved.pack)
+}
 
-    Ok((model_path, tok_path))
+/// The daemon's [`SourceFetch`]: its own cache, then the hub cache, then a
+/// streamed download with progress on `status`.
+pub struct ZendFetch<'a> {
+    pub runtime: &'a Runtime,
+    pub status: &'a Sender<String>,
+    /// A source file's published length, `(file, bytes)`, checked on a hit.
+    pub expected: Option<(String, u64)>,
+}
+
+impl SourceFetch for ZendFetch<'_> {
+    fn fetch(&self, s: &SourceRef) -> candle::Result<Fetched> {
+        let size_hint = self
+            .expected
+            .as_ref()
+            .and_then(|(file, bytes)| (*file == s.file).then_some(*bytes));
+        let path = self
+            .runtime
+            .block_on(resolve_file(
+                &s.repo,
+                &s.rev,
+                &s.file,
+                size_hint,
+                &cache_root(),
+                self.status,
+            ))
+            .map_err(|e| candle::Error::Msg(format!("{e:#}")))?;
+        Ok(Fetched { path, cached: true })
+    }
+
+    fn tokenizer_json(&self, repo: &str, rev: &str) -> candle::Result<String> {
+        let path = self
+            .runtime
+            .block_on(resolve_file(
+                repo,
+                rev,
+                TOK_FILE,
+                None,
+                &cache_root(),
+                self.status,
+            ))
+            .map_err(|e| candle::Error::Msg(format!("{e:#}")))?;
+        std::fs::read_to_string(&path)
+            .map_err(|e| candle::Error::Msg(format!("read {}: {e}", path.display())))
+    }
+
+    /// Our own cache's copy is the file; a hub cache's is a snapshot entry
+    /// linking to the blob that holds the bytes, and both go.
+    fn release(&self, f: &Fetched) -> candle::Result<()> {
+        let err = |p: &Path, e: std::io::Error| {
+            candle::Error::Msg(format!("release {}: {e}", p.display()))
+        };
+        let blob = std::fs::read_link(&f.path)
+            .ok()
+            .map(|t| match f.path.parent() {
+                Some(dir) if t.is_relative() => dir.join(t),
+                _ => t,
+            });
+        std::fs::remove_file(&f.path).map_err(|e| err(&f.path, e))?;
+        if let Some(blob) = blob {
+            std::fs::remove_file(&blob).map_err(|e| err(&blob, e))?;
+        }
+        tracing::info!(
+            "released {} — the model pack holds it now",
+            f.path.display()
+        );
+        Ok(())
+    }
 }
 
 // ── Resolution ────────────────────────────────────────────────────────────────
-
-/// Locate an engine artifact this codebase **prepares** rather than downloads.
-///
-/// Same cache layout as everything else — `<cache>/<repo-with-dashes>/<file>` —
-/// so a prepared artifact sits beside the published ones and one convention
-/// covers both. What differs is the miss: there is no URL to fall back to,
-/// because the name was never published, so the miss is reported as the missing
-/// build step it actually is.
-///
-/// Also accepts the file in the hub cache, for the case where a prepare wrote
-/// beside the source shards it read.
-fn resolve_prepared(
-    repo: &str,
-    filename: &str,
-    our_dir: &Path,
-    status: &tokio::sync::watch::Sender<String>,
-) -> anyhow::Result<PathBuf> {
-    let our_path = our_dir.join(repo.replace('/', "--")).join(filename);
-    for candidate in [Some(our_path.clone()), hf_hub_path(repo, "", filename)]
-        .into_iter()
-        .flatten()
-    {
-        if candidate.exists() {
-            let gb = candidate.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1e9;
-            tracing::info!("prepared artifact: {} ({:.2} GB)", candidate.display(), gb);
-            status
-                .send(format!("Found {} ({:.1} GB)", filename, gb))
-                .ok();
-            return Ok(candidate);
-        }
-    }
-    // No fetch, and no partial-file placeholder left behind. Naming the step is
-    // the whole point: a 404 on `{filename}` would be a confusing way to say
-    // "the merge has not been run on this machine".
-    anyhow::bail!(
-        "engine artifact {filename} is not on this machine.\n\
-         It is BUILT, not downloaded — nothing publishes it under that name, and the name \
-         carries the digest of the recipe that builds it. Produce it on this card with the \
-         `test_parallel_batched_forwarding` gate in \
-         `candle-transformers/src/models/quantized_qwen38_moe.rs` (`qwen4exp::prepare`: it \
-         fetches the recipe's pinned {repo} sources, brings the routed experts to this card's \
-         rung, folds in the MTP head and merges), which writes it to {}.",
-        our_path.display(),
-    )
-}
 
 /// Resolve a model file: our cache → HF hub cache → download.
 async fn resolve_file(
@@ -117,7 +142,7 @@ async fn resolve_file(
     filename: &str,
     size_hint: Option<u64>,
     our_dir: &Path,
-    status: &tokio::sync::watch::Sender<String>,
+    status: &Sender<String>,
 ) -> anyhow::Result<PathBuf> {
     // 1. Our own cache, keyed on REPO **and** filename, and the length is
     //    checked on top when the spec states one.
@@ -262,17 +287,6 @@ fn hf_url(repo: &str, revision: &str, file: &str) -> String {
     format!("https://huggingface.co/{repo}/resolve/{rev}/{file}")
 }
 
-/// `~/.cache/zend/models/`
-pub fn cache_dir() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("zend")
-        .join("models")
-}
-
 /// `~/.cache/huggingface/hub/` — respects `HF_HOME`.
 fn hf_hub_root() -> PathBuf {
     if let Ok(hf_home) = std::env::var("HF_HOME") {
@@ -294,7 +308,7 @@ async fn fetch(
     url: &str,
     dest: &Path,
     size_hint: Option<u64>,
-    status: &tokio::sync::watch::Sender<String>,
+    status: &Sender<String>,
 ) -> anyhow::Result<()> {
     let part = dest.with_extension("part");
     if part.exists() {
@@ -416,7 +430,7 @@ pub fn dsv4_files() -> Vec<RemoteFile> {
 
 /// The default on-disk directory for the DeepSeek-V4-Flash GGUFs.
 pub fn deepseek_dir() -> PathBuf {
-    cache_dir().join("deepseek-v4-flash-mxfp4")
+    cache_root().join("deepseek-v4-flash-mxfp4")
 }
 
 /// Local paths of the resolved DeepSeek-V4-Flash source files.
@@ -431,10 +445,7 @@ pub struct DeepseekPaths {
 /// `dir`, downloading only whichever are missing from the HF Hub. Files already on
 /// disk are kept, so adding speculative decode to an existing main-model install
 /// pulls just the ~10.9 GB drafter.
-pub async fn ensure_deepseek(
-    dir: &Path,
-    status: &tokio::sync::watch::Sender<String>,
-) -> anyhow::Result<DeepseekPaths> {
+pub async fn ensure_deepseek(dir: &Path, status: &Sender<String>) -> anyhow::Result<DeepseekPaths> {
     tokio::fs::create_dir_all(dir).await?;
     let mut splits = Vec::with_capacity(DSV4_SPLITS);
     for i in 1..=DSV4_SPLITS {
@@ -449,7 +460,7 @@ pub async fn ensure_deepseek(
 async fn ensure_remote_file(
     dir: &Path,
     f: &RemoteFile,
-    status: &tokio::sync::watch::Sender<String>,
+    status: &Sender<String>,
 ) -> anyhow::Result<PathBuf> {
     let local = dir.join(&f.local_name);
     let have = tokio::fs::metadata(&local)

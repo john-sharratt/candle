@@ -1,6 +1,6 @@
 //! Moving the weight/KV boundary for a streamed dense model.
 //!
-//! `docs/qwen38_layer_streaming.md` §2.1 is the defect this closes: *"A dense
+//! `docs/archived/qwen38_layer_streaming.md` §2.1 is the defect this closes: *"A dense
 //! model has no slots, so the boundary has nothing to trade and the partition is
 //! inert. KV pressure on a dense model can only be answered by refusing work."*
 //! Once a dense model's layers are slot tenants it has exactly what an expert

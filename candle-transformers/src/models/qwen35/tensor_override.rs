@@ -179,6 +179,20 @@ impl<'a> TensorOverrides<'a> {
         })
     }
 
+    /// What a load reads for `name`: the override's tensor when one replaces it,
+    /// the checkpoint's otherwise, `None` when neither has it.
+    pub fn effective_info<'c>(
+        &'c self,
+        checkpoint: &'c Content,
+        name: &str,
+    ) -> Option<&'c TensorInfo> {
+        self.sources
+            .iter()
+            .find(|s| s.spec.tensor == name)
+            .and_then(|s| s.content.tensor_infos.get(name))
+            .or_else(|| checkpoint.tensor_infos.get(name))
+    }
+
     /// Each override as `(tensor, file, its type, the checkpoint's type)`, for the load's log.
     pub fn describe(&self) -> Vec<(&'a str, &'a Path, GgmlDType, GgmlDType)> {
         self.sources

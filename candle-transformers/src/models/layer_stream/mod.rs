@@ -3,7 +3,7 @@
 //! A dense checkpoint larger than the card is held as a working set of resident
 //! layers with the rest streamed in behind the wave, the same way
 //! [`expert_lre`](crate::models::expert_lre) holds a routed one. The design is
-//! `docs/qwen38_layer_streaming.md`; this module is its implementation.
+//! `docs/archived/qwen38_layer_streaming.md`; this module is its implementation.
 //!
 //! ## Why it is not the expert cache
 //!
@@ -68,6 +68,10 @@ pub mod order;
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) mod pack;
 pub mod residency;
+/// The layer section of a model pack: opened at load against this build's
+/// repack fingerprints.
+#[cfg(feature = "cuda")]
+pub(crate) mod section;
 #[cfg(feature = "cuda")]
 pub mod view;
 pub mod warm;
@@ -78,13 +82,12 @@ pub use boundary::growth_tally;
 #[cfg(feature = "cuda")]
 pub use build::LoadedLayer;
 #[cfg(feature = "cuda")]
-pub use cache::{pack_path_for, LayerCache, LayerCacheStats, COMMITTED_DEPTH};
+pub use cache::{LayerCache, LayerCacheStats, COMMITTED_DEPTH};
 pub use descriptor::{
     layer_image, slot_bytes_for_layers, FfnForm, ImageError, LayerImage, LayerTensor, MixKind,
     Placement, Projection, PROJECTION_ALIGN,
 };
 pub use order::{eviction_order, protection_order};
-pub use pack::PackIdentity;
 pub use residency::{LayerResidency, LoadOp, PlanScratch, Residence};
 #[cfg(feature = "cuda")]
 pub use view::{build_layer_view, StreamedLayer};

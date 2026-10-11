@@ -801,8 +801,8 @@ impl ModelWeights {
         )
     }
 
-    /// Like from_gguf_by_path but with an explicit numeric int8mode (the test path selects it
-    /// from INT8MODE); from_gguf_by_path defaults it to Int8Mode::auto.
+    /// Like from_gguf_by_path but with an explicit numeric int8mode; from_gguf_by_path
+    /// defaults it to Int8Mode::auto.
     pub fn from_gguf_by_path_with_int8(
         file_path: &std::path::Path,
         device: &Device,
@@ -1307,67 +1307,37 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Slow without CUDA. Run with: cargo test --release --features cuda -- --ignored test_parallel_batched_forwarding
+    #[ignore] // Run with: cargo test --release --features cuda -- --ignored test_parallel_batched_forwarding
+    #[cfg(feature = "cuda")]
     fn test_parallel_batched_forwarding() -> Result<()> {
-        #[cfg(not(all(feature = "cuda")))]
-        println!("⚠ WARNING: This test should be run with --features cuda for optimal performance");
-        #[cfg(not(all(feature = "cuda")))]
-        println!(
-            "⚠ Current build is missing performance-critical features. Results may be slower.\n"
-        );
+        use crate::models::batch_test::test_helpers::plain_pack;
 
         println!("\n=== Setting up Test Parameters ===\n");
 
         let num_generate_tokens = 20;
         let dialect = Dialect::chat_ml();
 
-        // Download tokenizer.json (Qwen3) from HuggingFace.
-        // We keep this runtime-loaded so the test can validate real token ranges.
-        let api = crate::models::batch_test::test_helpers::api()
-            .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
-        let tok_repo = api.model("Qwen/Qwen3-8B".to_string());
-        let tokenizer_path = tok_repo.get("tokenizer.json").map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to download tokenizer.json: {}. This test requires internet access.",
-                e
-            ))
-        })?;
-        let tokenizer_json = std::fs::read_to_string(&tokenizer_path).map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to read tokenizer.json from {:?}: {}",
-                tokenizer_path, e
-            ))
-        })?;
+        let device = Device::new_cuda(0)?;
+        println!("Using device: {:?}\n", device);
+        let int8mode = Int8Mode::Performance;
+        println!("int8 mode = {int8mode:?}\n");
+
+        println!("\n=== Loading Model ===\n");
+        // The checkpoint's model pack, with the tokenizer inside it — loaded at
+        // runtime so the test validates real token ranges.
+        let (model_path, tokenizer_json) = plain_pack(
+            ("unsloth/Qwen3-8B-GGUF", "main", "Qwen3-8B-Q6_K.gguf"),
+            ("Qwen/Qwen3-8B", "main"),
+            int8mode,
+            &device,
+        )?;
+        println!("Model pack: {:?}", model_path);
 
         let params = TestParams::new(num_generate_tokens, &tokenizer_json, dialect)
             .map_err(|e| candle::Error::Msg(format!("Failed to create TestParams: {}", e)))?
             .with_suppress_thinking(true)
             .with_print_outputs(false)
             .with_timeout_secs(1200); // 8 minutes for this test (Qwen3-8B is large)
-
-        println!("\n=== Loading Model ===\n");
-
-        let repo = api.repo(hf_hub::Repo::with_revision(
-            "unsloth/Qwen3-8B-GGUF".to_string(),
-            hf_hub::RepoType::Model,
-            "main".to_string(),
-        ));
-        let model_path = repo.get("Qwen3-8B-Q6_K.gguf").map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to download model: {}. This test requires internet access.",
-                e
-            ))
-        })?;
-
-        println!("Model downloaded to: {:?}", model_path);
-
-        let device = Device::new_cuda(0).map_err(|e| {
-            candle::Error::Msg(format!(
-                "CUDA required for this test: {}. Use --features cuda",
-                e
-            ))
-        })?;
-        println!("Using device: {:?}\n", device);
 
         let configs = vec![
             // Sequential (non-batched) test using BF16 for better performance on tensor cores
@@ -1534,14 +1504,6 @@ mod tests {
                 test_mode: Some(TestMode::StoryRewrite),
             },
         ];
-
-        // Inference numeric mode, selected by INT8MODE (default Performance; "off"/"prec").
-        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
-            Some("off") => Int8Mode::Off,
-            Some("prec") | Some("precision") => Int8Mode::Precision,
-            _ => Int8Mode::Performance,
-        };
-        println!("int8 mode = {int8mode:?}\n");
 
         let load_model = || {
             let model = ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, int8mode)?;

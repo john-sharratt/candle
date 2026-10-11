@@ -9,10 +9,11 @@ use candle_nn::kv_cache::{KvErrorThresholdFactors, QWEN4EXP_KV_FACTORS, QWEN4EXP
 
 /// The threshold row for experts stored as `format`.
 ///
-/// `Q2_KO` has its own measured row. `Q3_KO` — the 32 GiB rung, calibrated on no
-/// card of that size — takes the tighter `Q2_KO` row: narrower experts have
-/// less margin, so the narrow row costs `Q3_KO` some ratio and cannot cost it
-/// validity. Every wider format runs the row derived on `Q4_KO`.
+/// `Q3_KO` — the floor rung, every card under 64 GiB — runs the narrow row,
+/// which was measured on `Q2_KO` experts when that was the 16 and 24 GiB cards'
+/// rung. Narrower experts have less margin, so a row placed against `Q2_KO`'s
+/// edge costs `Q3_KO` some ratio and cannot cost it validity; `Q2_KO` keeps it
+/// too. Every wider format runs the row derived on `Q4_KO`.
 pub fn kv_factors_for(format: GgmlDType) -> KvErrorThresholdFactors {
     match format {
         GgmlDType::Q2_KO | GgmlDType::Q3_KO => QWEN4EXP_Q2KO_KV_FACTORS,

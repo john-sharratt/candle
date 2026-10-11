@@ -156,10 +156,10 @@ fn main() -> anyhow::Result<()> {
         .builder()
         .max_concurrent(ctx_config.iter().map(|(_, n)| n).sum::<usize>() + 1)
         .max_seq_len(args.token_budget);
-    let (model_path, tokenizer_path) = builder.resolve_paths_pub()?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    let model = builder.load_model(&model_path, &device, None)?.model;
+    let resolved = builder.resolve_model(&device)?;
+    let tokenizer = resolved.tokenizer()?;
+    let model = builder.load_model(&resolved.pack, &device, None)?.model;
+    let builder = builder.model_path(&resolved.pack);
     let mut engine_config = builder.engine_config(&tokenizer, &device);
     engine_config.batched_config = batched_config;
 

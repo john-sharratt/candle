@@ -1578,8 +1578,9 @@ impl PipelineState {
         }
     }
 
-    /// The zone's gauges, refreshed each routed layer.
-    fn publish_gauges(&self) {
+    /// The zone's gauges, refreshed each routed layer and after every boundary
+    /// move.
+    pub(super) fn publish_gauges(&self) {
         let slot_bytes = self.inner.zone.slot_bytes();
         let occupied = self.inner.num_slots() - self.inner.free_len();
         if let Ok(mut s) = self.stats.lock() {

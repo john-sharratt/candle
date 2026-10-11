@@ -16,15 +16,16 @@
 
 use candle::{DType, Device, Result, Tensor};
 
-use crate::models::batch_test::test_helpers::hf_get;
+use crate::models::batch_test::test_helpers::{gate_pack, hf_get};
 use crate::models::batch_test::utils::{decode_replay_probe, TestParams};
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
 };
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::dialect::Dialect;
-use crate::models::quantized_qwen36_moe::from_gguf_path;
-use crate::models::qwen35::{HybridBatched, Qwen35LoadOptions};
+use crate::models::model_pack::{PackFamily, PackRequest};
+use crate::models::quantized_qwen36_moe::from_pack;
+use crate::models::qwen35::HybridBatched;
 
 const MODEL_REPO: &str = "unsloth/Qwen3.6-35B-A3B-GGUF";
 const MODEL_REV: &str = "a483e9e6cbd595906af30beda3187c2663a1118c";
@@ -38,9 +39,14 @@ const RECURRENT_LAYERS: usize = 30;
 // ── harness ──────────────────────────────────────────────────────────────────
 
 fn load() -> Result<(HybridBatched, Device)> {
-    let path = hf_get(MODEL_REPO, hf_hub::RepoType::Model, MODEL_REV, MODEL_FILE)?;
     let device = Device::new_cuda(0)?;
-    let model = from_gguf_path(&path, &device, Qwen35LoadOptions::default())?;
+    let request = PackRequest::of(
+        PackFamily::Qwen35,
+        (MODEL_REPO, MODEL_REV, MODEL_FILE),
+        (TOK_REPO, TOK_REV),
+        None,
+    );
+    let model = from_pack(&gate_pack(&request, &device)?, &device)?;
     Ok((model, device))
 }
 

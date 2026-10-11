@@ -48,6 +48,7 @@
 //! the module above.
 
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -313,12 +314,11 @@ fn story_slice(story: &str, fraction: usize) -> &str {
 pub fn run(probe: &Probe) -> anyhow::Result<ProbeOutcome> {
     let device = Device::new_cuda(probe.device)?;
     let builder = probe.builder();
-    let (model_path, tokenizer_path) = builder.resolve_paths_pub()?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    println!("Loading {model_path:?} …");
-    let model = builder.load_model(&model_path, &device, None)?.model;
-    run_on_model(probe, &device, tokenizer, model)
+    let resolved = builder.resolve_model(&device)?;
+    let tokenizer = resolved.tokenizer()?;
+    println!("Loading {:?} …", resolved.pack);
+    let model = builder.load_model(&resolved.pack, &device, None)?.model;
+    run_on_model(probe, &device, &resolved.pack, tokenizer, model)
 }
 
 /// Stand up an engine on `model` over a scratch substrate.
@@ -330,13 +330,17 @@ pub fn run(probe: &Probe) -> anyhow::Result<ProbeOutcome> {
 /// must be held for the engine's whole life; dropping it removes the store, and a
 /// previous run's corpse is swept on creation. See `scratch_substrate` for what that
 /// does and does not promise.
+///
+/// `pack` is the model pack `model` was loaded from — the authority on its logits
+/// width, which the engine's sampling buffers are sized to.
 pub(super) fn start_engine(
     probe: &Probe,
     device: &Device,
+    pack: &Path,
     tokenizer: &tokenizers::Tokenizer,
     model: Box<dyn crate::ManagedBatchedModel + Send>,
 ) -> anyhow::Result<(ScratchSubstrate, Arc<ConversationEngine>)> {
-    let builder = probe.builder();
+    let builder = probe.builder().model_path(pack);
     let scratch = ScratchSubstrate::new()?;
     if scratch.swept() > 0 {
         println!(
@@ -424,12 +428,11 @@ fn clean_baseline(
 pub fn run_baseline(probe: &Probe) -> anyhow::Result<(BaselineRow, Vec<String>)> {
     let device = Device::new_cuda(probe.device)?;
     let builder = probe.builder();
-    let (model_path, tokenizer_path) = builder.resolve_paths_pub()?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    println!("Loading {model_path:?} …");
-    let model = builder.load_model(&model_path, &device, None)?.model;
-    let (_scratch, engine) = start_engine(probe, &device, &tokenizer, model)?;
+    let resolved = builder.resolve_model(&device)?;
+    let tokenizer = resolved.tokenizer()?;
+    println!("Loading {:?} …", resolved.pack);
+    let model = builder.load_model(&resolved.pack, &device, None)?.model;
+    let (_scratch, engine) = start_engine(probe, &device, &resolved.pack, &tokenizer, model)?;
     clean_baseline(&engine, probe)
 }
 
@@ -441,11 +444,13 @@ pub fn run_baseline(probe: &Probe) -> anyhow::Result<(BaselineRow, Vec<String>)>
 /// — quite apart from the span reservation, which is process-global and does not expect a
 /// second weight zone to be carved beside the first.
 ///
-/// The caller passes the model already batched. Everything else — the scratch substrate,
-/// the engine, the phases — is set up here, because none of it is the caller's business.
+/// The caller passes the model already batched, with the pack it was loaded from.
+/// Everything else — the scratch substrate, the engine, the phases — is set up here,
+/// because none of it is the caller's business.
 pub fn run_on_model(
     probe: &Probe,
     device: &Device,
+    pack: &Path,
     tokenizer: tokenizers::Tokenizer,
     model: Box<dyn crate::ManagedBatchedModel + Send>,
 ) -> anyhow::Result<ProbeOutcome> {
@@ -453,7 +458,7 @@ pub fn run_on_model(
     let device = device.clone();
     let builder = probe.builder();
     // Held for the engine's whole life — see `start_engine`.
-    let (_scratch, engine) = start_engine(probe, &device, &tokenizer, model)?;
+    let (_scratch, engine) = start_engine(probe, &device, pack, &tokenizer, model)?;
 
     // The forward gate's own fixture — see `story_slice`.
     let story = fixtures::story_prompt();

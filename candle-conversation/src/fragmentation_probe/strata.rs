@@ -228,10 +228,9 @@ pub fn run_strata(
 ) -> anyhow::Result<Vec<StrataRun>> {
     let device = Device::new_cuda(probe.device)?;
     let builder = probe.builder();
-    let (model_path, tokenizer_path) = builder.resolve_paths_pub()?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    let tokenizer_json = std::fs::read_to_string(&tokenizer_path)?;
+    let resolved = builder.resolve_model(&device)?;
+    let tokenizer = resolved.tokenizer()?;
+    let tokenizer_json = resolved.tokenizer_json.clone();
 
     // The forward harness's counter, set up as the forward bench sets it up: empty
     // system turn, reasoning suppressed.
@@ -252,10 +251,10 @@ pub fn run_strata(
         }
     }
 
-    println!("Loading {model_path:?} …");
-    let model = builder.load_model(&model_path, &device, None)?.model;
+    println!("Loading {:?} …", resolved.pack);
+    let model = builder.load_model(&resolved.pack, &device, None)?.model;
     // Held for the engine's whole life — see `start_engine`.
-    let (_scratch, engine) = start_engine(probe, &device, &tokenizer, model)?;
+    let (_scratch, engine) = start_engine(probe, &device, &resolved.pack, &tokenizer, model)?;
     let config = builder.conversation_config();
 
     println!(

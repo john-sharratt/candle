@@ -90,7 +90,7 @@ pub use geometry::LatentGeometry;
 pub use hyper::{HyperConnection, HyperParams};
 pub use indexer::Indexer;
 pub use linear::QLinear;
-pub use loader::{config_from_gguf, GgufModel};
+pub use loader::{block_count, config_from_gguf, GgufModel};
 pub use moe::{Expert, Gate, MoE, ScoreFunc};
 #[cfg(feature = "cuda")]
 pub use paged::{paged_latent_decode, paged_latent_decode_raw, CorpusCache, SyntheticSlots};

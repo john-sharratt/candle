@@ -110,7 +110,7 @@ scenarios (below). None of the slow ones loaded a model; they were **unoptimised
   0.8B, same lineage/dialect/tool-call style as production), selected through a new
   `DaemonConfig::model: ModelChoice` — `MeasuredVram` (the existing ladder, the default) or
   `Preset(Box<Model>)` — with a matching `zend --model <PRESET>` flag and
-  `Model::{PRESETS, from_override_key}`. `download::ensure_model` and the session build from
+  `Model::{PRESETS, from_override_key}`. `download::ensure_model_pack` and the session build from
   the one resolved model. Scenarios run thinking-off (`api::chat::dial_selection`, now `pub`),
   one at a time, on a persistent `target/tmp/tools_integration_ws` whose calibration is paid
   once, force-compacted past 2 GiB. **9/10 pass in the default suite at ~20–30 s each**;

@@ -17,7 +17,7 @@ use tokio::sync::Mutex as ConvLock;
 use tokio::sync::{Notify, OwnedMutexGuard};
 use tokio::task::JoinHandle as TaskHandle;
 
-use candle::vram;
+use candle::{vram, Device};
 use candle_conversation::models::{Dialect, Model, StrataTokens};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
@@ -1043,8 +1043,8 @@ impl InferenceState {
     fn load(
         mut proj_builder: Builder,
         model: Model,
-        model_path: PathBuf,
-        tokenizer_path: PathBuf,
+        device: Device,
+        pack: PathBuf,
         workspace: Workspace,
         secrets: Arc<Secrets>,
         disabled_layers: HashSet<String>,
@@ -1069,8 +1069,6 @@ impl InferenceState {
         // Substrate steps below is best-effort — the substrate has
         // actually already loaded by the time we announce its step.
         progress.set_step(LoadStep::Model);
-        let device = candle::Device::cuda_if_available(0)
-            .map_err(|e| anyhow::anyhow!("device init: {e}"))?;
 
         // The card's headroom at startup, beside the file-ingest pool width
         // that will spend it, so a CUDA OOM during code_read is traceable to
@@ -1235,15 +1233,12 @@ impl InferenceState {
         // expanded by `preemptive_prefill` itself.
         let before_text: String = pre_collection_prelude(&proj_builder);
 
-        // The expert pack lives beside the checkpoint, so it is shared by every
-        // workspace on this model, survives `--wipe-substrate`, and turns the
-        // ~42 s expert repack into a read on every restart after the first.
-        let expert_pack_dir = model_path.parent().map(|p| p.to_path_buf());
+        // The model pack, from the model cache: shared by every workspace on
+        // this model, it survives `--wipe-substrate`, and carries the tokenizer.
         let mut builder = model
             .builder()
             .system_prompt(&before_text)
-            .model_path(model_path)
-            .tokenizer_path(tokenizer_path)
+            .model_path(pack)
             .workspace_path(root.clone())
             .read_only_substrate(read_only_substrate)
             .qsa_selection_budget(qsa_selection_budget)
@@ -1271,9 +1266,6 @@ impl InferenceState {
                     .map(|l| (l.id, l.on_corrupt_turn))
                     .collect(),
             );
-        if let Some(dir) = expert_pack_dir {
-            builder = builder.expert_pack_dir(dir);
-        }
         // Per-layer progress callback — the library reports
         // `(layers_loaded, total_layers)` after each transformer block
         // is mounted. We translate that into the LoadProgress fraction
@@ -6171,18 +6163,32 @@ impl ZendSession {
                         std::process::exit(1);
                     }
                 };
-                let (model_path, tok_path) =
-                    match download_runtime.block_on(crate::download::ensure_model(&model, &status_tx)) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            // A missing model is fatal — the daemon cannot serve
-                            // anything without it. Fail hard rather than limping
-                            // into a fake-ready state that errors on first submit.
-                            tracing::error!("model download failed: {e:#}; exiting");
-                            status_tx.send(format!("Download failed: {e}")).ok();
-                            std::process::exit(1);
-                        }
-                    };
+                // The device the pack is resolved for — its int8 mode and layer
+                // narrowing are this card's — and then loaded on.
+                let device = match Device::cuda_if_available(0) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::error!("device init failed: {e:#}; exiting");
+                        status_tx.send(format!("Device init failed: {e}")).ok();
+                        std::process::exit(1);
+                    }
+                };
+                let pack = match crate::download::ensure_model_pack(
+                    &model,
+                    &device,
+                    &download_runtime,
+                    &status_tx,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // A missing model is fatal — the daemon cannot serve
+                        // anything without it. Fail hard rather than limping
+                        // into a fake-ready state that errors on first submit.
+                        tracing::error!("model pack failed: {e:#}; exiting");
+                        status_tx.send(format!("Model pack failed: {e}")).ok();
+                        std::process::exit(1);
+                    }
+                };
                 // Drop the runtime; the model load below is sync.
                 drop(download_runtime);
 
@@ -6206,8 +6212,8 @@ impl ZendSession {
                 match InferenceState::load(
                     proj_builder,
                     model,
-                    model_path,
-                    tok_path,
+                    device,
+                    pack,
                     workspace,
                     secrets,
                     disabled_layers,

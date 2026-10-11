@@ -27,7 +27,8 @@
 //! # Local Files
 //!
 //! ```ignore
-//! // Directory containing the GGUF and tokenizer.json:
+//! // Directory containing the GGUF and tokenizer.json — packed into the model
+//! // cache on first use, and never written beside or deleted:
 //! let engine = Model::Qwen3_8B_Q4.builder()
 //!     .model_dir("/models/qwen3-8b")
 //!     .engine(&device)?;
@@ -36,6 +37,11 @@
 //! let engine = Model::Qwen3_8B_Q4.builder()
 //!     .model_path("/models/Qwen3-8B-Q4_K_M.gguf")
 //!     .tokenizer_path("/models/tokenizer.json")
+//!     .engine(&device)?;
+//!
+//! // Or a model pack, which carries its own tokenizer:
+//! let engine = Model::Qwen3_8B_Q4.builder()
+//!     .model_path("/models/Qwen3-8B-Q4_K_M.performance.pack.gguf")
 //!     .engine(&device)?;
 //! ```
 //!
@@ -50,6 +56,7 @@ mod dialect;
 mod gguf_rope;
 mod hermes3;
 pub mod overrides;
+mod pack_source;
 #[cfg(test)]
 mod preset_rope_tests;
 mod qwen2;
@@ -60,7 +67,15 @@ mod qwen38_flash_next;
 mod qwen3_moe;
 
 pub use builder::ModelBuilder;
+/// Model pack sources from the HuggingFace hub, cache first, through one
+/// timeout-protected download.
+#[cfg(feature = "hub")]
+pub use candle_transformers::models::model_pack::HubFetch;
+/// The model pack system's surface a daemon needs: where packs live, and how it
+/// supplies the sources one is built from.
+pub use candle_transformers::models::model_pack::{cache_root, Fetched, SourceFetch, SourceRef};
 pub use dialect::*;
+pub use pack_source::ResolvedModel;
 
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
@@ -255,13 +270,10 @@ pub enum Model {
     /// [`qwen38_flash_next`] and [`ModelSpec::prepared_from_source`].
     Qwen38_FlashNext_Q4KO,
 
-    /// Qwen3.8-Flash-Next with `Q3_KO` experts — the same model on the 32–63 GiB
-    /// rung of `quant_ladder`, from its own prepared artifact.
+    /// Qwen3.8-Flash-Next with `Q3_KO` experts — the same model on the floor rung
+    /// of `quant_ladder`, every card under 64 GiB (the 16 GB laptop and the 24 GB
+    /// RTX 3090 among them), from its own prepared artifact.
     Qwen38_FlashNext_Q3KO,
-
-    /// Qwen3.8-Flash-Next with `Q2_KO` experts — the same model on the rung under
-    /// 32 GiB, the 16 GB laptop among them, from its own prepared artifact.
-    Qwen38_FlashNext_Q2KO,
 
     /// Qwen3.5-9B Q6_K — the lineage's **dense** member (~7.5 GB), same hybrid
     /// attention/DeltaNet stack with the mixture taken out.
@@ -555,7 +567,6 @@ impl Model {
         Model::Qwen36_35B_A3B_Q4,
         Model::Qwen38_FlashNext_Q4KO,
         Model::Qwen38_FlashNext_Q3KO,
-        Model::Qwen38_FlashNext_Q2KO,
         Model::Qwen35_9B_Q6,
         Model::Qwen35_0_8B_Q8,
         Model::Qwen2_0_5B,
@@ -571,7 +582,6 @@ impl Model {
         match experts? {
             GgmlDType::Q4_KO => Some(Model::Qwen38_FlashNext_Q4KO),
             GgmlDType::Q3_KO => Some(Model::Qwen38_FlashNext_Q3KO),
-            GgmlDType::Q2_KO => Some(Model::Qwen38_FlashNext_Q2KO),
             _ => None,
         }
     }
@@ -602,7 +612,6 @@ impl Model {
             }
             Model::Qwen38_FlashNext_Q4KO => qwen38_flash_next::qwen38_flash_next_q4ko(),
             Model::Qwen38_FlashNext_Q3KO => qwen38_flash_next::qwen38_flash_next_q3ko(),
-            Model::Qwen38_FlashNext_Q2KO => qwen38_flash_next::qwen38_flash_next_q2ko(),
             Model::Qwen35_9B_Q6 => qwen35_dense::qwen35_9b_q6(),
             Model::Qwen35_0_8B_Q8 => qwen35_dense::qwen35_0_8b_q8(),
             Model::Qwen3_30B_A3B_Q4 => qwen3_moe::qwen3_30b_a3b_q4(),

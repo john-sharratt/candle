@@ -13,7 +13,7 @@
 use candle::forbidden_alloc;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::kv_cache::QuantFormat;
+use candle_nn::kv_cache::{QuantFormat, REGION_BYTES};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1043,6 +1043,44 @@ fn read_latency_cell(l: &ReadLatency) -> String {
     }
 }
 
+/// Whether a prefill of `takes[i]` rows on each of `seqs` fits the ground a
+/// forward can reach, priced as the wave it actually is: the model's own tier
+/// for that many sequences at their current depths
+/// ([`ManagedBatchedModel::wave_tier_bytes`], the function the placement uses)
+/// plus the KV those rows write, in whole regions, against
+/// [`ManagedBatchedModel::prefill_ground_bytes`].
+///
+/// The width cap alone cannot answer this: it prices a one-sequence wave, and
+/// the tier grows with sequences as well as rows. Measured on
+/// Qwen3.8-Flash-Next at BF16 ×8 on a 16 GB card: a cap of 4,354 rows, a
+/// 4,160-row eight-sequence wave, and a tier that did not fit.
+///
+/// `true` when the model cannot price the wave — it then runs as composed, and
+/// the placement is the check.
+fn prefill_pass_fits<M: ManagedBatchedModel + ?Sized>(
+    model: &M,
+    session: &BatchedInferenceSession,
+    seqs: &[usize],
+    takes: &[usize],
+) -> bool {
+    let act = session.activation_dtype();
+    let Some(ground) = model.prefill_ground_bytes() else {
+        return true;
+    };
+    let offsets: Vec<usize> = seqs
+        .iter()
+        .map(|&s| session.sequence_offset(s).unwrap_or(0))
+        .collect();
+    let rows: usize = takes.iter().sum();
+    let Some(tier) = model.wave_tier_bytes(rows, seqs.len(), takes, &offsets, act) else {
+        return true;
+    };
+    let kv = model.kv_bytes_per_row(act).map_or(0, |per_row| {
+        rows.saturating_mul(per_row).div_ceil(REGION_BYTES) * REGION_BYTES
+    });
+    (tier as usize).saturating_add(kv) <= ground
+}
+
 /// The expert pipeline's tallies for the interval just ended, with its
 /// residency ceiling filled in — taken where the tallies are, before the reset
 /// that starts the next interval.
@@ -1721,29 +1759,41 @@ impl TestParams {
                 }
             }
             let nl = model.num_layers();
-            // **Prefill honours the model's own width cap.**
+            // **Prefill is sliced only when the wave as composed cannot be
+            // placed** ([`prefill_pass_fits`]).
             //
-            // A wave's transient tier is sized by its row count, so a prompt
-            // submitted whole asks for a tier proportional to the whole prompt:
-            // at 127K tokens that was a measured 9.4 GB against a 3.2 GB span,
-            // and the partition refused it — correctly, since the ground is not
-            // there. `prefill_width_cap` is the model's answer to exactly this
-            // question and every engine already implements it; the harness was
-            // simply not asking. Submitting the prompt in cap-sized slices
-            // keeps each wave inside the span whatever the prompt's length.
+            // A wave's transient tier grows with its rows and its sequences, so
+            // a prompt submitted whole asks for a tier proportional to all of it:
+            // at 127K tokens that was a measured 9.4 GB against a 3.2 GB span, and
+            // eight 520-token prompts on Qwen3.8-Flash-Next at Q3 on a 16 GB card
+            // are a 4,160-row wave whose tier the partition cannot place. Such a
+            // prefill goes in passes, each as wide as the placement will take.
             //
-            // Short prompts are unaffected: every existing gate's prompt is a
-            // few hundred tokens, far below any model's cap, so it still takes
-            // exactly one slice and runs the identical single call it always
-            // did. Only the last slice's logits are kept — they are the ones
-            // that predict the first generated token.
+            // **Priced by the model's own placement arithmetic, not by the width
+            // cap.** `wave_tier_bytes` is the function the placement itself
+            // calls, so a wave this approves is one the placement takes. The cap
+            // is a cruder bound in both directions: it prices a one-sequence
+            // wave, which under-prices a wide fleet, and the trait's default cap
+            // is conservative enough that obeying it cut the Qwen3.8-27B's ×20
+            // prefill into six passes its tier never needed, at a fraction of the
+            // throughput and with the chunk boundaries moved under a calibrated
+            // ladder. A wave that fits runs as the single call it always did. The
+            // cap is printed beside the decision for comparison.
             let cap = model.prefill_width_cap(session.activation_dtype()).max(1);
-            let longest = user_tensors
+            let lens: Vec<usize> = user_tensors
                 .iter()
                 .map(|t| t.dims().last().copied().unwrap_or(0))
-                .max()
-                .unwrap_or(0);
-            let logits_vec = if longest <= cap {
+                .collect();
+            let total: usize = lens.iter().sum();
+            let whole = prefill_pass_fits(model, &session, &sequence_indices, &lens);
+            if repeat == 0 {
+                println!(
+                    "  - prefill: {total} rows across {} sequences, cap {cap} rows per wave{}",
+                    lens.len(),
+                    if whole { "" } else { " — sliced" }
+                );
+            }
+            let logits_vec = if whole {
                 model
                     .forward_wave(
                         &mut session,
@@ -1759,33 +1809,60 @@ impl TestParams {
                     )?
                     .logits_owned()?
             } else {
-                let mut last: Vec<Tensor> = Vec::new();
-                let mut start = 0usize;
-                while start < longest {
-                    // Sequences whose prompt has already been fully submitted
-                    // drop out of the slice rather than being padded: the wave
-                    // takes a ragged batch, and padding would put tokens in
-                    // their KV that the prompt never contained.
-                    let mut idx: Vec<usize> = Vec::new();
-                    let mut parts: Vec<Tensor> = Vec::new();
-                    for (&seq, t) in sequence_indices.iter().zip(user_tensors.iter()) {
-                        let len = t.dims().last().copied().unwrap_or(0);
-                        if start >= len {
-                            continue;
-                        }
-                        let take = cap.min(len - start);
-                        idx.push(seq);
-                        parts.push(t.narrow(t.rank() - 1, start, take)?);
-                    }
-                    if idx.is_empty() {
+                // Each pass gives every sequence still prefilling an equal share
+                // of the cap. Sequences whose prompt has been fully submitted
+                // drop out rather than being padded: the wave takes a ragged
+                // batch, and padding would put tokens in their KV that the
+                // prompt never contained. A sequence's logits are kept from the
+                // pass that submitted its last token — a shorter prompt finishes
+                // a pass before a longer one, and only that pass predicts its
+                // first generated token.
+                let mut done = vec![0usize; lens.len()];
+                let mut finals: Vec<Option<Tensor>> = vec![None; lens.len()];
+                loop {
+                    let active: Vec<usize> =
+                        (0..lens.len()).filter(|&i| done[i] < lens[i]).collect();
+                    if active.is_empty() {
                         break;
                     }
-                    last = model
+                    let idx: Vec<usize> = active.iter().map(|&i| sequence_indices[i]).collect();
+                    let takes_at = |step: usize| -> Vec<usize> {
+                        active
+                            .iter()
+                            .map(|&i| step.min(lens[i] - done[i]))
+                            .collect()
+                    };
+                    // Starting from every remaining row, narrowed until the
+                    // pass as composed (this many sequences at these depths)
+                    // fits — the widest pass the placement will take.
+                    let mut step = active.iter().map(|&i| lens[i] - done[i]).max().unwrap_or(1);
+                    while step > 1 && !prefill_pass_fits(model, &session, &idx, &takes_at(step)) {
+                        step = (step * 3 / 4).max(1);
+                    }
+                    let takes = takes_at(step);
+                    let mut parts: Vec<Tensor> = Vec::with_capacity(active.len());
+                    for (&i, &take) in active.iter().zip(&takes) {
+                        let t = &user_tensors[i];
+                        parts.push(t.narrow(t.rank() - 1, done[i], take)?);
+                        done[i] += take;
+                    }
+                    let logits = model
                         .forward_wave(&mut session, &[], &[], &idx, &parts, &[], &[], 0, nl, None)?
                         .logits_owned()?;
-                    start += cap;
+                    for (k, &i) in active.iter().enumerate() {
+                        if done[i] == lens[i] {
+                            finals[i] = logits.get(k).cloned();
+                        }
+                    }
                 }
-                last
+                finals
+                    .into_iter()
+                    .collect::<Option<Vec<Tensor>>>()
+                    .ok_or_else(|| {
+                        candle::Error::Msg(
+                            "sliced prefill: a sequence finished without logits".into(),
+                        )
+                    })?
             };
 
             // Idempotence gate: with the truncate above, every repeat runs the

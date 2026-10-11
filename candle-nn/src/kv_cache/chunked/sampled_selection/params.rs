@@ -1211,8 +1211,12 @@ pub const QWEN4EXP_KV_FACTORS: KvErrorThresholdFactors = KvErrorThresholdFactors
     v_low: 2.6,
 };
 
-/// **Qwen3.8-Flash-Next at `Q2_KO` experts** — the 16 GB card's rung
-/// (`quant_ladder`), measured on the RTX 4090 Mobile.
+/// **Qwen3.8-Flash-Next at `Q2_KO` experts** — measured on the RTX 4090 Mobile
+/// while `Q2_KO` was the 16 and 24 GiB cards' rung (`quant_ladder`).
+///
+/// Those cards now run `Q3_KO` experts under this row (`qwen4exp::kv_row`):
+/// wider experts have more margin, so a row placed against `Q2_KO`'s edge
+/// stays valid for them at some cost in ratio. The brackets below are `Q2_KO`'s.
 ///
 /// A row per expert format because the design calls for one
 /// (`docs/qwen38_flash_next.md` §Phase 6: "per machine and per expert format"),

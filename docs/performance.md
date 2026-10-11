@@ -399,8 +399,19 @@ The measurement consequence: **a chunked deep prefill figure is lower than the
 same model submitting the same tokens in one wave.** The chunked path is the one
 reported because it is the only configuration that spans every depth, and
 because it is what the production scheduler does. Prompts below a model's cap —
-every width-ladder row, and the 8K depth rows — take exactly one slice and are
-unaffected.
+the 8K depth rows — take exactly one slice and are unaffected.
+
+**The width gates slice only a wave that cannot be placed.** Their harness
+(`batch_test::utils`) prices the wave as composed — every sequence's rows, the
+tier `wave_tier_bytes` gives them, and their whole-region KV — against the
+model's `prefill_ground_bytes`, and submits it whole when it fits. The width cap
+prices a one-sequence wave, so it is printed beside the decision but does not
+make it: obeying it cut the Qwen3.8-27B's ×20 prefill into six passes its tier
+never needed. A wave that does not fit goes in passes as wide as the placement
+takes. In the 2026-10-11 sweep on the 16 GB card that was 11 rows: four of the
+Qwen3.8-27B's and four of the Qwen3-30B-A3B's, where the KV ground free at that
+moment was small, and three of Qwen3.8-Flash-Next's 4,160-row ×8 Q3_KO waves.
+Every other row went whole.
 
 ### 2.7 The span must be sized before the weights load
 
@@ -1134,8 +1145,9 @@ non-finite layer. **The Qwen3-30B and Flash-Next probes failed the 90% efficienc
 gate with KV compaction running**: 3,008 MiB and 1,264 MiB of the ground denied
 to the weight side were not holding KV. At `7aecbeab3` (2026-10-07) they read 99%
 and 97%. The 72 GB card recorded the same gate as open on 2026-10-10, flipping
-between about 80% and 99% from run to run; 59% is below that range. The cause is
-not yet established.
+between about 80% and 99% from run to run; 59% is below that range. §4 records
+the cause, found on the 16 GB card on 2026-10-11: a compaction settle bounded at
+four plan-capped passes.
 
 At `7aecbeab3` compaction stopped relocating every tenant's arenas into any hole
 below the frontier — an arena under another tenant's live region was emptied into
@@ -1641,6 +1653,44 @@ reached names (up to 41,022 of a pass's moves), and a pass running out of
 pre-provisioned record slots mid-sweep — relocations whose sources are then not
 reclaimed. The earlier runs logged neither. Which change introduced them, and
 whether they account for the shortfall, is not yet established.
+
+**Cause and fix (2026-10-11).** Read pass by pass, the shortfall is a retirement
+burst that the wave loop's compaction settle stopped clearing part-way. Each pass
+plans at most `PLANNED_MOVES_PER_POOL` moves a pool (`compact.rs`), which here is
+~75,000 moves and 12–16 arenas a pass, every pass reporting `plan_capped` and none
+clipped by its 80 ms clock. The settle ran a fixed four passes (~52 regions)
+against bursts of 75–120 regions of air, so the remainder stood through the next
+forward and the publish after it: 66%, 71% and 75% worst sustained on three runs
+at the same build, and 92% on a fourth where the burst happened to fall between
+publishes. The settle now runs passes until one finishes its plan or gains no
+ground — the frontier did not fall and the pass released no more arenas than it
+created (`scheduler::prefill::settle_passes`) — and two runs then read **100%
+worst sustained** (single samples 89% and 88%), story 20/20, uptake 93% and 91%.
+The Flash-Next probe at the same build is unchanged at 100% (8/8, uptake 106%).
+A clearing settle costs ~65 ms a pass, about 0.6 s for the largest burst
+measured.
+
+Two more defects came out of reading the same runs.
+
+- **Compaction declined thousands of record moves a pass.** A pass reserves a
+  record slot per relocated chunk, and sized that reservation at moves divided
+  by bands per chunk (32 here). Only some of a chunk's bands move when the
+  frontier's arenas are drained, so ~115,000 moves touched ~8,000 chunks against
+  a reservation for ~3,600; the rest were declined, and the frontier held at 400
+  regions for a dozen passes in a row. The reservation is now one record per
+  move, its true upper bound (`compact.rs`). Every pass since reads
+  `records_declined=0`.
+- **VRAM relief stalled the scheduler for 5–8 s at a time.** Relief waits for
+  the persistence thread to move turns warm before it can evict them, and that
+  wait covered the whole backlog, the cold writes and the maintenance after it,
+  and the pass already in flight when relief asked. A flush now carries the
+  bytes relief is short of, is taken up by a pass already running, and is
+  answered as soon as that much is installed warm (`persistence::flush`).
+  The hot→warm copy's host scatter writes each band straight into its slab and
+  claims slots in bulk (~1.4 → ~0.7 µs a band). Worst relief across a probe run
+  went from 5.0–8.0 s to 2.9 s; what remains is the hot→warm quantize and copy
+  themselves, ~0.8 s per 110 MiB group, which the relief log line now breaks out
+  (`pack_ms`, `evict_ms`, `flush_ms`, `concede_ms`).
 
 ### Validation at extreme width under maximum compression
 

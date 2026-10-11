@@ -40,6 +40,9 @@ pub mod loader;
 pub mod model;
 pub mod moe;
 pub mod mtp;
+/// Building the lineage's model pack: its sources composed, its section written.
+#[cfg(feature = "cuda")]
+pub(crate) mod pack_build;
 #[cfg(feature = "cuda")]
 pub mod quantized_attention;
 pub mod quantized_delta_net;
@@ -68,4 +71,4 @@ pub use tensor_override::{TensorOverride, TensorOverrides};
 #[cfg(feature = "cuda")]
 pub use batched::HybridBatched;
 #[cfg(feature = "cuda")]
-pub use quantized_loader::{load_hybrid_gguf, Qwen35LoadOptions};
+pub use quantized_loader::load_hybrid_pack;

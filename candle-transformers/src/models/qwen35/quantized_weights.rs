@@ -41,6 +41,7 @@ use crate::models::dense_span;
 use crate::models::expert_lre::ExpertCache;
 use crate::models::host_embedding::HostEmbedding;
 use crate::models::layer_stream::LayerTensor;
+use crate::models::model_pack::compose::checkpoint_bytes_of;
 use crate::models::quantized_matmul::{QMatMul, WeightResidency};
 use crate::models::quantized_mlp::QuantizedMlp;
 #[cfg(feature = "cuda")]
@@ -128,7 +129,7 @@ pub(crate) struct PendingLayer {
 ///
 /// Extracted from [`load_quantized_model`]'s loop rather than inlined in it,
 /// because a layer's tensors are also read **one at a time and then dropped**
-/// by the layer-streaming pack build (`docs/qwen38_layer_streaming.md` §12.2):
+/// by the layer-streaming pack build (`docs/archived/qwen38_layer_streaming.md` §12.2):
 /// it repacks each layer, writes the record, and lets the layer go, so its peak
 /// is one layer rather than the whole model. Two transcriptions of a layer's
 /// tensor names would be two chances for the pack to describe a layer the
@@ -249,8 +250,9 @@ fn load_mtp_head<R: Read + Seek>(
     // the trunk's geometry — so it takes the same `pending_ffn` the trunk layers
     // take and the same deferred resolve, and its experts land at the
     // `moe_layer_idx` straight after the last trunk MoE layer.
-    // `expert_host_refs` walks the checkpoint in that same order, so the cache
-    // holds the head's experts at exactly the index the router asks for.
+    // The pack's expert section holds the blocks in that same order
+    // (`model_pack::experts::qwen_expert_blocks`), so the cache holds the head's
+    // experts at exactly the index the router asks for.
     let block = PendingLayer {
         // Built by the SAME helpers a trunk layer is: `Loader::attention` and
         // `pending_ffn` already read exactly these tensor names, because the
@@ -346,9 +348,9 @@ pub fn load_residue<R: Read + Seek>(
 ///
 /// `moe_layer_idx_next` is that counter, threaded through so the head — built
 /// after the trunk loop — takes the index straight after the last trunk MoE
-/// layer. `expert_host_refs` enumerates the checkpoint in the same order (trunk
-/// layers, then the head), so the two agree by construction rather than by
-/// coincidence.
+/// layer. The pack's expert section holds the blocks in the same order (trunk
+/// layers, then the head — `model_pack::experts::qwen_expert_blocks`), so the
+/// two agree by construction rather than by coincidence.
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 fn pending_ffn<R: Read + Seek>(
     g: &mut Loader<'_, R>,
@@ -1255,15 +1257,16 @@ const NARROW_TWIN: GgmlDType = GgmlDType::Q3_KO;
 ///
 /// *Tight*, meaning the checkpoint does not fit in the card with room to serve from. When it
 /// does fit, every layer is resident, no byte crosses PCIe after load, and narrowing would be
-/// giving up precision for memory nobody needs. The comparison is against the GGUF's own size
-/// plus the KV side's opening reserve, both known before a tensor is read.
+/// giving up precision for memory nobody needs. The comparison is against `checkpoint_bytes` —
+/// everything the checkpoint's tensors weigh, which the model pack records at build time — plus
+/// the KV side's opening reserve.
 ///
 /// Returns `None` when either half fails, and `None` is the whole of the "off" path — there is
 /// no second code path here, only a twin that is or is not overridden.
 pub(crate) fn narrow_resident_twin(
     device: &Device,
     cfg: &Qwen35Config,
-    content: &gguf_file::Content,
+    checkpoint_bytes: u64,
 ) -> Option<GgmlDType> {
     if cfg.moe.is_some() {
         return None;
@@ -1272,19 +1275,9 @@ pub(crate) fn narrow_resident_twin(
         return None;
     };
     let total = candle::quantized::get_vram_info().ok()?.1;
-    // Everything the checkpoint's tensors weigh, from the header — the same arithmetic the
-    // ladder uses, and free.
-    let weights: usize = content
-        .tensor_infos
-        .values()
-        .map(|i| {
-            let elems: usize = i.shape.dims().iter().product();
-            elems / i.ggml_dtype.block_size() * i.ggml_dtype.type_size()
-        })
-        .sum();
     // "Tight" is: the weights plus the KV side's opening reserve do not both fit. A model that
     // clears this has slots for every layer and nothing to gain here.
-    let needed = weights + candle_nn::kv_cache::INITIAL_KV_RESERVE;
+    let needed = checkpoint_bytes as usize + candle_nn::kv_cache::INITIAL_KV_RESERVE;
     (needed > total).then_some(NARROW_TWIN)
 }
 
@@ -1368,7 +1361,7 @@ impl LoadInputs<'_, NoExperts, ResidentLayers> {
     /// What a test harness wants — it dequantizes projections to build a
     /// reference, which needs the weights in hand rather than a slot's view of
     /// them — and never what production wants, since §7 of
-    /// `docs/qwen38_layer_streaming.md` streams every dense checkpoint.
+    /// `docs/archived/qwen38_layer_streaming.md` streams every dense checkpoint.
     pub fn resident() -> Self {
         Self {
             host_embed: None,
@@ -1426,7 +1419,7 @@ impl LoadInputs<'_, NoExperts, ResidentLayers> {
 /// whatever the caller asked, because its weight is in the experts — which
 /// `expert_lre` already streams — and its per-layer projections are a rounding
 /// error beside them. That is not the fits/does-not-fit branch
-/// `docs/qwen38_layer_streaming.md` §7 forbids: every *dense* checkpoint
+/// `docs/archived/qwen38_layer_streaming.md` §7 forbids: every *dense* checkpoint
 /// streams, and "it fits" is the degenerate case where nothing is ever evicted.
 /// The DeltaNet gate projections, which a conversion may not quantize.
 ///
@@ -1548,7 +1541,10 @@ fn gate_precision_suffices(dtype: GgmlDType) -> bool {
 /// offered: a stack with some layers' gates restored and others still quantized is a model
 /// nobody has measured, and it would degrade in a way that reads as ordinary bad prose
 /// rather than as a fault.
-fn donor_gates(content: &gguf_file::Content, donor: &gguf_file::Content) -> Result<Vec<String>> {
+pub(crate) fn donor_gates(
+    content: &gguf_file::Content,
+    donor: &gguf_file::Content,
+) -> Result<Vec<String>> {
     let mut out = Vec::new();
     // **Repair only what is broken.** A checkpoint whose gates are F32 is correct as it
     // stands, and a donor differing from it anywhere on the recurrent path is then just a
@@ -1679,7 +1675,7 @@ where
     // Whether this load narrows its two permanently-resident weights. A hardware-and-model
     // fact, derived here where both halves are known, rather than a knob: see
     // [`narrow_resident_twin`].
-    let narrow_resident = narrow_resident_twin(device, &cfg, content);
+    let narrow_resident = narrow_resident_twin(device, &cfg, checkpoint_bytes_of(content));
 
     let mut g = Loader::new(content, reader, device, mode, WeightResidency::Span)
         .with_map(map)

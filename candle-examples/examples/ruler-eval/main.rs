@@ -25,13 +25,17 @@ extern crate accelerate_src;
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
+use std::path::Path;
+
 use candle::quantized::gguf_file;
 use candle::{Device, Result, Tensor};
+use candle_examples::model_pack::pack_checkpoint;
 use candle_transformers::model_overrides::{self, Checkpoint};
 use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
 };
 use candle_transformers::models::batched_model::BatchedInference;
+use candle_transformers::models::model_pack::PackFamily;
 use candle_transformers::models::rope_schedule::{DeclaredScaling, RopePreset, RopeSchedule};
 use candle_transformers::models::{
     quantized_llama, quantized_qwen2, quantized_qwen3, quantized_qwen3_moe,
@@ -276,11 +280,19 @@ fn gguf_rope_theta(content: &gguf_file::Content) -> Result<f32> {
 }
 
 impl Model {
-    fn load(arch: &ModelArch, model_path: &std::path::Path, device: &Device) -> Result<Self> {
+    /// `tokenizer_repo` is what a routed model's pack records with its
+    /// checkpoint, which it is built from on first use (`pack_checkpoint`).
+    fn load(
+        arch: &ModelArch,
+        model_path: &Path,
+        tokenizer_repo: &str,
+        device: &Device,
+    ) -> Result<Self> {
         match arch {
             ModelArch::Qwen3Moe => {
-                let m =
-                    quantized_qwen3_moe::ModelWeights::from_gguf_by_path(model_path, device, None)?;
+                let pack =
+                    pack_checkpoint(PackFamily::Routed, model_path, tokenizer_repo, None, device)?;
+                let m = quantized_qwen3_moe::ModelWeights::from_pack(&pack, device, None)?;
                 Ok(Model::Qwen3Moe(m))
             }
             _ => {
@@ -721,7 +733,12 @@ fn main() -> anyhow::Result<()> {
         args.model.name(),
         args.compression.label()
     );
-    let model = Model::load(&args.model.arch(), &model_path, &device)?;
+    let model = Model::load(
+        &args.model.arch(),
+        &model_path,
+        args.model.tokenizer_repo(),
+        &device,
+    )?;
     let batched = BatchedModel::from_model(model, &device)?;
     println!("Model loaded.");
 

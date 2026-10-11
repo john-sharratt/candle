@@ -11,7 +11,7 @@
 //! checkpoint outweighs the card at every rung, so the trunk's layers stream
 //! through the weight zone the way a MoE model's experts do — hot VRAM slots
 //! over pinned host RAM over a repacked `.pack` beside the GGUF, on the
-//! deterministic held-prefix schedule in `docs/qwen38_layer_streaming.md` §9.5.
+//! deterministic held-prefix schedule in `docs/archived/qwen38_layer_streaming.md` §9.5.
 //! Which rung it streams is a VRAM measurement, not a fit test: see
 //! [`QWEN38_27B_LADDER`].
 
@@ -22,7 +22,7 @@ use candle_nn::kv_cache::QWEN38_KV_FACTORS;
 
 use crate::models::draft_ladder::QWEN38_27B_DRAFT;
 
-use super::qwen35::{load_hybrid_gguf, HybridBatched, Qwen35LoadOptions};
+use super::qwen35::{load_hybrid_pack, HybridBatched};
 
 /// The 3.8 tokenizer, pinned to the canonical base-repo revision.
 pub const TOKENIZER_REPO: &str = "Qwen/Qwen3.8-27B";
@@ -94,7 +94,7 @@ pub const QWEN38_27B_MTP: (&str, &str, &str) = (
 /// # The thresholds are about residency, not about fitting
 ///
 /// A dense checkpoint no longer has to fit — layer streaming runs the 27B on a
-/// 16 GB card at any of these quants (`docs/qwen38_layer_streaming.md`). What
+/// 16 GB card at any of these quants (`docs/archived/qwen38_layer_streaming.md`). What
 /// the rung buys is **how much of the model stays resident**, and therefore how
 /// many bytes cross PCIe on every forward. So the ladder is not "the largest
 /// quant that fits" but "the largest quant whose residency the card can still
@@ -196,21 +196,17 @@ fn rung_for(total: usize) -> (&'static str, &'static str, &'static str) {
         .unwrap_or(QWEN38_27B_Q3KM)
 }
 
-/// Load the dense Qwen3.8 checkpoint and wrap it for the scheduler.
+/// Load the dense Qwen3.8 model pack and wrap it for the scheduler.
 ///
 /// The 27B's concrete entry (the arch string is `qwen35`): refuses a routed
-/// checkpoint, which would stand up an expert cache the caller did not plan
-/// VRAM for, and constructs the lineage's [`HybridBatched`] with the 27B's
-/// KV threshold factor row (derived 2026-08-28 — see `QWEN38_KV_FACTORS`).
-pub fn from_gguf_path(
-    file_path: &Path,
-    device: &Device,
-    options: Qwen35LoadOptions,
-) -> Result<HybridBatched> {
-    let model = load_hybrid_gguf(file_path, device, options)?;
+/// model, which would stand up an expert cache the caller did not plan VRAM
+/// for, and constructs the lineage's [`HybridBatched`] with the 27B's KV
+/// threshold factor row (derived 2026-08-28 — see `QWEN38_KV_FACTORS`).
+pub fn from_pack(path: &Path, device: &Device) -> Result<HybridBatched> {
+    let model = load_hybrid_pack(path, device)?;
     if model.cfg.moe.is_some() {
         candle::bail!(
-            "quantized_qwen38: {file_path:?} is a routed (MoE) checkpoint — \
+            "quantized_qwen38: {path:?} is a routed (MoE) model — \
              load it through quantized_qwen35_moe or quantized_qwen36_moe instead"
         );
     }
@@ -220,12 +216,14 @@ pub fn from_gguf_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::batch_test::test_helpers::hf_get;
+    use crate::models::batch_test::test_helpers::{gate_pack, hf_get};
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
     use crate::models::dialect::Dialect;
+    use crate::models::model_pack::{PackFamily, PackRequest};
     use candle::quantized::Int8Mode;
     use hf_hub::RepoType;
+    use std::path::PathBuf;
 
     /// The filename [`rung_for`] lands on — the assertions below read better
     /// against a name than against a triple.
@@ -288,16 +286,12 @@ mod tests {
         std::fs::read_to_string(&p).map_err(|e| candle::Error::Msg(format!("read {p:?}: {e}")))
     }
 
-    /// The checkpoint for this card, downloaded. Takes the device because the
+    /// The model pack for this card's checkpoint at `mode`, its draft head
+    /// folded in from the sidecar. Takes the device because the checkpoint
     /// choice is a VRAM measurement — see [`checkpoint_for_this_card`].
-    fn pinned(device: &Device) -> Result<std::path::PathBuf> {
-        let (total, (repo, rev, file)) = checkpoint_for_this_card(device)?;
-        let gib = total as f64 / (1024.0 * 1024.0 * 1024.0);
-        println!("  - Card: {gib:.1} GiB total → checkpoint {repo} @ {file}");
-        hf_get(repo, RepoType::Model, rev, file)
-    }
-
-    /// The NextN draft head that goes with the checkpoint this card runs.
+    ///
+    /// The NextN draft head that goes with the checkpoint, the pack's `mtp`
+    /// source.
     ///
     /// **The 27B keeps its head in a separate file**, unlike the 3.5/3.6, whose
     /// `-MTP-GGUF` repos embed the NextN tensors in the checkpoint. ggml-org
@@ -319,10 +313,21 @@ mod tests {
     /// its own repository and revision, because only ggml-org converts the
     /// sidecar — and it does not vary with the rung, since the same losslessness
     /// argument that permits Q4_0 permits a Q4_0 head in front of a Q8_0 trunk.
-    #[cfg(test)]
-    fn pinned_mtp_head() -> Result<std::path::PathBuf> {
-        let (repo, rev, file) = QWEN38_27B_MTP;
-        hf_get(repo, RepoType::Model, rev, file)
+    fn pinned_pack(device: &Device, mode: Int8Mode) -> Result<PathBuf> {
+        let (total, checkpoint) = checkpoint_for_this_card(device)?;
+        let gib = total as f64 / (1024.0 * 1024.0 * 1024.0);
+        println!(
+            "  - Card: {gib:.1} GiB total → checkpoint {} @ {}",
+            checkpoint.0, checkpoint.2
+        );
+        let request = PackRequest::of(
+            PackFamily::Qwen35,
+            checkpoint,
+            (TOKENIZER_REPO, TOKENIZER_REV),
+            Some(mode),
+        )
+        .with_source("mtp", QWEN38_27B_MTP);
+        gate_pack(&request, device)
     }
 
     /// The story-rewrite gate on the 27B — the same shape as the dense 9B
@@ -342,10 +347,10 @@ mod tests {
     /// Unsloth Dynamic quant carrying IQ4_XS tensors this codebase cannot read.
     #[test]
     #[ignore = "downloads the Qwen3.8-27B GGUF this card's rung names (14.6 GB at \
-                Q3_K_M through 29.1 GB at Q8_0 — see QWEN38_27B_LADDER) and builds a \
-                layer pack beside it on first run. Runs on a 16 GB card: \
+                Q3_K_M through 29.1 GB at Q8_0 — see QWEN38_27B_LADDER) and builds its \
+                model pack on first run. Runs on a 16 GB card: \
                 the layers are weight-zone slot tenants and the ones that do not fit \
-                stream (docs/qwen38_layer_streaming.md), so this is no longer a \
+                stream (docs/archived/qwen38_layer_streaming.md), so this is no longer a \
                 production-workstation gate. Decode is bandwidth-bound there and slow \
                 by construction — see §9.2. Run with: \
                 cargo test --release --features cuda --lib -p candle-transformers \
@@ -356,7 +361,6 @@ mod tests {
         // Device first: the checkpoint is chosen from a VRAM measurement, and
         // `get_vram_info` needs a live CUDA context to answer.
         let device = Device::new_cuda(0)?;
-        let model_path = pinned(&device)?;
 
         // One value for both the loader and the table's `int8` column, held at
         // `Performance` — same reasoning as the lineage's other gates.
@@ -524,22 +528,12 @@ mod tests {
             );
         }
 
-        // The drafter's own file — see `pinned_mtp_head`. Without it every row
-        // of this table runs `draft budget 0`.
-        let mtp_path = pinned_mtp_head()?;
+        // The pack carries the drafter from its own file — see `pinned_pack`.
+        // Without it every row of this table runs `draft budget 0`.
+        let pack = pinned_pack(&device, int8mode)?;
 
         let load = || {
-            let m = from_gguf_path(
-                &model_path,
-                &device,
-                Qwen35LoadOptions {
-                    int8mode: Some(int8mode),
-                    expert_pack_dir: None,
-                    mtp_path: Some(mtp_path.clone()),
-                    gate_donor_path: None,
-                    tensor_overrides: Vec::new(),
-                },
-            )?;
+            let m = from_pack(&pack, &device)?;
             let cfg = &m.model().cfg;
             // The flagship must still be the geometry this engine was audited
             // for (§3's constraint check) — a silent architecture change fails
@@ -566,9 +560,8 @@ mod tests {
         use crate::models::batch_test::long_context::{long_context_gate, DepthTask};
 
         let device = Device::new_cuda(0)?;
-        let model_path = pinned(&device)?;
-        let mtp_path = pinned_mtp_head()?;
         let int8mode = Int8Mode::Performance;
+        let pack = pinned_pack(&device, int8mode)?;
         long_context_gate(
             "Qwen3.8-27B (hybrid dense)",
             int8mode,
@@ -587,19 +580,7 @@ mod tests {
             64,
             DepthTask::Coherence,
             &device,
-            || {
-                from_gguf_path(
-                    &model_path,
-                    &device,
-                    Qwen35LoadOptions {
-                        int8mode: Some(int8mode),
-                        expert_pack_dir: None,
-                        mtp_path: Some(mtp_path.clone()),
-                        gate_donor_path: None,
-                        tensor_overrides: Vec::new(),
-                    },
-                )
-            },
+            || from_pack(&pack, &device),
         )
     }
 
@@ -619,9 +600,9 @@ mod tests {
     /// above: dense at 16.5 GB leaves no room on a 16 GB card.
     #[test]
     #[ignore = "downloads the Qwen3.8-27B GGUF this card's rung names (14.6 GB at Q3_K_M \
-                on the 16 GB card) and builds a layer pack beside it on first run, plus \
-                the 1.7 GB MTP sidecar. Runs on a 16 GB card through layer streaming \
-                (docs/qwen38_layer_streaming.md), where decode is bandwidth-bound: the \
+                on the 16 GB card) and the 1.7 GB MTP sidecar, and builds its model pack \
+                on first run. Runs on a 16 GB card through layer streaming \
+                (docs/archived/qwen38_layer_streaming.md), where decode is bandwidth-bound: the \
                 speedup a drafter buys is real but it is a multiple of a small number. \
                 Run with: \
                 cargo test --release --features cuda --lib -p candle-transformers \
@@ -632,12 +613,10 @@ mod tests {
         use crate::models::qwen35::mtp::MTP_MAX_DRAFT;
 
         // Device first — the checkpoint choice is a VRAM measurement.
-        let probe = Device::new_cuda(0)?;
-        let model_path = pinned(&probe)?;
-        let mtp_path = pinned_mtp_head()?;
         let int8mode = Int8Mode::Performance;
         let tok = tokenizer_json()?;
         let device = Device::new_cuda(0)?;
+        let pack = pinned_pack(&device, int8mode)?;
         speculative_gate(
             "Qwen3.8-27B",
             int8mode,
@@ -647,17 +626,7 @@ mod tests {
             &device,
             move || {
                 let device = Device::new_cuda(0)?;
-                let m = from_gguf_path(
-                    &model_path,
-                    &device,
-                    Qwen35LoadOptions {
-                        int8mode: Some(int8mode),
-                        expert_pack_dir: None,
-                        mtp_path: Some(mtp_path.clone()),
-                        gate_donor_path: None,
-                        tensor_overrides: Vec::new(),
-                    },
-                )?;
+                let m = from_pack(&pack, &device)?;
                 assert!(
                     m.has_drafter(),
                     "the pinned 27B declares an MTP head but none loaded — the pin has \

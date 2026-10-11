@@ -20,11 +20,9 @@ use super::dispatch::{Dispatch, OwnerTags};
 use super::link_rate::measure_link_rate;
 #[cfg(feature = "cuda")]
 use super::live_table::LiveTable;
+use super::pack::ExpertPack;
 #[cfg(feature = "cuda")]
-use super::pack::{
-    open_or_create, repack_fingerprint, LayerSpansInput, PackIdentity, PackSource, PackSpec,
-    RecordLayout,
-};
+use super::pack::RecordLayout;
 #[cfg(feature = "cuda")]
 use super::pad::Pad;
 #[cfg(feature = "cuda")]
@@ -38,19 +36,18 @@ use super::residency::Residency;
 #[cfg(feature = "cuda")]
 use super::routing_trace::RoutingTrace;
 #[cfg(feature = "cuda")]
+use super::section::geometries_of;
+#[cfg(feature = "cuda")]
 use super::slot_image::{row_tile_bytes_for, slot_bytes_for, slot_offsets};
 #[cfg(feature = "tensor-assert")]
 use super::slot_owners::SlotOwners;
 #[cfg(feature = "cuda")]
 use super::stager::{spawn_stager, StagerCtx, StagerMsg};
 #[cfg(feature = "cuda")]
-use super::startup::{
-    startup_from_pack, startup_pinned_prefix, startup_repack, StartupRing, StartupTargets,
-    PACK_TAIL_STEPS,
-};
+use super::startup::{startup_from_pack, StartupRing, StartupTargets, PACK_TAIL_STEPS};
 #[cfg(feature = "cuda")]
 use super::types::LookAhead;
-use super::types::{BoundaryAsk, MmapExpertRef, PipelineMessage, PipelineStats};
+use super::types::{BoundaryAsk, PipelineMessage, PipelineStats};
 #[cfg(feature = "cuda")]
 use super::warm_tier::WarmTier;
 use crate::models::profile::ProfileSnapshot;
@@ -459,10 +456,9 @@ pub struct ExpertCache {
 /// `max_expert_size` here, and the zone's capacity is that same quotient taken
 /// once, against a span whose extent is a fact rather than a forecast.
 pub struct ExpertCacheSetup<'a> {
-    /// The GGUF, mapped. Read only while the pack is being built.
-    pub mmap: Arc<memmap2::Mmap>,
-    /// Per-`[layer][expert]` byte ranges into that mapping.
-    pub host_refs: Vec<Vec<MmapExpertRef>>,
+    /// The model pack's expert section, opened — every expert of every layer,
+    /// and the geometry the cache sizes itself from (`section::geometries_of`).
+    pub(crate) pack: ExpertPack,
     /// The weight side of the device reservation.
     pub zone: WeightZone,
     pub device: &'a Device,
@@ -470,22 +466,19 @@ pub struct ExpertCacheSetup<'a> {
     /// Experts each token routes to (top-k) — sizes the bucketize workspace and
     /// is checked against the router's bound.
     pub experts_used: usize,
-    /// The checkpoint the experts come from — names the pack and identifies it.
-    pub gguf_path: &'a Path,
-    /// Where a persistent pack lives, or `None` for a temp file that is
-    /// unlinked as soon as it is open and costs a repack every boot.
-    pub expert_pack_dir: Option<&'a Path>,
     pub progress: Option<&'a dyn Fn(usize, usize)>,
     pub int8mode: Int8Mode,
-    /// Mapped bytes outside the experts that host RAM never serves after load —
-    /// read through a bounded cache of the model's own (net of that cache's
-    /// RAM), or uploaded to the device once and never read from the file again.
-    /// Flash-Next's n-gram table is 54 GB of the mapping read through a 2 GiB row
-    /// cache, and its dense stack is 5.2 GiB living on the card; left counted as
-    /// live weight, the host budget reserves them as page cache out of the warm
-    /// tier's RAM. `0` for a model whose whole non-expert mapping is paged —
-    /// one that reads a weight from the mapping at run time, such as a
-    /// host-mapped embedding gather.
+    /// Bytes the loader mapped of the model pack — its GGUF part, which holds
+    /// every tensor but the experts.
+    pub mapped_bytes: u64,
+    /// Of `mapped_bytes`, those host RAM never serves after load — read through
+    /// a bounded cache of the model's own (net of that cache's RAM), or uploaded
+    /// to the device once and never read from the file again. Flash-Next's
+    /// n-gram table is 54 GB of the mapping read through a 2 GiB row cache, and
+    /// its dense stack is 5.2 GiB living on the card; left counted as live
+    /// weight, the host budget reserves them as page cache out of the warm
+    /// tier's RAM. `0` for a model whose whole mapping is paged — one that reads
+    /// a weight from the mapping at run time.
     pub offloaded_bytes: u64,
 }
 
@@ -502,25 +495,21 @@ impl ExpertCache {
 
     /// Create a new expert cache with a background pipeline thread.
     ///
-    /// Opens the pack file for this checkpoint — building it by repacking every
-    /// expert out of the GGUF if there is not already a matching one — then
-    /// fills the warm and hot tiers from it, and builds the live pointer table
-    /// over the hot tier. After startup the GGUF's expert regions are never read
-    /// again. Requires an actual CUDA device: a cuda-feature build handed a CPU
-    /// device fails here rather than later.
+    /// Fills the warm and hot tiers from the model pack's expert section and
+    /// builds the live pointer table over the hot tier. Requires an actual CUDA
+    /// device: a cuda-feature build handed a CPU device fails here rather than
+    /// later.
     #[cfg(feature = "cuda")]
     pub fn new(setup: ExpertCacheSetup<'_>) -> Result<Self> {
         let ExpertCacheSetup {
-            mmap,
-            host_refs,
+            pack,
             zone,
             device,
             experts_per_layer,
             experts_used,
-            gguf_path,
-            expert_pack_dir,
             progress,
             int8mode,
+            mapped_bytes,
             offloaded_bytes,
         } = setup;
         // Experts run only on the KO int8 tensor-core path: the FP GEMX kernel
@@ -539,12 +528,26 @@ impl ExpertCache {
                  selected Off; pass an explicit int8 mode that this GPU supports."
             );
         }
-        let num_moe_layers = host_refs.len();
+        // The section was packed for one numeric mode and one expert count; a
+        // load asking for another would read records laid out for something
+        // else.
+        let header = pack.header();
+        if header.int8_mode != int8mode as u32
+            || header.experts_per_layer as usize != experts_per_layer
+        {
+            candle::bail!(
+                "expert cache: the pack holds {} experts per layer packed for int8 mode {}, the \
+                 load asks for {experts_per_layer} at {int8mode:?}",
+                header.experts_per_layer,
+                header.int8_mode
+            );
+        }
+        let num_moe_layers = header.layers.len();
         let num_slots = zone.capacity();
         // **The pinned set must be affordable before anything is loaded.**
         //
-        // `PINNED_LAYERS` is fixed, and those layers have no record in the pack
-        // and no slot in the warm tier — so a zone too small to hold them plus
+        // `PINNED_LAYERS` is fixed, and those layers have no slot in the warm
+        // tier and are never evicted — so a zone too small to hold them plus
         // one layer's worst-case routed set does not degrade, it stops: every
         // resident slot ends up holding an expert the eviction scan is forbidden
         // to touch, and every load from then on fails permanently. The zone's
@@ -586,75 +589,33 @@ impl ExpertCache {
         // ── CUDA startup: the pack, then the resident tiers from it ──
         let (pack, warm, pad, residency, layer_geometries, all_resident, can_fault) =
             if let Device::Cuda(cuda_dev) = device {
-                let geoms = super::pinned::layer_geometries(&host_refs, int8mode)?;
+                let geoms = geometries_of(pack.header())?;
                 let total_experts = num_moe_layers * experts_per_layer;
                 let all_resident = num_slots >= total_experts;
 
-                // **The GGUF's expert regions become dead pages here.** They are
-                // read once — streaming, to build the pack — and never again:
-                // every later load comes from the pack, the warm pool, or VRAM.
-                // The loader declared the whole mapping as resident weight
-                // bytes, which is right for a dense model where the mmap *is*
-                // the weight source, and wrong here by 16.6 GiB of a 18.6 GB
-                // file. That reservation is subtracted from the host-RAM budget
-                // the warm tier is then sized out of, so leaving it in place
-                // does not merely misreport — it takes the RAM away from the
-                // tier whose whole job is to stop those pages being needed.
-                let expert_source_bytes: u64 = host_refs
-                    .iter()
-                    .flatten()
-                    .map(|r| (r.gate_len + r.up_len + r.down_len) as u64)
-                    .sum();
-                // The same holds for any other region a bounded cache of the
-                // model's own serves (`offloaded_bytes`): its pages are not the
-                // page cache's to keep.
-                let live_weight_bytes = (mmap.len() as u64)
-                    .saturating_sub(expert_source_bytes)
-                    .saturating_sub(offloaded_bytes);
+                // The mapping is the model pack's GGUF part — every tensor but
+                // the experts — so all of it is live weight except what a
+                // bounded cache of the model's own serves (`offloaded_bytes`):
+                // those pages are not the page cache's to keep. That figure is
+                // subtracted from the host-RAM budget the warm tier is then
+                // sized out of, so overstating it would take the RAM away from
+                // the tier whose whole job is to keep experts off the disk.
+                let live_weight_bytes = mapped_bytes.saturating_sub(offloaded_bytes);
                 candle::vram::set_weights_mmap(live_weight_bytes);
                 tracing::info!(
                     target: "candle_transformers::expert_lre",
-                    mapped_gib = mmap.len() as f64 / 1e9,
-                    dead_gib = expert_source_bytes as f64 / 1e9,
+                    mapped_gib = mapped_bytes as f64 / 1e9,
                     offloaded_gib = offloaded_bytes as f64 / 1e9,
                     live_gib = live_weight_bytes as f64 / 1e9,
-                    "expert cache: the GGUF's expert pages are the pack's job now"
+                    "expert cache: live weight bytes of the mapping"
                 );
 
                 // The pack's record layout **is** the VRAM slot's layout: same
                 // three projections, same aligned offsets. One geometry, so a
                 // load is a read and a copy with nothing rearranged in between.
                 let slot_bytes = slot_bytes_for(&geoms);
-                let layers: Vec<LayerSpansInput> = geoms
-                    .iter()
-                    .map(|g| {
-                        let (gate, up, down, _) = slot_offsets(g);
-                        LayerSpansInput {
-                            gate: (gate, g.gate_repacked_size, g.gate_dtype),
-                            up: (up, g.up_repacked_size, g.up_dtype),
-                            down: (down, g.down_repacked_size, g.down_dtype),
-                        }
-                    })
-                    .collect();
                 let layouts: Vec<RecordLayout> =
-                    layers.iter().copied().map(RecordLayout::from).collect();
-                // Run the repack over a reference matrix in every quantisation
-                // the engine supports, and hash it. The pack's validity is then
-                // checked against what this build *produces* and not only
-                // against where it would put it — see `pack::fingerprint`.
-                let source = open_or_create(PackSpec {
-                    dir: expert_pack_dir,
-                    gguf_path,
-                    identity: PackIdentity::of(&mmap, int8mode, repack_fingerprint(cuda_dev)),
-                    num_layers: num_moe_layers,
-                    experts_per_layer,
-                    // The leading layers the cache pins permanently. They are
-                    // never evicted, so they are never reloaded, so the pack
-                    // holds no records for them.
-                    pinned_layers: pinned_layer_count(num_moe_layers),
-                    slot_bytes,
-                    layers,
-                })?;
+                    (0..num_moe_layers).map(|l| pack.layout(l)).collect();
 
                 // The warm tier is sized by what the machine can spare, not by
                 // what residency demands — the cold tier serves every expert at
@@ -687,17 +648,6 @@ impl ExpertCache {
                 let evictable = total_experts - pinned * experts_per_layer;
                 let mut residency =
                     vec![vec![ExpertResidency::default(); experts_per_layer]; num_moe_layers];
-                // The pinned prefix, from the checkpoint, before the warm tier
-                // takes the page-lock budget its pageable uploads need.
-                startup_pinned_prefix(
-                    &mut inner,
-                    &mut residency,
-                    &geoms,
-                    &mmap,
-                    &host_refs,
-                    cuda_dev,
-                    progress,
-                )?;
                 let want_warm = if all_resident {
                     0
                 } else {
@@ -744,51 +694,24 @@ impl ExpertCache {
                     geoms: &geoms,
                     layouts: &layouts,
                     stride,
-                    mmap: &mmap,
-                    host_refs: &host_refs,
                 };
-                let pack = match source {
-                    PackSource::Ready(pack) => {
-                        startup_from_pack(
-                            targets,
-                            &pack,
-                            &mut ring,
-                            num_moe_layers,
-                            experts_per_layer,
-                            cuda_dev,
-                            progress,
-                        )?;
-                        pack
-                    }
-                    PackSource::Build(mut writer) => {
-                        startup_repack(targets, &mut writer, &mut ring, cuda_dev, progress)?;
-                        // Publishing flushes and `fsync`s the whole pack — tens
-                        // of gigabytes, and the single largest thing that used
-                        // to happen behind a bar already reading 100%. It is
-                        // charged here, where it is paid, against the room
-                        // `startup_repack` left for it.
-                        let total = num_moe_layers * experts_per_layer;
-                        let t_publish = std::time::Instant::now();
-                        let pack = writer.finish()?;
-                        // Timed and named, because the next line printed used to
-                        // be the residency gauge's and the whole flush was read
-                        // off the log as the gauge being slow. The gauge is three
-                        // arithmetic operations.
-                        tracing::info!(
-                            target: "candle_transformers::expert_lre",
-                            secs = t_publish.elapsed().as_secs_f64(),
-                            "expert pack: published (flush + fsync + reopen)"
-                        );
-                        if let Some(cb) = progress {
-                            cb(total + 1, total + PACK_TAIL_STEPS);
-                        }
-                        pack
-                    }
-                };
-
-                // The pack's stride is what the geometry said it would be — the
-                // buffers above were cut to it before the file was opened.
-                debug_assert_eq!(pack.stride(), stride);
+                // The pack's stride is what the geometry says it is — the
+                // buffers above were cut to it.
+                if pack.stride() != stride {
+                    candle::bail!(
+                        "expert cache: the pack's stride is {} B, its geometry makes {stride} B",
+                        pack.stride()
+                    );
+                }
+                startup_from_pack(
+                    targets,
+                    &pack,
+                    &mut ring,
+                    num_moe_layers,
+                    experts_per_layer,
+                    cuda_dev,
+                    progress,
+                )?;
                 drop(ring);
                 (pack, warm, pad, residency, geoms, all_resident, can_fault)
             } else {

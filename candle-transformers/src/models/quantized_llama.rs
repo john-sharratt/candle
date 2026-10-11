@@ -1857,14 +1857,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Slow without CUDA. Run with: cargo test --release --features cuda,flash-attn -- --ignored test_parallel_batched_forwarding
+    #[ignore]
+    // Run with: cargo test --release --features cuda -- --ignored test_parallel_batched_forwarding_llama3
+    #[cfg(feature = "cuda")]
     fn test_parallel_batched_forwarding_llama3() -> Result<()> {
-        #[cfg(not(all(feature = "cuda")))]
-        println!("⚠ WARNING: This test should be run with --features cuda,flash-attn for optimal performance");
-        #[cfg(not(all(feature = "cuda")))]
-        println!(
-            "⚠ Current build is missing performance-critical features. Results may be slower.\n"
-        );
+        use crate::models::batch_test::test_helpers::plain_pack;
 
         println!("\n=== Setting up Test Parameters ===\n");
 
@@ -1883,20 +1880,29 @@ mod tests {
             .with_print_outputs(false)
             .with_timeout_secs(6800);
 
-        println!("\n=== Loading Model ===\n");
-
-        // Download model from HuggingFace
-        let model_path = llama3_2_3b_path()?;
-
-        println!("Model downloaded to: {:?}", model_path);
-
-        let device = Device::new_cuda(0).map_err(|e| {
-            candle::Error::Msg(format!(
-                "CUDA required for this test: {}. Use --features cuda",
-                e
-            ))
-        })?;
+        let device = Device::new_cuda(0)?;
         println!("Using device: {:?}\n", device);
+        // The production weight-twin selection (`Int8Mode::auto` — Precision on
+        // int8-MMA GPUs): the C-ladder validates KV-cache compression, so the
+        // weight error must not consume the error budget. Measured on this
+        // file's Llama-3.2-3B checkpoint: Performance's same-width KO twin alone
+        // flips C6–C8 StoryRewrite (C8 6/10 vs 10/10 at Precision, which
+        // matches the FP16 reference).
+        let int8mode = candle::quantized::Int8Mode::auto(&device);
+        println!("int8 mode = {int8mode:?}\n");
+
+        println!("\n=== Loading Model ===\n");
+        // The checkpoint's model pack. Its tokenizer is the ungated copy of the
+        // same vocabulary; the gate itself tokenizes with the embedded one it was
+        // validated against.
+        let ck = llama3_2_3b();
+        let (model_path, _) = plain_pack(
+            (&ck.repo, &ck.revision, &ck.filename),
+            ("unsloth/Llama-3.2-3B-Instruct", "main"),
+            int8mode,
+            &device,
+        )?;
+        println!("Model pack: {:?}", model_path);
 
         let configs = vec![
             TestConfig {
@@ -2170,7 +2176,7 @@ mod tests {
             // C9/C10 use CoherenceCheck: at ~4.3–5.6× CR (8dB) the exact-match
             // story rewrite exceeds the formats' information budget even with
             // reference FP16 weights (measured: C9 6/10, C10 1/5 sessions at
-            // INT8MODE=off) — the compress-tier trade-off, not a defect.
+            // Int8Mode::Off) — the compress-tier trade-off, not a defect.
             // Coherence still catches broken quantized reads (garbage output).
             // C9: K=[Q3_0,Q2_0] V=[Q3_0,Q2_0] — ~5.62× CR, 8dB
             TestConfig {
@@ -2191,22 +2197,6 @@ mod tests {
         ];
 
         // Sequential (non-batched) callbacks - access inner model via .model()
-        // Default to the production weight-twin selection (`Int8Mode::auto` —
-        // Precision on int8-MMA GPUs): the C-ladder validates KV-cache
-        // compression, so the weight error must not consume the error budget.
-        // Measured on this file's Llama-3.2-3B checkpoint: Performance's same-width KO twin
-        // alone flips C6–C8 StoryRewrite (C8 6/10 vs 10/10 at Precision, which
-        // matches the FP16 reference).
-        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
-            Some("off") => candle::quantized::Int8Mode::Off,
-            Some("prec") | Some("precision") => candle::quantized::Int8Mode::Precision,
-            Some("perf") | Some("performance") => candle::quantized::Int8Mode::Performance,
-            _ => candle::quantized::Int8Mode::auto(&device),
-        };
-        println!(
-            "int8 mode = {int8mode:?}
-"
-        );
         let load_model = || {
             let model =
                 ModelWeights::from_gguf_by_path_with_int8_v3(&model_path, &device, int8mode)?;
@@ -2339,7 +2329,9 @@ mod tests {
     ///
     /// Run with: cargo test --release --features cuda --lib --package candle-transformers quantized_llama::tests::test_parallel_batched_forwarding_llama2 -- --ignored --nocapture
     #[test]
-    #[ignore] // Slow without CUDA. Run with: cargo test --release --features cuda -- --ignored test_parallel_batched_forwarding_llama2
+    #[ignore]
+    // Run with: cargo test --release --features cuda -- --ignored test_parallel_batched_forwarding_llama2
+    #[cfg(feature = "cuda")]
     fn test_parallel_batched_forwarding_llama2() -> Result<()> {
         run_llama2_gate(|_| true)
     }
@@ -2352,6 +2344,7 @@ mod tests {
     /// Run with: cargo test --release --features cuda,profile --lib --package candle-transformers quantized_llama::tests::wide_prefill_llama2 -- --ignored --nocapture
     #[test]
     #[ignore = "downloads the Llama-2-7B-Chat Q4_0 GGUF and fills the card with 48 contexts"]
+    #[cfg(feature = "cuda")]
     fn wide_prefill_llama2() -> Result<()> {
         run_llama2_gate(|c| {
             matches!(c.mode, InferenceMode::BF16) && matches!(c.num_contexts, 1 | 48)
@@ -2359,63 +2352,40 @@ mod tests {
     }
 
     /// Llama 2 7B's gate over the rows `keep` selects from its full ladder.
+    #[cfg(feature = "cuda")]
     fn run_llama2_gate(keep: impl Fn(&TestConfig) -> bool) -> Result<()> {
-        #[cfg(not(all(feature = "cuda")))]
-        println!("⚠ WARNING: This test should be run with --features cuda for optimal performance");
-        #[cfg(not(all(feature = "cuda")))]
-        println!(
-            "⚠ Current build is missing performance-critical features. Results may be slower.\n"
-        );
+        use crate::models::batch_test::test_helpers::plain_pack;
 
         println!("\n=== Setting up Test Parameters (Llama 2 7B) ===\n");
 
         let num_generate_tokens = 20;
         let dialect = Dialect::llama2();
 
-        // Download tokenizer.json (Llama 2) from HuggingFace
-        let api = crate::models::batch_test::test_helpers::api()
-            .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
-        let tok_repo = api.model("NousResearch/Llama-2-7b-hf".to_string());
-        let tokenizer_path = tok_repo.get("tokenizer.json").map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to download tokenizer.json: {}. This test requires internet access.",
-                e
-            ))
-        })?;
-        let tokenizer_json = std::fs::read_to_string(&tokenizer_path).map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to read tokenizer.json from {:?}: {}",
-                tokenizer_path, e
-            ))
-        })?;
+        let device = Device::new_cuda(0)?;
+        println!("Using device: {:?}\n", device);
+        let int8mode = candle::quantized::Int8Mode::Performance;
+        println!("int8 mode = {int8mode:?}\n");
+
+        println!("\n=== Loading Llama 2 7B Chat Model ===\n");
+        // The Chat variant, which is instruction-tuned, as a model pack with
+        // its tokenizer inside.
+        let (model_path, tokenizer_json) = plain_pack(
+            (
+                "TheBloke/Llama-2-7B-Chat-GGUF",
+                "main",
+                "llama-2-7b-chat.Q4_0.gguf",
+            ),
+            ("NousResearch/Llama-2-7b-hf", "main"),
+            int8mode,
+            &device,
+        )?;
+        println!("Model pack: {:?}", model_path);
 
         let params = TestParams::new(num_generate_tokens, &tokenizer_json, dialect)
             .map_err(|e| candle::Error::Msg(format!("Failed to create TestParams: {}", e)))?
             .with_print_outputs(false)
             .with_test_mode(TestMode::NameGreeting) // Simpler validation for chat model
             .with_timeout_secs(1200); // 11 minutes and 20 seconds for 7B model
-
-        println!("\n=== Loading Llama 2 7B Chat Model ===\n");
-
-        // Download model from HuggingFace (TheBloke/Llama-2-7B-Chat-GGUF)
-        // Note: Using the Chat variant which is instruction-tuned
-        let repo = api.model("TheBloke/Llama-2-7B-Chat-GGUF".to_string());
-        let model_path = repo.get("llama-2-7b-chat.Q4_0.gguf").map_err(|e| {
-            candle::Error::Msg(format!(
-                "Failed to download model: {}. This test requires internet access.",
-                e
-            ))
-        })?;
-
-        println!("Model downloaded to: {:?}", model_path);
-
-        let device = Device::new_cuda(0).map_err(|e| {
-            candle::Error::Msg(format!(
-                "CUDA required for this test: {}. Use --features cuda",
-                e
-            ))
-        })?;
-        println!("Using device: {:?}\n", device);
 
         // Use smaller batch sizes for 7B model (more memory intensive)
         let configs = vec![
@@ -2512,15 +2482,6 @@ mod tests {
         let configs: Vec<TestConfig> = configs.into_iter().filter(|c| keep(c)).collect();
 
         // Sequential (non-batched) callbacks - access inner model via .model()
-        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
-            Some("off") => candle::quantized::Int8Mode::Off,
-            Some("prec") | Some("precision") => candle::quantized::Int8Mode::Precision,
-            _ => candle::quantized::Int8Mode::Performance,
-        };
-        println!(
-            "int8 mode = {int8mode:?}
-"
-        );
         let load_model = || {
             let model =
                 ModelWeights::from_gguf_by_path_with_int8_v2(&model_path, &device, int8mode)?;

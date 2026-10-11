@@ -73,6 +73,9 @@ cuda = [
     "candle/cuda",
     "candle-nn/cuda",
     "candle-transformers/cuda",
+    # The routed examples pack their checkpoint on first use, fetching its
+    # tokenizer through the hub downloader (`model_pack::HubFetch`).
+    "candle-transformers/hub",
     "dep:bindgen_cuda",
 ]
 cudnn = ["candle/cudnn", "candle-nn/cudnn", "candle-transformers/cudnn"]
@@ -176,9 +179,11 @@ required-features = ["cuda"]
 
 [[example]]
 name = "ruler-eval"
+required-features = ["cuda"]
 
 [[example]]
 name = "perplexity-eval"
+required-features = ["cuda"]
 
 [[example]]
 name = "decode_ab"

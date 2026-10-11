@@ -114,30 +114,13 @@ impl Probe {
     /// caller that loads the model itself still takes the builder from here, so the
     /// engine config the two agree on is the same one.
     pub fn builder(&self) -> crate::models::ModelBuilder {
-        let builder = self
-            .profile
+        self.profile
             .model
             .clone()
             .builder()
             .max_concurrent(self.profile.max_concurrency + self.profile.batch + 4)
             .max_seq_len(self.profile.max_seq_len)
-            .compression_level(self.compression_level);
-        // **The expert pack lives beside the checkpoint, and naming it is the difference
-        // between a read and a repack.** The pack is derived once from the GGUF's experts
-        // and persists; unnamed, the load re-derives it every run — 62 GiB of work on
-        // Qwen3.8-Flash-Next, ~42 s on the 30B — for a file already on the disk. Taken
-        // from the *resolved* path rather than from the local-cache branch above, so it
-        // applies to a downloaded checkpoint as much as a prepared one; the gate's own
-        // loader does exactly this, for exactly this reason.
-        match builder.resolve_paths_pub() {
-            Ok((model_path, _)) => match model_path.parent() {
-                Some(dir) => builder.expert_pack_dir(dir),
-                None => builder,
-            },
-            // Unresolvable here is not this function's to report: the caller resolves
-            // again and fails with the real error.
-            Err(_) => builder,
-        }
+            .compression_level(self.compression_level)
     }
 }
 

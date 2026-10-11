@@ -1,26 +1,23 @@
-//! Startup: build or reuse the pack, then fill the warm and hot tiers from it.
+//! Startup: fill the warm and hot tiers from the model pack's expert section.
 //!
-//! Every VRAM upload whose source is not already pinned — a repacked expert, a
-//! pageable warm slot, a pack read — goes through the pad's slots
-//! ([`StartupRing`]): the pad is allocated before the warm tier and is idle
-//! until the stager takes it over, so the fill borrows it as its landing ring.
+//! Every VRAM upload whose source is not already pinned — a pageable warm slot,
+//! a pack read — goes through the pad's slots ([`StartupRing`]): the pad is
+//! allocated before the warm tier and is idle until the stager takes it over,
+//! so the fill borrows it as its landing ring.
 
-use super::cache::{pinned_layer_count, ExpertCacheInner};
-use super::pack::{ExpertPack, PackRead, PackWriter, RecordLayout};
+use super::cache::ExpertCacheInner;
+use super::pack::{ExpertPack, PackRead, RecordLayout};
 use super::pad::Pad;
 use super::pinned::{ExpertResidency, LayerGeometry};
-use super::slot_image::{
-    build_slot_from_record_on_stream, build_slot_from_repacked_with_device,
-    repack_expert_projections, write_record,
-};
-use super::types::{ExpertSlot, MmapExpertRef};
+use super::slot_image::build_slot_from_record_on_stream;
+use super::types::ExpertSlot;
 use super::warm_tier::WarmTier;
 use candle::vram::{available_physical_ram, host_pinned_bytes};
 use candle::Result;
 use cudarc::driver::CudaEvent;
 
-/// Everything the startup fill writes into, gathered so the two entry points
-/// below take one argument each instead of six.
+/// Everything the startup fill writes into, gathered so the fill takes one
+/// argument for it instead of seven.
 pub(crate) struct StartupTargets<'a> {
     pub inner: &'a mut ExpertCacheInner,
     pub warm: &'a mut WarmTier,
@@ -30,28 +27,12 @@ pub(crate) struct StartupTargets<'a> {
     pub geoms: &'a [LayerGeometry],
     pub layouts: &'a [RecordLayout],
     pub stride: usize,
-    /// The checkpoint, and where each expert's projections sit in it — the
-    /// first-boot path repacks every evictable expert from here. (The pinned
-    /// prefix, which has no record in the pack, is filled from it before the
-    /// warm tier exists: [`startup_pinned_prefix`].)
-    pub mmap: &'a [u8],
-    pub host_refs: &'a [Vec<MmapExpertRef>],
 }
 
 /// Units the startup reports **after** the last expert, so the bar keeps moving
-/// through work that used to happen behind a full one.
-///
-/// The repack is the visible part of loading this model and it is not the last
-/// part: publishing the pack flushes and `fsync`s tens of gigabytes, and seeding
-/// the residency gauge follows it. Measured on a 72 GB card, the bar filled at
-/// 140 s into a 181 s step and the remaining 26 s read as a hang — 11.6 s of it
-/// in the `fsync` alone, which the log then attributed to the gauge, because the
-/// gauge's line is the next one printed.
-///
-/// Two, and they are charged where they are done: [`startup_repack`] leaves room
-/// for them, and the caller that publishes the pack and seeds the gauge reports
-/// each as it finishes.
-pub(crate) const PACK_TAIL_STEPS: usize = 2;
+/// through the work that follows the fill: seeding the residency gauge, whose
+/// caller reports it as it finishes.
+pub(crate) const PACK_TAIL_STEPS: usize = 1;
 
 /// The pad's slots as a ring of landing buffers for the startup fill.
 ///
@@ -144,187 +125,12 @@ unsafe fn upload_from_ring(
     Ok(slot)
 }
 
-/// Repack every expert out of the GGUF, write the pack, and fill both resident
-/// tiers from the bytes as they pass through.
+/// Fill both resident tiers from the expert section.
 ///
-/// This is the first-boot path and the only one that pays the ~42 s repack. It
-/// writes every **evictable** expert to the pack, including ones that also go
-/// straight to VRAM: an expert that exists only in a VRAM slot could not be
-/// evicted without losing it.
-///
-/// The exception is the pinned prefix (`cache::PINNED_LAYERS` leading layers),
-/// which is never evicted and so is never reloaded. Those experts were filled
-/// into VRAM before the warm tier existed ([`startup_pinned_prefix`]) and are
-/// not written — the pack holds every expert *that can be evicted*.
-///
-/// Progress is reported against `total_experts + PACK_TAIL_STEPS`, leaving room
-/// for the publish and the gauge seed its caller performs after it returns.
-pub(crate) fn startup_repack(
-    t: StartupTargets<'_>,
-    writer: &mut PackWriter,
-    ring: &mut StartupRing<'_>,
-    cuda_dev: &candle::CudaDevice,
-    progress: Option<&dyn Fn(usize, usize)>,
-) -> Result<()> {
-    let (mmap, host_refs) = (t.mmap, t.host_refs);
-    let num_moe_layers = host_refs.len();
-    let num_experts = host_refs.first().map_or(0, |l| l.len());
-    if num_moe_layers == 0 || num_experts == 0 {
-        return Ok(());
-    }
-    let total_experts = num_moe_layers * num_experts;
-    let pinned = pinned_layer_count(num_moe_layers);
-    // Warm slot for each expert, so the fill can place bytes as they go by
-    // rather than re-reading them afterwards.
-    let mut warm_slot_of: Vec<Vec<Option<usize>>> = vec![vec![None; num_experts]; num_moe_layers];
-    for (slot, &(layer, expert)) in t.membership.iter().enumerate() {
-        warm_slot_of[layer][expert] = Some(slot);
-    }
-
-    tracing::info!(
-        target: "candle_transformers::expert_lre",
-        layers = num_moe_layers,
-        experts = num_experts,
-        vram_slots = t.inner.num_slots(),
-        warm_slots = t.warm.num_slots(),
-        "startup: repacking every expert into the pack, filling both tiers as it goes"
-    );
-    let t0 = std::time::Instant::now();
-    let mut vram_count = 0usize;
-    let mut warm_count = 0usize;
-
-    for moe_idx in pinned..num_moe_layers {
-        let geom = &t.geoms[moe_idx];
-        let layout = t.layouts[moe_idx];
-        for expert_idx in 0..num_experts {
-            let r = &host_refs[moe_idx][expert_idx];
-            // A repack that fails leaves an expert with no valid record, and a
-            // record of zeroes reads back as a plausible expert. There is no
-            // partial answer here: the pack is authoritative or it is nothing.
-            let (gate, up, down) = repack_expert_projections(mmap, r, geom, cuda_dev)?;
-            writer.write_expert(moe_idx, expert_idx, &gate, &up, &down)?;
-
-            let mut res = ExpertResidency::default();
-            if let Some(warm_slot) = warm_slot_of[moe_idx][expert_idx] {
-                let dst = t.warm.slot_mut(warm_slot, t.stride);
-                write_record(dst, layout, &gate, &up, &down);
-                res.ram = Some(warm_slot);
-                warm_count += 1;
-            }
-            // The zone hands out the rightmost free slot, so the startup fill
-            // packs experts against the span's right edge and the volatile left
-            // margin is the last ground to be taken.
-            if let Some(slot_idx) = t.inner.take_free() {
-                let slot_base = t.inner.slot_base(slot_idx);
-                let idx = ring.acquire()?;
-                write_record(ring.buffer(idx), layout, &gate, &up, &down);
-                // SAFETY: `slot_idx` was just handed out by the zone.
-                let slot =
-                    unsafe { upload_from_ring(ring, idx, layout, geom, cuda_dev, slot_base)? };
-                t.inner.install(slot_idx, moe_idx, expert_idx, slot);
-                res.vram = Some(slot_idx);
-                vram_count += 1;
-            }
-            t.residency[moe_idx][expert_idx] = res;
-            if let Some(cb) = progress {
-                cb(
-                    moe_idx * num_experts + expert_idx + 1,
-                    total_experts + PACK_TAIL_STEPS,
-                );
-            }
-        }
-        if (moe_idx + 1) % 8 == 0 || moe_idx + 1 == num_moe_layers {
-            tracing::info!(
-                target: "candle_transformers::expert_lre",
-                layer = moe_idx + 1,
-                of = num_moe_layers,
-                vram_count,
-                warm_count,
-                "startup: repacking"
-            );
-        }
-    }
-
-    tracing::info!(
-        target: "candle_transformers::expert_lre",
-        secs = t0.elapsed().as_secs_f64(),
-        vram_count,
-        warm_count,
-        warm_gib = t.warm.total_bytes() as f64 / 1e9,
-        "startup: repack complete"
-    );
-    // The uploads are asynchronous; the resident tier must be complete before
-    // the pipeline takes it over.
-    cuda_dev
-        .cuda_stream()
-        .synchronize()
-        .map_err(candle::Error::wrap)
-}
-
-/// Fill the permanently resident prefix (`cache::PINNED_LAYERS` leading
-/// layers) into VRAM, straight from the checkpoint.
-///
-/// **Before the warm tier is allocated, whichever startup path follows.** These
-/// experts have no record in the pack, so each is repacked from the GGUF
-/// mapping and uploaded out of ordinary host memory — and an upload from
-/// pageable memory needs the driver to page-lock a bounce buffer. With the warm
-/// tier pinned up to the page-lock ceiling and its pageable remainder filled,
-/// there was no RAM left for that, and the load died here with
-/// `CUDA_ERROR_OUT_OF_MEMORY`. Mandatory and fixed-size, so it goes first,
-/// like the pad.
-///
-/// Takes zone slots from the right edge in layer order, exactly as the fill
-/// that follows would have; stops if the zone runs out. Progress is reported
-/// against the same `total_experts + PACK_TAIL_STEPS` as the fill after it.
-pub(crate) fn startup_pinned_prefix(
-    inner: &mut ExpertCacheInner,
-    residency: &mut [Vec<ExpertResidency>],
-    geoms: &[LayerGeometry],
-    mmap: &[u8],
-    host_refs: &[Vec<MmapExpertRef>],
-    cuda_dev: &candle::CudaDevice,
-    progress: Option<&dyn Fn(usize, usize)>,
-) -> Result<()> {
-    let num_moe_layers = host_refs.len();
-    let num_experts = host_refs.first().map_or(0, |l| l.len());
-    let total_experts = num_moe_layers * num_experts;
-    let pinned = pinned_layer_count(num_moe_layers);
-    'fill: for moe_idx in 0..pinned {
-        let geom = &geoms[moe_idx];
-        for expert_idx in 0..num_experts {
-            let Some(slot_idx) = inner.take_free() else {
-                break 'fill;
-            };
-            let slot_base = inner.slot_base(slot_idx);
-            let r = &host_refs[moe_idx][expert_idx];
-            let (gate, up, down) = repack_expert_projections(mmap, r, geom, cuda_dev)?;
-            // SAFETY: `slot_idx` was just handed out by the zone and is not
-            // reclaimed while this runs.
-            let slot = unsafe {
-                build_slot_from_repacked_with_device(&gate, &up, &down, geom, cuda_dev, slot_base)?
-            };
-            inner.install(slot_idx, moe_idx, expert_idx, slot);
-            residency[moe_idx][expert_idx].vram = Some(slot_idx);
-            if let Some(cb) = progress {
-                cb(
-                    moe_idx * num_experts + expert_idx + 1,
-                    total_experts + PACK_TAIL_STEPS,
-                );
-            }
-        }
-    }
-    cuda_dev
-        .cuda_stream()
-        .synchronize()
-        .map_err(candle::Error::wrap)
-}
-
-/// Fill both resident tiers from a pack that already exists.
-///
-/// The restart path, and the reason the pack is worth its 16.6 GiB: no repack,
-/// no GGUF expert reads at all. Only the experts that land somewhere are read —
-/// the rest stay on disk until something asks for them.
-#[allow(clippy::too_many_arguments)]
+/// Only the experts that land somewhere are read — the rest stay on disk until
+/// something asks for them. VRAM fills in layer order, so the permanently
+/// resident leading layers (`cache::PINNED_LAYERS`) take the first slots: the
+/// zone's floor prices them, so they always fit.
 pub(crate) fn startup_from_pack(
     t: StartupTargets<'_>,
     pack: &ExpertPack,
@@ -338,19 +144,6 @@ pub(crate) fn startup_from_pack(
         return Ok(());
     }
     let total_experts = num_moe_layers * num_experts;
-    let pinned = pinned_layer_count(num_moe_layers);
-    // The pack was written by a build that agreed on the pinned depth. If it
-    // does not, its record indices are shifted against ours and every read past
-    // the prefix would return a neighbouring expert's weights — plausible
-    // numbers, wrong model. `open_or_create` rebuilds on an identity mismatch;
-    // this is the one field that is ours rather than the checkpoint's.
-    if pack.pinned_layers() != pinned {
-        candle::bail!(
-            "expert pack pins {} leading layers, this build pins {pinned} — the record \
-             indices disagree. Delete the pack to rebuild it.",
-            pack.pinned_layers(),
-        );
-    }
     let t0 = std::time::Instant::now();
 
     // ── Warm tier: every membership record at once, at full queue depth ──
@@ -386,7 +179,6 @@ pub(crate) fn startup_from_pack(
     let stream = cuda_dev.cuda_stream();
     let mut vram_count = 0usize;
     let mut cold_reads = 0usize;
-    let mut repacked = 0usize;
     // The indices address four parallel collections and identify the expert in
     // the progress callback and the slot install, so they are the subject here
     // rather than an artefact of iterating one of them.
@@ -395,15 +187,6 @@ pub(crate) fn startup_from_pack(
         let geom = &t.geoms[moe_idx];
         let layout = t.layouts[moe_idx];
         for expert_idx in 0..num_experts {
-            // The pinned prefix was filled from the checkpoint before the warm
-            // tier existed (`startup_pinned_prefix`); it has no record here.
-            if moe_idx < pinned {
-                if t.residency[moe_idx][expert_idx].vram.is_some() {
-                    vram_count += 1;
-                    repacked += 1;
-                }
-                continue;
-            }
             let Some(slot_idx) = t.inner.take_free() else {
                 break 'fill;
             };
@@ -454,8 +237,6 @@ pub(crate) fn startup_from_pack(
             t.inner.install(slot_idx, moe_idx, expert_idx, slot);
             t.residency[moe_idx][expert_idx].vram = Some(slot_idx);
             vram_count += 1;
-            // The same denominator as the repack path, because the gauge seed
-            // that lands the bar is shared by both.
             if let Some(cb) = progress {
                 cb(
                     moe_idx * num_experts + expert_idx + 1,
@@ -468,10 +249,9 @@ pub(crate) fn startup_from_pack(
     // before the pipeline takes it over.
     stream.synchronize().map_err(candle::Error::wrap)?;
     // The fill stops as soon as VRAM is full, so the remaining experts never
-    // reach the progress callback. Land it on the experts so the bar is where
-    // the repack path's is at the same point.
+    // reach the progress callback. Land it on the experts, leaving the tail.
     if let Some(cb) = progress {
-        cb(total_experts + 1, total_experts + PACK_TAIL_STEPS);
+        cb(total_experts, total_experts + PACK_TAIL_STEPS);
     }
 
     tracing::info!(
@@ -479,11 +259,10 @@ pub(crate) fn startup_from_pack(
         secs = t0.elapsed().as_secs_f64(),
         vram_count,
         cold_reads,
-        repacked,
         warm_slots = t.membership.len(),
         warm_gib = t.warm.total_bytes() as f64 / 1e9,
         pack = %pack.path().display(),
-        "startup: filled from the pack — only the resident prefix was repacked"
+        "startup: filled from the pack"
     );
     Ok(())
 }

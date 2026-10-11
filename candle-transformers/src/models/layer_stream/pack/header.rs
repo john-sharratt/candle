@@ -1,5 +1,6 @@
-//! The layer pack's header: what the file claims to be, and the geometry a
-//! reader needs to interpret one record without consulting the GGUF.
+//! The layer section's header: what the section claims to be, the geometry a
+//! reader rebuilds every layer's image from, and the fingerprint of every
+//! repack that produced its bytes.
 //!
 //! Plain arithmetic over bytes — no CUDA, no device, no model — so the format
 //! is pinned down by unit tests that assert against raw expected bytes rather
@@ -8,78 +9,84 @@
 //! # Layout
 //!
 //! ```text
-//! 0    8   magic       b"CNDLLYR1"
+//! 0    8   magic       b"CNDLLYR2"
 //! 8    4   version     u32 LE
-//! 12   4   num_layers  u32 LE   trunk layers in the model
+//! 12   4   num_layers  u32 LE   trunk layers, every one of which has a record
 //! 16   4   slot_bytes  u32 LE   the largest layer image (§5.1 of the design)
 //! 20   8   stride      u64 LE   slot_bytes padded to a direct-I/O sector
-//! 28   8   source_len  u64 LE   the GGUF's length in bytes
-//! 36   4   source_sum  u32 LE   fletcher32 over the GGUF's identity sample
-//! 40   4   int8_mode   u32 LE   the numeric mode the repack targeted
-//! 44   8   repack_fp   u64 LE   fingerprint of the repack formula itself
-//! 52   4   pinned      u32 LE   leading layers with NO record in the file
-//! 56  ...  per-layer geometry, variable width
+//! 28   4   int8_mode   u32 LE   the numeric mode the repack targeted
+//! 32   4   num_pairs   u32 LE   entries in the fingerprint table
+//! 36  ...  per-layer geometry, variable width
+//! ...  ... fingerprint table, `num_pairs` × 16 bytes
 //! ```
 //!
-//! Each per-layer entry is `kind: u32, count: u32` followed by `count`
-//! projections of `role: u32, offset: u32, bytes: u32, dtype: u32`.
+//! Each per-layer entry is `kind, ffn, count` (`u32`s) followed by `count`
+//! projections of `role, offset, bytes, extent, dtype, src_dtype, rows, cols`
+//! (`u32`s). A fingerprint entry is `src_dtype: u32, dtype: u32, fp: u64`, one
+//! per distinct pair the projections use.
 //!
-//! # Why the table is variable-width, where the expert pack's is fixed
+//! # Why the table is variable-width, where the expert section's is fixed
 //!
-//! An expert record is always three projections, so its table is a fixed 36
-//! bytes per layer. A *layer* record is not: a DeltaNet layer carries six
-//! projections and an attention layer seven, and a future mixer could carry a
-//! different set again. Padding every entry to the widest kind would encode
-//! today's maximum into the format — the thing a version number then has to be
-//! remembered for. Reading `count` costs one `u32` and removes the question.
+//! An expert record is always three projections. A *layer* record is not: a
+//! DeltaNet layer carries five or six projections and an attention layer six or
+//! seven, and a future mixer could carry a different set again. Reading `count`
+//! costs one `u32` and removes the question.
 //!
-//! # `num_layers` counts the whole trunk; `pinned` says what is absent
+//! # Every layer has a record
 //!
-//! The geometry table describes **every** layer, so the identity check keeps
-//! its full strength. `pinned` says how many leading layers the file holds no
-//! *records* for: they are permanently VRAM-resident and never reloaded, so
-//! storing them would be dead disk. Record `0` is therefore layer `pinned`.
+//! The section is the model's only copy of its streamed projections, so the
+//! permanently resident head is stored like the rest and uploaded from here.
 
 use candle::quantized::GgmlDType;
 use candle::Result;
 
-use crate::models::layer_stream::descriptor::{LayerTensor, MixKind};
+use crate::models::layer_stream::descriptor::{FfnForm, LayerTensor, MixKind};
+use crate::models::repack_fingerprint::PairPrint;
 
-/// Marks the file as ours and the layout as this one. A change to the record
+/// Marks the section as ours and the layout as this one. A change to the record
 /// layout changes the last byte rather than adding a compatibility path.
-pub(crate) const MAGIC: &[u8; 8] = b"CNDLLYR1";
+pub(crate) const MAGIC: &[u8; 8] = b"CNDLLYR2";
 
 /// Bumped whenever the record layout or the header's own shape changes. There
-/// is no reader for an older version — a mismatch rewrites the pack, which
-/// costs one repack and nothing else.
-pub(crate) const VERSION: u32 = 1;
+/// is no reader for an older version — a mismatch rebuilds the model pack.
+pub(crate) const VERSION: u32 = 2;
 
 /// Bytes before the per-layer table.
-const FIXED_BYTES: usize = 56;
+pub(crate) const FIXED_BYTES: usize = 36;
 
-/// Bytes per projection in the geometry table.
-const PROJECTION_BYTES: usize = 16;
+/// Bytes per projection in the geometry table: eight `u32`s.
+const PROJECTION_BYTES: usize = 32;
 
-/// Bytes of per-layer preamble: `kind` and `count`.
-const LAYER_PREAMBLE: usize = 8;
+/// Bytes of per-layer preamble: `kind`, `ffn` and `count`.
+const LAYER_PREAMBLE: usize = 12;
 
-/// Where one projection sits inside a record, how long it is, and what it is.
+/// Bytes per fingerprint entry.
+const PAIR_BYTES: usize = 16;
+
+/// Where one projection sits inside a record, what it is, and what it was
+/// repacked from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProjectionSpan {
     pub role: LayerTensor,
     /// Byte offset from the start of the record.
     pub offset: u32,
-    /// Bytes of repacked payload — what the H2D copies, excluding any padding
-    /// to the next projection's alignment.
+    /// Bytes of payload — what the H2D copies.
     pub bytes: u32,
-    /// The repacked form's dtype, as the in-workspace discriminant.
+    /// Bytes the slot reserves from `offset`, which the kernel may address.
+    pub extent: u32,
+    /// The slot's dtype: a KO twin, or the source quant where none was taken.
     pub dtype: GgmlDType,
+    /// The checkpoint's dtype for this projection.
+    pub src_dtype: GgmlDType,
+    pub rows: u32,
+    pub cols: u32,
 }
 
 /// One trunk layer's projections, in image order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LayerSpans {
     pub kind: MixKind,
+    pub ffn: FfnForm,
     pub projections: Vec<ProjectionSpan>,
 }
 
@@ -96,55 +103,34 @@ pub(crate) struct PackHeader {
     /// The slot image size: the largest layer's projections at their aligned
     /// offsets. Every record is this wide, whatever kind it holds.
     pub slot_bytes: u32,
-    /// Record-to-record distance in the file — `slot_bytes` rounded up to a
-    /// direct-I/O sector, so every record offset is legal to `pread` at.
+    /// Record-to-record distance — `slot_bytes` rounded up to a direct-I/O
+    /// sector, so every record offset is legal to `pread` at.
     pub stride: u64,
-    pub source_len: u64,
-    pub source_sum: u32,
     pub int8_mode: u32,
-    /// Fingerprint of the repack formula — what the repack *produces* over a
-    /// reference sweep, as opposed to the geometry, which is only where it puts
-    /// the results.
-    pub repack_fp: u64,
-    /// Leading layers the file holds **no records** for. Record `0` is layer
-    /// `pinned_layers`.
-    pub pinned_layers: u32,
     pub layers: Vec<LayerSpans>,
+    /// One entry per repack pair the projections use, in [`pairs_in`] order.
+    pub pairs: Vec<PairPrint>,
+}
+
+/// The distinct `(src_dtype, dtype)` pairs `layers` use, sorted — the pairs a
+/// fingerprint table must cover, read off the geometry.
+pub(crate) fn pairs_in(layers: &[LayerSpans]) -> Vec<(GgmlDType, GgmlDType)> {
+    let mut pairs: Vec<(GgmlDType, GgmlDType)> = layers
+        .iter()
+        .flat_map(|l| l.projections.iter())
+        .map(|p| (p.src_dtype, p.dtype))
+        .collect();
+    pairs.sort_by_key(|&(s, d)| (s.to_u32(), d.to_u32()));
+    pairs.dedup();
+    pairs
 }
 
 impl PackHeader {
     /// Bytes this header occupies before the first record, unpadded.
     pub(crate) fn encoded_len(&self) -> usize {
-        FIXED_BYTES + self.layers.iter().map(|l| l.encoded_len()).sum::<usize>()
-    }
-
-    /// Layers the file holds records for — the evictable set.
-    pub(crate) fn stored_layers(&self) -> usize {
-        (self.num_layers as usize).saturating_sub(self.pinned_layers as usize)
-    }
-
-    /// The record index of trunk layer `layer`, or an error when the layer is
-    /// pinned and so has no record.
-    ///
-    /// A `Result` rather than an `Option` because the pinned case is a caller
-    /// bug — asking the cold tier for a layer that by construction never leaves
-    /// VRAM — and the message should say so at the point it happens.
-    pub(crate) fn record_index(&self, layer: usize) -> Result<usize> {
-        let pinned = self.pinned_layers as usize;
-        if layer < pinned {
-            candle::bail!(
-                "layer pack: layer {layer} is inside the pinned prefix ({pinned} layers), \
-                 which the file holds no record for — it is resident for the life of the \
-                 process and is never reloaded"
-            );
-        }
-        if layer >= self.num_layers as usize {
-            candle::bail!(
-                "layer pack: layer {layer} is past the model's {} layers",
-                self.num_layers
-            );
-        }
-        Ok(layer - pinned)
+        FIXED_BYTES
+            + self.layers.iter().map(|l| l.encoded_len()).sum::<usize>()
+            + self.pairs.len() * PAIR_BYTES
     }
 
     /// Serialize to exactly [`Self::encoded_len`] bytes.
@@ -155,100 +141,106 @@ impl PackHeader {
         out.extend_from_slice(&self.num_layers.to_le_bytes());
         out.extend_from_slice(&self.slot_bytes.to_le_bytes());
         out.extend_from_slice(&self.stride.to_le_bytes());
-        out.extend_from_slice(&self.source_len.to_le_bytes());
-        out.extend_from_slice(&self.source_sum.to_le_bytes());
         out.extend_from_slice(&self.int8_mode.to_le_bytes());
-        out.extend_from_slice(&self.repack_fp.to_le_bytes());
-        out.extend_from_slice(&self.pinned_layers.to_le_bytes());
+        out.extend_from_slice(&(self.pairs.len() as u32).to_le_bytes());
         for l in &self.layers {
-            out.extend_from_slice(&l.kind.to_u32().to_le_bytes());
-            out.extend_from_slice(&(l.projections.len() as u32).to_le_bytes());
-            for p in &l.projections {
-                out.extend_from_slice(&p.role.to_u32().to_le_bytes());
-                out.extend_from_slice(&p.offset.to_le_bytes());
-                out.extend_from_slice(&p.bytes.to_le_bytes());
-                out.extend_from_slice(&p.dtype.to_u32().to_le_bytes());
+            for v in [l.kind.to_u32(), l.ffn.to_u32(), l.projections.len() as u32] {
+                out.extend_from_slice(&v.to_le_bytes());
             }
+            for p in &l.projections {
+                for v in [
+                    p.role.to_u32(),
+                    p.offset,
+                    p.bytes,
+                    p.extent,
+                    p.dtype.to_u32(),
+                    p.src_dtype.to_u32(),
+                    p.rows,
+                    p.cols,
+                ] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        for p in &self.pairs {
+            out.extend_from_slice(&p.src_dtype.to_u32().to_le_bytes());
+            out.extend_from_slice(&p.dtype.to_u32().to_le_bytes());
+            out.extend_from_slice(&p.fp.to_le_bytes());
         }
         out
     }
 
     /// Decode from the head of `buf`.
     ///
-    /// Fails rather than truncates on a short or unrecognised buffer: a pack
-    /// whose header does not parse is a pack to rewrite, and the caller treats
-    /// every error here the same way.
+    /// Fails rather than truncates on a short or unrecognised buffer, and on a
+    /// fingerprint table that does not cover exactly the pairs its own layers
+    /// use.
     pub(crate) fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < FIXED_BYTES {
             candle::bail!(
-                "layer pack header is {} bytes, needs at least {FIXED_BYTES}",
+                "layer section header is {} bytes, needs at least {FIXED_BYTES}",
                 buf.len()
             );
         }
         if &buf[..8] != MAGIC {
-            candle::bail!("layer pack magic mismatch: {:?}", &buf[..8]);
+            candle::bail!("layer section magic mismatch: {:?}", &buf[..8]);
         }
         let u32_at = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
         let u64_at = |o: usize| {
-            u64::from_le_bytes([
-                buf[o],
-                buf[o + 1],
-                buf[o + 2],
-                buf[o + 3],
-                buf[o + 4],
-                buf[o + 5],
-                buf[o + 6],
-                buf[o + 7],
-            ])
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[o..o + 8]);
+            u64::from_le_bytes(b)
         };
         let version = u32_at(8);
         if version != VERSION {
-            candle::bail!("layer pack version {version}, this build writes {VERSION}");
+            candle::bail!("layer section version {version}, this build writes {VERSION}");
         }
-        let num_layers = u32_at(12);
-        // **Bound the count before reserving against it.** The per-layer walk
-        // below checks `buf.len()` at every step, but a `with_capacity` ahead of
-        // the loop is reached first — and a corrupt count (bit rot in these four
-        // bytes reads as ~4.29e9 layers) asks the allocator for ~137 GiB, which
-        // is `handle_alloc_error` and a non-unwinding abort, not the `Err` that
-        // makes the caller rebuild the pack. Every layer costs at least
-        // `LAYER_PREAMBLE`, so the buffer's own length is the ceiling.
-        let max_layers = buf.len().saturating_sub(FIXED_BYTES) / LAYER_PREAMBLE;
-        if num_layers as usize > max_layers {
+        let num_layers = u32_at(12) as usize;
+        let num_pairs = u32_at(32) as usize;
+        // **Bound the counts before reserving against them.** A corrupt count
+        // (bit rot in four bytes reads as ~4.29e9 layers) would otherwise ask the
+        // allocator for tens of GiB — a non-unwinding abort, not the `Err` that
+        // rebuilds the pack. Every layer costs at least its preamble, every pair
+        // its entry, so the buffer's own length is the ceiling.
+        let room = buf.len() - FIXED_BYTES;
+        if num_layers > room / LAYER_PREAMBLE || num_pairs > room / PAIR_BYTES {
             candle::bail!(
-                "layer pack header claims {num_layers} layers, but {} bytes hold at most {max_layers}",
+                "layer section header claims {num_layers} layers and {num_pairs} fingerprints, \
+                 more than {} bytes can hold",
                 buf.len()
             );
         }
 
-        let mut layers = Vec::with_capacity(num_layers as usize);
+        let mut layers = Vec::with_capacity(num_layers);
         let mut at = FIXED_BYTES;
-        for i in 0..num_layers as usize {
+        for i in 0..num_layers {
             if buf.len() < at + LAYER_PREAMBLE {
-                candle::bail!(
-                    "layer pack header claims {num_layers} layers but ends inside layer {i}"
-                );
+                candle::bail!("layer section header ends inside layer {i}");
             }
             let kind = MixKind::from_u32(u32_at(at)).ok_or_else(|| {
                 candle::Error::Msg(format!(
-                    "layer pack: layer {i} names mixer kind {}, which this build does not know",
+                    "layer section: layer {i} names mixer kind {}, which this build does not know",
                     u32_at(at)
                 ))
             })?;
-            let count = u32_at(at + 4) as usize;
+            let ffn = FfnForm::from_u32(u32_at(at + 4)).ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "layer section: layer {i} names FFN form {}, which this build does not know",
+                    u32_at(at + 4)
+                ))
+            })?;
+            let count = u32_at(at + 8) as usize;
             at += LAYER_PREAMBLE;
             if buf.len() < at + count * PROJECTION_BYTES {
-                candle::bail!(
-                    "layer pack header claims {count} projections for layer {i} but ends inside them"
-                );
+                candle::bail!("layer section header ends inside layer {i}'s projections");
             }
             let mut projections = Vec::with_capacity(count);
             for k in 0..count {
                 let o = at + k * PROJECTION_BYTES;
                 let role = LayerTensor::from_u32(u32_at(o)).ok_or_else(|| {
                     candle::Error::Msg(format!(
-                        "layer pack: layer {i} projection {k} names role {}, which this build \
-                         does not know",
+                        "layer section: layer {i} projection {k} names role {}, which this \
+                         build does not know",
                         u32_at(o)
                     ))
                 })?;
@@ -256,23 +248,47 @@ impl PackHeader {
                     role,
                     offset: u32_at(o + 4),
                     bytes: u32_at(o + 8),
-                    dtype: GgmlDType::from_u32(u32_at(o + 12))?,
+                    extent: u32_at(o + 12),
+                    dtype: GgmlDType::from_u32(u32_at(o + 16))?,
+                    src_dtype: GgmlDType::from_u32(u32_at(o + 20))?,
+                    rows: u32_at(o + 24),
+                    cols: u32_at(o + 28),
                 });
             }
             at += count * PROJECTION_BYTES;
-            layers.push(LayerSpans { kind, projections });
+            layers.push(LayerSpans {
+                kind,
+                ffn,
+                projections,
+            });
         }
-
+        if buf.len() < at + num_pairs * PAIR_BYTES {
+            candle::bail!("layer section header ends inside its fingerprint table");
+        }
+        let mut pairs = Vec::with_capacity(num_pairs);
+        for i in 0..num_pairs {
+            let o = at + i * PAIR_BYTES;
+            pairs.push(PairPrint {
+                src_dtype: GgmlDType::from_u32(u32_at(o))?,
+                dtype: GgmlDType::from_u32(u32_at(o + 4))?,
+                fp: u64_at(o + 8),
+            });
+        }
+        let covered: Vec<(GgmlDType, GgmlDType)> =
+            pairs.iter().map(|p| (p.src_dtype, p.dtype)).collect();
+        if covered != pairs_in(&layers) {
+            candle::bail!(
+                "layer section fingerprints cover {covered:?} but its layers use {:?}",
+                pairs_in(&layers)
+            );
+        }
         Ok(Self {
-            num_layers,
+            num_layers: num_layers as u32,
             slot_bytes: u32_at(16),
             stride: u64_at(20),
-            source_len: u64_at(28),
-            source_sum: u32_at(36),
-            int8_mode: u32_at(40),
-            repack_fp: u64_at(44),
-            pinned_layers: u32_at(52),
+            int8_mode: u32_at(28),
             layers,
+            pairs,
         })
     }
 }
@@ -281,94 +297,95 @@ impl PackHeader {
 mod tests {
     use super::*;
 
-    fn dn_layer() -> LayerSpans {
-        LayerSpans {
-            kind: MixKind::DeltaNet,
-            projections: vec![
-                ProjectionSpan {
-                    role: LayerTensor::Wqkv,
-                    offset: 0,
-                    bytes: 0x100,
-                    dtype: GgmlDType::Q4_K,
-                },
-                ProjectionSpan {
-                    role: LayerTensor::Wz,
-                    offset: 0x100,
-                    bytes: 0x80,
-                    dtype: GgmlDType::Q6_K,
-                },
-            ],
-        }
-    }
-
-    fn attn_layer() -> LayerSpans {
-        LayerSpans {
-            kind: MixKind::Attention,
-            projections: vec![ProjectionSpan {
-                role: LayerTensor::Wq,
-                offset: 0,
-                bytes: 0x200,
-                dtype: GgmlDType::Q4_K,
-            }],
+    fn proj(role: LayerTensor, offset: u32, src: GgmlDType) -> ProjectionSpan {
+        ProjectionSpan {
+            role,
+            offset,
+            bytes: 0x100,
+            extent: 0x100,
+            dtype: GgmlDType::Q4_KO,
+            src_dtype: src,
+            rows: 8,
+            cols: 128,
         }
     }
 
     fn two_layers() -> PackHeader {
+        let layers = vec![
+            LayerSpans {
+                kind: MixKind::DeltaNet,
+                ffn: FfnForm::Fused,
+                projections: vec![
+                    proj(LayerTensor::Wqkv, 0, GgmlDType::Q4_K),
+                    proj(LayerTensor::Wz, 0x100, GgmlDType::Q6_K),
+                ],
+            },
+            LayerSpans {
+                kind: MixKind::Attention,
+                ffn: FfnForm::Split,
+                projections: vec![proj(LayerTensor::Wq, 0, GgmlDType::Q4_K)],
+            },
+        ];
+        let pairs = pairs_in(&layers)
+            .into_iter()
+            .enumerate()
+            .map(|(i, (src_dtype, dtype))| PairPrint {
+                src_dtype,
+                dtype,
+                fp: 0x1000 + i as u64,
+            })
+            .collect();
         PackHeader {
             num_layers: 2,
             slot_bytes: 0x300,
             stride: 0x1000,
-            source_len: 0x0102_0304_0506_0708,
-            source_sum: 0xDEAD_BEEF,
             int8_mode: 3,
-            repack_fp: 0x1122_3344_5566_7788,
-            pinned_layers: 0,
-            layers: vec![dn_layer(), attn_layer()],
+            layers,
+            pairs,
         }
     }
 
+    /// The fixed prefix, as raw bytes — a field that moves is caught here
+    /// rather than by a round trip that agrees with itself.
     #[test]
     fn the_fixed_prefix_is_exact_bytes() {
         let bytes = two_layers().encode();
-        // Magic, then version 1, then num_layers 2 — asserted as raw bytes so a
-        // field that moves is caught here rather than by a round trip that
-        // agrees with itself.
-        assert_eq!(&bytes[0..8], b"CNDLLYR1");
-        assert_eq!(&bytes[8..12], &1u32.to_le_bytes());
+        assert_eq!(&bytes[0..8], b"CNDLLYR2");
+        assert_eq!(&bytes[8..12], &2u32.to_le_bytes());
         assert_eq!(&bytes[12..16], &2u32.to_le_bytes());
         assert_eq!(&bytes[16..20], &0x300u32.to_le_bytes());
         assert_eq!(&bytes[20..28], &0x1000u64.to_le_bytes());
-        assert_eq!(&bytes[28..36], &0x0102_0304_0506_0708u64.to_le_bytes());
-        assert_eq!(&bytes[36..40], &0xDEAD_BEEFu32.to_le_bytes());
-        assert_eq!(&bytes[40..44], &3u32.to_le_bytes());
-        assert_eq!(&bytes[44..52], &0x1122_3344_5566_7788u64.to_le_bytes());
-        assert_eq!(&bytes[52..56], &0u32.to_le_bytes());
+        assert_eq!(&bytes[28..32], &3u32.to_le_bytes());
+        assert_eq!(&bytes[32..36], &2u32.to_le_bytes());
     }
 
     #[test]
-    fn a_layer_entry_is_kind_count_then_projections() {
+    fn a_layer_entry_is_kind_ffn_count_then_projections() {
         let bytes = two_layers().encode();
-        // Layer 0: DeltaNet (0), two projections.
-        assert_eq!(&bytes[56..60], &0u32.to_le_bytes());
-        assert_eq!(&bytes[60..64], &2u32.to_le_bytes());
-        // First projection: role Wqkv (0), offset 0, bytes 0x100, dtype Q4_K.
-        assert_eq!(&bytes[64..68], &0u32.to_le_bytes());
-        assert_eq!(&bytes[68..72], &0u32.to_le_bytes());
-        assert_eq!(&bytes[72..76], &0x100u32.to_le_bytes());
-        assert_eq!(&bytes[76..80], &GgmlDType::Q4_K.to_u32().to_le_bytes());
-        // Second projection: role Wz (1).
-        assert_eq!(&bytes[80..84], &1u32.to_le_bytes());
-        // Layer 1 begins right after: Attention (1), one projection.
-        assert_eq!(&bytes[96..100], &1u32.to_le_bytes());
-        assert_eq!(&bytes[100..104], &1u32.to_le_bytes());
+        // Layer 0: DeltaNet (0), fused (0), two projections.
+        assert_eq!(&bytes[36..40], &0u32.to_le_bytes());
+        assert_eq!(&bytes[40..44], &0u32.to_le_bytes());
+        assert_eq!(&bytes[44..48], &2u32.to_le_bytes());
+        // First projection: role Wqkv (0), offset 0, bytes, extent, dtype, src.
+        assert_eq!(&bytes[48..52], &0u32.to_le_bytes());
+        assert_eq!(&bytes[52..56], &0u32.to_le_bytes());
+        assert_eq!(&bytes[56..60], &0x100u32.to_le_bytes());
+        assert_eq!(&bytes[60..64], &0x100u32.to_le_bytes());
+        assert_eq!(&bytes[64..68], &GgmlDType::Q4_KO.to_u32().to_le_bytes());
+        assert_eq!(&bytes[68..72], &GgmlDType::Q4_K.to_u32().to_le_bytes());
+        assert_eq!(&bytes[72..76], &8u32.to_le_bytes());
+        assert_eq!(&bytes[76..80], &128u32.to_le_bytes());
+        // Layer 1 begins after two 32-byte projections: Attention (1), split (1).
+        assert_eq!(&bytes[112..116], &1u32.to_le_bytes());
+        assert_eq!(&bytes[116..120], &1u32.to_le_bytes());
     }
 
     #[test]
     fn encoded_len_matches_what_encode_produces() {
         let h = two_layers();
         assert_eq!(h.encode().len(), h.encoded_len());
-        // 56 fixed + (8 + 2×16) + (8 + 1×16) = 56 + 40 + 24 = 120
-        assert_eq!(h.encoded_len(), 120);
+        // 36 fixed + (12 + 2×32) + (12 + 1×32) + 2×16 = 36 + 76 + 44 + 32
+        assert_eq!(h.encoded_len(), 188);
     }
 
     #[test]
@@ -378,27 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn variable_width_layers_decode_at_the_right_offsets() {
-        // The point of the variable-width table: a six-projection layer and a
-        // seven-projection layer in one file, and the second still parses.
-        let mut h = two_layers();
-        h.layers[0].projections.extend([ProjectionSpan {
-            role: LayerTensor::FfnDown,
-            offset: 0x180,
-            bytes: 0x40,
-            dtype: GgmlDType::Q4_K,
-        }]);
-        let back = PackHeader::decode(&h.encode()).unwrap();
-        assert_eq!(back, h);
-        assert_eq!(back.layers[0].projections.len(), 3);
-        assert_eq!(back.layers[1].projections.len(), 1);
-        assert_eq!(back.layers[1].kind, MixKind::Attention);
-    }
-
-    #[test]
     fn a_short_buffer_is_refused_not_truncated() {
         let bytes = two_layers().encode();
-        for cut in [0, 8, 40, 55, 60, 90, 119] {
+        for cut in [0, 8, 35, 40, 60, 120, 187] {
             assert!(
                 PackHeader::decode(&bytes[..cut]).is_err(),
                 "a {cut}-byte header must be refused"
@@ -410,68 +409,41 @@ mod tests {
     #[test]
     fn a_foreign_magic_is_refused() {
         let mut bytes = two_layers().encode();
-        bytes[7] = b'2';
+        bytes[7] = b'1';
         let err = PackHeader::decode(&bytes).unwrap_err().to_string();
         assert!(err.contains("magic mismatch"), "{err}");
     }
 
     #[test]
-    fn an_older_version_is_refused_rather_than_adapted_to() {
+    fn another_version_is_refused_rather_than_adapted_to() {
         let mut bytes = two_layers().encode();
-        bytes[8..12].copy_from_slice(&0u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
         let err = PackHeader::decode(&bytes).unwrap_err().to_string();
-        assert!(err.contains("version 0"), "{err}");
+        assert!(err.contains("version 1"), "{err}");
     }
 
     #[test]
     fn an_unknown_role_names_itself() {
         let mut bytes = two_layers().encode();
-        bytes[64..68].copy_from_slice(&999u32.to_le_bytes());
+        bytes[48..52].copy_from_slice(&999u32.to_le_bytes());
         let err = PackHeader::decode(&bytes).unwrap_err().to_string();
         assert!(err.contains("role 999"), "{err}");
     }
 
     #[test]
     fn an_absurd_layer_count_is_an_error_not_an_allocation() {
-        // The per-layer walk bounds itself against `buf.len()`, but the
-        // `with_capacity` ahead of it is reached first: a corrupt count asks the
-        // allocator for ~137 GiB, and `handle_alloc_error` aborts the process
-        // instead of returning the `Err` that rebuilds the pack. If this
-        // regresses the test does not fail — the runner dies.
         let mut bytes = two_layers().encode();
         bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = PackHeader::decode(&bytes).unwrap_err().to_string();
-        assert!(err.contains("at most"), "{err}");
+        assert!(err.contains("more than"), "{err}");
     }
 
+    /// A table that leaves out a pair its projections use is refused.
     #[test]
-    fn an_unknown_mixer_kind_names_itself() {
-        let mut bytes = two_layers().encode();
-        bytes[56..60].copy_from_slice(&7u32.to_le_bytes());
-        let err = PackHeader::decode(&bytes).unwrap_err().to_string();
-        assert!(err.contains("mixer kind 7"), "{err}");
-    }
-
-    #[test]
-    fn record_indices_skip_the_pinned_prefix() {
+    fn a_table_missing_a_pair_is_refused() {
         let mut h = two_layers();
-        h.num_layers = 6;
-        h.pinned_layers = 2;
-        assert_eq!(h.stored_layers(), 4);
-        assert_eq!(h.record_index(2).unwrap(), 0);
-        assert_eq!(h.record_index(5).unwrap(), 3);
-    }
-
-    #[test]
-    fn a_pinned_layer_has_no_record_and_says_so() {
-        let mut h = two_layers();
-        h.num_layers = 6;
-        h.pinned_layers = 2;
-        for pinned in [0, 1] {
-            let err = h.record_index(pinned).unwrap_err().to_string();
-            assert!(err.contains("inside the pinned prefix"), "{err}");
-        }
-        let err = h.record_index(6).unwrap_err().to_string();
-        assert!(err.contains("past the model's 6 layers"), "{err}");
+        h.pairs.pop();
+        let err = PackHeader::decode(&h.encode()).unwrap_err().to_string();
+        assert!(err.contains("fingerprints cover"), "{err}");
     }
 }

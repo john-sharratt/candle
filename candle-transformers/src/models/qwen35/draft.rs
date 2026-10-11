@@ -512,25 +512,21 @@ mod tests {
                 qwen35::draft::tests::a_draft_leaves_the_head_at_the_trunk_s_length \
                 -- --ignored --nocapture"]
     fn a_draft_leaves_the_head_at_the_trunk_s_length() -> Result<()> {
-        use super::super::quantized_loader::Qwen35LoadOptions;
-        use crate::models::batch_test::test_helpers::hf_get;
-        use crate::models::quantized_qwen35::from_gguf_path;
+        use crate::models::batch_test::test_helpers::gate_pack;
+        use crate::models::model_pack::{PackFamily, PackRequest};
+        use crate::models::quantized_qwen35::{
+            from_pack, QWEN35_9B, TOKENIZER_REPO, TOKENIZER_REV,
+        };
         use candle::quantized::Int8Mode;
 
-        let spec = crate::models::quantized_qwen35::QWEN35_9B;
-        let path = hf_get(spec.0, hf_hub::RepoType::Model, spec.1, spec.2)?;
         let device = Device::new_cuda(0)?;
-        let model = from_gguf_path(
-            &path,
-            &device,
-            Qwen35LoadOptions {
-                int8mode: Some(Int8Mode::Off),
-                expert_pack_dir: None,
-                mtp_path: None,
-                gate_donor_path: None,
-                tensor_overrides: Vec::new(),
-            },
-        )?;
+        let request = PackRequest::of(
+            PackFamily::Qwen35,
+            QWEN35_9B,
+            (TOKENIZER_REPO, TOKENIZER_REV),
+            Some(Int8Mode::Off),
+        );
+        let model = from_pack(&gate_pack(&request, &device)?, &device)?;
         assert!(model.has_drafter(), "the pinned 9B carries an MTP head");
         let head_kv = model.mtp_kv_layer().expect("a head means a head KV layer");
 

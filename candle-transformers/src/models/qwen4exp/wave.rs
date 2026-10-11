@@ -1913,8 +1913,14 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     /// The widest prefill **this card** can place: the rows whose whole tier —
     /// every phase, priced in [`Self::wave_geometry`] — fits the ground a
-    /// forward can reach ([`Self::placeable_tier_bytes`]), bounded by where
-    /// compute saturates and by what the KV side can hold.
+    /// forward can reach ([`Self::placeable_tier_bytes`]) **together with the
+    /// KV those rows write**, bounded by where compute saturates and by what the
+    /// KV side can hold.
+    ///
+    /// Together, because admit claims the wave's KV out of that same ground
+    /// before the tier is placed in what is left. Priced apart, a wave fitted
+    /// each half alone and its tier came up short by its own KV — on a 16 GB
+    /// card at BF16 ×8, by exactly the eight regions its prompts wrote.
     ///
     /// Not the generic single-phase bound (rows that fit a fixed 512 MiB FFN
     /// span), which cuts a 72 GB card's prefill to a fraction of the width its
@@ -1926,8 +1932,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
         let mut cap = MAX_PREFILL_TOKENS;
         if let Some(ground) = self.placeable_tier_bytes() {
+            let kv_row = self.kv_bytes_per_row(act_dtype).unwrap_or(0);
             let fits = WavePlan::new(self.wave_geometry(act_dtype))
-                .max_prefill_rows_for_tier(ground, WaveWidth::default());
+                .max_prefill_rows_for_tier_and_kv(ground, WaveWidth::default(), kv_row);
             if fits > 0 {
                 cap = cap.min(fits);
             }
@@ -1936,6 +1943,22 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             cap = cap.min(kv_fits);
         }
         cap
+    }
+
+    /// The same ground the width cap sizes against — [`Self::placeable_tier_bytes`].
+    fn prefill_ground_bytes(&self) -> Option<usize> {
+        self.placeable_tier_bytes()
+    }
+
+    /// K and V per KV head on the layers that page KV: the attention layers and
+    /// the draft head's — a quarter of the trunk — not every layer, which the
+    /// default charges.
+    fn kv_bytes_per_row(&self, act_dtype: DType) -> Option<usize> {
+        let cfg = &self.model.cfg;
+        let per_layer = 2 * cfg.num_kv_heads * cfg.attn_head_dim * act_dtype.size_in_bytes();
+        per_layer
+            .checked_mul(cfg.kv_layers().total())
+            .filter(|&bytes| bytes > 0)
     }
 
     fn reclaimable_kv_bytes(&self) -> usize {

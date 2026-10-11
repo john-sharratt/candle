@@ -11,6 +11,8 @@
 //! - [`hub_load_safetensors`] / `hub_load_local_safetensors` resolve a
 //!   sharded checkpoint's file list from a `model.safetensors.index.json`
 //!   weight map, for models too large for a single safetensors file.
+//! - `model_pack::pack_checkpoint` packs a checkpoint an example names into the
+//!   model cache, for the models that load from a model pack.
 //! - `token_output_stream` (`TokenOutputStream`) buffers decode-in-progress
 //!   BPE tokens so partial UTF-8 sequences aren't printed until complete;
 //!   used by every streaming text-generation example.
@@ -23,6 +25,8 @@ pub mod audio;
 pub mod bs1770;
 pub mod coco_classes;
 pub mod imagenet;
+#[cfg(feature = "cuda")]
+pub mod model_pack;
 pub mod token_output_stream;
 pub mod wav;
 use candle::utils::{cuda_is_available, metal_is_available};

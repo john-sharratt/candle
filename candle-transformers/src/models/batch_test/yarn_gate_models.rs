@@ -28,12 +28,13 @@ use candle::{Device, Result};
 use hf_hub::RepoType;
 use tokenizers::Tokenizer;
 
-use super::test_helpers::hf_get;
+use super::test_helpers::{gate_pack, hf_get};
 use super::yarn_gates::{
     answer_of, crossing_read, greedy_together, needle_prompt, needle_read, report, Read, NEEDLE_KEY,
 };
 use crate::models::batched_inference::{BatchedConfig, ManagedBatchedModel};
 use crate::models::batched_model::{ensure_vram_governor, BatchedInference};
+use crate::models::model_pack::{PackFamily, PackRequest};
 use crate::models::rope_schedule::{DeclaredScaling, RopePreset, RopeSchedule};
 
 fn tokenizer(repo: &str, rev: &str) -> Result<Tokenizer> {
@@ -113,26 +114,25 @@ fn judge(depths: &[usize], progressive: &[(Read, u32)], control: &[(Read, u32)],
 #[ignore = "loads Qwen3-30B-A3B Q4_K_M (~18 GB) and prefills to 112K; \
             run with --ignored --nocapture --test-threads=1, daemon stopped"]
 fn yarn_gates_qwen3_30b_a3b() -> Result<()> {
-    use crate::models::quantized_qwen3_moe::{GgufLoadOptions, ModelWeights};
+    use crate::models::quantized_qwen3_moe::ModelWeights;
 
     let device = Device::new_cuda(0)?;
     let tok = tokenizer("Qwen/Qwen3-30B-A3B", "main")?;
-    let path = hf_get(
-        "unsloth/Qwen3-30B-A3B-GGUF",
-        RepoType::Model,
-        "main",
-        "Qwen3-30B-A3B-Q4_K_M.gguf",
+    let pack = gate_pack(
+        &PackRequest::of(
+            PackFamily::Routed,
+            (
+                "unsloth/Qwen3-30B-A3B-GGUF",
+                "",
+                "Qwen3-30B-A3B-Q4_K_M.gguf",
+            ),
+            ("Qwen/Qwen3-30B-A3B", "main"),
+            Some(Int8Mode::auto(&device)),
+        ),
+        &device,
     )?;
     ensure_vram_governor(&device);
-    let weights = ModelWeights::from_gguf_with_options(
-        &path,
-        &device,
-        None,
-        GgufLoadOptions {
-            int8mode: Some(Int8Mode::auto(&device)),
-            expert_pack_dir: path.parent().map(|p| p.to_path_buf()),
-        },
-    )?;
+    let weights = ModelWeights::from_pack(&pack, &device, None)?;
     let inv = weights
         .rope_inv_freq()
         .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;
@@ -208,18 +208,22 @@ fn yarn_gates_qwen3_30b_a3b() -> Result<()> {
 #[ignore = "loads Qwen3.5-0.8B and prefills to 512K; \
             run with --ignored --nocapture --test-threads=1, daemon stopped"]
 fn yarn_gates_qwen35_0_8b() -> Result<()> {
-    use crate::models::quantized_qwen35::{
-        from_gguf_path, QWEN35_0_8B, TOKENIZER_REPO, TOKENIZER_REV,
-    };
+    use crate::models::quantized_qwen35::{from_pack, QWEN35_0_8B, TOKENIZER_REPO, TOKENIZER_REV};
     use crate::models::qwen35::rope::LINEAGE_L0;
-    use crate::models::qwen35::Qwen35LoadOptions;
 
     let device = Device::new_cuda(0)?;
     let tok = tokenizer(TOKENIZER_REPO, TOKENIZER_REV)?;
-    let (repo, rev, file) = QWEN35_0_8B;
-    let path = hf_get(repo, RepoType::Model, rev, file)?;
+    let pack = gate_pack(
+        &PackRequest::of(
+            PackFamily::Qwen35,
+            QWEN35_0_8B,
+            (TOKENIZER_REPO, TOKENIZER_REV),
+            None,
+        ),
+        &device,
+    )?;
     ensure_vram_governor(&device);
-    let mut model = from_gguf_path(&path, &device, Qwen35LoadOptions::default())?;
+    let mut model = from_pack(&pack, &device)?;
     let depths = [131_072, 393_216, 524_288 - 8_192];
     assert!(depths[1] > LINEAGE_L0);
 
@@ -241,15 +245,13 @@ fn yarn_gates_qwen35_0_8b() -> Result<()> {
 #[ignore = "loads this card's Flash-Next engine artifact and prefills to 512K; \
             run with --ignored --nocapture --test-threads=1, daemon stopped"]
 fn yarn_gates_qwen38_flash_next() -> Result<()> {
-    use crate::models::quantized_qwen38_moe::{
-        prepared_engine_gguf, TOKENIZER_REPO, TOKENIZER_REV,
-    };
+    use crate::models::quantized_qwen38_moe::{engine_pack, TOKENIZER_REPO, TOKENIZER_REV};
     use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
 
-    let merged = prepared_engine_gguf()?;
     let device = Device::new_cuda(0)?;
+    let pack = engine_pack(&device, Some(Int8Mode::auto(&device)))?;
     let tok = tokenizer(TOKENIZER_REPO, TOKENIZER_REV)?;
-    let gpu = Qwen4ExpGpu::load(&merged, &device, Int8Mode::auto(&device))?;
+    let gpu = Qwen4ExpGpu::load(&pack, &device)?;
     let mut model = Qwen4ExpBatched::new(gpu)?;
     let depths = [131_072, 393_216, 524_288 - 8_192];
 

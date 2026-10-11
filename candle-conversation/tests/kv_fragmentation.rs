@@ -66,7 +66,8 @@ fn resolved(name: &str) -> ModelProfile {
 ///
 /// Every machine holds only its own rung's engine artifact, so the probe takes the
 /// same `quant_ladder::expert_format` choice the forward gate does — the 16 GB
-/// laptop runs `Q2_KO` experts, the 72 GB card `Q4_KO`, from one row of thresholds.
+/// laptop and the 24 GB RTX 3090 run `Q3_KO` experts, the 72 GB card `Q4_KO`, from
+/// one row of thresholds.
 fn flash_next_row() -> ModelProfile {
     let mut row = resolved("qwen38-flash-next");
     let device = Device::new_cuda(0).expect("CUDA device");
@@ -568,11 +569,11 @@ fn ladder_rows(
     Box<dyn ManagedBatchedModel + Send>,
 ) {
     let builder = probe.builder();
-    let (model_path, tokenizer_path) = builder.resolve_paths_pub().expect("resolved paths");
-    let tokenizer_json = std::fs::read_to_string(&tokenizer_path).expect("tokenizer json");
-    println!("Loading {model_path:?} …");
+    let resolved = builder.resolve_model(device).expect("model pack resolved");
+    let tokenizer_json = resolved.tokenizer_json.clone();
+    println!("Loading {:?} …", resolved.pack);
     let loaded = builder
-        .load_model(&model_path, device, None)
+        .load_model(&resolved.pack, device, None)
         .expect("model loaded");
     let model = loaded.model;
 
@@ -620,12 +621,12 @@ fn ladder_and_engine(
     // model a daemon actually runs, rather than on a differently-configured twin — which
     // is what makes the two rows comparable at all.
     let builder = probe.builder();
-    let (model_path, tokenizer_path) = builder.resolve_paths_pub().expect("resolved paths");
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).expect("tokenizer");
-    let tokenizer_json = std::fs::read_to_string(&tokenizer_path).expect("tokenizer json");
-    println!("Loading {model_path:?} …");
+    let resolved = builder.resolve_model(&device).expect("model pack resolved");
+    let tokenizer = resolved.tokenizer().expect("tokenizer");
+    let tokenizer_json = resolved.tokenizer_json.clone();
+    println!("Loading {:?} …", resolved.pack);
     let loaded = builder
-        .load_model(&model_path, &device, None)
+        .load_model(&resolved.pack, &device, None)
         .expect("model loaded");
     let model = loaded.model;
 
@@ -714,7 +715,8 @@ fn ladder_and_engine(
     // Skipped when the caller only wants the ladder. The model is dropped either way; the
     // borrow above has ended, so nothing keeps it alive past this point.
     let outcome = if with_engine {
-        let outcome = run_on_model(&probe, &device, tokenizer, model).expect("the probe ran");
+        let outcome =
+            run_on_model(&probe, &device, &resolved.pack, tokenizer, model).expect("the probe ran");
         summarise(name, &outcome);
         Some(outcome)
     } else {
