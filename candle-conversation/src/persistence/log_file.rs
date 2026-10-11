@@ -612,14 +612,55 @@ mod tests {
     use super::*;
     use crate::persistence::record::{encode_record, record_head, RecordHeader, RecordType};
 
-    fn tmp_path(tag: &str) -> std::path::PathBuf {
+    /// A log file path in the temp directory, removed when the guard drops —
+    /// whether the test returns or panics.
+    ///
+    /// **A test's file is the test's to delete.** A bare path left the deletion
+    /// to the test's last line, which a failing assert never reaches, and to a
+    /// test that remembered: `a_large_log_still_grows_in_whole_extents` grows
+    /// its log past 64 MiB and kept no path to delete it by, so every run left
+    /// 128 MiB in `%TEMP%` — 24 GB of them before anyone looked.
+    struct TmpLog(std::path::PathBuf);
+
+    impl std::ops::Deref for TmpLog {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TmpLog {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpLog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn tmp_path(tag: &str) -> TmpLog {
         let mut p = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         p.push(format!("kvtier_logfile_{tag}_{nanos}.log"));
-        p
+        TmpLog(p)
+    }
+
+    /// The guard removes its file on drop, whatever the test did with it.
+    #[test]
+    fn a_test_log_is_removed_when_its_guard_drops() {
+        let kept = {
+            let path = tmp_path("guard");
+            std::fs::write(&path, b"x").expect("write");
+            assert!(path.exists());
+            path.to_path_buf()
+        };
+        assert!(!kept.exists(), "{kept:?} outlived its guard");
     }
 
     /// **A log that writes a few bytes costs a few bytes, not 64 MiB.**
@@ -656,7 +697,8 @@ mod tests {
     /// so the syscall-rarity argument the constant rests on still holds.
     #[test]
     fn a_large_log_still_grows_in_whole_extents() {
-        let mut log = LogFile::create(&tmp_path("large_extent")).expect("create");
+        let path = tmp_path("large_extent");
+        let mut log = LogFile::create(&path).expect("create");
         // Ask for a byte past the boundary: the target must land on a 64 MiB
         // multiple, not a 1 MiB one.
         log.grow_to(GROW_EXTENT + 1).expect("grow");
