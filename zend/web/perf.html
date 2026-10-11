@@ -104,10 +104,10 @@ const tokPerSec = (w) => (w.ws > 0 ? w.tok / (w.ws / 1000) : 0);
 
 /* One hue per scheduler phase, so the flip between small-batch decode and
  * large-batch prefill reads at a glance rather than by hunting a legend. */
-const PHASES = ['decode', 'prefill', 'section', 'projection', 'sealing', 'eviction', 'allocation',
+const PHASES = ['decode', 'prefill', 'projection', 'sealing', 'eviction', 'allocation',
   'requests', 'housekeeping', 'blocked', 'sync', 'idle'];
 const PH = {
-  decode: 'var(--ok)', prefill: 'var(--info)', section: '#818cf8',
+  decode: 'var(--ok)', prefill: 'var(--info)',
   projection: '#c084fc', sealing: 'var(--warn)', eviction: 'var(--crit)',
   allocation: '#94a3b8', requests: '#2dd4bf', housekeeping: '#a3e635',
   blocked: '#ec4899', sync: '#e11d48', idle: 'var(--line-2)',
@@ -171,11 +171,10 @@ mount(document.getElementById('page'),
       'End-to-end tokens per second — tokens ÷ wave wall-time. Falls when the migration drain takes the shared '
       + 'stream from prefill under pressure.', cTok),
     card('Phase throughput',
-      'Tokens per second <b>per phase</b>. Two scales: <b>left</b> is large-batch prefill and section, '
+      'Tokens per second <b>per phase</b>. Two scales: <b>left</b> is large-batch prefill, '
       + '<b>right</b> is decode — otherwise single-sequence decode flat-lines under prefill.',
       h('div', { class: 'legend' },
         h('span', {}, h('i', { style: `background:${PH.prefill}` }), 'prefill — left'),
-        h('span', {}, h('i', { style: `background:${PH.section}` }), 'section — left'),
         h('span', {}, h('i', { style: `background:${PH.decode}` }), 'decode — right')),
       cPhRate)),
   h('div', { class: 'grid g2' },
@@ -189,7 +188,7 @@ mount(document.getElementById('page'),
     card('Migration passes', 'How long a drain takes, and how much of it is compress-to-warm rather than the copy.', cMig),
     card('Projection cost', 'Where projection time goes: drain, re-projection, scan, layout.', cProj)),
   h('div', { class: 'grid g2' },
-    card('Active work', 'Resident conversations, and the decode / prefill / section widths sharing them.', cSlots),
+    card('Active work', 'Resident conversations, and the decode / prefill widths sharing them.', cSlots),
     card('Promotions', 'What the scheduler promoted, by name.', promoteList)));
 
 /* ── charts ─────────────────────────────────────────────────────────────── */
@@ -262,7 +261,6 @@ add(makeChart(cPhRate, () => {
     xs: mins.map(([m]) => -m),
     series: [
       series(mins.map(([, e]) => rate(e, 'prefill')), PH.prefill, 'prefill'),
-      series(mins.map(([, e]) => rate(e, 'section')), PH.section, 'section'),
       series(mins.map(([, e]) => rate(e, 'decode')), PH.decode, 'decode', { axis: 'r' }),
     ],
     y2: true, fmt: fmtNum, y2Fmt: fmtNum, y2Color: PH.decode,
@@ -327,8 +325,7 @@ add(makeChart(cSlots, () => ({
   series: [
     series(W.map((w) => w.slots), 'var(--accent)', 'resident'),
     series(W.map((w) => w.dec), PH.decode, 'decode'),
-    series(W.map((w) => w.pre), PH.prefill, 'prefill'),
-    series(W.map((w) => w.sec), PH.section, 'section'),
+    series(W.map((w) => w.pre + w.sec), PH.prefill, 'prefill'),
   ],
   yFmt: (v) => v.toFixed(0),
 })));

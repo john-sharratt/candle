@@ -2862,23 +2862,28 @@ impl WaveStats {
             });
         };
         inference(PhaseKind::Decode, &self.decode, decode_dur);
-        inference(PhaseKind::Section, &self.section, section_dur);
-        // Prefill emitted directly (not via `inference`) so the drain-path ingest
-        // prefill's tokens are folded in with the async-queue prefill's — matching
-        // the `drain_prefill` time already folded into `prefill_dur`.
-        let prefill_tok = self.prefill.tok_sum + self.drain_prefill_tokens;
+        // One prefill band for every prefill the window ran: the async-queue
+        // dialogue prefill, the drain-path ingest prefill, and section ingest —
+        // which is prefill of a section's tokens, run by the same wave step from
+        // the prefill quantum. Charted apart, a section sweep's time sat in
+        // prefill while its tokens went to section: a 2.1 s, 93-token sweep drew
+        // a 3 ms section band at 31,000 tok/s beside a token-less prefill band.
+        let prefill_dur = prefill_dur + section_dur;
+        let prefill_tok = self.prefill.tok_sum + self.drain_prefill_tokens + self.section.tok_sum;
         let prefill_seqs = self
             .prefill
             .seq_max
+            .max(self.section.seq_max)
             .max(if drain_prefill > 0 { 1 } else { 0 });
-        if self.prefill.fwds > 0 || prefill_dur > 0 || prefill_tok > 0 {
+        let prefill_fwds = self.prefill.fwds + self.section.fwds;
+        if prefill_fwds > 0 || prefill_dur > 0 || prefill_tok > 0 {
             phases.push(PhaseMeasure {
                 kind: PhaseKind::Prefill,
                 dur_ms: prefill_dur as u32,
                 tokens: prefill_tok,
                 bytes: 0,
                 seqs: prefill_seqs as u32,
-                count: self.prefill.fwds as u32,
+                count: prefill_fwds as u32,
             });
         }
         let push = |phases: &mut Vec<PhaseMeasure>, kind, dur: u64, bytes, count| {
