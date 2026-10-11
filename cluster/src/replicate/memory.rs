@@ -10,12 +10,12 @@
 //! in any arrival order.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use applied_set::AppliedSet;
 
-use super::store::{Applied, Listing, Store, Tap, GEN_DETACHED};
+use super::store::{Applied, Disk, Listing, Store, Tap, Tombstones, GEN_DETACHED};
 use crate::consensus::{Change, MaxMembers};
 use crate::frame::{Gone, RecordHeader};
 
@@ -168,6 +168,10 @@ pub struct MemoryStore {
     inner: Mutex<Inner>,
     tap: Mutex<Option<Tap>>,
     reloads: AtomicU64,
+    /// The volume it reports, set by the tests.
+    disk: Mutex<Disk>,
+    /// Whether a test write fails: the volume is full.
+    full: AtomicBool,
 }
 
 impl MemoryStore {
@@ -180,7 +184,24 @@ impl MemoryStore {
             }),
             tap: Mutex::new(None),
             reloads: AtomicU64::new(0),
+            disk: Mutex::new(Disk {
+                free: 1 << 40,
+                total: 2 << 40,
+                write_failed: false,
+            }),
+            full: AtomicBool::new(false),
         }
+    }
+
+    /// The volume now has `free` of `total` bytes free; `full` says whether a
+    /// write fails for lack of space.
+    pub fn set_disk(&self, free: u64, total: u64, full: bool) {
+        *self.disk.lock().unwrap_or_else(|e| e.into_inner()) = Disk {
+            free,
+            total,
+            write_failed: full,
+        };
+        self.full.store(full, Ordering::Relaxed);
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
@@ -485,6 +506,33 @@ impl Store for MemoryStore {
 
     fn reload(&self) {
         self.reloads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn disk(&self) -> Disk {
+        *self.disk.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn test_write(&self) -> bool {
+        let ok = !self.full.load(Ordering::Relaxed);
+        if ok {
+            self.disk
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .write_failed = false;
+        }
+        ok
+    }
+
+    fn drop_dead_segment(&self) -> bool {
+        false
+    }
+
+    fn deferred(&self) -> Vec<(String, u64, usize)> {
+        Vec::new()
+    }
+
+    fn tombstones(&self) -> Tombstones {
+        Tombstones::default()
     }
 }
 

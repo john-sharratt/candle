@@ -190,6 +190,15 @@ pub fn pick_maintenance_op(stats: &[SegmentStat], force: bool) -> Option<Mainten
     None
 }
 
+/// Drop the first fully-dead segment, and nothing else: no relocation, so no
+/// scratch space.
+pub fn pick_drop(stats: &[SegmentStat]) -> Option<MaintenanceOp> {
+    stats
+        .iter()
+        .find(|s| s.live_bytes == 0)
+        .map(|s| MaintenanceOp::Drop(s.id))
+}
+
 /// What a stream sheds, matching [`super::compaction::collect_live_records`].
 ///
 /// # Turn tombstones were missing from this, and that is why nothing compacted
@@ -819,6 +828,21 @@ impl SubstratePersistence {
         substrate: &Substrate,
         force: bool,
     ) -> Result<Option<MaintenancePlan>> {
+        self.plan_with(substrate, |stats| pick_maintenance_op(stats, force))
+    }
+
+    /// [`Self::plan_maintenance`] restricted to dropping a fully-dead segment:
+    /// what a member whose volume is full may still run, since a drop needs no
+    /// scratch space (`docs/replicated_substrate.md` §7.7).
+    pub fn plan_drop(&self, substrate: &Substrate) -> Result<Option<MaintenancePlan>> {
+        self.plan_with(substrate, pick_drop)
+    }
+
+    fn plan_with(
+        &self,
+        substrate: &Substrate,
+        pick: impl Fn(&[SegmentStat]) -> Option<MaintenanceOp>,
+    ) -> Result<Option<MaintenancePlan>> {
         if self.is_read_only() {
             return Ok(None);
         }
@@ -839,7 +863,7 @@ impl SubstratePersistence {
                 age_secs: self.segments.sealed_age_secs(id, now)?,
             });
         }
-        let Some(op) = pick_maintenance_op(&stats, force) else {
+        let Some(op) = pick(&stats) else {
             return Ok(None);
         };
         // Re-emit the resident (metadata) set only when this op could otherwise
@@ -4083,6 +4107,14 @@ mod tests {
             pick_maintenance_op(&dead, false),
             Some(MaintenanceOp::Compact(SegmentId(1)))
         );
+    }
+
+    /// A full volume's pass drops a dead segment and never relocates.
+    #[test]
+    fn a_drop_only_pass_drops_and_nothing_else() {
+        let stats = [stat(1, 1000, 100, 999), stat(2, 1000, 0, 0)];
+        assert_eq!(pick_drop(&stats), Some(MaintenanceOp::Drop(SegmentId(2))));
+        assert_eq!(pick_drop(&stats[..1]), None, "a compaction is not a drop");
     }
 
     #[test]

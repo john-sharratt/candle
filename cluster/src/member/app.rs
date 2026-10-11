@@ -20,7 +20,8 @@ use crate::close::{Close, CloseCode};
 use crate::dial::{dial, Attempt, Connect, Stopped};
 use crate::dispatch::RouteTable;
 use crate::frame::{
-    Admit, BuildId, Capacity, Claim, Frame, Hello, MemberState, Members, ModelId, Routes, Unclaim,
+    Admit, BuildId, Capacity, Claim, Epoch, Frame, Hello, MemberState, Members, ModelId, Routes,
+    Unclaim,
 };
 use crate::handshake::{GroupKey, HandshakeError, PROTO};
 use crate::replicate::{Phase, Replication, Replicator};
@@ -356,12 +357,17 @@ impl AppMember {
         }
     }
 
-    /// What `CAPACITY` reports on socket `c`: ready only once the member is
-    /// in the group and that socket's admission catch-up has finished (§7.2).
+    /// What `CAPACITY` reports on socket `c`: `fault` with a full disk (§7.7),
+    /// `draining` while drained (§12.4), and ready only once the member is in
+    /// the group and that socket's admission catch-up has finished (§7.2).
     fn capacity_for(&self, c: usize) -> Capacity {
         let mut cap = (self.capacity)();
         if let Some(r) = &self.replicator {
-            if cap.state == MemberState::Ready && !r.socket_ready(c) {
+            if r.faulted() {
+                cap.state = MemberState::Fault;
+            } else if r.drained() {
+                cap.state = MemberState::Draining;
+            } else if cap.state == MemberState::Ready && !r.socket_ready(c) {
                 cap.state = MemberState::Loading;
             }
         }
@@ -462,6 +468,11 @@ impl AppMember {
             }));
         }
         gone.len()
+    }
+
+    /// The claims this member holds, by key.
+    pub fn own_claims(&self) -> Vec<(Vec<u8>, Epoch)> {
+        lock(&self.claims).own()
     }
 
     /// Hand back every claim this member holds — it is about to stop taking

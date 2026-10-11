@@ -17,6 +17,7 @@ use cluster::gateway::Hub;
 use cluster::handshake::GroupKey;
 use cluster::member::{AppMember, Identity};
 use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
+use cluster::replicate::{Store, Tombstones};
 use host::cluster::store::{ConversationStore, VOTES};
 use serde_json::json;
 use tempfile::TempDir;
@@ -152,6 +153,40 @@ async fn substrates_replicate_live_and_by_catch_up() {
             c.conv.applied_set(),
         );
         sa == sb && sb == sc
+    })
+    .await;
+}
+
+/// What operating a member reads of a real substrate (§7.7, §12.1): its
+/// volume measured with no write failed, a test write that succeeds, nothing
+/// deferred and no tombstones on a fresh store — and the member reports it in
+/// `COORD`, so the gateway's page carries its free space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_store_reports_its_disk_and_state() {
+    let dir = TempDir::new().unwrap();
+    let mut substrate = Substrate::new();
+    let sp = SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+    let conv = Conversation::from_parts(substrate, sp);
+    let store = ConversationStore::new(conv, 0, || {});
+    let disk = store.disk();
+    assert!(disk.total > 0 && disk.free <= disk.total, "{disk:?}");
+    assert!(!disk.write_failed);
+    assert!(store.test_write());
+    assert!(store.deferred().is_empty());
+    assert_eq!(store.tombstones(), Tombstones::default());
+    assert!(
+        !store.drop_dead_segment(),
+        "a fresh log has no dead segment"
+    );
+
+    let hub = Hub::new(key(), "gw");
+    let m = member(&hub);
+    let node = format!("{:016x}", m.conv.node());
+    until("the page has its disk", || {
+        hub.status(0)
+            .members
+            .iter()
+            .any(|r| r.node == node && r.coord.as_ref().is_some_and(|c| c.disk.total > 0))
     })
     .await;
 }

@@ -1,5 +1,5 @@
 //! What belongs to the process rather than to any tenant: the panic hook, the
-//! one tracing subscriber, and the shutdown signal.
+//! one tracing subscriber, and the stop signal.
 //!
 //! Each was a copy per daemon, and each is process-wide by nature — a second
 //! `tracing` subscriber panics at `init`, a second panic hook replaces the
@@ -128,9 +128,8 @@ pub fn fatal(tenant: &str, why: &str) -> ! {
     exit(1)
 }
 
-/// Resolves when the process receives Ctrl-C (or `SIGTERM` on Unix). A
-/// *second* Ctrl-C aborts at once — the escape hatch if the drain wedges.
-pub async fn shutdown_signal() {
+/// Resolves when the process receives Ctrl-C (or `SIGTERM` on Unix).
+pub async fn stop_signal() {
     let interrupted = async {
         ctrl_c().await.expect("failed to install Ctrl-C handler");
     };
@@ -149,10 +148,13 @@ pub async fn shutdown_signal() {
         _ = interrupted => {}
         _ = terminate => {}
     }
-    tracing::warn!(
-        "shutdown signal received — draining in-flight work; press Ctrl-C again to abort"
-    );
+}
 
+/// From here on a Ctrl-C aborts at once (`exit(130)`) — the escape hatch for
+/// a stop that wedges. Armed once a stop has begun, so after the Ctrl-C that
+/// began it this is the second.
+pub fn abort_on_ctrl_c() {
+    tracing::warn!("stopping — draining in-flight work; press Ctrl-C again to abort");
     tokio::spawn(async {
         if ctrl_c().await.is_ok() {
             tracing::error!("second Ctrl-C — aborting immediately");

@@ -1,8 +1,10 @@
 # Replicated substrate: zend, npcd and agents as members of the gateway
 
-**Status:** being built in §15's order. Chunks 1–5 are built: substrate identity and
+**Status:** being built in §15's order. Chunks 1–6 are built: substrate identity and
 order-independent apply, the `cluster` crate's wire protocol, consensus, members behind
-the gateway, and live replication with catch-up and rejoin. Chunks 6–10 are not.
+the gateway, live replication with catch-up and rejoin, and operating the cluster —
+fault mode, the maintenance commands, Ctrl-C draining first, `COORD` and the status
+page. Chunks 7–10 are not.
 **Scope:** a zend or npcd daemon started with
 `--cluster https://<host or ip>` — and a new kind of member, the *agent*, a CPU machine
 that runs command-line work inside repositories — dials that web gateway over one
@@ -1162,7 +1164,7 @@ Routes by group (the full table is in each crate's `declared`):
 | zend `/v1/conversations` (list), `/v1/repo_map`, `/v1/substrate/zend/*` reads | `Any` — replicated state |
 | zend `/v1/substrate/zend/*` writes (retiring the system prompt, tombstoning a timeline, a projection probe) | `Best` |
 | zend `/v1/substrate/zend/timeline/:tl/selection` | `Aggregate(FirstFound)` — in memory on whichever member last projected it |
-| zend `/v1/substrate/zend/layer/:name/toggle`, `/v1/substrate/zend/maintenance` | `Aggregate(Envelope)` — each member's own kill switch and log |
+| zend `/v1/substrate/zend/layer/:name/toggle` | `Aggregate(Envelope)` — each member's own kill switch. A maintenance pass is the `maintain` command (§12.4) |
 | npcd `/v1/npc/:nid/*` | `Owner(Path("nid"))` |
 | npcd `/v1/interaction/:ix*` | `Owner(Path("ix"))` — interaction ids are minted as `<nid>-<n>`, so the owner is in the id |
 | npcd `/v1/world/:wid/*` live state (channel, posting, the internal `act` route), `/v1/pulse/operations*`, `/v1/pulse/missions*` | `Owner(Path("wid"))`, the world's authority (§9.2); a route among them that names no world goes `Best` |
@@ -2426,11 +2428,11 @@ the group has to know the member can no longer write.
 - **An append or a commit fails for lack of space.** That is `ERROR_DISK_FULL` or
   `ERROR_HANDLE_DISK_FULL` on Windows, `ENOSPC` elsewhere. The redo log's staging,
   segment rotation and group fsync (`persistence/mod.rs:634-641,1917-1952`) are where it
-  surfaces.
+  surfaces; the log latches it (`persistence/space.rs`) until a test write succeeds.
 - **The substrate's volume falls below a floor** of 2 GiB free, or 1% of the volume if
-  that is larger. The persistence thread checks this on every pass, so a member
-  normally enters fault mode *before* a write fails, with room left to write its own
-  fault notice.
+  that is larger. The member measures the volume once a second (`replicate/fault.rs`),
+  so it normally enters fault mode *before* a write fails, with room left to write
+  its own fault notice.
 
 **Fault mode has one other cause: a candidate build that failed certification** (§3.8).
 It behaves the same way, with no requests routed to it, roles handed back, and still
@@ -2458,10 +2460,11 @@ rollout of its build (§3.11), never by itself.
   needs no free space, so what it wrote before the disk filled still reaches the
   group;
 - **answering catch-up `FETCH`es** for records it holds, which are reads;
-- **trying to free space.** It runs maintenance's `Drop` operations, which unlink
-  segments holding only dead records and need no scratch space (`persistence/maintenance.rs`),
-  and it expires tombstones that are due (§6.8). It does not start a `Compact` or
-  `Combine`, which would need room it does not have.
+- **trying to free space.** Once a second it runs a maintenance `Drop`, which unlinks a
+  segment holding only dead records and needs no scratch space
+  (`persistence/maintenance.rs`). It does not start a `Compact` or `Combine`, which would
+  need room it does not have — nor expire tombstones, since a tombstone shrinks only
+  inside a full compaction (§6.8).
 
 **The gateway stops relaying live events to it** and does not queue them. Queuing them
 would only fill the gateway's ordered lane and make the member lagging (§4.4). What the
@@ -3059,47 +3062,59 @@ tombstone expiry. That includes the ones only a member can see.
 
 A gateway sees its own queues, the claims it is told and the Paxos frames it carries. It
 cannot see a member's generation, its acceptor state, the promises and acceptances its
-proposals gathered, or how far it has caught up. So each
-member sends a `COORD` frame every 2 s, and at once on any change, on every socket.
+proposals gathered, or how far it has caught up. So each member sends a `COORD` frame on
+every socket: every 2 s, at once when its mode changes or a maintenance command starts
+or ends, and within a second of any other change (`replicate/coord.rs`). Its body is the
+JSON of `cluster::coord::CoordState`, fields in declaration order, so one state has one
+encoding; the gateway diffs each against the member's previous report — kept across its
+sockets, so a member that reconnects is logged for what changed while it was away — and
+writes the differences to the coordination log (`gateway/coord_log.rs`).
 
 | Field | |
 |---|---|
-| `mode` | joined, cut off for this app (with detached-event count), rejoining (catching up, taking its generation or waiting for a quorum to, sending detached), reloading after a turn ranked below one it held and why (§6.6), upgrading below the floor (§3.5), lagging (§4.4), in disconnected mode for which npcd worlds, or **in fault mode** (§7.7) |
+| `mode` | joined, cut off for this app, rejoining (catching up, taking its generation or waiting for a quorum to), reloading after a turn ranked below one it held (§6.6), draining (§12.4), upgrading below the floor (§3.5), in disconnected mode for which npcd worlds (§9.4), or **in fault mode** (§7.7). Fault outranks draining, and draining the rest. Whether it holds writes from while cut off is `detached` beside it. A member *lagging* (§4.4) is the gateway's own judgement, shown from its queues |
 | `upgrade` | its build; as a candidate, its certification state; the artifacts it is fetching or holds (bytes, resumes, verified); its place in a rollout (waiting, draining, swapping, starting, joined, failed and restored); its kept builds with their bytes; its substrate's log format and record census, against which a build is checked (§3.9); the latest `rollout/<app>` decision it holds (§3.11) |
 | `fault` | in fault mode: the reason (disk full, or certification failed), the volume's free space against the floor, since when, what it gave up (claims, worlds, characters), that it is still voting and the vote journal's slots in use, and space freed since |
 | `gen` | its current generation, the generation it took at its last rejoin, and the greatest `gen/<k>` decision it knows (§6.7) |
 | `deferred` | records it holds back because its build does not decode their type, by type and origin (§6.5) |
 | `clusters` | every `--cluster` it was given, with each one's socket state, so every gateway can show the others' view |
-| `paxos` | as proposer, for each key it proposed for or holds: its ballot, which members promised and which accepted against the quorum, `NACK`s with the higher ballot that beat it, and a lease's remaining term on its own clock; as acceptor, for each key: the promised ballot and the accepted value, with a lease's remaining time; and its `max_members` and quorum (§5.9) |
+| `paxos` | for each key it proposes for, holds, or has voted on: the round in progress, its ballot and phase, the members that promised or accepted it, and the higher ballot a `NACK` beat it with; a lease's remaining term on its own clock; and as acceptor, its promised and accepted ballots. With them its `max_members` and quorum (§5.9) |
 | `npc_leases` | the NPC leases it holds, by world, with expiry (§9.3) |
 | `claims` | the sticky keys it holds, with epochs (§5.4) |
 | `applied` | per origin: `applied_through`, gaps, and the origin's announced `high_water`, so a lag shows as a number (§7.1) |
-| `outbox` | its own events unsent and in flight, per socket (§6.3) |
-| `catchup` | the catch-up in progress: answerer, header ranges, records fetched against wanted and skipped, bytes, ETA (§7.2) |
-| `tombstones` | timeline tombstones held, how many are waiting for a full compaction, how many are waiting for age, and the oldest (§6.8) |
-| `clock` | its offset from this gateway's clock, measured from `PING` round trips (§3.4) |
+| `outbox` | its own events unsent and in flight (§6.3) |
+| `catchups` | each catch-up in progress: its socket and why it runs, its answerer, records fetched against wanted and skipped as held, and bytes fetched against wanted (§7.2) |
+| `tombstones` | timeline tombstones held, how many a full compaction has run past and so wait only for their age, and the deleted set's entries (§6.8) |
+| `disk` | the substrate's volume: free and total bytes, and the fault floor (§7.7) |
+| `commands` | the last 8 maintenance commands run on it: job, command, arguments, who ran it, when, and how it ended (§12.4) |
+
+Two of these are not the member's to report: the gateway measures a member's **clock
+offset** itself, from the `now_ms` of its `HELLO` against its own clock at admission
+(§3.4), and shows it on the member's row. And `upgrade`, `npc_leases` and the
+certification cause of `fault` arrive with the chunks that build what they describe —
+NPC leases with chunk 7, builds with chunk 9 (§15).
 
 ### 12.2 The page
 
 | Block | Shows |
 |---|---|
-| **Apps** | For zend, npcd and agent: the **mode** (dumb, with the configured upstream URL and its backoff state, or clustered) and when it last switched (§5.7); the build floor (count, hash, the node that set it), any pending floor with its grace countdown and the older members it will close, with `raise-floor` and `cancel-floor`, and whether builds are mixed (§3.5); the model lock (§3.6); the member count; **`max_members` and the quorum**, with whether it was raised automatically or set lower and by whom (flag or admin call), and a button for the admin call (§5.9); the decided tombstone retention *N* |
-| **Upgrades** (§3.8, §3.9) | Per app, the candidate build with its state (loading, certifying, passed, passed with gaps, rejected) and the grace countdown from when it became ready. **Certification, per route:** samples live and mirrored; error rate for candidate and baseline, with the test's result; p50 and p95 ratios; mirror mismatch rate, with the last few mismatching pairs shown side by side. **Distribution:** each member's artifact with bytes fetched, resumes, sources and verification; stranded members and why. **Rollout:** automatic or forced, and for a forced one who ran it, its direction and its source (§3.11); order, which members hold `upgrade/<app>` or its `parallel` leases, each member's step, any that failed and were restored, with the new process's last log lines. **Builds held:** every build any member of the app runs or keeps, newest first, with its holders and bytes, rejected builds marked, and a *Roll back to…* action on each. The commands for this block, `rollout`, `certify-anyway`, `reject-build`, `raise-floor`, `cancel-floor` and `pause-rollout`, sit here. |
+| **Apps** | For zend, npcd and agent: the **mode** (dumb or clustered) and when it last switched (§5.7); the build floor (count, hash, the node that set it) (§3.5); the model lock (§3.6); the member count and how many are ready; **`max_members` and the quorum**, the greatest any member reports while they converge (§5.9). Whether it was raised or set lower, and by whom, is in the log. Pending floors and their grace come with chunk 9 |
+| **Upgrades** (§3.8, §3.9; chunk 9) | Per app, the candidate build with its state (loading, certifying, passed, passed with gaps, rejected) and the grace countdown from when it became ready. **Certification, per route:** samples live and mirrored; error rate for candidate and baseline, with the test's result; p50 and p95 ratios; mirror mismatch rate, with the last few mismatching pairs shown side by side. **Distribution:** each member's artifact with bytes fetched, resumes, sources and verification; stranded members and why. **Rollout:** automatic or forced, and for a forced one who ran it, its direction and its source (§3.11); order, which members hold `upgrade/<app>` or its `parallel` leases, each member's step, any that failed and were restored, with the new process's last log lines. **Builds held:** every build any member of the app runs or keeps, newest first, with its holders and bytes, rejected builds marked, and a *Roll back to…* action on each. The commands for this block, `rollout`, `certify-anyway`, `reject-build`, `raise-floor`, `cancel-floor` and `pause-rollout`, sit here. |
 | **Faults** (§7.7) | Members in fault mode, at the top of the page and in red: reason, free space against the floor, since when, what each gave up, its unsent events, space freed; and members within 2× of the floor, as a warning before they fault |
-| **Members** | For each one: node, host, build (`count`, `hash`, and for a local build its `local` digest, flagged *local*, and *behind floor N* when it is), power and weight, idle, state (connecting / catching up / resyncing after a restart / ready / cut off / rejoining / waiting for a quorum to rejoin / reloading / upgrading / lagging / **fault**), free disk on its substrate's volume, its `mode` and `gen`, time connected, last joined, RTT, clock offset, the last close; and its `clusters` column, the socket state to every gateway it was given, which is what explains a member this gateway sees and another does not |
-| **Generations** (§6.7) | Members currently cut off, with detached events waiting; members rejoining, with their step, and any waiting for a quorum; the decided generations, newest first, each with the member that took it; the last rejoins: member, time away, external events caught up first, the generation taken, detached events sent; reloads in the last day, by cause (a rejoin, or a turn from a takeover across gateways, §6.6) |
-| **Claims** (§5.4) | Live claims per member, with epoch and idle time, as this gateway has been told them; moves in the last hour, and why (release, holder left, takeover); requests held at the catch-up barrier; `409`-then-`503` answers for keys whose holder is reachable only through another cluster |
-| **Consensus** (§5.9) | Every Paxos key, leases and decisions alike: its holder or decided value; the proposer's ballot and the members that promised and accepted, against the quorum; **each member's acceptor state** for the key (promised ballot, accepted value, a lease's time left), as reported in `COORD`, so a split vote shows member by member; rounds in flight and their phase, as seen in the frames this gateway carries; `NACK`s and duelling proposers; decided group values with when and by whom |
-| **World leases** (§9.2) | For each npcd world: its authority and term left; the member rendezvous names as proposer, flagged where it is not the authority; worlds with no holder, and why (no quorum reachable, a term still running out); handovers in progress, with the `through` the new proposer is waiting on |
-| **NPC leases** (§9.3) | Per world: characters by holder and expiry; characters held by members now away, which are not lent again until those members return; forced admin releases |
-| **Disconnected worlds** (§9.4) | Members running worlds in disconnected mode: which worlds, which characters, since when |
-| **Replication** | For each member and origin: `applied_through` against `high_water`, gaps, and lag in events and seconds (§7.1); its outbox, unsent and in flight per socket (§6.3); events in and out per second; bytes in and out per second, live, catch-up and `PULSE` separately; frames sent but not yet receipted; queued bytes per lane; pulses dropped under pressure |
-| **Recovery** | Retransmits after a dropped socket (events and bytes); catch-ups requested and answered, which member was picked, headers sent, records fetched against records skipped as already held, fetches re-sent, and catch-ups in progress with their ETA (§7.2); full resyncs after a restart, and the catch-ups other members ran against them (§7.5) |
-| **Tombstones** (§6.8) | Per member: tombstones held, waiting for a full compaction, waiting for age, and expired in the last day; the deleted set's entries and bytes; deleted-set entries learned by catch-up in the last day |
+| **Members** | For each one: node, host, build (`count`, `hash`, and for a local build its `local` digest, flagged *local*), power and weight, idle, free slots, state (loading — connecting or catching up — / ready / upgrading / draining / **fault**, and *lagging* beside it), its `mode` and `gen`, free disk on its substrate's volume, session, time connected, clock offset, the last close; and its `clusters` column, the socket state to every gateway it was given, which is what explains a member this gateway sees and another does not |
+| **Generations** (§6.7) | Per member: its mode, the generation it writes under, the one its last rejoin took, the greatest decided, whether it holds writes from while cut off, and the records it defers for a type its build does not decode (§6.5). Each rejoin, the generation it took, and each reload are in the log |
+| **Claims** (§5.4) | Live claims, with key, holder and epoch, as this gateway has been told them. Each claim taken and released is in the log; `409`-then-`503` answers are counted under Traffic |
+| **Consensus** (§5.9) | Every Paxos key each member knows — leases and decisions alike: the round it has in progress, its ballot and phase, the members that promised or accepted it, the ballot a `NACK` beat it with, a lease's time left, and **its acceptor's promised and accepted ballots**, as reported in `COORD`, so a split vote shows member by member |
+| **World leases** (§9.2; chunk 7) | For each npcd world: its authority and term left; the member rendezvous names as proposer, flagged where it is not the authority; worlds with no holder, and why (no quorum reachable, a term still running out); handovers in progress, with the `through` the new proposer is waiting on |
+| **NPC leases** (§9.3; chunk 7) | Per world: characters by holder and expiry; characters held by members now away, which are not lent again until those members return; forced admin releases |
+| **Disconnected worlds** (§9.4; chunk 7) | Members running worlds in disconnected mode: which worlds, which characters, since when |
+| **Replication** | For each member and origin: `applied_through` against `high_water`, how far behind that is, and the `oseq`s missing below the top (§7.1). Per member: its outbox, unsent and in flight (§6.3); this gateway's queues to it — live and catch-up bytes, live events skipped while it lagged, catch-up frames dropped at the cap (§4.4) |
+| **Recovery** | Per member: records applied and refused, catch-ups asked, catch-ups answered and records fetched for others, events retransmitted, reloads; and each catch-up in progress — its socket, why it runs, its answerer, records fetched against wanted and skipped as held, bytes (§7.2). Each catch-up starting and finishing, and each full resync's offer (§7.5), is in the log |
+| **Tombstones** (§6.8) | Per member: timeline tombstones held, those waiting only for their age, and the deleted set's entries. Each expiry is in the log |
 | **Traffic** | Open streams, requests per second, and the share of each dispatch class (§5.2); aggregates answered and members past their deadline (§5.5) |
 | **Failures** | HTTP exchanges failed by a dropped socket in the last hour, split into failed before the response head and aborted mid-body (§5.6) |
-| **Agents** | Cores, load, jobs queued and running, toolchains and repositories (§11) |
-| **Peers** (§13.4) | Peer gateways and their link state and build; session key and OAuth digests agreeing or not; certificates per site and gateway (`not_after`, digest, any gateway behind); each site's orderer and orders in progress, with any duplicate order a partition caused; challenges outstanding with peer acknowledgements; the shared ledger |
+| **Agents** (§11; chunk 8) | Cores, load, jobs queued and running, toolchains and repositories |
+| **Peers** (§13.4; chunk 10) | Peer gateways and their link state and build; session key and OAuth digests agreeing or not; certificates per site and gateway (`not_after`, digest, any gateway behind); each site's orderer and orders in progress, with any duplicate order a partition caused; challenges outstanding with peer acknowledgements; the shared ledger |
 | **Refusals** | The last 100 handshakes refused, with code, node, host and reason. That covers 4401 proof, 4410 build, 4412 model, 4417 clock, and the others (§3.4); members admitted to upgrade below the floor are listed in Upgrades, not here |
 
 ### 12.3 The coordination log
@@ -3149,15 +3164,20 @@ therefore shows on both pages, together with the member reports that explain it.
 
 ### 12.4 Maintenance commands
 
-The page runs maintenance on members from a **Commands** menu on each member's row, and
-on a whole app from the Apps block.
+The page runs maintenance from its **Commands** panel, which each member's row opens on
+that member and the Apps block opens on the app's `set-quorum`.
 
 **Every command is a route on the member.** It is `POST /v1/cluster/command/:name`, in
-the host crate's shared endpoints and admin only (`host/src/endpoints/mod.rs`). The page
-sends it with `x-tokera-node` (§5.2), so it rides that member's socket like any other
-request. "Run on all members of the app" sends it once per member. The same route works
-on a member's own listener, so a command can be run without a gateway: with `curl`, or
-on a member that is cut off.
+the host crate (`host/src/commands/`), admin only, its body an optional
+`{ app, from, max_members, confirm }`. The page sends it through
+`/gateway/member/<app>/<node>/v1/cluster/command/…` (`web/src/cluster/page.rs`), which
+forwards only `/v1/cluster/…` down that member's socket — the page is served on every
+host, so the member is named by app rather than by the host it was reached on. An
+admin's `x-tokera-node` (§5.2) reaches the same route through a site. "Every member"
+sends it once per member. The same route works on a member's own listener, so a command
+can be run without a gateway: with `curl`, or on a member that is cut off. A daemon
+without `--cluster` serves it too; the commands that act on a cluster then refuse with
+the reason.
 
 | Command | What it does | Built from |
 |---|---|---|
@@ -3165,9 +3185,9 @@ on a member that is cut off.
 | `undrain` | Take work again, after a catch-up. | |
 | `restart` | `drain`, wait for in-flight requests and the outbox to empty (bounded at 60 s), flush and commit the log, close its sockets with `1001`, then relaunch the same binary with the same arguments. | `self_heal::LaunchSpec::capture` / `relaunch_command` (`host/src/self_heal.rs:171-183`), which already relaunch a daemon with its launch arguments, one-shot flags dropped |
 | `shutdown` | `drain`, flush, close with `1001`, exit. Nothing restarts it. | |
-| `compact` | A full `compact()` of its substrate (`persistence/mod.rs:2169-2344`), run while drained. Refused in fault mode, and refused when free space is below the substrate's live size, because the scratch copy needs it. | zend's `--compact-substrate` (`zend/src/loading.rs:30`) as a command |
-| `maintain` | One incremental maintenance pass: Drop, Compact or Combine, as the planner picks (`persistence/maintenance.rs`). Allowed in fault mode only as Drop. | `POST /v1/substrate/zend/maintenance`, moved to the host so npcd has it too |
-| `expire-tombstones` | Run the tombstone expiry check now (§6.8). | |
+| `compact` | A full `compact()` of its substrate (`persistence/mod.rs:2169-2344`), run drained: a member not already drained drains for it and undrains after. Refused in fault mode, and refused when free space is below the substrate's live size, because the scratch copy needs it. | zend's `--compact-substrate` (`zend/src/loading.rs:30`) as a command |
+| `maintain` | One incremental maintenance pass: Drop, Compact or Combine, as the planner picks (`persistence/maintenance.rs`). Allowed in fault mode only as Drop. | zend's `POST /v1/substrate/zend/maintenance`, which it replaces, in the host so npcd has it too |
+| `expire-tombstones` | The tombstone expiry check (§6.8), which runs inside a full compaction: when any tombstone has had a complete compaction run past it, a `compact` as above, reporting how many expired; otherwise it says none can yet. | |
 | `audit` | The read-only liveness walk: what maintenance counts as live against what it carries (`persistence/liveness_audit.rs`). Reports, changes nothing. | |
 | `self-check` | zend only: ask every stored conversation whether it is intact, reporting and tombstoning nothing. | zend's `--self-check` (`zend/src/self_check/`) |
 | `catch-up` | Run a catch-up now (§7.2), from the member the gateway picks or from one named. | |
@@ -3179,18 +3199,22 @@ on a member that is cut off.
 
 **How a command runs.**
 
-- **It answers at once** with a job id. Its progress streams on
-  `GET /v1/cluster/command/job/:id`, in the NDJSON form npcd already uses
-  (`npcd/src/ndjson.rs:40-62`), and the page shows it under the member's row.
+- **It answers at once** — `202` with its job id and stream — and its progress streams
+  on `GET /v1/cluster/command/job/:id`, in the NDJSON form npcd already uses
+  (`npcd/src/ndjson.rs:40-62`): a `started` line with its arguments, a `step` line per
+  step, and exactly one terminal line, `done` with the result or `error` with the
+  reason. The page shows each job as it streams. A member keeps its last 32 jobs.
 - **It refuses with the reason** when the member is in the wrong state: `compact` in
-  fault mode, `undrain` while catching up, `restart` while another command is running.
-  One command runs per member at a time.
+  fault mode, `undrain` while catching up, anything while another command is running —
+  one command runs per member at a time (`409`). A request the member cannot parse is
+  `400`, a body with an unknown field `422`.
 - **A destructive command needs its target named twice.** For `shutdown`, `set-quorum`
   and `prune-builds`, the page asks for the member's host name
   typed out, and sends it as `confirm`. For `rollout`, it asks for the build's
   `count-hash`. A request without the matching name is refused.
-- **Every command is in the coordination log** (§12.3): who ran it, on which member,
-  with what arguments, and how it ended.
+- **Every command is in the coordination log** (§12.3): the member reports its last 8
+  commands in `COORD` — who ran it (the caller's email, or `local`), with what
+  arguments, and how it ended — and the gateway logs each as it starts and ends.
 
 **Ctrl-C drains first.** The first Ctrl-C, or `SIGTERM` on Unix, runs the same sequence
 as `shutdown`. Today `shutdown_signal` (`host/src/process.rs:131-162`) resolves on the
@@ -3199,13 +3223,16 @@ now does, in order:
 
 1. **`drain`.** It hands back every claim, world lease and NPC lease, and stops its
    characters at their next turn boundary. The gateways stop routing new work to it the
-   moment its `COORD` says so.
-2. **Waits**, bounded at 60 s, for in-flight requests to finish and for its outbox of
-   unsent and in-flight events to empty, so what it wrote reaches the group before it
-   goes.
-3. **Flushes and commits** the log.
-4. **Closes its sockets with `1001`.**
-5. **Runs the tenants' existing shutdown** (`docs/shared_model_host.md`).
+   moment its `CAPACITY` and `COORD` say so.
+2. **Flushes and commits** the log: everything its tenants handed the writer is on disk.
+3. **Waits**, bounded at 60 s, for its outbox of unsent and in-flight events to empty,
+   so what it wrote reaches the group before it goes (`host/src/cluster/leave.rs`).
+4. **Finishes the requests in flight**, as the HTTP server's graceful stop does.
+5. **Closes its sockets with `1001`.**
+6. **Runs the tenants' existing shutdown** (`docs/shared_model_host.md`).
+
+`shutdown` and `restart` run the same sequence (`host/src/stopping.rs`); `restart` then
+starts the same binary with the same arguments, one-shot flags dropped.
 
 The handover is complete before it exits: conversations it held move to other members,
 which catch up to its last write, and its worlds go to the next proposer at once. They
@@ -3217,9 +3244,10 @@ rules: claims lapse with the member, world leases run out after their term (§9.
 unsent events go out when the member next starts (§7.5). Ctrl-C on a daemon without
 `--cluster` behaves exactly as today.
 
-The loading page shows the drain as it runs, with each step and what is left, so a
-Ctrl-C at the console is visible to anyone watching the member's own page or the
-gateway's.
+The loading page shows the drain as it runs, with each step and what is left: while the
+process stops, every tenant's `/v1/status` line is loading again, its load the stop's
+step. So a Ctrl-C at the console is visible to anyone watching the member's own page or
+the gateway's.
 
 **Gateway commands**, for maintaining a gateway itself, on the Apps block:
 
@@ -3255,6 +3283,10 @@ gateway's.
   `1001`, to carry on through their other clusters. It then waits for its in-flight
   requests (bounded at 60 s) so it can be restarted without failing a request.
 - **`undrain-gateway`** reverses it.
+
+These two are the gateway's own, not a member's: `POST /gateway/command/drain-gateway`
+and `/undrain-gateway`, admin only, beside the page (`web/src/cluster/page.rs`), with a
+button for each in the page's header.
 
 ---
 
@@ -3655,10 +3687,17 @@ reconnected ends byte-identical to the other.
 - The maintenance commands and their job stream (§12.4), with zend's maintenance route
   moved into the host.
 - Ctrl-C draining first.
-- `COORD` and every status-page block (§12.1–§12.3).
-- The quorum admin call.
+- `COORD` and every status-page block whose state exists by now (§12.1–§12.3); the
+  Upgrades, World leases, NPC leases, Disconnected worlds, Agents and Peers blocks
+  arrive with the chunks that build what they show.
+- The quorum admin call, and `--cluster-quorum-max`.
 
-**Tests.** The fault-mode, command, quorum and status-page tables (§14.1).
+**Tests.** The fault-mode, command, quorum and status-page tables (§14.1):
+`cluster/tests/operation.rs` (fault mode and its hysteresis, a faulted member's vote, a
+member's drain, `COORD` on the page, the quorum call, a gateway's drain),
+`host/tests/cluster_member.rs` (commands through a real member and the log, leaving
+before a stop), `host/tests/replication_store.rs` (a real store's disk and state), and
+the unit tests of `coord_log`, `paxos_log`, `commands::{parse, jobs}` and `stopping`.
 
 **Exit.** A member whose disk fills stays connected and voting and recovers without
 help. Every command runs through the gateway and on a member's own listener alike.

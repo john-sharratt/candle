@@ -16,16 +16,21 @@ use axum::Router;
 use cluster::consensus::votes::MemoryVotes;
 use cluster::dispatch::{Dispatch, Merge};
 use cluster::frame::{BuildId, ModelId};
-use cluster::gateway::Hub;
+use cluster::gateway::{state_name, Hub};
 use cluster::handshake::GroupKey;
-use cluster::member::Link;
+use cluster::member::{Check, Link};
 use cluster::replicate::{MemoryStore, Replication, Store};
 use host::access::LocalSignin;
 use host::cluster::dial::Target;
+use host::cluster::leave::drain_and_send;
 use host::cluster::{Cluster, ClusterSettings, Join};
+use host::commands::jobs::Job;
+use host::commands::parse::{Body as CommandBody, Command};
+use host::commands::Commands;
 use host::guard::{dispatch_table, get, Api};
 use host::model::ModelView;
 use host::server::{builder, Listen};
+use host::stopping::Stopping;
 use host::telemetry::Telemetry;
 use host::TenantUi;
 use http_body_util::BodyExt;
@@ -136,6 +141,7 @@ async fn member(gateway: SocketAddr, node: u64, ui: &Path) -> Member {
         targets: vec![Target::parse(&format!("http://{gateway}"), None).unwrap()],
         key: key(),
         affinity_idle: Duration::from_secs(600),
+        quorum_max: None,
         host: format!("m{node}"),
         build: BuildId {
             count: 7,
@@ -348,6 +354,145 @@ async fn a_write_is_seen_by_the_next_request_on_any_member() {
         }
     }
     assert_eq!(readers.len(), 2, "reads reached both members");
+    a.cluster.close_all("test over");
+    b.cluster.close_all("test over");
+}
+
+/// Wait for the gateway's log to say `text` of `node`; on a timeout, fail with
+/// what it did say.
+async fn until_logged(hub: &Hub, node: &str, text: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let entries = hub.log.read(None, Some(node), 1000);
+        if entries.iter().any(|e| e.text.contains(text)) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let said: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
+            panic!("the log never said {text:?} of {node}; it said {said:#?}");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Wait for `job` to end; its last line.
+async fn ended(job: &Job) -> Value {
+    until("the job ended", || job.ended()).await;
+    job.snapshot().pop().unwrap()
+}
+
+/// **Commands on a member** (§12.4): `drain` hands back its claims and the
+/// gateway routes it nothing new, `undrain` makes it routable again, and each
+/// command shows in the gateway's coordination log through `COORD` — who ran
+/// it, and how it ended. `set-quorum` writes `max_members` lower.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commands_run_on_a_member_and_reach_the_log() {
+    let ui = tempfile::TempDir::new().unwrap();
+    std::fs::write(ui.path().join("index.html"), "<p>zend</p>").unwrap();
+    let dumb = closed_port().await;
+    let (gw, hub) = gateway(&format!("http://{dumb}")).await;
+    let a = member(gw, 1, ui.path()).await;
+    let b = member(gw, 2, ui.path()).await;
+    assert_eq!(a.connect(1).await, Link::Joined);
+    assert_eq!(b.connect(2).await, Link::Joined);
+    let routable = |n| hub.member("zend", n).is_some_and(|m| m.routable());
+    until("both routable", || routable(1) && routable(2)).await;
+    // Seen together, the two raise the group's size to two.
+    until("max_members two", || b.store.max_members() == 2).await;
+    let b_member = b.cluster.link("zend").unwrap().member().unwrap().clone();
+    assert!(matches!(b_member.claim(b"c-2"), Check::Took(_)));
+
+    let commands = Arc::new(Commands::new(
+        Some(b.cluster.clone()),
+        vec![],
+        Arc::new(Stopping::new()),
+        "m2".into(),
+    ));
+    let drain = commands
+        .start(
+            Command::Drain,
+            &CommandBody::default(),
+            "ops@example.com".into(),
+        )
+        .unwrap();
+    assert_eq!(
+        ended(&drain).await["result"],
+        json!({"zend": {"claims": 1, "leases": 0}})
+    );
+    until("b draining", || {
+        hub.member("zend", 2)
+            .is_some_and(|m| !m.routable() && state_name(m.state()) == "draining")
+    })
+    .await;
+    let b_hex = "0000000000000002";
+    until_logged(
+        &hub,
+        b_hex,
+        r#"command drain (job 1) by ops@example.com, with {"app":null}"#,
+    )
+    .await;
+    until_logged(&hub, b_hex, "command drain (job 1) ended: ok").await;
+
+    let undrain = commands
+        .start(
+            Command::Undrain,
+            &CommandBody::default(),
+            "ops@example.com".into(),
+        )
+        .unwrap();
+    assert_eq!(ended(&undrain).await["event"], "done");
+    until("b routable again", || routable(2)).await;
+
+    // A leaves for good; B, alone, is told the group is one.
+    a.cluster.close_all("retired");
+    until("a gone", || hub.member("zend", 1).is_none()).await;
+    sleep(Duration::from_secs(1)).await;
+    let quorum = commands
+        .start(
+            Command::SetQuorum { max_members: 1 },
+            &CommandBody::default(),
+            "ops@example.com".into(),
+        )
+        .unwrap();
+    assert_eq!(
+        ended(&quorum).await["result"],
+        json!({"zend": {"max_members": 1, "quorum": 1}})
+    );
+    until("b holds one", || b.store.max_members() == 1).await;
+    until_logged(&hub, b_hex, "max_members 2 → 1, quorum 1").await;
+    b.cluster.close_all("test over");
+}
+
+/// **Leaving first** (§12.4): before the process stops, a member drains and
+/// sends what it wrote; the stop's steps are what its loading page shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopping_member_drains_and_sends_first() {
+    let ui = tempfile::TempDir::new().unwrap();
+    std::fs::write(ui.path().join("index.html"), "<p>zend</p>").unwrap();
+    let dumb = closed_port().await;
+    let (gw, hub) = gateway(&format!("http://{dumb}")).await;
+    let a = member(gw, 1, ui.path()).await;
+    let b = member(gw, 2, ui.path()).await;
+    assert_eq!(a.connect(1).await, Link::Joined);
+    assert_eq!(b.connect(2).await, Link::Joined);
+    for k in 0..50 {
+        b.store.write(format!("b/{k}").as_bytes(), b"x");
+    }
+    let stopping = Stopping::new();
+    assert_eq!(drain_and_send(&b.cluster, &stopping).await, 0);
+    until("b draining", || {
+        hub.member("zend", 2)
+            .is_some_and(|m| state_name(m.state()) == "draining")
+    })
+    .await;
+    until("a holds everything b wrote", || {
+        (0..50).all(|k| a.store.value(format!("b/{k}").as_bytes()).is_some())
+    })
+    .await;
+    assert!(matches!(
+        stopping.step().map(|s| s.label),
+        Some("Flushing" | "Sending")
+    ));
     a.cluster.close_all("test over");
     b.cluster.close_all("test over");
 }

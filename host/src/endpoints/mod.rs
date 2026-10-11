@@ -22,9 +22,11 @@ use web::auth::{Role, Roles};
 use web::Roots;
 
 use crate::cluster::Cluster;
+use crate::commands::{self, Commands};
 use crate::guard::{get, post, Api, Guarded, Routes};
 use crate::logs::LogBus;
 use crate::model::ModelView;
+use crate::stopping::Stopping;
 use crate::telemetry::Telemetry;
 use crate::tenant::Reports;
 use crate::ui;
@@ -50,6 +52,11 @@ pub struct Shared {
     /// The cluster this process joined with `--cluster`, for `/v1/status`'s
     /// `cluster` block; `None` standalone.
     pub cluster: Option<Arc<Cluster>>,
+    /// The process's stop, whose step every tenant's loading page shows while
+    /// it runs.
+    pub stopping: Arc<Stopping>,
+    /// This machine's name: what a destructive command's `confirm` says.
+    pub host: String,
 }
 
 impl Shared {
@@ -66,16 +73,25 @@ impl Shared {
 /// from `common` — its library at `/common/`, and the estate's marks at
 /// `/brand/`, where the switcher addresses them on every host.
 pub fn routes(shared: Arc<Shared>, common: Roots) -> Routes {
-    let api = shared_table(shared.roles.clone()).into_routes(shared);
+    let roles = shared.roles.clone();
+    let commands = Arc::new(Commands::new(
+        shared.cluster.clone(),
+        shared.tenants.clone(),
+        Arc::clone(&shared.stopping),
+        shared.host.clone(),
+    ));
+    let api = shared_table(roles.clone()).into_routes(shared);
     let common = front_end_table().into_routes(common);
-    api.merge("host", common, "host")
+    api.merge("host", commands::routes(commands, roles), "host")
+        .and_then(|r| r.merge("host", common, "host"))
         .expect("the host's own routes are disjoint")
 }
 
 /// Every route the host serves, and the role each needs — the table merged
 /// with every tenant's at start, read without the state behind it.
 pub fn declared(roles: Roles) -> Vec<Guarded> {
-    let mut all = shared_table(roles).declared().to_vec();
+    let mut all = shared_table(roles.clone()).declared().to_vec();
+    all.extend_from_slice(commands::table(roles).declared());
     all.extend_from_slice(front_end_table().declared());
     all
 }
@@ -183,8 +199,10 @@ pub(crate) mod test_support {
     use tower::ServiceExt;
     use web::auth::session::Identity;
 
+    use candle_conversation::projection::Conversation;
+
     use crate::loading::LoadingView;
-    use crate::tenant::{MeShare, TenantStatus};
+    use crate::tenant::{CheckProgress, MeShare, TenantStatus};
 
     /// A tenant whose every report is fixed.
     pub struct Scripted {
@@ -219,6 +237,16 @@ pub(crate) mod test_support {
         fn me<'a>(&'a self, _: Option<&'a Identity>, _: Role) -> BoxFuture<'a, MeShare> {
             let m = self.me.clone();
             Box::pin(async move { m })
+        }
+        fn conversation(&self) -> Option<Conversation> {
+            None
+        }
+        fn self_check(&self, progress: CheckProgress) -> BoxFuture<'_, Result<Value, String>> {
+            Box::pin(async move {
+                progress(1, 2);
+                progress(2, 2);
+                Ok(json!({"checked": 2, "corrupt": 0}))
+            })
         }
     }
 
@@ -264,6 +292,8 @@ pub(crate) mod test_support {
             log: LogBus::new(&["zend", "npcd"]),
             telemetry: Telemetry::new(ModelView::of_prescribed()),
             cluster: None,
+            stopping: Arc::new(Stopping::new()),
+            host: "m1".into(),
         })
     }
 
@@ -278,17 +308,31 @@ pub(crate) mod test_support {
     }
 
     pub async fn call(app: &Router, method: &str, uri: &str, sub: Option<&str>) -> (u16, Value) {
+        send(app, method, uri, sub, None).await
+    }
+
+    /// `method uri` as `sub`, with `json` as its body when given.
+    pub async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        sub: Option<&str>,
+        json: Option<&str>,
+    ) -> (u16, Value) {
         let mut b = Request::builder().method(method).uri(uri);
         if let Some(s) = sub {
             b = b
                 .header("x-tokera-user", s)
                 .header("x-tokera-provider", "google");
         }
-        let res = app
-            .clone()
-            .oneshot(b.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let body = match json {
+            Some(j) => {
+                b = b.header("content-type", "application/json");
+                Body::from(j.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
         let status = res.status().as_u16();
         let bytes = axum::body::to_bytes(res.into_body(), 8 << 20)
             .await
@@ -297,6 +341,30 @@ pub(crate) mod test_support {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    /// A job's NDJSON stream, read to its end, as the admin.
+    pub async fn job_lines(app: &Router, id: u64) -> Vec<Value> {
+        let req = Request::builder()
+            .uri(format!("/v1/cluster/command/job/{id}"))
+            .header("x-tokera-user", "boss")
+            .header("x-tokera-provider", "google")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status().as_u16(), 200);
+        let bytes = axum::body::to_bytes(res.into_body(), 8 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let mut v: Value = serde_json::from_str(l).unwrap();
+                v.as_object_mut().unwrap().remove("at_ms");
+                v
+            })
+            .collect()
     }
 }
 
@@ -332,6 +400,9 @@ mod tests {
                 ("/v1/schema/layers", "user"),
                 ("/v1/substrate", "admin"),
                 ("/ws/logs", "admin"),
+                ("/v1/cluster/command/:name", "admin"),
+                ("/v1/cluster/command/job/:id", "admin"),
+                ("/v1/cluster/quorum", "admin"),
                 ("/common/*path", "unauthenticated"),
                 ("/brand/*path", "unauthenticated"),
             ]

@@ -10,10 +10,14 @@ use std::sync::Arc;
 
 use candle_conversation::models::DialectType;
 use candle_conversation::persistence::SUBSTRATE_DIR;
+use candle_conversation::projection::Conversation;
 use candle_conversation::Capabilities;
 use futures::future::BoxFuture;
 use host::loading::{tokens_per_second, LoadingView};
-use host::{Maintenance, MeShare, Reports, Running, Tenant, TenantContext, TenantStatus, TenantUi};
+use host::{
+    CheckProgress, Maintenance, MeShare, Reports, Running, Tenant, TenantContext, TenantStatus,
+    TenantUi,
+};
 use serde_json::{json, Map, Value};
 use tokio::task::spawn_blocking;
 use web::auth::session::Identity;
@@ -212,6 +216,24 @@ impl Reports for ZendReports {
             MeShare {
                 top: Map::new(),
                 own: modes_view(role),
+            }
+        })
+    }
+
+    fn conversation(&self) -> Option<Conversation> {
+        self.session.conversation()
+    }
+
+    /// On the blocking pool: it asks every stored conversation, a turn each.
+    fn self_check(&self, progress: CheckProgress) -> BoxFuture<'_, Result<Value, String>> {
+        Box::pin(async move {
+            let ran = self
+                .off_runtime(move |session| session.self_check_now(&*progress))
+                .await;
+            match ran {
+                None => Err("the model is not loaded yet".into()),
+                Some(Err(e)) => Err(format!("{e:#}")),
+                Some(Ok(report)) => Ok(json!(report)),
             }
         })
     }

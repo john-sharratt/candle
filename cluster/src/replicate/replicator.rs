@@ -11,22 +11,24 @@
 //! | Paxos, `max_members`, generations and the rejoin | [`super::consensus`] |
 //! | the once-a-tick work: `ACK`, gaps, periodic catch-ups, cutting off | [`super::tick`] |
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
 use super::catchup::{Progress, Purpose, Requester};
+use super::fault::Fault;
 use super::store::Store;
 use super::watch::GapWatch;
 use crate::consensus::votes::VoteStore;
 use crate::consensus::{Config, Millis, Paxos};
+use crate::coord::CommandLine;
 use crate::delivery::Outbox;
 use crate::fragment::Whole;
 use crate::frame::{Admit, Catchup, Done, Frame, Headers, Members};
@@ -34,7 +36,7 @@ use crate::member::AppMember;
 use crate::session::SessionHandle;
 
 /// Where the member stands in the group, beyond its sockets (§6.6, §6.7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Writing under the group's generation; serving as its sockets allow.
@@ -110,6 +112,14 @@ pub(super) struct State {
     /// held them at the last read (once a second).
     pub max_members: u32,
     pub generation: u64,
+    /// In fault mode for a full disk (§7.7).
+    pub fault: Option<Fault>,
+    /// Drained: taking no work, still connected (§12.4).
+    pub drained: bool,
+    /// The generation its last rejoin took.
+    pub last_rejoin: Option<u64>,
+    /// The last `COORD` sent, and when (§12.1).
+    pub coord_sent: Option<(Vec<u8>, Instant)>,
     pub stats: Stats,
 }
 
@@ -141,7 +151,7 @@ impl State {
 }
 
 /// Counters for the status page and the tests.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stats {
     pub applied: u64,
     pub refused: u64,
@@ -153,7 +163,7 @@ pub struct Stats {
 }
 
 /// A catch-up in progress, for the loading page and `/v1/status` (§7.6).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatchupView {
     pub cluster: usize,
     pub purpose: Purpose,
@@ -212,6 +222,8 @@ pub struct Replicator {
     pub(super) paxos: Mutex<Paxos<Box<dyn VoteStore>>>,
     epoch: Instant,
     pub(super) member: Weak<AppMember>,
+    /// The maintenance commands run lately, for `COORD` (§12.4).
+    pub(super) commands: Mutex<VecDeque<CommandLine>>,
 }
 
 impl Replicator {
@@ -261,6 +273,10 @@ impl Replicator {
                 ack_dirty: true,
                 max_members,
                 generation,
+                fault: None,
+                drained: false,
+                last_rejoin: None,
+                coord_sent: None,
                 stats: Stats::default(),
             }),
             send_wake: Notify::new(),
@@ -273,6 +289,7 @@ impl Replicator {
             paxos: Mutex::new(paxos),
             epoch,
             member,
+            commands: Mutex::new(VecDeque::new()),
             store,
         });
         let tap = Arc::downgrade(&r);
@@ -434,7 +451,10 @@ impl Replicator {
     /// is in the group: what its `CAPACITY` reports as ready (§7.2).
     pub fn socket_ready(&self, c: usize) -> bool {
         let s = self.state();
-        s.phase == Phase::Joined && s.ready.get(c).copied().unwrap_or(false)
+        s.phase == Phase::Joined
+            && s.fault.is_none()
+            && !s.drained
+            && s.ready.get(c).copied().unwrap_or(false)
     }
 
     /// Whether any socket's admission catch-up has finished: the `catchup`

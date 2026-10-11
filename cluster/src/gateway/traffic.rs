@@ -119,6 +119,11 @@ impl Traffic {
         OpenStream(self.open_streams.clone())
     }
 
+    /// Streams open now.
+    pub fn open_streams(&self) -> u64 {
+        self.open_streams.load(Ordering::Relaxed)
+    }
+
     pub fn request(&self, class: Class) {
         let i = Class::ALL.iter().position(|c| *c == class).expect("listed");
         self.requests[i].fetch_add(1, Ordering::Relaxed);

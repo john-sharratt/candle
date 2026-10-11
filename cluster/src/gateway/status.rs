@@ -1,24 +1,65 @@
-//! The gateway status page's data (§12.2): the Apps and Members blocks,
-//! Claims, Refusals, Traffic and Failures, and the coordination log (§12.3),
-//! as `GET /gateway/status.json` serves them.
+//! The gateway status page's data (§12.2): the Apps, Faults and Members
+//! blocks, Claims, Refusals, Traffic and Failures, and the coordination log
+//! (§12.3), as `GET /gateway/status.json` serves them. Each member row carries
+//! the member's last `COORD` (§12.1), from which the page draws the
+//! Generations, Consensus, Replication, Recovery and Tombstones blocks.
 
 use serde::{Serialize, Serializer};
 
 use super::log::Entry;
 use super::registry::MemberView;
 use super::traffic::TrafficView;
+use crate::coord::{CoordState, FaultView};
 use crate::frame::{BuildId, MemberState};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HubStatus {
     pub gateway: String,
     pub now_ms: u64,
+    /// Admitting no sockets, its members sent to their other clusters
+    /// (§12.4 `drain-gateway`).
+    pub draining: bool,
     pub apps: Vec<AppView>,
+    pub faults: Vec<FaultRow>,
     pub members: Vec<MemberRow>,
     pub claims: Vec<ClaimView>,
     pub refusals: Vec<Refusal>,
     pub traffic: TrafficView,
     pub log: Vec<Entry>,
+}
+
+/// A member in fault mode, or within twice the floor of it (§7.7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FaultRow {
+    pub app: String,
+    pub node: String,
+    pub host: String,
+    /// `None` for a member still out of fault mode, near the floor.
+    pub fault: Option<FaultView>,
+    pub free: u64,
+    pub floor: u64,
+    /// Its own events not yet sent, or not yet receipted.
+    pub unsent: usize,
+}
+
+impl FaultRow {
+    /// The row for `row`, when it belongs in the block.
+    pub fn of(row: &MemberRow) -> Option<FaultRow> {
+        let c = row.coord.as_ref()?;
+        let near = c.disk.total > 0 && c.disk.free < 2 * c.disk.floor;
+        if c.fault.is_none() && !near {
+            return None;
+        }
+        Some(FaultRow {
+            app: row.app.clone(),
+            node: row.node.clone(),
+            host: row.host.clone(),
+            fault: c.fault.clone(),
+            free: c.disk.free,
+            floor: c.disk.floor,
+            unsent: c.outbox.unsent + c.outbox.in_flight,
+        })
+    }
 }
 
 /// One app on this gateway.
@@ -34,6 +75,10 @@ pub struct AppView {
     pub model_lock: Option<String>,
     pub members: usize,
     pub ready: usize,
+    /// `max_members` and its quorum, as the app's members report them
+    /// (§5.9); the greatest any reports, while they converge.
+    pub max_members: Option<u32>,
+    pub quorum: Option<usize>,
 }
 
 /// One admitted member.
@@ -52,8 +97,11 @@ pub struct MemberRow {
     pub state: &'static str,
     pub session: u64,
     pub connected_ms: u64,
-    /// The size of its last `COORD`, which this build does not decode.
-    pub coord_bytes: usize,
+    /// Its clock against this gateway's, measured at admission from its
+    /// `HELLO`: positive when it runs ahead.
+    pub clock_offset_ms: i64,
+    /// Its last `COORD` (§12.1).
+    pub coord: Option<CoordState>,
     pub last_close: Option<String>,
     /// Its own highest `oseq`, from its `ACK`s.
     pub high_water: u64,
@@ -75,14 +123,17 @@ pub struct Queues {
     pub dropped: u64,
 }
 
+/// What the gateway knows of a member's socket beyond the registry.
+#[derive(Debug, Clone, Default)]
+pub struct SocketReport {
+    pub connected_ms: u64,
+    pub clock_offset_ms: i64,
+    pub coord: Option<CoordState>,
+    pub queues: Queues,
+}
+
 impl MemberRow {
-    pub fn of(
-        m: &MemberView,
-        connected_ms: u64,
-        coord_bytes: usize,
-        last_close: Option<String>,
-        queues: Queues,
-    ) -> Self {
+    pub fn of(m: &MemberView, socket: SocketReport, last_close: Option<String>) -> Self {
         let c = m.capacity.as_ref();
         Self {
             app: m.app.clone(),
@@ -96,12 +147,13 @@ impl MemberRow {
             slots_free: c.map(|c| c.slots_free),
             state: state_name(m.state()),
             session: m.session,
-            connected_ms,
-            coord_bytes,
+            connected_ms: socket.connected_ms,
+            clock_offset_ms: socket.clock_offset_ms,
+            coord: socket.coord,
             last_close,
             high_water: m.high_water,
             lagging: m.lagging,
-            queues,
+            queues: socket.queues,
         }
     }
 }
@@ -161,4 +213,73 @@ fn build_opt<S: Serializer>(b: &Option<BuildId>, s: S) -> Result<S::Ok, S::Error
             local: &b.local,
         })
         .serialize(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coord::{DiskView, OutboxView};
+
+    const GIB: u64 = 1 << 30;
+
+    fn row(coord: Option<CoordState>) -> MemberRow {
+        MemberRow {
+            app: "zend".into(),
+            node: "0000000000000002".into(),
+            host: "m2".into(),
+            build: BuildId {
+                count: 1,
+                hash: "h1".into(),
+                local: String::new(),
+            },
+            local_build: false,
+            weight: 1,
+            power: None,
+            idle: None,
+            slots_free: None,
+            state: "ready",
+            session: 1,
+            connected_ms: 0,
+            clock_offset_ms: 0,
+            coord,
+            last_close: None,
+            high_water: 0,
+            lagging: false,
+            queues: Queues::default(),
+        }
+    }
+
+    fn disk(free: u64) -> CoordState {
+        CoordState {
+            disk: DiskView {
+                free,
+                total: 100 * GIB,
+                floor: 2 * GIB,
+            },
+            outbox: OutboxView {
+                unsent: 3,
+                in_flight: 4,
+            },
+            ..CoordState::default()
+        }
+    }
+
+    /// A member in fault mode is listed, and so is one within twice the floor
+    /// of it, as a warning; one with room, or that has not reported, is not.
+    #[test]
+    fn the_faults_block_lists_faults_and_members_near_the_floor() {
+        assert_eq!(FaultRow::of(&row(None)), None);
+        assert_eq!(FaultRow::of(&row(Some(disk(10 * GIB)))), None);
+        let near = FaultRow::of(&row(Some(disk(3 * GIB)))).unwrap();
+        assert_eq!(
+            (near.fault, near.free, near.floor, near.unsent),
+            (None, 3 * GIB, 2 * GIB, 7)
+        );
+        let mut faulted = disk(10 * GIB);
+        faulted.fault = Some(FaultView {
+            reason: "a write failed for lack of space".into(),
+            ..FaultView::default()
+        });
+        assert!(FaultRow::of(&row(Some(faulted))).unwrap().fault.is_some());
+    }
 }

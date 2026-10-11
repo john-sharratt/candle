@@ -23,7 +23,7 @@ use cluster::handshake::GroupKey;
 use cluster::member::{AppMember, Identity, Link};
 use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
 use cluster::pipe::{Message, PipeRx};
-use cluster::replicate::{Applied, Listing, MemoryStore, Replication, Store};
+use cluster::replicate::{Applied, Disk, Listing, MemoryStore, Replication, Store, Tombstones};
 use cluster::session::VirtualConn;
 
 pub const APP: &str = "zend";
@@ -342,6 +342,21 @@ impl Store for Recording {
     }
     fn reload(&self) {
         self.inner.reload()
+    }
+    fn disk(&self) -> Disk {
+        self.inner.disk()
+    }
+    fn test_write(&self) -> bool {
+        self.inner.test_write()
+    }
+    fn drop_dead_segment(&self) -> bool {
+        self.inner.drop_dead_segment()
+    }
+    fn deferred(&self) -> Vec<(String, u64, usize)> {
+        self.inner.deferred()
+    }
+    fn tombstones(&self) -> Tombstones {
+        self.inner.tombstones()
     }
 }
 

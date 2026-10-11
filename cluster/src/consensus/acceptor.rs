@@ -203,6 +203,11 @@ impl<S: VoteStore> Acceptor<S> {
     pub fn vote(&self, key: &[u8]) -> Option<&Vote> {
         self.votes.get(key)
     }
+
+    /// Every key this acceptor holds a vote for.
+    pub fn keys(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.votes.keys()
+    }
 }
 
 #[cfg(test)]

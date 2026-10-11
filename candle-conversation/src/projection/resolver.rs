@@ -331,6 +331,17 @@ impl SubstrateRef {
 /// - **Reset** — does *not* clear the shared store (other conversations
 ///   would lose their history).  Sequence-level reset only drops local
 ///   KV state via the scheduler.
+/// Which maintenance op a pass may pick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+    /// The background pass: only past the age and dead-ratio gates.
+    Gated,
+    /// The manual trigger: the gates waived.
+    Forced,
+    /// A full volume's pass: dropping a dead segment, nothing that relocates.
+    DropOnly,
+}
+
 #[derive(Clone)]
 pub struct Conversation {
     pub(super) inner: Arc<RwLock<Substrate>>,
@@ -4730,7 +4741,14 @@ impl Conversation {
     ///
     /// Returns `true` when an op actually ran.
     pub fn compact_persistence_if_needed(&self) -> candle::Result<bool> {
-        self.run_maintenance_pass(false)
+        self.run_maintenance_pass(Pass::Gated)
+    }
+
+    /// Run one maintenance op that drops a fully-dead segment, and nothing
+    /// that relocates: what a member whose volume is full may run
+    /// (`docs/replicated_substrate.md` §7.7). Returns whether one ran.
+    pub fn drop_dead_segment(&self) -> candle::Result<bool> {
+        self.run_maintenance_pass(Pass::DropOnly)
     }
 
     /// Force one maintenance op **now**, waiving the age/ratio gates — the manual
@@ -4748,7 +4766,7 @@ impl Conversation {
             p.seal_active()
                 .map_err(|e| candle::Error::Msg(format!("substrate maintenance seal: {e}")))?;
         }
-        self.run_maintenance_pass(true)
+        self.run_maintenance_pass(Pass::Forced)
     }
 
     /// Run one step of a maintenance op under its own hold of the persistence
@@ -4775,9 +4793,10 @@ impl Conversation {
 
     /// One maintenance pass under phased locking so the slow relocation I/O never
     /// holds the substrate write lock (which would stall every decode `read()`),
-    /// mirroring the persistence thread's hot→warm / warm→cold discipline. When
-    /// `force` is set the age/ratio gates are waived (`pick_maintenance_op`).
-    fn run_maintenance_pass(&self, force: bool) -> candle::Result<bool> {
+    /// mirroring the persistence thread's hot→warm / warm→cold discipline. A
+    /// forced pass waives the age/ratio gates (`pick_maintenance_op`); a
+    /// drop-only pass relocates nothing (`pick_drop`).
+    fn run_maintenance_pass(&self, pass: Pass) -> candle::Result<bool> {
         // 1. Plan under a brief read + persistence lock (snapshot only). The
         //    relocation watch starts in the same hold, so every write after the
         //    plan is known to the relocation below.
@@ -4797,9 +4816,12 @@ impl Conversation {
                 return Ok(false);
             }
             let substrate = self.read();
-            let plan = p
-                .plan_maintenance(&substrate, force)
-                .map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?;
+            let plan = match pass {
+                Pass::Gated => p.plan_maintenance(&substrate, false),
+                Pass::Forced => p.plan_maintenance(&substrate, true),
+                Pass::DropOnly => p.plan_drop(&substrate),
+            }
+            .map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?;
             if plan.is_some() {
                 p.watch_relocation();
             }

@@ -91,7 +91,11 @@ impl Replicator {
                     }
                 };
                 s.outbox.queue(oseq, c as u32);
-                s.fresh.remove(&oseq);
+                // Not fresh: owed again after a socket dropped or the process
+                // restarted.
+                if s.fresh.remove(&oseq).is_none() {
+                    s.stats.resent += 1;
+                }
                 picks.push((oseq, c, handle));
             }
             picks

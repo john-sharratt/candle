@@ -26,7 +26,8 @@ tokio      = { version = "1", features = ["full"] }
 sha2       = "0.10"
 # The model download (`download`).
 reqwest    = { version = "0.12", features = ["stream"] }
-sysinfo    = { version = "0.31", default-features = false, features = ["system"] }
+# `disk`: the substrate's volume, for fault mode (`docs/replicated_substrate.md` §7.7).
+sysinfo    = { version = "0.31", default-features = false, features = ["system", "disk"] }
 # Card readings for `/v1/telemetry`: a runtime link against the installed
 # driver — see `telemetry::device`.
 nvml-wrapper = "0.12"

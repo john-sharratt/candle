@@ -23,12 +23,24 @@ use tokio::task::spawn_blocking;
 
 use super::Shared;
 use crate::cluster::view::status_block;
+use crate::loading::LoadingView;
+use crate::stopping::StopStep;
 use crate::tenant::TenantStatus;
 use crate::ui::build_id;
 
 pub async fn status(State(s): State<Arc<Shared>>) -> Json<Value> {
     let lines = join_all(s.tenants.iter().map(|(_, r)| r.status())).await;
-    let named: Vec<(&str, TenantStatus)> = s.tenants.iter().map(|(n, _)| *n).zip(lines).collect();
+    let stopping = s.stopping.step();
+    let named: Vec<(&str, TenantStatus)> = s
+        .tenants
+        .iter()
+        .map(|(n, _)| *n)
+        .zip(lines)
+        .map(|(n, line)| match &stopping {
+            Some(step) => (n, draining(line, step)),
+            None => (n, line),
+        })
+        .collect();
     let dirs = s.content_dirs.clone();
     let version = s.version;
     // A failed walk is a bug, not an empty build: an open page reads a changed
@@ -37,6 +49,27 @@ pub async fn status(State(s): State<Arc<Shared>>) -> Json<Value> {
         .await
         .expect("the build id walk panicked");
     Json(assemble(&s, &build, named))
+}
+
+/// A tenant's line while the process stops (§12.4): loading again, the step
+/// in hand as its load, so the loading page shows the drain as it runs.
+fn draining(mut line: TenantStatus, step: &StopStep) -> TenantStatus {
+    line.state = "loading";
+    line.loading = Some(LoadingView {
+        current: "draining",
+        label: step.label,
+        progress: 0.0,
+        completed: Vec::new(),
+        completed_labels: Vec::new(),
+        progressed: 0,
+        total: 0,
+        unit: String::new(),
+        detail: step.detail.clone(),
+        elapsed_ms: 0,
+        prefill_tokens: 0,
+        prefill_tps: None,
+    });
+    line
 }
 
 /// The body, from each tenant's line.
@@ -135,6 +168,23 @@ mod tests {
                 "cluster": null,
             })
         );
+    }
+
+    /// While the process stops, every tenant is loading again, its load the
+    /// stop's step — what the loading page shows.
+    #[tokio::test]
+    async fn a_stop_shows_as_every_tenants_load() {
+        let s = shared(vec![("zend", scripted(TenantStatus::of(None)))]);
+        s.stopping
+            .set_step("Sending", "12 own events still to reach the group");
+        let (_, body) = get_json(&app(s), "/v1/status").await;
+        assert_eq!(body["state"], "loading");
+        assert_eq!(body["loading"]["current"], "draining");
+        assert_eq!(
+            body["detail"],
+            "Sending — 12 own events still to reach the group"
+        );
+        assert_eq!(body["tenants"]["zend"]["state"], "loading");
     }
 
     /// Nobody past the model step: not connected.

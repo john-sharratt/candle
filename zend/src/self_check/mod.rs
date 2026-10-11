@@ -1,7 +1,8 @@
 //! `--self-check`: every stored conversation asked whether it is intact.
 //!
 //! A boot step, run once the substrate is loaded and the sections are rebuilt,
-//! and before anything ingests. Each conversation in the dialogue and the
+//! and before anything ingests — and the host's `self-check` command, a dry
+//! run on a live daemon. Each conversation in the dialogue and the
 //! `repo_map` / `code_reading` layers is written out as a record
 //! ([`transcript`]) and the model is asked the questions for its
 //! [`questions::Subject`] about that record; one that answers no to any of them
@@ -24,9 +25,9 @@ use std::sync::Mutex;
 use candle_conversation::projection::LayerId;
 use candle_conversation::{ConversationEngine, SequenceConfig, UnsealedAsker};
 use futures::stream::{self, StreamExt};
+use serde::Serialize;
 
 use crate::config::SelfCheck;
-use crate::loading::LoadProgress;
 use ask::Asker;
 use candidates::{select, Candidate, Entry};
 use questions::Findings;
@@ -38,7 +39,7 @@ use questions::Findings;
 const CONVERSATIONS_IN_FLIGHT: usize = 8;
 
 /// What a run found.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Report {
     pub checked: usize,
     pub corrupt: usize,
@@ -50,18 +51,19 @@ pub struct Report {
 }
 
 /// Ask about every checkable conversation in `layers` and act on the answers as
-/// `mode` says.
+/// `mode` says, telling `progress` how many have been asked of how many.
 ///
 /// `base` puts the questions: an asker on a conversation with no history of its
 /// own (the dialogue base), so each question's record is the only
-/// conversation in view.
+/// conversation in view. It runs at load (`--self-check`) and as the host's
+/// `self-check` command, which is always a dry run.
 pub fn run(
     engine: &Mutex<ConversationEngine>,
     config: &SequenceConfig,
     layers: &HashSet<LayerId>,
     base: UnsealedAsker,
     mode: SelfCheck,
-    progress: &LoadProgress,
+    progress: &dyn Fn(u64, u64),
 ) -> anyhow::Result<Report> {
     let (asker, candidates) = {
         let e = engine.lock().unwrap();
@@ -85,7 +87,7 @@ pub fn run(
         dry_run = matches!(mode, SelfCheck::DryRun),
         "self-check: asking every stored conversation whether it is intact",
     );
-    progress.set_step_progress(0, total);
+    progress(0, total);
 
     let mut report = Report {
         checked: candidates.len(),
@@ -105,7 +107,7 @@ pub fn run(
             .buffer_unordered(CONVERSATIONS_IN_FLIGHT)
             .inspect(|_| {
                 done += 1;
-                progress.set_step_progress(done, total);
+                progress(done, total);
             })
             .collect::<Vec<_>>(),
     );

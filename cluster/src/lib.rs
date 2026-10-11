@@ -24,6 +24,7 @@ pub mod backoff;
 pub mod clock;
 pub mod close;
 pub mod consensus;
+pub mod coord;
 pub mod delivery;
 pub mod dial;
 pub mod dispatch;

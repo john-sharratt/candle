@@ -71,6 +71,7 @@ pub mod resume;
 pub mod sealed_reader;
 pub mod segment;
 pub mod segmented_log;
+pub mod space;
 pub mod stamped_locs;
 pub mod streams;
 mod stripes;
@@ -537,6 +538,8 @@ pub struct SubstratePersistence {
     /// what it wrote cut off and no rejoin has fixed. A rewrite or relocation
     /// of a record already here is not tapped again.
     own_written: OriginApplied,
+    /// A write failed for lack of space (§7.7) — see [`space`].
+    out_of_space: bool,
 }
 
 /// Told the `oseq` of each record this node writes that may be sent.
@@ -1120,6 +1123,7 @@ impl SubstratePersistence {
             predates_identities: predates,
             tap: None,
             own_written,
+            out_of_space: false,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -1409,7 +1413,8 @@ impl SubstratePersistence {
         }
         .with_identity(self.minter.mint(0));
         let head = record::record_head(&header, parts);
-        let (segment, offset) = self.segments.append_parts(&head.line, parts, head.pad)?;
+        let appended = self.segments.append_parts(&head.line, parts, head.pad);
+        let (segment, offset) = self.watch_space(appended)?;
         let size = (head.line.len() + header.payload_len as usize + head.pad) as u64;
         // The hooks key these types by header alone, so the payload they are
         // handed is never read.
@@ -2661,7 +2666,8 @@ impl SubstratePersistence {
             return Ok(());
         }
         self.write_replica_if_changed()?;
-        self.segments.commit()?;
+        let committed = self.segments.commit();
+        self.watch_space(committed)?;
         self.maybe_rotate_active()
     }
 
@@ -2676,7 +2682,8 @@ impl SubstratePersistence {
     /// [`STAGE_FLUSH_BYTES`], leaving the sync to the next commit.
     fn write_through_if_over_stage(&mut self) -> Result<()> {
         if self.segments.pending_len() >= STAGE_FLUSH_BYTES {
-            self.segments.flush()?;
+            let flushed = self.segments.flush();
+            self.watch_space(flushed)?;
         }
         Ok(())
     }
@@ -2690,7 +2697,8 @@ impl SubstratePersistence {
             return Ok(false);
         }
         self.write_replica_if_changed()?;
-        self.segments.commit()?;
+        let committed = self.segments.commit();
+        self.watch_space(committed)?;
         self.maybe_rotate_active()?;
         Ok(true)
     }

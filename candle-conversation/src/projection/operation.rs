@@ -1,0 +1,82 @@
+//! What operating a cluster member asks of its substrate
+//! (`docs/replicated_substrate.md` §7.7, §12): whether a write has failed for
+//! lack of space and whether one succeeds now, how large the live log is, the
+//! records held back for a type this build does not read, the tombstones
+//! waiting to expire, and the read-only liveness audit.
+
+use std::collections::BTreeMap;
+
+use super::resolver::Conversation;
+use crate::persistence::liveness_audit::LivenessAudit;
+use crate::persistence::Result as PersistenceResult;
+
+/// A substrate's timeline tombstones, by how far each is from expiring (§6.8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TombstoneCounts {
+    /// Timeline tombstones held as records.
+    pub held: usize,
+    /// Of those, the ones a complete compaction has run past: waiting only for
+    /// their age.
+    pub swept: usize,
+    /// Expired tombstones kept as deleted-set entries.
+    pub deleted: usize,
+}
+
+impl Conversation {
+    /// Whether a write has failed for lack of space since the last
+    /// [`Self::test_write`] succeeded.
+    pub fn out_of_space(&self) -> bool {
+        self.persistence.lock().unwrap().out_of_space()
+    }
+
+    /// A test append and commit, as leaving fault mode needs (§7.7).
+    pub fn test_write(&self) -> PersistenceResult<()> {
+        self.persistence.lock().unwrap().test_write()
+    }
+
+    /// The bytes of live records in the log — what a full compaction copies,
+    /// and so needs free beside it.
+    pub fn live_bytes(&self) -> u64 {
+        let p = self.persistence.lock().unwrap();
+        let view = self.read();
+        p.segment_liveness(&view).values().sum()
+    }
+
+    /// Records held back because this build does not decode their type, by
+    /// type and origin, with how many of each (§6.5).
+    pub fn deferred_records(&self) -> BTreeMap<(String, u64), usize> {
+        let p = self.persistence.lock().unwrap();
+        let mut counts = BTreeMap::new();
+        for d in &p.replica().deferred {
+            *counts.entry((d.record_type.clone(), d.origin)).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// The timeline tombstones held and the deleted set's entries.
+    pub fn tombstone_counts(&self) -> TombstoneCounts {
+        let view = self.read();
+        let held = view.tombstoned_timelines();
+        let deleted: Vec<u64> = view.deleted_entries().map(|e| e.timeline).collect();
+        let live: Vec<_> = held
+            .iter()
+            .filter(|t| !deleted.contains(&t.raw()))
+            .collect();
+        TombstoneCounts {
+            held: live.len(),
+            swept: live
+                .iter()
+                .filter(|t| view.is_tombstone_swept(***t))
+                .count(),
+            deleted: deleted.len(),
+        }
+    }
+
+    /// The read-only liveness audit: what maintenance counts as live against
+    /// what it carries. Changes nothing.
+    pub fn liveness_audit(&self) -> PersistenceResult<LivenessAudit> {
+        let p = self.persistence.lock().unwrap();
+        let view = self.read();
+        p.liveness_audit(&view)
+    }
+}

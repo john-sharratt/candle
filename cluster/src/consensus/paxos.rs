@@ -86,6 +86,10 @@ pub enum Out {
 pub struct KeyStatus {
     /// A round in progress: its ballot and phase.
     pub round: Option<(Ballot, &'static str)>,
+    /// The members that promised, or accepted, the round in progress.
+    pub voters: Vec<u64>,
+    /// The higher ballot that beat it, when a `NACK` did.
+    pub beaten_by: Option<Ballot>,
     /// The lease this member holds, while it holds it.
     pub held_until: Option<Millis>,
     /// What its acceptor has promised and accepted.
@@ -121,6 +125,8 @@ struct Round {
     /// When this round's `PREPARE` was sent: a lease's term counts from here.
     started: Millis,
     deadline: Millis,
+    /// The higher ballot an acceptor's `NACK` named, when one beat this round.
+    beaten_by: Option<Ballot>,
 }
 
 pub struct Paxos<S: VoteStore> {
@@ -248,6 +254,7 @@ impl<S: VoteStore> Paxos<S> {
                 },
                 started: now,
                 deadline: now + self.cfg.round_timeout,
+                beaten_by: None,
             },
         );
         out.push(Out::Broadcast(Frame::Prepare(Prepare {
@@ -294,6 +301,9 @@ impl<S: VoteStore> Paxos<S> {
             .get(key)
             .is_some_and(|r| !matches!(r.phase, Phase::Waiting { .. }) && promised > r.ballot);
         if beaten {
+            if let Some(r) = self.rounds.get_mut(key) {
+                r.beaten_by = Some(promised);
+            }
             self.backoff(key, now);
         }
     }
@@ -557,8 +567,9 @@ impl<S: VoteStore> Paxos<S> {
 
     /// What this member knows of `key`, for the status page (§12.1).
     pub fn status(&self, key: &[u8], now: Millis) -> KeyStatus {
+        let round = self.rounds.get(key);
         KeyStatus {
-            round: self.rounds.get(key).map(|r| {
+            round: round.map(|r| {
                 let phase = match r.phase {
                     Phase::Preparing { .. } => "preparing",
                     Phase::Proposing { .. } => "proposing",
@@ -566,6 +577,12 @@ impl<S: VoteStore> Paxos<S> {
                 };
                 (r.ballot, phase)
             }),
+            voters: match round.map(|r| &r.phase) {
+                Some(Phase::Preparing { promises }) => promises.keys().copied().collect(),
+                Some(Phase::Proposing { accepted, .. }) => accepted.iter().copied().collect(),
+                _ => Vec::new(),
+            },
+            beaten_by: round.and_then(|r| r.beaten_by),
             held_until: self
                 .held
                 .get(key)
@@ -577,6 +594,30 @@ impl<S: VoteStore> Paxos<S> {
                 .vote(key)
                 .and_then(|v| v.accepted.as_ref().map(|a| a.ballot)),
         }
+    }
+
+    /// Every key this member knows of — a round in progress, a lease it holds,
+    /// a vote its acceptor keeps — in order, for the status page (§12.1).
+    pub fn keys(&self) -> Vec<Vec<u8>> {
+        let mut keys: Vec<Vec<u8>> = self
+            .rounds
+            .keys()
+            .chain(self.held.keys())
+            .chain(self.acceptor.keys())
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// The leases this member holds at `now`.
+    pub fn held(&self, now: Millis) -> Vec<Vec<u8>> {
+        self.held
+            .iter()
+            .filter(|(_, (_, until))| now < *until)
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     /// Stop proposing for `key`: rendezvous names another member now (§9.5),

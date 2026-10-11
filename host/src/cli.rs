@@ -77,6 +77,12 @@ pub struct HostArgs {
     #[arg(long, value_name = "MINUTES", default_value_t = 10)]
     pub cluster_affinity_idle: u64,
 
+    /// Write the group's `max_members` as `N` at startup, lowering the base of
+    /// its quorum (§5.9): for retiring machines for good, or knowingly running
+    /// with less safety.
+    #[arg(long, value_name = "N")]
+    pub cluster_quorum_max: Option<u32>,
+
     /// Increase log verbosity. -v = DEBUG, -vv = TRACE.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -94,6 +100,7 @@ impl Default for HostArgs {
             cluster_name: None,
             group_key: None,
             cluster_affinity_idle: 10,
+            cluster_quorum_max: None,
             verbose: 0,
         }
     }
@@ -134,6 +141,7 @@ impl HostArgs {
             self.cluster_name.as_deref(),
             self.group_key.as_deref(),
             Duration::from_secs(self.cluster_affinity_idle * 60),
+            self.cluster_quorum_max,
             host,
         )
     }
@@ -218,12 +226,15 @@ mod tests {
             &key_arg,
             "--cluster-affinity-idle",
             "5",
+            "--cluster-quorum-max",
+            "2",
         ])
         .unwrap()
         .host;
         let yaml: HostArgs = serde_yaml::from_str(&format!(
             "clusters: [\"https://code.tokera.com\", \"https://192.168.0.5:9443\"]\n\
-             cluster_name: code.tokera.com\ngroup_key: '{key_arg}'\ncluster_affinity_idle: 5\n"
+             cluster_name: code.tokera.com\ngroup_key: '{key_arg}'\ncluster_affinity_idle: 5\n\
+             cluster_quorum_max: 2\n"
         ))
         .unwrap();
         assert_eq!(flags, yaml);
@@ -234,6 +245,7 @@ mod tests {
             Some("code.tokera.com")
         );
         assert_eq!(settings.affinity_idle, Duration::from_secs(300));
+        assert_eq!(settings.quorum_max, Some(2));
         assert_eq!(settings.host, "m5");
 
         assert!(HostArgs::default().cluster("m".into()).unwrap().is_none());

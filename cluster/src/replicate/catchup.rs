@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::frame::{Fetch, Gone, Headers};
 
@@ -26,7 +26,7 @@ pub const FETCH_WINDOW: u64 = 8 << 20;
 pub const FETCH_TRIES: u8 = 3;
 
 /// Why a catch-up runs (§7.1, §7.5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Purpose {
     /// A socket was admitted: the gateway picks the answerer. The socket is
@@ -41,7 +41,7 @@ pub enum Purpose {
 }
 
 /// What a catch-up has done so far, for the loading page (§7.6).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Progress {
     /// Records the headers listed that this member lacked, and their bytes.
     pub wanted: u64,

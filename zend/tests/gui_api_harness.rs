@@ -29,6 +29,7 @@ use host::logs::{BusWriter, LogBus};
 use host::model::ModelView;
 use host::run::merge_routes;
 use host::server::{builder, Listen};
+use host::stopping::Stopping;
 use host::telemetry::Telemetry;
 use host::{Reports, TenantUi};
 use web::auth::Roles;
@@ -80,6 +81,8 @@ async fn boot() -> Harness {
         telemetry: Telemetry::new(ModelView::of_prescribed()),
         roles: roles.clone(),
         cluster: None,
+        stopping: Arc::new(Stopping::new()),
+        host: "harness".into(),
     });
     let all = merge_routes(
         routes(shared, Roots::disk(&[common])),

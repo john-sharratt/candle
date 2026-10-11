@@ -1,7 +1,7 @@
-//! The replicator's clock (§7.1, §6.7): consensus timers every tick, and once a
-//! second the `ACK`, the gap watch, the periodic catch-up while a socket is
-//! down, catch-ups whose answerer went quiet, and cutting off when no socket is
-//! left.
+//! The replicator's clock (§7.1, §6.7, §7.7, §12.1): consensus timers every
+//! tick, and once a second the disk check, `COORD`, the `ACK`, the gap watch,
+//! the periodic catch-up while a socket is down, catch-ups whose answerer went
+//! quiet, and cutting off when no socket is left.
 
 use std::mem::replace;
 use std::sync::Arc;
@@ -41,8 +41,15 @@ impl Replicator {
     }
 
     async fn second(self: &Arc<Self>) {
+        self.check_disk().await;
+        self.send_coord().await;
         self.cut_off_if_alone().await;
         self.refresh_group().await;
+        // In fault mode a member applies nothing, so it acknowledges nothing
+        // and asks for nothing; leaving starts its catch-ups (§7.7).
+        if self.faulted() {
+            return;
+        }
         let store = self.store.clone();
         let Ok(applied) = tokio::task::spawn_blocking(move || store.applied()).await else {
             return;

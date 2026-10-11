@@ -20,8 +20,10 @@ use candle_conversation::projection::Conversation;
 use cluster::consensus::votes::{FileJournal, VoteStore, DEFAULT_SIZE};
 use cluster::consensus::{Change, MaxMembers};
 use cluster::frame::{Gone, RecordHeader};
-use cluster::replicate::{Applied, Listing, Replication, Store, Tap};
+use cluster::replicate::{Applied, Disk, Listing, Replication, Store, Tap, Tombstones};
 use serde_json::{json, Value};
+
+use super::disk::volume_of;
 
 /// The file a member's acceptor keeps its votes in, beside its log (§5.9).
 pub const VOTES: &str = "VOTES";
@@ -285,6 +287,52 @@ impl Store for ConversationStore {
 
     fn reload(&self) {
         (self.reload)();
+    }
+
+    fn disk(&self) -> Disk {
+        let (free, total) = volume_of(&self.conversation.substrate_dir()).unwrap_or_else(|| {
+            tracing::error!("the substrate's volume is on no measured mount");
+            (0, 0)
+        });
+        Disk {
+            free,
+            total,
+            write_failed: self.conversation.out_of_space(),
+        }
+    }
+
+    fn test_write(&self) -> bool {
+        match self.conversation.test_write() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("the test write failed: {e}");
+                false
+            }
+        }
+    }
+
+    fn drop_dead_segment(&self) -> bool {
+        self.conversation.drop_dead_segment().unwrap_or_else(|e| {
+            tracing::error!("dropping a dead segment failed: {e}");
+            false
+        })
+    }
+
+    fn deferred(&self) -> Vec<(String, u64, usize)> {
+        self.conversation
+            .deferred_records()
+            .into_iter()
+            .map(|((record_type, origin), n)| (record_type, origin, n))
+            .collect()
+    }
+
+    fn tombstones(&self) -> Tombstones {
+        let t = self.conversation.tombstone_counts();
+        Tombstones {
+            held: t.held,
+            swept: t.swept,
+            deleted: t.deleted,
+        }
     }
 }
 

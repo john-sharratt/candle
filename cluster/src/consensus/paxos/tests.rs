@@ -214,6 +214,34 @@ fn a_doubled_reply_counts_once() {
     );
 }
 
+/// The status page sees which members promised the round in progress and,
+/// when an acceptor refused it, the ballot that beat it.
+#[test]
+fn a_rounds_voters_and_the_ballot_that_beat_it_are_reported() {
+    let mut net = Net::new(3, 3);
+    net.cut[1] = true;
+    net.cut[2] = true;
+    net.act(0, |p, now| p.decide(b"k", b"v".to_vec(), now));
+    net.settle();
+    let s = net.members[0].status(b"k", net.now);
+    assert_eq!(s.round.map(|(_, phase)| phase), Some("preparing"));
+    assert_eq!(s.voters, [1], "its own acceptor's promise");
+    assert_eq!(s.beaten_by, None);
+
+    let higher = Ballot { round: 9, node: 2 };
+    let nack = Frame::Nack(Nack {
+        key: b"k".to_vec(),
+        promised: higher,
+        from: 2,
+        reply_to: 1,
+    });
+    let now = net.now;
+    net.members[0].handle(&nack, now).unwrap();
+    let s = net.members[0].status(b"k", net.now);
+    assert_eq!(s.round.map(|(_, phase)| phase), Some("waiting"));
+    assert_eq!(s.beaten_by, Some(higher));
+}
+
 #[test]
 fn a_member_alone_in_a_group_of_three_never_holds_a_lease() {
     let mut net = Net::new(3, 2);

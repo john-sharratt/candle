@@ -205,6 +205,7 @@ mod error;
 pub(crate) mod event;
 mod ids;
 pub mod layer_toggle;
+pub mod operation;
 mod owned_prefix;
 mod owned_sections;
 mod plain_prompt;
@@ -222,6 +223,8 @@ mod working_set_observe;
 mod working_set_pick;
 mod yaml;
 
+#[cfg(test)]
+mod operation_tests;
 #[cfg(test)]
 mod remote_turn_tests;
 #[cfg(test)]

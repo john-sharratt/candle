@@ -35,12 +35,17 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, MissedTickBehavior};
 
 use super::admission::{Admission, Admitted};
+use super::coord_log::changes;
 use super::log::{CoordLog, Entry};
+use super::paxos_log::paxos_step;
 use super::registry::{MemberView, Pick, Registry};
-use super::status::{AppView, ClaimView, HubStatus, MemberRow, Queues, Refusal};
+use super::status::{
+    AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
+};
 use super::traffic::Traffic;
 use crate::clock::now_ms;
 use crate::close::{Close, CloseCode};
+use crate::coord::CoordState;
 use crate::delivery::ReceiptPacer;
 use crate::dispatch::{Dispatch, RouteTable};
 use crate::frame::{name, Admit, Frame, Hello, Members};
@@ -78,7 +83,10 @@ pub(super) struct Socket {
     pub session: u64,
     pub handle: SessionHandle,
     pub connected_ms: u64,
-    pub coord: Option<Vec<u8>>,
+    /// Its clock against this gateway's at admission, from its `HELLO`.
+    pub clock_offset_ms: i64,
+    /// Its last `COORD` (§12.1).
+    pub coord: Option<CoordState>,
     pub pacer: ReceiptPacer,
     /// Its last `ACK`: what it has applied of each origin.
     pub acks: Vec<(u64, u64)>,
@@ -103,6 +111,12 @@ pub(super) struct State {
     refusals: VecDeque<Refusal>,
     modes: HashMap<String, Mode>,
     last_close: HashMap<(String, u64), String>,
+    /// Each member's last `COORD`, kept across its sockets: a member that
+    /// reconnects is logged for what changed while it was away, not again for
+    /// everything it reports.
+    reported: HashMap<(String, u64), CoordState>,
+    /// Admitting no sockets (§12.4 `drain-gateway`).
+    pub draining: bool,
 }
 
 pub struct Hub {
@@ -236,6 +250,14 @@ impl Hub {
             self.refused(app, ip, None, &close);
             return;
         }
+        if self.draining() {
+            let close = Close::new(
+                CloseCode::GoingAway,
+                "this gateway is draining: carry on through the other clusters",
+            );
+            let _ = tx.send(Message::Close(close)).await;
+            return;
+        }
         let mut seen = None;
         let mut decided = None;
         let handshake = admit(
@@ -292,12 +314,14 @@ impl Hub {
         let handle = session.handle.clone();
         {
             let mut s = self.state();
+            let connected_ms = now_ms();
             let replaced = s.sockets.insert(
                 (app.to_string(), node),
                 Socket {
                     session: admitted.session,
                     handle: handle.clone(),
-                    connected_ms: now_ms(),
+                    connected_ms,
+                    clock_offset_ms: hello.now_ms as i64 - connected_ms as i64,
                     coord: None,
                     pacer: ReceiptPacer::new(Instant::now()),
                     acks: Vec::new(),
@@ -412,6 +436,9 @@ impl Hub {
 
     /// A frame from `node`: kept, relayed, or a protocol violation.
     fn on_frame(&self, app: &str, node: u64, frame: Frame) -> Result<(), Close> {
+        if let Some((key, text)) = paxos_step(node, &frame) {
+            self.note(app, key, text);
+        }
         match frame {
             Frame::Capacity(c) => {
                 if self.state().registry.capacity(app, node, c) {
@@ -456,8 +483,25 @@ impl Hub {
                 self.to_others(app, node, Frame::Unclaim(u));
             }
             Frame::Coord(c) => {
-                if let Some(s) = self.state().sockets.get_mut(&(app.to_string(), node)) {
-                    s.coord = Some(c.state);
+                let state = CoordState::decode(&c.state).ok_or_else(|| {
+                    Close::new(
+                        CloseCode::Malformed,
+                        "a COORD that is not a coordination state",
+                    )
+                })?;
+                let lines = {
+                    let mut s = self.state();
+                    let key = (app.to_string(), node);
+                    let Some(socket) = s.sockets.get_mut(&key) else {
+                        return Ok(());
+                    };
+                    socket.coord = Some(state.clone());
+                    let lines = changes(s.reported.get(&key), &state);
+                    s.reported.insert(key, state);
+                    lines
+                };
+                for line in lines {
+                    self.note(app, hex(node), line);
                 }
             }
             f @ (Frame::Prepare(_) | Frame::Propose(_) | Frame::Release(_)) => {
@@ -603,20 +647,25 @@ impl Hub {
         for app in APPS {
             for m in s.registry.members(app) {
                 let socket = s.sockets.get(&(app.to_string(), m.node));
-                members.push(MemberRow::of(
-                    m,
-                    socket.map_or(0, |x| x.connected_ms),
-                    socket.and_then(|x| x.coord.as_ref()).map_or(0, Vec::len),
-                    s.last_close.get(&(app.to_string(), m.node)).cloned(),
-                    socket.map_or(Queues::default(), |x| Queues {
+                let report = socket.map_or(SocketReport::default(), |x| SocketReport {
+                    connected_ms: x.connected_ms,
+                    clock_offset_ms: x.clock_offset_ms,
+                    coord: x.coord.clone(),
+                    queues: Queues {
                         live_bytes: x.handle.gauges().live(),
                         catchup_bytes: x.handle.gauges().catchup(),
                         skipped: x.skipped,
                         dropped: x.dropped,
-                    }),
+                    },
+                });
+                members.push(MemberRow::of(
+                    m,
+                    report,
+                    s.last_close.get(&(app.to_string(), m.node)).cloned(),
                 ));
             }
         }
+        let faults = members.iter().filter_map(FaultRow::of).collect();
         let claims = APPS
             .iter()
             .flat_map(|app| {
@@ -634,7 +683,9 @@ impl Hub {
         HubStatus {
             gateway: self.name.clone(),
             now_ms: now,
+            draining: s.draining,
             apps: APPS.iter().map(|a| app_view(&s, a)).collect(),
+            faults,
             members,
             claims,
             refusals: s.refusals.iter().cloned().collect(),
@@ -646,7 +697,16 @@ impl Hub {
 
 fn app_view(s: &State, app: &str) -> AppView {
     let mode = s.modes.get(app).copied().unwrap_or_default();
+    let quorum = s
+        .sockets
+        .iter()
+        .filter(|((a, _), _)| a == app)
+        .filter_map(|(_, x)| x.coord.as_ref())
+        .map(|c| (c.paxos.max_members, c.paxos.quorum))
+        .max();
     AppView {
+        max_members: quorum.map(|(m, _)| m),
+        quorum: quorum.map(|(_, q)| q),
         app: app.to_string(),
         mode: if mode.clustered { "clustered" } else { "dumb" },
         since_ms: mode.since_ms,

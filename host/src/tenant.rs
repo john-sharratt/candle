@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use candle_conversation::projection::Conversation;
 use candle_conversation::{Capabilities, EngineSource};
 use futures::future::BoxFuture;
 use serde::Serialize;
@@ -117,7 +118,19 @@ pub trait Reports: Send + Sync {
 
     /// Its share of `/v1/me` for this caller.
     fn me<'a>(&'a self, identity: Option<&'a Identity>, role: Role) -> BoxFuture<'a, MeShare>;
+
+    /// Its substrate, once its engine holds it open: what the maintenance
+    /// commands run on (`docs/replicated_substrate.md` §12.4).
+    fn conversation(&self) -> Option<Conversation>;
+
+    /// Ask every stored conversation whether it is intact, reporting what it
+    /// finds and tombstoning nothing (§12.4 `self-check`). Refused, with the
+    /// reason, by a tenant that has no such check or before its engine loads.
+    fn self_check(&self, progress: CheckProgress) -> BoxFuture<'_, Result<Value, String>>;
 }
+
+/// A self-check's progress: conversations asked so far, of how many.
+pub type CheckProgress = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// One tenant's part of `/v1/me`.
 #[derive(Debug, Clone, Default, PartialEq)]

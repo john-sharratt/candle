@@ -5,9 +5,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use candle_conversation::projection::Conversation;
 use futures::future::BoxFuture;
 use host::loading::{tokens_per_second, LoadingView};
-use host::{Maintenance, MeShare, Reports, TenantStatus};
+use host::{CheckProgress, Maintenance, MeShare, Reports, TenantStatus};
 use serde_json::{json, Map, Value};
 use tokio::task::spawn_blocking;
 use web::auth::session::Identity;
@@ -175,6 +176,22 @@ impl Reports for NpcdReports {
                     own: json!({"error": "account_write_failed", "detail": detail}),
                 },
             }
+        })
+    }
+
+    fn conversation(&self) -> Option<Conversation> {
+        let minds = self
+            .authored
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.minds.read().unwrap().clone())?;
+        let conv = minds.engine().lock().unwrap().conversation();
+        Some(conv)
+    }
+
+    fn self_check(&self, _: CheckProgress) -> BoxFuture<'_, Result<Value, String>> {
+        Box::pin(async {
+            Err("self-check is zend's: npcd has no conversations of a user's to ask about".into())
         })
     }
 }

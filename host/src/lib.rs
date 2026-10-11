@@ -13,6 +13,8 @@
 //! | [`server`] | one `web::Builder`: the shared and tenant APIs, the UIs by host name |
 //! | [`cluster`] | with `--cluster`, each tenant's app as a cluster member |
 //! | [`endpoints`] | `/v1/status`, `/v1/me`, `/v1/telemetry`, `/ws/logs`, … served once |
+//! | [`commands`] | the maintenance commands and their jobs |
+//! | [`stopping`] | how the process comes to stop: Ctrl-C, `shutdown`, `restart` |
 //! | [`guard`] | routes that cannot forget their role, and the path-overlap refusal |
 //! | [`access`] | the estate's role table and `--local-signin` |
 //! | [`ui`] | UIs from disk, `/common/`, the on-disk build id |
@@ -23,6 +25,7 @@
 pub mod access;
 pub mod cli;
 pub mod cluster;
+pub mod commands;
 pub mod ctrl_c;
 pub mod download;
 pub mod endpoints;
@@ -35,6 +38,7 @@ pub mod process;
 pub mod run;
 pub mod self_heal;
 pub mod server;
+pub mod stopping;
 pub mod telemetry;
 pub mod tenant;
 pub mod ui;
@@ -45,5 +49,6 @@ pub use run::{run, HostConfig};
 pub use self_heal::OneShot;
 pub use server::Listen;
 pub use tenant::{
-    Maintenance, MeShare, Reports, Running, Stop, Tenant, TenantContext, TenantStatus, TenantUi,
+    CheckProgress, Maintenance, MeShare, Reports, Running, Stop, Tenant, TenantContext,
+    TenantStatus, TenantUi,
 };

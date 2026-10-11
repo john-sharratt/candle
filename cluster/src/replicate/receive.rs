@@ -60,6 +60,18 @@ impl Replicator {
         let Some(upto) = records.iter().map(|(_, _, seq)| *seq).max() else {
             return;
         };
+        let advance = |at: &mut u64| {
+            let advanced = upto > *at;
+            *at = (*at).max(upto);
+            advanced
+        };
+        // In fault mode nothing is applied: what arrives is fetched again by
+        // the catch-up that leaving starts (§7.7). It counts as handled, so a
+        // request waiting on it is not held for it.
+        if self.faulted() {
+            self.applied_upto.send_if_modified(advance);
+            return;
+        }
         let fetched: Vec<(usize, u64)> = records
             .iter()
             .filter(|(_, w, _)| w.reply_to.is_some())
@@ -74,11 +86,7 @@ impl Replicator {
         // Arrivals are applied in order, so everything through this batch is
         // done — refused records included: they are fetched again, not waited
         // for.
-        self.applied_upto.send_if_modified(|at| {
-            let advanced = upto > *at;
-            *at = (*at).max(upto);
-            advanced
-        });
+        self.applied_upto.send_if_modified(advance);
         let Ok(Applied { taken, reload }) = applied else {
             return;
         };

@@ -662,9 +662,16 @@ async fn a_holder_elsewhere_is_answered_retry() {
 #[tokio::test]
 async fn the_status_page_is_an_admins() {
     let dumb = spawn(dumb_daemon()).await;
-    let (gw, _hub) = gateway(dumb).await;
+    let (gw, hub) = gateway(dumb).await;
     assert_eq!(fetch(gw, "/gateway").await.status, 401);
     assert_eq!(fetch(gw, "/gateway/status.json").await.status, 401);
+    for command in ["drain-gateway", "undrain-gateway"] {
+        let path = format!("/gateway/command/{command}");
+        assert_eq!(ask(gw, "POST", &path, &[], "").await.status, 401);
+    }
+    let member_command = "/gateway/member/zend/0000000000000001/v1/cluster/command/drain";
+    assert_eq!(ask(gw, "POST", member_command, &[], "").await.status, 401);
+    assert!(!hub.draining(), "a refused command does nothing");
 }
 
 /// **The cluster socket** refuses an app that is none of the three, and a

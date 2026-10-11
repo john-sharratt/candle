@@ -21,15 +21,17 @@ use web::Roots;
 
 use crate::access::{roles, LocalSignin};
 use crate::cli::HostArgs;
+use crate::cluster::leave::drain_and_send;
 use crate::cluster::{watch_readiness, Cluster, Join};
 use crate::ctrl_c::accept_ctrl_c;
 use crate::endpoints::{declared, routes, Shared};
 use crate::guard::{dispatch_table, Routes};
 use crate::logs::LogBus;
 use crate::model::{ModelView, MODEL};
-use crate::process::{init_logging, install_panic_hook, shutdown_signal};
+use crate::process::{abort_on_ctrl_c, init_logging, install_panic_hook, stop_signal};
 use crate::self_heal::{spawn_watchdog, LaunchSpec, OneShot};
 use crate::server::serve;
+use crate::stopping::{Ending, Stopping};
 use crate::telemetry::Telemetry;
 use crate::tenant::{Stop, Tenant, TenantContext, TenantUi};
 use crate::ui::{require_dir, COMMON_DIR};
@@ -135,7 +137,7 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     // A sticky CUDA fault or an unbroken out-of-memory streak kills the
     // context for good; nothing supervises this process, so it relaunches
     // itself (`self_heal.rs`).
-    spawn_watchdog(launch, state_dir);
+    spawn_watchdog(launch.clone(), state_dir);
     // A no-op without the `profile` feature.
     set_gpu_span_period(GPU_SPAN_PERIOD);
 
@@ -144,8 +146,14 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
         Err(e) => fail(&format!("could not start the runtime: {e}")),
     };
     match runtime.block_on(serve_tenants(cfg, tenants, bus)) {
-        Ok(()) => {
+        Ok(ending) => {
             tracing::info!("stopped");
+            if ending == Ending::Relaunch {
+                match launch.relaunch() {
+                    Ok(pid) => tracing::warn!(pid, "restart: started again — exiting"),
+                    Err(e) => tracing::error!("restart: the new process did not start: {e}"),
+                }
+            }
             // Exit rather than fall out of `main`: every tenant drained and
             // flushed its substrate above, and the detached engine threads
             // (scheduler, GPU worker, CUDA context) are not all cleanly
@@ -161,7 +169,7 @@ async fn serve_tenants(
     cfg: HostConfig,
     tenants: Vec<Box<dyn Tenant>>,
     bus: Arc<LogBus>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Ending> {
     let substrates: Vec<(&str, PathBuf)> = tenants
         .iter()
         .map(|t| (t.name(), t.substrate_dir()))
@@ -199,7 +207,7 @@ async fn serve_tenants(
     let roles = roles();
     let names: Vec<&'static str> = uis.iter().map(|(n, _)| *n).collect();
     let machine = System::host_name().unwrap_or_else(|| listen.bind.to_string());
-    let cluster = match cfg.args.cluster(machine)? {
+    let cluster = match cfg.args.cluster(machine.clone())? {
         Some(settings) => {
             tracing::info!(
                 clusters = %settings.targets.iter().map(|t| t.url.as_str()).collect::<Vec<_>>().join(", "),
@@ -276,6 +284,7 @@ async fn serve_tenants(
 
     let mut content_dirs: Vec<PathBuf> = uis.iter().map(|(_, ui)| ui.content.clone()).collect();
     content_dirs.push(common.clone());
+    let stopping = Arc::new(Stopping::new());
     let shared = Arc::new(Shared {
         started_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -288,6 +297,8 @@ async fn serve_tenants(
         telemetry,
         roles,
         cluster: cluster.clone(),
+        stopping: Arc::clone(&stopping),
+        host: machine,
     });
     let all = match merge_routes(routes(shared, Roots::disk(&[common])), tenant_routes) {
         Ok(all) => all,
@@ -308,14 +319,31 @@ async fn serve_tenants(
         all.router,
         local_signin,
         cluster.clone(),
-        shutdown_signal(),
+        leave(Arc::clone(&stopping), cluster.clone()),
     )
     .await;
     if let Some(c) = &cluster {
         c.close_all("the member is shutting down");
     }
     stop_all(stops).await;
-    served
+    served.map(|()| stopping.ending().unwrap_or(Ending::Exit))
+}
+
+/// Resolves once the process should stop serving: a Ctrl-C, or a `shutdown`
+/// or `restart` command (§12.4). A member first drains and sends what it
+/// wrote; the server then finishes the requests in flight.
+async fn leave(stopping: Arc<Stopping>, cluster: Option<Arc<Cluster>>) {
+    tokio::select! {
+        _ = stop_signal() => {
+            stopping.ask(Ending::Exit);
+        }
+        _ = stopping.asked() => {}
+    }
+    abort_on_ctrl_c();
+    if let Some(c) = &cluster {
+        drain_and_send(c, &stopping).await;
+    }
+    stopping.set_step("Stopping", "finishing the requests in flight");
 }
 
 /// Stop every started tenant in reverse rank: the lowest-ranked first, so the

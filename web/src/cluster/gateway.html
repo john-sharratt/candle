@@ -71,6 +71,20 @@ input { font: inherit; padding: 4px 8px; border: 1px solid var(--rule); border-r
 input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .empty { color: var(--muted); font-style: italic; }
 #error { color: var(--bad); }
+section.alarm { border-color: var(--bad); }
+section.alarm h2 { color: var(--bad); }
+button { font: inherit; font-size: 12.5px; padding: 3px 10px; border: 1px solid var(--rule); border-radius: 4px; background: var(--ground); color: var(--ink); cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.controls { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+.cmd-form { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: end; }
+.cmd-form label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+select { font: inherit; padding: 4px 6px; border: 1px solid var(--rule); border-radius: 4px; background: var(--ground); color: var(--ink); }
+select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.job { border-top: 1px solid var(--rule); padding: 8px 0; }
+.job h3 { font-size: 13px; margin: 0 0 4px; }
+.job ol { margin: 0; padding-left: 20px; font-family: var(--mono); font-size: 12px; }
+.job li.error { color: var(--bad); } .job li.done { color: var(--good); }
 </style>
 </head>
 <body>
@@ -79,7 +93,17 @@ input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   <span class="meta" id="gateway"></span>
   <span class="meta" id="updated"></span>
   <span id="error" role="status"></span>
+  <div class="controls">
+    <span id="draining"></span>
+    <button id="drain" type="button">Drain gateway</button>
+    <button id="undrain" type="button">Undrain gateway</button>
+  </div>
 </header>
+
+<section id="faults-block" aria-labelledby="h-faults">
+  <h2 id="h-faults">Faults</h2>
+  <div class="scroll"><table id="faults"></table></div>
+</section>
 
 <section aria-labelledby="h-apps">
   <h2 id="h-apps">Apps</h2>
@@ -89,6 +113,52 @@ input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 <section aria-labelledby="h-members">
   <h2 id="h-members">Members</h2>
   <div class="scroll"><table id="members"></table></div>
+</section>
+
+<section id="commands" aria-labelledby="h-commands">
+  <h2 id="h-commands">Commands</h2>
+  <form id="cmd-form" class="cmd-form">
+    <label>App <select id="cmd-app"></select></label>
+    <label>Member <select id="cmd-node"></select></label>
+    <label>Command <select id="cmd-name">
+      <option>drain</option><option>undrain</option><option>restart</option><option>shutdown</option>
+      <option>compact</option><option>maintain</option><option>expire-tombstones</option><option>audit</option>
+      <option>self-check</option><option>catch-up</option><option>resync</option><option>rejoin</option>
+      <option>check-disk</option><option>release-leases</option><option>set-quorum</option>
+    </select></label>
+    <label id="cmd-from-l" hidden>From node <input id="cmd-from" placeholder="any member" size="18"></label>
+    <label id="cmd-max-l" hidden>max_members <input id="cmd-max" type="number" min="1" size="4"></label>
+    <button type="submit">Run</button>
+  </form>
+  <p class="dim" id="cmd-hint"></p>
+  <div id="jobs"></div>
+</section>
+
+<section aria-labelledby="h-generations">
+  <h2 id="h-generations">Generations</h2>
+  <div class="scroll"><table id="generations"></table></div>
+</section>
+
+<section aria-labelledby="h-consensus">
+  <h2 id="h-consensus">Consensus</h2>
+  <div class="scroll"><table id="consensus"></table></div>
+</section>
+
+<section aria-labelledby="h-replication">
+  <h2 id="h-replication">Replication</h2>
+  <div class="scroll"><table id="replication"></table></div>
+  <div class="scroll"><table id="queues"></table></div>
+</section>
+
+<section aria-labelledby="h-recovery">
+  <h2 id="h-recovery">Recovery</h2>
+  <div class="scroll"><table id="recovery"></table></div>
+  <div class="scroll"><table id="catchups"></table></div>
+</section>
+
+<section aria-labelledby="h-tombstones">
+  <h2 id="h-tombstones">Tombstones</h2>
+  <div class="scroll"><table id="tombstones"></table></div>
 </section>
 
 <section aria-labelledby="h-traffic">
@@ -134,6 +204,18 @@ const ago = (ms, now) => {
 };
 const build = (b) => b ? `${b.count} (${esc(b.hash)})${b.local ? ` <span class="warn">local ${esc(b.local)}</span>` : ""}` : "—";
 const stateClass = (s) => ({ready: "ok", loading: "warn", upgrading: "warn", draining: "warn", fault: "bad"}[s] || "dim");
+const modeClass = (m) => ({joined: "ok", fault: "bad", cut_off: "warn", rejoining: "warn", reloading: "warn", draining: "warn"}[m] || "dim");
+const bytes = (n) => {
+  if (n == null) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(1) : n) + " " + units[i];
+};
+const node = (hex) => `<td class="mono">${esc(hex)}</td>`;
+const purpose = (p) => typeof p === "string" ? p : Object.entries(p).map(([k, v]) => `${k} ${v.toString(16).padStart(16, "0")}`).join("");
+// Every member that has reported, with its report.
+const reporting = (s) => s.members.filter((m) => m.coord);
 
 function table(el, head, rows, empty) {
   if (!rows.length) { el.innerHTML = `<tr><td class="empty">${esc(empty)}</td></tr>`; return; }
@@ -151,7 +233,21 @@ let last = null, before = null;
 function render(s, earlier) {
   $("gateway").textContent = s.gateway;
   $("updated").textContent = "updated " + when(s.now_ms);
-  table($("apps"), ["App", "Mode", "Since", "Floor", "Set by", "Model lock", "Members", "Ready"],
+  $("draining").innerHTML = s.draining ? `<span class="pill warn">draining: admitting no sockets</span>` : "";
+  $("faults-block").classList.toggle("alarm", s.faults.some((f) => f.fault));
+  table($("faults"), ["App", "Node", "Host", "State", "Reason", "Free", "Floor", "Since", "Claims given up", "Voting", "Unsent", "Freed"],
+    s.faults.map((f) => [
+      `<td>${esc(f.app)}</td>`, node(f.node), `<td>${esc(f.host)}</td>`,
+      `<td><span class="pill ${f.fault ? "bad" : "warn"}">${f.fault ? "fault" : "near the floor"}</span></td>`,
+      `<td class="wrap">${esc(f.fault ? f.fault.reason : "within twice the floor")}</td>`,
+      `<td class="mono">${bytes(f.free)}</td>`, `<td class="mono">${bytes(f.floor)}</td>`,
+      `<td class="mono">${f.fault ? ago(f.fault.since_ms, s.now_ms) : "—"}</td>`,
+      `<td class="mono">${f.fault ? f.fault.claims_released : "—"}</td>`,
+      `<td>${f.fault ? (f.fault.voting ? "yes" : "no") : "—"}</td>`,
+      `<td class="mono">${f.unsent}</td>`,
+      `<td class="mono">${f.fault ? bytes(f.fault.freed) : "—"}</td>`,
+    ]), "no member is in fault mode or near its floor");
+  table($("apps"), ["App", "Mode", "Since", "Floor", "Set by", "Model lock", "Members", "Ready", "max_members", "Quorum", ""],
     s.apps.map((a) => [
       `<td>${esc(a.app)}</td>`,
       `<td><span class="pill ${a.mode === "clustered" ? "ok" : "dim"}">${esc(a.mode)}</span></td>`,
@@ -161,22 +257,106 @@ function render(s, earlier) {
       `<td class="wrap">${esc(a.model_lock || "—")}</td>`,
       `<td class="mono">${a.members}</td>`,
       `<td class="mono">${a.ready}</td>`,
+      `<td class="mono">${a.max_members ?? "—"}</td>`,
+      `<td class="mono">${a.quorum ?? "—"}</td>`,
+      `<td>${a.members ? `<button type="button" class="quorum" data-app="${esc(a.app)}">Set quorum…</button>` : ""}</td>`,
     ]), "no apps");
-  table($("members"), ["App", "Node", "Host", "Build", "State", "Power", "Weight", "Idle", "Free slots", "Session", "Connected", "Last close"],
+  table($("members"), ["App", "Node", "Host", "Build", "State", "Mode", "Gen", "Free disk", "Power", "Weight", "Idle", "Free slots", "Session", "Connected", "Clock", "Clusters", "Last close", ""],
+    s.members.map((m) => {
+      const c = m.coord;
+      return [
+        `<td>${esc(m.app)}</td>`,
+        node(m.node),
+        `<td>${esc(m.host)}</td>`,
+        `<td class="mono">${build(m.build)}</td>`,
+        `<td><span class="pill ${stateClass(m.state)}">${esc(m.state)}</span>${m.lagging ? ` <span class="pill warn">lagging</span>` : ""}</td>`,
+        `<td>${c ? `<span class="pill ${modeClass(c.mode)}">${esc(c.mode)}</span>` : "—"}</td>`,
+        `<td class="mono">${c ? c.gen.current : "—"}</td>`,
+        `<td class="mono">${c ? bytes(c.disk.free) : "—"}</td>`,
+        `<td class="mono">${m.power ?? "—"}</td>`,
+        `<td class="mono">${m.weight}</td>`,
+        `<td>${m.idle == null ? "—" : m.idle ? "yes" : "no"}</td>`,
+        `<td class="mono">${m.slots_free ?? "—"}</td>`,
+        `<td class="mono">${m.session}</td>`,
+        `<td class="mono">${ago(m.connected_ms, s.now_ms)}</td>`,
+        `<td class="mono">${m.clock_offset_ms > 0 ? "+" : ""}${m.clock_offset_ms} ms</td>`,
+        `<td class="wrap">${c ? c.clusters.map((x) => `${esc(x.url)} <span class="${x.state === "admitted" ? "ok" : "warn"}">${esc(x.state)}</span>`).join("<br>") : "—"}</td>`,
+        `<td class="wrap">${esc(m.last_close || "—")}</td>`,
+        `<td><button type="button" class="pick" data-app="${esc(m.app)}" data-node="${esc(m.node)}">Commands</button></td>`,
+      ];
+    }), "no member is connected — every app is dumb");
+  fillCommandTargets(s);
+  const reported = reporting(s);
+  table($("generations"), ["App", "Node", "Mode", "Generation", "Last rejoin took", "Greatest decided", "Detached", "Deferred records"],
+    reported.map((m) => {
+      const c = m.coord;
+      return [
+        `<td>${esc(m.app)}</td>`, node(m.node),
+        `<td><span class="pill ${modeClass(c.mode)}">${esc(c.mode)}</span></td>`,
+        `<td class="mono">${c.gen.current}</td>`,
+        `<td class="mono">${c.gen.last_rejoin ?? "—"}</td>`,
+        `<td class="mono">${c.gen.decided}</td>`,
+        `<td>${c.detached ? `<span class="warn">holding writes from while cut off</span>` : "no"}</td>`,
+        `<td class="wrap">${c.deferred.length ? c.deferred.map((d) => `${esc(d.record_type)} from ${esc(d.origin)}: ${d.count}`).join("<br>") : "none"}</td>`,
+      ];
+    }), "no member has reported");
+  table($("consensus"), ["App", "Member", "Key", "Round", "Lease left", "Promised", "Accepted"],
+    reported.flatMap((m) => m.coord.paxos.keys.map((k) => [
+      `<td>${esc(m.app)}</td>`, node(m.node),
+      `<td class="mono">${esc(k.key)}</td>`,
+      `<td class="mono">${esc(k.round || "—")}</td>`,
+      `<td class="mono">${k.held_ms != null ? (k.held_ms / 1000).toFixed(1) + " s" : "—"}</td>`,
+      `<td class="mono">${esc(k.promised || "—")}</td>`,
+      `<td class="mono">${esc(k.accepted || "—")}</td>`,
+    ])), "no Paxos key is known to any member");
+  table($("replication"), ["App", "Member", "Origin", "Applied through", "High water", "Behind", "Missing below the top"],
+    reported.flatMap((m) => m.coord.applied.map((a) => {
+      const behind = Math.max(0, a.high_water - a.through);
+      return [
+        `<td>${esc(m.app)}</td>`, node(m.node), node(a.origin),
+        `<td class="mono">${a.through}</td>`, `<td class="mono">${a.high_water}</td>`,
+        `<td class="mono ${behind ? "warn" : ""}">${behind}</td>`,
+        `<td class="mono ${a.missing ? "warn" : ""}">${a.missing}</td>`,
+      ];
+    })), "nothing applied yet");
+  table($("queues"), ["App", "Member", "Unsent", "In flight", "Live queued", "Catch-up queued", "Live skipped", "Catch-up dropped"],
     s.members.map((m) => [
-      `<td>${esc(m.app)}</td>`,
-      `<td class="mono">${esc(m.node)}</td>`,
-      `<td>${esc(m.host)}</td>`,
-      `<td class="mono">${build(m.build)}</td>`,
-      `<td><span class="pill ${stateClass(m.state)}">${esc(m.state)}</span></td>`,
-      `<td class="mono">${m.power ?? "—"}</td>`,
-      `<td class="mono">${m.weight}</td>`,
-      `<td>${m.idle == null ? "—" : m.idle ? "yes" : "no"}</td>`,
-      `<td class="mono">${m.slots_free ?? "—"}</td>`,
-      `<td class="mono">${m.session}</td>`,
-      `<td class="mono">${ago(m.connected_ms, s.now_ms)}</td>`,
-      `<td class="wrap">${esc(m.last_close || "—")}</td>`,
-    ]), "no member is connected — every app is dumb");
+      `<td>${esc(m.app)}</td>`, node(m.node),
+      `<td class="mono">${m.coord ? m.coord.outbox.unsent : "—"}</td>`,
+      `<td class="mono">${m.coord ? m.coord.outbox.in_flight : "—"}</td>`,
+      `<td class="mono">${bytes(m.live_bytes)}</td>`,
+      `<td class="mono">${bytes(m.catchup_bytes)}</td>`,
+      `<td class="mono">${m.skipped}</td>`,
+      `<td class="mono">${m.dropped}</td>`,
+    ]), "no member is connected");
+  table($("recovery"), ["App", "Member", "Applied", "Refused", "Catch-ups asked", "Answered for others", "Fetched for others", "Retransmitted", "Reloads"],
+    reported.map((m) => {
+      const t = m.coord.stats;
+      return [
+        `<td>${esc(m.app)}</td>`, node(m.node),
+        `<td class="mono">${t.applied}</td>`, `<td class="mono">${t.refused}</td>`,
+        `<td class="mono">${t.catchups}</td>`, `<td class="mono">${t.answered}</td>`,
+        `<td class="mono">${t.fetched_for_others}</td>`, `<td class="mono">${t.resent}</td>`,
+        `<td class="mono">${t.reloads}</td>`,
+      ];
+    }), "no member has reported");
+  table($("catchups"), ["App", "Member", "Cluster", "Why", "Answerer", "Fetched", "Wanted", "Already held", "Bytes"],
+    reported.flatMap((m) => m.coord.catchups.map((c) => [
+      `<td>${esc(m.app)}</td>`, node(m.node),
+      `<td class="mono">${c.cluster}</td>`,
+      `<td>${esc(purpose(c.purpose))}</td>`,
+      `<td class="mono">${c.answerer != null ? c.answerer.toString(16).padStart(16, "0") : "—"}</td>`,
+      `<td class="mono">${c.fetched}</td>`, `<td class="mono">${c.wanted}</td>`,
+      `<td class="mono">${c.skipped}</td>`,
+      `<td class="mono">${bytes(c.fetched_bytes)} of ${bytes(c.wanted_bytes)}</td>`,
+    ])), "no catch-up in progress");
+  table($("tombstones"), ["App", "Member", "Held", "Waiting for age", "Expired, kept as deleted-set entries"],
+    reported.map((m) => [
+      `<td>${esc(m.app)}</td>`, node(m.node),
+      `<td class="mono">${m.coord.tombstones.held}</td>`,
+      `<td class="mono">${m.coord.tombstones.waiting_age}</td>`,
+      `<td class="mono">${m.coord.tombstones.deleted}</td>`,
+    ]), "no member has reported");
   const t = s.traffic;
   const prev = earlier && earlier.traffic;
   const span = earlier ? Math.max(1, (s.now_ms - earlier.now_ms) / 1000) : 1;
@@ -229,6 +409,123 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 for (const id of ["f-app", "f-subject"]) $(id).addEventListener("input", () => last && render(last, before));
+
+// The commands' targets: every app with a member here, and its members, the
+// choice kept across the once-a-second redraw.
+function fillCommandTargets(s) {
+  const app = $("cmd-app"), node = $("cmd-node");
+  const apps = [...new Set(s.members.map((m) => m.app))];
+  const keepApp = app.value;
+  app.innerHTML = apps.map((a) => `<option>${esc(a)}</option>`).join("");
+  if (apps.includes(keepApp)) app.value = keepApp;
+  const keepNode = node.value;
+  const members = s.members.filter((m) => m.app === app.value);
+  node.innerHTML = `<option value="all">every member</option>` +
+    members.map((m) => `<option value="${esc(m.node)}">${esc(m.host)} · ${esc(m.node)}</option>`).join("");
+  if (keepNode === "all" || members.some((m) => m.node === keepNode)) node.value = keepNode;
+}
+
+const DESTRUCTIVE = ["shutdown", "set-quorum"];
+
+function showArgs() {
+  const name = $("cmd-name").value;
+  $("cmd-from-l").hidden = name !== "catch-up";
+  $("cmd-max-l").hidden = name !== "set-quorum";
+  $("cmd-hint").textContent = DESTRUCTIVE.includes(name)
+    ? `${name} asks for each member's host name, typed out, before it runs.` : "";
+}
+$("cmd-name").addEventListener("change", showArgs);
+$("cmd-app").addEventListener("change", () => last && fillCommandTargets(last));
+
+document.addEventListener("click", (e) => {
+  const pick = e.target.closest("button.pick, button.quorum");
+  if (!pick) return;
+  $("cmd-app").value = pick.dataset.app;
+  if (last) fillCommandTargets(last);
+  $("cmd-node").value = pick.dataset.node || "all";
+  if (pick.classList.contains("quorum")) {
+    $("cmd-name").value = "set-quorum";
+    const first = last && last.members.find((m) => m.app === pick.dataset.app);
+    if (first) $("cmd-node").value = first.node;
+  }
+  showArgs();
+  $("commands").scrollIntoView({behavior: "smooth", block: "start"});
+});
+
+// One job's lines, read from its stream as they come, under its heading.
+async function follow(app, m, name, started) {
+  const el = document.createElement("div");
+  el.className = "job";
+  el.innerHTML = `<h3>${esc(name)} on ${esc(m.host)} · <span class="mono">${esc(m.node)}</span>, job ${started.job}</h3><ol></ol>`;
+  $("jobs").prepend(el);
+  const list = el.querySelector("ol");
+  const r = await fetch(`/gateway/member/${encodeURIComponent(app)}/${m.node}${started.stream}`);
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  for (;;) {
+    const {value, done} = await reader.read();
+    if (done) break;
+    buffered += decoder.decode(value, {stream: true});
+    let at;
+    while ((at = buffered.indexOf("\n")) >= 0) {
+      const line = JSON.parse(buffered.slice(0, at));
+      buffered = buffered.slice(at + 1);
+      const li = document.createElement("li");
+      li.className = line.event;
+      li.textContent = line.event === "step" ? `${line.step}: ${line.detail}`
+        : line.event === "done" ? `done: ${JSON.stringify(line.result)}`
+        : line.event === "error" ? `failed: ${line.detail}`
+        : `started with ${JSON.stringify(line.args)}`;
+      list.append(li);
+    }
+  }
+}
+
+$("cmd-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!last) return;
+  const app = $("cmd-app").value, name = $("cmd-name").value, which = $("cmd-node").value;
+  const targets = last.members.filter((m) => m.app === app && (which === "all" || m.node === which));
+  for (const m of targets) {
+    const body = {app};
+    if (name === "catch-up" && $("cmd-from").value.trim()) body.from = $("cmd-from").value.trim();
+    if (name === "set-quorum") body.max_members = Number($("cmd-max").value);
+    if (DESTRUCTIVE.includes(name)) {
+      const typed = prompt(`${name} on ${m.host}: type its host name to confirm`);
+      if (typed === null) continue;
+      body.confirm = typed;
+    }
+    try {
+      const r = await fetch(`/gateway/member/${encodeURIComponent(app)}/${m.node}/v1/cluster/command/${name}`, {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      const answer = await r.json();
+      if (!r.ok) throw new Error(`${m.host}: ${answer.detail || r.status}`);
+      follow(app, m, name, answer);
+    } catch (err) {
+      $("error").textContent = String(err.message || err);
+    }
+  }
+});
+showArgs();
+
+async function command(name) {
+  try {
+    const r = await fetch(`/gateway/command/${name}`, {method: "POST"});
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.detail || r.status);
+    $("error").textContent = body.still_open ? `${body.still_open} requests were still open after a minute` : "";
+  } catch (e) {
+    $("error").textContent = String(e.message || e);
+  }
+}
+$("drain").addEventListener("click", () => {
+  if (confirm("Drain this gateway? It admits no member sockets and closes the ones it has; members carry on through their other clusters.")) command("drain-gateway");
+});
+$("undrain").addEventListener("click", () => command("undrain-gateway"));
 poll();
 </script>
 </body>

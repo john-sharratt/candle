@@ -25,7 +25,6 @@ mod chat_frames;
 mod compressed;
 pub mod conversations;
 pub mod files;
-pub mod maintenance;
 pub mod models;
 pub mod projections;
 mod repo_map;
@@ -56,8 +55,8 @@ pub const CONVERSATION_HEADER: &str = "x-tokera-conversation";
 ///
 /// Under a cluster a conversation is served by the member holding its claim;
 /// the substrate's replicated state is read from any member, and what lives in
-/// one member's memory — a layer's kill switch, a projection's selection, a
-/// maintenance pass — is asked of each.
+/// one member's memory — a layer's kill switch, a projection's selection — is
+/// asked of each. A maintenance pass is the host's `maintain` command.
 fn table(roles: Roles) -> Api<Arc<ZendSession>> {
     let conversation = || Dispatch::sticky_path("id");
     let each = || Dispatch::Aggregate(Merge::Envelope);
@@ -131,12 +130,6 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Role::Admin,
             Dispatch::Best,
             post(substrate::project),
-        )
-        .route(
-            "/v1/substrate/zend/maintenance",
-            Role::Admin,
-            each(),
-            post(maintenance::force_maintenance),
         )
         .route(
             "/v1/conversations",
@@ -215,7 +208,6 @@ mod tests {
                 ("/v1/substrate/zend/timeline/:tl", "admin"),
                 ("/v1/substrate/zend/timeline/:tl/selection", "admin"),
                 ("/v1/substrate/zend/project", "admin"),
-                ("/v1/substrate/zend/maintenance", "admin"),
                 ("/v1/conversations", "unauthenticated"),
                 ("/v1/conversations/:id", "unauthenticated"),
                 ("/v1/conversations/:id/files", "unauthenticated"),
@@ -280,7 +272,7 @@ mod tests {
             ),
             (
                 "POST",
-                "/v1/substrate/zend/maintenance",
+                "/v1/substrate/zend/layer/repo_map/toggle",
                 Dispatch::Aggregate(Merge::Envelope),
             ),
         ] {

@@ -12,6 +12,8 @@
 //! | [`sticky`] | claiming a sticky key before serving it (§5.4) |
 //! | [`capacity`] | what `CAPACITY` reports (§5.3) |
 //! | [`store`] | a tenant's substrate as replication drives it (§6, §7) |
+//! | [`disk`] | the volume a substrate is on, for fault mode (§7.7) |
+//! | [`leave`] | draining and sending before the process stops (§12.4) |
 //! | [`view`] | the `cluster` block of `/v1/status`, and the `connecting` and `catchup` steps |
 //!
 //! The protocol — handshake, sessions, claims, reconnects, replication — is
@@ -19,7 +21,9 @@
 
 pub mod capacity;
 pub mod dial;
+pub mod disk;
 pub mod flush;
+pub mod leave;
 pub mod listener;
 pub mod serve;
 pub mod sticky;
@@ -67,6 +71,8 @@ pub struct ClusterSettings {
     pub key: GroupKey,
     /// How long a claim lives unserved (`--cluster-affinity-idle`).
     pub affinity_idle: Duration,
+    /// `max_members` to write as a set at startup (`--cluster-quorum-max`).
+    pub quorum_max: Option<u32>,
     /// This machine's name in `HELLO` and on the status page.
     pub host: String,
     /// The build this member reports: this binary's ([`this_build`]).
@@ -81,13 +87,22 @@ impl ClusterSettings {
         name: Option<&str>,
         key: Option<&Path>,
         affinity_idle: Duration,
+        quorum_max: Option<u32>,
         host: String,
     ) -> anyhow::Result<Option<ClusterSettings>> {
         if urls.is_empty() {
             if key.is_some() {
                 anyhow::bail!("--group-key names a cluster's key, and no --cluster is given");
             }
+            if quorum_max.is_some() {
+                anyhow::bail!(
+                    "--cluster-quorum-max sets a cluster's quorum, and no --cluster is given"
+                );
+            }
             return Ok(None);
+        }
+        if quorum_max == Some(0) {
+            anyhow::bail!("--cluster-quorum-max is at least 1: a group has at least this member");
         }
         let Some(key) = key else {
             anyhow::bail!("--cluster needs --group-key: the key a member proves it holds");
@@ -100,6 +115,7 @@ impl ClusterSettings {
             targets,
             key: GroupKey::load(key)?,
             affinity_idle,
+            quorum_max,
             host,
             build: this_build(),
         }))
@@ -417,6 +433,17 @@ impl Join {
         let _ = self.link.own_oseq.set(Box::new(own_oseq));
         self.cluster
             .start(&self.link, node, model, Some(replication));
+        let replicator = self.link.member().and_then(|m| m.replicator().cloned());
+        if let (Some(n), Some(r)) = (self.cluster.settings.quorum_max, replicator) {
+            tracing::warn!(
+                app = self.link.app,
+                max_members = n,
+                "--cluster-quorum-max: writing the group's max_members lower"
+            );
+            self.cluster
+                .runtime
+                .spawn(async move { r.set_quorum(n).await });
+        }
         loop {
             progress(&self.link.clusters());
             let link = self.link.socket_state();

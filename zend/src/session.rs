@@ -29,8 +29,9 @@ use candle_conversation::models::{Dialect, Model, StrataTokens};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
 use candle_conversation::projection::{
-    self, Builder, GroupSchema, LayerId, Reserved, SectionId, SectionLoads, SelectionRule,
-    SystemItem, SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex, WorkingSetShare,
+    self, Builder, Conversation, GroupSchema, LayerId, Reserved, SectionId, SectionLoads,
+    SelectionRule, SystemItem, SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex,
+    WorkingSetShare,
 };
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
@@ -85,6 +86,7 @@ use crate::repo_path::shown as shown_unit;
 use crate::repo_scan::{utility_config, DIR_KEY};
 use crate::resume;
 use crate::retrieval_scope::RetrievalScope;
+use crate::self_check::{self, Report as SelfCheckReport};
 use crate::think_budget;
 use crate::think_progress::{ThinkProgress, ThinkUpdate};
 use crate::tool_round;
@@ -1033,9 +1035,6 @@ pub type LastMaintenanceOp = Option<(String, u64)>;
 /// Redo-log maintenance state for `/v1/status`:
 /// `(segment_count, last_op, compaction_in_progress)`.
 pub type MaintenanceStatus = (usize, LastMaintenanceOp, bool);
-
-/// Result of a forced maintenance pass: `(ran, segment_count, last_op)`.
-pub type ForcedMaintenance = (bool, usize, LastMaintenanceOp);
 
 impl InferenceState {
     // Every argument is a distinct piece of deployment config read from the CLI
@@ -2397,13 +2396,13 @@ impl InferenceState {
                 .filter_map(|il| proj_builder_refresh.id_for_layer(&il.name))
                 .collect();
             layers.insert(dialogue_layer);
-            crate::self_check::run(
+            self_check::run(
                 &engine,
                 &conv_config,
                 &layers,
                 base_conv.unsealed_asker(),
                 self_check,
-                &progress,
+                &|done, total| progress.set_step_progress(done, total),
             )?;
         }
 
@@ -5079,27 +5078,42 @@ impl ZendSession {
         Some(conv.section_loads())
     }
 
-    /// Force one background-maintenance op now — the `POST /v1/substrate/zend/maintenance`
-    /// test trigger. Seals the active segment (so a conversation archived this
-    /// session, whose now-dead records sit in the active, becomes eligible) and
-    /// compacts a dead-carrying sealed segment, waiving the age/ratio gates. Runs
-    /// under phased locking (never holds the substrate write lock across the
-    /// relocation I/O) and — crucially — is invoked on a cloned `Conversation`
-    /// handle **without** holding the engine lock, so the user's in-flight chat
-    /// (per-turn group-commits) isn't blocked. Returns `(ran, segments, last_op)`,
-    /// or `None` if the model isn't loaded.
-    pub fn force_maintenance(&self) -> Option<ForcedMaintenance> {
+    /// The substrate, once the model is loaded: what the host's maintenance
+    /// commands run on. A cloned handle, taken without holding the engine
+    /// lock past the clone, so a command never blocks a turn's commits.
+    pub fn conversation(&self) -> Option<Conversation> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let conv = { state.engine.lock().unwrap().conversation() };
-        let ran = match conv.force_compact_persistence() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("force maintenance failed: {e:#}");
-                false
-            }
-        };
-        let (segments, last_op, _running) = conv.maintenance_status();
-        Some((ran, segments, last_op))
+        let conv = state.engine.lock().unwrap().conversation();
+        Some(conv)
+    }
+
+    /// `self-check`, run now (`docs/replicated_substrate.md` §12.4): every
+    /// stored conversation asked whether it is intact, as `--self-check
+    /// --dry-run` asks at load — reporting, tombstoning nothing. Blocks until
+    /// done; `None` until the model is loaded.
+    pub fn self_check_now(
+        &self,
+        progress: &dyn Fn(u64, u64),
+    ) -> Option<anyhow::Result<SelfCheckReport>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let mut layers: HashSet<LayerId> = state
+            .ingest_layers
+            .iter()
+            .filter(|il| state.ingest_bases.contains_key(&il.name))
+            .filter_map(|il| state.refresh_builder.id_for_layer(&il.name))
+            .collect();
+        if let Some(dialogue) = state.refresh_builder.id_for_layer("dialogue") {
+            layers.insert(dialogue);
+        }
+        let base = state.base_conv.lock().unwrap().unsealed_asker();
+        Some(self_check::run(
+            &state.engine,
+            &state.refresh_config,
+            &layers,
+            base,
+            SelfCheck::DryRun,
+            progress,
+        ))
     }
 
     /// `GET /v1/substrate` — a structural snapshot of the live substrate for the

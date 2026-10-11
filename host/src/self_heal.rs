@@ -176,6 +176,12 @@ impl LaunchSpec {
         })
     }
 
+    /// Start an identical process — the `restart` command's last step, once
+    /// this one has stopped. Its process id.
+    pub fn relaunch(&self) -> io::Result<u32> {
+        self.relaunch_command().spawn().map(|child| child.id())
+    }
+
     /// Build (without spawning) the command that relaunches an identical
     /// process. A fresh stdin: the child must not inherit a handle whose
     /// other end goes away when this process exits.

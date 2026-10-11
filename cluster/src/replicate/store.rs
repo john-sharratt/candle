@@ -25,6 +25,27 @@ pub struct Applied {
     pub reload: bool,
 }
 
+/// The volume a store is on, as fault mode judges it (§7.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Disk {
+    pub free: u64,
+    pub total: u64,
+    /// A write has failed for lack of space since the last test write
+    /// succeeded.
+    pub write_failed: bool,
+}
+
+/// The timeline tombstones a store holds, by how far each is from expiring
+/// (§6.8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tombstones {
+    pub held: usize,
+    /// Of those, the ones a complete compaction has run past.
+    pub swept: usize,
+    /// Expired tombstones kept as deleted-set entries.
+    pub deleted: usize,
+}
+
 /// What a store holds of one origin's range, for a `HEADERS`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Listing {
@@ -107,4 +128,22 @@ pub trait Store: Send + Sync + 'static {
     /// Rebuild the in-memory state from the log — after a rejoin fixed a
     /// generation, or a turn arrived ranked below one held. Blocks until done.
     fn reload(&self);
+
+    /// The volume it is on, measured now.
+    fn disk(&self) -> Disk;
+
+    /// A test append and commit; whether it succeeded. One that does clears
+    /// the record of a failed write.
+    fn test_write(&self) -> bool;
+
+    /// Drop one fully-dead segment of its log, if it has one: freeing space
+    /// with no scratch space needed. Whether one was dropped.
+    fn drop_dead_segment(&self) -> bool;
+
+    /// Records held back because this build does not decode their type: per
+    /// type and origin, how many.
+    fn deferred(&self) -> Vec<(String, u64, usize)>;
+
+    /// Its timeline tombstones.
+    fn tombstones(&self) -> Tombstones;
 }

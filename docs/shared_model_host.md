@@ -577,7 +577,7 @@ other needs:
 |---|---|---|
 | `log_broadcast.rs`, `log_line.rs`, `api/ws_logs.rs` | `logs.rs`, the `/ws/logs` handler in `ops.rs` | `host::logs` (one bus, one frame), `host::endpoints::logs` (one socket handler) |
 | `loading.rs` | `engine/loading.rs` | stay each tenant's — the steps are each daemon's own — reported in one shape, `host::loading::LoadingView` (§3.5) |
-| `api/status.rs` | the status handler in `ops.rs` | `host::endpoints::status`; zend's maintenance trigger stays zend's, at `/v1/substrate/zend/maintenance` |
+| `api/status.rs` | the status handler in `ops.rs` | `host::endpoints::status`; zend's maintenance trigger is the host's `maintain` command, for every tenant (`docs/replicated_substrate.md` §12.4) |
 | `api/telemetry.rs`, `api/memory.rs`, `api/profile.rs` | `telemetry/` (`mod.rs` sampler, `ring.rs`, `device.rs` NVML, `sample.rs`, `memory.rs`) | `host::telemetry`, `host::endpoints::{telemetry, waves, profile}` |
 | `api/me.rs` | the `/v1/me` route in `api.rs` | `host::endpoints::me`; npcd's accounts and profile routes stay npcd's (§3.5) |
 | `access.rs` (peer trust, `--local-signin`, role lookup) | `identity.rs` (the refusal), `guard.rs` (route grading) | `web::auth::Gateways` and `web::Builder::trust` (peer trust, in the server); `host::access` (the role table, `--local-signin`); `host::guard` (route grading, the refusal, the path-overlap check). zend keeps its tools-mode policy; npcd keeps `Caller` and `--log-identity` |

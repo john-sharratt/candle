@@ -111,8 +111,16 @@ impl Replicator {
         });
     }
 
-    /// Propose `gen/<k>`, or the first `k` above it no decision names yet.
+    /// Propose `gen/<k>`, or the first `k` above it no decision names yet. A
+    /// member in fault mode proposes nothing (§7.7): it stays cut off, and
+    /// tries again once it has left and caught up.
     async fn propose_generation(self: &Arc<Self>, k: u64) {
+        if self.faulted() {
+            let mut s = self.state();
+            s.phase = Phase::CutOff;
+            s.retry_rejoin = Some(Instant::now() + REJOIN_RETRY);
+            return;
+        }
         let store = self.store.clone();
         let Ok(k) = tokio::task::spawn_blocking(move || {
             let mut k = k;
@@ -148,22 +156,28 @@ impl Replicator {
     /// and send it (§6.7).
     async fn rejoined(self: &Arc<Self>, k: u64) {
         let store = self.store.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let fixed = tokio::task::spawn_blocking(move || {
             let fixed = store.detached();
             store.rejoin(k);
             if fixed {
                 store.reload();
             }
+            fixed
         })
-        .await;
+        .await
+        .unwrap_or(false);
         {
             let mut s = self.state();
             s.phase = Phase::Joined;
             s.retry_rejoin = None;
+            if fixed {
+                s.last_rejoin = Some(k);
+            }
         }
         if let Some(m) = self.member() {
             m.capacity_changed();
         }
+        self.coord_now();
         self.send_wake.notify_one();
     }
 
@@ -232,10 +246,12 @@ impl Replicator {
     /// `max_members` when more ready members are seen at once.
     pub(super) async fn refresh_group(self: &Arc<Self>) {
         let seen = self.ready_members();
+        // A member in fault mode proposes nothing, and a raise is a proposal.
+        let may_raise = !self.faulted();
         let store = self.store.clone();
         let Ok((max_members, generation)) = tokio::task::spawn_blocking(move || {
             let held = store.max_members();
-            if seen > held {
+            if may_raise && seen > held {
                 store.raise_max_members(seen);
             }
             (store.max_members(), store.generation())

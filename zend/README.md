@@ -69,7 +69,6 @@ POST   /v1/substrate/zend/layer/:name/toggle         Enable/disable a layer     
 GET/DELETE /v1/substrate/zend/timeline/:tl           One timeline's detail + summary forest / tombstone it                (admin)
 GET    /v1/substrate/zend/timeline/:tl/selection     The timeline's last selection diagnostic                             (admin)
 POST   /v1/substrate/zend/project                    Run a projection against the live substrate (search)                 (admin)
-POST   /v1/substrate/zend/maintenance                Force a persistence maintenance pass                                 (admin)
 GET    /v1/conversations                             Sidebar conversation list
 GET/DELETE /v1/conversations/:id                     Conversation detail / delete (tombstone)
 GET/POST /v1/conversations/:id/files                 Per-conversation file upload/list
@@ -80,7 +79,7 @@ GET    /v1/conversations/:id/projections/:turn/:event  One projection point in f
 POST   /v1/conversations/:id/projection-context      The context a projection assembled
 ```
 
-The host serves the endpoints every tenant shares, once (`host::endpoints`): `GET /v1/status` (zend's line under `tenants.zend`), `GET /v1/me` (zend's tools modes under `tenants.zend`), `GET /v1/telemetry`, `/v1/memory`, `/v1/phases`, `/v1/promotes`, `/v1/profile`, `GET /v1/tools` (every catalog, each tool naming its tenant), `GET /v1/schema/layers`, `GET /v1/substrate`, and `WS /ws/logs`. It serves the web UI from `web/` for every path no route claims (`GET /`, `/perf`, `/substrate`, `/project`, resolved to their `.html` files), and the shared front-end at `/common/` and `/brand/`.
+The host serves the endpoints every tenant shares, once (`host::endpoints`): `GET /v1/status` (zend's line under `tenants.zend`), `GET /v1/me` (zend's tools modes under `tenants.zend`), `GET /v1/telemetry`, `/v1/memory`, `/v1/phases`, `/v1/promotes`, `/v1/profile`, `GET /v1/tools` (every catalog, each tool naming its tenant), `GET /v1/schema/layers`, `GET /v1/substrate`, `WS /ws/logs`, and the maintenance commands — `POST /v1/cluster/command/:name` (`maintain`, `compact`, `audit`, `self-check`, …) with their job stream at `GET /v1/cluster/command/job/:id` (`docs/replicated_substrate.md` §12.4). It serves the web UI from `web/` for every path no route claims (`GET /`, `/perf`, `/substrate`, `/project`, resolved to their `.html` files), and the shared front-end at `/common/` and `/brand/`.
 
 `POST /v1/chat/completions` accepts the standard OpenAI `messages`/`stream`/`max_tokens` fields plus `zend` extensions: **`conv_id` (required)**, `tools` (a `ToolMode` dial — `none`/`restricted`/`comprehensive`), `identity`, `effort`, `verbosity`, `think`, `assistant_prefill`, `force_high_resolution`, `lossless_kv`.
 
