@@ -51,6 +51,9 @@ mod model_binding;
 pub mod payload_parts;
 pub mod pipeline;
 pub mod priority_lock;
+pub mod rebase;
+#[cfg(test)]
+mod rebase_tests;
 pub mod record;
 pub mod recovery;
 pub mod relocation_watch;
@@ -75,6 +78,8 @@ pub mod walker;
 pub mod writer;
 pub mod writer_lock;
 
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -87,22 +92,24 @@ use accounting::RecordAccounting;
 use appended::Appended;
 use candle::direct_io::DirectFile;
 use chunk_plan::ChunkedReadPlan;
+use compaction::Housekeeping;
 use content_hash::snapshot_stream_id;
 use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use identity::{
-    load_or_mint, now_ms, read_node, MarkerIds, Minter, NodeSource, Origination, OwnSections,
-    RecordIdentity, Stamped,
+    load_or_mint, now_ms, read_node, MarkerIds, MintGeneration, Minter, NodeSource, Origination,
+    OwnSections, RecordIdentity, Stamped, GEN_DETACHED,
 };
 use inherit::InheritedSubstrate;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 pub use model_binding::{BoundSubstrate, ModelBinding};
 pub use priority_lock::PersistenceLock;
+use rebase::{RebaseEntry, RebaseMap};
 use record::verify_record_crc;
 use record::{
-    decode_header, decode_record, encode_record_written, padded_record_len, ChunkPayload,
-    CustomObjectPayload, DebugIdPayload, NpcPayload, Record, RecordHeader, RecordType,
-    SectionGeneration, SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
+    decode_header, decode_record, encode_record, encode_record_written, padded_record_len,
+    ChunkPayload, CustomObjectPayload, DebugIdPayload, NpcPayload, Record, RecordHeader,
+    RecordType, SectionGeneration, SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
     HEADER_PROBE_SIZE,
 };
 use relocation_watch::RelocationWatch;
@@ -505,6 +512,9 @@ pub struct SubstratePersistence {
     /// Where every record with an identity is, kept current through every
     /// append, relocation and rewrite (§6.2).
     locations: LocationIndex,
+    /// The generations fixed for what this node wrote cut off (§6.7), applied
+    /// to its own records wherever it reads them back.
+    rebases: RebaseMap,
 }
 
 /// What [`SubstratePersistence::metadata_locs`] keys a record by: its type, the
@@ -518,7 +528,10 @@ pub(crate) type MetadataKey = (RecordType, u64, u64);
 /// The [`MetadataKey`] of a record with header `h`.
 fn metadata_key(h: &RecordHeader) -> MetadataKey {
     let writer = match h.record_type {
-        RecordType::CustomObject | RecordType::Deleted | RecordType::Replica => 0,
+        RecordType::CustomObject
+        | RecordType::Deleted
+        | RecordType::Replica
+        | RecordType::Rebase => 0,
         _ => h.origin,
     };
     (h.record_type, h.stream_id, writer)
@@ -543,6 +556,7 @@ fn is_tracked_metadata(rt: RecordType) -> bool {
             | RecordType::CustomObject
             | RecordType::Deleted
             | RecordType::Replica
+            | RecordType::Rebase
     )
 }
 
@@ -585,6 +599,20 @@ fn record_metadata_loc(map: &mut StampedLocs<MetadataKey>, entry: &walker::WalkE
 /// record with an identity is located, another origin's is applied, and a
 /// `Replica` record's sets join what is held. Both only grow, so the order the
 /// walk meets them in does not matter.
+/// `entry` with its identity fixed: a record this node wrote cut off carries
+/// the generation a rejoin fixed for it ([`RebaseMap`]); any other record is
+/// itself.
+fn fix_walked<'a>(entry: &'a WalkEntry, rebases: &RebaseMap) -> Cow<'a, WalkEntry> {
+    let id = entry.record.header.identity();
+    let fixed = rebases.fix(id);
+    if fixed == id {
+        return Cow::Borrowed(entry);
+    }
+    let mut owned = entry.clone();
+    owned.record.header = owned.record.header.with_identity(fixed);
+    Cow::Owned(owned)
+}
+
 fn observe_replica(
     replica: &mut ReplicaPayload,
     locations: &mut LocationIndex,
@@ -893,7 +921,27 @@ impl SubstratePersistence {
         // What the store actually holds, by type. One array increment per record
         // in a walk that already visits every record — see `RecordCensus`.
         let mut census = RecordCensus::new();
+        // What this node wrote cut off carries the provisional generation until
+        // a rejoin fixed it, and the `Rebase` record that says so is written
+        // after the records it fixes. So those records are held back until the
+        // walk has read every `Rebase`, then applied with the generation fixed
+        // for them — nothing reaches the substrate, or any index, unfixed.
+        let rebases = RefCell::new(RebaseMap::default());
+        let held: RefCell<Vec<WalkEntry>> = RefCell::new(Vec::new());
+        let draining = Cell::new(false);
         let mut walk = |entry: &WalkEntry| {
+            let h = &entry.record.header;
+            if h.record_type == RecordType::Rebase {
+                if let Ok(map) = RebaseMap::decode(&entry.record.payload) {
+                    rebases.borrow_mut().merge(&map);
+                }
+            }
+            if h.gen == GEN_DETACHED && h.origin == node && !draining.get() {
+                held.borrow_mut().push(entry.clone());
+                return;
+            }
+            let fixed = fix_walked(entry, &rebases.borrow());
+            let entry = fixed.as_ref();
             let h = &entry.record.header;
             origination.observe(&h.identity());
             own_sections.observe(node, h, &entry.record.payload);
@@ -918,6 +966,24 @@ impl SubstratePersistence {
         } else {
             SegmentedLog::open_with_sink(dir, &mut walk)?
         };
+        draining.set(true);
+        let held = held.take();
+        // A detached record no `Rebase` covers was written since this node was
+        // last cut off and has not rejoined: it is cut off still, from the
+        // first such record.
+        let still_detached = held
+            .iter()
+            .map(|e| rebases.borrow().fix(e.record.header.identity()))
+            .filter(|id| id.gen == GEN_DETACHED)
+            .map(|id| id.oseq)
+            .min();
+        for entry in &held {
+            walk(entry);
+        }
+        let rebases = rebases.into_inner();
+        if still_detached.is_some() {
+            origination.detach(still_detached);
+        }
         let segmented_log::OpenedSegments {
             mut segments,
             manifest,
@@ -987,6 +1053,7 @@ impl SubstratePersistence {
             replica_dirty: release_known_deferred(&mut replica) && !read_only,
             replica,
             locations,
+            rebases,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -1540,10 +1607,11 @@ impl SubstratePersistence {
         self.locations.get(origin, oseq)
     }
 
-    /// The bytes of record `(origin, oseq)` as the log holds them — header
-    /// line, payload and padding — from wherever maintenance has moved it, or
-    /// `None` when this member does not hold it. What a member sends for an
-    /// event it owes, or to answer a fetch (§6.2, §6.3, §7.2).
+    /// The bytes of record `(origin, oseq)` — header line, payload and
+    /// padding — from wherever maintenance has moved it, or `None` when this
+    /// member does not hold it. What a member sends for an event it owes, or
+    /// to answer a fetch (§6.2, §6.3, §7.2). A record this node wrote cut off
+    /// comes back with the generation its rejoin fixed (§6.7).
     pub fn read_event(&mut self, origin: u64, oseq: u64) -> Result<Option<Vec<u8>>> {
         let Some(at) = self.locations.get(origin, oseq) else {
             return Ok(None);
@@ -1562,7 +1630,12 @@ impl SubstratePersistence {
         }
         let mut bytes = vec![0u8; padded_record_len(header_bytes - 1, header.payload_len)];
         self.segments.read_into(at.segment, at.offset, &mut bytes)?;
-        Ok(Some(bytes))
+        let fixed = self.rebases.fix(id);
+        if fixed == id {
+            return Ok(Some(bytes));
+        }
+        let (header, payload, _) = decode_record(&bytes)?;
+        Ok(Some(encode_record(&header.with_identity(fixed), payload)))
     }
 
     /// Write what is staged to its segment, so a read by location finds it —
@@ -1586,6 +1659,66 @@ impl SubstratePersistence {
             header,
             payload: payload.to_vec(),
         }))
+    }
+
+    /// This member is cut off from every cluster: what it writes from here on
+    /// is detached, under the provisional generation, until [`Self::rejoin`]
+    /// (§6.7).
+    pub fn detach(&self) {
+        self.minter.detach(None);
+    }
+
+    /// Whether this member is cut off — detached since [`Self::detach`], or
+    /// found so at open: it holds records it wrote detached that no rejoin
+    /// fixed.
+    pub fn is_detached(&self) -> bool {
+        self.minter.origination().is_detached()
+    }
+
+    /// The generations fixed for what this node wrote cut off.
+    pub fn rebases(&self) -> &RebaseMap {
+        &self.rebases
+    }
+
+    /// This member rejoined (§6.7). When it wrote anything while cut off, a
+    /// generation is decided for it through `generations`, fixed for every
+    /// record it wrote detached by a `Rebase` record made durable here, and
+    /// minted from here on; the entry is returned. When it wrote nothing it
+    /// has nothing to place, takes no generation, and returns `None`.
+    ///
+    /// A substrate built from this store holds those records' values under the
+    /// provisional generation still: the caller reloads it, as every rejoin
+    /// does (§6.6).
+    pub fn rejoin(&mut self, generations: &dyn MintGeneration) -> Result<Option<RebaseEntry>> {
+        if self.is_read_only() {
+            return Err(PersistenceError::ReadOnly);
+        }
+        let origination = self.minter.origination();
+        let Some((from, through)) = origination.detached_range() else {
+            self.minter.attach(origination.gen());
+            return Ok(None);
+        };
+        let entry = RebaseEntry {
+            origin: self.node(),
+            from,
+            through,
+            gen: generations.mint_generation(origination.gen()),
+        };
+        self.rebases.add(entry);
+        let payload = self.rebases.encode();
+        self.append_carried(
+            RecordType::Rebase,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &payload,
+            RecordIdentity::NONE,
+        )?;
+        self.commit()?;
+        self.minter.attach(entry.gen);
+        Ok(Some(entry))
     }
 
     /// Write the replica when it changed since it was last written — at a
@@ -2706,7 +2839,10 @@ impl SubstratePersistence {
                 now_ms: now_ms(),
                 retention: self.tombstone_retention,
             },
-            &self.replica,
+            &Housekeeping {
+                replica: self.replica.clone(),
+                rebases: self.rebases.clone(),
+            },
         );
         // What this compaction is carrying forward, by type, against what the
         // store held when it opened. A class present at open and absent here is
@@ -2843,7 +2979,10 @@ impl SubstratePersistence {
         let marker_ids = &mut self.marker_ids;
         let replica = &mut self.replica;
         let locations = &mut self.locations;
+        let rebases = &self.rebases;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
+            let fixed = fix_walked(entry, rebases);
+            let entry = fixed.as_ref();
             observe_replica(replica, locations, node, entry);
             let h = &entry.record.header;
             marker_ids.record(

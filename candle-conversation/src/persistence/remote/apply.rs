@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use super::super::identity::RecordIdentity;
+use super::super::identity::{RecordIdentity, GEN_DETACHED};
 use super::super::record::{Record, RecordHeader, RecordType, SectionTombstonePayload};
 use super::super::replica::DeferredRecord;
 use super::super::streams::{StreamDecl, StreamId};
@@ -26,6 +26,7 @@ fn is_local_only(rt: RecordType) -> bool {
             | RecordType::Template
             | RecordType::BranchCheckpoint
             | RecordType::Replica
+            | RecordType::Rebase
             | RecordType::Deleted
     )
 }
@@ -108,6 +109,9 @@ impl SubstratePersistence {
         let id = h.identity();
         if id.is_none() {
             return Ok(RemoteOutcome::Refused(Refusal::Unidentified));
+        }
+        if id.gen == GEN_DETACHED {
+            return Ok(RemoteOutcome::Refused(Refusal::Detached));
         }
         if h.record_type == RecordType::Unknown {
             self.defer(DeferredRecord {

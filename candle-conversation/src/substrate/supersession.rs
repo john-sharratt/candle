@@ -81,6 +81,7 @@ impl Substrate {
             | RecordType::Tokenizer
             | RecordType::HeaderIndex
             | RecordType::Replica
+            | RecordType::Rebase
             | RecordType::Deleted
             | RecordType::Unknown => None,
         }

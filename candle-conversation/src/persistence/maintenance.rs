@@ -1475,7 +1475,8 @@ impl SubstratePersistence {
     /// The whole resident set an op re-emits: the substrate's
     /// ([`gather_resident_set`]) and this handle's own — the `Replica` record,
     /// when the member has applied anything of another origin or deferred
-    /// anything.
+    /// anything, and the `Rebase` record, when it has rejoined after writing
+    /// cut off.
     fn resident_set(&self, substrate: &Substrate) -> Vec<Resident> {
         let mut out = gather_resident_set(substrate, &self.marker_ids, self.node());
         if !self.replica.is_empty() {
@@ -1484,6 +1485,15 @@ impl SubstratePersistence {
                 stream_id: 0,
                 chunk_index: 0,
                 payload: self.replica.encode(),
+                id: RecordIdentity::NONE,
+            });
+        }
+        if !self.rebases.is_empty() {
+            out.push(Resident {
+                rt: RecordType::Rebase,
+                stream_id: 0,
+                chunk_index: 0,
+                payload: self.rebases.encode(),
                 id: RecordIdentity::NONE,
             });
         }
@@ -1714,8 +1724,9 @@ impl SubstratePersistence {
     /// to consult — it is host-defined resident state like the cast in
     /// `npc_locs`. Gating it on `carried` (which never holds a key hash) would
     /// count its segment dead and let a drop take its only current copy. The
-    /// `Deleted` and `Replica` records are always carried for the same reason:
-    /// each belongs to no stream, and is the only record of what it holds.
+    /// `Deleted`, `Replica` and `Rebase` records are always carried for the
+    /// same reason: each belongs to no stream, and is the only record of what
+    /// it holds.
     fn carried_metadata<'a>(
         &'a self,
         carried: &'a CarriedStreams,
@@ -1725,7 +1736,10 @@ impl SubstratePersistence {
             .filter_map(move |(&(rt, stream_id, writer), loc)| {
                 if matches!(
                     rt,
-                    RecordType::CustomObject | RecordType::Deleted | RecordType::Replica
+                    RecordType::CustomObject
+                        | RecordType::Deleted
+                        | RecordType::Replica
+                        | RecordType::Rebase
                 ) {
                     return Some((rt, loc));
                 }

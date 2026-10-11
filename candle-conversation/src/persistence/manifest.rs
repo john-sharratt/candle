@@ -241,6 +241,7 @@ impl Manifest {
             | RecordType::CustomObject
             | RecordType::Deleted
             | RecordType::Replica
+            | RecordType::Rebase
             | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }

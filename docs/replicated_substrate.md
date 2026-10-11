@@ -1918,9 +1918,24 @@ rejoin. The invariant rests on one number, and on one Paxos decision per rejoin.
    generation it knows. If `gen/<k>` is already decided for another member, it learns
    that decision, which raises its current generation, and proposes `gen/<k + 1>`. When
    its own proposal is decided, its detached events take `gen = k`.
-   - The assignment is persisted as a `Rebase { origin, oseq range, gen }` record (tag 30) in
-     the member's own log. It is housekeeping, never replicated: the member applies it
-     when reading its own records back, at open and when it sends or answers a fetch.
+   - The assignment is persisted as a `Rebase { origin, oseq range, gen }` entry in the
+     `Rebase` record (tag 30) of the member's own log, which holds every entry and is
+     carried whole by every rewrite (`persistence/rebase.rs`). It is housekeeping, never
+     replicated: the member applies it when reading its own records back, at open and
+     when it sends or answers a fetch (`read_event`). The records themselves keep the
+     header they were written with.
+   - At open the walk meets the `Rebase` record after the records it fixes, so it holds
+     this member's own detached records back until it has read the whole log, then
+     applies them under their fixed generation: nothing reaches the substrate, or any
+     index, unfixed. A detached record no entry covers means the member was cut off
+     when it stopped, and it reopens cut off still.
+   - A member that wrote nothing while cut off has nothing to place, and takes no
+     generation.
+   - The decision comes through the `MintGeneration` trait
+     (`persistence/identity/generations.rs`); chunk 5 implements it with chunk 3's
+     consensus, and an in-process `LocalGenerations` serves a single process and the
+     tests.
+   - A record carrying ⊤ is never sent, so one that arrives is refused.
    - **Why this is exact.** An event a joined member wrote before `gen/<k>` was decided
      carries a generation that had been decided by then, which is below *k*. So it
      sorts before the detached events on every member, whether or not this member had

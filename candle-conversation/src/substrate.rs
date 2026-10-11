@@ -5900,8 +5900,12 @@ impl Substrate {
             | RecordType::VfsEvent
             | RecordType::VfsTombstone
             // What this member has applied of other origins is the persistence
-            // layer's to keep (`persistence::replica`).
+            // layer's to keep (`persistence::replica`), and so are the
+            // generations fixed for what it wrote cut off
+            // (`persistence::rebase`), which the walk applies before a record
+            // gets here.
             | RecordType::Replica
+            | RecordType::Rebase
             | RecordType::Unknown => {}
         }
     }

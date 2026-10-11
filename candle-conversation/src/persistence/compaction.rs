@@ -31,6 +31,7 @@ use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES}
 use super::identity::MarkerIds;
 use super::log_file::LogFile;
 use super::manifest::{encode_conv_state_payload, Manifest, RecordLoc};
+use super::rebase::RebaseMap;
 use super::record::{
     decode_header, encode_record, encode_record_written, DebugIdPayload, DistillMode,
     DistillPayload, RecordHeader, RecordType, SectionTombstonePayload, TombstonePayload,
@@ -162,6 +163,28 @@ fn branch_checkpoints_to_keep(substrate: &Substrate) -> Vec<(StreamId, RecordLoc
     partition_branch_checkpoints(substrate).0
 }
 
+/// The records a member keeps of its own and never replicates, which a rewrite
+/// carries whole: what it has applied of other origins and deferred — the
+/// records it covers that a rewrite drops are known gone from then on — and the
+/// generations fixed for what it wrote cut off (§6.7).
+#[derive(Clone, Debug, Default)]
+pub struct Housekeeping {
+    pub replica: ReplicaPayload,
+    pub rebases: RebaseMap,
+}
+
+/// A housekeeping record — no identity — holding `payload`.
+fn local_record(record_type: RecordType, payload: Vec<u8>) -> CompactItem {
+    CompactItem::synth(
+        RecordHeader {
+            record_type,
+            payload_len: payload.len() as u64,
+            ..RecordHeader::NONE
+        },
+        payload,
+    )
+}
+
 /// Collect every **live** record, in dependency order, as [`CompactItem`]s —
 /// planning only, **no disk reads**. `ModelKey` / `Template` / `Tokenizer` /
 /// `Chunk` / `Tokens` become `Raw` items carrying their source `(segment,
@@ -182,9 +205,8 @@ fn branch_checkpoints_to_keep(substrate: &Substrate) -> Vec<(StreamId, RecordLoc
 ///
 /// A timeline tombstone is carried until `expiry` lets it shrink to its
 /// deleted-set entry (§6.8): this compaction runs past every tombstone it
-/// carries, and says so in the `Deleted` record it writes. `replica` — what
-/// the member has applied of other origins and deferred — is written whole:
-/// the records it covers that this rewrite drops are known gone from here on.
+/// carries, and says so in the `Deleted` record it writes. The member's own
+/// [`Housekeeping`] is written whole.
 #[allow(clippy::too_many_arguments)]
 pub fn collect_live_records(
     manifest: &Manifest,
@@ -194,19 +216,20 @@ pub fn collect_live_records(
     marker_ids: &MarkerIds,
     node: u64,
     expiry: TombstoneExpiry,
-    replica: &ReplicaPayload,
+    housekeeping: &Housekeeping,
 ) -> Vec<CompactItem> {
     let mut out: Vec<CompactItem> = Vec::new();
 
-    if !replica.is_empty() {
-        let payload = replica.encode();
-        out.push(CompactItem::synth(
-            RecordHeader {
-                record_type: RecordType::Replica,
-                payload_len: payload.len() as u64,
-                ..RecordHeader::NONE
-            },
-            payload,
+    if !housekeeping.replica.is_empty() {
+        out.push(local_record(
+            RecordType::Replica,
+            housekeeping.replica.encode(),
+        ));
+    }
+    if !housekeeping.rebases.is_empty() {
+        out.push(local_record(
+            RecordType::Rebase,
+            housekeeping.rebases.encode(),
         ));
     }
 
@@ -1139,6 +1162,7 @@ mod tests {
     use crate::persistence::identity::RecordIdentity;
     use crate::persistence::log_file::{read_record_at, LogSource, MemLog, SUPERBLOCK_SIZE};
     use crate::persistence::manifest::ConvState;
+    use crate::persistence::rebase::RebaseEntry;
     use crate::persistence::record::{encode_record, SectionGeneration};
     use crate::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
     use crate::persistence::vfs::VfsEventId;
@@ -1248,7 +1272,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         // Exactly: 1 ModelKey + 1 StreamDecl + 1 Chunk = 3 (LWW keeps one of each).
         assert_eq!(live.len(), 3);
@@ -1308,7 +1332,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         assert!(
             !has_type(&live, RecordType::Chunk),
@@ -1361,7 +1385,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         let path = std::env::temp_dir().join(format!(
             "kvtier_compact_{}.log",
@@ -1471,7 +1495,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         // The marker survives, at its mode — without it the exemption is lost.
@@ -1609,7 +1633,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         let has_label = |needle: &str| {
@@ -1719,7 +1743,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         // The dead timeline's records are physically gone from the live set.
@@ -1795,7 +1819,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         assert!(
@@ -1845,7 +1869,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         assert!(
@@ -1911,7 +1935,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         // The declaration and the sig survive — the belief gallery still finds it.
@@ -2042,7 +2066,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         assert!(
@@ -2100,7 +2124,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         assert!(
             !has_type(&live, RecordType::Snapshot),
@@ -2165,7 +2189,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         assert!(
             !has_type(&live, RecordType::Snapshot),
@@ -2195,7 +2219,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         assert!(has_type(&live, RecordType::Snapshot));
     }
@@ -2243,7 +2267,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         let kept: Vec<u64> = live
@@ -2324,7 +2348,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         assert!(
@@ -2367,7 +2391,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         let snaps: Vec<_> = live
@@ -2446,7 +2470,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
 
         assert!(
@@ -2529,7 +2553,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         let npcs: Vec<&CompactItem> = live
             .iter()
@@ -2559,7 +2583,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         assert!(!has_type(&live, RecordType::Npc));
     }
@@ -2581,7 +2605,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         assert!(
             live.iter().any(
@@ -2665,7 +2689,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         let events: Vec<(u64, u64, (u64, u64))> = live
             .iter()
@@ -2753,7 +2777,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         for from_turn in [0u32, 1] {
             assert!(
@@ -2812,7 +2836,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         assert!(!has_type(&live, RecordType::TurnCoupling));
     }
@@ -3054,9 +3078,16 @@ mod tests {
             }],
         );
 
-        // What the member has applied of another origin — held persistence-side.
-        let mut replica = ReplicaPayload::default();
-        replica.applied.insert(0xB, 1);
+        // What the member has applied of another origin, and the generation
+        // fixed for what it wrote cut off — held persistence-side.
+        let mut housekeeping = Housekeeping::default();
+        housekeeping.replica.applied.insert(0xB, 1);
+        housekeeping.rebases.add(RebaseEntry {
+            origin: 0xA,
+            from: 4,
+            through: 9,
+            gen: 2,
+        });
         let live = collect_live_records(
             &manifest,
             &substrate,
@@ -3065,7 +3096,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &replica,
+            &housekeeping,
         );
 
         for &rt in WRITTEN_RECORD_TYPES {
@@ -3135,7 +3166,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         assert!(
             has_synth(
@@ -3192,7 +3223,7 @@ mod tests {
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
-            &ReplicaPayload::default(),
+            &Housekeeping::default(),
         );
         // The reason is diagnostic only and is not re-derived at compaction
         // time — the same rule the turn-scoped tombstone's re-emit follows —

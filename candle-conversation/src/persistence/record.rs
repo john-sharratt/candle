@@ -302,6 +302,12 @@ pub enum RecordType {
     /// commit in which it changed and carried by every rewrite, never
     /// replicated, with no identity.
     Replica = 28,
+    /// The generations fixed for what this member wrote while cut off
+    /// (`docs/replicated_substrate.md` §6.7). Payload
+    /// [`super::rebase::RebaseMap`]. Local housekeeping — rewritten whole when
+    /// a rejoin adds an entry and carried by every rewrite, never replicated,
+    /// with no identity.
+    Rebase = 30,
     /// A member's **deleted set** (`docs/replicated_substrate.md` §6.8): every
     /// timeline whose tombstone expired, shrunk to its entry, and the
     /// tombstones a complete compaction has run past. Payload
@@ -362,6 +368,7 @@ impl RecordType {
             26 => RecordType::VfsTombstone,
             27 => RecordType::CustomObject,
             28 => RecordType::Replica,
+            30 => RecordType::Rebase,
             31 => RecordType::Deleted,
             _ => RecordType::Unknown,
         }

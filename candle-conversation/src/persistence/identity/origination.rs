@@ -26,6 +26,9 @@ pub struct Origination {
     next_oseq: u64,
     clock: Hlc,
     gen: u64,
+    /// While cut off from every cluster: the first `oseq` written detached,
+    /// or the next one when nothing has been yet (§6.7).
+    detached_from: Option<u64>,
 }
 
 impl Origination {
@@ -36,7 +39,37 @@ impl Origination {
             next_oseq: 1,
             clock: Hlc::new(),
             gen: 0,
+            detached_from: None,
         }
+    }
+
+    /// The member is cut off: what it mints from here on is detached, under
+    /// [`GEN_DETACHED`], until [`Self::attach`]. Starting from `oseq` when it
+    /// was cut off already at that record (a reopen that found it so), or from
+    /// the next record otherwise.
+    pub fn detach(&mut self, from: Option<u64>) {
+        if self.detached_from.is_none() {
+            self.detached_from = Some(from.unwrap_or(self.next_oseq));
+        }
+    }
+
+    /// The member rejoined under generation `gen`, which fixes everything it
+    /// wrote detached; it mints in `gen` from here on.
+    pub fn attach(&mut self, gen: u64) {
+        self.detached_from = None;
+        self.gen = self.gen.max(gen);
+    }
+
+    /// Whether the member is cut off.
+    pub fn is_detached(&self) -> bool {
+        self.detached_from.is_some()
+    }
+
+    /// The `oseq`s written detached since the member was cut off, when there
+    /// are any.
+    pub fn detached_range(&self) -> Option<(u64, u64)> {
+        let from = self.detached_from?;
+        (from < self.next_oseq).then_some((from, self.next_oseq - 1))
     }
 
     /// Take a record the substrate holds into account, whoever wrote it: its
@@ -63,7 +96,11 @@ impl Origination {
         RecordIdentity {
             origin: self.node,
             oseq,
-            gen: self.gen,
+            gen: if self.is_detached() {
+                GEN_DETACHED
+            } else {
+                self.gen
+            },
             epoch,
             hlc: self.clock.tick(now_ms),
         }
@@ -130,6 +167,32 @@ mod tests {
         );
         assert_eq!(next.gen, 3);
         assert!(next.hlc > 20 << 16);
+    }
+
+    /// A detached writer stamps the provisional generation, which sorts above
+    /// everything it holds; its detached range is what it wrote since; once
+    /// attached under a decided generation it stamps that one.
+    #[test]
+    fn a_detached_writer_stamps_the_provisional_generation() {
+        let mut w = Origination::new(7);
+        let joined = w.mint(1_000, 0);
+        w.detach(None);
+        assert_eq!(w.detached_range(), None, "nothing written detached yet");
+        let a = w.mint(1_000, 0);
+        let b = w.mint(1_000, 0);
+        assert_eq!((a.gen, b.gen), (GEN_DETACHED, GEN_DETACHED));
+        assert!(a.stamp() > joined.stamp());
+        assert_eq!(w.detached_range(), Some((2, 3)));
+        w.detach(None);
+        assert_eq!(
+            w.detached_range(),
+            Some((2, 3)),
+            "still from where it began"
+        );
+        w.attach(4);
+        assert!(!w.is_detached());
+        assert_eq!(w.mint(1_000, 0).gen, 4);
+        assert_eq!(w.detached_range(), None);
     }
 
     /// A detached record does not raise the generation a joined writer stamps,

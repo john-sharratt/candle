@@ -17,6 +17,10 @@ pub enum Refusal {
     Checksum,
     /// It carries no identity, so it is not an event any member sent.
     Unidentified,
+    /// It carries the provisional generation of a member cut off, which no
+    /// member sends: its writer sends it once a rejoin has fixed its
+    /// generation (§6.7).
+    Detached,
     /// It is a type that never leaves the member that wrote it (§6.1).
     LocalOnly(RecordType),
     /// It is this member's own record, past every `oseq` this member issued:

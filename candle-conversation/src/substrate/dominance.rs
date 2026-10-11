@@ -84,6 +84,7 @@ impl Substrate {
             | RecordType::Npc
             | RecordType::CustomObject
             | RecordType::Replica
+            | RecordType::Rebase
             | RecordType::Deleted
             | RecordType::Unknown => false,
         }

@@ -173,7 +173,8 @@ impl RecordAccounting {
             | RecordType::Template
             | RecordType::Tokenizer
             | RecordType::Deleted
-            | RecordType::Replica => (header.record_type, 0, 0),
+            | RecordType::Replica
+            | RecordType::Rebase => (header.record_type, 0, 0),
             // Payload-keyed metadata records — excluded (see module doc).
             // `HeaderIndex` records are excluded too: they're derived
             // data with no supersession key, reclaimed wholesale at

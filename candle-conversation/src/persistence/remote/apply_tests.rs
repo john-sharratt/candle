@@ -9,7 +9,7 @@
 
 use tempfile::TempDir;
 
-use super::super::identity::RecordIdentity;
+use super::super::identity::{RecordIdentity, GEN_DETACHED};
 use super::super::record::{
     encode_record, ChunkPayload, RecordHeader, RecordType, TombstonePayload,
 };
@@ -412,6 +412,32 @@ fn unidentified_and_local_records_are_refused() {
             RemoteOutcome::Refused(Refusal::LocalOnly(RecordType::Replica)),
         ]
     );
+}
+
+/// A record still carrying the provisional generation of a member cut off is
+/// one no member sends, and is refused.
+#[test]
+fn a_detached_record_is_refused() {
+    let mut sender = store();
+    let detached = RecordIdentity {
+        gen: GEN_DETACHED,
+        ..at(A, 10)
+    };
+    let payload = TombstonePayload {
+        timeline_id: TL,
+        turn_index: Some(0),
+        turn_writer: A,
+        reason: None,
+    }
+    .encode();
+    sender.append(RecordType::Tombstone, 0, 0, &payload, detached);
+    let mut receiver = store();
+    let batch = receiver.apply(&sender.events(&[detached]));
+    assert_eq!(
+        batch.outcomes,
+        vec![RemoteOutcome::Refused(Refusal::Detached)]
+    );
+    assert!(!receiver.sp.is_applied(A, 10));
 }
 
 /// Applying another member's record moves this member's clock past it: the

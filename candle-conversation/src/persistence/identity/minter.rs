@@ -102,6 +102,17 @@ impl Minter {
         self.lock().sections.generation(stream_id)
     }
 
+    /// The member is cut off: what this node mints from here on is detached
+    /// ([`Origination::detach`]).
+    pub fn detach(&self, from: Option<u64>) {
+        self.lock().origination.detach(from);
+    }
+
+    /// The member rejoined under generation `gen` ([`Origination::attach`]).
+    pub fn attach(&self, gen: u64) {
+        self.lock().origination.attach(gen);
+    }
+
     /// Take a record this substrate holds into account (see
     /// [`Origination::observe`]).
     pub fn observe(&self, id: &RecordIdentity) {

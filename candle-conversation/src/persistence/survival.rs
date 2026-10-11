@@ -120,6 +120,11 @@ pub fn survival(rt: RecordType) -> Survival {
         // The applied and deferred sets, held by the persistence layer and
         // rewritten whole by both paths.
         RecordType::Replica => Survival::Resident,
+        // The generations fixed for what this member wrote while cut off, held
+        // by the persistence layer and rewritten whole by both paths: the
+        // records it fixes are carried with the generation they were written
+        // under, so it must outlive every copy of them.
+        RecordType::Rebase => Survival::Resident,
 
         // Kills file events by writer and sequence number; located through
         // `VfsIndex`. Carried when it kills another member's event, which can
@@ -168,6 +173,7 @@ pub const WRITTEN_RECORD_TYPES: &[RecordType] = &[
     RecordType::VfsTombstone,
     RecordType::CustomObject,
     RecordType::Replica,
+    RecordType::Rebase,
     RecordType::Deleted,
 ];
 
@@ -279,6 +285,7 @@ pub fn type_label(rt: RecordType) -> &'static str {
         RecordType::CustomObject => "custom_object",
         RecordType::Deleted => "deleted",
         RecordType::Replica => "replica",
+        RecordType::Rebase => "rebase",
         RecordType::Unknown => "unknown",
     }
 }

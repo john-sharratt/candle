@@ -2,6 +2,7 @@
 //! substrate's sequence, and its version stamp (`docs/replicated_substrate.md`
 //! §3.7, §6.2).
 
+mod generations;
 mod hlc;
 mod machine_id;
 mod marker_ids;
@@ -13,6 +14,7 @@ mod section_generations;
 #[cfg(test)]
 mod substrate_tests;
 
+pub use generations::{LocalGenerations, MintGeneration};
 pub use hlc::{wall_ms, Hlc, COUNTER_BITS};
 pub use machine_id::machine_id;
 pub use marker_ids::{is_marker, MarkerIds};
