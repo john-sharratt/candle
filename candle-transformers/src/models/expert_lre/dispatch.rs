@@ -109,10 +109,13 @@ pub(crate) const LOOK_AHEAD_MARGIN: usize = 6;
 /// compute-bound at 814 t/s, 32 ran at 1,083, 64 no faster. Where misses are
 /// most of a launch they need more: Qwen3.8-Flash-Next's C10 ×8 prefill (a
 /// working set 3× the zone) ran 969 t/s at 32, 1,031 at 64 and 1,044 at 128, and
-/// 128 cost its ×16 decode ~4%. The workers take their own grid rows, so a count
-/// above a projection's row tiles adds rows, never width.
+/// 128 cost its ×16 decode ~4%. At the Q3_KO rung on the 16 GB laptop, whose
+/// prefill is bound by the link (Gen4 ×8) once its staging keeps up, 128 ran
+/// every prefill row level or ahead of 64 — C5×2 373.0 → 382.5, BF16×8 1131 →
+/// 1141 t/s — with decode no lower. The workers take their own grid rows, so a
+/// count above a projection's row tiles adds rows, never width.
 pub(crate) const WORKERS_DECODE: usize = 32;
-pub(crate) const WORKERS_PREFILL: usize = 64;
+pub(crate) const WORKERS_PREFILL: usize = 128;
 
 /// Launches over more tokens than this take [`WORKERS_PREFILL`].
 pub(crate) const WORKERS_PREFILL_TOKENS: usize = 64;

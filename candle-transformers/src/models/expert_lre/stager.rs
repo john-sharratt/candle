@@ -87,10 +87,12 @@ pub(crate) const NVME_QD: usize = 8;
 const SPEC_IN_FLIGHT: usize = NVME_QD / 2;
 
 /// Adjacent pack records a reader serves in one request (≈ 15 MiB at the
-/// Q3_KO rung's 1.9 MiB stride). The drive charges per request: on the 16 GB
-/// laptop's SN810 random reads ran at 2.5 / 3.9 / 4.7 GB/s for 1 / 2 / 4 MiB
-/// whatever the queue depth, so a wide prefill — whose cold set is most of a
-/// layer, queued in expert order — reads its neighbouring experts together.
+/// Q3_KO rung's 1.9 MiB stride): a wide prefill's cold set, queued in expert
+/// order, reads its neighbouring experts together, paying the drive's
+/// per-request cost once. (Measured at first while the pack's reads were
+/// serialised by a cached view of the file — `direct_io::open_direct` — where
+/// it was worth 12%; with the reads overlapped the drive is full at eight
+/// single-record requests, and runs only trim the request count.)
 const RUN_RECORDS: usize = 8;
 
 /// Rows ahead of the one just begun that the stager's lookahead stages for.
