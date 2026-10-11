@@ -252,6 +252,8 @@ pub(crate) use dispatch::PREFILL_LAUNCH_TOKENS as LOOK_AHEAD_MAX_TOKENS;
 pub use handle::ExpertCache;
 pub use handle::ExpertCacheSetup;
 #[cfg(feature = "cuda")]
+pub(crate) use handle::STAGED_HOPS;
+#[cfg(feature = "cuda")]
 pub use handle::{
     last_warm_tier_sizing, WarmTierSizing, CEILING_AVAILABLE, CEILING_HOST_BUDGET, CEILING_NONE,
     CEILING_PINNABLE, WARM_TIER_HEADROOM,

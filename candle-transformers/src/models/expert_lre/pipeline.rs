@@ -1319,10 +1319,10 @@ impl PipelineState {
         Ok(listed)
     }
 
-    /// A prefill-width launch at `row` voted on the next row: stage every
-    /// expert that row's router put in some token's top `k` (`voted_set`) and
-    /// that the device cannot read yet, in expert order, so the drive reads the
-    /// next layer while this one computes.
+    /// A prefill-width launch at `row` voted on the rows after it: stage every
+    /// expert each of those rows' routers put in some token's top `k`
+    /// (`voted_set`) and that the device cannot read yet, in expert order, so
+    /// the drive reads the coming layers while this one computes.
     ///
     /// **The drive, not the link.** A prefill launch's own misses saturate the
     /// link, which is why it lists nothing for the device's read-ahead (above);
@@ -1331,34 +1331,36 @@ impl PipelineState {
     /// instead measured ~1,000 unrouted reads a pass on Flash-Next's ×8 prefill
     /// and covered ~40% of the next row's cold set — those scores are decode's.
     fn stage_voted(&mut self, row: usize, votes: &Votes) -> Result<()> {
-        let target = row + 1;
         let width = self.inner.experts_per_layer;
-        if target >= self.num_moe_layers || votes.hops(width) == 0 {
-            return Ok(());
+        // Nearest row first: the stager serves its speculative queue in order.
+        for hop in 1..=votes.hops(width) {
+            let target = row + hop;
+            if target >= self.num_moe_layers {
+                break;
+            }
+            let voted = voted_set(votes.hop(hop, width).0);
+            let cold: Vec<usize> = {
+                let places = self.residency.lock().map_err(|_| {
+                    candle::Error::Msg("expert pipeline: residency poisoned".into())
+                })?;
+                voted
+                    .into_iter()
+                    .filter(|&e| places.place(target, e).entry() == 0)
+                    .collect()
+            };
+            if cold.is_empty() {
+                continue;
+            }
+            if let Ok(mut s) = self.stats.lock() {
+                s.stage_requests += cold.len();
+            }
+            // A closed channel means the stager is gone; its guard has raised
+            // the abort word, which the next routed layer reports.
+            let _ = self.stager.send(StagerMsg::Stage {
+                row: target,
+                experts: cold,
+            });
         }
-        let voted = voted_set(votes.hop(1, width).0);
-        let cold: Vec<usize> = {
-            let places = self
-                .residency
-                .lock()
-                .map_err(|_| candle::Error::Msg("expert pipeline: residency poisoned".into()))?;
-            voted
-                .into_iter()
-                .filter(|&e| places.place(target, e).entry() == 0)
-                .collect()
-        };
-        if cold.is_empty() {
-            return Ok(());
-        }
-        if let Ok(mut s) = self.stats.lock() {
-            s.stage_requests += cold.len();
-        }
-        // A closed channel means the stager is gone; its guard has raised the
-        // abort word, which the next routed layer reports.
-        let _ = self.stager.send(StagerMsg::Stage {
-            row: target,
-            experts: cold,
-        });
         Ok(())
     }
 

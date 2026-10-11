@@ -3519,6 +3519,17 @@ impl TestParams {
                     ),
                 }),
             ),
+            // Why staged reads waited: no pad slot the queue may take, or a
+            // victim still in use by an invocation that had begun.
+            (
+                "  spec stalls",
+                Box::new(|s: &PipelineStats| {
+                    format!(
+                        "{} no slot · {} in use",
+                        s.spec_stalls_no_slot, s.spec_stalls_in_use
+                    )
+                }),
+            ),
             (
                 "  pageable reads",
                 Box::new(|s: &PipelineStats| read_latency_cell(&s.paged_reads)),

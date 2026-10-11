@@ -222,20 +222,20 @@ struct Stager {
     disconnected: bool,
 }
 
-/// The share of a layer's experts a row's cold set must reach to count as
-/// wide (`1 / WIDE_ROW_SHARE`).
+/// The share of a layer's experts a row must route to count as wide
+/// (`1 / WIDE_ROW_SHARE`).
 const WIDE_ROW_SHARE: usize = 4;
 
-/// Whether a row whose cold set is `cold` of a layer's `n_experts` is a wide
-/// one — a prefill wave's, which routes to nearly every expert, so the next
-/// row's whole non-resident set is what that row will need.
+/// Whether a row routing `routed` of a layer's `n_experts` is a wide one — a
+/// prefill wave's, whose successor's voted set is staged ahead and whose
+/// speculative reads may use every reader.
 ///
-/// A decode row routes a few experts per token and finds most of them resident;
-/// a prefill row of a few hundred tokens or more misses on every expert the
-/// device does not hold. Reading the next layer whole is right for the second
-/// and a waste of the drive for the first, which keeps its scored lookahead.
-fn wide_row(cold: usize, n_experts: usize) -> bool {
-    n_experts > 0 && cold * WIDE_ROW_SHARE >= n_experts
+/// A decode row routes a few experts per token; a prefill row of a few hundred
+/// tokens or more routes about half its layer. The second's staging keeps the
+/// drive busy through the layer; the first keeps half the readers free for its
+/// demand.
+fn wide_row(routed: usize, n_experts: usize) -> bool {
+    n_experts > 0 && routed * WIDE_ROW_SHARE >= n_experts
 }
 
 /// Whether an evicted pad slot of `row`, whose entry is already emptied, may be
@@ -586,7 +586,11 @@ impl Stager {
             .count();
         self.predicted_ahead.retain(|&(r, _)| r != row);
         self.spec.retain(|s| s.row != row);
-        self.wide = wide_row(cold.len(), self.ctx.n_experts);
+        // By what the row routes, not by what is still cold: staged ahead, a
+        // prefill row's cold set shrinks below the mark at ×2, which took its
+        // speculative reads back to half the readers and left ~3,300 of its
+        // successor's stagings unstarted a config (Flash-Next, 16 GB laptop).
+        self.wide = wide_row(routed.iter().filter(|&&r| r).count(), self.ctx.n_experts);
         self.look_ahead(row);
         if let Ok(mut s) = self.ctx.stats.lock() {
             s.staged_ahead_routed += hit.len();
@@ -897,6 +901,9 @@ impl Stager {
                             self.spec.pop_front();
                             continue;
                         }
+                        if let Ok(mut s) = self.ctx.stats.lock() {
+                            s.spec_stalls_no_slot += 1;
+                        }
                         self.spec_stalled = true;
                         break;
                     };
@@ -904,6 +911,9 @@ impl Stager {
                         // Its row began an invocation between the choice and
                         // the store: look again once something has moved.
                         drop(r);
+                        if let Ok(mut s) = self.ctx.stats.lock() {
+                            s.spec_stalls_in_use += 1;
+                        }
                         self.spec_stalled = true;
                         break;
                     }
@@ -933,10 +943,10 @@ impl Stager {
 mod tests {
     use super::{demand_left_behind, overwritable, wide_row};
 
-    /// A quarter of the layer cold is wide; less is not, and an empty layer
+    /// A quarter of the layer routed is wide; less is not, and an empty layer
     /// never is.
     #[test]
-    fn a_row_is_wide_from_a_quarter_of_its_layer_cold() {
+    fn a_row_is_wide_from_a_quarter_of_its_layer_routed() {
         assert!(wide_row(128, 512));
         assert!(wide_row(512, 512));
         assert!(!wide_row(127, 512));

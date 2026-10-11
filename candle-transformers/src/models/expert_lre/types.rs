@@ -77,6 +77,11 @@ pub struct PipelineStats {
     /// queued run of adjacent records in one, so records over requests is how
     /// well the cold reads coalesce.
     pub pack_requests: usize,
+    /// Times the stager's speculative queue stalled with a read waiting: no
+    /// pad slot it may take, and a victim chosen whose row began an invocation
+    /// before it could be overwritten. Either waits for the next message.
+    pub spec_stalls_no_slot: usize,
+    pub spec_stalls_in_use: usize,
     /// Pad slots the stager took back from a staged expert.
     pub pad_evictions: usize,
     /// **Gauge**, not a tally: experts the warm tier holds, of the model's
@@ -270,6 +275,8 @@ impl PipelineStats {
             s.pack_reads = ReadLatency::default();
             s.paged_reads = ReadLatency::default();
             s.pack_requests = 0;
+            s.spec_stalls_no_slot = 0;
+            s.spec_stalls_in_use = 0;
             s.pad_evictions = 0;
             s.ahead_claims = 0;
             s.ahead_bytes = 0;

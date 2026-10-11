@@ -79,7 +79,7 @@ use crate::models::delta_net::{
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
 use crate::models::expert_lre::{
-    WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS,
+    WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS, STAGED_HOPS,
 };
 use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
@@ -1792,7 +1792,7 @@ impl Qwen4ExpBatched {
 
 /// Later rows a MoE layer's router look-ahead votes on, for a wave of
 /// `total_rows`: [`LOOK_AHEAD_HOPS`] at decode width, for the device's
-/// read-ahead, and the next row alone at prefill width, whose voted set the
+/// read-ahead, and [`STAGED_HOPS`] at prefill width, whose voted sets the
 /// expert stager reads off the drive (`PipelineState::stage_voted`). One answer
 /// for the forward that builds the routers and the plan that prices their
 /// columns ([`WaveWidth::look_ahead_hops`]).
@@ -1800,7 +1800,7 @@ fn look_ahead_hops(total_rows: usize) -> usize {
     if total_rows <= LOOK_AHEAD_MAX_TOKENS {
         LOOK_AHEAD_HOPS
     } else {
-        1
+        STAGED_HOPS
     }
 }
 
