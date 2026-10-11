@@ -34,6 +34,7 @@ use candle_transformers::models::model_pack::{ModelPack, SourceFetch};
 use candle_transformers::models::selection_strata::StrataTokens;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// A model pack [`ModelBuilder::prepare`] resolved and read: its path, its
 /// tokenizer, and the vocabulary size its header states.
@@ -172,6 +173,12 @@ pub struct ModelBuilder {
     /// ([`SharedSubstrate::open_in_read_only`]) — for a tool reading a workspace
     /// another process may be appending to. `false` by default.
     read_only_substrate: bool,
+    /// How long the substrate keeps a timeline tombstone before a compaction
+    /// may shrink it to its deleted-set entry
+    /// (`SubstratePersistence::set_tombstone_retention`). `None` leaves the
+    /// substrate's own — its default, or what the host that handed it over
+    /// set.
+    tombstone_retention: Option<Duration>,
     /// The substrate's ingest-cancel latch, forwarded to
     /// [`EngineConfig::cancel`]. See [`ModelBuilder::cancel_token`].
     cancel: CancelToken,
@@ -233,6 +240,7 @@ impl ModelBuilder {
             workspace_path: None,
             substrate: None,
             read_only_substrate: false,
+            tombstone_retention: None,
             cancel: CancelToken::new(),
             tenant_rank: TenantRank::FIRST,
             layer_corrupt_turn: HashMap::new(),
@@ -357,6 +365,15 @@ impl ModelBuilder {
     /// that handle's own mode rules.
     pub fn read_only_substrate(mut self, read_only: bool) -> Self {
         self.read_only_substrate = read_only;
+        self
+    }
+
+    /// How long the substrate keeps a timeline tombstone before a compaction
+    /// may shrink it to its deleted-set entry — the daemon's
+    /// `--tombstone-retention` (`docs/replicated_substrate.md` §6.8). Applies
+    /// to a handed-over substrate as to one this builder opens.
+    pub fn tombstone_retention(mut self, retention: Duration) -> Self {
+        self.tombstone_retention = Some(retention);
         self
     }
 
@@ -1018,6 +1035,13 @@ impl ModelBuilder {
                     .map_err(|e| ConversationError::Other(format!("substrate persistence: {e}")))?
             }
         };
+        if let Some(retention) = self.tombstone_retention {
+            shared
+                .persistence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_tombstone_retention(retention);
+        }
         BoundSubstrate::bind(shared, identity).map_err(|e| ConversationError::Other(e.to_string()))
     }
 

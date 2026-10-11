@@ -25,8 +25,8 @@ use super::log_file::{LogFile, SUPERBLOCK_SIZE};
 use super::maintenance::gather_resident_set;
 use super::manifest::{decode_conv_state_payload, decode_label_payload};
 use super::record::{
-    DebugIdPayload, DistillPayload, RecordType, TombstonePayload, TreeMetadataPayload,
-    TurnCouplingPayload,
+    DebugIdPayload, DistillPayload, RecordType, SectionTombstonePayload, TombstonePayload,
+    TreeMetadataPayload, TurnCouplingPayload,
 };
 use super::segment::SegmentId;
 use super::segmented_log::segment_path;
@@ -47,7 +47,8 @@ pub struct ResidentKey {
     pub record_type: RecordType,
     pub id: u64,
     pub sub: u64,
-    /// The writing origin, for a key that is one record; zero otherwise.
+    /// An origin the key names: the writing origin for a key that is one
+    /// record, and a turn tombstone's turn writer; zero otherwise.
     pub origin: u64,
 }
 
@@ -96,7 +97,17 @@ pub fn resident_key(
             sub: 0,
             origin: record.origin,
         }),
-        RecordType::SectionTombstone | RecordType::CustomObject => key(stream_id, 0),
+        // Each ended generation of a section is its own marker.
+        RecordType::SectionTombstone => {
+            let generation = SectionTombstonePayload::decode(payload).ok()?.generation;
+            Some(ResidentKey {
+                record_type: rt,
+                id: stream_id,
+                sub: generation.map_or(0, |g| g.oseq),
+                origin: generation.map_or(0, |g| g.writer),
+            })
+        }
+        RecordType::CustomObject => key(stream_id, 0),
         RecordType::ConvState => key(decode_conv_state_payload(payload).ok()?.0, 0),
         RecordType::Label => Some(ResidentKey {
             record_type: rt,
@@ -116,8 +127,14 @@ pub fn resident_key(
         RecordType::Distilled => key(DistillPayload::decode(payload).ok()?.timeline_id, 0),
         RecordType::Tombstone => {
             let p = TombstonePayload::decode(payload).ok()?;
-            // A whole-timeline tombstone and each turn's are separate records.
-            key(p.timeline_id, p.turn_index.map_or(0, |t| t as u64 + 1))
+            // A whole-timeline tombstone and each turn's are separate records,
+            // a turn's named by its index and its writer.
+            Some(ResidentKey {
+                record_type: rt,
+                id: p.timeline_id,
+                sub: p.turn_index.map_or(0, |t| t as u64 + 1),
+                origin: p.turn_writer,
+            })
         }
         _ => None,
     }
@@ -386,19 +403,30 @@ mod tests {
         let whole = TombstonePayload {
             timeline_id: 9,
             turn_index: None,
+            turn_writer: 0,
             reason: None,
         }
         .encode();
         let turn = TombstonePayload {
             timeline_id: 9,
             turn_index: Some(0),
+            turn_writer: 0,
+            reason: None,
+        }
+        .encode();
+        let others = TombstonePayload {
+            timeline_id: 9,
+            turn_index: Some(0),
+            turn_writer: 7,
             reason: None,
         }
         .encode();
         let none = RecordIdentity::NONE;
         let a = resident_key(RecordType::Tombstone, 0, &whole, &none).unwrap();
         let b = resident_key(RecordType::Tombstone, 0, &turn, &none).unwrap();
+        let c = resident_key(RecordType::Tombstone, 0, &others, &none).unwrap();
         assert_ne!(a, b);
+        assert_ne!(b, c, "another writer's turn 0 is another turn");
         assert_eq!((a.id, a.sub, b.sub), (9, 0, 1));
     }
 }

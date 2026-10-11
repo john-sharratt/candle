@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use candle_conversation::models::{Model, StrataTokens};
+use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::EngineSource;
 use host::MODEL;
 use web::auth::Roles;
@@ -112,6 +114,10 @@ pub struct DaemonConfig {
     /// the user's next tool round waited behind it — 18 s on one conversation,
     /// most of a minute on another.
     pub summarize: bool,
+    /// `--tombstone-retention <DAYS>`: how long the substrate keeps a deleted
+    /// conversation's tombstone before a compaction may shrink it to its
+    /// deleted-set entry (`ModelBuilder::tombstone_retention`).
+    pub tombstone_retention: Duration,
     /// Who is an admin — the table a caller's tools modes resolve from
     /// ([`crate::access`]). The host's estate table in the daemon; empty
     /// (nobody) by default, so a harness that builds a default config grants no
@@ -139,6 +145,7 @@ impl DaemonConfig {
             qsa_selection_budget: None,
             qsa_strata: StrataTokens::DEFAULT,
             summarize: false,
+            tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
             roles: Roles::default(),
         }
     }

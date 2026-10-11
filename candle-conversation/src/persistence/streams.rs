@@ -165,6 +165,17 @@ impl StreamDecl {
     }
 }
 
+/// The bytes every section declaration's payload starts with: the enum is
+/// internally tagged, so its tag is the first field written.
+const SECTION_DECL_PREFIX: &[u8] = br#"{"kind":"prompt_section""#;
+
+/// Whether a `StreamDecl` payload declares a section, read off its first bytes
+/// — what a walk over every record asks of each declaration without decoding
+/// it.
+pub fn declares_section(payload: &[u8]) -> bool {
+    payload.starts_with(SECTION_DECL_PREFIX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +198,8 @@ mod tests {
         let bytes = decl.encode();
         assert_eq!(StreamDecl::decode(&bytes).unwrap(), decl);
         assert_eq!(decl.kind(), StreamKind::PromptSection);
+        assert!(bytes.starts_with(br#"{"kind":"prompt_section","address":"#));
+        assert!(declares_section(&bytes));
     }
 
     #[test]
@@ -218,6 +231,7 @@ mod tests {
         let bytes = decl.encode();
         let decoded = StreamDecl::decode(&bytes).unwrap();
         assert_eq!(decoded, decl);
+        assert!(!declares_section(&bytes));
         assert_eq!(decl.kind(), StreamKind::Turn);
     }
 

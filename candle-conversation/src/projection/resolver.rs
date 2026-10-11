@@ -37,8 +37,8 @@ use crate::persistence::integrity::{classify_turn, TurnIntegrity};
 use crate::persistence::maintenance::RELOCATION_BATCH_BYTES;
 use crate::persistence::manifest::{self, ConvState, RecordLoc};
 use crate::persistence::record::{
-    BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SnapshotPayload,
-    TreeMetadataPayload,
+    BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SectionGeneration,
+    SnapshotPayload, TreeMetadataPayload,
 };
 use crate::persistence::resume::{read_persisted_section_windows, TurnChunkGrid};
 use crate::persistence::sealed_reader::{SealedReader, SEALED_READ_ATTEMPTS};
@@ -2634,6 +2634,11 @@ impl Conversation {
         let stream_id = decl.stream_id();
         let payload = decl.encode();
         let identity = self.minter.mint(0);
+        // A section's declaration starts its generation, which every record
+        // this node writes for the section from here on carries.
+        if matches!(decl, StreamDecl::PromptSection(_)) {
+            self.minter.start_section(stream_id.0, identity.oseq);
+        }
         self.write().apply_stream_decl(stream_id, decl, identity);
         self.writer.enqueue(WriteJob::StreamDecl {
             stream_id: stream_id.0,
@@ -2919,13 +2924,9 @@ impl Conversation {
                             CorruptTurnPolicy::DropTurn => {
                                 // Dialogue: drop only the corrupt turn, keeping the
                                 // rest of the conversation live.
-                                self.write().tombstone_turn(timeline, decl.turn_index);
+                                let mark = self.write().tombstone_turn(timeline, decl.turn_index);
                                 if let Some(mut p) = self.writable_persistence() {
-                                    match p.write_turn_tombstone(
-                                        timeline.raw(),
-                                        decl.turn_index,
-                                        Some(&reason),
-                                    ) {
+                                    match p.write_turn_tombstone(mark, Some(&reason)) {
                                         Ok(_) => tracing::debug!(
                                             timeline_id = decl.timeline_id,
                                             turn_index = decl.turn_index,
@@ -3569,12 +3570,12 @@ impl Conversation {
         stream_id: StreamId,
         reason: Option<&str>,
     ) -> candle::Result<()> {
-        self.write().tombstone_section(stream_id);
+        let generation = self.write().tombstone_section(stream_id);
         if self.read_only {
             return Ok(());
         }
         let mut p = self.persistence.lock().unwrap();
-        p.write_section_tombstone(stream_id.0, reason)
+        p.write_section_tombstone(stream_id.0, generation, reason)
             .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
         Ok(())
     }
@@ -3590,12 +3591,12 @@ impl Conversation {
         stream_id: StreamId,
         reason: &str,
     ) -> candle::Result<()> {
-        self.write().retire_section_generation(stream_id);
+        let generation = self.write().retire_section_generation(stream_id);
         if self.read_only {
             return Ok(());
         }
         let mut p = self.persistence.lock().unwrap();
-        p.write_section_tombstone(stream_id.0, Some(reason))
+        p.write_section_tombstone(stream_id.0, generation, Some(reason))
             .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
         Ok(())
     }
@@ -3648,12 +3649,12 @@ impl Conversation {
     /// that stay live forever never make it dead. Retiring the tail past a depth
     /// is what turns an unbounded log into a bounded one.
     pub fn tombstone_turn(&self, timeline: TimelineId, turn_index: u32) -> candle::Result<()> {
-        self.write().tombstone_turn(timeline, turn_index);
+        let mark = self.write().tombstone_turn(timeline, turn_index);
         if self.read_only {
             return Ok(());
         }
         let mut p = self.persistence.lock().unwrap();
-        p.write_turn_tombstone(timeline.raw(), turn_index, Some("retention"))
+        p.write_turn_tombstone(mark, Some("retention"))
             .map_err(|e| candle::Error::Msg(format!("write_turn_tombstone: {e}")))?;
         Ok(())
     }
@@ -3781,14 +3782,14 @@ impl Conversation {
 
     fn write_owned_tombstones(
         &self,
-        streams: impl IntoIterator<Item = StreamId>,
+        streams: impl IntoIterator<Item = (StreamId, Option<SectionGeneration>)>,
     ) -> candle::Result<()> {
         if self.read_only {
             return Ok(());
         }
         let mut p = self.persistence.lock().unwrap();
-        for stream in streams {
-            p.write_section_tombstone(stream.0, Some("owner released"))
+        for (stream, generation) in streams {
+            p.write_section_tombstone(stream.0, generation, Some("owner released"))
                 .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
         }
         Ok(())
@@ -4144,7 +4145,9 @@ impl Conversation {
     /// The payload is moved, not copied — the encode already happened on the
     /// caller's side, and the in-RAM mirror and the queued job share it.
     pub fn persist_projection_events(&self, stream_id: StreamId, payload: Vec<u8>) {
-        let identity = self.minter.mint(0);
+        let identity = self
+            .minter
+            .mint_for(RecordType::ProjectionEvents, stream_id.0);
         self.write()
             .apply_projection_events(stream_id, payload.clone(), identity);
         self.writer.enqueue(WriteJob::ProjectionEvents {
@@ -4158,7 +4161,7 @@ impl Conversation {
     /// record, the greatest stamp per stream) and mirror it into the in-RAM
     /// substrate under the same identity.
     pub fn persist_wide_q_sigs(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
-        let identity = self.minter.mint(0);
+        let identity = self.minter.mint_for(RecordType::WideQSig, stream_id.0);
         self.write()
             .apply_wide_q_sigs(stream_id, payload.to_vec(), identity);
         if self.read_only {
@@ -4177,7 +4180,7 @@ impl Conversation {
     /// restart, and every cold-loaded turn then hands a slot keys it cannot
     /// index.
     pub fn persist_index_page(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
-        let identity = self.minter.mint(0);
+        let identity = self.minter.mint_for(RecordType::TurnIndexPage, stream_id.0);
         self.write().apply_index_page(stream_id, payload, identity);
         if self.read_only {
             return Ok(());
@@ -4210,7 +4213,7 @@ impl Conversation {
     /// the durable redo-log append onto the off-thread writer — so the seal never
     /// blocks on the persistence lock. Same crash-safety as [`Self::enqueue_tokens`].
     pub fn enqueue_wide_q_sigs(&self, stream_id: StreamId, payload: Vec<u8>) {
-        let identity = self.minter.mint(0);
+        let identity = self.minter.mint_for(RecordType::WideQSig, stream_id.0);
         self.write()
             .apply_wide_q_sigs(stream_id, payload.clone(), identity);
         self.writer.enqueue(WriteJob::WideQSigs {
@@ -4224,7 +4227,7 @@ impl Conversation {
     /// id, mirroring it in RAM first so this session's own projections can
     /// borrow the piece immediately.
     pub fn enqueue_index_page(&self, stream_id: StreamId, payload: Vec<u8>) {
-        let identity = self.minter.mint(0);
+        let identity = self.minter.mint_for(RecordType::TurnIndexPage, stream_id.0);
         self.write()
             .apply_index_page(stream_id, payload.as_slice(), identity);
         self.writer.enqueue(WriteJob::TurnIndexPage {

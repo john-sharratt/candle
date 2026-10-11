@@ -34,7 +34,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use super::identity::RecordIdentity;
-use super::record::{RecordHeader, RecordType};
+use super::record::{RecordHeader, RecordType, SectionTombstonePayload};
 
 /// The current record of one key: its padded on-disk size and its identity.
 /// A snapshot retraction is current with size zero — it names nothing to
@@ -86,16 +86,21 @@ impl RecordAccounting {
     /// key was already live, its previous on-disk size becomes dead
     /// weight.
     ///
-    /// A `SectionTombstone` also retires every live record its stream owns:
-    /// the tombstone ends that generation of the section
-    /// (`Substrate::reset_tombstoned_stream`), and a fresh prefill of the same
+    /// A `SectionTombstone` also retires every live record of the stream its
+    /// generation was written by: the tombstone ends that generation of the
+    /// section (`Substrate::end_section`), and a fresh prefill of the same
     /// content writes a new one under the same keys — which, with the old keys
     /// retired here, count as new rather than as superseding the dead bytes a
     /// second time. That retirement walks the live map, which is fine for a
-    /// record written once per section rebuild or repair.
-    pub fn record(&mut self, header: &RecordHeader, padded_size: u64) {
+    /// record written once per section rebuild or repair. `payload` is read
+    /// for nothing else.
+    pub fn record(&mut self, header: &RecordHeader, payload: &[u8], padded_size: u64) {
         if header.record_type == RecordType::SectionTombstone {
-            self.retire_stream(header.stream_id);
+            let writer = SectionTombstonePayload::decode(payload)
+                .ok()
+                .and_then(|p| p.generation)
+                .map_or(0, |g| g.writer);
+            self.retire_stream(header.stream_id, writer);
         }
         // A snapshot retraction kills the stream's tail when it outranks it,
         // and is itself never carried forward, so it is dead the moment it
@@ -154,9 +159,12 @@ impl RecordAccounting {
             // `stream_id` and is written whole every time, so the newest record
             // supersedes the last by the same rule.
             | RecordType::ConvState => (header.record_type, header.stream_id, 0),
-            RecordType::ModelKey | RecordType::Template | RecordType::Tokenizer => {
-                (header.record_type, 0, 0)
-            }
+            // The deleted set is one record, rewritten whole by each compaction
+            // — a singleton like these.
+            RecordType::ModelKey
+            | RecordType::Template
+            | RecordType::Tokenizer
+            | RecordType::Deleted => (header.record_type, 0, 0),
             // Payload-keyed metadata records — excluded (see module doc).
             // `HeaderIndex` records are excluded too: they're derived
             // data with no supersession key, reclaimed wholesale at
@@ -209,14 +217,14 @@ impl RecordAccounting {
         }
     }
 
-    /// Count every live record `stream_id` owns as dead, every writer's — its
+    /// Count every live record `writer`'s stream `stream_id` owns as dead — its
     /// chunks and its per-stream records. Keyed only on the stream-owned
     /// types, since `Snapshot`, `Npc` and `ConvState` reuse the header's
     /// `stream_id` for ids of their own.
-    fn retire_stream(&mut self, stream_id: u64) {
+    fn retire_stream(&mut self, stream_id: u64, writer: u64) {
         let mut retired = 0u64;
-        self.live_sizes.retain(|&(rt, sid, _, _), live| {
-            let owned = sid == stream_id && stream_owned(rt);
+        self.live_sizes.retain(|&(rt, sid, _, w), live| {
+            let owned = sid == stream_id && w == writer && stream_owned(rt);
             if owned {
                 retired += live.size;
             }
@@ -241,6 +249,12 @@ impl RecordAccounting {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::record::SectionGeneration;
+
+    /// Note a record whose payload the accounting does not read.
+    fn record(acc: &mut RecordAccounting, header: &RecordHeader, size: u64) {
+        acc.record(header, &[], size);
+    }
 
     fn header(rt: RecordType, stream_id: u64, chunk_index: u64) -> RecordHeader {
         RecordHeader {
@@ -262,12 +276,12 @@ mod tests {
         let mut acc = RecordAccounting::new();
         let mut snapshot = header(RecordType::Snapshot, 7, 0);
         snapshot.payload_len = 1000;
-        acc.record(&snapshot, 4096);
+        record(&mut acc, &snapshot, 4096);
         assert_eq!(acc.dead_bytes(), 0);
-        acc.record(&header(RecordType::Snapshot, 7, 0), 64);
+        record(&mut acc, &header(RecordType::Snapshot, 7, 0), 64);
         assert_eq!(acc.dead_bytes(), 4096 + 64);
         // The next real snapshot is live again, superseding nothing.
-        acc.record(&snapshot, 4096);
+        record(&mut acc, &snapshot, 4096);
         assert_eq!(acc.dead_bytes(), 4096 + 64);
     }
 
@@ -283,14 +297,14 @@ mod tests {
             ..header(RecordType::Tokens, 9, 0)
         };
         let mut acc = RecordAccounting::new();
-        acc.record(&stamped(20), 4096);
-        acc.record(&stamped(10), 8192);
+        record(&mut acc, &stamped(20), 4096);
+        record(&mut acc, &stamped(10), 8192);
         assert_eq!(acc.dead_bytes(), 8192, "the late, older record is dead");
-        acc.record(&stamped(30), 4096);
+        record(&mut acc, &stamped(30), 4096);
         assert_eq!(acc.dead_bytes(), 8192 + 4096, "the newer one supersedes 20");
         // A relocated copy of the live record keeps its identity: the old
         // copy is dead and the copy is live.
-        acc.record(&stamped(30), 4096);
+        record(&mut acc, &stamped(30), 4096);
         assert_eq!(acc.dead_bytes(), 8192 + 4096 + 4096);
     }
 
@@ -306,16 +320,16 @@ mod tests {
             ..header(RecordType::Snapshot, 7, 0)
         };
         let mut acc = RecordAccounting::new();
-        acc.record(&at(10, 1000), 4096);
-        acc.record(&at(20, 0), 64);
+        record(&mut acc, &at(10, 1000), 4096);
+        record(&mut acc, &at(20, 0), 64);
         assert_eq!(acc.dead_bytes(), 4096 + 64);
-        acc.record(&at(15, 1000), 4096);
+        record(&mut acc, &at(15, 1000), 4096);
         assert_eq!(
             acc.dead_bytes(),
             4096 + 64 + 4096,
             "older than the retraction"
         );
-        acc.record(&at(25, 1000), 4096);
+        record(&mut acc, &at(25, 1000), 4096);
         assert_eq!(acc.dead_bytes(), 4096 + 64 + 4096, "newer: live again");
     }
 
@@ -330,37 +344,43 @@ mod tests {
             ..header(RecordType::Chunk, 5, 0)
         };
         let mut acc = RecordAccounting::new();
-        acc.record(&by(3, 10), 4096);
-        acc.record(&by(8, 20), 4096);
+        record(&mut acc, &by(3, 10), 4096);
+        record(&mut acc, &by(8, 20), 4096);
         assert_eq!(acc.dead_bytes(), 0);
-        acc.record(&by(3, 30), 4096);
+        record(&mut acc, &by(3, 30), 4096);
         assert_eq!(acc.dead_bytes(), 4096, "the first writer's re-write");
-        // A section tombstone ends the stream for every writer.
-        acc.record(&header(RecordType::SectionTombstone, 5, 0), 64);
-        assert_eq!(acc.dead_bytes(), 4096 * 3);
+        // A section tombstone ends one writer's generation: that writer's
+        // records die, the other writer's stay live.
+        let ends = SectionTombstonePayload {
+            generation: Some(SectionGeneration { writer: 3, oseq: 1 }),
+            reason: None,
+        }
+        .encode();
+        acc.record(&header(RecordType::SectionTombstone, 5, 0), &ends, 64);
+        assert_eq!(acc.dead_bytes(), 4096 * 2);
     }
 
     #[test]
     fn superseded_chunk_counts_as_dead() {
         let mut acc = RecordAccounting::new();
-        acc.record(&header(RecordType::Chunk, 5, 0), 4096);
-        acc.record(&header(RecordType::Chunk, 5, 1), 4096);
+        record(&mut acc, &header(RecordType::Chunk, 5, 0), 4096);
+        record(&mut acc, &header(RecordType::Chunk, 5, 1), 4096);
         assert_eq!(acc.dead_bytes(), 0, "distinct keys are all live");
-        acc.record(&header(RecordType::Chunk, 5, 0), 8192);
+        record(&mut acc, &header(RecordType::Chunk, 5, 0), 8192);
         assert_eq!(acc.dead_bytes(), 4096, "the first (5,0) write is dead");
-        acc.record(&header(RecordType::Chunk, 5, 0), 8192);
+        record(&mut acc, &header(RecordType::Chunk, 5, 0), 8192);
         assert_eq!(acc.dead_bytes(), 4096 + 8192);
     }
 
     #[test]
     fn per_stream_and_singleton_keys() {
         let mut acc = RecordAccounting::new();
-        acc.record(&header(RecordType::Tokens, 1, 0), 4096);
-        acc.record(&header(RecordType::Tokens, 2, 0), 4096);
-        acc.record(&header(RecordType::Tokens, 1, 0), 4096);
+        record(&mut acc, &header(RecordType::Tokens, 1, 0), 4096);
+        record(&mut acc, &header(RecordType::Tokens, 2, 0), 4096);
+        record(&mut acc, &header(RecordType::Tokens, 1, 0), 4096);
         assert_eq!(acc.dead_bytes(), 4096, "streams don't shadow each other");
-        acc.record(&header(RecordType::ModelKey, 0, 0), 4096);
-        acc.record(&header(RecordType::ModelKey, 0, 0), 4096);
+        record(&mut acc, &header(RecordType::ModelKey, 0, 0), 4096);
+        record(&mut acc, &header(RecordType::ModelKey, 0, 0), 4096);
         assert_eq!(acc.dead_bytes(), 8192, "superseded singleton is dead");
     }
 
@@ -369,8 +389,8 @@ mod tests {
     #[test]
     fn commits_key_per_stream_not_per_index() {
         let mut acc = RecordAccounting::new();
-        acc.record(&header(RecordType::Commit, 9, 3), 4096);
-        acc.record(&header(RecordType::Commit, 9, 7), 4096);
+        record(&mut acc, &header(RecordType::Commit, 9, 3), 4096);
+        record(&mut acc, &header(RecordType::Commit, 9, 7), 4096);
         assert_eq!(acc.dead_bytes(), 4096);
     }
 
@@ -379,10 +399,10 @@ mod tests {
     #[test]
     fn conv_state_supersedes_per_timeline() {
         let mut acc = RecordAccounting::new();
-        acc.record(&header(RecordType::ConvState, 11, 0), 4096);
-        acc.record(&header(RecordType::ConvState, 12, 0), 4096);
+        record(&mut acc, &header(RecordType::ConvState, 11, 0), 4096);
+        record(&mut acc, &header(RecordType::ConvState, 12, 0), 4096);
         assert_eq!(acc.dead_bytes(), 0, "two conversations, both live");
-        acc.record(&header(RecordType::ConvState, 11, 0), 4096);
+        record(&mut acc, &header(RecordType::ConvState, 11, 0), 4096);
         assert_eq!(acc.dead_bytes(), 4096, "11's first state is dead");
     }
 
@@ -392,9 +412,9 @@ mod tests {
     fn payload_keyed_types_are_skipped() {
         let mut acc = RecordAccounting::new();
         for _ in 0..3 {
-            acc.record(&header(RecordType::Label, 0, 0), 4096);
-            acc.record(&header(RecordType::TreeMetadata, 0, 0), 4096);
-            acc.record(&header(RecordType::HeaderIndex, 0, 0), 4096);
+            record(&mut acc, &header(RecordType::Label, 0, 0), 4096);
+            record(&mut acc, &header(RecordType::TreeMetadata, 0, 0), 4096);
+            record(&mut acc, &header(RecordType::HeaderIndex, 0, 0), 4096);
         }
         assert_eq!(acc.dead_bytes(), 0);
     }
@@ -405,8 +425,8 @@ mod tests {
     #[test]
     fn a_file_event_is_live_until_retired() {
         let mut acc = RecordAccounting::new();
-        acc.record(&header(RecordType::VfsEvent, 7, 1), 4096);
-        acc.record(&header(RecordType::VfsEvent, 7, 2), 8192);
+        record(&mut acc, &header(RecordType::VfsEvent, 7, 1), 4096);
+        record(&mut acc, &header(RecordType::VfsEvent, 7, 2), 8192);
         assert_eq!(acc.dead_bytes(), 0);
         acc.retire(RecordType::VfsEvent, 7, 2);
         acc.retire(RecordType::VfsEvent, 7, 2);
@@ -421,23 +441,23 @@ mod tests {
     #[test]
     fn a_section_tombstone_retires_its_stream() {
         let mut acc = RecordAccounting::new();
-        acc.record(&header(RecordType::StreamDecl, 40, 0), 4096);
-        acc.record(&header(RecordType::Chunk, 40, 0), 8192);
-        acc.record(&header(RecordType::Chunk, 40, 1), 8192);
-        acc.record(&header(RecordType::Tokens, 40, 0), 4096);
-        acc.record(&header(RecordType::Chunk, 41, 0), 8192);
-        acc.record(&header(RecordType::Npc, 40, 0), 4096);
+        record(&mut acc, &header(RecordType::StreamDecl, 40, 0), 4096);
+        record(&mut acc, &header(RecordType::Chunk, 40, 0), 8192);
+        record(&mut acc, &header(RecordType::Chunk, 40, 1), 8192);
+        record(&mut acc, &header(RecordType::Tokens, 40, 0), 4096);
+        record(&mut acc, &header(RecordType::Chunk, 41, 0), 8192);
+        record(&mut acc, &header(RecordType::Npc, 40, 0), 4096);
         assert_eq!(acc.dead_bytes(), 0);
 
-        acc.record(&header(RecordType::SectionTombstone, 40, 0), 4096);
+        record(&mut acc, &header(RecordType::SectionTombstone, 40, 0), 4096);
         assert_eq!(
             acc.dead_bytes(),
             4096 + 8192 + 8192 + 4096,
             "stream 40's decl, chunks and tokens; not stream 41, not the Npc keyed 40"
         );
 
-        acc.record(&header(RecordType::StreamDecl, 40, 0), 4096);
-        acc.record(&header(RecordType::Chunk, 40, 0), 8192);
+        record(&mut acc, &header(RecordType::StreamDecl, 40, 0), 4096);
+        record(&mut acc, &header(RecordType::Chunk, 40, 0), 8192);
         assert_eq!(
             acc.dead_bytes(),
             4096 + 8192 + 8192 + 4096,
@@ -448,12 +468,12 @@ mod tests {
     #[test]
     fn reset_clears_everything() {
         let mut acc = RecordAccounting::new();
-        acc.record(&header(RecordType::Chunk, 1, 0), 4096);
-        acc.record(&header(RecordType::Chunk, 1, 0), 4096);
+        record(&mut acc, &header(RecordType::Chunk, 1, 0), 4096);
+        record(&mut acc, &header(RecordType::Chunk, 1, 0), 4096);
         assert_eq!(acc.dead_bytes(), 4096);
         acc.reset();
         assert_eq!(acc.dead_bytes(), 0);
-        acc.record(&header(RecordType::Chunk, 1, 0), 4096);
+        record(&mut acc, &header(RecordType::Chunk, 1, 0), 4096);
         assert_eq!(acc.dead_bytes(), 0, "post-reset state starts fresh");
     }
 }

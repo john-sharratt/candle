@@ -89,6 +89,7 @@ mod tests {
         TombstonePayload {
             timeline_id,
             turn_index: None,
+            turn_writer: 0,
             reason: None,
         }
         .encode()
@@ -110,7 +111,11 @@ mod tests {
             t.identity_for(RecordType::Tombstone, 0, &tombstone(10)),
             id(3)
         );
-        let section = SectionTombstonePayload { reason: None }.encode();
+        let section = SectionTombstonePayload {
+            generation: None,
+            reason: None,
+        }
+        .encode();
         t.record(RecordType::SectionTombstone, 44, &section, id(4));
         assert_eq!(
             t.identity_for(RecordType::SectionTombstone, 44, &section),

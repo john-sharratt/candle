@@ -40,6 +40,8 @@
 //! return a plain `f32`). Scores default to zero until the reprojection's belief
 //! scan populates them.
 
+mod deleted_set;
+mod ended_sections;
 mod label_records;
 #[cfg(test)]
 mod order_independence_tests;
@@ -47,6 +49,7 @@ mod pending;
 mod replicated_state;
 mod stamps;
 mod stream_index;
+mod tombstones;
 
 use std::sync::{Mutex, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -61,15 +64,17 @@ use crate::conversation::window_sealed_tokens;
 use crate::index_pages::{self, StoredPages};
 use crate::normalization::Phase;
 use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
+use crate::persistence::deleted::{DeletedPayload, DeletedTimeline};
 use crate::persistence::identity::RecordIdentity;
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
 use crate::persistence::record::{
     CustomObjectPayload, DebugIdPayload, DistillMode, DistillPayload, RecordType,
-    SectionTombstonePayload, TombstonePayload, TreeMetadataPayload, TurnCouplingPayload,
+    SectionGeneration, SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
+    TurnCouplingPayload,
 };
-use crate::persistence::streams::{StreamDecl, StreamId};
+use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
 use crate::persistence::walker::WalkEntry;
 use crate::projection::{
     decode_events, CorruptTurnPolicy, GroupId, LayerId, OwnedSection, OwnedSections,
@@ -87,12 +92,15 @@ use crate::turn_layout::{phase_span_of, ThinkingLength, TurnLayout, TurnSegment}
 use crate::working_set::marks::is_dialogue;
 use crate::working_set::{Candidate, Limits, Refusal, WorkingSet};
 use crate::ConversationError;
+use deleted_set::DeletedSet;
+use ended_sections::EndedSections;
 use label_records::label_records;
 use pending::{PendingChild, PendingChildren};
 use stamps::{take, take_keyed};
 pub use stamps::{StreamIds, TimelineIds};
 use stream_index::StreamIndex;
 pub use stream_index::{StreamKey, TurnStream};
+pub use tombstones::TurnMark;
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
@@ -365,13 +373,27 @@ pub struct Substrate {
     /// (walker can apply a tombstone before its target
     /// `StreamDecl::Turn`) — registration just observes them as
     /// already tombstoned, which is the correct behaviour.
+    ///
+    /// A timeline whose tombstone expired stays here: its entry in
+    /// [`Self::deleted`] dominates exactly as the tombstone did.
     tombstoned_timelines: HashSet<TimelineId>,
+    /// The deleted set: every timeline whose tombstone expired, and the
+    /// tombstones a complete compaction has run past (§6.8). Rebuilt from the
+    /// `Deleted` record each walk; like the tombstones it extends, never
+    /// cleared.
+    deleted: DeletedSet,
     /// The live recurrent-state snapshot per snapshot stream
     /// (`snapshot_stream_id(timeline)` — the key is computed by the reader at
     /// resume, never inverted from the id). Location only: the payload stays
     /// on disk until a resume materializes it, exactly like `Tokens`.
     /// Last-writer-wins by walk/append order — the single tail.
     recurrent_snapshots: HashMap<StreamId, RecordLoc>,
+    /// The snapshot streams of every timeline tombstoned or distilled: their
+    /// tail is gone, and a snapshot for one that arrives later — replicated
+    /// late, or met after the marker in a walk — is refused rather than
+    /// installed again (§6.5). The tombstone and distill markers that fill it
+    /// outlive every rewrite, so like them it is never cleared.
+    retired_snapshots: HashSet<StreamId>,
     /// The live recurrent checkpoint per **prompt branch**
     /// (`branch_checkpoint_stream_id(content prefix)`). Same single-tail rule
     /// and same location-only storage as `recurrent_snapshots`, kept separate
@@ -413,27 +435,28 @@ pub struct Substrate {
     /// restart is each stream's declaration, which names its owner — see
     /// [`Self::persisted_owned_streams`].
     owned_sections: OwnedSections,
-    /// Section streams flagged by [`RecordType::SectionTombstone`] as
-    /// logically deleted — the section counterpart of
-    /// [`Self::tombstoned_timelines`]. Set by the reactive repair that
-    /// confirms a section's persisted per-layer chunks disagree across
-    /// layers (`candle-conversation/src/scheduler/mod.rs`'s
-    /// `snapshot_sequence_per_layer` failure hook). [`Self::section_exists`]
-    /// and `Conversation::section_stream_is_persisted` both read this so a
-    /// tombstoned section is neither "already present" nor "restorable" on
-    /// the next ingest triage — the request falls through to a fresh
-    /// prefill instead of reloading the corrupted chunks, in this same
-    /// process as well as after a restart.
-    tombstoned_sections: HashSet<StreamId>,
-    /// Individual `(timeline, turn_index)` turns flagged dead by a **turn-scoped**
+    /// Section generations ended by a [`RecordType::SectionTombstone`] — the
+    /// section counterpart of [`Self::tombstoned_timelines`]. Set by the
+    /// reactive repair that confirms a section's persisted per-layer chunks
+    /// disagree across layers (`candle-conversation/src/scheduler/mod.rs`'s
+    /// `snapshot_sequence_per_layer` failure hook), by a rebuild, and by an
+    /// owner releasing its section. [`Self::section_exists`] and
+    /// `Conversation::section_stream_is_persisted` both read
+    /// [`Self::is_section_tombstoned`] so a tombstoned section is neither
+    /// "already present" nor "restorable" on the next ingest triage — the
+    /// request falls through to a fresh prefill instead of reloading the
+    /// corrupted chunks, in this same process as well as after a restart.
+    ended_sections: EndedSections,
+    /// Individual turns flagged dead by a **turn-scoped**
     /// [`RecordType::Tombstone`] (`turn_index = Some`), leaving the rest of their
-    /// timeline live. Written by the per-layer `drop_turn` corrupt-turn policy.
+    /// timeline live, each named as its writer wrote it ([`TurnMark`]).
+    /// Written by the per-layer `drop_turn` corrupt-turn policy and by retention.
     /// Consumers: the reload restores a flagged turn as an EMPTY PLACEHOLDER
     /// (occupying its index so later turns keep their persisted stream ids),
     /// the belief galleries and group-default tag resolution skip it, and
     /// compaction sheds its bulk records while keeping its `StreamDecl` +
     /// re-emitting the tombstone.
-    tombstoned_turns: HashSet<(TimelineId, u32)>,
+    tombstoned_turns: HashSet<TurnMark>,
     /// Per-layer policy for an unrecoverable turn on reload
     /// ([`CorruptTurnPolicy`]), resolved from the projection schema at engine
     /// setup. Absent → the default [`CorruptTurnPolicy::DropConversation`].
@@ -1568,6 +1591,17 @@ pub struct StreamRuntime {
 }
 
 impl StreamRuntime {
+    /// Whether the stream holds nothing: no declaration and no value.
+    pub fn is_empty(&self) -> bool {
+        self.decl.is_none()
+            && self.chunks.is_empty()
+            && self.tokens.is_none()
+            && self.projection_events.is_none()
+            && self.wide_q_sigs.is_none()
+            && self.index_page.is_none()
+            && self.committed_through.is_none()
+    }
+
     /// Whether this stream is an **orphan** to node `node`: it has no
     /// declaration, and never will, so nothing can rebuild its turn or section
     /// and every record it holds is dead weight.
@@ -4279,10 +4313,12 @@ impl Substrate {
     /// with the greatest stamp is the stream's (§6.5); one ranked below the
     /// declaration held changes nothing.
     ///
-    /// A section declaration on a tombstoned stream starts the stream's next
-    /// generation: the tombstone emptied the index for it
-    /// ([`Self::reset_tombstoned_stream`]), and this lifts the flag so the
-    /// fresh prefill's records read as persisted again.
+    /// A section declaration starts a **generation** of the section, named by
+    /// its writer and its `oseq` ([`SectionGeneration`]). One a tombstone has
+    /// ended is refused, whenever it arrives; one that is installed drops
+    /// whatever its stream still held of an earlier generation. An unstamped
+    /// section declaration lifts an unstamped tombstone before it, as the log
+    /// order of unstamped records always has.
     pub fn apply_stream_decl(&mut self, stream_id: StreamId, decl: StreamDecl, id: RecordIdentity) {
         // Turn decls register their timeline whether or not they win the
         // stream: registration is a set insert, so it holds in any order, and
@@ -4299,11 +4335,25 @@ impl Substrate {
         let key = StreamKey::of(stream_id, &id);
         let tagged = matches!(&decl, StreamDecl::Turn(t) if !is_dialogue(&t.tags));
         let section = matches!(decl, StreamDecl::PromptSection(_));
-        let Some(moved) = self.streams.declare(key, decl, id) else {
+        let generation = SectionGeneration {
+            writer: key.writer,
+            oseq: id.oseq,
+        };
+        if section && !id.is_none() && self.ended_sections.is_ended(stream_id, generation) {
+            return;
+        }
+        let Some(mut moved) = self.streams.declare(key, decl, id) else {
             return;
         };
         if section {
-            self.tombstoned_sections.remove(&stream_id);
+            if id.is_none() {
+                self.ended_sections.lift_unstamped(stream_id);
+            } else if self
+                .streams
+                .prune(key, |held| held.epoch >= generation.oseq)
+            {
+                moved.push(stream_id);
+            }
         }
         if tagged {
             self.tagged_turns.insert(key);
@@ -4312,6 +4362,31 @@ impl Substrate {
         }
         self.forget_memos(&moved);
         self.gallery_epoch += 1;
+    }
+
+    /// Whether a value written as record `id` belongs on `key`'s stream: not
+    /// when it carries, in its `epoch`, a section generation a tombstone ended
+    /// or one older than the generation the stream is declared in. An
+    /// unstamped record always does.
+    fn admits(&self, key: StreamKey, id: &RecordIdentity) -> bool {
+        if id.is_none() {
+            return true;
+        }
+        let generation = SectionGeneration {
+            writer: key.writer,
+            oseq: id.epoch,
+        };
+        if self.ended_sections.is_ended(key.stream_id, generation) {
+            return false;
+        }
+        match self.streams.physical(key) {
+            Some(StreamRuntime {
+                decl: Some(StreamDecl::PromptSection(_)),
+                ids,
+                ..
+            }) if !ids.decl.is_none() => id.epoch >= ids.decl.oseq,
+            _ => true,
+        }
     }
 
     /// Drop the decoded memos of `ids`: what they name has changed, by a
@@ -4358,7 +4433,11 @@ impl Substrate {
         loc: ChunkLoc,
         id: RecordIdentity,
     ) {
-        let entry = self.streams.entry(StreamKey::of(stream_id, &id));
+        let key = StreamKey::of(stream_id, &id);
+        if !self.admits(key, &id) {
+            return;
+        }
+        let entry = self.streams.entry(key);
         if take_keyed(&mut entry.ids.chunks, idx, id) {
             entry.chunks.insert(idx, loc);
         }
@@ -4367,7 +4446,11 @@ impl Substrate {
     /// Record the location of `stream_id`'s `Tokens` record `id` — the greatest
     /// stamp holds it.
     pub fn apply_tokens_loc(&mut self, stream_id: StreamId, loc: RecordLoc, id: RecordIdentity) {
-        let entry = self.streams.entry(StreamKey::of(stream_id, &id));
+        let key = StreamKey::of(stream_id, &id);
+        if !self.admits(key, &id) {
+            return;
+        }
+        let entry = self.streams.entry(key);
         if take(&mut entry.ids.tokens, id) {
             entry.tokens = Some(loc);
         }
@@ -4377,6 +4460,9 @@ impl Substrate {
     /// — the greatest stamp is the stream's tail. The location it replaces was
     /// credited dead by the accounting layer when this one appended.
     pub fn apply_snapshot_loc(&mut self, stream_id: StreamId, loc: RecordLoc, id: RecordIdentity) {
+        if self.retired_snapshots.contains(&stream_id) {
+            return;
+        }
         if take(self.snapshot_ids.entry(stream_id).or_default(), id) {
             self.recurrent_snapshots.insert(stream_id, loc);
         }
@@ -4386,6 +4472,9 @@ impl Substrate {
     /// the tail is gone, and every snapshot it outranks that arrives later is
     /// refused (§6.5 — an empty payload is a value meaning *retracted*).
     pub fn retract_snapshot(&mut self, stream_id: StreamId, id: RecordIdentity) {
+        if self.retired_snapshots.contains(&stream_id) {
+            return;
+        }
         if take(self.snapshot_ids.entry(stream_id).or_default(), id) {
             self.recurrent_snapshots.remove(&stream_id);
         }
@@ -4407,6 +4496,15 @@ impl Substrate {
     pub fn drop_snapshot_loc(&mut self, stream_id: StreamId) {
         self.recurrent_snapshots.remove(&stream_id);
         self.snapshot_ids.remove(&stream_id);
+    }
+
+    /// Retire `timeline`'s snapshot stream for good — what its tombstone or
+    /// its distillation does to the conversation's recurrent state. Its tail
+    /// goes, and no snapshot of it is installed again, whenever it arrives.
+    fn retire_snapshot_stream(&mut self, timeline: TimelineId) {
+        let stream_id = snapshot_stream_id(timeline.raw());
+        self.retired_snapshots.insert(stream_id);
+        self.drop_snapshot_loc(stream_id);
     }
 
     /// Every snapshot stream whose current record is a retraction, with the
@@ -4480,7 +4578,11 @@ impl Substrate {
         through_index: u64,
         id: RecordIdentity,
     ) {
-        let entry = self.streams.entry(StreamKey::of(stream_id, &id));
+        let key = StreamKey::of(stream_id, &id);
+        if !self.admits(key, &id) {
+            return;
+        }
+        let entry = self.streams.entry(key);
         match entry.committed_through {
             Some(held) if through_index < held => {}
             Some(held) if through_index == held => {
@@ -4502,6 +4604,9 @@ impl Substrate {
         id: RecordIdentity,
     ) {
         let key = StreamKey::of(stream_id, &id);
+        if !self.admits(key, &id) {
+            return;
+        }
         let entry = self.streams.entry(key);
         if !take(&mut entry.ids.projection_events, id) {
             return;
@@ -4521,6 +4626,9 @@ impl Substrate {
     /// stamp holds it.
     pub fn apply_wide_q_sigs(&mut self, stream_id: StreamId, payload: Vec<u8>, id: RecordIdentity) {
         let key = StreamKey::of(stream_id, &id);
+        if !self.admits(key, &id) {
+            return;
+        }
         let entry = self.streams.entry(key);
         if !take(&mut entry.ids.wide_q_sigs, id) {
             return;
@@ -4539,7 +4647,11 @@ impl Substrate {
         payload: impl Into<Arc<[u8]>>,
         id: RecordIdentity,
     ) {
-        let entry = self.streams.entry(StreamKey::of(stream_id, &id));
+        let key = StreamKey::of(stream_id, &id);
+        if !self.admits(key, &id) {
+            return;
+        }
+        let entry = self.streams.entry(key);
         if take(&mut entry.ids.index_page, id) {
             entry.index_page = Some(Arc::new(StoredPages::new(payload)));
         }
@@ -4742,28 +4854,68 @@ impl Substrate {
                 // the in-RAM set depend on the order the log happened to be
                 // replayed in.
                 if !self.tombstoned_timelines.contains(&timeline) {
-                    self.tombstoned_turns.insert((timeline, turn));
+                    self.tombstoned_turns.insert(TurnMark {
+                        timeline,
+                        turn_index: turn,
+                        writer: payload.turn_writer,
+                    });
                     self.gallery_epoch += 1;
                 }
             }
-            None => {
-                self.tombstoned_timelines.insert(timeline);
-                self.gallery_epoch += 1;
-                // The same subsumption the live path applies — see
-                // [`Self::tombstone_timeline`]. Replay order is arbitrary, so a
-                // turn tombstone read after its timeline's must not resurrect
-                // an entry the timeline tombstone already covers; `retain` here
-                // plus the guard in the `Some` arm keeps both orders equal.
-                self.tombstoned_turns.retain(|(tl, _)| *tl != timeline);
-                // A dead conversation's recurrent-state snapshot dies with it:
-                // dropping the index entry here means compaction (which walks
-                // this map) never carries the record forward. A snapshot of a
-                // turn-tombstoned tail is handled at restore instead — the
-                // payload's turn_index is validated against the recovered
-                // timeline before any state is scattered.
-                self.drop_snapshot_loc(snapshot_stream_id(payload.timeline_id));
+            None => self.mark_timeline_dead(timeline),
+        }
+    }
+
+    /// Replay a timeline's death, from its tombstone or from its entry in a
+    /// `Deleted` record.
+    fn mark_timeline_dead(&mut self, timeline: TimelineId) {
+        self.tombstoned_timelines.insert(timeline);
+        self.gallery_epoch += 1;
+        // The same subsumption the live path applies — see
+        // [`Self::tombstone_timeline`]. Replay order is arbitrary, so a turn
+        // tombstone read after its timeline's must not resurrect an entry the
+        // timeline tombstone already covers; `retain` here plus the guard in
+        // `apply_tombstone`'s turn arm keeps both orders equal.
+        self.tombstoned_turns.retain(|m| m.timeline != timeline);
+        // A dead conversation's recurrent-state snapshot dies with it: dropping
+        // the index entry here means compaction (which walks this map) never
+        // carries the record forward. A snapshot of a turn-tombstoned tail is
+        // handled at restore instead — the payload's turn_index is validated
+        // against the recovered timeline before any state is scattered.
+        self.retire_snapshot_stream(timeline);
+    }
+
+    /// Apply a `Deleted` record: each timeline it names is dead for good, as
+    /// its tombstone made it, and the tombstones it names as swept have had a
+    /// complete compaction run past them (§6.8).
+    pub fn apply_deleted(&mut self, payload: &DeletedPayload) {
+        self.deleted.apply(payload);
+        for entry in &payload.timelines {
+            if let Some(timeline) = TimelineId::from_raw(entry.timeline) {
+                self.mark_timeline_dead(timeline);
             }
         }
+    }
+
+    /// The entry a timeline's expired tombstone left, if it expired.
+    pub fn deleted_entry(&self, timeline: TimelineId) -> Option<DeletedTimeline> {
+        self.deleted.entry(timeline.raw()).copied()
+    }
+
+    /// Whether a complete compaction has run past `timeline`'s tombstone.
+    pub fn is_tombstone_swept(&self, timeline: TimelineId) -> bool {
+        self.deleted.is_swept(timeline.raw())
+    }
+
+    /// Every expired timeline tombstone's entry, in timeline order.
+    pub fn deleted_entries(&self) -> impl Iterator<Item = DeletedTimeline> + '_ {
+        self.deleted.entries()
+    }
+
+    /// The deleted set as its record holds it — what maintenance carries —
+    /// or `None` when it is empty.
+    pub fn deleted_payload(&self) -> Option<DeletedPayload> {
+        self.deleted.payload()
     }
 
     /// Mark a single `(timeline, turn)` tombstoned — the turn-scoped companion
@@ -4783,7 +4935,10 @@ impl Substrate {
     /// the turn's hot K/V is released as a retired timeline's is. A turn the
     /// timeline does not hold yet (the reload path marks before it restores) is
     /// only marked.
-    pub fn tombstone_turn(&mut self, timeline: TimelineId, turn_index: u32) {
+    ///
+    /// Returns the turn as its tombstone record names it ([`TurnMark`]).
+    pub fn tombstone_turn(&mut self, timeline: TimelineId, turn_index: u32) -> TurnMark {
+        let mark = self.turn_mark(timeline, turn_index);
         // **Not onto a timeline that is already wholly dead.** Its tombstone
         // says strictly more, and [`Self::tombstone_timeline`] has just dropped
         // every turn mark it covers — so inserting one here would put back an
@@ -4795,9 +4950,9 @@ impl Substrate {
         // `retire_npc` while the tick that is still running goes on to retire
         // that conversation's tail.
         if self.tombstoned_timelines.contains(&timeline) {
-            return;
+            return mark;
         }
-        self.tombstoned_turns.insert((timeline, turn_index));
+        self.tombstoned_turns.insert(mark);
         self.gallery_epoch += 1;
         let (residence, retired_tokens) = match self
             .timelines
@@ -4811,7 +4966,7 @@ impl Substrate {
                 entry.content.token_count = 0;
                 (entry.content.residence, retired_tokens)
             }
-            None => return,
+            None => return mark,
         };
         // The running total counts what the timeline's turns pin; a retired turn
         // pins nothing, exactly as a reload restores it with none.
@@ -4819,6 +4974,42 @@ impl Substrate {
             *total = total.saturating_sub(retired_tokens);
         }
         self.release_dead_residence(residence);
+        mark
+    }
+
+    /// The turn at `turn_index` of `timeline` as a turn tombstone names it: the
+    /// index its writer gave it and the writer, read off the declaration at
+    /// that position. A position with no declaration is named by itself, as a
+    /// turn with no identity is.
+    pub fn turn_mark(&self, timeline: TimelineId, turn_index: u32) -> TurnMark {
+        let at = turn_stream_id(timeline.raw(), turn_index);
+        self.streams
+            .resolve(at)
+            .and_then(|key| self.streams.turn(key))
+            .map_or(
+                TurnMark {
+                    timeline,
+                    turn_index,
+                    writer: 0,
+                },
+                |turn| TurnMark {
+                    timeline,
+                    turn_index: turn.decl.turn_index,
+                    writer: turn.key.writer,
+                },
+            )
+    }
+
+    /// Whether the declared turn on `key`'s stream was retired by a turn
+    /// tombstone — the question a rewrite asks of every writer's stream.
+    pub fn is_turn_stream_retired(&self, key: StreamKey, decl: &TurnDecl) -> bool {
+        TimelineId::from_raw(decl.timeline_id).is_some_and(|timeline| {
+            self.tombstoned_turns.contains(&TurnMark {
+                timeline,
+                turn_index: decl.turn_index,
+                writer: key.writer,
+            })
+        })
     }
 
     /// Drop a retired residence's hot copy now rather than at compaction.
@@ -4852,9 +5043,11 @@ impl Substrate {
         }
     }
 
-    /// Whether `(timeline, turn)` was dropped by a turn-scoped tombstone.
+    /// Whether the turn at `turn_index` of `timeline` was dropped by a
+    /// turn-scoped tombstone.
     pub fn is_turn_tombstoned(&self, timeline: TimelineId, turn_index: u32) -> bool {
-        self.tombstoned_turns.contains(&(timeline, turn_index))
+        self.tombstoned_turns
+            .contains(&self.turn_mark(timeline, turn_index))
     }
 
     /// Record a layer's [`CorruptTurnPolicy`] (from the projection schema),
@@ -4890,7 +5083,9 @@ impl Substrate {
         // Dropping them here is safe precisely because the timeline tombstone
         // says more than they do: its records go wholesale, so nothing needs to
         // know which of its turns were retired first.
-        self.tombstoned_turns.retain(|(tl, _)| *tl != timeline);
+        self.tombstoned_turns.retain(|m| m.timeline != timeline);
+        // Its recurrent tail dies with it, as a replay of the tombstone has it.
+        self.retire_snapshot_stream(timeline);
         self.splice_source_timelines.remove(&timeline);
         // A tombstoned conversation is never a projection's target again.
         self.retrieval_scopes.remove(&timeline);
@@ -4918,13 +5113,16 @@ impl Substrate {
     /// this same process would restore the corrupted chunks again.
     ///
     /// Releases any hot/warm VRAM a currently-registered section pointing at
-    /// this stream holds, and forgets the stream's indexed records — see
-    /// [`Self::reset_tombstoned_stream`]. A tombstoned section is never read
-    /// again in this generation, so nothing later depends on keeping its
-    /// resident bytes around — unlike an ordinary LRU eviction, this is not
-    /// something a future projection will need back.
-    pub fn tombstone_section(&mut self, stream_id: StreamId) {
-        self.reset_tombstoned_stream(stream_id);
+    /// this stream holds, and ends the generation the stream resolves to — see
+    /// [`Self::end_section`]. A tombstoned section is never read again in this
+    /// generation, so nothing later depends on keeping its resident bytes
+    /// around — unlike an ordinary LRU eviction, this is not something a future
+    /// projection will need back.
+    ///
+    /// Returns the generation ended, for the tombstone record to name.
+    pub fn tombstone_section(&mut self, stream_id: StreamId) -> Option<SectionGeneration> {
+        let generation = self.section_generation(stream_id);
+        self.end_section(stream_id, generation);
         let residences: Vec<ResidenceIndex> = self
             .sections
             .values()
@@ -4933,6 +5131,24 @@ impl Substrate {
             .collect();
         for r in residences {
             self.release_dead_residence(r);
+        }
+        generation
+    }
+
+    /// The generation section `stream_id` resolves to: its writer and the
+    /// `oseq` of the declaration that started it. `None` for a stream with no
+    /// section declaration, or an unstamped one.
+    pub fn section_generation(&self, stream_id: StreamId) -> Option<SectionGeneration> {
+        let key = self.streams.resolve(stream_id)?;
+        let rt = self.streams.physical(key)?;
+        match &rt.decl {
+            Some(StreamDecl::PromptSection(_)) if !rt.ids.decl.is_none() => {
+                Some(SectionGeneration {
+                    writer: key.writer,
+                    oseq: rt.ids.decl.oseq,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -4943,32 +5159,47 @@ impl Substrate {
     /// never be read again, so it releases them. A rebuild retires sound bytes
     /// that are merely stale — compressed under thresholds since changed — and
     /// the conversations reading them now should keep reading them until the
-    /// replacement exists. So this only flags the stream and forgets its
-    /// records ([`Self::reset_tombstoned_stream`]): nothing reloads them, the
-    /// compactor stops carrying them, and the next triage that asks for the
-    /// section prefills it fresh — at the next start, or earlier if this
-    /// process asks first.
-    pub fn retire_section_generation(&mut self, stream_id: StreamId) {
-        self.reset_tombstoned_stream(stream_id);
+    /// replacement exists. So this only ends the generation the stream
+    /// resolves to ([`Self::end_section`]): nothing reloads it, the compactor
+    /// stops carrying it, and the next triage that asks for the section
+    /// prefills it fresh — at the next start, or earlier if this process asks
+    /// first.
+    ///
+    /// Returns the generation ended, for the tombstone record to name.
+    pub fn retire_section_generation(&mut self, stream_id: StreamId) -> Option<SectionGeneration> {
+        let generation = self.section_generation(stream_id);
+        self.end_section(stream_id, generation);
+        generation
     }
 
-    /// Whether the section stream `stream_id` has been tombstoned.
+    /// Whether section `stream_id` reads as tombstoned: a generation of it has
+    /// ended and no section declaration of it stands.
     pub fn is_section_tombstoned(&self, stream_id: StreamId) -> bool {
-        self.tombstoned_sections.contains(&stream_id)
+        self.ended_sections.any(stream_id)
+            && !matches!(
+                self.streams.get(stream_id).and_then(|s| s.decl.as_ref()),
+                Some(StreamDecl::PromptSection(_))
+            )
     }
 
-    /// Direct read of the tombstoned-section-stream set. Used by the
-    /// compactor to re-emit one [`RecordType::SectionTombstone`] marker per
-    /// entry (the same role [`Self::tombstoned_timelines`] plays for
-    /// timeline tombstones) and by a future boot-time integrity pass that
-    /// wants the same set the reactive repair maintains.
-    pub fn tombstoned_sections(&self) -> &HashSet<StreamId> {
-        &self.tombstoned_sections
+    /// Every section generation a tombstone ended — what a rewrite re-emits a
+    /// [`RecordType::SectionTombstone`] for, the same role
+    /// [`Self::tombstoned_timelines`] plays for timeline tombstones.
+    pub fn ended_section_generations(
+        &self,
+    ) -> impl Iterator<Item = (StreamId, SectionGeneration)> + '_ {
+        self.ended_sections.generations()
+    }
+
+    /// Every unstamped section stream a tombstone written before generations
+    /// ended, and no unstamped declaration started again since.
+    pub fn ended_unstamped_sections(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.ended_sections.unstamped()
     }
 
     /// Apply a decoded [`SectionTombstonePayload`] read back from the redo
-    /// log. Flags the stream and forgets its records the way the live
-    /// [`Self::tombstone_section`] does — replay runs before anything is
+    /// log — the generation it names ends the way the live
+    /// [`Self::tombstone_section`] ends it; replay runs before anything is
     /// restored, so there is no VRAM to release.
     pub fn apply_section_tombstone(
         &mut self,
@@ -4982,27 +5213,51 @@ impl Substrate {
                 "replaying section tombstone with recorded reason",
             );
         }
-        self.reset_tombstoned_stream(stream_id);
+        self.end_section(stream_id, payload.generation);
     }
 
     /// A section tombstone ends one **generation** of a stream, not the stream.
     ///
     /// A section's stream id is a pure function of its content address, so a
-    /// fresh prefill of the same text lands on the same id. The tombstone
-    /// therefore flags the stream *and* drops every record the index holds for
-    /// it — decl, chunks, tokens, commit — so what was written before the
-    /// tombstone is unreachable from the index. Compaction and segment
-    /// maintenance both copy only what the index names, so those records are
-    /// reclaimed rather than carried forward.
+    /// fresh prefill of the same text lands on the same id. The generation
+    /// `generation` names is ended for good: its declaration and every value it
+    /// wrote leave the index, and whatever of it arrives later is refused
+    /// ([`Self::apply_stream_decl`], `admits`). Compaction and segment
+    /// maintenance copy only what the index names, so its records are
+    /// reclaimed rather than carried forward. A later generation's declaration
+    /// and values stand.
     ///
-    /// The next `StreamDecl` for the stream is a new generation and lifts the
-    /// flag ([`Self::apply_stream_decl`]); its records then index normally.
-    /// Replay walks the log in append order, so `old records → tombstone →
-    /// new decl + records` rebuilds exactly the new generation.
-    fn reset_tombstoned_stream(&mut self, stream_id: StreamId) {
-        self.tombstoned_sections.insert(stream_id);
-        let moved = self.streams.remove(stream_id);
-        self.tagged_turns.retain(|key| key.stream_id != stream_id);
+    /// `None` is a tombstone written before generations: it drops the
+    /// unstamped stream as the log stands at that point, and the next
+    /// unstamped declaration starts the stream again.
+    fn end_section(&mut self, stream_id: StreamId, generation: Option<SectionGeneration>) {
+        let mut moved = vec![stream_id];
+        match generation {
+            Some(g) => {
+                self.ended_sections.end(stream_id, g);
+                let key = StreamKey {
+                    stream_id,
+                    writer: g.writer,
+                };
+                let declared_here = self.streams.physical(key).is_some_and(|rt| {
+                    matches!(rt.decl, Some(StreamDecl::PromptSection(_)))
+                        && rt.ids.decl.oseq == g.oseq
+                });
+                if declared_here {
+                    moved.extend(self.streams.undeclare(key));
+                }
+                self.streams.prune(key, |held| held.epoch != g.oseq);
+            }
+            None => {
+                self.ended_sections.end_unstamped(stream_id);
+                let key = StreamKey {
+                    stream_id,
+                    writer: 0,
+                };
+                moved.extend(self.streams.remove_writer(key));
+                self.tagged_turns.remove(&key);
+            }
+        }
         self.forget_memos(&moved);
         self.gallery_epoch += 1;
     }
@@ -5165,7 +5420,7 @@ impl Substrate {
         &mut self,
         owner: TimelineId,
         section: SectionId,
-    ) -> Option<StreamId> {
+    ) -> Option<(StreamId, Option<SectionGeneration>)> {
         if !self.owned_sections.release(owner, section) {
             return None;
         }
@@ -5173,8 +5428,12 @@ impl Substrate {
     }
 
     /// Release everything `owner` owns, returning the streams to tombstone on
-    /// disk — see [`Self::release_owned_section`].
-    pub fn release_owned_sections(&mut self, owner: TimelineId) -> Vec<StreamId> {
+    /// disk with the generation each ended — see
+    /// [`Self::release_owned_section`].
+    pub fn release_owned_sections(
+        &mut self,
+        owner: TimelineId,
+    ) -> Vec<(StreamId, Option<SectionGeneration>)> {
         self.owned_sections
             .release_all(owner)
             .into_iter()
@@ -5214,17 +5473,21 @@ impl Substrate {
         found
     }
 
-    /// End `section`'s stream and remove its entry; the stream, if it sealed.
-    fn drop_owned_entry(&mut self, section: SectionId) -> Option<StreamId> {
+    /// End `section`'s stream and remove its entry; the stream, if it sealed,
+    /// with the generation ended.
+    fn drop_owned_entry(
+        &mut self,
+        section: SectionId,
+    ) -> Option<(StreamId, Option<SectionGeneration>)> {
         let stream = self.section_stream(section)?;
-        self.tombstone_section(stream);
+        let generation = self.tombstone_section(stream);
         let entry = self.sections.remove(&section)?;
         self.section_token_total = self.section_token_total.saturating_sub(entry.token_count);
         let r = entry.residence;
         if self.residence[r.0].warm.take().is_some() {
             Self::remove_from_lru(&mut self.warm_lru, r);
         }
-        Some(stream)
+        Some((stream, generation))
     }
 
     /// Whether `timeline` has been tombstoned.
@@ -5271,7 +5534,7 @@ impl Substrate {
         // They did: full compaction gated, incremental maintenance did not, and
         // a production store carried 766 distilled tails of ~116 MiB each —
         // ~89 GB of a 120 GB log — forward on every pass.
-        self.drop_snapshot_loc(snapshot_stream_id(timeline.raw()));
+        self.retire_snapshot_stream(timeline);
         self.release_distilled_kv(timeline);
     }
 
@@ -5368,26 +5631,19 @@ impl Substrate {
     /// counter.
     ///
     /// A tombstoned section is not here: its tombstone names the stream in the
-    /// header, so the accounting retires its records itself, and the stream's
-    /// index entry is gone ([`Self::reset_tombstoned_stream`]).
+    /// header, so the accounting retires its records itself, and the ended
+    /// generation leaves the index ([`Self::end_section`]).
     pub fn tombstoned_stream_bytes(&self) -> u64 {
-        if self.tombstoned_timelines.is_empty()
-            && self.tombstoned_turns.is_empty()
-            && self.tombstoned_sections.is_empty()
-        {
+        if self.tombstoned_timelines.is_empty() && self.tombstoned_turns.is_empty() {
             return 0;
         }
         self.streams
             .iter_physical()
             .filter(|(key, s)| match &s.decl {
                 Some(StreamDecl::Turn(t)) => {
-                    TimelineId::from_raw(t.timeline_id).is_some_and(|tl| {
-                        self.tombstoned_timelines.contains(&tl)
-                            || self
-                                .streams
-                                .position(*key)
-                                .is_some_and(|pos| self.tombstoned_turns.contains(&(tl, pos)))
-                    })
+                    TimelineId::from_raw(t.timeline_id)
+                        .is_some_and(|tl| self.tombstoned_timelines.contains(&tl))
+                        || self.is_turn_stream_retired(*key, t)
                 }
                 Some(StreamDecl::PromptSection(_)) | None => false,
             })
@@ -5398,10 +5654,10 @@ impl Substrate {
             .sum()
     }
 
-    /// The `(timeline, turn)` pairs dead by turn-scoped tombstones — consulted
-    /// by compaction, which sheds their bulk records while re-emitting the
-    /// tombstone itself (the reload's placeholder logic needs it).
-    pub fn tombstoned_turns(&self) -> &HashSet<(TimelineId, u32)> {
+    /// The turns dead by turn-scoped tombstones — consulted by compaction,
+    /// which sheds their bulk records while re-emitting the tombstone itself
+    /// (the reload's placeholder logic needs it).
+    pub fn tombstoned_turns(&self) -> &HashSet<TurnMark> {
         &self.tombstoned_turns
     }
 
@@ -5568,6 +5824,11 @@ impl Substrate {
             RecordType::Distilled => {
                 if let Ok(payload) = DistillPayload::decode(&entry.record.payload) {
                     self.apply_distill(&payload);
+                }
+            }
+            RecordType::Deleted => {
+                if let Ok(payload) = DeletedPayload::decode(&entry.record.payload) {
+                    self.apply_deleted(&payload);
                 }
             }
             RecordType::ProjectionEvents => {
@@ -6939,9 +7200,7 @@ impl Substrate {
     /// path, which re-prefills fresh and overwrites the tombstoned entry.
     pub fn section_exists(&self, section: SectionId) -> bool {
         match self.sections.get(&section) {
-            Some(entry) => !self
-                .tombstoned_sections
-                .contains(&self.residence[entry.residence.0].stream_id),
+            Some(entry) => !self.is_section_tombstoned(self.residence[entry.residence.0].stream_id),
             None => false,
         }
     }
@@ -8590,7 +8849,11 @@ mod tests {
         let (b, rb) = install_owned(&mut sub, theirs, "b", 102);
         assert_eq!(sub.section_token_total, 20);
 
-        assert_eq!(sub.release_owned_section(mine, a), Some(StreamId(101)));
+        assert_eq!(
+            sub.release_owned_section(mine, a),
+            Some((StreamId(101), None)),
+            "an undeclared stream ends unstamped"
+        );
 
         assert!(!sub.section_exists(a));
         assert!(sub.is_section_tombstoned(StreamId(101)));
@@ -8614,7 +8877,10 @@ mod tests {
         assert_eq!(sub.release_owned_section(owner(2), a), None);
         assert!(sub.section_exists(a));
         assert!(!sub.is_section_tombstoned(StreamId(101)));
-        assert_eq!(sub.release_owned_section(owner(1), a), Some(StreamId(101)));
+        assert_eq!(
+            sub.release_owned_section(owner(1), a),
+            Some((StreamId(101), None))
+        );
         assert_eq!(
             sub.release_owned_section(owner(1), a),
             None,
@@ -8645,7 +8911,7 @@ mod tests {
 
         assert_eq!(
             sub.release_owned_sections(mine),
-            vec![StreamId(101), StreamId(102)]
+            vec![(StreamId(101), None), (StreamId(102), None)]
         );
         assert!(!sub.section_exists(a) && !sub.section_exists(b));
         assert!(sub.section_exists(c));
@@ -10994,7 +11260,7 @@ mod tests {
         sub.apply_stream_decl(tool, decl(1, &[]), none);
         assert_eq!(tagged(&sub), vec![chat]);
 
-        sub.reset_tombstoned_stream(chat);
+        sub.end_section(chat, None);
         assert!(tagged(&sub).is_empty());
         sub.apply_stream_decl(tool, decl(1, &["tool"]), none);
         sub.clear_walker_state();
@@ -11735,6 +12001,7 @@ mod tests {
         sub.apply_tombstone(&super::TombstonePayload {
             timeline_id: timeline.raw(),
             turn_index: None,
+            turn_writer: 0,
             reason: None,
         });
         assert!(sub.is_tombstoned(timeline));
@@ -11757,6 +12024,7 @@ mod tests {
         sub.apply_tombstone(&super::TombstonePayload {
             timeline_id: unregistered.raw(),
             turn_index: None,
+            turn_writer: 0,
             reason: None,
         });
 
@@ -11775,6 +12043,7 @@ mod tests {
         sub.apply_tombstone(&super::TombstonePayload {
             timeline_id: tl.raw(),
             turn_index: Some(2),
+            turn_writer: 0,
             reason: Some("corrupt reload (turn 2): chunk mismatch".to_string()),
         });
         assert!(sub.is_turn_tombstoned(tl, 2));

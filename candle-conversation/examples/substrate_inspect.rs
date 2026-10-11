@@ -5282,7 +5282,7 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
         counts[type_index(e.record.header.record_type)] += 1;
         payload_bytes += e.record.header.payload_len;
         record_bytes += e.size;
-        acc.record(&e.record.header, e.size);
+        acc.record(&e.record.header, &e.record.payload, e.size);
     }
 
     let manifest = build_manifest(log)?;

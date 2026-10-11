@@ -20,16 +20,19 @@ use rand::SeedableRng;
 use tempfile::TempDir;
 
 use super::Substrate;
+use crate::persistence::content_hash::{snapshot_stream_id, ContentHash};
 use crate::persistence::identity::RecordIdentity;
 use crate::persistence::manifest::{encode_conv_state_payload, encode_label_payload, ConvState};
 use crate::persistence::record::{
     ChunkPayload, CustomObjectPayload, DebugIdPayload, Record, RecordHeader, RecordType,
-    TreeMetadataPayload, TurnCouplingPayload,
+    SectionGeneration, SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
+    TurnCouplingPayload,
 };
 use crate::persistence::segment::SegmentId;
-use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
+use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::walker::WalkEntry;
 use crate::persistence::SubstratePersistence;
+use crate::projection::TimelineId;
 
 const A: u64 = 0xA;
 const B: u64 = 0xB;
@@ -42,6 +45,15 @@ fn at(origin: u64, hlc: u64) -> RecordIdentity {
         gen: 0,
         epoch: 0,
         hlc,
+    }
+}
+
+/// [`at`], written into the section generation its writer's declaration
+/// `generation` started.
+fn in_generation(origin: u64, hlc: u64, generation: u64) -> RecordIdentity {
+    RecordIdentity {
+        epoch: generation,
+        ..at(origin, hlc)
     }
 }
 
@@ -185,6 +197,48 @@ fn coupling(tl: u64, from: u32, id: RecordIdentity) -> Event {
     event(RecordType::TurnCoupling, 0, 0, p.encode(), id)
 }
 
+fn section_decl() -> StreamDecl {
+    StreamDecl::PromptSection(SectionDecl {
+        address: ContentAddress {
+            prefix_hash: ContentHash { lo: 0x51, hi: 0x52 },
+            section_hash: ContentHash { lo: 0x53, hi: 0x54 },
+        },
+        debug_name: "framing".to_string(),
+    })
+}
+
+fn section(id: RecordIdentity) -> Event {
+    let d = section_decl();
+    event(RecordType::StreamDecl, d.stream_id().0, 0, d.encode(), id)
+}
+
+fn section_tombstone(writer: u64, generation: u64, id: RecordIdentity) -> Event {
+    let p = SectionTombstonePayload {
+        generation: Some(SectionGeneration {
+            writer,
+            oseq: generation,
+        }),
+        reason: None,
+    };
+    event(
+        RecordType::SectionTombstone,
+        section_decl().stream_id().0,
+        0,
+        p.encode(),
+        id,
+    )
+}
+
+fn tombstone(tl: u64, turn: Option<(u32, u64)>, id: RecordIdentity) -> Event {
+    let p = TombstonePayload {
+        timeline_id: tl,
+        turn_index: turn.map(|(index, _)| index),
+        turn_writer: turn.map_or(0, |(_, writer)| writer),
+        reason: None,
+    };
+    event(RecordType::Tombstone, 0, 0, p.encode(), id)
+}
+
 fn object(key: &str, n: u64, id: RecordIdentity) -> Event {
     let obj = CustomObjectPayload::new(key, serde_json::json!({ "n": n }));
     event(
@@ -245,6 +299,57 @@ fn two_writers_turn_n() -> Vec<Event> {
         chunk(sid1, 0, 4, at(B, 5)),
         blob(RecordType::Tokens, sid1.0, b"tokens-b", at(B, 6)),
         decl_at(T5, 2, at(A, 7)),
+    ]
+}
+
+/// A section's first generation, ended by its tombstone, and the second
+/// generation its writer prefilled after — with a chunk of the first that the
+/// second never rewrote.
+fn section_generations() -> Vec<Event> {
+    let sid = section_decl().stream_id();
+    vec![
+        section(at(A, 1)),
+        chunk(sid, 0, 1, in_generation(A, 2, 1)),
+        chunk(sid, 1, 2, in_generation(A, 3, 1)),
+        section_tombstone(A, 1, at(A, 5)),
+        section(at(A, 6)),
+        chunk(sid, 0, 3, in_generation(A, 7, 6)),
+        blob(
+            RecordType::Tokens,
+            sid.0,
+            b"tokens-g6",
+            in_generation(A, 8, 6),
+        ),
+    ]
+}
+
+const T6: u64 = 0x1000_0006;
+const T7: u64 = 0x1000_0007;
+
+/// A timeline tombstone with records of its timeline on both sides of it,
+/// one of them a snapshot ranked above every other.
+fn timeline_tombstone() -> Vec<Event> {
+    let snap = snapshot_stream_id(T6).0;
+    vec![
+        decl(T6, at(A, 1)),
+        label(T6, "c6", "doomed", &[], at(A, 2)),
+        blob(RecordType::Snapshot, snap, b"snapshot-a", at(A, 3)),
+        tombstone(T6, None, at(B, 4)),
+        blob(RecordType::Snapshot, snap, b"snapshot-b-late", at(B, 5)),
+        coupling(T6, 0, at(A, 6)),
+        debug_id(T6, "doomed", at(A, 7)),
+    ]
+}
+
+/// Two writers' turn 1, and a tombstone of the second writer's — which sits
+/// at index 2 once both are placed — named by its writer.
+fn turn_tombstone_by_writer() -> Vec<Event> {
+    vec![
+        decl_at(T7, 0, at(A, 1)),
+        decl_at(T7, 1, at(A, 2)),
+        decl_at(T7, 1, at(B, 3)),
+        tombstone(T7, Some((1, B)), at(A, 4)),
+        decl_at(T7, 2, at(A, 5)),
     ]
 }
 
@@ -383,6 +488,57 @@ fn two_writers_turn_n_is_the_same_in_every_order() {
     assert!(state.contains("chunk 0 b/5@0.0.5"), "{state}");
 }
 
+#[test]
+fn a_section_generation_ended_and_restarted_is_the_same_in_every_order() {
+    let state = assert_order_free(&section_generations());
+    let sid = section_decl().stream_id().0;
+    assert!(
+        state.contains(&format!("stream {sid:016x} writer a\n  decl a/6@0.0.6")),
+        "{state}"
+    );
+    assert!(state.contains("chunk 0 a/7@0.6.7"), "{state}");
+    assert!(state.contains("tokens a/8@0.6.8"), "{state}");
+    assert!(
+        !state.contains("chunk 1 "),
+        "the first generation's chunk: {state}"
+    );
+    assert!(
+        state.contains(&format!("ended_sections [({sid}, 10, 1)]")),
+        "{state}"
+    );
+}
+
+#[test]
+fn a_timeline_tombstone_and_its_timelines_records_are_the_same_in_every_order() {
+    let state = assert_order_free(&timeline_tombstone());
+    assert!(!state.contains(&format!("{T6:016x}")), "{state}");
+    assert!(
+        !state.contains("snapshot "),
+        "no snapshot of a dead timeline is installed, however late: {state}"
+    );
+    assert!(state.contains(&format!("tombstoned [{T6}]")), "{state}");
+}
+
+#[test]
+fn a_turn_tombstone_names_its_writers_turn_in_every_order() {
+    let state = assert_order_free(&turn_tombstone_by_writer());
+    assert!(
+        state.contains(&format!("tombstoned_turns [({T7}, 1, 11)]")),
+        "{state}"
+    );
+    let mut sub = Substrate::new();
+    for (position, e) in turn_tombstone_by_writer().iter().enumerate() {
+        sub.apply_walker_entry(&walked(e, position));
+    }
+    let tl = TimelineId::from_raw(T7).unwrap();
+    assert!(!sub.is_turn_tombstoned(tl, 1), "the first writer's turn 1");
+    assert!(
+        sub.is_turn_tombstoned(tl, 2),
+        "the second writer's, placed at 2"
+    );
+    assert!(!sub.is_turn_tombstoned(tl, 3));
+}
+
 /// Every lookup by a turn's id reaches the turn at that position: the second
 /// writer's turn 1 is reached as turn 2, with its own tokens, and the first
 /// writer's turn 2 as turn 3.
@@ -434,6 +590,9 @@ fn all_events() -> Vec<Event> {
     all.extend(children_first());
     all.extend(recurrent_and_blobs());
     all.extend(two_writers_turn_n());
+    all.extend(section_generations());
+    all.extend(timeline_tombstone());
+    all.extend(turn_tombstone_by_writer());
     all
 }
 

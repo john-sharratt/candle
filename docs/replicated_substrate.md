@@ -1675,9 +1675,9 @@ replaying it at the next start meets records in an order no writer chose.
 | `TurnCoupling`, VFS kills, applied-set gaps | Set inserts, which commute already. |
 | **Turn streams** (`Chunk`, `Tokens`, `WideQSig`, `TurnIndexPage` under a turn's stream id) | **Indexed per writer.** The index keys a turn stream `(stream_id, origin)`, so two writers' turn *N*, which share `turn_stream_id(timeline, N)`, never overwrite each other's entries. A lookup by stream id, which is all any caller does, resolves to the turn that holds that index in the timeline's stamp order (§6.6). That is decided by the stamps, not by which arrived last. |
 | **Records that need a parent**: `TreeMetadata`, `DebugId`, `TurnCoupling`, `Label`, `ConvState`, and every timeline-scoped value | **Wait for the parent.** A record whose timeline is not registered yet is held, with its identity, in a pending map keyed by timeline (`substrate/pending.rs`), and applied by the decl that registers it. Nothing is dropped for arriving early. A stream's own records (`Chunk`, `Tokens`, `WideQSig`, `TurnIndexPage`, `ProjectionEvents`, `Commit`) need no holding: they are indexed under their stream as they arrive, and a stream another origin wrote is not an orphan for want of a decl (§6.8). |
-| **Timeline `Tombstone`** | **Dominates.** It is a fact about the timeline, not a value. Once applied, every later record for that timeline is skipped at apply, and `register_timeline` refuses it. Every earlier one is dead at read, as today. A `Snapshot` arriving after it is not re-inserted. Compaction **keeps** timeline tombstones as resident records (today it drops them, `persistence/compaction.rs:541-546`), because a record replicated late, say by a member that was cut off, must still find the tombstone and die. A tombstone **expires** once a complete compaction has run since it and it is more than *N* days old (§6.8). |
-| Turn `Tombstone` | Dominates its turn the same way; it already commutes with the timeline tombstone (`substrate.rs:4353-4363`). |
-| **Section generations** | A section's **generation** is the version stamp of the `StreamDecl::PromptSection` that started it. Every record of the section carries its generation in the header's `epoch`. A `SectionTombstone` names the generation it ends. The live generation is the decl with the greatest stamp that no tombstone names, and records of any other generation are ignored at read. That replaces "a later decl lifts the tombstone" (`substrate.rs:4116-4118`), which only worked in append order. |
+| **Timeline `Tombstone`** | **Dominates.** It is a fact about the timeline, not a value. Every record for that timeline, earlier or later, is dead at read: no projection, listing or gather sees it, and every rewrite drops it. A remote record it dominates is not written at all (below). `register_timeline` registers it **dead** rather than refusing it: a refused registration would turn the next append of a writer that has not heard of the deletion into a fault, while a dead one is filtered at every read. Its `Snapshot` stream is **retired**: the tail goes, and a snapshot arriving after the tombstone, however late and whatever its stamp, is not installed (`Substrate::retire_snapshot_stream`; a `Distilled` marker retires it the same way). Compaction **keeps** timeline tombstones as resident records, because a record replicated late, say by a member that was cut off, must still find the tombstone and die. A tombstone **expires** once a complete compaction has run since it and it is more than *N* days old (§6.8). |
+| Turn `Tombstone` | Dominates its turn the same way. It names the turn as its writer wrote it — the index the writer gave it and the writer's origin (`turn_writer`) — because a turn's index is its position in the timeline's stamp order, which another writer's turn can move (§6.6). It commutes with the timeline tombstone, which subsumes it. |
+| **Section generations** | A section's **generation** is named by the writer of the `StreamDecl::PromptSection` that started it and that decl's `oseq`. Every record of the section carries the generation's `oseq` in its header's `epoch` (`Minter::mint_for`; the minter knows the generation of each section it is writing, and recovers it at open from its own records). A `SectionTombstone` names the generation it ends, `{writer, oseq}`, and that generation is ended for good: its decl is refused and every record that carries it is dropped, before or after the tombstone (`substrate/ended_sections.rs`). A decl that is installed drops whatever its writer's stream still held of an earlier generation. The live generation is the decl with the greatest stamp that no tombstone names. A tombstone written before generations names none, and keeps the append-order rule every unstamped record has: it ends the unstamped stream as the log stands, and an unstamped decl after it starts it again. |
 
 **Deciding whether to write.** In order:
 
@@ -1971,11 +1971,19 @@ entry takes its place in the member's **deleted set**, a new resident record, `D
 
 A million deleted conversations cost 24 MB, against 4 GB as tombstone records.
 
+The `Deleted` record (`persistence/deleted.rs`) is local housekeeping: one record,
+rewritten whole by every compaction and carried by maintenance, never replicated, so it
+carries no identity. Beside the entries it lists the timeline tombstones a complete
+compaction has already run past (*swept*) — the first of the two expiry conditions,
+which a compaction can only know from the compaction before it. The keyed-value entry
+arrives with the keyed tombstones it shrinks, in chunk 7 (§15): chunk 1 has none.
+
 **The deleted set dominates exactly as the tombstone did** (§6.5):
 
-- a record for a timeline it names is skipped at apply, at any time, however late;
+- a record for a timeline it names is dead at read, and a remote one is not written, at
+  any time, however late;
 - a keyed write it outranks is skipped too;
-- `register_timeline` refuses a timeline it names.
+- `register_timeline` registers a timeline it names dead.
 
 **A catch-up carries the set.** When a catch-up's headers list an `oseq` as gone (§7.2),
 and that `oseq` was a tombstone that expired, the header says so and carries its entry.
@@ -3231,7 +3239,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | rendezvous | ownership is deterministic, minimal movement on joins and leaves, and the weighted share tends to the weights |
 | **order independence** (`candle-conversation`, CPU substrate) | **the central test.** Generated event sets cover every record type, two and three origins, competing writes to one key, tombstones before and after their targets, children before parents, section generations ended and restarted, two writers' turns at one index, and events with fixed generations from a cut-off member. **Every permutation** of each set (exhaustive up to 7 events, 5,000 seeded random shuffles beyond) is applied to a fresh substrate, and the resulting state — every index, value, stamp, tombstone, lease and turn order — is byte-identical across all of them. The same holds after a compaction and a reopen part-way through. |
 | apply (`candle-conversation`, CPU substrate) | a record of an unknown type is neither written nor marked applied, goes in the deferred set, and is not asked for by a catch-up; a build that knows the type moves it back to wanted on open, and its first catch-up fetches it; duplicates are not written; dominated records are not written; a same-`digest` record is skipped; a record failing its `digest` is refused; a turn is adopted only when complete, and an incomplete remote turn is pending, never `Corrupt`, at runtime and at open; repair tombstones are never replicated; placeholders fill gaps; a child record waits for its parent and is applied when it comes; `Commit` takes the max; a timeline tombstone survives compaction and kills a record arriving after it |
-| tombstone expiry | a tombstone record is kept by every compaction until a complete `compact()` has finished after it **and** its `hlc` is more than *N* days old, and is then replaced by its entry in the `Deleted` record; neither condition alone shrinks it; with paused time, a record for a deleted timeline arriving a year after expiry dies in every arrival order, and a register of that timeline is refused; a keyed entry kills lower-stamped writes and yields to a greater stamp; a catch-up's gone header for an expired tombstone carries its entry, and a member returning after any absence drops the timelines it names and its unsent writes to them die everywhere; `Deleted` survives compaction and reopen byte-exact |
+| tombstone expiry | a tombstone record is kept by every compaction until a complete `compact()` has finished after it **and** its `hlc` is more than *N* days old, and is then replaced by its entry in the `Deleted` record; neither condition alone shrinks it; with paused time, a record for a deleted timeline arriving a year after expiry dies in every arrival order, and a register of that timeline leaves it dead; a keyed entry kills lower-stamped writes and yields to a greater stamp; a catch-up's gone header for an expired tombstone carries its entry, and a member returning after any absence drops the timelines it names and its unsent writes to them die everywhere; `Deleted` survives compaction and reopen byte-exact |
 | identity | the `TimelineId` layout and monotonicity; `hlc` is monotonic and passes every `hlc` seen; `(origin, oseq)`, stamp and `digest` preserved through relocation, re-emission and `compact()`; the applied set and the location index rebuild from the last `Replica` plus the walk; a substrate copied to another directory or machine re-mints its node; passthrough timelines are `hash(conversation_key)` |
 | VFS scoping | the writer's, reviewer's and checker's missions of one operation see one store, and a draft written in one step is read in the next, on another in-process member too; two operations over one base see different files; a character with no mission reads the tip; the table's reading and checks read the store; nothing an operation writes reaches the mind folder before its publish step; a failed run's store is discarded under `discard` and kept under `keep`, and `reopen` resumes a kept one; a workflow with a route to `done` from anything but a publish step is a load error; a clean publish lands the store and settles the run `done`; a conflict refuses the publish with the paths named, `merge_sync` marks the overlapping hunks in the store, and once the Maker has resolved and committed them at the bench the publish lands and the run settles `done` without going back through verification; the `published` check holds the step open until then; a Maker that reports `stuck` hands the step to another; publishing the same text twice merges as a no-op; in disconnected mode a step's edits write no `VfsEvent`; with `origin` or every agent unreachable, a publish settles nothing, counts toward neither send-backs nor stuck, and under paused time is offered again exactly 30 minutes later with the store intact |
 | agent selection | stickiness, the spill after the wait, and the idle-core ranking with repository and toolchain filters |
@@ -3308,8 +3316,9 @@ it changes how *every* log is replayed, today's single-machine ones included.
     and `turn_stream_id` lookups resolved to the turn at that index. The 34 call sites
     are untouched;
   - the deferred set for record types the build does not decode.
-- **Tombstone expiry (§6.8).** The `Deleted` record (tag 31), and expiry after a
-  complete compaction and *N* days.
+- **Tombstone expiry (§6.8).** The `Deleted` record (tag 31) with its timeline entries,
+  and expiry after a complete compaction and *N* days (`--tombstone-retention`, zend and
+  npcd). The keyed-value entry lands in chunk 7 with the keyed tombstones it shrinks.
 - **Remote records (§6.5).** Applying a record from another origin under the substrate
   write lock:
   - `adopt_remote_turn` for complete turns only, with incomplete remote turns pending,
@@ -3458,6 +3467,8 @@ help. Every command runs through the gateway and on a member's own listener alik
 
 - World state as per-entity state records in place of the three whole-world
   CustomObjects, and `PULSE` for transients (§9.1).
+- The keyed-value tombstone of a ceased entity, and its `(key hash, stamp, origin, oseq)`
+  entry in the `Deleted` record when it expires (§6.8).
 - The world lease, and the authority's term handling (§9.2).
 - NPC leases spread by rendezvous, and acts forwarded to the authority (§9.3).
 - Disconnected mode (§9.4).

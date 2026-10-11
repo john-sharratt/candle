@@ -109,8 +109,8 @@ pub fn survival(rt: RecordType) -> Survival {
         // merely forget a deletion — the rewrite carries the turn's content
         // forward regardless, so the condemned turn returns on the next reload.
         RecordType::Tombstone => Survival::Resident,
-        // The section counterpart of `Tombstone`, re-emitted from
-        // `tombstoned_sections` for the same reason: losing this marker does
+        // The section counterpart of `Tombstone`, re-emitted for every ended
+        // generation for the same reason: losing this marker does
         // not merely forget a deletion, it resurrects the corrupted chunks
         // the marker exists to keep unread.
         RecordType::SectionTombstone => Survival::Resident,
@@ -121,6 +121,10 @@ pub fn survival(rt: RecordType) -> Survival {
         // in `Substrate::custom_objects` and re-emitted from
         // `live_custom_objects`.
         RecordType::CustomObject => Survival::Resident,
+        // The deleted set, held in `Substrate::deleted` and rewritten whole —
+        // by compaction with the tombstones it expired, by maintenance as it
+        // stands.
+        RecordType::Deleted => Survival::Resident,
 
         // ── Maintained, not compacted ───────────────────────────────────────
         // Kills file events by sequence number; located through `VfsIndex`.
@@ -166,6 +170,7 @@ pub const WRITTEN_RECORD_TYPES: &[RecordType] = &[
     RecordType::VfsEvent,
     RecordType::VfsTombstone,
     RecordType::CustomObject,
+    RecordType::Deleted,
 ];
 
 /// A per-record-type tally, for reporting what a store holds and what a rewrite
@@ -274,6 +279,7 @@ pub fn type_label(rt: RecordType) -> &'static str {
         RecordType::VfsEvent => "vfs_event",
         RecordType::VfsTombstone => "vfs_tombstone",
         RecordType::CustomObject => "custom_object",
+        RecordType::Deleted => "deleted",
         RecordType::Unknown => "unknown",
     }
 }

@@ -294,6 +294,13 @@ pub enum RecordType {
     /// substrate holds the live set in RAM and re-emits it on compaction, so it
     /// survives like the other resident metadata. See [`CustomObjectPayload`].
     CustomObject = 27,
+    /// A member's **deleted set** (`docs/replicated_substrate.md` §6.8): every
+    /// timeline whose tombstone expired, shrunk to its entry, and the
+    /// tombstones a complete compaction has run past. Payload
+    /// [`super::deleted::DeletedPayload`]. Local housekeeping — one record,
+    /// rewritten whole by each compaction and carried by maintenance, never
+    /// replicated, with no identity.
+    Deleted = 31,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -339,6 +346,7 @@ impl RecordType {
             25 => RecordType::VfsEvent,
             26 => RecordType::VfsTombstone,
             27 => RecordType::CustomObject,
+            31 => RecordType::Deleted,
             _ => RecordType::Unknown,
         }
     }
@@ -1408,6 +1416,14 @@ pub struct TombstonePayload {
     /// timeline-level tombstone stays byte-identical to the pre-`turn_index` format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_index: Option<u32>,
+    /// For a turn tombstone, the origin of the member that wrote the turn:
+    /// `turn_index` is the index that writer gave it, which another writer's
+    /// turn can move it above (`docs/replicated_substrate.md` §6.6), so the
+    /// pair names the turn wherever it now sits. Zero for a turn with no
+    /// identity, and skipped from the serialized record then, so such a
+    /// tombstone stays byte-identical to the format before this field.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub turn_writer: u64,
     /// Why the timeline was tombstoned, when known — e.g.
     /// `"corrupt reload (turn N): <detail>"` for a turn dropped during substrate
     /// reconstruction because its persisted state was inconsistent. Diagnostic
@@ -1442,6 +1458,7 @@ mod tombstone_payload_tests {
         let p = TombstonePayload {
             timeline_id: 77,
             turn_index: None,
+            turn_writer: 0,
             reason: None,
         };
         assert_eq!(p.encode(), br#"{"timeline_id":77}"#.to_vec());
@@ -1452,6 +1469,7 @@ mod tombstone_payload_tests {
         let p = TombstonePayload {
             timeline_id: 42,
             turn_index: None,
+            turn_writer: 0,
             reason: Some("corrupt reload (turn 1): chunk mismatch".to_string()),
         };
         assert_eq!(
@@ -1473,6 +1491,7 @@ mod tombstone_payload_tests {
         let p = TombstonePayload {
             timeline_id: 5,
             turn_index: None,
+            turn_writer: 0,
             reason: Some("corrupt reload".to_string()),
         };
         assert_eq!(TombstonePayload::decode(&p.encode()).unwrap(), p);
@@ -1487,6 +1506,7 @@ mod tombstone_payload_tests {
         let p = TombstonePayload {
             timeline_id: 77,
             turn_index: Some(2),
+            turn_writer: 0,
             reason: None,
         };
         assert_eq!(p.encode(), br#"{"timeline_id":77,"turn_index":2}"#.to_vec());
@@ -1495,6 +1515,7 @@ mod tombstone_payload_tests {
         let q = TombstonePayload {
             timeline_id: 3,
             turn_index: Some(9),
+            turn_writer: 0,
             reason: Some("corrupt reload (turn 9): chunk mismatch".to_string()),
         };
         assert_eq!(
@@ -1503,6 +1524,23 @@ mod tombstone_payload_tests {
                 .to_vec()
         );
         assert_eq!(TombstonePayload::decode(&q.encode()).unwrap(), q);
+    }
+
+    /// A turn tombstone names its turn's writer beside the index that writer
+    /// gave it, between the two in the record.
+    #[test]
+    fn a_turn_tombstone_names_its_writer() {
+        let p = TombstonePayload {
+            timeline_id: 77,
+            turn_index: Some(2),
+            turn_writer: 0xab,
+            reason: None,
+        };
+        assert_eq!(
+            p.encode(),
+            br#"{"timeline_id":77,"turn_index":2,"turn_writer":171}"#.to_vec()
+        );
+        assert_eq!(TombstonePayload::decode(&p.encode()).unwrap(), p);
     }
 }
 
@@ -1513,6 +1551,15 @@ mod tombstone_payload_tests {
 /// names.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SectionTombstonePayload {
+    /// The generation the tombstone ends (`docs/replicated_substrate.md`
+    /// §6.5): the writer whose section it is and the `oseq` of the declaration
+    /// that started it. A later generation of the same section — a fresh
+    /// prefill of the same content, under the same stream id — is not ended,
+    /// whatever order the records arrive in. `None` on a tombstone written
+    /// before generations, which ends the unstamped stream as it stands in the
+    /// log at that point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<SectionGeneration>,
     /// Why the section was tombstoned, when known — e.g. the chunk index and
     /// layer split a confirmed per-layer window divergence reported.
     /// Diagnostic only: replay treats any record of this type as dead
@@ -1520,6 +1567,15 @@ pub struct SectionTombstonePayload {
     /// minimal on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// One generation of a section stream: the writer, and the `oseq` of the
+/// declaration that started it, which every record of the generation carries
+/// in its `epoch`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SectionGeneration {
+    pub writer: u64,
+    pub oseq: u64,
 }
 
 impl SectionTombstonePayload {
@@ -1535,17 +1591,38 @@ impl SectionTombstonePayload {
 
 #[cfg(test)]
 mod section_tombstone_payload_tests {
-    use super::SectionTombstonePayload;
+    use super::{SectionGeneration, SectionTombstonePayload};
 
     #[test]
     fn reasonless_payload_is_byte_identical_minimal_form() {
-        let p = SectionTombstonePayload { reason: None };
+        let p = SectionTombstonePayload {
+            generation: None,
+            reason: None,
+        };
         assert_eq!(p.encode(), br#"{}"#.to_vec());
+    }
+
+    /// A tombstone names the generation it ends, ahead of its reason.
+    #[test]
+    fn the_generation_is_serialised_when_named() {
+        let p = SectionTombstonePayload {
+            generation: Some(SectionGeneration {
+                writer: 171,
+                oseq: 9,
+            }),
+            reason: Some("rebuild".to_string()),
+        };
+        assert_eq!(
+            p.encode(),
+            br#"{"generation":{"writer":171,"oseq":9},"reason":"rebuild"}"#.to_vec()
+        );
+        assert_eq!(SectionTombstonePayload::decode(&p.encode()).unwrap(), p);
     }
 
     #[test]
     fn reason_is_serialised_when_present() {
         let p = SectionTombstonePayload {
+            generation: None,
             reason: Some(
                 "chunk 2: (offset 0, 32 tokens) on layers [0,1]; (offset 0, 0 tokens) \
                           on layers [2..47]"
@@ -1561,10 +1638,14 @@ mod section_tombstone_payload_tests {
     #[test]
     fn round_trips() {
         let p = SectionTombstonePayload {
+            generation: None,
             reason: Some("window divergence".to_string()),
         };
         assert_eq!(SectionTombstonePayload::decode(&p.encode()).unwrap(), p);
-        let q = SectionTombstonePayload { reason: None };
+        let q = SectionTombstonePayload {
+            generation: None,
+            reason: None,
+        };
         assert_eq!(SectionTombstonePayload::decode(&q.encode()).unwrap(), q);
     }
 

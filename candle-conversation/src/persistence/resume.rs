@@ -1185,7 +1185,11 @@ mod tests {
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             sp.declare_stream(&decl).unwrap();
-            sp.append_turn_index_page(stream_id, &payload, sp.mint())
+            let id = sp.mint_for(RecordType::TurnIndexPage, stream_id);
+            sp.append_turn_index_page(stream_id, &payload, id).unwrap();
+            // A page minted outside the section's generation is not the
+            // section's: it is refused on replay.
+            sp.append_turn_index_page(stream_id, b"stray", sp.mint())
                 .unwrap();
             sp.commit().unwrap();
         }
@@ -1306,8 +1310,8 @@ mod tests {
 
             // 2. Repair: tombstone in-RAM and durably.
             let reason = divergence.describe();
-            substrate.tombstone_section(stream_id);
-            sp.write_section_tombstone(stream_id.0, Some(&reason))
+            let generation = substrate.tombstone_section(stream_id);
+            sp.write_section_tombstone(stream_id.0, generation, Some(&reason))
                 .unwrap();
             sp.commit().unwrap();
 
@@ -1376,8 +1380,9 @@ mod tests {
             let mut substrate = Substrate::new();
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            substrate.tombstone_section(stream_id);
-            sp.write_section_tombstone(stream_id.0, Some("system prompt rebuild"))
+            let generation = substrate.tombstone_section(stream_id);
+            assert!(generation.is_some(), "the section is stamped");
+            sp.write_section_tombstone(stream_id.0, generation, Some("system prompt rebuild"))
                 .unwrap();
             sp.commit().unwrap();
             write_generation(&mut sp, 2, 100);

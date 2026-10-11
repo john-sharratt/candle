@@ -11,12 +11,13 @@ use std::env::current_dir;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::{self, Next};
 use axum::Router;
 use candle_conversation::models::DialectType;
+use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::Capabilities;
 use clap::Args;
@@ -127,7 +128,20 @@ pub struct NpcdArgs {
     #[arg(long)]
     #[serde(skip)]
     pub wipe_conversations: bool,
+
+    /// How many days the substrate keeps a retired conversation's tombstone
+    /// before a compaction may shrink it to a 24-byte entry in the deleted set
+    /// (`docs/replicated_substrate.md` §6.8). Only when the bytes are reclaimed
+    /// depends on it: the conversation stays retired either way.
+    #[arg(long, value_name = "DAYS", default_value_t = DEFAULT_TOMBSTONE_RETENTION_DAYS)]
+    pub tombstone_retention: u64,
 }
+
+/// `--tombstone-retention`'s default, in days: the substrate's own.
+const DEFAULT_TOMBSTONE_RETENTION_DAYS: u64 =
+    DEFAULT_TOMBSTONE_RETENTION.as_secs() / SECONDS_PER_DAY;
+
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 impl NpcdArgs {
     /// The flags that act once, at the start they are given to. A self-heal
@@ -165,6 +179,7 @@ impl Default for NpcdArgs {
             forget_dreams: false,
             forget_journal: false,
             wipe_conversations: false,
+            tombstone_retention: DEFAULT_TOMBSTONE_RETENTION_DAYS,
         }
     }
 }
@@ -308,6 +323,13 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // log — every request after this is answered from memory.
     let npcs = Npcs::load(&data)
         .map_err(|e| anyhow::anyhow!("opening the substrate at {}: {e:?}", data.display()))?;
+    npcs.substrate()
+        .persistence
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_tombstone_retention(Duration::from_secs(
+            args.tombstone_retention.saturating_mul(SECONDS_PER_DAY),
+        ));
 
     let roles = ctx.roles.clone();
     if roles.is_empty() {

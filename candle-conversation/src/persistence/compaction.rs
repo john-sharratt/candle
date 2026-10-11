@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::content_hash::snapshot_stream_id;
+use super::deleted::{DeletedPayload, DeletedTimeline};
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use super::identity::MarkerIds;
 use super::log_file::LogFile;
@@ -39,6 +40,7 @@ use super::segment::{SegmentId, FIRST_SEGMENT};
 use super::stamped_locs::StampedLocs;
 use super::streams::StreamId;
 use super::stripes::{stripes, MAX_STRIPE_BYTES};
+use super::tombstone_expiry::TombstoneExpiry;
 use super::vfs::{carried, VfsIndex};
 use super::Result;
 use crate::projection::TimelineId;
@@ -176,6 +178,10 @@ fn branch_checkpoints_to_keep(substrate: &Substrate) -> Vec<(StreamId, RecordLoc
 /// match in [`super::accounting::RecordAccounting::record`] is the checklist:
 /// a header-keyed type needs a `Raw` carry-forward from its location map, and a
 /// payload-keyed one needs a `Synth` re-emit from substrate RAM.
+///
+/// A timeline tombstone is carried until `expiry` lets it shrink to its
+/// deleted-set entry (§6.8): this compaction runs past every tombstone it
+/// carries, and says so in the `Deleted` record it writes.
 pub fn collect_live_records(
     manifest: &Manifest,
     substrate: &Substrate,
@@ -183,6 +189,7 @@ pub fn collect_live_records(
     vfs_index: &VfsIndex,
     marker_ids: &MarkerIds,
     node: u64,
+    expiry: TombstoneExpiry,
 ) -> Vec<CompactItem> {
     let mut out: Vec<CompactItem> = Vec::new();
 
@@ -279,16 +286,10 @@ pub fn collect_live_records(
         .iter()
         .map(|(t, m)| (t.raw(), *m))
         .collect();
-    // Tombstoned section streams drop out the same way — their `StreamDecl` /
-    // `Chunk` / `Tokens` records are the corrupted bytes the tombstone exists
-    // to keep unread, so nothing here should carry them forward. A section has
-    // no turn-numbering to preserve (unlike a tombstoned turn, which keeps a
-    // placeholder `StreamDecl`), so the whole stream drops entirely.
-    let tombstoned_sections: std::collections::HashSet<u64> = substrate
-        .tombstoned_sections()
-        .iter()
-        .map(|s| s.0)
-        .collect();
+    // An ended section generation needs no gate here: its `StreamDecl` /
+    // `Chunk` / `Tokens` records are the corrupted or stale bytes the tombstone
+    // exists to keep unread, and the tombstone already took them out of the
+    // index (`Substrate::end_section`), so the walk below never meets them.
 
     // Recurrent-state snapshots: one live tail per conversation, staged
     // verbatim (`Raw`, the `Tokens` shape — the payload is a multi-MB state
@@ -410,9 +411,6 @@ pub fn collect_live_records(
         if entry.is_orphan(node) {
             continue;
         }
-        if tombstoned_sections.contains(&stream_id.0) {
-            continue;
-        }
         let mut turn_dead = false;
         let distill: Option<DistillMode> =
             if let Some(crate::persistence::streams::StreamDecl::Turn(t)) = &entry.decl {
@@ -440,11 +438,8 @@ pub fn collect_live_records(
                 // StreamDecl: the reload restores the turn as an empty
                 // placeholder from the decl, preserving the timeline's turn
                 // indexing (a fully-dropped decl would renumber every later
-                // turn away from its persisted stream ids). The tombstone names
-                // the turn's position, not the index its writer gave it.
-                turn_dead = TimelineId::from_raw(t.timeline_id)
-                    .zip(substrate.turn_position(key))
-                    .is_some_and(|(tl, pos)| substrate.tombstoned_turns().contains(&(tl, pos.0)));
+                // turn away from its persisted stream ids).
+                turn_dead = substrate.is_turn_stream_retired(key, t);
                 distilled.get(&t.timeline_id).copied()
             } else {
                 None
@@ -587,19 +582,80 @@ pub fn collect_live_records(
             ));
         }
     }
+    // Timeline tombstones are kept although their records vanish wholesale
+    // above: a record replicated late — by a member that was cut off — must
+    // still find the tombstone and die. Each stays until it is old and this is
+    // not the first complete compaction to run past it, when it shrinks to its
+    // entry in the deleted set; this compaction has run past every one it
+    // carries, and the `Deleted` record it writes says so.
+    let mut dead: Vec<TimelineId> = substrate
+        .tombstoned_timelines()
+        .iter()
+        .copied()
+        .filter(|tl| substrate.deleted_entry(*tl).is_none())
+        .collect();
+    dead.sort_unstable();
+    let mut deleted: Vec<DeletedTimeline> = substrate.deleted_entries().collect();
+    let mut swept: Vec<u64> = Vec::new();
+    for tl in dead {
+        let payload = TombstonePayload {
+            timeline_id: tl.raw(),
+            turn_index: None,
+            turn_writer: 0,
+            reason: None,
+        }
+        .encode();
+        let id = marker_ids.identity_for(RecordType::Tombstone, 0, &payload);
+        if substrate.is_tombstone_swept(tl) && expiry.is_old(id.hlc) {
+            deleted.push(DeletedTimeline {
+                timeline: tl.raw(),
+                origin: id.origin,
+                oseq: id.oseq,
+            });
+            continue;
+        }
+        swept.push(tl.raw());
+        out.push(CompactItem::synth(
+            RecordHeader {
+                record_type: RecordType::Tombstone,
+                payload_len: payload.len() as u64,
+                ..RecordHeader::NONE
+            }
+            .with_identity(id),
+            payload,
+        ));
+    }
+    deleted.sort_unstable();
+    if !deleted.is_empty() || !swept.is_empty() {
+        let payload = DeletedPayload {
+            timelines: deleted,
+            swept,
+        }
+        .encode();
+        out.push(CompactItem::synth(
+            RecordHeader {
+                record_type: RecordType::Deleted,
+                payload_len: payload.len() as u64,
+                ..RecordHeader::NONE
+            },
+            payload,
+        ));
+    }
     // Turn-scoped tombstones on LIVE timelines are re-emitted: the compacted
     // log keeps the dead turn's StreamDecl (index preservation) but sheds its
     // bulk records, and the reload's placeholder logic keys off this tombstone
     // to restore the turn as an empty hole instead of re-hitting the (now
-    // absent) content. Timeline tombstones need no re-emission — their records
-    // vanish wholesale above.
-    for &(tl, turn_index) in substrate.tombstoned_turns() {
-        if tombstoned.contains(&tl.raw()) {
+    // absent) content.
+    let mut marks: Vec<_> = substrate.tombstoned_turns().iter().copied().collect();
+    marks.sort_unstable();
+    for mark in marks {
+        if tombstoned.contains(&mark.timeline.raw()) {
             continue;
         }
         let payload = TombstonePayload {
-            timeline_id: tl.raw(),
-            turn_index: Some(turn_index),
+            timeline_id: mark.timeline.raw(),
+            turn_index: Some(mark.turn_index),
+            turn_writer: mark.writer,
             reason: None,
         }
         .encode();
@@ -623,12 +679,21 @@ pub fn collect_live_records(
     // tombstones are: the marker itself is what makes the drop permanent
     // across reloads, so it must survive the rewrite that drops the
     // section's now-dead `Chunk` / `Tokens` / `StreamDecl` records (those
-    // simply never appear in the live set above, since nothing here stages
-    // records for a stream this set names). Losing this marker would
-    // resurrect the corrupted chunks on the next boot that restores from an
-    // older segment still holding them.
-    for &stream_id in substrate.tombstoned_sections() {
-        let payload = SectionTombstonePayload { reason: None }.encode();
+    // simply never appear in the live set above, since the tombstone took them
+    // out of the index). Losing this marker would resurrect the corrupted
+    // chunks on the next boot that restores from an older segment still
+    // holding them. One per ended generation, naming it; one per unstamped
+    // stream a tombstone written before generations ended.
+    let ended = substrate
+        .ended_section_generations()
+        .map(|(sid, g)| (sid, Some(g)))
+        .chain(substrate.ended_unstamped_sections().map(|sid| (sid, None)));
+    for (stream_id, generation) in ended {
+        let payload = SectionTombstonePayload {
+            generation,
+            reason: None,
+        }
+        .encode();
         let id = marker_ids.identity_for(RecordType::SectionTombstone, stream_id.0, &payload);
         out.push(CompactItem::synth(
             RecordHeader {
@@ -1047,7 +1112,14 @@ mod tests {
     use crate::persistence::identity::RecordIdentity;
     use crate::persistence::log_file::{read_record_at, LogSource, MemLog, SUPERBLOCK_SIZE};
     use crate::persistence::manifest::ConvState;
-    use crate::persistence::record::encode_record;
+    use crate::persistence::record::{encode_record, SectionGeneration};
+    use crate::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
+
+    /// A clock at the epoch: no tombstone is ever old enough to shrink.
+    const NO_EXPIRY: TombstoneExpiry = TombstoneExpiry {
+        now_ms: 0,
+        retention: DEFAULT_TOMBSTONE_RETENTION,
+    };
 
     /// True iff any record of type `rt` carries `payload` (only `Synth` items
     /// hold a payload; `Raw` read-back records don't).
@@ -1147,6 +1219,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         // Exactly: 1 ModelKey + 1 StreamDecl + 1 Chunk = 3 (LWW keeps one of each).
         assert_eq!(live.len(), 3);
@@ -1205,6 +1278,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         assert!(
             !has_type(&live, RecordType::Chunk),
@@ -1256,6 +1330,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         let path = std::env::temp_dir().join(format!(
             "kvtier_compact_{}.log",
@@ -1348,6 +1423,7 @@ mod tests {
             &TombstonePayload {
                 timeline_id: corpus_tl,
                 turn_index: None,
+                turn_writer: 0,
                 reason: None,
             }
             .encode(),
@@ -1363,6 +1439,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         // The marker survives, at its mode — without it the exemption is lost.
@@ -1482,6 +1559,7 @@ mod tests {
                 &TombstonePayload {
                     timeline_id: tl,
                     turn_index: None,
+                    turn_writer: 0,
                     reason: None,
                 }
                 .encode(),
@@ -1498,6 +1576,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         let has_label = |needle: &str| {
@@ -1590,6 +1669,7 @@ mod tests {
             &TombstonePayload {
                 timeline_id: dead_tl,
                 turn_index: None,
+                turn_writer: 0,
                 reason: None,
             }
             .encode(),
@@ -1605,6 +1685,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         // The dead timeline's records are physically gone from the live set.
@@ -1679,6 +1760,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         assert!(
@@ -1727,6 +1809,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         assert!(
@@ -1791,6 +1874,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         // The declaration and the sig survive — the belief gallery still finds it.
@@ -1920,6 +2004,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         assert!(
@@ -1960,6 +2045,7 @@ mod tests {
             &TombstonePayload {
                 timeline_id: tl,
                 turn_index: None,
+                turn_writer: 0,
                 reason: None,
             }
             .encode(),
@@ -1975,6 +2061,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         assert!(
             !has_type(&live, RecordType::Snapshot),
@@ -2038,6 +2125,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         assert!(
             !has_type(&live, RecordType::Snapshot),
@@ -2066,6 +2154,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         assert!(has_type(&live, RecordType::Snapshot));
     }
@@ -2112,6 +2201,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         let kept: Vec<u64> = live
@@ -2175,6 +2265,7 @@ mod tests {
             &TombstonePayload {
                 timeline_id: tl,
                 turn_index: None,
+                turn_writer: 0,
                 reason: None,
             }
             .encode(),
@@ -2190,6 +2281,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         assert!(
@@ -2231,6 +2323,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         let snaps: Vec<_> = live
@@ -2308,6 +2401,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
 
         assert!(
@@ -2389,6 +2483,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         let npcs: Vec<&CompactItem> = live
             .iter()
@@ -2417,6 +2512,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         assert!(!has_type(&live, RecordType::Npc));
     }
@@ -2437,6 +2533,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         assert!(
             live.iter().any(
@@ -2485,6 +2582,7 @@ mod tests {
             &TombstonePayload {
                 timeline_id: dead_tl,
                 turn_index: None,
+                turn_writer: 0,
                 reason: None,
             }
             .encode(),
@@ -2517,6 +2615,7 @@ mod tests {
             &vfs,
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         let events: Vec<(u64, u64, (u64, u64))> = live
             .iter()
@@ -2603,6 +2702,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         for from_turn in [0u32, 1] {
             assert!(
@@ -2644,6 +2744,7 @@ mod tests {
             &TombstonePayload {
                 timeline_id: tl,
                 turn_index: None,
+                turn_writer: 0,
                 reason: None,
             }
             .encode(),
@@ -2659,6 +2760,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         assert!(!has_type(&live, RecordType::TurnCoupling));
     }
@@ -2803,6 +2905,7 @@ mod tests {
             &TombstonePayload {
                 timeline_id: live_tl,
                 turn_index: Some(1),
+                turn_writer: 0,
                 reason: None,
             }
             .encode(),
@@ -2853,7 +2956,26 @@ mod tests {
             RecordType::SectionTombstone,
             9_501,
             0,
-            &SectionTombstonePayload { reason: None }.encode(),
+            &SectionTombstonePayload {
+                generation: None,
+                reason: None,
+            }
+            .encode(),
+        ));
+        // The deleted set — a timeline whose tombstone expired.
+        blob.extend_from_slice(&record(
+            RecordType::Deleted,
+            0,
+            0,
+            &DeletedPayload {
+                timelines: vec![DeletedTimeline {
+                    timeline: 1003,
+                    origin: 0xA,
+                    oseq: 4,
+                }],
+                swept: Vec::new(),
+            }
+            .encode(),
         ));
 
         let mut mem = MemLog::with_records(&blob);
@@ -2867,8 +2989,15 @@ mod tests {
         vfs.record_event(live_tl, 0, loc_at(8_192, 128));
         vfs.record_tombstone(live_tl, 1, loc_at(12_288, 64), &[]);
 
-        let live =
-            collect_live_records(&manifest, &substrate, &npc_locs, &vfs, &MarkerIds::new(), 0);
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &npc_locs,
+            &vfs,
+            &MarkerIds::new(),
+            0,
+            NO_EXPIRY,
+        );
 
         for &rt in WRITTEN_RECORD_TYPES {
             match survival(rt) {
@@ -2927,6 +3056,7 @@ mod tests {
             &TombstonePayload {
                 timeline_id: tl,
                 turn_index: Some(3),
+                turn_writer: 0,
                 reason: None,
             }
             .encode(),
@@ -2942,6 +3072,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         assert!(
             has_synth(
@@ -2950,6 +3081,7 @@ mod tests {
                 &TombstonePayload {
                     timeline_id: tl,
                     turn_index: Some(3),
+                    turn_writer: 0,
                     reason: None,
                 }
                 .encode(),
@@ -2964,12 +3096,14 @@ mod tests {
     #[test]
     fn collect_carries_section_tombstones_forward() {
         let stream_id = 55_001u64;
+        let generation = SectionGeneration { writer: 4, oseq: 9 };
         let mut blob = Vec::new();
         blob.extend_from_slice(&record(
             RecordType::SectionTombstone,
             stream_id,
             0,
             &SectionTombstonePayload {
+                generation: Some(generation),
                 reason: Some(
                     "chunk 4: (offset 0, 32 tokens) on layer(s) [0]; (offset 0, 0 \
                               tokens) on layer(s) [1..47]"
@@ -2994,6 +3128,7 @@ mod tests {
             &VfsIndex::new(),
             &MarkerIds::new(),
             0,
+            NO_EXPIRY,
         );
         // The reason is diagnostic only and is not re-derived at compaction
         // time — the same rule the turn-scoped tombstone's re-emit follows —
@@ -3003,7 +3138,11 @@ mod tests {
             has_synth(
                 &live,
                 RecordType::SectionTombstone,
-                &SectionTombstonePayload { reason: None }.encode(),
+                &SectionTombstonePayload {
+                    generation: Some(generation),
+                    reason: None,
+                }
+                .encode(),
             ),
             "a section tombstone must survive, or the corrupted chunks return",
         );

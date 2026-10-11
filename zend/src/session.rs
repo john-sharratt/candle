@@ -1054,6 +1054,7 @@ impl InferenceState {
         qsa_selection_budget: Option<usize>,
         qsa_strata: StrataTokens,
         summarize: bool,
+        tombstone_retention: Duration,
         progress: Arc<LoadProgress>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         // The workspace folder: where the substrate, the schema override and a
@@ -1238,6 +1239,7 @@ impl InferenceState {
             .model_path(pack)
             .workspace_path(root.clone())
             .read_only_substrate(read_only_substrate)
+            .tombstone_retention(tombstone_retention)
             .cancel_token(crate::ingest_cancel::token().clone())
             .qsa_selection_budget(qsa_selection_budget)
             .qsa_strata(qsa_strata)
@@ -6116,6 +6118,7 @@ impl ZendSession {
         let qsa_selection_budget = self.config.qsa_selection_budget;
         let qsa_strata = self.config.qsa_strata;
         let summarize = self.config.summarize;
+        let tombstone_retention = self.config.tombstone_retention;
         // Handed to both the downloader and the engine builder, so the artifact
         // fetched and the model built are the same one.
         let model = self.config.model.clone();
@@ -6217,6 +6220,7 @@ impl ZendSession {
                     qsa_selection_budget,
                     qsa_strata,
                     summarize,
+                    tombstone_retention,
                     load_progress_for_blocking,
                 ) {
                     Ok(Some(state)) => {

@@ -41,6 +41,8 @@ use super::StreamRuntime;
 /// A declared turn's stream, as callers address it.
 #[derive(Debug, Clone, Copy)]
 pub struct TurnStream<'a> {
+    /// The writer's stream the turn's records are filed under.
+    pub key: StreamKey,
     /// The id the turn is addressed by — its position's, which is not the id
     /// its records carry when another writer's turn placed it higher.
     pub stream_id: StreamId,
@@ -176,18 +178,111 @@ impl StreamIndex {
         Some(changed)
     }
 
-    /// Drop every writer's stream of `stream_id`, returning the logical ids
-    /// whose stream changed.
-    pub fn remove(&mut self, stream_id: StreamId) -> Vec<StreamId> {
-        let Some(writers) = self.streams.remove(&stream_id) else {
+    /// Take `key`'s declaration away, returning the logical ids whose stream
+    /// changed. What the stream holds besides stays.
+    pub fn undeclare(&mut self, key: StreamKey) -> Vec<StreamId> {
+        let mut changed = vec![key.stream_id];
+        if let Some((timeline, rank)) = self.unrank(key, &mut changed) {
+            changed.extend(self.place(timeline, rank));
+        }
+        if let Some(rt) = self
+            .streams
+            .get_mut(&key.stream_id)
+            .and_then(|w| w.get_mut(&key.writer))
+        {
+            rt.decl = None;
+            rt.ids.decl = RecordIdentity::NONE;
+        }
+        self.drop_if_empty(key);
+        changed.sort_unstable();
+        changed.dedup();
+        changed
+    }
+
+    /// Drop every value of `key`'s stream whose record `keep` refuses — the
+    /// declaration aside — and the stream itself once it holds nothing.
+    /// Returns whether anything was dropped.
+    pub fn prune(&mut self, key: StreamKey, keep: impl Fn(&RecordIdentity) -> bool) -> bool {
+        let Some(rt) = self
+            .streams
+            .get_mut(&key.stream_id)
+            .and_then(|w| w.get_mut(&key.writer))
+        else {
+            return false;
+        };
+        let mut dropped = false;
+        let ids = &mut rt.ids;
+        let gone: Vec<u64> = ids
+            .chunks
+            .iter()
+            .filter(|(_, id)| !keep(id))
+            .map(|(idx, _)| *idx)
+            .collect();
+        for idx in gone {
+            ids.chunks.remove(&idx);
+            rt.chunks.remove(&idx);
+            dropped = true;
+        }
+        if rt.tokens.is_some() && !keep(&ids.tokens) {
+            rt.tokens = None;
+            ids.tokens = RecordIdentity::NONE;
+            dropped = true;
+        }
+        if rt.projection_events.is_some() && !keep(&ids.projection_events) {
+            rt.projection_events = None;
+            ids.projection_events = RecordIdentity::NONE;
+            dropped = true;
+        }
+        if rt.wide_q_sigs.is_some() && !keep(&ids.wide_q_sigs) {
+            rt.wide_q_sigs = None;
+            ids.wide_q_sigs = RecordIdentity::NONE;
+            dropped = true;
+        }
+        if rt.index_page.is_some() && !keep(&ids.index_page) {
+            rt.index_page = None;
+            ids.index_page = RecordIdentity::NONE;
+            dropped = true;
+        }
+        if rt.committed_through.is_some() && !keep(&ids.commit) {
+            rt.committed_through = None;
+            ids.commit = RecordIdentity::NONE;
+            dropped = true;
+        }
+        self.drop_if_empty(key);
+        dropped
+    }
+
+    /// Forget `key`'s stream when it holds nothing at all.
+    fn drop_if_empty(&mut self, key: StreamKey) {
+        let Some(writers) = self.streams.get_mut(&key.stream_id) else {
+            return;
+        };
+        if writers
+            .get(&key.writer)
+            .is_some_and(StreamRuntime::is_empty)
+        {
+            writers.remove(&key.writer);
+        }
+        if writers.is_empty() {
+            self.streams.remove(&key.stream_id);
+        }
+    }
+
+    /// Drop one writer's stream, returning the logical ids whose stream
+    /// changed.
+    pub fn remove_writer(&mut self, key: StreamKey) -> Vec<StreamId> {
+        let Some(writers) = self.streams.get_mut(&key.stream_id) else {
             return Vec::new();
         };
-        let mut changed = vec![stream_id];
-        for writer in writers.into_keys() {
-            let key = StreamKey { stream_id, writer };
-            if let Some((timeline, rank)) = self.unrank(key, &mut changed) {
-                changed.extend(self.place(timeline, rank));
-            }
+        if writers.remove(&key.writer).is_none() {
+            return Vec::new();
+        }
+        if writers.is_empty() {
+            self.streams.remove(&key.stream_id);
+        }
+        let mut changed = vec![key.stream_id];
+        if let Some((timeline, rank)) = self.unrank(key, &mut changed) {
+            changed.extend(self.place(timeline, rank));
         }
         changed.sort_unstable();
         changed.dedup();
@@ -265,6 +360,7 @@ impl StreamIndex {
         };
         let pos = self.position(key)?;
         Some(TurnStream {
+            key,
             stream_id: turn_stream_id(decl.timeline_id, pos),
             index: TurnIndex(pos),
             decl,
@@ -343,7 +439,9 @@ impl StreamIndex {
 mod tests {
     use super::*;
     use crate::persistence::content_hash::ContentHash;
-    use crate::persistence::streams::{ContentAddress, SectionDecl, TurnDecl};
+    use crate::persistence::manifest::RecordLoc;
+    use crate::persistence::segment::SegmentId;
+    use crate::persistence::streams::{ContentAddress, SectionDecl};
 
     const TL: u64 = 77;
 
@@ -616,20 +714,67 @@ mod tests {
         assert_eq!(index.iter_physical().count(), 2);
     }
 
-    /// Removing a stream id takes every writer's stream of it, and re-places
-    /// the turns of any timeline it held.
+    /// Removing one writer's stream re-places the turns of its timeline and
+    /// leaves the other writer's stream of the same id.
     #[test]
-    fn removing_a_stream_re_places_its_timeline() {
+    fn removing_a_writers_stream_re_places_its_timeline() {
         let mut index = StreamIndex::default();
         write(&mut index, 0, 5, 10, 100);
         write(&mut index, 1, 5, 11, 101);
         write(&mut index, 1, 9, 12, 901);
         assert_eq!(mark_at(&index, 2), Some(901));
-        let changed = index.remove(sid(1));
+        let changed = index.remove_writer(StreamKey {
+            stream_id: sid(1),
+            writer: 5,
+        });
         assert!(changed.contains(&sid(1)));
-        assert_eq!(order(&index), vec![(0, 0, 5)]);
-        assert_eq!(mark_at(&index, 1), None);
+        assert!(changed.contains(&sid(2)));
+        assert_eq!(order(&index), vec![(0, 0, 5), (1, 1, 9)]);
+        assert_eq!(mark_at(&index, 1), Some(901));
         assert_eq!(mark_at(&index, 2), None);
+    }
+
+    /// Pruning drops the values a predicate refuses, and the stream with them
+    /// once nothing is left; undeclaring keeps the values.
+    #[test]
+    fn pruning_and_undeclaring_a_stream() {
+        let mut index = StreamIndex::default();
+        let key = StreamKey {
+            stream_id: StreamId(4242),
+            writer: 5,
+        };
+        index.declare(key, section(), id(5, 20));
+        let rt = index.entry(key);
+        rt.committed_through = Some(3);
+        rt.ids.commit = RecordIdentity {
+            epoch: 20,
+            ..id(5, 21)
+        };
+        rt.tokens = Some(RecordLoc {
+            segment: SegmentId(1),
+            offset: 0,
+            payload_len: 8,
+            record_size: 4096,
+        });
+        rt.ids.tokens = RecordIdentity {
+            epoch: 7,
+            ..id(5, 8)
+        };
+        assert!(index.prune(key, |held| held.epoch >= 20));
+        let rt = index.physical(key).unwrap();
+        assert!(rt.tokens.is_none());
+        assert_eq!(rt.committed_through, Some(3));
+        assert!(
+            !index.prune(key, |held| held.epoch >= 20),
+            "nothing left to drop"
+        );
+        index.undeclare(key);
+        assert!(index.physical(key).unwrap().decl.is_none());
+        assert!(index.prune(key, |_| false));
+        assert!(
+            index.physical(key).is_none(),
+            "an empty stream is forgotten"
+        );
     }
 
     /// The logical view names each declared turn by its position.

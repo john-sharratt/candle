@@ -10,8 +10,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use candle_conversation::models::{Recent, StrataTokens};
+use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use clap::Args;
 use host::OneShot;
@@ -159,6 +161,13 @@ pub struct ZendArgs {
     #[arg(long)]
     pub summarize: bool,
 
+    /// How many days the substrate keeps a deleted conversation's tombstone
+    /// before a compaction may shrink it to a 24-byte entry in the deleted set
+    /// (`docs/replicated_substrate.md` §6.8). Only when the bytes are reclaimed
+    /// depends on it: the conversation stays deleted either way.
+    #[arg(long, value_name = "DAYS", default_value_t = DEFAULT_TOMBSTONE_RETENTION_DAYS)]
+    pub tombstone_retention: u64,
+
     /// The secrets file holding the API keys and tokens zend presents to
     /// third-party services (`tavily_api_key`, `github_token`). Defaults to
     /// `~/.zend/secrets.yaml`. A named file that does not exist fails the
@@ -186,10 +195,17 @@ impl Default for ZendArgs {
             qsa_recent: StrataTokens::DEFAULT.recent,
             qsa_recent_mode: StrataTokens::DEFAULT.mode,
             summarize: false,
+            tombstone_retention: DEFAULT_TOMBSTONE_RETENTION_DAYS,
             secrets: None,
         }
     }
 }
+
+/// `--tombstone-retention`'s default, in days: the substrate's own.
+const DEFAULT_TOMBSTONE_RETENTION_DAYS: u64 =
+    DEFAULT_TOMBSTONE_RETENTION.as_secs() / SECONDS_PER_DAY;
+
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// A `--qsa-recent-mode` value.
 fn parse_recent_mode(mode: &str) -> Result<Recent, String> {
@@ -309,6 +325,8 @@ impl ZendArgs {
         config.qsa_selection_budget = self.qsa_selection_budget;
         config.qsa_strata = self.qsa_strata();
         config.summarize = self.summarize;
+        config.tombstone_retention =
+            Duration::from_secs(self.tombstone_retention.saturating_mul(SECONDS_PER_DAY));
         let mut ui = default_ui();
         ui.content = self.ui;
         Ok(ZendTenant::new(config, ui))

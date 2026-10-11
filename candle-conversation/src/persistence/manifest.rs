@@ -239,6 +239,7 @@ impl Manifest {
             | RecordType::Snapshot
             | RecordType::BranchCheckpoint
             | RecordType::CustomObject
+            | RecordType::Deleted
             | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }
@@ -537,6 +538,7 @@ mod tests {
             &TombstonePayload {
                 timeline_id: 77,
                 turn_index: None,
+                turn_writer: 0,
                 reason: None,
             }
             .encode(),

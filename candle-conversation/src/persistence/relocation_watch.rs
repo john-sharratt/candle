@@ -45,7 +45,8 @@ use std::collections::{HashMap, HashSet};
 use super::identity::RecordIdentity;
 use super::manifest::decode_label_payload;
 use super::record::{
-    DebugIdPayload, DistillPayload, RecordHeader, RecordType, TreeMetadataPayload,
+    DebugIdPayload, DistillPayload, RecordHeader, RecordType, SectionTombstonePayload,
+    TreeMetadataPayload,
 };
 
 /// The identity under which one resident record replaces (or, for a label,
@@ -131,8 +132,10 @@ pub struct RelocationWatch {
     chunks: HashSet<(u64, u64, u64)>,
     /// `(stream_id, writer)` of every `Tokens` record appended.
     tokens: HashSet<(u64, u64)>,
-    /// Every section stream a `SectionTombstone` retired.
-    retired: HashSet<u64>,
+    /// `(stream_id, writer)` of every section stream a `SectionTombstone`
+    /// retired — the writer of the generation it ended, zero for one written
+    /// before generations.
+    retired: HashSet<(u64, u64)>,
     /// Every stream a `StreamDecl` was appended for.
     declared: HashSet<u64>,
     /// Every resident record written again, by key, in write order.
@@ -152,7 +155,11 @@ impl RelocationWatch {
                 self.tokens.insert((header.stream_id, header.origin));
             }
             RecordType::SectionTombstone => {
-                self.retired.insert(header.stream_id);
+                let writer = SectionTombstonePayload::decode(payload)
+                    .ok()
+                    .and_then(|p| p.generation)
+                    .map_or(0, |g| g.writer);
+                self.retired.insert((header.stream_id, writer));
             }
             RecordType::StreamDecl => {
                 self.declared.insert(header.stream_id);
@@ -171,22 +178,33 @@ impl RelocationWatch {
     /// Whether the planned copy of chunk `index` of `writer`'s `stream` is
     /// still the one to carry forward.
     pub fn keeps_chunk(&self, stream: u64, index: u64, writer: u64) -> bool {
-        !self.chunks.contains(&(stream, index, writer)) && !self.retired.contains(&stream)
+        !self.chunks.contains(&(stream, index, writer)) && !self.retired.contains(&(stream, writer))
     }
 
     /// Whether the planned copy of `writer`'s `stream`'s `Tokens` is still the
     /// one to carry forward.
     pub fn keeps_tokens(&self, stream: u64, writer: u64) -> bool {
-        !self.tokens.contains(&(stream, writer)) && !self.retired.contains(&stream)
+        !self.tokens.contains(&(stream, writer)) && !self.retired.contains(&(stream, writer))
     }
 
     /// What to do with a planned resident record of type `rt`, header stream
     /// `stream_id`, written by `writer`, carrying `payload`.
+    ///
+    /// A planned tombstone that names a generation is always carried: it ends
+    /// only that generation, so a section declared again since is untouched
+    /// by it. One written before generations ends whatever unstamped stream
+    /// stands at its place in the log, so it is not carried past a declaration
+    /// made since.
     pub fn reemit(&self, rt: RecordType, stream_id: u64, writer: u64, payload: &[u8]) -> Reemit {
-        if stream_keyed(rt) && self.retired.contains(&stream_id) {
+        if stream_keyed(rt) && self.retired.contains(&(stream_id, writer)) {
             return Reemit::Skip;
         }
-        if rt == RecordType::SectionTombstone && self.declared.contains(&stream_id) {
+        if rt == RecordType::SectionTombstone
+            && self.declared.contains(&stream_id)
+            && SectionTombstonePayload::decode(payload)
+                .ok()
+                .is_some_and(|p| p.generation.is_none())
+        {
             return Reemit::Skip;
         }
         // The planned copy is only decoded when something could have been
@@ -207,7 +225,7 @@ mod tests {
 
     use super::*;
     use crate::persistence::manifest::encode_label_payload;
-    use crate::persistence::record::TombstonePayload;
+    use crate::persistence::record::{SectionGeneration, TombstonePayload};
 
     /// A header stamped with identity `oseq` of origin 9, so a test can tell
     /// which write a carried copy took its identity from.
@@ -323,34 +341,70 @@ mod tests {
         );
     }
 
+    fn section_tombstone(generation: Option<SectionGeneration>) -> Vec<u8> {
+        SectionTombstonePayload {
+            generation,
+            reason: None,
+        }
+        .encode()
+    }
+
     /// A retired section carries none of its old generation past the
-    /// tombstone — every writer's chunks, tokens, and stream-keyed metadata.
+    /// tombstone — its writer's chunks, tokens, and stream-keyed metadata —
+    /// and leaves another writer's stream of the same section to carry.
     #[test]
     fn a_retired_section_drops_its_whole_old_generation() {
         let mut w = RelocationWatch::default();
-        w.record(&header(RecordType::SectionTombstone, 40, 0), &[]);
-        assert!(!w.keeps_chunk(40, 0, 0));
+        let ends = section_tombstone(Some(SectionGeneration { writer: 4, oseq: 3 }));
+        w.record(&header(RecordType::SectionTombstone, 40, 0), &ends);
+        assert!(!w.keeps_chunk(40, 0, 4));
         assert!(!w.keeps_chunk(40, 9, 4));
-        assert!(!w.keeps_tokens(40, 0));
-        assert_eq!(w.reemit(RecordType::StreamDecl, 40, 0, &[]), Reemit::Skip);
+        assert!(!w.keeps_tokens(40, 4));
+        assert_eq!(w.reemit(RecordType::StreamDecl, 40, 4, &[]), Reemit::Skip);
         assert_eq!(w.reemit(RecordType::WideQSig, 40, 4, &[]), Reemit::Skip);
-        assert!(w.keeps_chunk(41, 0, 0));
-        assert!(w.keeps_tokens(41, 0));
-        assert_eq!(w.reemit(RecordType::StreamDecl, 41, 0, &[]), Reemit::Carry);
+        assert!(w.keeps_chunk(40, 0, 6), "another writer's stream");
+        assert!(w.keeps_tokens(40, 6));
+        assert!(w.keeps_chunk(41, 0, 4));
+        assert!(w.keeps_tokens(41, 4));
+        assert_eq!(w.reemit(RecordType::StreamDecl, 41, 4, &[]), Reemit::Carry);
+        // A tombstone written before generations retires the unstamped stream.
+        w.record(
+            &header(RecordType::SectionTombstone, 42, 0),
+            &section_tombstone(None),
+        );
+        assert!(!w.keeps_chunk(42, 0, 0));
+        assert!(w.keeps_chunk(42, 0, 4));
     }
 
     /// A section declared again since the plan has started its next
-    /// generation; the planned tombstone must not retire it a second time.
+    /// generation: a planned tombstone written before generations must not
+    /// retire it a second time, and one that names the generation it ended
+    /// cannot, so it is carried.
     #[test]
     fn a_revived_section_keeps_no_planned_tombstone() {
         let mut w = RelocationWatch::default();
         w.record(&header(RecordType::StreamDecl, 40, 0), b"decl");
         assert_eq!(
-            w.reemit(RecordType::SectionTombstone, 40, 0, &[]),
+            w.reemit(
+                RecordType::SectionTombstone,
+                40,
+                0,
+                &section_tombstone(None)
+            ),
             Reemit::Skip
         );
+        let named = section_tombstone(Some(SectionGeneration { writer: 4, oseq: 3 }));
         assert_eq!(
-            w.reemit(RecordType::SectionTombstone, 41, 0, &[]),
+            w.reemit(RecordType::SectionTombstone, 40, 0, &named),
+            Reemit::Carry
+        );
+        assert_eq!(
+            w.reemit(
+                RecordType::SectionTombstone,
+                41,
+                0,
+                &section_tombstone(None)
+            ),
             Reemit::Carry
         );
     }
@@ -421,6 +475,7 @@ mod tests {
         let tomb = TombstonePayload {
             timeline_id: 5,
             turn_index: None,
+            turn_writer: 0,
             reason: None,
         }
         .encode();

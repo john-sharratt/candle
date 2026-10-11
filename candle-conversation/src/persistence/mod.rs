@@ -32,7 +32,10 @@ pub mod chunk_window_integrity;
 pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
+pub mod deleted;
 pub mod elevate;
+#[cfg(test)]
+mod expiry_tests;
 pub mod flush;
 pub mod header_index;
 mod held_groups;
@@ -59,6 +62,7 @@ pub mod streams;
 mod stripes;
 pub mod survival;
 pub mod thread;
+pub mod tombstone_expiry;
 pub mod transfer;
 pub mod triggers;
 pub mod vfs;
@@ -68,10 +72,11 @@ pub mod writer_lock;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::substrate::Substrate;
+use crate::substrate::{Substrate, TurnMark};
 
 use accounting::RecordAccounting;
 use appended::Appended;
@@ -80,7 +85,8 @@ use chunk_plan::ChunkedReadPlan;
 use content_hash::snapshot_stream_id;
 use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use identity::{
-    load_or_mint, read_node, MarkerIds, Minter, NodeSource, Origination, RecordIdentity, Stamped,
+    load_or_mint, now_ms, read_node, MarkerIds, Minter, NodeSource, Origination, OwnSections,
+    RecordIdentity, Stamped,
 };
 use inherit::InheritedSubstrate;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
@@ -89,8 +95,8 @@ pub use model_binding::{BoundSubstrate, ModelBinding};
 pub use priority_lock::PersistenceLock;
 use record::{
     decode_header, decode_record, encode_record_written, ChunkPayload, CustomObjectPayload,
-    DebugIdPayload, NpcPayload, RecordHeader, RecordType, SectionTombstonePayload,
-    TombstonePayload, TreeMetadataPayload,
+    DebugIdPayload, NpcPayload, RecordHeader, RecordType, SectionGeneration,
+    SectionTombstonePayload, TombstonePayload, TreeMetadataPayload,
 };
 use relocation_watch::RelocationWatch;
 use sealed_reader::SealedReader;
@@ -99,6 +105,7 @@ use segmented_log::SegmentedLog;
 use stamped_locs::StampedLocs;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use survival::RecordCensus;
+use tombstone_expiry::{TombstoneExpiry, DEFAULT_TOMBSTONE_RETENTION};
 use vfs::VfsIndex;
 use walker::WalkEntry;
 use writer_lock::WriterLock;
@@ -475,6 +482,9 @@ pub struct SubstratePersistence {
     /// The identity of each marker record a rewrite writes back — see
     /// [`MarkerIds`]. Built by the open walk and kept by every append.
     marker_ids: MarkerIds,
+    /// How long a timeline tombstone is kept before a compaction may shrink it
+    /// to its deleted-set entry (`--tombstone-retention`, §6.8).
+    tombstone_retention: Duration,
 }
 
 /// What [`SubstratePersistence::metadata_locs`] keys a record by: its type, the
@@ -488,7 +498,7 @@ pub(crate) type MetadataKey = (RecordType, u64, u64);
 /// The [`MetadataKey`] of a record with header `h`.
 fn metadata_key(h: &RecordHeader) -> MetadataKey {
     let writer = match h.record_type {
-        RecordType::CustomObject => 0,
+        RecordType::CustomObject | RecordType::Deleted => 0,
         _ => h.origin,
     };
     (h.record_type, h.stream_id, writer)
@@ -511,6 +521,7 @@ fn is_tracked_metadata(rt: RecordType) -> bool {
             | RecordType::TurnIndexPage
             | RecordType::Commit
             | RecordType::CustomObject
+            | RecordType::Deleted
     )
 }
 
@@ -796,6 +807,7 @@ impl SubstratePersistence {
             (node, Some(source))
         };
         let mut origination = Origination::new(node);
+        let mut own_sections = OwnSections::default();
         let mut marker_ids = MarkerIds::new();
         let mut inherited_subs = Vec::with_capacity(inherited.len());
         for path in inherited {
@@ -817,13 +829,14 @@ impl SubstratePersistence {
         let mut walk = |entry: &WalkEntry| {
             let h = &entry.record.header;
             origination.observe(&h.identity());
+            own_sections.observe(node, h, &entry.record.payload);
             marker_ids.record(
                 h.record_type,
                 h.stream_id,
                 &entry.record.payload,
                 h.identity(),
             );
-            accounting.record(&entry.record.header, entry.size);
+            accounting.record(&entry.record.header, &entry.record.payload, entry.size);
             census.record(entry.record.header.record_type);
             record_metadata_loc(&mut metadata_locs, entry);
             record_resident_loc(&mut resident_locs, entry);
@@ -899,9 +912,10 @@ impl SubstratePersistence {
             vfs_index,
             open_census: census,
             writer_lock,
-            minter: Minter::new(origination),
+            minter: Minter::with_sections(origination, own_sections.live()),
             node_source,
             marker_ids,
+            tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -955,9 +969,23 @@ impl SubstratePersistence {
         self.minter.mint(0)
     }
 
+    /// The identity of the next record of type `rt` this substrate writes
+    /// under stream `stream_id` — carrying the section's generation when the
+    /// stream is a section this node is writing ([`Minter::mint_for`]).
+    pub fn mint_for(&self, rt: RecordType, stream_id: StreamId) -> RecordIdentity {
+        self.minter.mint_for(rt, stream_id.0)
+    }
+
     /// The identity of each marker record a rewrite writes back.
     pub fn marker_ids(&self) -> &MarkerIds {
         &self.marker_ids
+    }
+
+    /// How long a timeline tombstone is kept before a compaction may shrink it
+    /// to its deleted-set entry — the member's `--tombstone-retention`. Only
+    /// when its bytes are reclaimed depends on it; the timeline stays dead.
+    pub fn set_tombstone_retention(&mut self, retention: Duration) {
+        self.tombstone_retention = retention;
     }
 
     /// The logical end of what is written to the active segment — synced only
@@ -1055,7 +1083,7 @@ impl SubstratePersistence {
         let identity = if record_type == RecordType::HeaderIndex {
             RecordIdentity::NONE
         } else {
-            self.minter.mint(0)
+            self.minter.mint_for(record_type, stream_id)
         };
         self.append_carried(
             record_type,
@@ -1205,7 +1233,7 @@ impl SubstratePersistence {
         if let Some(watch) = self.relocation_watch.as_mut() {
             watch.record(&header, payload);
         }
-        self.accounting.record(&header, size);
+        self.accounting.record(&header, payload, size);
         self.track_metadata_loc(&header, segment, offset, size);
         self.track_resident_loc(&header, payload, segment, offset, size);
         self.marker_ids.record(
@@ -1259,7 +1287,9 @@ impl SubstratePersistence {
         let header = &header;
         let (segment, offset) = self.segments.stage(raw);
         let size = raw.len() as u64;
-        self.accounting.record(header, size);
+        // Maintenance relocates verbatim only records the accounting keys by
+        // header alone — never a section tombstone, which it re-emits.
+        self.accounting.record(header, &[], size);
         // A relocated `Snapshot` becomes the stream's current on-disk tail —
         // the persistence-side map must follow it, or the next maintenance
         // pass would mis-read the relocated (live) copy as superseded and skip
@@ -1339,11 +1369,16 @@ impl SubstratePersistence {
     }
 
     /// Declare a stream — append its `StreamDecl` record. Returns the
-    /// stream's derived id and the identity the record was written with.
+    /// stream's derived id and the identity the record was written with. A
+    /// section's declaration starts its generation, which every record this
+    /// node writes for the section from here on carries.
     pub fn declare_stream(&mut self, decl: &StreamDecl) -> Result<Stamped<StreamId>> {
         let stream = decl.stream_id();
         let at =
             self.append_record(RecordType::StreamDecl, 0, stream.0, 0, 0, 0, &decl.encode())?;
+        if matches!(decl, StreamDecl::PromptSection(_)) {
+            self.minter.start_section(stream.0, at.identity.oseq);
+        }
         Ok(Stamped {
             value: stream,
             id: at.identity,
@@ -1684,6 +1719,7 @@ impl SubstratePersistence {
         let payload = TombstonePayload {
             timeline_id,
             turn_index: None,
+            turn_writer: 0,
             reason: reason.map(str::to_string),
         };
         let bytes = payload.encode();
@@ -1701,19 +1737,17 @@ impl SubstratePersistence {
         Ok(())
     }
 
-    /// Append a **turn-scoped** tombstone — kill only `(timeline_id, turn_index)`,
+    /// Append a **turn-scoped** tombstone — kill only the turn `mark` names,
     /// leaving the rest of the timeline live. Used by the per-layer `drop_turn`
     /// corrupt-turn policy so one unrecoverable turn (e.g. a partial write) does
-    /// not drop its whole conversation the way a timeline tombstone would.
-    pub fn write_turn_tombstone(
-        &mut self,
-        timeline_id: u64,
-        turn_index: u32,
-        reason: Option<&str>,
-    ) -> Result<()> {
+    /// not drop its whole conversation the way a timeline tombstone would, and
+    /// by retention. The mark names the turn as its writer wrote it
+    /// ([`Substrate::tombstone_turn`] returns it).
+    pub fn write_turn_tombstone(&mut self, mark: TurnMark, reason: Option<&str>) -> Result<()> {
         let payload = TombstonePayload {
-            timeline_id,
-            turn_index: Some(turn_index),
+            timeline_id: mark.timeline.raw(),
+            turn_index: Some(mark.turn_index),
+            turn_writer: mark.writer,
             reason: reason.map(str::to_string),
         };
         let bytes = payload.encode();
@@ -1727,14 +1761,29 @@ impl SubstratePersistence {
     /// which reads as "not persisted" on the next ingest triage, so the
     /// section re-prefills fresh instead of restoring the tombstoned chunks.
     /// Idempotent — duplicate tombstones for the same stream replay into the
-    /// same set. `reason` is a diagnostic note (the confirmed divergence
-    /// detail); pass `None` when there is nothing more to say than "gone".
-    pub fn write_section_tombstone(&mut self, stream_id: u64, reason: Option<&str>) -> Result<()> {
+    /// same set. `generation` is the one it ends
+    /// ([`Substrate::tombstone_section`] returns it); `None` ends the
+    /// unstamped stream. `reason` is a diagnostic note (the confirmed
+    /// divergence detail); pass `None` when there is nothing more to say than
+    /// "gone". A generation this node was writing stops being stamped on its
+    /// records.
+    pub fn write_section_tombstone(
+        &mut self,
+        stream_id: u64,
+        generation: Option<SectionGeneration>,
+        reason: Option<&str>,
+    ) -> Result<()> {
         let payload = SectionTombstonePayload {
+            generation,
             reason: reason.map(str::to_string),
         };
         let bytes = payload.encode();
         self.append_record(RecordType::SectionTombstone, 0, stream_id, 0, 0, 0, &bytes)?;
+        if let Some(g) = generation {
+            if g.writer == self.node() {
+                self.minter.end_section(stream_id, g.oseq);
+            }
+        }
         Ok(())
     }
 
@@ -2401,6 +2450,10 @@ impl SubstratePersistence {
             &self.vfs_index,
             &self.marker_ids,
             self.node(),
+            TombstoneExpiry {
+                now_ms: now_ms(),
+                retention: self.tombstone_retention,
+            },
         );
         // What this compaction is carrying forward, by type, against what the
         // store held when it opened. A class present at open and absent here is
@@ -2539,7 +2592,7 @@ impl SubstratePersistence {
                 &entry.record.payload,
                 h.identity(),
             );
-            accounting.record(&entry.record.header, entry.size);
+            accounting.record(&entry.record.header, &entry.record.payload, entry.size);
             record_metadata_loc(metadata_locs, entry);
             record_resident_loc(resident_locs, entry);
             record_snapshot_loc(snapshot_locs, entry);
