@@ -120,44 +120,19 @@ pub enum Origin {
     Lodged { by: String },
     /// A routine drawn from the bank when nothing was lodged (`routine` names it).
     Random { routine: String },
-    /// Written by the command table for one stage of an operation (`generator`
-    /// names which of the configured generators found the work, `target` the
-    /// piece of the corpus it is about, `operation` the operation it belongs to)
-    /// — see `engine::mission_gen` and `sim::operations`.
+    /// Written by the command table for one step of an operation's workflow
+    /// (`generator` names which of the configured generators found the work,
+    /// `target` the piece of the corpus it is about, `operation` the operation
+    /// it belongs to, `step` the workflow step it carries) — see
+    /// `engine::mission_gen`, `engine::workflow` and `sim::operations`.
     Generated {
         generator: String,
         target: String,
         #[serde(default)]
         operation: u64,
         #[serde(default)]
-        stage: Stage,
+        step: String,
     },
-}
-
-/// Which stage of an operation a generated mission is.
-///
-/// **Work is checked by somebody other than whoever did it.** The draft is
-/// written by one Maker; the review is carried by another, who may mend what is
-/// wrong in it and pass the operation, or reject it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Stage {
-    /// Write the document the operation is for.
-    #[default]
-    Draft,
-    /// Read what the draft wrote, mend it, and pass or reject it.
-    Review,
-    /// Check the reviewed document against the main storyline, and accept,
-    /// mend or reject it.
-    Canon,
-}
-
-impl Stage {
-    /// Whether this stage ends in a verdict on somebody else's work — passed
-    /// or rejected — rather than in work of its own.
-    pub fn judges(self) -> bool {
-        matches!(self, Stage::Review | Stage::Canon)
-    }
 }
 
 /// The documents a mission is about: the one it is to produce or change, and the
@@ -187,6 +162,15 @@ pub struct Work {
     /// shown the failed text — see `engine::compose`.
     #[serde(default)]
     pub anew: bool,
+    /// The checks the document is held to before the mission may be reported
+    /// done — the names in its workflow step's `checks` (see
+    /// `mission_gen::gates::CHECKS`).
+    #[serde(default)]
+    pub checks: Vec<String>,
+    /// The acts its workflow step adds to the Maker's own — `report_rejected`
+    /// for a step that may send the work back.
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 /// What a character's system prompt carries of its mission: the section text and
@@ -254,15 +238,23 @@ impl Mission {
         self
     }
 
-    /// The operation this mission is a stage of, and which stage — `None` for a
-    /// mission that is not the table's.
-    pub fn operation(&self) -> Option<(u64, Stage)> {
+    /// The operation this mission carries a step of, and which step — `None`
+    /// for a mission that is not the table's.
+    pub fn operation(&self) -> Option<(u64, &str)> {
         match &self.origin {
             Origin::Generated {
-                operation, stage, ..
-            } => Some((*operation, *stage)),
+                operation, step, ..
+            } => Some((*operation, step.as_str())),
             _ => None,
         }
+    }
+
+    /// Whether this mission's step may send the work back with
+    /// `report_rejected`.
+    pub fn may_reject(&self) -> bool {
+        self.work
+            .as_ref()
+            .is_some_and(|w| w.tools.iter().any(|t| t == "report_rejected"))
     }
 
     /// Sign off every open step that reads `path`, because the body just read
@@ -281,6 +273,36 @@ impl Mission {
             }
         }
         ticked
+    }
+
+    /// Strike every open step that reads a document `holds` says the record no
+    /// longer has, and drop it from the documents the mission reads. Returns the
+    /// paths struck, as the steps spelled them.
+    ///
+    /// **A read of nothing is not a step.** A failed draft is moved out of the
+    /// record, and missions written while it stood still listed it to read: two
+    /// Makers were sent to a desk to read a page that was gone, were told there
+    /// was no document there, and were sent back to read it — forty minutes of
+    /// "I am done" and no story, the step the engine signs off on a read the
+    /// one step nothing could ever sign off.
+    pub fn strike_gone_reads(&mut self, holds: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let gone: Vec<String> = self
+            .todo
+            .iter()
+            .filter(|t| !t.done && !t.reports)
+            .filter_map(|t| raw_doc_after(&t.text, "read "))
+            .filter(|p| !holds(p))
+            .collect();
+        if gone.is_empty() {
+            return gone;
+        }
+        let plain: Vec<String> = gone.iter().map(|p| plain_path(p)).collect();
+        self.todo
+            .retain(|t| t.done || reading_doc(&t.text).is_none_or(|p| !plain.contains(&p)));
+        if let Some(work) = &mut self.work {
+            work.reads.retain(|r| !plain.contains(&plain_path(r)));
+        }
+        gone
     }
 
     /// Whether the mission's document has been committed while it was carried
@@ -863,18 +885,16 @@ fn doc_compass_unwritten(doc: &DocStep, at: &DeskVerbs, way: Option<&str>) -> St
             )
         }
         (doc, _) => {
-            let (verb, p) = match doc {
-                DocStep::Read(p) => ("read", p),
-                DocStep::Write(p) => ("write", p),
+            let (verb, p, desk) = match doc {
+                DocStep::Read(p) => ("read", p, "Documents are read at a desk"),
+                DocStep::Write(p) => ("write", p, "A piece is written at a writing desk"),
             };
             match way {
-                Some(way) => format!(
-                    "Your mission, next: {verb} {p}. Documents are read and written at a desk: \
-                     the nearest is in {way}."
-                ),
+                Some(way) => {
+                    format!("Your mission, next: {verb} {p}. {desk}: the nearest is in {way}.")
+                }
                 None => format!(
-                    "Your mission, next: {verb} {p}. Documents are read and written at a desk; \
-                     at one, `scan` shows its address."
+                    "Your mission, next: {verb} {p}. {desk}; at one, `scan` shows its address."
                 ),
             }
         }
@@ -1418,7 +1438,7 @@ pub mod bank {
 #[cfg(test)]
 mod tests {
     use super::bank::{random, Duty, Facts, ROUTINES};
-    use super::{Mission, Origin, Outcome, Stage, StepOutcome, Todo, Work};
+    use super::{Mission, Origin, Outcome, StepOutcome, Todo, Work};
 
     fn makers() -> Vec<String> {
         vec!["Wren".to_string(), "Pax".to_string(), "Soren".to_string()]
@@ -1484,7 +1504,7 @@ mod tests {
                 generator: "life-event".into(),
                 target: "life:keeper".into(),
                 operation: 1,
-                stage: Stage::Draft,
+                step: "write".into(),
             },
         )
         .with_work(Work {
@@ -1493,6 +1513,8 @@ mod tests {
             min_words: 250,
             edit_optional: false,
             anew: false,
+            checks: Vec::new(),
+            tools: Vec::new(),
         })
     }
 
@@ -1627,8 +1649,25 @@ mod tests {
                 Some("band one, on the story level: `move_to` the lift"),
                 None
             ),
-            "Your mission, next: read layers/eras/x.md. Documents are read and written at a desk: \
-             the nearest is in band one, on the story level: `move_to` the lift."
+            "Your mission, next: read layers/eras/x.md. Documents are read at a desk: the nearest \
+             is in band one, on the story level: `move_to` the lift."
+        );
+        // A terminal that reads but does not compose is not where a piece is
+        // written: the way goes to a writing desk.
+        let reads_only = DeskVerbs {
+            read: Some("http://local/chronicle/t/file_read".into()),
+            commit: Some("http://local/chronicle/t/bench_commit".into()),
+            ..DeskVerbs::default()
+        };
+        assert_eq!(
+            doc_compass(
+                &DocStep::Write("layers/stories/y.md".into()),
+                &reads_only,
+                Some("band one, on the story level: `move_to` the lift"),
+                None
+            ),
+            "Your mission, next: write layers/stories/y.md. A piece is written at a writing \
+             desk: the nearest is in band one, on the story level: `move_to` the lift."
         );
     }
 
@@ -1835,6 +1874,70 @@ mod tests {
                 "go back to the table and report your verdict"
             ]
         );
+    }
+
+    /// **A read of a document the record no longer holds is struck**, step and
+    /// listed read both; one already done, and every other step, stays.
+    #[test]
+    fn a_read_of_a_document_gone_from_the_record_is_struck() {
+        use super::{Mission, Origin, Todo, Work};
+        let gone = "layers/stories/the-anchor-s-last-breath.md";
+        let kept = "layers/eras/the-portal-retreat.md";
+        let writes = "layers/stories/the-first-breach.md";
+        let mut m = Mission::new(
+            "write it",
+            vec![
+                Todo::new("go to the first writing room on the story level"),
+                Todo::new(format!("read {kept}")),
+                Todo::new(format!("read {gone}")),
+                Todo::new(format!("write {writes} and commit it")),
+                Todo::report("go back to the table and report it"),
+            ],
+            Origin::Random {
+                routine: "r".into(),
+            },
+        )
+        .with_work(Work {
+            writes: writes.into(),
+            reads: vec![
+                kept.into(),
+                "Layers/Stories/The-Anchor-S-Last-Breath.md".into(),
+            ],
+            min_words: 0,
+            edit_optional: false,
+            anew: false,
+            checks: Vec::new(),
+            tools: Vec::new(),
+        });
+        let holds = |p: &str| p != gone;
+        assert_eq!(m.strike_gone_reads(&holds), [gone]);
+        let steps: Vec<&str> = m.todo.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(
+            steps,
+            [
+                "go to the first writing room on the story level",
+                "read layers/eras/the-portal-retreat.md",
+                "write layers/stories/the-first-breach.md and commit it",
+                "go back to the table and report it"
+            ]
+        );
+        assert_eq!(m.work.as_ref().unwrap().reads, [kept]);
+        assert!(
+            m.strike_gone_reads(&holds).is_empty(),
+            "nothing left to strike"
+        );
+
+        // A read already made stays on the list as done: it happened.
+        let mut read = Mission::new(
+            "check it",
+            vec![Todo::new(format!("read {gone}")), Todo::report("report")],
+            Origin::Random {
+                routine: "r".into(),
+            },
+        );
+        read.read_doc(gone);
+        assert!(read.strike_gone_reads(&holds).is_empty());
+        assert_eq!(read.todo.len(), 2);
     }
 
     #[test]

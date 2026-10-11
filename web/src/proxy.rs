@@ -11,30 +11,15 @@
 //!     is released when it expires.
 
 use std::net::IpAddr;
-use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::response::Response;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 
 use crate::errors::{self, Problem};
 use crate::health::{Gate, Health};
-
-pub type HttpClient = Client<HttpConnector, Body>;
-
-pub fn client(connect_timeout: Duration) -> HttpClient {
-    let mut connector = HttpConnector::new();
-    connector.set_nodelay(true); // SSE frames must not wait on Nagle
-    connector.set_connect_timeout(Some(connect_timeout));
-    connector.enforce_http(false);
-    Client::builder(TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(30))
-        .build(connector)
-}
+use crate::upstream_tls::HttpClient;
 
 /// Hop-by-hop headers belong to one connection and are never forwarded
 /// (RFC 9110 §7.6.1). `Upgrade` is handled explicitly rather than stripped —
@@ -281,6 +266,12 @@ pub async fn forward(f: Forward<'_>, req: Request) -> Response {
     for h in HOP_BY_HOP {
         out.headers_mut().remove(&h);
     }
+    // An upstream's `Alt-Svc` names *its* ports — zend on its TLS entrance
+    // advertises HTTP/3 on 8444, a private port. Passed through, a browser
+    // would try QUIC there on the public name and mark HTTP/3 broken for it.
+    // What the gateway offers is the gateway's to say: its own TLS entrance
+    // sets the header on the way out.
+    out.headers_mut().remove(header::ALT_SVC);
     if upgraded {
         // `Connection` is hop-by-hop and was just stripped with the rest — but
         // on a 101 it is the header that makes the handshake valid, and a

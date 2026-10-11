@@ -129,6 +129,40 @@ pub struct Server {
     /// that never gets its first byte has to give up eventually.
     #[serde(default = "d_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+    /// The TLS entrance, beside the plain one at [`bind`](Self::bind): HTTP/3
+    /// over QUIC, and HTTP/2 or HTTP/1.1 over TCP for a client that cannot reach
+    /// UDP, with certificates from Let's Encrypt. See [`crate::tls`] and
+    /// [`crate::acme`].
+    ///
+    /// Normally supplied by [`tls_file`](Self::tls_file), under the same rule
+    /// as [`Config::auth_file`]: the file absent means no TLS entrance, so this
+    /// table stays identical on a machine that should not bind 443 or ask a CA
+    /// for anything; present but unparseable is a hard failure.
+    #[serde(default)]
+    pub tls: Option<Tls>,
+    /// A file to read [`tls`](Self::tls) from, resolved against this config.
+    #[serde(default)]
+    pub tls_file: Option<PathBuf>,
+}
+
+/// Where the TLS entrance listens, and where its certificates come from.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Tls {
+    /// TCP and UDP both, on the same port. `Alt-Svc` advertises HTTP/3 on the
+    /// port the TCP answer came from, so the two cannot differ.
+    pub bind: SocketAddr,
+    pub acme: Acme,
+}
+
+/// Certificates from Let's Encrypt, for every public name the site table
+/// serves.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Acme {
+    /// Where the account, the certificates and the issuance ledger live,
+    /// resolved against the config.
+    pub store: PathBuf,
 }
 
 fn d_bind() -> SocketAddr {
@@ -195,6 +229,8 @@ impl Default for Server {
             cache: Cache::default(),
             backoff: Backoff::default(),
             connect_timeout_ms: d_connect_timeout_ms(),
+            tls: None,
+            tls_file: None,
         }
     }
 }
@@ -311,6 +347,15 @@ pub struct Route {
     pub upstream: Upstream,
     #[serde(default)]
     pub rewrite_host: bool,
+    /// The `https://` upstream presents a certificate it made for itself at
+    /// startup ([`crate::tls::self_signed`]), so the proxy accepts it without a
+    /// CA. The handshake still has to prove the upstream holds the key; what is
+    /// given up is knowing *which* key, so this is for a daemon on the private
+    /// network the gateway already trusts with its identity headers, never for
+    /// a host across the internet. An `https://` upstream without it is
+    /// verified against the Mozilla roots built into the binary.
+    #[serde(default)]
+    pub self_signed: bool,
 }
 
 /// Where a prefix is answered.
@@ -446,6 +491,44 @@ impl Config {
         Ok(())
     }
 
+    /// Fold `tls_file` into [`Server::tls`] and resolve the ACME store against
+    /// the config. Absent file, no TLS entrance; present and broken, a hard
+    /// failure — the rule [`load_auth_file`](Self::load_auth_file) follows.
+    fn resolve_tls(&mut self, base: &Path) -> Result<()> {
+        if let Some(rel) = self.server.tls_file.clone() {
+            if self.server.tls.is_some() {
+                bail!("both `tls:` and `tls_file:` are set; use one");
+            }
+            let path = if rel.is_absolute() {
+                rel
+            } else {
+                base.join(rel)
+            };
+            self.server.tls_file = Some(path.clone());
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    self.server.tls = Some(
+                        serde_yaml::from_str(&text)
+                            .with_context(|| format!("parsing {}", path.display()))?,
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::info!(
+                        "tls: no {} — running without the TLS entrance",
+                        path.display()
+                    );
+                }
+                Err(e) => bail!("reading {}: {e}", path.display()),
+            }
+        }
+        if let Some(tls) = &mut self.server.tls {
+            if tls.acme.store.is_relative() {
+                tls.acme.store = base.join(&tls.acme.store);
+            }
+        }
+        Ok(())
+    }
+
     fn finish(&mut self) -> Result<()> {
         if self.sites.is_empty() {
             bail!("no sites declared — nothing to serve");
@@ -459,6 +542,7 @@ impl Config {
         let base = self.base.clone();
 
         self.load_auth_file(&base)?;
+        self.resolve_tls(&base)?;
 
         // Secret paths resolve against the config file, exactly like `roots`
         // and `papers`. Read as given they would follow the working directory
@@ -521,6 +605,15 @@ impl Config {
                             site.name
                         );
                     }
+                }
+                // Said, not ignored: on anything but an https upstream there is
+                // no certificate for the flag to describe.
+                if r.self_signed && !r.upstream.url().is_some_and(|u| u.starts_with("https://")) {
+                    bail!(
+                        "site `{}`: `self_signed` on `{}` needs an https:// upstream",
+                        site.name,
+                        r.prefix
+                    );
                 }
             }
             // A site with no roots is a pure gateway — legal, and how a proxy
@@ -649,6 +742,19 @@ sites:
     }
 
     #[test]
+    fn self_signed_belongs_to_an_https_upstream_only() {
+        let ok = "sites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"https://10.0.0.5:8444\", self_signed: true}\n";
+        let c = Config::from_yaml(ok, Path::new(".")).expect("valid");
+        assert!(c.sites[0].api[0].self_signed);
+        for bad in [
+            "sites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"http://10.0.0.5:8081\", self_signed: true}\n",
+            "sites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: local, self_signed: true}\n",
+        ] {
+            assert!(Config::from_yaml(bad, Path::new(".")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn two_defaults_is_an_error() {
         let y = "sites:\n  - {name: a, roots: ['.'], default: true}\n  - {name: b, roots: ['.'], default: true}\n";
         assert!(Config::from_yaml(y, Path::new(".")).is_err());
@@ -772,6 +878,62 @@ google:
             YAML.trim_start_matches('\n')
         );
         assert!(Config::from_yaml(&y, &dir).is_err());
+    }
+
+    // ── tls ─────────────────────────────────────────────────────────────────
+
+    fn with_tls_file(dir: &Path, body: Option<&str>) -> Result<Config> {
+        if let Some(b) = body {
+            std::fs::create_dir_all(dir.join("secrets")).unwrap();
+            std::fs::write(dir.join("secrets").join("tls.yaml"), b).unwrap();
+        }
+        let y = format!(
+            "server:\n  bind: \"0.0.0.0:80\"\n  tls_file: \"secrets/tls.yaml\"\n{}",
+            YAML.trim_start_matches('\n')
+                .lines()
+                .skip(2)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        Config::from_yaml(&y, dir)
+    }
+
+    const TLS: &str = "bind: \"0.0.0.0:443\"\nacme:\n  store: \"secrets/acme\"\n";
+
+    /// A TLS file opens the entrance, its store resolved against the config
+    /// like every other path in the table.
+    #[test]
+    fn a_tls_file_opens_the_tls_entrance() {
+        let dir = tmpdir();
+        let c = with_tls_file(&dir, Some(TLS)).expect("valid");
+        let tls = c.server.tls.expect("the TLS entrance is configured");
+        assert_eq!(tls.bind.port(), 443);
+        assert_eq!(tls.acme.store, dir.join("secrets").join("acme"));
+        assert_eq!(c.server.bind.port(), 80, "the plain entrance is untouched");
+    }
+
+    /// No file: no TLS entrance, and the plain one still serves — the meaning
+    /// an absent auth file has, so one table runs everywhere.
+    #[test]
+    fn no_tls_file_means_no_tls_entrance_rather_than_a_failure() {
+        let c = with_tls_file(&tmpdir(), None).expect("an absent file is not an error");
+        assert!(c.server.tls.is_none());
+    }
+
+    /// Present and wrong is a deployment that meant to have TLS: refused — a
+    /// field nothing reads included, so a leftover setting cannot look live.
+    #[test]
+    fn a_broken_tls_file_is_a_hard_failure() {
+        for bad in [
+            "bind: \"0.0.0.0:443\"\n",
+            "bind: \"0.0.0.0:443\"\nacme:\n  store: s\n  typo: 1\n",
+            "bind: \"0.0.0.0:443\"\nacme:\n  directory: staging\n  store: s\n",
+        ] {
+            assert!(
+                with_tls_file(&tmpdir(), Some(bad)).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
     }
 
     /// The shipped table names an auth file and does not carry the block, so

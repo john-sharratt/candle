@@ -3359,8 +3359,7 @@ mod tests {
                 ("/v1/pulse/operations", "admin"),
                 ("/v1/pulse/operations/:wid/:oid", "admin"),
                 ("/v1/pulse/operations/:wid/:oid/cancel", "admin"),
-                ("/v1/pulse/operations/:wid/:oid/read-again", "admin"),
-                ("/v1/pulse/operations/:wid/:oid/check", "admin"),
+                ("/v1/pulse/operations/:wid/:oid/step", "admin"),
                 ("/v1/pulse/operations/:wid/:oid/document", "admin"),
                 // Generation on the resident model, over the caller's own cast.
                 ("/v1/generate/description", "user"),

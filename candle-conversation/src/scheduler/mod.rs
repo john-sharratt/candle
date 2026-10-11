@@ -55,6 +55,7 @@ pub mod relief_trace;
 mod run;
 mod sample;
 mod seal_scan;
+mod segment_rearm;
 mod settle;
 mod spec_chooser;
 #[cfg(test)]
@@ -70,6 +71,7 @@ use crate::config::{DecodeHealthConfig, SamplingConfig};
 use crate::conversation::slice_per_layer_sealed;
 use crate::decode_health::DecodeHealthState;
 use crate::decoded_text::{decode_turn_text, TagIds};
+use crate::dry_reference::reference_flags;
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
 use crate::index_pages::{self, StoredPages};
@@ -3494,6 +3496,11 @@ pub(crate) struct Scheduler {
     /// creep, a section chunk or glue — so the profile can tell an 8-session
     /// decode step from one that also paid for ingest.
     wave_cobatched: bool,
+    /// The airtime ratio `R` the last wave step's co-batched work yielded to —
+    /// the ratio of the decodes that outrank it, 1 when none does. The decode
+    /// quantum owes decode that share of a co-batched step
+    /// (`decode_owed_after_cobatched`).
+    wave_step_ratio: u32,
     /// Set once per wave after the co-batched decode wave folded the active
     /// section-ingest chunk into its full sweep (section rides decode's `[0, N)`
     /// as a prefill-group member — one shared MoE grouped GEMM per layer serves
@@ -3655,7 +3662,8 @@ impl Scheduler {
             max_recent_len,
             eos_tokens.clone(),
             penalty_log_path,
-        );
+        )
+        .with_reference_flags(reference_flags(&tokenizer, vocab_size));
 
         let chunk_size = CHUNK_SIZE;
         // Before the tokenizer moves into `Self`. A multi-token spelling yields
@@ -3780,6 +3788,7 @@ impl Scheduler {
             wave_prefill_members: Vec::new(),
             wave_cohort_advanced: false,
             wave_cobatched: false,
+            wave_step_ratio: 1,
             wave_section_advanced: false,
             shutdown_requested: false,
             section_name_cache: HashMap::new(),
@@ -13777,7 +13786,7 @@ mod tests {
 
     /// A `DecodeState` carrying nothing but the two fields the reasoning
     /// boundary is decided from.
-    fn boundary_state() -> (DecodeState, Receiver<TurnEvent>) {
+    pub(super) fn boundary_state() -> (DecodeState, Receiver<TurnEvent>) {
         let (tx, rx) = flume::unbounded();
         let state = DecodeState {
             event_tx: tx,

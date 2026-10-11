@@ -78,7 +78,7 @@ fn clip(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::mission::{Origin, Stage, Todo, Work};
+    use crate::engine::mission::{Origin, Todo, Work};
 
     fn drafted() -> Mission {
         Mission::new(
@@ -88,7 +88,7 @@ mod tests {
                 generator: "life-event".into(),
                 target: "life:zenling-shooter".into(),
                 operation: 3,
-                stage: Stage::Draft,
+                step: "write".into(),
             },
         )
         .with_work(Work {
@@ -97,6 +97,8 @@ mod tests {
             min_words: 250,
             edit_optional: false,
             anew: false,
+            checks: Vec::new(),
+            tools: Vec::new(),
         })
     }
 

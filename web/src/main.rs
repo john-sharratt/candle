@@ -71,8 +71,43 @@ async fn main() -> anyhow::Result<()> {
             .clone()
             .map(|a| web::auth::Auth::new(a).map(|_| ()));
         print_table(&cfg, cli.authoritative, auth.as_ref().map(|r| r.is_ok()));
+        // The same for the TLS entrance: what it would ask the CA for, and
+        // whether the store it would serve from loads.
+        let tls = cfg.server.tls.as_ref().map(|t| {
+            let store = web::acme::store::Store::new(&t.acme.store);
+            store.load_certs().map(|certs| (t, certs))
+        });
+        match &tls {
+            Some(Ok((t, certs))) => {
+                println!(
+                    "tls: HTTP/3 + HTTP/2 + HTTP/1.1 on {}, Let's Encrypt, store {}",
+                    t.bind,
+                    t.acme.store.display()
+                );
+                for g in web::acme::names::groups(&cfg) {
+                    let held = certs.iter().find(|c| c.site == g.site);
+                    println!(
+                        "  {:<14} {:<60} {}",
+                        g.site,
+                        g.names.join(", "),
+                        match held {
+                            Some(c) => format!("held, expires {}", c.not_after),
+                            None => "not yet issued".to_string(),
+                        }
+                    );
+                }
+            }
+            Some(Err(_)) => println!("tls: STORE UNUSABLE, see below"),
+            None => match &cfg.server.tls_file {
+                Some(p) => println!("tls: not configured — no {}", p.display()),
+                None => println!("tls: not configured — no `tls_file:` in this table"),
+            },
+        }
         if let Some(Err(e)) = auth {
             anyhow::bail!("sign-in is configured but unusable: {e}");
+        }
+        if let Some(Err(e)) = tls {
+            anyhow::bail!("the TLS entrance's store is unusable: {e:#}");
         }
         return Ok(());
     }

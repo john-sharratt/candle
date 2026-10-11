@@ -20,46 +20,56 @@ const clock = (s) => `${pad2(Math.floor(s / 3600) % 24)}:${pad2(Math.floor(s / 6
 
 const forgottenEntries = new Set();
 
+/* The steps of the workflows the mock's operations run on, as the view gives
+ * them. */
+const STORY_STEPS = [
+  { name: 'write', table: false }, { name: 'read', table: true }, { name: 'review', table: false },
+  { name: 'reread', table: true }, { name: 'canon', table: false }, { name: 'fix', table: false },
+];
+const LIFE_STEPS = STORY_STEPS;
+
 /* The command table's operations, as `/v1/pulse/operations` serves them: one
- * waiting for its review, one passed, one rejected. */
+ * waiting for its review, one passed, one failed. */
 const mockOps = [
   {
     id: 3, name: 'Operation Grey Bearing', objective: 'Tell what The Tower Age passes over: "The Weight of the Deep"',
-    phase: 'reviewing', finished: false, generator: 'untold', target: 'era:layers/eras/the-tower-age.md',
-    document: 'layers/stories/the-weight-of-the-deep.md', writer: 'm3', writer_name: 'Tess',
-    reviewer: null, reviewer_name: null, carrying: null, carrying_name: null,
-    reading: "The table's verdict: to be mended — the faults below can be put right in place.\n\nWhat the table checked: It is set in the Tower Age; the shaft and the dust fit the era.\n\nWhat it found wrong: \"He has been here so long that the concept of sky has become abstract\" restates the mood of the paragraph before it.",
-    log: [
-      { stage: 'draft', by: 'm3', outcome: 'done', notes: 'Wrote the scene at the shaft.' },
-      { stage: 'review', by: 'table', outcome: 'read', notes: 'to be mended' },
+    workflow: 'story', steps: STORY_STEPS, step: 'review', state: 'running', finished: false, round: 0, send_backs: 0,
+    generator: 'untold', target: 'era:layers/eras/the-tower-age.md',
+    document: 'layers/stories/the-weight-of-the-deep.md', carrying: null, carrying_name: null,
+    history: [
+      { step: 'write', by: 'm3', by_name: 'Tess', outcome: null, to: 'read', notes: 'Wrote the scene at the shaft.' },
+      { step: 'read', by: 'table', by_name: 'the table', outcome: 'mend', to: 'review',
+        notes: "The table's verdict: to be mended — the faults below can be put right in place.\n\nWhat it found wrong: \"He has been here so long that the concept of sky has become abstract\" restates the mood of the paragraph before it." },
     ],
     why: null, waiting_brief: 'Operation Grey Bearing — Tell what The Tower Age passes over.\n\nAnother Maker drafted it…',
   },
   {
     id: 2, name: 'Operation Ashen Ledger', objective: "Creed's life, 2950-03-12: The Silence Between Orders",
-    phase: 'succeeded', finished: true, generator: 'life-event', target: 'life:creed-the-loyal-soldier',
+    workflow: 'life-event', steps: LIFE_STEPS, step: null, state: 'succeeded', finished: true, round: 0, send_backs: 0,
+    generator: 'life-event', target: 'life:creed-the-loyal-soldier',
     document: 'layers/life/creed-the-loyal-soldier/2950-03-12 The Silence Between Orders.md',
-    writer: 'm1', writer_name: 'Wren', reviewer: 'm2', reviewer_name: 'Pax', carrying: null, carrying_name: null,
-    reading: "The table's verdict: sound — the table found nothing worth mending.",
-    log: [
-      { stage: 'draft', by: 'm1', outcome: 'done', notes: 'Written in the second person, as the rest of the life.' },
-      { stage: 'review', by: 'table', outcome: 'read', notes: 'sound' },
-      { stage: 'review', by: 'm2', outcome: 'passed', notes: 'Read it against the era; mended one repeated line.' },
+    carrying: null, carrying_name: null,
+    history: [
+      { step: 'write', by: 'm1', by_name: 'Wren', outcome: null, to: 'read', notes: 'Written in the second person, as the rest of the life.' },
+      { step: 'read', by: 'table', by_name: 'the table', outcome: 'sound', to: 'review', notes: "The table's verdict: sound." },
+      { step: 'review', by: 'm2', by_name: 'Pax', outcome: 'pass', to: 'reread', notes: 'Read it against the era; mended one repeated line.' },
+      { step: 'reread', by: 'table', by_name: 'the table', outcome: 'sound', to: 'canon', notes: "The table's verdict: sound." },
+      { step: 'canon', by: 'm3', by_name: 'Tess', outcome: 'pass', to: 'done', notes: 'It agrees with the Tower Age.' },
     ],
     why: null, waiting_brief: null,
   },
   {
     id: 1, name: 'Operation Iron Lantern', objective: "Verdi's life, 2937: The First Zenling",
-    phase: 'failed', finished: true, generator: 'life-event', target: 'life:verdi-the-decay-enthusiast',
+    workflow: 'life-event', steps: LIFE_STEPS, step: null, state: 'failed', finished: true, round: 3, send_backs: 3,
+    generator: 'life-event', target: 'life:verdi-the-decay-enthusiast',
     document: 'layers/life/verdi-the-decay-enthusiast/2937 The First Zenling.md',
-    writer: 'm2', writer_name: 'Pax', reviewer: 'm3', reviewer_name: 'Tess', carrying: null, carrying_name: null,
-    reading: "The table's verdict: failing — the faults below run through all of it.",
-    log: [
-      { stage: 'draft', by: 'm2', outcome: 'done', notes: 'Written.' },
-      { stage: 'review', by: 'table', outcome: 'read', notes: 'failing' },
-      { stage: 'review', by: 'm3', outcome: 'rejected', notes: 'Told in the first person throughout; the life is in the second.' },
+    carrying: null, carrying_name: null,
+    history: [
+      { step: 'write', by: 'm2', by_name: 'Pax', outcome: null, to: 'read', notes: 'Written.' },
+      { step: 'read', by: 'table', by_name: 'the table', outcome: 'fail', to: 'review', notes: "The table's verdict: failing." },
+      { step: 'review', by: 'm3', by_name: 'Tess', outcome: 'reject', to: 'fix', notes: 'Told in the first person throughout; the life is in the second.' },
     ],
-    why: 'rejected on review: Told in the first person throughout; the life is in the second.', waiting_brief: null,
+    why: 'sent back 3 times', waiting_brief: null,
   },
 ];
 const WORLD_EPOCH =Date.UTC(2187, 5, 14, 6, 14);
@@ -1309,21 +1319,22 @@ export const MockAPI = {
   async cancelOperation(_wid, oid, why) {
     const op = mockOps.find((o) => o.id === Number(oid));
     if (!op || op.finished) throw Object.assign(new Error('not running'), { error: 'not_running', status: 409 });
-    Object.assign(op, { phase: 'cancelled', finished: true, why: why || 'called off by an operator', waiting_brief: null });
+    Object.assign(op, { state: 'cancelled', step: null, finished: true, why: why || 'called off by an operator', waiting_brief: null });
     return { cancelled: op.id };
   },
-  async readOperationAgain(_wid, oid) {
+  async stepOperation(_wid, oid, step) {
     const op = mockOps.find((o) => o.id === Number(oid));
-    if (!op || op.phase !== 'reviewing' || !op.waiting_brief) {
-      throw Object.assign(new Error('the operation has no review waiting at the table'),
-        { error: 'not_waiting', status: 409 });
+    if (!op) throw Object.assign(new Error('no such operation'), { error: 'no_operation', status: 404 });
+    if (!op.steps.some((s) => s.name === step)) {
+      throw Object.assign(new Error(`the workflow \`${op.workflow}\` has no step \`${step}\``),
+        { error: 'not_moved', status: 409 });
     }
-    Object.assign(op, { phase: 'reading', waiting_brief: null, reviewer: null });
-    return { reading: op.id };
+    Object.assign(op, { step, state: 'running', finished: false, why: null, waiting_brief: null, round: op.round + 1 });
+    return { operation: op.id, step };
   },
   async operationDocument(_wid, oid) {
     const op = mockOps.find((o) => o.id === Number(oid));
-    if (!op || op.phase === 'drafting') {
+    if (!op || (op.step === 'write' && !op.history.length)) {
       throw Object.assign(
         new Error('the document is neither on the record nor among the rejected — it was never committed'),
         { error: 'no_document', status: 404 });
@@ -1331,30 +1342,21 @@ export const MockAPI = {
     const text = `# ${op.name}\n\nThe draft ${op.name} wrote, as it stands.`;
     return {
       path: op.document,
-      where: op.phase === 'failed' ? 'rejected' : 'record',
+      where: op.state === 'failed' ? 'rejected' : 'record',
       words: text.split(/\s+/).length,
       text,
     };
   },
-  async checkOperation(_wid, oid) {
-    const op = mockOps.find((o) => o.id === Number(oid));
-    const lore = op && /^layers\/(life|stories)\//.test(op.document);
-    if (!op || op.phase !== 'succeeded' || !lore) {
-      throw Object.assign(new Error('only a life event or story that has passed can be sent to be checked'),
-        { error: 'not_lore', status: 409 });
-    }
-    Object.assign(op, { phase: 'reviewed', finished: false });
-    return { checking: op.id };
-  },
   async reviewDocument(path) {
     const id = mockOps.reduce((m, o) => Math.max(m, o.id), 0) + 1;
+    const workflow = /^layers\/life\//.test(path) ? 'life-event' : /^layers\/stories\//.test(path) ? 'story' : 'correction';
     mockOps.unshift({
-      id, name: 'Operation Grey Bearing', objective: 'Review ' + path, phase: 'reading', finished: false,
-      generator: 'operator', target: 'doc:' + path, document: path, writer: null, reviewer: null,
-      reading: null, log: [{ stage: 'draft', by: 'operator', outcome: 'done', notes: 'put through review by hand' }],
-      why: null, waiting_brief: null,
+      id, name: 'Operation Grey Bearing', objective: 'Review ' + path, workflow, steps: STORY_STEPS,
+      step: 'read', state: 'running', finished: false, round: 0, send_backs: 0,
+      generator: 'operator', target: 'doc:' + path, document: path, carrying: null, carrying_name: null,
+      history: [], why: null, waiting_brief: null,
     });
-    return { path, opened: [{ world: 'battle-cities', operation: id }] };
+    return { path, workflow, opened: [{ world: 'battle-cities', operation: id }] };
   },
   async commandTable(open) {
     return { open, called: open ? 3 : 0 };

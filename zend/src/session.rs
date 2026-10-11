@@ -417,11 +417,7 @@ fn turn_sampling(
             let mut sampling = conv.default_sampling();
             // A `/no_think` turn is a direct response, not reasoning: strip the
             // thinking-temperature boost, which is meant for the `<think>` span
-            // and has no business heating a plain answer.  DRY stays on: it is
-            // span-scoped (`dry_span_len` — it only ever sees the current prose
-            // span, never the prompt or a prior span), so it breaks answer loops
-            // without penalizing verbatim reproduction of numbers/identifiers
-            // lifted from the prompt.
+            // and has no business heating a plain answer.
             if think_mode == ThinkMode::Off {
                 sampling.segment_temp_boost = 0.0;
             }

@@ -1,19 +1,15 @@
-//! The last acceptance step of an operation: a reviewed life event or story
-//! checked against the main storyline — the eras — for major contradictions.
+//! The main storyline a document answers to — the eras — and the year its work
+//! is done in.
 //!
-//! **Read the storyline, then decide.** The review read the draft as writing;
-//! this reads it as history. A Maker who has carried no other stage of the
-//! operation reads the draft and the eras around it — the one it is set in and
-//! those either side — and then decides for itself: accept it as it stands,
-//! mend a contradiction that an edit can put right and accept it, or reject it
-//! when the contradiction runs through it. The reading steps are the engine's to
-//! sign off, and neither verdict is taken until they are done, so a check is
-//! never a judgement made without the storyline in front of it.
+//! **Read the storyline, then decide.** A workflow's check against the
+//! storyline (`context: storyline`, see [`super::step`]) reads the document
+//! and the eras around it — the one it is set in and those either side — and
+//! names them in its prompt; the Maker accepts it, mends a contradiction an edit
+//! can put right, or rejects it. The reading steps are the engine's to sign
+//! off, and no verdict is taken until they are done, so a check is never a
+//! judgement made without the storyline in front of it.
 
-use super::answer::Desk;
 use super::corpus::Corpus;
-use super::gates::{Form, LIFE_MIN_WORDS, STORY_MIN_WORDS};
-use crate::engine::mission::{Mission, Origin, Stage, Todo, Work};
 use crate::sim::operations::Operation;
 
 /// The eras a document is checked against, in the order they happened: the
@@ -61,117 +57,50 @@ pub fn set_in(target: &str, document: &str, corpus: &Corpus) -> Option<u32> {
         .and_then(|y| y.parse::<u32>().ok())
 }
 
-/// The canon-check mission for operation `op`.
-pub fn canon_mission(op: &Operation, corpus: &Corpus, desk: Option<&Desk>) -> Mission {
-    let doc = &op.document;
-    let eras = storyline(op, corpus);
-    let mut reads = vec![doc.clone()];
-    reads.extend(eras.iter().cloned());
-    let mut todo = Vec::new();
-    if let Some(d) = desk {
-        todo.push(Todo::new(format!("go to {} on {}", d.room, d.level)));
-    }
-    for r in &reads {
-        todo.push(Todo::new(format!("read {r}")));
-    }
-    todo.push(Todo::report("go back to the table and report your verdict"));
-    let titles: Vec<String> = eras
-        .iter()
-        .filter_map(|p| corpus.eras.iter().find(|e| &e.path == p))
-        .map(|e| match e.year {
-            Some(y) => format!("{} ({y})", e.title),
-            None => e.title.clone(),
-        })
-        .collect();
-    let brief = format!(
-        "{name} — {objective}.\n\n\
-         `{doc}` has been written and passed on review by two other Makers. Before it stands in \
-         the record, check it against the main storyline: the eras of this world, which \
-         everything else must agree with. Read the draft, then read the storyline around it — \
-         {titles} — before you decide anything.\n\n\
-         Look for major contradictions only: a date the eras put elsewhere — check every year \
-         it names, and every claim about how things stood then (\"the war is over\", \"the \
-         gates are open\", who ruled, who was gone) against the era that year falls in — a war \
-         or a battle with a different outcome, somebody somewhere the storyline says they could \
-         not be, something that did not exist yet or no longer did, an order of events the eras \
-         reverse. Its style and voice have been reviewed already; leave them.\n\n\
-         Then decide.\n\
-         - It agrees with the storyline: `report_done`, saying what you checked it against.\n\
-         - A contradiction an edit can put right: put it right with `file_edit`, `bench_commit` \
-           it, then `report_done` saying what you changed and why.\n\
-         - The contradiction runs through it — the events themselves could not have happened \
-           as told: `report_rejected`, saying which era it contradicts and how. A rejected draft \
-           leaves the record.",
-        name = op.name,
-        objective = op.objective,
-        titles = titles.join(", "),
-    );
-    Mission::new(
-        brief,
-        todo,
-        Origin::Generated {
-            generator: op.generator.clone(),
-            target: op.target.clone(),
-            operation: op.id,
-            stage: Stage::Canon,
-        },
-    )
-    .with_work(Work {
-        writes: doc.clone(),
-        reads,
-        min_words: match Form::of(doc) {
-            Form::LifeEvent => LIFE_MIN_WORDS,
-            Form::Story => STORY_MIN_WORDS,
-            Form::Other => 0,
-        },
-        edit_optional: true,
-        anew: false,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::mission_gen::corpus::tests::mind;
+    use crate::sim::operations::tests::workflows;
     use crate::sim::operations::Operations;
 
     /// **A life event is checked against the era its year falls in and those
     /// either side; a story against the era it was told for and its
-    /// neighbours.** Every era is read before the verdict.
+    /// neighbours.**
     #[test]
-    fn a_check_reads_the_draft_and_the_storyline_around_it() {
+    fn the_storyline_is_the_era_it_is_set_in_and_its_neighbours() {
         let dir = mind();
         let c = Corpus::read(dir.path(), "test");
         let mut ops = Operations::default();
-        let life = ops.open(
-            "life-event",
-            "life:keeper",
-            "Keeper's charge",
-            "layers/life/keeper/2786 The Charge.md",
-        );
-        let m = canon_mission(ops.get(life).unwrap(), &c, None);
-        let steps: Vec<&str> = m.todo.iter().map(|t| t.text.as_str()).collect();
+        ops.set_workflows(workflows());
+        let life = ops
+            .open(
+                "life-event",
+                None,
+                "life-event",
+                "life:keeper",
+                "Keeper's charge",
+                "layers/life/keeper/2786 The Charge.md",
+            )
+            .unwrap();
         assert_eq!(
-            steps,
+            storyline(ops.get(life).unwrap(), &c),
             [
-                "read layers/life/keeper/2786 The Charge.md",
-                "read layers/eras/the-fall.md",
-                "read layers/eras/the-retreat.md",
-                "read layers/eras/the-salvation.md",
-                "go back to the table and report your verdict",
+                "layers/eras/the-fall.md",
+                "layers/eras/the-retreat.md",
+                "layers/eras/the-salvation.md",
             ]
         );
-        assert_eq!(m.operation(), Some((life, Stage::Canon)));
-        assert!(m.written_up(), "accepting it unchanged is a verdict");
-        assert!(m.prompt.contains("before you decide anything"));
-        assert!(m.prompt.contains("`report_rejected`"));
-
-        let story = ops.open(
-            "untold",
-            "era:layers/eras/the-fall.md",
-            "a story",
-            "layers/stories/x.md",
-        );
+        let story = ops
+            .open(
+                "story",
+                None,
+                "untold",
+                "era:layers/eras/the-fall.md",
+                "a story",
+                "layers/stories/x.md",
+            )
+            .unwrap();
         assert_eq!(
             storyline(ops.get(story).unwrap(), &c),
             ["layers/eras/the-fall.md", "layers/eras/the-retreat.md"],

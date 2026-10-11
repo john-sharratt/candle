@@ -27,13 +27,18 @@
 pub mod answer;
 pub mod canon;
 pub mod config;
+pub mod copied;
 pub mod corpus;
 pub mod fingerprint;
 pub mod gates;
+pub mod glossary;
 pub mod leakage;
 pub mod material;
 pub mod reading;
 pub mod rejection;
+#[cfg(test)]
+mod replay;
 pub mod research;
 pub mod run;
+pub mod step;
 pub mod target;

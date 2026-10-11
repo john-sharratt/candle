@@ -11,17 +11,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use candle_conversation::guest::resolve_seed;
+use candle_conversation::stencil::ThinkMode;
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use serde::Serialize;
 use tokio::task::spawn_blocking;
 
 use super::answer::{self, Answer, Desk};
 use super::canon;
-use super::config::{Config, Generator};
+use super::config::{Config, Generator, READING};
 use super::corpus::Corpus;
 use super::gates;
 use super::material;
 use super::reading;
+use super::step;
 use super::target::{self, Kind, Target};
 use crate::engine::journal::tools::arguments;
 use crate::engine::mind::Minds;
@@ -30,8 +32,9 @@ use crate::engine::mission::{time_step_text, Mission, Todo};
 use crate::engine::prose::{self, decode_call, CallAsk};
 use crate::engine::runtime::Runtime;
 use crate::engine::work::what_happens;
+use crate::engine::workflow::{OnFailed, Where};
 use crate::prose::Request;
-use crate::sim::operations::{AfterReading, Operation};
+use crate::sim::operations::Operation;
 use crate::world::Hosted;
 
 /// The most tokens one answer may run to. The table's reading and its faults
@@ -39,27 +42,22 @@ use crate::world::Hosted;
 /// call at all — a life event was refused "not a call" three times running.
 const ANSWER_TOKENS: usize = 2400;
 
-/// The most tokens the table's reading may run to: an answer's room, and the
-/// reader's working in `notes` before it — see [`reading::specs`].
-const READING_TOKENS: usize = 4800;
+/// The most tokens the table's reading may run to, past its thinking.
+pub(super) const READING_TOKENS: usize = 2400;
 
 /// How many times an answer is asked for before the target is given up.
 const ATTEMPTS: usize = 3;
 
-/// The sampling temperature a mission is written at.
+/// How much a mission and the table's reading are thought through before the
+/// call is written — see [`crate::engine::prose::decode_call`].
 ///
-/// Below the checkpoint's own, because a mission carries paths and dates that
-/// must be copied exactly: at the default a story brief about "the vanishing
-/// silence" named its own file `the-vanishing-silage.md`.
-const TEMPERATURE: f32 = 0.5;
-
-/// The sampling temperature the table reads a draft at.
-///
-/// **A judge gives the same verdict twice.** At the generator's temperature
-/// the table failed a Zen given hands and a chair — and, reading the same text
-/// an hour later, found it sound. A reading decides whether work goes on, back
-/// to a reviewer, or out of the record; it is held near-deterministic.
-const READING_TEMPERATURE: f32 = 0.2;
+/// **Both decode on the checkpoint's own sampling.** Held below its
+/// temperature — 0.5 for a mission, 0.2 for a reading — the model went round:
+/// a reading at 0.2 wrote "the draft's voice is not Keeper's voice" until the
+/// cap, three tries running, the near-greedy loop the checkpoint's own card
+/// warns against. A reading's verdict is read twice before a draft stands on it
+/// (`table_step`), which is what holding the table near-deterministic was for.
+pub(super) const THINK: ThinkMode = ThinkMode::Balanced;
 
 /// How often the loop looks at the table.
 const TICK: Duration = Duration::from_secs(20);
@@ -157,7 +155,8 @@ async fn write_up(
     // stays first in line — a review queued for a life whose character has no
     // personality file was chosen again on every draw, and nothing behind it was
     // ever reached.
-    let Some(material) = material::render(generator.kind, target, corpus) else {
+    let Some(material) = material::render(generator.kind, target, corpus, &generator.context)
+    else {
         let why = format!("{} has nothing to show for {}", generator.id, target.key);
         decline(hosted, generator, target, &why);
         tracing::warn!(generator = %generator.id, target = %target.key, "mission generator: no material, target set aside");
@@ -175,7 +174,7 @@ async fn write_up(
 
     let (engine, base) = (minds.engine(), minds.base_config());
     let mut prompt = asked.clone();
-    let mut last_fault = String::new();
+    let mut faults: Vec<String> = Vec::new();
     let mut last_raw = String::new();
     for attempt in 1..=ATTEMPTS {
         let calls = answer::specs(generator.kind);
@@ -184,8 +183,9 @@ async fn write_up(
             prompt: &prompt,
             calls: &calls,
             max_tokens: ANSWER_TOKENS,
-            temperature: Some(TEMPERATURE),
+            temperature: None,
             seed: resolve_seed(None),
+            think: THINK,
         };
         let raw = decode_call(&engine, &base, &ask).await?;
         let checked = match answer::check(&raw, generator.kind, target, corpus) {
@@ -207,25 +207,27 @@ async fn write_up(
         };
         match checked {
             Ok(Answer::Mission(p)) => {
-                let desk = desk_for(hosted, &p.writes);
-                let mission = through_time(
-                    hosted,
-                    answer::mission(&p, &generator.id, target, desk.as_ref()),
-                    canon::set_in(&target.key, &p.writes, corpus),
-                );
                 // What its document says now, when the record holds it — put
-                // back if the operation fails (`Sim::set_aside_failed`).
+                // back if the operation fails and its workflow says `restore`
+                // (`Sim::set_aside_failed`).
                 let before = corpus.on_disk(&p.writes);
-                let (operation, name) = hosted.with_sim(|s| {
+                let opened = hosted.with_sim(|s| {
                     let id = s.missions.launch(
-                        mission,
+                        &generator.workflow,
+                        &generator.id,
+                        &target.key,
                         target.fingerprint,
                         &p.objective,
+                        &p.writes,
+                        &p.brief,
+                        p.fields.clone(),
+                        p.reads.clone(),
                         before.as_deref(),
-                    );
+                    )?;
                     let name = s.missions.operations().get(id).map(|o| o.name.clone());
-                    (id, name.unwrap_or_default())
+                    Ok::<_, String>((id, name.unwrap_or_default()))
                 });
+                let (operation, name) = opened.map_err(|e| anyhow::anyhow!("{e}"))?;
                 tracing::info!(
                     generator = %generator.id, target = %target.key, writes = %p.writes, attempt,
                     %name, "mission generator: an operation is open — {}", p.objective
@@ -251,18 +253,20 @@ async fn write_up(
                 });
             }
             Err(fault) => {
-                tracing::info!(generator = %generator.id, target = %target.key, attempt, %fault, "mission generator: answer refused");
-                prompt = format!(
-                    "{asked}\n\n## Your last answer was refused\n\n{fault}\n\nIt was:\n\n{}\n\nAnswer \
-                     again.",
-                    raw.trim()
-                );
-                last_fault = fault;
+                // How the answer opened and closed, so a refusal can be told
+                // from a decode that never produced a call.
+                let (head, tail) = ends(&raw, 160);
+                tracing::info!(generator = %generator.id, target = %target.key, attempt, %fault, %head, %tail, "mission generator: answer refused");
+                faults.push(fault);
+                prompt = retry_prompt(&asked, &faults);
                 last_raw = raw;
             }
         }
     }
-    let why = format!("no acceptable answer in {ATTEMPTS} tries — last: {last_fault}");
+    let why = format!(
+        "no acceptable answer in {ATTEMPTS} tries — last: {}",
+        faults.last().map_or("", String::as_str)
+    );
     decline(hosted, generator, target, &why);
     tracing::warn!(generator = %generator.id, target = %target.key, %why, "mission generator: target set aside");
     Ok(Generation::Failed {
@@ -319,33 +323,24 @@ async fn contradict(
     Ok(answer.text.trim().eq_ignore_ascii_case("yes"))
 }
 
+/// The first and last `chars` characters of `raw`, trimmed — all of it in
+/// `head` when it is short.
+fn ends(raw: &str, chars: usize) -> (String, String) {
+    let raw = raw.trim();
+    let n = raw.chars().count();
+    if n <= chars * 2 {
+        return (raw.to_string(), String::new());
+    }
+    let head: String = raw.chars().take(chars).collect();
+    let tail: String = raw.chars().skip(n - chars).collect();
+    (head, tail)
+}
+
 fn decline(hosted: &Hosted, generator: &Generator, target: &Target, why: &str) {
     hosted.with_sim(|s| {
         s.missions
             .decline(&target.key, &generator.id, target.fingerprint, why)
     });
-}
-
-/// The part a document is written at, by where it lives in the mind.
-///
-/// The vault's own division of labour: lives and personalities on the casting
-/// level, stories at the story desks, places at the map table, and everything
-/// of the world's history at a chronicle terminal.
-pub fn bench_for(path: &str) -> &'static str {
-    match path {
-        p if p.starts_with("layers/life/") || p.starts_with("personalities/") => {
-            "character-terminal"
-        }
-        p if p.starts_with("layers/stories/") => "story-desk",
-        p if p.starts_with("map/") => "map-table",
-        _ => "chronicle-terminal",
-    }
-}
-
-/// The first room in the world holding the bench `path` is written at, and the
-/// level it is on.
-fn desk_for(hosted: &Hosted, path: &str) -> Option<Desk> {
-    room_with(hosted, bench_for(path))
 }
 
 /// The same mission, sent first to a time machine to work in `year` — when it
@@ -386,19 +381,46 @@ fn room_with(hosted: &Hosted, part: &str) -> Option<Desk> {
 }
 
 /// What the table is asked when it reads a draft: the record it answers to,
-/// what it was to tell when its brief says, and the configured question.
+/// what it was to tell when that is known, and the step's question.
 ///
 /// **What it was to tell, beside what it tells.** Read against the lore
 /// alone, a draft that tells nothing reads as one that tells it quietly; the
 /// brief's own event is what it answers to first.
-fn reading_prompt(material: &str, brief: &str, question: &str) -> String {
-    let told = match what_happens(brief) {
+pub(super) fn reading_prompt(material: &str, told: Option<&str>, question: &str) -> String {
+    let told = match told {
         Some(h) => format!("# What it was to tell\n\n{h}\n\n"),
         None => String::new(),
     };
     format!(
         "# The record\n\n{material}\n\n{told}# What you are asked\n\n{}",
         question.trim()
+    )
+}
+
+/// What a call is asked again after `faults` refused its answers: the ask and
+/// every fault found so far — not the refused answer itself.
+///
+/// **Every refusal, not only the last.** Told only why its last answer was
+/// refused, a story proposal refused for reusing other stories' names was
+/// refused next for its turn — and on its third try took back the very names
+/// the first refusal had ruled out.
+///
+/// **The refused answer is not shown.** An answer in front of it to copy is
+/// what it copied: a reading refused for a 1165-word `checked` sent back the
+/// same 1165 words, and a story refused for "Kess, Jorik" sent back Kess and
+/// Jorik twice, with the refusal naming them right above. Each fault quotes
+/// what it is about; the answer is written fresh against them.
+fn retry_prompt(asked: &str, faults: &[String]) -> String {
+    let said: Vec<String> = faults
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("{}. {}", i + 1, f.trim()))
+        .collect();
+    format!(
+        "{asked}\n\n## Your answers so far were refused\n\nEvery one of these still holds — \
+         write a new answer, from the start, so that none of them is true of it:\n\n{}\n\n\
+         Answer again.",
+        said.join("\n")
     )
 }
 
@@ -413,49 +435,60 @@ async fn table_reading(
     corpus: &Corpus,
 ) -> anyhow::Result<Option<reading::Reading>> {
     let mut prompt = asked.to_string();
+    let mut faults: Vec<String> = Vec::new();
     for attempt in 1..=ATTEMPTS {
         let calls = reading::specs();
         let ask = CallAsk {
-            system: &config.system,
+            system: &config.reader,
             prompt: &prompt,
             calls: &calls,
             max_tokens: READING_TOKENS,
-            temperature: Some(READING_TEMPERATURE),
+            temperature: None,
             seed: resolve_seed(None),
+            think: THINK,
         };
         let raw = decode_call(engine, base, &ask).await?;
         match reading::check(&raw, &op.document, corpus, attempt < ATTEMPTS) {
             Ok(r) => return Ok(Some(r)),
             Err(fault) => {
-                tracing::info!(operation = %op.name, attempt, %fault, "operation: reading refused");
+                let (head, tail) = ends(&raw, 160);
+                tracing::info!(operation = %op.name, attempt, %fault, %head, %tail, "operation: reading refused");
                 if attempt == ATTEMPTS {
                     // What it actually said, for whoever tunes the prompt or
                     // the check: the fault alone does not say which was wrong.
                     tracing::warn!(operation = %op.name, answer = %raw.trim(), "operation: no acceptable reading");
                 }
-                prompt = format!(
-                    "{asked}\n\n## Your last answer was refused\n\n{fault}\n\nIt was:\n\n{}\n\n\
-                     Answer again.",
-                    raw.trim()
-                );
+                faults.push(fault);
+                prompt = retry_prompt(asked, &faults);
             }
         }
     }
     Ok(None)
 }
 
-/// Read operation `id`'s draft and put its review on the table.
+/// The outcome of a reading the table could not give in [`ATTEMPTS`].
+pub const UNREAD: &str = "unread";
+
+/// The findings of a reading the table could not give.
+const NOT_READ: &str = "The table could not read it; read it wholly for yourself.";
+
+/// Take the table step operation `id` waits on, running its `call`, and move
+/// the operation on by the call's verdict.
 ///
-/// **A reading that will not come is not a review withheld.** When the table
-/// cannot give an acceptable reading in [`ATTEMPTS`], the review is still set,
-/// and the reviewer is told the table had nothing to add: the second Maker's
-/// reading is the gate that matters.
-pub async fn read_draft(
+/// **A reading that will not come is an outcome, not a stall.** When the table
+/// cannot give an acceptable reading in [`ATTEMPTS`], the step is taken
+/// [`UNREAD`], and the workflow says where that leads — in npcd's, to a review
+/// told the table had nothing to add.
+pub async fn table_step(
     rt: &Runtime,
     hosted: &Hosted,
     config: &Config,
     id: u64,
+    call: &str,
 ) -> anyhow::Result<()> {
+    if call != READING {
+        anyhow::bail!("the table has no call `{call}`");
+    }
     let mind = rt
         .mind
         .clone()
@@ -466,7 +499,15 @@ pub async fn read_draft(
         .unwrap()
         .clone()
         .ok_or_else(|| anyhow::anyhow!("the engine is not loaded yet"))?;
-    let Some(op) = hosted.sim(|s| s.missions.operations().get(id).cloned()) else {
+    let Some((op, prompt, context)) = hosted.sim(|s| {
+        let ops = s.missions.operations();
+        let offer = ops.offer(id).ok()?;
+        Some((
+            ops.get(id)?.clone(),
+            offer.prompt.to_string(),
+            offer.step.context.clone(),
+        ))
+    }) else {
         return Ok(());
     };
     // The form put right before the table reads it, so the reading is of what
@@ -475,22 +516,35 @@ pub async fn read_draft(
         hosted.with_sim(|s| s.bench.rebase(&op.document));
     }
     let corpus = Corpus::read(&mind, hosted.id());
-    let Some(material) = material::draft(&corpus, &op.document) else {
+    let Some(material) = material::draft(
+        &corpus,
+        &op.document,
+        op.target.strip_prefix("era:"),
+        &context,
+    ) else {
         hosted.with_sim(|s| {
             s.missions
-                .cancel_operation(id, "its draft is no longer on the record")
+                .cancel_operation(id, "its document is no longer on the record")
         });
-        tracing::warn!(operation = %op.name, document = %op.document, "operation: draft gone, called off");
+        tracing::warn!(operation = %op.name, document = %op.document, "operation: document gone, called off");
         return Ok(());
     };
-    let asked = reading_prompt(&material, &op.brief, &config.reading);
+    let told = match context.iter().any(|c| c == "told") {
+        true => op
+            .fields
+            .get("happens")
+            .cloned()
+            .or_else(|| what_happens(&op.brief)),
+        false => None,
+    };
+    let asked = reading_prompt(&material, told.as_deref(), &prompt);
     let (engine, base) = (minds.engine(), minds.base_config());
     let mut reading = table_reading(&engine, &base, config, &asked, &op, &corpus).await?;
     // **A draft stands on two sound readings, not one.** A single reading
     // found a life event sound in which a door was opened on an empty room
     // and shut again — "while quiet, it has a clear beginning and end" — and
     // a second reader is how a judge that talked itself into a verdict is
-    // caught. A second reading that finds faults is the one the review gets.
+    // caught. A second reading that finds faults is the one that counts.
     if reading
         .as_ref()
         .is_some_and(|r| r.verdict == reading::Verdict::Sound)
@@ -501,36 +555,51 @@ pub async fn read_draft(
             reading = Some(second);
         }
     }
-    let rendered = match &reading {
-        Some(r) => r.render(),
-        None => "The table could not read it; read it wholly for yourself.".to_string(),
+    let (outcome, found) = match &reading {
+        Some(r) => (r.verdict.name(), r.render()),
+        None => (UNREAD, NOT_READ.to_string()),
     };
-    let desk = desk_for(hosted, &op.document);
-    let sound = reading
-        .as_ref()
-        .is_some_and(|r| r.verdict == reading::Verdict::Sound);
-    let review = through_time(
-        hosted,
-        reading::review_mission(
-            &op,
-            &rendered,
-            reading.as_ref().map(|r| r.verdict),
-            &corpus,
-            desk.as_ref(),
-        ),
-        canon::set_in(&op.target, &op.document, &corpus),
-    );
-    let next = hosted.with_sim(|s| s.missions.offer_review(id, review, &rendered, sound));
-    // Read again after a review and still found wanting, past the limit: the
-    // operation has failed, and its document is settled with every other
-    // failed one's — see `spawn`.
-    if next == AfterReading::Failed {
-        tracing::info!(operation = %op.name, "operation FAILED on the table's reading");
+    let at = hosted.with_sim(|s| s.missions.table_took(id, outcome, &found));
+    match at {
+        Ok(at) => {
+            tracing::info!(operation = %op.name, verdict = outcome, ?at, "operation: read");
+            if matches!(at, Where::Failed(_)) {
+                tracing::info!(operation = %op.name, "operation FAILED on the table's reading");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(operation = %op.name, "operation: the workflow refused the reading: {e}")
+        }
     }
-    tracing::info!(
-        operation = %op.name, verdict = ?reading.as_ref().map(|r| r.verdict), ?next,
-        "operation: read"
-    );
+    Ok(())
+}
+
+/// Put the Maker's step operation `id` waits on at the table, as a mission
+/// built from the step ([`step::step_mission`]), at its workflow's desk and in
+/// its workflow's year.
+fn offer_step(hosted: &Hosted, corpus: &Corpus, id: u64) -> Result<(), String> {
+    let (desk, year) = hosted
+        .sim(|s| {
+            let ops = s.missions.operations();
+            let wf = ops.workflow_of(ops.get(id)?)?;
+            Some((wf.desk.clone(), wf.year.is_some()))
+        })
+        .ok_or("no such operation, or its workflow is not loaded")?;
+    let desk = desk.and_then(|d| room_with(hosted, &d));
+    let (op, mission) = hosted.sim(|s| {
+        let ops = s.missions.operations();
+        let op = ops.get(id).ok_or("no such operation")?.clone();
+        let offer = ops.offer(id)?;
+        let mission = step::step_mission(&op, &offer, corpus, desk.as_ref())?;
+        Ok::<_, String>((op, mission))
+    })?;
+    let year = year
+        .then(|| canon::set_in(&op.target, &op.document, corpus))
+        .flatten();
+    let mission = through_time(hosted, mission, year);
+    let step = op.step().unwrap_or_default().to_string();
+    hosted.with_sim(|s| s.missions.offer_step(id, mission));
+    tracing::info!(operation = %op.name, %step, desk = ?desk.map(|d| d.room), "operation: step on the table");
     Ok(())
 }
 
@@ -566,24 +635,37 @@ pub fn spawn(rt: Arc<Runtime>) {
                 let Some(hosted) = rt.hosted.get(&id) else {
                     continue;
                 };
+                // The workflows as the mind's file has them now: an edit to
+                // `missions.yaml` applies to every operation's next step.
+                hosted.with_sim(|s| s.missions.set_workflows(config.workflows.clone()));
                 // **Every failed operation's document is settled here**, however
                 // it failed — rejected, read and found wanting past the limit,
-                // or stuck: a draft is moved out of the record and leaves
-                // memory now, not at the next boot (the substrate holds
-                // whatever was ingested of it, and a gather could otherwise
-                // still surface lore the review threw out); a correction's
-                // document is put back (`Sim::set_aside_failed`).
-                let retiring = hosted.sim(|s| s.missions.operations().to_retire());
+                // or stuck — as its workflow's `on-failed` says: a draft set
+                // aside leaves the record and memory now, not at the next boot
+                // (the substrate holds whatever was ingested of it, and a
+                // gather could otherwise still surface lore the review threw
+                // out); a correction's document is put back
+                // (`Sim::set_aside_failed`).
+                let retiring = hosted.sim(|s| {
+                    let ops = s.missions.operations();
+                    ops.to_retire()
+                        .into_iter()
+                        .map(|op| {
+                            let leaves = ops.on_failed(&op) == OnFailed::SetAside;
+                            (op, leaves)
+                        })
+                        .collect::<Vec<_>>()
+                });
                 // Taken out of the lock first, so the read guard is not held
                 // across the scans; each scan holds the engine, and runs off
                 // the async workers so it does not stall them while it does.
                 let minds = rt.minds.read().unwrap().clone();
                 if let (false, Some(minds)) = (retiring.is_empty(), minds) {
-                    for op in retiring {
+                    for (op, leaves) in retiring {
                         let doc = op.document.clone();
                         let set_aside = hosted.with_sim(|s| s.set_aside_failed(&op));
                         tracing::info!(operation = %op.name, %doc, ?set_aside, "operation: failed document settled");
-                        let scan = match op.leaves_on_failure() {
+                        let scan = match leaves {
                             true => {
                                 let engine = minds.engine();
                                 let rel = doc.clone();
@@ -607,36 +689,40 @@ pub fn spawn(rt: Arc<Runtime>) {
                         }
                     }
                 }
-                // Drafts waiting for the table's reading come first: an
-                // operation half done is worth more than a new one opened.
+                // A document can leave the record under a mission written to
+                // read it — a failed draft set aside above, or by any other
+                // hand — and a read of nothing is a step no Maker can finish.
+                let struck = hosted.with_sim(|s| {
+                    let root = s.bench.mind_root()?.to_path_buf();
+                    Some(s.missions.strike_gone_reads(&|p| root.join(p).is_file()))
+                });
+                for (whose, gone) in struck.unwrap_or_default() {
+                    tracing::info!(body = ?whose, ?gone, "mission: reads of documents gone from the record struck");
+                }
+                // Steps of operations already open come first: an operation
+                // half done is worth more than a new one opened. The table's
+                // own steps are taken here; a Maker's is put on the table.
                 if hosted.sim(|s| s.table_open && s.bench.has_root()) {
-                    for op in hosted.sim(|s| s.missions.operations().awaiting_reading()) {
+                    for (op, call) in hosted.sim(|s| s.missions.operations().awaiting_table()) {
                         if rt.stopping() {
                             return;
                         }
-                        if let Err(e) = read_draft(&rt, &hosted, &config, op).await {
-                            tracing::warn!("operation reading: {e:#}");
+                        if let Err(e) = table_step(&rt, &hosted, &config, op, &call).await {
+                            tracing::warn!("operation: the table's step: {e:#}");
                             break;
                         }
                     }
-                    // Reviewed lore goes to its check against the storyline.
-                    // Nothing to decode: the engine knows which eras to set.
-                    let reviewed = hosted.sim(|s| s.missions.operations().awaiting_canon());
-                    if !reviewed.is_empty() {
+                    let owed = hosted.sim(|s| s.missions.operations().awaiting_offer());
+                    if !owed.is_empty() {
                         let corpus = Corpus::read(&mind, hosted.id());
-                        for id in reviewed {
-                            let Some(op) = hosted.sim(|s| s.missions.operations().get(id).cloned())
-                            else {
-                                continue;
-                            };
-                            let desk = desk_for(&hosted, &op.document);
-                            let check = through_time(
-                                &hosted,
-                                canon::canon_mission(&op, &corpus, desk.as_ref()),
-                                canon::set_in(&op.target, &op.document, &corpus),
-                            );
-                            hosted.with_sim(|s| s.missions.offer_check(id, check));
-                            tracing::info!(operation = %op.name, "operation: canon check on the table");
+                        for op in owed {
+                            // A step that cannot be written up never will be:
+                            // called off, so it does not hold its target.
+                            if let Err(e) = offer_step(&hosted, &corpus, op) {
+                                let why = format!("its step could not be put on the table: {e}");
+                                hosted.with_sim(|s| s.missions.cancel_operation(op, &why));
+                                tracing::warn!(operation = op, "operation: called off — {why}");
+                            }
                         }
                     }
                 }
@@ -655,7 +741,7 @@ pub fn spawn(rt: Arc<Runtime>) {
                     );
                 }
                 while hosted.sim(|s| s.table_open && s.bench.has_root())
-                    && hosted.sim(|s| s.missions.pooled().len()) < config.keep
+                    && !hosted.sim(|s| s.missions.stocked_for(&makers, config.keep))
                     && !rt.stopping()
                 {
                     match generate(&rt, &hosted, &config, None).await {
@@ -674,35 +760,45 @@ pub fn spawn(rt: Arc<Runtime>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bench_for, reading_prompt};
+    use super::{ends, reading_prompt, retry_prompt};
+
+    /// **An answer asked again carries every refusal so far**, numbered, and
+    /// none of the refused answers to copy back.
+    #[test]
+    fn a_retry_carries_every_refusal_so_far() {
+        let faults = vec!["Names reused.".to_string(), " Not an act. ".to_string()];
+        assert_eq!(
+            retry_prompt("Ask.", &faults),
+            "Ask.\n\n## Your answers so far were refused\n\nEvery one of these still holds — \
+             write a new answer, from the start, so that none of them is true of it:\n\n1. \
+             Names reused.\n2. Not an act.\n\nAnswer again."
+        );
+    }
+
+    #[test]
+    fn a_refused_answer_is_logged_by_its_two_ends() {
+        assert_eq!(ends("  short  ", 4), ("short".to_string(), String::new()));
+        assert_eq!(
+            ends("abcdefghijkl", 3),
+            ("abc".to_string(), "jkl".to_string())
+        );
+    }
 
     #[test]
     fn the_table_reads_a_draft_beside_what_it_was_to_tell() {
         assert_eq!(
             reading_prompt(
                 "the draft",
-                "Write it.\n\nWhat happens: Keeper orders the retreat.\n\nGo.",
+                Some("Keeper orders the retreat."),
                 " Read it. "
             ),
             "# The record\n\nthe draft\n\n# What it was to tell\n\nKeeper orders the \
              retreat.\n\n# What you are asked\n\nRead it."
         );
         assert_eq!(
-            reading_prompt("the draft", "", "Read it."),
+            reading_prompt("the draft", None, "Read it."),
             "# The record\n\nthe draft\n\n# What you are asked\n\nRead it.",
             "a draft put through review by hand has no brief"
         );
-    }
-
-    #[test]
-    fn each_kind_of_document_is_written_at_its_own_bench() {
-        assert_eq!(
-            bench_for("layers/life/keeper/2488 X.md"),
-            "character-terminal"
-        );
-        assert_eq!(bench_for("layers/stories/x.md"), "story-desk");
-        assert_eq!(bench_for("layers/eras/x.md"), "chronicle-terminal");
-        assert_eq!(bench_for("layers/world/combat.md"), "chronicle-terminal");
-        assert_eq!(bench_for("map/battle-cities.yaml"), "map-table");
     }
 }

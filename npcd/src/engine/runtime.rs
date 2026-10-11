@@ -94,6 +94,7 @@ use crate::engine::mission::{
 use crate::engine::mission_acts;
 use crate::engine::mission_gen;
 use crate::engine::mission_gen::config::Config;
+use crate::engine::mission_gen::gates::{life_voice, Form};
 use crate::engine::mission_gen::material::strip_calls;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::prose::{decode_call, CallAsk};
@@ -670,7 +671,7 @@ fn held_drafts<'a>(rt: &Runtime, worlds: impl Iterator<Item = &'a str>) -> HashS
         .flat_map(|m| {
             m.operations()
                 .all()
-                .filter(|o| !o.phase.finished())
+                .filter(|o| !o.settled())
                 .map(|o| o.document.clone())
                 .collect::<Vec<_>>()
         })
@@ -1273,7 +1274,7 @@ impl Runtime {
             Some(m)
                 if !m.todo.is_empty()
                     && m.next_step().is_none_or(|t| t.reports)
-                    && m.operation().is_some_and(|(_, stage)| stage.judges()) =>
+                    && m.may_reject() =>
             {
                 Some(VERDICT_AT_THE_TABLE.to_string())
             }
@@ -1460,7 +1461,7 @@ impl Runtime {
                     table.as_deref(),
                     at_table,
                     &mission.observed,
-                    mission.operation().is_some_and(|(_, stage)| stage.judges()),
+                    mission.may_reject(),
                 ));
             }
             if let Some(year) = time_step(&next.text) {
@@ -1478,12 +1479,20 @@ impl Runtime {
                 return Some(time_compass(year, here_has, way.as_deref()));
             }
             if let Some(doc) = DocStep::of(&next.text) {
-                // The nearest desk that reads documents, when this is not one.
-                let way = (desk.read.is_none())
+                // The nearest desk that does this step, when this is not one. A
+                // piece is written at a desk that composes: standing at a
+                // terminal that only reads, a Maker was told "at a desk, `scan`
+                // shows its address", scanned the terminal it stood at, and
+                // never found the desk it needed.
+                let (act, here_does) = match &doc {
+                    DocStep::Read(_) => ("file_read", desk.read.is_some()),
+                    DocStep::Write(_) => ("compose", desk.compose.is_some()),
+                };
+                let way = (!here_does)
                     .then(|| {
                         reach
                             .iter()
-                            .find(|at| s.part_offers(&place(at), "file_read"))
+                            .find(|at| s.part_offers(&place(at), act))
                             .and_then(&way_to)
                     })
                     .flatten();
@@ -2599,6 +2608,18 @@ impl Runtime {
         let Some((hosted, body)) = self.body_of(npc_id) else {
             return refused("There is nothing here to write at.".into());
         };
+        // **A committed piece is not sat down to again.** A reviewer whose
+        // write step was done and committed — told to go and report — sat down
+        // and composed the piece afresh on her way out, and left the new copy
+        // uncommitted in her working set.
+        let committed = hosted.sim(|s| {
+            let m = s.missions.active(&body)?;
+            let w = m.work.as_ref()?;
+            (!w.edit_optional && m.written_up()).then(|| w.writes.clone())
+        });
+        if let Some(writes) = committed {
+            return refused(compose::already_committed(&writes));
+        }
         let job = hosted.sim(|s| {
             let m = s.missions.active(&body)?;
             let w = m.work.as_ref()?;
@@ -2643,7 +2664,18 @@ impl Runtime {
                 ))
             })
             .collect();
-        let question = compose::question(&brief, &writes, min_words, &sources, standing.as_deref());
+        let told_in = match Form::of(&writes) {
+            Form::LifeEvent => life_voice(&root, &writes),
+            _ => None,
+        };
+        let question = compose::question(
+            &brief,
+            &writes,
+            min_words,
+            &sources,
+            standing.as_deref(),
+            told_in,
+        );
         let Some(minds) = self.minds.read().unwrap().clone() else {
             return refused("You cannot settle to write yet.".into());
         };
@@ -2667,6 +2699,7 @@ impl Runtime {
                 max_tokens: compose::COMPOSE_TOKENS,
                 temperature: None,
                 seed: resolve_seed(None),
+                think: compose::THINK,
             };
             let raw = match decode_call(&engine, &base, &ask).await {
                 Ok(raw) => raw,
@@ -2702,6 +2735,18 @@ impl Runtime {
                     .into(),
             );
         };
+        // **A piece written back as it stands is no change, and is said to be.**
+        // Sent to mend a draft, a reviewer sat down and wrote the standing text
+        // out again word for word; a working copy equal to the record is not a
+        // change, so its commit found nothing to merge and the next sitting was
+        // let through as if nothing had been written — four sittings over the
+        // same 307 words.
+        if standing
+            .as_deref()
+            .is_some_and(|s| compose::same_words(s, &text))
+        {
+            return refused(compose::unchanged(&writes));
+        }
         let words = text.split_whitespace().count();
         let write = Act {
             tool: "file_write",
@@ -6031,6 +6076,49 @@ mod tests {
         assert!(r.feed.starts_with("compose ✗"), "{}", r.feed);
     }
 
+    /// **A piece the mission has committed is not composed again**: the
+    /// refusal points at the report, before any engine time is spent.
+    #[tokio::test]
+    async fn compose_is_refused_once_the_piece_is_committed() {
+        use crate::engine::mission::{Mission, Origin, Todo, Work};
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        let doc = "layers/life/quill/3085 The Seal.md";
+        let mut m = Mission::new(
+            "write it",
+            vec![
+                Todo::new(format!("write {doc} and commit it")),
+                Todo::report("go back to the table and report it"),
+            ],
+            Origin::Random {
+                routine: "r".into(),
+            },
+        )
+        .with_work(Work {
+            writes: doc.into(),
+            reads: vec![],
+            min_words: 250,
+            edit_optional: false,
+            anew: false,
+            checks: Vec::new(),
+            tools: Vec::new(),
+        });
+        m.committed(&[doc.to_string()]);
+        let hosted = rt.hosted.get(WORLD).expect("hosted");
+        hosted.with_sim(|s| s.missions.assign("m1", m));
+        let compose = Act {
+            tool: "compose",
+            args: serde_json::Map::new(),
+        };
+        let r = rt.compose(1, &compose).await;
+        assert!(!r.landed);
+        assert_eq!(
+            r.answer,
+            "layers/life/quill/3085 The Seal.md is written and committed — that step of your \
+             mission is done. What is left is your report at the table."
+        );
+    }
+
     /// Put a body in the world and give a character to it.
     fn embody(rt: &Arc<Runtime>, npc_id: u64, body: &str, room: &str) {
         let w = rt.hosted.get(WORLD).expect("hosted");
@@ -7069,6 +7157,37 @@ mod tests {
         );
     }
 
+    /// **A piece is written at a desk that composes.** At a chronicle terminal,
+    /// which reads documents but does not compose them, a Maker was told "at a
+    /// desk, `scan` shows its address" and scanned the terminal it stood at for
+    /// twelve hours; the compass gives the way to a writing desk instead.
+    #[tokio::test]
+    async fn the_compass_to_write_points_past_a_terminal_that_only_reads() {
+        use crate::engine::mission::{Mission, Origin, Todo};
+        let rt = vaulted();
+        let terminal = npc_map::world::Where::new("vault-chronicle", "early-range");
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with(|w| w.enter("m1", "Maker-01".to_string(), terminal).unwrap());
+        rt.scheduler.wake(1, 0, 0);
+        rt.embody(1, WORLD, "m1", 0).expect("bound");
+        let mission = Mission::new(
+            "Write the story.",
+            vec![Todo::new("write layers/stories/y.md")],
+            Origin::Lodged {
+                by: "u_op".to_string(),
+            },
+        );
+        hosted.with_sim(|s| s.missions.assign("m1", mission));
+        let told = rt.mission_compass(1).expect("a compass");
+        assert!(
+            told.starts_with(
+                "Your mission, next: write layers/stories/y.md. A piece is written at a writing \
+                 desk: the nearest is in "
+            ),
+            "{told}"
+        );
+    }
+
     /// **A carried mission is in the system prompt, not restated.** Given a
     /// mission, the persona a turn reads carries its ask, its steps and where it
     /// ends, and the quiet-turn nudge says nothing — neither the "nothing has
@@ -7390,7 +7509,9 @@ mod tests {
     /// take up something else for, and the table's routine stays its to choose.
     #[tokio::test]
     async fn the_open_table_hands_its_work_to_whoever_stands_at_it_free() {
-        use crate::engine::mission::{Origin, Outcome as Verdict, Stage, Todo, Work};
+        use crate::engine::mission::{Origin, Outcome as Verdict, Todo, Work};
+        use crate::sim::operations::tests::workflows;
+        use std::collections::BTreeMap;
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         rt.embody_in_world(1, WORLD, None, "Maker-01", None, 0)
@@ -7398,51 +7519,76 @@ mod tests {
         rt.set_table_open(true);
         let hosted = rt.hosted.get(WORLD).unwrap();
         let (_, body) = rt.body_of(1).unwrap();
-        let draft = Mission::new(
-            "Write the next year of Keeper's life.",
-            vec![Todo::new("write it"), Todo::report("report it")],
-            Origin::Generated {
-                generator: "life-event".into(),
-                target: "life:keeper".into(),
-                operation: 0,
-                stage: Stage::Draft,
-            },
-        )
-        .with_work(Work {
-            writes: "layers/life/keeper/2488 X.md".into(),
-            reads: vec![],
-            min_words: 0,
-            edit_optional: false,
-            anew: false,
+        // A step of the operation, as the engine's loop sets it on the table.
+        let step = |prompt: &str, tools: Vec<String>, report: &str| {
+            Mission::new(
+                prompt,
+                vec![Todo::new("write it"), Todo::report(report)],
+                Origin::Generated {
+                    generator: "life-event".into(),
+                    target: "life:keeper".into(),
+                    operation: 0,
+                    step: String::new(),
+                },
+            )
+            .with_work(Work {
+                writes: "layers/life/keeper/2488 X.md".into(),
+                reads: vec![],
+                min_words: 0,
+                edit_optional: false,
+                anew: false,
+                checks: Vec::new(),
+                tools,
+            })
+        };
+        let id = hosted.with_sim(|s| {
+            s.missions.set_workflows(workflows());
+            let id = s
+                .missions
+                .launch(
+                    "life-event",
+                    "life-event",
+                    "life:keeper",
+                    1,
+                    "Keeper's next year",
+                    "layers/life/keeper/2488 X.md",
+                    "What happens: Keeper waits.",
+                    BTreeMap::new(),
+                    Vec::new(),
+                    None,
+                )
+                .unwrap();
+            s.missions.offer_step(
+                id,
+                step(
+                    "Write the next year of Keeper's life.",
+                    Vec::new(),
+                    "report it",
+                ),
+            );
+            id
         });
-        let id = hosted.with_sim(|s| s.missions.launch(draft, 1, "Keeper's next year", None));
         let handed = rt.at_table_summons(1).unwrap();
         assert!(
             handed.starts_with("The table hands you the next piece of work, and you take it up."),
             "{handed}"
         );
         assert_eq!(
-            hosted.sim(|s| s.missions.active(&body).and_then(|m| m.operation())),
-            Some((id, Stage::Draft))
+            hosted.sim(|s| s
+                .missions
+                .active(&body)
+                .and_then(|m| m.operation().map(|(i, st)| (i, st.to_string())))),
+            Some((id, "write".to_string()))
         );
 
         // Its own draft's review is not handed to it.
         hosted.with_sim(|s| {
             s.missions.report(&body, Verdict::Pass, "written", None);
-            let review = Mission::new(
-                "Review it.",
-                vec![],
-                s.missions.active(&body).map_or(
-                    Origin::Generated {
-                        generator: "life-event".into(),
-                        target: "life:keeper".into(),
-                        operation: 0,
-                        stage: Stage::Review,
-                    },
-                    |m| m.origin.clone(),
-                ),
-            );
-            s.missions.offer_review(id, review, "sound", true);
+            s.missions
+                .table_took(id, "sound", "nothing to mend")
+                .unwrap();
+            let review = step("Review it.", vec!["report_rejected".into()], "report it");
+            s.missions.offer_step(id, review);
         });
         assert_eq!(rt.at_table_summons(1).as_deref(), Some(AT_THE_TABLE));
         assert!(!hosted.sim(|s| s.missions.is_on_mission(&body)));
@@ -7456,9 +7602,18 @@ mod tests {
                 generator: "life-event".into(),
                 target: "life:keeper".into(),
                 operation: id,
-                stage: Stage::Review,
+                step: "review".into(),
             },
-        );
+        )
+        .with_work(Work {
+            writes: "layers/life/keeper/2488 X.md".into(),
+            reads: vec![],
+            min_words: 0,
+            edit_optional: true,
+            anew: false,
+            checks: Vec::new(),
+            tools: vec!["report_rejected".into()],
+        });
         hosted.with_sim(|s| s.missions.assign(&body, review));
         assert_eq!(
             rt.at_table_summons(1).as_deref(),

@@ -20,10 +20,11 @@
 //! `file_write` would, through the same checks, and the Maker reads it back,
 //! mends it and commits it.
 
-use candle_conversation::stencil::{Param, ToolSpec};
+use candle_conversation::stencil::{Param, ThinkMode, ToolSpec};
 use serde_json::{json, Value};
 
 use crate::engine::act;
+use crate::engine::mission_gen::gates::Voice;
 
 /// The call a composition answers with.
 pub const DRAFT: &str = "draft";
@@ -33,6 +34,10 @@ pub const SOURCE_WORDS: usize = 900;
 
 /// Room for the longest piece the gates allow, and a little over.
 pub const COMPOSE_TOKENS: usize = 2400;
+
+/// How much a sitting thinks the piece through before writing it: a little,
+/// so the piece is planned in the block rather than in its own sentences.
+pub const THINK: ThinkMode = ThinkMode::Quick;
 
 /// How many times one sitting writes: the piece, then — while it is short of
 /// its floor — what comes next, up to this many in all. See [`fuller`].
@@ -73,12 +78,20 @@ pub fn read(raw: &str) -> Option<String> {
 /// copy holds what it last typed by hand, and given that the sitting wrote the
 /// vault back in. It is `None` for a piece written anew — a draft the table
 /// failed.
+///
+/// **The voice a life is told in is said, not left to be found.** The gate
+/// holds a life event to the voice its other events are written in, and the
+/// writer was never told which: a reviewer composed Marek's year in the third
+/// person six sittings running, each refused at the report because every other
+/// event of that life says "you". `voice` is that voice, when the piece is a
+/// life event and the life has one.
 pub fn question(
     brief: &str,
     writes: &str,
     min_words: usize,
     sources: &[(String, String)],
     standing: Option<&str>,
+    voice: Option<Voice>,
 ) -> String {
     let mut q = format!("# Your brief\n\n{}\n", brief.trim());
     if !sources.is_empty() {
@@ -95,6 +108,14 @@ pub fn question(
         0 => String::new(),
         n => format!(" At least {n} words."),
     };
+    let told = match voice {
+        Some(v) => format!(
+            " Every other event of this life is told in {}: tell this one in it too, from the \
+             first sentence to the last.",
+            v.word()
+        ),
+        None => String::new(),
+    };
     let job = match standing {
         Some(_) => format!(
             "Write `{writes}` whole again, as it is to stand in the record — keep everything in \
@@ -105,10 +126,17 @@ pub fn question(
              record."
         ),
     };
+    // **The craft is said where the writing starts.** Put only in the voice,
+    // above a brief whose "what happens" is itself a summary, it was not what
+    // the writer followed: a life event came back as "the decision arrived not
+    // as emotion but as arithmetic" and "the last thing Keeper processed was
+    // the realization that…" — the summary, retold.
     q.push_str(&format!(
-        "\n# Write it now\n\n{job}{length} Build it from your brief and from what you read above: \
-         its people, its places, its time. Answer with `{DRAFT}`, its `text` the whole piece and \
-         nothing but the piece."
+        "\n# Write it now\n\n{job}{length}{told} Build it from your brief and from what you read above: \
+         its people, its places, its time. The brief tells you what happens; you show it \
+         happening — what is done and said, moment by moment, as somebody there would see and \
+         hear it — and never name a feeling or say what the moment means. Answer with \
+         `{DRAFT}`, its `text` the whole piece and nothing but the piece."
     ));
     q
 }
@@ -145,9 +173,93 @@ pub fn already_written(writes: &str, words: usize) -> String {
     )
 }
 
-/// The piece so far with what the writer went on to write after it.
+/// Whether two pieces are the same words in the same order — spacing, line
+/// breaks and a heading's `#` aside.
+pub fn same_words(a: &str, b: &str) -> bool {
+    let words = |t: &str| {
+        t.split_whitespace()
+            .filter(|w| !w.chars().all(|c| c == '#'))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    words(a) == words(b)
+}
+
+/// The refusal for sitting down to a piece this mission has already committed.
+pub fn already_committed(writes: &str) -> String {
+    format!(
+        "{writes} is written and committed — that step of your mission is done. What is left \
+         is your report at the table."
+    )
+}
+
+/// The refusal for a sitting that wrote the standing document back as it was.
+pub fn unchanged(writes: &str) -> String {
+    format!(
+        "You wrote {writes} out again exactly as it stands — nothing in it changed, so there is \
+         nothing to commit. If it can stand as it is, go back to the table and give your verdict. \
+         If something in it is wrong, put that passage right with `file_edit`, or sit down again \
+         and write it changed."
+    )
+}
+
+/// The piece so far with what the writer went on to write after it — less
+/// anything of it the piece already says.
+///
+/// **Carrying on is not starting over.** Asked to go on from where a piece
+/// stopped, the writer wrote it again from its first line, and joined as it
+/// came the piece said every passage twice: the gate refused it five faults
+/// deep, the reviewer cut the copies, fell short of the floor, was carried on,
+/// and wrote it all again — six sittings over one story.
 pub fn joined(so_far: &str, next: &str) -> String {
-    format!("{}\n\n{}", so_far.trim_end(), next.trim())
+    let said = |s: &str| {
+        let s = normal(s);
+        !s.is_empty() && normal(so_far).contains(&s)
+    };
+    let fresh: Vec<String> = next
+        .trim()
+        .split("\n\n")
+        .filter_map(|para| {
+            let para = para.trim();
+            if para.starts_with('#') {
+                return (!said(para)).then(|| para.to_string());
+            }
+            let kept: Vec<&str> = sentences(para).into_iter().filter(|s| !said(s)).collect();
+            (!kept.is_empty()).then(|| kept.join(" "))
+        })
+        .collect();
+    match fresh.is_empty() {
+        true => so_far.trim_end().to_string(),
+        false => format!("{}\n\n{}", so_far.trim_end(), fresh.join("\n\n")),
+    }
+}
+
+/// A passage as [`joined`] compares it: its words, single-spaced.
+fn normal(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A paragraph's sentences, each with its own closing mark.
+fn sentences(para: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bytes = para.as_bytes();
+    for (i, c) in para.char_indices() {
+        let ends = matches!(c, '.' | '!' | '?')
+            && bytes.get(i + 1).is_none_or(|b| b.is_ascii_whitespace());
+        if ends {
+            let s = para[start..=i].trim();
+            if !s.is_empty() {
+                out.push(s);
+            }
+            start = i + 1;
+        }
+    }
+    let rest = para[start..].trim();
+    if !rest.is_empty() {
+        out.push(rest);
+    }
+    out
 }
 
 /// `piece` without a first line that only names the file it is written to —
@@ -167,9 +279,23 @@ pub fn unlabelled(piece: &str, writes: &str) -> String {
         .trim_start_matches('#')
         .trim()
         .trim_matches('`');
-    match [writes, file, stem].contains(&named) {
-        true => lines.next().unwrap_or_default().trim_start().to_string(),
-        false => piece.to_string(),
+    if [writes, file, stem].contains(&named) {
+        return lines.next().unwrap_or_default().trim_start().to_string();
+    }
+    // **Or as a label on the first sentence**: "layers/life/marek-the-ordnance/
+    // 2805 The First Refusal.md: The command post smelled of ionized air…"
+    let rest = lines.next();
+    let labelled = [writes, file, stem].iter().find_map(|name| {
+        named
+            .strip_prefix(name)
+            .and_then(|after| after.trim_start_matches('`').strip_prefix(':'))
+    });
+    match labelled {
+        Some(sentence) => match rest {
+            Some(r) => format!("{}\n{r}", sentence.trim_start()),
+            None => sentence.trim_start().to_string(),
+        },
+        None => piece.to_string(),
     }
 }
 
@@ -197,13 +323,50 @@ mod tests {
                 "# The Revenge Fleet\n\nThe fleet arrived in 2487.".into(),
             )],
             None,
+            Some(Voice::Second),
         );
         assert!(q.starts_with("# Your brief\n\nWrite Zen's life where the record has nothing"));
+        // The voice the life is told in is said with the job.
+        assert!(q.contains(
+            "At least 250 words. Every other event of this life is told in the second person \
+             (\"you\"): tell this one in it too, from the first sentence to the last."
+        ));
         assert!(q.contains("## `layers/eras/the-revenge-fleet.md`\n\n# The Revenge Fleet"));
         assert!(q.contains("Write `layers/life/zen/2491 The Count.md` whole — the piece"));
         assert!(!q.contains("as it stands"));
         assert!(q.contains("At least 250 words."));
+        // The craft is said at the point of writing, after the brief.
+        assert!(q.contains(
+            "The brief tells you what happens; you show it happening — what is done and said, \
+             moment by moment, as somebody there would see and hear it — and never name a \
+             feeling or say what the moment means."
+        ));
         assert!(q.ends_with("its `text` the whole piece and nothing but the piece."));
+    }
+
+    /// **The same words are the same piece**, however they are spaced.
+    #[test]
+    fn a_piece_written_back_unchanged_is_known() {
+        let standing =
+            "# The First Refusal\n\nThe command post smelled of ionized air.\n\nMarek waited.";
+        assert!(same_words(
+            standing,
+            "The First Refusal\nThe command post smelled of ionized air. Marek waited.\n"
+        ));
+        assert!(!same_words(
+            standing,
+            "The command post smelled of ionized air. Marek waited."
+        ));
+        assert!(!same_words(
+            standing,
+            "# The First Refusal\n\nThe post smelled of ionized air.\n\nMarek waited."
+        ));
+        assert!(unchanged("x.md").starts_with("You wrote x.md out again exactly as it stands"));
+        assert_eq!(
+            already_committed("x.md"),
+            "x.md is written and committed — that step of your mission is done. What is left is \
+             your report at the table."
+        );
     }
 
     #[test]
@@ -214,6 +377,11 @@ mod tests {
             380,
             &[],
             Some("  You count the fleet.  "),
+            None,
+        );
+        assert!(
+            !q.contains("Every other event"),
+            "a story has no life's voice"
         );
         assert!(
             q.contains("\n# `layers/stories/the-count.md` as it stands\n\nYou count the fleet.\n"),
@@ -223,7 +391,7 @@ mod tests {
             "Write `layers/stories/the-count.md` whole again, as it is to stand in the record — \
              keep everything in it that is right"
         ));
-        let blank = question("b", "x.md", 0, &[], Some("  "));
+        let blank = question("b", "x.md", 0, &[], Some("  "), None);
         assert!(!blank.contains("as it stands"), "{blank}");
     }
 
@@ -260,6 +428,22 @@ mod tests {
         );
     }
 
+    /// **Carrying on adds only what is new**: a continuation that starts the
+    /// piece over keeps none of what the piece already says, heading included.
+    #[test]
+    fn a_continuation_that_starts_over_adds_only_what_is_new() {
+        let so_far = "# The Ledger\n\nAutumn, 3012. The vault drips.\n\nElian holds the blueprint.";
+        let again =
+            "# The Ledger\n\nAutumn, 3012.  The vault drips. Kael takes it.\n\nElian holds \
+                     the blueprint.\n\nThe door shuts behind them.";
+        assert_eq!(
+            joined(so_far, again),
+            "# The Ledger\n\nAutumn, 3012. The vault drips.\n\nElian holds the blueprint.\n\nKael \
+             takes it.\n\nThe door shuts behind them."
+        );
+        assert_eq!(joined(so_far, so_far), so_far, "nothing new, nothing added");
+    }
+
     #[test]
     fn a_written_piece_is_pointed_at_its_commit() {
         assert_eq!(
@@ -287,6 +471,21 @@ mod tests {
         }
         let titled = "# The Unlocked Door\n\nYou open the door.";
         assert_eq!(unlabelled(titled, W), titled);
+        // A name glued on the first sentence as its label goes; the sentence stays.
+        assert_eq!(
+            unlabelled(&format!("{W}: You open the door.\n\nIt is dark."), W),
+            "You open the door.\n\nIt is dark."
+        );
+        assert_eq!(
+            unlabelled("`2950-06-12 The Unlocked Door.md`: You open the door.", W),
+            "You open the door."
+        );
+        let colon = "The Unlocked Door: you open it.";
+        assert_eq!(
+            unlabelled(colon, W),
+            colon,
+            "a title is not the file's name"
+        );
     }
 
     #[test]

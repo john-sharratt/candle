@@ -15,57 +15,129 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::{err, owner_of, Authored};
+use crate::engine::mission_gen::gates::Form;
 use crate::engine::no_engine;
+use crate::engine::workflow::{Taker, Where, Workflow};
 use crate::sim::operations::Operation;
 use crate::world::Hosted;
 
-/// One operation as an operator reads it, with the names of who carried it and
-/// the brief of its mission still waiting at the table.
-fn view(hosted: &Hosted, op: &Operation, waiting: Option<&str>, carrying: Option<&str>) -> Value {
-    let name_of =
-        |body: Option<&str>| body.and_then(|b| hosted.read(|w| w.actor(b).map(|a| a.name.clone())));
+/// Where an operation stands, as the page names it: `running`, `succeeded`,
+/// `failed` or `cancelled`.
+fn state(op: &Operation) -> &'static str {
+    match op.run.at {
+        Where::NextStep(_) => "running",
+        Where::Done => "succeeded",
+        Where::Failed(_) => "failed",
+        Where::Cancelled(_) => "cancelled",
+    }
+}
+
+/// What an operator needs of one operation, gathered under the world's lock.
+struct Seen {
+    op: Operation,
+    /// The steps of its workflow in order, and which are the table's.
+    steps: Vec<(String, bool)>,
+    waiting: Option<String>,
+    carrying: Option<String>,
+}
+
+/// One operation as an operator reads it: where it stands in its workflow,
+/// every step taken and by whom, and the brief of its mission still waiting at
+/// the table.
+fn view(hosted: &Hosted, seen: &Seen) -> Value {
+    let op = &seen.op;
+    let name_of = |body: &str| hosted.read(|w| w.actor(body).map(|a| a.name.clone()));
+    let history: Vec<Value> = op
+        .run
+        .history
+        .iter()
+        .map(|t| {
+            let (by, by_name) = match &t.by {
+                Taker::Table => ("table".to_string(), Some("the table".to_string())),
+                Taker::Actor(b) => (b.clone(), name_of(b)),
+            };
+            json!({
+                "step": t.step,
+                "by": by,
+                "by_name": by_name,
+                "outcome": t.outcome,
+                "to": t.to,
+                "notes": t.notes,
+            })
+        })
+        .collect();
+    let steps: Vec<Value> = seen
+        .steps
+        .iter()
+        .map(|(name, table)| json!({ "name": name, "table": table }))
+        .collect();
     json!({
         "id": op.id,
         "name": op.name,
         "objective": op.objective,
-        "phase": op.phase,
-        "finished": op.phase.finished(),
+        "workflow": op.run.workflow,
+        "steps": steps,
+        "step": op.step(),
+        "state": state(op),
+        "finished": op.settled(),
+        "round": op.run.round,
+        "send_backs": op.run.send_backs,
         "generator": op.generator,
         "target": op.target,
         "document": op.document,
-        "writer": op.writer,
-        "writer_name": name_of(op.writer.as_deref()),
-        "reviewer": op.reviewer,
-        "reviewer_name": name_of(op.reviewer.as_deref()),
-        "checker": op.checker,
-        "checker_name": name_of(op.checker.as_deref()),
-        "carrying": carrying,
-        "carrying_name": name_of(carrying),
-        "reading": op.reading,
-        "log": op.log,
-        "why": op.why,
-        "waiting_brief": waiting,
+        "carrying": seen.carrying,
+        "carrying_name": seen.carrying.as_deref().and_then(name_of),
+        "history": history,
+        "why": op.why(),
+        "waiting_brief": seen.waiting,
     })
+}
+
+/// The steps of `wf` in order, each with whether the table takes it.
+fn steps_of(wf: Option<&Workflow>) -> Vec<(String, bool)> {
+    wf.map(|w| {
+        w.steps
+            .iter()
+            .map(|s| (s.name.clone(), s.call.is_some()))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Every operation of one world, newest first.
 fn world_ops(hosted: &Hosted) -> Vec<Value> {
-    let ops: Vec<(Operation, Option<String>, Option<String>)> = hosted.sim(|s| {
-        s.missions
-            .operations()
-            .all()
-            .map(|o| {
-                (
-                    o.clone(),
-                    s.missions.waiting_brief(o.id).map(str::to_string),
-                    s.missions.carrying(o.id).map(str::to_string),
-                )
+    let ops: Vec<Seen> = hosted.sim(|s| {
+        let ops = s.missions.operations();
+        ops.all()
+            .map(|o| Seen {
+                op: o.clone(),
+                steps: steps_of(ops.workflow_of(o)),
+                waiting: s.missions.waiting_brief(o.id).map(str::to_string),
+                carrying: s.missions.carrying(o.id).map(str::to_string),
             })
             .collect()
     });
-    ops.iter()
-        .map(|(o, w, c)| view(hosted, o, w.as_deref(), c.as_deref()))
-        .collect()
+    ops.iter().map(|seen| view(hosted, seen)).collect()
+}
+
+/// The workflow a document is put through review on, by its form: a life
+/// event's, a story's, or — for any other page of the record — a
+/// correction's.
+fn workflow_for(path: &str) -> &'static str {
+    match Form::of(path) {
+        Form::LifeEvent => "life-event",
+        Form::Story => "story",
+        Form::Other => "correction",
+    }
+}
+
+/// The first step of `wf` the table takes — where a document already written
+/// is put through review.
+fn first_reading(wf: &Workflow) -> Option<&str> {
+    wf.steps
+        .iter()
+        .find(|s| s.call.is_some())
+        .map(|s| s.name.as_str())
 }
 
 /// `GET /v1/pulse/operations` — every world's operations, newest first.
@@ -92,11 +164,16 @@ pub struct ReviewBody {
     /// Which world; absent is every world with documents.
     #[serde(default)]
     world: Option<String>,
+    /// The workflow to put it through; absent is the one for its form — a
+    /// life event's, a story's, or a correction's for any other page.
+    #[serde(default)]
+    workflow: Option<String>,
 }
 
 /// `POST /v1/pulse/operations` — open an operation that reviews a document
-/// already on the record: the table reads it, and a Maker reviews it. For work
-/// done outside the table.
+/// already on the record: it starts at its workflow's first reading by the
+/// table, and goes on from there as any other. For work done outside the
+/// table.
 pub async fn review(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
@@ -116,6 +193,10 @@ pub async fn review(
             "there is no such document in the mind to review",
         );
     }
+    let workflow = body
+        .workflow
+        .clone()
+        .unwrap_or_else(|| workflow_for(&path).to_string());
     let mut opened = Vec::new();
     for id in rt.hosted.ids() {
         if body.world.as_deref().is_some_and(|w| w != id) {
@@ -124,12 +205,26 @@ pub async fn review(
         let Some(hosted) = rt.hosted.get(&id) else {
             continue;
         };
-        if hosted.sim(|sim| sim.bench.has_root()) {
-            let op = hosted.with_sim(|sim| sim.missions.review_document(&path));
-            opened.push(json!({ "world": id, "operation": op }));
+        if !hosted.sim(|sim| sim.bench.has_root()) {
+            continue;
+        }
+        let op = hosted.with_sim(|sim| {
+            let wf = sim
+                .missions
+                .operations()
+                .workflow(&workflow)
+                .ok_or_else(|| format!("there is no workflow called `{workflow}`"))?;
+            let at = first_reading(wf)
+                .ok_or_else(|| format!("the workflow `{workflow}` has no step the table reads"))?
+                .to_string();
+            sim.missions.review_document(&workflow, &at, &path)
+        });
+        match op {
+            Ok(op) => opened.push(json!({ "world": id, "operation": op })),
+            Err(e) => return err(StatusCode::UNPROCESSABLE_ENTITY, "no_workflow", &e),
         }
     }
-    Json(json!({ "path": path, "opened": opened })).into_response()
+    Json(json!({ "path": path, "workflow": workflow, "opened": opened })).into_response()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -187,49 +282,28 @@ pub async fn edit(
     }
 }
 
-/// `POST /v1/pulse/operations/:wid/:oid/read-again` — send an operation's
-/// review, still waiting at the table, back to the table's reading, so it is
-/// set again from a fresh reading under the current prompt.
-pub async fn read_again(
-    State(s): State<Arc<Authored>>,
-    headers: HeaderMap,
-    Path((wid, oid)): Path<(String, u64)>,
-) -> Response {
-    if let Err(r) = owner_of(&s, &headers).await {
-        return *r;
-    }
-    let Some(rt) = s.runtime.as_ref() else {
-        return no_engine("reading an operation again");
-    };
-    let Some(hosted) = rt.hosted.get(&wid) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "no_world",
-            "no such world is running",
-        );
-    };
-    match hosted.with_sim(|sim| sim.missions.read_again(oid)) {
-        true => Json(json!({ "reading": oid })).into_response(),
-        false => err(
-            StatusCode::CONFLICT,
-            "not_waiting",
-            "the operation has no review waiting at the table",
-        ),
-    }
+#[derive(Debug, Deserialize)]
+pub struct StepBody {
+    /// The step of the operation's workflow to send it to.
+    step: String,
 }
 
-/// `POST /v1/pulse/operations/:wid/:oid/check` — send a succeeded life event
-/// or story to be checked against the main storyline.
-pub async fn check(
+/// `POST /v1/pulse/operations/:wid/:oid/step` — send an operation to a step
+/// of its workflow, in a new round: a running one leaves whatever it waited on
+/// (its step not being carried), a finished one is reopened there — read
+/// again by the table, say, or a passed story checked again against the
+/// storyline.
+pub async fn step(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path((wid, oid)): Path<(String, u64)>,
+    Json(body): Json<StepBody>,
 ) -> Response {
     if let Err(r) = owner_of(&s, &headers).await {
         return *r;
     }
     let Some(rt) = s.runtime.as_ref() else {
-        return no_engine("checking an operation");
+        return no_engine("moving an operation");
     };
     let Some(hosted) = rt.hosted.get(&wid) else {
         return err(
@@ -238,13 +312,11 @@ pub async fn check(
             "no such world is running",
         );
     };
-    match hosted.with_sim(|sim| sim.missions.recheck(oid)) {
-        true => Json(json!({ "checking": oid })).into_response(),
-        false => err(
-            StatusCode::CONFLICT,
-            "not_lore",
-            "only a life event or story that has passed can be sent to be checked",
-        ),
+    let step = body.step.trim();
+    match hosted.with_sim(|sim| sim.missions.send_to_step(oid, step)) {
+        Ok(()) => Json(json!({ "operation": oid, "step": step })).into_response(),
+        Err(e) if e == "no such operation" => err(StatusCode::NOT_FOUND, "no_operation", &e),
+        Err(e) => err(StatusCode::CONFLICT, "not_moved", &e),
     }
 }
 
@@ -378,7 +450,59 @@ pub async fn cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::operations::tests::workflows;
     use crate::sim::operations::Operations;
+
+    /// **A document is put through review on the workflow for its form**, at
+    /// that workflow's first reading by the table.
+    #[test]
+    fn a_document_is_reviewed_on_the_workflow_for_its_form() {
+        assert_eq!(
+            workflow_for("layers/life/keeper/2786 The Charge.md"),
+            "life-event"
+        );
+        assert_eq!(workflow_for("layers/stories/the-ledger.md"), "story");
+        assert_eq!(workflow_for("layers/eras/the-fall.md"), "correction");
+        let all = workflows();
+        for name in ["life-event", "story", "correction"] {
+            let wf = all.iter().find(|w| w.name == name).unwrap();
+            assert_eq!(first_reading(wf), Some("read"), "{name}");
+        }
+    }
+
+    /// **An operation is shown by where it stands in its workflow** and every
+    /// step taken.
+    #[test]
+    fn an_operation_is_shown_by_its_workflow() {
+        let mut ops = Operations::default();
+        ops.set_workflows(workflows());
+        let id = ops
+            .open(
+                "story",
+                None,
+                "untold",
+                "era:x",
+                "Tell X",
+                "layers/stories/x.md",
+            )
+            .unwrap();
+        let op = ops.get(id).unwrap();
+        assert_eq!(state(op), "running");
+        let steps = steps_of(ops.workflow_of(op));
+        assert_eq!(
+            steps,
+            [
+                ("write".to_string(), false),
+                ("fix".to_string(), false),
+                ("read".to_string(), true),
+                ("review".to_string(), false),
+                ("reread".to_string(), true),
+                ("canon".to_string(), false),
+            ]
+        );
+        ops.cancel(id, "not wanted");
+        assert_eq!(state(ops.get(id).unwrap()), "cancelled");
+    }
 
     /// **An operation's document is found where it is now**: on the record,
     /// in the operation's own rejected folder, or moved aside by hand into any
@@ -388,12 +512,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let mut ops = Operations::default();
-        let id = ops.open(
-            "life-event",
-            "life:keeper",
-            "Keeper's charge",
-            "layers/life/keeper/2786 The Charge.md",
-        );
+        ops.set_workflows(workflows());
+        let id = ops
+            .open(
+                "life-event",
+                None,
+                "life-event",
+                "life:keeper",
+                "Keeper's charge",
+                "layers/life/keeper/2786 The Charge.md",
+            )
+            .unwrap();
         let op = ops.get(id).unwrap().clone();
         let put = |rel: &str| {
             let p = root.join(rel);

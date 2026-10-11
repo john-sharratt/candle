@@ -113,6 +113,7 @@ pub mod whereabouts;
 pub mod window;
 pub mod witnessed;
 pub mod work;
+pub mod workflow;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -362,14 +363,9 @@ pub fn api(state: Arc<Authored>) -> Api<Arc<Authored>> {
             post(operations_api::cancel),
         )
         .route(
-            "/v1/pulse/operations/:wid/:oid/read-again",
+            "/v1/pulse/operations/:wid/:oid/step",
             Role::Admin,
-            post(operations_api::read_again),
-        )
-        .route(
-            "/v1/pulse/operations/:wid/:oid/check",
-            Role::Admin,
-            post(operations_api::check),
+            post(operations_api::step),
         )
         .route(
             "/v1/pulse/operations/:wid/:oid/document",

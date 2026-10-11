@@ -54,9 +54,11 @@ pub enum StepMask {
     /// Mask the sampler to this allowed set (a branch frontier).
     Branch(AllowedSet),
     /// Free decode within a span (normal decode — EOS and any close token are
-    /// intercepted by the session, never banned).  `close_boost` is the soft
-    /// close-token logit ramp.
-    Free { close_boost: f32 },
+    /// intercepted by the session).  `close_boost` is the soft close-token logit
+    /// ramp; `opens_value` marks the first step of a call's value, which bans
+    /// the end-of-turn tokens and lifts the repetition penalties for this one
+    /// step (see `StencilSession::free_decode_action`).
+    Free { close_boost: f32, opens_value: bool },
     /// The stencil finished — resume unconstrained decoding.
     Done,
 }
@@ -235,9 +237,15 @@ impl StencilDriver {
                     }
                     return StepMask::Branch(set);
                 }
-                StencilAction::FreeDecode { close_boost } => {
+                StencilAction::FreeDecode {
+                    close_boost,
+                    opens_value,
+                } => {
                     self.stats.free_tokens += 1;
-                    return StepMask::Free { close_boost };
+                    return StepMask::Free {
+                        close_boost,
+                        opens_value,
+                    };
                 }
                 StencilAction::Exit => {
                     self.done = true;
@@ -615,6 +623,46 @@ mod tests {
     /// exercised through one.
     const NUM_ONLY: &str = r#"[{"name":"wait","params":[
         {"name":"secs","type":"number","required":true}]}]"#;
+
+    /// **An end-of-turn token is barred at a call value's first step, and only
+    /// there**: once the value has begun, an EOS closes it as written.
+    #[test]
+    fn an_end_token_is_barred_only_at_a_values_first_step() {
+        let v = TestVocab::new();
+        let tools = parse_tools(STR_ONLY).unwrap();
+        let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3()).unwrap();
+        let tree = Arc::new(compile(&spec, &v).unwrap());
+        let mut driver = StencilDriver::new(tree);
+        let first = loop {
+            match driver.step() {
+                StepMask::Prefill(_) => continue,
+                StepMask::Branch(set) => {
+                    let t = set.tokens()[0];
+                    driver.accept(t, &v.token_bytes(t));
+                }
+                other => break other,
+            }
+        };
+        assert_eq!(
+            first,
+            StepMask::Free {
+                close_boost: 0.0,
+                opens_value: true
+            },
+            "the value's first token"
+        );
+        driver.accept(b' ' as TokenId, b" ");
+        driver.accept(b'"' as TokenId, b"\"");
+        driver.accept(b'a' as TokenId, b"a");
+        assert_eq!(
+            driver.step(),
+            StepMask::Free {
+                close_boost: 0.0,
+                opens_value: false
+            },
+            "a value begun may end on EOS"
+        );
+    }
 
     #[test]
     fn tool_call_value_span_is_never_a_terminal_close_span() {

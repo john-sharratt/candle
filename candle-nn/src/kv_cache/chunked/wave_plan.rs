@@ -1260,10 +1260,11 @@ pub enum WaveBuffer {
     // ── A single-stream draft head's pass (the Qwen3.5 lineage's NextN) ─────
     // The same pass on a stack with ordinary layer norms: the trunk's final
     // norm over every row, that shifted one row right, the two input norms,
-    // their concatenation and `eh_proj` — then the head's attention block, as
-    // a trunk attention layer runs it. Every buffer is `[rows, ·]` in the
-    // compute dtype. Priced zero without a head ([`ModelGeometry::mtp_head`])
-    // and on a wave that stops short of it.
+    // their concatenation, its q8a128 operand on an int8 session, and
+    // `eh_proj` — then the head's attention block, as a trunk attention layer
+    // runs it. Every buffer is `[rows, ·]`, in the compute dtype but for the
+    // operand. Priced zero without a head ([`ModelGeometry::mtp_head`]) and on
+    // a wave that stops short of it.
     /// The rows' embeddings, gathered for the head on the **forward** phase —
     /// beside the ids they are read with, and outside the head's attention
     /// generation, which the gather's staging would otherwise share.
@@ -1278,6 +1279,19 @@ pub enum WaveBuffer {
     MtpHiddenNorm,
     /// The two norms side by side, `[rows, 2 · hidden]`.
     MtpInputCat,
+    /// That concatenation quantized to q8a128 for `eh_proj` — int8 sessions
+    /// only. `MtpInput::forward` hands `eh_proj` the float concatenation, and
+    /// the int8 matmul quantizes it at the call into the concatenation's arena,
+    /// so it lands on the head's attention phase beside it: `[rows, 2 · hidden]`
+    /// of q8a128, the multi-stream head's [`Self::HeadHiddenOperand`] by
+    /// another name.
+    ///
+    /// Undeclared, it was the head pass's one carve the plan did not know
+    /// about, and on the 35B-A3B (`2 · hidden` = `attn_cols` = 4096) exactly the
+    /// size of the [`Self::OProjOperand`] the pass carves second-to-last — so
+    /// wherever the head pass set the attention phase's price the span ran out
+    /// on that operand (`4,704,768 B asked`, 1,021 prefill rows).
+    MtpInputOperand,
     /// `eh_proj`'s output: the head block's input, `[rows, hidden]`.
     MtpInput,
 
@@ -1413,6 +1427,7 @@ impl WaveBuffer {
                 | Self::MtpEmbedNorm
                 | Self::MtpHiddenNorm
                 | Self::MtpInputCat
+                | Self::MtpInputOperand
                 | Self::MtpInput
         )
     }
@@ -1485,6 +1500,7 @@ impl WaveBuffer {
             | Self::MtpEmbedNorm
             | Self::MtpHiddenNorm
             | Self::MtpInputCat
+            | Self::MtpInputOperand
             | Self::MtpInput => Chain::HeadPass,
             Self::MtpRowEmbeds => Chain::Forward,
             Self::HeadEmbedNorm | Self::HeadEmbedOperand | Self::HeadEmbedProj => Chain::Forward,
@@ -1566,6 +1582,7 @@ impl WaveBuffer {
             | Self::MtpEmbedNorm
             | Self::MtpHiddenNorm
             | Self::MtpInputCat
+            | Self::MtpInputOperand
             | Self::MtpInput
             | Self::PleRows
             | Self::PleKeyValue
@@ -2231,12 +2248,17 @@ impl WaveBuffer {
             | Self::MtpEmbedNorm
             | Self::MtpHiddenNorm
             | Self::MtpInputCat
+            | Self::MtpInputOperand
             | Self::MtpInput
                 if !g.mtp_head || w.scored_rows == 0 =>
             {
                 dense(0, 0, g.act_dtype)
             }
             Self::MtpInputCat => dense(rows, 2 * g.hidden, g.act_dtype),
+            // `eh_proj` follows the session's int8 mode, as every projection
+            // the norms feed does; a float `eh_proj` reads the concatenation as
+            // it stands.
+            Self::MtpInputOperand => q8(operand_rows(rows), 2 * g.hidden),
             Self::MtpRowEmbeds
             | Self::MtpTrunkNorm
             | Self::MtpShift
@@ -2826,10 +2848,12 @@ mod tests {
     }
 
     /// A single-stream NextN head's pass over 100 rows of 1024 BF16: five
-    /// `100 × 1024 × 2` buffers and the `2 · hidden` concatenation on the
-    /// head's attention phase, the row embeddings on the forward phase — and
-    /// none of it on a wave that stops short of the head, or on a stack
-    /// without one.
+    /// `100 × 1024 × 2` buffers, the `2 · hidden` concatenation and — on this
+    /// int8 session — its q8a128 operand for `eh_proj` (`100 × 2048` is 1,600
+    /// tiles, 200 super-blocks) on the head's attention phase, the row
+    /// embeddings on the forward phase — and none of it on a wave that stops
+    /// short of the head, or on a stack without one. A float session's
+    /// `eh_proj` reads the concatenation as it stands and carves no operand.
     #[test]
     fn a_single_stream_draft_head_prices_its_pass() {
         let g = ModelGeometry {
@@ -2839,8 +2863,17 @@ mod tests {
         let wide = WaveWidth::prefill(100, 1);
         assert_eq!(WaveBuffer::MtpRowEmbeds.bytes(&g, wide), 204_800);
         assert_eq!(WaveBuffer::MtpInputCat.bytes(&g, wide), 409_600);
+        assert_eq!(WaveBuffer::MtpInputOperand.bytes(&g, wide), 230_400);
         let p = WavePlan::new(g);
-        assert_eq!(p.chain_bytes(Chain::HeadPass, wide), 5 * 204_800 + 409_600);
+        assert_eq!(
+            p.chain_bytes(Chain::HeadPass, wide),
+            5 * 204_800 + 409_600 + 230_400
+        );
+        let float = ModelGeometry {
+            packed_norm: false,
+            ..g
+        };
+        assert_eq!(WaveBuffer::MtpInputOperand.bytes(&float, wide), 0);
         let window = WaveWidth {
             prefill_rows: 100,
             ..WaveWidth::default()
@@ -2849,6 +2882,111 @@ mod tests {
         assert_eq!(WaveBuffer::MtpRowEmbeds.bytes(&g, window), 0);
         let headless = WavePlan::new(gated_partial_rotary());
         assert_eq!(headless.chain_bytes(Chain::HeadPass, wide), 0);
+    }
+
+    /// Qwen3.6-35B-A3B's shapes as an int8 BF16 session with its NextN head:
+    /// hidden 2048, 16 query and 2 KV heads at 256, a 3:1 hybrid whose 30
+    /// DeltaNet layers run a `conv_dim` 8192 / `value_dim` 4096 mixer over 32
+    /// V heads, and a 256-expert MoE with a shared expert.
+    fn qwen36_35b_a3b_with_head() -> ModelGeometry {
+        ModelGeometry {
+            hidden: 2048,
+            vocab: 248_320,
+            intermediate: 512,
+            n_head: 16,
+            n_kv_head: 2,
+            head_dim: 256,
+            experts_per_tok: 8,
+            n_experts: 256,
+            delta_net: Some(DeltaNetWidths {
+                conv_dim: 8192,
+                value_dim: 4096,
+                n_v_heads: 32,
+                layers: 30,
+            }),
+            shared_expert: Some(SharedExpertWidths {
+                intermediate: 512,
+                gate_cols: 32,
+            }),
+            mtp_head: true,
+            ..gated_partial_rotary()
+        }
+    }
+
+    /// **The head pass, walked as it carves, fits the attention phase it runs
+    /// in — including where it is the chain that sets that phase's price.**
+    ///
+    /// The daemon's failure, reproduced in the plan: two deep ingests of 511
+    /// and 510 rows at 100,000 positions each, so each stages a full key chunk
+    /// and the prefill launch's stage and carry make the head's attention block
+    /// out-price every DeltaNet layer. The head pass then IS the attention
+    /// phase's price, and every byte it carves beyond its declarations comes
+    /// out of the last carves' room. `eh_proj`'s q8a128 operand was such a
+    /// byte-for-byte omission — `[1021, 4096]`, the very size the pass's
+    /// `o_proj` operand asks for second-to-last — so the live span ran out on
+    /// exactly that request: `4704768 B asked … Asked by: QMatMul::forward_live_as
+    /// <- output_projection <- forward_attn_batched <- head_wave_pass`.
+    ///
+    /// The assembly is listed here in `head_wave_pass`'s carve order from its
+    /// own arithmetic, not read back from the plan: the trunk's final norm over
+    /// every row, the shift, `enorm`, `hnorm`, the concatenation, the operand
+    /// `eh_proj` quantizes it into, and `eh_proj`'s result. The block behind it
+    /// is a trunk attention layer, whose chain the census tests pin.
+    #[test]
+    fn the_head_pass_fits_the_attention_phase_it_prices() {
+        let g = qwen36_35b_a3b_with_head();
+        let p = WavePlan::new(g);
+        let q_lens = [511usize, 510];
+        let offsets = [100_000usize, 100_000];
+        let w = WaveWidth {
+            kv_stage: PrefillKvStageLayout::new(
+                &q_lens,
+                &offsets,
+                g.n_head,
+                g.n_kv_head,
+                g.head_dim,
+                PrefillLaunchBounds::PRODUCTION,
+            ),
+            ..WaveWidth::prefill(1021, 2)
+        };
+
+        // `1021 × 4096` is 32,672 tiles, 4,084 super-blocks of 1,152 B: the
+        // daemon's ask, to the byte.
+        assert_eq!(WaveBuffer::MtpInputOperand.bytes(&g, w), 4_704_768);
+
+        let hidden_row = 1021 * 2048 * 2;
+        let assembly = [
+            hidden_row,     // final_norm over every row
+            hidden_row,     // the shift
+            hidden_row,     // enorm
+            hidden_row,     // hnorm
+            2 * hidden_row, // [enorm ; hnorm]
+            4_704_768,      // its q8a128 operand for eh_proj
+            hidden_row,     // eh_proj
+        ];
+        let assembled = assembly.iter().fold(0usize, |cursor, &len| {
+            cursor.div_ceil(BUMP_ALIGNMENT) * BUMP_ALIGNMENT + len
+        });
+        assert_eq!(assembled, 33_978_880);
+        assert_eq!(
+            p.chain_bytes(Chain::HeadPass, w),
+            assembled,
+            "the plan's head-pass assembly is not the one head_wave_pass carves"
+        );
+
+        let head_pass = p.walk_chain(assembled, Chain::Attention, w);
+        let delta_net = p.chain_bytes(Chain::DeltaNet, w);
+        assert!(
+            head_pass > delta_net,
+            "this width must make the head pass the phase's binding chain \
+             ({head_pass} B against the DeltaNet layer's {delta_net} B), or the \
+             assertion below is answered by the DeltaNet layer's slack"
+        );
+        assert_eq!(
+            p.phase_bytes(LayerPhase::Attention, w),
+            head_pass,
+            "the attention phase is not priced at what the head pass carves"
+        );
     }
 
     /// A single-stream stack embeds onto the forward span in every forward,

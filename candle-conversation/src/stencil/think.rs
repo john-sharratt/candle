@@ -698,7 +698,16 @@ mod tests {
         // The block-opening newline prefills, then the free span.
         let (mask, primed) = step_to_decode(&mut d, &v);
         assert_eq!(primed, "\n");
-        assert!(matches!(mask, StepMask::Free { .. }));
+        assert!(
+            matches!(
+                mask,
+                StepMask::Free {
+                    opens_value: false,
+                    ..
+                }
+            ),
+            "a thought may end at its first token"
+        );
 
         // A few free tokens, then close → DROP (suppressed).
         free_decode(&mut d, 5);

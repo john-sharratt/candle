@@ -60,9 +60,15 @@ settled targets too).
 
 ## Operations
 
-**The table holds the objective; a mission is one stage of it.** Every mission the generator
-writes opens an operation (`sim::operations`) — named like "Operation Iron Lantern", from two
-word lists in the world's register — and is its draft. The stages:
+**The table holds the objective; a mission is one step of it.** Every proposal the generator
+accepts opens an operation (`sim::operations`) — named like "Operation Iron Lantern", from two
+word lists in the world's register — on its generator's **workflow**, from the `workflows:` of
+`missions.yaml` (`engine::workflow`; the format, and the workflows npcd runs, are
+`docs/npcd_workflows_current.yaml`). A workflow is its steps in order, each taken by a Maker
+(`by: maker`, or `another` — nobody who acted in the round) or by the table (`by: table`, a
+`call` such as `reading`); each step's outcome names the next, until one leads to `done` or
+`failed`. Every Maker step is set on the table by one builder (`mission_gen::step`) from the
+step's prompt, `edits`, `context`, `checks` and `tools`. The steps of the workflows npcd runs:
 
 1. **Draft.** One Maker writes the document. Its report is refused until the document passes
    the engine's **quality gate** (`mission_gen::gates`), with each fault worded as what to
@@ -92,8 +98,8 @@ word lists in the world's register — and is its draft. The stages:
    (`run::reading_prompt`) — and one that does not tell that event is not `sound`. The review carries the draft's own brief's "What
    happens" (`Operation::brief`), so a reviewer writing it anew knows the event it was to tell.
 3. **Review.** A review mission goes on the table carrying that reading. **No Maker takes two
-   stages of one operation** (`Operations::may_take`): the writer never reviews its own draft,
-   and a review reported stuck goes to somebody new. The reviewer reads the draft and what it
+   steps of one round** (`Operations::may_take`, a step `by: another`): the writer never reviews
+   its own draft, and a review reported stuck goes to somebody new. The reviewer reads the draft and what it
    answers to, mends what can be mended with `file_edit`, and `report_done` passes the
    operation — held to the same gate — or `report_rejected` fails it.
 4. **Canon check** (`mission_gen::canon`), for a life event or a story. A third Maker, who has
@@ -119,15 +125,16 @@ is done: the reviewer puts right what the table found, writing the draft again w
 voice is wrong, and rejects only what its mending could not save. Left to judge without
 mending, reviewers rejected nine drafts in nine. A `sound` reading leaves the edit optional.
 
-**The table has the last word on what a review mended** (`Operations::table_read`). A review
-that passes a draft the table did not find sound sends the mended text back to the table, which
-reads it again: sound, it goes on to its canon check; still wanting, it goes to another review,
-by somebody new; read three times (`READINGS_LIMIT`) and still wanting, the operation fails in
-the table's words and the draft leaves the record. The table reads with the subject's anchor,
-its other events and the era in front of it; a reviewer mends in a few turns. Before this, a Zen
-the table failed for having hands and a chair was "mended" by its reviewer and stood.
-An operator can send a review still waiting at the table back to be read again
-(`POST /v1/pulse/operations/:wid/:oid/read-again`).
+**The table has the last word on what a review passed** (the `reread` step). Every pass is read
+again: sound, it goes on to its canon check; still wanting, it goes to another review, by
+somebody new; failing, to be fixed. A route back to an earlier step — `fix` is listed before the
+reading, so a rejection is one — is a **send-back**: a new round, in which whoever sent it back
+takes no part and the writer may fix it. Sent back past the workflow's `send-backs`, the
+operation fails in the last step's words. The table reads with the subject's anchor, its other
+events and the era in front of it; a reviewer mends in a few turns. Before this, a Zen the table
+failed for having hands and a chair was "mended" by its reviewer and stood. An operator can send
+an operation to any step of its workflow — read again, or checked again against the storyline
+(`POST /v1/pulse/operations/:wid/:oid/step {step}`).
 
 **A rejection shows its evidence** (`mission_gen::rejection`). `report_rejected` is refused
 unless its reason quotes the draft as it stands (the same 12-character quote a reading is held
@@ -160,22 +167,25 @@ title, or a layer document's address.
 
 A rejected draft is moved to `rejected/<operation>/` in the mind (`Benches::retire`), where no
 world reads it and an operator still can; its target counts a stuck and is tried again by a
-fresh operation, up to the ledger's limit. Only a draft leaves — a life event or a story
-(`Operation::leaves_on_failure`). A correction works on a document the record already held, so
-when it fails its document is put back to what it said when the operation opened
-(`Operation::before`, `Sim::set_aside_failed`): moving the era aside would lose canon, and leaving
+fresh operation, up to the ledger's limit. What becomes of a failed operation's document is its
+workflow's `on-failed`: a draft — a life event or a story — is set aside (`set-aside`). A
+correction works on a document the record already held, so when it fails its document is put
+back to what it said when the operation opened (`restore`; `Operation::before`,
+`Sim::set_aside_failed`): moving the era aside would lose canon, and leaving
 the rejected edit would let it stand — unless a later operation on the same document has since
 succeeded, whose accepted text that would overwrite. Every failed operation is settled this way by
 the generator's loop, however it failed — rejected, read past the limit, or stuck — and a
 rejection is settled at once as well. A target is settled when its operation is, not when
 its draft is reported. An operator can put any document already on the record through the
-reading and a review (`POST /v1/pulse/operations {path}`).
+reading and a review (`POST /v1/pulse/operations {path}`): it opens on the workflow for its
+form — a life event's, a story's, or a correction's — at that workflow's first reading.
 
 The operations tab of the npcd console (`/operations`) shows each running operation's place
-in the chain and who carries it, the table's reading and the log of every stage, and folds the
-finished away below. An operation can be renamed, its objective restated, the brief of its
-waiting mission rewritten (`PATCH /v1/pulse/operations/:wid/:oid`), or called off
-(`POST …/:oid/cancel`), which stands down whoever is carrying it.
+in its workflow and who carries it, every step taken with its outcome and what it found, and
+folds the finished away below. An operation can be renamed, its objective restated, the brief
+of its waiting mission rewritten (`PATCH /v1/pulse/operations/:wid/:oid`), sent to a step
+(`POST …/:oid/step`), or called off (`POST …/:oid/cancel`), which stands down whoever is
+carrying it.
 
 ## Who chooses what
 

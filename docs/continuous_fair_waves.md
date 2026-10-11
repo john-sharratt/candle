@@ -99,6 +99,17 @@ of forward progress per wave (fractional, accumulated):
 `R` is the single knob that trades ingest throughput against decode latency, set
 per layer by how interactive that layer's conversations are.
 
+**Only an outranking decode is protected.** The creep yields to the decodes whose
+priority is strictly higher than its own, at the highest of their ratios; with
+none, `R = 1` and it clears every layer in one wave. A creep runs at the band of
+its highest-ranked prompt (a decode or prompt whose layer does not resolve counts
+as `High`, the band it is gated in), and section chunks, which are background
+ingest, ride at the band of the prompt they joined — alone they are `Low`. A
+second conversation's prompt is not background to the first: both are `High`,
+so it shares the next wave whole. Held to one layer a wave beside a `High`
+decode, a 26-token prompt waited 57 s for another conversation's tool round to
+finish (`scheduler::prefill::throttle_ratio`).
+
 ### 3.1 Priority pause
 
 The throttle shares the device; the pause yields it. While any sequence of a

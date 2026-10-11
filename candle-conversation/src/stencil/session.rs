@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::error::WalkError;
 use super::mask::AllowedSet;
-use super::terminator::{Feed, TerminatorState};
+use super::terminator::{Feed, Terminator, TerminatorState};
 use super::tree::{FreeTextSpan, NodeId, StencilNode, StencilTree};
 use super::trie::{Step, TokenTrie, TrieNodeId};
 use super::vocab::TokenId;
@@ -23,9 +23,12 @@ pub enum StencilAction {
     /// The next decode is masked to this allowed set (a branch frontier).
     MaskedDecode(AllowedSet),
     /// The next decode is free (normal decode — EOS and any close token are
-    /// intercepted by the session's `observe`, never banned).  `close_boost` is
-    /// added to the span's close token (the soft ramp).
-    FreeDecode { close_boost: f32 },
+    /// intercepted by the session's `observe`).  `close_boost` is added to the
+    /// span's close token (the soft ramp). `opens_value` is set at the first
+    /// token of a call's value, where the model chooses how the value opens: no
+    /// end-of-turn token may be sampled there, and no repetition penalty weighs
+    /// on the choice — see [`StencilSession::free_decode_action`].
+    FreeDecode { close_boost: f32, opens_value: bool },
     /// Stencil finished — resume normal decode.
     Exit,
 }
@@ -243,11 +246,32 @@ impl StencilSession {
     }
 
     /// The free-decode action for `span` given its running `emitted` count.
-    /// Decode is normal — EOS and any close token are intercepted by `observe`,
-    /// never banned — so the only per-step parameter is the soft close ramp.
+    /// Decode is normal — EOS and any close token are intercepted by `observe`
+    /// — with the soft close ramp, and one exception.
+    ///
+    /// **An end-of-turn token is not a call's value.** At the first token of a
+    /// value the model may write it, or write it empty with its own quotes; an
+    /// EOS sampled there is the model reaching to end its turn, and intercepted
+    /// it closed the value empty. After one long field a model stopped like
+    /// this on every field left — `"faults": ""`, `"turns": ""`,
+    /// `"happens": ""` — and a call closed whole and hollow. So the end tokens
+    /// are barred at a value's first step, and once anything of the value is
+    /// written an EOS closes it as written. A reasoning span (`Never`), and a
+    /// span whose job is to run to EOS (`eos_ends`), keep it: ending there is
+    /// how they close.
+    ///
+    /// **How a value opens is the model's choice, not a repetition.** Every
+    /// string opens on the same token, ` "`, so by a call's third field the
+    /// presence penalty has counted it — in the reasoning before the call and
+    /// in each value already written — while the empty value's single token
+    /// ` ""` is never counted. A table that had planned its faults in thinking
+    /// ("I'll combine these into the faults array") wrote `"faults": ""` in 64
+    /// readings of 64, and a verdict of `sound` after it. So the first step of
+    /// a value samples without the repetition penalties.
     fn free_decode_action(span: &FreeTextSpan, emitted: u32) -> StencilAction {
         StencilAction::FreeDecode {
             close_boost: span.limits.boost_at(emitted),
+            opens_value: emitted == 0 && !span.eos_ends && span.term != Terminator::Never,
         }
     }
 

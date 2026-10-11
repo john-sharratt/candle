@@ -70,8 +70,8 @@ as its working directory. cf-ddns is the exception — see below.
 
 | Service | Machine | Listens | Build | Stop by default in `/down` |
 |---|---|---|---|---|
-| web | .5 | `0.0.0.0:80` (from `web/web.yaml`) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
-| zend | .5 | `192.168.0.5:8081` | `cargo build --release -p zend` | yes |
+| web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:9443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml` — `rdp-tunnel-server` holds 443 and 8443) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
+| zend | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the gateway's upstream | `cargo build --release -p zend` | yes |
 | npcd | .6 | `0.0.0.0:8081` | `cargo build --release -p npcd` | yes |
 | cf-ddns | .5 | — (outbound only) | scheduled task, see below | **never** |
 
@@ -84,7 +84,7 @@ Paths are relative to the repo root.
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
-| .5 | zend | `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --max-depth 3 -v` | 2026-09-29, from the running process — the workspace is `D:\prog`, whose `workspace.yaml` lists the repositories (`candle`, `battle-cities`); its substrate is `D:\prog\substrate`. `repo_map` and `code_reading` ingest to three path components below each repository's root; what was ingested deeper is retained while a branch holds it; `-v` (DEBUG) |
+| .5 | zend | `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --tls-port 8444 --max-depth 2 -v` | 2026-10-10 — the workspace is `D:\prog`, whose `workspace.yaml` lists the repositories (`candle`, `battle-cities`); its substrate is `D:\prog\substrate`. `repo_map` and `code_reading` ingest to two path components below each repository's root; what was ingested deeper is retained while a branch holds it; `--tls-port 8444` is the gateway's upstream (`self_signed: true` in `web/web.yaml`); `-v` (DEBUG) |
 | .6 | npcd | `target\release\npcd.exe --bind 0.0.0.0:8081 --content web/content/npcd --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`) |
 
 Notes on the arguments:

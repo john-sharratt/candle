@@ -71,6 +71,9 @@ candle-kernels/build_tool/
 # is left unanchored on purpose — if one is ever added, anchor this instead.
 substrate/
 substrate.*/
+# The same log under its hidden name, which a crate's tests have left behind in
+# the crate's own folder (`npcd/.substrate/` at 4 GB).
+.substrate/
 
 # Per-folder substrate metadata — the daemon writes a `.substrate.yaml` (summary,
 # distinctive terms, retrieval questions) into every folder it maps.

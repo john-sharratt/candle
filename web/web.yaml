@@ -32,6 +32,33 @@ server:
   # must not take the real one.
   bind: "0.0.0.0:80"
 
+  # ── the TLS entrance ──────────────────────────────────────────────────────
+  # HTTP/3 over QUIC on udp, with HTTP/2 and HTTP/1.1 over tcp for a client
+  # that cannot reach udp — both on one port. A browser's first request always
+  # comes over tcp; every tcp answer carries `Alt-Svc: h3=":443"`, and its next
+  # connection tries QUIC.
+  #
+  # Certificates come from Let's Encrypt, issued and renewed by this process:
+  # one per site, covering that site's public hosts (wildcards and .localhost /
+  # .test names are left out — HTTP-01 cannot prove them). The CA's challenge
+  # arrives on the plain entrance above, through the tunnel or directly, and is
+  # answered there for every hostname. Each name is proved to reach this box
+  # before it goes into an order, and `web/src/acme/ledger.rs` holds every order
+  # far under the CA's rate limits — read it before changing anything here.
+  #
+  # Like sign-in, it is off unless its file exists, so this table stays the
+  # same everywhere and only the box meant to bind 443 and ask a CA does:
+  #
+  #   cat > web/secrets/tls.yaml <<'YAML'
+  #   bind: "0.0.0.0:443"
+  #   acme:
+  #     store: "secrets/acme"     # account, certificates, ledger
+  #   YAML
+  #
+  # Open tcp/443 and udp/443 to this box for clients that reach it directly.
+  # With only tcp open everything still works over HTTP/2.
+  tls_file: "secrets/tls.yaml"
+
   # How long a static file may be reused before the browser asks again.
   #
   # Two tiers, split by how much a stale copy matters rather than by how often
@@ -221,11 +248,17 @@ sites:
   #
   # It has no mock, so `--authoritative` cannot stand in for it — that is
   # reported at startup rather than discovered from an empty page.
+  #
+  # Over TLS: zend runs with `--tls-port 8444` and serves it with a certificate
+  # it makes at startup, a new key each time, so `self_signed` tells the proxy
+  # to accept it without a CA. The handshake still proves zend holds that key;
+  # this is the private network, and only this route says so.
   - name: zend
     hosts: ["code.tokera.com", "zend.localhost", "zend.test"]
     api:
       - prefix: /
-        upstream: "http://192.168.0.5:8081"
+        upstream: "https://192.168.0.5:8444"
+        self_signed: true
 
   # ── the other Tokera names ──────────────────────────────────────────────
   # Every alternate domain for the brand, sent to the one that is the brand.

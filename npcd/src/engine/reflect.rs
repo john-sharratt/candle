@@ -380,9 +380,11 @@ fn call_tree(
                 enum_values: None,
                 items: None,
                 min_items: 0,
+                max_items: None,
                 properties: None,
                 nullable: false,
                 minimum: None,
+                max_tokens: None,
                 requires: Vec::new(),
                 shapes: Vec::new(),
             })
@@ -1185,7 +1187,7 @@ impl<'t> Reflect<'t> {
 
         // **The repetition control is the cast's, and it is not adjusted here.**
         //
-        // The base sampling carries DRY, presence, and any `cross_turn_penalty`
+        // The base sampling carries presence and any `cross_turn_penalty`
         // from the checkpoint, and the schema does not set
         // `free_tool_calls_from_penalties` — so all of it is live inside the
         // stencilled `brief` span, which is exactly where it is wanted: the

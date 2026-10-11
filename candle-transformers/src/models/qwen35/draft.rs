@@ -218,8 +218,9 @@ pub fn head_wave_pass(
         }
     }
 
-    // The two norms, their concatenation and `eh_proj` each inherit the pass
-    // from their operands (`MtpEmbedNorm` … `MtpInput`).
+    // The two norms, their concatenation, the q8a128 operand an int8 `eh_proj`
+    // quantizes it into, and `eh_proj`'s result each land on the pass
+    // (`MtpEmbedNorm` … `MtpInput`).
     let x = head.input.forward(&embed, &shifted, ticket)?;
     let xt = TensorCat::from_cat_tensor(x.reshape((1, rows, hidden))?, 0)?;
 
@@ -356,9 +357,11 @@ pub fn draft_cohort(
     // A step's forward phase carries what a wave's head does — its embeddings,
     // the closing norm, the logits — **plus** the head's input assembly, which
     // a wave runs on the head pass's attention generation (`Chain::HeadPass`)
-    // and a step runs here; so it is covered for both. The assembly's trunk
-    // norm and shift, which a step does not carve, are the room its two
-    // quantized operands take instead.
+    // and a step runs here; so it is covered for both, `eh_proj`'s q8a128
+    // operand included (`WaveBuffer::MtpInputOperand`). The assembly's trunk
+    // norm and shift, which a step does not carve, are the room its closing
+    // norm takes in the dense form the LM head then quantizes from — the
+    // forward phase prices that norm only in the head's packed encoding.
     if let Device::Cuda(d) = dev {
         let plan = WavePlan::new(model.wave_geometry(act_dtype));
         let width = WaveWidth::decode(n);
