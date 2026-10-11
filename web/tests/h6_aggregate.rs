@@ -105,6 +105,7 @@ fn member(hub: &Arc<Hub>, node: u64) -> Arc<AppMember> {
             cores: 1,
             load_milli: 0,
         }),
+        None,
         WallInstant::now(),
     );
     let router = Router::new().route(

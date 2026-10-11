@@ -37,6 +37,11 @@ pub enum LoadStep {
     /// §7.6): dial each until one admits this member, every one has failed an
     /// attempt, or ten seconds have passed. Skipped standalone.
     Connecting,
+    /// Catch up on what the group wrote while this member was away, and take
+    /// a generation for what it wrote cut off (§7.2, §7.6). Skipped standalone
+    /// and when no cluster was reached.
+    #[serde(rename = "catchup")]
+    CatchUp,
     /// Install every act into the schema's `tools` collection, one member each,
     /// so a turn can show the ones it is able to take. See `engine::tools::install`.
     ///
@@ -65,6 +70,7 @@ impl LoadStep {
         LoadStep::Model,
         LoadStep::Substrate,
         LoadStep::Connecting,
+        LoadStep::CatchUp,
         LoadStep::Tools,
         LoadStep::Layers,
         LoadStep::Waking,
@@ -76,6 +82,7 @@ impl LoadStep {
             LoadStep::Model => "model",
             LoadStep::Substrate => "substrate",
             LoadStep::Connecting => "connecting",
+            LoadStep::CatchUp => "catchup",
             LoadStep::Tools => "tools",
             LoadStep::Layers => "layers",
             LoadStep::Waking => "waking",
@@ -88,6 +95,7 @@ impl LoadStep {
             LoadStep::Model => "Loading model",
             LoadStep::Substrate => "Replaying substrate",
             LoadStep::Connecting => "Connecting to the cluster",
+            LoadStep::CatchUp => "Catching up",
             LoadStep::Layers => "Ingesting mind layers",
             LoadStep::Tools => "Installing tools",
             LoadStep::Waking => "Waking the cast",
@@ -102,6 +110,7 @@ impl LoadStep {
             LoadStep::Model => "layers",
             LoadStep::Substrate => "turns",
             LoadStep::Connecting => "clusters",
+            LoadStep::CatchUp => "records",
             LoadStep::Layers => "files",
             LoadStep::Tools => "tools",
             LoadStep::Waking => "characters",
@@ -348,6 +357,7 @@ mod tests {
                 LoadStep::Model,
                 LoadStep::Substrate,
                 LoadStep::Connecting,
+                LoadStep::CatchUp,
                 LoadStep::Tools
             ]
         );
@@ -375,7 +385,8 @@ mod tests {
         // The cluster is joined once the substrate — and the node it carries —
         // is open, and before anything is written that the group would share.
         assert!(pos(LoadStep::Substrate) < pos(LoadStep::Connecting));
-        assert!(pos(LoadStep::Connecting) < pos(LoadStep::Tools));
+        assert!(pos(LoadStep::Connecting) < pos(LoadStep::CatchUp));
+        assert!(pos(LoadStep::CatchUp) < pos(LoadStep::Tools));
     }
 
     #[test]
@@ -426,7 +437,7 @@ mod tests {
         }
         assert_eq!(
             LoadStep::ALL.len(),
-            6,
+            7,
             "a step was added without a decision"
         );
     }

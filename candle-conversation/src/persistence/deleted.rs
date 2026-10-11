@@ -18,8 +18,10 @@
 //! `origin`, `oseq` as `u64`s; `u32` swept count, then each swept timeline as a
 //! `u64`.
 
+use super::identity::RecordIdentity;
 use super::le_reader::LeReader;
-use super::Result;
+use super::record::RecordType;
+use super::{Result, SubstratePersistence};
 
 /// One expired timeline tombstone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -72,6 +74,25 @@ impl DeletedPayload {
         }
         r.finish()?;
         Ok(DeletedPayload { timelines, swept })
+    }
+}
+
+impl SubstratePersistence {
+    /// Make the deleted set durable now, whole: an entry a catch-up brought in
+    /// must survive a restart before the next compaction rewrites the record
+    /// (§6.8, §7.2).
+    pub fn write_deleted(&mut self, deleted: &DeletedPayload) -> Result<()> {
+        self.append_carried(
+            RecordType::Deleted,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &deleted.encode(),
+            RecordIdentity::NONE,
+        )?;
+        self.commit()
     }
 }
 

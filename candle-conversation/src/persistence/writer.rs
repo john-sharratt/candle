@@ -29,8 +29,10 @@
 //! already made their in-memory change, which is all a read-only substrate
 //! keeps; nothing is ever committed.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crossbeam::channel::{self, Receiver, Sender};
 
@@ -241,10 +243,32 @@ impl Backpressure {
     }
 }
 
+/// How far the writer has come: jobs queued, and jobs written — for a caller
+/// that waits until what it queued is in the log, as a request's response does
+/// before it ends (`docs/replicated_substrate.md` §6.4).
+#[derive(Default)]
+struct Progress {
+    queued: AtomicU64,
+    written: Mutex<u64>,
+    advanced: Condvar,
+}
+
+impl Progress {
+    fn wrote_one(&self) {
+        *self.written.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.advanced.notify_all();
+    }
+}
+
+/// How long [`SubstrateWriter::wait_written`] waits before giving up on a
+/// writer that has stopped.
+const WAIT_WRITTEN: Duration = Duration::from_secs(10);
+
 /// The off-thread substrate writer: a bounded queue + a drainer thread.
 pub struct SubstrateWriter {
     tx: Sender<(WriteJob, u64)>,
     backpressure: Arc<Backpressure>,
+    progress: Arc<Progress>,
     handle: Mutex<Option<JoinHandle<()>>>,
     /// The persistence handle was opened read-only: no thread runs, and
     /// [`Self::enqueue`] drops every job.
@@ -268,24 +292,64 @@ impl SubstrateWriter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_read_only();
+        let progress = Arc::new(Progress::default());
         if read_only {
             return Self {
                 tx,
                 backpressure,
+                progress,
                 handle: Mutex::new(None),
                 read_only,
             };
         }
         let bp = backpressure.clone();
+        let written = progress.clone();
         let handle = std::thread::Builder::new()
             .name("substrate-writer".into())
-            .spawn(move || writer_loop(rx, substrate, persistence, bp))
+            .spawn(move || writer_loop(rx, substrate, persistence, bp, written))
             .expect("spawn substrate-writer thread");
         Self {
             tx,
             backpressure,
+            progress,
             handle: Mutex::new(Some(handle)),
             read_only,
+        }
+    }
+
+    /// A position in the queue: every job enqueued before this call is at or
+    /// below it.
+    pub fn ticket(&self) -> u64 {
+        self.progress.queued.load(Ordering::SeqCst)
+    }
+
+    /// Block until every job at or below `ticket` has been appended — or the
+    /// writer has stopped, which gives up after [`WAIT_WRITTEN`]. Over a
+    /// read-only substrate nothing is queued, so it returns at once.
+    pub fn wait_written(&self, ticket: u64) {
+        let deadline = Instant::now() + WAIT_WRITTEN;
+        let mut written = self
+            .progress
+            .written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while *written < ticket {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                tracing::warn!(
+                    target: "candle_conversation::persistence::writer",
+                    ticket,
+                    written = *written,
+                    "gave up waiting for the substrate writer"
+                );
+                return;
+            }
+            written = self
+                .progress
+                .advanced
+                .wait_timeout(written, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 
@@ -307,6 +371,8 @@ impl SubstrateWriter {
         // next boot the turn is simply absent — which reconstruct tolerates.
         if self.tx.send((job, bytes)).is_err() {
             self.backpressure.release(bytes);
+        } else {
+            self.progress.queued.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -333,11 +399,13 @@ fn writer_loop(
     substrate: Arc<RwLock<Substrate>>,
     persistence: Arc<PersistenceLock>,
     bp: Arc<Backpressure>,
+    progress: Arc<Progress>,
 ) {
     while let Ok((first, first_bytes)) = rx.recv() {
         let t_process = std::time::Instant::now();
         let mut ack = process_one(first, &substrate, &persistence);
         bp.release(first_bytes);
+        progress.wrote_one();
         let mut n = 1;
         let mut batch_bytes = first_bytes;
         while ack.is_none() && n < MAX_BATCH {
@@ -345,6 +413,7 @@ fn writer_loop(
                 Ok((job, bytes)) => {
                     ack = process_one(job, &substrate, &persistence);
                     bp.release(bytes);
+                    progress.wrote_one();
                     n += 1;
                     batch_bytes += bytes;
                 }

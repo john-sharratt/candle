@@ -116,7 +116,10 @@ use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
 use candle_conversation::EngineSource;
 use cluster::member::{ClusterView, Link};
-use host::cluster::view::{admitted, connecting_detail, model_id};
+use host::cluster::store::ConversationStore;
+use host::cluster::view::{
+    admitted, catchup_detail, catchup_progress, connecting_detail, model_id,
+};
 use host::cluster::Join;
 use host::download::ensure_model_pack;
 use host::process::fatal;
@@ -4000,10 +4003,14 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     // process stops.
     if let Some(join) = &plan.cluster {
         p.set_step(LoadStep::Connecting);
-        let (node, model, writer) = {
+        let (node, model, writer, store) = {
             let e = engine.lock().unwrap();
             let conv = e.conversation();
-            (conv.node(), model_id(e.model_key()), conv.clone())
+            let reloader = e.reloader();
+            let store = ConversationStore::new(conv.clone(), e.kv_layers(), move || {
+                reloader.reload_and_wait()
+            });
+            (conv.node(), model_id(e.model_key()), conv.clone(), store)
         };
         let report = |views: &[ClusterView]| {
             p.set_progress(admitted(views), views.len() as u64);
@@ -4013,12 +4020,22 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         let link = join.connect(
             node,
             Some(model),
+            store.replication()?,
             move || writer.last_oseq(),
             stopping,
             report,
         );
         if let Link::Stopped(_) = link {
             join.hold(stopping, report);
+        }
+        if link == Link::Joined {
+            // Ready only once caught up on what the group wrote (§7.6).
+            p.set_step(LoadStep::CatchUp);
+            join.catch_up(stopping, |catchups| {
+                let (done, total) = catchup_progress(catchups);
+                p.set_progress(done, total);
+                p.set_detail(catchup_detail(catchups));
+            });
         }
         if rt.stopping() {
             anyhow::bail!("the process stopped while connecting to the cluster");

@@ -195,11 +195,13 @@ impl Gone {
 }
 
 /// What the answerer holds of `origin`'s range `from..=to`, a range it covers
-/// completely (§7.2).
+/// completely (§7.2). `answerer` names it, the member a `FETCH` for these
+/// records goes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Headers {
     pub request: u64,
     pub reply_to: u64,
+    pub answerer: u64,
     pub origin: u64,
     pub from: u64,
     pub to: u64,
@@ -211,6 +213,7 @@ impl Headers {
     pub fn write(&self, w: &mut Writer) {
         w.u64(self.request)
             .u64(self.reply_to)
+            .u64(self.answerer)
             .u64(self.origin)
             .u64(self.from)
             .u64(self.to)
@@ -222,6 +225,7 @@ impl Headers {
         let h = Self {
             request: r.u64()?,
             reply_to: r.u64()?,
+            answerer: r.u64()?,
             origin: r.u64()?,
             from: r.u64()?,
             to: r.u64()?,

@@ -128,7 +128,9 @@ pub use conversation::{
     ChainRound, GlueMarkers, PieceKind, PromptDump, PromptPiece, SectionRef, SectionState,
     Sequence, UnsealedAsker,
 };
-pub use engine::{ConversationEngine, EngineAttacher, SubstrateReloadStatus, ThinkSteering};
+pub use engine::{
+    ConversationEngine, EngineAttacher, SubstrateReloadStatus, SubstrateReloader, ThinkSteering,
+};
 pub use engine_slot::{Capabilities, EngineSlot, EngineSource, EngineTicket};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};

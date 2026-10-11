@@ -1,8 +1,9 @@
 # Replicated substrate: zend, npcd and agents as members of the gateway
 
-**Status:** being built in §15's order. Chunks 1–4 are built: substrate identity and
-order-independent apply, the `cluster` crate's wire protocol, consensus, and members
-behind the gateway without replication. Chunks 5–10 are not. **Scope:** a zend or npcd daemon started with
+**Status:** being built in §15's order. Chunks 1–5 are built: substrate identity and
+order-independent apply, the `cluster` crate's wire protocol, consensus, members behind
+the gateway, and live replication with catch-up and rejoin. Chunks 6–10 are not.
+**Scope:** a zend or npcd daemon started with
 `--cluster https://<host or ip>` — and a new kind of member, the *agent*, a CPU machine
 that runs command-line work inside repositories — dials that web gateway over one
 WebSocket per app, proves it holds the estate's group key, and while connected *is* that
@@ -902,9 +903,9 @@ u8 kind | u8 flags | u32 stream (LE) | body…        (WebSocket supplies the le
 | `FIN` / `RESET` | end or abort one stream | ordered |
 | `EVENT` | one substrate record (§6.3), fragmented above 1 MiB | ordered, or catch-up when `flags & CATCHUP` |
 | `RECEIPT` | `{ through }` — gateway → member: every frame of this session up to sequence `through` has been taken in (§6.3) | control |
-| `ACK` | `{ origin → applied_through }` — what this member has applied | control |
+| `ACK` | `{ origin → applied_through }` — what this member has applied, its own origin at its highest `oseq` it may send among them; sent on admission and at most once a second as either changes | control |
 | `CATCHUP` | `{ request, reply_to, to?, since: origin → applied_through }` — a member asking what exists after what it holds; `to` names the member to ask, or is absent for the gateway to pick (§7.2, §7.5) | control |
-| `HEADERS` | `{ request, reply_to, origin, from, to, gone, records: [(oseq, type, stream_id, chunk_index, len, digest)] }` — what the answerer holds of one origin's range `from..=to`, a range it covers completely; `gone` lists the `oseq`s in it the answerer knows no longer exist, each one that was an expired tombstone carrying its deleted-set entry (§6.8, §7.2) | catch-up |
+| `HEADERS` | `{ request, reply_to, answerer, origin, from, to, gone, records: [(oseq, type, stream_id, chunk_index, len, digest)] }` — what the answerer holds of one origin's range `from..=to`, a range it covers completely; `gone` lists the `oseq`s in it the answerer knows no longer exist, each one that was an expired tombstone carrying its deleted-set entry (§6.8, §7.2) | catch-up |
 | `FETCH` | `{ request, reply_to, from_node, origin, oseqs }` — ask one member for the records themselves | control |
 | `EVENT` with `flags & ADDRESSED` | a fetched record, carrying `reply_to` | catch-up |
 | `DONE` | `{ request, reply_to }` — the last `HEADERS` of an answer, or the last record of a `FETCH` | catch-up |
@@ -955,7 +956,7 @@ misread, and on an admitted socket closes it 4400.
 | `RECEIPT` | 61 | `u64 through` |
 | `ACK` | 62 | `list<u64 origin · u64 applied_through>` |
 | `CATCHUP` | 63 | `u64 request` · `u64 reply_to` · `opt<u64> to` · `applied` since |
-| `HEADERS` | 64 | `u64 request` · `u64 reply_to` · `u64 origin` · `u64 from` · `u64 to` · `list<u64 oseq · opt<blob> deleted_entry>` gone · `list<record header>`; every `oseq` within `from..=to` |
+| `HEADERS` | 64 | `u64 request` · `u64 reply_to` · `u64 answerer` · `u64 origin` · `u64 from` · `u64 to` · `list<u64 oseq · opt<blob> deleted_entry>` gone · `list<record header>`; every `oseq` within `from..=to`. `answerer` is the member that holds the records, whom the requester's `FETCH` names |
 | `FETCH` | 65 | `u64 request` · `u64 reply_to` · `u64 from_node` · `u64 origin` · `list<u64> oseqs` |
 | `DONE` | 66 | `u64 request` · `u64 reply_to` |
 | `HAVE` | 67 | `u64 request` · `u64 reply_to` · `applied` |
@@ -1025,7 +1026,10 @@ A gateway relays only among the members connected to *it*. An event leaves its o
 through one cluster (§6.3), so a member joined to every cluster receives it once, from
 that cluster. A member whose socket to that cluster was down misses it and gets it from
 its catch-up (§7). Gateways never relay to each other: the members, joined to several
-clusters, are what carries a record across them.
+clusters, are what carries a record across them. That rests on **every member joining
+every cluster** (`--cluster` for every gateway, §15.1). A member configured with fewer
+never sees the others' members in `MEMBERS`, so no `high_water` tells it what they
+wrote; their events reach it only through the catch-ups it runs for other reasons.
 
 ### 4.4 Gateway queues
 
@@ -1742,13 +1746,22 @@ clusters and reach a receiver out of order. They are applied in the order they a
 ### 6.4 Events before the response
 
 A request's response ends only after the events it caused are on the socket ahead of
-it. Each request carries a `WriteTicket`: the persistence writer's enqueue counter when
-the handler returned (`persistence/writer.rs` queues jobs FIFO, `:311-356`). The member
-holds that stream's `FIN` until the tap has emitted every record enqueued at or before
-the ticket. Those records go out on the same socket as the stream (§6.3). Stream frames
-and events share that socket's one ordered lane (§4.2), and the gateway relays a member's
-events in arrival order. So any request *that gateway* routes to another member
-afterwards lands behind those events on that member's ordered lane.
+it (`host/src/cluster/flush.rs`). When the handler's body is done, the member takes a
+`WriteTicket` — the substrate writer's enqueue counter (`persistence/writer.rs` queues
+jobs FIFO) — and waits until every job at or below it is in the log, which taps its
+records. Every own event still unsent then goes on the request's socket, and one that
+already left round robin on another socket is waited for until that gateway has
+receipted it. Only then does the response end: a body of unknown length sends its
+terminating chunk, a body of known length its last frame, held until now, and a response
+with no body its head. Stream frames and events share that socket's one ordered lane
+(§4.2), and the gateway relays a member's events in arrival order. So any request *that
+gateway* routes to another member afterwards lands behind those events on that member's
+ordered lane, and that member serves a stream a gateway opens only once every record that
+arrived before it is applied (`AppMember::run`). The request sees what they wrote.
+
+Events no request takes wait 100 ms (`GRACE`) before the round robin sends them, so a
+short request's own events leave on its socket rather than on whichever socket the round
+robin would have picked.
 
 A later request taken by a *different* gateway has no such ordering. For a sticky key
 the claim covers it: the request goes to the claim holder, which wrote the events, and a
@@ -2235,8 +2248,8 @@ merely reconnects inside a running process never needs it.
 - **When an origin's `high_water` is above what it holds** (§4.1, `MEMBERS`), and stays
   above for 5 s. This is how a lost event is found even when nothing after it ever
   comes: an origin that wrote one last event that went missing still announces it. The
-  catch-up is addressed `to:` that origin, which holds all of its own records, and asks
-  for that origin alone.
+  catch-up is addressed `to:` that origin, which holds all of its own records, with the
+  member's whole `since`; whatever else it lists is lacking too.
 - **Every 30 s while any of its sockets is down.** The catch-up runs on the sockets that
   are still up. A gateway it cannot reach may still be relaying events to others that
   this member will not otherwise see.
@@ -2261,10 +2274,12 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
      `(oseq, type, stream_id, chunk_index, len, digest)`, about 40 bytes packed, never
      the payload. It also lists the `oseq`s in the range it knows are gone.
    - The answer ends with `DONE`.
-4. **Compare.** For each listed record the requester does not hold, it decides whether
-   to fetch it:
-   - It skips a record whose key it holds with the same `digest`, which is the same
-     record already present under another `oseq` (§6.5).
+4. **Compare.** It decides what to fetch:
+   - Every listed record it does not hold, and that none of its other catch-ups is
+     already fetching, is wanted. It never compares by `digest`: a record keeps its
+     identity through every rewrite (§6.2), so one it lacks is never held under another
+     `oseq`, and two records with equal bytes under different stamps are two values
+     (§6.5).
    - It records as gone, in its applied set, exactly the `oseq`s the header lists as
      gone: records superseded or tombstoned and compacted away on the answerer by rules
      every member applies alike (§6.8). A gone `oseq` that was an expired tombstone
@@ -2274,8 +2289,13 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
      (§7.1), finds it.
 5. **Fetch.** The requester sends `FETCH { request, reply_to: self, from_node, origin,
    oseqs }` to the member that sent the headers. That member reads each record from its
-   log and sends it as an addressed `EVENT`, then `DONE`. Fetches are windowed: at most
-   8 MiB of records outstanding at once, so the requester sets the pace.
+   log and sends it as an addressed `EVENT`, then `DONE` once the last of them is
+   written; the catch-up lane keeps their order (§4.2). Fetches are windowed: at most
+   8 MiB of records outstanding at once, so the requester sets the pace. A record a
+   `FETCH` ends short of is fetched again; one its answerer cannot deliver after three
+   fetches is left wanted for a later catch-up rather than holding this one open.
+   Request numbers start from a random base in each process, so answers to a previous
+   process's requests, still in flight to the node, never match this one's.
 6. **Apply and record.** Fetched records apply like any other (§6.5). As each one
    applies, `applied_through` advances, and the `Replica` record persists it at the next
    group commit. A catch-up cut off by a disconnect or a restart resumes from there.
@@ -2304,7 +2324,7 @@ dumb mode on that gateway, as its leaving would.
 The headers for a million records are about 40 MB, which is cheap to send and to compare.
 The records themselves are another matter. A member joining with an empty substrate
 fetches the whole log, which can be many gigabytes: that is the cost of D5. Headers
-first means it fetches each record once, and nothing it can already match by content.
+first means it fetches each record once, and nothing it already holds.
 The headers' `len` gives the loading page an exact total to show progress against.
 
 ### 7.4 Backpressure
@@ -2315,9 +2335,12 @@ A catch-up uses only spare capacity:
   cap per member (§4.4) from being reached. A `FETCH` whose `DONE` arrives short of
   records is fetched again.
 - The answerer sends catch-up frames only when its ordered lane is empty and its
-  socket's unsent bytes are under 8 MiB (§4.2).
-- The answerer pauses while its measured send rate shows the socket saturated by live
-  traffic.
+  socket's unsent bytes are under 1 MiB (§4.2). Live traffic that keeps the socket
+  busy therefore holds catch-up back entirely, and a live event queued behind catch-up
+  waits for at most 1 MiB of it to drain. That bound is in bytes, and small records
+  make it many frames for the gateway to relay first, so it is kept to what keeps a
+  link busy and no more: under catch-up of 100 k small records, H4 measures the live
+  p99 against it (§14.2).
 
 A joining member on a slow link therefore catches up behind the live traffic, not in
 front of it.
@@ -3399,7 +3422,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | emission | a request's events leave on the request's socket; other events go round robin across sockets, one whole event at a time; with every socket down events stay *unsent*, never queued in memory |
 | retransmit | events in flight on a socket that drops, and only those past its last `RECEIPT`, go back to unsent and leave again in `oseq` order on the next socket admitted; nothing is re-sent that a `RECEIPT` covered |
 | arrival order | a member's log in arrival order reopens to the same state it held before the restart; an older keyed record arriving late, from the same origin or another, never replaces a value with a greater stamp |
-| catch-up | the gateway picks the answerer round robin among the other ready members, or the member `to` names; `HEADERS` pack to exact bytes; an answerer with a hole in its own applied set ends its range at the hole and never lists past it; only `oseq`s a header names as gone are recorded as gone, and an `oseq` outside every complete range stays wanted; an origin's `high_water` above what a member holds for 5 s starts a catch-up addressed to that origin, which finds a lost last event; same-`digest` records are not fetched; fetches stay within an 8 MiB window; a `FETCH` ending short is fetched again; replies reach only `reply_to` and no other member sees any catch-up frame; `applied_through` persists in `Replica` and a catch-up cut off part-way resumes from it; a socket reconnect, admission, and every 30 s with a socket down each start one |
+| catch-up | the gateway picks the answerer round robin among the other ready members, or the member `to` names; `HEADERS` pack to exact bytes; an answerer with a hole in its own applied set ends its range at the hole and never lists past it; only `oseq`s a header names as gone are recorded as gone, and an `oseq` outside every complete range stays wanted; an origin's `high_water` above what a member holds for 5 s starts a catch-up addressed to that origin, which finds a lost last event; two catch-ups of one member never fetch one record; fetches stay within an 8 MiB window; a `FETCH` ending short is fetched again; replies reach only `reply_to` and no other member sees any catch-up frame; `applied_through` persists in `Replica` and a catch-up cut off part-way resumes from it; a socket reconnect, admission, and every 30 s with a socket down each start one |
 | full resync | only the first admission after a process start runs it; it catches up first, then sends `HAVE`; every member holding less runs an addressed catch-up against it; afterwards its own events are classed received or unsent correctly, against the *highest* `applied_through` any member acknowledged, so one lagging member causes no re-broadcast; a reconnect in a running process never sends `HAVE` |
 | clusters | four sockets for two apps × two clusters each handshake, keep alive and reconnect independently; a 4410 on one cluster closes that app on all of them; ready on the first cluster caught up |
 | own listener | joined: a request on the listener is forwarded up, carrying the identity the listener resolved, and answered from wherever the cluster routes it; a request arriving on a socket is never forwarded; `/v1/status` always answers locally; cut off: served locally; rejoining, reloading or upgrading: `503` with `Retry-After`; a request marked `x-tokera-hop: dumb` from an allowlisted gateway is served locally in every state, and the mark from any other peer is ignored; a daemon started with no reachable cluster serves locally once every cluster has failed one attempt or after 10 s, and rejoins on its first ready socket; the switch flips per app on the first ready socket and the last drop; a request in flight across the switch finishes where it started or fails as §5.6 says |
@@ -3608,9 +3631,10 @@ That configuration can go live and be watched before anything replicates.
 - **The relay (§4.3).** `RECEIPT`s, retransmit on a dropped socket, and the lagging state
   (§4.4).
 - **Apply on arrival**, through chunk 1.
-- **Catch-up (§7).** Headers first with coverage-honest ranges, the `digest` compare,
-  windowed fetches, `reply_to` addressing, `high_water` gap detection, deleted-set
-  entries in gone headers, and the full resync after a restart.
+- **Catch-up (§7).** Headers first with coverage-honest ranges, the compare against
+  what is held and what another catch-up is fetching, windowed fetches, `reply_to`
+  addressing, `high_water` gap detection, deleted-set entries in gone headers, and the
+  full resync after a restart.
 - **The `catchup` loading step**, and readiness gating clustered mode (§7.2, §7.6).
 - **Cut-off and rejoin (§6.7).** The generation comes from chunk 3's `gen/<k>` decision.
   The rejoin waits for a quorum. A turn arriving ranked below one held makes the member

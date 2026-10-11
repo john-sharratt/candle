@@ -211,6 +211,7 @@ mod plain_prompt;
 mod policy;
 mod project;
 mod reconcile;
+pub mod replication;
 mod resolver;
 mod schema;
 mod score;
@@ -223,6 +224,8 @@ mod yaml;
 
 #[cfg(test)]
 mod remote_turn_tests;
+#[cfg(test)]
+mod replication_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

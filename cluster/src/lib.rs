@@ -11,6 +11,10 @@
 //!   vote journal, the quorum and rendezvous.
 //! - [`delivery`]: the sender's outbox (unsent, in flight, received) and the
 //!   frame counting `RECEIPT`s refer to.
+//! - [`gateway`] and [`member`]: the two ends of a socket — admission, routing
+//!   and relaying; dialling, claims and the member's own listener.
+//! - [`replicate`]: a member's substrate replication — events out and in,
+//!   catch-ups, and the rejoin after a cut-off.
 //! - [`version`]: this build's `count`, `hash` and `local`.
 //!
 //! No candle and no CUDA: the gateway links this crate, and a record inside an
@@ -29,6 +33,7 @@ pub mod gateway;
 pub mod handshake;
 pub mod member;
 pub mod pipe;
+pub mod replicate;
 pub mod session;
 pub mod version;
 pub mod wire;

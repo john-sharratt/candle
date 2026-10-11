@@ -7,19 +7,23 @@
 //! |---|---|
 //! | [`dial`] | one socket's connection: TLS, the certificate's name, the WebSocket |
 //! | [`serve`] | a request a gateway sent over a socket, served by this host's router |
+//! | [`flush`] | its response ending only after the events it caused (§6.4) |
 //! | [`listener`] | the own listener: forward up when joined, serve when cut off (§5.8) |
 //! | [`sticky`] | claiming a sticky key before serving it (§5.4) |
 //! | [`capacity`] | what `CAPACITY` reports (§5.3) |
-//! | [`view`] | the `cluster` block of `/v1/status` and the `connecting` step |
+//! | [`store`] | a tenant's substrate as replication drives it (§6, §7) |
+//! | [`view`] | the `cluster` block of `/v1/status`, and the `connecting` and `catchup` steps |
 //!
-//! The protocol — handshake, sessions, claims, reconnects — is the `cluster`
-//! crate's [`AppMember`]; this module is its process.
+//! The protocol — handshake, sessions, claims, reconnects, replication — is
+//! the `cluster` crate's [`AppMember`]; this module is its process.
 
 pub mod capacity;
 pub mod dial;
+pub mod flush;
 pub mod listener;
 pub mod serve;
 pub mod sticky;
+pub mod store;
 pub mod view;
 
 use std::collections::BTreeMap;
@@ -36,6 +40,7 @@ use cluster::dispatch::RouteTable;
 use cluster::frame::{BuildId, MemberState, ModelId};
 use cluster::handshake::GroupKey;
 use cluster::member::{AppMember, ClusterView, Identity, Link};
+use cluster::replicate::{CatchupView, Phase, Replication, ReplicationView};
 use cluster::version::this_build;
 use sysinfo::System;
 use tokio::runtime::Handle;
@@ -188,8 +193,15 @@ impl Cluster {
         self.router.get().cloned()
     }
 
-    /// Start `link`'s sockets as `node`, its substrate bound to `model`.
-    fn start(self: &Arc<Self>, link: &Arc<AppLink>, node: u64, model: Option<ModelId>) {
+    /// Start `link`'s sockets as `node`, its substrate bound to `model` and
+    /// replicated through `replication`.
+    fn start(
+        self: &Arc<Self>,
+        link: &Arc<AppLink>,
+        node: u64,
+        model: Option<ModelId>,
+        replication: Option<Replication>,
+    ) {
         let routes = loop {
             if let Some(r) = link.routes.get() {
                 break r.clone();
@@ -236,6 +248,7 @@ impl Cluster {
                     },
                 )
             }),
+            replication,
             Instant::now(),
         );
         if link.member.set(member.clone()).is_err() {
@@ -249,12 +262,13 @@ impl Cluster {
             };
             let cluster = self.clone();
             let member = member.clone();
+            let replicator = member.replicator().cloned();
             self.runtime.spawn(async move {
                 let stopped = member
                     .clone()
                     .run(c, dial, move |conn| {
                         if let Some(router) = cluster.router() {
-                            serve::serve(router, conn, c);
+                            serve::serve(router, conn, c, replicator.clone());
                         } else {
                             conn.reset();
                         }
@@ -300,11 +314,12 @@ pub fn watch_readiness(tenants: Vec<(Arc<AppLink>, Arc<dyn Reports>)>) {
 }
 
 impl Cluster {
-    /// Close every app's sockets with `1001`: the process is stopping.
+    /// The process is stopping: every app's replication stops and its sockets
+    /// close `1001`, before the tenants release their substrates.
     pub fn close_all(&self, reason: &str) {
         for link in self.links.values() {
             if let Some(m) = link.member() {
-                m.close_all(reason);
+                m.shutdown(reason);
             }
         }
     }
@@ -340,6 +355,18 @@ impl AppLink {
         self.member.get().map_or(Link::Starting, |m| m.link())
     }
 
+    /// Where its sockets stand, whatever its replication's phase.
+    pub fn socket_state(&self) -> Link {
+        self.member
+            .get()
+            .map_or(Link::Starting, |m| m.socket_link())
+    }
+
+    /// Its replication, as `/v1/status` shows it.
+    pub fn replication(&self) -> Option<ReplicationView> {
+        self.member.get()?.replicator().map(|r| r.view())
+    }
+
     /// Every cluster's socket, for the loading step and `/v1/status`.
     pub fn clusters(&self) -> Vec<ClusterView> {
         self.member.get().map(|m| m.clusters()).unwrap_or_default()
@@ -370,10 +397,11 @@ impl Join {
         &self.link
     }
 
-    /// Dial every cluster as `node`, the substrate bound to `model`, and wait
-    /// — the `connecting` loading step (§7.6) — until the app is joined, cut
-    /// off, or stopped by a terminal refusal, or `cancelled` says the process
-    /// is stopping. Each poll shows `progress` every cluster's socket.
+    /// Dial every cluster as `node`, the substrate bound to `model` and
+    /// replicated through `replication`, and wait — the `connecting` loading
+    /// step (§7.6) — until the app is joined, cut off, or stopped by a
+    /// terminal refusal, or `cancelled` says the process is stopping. Each poll
+    /// shows `progress` every cluster's socket.
     ///
     /// A stopped app is the build itself being wrong: the tenant stays on its
     /// loading page with the reason ([`Join::hold`]) rather than serving.
@@ -381,15 +409,17 @@ impl Join {
         &self,
         node: u64,
         model: Option<ModelId>,
+        replication: Replication,
         own_oseq: impl Fn() -> u64 + Send + Sync + 'static,
         cancelled: impl Fn() -> bool,
         mut progress: impl FnMut(&[ClusterView]),
     ) -> Link {
         let _ = self.link.own_oseq.set(Box::new(own_oseq));
-        self.cluster.start(&self.link, node, model);
+        self.cluster
+            .start(&self.link, node, model, Some(replication));
         loop {
             progress(&self.link.clusters());
-            let link = self.link.state();
+            let link = self.link.socket_state();
             if let Link::Stopped(close) = &link {
                 tracing::error!(
                     app = self.link.app,
@@ -399,6 +429,24 @@ impl Join {
             }
             if link != Link::Starting || cancelled() {
                 return link;
+            }
+            sleep(CONNECTING_POLL);
+        }
+    }
+
+    /// The `catchup` loading step (§7.6): wait until a socket's admission
+    /// catch-up has finished and any rejoin is done, or the app is cut off —
+    /// it then serves locally — or `cancelled` says the process is stopping.
+    /// Each poll shows `progress` the catch-ups running.
+    pub fn catch_up(&self, cancelled: impl Fn() -> bool, mut progress: impl FnMut(&[CatchupView])) {
+        let Some(r) = self.link.member().and_then(|m| m.replicator().cloned()) else {
+            return;
+        };
+        loop {
+            progress(&r.catchups());
+            let ready = r.caught_up() && r.phase() == Phase::Joined;
+            if ready || self.link.state() == Link::CutOff || cancelled() {
+                return;
             }
             sleep(CONNECTING_POLL);
         }

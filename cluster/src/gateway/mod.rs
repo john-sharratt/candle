@@ -8,13 +8,14 @@ mod claims;
 mod hub;
 mod log;
 mod registry;
+mod relay;
 mod status;
 mod traffic;
 
 pub use admission::{Admission, Admitted, MAX_SKEW_MS};
 pub use claims::Claims;
-pub use hub::{Hub, MemberStream, APPS, MEMBERS_EVERY, REFUSALS_KEPT};
+pub use hub::{Hub, MemberStream, APPS, CATCHUP_CAP, LAG_CAP, MEMBERS_EVERY, REFUSALS_KEPT};
 pub use log::{CoordLog, Entry};
 pub use registry::{MemberView, Pick, Registry};
-pub use status::{state_name, AppView, ClaimView, HubStatus, MemberRow, Refusal};
+pub use status::{state_name, AppView, ClaimView, HubStatus, MemberRow, Queues, Refusal};
 pub use traffic::{Class, Failure, OpenStream, Traffic, TrafficView};

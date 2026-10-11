@@ -34,6 +34,12 @@ nvml-wrapper = "0.12"
 web                 = { path = "../web" }
 # The cluster a daemon joins with `--cluster` (`docs/replicated_substrate.md`).
 cluster             = { path = "../cluster" }
+# What a member holds of each origin, as replication and its substrate share it.
+applied-set         = { path = "../applied-set" }
+# A response served off a socket ends only after the events it caused are on
+# it: its body is wrapped to flush them first (§6.4).
+http-body           = "1"
+bytes               = "1"
 # A member dials each gateway over `wss`, verifying its certificate against the
 # Mozilla roots built into the binary. The TLS is its own, on `ring` as `web`'s
 # is, and the WebSocket handshake runs over it: two crypto providers linked

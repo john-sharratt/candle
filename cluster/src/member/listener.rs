@@ -1,6 +1,7 @@
 //! What a member's own listener does with a request (§5.8): forward it up to a
 //! gateway while joined, serve it locally while cut off, and refuse it while
-//! the member cannot serve. Some requests are always served here:
+//! the member cannot serve — connecting, rejoining, reloading, or stopped.
+//! Some requests are always served here:
 //!
 //! - one that arrived on a socket — the cluster already routed it, so
 //!   forwarding it would only loop;
@@ -47,6 +48,8 @@ pub fn decide(link: &Link, local_build: bool, arrival: Arrival<'_>) -> Serve {
         Link::Joined => Serve::ForwardUp,
         Link::CutOff => Serve::Local,
         Link::Starting => Serve::Unavailable("connecting to the cluster".into()),
+        Link::Rejoining => Serve::Unavailable("rejoining the cluster".into()),
+        Link::Reloading => Serve::Unavailable("reloading its substrate".into()),
         Link::Stopped(close) => Serve::Unavailable(close.reason.clone()),
     }
 }
@@ -75,6 +78,14 @@ mod tests {
             decide(&Link::Starting, false, at("/v1/chat")),
             Serve::Unavailable(_)
         ));
+        assert_eq!(
+            decide(&Link::Rejoining, false, at("/v1/chat")),
+            Serve::Unavailable("rejoining the cluster".into())
+        );
+        assert_eq!(
+            decide(&Link::Reloading, false, at("/v1/chat")),
+            Serve::Unavailable("reloading its substrate".into())
+        );
         let stopped = Link::Stopped(Close::new(
             CloseCode::Superseded,
             "rebuild: below the floor",

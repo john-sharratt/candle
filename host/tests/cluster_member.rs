@@ -13,11 +13,13 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::{Path as UrlPath, Request};
 use axum::Router;
+use cluster::consensus::votes::MemoryVotes;
 use cluster::dispatch::{Dispatch, Merge};
 use cluster::frame::{BuildId, ModelId};
 use cluster::gateway::Hub;
 use cluster::handshake::GroupKey;
 use cluster::member::Link;
+use cluster::replicate::{MemoryStore, Replication, Store};
 use host::access::LocalSignin;
 use host::cluster::dial::Target;
 use host::cluster::{Cluster, ClusterSettings, Join};
@@ -62,8 +64,21 @@ async fn closed_port() -> SocketAddr {
 }
 
 /// The member's API: each route says whether it was reached over a socket,
-/// and who it was told the caller is.
-fn api() -> Api<()> {
+/// and who it was told the caller is; one writes a key into the member's
+/// substrate, another says whether the member holds it.
+fn api(store: Arc<MemoryStore>) -> Api<()> {
+    let writer = store.clone();
+    let write = move |UrlPath(k): UrlPath<String>| {
+        let s = writer.clone();
+        async move {
+            s.write(k.as_bytes(), b"written");
+            format!("{:x}", s.node())
+        }
+    };
+    let read = move |UrlPath(k): UrlPath<String>| {
+        let s = store.clone();
+        async move { axum::Json(json!({"held": s.value(k.as_bytes()).is_some(), "node": s.node()})) }
+    };
     let seen = |req: Request| async move {
         let email = req
             .headers()
@@ -95,12 +110,25 @@ fn api() -> Api<()> {
             Dispatch::sticky_path("id"),
             get(|UrlPath(id): UrlPath<String>| async move { format!("served {id}") }),
         )
+        .route(
+            "/v1/write/:k",
+            Role::Unauthenticated,
+            Dispatch::Best,
+            get(write),
+        )
+        .route(
+            "/v1/read/:k",
+            Role::Unauthenticated,
+            Dispatch::Any,
+            get(read),
+        )
 }
 
 struct Member {
     addr: SocketAddr,
     cluster: Arc<Cluster>,
     join: Join,
+    store: Arc<MemoryStore>,
 }
 
 async fn member(gateway: SocketAddr, node: u64, ui: &Path) -> Member {
@@ -122,7 +150,8 @@ async fn member(gateway: SocketAddr, node: u64, ui: &Path) -> Member {
         Handle::current(),
     )
     .unwrap();
-    let routes = api();
+    let store = Arc::new(MemoryStore::new(node));
+    let routes = api(store.clone());
     let table = dispatch_table(routes.declared()).unwrap();
     cluster.link("zend").unwrap().set_routes(table);
     let uis = vec![(
@@ -154,15 +183,19 @@ async fn member(gateway: SocketAddr, node: u64, ui: &Path) -> Member {
         addr,
         cluster,
         join,
+        store,
     }
 }
 
 impl Member {
-    /// Connect as `node`, as the tenant's loader does, and say it is ready.
+    /// Connect as `node`, as the tenant's loader does, catch up, and say it is
+    /// ready.
     async fn connect(&self, node: u64) -> Link {
         let join = self.join.clone();
+        let replication =
+            Replication::open(self.store.clone(), Box::new(MemoryVotes::new())).unwrap();
         let link = spawn_blocking(move || {
-            join.connect(
+            let link = join.connect(
                 node,
                 Some(ModelId {
                     arch: "Qwen4Exp".into(),
@@ -171,10 +204,13 @@ impl Member {
                     rope: "yarn".into(),
                     describe: "Flash-Next".into(),
                 }),
+                replication,
                 || 0,
                 || false,
                 |_| {},
-            )
+            );
+            join.catch_up(|| false, |_| {});
+            link
         })
         .await
         .unwrap();
@@ -277,6 +313,43 @@ async fn a_joined_member_forwards_its_listeners_requests_up() {
     })
     .await;
     m.cluster.close_all("test over");
+}
+
+/// **A write is seen by the next request, wherever it lands** (§6.4): a
+/// request through the gateway writes on the member it reaches, whose response
+/// ends only after the write's event is on its socket; the next request, routed
+/// to either member, is served only after the records ahead of it are applied,
+/// and finds the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_is_seen_by_the_next_request_on_any_member() {
+    let ui = tempfile::TempDir::new().unwrap();
+    std::fs::write(ui.path().join("index.html"), "<p>zend</p>").unwrap();
+    let dumb = closed_port().await;
+    let (gw, hub) = gateway(&format!("http://{dumb}")).await;
+    let a = member(gw, 1, ui.path()).await;
+    let b = member(gw, 2, ui.path()).await;
+    assert_eq!(a.connect(1).await, Link::Joined);
+    assert_eq!(b.connect(2).await, Link::Joined);
+    until("both routable", || {
+        [1, 2]
+            .iter()
+            .all(|n| hub.member("zend", *n).is_some_and(|m| m.routable()))
+    })
+    .await;
+
+    let mut readers = std::collections::BTreeSet::new();
+    for k in 0..20 {
+        let (status, _) = ask(gw, &format!("/v1/write/k{k}"), &[]).await;
+        assert_eq!(status, 200);
+        for _ in 0..2 {
+            let read = ask_json(gw, &format!("/v1/read/k{k}"), &[]).await;
+            assert_eq!(read["held"], true, "k{k} read on member {}", read["node"]);
+            readers.insert(read["node"].as_u64().unwrap());
+        }
+    }
+    assert_eq!(readers.len(), 2, "reads reached both members");
+    a.cluster.close_all("test over");
+    b.cluster.close_all("test over");
 }
 
 /// **Cut off**: a member whose every cluster has failed one attempt serves its

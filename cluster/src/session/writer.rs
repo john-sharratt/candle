@@ -1,7 +1,8 @@
 //! The session's writer: drains commands into the lanes and writes the next
-//! frame the lanes give, counting every frame it sends (§4.3) and sending a
-//! `PING` every 15 s (§3.2).
+//! frame the lanes give, counting every frame it sends (§4.3), taking each off
+//! its lane's gauge, and sending a `PING` every 15 s (§3.2).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc::error::TryRecvError;
@@ -9,6 +10,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval_at, sleep, Instant, MissedTickBehavior};
 
 use super::command::Command;
+use super::gauge::Gauges;
 use super::lanes::Lanes;
 use crate::close::Close;
 use crate::delivery::FrameCounter;
@@ -51,7 +53,11 @@ async fn take<T: PipeTx>(tx: &mut T, lanes: &mut Lanes, command: Command) -> boo
     }
 }
 
-pub async fn run<T: PipeTx>(mut tx: T, mut commands: UnboundedReceiver<Command>) {
+pub async fn run<T: PipeTx>(
+    mut tx: T,
+    mut commands: UnboundedReceiver<Command>,
+    gauges: Arc<Gauges>,
+) {
     let mut lanes = Lanes::new();
     let mut counter = FrameCounter::default();
     let mut ping = interval_at(Instant::now() + PING_EVERY, PING_EVERY);
@@ -74,9 +80,15 @@ pub async fn run<T: PipeTx>(mut tx: T, mut commands: UnboundedReceiver<Command>)
             }
         }
         if let Some(next) = lanes.next(tx.unsent_bytes()) {
-            if tx.send(Message::Frame(next.frame.encode())).await.is_err() {
+            let bytes = next.frame.encode();
+            let gauged = match &next.frame {
+                Frame::Event { event, .. } => event.bytes.len(),
+                _ => bytes.len(),
+            };
+            if tx.send(Message::Frame(bytes)).await.is_err() {
                 return;
             }
+            gauges.written(next.lane, gauged);
             let number = counter.count_one();
             if let Some(done) = next.done {
                 let _ = done.send(number);

@@ -7,7 +7,7 @@ mod claims;
 mod link;
 mod listener;
 
-pub use app::{AppMember, CapacitySource, ClusterView, Identity, CAPACITY_EVERY};
+pub use app::{AppMember, CapacitySource, ClusterView, Identity, APPLY_WAIT, CAPACITY_EVERY};
 pub use claims::{Check, MemberClaims};
 pub use link::{Link, Links, START_WAIT};
 pub use listener::{decide, Arrival, Serve, DUMB_HOP, DUMB_HOP_VALUE, STATUS_PATH};

@@ -278,6 +278,7 @@ fn member(gateway: SocketAddr, node: u64, power: u32) -> Member {
             cores: 8,
             load_milli: 0,
         }),
+        None,
         Instant::now(),
     );
     let router = member_api(node, app.clone());

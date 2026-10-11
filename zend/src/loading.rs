@@ -5,14 +5,16 @@
 //! 1. **Model** — fetch and load the GGUF weights.
 //! 2. **Substrate** — replay the redo log into the in-RAM substrate.
 //! 3. **Connecting** — with `--cluster`, join the gateways.
-//! 4. **Sections** — prefill the projection schema's pinned sections, then
+//! 4. **Catch-up** — with a cluster reached, fetch what the group wrote while
+//!    this member was away.
+//! 5. **Sections** — prefill the projection schema's pinned sections, then
 //!    calibrate them.
-//! 5. **Self-check** — with `--self-check`, ask every stored conversation
+//! 6. **Self-check** — with `--self-check`, ask every stored conversation
 //!    whether it is intact (`crate::self_check`).
-//! 6. **Priming** — read the priming chain the base conversation descends
+//! 7. **Priming** — read the priming chain the base conversation descends
 //!    from (`crate::branch_ingest::prime`).
-//! 7. **Normalizing** — relearn the tool catalog's score-normalization levels.
-//! 8. **Preloading** — decode and place on the GPU what a projection's belief
+//! 8. **Normalizing** — relearn the tool catalog's score-normalization levels.
+//! 9. **Preloading** — decode and place on the GPU what a projection's belief
 //!    scan reads, so the first question asked does not pay for it.
 //!
 //! `LoadProgress` is the single source of truth; the daemon advances it
@@ -35,6 +37,10 @@ pub enum LoadStep {
     /// dialling every gateway until one admits this member, every one has
     /// failed an attempt, or ten seconds have passed. Skipped standalone.
     Connecting,
+    /// Catching up on what the group wrote while this member was away
+    /// (§7.2, §7.6), and taking a generation for what it wrote cut off.
+    /// Skipped standalone and when no cluster was reached.
+    CatchUp,
     Sections,
     CalibratingSections,
     /// Every stored conversation asked whether it is intact (`--self-check`).
@@ -68,6 +74,7 @@ impl LoadStep {
         LoadStep::Substrate,
         LoadStep::Compacting,
         LoadStep::Connecting,
+        LoadStep::CatchUp,
         LoadStep::Sections,
         LoadStep::CalibratingSections,
         LoadStep::SelfCheck,
@@ -83,6 +90,7 @@ impl LoadStep {
             LoadStep::Substrate => "substrate",
             LoadStep::Compacting => "compacting",
             LoadStep::Connecting => "connecting",
+            LoadStep::CatchUp => "catchup",
             LoadStep::Sections => "sections",
             LoadStep::CalibratingSections => "calibrating_sections",
             LoadStep::SelfCheck => "self_check",
@@ -99,6 +107,7 @@ impl LoadStep {
             LoadStep::Substrate => "Loading substrate",
             LoadStep::Compacting => "Compacting substrate",
             LoadStep::Connecting => "Connecting to the cluster",
+            LoadStep::CatchUp => "Catching up",
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
             LoadStep::SelfCheck => "Checking conversations",
@@ -124,6 +133,7 @@ impl LoadStep {
             LoadStep::Substrate => "turns",
             LoadStep::Compacting => "",
             LoadStep::Connecting => "clusters",
+            LoadStep::CatchUp => "records",
             LoadStep::Sections => "",
             LoadStep::CalibratingSections => "",
             LoadStep::SelfCheck => "conversations",
@@ -419,7 +429,8 @@ mod tests {
                 LoadStep::Model,
                 LoadStep::Substrate,
                 LoadStep::Compacting,
-                LoadStep::Connecting
+                LoadStep::Connecting,
+                LoadStep::CatchUp
             ]
         );
     }
@@ -501,6 +512,7 @@ mod tests {
                 "substrate",
                 "compacting",
                 "connecting",
+                "catchup",
                 "sections",
                 "calibrating_sections",
                 "self_check",

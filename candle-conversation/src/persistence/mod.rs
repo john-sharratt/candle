@@ -48,6 +48,7 @@ pub mod identity;
 pub mod inherit;
 pub mod integrity;
 mod le_reader;
+pub mod listing;
 pub mod liveness_audit;
 pub mod log_file;
 pub mod maintenance;
@@ -119,7 +120,7 @@ use record::{
     HEADER_PROBE_SIZE,
 };
 use relocation_watch::RelocationWatch;
-use replica::{DeferredRecord, Located, LocationIndex, ReplicaPayload};
+use replica::{AppliedSet, DeferredRecord, Located, LocationIndex, OriginApplied, ReplicaPayload};
 use sealed_reader::SealedReader;
 use segment::SegmentId;
 use segmented_log::SegmentedLog;
@@ -529,7 +530,17 @@ pub struct SubstratePersistence {
     /// The open met a record written before identities: the store is to be
     /// adopted ([`adoption`]).
     predates_identities: bool,
+    /// Told the `oseq` of every record this node writes that may be sent, once
+    /// each, as it is appended — the replication tap (§6.3).
+    tap: Option<Tap>,
+    /// This node's own records written and sendable: everything it holds but
+    /// what it wrote cut off and no rejoin has fixed. A rewrite or relocation
+    /// of a record already here is not tapped again.
+    own_written: OriginApplied,
 }
+
+/// Told the `oseq` of each record this node writes that may be sent.
+pub type Tap = Box<dyn Fn(u64) + Send + Sync>;
 
 /// What [`SubstratePersistence::metadata_locs`] keys a record by: its type, the
 /// header's `stream_id`, and the writer's origin for a stream's own records —
@@ -1032,6 +1043,10 @@ impl SubstratePersistence {
         if still_detached.is_some() {
             origination.detach(still_detached);
         }
+        // Every own record the store holds may be sent, but what it wrote cut
+        // off and no rejoin fixed (§6.3, §6.7).
+        let own_written =
+            OriginApplied::from_parts(still_detached.unwrap_or(origination.next_oseq()) - 1, []);
         let segmented_log::OpenedSegments {
             mut segments,
             manifest,
@@ -1103,6 +1118,8 @@ impl SubstratePersistence {
             locations,
             rebases,
             predates_identities: predates,
+            tap: None,
+            own_written,
         };
         // Self-heal a large un-indexed tail (a crash window, or a log
         // that predates the index chain entirely): flush it now so the
@@ -1587,8 +1604,9 @@ impl SubstratePersistence {
     }
 
     /// The runtime twin of [`observe_replica`]: a record just placed at
-    /// `(segment, offset)` is where its identity is now, and another origin's
-    /// record is applied.
+    /// `(segment, offset)` is where its identity is now; another origin's
+    /// record is applied; and one of this node's own, written for the first
+    /// time and not cut off, is tapped (§6.3).
     fn track_identity(&mut self, h: &RecordHeader, segment: SegmentId, offset: u64) {
         let id = h.identity();
         if id.is_none() {
@@ -1596,9 +1614,40 @@ impl SubstratePersistence {
         }
         self.locations
             .insert(id.origin, id.oseq, Located { segment, offset });
-        if id.origin != self.node() && self.replica.applied.insert(id.origin, id.oseq) {
-            self.replica_dirty = true;
+        if id.origin != self.node() {
+            if self.replica.applied.insert(id.origin, id.oseq) {
+                self.replica_dirty = true;
+            }
+        } else if id.gen != GEN_DETACHED && self.own_written.insert(id.oseq) {
+            if let Some(tap) = &self.tap {
+                tap(id.oseq);
+            }
         }
+    }
+
+    /// Tell `tap` the `oseq` of every record this node writes from now on that
+    /// may be sent, as it is appended — and of what it wrote cut off, when a
+    /// rejoin fixes it (§6.3, §6.7). It is called under the persistence lock,
+    /// so it must not block.
+    pub fn set_tap(&mut self, tap: Tap) {
+        self.tap = Some(tap);
+    }
+
+    /// Every own `oseq` written and sendable: what this node can say it holds
+    /// of itself.
+    pub fn own_written(&self) -> &OriginApplied {
+        &self.own_written
+    }
+
+    /// What this member holds of every origin, its own written records
+    /// included — what a catch-up starts from and a restart offers (§7.2,
+    /// §7.5).
+    pub fn applied_set(&self) -> AppliedSet {
+        let mut set = self.replica.applied.clone();
+        if self.own_written.top() > 0 {
+            set.set_origin(self.node(), self.own_written.clone());
+        }
+        set
     }
 
     /// Every `oseq` of `origin` up to this one is applied here or known gone —
@@ -1737,7 +1786,9 @@ impl SubstratePersistence {
     ///
     /// A substrate built from this store holds those records' values under the
     /// provisional generation still: the caller reloads it, as every rejoin
-    /// does (§6.6).
+    /// does (§6.6). The fixed records are tapped, so the caller lets the
+    /// substrate writer drain first: a record minted cut off and still queued
+    /// would be tapped before it could be read.
     pub fn rejoin(&mut self, generations: &dyn MintGeneration) -> Result<Option<RebaseEntry>> {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
@@ -1767,6 +1818,14 @@ impl SubstratePersistence {
         )?;
         self.commit()?;
         self.minter.attach(entry.gen);
+        // Fixed, they may be sent now (§6.7 step 3). The caller has let the
+        // writer drain first, so each of them is in the log to be read.
+        self.own_written.insert_range(from, through);
+        if let Some(tap) = &self.tap {
+            for oseq in from..=through {
+                tap(oseq);
+            }
+        }
         Ok(Some(entry))
     }
 

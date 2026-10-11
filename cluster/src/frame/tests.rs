@@ -488,6 +488,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
             Frame::Headers(Headers {
                 request: 1,
                 reply_to: 2,
+                answerer: 9,
                 origin: 5,
                 from: 4,
                 to: 6,
@@ -500,6 +501,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
             B::header(64, 0, 0)
                 .u64(1)
                 .u64(2)
+                .u64(9)
                 .u64(5)
                 .u64(4)
                 .u64(6)

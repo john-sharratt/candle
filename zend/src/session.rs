@@ -14,7 +14,10 @@ use cluster::member::{ClusterView, Link};
 use futures::executor::block_on;
 use futures::future::select_all;
 use futures::{Stream, StreamExt};
-use host::cluster::view::{admitted, connecting_detail, model_id};
+use host::cluster::store::ConversationStore;
+use host::cluster::view::{
+    admitted, catchup_detail, catchup_progress, connecting_detail, model_id,
+};
 use host::cluster::Join;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as ConvLock;
@@ -1430,6 +1433,11 @@ impl InferenceState {
             progress.set_step(LoadStep::Connecting);
             let conv = engine.conversation();
             let writer = conv.clone();
+            let reloader = engine.reloader();
+            let store = ConversationStore::new(conv.clone(), engine.kv_layers(), move || {
+                reloader.reload_and_wait()
+            });
+            let replication = store.replication()?;
             let report = |views: &[ClusterView]| {
                 progress.set_step_progress(admitted(views), views.len() as u64);
                 status_tx.send(connecting_detail(views)).ok();
@@ -1437,12 +1445,23 @@ impl InferenceState {
             let link = join.connect(
                 conv.node(),
                 Some(model_id(engine.model_key())),
+                replication,
                 move || writer.last_oseq(),
                 crate::ingest_cancel::cancelled,
                 report,
             );
             if let Link::Stopped(_) = link {
                 join.hold(crate::ingest_cancel::cancelled, report);
+            }
+            if link == Link::Joined {
+                // Serving from a substrate that is behind is the thing to
+                // avoid (§7.6): ready only once caught up.
+                progress.set_step(LoadStep::CatchUp);
+                join.catch_up(crate::ingest_cancel::cancelled, |catchups| {
+                    let (done, total) = catchup_progress(catchups);
+                    progress.set_step_progress(done, total);
+                    status_tx.send(catchup_detail(catchups)).ok();
+                });
             }
             if crate::ingest_cancel::cancelled() {
                 tracing::warn!("shutdown while connecting to the cluster — draining the engine");

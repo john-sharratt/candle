@@ -55,6 +55,24 @@ pub struct MemberRow {
     /// The size of its last `COORD`, which this build does not decode.
     pub coord_bytes: usize,
     pub last_close: Option<String>,
+    /// Its own highest `oseq`, from its `ACK`s.
+    pub high_water: u64,
+    pub lagging: bool,
+    #[serde(flatten)]
+    pub queues: Queues,
+}
+
+/// A member's queues on this gateway (§4.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Queues {
+    /// Live events queued and not yet written to it, in bytes.
+    pub live_bytes: usize,
+    /// Its catch-up lane, in bytes.
+    pub catchup_bytes: usize,
+    /// Live events not queued for it while it lagged.
+    pub skipped: u64,
+    /// Catch-up frames dropped at its cap.
+    pub dropped: u64,
 }
 
 impl MemberRow {
@@ -63,6 +81,7 @@ impl MemberRow {
         connected_ms: u64,
         coord_bytes: usize,
         last_close: Option<String>,
+        queues: Queues,
     ) -> Self {
         let c = m.capacity.as_ref();
         Self {
@@ -80,6 +99,9 @@ impl MemberRow {
             connected_ms,
             coord_bytes,
             last_close,
+            high_water: m.high_water,
+            lagging: m.lagging,
+            queues,
         }
     }
 }

@@ -121,6 +121,7 @@ fn member(
             cores: 8,
             load_milli: 0,
         }),
+        None,
         Instant::now(),
     );
     let (tx, down) = mpsc::unbounded_channel();

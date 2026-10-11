@@ -1,10 +1,13 @@
 //! The member's cluster as it reports it (`docs/replicated_substrate.md` §7.6):
-//! the `connecting` loading step's detail, and the `cluster` block of its own
-//! `/v1/status` — per app, the link and every cluster's socket.
+//! the `connecting` and `catchup` loading steps' detail, and the `cluster`
+//! block of its own `/v1/status` — per app, the link, every cluster's socket,
+//! and its replication: its own events in flight and unsent, and any catch-up
+//! in progress.
 
 use candle_conversation::models::identity::ModelKey;
 use cluster::frame::ModelId;
 use cluster::member::{ClusterView, Link};
+use cluster::replicate::CatchupView;
 use serde_json::{json, Map, Value};
 
 use super::Cluster;
@@ -26,8 +29,45 @@ pub fn link_name(link: &Link) -> (&'static str, Option<String>) {
         Link::Starting => ("connecting", None),
         Link::Joined => ("joined", None),
         Link::CutOff => ("cut_off", None),
+        Link::Rejoining => ("rejoining", None),
+        Link::Reloading => ("reloading", None),
         Link::Stopped(close) => ("stopped", Some(close.to_string())),
     }
+}
+
+/// The `catchup` step's progress: records and bytes fetched against what the
+/// headers listed.
+pub fn catchup_progress(catchups: &[CatchupView]) -> (u64, u64) {
+    catchups.iter().fold((0, 0), |(done, total), c| {
+        (done + c.progress.fetched, total + c.progress.wanted)
+    })
+}
+
+/// The `catchup` step's detail: per catch-up, records and bytes fetched
+/// against the total the headers listed, records skipped as already held, and
+/// which member is answering.
+pub fn catchup_detail(catchups: &[CatchupView]) -> String {
+    catchups
+        .iter()
+        .map(|c| {
+            let p = &c.progress;
+            let mut line = format!(
+                "{} of {} records, {} of {} MiB",
+                p.fetched,
+                p.wanted,
+                p.fetched_bytes >> 20,
+                p.wanted_bytes >> 20,
+            );
+            if p.skipped > 0 {
+                line.push_str(&format!(", {} already held", p.skipped));
+            }
+            if let Some(a) = p.answerer {
+                line.push_str(&format!(", from {a:016x}"));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// How many clusters have admitted this member.
@@ -78,6 +118,7 @@ pub fn status_block(cluster: &Cluster) -> Value {
                     "reason": reason,
                     "node": link.member().map(|m| format!("{:016x}", m.node())),
                     "clusters": link.clusters(),
+                    "replication": link.replication(),
                 }),
             )
         })
@@ -90,8 +131,11 @@ pub fn status_block(cluster: &Cluster) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::slice::from_ref;
+
     use super::*;
     use cluster::close::{Close, CloseCode};
+    use cluster::replicate::{Progress, Purpose};
 
     fn view(url: &str, state: &'static str) -> ClusterView {
         ClusterView {
@@ -117,10 +161,35 @@ mod tests {
         assert_eq!(admitted(&views), 1);
     }
 
+    /// Each catch-up in a line: what it fetched of what the headers listed,
+    /// what it skipped, and who answers.
+    #[test]
+    fn the_catchup_detail_names_each_catch_up() {
+        let c = CatchupView {
+            cluster: 0,
+            purpose: Purpose::Admission,
+            progress: Progress {
+                wanted: 120,
+                wanted_bytes: 64 << 20,
+                skipped: 7,
+                fetched: 30,
+                fetched_bytes: 16 << 20,
+                left: 0,
+                answerer: Some(0xab),
+            },
+        };
+        assert_eq!(
+            catchup_detail(from_ref(&c)),
+            "30 of 120 records, 16 of 64 MiB, 7 already held, from 00000000000000ab"
+        );
+        assert_eq!(catchup_progress(&[c.clone(), c]), (60, 240));
+    }
+
     #[test]
     fn a_link_is_one_word_and_a_stop_its_reason() {
         assert_eq!(link_name(&Link::Joined), ("joined", None));
         assert_eq!(link_name(&Link::CutOff), ("cut_off", None));
+        assert_eq!(link_name(&Link::Rejoining), ("rejoining", None));
         let stop = Link::Stopped(Close::new(CloseCode::Superseded, "rebuild"));
         assert_eq!(link_name(&stop), ("stopped", Some("4410: rebuild".into())));
     }

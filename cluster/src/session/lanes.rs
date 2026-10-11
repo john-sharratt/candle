@@ -6,21 +6,29 @@
 //! - **catch-up** goes only when the ordered lane is empty and the socket's
 //!   unsent bytes are under the low-water mark.
 //!
-//! Events are sent one at a time per lane, so a member's events leave in the
-//! order it produced them. A large event yields **one fragment per turn**: the
-//! event holds one place in its FIFO, and after each fragment it goes back to
-//! the end of the queue. Every frame queued meanwhile goes out before the
-//! event's next fragment, so no frame waits behind more than one 1 MiB
-//! fragment of it.
+//! Each lane keeps the order things were queued in: nothing overtakes a frame
+//! or an event queued before it. Events are sent one at a time, so a member's
+//! events leave in the order it produced them.
+//!
+//! On the ordered lane a large event yields **one fragment per turn**: after
+//! each fragment its turn goes back behind the frames queued since, but ahead
+//! of any later event. Those frames go out before its next fragment, so no
+//! frame waits behind more than one 1 MiB fragment of it. The catch-up lane
+//! sends an event's fragments back to back: a `DONE` queued after a fetched
+//! record never reaches the requester before the record's last fragment.
 
 use std::collections::VecDeque;
 
 use tokio::sync::oneshot;
 
+use super::gauge::Lane;
 use crate::frame::{Event, Frame};
 
-/// The socket's unsent bytes under which catch-up frames may go (§7.4).
-pub const CATCHUP_LOW_WATER: usize = 8 << 20;
+/// The socket's unsent bytes under which catch-up frames may go (§7.4). A
+/// live event queued behind catch-up waits for at most this much to drain —
+/// with small records, tens of thousands of frames — so it is kept to what
+/// keeps a link busy, not more.
+pub const CATCHUP_LOW_WATER: usize = 1 << 20;
 
 /// An event waiting to go, as its fragments, and who to tell the session
 /// frame number its last fragment went out as.
@@ -30,33 +38,59 @@ pub struct PendingEvent {
     pub done: Option<oneshot::Sender<u64>>,
 }
 
+impl PendingEvent {
+    /// A fetched record — flagged catch-up or addressed to a requester — goes
+    /// on the catch-up lane; a live event on the ordered lane.
+    pub fn lane(&self) -> Lane {
+        if self.catchup || self.fragments.front().is_some_and(|f| f.reply_to.is_some()) {
+            Lane::CatchUp
+        } else {
+            Lane::Live
+        }
+    }
+}
+
 enum Slot {
     Frame(Frame),
-    /// The lane's event queue takes this turn.
+    /// The turn of the event at the head of the lane's event queue: event
+    /// slots are in the same order as the events.
     Event,
 }
 
-#[derive(Default)]
 struct Fifo {
     slots: VecDeque<Slot>,
     events: VecDeque<PendingEvent>,
+    /// Whether a large event yields its turn after each fragment.
+    interleave: bool,
 }
 
 impl Fifo {
+    fn new(interleave: bool) -> Self {
+        Self {
+            slots: VecDeque::new(),
+            events: VecDeque::new(),
+            interleave,
+        }
+    }
+
     fn push_frame(&mut self, frame: Frame) {
         self.slots.push_back(Slot::Frame(frame));
     }
 
     fn push_event(&mut self, event: PendingEvent) {
-        if self.events.is_empty() {
-            self.slots.push_back(Slot::Event);
-        }
+        self.slots.push_back(Slot::Event);
         self.events.push_back(event);
     }
 
-    fn pop(&mut self) -> Option<Next> {
+    /// The next frame, gauged as `frames` when it is a frame and as `events`
+    /// when it is an event's fragment.
+    fn pop(&mut self, frames: Lane, events: Lane) -> Option<Next> {
         match self.slots.pop_front()? {
-            Slot::Frame(frame) => Some(Next { frame, done: None }),
+            Slot::Frame(frame) => Some(Next {
+                frame,
+                done: None,
+                lane: frames,
+            }),
             Slot::Event => {
                 let head = self.events.front_mut().expect("an event slot has an event");
                 let fragment = head.fragments.pop_front().expect("events are never empty");
@@ -64,17 +98,27 @@ impl Fifo {
                 let done = if head.fragments.is_empty() {
                     self.events.pop_front().expect("head").done
                 } else {
+                    // Its next turn: behind the frames queued since, ahead of
+                    // the next event — or at once, on a lane that does not
+                    // interleave.
+                    let at = if self.interleave {
+                        self.slots
+                            .iter()
+                            .position(|s| matches!(s, Slot::Event))
+                            .unwrap_or(self.slots.len())
+                    } else {
+                        0
+                    };
+                    self.slots.insert(at, Slot::Event);
                     None
                 };
-                if !self.events.is_empty() {
-                    self.slots.push_back(Slot::Event);
-                }
                 Some(Next {
                     frame: Frame::Event {
                         catchup,
                         event: fragment,
                     },
                     done,
+                    lane: events,
                 })
             }
         }
@@ -85,22 +129,33 @@ impl Fifo {
     }
 }
 
-/// The next frame to write, and the completion to fire once it is written.
+/// The next frame to write, the completion to fire once it is written, and
+/// the lane whose gauge it comes off.
 pub struct Next {
     pub frame: Frame,
     pub done: Option<oneshot::Sender<u64>>,
+    pub lane: Lane,
 }
 
-#[derive(Default)]
 pub struct Lanes {
     control: VecDeque<Frame>,
     ordered: Fifo,
     catchup: Fifo,
 }
 
+impl Default for Lanes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Lanes {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            control: VecDeque::new(),
+            ordered: Fifo::new(true),
+            catchup: Fifo::new(false),
+        }
     }
 
     pub fn control(&mut self, frame: Frame) {
@@ -116,12 +171,7 @@ impl Lanes {
     }
 
     pub fn event(&mut self, event: PendingEvent) {
-        if event.catchup
-            || event
-                .fragments
-                .front()
-                .is_some_and(|f| f.reply_to.is_some())
-        {
+        if event.lane() == Lane::CatchUp {
             self.catchup.push_event(event);
         } else {
             self.ordered.push_event(event);
@@ -131,13 +181,17 @@ impl Lanes {
     /// The next frame to write, given the socket's unsent bytes.
     pub fn next(&mut self, unsent_bytes: usize) -> Option<Next> {
         if let Some(frame) = self.control.pop_front() {
-            return Some(Next { frame, done: None });
+            return Some(Next {
+                frame,
+                done: None,
+                lane: Lane::Control,
+            });
         }
-        if let Some(next) = self.ordered.pop() {
+        if let Some(next) = self.ordered.pop(Lane::Stream, Lane::Live) {
             return Some(next);
         }
         if unsent_bytes < CATCHUP_LOW_WATER {
-            return self.catchup.pop();
+            return self.catchup.pop(Lane::CatchUp, Lane::CatchUp);
         }
         None
     }
@@ -225,20 +279,72 @@ mod tests {
         );
     }
 
-    /// A member's events leave in the order produced, never interleaved.
+    /// Each frame names the gauge it comes off: control and stream frames
+    /// none, a live event's fragments the live gauge, everything on the
+    /// catch-up lane the catch-up gauge.
+    #[test]
+    fn each_frame_names_its_lane() {
+        let mut l = Lanes::new();
+        let (live, _) = event(1, 10, false);
+        let (fetched, _) = event(2, 10, true);
+        l.control(Frame::Receipt(Receipt { through: 1 }));
+        l.ordered(data(1));
+        l.event(live);
+        l.event(fetched);
+        l.catchup(Frame::Done(Done {
+            request: 1,
+            reply_to: 1,
+        }));
+        let mut lanes = Vec::new();
+        while let Some(n) = l.next(0) {
+            lanes.push(n.lane);
+        }
+        assert_eq!(
+            lanes,
+            [
+                Lane::Control,
+                Lane::Stream,
+                Lane::Live,
+                Lane::CatchUp,
+                Lane::CatchUp
+            ]
+        );
+    }
+
+    /// A member's events leave in the order produced, never interleaved with
+    /// each other; a frame queued between two events goes between a large
+    /// one's fragments, and one queued after the second waits for it.
     #[test]
     fn events_go_one_at_a_time_in_order() {
         let mut l = Lanes::new();
         let (a, _) = event(1, 2 << 20, false);
         let (b, _) = event(2, 10, false);
         l.event(a);
+        l.ordered(data(3));
         l.event(b);
         l.ordered(data(4));
         let order: Vec<String> = drain(&mut l, 0).iter().map(label).collect();
-        assert_eq!(order, ["E1.0", "D4", "E1.1", "E2.0"]);
+        assert_eq!(order, ["E1.0", "D3", "E1.1", "E2.0", "D4"]);
     }
 
-    /// Catch-up waits while the socket holds 8 MiB unsent, and while the
+    /// On the catch-up lane a fetched record's fragments go back to back, and
+    /// the `DONE` queued after the records goes after the last of them.
+    #[test]
+    fn a_done_never_overtakes_the_records_before_it() {
+        let mut l = Lanes::new();
+        let (a, _) = event(1, 2 << 20, true);
+        let (b, _) = event(2, 10, true);
+        l.event(a);
+        l.event(b);
+        l.catchup(Frame::Done(Done {
+            request: 1,
+            reply_to: 1,
+        }));
+        let order: Vec<String> = drain(&mut l, 0).iter().map(label).collect();
+        assert_eq!(order, ["E1.0", "E1.1", "E2.0", "DONE"]);
+    }
+
+    /// Catch-up waits while the socket holds 1 MiB unsent, and while the
     /// ordered lane has anything.
     #[test]
     fn catchup_waits_for_an_empty_ordered_lane_and_a_drained_socket() {

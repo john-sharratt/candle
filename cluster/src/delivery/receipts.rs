@@ -2,6 +2,10 @@
 //! sends on a session, 1, 2, 3 and on. The gateway receipts the count it has
 //! relayed — a frame counts once it sits in every recipient's queue — every
 //! 100 ms or every 1 MiB, whichever comes first.
+//!
+//! The frames that matter are events': the gateway relays a member's frames in
+//! the order they arrive, so once the event whose last fragment was frame `n`
+//! is relayed, every frame through `n` is.
 
 use std::time::{Duration, Instant};
 
@@ -26,10 +30,11 @@ impl ReceiptPacer {
         }
     }
 
-    /// The member's next frame, of `bytes`, has been relayed. Returns the
-    /// `RECEIPT` to send now, if the byte threshold was reached.
-    pub fn relayed(&mut self, bytes: usize, now: Instant) -> Option<u64> {
-        self.relayed += 1;
+    /// The member's frames through `through`, the last of them an event of
+    /// `bytes`, have been relayed. Returns the `RECEIPT` to send now, if the
+    /// byte threshold was reached.
+    pub fn relayed(&mut self, through: u64, bytes: usize, now: Instant) -> Option<u64> {
+        self.relayed = self.relayed.max(through);
         self.bytes_since += bytes;
         if self.bytes_since >= EVERY_BYTES {
             return self.issue(now);
@@ -79,14 +84,14 @@ mod tests {
     fn a_receipt_goes_every_mebibyte_or_every_100_ms() {
         let t0 = Instant::now();
         let mut p = ReceiptPacer::new(t0);
-        assert_eq!(p.relayed(600 << 10, t0), None);
-        assert_eq!(p.relayed(500 << 10, t0), Some(2));
+        assert_eq!(p.relayed(1, 600 << 10, t0), None);
+        assert_eq!(p.relayed(4, 500 << 10, t0), Some(4));
         assert_eq!(p.tick(t0 + EVERY), None, "nothing new since");
-        assert_eq!(p.relayed(10, t0 + Duration::from_millis(150)), None);
-        assert_eq!(p.tick(t0 + Duration::from_millis(150)), Some(3));
-        assert_eq!(p.relayed(10, t0 + Duration::from_millis(160)), None);
+        assert_eq!(p.relayed(5, 10, t0 + Duration::from_millis(150)), None);
+        assert_eq!(p.tick(t0 + Duration::from_millis(150)), Some(5));
+        assert_eq!(p.relayed(9, 10, t0 + Duration::from_millis(160)), None);
         assert_eq!(p.tick(t0 + Duration::from_millis(200)), None);
-        assert_eq!(p.tick(t0 + Duration::from_millis(250)), Some(4));
+        assert_eq!(p.tick(t0 + Duration::from_millis(250)), Some(9));
     }
 
     #[test]

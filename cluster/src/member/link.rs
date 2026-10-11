@@ -19,8 +19,15 @@ pub enum Link {
     Starting,
     /// At least one socket is admitted and ready.
     Joined,
-    /// No socket is: served locally, writes wait as detached (§6.7).
+    /// No socket is: served locally, writes wait as detached (§6.7). Also a
+    /// member admitted again that has not yet found a quorum to place what it
+    /// wrote cut off.
     CutOff,
+    /// Admitted again after writing cut off: catching up and taking its
+    /// generation (§6.7).
+    Rejoining,
+    /// Rebuilding its substrate from the log (§6.6).
+    Reloading,
     /// A refusal stopped the app on every cluster until the binary is replaced.
     Stopped(Close),
 }

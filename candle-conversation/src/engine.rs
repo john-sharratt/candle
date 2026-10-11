@@ -306,6 +306,10 @@ struct EngineCore {
     /// The model every attached substrate must be bound to.
     model_key: ModelKey,
 
+    /// How many layers hold K/V — what says when a turn another member wrote
+    /// has all its chunks (`docs/replicated_substrate.md` §6.5).
+    kv_layers: usize,
+
     /// What [`ConversationEngine::attach`] hands a new persistence thread
     /// beside the backings ([`Attachments::persist_with`]): the device and the
     /// compression policy.
@@ -536,6 +540,7 @@ impl ConversationEngine {
                 ConversationError::Channel(format!("failed to spawn scheduler thread: {e}"))
             })?;
 
+        let kv_layers = backings.len();
         let core = EngineCore {
             scheduler_tx: tx,
             scheduler_handle: Mutex::new(Some(handle)),
@@ -548,6 +553,7 @@ impl ConversationEngine {
             guests,
             model_core,
             model_key: config.substrate.model_key().clone(),
+            kv_layers,
             device,
             compression_policy,
             attachments: Mutex::new(Attachments::first(
@@ -614,11 +620,51 @@ impl ConversationEngine {
         &self.core.model_key
     }
 
+    /// How many layers hold K/V.
+    pub fn kv_layers(&self) -> usize {
+        self.core.kv_layers
+    }
+
     /// The model's chat dialect.
     pub fn dialect(&self) -> &Dialect {
         &self.core.dialect
     }
 }
+
+/// Reloads one substrate on its engine's scheduler thread — see
+/// [`ConversationEngine::reloader`].
+#[derive(Clone)]
+pub struct SubstrateReloader {
+    scheduler_tx: Sender<SchedulerRequest>,
+    conversation: Conversation,
+}
+
+impl SubstrateReloader {
+    /// Ask for the reload; poll the returned status until `finished`.
+    pub fn reload(&self) -> Arc<SubstrateReloadStatus> {
+        let status = Arc::new(SubstrateReloadStatus::default());
+        let request = SchedulerRequest::ReconstructSubstrate {
+            conversation: self.conversation.clone(),
+            status: Arc::clone(&status),
+        };
+        if self.scheduler_tx.send(request).is_err() {
+            // No scheduler to run it: nothing to wait for.
+            status.finish();
+        }
+        status
+    }
+
+    /// Reload and return once it has finished.
+    pub fn reload_and_wait(&self) {
+        let status = self.reload();
+        while !status.snapshot().2 {
+            std::thread::sleep(RELOAD_POLL);
+        }
+    }
+}
+
+/// How often a reload waited on is looked at.
+const RELOAD_POLL: Duration = Duration::from_millis(50);
 
 /// Attaches substrates to an engine — a cheap clone of its shared core, so the
 /// engine's own handle can stay with the tenant that built it.
@@ -767,15 +813,17 @@ impl ConversationEngine {
     /// so all offsets / KV pointers are rebuilt from the new log. Returns a fresh
     /// status handle; poll [`SubstrateReloadStatus::snapshot`] until `finished`.
     pub fn reload_substrate(&self) -> Arc<SubstrateReloadStatus> {
-        let status = Arc::new(SubstrateReloadStatus::default());
-        let _ = self
-            .core
-            .scheduler_tx
-            .send(SchedulerRequest::ReconstructSubstrate {
-                conversation: self.conversation.clone(),
-                status: Arc::clone(&status),
-            });
-        status
+        self.reloader().reload()
+    }
+
+    /// A handle that reloads this substrate without holding the engine — what
+    /// replication keeps, to reload after a rejoin or a turn that arrived
+    /// ranked below one held (`docs/replicated_substrate.md` §6.6).
+    pub fn reloader(&self) -> SubstrateReloader {
+        SubstrateReloader {
+            scheduler_tx: self.core.scheduler_tx.clone(),
+            conversation: self.conversation.clone(),
+        }
     }
 
     /// Clone the workspace `Conversation` handle.

@@ -1,0 +1,309 @@
+//! A tenant's substrate as the cluster's replicator drives it
+//! (`docs/replicated_substrate.md` §6–§7): the `cluster` crate's [`Store`]
+//! over a [`Conversation`].
+//!
+//! Consensus decisions and `max_members` are custom objects under
+//! `cluster/`, replicated like any keyed value (§5.9): a decision's bytes as a
+//! JSON array, `max_members` as a number — a set under `max_members/set`, and
+//! each member's latest raise under `max_members/raise/<node>`.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use applied_set::AppliedSet;
+use candle_conversation::persistence::deleted::DeletedTimeline;
+use candle_conversation::persistence::identity::VersionStamp;
+use candle_conversation::persistence::record::decode_header;
+use candle_conversation::persistence::remote::RemoteOutcome;
+use candle_conversation::projection::replication::CLUSTER_PREFIX;
+use candle_conversation::projection::Conversation;
+use cluster::consensus::votes::{FileJournal, VoteStore, DEFAULT_SIZE};
+use cluster::consensus::{Change, MaxMembers};
+use cluster::frame::{Gone, RecordHeader};
+use cluster::replicate::{Applied, Listing, Replication, Store, Tap};
+use serde_json::{json, Value};
+
+/// The file a member's acceptor keeps its votes in, beside its log (§5.9).
+pub const VOTES: &str = "VOTES";
+
+const GENERATION: &str = "gen/";
+const MAX_MEMBERS_SET: &str = "max_members/set";
+const MAX_MEMBERS_RAISE: &str = "max_members/raise/";
+
+/// See the module documentation.
+pub struct ConversationStore {
+    conversation: Conversation,
+    kv_layers: usize,
+    reload: Box<dyn Fn() + Send + Sync>,
+}
+
+impl ConversationStore {
+    /// `conversation`'s substrate, on a model with `kv_layers` K/V layers;
+    /// `reload` rebuilds its in-memory state from the log and returns once
+    /// done.
+    pub fn new(
+        conversation: Conversation,
+        kv_layers: usize,
+        reload: impl Fn() + Send + Sync + 'static,
+    ) -> Arc<ConversationStore> {
+        Arc::new(ConversationStore {
+            conversation,
+            kv_layers,
+            reload: Box::new(reload),
+        })
+    }
+
+    /// Replication of this substrate, with the acceptor's votes in its vote
+    /// journal.
+    pub fn replication(self: &Arc<Self>) -> anyhow::Result<Replication> {
+        let votes = FileJournal::open(&self.votes_path(), DEFAULT_SIZE)?;
+        Ok(Replication::open(
+            self.clone(),
+            Box::new(votes) as Box<dyn VoteStore>,
+        )?)
+    }
+
+    fn votes_path(&self) -> PathBuf {
+        self.conversation.substrate_dir().join(VOTES)
+    }
+
+    /// Every object under `cluster/`, by its key below the prefix.
+    fn objects(&self) -> Vec<(String, Value, VersionStamp)> {
+        self.conversation
+            .cluster_objects()
+            .into_iter()
+            .map(|(k, v, s)| (k[CLUSTER_PREFIX.len()..].to_string(), v, s))
+            .collect()
+    }
+
+    fn put(&self, key: &str, blob: Value) {
+        if let Err(e) = self
+            .conversation
+            .put_cluster_object(&format!("{CLUSTER_PREFIX}{key}"), blob)
+        {
+            tracing::error!(key, "a cluster record was not written: {e}");
+        }
+    }
+}
+
+/// A deleted-set entry as a `HEADERS` gone entry carries it: `timeline`,
+/// `origin`, `oseq`, little-endian.
+pub fn encode_entry(e: &DeletedTimeline) -> Vec<u8> {
+    [e.timeline, e.origin, e.oseq]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect()
+}
+
+pub fn decode_entry(b: &[u8]) -> Option<DeletedTimeline> {
+    if b.len() != 24 {
+        return None;
+    }
+    let word = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+    Some(DeletedTimeline {
+        timeline: word(0),
+        origin: word(1),
+        oseq: word(2),
+    })
+}
+
+impl Store for ConversationStore {
+    fn node(&self) -> u64 {
+        self.conversation.node()
+    }
+
+    fn own_through(&self) -> u64 {
+        self.conversation.applied_set().through(self.node())
+    }
+
+    fn set_tap(&self, tap: Tap) {
+        self.conversation.set_replication_tap(tap);
+    }
+
+    fn read(&self, origin: u64, oseq: u64) -> Option<Vec<u8>> {
+        self.conversation.read_event(origin, oseq)
+    }
+
+    fn applied(&self) -> AppliedSet {
+        self.conversation.applied_set()
+    }
+
+    fn apply(&self, records: &[(u64, u64, Vec<u8>)]) -> Applied {
+        // A record whose header names another identity than it travelled under
+        // is refused: the applied set is kept by header, and the requester
+        // counts what it asked for by the frame's.
+        let honest: Vec<bool> = records
+            .iter()
+            .map(|(origin, oseq, bytes)| {
+                decode_header(bytes).is_ok_and(|(h, _)| {
+                    let id = h.identity();
+                    (id.origin, id.oseq) == (*origin, *oseq)
+                })
+            })
+            .collect();
+        let batch: Vec<&[u8]> = records
+            .iter()
+            .zip(&honest)
+            .filter(|(_, ok)| **ok)
+            .map(|((_, _, b), _)| b.as_slice())
+            .collect();
+        let result = self.conversation.apply_remote(&batch, self.kv_layers);
+        let (mut outcomes, reload) = match result {
+            Ok(b) => (b.outcomes.into_iter(), b.reload),
+            Err(e) => {
+                tracing::error!("applying records from other members failed: {e}");
+                return Applied {
+                    taken: vec![false; records.len()],
+                    reload: false,
+                };
+            }
+        };
+        let taken = honest
+            .iter()
+            .map(|ok| {
+                *ok && outcomes
+                    .next()
+                    .is_some_and(|o| !matches!(o, RemoteOutcome::Refused(_)))
+            })
+            .collect();
+        Applied { taken, reload }
+    }
+
+    fn list(&self, origin: u64, from: u64, to: u64) -> Listing {
+        match self.conversation.list_held(origin, from, to) {
+            Ok(held) => Listing {
+                records: held
+                    .records
+                    .into_iter()
+                    .map(|r| RecordHeader {
+                        oseq: r.oseq,
+                        record_type: r.record_type,
+                        stream_id: r.stream_id,
+                        chunk_index: r.chunk_index,
+                        len: r.len,
+                        digest: r.digest,
+                    })
+                    .collect(),
+                gone: held
+                    .gone
+                    .into_iter()
+                    .map(|(oseq, e)| Gone {
+                        oseq,
+                        deleted_entry: e.as_ref().map(encode_entry),
+                    })
+                    .collect(),
+            },
+            Err(e) => {
+                // Listing nothing claims nothing: the requester's catch-up
+                // leaves the range wanted.
+                tracing::error!(origin, from, to, "a catch-up's range is unreadable: {e}");
+                Listing::default()
+            }
+        }
+    }
+
+    fn gone(&self, origin: u64, gone: &[Gone]) {
+        let gone: Vec<(u64, Option<DeletedTimeline>)> = gone
+            .iter()
+            .map(|g| (g.oseq, g.deleted_entry.as_deref().and_then(decode_entry)))
+            .collect();
+        if let Err(e) = self.conversation.record_gone(origin, &gone) {
+            tracing::error!(
+                origin,
+                "what a catch-up learned is gone was not recorded: {e}"
+            );
+        }
+    }
+
+    fn ticket(&self) -> u64 {
+        self.conversation.write_ticket()
+    }
+
+    fn wait_written(&self, ticket: u64) {
+        self.conversation.wait_written(ticket);
+    }
+
+    fn detach(&self) {
+        self.conversation.detach();
+    }
+
+    fn detached(&self) -> bool {
+        self.conversation.holds_detached()
+    }
+
+    fn rejoin(&self, gen: u64) {
+        if let Err(e) = self.conversation.rejoin_at(gen) {
+            tracing::error!(gen, "the rejoin's generation was not recorded: {e}");
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        let decided = self
+            .objects()
+            .iter()
+            .filter_map(|(k, _, _)| k.strip_prefix(GENERATION)?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        self.conversation.generation().max(decided)
+    }
+
+    fn record_decision(&self, key: &[u8], value: &[u8]) {
+        self.put(&String::from_utf8_lossy(key), json!(value));
+    }
+
+    fn decision(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let key = String::from_utf8_lossy(key);
+        self.objects()
+            .into_iter()
+            .find(|(k, _, _)| *k == key)
+            .and_then(|(_, v, _)| serde_json::from_value(v).ok())
+    }
+
+    fn max_members(&self) -> u32 {
+        let mut m = MaxMembers::<VersionStamp>::new();
+        for (key, value, stamp) in self.objects() {
+            let Some(n) = value.as_u64() else { continue };
+            if key == MAX_MEMBERS_SET {
+                m.apply(stamp, Change::Set(n as u32));
+            } else if key.starts_with(MAX_MEMBERS_RAISE) {
+                m.apply(stamp, Change::Raise(n as u32));
+            }
+        }
+        m.value()
+    }
+
+    fn raise_max_members(&self, seen: u32) {
+        self.put(
+            &format!("{MAX_MEMBERS_RAISE}{:016x}", self.node()),
+            json!(seen),
+        );
+    }
+
+    fn set_max_members(&self, n: u32) {
+        self.put(MAX_MEMBERS_SET, json!(n));
+    }
+
+    fn reload(&self) {
+        (self.reload)();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_deleted_entry_is_24_bytes_and_back() {
+        let e = DeletedTimeline {
+            timeline: 0x0102,
+            origin: 0xA,
+            oseq: 7,
+        };
+        let mut want = vec![0x02, 0x01, 0, 0, 0, 0, 0, 0];
+        want.extend([0x0A, 0, 0, 0, 0, 0, 0, 0]);
+        want.extend([7, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(encode_entry(&e), want);
+        assert_eq!(decode_entry(&want), Some(e));
+        assert_eq!(decode_entry(&want[..23]), None);
+    }
+}

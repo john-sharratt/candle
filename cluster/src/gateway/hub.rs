@@ -4,11 +4,28 @@
 //! keeps or relays — and the rest answers the proxy: which member a request
 //! goes to, a stream to it, and the state the status page shows.
 //!
-//! What it relays (§4.3): `CLAIM` and `UNCLAIM`, kept for routing and sent to
-//! the app's other members; `PREPARE`, `PROPOSE` and `RELEASE` to the app's
-//! other members; `PROMISE`, `NACK` and `ACCEPTED` to the member their
-//! `reply_to` names. It keeps `CAPACITY`, `ROUTES` and `COORD`, and sends
-//! `MEMBERS` on every change and every 5 s.
+//! What it relays (§4.3):
+//!
+//! - a live `EVENT` to every other member of the app, but one upgrading, in
+//!   fault mode or lagging; each sender is receipted for what is relayed;
+//! - catch-up traffic — `HEADERS`, an addressed `EVENT`, `DONE` — to the one
+//!   member its `reply_to` names; a `CATCHUP` to the member it names, or one
+//!   other ready member round robin, or answered `DONE` here when there is
+//!   none; a `FETCH` to the member it names; a `HAVE` to every other member;
+//! - `CLAIM` and `UNCLAIM`, kept for routing and sent to the app's other
+//!   members; `PREPARE`, `PROPOSE` and `RELEASE` to the app's other members;
+//!   `PROMISE`, `NACK` and `ACCEPTED` to the member their `reply_to` names.
+//!
+//! It keeps `CAPACITY`, `ROUTES`, `ACK` and `COORD`, and sends `MEMBERS` on
+//! every change and every 5 s.
+//!
+//! **Queues** (§4.4). A member whose ordered lane holds more than
+//! [`LAG_CAP`] of live events unsent becomes **lagging**: no further live
+//! event is queued for it and no request is routed to it, while what is
+//! queued still drains. It is ready again once the lane is empty and its
+//! `ACK`s cover every other member's `high_water`. A catch-up frame that would
+//! take a member's catch-up lane past [`CATCHUP_CAP`] is dropped and counted;
+//! the requester fetches again.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -20,10 +37,11 @@ use tokio::time::{interval, MissedTickBehavior};
 use super::admission::{Admission, Admitted};
 use super::log::{CoordLog, Entry};
 use super::registry::{MemberView, Pick, Registry};
-use super::status::{AppView, ClaimView, HubStatus, MemberRow, Refusal};
+use super::status::{AppView, ClaimView, HubStatus, MemberRow, Queues, Refusal};
 use super::traffic::Traffic;
 use crate::clock::now_ms;
 use crate::close::{Close, CloseCode};
+use crate::delivery::ReceiptPacer;
 use crate::dispatch::{Dispatch, RouteTable};
 use crate::frame::{name, Admit, Frame, Hello, Members};
 use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter};
@@ -39,6 +57,15 @@ pub const REFUSALS_KEPT: usize = 100;
 /// The apps a member may join (§3.1).
 pub const APPS: [&str; 3] = ["zend", "npcd", "agent"];
 
+/// Live events unsent on a member's ordered lane past which it is lagging.
+pub const LAG_CAP: usize = 256 << 20;
+
+/// Bytes on a member's catch-up lane past which a catch-up frame is dropped.
+pub const CATCHUP_CAP: usize = 16 << 20;
+
+/// How often each socket's `RECEIPT` timer and lagging state are looked at.
+const RECEIPT_TICK: Duration = Duration::from_millis(100);
+
 /// A stream a member opened towards the gateway (§5.1): served by the
 /// gateway's own router as a request for `app`.
 pub struct MemberStream {
@@ -47,11 +74,18 @@ pub struct MemberStream {
     pub conn: VirtualConn,
 }
 
-struct Socket {
-    session: u64,
-    handle: SessionHandle,
-    connected_ms: u64,
-    coord: Option<Vec<u8>>,
+pub(super) struct Socket {
+    pub session: u64,
+    pub handle: SessionHandle,
+    pub connected_ms: u64,
+    pub coord: Option<Vec<u8>>,
+    pub pacer: ReceiptPacer,
+    /// Its last `ACK`: what it has applied of each origin.
+    pub acks: Vec<(u64, u64)>,
+    /// Live events not queued for it while it lagged, and catch-up frames
+    /// dropped at its cap.
+    pub skipped: u64,
+    pub dropped: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -61,10 +95,10 @@ struct Mode {
 }
 
 #[derive(Default)]
-struct State {
+pub(super) struct State {
     admission: Admission,
-    registry: Registry,
-    sockets: HashMap<(String, u64), Socket>,
+    pub registry: Registry,
+    pub sockets: HashMap<(String, u64), Socket>,
     limiter: ProofLimiter,
     refusals: VecDeque<Refusal>,
     modes: HashMap<String, Mode>,
@@ -80,7 +114,7 @@ pub struct Hub {
     pub traffic: Traffic,
 }
 
-fn hex(node: u64) -> String {
+pub(super) fn hex(node: u64) -> String {
     format!("{node:016x}")
 }
 
@@ -95,11 +129,11 @@ impl Hub {
         })
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
+    pub(super) fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn note(&self, app: &str, subject: String, text: String) {
+    pub(super) fn note(&self, app: &str, subject: String, text: String) {
         self.log.push(Entry {
             at_ms: now_ms(),
             gateway: self.name.clone(),
@@ -147,6 +181,17 @@ impl Hub {
             .flatten();
         let (_, members) = s.registry.listing(app);
         let claims = s.registry.claims(app).table();
+        // The most any other member has acknowledged of this node's own
+        // events: every one at or below it is held somewhere (§7.5).
+        let own_applied_through = s
+            .sockets
+            .iter()
+            .filter(|((a, n), _)| a == app && *n != hello.node)
+            .flat_map(|(_, x)| x.acks.iter())
+            .filter(|(origin, _)| *origin == hello.node)
+            .map(|(_, through)| *through)
+            .max()
+            .unwrap_or(0);
         drop(s);
         if let Some(model) = lock {
             self.note(app, hex(hello.node), format!("model lock set: {model}"));
@@ -160,7 +205,7 @@ impl Hub {
                 floor_hash: admitted.floor.hash.clone(),
                 // A new session has sent no table on this gateway yet.
                 routes_wanted: true,
-                own_applied_through: 0,
+                own_applied_through,
             },
             admitted,
         ))
@@ -254,6 +299,10 @@ impl Hub {
                     handle: handle.clone(),
                     connected_ms: now_ms(),
                     coord: None,
+                    pacer: ReceiptPacer::new(Instant::now()),
+                    acks: Vec::new(),
+                    skipped: 0,
+                    dropped: 0,
                 },
             );
             if let Some(old) = replaced {
@@ -276,6 +325,7 @@ impl Hub {
                 capacity: None,
                 routes: None,
                 high_water: 0,
+                lagging: false,
             });
         }
         let local = if hello.build.is_local() {
@@ -303,6 +353,8 @@ impl Hub {
         let mut ended = session.ended;
         let mut tick = interval(MEMBERS_EVERY);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut receipts = interval(RECEIPT_TICK);
+        receipts.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let how = loop {
             tokio::select! {
                 arrived = incoming.recv() => match arrived {
@@ -317,15 +369,16 @@ impl Hub {
                         node,
                         conn,
                     }),
-                    // This gateway relays no substrate events, and a member
-                    // of this build sends none.
-                    Some(Incoming::Event { .. }) => {}
+                    Some(Incoming::Event { whole, frame, .. }) => {
+                        self.relay_event(app, node, whole, frame);
+                    }
                     None => break (&mut ended).await.unwrap_or(Ended::Dropped),
                 },
                 _ = tick.tick() => {
                     let (epoch, members) = self.state().registry.listing(app);
                     let _ = handle.control(Frame::Members(Members { epoch, members }));
                 }
+                _ = receipts.tick() => self.receipt_tick(app, node),
             }
         };
 
@@ -428,14 +481,20 @@ impl Hub {
                     format!("{} is the gateway's to send", name(f.kind())),
                 ));
             }
-            // What this gateway neither keeps nor relays: a member's
-            // acknowledgements, catch-up and build traffic, and world pulses.
+            f @ (Frame::Ack(_)
+            | Frame::Catchup(_)
+            | Frame::Headers(_)
+            | Frame::Fetch(_)
+            | Frame::Done(_)
+            | Frame::Have(_)) => self.relay_substrate(app, node, f),
+            // What this gateway neither keeps nor relays: build traffic and
+            // world pulses.
             _ => {}
         }
         Ok(())
     }
 
-    fn to_others(&self, app: &str, from: u64, frame: Frame) {
+    pub(super) fn to_others(&self, app: &str, from: u64, frame: Frame) {
         let s = self.state();
         for ((a, n), socket) in &s.sockets {
             if a == app && *n != from {
@@ -444,7 +503,7 @@ impl Hub {
         }
     }
 
-    fn to_member(&self, app: &str, node: u64, frame: Frame) {
+    pub(super) fn to_member(&self, app: &str, node: u64, frame: Frame) {
         if let Some(socket) = self.state().sockets.get(&(app.to_string(), node)) {
             let _ = socket.handle.control(frame);
         }
@@ -549,6 +608,12 @@ impl Hub {
                     socket.map_or(0, |x| x.connected_ms),
                     socket.and_then(|x| x.coord.as_ref()).map_or(0, Vec::len),
                     s.last_close.get(&(app.to_string(), m.node)).cloned(),
+                    socket.map_or(Queues::default(), |x| Queues {
+                        live_bytes: x.handle.gauges().live(),
+                        catchup_bytes: x.handle.gauges().catchup(),
+                        skipped: x.skipped,
+                        dropped: x.dropped,
+                    }),
                 ));
             }
         }

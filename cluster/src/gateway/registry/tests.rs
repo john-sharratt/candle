@@ -33,7 +33,40 @@ fn member(node: u64, session: u64) -> MemberView {
         capacity: None,
         routes: None,
         high_water: 0,
+        lagging: false,
     }
+}
+
+/// A lagging member is routed nothing and never answers a catch-up, though it
+/// stays ready and the app stays clustered (§4.4).
+#[test]
+fn a_lagging_member_is_routed_nothing() {
+    let mut r = three();
+    assert!(r.set_lagging("zend", 2, true));
+    assert!(!r.set_lagging("zend", 2, true), "no change");
+    for _ in 0..6 {
+        assert_ne!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(2));
+        assert_ne!(r.answerer("zend", 1), Some(2));
+    }
+    assert!(r.clustered("zend"));
+    r.set_lagging("zend", 2, false);
+    let picks: Vec<Pick> = (0..3)
+        .map(|_| r.pick("zend", &Dispatch::Any, None, None))
+        .collect();
+    assert!(picks.contains(&Pick::Member(2)));
+}
+
+/// A catch-up's answerer is picked round robin among the other ready members,
+/// never the requester; alone, there is none.
+#[test]
+fn the_answerer_is_another_member_round_robin() {
+    let mut r = three();
+    let picks: Vec<Option<u64>> = (0..4).map(|_| r.answerer("zend", 2)).collect();
+    assert_eq!(picks, vec![Some(1), Some(3), Some(1), Some(3)]);
+    let mut alone = Registry::new();
+    alone.join(member(1, 1));
+    alone.capacity("zend", 1, capacity(MemberState::Ready, 1, true, 1));
+    assert_eq!(alone.answerer("zend", 1), None);
 }
 
 /// Three ready members: power 100 (idle), 300 (busy), 200 (idle).

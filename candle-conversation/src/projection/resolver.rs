@@ -333,7 +333,7 @@ impl SubstrateRef {
 ///   KV state via the scheduler.
 #[derive(Clone)]
 pub struct Conversation {
-    inner: Arc<RwLock<Substrate>>,
+    pub(super) inner: Arc<RwLock<Substrate>>,
     /// The process's one timeline allocator ([`process_timeline_allocator`]),
     /// so a timeline id minted on one substrate is never minted on another
     /// attached to the same engine.
@@ -347,7 +347,7 @@ pub struct Conversation {
     tenant_rank: TenantRank,
     /// The mandatory persistence layer — every turn is recorded into its
     /// redo log (`docs/archived/kv_tier_migration.md` §13.6).
-    persistence: Arc<PersistenceLock>,
+    pub(super) persistence: Arc<PersistenceLock>,
     /// The substrate's identity minter, shared with `persistence`. A write
     /// that changes the substrate in memory and hands its record to the writer
     /// thread mints here first, so the value and its record carry one identity
@@ -378,7 +378,7 @@ pub struct Conversation {
     /// the inference thread never blocks on the persistence lock (which a
     /// compaction can hold across its relocation I/O). Shared across clones; the
     /// last drop drains + fsyncs + joins the writer. See [`SubstrateWriter`].
-    writer: Arc<SubstrateWriter>,
+    pub(super) writer: Arc<SubstrateWriter>,
     /// Reads records out of sealed segments without `persistence`'s mutex — the
     /// read-side twin of `writer`. A compaction holds that mutex across its
     /// relocation I/O, and the recurrent-snapshot read at every hybrid-model

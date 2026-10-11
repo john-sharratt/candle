@@ -181,6 +181,14 @@ impl Frame {
         }
     }
 
+    /// The frame's length on the wire.
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Frame::Data(d) => HEADER_LEN + d.bytes.len(),
+            _ => self.encode().len(),
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(HEADER_LEN + 64);
         w.u8(self.kind().tag()).u8(self.flags()).u32(self.stream());

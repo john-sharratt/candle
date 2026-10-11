@@ -121,9 +121,16 @@ async fn events_arrive_whole_in_order_with_their_frame_numbers() {
         .event(9, 3, b"fetched", Some(44), true)
         .unwrap();
     let mut got = Vec::new();
+    let mut numbers = Vec::new();
     while got.len() < 3 {
-        if let Incoming::Event { catchup, whole } = gateway.incoming.recv().await.unwrap() {
+        if let Incoming::Event {
+            catchup,
+            whole,
+            frame,
+        } = gateway.incoming.recv().await.unwrap()
+        {
             got.push((whole.oseq, whole.bytes.len(), catchup, whole.reply_to));
+            numbers.push(frame);
             if whole.oseq == 1 {
                 assert_eq!(whole.bytes, big);
             }
@@ -141,6 +148,38 @@ async fn events_arrive_whole_in_order_with_their_frame_numbers() {
         (a.await.unwrap(), b.await.unwrap(), c.await.unwrap()),
         (4, 5, 6)
     );
+    assert_eq!(numbers, vec![4, 5, 6], "both ends count the same frames");
+}
+
+/// Live events and catch-up traffic are gauged while queued and come off as
+/// they are written.
+#[tokio::test]
+async fn the_gauges_empty_as_the_writer_drains() {
+    let (mut gateway, member) = sessions(8 << 20);
+    member
+        .handle
+        .event(9, 1, &vec![1; 3 << 20], None, false)
+        .unwrap();
+    member
+        .handle
+        .event(9, 2, &[2; 100], Some(4), false)
+        .unwrap();
+    let mut events = 0;
+    while events < 2 {
+        if let Incoming::Event { .. } = gateway.incoming.recv().await.unwrap() {
+            events += 1;
+        }
+    }
+    // The writer takes a frame off its gauge once the pipe has it, which may
+    // be a moment after the peer read it.
+    let g = member.handle.gauges();
+    timeout(Duration::from_secs(5), async {
+        while (g.live(), g.catchup()) != (0, 0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the gauges empty");
 }
 
 #[tokio::test]

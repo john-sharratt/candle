@@ -25,8 +25,11 @@ pub struct MemberView {
     /// Its last `CAPACITY`; a member is loading until it sends one.
     pub capacity: Option<Capacity>,
     pub routes: Option<RouteTable>,
-    /// Its own highest `oseq`, from `ACK`s and `COORD` (§7.1).
+    /// Its own highest `oseq`, from its `ACK`s (§7.1).
     pub high_water: u64,
+    /// Its ordered lane passed its cap: it is sent no live event and routed
+    /// no request until it has drained and caught up (§4.4).
+    pub lagging: bool,
 }
 
 impl MemberView {
@@ -38,6 +41,11 @@ impl MemberView {
 
     pub fn ready(&self) -> bool {
         self.state() == MemberState::Ready
+    }
+
+    /// Ready, and not lagging: a request may be routed to it.
+    pub fn routable(&self) -> bool {
+        self.ready() && !self.lagging
     }
 
     pub fn info(&self) -> MemberInfo {
@@ -125,6 +133,24 @@ impl Registry {
         }
     }
 
+    /// `node`'s own highest `oseq`, from its `ACK`.
+    pub fn high_water(&mut self, app: &str, node: u64, high_water: u64) {
+        if let Some(m) = self.app(app).members.get_mut(&node) {
+            m.high_water = m.high_water.max(high_water);
+        }
+    }
+
+    /// Mark `node` lagging or not; whether that changed.
+    pub fn set_lagging(&mut self, app: &str, node: u64, lagging: bool) -> bool {
+        let a = self.app(app);
+        let Some(m) = a.members.get_mut(&node) else {
+            return false;
+        };
+        let changed = m.lagging != lagging;
+        m.lagging = lagging;
+        changed
+    }
+
     pub fn claims(&mut self, app: &str) -> &mut Claims {
         &mut self.app(app).claims
     }
@@ -172,11 +198,30 @@ impl Registry {
             .find_map(|m| m.routes.as_ref())
     }
 
+    /// The members a request may go to: ready, and not lagging.
     fn ready(&self, app: &str) -> Vec<&MemberView> {
         self.apps
             .get(app)
-            .map(|a| a.members.values().filter(|m| m.ready()).collect())
+            .map(|a| a.members.values().filter(|m| m.routable()).collect())
             .unwrap_or_default()
+    }
+
+    /// The next routable member other than `except`, round robin: the
+    /// answerer of a `CATCHUP` that names none (§7.2).
+    pub fn answerer(&mut self, app: &str, except: u64) -> Option<u64> {
+        let nodes: Vec<u64> = self
+            .ready(app)
+            .iter()
+            .map(|m| m.node)
+            .filter(|n| *n != except)
+            .collect();
+        if nodes.is_empty() {
+            return None;
+        }
+        let a = self.app(app);
+        let pick = nodes[a.rr % nodes.len()];
+        a.rr = a.rr.wrapping_add(1);
+        Some(pick)
     }
 
     /// The highest-power idle ready member; with none idle, the one with the
@@ -220,7 +265,7 @@ impl Registry {
             return Pick::Configured;
         }
         let ready_here =
-            |r: &Registry, node: u64| r.member(app, node).is_some_and(MemberView::ready);
+            |r: &Registry, node: u64| r.member(app, node).is_some_and(MemberView::routable);
         let node = match dispatch {
             Dispatch::Aggregate(_) => {
                 return Pick::All(self.ready(app).iter().map(|m| m.node).collect());

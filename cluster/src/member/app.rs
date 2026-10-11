@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::watch;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use super::claims::{Check, MemberClaims};
 use super::link::{Link, Links};
@@ -20,13 +20,17 @@ use crate::close::{Close, CloseCode};
 use crate::dial::{dial, Attempt, Connect, Stopped};
 use crate::dispatch::RouteTable;
 use crate::frame::{
-    Admit, BuildId, Capacity, Claim, Frame, Hello, Members, ModelId, Routes, Unclaim,
+    Admit, BuildId, Capacity, Claim, Frame, Hello, MemberState, Members, ModelId, Routes, Unclaim,
 };
 use crate::handshake::{GroupKey, HandshakeError, PROTO};
+use crate::replicate::{Phase, Replication, Replicator};
 use crate::session::{Ended, Incoming, Session, SessionHandle, VirtualConn};
 
 /// How often `CAPACITY` is sent when nothing prompts it sooner (§4.1).
 pub const CAPACITY_EVERY: Duration = Duration::from_secs(1);
+
+/// The longest a request waits for the records ahead of it to be applied.
+pub const APPLY_WAIT: Duration = Duration::from_secs(10);
 
 /// Who this member is to an app's gateways.
 #[derive(Debug, Clone)]
@@ -67,6 +71,8 @@ pub struct AppMember {
     key: GroupKey,
     routes: RouteTable,
     capacity: CapacitySource,
+    /// The app's substrate replication; an agent has no substrate (§11).
+    replicator: Option<Arc<Replicator>>,
     links: Mutex<Links>,
     sockets: Mutex<Vec<Option<SessionHandle>>>,
     members: Mutex<Vec<Option<Members>>>,
@@ -97,18 +103,21 @@ async fn stopped_elsewhere(stop: &mut watch::Receiver<Option<Close>>) -> Close {
 
 impl AppMember {
     /// The app as `id` on `clusters` (their URLs, for display), declaring
-    /// `routes`, measuring itself with `capacity`; dialling from `started`.
+    /// `routes`, measuring itself with `capacity`, replicating through
+    /// `replication`; dialling from `started`.
     pub fn new(
         id: Identity,
         key: GroupKey,
         clusters: Vec<String>,
         routes: RouteTable,
         capacity: CapacitySource,
+        replication: Option<Replication>,
         started: Instant,
     ) -> Arc<AppMember> {
         let n = clusters.len();
-        Arc::new(AppMember {
+        Arc::new_cyclic(|me| AppMember {
             claims: Mutex::new(MemberClaims::new(id.node)),
+            replicator: replication.map(|r| Replicator::new(r, n, me.clone())),
             id,
             key,
             routes,
@@ -148,15 +157,19 @@ impl AppMember {
     }
 
     /// Dial cluster `c` through `connector` until a terminal close, handing
-    /// every stream a gateway opens to `streams`.
+    /// every stream a gateway opens to `streams` — once every record that
+    /// arrived before it is applied (§6.4).
     pub async fn run<C, F>(self: Arc<Self>, c: usize, connector: C, streams: F) -> Stopped
     where
         C: Connect,
-        F: Fn(VirtualConn) + Send + Sync,
+        F: Fn(VirtualConn) + Send + Sync + 'static,
     {
+        if let Some(r) = &self.replicator {
+            r.start();
+        }
         let mut stop = self.stop.subscribe();
         let this = &self;
-        let streams = &streams;
+        let streams = &Arc::new(streams);
         let dialled = dial(
             connector,
             self.key.clone(),
@@ -241,9 +254,9 @@ impl AppMember {
         self.bump();
     }
 
-    async fn session<F>(&self, c: usize, admit: Admit, session: Session, streams: &F) -> Ended
+    async fn session<F>(&self, c: usize, admit: Admit, session: Session, streams: &Arc<F>) -> Ended
     where
-        F: Fn(VirtualConn) + Send + Sync,
+        F: Fn(VirtualConn) + Send + Sync + 'static,
     {
         let handle = session.handle.clone();
         {
@@ -257,11 +270,14 @@ impl AppMember {
                 table: self.routes.encode(),
             }));
         }
-        let _ = handle.control(Frame::Capacity((self.capacity)()));
         for (key, epoch) in lock(&self.claims).own() {
             let _ = handle.control(Frame::Claim(Claim { key, epoch }));
         }
         lock(&self.sockets)[c] = Some(handle.clone());
+        if let Some(r) = &self.replicator {
+            r.admitted(c, &admit, handle.clone());
+        }
+        let _ = handle.control(Frame::Capacity(self.capacity_for(c)));
         {
             let mut d = lock(&self.dialling);
             d[c].view.state = "admitted";
@@ -279,37 +295,103 @@ impl AppMember {
             tokio::select! {
                 arrived = incoming.recv() => match arrived {
                     Some(Incoming::Frame(frame)) => self.on_frame(c, frame),
-                    Some(Incoming::Stream(conn)) => streams(conn),
-                    // No member of this build writes events, so none arrive.
-                    Some(Incoming::Event { .. }) => {}
+                    Some(Incoming::Stream(conn)) => match &self.replicator {
+                        // Served behind the records the gateway relayed
+                        // ahead of it, so it sees what they wrote.
+                        Some(r) => {
+                            let applied = r.applied_so_far();
+                            let streams = streams.clone();
+                            tokio::spawn(async move {
+                                if timeout(APPLY_WAIT, applied).await.is_err() {
+                                    tracing::warn!(
+                                        "records ahead of a request are not applied after {:?}: \
+                                         serving it",
+                                        APPLY_WAIT
+                                    );
+                                }
+                                streams(conn);
+                            });
+                        }
+                        None => streams(conn),
+                    },
+                    Some(Incoming::Event { whole, .. }) => {
+                        if let Some(r) = &self.replicator {
+                            r.event(c, whole);
+                        }
+                    }
                     None => break (&mut ended).await.unwrap_or(Ended::Dropped),
                 },
                 _ = tick.tick() => {
-                    let _ = handle.control(Frame::Capacity((self.capacity)()));
+                    let _ = handle.control(Frame::Capacity(self.capacity_for(c)));
                 }
             }
         };
         lock(&self.sockets)[c] = None;
         lock(&self.members)[c] = None;
+        if let Some(r) = &self.replicator {
+            r.closed(c);
+        }
         how
     }
 
     fn on_frame(&self, c: usize, frame: Frame) {
         match frame {
-            Frame::Members(m) => lock(&self.members)[c] = Some(m),
+            Frame::Members(m) => {
+                if let Some(r) = &self.replicator {
+                    r.frame(c, Frame::Members(m.clone()));
+                }
+                lock(&self.members)[c] = Some(m);
+            }
             Frame::Claim(claim) => {
                 lock(&self.claims).heard(&claim.key, claim.epoch);
             }
             Frame::Unclaim(u) => lock(&self.claims).heard_release(&u.key, u.epoch),
-            // Consensus, catch-up and builds are not taken part in by a
-            // member of this build.
-            _ => {}
+            // Substrate and consensus traffic is the replicator's; build
+            // traffic is not taken part in by a member of this build.
+            other => {
+                if let Some(r) = &self.replicator {
+                    r.frame(c, other);
+                }
+            }
         }
     }
 
-    /// The app's link, as its own listener decides by (§5.8).
+    /// What `CAPACITY` reports on socket `c`: ready only once the member is
+    /// in the group and that socket's admission catch-up has finished (§7.2).
+    fn capacity_for(&self, c: usize) -> Capacity {
+        let mut cap = (self.capacity)();
+        if let Some(r) = &self.replicator {
+            if cap.state == MemberState::Ready && !r.socket_ready(c) {
+                cap.state = MemberState::Loading;
+            }
+        }
+        cap
+    }
+
+    /// The app's link, as its own listener decides by (§5.8): its sockets'
+    /// state, and where it stands in the group (§6.6, §6.7).
     pub fn link(&self) -> Link {
+        let sockets = self.socket_link();
+        let Some(r) = &self.replicator else {
+            return sockets;
+        };
+        match (sockets, r.phase()) {
+            (Link::Stopped(close), _) => Link::Stopped(close),
+            (_, Phase::Reloading) => Link::Reloading,
+            (Link::Joined, Phase::Rejoining) => Link::Rejoining,
+            (Link::Joined, Phase::CutOff) => Link::CutOff,
+            (sockets, _) => sockets,
+        }
+    }
+
+    /// The link by its sockets alone.
+    pub fn socket_link(&self) -> Link {
         lock(&self.links).state(Instant::now())
+    }
+
+    /// The app's replication, when it has a substrate.
+    pub fn replicator(&self) -> Option<&Arc<Replicator>> {
+        self.replicator.as_ref()
     }
 
     /// A receiver that wakes on every change of a socket's state.
@@ -382,9 +464,22 @@ impl AppMember {
         gone.len()
     }
 
+    /// Hand back every claim this member holds — it is about to stop taking
+    /// work — announcing each with this member's `oseq` at `through`.
+    pub fn release_all(&self, through: u64) -> usize {
+        self.release_idle(Duration::ZERO, through)
+    }
+
     /// Send `CAPACITY` now, on a change the host saw (§4.1).
     pub fn capacity_changed(&self) {
-        self.announce(Frame::Capacity((self.capacity)()));
+        let sockets: Vec<(usize, SessionHandle)> = lock(&self.sockets)
+            .iter()
+            .enumerate()
+            .filter_map(|(c, h)| h.clone().map(|h| (c, h)))
+            .collect();
+        for (c, handle) in sockets {
+            let _ = handle.control(Frame::Capacity(self.capacity_for(c)));
+        }
     }
 
     fn announce(&self, frame: Frame) {
@@ -393,10 +488,19 @@ impl AppMember {
         }
     }
 
-    /// Close every socket with `1001`: the member is shutting down.
+    /// Close every socket with `1001`.
     pub fn close_all(&self, reason: &str) {
         for handle in lock(&self.sockets).iter().flatten() {
             handle.close(Close::new(CloseCode::GoingAway, reason));
         }
+    }
+
+    /// The member is shutting down: its sockets close `1001` and its
+    /// replication stops, before the tenant releases its substrate.
+    pub fn shutdown(&self, reason: &str) {
+        if let Some(r) = &self.replicator {
+            r.shutdown();
+        }
+        self.close_all(reason);
     }
 }

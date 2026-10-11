@@ -35,3 +35,19 @@ pub trait VoteStore: Send {
     /// Forget `key`, freeing its place.
     fn free(&mut self, key: &[u8]) -> io::Result<()>;
 }
+
+/// A member's journal chosen at run time: the file on a daemon, memory in a
+/// simulation.
+impl VoteStore for Box<dyn VoteStore> {
+    fn load(&mut self) -> io::Result<Vec<(Vec<u8>, Vote)>> {
+        (**self).load()
+    }
+
+    fn write(&mut self, key: &[u8], vote: &Vote) -> io::Result<()> {
+        (**self).write(key, vote)
+    }
+
+    fn free(&mut self, key: &[u8]) -> io::Result<()> {
+        (**self).free(key)
+    }
+}

@@ -28,6 +28,8 @@ pub async fn run<R: PipeRx>(
     incoming: Sender<Incoming>,
 ) -> Ended {
     let mut reassembly = Reassembly::new();
+    // The peer's frames counted from one, as its writer counts them (§4.3).
+    let mut number = 0u64;
     let violation = |reason: String| {
         let close = Close::new(CloseCode::Malformed, reason);
         let _ = commands.send(Command::Close(close.clone()));
@@ -51,6 +53,7 @@ pub async fn run<R: PipeRx>(
             }
             Ok(Some(Message::Frame(bytes))) => bytes,
         };
+        number += 1;
         let frame = match Frame::decode(&message) {
             Ok(f) => f,
             Err(e) => break violation(e.to_string()),
@@ -112,7 +115,13 @@ pub async fn run<R: PipeRx>(
             }
             Frame::Event { catchup, event } => match reassembly.accept(event) {
                 Ok(Some(whole)) => {
-                    let _ = incoming.send(Incoming::Event { catchup, whole }).await;
+                    let _ = incoming
+                        .send(Incoming::Event {
+                            catchup,
+                            whole,
+                            frame: number,
+                        })
+                        .await;
                 }
                 Ok(None) => {}
                 Err(e) => break violation(e.to_string()),

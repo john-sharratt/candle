@@ -31,6 +31,8 @@ tokio       = { version = "1", features = ["sync", "rt", "time", "macros", "io-u
 # A member's socket. No TLS and no connector here: the host that dials picks
 # its own, and the gateway's socket is axum's.
 tokio-tungstenite = { version = "0.24", default-features = false }
+# A member's replication reports cut-offs, rejoins and quiet catch-ups.
+tracing     = { workspace = true }
 
 [build-dependencies]
 sha2 = "0.10"
