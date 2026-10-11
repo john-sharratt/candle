@@ -506,11 +506,11 @@ impl ConvDispatcher {
     /// # Safety
     /// - All pointers must be valid for the specified data type
     /// - `info` must point to a valid dims/strides array
-    /// - `columns` is `b · l_out · c_in` and `dst` holds `columns · l_k`
-    ///   elements (`run_im2col1d`)
+    /// - `numel` is `b · l_out · c_in · l_k`, the element count `dst` holds
+    ///   (`run_im2col1d`)
     pub unsafe fn im2col1d(
         dtype: ConvDType,
-        columns: usize,
+        numel: usize,
         l_out: usize,
         l_k: usize,
         stride: usize,
@@ -522,7 +522,7 @@ impl ConvDispatcher {
     ) {
         run_im2col1d(
             dtype as i32,
-            columns,
+            numel,
             l_out,
             l_k,
             stride,
