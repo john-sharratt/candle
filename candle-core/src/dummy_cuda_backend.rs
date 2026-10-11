@@ -10,6 +10,12 @@ pub struct CudaDevice;
 #[derive(Debug)]
 pub struct CudaStorage;
 
+impl CudaStorage {
+    pub fn to_cpu_storage_range(&self, _: usize, _: usize) -> Result<CpuStorage> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+}
+
 macro_rules! fail {
     () => {
         unimplemented!("cuda support has not been enabled, add `cuda` feature to enable.")

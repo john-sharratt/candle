@@ -657,7 +657,7 @@ impl Map1 for Im2Col1D {
         let shape = layout.shape();
         let dims = shape.dims();
         let l_out = self.l_out(dims[2]);
-        let threads = dims[0] * l_out * dims[1];
+        let dst_numel = dims[0] * l_out * dims[1] * self.l_k;
         let ds = dev.info_table(&[dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
 
@@ -669,7 +669,7 @@ impl Map1 for Im2Col1D {
 
         let stream = dev.cuda_stream();
         // SAFETY: Set later by running the kernel.
-        let (dst, out_backing) = unsafe { alloc_inheriting::<T>(dev, threads * self.l_k, origin)? };
+        let (dst, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_numel, origin)? };
         {
             let (ds_ptr, _ds_guard) = ds.device_ptr(&stream);
             let (src_ptr, _src_guard) = src.device_ptr(&stream);
@@ -678,8 +678,9 @@ impl Map1 for Im2Col1D {
             unsafe {
                 kernels::simple::conv::run_im2col1d(
                     dtype,
-                    // One thread per column, each writing its `l_k` elements.
-                    threads,
+                    // One thread per destination element: every one is
+                    // written, so the uninitialised allocation is fully set.
+                    dst_numel,
                     l_out,
                     self.l_k,
                     self.stride,
@@ -3709,6 +3710,32 @@ impl CudaStorage {
                 Ok(data[offset])
             }
         }
+    }
+
+    /// Elements `start..end` copied to the host, and nothing else of the
+    /// storage — what a readback of a contiguous view needs, where
+    /// [`BackendStorage::to_cpu_storage`] copies everything the view was cut
+    /// from.
+    pub fn to_cpu_storage_range(&self, start: usize, end: usize) -> Result<CpuStorage> {
+        // A readback must see everything recorded before it.
+        let _eager = self.device.pause_capture()?;
+        macro_rules! range {
+            ($slice:expr, $variant:ident) => {{
+                let view = $slice.slice(start..end);
+                CpuStorage::$variant($slice.stream().memcpy_dtov(&view).w()?)
+            }};
+        }
+        Ok(match &self.slice {
+            CudaStorageSlice::U8(s) => range!(s, U8),
+            CudaStorageSlice::U32(s) => range!(s, U32),
+            CudaStorageSlice::I64(s) => range!(s, I64),
+            CudaStorageSlice::BF16(s) => range!(s, BF16),
+            CudaStorageSlice::F16(s) => range!(s, F16),
+            CudaStorageSlice::F32(s) => range!(s, F32),
+            CudaStorageSlice::F64(s) => range!(s, F64),
+            CudaStorageSlice::F8E4M3(s) => range!(s, F8E4M3),
+            CudaStorageSlice::Moved => CudaStorageSlice::unreachable_moved(),
+        })
     }
 
     /// Transfer a single scalar element from GPU to CPU (type-erased version).

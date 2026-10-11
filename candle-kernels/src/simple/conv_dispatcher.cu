@@ -109,7 +109,7 @@ extern "C" __global__ void im2col_bf16(size_t, size_t, size_t, size_t, size_t, s
 // =============================================================================
 // Forward declarations for im2col1d kernels
 // =============================================================================
-// Signature: (columns, l_out, l_k, stride, padding, dilation, info, src, dst) —
+// Signature: (numel, l_out, l_k, stride, padding, dilation, info, src, dst) —
 // one thread per column (b · l_out · c_in), each writing its l_k elements.
 
 extern "C" __global__ void im2col1d_f32(size_t, size_t, size_t, size_t, size_t, size_t, const size_t*, const float*, float*);
@@ -473,8 +473,8 @@ extern "C" void run_im2col(
 
 /// Dispatcher for 1D im2col transformation.
 /// @param dtype Data type (0=f32, 1=f64, 2=f16, 3=bf16, 4=u8, 5=u32)
-/// @param columns b * l_out * c_in — one thread per column, each writing its
-///        l_k elements; dst holds columns * l_k
+/// @param numel b * l_out * c_in * l_k, the destination's element count — one
+///        thread per element
 /// @param l_out Output length
 /// @param l_k Kernel length
 /// @param stride Convolution stride
@@ -485,7 +485,7 @@ extern "C" void run_im2col(
 /// @param dst Destination tensor
 extern "C" void run_im2col1d(
     int32_t dtype,
-    size_t columns,
+    size_t numel,
     size_t l_out,
     size_t l_k,
     size_t stride,
@@ -495,32 +495,33 @@ extern "C" void run_im2col1d(
     const void* src,
     void* dst
 ) {
-    // One thread per column: sized by the destination's element count, the
-    // threads past `columns` would write l_k elements each past its end.
-    int grid = grid_size(columns);
+    // One thread per destination element. Sized by anything smaller, the
+    // elements past it are never written and keep whatever the uninitialised
+    // allocation held.
+    int grid = grid_size(numel);
     switch (dtype) {
         case CONV_F32:
-            im2col1d_f32<<<grid, BLOCK_SIZE>>>(columns, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_f32<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
                          (const float*)src, (float*)dst);
             break;
         case CONV_F64:
-            im2col1d_f64<<<grid, BLOCK_SIZE>>>(columns, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_f64<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
                          (const double*)src, (double*)dst);
             break;
         case CONV_F16:
-            im2col1d_f16<<<grid, BLOCK_SIZE>>>(columns, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_f16<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
                          (const __half*)src, (__half*)dst);
             break;
         case CONV_BF16:
-            im2col1d_bf16<<<grid, BLOCK_SIZE>>>(columns, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_bf16<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
                           (const __nv_bfloat16*)src, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            im2col1d_u8<<<grid, BLOCK_SIZE>>>(columns, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_u8<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
                         (const uint8_t*)src, (uint8_t*)dst);
             break;
         case CONV_U32:
-            im2col1d_u32<<<grid, BLOCK_SIZE>>>(columns, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_u32<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
                          (const uint32_t*)src, (uint32_t*)dst);
             break;
     }
