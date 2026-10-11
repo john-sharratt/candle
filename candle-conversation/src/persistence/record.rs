@@ -295,6 +295,16 @@ pub enum RecordType {
     /// substrate holds the live set in RAM and re-emits it on compaction, so it
     /// survives like the other resident metadata. See [`CustomObjectPayload`].
     CustomObject = 27,
+    /// Bytes named by their SHA-256 — an image, say
+    /// (`docs/replicated_substrate.md` §10.3). Payload [`BlobPayload`]: the
+    /// hash, then the bytes. Keyed in the **header** by the hash's first 128
+    /// bits — `stream_id` its first eight bytes, `chunk_index` the next eight —
+    /// so the log opens without hashing a body, and the full hash is checked
+    /// on every read. Content-addressed, so one hash is one value: a second
+    /// record of a hash already held is a duplicate, dead on arrival. Never
+    /// superseded and never resident; relocated verbatim by location
+    /// ([`super::blob::BlobIndex`]).
+    Blob = 29,
     /// What this member has applied of every other origin, and the records it
     /// deferred because it does not decode their type
     /// (`docs/replicated_substrate.md` §6.2, §6.5). Payload
@@ -368,6 +378,7 @@ impl RecordType {
             26 => RecordType::VfsTombstone,
             27 => RecordType::CustomObject,
             28 => RecordType::Replica,
+            29 => RecordType::Blob,
             30 => RecordType::Rebase,
             31 => RecordType::Deleted,
             _ => RecordType::Unknown,
@@ -3095,7 +3106,7 @@ mod tests {
     /// on-disk `HeaderIndex` format.
     #[test]
     fn record_type_tags_round_trip_with_pinned_values() {
-        let pinned: [(RecordType, u8); 18] = [
+        let pinned: [(RecordType, u8); 19] = [
             (RecordType::ModelKey, 1),
             (RecordType::Template, 2),
             (RecordType::StreamDecl, 3),
@@ -3114,6 +3125,7 @@ mod tests {
             (RecordType::HeaderIndex, 18),
             (RecordType::SectionTombstone, 24),
             (RecordType::CustomObject, 27),
+            (RecordType::Blob, 29),
         ];
         for (rt, tag) in pinned {
             assert_eq!(rt.tag(), tag, "{rt:?} wire tag");

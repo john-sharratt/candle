@@ -134,7 +134,7 @@ fn record(root: &Path) -> RecordingTurnSink {
             .files
             .fresh_at(REPO, &item.at)
             .expect("a git repository");
-        let tools = ctx.with_files(Arc::new(files));
+        let tools = ctx.with_files(Arc::new(files), "");
         let unit = DirUnit::of(&item.unit);
         let tags = vec!["repo_map".to_string(), unit.dir.clone()];
         let (prefilled, decode_user) = render_chain(&tools, &unit, &env);

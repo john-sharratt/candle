@@ -28,7 +28,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::Response;
 use cluster::clock::now_ms;
 use cluster::gateway::{Failure, Hub};
-use cluster::member::{DUMB_HOP, DUMB_HOP_VALUE};
+use cluster::member::{DUMB_HOP, DUMB_HOP_VALUE, FROM_MEMBER};
 use http_body_util::BodyExt;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
@@ -84,11 +84,6 @@ pub const IDENTITY_HEADERS: [&str; 7] = [
     // member itself opened, so a client claiming it is claiming to be one.
     FROM_MEMBER,
 ];
-
-/// The header naming the member a request came from, its node in hex — set by
-/// the gateway on a request that arrived on a stream a member opened (§5.8),
-/// and on nothing else.
-pub const FROM_MEMBER: &str = "x-tokera-from-member";
 
 /// What a visitor is told when a daemon behind the gateway is not answering.
 ///

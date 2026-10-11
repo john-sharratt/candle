@@ -4,7 +4,6 @@
 //! Every route is Admin, like the rest of the table: an operation's missions
 //! are taken up by the whole cast.
 
-use std::path::Path as FsPath;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -19,7 +18,9 @@ use crate::engine::mission_gen::gates::Form;
 use crate::engine::no_engine;
 use crate::engine::runtime::Runtime;
 use crate::engine::workflow::{Taker, Where, Workflow};
+use crate::opstore::owner::Owner;
 use crate::sim::operations::Operation;
+use crate::sim::shelf::{Published, Shelf};
 use crate::world::Hosted;
 
 /// Where an operation stands, as the page names it: `running`, `succeeded`,
@@ -91,6 +92,8 @@ fn view(hosted: &Hosted, seen: &Seen) -> Value {
         "history": history,
         "why": op.why(),
         "waiting_brief": seen.waiting,
+        "published": op.published,
+        "retry": op.retry.as_ref().map(|r| json!({ "at_ms": r.at_ms, "why": r.why })),
     })
 }
 
@@ -225,7 +228,11 @@ pub async fn review(
             sim.missions.review_document(&workflow, &at, &path)
         });
         match op {
-            Ok(op) => opened.push(json!({ "world": id, "operation": op })),
+            Ok(op) => {
+                // Its store takes the record as it stands as its base (§10.3).
+                rt.ops.pin(&Owner::operation(&id, op));
+                opened.push(json!({ "world": id, "operation": op }))
+            }
             Err(e) => return err(StatusCode::UNPROCESSABLE_ENTITY, "no_workflow", &e),
         }
     }
@@ -316,7 +323,8 @@ pub struct StepBody {
 /// of its workflow, in a new round: a running one leaves whatever it waited on
 /// (its step not being carried), a finished one is reopened there — read
 /// again by the table, say, or a passed story checked again against the
-/// storyline.
+/// storyline. A kept store resumes as it was; a discarded one starts afresh
+/// on the record as it stands now (§10.3).
 pub async fn step(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
@@ -335,51 +343,56 @@ pub async fn step(
     };
     let step = body.step.trim();
     match hosted.with_sim(|sim| sim.missions.send_to_step(oid, step)) {
-        Ok(()) => Json(json!({ "operation": oid, "step": step })).into_response(),
+        Ok(()) => {
+            rt.ops.pin(&Owner::operation(&wid, oid));
+            Json(json!({ "operation": oid, "step": step })).into_response()
+        }
         Err(e) if e == "no such operation" => err(StatusCode::NOT_FOUND, "no_operation", &e),
         Err(e) => err(StatusCode::CONFLICT, "not_moved", &e),
     }
 }
 
-/// Where an operation's document is now, as a mind path, and whether that is
-/// the record or among the rejected. `None` when it is in neither.
-///
-/// A rejected draft is moved to `rejected/<the operation's name>/<its file>`
-/// (`Benches::retire`), so it is looked for there first, then in any other
-/// folder of the rejected — a draft an operator moved aside by hand.
-fn find_document(root: &FsPath, op: &Operation) -> Option<(String, &'static str)> {
-    if root.join(&op.document).is_file() {
-        return Some((op.document.clone(), "record"));
+/// `POST /v1/pulse/operations/:wid/:oid/retry` — offer a publish that is
+/// waiting on git at once, rather than when its wait is over (§10.3).
+pub async fn retry(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path((wid, oid)): Path<(String, u64)>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
     }
-    let file = op.document.rsplit('/').next()?;
-    let slug: String = op
-        .name
-        .to_lowercase()
-        .replace(' ', "-")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-')
-        .collect();
-    let own = format!("rejected/{slug}/{file}");
-    if root.join(&own).is_file() {
-        return Some((own, "rejected"));
+    let Some(rt) = s.runtime.as_ref() else {
+        return no_engine("offering a publish again");
+    };
+    let hosted = match run_here(rt, &wid) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match hosted.with_sim(|sim| sim.missions.retry_now(oid)) {
+        true => Json(json!({ "operation": oid, "offered": true })).into_response(),
+        false => err(
+            StatusCode::CONFLICT,
+            "not_waiting",
+            "that operation has no publish waiting to be tried again",
+        ),
     }
-    let mut folders: Vec<String> = std::fs::read_dir(root.join("rejected"))
-        .ok()?
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    folders.sort();
-    folders
-        .into_iter()
-        .map(|f| format!("rejected/{f}/{file}"))
-        .find(|p| root.join(p).is_file())
-        .map(|p| (p, "rejected"))
 }
 
-/// `GET /v1/pulse/operations/:wid/:oid/document` — the text of the document
-/// operation `oid` wrote: from the record, or from where its rejection moved
-/// it. 404 `no_document` when it is in neither — a draft never committed.
+/// Where an operation's document stands, against the record: `record` when
+/// its store holds what the record holds, `operation` when the store holds
+/// work the record does not have yet.
+fn standing_of(stored: &str, published: Option<&str>) -> &'static str {
+    match published == Some(stored) {
+        true => "record",
+        false => "operation",
+    }
+}
+
+/// `GET /v1/pulse/operations/:wid/:oid/document` — the text of operation
+/// `oid`'s document as its store holds it (§10.3): the record's, under
+/// whatever the operation has changed. 404 `no_document` when neither has it
+/// — a draft never committed, or a discarded store.
 pub async fn document(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
@@ -408,12 +421,14 @@ pub async fn document(
             "there is no mind to read it from",
         );
     };
-    let found = find_document(root, &op)
-        .and_then(|(path, at)| Some((std::fs::read_to_string(root.join(&path)).ok()?, path, at)));
-    match found {
-        Some((text, path, at)) => Json(json!({
-            "path": path,
-            "where": at,
+    let stored = hosted
+        .op_shelf(oid)
+        .and_then(|shelf| shelf.read(&op.document));
+    let published = Published { root: root.clone() }.read(&op.document);
+    match stored {
+        Some(text) => Json(json!({
+            "path": op.document,
+            "where": standing_of(&text, published.as_deref()),
             "words": text.split_whitespace().count(),
             "text": text,
         }))
@@ -421,7 +436,8 @@ pub async fn document(
         None => err(
             StatusCode::NOT_FOUND,
             "no_document",
-            "the document is neither on the record nor among the rejected — it was never committed",
+            "neither the record nor the operation holds the document — it was never committed, \
+             or the operation's work was discarded",
         ),
     }
 }
@@ -516,59 +532,22 @@ mod tests {
                 ("review".to_string(), false),
                 ("reread".to_string(), true),
                 ("canon".to_string(), false),
+                ("publish".to_string(), false),
             ]
         );
         ops.cancel(id, "not wanted");
         assert_eq!(state(ops.get(id).unwrap()), "cancelled");
     }
 
-    /// **An operation's document is found where it is now**: on the record,
-    /// in the operation's own rejected folder, or moved aside by hand into any
-    /// other — and nowhere when it was never committed.
+    /// **A document is the record's when its store holds what the record
+    /// does**, and the operation's while it holds work the record lacks.
     #[test]
-    fn an_operations_document_is_found_wherever_it_went() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let mut ops = Operations::default();
-        ops.set_workflows(workflows());
-        let id = ops
-            .open(
-                "life-event",
-                None,
-                "life-event",
-                "life:keeper",
-                "Keeper's charge",
-                "layers/life/keeper/2786 The Charge.md",
-            )
-            .unwrap();
-        let op = ops.get(id).unwrap().clone();
-        let put = |rel: &str| {
-            let p = root.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, "the charge").unwrap();
-        };
-        assert_eq!(find_document(root, &op), None, "never committed");
-
-        put("rejected/cleanup/2786 The Charge.md");
+    fn a_document_stands_on_the_record_or_in_its_operation() {
+        assert_eq!(standing_of("the charge", Some("the charge")), "record");
         assert_eq!(
-            find_document(root, &op),
-            Some(("rejected/cleanup/2786 The Charge.md".into(), "rejected"))
+            standing_of("the charge, mended", Some("the charge")),
+            "operation"
         );
-        let own = format!(
-            "rejected/{}/2786 The Charge.md",
-            op.name.to_lowercase().replace(' ', "-")
-        );
-        put(&own);
-        assert_eq!(
-            find_document(root, &op),
-            Some((own, "rejected")),
-            "its own first"
-        );
-        put(&op.document);
-        assert_eq!(
-            find_document(root, &op),
-            Some((op.document.clone(), "record")),
-            "the record first of all"
-        );
+        assert_eq!(standing_of("a new draft", None), "operation");
     }
 }

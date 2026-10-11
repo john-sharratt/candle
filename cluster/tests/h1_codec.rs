@@ -52,6 +52,11 @@ fn mix() -> Vec<Frame> {
             vram_free_mib: 9000,
             cores: 16,
             load_milli: 800,
+            os: "windows".into(),
+            mem_free_mib: 12_000,
+            jobs: 0,
+            toolchains: vec!["cargo".into()],
+            low_priority: false,
         }),
         Frame::Prepare(Prepare {
             key: b"world/w1".to_vec(),

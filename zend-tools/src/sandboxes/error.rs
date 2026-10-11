@@ -20,4 +20,14 @@ pub enum SandboxesError {
     Job(#[from] SandboxError),
     #[error(transparent)]
     NotFound(#[from] JobNotFound),
+    /// With `--cluster`, no agent can be reached, or none holds the
+    /// repository and the program (§11.5).
+    #[error("no agent can run this: {0}")]
+    NoAgent(String),
+    /// The agent refused the command, which never ran.
+    #[error("the agent refused the command: {0}")]
+    AgentRefused(String),
+    /// The job failed on the agent, or on its way there and back.
+    #[error("the job failed on its agent: {0}")]
+    AgentFailed(String),
 }

@@ -10,9 +10,18 @@
 //! On Windows the child is assigned to the job just after it starts, so a
 //! grandchild spawned in the first microseconds of its life would escape the
 //! job. git starts `ssh` and hook shells far later than that.
+//!
+//! A command can be started below normal priority ([`Priority::Below`]): on
+//! Windows with the below-normal creation flag, which what it starts
+//! inherits, and the job's priority-class limit, which holds every process in
+//! the job there; on Unix with a nice of ten taken before the program runs,
+//! which what it starts inherits and none of it can lower again without
+//! privilege.
 
 use std::io;
 use std::process::{Child, Command};
+
+use crate::sandbox::Priority;
 
 #[cfg(windows)]
 mod imp {
@@ -27,14 +36,21 @@ mod imp {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
     };
+    use windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
+
+    use super::Priority;
 
     /// No console window for a child of a daemon that has none.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    pub fn prepare(command: &mut Command) {
-        command.creation_flags(CREATE_NO_WINDOW);
+    pub fn prepare(command: &mut Command, priority: Priority) {
+        let class = match priority {
+            Priority::Normal => 0,
+            Priority::Below => BELOW_NORMAL_PRIORITY_CLASS,
+        };
+        command.creation_flags(CREATE_NO_WINDOW | class);
     }
 
     pub struct Tree {
@@ -46,22 +62,30 @@ mod imp {
     unsafe impl Sync for Tree {}
 
     impl Tree {
-        pub fn adopt(child: &Child) -> io::Result<Self> {
-            Self::adopt_handle(child.as_raw_handle() as HANDLE)
+        pub fn adopt(child: &Child, priority: Priority) -> io::Result<Self> {
+            Self::adopt_handle(child.as_raw_handle() as HANDLE, priority)
         }
 
-        pub fn adopt_async(child: &tokio::process::Child) -> io::Result<Self> {
+        pub fn adopt_async(child: &tokio::process::Child, priority: Priority) -> io::Result<Self> {
             let handle = child.raw_handle().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "the child has already exited")
             })?;
-            Self::adopt_handle(handle as HANDLE)
+            Self::adopt_handle(handle as HANDLE, priority)
         }
 
         /// Put the process behind `process` — a handle its owner keeps open —
-        /// into a new job.
-        fn adopt_handle(process: HANDLE) -> io::Result<Self> {
+        /// into a new job, held at `priority`.
+        fn adopt_handle(process: HANDLE, priority: Priority) -> io::Result<Self> {
+            let (flags, class) = match priority {
+                Priority::Normal => (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0),
+                Priority::Below => (
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+                    BELOW_NORMAL_PRIORITY_CLASS,
+                ),
+            };
             // SAFETY: plain Win32 calls on a handle this function owns, and on
-            // the child's process handle, which the caller keeps open.
+            // the child's process handle, which the caller keeps open; `info`
+            // outlives the call that reads it.
             unsafe {
                 let job = CreateJobObjectW(null(), null());
                 if job.is_null() {
@@ -69,7 +93,8 @@ mod imp {
                 }
                 let tree = Self { job };
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                info.BasicLimitInformation.LimitFlags = flags;
+                info.BasicLimitInformation.PriorityClass = class;
                 if SetInformationJobObject(
                     job,
                     JobObjectExtendedLimitInformation,
@@ -111,8 +136,25 @@ mod imp {
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
 
-    pub fn prepare(command: &mut Command) {
+    use super::Priority;
+
+    /// The nice a command started below normal priority takes.
+    const BELOW_NICE: libc::c_int = 10;
+
+    pub fn prepare(command: &mut Command, priority: Priority) {
         command.process_group(0);
+        if priority == Priority::Below {
+            // SAFETY: runs in the child between fork and exec, and calls only
+            // `setpriority` and `errno`, which are async-signal-safe.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setpriority(libc::PRIO_PROCESS as _, 0, BELOW_NICE) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
     }
 
     pub struct Tree {
@@ -120,13 +162,13 @@ mod imp {
     }
 
     impl Tree {
-        pub fn adopt(child: &Child) -> io::Result<Self> {
+        pub fn adopt(child: &Child, _priority: Priority) -> io::Result<Self> {
             Ok(Self {
                 group: child.id() as i32,
             })
         }
 
-        pub fn adopt_async(child: &tokio::process::Child) -> io::Result<Self> {
+        pub fn adopt_async(child: &tokio::process::Child, _priority: Priority) -> io::Result<Self> {
             let id = child.id().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "the child has already exited")
             })?;
@@ -151,23 +193,29 @@ mod imp {
     }
 }
 
-/// Set `command` up to start a tree [`ProcessTree::adopt`] can kill.
-pub(crate) fn prepare(command: &mut Command) {
-    imp::prepare(command);
+/// Set `command` up to start, at `priority`, a tree [`ProcessTree::adopt`]
+/// can kill.
+pub(crate) fn prepare(command: &mut Command, priority: Priority) {
+    imp::prepare(command, priority);
 }
 
 /// A started child and everything it goes on to start.
 pub(crate) struct ProcessTree(imp::Tree);
 
 impl ProcessTree {
-    pub(crate) fn adopt(child: &Child) -> io::Result<Self> {
-        imp::Tree::adopt(child).map(Self)
+    /// The tree of `child`, started by [`prepare`] at `priority`, which the
+    /// tree holds what it starts at.
+    pub(crate) fn adopt(child: &Child, priority: Priority) -> io::Result<Self> {
+        imp::Tree::adopt(child, priority).map(Self)
     }
 
     /// [`Self::adopt`] for a child started by tokio. Fails once the child has
     /// been reaped.
-    pub(crate) fn adopt_async(child: &tokio::process::Child) -> io::Result<Self> {
-        imp::Tree::adopt_async(child).map(Self)
+    pub(crate) fn adopt_async(
+        child: &tokio::process::Child,
+        priority: Priority,
+    ) -> io::Result<Self> {
+        imp::Tree::adopt_async(child, priority).map(Self)
     }
 
     /// Kill every process in the tree.

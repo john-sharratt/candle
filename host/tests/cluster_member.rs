@@ -20,8 +20,8 @@ use cluster::gateway::{state_name, Hub};
 use cluster::handshake::GroupKey;
 use cluster::member::{Check, Link};
 use cluster::replicate::{MemoryStore, Replication, Store};
+use cluster_dial::Target;
 use host::access::LocalSignin;
-use host::cluster::dial::Target;
 use host::cluster::leave::drain_and_send;
 use host::cluster::{Cluster, ClusterSettings, Join};
 use host::commands::jobs::Job;
@@ -148,6 +148,7 @@ async fn member(gateway: SocketAddr, node: u64, ui: &Path) -> Member {
             hash: "h7".into(),
             local: String::new(),
         },
+        agent: None,
     };
     let cluster = Cluster::new(
         settings,

@@ -1,4 +1,4 @@
-//! What one of a conversation's file events says — the `body` the substrate
+//! What one of a set of stores' file events says — the `body` the substrate
 //! keeps and never reads (`docs/zend_vfs_events.md` §4).
 
 use serde::{Deserialize, Serialize};

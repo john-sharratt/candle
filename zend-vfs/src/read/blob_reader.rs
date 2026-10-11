@@ -29,6 +29,7 @@ use std::time::Duration;
 use crate::error::GitError;
 use crate::kill_tree::ProcessTree;
 use crate::runner::{Invocation, NETWORK_TIMEOUT};
+use crate::sandbox::Priority;
 use crate::types::{Oid, RepoPath, Rev};
 use crate::Repo;
 
@@ -110,7 +111,7 @@ impl BlobReader {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = cmd.spawn()?;
-        let tree = Arc::new(ProcessTree::adopt(&child)?);
+        let tree = Arc::new(ProcessTree::adopt(&child, Priority::Normal)?);
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
         Ok(Batch {

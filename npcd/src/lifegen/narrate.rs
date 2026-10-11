@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path as UrlPath, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -252,9 +252,9 @@ fn push_ancestor(s: &mut String, plan: &Plan, id: NodeId, heading: &str) {
 
 /// `POST /v1/life/:who/node/:key/narrate`
 ///
-/// Generates one node through [`crate::prose`] and writes it into the plan and
-/// onto disk, answering with the prose so the console can show it without a
-/// second read.
+/// Generates one node through [`crate::prose`] and keeps it in the plan and its
+/// document, as the calling admin, answering with the prose so the console can
+/// show it without a second read.
 /// **The body is required, and `{}` is the ordinary one.**
 ///
 /// It was `Option<Json<NarrateBody>>`, so a bodyless POST would work — and that
@@ -264,14 +264,15 @@ fn push_ancestor(s: &mut String, plan: &Plan, id: NodeId, heading: &str) {
 /// offer has to be refused, not silently reinterpreted as asking for nothing.
 pub async fn post_narrate(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     UrlPath((who, key)): UrlPath<(String, String)>,
     Json(body): Json<NarrateBody>,
 ) -> Response {
-    let mind = match super::routes::resolve(&s, &who).await {
+    let author = match super::routes::resolve(&s, &headers, &who).await {
         Ok(m) => m,
         Err(r) => return *r,
     };
-    let mut plan = match super::routes::open(&mind, &who) {
+    let mut plan = match super::routes::open(&author, &who) {
         Ok(p) => p,
         Err(r) => return *r,
     };
@@ -323,7 +324,7 @@ pub async fn post_narrate(
     let trimmed = text.trim();
     if trimmed.is_empty() {
         // **Not written.** A node that generated nothing must keep whatever it
-        // had: `document::sync` drops a file whose node no longer reads as
+        // had: `document::keep` drops a file whose node no longer reads as
         // generated, so writing an empty answer would delete a good document to
         // record a failed draft.
         return fail(
@@ -347,7 +348,7 @@ pub async fn post_narrate(
     c.generated(title, trimmed.to_string());
     let stale = plan.mark_stale_below(id);
 
-    match super::routes::commit(&mind, &plan) {
+    match super::routes::commit(&author, &plan) {
         Ok(written) => Json(json!({
             "node": key,
             "text": trimmed,
@@ -366,7 +367,7 @@ pub async fn post_narrate(
 /// What a node is called when it has never had a title.
 ///
 /// The title becomes the document's filename, so an empty one is not cosmetic —
-/// `document::sync` would write a file named after nothing.
+/// `document::keep` would write a file named after nothing.
 fn default_title(id: NodeId) -> String {
     match id {
         NodeId::Story => "The Life".into(),

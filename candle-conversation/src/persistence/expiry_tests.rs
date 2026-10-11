@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use super::blob::BlobIndex;
 use super::compaction::{collect_live_records, CompactItem, Housekeeping};
 use super::deleted::{DeletedKey, DeletedPayload, DeletedTimeline};
 use super::identity::{MarkerIds, RecordIdentity, COUNTER_BITS};
@@ -114,6 +115,7 @@ fn compact(store: &Store, now_ms: u64) -> Vec<(RecordType, u64, Vec<u8>, RecordI
         &store.substrate,
         &StampedLocs::new(),
         &VfsIndex::new(),
+        &BlobIndex::new(),
         &store.markers,
         0,
         TombstoneExpiry {

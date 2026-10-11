@@ -26,11 +26,14 @@ pub use page::{LogPage, PAGE_LINES};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use zend_vfs::{
-    CommandPolicy, DiskWriteGrant, JobId, JobInfo, JobRequest, Repo, RunOutcome, Sandbox,
-    SandboxServer, Workspace, JOBS_DIR,
+    here, CommandPolicy, DiskWriteGrant, JobId, JobInfo, JobRequest, Push, Repo, RunOutcome,
+    Sandbox, SandboxServer, Workspace, JOBS_DIR,
 };
+
+use crate::executor::Executor;
 
 /// A job that has ended.
 #[derive(Debug)]
@@ -86,11 +89,6 @@ impl Sandboxes {
         &self.jobs_dir
     }
 
-    /// `Ok` when `repo` has a sandbox; otherwise why not, naming those that do.
-    pub fn check(&self, repo: &str) -> Result<(), SandboxesError> {
-        self.server(repo).map(|_| ())
-    }
-
     fn server(&self, repo: &str) -> Result<&SandboxServer, SandboxesError> {
         self.servers
             .get(repo)
@@ -101,7 +99,7 @@ impl Sandboxes {
     }
 
     /// Run `request` in `repo`'s sandbox and wait for it to end.
-    pub fn run(
+    pub fn run_here(
         &self,
         grant: DiskWriteGrant,
         repo: &str,
@@ -125,9 +123,26 @@ impl Sandboxes {
     pub fn status(&self, repo: &str, id: &JobId) -> Result<JobInfo, SandboxesError> {
         Ok(self.server(repo)?.query_job(id)?)
     }
+}
 
-    /// Page `page` of the job `id`'s output, and where the job stands.
-    pub fn output(
+/// Commands on this daemon's own checkouts, and pushes from its own folders.
+impl Executor for Sandboxes {
+    /// `Ok` when `repo` has a sandbox; otherwise why not, naming those that do.
+    fn check(&self, repo: &str) -> Result<(), SandboxesError> {
+        self.server(repo).map(|_| ())
+    }
+
+    fn run(
+        &self,
+        grant: DiskWriteGrant,
+        repo: &str,
+        _lineage: &str,
+        request: JobRequest,
+    ) -> Result<Ran, SandboxesError> {
+        self.run_here(grant, repo, request)
+    }
+
+    fn output(
         &self,
         repo: &str,
         id: &JobId,
@@ -136,6 +151,10 @@ impl Sandboxes {
         let info = self.status(repo, id)?;
         let read = page::read(&info.log, page).map_err(SandboxesError::Log)?;
         Ok((info, read))
+    }
+
+    fn pusher(&self, _repo: &str) -> Arc<dyn Push> {
+        here()
     }
 }
 

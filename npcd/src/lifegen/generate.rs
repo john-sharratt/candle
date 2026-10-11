@@ -29,7 +29,6 @@
 //! threads exist — there are none.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +37,7 @@ use super::plan::{CastMember, NodeId, Phase, Plan, YearBeat};
 use super::progress::{GenProgress, Stage};
 use super::prompt;
 use super::seed::check;
+use crate::sim::shelf::Shelf;
 
 /// How many nodes are submitted to the guest at once.
 ///
@@ -89,7 +89,7 @@ pub type Narrator = Arc<
 /// no fork is going to use.
 pub async fn run_phase(
     narrate: &Narrator,
-    mind: &Path,
+    shelf: &dyn Shelf,
     plan: &Mutex<Plan>,
     phase: Phase,
     // The character's own idiom, from their personality — see
@@ -286,15 +286,7 @@ pub async fn run_phase(
     let p = plan.lock().unwrap();
 
     progress.stage(Stage::Writing);
-    // Only a story that was actually generated is written. Without the guard a redo
-    // that cleared the node and then failed to refill it wrote the *empty* node over
-    // the good document already on disk — a failed regeneration destroying the thing
-    // it was regenerating. `routes.rs::commit` has always tested this; this call site
-    // did not.
-    if phase == Phase::Story && p.story.content.is_generated() {
-        document::write_story(mind, &p.seed.who, &p.story.content.text)?;
-    }
-    let report = document::sync(mind, &p)?;
+    let report = document::keep(shelf, &p)?;
     if !report.removed.is_empty() {
         tracing::info!(
             "life {}: {} document(s) removed as no longer part of the plan",
@@ -302,7 +294,6 @@ pub async fn run_phase(
             report.removed.len()
         );
     }
-    super::plan::save(mind, &p)?;
     Ok(written)
 }
 

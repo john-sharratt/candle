@@ -179,6 +179,68 @@ const STORES: &[&str] = &["stores"];
 const STRUCTURE: &[&str] = &["structure-board"];
 const READING_TABLE: &[&str] = &["reading-table"];
 const TIME_MACHINE: &[&str] = &["time-machine"];
+const MERGE_TABLE: &[&str] = &["merge-table"];
+
+// ── The merge table ─────────────────────────────────────────────────────────
+//
+// Where an operation's verified work lands in the record
+// (`docs/replicated_substrate.md` §10.3). None takes an argument: each acts on
+// the operation whose publish step the Maker carries.
+
+pub const MERGE_STATUS: Tool = Tool {
+    name: "merge_status",
+    at: MERGE_TABLE,
+    category: "Archive",
+    plane: Plane::World,
+    availability: Availability::AtPart,
+    description: "See what the operation you are publishing changes in the record, and whether \
+                  it lands cleanly on the record as it stands now.",
+    params: &[],
+    examples: &[Example {
+        situation: "You have come down to the merge table to publish a story that passed its \
+                    checks.",
+        call: r#"{}"#,
+        because: "Knowing whether the record moved under the work tells you whether it lands at \
+                  once or needs settling first.",
+    }],
+};
+
+pub const MERGE_PUBLISH: Tool = Tool {
+    name: "merge_publish",
+    at: MERGE_TABLE,
+    category: "Archive",
+    plane: Plane::World,
+    availability: Availability::AtPart,
+    description: "Land the operation's verified work in the record. Refused, naming the \
+                  documents, when the record has moved under it at the same lines — then \
+                  `merge_sync` and settle them first.",
+    params: &[],
+    examples: &[Example {
+        situation: "`merge_status` says the work lands cleanly.",
+        call: r#"{}"#,
+        because: "Nothing reaches the record but through this; until it lands, the work stands \
+                  nowhere anybody else can read it.",
+    }],
+};
+
+pub const MERGE_SYNC: Tool = Tool {
+    name: "merge_sync",
+    at: MERGE_TABLE,
+    category: "Archive",
+    plane: Plane::World,
+    availability: Availability::AtPart,
+    description: "Bring the record's newer text into the operation's work, with every place \
+                  both changed marked in the document. Settle each mark at the bench, commit, \
+                  and publish again.",
+    params: &[],
+    examples: &[Example {
+        situation: "`merge_publish` was refused: another operation changed the same lines of \
+                    the document first.",
+        call: r#"{}"#,
+        because: "The overlap has to be settled by somebody who reads both sides; the marks \
+                  put both in front of you.",
+    }],
+};
 
 // ── The time machine ────────────────────────────────────────────────────────
 
@@ -1014,6 +1076,9 @@ pub const GATHER_CALL: Tool = on_with!(
 
 /// Everything in this module, in the order it is offered.
 pub const STATION_ACTS: &[Tool] = &[
+    MERGE_STATUS,
+    MERGE_PUBLISH,
+    MERGE_SYNC,
     TIME_TRAVEL,
     CHRONICLE_ADD_ENTRY,
     CHRONICLE_REWRITE_PAGE,

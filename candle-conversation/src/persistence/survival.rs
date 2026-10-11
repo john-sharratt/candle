@@ -80,6 +80,9 @@ pub fn survival(rt: RecordType) -> Survival {
         // A conversation's file events: bodies owned by the daemon above and
         // never in RAM here, located through `VfsIndex`.
         RecordType::VfsEvent => Survival::Relocated,
+        // Bytes named by their hash, never in RAM here, located through
+        // `BlobIndex`.
+        RecordType::Blob => Survival::Relocated,
         // Workspace singletons, located through the manifest.
         RecordType::ModelKey | RecordType::Template | RecordType::Tokenizer => Survival::Relocated,
 
@@ -173,6 +176,7 @@ pub const WRITTEN_RECORD_TYPES: &[RecordType] = &[
     RecordType::VfsTombstone,
     RecordType::CustomObject,
     RecordType::Replica,
+    RecordType::Blob,
     RecordType::Rebase,
     RecordType::Deleted,
 ];
@@ -283,6 +287,7 @@ pub fn type_label(rt: RecordType) -> &'static str {
         RecordType::VfsEvent => "vfs_event",
         RecordType::VfsTombstone => "vfs_tombstone",
         RecordType::CustomObject => "custom_object",
+        RecordType::Blob => "blob",
         RecordType::Deleted => "deleted",
         RecordType::Replica => "replica",
         RecordType::Rebase => "rebase",

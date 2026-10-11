@@ -364,8 +364,7 @@ impl Missions {
     ///
     /// `objective` says in a line what it is for, `brief` what its document is
     /// to tell, `fields` the proposal's own, which every step's prompt is filled
-    /// from, and `reads` what its work reads; `before` is what its document
-    /// says now, when the record already holds it. Returns its id.
+    /// from, and `reads` what its work reads. Returns its id.
     #[allow(clippy::too_many_arguments)]
     pub fn launch(
         &mut self,
@@ -378,15 +377,11 @@ impl Missions {
         brief: &str,
         fields: BTreeMap<String, String>,
         reads: Vec<String>,
-        before: Option<&str>,
     ) -> Result<u64, String> {
         let id = self
             .operations
             .open(workflow, None, generator, target, objective, document)?;
         self.operations.briefed(id, brief, fields, reads);
-        if let Some(text) = before {
-            self.operations.kept_before(id, text);
-        }
         let stuck = self
             .targets
             .get(target)
@@ -652,12 +647,13 @@ impl Missions {
     }
 
     /// Strike, from every mission carried, waiting at the table or lodged, each
-    /// read of a document `holds` says the record no longer has — see
+    /// read of a document `holds` says is not there for it — asked with the
+    /// operation the mission is a step of, whose store it reads through; see
     /// [`Mission::strike_gone_reads`]. Returns each body or the pool (`None`)
     /// with the paths struck from it.
     pub fn strike_gone_reads(
         &mut self,
-        holds: &dyn Fn(&str) -> bool,
+        holds: &dyn Fn(Option<u64>, &str) -> bool,
     ) -> Vec<(Option<String>, Vec<String>)> {
         let carried = self
             .active
@@ -876,6 +872,30 @@ impl Missions {
             }
             None => false,
         }
+    }
+
+    /// Operation `id`'s store landed on the record as `commit`.
+    pub fn published(&mut self, id: u64, commit: &str) {
+        self.operations.published(id, commit);
+    }
+
+    /// Offer operation `id`'s publish waiting on git at once. `false` when
+    /// none is waiting.
+    pub fn retry_now(&mut self, id: u64) -> bool {
+        self.operations.retry_now(id)
+    }
+
+    /// The body's publish could not reach git, for `why`, at `now_ms`: its
+    /// mission is put down without a report — neither an outcome nor a stuck
+    /// one — and its operation's step is offered again once the wait is over
+    /// (`docs/replicated_substrate.md` §10.3). Returns the operation.
+    pub fn publish_waits(&mut self, body: &str, why: &str, now_ms: u64) -> Option<u64> {
+        let (id, _) = self.active.get(body)?.operation()?;
+        let m = self.active.remove(body)?;
+        self.close(body, &m);
+        self.operations.released(id);
+        self.operations.publish_waits(id, why, now_ms);
+        Some(id)
     }
 
     /// File the body's completion report, closing the open mission and keeping
@@ -1154,7 +1174,7 @@ mod tests {
         m.lodge("sila", with_read("lodged"));
         m.pool.push(with_read("pooled"));
         m.assign("paxon", a_mission("reads nothing"));
-        let struck = m.strike_gone_reads(&|p| p != gone);
+        let struck = m.strike_gone_reads(&|_, p| p != gone);
         assert_eq!(
             struck,
             [

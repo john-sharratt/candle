@@ -3,9 +3,10 @@
 //! # This is the only handoff
 //!
 //! The generator's entire contact with the running engine is a `.md` file in
-//! `layers/life/<who>/`. The watcher notices it, [`crate::engine::ingest`] puts
-//! it on a conversation, and [`crate::engine::authoring`] executes the
-//! `<tool_call>` blocks inside it. Nothing here writes to the substrate, and
+//! `layers/life/<who>/`. Once it is in the mind folder — published, over a mind
+//! under git — the watcher notices it, [`crate::engine::ingest`] puts it on a
+//! conversation, and [`crate::engine::authoring`] executes the `<tool_call>`
+//! blocks inside it. Nothing here writes to the substrate's memory, and
 //! nothing here is privileged over a document somebody typed.
 //!
 //! That is worth defending rather than treating as an implementation detail. It
@@ -21,13 +22,14 @@
 //! goes through [`file_name`], and a test asserts the round trip for all three
 //! grains and for titles hostile enough to break it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Serialize;
 
 use super::consequence::render_all;
-use super::plan::{is_safe_id, NodeId, Plan};
+use super::plan::{is_safe_id, stored, NodeId, Plan};
 use crate::engine::life::{parse_name, Precision};
+use crate::sim::shelf::Shelf;
 
 /// Characters a filename may not carry.
 ///
@@ -140,22 +142,22 @@ pub fn body(prose: &str, consequences: &str) -> String {
     format!("{prose}\n\n{consequences}\n")
 }
 
-/// Where a character's life documents live.
+/// Where a character's life documents live in the mind.
 ///
 /// `None` for an id that must not become a path — `who` reaches here from a
-/// URL, and an unchecked one would let a request choose the directory this
-/// module creates, writes into, and deletes `.md` files from. See
+/// URL, and an unchecked one would let a request choose the folder this
+/// module writes into and removes `.md` files from. See
 /// [`super::plan::is_safe_id`].
-pub fn life_dir(mind: &Path, who: &str) -> Option<PathBuf> {
-    is_safe_id(who).then(|| mind.join("layers").join("life").join(who))
+pub fn life_dir(who: &str) -> Option<String> {
+    is_safe_id(who).then(|| format!("layers/life/{who}"))
 }
 
-/// What one write-out did.
+/// What one keeping of a plan did to its dated documents.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Written {
     pub wrote: usize,
     pub unchanged: usize,
-    /// Documents on disk that no longer correspond to any generated node.
+    /// Documents that no longer correspond to any generated node.
     ///
     /// **Removed, not left.** A regeneration that produces fewer days would
     /// otherwise leave the character remembering an episode that has been
@@ -163,55 +165,72 @@ pub struct Written {
     pub removed: Vec<String>,
 }
 
-/// Write every generated node of a plan into the character's life directory,
-/// and remove the documents that no longer belong to one.
+/// Keep `plan` on `shelf` as one commit: every generated node's document in
+/// the character's life folder, the story in semantic memory once it is
+/// generated, the removal of the dated documents the plan no longer accounts
+/// for, and the plan itself. On an author's shelf that is their draft, to be
+/// published with the rest of what they wrote (`docs/replicated_substrate.md`
+/// §10.3).
 ///
-/// Idempotent: a document whose bytes already match is left alone, so a
+/// Idempotent: a document whose text already matches is left alone, so a
 /// re-run does not churn the ledger the ingest diffs against.
-pub fn sync(mind: &Path, plan: &Plan) -> anyhow::Result<Written> {
+pub fn keep(shelf: &dyn Shelf, plan: &Plan) -> anyhow::Result<Written> {
     let who = &plan.seed.who;
-    let dir = life_dir(mind, who)
-        .ok_or_else(|| anyhow::anyhow!("`{who}` is not a character id a path is built from"))?;
-    std::fs::create_dir_all(&dir)?;
+    let unsafe_id = || anyhow::anyhow!("`{who}` is not a character id a path is built from");
+    let dir = life_dir(who).ok_or_else(unsafe_id)?;
 
     let mut report = Written::default();
-    let mut keep: Vec<String> = Vec::new();
+    let mut changes: Vec<(String, Option<String>)> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
 
     for (id, prose, consequences) in nodes(plan) {
         let Some(name) = file_name(id, &prose.0) else {
             continue;
         };
         let text = body(&prose.1, &consequences);
-        keep.push(name.clone());
-        let path = dir.join(&name);
-        if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
+        let path = format!("{dir}/{name}");
+        kept.push(name);
+        if shelf.read(&path).is_some_and(|old| old == text) {
             report.unchanged += 1;
             continue;
         }
-        let tmp = path.with_extension("md.tmp");
-        std::fs::write(&tmp, &text)?;
-        std::fs::rename(&tmp, &path)?;
+        changes.push((path, Some(text)));
         report.wrote += 1;
     }
 
-    // Anything dated in this directory that the plan no longer accounts for.
+    // Anything dated in the folder that the plan no longer accounts for.
     // Undated files are left alone: they are not ours, and an author may keep
     // notes beside a life.
-    for entry in std::fs::read_dir(&dir)?.flatten() {
-        let path = entry.path();
-        if path.is_dir() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+    for name in shelf.list(&dir) {
+        if name.ends_with('/') || !name.ends_with(".md") {
             continue;
         }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if parse_name(&path).is_err() || keep.iter().any(|k| k == name) {
+        if parse_name(Path::new(&name)).is_err() || kept.contains(&name) {
             continue;
         }
-        std::fs::remove_file(&path)?;
-        report.removed.push(name.to_string());
+        changes.push((format!("{dir}/{name}"), None));
+        report.removed.push(name);
     }
     report.removed.sort();
+
+    // Only a story that was actually generated is kept: a redo that cleared it
+    // and failed to refill it must not write the empty node over the good
+    // document that is there.
+    if plan.story.content.is_generated() {
+        let path = story_path(who).ok_or_else(unsafe_id)?;
+        let text = format!("{}\n", plan.story.content.text.trim());
+        if shelf.read(&path).as_deref() != Some(text.as_str()) {
+            changes.push((path, Some(text)));
+        }
+    }
+
+    let (path, text) = stored(plan)?;
+    if shelf.read(&path).as_deref() != Some(text.as_str()) {
+        changes.push((path, Some(text)));
+    }
+    if !changes.is_empty() {
+        shelf.commit(&changes).map_err(anyhow::Error::msg)?;
+    }
     Ok(report)
 }
 
@@ -257,36 +276,14 @@ fn nodes(plan: &Plan) -> Vec<(NodeId, (String, String), String)> {
     out
 }
 
-/// Where the story goes: semantic memory, not the dated history.
+/// Where the story goes in the mind: semantic memory, not the dated history.
 ///
 /// [`crate::engine::life`] is explicit that `layers/memory/<who>/` holds what a
 /// character *is like* — traits and standing knowledge, with no honest date to
 /// give them. A whole-life arc is exactly that, and dating it would mean
 /// inventing a day on which a character acquired their own disposition.
-pub fn story_path(mind: &Path, who: &str) -> Option<PathBuf> {
-    is_safe_id(who).then(|| {
-        mind.join("layers")
-            .join("memory")
-            .join(who)
-            .join("life-story.md")
-    })
-}
-
-/// Write the story into semantic memory.
-pub fn write_story(mind: &Path, who: &str, text: &str) -> anyhow::Result<bool> {
-    let path = story_path(mind, who)
-        .ok_or_else(|| anyhow::anyhow!("`{who}` is not a character id a path is built from"))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let text = format!("{}\n", text.trim());
-    if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
-        return Ok(false);
-    }
-    let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, &text)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(true)
+pub fn story_path(who: &str) -> Option<String> {
+    is_safe_id(who).then(|| format!("layers/memory/{who}/life-story.md"))
 }
 
 /// The grain a node's document is written at, for the console.
@@ -301,7 +298,11 @@ pub fn precision(id: NodeId) -> Option<Precision> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::drafts::disk::Disk;
     use crate::lifegen::consequence::Consequence;
     use crate::lifegen::plan::Plan;
     use crate::lifegen::seed::{check, Cadence, Seed};
@@ -347,11 +348,30 @@ mod tests {
         assert_eq!(file_name(y, "2751").unwrap(), "2751 2751.md");
     }
 
-    fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("npcd-doc-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    /// A shelf over a folder that counts the commits made to it.
+    struct Counting {
+        disk: Disk,
+        commits: Mutex<Vec<usize>>,
+    }
+
+    impl Shelf for Counting {
+        fn read(&self, key: &str) -> Option<String> {
+            self.disk.read(key)
+        }
+        fn list(&self, dir: &str) -> BTreeSet<String> {
+            self.disk.list(dir)
+        }
+        fn commit(&self, changes: &[(String, Option<String>)]) -> Result<(), String> {
+            self.commits.lock().unwrap().push(changes.len());
+            self.disk.commit(changes)
+        }
+    }
+
+    fn counting(dir: &tempfile::TempDir) -> Counting {
+        Counting {
+            disk: Disk::new(dir.path()),
+            commits: Mutex::new(Vec::new()),
+        }
     }
 
     fn plan() -> Plan {
@@ -497,9 +517,13 @@ mod tests {
         assert_eq!(parsed.prose, "You came back.");
     }
 
+    /// **Every generated node, and the plan itself, is kept in one commit**,
+    /// what was not generated is not written, and keeping it again changes
+    /// nothing.
     #[test]
-    fn syncing_writes_every_generated_node_and_skips_the_rest() {
-        let mind = tmp("sync");
+    fn keeping_writes_every_generated_node_and_the_plan_in_one_commit() {
+        let mind = tempfile::tempdir().unwrap();
+        let shelf = counting(&mind);
         let mut p = plan();
         p.content_mut(NodeId::Year { year: 1998 })
             .unwrap()
@@ -511,72 +535,95 @@ mod tests {
         .unwrap()
         .generated("September".into(), "It rained.".into());
 
-        let r = sync(&mind, &p).unwrap();
+        let r = keep(&shelf, &p).unwrap();
         assert_eq!((r.wrote, r.unchanged), (2, 0));
-        let dir = life_dir(&mind, "cindy-tan").unwrap();
-        assert!(dir.join("1998 Nanyang.md").is_file());
+        assert_eq!(
+            *shelf.commits.lock().unwrap(),
+            [3],
+            "two documents and the plan"
+        );
+        let dir = mind.path().join("layers/life/cindy-tan");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("1998 Nanyang.md")).unwrap(),
+            "You were born.\n"
+        );
         assert!(dir.join("1998-09 September.md").is_file());
-        assert!(
-            !dir.join("1998-10 .md").exists(),
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
             "ungenerated months are not written"
         );
+        assert_eq!(
+            std::fs::read_to_string(mind.path().join(".lifegen/cindy-tan.json")).unwrap(),
+            serde_json::to_string_pretty(&p).unwrap()
+        );
 
-        // Idempotent: nothing churns on a second pass.
-        let r2 = sync(&mind, &p).unwrap();
+        let r2 = keep(&shelf, &p).unwrap();
         assert_eq!((r2.wrote, r2.unchanged), (0, 2));
-        let _ = std::fs::remove_dir_all(&mind);
+        assert_eq!(*shelf.commits.lock().unwrap(), [3], "nothing churned");
     }
 
     /// **A regeneration that produces fewer days must not leave the character
     /// remembering an episode written out of their history.**
     #[test]
     fn a_document_the_plan_no_longer_accounts_for_is_removed() {
-        let mind = tmp("orphan");
+        let mind = tempfile::tempdir().unwrap();
+        let shelf = Disk::new(mind.path());
         let mut p = plan();
         p.ensure_day(1998, 9, 14)
             .unwrap()
             .content
             .generated("A Day".into(), "It happened.".into());
-        sync(&mind, &p).unwrap();
-        let dir = life_dir(&mind, "cindy-tan").unwrap();
-        assert!(dir.join("1998-09-14 A Day.md").is_file());
+        keep(&shelf, &p).unwrap();
+        let day = mind
+            .path()
+            .join("layers/life/cindy-tan/1998-09-14 A Day.md");
+        assert!(day.is_file());
 
         // The day is written out of the plan.
         p.month_mut(1998, 9).unwrap().days.clear();
-        let r = sync(&mind, &p).unwrap();
+        let r = keep(&shelf, &p).unwrap();
         assert_eq!(r.removed, vec!["1998-09-14 A Day.md".to_string()]);
-        assert!(!dir.join("1998-09-14 A Day.md").exists());
-        let _ = std::fs::remove_dir_all(&mind);
+        assert!(!day.exists());
     }
 
     /// An author's own notes beside a life are not the generator's to delete.
     #[test]
-    fn an_undated_file_in_the_life_directory_is_left_alone() {
-        let mind = tmp("notes");
-        let dir = life_dir(&mind, "cindy-tan").unwrap();
+    fn an_undated_file_in_the_life_folder_is_left_alone() {
+        let mind = tempfile::tempdir().unwrap();
+        let dir = mind.path().join("layers/life/cindy-tan");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("notes.md"), "mine").unwrap();
-        let r = sync(&mind, &plan()).unwrap();
+        let r = keep(&Disk::new(mind.path()), &plan()).unwrap();
         assert!(r.removed.is_empty());
         assert!(dir.join("notes.md").is_file());
-        let _ = std::fs::remove_dir_all(&mind);
     }
 
     /// **The story is semantic memory, not dated history.** Dating it would
     /// mean inventing a day on which a character acquired their own
-    /// disposition.
+    /// disposition. Only a generated story is kept.
     #[test]
-    fn the_story_is_written_into_semantic_memory() {
-        let mind = tmp("story");
-        assert!(write_story(&mind, "cindy-tan", "She was always careful.").unwrap());
-        let p = story_path(&mind, "cindy-tan").unwrap();
-        assert!(p.starts_with(mind.join("layers").join("memory").join("cindy-tan")));
+    fn the_story_is_kept_in_semantic_memory() {
+        let mind = tempfile::tempdir().unwrap();
+        let shelf = Disk::new(mind.path());
+        let mut p = plan();
+        keep(&shelf, &p).unwrap();
+        let story = mind.path().join("layers/memory/cindy-tan/life-story.md");
+        assert!(!story.exists(), "an ungenerated story is not written");
+
+        p.story
+            .content
+            .generated("An Arc".into(), "  She was always careful.  ".into());
+        keep(&shelf, &p).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&p).unwrap(),
+            std::fs::read_to_string(&story).unwrap(),
             "She was always careful.\n"
         );
-        // Idempotent, so an unchanged story does not churn the ingest ledger.
-        assert!(!write_story(&mind, "cindy-tan", "She was always careful.").unwrap());
-        let _ = std::fs::remove_dir_all(&mind);
+        assert_eq!(
+            story_path("cindy-tan").unwrap(),
+            "layers/memory/cindy-tan/life-story.md"
+        );
+        assert_eq!(story_path("../x"), None);
+        assert_eq!(life_dir("cindy-tan").unwrap(), "layers/life/cindy-tan");
     }
 }

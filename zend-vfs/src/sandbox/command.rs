@@ -5,6 +5,19 @@ use std::time::Duration;
 /// How long a command runs before it is killed, unless it says otherwise.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// How a command's processes compete for the processor with whatever else
+/// the host runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Priority {
+    #[default]
+    Normal,
+    /// Below every ordinary process, the command and everything it starts:
+    /// what an agent sharing its host with a model member runs its jobs at
+    /// (`docs/replicated_substrate.md` §11.5), so a build never takes the
+    /// processor the decode needs.
+    Below,
+}
+
 /// A program and its arguments, run in the repository's folder with no shell
 /// in between: each argument reaches the program as written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +28,7 @@ pub struct SandboxCommand {
     pub args: Vec<String>,
     /// Killed, with everything it started, when it runs longer than this.
     pub timeout: Duration,
+    pub priority: Priority,
 }
 
 impl SandboxCommand {
@@ -23,7 +37,13 @@ impl SandboxCommand {
             program: program.into(),
             args: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
+            priority: Priority::Normal,
         }
+    }
+
+    pub fn priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
+        self
     }
 
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
@@ -61,7 +81,12 @@ mod tests {
         assert_eq!(c.program, "cargo");
         assert_eq!(c.args, ["test", "-p", "zend-vfs"]);
         assert_eq!(c.timeout, Duration::from_secs(5));
+        assert_eq!(c.priority, Priority::Normal);
         assert_eq!(SandboxCommand::new("x").timeout, DEFAULT_TIMEOUT);
+        assert_eq!(
+            SandboxCommand::new("x").priority(Priority::Below).priority,
+            Priority::Below
+        );
     }
 
     #[test]

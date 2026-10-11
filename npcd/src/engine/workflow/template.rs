@@ -59,7 +59,7 @@ fn story_steps_and_settings() {
     assert_eq!(story.send_backs, 3);
     assert_eq!(story.desk.as_deref(), Some("story-desk"));
     assert_eq!(story.year.as_deref(), Some("era-opens"));
-    assert_eq!(story.on_failed, OnFailed::SetAside);
+    assert_eq!(story.on_failed, OnFailed::Discard);
     let steps: Vec<(&str, By)> = story
         .steps
         .iter()
@@ -74,13 +74,54 @@ fn story_steps_and_settings() {
             ("review", By::Another),
             ("reread", By::Table),
             ("canon", By::Another),
+            ("publish", By::Maker),
         ]
     );
     assert_eq!(
         m.workflow("correction").unwrap().on_failed,
-        OnFailed::Restore
+        OnFailed::Discard
     );
     assert_eq!(m.workflow("correction").unwrap().year, None);
+}
+
+/// **Every workflow ends in a publish step at the merge table**, after its
+/// verification, and it alone leads to `done`.
+#[test]
+fn every_workflow_publishes_after_its_verification() {
+    let m = missions();
+    for (workflow, after) in [
+        ("story", ("canon", "pass")),
+        ("life-event", ("canon", "pass")),
+        ("correction", ("reread", "sound")),
+    ] {
+        let wf = m.workflow(workflow).unwrap();
+        let publish = wf.step("publish").unwrap();
+        assert!(publish.publishes(), "{workflow}");
+        assert_eq!(publish.desk.as_deref(), Some("merge-table"), "{workflow}");
+        assert_eq!(publish.next, Next::Single("done".to_string()));
+        assert_eq!(publish.edits, Variants::One(Edits::Optional));
+        assert_eq!(
+            publish.tools,
+            ["merge_status", "merge_sync", "merge_publish"]
+        );
+        let (step, outcome) = after;
+        assert_eq!(
+            wf.step(step).unwrap().route(Some(outcome)),
+            Ok("publish"),
+            "{workflow}"
+        );
+        let Variants::One(prompt) = &publish.prompt else {
+            panic!("{workflow}: publish has one prompt");
+        };
+        assert_eq!(prompt, &format!("{}\n", m.prompts["publish"]));
+        let to_done: Vec<&str> = wf
+            .steps
+            .iter()
+            .filter(|s| s.targets().contains(&"done"))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(to_done, ["publish"], "{workflow}");
+    }
 }
 
 #[test]

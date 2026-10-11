@@ -14,19 +14,26 @@
 //! acting *do*; a metronome beating underneath would make each of them a race,
 //! and the metronome has its own tests.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use candle_conversation::persistence::{SharedSubstrate, SubstratePersistence};
+use candle_conversation::substrate::Substrate;
 use serde_json::json;
+use tempfile::TempDir;
 
 use npc_map::world::Where;
 
 use npcd::engine::act::Act;
 use npcd::engine::body::Outcome;
 use npcd::engine::environment;
+use npcd::engine::mission::{Mission, Origin, Todo};
 use npcd::engine::runtime::Runtime;
 use npcd::engine::tick::Pace;
+use npcd::engine::workflow::parse_missions;
 use npcd::mind::Mind;
+use npcd::sim::shelf::Shelf;
 
 const ROOMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps");
 
@@ -802,13 +809,15 @@ async fn a_visitor_follows_the_character_it_came_to_see() {
 // act named by a model reaches the code that edits documents, and that nothing
 // in between is standing in for it.
 
-/// A mind with documents in it, and a daemon pointed at that mind.
+/// A mind with documents in it, a substrate beside it, and a daemon pointed at
+/// both.
 ///
 /// `Mind::new(Some(dir))` is the whole of the wiring: a runtime given a mind
 /// points its worlds at it, so a world hosted by any route can edit documents.
-fn daemon_with_a_mind(name: &str) -> (Arc<Runtime>, std::path::PathBuf) {
-    let mind = std::env::temp_dir().join(format!("npcd-vault-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&mind);
+/// The substrate is where an operation's store keeps its events (§10.3).
+fn daemon_with_a_mind() -> (Arc<Runtime>, PathBuf, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let mind = dir.path().join("mind");
     std::fs::create_dir_all(mind.join("layers/eras")).unwrap();
     std::fs::create_dir_all(mind.join("moods")).unwrap();
     std::fs::write(
@@ -822,10 +831,60 @@ fn daemon_with_a_mind(name: &str) -> (Arc<Runtime>, std::path::PathBuf) {
     )
     .unwrap();
 
-    let rt = Runtime::new(Mind::new(Some(mind.clone())), &std::env::temp_dir());
+    let rt = Runtime::new(Mind::new(Some(mind.clone())), dir.path());
+    let mut substrate = Substrate::new();
+    let persistence =
+        SubstratePersistence::open_in_with_substrate(&dir.path().join("substrate"), &mut substrate)
+            .unwrap();
+    rt.set_substrate(SharedSubstrate::new(substrate, persistence));
     rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
     rt.hold_world(WORLD, true);
-    (rt, mind)
+    (rt, mind, dir)
+}
+
+/// Put `body` on a step of a fresh operation, as the table does, so what it
+/// commits goes into that operation's store. Returns the operation.
+fn on_an_operation(rt: &Arc<Runtime>, body: &str) -> u64 {
+    let workflows = parse_missions(include_str!("../../docs/npcd_workflows_current.yaml"))
+        .unwrap()
+        .workflows;
+    let world = rt.hosted.get(WORLD).expect("hosted");
+    world.with_sim(|s| {
+        s.missions.set_workflows(workflows);
+        let id = s
+            .missions
+            .launch(
+                "story",
+                "untold",
+                "era:layers/eras/third.md",
+                1,
+                "work at the bench",
+                "layers/stories/the-bench.md",
+                "What happens: work at the bench.",
+                BTreeMap::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        s.missions.assign(
+            body,
+            Mission::new(
+                "Work at the bench.",
+                vec![Todo::new("work at the bench")],
+                Origin::Generated {
+                    generator: "untold".into(),
+                    target: "era:layers/eras/third.md".into(),
+                    operation: id,
+                    step: "write".into(),
+                },
+            ),
+        );
+        id
+    })
+}
+
+/// What operation `op`'s store holds at `key`.
+fn stored(rt: &Arc<Runtime>, op: u64, key: &str) -> Option<String> {
+    rt.hosted.get(WORLD)?.op_shelf(op)?.read(key)
 }
 
 /// Put a body at a named station rather than in the casting hall.
@@ -839,15 +898,16 @@ fn maker_at(rt: &Arc<Runtime>, npc_id: u64, body: &str, area: &str, node: &str) 
     rt.embody(npc_id, WORLD, body, 0).expect("bound");
 }
 
-/// **The whole chain, from the function the decode loop calls to the disk.**
+/// **The whole chain, from the function the decode loop calls to the
+/// operation's store — and the disk left as it was.**
 ///
-/// If any part of this were a stub the assertion at the end would still pass
-/// against an in-memory fixture — so the assertion is deliberately the file,
-/// read back with `std::fs`.
+/// The store is read back afresh from its events in the substrate, and the
+/// mind folder with `std::fs`: the record moves only at a publish.
 #[tokio::test]
-async fn an_act_from_the_decode_loop_reaches_a_document_on_disk() {
-    let (rt, mind) = daemon_with_a_mind("chronicle");
+async fn an_act_from_the_decode_loop_reaches_the_operations_store() {
+    let (rt, mind, _dir) = daemon_with_a_mind();
     maker_at(&rt, 1, "m1", "vault-chronicle", "early-range");
+    let op = on_an_operation(&rt, "m1");
 
     // The era the mind holds is a thing the world knows about, because hosting
     // indexed it.
@@ -873,7 +933,7 @@ async fn an_act_from_the_decode_loop_reaches_a_document_on_disk() {
     );
 
     rt.record_act(1, &act("bench_commit", json!({"why": "dated the fall"})));
-    let after = std::fs::read_to_string(mind.join("layers/eras/third.md")).unwrap();
+    let after = stored(&rt, op, "layers/eras/third.md").unwrap();
     assert!(
         after.contains("The redoubt fell before the thaw."),
         "{after}"
@@ -882,14 +942,20 @@ async fn an_act_from_the_decode_loop_reaches_a_document_on_disk() {
         after.contains("It burned in the spring."),
         "the entry replaced the document"
     );
+    assert_eq!(
+        std::fs::read_to_string(mind.join("layers/eras/third.md")).unwrap(),
+        "# the third era\n\nIt burned in the spring.\n",
+        "only a publish reaches the record"
+    );
 }
 
 /// The file acts, through the same door, including the read that a model would
 /// actually see.
 #[tokio::test]
-async fn the_file_acts_reach_the_mind_through_the_runtime() {
-    let (rt, mind) = daemon_with_a_mind("files");
+async fn the_file_acts_reach_the_store_through_the_runtime() {
+    let (rt, _mind, _dir) = daemon_with_a_mind();
     maker_at(&rt, 1, "m1", "vault-chronicle", "early-range");
+    let op = on_an_operation(&rt, "m1");
 
     let read = rt
         .record_act(
@@ -917,7 +983,7 @@ async fn the_file_acts_reach_the_mind_through_the_runtime() {
         1,
         &act("bench_commit", json!({"why": "against its neighbours"})),
     );
-    assert!(std::fs::read_to_string(mind.join("layers/eras/third.md"))
+    assert!(stored(&rt, op, "layers/eras/third.md")
         .unwrap()
         .contains("in the autumn"));
 }
@@ -927,8 +993,9 @@ async fn the_file_acts_reach_the_mind_through_the_runtime() {
 /// test.
 #[tokio::test]
 async fn a_mood_edited_at_a_story_desk_keeps_its_comments() {
-    let (rt, mind) = daemon_with_a_mind("mood");
+    let (rt, _mind, _dir) = daemon_with_a_mind();
     maker_at(&rt, 1, "m1", "vault-story", "first-room");
+    let op = on_an_operation(&rt, "m1");
 
     rt.record_act(
         1,
@@ -945,14 +1012,11 @@ async fn a_mood_edited_at_a_story_desk_keeps_its_comments() {
         &act("bench_commit", json!({"why": "it read as two things"})),
     );
 
-    let on_disk = std::fs::read_to_string(mind.join("moods/undone.yaml")).unwrap();
+    let kept = stored(&rt, op, "moods/undone.yaml").unwrap();
+    assert!(kept.contains("The whole interior rearranged."), "{kept}");
     assert!(
-        on_disk.contains("The whole interior rearranged."),
-        "{on_disk}"
-    );
-    assert!(
-        on_disk.contains("# why it reads this way"),
-        "the splice was bypassed: {on_disk}"
+        kept.contains("# why it reads this way"),
+        "the splice was bypassed: {kept}"
     );
 }
 
@@ -960,8 +1024,9 @@ async fn a_mood_edited_at_a_story_desk_keeps_its_comments() {
 /// by something a test set up.
 #[tokio::test]
 async fn a_path_out_of_the_mind_is_refused_through_the_runtime() {
-    let (rt, mind) = daemon_with_a_mind("escape");
+    let (rt, mind, _dir) = daemon_with_a_mind();
     maker_at(&rt, 1, "m1", "vault-chronicle", "early-range");
+    on_an_operation(&rt, "m1");
 
     for bad in [
         "../stolen.md",

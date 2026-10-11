@@ -43,7 +43,7 @@ mod template;
 
 pub use config::{
     By, Edits, Generator, Missions, Next, OnFailed, Step, Variants, Workflow, CANCELLED, DEFAULT,
-    DONE, FAILED, START, STUCK,
+    DONE, FAILED, PUBLISHED, START, STUCK,
 };
 pub use parse::{parse_missions, parse_workflows};
 pub use prompt::{fill, placeholders};

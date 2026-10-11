@@ -1,0 +1,19 @@
+[package]
+name = "cluster-dial"
+version = "0.1.0"
+edition = "2021"
+description = "A member's or an agent's wss connection to a gateway (docs/replicated_substrate.md §3.2, §13.3)"
+
+# No candle: `tokera-agent` dials with this, and links no model (§11.1).
+[dependencies]
+anyhow    = { workspace = true }
+cluster   = { path = "../cluster" }
+# The TLS is its own, on `ring` as `web`'s is, and the WebSocket handshake runs
+# over it: two crypto providers linked into one process leave rustls with no
+# default to pick.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+rustls            = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls      = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types  = { version = "1", features = ["std"] }
+webpki-roots      = "1"
+tokio             = { version = "1", features = ["net"] }

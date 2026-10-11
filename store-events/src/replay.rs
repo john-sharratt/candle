@@ -1,4 +1,4 @@
-//! A conversation's file events read back into what its stores restore, and
+//! A set of stores' file events read back into what the stores restore, and
 //! the mirror of them (`docs/zend_vfs_events.md` §5).
 
 use std::collections::BTreeMap;
@@ -6,13 +6,13 @@ use std::collections::BTreeMap;
 use candle_conversation::persistence::vfs::VfsEventPayload;
 use zend_vfs::{SavedChain, Snapshot};
 
-use super::event::FileEvent;
-use super::mirror::{absorb, RepoMirror};
+use crate::event::FileEvent;
+use crate::mirror::{absorb, RepoMirror};
 
 /// One repository's events, replayed: what its store restores, and what the
 /// substrate holds of it.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Replayed {
+pub struct Replayed {
     pub snapshot: Snapshot,
     pub mirror: RepoMirror,
 }
@@ -25,7 +25,7 @@ pub(super) struct Replayed {
 /// the snapshot at all. `Err` says why the events do not make a store's
 /// state: a body that is no event, or an event under a key it cannot be
 /// under.
-pub(super) fn replay_repo(events: &[VfsEventPayload]) -> Result<Replayed, String> {
+pub fn replay_repo(events: &[VfsEventPayload]) -> Result<Replayed, String> {
     let mut mirror = RepoMirror::default();
     for e in events {
         let event = FileEvent::from_value(&e.body)
@@ -55,7 +55,7 @@ pub(super) fn replay_repo(events: &[VfsEventPayload]) -> Result<Replayed, String
 }
 
 /// `events` grouped by repository, each group still in the order given.
-pub(super) fn by_repo(events: Vec<VfsEventPayload>) -> BTreeMap<String, Vec<VfsEventPayload>> {
+pub fn by_repo(events: Vec<VfsEventPayload>) -> BTreeMap<String, Vec<VfsEventPayload>> {
     let mut out: BTreeMap<String, Vec<VfsEventPayload>> = BTreeMap::new();
     for e in events {
         out.entry(e.repo.clone()).or_default().push(e);

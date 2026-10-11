@@ -47,6 +47,7 @@ pub mod posting;
 pub mod reading;
 pub mod record;
 pub mod seed;
+pub mod shelf;
 pub mod tower;
 pub mod upkeep;
 
@@ -56,14 +57,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::mission::bank::Duty;
 use crate::engine::mission_acts::COLLECT_MISSION;
-use crate::engine::workflow::OnFailed;
 use bench::Benches;
 use device::Devices;
 use field::{Field, Resource};
 use item::Pack;
 use ledger::Ledger;
 use missions::{MissionMaterial, Missions};
-use operations::Operation;
 use tower::Tower;
 
 /// Everything about a world that is not its map.
@@ -260,25 +259,6 @@ impl Sim {
             }
         }
         out
-    }
-
-    /// What becomes of a failed operation's document, by its workflow's
-    /// `on-failed`: `set-aside` moves it out of the record to `rejected/`;
-    /// `restore` puts it back to what it said when the operation opened, so a
-    /// rejected correction does not stand — unless a later operation on it has
-    /// since succeeded, whose accepted text that would overwrite; `keep` leaves
-    /// it. Returns where the document is now, or why it could not be settled;
-    /// `None` when there was nothing to do.
-    pub fn set_aside_failed(&mut self, op: &Operation) -> Option<Result<String, String>> {
-        match (self.missions.operations().on_failed(op), &op.before) {
-            (OnFailed::SetAside, _) => {
-                let to = op.name.to_lowercase().replace(' ', "-");
-                Some(self.bench.retire(&op.document, &to))
-            }
-            (OnFailed::Restore, Some(_)) if self.missions.operations().succeeded_after(op) => None,
-            (OnFailed::Restore, Some(before)) => Some(self.bench.put_back(&op.document, before)),
-            (OnFailed::Restore, None) | (OnFailed::Keep, _) => None,
-        }
     }
 
     /// `creator_present.what` — this body's own finished work: the documents
@@ -769,59 +749,6 @@ impl Sim {
 mod tests {
     use super::*;
     use item::{Item, Kind};
-    use operations::tests::workflows;
-    use operations::Operations;
-
-    /// **A failed operation's document is settled as its workflow says**: a
-    /// correction's (`restore`) goes back to what it said when the operation
-    /// opened; a story's (`set-aside`) is moved to `rejected/`.
-    #[test]
-    fn a_failed_operation_sets_its_document_aside_by_what_it_was() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("layers/eras")).unwrap();
-        std::fs::create_dir_all(root.path().join("layers/stories")).unwrap();
-        std::fs::write(root.path().join("layers/eras/a.md"), "corrected badly").unwrap();
-        std::fs::write(root.path().join("layers/stories/s.md"), "a weak story").unwrap();
-        let mut sim = Sim::default();
-        sim.set_bench_root(root.path());
-        sim.missions.set_workflows(workflows());
-        let mut ops = Operations::default();
-        ops.set_workflows(workflows());
-
-        let fix = ops
-            .open(
-                "correction",
-                None,
-                "contradiction",
-                "pair:a|b",
-                "fix",
-                "layers/eras/a.md",
-            )
-            .unwrap();
-        ops.kept_before(fix, "the era as it was");
-        let put = sim.set_aside_failed(ops.get(fix).unwrap());
-        assert_eq!(put, Some(Ok("layers/eras/a.md".to_string())));
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("layers/eras/a.md")).unwrap(),
-            "the era as it was"
-        );
-
-        let story = ops
-            .open(
-                "story",
-                None,
-                "untold",
-                "era:layers/eras/a.md",
-                "tell",
-                "layers/stories/s.md",
-            )
-            .unwrap();
-        let moved = sim.set_aside_failed(ops.get(story).unwrap());
-        let to = moved.expect("a draft is set aside").expect("and moved");
-        assert!(to.starts_with("rejected/") && to.ends_with("/s.md"), "{to}");
-        assert!(!root.path().join("layers/stories/s.md").exists());
-        assert!(root.path().join(&to).is_file());
-    }
 
     fn two_bodies() -> Sim {
         let mut s = Sim::new();

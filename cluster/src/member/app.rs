@@ -22,7 +22,7 @@ use crate::dial::{dial, Attempt, Connect, Stopped};
 use crate::dispatch::RouteTable;
 use crate::frame::{
     Admit, BuildId, Capacity, Claim, Epoch, Frame, Hello, MemberInfo, MemberState, Members,
-    ModelId, Routes, Unclaim,
+    ModelId, RepoAd, Routes, Unclaim,
 };
 use crate::handshake::{GroupKey, HandshakeError, PROTO};
 use crate::replicate::{Phase, Replication, Replicator};
@@ -30,6 +30,9 @@ use crate::session::{Ended, Incoming, Session, SessionHandle, VirtualConn};
 
 /// How often `CAPACITY` is sent when nothing prompts it sooner (§4.1).
 pub const CAPACITY_EVERY: Duration = Duration::from_secs(1);
+
+/// The prefix of a stream's target that names another app's group (§5.1).
+pub const GROUP: &str = "group:";
 
 /// The longest a request waits for the records ahead of it to be applied.
 pub const APPLY_WAIT: Duration = Duration::from_secs(10);
@@ -43,7 +46,7 @@ pub struct Identity {
     pub build: BuildId,
     /// The model the substrate is bound to; `None` for an agent.
     pub model: Option<ModelId>,
-    pub repos: Vec<String>,
+    pub repos: Vec<RepoAd>,
 }
 
 /// What the host measures for `CAPACITY` (§5.3).
@@ -424,12 +427,27 @@ impl AppMember {
     /// A stream up to a gateway for a request this member's own listener took
     /// (§5.8), dealt round robin across the admitted sockets.
     pub fn open_up(&self) -> Option<VirtualConn> {
+        self.open_to(&self.id.app)
+    }
+
+    /// Whether any socket is admitted: a stream up can be opened.
+    pub fn admitted(&self) -> bool {
+        lock(&self.sockets).iter().any(Option::is_some)
+    }
+
+    /// A stream to another app's group through a gateway — `group:agent` for
+    /// a job (§5.1, §11.5) — dealt round robin across the admitted sockets.
+    pub fn open_group(&self, app: &str) -> Option<VirtualConn> {
+        self.open_to(&format!("{GROUP}{app}"))
+    }
+
+    fn open_to(&self, target: &str) -> Option<VirtualConn> {
         let sockets: Vec<SessionHandle> = lock(&self.sockets).iter().flatten().cloned().collect();
         if sockets.is_empty() {
             return None;
         }
         let at = self.rr.fetch_add(1, Ordering::Relaxed);
-        (0..sockets.len()).find_map(|i| sockets[(at + i) % sockets.len()].open(&self.id.app).ok())
+        (0..sockets.len()).find_map(|i| sockets[(at + i) % sockets.len()].open(target).ok())
     }
 
     /// Whether `node` is a member of any cluster this member is joined to.

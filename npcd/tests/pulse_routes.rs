@@ -76,12 +76,13 @@ impl Rig {
     async fn new(awake: bool) -> Self {
         let base = tmp("rig");
         let owner_identity = identity("google-owner");
-        let mut accounts = Accounts::load(base.join("accounts")).unwrap();
+        let mut npcs = Npcs::load(&base).unwrap();
+        let mut accounts = Accounts::open(npcs.substrate(), &base.join("accounts")).unwrap();
         let owner = accounts.upsert(&owner_identity, 0).unwrap()["user_id"]
             .as_str()
             .unwrap()
             .to_owned();
-        let mut npcs = Npcs::load(&base).unwrap();
+        let (images, _) = Images::open(npcs.substrate(), &base.join("images")).unwrap();
         let made = npcs
             .create(
                 &owner_identity,
@@ -106,7 +107,7 @@ impl Rig {
             serde_yaml::from_str(&format!("admins:\n  - sub: {ADMIN}\n")).unwrap(),
             Libraries::load(&Source::resolve(None).unwrap()),
             Mind::new(None),
-            Images::new(&base),
+            images,
             Default::default(),
         )
         .with_runtime(rt.clone());

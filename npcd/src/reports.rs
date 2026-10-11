@@ -213,15 +213,18 @@ mod tests {
 
     /// npcd with no engine, over a directory of the test's own.
     fn reports(base: &std::path::Path) -> NpcdReports {
+        let npcs = Npcs::load(base).unwrap();
+        let accounts = Accounts::open(npcs.substrate(), &base.join("accounts")).unwrap();
+        let (images, _) = Images::open(npcs.substrate(), &base.join("images")).unwrap();
         let authored = Authored::new(
             Registry::load("world", base.join("worlds")).unwrap(),
             Registry::load("personality", base.join("personalities")).unwrap(),
-            Accounts::load(base.join("accounts")).unwrap(),
-            Npcs::load(base).unwrap(),
+            accounts,
+            npcs,
             serde_yaml::from_str("admins: []\n").unwrap(),
             Libraries::load(&Source::resolve(None).unwrap()),
             Mind::new(None),
-            Images::new(base),
+            images,
             BTreeMap::new(),
         );
         NpcdReports::new(Arc::new(authored), base.to_path_buf())

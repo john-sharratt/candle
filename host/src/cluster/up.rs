@@ -7,12 +7,11 @@
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::{header, Method};
-use cluster::member::AppMember;
+use cluster::member::{AppMember, FROM_MEMBER};
 use http_body_util::BodyExt;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use web::cluster::ClusterPeer;
-use web::proxy::FROM_MEMBER;
 
 /// Send `method path` with a JSON `body` up to a gateway, for it to route to
 /// whichever member the route names; its status and body.

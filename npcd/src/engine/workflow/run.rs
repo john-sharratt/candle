@@ -370,6 +370,7 @@ mod tests {
           fail: draft
         stuck: draft
         stuck-limit: 2
+        checks: [published]
         prompt: Review it.
 ";
 
@@ -655,7 +656,7 @@ mod tests {
 
     #[test]
     fn a_missing_variant_is_an_error_at_offer_time() {
-        let wf = parse_workflows("workflows:\n  w:\n    steps:\n      a:\n        by: maker\n        next: done\n        prompt:\n          fail: again\n").unwrap().remove(0);
+        let wf = parse_workflows("workflows:\n  w:\n    steps:\n      a:\n        by: maker\n        next: done\n        checks: [published]\n        prompt:\n          fail: again\n").unwrap().remove(0);
         assert_eq!(
             offered(&wf, &start(&wf)),
             Err("step `a`: has no variant for `start` and no `default`".to_string())

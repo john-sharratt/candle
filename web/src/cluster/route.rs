@@ -24,16 +24,13 @@ use axum::extract::Request;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
 use cluster::dispatch::{extract, Dispatch, Extracted, KeySource, Merge, BODY_LIMIT};
-use cluster::gateway::{Class, Pick};
+use cluster::gateway::{Class, Pick, NODE_HEADER};
 
 use super::{aggregate, merge_ws, Gateway};
 use crate::auth::{cookie, Identity, Role, Roles};
 use crate::config::Cache;
 use crate::errors::{self, Problem};
 use crate::proxy::{self, Forward, To};
-
-/// The header an admin addresses one member with.
-pub const NODE_HEADER: &str = "x-tokera-node";
 
 /// The header a member names a key's holder in, on its `409`.
 pub const HOLDER_HEADER: &str = "x-tokera-holder";

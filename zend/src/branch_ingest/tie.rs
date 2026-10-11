@@ -150,6 +150,8 @@ pub fn backfill_commits(
 
 #[cfg(test)]
 mod tests {
+    use candle_conversation::persistence::identity::VersionStamp;
+
     use super::*;
 
     fn tl(n: u64) -> TimelineId {
@@ -161,6 +163,7 @@ mod tests {
             timeline: tl(n),
             key: key.to_string(),
             subject: "s".to_string(),
+            stamp: VersionStamp::default(),
         }
     }
 

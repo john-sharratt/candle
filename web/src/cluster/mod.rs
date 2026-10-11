@@ -7,6 +7,7 @@
 //! | [`endpoint`] | the socket a member dials, and its admission |
 //! | [`codec`] | axum's WebSocket messages as the cluster pipe's |
 //! | [`streams`] | requests members forward up, served by this gateway's router |
+//! | [`jobs`] | a member's jobs, each sent to the agent §11.3 chooses |
 //! | [`route`] | where a request for a clustered app goes: dispatch, keys, pins |
 //! | [`transport`] | one request to one member, over a stream on its socket |
 //! | [`aggregate`], [`merge_ws`] | a request every ready member answers |
@@ -19,6 +20,7 @@
 pub mod aggregate;
 pub mod codec;
 pub mod endpoint;
+pub mod jobs;
 pub mod merge_ws;
 pub mod page;
 pub mod route;

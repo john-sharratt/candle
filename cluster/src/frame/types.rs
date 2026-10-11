@@ -71,9 +71,10 @@ impl ModelId {
 }
 
 /// A member's state as `MEMBERS` and `CAPACITY` report it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum MemberState {
     /// Admitted, still loading or catching up: routed nothing (§3.8, §7.2).
+    #[default]
     Loading = 0,
     Ready = 1,
     /// Below the floor, taking the floor's build (§3.5).
@@ -137,6 +138,30 @@ impl MemberInfo {
             weight: r.u32()?,
             state: MemberState::read(r)?,
             high_water: r.u64()?,
+        })
+    }
+}
+
+/// A repository a member holds, as its `HELLO` advertises it (§10.1, §11.2):
+/// its name in the workspace manifest, its origin's URL, and whether the
+/// member can push to that origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoAd {
+    pub name: String,
+    pub origin: String,
+    pub push: bool,
+}
+
+impl RepoAd {
+    pub fn write(&self, w: &mut Writer) {
+        w.str(&self.name).str(&self.origin).bool(self.push);
+    }
+
+    pub fn read(r: &mut Reader) -> Result<Self, WireError> {
+        Ok(Self {
+            name: r.str()?,
+            origin: r.str()?,
+            push: r.bool()?,
         })
     }
 }

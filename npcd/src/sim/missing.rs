@@ -8,36 +8,24 @@
 //! slip of a letter or two away, or, when nothing is that close, what the
 //! folder holds.
 
-use std::path::Path;
+use std::collections::BTreeSet;
 
 /// The most documents a refusal lists from a folder when nothing is close.
 const LISTED: usize = 20;
 
-/// The refusal for `key`, which resolved to `full` and is not there.
-pub fn no_document(key: &str, full: &Path) -> String {
+/// The refusal for `key`, which is not there, beside `folder` — what its
+/// folder holds, documents by name and folders with a trailing `/`.
+pub fn no_document(key: &str, folder: &BTreeSet<String>) -> String {
     let refused = format!("There is no document at {key}.");
-    let Some(dir) = full.parent() else {
-        return refused;
-    };
-    let folder = key.rsplit_once('/').map_or("", |(d, _)| d);
-    let wanted = full
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let mut there: Vec<String> = std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .filter(|n| n.ends_with(".md") || n.ends_with(".yaml"))
-                .collect()
-        })
-        .unwrap_or_default();
-    there.sort();
-    let path = |name: &str| match folder.is_empty() {
+    let (dir, wanted) = key.rsplit_once('/').unwrap_or(("", key));
+    let wanted = wanted.to_lowercase();
+    let there: Vec<&String> = folder
+        .iter()
+        .filter(|n| !n.ends_with('/') && (n.ends_with(".md") || n.ends_with(".yaml")))
+        .collect();
+    let path = |name: &str| match dir.is_empty() {
         true => name.to_string(),
-        false => format!("{folder}/{name}"),
+        false => format!("{dir}/{name}"),
     };
     let nearest = there
         .iter()
@@ -48,14 +36,14 @@ pub fn no_document(key: &str, full: &Path) -> String {
         (Some((_, name)), _) => format!("{refused} Did you mean {}?", path(name)),
         (None, 0) => refused,
         (None, n) if n <= LISTED => format!(
-            "{refused} {folder} holds: {}.",
+            "{refused} {dir} holds: {}.",
             there.iter().map(|n| path(n)).collect::<Vec<_>>().join(", ")
         ),
-        (None, _) => format!("{refused} Use `file_list` on {folder} to see what it holds."),
+        (None, _) => format!("{refused} Use `file_list` on {dir} to see what it holds."),
     }
 }
 
-/// How many edits still count as the same name misspelled: a letter or two,
+/// How many edits still count as the same name misspelt: a letter or two,
 /// and a little more for a long name.
 fn close_enough(name: &str) -> usize {
     (name.chars().count() / 10).max(2)
@@ -81,60 +69,40 @@ fn distance(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::PathBuf;
-
     use super::*;
 
-    fn eras(name: &str, files: &[&str]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("npcd-missing-{name}-{}", std::process::id()));
-        let dir = root.join("layers/eras");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&dir).unwrap();
-        for f in files {
-            fs::write(dir.join(f), "# an era\n").unwrap();
-        }
-        dir
+    fn folder(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
     }
 
     /// **The near miss the pulse showed**: one letter of spelling away.
     #[test]
     fn a_misspelt_document_is_told_the_one_it_meant() {
-        let dir = eras(
-            "spelt",
-            &["the-stabilisation.md", "the-spawn.md", "the-concord.md"],
-        );
+        let there = folder(&["the-stabilisation.md", "the-spawn.md", "the-concord.md"]);
         assert_eq!(
-            no_document(
-                "layers/eras/the-stabilization.md",
-                &dir.join("the-stabilization.md")
-            ),
+            no_document("layers/eras/the-stabilization.md", &there),
             "There is no document at layers/eras/the-stabilization.md. Did you mean \
              layers/eras/the-stabilisation.md?"
         );
     }
 
     /// Nothing close: the folder's documents are named, so the next try is not
-    /// a guess.
+    /// a guess; a folder within it is not.
     #[test]
     fn nothing_close_lists_the_folder() {
-        let dir = eras("listed", &["the-spawn.md", "the-concord.md"]);
+        let there = folder(&["the-spawn.md", "the-concord.md", "older/"]);
         assert_eq!(
-            no_document(
-                "layers/eras/the-long-winter.md",
-                &dir.join("the-long-winter.md")
-            ),
+            no_document("layers/eras/the-long-winter.md", &there),
             "There is no document at layers/eras/the-long-winter.md. layers/eras holds: \
              layers/eras/the-concord.md, layers/eras/the-spawn.md."
         );
     }
 
-    /// A folder that is not there says only that the document is not.
+    /// A folder with nothing in it says only that the document is not.
     #[test]
     fn no_folder_says_only_that() {
-        let dir = eras("nofolder", &[]);
         assert_eq!(
-            no_document("layers/nowhere/x.md", &dir.join("nowhere/x.md")),
+            no_document("layers/nowhere/x.md", &BTreeSet::new()),
             "There is no document at layers/nowhere/x.md."
         );
     }

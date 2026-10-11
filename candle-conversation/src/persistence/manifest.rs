@@ -235,6 +235,8 @@ impl Manifest {
             // layer's `VfsIndex`.
             | RecordType::VfsEvent
             | RecordType::VfsTombstone
+            // Blobs are located by the persistence layer's `BlobIndex`.
+            | RecordType::Blob
             | RecordType::WideQSig
             | RecordType::Snapshot
             | RecordType::BranchCheckpoint

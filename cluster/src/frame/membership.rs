@@ -24,13 +24,15 @@ impl Members {
     }
 }
 
-/// What a member can take on now (§5.3), every 1 s or on change.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a member can take on now (§5.3, §11.2), every 1 s or on change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Capacity {
     pub state: MemberState,
     /// Sustained aggregate decode rate, tokens per second.
     pub power: u32,
     pub idle: bool,
+    /// Requests it can start now: decode slots for a model member, job
+    /// slots for an agent.
     pub slots_free: u32,
     pub decodes: u32,
     pub prefill_backlog: u32,
@@ -38,6 +40,17 @@ pub struct Capacity {
     pub cores: u16,
     /// Host load average × 1000.
     pub load_milli: u32,
+    /// The host's operating system, as `std::env::consts::OS` names it.
+    pub os: String,
+    pub mem_free_mib: u32,
+    /// Jobs running on an agent.
+    pub jobs: u32,
+    /// The programs of the sandbox allow-list found on its `PATH`.
+    pub toolchains: Vec<String>,
+    /// An agent sharing its host with a model member (§11.5): its jobs run
+    /// below normal priority, and it is chosen only when no dedicated agent
+    /// can take a job.
+    pub low_priority: bool,
 }
 
 impl Capacity {
@@ -50,7 +63,14 @@ impl Capacity {
             .u32(self.prefill_backlog)
             .u32(self.vram_free_mib)
             .u16(self.cores)
-            .u32(self.load_milli);
+            .u32(self.load_milli)
+            .str(&self.os)
+            .u32(self.mem_free_mib)
+            .u32(self.jobs)
+            .list(&self.toolchains, |w, t| {
+                w.str(t);
+            })
+            .bool(self.low_priority);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
@@ -64,7 +84,17 @@ impl Capacity {
             vram_free_mib: r.u32()?,
             cores: r.u16()?,
             load_milli: r.u32()?,
+            os: r.str()?,
+            mem_free_mib: r.u32()?,
+            jobs: r.u32()?,
+            toolchains: r.list(|r| r.str())?,
+            low_priority: r.bool()?,
         })
+    }
+
+    /// Idle cores: `cores × (1 − load / cores)`, in thousandths (§11.3).
+    pub fn idle_cores_milli(&self) -> i64 {
+        i64::from(self.cores) * 1000 - i64::from(self.load_milli)
     }
 }
 

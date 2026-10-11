@@ -119,7 +119,11 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 build: build(),
                 model: Some(model.clone()),
                 power: 170,
-                repos: vec!["candle".into()],
+                repos: vec![RepoAd {
+                    name: "candle".into(),
+                    origin: "git@host:candle.git".into(),
+                    push: true,
+                }],
                 now_ms: 1_700_000_000_000,
                 nonce: [9; 32],
             })),
@@ -138,6 +142,8 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u32(170)
                 .u32(1)
                 .s("candle")
+                .s("git@host:candle.git")
+                .u8(1)
                 .u64(1_700_000_000_000)
                 .raw(&[9; 32])
                 .0,
@@ -196,6 +202,11 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 vram_free_mib: 8000,
                 cores: 16,
                 load_milli: 1250,
+                os: "linux".into(),
+                mem_free_mib: 30_000,
+                jobs: 2,
+                toolchains: vec!["cargo".into(), "npm".into()],
+                low_priority: true,
             }),
             B::header(11, 0, 0)
                 .u8(0)
@@ -207,6 +218,13 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u32(8000)
                 .u16(16)
                 .u32(1250)
+                .s("linux")
+                .u32(30_000)
+                .u32(2)
+                .u32(2)
+                .s("cargo")
+                .s("npm")
+                .u8(1)
                 .0,
         ),
         (

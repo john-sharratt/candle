@@ -3,11 +3,13 @@
 
 use std::collections::BTreeSet;
 
-use super::config::{Generator, Variants, Workflow, CANCELLED, DONE, FAILED};
+use super::config::{Generator, Variants, Workflow, CANCELLED, DONE, FAILED, PUBLISHED};
 
 /// Check `workflow` whole: at least one step, no step named for an end state,
 /// no empty prompt, and every target — through `next` or `stuck` — a step that
-/// exists, `done` or `failed`.
+/// exists, `done` or `failed`. **Only a publish step leads to `done`**
+/// (`docs/replicated_substrate.md` §10.3): an operation's work reaches the
+/// record through its publish step, after its verification, and nowhere else.
 pub fn validate(workflow: &Workflow) -> Result<(), String> {
     let ctx = format!("workflow `{}`", workflow.name);
     if workflow.steps.is_empty() {
@@ -36,6 +38,12 @@ pub fn validate(workflow: &Workflow) -> Result<(), String> {
             if target != DONE && target != FAILED && workflow.step(target).is_none() {
                 return Err(format!(
                     "{ctx}: leads to `{target}`, which is not a step, `{DONE}` or `{FAILED}`"
+                ));
+            }
+            if target == DONE && !step.publishes() {
+                return Err(format!(
+                    "{ctx}: leads to `{DONE}` without publishing; only a step that checks \
+                     `{PUBLISHED}` settles an operation done"
                 ));
             }
         }
@@ -100,13 +108,33 @@ mod tests {
             "workflow `w`, step `a`: leads to `b`, which is not a step, `done` or `failed`"
         );
         assert_eq!(
-            err(&steps("      a:\n        by: maker\n        next:\n          pass: done\n          fail: rewrite\n        prompt: p\n")),
+            err(&steps("      a:\n        by: maker\n        checks: [published]\n        next:\n          pass: done\n          fail: rewrite\n        prompt: p\n")),
             "workflow `w`, step `a`: leads to `rewrite`, which is not a step, `done` or `failed`"
         );
         assert_eq!(
-            err(&steps("      a:\n        by: maker\n        next: done\n        stuck: elsewhere\n        prompt: p\n")),
+            err(&steps("      a:\n        by: maker\n        checks: [published]\n        next: done\n        stuck: elsewhere\n        prompt: p\n")),
             "workflow `w`, step `a`: leads to `elsewhere`, which is not a step, `done` or `failed`"
         );
+    }
+
+    /// **Only a publish step leads to `done`** (§10.3): one that does not
+    /// check `published` is a load error, whether `done` is its next or an
+    /// outcome's.
+    #[test]
+    fn only_a_publish_step_leads_to_done() {
+        let refused = "workflow `w`, step `canon`: leads to `done` without publishing; only a \
+                       step that checks `published` settles an operation done";
+        assert_eq!(
+            err(&steps(
+                "      canon:\n        by: another\n        next: done\n        prompt: p\n"
+            )),
+            refused
+        );
+        assert_eq!(
+            err(&steps("      canon:\n        by: another\n        next:\n          pass: done\n          reject: canon\n        prompt: p\n")),
+            refused
+        );
+        assert!(parse_missions(&steps("      canon:\n        by: another\n        next:\n          pass: publish\n          reject: canon\n        prompt: p\n      publish:\n        by: maker\n        desk: merge-table\n        checks: [published]\n        next: done\n        prompt: q\n")).is_ok());
     }
 
     #[test]
@@ -135,13 +163,13 @@ mod tests {
 
     #[test]
     fn a_later_step_and_both_end_states_are_valid_targets() {
-        let m = parse_missions(&steps("      a:\n        by: maker\n        stuck: b\n        next:\n          go: b\n          win: done\n          lose: failed\n        prompt: p\n      b:\n        by: table\n        call: c\n        next: a\n        prompt: q\n")).unwrap();
+        let m = parse_missions(&steps("      a:\n        by: maker\n        checks: [published]\n        stuck: b\n        next:\n          go: b\n          win: done\n          lose: failed\n        prompt: p\n      b:\n        by: table\n        call: c\n        next: a\n        prompt: q\n")).unwrap();
         assert_eq!(m.workflows[0].steps.len(), 2);
     }
 
     #[test]
     fn a_generator_must_open_a_declared_workflow_under_its_own_id() {
-        let wf = "workflows:\n  w:\n    steps:\n      s:\n        by: maker\n        next: done\n        prompt: p\n";
+        let wf = "workflows:\n  w:\n    steps:\n      s:\n        by: maker\n        checks: [published]\n        next: done\n        prompt: p\n";
         assert_eq!(
             err(&format!(
                 "generators:\n  - id: g\n    call: c\n    workflow: nowhere\n    prompt: p\n{wf}"

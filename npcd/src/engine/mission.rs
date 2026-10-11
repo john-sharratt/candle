@@ -285,13 +285,14 @@ impl Mission {
     /// was no document there, and were sent back to read it — forty minutes of
     /// "I am done" and no story, the step the engine signs off on a read the
     /// one step nothing could ever sign off.
-    pub fn strike_gone_reads(&mut self, holds: &dyn Fn(&str) -> bool) -> Vec<String> {
+    pub fn strike_gone_reads(&mut self, holds: &dyn Fn(Option<u64>, &str) -> bool) -> Vec<String> {
+        let op = self.operation().map(|(id, _)| id);
         let gone: Vec<String> = self
             .todo
             .iter()
             .filter(|t| !t.done && !t.reports)
             .filter_map(|t| raw_doc_after(&t.text, "read "))
-            .filter(|p| !holds(p))
+            .filter(|p| !holds(op, p))
             .collect();
         if gone.is_empty() {
             return gone;
@@ -1909,7 +1910,10 @@ mod tests {
             checks: Vec::new(),
             tools: Vec::new(),
         });
-        let holds = |p: &str| p != gone;
+        let holds = |op: Option<u64>, p: &str| {
+            assert_eq!(op, None, "not an operation's step");
+            p != gone
+        };
         assert_eq!(m.strike_gone_reads(&holds), [gone]);
         let steps: Vec<&str> = m.todo.iter().map(|t| t.text.as_str()).collect();
         assert_eq!(

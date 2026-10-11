@@ -1,6 +1,8 @@
-//! The programs `run_command` may start in a repository's sandbox.
+//! The programs `run_command` may start in a repository's sandbox — on a
+//! daemon's own checkout, or on an agent's (`docs/replicated_substrate.md`
+//! §11.2, which advertises those of them found on its `PATH`).
 //!
-//! The sandbox's policy is an allow-list (`zend_vfs::sandbox::policy`): a
+//! The sandbox's policy is an allow-list ([`policy`](super::policy)): a
 //! program nobody listed does not run. This deployment lists the build, test
 //! and packaging toolchains a coding conversation runs — each by the name it
 //! is started by, looked up on the `PATH` (on Windows through `PATHEXT`, so the
@@ -15,13 +17,13 @@
 //! see only the command line, never what a script inside it does. The real
 //! boundary is who may call `run_command` at all: it needs `Exec`, `DiskWrite`
 //! and `Network`, which only the Comprehensive tools mode grants, and only an
-//! admin may use Comprehensive (`crate::access`). The list keeps a model's
+//! admin may use Comprehensive (zend's `access`). The list keeps a model's
 //! ordinary calls to the toolchains, and names them in a refusal so the next
 //! call can be one.
 //!
 //! No shell is listed: a command is one program, never a script line.
 
-use zend_vfs::CommandPolicy;
+use super::CommandPolicy;
 
 /// The programs a sandbox job may start, by the name a command gives them:
 /// JavaScript and TypeScript, Rust, Python, Go, .NET, the JVM, then native
@@ -39,8 +41,7 @@ pub fn policy() -> CommandPolicy {
 
 #[cfg(test)]
 mod tests {
-    use zend_vfs::SandboxCommand;
-
+    use super::super::SandboxCommand;
     use super::*;
 
     /// **The toolchains run; a shell and git do not.**

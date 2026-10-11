@@ -134,6 +134,10 @@ impl RecordAccounting {
             RecordType::VfsEvent | RecordType::VfsTombstone => {
                 (header.record_type, header.stream_id, header.chunk_index)
             }
+            // A blob is keyed by its hash's first 128 bits, in the header: a
+            // second record of one hash is the same bytes again, and one of
+            // the two is dead whichever arrived first.
+            RecordType::Blob => (RecordType::Blob, header.stream_id, header.chunk_index),
             // `Snapshot` is header-keyed by a synthetic per-timeline stream
             // id: the newest snapshot supersedes the previous one here — this
             // insert-returning-old IS the single-tail tombstone (design doc

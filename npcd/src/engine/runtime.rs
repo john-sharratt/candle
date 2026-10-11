@@ -64,7 +64,7 @@ use tower::ServiceExt;
 
 use crate::authority::ops::WorldOp;
 use crate::authority::told::Told;
-use crate::authority::Standing;
+use crate::authority::{Role, Standing};
 use crate::effector::auth::PinnedStandpoint;
 use crate::effector::router::address_of;
 use crate::effector::station;
@@ -102,6 +102,7 @@ use crate::engine::mission_gen::gates::{life_voice, Form};
 use crate::engine::mission_gen::material::strip_calls;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::prose::{decode_call, CallAsk};
+use crate::engine::record_follow;
 use crate::engine::reflect;
 use crate::engine::schema;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
@@ -112,10 +113,13 @@ use crate::engine::work;
 use crate::mind::Mind;
 use crate::model;
 use crate::npcs::{Casting, Npcs};
+use crate::opstore::MindStores;
 use crate::sim::Sim;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
-use crate::world_state::{place_of, sim_of, store};
+use crate::world_state::place_of;
+use agent::client::Agents;
+use agent::pusher::AgentPush;
 use candle_conversation::EngineSource;
 use cluster::member::{ClusterView, Link};
 use host::cluster::store::ConversationStore;
@@ -433,6 +437,8 @@ pub struct Runtime {
     /// following it, or cut off from it — and which characters it runs
     /// (`docs/replicated_substrate.md` §9). See [`crate::authority`].
     pub standing: Standing,
+    /// Every store over the mind, each operation's and each author's (§10.3).
+    pub ops: Arc<MindStores>,
     /// Each character's mission compass as last told to it — see
     /// [`Runtime::mission_compass`] — so it is told again only when it changes.
     compass_told: Mutex<HashMap<u64, String>>,
@@ -620,49 +626,13 @@ fn written_up_to_floor(s: &Sim, body: &str, mission: &Mission, doc: &DocStep) ->
     if work.min_words == 0 || !p.eq_ignore_ascii_case(&work.writes) {
         return None;
     }
-    let changed = s
-        .bench
-        .opened(body)?
-        .changed()
-        .iter()
-        .any(|c| c.eq_ignore_ascii_case(&work.writes));
-    if !changed {
-        return None;
-    }
     let words = s
         .bench
-        .read(body, &work.writes)
-        .ok()?
+        .opened(body)?
+        .changed_text(&work.writes)?
         .split_whitespace()
         .count();
     (words >= work.min_words).then_some(words)
-}
-
-/// The mind paths of every document an operation in `worlds` has not finished
-/// with — drafting, reading, reviewing or checking it — read from each world
-/// as it is hosted, or from its state records for one that is not.
-fn held_drafts<'a>(rt: &Runtime, worlds: impl Iterator<Item = &'a str>) -> HashSet<String> {
-    let unsettled = |s: &Sim| -> Vec<String> {
-        s.missions
-            .operations()
-            .all()
-            .filter(|o| !o.settled())
-            .map(|o| o.document.clone())
-            .collect()
-    };
-    let shared = rt.substrate();
-    let worlds: HashSet<&str> = worlds.collect();
-    worlds
-        .into_iter()
-        .flat_map(|w| match rt.hosted.get(w) {
-            Some(hosted) => hosted.sim(unsettled),
-            None => shared
-                .as_ref()
-                .and_then(|shared| sim_of(&store::read(shared, w)))
-                .map(|s| unsettled(&s))
-                .unwrap_or_default(),
-        })
-        .collect()
 }
 
 /// What a character with no mission is set on **while the command table is
@@ -832,7 +802,9 @@ impl Runtime {
         if let Some(root) = mind_handle.root() {
             hosted.set_bench_root(root);
         }
-        Arc::new(Self {
+        let ops = MindStores::new(mind_handle.root());
+        hosted.set_op_stores(Arc::clone(&ops));
+        let rt = Arc::new(Self {
             scheduler: Arc::new(Scheduler::default()),
             progress: Arc::new(LoadProgress::new()),
             data: data.to_path_buf(),
@@ -868,7 +840,17 @@ impl Runtime {
             spawner: Handle::try_current().ok(),
             tasks: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
-        })
+            ops,
+        });
+        // A world run disconnected keeps its operations' stores in memory,
+        // writing no event (§9.4, §10.3).
+        let standing = Arc::downgrade(&rt);
+        rt.ops.set_quiet(Box::new(move |world| {
+            standing
+                .upgrade()
+                .is_some_and(|rt| rt.standing.role(world) == Role::Disconnected)
+        }));
+        rt
     }
 
     /// Host every authored world that has rooms to stand in.
@@ -2642,20 +2624,19 @@ impl Runtime {
         if let Some(words) = written {
             return refused(compose::already_written(&writes, words));
         }
-        // The piece as the record has it — what the table read — never the
-        // Maker's own working copy, which holds whatever it last typed by hand;
-        // and nothing when the piece is to be written anew.
+        // The piece as the operation's store has it — what the table read —
+        // never the Maker's own working copy, which holds whatever it last
+        // typed by hand; and nothing when the piece is to be written anew.
+        let shelf = hosted.shelf_of(&body);
         let standing = match anew {
             true => None,
-            false => std::fs::read_to_string(root.join(&writes))
-                .ok()
-                .map(|t| strip_calls(&t)),
+            false => shelf.read(&writes).map(|t| strip_calls(&t)),
         };
         let sources: Vec<(String, String)> = reads
             .iter()
             .filter(|p| **p != writes)
             .filter_map(|p| {
-                let text = std::fs::read_to_string(root.join(p)).ok()?;
+                let text = shelf.read(p)?;
                 Some((
                     p.clone(),
                     compose::cut(&strip_calls(&text), compose::SOURCE_WORDS),
@@ -2663,7 +2644,7 @@ impl Runtime {
             })
             .collect();
         let told_in = match Form::of(&writes) {
-            Form::LifeEvent => life_voice(&root, &writes),
+            Form::LifeEvent => life_voice(&*shelf, &writes),
             _ => None,
         };
         let question = compose::question(
@@ -2967,6 +2948,7 @@ impl Runtime {
     /// engine when this is unset, so a future wiring mistake is a startup error
     /// instead of a slow leak.
     pub fn set_substrate(&self, shared: SharedSubstrate) {
+        self.ops.set_substrate(shared.clone());
         *self.substrate.write().unwrap() = Some(shared);
     }
 
@@ -3966,6 +3948,14 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         // followed from now on (§9.2–§9.4).
         if let Some(member) = join.link().member() {
             rt.join_cluster(Arc::clone(member));
+            // A publish's push goes through an agent holding the mind
+            // repository with push rights — this process's own while it is
+            // cut off (§10.3, §11.5).
+            if let (Some(name), Some(handle)) = (rt.ops.repo_name(), &rt_handle) {
+                let agents = Agents::new(Arc::clone(member), join.in_process_agent());
+                rt.ops
+                    .set_pusher(AgentPush::shared(agents, handle.clone(), name));
+            }
         }
     }
 
@@ -4083,17 +4073,12 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         Some(dir) => {
             // ── what has left the record leaves memory ────────────────────
             //
-            // Before anything is ingested: a document gone from disk — deleted,
-            // or a rejected draft moved to `rejected/` — and a draft an
-            // operation has not yet passed are retired from the substrate, and
-            // the ledger forgets them, so a passed draft is ingested afresh.
-            let held = held_drafts(rt, plan.cast.iter().map(|c| c.world_id.as_str()));
-            let mut out_of_record: Vec<PathBuf> = rt.ledger.missing();
-            out_of_record.extend(
-                held.iter()
-                    .map(|r| dir.join(r))
-                    .filter(|p| !matches!(rt.ledger.inspect(p, None), Reconcile::Unchanged)),
-            );
+            // Before anything is ingested: a document gone from disk is
+            // retired from the substrate, and the ledger forgets it. The mind
+            // folder holds only published work — an operation's drafts are in
+            // its store until its publish step lands them (§10.3) — so
+            // everything on disk is memory's to take.
+            let out_of_record: Vec<PathBuf> = rt.ledger.missing();
             if !out_of_record.is_empty() {
                 let e = engine.lock().unwrap();
                 let retired: usize = out_of_record
@@ -4111,7 +4096,6 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                     out_of_record.len()
                 );
             }
-            let held_path = |p: &Path| mind_record::rel(dir, p).is_some_and(|r| held.contains(&r));
             let mind_root: &Path = dir;
 
             let units = crate::projection::ingest_units(&rt.mind_handle);
@@ -4140,19 +4124,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                     }
                     shared_groups.push((source.name.clone(), group));
                 }
-                let (mut turns, mut report) = ingest::pending(source, &rt.ledger)?;
-                // An operation's draft enters memory when it is passed, not
-                // when it is written.
-                let owed = turns.len();
-                turns.retain(|t| !held_path(&t.path));
-                let held_back = owed - turns.len();
-                report.written -= held_back;
-                if held_back > 0 {
-                    tracing::info!(
-                        "layer {}: {held_back} draft(s) held back until their review passes",
-                        source.label()
-                    );
-                }
+                let (turns, mut report) = ingest::pending(source, &rt.ledger)?;
                 let total = turns.len();
                 ingest::announce(p, source, 0, total);
 
@@ -4204,8 +4176,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             // formed at the point in the life where it formed, by the same
             // mechanism a belief would be formed at run time.
             for (who, dir) in life::lives(dir, &plan.characters) {
-                let (mut episodes, rejected) = life::episodes(&dir, &who);
-                episodes.retain(|ep| !held_path(&ep.path));
+                let (episodes, rejected) = life::episodes(&dir, &who);
                 for r in &rejected {
                     // A life with a hole in it is still a life, but the author
                     // has to be told which document fell out.
@@ -4421,9 +4392,11 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     p.mark_ready();
     tracing::info!("engine ready in {:?}", rt.uptime());
 
-    // The command table's generator, once there is a cast to set work for.
+    // The command table's generator, once there is a cast to set work for, and
+    // the mind folder kept at the record its publishes land on.
     if rt_handle.is_some() {
         mission_gen::run::spawn(Arc::clone(rt));
+        record_follow::spawn(Arc::clone(rt));
     }
 
     supervise(rt);
@@ -5751,6 +5724,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::shelf::Published;
     use serde_json::json;
 
     fn rt() -> Arc<Runtime> {
@@ -7370,6 +7344,7 @@ mod tests {
         let hosted = first
             .host(WORLD, Path::new(ROOMS))
             .expect("the vault loads");
+        let published = Published { root: mind.clone() };
         hosted.with_sim(|s| {
             s.set_bench_root(&mind);
             s.bench
@@ -7378,6 +7353,7 @@ mod tests {
                     "a story",
                     DOC,
                     "# The Count\n\nYou count the fleet.\n",
+                    &published,
                 )
                 .unwrap();
         });
@@ -7390,7 +7366,7 @@ mod tests {
             .expect("the vault loads");
         let back = revived.with_sim(|s| {
             s.set_bench_root(&mind);
-            s.bench.read("m1", DOC)
+            s.bench.read("m1", DOC, &published)
         });
         assert_eq!(back.as_deref(), Ok("# The Count\n\nYou count the fleet.\n"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -7617,7 +7593,6 @@ mod tests {
                     "What happens: Keeper waits.",
                     BTreeMap::new(),
                     Vec::new(),
-                    None,
                 )
                 .unwrap();
             s.missions.offer_step(

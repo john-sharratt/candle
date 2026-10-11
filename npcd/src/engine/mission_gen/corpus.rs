@@ -5,6 +5,7 @@
 //! reads and writes at a bench — so a target is chosen from what is actually on
 //! the page, including whatever a Maker committed a minute ago.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::fingerprint::Fingerprint;
@@ -109,9 +110,19 @@ pub struct Corpus {
     pub stories: Vec<Story>,
     /// The world's own terms, from `layers/world/` ([`glossary`]).
     pub terms: Vec<Term>,
+    /// Documents as an operation's store holds them over the published mind
+    /// (`docs/replicated_substrate.md` §10.3), read before the disk.
+    pub held: BTreeMap<String, String>,
 }
 
 impl Corpus {
+    /// This corpus as operation work sees it: `path` holding `text`, the
+    /// document as its store has it.
+    pub fn holding(mut self, path: &str, text: String) -> Corpus {
+        self.held.insert(path.to_string(), text);
+        self
+    }
+
     /// Read the mind at `root`, as the world `world` sees it.
     ///
     /// **The cast is whoever has a life or a memory folder.** A personality with
@@ -183,12 +194,16 @@ impl Corpus {
             lives,
             stories,
             terms: glossary::terms(root),
+            held: BTreeMap::new(),
         }
     }
 
     /// A document's text by mind path, when it is one this corpus holds or the
     /// disk has.
     pub fn text(&self, path: &str) -> Option<String> {
+        if let Some(t) = self.held.get(path) {
+            return Some(t.clone());
+        }
         if let Some(e) = self.eras.iter().find(|e| e.path == path) {
             return Some(e.text.clone());
         }
@@ -206,7 +221,7 @@ impl Corpus {
 
     /// Whether a document exists, by mind path.
     pub fn exists(&self, path: &str) -> bool {
-        self.root.join(path).is_file()
+        self.held.contains_key(path) || self.root.join(path).is_file()
     }
 
     /// The world's present: the year its latest era opens. Nothing in a life
@@ -426,6 +441,29 @@ pub(crate) mod tests {
         assert_eq!(c.era_of(2000), None);
         assert!(c.exists("layers/stories/the-charge.md"));
         assert!(!c.exists("layers/stories/nothing.md"));
+    }
+
+    /// **An operation's document is read as its store holds it**, over what
+    /// the published mind says, and is there although no file is.
+    #[test]
+    fn a_held_document_is_read_over_the_published_mind() {
+        let dir = mind();
+        let c = corpus(&dir)
+            .holding(
+                "layers/stories/the-charge.md",
+                "# The Charge\n\nRedrawn.\n".into(),
+            )
+            .holding("layers/stories/new.md", "# New\n\nA draft.\n".into());
+        assert_eq!(
+            c.text("layers/stories/the-charge.md").as_deref(),
+            Some("# The Charge\n\nRedrawn.\n")
+        );
+        assert_eq!(
+            c.text("layers/stories/new.md").as_deref(),
+            Some("# New\n\nA draft.\n")
+        );
+        assert!(c.exists("layers/stories/new.md"));
+        assert_eq!(c.on_disk("layers/stories/new.md"), None, "not published");
     }
 
     /// The widest silence between written years, and none when every written

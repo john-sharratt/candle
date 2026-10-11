@@ -1,6 +1,6 @@
 //! `HELLO`, `CHALLENGE`, `PROVE` and `ADMIT` (§3.3).
 
-use super::types::{BuildId, ClaimInfo, MemberInfo, ModelId};
+use super::types::{BuildId, ClaimInfo, MemberInfo, ModelId, RepoAd};
 use crate::wire::{Reader, WireError, Writer};
 
 /// The member's opening frame.
@@ -14,7 +14,9 @@ pub struct Hello {
     /// The model its substrate is bound to; an agent sends none.
     pub model: Option<ModelId>,
     pub power: u32,
-    pub repos: Vec<String>,
+    /// The repositories it holds: a zend member's manifest, an agent's
+    /// checkouts (§10.1, §11.2).
+    pub repos: Vec<RepoAd>,
     pub now_ms: u64,
     pub nonce: [u8; 32],
 }
@@ -28,9 +30,7 @@ impl Hello {
         self.build.write(w);
         w.option(self.model.as_ref(), |w, m| m.write(w))
             .u32(self.power)
-            .list(&self.repos, |w, r| {
-                w.str(r);
-            })
+            .list(&self.repos, |w, r| r.write(w))
             .u64(self.now_ms)
             .fixed(&self.nonce);
     }
@@ -44,7 +44,7 @@ impl Hello {
             build: BuildId::read(r)?,
             model: r.option(ModelId::read)?,
             power: r.u32()?,
-            repos: r.list(|r| r.str())?,
+            repos: r.list(RepoAd::read)?,
             now_ms: r.u64()?,
             nonce: r.fixed()?,
         })

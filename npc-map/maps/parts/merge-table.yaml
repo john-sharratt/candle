@@ -1,0 +1,14 @@
+id: merge-table
+kind: station
+name: merge table
+binds: one operation
+short: >
+  A merge table lands an operation's verified work in the record, and nothing
+  reaches the record any other way.
+long: >
+  A Maker carrying an operation's last step brings its work here. The table
+  says what the work changes and whether the record moved under it since the
+  work began; when it lands cleanly it is published, and everyone reads it
+  from then on. Where another operation changed the same lines first, the
+  table puts both texts into the document, marked, and the Maker settles them
+  at the bench before publishing again.

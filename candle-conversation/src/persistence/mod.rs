@@ -30,6 +30,7 @@ pub mod adoption;
 #[cfg(test)]
 mod adoption_tests;
 pub mod appended;
+pub mod blob;
 pub mod chunk_plan;
 pub mod chunk_window_integrity;
 pub mod cold_load;
@@ -98,6 +99,7 @@ use crate::substrate::{Substrate, TurnMark};
 use accounting::RecordAccounting;
 use adoption::Adoption;
 use appended::Appended;
+use blob::BlobIndex;
 use candle::direct_io::DirectFile;
 use chunk_plan::ChunkedReadPlan;
 use compaction::Housekeeping;
@@ -129,7 +131,7 @@ use stamped_locs::StampedLocs;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use survival::RecordCensus;
 use tombstone_expiry::{TombstoneExpiry, DEFAULT_TOMBSTONE_RETENTION};
-use vfs::VfsIndex;
+use vfs::{VfsEventId, VfsEventPayload, VfsIndex, VfsWrite};
 use walker::WalkEntry;
 use writer_lock::WriterLock;
 
@@ -419,6 +421,35 @@ impl SharedSubstrate {
     pub fn custom_objects_version(&self) -> u64 {
         self.substrate.read().unwrap().custom_objects_version()
     }
+
+    /// Write `write` as `timeline`'s file events, then its tombstones, in
+    /// one commit; the ids the events took (`docs/zend_vfs_events.md`).
+    pub fn write_vfs(&self, timeline: u64, write: &VfsWrite) -> Result<Vec<VfsEventId>> {
+        let mut p = self.persistence.lock().unwrap();
+        let ids = p.write_vfs(timeline, write)?;
+        p.commit()?;
+        Ok(ids)
+    }
+
+    /// Every live file event of `timeline`, in `(repo, key)` order and within
+    /// a key in stamp order.
+    pub fn vfs_events(&self, timeline: u64) -> Result<Vec<VfsEventPayload>> {
+        self.persistence.lock().unwrap().vfs_events(timeline)
+    }
+
+    /// Keep `bytes` as a blob, durably, unless one of their hash is already
+    /// held; their SHA-256 either way (`docs/replicated_substrate.md` §10.3).
+    pub fn put_blob(&self, bytes: Vec<u8>) -> Result<[u8; 32]> {
+        let mut p = self.persistence.lock().unwrap();
+        let sha256 = p.write_blob(bytes)?;
+        p.commit_if_pending()?;
+        Ok(sha256)
+    }
+
+    /// The bytes named `sha256`, or `None` when no blob of that hash is held.
+    pub fn blob(&self, sha256: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        self.persistence.lock().unwrap().blob(sha256)
+    }
 }
 
 /// The persistence layer behind a substrate — owns the active redo log, the
@@ -534,6 +565,10 @@ pub struct SubstratePersistence {
     /// are never in RAM here, so like `npc_locs` this map is what keeps them:
     /// compaction and maintenance carry what it names, and a resume reads it.
     vfs_index: VfsIndex,
+
+    /// Where every blob is (`blob`). Their bytes are never in RAM here: this
+    /// map is what keeps them, as `vfs_index` keeps the file events.
+    blob_index: BlobIndex,
 
     /// Per-type record counts as the store stood when it opened — the baseline
     /// a rewrite's carry-forward tally is reported against, so a class that
@@ -1026,6 +1061,7 @@ impl SubstratePersistence {
         let mut snapshot_locs = StampedLocs::new();
         let mut npc_locs = StampedLocs::new();
         let mut vfs_index = VfsIndex::new();
+        let mut blob_index = BlobIndex::new();
         // What the store actually holds, by type. One array increment per record
         // in a walk that already visits every record — see `RecordCensus`.
         let mut census = RecordCensus::new();
@@ -1069,6 +1105,7 @@ impl SubstratePersistence {
             record_snapshot_loc(&mut snapshot_locs, entry);
             record_npc_loc(&mut npc_locs, entry);
             vfs::record_vfs_loc(&mut vfs_index, &mut accounting, entry);
+            blob::record_blob_loc(&mut blob_index, entry);
             sink(entry);
         };
         let opened = if read_only {
@@ -1158,6 +1195,7 @@ impl SubstratePersistence {
             snapshot_locs,
             npc_locs,
             vfs_index,
+            blob_index,
             open_census: census,
             writer_lock,
             minter: Minter::with_sections(origination, own_sections.live()),
@@ -3034,6 +3072,7 @@ impl SubstratePersistence {
             substrate,
             &self.npc_locs,
             &self.vfs_index,
+            &self.blob_index,
             &self.marker_ids,
             self.node(),
             TombstoneExpiry {
@@ -3166,6 +3205,7 @@ impl SubstratePersistence {
         self.snapshot_locs.clear();
         self.npc_locs.clear();
         self.vfs_index.clear();
+        self.blob_index.clear();
         // The marker identities are rebuilt the same way: every carried marker
         // kept its own, so the rebuilt table holds what the old one did for
         // every marker still live, and nothing for one the compaction dropped.
@@ -3180,6 +3220,7 @@ impl SubstratePersistence {
         let snapshot_locs = &mut self.snapshot_locs;
         let npc_locs = &mut self.npc_locs;
         let vfs_index = &mut self.vfs_index;
+        let blob_index = &mut self.blob_index;
         let marker_ids = &mut self.marker_ids;
         let replica = &mut self.replica;
         let locations = &mut self.locations;
@@ -3201,6 +3242,7 @@ impl SubstratePersistence {
             record_snapshot_loc(snapshot_locs, entry);
             record_npc_loc(npc_locs, entry);
             vfs::record_vfs_loc(vfs_index, accounting, entry);
+            blob::record_blob_loc(blob_index, entry);
             substrate.apply_walker_entry(entry);
         })?;
         // The compacted segment carries a fresh index chain; chain the next

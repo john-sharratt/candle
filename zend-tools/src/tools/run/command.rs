@@ -89,9 +89,9 @@ impl Tool for RunCommand {
 
     fn run(ctx: &ToolContext, req: RunRequest) -> Result<RunResponse, RunError> {
         let (program, args) = take_apart(req.program, req.args)?;
-        let sandboxes = ctx.sandboxes()?.ok_or(RunError::NoSandboxes)?;
+        let executor = ctx.executor()?.ok_or(RunError::NoSandboxes)?;
         let files = ctx.files.repo(&req.repo)?;
-        sandboxes.check(&req.repo)?;
+        executor.check(&req.repo)?;
         let branch = match files.rev() {
             Some(Rev::Branch(branch)) => branch,
             _ => return Err(RunError::NoBranch(req.repo)),
@@ -101,9 +101,10 @@ impl Tool for RunCommand {
         if let Some(secs) = req.timeout_secs {
             command = command.timeout(Duration::from_secs(secs.into()));
         }
-        let ran = sandboxes.run(
+        let ran = executor.run(
             grant,
             &req.repo,
+            ctx.lineage(),
             JobRequest {
                 branch,
                 files,

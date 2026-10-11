@@ -1,8 +1,11 @@
-//! Images a person uploaded, on disk.
+//! Images a person uploaded, as blobs in the substrate.
 //!
-//! A portrait is a file. It needs no engine, no model and no GPU — which is why
-//! it is here rather than behind [`crate::engine`], and why the console's
-//! upload silently dropping the file was a gap rather than a limitation.
+//! A portrait needs no engine, no model and no GPU — which is why it is here
+//! rather than behind [`crate::engine`], and why the console's upload silently
+//! dropping the file was a gap rather than a limitation. Each is a `Blob`
+//! record named by its SHA-256 (`docs/replicated_substrate.md` §10.3), so
+//! every member of the cluster serves the same portrait for a character
+//! whichever member it was uploaded to.
 //!
 //! # What it stored, and what it did with it
 //!
@@ -15,22 +18,24 @@
 //!
 //! # Content-addressed
 //!
-//! The id is a hash of the bytes, so uploading the same portrait twice stores
-//! it once and produces the same id — which also means an id cannot be guessed
-//! from a counter, and cannot collide by accident.
+//! The id is the bytes' SHA-256 and their format, `<64 hex>.<ext>`, so
+//! uploading the same portrait twice stores it once and produces the same id —
+//! which also means an id cannot be guessed from a counter, and cannot collide
+//! by accident.
 //!
 //! # What is accepted
 //!
 //! PNG, JPEG, WebP and GIF, recognised by their **magic bytes** rather than by
 //! a `Content-Type` header or a file extension. Both of those are the client's
 //! claim about the file; the first bytes are the file. Anything else is refused
-//! before it reaches the disk, so this directory holds images and nothing else —
-//! it is served back to browsers, and a stored `.html` served from this origin
-//! would run in it.
+//! before it is stored, so what this serves back to browsers is images and
+//! nothing else — a stored `.html` served from this origin would run in it.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 
-use sha2::{Digest, Sha256};
+use candle_conversation::persistence::blob::{hex, parse_hex};
+use candle_conversation::persistence::SharedSubstrate;
 
 /// Four megabytes. A generous portrait and nowhere near a way to fill a disk
 /// one upload at a time.
@@ -101,92 +106,110 @@ fn mime_for(ext: &str) -> Option<&'static str> {
     }
 }
 
-/// Where images live, under the daemon's data directory.
-#[derive(Debug, Clone)]
+/// The images the substrate holds.
+#[derive(Clone)]
 pub struct Images {
-    dir: PathBuf,
+    shared: SharedSubstrate,
 }
 
 impl Images {
-    pub fn new(data: &Path) -> Self {
-        Self {
-            dir: data.join("images"),
+    /// The images `shared` holds — taking in, once, the files a daemon kept
+    /// in `legacy` before images were blobs, and removing the folder after.
+    /// Returns each taken-in file's old id with its new one, for the records
+    /// that name it.
+    pub fn open(
+        shared: SharedSubstrate,
+        legacy: &Path,
+    ) -> Result<(Images, HashMap<String, String>), ImageError> {
+        let images = Images { shared };
+        let mut renames = HashMap::new();
+        if legacy.is_dir() {
+            for entry in std::fs::read_dir(legacy).map_err(ImageError::Io)?.flatten() {
+                let old = entry.file_name().to_string_lossy().into_owned();
+                if !old.starts_with("img_") {
+                    continue;
+                }
+                let bytes = std::fs::read(entry.path()).map_err(ImageError::Io)?;
+                match images.put(&bytes) {
+                    Ok(new) => {
+                        renames.insert(old, new);
+                    }
+                    Err(e) => tracing::warn!("image {old} was not taken in: {e}"),
+                }
+            }
+            std::fs::remove_dir_all(legacy).map_err(ImageError::Io)?;
+            tracing::info!(
+                "images: {} taken in from {}",
+                renames.len(),
+                legacy.display()
+            );
         }
+        Ok((images, renames))
     }
 
     /// Store one, and give back the id it is addressed by.
     ///
-    /// The id is `img_<16 hex of the content hash>.<ext>` — content-addressed,
-    /// so the same portrait uploaded twice is stored once, and idempotent, so a
-    /// retried upload is not a second file.
+    /// The id is `<64 hex of the content hash>.<ext>` — content-addressed, so
+    /// the same portrait uploaded twice is stored once, and idempotent, so a
+    /// retried upload is not a second blob.
     pub fn put(&self, bytes: &[u8]) -> Result<String, ImageError> {
         if bytes.len() > MAX_BYTES {
             return Err(ImageError::TooLarge(bytes.len()));
         }
         let ext = sniff(bytes).ok_or(ImageError::NotAnImage)?;
-
-        let digest = Sha256::digest(bytes);
-        let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-        let id = format!("img_{hex}.{ext}");
-
-        std::fs::create_dir_all(&self.dir).map_err(ImageError::Io)?;
-        let path = self.dir.join(&id);
-        // Already there: the same bytes hash the same, so there is nothing to
-        // write and nothing to check.
-        if path.exists() {
-            return Ok(id);
-        }
-        // Beside the target, then renamed — the same atomicity the mind's
-        // documents get, so an interrupted upload leaves no half-written image
-        // for the next request to serve.
-        let tmp = self.dir.join(format!(".{id}.part"));
-        std::fs::write(&tmp, bytes).map_err(ImageError::Io)?;
-        std::fs::rename(&tmp, &path).map_err(ImageError::Io)?;
-        Ok(id)
+        let sha256 = self
+            .shared
+            .put_blob(bytes.to_vec())
+            .map_err(|e| ImageError::Io(std::io::Error::other(format!("{e:?}"))))?;
+        Ok(format!("{}.{ext}", hex(&sha256)))
     }
 
     /// Read one back, with the type to serve it as.
     ///
-    /// The id is checked against the shape [`Self::put`] produces rather than
-    /// joined onto the directory as given: it arrives in a URL, and a path is
-    /// the one thing a URL must never be able to become.
+    /// The id is checked against the shape [`Self::put`] produces: it arrives
+    /// in a URL, and only a hash and a known format are ever looked up.
     pub fn get(&self, id: &str) -> Result<(Vec<u8>, &'static str), ImageError> {
-        let format = valid_id(id).ok_or(ImageError::NotFound)?;
-        let bytes = std::fs::read(self.dir.join(id)).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => ImageError::NotFound,
-            _ => ImageError::Io(e),
-        })?;
+        let (sha256, format) = valid_id(id).ok_or(ImageError::NotFound)?;
+        let bytes = self
+            .shared
+            .blob(&sha256)
+            .map_err(|e| ImageError::Io(std::io::Error::other(format!("{e:?}"))))?
+            .ok_or(ImageError::NotFound)?;
         Ok((bytes, format))
     }
 }
 
-/// Whether this is an id this module minted, and what it serves as.
+/// Whether this is an id this module minted — the hash it names, and what it
+/// serves as.
 ///
-/// `img_` then exactly sixteen lowercase hex characters then a known extension.
-/// Nothing else — no separators, no dots, no traversal, and nothing that could
-/// be a name outside the directory even before the join.
-fn valid_id(id: &str) -> Option<&'static str> {
-    let rest = id.strip_prefix("img_")?;
-    let (hex, ext) = rest.split_once('.')?;
-    if hex.len() != 16
-        || !hex
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
+/// Exactly sixty-four lowercase hex characters, a dot, and a known extension.
+/// Nothing else.
+fn valid_id(id: &str) -> Option<([u8; 32], &'static str)> {
+    let (hash, ext) = id.split_once('.')?;
+    if hash.bytes().any(|b| b.is_ascii_uppercase()) {
         return None;
     }
-    mime_for(ext)
+    Some((parse_hex(hash)?, mime_for(ext)?))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
 
-    fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("npcd-img-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use super::*;
+    use crate::npcs::Npcs;
+
+    /// The images of a fresh substrate in a directory of the test's own.
+    fn store() -> (TempDir, Images) {
+        let dir = TempDir::new().unwrap();
+        let (images, _) = open(dir.path());
+        (dir, images)
+    }
+
+    fn open(dir: &Path) -> (Images, HashMap<String, String>) {
+        let shared = Npcs::load(dir).unwrap().substrate();
+        Images::open(shared, &dir.join("images")).unwrap()
     }
 
     fn png() -> Vec<u8> {
@@ -197,21 +220,43 @@ mod tests {
 
     #[test]
     fn an_image_round_trips_and_keeps_its_type() {
-        let images = Images::new(&tmp("round"));
+        let (_dir, images) = store();
         let id = images.put(&png()).expect("stored");
-        assert!(id.starts_with("img_") && id.ends_with(".png"), "{id}");
+        let (hash, ext) = id.split_once('.').unwrap();
+        assert_eq!((hash.len(), ext), (64, "png"), "{id}");
         let (back, mime) = images.get(&id).expect("read back");
         assert_eq!(back, png());
         assert_eq!(mime, "image/png");
     }
 
-    /// Content-addressed: the same portrait twice is one file and one id.
+    /// Content-addressed: the same portrait twice is one blob and one id, and
+    /// the id is the bytes' SHA-256.
     #[test]
-    fn the_same_bytes_store_once() {
-        let images = Images::new(&tmp("dedup"));
+    fn the_same_bytes_store_once_under_their_hash() {
+        let (_dir, images) = store();
         let a = images.put(&png()).unwrap();
         let b = images.put(&png()).unwrap();
         assert_eq!(a, b);
+        assert_eq!(a, format!("{}.png", hex(&Sha256::digest(png()).into())));
+    }
+
+    /// **An image outlives a restart**, and one kept as a file before images
+    /// were blobs is taken in once — its old id renamed for the records that
+    /// name it, and the folder gone.
+    #[test]
+    fn an_old_file_is_taken_in_and_every_image_outlives_a_restart() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("images")).unwrap();
+        std::fs::write(dir.path().join("images/img_0011223344556677.png"), png()).unwrap();
+        let (images, renames) = open(dir.path());
+        let new = renames["img_0011223344556677.png"].clone();
+        assert_eq!(images.get(&new).unwrap().0, png());
+        assert!(!dir.path().join("images").exists());
+        drop(images);
+
+        let (again, renames) = open(dir.path());
+        assert!(renames.is_empty(), "taken in once");
+        assert_eq!(again.get(&new).unwrap().0, png());
     }
 
     /// **The format is judged by the file, not by what the client called it.**
@@ -221,7 +266,7 @@ mod tests {
     /// `Content-Type` header is the uploader's claim, not a fact.
     #[test]
     fn anything_that_is_not_an_image_is_refused() {
-        let images = Images::new(&tmp("sniff"));
+        let (_dir, images) = store();
         for bad in [
             &b"<html><script>alert(1)</script></html>"[..],
             &b"GIF87"[..],        // truncated magic
@@ -243,30 +288,32 @@ mod tests {
 
     #[test]
     fn an_oversized_upload_is_refused_before_it_is_written() {
-        let images = Images::new(&tmp("big"));
+        let (_dir, images) = store();
         let mut huge = png();
         huge.resize(MAX_BYTES + 1, 0);
         assert!(matches!(images.put(&huge), Err(ImageError::TooLarge(_))));
     }
 
-    /// **An id arrives in a URL, so it must not be able to become a path.**
+    /// **An id arrives in a URL, so only a hash and a known format are ever
+    /// looked up.**
     #[test]
-    fn a_crafted_id_cannot_reach_outside_the_directory() {
-        let dir = tmp("escape");
-        std::fs::write(dir.join("secret.txt"), b"not yours").unwrap();
-        let images = Images::new(&dir);
+    fn a_crafted_id_is_not_found() {
+        let (_dir, images) = store();
+        let hash = "00".repeat(32);
         for bad in [
-            "../secret.txt",
-            "img_../../secret.txt",
-            "img_0011223344556677.png/../../secret.txt",
-            "img_00112233445566.png",    // too short
-            "img_00112233445566778.png", // too long
-            "img_00112233445566GG.png",  // not hex
-            "img_0011223344556677.html",
-            "img_0011223344556677.PNG", // the case this mints is lower
-            "secret.txt",
-            "",
+            "../secret.txt".to_string(),
+            format!("{hash}.png/../../secret.txt"),
+            format!("{}.png", &hash[..62]), // too short
+            format!("{hash}0.png"),         // too long
+            format!("{}GG.png", &hash[..62]),
+            format!("{hash}.html"),
+            format!("{hash}.PNG"),
+            format!("{}.png", hash.to_uppercase()),
+            "img_0011223344556677.png".to_string(),
+            "secret.txt".to_string(),
+            String::new(),
         ] {
+            let bad = bad.as_str();
             assert!(
                 matches!(images.get(bad), Err(ImageError::NotFound)),
                 "`{bad}` was not refused"
@@ -295,7 +342,7 @@ mod tests {
             );
         }
         // And the round trip proves it end to end, not just in the tables.
-        let images = Images::new(&tmp("formats"));
+        let (_dir, images) = store();
         for bytes in &samples {
             let id = images.put(bytes).expect("stored");
             assert!(images.get(&id).is_ok(), "{id} could not be read back");
@@ -304,9 +351,9 @@ mod tests {
 
     #[test]
     fn an_image_that_is_not_there_says_so() {
-        let images = Images::new(&tmp("missing"));
+        let (_dir, images) = store();
         assert!(matches!(
-            images.get("img_0011223344556677.png"),
+            images.get(&format!("{}.png", "ab".repeat(32))),
             Err(ImageError::NotFound)
         ));
     }

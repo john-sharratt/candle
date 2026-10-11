@@ -18,8 +18,9 @@
 //! - [`grants`] — the capabilities a call may use; [`net`], [`exec`] and
 //!   [`disk`] are the only ways tool code reaches the network, starts a program
 //!   or opens a database, and each refuses without its capability
-//! - [`sandboxes`] — the workspace's command sandboxes, one per git
-//!   repository, that `run_command` runs a program in
+//! - [`executor`] — where `run_command` runs and pushes are made: this
+//!   daemon's own [`sandboxes`], one per git repository, or agents
+//!   (`docs/replicated_substrate.md` §11.5)
 //! - [`state`] — the individual stores: [`state::CredentialStore`],
 //!   [`state::NotesStore`], [`state::SessionRegistry`], [`state::HashStateStore`],
 //!   [`state::Secrets`]; the file stores the `file_*` tools work through are
@@ -77,6 +78,7 @@ pub mod alias_pins;
 pub mod context;
 pub mod disk;
 pub mod exec;
+pub mod executor;
 pub mod grants;
 pub mod net;
 mod numfmt;

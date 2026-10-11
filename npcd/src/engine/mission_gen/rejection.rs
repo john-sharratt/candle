@@ -8,21 +8,21 @@
 //! nothing in the draft. A reason that quotes the draft cannot be carried over
 //! from another one.
 
-use std::path::Path;
-
 use super::config::{REJECTION_NAMES_AN_ERA, REJECTION_QUOTES};
 use super::corpus::{era_year, heading};
 use super::reading::quotes_draft;
 use crate::engine::mission::Work;
+use crate::sim::shelf::Shelf;
 
 /// Why a rejection of `work` with `why` is refused, for the Maker to read and
 /// answer; `None` when it shows what its step's checks ask — the draft quoted
 /// (`rejection-quotes-the-draft`), the era it contradicts named
-/// (`rejection-names-an-era`). `root` is the mind the documents are read from.
-/// A draft no longer on the record needs no quote.
-pub fn unsupported(root: &Path, work: &Work, why: &str) -> Option<String> {
+/// (`rejection-names-an-era`). The documents are read from `shelf`, the
+/// operation's store (`docs/replicated_substrate.md` §10.3). A draft not
+/// there needs no quote.
+pub fn unsupported(shelf: &dyn Shelf, work: &Work, why: &str) -> Option<String> {
     let checks = |name: &str| work.checks.iter().any(|c| c == name);
-    let draft = std::fs::read_to_string(root.join(&work.writes)).ok()?;
+    let draft = shelf.read(&work.writes)?;
     if checks(REJECTION_QUOTES) && !quotes_draft(why, &draft) {
         return Some(format!(
             "Your reason does not quote {doc}. Copy the words of it that cannot stand, exactly, \
@@ -38,7 +38,7 @@ pub fn unsupported(root: &Path, work: &Work, why: &str) -> Option<String> {
         .reads
         .iter()
         .filter(|r| r.starts_with("layers/eras/"))
-        .filter_map(|r| std::fs::read_to_string(root.join(r)).ok())
+        .filter_map(|r| shelf.read(r))
         .filter_map(|t| Some((heading(&t)?, era_year(&t))))
         .collect();
     let lower = why.to_lowercase();
@@ -62,6 +62,7 @@ pub fn unsupported(root: &Path, work: &Work, why: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::shelf::Published;
 
     const DRAFT: &str = "The Hart interviewer wanted to know what the room was and you could not \
                          tell her. The floor just shakes.";
@@ -74,6 +75,12 @@ mod tests {
         Work {
             checks: checks.iter().map(|c| c.to_string()).collect(),
             ..work.clone()
+        }
+    }
+
+    fn on(dir: &tempfile::TempDir) -> Published {
+        Published {
+            root: dir.path().to_path_buf(),
         }
     }
 
@@ -117,14 +124,14 @@ mod tests {
         let review = checked(&work, REVIEW);
         let carried = "The draft is structurally broken — it loops endlessly on the same \
                        description of the room.";
-        let refused = unsupported(dir.path(), &review, carried).unwrap();
+        let refused = unsupported(&on(&dir), &review, carried).unwrap();
         assert!(refused
             .starts_with("Your reason does not quote layers/life/cadence/2900 The Shelf.md."));
         let quoted = "\"The Hart interviewer wanted to know what the room was\" — no such \
                       interviewer exists before the towers.";
-        assert_eq!(unsupported(dir.path(), &review, quoted), None);
+        assert_eq!(unsupported(&on(&dir), &review, quoted), None);
         assert_eq!(
-            unsupported(dir.path(), &work, carried),
+            unsupported(&on(&dir), &work, carried),
             None,
             "a step that does not check rejections takes any reason"
         );
@@ -137,28 +144,28 @@ mod tests {
         let (dir, work) = mind();
         let canon = checked(&work, CANON);
         let unnamed = "\"The floor just shakes.\" is wrong.";
-        assert!(unsupported(dir.path(), &canon, unnamed)
+        assert!(unsupported(&on(&dir), &canon, unnamed)
             .unwrap()
             .contains("Name the era it contradicts — The Final Battle, The Tower Age —"));
         assert_eq!(
-            unsupported(dir.path(), &checked(&work, REVIEW), unnamed),
+            unsupported(&on(&dir), &checked(&work, REVIEW), unnamed),
             None,
             "a review need not name an era"
         );
         let titled = "\"The floor just shakes.\" — the final battle era has nobody left there.";
-        assert_eq!(unsupported(dir.path(), &canon, titled), None);
+        assert_eq!(unsupported(&on(&dir), &canon, titled), None);
         let dated = "\"The floor just shakes.\" — by 2937 the shelf is a tower footing.";
-        assert_eq!(unsupported(dir.path(), &canon, dated), None);
+        assert_eq!(unsupported(&on(&dir), &canon, dated), None);
     }
 
-    /// A draft already gone from the record has nothing left to quote.
+    /// A draft not there has nothing left to quote.
     #[test]
-    fn a_draft_off_the_record_needs_no_quote() {
+    fn a_draft_not_there_needs_no_quote() {
         let (dir, work) = mind();
         std::fs::remove_file(dir.path().join(&work.writes)).unwrap();
         assert_eq!(
             unsupported(
-                dir.path(),
+                &on(&dir),
                 &checked(&work, CANON),
                 "It is not on the record any more."
             ),

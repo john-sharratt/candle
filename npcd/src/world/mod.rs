@@ -28,7 +28,7 @@ pub mod mapstore;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use npc_map::delta::{Attention, Delta};
@@ -37,26 +37,35 @@ use npc_map::{MapEdit, MapSet};
 
 use crate::engine::rooms::Rooms;
 use crate::engine::watch::Watch;
+use crate::opstore::owner::Owner;
+use crate::opstore::shelf::StoreShelf;
+use crate::opstore::MindStores;
+use crate::sim::shelf::{Published, Shelf};
 use crate::sim::{seed, Sim};
+
+use self::mapstore::Keep;
 
 /// One world, and everything about who has been told what in it.
 pub struct Hosted {
     id: String,
     state: Mutex<State>,
-    /// The directory this world's map was loaded from, when it was loaded from
-    /// disk — where a runtime reshape ([`Hosted::reshape`]) writes the change
-    /// back so it survives a restart. `None` for an in-memory world
-    /// ([`Hosted::of`], a generated world or a test), whose reshapes are
-    /// ephemeral by construction: there is no authored file to keep them in.
+    /// The folder this world's map was loaded from, when it was loaded from
+    /// one — where a runtime reshape ([`Hosted::reshape`]) is kept so it
+    /// survives a restart. `None` for an in-memory world ([`Hosted::of`], a
+    /// generated world or a test), whose reshapes are ephemeral by
+    /// construction: there is no authored file to keep them in.
     map_dir: Option<PathBuf>,
-    /// Serialises the write-back half of [`Hosted::reshape`] — deliberately a
+    /// Serialises the keeping half of [`Hosted::reshape`] — deliberately a
     /// second lock, separate from `state`, because that write is deliberately
     /// off the world lock for latency. Without it, two reshapes landing on the
-    /// same area at once would both call [`mapstore::persist`] and both write
-    /// the identical `<area>.yaml.tmp` path at once, with nothing stopping the
-    /// two `File::create`/`write_all` calls from interleaving before either
-    /// `rename` lands.
+    /// same area at once would both call [`mapstore::persist`] at once, and
+    /// the area's file would be whichever finished last rather than the map
+    /// after both.
     writeback: Mutex<()>,
+    /// The operations' stores this world's benches work in
+    /// (`docs/replicated_substrate.md` §10.3); unset for a world that holds no
+    /// documents.
+    ops: OnceLock<Arc<MindStores>>,
 }
 
 struct State {
@@ -97,6 +106,9 @@ pub struct Reshaped {
 pub enum Durability {
     /// Written back to the authored YAML — it will still be there after a reboot.
     Written,
+    /// Kept in its author's drafts (`docs/replicated_substrate.md` §10.3): live
+    /// for this run, and the authored map once it is published.
+    Drafted,
     /// The change is live but was not written back (the write failed). The reason
     /// is carried so an operator learns the reshape is not yet durable.
     Failed(String),
@@ -130,6 +142,7 @@ impl Hosted {
             }),
             map_dir: Some(dir.to_path_buf()),
             writeback: Mutex::new(()),
+            ops: OnceLock::new(),
         })
     }
 
@@ -151,11 +164,52 @@ impl Hosted {
             // ephemeral: nothing to write them back to.
             map_dir: None,
             writeback: Mutex::new(()),
+            ops: OnceLock::new(),
         }
     }
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The operations' stores this world's benches work in.
+    pub fn set_op_stores(&self, ops: Arc<MindStores>) {
+        let _ = self.ops.set(ops);
+    }
+
+    pub fn op_stores(&self) -> Option<&Arc<MindStores>> {
+        self.ops.get()
+    }
+
+    /// The shelf `body` works on (§10.3): the store of the operation its
+    /// mission is a step of, or the published mind — which is also all a
+    /// daemon with no mind folder has.
+    pub fn shelf_of(&self, body: &str) -> Box<dyn Shelf> {
+        let (op, root) = self.sim(|s| {
+            let op = s
+                .missions
+                .active(body)
+                .and_then(|m| m.operation())
+                .map(|(op, _)| op);
+            (op, s.bench.mind_root().map(Path::to_path_buf))
+        });
+        match (op, self.ops.get()) {
+            (Some(op), Some(stores)) if stores.repo_name().is_some() => Box::new(StoreShelf {
+                stores: Arc::clone(stores),
+                owner: Owner::operation(&self.id, op),
+            }),
+            _ => Box::new(Published {
+                root: root.unwrap_or_default(),
+            }),
+        }
+    }
+
+    /// The shelf of operation `op` itself — what the table's steps read.
+    pub fn op_shelf(&self, op: u64) -> Option<StoreShelf> {
+        Some(StoreShelf {
+            stores: Arc::clone(self.ops.get()?),
+            owner: Owner::operation(&self.id, op),
+        })
     }
 
     /// Do something to the world, under the lock.
@@ -197,42 +251,48 @@ impl Hosted {
         f(world, sim)
     }
 
+    /// The folder this world's map was loaded from, when it was loaded from
+    /// one.
+    pub fn map_dir(&self) -> Option<&Path> {
+        self.map_dir.as_deref()
+    }
+
     /// Reshape this world's walkable map while it runs, and keep the change
-    /// (effector design Appendix F).
+    /// where `keep` says (effector design Appendix F).
     ///
-    /// **Two steps, in order: mutate, then persist.** The in-RAM mutation runs
+    /// **Two steps, in order: mutate, then keep.** The in-RAM mutation runs
     /// under the world lock ([`World::reshape`]) — swap the map, re-derive the
     /// lift shaft, relocate anyone standing where a room was drowned — and refuses
     /// without touching the world if the edit would not validate. Only once that
-    /// has landed is the change written back to the authored YAML, so the swap is
-    /// the source of truth and the file follows it.
+    /// has landed is the change kept in the authored YAML, so the swap is the
+    /// source of truth and the file follows it.
     ///
-    /// **The write is off the lock, and best-effort.** The map is snapshotted
-    /// under the lock and serialised outside it, so a disk stall never freezes
-    /// ticks; and a write that fails is *reported* ([`Durability::Failed`]) rather
-    /// than un-happening a reshape that already took — the operator is told the
+    /// **Keeping it is off the lock, and best-effort.** The map is snapshotted
+    /// under the lock and serialised outside it, so a stall never freezes ticks;
+    /// and a write that fails is *reported* ([`Durability::Failed`]) rather than
+    /// un-happening a reshape that already took — the operator is told the
     /// change is live but not yet durable, which is the truth, instead of a lie in
-    /// either direction. A world with no authored directory ([`Hosted::of`]) is
-    /// [`Durability::Ephemeral`]: the reshape holds for the run and is gone on
-    /// restart, because there is nowhere to keep it.
+    /// either direction. A world with no authored folder ([`Hosted::of`]), or
+    /// nowhere to keep it, is [`Durability::Ephemeral`]: the reshape holds for
+    /// the run and is gone on restart.
     ///
-    /// **The write-back itself is serialised** against every other reshape's
-    /// write-back on this world ([`Self::writeback`]), so two edits landing on
-    /// the same area in quick succession still write it one at a time rather
-    /// than racing on the same temp file.
+    /// **Keeping is serialised** against every other reshape's on this world
+    /// ([`Self::writeback`]), so two edits landing on the same area in quick
+    /// succession still write it one at a time.
     ///
     /// `Err(reason)` is the world's own words on why the edit was refused, with
     /// nothing changed.
-    pub fn reshape(&self, edit: &MapEdit) -> Result<Reshaped, String> {
+    pub fn reshape(&self, edit: &MapEdit, keep: Option<Keep>) -> Result<Reshaped, String> {
         let relocated = self.with(|w| w.reshape(edit))?;
-        let durability = match &self.map_dir {
-            None => Durability::Ephemeral,
-            Some(dir) => {
+        let durability = match (&self.map_dir, keep) {
+            (None, _) | (_, None) => Durability::Ephemeral,
+            (Some(_), Some(keep)) => {
                 // Held for the snapshot and the write together, so no other
                 // reshape's write-back can interleave with this one's.
                 let _writeback = self.writeback.lock().expect("writeback lock");
                 let map = self.read(|w| w.map().clone());
-                match mapstore::persist(dir, edit, &map) {
+                match mapstore::persist(&keep, edit, &map) {
+                    Ok(()) if keep.drafts => Durability::Drafted,
                     Ok(()) => Durability::Written,
                     Err(e) => {
                         tracing::error!(
@@ -380,6 +440,8 @@ pub struct Worlds {
     /// argument would be a chance for two worlds to disagree about it. `None`
     /// in a daemon started without a mind, and then every bench act refuses.
     bench_root: Mutex<Option<PathBuf>>,
+    /// The operations' stores over that mind, for every world hosted here.
+    ops: Mutex<Option<Arc<MindStores>>>,
 }
 
 impl Worlds {
@@ -409,10 +471,22 @@ impl Worlds {
         *self.bench_root.lock().expect("bench root lock") = Some(root);
     }
 
+    /// Name the operations' stores every world's benches work in, as
+    /// [`Self::set_bench_root`] names their documents.
+    pub fn set_op_stores(&self, ops: Arc<MindStores>) {
+        for hosted in self.worlds.lock().expect("worlds lock").values() {
+            hosted.set_op_stores(Arc::clone(&ops));
+        }
+        *self.ops.lock().expect("op stores lock") = Some(ops);
+    }
+
     /// Keep a world that was built rather than loaded.
     pub fn keep(&self, hosted: Arc<Hosted>) -> Arc<Hosted> {
         if let Some(root) = self.bench_root.lock().expect("bench root lock").clone() {
             hosted.set_bench_root(root);
+        }
+        if let Some(ops) = self.ops.lock().expect("op stores lock").clone() {
+            hosted.set_op_stores(ops);
         }
         let mut worlds = self.worlds.lock().expect("worlds lock");
         worlds.insert(hosted.id.clone(), hosted.clone());
@@ -457,6 +531,7 @@ impl Worlds {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drafts::disk::Disk;
     use npc_map::world::Where;
 
     fn vault() -> Hosted {
@@ -594,24 +669,17 @@ mod tests {
         assert_eq!(worlds.len(), 1);
     }
 
-    /// **Concurrent reshapes to the same area do not corrupt the write-back.**
+    /// **Concurrent reshapes to the same area do not corrupt what is kept.**
     /// Eight threads each add their own room off `core` at once; the write-back
-    /// mutex ([`Hosted::writeback`]) must serialise their write-backs to
-    /// `a.yaml.tmp` so the file on disk is never a torn write of two of them at
-    /// once, and every room they added survives to the reloaded map.
+    /// mutex ([`Hosted::writeback`]) must serialise their keeping so the file
+    /// on disk is never a torn write of two of them at once, and every room
+    /// they added survives to the reloaded map.
     #[test]
     fn concurrent_reshapes_to_the_same_area_do_not_corrupt_the_written_file() {
         use npc_map::schema::{Node, NodeKind};
-        use std::sync::atomic::{AtomicU64, Ordering};
 
-        static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "npcd-world-race-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
         std::fs::write(
             dir.join("a.yaml"),
             "id: a\nkind: level\nname: A\nsummary: a place\nnodes:\n  - id: core\n    kind: core\n    name: core\n",
@@ -622,6 +690,7 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|i| {
                 let hosted = Arc::clone(&hosted);
+                let dir = dir.clone();
                 std::thread::spawn(move || {
                     let edit = MapEdit::AddNode {
                         area: "a".into(),
@@ -641,7 +710,13 @@ mod tests {
                             visible: vec![],
                         }),
                     };
-                    hosted.reshape(&edit).expect("each add lands")
+                    let keep = Keep {
+                        shelf: Box::new(Disk::new(&dir)),
+                        folder: String::new(),
+                        drafts: false,
+                    };
+                    let reshaped = hosted.reshape(&edit, Some(keep)).expect("each add lands");
+                    assert_eq!(reshaped.durability, Durability::Written);
                 })
             })
             .collect();

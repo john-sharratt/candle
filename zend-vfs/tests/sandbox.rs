@@ -110,10 +110,10 @@ async fn the_command_runs_on_the_conversations_branch() {
     assert_eq!(disk(&f.root, "FEATURE.md"), None);
 }
 
-/// **A binary file the command writes is reported, not lost** — the store
-/// holds text only — while its text changes are recorded.
+/// **A binary file the command writes is recorded beside its text ones**, as
+/// the bytes it wrote (`docs/replicated_substrate.md` §10.2).
 #[tokio::test]
-async fn a_binary_file_the_store_cannot_hold_is_reported() {
+async fn a_binary_file_the_command_writes_is_recorded() {
     let f = fixture();
     let files = f.store();
     let done = run(
@@ -126,17 +126,20 @@ async fn a_binary_file_the_store_cannot_hold_is_reported() {
         ),
     )
     .await;
-    assert_eq!(done.changed.len(), 1, "{done:?}");
-    assert_eq!(done.changed[0].path, "out.txt");
-    assert_eq!(done.unrecorded.len(), 1);
-    assert_eq!(done.unrecorded[0].path, "out.bin");
+    let changed: Vec<&str> = done.changed.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(changed, ["out.bin", "out.txt"], "{done:?}");
+    assert!(done.unrecorded.is_empty(), "{done:?}");
     assert_eq!(
-        done.unrecorded[0].delta.delta,
+        done.changed[0].delta.delta,
         FileDelta::ReplaceBinary {
             content: BINARY.to_vec()
         }
     );
-    assert_eq!(read(&files, "out.bin"), None);
+    assert_eq!(
+        files.read_bytes("out.bin").unwrap().as_deref(),
+        Some(BINARY)
+    );
+    assert!(files.read("out.bin").is_err(), "a binary file is not text");
     assert_untouched(&f, "main");
 }
 

@@ -1,17 +1,17 @@
-//! Accounts — durable like worlds, publishable like nothing.
+//! Accounts — replicated like a world's state, publishable like nothing.
 //!
-//! An account is the local record of somebody the gateway has vouched for: who
-//! they are, what they have chosen to be called here, and the author profile
-//! their characters read. It survives a substrate wipe for the same reason a
-//! world does, and by the same mechanism — a file read once at start and
-//! written back on change.
+//! An account is the record of somebody the gateway has vouched for: who they
+//! are, what they have chosen to be called here, and the author profile their
+//! characters read. Each is a `CustomObject account/<id>` record in the
+//! substrate (`docs/replicated_substrate.md` §10.3), so every member of the
+//! cluster reads the same accounts and a sign-in on one is known to all.
 //!
-//! It is **not** in the repository, and that is the one thing about this module
-//! worth being loud about. `npcd/.gitignore` excludes `accounts/`, because the
-//! repository is public and an account carries a real email address and the
-//! identity provider's stable subject id. Git history is the one place you
-//! cannot quietly remove something from afterwards, so the decision has to hold
-//! before the first write rather than after the first user.
+//! It is **never** in the mind repository, and that is the one thing about
+//! this module worth being loud about. The repository can be public and an
+//! account carries a real email address and the identity provider's stable
+//! subject id. Git history is the one place you cannot quietly remove
+//! something from afterwards; the substrate is not git, and nothing publishes
+//! it.
 //!
 //! # Nothing here decides who you are
 //!
@@ -22,13 +22,18 @@
 
 use std::path::Path;
 
+use candle_conversation::persistence::record::CustomObjectPayload;
+use candle_conversation::persistence::SharedSubstrate;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use web::auth::session::Identity;
 
 use crate::registry::Registry;
 
-/// The account key: **issuer and subject**, as a file name.
+/// Where accounts live among the substrate's custom objects.
+const PREFIX: &str = "account/";
+
+/// The account key: **issuer and subject**, hashed into a record name.
 ///
 /// A subject is unique per issuer, not globally. Keying on the subject alone
 /// worked only because exactly one provider was configured; the day a second
@@ -57,35 +62,81 @@ fn file_id(provider: &str, sub: &str) -> String {
     hasher.update(sub.as_bytes());
     let digest = hasher.finalize();
     // 128 bits of a 256-bit digest. Collisions are not a security boundary here
-    // — the subject inside the file is authoritative and is checked on load —
+    // — the subject inside the record is authoritative and is set on sign-in —
     // so this is about a name of workable length.
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The account store.
+/// The public id of an account filed under `key`: what its characters are
+/// owned by, and its author's store over the mind (§10.3).
+fn public_id(key: &str) -> String {
+    format!("u_{}", &key[..8])
+}
+
+/// The public id of `id`'s account.
+pub fn user_id_of(id: &Identity) -> String {
+    public_id(&file_id(&id.provider, &id.sub))
+}
+
+/// The account store: the substrate's `account/` records.
 pub struct Accounts {
-    reg: Registry,
+    shared: SharedSubstrate,
 }
 
 impl Accounts {
-    pub fn load(dir: impl AsRef<Path>) -> anyhow::Result<Self> {
-        Ok(Self {
-            // Written by this daemon, never by hand — so a save serialises the
-            // document whole instead of splicing to keep comments there are
-            // none of. See `registry::Written`: with the profile history in the
-            // file, splicing made every save quadratic in how much history the
-            // account had accumulated.
-            reg: Registry::load_generated("account", dir)?,
-        })
+    /// The accounts `shared` holds — taking in, once, the account files a
+    /// daemon kept in `legacy` before accounts were records, and removing the
+    /// folder after.
+    pub fn open(shared: SharedSubstrate, legacy: &Path) -> anyhow::Result<Self> {
+        let accounts = Self { shared };
+        if legacy.is_dir() {
+            let files = Registry::load("account", legacy)?;
+            for file in files.iter() {
+                if accounts.body(&file.id).is_none() {
+                    accounts.put(&file.id, file.body.clone())?;
+                }
+            }
+            std::fs::remove_dir_all(legacy)?;
+            tracing::info!(
+                "accounts: {} taken in from {}",
+                files.len(),
+                legacy.display()
+            );
+        }
+        Ok(accounts)
+    }
+
+    /// Account `key`'s record.
+    fn body(&self, key: &str) -> Option<Value> {
+        self.shared
+            .custom_object(&format!("{PREFIX}{key}"))
+            .filter(|o| !o.ceased)
+            .map(|o| o.blob)
+    }
+
+    /// Write account `key`'s record.
+    fn put(&self, key: &str, body: Value) -> anyhow::Result<()> {
+        self.shared
+            .put_custom_object(CustomObjectPayload::new(format!("{PREFIX}{key}"), body))
+            .map_err(|e| anyhow::anyhow!("account {key} was not written: {e:?}"))
+    }
+
+    /// Every account, by key.
+    fn all(&self) -> Vec<(String, Value)> {
+        self.shared
+            .custom_objects_under(PREFIX)
+            .into_iter()
+            .map(|(o, _)| (o.key[PREFIX.len()..].to_string(), o.blob))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
-        self.reg.len()
+        self.all().len()
     }
 
     /// Whether nobody has ever signed in. A fresh daemon, not a broken one.
     pub fn is_empty(&self) -> bool {
-        self.reg.is_empty()
+        self.len() == 0
     }
 
     /// The record for a verified identity, created on first sight.
@@ -100,7 +151,7 @@ impl Accounts {
     pub fn upsert(&mut self, id: &Identity, now_ms: u64) -> anyhow::Result<Value> {
         let key = file_id(&id.provider, &id.sub);
 
-        let existing = self.reg.get(&key).map(|r| r.body.clone());
+        let existing = self.body(&key);
         let mut body = existing.clone().unwrap_or_else(|| {
             json!({
                 "sub": id.sub,
@@ -164,9 +215,9 @@ impl Accounts {
         }
 
         // Only write when something actually changed. A GET of `/v1/me` on
-        // every page load must not rewrite a file and dirty a working tree.
+        // every page load must not write a record every member then applies.
         if existing.as_ref() != Some(&body) {
-            self.reg.put(&key, body.clone())?;
+            self.put(&key, body.clone())?;
         }
         Ok(with_public_id(&key, &body))
     }
@@ -194,7 +245,7 @@ impl Accounts {
         now_ms: u64,
     ) -> anyhow::Result<Option<Value>> {
         let key = file_id(&id.provider, &id.sub);
-        let Some(mut body) = self.reg.get(&key).map(|r| r.body.clone()) else {
+        let Some(mut body) = self.body(&key) else {
             return Ok(None);
         };
 
@@ -244,8 +295,8 @@ impl Accounts {
             };
             history.push(retired);
             // Oldest first, so dropping the front drops the least useful. The
-            // file is read into memory whole at start, and every entry is a
-            // full copy of a profile.
+            // record is resident whole, and every entry is a full copy of a
+            // profile.
             if history.len() > KEEP_REVISIONS {
                 history.drain(..history.len() - KEEP_REVISIONS);
             }
@@ -253,7 +304,7 @@ impl Accounts {
             map.insert("profile".into(), profile);
         }
 
-        self.reg.put(&key, body.clone())?;
+        self.put(&key, body.clone())?;
         Ok(Some(with_public_id(&key, &body)))
     }
 
@@ -270,7 +321,7 @@ impl Accounts {
     /// each time they open the page, to render a list of dates. The full text
     /// arrives from [`profile_revision`] when one is actually picked.
     pub fn profile_history(&self, id: &Identity) -> Option<Vec<Value>> {
-        let body = &self.reg.get(&file_id(&id.provider, &id.sub))?.body;
+        let body = self.body(&file_id(&id.provider, &id.sub))?;
 
         let summarise = |v: &Value, live: bool| {
             json!({
@@ -293,7 +344,7 @@ impl Accounts {
 
     /// One revision in full, live or superseded.
     pub fn profile_revision(&self, id: &Identity, revision: u64) -> Option<Value> {
-        let body = &self.reg.get(&file_id(&id.provider, &id.sub))?.body;
+        let body = self.body(&file_id(&id.provider, &id.sub))?;
         let at = |v: &Value| v.get("revision").and_then(Value::as_u64) == Some(revision);
 
         if body.get("profile").is_some_and(at) {
@@ -349,9 +400,9 @@ impl Accounts {
         // Uniqueness is case-insensitive: two authors called `Wren` and `wren`
         // are the same address to anyone typing it.
         let folded = name.to_ascii_lowercase();
-        let taken = self.reg.iter().any(|r| {
-            r.id != key
-                && r.body
+        let taken = self.all().into_iter().any(|(other, body)| {
+            other != key
+                && body
                     .get("unique_name")
                     .and_then(|v| v.as_str())
                     .is_some_and(|n| n.to_ascii_lowercase() == folded)
@@ -360,11 +411,7 @@ impl Accounts {
             return Err(NameError::Taken);
         }
 
-        let mut body = self
-            .reg
-            .get(&key)
-            .map(|r| r.body.clone())
-            .ok_or(NameError::NoAccount)?;
+        let mut body = self.body(&key).ok_or(NameError::NoAccount)?;
         let Some(map) = body.as_object_mut() else {
             return Err(NameError::Io(anyhow::anyhow!(
                 "account {key} is not an object"
@@ -372,16 +419,14 @@ impl Accounts {
         };
         map.insert("unique_name".into(), json!(name));
 
-        self.reg
-            .put(&key, body.clone())
-            .map_err(|e| NameError::Io(anyhow::Error::new(e)))?;
+        self.put(&key, body.clone()).map_err(NameError::Io)?;
         Ok(with_public_id(&key, &body))
     }
 
     /// What the console sees for a verified identity, without creating anything.
     pub fn get(&self, id: &Identity) -> Option<Value> {
         let key = file_id(&id.provider, &id.sub);
-        self.reg.get(&key).map(|r| with_public_id(&key, &r.body))
+        self.body(&key).map(|body| with_public_id(&key, &body))
     }
 }
 
@@ -441,15 +486,15 @@ const AUTHORED_TEXT: [&str; 2] = ["description", "history"];
 
 /// How many superseded revisions are kept.
 ///
-/// Bounded because the whole account file is read into memory at start, and
+/// Bounded because the whole account record is resident, on every member, and
 /// every save appends a full copy of the outgoing profile — paragraphs of it.
 /// Unbounded, an author who edits often eventually carries their entire writing
 /// history resident, forever, for a feature that reaches back a few steps.
 ///
 /// **Twenty, not two hundred.** The bound was set generously on the reasoning
 /// that it should never be the thing a person notices — but the cost is not
-/// linear in it. Every save rewrites the account, and the history is the largest
-/// thing in the file, so a deeper history makes *every* save more expensive
+/// linear in it. Every save writes the account whole, and the history is the
+/// largest thing in it, so a deeper history makes *every* save more expensive
 /// rather than only the rare walk back through one. Twenty is still far past
 /// any real use of undo on a profile description, and it is the difference
 /// between a save that is instant and one that is not.
@@ -551,7 +596,7 @@ fn check_unique_name(name: &str) -> Result<(), NameError> {
 
 /// The wire shape.
 ///
-/// `user_id` is the file key, not the provider's subject — the console needs a
+/// `user_id` is the record key, not the provider's subject — the console needs a
 /// stable handle for a user and has no business holding the provider's id for
 /// one. The `sub` never leaves this process.
 fn with_public_id(key: &str, body: &Value) -> Value {
@@ -562,7 +607,7 @@ fn with_public_id(key: &str, body: &Value) -> Value {
         // history on every `/v1/me` would grow the page-load payload by one
         // profile per edit the author has ever made, to render a chip.
         map.remove("profile_history");
-        map.insert("user_id".into(), json!(format!("u_{}", &key[..8])));
+        map.insert("user_id".into(), json!(public_id(key)));
     }
     out
 }
@@ -596,6 +641,7 @@ fn default_unique_name(id: &Identity) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::npcs::Npcs;
 
     /// A directory of this test's own.
     ///
@@ -616,6 +662,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// The accounts of the substrate in `dir`, opened as the daemon opens them
+    /// — a second call over the same `dir` is a restart.
+    fn open(dir: &std::path::Path) -> Accounts {
+        let shared = Npcs::load(dir).unwrap().substrate();
+        Accounts::open(shared, &dir.join("accounts")).unwrap()
     }
 
     /// `json!` builds a `Value`; the store takes a `Map`, because a patch that
@@ -648,14 +701,15 @@ mod tests {
     #[test]
     fn a_first_sight_creates_an_account_that_survives_a_restart() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         let me = a
             .upsert(&ident("google-1", "wren@example.com", "Wren S"), 1_000)
             .unwrap();
         assert_eq!(me["email"], "wren@example.com");
         assert_eq!(me["unique_name"], "wren");
 
-        let again = Accounts::load(&dir).unwrap();
+        drop(a);
+        let again = open(&dir);
         assert_eq!(again.len(), 1);
         assert_eq!(again.get(&who("google-1")).unwrap()["display"], "Wren S");
     }
@@ -664,7 +718,7 @@ mod tests {
     #[test]
     fn provider_fields_refresh_on_each_sign_in() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         a.upsert(&ident("g1", "old@example.com", "Old Name"), 1)
             .unwrap();
         let me = a
@@ -679,7 +733,7 @@ mod tests {
     #[test]
     fn author_owned_fields_are_not_overwritten_by_signing_in_again() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         a.upsert(&ident("g1", "wren@example.com", "Wren"), 1)
             .unwrap();
         a.put_profile(
@@ -696,27 +750,43 @@ mod tests {
         assert_eq!(me["unique_name"], "wren");
     }
 
-    /// A `/v1/me` on every page load must not dirty the working tree.
+    /// A `/v1/me` on every page load must not write a record.
     #[test]
-    fn an_unchanged_sign_in_does_not_rewrite_the_file() {
+    fn an_unchanged_sign_in_writes_no_record() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         let id = ident("g1", "wren@example.com", "Wren");
         a.upsert(&id, 1).unwrap();
 
-        let path = dir.join(format!("{}.yaml", file_id("google", "g1")));
-        let first = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let first = a.shared.custom_objects_version();
         a.upsert(&id, 2).unwrap();
-        let second = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert_eq!(first, second, "an unchanged upsert rewrote the file");
+        assert_eq!(
+            a.shared.custom_objects_version(),
+            first,
+            "an unchanged upsert wrote a record"
+        );
+    }
+
+    /// **An account is a record**, not a file: the substrate holds it under
+    /// `account/<id>`.
+    #[test]
+    fn an_account_is_a_custom_object_record() {
+        let dir = tmp();
+        let mut a = open(&dir);
+        a.upsert(&ident("g1", "wren@example.com", "Wren"), 1)
+            .unwrap();
+        let key = format!("account/{}", file_id("google", "g1"));
+        let held = a.shared.custom_object(&key).unwrap();
+        assert_eq!(held.blob["email"], "wren@example.com");
+        assert_eq!(held.blob["sub"], "g1", "the subject stays in the record");
+        assert!(!dir.join("accounts").exists(), "no file is written");
     }
 
     /// A profile edit must not be a way to become somebody else.
     #[test]
     fn a_profile_edit_cannot_reach_identity_fields() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         a.upsert(&ident("g1", "wren@example.com", "Wren"), 1)
             .unwrap();
         let me = a
@@ -737,7 +807,7 @@ mod tests {
     #[test]
     fn the_revision_is_the_stores_to_bump() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
         let one = a
             .put_profile(&who("g1"), &patch(json!({"description": "a"})), 2)
@@ -762,7 +832,7 @@ mod tests {
     #[test]
     fn a_revision_is_tombstoned_rather_than_overwritten() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
         a.put_profile(&who("g1"), &patch(json!({"description": "Surveyor."})), 100)
             .unwrap();
@@ -800,21 +870,22 @@ mod tests {
         let full = a.profile_revision(&who("g1"), 1).unwrap();
         assert_eq!(full["description"], "Surveyor.");
 
-        // And it survives a restart, because the file carries it.
-        let again = Accounts::load(&dir).unwrap();
+        // And it survives a restart, because the record carries it.
+        drop(a);
+        let again = open(&dir);
         assert_eq!(again.profile_history(&who("g1")).unwrap().len(), 3);
     }
 
     /// History is bounded, because the whole file is resident.
     ///
     /// Every save appends a full copy of the outgoing profile — paragraphs of
-    /// it — and `Registry::load` reads every account into memory at start.
+    /// it — and every member holds every account's record.
     /// Unbounded, an author who edits often carries their entire writing
     /// history forever to support an undo that reaches back a few steps.
     #[test]
     fn the_kept_history_is_bounded_and_keeps_the_newest() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
 
         let n = KEEP_REVISIONS + 25;
@@ -872,7 +943,7 @@ mod tests {
     #[test]
     fn the_history_does_not_ride_along_on_every_page_load() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
         let me = a
             .put_profile(&who("g1"), &patch(json!({"description": "a"})), 2)
@@ -910,7 +981,7 @@ mod tests {
     #[test]
     fn a_field_the_gateway_did_not_send_keeps_its_stored_value() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         let full = ident("g1", "wren@example.com", "Wren S");
         a.upsert(&full, 1_000).unwrap();
 
@@ -922,12 +993,13 @@ mod tests {
         assert_eq!(me["display"], "Wren S", "the display name was blanked");
 
         // And it is durable, not just what this call returned.
-        let again = Accounts::load(&dir).unwrap();
+        drop(a);
+        let mut again = open(&dir);
         assert_eq!(again.get(&full).unwrap()["display"], "Wren S");
 
         // A real change still lands.
         let renamed = ident("g1", "wren@example.com", "Wren Sharratt");
-        let me = a.upsert(&renamed, 3_000).unwrap();
+        let me = again.upsert(&renamed, 3_000).unwrap();
         assert_eq!(me["display"], "Wren Sharratt");
     }
 
@@ -954,7 +1026,7 @@ mod tests {
     #[test]
     fn an_account_is_not_reachable_from_another_provider() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         let mut google = ident("1234", "wren@example.com", "Wren");
         google.provider = "google".into();
         a.upsert(&google, 1_000).unwrap();
@@ -968,16 +1040,18 @@ mod tests {
         assert!(a.get(&google).is_some());
     }
 
-    /// A record written under an older profile shape corrects itself the next
-    /// time its owner signs in — no field survives that the profile does not
-    /// have, and a `gender` outside the allowed set is cleared rather than
-    /// carried.
+    /// **An account file kept before accounts were records is taken in once**,
+    /// and its folder goes; a record written under an older profile shape
+    /// corrects itself the next time its owner signs in — no field survives
+    /// that the profile does not have, and a `gender` outside the allowed set
+    /// is cleared rather than carried.
     #[test]
-    fn an_older_shape_is_corrected_on_the_next_sign_in() {
+    fn an_older_file_is_taken_in_and_corrected_on_the_next_sign_in() {
         let dir = tmp();
         let key = file_id("google", "g1");
+        std::fs::create_dir_all(dir.join("accounts")).unwrap();
         std::fs::write(
-            dir.join(format!("{key}.yaml")),
+            dir.join("accounts").join(format!("{key}.yaml")),
             serde_yaml::to_string(&json!({
                 "sub": "g1",
                 "provider": "google",
@@ -996,7 +1070,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
+        assert!(!dir.join("accounts").exists(), "the folder is taken in");
+        assert_eq!(a.len(), 1);
         let me = a
             .upsert(&ident("g1", "wren@example.com", "Wren"), 2)
             .unwrap();
@@ -1007,7 +1083,8 @@ mod tests {
         assert_eq!(me["profile"]["description"], "Ex-surveyor.");
 
         // Durable, not re-derived on every read.
-        let again = Accounts::load(&dir).unwrap();
+        drop(a);
+        let again = open(&dir);
         let stored = &again.get(&who("g1")).unwrap()["profile"];
         assert!(stored.get("pronouns").is_none(), "{stored}");
         assert_eq!(stored["gender"], "");
@@ -1076,7 +1153,7 @@ mod tests {
 
         // And a legitimate empty patch still advances exactly one revision.
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
         let me = a
             .put_profile(&who("g1"), &patch(json!({})), 2)
@@ -1090,7 +1167,7 @@ mod tests {
     #[test]
     fn a_patch_cannot_introduce_a_field_the_profile_does_not_have() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         a.upsert(&ident("g1", "w@e.com", "W"), 1).unwrap();
         let me = a
             .put_profile(
@@ -1129,13 +1206,14 @@ mod tests {
     #[test]
     fn a_chosen_name_persists_across_a_restart() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         a.upsert(&ident("g1", "wren@example.com", "Wren S"), 1)
             .unwrap();
         a.put_unique_name(&who("g1"), "  ridge-walker  ").unwrap();
 
-        let again = Accounts::load(&dir).unwrap();
-        // Trimmed on the way in, so the file holds the address and not the
+        drop(a);
+        let again = open(&dir);
+        // Trimmed on the way in, so the record holds the address and not the
         // author's stray whitespace.
         assert_eq!(
             again.get(&who("g1")).unwrap()["unique_name"],
@@ -1146,7 +1224,7 @@ mod tests {
     #[test]
     fn the_provider_subject_never_reaches_the_wire() {
         let dir = tmp();
-        let mut a = Accounts::load(&dir).unwrap();
+        let mut a = open(&dir);
         let me = a
             .upsert(&ident("secret-subject-id", "w@e.com", "W"), 1)
             .unwrap();

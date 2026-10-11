@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::adoption::Adoption;
+use super::blob::BlobIndex;
 use super::content_hash::snapshot_stream_id;
 use super::deleted::{DeletedKey, DeletedPayload, DeletedTimeline};
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
@@ -214,6 +215,7 @@ pub fn collect_live_records(
     substrate: &Substrate,
     npc_locs: &StampedLocs<u64>,
     vfs_index: &VfsIndex,
+    blob_index: &BlobIndex,
     marker_ids: &MarkerIds,
     node: u64,
     expiry: TombstoneExpiry,
@@ -270,6 +272,26 @@ pub fn collect_live_records(
                 loc.record_size,
             ));
         }
+    }
+
+    // Blobs, staged verbatim by location: their bytes are never in RAM, and
+    // nothing supersedes one — the first record of each hash is carried.
+    for (key, loc) in blob_index.blobs() {
+        out.push(CompactItem::raw(
+            RecordHeader {
+                record_type: RecordType::Blob,
+                format: 0,
+                payload_len: loc.payload_len,
+                crc: 0,
+                stream_id: key.hi,
+                chunk_index: key.lo,
+                token_count: 0,
+                ..RecordHeader::NONE
+            },
+            loc.segment,
+            loc.offset,
+            loc.record_size,
+        ));
     }
 
     // Characters, staged verbatim from wherever they physically live.
@@ -1331,6 +1353,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -1391,6 +1414,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -1444,6 +1468,7 @@ mod tests {
             &before_sub,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -1558,6 +1583,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -1696,6 +1722,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -1806,6 +1833,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -1882,6 +1910,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -1932,6 +1961,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -1998,6 +2028,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2129,6 +2160,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2187,6 +2219,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2252,6 +2285,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2282,6 +2316,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2330,6 +2365,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2411,6 +2447,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2454,6 +2491,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2533,6 +2571,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2616,6 +2655,7 @@ mod tests {
             &substrate,
             &npc_locs,
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2646,6 +2686,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2668,6 +2709,7 @@ mod tests {
             &substrate,
             &npc_locs,
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2752,6 +2794,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &vfs,
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2840,6 +2883,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2899,6 +2943,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -2921,6 +2966,7 @@ mod tests {
     /// [`survival`]: crate::persistence::survival::survival
     #[test]
     fn every_record_type_survives_compaction() {
+        use crate::persistence::blob::BlobKey;
         use crate::persistence::content_hash::snapshot_stream_id;
         use crate::persistence::record::{
             CustomObjectPayload, DistillMode, DistillPayload, TreeMetadataPayload,
@@ -3144,6 +3190,10 @@ mod tests {
             }],
         );
 
+        // And blobs, by location.
+        let mut blobs = BlobIndex::new();
+        blobs.record(BlobKey { hi: 3, lo: 4 }, loc_at(16_384, 512));
+
         // What the member has applied of another origin, and the generation
         // fixed for what it wrote cut off — held persistence-side.
         let mut housekeeping = Housekeeping::default();
@@ -3159,6 +3209,7 @@ mod tests {
             &substrate,
             &npc_locs,
             &vfs,
+            &blobs,
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -3229,6 +3280,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,
@@ -3286,6 +3338,7 @@ mod tests {
             &substrate,
             &StampedLocs::new(),
             &VfsIndex::new(),
+            &BlobIndex::new(),
             &MarkerIds::new(),
             0,
             NO_EXPIRY,

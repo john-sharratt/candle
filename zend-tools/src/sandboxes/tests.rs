@@ -11,6 +11,7 @@ use zend_vfs::{
 };
 
 use super::{Sandboxes, SandboxesError};
+use crate::executor::Executor;
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -104,7 +105,7 @@ fn only_git_repositories_have_a_sandbox() {
     assert!(boxes.jobs_dir().is_dir());
     let files = store(&ws);
     let err = boxes
-        .run(
+        .run_here(
             DiskWriteGrant::issue(),
             "plain",
             request(&files, shell("echo x")),
@@ -131,7 +132,7 @@ fn a_job_runs_records_what_it_wrote_and_pages_its_output() {
         "echo made > out.txt; echo first; echo second"
     };
     let ran = boxes
-        .run(
+        .run_here(
             DiskWriteGrant::issue(),
             "app",
             request(&files, shell(script)),
@@ -166,7 +167,7 @@ fn a_refused_command_never_runs() {
     let boxes = Sandboxes::for_workspace(&ws, &policy()).unwrap();
     let files = store(&ws);
     let err = boxes
-        .run(
+        .run_here(
             DiskWriteGrant::issue(),
             "app",
             request(&files, SandboxCommand::new("python")),

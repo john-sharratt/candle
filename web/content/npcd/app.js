@@ -152,6 +152,10 @@ function closeOtherPopovers(keep) {
     menuOpen = false;
     renderChrome();
   }
+  if (keep !== 'drafts' && draftsOpen) {
+    draftsOpen = false;
+    renderChrome();
+  }
   if (keep !== 'estate') {
     // A `<details>`: closing it is setting the attribute, and it owns its own
     // open state rather than a flag here.
@@ -184,6 +188,89 @@ function themeMenu() {
   return h('div', { class: 'menu' }, THEMES.map(([k, label, sw]) =>
     h('button', { class: k === cur ? 'on' : '', onClick: () => { menuOpen = false; setTheme(k); } },
       h('span', { class: 'sw', style: `background:${sw}` }), label)));
+}
+
+// ── drafts (admins) ─────────────────────────────────────────────────────────
+//
+// Over a mind under git, everything an admin writes — a world, a personality,
+// an entry, a life — is a draft of their own until they publish it
+// (`docs/replicated_substrate.md` §10.3). The topbar says how many there are
+// and publishes them. Over a mind folder that is not a git repository a write
+// is what stands, and there is nothing here to show.
+
+let DRAFTS = null;
+let draftsOpen = false;
+let draftsBusy = false;
+
+async function refreshDrafts() {
+  if (!can('admin')) {
+    DRAFTS = null;
+    return;
+  }
+  try {
+    DRAFTS = await API.getDrafts();
+  } catch (_) {
+    DRAFTS = null;
+  }
+  renderChrome();
+}
+
+const plural = (n, one) => `${n} ${one}${n === 1 ? '' : 's'}`;
+
+async function draftsAct(act) {
+  draftsBusy = true;
+  renderChrome();
+  try {
+    if (act === 'publish') {
+      const r = await API.publishDrafts();
+      toast(r.published
+        ? `Published ${plural(r.paths.length, 'change')} to the record`
+        : 'Nothing to publish: the record already says this', 'ok');
+      draftsOpen = false;
+    } else if (act === 'sync') {
+      const r = await API.syncDrafts();
+      toast(r.conflicts.length
+        ? `The record's newer text is in. Settle the marks in ${r.conflicts.join(', ')}, then publish.`
+        : 'Your drafts hold everything the record has.', r.conflicts.length ? 'warn' : 'ok');
+    } else if (act === 'discard') {
+      await API.discardDrafts();
+      toast('Drafts discarded', 'ok');
+      draftsOpen = false;
+    }
+  } catch (e) {
+    toast(e.error === 'conflicts'
+      ? `The record moved under ${(e.paths || []).join(', ')}. Sync to bring its text in, settle the marks, and publish again.`
+      : (e.detail || e.message), 'err');
+  }
+  draftsBusy = false;
+  await refreshDrafts();
+}
+
+function draftsButton() {
+  if (!DRAFTS || !DRAFTS.keeps_drafts || !DRAFTS.drafts.length) return null;
+  return h('button', {
+    class: 'btn sm' + (draftsOpen ? ' on' : ''),
+    title: 'Your changes to the mind that are not published yet',
+    onClick: (e) => {
+      e.stopPropagation();
+      closeOtherPopovers('drafts');
+      draftsOpen = !draftsOpen;
+      renderChrome();
+    },
+  }, plural(DRAFTS.drafts.length, 'draft'));
+}
+
+function draftsMenu() {
+  if (!draftsOpen || !DRAFTS || !DRAFTS.drafts.length) return null;
+  return h('div', { class: 'menu drafts-menu', onClick: (e) => e.stopPropagation() },
+    h('div', { class: 'tiny dim' }, 'Only you see these until you publish them.'),
+    DRAFTS.drafts.map((d) => h('div', { class: 'mono tiny', title: d.removed ? 'removed' : 'changed' },
+      (d.removed ? '− ' : '· ') + d.path)),
+    h('div', { class: 'row' },
+      h('button', { class: 'btn sm primary', disabled: draftsBusy, onClick: () => draftsAct('publish') },
+        draftsBusy ? 'Working…' : 'Publish'),
+      h('button', { class: 'btn sm', disabled: draftsBusy, onClick: () => draftsAct('sync') }, 'Sync'),
+      h('button', { class: 'btn sm ghost', disabled: draftsBusy, onClick: () => draftsAct('discard') }, 'Discard')));
 }
 
 // ── chrome (right side of the topbar) ───────────────────────────────────────
@@ -232,6 +319,7 @@ function renderChrome() {
   const host = document.getElementById('chrome');
   if (!host) return;
   mount(host,
+    draftsButton(),
     themeButton(),
     ME
       /* Your own name and face, not your handle. `unique_name` is the address
@@ -251,13 +339,12 @@ function renderChrome() {
       : AUTH_UNAVAILABLE
         ? h('span', { class: 'tiny dim', title: 'This deployment has no sign-in configured' }, 'sign-in off')
         : h('button', { class: 'btn sm primary', onClick: () => window.__npcdSignIn() }, 'Sign in'));
-  const old = document.querySelector('.menu');
-  if (old) old.remove();
-  const m = themeMenu();
+  for (const old of document.querySelectorAll('.menu')) old.remove();
+  const m = themeMenu() || draftsMenu();
   if (m) {
     document.querySelector('.topbar').appendChild(m);
     setTimeout(() => document.addEventListener('click', function close() {
-      menuOpen = false; renderChrome(); document.removeEventListener('click', close);
+      menuOpen = false; draftsOpen = false; renderChrome(); document.removeEventListener('click', close);
     }, { once: true }), 0);
   }
 }
@@ -533,6 +620,7 @@ async function boot() {
 
   renderChrome();
   renderNav(null);   // tabs appear immediately, even if the first page fails to render
+  refreshDrafts();
 
   // ── responsive wiring ────────────────────────────────────────────────────
   const railEl = document.getElementById('rail');
@@ -588,6 +676,9 @@ async function boot() {
   if (restored && restored.hash) location.replace(restored.hash);
   setInterval(async () => {
     try { checkBuild(await API.getStatus(), { hash: location.hash }); } catch (_) {}
+    // The count follows every save an admin makes, wherever on the console it
+    // was made, without each page having to announce it.
+    if (!draftsOpen && !draftsBusy) refreshDrafts();
   }, 5000);
 
   // Keyboard: g-then-key jumps, "/" focuses search unless a composer has it.

@@ -1,23 +1,26 @@
 //! The first routes `npcd` answers itself rather than handing to the mock.
 //!
-//! Worlds and personalities are authored files (see [`crate::registry`]), so they
-//! are real even though there is no engine yet — a save here writes YAML into
-//! the repository and shows up in `git status`. Everything else still falls
-//! through to `web::mock::npcd`, which is why this is a thin router laid *over*
-//! that one rather than a fork of it: as each surface becomes real it moves
-//! here, one route at a time, and the console never notices.
+//! Worlds and personalities are authored files in the mind (see
+//! [`crate::registry`]). A save here is the calling admin's draft of one — kept
+//! in their own store and published from the console — over a mind under git,
+//! and the file itself over a mind folder that is not one (see
+//! [`crate::drafts`]). Everything else still falls through to
+//! `web::mock::npcd`, which is why this is a thin router laid *over* that one
+//! rather than a fork of it: as each surface becomes real it moves here, one
+//! route at a time, and the console never notices.
 //!
 //! The ids in these paths never become paths. `GET /v1/world/{wid}` is a lookup
-//! in a `BTreeMap` that was filled at boot, and an id that is not a key is a
-//! 404 — there is no filesystem call on the read path to traverse. The one
-//! place an id becomes a file name is a save, and that goes through
+//! in a `BTreeMap` read from the folder, and an id that is not a key is a 404 —
+//! there is no filesystem call on the read path to traverse. The one place an
+//! id becomes a file name is a save, and that goes through
 //! `registry::id::check` first.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::{Arc, RwLock as SyncRwLock};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -38,10 +41,13 @@ use web::auth::{Role, Roles};
 use crate::accounts::{self, Accounts, NameError, PatchError};
 use crate::clock::{self, Clock};
 use crate::collections::{self, Libraries};
+use crate::drafts::routes as drafts;
+use crate::drafts::{caller, records, Author};
 use crate::engine::runtime::Runtime;
 use crate::guest_routes;
 use crate::identity::require;
 use crate::images::{ImageError, Images};
+use crate::lifegen::job::Jobs;
 use crate::lifegen::narrate as lifegen_narrate;
 use crate::lifegen::routes as lifegen;
 use crate::mind::catalog::CatalogError;
@@ -51,10 +57,13 @@ use crate::mind::{
     Scope,
 };
 use crate::npcs::{self, Filter, NpcError, Npcs};
+use crate::personality_portrait;
 use crate::portrait;
 use crate::projection::BUNDLED;
 use crate::prose;
-use crate::registry::{self, PutError, Registry};
+use crate::registry::authored::{PERSONALITIES, WORLDS};
+use crate::registry::{self, PutError, Record, Registry};
+use crate::sim::shelf::{Published, Shelf};
 use crate::visibility;
 use host::guard::Api;
 
@@ -92,17 +101,17 @@ pub struct Authored {
     /// `personality_id -> image_id` for the portraits personalities were
     /// authored with — see [`crate::personality_portrait`].
     ///
-    /// Read once at startup and never written, so no lock. It is *derived* from
-    /// the personality registry rather than stored in it: the registry holds the
-    /// document as authored, and an id minted by this daemon's image store is
-    /// not something the author wrote. Keeping it out here is what stops a save
-    /// round-tripping a local id back into the mind.
-    pub personality_portraits: BTreeMap<String, String>,
-    /// The mind directory, for the file editor. No lock: it holds a path, and
-    /// the filesystem is the thing being shared — two saves to one document
-    /// race in the OS whatever this does, and each is atomic (see
-    /// [`crate::mind::doc`]).
+    /// Derived again each time the personality registry is read again. It is
+    /// *derived* from the registry rather than stored in it: the registry holds
+    /// the document as authored, and an id minted by this daemon's image store
+    /// is not something the author wrote. Keeping it out here is what stops a
+    /// save round-tripping a local id back into the mind.
+    pub personality_portraits: SyncRwLock<BTreeMap<String, String>>,
+    /// The mind directory, for the file editor.
     pub mind: Mind,
+    /// The folder the worlds and personalities are kept in, and an author's
+    /// writes go to: the mind, or the data directory of a daemon with none.
+    authored_dir: PathBuf,
     /// The engine.
     ///
     /// Always present, and always *there before the model is*. The daemon binds
@@ -120,7 +129,7 @@ pub struct Authored {
     /// the runtime because a generation is an *authoring* action against the
     /// mind directory — the engine is something it borrows, not something it
     /// belongs to.
-    pub lifegen: crate::lifegen::job::Jobs,
+    pub lifegen: Jobs,
 }
 
 impl Authored {
@@ -145,6 +154,13 @@ impl Authored {
         images: Images,
         personality_portraits: BTreeMap<String, String>,
     ) -> Self {
+        // Both registries are read from their folders of one place, which is
+        // where an author's writes go.
+        let authored_dir = worlds
+            .dir()
+            .parent()
+            .map(FsPath::to_path_buf)
+            .unwrap_or_default();
         Self {
             worlds: RwLock::new(worlds),
             personalities: RwLock::new(personalities),
@@ -153,11 +169,57 @@ impl Authored {
             roles,
             libraries,
             images,
-            personality_portraits,
+            personality_portraits: SyncRwLock::new(personality_portraits),
             mind,
+            authored_dir,
             runtime: None,
-            lifegen: crate::lifegen::job::Jobs::new(),
+            lifegen: Jobs::new(),
         }
+    }
+
+    /// Account `account` as an author: its view of the authored folder, and
+    /// where its writes go — its drafts, over a mind under git (§10.3).
+    pub fn author(&self, account: &str) -> Author {
+        let stores = self.runtime.as_ref().map(|rt| &rt.ops);
+        Author::open(&self.authored_dir, stores, account)
+    }
+
+    /// What follows a write through `author`: over a mind that keeps no
+    /// drafts, the write is what stands, so what is read from the folder is
+    /// read again.
+    pub async fn wrote(&self, author: &Author) {
+        if !author.keeps_drafts() {
+            self.reload_authored().await;
+        }
+    }
+
+    /// Read the worlds and personalities again from the folder, as it stands
+    /// now: after the mind folder moves to a newer record, or a write to a
+    /// mind that keeps no drafts. A world that is gone stops running.
+    pub async fn reload_authored(&self) {
+        let gone = match self.worlds.write().await.reload() {
+            Ok(gone) => gone,
+            Err(e) => {
+                tracing::warn!("worlds could not be read again: {e:#}");
+                Vec::new()
+            }
+        };
+        if let Err(e) = self.personalities.write().await.reload() {
+            tracing::warn!("personalities could not be read again: {e:#}");
+        }
+        if let Some(rt) = self.runtime.as_ref() {
+            for wid in &gone {
+                rt.remove_world(wid);
+            }
+        }
+        let portraits = {
+            let personalities = self.personalities.read().await;
+            personality_portrait::ingest(&personalities, personalities.dir(), &self.images)
+        };
+        *self
+            .personality_portraits
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = portraits;
     }
 
     /// The same state with an engine behind it.
@@ -213,9 +275,8 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
     let character = || Dispatch::owner_path("nid");
     let life = || Dispatch::sticky_path("who");
     Api::new(roles)
-        // Authored content. Anyone may read it; only an admin may change a file
-        // on disk. The mind is not under version control, so a bad write is not
-        // a row to restore — it is prose somebody wrote, gone.
+        // Authored content. Anyone may read it; only an admin may change it, as
+        // a draft of their own until they publish it (§10.3).
         .route(
             "/v1/world",
             Role::Unauthenticated,
@@ -428,6 +489,33 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Role::Admin,
             Dispatch::Best,
             put(put_mind_fields),
+        )
+        // An admin's drafts of the mind, and landing them on the record
+        // (§10.3). An author's store replicates, so any member reads it; the
+        // git work runs on the best one.
+        .route(
+            "/v1/mind/drafts",
+            Role::Admin,
+            Dispatch::Any,
+            get(drafts::get_drafts),
+        )
+        .route(
+            "/v1/mind/drafts",
+            Role::Admin,
+            Dispatch::Best,
+            delete(drafts::delete_drafts),
+        )
+        .route(
+            "/v1/mind/publish",
+            Role::Admin,
+            Dispatch::Best,
+            post(drafts::post_publish),
+        )
+        .route(
+            "/v1/mind/sync",
+            Role::Admin,
+            Dispatch::Best,
+            post(drafts::post_sync),
         )
         // The nine layers are the host's `/v1/schema/layers`, which reads them
         // from npcd through [`schema_layers`].
@@ -722,7 +810,7 @@ async fn import_npcs(State(s): State<Arc<Authored>>, Json(body): Json<Value>) ->
 async fn list_npcs(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let (_, owner) = match owner_of(&s, &headers).await {
         Ok(v) => v,
@@ -1453,7 +1541,7 @@ async fn put_portrait(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path(nid): Path<String>,
-    axum::extract::Query(q): axum::extract::Query<PortraitOrigin>,
+    Query(q): Query<PortraitOrigin>,
     body: axum::body::Bytes,
 ) -> Response {
     // Two values, and anything else is refused rather than stored: the string
@@ -1798,20 +1886,21 @@ pub fn err(status: StatusCode, code: &str, detail: &str) -> Response {
 
 /// Everything a mind request needs, or the refusal that says why not.
 ///
-/// The three handlers below all begin the same way — is there a mind, does the
-/// path parse, which world is this scoped to — so it happens once. The scope is
+/// The handlers below all begin the same way — is there a mind, does the path
+/// parse, which world is this scoped to — so it happens once. The scope is
 /// resolved here too, which is what stops a handler forgetting to apply it.
 async fn mind_request(
     s: &Arc<Authored>,
-    q: &std::collections::HashMap<String, String>,
-) -> Result<(std::path::PathBuf, Option<Address>, Scope), Box<Response>> {
-    let Some(root) = s.mind.root() else {
+    headers: &HeaderMap,
+    q: &HashMap<String, String>,
+) -> Result<(Option<Address>, Scope), Box<Response>> {
+    if s.mind.root().is_none() {
         return Err(Box::new(err(
             StatusCode::NOT_FOUND,
             "no_mind",
             "this daemon was started without --mind, so it has no authored content to edit",
         )));
-    };
+    }
     // `?id=` is an address in the corpus — `canon/ammo/bolt` — not a path. The
     // absent case is the corpus itself.
     let addr = Address::parse(q.get("id").map(String::as_str).unwrap_or_default())
@@ -1822,14 +1911,26 @@ async fn mind_request(
     // editing the corpus should not have to choose a lens first.
     let scope = match q.get("world").map(String::as_str).filter(|w| !w.is_empty()) {
         None => Scope::unscoped(),
-        Some(wid) => match s.worlds.read().await.get(wid) {
+        Some(wid) => match seen(s, headers, &s.worlds, WORLDS, wid).await {
             Some(r) => Scope::of_world(&r.body),
             None => {
                 return Err(Box::new(err(StatusCode::BAD_REQUEST, "unknown_world", wid)));
             }
         },
     };
-    Ok((root.to_path_buf(), addr, scope))
+    Ok((addr, scope))
+}
+
+/// The mind as the caller reads it (§10.3): an admin's own drafts over the
+/// published mind; anyone else the published mind. Asked after
+/// [`mind_request`], which refuses a daemon with no mind.
+fn mind_view(s: &Authored, headers: &HeaderMap) -> Box<dyn Shelf> {
+    match caller::admin(s, headers) {
+        Some(author) => Box::new(author),
+        None => Box::new(Published {
+            root: s.mind.root().map(FsPath::to_path_buf).unwrap_or_default(),
+        }),
+    }
 }
 
 /// The section category of a `responses/` or `moods/` file, from the libraries
@@ -1868,12 +1969,14 @@ fn category_lookup(s: &Arc<Authored>) -> impl Fn(&MindPath) -> Option<String> + 
 /// part of the corpus has no address at all.
 async fn mind_list(
     State(s): State<Arc<Authored>>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (root, addr, scope) = match mind_request(&s, &q).await {
+    let (addr, scope) = match mind_request(&s, &headers, &q).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
+    let view = mind_view(&s, &headers);
     let cat = category_lookup(&s);
     let (id, title, parent, has_text, children) = match &addr {
         None => (
@@ -1881,7 +1984,7 @@ async fn mind_list(
             "The mind".to_owned(),
             None,
             false,
-            Ok(mind_catalog::sections(&root, &scope, &cat)),
+            Ok(mind_catalog::sections(&*view, &scope, &cat)),
         ),
         Some(a) => (
             a.as_str(),
@@ -1890,10 +1993,8 @@ async fn mind_list(
             // Whether *this* has text of its own, which is what lets a topic be
             // opened as well as opened into.
             a.entry_path()
-                .and_then(|p| p.resolve(&root).ok())
-                .map(|f| f.is_file())
-                .unwrap_or(false),
-            mind_catalog::children(&root, a, &scope, &cat),
+                .is_some_and(|p| view.size(&p.as_str()).is_some()),
+            mind_catalog::children(&*view, a, &scope, &cat),
         ),
     };
     match children {
@@ -1910,16 +2011,17 @@ async fn mind_list(
     }
 }
 
-/// The addressed thing, and everything needed to act on it.
+/// The addressed thing.
 ///
-/// Every write handler begins the same way and the scope check is the part that
+/// Every entry handler begins the same way and the scope check is the part that
 /// must not be forgotten, so it happens here once. `None` — the corpus itself —
 /// is refused: there is no text at the root to read, write or remove.
 async fn mind_entry_of(
     s: &Arc<Authored>,
-    q: &std::collections::HashMap<String, String>,
-) -> Result<(std::path::PathBuf, Address), Box<Response>> {
-    let (root, addr, scope) = mind_request(s, q).await?;
+    headers: &HeaderMap,
+    q: &HashMap<String, String>,
+) -> Result<Address, Box<Response>> {
+    let (addr, scope) = mind_request(s, headers, q).await?;
     let Some(addr) = addr else {
         return Err(Box::new(err(
             StatusCode::BAD_REQUEST,
@@ -1940,19 +2042,30 @@ async fn mind_entry_of(
             )));
         }
     }
-    Ok((root, addr))
+    Ok(addr)
+}
+
+/// The addressed thing, and the calling admin as its author.
+async fn mind_write_of(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+    q: &HashMap<String, String>,
+) -> Result<(Author, Address), Box<Response>> {
+    let addr = mind_entry_of(s, headers, q).await?;
+    Ok((caller::author(s, headers)?, addr))
 }
 
 /// Read the text of an entry, or a topic's overview.
 async fn mind_entry(
     State(s): State<Arc<Authored>>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (root, addr) = match mind_entry_of(&s, &q).await {
+    let addr = match mind_entry_of(&s, &headers, &q).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    match mind_catalog::read(&root, &addr) {
+    match mind_catalog::read(&*mind_view(&s, &headers), &addr) {
         Ok(d) => Json(json!({
             "id": addr.as_str(),
             "title": addr.title(),
@@ -1970,10 +2083,11 @@ async fn mind_entry(
 /// needs: a create that overwrote would take somebody's work with no error.
 async fn put_mind_entry(
     State(s): State<Arc<Authored>>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (root, addr) = match mind_entry_of(&s, &q).await {
+    let (author, addr) = match mind_write_of(&s, &headers, &q).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
@@ -1985,7 +2099,9 @@ async fn put_mind_entry(
         );
     };
     let must_be_new = matches!(q.get("new").map(String::as_str), Some("1" | "true"));
-    match mind_catalog::write(&root, &addr, text, must_be_new) {
+    let wrote = mind_catalog::write(&author, &addr, text, must_be_new);
+    s.wrote(&author).await;
+    match wrote {
         Ok(Wrote::Created) => (
             StatusCode::CREATED,
             Json(json!({ "id": addr.as_str(), "title": addr.title(), "created": true })),
@@ -2030,7 +2146,10 @@ pub fn schema_layers(s: &Authored) -> Result<Vec<Value>, String> {
     };
     let text = match s.mind.root() {
         Some(root) => {
-            mind_catalog::read(root, &addr)
+            let published = Published {
+                root: root.to_path_buf(),
+            };
+            mind_catalog::read(&published, &addr)
                 .map_err(|e| format!("{e:?}"))?
                 .text
         }
@@ -2048,13 +2167,14 @@ pub fn schema_layers(s: &Authored) -> Result<Vec<Value>, String> {
 /// editor instead.
 async fn mind_fields(
     State(s): State<Arc<Authored>>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (root, addr) = match mind_entry_of(&s, &q).await {
+    let addr = match mind_entry_of(&s, &headers, &q).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let doc = match mind_catalog::read(&root, &addr) {
+    let doc = match mind_catalog::read(&*mind_view(&s, &headers), &addr) {
         Ok(d) => d,
         Err(e) => return doc_err(e),
     };
@@ -2084,10 +2204,11 @@ async fn mind_fields(
 /// key survive an edit made by somebody who never saw them.
 async fn put_mind_fields(
     State(s): State<Arc<Authored>>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (root, addr) = match mind_entry_of(&s, &q).await {
+    let (author, addr) = match mind_write_of(&s, &headers, &q).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
@@ -2113,13 +2234,15 @@ async fn put_mind_fields(
             Ok(t) => t,
             Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_field", &e.to_string()),
         };
-        return match mind_catalog::write(&root, &addr, &text, false) {
+        let wrote = mind_catalog::write(&author, &addr, &text, false);
+        s.wrote(&author).await;
+        return match wrote {
             Ok(_) => Json(json!({ "id": addr.as_str(), "title": addr.title() })).into_response(),
             Err(e) => doc_err(e),
         };
     }
 
-    let current = match mind_catalog::read(&root, &addr) {
+    let current = match mind_catalog::read(&author, &addr) {
         Ok(d) => d,
         Err(e) => return doc_err(e),
     };
@@ -2136,7 +2259,9 @@ async fn put_mind_fields(
              which would lose its comments — edit it as text instead",
         );
     };
-    match mind_catalog::write(&root, &addr, &next, false) {
+    let wrote = mind_catalog::write(&author, &addr, &next, false);
+    s.wrote(&author).await;
+    match wrote {
         Ok(_) => Json(json!({ "id": addr.as_str(), "title": addr.title() })).into_response(),
         Err(e) => doc_err(e),
     }
@@ -2148,13 +2273,16 @@ async fn put_mind_fields(
 /// one button must not become a recursive delete.
 async fn delete_mind_entry(
     State(s): State<Arc<Authored>>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let (root, addr) = match mind_entry_of(&s, &q).await {
+    let (author, addr) = match mind_write_of(&s, &headers, &q).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    match mind_catalog::remove(&root, &addr) {
+    let removed = mind_catalog::remove(&author, &addr);
+    s.wrote(&author).await;
+    match removed {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => doc_err(e),
     }
@@ -2165,14 +2293,6 @@ fn catalog_err(e: CatalogError) -> Response {
     match e {
         CatalogError::NotFound => err(StatusCode::NOT_FOUND, "not_found", &e.to_string()),
         CatalogError::OutOfScope => err(StatusCode::FORBIDDEN, "out_of_scope", &e.to_string()),
-        CatalogError::Io(io) => {
-            tracing::error!(error = %io, "mind listing failed");
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "io_error",
-                "could not read that part of the mind",
-            )
-        }
     }
 }
 
@@ -2196,11 +2316,11 @@ fn doc_err(e: DocError) -> Response {
         DocError::TooLarge(_) => err(StatusCode::PAYLOAD_TOO_LARGE, "too_large", &e.to_string()),
         DocError::Exists => err(StatusCode::CONFLICT, "already_exists", &e.to_string()),
         DocError::CannotPatch => err(StatusCode::CONFLICT, "cannot_patch", &e.to_string()),
-        DocError::Io(io) => {
-            // The path is deliberately not in the reply: an I/O message can
-            // carry the absolute location of the mind on disk, which is the
-            // estate's internal shape and not the caller's business.
-            tracing::error!(error = %io, "mind write failed");
+        DocError::Unkept(why) => {
+            // The reason is deliberately not in the reply: it can carry the
+            // absolute location of the mind on disk, which is the estate's
+            // internal shape and not the caller's business.
+            tracing::error!(error = %why, "mind write failed");
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "io_error",
@@ -2245,11 +2365,7 @@ fn with_count(mut v: Value, counts: &BTreeMap<&str, usize>, id: &str) -> Value {
 /// so that a listing being screen-shared does not contain what a screenshot
 /// should not. It is discretion, not access control — `GET /v1/world/earth`
 /// still answers anyone who knows the id, exactly as it did before.
-fn revealing(
-    s: &Arc<Authored>,
-    headers: &HeaderMap,
-    q: &std::collections::HashMap<String, String>,
-) -> bool {
+fn revealing(s: &Arc<Authored>, headers: &HeaderMap, q: &HashMap<String, String>) -> bool {
     if !matches!(q.get("reveal").map(String::as_str), Some("1" | "true")) {
         return false;
     }
@@ -2266,14 +2382,14 @@ fn revealing(
 async fn list_worlds(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let query = q.get("q").map(String::as_str).unwrap_or_default();
     let reveal = revealing(&s, &headers, &q);
     let npcs = s.npcs.read().await;
     let counts = npcs.counts_by(|n| n.world_id.as_str());
-    let reg = s.worlds.read().await;
-    let worlds: Vec<Value> = reg
+    let worlds: Vec<Value> = seen_all(&s, &headers, &s.worlds, WORLDS)
+        .await
         .iter()
         .filter(|r| reveal || visibility::listable(&r.id, &r.body, query))
         .map(|r| with_count(with_id("world_id", &r.id, &r.body), &counts, &r.id))
@@ -2281,10 +2397,48 @@ async fn list_worlds(
     Json(json!({ "worlds": worlds })).into_response()
 }
 
-async fn get_world(State(s): State<Arc<Authored>>, Path(wid): Path<String>) -> Response {
+/// Every record of `reg`, kept in `folder`, as the caller sees them: an admin
+/// sees their own drafts over the published records (§10.3), anyone else the
+/// published ones.
+async fn seen_all(
+    s: &Authored,
+    headers: &HeaderMap,
+    reg: &RwLock<Registry>,
+    folder: &str,
+) -> Vec<Record> {
+    let admin = caller::admin(s, headers);
+    let reg = reg.read().await;
+    match &admin {
+        Some(author) => records::records(author, &reg, folder),
+        None => reg.iter().cloned().collect(),
+    }
+}
+
+/// Record `id` of `reg`, kept in `folder`, as the caller sees it.
+async fn seen(
+    s: &Authored,
+    headers: &HeaderMap,
+    reg: &RwLock<Registry>,
+    folder: &str,
+    id: &str,
+) -> Option<Record> {
+    let admin = caller::admin(s, headers);
+    let reg = reg.read().await;
+    match &admin {
+        Some(author) => records::record(author, &reg, folder, id),
+        None => reg.get(id).cloned(),
+    }
+}
+
+async fn get_world(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(wid): Path<String>,
+) -> Response {
+    let record = seen(&s, &headers, &s.worlds, WORLDS, &wid).await;
     let npcs = s.npcs.read().await;
     let counts = npcs.counts_by(|n| n.world_id.as_str());
-    match s.worlds.read().await.get(&wid) {
+    match record {
         Some(r) => {
             let mut body = with_count(with_id("world_id", &r.id, &r.body), &counts, &r.id);
             // The narrative clock, computed rather than stored: what is on disk
@@ -2314,10 +2468,19 @@ async fn get_world(State(s): State<Arc<Authored>>, Path(wid): Path<String>) -> R
 /// reset the speed.
 async fn put_world_time(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     Path(wid): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(current) = s.worlds.read().await.get(&wid).map(|r| r.body.clone()) else {
+    let author = match caller::author(&s, &headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    let current = {
+        let reg = s.worlds.read().await;
+        records::record(&author, &reg, WORLDS, &wid).map(|r| r.body)
+    };
+    let Some(current) = current else {
         return err(StatusCode::NOT_FOUND, "world_not_found", &wid);
     };
 
@@ -2356,16 +2519,15 @@ async fn put_world_time(
     }
 
     let next = Value::Object(clock::with_clock(&current, clock));
-    match s.worlds.write().await.put(&wid, next) {
-        Ok(()) => Json(clock.wire(now)).into_response(),
+    match records::save(&author, "world", WORLDS, &wid, &next) {
+        Ok(()) => {
+            s.wrote(&author).await;
+            Json(clock.wire(now)).into_response()
+        }
         Err(e) => registry_err(e),
     }
 }
 
-// No identity parameter on the four write handlers: the registration put them
-// behind `Role::Admin` and `guard` refused anything below it before this ran.
-// Taking the headers here only to re-derive an answer already given is how two
-// places end up disagreeing about one rule.
 /// The section libraries a world's lens is assembled from.
 ///
 /// The same answer for every world, deliberately: responses and moods are
@@ -2373,12 +2535,13 @@ async fn put_world_time(
 /// is per-world because the console asks it per-world and because a world will
 /// one day be able to override a collection — when it can, this is where that
 /// happens.
-async fn world_collections(State(s): State<Arc<Authored>>, Path(wid): Path<String>) -> Response {
-    let Some(excludes) = s
-        .worlds
-        .read()
+async fn world_collections(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(wid): Path<String>,
+) -> Response {
+    let Some(excludes) = seen(&s, &headers, &s.worlds, WORLDS, &wid)
         .await
-        .get(&wid)
         .map(|r| collections::excludes_of(&r.body))
     else {
         return err(StatusCode::NOT_FOUND, "world_not_found", &wid);
@@ -2393,14 +2556,12 @@ async fn world_collections(State(s): State<Arc<Authored>>, Path(wid): Path<Strin
 /// [`collections::personality_wire`].
 async fn personality_collections(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     Path(aid): Path<String>,
 ) -> Response {
-    let Some(body) = s
-        .personalities
-        .read()
+    let Some(body) = seen(&s, &headers, &s.personalities, PERSONALITIES, &aid)
         .await
-        .get(&aid)
-        .map(|r| r.body.clone())
+        .map(|r| r.body)
     else {
         return err(StatusCode::NOT_FOUND, "personality_not_found", &aid);
     };
@@ -2409,22 +2570,23 @@ async fn personality_collections(
 
 async fn put_world(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     Path(wid): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    save(&s.worlds, "world_id", &wid, body).await
+    save(&s, &headers, "world", WORLDS, "world_id", &wid, body).await
 }
 
-/// Delete a world: its document, and the world running from it — stopped, and
-/// its state records tombstoned (`docs/replicated_substrate.md` §9.1).
-async fn delete_world(State(s): State<Arc<Authored>>, Path(wid): Path<String>) -> Response {
-    let removed = remove(&s.worlds, "world_not_found", &wid).await;
-    if removed.status().is_success() {
-        if let Some(rt) = s.runtime.as_ref() {
-            rt.remove_world(&wid);
-        }
-    }
-    removed
+/// Delete a world's document. The world running from it stops — and its
+/// state records are tombstoned (`docs/replicated_substrate.md` §9.1) — once
+/// the document is gone from the folder: at once over a mind that keeps no
+/// drafts, when the deletion is published over one that does.
+async fn delete_world(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(wid): Path<String>,
+) -> Response {
+    remove(&s, &headers, WORLDS, "world_not_found", &wid).await
 }
 
 /// Every personality, minus the hidden ones the filter has not named.
@@ -2436,14 +2598,14 @@ async fn delete_world(State(s): State<Arc<Authored>>, Path(wid): Path<String>) -
 async fn list_personalities(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let query = q.get("q").map(String::as_str).unwrap_or_default();
     let reveal = revealing(&s, &headers, &q);
     let npcs = s.npcs.read().await;
     let counts = npcs.counts_by(|n| n.personality_id.as_str());
-    let reg = s.personalities.read().await;
-    let personalities: Vec<Value> = reg
+    let personalities: Vec<Value> = seen_all(&s, &headers, &s.personalities, PERSONALITIES)
+        .await
         .iter()
         .filter(|r| reveal || visibility::listable(&r.id, &r.body, query))
         .map(|r| {
@@ -2457,10 +2619,15 @@ async fn list_personalities(
     Json(json!({ "personalities": personalities })).into_response()
 }
 
-async fn get_personality(State(s): State<Arc<Authored>>, Path(aid): Path<String>) -> Response {
+async fn get_personality(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(aid): Path<String>,
+) -> Response {
+    let record = seen(&s, &headers, &s.personalities, PERSONALITIES, &aid).await;
     let npcs = s.npcs.read().await;
     let counts = npcs.counts_by(|n| n.personality_id.as_str());
-    match s.personalities.read().await.get(&aid) {
+    match record {
         Some(r) => Json(with_portrait_image(
             with_count(with_id("personality_id", &r.id, &r.body), &counts, &r.id),
             &s,
@@ -2479,16 +2646,22 @@ async fn get_personality(State(s): State<Arc<Authored>>, Path(aid): Path<String>
 /// this only adds the id the image route answers to, which is a fact about this
 /// daemon's store and not about the document.
 fn with_portrait_image(mut v: Value, s: &Authored, id: &str) -> Value {
-    let Some(image_id) = s.personality_portraits.get(id) else {
+    let Some(image_id) = s
+        .personality_portraits
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .cloned()
+    else {
         return v;
     };
     let Some(map) = v.as_object_mut() else {
         return v;
     };
-    map.entry(crate::personality_portrait::FIELD)
+    map.entry(personality_portrait::FIELD)
         .or_insert_with(|| json!({}));
     if let Some(p) = map
-        .get_mut(crate::personality_portrait::FIELD)
+        .get_mut(personality_portrait::FIELD)
         .and_then(Value::as_object_mut)
     {
         p.insert("image_id".to_string(), json!(image_id));
@@ -2498,22 +2671,50 @@ fn with_portrait_image(mut v: Value, s: &Authored, id: &str) -> Value {
 
 async fn put_personality(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     Path(aid): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    save(&s.personalities, "personality_id", &aid, body).await
+    save(
+        &s,
+        &headers,
+        "personality",
+        PERSONALITIES,
+        "personality_id",
+        &aid,
+        body,
+    )
+    .await
 }
 
-async fn delete_personality(State(s): State<Arc<Authored>>, Path(aid): Path<String>) -> Response {
-    remove(&s.personalities, "personality_not_found", &aid).await
+async fn delete_personality(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(aid): Path<String>,
+) -> Response {
+    remove(&s, &headers, PERSONALITIES, "personality_not_found", &aid).await
 }
 
-/// Shared save path.
+/// Shared save path: the calling admin's write of record `id` of the
+/// collection kept in `folder` — a draft over a mind under git, what stands
+/// over one that is not (§10.3).
 ///
 /// The id is taken from the URL and the body's own id field is discarded rather
 /// than trusted: a document that could name its own file is a document that
 /// could name somebody else's.
-async fn save(reg: &RwLock<Registry>, key: &str, id: &str, mut body: Value) -> Response {
+async fn save(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+    kind: &str,
+    folder: &str,
+    key: &str,
+    id: &str,
+    mut body: Value,
+) -> Response {
+    let author = match caller::author(s, headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
     if let Some(map) = body.as_object_mut() {
         map.remove(key);
         // `npc_count` is computed at read time, exactly like the id, and for
@@ -2531,15 +2732,32 @@ async fn save(reg: &RwLock<Registry>, key: &str, id: &str, mut body: Value) -> R
             "the body must be a JSON object",
         );
     }
-    match reg.write().await.put(id, body.clone()) {
-        Ok(()) => Json(with_id(key, id, &body)).into_response(),
+    match records::save(&author, kind, folder, id, &body) {
+        Ok(()) => {
+            s.wrote(&author).await;
+            Json(with_id(key, id, &body)).into_response()
+        }
         Err(e) => registry_err(e),
     }
 }
 
-async fn remove(reg: &RwLock<Registry>, missing: &str, id: &str) -> Response {
-    match reg.write().await.delete(id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+/// Shared remove path, as the calling admin.
+async fn remove(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+    folder: &str,
+    missing: &str,
+    id: &str,
+) -> Response {
+    let author = match caller::author(s, headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    match records::remove(&author, folder, id) {
+        Ok(true) => {
+            s.wrote(&author).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => err(StatusCode::NOT_FOUND, missing, id),
         Err(e) => registry_err(e),
     }
@@ -2610,7 +2828,12 @@ mod tests {
         // test that seeds a personality with a portrait exercises the path the
         // daemon takes rather than a hand-built map that cannot disagree with it.
         let personalities = Registry::load("personality", base.join("personalities")).unwrap();
-        let images = Images::new(&base);
+        // A real substrate, in the test's own directory — the registry has no
+        // in-memory mode, and one that only existed for tests would be a
+        // second code path exercised by nothing else.
+        let npcs = Npcs::load(&base).unwrap();
+        let accounts = Accounts::open(npcs.substrate(), &base.join("accounts")).unwrap();
+        let (images, _) = Images::open(npcs.substrate(), &base.join("images")).unwrap();
         let personality_portraits = crate::personality_portrait::ingest(
             &personalities,
             &base.join("personalities"),
@@ -2619,11 +2842,8 @@ mod tests {
         Arc::new(Authored::new(
             Registry::load("world", base.join("worlds")).unwrap(),
             personalities,
-            Accounts::load(base.join("accounts")).unwrap(),
-            // A real substrate, in the test's own directory — the registry has
-            // no in-memory mode, and one that only existed for tests would be a
-            // second code path exercised by nothing else.
-            Npcs::load(&base).unwrap(),
+            accounts,
+            npcs,
             // Parsed from YAML rather than built by hand, so these tests fail
             // if the config shape the deployment writes stops matching the type
             // the daemon reads.
@@ -3366,6 +3586,12 @@ mod tests {
                 ("/v1/mind/entry", "admin"),
                 ("/v1/mind/fields", "user"),
                 ("/v1/mind/fields", "admin"),
+                // An admin's drafts: read anywhere, discarded and published on
+                // the best member.
+                ("/v1/mind/drafts", "admin"),
+                ("/v1/mind/drafts", "admin"),
+                ("/v1/mind/publish", "admin"),
+                ("/v1/mind/sync", "admin"),
                 // The cast: signed in, then ownership per record. Two
                 // registrations because the listing reads anywhere and the
                 // create goes to the best member.
@@ -3513,6 +3739,7 @@ mod tests {
                 ("/v1/pulse/operations/:wid/:oid", "admin"),
                 ("/v1/pulse/operations/:wid/:oid/cancel", "admin"),
                 ("/v1/pulse/operations/:wid/:oid/step", "admin"),
+                ("/v1/pulse/operations/:wid/:oid/retry", "admin"),
                 ("/v1/pulse/operations/:wid/:oid/document", "admin"),
                 // Generation on the resident model, over the caller's own cast.
                 ("/v1/generate/description", "user"),
@@ -4365,15 +4592,18 @@ mod tests {
     #[tokio::test]
     async fn without_a_mind_the_editor_says_it_has_nothing_to_edit() {
         let base = tmp("mind-none");
+        let npcs = Npcs::load(&base).unwrap();
+        let accounts = Accounts::open(npcs.substrate(), &base.join("accounts")).unwrap();
+        let (images, _) = Images::open(npcs.substrate(), &base.join("images")).unwrap();
         let st = Arc::new(Authored::new(
             Registry::load("world", base.join("worlds")).unwrap(),
             Registry::load("personality", base.join("personalities")).unwrap(),
-            Accounts::load(base.join("accounts")).unwrap(),
-            Npcs::load(&base).unwrap(),
+            accounts,
+            npcs,
             serde_yaml::from_str(&format!("admins:\n  - sub: {ADMIN}\n")).unwrap(),
             crate::collections::Libraries::load(&crate::projection::Source::resolve(None).unwrap()),
             Mind::new(None),
-            Images::new(&base),
+            images,
             BTreeMap::new(),
         ));
         let (s, v) = call(router(st), get("/v1/mind/list", Some("google-1"))).await;
@@ -5237,15 +5467,18 @@ layers:
     #[test]
     fn a_daemon_with_no_mind_lists_the_bundled_layers() {
         let base = tmp("schema-layers-bundled");
+        let npcs = Npcs::load(&base).unwrap();
+        let accounts = Accounts::open(npcs.substrate(), &base.join("accounts")).unwrap();
+        let (images, _) = Images::open(npcs.substrate(), &base.join("images")).unwrap();
         let st = Arc::new(Authored::new(
             Registry::load("world", base.join("worlds")).unwrap(),
             Registry::load("personality", base.join("personalities")).unwrap(),
-            Accounts::load(base.join("accounts")).unwrap(),
-            Npcs::load(&base).unwrap(),
+            accounts,
+            npcs,
             serde_yaml::from_str(&format!("admins:\n  - sub: {ADMIN}\n")).unwrap(),
             Libraries::load(&Source::resolve(None).unwrap()),
             Mind::new(None),
-            Images::new(&base),
+            images,
             BTreeMap::new(),
         ));
         let names: Vec<String> = schema_layers(&st)

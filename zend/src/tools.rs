@@ -39,13 +39,18 @@ use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
+use agent::client::Agents;
+use host::cluster::Join;
+use tokio::runtime::Handle;
+use zend_tools::executor::Executor;
 use zend_tools::sandboxes::Sandboxes;
 use zend_tools::state::Secrets;
 use zend_tools::{alias_pins, registry, replay, Replay, ToolContext};
-use zend_vfs::{RepoFiles, Workspace};
+use zend_vfs::sandbox::programs;
+use zend_vfs::{RepoFiles, Workspace, JOBS_DIR};
 
 use crate::access;
-use crate::sandbox_programs;
+use crate::agent_exec::AgentExecutor;
 use crate::tool_guidance;
 use crate::types::ToolMode;
 
@@ -765,16 +770,44 @@ impl ToolHost {
     /// reads fall through to when the session layer has no entry, whose every
     /// context carries `secrets` — read once by the daemon at launch
     /// ([`crate::secrets::load`]) — and whose commands run in a sandbox per git
-    /// repository, starting the programs [`sandbox_programs`] lists. Fails
+    /// repository, starting the programs [`programs`] lists. Fails
     /// only when the workspace's jobs folder cannot be made.
     pub fn new(workspace: &Workspace, secrets: Arc<Secrets>) -> io::Result<Self> {
-        let sandboxes = Sandboxes::for_workspace(workspace, &sandbox_programs::policy())?;
+        let sandboxes = Sandboxes::for_workspace(workspace, &programs::policy())?;
+        Ok(Self::on(workspace, secrets, Arc::new(sandboxes)))
+    }
+
+    /// The host this daemon runs with: commands and pushes on agents when it
+    /// is a member of `cluster` (§11.5) — reaching the agent in its own
+    /// process while cut off, with `--agent` — and on its own checkouts
+    /// otherwise.
+    pub fn deployed(
+        workspace: &Workspace,
+        secrets: Arc<Secrets>,
+        cluster: Option<&Join>,
+    ) -> anyhow::Result<Self> {
+        let Some(join) = cluster else {
+            return Ok(Self::new(workspace, secrets)?);
+        };
+        let member = join
+            .link()
+            .member()
+            .ok_or_else(|| anyhow::anyhow!("the cluster's member was never started"))?;
+        let agents = Agents::new(Arc::clone(member), join.in_process_agent());
+        let executor =
+            AgentExecutor::new(agents, Handle::current(), workspace.root().join(JOBS_DIR));
+        Ok(Self::on(workspace, secrets, Arc::new(executor)))
+    }
+
+    /// A host whose commands run, and whose pushes are made, by `executor` —
+    /// agents, for a daemon given `--cluster` (§11.5).
+    pub fn on(workspace: &Workspace, secrets: Arc<Secrets>, executor: Arc<dyn Executor>) -> Self {
         let base = ToolContext::with_workspace(workspace.clone())
             .with_secrets(secrets)
-            .with_sandboxes(Arc::new(sandboxes));
+            .with_executor(executor);
         let contexts =
             ToolMode::ALL.map(|mode| Arc::new(base.clone().granting(access::grants(mode))));
-        Ok(Self { contexts })
+        Self { contexts }
     }
 
     /// A new conversation's own file stores: an overlay over each repository
@@ -788,9 +821,14 @@ impl ToolHost {
     }
 
     /// The context a round of tools in `mode` runs in, for the conversation
-    /// whose file stores are `files`.
-    pub fn context_for(&self, mode: ToolMode, files: &Arc<RepoFiles>) -> Arc<ToolContext> {
-        Arc::new(self.contexts[mode.level() as usize].with_files(Arc::clone(files)))
+    /// `lineage` whose file stores are `files`.
+    pub fn context_for(
+        &self,
+        mode: ToolMode,
+        files: &Arc<RepoFiles>,
+        lineage: &str,
+    ) -> Arc<ToolContext> {
+        Arc::new(self.contexts[mode.level() as usize].with_files(Arc::clone(files), lineage))
     }
 }
 
@@ -847,7 +885,7 @@ mod tests {
     fn dispatch_refuses_an_alias_its_arguments_contradict() {
         let dir = tempfile::tempdir().unwrap();
         let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
-        let ctx = host.context_for(ToolMode::Comprehensive, &host.conversation_files());
+        let ctx = host.context_for(ToolMode::Comprehensive, &host.conversation_files(), "c1");
         let out = run_tool(
             &ctx,
             &ToolCall {
@@ -898,7 +936,9 @@ mod tests {
         let files = host.conversation_files();
         for mode in ToolMode::ALL {
             assert_eq!(
-                host.context_for(mode, &files).secrets.tavily_api_key(),
+                host.context_for(mode, &files, "c1")
+                    .secrets
+                    .tavily_api_key(),
                 Some("tvly-wired-through"),
                 "{} lost the daemon's secrets",
                 mode.id()
@@ -916,11 +956,12 @@ mod tests {
         let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
         let files = host.conversation_files();
         for mode in ToolMode::ALL {
-            let ctx = host.context_for(mode, &files);
+            let ctx = host.context_for(mode, &files, "c1");
             assert_eq!(ctx.grants(), access::grants(mode), "{}", mode.id());
             assert!(Arc::ptr_eq(&ctx.files, &files), "{}", mode.id());
+            assert_eq!(ctx.lineage(), "c1", "{}", mode.id());
         }
-        let restricted = host.context_for(ToolMode::Restricted, &files);
+        let restricted = host.context_for(ToolMode::Restricted, &files, "c1");
         for (name, arguments) in [
             (
                 "web_fetch",
@@ -953,7 +994,7 @@ mod tests {
         }
         // Comprehensive reaches the sandboxes — here to be told the folder is
         // not a git repository, so there is none for it.
-        let comprehensive = host.context_for(ToolMode::Comprehensive, &files);
+        let comprehensive = host.context_for(ToolMode::Comprehensive, &files, "c1");
         let call = ToolCall {
             name: "run_command".to_string(),
             arguments: serde_json::json!({ "repo": "r", "program": "npm", "args": ["test"] }),
@@ -968,7 +1009,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
         assert_eq!(
-            host.context_for(ToolMode::Restricted, &host.conversation_files())
+            host.context_for(ToolMode::Restricted, &host.conversation_files(), "c1")
                 .secrets
                 .tavily_api_key(),
             None
@@ -985,8 +1026,8 @@ mod tests {
         std::fs::write(dir.path().join("r/shared.txt"), "disk\n").unwrap();
         let host = ToolHost::new(&workspace_in(&dir), no_secrets()).unwrap();
         let (a, b) = (host.conversation_files(), host.conversation_files());
-        let in_a = host.context_for(ToolMode::Comprehensive, &a);
-        let in_b = host.context_for(ToolMode::Comprehensive, &b);
+        let in_a = host.context_for(ToolMode::Comprehensive, &a, "a");
+        let in_b = host.context_for(ToolMode::Comprehensive, &b, "b");
 
         in_a.files
             .repo("r")
@@ -1005,7 +1046,7 @@ mod tests {
         );
         assert_eq!(b_store.read("only_a.txt").unwrap(), None);
         // A later round of the same conversation sees its own change.
-        let again = host.context_for(ToolMode::Comprehensive, &a);
+        let again = host.context_for(ToolMode::Comprehensive, &a, "a");
         assert_eq!(
             again
                 .files

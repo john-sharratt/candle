@@ -21,6 +21,11 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
+use crate::mind::{catalog, parts, Address, Mind};
+use crate::sim::shelf::Published;
+
 /// The schema compiled into the binary — `npcd/projection.yaml`, the checked-in
 /// default. Embedded rather than read from the source tree so a released binary
 /// carries a working schema with no files beside it.
@@ -64,12 +69,14 @@ pub struct Source {
 ///
 /// Used by `/v1/schema/layers`, and by the substrate view, which needs to know
 /// what the layers *are* before it can report that every one of them is empty.
-pub fn layers(mind: &crate::mind::Mind) -> Option<Vec<serde_json::Value>> {
-    let root = mind.root()?;
-    let addr = crate::mind::Address::parse("settings/projection").ok()??;
+pub fn layers(mind: &Mind) -> Option<Vec<Value>> {
+    let published = Published {
+        root: mind.root()?.to_path_buf(),
+    };
+    let addr = Address::parse("settings/projection").ok()??;
     let (list_key, id_key) = addr.parts()?;
-    let doc = crate::mind::catalog::read(root, &addr).ok()?;
-    let items = crate::mind::parts::list(&doc.text, list_key, id_key).ok()?;
+    let doc = catalog::read(&published, &addr).ok()?;
+    let items = parts::list(&doc.text, list_key, id_key).ok()?;
     Some(items.into_iter().map(|(_, v)| v).collect())
 }
 
@@ -78,7 +85,7 @@ pub fn layers(mind: &crate::mind::Mind) -> Option<Vec<serde_json::Value>> {
 /// The pair the ingest needs: a layer with an `ingest_unit:` is a turn sink, and
 /// the unit is what the loading screen counts. Read through [`layers`] rather
 /// than parsing the schema again, so there is one reading of the document.
-pub fn ingest_units(mind: &crate::mind::Mind) -> Vec<(String, Option<String>)> {
+pub fn ingest_units(mind: &Mind) -> Vec<(String, Option<String>)> {
     layers(mind)
         .unwrap_or_default()
         .into_iter()

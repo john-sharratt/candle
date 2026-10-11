@@ -15,6 +15,7 @@
 //!   and relaying; dialling, claims and the member's own listener.
 //! - [`replicate`]: a member's substrate replication — events out and in,
 //!   catch-ups, and the rejoin after a cut-off.
+//! - [`machine`]: the host as `CAPACITY` reports it.
 //! - [`version`]: this build's `count`, `hash` and `local`.
 //!
 //! No candle and no CUDA: the gateway links this crate, and a record inside an
@@ -32,6 +33,7 @@ pub mod fragment;
 pub mod frame;
 pub mod gateway;
 pub mod handshake;
+pub mod machine;
 pub mod member;
 pub mod pipe;
 pub mod replicate;

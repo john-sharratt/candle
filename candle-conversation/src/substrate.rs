@@ -68,7 +68,7 @@ use crate::index_pages::{self, StoredPages};
 use crate::normalization::Phase;
 use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
 use crate::persistence::deleted::{DeletedKey, DeletedPayload, DeletedTimeline};
-use crate::persistence::identity::RecordIdentity;
+use crate::persistence::identity::{RecordIdentity, VersionStamp};
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
@@ -4030,6 +4030,15 @@ impl Substrate {
         })
     }
 
+    /// The version stamp of `timeline`'s first declared turn — what orders two
+    /// members' ingests of one unit (`docs/replicated_substrate.md` §10.4): the
+    /// lower is the unit. `None` for a timeline with no turn declared.
+    pub fn first_turn_stamp(&self, timeline: u64) -> Option<VersionStamp> {
+        self.turn_streams_of(timeline)
+            .next()
+            .map(|(_, _, rt)| rt.ids.decl.stamp())
+    }
+
     /// Every timeline with a declared turn.
     pub fn timelines_with_turns(&self) -> impl Iterator<Item = u64> + '_ {
         self.streams.timelines()
@@ -5965,6 +5974,8 @@ impl Substrate {
             // holds no opinion about them either.
             | RecordType::VfsEvent
             | RecordType::VfsTombstone
+            // Blobs are located by the persistence layer too (`BlobIndex`).
+            | RecordType::Blob
             // What this member has applied of other origins is the persistence
             // layer's to keep (`persistence::replica`), and so are the
             // generations fixed for what it wrote cut off

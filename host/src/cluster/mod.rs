@@ -5,7 +5,6 @@
 //!
 //! | Module | |
 //! |---|---|
-//! | [`dial`] | one socket's connection: TLS, the certificate's name, the WebSocket |
 //! | [`serve`] | a request a gateway sent over a socket, served by this host's router |
 //! | [`flush`] | its response ending only after the events it caused (§6.4) |
 //! | [`listener`] | the own listener: forward up when joined, serve when cut off (§5.8) |
@@ -18,10 +17,11 @@
 //! | [`view`] | the `cluster` block of `/v1/status`, and the `connecting` and `catchup` steps |
 //!
 //! The protocol — handshake, sessions, claims, reconnects, replication — is
-//! the `cluster` crate's [`AppMember`]; this module is its process.
+//! the `cluster` crate's [`AppMember`]; one socket's connection — TLS, the
+//! certificate's name, the WebSocket — is `cluster-dial`'s; this module is its
+//! process.
 
 pub mod capacity;
-pub mod dial;
 pub mod disk;
 pub mod flush;
 pub mod leave;
@@ -37,24 +37,30 @@ use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::thread::{available_parallelism, sleep};
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use agent::checkouts::Checkouts;
+use agent::config::AgentConfig;
+use agent::jobs::Jobs;
+use agent::member::{node_in, Agent, APP as AGENT_APP};
 use axum::Router;
 use candle_conversation::phase_ring::latest_wave;
 use cluster::dispatch::RouteTable;
-use cluster::frame::{BuildId, MemberState, ModelId};
+use cluster::frame::{BuildId, MemberState, ModelId, RepoAd};
 use cluster::handshake::GroupKey;
+use cluster::machine::measure;
 use cluster::member::{AppMember, ClusterView, Identity, Link};
 use cluster::replicate::{CatchupView, Phase, Replication, ReplicationView};
 use cluster::version::this_build;
-use sysinfo::System;
+use cluster_dial::{tls_connector, Dial, Target};
 use tokio::runtime::Handle;
 use tokio::time::interval;
 use tokio_rustls::TlsConnector;
+use zend_vfs::sandbox::programs::policy;
+use zend_vfs::Priority;
 
-use capacity::{capacity, Machine, Wave};
-use dial::{tls_connector, Dial, Target};
+use capacity::{capacity, Wave};
 
 use crate::telemetry::Telemetry;
 use crate::tenant::Reports;
@@ -79,6 +85,8 @@ pub struct ClusterSettings {
     pub host: String,
     /// The build this member reports: this binary's ([`this_build`]).
     pub build: BuildId,
+    /// `--agent`: the in-process agent's file, its checkouts and slots.
+    pub agent: Option<AgentConfig>,
 }
 
 impl ClusterSettings {
@@ -90,11 +98,15 @@ impl ClusterSettings {
         key: Option<&Path>,
         affinity_idle: Duration,
         quorum_max: Option<u32>,
+        agent: Option<&Path>,
         host: String,
     ) -> anyhow::Result<Option<ClusterSettings>> {
         if urls.is_empty() {
             if key.is_some() {
                 anyhow::bail!("--group-key names a cluster's key, and no --cluster is given");
+            }
+            if agent.is_some() {
+                anyhow::bail!("--agent joins a cluster's agents, and no --cluster is given");
             }
             if quorum_max.is_some() {
                 anyhow::bail!(
@@ -120,6 +132,7 @@ impl ClusterSettings {
             quorum_max,
             host,
             build: this_build(),
+            agent: agent.map(AgentConfig::load).transpose()?,
         }))
     }
 }
@@ -135,6 +148,8 @@ pub struct Cluster {
     /// This host's whole router, which serves the requests gateways send.
     router: OnceLock<Router>,
     links: BTreeMap<&'static str, Arc<AppLink>>,
+    /// The agent in this process, with `--agent` (§11.5).
+    agent: Option<Arc<Jobs>>,
 }
 
 /// One tenant's app: unjoined until the tenant opens its substrate and
@@ -149,6 +164,8 @@ pub struct AppLink {
     /// The `oseq` of the last record the tenant's substrate wrote, for
     /// `UNCLAIM`'s `through`.
     own_oseq: OnceLock<Box<dyn Fn() -> u64 + Send + Sync>>,
+    /// The repositories the tenant holds, for `HELLO` (§10.1).
+    repos: OnceLock<Vec<RepoAd>>,
 }
 
 impl Cluster {
@@ -159,10 +176,16 @@ impl Cluster {
         telemetry: Arc<Telemetry>,
         runtime: Handle,
     ) -> anyhow::Result<Arc<Cluster>> {
-        let targets = settings.targets.iter().cloned().map(Arc::new).collect();
+        let targets: Vec<Arc<Target>> = settings.targets.iter().cloned().map(Arc::new).collect();
+        let tls = tls_connector()?;
+        let agent = match &settings.agent {
+            Some(cfg) => Some(start_agent(&settings, cfg, &targets, &tls, &runtime)?),
+            None => None,
+        };
         Ok(Arc::new(Cluster {
             targets,
-            tls: tls_connector()?,
+            agent,
+            tls,
             build: settings.build.clone(),
             runtime,
             telemetry,
@@ -178,6 +201,7 @@ impl Cluster {
                             ready: AtomicBool::new(false),
                             member: OnceLock::new(),
                             own_oseq: OnceLock::new(),
+                            repos: OnceLock::new(),
                         }),
                     )
                 })
@@ -188,6 +212,11 @@ impl Cluster {
 
     pub fn link(&self, app: &str) -> Option<&Arc<AppLink>> {
         self.links.get(app)
+    }
+
+    /// The agent in this process, with `--agent`.
+    pub fn agent(&self) -> Option<&Arc<Jobs>> {
+        self.agent.as_ref()
     }
 
     pub fn links(&self) -> impl Iterator<Item = &Arc<AppLink>> {
@@ -228,7 +257,6 @@ impl Cluster {
         };
         let telemetry = self.telemetry.clone();
         let ready = link.clone();
-        let cores = available_parallelism().map_or(1, |n| n.get()) as u16;
         let member = AppMember::new(
             Identity {
                 app: link.app.to_string(),
@@ -236,7 +264,7 @@ impl Cluster {
                 host: self.settings.host.clone(),
                 build: self.build.clone(),
                 model,
-                repos: Vec::new(),
+                repos: link.repos.get().cloned().unwrap_or_default(),
             },
             self.settings.key.clone(),
             self.targets.iter().map(|t| t.url.clone()).collect(),
@@ -255,16 +283,7 @@ impl Cluster {
                     used_mib: w.sample.used_mib,
                     budget_mib: w.sample.budget_mib,
                 });
-                let load = System::load_average();
-                capacity(
-                    state,
-                    telemetry.capacity(),
-                    wave,
-                    Machine {
-                        cores,
-                        load_milli: (load.one * 1000.0) as u32,
-                    },
-                )
+                capacity(state, telemetry.capacity(), wave, measure())
             }),
             replication,
             Instant::now(),
@@ -317,6 +336,46 @@ impl Cluster {
     }
 }
 
+/// `--agent`: open the agent file's checkouts and join every cluster's agents
+/// on a socket of its own, beside the tenants' (§11.5). Its node is kept in
+/// its jobs folder, apart from any tenant's substrate.
+///
+/// It is an agent at low priority: the host runs a model member too, so its
+/// commands run below normal priority — a build never takes the processor the
+/// decode needs — and the gateways send its jobs to it only when no dedicated
+/// agent can take them.
+fn start_agent(
+    settings: &ClusterSettings,
+    cfg: &AgentConfig,
+    targets: &[Arc<Target>],
+    tls: &TlsConnector,
+    runtime: &Handle,
+) -> anyhow::Result<Arc<Jobs>> {
+    let checkouts = Checkouts::open(cfg, &policy())?;
+    let jobs = Jobs::new(checkouts, cfg.slots(measure().cores), Priority::Below);
+    let node = node_in(&cfg.jobs_dir)?;
+    let _on = runtime.enter();
+    let agent = Agent::new(
+        node,
+        settings.host.clone(),
+        settings.key.clone(),
+        targets.iter().map(|t| t.url.clone()).collect(),
+        Arc::clone(&jobs),
+    );
+    for (c, target) in targets.iter().enumerate() {
+        agent.dial(
+            c,
+            Dial {
+                target: Arc::clone(target),
+                app: AGENT_APP,
+                tls: tls.clone(),
+            },
+        );
+    }
+    tracing::info!(node = %format!("{node:016x}"), "joined the cluster's agents in process");
+    Ok(jobs)
+}
+
 /// Every second, tell each app's gateways whether its tenant is ready — the
 /// state `CAPACITY` carries, and what makes the app clustered.
 pub fn watch_readiness(tenants: Vec<(Arc<AppLink>, Arc<dyn Reports>)>) {
@@ -351,6 +410,13 @@ impl AppLink {
     /// The app's dispatch table, once the host has merged its routes.
     pub fn set_routes(&self, routes: RouteTable) {
         let _ = self.routes.set(routes);
+    }
+
+    /// The repositories the tenant holds, before it joins: its `HELLO`
+    /// advertises them, and `Sticky` and `Best` consider only members holding
+    /// a conversation's repositories (§10.1).
+    pub fn set_repos(&self, repos: Vec<RepoAd>) {
+        let _ = self.repos.set(repos);
     }
 
     /// The tenant finished loading, or went back to it: `CAPACITY` says so at
@@ -413,6 +479,12 @@ impl Join {
 
     pub fn link(&self) -> &Arc<AppLink> {
         &self.link
+    }
+
+    /// The agent in this process, with `--agent`: what the tenant's jobs go
+    /// to while it is cut off from every cluster (§11.5).
+    pub fn in_process_agent(&self) -> Option<Arc<Jobs>> {
+        self.cluster.agent().cloned()
     }
 
     /// Dial every cluster as `node`, the substrate bound to `model` and

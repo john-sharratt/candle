@@ -1,9 +1,12 @@
-//! What a sandbox run hands back.
+//! What a sandbox run hands back — in process, or from an agent as JSON
+//! (`docs/replicated_substrate.md` §11.4).
+
+use serde::{Deserialize, Serialize};
 
 use crate::file_delta::TimedDelta;
 
 /// What the command printed, as its sink took it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Output {
     /// How many bytes the command wrote to its two streams together.
     pub bytes: u64,
@@ -14,7 +17,7 @@ pub struct Output {
 
 /// A file the command changed, as the delta the conversation's store now
 /// holds for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedFile {
     /// Repository-relative, `/`-separated.
     pub path: String,
@@ -24,7 +27,7 @@ pub struct ChangedFile {
 /// A file the command changed that the conversation's store could not take —
 /// a binary file, or one that would put the store over its size cap. The
 /// change is reported here rather than lost.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unrecorded {
     pub path: String,
     pub delta: TimedDelta,
@@ -33,7 +36,7 @@ pub struct Unrecorded {
 }
 
 /// Everything one run produced besides its output, which went to the sink.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunOutcome {
     /// The command's exit code; `None` when it was killed or ended by a
     /// signal.

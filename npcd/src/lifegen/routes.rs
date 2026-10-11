@@ -14,17 +14,19 @@
 //! A path built from a URL is worth two checks in two files. One of them would
 //! be a comment saying the caller had better have been careful.
 //!
-//! # Editing writes through to disk immediately
+//! # A save keeps the plan and its documents together
 //!
-//! A save writes the plan, regenerates the affected documents and lets the
-//! watcher ingest them. There is no separate publish step, because a plan and a
-//! directory that disagree is a state somebody would have to reconcile by hand
-//! — and the documents are cheap to write.
+//! A save keeps the plan and regenerates the affected documents in one commit
+//! — a plan and a folder that disagree is a state somebody would have to
+//! reconcile by hand. It is the calling admin's: their draft over a mind under
+//! git, published from the console with the rest of what they wrote and
+//! ingested once it is in the mind folder; the folder itself over a mind that
+//! is not (`docs/replicated_substrate.md` §10.3).
 
 use std::sync::Arc;
 
 use axum::extract::{Path as UrlPath, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -39,6 +41,7 @@ use super::job::NotStarted;
 use super::plan::{self, NodeId, Phase, Plan};
 use super::seed::{check, Seed};
 use crate::api::Authored;
+use crate::drafts::{caller, Author};
 
 /// What one rung of the ladder may write.
 ///
@@ -97,8 +100,6 @@ fn refuse(code: StatusCode, kind: &str, detail: &str) -> Refusal {
     Box::new(err(code, kind, detail))
 }
 
-/// Resolve a character id to a mind root, refusing anything the registry does
-/// not know.
 /// The character's own idiom, from the personality this life belongs to.
 ///
 /// Empty when there is no personality or it carries no anchor — a life still
@@ -113,14 +114,20 @@ pub(super) async fn voice_for(s: &Arc<Authored>, who: &str) -> String {
         .unwrap_or_default()
 }
 
-pub(super) async fn resolve(s: &Arc<Authored>, who: &str) -> Result<std::path::PathBuf, Refusal> {
-    let Some(mind) = s.mind.root() else {
+/// Resolve a character id to the calling admin's view of the mind, refusing
+/// anything the registry does not know.
+pub(super) async fn resolve(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+    who: &str,
+) -> Result<Arc<Author>, Refusal> {
+    if s.mind.root().is_none() {
         return Err(refuse(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_mind",
             "this daemon was started without a mind directory, so it has nowhere to write a life",
         ));
-    };
+    }
     if !plan::is_safe_id(who) {
         return Err(refuse(
             StatusCode::BAD_REQUEST,
@@ -131,12 +138,12 @@ pub(super) async fn resolve(s: &Arc<Authored>, who: &str) -> Result<std::path::P
     if s.personalities.read().await.get(who).is_none() {
         return Err(refuse(StatusCode::NOT_FOUND, "personality_not_found", who));
     }
-    Ok(mind.to_path_buf())
+    Ok(Arc::new(caller::author(s, headers)?))
 }
 
 /// Load the plan for a character, or report that there is not one.
-pub(super) fn open(mind: &std::path::Path, who: &str) -> Result<Plan, Refusal> {
-    match plan::load(mind, who) {
+pub(super) fn open(author: &Author, who: &str) -> Result<Plan, Refusal> {
+    match plan::load(author, who) {
         Ok(Some(p)) => Ok(p),
         Ok(None) => Err(refuse(
             StatusCode::NOT_FOUND,
@@ -151,30 +158,29 @@ pub(super) fn open(mind: &std::path::Path, who: &str) -> Result<Plan, Refusal> {
     }
 }
 
-/// Persist a plan and bring its documents into line with it.
-pub(super) fn commit(mind: &std::path::Path, p: &Plan) -> Result<Value, Refusal> {
-    let fail = |e: anyhow::Error| {
+/// Keep a plan and bring its documents into line with it, as `author`.
+pub(super) fn commit(author: &Author, p: &Plan) -> Result<Value, Refusal> {
+    let written = document::keep(author, p).map_err(|e| {
         refuse(
             StatusCode::INTERNAL_SERVER_ERROR,
             "life_write_failed",
             &format!("{e:#}"),
         )
-    };
-    if p.story.content.is_generated() {
-        document::write_story(mind, &p.seed.who, &p.story.content.text).map_err(fail)?;
-    }
-    let written = document::sync(mind, p).map_err(fail)?;
-    plan::save(mind, p).map_err(fail)?;
-    Ok(json!({ "documents": written }))
+    })?;
+    Ok(json!({ "documents": written, "drafted": author.keeps_drafts() }))
 }
 
 /// `GET /v1/life/:who` — the plan, with its counts.
-pub async fn get_life(State(s): State<Arc<Authored>>, UrlPath(who): UrlPath<String>) -> Response {
-    let mind = match resolve(&s, &who).await {
+pub async fn get_life(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    UrlPath(who): UrlPath<String>,
+) -> Response {
+    let author = match resolve(&s, &headers, &who).await {
         Ok(m) => m,
         Err(r) => return *r,
     };
-    match plan::load(&mind, &who) {
+    match plan::load(&*author, &who) {
         // A character with no plan is ordinary, not an error — the console
         // renders the seed form rather than a failure.
         Ok(None) => Json(json!({ "who": who, "plan": Value::Null })).into_response(),
@@ -206,10 +212,11 @@ pub async fn get_life(State(s): State<Arc<Authored>>, UrlPath(who): UrlPath<Stri
 /// would make the dates un-correctable in practice.
 pub async fn put_seed(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     UrlPath(who): UrlPath<String>,
     Json(mut body): Json<Seed>,
 ) -> Response {
-    let mind = match resolve(&s, &who).await {
+    let author = match resolve(&s, &headers, &who).await {
         Ok(m) => m,
         Err(r) => return *r,
     };
@@ -240,14 +247,19 @@ pub async fn put_seed(
     // let the `Err` arm fall through to a fresh empty plan, so a plan file that failed to
     // parse — the one moment the authored life is least recoverable — was replaced by a blank
     // one instead of reported.
-    if let Err(e) = plan::load(&mind, &who) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "life_plan_unreadable",
-            &format!("the existing plan could not be read, so re-seeding would discard it: {e:#}"),
-        );
-    }
-    if let Ok(Some(old)) = plan::load(&mind, &who) {
+    let old = match plan::load(&*author, &who) {
+        Ok(old) => old,
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "life_plan_unreadable",
+                &format!(
+                    "the existing plan could not be read, so re-seeding would discard it: {e:#}"
+                ),
+            )
+        }
+    };
+    if let Some(old) = old {
         fresh.story = old.story.clone();
         for y in &mut fresh.years {
             let Some(was) = old.year(y.year) else {
@@ -262,7 +274,7 @@ pub async fn put_seed(
             }
         }
     }
-    match commit(&mind, &fresh) {
+    match commit(&author, &fresh) {
         Ok(v) => {
             Json(json!({ "plan": fresh, "counts": fresh.counts(), "written": v })).into_response()
         }
@@ -286,14 +298,15 @@ pub struct NodeEdit {
 /// the console can offer to bring the subtree back into line).
 pub async fn put_node(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     UrlPath((who, key)): UrlPath<(String, String)>,
     Json(body): Json<NodeEdit>,
 ) -> Response {
-    let mind = match resolve(&s, &who).await {
+    let author = match resolve(&s, &headers, &who).await {
         Ok(m) => m,
         Err(r) => return *r,
     };
-    let mut p = match open(&mind, &who) {
+    let mut p = match open(&author, &who) {
         Ok(p) => p,
         Err(r) => return *r,
     };
@@ -309,7 +322,7 @@ pub async fn put_node(
     };
     c.edit(body.title, body.text);
     let stale = p.mark_stale_below(id);
-    match commit(&mind, &p) {
+    match commit(&author, &p) {
         Ok(v) => Json(json!({ "node": key, "stale_below": stale, "written": v })).into_response(),
         Err(r) => *r,
     }
@@ -323,14 +336,15 @@ pub async fn put_node(
 /// calls cannot arise. See [`super::consequence`].
 pub async fn put_consequences(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     UrlPath((who, date)): UrlPath<(String, String)>,
     Json(body): Json<Vec<Consequence>>,
 ) -> Response {
-    let mind = match resolve(&s, &who).await {
+    let author = match resolve(&s, &headers, &who).await {
         Ok(m) => m,
         Err(r) => return *r,
     };
-    let mut p = match open(&mind, &who) {
+    let mut p = match open(&author, &who) {
         Ok(p) => p,
         Err(r) => return *r,
     };
@@ -384,7 +398,7 @@ pub async fn put_consequences(
             .into_response();
     }
 
-    match commit(&mind, &p) {
+    match commit(&author, &p) {
         Ok(v) => Json(json!({ "day": date, "written": v })).into_response(),
         Err(r) => *r,
     }
@@ -402,14 +416,15 @@ pub struct NewDay {
 /// `POST /v1/life/:who/day` — mark a day as one worth remembering.
 pub async fn post_day(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     UrlPath(who): UrlPath<String>,
     Json(body): Json<NewDay>,
 ) -> Response {
-    let mind = match resolve(&s, &who).await {
+    let author = match resolve(&s, &headers, &who).await {
         Ok(m) => m,
         Err(r) => return *r,
     };
-    let mut p = match open(&mind, &who) {
+    let mut p = match open(&author, &who) {
         Ok(p) => p,
         Err(r) => return *r,
     };
@@ -433,7 +448,7 @@ pub async fn post_day(
     if d.content.title.is_empty() {
         d.content.title = body.title;
     }
-    match commit(&mind, &p) {
+    match commit(&author, &p) {
         Ok(v) => Json(json!({ "day": body.date, "written": v })).into_response(),
         Err(r) => *r,
     }
@@ -445,13 +460,14 @@ pub async fn post_day(
 /// episode that has been written out of their history.
 pub async fn delete_day(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     UrlPath((who, date)): UrlPath<(String, String)>,
 ) -> Response {
-    let mind = match resolve(&s, &who).await {
+    let author = match resolve(&s, &headers, &who).await {
         Ok(m) => m,
         Err(r) => return *r,
     };
-    let mut p = match open(&mind, &who) {
+    let mut p = match open(&author, &who) {
         Ok(p) => p,
         Err(r) => return *r,
     };
@@ -466,7 +482,7 @@ pub async fn delete_day(
     if m.days.len() == before {
         return err(StatusCode::NOT_FOUND, "no_such_day", &date);
     }
-    match commit(&mind, &p) {
+    match commit(&author, &p) {
         Ok(v) => Json(json!({ "removed": date, "written": v })).into_response(),
         Err(r) => *r,
     }
@@ -487,14 +503,15 @@ pub struct GenerateRequest {
 /// `POST /v1/life/:who/generate` — run the ladder.
 pub async fn post_generate(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     UrlPath(who): UrlPath<String>,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
-    let mind = match resolve(&s, &who).await {
+    let author = match resolve(&s, &headers, &who).await {
         Ok(m) => m,
         Err(r) => return *r,
     };
-    let mut p = match open(&mind, &who) {
+    let mut p = match open(&author, &who) {
         Ok(p) => p,
         Err(r) => return *r,
     };
@@ -520,9 +537,9 @@ pub async fn post_generate(
         //
         // Clearing here meant a redo destroyed the node before the run that was meant to
         // improve it. A decode that yields no prose then leaves `apply` with nothing to
-        // write, `document::sync` drops the file (the node no longer reads as generated), and
-        // `plan::save` persists the emptied node — the operator's good month gone from both
-        // disk and plan, with the job still reporting `done`. Cancelling a multi-node redo did
+        // write, `document::keep` drops the file (the node no longer reads as generated) and
+        // keeps the emptied node — the operator's good month gone from both document and
+        // plan, with the job still reporting `done`. Cancelling a multi-node redo did
         // the same to every node it had not reached yet, which is not "a shorter run".
         //
         // `edited` is still cleared: naming a node in `redo` is the explicit override that the
@@ -593,7 +610,7 @@ pub async fn post_generate(
     // and a personality is an authored document an operator can edit mid-run,
     // so the voice a phase writes against is the one it started with.
     let voice = voice_for(&s, &who).await;
-    match s.lifegen.start(narrate, &mind, p, phases, voice) {
+    match s.lifegen.start(narrate, author, p, phases, voice) {
         Ok(job) => Json(job.view()).into_response(),
         Err(e @ NotStarted::AlreadyRunning { .. }) => (
             StatusCode::CONFLICT,

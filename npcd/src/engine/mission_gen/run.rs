@@ -7,6 +7,7 @@
 //! do. The loop runs one at a time per world while the table is open and its
 //! pool is below the configured level.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,7 +15,6 @@ use candle_conversation::guest::resolve_seed;
 use candle_conversation::stencil::ThinkMode;
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use serde::Serialize;
-use tokio::task::spawn_blocking;
 
 use super::answer::{self, Answer, Desk};
 use super::canon;
@@ -25,16 +25,18 @@ use super::material;
 use super::reading;
 use super::step;
 use super::target::{self, Kind, Target};
+use crate::api::now_ms;
 use crate::engine::journal::tools::arguments;
 use crate::engine::mind::Minds;
-use crate::engine::mind_record;
 use crate::engine::mission::{time_step_text, Mission, Todo};
 use crate::engine::prose::{self, decode_call, CallAsk};
 use crate::engine::runtime::Runtime;
 use crate::engine::work::what_happens;
 use crate::engine::workflow::{OnFailed, Where};
+use crate::opstore::owner::Owner;
 use crate::prose::Request;
 use crate::sim::operations::Operation;
+use crate::sim::shelf::Shelf;
 use crate::world::Hosted;
 
 /// The most tokens one answer may run to. The table's reading and its faults
@@ -207,10 +209,6 @@ async fn write_up(
         };
         match checked {
             Ok(Answer::Mission(p)) => {
-                // What its document says now, when the record holds it — put
-                // back if the operation fails and its workflow says `restore`
-                // (`Sim::set_aside_failed`).
-                let before = corpus.on_disk(&p.writes);
                 let opened = hosted.with_sim(|s| {
                     let id = s.missions.launch(
                         &generator.workflow,
@@ -222,12 +220,15 @@ async fn write_up(
                         &p.brief,
                         p.fields.clone(),
                         p.reads.clone(),
-                        before.as_deref(),
                     )?;
                     let name = s.missions.operations().get(id).map(|o| o.name.clone());
                     Ok::<_, String>((id, name.unwrap_or_default()))
                 });
                 let (operation, name) = opened.map_err(|e| anyhow::anyhow!("{e}"))?;
+                // Its store takes the mind as it stands now as its base (§10.3).
+                if let Some(stores) = hosted.op_stores() {
+                    stores.pin(&Owner::operation(hosted.id(), operation));
+                }
                 tracing::info!(
                     generator = %generator.id, target = %target.key, writes = %p.writes, attempt,
                     %name, "mission generator: an operation is open — {}", p.objective
@@ -510,21 +511,31 @@ pub async fn table_step(
     }) else {
         return Ok(());
     };
-    // The form put right before the table reads it, so the reading is of what
-    // the draft says rather than of a heading line.
-    if gates::tidy_on_disk(&mind, &op.document) {
-        hosted.with_sim(|s| s.bench.rebase(&op.document));
+    // The table reads the draft in the operation's store (§10.3). The form is
+    // put right first, so the reading is of what the draft says rather than of
+    // a heading line.
+    let Some(shelf) = hosted.op_shelf(id) else {
+        anyhow::bail!("this world has no operation stores");
+    };
+    if gates::tidy_on(&shelf, &op.document) {
+        hosted.with_sim(|s| s.bench.rebase(&op.document, &shelf));
     }
+    let held = shelf.read(&op.document);
     let corpus = Corpus::read(&mind, hosted.id());
-    let Some(material) = material::draft(
-        &corpus,
-        &op.document,
-        op.target.strip_prefix("era:"),
-        &context,
-    ) else {
+    let material = held.and_then(|text| {
+        let corpus = corpus.clone().holding(&op.document, text);
+        let drafted = material::draft(
+            &corpus,
+            &op.document,
+            op.target.strip_prefix("era:"),
+            &context,
+        )?;
+        Some((corpus, drafted))
+    });
+    let Some((corpus, material)) = material else {
         hosted.with_sim(|s| {
             s.missions
-                .cancel_operation(id, "its document is no longer on the record")
+                .cancel_operation(id, "its document is no longer in its store")
         });
         tracing::warn!(operation = %op.name, document = %op.document, "operation: document gone, called off");
         return Ok(());
@@ -575,14 +586,19 @@ pub async fn table_step(
 }
 
 /// Put the Maker's step operation `id` waits on at the table, as a mission
-/// built from the step ([`step::step_mission`]), at its workflow's desk and in
-/// its workflow's year.
+/// built from the step ([`step::step_mission`]), at the step's own desk or its
+/// workflow's, and in its workflow's year.
 fn offer_step(hosted: &Hosted, corpus: &Corpus, id: u64) -> Result<(), String> {
     let (desk, year) = hosted
         .sim(|s| {
             let ops = s.missions.operations();
-            let wf = ops.workflow_of(ops.get(id)?)?;
-            Some((wf.desk.clone(), wf.year.is_some()))
+            let op = ops.get(id)?;
+            let wf = ops.workflow_of(op)?;
+            let step = wf.step(op.step()?)?;
+            let desk = step.desk.clone().or_else(|| wf.desk.clone());
+            // A publish lands the work in the present record; it is written
+            // in no year.
+            Some((desk, wf.year.is_some() && !step.publishes()))
         })
         .ok_or("no such operation, or its workflow is not loaded")?;
     let desk = desk.and_then(|d| room_with(hosted, &d));
@@ -601,6 +617,28 @@ fn offer_step(hosted: &Hosted, corpus: &Corpus, id: u64) -> Result<(), String> {
     hosted.with_sim(|s| s.missions.offer_step(id, mission));
     tracing::info!(operation = %op.name, %step, desk = ?desk.map(|d| d.room), "operation: step on the table");
     Ok(())
+}
+
+/// Settle every failed operation of `hosted` not yet settled, as its
+/// workflow's `on-failed` says: its store discarded, or kept unpublished for
+/// an operator to reopen (`docs/replicated_substrate.md` §10.3).
+pub fn settle_failed(hosted: &Hosted) {
+    let failed = hosted.sim(|s| {
+        let ops = s.missions.operations();
+        ops.to_retire()
+            .into_iter()
+            .map(|op| (op.id, op.name.clone(), ops.on_failed(&op)))
+            .collect::<Vec<_>>()
+    });
+    for (id, name, on_failed) in failed {
+        if on_failed == OnFailed::Discard {
+            if let Some(stores) = hosted.op_stores() {
+                stores.discard(&Owner::operation(hosted.id(), id));
+            }
+        }
+        hosted.with_sim(|s| s.missions.mark_retired(id));
+        tracing::info!(operation = %name, ?on_failed, "operation: failed work settled");
+    }
 }
 
 /// Keep every hosted world's table stocked while the daemon runs.
@@ -645,63 +683,25 @@ pub fn spawn(rt: Arc<Runtime>) {
                 if !rt.standing.role(&id).is_authority() {
                     continue;
                 }
-                // **Every failed operation's document is settled here**, however
-                // it failed — rejected, read and found wanting past the limit,
-                // or stuck — as its workflow's `on-failed` says: a draft set
-                // aside leaves the record and memory now, not at the next boot
-                // (the substrate holds whatever was ingested of it, and a
-                // gather could otherwise still surface lore the review threw
-                // out); a correction's document is put back
-                // (`Sim::set_aside_failed`).
-                let retiring = hosted.sim(|s| {
-                    let ops = s.missions.operations();
-                    ops.to_retire()
-                        .into_iter()
-                        .map(|op| {
-                            let leaves = ops.on_failed(&op) == OnFailed::SetAside;
-                            (op, leaves)
-                        })
-                        .collect::<Vec<_>>()
-                });
-                // Taken out of the lock first, so the read guard is not held
-                // across the scans; each scan holds the engine, and runs off
-                // the async workers so it does not stall them while it does.
-                let minds = rt.minds.read().unwrap().clone();
-                if let (false, Some(minds)) = (retiring.is_empty(), minds) {
-                    for (op, leaves) in retiring {
-                        let doc = op.document.clone();
-                        let set_aside = hosted.with_sim(|s| s.set_aside_failed(&op));
-                        tracing::info!(operation = %op.name, %doc, ?set_aside, "operation: failed document settled");
-                        let scan = match leaves {
-                            true => {
-                                let engine = minds.engine();
-                                let rel = doc.clone();
-                                spawn_blocking(move || {
-                                    mind_record::retire(&engine.lock().unwrap(), &rel)
-                                })
-                                .await
-                            }
-                            false => Ok(0),
-                        };
-                        // Marked only once it has run, so a scan that failed is
-                        // tried again on the next pass.
-                        match scan {
-                            Ok(gone) => {
-                                hosted.with_sim(|s| s.missions.mark_retired(op.id));
-                                tracing::info!(%doc, gone, "operation: failed draft retired from memory");
-                            }
-                            Err(e) => {
-                                tracing::warn!(%doc, "operation: retiring the draft failed: {e}")
-                            }
-                        }
-                    }
-                }
+                // **Every failed operation's store is settled here**, however it
+                // failed — rejected, read and found wanting past the limit, or
+                // stuck — as its workflow's `on-failed` says: discarded, or
+                // kept unpublished for an operator to reopen. Nothing of it
+                // reached the record, so nothing there needs putting back.
+                settle_failed(&hosted);
                 // A document can leave the record under a mission written to
-                // read it — a failed draft set aside above, or by any other
-                // hand — and a read of nothing is a step no Maker can finish.
-                let struck = hosted.with_sim(|s| {
-                    let root = s.bench.mind_root()?.to_path_buf();
-                    Some(s.missions.strike_gone_reads(&|p| root.join(p).is_file()))
+                // read it, and a read of nothing is a step no Maker can finish.
+                // A step reads through its operation's store (§10.3), so its
+                // own document counts there while it is a draft.
+                let struck = hosted.sim(|s| s.bench.mind_root().map(Path::to_path_buf));
+                let struck = struck.map(|root| {
+                    let holds = |op: Option<u64>, p: &str| {
+                        root.join(p).is_file()
+                            || op
+                                .and_then(|id| hosted.op_shelf(id))
+                                .is_some_and(|shelf| shelf.read(p).is_some())
+                    };
+                    hosted.with_sim(|s| s.missions.strike_gone_reads(&holds))
                 });
                 for (whose, gone) in struck.unwrap_or_default() {
                     tracing::info!(body = ?whose, ?gone, "mission: reads of documents gone from the record struck");
@@ -719,7 +719,7 @@ pub fn spawn(rt: Arc<Runtime>) {
                             break;
                         }
                     }
-                    let owed = hosted.sim(|s| s.missions.operations().awaiting_offer());
+                    let owed = hosted.sim(|s| s.missions.operations().awaiting_offer(now_ms()));
                     if !owed.is_empty() {
                         let corpus = Corpus::read(&mind, hosted.id());
                         for op in owed {
@@ -767,7 +767,100 @@ pub fn spawn(rt: Arc<Runtime>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ends, reading_prompt, retry_prompt};
+    use std::sync::Arc;
+
+    use super::{ends, reading_prompt, retry_prompt, settle_failed};
+    use crate::engine::mission::{Mission, Origin, Outcome, Todo};
+    use crate::engine::workflow::OnFailed;
+    use crate::opstore::owner::Owner;
+    use crate::opstore::shelf::StoreShelf;
+    use crate::opstore::MindStores;
+    use crate::sim::operations::tests::workflows;
+    use crate::sim::shelf::Shelf;
+    use crate::world::Hosted;
+
+    const DRAFT: &str = "layers/stories/the-gate.md";
+
+    /// **A failed operation's store is settled as its workflow says**: under
+    /// `discard` its work is gone, under `keep` it stays unpublished — and
+    /// sent back to a step, the kept work is there to go on with, while the
+    /// discarded one starts afresh on the record.
+    #[test]
+    fn a_failed_store_is_discarded_or_kept_and_a_kept_one_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mind = dir.path().join("mind");
+        std::fs::create_dir_all(mind.join("layers/eras")).unwrap();
+        let h = Hosted::load(
+            "creators-vault",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"),
+        )
+        .unwrap();
+        h.set_bench_root(&mind);
+        let stores = MindStores::new(Some(&mind));
+        stores.set_quiet(Box::new(|_| true));
+        h.set_op_stores(Arc::clone(&stores));
+        let mut wfs = workflows();
+        let mut kept = wfs.iter().find(|w| w.name == "story").unwrap().clone();
+        kept.name = "kept-story".into();
+        kept.on_failed = OnFailed::Keep;
+        wfs.push(kept);
+
+        let fail = |workflow: &str, body: &str| -> u64 {
+            let id = h.with_sim(|s| {
+                s.missions.set_workflows(wfs.clone());
+                s.missions
+                    .review_document(workflow, "write", DRAFT)
+                    .unwrap()
+            });
+            StoreShelf {
+                stores: Arc::clone(&stores),
+                owner: Owner::operation(h.id(), id),
+            }
+            .commit(&[(DRAFT.into(), Some(format!("{workflow}'s draft\n")))])
+            .unwrap();
+            h.with_sim(|s| {
+                s.missions.assign(
+                    body,
+                    Mission::new(
+                        "Write it.",
+                        vec![Todo::report("report it")],
+                        Origin::Generated {
+                            generator: "operator".into(),
+                            target: format!("doc:{DRAFT}"),
+                            operation: id,
+                            step: "write".into(),
+                        },
+                    ),
+                );
+                s.missions
+                    .report(body, Outcome::Fail, "it cannot be written", None);
+                assert!(s.missions.operations().get(id).unwrap().failed());
+            });
+            id
+        };
+        let discarded = fail("story", "m1");
+        let kept = fail("kept-story", "m2");
+        let read = |op: u64| h.op_shelf(op).unwrap().read(DRAFT);
+
+        settle_failed(&h);
+        assert_eq!(read(discarded), None, "discarded");
+        assert_eq!(read(kept).as_deref(), Some("kept-story's draft\n"), "kept");
+        assert!(
+            h.sim(|s| s.missions.operations().to_retire().is_empty()),
+            "settled once"
+        );
+
+        for op in [discarded, kept] {
+            h.with_sim(|s| s.missions.send_to_step(op, "write").unwrap());
+            stores.pin(&Owner::operation(h.id(), op));
+        }
+        assert_eq!(
+            read(kept).as_deref(),
+            Some("kept-story's draft\n"),
+            "resumed"
+        );
+        assert_eq!(read(discarded), None, "afresh on the record");
+    }
 
     /// **An answer asked again carries every refusal so far**, numbered, and
     /// none of the refused answers to copy back.

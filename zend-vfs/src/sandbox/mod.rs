@@ -53,6 +53,7 @@
 //! | [`command`] | The program, its arguments and its timeout |
 //! | `follow` | Putting the local branch on the conversation's base: a lagging one brought up, unpushed commits set aside |
 //! | [`policy`] | The security check a command passes before it runs |
+//! | [`programs`] | The programs this deployment's policy starts |
 //! | `git_use` | Finding git run directly — as the program, or in a shell's script |
 //! | [`process`] | Starting it, passing on its output, killing its process tree |
 //! | `resolve` | Finding the file a program name on the `PATH` starts |
@@ -71,6 +72,7 @@ mod git_use;
 pub mod outcome;
 pub mod policy;
 pub mod process;
+pub mod programs;
 mod resolve;
 pub mod server;
 
@@ -84,7 +86,7 @@ use crate::checkout::{self, CheckoutError, Ledger, Preserved};
 use crate::file_delta::TimedDelta;
 use crate::{BranchName, DiskWriteGrant, FileChanges, Oid, Repo, Rev, VfsStore};
 
-pub use command::{SandboxCommand, DEFAULT_TIMEOUT};
+pub use command::{Priority, SandboxCommand, DEFAULT_TIMEOUT};
 pub use error::SandboxError;
 pub use outcome::{ChangedFile, Output, RunOutcome, Unrecorded};
 pub use policy::{CommandPolicy, Refused};

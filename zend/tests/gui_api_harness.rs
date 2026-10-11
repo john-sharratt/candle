@@ -308,23 +308,20 @@ async fn model_independent_api_contract() {
     assert_eq!(r.status(), 503);
 }
 
+/// A conversation's files are its substrate's (`docs/replicated_substrate.md`
+/// §10.2): until the model and its substrate load, every files route
+/// answers `503`.
 #[tokio::test]
-async fn conversation_files_upload_list_get_delete() {
+async fn conversation_files_wait_for_the_substrate() {
     let hz = boot().await;
     let base = format!("http://{}", hz.addr);
     let client = reqwest::Client::new();
-
-    // empty to start
     let r = client
         .get(format!("{base}/v1/conversations/c1/files"))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    let v: serde_json::Value = r.json().await.unwrap();
-    assert_eq!(v["files"].as_array().unwrap().len(), 0);
-
-    // upload a file (multipart) -> SSE progress; the stream carries file_done
+    assert_eq!(r.status(), 503);
     let form = reqwest::multipart::Form::new().part(
         "file",
         reqwest::multipart::Part::text("fn main() {}\n").file_name("main.rs"),
@@ -335,49 +332,19 @@ async fn conversation_files_upload_list_get_delete() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    let sse = r.text().await.unwrap();
-    assert!(sse.contains("file_start"), "no file_start in {sse}");
-    assert!(sse.contains("\"partIndex\""), "no part events in {sse}");
-    assert!(sse.contains("file_done"), "no file_done in {sse}");
-    assert!(sse.contains("[DONE]"));
-
-    // it now lists, with id + metadata
+    assert_eq!(r.status(), 503);
     let r = client
-        .get(format!("{base}/v1/conversations/c1/files"))
+        .get(format!("{base}/v1/conversations/c1/files/7"))
         .send()
         .await
         .unwrap();
-    let v: serde_json::Value = r.json().await.unwrap();
-    let files = v["files"].as_array().unwrap();
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0]["name"], "main.rs");
-    assert_eq!(files[0]["ext"], "RS");
-    assert_eq!(files[0]["kind"], "code");
-    let id = files[0]["id"].as_u64().unwrap();
-
-    // content reconstructs byte-exact
+    assert_eq!(r.status(), 503);
     let r = client
-        .get(format!("{base}/v1/conversations/c1/files/{id}"))
+        .delete(format!("{base}/v1/conversations/c1/files/7"))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    assert_eq!(r.text().await.unwrap(), "fn main() {}\n");
-
-    // delete -> 204, then gone
-    let r = client
-        .delete(format!("{base}/v1/conversations/c1/files/{id}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 204);
-    let r = client
-        .get(format!("{base}/v1/conversations/c1/files/{id}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 404);
+    assert_eq!(r.status(), 503);
 }
 
 /// The log pane is an admin's: it names paths on this host. Signed out, the

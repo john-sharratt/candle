@@ -28,6 +28,7 @@ use crate::classify::classify;
 use crate::error::GitError;
 use crate::kill_tree::{self, ProcessTree};
 use crate::redact::redact_urls;
+use crate::sandbox::Priority;
 use crate::types::RemoteName;
 
 /// Timeout for an operation that stays on this machine.
@@ -250,7 +251,7 @@ impl Invocation {
         for (key, value) in &self.env {
             cmd.env(key, value);
         }
-        kill_tree::prepare(&mut cmd);
+        kill_tree::prepare(&mut cmd, Priority::Normal);
         Ok(cmd)
     }
 
@@ -273,7 +274,7 @@ impl Invocation {
                 GitError::Io(e)
             }
         })?;
-        let tree = match ProcessTree::adopt(&child) {
+        let tree = match ProcessTree::adopt(&child, Priority::Normal) {
             Ok(tree) => tree,
             Err(e) => {
                 let _ = child.kill();

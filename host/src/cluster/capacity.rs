@@ -11,6 +11,7 @@
 //!   size fit in what its budget left.
 
 use cluster::frame::{Capacity, MemberState};
+use cluster::machine::Machine;
 
 use crate::telemetry::CardReading;
 
@@ -27,14 +28,6 @@ pub struct Wave {
     pub slots: u32,
     pub used_mib: u64,
     pub budget_mib: u64,
-}
-
-/// The host this member runs on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Machine {
-    pub cores: u16,
-    /// The load average × 1000; zero where the platform keeps none.
-    pub load_milli: u32,
 }
 
 pub fn capacity(
@@ -70,6 +63,13 @@ pub fn capacity(
             .map_or(0, |m| m.min(u64::from(u32::MAX)) as u32),
         cores: machine.cores,
         load_milli: machine.load_milli,
+        os: machine.os,
+        mem_free_mib: machine.mem_free_mib,
+        jobs: 0,
+        toolchains: Vec::new(),
+        // A model member runs no jobs; its host's agent, when it has one,
+        // reports its own capacity.
+        low_priority: false,
     }
 }
 
@@ -77,10 +77,14 @@ pub fn capacity(
 mod tests {
     use super::*;
 
-    const MACHINE: Machine = Machine {
-        cores: 16,
-        load_milli: 1_250,
-    };
+    fn machine() -> Machine {
+        Machine {
+            os: "linux".into(),
+            cores: 16,
+            load_milli: 1_250,
+            mem_free_mib: 20_000,
+        }
+    }
 
     fn card(peak: Option<f64>) -> CardReading {
         CardReading {
@@ -105,11 +109,12 @@ mod tests {
     /// 100 before.
     #[test]
     fn power_is_the_peak_decode_rate_or_the_card() {
-        let c = capacity(MemberState::Ready, card(Some(171.6)), None, MACHINE);
+        let c = capacity(MemberState::Ready, card(Some(171.6)), None, machine());
         assert_eq!(c.power, 172);
-        let c = capacity(MemberState::Loading, card(None), None, MACHINE);
+        let c = capacity(MemberState::Loading, card(None), None, machine());
         assert_eq!((c.power, c.state), (737, MemberState::Loading));
         assert_eq!((c.vram_free_mib, c.cores, c.load_milli), (4_096, 16, 1_250));
+        assert_eq!((c.os.as_str(), c.mem_free_mib), ("linux", 20_000));
     }
 
     /// A recent wave with a backlog or a full budget is not idle; one with
@@ -117,7 +122,7 @@ mod tests {
     /// said. Free slots are the room left over the average residence.
     #[test]
     fn idle_reads_the_newest_wave() {
-        let at = |w: Wave| capacity(MemberState::Ready, card(None), Some(w), MACHINE);
+        let at = |w: Wave| capacity(MemberState::Ready, card(None), Some(w), machine());
         let busy = at(wave(1.0, 3, 8_000));
         assert_eq!(
             (busy.idle, busy.prefill_backlog, busy.decodes),
@@ -134,7 +139,7 @@ mod tests {
             (quiet.idle, quiet.decodes, quiet.prefill_backlog),
             (true, 0, 0)
         );
-        let never = capacity(MemberState::Ready, card(None), None, MACHINE);
+        let never = capacity(MemberState::Ready, card(None), None, machine());
         assert_eq!((never.idle, never.slots_free), (true, 0));
     }
 }

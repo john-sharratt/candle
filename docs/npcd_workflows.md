@@ -35,7 +35,7 @@ workflows:
     send-backs: 3          # default 3
     desk: workshop         # optional: where the work is done
     year: now              # optional: when the work is done
-    on-failed: restore     # set-aside | restore | keep (default keep)
+    on-failed: discard     # discard | keep (default discard)
     steps:                 # in order; the first is the start
       fix:
         by: maker
@@ -54,11 +54,28 @@ workflows:
         by: table
         call: inspection
         next:
-          sound: done
+          sound: publish
           faulty: fix
         prompt: |
           Inspect the fix of {objective}. {verdict}
+      publish:
+        by: maker
+        desk: merge-table  # this step's own desk, over the workflow's
+        edits: optional    # only to resolve a conflict
+        tools: [merge_status, merge_sync, merge_publish]
+        checks: [published]
+        next: done
+        prompt: |
+          Land {objective} in the record.
 ```
+
+**Each step works in its operation's store.** An operation owns one store over
+the mind repository (`docs/replicated_substrate.md` §10.3). Every step's
+mission reads through it and commits into it, so a writer's draft is in front
+of the reviewer and the checker of the same operation and of no one else, and
+nothing reaches the record until the publish step lands the store there.
+`on-failed` says what becomes of a failed operation's store: `discard` drops
+it, and `keep` leaves it, unpublished, for an operator to reopen.
 
 Other top-level keys belong to other readers and are ignored. Inside these
 sections, an unknown key is a load error.
@@ -76,11 +93,22 @@ A step has exactly these keys:
 | `next` | a target for a step with one result, or a non-empty map of outcome → target |
 | `stuck` | actor steps only: where a `stuck` report leads once `stuck-limit` have been made in the round (default `failed`) |
 | `stuck-limit` | actor steps only: at least 1 (default 1) |
+| `desk` | where this step is taken, over the workflow's `desk` |
 | `tools`, `checks`, `context` | YAML lists of names, carried as names. Rust gives them meaning. |
 
 A target is a step, `done`, or `failed`. `cancelled` is an end state that only
 the engine can set, so no step leads there. No step may be named for an end
 state, and `stuck` is never a key in `next`.
+
+**Only a publish step leads to `done`.** A publish step is one whose `checks`
+include `published`, which holds the step open until the operation's store
+has landed on the record. A step that leads to `done` without it is a load
+error, so verification before publishing is a rule of the format.
+
+A publish that cannot reach git — `origin` down, or no agent to push with —
+neither settles nor counts as stuck. The operation records when it may be
+tried again, 30 minutes on, and the table does not offer its step before
+then.
 
 ### Variants
 
@@ -179,11 +207,12 @@ onto `story`, `life-event` and `correction`:
 | `Phase::Reading` | `read`, `by: table`, `call: reading`, which always leads to `review` with its verdict as the incoming outcome |
 | `Phase::Reviewing` (a second Maker) | `review`, `by: another`, with prompt and edits chosen by the reading's verdict; `pass: reread`, `reject: fix` |
 | the table's second reading | `reread`. `mend` sends the work back to `review`. |
-| `Phase::Checking` (a third Maker) | `canon`, `by: another`; `pass: done`, `reject: fix` |
+| `Phase::Checking` (a third Maker) | `canon`, `by: another`; `pass: publish`, `reject: fix` |
+| the commit into the mind folder | `publish`, at the merge table, the only step leading to `done` |
 | `Phase::Fixing`, carrying `fault` | `fix`, `by: another`, `next: read` (a send-back), with the fault as `{findings}` |
 | `FIX_LIMIT` | `send-backs` |
 | `REVIEW_STUCK_LIMIT` | `stuck-limit` |
 | `needs_canon(document)` | whether the workflow has a `canon` step |
-| `leaves_on_failure`, `before` | `on-failed: set-aside` or `restore` |
+| `leaves_on_failure`, `before` | `on-failed: discard` or `keep`: a failed draft never reached the record |
 | `writer`/`reviewer`/`checker`, `round` | the run's history and rounds |
 | `Phase::Succeeded` / `Failed` / `Cancelled` | `done` / `failed` / `cancelled` |

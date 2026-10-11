@@ -119,7 +119,7 @@ fn member(
             prefill_backlog: 0,
             vram_free_mib: 1000,
             cores: 8,
-            load_milli: 0,
+            ..Capacity::default()
         }),
         None,
         Instant::now(),
@@ -215,16 +215,22 @@ async fn members_join_route_and_carry_streams() {
     let MemberStream {
         app,
         node,
+        target,
         conn: mut at_gateway,
     } = up.recv().await.unwrap();
     assert_eq!(
-        (app.as_str(), node, at_gateway.target()),
-        ("zend", 1, "zend")
+        (app.as_str(), node, target.as_str(), at_gateway.target()),
+        ("zend", 1, "zend", "zend")
     );
     upstream.write_all(b"x").await.unwrap();
     let mut one = [0u8; 1];
     at_gateway.read_exact(&mut one).await.unwrap();
     assert_eq!(&one, b"x");
+
+    // A stream to the agents' group arrives as A's, aimed at the group.
+    let _jobs = a.app.open_group("agent").expect("a ready socket");
+    let MemberStream { app, target, .. } = up.recv().await.unwrap();
+    assert_eq!((app.as_str(), target.as_str()), ("zend", "group:agent"));
 
     // The log saw the admissions, the switch and the claim.
     let texts: Vec<String> = hub

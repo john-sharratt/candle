@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, MissedTickBehavior};
 
 use super::admission::{Admission, Admitted};
+use super::agents::{Choice, Need};
 use super::coord_log::changes;
 use super::log::{CoordLog, Entry};
 use super::paxos_log::paxos_step;
@@ -73,10 +74,13 @@ pub const CATCHUP_CAP: usize = 16 << 20;
 const RECEIPT_TICK: Duration = Duration::from_millis(100);
 
 /// A stream a member opened towards the gateway (§5.1): served by the
-/// gateway's own router as a request for `app`.
+/// gateway's own router as a request for `app`, or, when its target is
+/// `group:<other>`, routed to that app's group.
 pub struct MemberStream {
     pub app: String,
     pub node: u64,
+    /// What it was opened towards: the member's own app, or `group:<app>`.
+    pub target: String,
     pub conn: VirtualConn,
 }
 
@@ -350,6 +354,7 @@ impl Hub {
                 build: hello.build.clone(),
                 weight: hello.power,
                 session: admitted.session,
+                repos: hello.repos.clone(),
                 capacity: None,
                 routes: None,
                 high_water: 0,
@@ -395,6 +400,7 @@ impl Hub {
                     Some(Incoming::Stream(conn)) => streams(MemberStream {
                         app: app.to_string(),
                         node,
+                        target: conn.target().to_string(),
                         conn,
                     }),
                     Some(Incoming::Event { whole, frame, .. }) => {
@@ -611,6 +617,17 @@ impl Hub {
         pinned: Option<u64>,
     ) -> Pick {
         self.state().registry.pick(app, dispatch, key, pinned)
+    }
+
+    /// Which agent of `app` runs a job (§11.3).
+    pub fn pick_agent(
+        &self,
+        app: &str,
+        lineage: Option<&str>,
+        need: &Need,
+        waited: bool,
+    ) -> Choice {
+        self.state().registry.pick_agent(app, lineage, need, waited)
     }
 
     /// Open a stream to `node`'s socket for `app`, towards `target`.

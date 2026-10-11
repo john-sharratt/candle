@@ -2414,14 +2414,18 @@ world refuses a `409` in its own words, and a success reports who it relocated a
 it is durable.
 
 Persistence is `npcd/src/world/mapstore.rs`, invoked by `Hosted::reshape` after the in-RAM
-swap: it writes the one area the edit touched back to `<mind>/map/<world>/<area-id>.yaml`
-(atomic temp-then-rename), or removes that file for a drowned area. Only the touched file
-is rewritten — every other authored file is left byte-for-byte, comments and all — and the
-derived `exits`/`visible` are `#[serde(skip)]`, so what lands on disk is the authored form
-a fresh load re-weaves. The write is off the world lock and best-effort: the swap is the
-source of truth, so a disk failure is *reported* (`durable: "failed"`) rather than
-un-happening a reshape that already took. A world with no authored directory (a generated
-or test world) is `durable: "ephemeral"` — the change holds for the run only.
+swap: it keeps the one area the edit touched as `<mind>/map/<world>/<area-id>.yaml`, or
+removes that file for a drowned area. A map in the mind is kept as a write of the
+character's owner whose token asked for it (`docs/replicated_substrate.md` §10.3): their
+draft over a mind under git (`durable: "drafted"`, the authored map once they publish it),
+the file itself over a mind folder that is not one (`durable: "written"`, atomic
+temp-then-rename). Only the touched file is rewritten — every other authored file is left
+byte-for-byte, comments and all — and the derived `exits`/`visible` are `#[serde(skip)]`,
+so what is kept is the authored form a fresh load re-weaves. Keeping it is off the world
+lock and best-effort: the swap is the source of truth, so a failure is *reported*
+(`durable: "failed"`) rather than un-happening a reshape that already took. A world with no
+authored directory (a generated or test world), or a map in the mind with no owner to keep
+it for, is `durable: "ephemeral"` — the change holds for the run only.
 
 *As-built: implemented and tested end to end — `MapSet::apply` (the transactional
 mutation), `World::reshape` (swap, re-derive the shaft, relocate the stranded), the

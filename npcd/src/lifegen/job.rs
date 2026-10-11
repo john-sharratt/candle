@@ -18,13 +18,13 @@
 //! # A cancelled run keeps what it finished
 //!
 //! Cancelling stops the next fork from dispatching. Everything already written
-//! stays — in the plan and on disk — because a life is generated a stratum at a
-//! time and half a ladder is a useful thing to come back to. The alternative,
-//! discarding a phase's work because the operator stopped the phase after it,
-//! would make the stop button expensive enough that nobody uses it.
+//! stays — in the plan and its documents — because a life is generated a
+//! stratum at a time and half a ladder is a useful thing to come back to. The
+//! alternative, discarding a phase's work because the operator stopped the
+//! phase after it, would make the stop button expensive enough that nobody
+//! uses it.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +33,7 @@ use serde::Serialize;
 use super::generate::{run_phase, Narrator};
 use super::plan::{Phase, Plan};
 use super::progress::{GenProgress, GenSnapshot, Outcome};
+use crate::sim::shelf::Shelf;
 
 /// A generation in progress, or one that has finished.
 #[derive(Debug)]
@@ -170,11 +171,12 @@ impl Jobs {
     ///
     /// The plan is handed in already loaded, because deciding what to generate
     /// (which phases, against which seed) belongs to the caller — this owns
-    /// running it, not choosing it.
+    /// running it, not choosing it. What it writes is kept on `shelf`: the
+    /// author who started it.
     pub fn start(
         &self,
         narrate: Narrator,
-        mind: &Path,
+        shelf: Arc<dyn Shelf>,
         plan: Plan,
         phases: Vec<Phase>,
         // The character's own idiom, read from their personality by the caller
@@ -184,11 +186,10 @@ impl Jobs {
         let job = self.reserve(plan, phases)?;
         let run = Arc::clone(&job);
         let phases = job.phases.clone();
-        let mind: PathBuf = mind.to_path_buf();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let outcome = drive(&narrate, &mind, &run, &phases, &voice).await;
+                    let outcome = drive(&narrate, &*shelf, &run, &phases, &voice).await;
                     run.progress.finish(outcome);
                 });
             }
@@ -249,7 +250,7 @@ impl Jobs {
 /// Run the ladder, rung by rung.
 async fn drive(
     narrate: &Narrator,
-    mind: &Path,
+    shelf: &dyn Shelf,
     job: &Job,
     phases: &[Phase],
     voice: &str,
@@ -258,7 +259,7 @@ async fn drive(
         if job.progress.is_cancelled() {
             return Outcome::Cancelled;
         }
-        match run_phase(narrate, mind, &job.plan, *phase, voice, &job.progress).await {
+        match run_phase(narrate, shelf, &job.plan, *phase, voice, &job.progress).await {
             Ok(n) => tracing::info!("life {}: {} — {n} node(s) written", job.who, phase.unit()),
             Err(e) => {
                 tracing::warn!("life {}: {} failed — {e:#}", job.who, phase.unit());

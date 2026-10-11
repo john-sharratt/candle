@@ -1,0 +1,44 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2021"
+description = "tokera-agent: a CPU-only cluster member that runs jobs on its checkouts and pushes with its credentials (docs/replicated_substrate.md §11)"
+
+[lib]
+name = "agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tokera-agent"
+path = "src/main.rs"
+
+# No candle and no model (§11.1): the cluster socket, the checkouts' git and
+# sandbox, and the job API.
+[dependencies]
+anyhow       = { workspace = true }
+axum         = { version = "0.7" }
+base64       = "0.22"
+clap         = { workspace = true }
+cluster      = { path = "../cluster" }
+cluster-dial = { path = "../cluster-dial" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http-body-util = "0.1"
+hyper        = { version = "1", features = ["server", "client", "http1"] }
+hyper-util   = { version = "0.1", features = ["server", "server-auto", "http1", "tokio"] }
+rand         = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+serde_yaml   = "0.9"
+thiserror    = { workspace = true }
+tokio        = { version = "1", features = ["full"] }
+tokio-util   = { version = "0.7", features = ["io"] }
+tower        = { version = "0.5" }
+tracing      = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zend-vfs     = { path = "../zend-vfs" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The gateway's router over a cluster hub, in process.
+web      = { path = "../web" }
+tokio    = { version = "1", features = ["full", "test-util"] }

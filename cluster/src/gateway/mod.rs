@@ -4,6 +4,7 @@
 //! proxy and status page.
 
 mod admission;
+mod agents;
 mod claims;
 mod coord_log;
 mod drain;
@@ -18,6 +19,10 @@ mod world_log;
 mod worlds_view;
 
 pub use admission::{Admission, Admitted, MAX_SKEW_MS};
+pub use agents::{
+    choose, Choice, Need, LINEAGE_HEADER, NODE_HEADER, PUSH_HEADER, REPO_HEADER, SPILL_AFTER,
+    TOOLCHAIN_HEADER,
+};
 pub use claims::Claims;
 pub use coord_log::changes;
 pub use drain::DRAIN_WAIT;

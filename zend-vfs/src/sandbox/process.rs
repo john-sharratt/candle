@@ -66,11 +66,11 @@ pub(crate) async fn execute(
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE");
-    kill_tree::prepare(&mut std_command);
+    kill_tree::prepare(&mut std_command, command.priority);
     let mut child = tokio::process::Command::from(std_command)
         .kill_on_drop(true)
         .spawn()?;
-    let tree = match ProcessTree::adopt_async(&child) {
+    let tree = match ProcessTree::adopt_async(&child, command.priority) {
         Ok(tree) => tree,
         Err(e) => {
             let _ = child.kill().await;
@@ -157,6 +157,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::sandbox::Priority;
 
     /// A command that runs `script` in the platform's shell.
     fn shell(script: &str) -> SandboxCommand {
@@ -284,6 +285,47 @@ mod tests {
         .unwrap();
         assert_eq!(done.exit_code, Some(0));
         assert_eq!(String::from_utf8(sink).unwrap().trim(), "hello world");
+    }
+
+    /// What the command's own process reports its priority as: its class on
+    /// Windows, its nice on Unix.
+    fn own_priority() -> SandboxCommand {
+        if cfg!(windows) {
+            SandboxCommand::new("powershell").args([
+                "-NoProfile",
+                "-Command",
+                "(Get-Process -Id $PID).PriorityClass",
+            ])
+        } else {
+            SandboxCommand::new("sh").args(["-c", "nice"])
+        }
+    }
+
+    /// **A command run below normal priority is**, and one run at normal
+    /// priority is not lowered.
+    #[tokio::test]
+    async fn a_command_runs_at_the_priority_it_asks_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = Vec::new();
+        execute(
+            dir.path(),
+            &own_priority().priority(Priority::Below),
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        let below = String::from_utf8(sink).unwrap();
+        assert_eq!(
+            below.trim(),
+            if cfg!(windows) { "BelowNormal" } else { "10" }
+        );
+
+        let mut sink = Vec::new();
+        execute(dir.path(), &own_priority(), &mut sink)
+            .await
+            .unwrap();
+        let normal = String::from_utf8(sink).unwrap();
+        assert_eq!(normal.trim(), if cfg!(windows) { "Normal" } else { "0" });
     }
 
     /// A program that does not exist is an error, not an outcome.

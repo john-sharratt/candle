@@ -76,6 +76,9 @@ fn payload_needed(rt: RecordType) -> bool {
             // A conversation's file events likewise: indexed by timeline and
             // sequence number from the header, bodies read on resume.
             | RecordType::VfsEvent
+            // Blobs likewise: indexed by their hash's prefix from the header,
+            // bytes read when asked for.
+            | RecordType::Blob
     )
 }
 

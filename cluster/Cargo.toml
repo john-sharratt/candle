@@ -26,6 +26,8 @@ sha2        = "0.10"
 rand        = { workspace = true }
 # The status page's data, as JSON.
 serde       = { workspace = true }
+# A member's `CAPACITY`: cores, load and free memory (§5.3, §11.2).
+sysinfo     = { version = "0.31", default-features = false, features = ["system"] }
 thiserror   = { workspace = true }
 tokio       = { version = "1", features = ["sync", "rt", "time", "macros", "io-util"] }
 # A member's socket. No TLS and no connector here: the host that dials picks

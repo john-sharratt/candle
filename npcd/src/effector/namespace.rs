@@ -52,6 +52,9 @@ pub fn namespace_of(part_id: &str) -> &str {
         "seat" => "room",
         // `time_travel` is `http://local/time/<id>/travel`.
         "time-machine" => "time",
+        // Where an operation's work lands in the record: `merge_publish` is
+        // `http://local/archive/<id>/merge_publish`.
+        "merge-table" => "archive",
         // Anything unmapped addresses itself.
         other => other,
     }
@@ -81,6 +84,11 @@ mod tests {
         ] {
             assert_eq!(namespace_of(part), "record", "{part} is a record surface");
         }
+    }
+
+    #[test]
+    fn the_merge_table_routes_under_archive() {
+        assert_eq!(namespace_of("merge-table"), "archive");
     }
 
     #[test]

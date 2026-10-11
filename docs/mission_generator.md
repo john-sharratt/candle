@@ -49,8 +49,17 @@ corpus (eras, lives,  ▼
        a different Maker reviews it ── mends in place and passes, or rejects
                       │
                       ▼
-       succeeded: the document stands     failed: it moves to rejected/, the target is retried
+       a Maker publishes it at the merge table ── it lands in the record
+                      │
+                      ▼
+       succeeded: the document stands     failed: its store is discarded, the target is retried
 ```
+
+**Every step works in its operation's store** (`npcd::opstore`,
+`docs/replicated_substrate.md` §10.3). The draft, the reviewer's mending and the canon check's
+edit are all commits into the operation's own store over the mind repository; the mind folder
+holds only published work, and nothing reaches it, or memory, but through the workflow's last
+step — `publish`, at the merge table on the archive floor.
 
 A loop keeps each world's pool at `keep` missions while its table is open
 (`mission_gen::run::spawn`), reading waiting drafts before it opens new operations. An operator
@@ -157,35 +166,46 @@ Makers stood at the table scanning and reflecting with thirty-five reviews waiti
 whose reading is done is asked for its verdict, not for "what you found": a review has nothing
 to find.
 
-**Memory holds only what passed** (`engine::mind_record`). Every conversation a mind document
-becomes — a layer document, a life episode, each belief and relationship the episode forms — is
-marked with the document's path. At boot, a document gone from disk or changed is retired from
-the substrate before it is ingested again, and a document an operation is still drafting or
-reviewing is held out of the ingest altogether; a rejected draft is retired the moment its
-operation fails. Conversations written before the mark are found by a life event's date and
-title, or a layer document's address.
+**Memory holds only what was published** (`engine::mind_record`). Every conversation a mind
+document becomes — a layer document, a life episode, each belief and relationship the episode
+forms — is marked with the document's path. At boot, a document gone from disk or changed is
+retired from the substrate before it is ingested again. The mind folder holds only published
+work, so everything in it is memory's to take; a publish lands in it (`opstore::merge::follow`,
+on this member at once and on every other within a minute), and the watcher ingests the change.
+Conversations written before the mark are found by a life event's date and title, or a layer
+document's address.
 
-A rejected draft is moved to `rejected/<operation>/` in the mind (`Benches::retire`), where no
-world reads it and an operator still can; its target counts a stuck and is tried again by a
-fresh operation, up to the ledger's limit. What becomes of a failed operation's document is its
-workflow's `on-failed`: a draft — a life event or a story — is set aside (`set-aside`). A
-correction works on a document the record already held, so when it fails its document is put
-back to what it said when the operation opened (`restore`; `Operation::before`,
-`Sim::set_aside_failed`): moving the era aside would lose canon, and leaving
-the rejected edit would let it stand — unless a later operation on the same document has since
-succeeded, whose accepted text that would overwrite. Every failed operation is settled this way by
-the generator's loop, however it failed — rejected, read past the limit, or stuck — and a
-rejection is settled at once as well. A target is settled when its operation is, not when
-its draft is reported. An operator can put any document already on the record through the
-reading and a review (`POST /v1/pulse/operations {path}`): it opens on the workflow for its
-form — a life event's, a story's, or a correction's — at that workflow's first reading.
+**Publishing** (`engine::archive`). The publish step sends a Maker to a merge table on the
+archive floor. `merge_status` says what the operation changes and whether the record moved
+under it; `merge_publish` lands it as one commit, pushed under a lease — through an agent
+holding the mind repository under `--cluster` (§11.5) — and a record that moved only at other
+lines is taken in on the way. One that changed the same lines refuses it, naming the documents;
+`merge_sync` brings the record's text in with each overlap marked, the Maker settles the marks
+at the bench and publishes again. The step's `published` check holds its report until the work
+has landed. A publish that cannot reach git — `origin` down, or no agent — puts the Maker's
+mission down without a report, and the table offers the step again thirty minutes later
+(`Operation::retry`); the store keeps the work meanwhile.
+
+A failed operation's target counts a stuck and is tried again by a fresh operation, up to the
+ledger's limit. Its store is settled as its workflow's `on-failed` says: `discard` (the
+default) drops it, and `keep` leaves it, unpublished, for an operator to reopen. Nothing of a
+failed operation ever reached the record, so there is nothing there to set aside or put back.
+Every failed operation is settled this way by the generator's loop, however it failed —
+rejected, read past the limit, or stuck — and a rejection is settled at once as well. A target
+is settled when its operation is, not when its draft is reported. An operator can put any
+document already on the record through the reading and a review
+(`POST /v1/pulse/operations {path}`): it opens on the workflow for its form — a life event's, a
+story's, or a correction's — at that workflow's first reading, its store on the record as it
+stands.
 
 The operations tab of the npcd console (`/operations`) shows each running operation's place
 in its workflow and who carries it, every step taken with its outcome and what it found, and
 folds the finished away below. An operation can be renamed, its objective restated, the brief
 of its waiting mission rewritten (`PATCH /v1/pulse/operations/:wid/:oid`), sent to a step
-(`POST …/:oid/step`), or called off (`POST …/:oid/cancel`), which stands down whoever is
-carrying it.
+(`POST …/:oid/step`; a kept store resumes, a discarded one starts afresh on the record), its
+waiting publish offered at once (`POST …/:oid/retry`), or called off (`POST …/:oid/cancel`),
+which stands down whoever is carrying it. Its document reads as its store holds it
+(`GET …/:oid/document`).
 
 ## Who chooses what
 

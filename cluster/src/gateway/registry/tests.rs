@@ -14,7 +14,7 @@ fn capacity(state: MemberState, power: u32, idle: bool, slots_free: u32) -> Capa
         prefill_backlog: 0,
         vram_free_mib: 0,
         cores: 8,
-        load_milli: 0,
+        ..Capacity::default()
     }
 }
 
@@ -30,6 +30,7 @@ fn member(node: u64, session: u64) -> MemberView {
         },
         weight: 1,
         session,
+        repos: Vec::new(),
         capacity: None,
         routes: None,
         high_water: 0,

@@ -31,7 +31,9 @@ pub use streams::{Data, Open, Window, MAX_DATA};
 pub use substrate::{
     Ack, Catchup, Done, Event, Fetch, Gone, Have, Headers, Receipt, RecordHeader, MAX_FRAGMENT,
 };
-pub use types::{Artifact, Ballot, BuildId, ClaimInfo, Epoch, MemberInfo, MemberState, ModelId};
+pub use types::{
+    Artifact, Ballot, BuildId, ClaimInfo, Epoch, MemberInfo, MemberState, ModelId, RepoAd,
+};
 
 use crate::wire::{Reader, WireError, Writer};
 

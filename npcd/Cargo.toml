@@ -54,6 +54,11 @@ host       = { path = "../host" }
 # How each route is dispatched under a cluster (`docs/replicated_substrate.md`
 # §5.2).
 cluster    = { path = "../cluster" }
+# An operation's store over the mind repository, kept as file events, and its
+# publish pushed by an agent (`docs/replicated_substrate.md` §10.3, §11).
+zend-vfs     = { path = "../zend-vfs" }
+store-events = { path = "../store-events" }
+agent        = { path = "../agent" }
 # Hashing a provider's subject id into a file name that is valid whatever shape
 # the provider chose. Not a security boundary — the subject inside the file is
 # authoritative — but it has to be total over every possible input.

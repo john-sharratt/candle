@@ -69,7 +69,6 @@ use crate::code_read::PATH_KEY;
 use crate::coding_sampling;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
-use crate::conv_file_store::ConvFileStore;
 use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
 use crate::fast_path::coverage::Coverage;
@@ -82,6 +81,7 @@ use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript}
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
 use crate::repeat_guard::{self, RepeatGuard, Verdict};
+use crate::repo_ads::repo_ads;
 use crate::repo_path::shown as shown_unit;
 use crate::repo_scan::{utility_config, DIR_KEY};
 use crate::resume;
@@ -1437,6 +1437,7 @@ impl InferenceState {
                 reloader.reload_and_wait()
             });
             let replication = store.replication()?;
+            join.link().set_repos(repo_ads(&workspace));
             let report = |views: &[ClusterView]| {
                 progress.set_step_progress(admitted(views), views.len() as u64);
                 status_tx.send(connecting_detail(views)).ok();
@@ -2578,7 +2579,7 @@ impl InferenceState {
             identity_builders,
             think_closer_phrase,
             tokenizer,
-            tool_host: ToolHost::new(&workspace, secrets)?,
+            tool_host: ToolHost::deployed(&workspace, secrets, cluster.as_ref())?,
             workspace,
             base_branches,
             tool_stencil,
@@ -2611,9 +2612,12 @@ impl InferenceState {
             // `Off`, as repo_map's folder summaries run: a file read is a tool
             // round and a description, with no reasoning block between them.
             think_triggers: turn_triggers(self, ThinkMode::Off),
-            tool_ctx: self
-                .tool_host
-                .context_for(ToolMode::Restricted, &self.tool_host.conversation_files()),
+            // Ingest reads; it runs no job, so it belongs to no lineage.
+            tool_ctx: self.tool_host.context_for(
+                ToolMode::Restricted,
+                &self.tool_host.conversation_files(),
+                "",
+            ),
             retrieval: &self.retrieval_scope,
             chain_end: *self.chain_end.lock().unwrap(),
         }
@@ -2753,6 +2757,7 @@ impl InferenceState {
     /// safe).
     pub(crate) fn ingest_uploaded_files(
         &self,
+        conv_id: &str,
         rel_paths: &[String],
         progress: &Arc<LoadProgress>,
     ) -> anyhow::Result<(bool, bool)> {
@@ -2766,7 +2771,13 @@ impl InferenceState {
             );
             return Ok((false, false));
         };
-        let ctx = self.refresh_ctx();
+        // The uploads are the conversation's: its files, as its events hold
+        // them, are what the read reads.
+        let files = self.saved_files(conv_id);
+        let ctx = RefreshContext {
+            tool_ctx: self.tool_host.context_for(ToolMode::Restricted, &files, ""),
+            ..self.refresh_ctx()
+        };
         let (ingested, n_failed) = crate::code_read::ingest_files(
             &ctx,
             rel_paths,
@@ -2781,23 +2792,157 @@ impl InferenceState {
         Ok((ingested, n_failed > 0))
     }
 
+    /// `conv_id`'s file stores as its saved events hold them: a fresh set,
+    /// restored, never saved — what a read of its uploads reads.
+    pub(crate) fn saved_files(&self, conv_id: &str) -> Arc<RepoFiles> {
+        let files = self.tool_host.conversation_files();
+        let mirror = Mutex::new(Mirror::unread());
+        conv_overlay::restore(
+            &self.engine.lock().unwrap(),
+            timeline_for(conv_id),
+            &files,
+            &mirror,
+        );
+        files
+    }
+
+    /// Run `change` over `conv_id`'s file stores and save what it changed as
+    /// the conversation's file events (§10.2). A conversation open here is
+    /// changed under its own lock, so an upload and a turn never interleave;
+    /// one that is not is changed over its stores restored from those events,
+    /// put on each repository's base first when it has never worked anywhere.
+    pub(crate) async fn change_files<T>(
+        &self,
+        conv_id: &str,
+        change: impl FnOnce(&RepoFiles) -> T,
+    ) -> T {
+        let open = self.conversations.lock().unwrap().get(conv_id).cloned();
+        if let Some(conv) = open {
+            let cs = conv.lock_owned().await;
+            let out = change(&cs.files);
+            conv_overlay::save(
+                &self.engine.lock().unwrap(),
+                timeline_for(conv_id),
+                &cs.files,
+                &cs.mirror,
+            );
+            return out;
+        }
+        self.change_saved(conv_id, change)
+    }
+
+    /// [`Self::change_files`] for a conversation not open here: its stores
+    /// restored from its events, changed, and saved back.
+    pub(crate) fn change_saved<T>(&self, conv_id: &str, change: impl FnOnce(&RepoFiles) -> T) -> T {
+        let timeline = timeline_for(conv_id);
+        let files = self.tool_host.conversation_files();
+        let mirror = Mutex::new(Mirror::unread());
+        {
+            let engine = self.engine.lock().unwrap();
+            conv_branches::seed(&engine, timeline, &self.base_branches);
+            conv_overlay::restore(&engine, timeline, &files, &mirror);
+        }
+        let out = change(&files);
+        conv_overlay::save(&self.engine.lock().unwrap(), timeline, &files, &mirror);
+        out
+    }
+
+    /// Uploads kept before conversations held them, each put in its
+    /// conversation's uploads store and its upload record pointed at it; the
+    /// old folder removed once every file is held (§10.2, §15.1). A file that
+    /// cannot be stored keeps the folder, so nothing is lost.
+    pub(crate) fn take_in_legacy_uploads(&self) {
+        let root = self.workspace.root();
+        let legacy = match crate::legacy_uploads::read(root) {
+            Ok(legacy) => legacy,
+            Err(e) => {
+                tracing::warn!("the old uploads could not be read, and are left as they are: {e}");
+                return;
+            }
+        };
+        if legacy.is_empty() {
+            return;
+        }
+        let mut all_held = true;
+        for (conv_id, files) in legacy {
+            let wanted = files.len();
+            let moved: Vec<(u64, UploadInfo)> = self.change_saved(&conv_id, |repos| {
+                let Ok(store) = repos.repo(UPLOADS_REPO) else {
+                    return Vec::new();
+                };
+                files
+                    .into_iter()
+                    .filter_map(|f| {
+                        let size = f.bytes.len() as u64;
+                        match crate::uploads::store(&store, &f.name, f.bytes) {
+                            Ok(stored) => Some((f.id, upload_record(stored, size))),
+                            Err(e) => {
+                                tracing::warn!(name = %f.name, "an old upload was not taken in: {e}");
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            });
+            all_held &= moved.len() == wanted;
+            let timeline = timeline_for(&conv_id);
+            let engine = self.engine.lock().unwrap();
+            let mut records: Vec<UploadInfo> = engine
+                .conversation_metadata(timeline)
+                .and_then(|m| m.get("uploads").cloned())
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            for (old, new) in &moved {
+                match records.iter_mut().find(|r| r.id == *old) {
+                    Some(r) => {
+                        r.id = new.id;
+                        r.path = new.path.clone();
+                        r.name = new.name.clone();
+                    }
+                    None => records.push(new.clone()),
+                }
+            }
+            if let Ok(json) = serde_json::to_string(&records) {
+                if let Err(e) = engine.set_conversation_metadata(timeline, "uploads", &json) {
+                    tracing::warn!(conv_id = %conv_id, "an old upload's record was not moved: {e}");
+                    all_held = false;
+                }
+            }
+        }
+        if !all_held {
+            tracing::warn!("some old uploads were not taken in; their folder is kept");
+            return;
+        }
+        match crate::legacy_uploads::remove(root) {
+            Ok(()) => tracing::info!("the old uploads are held by their conversations"),
+            Err(e) => tracing::warn!("the old uploads folder could not be removed: {e}"),
+        }
+    }
+
     /// Tombstone the per-file `code_read` conversation of every uploaded file
-    /// that has since been deleted from the `uploads/` folder.
+    /// that no conversation holds any more.
     ///
     /// Uploads are endpoint-managed and on no branch, so the branch pass never
     /// retires them — that would delete uploaded content on the next pass. But
-    /// a genuine deletion of an uploaded file — whether from the filesystem or
-    /// via the GUI — must still retire its conversation; otherwise deleted
+    /// a deleted upload must still retire its conversation; otherwise deleted
     /// uploads accumulate live turns forever, growing the redo log and the
     /// projection candidate set without bound.
     ///
-    /// Cheap and self-limiting: a metadata scan plus one `Path::exists` probe per
-    /// upload conversation, no walk and no re-ingest. Tombstoning only *absent*
-    /// files makes it a no-op for still-present uploads.
+    /// An upload is held while some conversation's upload record names its
+    /// path (§10.2), or while the uploads folder — the lower layer every
+    /// conversation's uploads store reads — still has it. Cheap and
+    /// self-limiting: a metadata scan, no walk and no re-ingest.
     ///
-    /// Runs at startup, to retire uploads deleted while the daemon was down.
+    /// Runs at startup, to retire uploads deleted since the last one.
     pub(crate) fn reconcile_uploaded_files(&self) {
         let engine = self.engine.lock().unwrap();
+        let held: HashSet<String> = engine
+            .conversations_with_metadata_key("uploads")
+            .into_iter()
+            .filter_map(|(_, json)| serde_json::from_str::<Vec<UploadInfo>>(&json).ok())
+            .flatten()
+            .map(|u| u.path)
+            .collect();
         let mut tombstoned = 0usize;
         for (tl, path) in engine.conversations_with_metadata_key("path") {
             if !crate::code_read::is_upload_path(&path) {
@@ -2805,7 +2950,7 @@ impl InferenceState {
             }
             // `path` is workspace-relative with `/` separators; `Path::join`
             // accepts them on win32, and `exists()` is case-insensitive there.
-            if self.workspace.root().join(&path).exists() {
+            if held.contains(&path) || self.workspace.root().join(&path).exists() {
                 continue;
             }
             match engine.tombstone_timeline(tl) {
@@ -3473,7 +3618,7 @@ fn run_inference_stream(
             }
             // The round is finished over the conversation's own files, under
             // the grants of the mode it was held at.
-            let ctx = state.tool_host.context_for(tools_mode, &cs.files);
+            let ctx = state.tool_host.context_for(tools_mode, &cs.files, &conv_id);
             let dispatched =
                 tokio::task::spawn_blocking(move || run_tool_calls(&ctx, calls, Dispatch::Resumed))
                     .await;
@@ -4093,7 +4238,7 @@ fn run_inference_stream(
             // and carries each result so the cards resolve immediately, before
             // the post-stream hydrate.
             let n_calls = round.len();
-            let ctx = state.tool_host.context_for(tools_mode, &cs.files);
+            let ctx = state.tool_host.context_for(tools_mode, &cs.files, &conv_id);
             let ran = tokio::task::spawn_blocking(move || tool_round::run(&ctx, round)).await;
             // Whatever the round changed outlives this conversation's state.
             conv_overlay::save(
@@ -4792,9 +4937,6 @@ pub struct ZendSession {
     started_at_ms: u64,
     /// Populated in the background after construction; None until model loads.
     inference: Arc<RwLock<Option<Arc<InferenceState>>>>,
-    /// Conversation-files store (uploads). Persistent under the workspace,
-    /// independent of the inference engine — available before the model loads.
-    file_store: ConvFileStore,
     /// Handle to the `zend-loader` thread. [`Self::shutdown`] joins it so an
     /// in-progress load has broken its ingest and drained the engine (on the
     /// loader thread, which owns it) before the process exits.
@@ -4851,16 +4993,20 @@ pub struct UploadStats {
 /// in the conversation's Label record, so it recovers with the conversation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UploadInfo {
-    /// Conv-file-store id — the handle the GUI opens the file's content by.
+    /// The handle the GUI opens the file's content by: a hash of its path in
+    /// the conversation's uploads store ([`crate::uploads::id_of`]).
     pub id: u64,
     pub name: String,
-    /// Workspace-relative path of the file (e.g. `uploads/notes (1).txt`),
-    /// with `/` separators — portable, not an absolute host path.
+    /// Workspace-relative path of the file (e.g. `uploads/notes-001.txt`),
+    /// with `/` separators: `uploads/` and its path in the uploads store.
     pub path: String,
     pub ext: String,
     pub kind: String,
     /// Display size (e.g. `18.4 KB`).
     pub size: String,
+    /// Its length in bytes.
+    #[serde(default)]
+    pub bytes: u64,
     /// Display timestamp (e.g. `just now`).
     pub added: String,
     /// Number of turns present when the file was uploaded — positions the
@@ -4872,6 +5018,23 @@ pub struct UploadInfo {
     /// the model wasn't loaded to run the ingest phases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<UploadStats>,
+}
+
+/// The record of a file just stored at `stored` in a conversation's uploads
+/// store, `size` bytes long: positioned and measured later.
+fn upload_record(stored: String, size: u64) -> UploadInfo {
+    UploadInfo {
+        id: crate::uploads::id_of(&stored),
+        path: format!("{UPLOADS_REPO}/{stored}"),
+        ext: crate::conv_files::ext_badge(&stored),
+        kind: crate::conv_files::kind_for(&stored).as_str().to_string(),
+        size: crate::conv_files::fmt_bytes(size),
+        bytes: size,
+        added: "just now".to_string(),
+        name: stored,
+        turn_index: 0,
+        stats: None,
+    }
 }
 
 /// Sidebar entry surfaced by `GET /v1/conversations`. Built directly from
@@ -4930,7 +5093,6 @@ impl ZendSession {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let file_store = ConvFileStore::open(config.workspace.root());
         Self {
             inference: Arc::new(RwLock::new(None)),
             config,
@@ -4940,78 +5102,137 @@ impl ZendSession {
             load_progress: Arc::new(LoadProgress::new()),
             live_turns: Arc::new(LiveTurns::default()),
             started_at_ms,
-            file_store,
             load_thread: Mutex::new(None),
             ingest_worker: Mutex::new(None),
             origin_watch: Mutex::new(None),
         }
     }
 
-    /// The conversation-files store (uploads). Available before the model loads.
-    pub fn files(&self) -> &ConvFileStore {
-        &self.file_store
+    fn loaded(&self) -> Option<Arc<InferenceState>> {
+        self.inference.read().unwrap().as_ref().map(Arc::clone)
     }
 
-    /// The uploads repository's folder in the daemon's workspace — raw
-    /// uploaded files are written here, and the model reads them as
-    /// `repo: uploads`. Created when the workspace is opened.
-    pub fn uploads_dir(&self) -> PathBuf {
-        self.config.workspace.root().join(UPLOADS_REPO)
+    /// Whether the model and its substrate are loaded: what a conversation's
+    /// files need.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded().is_some()
     }
 
-    /// **Phase 1 of the upload pipeline** — write `bytes` to
-    /// `<workspace>/uploads/<safe, non-colliding name>` and return the actual
-    /// path used. The name is sanitized to its final path component and a
-    /// conservative charset (a malicious `name` can never escape the uploads
-    /// directory — no `..`, no separators, no absolute paths), then de-duped
-    /// against existing files so a second `notes.txt` becomes `notes (1).txt`
-    /// rather than overwriting the first. The caller reads the final file name
-    /// back off the returned path.
-    pub fn write_upload_to_disk(&self, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
-        let dir = self.uploads_dir();
-        std::fs::create_dir_all(&dir)?;
-        let safe = sanitize_upload_name(name);
-        let path = dir.join(dedup_in_dir(&dir, &safe));
-        std::fs::write(&path, bytes)?;
-        Ok(path)
+    /// **Phase 1 of the upload pipeline** — each of `files` into `conv_id`'s
+    /// uploads store under a safe, unused name, saved as the conversation's
+    /// file events (§10.2): what was stored, as its upload record, or the file
+    /// and why not. `None` while the model is not loaded: the uploads are the
+    /// substrate's.
+    pub async fn store_uploads(
+        &self,
+        conv_id: &str,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> Option<Vec<Result<UploadInfo, (String, String)>>> {
+        let state = self.loaded()?;
+        Some(
+            state
+                .change_files(conv_id, |repos| {
+                    let store = match repos.repo(UPLOADS_REPO) {
+                        Ok(store) => store,
+                        Err(e) => {
+                            return files
+                                .into_iter()
+                                .map(|(name, _)| Err((name, e.to_string())))
+                                .collect();
+                        }
+                    };
+                    files
+                        .into_iter()
+                        .map(|(name, bytes)| {
+                            let size = bytes.len() as u64;
+                            let stored = crate::uploads::store(&store, &name, bytes)
+                                .map_err(|e| (name.clone(), e.to_string()))?;
+                            Ok(upload_record(stored, size))
+                        })
+                        .collect()
+                })
+                .await,
+        )
     }
 
-    /// The path of a file under the workspace expressed relative to the
-    /// workspace root, with `/` separators (matching `repo_scan`'s
-    /// normalization). Falls back to the file name alone if `path` is
-    /// somehow not under the workspace. This is the form persisted in the
-    /// upload event — a portable, workspace-relative reference, not an
-    /// absolute host path.
-    pub fn workspace_relative(&self, path: &std::path::Path) -> String {
-        path.strip_prefix(self.config.workspace.root())
-            .ok()
-            .and_then(|p| p.to_str())
-            .map(|s| s.replace('\\', "/"))
-            .unwrap_or_else(|| {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("upload")
-                    .to_string()
+    /// The upload record `id` of `conv_id`.
+    fn upload_of(&self, conv_id: &str, id: u64) -> Option<UploadInfo> {
+        self.conversation_uploads(conv_id)
+            .into_iter()
+            .find(|u| u.id == id)
+    }
+
+    /// Upload `id`'s bytes, from `conv_id`'s uploads store. The outer `None`
+    /// while the model is not loaded; the inner when there is no such upload.
+    pub fn upload_content(&self, conv_id: &str, id: u64) -> Option<Option<Vec<u8>>> {
+        let state = self.loaded()?;
+        let Some(upload) = self.upload_of(conv_id, id) else {
+            return Some(None);
+        };
+        let files = state.saved_files(conv_id);
+        let inner = upload.path.split_once('/').map_or("", |(_, p)| p);
+        Some(
+            files
+                .repo(UPLOADS_REPO)
+                .ok()
+                .and_then(|s| s.read_bytes(inner).ok().flatten()),
+        )
+    }
+
+    /// Delete upload `id` from `conv_id`: from its uploads store, saved, and
+    /// from its upload records. Whether it was there; `None` while the model
+    /// is not loaded.
+    pub async fn delete_upload(&self, conv_id: &str, id: u64) -> Option<bool> {
+        let state = self.loaded()?;
+        let Some(upload) = self.upload_of(conv_id, id) else {
+            return Some(false);
+        };
+        let inner = upload
+            .path
+            .split_once('/')
+            .map_or("", |(_, p)| p)
+            .to_string();
+        state
+            .change_files(conv_id, |repos| {
+                if let Ok(store) = repos.repo(UPLOADS_REPO) {
+                    store.delete(&inner);
+                }
             })
+            .await;
+        let kept: Vec<UploadInfo> = self
+            .conversation_uploads(conv_id)
+            .into_iter()
+            .filter(|u| u.id != id)
+            .collect();
+        let timeline = timeline_for(conv_id);
+        let engine = state.engine.lock().unwrap();
+        if let Ok(json) = serde_json::to_string(&kept) {
+            if let Err(e) = engine.set_conversation_metadata(timeline, "uploads", &json) {
+                tracing::warn!(conv_id = %conv_id, "forgetting an upload failed: {e}");
+            }
+        }
+        Some(true)
     }
 
     /// **Phase 2 of the upload pipeline** — read the just-uploaded files into
     /// the substrate via the normal `code_read` ingest, scoped to **only those
-    /// files** (`rel_paths`, workspace-relative). Bounded to the uploaded
-    /// files' work — never a whole-workspace re-ingest — so it can't overload
-    /// the model and is safe under `--skip-code-read`. Returns `Ok(true)` when
-    /// something was ingested, `Ok(false)` for a no-op (non-code files, or the
-    /// model not loaded). Per-scope progress streams into `progress`.
-    /// Returns `(ingested, failed)` — see `ingest_uploaded_files`.
+    /// files** (`rel_paths`, workspace-relative, in `conv_id`'s uploads).
+    /// Bounded to the uploaded files' work — never a whole-workspace re-ingest
+    /// — so it can't overload the model and is safe under `--skip-code-read`.
+    /// Returns `Ok(true)` when something was ingested, `Ok(false)` for a no-op
+    /// (non-code files, or the model not loaded). Per-scope progress streams
+    /// into `progress`. Returns `(ingested, failed)` — see
+    /// `ingest_uploaded_files`.
     pub fn read_file_phase(
         &self,
+        conv_id: &str,
         rel_paths: &[String],
         progress: &Arc<crate::loading::LoadProgress>,
     ) -> anyhow::Result<(bool, bool)> {
-        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+        let Some(state) = self.loaded() else {
             return Ok((false, false));
         };
-        state.ingest_uploaded_files(rel_paths, progress)
+        state.ingest_uploaded_files(conv_id, rel_paths, progress)
     }
 
     /// Kick the async summariser so the just-ingested turns start folding into
@@ -6331,14 +6552,16 @@ impl ZendSession {
                         // ingest passes own it and report sub-step progress
                         // through the same `LoadProgress` handle.
 
-                        // Uploads are endpoint-managed, but a deletion of an
-                        // uploaded file still has to retire its substrate
-                        // conversation: the cheap tombstone-if-absent reconcile
-                        // runs once at startup, for uploads deleted while the
-                        // daemon was down. A read-only substrate takes none of
+                        // Uploads kept before conversations held them are taken
+                        // in once. Uploads are endpoint-managed, but a deletion
+                        // of an uploaded file still has to retire its substrate
+                        // conversation: the cheap tombstone-if-unheld reconcile
+                        // runs once at startup, for uploads deleted since the
+                        // last one. A read-only substrate takes none of
                         // this upkeep, here or below: it is written by the daemon
                         // beside it.
                         if !read_only_substrate {
+                            state.take_in_legacy_uploads();
                             state.reconcile_uploaded_files();
                         }
 
@@ -6735,69 +6958,6 @@ pub fn timeline_for(conv_id: &str) -> projection::TimelineId {
     projection::TimelineId::from_raw(h.lo.max(1)).expect("timeline id is non-zero")
 }
 
-/// Reduce an uploaded file name to a safe basename that stays inside the
-/// uploads directory: take the final path component (defeating `../` and
-/// absolute paths), keep only `[A-Za-z0-9._-]`, collapse the rest to `_`,
-/// and fall back to `upload` if nothing survives. A leading `.` is
-/// prefixed with `_` so uploads are never hidden dotfiles.
-fn sanitize_upload_name(name: &str) -> String {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let mut out: String = base
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    // Windows strips trailing dots/spaces on create; drop them here so the
-    // recorded name matches what actually lands on disk (and a `foo.exe.` can't
-    // dodge the extension gate by re-materialising as `foo.exe`). Spaces have
-    // already become `_`, so only trailing dots remain to trim.
-    while out.ends_with('.') {
-        out.pop();
-    }
-    // Reject the pure-dot names that name a directory, and hidden dotfiles.
-    if out.is_empty() {
-        return "upload".to_string();
-    }
-    if out.starts_with('.') {
-        out.insert(0, '_');
-    }
-    out
-}
-
-/// Return `safe` if it doesn't already exist in `dir`, otherwise the first
-/// free `stem-NNN.ext` variant (`NNN` = 001, 002, …, zero-padded to three
-/// digits so directory listings sort correctly). `safe` is assumed already
-/// sanitized. The scan is bounded; in the (pathological) event every
-/// candidate up to the cap is taken, it falls back to the millisecond
-/// timestamp so the write still succeeds rather than clobbering.
-fn dedup_in_dir(dir: &std::path::Path, safe: &str) -> String {
-    if !dir.join(safe).exists() {
-        return safe.to_string();
-    }
-    // Split into stem + extension (the extension is the final `.` segment,
-    // if any) so the counter lands before the extension: `notes-001.txt`.
-    let (stem, ext) = match safe.rfind('.') {
-        Some(i) if i > 0 => (&safe[..i], &safe[i..]), // ext includes the dot
-        _ => (safe, ""),
-    };
-    for n in 1..=9999u32 {
-        let cand = format!("{stem}-{n:03}{ext}");
-        if !dir.join(&cand).exists() {
-            return cand;
-        }
-    }
-    let stamp = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    format!("{stem}-{stamp}{ext}")
-}
-
 /// Cap the titler's prefill at `head + tail` tokens. For short messages
 /// (≤ head+tail) the text is returned verbatim; for long ones the head and
 /// tail token windows are decoded back to text and joined with `" … "`.
@@ -7041,61 +7201,6 @@ fn pre_collection_prelude(builder: &Builder) -> String {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod sanitize_tests {
-    use super::sanitize_upload_name;
-
-    #[test]
-    fn keeps_safe_basenames() {
-        assert_eq!(sanitize_upload_name("notes.txt"), "notes.txt");
-        assert_eq!(sanitize_upload_name("my-file_v2.rs"), "my-file_v2.rs");
-    }
-
-    #[test]
-    fn strips_path_traversal_and_separators() {
-        // Only the final component survives — no directory escape possible.
-        assert_eq!(sanitize_upload_name("../../etc/passwd"), "passwd");
-        assert_eq!(sanitize_upload_name("/abs/path/x.md"), "x.md");
-        assert_eq!(sanitize_upload_name("a\\b\\c.json"), "c.json");
-        assert_eq!(sanitize_upload_name(".."), "upload");
-        assert_eq!(sanitize_upload_name("."), "upload");
-    }
-
-    #[test]
-    fn collapses_unsafe_chars_and_unhides_dotfiles() {
-        assert_eq!(
-            sanitize_upload_name("weird name!@#.txt"),
-            "weird_name___.txt"
-        );
-        assert_eq!(sanitize_upload_name(".env"), "_.env"); // never a hidden dotfile
-        assert_eq!(sanitize_upload_name(""), "upload");
-    }
-
-    #[test]
-    fn dedup_appends_a_counter_before_the_extension() {
-        use super::dedup_in_dir;
-        let dir = std::env::temp_dir().join(format!(
-            "zend_dedup_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // A free name is returned verbatim.
-        assert_eq!(dedup_in_dir(&dir, "notes.txt"), "notes.txt");
-        std::fs::write(dir.join("notes.txt"), b"a").unwrap();
-        // Collision -> "notes-001.txt"; zero-padded, counter before the ext.
-        assert_eq!(dedup_in_dir(&dir, "notes.txt"), "notes-001.txt");
-        std::fs::write(dir.join("notes-001.txt"), b"b").unwrap();
-        assert_eq!(dedup_in_dir(&dir, "notes.txt"), "notes-002.txt");
-        // Extensionless names get the counter at the end.
-        std::fs::write(dir.join("README"), b"c").unwrap();
-        assert_eq!(dedup_in_dir(&dir, "README"), "README-001");
-        std::fs::remove_dir_all(&dir).ok();
-    }
 }
 
 #[cfg(test)]

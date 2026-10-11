@@ -224,7 +224,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
     };
     let served = single_repo(workspace, FIXTURE_REPO).expect("workspace");
     let tool_host = ToolHost::new(&served, Arc::new(Secrets::empty())).expect("tool host");
-    let tool_ctx = tool_host.context_for(ToolMode::Restricted, &tool_host.conversation_files());
+    let tool_ctx = tool_host.context_for(ToolMode::Restricted, &tool_host.conversation_files(), "");
     let dialogue = engine
         .new_conversation_with_projection(
             &formatted_prompt,

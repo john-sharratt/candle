@@ -55,12 +55,12 @@ impl Tool for RunOutput {
     }
 
     fn run(ctx: &ToolContext, req: OutputRequest) -> Result<OutputResponse, RunError> {
-        let sandboxes = ctx.sandboxes()?.ok_or(RunError::NoSandboxes)?;
+        let executor = ctx.executor()?.ok_or(RunError::NoSandboxes)?;
         // The repository is named as every file tool names it, so an unknown
         // one is `unknown_repo` here too.
         ctx.files.repo(&req.repo)?;
         let id = JobId::parse(&req.job).ok_or_else(|| RunError::BadJob(req.job.clone()))?;
-        let (info, output) = sandboxes.output(&req.repo, &id, req.page)?;
+        let (info, output) = executor.output(&req.repo, &id, req.page)?;
         let (status, exit_code) = match info.status {
             JobStatus::Queued => ("queued", None),
             JobStatus::Running => ("running", None),

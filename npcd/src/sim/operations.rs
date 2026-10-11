@@ -56,19 +56,33 @@ pub struct Operation {
     /// What the work reads, beside its own document.
     #[serde(default)]
     pub reads: Vec<String>,
-    /// What its document said when it opened, for one that works on a document
-    /// the record already held — put back if it fails and its workflow says
-    /// `restore`. `None` for a draft.
-    #[serde(default)]
-    pub before: Option<String>,
     /// What its document said when the step on offer was taken up — what a
     /// step that must change it is judged against.
     #[serde(default)]
     pub found: Option<String>,
-    /// Whether a failed operation's document has been settled.
+    /// Whether a failed operation's store has been settled.
     #[serde(default)]
     pub retired: bool,
+    /// The commit its store landed on the record as, once published.
+    #[serde(default)]
+    pub published: Option<String>,
+    /// When its publish step may be offered again, in milliseconds since the
+    /// epoch, after a publish that could not reach git — and why it could not.
+    #[serde(default)]
+    pub retry: Option<Retry>,
 }
+
+/// A publish that could not reach git, and when it is tried again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retry {
+    pub at_ms: u64,
+    pub why: String,
+}
+
+/// How long a publish that could not reach git waits before its step is
+/// offered again: the same on every world and member, so a disconnected world
+/// needs nothing from a gateway to keep it (§10.3).
+pub const RETRY_AFTER_MS: u64 = 30 * 60 * 1000;
 
 /// The run of an operation saved before operations ran on workflows: settled,
 /// so nothing offers it again.
@@ -195,19 +209,13 @@ impl Operations {
                 brief: String::new(),
                 fields: BTreeMap::new(),
                 reads: Vec::new(),
-                before: None,
                 found: None,
                 retired: false,
+                published: None,
+                retry: None,
             },
         );
         Ok(id)
-    }
-
-    /// Keep `text` as what operation `id`'s document said when it opened.
-    pub fn kept_before(&mut self, id: u64, text: &str) {
-        if let Some(op) = self.ops.get_mut(&id) {
-            op.before = Some(text.to_string());
-        }
     }
 
     /// Keep the brief operation `id` was written to, the proposal fields its
@@ -262,11 +270,13 @@ impl Operations {
     }
 
     /// The operations waiting on a Maker's step that is not yet on the table,
-    /// oldest first.
-    pub fn awaiting_offer(&self) -> Vec<u64> {
+    /// oldest first — a publish waiting to be tried again only once its time
+    /// has come, at `now_ms`.
+    pub fn awaiting_offer(&self, now_ms: u64) -> Vec<u64> {
         self.ops
             .values()
             .filter(|o| !o.offered && o.holder.is_none())
+            .filter(|o| o.retry.as_ref().is_none_or(|r| r.at_ms <= now_ms))
             .filter(|o| {
                 self.workflow_of(o)
                     .and_then(|w| w.step(o.step()?))
@@ -366,15 +376,17 @@ impl Operations {
         o.holder = None;
         o.offered = false;
         o.retired = false;
+        o.published = None;
+        o.retry = None;
         Ok(())
     }
 
-    /// What becomes of `op`'s document now that it has failed.
+    /// What becomes of `op`'s store now that it has failed.
     pub fn on_failed(&self, op: &Operation) -> OnFailed {
         self.workflow_of(op).map_or(OnFailed::Keep, |w| w.on_failed)
     }
 
-    /// The failed operations whose documents have not yet been settled.
+    /// The failed operations whose stores have not yet been settled.
     pub fn to_retire(&self) -> Vec<Operation> {
         self.ops
             .values()
@@ -383,16 +395,38 @@ impl Operations {
             .collect()
     }
 
-    /// Whether an operation opened after `op` on the same document has
-    /// succeeded — whose accepted text putting `op`'s document back would
-    /// overwrite.
-    pub fn succeeded_after(&self, op: &Operation) -> bool {
-        self.ops
-            .values()
-            .any(|o| o.id > op.id && o.document == op.document && o.succeeded())
+    /// Operation `id`'s store landed on the record as `commit`.
+    pub fn published(&mut self, id: u64, commit: &str) {
+        if let Some(o) = self.ops.get_mut(&id) {
+            o.published = Some(commit.to_string());
+            o.retry = None;
+        }
     }
 
-    /// Record that operation `id`'s failed document has been settled.
+    /// Operation `id`'s publish could not reach git, for `why`, at `now_ms`:
+    /// its step is offered again [`RETRY_AFTER_MS`] later. Nothing else about
+    /// it changes.
+    pub fn publish_waits(&mut self, id: u64, why: &str, now_ms: u64) {
+        if let Some(o) = self.ops.get_mut(&id) {
+            o.retry = Some(Retry {
+                at_ms: now_ms + RETRY_AFTER_MS,
+                why: why.to_string(),
+            });
+        }
+    }
+
+    /// Offer operation `id`'s waiting publish at once, as an operator asks.
+    pub fn retry_now(&mut self, id: u64) -> bool {
+        match self.ops.get_mut(&id) {
+            Some(o) if o.retry.is_some() => {
+                o.retry = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record that operation `id`'s failed store has been settled.
     pub fn mark_retired(&mut self, id: u64) {
         if let Some(o) = self.ops.get_mut(&id) {
             o.retired = true;
@@ -460,17 +494,17 @@ pub(crate) mod tests {
         ops.get(id).unwrap().step().map(str::to_string)
     }
 
-    /// **A story runs write, read, review, read again, canon — and stands**,
-    /// each Maker step by somebody who has not acted in the round.
+    /// **A story runs write, read, review, read again, canon, publish — and
+    /// stands**, each Maker step by somebody who has not acted in the round.
     #[test]
     fn a_story_runs_its_workflow_and_stands() {
         let (mut ops, id) = one("story", "layers/stories/x.md");
         assert_eq!(ops.get(id).unwrap().name, "Operation Iron Lantern");
         assert_eq!(at(&ops, id).as_deref(), Some("write"));
-        assert_eq!(ops.awaiting_offer(), vec![id]);
+        assert_eq!(ops.awaiting_offer(0), vec![id]);
         assert_eq!(ops.edits(id), Some(Edits::New));
         ops.offered(id);
-        assert!(ops.awaiting_offer().is_empty());
+        assert!(ops.awaiting_offer(0).is_empty());
         assert!(ops.may_take(id, "wren"));
         ops.taken(id, "wren", None);
         assert!(!ops.may_take(id, "pax"), "held");
@@ -489,13 +523,55 @@ pub(crate) mod tests {
         ops.advance(id, &Taker::Table, Some("sound"), "").unwrap();
         assert_eq!(at(&ops, id).as_deref(), Some("canon"));
         assert!(!ops.may_take(id, "pax"));
+        ops.advance(id, &by("bram"), Some("pass"), "agrees")
+            .unwrap();
+        assert_eq!(at(&ops, id).as_deref(), Some("publish"));
+        assert_eq!(ops.edits(id), Some(Edits::Optional));
+        assert!(ops.may_take(id, "wren"), "anybody may publish");
         assert_eq!(
-            ops.advance(id, &by("bram"), Some("pass"), "agrees"),
+            ops.advance(id, &by("wren"), None, "landed"),
             Ok(Where::Done)
         );
         let o = ops.get(id).unwrap();
         assert!(o.succeeded() && o.settled());
         assert!(ops.to_retire().is_empty());
+    }
+
+    /// **A publish that could not reach git waits 30 minutes**, changing
+    /// nothing else; an operator may offer it at once, and a landed publish
+    /// clears the wait.
+    #[test]
+    fn a_publish_that_could_not_reach_git_waits_thirty_minutes() {
+        let (mut ops, id) = one("correction", "layers/eras/a.md");
+        ops.advance(id, &by("wren"), None, "changed").unwrap();
+        ops.advance(id, &Taker::Table, Some("sound"), "").unwrap();
+        ops.advance(id, &by("pax"), Some("pass"), "agrees").unwrap();
+        ops.advance(id, &Taker::Table, Some("sound"), "").unwrap();
+        assert_eq!(at(&ops, id).as_deref(), Some("publish"));
+        let run = ops.get(id).unwrap().run.clone();
+
+        ops.publish_waits(id, "origin is not reachable", 1_000);
+        let o = ops.get(id).unwrap();
+        assert_eq!(
+            o.retry,
+            Some(Retry {
+                at_ms: 1_801_000,
+                why: "origin is not reachable".to_string()
+            })
+        );
+        assert_eq!(o.run, run, "the run is as it was");
+        assert!(ops.awaiting_offer(1_800_999).is_empty());
+        assert_eq!(ops.awaiting_offer(1_801_000), vec![id]);
+
+        assert!(ops.retry_now(id));
+        assert!(!ops.retry_now(id), "nothing waits");
+        assert_eq!(ops.awaiting_offer(0), vec![id]);
+
+        ops.publish_waits(id, "no agent", 0);
+        ops.published(id, "0123abcd");
+        let o = ops.get(id).unwrap();
+        assert_eq!(o.published.as_deref(), Some("0123abcd"));
+        assert_eq!(o.retry, None);
     }
 
     /// **A rejection sends it to be fixed, by anybody but who rejected it** —
@@ -528,7 +604,7 @@ pub(crate) mod tests {
         let o = ops.get(id).unwrap();
         assert!(o.failed(), "{:?}", o.run.at);
         assert!(o.why().unwrap().ends_with("still wrong"));
-        assert_eq!(ops.on_failed(o), OnFailed::SetAside);
+        assert_eq!(ops.on_failed(o), OnFailed::Discard);
         assert_eq!(ops.to_retire().len(), 1);
         ops.mark_retired(id);
         assert!(ops.to_retire().is_empty());
@@ -550,18 +626,21 @@ pub(crate) mod tests {
         assert_eq!(at(&ops, id).as_deref(), Some("fix"));
     }
 
-    /// **A correction stands on the table's second reading** — no canon check
-    /// — and its document is put back if it fails.
+    /// **A correction publishes on the table's second reading** — no canon
+    /// check — and its store is discarded if it fails.
     #[test]
-    fn a_correction_stands_without_a_canon_check_and_is_restored_on_failure() {
+    fn a_correction_publishes_without_a_canon_check_and_is_discarded_on_failure() {
         let (mut ops, id) = one("correction", "layers/eras/a.md");
-        ops.kept_before(id, "the era as it was");
         assert_eq!(ops.edits(id), Some(Edits::Change));
         ops.advance(id, &by("wren"), None, "changed").unwrap();
         ops.advance(id, &Taker::Table, Some("sound"), "").unwrap();
         ops.advance(id, &by("pax"), Some("pass"), "agrees").unwrap();
         assert_eq!(
             ops.advance(id, &Taker::Table, Some("sound"), ""),
+            Ok(Where::NextStep("publish".to_string()))
+        );
+        assert_eq!(
+            ops.advance(id, &by("bram"), None, "landed"),
             Ok(Where::Done)
         );
         let (mut ops, id) = one("correction", "layers/eras/a.md");
@@ -569,7 +648,7 @@ pub(crate) mod tests {
             .unwrap();
         let o = ops.get(id).unwrap();
         assert!(o.failed());
-        assert_eq!(ops.on_failed(o), OnFailed::Restore);
+        assert_eq!(ops.on_failed(o), OnFailed::Discard);
     }
 
     /// An operation can be opened at any step — a review of a document put
@@ -595,12 +674,12 @@ pub(crate) mod tests {
         assert_eq!(ops.get(id).unwrap().why(), Some("not wanted"));
         ops.reopen(id, "canon").unwrap();
         assert_eq!(at(&ops, id).as_deref(), Some("canon"));
-        assert_eq!(ops.awaiting_offer(), vec![id]);
+        assert_eq!(ops.awaiting_offer(0), vec![id]);
         ops.offered(id);
         ops.taken(id, "pax", Some("text".into()));
         assert_eq!(ops.get(id).unwrap().found.as_deref(), Some("text"));
         ops.released(id);
-        assert_eq!(ops.awaiting_offer(), vec![id]);
+        assert_eq!(ops.awaiting_offer(0), vec![id]);
     }
 
     /// An operation saved before workflows loads settled, and is offered to
@@ -613,7 +692,7 @@ pub(crate) mod tests {
         ops.set_workflows(workflows());
         let o = ops.get(1).unwrap();
         assert!(o.settled() && !o.failed());
-        assert!(ops.awaiting_offer().is_empty() && ops.awaiting_table().is_empty());
+        assert!(ops.awaiting_offer(0).is_empty() && ops.awaiting_table().is_empty());
     }
 
     #[test]

@@ -31,7 +31,6 @@
 //! reviewing what the model wrote.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,6 +38,7 @@ use sha2::{Digest, Sha256};
 use super::calendar::{months_in_year, Date};
 use super::consequence::Consequence;
 use super::seed::{Checked, Era, Grain, Seed};
+use crate::sim::shelf::Shelf;
 
 /// One generated body of text, and what has happened to it since.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,48 +660,39 @@ pub fn is_safe_id(who: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
-/// Where a plan is stored: `<mind>/.lifegen/<who>.json`.
+/// Where a plan is kept in the mind: `.lifegen/<who>.json`.
 ///
-/// A dot-directory outside `layers/`, for two independent reasons — the walker
+/// A dot-folder outside `layers/`, for two independent reasons — the walker
 /// admits only `.md`/`.yaml`, so JSON is invisible to it anyway, and a file
-/// inside a life directory would be reported by
+/// inside a life folder would be reported by
 /// [`crate::engine::life::episodes`] as an undated document on every load.
 ///
 /// `None` for an id that must not become a path; see [`is_safe_id`].
-pub fn path(mind: &Path, who: &str) -> Option<PathBuf> {
-    is_safe_id(who).then(|| mind.join(".lifegen").join(format!("{who}.json")))
+pub fn path(who: &str) -> Option<String> {
+    is_safe_id(who).then(|| format!(".lifegen/{who}.json"))
 }
 
 fn unsafe_id(who: &str) -> anyhow::Error {
     anyhow::anyhow!("`{who}` is not a character id this daemon will build a path from")
 }
 
-/// Read a plan, or `None` when there is not one yet.
-pub fn load(mind: &Path, who: &str) -> anyhow::Result<Option<Plan>> {
-    let p = path(mind, who).ok_or_else(|| unsafe_id(who))?;
-    match std::fs::read(&p) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+/// Read a plan as `shelf` holds it, or `None` when there is not one yet.
+pub fn load(shelf: &dyn Shelf, who: &str) -> anyhow::Result<Option<Plan>> {
+    let p = path(who).ok_or_else(|| unsafe_id(who))?;
+    match shelf.read(&p) {
+        Some(text) => Ok(Some(serde_json::from_str(&text)?)),
+        None => Ok(None),
     }
 }
 
-/// Write a plan, atomically.
-///
-/// Through a temporary and a rename, because the alternative is a truncated
-/// plan when the daemon dies mid-write — and a plan is the only record of what
-/// an operator edited by hand. The documents can be regenerated; their
-/// corrections cannot.
-pub fn save(mind: &Path, plan: &Plan) -> anyhow::Result<()> {
+/// A plan as it is kept: where, and its text. It is kept with the documents
+/// it writes ([`super::document::keep`]), in one commit — a plan is the only
+/// record of what an operator edited by hand, and a plan and a folder that
+/// disagree is a state somebody would have to reconcile by hand.
+pub fn stored(plan: &Plan) -> anyhow::Result<(String, String)> {
     let who = &plan.seed.who;
-    let p = path(mind, who).ok_or_else(|| unsafe_id(who))?;
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(plan)?)?;
-    std::fs::rename(&tmp, &p)?;
-    Ok(())
+    let p = path(who).ok_or_else(|| unsafe_id(who))?;
+    Ok((p, serde_json::to_string_pretty(plan)?))
 }
 
 /// The date a node falls on, as a real calendar date — used to check a day
@@ -713,6 +704,8 @@ pub fn day_date(year: i32, month: u32, day: u32) -> Option<Date> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drafts::disk::Disk;
+    use crate::engine::watcher::is_ingestible;
     use crate::lifegen::seed::{check, Cadence, Seed};
 
     fn seed(born: &str, through: &str) -> Seed {
@@ -1185,24 +1178,22 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_saves_and_loads_from_a_dot_directory_outside_the_layers() {
-        let mind = std::env::temp_dir().join(format!("npcd-plan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&mind);
-        std::fs::create_dir_all(&mind).unwrap();
-
+    fn a_plan_is_kept_in_a_dot_folder_outside_the_layers() {
+        let mind = tempfile::tempdir().unwrap();
+        let shelf = Disk::new(mind.path());
         assert!(
-            load(&mind, "cindy-tan").unwrap().is_none(),
+            load(&shelf, "cindy-tan").unwrap().is_none(),
             "absent is ordinary"
         );
         let p = plan();
-        save(&mind, &p).unwrap();
-        assert_eq!(load(&mind, "cindy-tan").unwrap().unwrap(), p);
+        let (at, text) = stored(&p).unwrap();
+        assert_eq!(at, ".lifegen/cindy-tan.json");
+        shelf.commit(&[(at.clone(), Some(text))]).unwrap();
+        assert_eq!(load(&shelf, "cindy-tan").unwrap().unwrap(), p);
 
         // Outside `layers/`, and not a file the ingest walker would ever admit.
-        let stored = path(&mind, "cindy-tan").unwrap();
-        assert!(stored.starts_with(mind.join(".lifegen")));
-        assert!(!crate::engine::watcher::is_ingestible(&stored));
-        let _ = std::fs::remove_dir_all(&mind);
+        assert!(!is_ingestible(&mind.path().join(&at)));
+        assert_eq!(path("../x"), None);
     }
 
     #[test]

@@ -42,14 +42,12 @@ applied-set         = { path = "../applied-set" }
 http-body           = "1"
 bytes               = "1"
 # A member dials each gateway over `wss`, verifying its certificate against the
-# Mozilla roots built into the binary. The TLS is its own, on `ring` as `web`'s
-# is, and the WebSocket handshake runs over it: two crypto providers linked
-# into one process leave rustls with no default to pick.
-tokio-tungstenite   = { version = "0.24", default-features = false, features = ["handshake"] }
-rustls              = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Mozilla roots built into the binary.
+cluster-dial        = { path = "../cluster-dial" }
+# `--agent`: the agent in this process, beside the tenants (§11.5).
+agent               = { path = "../agent" }
+zend-vfs            = { path = "../zend-vfs" }
 tokio-rustls        = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls-pki-types    = { version = "1", features = ["std"] }
-webpki-roots        = "1"
 # The requests a gateway sends over a member's socket, served as the TLS
 # entrance serves a connection.
 hyper               = { version = "1", features = ["server", "client", "http1"] }

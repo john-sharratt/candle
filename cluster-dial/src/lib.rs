@@ -1,8 +1,9 @@
-//! A member's connection to one gateway (`docs/replicated_substrate.md` §3.2,
-//! §13.3): `wss` to an `https` cluster, its certificate verified against the
-//! Mozilla roots built into the binary — by the URL's host, or by
-//! `--cluster-name` when the URL names an address — and never self-signed. An
-//! `http` cluster is refused unless its host is loopback.
+//! A member's or an agent's connection to one gateway
+//! (`docs/replicated_substrate.md` §3.2, §13.3): `wss` to an `https` cluster,
+//! its certificate verified against the Mozilla roots built into the binary —
+//! by the URL's host, or by `--cluster-name` when the URL names an address —
+//! and never self-signed. An `http` cluster is refused unless its host is
+//! loopback.
 
 use std::net::IpAddr;
 use std::sync::Arc;

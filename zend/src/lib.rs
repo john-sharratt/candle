@@ -9,10 +9,11 @@
 //! (`loading`, `config`); workspace ingestion
 //! (`ingest`, `ingest_backlog`, `ingest_report`, `ingest_worker`, `repo_scan`,
 //! `code_read`, `raw_read`, `refresh_ctx`, `turn_sink`); tool
-//! orchestration (`tools`, `tool_def`, `tool_summary`); conversation-attached
-//! files (`conv_files`, `conv_file_store`); and shared wire types (`types`,
-//! `response_section`).
+//! orchestration (`tools`, `tool_def`, `tool_summary`, `agent_exec`);
+//! conversation-attached files (`conv_files`, `uploads`, `legacy_uploads`);
+//! and shared wire types (`types`, `response_section`, `repo_ads`).
 pub mod access;
+pub mod agent_exec;
 pub mod api;
 pub mod branch_ingest;
 pub mod chatml;
@@ -21,7 +22,6 @@ pub mod code_read;
 pub mod coding_sampling;
 pub mod config;
 pub mod conv_branches;
-pub mod conv_file_store;
 pub mod conv_files;
 pub mod conv_order;
 pub mod conv_overlay;
@@ -31,6 +31,7 @@ pub mod ingest_backlog;
 pub mod ingest_cancel;
 pub mod ingest_report;
 pub mod ingest_worker;
+pub mod legacy_uploads;
 pub mod lenient_json;
 pub mod live_turn;
 pub mod loading;
@@ -42,12 +43,12 @@ pub mod raw_read;
 pub mod reasoning_split;
 pub mod refresh_ctx;
 pub mod repeat_guard;
+pub mod repo_ads;
 pub mod repo_path;
 pub mod repo_scan;
 pub mod response_section;
 pub mod resume;
 pub mod retrieval_scope;
-pub mod sandbox_programs;
 pub mod schema_layers;
 pub mod secrets;
 pub mod self_check;
@@ -64,5 +65,6 @@ pub mod tool_summary;
 pub mod tools;
 pub mod turn_sink;
 pub mod types;
+pub mod uploads;
 pub mod working_set;
 pub mod workspace;

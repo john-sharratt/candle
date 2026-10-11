@@ -191,7 +191,7 @@ fn build(
             prefill_backlog: 0,
             vram_free_mib: 1000,
             cores: 8,
-            load_milli: 0,
+            ..Capacity::default()
         }),
         Some(replication),
         Instant::now(),

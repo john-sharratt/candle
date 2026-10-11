@@ -33,6 +33,10 @@ host         = { path = "../host" }
 # How each route is dispatched under a cluster, and the passthrough key the
 # gateway routes a conversation by (`docs/replicated_substrate.md` §5.2).
 cluster      = { path = "../cluster" }
+# With `--cluster`, commands and pushes go to agents (`docs/replicated_substrate.md` §11.5).
+agent        = { path = "../agent" }
+# A conversation's files kept as file events (`docs/zend_vfs_events.md`).
+store-events = { path = "../store-events" }
 # The gateway's own types, where zend reads them: who a caller is
 # (`web::auth`) and how a file goes on the wire (`web::asset` — entity tag,
 # conditional answer, gzip, cache tier), one implementation shared with the
@@ -53,6 +57,7 @@ tokenizers          = { workspace = true }
 # can be pinned independently as the language ecosystem moves.
 ignore                  = "0.4"
 sha2                    = "0.10"
+thiserror               = { workspace = true }
 #
 # `tree-sitter` sets `links = "tree-sitter"`, so exactly ONE version may exist
 # in the whole workspace — which makes this pin a workspace-wide decision rather

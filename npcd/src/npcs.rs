@@ -823,6 +823,32 @@ impl Npcs {
         self.bump(npc, owner, now_ms)
     }
 
+    /// Every character whose portrait names an image `renames` has a new name
+    /// for, written again naming it. Returns how many were.
+    pub fn repoint_portraits(
+        &mut self,
+        renames: &HashMap<String, String>,
+        now_ms: u64,
+    ) -> Result<usize, NpcError> {
+        let moved: Vec<NpcPayload> = self
+            .by_id
+            .values()
+            .filter(|n| {
+                n.portrait_image_id
+                    .as_ref()
+                    .is_some_and(|id| renames.contains_key(id))
+            })
+            .cloned()
+            .collect();
+        for mut npc in moved.clone() {
+            let id = npc.portrait_image_id.take().unwrap_or_default();
+            npc.portrait_image_id = renames.get(&id).cloned();
+            let owner = npc.owner_id.clone();
+            self.bump(npc, &owner, now_ms)?;
+        }
+        Ok(moved.len())
+    }
+
     /// Set the affect dials.
     pub fn put_modulation(
         &mut self,

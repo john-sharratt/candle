@@ -24,18 +24,24 @@
 //! thing let go without a reason cannot be argued with later. Each of those is
 //! written for a character to read and act on.
 
+use std::sync::Arc;
+
 use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
+use crate::engine::archive;
 use crate::engine::body::Outcome;
 use crate::engine::chronology;
 use crate::engine::mission::{progress_line, time_step, Aim, DocStep, Mission, Outcome as Verdict};
-use crate::engine::mission_gen::config::CHANGED;
+use crate::engine::mission_gen::config::{CHANGED, MERGE_PUBLISH, MERGE_STATUS, MERGE_SYNC};
 use crate::engine::mission_gen::copied::{self, BRIEF_COPIED};
 use crate::engine::mission_gen::{gates, leakage, rejection};
 use crate::engine::passage;
 use crate::engine::workflow::OnFailed;
+use crate::engine::workflow::PUBLISHED;
+use crate::opstore::owner::Owner;
 use crate::sim::record::{slug_of, Condition, Item, Kind, State};
+use crate::sim::shelf::Shelf;
 use crate::sim::Sim;
 use crate::world::Hosted;
 use npc_map::route;
@@ -338,57 +344,59 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                      found, before you judge it — reject only what your mending could not save."
                 ));
             }
+            let shelf = hosted.shelf_of(body);
             let unsupported = hosted.sim(|s| {
                 let m = s.missions.active(body)?;
                 m.operation()?;
-                rejection::unsupported(s.bench.mind_root()?, m.work.as_ref()?, &why)
+                rejection::unsupported(&*shelf, m.work.as_ref()?, &why)
             });
             if let Some(refusal) = unsupported {
                 tracing::info!(npc = body, %why, "operation rejection refused: no evidence");
                 return Outcome::Refused(refusal);
             }
-            hosted.with_sim(|s| {
-                let Some(m) = s.missions.reject(body, &why) else {
-                    return Outcome::Refused(
-                        "You are not reviewing anybody's draft; there is nothing to reject.".into(),
-                    );
-                };
+            let rejected = hosted.with_sim(|s| {
+                let m = s.missions.reject(body, &why)?;
                 // **A rejected draft goes where its workflow sends a
                 // rejection** — back to be fixed, with your reasons as what the
                 // fix answers to. Only one sent back as often as its workflow
-                // allows has failed, and its document is settled as the
-                // workflow's `on-failed` says: a draft moved aside, not
-                // deleted, so an operator can still read what was refused; a
-                // correction's put back to what it said — see
-                // `Sim::set_aside_failed`. Settled here at once, so the
-                // reviewer's world shows it; the generator's loop settles
-                // every other failure the same way, and doing so again is
-                // harmless.
+                // allows has failed, and its store is settled as the
+                // workflow's `on-failed` says: discarded, or kept unpublished
+                // for an operator to reopen. Settled here at once; the
+                // generator's loop settles every other failure the same way,
+                // and discarding again is harmless.
                 let op = m
                     .operation()
                     .and_then(|(id, _)| s.missions.operations().get(id))
                     .cloned();
-                let failed = op.as_ref().is_some_and(|o| o.failed());
-                let moved = match failed {
-                    true => op.as_ref().and_then(|o| s.set_aside_failed(o)),
-                    false => None,
-                };
-                let on_failed = op
+                let failed = op
                     .as_ref()
-                    .map_or(OnFailed::Keep, |o| s.missions.operations().on_failed(o));
-                let gone = match (failed, on_failed) {
-                    (false, _) => "it goes back to be fixed, with your reasons",
-                    (true, OnFailed::SetAside) => "the draft leaves the record",
-                    (true, OnFailed::Restore) => "the document goes back to what it said before",
-                    (true, OnFailed::Keep) => "the document stays as it is",
-                };
-                tracing::info!(npc = body, prompt = %m.mission_text(), %why, moved = ?moved, "operation REJECTED on review");
-                Outcome::Did(format!(
-                    "Rejected, with your reasons; {gone}. {}{}",
-                    m.mission_text(),
-                    back_to_now(&m)
-                ))
-            })
+                    .filter(|o| o.failed())
+                    .map(|o| (o.id, s.missions.operations().on_failed(o)));
+                Some((m, failed))
+            });
+            let Some((m, failed)) = rejected else {
+                return Outcome::Refused(
+                    "You are not reviewing anybody's draft; there is nothing to reject.".into(),
+                );
+            };
+            let gone = match failed {
+                None => "it goes back to be fixed, with your reasons",
+                Some((id, OnFailed::Discard)) => {
+                    if let Some(stores) = hosted.op_stores() {
+                        stores.discard(&Owner::operation(hosted.id(), id));
+                    }
+                    "the work is dropped, and the record stays as it was"
+                }
+                Some((_, OnFailed::Keep)) => {
+                    "the work is kept, unpublished, for an operator to reopen"
+                }
+            };
+            tracing::info!(npc = body, prompt = %m.mission_text(), %why, "operation REJECTED on review");
+            Outcome::Did(format!(
+                "Rejected, with your reasons; {gone}. {}{}",
+                m.mission_text(),
+                back_to_now(&m)
+            ))
         }
         other => Outcome::Refused(format!("`{other}` is not a mission act.")),
     }
@@ -403,7 +411,7 @@ pub fn take_up(hosted: &Hosted, body: &str) -> String {
     let me = hosted
         .read(|w| w.actor(body).map(|actor| actor.name.clone()))
         .unwrap_or_default();
-    hosted.with_both(|w, s| {
+    let mission = hosted.with_both(|w, s| {
         let room_name = |place: &str| {
             let (area, node) = place.split_once('/')?;
             w.node(&Where::new(area, node)).map(|n| n.name.clone())
@@ -418,19 +426,19 @@ pub fn take_up(hosted: &Hosted, body: &str) -> String {
             })
             .unwrap_or_default();
         let material = s.mission_material(&me, &room_name, &reach);
-        let mission = s.missions.collect(body, &material.facts()).clone();
-        tracing::info!(npc = body, prompt = %mission.mission_text(), "mission taken up at the command table");
-        // What an operation's document says as its step is taken up — what a
-        // step that must change it is held against (`changed`).
-        let found = mission.operation().zip(mission.work.as_ref()).and_then(|((id, _), w)| {
-            let text = std::fs::read_to_string(s.bench.mind_root()?.join(&w.writes)).ok()?;
-            Some((id, text))
-        });
-        if let Some((id, text)) = found {
-            s.missions.found(id, text);
-        }
-        mission.standing_text()
-    })
+        s.missions.collect(body, &material.facts()).clone()
+    });
+    tracing::info!(npc = body, prompt = %mission.mission_text(), "mission taken up at the command table");
+    // What an operation's document says in its store as its step is taken up
+    // — what a step that must change it is held against (`changed`).
+    let found = mission
+        .operation()
+        .zip(mission.work.as_ref())
+        .and_then(|((id, _), w)| Some((id, hosted.op_shelf(id)?.read(&w.writes)?)));
+    if let Some((id, text)) = found {
+        hosted.with_sim(|s| s.missions.found(id, text));
+    }
+    mission.standing_text()
 }
 
 /// Whether the next step of the body's mission still to do is the writing of
@@ -455,67 +463,106 @@ fn rewriting_next(hosted: &Hosted, body: &str) -> bool {
 /// the gate's faults, once the engine has tidied what needs no judgement (see
 /// [`gates::tidy`]). `None` when nothing does.
 pub fn report_block(hosted: &Hosted, body: &str) -> Option<String> {
-    let tidy = hosted.sim(|s| {
+    // A publish step not yet landed is held at the report, but nothing in the
+    // document is wrong: there is nothing to write again.
+    if let Some(why) = hosted.sim(|s| unpublished(s, body)) {
+        return Some(why);
+    }
+    let shelf = hosted.shelf_of(body);
+    let path = hosted.sim(|s| {
         let m = s.missions.active(body)?;
         m.operation()?;
-        Some((
-            s.bench.mind_root()?.to_path_buf(),
-            m.work.as_ref()?.writes.clone(),
-        ))
+        Some(m.work.as_ref()?.writes.clone())
     });
-    if let Some((root, path)) = &tidy {
-        if gates::tidy_on_disk(root, path) {
+    if let Some(path) = &path {
+        if gates::tidy_on(&*shelf, path) {
             tracing::info!(npc = body, %path, "operation document tidied");
         }
     }
     let vocabulary = hosted.read(leakage::vocabulary);
-    let refusal = hosted.sim(|s| gate_refusal(s, body, &vocabulary))?;
+    let lore = hosted.sim(|s| s.bench.mind_root().map(leakage::lore));
+    let refusal = hosted.sim(|s| gate_refusal(s, body, &*shelf, &vocabulary, &lore))?;
     // A document that does not stand is to be written again — said in the
     // mission's own steps, so the compass sends the Maker back to its desk
-    // instead of on to a report that will be refused. One gone from the record
+    // instead of on to a report that will be refused. One gone from the store
     // has nothing to write again.
-    if tidy.is_some_and(|(root, path)| root.join(path).is_file()) {
+    if path.is_some_and(|path| shelf.read(&path).is_some()) {
         hosted.with_sim(|s| s.missions.reopen_write(body));
     }
     Some(refusal)
+}
+
+/// Why the body's publish step may not be reported yet: its operation has not
+/// landed on the record (`published`). `None` when it has, or the step does
+/// not check it.
+fn unpublished(s: &Sim, body: &str) -> Option<String> {
+    let m = s.missions.active(body)?;
+    let (id, _) = m.operation()?;
+    let work = m.work.as_ref()?;
+    if !work.checks.iter().any(|c| c == PUBLISHED) {
+        return None;
+    }
+    s.missions
+        .operations()
+        .get(id)?
+        .published
+        .is_none()
+        .then(|| {
+            format!(
+                "{} has not landed in the record yet. At the merge table, `merge_status` shows \
+             whether it merges cleanly, and `merge_publish` lands it; report once it has.",
+                work.writes
+            )
+        })
 }
 
 /// Why the body's operation document may not be reported done yet: it fails
 /// a check its workflow step names — the page's own (`gates::CHECKS`), the
 /// writers' room in it (`leakage`, whose `vocabulary` is the world the Makers
 /// stand in), its brief's words copied into it (`copied`), or, on a step that
-/// must change it, being as the step found it (`changed`). `None` when it
-/// passes, or when the mission is not an operation's.
-fn gate_refusal(s: &Sim, body: &str, vocabulary: &[String]) -> Option<String> {
+/// must change it, being as the step found it (`changed`). The document is
+/// read from `shelf`, the operation's store; `lore` is the published record's
+/// eras and world. `None` when it passes, or when the mission is not an
+/// operation's.
+fn gate_refusal(
+    s: &Sim,
+    body: &str,
+    shelf: &dyn Shelf,
+    vocabulary: &[String],
+    lore: &Option<Arc<String>>,
+) -> Option<String> {
+    // A world with no documents has nothing to hold to a gate.
+    if !s.bench.has_root() {
+        return None;
+    }
     let m = s.missions.active(body)?;
     let (id, _) = m.operation()?;
     let work = m.work.as_ref()?;
     let checks = |name: &str| work.checks.iter().any(|c| c == name);
     let path = &work.writes;
-    let root = s.bench.mind_root()?;
-    let text = match std::fs::read_to_string(root.join(path)) {
-        Ok(t) => t,
-        // A document written anew is not on the record until it is written.
-        Err(_) if work.anew => return None,
-        Err(_) => {
+    let op = s.missions.operations().get(id);
+    let text = match shelf.read(path) {
+        Some(t) => t,
+        // A document written anew is not there until it is written.
+        None if work.anew => return None,
+        None => {
             return Some(format!(
                 "{path} is not on the record any more, so there is nothing to pass. `invoke` this \
                  table's `report_rejected` and say so."
             ))
         }
     };
-    let mut faults: Vec<String> = gates::check(path, &text, gates::life_voice(root, path))
+    let mut faults: Vec<String> = gates::check(path, &text, gates::life_voice(shelf, path))
         .into_iter()
         .filter(|f| checks(f.check))
         .map(|f| f.text)
         .collect();
     if checks(gates::LEAKAGE) && gates::Form::of(path) != gates::Form::Other {
-        let leaked = leakage::leaks(&text, vocabulary, &leakage::lore(root));
+        let leaked = leakage::leaks(&text, vocabulary, lore.as_deref().map_or("", |l| l));
         if !leaked.is_empty() {
             faults.push(leakage::fault(&leaked));
         }
     }
-    let op = s.missions.operations().get(id);
     let found = op.and_then(|o| o.found.as_deref());
     if checks(CHANGED) && !work.edit_optional && found == Some(text.as_str()) {
         faults.push(
@@ -577,12 +624,18 @@ fn outside_the_mission(s: &Sim, body: &str, path: &str) -> Option<String> {
 /// Why an edit to the body's mission piece is refused: it takes most of the
 /// piece, which is writing it again by hand — see [`passage`]. `None` for any
 /// other document, a mission with no prose floor, or a passage.
-fn rewritten_by_hand(s: &Sim, body: &str, what: &str, old: &str) -> Option<String> {
+fn rewritten_by_hand(
+    s: &Sim,
+    body: &str,
+    what: &str,
+    old: &str,
+    shelf: &dyn Shelf,
+) -> Option<String> {
     let work = s.missions.active(body)?.work.as_ref()?;
     if work.min_words == 0 || !what.eq_ignore_ascii_case(&work.writes) {
         return None;
     }
-    let current = s.bench.read(body, &work.writes).ok()?;
+    let current = s.bench.read(body, &work.writes, shelf).ok()?;
     passage::rewrites_the_piece(&work.writes, &current, old)
 }
 
@@ -595,19 +648,10 @@ fn short_of_the_floor(s: &Sim, body: &str) -> Option<String> {
     if work.min_words == 0 {
         return None;
     }
-    let touched = s
-        .bench
-        .opened(body)?
-        .changed()
-        .iter()
-        .any(|p| p.eq_ignore_ascii_case(&work.writes));
-    if !touched {
-        return None;
-    }
     let n = s
         .bench
-        .read(body, &work.writes)
-        .ok()?
+        .opened(body)?
+        .changed_text(&work.writes)?
         .split_whitespace()
         .count();
     (n < work.min_words).then(|| {
@@ -815,6 +859,11 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     if act.tool == "time_travel" {
         return time_travel(hosted, body, a);
     }
+    // The merge table's acts name nothing: each is about the operation whose
+    // publish step the body carries.
+    if matches!(act.tool, MERGE_STATUS | MERGE_PUBLISH | MERGE_SYNC) {
+        return archive::perform(hosted, body, act.tool);
+    }
     // The mission acts before the subject is looked for: `collect_mission`
     // names nothing, and the reports carry their subject under `found` / `why`,
     // which the shared [`subject`] list does not scan.
@@ -876,6 +925,7 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "You meant to write a memory, but not whose, or not what.".into(),
                 );
             };
+            let shelf = hosted.shelf_of(body);
             hosted.with_sim(|s| {
                 // No mind folder — the mind-less test daemon — keeps the draft
                 // in the record, exactly as it did before any of this reached
@@ -887,7 +937,7 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     };
                 }
                 let path = format!("layers/memory/{}/memories.md", slug_of(&who));
-                match s.bench.append(body, &who, &path, &t) {
+                match s.bench.append(body, &who, &path, &t, &*shelf) {
                     Ok(p) => Outcome::Did(format!(
                         "Something that happened to {who} is written down ({p}). Nobody else sees \
                          it until you commit."
@@ -902,6 +952,7 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     "You meant to write a place's history, but not whose, or not what.".into(),
                 );
             };
+            let shelf = hosted.shelf_of(body);
             hosted.with_sim(|s| {
                 // A place's local history is a second document, in geography —
                 // its entry (its own `path`) is where you stand, this is what
@@ -919,7 +970,7 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 if let Err(why) = s.record.claim_for_write(&place, body) {
                     return Outcome::Refused(why);
                 }
-                match s.bench.append(body, &place, &path, &t) {
+                match s.bench.append(body, &place, &path, &t, &*shelf) {
                     Ok(p) => Outcome::Did(format!(
                         "The local history of {place} is written down ({p}). Nobody else sees it \
                          until you commit."
@@ -943,10 +994,11 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 );
             };
             let path = personality_path(&what);
+            let shelf = hosted.shelf_of(body);
             hosted.with_sim(|s| {
                 match s
                     .bench
-                    .write_field(body, &what, &path, PORTRAIT_PROMPT, &carrying)
+                    .write_field(body, &what, &path, PORTRAIT_PROMPT, &carrying, &*shelf)
                 {
                     Ok(p) => Outcome::Did(format!(
                         "{what} is drawn from these words now ({p}): {carrying}"
@@ -957,10 +1009,13 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
         }
         "portrait_prompt_read" => {
             let path = personality_path(&what);
-            hosted.sim(|s| match s.bench.read_field(body, &path, PORTRAIT_PROMPT) {
-                Ok(prompt) => Outcome::Did(format!("{what} is drawn from: {prompt}")),
-                Err(why) => Outcome::Refused(why),
-            })
+            let shelf = hosted.shelf_of(body);
+            hosted.sim(
+                |s| match s.bench.read_field(body, &path, PORTRAIT_PROMPT, &*shelf) {
+                    Ok(prompt) => Outcome::Did(format!("{what} is drawn from: {prompt}")),
+                    Err(why) => Outcome::Refused(why),
+                },
+            )
         }
 
         // ── moving something along ──────────────────────────────────────────
@@ -1428,11 +1483,14 @@ fn library(hosted: &Hosted, body: &str, tool: &str, args: &Map<String, Value>) -
         Ok(p) => p,
         Err(why) => return Outcome::Refused(why),
     };
+    let shelf = hosted.shelf_of(body);
     if tool == "library_read" {
-        return hosted.sim(|s| match s.bench.read_field(body, &path, &["template"]) {
-            Ok(t) => Outcome::Did(format!("{path}:\n{t}")),
-            Err(why) => Outcome::Refused(why),
-        });
+        return hosted.sim(
+            |s| match s.bench.read_field(body, &path, &["template"], &*shelf) {
+                Ok(t) => Outcome::Did(format!("{path}:\n{t}")),
+                Err(why) => Outcome::Refused(why),
+            },
+        );
     }
     let (Some(field), Some(t)) = (text(args, "field"), verbatim(args, "text")) else {
         return Outcome::Refused(
@@ -1445,15 +1503,18 @@ fn library(hosted: &Hosted, body: &str, tool: &str, args: &Map<String, Value>) -
             LIBRARY_FIELDS.join(" or ")
         ));
     }
-    hosted.with_sim(
-        |s| match s.bench.write_field(body, &path, &path, &[&field], &t) {
+    hosted.with_sim(|s| {
+        match s
+            .bench
+            .write_field(body, &path, &path, &[&field], &t, &*shelf)
+        {
             Ok(p) => Outcome::Did(format!(
                 "The {field} of {p} says what you wrote. It is how everybody here reads, once you \
              commit it."
             )),
             Err(why) => Outcome::Refused(why),
-        },
-    )
+        }
+    })
 }
 
 /// Where a likeness's art direction lives inside a personality.
@@ -1486,6 +1547,7 @@ fn author_sheet(hosted: &Hosted, body: &str, args: &Map<String, Value>, at: &[&s
             "You meant to write who somebody is, but not whose, or not what.".into(),
         );
     };
+    let shelf = hosted.shelf_of(body);
     hosted.with_sim(|s| {
         if !s.bench.has_root() {
             return match s.record.write(&who, body, &t) {
@@ -1494,7 +1556,7 @@ fn author_sheet(hosted: &Hosted, body: &str, args: &Map<String, Value>, at: &[&s
             };
         }
         let path = personality_path(&who);
-        match s.bench.write_field(body, &who, &path, at, &t) {
+        match s.bench.write_field(body, &who, &path, at, &t, &*shelf) {
             Ok(p) => Outcome::Did(format!(
                 "{who} is written into {p}: {t}. Nobody else sees it until you commit."
             )),
@@ -1529,6 +1591,7 @@ fn library_path(args: &Map<String, Value>) -> Result<String, String> {
 /// the mind afterwards. Everything else is a judgement rather than a document
 /// and stays in the record, which is where a judgement belongs.
 fn write_into(hosted: &Hosted, body: &str, what: &str, text: &str) -> Outcome {
+    let shelf = hosted.shelf_of(body);
     hosted.with_sim(|s| {
         // An era or a story that has no document yet gets one here — the first
         // entry written into an era is what creates it. A world with nowhere to
@@ -1549,7 +1612,7 @@ fn write_into(hosted: &Hosted, body: &str, what: &str, text: &str) -> Outcome {
         if let Err(why) = s.record.claim_for_write(what, body) {
             return Outcome::Refused(why);
         }
-        match s.bench.append(body, what, &path, text) {
+        match s.bench.append(body, what, &path, text, &*shelf) {
             Ok(p) => Outcome::Did(format!(
                 "You write into {what} ({p}). Nobody else sees it until you commit."
             )),
@@ -1788,6 +1851,7 @@ fn bench(
                         .into(),
                 );
             };
+            let shelf = hosted.shelf_of(body);
             hosted.with_sim(|s| {
                 // **A mission's document is committed whole or not at all.** A
                 // story asked for at six hundred words was committed at three
@@ -1801,7 +1865,7 @@ fn bench(
                 // can refuse, and a refusal has to leave everything — the
                 // working set and the record item — exactly as it was.
                 let written = match s.bench.opened(body).is_some() {
-                    true => match s.bench.commit(body) {
+                    true => match s.bench.commit(body, &*shelf) {
                         Ok(w) => w,
                         Err(collision) => {
                             return Outcome::Refused(format!(
@@ -1904,7 +1968,8 @@ fn bench(
             let from = text(args, "start_line")
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .unwrap_or(1);
-            hosted.with_sim(|s| match s.bench.excerpt(body, what, from) {
+            let shelf = hosted.shelf_of(body);
+            hosted.with_sim(|s| match s.bench.excerpt(body, what, from, &*shelf) {
                 Ok(mut rendered) => {
                     // Reading a document a mission names is that step done.
                     if s.missions.read_doc(body, what) {
@@ -1917,16 +1982,20 @@ fn bench(
                 Err(why) => Outcome::Refused(why),
             })
         }
-        "file_list" => hosted.sim(|s| match s.bench.list(body, what) {
-            Ok(names) if names.is_empty() => Outcome::Did(format!("Nothing under {what}.")),
-            Ok(names) => Outcome::Did(format!("Under {what}: {}.", names.join(", "))),
-            Err(why) => Outcome::Refused(why),
-        }),
+        "file_list" => {
+            let shelf = hosted.shelf_of(body);
+            hosted.sim(|s| match s.bench.list(body, what, &*shelf) {
+                Ok(names) if names.is_empty() => Outcome::Did(format!("Nothing under {what}.")),
+                Ok(names) => Outcome::Did(format!("Under {what}: {}.", names.join(", "))),
+                Err(why) => Outcome::Refused(why),
+            })
+        }
         "file_write" => {
             let Some(t) = verbatim(args, "content") else {
                 return Outcome::Refused("You meant to write a document, but not what.".into());
             };
-            hosted.with_sim(|s| match s.bench.write(body, what, what, &t) {
+            let shelf = hosted.shelf_of(body);
+            hosted.with_sim(|s| match s.bench.write(body, what, what, &t, &*shelf) {
                 Ok(p) => Outcome::Did(format!(
                     "{p} says what you wrote. Nobody else sees it until you commit."
                 )),
@@ -1941,11 +2010,12 @@ fn bench(
                         .into(),
                 );
             };
+            let shelf = hosted.shelf_of(body);
             hosted.with_sim(|s| {
-                if let Some(why) = rewritten_by_hand(s, body, what, &old) {
+                if let Some(why) = rewritten_by_hand(s, body, what, &old, &*shelf) {
                     return Outcome::Refused(why);
                 }
-                match s.bench.edit(body, what, what, &old, &new) {
+                match s.bench.edit(body, what, what, &old, &new, &*shelf) {
                     Ok(p) => {
                         Outcome::Did(format!("{p} is changed, and the rest of it is untouched."))
                     }
@@ -1956,23 +2026,26 @@ fn bench(
         // The record's guard comes first: a *filed* thing is retired with a
         // reason, and letting `file_delete` take one would lose the reason
         // whoever comes after will want.
-        "file_delete" => hosted.with_sim(|s| {
-            if let Some(i) = s.record.by_name(what) {
-                if i.state == State::Filed {
-                    return Outcome::Refused(format!(
-                        "{} is part of the record. Taking it out is `record_let_go`, which keeps \
-                         the reason.",
-                        i.name
-                    ));
+        "file_delete" => {
+            let shelf = hosted.shelf_of(body);
+            hosted.with_sim(|s| {
+                if let Some(i) = s.record.by_name(what) {
+                    if i.state == State::Filed {
+                        return Outcome::Refused(format!(
+                            "{} is part of the record. Taking it out is `record_let_go`, which \
+                             keeps the reason.",
+                            i.name
+                        ));
+                    }
                 }
-            }
-            match s.bench.remove(body, what, what) {
-                Ok(p) => Outcome::Did(format!(
-                    "{p} goes when you commit. It was never part of the record."
-                )),
-                Err(why) => Outcome::Refused(why),
-            }
-        }),
+                match s.bench.remove(body, what, what, &*shelf) {
+                    Ok(p) => Outcome::Did(format!(
+                        "{p} goes when you commit. It was never part of the record."
+                    )),
+                    Err(why) => Outcome::Refused(why),
+                }
+            })
+        }
         other => Outcome::Refused(format!("Nothing here knows how to {other}.")),
     }
 }
@@ -1980,6 +2053,7 @@ fn bench(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::shelf::NO_OPERATION;
     use npc_map::world::Where;
     use serde_json::json;
 
@@ -2094,7 +2168,63 @@ mod tests {
 
         let h = vault();
         h.set_bench_root(&root);
+        on_operation(&h, &root);
         (h, root)
+    }
+
+    /// The operation [`on_operation`] opens: the first, so always 1.
+    const OP: u64 = 1;
+
+    /// Both Makers on a step of one operation, [`OP`], whose store takes their
+    /// commits (`docs/replicated_substrate.md` §10.3) — held in memory, as a
+    /// disconnected world's is, so no substrate is needed.
+    fn on_operation(h: &Hosted, root: &std::path::Path) {
+        use std::collections::BTreeMap;
+
+        use crate::engine::mission::{Mission, Origin, Todo};
+        use crate::opstore::MindStores;
+        use crate::sim::operations::tests::workflows;
+        let stores = MindStores::new(Some(root));
+        stores.set_quiet(Box::new(|_| true));
+        h.set_op_stores(stores);
+        h.with_sim(|s| {
+            s.missions.set_workflows(workflows());
+            let id = s
+                .missions
+                .launch(
+                    "story",
+                    "untold",
+                    "era:layers/eras/third.md",
+                    1,
+                    "the bench's work",
+                    "layers/stories/the-bench.md",
+                    "What happens: work at the bench.",
+                    BTreeMap::new(),
+                    Vec::new(),
+                )
+                .unwrap();
+            assert_eq!(id, OP);
+            for body in ["m1", "m2"] {
+                s.missions.assign(
+                    body,
+                    Mission::new(
+                        "Work at the bench.",
+                        vec![Todo::new("work at the bench")],
+                        Origin::Generated {
+                            generator: "untold".into(),
+                            target: "era:layers/eras/third.md".into(),
+                            operation: id,
+                            step: "write".into(),
+                        },
+                    ),
+                );
+            }
+        });
+    }
+
+    /// What `key` holds in operation [`OP`]'s store.
+    fn stored(h: &Hosted, key: &str) -> Option<String> {
+        h.op_shelf(OP)?.read(key)
     }
 
     /// **A mission that writes the record is reported done only once its
@@ -2114,7 +2244,12 @@ mod tests {
                     Todo::new(format!("write {path} and commit it")),
                     Todo::report("go back to the table and report it"),
                 ],
-                Origin::Lodged { by: "u_op".into() },
+                Origin::Generated {
+                    generator: "untold".into(),
+                    target: "era:layers/eras/third.md".into(),
+                    operation: OP,
+                    step: "write".into(),
+                },
             )
             .with_work(Work {
                 writes: path.into(),
@@ -2221,7 +2356,11 @@ mod tests {
                 .contains("last step of your mission"),
             "{committed:?}"
         );
-        assert!(root.join(path).is_file());
+        assert!(stored(&h, path).is_some());
+        assert!(
+            !root.join(path).is_file(),
+            "only a publish reaches the record"
+        );
         // **Finished work cannot be reported stuck.** It used to be taken, and
         // a stuck report failed the operation and threw the draft away.
         match perform(
@@ -2262,6 +2401,10 @@ mod tests {
         use crate::engine::mission_gen::step::step_mission;
         use crate::sim::operations::tests::workflows;
         let (h, root) = vault_with_documents("operation");
+        h.with_sim(|s| {
+            s.missions.cancel("m1");
+            s.missions.cancel("m2");
+        });
         let path = "layers/stories/the-water-schedule.md";
         let fields: BTreeMap<String, String> = [
             ("title", "The Water Schedule"),
@@ -2288,7 +2431,6 @@ mod tests {
                     "What happens: The clerks count the cisterns before dawn.",
                     fields,
                     Vec::new(),
-                    None,
                 )
                 .unwrap()
         });
@@ -2384,8 +2526,13 @@ mod tests {
         // Mended, and still without a heading: the engine gives it its title.
         write(&prose);
         assert!(report("m1").happened(), "the mended draft passes the gate");
-        let stood = std::fs::read_to_string(root.join(path)).unwrap();
+        let draft = || h.op_shelf(id).unwrap().read(path);
+        let stood = draft().unwrap();
         assert!(stood.starts_with("# The Water Schedule\n\n"), "{stood}");
+        assert!(
+            !root.join(path).exists(),
+            "only a publish reaches the record"
+        );
 
         assert_eq!(
             h.sim(|s| s.missions.operations().awaiting_table()),
@@ -2458,8 +2605,8 @@ mod tests {
             format!("{rejected:?}").contains("it goes back to be fixed, with your reasons"),
             "{rejected:?}"
         );
-        // **A rejected draft stays in the record, to be fixed.**
-        assert!(root.join(path).is_file(), "the draft is what the fix mends");
+        // **A rejected draft stays in the operation's store, to be fixed.**
+        assert!(draft().is_some(), "the draft is what the fix mends");
         let step = h.sim(|s| {
             s.missions
                 .operations()
@@ -2471,11 +2618,11 @@ mod tests {
         assert_eq!(step.as_deref(), Some("fix"));
     }
 
-    /// **A write is in memory and nowhere else until the commit.** The one
-    /// behaviour the whole bench is built around, asserted against the disk
-    /// rather than against a report.
+    /// **A write is in the working set and nowhere else until the commit**,
+    /// and the commit lands it in the operation's store, never on the disk —
+    /// the record moves only at a publish (§10.3).
     #[test]
-    fn a_written_document_reaches_the_disk_only_at_the_commit() {
+    fn a_written_document_reaches_the_store_only_at_the_commit() {
         let (h, root) = vault_with_documents("commit");
         let wrote = perform(
             &h,
@@ -2486,9 +2633,10 @@ mod tests {
             ),
         );
         assert!(wrote.happened(), "{wrote:?}");
-        assert!(
-            !root.join("layers/eras/fifth.md").exists(),
-            "the disk moved early"
+        assert_eq!(
+            stored(&h, "layers/eras/fifth.md"),
+            None,
+            "the store moved early"
         );
 
         let out = perform(
@@ -2498,9 +2646,36 @@ mod tests {
         );
         assert!(out.happened(), "{out:?}");
         assert_eq!(
-            std::fs::read_to_string(root.join("layers/eras/fifth.md")).unwrap(),
-            "the fifth era\n"
+            stored(&h, "layers/eras/fifth.md").as_deref(),
+            Some("the fifth era\n")
         );
+        assert!(
+            !root.join("layers/eras/fifth.md").exists(),
+            "the disk moved"
+        );
+    }
+
+    /// **A body on no operation has nowhere to commit**: what it writes stays
+    /// in its working set, and the commit says why.
+    #[test]
+    fn a_commit_on_no_operation_is_refused() {
+        let (h, root) = vault_with_documents("no-operation");
+        h.with_sim(|s| s.missions.cancel("m1"));
+        assert!(perform(
+            &h,
+            "m1",
+            &act(
+                "file_write",
+                json!({"path":"layers/eras/fifth.md","content":"the fifth era\n"}),
+            ),
+        )
+        .happened());
+        match perform(&h, "m1", &act("bench_commit", json!({"why":"named it"}))) {
+            Outcome::Refused(why) => assert!(why.contains(NO_OPERATION), "{why}"),
+            other => panic!("a commit with no operation was taken: {other:?}"),
+        }
+        assert!(!root.join("layers/eras/fifth.md").exists());
+        assert_eq!(stored(&h, "layers/eras/fifth.md"), None);
     }
 
     /// A body reads its own uncommitted work; nobody else can see it at all.
@@ -2549,14 +2724,15 @@ mod tests {
             ),
         );
         perform(&h, "m1", &act("bench_commit", json!({"why":"…"})));
-        assert!(root.join("layers/eras/sixth.md").exists());
-        assert!(
-            !root
-                .join("layers/eras")
-                .join("a night at the gate")
-                .exists(),
+        assert!(stored(&h, "layers/eras/sixth.md").is_some());
+        assert_eq!(
+            h.op_shelf(OP).unwrap().list("layers/eras"),
+            ["fourth.md", "sixth.md", "third.md"]
+                .map(String::from)
+                .into(),
             "wrote into the prose"
         );
+        assert!(!root.join("layers/eras/sixth.md").exists());
     }
 
     /// **A document is written exactly as it was given.** A trailing newline is
@@ -2565,7 +2741,7 @@ mod tests {
     /// character said, and report success doing it.
     #[test]
     fn a_document_is_written_exactly_as_it_was_given() {
-        let (h, root) = vault_with_documents("verbatim");
+        let (h, _) = vault_with_documents("verbatim");
         perform(
             &h,
             "m1",
@@ -2576,8 +2752,8 @@ mod tests {
         );
         perform(&h, "m1", &act("bench_commit", json!({"why":"…"})));
         assert_eq!(
-            std::fs::read_to_string(root.join("layers/eras/fifth.md")).unwrap(),
-            "a line\n\nand another\n"
+            stored(&h, "layers/eras/fifth.md").as_deref(),
+            Some("a line\n\nand another\n")
         );
     }
 
@@ -2599,8 +2775,8 @@ mod tests {
         assert!(out.happened(), "{out:?}");
         perform(&h, "m1", &act("bench_commit", json!({"why":"…"})));
         assert_eq!(
-            std::fs::read_to_string(root.join("layers/eras/third.md")).unwrap(),
-            "a:\n  b: 2\n  c: 1\n"
+            stored(&h, "layers/eras/third.md").as_deref(),
+            Some("a:\n  b: 2\n  c: 1\n")
         );
     }
 
@@ -2683,7 +2859,7 @@ mod tests {
 
     #[test]
     fn an_edit_leaves_everything_it_did_not_name_alone() {
-        let (h, root) = vault_with_documents("edit");
+        let (h, _) = vault_with_documents("edit");
         let out = perform(
             &h,
             "m1",
@@ -2702,8 +2878,8 @@ mod tests {
             ),
         );
         assert_eq!(
-            std::fs::read_to_string(root.join("layers/eras/third.md")).unwrap(),
-            "the third era\nburned in the autumn\n"
+            stored(&h, "layers/eras/third.md").as_deref(),
+            Some("the third era\nburned in the autumn\n")
         );
     }
 
@@ -2760,7 +2936,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deleted_document_goes_from_the_disk_at_the_commit() {
+    fn a_deleted_document_goes_from_the_store_at_the_commit() {
         let (h, root) = vault_with_documents("delete");
         let out = perform(
             &h,
@@ -2769,11 +2945,15 @@ mod tests {
         );
         assert!(out.happened(), "{out:?}");
         assert!(
-            root.join("layers/eras/fourth.md").exists(),
+            stored(&h, "layers/eras/fourth.md").is_some(),
             "gone before the commit"
         );
         perform(&h, "m1", &act("bench_commit", json!({"why":"never canon"})));
-        assert!(!root.join("layers/eras/fourth.md").exists());
+        assert_eq!(stored(&h, "layers/eras/fourth.md"), None);
+        assert!(
+            root.join("layers/eras/fourth.md").exists(),
+            "only a publish reaches the record"
+        );
     }
 
     /// The one act somebody else's work can refuse — now over a real document,
@@ -2966,8 +3146,8 @@ mod tests {
     // act at a chronicle terminal reported success against an in-memory fixture
     // and changed nothing that survived a restart.
 
-    /// **An entry written at a chronicle terminal reaches the disk.** The one
-    /// test that says the stations are real.
+    /// **An entry written at a chronicle terminal reaches the era document in
+    /// the operation's store.** The one test that says the stations are real.
     #[test]
     fn an_entry_written_into_an_era_lands_in_the_era_document() {
         let (h, root) = vault_with_documents("era-entry");
@@ -2986,9 +3166,10 @@ mod tests {
             ),
         );
         assert!(out.happened(), "{out:?}");
-        assert!(
-            !root.join("layers/eras/the-third-era.md").exists(),
-            "the disk moved before the commit"
+        assert_eq!(
+            stored(&h, "layers/eras/the-third-era.md"),
+            None,
+            "the store moved before the commit"
         );
 
         assert!(perform(
@@ -2997,7 +3178,8 @@ mod tests {
             &act("bench_commit", json!({"why":"dated the fall"}))
         )
         .happened());
-        let written = std::fs::read_to_string(root.join("layers/eras/the-third-era.md")).unwrap();
+        assert!(!root.join("layers/eras/the-third-era.md").exists());
+        let written = stored(&h, "layers/eras/the-third-era.md").unwrap();
         assert!(
             written.contains("The redoubt fell in the spring."),
             "{written}"
@@ -3007,7 +3189,7 @@ mod tests {
     /// A second entry is added to the first, not written over it.
     #[test]
     fn a_second_entry_is_added_rather_than_replacing_the_first() {
-        let (h, root) = vault_with_documents("era-append");
+        let (h, _) = vault_with_documents("era-append");
         perform(
             &h,
             "m1",
@@ -3031,7 +3213,7 @@ mod tests {
         );
         perform(&h, "m1", &act("bench_commit", json!({"why":"two entries"})));
 
-        let written = std::fs::read_to_string(root.join("layers/eras/the-third-era.md")).unwrap();
+        let written = stored(&h, "layers/eras/the-third-era.md").unwrap();
         assert!(written.contains("First."), "{written}");
         assert!(
             written.contains("Second."),
@@ -3073,7 +3255,7 @@ mod tests {
     /// A story is a document too, and lands in its own layer.
     #[test]
     fn a_draft_written_into_a_silence_lands_in_the_stories_layer() {
-        let (h, root) = vault_with_documents("story-draft");
+        let (h, _) = vault_with_documents("story-draft");
         perform(
             &h,
             "m1",
@@ -3094,11 +3276,9 @@ mod tests {
             &act("bench_commit", json!({"why":"filled the longest silence"})),
         );
 
-        let p = root.join("layers/stories/the-third-silence.md");
-        assert!(p.exists(), "the draft did not reach the stories layer");
-        assert!(std::fs::read_to_string(p)
-            .unwrap()
-            .contains("A night at the gate."));
+        let draft = stored(&h, "layers/stories/the-third-silence.md")
+            .expect("the draft did not reach the stories layer");
+        assert!(draft.contains("A night at the gate."));
     }
 
     /// **A filed document is not written over casually.** It refuses until the
@@ -3213,11 +3393,13 @@ mod tests {
         // seed); the world/ layers are made on the first commit into them.
         let h = vault();
         h.set_bench_root(&root);
+        on_operation(&h, &root);
         (h, root)
     }
 
-    /// **Who a character is reaches the sheet on disk, and not before the
-    /// commit.** The `anchor` field, written the way a portrait's words are.
+    /// **Who a character is reaches the sheet in the operation's store, and
+    /// not before the commit.** The `anchor` field, written the way a
+    /// portrait's words are.
     #[test]
     fn character_identity_is_written_to_the_sheet_and_survives_a_commit() {
         let (h, root) = vault_authoring("identity");
@@ -3231,7 +3413,7 @@ mod tests {
         );
         assert!(out.happened(), "{out:?}");
         assert!(
-            !std::fs::read_to_string(root.join("personalities/the-courier.yaml"))
+            !stored(&h, "personalities/the-courier.yaml")
                 .unwrap()
                 .contains("cannot take"),
             "the sheet moved before the commit"
@@ -3243,7 +3425,13 @@ mod tests {
             &act("bench_commit", json!({"why":"cast the courier"}))
         )
         .happened());
-        let sheet = std::fs::read_to_string(root.join("personalities/the-courier.yaml")).unwrap();
+        assert!(
+            !std::fs::read_to_string(root.join("personalities/the-courier.yaml"))
+                .unwrap()
+                .contains("cannot take"),
+            "only a publish reaches the record"
+        );
+        let sheet = stored(&h, "personalities/the-courier.yaml").unwrap();
         let doc: Value = serde_yaml::from_str(&sheet).unwrap();
         assert_eq!(
             doc["anchor"],
@@ -3265,7 +3453,7 @@ mod tests {
     /// beside the anchor, and the anchor written first is still there.
     #[test]
     fn character_wants_becomes_a_new_field_beside_the_anchor() {
-        let (h, root) = vault_authoring("wants");
+        let (h, _) = vault_authoring("wants");
         perform(
             &h,
             "m1",
@@ -3288,7 +3476,7 @@ mod tests {
             &act("bench_commit", json!({"why":"gave the courier a reason"})),
         );
 
-        let sheet = std::fs::read_to_string(root.join("personalities/the-courier.yaml")).unwrap();
+        let sheet = stored(&h, "personalities/the-courier.yaml").unwrap();
         let doc: Value = serde_yaml::from_str(&sheet).unwrap();
         assert_eq!(doc["anchor"], json!("reliable to a fault"));
         assert_eq!(
@@ -3311,15 +3499,23 @@ mod tests {
             ),
         );
         assert!(out.happened(), "{out:?}");
-        let p = root.join("layers/memory/the-courier/memories.md");
-        assert!(!p.exists(), "the memory reached the disk before the commit");
+        let key = "layers/memory/the-courier/memories.md";
+        assert_eq!(
+            stored(&h, key),
+            None,
+            "the memory was kept before the commit"
+        );
 
         perform(
             &h,
             "m1",
             &act("bench_commit", json!({"why":"remembered the gate"})),
         );
-        let written = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !root.join(key).exists(),
+            "only a publish reaches the record"
+        );
+        let written = stored(&h, key).unwrap();
         assert!(
             written.contains("waited four hours at a gate that was never going to open"),
             "{written}"
@@ -3329,7 +3525,7 @@ mod tests {
     /// **A second memory is added to the first**, the way an era's entries are.
     #[test]
     fn a_second_memory_is_added_rather_than_replacing_the_first() {
-        let (h, root) = vault_authoring("memory-append");
+        let (h, _) = vault_authoring("memory-append");
         perform(
             &h,
             "m1",
@@ -3351,8 +3547,7 @@ mod tests {
             "m1",
             &act("bench_commit", json!({"why":"two afternoons"})),
         );
-        let written =
-            std::fs::read_to_string(root.join("layers/memory/the-courier/memories.md")).unwrap();
+        let written = stored(&h, "layers/memory/the-courier/memories.md").unwrap();
         assert!(written.contains("First."), "{written}");
         assert!(
             written.find("First.") < written.find("Second."),
@@ -3360,9 +3555,18 @@ mod tests {
         );
     }
 
-    /// **A place entry lands in the locations layer and survives a reload.** A
-    /// fresh, empty record reads the committed disk and the place is part of the
-    /// record again — the durability this whole change exists for.
+    /// Land what operation [`OP`]'s store holds at `key` in the mind folder at
+    /// `root`, as its publish does.
+    fn publish(h: &Hosted, root: &std::path::Path, key: &str) {
+        let text = stored(h, key).unwrap();
+        let full = root.join(key);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, text).unwrap();
+    }
+
+    /// **A place entry lands in the locations layer and, published, survives a
+    /// reload.** A fresh, empty record reads the published mind and the place
+    /// is part of the record again.
     #[test]
     fn a_place_entry_lands_in_the_locations_layer_and_survives_a_reload() {
         let (h, root) = vault_authoring("place-entry");
@@ -3375,8 +3579,8 @@ mod tests {
             ),
         );
         assert!(out.happened(), "{out:?}");
-        let p = root.join("layers/world/locations/the-eastern-flats.md");
-        assert!(!p.exists(), "the disk moved before the commit");
+        let key = "layers/world/locations/the-eastern-flats.md";
+        assert_eq!(stored(&h, key), None, "the store moved before the commit");
 
         assert!(perform(
             &h,
@@ -3385,14 +3589,19 @@ mod tests {
         )
         .happened());
         assert!(
-            std::fs::read_to_string(&p)
+            stored(&h, key)
                 .unwrap()
                 .contains("a wind that does not stop"),
             "the entry did not reach the locations layer"
         );
+        assert!(
+            !root.join(key).exists(),
+            "only a publish reaches the record"
+        );
 
-        // A fresh process, an empty record: it reads the committed disk and the
-        // place is filed, at its path, again.
+        // Published, then a fresh process with an empty record: it reads the
+        // mind and the place is filed, at its path, again.
+        publish(&h, &root, key);
         let mut fresh = crate::sim::record::Record::new();
         fresh.index_canon(&root);
         assert_eq!(
@@ -3429,13 +3638,14 @@ mod tests {
             &act("bench_commit", json!({"why":"gave the flats a reason"}))
         )
         .happened());
-        let p = root.join("layers/world/geography/the-eastern-flats.md");
+        let key = "layers/world/geography/the-eastern-flats.md";
         assert!(
-            std::fs::read_to_string(&p)
+            stored(&h, key)
                 .unwrap()
                 .contains("the year it stopped being worth rebuilding"),
             "the history did not reach the geography layer"
         );
+        publish(&h, &root, key);
 
         // A place known only by its history is part of the record again, but its
         // history is NOT its entry path: `Item.path` names the entry, which is
@@ -3503,16 +3713,12 @@ mod tests {
         )
         .happened());
 
-        let entry =
-            std::fs::read_to_string(root.join("layers/world/locations/the-eastern-flats.md"))
-                .unwrap();
+        let entry = stored(&h, "layers/world/locations/the-eastern-flats.md").unwrap();
         assert!(
             entry.contains("a new survey line about the wind"),
             "the entry prose did not reach the entry file: {entry}"
         );
-        let history =
-            std::fs::read_to_string(root.join("layers/world/geography/the-eastern-flats.md"))
-                .unwrap();
+        let history = stored(&h, "layers/world/geography/the-eastern-flats.md").unwrap();
         assert!(
             !history.contains("a new survey line about the wind"),
             "the entry prose leaked into the history file: {history}"
@@ -3577,7 +3783,7 @@ mod tests {
     // ── the craft libraries ─────────────────────────────────────────────────
 
     #[test]
-    fn a_mood_can_be_read_and_changed_and_lands_on_the_disk() {
+    fn a_mood_can_be_read_and_changed_and_lands_in_the_store() {
         let (h, root) = vault_with_documents("mood");
         let read = perform(
             &h,
@@ -3610,11 +3816,11 @@ mod tests {
             ),
         );
 
-        let on_disk = std::fs::read_to_string(root.join("moods/undone.yaml")).unwrap();
-        assert!(
-            on_disk.contains("whole interior has rearranged"),
-            "{on_disk}"
-        );
+        let kept = stored(&h, "moods/undone.yaml").unwrap();
+        assert!(kept.contains("whole interior has rearranged"), "{kept}");
+        assert!(!std::fs::read_to_string(root.join("moods/undone.yaml"))
+            .unwrap()
+            .contains("whole interior"));
     }
 
     /// **The comments survive.** This is the entire reason the write goes
@@ -3622,7 +3828,7 @@ mod tests {
     /// that loads perfectly, with the half a person wrote silently gone.
     #[test]
     fn changing_a_field_keeps_everything_written_around_it() {
-        let (h, root) = vault_with_documents("mood-comments");
+        let (h, _) = vault_with_documents("mood-comments");
         perform(
             &h,
             "m1",
@@ -3635,7 +3841,7 @@ mod tests {
         );
         perform(&h, "m1", &act("bench_commit", json!({"why":"…"})));
 
-        let on_disk = std::fs::read_to_string(root.join("moods/undone.yaml")).unwrap();
+        let on_disk = stored(&h, "moods/undone.yaml").unwrap();
         assert!(
             on_disk.contains("# The felt register — its KV is loaded"),
             "the comment was lost: {on_disk}"
@@ -3700,7 +3906,7 @@ mod tests {
 
     #[test]
     fn the_words_a_likeness_is_drawn_from_can_be_read_and_changed() {
-        let (h, root) = vault_with_documents("portrait");
+        let (h, _) = vault_with_documents("portrait");
         let read = perform(
             &h,
             "m1",
@@ -3729,8 +3935,7 @@ mod tests {
             &act("bench_commit", json!({"why":"the winter changed him"})),
         );
 
-        let on_disk =
-            std::fs::read_to_string(root.join("personalities/ash-the-drifter.yaml")).unwrap();
+        let on_disk = stored(&h, "personalities/ash-the-drifter.yaml").unwrap();
         assert!(on_disk.contains("after the winter"), "{on_disk}");
         // The picture it names is untouched — a redraw follows the words.
         assert!(

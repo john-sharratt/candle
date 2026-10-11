@@ -47,10 +47,17 @@ workflows:
       canon:
         by: another
         next:
-          pass: done
+          pass: publish
           fail: write
         prompt: |
           Check {objective} against the main storyline.
+      publish:
+        by: maker
+        desk: merge-table
+        checks: [published]
+        next: done
+        prompt: |
+          Land {objective} in the record.
   repair:
     send-backs: 1
     steps:
@@ -67,10 +74,16 @@ workflows:
       inspect:
         by: another
         next:
-          pass: done
+          pass: publish
           fail: fix
         prompt: |
           Inspect the fix of {objective}.
+      publish:
+        by: maker
+        checks: [published]
+        next: done
+        prompt: |
+          Land the fix of {objective}.
 "#;
 
 fn workflows() -> Vec<Workflow> {
@@ -105,6 +118,7 @@ fn both_workflows_parse_in_order_with_their_shapes() {
             ("read", By::Table),
             ("review", By::Another),
             ("canon", By::Another),
+            ("publish", By::Maker),
         ]
     );
     assert_eq!(story.start().next, Next::Single("read".to_string()));
@@ -116,13 +130,16 @@ fn both_workflows_parse_in_order_with_their_shapes() {
     );
     assert_eq!(
         story.step("canon").unwrap().targets(),
-        ["done", "write", "failed"]
+        ["publish", "write", "failed"]
     );
+    let publish = story.step("publish").unwrap();
+    assert_eq!(publish.targets(), ["done", "failed"]);
+    assert_eq!(publish.desk.as_deref(), Some("merge-table"));
     assert_eq!(all[1].start().name, "diagnose");
 }
 
 /// Write, a reading that sends it back, write again, a reading to mend, a
-/// review by a second actor, and a canon check by a third.
+/// review by a second actor, a canon check by a third, and the publish.
 #[test]
 fn story_routes_back_through_write_and_settles_done() {
     let all = workflows();
@@ -175,10 +192,17 @@ fn story_routes_back_through_write_and_settles_done() {
     assert!(!may_take(wf, &run, &actor("bob")));
     assert_eq!(
         advance(wf, &mut run, &actor("cara"), Some("pass"), ""),
+        next("publish")
+    );
+    assert_eq!(
+        advance(wf, &mut run, &actor("ann"), None, "landed"),
         Ok(Where::Done)
     );
     let steps: Vec<&str> = run.history.iter().map(|t| t.step.as_str()).collect();
-    assert_eq!(steps, ["write", "read", "write", "read", "review", "canon"]);
+    assert_eq!(
+        steps,
+        ["write", "read", "write", "read", "review", "canon", "publish"]
+    );
     assert_eq!(run.send_backs, 1);
 }
 

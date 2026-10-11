@@ -366,7 +366,7 @@ impl GitWorkspace {
         Conversation {
             ctx: ToolContext::with_workspace(ws)
                 .granting(Grants::ALL)
-                .with_sandboxes(Arc::new(sandboxes)),
+                .with_executor(Arc::new(sandboxes)),
         }
     }
 

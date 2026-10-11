@@ -1,6 +1,8 @@
 //! Running a program on the machine: `run_command`, `run_output`.
 //!
-//! A command runs in the repository's sandbox (`crate::sandboxes`): a checkout
+//! A command runs through the context's [`Executor`](crate::executor::Executor)
+//! — this daemon's own sandbox (`crate::sandboxes`), or an agent's under
+//! `--cluster`: a checkout
 //! of the conversation's branch at the commit its files are based on, with its
 //! uncommitted changes laid down, the repository's own folder set aside first
 //! and put back after (`docs/zend_workspace_execution.md` §7.4). What the
@@ -27,6 +29,7 @@
 //! | `cannot_start` | The program could not be started — not installed, or not on the `PATH` |
 //! | `sandbox_failed` | A step around the command failed: the checkout, the read-back, putting the folder back |
 //! | `not_found` | `run_output` names a job the sandbox does not keep |
+//! | `no_agent` | The daemon runs commands on agents, and none can be reached that holds the repository and the program |
 //! | `invalid_arguments` | A command line in `program`, shell syntax in `args`, or a `job` that is not a job id |
 //! | `io_error` | The job's log could not be written or read |
 //! | `not_permitted` | The context may not run programs on this host |
@@ -89,6 +92,9 @@ impl ToolError for RunError {
                 SandboxesError::NoSandbox { .. } => "no_sandbox",
                 SandboxesError::Log(_) => "io_error",
                 SandboxesError::NotFound(_) => "not_found",
+                SandboxesError::NoAgent(_) => "no_agent",
+                SandboxesError::AgentRefused(_) => "refused",
+                SandboxesError::AgentFailed(_) => "sandbox_failed",
                 SandboxesError::Job(job) => match job {
                     SandboxError::Refused(_) => "refused",
                     SandboxError::Behind { .. } => "behind",

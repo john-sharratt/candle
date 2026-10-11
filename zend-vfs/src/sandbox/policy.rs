@@ -87,6 +87,11 @@ impl CommandPolicy {
         }
     }
 
+    /// The programs this policy starts, in order.
+    pub fn programs(&self) -> impl Iterator<Item = &str> {
+        self.programs.iter().map(String::as_str)
+    }
+
     /// The programs this policy starts, in order, comma-separated — or
     /// `nothing` for a policy that starts none.
     pub fn allowed(&self) -> String {

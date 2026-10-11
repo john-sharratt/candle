@@ -8,9 +8,10 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 
+use super::agents::{choose, Choice, Need};
 use super::claims::Claims;
 use crate::dispatch::{Dispatch, RouteTable};
-use crate::frame::{BuildId, Capacity, ClaimInfo, MemberInfo, MemberState};
+use crate::frame::{BuildId, Capacity, ClaimInfo, MemberInfo, MemberState, RepoAd};
 
 /// One admitted member.
 #[derive(Debug, Clone)]
@@ -22,6 +23,8 @@ pub struct MemberView {
     /// Its power at admission, fixed for the session (§9.5).
     pub weight: u32,
     pub session: u64,
+    /// The repositories its `HELLO` advertised (§10.1, §11.2).
+    pub repos: Vec<RepoAd>,
     /// Its last `CAPACITY`; a member is loading until it sends one.
     pub capacity: Option<Capacity>,
     pub routes: Option<RouteTable>,
@@ -250,6 +253,24 @@ impl Registry {
         let pick = nodes[a.rr % nodes.len()];
         a.rr = a.rr.wrapping_add(1);
         Some(pick)
+    }
+
+    /// Which agent of `app` runs a job of `lineage` needing `need` (§11.3): the
+    /// lineage's holder while it has a free slot, and after `waited` the best
+    /// idle agent.
+    pub fn pick_agent(
+        &self,
+        app: &str,
+        lineage: Option<&str>,
+        need: &Need,
+        waited: bool,
+    ) -> Choice {
+        let holder = lineage.and_then(|k| {
+            self.apps
+                .get(app)
+                .and_then(|a| a.claims.holder(k.as_bytes()))
+        });
+        choose(&self.ready(app), holder, need, waited)
     }
 
     /// Where a request with `dispatch` goes. `key` is its sticky or owner key;

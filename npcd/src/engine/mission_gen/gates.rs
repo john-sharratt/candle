@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::material::strip_calls;
+use crate::sim::shelf::Shelf;
 
 /// What kind of document the gate is checking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,19 +124,16 @@ impl Voice {
 }
 
 /// The voice the rest of a life is written in: the most common among its other
-/// events on disk. `None` when it has none.
-pub fn life_voice(mind: &Path, path: &str) -> Option<Voice> {
-    let dir = Path::new(path).parent()?;
-    let entries = std::fs::read_dir(mind.join(dir)).ok()?;
+/// events on `shelf`. `None` when it has none.
+pub fn life_voice(shelf: &dyn Shelf, path: &str) -> Option<Voice> {
+    let (dir, _) = path.rsplit_once('/')?;
     let mut counts: HashMap<&'static str, (usize, Voice)> = HashMap::new();
-    for e in entries.flatten() {
-        let p = e.path();
-        let rel =
-            format!("{}/{}", dir.display(), e.file_name().to_string_lossy()).replace('\\', "/");
-        if rel == path || p.extension().and_then(|x| x.to_str()) != Some("md") {
+    for name in shelf.list(dir) {
+        let rel = format!("{dir}/{name}");
+        if rel == path || !name.ends_with(".md") {
             continue;
         }
-        if let Ok(text) = std::fs::read_to_string(&p) {
+        if let Some(text) = shelf.read(&rel) {
             let v = Voice::of(&text);
             counts.entry(v.word()).or_insert((0, v)).0 += 1;
         }
@@ -221,14 +219,13 @@ pub fn tidy(path: &str, text: &str) -> String {
     }
 }
 
-/// Tidy the document at `path` under `root` in place. `true` when it changed.
-pub fn tidy_on_disk(root: &Path, path: &str) -> bool {
-    let full = root.join(path);
-    let Ok(text) = std::fs::read_to_string(&full) else {
+/// Tidy the document at `path` on `shelf` in place. `true` when it changed.
+pub fn tidy_on(shelf: &dyn Shelf, path: &str) -> bool {
+    let Some(text) = shelf.read(path) else {
         return false;
     };
     let tidied = tidy(path, &text);
-    tidied != text && std::fs::write(&full, tidied).is_ok()
+    tidied != text && shelf.commit(&[(path.to_string(), Some(tidied))]).is_ok()
 }
 
 /// A story's title from its file name: `the-weight-of-the-deep.md` → "The
@@ -500,7 +497,11 @@ fn refrains(text: &str) -> Vec<(String, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::sim::shelf::Published;
 
     /// What the faults say, in order.
     fn said(faults: Vec<Fault>) -> Vec<String> {
@@ -704,7 +705,7 @@ mod tests {
         std::fs::write(life.join("2487 A.md"), varied(300, "we")).unwrap();
         std::fs::write(life.join("2786 B.md"), varied(300, "we")).unwrap();
         assert_eq!(
-            life_voice(dir.path(), "layers/life/keeper/2750 New.md"),
+            life_voice(&on(&dir), "layers/life/keeper/2750 New.md"),
             Some(Voice::FirstPlural)
         );
         assert_eq!(
@@ -722,9 +723,68 @@ mod tests {
         std::fs::write(life.join("3086 B.md"), varied(300, "you")).unwrap();
         std::fs::write(life.join("2950 New.md"), varied(300, "I")).unwrap();
         assert_eq!(
-            life_voice(dir.path(), "layers/life/creed/2950 New.md"),
+            life_voice(&on(&dir), "layers/life/creed/2950 New.md"),
             Some(Voice::Second)
         );
-        assert_eq!(life_voice(dir.path(), "layers/life/nobody/1 X.md"), None);
+        assert_eq!(life_voice(&on(&dir), "layers/life/nobody/1 X.md"), None);
+    }
+
+    /// **Tidying commits through the shelf it read from**; the published
+    /// mind takes no commit, so nothing on it is tidied.
+    #[test]
+    fn tidying_commits_into_the_shelf() {
+        let dir = tempfile::tempdir().unwrap();
+        let life = dir.path().join("layers/life/creed");
+        std::fs::create_dir_all(&life).unwrap();
+        std::fs::write(life.join("2950 X.md"), "# A Heading\n\nYou woke.\n").unwrap();
+        assert!(!tidy_on(&on(&dir), "layers/life/creed/2950 X.md"));
+        assert_eq!(
+            std::fs::read_to_string(life.join("2950 X.md")).unwrap(),
+            "# A Heading\n\nYou woke.\n"
+        );
+        let held = Held(Mutex::new(BTreeMap::from([(
+            "layers/life/creed/2950 X.md".to_string(),
+            "# A Heading\n\nYou woke.\n".to_string(),
+        )])));
+        assert!(tidy_on(&held, "layers/life/creed/2950 X.md"));
+        assert_eq!(
+            held.read("layers/life/creed/2950 X.md").as_deref(),
+            Some("You woke.\n")
+        );
+        assert!(
+            !tidy_on(&held, "layers/life/creed/2950 X.md"),
+            "already tidy"
+        );
+        assert!(!tidy_on(&held, "layers/life/creed/1 Y.md"), "not there");
+    }
+
+    fn on(dir: &tempfile::TempDir) -> Published {
+        Published {
+            root: dir.path().to_path_buf(),
+        }
+    }
+
+    /// A shelf holding its documents in memory, taking every commit.
+    struct Held(Mutex<BTreeMap<String, String>>);
+
+    impl Shelf for Held {
+        fn read(&self, key: &str) -> Option<String> {
+            self.0.lock().unwrap().get(key).cloned()
+        }
+
+        fn list(&self, _dir: &str) -> BTreeSet<String> {
+            BTreeSet::new()
+        }
+
+        fn commit(&self, changes: &[(String, Option<String>)]) -> Result<(), String> {
+            let mut docs = self.0.lock().unwrap();
+            for (key, text) in changes {
+                match text {
+                    Some(t) => docs.insert(key.clone(), t.clone()),
+                    None => docs.remove(key),
+                };
+            }
+            Ok(())
+        }
     }
 }

@@ -3,13 +3,15 @@
  * Each operation is one piece of the world's storyline carried through a
  * workflow from the mind's missions.yaml: steps taken by Makers and by the
  * table, each step's outcome choosing the next, until one leads to done or
- * failed. Nothing stands in the record until its workflow says it does.
+ * failed. Its work stays in its own store until its last step publishes it at
+ * the merge table; nothing stands in the record before that.
  *
  * Running operations are shown open, with where each stands in its workflow
  * and who is carrying it; finished ones fold away below. An operation can be
  * renamed, its objective restated, the brief of its waiting mission rewritten,
- * sent to any step of its workflow, or called off. The page polls, and holds
- * its paint while you are editing. */
+ * sent to any step of its workflow, its publish waiting on git offered at
+ * once, or called off. The page polls, and holds its paint while you are
+ * editing. */
 
 import { API } from '../lib/api.js';
 import { h, mount, fmtNum } from '/common/lib/dom.js';
@@ -81,7 +83,7 @@ export async function render(_params, _q) {
       h('div', { class: 'sub' },
         'What the command table is having written. Each operation runs a workflow from the '
         + "mind's missions.yaml — written, read by the table, reviewed and checked by other "
-        + 'Makers — before it stands in the record.')),
+        + 'Makers, then published at the merge table — before it stands in the record.')),
     h('div', { class: 'row wrap', style: 'gap:6px' }, openBtn, reviewPath, reviewBtn)));
   el.appendChild(h('div', { style: 'margin:-6px 0 12px' }, note));
   el.appendChild(kpiHost);
@@ -122,12 +124,35 @@ export async function render(_params, _q) {
       ...makers.map((t) => h('span', {}, `${t.step} by `, h('b', {}, name(t.by_name, t.by)))),
       op.round ? h('span', { class: 'dim' }, `round ${op.round + 1} · sent back ${op.send_backs}×`) : null,
       op.carrying ? h('span', { class: 'chip accent' }, 'carried now by ' + name(op.carrying_name, op.carrying)) : null,
-      op.waiting_brief ? h('span', { class: 'chip' }, 'waiting at the table') : null);
+      op.waiting_brief ? h('span', { class: 'chip' }, 'waiting at the table') : null,
+      op.retry ? h('span', { class: 'chip warn' }, 'publish waiting on git') : null,
+      op.published ? h('span', { class: 'chip ok mono', title: op.published }, 'published ' + op.published.slice(0, 10)) : null);
   }
 
-  /* The document an operation wrote, read from wherever it is now — the record,
-   * or where its rejection moved it. Fetched once when first opened and kept,
-   * so the poll's repaint shows it again without asking for it again. */
+  /* A publish that could not reach git: why, when it is offered again, and the
+   * button that offers it now. */
+  function waiting(world, op) {
+    if (!op.retry) return null;
+    const minutes = Math.max(0, Math.ceil((op.retry.at_ms - Date.now()) / 60000));
+    return h('div', { class: 'tiny row wrap', style: 'margin:6px 0;gap:6px;align-items:center' },
+      h('span', { class: 'st-warn' }, `The publish could not reach git: ${op.retry.why}.`),
+      h('span', { class: 'dim' }, minutes ? `Offered again in ${minutes} min.` : 'Offered again now.'),
+      h('button', {
+        class: 'btn sm ghost',
+        onClick: async () => {
+          try {
+            await API.retryOperation(world, op.id);
+            say(`${op.name}'s publish is on the table again.`);
+            paint();
+          } catch (e) { say(e.message || String(e), true); }
+        },
+      }, 'Try now'));
+  }
+
+  /* The document an operation wrote, as its store holds it — the record's,
+   * under whatever the operation has changed. Fetched once when first opened
+   * and kept, so the poll's repaint shows it again without asking for it
+   * again. */
   const docs = new Map();
   function docView(world, op) {
     const key = `${keyOf(world, op)}:doc`;
@@ -137,7 +162,7 @@ export async function render(_params, _q) {
         ? h('div', { class: 'tiny st-warn' }, d.error)
         : h('div', {},
           h('div', { class: 'tiny dim', style: 'margin-bottom:4px' },
-            `${d.where === 'rejected' ? 'Rejected — ' : 'On the record — '}${d.path} · ${fmtNum(d.words)} words `,
+            `${d.where === 'operation' ? 'Unpublished — ' : 'On the record — '}${d.path} · ${fmtNum(d.words)} words `,
             h('button', {
               class: 'btn sm ghost',
               onClick: () => { docs.delete(key); load(); },
@@ -185,6 +210,7 @@ export async function render(_params, _q) {
         h('span', { class: 'tiny dim' }, ` · ${op.generator} · ${op.target}`)),
       doc ? doc.panel : null,
       op.why ? h('div', { class: 'tiny st-warn', style: 'margin:6px 0' }, op.why) : null,
+      waiting(world, op),
       op.waiting_brief
         ? section(`${keyOf(world, op)}:brief`, 'The waiting brief', op.waiting_brief)
         : null,

@@ -319,8 +319,15 @@ export const LiveAPI = {
   stepOperation: (wid, oid, step) =>
     j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/step',
       { method: 'POST', body: { step } }),
-  /* The document an operation wrote — `{path, where, words, text}`, `where`
-   * being `record` or `rejected` — or a 404 when it was never committed. */
+  /* Offer a publish that is waiting on git at once, rather than when its
+   * wait is over. */
+  retryOperation: (wid, oid) =>
+    j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/retry',
+      { method: 'POST', body: {} }),
+  /* The document an operation wrote, as its store holds it —
+   * `{path, where, words, text}`, `where` being `record` when the record
+   * already says it and `operation` while it holds unpublished work — or a 404
+   * when neither has it. */
   operationDocument: (wid, oid) =>
     j('/v1/pulse/operations/' + encodeURIComponent(wid) + '/' + oid + '/document'),
   /* Put a document already on the record through the table's reading and a
@@ -372,6 +379,21 @@ export const LiveAPI = {
     j('/v1/mind/entry' + qs({ id, world, new: isNew ? 1 : '' }), { method: 'PUT', body: { text } }),
   deleteMindEntry: (id, world) =>
     j('/v1/mind/entry' + qs({ id, world }), { method: 'DELETE' }),
+
+  /* An admin's drafts. Over a mind under git every write above — a world, a
+   * personality, an entry, a life — is a draft of the caller's own until they
+   * publish it; `{keeps_drafts, drafts: [{path, removed}]}`, `keeps_drafts`
+   * false over a mind folder that is not a git repository, where a write is
+   * what stands. */
+  getDrafts: () => j('/v1/mind/drafts'),
+  /* Land them on the record: `{published, paths}`, `published` the commit or
+   * null when they said nothing new. 409 `conflicts` names the documents the
+   * record moved under; 503 `unreachable` when git cannot be reached. */
+  publishDrafts: () => j('/v1/mind/publish', { method: 'POST', body: {} }),
+  /* Bring the record's newer text in, each overlap marked in the document:
+   * `{synced, conflicts}`. */
+  syncDrafts: () => j('/v1/mind/sync', { method: 'POST', body: {} }),
+  discardDrafts: () => j('/v1/mind/drafts', { method: 'DELETE' }),
 
   /* A portrait: the raw image as the body, not a multipart form. There is one
    * file and no other fields, so an envelope would be ceremony around a byte

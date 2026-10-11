@@ -1,5 +1,7 @@
 //! Pushing to remote branches and tags, each change guarded by a lease.
 
+use serde::{Deserialize, Serialize};
+
 use crate::classify::classify;
 use crate::error::GitError;
 use crate::runner::Context;
@@ -31,7 +33,8 @@ impl PushTarget {
         }
     }
 
-    fn from_ref(name: &RefName) -> Option<Self> {
+    /// The branch or tag `name` names; `None` for any other ref.
+    pub fn from_ref(name: &RefName) -> Option<Self> {
         name.branch()
             .map(Self::Branch)
             .or_else(|| TagName::from_ref(name).map(Self::Tag))
@@ -92,7 +95,8 @@ impl PushSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "rejection", content = "why", rename_all = "snake_case")]
 pub enum Rejection {
     /// The remote branch did not hold what the lease expected.
     Stale,
@@ -105,7 +109,9 @@ pub enum Rejection {
     Other(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How one ref's push came out — here, or from an agent as JSON (§11.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PushOutcome {
     Created,
     FastForward,
@@ -170,11 +176,22 @@ pub(crate) fn parse_push(out: &str) -> Result<Vec<PushResult>, GitError> {
 
 impl Repo {
     /// Push every spec to `remote` in one atomic push: all refs change or
-    /// none do. A rejection is a result, not an error — the error cases are
-    /// the transport's (unreachable, authentication).
+    /// none do — from this checkout, or from an agent's when the repository
+    /// was opened [`pushing through`](Repo::pushing_through) one (§11.5).
+    pub fn push(
+        &self,
+        remote: &RemoteName,
+        specs: &[PushSpec],
+    ) -> Result<Vec<PushResult>, GitError> {
+        self.pusher.push(self, remote, specs)
+    }
+
+    /// Push every spec to `remote` from this checkout, in one atomic push. A
+    /// rejection is a result, not an error — the error cases are the
+    /// transport's (unreachable, authentication).
     ///
     /// Deleting with [`Lease::Absent`] is refused: there is nothing to delete.
-    pub fn push(
+    pub fn push_here(
         &self,
         remote: &RemoteName,
         specs: &[PushSpec],

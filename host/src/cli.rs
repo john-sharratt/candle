@@ -83,6 +83,12 @@ pub struct HostArgs {
     #[arg(long, value_name = "N")]
     pub cluster_quorum_max: Option<u32>,
 
+    /// Also join the cluster's agents, running build and git jobs on the
+    /// checkouts this agent file names (§11.5) — and, cut off from every
+    /// cluster, running this process's own. Needs `--cluster`.
+    #[arg(long, value_name = "FILE")]
+    pub agent: Option<PathBuf>,
+
     /// Increase log verbosity. -v = DEBUG, -vv = TRACE.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -101,6 +107,7 @@ impl Default for HostArgs {
             group_key: None,
             cluster_affinity_idle: 10,
             cluster_quorum_max: None,
+            agent: None,
             verbose: 0,
         }
     }
@@ -142,6 +149,7 @@ impl HostArgs {
             self.group_key.as_deref(),
             Duration::from_secs(self.cluster_affinity_idle * 60),
             self.cluster_quorum_max,
+            self.agent.as_deref(),
             host,
         )
     }

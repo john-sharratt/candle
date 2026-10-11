@@ -178,6 +178,7 @@ pub fn ingest(reg: &Registry, dir: &Path, images: &Images) -> BTreeMap<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::npcs::Npcs;
     use serde_json::json;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
@@ -291,11 +292,11 @@ mod tests {
         std::fs::write(dir.join("plain.yaml"), "id: plain\n").unwrap();
 
         let reg = Registry::load("personality", &dir).unwrap();
-        let images = Images::new(&tmp("ingest-store"));
+        let (_store, images) = images();
         let map = ingest(&reg, &dir, &images);
 
         let id = map.get("keeper").expect("keeper's portrait was stored");
-        assert!(id.starts_with("img_") && id.ends_with(".png"), "{id}");
+        assert!(id.len() == 68 && id.ends_with(".png"), "{id}");
         assert!(images.get(id).is_ok(), "the id does not serve");
         assert!(!map.contains_key("ghost"), "a missing file became an id");
         assert!(!map.contains_key("plain"));
@@ -314,7 +315,15 @@ mod tests {
         )
         .unwrap();
         let reg = Registry::load("personality", &dir).unwrap();
-        let images = Images::new(&tmp("stable-store"));
+        let (_store, images) = images();
         assert_eq!(ingest(&reg, &dir, &images), ingest(&reg, &dir, &images));
+    }
+
+    /// The images of a fresh substrate in a directory of the test's own.
+    fn images() -> (tempfile::TempDir, Images) {
+        let store = tempfile::TempDir::new().unwrap();
+        let shared = Npcs::load(store.path()).unwrap().substrate();
+        let (images, _) = Images::open(shared, &store.path().join("images")).unwrap();
+        (store, images)
     }
 }

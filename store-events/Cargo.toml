@@ -1,0 +1,17 @@
+[package]
+name = "store-events"
+version = "0.1.0"
+edition = "2021"
+description = "A set of zend-vfs stores kept as file events in a substrate, and replayed back (docs/zend_vfs_events.md)"
+
+# The stores are zend-vfs's, the events the substrate's: what zend keeps of a
+# conversation's files and npcd of an operation's (docs/replicated_substrate.md §10).
+[dependencies]
+candle-conversation = { path = "../candle-conversation" }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tracing    = { workspace = true }
+zend-vfs   = { path = "../zend-vfs" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

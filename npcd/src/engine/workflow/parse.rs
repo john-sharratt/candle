@@ -137,7 +137,7 @@ fn parse_workflow(name: &str, body: &Value) -> Result<Workflow, String> {
             "on-failed" => {
                 let text = text_of(v, &ctx, &key)?;
                 on_failed = OnFailed::parse(text).ok_or_else(|| {
-                    format!("{ctx}: `on-failed: {text}` is not one of set-aside, restore, keep")
+                    format!("{ctx}: `on-failed: {text}` is not one of discard, keep")
                 })?
             }
             "steps" => {
@@ -178,9 +178,11 @@ fn parse_step(workflow: &str, name: &str, body: &Value) -> Result<Step, String> 
     let mut context = Vec::new();
     let mut stuck = None;
     let mut stuck_limit = None;
+    let mut desk = None;
     for (k, v) in body {
         let key = name_of(k, &ctx)?;
         match key.as_str() {
+            "desk" => desk = Some(text_of(v, &ctx, &key)?.to_string()),
             "by" => {
                 let text = text_of(v, &ctx, &key)?;
                 by = Some(By::parse(text).ok_or_else(|| {
@@ -206,7 +208,7 @@ fn parse_step(workflow: &str, name: &str, body: &Value) -> Result<Step, String> 
             "stuck-limit" => stuck_limit = Some(count(v, &format!("{ctx}: `stuck-limit`"))?),
             other => {
                 return Err(format!(
-                    "{ctx}: unknown key `{other}`; a step has by, prompt, next, call, edits, tools, checks, context, stuck, stuck-limit"
+                    "{ctx}: unknown key `{other}`; a step has by, prompt, next, call, edits, tools, checks, context, stuck, stuck-limit, desk"
                 ))
             }
         }
@@ -248,6 +250,7 @@ fn parse_step(workflow: &str, name: &str, body: &Value) -> Result<Step, String> 
         context,
         stuck: stuck.unwrap_or_else(|| FAILED.to_string()),
         stuck_limit,
+        desk,
     })
 }
 
@@ -360,18 +363,20 @@ mod tests {
         parse_missions(yaml).unwrap_err()
     }
 
-    const PLAIN: &str = "      s:\n        by: maker\n        next: done\n        prompt: p\n";
+    /// A publish step: the one kind of step that may lead to `done`.
+    const PLAIN: &str =
+        "      s:\n        by: maker\n        next: done\n        checks: [published]\n        prompt: p\n";
 
     #[test]
     fn steps_keep_the_order_they_are_listed_in_and_defaults_apply() {
-        let wf = one(&steps("      zeta:\n        by: maker\n        next: alpha\n        prompt: z\n      alpha:\n        by: table\n        call: reading\n        next: mid\n        prompt: a\n      mid:\n        by: another\n        next: done\n        prompt: m\n"));
+        let wf = one(&steps("      zeta:\n        by: maker\n        next: alpha\n        prompt: z\n      alpha:\n        by: table\n        call: reading\n        next: mid\n        prompt: a\n      mid:\n        by: another\n        next: done\n        checks: [published]\n        prompt: m\n"));
         let names: Vec<&str> = wf.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["zeta", "alpha", "mid"]);
         assert_eq!(wf.start().name, "zeta");
         assert_eq!(wf.send_backs, 3);
         assert_eq!(wf.desk, None);
         assert_eq!(wf.year, None);
-        assert_eq!(wf.on_failed, OnFailed::Keep);
+        assert_eq!(wf.on_failed, OnFailed::Discard);
         let zeta = wf.start();
         assert_eq!(zeta.edits, Variants::One(Edits::Optional));
         assert_eq!(zeta.stuck, "failed");
@@ -384,17 +389,26 @@ mod tests {
     #[test]
     fn workflow_keys_are_carried() {
         let wf = one(&format!(
-            "workflows:\n  w:\n    send-backs: 0\n    desk: story-desk\n    year: era-opens\n    on-failed: set-aside\n    steps:\n{PLAIN}"
+            "workflows:\n  w:\n    send-backs: 0\n    desk: story-desk\n    year: era-opens\n    on-failed: keep\n    steps:\n{PLAIN}"
         ));
         assert_eq!(wf.send_backs, 0);
         assert_eq!(wf.desk.as_deref(), Some("story-desk"));
         assert_eq!(wf.year.as_deref(), Some("era-opens"));
-        assert_eq!(wf.on_failed, OnFailed::SetAside);
+        assert_eq!(wf.on_failed, OnFailed::Keep);
+    }
+
+    /// A step names its own desk, over its workflow's.
+    #[test]
+    fn a_step_names_its_own_desk() {
+        let wf = one(&steps(
+            "      publish:\n        by: maker\n        desk: merge-table\n        next: done\n        checks: [published]\n        prompt: p\n",
+        ));
+        assert_eq!(wf.start().desk.as_deref(), Some("merge-table"));
     }
 
     #[test]
     fn every_step_key_is_read() {
-        let wf = one(&steps("      read:\n        by: another\n        edits:\n          sound: optional\n          fail: new\n        next:\n          pass: done\n          fail: read\n        stuck: read\n        stuck-limit: 2\n        tools:\n          - report_rejected\n        checks:\n          - ' length '\n          - leakage\n        context: [draft, era-it-tells]\n        prompt:\n          sound: |\n            Read {objective}.\n          default: Again.\n"));
+        let wf = one(&steps("      read:\n        by: another\n        edits:\n          sound: optional\n          fail: new\n        next:\n          pass: done\n          fail: read\n        stuck: read\n        stuck-limit: 2\n        tools:\n          - report_rejected\n        checks:\n          - ' length '\n          - leakage\n          - published\n        context: [draft, era-it-tells]\n        prompt:\n          sound: |\n            Read {objective}.\n          default: Again.\n"));
         let read = wf.start();
         assert_eq!(read.by, By::Another);
         assert_eq!(
@@ -421,7 +435,7 @@ mod tests {
         assert_eq!(read.stuck, "read");
         assert_eq!(read.stuck_limit, 2);
         assert_eq!(read.tools, ["report_rejected"]);
-        assert_eq!(read.checks, ["length", "leakage"]);
+        assert_eq!(read.checks, ["length", "leakage", "published"]);
         assert_eq!(read.context, ["draft", "era-it-tells"]);
     }
 
@@ -479,7 +493,7 @@ mod tests {
     fn an_unknown_key_is_refused_at_every_level() {
         assert_eq!(
             err(&steps("      s:\n        by: maker\n        next: done\n        pass: done\n        prompt: p\n")),
-            "workflow `w`, step `s`: unknown key `pass`; a step has by, prompt, next, call, edits, tools, checks, context, stuck, stuck-limit"
+            "workflow `w`, step `s`: unknown key `pass`; a step has by, prompt, next, call, edits, tools, checks, context, stuck, stuck-limit, desk"
         );
         assert_eq!(
             err(&format!(
@@ -564,7 +578,7 @@ mod tests {
             ),
             (
                 format!("workflows:\n  w:\n    on-failed: drop\n    steps:\n{PLAIN}"),
-                "workflow `w`: `on-failed: drop` is not one of set-aside, restore, keep",
+                "workflow `w`: `on-failed: drop` is not one of discard, keep",
             ),
             (
                 format!("workflows:\n  w:\n    send-backs: -1\n    steps:\n{PLAIN}"),

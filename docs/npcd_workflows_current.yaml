@@ -14,8 +14,10 @@
 #               before the operation fails (today's FIX_LIMIT)
 #   desk        where its work is done: the bench its steps send a Maker to
 #   year        when its work is done: the time machine is set to it
-#   on-failed   set-aside (moved out of the record, retired from memory) |
-#               restore (put back as it was) | keep
+#   on-failed   discard (the default: the operation's store is dropped) |
+#               keep (left unpublished, for an operator to reopen). Nothing of
+#               a failed operation reached the record: only a publish step
+#               puts work there.
 #   steps       in order; the first is where an operation starts
 #
 # step keys — no others:
@@ -26,7 +28,10 @@
 #               write it whole (compose), change it (a commit is required),
 #               or leave it unless it finds a fault
 #   next        a step name for one result, or a map of outcome → step;
-#               done and failed end the operation (cancelled is the engine's)
+#               done and failed end the operation (cancelled is the engine's).
+#               Only a publish step — one carrying the `published` check —
+#               leads to done.
+#   desk        where this step is taken, over its workflow's desk
 #   stuck       where a `stuck` report leads once `stuck-limit` are made this
 #               round; until then the step is offered to someone else
 #   tools       acts this step adds to the Maker's own
@@ -36,9 +41,10 @@
 #               step whose edits are `change`, the document differs from what
 #               the step found; `brief-copied`: no run of ten or more of
 #               the brief's own words set down in it; `rejection-quotes-the-draft`,
-#               `rejection-names-an-era`: what a rejection must give; and the
-#               gate's own — length, heading, voice, paragraphs, said-twice,
-#               refrains, scaffolding, leakage.
+#               `rejection-names-an-era`: what a rejection must give;
+#               `published`: the operation's store has landed on the record;
+#               and the gate's own — length, heading, voice, paragraphs,
+#               said-twice, refrains, scaffolding, leakage.
 #   context     sections the engine puts before the prompt
 #   prompt      the text, or a map keyed by the outcome that led here
 #               (start for the first step, default for any other)
@@ -222,6 +228,23 @@ prompts:
       happened as told: `report_rejected`, saying which era it contradicts and
       how. A rejected draft goes back to be fixed, with your reasons.
 
+  publish: |
+    {name} — {objective}.
+
+    `{document}` has passed every check. Land it in the record at the merge
+    table: `merge_status` shows what the operation changes and whether it
+    merges cleanly; `merge_publish` lands it.
+
+    If the record moved under it at the lines it changes, `merge_publish` is
+    refused and names the documents. Then `merge_sync` brings the record's
+    newer text in, with each overlap marked in the document. Read both sides,
+    keep what the operation was verified to say and what the record has
+    gained since, edit the document until no marker is left, `bench_commit`
+    it, and publish again.
+
+    Once it has landed, `report_done`. If git cannot be reached, the table
+    offers this step again later; nothing is lost.
+
 generators:
 
   - id: life-event
@@ -339,7 +362,7 @@ workflows:
     send-backs: 3
     desk: story-desk
     year: era-opens
-    on-failed: set-aside
+    on-failed: discard
     steps:
 
       write:
@@ -514,7 +537,7 @@ workflows:
         by: another
         edits: optional
         next:
-          pass: done
+          pass: publish
           reject: fix
         stuck: fix
         stuck-limit: 2
@@ -537,12 +560,32 @@ workflows:
         prompt: |
           {canon}
 
+      # Every workflow ends here, once its verification has passed: the
+      # operation's store lands on the record at the merge table. Edits are
+      # only to resolve a conflict, and nothing goes back through review —
+      # what is merged is the verified text.
+      publish:
+        by: maker
+        desk: merge-table
+        edits: optional
+        next: done
+        stuck: failed
+        stuck-limit: 3
+        tools:
+          - merge_status
+          - merge_sync
+          - merge_publish
+        checks:
+          - published
+        prompt: |
+          {publish}
+
   # ── The next event of a character's life ──────────────────────────────────
   life-event:
     send-backs: 3
     desk: character-terminal
     year: event-year
-    on-failed: set-aside
+    on-failed: discard
     steps:
 
       write:
@@ -690,7 +733,7 @@ workflows:
         by: another
         edits: optional
         next:
-          pass: done
+          pass: publish
           reject: fix
         stuck: fix
         stuck-limit: 2
@@ -713,12 +756,28 @@ workflows:
         prompt: |
           {canon}
 
+      publish:
+        by: maker
+        desk: merge-table
+        edits: optional
+        next: done
+        stuck: failed
+        stuck-limit: 3
+        tools:
+          - merge_status
+          - merge_sync
+          - merge_publish
+        checks:
+          - published
+        prompt: |
+          {publish}
+
   # ── Two documents that cannot both be true ────────────────────────────────
   # No canon check: a correction changes the record to agree with itself.
   correction:
     send-backs: 3
     desk: chronicle-terminal
-    on-failed: restore
+    on-failed: discard
     steps:
 
       write:
@@ -807,10 +866,10 @@ workflows:
         by: table
         call: reading
         next:
-          sound: done
+          sound: publish
           mend: review
           fail: fix
-          unread: done
+          unread: publish
         context:
           - draft
           - worlds-words
@@ -819,6 +878,22 @@ workflows:
           - told
         prompt: |
           {reading}
+
+      publish:
+        by: maker
+        desk: merge-table
+        edits: optional
+        next: done
+        stuck: failed
+        stuck-limit: 3
+        tools:
+          - merge_status
+          - merge_sync
+          - merge_publish
+        checks:
+          - published
+        prompt: |
+          {publish}
 
 # ── Engine rules — not configured, true of every workflow ───────────────────
 #
@@ -830,11 +905,17 @@ workflows:
 #   is not sound is the one that counts.
 # - A document is tidied (headings, run-on paragraphs) before every reading
 #   and every report.
-# - A draft is held out of memory until its operation is done.
+# - Every step works in its operation's own store over the mind repository
+#   (docs/replicated_substrate.md §10.3): its reads see the steps before it,
+#   and its commits stay there. Nothing reaches the record, or memory, but
+#   through the publish step.
+# - A publish that cannot reach git waits: its step is offered again 30
+#   minutes later, and the store keeps the work meanwhile.
 # - Reads of documents gone from the record are struck; an operation whose
 #   document is gone is cancelled; one no Maker may take is cancelled.
-# - Every Maker step's mission sends the Maker to the workflow's `desk`, sets
-#   the time machine to its `year`, reads its `reads`, writes or changes its
+# - Every Maker step's mission sends the Maker to the step's `desk`, or the
+#   workflow's, sets the time machine to its `year` (a publish step is in
+#   none), reads its `reads`, writes or changes its
 #   document as `edits` says, and reports at the order table: `report_done`
 #   (the step's forward outcome — `pass`, or `next` for a step with one),
 #   `report_rejected` (the outcome `reject`, offered only where `tools` lists

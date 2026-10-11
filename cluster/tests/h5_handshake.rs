@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use cluster::clock::now_ms;
 use cluster::close::Close;
-use cluster::frame::{Admit, BuildId, Done, Frame, Hello, Kind, ModelId};
+use cluster::frame::{Admit, BuildId, Done, Frame, Hello, Kind, ModelId, RepoAd};
 use cluster::gateway::Hub;
 use cluster::handshake::{admit, join, GroupKey, HandshakeError, PROTO};
 use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
@@ -60,7 +60,11 @@ fn hello(node: u64, proto: u16) -> Hello {
         },
         model: None,
         power: 100,
-        repos: vec!["candle".into()],
+        repos: vec![RepoAd {
+            name: "candle".into(),
+            origin: "git@h:candle.git".into(),
+            push: false,
+        }],
         now_ms: 0,
         nonce: [0; 32],
     }

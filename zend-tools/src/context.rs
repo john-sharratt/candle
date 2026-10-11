@@ -16,7 +16,8 @@
 //! | `http_client` | `reqwest::blocking::Client` | Shared HTTP client for `web_fetch`, `weather`, etc. — reached only through [`ToolContext::http`] |
 //! | `secrets` | [`state::Secrets`] | The daemon's API keys and tokens (Tavily, GitHub), read once from a per-user file |
 //! | `subagent_runner` | `Option<Arc<dyn SubagentRunner>>` | Injected by daemon to run nested agent loops |
-//! | `sandboxes` | [`Sandboxes`] | The workspace's command sandboxes `run_command` runs in — reached only through [`ToolContext::sandboxes`] |
+//! | `executor` | [`Executor`] | Where `run_command` runs and the repositories' pushes are made: this daemon's sandboxes, or agents — commands reached only through [`ToolContext::executor`] |
+//! | `lineage` | `String` | The conversation the context's jobs belong to, which keeps them on one agent |
 //!
 //! # Grants
 //!
@@ -37,10 +38,10 @@
 
 use std::sync::Arc;
 
+use crate::executor::Executor;
 use crate::grants::{Capability, Grants, NotPermitted};
-use crate::sandboxes::Sandboxes;
 use crate::state::{CredentialStore, HashStateStore, NotesStore, Secrets, SessionRegistry};
-use zend_vfs::{RepoFiles, Workspace};
+use zend_vfs::{here, Push, RepoFiles, Workspace};
 
 /// Read-only handle bundle passed by the runner into each tool invocation.
 /// All stores are wrapped in `Arc` so cloning the context is cheap.
@@ -54,9 +55,12 @@ pub struct ToolContext {
     http_client: reqwest::blocking::Client,
     pub secrets: Arc<Secrets>,
     pub subagent_runner: Option<Arc<dyn crate::SubagentRunner>>,
-    /// `None` for a context the daemon gave no workspace's sandboxes — a test,
-    /// a detached context — which has no checkout to run a command on.
-    sandboxes: Option<Arc<Sandboxes>>,
+    /// `None` for a context the daemon gave no executor — a test, a detached
+    /// context — which has nowhere to run a command, and pushes from the
+    /// repository's own folder.
+    executor: Option<Arc<dyn Executor>>,
+    /// The conversation this context's jobs belong to; empty for none.
+    lineage: String,
     grants: Grants,
 }
 
@@ -91,7 +95,8 @@ impl ToolContext {
             // themselves unconfigured rather than reaching the network.
             secrets: Arc::new(Secrets::empty()),
             subagent_runner: None,
-            sandboxes: None,
+            executor: None,
+            lineage: String::new(),
             grants: Grants::NONE,
         }
     }
@@ -119,26 +124,38 @@ impl ToolContext {
         Ok(&self.credentials)
     }
 
-    /// The workspace's command sandboxes, when the context may run programs
-    /// on this host — `None` when it was given none.
-    pub fn sandboxes(&self) -> Result<Option<&Sandboxes>, NotPermitted> {
+    /// Where commands run, when the context may run programs — `None` when it
+    /// was given nowhere.
+    pub fn executor(&self) -> Result<Option<&dyn Executor>, NotPermitted> {
         self.grants.require(Capability::Exec)?;
-        Ok(self.sandboxes.as_deref())
+        Ok(self.executor.as_deref())
     }
 
-    /// This context with `sandboxes` to run commands in, shared by every
-    /// context built from it.
-    pub fn with_sandboxes(mut self, sandboxes: Arc<Sandboxes>) -> Self {
-        self.sandboxes = Some(sandboxes);
+    /// What makes `repo`'s pushes: the executor's, or the repository's own
+    /// folder for a context given none.
+    pub fn pusher(&self, repo: &str) -> Arc<dyn Push> {
+        self.executor.as_ref().map_or_else(here, |e| e.pusher(repo))
+    }
+
+    /// The conversation this context's jobs belong to.
+    pub fn lineage(&self) -> &str {
+        &self.lineage
+    }
+
+    /// This context with `executor` to run commands and make pushes, shared
+    /// by every context built from it.
+    pub fn with_executor(mut self, executor: Arc<dyn Executor>) -> Self {
+        self.executor = Some(executor);
         self
     }
 
     /// This context with `files` as its file stores — one conversation's own,
-    /// so the changes its tool calls make are its alone. Every other store is
-    /// shared with `self`.
-    pub fn with_files(&self, files: Arc<RepoFiles>) -> Self {
+    /// so the changes its tool calls make are its alone — and its jobs that
+    /// conversation's, `lineage`. Every other store is shared with `self`.
+    pub fn with_files(&self, files: Arc<RepoFiles>, lineage: &str) -> Self {
         Self {
             files,
+            lineage: lineage.to_string(),
             ..self.clone()
         }
     }
@@ -187,13 +204,13 @@ mod tests {
             .is_ok());
     }
 
-    /// **The sandboxes are out of reach without `Exec`**, and a context given
-    /// none says so rather than inventing some.
+    /// **The executor is out of reach without `Exec`**, and a context given
+    /// none says so rather than inventing one.
     #[test]
-    fn the_sandboxes_need_exec() {
+    fn the_executor_needs_exec() {
         let ctx = ToolContext::new();
-        assert_eq!(ctx.sandboxes().err(), Some(NotPermitted(Capability::Exec)));
+        assert_eq!(ctx.executor().err(), Some(NotPermitted(Capability::Exec)));
         let ctx = ctx.granting(Grants::NONE.with(Capability::Exec));
-        assert!(ctx.sandboxes().unwrap().is_none());
+        assert!(ctx.executor().unwrap().is_none());
     }
 }

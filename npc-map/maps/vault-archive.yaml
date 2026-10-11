@@ -1,0 +1,38 @@
+id: vault-archive
+kind: level
+within: creators-vault
+ordinal: 8
+name: the archive floor
+summary: >
+  Where finished work enters the record. Nothing a Maker writes upstairs is in
+  the record until it has passed every check and been brought down here and
+  published at a merge table.
+character: >
+  The lowest floor of the vault, and the only one where anything is final.
+lacks:
+  - way off this level except the lift
+spine:
+  name: the stacks
+  loop: false
+  through: [stacks-north, stacks-south]
+nodes:
+  - { id: stacks-north, kind: passage, name: the north stacks }
+  - { id: stacks-south, kind: passage, name: the south stacks, off: [stacks-north] }
+
+  - id: core
+    kind: core
+    name: the lift
+    plural: false
+    off: [stacks-north]
+
+  - id: merge-room
+    kind: work
+    name: the merge room
+    off: [stacks-north]
+    parts: [{ part: merge-table, count: 6 }, story-desk, light-ring]
+
+  - id: reading-room
+    kind: social
+    name: the reading room
+    off: [stacks-south]
+    parts: [{ part: seat, count: 6 }]

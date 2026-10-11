@@ -8,6 +8,7 @@ use super::{Missions, Settled};
 use crate::engine::mission::bank::Facts;
 use crate::engine::mission::{Mission, Origin, Outcome, Todo, Work};
 use crate::sim::operations::tests::workflows;
+use crate::sim::operations::RETRY_AFTER_MS;
 
 /// A table running npcd's workflows.
 fn table() -> Missions {
@@ -41,7 +42,6 @@ fn launch(m: &mut Missions, target: &str, fingerprint: u64) -> u64 {
         "What happens: something.",
         BTreeMap::new(),
         Vec::new(),
-        None,
     )
     .unwrap()
 }
@@ -49,7 +49,7 @@ fn launch(m: &mut Missions, target: &str, fingerprint: u64) -> u64 {
 /// Put every step a Maker owes on the table, as the engine's loop does: a
 /// mission naming the step, its document, and the acts the step adds.
 fn put_up(m: &mut Missions) {
-    for id in m.operations().awaiting_offer() {
+    for id in m.operations().awaiting_offer(0) {
         let o = m.operations().get(id).unwrap();
         let step = o.step().unwrap().to_string();
         let tools = m.operations().offer(id).unwrap().step.tools.clone();
@@ -93,8 +93,9 @@ fn a_mission(prompt: &str) -> Mission {
     )
 }
 
-/// **An operation runs write, read, review, read again and canon, each Maker
-/// step by somebody new to the round, and only then settles its target.**
+/// **An operation runs write, read, review, read again, canon and publish,
+/// each Maker step by somebody new to the round, and only then settles its
+/// target.**
 /// Lodged work still comes first; the pool before the bank; and a done target
 /// is free again only once what it is about has changed.
 #[test]
@@ -137,11 +138,61 @@ fn an_operation_moves_its_target_through_the_ledger() {
     put_up(&mut m);
     assert_eq!(collect_step(&mut m, "cara"), Some((id, "canon".into())));
     m.report("cara", Outcome::Pass, "agrees with the Concord", None);
+    assert_eq!(
+        m.targets()["life:keeper"].state,
+        Settled::Carried,
+        "verified is not published"
+    );
+    put_up(&mut m);
+    assert_eq!(collect_step(&mut m, "bram"), Some((id, "publish".into())));
+    m.report("bram", Outcome::Pass, "landed", None);
 
     assert!(m.operations().get(id).unwrap().succeeded());
     assert_eq!(m.targets()["life:keeper"].state, Settled::Done);
     assert!(m.blocks("life:keeper", 7), "done, and nothing has changed");
     assert!(!m.blocks("life:keeper", 8), "the life has a new event");
+}
+
+/// **A publish that cannot reach git is put down without a report**: the
+/// Maker's mission goes, the run stays on `publish` with nothing counted, and
+/// the step comes back to the table thirty minutes on.
+#[test]
+fn a_publish_that_cannot_reach_git_is_put_down_and_offered_again() {
+    let mut m = table();
+    let id = launch(&mut m, "pair:a-b", 1);
+    put_up(&mut m);
+    collect_step(&mut m, "wren");
+    m.report("wren", Outcome::Pass, "changed it", None);
+    m.table_took(id, "sound", "").unwrap();
+    put_up(&mut m);
+    collect_step(&mut m, "pax");
+    m.report("pax", Outcome::Pass, "it agrees", None);
+    m.table_took(id, "sound", "").unwrap();
+    put_up(&mut m);
+    assert_eq!(collect_step(&mut m, "bram"), Some((id, "publish".into())));
+    let run = m.operations().get(id).unwrap().run.clone();
+
+    assert_eq!(m.publish_waits("bram", "origin is down", 5_000), Some(id));
+    assert!(!m.is_on_mission("bram"));
+    let o = m.operations().get(id).unwrap();
+    assert_eq!(o.run, run, "neither an outcome nor a stuck report");
+    assert_eq!(o.holder, None);
+    assert_eq!(m.targets()["pair:a-b"].state, Settled::Carried);
+    assert!(m
+        .operations()
+        .awaiting_offer(5_000 + RETRY_AFTER_MS - 1)
+        .is_empty());
+    assert_eq!(
+        m.operations().awaiting_offer(5_000 + RETRY_AFTER_MS),
+        vec![id]
+    );
+    assert_eq!(m.publish_waits("bram", "again", 6_000), None, "not on it");
+
+    m.published(id, "abc123");
+    assert_eq!(
+        m.operations().get(id).unwrap().published.as_deref(),
+        Some("abc123")
+    );
 }
 
 /// **A rejection sends the work to be fixed** — by anybody but the rejecter,

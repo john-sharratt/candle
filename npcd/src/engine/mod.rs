@@ -48,6 +48,7 @@
 
 pub mod act;
 pub mod acts;
+pub mod archive;
 pub mod ask_api;
 pub mod at_work;
 pub mod authoring;
@@ -91,6 +92,7 @@ pub mod prompt;
 pub mod prose;
 pub mod pulse;
 pub mod reach;
+pub mod record_follow;
 pub mod reflect;
 pub mod rendered;
 pub mod reported;
@@ -524,6 +526,12 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Role::Admin,
             world(),
             post(operations_api::step),
+        )
+        .route(
+            "/v1/pulse/operations/:wid/:oid/retry",
+            Role::Admin,
+            world(),
+            post(operations_api::retry),
         )
         .route(
             "/v1/pulse/operations/:wid/:oid/document",

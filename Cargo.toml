@@ -1,8 +1,10 @@
 [workspace]
 members = [
+    "agent",
     "applied-set",
     "candle-conversation",
     "cluster",
+    "cluster-dial",
     "candle-core",
     "zend",
     "candle-datasets",
@@ -14,6 +16,7 @@ members = [
     "host",
     "npc-map",
     "npcd",
+    "store-events",
     "tokerad",
     "web",
     "tensor-tools",

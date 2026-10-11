@@ -74,6 +74,7 @@ impl Substrate {
             | RecordType::Distilled
             | RecordType::VfsEvent
             | RecordType::VfsTombstone
+            | RecordType::Blob
             | RecordType::Npc
             | RecordType::BranchCheckpoint
             | RecordType::ModelKey

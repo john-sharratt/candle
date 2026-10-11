@@ -17,6 +17,11 @@ use super::link::Link;
 pub const DUMB_HOP: &str = "x-tokera-hop";
 pub const DUMB_HOP_VALUE: &str = "dumb";
 
+/// The header naming the member a request came from, its node in hex — set by
+/// the gateway on a request that arrived on a stream a member opened (§5.8),
+/// and on nothing else.
+pub const FROM_MEMBER: &str = "x-tokera-from-member";
+
 /// The one path that never forwards.
 pub const STATUS_PATH: &str = "/v1/status";
 

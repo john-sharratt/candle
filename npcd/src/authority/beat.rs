@@ -217,6 +217,9 @@ impl Runtime {
         let Some(shared) = self.substrate() else {
             return;
         };
+        // What its operations' stores held here goes with the local world: a
+        // publish it landed is in the record, and the rest is the events'.
+        self.ops.scrap(world);
         let records = store::read(&shared, world);
         apply(hosted, &records);
         self.standing.set_written(world, records);

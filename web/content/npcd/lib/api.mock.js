@@ -23,14 +23,31 @@ const forgottenEntries = new Set();
 /* The steps of the workflows the mock's operations run on, as the view gives
  * them. */
 const STORY_STEPS = [
-  { name: 'write', table: false }, { name: 'read', table: true }, { name: 'review', table: false },
-  { name: 'reread', table: true }, { name: 'canon', table: false }, { name: 'fix', table: false },
+  { name: 'write', table: false }, { name: 'fix', table: false }, { name: 'read', table: true },
+  { name: 'review', table: false }, { name: 'reread', table: true }, { name: 'canon', table: false },
+  { name: 'publish', table: false },
 ];
 const LIFE_STEPS = STORY_STEPS;
 
 /* The command table's operations, as `/v1/pulse/operations` serves them: one
- * waiting for its review, one passed, one failed. */
+ * whose publish waits on git, one waiting for its review, one published, one
+ * failed. */
 const mockOps = [
+  {
+    id: 4, name: 'Operation Quiet Harbour', objective: 'Tell what The Salvation passes over: "The Last Tally"',
+    workflow: 'story', steps: STORY_STEPS, step: 'publish', state: 'running', finished: false, round: 0, send_backs: 0,
+    generator: 'untold', target: 'era:layers/eras/the-salvation.md',
+    document: 'layers/stories/the-last-tally.md', carrying: null, carrying_name: null,
+    history: [
+      { step: 'write', by: 'm1', by_name: 'Wren', outcome: null, to: 'read', notes: 'Written.' },
+      { step: 'read', by: 'table', by_name: 'the table', outcome: 'sound', to: 'review', notes: "The table's verdict: sound." },
+      { step: 'review', by: 'm2', by_name: 'Pax', outcome: 'pass', to: 'reread', notes: 'Read it against the era.' },
+      { step: 'reread', by: 'table', by_name: 'the table', outcome: 'sound', to: 'canon', notes: "The table's verdict: sound." },
+      { step: 'canon', by: 'm3', by_name: 'Tess', outcome: 'pass', to: 'publish', notes: 'It agrees with the Salvation.' },
+    ],
+    why: null, waiting_brief: null, published: null,
+    retry: { at_ms: Date.now() + 1000 * 60 * 24, why: 'remote origin could not be reached: connection refused' },
+  },
   {
     id: 3, name: 'Operation Grey Bearing', objective: 'Tell what The Tower Age passes over: "The Weight of the Deep"',
     workflow: 'story', steps: STORY_STEPS, step: 'review', state: 'running', finished: false, round: 0, send_backs: 0,
@@ -42,6 +59,7 @@ const mockOps = [
         notes: "The table's verdict: to be mended — the faults below can be put right in place.\n\nWhat it found wrong: \"He has been here so long that the concept of sky has become abstract\" restates the mood of the paragraph before it." },
     ],
     why: null, waiting_brief: 'Operation Grey Bearing — Tell what The Tower Age passes over.\n\nAnother Maker drafted it…',
+    published: null, retry: null,
   },
   {
     id: 2, name: 'Operation Ashen Ledger', objective: "Creed's life, 2950-03-12: The Silence Between Orders",
@@ -54,9 +72,10 @@ const mockOps = [
       { step: 'read', by: 'table', by_name: 'the table', outcome: 'sound', to: 'review', notes: "The table's verdict: sound." },
       { step: 'review', by: 'm2', by_name: 'Pax', outcome: 'pass', to: 'reread', notes: 'Read it against the era; mended one repeated line.' },
       { step: 'reread', by: 'table', by_name: 'the table', outcome: 'sound', to: 'canon', notes: "The table's verdict: sound." },
-      { step: 'canon', by: 'm3', by_name: 'Tess', outcome: 'pass', to: 'done', notes: 'It agrees with the Tower Age.' },
+      { step: 'canon', by: 'm3', by_name: 'Tess', outcome: 'pass', to: 'publish', notes: 'It agrees with the Tower Age.' },
+      { step: 'publish', by: 'm1', by_name: 'Wren', outcome: null, to: 'done', notes: 'Landed in the record.' },
     ],
-    why: null, waiting_brief: null,
+    why: null, waiting_brief: null, published: '4e9c85523c820b6359da78e9ae6a25ee6e5c8276', retry: null,
   },
   {
     id: 1, name: 'Operation Iron Lantern', objective: "Verdi's life, 2937: The First Zenling",
@@ -69,7 +88,7 @@ const mockOps = [
       { step: 'read', by: 'table', by_name: 'the table', outcome: 'fail', to: 'review', notes: "The table's verdict: failing." },
       { step: 'review', by: 'm3', by_name: 'Tess', outcome: 'reject', to: 'fix', notes: 'Told in the first person throughout; the life is in the second.' },
     ],
-    why: 'sent back 3 times', waiting_brief: null,
+    why: 'sent back 3 times', waiting_brief: null, published: null, retry: null,
   },
 ];
 const WORLD_EPOCH =Date.UTC(2187, 5, 14, 6, 14);
@@ -370,6 +389,10 @@ const mindField = (key, value, notes) => {
  * cannot tell the two apart. */
 const mindErr = (error, detail, status) =>
   Object.assign(new Error(detail), { error, detail, status: status || 404 });
+
+/* The admin's unpublished drafts, by path: whether the draft removes it. */
+const MOCK_DRAFTS = new Map();
+const drafted = (path, removed = false) => MOCK_DRAFTS.set(path, removed);
 
 export const MockAPI = {
   /* The host's shape: the process's line at the top, npcd's own under
@@ -696,8 +719,8 @@ export const MockAPI = {
     return { worlds: narrow(all, q, (x) => [x.world_id, x.name]) };
   },
   async getWorld(w) { return (await this.listWorlds()).worlds.find((x) => x.world_id === w); },
-  async setWorld() { return { ok: true }; },
-  async setWorldTime() { return { ok: true }; },
+  async setWorld(w) { drafted(`worlds/${w}.yaml`); return { ok: true }; },
+  async setWorldTime(w) { drafted(`worlds/${w}.yaml`); return { ok: true }; },
   async listPersonalities(q) {
     // Ids are slugs and the anchor is `anchor`, matching
     // `personalities/<id>.yaml`. Both were invented shapes — numbered rows and
@@ -726,7 +749,32 @@ export const MockAPI = {
     return { personalities: narrow(all, q, (x) => [x.personality_id, x.name]) };
   },
   async getPersonality(a) { return (await this.listPersonalities()).personalities.find((x) => x.personality_id === a); },
-  async setPersonality() { return { ok: true }; },
+  async setPersonality(a) { drafted(`personalities/${a}.yaml`); return { ok: true }; },
+
+  /* An admin's drafts: every save above lands here until it is published, the
+   * way it does over a mind under git. */
+  async getDrafts() {
+    await sleep(40);
+    return {
+      keeps_drafts: true,
+      drafts: [...MOCK_DRAFTS].map(([path, removed]) => ({ path, removed })),
+    };
+  },
+  async publishDrafts() {
+    await sleep(300);
+    const paths = [...MOCK_DRAFTS.keys()];
+    MOCK_DRAFTS.clear();
+    return { published: paths.length ? '9f1c2a7e4b' : null, paths };
+  },
+  async syncDrafts() {
+    await sleep(120);
+    return { synced: 'up_to_date', conflicts: [] };
+  },
+  async discardDrafts() {
+    await sleep(60);
+    MOCK_DRAFTS.clear();
+    return null;
+  },
 
   /* The life ladder.
    *
@@ -985,7 +1033,7 @@ export const MockAPI = {
     }
     return {
       npc_id: id,
-      portrait: { image_id: 'img_0011223344556677.png', origin: origin || 'uploaded' },
+      portrait: { image_id: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff.png', origin: origin || 'uploaded' },
     };
   },
 
@@ -1019,6 +1067,7 @@ export const MockAPI = {
     // is what editing the file itself means.
     delete node.doc;
     node.text = text;
+    drafted(id);
     return { id, title: node.title };
   },
 
@@ -1028,6 +1077,7 @@ export const MockAPI = {
     if (!node) throw mindErr('not_found', 'no such place');
     delete node.doc;
     delete node.text;
+    drafted(id, true);
     return null;
   },
 
@@ -1058,6 +1108,7 @@ export const MockAPI = {
       );
     }
     node.doc = { ...values };
+    drafted(id);
     return { id, title: node.title };
   },
 
@@ -1336,17 +1387,26 @@ export const MockAPI = {
     Object.assign(op, { step, state: 'running', finished: false, why: null, waiting_brief: null, round: op.round + 1 });
     return { operation: op.id, step };
   },
+  async retryOperation(_wid, oid) {
+    const op = mockOps.find((o) => o.id === Number(oid));
+    if (!op || !op.retry) {
+      throw Object.assign(new Error('that operation has no publish waiting to be tried again'),
+        { error: 'not_waiting', status: 409 });
+    }
+    op.retry = null;
+    return { operation: op.id, offered: true };
+  },
   async operationDocument(_wid, oid) {
     const op = mockOps.find((o) => o.id === Number(oid));
-    if (!op || (op.step === 'write' && !op.history.length)) {
+    if (!op || op.state === 'failed' || (op.step === 'write' && !op.history.length)) {
       throw Object.assign(
-        new Error('the document is neither on the record nor among the rejected — it was never committed'),
+        new Error('neither the record nor the operation holds the document — it was never committed, or the operation\'s work was discarded'),
         { error: 'no_document', status: 404 });
     }
     const text = `# ${op.name}\n\nThe draft ${op.name} wrote, as it stands.`;
     return {
       path: op.document,
-      where: op.state === 'failed' ? 'rejected' : 'record',
+      where: op.published ? 'record' : 'operation',
       words: text.split(/\s+/).length,
       text,
     };
@@ -1505,7 +1565,7 @@ export const MockAPI = {
   },
   async generatePortrait(id) {
     await sleep(1400);
-    return { ...(await this.getNpc(id)), portrait: { image_id: 'img_mock_generated.png', origin: 'generated', seed: 42 } };
+    return { ...(await this.getNpc(id)), portrait: { image_id: 'ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100.png', origin: 'generated', seed: 42 } };
   },
   async getImageQueue() { return { depth: 2, position: 1, state: 'waiting_for_vram', next_run_eta: null }; },
   imageUrl: () => null,

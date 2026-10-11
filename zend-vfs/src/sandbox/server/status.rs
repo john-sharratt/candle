@@ -2,13 +2,15 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::job_id::JobId;
 use crate::sandbox::{RunOutcome, SandboxError};
 
 /// Where a job stands.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum JobStatus {
     /// Waiting for the checkout, which another job holds.
     Queued,

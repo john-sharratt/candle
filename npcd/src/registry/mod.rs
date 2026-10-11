@@ -1,35 +1,29 @@
-//! Authored content that lives in the repository rather than in the substrate.
+//! Records kept as one YAML file each in a directory.
 //!
-//! Worlds and personalities are **written**, not accumulated. They are the setting
-//! an author invents and the doctrine they give a kind of character, and they
-//! want the things files give you — a diff, a review, a revert, and survival
-//! across a substrate wipe. NPCs are the opposite: they are lived experience,
-//! they belong to the substrate, and nothing here touches them.
+//! Two kinds of collection are kept this way. Worlds and personalities are
+//! **written** by an author, in the mind: the setting an author invents and
+//! the doctrine they give a kind of character, wanting what files give — a
+//! diff, a review, a revert, survival across a substrate wipe. A registry of
+//! them is what the mind folder holds as published; a save is an author's
+//! change to the mind ([`authored`], [`crate::drafts`]) and the registry is
+//! read again when the mind folder moves. Device tokens are written by this
+//! daemon, in its data directory, through [`Registry::put`].
 //!
-//! # The whole directory is read once, at boot
+//! # The whole directory is read at once
 //!
-//! After that the registry answers from memory and the filesystem is touched
-//! only when something is saved. That is a security decision before it is a
-//! performance one: **a request never names a path.** An id arriving on a URL
-//! is a key into a `BTreeMap`, and a key that is not in the map is a 404 rather
-//! than an open() of something. There is no traversal to defend against on the
-//! read path because there is no path.
+//! After that the registry answers from memory. That is a security decision
+//! before it is a performance one: **a request never names a path.** An id
+//! arriving on a URL is a key into a `BTreeMap`, and a key that is not in the
+//! map is a 404 rather than an open() of something. There is no traversal to
+//! defend against on the read path because there is no path.
 //!
 //! Writing is the one place an id becomes a file name, and it goes through
 //! [`id::check`] — an allowlist of 37 characters plus the Win32 device names
 //! that allowlist cannot see. Belt and braces, the assembled path is then
 //! checked to still be a direct child of the directory before anything is
 //! written; that check should be unreachable, and is cheap enough to keep.
-//!
-//! # A save edits the file; it does not rewrite it
-//!
-//! These documents carry their reasoning in their comments, and none of that is
-//! data. Saving through `serde_yaml` would round-trip the parsed value and
-//! delete every comment and block scalar in the file — so [`Registry::put`]
-//! goes through [`yaml_edit`], which replaces only the values that changed and
-//! copies every other byte through. See that module for why, and for what it
-//! does when a document is one it cannot edit.
 
+pub mod authored;
 pub mod id;
 /// Public because the mind's field editor patches documents the registry does
 /// not own — a canon page, a response section — and both need the same
@@ -107,36 +101,16 @@ impl PutError {
     }
 }
 
-/// One authored record, and where it came from.
+/// One record, and where it came from.
 #[derive(Debug, Clone)]
 pub struct Record {
     pub id: String,
-    /// The document as authored. Kept as JSON rather than a typed struct
+    /// The document as written. Kept as JSON rather than a typed struct
     /// because the schema is still moving and a field the daemon does not
     /// understand yet must survive a load/save round trip rather than being
     /// silently dropped — losing an author's work to a struct update is not a
     /// trade worth making.
     pub body: Value,
-}
-
-/// Who writes the files in a collection, which decides how a save is rendered.
-///
-/// This is not a preference. Preserving an author's formatting means splicing
-/// the new value into the existing text, and the splice locates what it is
-/// replacing by **building a pattern out of that text** — so its cost grows
-/// with the size of the thing being replaced, and a document holding a
-/// collection that grows without bound gets quadratically more expensive to
-/// save. That is worth paying where the comments are the most valuable thing in
-/// the file. It buys exactly nothing where no human has ever opened it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Written {
-    /// **By a person**, in an editor, with comments. Worlds and personalities:
-    /// a save changes the lines it must and leaves the rest of the file alone.
-    ByHand,
-    /// **By this daemon.** Accounts: nobody has ever commented one, so a save
-    /// serialises the document whole. Cheaper, and linear in the document
-    /// instead of quadratic in its largest collection.
-    ByDaemon,
 }
 
 /// An in-memory collection of records backed by one directory.
@@ -148,8 +122,6 @@ pub struct Registry {
     items: BTreeMap<String, Record>,
     /// What this collection is called in errors and logs (`world`, `personality`).
     kind: &'static str,
-    /// Whether a save preserves an author's formatting. See [`Written`].
-    written: Written,
 }
 
 impl Registry {
@@ -163,76 +135,62 @@ impl Registry {
     /// One malformed world must not take the daemon down and with it every
     /// other world — the same call the blog index makes about a post with
     /// broken front matter.
-    /// Files somebody wrote by hand, so a save preserves their formatting. Use
-    /// [`Self::load_generated`] for a collection this daemon writes — see
-    /// [`Written`], which explains why the choice is a performance decision and
-    /// not only a cosmetic one.
     pub fn load(kind: &'static str, dir: impl AsRef<Path>) -> Result<Self> {
-        Self::read(kind, dir, Written::ByHand)
-    }
-
-    /// Files this daemon writes, with no comments in them to keep.
-    pub fn load_generated(kind: &'static str, dir: impl AsRef<Path>) -> Result<Self> {
-        Self::read(kind, dir, Written::ByDaemon)
-    }
-
-    fn read(kind: &'static str, dir: impl AsRef<Path>, written: Written) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
+        let items = Self::read(kind, &dir)?;
+        tracing::info!("{kind}: {} loaded from {}", items.len(), dir.display());
+        Ok(Self { dir, items, kind })
+    }
+
+    /// Read the directory again, as it stands now. The ids that were here and
+    /// are gone come back, so whatever runs from one can be stopped.
+    pub fn reload(&mut self) -> Result<Vec<String>> {
+        let items = Self::read(self.kind, &self.dir)?;
+        let gone = self
+            .items
+            .keys()
+            .filter(|id| !items.contains_key(*id))
+            .cloned()
+            .collect();
+        self.items = items;
+        Ok(gone)
+    }
+
+    fn read(kind: &'static str, dir: &Path) -> Result<BTreeMap<String, Record>> {
         let mut items = BTreeMap::new();
+        if !dir.is_dir() {
+            return Ok(items);
+        }
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .with_context(|| format!("reading {kind} directory {}", dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "yaml"))
+            .collect();
+        entries.sort();
 
-        if dir.is_dir() {
-            let mut entries: Vec<_> = std::fs::read_dir(&dir)
-                .with_context(|| format!("reading {kind} directory {}", dir.display()))?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "yaml"))
-                .collect();
-            entries.sort();
-
-            for path in entries {
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                    tracing::warn!(path = %path.display(), "{kind}: file name is not UTF-8, skipping");
-                    continue;
-                };
-                // A file already on disk gets the same gate as one we would
-                // write. Something dropped in by hand — or by a checkout of a
-                // branch written on another OS — must not become an id the GUI
-                // then cannot save back.
-                if let Err(e) = id::check(stem) {
-                    tracing::warn!(path = %path.display(), error = %e, "{kind}: unusable file name, skipping");
+        for path in entries {
+            let Some(file) = path.file_name().and_then(|s| s.to_str()) else {
+                tracing::warn!(path = %path.display(), "{kind}: file name is not UTF-8, skipping");
+                continue;
+            };
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "{kind}: unreadable, skipping");
                     continue;
                 }
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, "{kind}: unreadable, skipping");
-                        continue;
-                    }
-                };
-                match serde_yaml::from_str::<Value>(&text) {
-                    Ok(body) => {
-                        items.insert(
-                            stem.to_string(),
-                            Record {
-                                id: stem.to_string(),
-                                body,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, "{kind}: does not parse, skipping");
-                    }
-                }
+            };
+            if let Some(record) = authored::record_of(kind, file, &text) {
+                items.insert(record.id.clone(), record);
             }
         }
+        Ok(items)
+    }
 
-        tracing::info!("{kind}: {} loaded from {}", items.len(), dir.display());
-        Ok(Self {
-            dir,
-            items,
-            kind,
-            written,
-        })
+    /// The directory the records are read from.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     pub fn len(&self) -> usize {
@@ -255,16 +213,13 @@ impl Registry {
         self.items.values()
     }
 
-    /// Write a record to disk and into memory.
+    /// Write a record this daemon keeps to disk and into memory, serialised
+    /// whole: nobody has ever commented one, so there is nothing in the file
+    /// to keep.
     ///
     /// Disk first: if the write fails, memory still matches what is on disk,
     /// and the caller gets an error instead of a registry that has quietly
-    /// diverged from the repository it is supposed to be.
-    ///
-    /// An existing file is **edited, not rewritten** — see [`yaml_edit`]. The
-    /// document's comments are the most valuable thing in it and none of them
-    /// are data, so a save that changes a name changes one line and leaves the
-    /// rest of the author's file alone.
+    /// diverged from the directory it is supposed to be.
     pub fn put(&mut self, id: &str, body: Value) -> std::result::Result<(), PutError> {
         id::check(id).map_err(PutError::BadId)?;
         let path = self.path_for(id).map_err(PutError::Io)?;
@@ -278,7 +233,9 @@ impl Registry {
             _ => {}
         }
 
-        let yaml = self.render(id, &path, &body).map_err(PutError::Io)?;
+        let yaml = serde_yaml::to_string(&body)
+            .with_context(|| format!("{}: serialising `{id}`", self.kind))
+            .map_err(PutError::Io)?;
         if yaml.len() > MAX_BYTES {
             return Err(PutError::TooLarge {
                 bytes: yaml.len(),
@@ -300,55 +257,7 @@ impl Registry {
                 body,
             },
         );
-        tracing::info!("{}: saved `{id}` to {}", self.kind, path.display());
         Ok(())
-    }
-
-    /// The bytes to write for `body`: an edit of the file that is there, or a
-    /// fresh serialisation when there is nothing to edit.
-    ///
-    /// The base is re-read from disk rather than taken from memory, so a
-    /// comment, a blank line or a rewrap somebody added by hand while the
-    /// daemon was up survives the next save. It is **not** protection against a
-    /// lost update: a `PUT` is a whole-document replacement, so a data field the
-    /// caller sends overwrites a hand edit to that same field regardless of
-    /// which text is used as the base. Closing that gap needs a revision on the
-    /// wire, or a watcher keeping memory current; neither exists yet, and this
-    /// re-read is worth doing on its own for the formatting.
-    fn render(&self, id: &str, path: &Path, body: &Value) -> Result<String> {
-        let whole = || {
-            serde_yaml::to_string(body)
-                .with_context(|| format!("{}: serialising `{id}`", self.kind))
-        };
-        // Nothing to preserve, so nothing to splice. This is the whole of the
-        // optimisation and it is a short-circuit rather than a faster splice:
-        // the expensive part of an in-place edit is locating the old text by
-        // pattern, and a document whose largest collection grows on every save
-        // makes that pattern grow with it. See [`Written`].
-        if self.written == Written::ByDaemon {
-            return whole();
-        }
-        let Some(map) = body.as_object() else {
-            return whole();
-        };
-        let Ok(original) = std::fs::read_to_string(path) else {
-            return whole(); // a new record; nothing to preserve
-        };
-        match yaml_edit::splice(&original, map) {
-            Some(edited) => Ok(edited),
-            None => {
-                // The file exists and could not be edited — an alias, a root
-                // that is not a mapping, or a rendering that failed its own
-                // read-back. Saying so matters: the save still succeeds, and
-                // the cost is the author's comments.
-                tracing::warn!(
-                    path = %path.display(),
-                    "{}: `{id}` could not be edited in place — rewriting whole, comments will be lost",
-                    self.kind
-                );
-                whole()
-            }
-        }
     }
 
     /// Remove a record from disk and memory. Absent is not an error — the
@@ -397,28 +306,6 @@ impl Registry {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    /// A directory no other test in this run shares.
-    ///
-    /// **The clock alone does not separate them.** Named by process and time,
-    /// two tests started in parallel inside one tick of the Windows clock got
-    /// the same directory, and one test's `ardh.yaml` was the other's.
-    fn tmp() -> PathBuf {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let p = std::env::temp_dir().join(format!(
-            "npcd-registry-{}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
 
     /// **What may leave the machine.** The HTTP layer decides by variant, so
     /// this is the rule itself rather than a rendering of it.
@@ -455,169 +342,67 @@ mod tests {
         }
     }
 
-    /// A document larger than the limit is refused rather than written. Without
-    /// this, an authored file was capped only by axum's 2 MB body default and a
-    /// caller could fill a disk one save at a time.
+    /// A document larger than the limit is refused rather than written.
     #[test]
     fn an_oversized_document_is_refused() {
-        let dir = tmp();
-        let mut r = Registry::load("world", &dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Registry::load("token", dir.path()).unwrap();
         let big = json!({ "name": "x", "setting": "a".repeat(MAX_BYTES + 1) });
         assert!(matches!(r.put("big", big), Err(PutError::TooLarge { .. })));
-        assert!(!dir.join("big.yaml").exists(), "it was written anyway");
-
-        // The limit is generous: the largest real personality is ~11 KiB.
-        let ok = json!({ "name": "x", "setting": "a".repeat(64 * 1024) });
-        assert!(r.put("fine", ok).is_ok());
+        assert!(
+            !dir.path().join("big.yaml").exists(),
+            "it was written anyway"
+        );
     }
 
     /// `fs::write` follows a symlink, so a link at `<id>.yaml` would put the
-    /// document wherever it points. `path_for` validates the path string; this
-    /// validates what is actually there, which a string check cannot.
-    ///
-    /// Exercised with a directory because creating a symlink needs privileges a
-    /// test cannot assume on Windows — the guard is the same one, and it is the
-    /// `!is_file()` branch either way.
+    /// document wherever it points. Exercised with a directory because creating
+    /// a symlink needs privileges a test cannot assume on Windows — the guard is
+    /// the same one, and it is the `!is_file()` branch either way.
     #[test]
     fn a_name_taken_by_something_that_is_not_a_file_is_refused() {
-        let dir = tmp();
-        std::fs::create_dir_all(dir.join("taken.yaml")).unwrap();
-        let mut r = Registry::load("world", &dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("taken.yaml")).unwrap();
+        let mut r = Registry::load("token", dir.path()).unwrap();
         assert!(matches!(
             r.put("taken", json!({ "name": "x" })),
             Err(PutError::NotAPlainFile)
         ));
-        assert!(dir.join("taken.yaml").is_dir(), "it was clobbered");
+        assert!(dir.path().join("taken.yaml").is_dir(), "it was clobbered");
     }
 
     #[test]
     fn a_missing_directory_is_an_empty_registry_not_a_failure() {
-        let r = Registry::load("world", tmp().join("does-not-exist")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let r = Registry::load("world", dir.path().join("does-not-exist")).unwrap();
         assert_eq!(r.len(), 0);
     }
 
-    /// **A hand-written file keeps its comments; a generated one is rewritten.**
-    ///
-    /// The two halves are one test because the point is the *difference*: it is
-    /// the reason `Written` exists, and asserting either alone would leave the
-    /// other free to drift into it.
+    /// **A save is serialised whole**: a daemon's record has no comments to
+    /// keep, and the bytes are exactly the serialisation.
     #[test]
-    fn an_authored_file_keeps_its_comments_and_a_generated_one_does_not() {
-        let dir = tmp();
-        let commented = "# the author's note\nname: Ardh\nsetting: A kingdom.\n";
-
-        std::fs::write(dir.join("byhand.yaml"), commented).unwrap();
-        let mut authored = Registry::load("world", &dir).unwrap();
-        authored
-            .put("byhand", json!({"name": "Ardh", "setting": "A republic."}))
-            .unwrap();
-        let after = std::fs::read_to_string(dir.join("byhand.yaml")).unwrap();
-        assert!(
-            after.contains("# the author's note"),
-            "an authored file lost its comment: {after}"
-        );
-        assert!(
-            after.contains("A republic."),
-            "the edit did not land: {after}"
-        );
-
-        std::fs::write(dir.join("bydaemon.yaml"), commented).unwrap();
-        let mut generated = Registry::load_generated("account", &dir).unwrap();
-        generated
-            .put(
-                "bydaemon",
-                json!({"name": "Ardh", "setting": "A republic."}),
-            )
-            .unwrap();
-        let after = std::fs::read_to_string(dir.join("bydaemon.yaml")).unwrap();
-        assert!(
-            !after.contains("# the author's note"),
-            "a generated file was spliced rather than rewritten, which is the \
-             expensive path this mode exists to avoid: {after}"
-        );
-        assert!(
-            after.contains("A republic."),
-            "the edit did not land: {after}"
-        );
-    }
-
-    /// **A growing collection must not make saves progressively slower.**
-    ///
-    /// This is the regression that cost 455 seconds in one test. Splicing locates
-    /// the text it replaces by building a pattern out of that text, so a document
-    /// whose largest collection grows on every save gets quadratically dearer to
-    /// write. A generated registry does not splice, so its saves stay flat.
-    ///
-    /// Asserted as a ratio against this machine's own first-ten timing rather
-    /// than a wall-clock bound, so it means the same thing on a slow box as on a
-    /// fast one. The margin is wide because it is catching an order of magnitude,
-    /// not a regression of a few percent.
-    #[test]
-    fn saving_a_generated_record_does_not_get_slower_as_it_grows() {
-        use std::time::Instant;
-
-        let dir = tmp();
-        let mut r = Registry::load_generated("account", &dir).unwrap();
-        // Small entries and a shallow history: the splice path's cost grows with
-        // the *text* of the collection, so 60 entries of 60 characters is already
-        // three orders of magnitude off the flat path and detects a reversion
-        // just as surely as 200 of 200 did — for a fiftieth of the runtime.
-        let entry = |i: usize| json!({ "revision": i, "text": "x".repeat(60) });
-
-        let mut history: Vec<Value> = Vec::new();
-        let save = |history: &Vec<Value>, r: &mut Registry| {
-            r.put("acct", json!({ "name": "A", "history": history }))
-                .unwrap();
-        };
-
-        let batch = |from: usize, to: usize, history: &mut Vec<Value>, r: &mut Registry| {
-            let at = Instant::now();
-            for i in from..to {
-                history.push(entry(i));
-                save(history, r);
-            }
-            at.elapsed()
-        };
-
-        batch(0, 5, &mut history, &mut r);
-        let early = batch(5, 15, &mut history, &mut r);
-        batch(15, 60, &mut history, &mut r);
-        let late = batch(60, 70, &mut history, &mut r);
-
-        assert!(
-            late < early * 20 + std::time::Duration::from_millis(50),
-            "saves got dramatically slower as the document grew — ten saves at \
-             70 entries took {late:?} against {early:?} at 15, which is the \
-             quadratic splice path coming back"
+    fn a_save_is_the_whole_serialisation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.yaml"), "# a note\nname: A\n").unwrap();
+        let mut r = Registry::load("token", dir.path()).unwrap();
+        r.put("t", json!({"name": "B", "npc": 7})).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("t.yaml")).unwrap(),
+            "name: B\nnpc: 7\n"
         );
     }
 
     #[test]
     fn a_record_survives_a_save_and_a_reload() {
-        let dir = tmp();
-        let mut r = Registry::load("world", &dir).unwrap();
-        r.put("ardh", json!({"name": "Ardh", "setting": "A kingdom."}))
-            .unwrap();
-
-        let again = Registry::load("world", &dir).unwrap();
-        assert_eq!(again.len(), 1);
-        assert_eq!(again.get("ardh").unwrap().body["name"], "Ardh");
-    }
-
-    /// A field the daemon has no struct for must come back unchanged. Losing an
-    /// author's work to a schema that has not caught up yet is the failure this
-    /// prevents.
-    #[test]
-    fn unknown_fields_survive_the_round_trip() {
-        let dir = tmp();
-        let mut r = Registry::load("world", &dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Registry::load("token", dir.path()).unwrap();
         r.put(
             "ardh",
             json!({"name": "Ardh", "some_future_field": {"deep": [1, 2, 3]}}),
         )
         .unwrap();
-
-        let again = Registry::load("world", &dir).unwrap();
+        let again = Registry::load("token", dir.path()).unwrap();
+        assert_eq!(again.len(), 1);
         assert_eq!(
             again.get("ardh").unwrap().body["some_future_field"]["deep"][2],
             3
@@ -626,21 +411,20 @@ mod tests {
 
     #[test]
     fn a_bad_id_is_refused_before_anything_is_written() {
-        let dir = tmp();
-        let mut r = Registry::load("world", &dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Registry::load("token", dir.path()).unwrap();
         for bad in ["../escape", "a/b", "con", "", "x.yaml", "-x"] {
             assert!(r.put(bad, json!({})).is_err(), "accepted `{bad}`");
         }
-        // Nothing reached the disk.
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     /// The point of the whole design: a lookup is a map lookup. An id nobody
-    /// authored is simply absent, whatever it says.
+    /// wrote is simply absent, whatever it says.
     #[test]
     fn an_unknown_id_is_absent_rather_than_a_path() {
-        let dir = tmp();
-        let mut r = Registry::load("world", &dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Registry::load("token", dir.path()).unwrap();
         r.put("ardh", json!({"name": "Ardh"})).unwrap();
         for miss in ["nope", "../../etc/passwd", "ardh.yaml", "ARDH"] {
             assert!(r.get(miss).is_none(), "`{miss}` resolved to something");
@@ -648,158 +432,55 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_does_not_parse_is_skipped_and_the_rest_still_load() {
-        let dir = tmp();
-        std::fs::write(dir.join("good.yaml"), "name: Good\n").unwrap();
-        std::fs::write(dir.join("broken.yaml"), "name: [unclosed\n").unwrap();
-        let r = Registry::load("world", &dir).unwrap();
-        assert_eq!(r.len(), 1, "the good one should still be there");
-        assert!(r.get("good").is_some());
-        assert!(r.get("broken").is_none());
-    }
-
-    /// A file whose name could not have been written by us — dropped in by
-    /// hand, or arriving from a checkout made on another OS.
-    #[test]
-    fn a_file_with_an_unusable_name_is_skipped() {
-        let dir = tmp();
-        std::fs::write(dir.join("Ardh.yaml"), "name: Uppercase\n").unwrap();
-        std::fs::write(dir.join("ok.yaml"), "name: Fine\n").unwrap();
-        let r = Registry::load("world", &dir).unwrap();
-        assert!(r.get("Ardh").is_none(), "an unsaveable id was loaded");
-        assert!(r.get("ok").is_some());
-    }
-
-    /// The property the console depends on: saving one field does not cost the
-    /// author the rest of the file. Tested here as well as in [`yaml_edit`]
-    /// because this is the layer the API calls, and a `put` that forgot to use
-    /// the editor would pass every test in that module.
-    #[test]
-    fn a_save_keeps_the_comments_and_the_shape_of_the_file() {
-        let dir = tmp();
-        let authored = "\
-# Sandbox -- why this world is written the way it is.
-#
-# The setting says what IS there, not what is absent.
-
-id: sandbox
-name: Sandbox
-public: false
-
-setting: >-
-  A room, a view from it, and objects that behave the same way
-  every time you touch them.
-
-# No shared canon: this world's whole content is one life.
-selects: []
-";
-        std::fs::write(dir.join("sandbox.yaml"), authored).unwrap();
-
-        let mut r = Registry::load("world", &dir).unwrap();
-        let mut body = r.get("sandbox").unwrap().body.clone();
-        body["name"] = json!("Sandbox Prime");
-        r.put("sandbox", body).unwrap();
-
-        let after = std::fs::read_to_string(dir.join("sandbox.yaml")).unwrap();
+    fn a_file_that_does_not_parse_or_is_misnamed_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("good.yaml"), "name: Good\n").unwrap();
+        std::fs::write(dir.path().join("broken.yaml"), "name: [unclosed\n").unwrap();
+        std::fs::write(dir.path().join("Upper.yaml"), "name: Upper\n").unwrap();
+        let r = Registry::load("world", dir.path()).unwrap();
         assert_eq!(
-            after,
-            authored.replace("name: Sandbox\n", "name: Sandbox Prime\n"),
-            "a save changed more than the one field it was given"
+            r.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
+            ["good"]
         );
     }
 
-    /// A record with no file yet has nothing to preserve, and must still land.
+    /// **A reload reads the directory as it stands and names what went.**
     #[test]
-    fn a_brand_new_record_is_written_from_scratch() {
-        let dir = tmp();
-        let mut r = Registry::load("world", &dir).unwrap();
-        r.put("ardh", json!({ "name": "Ardh", "selects": ["north"] }))
-            .unwrap();
-        let text = std::fs::read_to_string(dir.join("ardh.yaml")).unwrap();
-        assert!(text.contains("name: Ardh"), "{text}");
+    fn a_reload_reads_the_directory_again() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.yaml"), "name: A\n").unwrap();
+        std::fs::write(dir.path().join("b.yaml"), "name: B\n").unwrap();
+        let mut r = Registry::load("world", dir.path()).unwrap();
+        std::fs::remove_file(dir.path().join("a.yaml")).unwrap();
+        std::fs::write(dir.path().join("b.yaml"), "name: B2\n").unwrap();
+        std::fs::write(dir.path().join("c.yaml"), "name: C\n").unwrap();
+        assert_eq!(r.reload().unwrap(), ["a"]);
+        assert_eq!(r.get("b").unwrap().body["name"], "B2");
         assert_eq!(
-            Registry::load("world", &dir)
-                .unwrap()
-                .get("ardh")
-                .unwrap()
-                .body["selects"][0],
-            "north"
-        );
-    }
-
-    /// The base for an edit is the file on disk, not the copy in memory — so
-    /// prose somebody added by hand while the daemon was up is still there
-    /// afterwards.
-    ///
-    /// What this deliberately does **not** claim is protection against a lost
-    /// update. A `PUT` replaces the document, so a data field the caller sends
-    /// wins over a hand edit to that same field; the comment survives and the
-    /// value does not. Re-reading the file cannot change that and is not
-    /// pretending to — it is worth doing for the formatting alone.
-    #[test]
-    fn a_save_edits_the_file_on_disk_not_the_copy_in_memory() {
-        let dir = tmp();
-        std::fs::write(dir.join("ardh.yaml"), "name: Ardh\nsetting: Old.\n").unwrap();
-        let mut r = Registry::load("world", &dir).unwrap();
-
-        // Somebody edits the file directly, adding a comment and a field the
-        // registry has never seen. It knows about neither.
-        std::fs::write(
-            dir.join("ardh.yaml"),
-            "# written by hand\nname: Ardh\nsetting: Old.\n\n# and a new field\nmood: bleak\n",
-        )
-        .unwrap();
-
-        let mut body = r.get("ardh").unwrap().body.clone();
-        body["name"] = json!("Low Fen");
-        r.put("ardh", body).unwrap();
-
-        let after = std::fs::read_to_string(dir.join("ardh.yaml")).unwrap();
-        // The proof that the file was the base: this comment exists nowhere in
-        // the registry's memory, and it is still here.
-        assert!(after.contains("# written by hand"), "{after}");
-        assert!(after.contains("name: Low Fen"), "{after}");
-        // And the other half of the same fact. `mood` is absent from the body,
-        // and a PUT *replaces* the document — so the key goes. That is the rule
-        // the console relies on to remove a field, and it cannot be told apart
-        // here from a field the caller had never heard of. A caller that means
-        // "change only this" needs a PATCH, which these routes do not offer.
-        assert!(
-            !after.contains("mood: bleak"),
-            "a field absent from the body survived:\n{after}"
-        );
-        // The comment that introduced it **stays**, which is deliberate rather
-        // than an oversight. A person wrote that line; it may explain why the
-        // field went away, or be about to introduce its replacement. Deleting
-        // somebody's prose because a neighbouring key left is the destructive
-        // reading of "replace the document", and this is the one place where
-        // the conservative answer is also the cheaper one.
-        assert!(
-            after.contains("# and a new field"),
-            "a comment was deleted with its key:\n{after}"
+            r.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
+            ["b", "c"]
         );
     }
 
     #[test]
     fn delete_removes_from_both_disk_and_memory() {
-        let dir = tmp();
-        let mut r = Registry::load("world", &dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Registry::load("token", dir.path()).unwrap();
         r.put("ardh", json!({"name": "Ardh"})).unwrap();
         assert!(r.delete("ardh").unwrap());
         assert!(r.get("ardh").is_none());
-        assert!(!dir.join("ardh.yaml").exists());
-        // Deleting again is not an error.
+        assert!(!dir.path().join("ardh.yaml").exists());
         assert!(!r.delete("ardh").unwrap());
     }
 
     #[test]
     fn listing_order_is_stable() {
-        let dir = tmp();
-        let mut r = Registry::load("world", &dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = Registry::load("token", dir.path()).unwrap();
         for id in ["zeta", "alpha", "mid"] {
             r.put(id, json!({"name": id})).unwrap();
         }
-        let ids: Vec<_> = Registry::load("world", &dir)
+        let ids: Vec<_> = Registry::load("token", dir.path())
             .unwrap()
             .iter()
             .map(|x| x.id.clone())

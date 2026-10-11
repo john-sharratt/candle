@@ -1957,3 +1957,16 @@ canvas { width: 100%; display: block; }
 @media (max-width: 559px) {
   .msg { max-width: 92%; }
 }
+
+/* ── an admin's drafts ─────────────────────────────────────────────────────
+ * The topbar's list of unpublished changes and the three things to do with
+ * them. A column of paths, then one row of buttons — the shared `.menu button`
+ * is a full-width list item, which is right for a choice and wrong for an
+ * action beside two others. */
+.drafts-menu {
+  display: flex; flex-direction: column; gap: 6px;
+  min-width: 260px; max-width: min(440px, calc(100vw - 24px)); padding: 10px 12px;
+}
+.drafts-menu .mono { overflow-wrap: anywhere; color: var(--ink-dim); }
+.drafts-menu .row { display: flex; gap: 6px; margin-top: 4px; }
+.drafts-menu .row button { width: auto; padding: 5px 10px; }

@@ -63,6 +63,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Instant, SystemTime};
 
 use super::appended::Appended;
+use super::blob::BlobKey;
 use super::identity::{MarkerIds, RecordIdentity};
 use super::manifest::{encode_conv_state_payload, encode_label_payload, ChunkLoc, RecordLoc};
 use super::record::{
@@ -340,6 +341,9 @@ pub struct MaintenancePlan {
     /// conversation lives, because copies of the events it killed can sit in
     /// segments this op leaves alone, and it has to stay after them.
     vfs_relocs: Vec<VfsReloc>,
+    /// Blobs to relocate, by location: their bytes are never in this
+    /// process's RAM either.
+    blob_relocs: Vec<(BlobKey, RecordLoc)>,
     /// `(type, source_loc)` singleton records to relocate.
     singleton_relocs: Vec<(RecordType, RecordLoc)>,
 }
@@ -888,6 +892,7 @@ impl SubstratePersistence {
         ) = self.gather_relocations(substrate, &op.targets());
         let npc_relocs = self.npc_relocations(&op.targets());
         let vfs_relocs = self.vfs_relocations(substrate, &op.targets());
+        let blob_relocs = self.blob_relocations(&op.targets());
         let relocs_ms = t_relocs.elapsed().as_millis() as u64;
         // What this op carries off the target segments, by type. The incremental
         // path is the one that actually runs on a busy store — the 143 GB store
@@ -930,6 +935,7 @@ impl SubstratePersistence {
             singletons = singleton_relocs.len(),
             npcs = npc_relocs.len(),
             vfs = vfs_relocs.len(),
+            blobs = blob_relocs.len(),
             liveness_ms,
             resident_ms,
             relocs_ms,
@@ -948,6 +954,7 @@ impl SubstratePersistence {
             singleton_relocs,
             npc_relocs,
             vfs_relocs,
+            blob_relocs,
         }))
     }
 
@@ -1372,6 +1379,32 @@ impl SubstratePersistence {
             }
         }
 
+        // Blobs — carried verbatim, each still where the plan found it.
+        let mut blobs_by_seg: BTreeMap<SegmentId, Vec<(BlobKey, RecordLoc)>> = BTreeMap::new();
+        for &(key, loc) in plan
+            .blob_relocs
+            .iter()
+            .filter(|(key, loc)| self.blob_index.get(*key) == Some(*loc))
+        {
+            blobs_by_seg
+                .entry(loc.segment)
+                .or_default()
+                .push((key, loc));
+        }
+        for (source, recs) in blobs_by_seg {
+            let items: Vec<RawReloc> = recs
+                .iter()
+                .map(|(_, loc)| RawReloc {
+                    offset: loc.offset,
+                    record_size: loc.record_size,
+                })
+                .collect();
+            let new = self.relocate_raw_from_segment(source, &items)?;
+            for ((key, loc), at) in recs.into_iter().zip(new) {
+                self.blob_index.repoint(key, loc, at.loc(loc.payload_len));
+            }
+        }
+
         // Durability barrier: relocated copies are fsynced before any source is
         // unlinked (in `finish_maintenance`).
         self.commit()?;
@@ -1560,6 +1593,7 @@ impl SubstratePersistence {
             singleton_relocs,
             npc_relocs: self.npc_relocations(&op.targets()),
             vfs_relocs: self.vfs_relocations(substrate, &op.targets()),
+            blob_relocs: self.blob_relocations(&op.targets()),
         };
         let result = self.execute_maintenance(&plan)?;
         result.apply_to_substrate(substrate);
@@ -1618,6 +1652,16 @@ impl SubstratePersistence {
             }
         }
         out
+    }
+
+    /// The blobs physically inside a target segment, in key order.
+    pub(super) fn blob_relocations(&self, targets: &[SegmentId]) -> Vec<(BlobKey, RecordLoc)> {
+        self.blob_index
+            .blobs()
+            .iter()
+            .filter(|(_, loc)| targets.contains(&loc.segment))
+            .map(|(&key, &loc)| (key, loc))
+            .collect()
     }
 
     /// Gather the relocation worklist for `targets` — the live read-back records
@@ -1946,6 +1990,10 @@ impl SubstratePersistence {
             for loc in tl.tombstones().values() {
                 live.push(CountedRecord::at(RecordType::VfsTombstone, loc));
             }
+        }
+        // Blobs — exactly what `blob_relocations` carries.
+        for loc in self.blob_index.blobs().values() {
+            live.push(CountedRecord::at(RecordType::Blob, loc));
         }
         (live, carried)
     }

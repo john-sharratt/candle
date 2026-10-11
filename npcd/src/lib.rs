@@ -18,7 +18,9 @@
 //! | [`reports`] | npcd's share of the host's shared endpoints |
 //! | [`engine`] | the cast's loop: perception, the act vocabulary, the tick |
 //! | [`api`] | the authored corpus, the mind, the cast, the authoring plane |
-//! | [`mind`] | the authored corpus on disk |
+//! | [`mind`] | the authored corpus |
+//! | [`drafts`] | an admin's writes to the mind: drafts in their own store, published from the console |
+//! | [`opstore`] | the stores over the mind repository, an operation's and an author's |
 //! | [`registry`] | authored documents, and what may become a file name |
 //! | [`projection`] | the schema and the content libraries it reads |
 
@@ -30,6 +32,7 @@ pub mod collections;
 pub mod compliance;
 pub mod console;
 pub mod describe;
+pub mod drafts;
 pub mod effector;
 pub mod engine;
 pub mod guest_routes;
@@ -42,6 +45,7 @@ pub mod model;
 pub mod namegen;
 pub mod ndjson;
 pub mod npcs;
+pub mod opstore;
 pub mod personality_portrait;
 pub mod portrait;
 pub mod projection;

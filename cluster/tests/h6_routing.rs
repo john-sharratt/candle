@@ -107,6 +107,7 @@ fn view(node: u64, session: u64) -> MemberView {
         },
         weight: 1,
         session,
+        repos: Vec::new(),
         capacity: None,
         routes: None,
         high_water: 0,
@@ -127,8 +128,7 @@ fn capacity(c: Cap) -> Capacity {
         decodes: 0,
         prefill_backlog: 0,
         vram_free_mib: 0,
-        cores: 0,
-        load_milli: 0,
+        ..Capacity::default()
     }
 }
 

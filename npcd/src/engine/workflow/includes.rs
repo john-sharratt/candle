@@ -283,10 +283,10 @@ mod tests {
     }
 
     fn step(name: &str, prompt: &str) -> String {
-        format!("      {name}:\n        by: maker\n        next: done\n        prompt: {prompt}\n")
+        format!("      {name}:\n        by: maker\n        next: done\n        checks: [published]\n        prompt: {prompt}\n")
     }
 
-    const TWO: &str = "workflows:\n  story:\n    steps:\n      read:\n        by: maker\n        next: read-again\n        prompt: \"Read {objective}. {voice}\"\n      read-again:\n        by: maker\n        next: done\n        prompt: \"Again: {read.prompt}\"\n  life-event:\n    steps:\n      read:\n        by: maker\n        next: done\n        prompt: \"{story.read-again.prompt} / {writing}\"\n";
+    const TWO: &str = "workflows:\n  story:\n    steps:\n      read:\n        by: maker\n        next: read-again\n        prompt: \"Read {objective}. {voice}\"\n      read-again:\n        by: maker\n        next: done\n        checks: [published]\n        prompt: \"Again: {read.prompt}\"\n  life-event:\n    steps:\n      read:\n        by: maker\n        next: done\n        checks: [published]\n        prompt: \"{story.read-again.prompt} / {writing}\"\n";
 
     #[test]
     fn shared_and_step_includes_resolve_and_nest() {
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn included_text_is_spliced_verbatim() {
-        let yaml = "prompts:\n  review: |\n    Findings: {findings}\nworkflows:\n  w:\n    steps:\n      a:\n        by: maker\n        next: done\n        prompt: |\n          {review}\n          Mend it.\n";
+        let yaml = "prompts:\n  review: |\n    Findings: {findings}\nworkflows:\n  w:\n    steps:\n      a:\n        by: maker\n        next: done\n        checks: [published]\n        prompt: |\n          {review}\n          Mend it.\n";
         assert_eq!(
             prompts_of(yaml),
             [("w.a".to_string(), one("Findings: {findings}\n\nMend it.\n"))]
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn variants_resolve_and_can_be_included_by_name() {
-        let yaml = "prompts:\n  head: \"H\"\nworkflows:\n  story:\n    steps:\n      review:\n        by: another\n        next: done\n        prompt:\n          sound: \"{head} sound\"\n          mend: \"{head} mend\"\n  life:\n    steps:\n      review:\n        by: another\n        next: done\n        prompt:\n          sound: \"{story.review.prompt.sound}\"\n          fail: \"{story.review.prompt.mend}!\"\n      again:\n        by: maker\n        next: done\n        prompt: \"{review.prompt.fail}\"\n";
+        let yaml = "prompts:\n  head: \"H\"\nworkflows:\n  story:\n    steps:\n      review:\n        by: another\n        next: done\n        checks: [published]\n        prompt:\n          sound: \"{head} sound\"\n          mend: \"{head} mend\"\n  life:\n    steps:\n      review:\n        by: another\n        next: done\n        checks: [published]\n        prompt:\n          sound: \"{story.review.prompt.sound}\"\n          fail: \"{story.review.prompt.mend}!\"\n      again:\n        by: maker\n        next: done\n        checks: [published]\n        prompt: \"{review.prompt.fail}\"\n";
         let by = |pairs: &[(&str, &str)]| {
             Variants::ByOutcome(
                 pairs
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn generator_and_shared_prompts_resolve() {
-        let m = parse_missions("prompts:\n  base: \"B\"\n  table: \"{base} table\"\ngenerators:\n  - id: g\n    call: c\n    workflow: w\n    prompt: \"{table} / {w.s.prompt}\"\nworkflows:\n  w:\n    steps:\n      s:\n        by: maker\n        next: done\n        prompt: S\n").unwrap();
+        let m = parse_missions("prompts:\n  base: \"B\"\n  table: \"{base} table\"\ngenerators:\n  - id: g\n    call: c\n    workflow: w\n    prompt: \"{table} / {w.s.prompt}\"\nworkflows:\n  w:\n    steps:\n      s:\n        by: maker\n        next: done\n        checks: [published]\n        prompt: S\n").unwrap();
         assert_eq!(m.prompts["table"], "B table");
         assert_eq!(m.generators[0].prompt, "B table / S");
     }
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn bad_references_are_refused() {
         let wf = |prompt: &str| format!("workflows:\n  w:\n    steps:\n{}", step("s", prompt));
-        let variants = "      v:\n        by: maker\n        next: done\n        prompt:\n          sound: x\n";
+        let variants = "      v:\n        by: maker\n        next: done\n        checks: [published]\n        prompt:\n          sound: x\n";
         let cases = [
             (wf("\"{nope.prompt}\""), "workflow `w`, step `s`: includes `{nope.prompt}`, which names no step"),
             (wf("\"{other.s.prompt}\""), "workflow `w`, step `s`: includes `{other.s.prompt}`, which names no step"),
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn a_cycle_is_refused_naming_its_chain() {
         assert_eq!(
-            err("workflows:\n  w:\n    steps:\n      a:\n        by: maker\n        next: b\n        prompt: \"{b.prompt}\"\n      b:\n        by: maker\n        next: done\n        prompt: \"{a.prompt}\"\n"),
+            err("workflows:\n  w:\n    steps:\n      a:\n        by: maker\n        next: b\n        prompt: \"{b.prompt}\"\n      b:\n        by: maker\n        next: done\n        checks: [published]\n        prompt: \"{a.prompt}\"\n"),
             "workflow `w`, step `a`: its prompt includes itself: {w.a.prompt} → {w.b.prompt} → {w.a.prompt}"
         );
         assert_eq!(

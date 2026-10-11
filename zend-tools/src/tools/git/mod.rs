@@ -237,7 +237,8 @@ pub(super) fn landed(name: &RefName, published: Published) -> Result<&'static st
     }
 }
 
-/// Open the workspace repository called `name`, as this conversation sees it.
+/// Open the workspace repository called `name`, as this conversation sees it,
+/// its pushes made where the context's executor makes them (§11.5).
 pub fn open(ctx: &ToolContext, name: &str) -> Result<ConvRepo, GitToolError> {
     let workspace = ctx.files.workspace().ok_or(GitToolError::NoWorkspace)?;
     let repo = workspace
@@ -247,7 +248,7 @@ pub fn open(ctx: &ToolContext, name: &str) -> Result<ConvRepo, GitToolError> {
             known: workspace.names().join(", "),
         })?;
     Ok(ConvRepo {
-        repo: GitRepo::open(&repo.dir)?,
+        repo: GitRepo::open(&repo.dir)?.pushing_through(ctx.pusher(name)),
         store: ctx.files.repo(name).ok(),
     })
 }

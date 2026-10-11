@@ -86,7 +86,7 @@ impl Tokens {
     /// files and no human ever comments one, so a save serialises whole rather
     /// than splicing (the accounts reasoning, [`crate::accounts`]).
     pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
-        let reg = Registry::load_generated("token", dir)?;
+        let reg = Registry::load("token", dir)?;
         let mut by_token = HashMap::new();
         for record in reg.iter() {
             // The record id is the character's numeric id. A file whose name is

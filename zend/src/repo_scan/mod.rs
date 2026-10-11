@@ -753,6 +753,8 @@ pub fn committed(engine: &Mutex<ConversationEngine>) -> Vec<Committed> {
         .conversations_with_metadata_key(CONTENT_KEY)
         .into_iter()
         .collect();
+    let conv = e.conversation();
+    let substrate = conv.read();
     e.conversations_with_metadata_key(DIR_KEY)
         .into_iter()
         .filter_map(|(timeline, dir)| {
@@ -760,6 +762,9 @@ pub fn committed(engine: &Mutex<ConversationEngine>) -> Vec<Committed> {
                 timeline,
                 key: keys.get(&timeline)?.clone(),
                 subject: dir,
+                stamp: substrate
+                    .first_turn_stamp(timeline.raw())
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -953,7 +958,7 @@ fn run_dir_pool(
 /// git.
 fn unit_tools(tools: &ToolContext, job: &UnitJob) -> Option<ToolContext> {
     let files = tools.files.fresh_at(&job.unit.repo, &job.at)?;
-    Some(tools.with_files(Arc::new(files)))
+    Some(tools.with_files(Arc::new(files), ""))
 }
 
 /// Ingest one directory into a fresh conversation: render the folder's

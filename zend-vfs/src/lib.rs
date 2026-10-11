@@ -74,7 +74,7 @@ mod testing;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use changeset::{Change, ChangeSet};
 pub use disk_grant::DiskWriteGrant;
@@ -103,10 +103,11 @@ pub use remote::probe;
 pub use remote::push::{
     Lease, PushAction, PushOutcome, PushResult, PushSpec, PushTarget, Rejection,
 };
+pub use remote::pusher::{here, Here, Push};
 pub use sandbox::{
-    CommandPolicy, Job, JobHandle, JobId, JobInfo, JobNotFound, JobRequest, JobStatus,
-    OutputStream, RunOutcome, Sandbox, SandboxCommand, SandboxError, SandboxServer, StartedJob,
-    JOBS_DIR,
+    ChangedFile, CommandPolicy, Job, JobHandle, JobId, JobInfo, JobNotFound, JobRequest, JobStatus,
+    OutputStream, Priority, RunOutcome, Sandbox, SandboxCommand, SandboxError, SandboxServer,
+    StartedJob, Unrecorded, JOBS_DIR,
 };
 pub use setup::clone::CloneOptions;
 pub use types::{
@@ -145,6 +146,8 @@ pub struct Repo {
     /// can without a `git` process (see [`library`]). `None` for a repository
     /// libgit2 cannot hold, whose every question goes to the `git` program.
     library: Option<Mutex<git2::Repository>>,
+    /// What makes its pushes: this checkout, or an agent (§11.5).
+    pusher: Arc<dyn Push>,
 }
 
 impl fmt::Debug for Repo {
@@ -226,7 +229,14 @@ impl Repo {
             format,
             write: Mutex::new(()),
             library: None,
+            pusher: here(),
         })
+    }
+
+    /// This repository with its pushes made by `pusher`.
+    pub fn pushing_through(mut self, pusher: Arc<dyn Push>) -> Self {
+        self.pusher = pusher;
+        self
     }
 
     /// This working tree's own git folder.

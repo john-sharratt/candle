@@ -28,13 +28,19 @@
 //!
 //! # The response tells the truth about durability
 //!
-//! A reshape is committed to the running world first and written back to the
-//! authored YAML second ([`Hosted::reshape`]). The response says which happened:
-//! `durable: "written"` when the change is on disk, `"ephemeral"` for a world
-//! with no authored file (it holds for the run only), and `"failed"` with the
-//! reason when the change is live but the write did not land — so the operator
-//! learns the change took but is not yet safe from a restart, rather than being
-//! told a comfortable half-truth.
+//! A reshape is committed to the running world first and kept in the authored
+//! YAML second ([`Hosted::reshape`]). A map in the mind is kept as an author's
+//! write (`docs/replicated_substrate.md` §10.3) — the author being the owner of
+//! the character the token names: a draft of theirs over a mind under git, the
+//! file itself over one that is not. The response says which happened:
+//! `durable: "written"` when the change is on disk, `"drafted"` when it is in
+//! its author's drafts, `"ephemeral"` for a world with no authored file or
+//! nobody to keep it for (it holds for the run only), and `"failed"` with the
+//! reason when the change is live but was not kept — so the operator learns
+//! the change took but is not yet safe from a restart, rather than being told a
+//! comfortable half-truth.
+
+use std::path::Component;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -46,10 +52,14 @@ use serde_json::{json, Value};
 use npc_map::MapEdit;
 
 use crate::api::err;
+use crate::drafts::disk::Disk;
+use crate::drafts::Author;
 use crate::effector::auth::DeviceCaller;
 use crate::effector::router::Local;
 use crate::effector::token::Scope;
-use crate::world::Durability;
+use crate::engine::runtime::Runtime;
+use crate::world::mapstore::Keep;
+use crate::world::{Durability, Hosted};
 
 /// The `/reshape` sub-router: one route, `POST /reshape/:world`.
 ///
@@ -111,13 +121,26 @@ async fn reshape_world(
         }
     };
 
-    match hosted.reshape(&edit) {
+    let keep = keep_for(&runtime, &hosted, caller.npc_id).await;
+    match hosted.reshape(&edit, keep) {
         Ok(reshaped) => {
             let (durable, detail) = match reshaped.durability {
                 Durability::Written => ("written", None),
+                Durability::Drafted => (
+                    "drafted",
+                    Some(
+                        "the change is in its author's drafts: publish them to make it the \
+                         authored map"
+                            .to_string(),
+                    ),
+                ),
                 Durability::Ephemeral => (
                     "ephemeral",
-                    Some("this world has no authored map on disk, so the change holds for this run only".to_string()),
+                    Some(
+                        "this world has no authored map, or nobody to keep the change for, so it \
+                         holds for this run only"
+                            .to_string(),
+                    ),
                 ),
                 Durability::Failed(reason) => ("failed", Some(reason)),
             };
@@ -134,6 +157,44 @@ async fn reshape_world(
         // The world's own words on why it would not take the edit.
         Err(reason) => err(StatusCode::CONFLICT, "refused", &reason),
     }
+}
+
+/// Where a reshape of `hosted`, asked for through character `npc`'s token, is
+/// kept: a map in the mind as a write of the character's owner — their draft
+/// over a mind under git — and a map outside it in its own folder. `None` for
+/// a world with no folder, or a map in the mind with nobody to keep it for.
+async fn keep_for(rt: &Runtime, hosted: &Hosted, npc: u64) -> Option<Keep> {
+    let dir = hosted.map_dir()?;
+    let in_mind = rt
+        .ops
+        .mind_dir()
+        .and_then(|mind| Some((mind, dir.strip_prefix(mind).ok()?)));
+    let Some((mind, rel)) = in_mind else {
+        return Some(Keep {
+            shelf: Box::new(Disk::new(dir)),
+            folder: String::new(),
+            drafts: false,
+        });
+    };
+    let owner = rt
+        .npcs()?
+        .read()
+        .await
+        .payload(npc)
+        .map(|p| p.owner_id.clone())?;
+    let folder: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    let author = Author::open(mind, Some(&rt.ops), &owner);
+    Some(Keep {
+        drafts: author.keeps_drafts(),
+        shelf: Box::new(author),
+        folder: folder.join("/"),
+    })
 }
 
 #[cfg(test)]

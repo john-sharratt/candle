@@ -140,7 +140,9 @@ use self::view::View;
 use super::file_delta::{self, FileDelta, FileTimes, ReplayError, TimedDelta};
 use crate::{BranchName, FileChanges, ObjectFormat, Oid, Rev};
 
-const MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+/// The most a store's session layer holds, every chain counted: past it a
+/// change is refused [`VfsError::Full`].
+pub const MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
 /// Largest workspace file the lower layer will read into a tool response.
 /// Listing is unaffected — an oversize file still shows up with its true size.
@@ -867,6 +869,21 @@ impl VfsStore {
         })
     }
 
+    /// [`Self::current`] as bytes: what a binary file — an upload, a build's
+    /// output — holds as well as a text one.
+    fn current_bytes(&self, view: &View<'_>, norm: &str) -> Result<Option<Vec<u8>>, VfsError> {
+        let chain = self.upper.read().unwrap().chains.get(norm).cloned();
+        let Some(chain) = chain else {
+            return view.read_bytes(norm);
+        };
+        let base = match chain.deltas.first().map(|t| &t.delta) {
+            Some(FileDelta::Edit { .. }) => view.read_bytes(norm)?,
+            _ => None,
+        };
+        file_delta::replay_bytes(base, chain.deltas.iter().map(|t| &t.delta))
+            .map_err(|_| Self::diverged(norm))
+    }
+
     fn not_text(norm: &str) -> VfsError {
         VfsError::Unreadable(format!("{norm} is not valid UTF-8 text"))
     }
@@ -907,20 +924,22 @@ impl VfsStore {
         loop {
             let seen = Seen::of(&self.upper.read().unwrap(), &norm);
             let view = self.view()?;
-            let replayed =
-                file_delta::replay(self.current(&view, &norm)?, deltas.iter().map(|t| &t.delta));
-            let result = replayed.map_err(|e| match e {
-                ReplayError::Diverged(_) => VfsError::Diverged(format!(
+            let replayed = file_delta::replay_bytes(
+                self.current_bytes(&view, &norm)?,
+                deltas.iter().map(|t| &t.delta),
+            );
+            let result = replayed.map_err(|_| {
+                VfsError::Diverged(format!(
                     "the changes do not fit {norm} as it stands — read it and build them again"
-                )),
-                ReplayError::NotText => Self::not_text(&norm),
+                ))
             })?;
             let in_lower = view.is_file(&norm);
             let mut guard = self.upper.write().unwrap();
             if !seen.stands(&guard, &norm) {
                 continue;
             }
-            let conflict = Self::still_conflicted(&guard, &norm, result.as_deref());
+            let text = result.as_deref().and_then(|b| std::str::from_utf8(b).ok());
+            let conflict = Self::still_conflicted(&guard, &norm, text);
             let mut chain = seen.chain.unwrap_or(Chain {
                 deltas: Vec::new(),
                 size: None,
@@ -931,7 +950,7 @@ impl VfsStore {
             if let Some(last) = chain.deltas.iter().rposition(|t| t.delta.supersedes()) {
                 chain.deltas.drain(..last);
             }
-            chain.size = result.as_ref().map(String::len);
+            chain.size = result.as_ref().map(Vec::len);
             chain.conflict = conflict;
             // Deleting a file only the session made leaves nothing to record.
             if chain.size.is_none() && !in_lower {
@@ -1059,10 +1078,30 @@ impl VfsStore {
         let norm = Self::normalize(path);
         Self::guard(&norm)?;
         let view = self.view()?;
-        if self.holds(&norm) {
-            return Ok(self.current(&view, &norm)?.map(String::into_bytes));
-        }
-        view.read_bytes(&norm)
+        self.current_bytes(&view, &norm)
+    }
+
+    /// Replace the whole file with `bytes` — one [`FileDelta::Replace`] when
+    /// they are text, one [`FileDelta::ReplaceBinary`] otherwise — as
+    /// [`Self::write`] does. An upload is written this way (§10.2).
+    pub fn write_bytes(&self, path: &str, bytes: Vec<u8>) -> Result<bool, VfsError> {
+        let content = match String::from_utf8(bytes) {
+            Ok(text) => return self.write(path, text),
+            Err(e) => e.into_bytes(),
+        };
+        let norm = Self::normalize(path);
+        Self::guard(&norm)?;
+        let view = self.view()?;
+        let created = !self.resolves_as_file(&view, &norm);
+        let size = content.len();
+        let mut guard = self.upper.write().unwrap();
+        let chain = Chain {
+            deltas: vec![TimedDelta::now(FileDelta::ReplaceBinary { content })],
+            size: Some(size),
+            conflict: false,
+        };
+        Self::set_capped(&mut guard, norm, chain)?;
+        Ok(created)
     }
 
     /// One [`PAGE_LINES`]-line page of a file, resolved through the overlay the
@@ -1589,6 +1628,55 @@ mod tests {
             .into_iter()
             .map(|e| e.path)
             .collect()
+    }
+
+    // ── binary files ─────────────────────────────────────────────────────────
+
+    /// **A binary file is held as its bytes** — one `ReplaceBinary`, counted
+    /// against the cap at its length, read back byte for byte, refused only as
+    /// text; text written as bytes is an ordinary `Replace`.
+    #[test]
+    fn a_binary_file_is_held_as_its_bytes() {
+        let store = VfsStore::new();
+        let png = vec![0x89, b'P', b'N', b'G', 0xff, 0x00];
+        assert!(store.write_bytes("logo.png", png.clone()).unwrap());
+        assert_eq!(
+            store.deltas("logo.png").unwrap()[0].delta,
+            FileDelta::ReplaceBinary {
+                content: png.clone()
+            }
+        );
+        assert_eq!(store.read_bytes("logo.png").unwrap(), Some(png.clone()));
+        assert!(matches!(
+            store.read("logo.png"),
+            Err(VfsError::Unreadable(_))
+        ));
+        assert_eq!(store.total_bytes(), png.len());
+        store.write_bytes("notes.txt", b"plain\n".to_vec()).unwrap();
+        assert_eq!(
+            store.deltas("notes.txt").unwrap()[0].delta,
+            FileDelta::Replace {
+                content: "plain\n".into()
+            }
+        );
+        // A binary delta applied — a sandbox's capture — is held the same way.
+        let other = VfsStore::new();
+        other
+            .apply("logo.png", &store.deltas("logo.png").unwrap())
+            .unwrap();
+        assert_eq!(other.read_bytes("logo.png").unwrap(), Some(png));
+    }
+
+    /// **An upload past the cap is refused**, the store left as it was.
+    #[test]
+    fn bytes_past_the_cap_are_refused() {
+        let store = VfsStore::new();
+        let big = vec![0xffu8; MAX_BYTES + 1];
+        assert!(matches!(
+            store.write_bytes("big.bin", big),
+            Err(VfsError::Full)
+        ));
+        assert_eq!(store.read_bytes("big.bin").unwrap(), None);
     }
 
     // ── the changes a checkout replays ───────────────────────────────────────

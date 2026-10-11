@@ -12,18 +12,21 @@
 //!   out of the listing — they are not in the vocabulary.
 //! - **Sizes are what the thing is.** A collection has a count of what is in
 //!   it; an entry has a length. Not one column meaning two things.
+//!
+//! What is listed is what a [`Shelf`] holds: the published mind, or an author's
+//! view of it with their own drafts laid over (`docs/replicated_substrate.md`
+//! §10.3).
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::Path;
 
 use serde_json::{json, Value};
 
-use super::address::{Address, Section, SECTIONS};
+use super::address::{Address, Format, Section, SECTIONS};
 use super::doc;
 use super::parts;
 use super::path::MindPath;
 use super::scope::Scope;
+use crate::sim::shelf::Shelf;
 
 /// A thing in the corpus: something that holds other things, or something to
 /// read.
@@ -80,7 +83,6 @@ pub enum CatalogError {
     NotFound,
     /// The world named does not admit it.
     OutOfScope,
-    Io(std::io::Error),
 }
 
 impl std::fmt::Display for CatalogError {
@@ -88,14 +90,13 @@ impl std::fmt::Display for CatalogError {
         match self {
             CatalogError::NotFound => write!(f, "there is nothing there"),
             CatalogError::OutOfScope => write!(f, "this world does not include that"),
-            CatalogError::Io(e) => write!(f, "{e}"),
         }
     }
 }
 
 /// The corpus itself — the nine sections, each with what it holds.
 pub fn sections(
-    root: &Path,
+    shelf: &dyn Shelf,
     scope: &Scope,
     category_of: &dyn Fn(&MindPath) -> Option<String>,
 ) -> Vec<Node> {
@@ -103,7 +104,7 @@ pub fn sections(
         .into_iter()
         .map(|s| {
             let addr = Address::of_section(s);
-            let count = children(root, &addr, scope, category_of)
+            let count = children(shelf, &addr, scope, category_of)
                 .map(|c| c.len() as u64)
                 .unwrap_or(0);
             Node {
@@ -121,7 +122,7 @@ pub fn sections(
 
 /// What is inside `addr`.
 pub fn children(
-    root: &Path,
+    shelf: &dyn Shelf,
     addr: &Address,
     scope: &Scope,
     category_of: &dyn Fn(&MindPath) -> Option<String>,
@@ -135,17 +136,13 @@ pub fn children(
         return Ok(Address::settings()
             .into_iter()
             .map(|a| {
-                let chars = a
-                    .entry_path()
-                    .and_then(|p| p.resolve(root).ok())
-                    .and_then(|f| fs::metadata(f).ok())
-                    .map(|m| m.len());
+                let chars = a.entry_path().and_then(|p| shelf.size(&p.as_str()));
                 // A settings document with parts is a collection *and* an
                 // entry: the projection schema holds its layers, and still
                 // reads whole.
                 let count = a
                     .parts()
-                    .map(|_| children(root, &a, scope, category_of).map_or(0, |c| c.len() as u64));
+                    .map(|_| children(shelf, &a, scope, category_of).map_or(0, |c| c.len() as u64));
                 Node {
                     title: a.title(),
                     id: a.as_str(),
@@ -167,7 +164,7 @@ pub fn children(
     // itself — `settings/projection` holds the nine layers. It is a collection
     // with a body, exactly as a canon topic is: it still reads whole.
     if let Some((list_key, id_key)) = addr.parts() {
-        let text = read(root, addr).map_err(|_| CatalogError::NotFound)?.text;
+        let text = read(shelf, addr).map_err(|_| CatalogError::NotFound)?.text;
         // A document that declares parts but has none — or cannot be read as a
         // mapping — is simply an entry with no children, not a failure. The
         // text view still opens it.
@@ -194,10 +191,9 @@ pub fn children(
     let Some(dir) = addr.collection_path() else {
         return Err(CatalogError::NotFound);
     };
-    let Ok(full) = dir.resolve(root) else {
-        return Err(CatalogError::NotFound);
-    };
-    if !full.is_dir() {
+    let dir = dir.as_str();
+    let listed = shelf.list(&dir);
+    if listed.is_empty() {
         // A section whose folder is simply absent is empty, not broken: a mind
         // need not have written any beliefs yet.
         return if addr.is_section() {
@@ -210,30 +206,17 @@ pub fn children(
     // Gathered by name so a topic's folder and its overview page meet: both
     // reduce to the same name, and the pair becomes one row.
     let mut found: BTreeMap<String, (bool, bool, u64, u64)> = BTreeMap::new();
-    let ext = addr.section().format();
-    for entry in fs::read_dir(&full).map_err(CatalogError::Io)? {
-        let entry = entry.map_err(CatalogError::Io)?;
-        let Some(raw) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Ok(meta) = entry.path().symlink_metadata() else {
-            continue;
-        };
-        // A link is not followed: it would be a second name for a document that
-        // already has one, and writing through it would replace the link.
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        let (name, is_dir) = if meta.is_dir() {
-            (raw.clone(), true)
-        } else {
+    let ext = ext_str(addr.section().format());
+    for raw in listed {
+        let (name, folder) = match raw.strip_suffix('/') {
+            Some(folder) => (folder.to_owned(), true),
             // Only this section's own format is an entry. Anything else in the
             // folder is not part of the corpus and is not shown — there is no
             // greyed row to explain, because there is no address for it.
-            match raw.strip_suffix(&format!(".{}", ext_str(ext))) {
+            None => match raw.strip_suffix(&format!(".{ext}")) {
                 Some(stem) => (stem.to_owned(), false),
                 None => continue,
-            }
+            },
         };
         if name.is_empty() {
             continue;
@@ -244,15 +227,20 @@ pub fn children(
         if !admits(&child, scope, category_of) {
             continue;
         }
-        let slot = found.entry(name).or_insert((false, false, 0, 0));
-        if is_dir {
+        let at = format!("{dir}/{}", raw.trim_end_matches('/'));
+        if folder {
+            let slot = found.entry(name).or_insert((false, false, 0, 0));
             slot.0 = true;
-            slot.2 = fs::read_dir(entry.path())
-                .map(|d| d.count() as u64)
-                .unwrap_or(0);
+            slot.2 = shelf.list(&at).len() as u64;
         } else {
+            // A link has no size: it is not followed, being a second name for
+            // a document that already has one.
+            let Some(len) = shelf.size(&at) else {
+                continue;
+            };
+            let slot = found.entry(name).or_insert((false, false, 0, 0));
             slot.1 = true;
-            slot.3 = meta.len();
+            slot.3 = len;
         }
     }
 
@@ -289,9 +277,9 @@ pub fn children(
 ///
 /// A *part* reads as a document of its own — one layer of the projection
 /// schema, not the seven hundred lines it sits in.
-pub fn read(root: &Path, addr: &Address) -> Result<doc::Doc, doc::DocError> {
+pub fn read(shelf: &dyn Shelf, addr: &Address) -> Result<doc::Doc, doc::DocError> {
     let path = addr.entry_path().ok_or(doc::DocError::NotFound)?;
-    let whole = doc::read(root, &path)?;
+    let whole = doc::read(shelf, &path)?;
     let Some(part) = addr.part() else {
         return Ok(whole);
     };
@@ -313,14 +301,14 @@ pub fn read(root: &Path, addr: &Address) -> Result<doc::Doc, doc::DocError> {
 /// exists, and there is nowhere in the document for a new one to go without
 /// rewriting the list. See [`parts`].
 pub fn write(
-    root: &Path,
+    shelf: &dyn Shelf,
     addr: &Address,
     text: &str,
     must_be_new: bool,
 ) -> Result<doc::Wrote, doc::DocError> {
     let path = addr.entry_path().ok_or(doc::DocError::NotFound)?;
     let Some(part) = addr.part() else {
-        return doc::write(root, &path, text, must_be_new);
+        return doc::write(shelf, &path, text, must_be_new);
     };
     if must_be_new {
         return Err(doc::DocError::NotFound);
@@ -328,14 +316,14 @@ pub fn write(
     let value: serde_json::Value =
         serde_yaml::from_str(text).map_err(|_| doc::DocError::NotFound)?;
     let object = value.as_object().ok_or(doc::DocError::NotFound)?;
-    let whole = doc::read(root, &path)?;
+    let whole = doc::read(shelf, &path)?;
     let next = parts::write(&whole.text, part.list, part.id_key, part.name, object).map_err(
         |e| match e {
             parts::PartError::CannotPatch => doc::DocError::CannotPatch,
             _ => doc::DocError::NotFound,
         },
     )?;
-    doc::write(root, &path, &next, false)
+    doc::write(shelf, &path, &next, false)
 }
 
 /// Remove what is at `addr`.
@@ -348,12 +336,12 @@ pub fn write(
 /// removed by naming one: `settings/projection/world` is a layer, and deleting
 /// `projection.yaml` because somebody pressed Delete on a layer would be the
 /// worst kind of surprise.
-pub fn remove(root: &Path, addr: &Address) -> Result<(), doc::DocError> {
+pub fn remove(shelf: &dyn Shelf, addr: &Address) -> Result<(), doc::DocError> {
     if addr.part().is_some() {
         return Err(doc::DocError::NotFound);
     }
     let path = addr.entry_path().ok_or(doc::DocError::NotFound)?;
-    doc::remove(root, &path)
+    doc::remove(shelf, &path)
 }
 
 /// Whether the world admits this address, asked of whichever path it has.
@@ -373,19 +361,25 @@ fn admits(
     }
 }
 
-fn ext_str(f: super::address::Format) -> &'static str {
+fn ext_str(f: Format) -> &'static str {
     match f {
-        super::address::Format::Markdown => "md",
-        super::address::Format::Yaml => "yaml",
+        Format::Markdown => "md",
+        Format::Yaml => "yaml",
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
     use super::*;
+    use crate::drafts::disk::Disk;
+    use crate::drafts::overlay::Overlay;
+    use crate::sim::shelf::Published;
     use serde_json::json;
 
-    fn tmp(name: &str) -> std::path::PathBuf {
+    fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("npcd-catalog-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
@@ -457,7 +451,13 @@ mod tests {
     fn a_topic_is_one_row_with_text_of_its_own() {
         let root = tmp("topic");
         seed(&root);
-        let got = children(&root, &addr("canon"), &Scope::unscoped(), &no_cat).unwrap();
+        let got = children(
+            &Disk::new(&root),
+            &addr("canon"),
+            &Scope::unscoped(),
+            &no_cat,
+        )
+        .unwrap();
         let ammo = got.iter().find(|n| n.id == "canon/ammo").expect("listed");
         assert_eq!(ammo.kind, Kind::Collection);
         assert_eq!(ammo.count, Some(2), "two entries inside");
@@ -479,7 +479,8 @@ mod tests {
         let root = tmp("nofiles");
         seed(&root);
         for place in ["canon", "canon/ammo", "responses", "characters", "settings"] {
-            let got = children(&root, &addr(place), &Scope::unscoped(), &no_cat).unwrap();
+            let got =
+                children(&Disk::new(&root), &addr(place), &Scope::unscoped(), &no_cat).unwrap();
             for n in &got {
                 assert!(!n.id.contains(".md"), "{}", n.id);
                 assert!(!n.id.contains(".yaml"), "{}", n.id);
@@ -495,7 +496,13 @@ mod tests {
     fn a_foreign_file_is_not_in_the_corpus() {
         let root = tmp("foreign");
         seed(&root);
-        let got = children(&root, &addr("canon"), &Scope::unscoped(), &no_cat).unwrap();
+        let got = children(
+            &Disk::new(&root),
+            &addr("canon"),
+            &Scope::unscoped(),
+            &no_cat,
+        )
+        .unwrap();
         assert!(!titles(&got).contains(&"Notes"), "notes.txt was listed");
     }
 
@@ -504,7 +511,7 @@ mod tests {
     fn the_corpus_is_the_nine_sections() {
         let root = tmp("sections");
         seed(&root);
-        let got = sections(&root, &Scope::unscoped(), &no_cat);
+        let got = sections(&Disk::new(&root), &Scope::unscoped(), &no_cat);
         assert_eq!(got.len(), 9);
         assert_eq!(
             titles(&got),
@@ -535,7 +542,13 @@ mod tests {
         // `layers/stories` was never created by the seed — a section whose
         // folder is not there yet lists as empty rather than failing, because
         // an author who has not written a story yet is a normal state.
-        let got = children(&root, &addr("stories"), &Scope::unscoped(), &no_cat).unwrap();
+        let got = children(
+            &Disk::new(&root),
+            &addr("stories"),
+            &Scope::unscoped(),
+            &no_cat,
+        )
+        .unwrap();
         assert!(got.is_empty());
     }
 
@@ -543,7 +556,13 @@ mod tests {
     fn the_settings_are_listed_from_their_names() {
         let root = tmp("settings");
         seed(&root);
-        let got = children(&root, &addr("settings"), &Scope::unscoped(), &no_cat).unwrap();
+        let got = children(
+            &Disk::new(&root),
+            &addr("settings"),
+            &Scope::unscoped(),
+            &no_cat,
+        )
+        .unwrap();
         assert_eq!(
             titles(&got),
             ["Mind", "Projection schema", "Authoring guidance"]
@@ -572,7 +591,7 @@ mod tests {
         .unwrap();
 
         let got = children(
-            &root,
+            &Disk::new(&root),
             &addr("settings/projection"),
             &Scope::unscoped(),
             &no_cat,
@@ -589,7 +608,7 @@ mod tests {
         );
 
         // One part reads as itself.
-        let one = read(&root, &addr("settings/projection/world")).unwrap();
+        let one = read(&Disk::new(&root), &addr("settings/projection/world")).unwrap();
         assert!(one.text.contains("window: 8000"), "{}", one.text);
         assert!(
             !one.text.contains("beliefs"),
@@ -599,13 +618,15 @@ mod tests {
 
         // And saving it changes that layer and leaves the comments.
         write(
-            &root,
+            &Disk::new(&root),
             &addr("settings/projection/world"),
             "name: world\nwindow: 9000\n",
             false,
         )
         .unwrap();
-        let after = read(&root, &addr("settings/projection")).unwrap().text;
+        let after = read(&Disk::new(&root), &addr("settings/projection"))
+            .unwrap()
+            .text;
         assert!(after.contains("window: 9000"), "{after}");
         assert!(
             after.contains("# ── Beliefs ──"),
@@ -623,7 +644,7 @@ mod tests {
         let root = tmp("part-delete");
         seed(&root);
         fs::write(root.join("projection.yaml"), "layers:\n  - name: world\n").unwrap();
-        assert!(remove(&root, &addr("settings/projection/world")).is_err());
+        assert!(remove(&Disk::new(&root), &addr("settings/projection/world")).is_err());
         assert!(root.join("projection.yaml").exists(), "the document went");
     }
 
@@ -636,15 +657,15 @@ mod tests {
             "excludes": ["intimate"],
             "personalities": ["cindy-tan"],
         }));
-        let canon = children(&root, &addr("canon"), &scope, &no_cat).unwrap();
+        let canon = children(&Disk::new(&root), &addr("canon"), &scope, &no_cat).unwrap();
         assert_eq!(titles(&canon), ["Ammo"], "armor and alliances are out");
 
-        let responses = children(&root, &addr("responses"), &scope, &cat).unwrap();
+        let responses = children(&Disk::new(&root), &addr("responses"), &scope, &cat).unwrap();
         assert_eq!(titles(&responses), ["Fight"]);
 
         // And naming an excluded topic directly is refused.
         assert!(matches!(
-            children(&root, &addr("canon/armor"), &scope, &no_cat),
+            children(&Disk::new(&root), &addr("canon/armor"), &scope, &no_cat),
             Err(CatalogError::OutOfScope)
         ));
     }
@@ -654,9 +675,9 @@ mod tests {
         let root = tmp("rw");
         seed(&root);
         let a = addr("canon/ammo/bolt");
-        assert_eq!(read(&root, &a).unwrap().text, "a bolt");
+        assert_eq!(read(&Disk::new(&root), &a).unwrap().text, "a bolt");
 
-        write(&root, &a, "a heavier bolt", false).unwrap();
+        write(&Disk::new(&root), &a, "a heavier bolt", false).unwrap();
         assert_eq!(
             fs::read_to_string(root.join("layers/world/ammo/bolt.md")).unwrap(),
             "a heavier bolt"
@@ -664,10 +685,10 @@ mod tests {
 
         // A new entry, with no extension anywhere in the address.
         let n = addr("canon/ammo/tracer");
-        write(&root, &n, "a tracer", true).unwrap();
+        write(&Disk::new(&root), &n, "a tracer", true).unwrap();
         assert!(root.join("layers/world/ammo/tracer.md").is_file());
 
-        remove(&root, &n).unwrap();
+        remove(&Disk::new(&root), &n).unwrap();
         assert!(!root.join("layers/world/ammo/tracer.md").exists());
     }
 
@@ -677,13 +698,54 @@ mod tests {
     fn removing_a_topics_text_keeps_its_entries() {
         let root = tmp("rmtopic");
         seed(&root);
-        remove(&root, &addr("canon/ammo")).unwrap();
+        remove(&Disk::new(&root), &addr("canon/ammo")).unwrap();
         assert!(!root.join("layers/world/ammo.md").exists());
         assert!(root.join("layers/world/ammo/bolt.md").is_file());
         // And it is still a topic, now without an overview.
-        let got = children(&root, &addr("canon"), &Scope::unscoped(), &no_cat).unwrap();
+        let got = children(
+            &Disk::new(&root),
+            &addr("canon"),
+            &Scope::unscoped(),
+            &no_cat,
+        )
+        .unwrap();
         let ammo = got.iter().find(|n| n.id == "canon/ammo").unwrap();
         assert!(!ammo.has_text);
         assert_eq!(ammo.count, Some(2));
+    }
+
+    /// **An author's drafts are in what they list**: a drafted entry is a row,
+    /// a removed one is not, and a drafted entry's length is its draft's.
+    #[test]
+    fn an_authors_drafts_are_listed() {
+        let root = tmp("drafts");
+        seed(&root);
+        let view = Overlay::new(
+            Published { root: root.clone() },
+            [
+                (
+                    "layers/world/ammo/tracer.md".to_string(),
+                    Some("a tracer round".to_string()),
+                ),
+                ("layers/world/ammo/shell.md".to_string(), None),
+                (
+                    "layers/world/ammo/bolt.md".to_string(),
+                    Some("a bolt, heavier".to_string()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let got = children(&view, &addr("canon/ammo"), &Scope::unscoped(), &no_cat).unwrap();
+        assert_eq!(titles(&got), ["Bolt", "Tracer"]);
+        assert_eq!(got[0].chars, Some("a bolt, heavier".len() as u64));
+        assert_eq!(
+            read(&view, &addr("canon/ammo/tracer")).unwrap().text,
+            "a tracer round"
+        );
+        assert!(matches!(
+            read(&view, &addr("canon/ammo/shell")),
+            Err(doc::DocError::NotFound)
+        ));
     }
 }

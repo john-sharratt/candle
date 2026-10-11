@@ -83,6 +83,7 @@ impl Substrate {
             | RecordType::BranchCheckpoint
             | RecordType::Npc
             | RecordType::CustomObject
+            | RecordType::Blob
             | RecordType::Replica
             | RecordType::Rebase
             | RecordType::Deleted

@@ -2978,15 +2978,25 @@ passed:
   world's map directory, `Tool` consts with `at: &["merge-table"]` chained into `CATALOG`
   (`npcd/src/engine/tools.rs:956-965`), and a match arm in `work::perform`
   (`work.rs:708`).
-- `merge_publish` sends the operation's store to an agent as a git job (§11.4): a commit
-  on the operation's branch, `operation/<world>/<id>`, a merge into `main`, and a push
-  under a lease. The commit message names the operation and every step's taker, from its
-  run history.
+- `merge_publish` lands the operation's store on the record as **one commit on the
+  store's base**, pushed under a lease on what the record held when the commit began
+  (`npcd/src/opstore/merge/publish.rs`). A record that moved since the base is merged into
+  the store first when it merges cleanly, and the commit lands on top of it; one that
+  moved at the lines the store changes is refused with the paths. There is no operation
+  branch: the record is the mind's branch on `origin`, as it is for zend's `land`. The
+  member builds the commit in its own clone of the mind; only the push needs credentials,
+  and it goes through an agent holding the mind with push rights (§11.4, `AgentPush`), or
+  through the mind's own checkout on a member run without `--cluster`. The commit message
+  names the operation, its document and every step's taker, from its run history.
 - **On success** the store's base moves to the merged commit and its published paths are
   tombstoned, which is zend's `land` behaviour (`zend-vfs/src/work/commit.rs:200-218`).
   The run reaches `done`, and the store is dropped with the operation's settlement.
-- The world's authority's mind watcher (§9.2) then picks up the pushed change from
-  `origin` and ingests it into memory (`npcd/src/engine/watcher.rs`).
+- **Every member's mind folder follows the record** (`npcd/src/engine/record_follow.rs`).
+  The publishing member brings its folder up at once; every member fetches the record
+  every 60 s and checks it out. A folder with changes of its own on disk, or a branch
+  holding commits the record does not, is left as it is and said so in the log — never
+  overwritten. Each time the folder moves, the watcher ingests what changed
+  (`npcd/src/engine/watcher.rs`) and the worlds and personalities are read again.
 
 **When git cannot be reached, the step waits and is tried again.** A publish needs
 `origin` and an agent to push with (§11.4). Either can be unreachable: `origin` is down,
@@ -3013,12 +3023,38 @@ its own copy (§9.4). Nothing tracks that.
 
 **Other npcd content.**
 
-- **Admin writes** to worlds, personalities, mind entries and maps become `VfsEvent`s on
-  the admin's own authoring store (one per account). The console's **Publish** runs the
-  same agent merge.
-- **Accounts** become `CustomObject account/<user>` records.
-- **Images** become a new content-addressed `Blob` record (tag 29), keyed by SHA-256.
-  `portrait_image_id` names that hash.
+- **Admin writes are drafts** (`npcd/src/drafts/`). Everything an admin writes to the
+  mind through the console — a world or personality (`PUT /v1/world/:wid`,
+  `/v1/personality/:aid`, the world's clock), a corpus entry or its fields
+  (`/v1/mind/entry`, `/v1/mind/fields`), a life (every `/v1/life/:who` write and the
+  generation ladder) and a reshaped map (`/reshape/:world`) — becomes `VfsEvent`s on the
+  admin's own **authoring store**:
+  - One store per account, owned by the account's public id (`u_…`, what its characters
+    are owned by). Its `TimelineId` is `hash("author" ‖ id)`. A reshape asked for
+    through a character's token is a write of that character's owner.
+  - The admin reads the published mind as it stands, with their own drafts laid over it,
+    in every listing and document read; everyone else reads the published mind. The
+    drafts are made on the commit the store held when the first of them was written, and
+    an empty store takes the record as it stands again.
+  - A world or personality is rendered against the text the author sees, so its comments
+    survive (`npcd/src/registry/authored.rs`). A life's plan and every document it
+    writes are one commit.
+  - The console's **Publish** (`POST /v1/mind/publish`) runs the same merge as
+    `merge_publish`, with the commit message naming the account and every drafted path.
+    A conflict is refused with its paths (`409`); **Sync** (`POST /v1/mind/sync`) brings
+    the record's newer text in with each overlap marked, and the author settles the marks
+    in the editor and publishes again. **Discard** (`DELETE /v1/mind/drafts`) drops them;
+    `GET /v1/mind/drafts` lists them.
+  - Over a mind folder that is not a git repository there is no record to land on, and
+    an admin's write is the file itself, read again at once.
+- **Accounts** become `CustomObject account/<key>` records, `<key>` the first 128 bits of
+  `SHA-256(issuer ‖ 0 ‖ subject)`. A daemon's old `accounts/` folder is taken in once at
+  startup and removed.
+- **Images** become a new content-addressed `Blob` record (tag 29): its payload the
+  SHA-256 and then the bytes, its header key the hash's first sixteen bytes. An image's id
+  is `<sha256-hex>.<ext>`, and `portrait_image_id` names it. A daemon's old `images/`
+  folder is taken in once at startup, and every character's portrait pointing at an old
+  id is pointed at the blob it became.
 - **Device tokens** stay local. They authenticate a device to the one machine it was
   issued on.
 
@@ -3032,9 +3068,11 @@ unit another member has already ingested, with no ledger of its own: the replica
 units are the ledger.
 
 Two members can still ingest the same unit before either sees the other's. Both units'
-records arrive everywhere. **The unit whose decl has the lower version stamp (§6.2) is
-the unit**, and the other is dead at read on every member, by the same rule in any
-arrival order. Compaction then drops the dead one's records, as it drops any record
+conversations arrive everywhere. **The conversation whose first turn has the lower
+version stamp (§6.2) holds the unit**, the timeline breaking a tie, and the planner
+tombstones the other (`zend/src/branch_ingest/plan.rs`) — the same choice on every
+member in any arrival order, since the stamps and timelines are the records' own.
+Compaction then drops the tombstoned conversation's records, as it drops any record
 §6.5 makes dead. Unlike two turns at one index (§6.6), two ingests of one unit are the
 same content twice, so keeping one loses nothing.
 
@@ -3081,31 +3119,44 @@ If that agent is busy, the job waits up to 5 s and then spills to the **best idl
 agent**: the one with the most idle cores, `cores × (1 − load/cores)`, among agents that
 hold the job's repositories and toolchain.
 
+**An agent at low priority** — one sharing its host with a model member (§11.5), which
+says so in its `CAPACITY` — is chosen only when no dedicated agent fit for the job has a
+free slot (`cluster/src/gateway/agents.rs`). It is never the best idle agent beside a free
+dedicated one, a lineage it holds moves to a free dedicated agent, and a job that must
+queue queues on a dedicated agent.
+
 A fork's lineage header is its parent's.
 
 ### 11.4 Jobs
 
-The agent's API:
+The agent's API (`agent/src/routes.rs`), served only over a stream a gateway opened for a
+member:
 
 | Route | |
 |---|---|
-| `POST /v1/jobs` | `{ repo, base, overlay, program, args, timeout_secs }` or `{ repo, base, overlay, git: commit \| merge \| push, … }`. Returns the job id. |
-| `GET /v1/jobs/:id` | Status: queued, running, exited, timed out, cancelled, refused or failed. |
-| `GET /v1/jobs/:id/log` | The log as a stream from its first byte. |
+| `POST /v1/jobs` | A run, `{ "job": "run", repo, branch, overlay, program, args, timeout_secs }`, or a push, `{ "job": "push", repo, bundle, specs: [{ target, to, expect }] }` (`agent/src/wire.rs`). Answers the job's view: its id, its status, its log's size, and once it has ended a run's outcome or a push's refs. |
+| `GET /v1/jobs/:id` | Status: queued, running, exited, timed out, cancelled, refused or failed. `?wait=<s>` holds the answer until the job ends, up to 30 s. |
+| `GET /v1/jobs/:id/log` | The log from its first byte. |
 | `DELETE /v1/jobs/:id` | Cancel, killing the process tree. |
 
 `overlay` is the conversation's or operation's store `Snapshot` (`zend-vfs/src/vfs/mod.rs:380`),
-which the 10 MiB store cap keeps small. That answers the open question of sync
-granularity (`docs/zend_workspace_execution.md` §9.4) with a per-job overlay over a
+its base included, which the 10 MiB store cap keeps small. That answers the open question
+of sync granularity (`docs/zend_workspace_execution.md` §9.4) with a per-job overlay over a
 fetched base.
 
-The agent runs the existing sandbox cycle against its own checkout: fetch the base,
-then preserve → materialize → run → capture → restore (`zend-vfs/src/sandbox/mod.rs:1-45`).
-It returns the exit code, the log, and the captured deltas. A git job builds and pushes
-with the existing `zend-vfs` machinery and returns the new base.
+**A run** goes through the existing sandbox cycle against the agent's own checkout:
+fetch the base, then preserve → materialize → run → capture → restore
+(`zend-vfs/src/sandbox/mod.rs:1-45`). It returns the exit code, the log, and the captured
+deltas. The calling member applies the deltas to the store. They are then ordinary VFS
+events and replicate.
 
-The calling member applies the deltas to the store. They are then ordinary VFS events
-and replicate.
+**A push** carries what the member built. Commits and merges are made in the member's
+own clone with the existing `zend-vfs` machinery; only the write to `origin` needs the
+credentials an agent holds. So the member bundles the objects `origin` lacks — a git
+bundle, base64 on the wire, absent when it lacks none — and names each ref the push sets
+with the lease it holds on what `origin` has, and the agent pushes them in one atomic push
+(`agent/src/pusher.rs`). A lease `origin` no longer matches is refused exactly as it would
+be from the member's own clone.
 
 ### 11.5 How zend calls it
 
@@ -3115,9 +3166,14 @@ through a stream the member opens to `group:agent` (§5.1). The in-process `Sand
 deployment configuration, not a fallback: with `--cluster`, an unreachable agent is the
 tool error `no_agent`, never a quiet local run.
 
-A machine with a GPU can also be an agent. `tokerad --agent` opens a third socket that
-serves the job API in-process at low priority, which is §8.1's "GPU nodes may register as
-low-priority build agents".
+A machine with a GPU can also be an agent. `tokerad --agent <agent file>` — the file
+naming its checkouts, job slots and jobs folder (`agent/src/config.rs`) — opens a third
+socket that serves the job API in-process at low priority, which is §8.1's "GPU nodes may
+register as low-priority build agents". Low priority is two things: its commands, and
+everything they start, run below normal OS priority (`zend_vfs::Priority::Below` — the
+below-normal class held by the command's job object on Windows, a nice of ten on Unix),
+so a build never takes the processor the decode needs; and the gateways choose it last
+(§11.3).
 
 **A member cut off from every cluster can still reach its own in-process agent.** Agents
 dial out and have no listener, so a member cut off from the gateways reaches no other

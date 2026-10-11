@@ -42,7 +42,7 @@ use candle_conversation::stencil::{TriggerRegistry, MAX_TOOL_CALLS_PER_TURN};
 use candle_conversation::{ConversationEngine, Sequence, TurnOptions, TurnText};
 use zend_tools::ToolContext;
 use zend_vfs::vfs::PAGE_LINES;
-use zend_vfs::Oid;
+use zend_vfs::{ObjectFormat, Oid};
 
 use self::lines::line_count;
 use crate::branch_ingest::filter::{language_of, MAX_FILE_BYTES};
@@ -169,6 +169,9 @@ fn scan_ingest_chains(engine: &Mutex<ConversationEngine>) -> IngestChains {
                 timeline,
                 key: key.clone(),
                 subject: path,
+                stamp: substrate
+                    .first_turn_stamp(timeline.raw())
+                    .unwrap_or_default(),
             }),
         }
     }
@@ -348,12 +351,13 @@ fn parallelism() -> usize {
     CODE_READ_PARALLELISM
 }
 
-/// Ingest ONLY `rel_paths` — workspace-relative, in the uploads repository —
-/// into the `code_reading` layer: the upload pipeline's read_file phase.
+/// Ingest ONLY `rel_paths` — workspace-relative, in the uploads repository of
+/// the conversation whose stores `ctx`'s tools hold — into the `code_reading`
+/// layer: the upload pipeline's read_file phase.
 ///
 /// Bounded to these files: no branch is walked and nothing else is
 /// tombstoned. Each file is keyed the way a branch's file is — its path and
-/// blob id, the id computed from the bytes on disk — so identical bytes
+/// blob id, the id computed from the bytes it holds — so identical bytes
 /// uploaded again are not read again, and an upload that replaces a path
 /// retires the conversation of what that path held before.
 ///
@@ -376,10 +380,12 @@ pub fn ingest_files(
         let Some(language) = language_of(&path) else {
             continue; // not a recognised code language — nothing to read
         };
-        match uploads.content_id(inner) {
-            Ok(Some((blob, size))) if size <= MAX_FILE_BYTES => jobs.push(FileJob {
+        // An upload is the conversation's, in its store's session layer: its
+        // id is computed from its bytes, as git would.
+        match uploads.read_bytes(inner) {
+            Ok(Some(bytes)) if bytes.len() as u64 <= MAX_FILE_BYTES => jobs.push(FileJob {
                 path,
-                blob,
+                blob: ObjectFormat::Sha1.blob_id(&bytes),
                 language,
                 at: None,
                 branches: Vec::new(),
@@ -664,14 +670,14 @@ struct Job<'a> {
 
 /// The tools a file's conversation runs against: file stores reading the
 /// commit the file was found on, so its `file_read` returns the bytes its key
-/// names — or, for an upload, a fresh set over the uploads folder. `None`
-/// when the file's repository is not read through git.
+/// names — or, for an upload, the uploading conversation's own stores, which
+/// hold it. `None` when the file's repository is not read through git.
 fn file_tools(tools: &ToolContext, file: &FileJob) -> Option<ToolContext> {
     let files = match &file.at {
-        Some(at) => tools.files.fresh_at(split(&file.path).0, at)?,
-        None => tools.files.fresh(),
+        Some(at) => Arc::new(tools.files.fresh_at(split(&file.path).0, at)?),
+        None => Arc::clone(&tools.files),
     };
-    Some(tools.with_files(Arc::new(files)))
+    Some(tools.with_files(files, ""))
 }
 
 /// Ingest one file into a fresh per-file conversation: skip it when its key

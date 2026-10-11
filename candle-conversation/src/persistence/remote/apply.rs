@@ -8,7 +8,7 @@ use super::super::record::{Record, RecordHeader, RecordType, SectionTombstonePay
 use super::super::replica::DeferredRecord;
 use super::super::streams::{StreamDecl, StreamId};
 use super::super::walker::WalkEntry;
-use super::super::{record_snapshot_loc, vfs, Result, SubstratePersistence};
+use super::super::{blob, record_snapshot_loc, vfs, Result, SubstratePersistence};
 use super::adopt::adopt_complete_turns;
 use super::incoming::Incoming;
 use super::outcome::{Refusal, RemoteBatch, RemoteOutcome};
@@ -172,11 +172,12 @@ impl SubstratePersistence {
     /// What the walk at open keeps beside the substrate for a record, and an
     /// append of this member's own does not: a timeline tombstone retires the
     /// conversation's snapshot tail and file events, a file event joins its
-    /// timeline's index, and a section tombstone naming a generation this
-    /// member is writing ends it here too.
+    /// timeline's index, a blob joins the blobs, and a section tombstone naming
+    /// a generation this member is writing ends it here too.
     fn index_remote(&mut self, entry: &WalkEntry) {
         record_snapshot_loc(&mut self.snapshot_locs, entry);
         vfs::record_vfs_loc(&mut self.vfs_index, &mut self.accounting, entry);
+        blob::record_blob_loc(&mut self.blob_index, entry);
         let h = &entry.record.header;
         if h.record_type == RecordType::SectionTombstone {
             if let Some(g) = SectionTombstonePayload::decode(&entry.record.payload)

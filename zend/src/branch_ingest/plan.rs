@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use candle_conversation::persistence::identity::VersionStamp;
 use candle_conversation::projection::TimelineId;
 
 /// A unit on some branch: its key, and the path or folder it is of.
@@ -13,13 +14,14 @@ pub struct Live<'a> {
     pub subject: &'a str,
 }
 
-/// A committed conversation of the layer: its key, and the path or folder
-/// it is of.
+/// A committed conversation of the layer: its key, the path or folder it is
+/// of, and the stamp of its first turn's declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Committed {
     pub timeline: TimelineId,
     pub key: String,
     pub subject: String,
+    pub stamp: VersionStamp,
 }
 
 /// One pass over one layer.
@@ -30,7 +32,7 @@ pub struct Plan {
     pub queued: Vec<usize>,
     /// Conversations to tombstone now: of a key not among the units to
     /// retain, whose path or folder has nothing queued to replace it — and
-    /// any second conversation of a key another already holds.
+    /// every conversation of a key but the one that holds it.
     pub tombstone: Vec<TimelineId>,
 }
 
@@ -43,17 +45,28 @@ pub struct Plan {
 /// holds it. A dead key whose path or folder has a queued key stays until
 /// that replacement commits — its ingest tombstones it then — so a path is
 /// never missing from the layer while it is being read again.
+///
+/// **A key is held by its conversation with the lowest stamp**
+/// (`docs/replicated_substrate.md` §10.4). Two members can ingest one unit
+/// before either sees the other's; both conversations arrive everywhere, and
+/// every member keeps the same one and tombstones the other, whatever order
+/// they arrived in.
 pub fn plan(ingest: &[Live<'_>], retain: &HashSet<&str>, committed: &[Committed]) -> Plan {
-    let mut holder: HashMap<&str, TimelineId> = HashMap::new();
-    let mut tombstone = Vec::new();
+    let mut holder: HashMap<&str, &Committed> = HashMap::new();
     for c in committed {
-        match holder.get(c.key.as_str()) {
-            Some(_) => tombstone.push(c.timeline),
-            None => {
-                holder.insert(&c.key, c.timeline);
-            }
+        let lower =
+            |held: &&Committed| (c.stamp, c.timeline.raw()) < (held.stamp, held.timeline.raw());
+        if holder.get(c.key.as_str()).is_none_or(lower) {
+            holder.insert(&c.key, c);
         }
     }
+    let mut tombstone: Vec<TimelineId> = committed
+        .iter()
+        .filter(|c| holder.get(c.key.as_str()).map(|h| h.timeline) != Some(c.timeline))
+        .map(|c| c.timeline)
+        .collect();
+    let holder: HashMap<&str, TimelineId> =
+        holder.into_iter().map(|(k, c)| (k, c.timeline)).collect();
     let queued: Vec<usize> = ingest
         .iter()
         .enumerate()
@@ -80,10 +93,19 @@ mod tests {
     }
 
     fn committed(n: u64, key: &str, subject: &str) -> Committed {
+        stamped(n, key, subject, n)
+    }
+
+    /// A conversation whose first turn was declared at `hlc`.
+    fn stamped(n: u64, key: &str, subject: &str, hlc: u64) -> Committed {
         Committed {
             timeline: tl(n),
             key: key.to_string(),
             subject: subject.to_string(),
+            stamp: VersionStamp {
+                hlc,
+                ..VersionStamp::default()
+            },
         }
     }
 
@@ -137,15 +159,25 @@ mod tests {
         assert_eq!(replaced.tombstone, [tl(1)]);
     }
 
-    /// **Two conversations of one key are one too many**: the first stays.
+    /// **Two conversations of one key are one too many**: the one whose first
+    /// turn has the lower stamp stays, whatever order they are listed in —
+    /// so every member keeps the same one (§10.4).
     #[test]
-    fn a_duplicate_of_a_held_key_is_tombstoned() {
+    fn a_duplicate_of_a_held_key_is_tombstoned_by_its_stamp() {
+        let earlier = stamped(2, "a@1", "a", 10);
+        let later = stamped(1, "a@1", "a", 20);
+        for committed in [[earlier.clone(), later.clone()], [later, earlier]] {
+            let p = unbounded(&[live("a@1", "a")], &committed);
+            assert!(p.queued.is_empty());
+            assert_eq!(p.tombstone, [tl(1)], "the later ingest goes");
+        }
+        // The same stamp — two writes of one origin never tie — falls to the
+        // timeline.
         let p = unbounded(
-            &[live("a@1", "a")],
-            &[committed(1, "a@1", "a"), committed(2, "a@1", "a")],
+            &[live("b@1", "b")],
+            &[stamped(4, "b@1", "b", 5), stamped(3, "b@1", "b", 5)],
         );
-        assert!(p.queued.is_empty());
-        assert_eq!(p.tombstone, [tl(2)]);
+        assert_eq!(p.tombstone, [tl(4)]);
     }
 
     /// **A unit past the depth bound is retained, not ingested**: held, it

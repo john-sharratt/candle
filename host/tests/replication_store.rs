@@ -87,7 +87,7 @@ fn member(hub: &Arc<Hub>) -> Member {
             prefill_backlog: 0,
             vram_free_mib: 0,
             cores: 1,
-            load_milli: 0,
+            ..Capacity::default()
         }),
         Some(replication),
         Instant::now(),

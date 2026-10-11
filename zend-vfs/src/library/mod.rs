@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::error::GitError;
+use crate::remote::pusher::here;
 use crate::types::{ObjectFormat, Oid};
 use crate::Repo;
 
@@ -52,6 +53,7 @@ pub(crate) fn open_in_process(dir: &Path) -> Option<Repo> {
         format: ObjectFormat::Sha1,
         write: Mutex::new(()),
         library: Some(Mutex::new(library)),
+        pusher: here(),
     })
 }
 

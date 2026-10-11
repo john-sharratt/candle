@@ -51,6 +51,7 @@ use crate::mind::Mind;
 use crate::npcs::{Casting, Npcs};
 use crate::personality_portrait;
 use crate::projection;
+use crate::registry::authored::{PERSONALITIES, WORLDS};
 use crate::registry::Registry;
 use crate::reports::NpcdReports;
 
@@ -302,8 +303,8 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // data directory otherwise. Worlds and personalities are written by a
     // person; the data directory holds what the ENGINE wrote.
     let authored_dir = schema.dir.clone().unwrap_or_else(|| data.clone());
-    let worlds = Registry::load("world", authored_dir.join("worlds"))?;
-    let personalities = Registry::load("personality", authored_dir.join("personalities"))?;
+    let worlds = Registry::load("world", authored_dir.join(WORLDS))?;
+    let personalities = Registry::load("personality", authored_dir.join(PERSONALITIES))?;
     tracing::info!(
         "authored content: {} worlds, {} personalities from {}",
         worlds.len(),
@@ -311,19 +312,9 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         authored_dir.display()
     );
 
-    // Accounts are durable but never published — `npcd/.gitignore` keeps the
-    // directory out of a public repository, because a record here carries a
-    // real email address and a provider subject id.
-    let accounts = Accounts::load(data.join("accounts"))?;
-    tracing::info!(
-        "accounts: {} known, from {}",
-        accounts.len(),
-        data.join("accounts").display()
-    );
-
     // The cast, rebuilt from the substrate's redo log. The one read of that
     // log — every request after this is answered from memory.
-    let npcs = Npcs::load(&data)
+    let mut npcs = Npcs::load(&data)
         .map_err(|e| anyhow::anyhow!("opening the substrate at {}: {e:?}", data.display()))?;
     npcs.substrate()
         .persistence
@@ -332,6 +323,11 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         .set_tombstone_retention(Duration::from_secs(
             args.tombstone_retention.saturating_mul(SECONDS_PER_DAY),
         ));
+
+    // Accounts are records in the substrate, replicated but never published:
+    // one carries a real email address and a provider subject id.
+    let accounts = Accounts::open(npcs.substrate(), &data.join("accounts"))?;
+    tracing::info!("accounts: {} known", accounts.len());
 
     let roles = ctx.roles.clone();
     if roles.is_empty() {
@@ -368,10 +364,18 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         None => tracing::info!("mind: none — the file editor will report it has nothing to edit"),
     }
 
-    // Portraits, beside the accounts and the substrate.
-    let images = Images::new(&data);
+    // Portraits, as blobs in the substrate; a character naming an image kept
+    // as a file before then is pointed at the blob it became.
+    let (images, renames) = Images::open(npcs.substrate(), &data.join("images"))
+        .map_err(|e| anyhow::anyhow!("taking in the images at {}: {e}", data.display()))?;
+    if !renames.is_empty() {
+        let moved = npcs
+            .repoint_portraits(&renames, api::now_ms())
+            .map_err(|e| anyhow::anyhow!("repointing portraits: {e:?}"))?;
+        tracing::info!("images: {moved} character portraits repointed");
+    }
     let personality_portraits =
-        personality_portrait::ingest(&personalities, &authored_dir.join("personalities"), &images);
+        personality_portrait::ingest(&personalities, personalities.dir(), &images);
     tracing::info!(
         "authored portraits: {} of {} personalities carry one",
         personality_portraits.len(),
@@ -410,6 +414,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     runtime.set_effector_router(local_router.clone());
 
     install_sinks(&runtime, &authored, feelings);
+    reload_on_move(&runtime, &authored);
     // A member follows each world it hosts until its lease says otherwise
     // (`docs/replicated_substrate.md` §9.2): known before the first is hosted.
     if ctx.cluster.is_some() {
@@ -503,6 +508,27 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         reports: Arc::new(NpcdReports::new(authored, data)),
         stop: Box::new(move || Box::pin(stop(stopping, npcs, mind_watcher, guardian))),
     })
+}
+
+/// Read the worlds and personalities again each time the mind folder moves to
+/// a newer record — a publish on this member, or another member's that the
+/// folder followed (`docs/replicated_substrate.md` §10.3). Holds the state
+/// weakly, so the task ends with it.
+fn reload_on_move(runtime: &Arc<Runtime>, authored: &Arc<Authored>) {
+    let mut moves = runtime.ops.moves();
+    let authored = Arc::downgrade(authored);
+    tokio::spawn(async move {
+        while moves.changed().await.is_ok() {
+            let Some(authored) = authored.upgrade() else {
+                return;
+            };
+            if authored.runtime.as_ref().is_some_and(|rt| rt.stopping()) {
+                return;
+            }
+            authored.reload_authored().await;
+            tracing::info!("authored: read again after the mind moved to a newer record");
+        }
+    });
 }
 
 /// Stop npcd, in the order that loses nothing.

@@ -3,16 +3,21 @@
 //! # In memory until it commits
 //!
 //! A working set is a body's uncommitted edits, held here and nowhere else. A
-//! read falls through to the disk; a write does not touch the disk at all until
-//! [`Benches::commit`], which writes every changed document in one go. That is
-//! the whole mechanism, and it is what makes "your work is yours alone until you
+//! read falls through to the body's [`Shelf`] — the store of the operation its
+//! mission is a step of, or the published mind — and a write touches nothing
+//! else until [`Benches::commit`], which records every changed document into
+//! that store in one go (`docs/replicated_substrate.md` §10.3). That is the
+//! whole mechanism, and it is what makes "your work is yours alone until you
 //! offer it" a fact about the program rather than a line in a description —
-//! there is no path by which another body can observe a working set.
+//! there is no path by which another body can observe a working set. Nothing
+//! reaches the published mind from here: an operation's publish step merges
+//! its store into the record.
 //!
 //! # A collision is a comparison, not a lock
 //!
-//! Every entry remembers what the file held when this working set first touched
-//! it. Committing re-reads the disk and requires it to still match. So two
+//! Every entry remembers what the document held when this working set first
+//! touched it. Committing re-reads the shelf and requires it to still match:
+//! there the operation's earlier steps are what moved the document. So two
 //! Makers editing the same document do not deadlock and do not silently
 //! overwrite each other: the second one to commit is refused, and told whose
 //! work it ran into.
@@ -30,7 +35,7 @@
 //! `&Path` from outside, and the extension check keeps a working set to the
 //! `.md` and `.yaml` documents the mind is actually made of.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +44,7 @@ use serde_json::{Map, Value};
 use crate::mind::path::MindPath;
 use crate::registry::yaml_edit;
 use crate::sim::missing::no_document;
+use crate::sim::shelf::Shelf;
 
 /// One document's pending change.
 ///
@@ -55,7 +61,7 @@ pub struct Change {
 }
 
 impl Change {
-    /// Whether committing this would actually alter the disk. A write that
+    /// Whether committing this would actually alter what stands. A write that
     /// restores a file to exactly what it already said is not a change, and
     /// counting it as one would manufacture collisions out of nothing.
     pub fn changed(&self) -> bool {
@@ -130,6 +136,17 @@ impl Working {
     pub fn is_empty(&self) -> bool {
         self.changed().is_empty()
     }
+
+    /// What this would write to `path`, named in any case: `None` when it
+    /// leaves `path` as it stands or takes it out.
+    pub fn changed_text(&self, path: &str) -> Option<&str> {
+        self.files
+            .iter()
+            .find(|(key, c)| c.changed() && key.eq_ignore_ascii_case(path))?
+            .1
+            .now
+            .as_deref()
+    }
 }
 
 /// Every bench in a world, and the documents under them.
@@ -184,60 +201,15 @@ impl Benches {
         self.root.as_deref()
     }
 
-    /// Move the document at `raw` out of the record, to
-    /// `rejected/<to>/<its file name>` under the root — where no world reads
-    /// it, and an operator still can. Anybody's change to it, open or set
-    /// aside, is dropped with it — a stash brought back and committed would
-    /// write the rejected document into the record again. Returns where it
-    /// went, as a mind path.
-    pub fn retire(&mut self, raw: &str, to: &str) -> Result<String, String> {
-        let (key, full) = self.doc(raw)?;
-        let root = self.root()?.to_path_buf();
-        let name = full
-            .file_name()
-            .ok_or_else(|| format!("{raw} names no file"))?
-            .to_string_lossy()
-            .to_string();
-        let slug: String = to
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-')
-            .collect();
-        let dest_rel = format!("rejected/{slug}/{name}");
-        let dest = root.join(&dest_rel);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("{} would not open: {e}", parent.display()))?;
-        }
-        std::fs::rename(&full, &dest).map_err(|e| format!("{raw} would not move aside: {e}"))?;
-        for working in self.open.values_mut().chain(self.stashed.values_mut()) {
-            working.files.remove(&key);
-        }
-        self.last.remove(&key);
-        Ok(dest_rel)
-    }
-
-    /// Put the document at `raw` back to `text` in the record, dropping
-    /// anybody's change to it, open or set aside — for a correction that
-    /// failed, whose edit is not to stand. Returns its mind path.
-    pub fn put_back(&mut self, raw: &str, text: &str) -> Result<String, String> {
-        let (key, full) = self.doc(raw)?;
-        std::fs::write(&full, text).map_err(|e| format!("{raw} would not go back: {e}"))?;
-        for working in self.open.values_mut().chain(self.stashed.values_mut()) {
-            working.files.remove(&key);
-        }
-        self.last.remove(&key);
-        Ok(key)
-    }
-
     fn root(&self) -> Result<&Path, String> {
         self.root
             .as_deref()
             .ok_or_else(|| "There are no documents in this world to work on.".to_string())
     }
 
-    /// Parse and resolve a path naming an editable document.
-    fn doc(&self, raw: &str) -> Result<(String, PathBuf), String> {
-        let root = self.root()?;
+    /// Parse a path naming an editable document: its key.
+    fn doc(&self, raw: &str) -> Result<String, String> {
+        self.root()?;
         let p = MindPath::parse(raw).map_err(|e| format!("{raw} is not a document here: {e}."))?;
         p.check_editable()
             .map_err(|e| format!("{raw} is not a document here: {e}."))?;
@@ -247,16 +219,12 @@ impl Benches {
                 EDITABLE_AREAS.join(", ")
             ));
         }
-        let full = p
-            .resolve(root)
-            .map_err(|e| format!("{raw} is not a document here: {e}."))?;
-        refuse_link(&full, raw)?;
-        Ok((p.as_str(), full))
+        Ok(p.as_str())
     }
 
-    /// Parse and resolve a path naming a place to look, which has no extension.
-    fn dir(&self, raw: &str) -> Result<(String, PathBuf), String> {
-        let root = self.root()?;
+    /// Parse a path naming a place to look, which has no extension: its key.
+    fn dir(&self, raw: &str) -> Result<String, String> {
+        self.root()?;
         let p = MindPath::parse(raw).map_err(|e| format!("{raw} is nowhere here: {e}."))?;
         if !editable_area(&p) {
             return Err(format!(
@@ -264,11 +232,13 @@ impl Benches {
                 EDITABLE_AREAS.join(", ")
             ));
         }
-        let full = p
-            .resolve(root)
-            .map_err(|e| format!("{raw} is nowhere here: {e}."))?;
-        refuse_link(&full, raw)?;
-        Ok((p.as_str(), full))
+        Ok(p.as_str())
+    }
+
+    /// The refusal for `key`, not on `shelf`, naming what its folder holds.
+    fn missing(&self, key: &str, shelf: &dyn Shelf) -> String {
+        let folder = key.rsplit_once('/').map_or("", |(d, _)| d);
+        no_document(key, &shelf.list(folder))
     }
 
     /// The working set for a body, opened on `about` if it has none.
@@ -277,7 +247,7 @@ impl Benches {
     /// to be a deliberate act and it stays one, but refusing every write until
     /// somebody remembered to branch would spend a character's turn on a
     /// procedural scolding it cannot learn from — and the collision check does
-    /// not depend on branching, because it compares against the disk rather
+    /// not depend on branching, because it compares against the shelf rather
     /// than against a claim.
     fn working(&mut self, body: &str, about: &str) -> &mut Working {
         self.open
@@ -319,9 +289,9 @@ impl Benches {
     // ── the documents ───────────────────────────────────────────────────────
 
     /// Read a document as this body currently has it — its own uncommitted
-    /// version when it has one, and what stands otherwise.
-    pub fn read(&self, body: &str, raw: &str) -> Result<String, String> {
-        let (key, full) = self.doc(raw)?;
+    /// version when it has one, and what stands on its `shelf` otherwise.
+    pub fn read(&self, body: &str, raw: &str, shelf: &dyn Shelf) -> Result<String, String> {
+        let key = self.doc(raw)?;
         if let Some(c) = self.open.get(body).and_then(|w| w.files.get(&key)) {
             return match &c.now {
                 Some(t) => Ok(t.clone()),
@@ -330,7 +300,7 @@ impl Benches {
                 )),
             };
         }
-        std::fs::read_to_string(&full).map_err(|_| no_document(&key, &full))
+        shelf.read(&key).ok_or_else(|| self.missing(&key, shelf))
     }
 
     /// Read a document as a numbered excerpt, capped at [`MAX_READ_LINES`].
@@ -339,9 +309,15 @@ impl Benches {
     /// edit matches against the document's own text, and matching against a
     /// rendering with line numbers stuck to the front of every line would never
     /// find anything.
-    pub fn excerpt(&self, body: &str, raw: &str, start_line: usize) -> Result<String, String> {
-        let (key, _) = self.doc(raw)?;
-        let content = self.read(body, raw)?;
+    pub fn excerpt(
+        &self,
+        body: &str,
+        raw: &str,
+        start_line: usize,
+        shelf: &dyn Shelf,
+    ) -> Result<String, String> {
+        let key = self.doc(raw)?;
+        let content = self.read(body, raw, shelf)?;
         Ok(numbered_excerpt(&key, &content, start_line))
     }
 
@@ -352,16 +328,17 @@ impl Benches {
         about: &str,
         raw: &str,
         text: &str,
+        shelf: &dyn Shelf,
     ) -> Result<String, String> {
-        let (key, full) = self.doc(raw)?;
-        // Only touch the disk when this path is new to the working set —
+        let key = self.doc(raw)?;
+        // Only read the shelf when this path is new to the working set —
         // re-reading it on every write would let a later read become the base
         // and quietly swallow somebody else's commit.
         let fresh = !self
             .open
             .get(body)
             .is_some_and(|w| w.files.contains_key(&key));
-        let base = fresh.then(|| on_disk(&full)).flatten();
+        let base = fresh.then(|| shelf.read(&key)).flatten();
         let w = self.working(body, about);
         match w.files.get_mut(&key) {
             Some(c) => c.now = Some(text.to_string()),
@@ -391,20 +368,21 @@ impl Benches {
         about: &str,
         raw: &str,
         text: &str,
+        shelf: &dyn Shelf,
     ) -> Result<String, String> {
-        let (key, full) = self.doc(raw)?;
-        let existing = match self.read(body, raw) {
+        let key = self.doc(raw)?;
+        let existing = match self.read(body, raw, shelf) {
             Ok(t) => t,
             // Not there yet is not an error here: writing the first entry into
             // an era nobody has opened is how an era begins.
-            Err(_) if !full.exists() => String::new(),
+            Err(_) if shelf.read(&key).is_none() => String::new(),
             Err(why) => return Err(why),
         };
         let next = match existing.trim_end().is_empty() {
             true => format!("{}\n", text.trim_end()),
             false => format!("{}\n\n{}\n", existing.trim_end(), text.trim_end()),
         };
-        self.write(body, about, &key, &next)
+        self.write(body, about, &key, &next, shelf)
     }
 
     /// Replace one span of a document, where it appears exactly once.
@@ -419,17 +397,18 @@ impl Benches {
         raw: &str,
         old: &str,
         new: &str,
+        shelf: &dyn Shelf,
     ) -> Result<String, String> {
         if old.is_empty() {
             return Err("Replacing nothing would put your text everywhere at once.".into());
         }
-        let (key, _) = self.doc(raw)?;
-        let current = self.read(body, raw)?;
+        let key = self.doc(raw)?;
+        let current = self.read(body, raw, shelf)?;
         match current.matches(old).count() {
             0 => Err(not_there(&key, &current)),
             1 => {
                 let next = current.replacen(old, new, 1);
-                self.write(body, about, raw, &next)
+                self.write(body, about, raw, &next, shelf)
             }
             n => Err(format!(
                 "That appears {n} times in {key}, so changing it would change the wrong one. Give \
@@ -443,8 +422,14 @@ impl Benches {
     /// `at` is the path to it — `["portrait", "prompt"]` — because the fields
     /// worth reading are not all at the top level and a dotted string would
     /// have to be parsed back into exactly this.
-    pub fn read_field(&self, body: &str, raw: &str, at: &[&str]) -> Result<String, String> {
-        let text = self.read(body, raw)?;
+    pub fn read_field(
+        &self,
+        body: &str,
+        raw: &str,
+        at: &[&str],
+        shelf: &dyn Shelf,
+    ) -> Result<String, String> {
+        let text = self.read(body, raw, shelf)?;
         let doc: Value = serde_yaml::from_str(&text)
             .map_err(|e| format!("{raw} is not a document this can read: {e}"))?;
         let mut here = &doc;
@@ -479,9 +464,10 @@ impl Benches {
         raw: &str,
         at: &[&str],
         value: &str,
+        shelf: &dyn Shelf,
     ) -> Result<String, String> {
-        let (key, _) = self.doc(raw)?;
-        let text = self.read(body, raw)?;
+        let key = self.doc(raw)?;
+        let text = self.read(body, raw, shelf)?;
         let mut doc: Map<String, Value> = serde_yaml::from_str(&text)
             .map_err(|e| format!("{key} is not a document this can change: {e}"))?;
 
@@ -503,26 +489,33 @@ impl Benches {
                  what somebody wrote around the parts that matter."
             )
         })?;
-        self.write(body, about, &key, &next)
+        self.write(body, about, &key, &next, shelf)
     }
 
-    /// Take a document out. It goes from the disk when this is committed.
-    pub fn remove(&mut self, body: &str, about: &str, raw: &str) -> Result<String, String> {
-        let (key, full) = self.doc(raw)?;
+    /// Take a document out. It goes from the shelf when this is committed.
+    pub fn remove(
+        &mut self,
+        body: &str,
+        about: &str,
+        raw: &str,
+        shelf: &dyn Shelf,
+    ) -> Result<String, String> {
+        let key = self.doc(raw)?;
         let held = self
             .open
             .get(body)
             .and_then(|w| w.files.get(&key))
             .map(|c| c.now.is_some());
+        let standing = shelf.read(&key);
         let there = match held {
             Some(present) => present,
-            None => full.exists(),
+            None => standing.is_some(),
         };
         if !there {
-            return Err(no_document(&key, &full));
+            return Err(self.missing(&key, shelf));
         }
         let fresh = held.is_none();
-        let base = fresh.then(|| on_disk(&full)).flatten();
+        let base = fresh.then_some(standing).flatten();
         let w = self.working(body, about);
         match w.files.get_mut(&key) {
             Some(c) => c.now = None,
@@ -535,8 +528,8 @@ impl Benches {
 
     /// What documents are in a place, as this body has them — including ones it
     /// has made and not committed, and without ones it has taken out.
-    pub fn list(&self, body: &str, raw: &str) -> Result<Vec<String>, String> {
-        let (key, full) = self.dir(raw)?;
+    pub fn list(&self, body: &str, raw: &str, shelf: &dyn Shelf) -> Result<Vec<String>, String> {
+        let key = self.dir(raw)?;
         let prefix = match key.is_empty() {
             true => String::new(),
             false => format!("{key}/"),
@@ -548,16 +541,7 @@ impl Benches {
         if key.is_empty() {
             return Ok(EDITABLE_AREAS.iter().map(|a| format!("{a}/")).collect());
         }
-        let mut names: BTreeSet<String> = BTreeSet::new();
-        if let Ok(entries) = std::fs::read_dir(&full) {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                match e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    true => names.insert(format!("{name}/")),
-                    false => names.insert(name),
-                };
-            }
-        }
+        let mut names = shelf.list(&key);
         if let Some(w) = self.open.get(body) {
             for (path, c) in &w.files {
                 let Some(rest) = path.strip_prefix(&prefix) else {
@@ -645,13 +629,14 @@ impl Benches {
         }
     }
 
-    /// Write everything this body has changed, all at once.
+    /// Record everything this body has changed onto its `shelf`, all at once.
     ///
-    /// The check runs over every document before anything is written, so a
+    /// The check runs over every document before anything is recorded, so a
     /// collision on the last of six leaves the first five untouched and the
     /// working set intact — the character still has all of its work, and a
-    /// person to talk to about it.
-    pub fn commit(&mut self, body: &str) -> Result<Vec<String>, String> {
+    /// person to talk to about it. A shelf that takes no commit — the
+    /// published mind — refuses the lot, and the working set stays.
+    pub fn commit(&mut self, body: &str, shelf: &dyn Shelf) -> Result<Vec<String>, String> {
         let Some(w) = self.open.get(body) else {
             return Err("You have nothing open.".into());
         };
@@ -670,13 +655,13 @@ impl Benches {
         }
 
         for (key, c) in &changed {
-            let (_, full) = self.doc(key)?;
+            self.doc(key)?;
             // **Nobody collides with themselves.** A reviewer back from a
             // restart with its working copy restored was refused its commit
             // because the document had "moved under" it — and the hand named
             // was its own.
             let own = self.last.get(key).is_some_and(|who| who == body);
-            if on_disk(&full) != c.base && !own {
+            if shelf.read(key) != c.base && !own {
                 return Err(match self.last.get(key) {
                     Some(who) => format!(
                         "{key} has moved under you — {who} committed over the same ground while \
@@ -687,32 +672,29 @@ impl Benches {
             }
         }
 
-        let mut written = Vec::with_capacity(changed.len());
-        for (key, c) in &changed {
-            let (_, full) = self.doc(key)?;
-            match &c.now {
-                Some(text) => put(&full, text)?,
-                None => {
-                    std::fs::remove_file(&full).map_err(|e| format!("{key} would not go: {e}"))?
-                }
-            }
+        let changes: Vec<(String, Option<String>)> = changed
+            .iter()
+            .map(|(key, c)| (key.clone(), c.now.clone()))
+            .collect();
+        shelf.commit(&changes)?;
+        let written: Vec<String> = changed.into_iter().map(|(key, _)| key).collect();
+        for key in &written {
             self.last.insert(key.clone(), body.to_string());
-            written.push(key.clone());
         }
         self.open.remove(body);
         Ok(written)
     }
 
-    /// Take what is on disk now as the base of every open or set-aside change
-    /// to `raw` — for the engine's own clerical rewrite of a document
-    /// (`gates::tidy_on_disk`), which is nobody's commit and must not read as
-    /// one: a working copy opened before it would otherwise be refused at its
-    /// commit for a change nobody made.
-    pub fn rebase(&mut self, raw: &str) {
-        let Ok((key, full)) = self.doc(raw) else {
+    /// Take what stands on `shelf` now as the base of every open or set-aside
+    /// change to `raw` — for the engine's own clerical rewrite of a document
+    /// (`gates::tidy`), which is nobody's commit and must not read as one: a
+    /// working copy opened before it would otherwise be refused at its commit
+    /// for a change nobody made.
+    pub fn rebase(&mut self, raw: &str, shelf: &dyn Shelf) {
+        let Ok(key) = self.doc(raw) else {
             return;
         };
-        let now = on_disk(&full);
+        let now = shelf.read(&key);
         for working in self.open.values_mut().chain(self.stashed.values_mut()) {
             if let Some(c) = working.files.get_mut(&key) {
                 c.base = now.clone();
@@ -733,7 +715,7 @@ impl Benches {
 /// another document *inside* it resolves cleanly and would silently redirect a
 /// read to a file the character did not name. The console's editor
 /// ([`crate::mind::doc`]) refuses links outright for the same reason, and a
-/// bench that did not would be the weaker of two doors into one tree.
+/// shelf that did not would be the weaker of two doors into one tree.
 ///
 /// A path that is not there yet is not a link, which is the ordinary case for
 /// creating a document.
@@ -743,7 +725,7 @@ impl Benches {
 /// actually create there — `mklink /J` needs no Developer Mode where
 /// `mklink` does — so testing only `is_symlink` would leave the reachable half
 /// of the hazard unguarded on the platform this daemon runs on.
-fn refuse_link(full: &Path, raw: &str) -> Result<(), String> {
+pub(crate) fn refuse_link(full: &Path, raw: &str) -> Result<(), String> {
     let Ok(meta) = full.symlink_metadata() else {
         return Ok(());
     };
@@ -847,1024 +829,5 @@ fn numbered_excerpt(path: &str, content: &str, start_line: usize) -> String {
     format!("\n{path} ({range}):\n\n```{tag}\n{numbered}```\n")
 }
 
-/// What a file holds, or nothing when it is not there.
-///
-/// A file that exists and cannot be read is `None` on purpose: it is not the
-/// base this working set was built on either way, so the commit check refuses
-/// rather than writing over something it could not see.
-fn on_disk(full: &Path) -> Option<String> {
-    std::fs::read_to_string(full).ok()
-}
-
-/// Write a document, making its directory if it is new.
-///
-/// Through a temporary and a rename, because the obvious spelling truncates
-/// before it writes: a machine that dies in that window leaves the document
-/// gone rather than merely unchanged, and on NTFS it can leave one of the right
-/// length full of NULs. A rename either happened or did not.
-fn put(full: &Path, text: &str) -> Result<(), String> {
-    if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("{} would not open: {e}", parent.display()))?;
-    }
-    let tmp = full.with_extension("npcd-writing");
-    std::fs::write(&tmp, text).map_err(|e| format!("{} would not write: {e}", full.display()))?;
-    std::fs::rename(&tmp, full).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{} would not land: {e}", full.display())
-    })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A root with two documents in it, at a path unique to this test.
-    fn rooted(name: &str) -> (Benches, PathBuf) {
-        let root = std::env::temp_dir().join(format!("npcd-bench-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("layers/eras")).unwrap();
-        std::fs::write(
-            root.join("layers/eras/third.md"),
-            "the third era\nburned in the spring\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("layers/eras/fourth.md"), "the fourth era\n").unwrap();
-        let mut b = Benches::new();
-        b.set_root(&root);
-        (b, root)
-    }
-
-    /// **A working copy comes back through a save and a restore**, under the
-    /// root the restoring daemon was given rather than the saved one.
-    #[test]
-    fn uncommitted_work_survives_a_save_and_restore() {
-        let (mut b, root) = rooted("restore");
-        b.write("m1", "the third era", "layers/eras/third.md", "rewritten\n")
-            .unwrap();
-        let saved: Benches = serde_json::from_value(serde_json::to_value(&b).unwrap()).unwrap();
-
-        let (mut fresh, fresh_root) = rooted("restore-fresh");
-        fresh.restore(saved);
-        assert_eq!(fresh.mind_root(), Some(fresh_root.as_path()));
-        assert_eq!(
-            fresh.read("m1", "layers/eras/third.md").unwrap(),
-            "rewritten\n"
-        );
-        assert_eq!(
-            fresh.opened("m1").unwrap().changed(),
-            [&"layers/eras/third.md".to_string()]
-        );
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(fresh_root);
-    }
-
-    #[test]
-    fn a_world_with_no_root_has_no_documents_and_says_so() {
-        let mut b = Benches::new();
-        assert!(!b.has_root());
-        let err = b.read("m1", "layers/eras/third.md").unwrap_err();
-        assert!(err.contains("no documents"), "{err}");
-        assert!(b.write("m1", "x", "layers/eras/third.md", "…").is_err());
-        assert!(b.list("m1", "layers/eras").is_err());
-    }
-
-    /// **A retired document leaves the record for `rejected/`**, and anybody's
-    /// open change to it goes with it.
-    #[test]
-    fn a_retired_document_moves_aside_out_of_the_record() {
-        let (mut b, root) = rooted("retire");
-        b.write("m2", "x", "layers/eras/third.md", "set aside")
-            .unwrap();
-        assert!(b.stash("m2"));
-        b.write("m1", "x", "layers/eras/third.md", "an edit")
-            .unwrap();
-        let to = b
-            .retire("layers/eras/third.md", "operation-iron-lantern")
-            .unwrap();
-        assert_eq!(to, "rejected/operation-iron-lantern/third.md");
-        assert!(!root.join("layers/eras/third.md").exists());
-        assert!(root.join(&to).is_file());
-        assert!(b.opened("m1").is_none_or(|w| w.changed().is_empty()));
-        // A stash brought back carries nothing of it to commit.
-        let _ = b.pop("m2");
-        assert!(b.opened("m2").is_none_or(|w| w.changed().is_empty()));
-        assert!(b.retire("layers/eras/third.md", "again").is_err());
-        assert_eq!(b.mind_root(), Some(root.as_path()));
-    }
-
-    /// **Nobody collides with themselves, nor with the engine's tidying.** A
-    /// body's own earlier commit, or a rebased clerical rewrite, is not a
-    /// change made under it; somebody else's commit still is.
-    #[test]
-    fn only_somebody_elses_commit_is_a_collision() {
-        let (mut b, root) = rooted("own-commit");
-        let path = "layers/eras/third.md";
-        b.write("m1", "x", path, "first pass\n").unwrap();
-        b.commit("m1").unwrap();
-        // It opens again, and its own earlier hand changes the file under it.
-        b.write("m1", "x", path, "second pass\n").unwrap();
-        std::fs::write(root.join(path), "first pass, tidied\n").unwrap();
-        assert!(b.commit("m1").is_ok(), "its own hand is no collision");
-
-        // The engine tidies under somebody else's open copy: rebased, it commits.
-        b.write("m2", "x", path, "a mend\n").unwrap();
-        std::fs::write(root.join(path), "second pass, tidied\n").unwrap();
-        b.rebase(path);
-        assert!(b.commit("m2").is_ok());
-
-        // Somebody else's commit under an open copy is still a collision.
-        b.write("m3", "x", path, "late\n").unwrap();
-        b.write("m1", "x", path, "first in\n").unwrap();
-        b.commit("m1").unwrap();
-        let e = b.commit("m3").unwrap_err();
-        assert!(e.contains("m1 committed over the same ground"), "{e}");
-    }
-
-    /// **A document put back says what it said, and nobody's change to it
-    /// survives.**
-    #[test]
-    fn a_document_put_back_says_what_it_said() {
-        let (mut b, root) = rooted("put-back");
-        b.write("m1", "x", "layers/eras/third.md", "a failed correction")
-            .unwrap();
-        b.commit("m1").unwrap();
-        b.write("m2", "x", "layers/eras/third.md", "more").unwrap();
-        assert_eq!(
-            b.put_back("layers/eras/third.md", "the third era\n"),
-            Ok("layers/eras/third.md".to_string())
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("layers/eras/third.md")).unwrap(),
-            "the third era\n"
-        );
-        assert!(b.opened("m2").is_none_or(|w| w.changed().is_empty()));
-    }
-
-    #[test]
-    fn a_read_falls_through_to_the_disk() {
-        let (b, _) = rooted("read");
-        let got = b.read("m1", "layers/eras/third.md").unwrap();
-        assert!(got.starts_with("the third era"), "{got}");
-    }
-
-    /// The whole point of the module: a write is invisible on the disk and
-    /// visible to its own author.
-    #[test]
-    fn a_write_stays_in_memory_until_it_is_committed() {
-        let (mut b, root) = rooted("memory");
-        b.write("m1", "the third era", "layers/eras/third.md", "rewritten\n")
-            .unwrap();
-
-        assert_eq!(b.read("m1", "layers/eras/third.md").unwrap(), "rewritten\n");
-        assert_eq!(
-            std::fs::read_to_string(root.join("layers/eras/third.md")).unwrap(),
-            "the third era\nburned in the spring\n",
-            "the disk moved before the commit"
-        );
-        // And invisible to anybody else, which is what makes it *yours*.
-        assert!(b
-            .read("m2", "layers/eras/third.md")
-            .unwrap()
-            .starts_with("the third era"));
-
-        b.commit("m1").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.join("layers/eras/third.md")).unwrap(),
-            "rewritten\n"
-        );
-    }
-
-    #[test]
-    fn committing_clears_the_working_set_and_names_what_it_wrote() {
-        let (mut b, _) = rooted("clears");
-        b.write("m1", "layers/eras", "layers/eras/third.md", "a\n")
-            .unwrap();
-        b.write("m1", "layers/eras", "layers/eras/fourth.md", "b\n")
-            .unwrap();
-        let written = b.commit("m1").unwrap();
-        assert_eq!(
-            written,
-            vec!["layers/eras/fourth.md", "layers/eras/third.md"]
-        );
-        assert!(b.opened("m1").is_none());
-        assert!(b.diff("m1").is_empty());
-    }
-
-    #[test]
-    fn a_new_document_is_created_with_its_directory() {
-        let (mut b, root) = rooted("create");
-        b.write(
-            "m1",
-            "a silence",
-            "layers/stories/deep/new.md",
-            "a night at the gate\n",
-        )
-        .unwrap();
-        b.commit("m1").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.join("layers/stories/deep/new.md")).unwrap(),
-            "a night at the gate\n"
-        );
-    }
-
-    #[test]
-    fn removing_a_document_takes_it_off_the_disk_at_the_commit() {
-        let (mut b, root) = rooted("remove");
-        b.remove("m1", "layers/eras", "layers/eras/fourth.md")
-            .unwrap();
-        assert!(
-            root.join("layers/eras/fourth.md").exists(),
-            "gone before the commit"
-        );
-        assert!(b
-            .read("m1", "layers/eras/fourth.md")
-            .unwrap_err()
-            .contains("taken"));
-        b.commit("m1").unwrap();
-        assert!(!root.join("layers/eras/fourth.md").exists());
-    }
-
-    #[test]
-    fn removing_something_that_is_not_there_is_refused() {
-        let (mut b, _) = rooted("remove-absent");
-        assert!(b.remove("m1", "x", "layers/eras/never.md").is_err());
-    }
-
-    // ── the uniqueness rule ─────────────────────────────────────────────────
-
-    #[test]
-    fn an_edit_replaces_the_one_place_its_target_appears() {
-        let (mut b, _) = rooted("edit-one");
-        b.edit(
-            "m1",
-            "layers/eras",
-            "layers/eras/third.md",
-            "spring",
-            "autumn",
-        )
-        .unwrap();
-        assert_eq!(
-            b.read("m1", "layers/eras/third.md").unwrap(),
-            "the third era\nburned in the autumn\n"
-        );
-    }
-
-    /// An ambiguous edit is the one that silently does the wrong thing, so it
-    /// is refused and says how many it found.
-    #[test]
-    fn an_edit_whose_target_appears_twice_is_refused_and_counts_them() {
-        let (mut b, root) = rooted("edit-two");
-        std::fs::write(root.join("layers/eras/third.md"), "a fire\nand a fire\n").unwrap();
-        let err = b
-            .edit(
-                "m1",
-                "layers/eras",
-                "layers/eras/third.md",
-                "a fire",
-                "a flood",
-            )
-            .unwrap_err();
-        assert!(err.contains('2'), "{err}");
-        assert!(
-            b.opened("m1").is_none_or(|w| w.is_empty()),
-            "a refused edit still landed"
-        );
-    }
-
-    #[test]
-    fn an_edit_whose_target_is_not_there_is_refused() {
-        let (mut b, _) = rooted("edit-none");
-        let err = b
-            .edit(
-                "m1",
-                "layers/eras",
-                "layers/eras/third.md",
-                "a flood",
-                "a fire",
-            )
-            .unwrap_err();
-        assert!(err.contains("does not appear"), "{err}");
-        // **And it is shown what is there** — the text the next edit has to
-        // quote, including this working set's own earlier changes.
-        assert!(
-            err.ends_with(
-                "If you meant to replace the whole piece, write it whole again rather than \
-                 editing it. It says, as it stands now:\n\nthe third era\nburned in the spring"
-            ),
-            "{err}"
-        );
-    }
-
-    /// A document too long to hand back whole is pointed at, not pasted.
-    #[test]
-    fn a_long_document_is_not_pasted_into_a_refusal() {
-        let long = "word ".repeat(SHOWN_WHOLE + 1);
-        let err = not_there("layers/eras/third.md", &long);
-        assert!(err.ends_with("Otherwise read it back first."), "{err}");
-        assert!(
-            err.contains("write it whole again rather than editing it"),
-            "{err}"
-        );
-        assert!(not_there("layers/eras/third.md", "").ends_with("write it whole first."));
-    }
-
-    #[test]
-    fn replacing_the_empty_string_is_refused() {
-        let (mut b, _) = rooted("edit-empty");
-        assert!(b
-            .edit("m1", "layers/eras", "layers/eras/third.md", "", "x")
-            .is_err());
-    }
-
-    /// Edits compound in memory: the second reads the first's result, not the
-    /// disk's.
-    #[test]
-    fn a_second_edit_sees_the_first() {
-        let (mut b, _) = rooted("edit-compound");
-        b.edit(
-            "m1",
-            "layers/eras",
-            "layers/eras/third.md",
-            "third",
-            "thirteenth",
-        )
-        .unwrap();
-        b.edit(
-            "m1",
-            "layers/eras",
-            "layers/eras/third.md",
-            "spring",
-            "autumn",
-        )
-        .unwrap();
-        assert_eq!(
-            b.read("m1", "layers/eras/third.md").unwrap(),
-            "the thirteenth era\nburned in the autumn\n"
-        );
-    }
-
-    // ── collisions ──────────────────────────────────────────────────────────
-
-    /// The act somebody else's work can refuse, and the refusal names them.
-    #[test]
-    fn a_commit_over_somebody_elses_commit_is_refused_and_names_them() {
-        let (mut b, _) = rooted("collide");
-        b.write("m1", "layers/eras", "layers/eras/third.md", "mine\n")
-            .unwrap();
-        b.write("m2", "layers/eras", "layers/eras/third.md", "mine too\n")
-            .unwrap();
-
-        assert_eq!(b.commit("m1").unwrap(), vec!["layers/eras/third.md"]);
-        let err = b.commit("m2").unwrap_err();
-        assert!(err.contains("m1"), "the other party was not named: {err}");
-        assert!(
-            b.opened("m2").is_some(),
-            "a refused commit threw the work away"
-        );
-    }
-
-    /// A refusal on one document leaves the others alone — the character still
-    /// has every change it made.
-    #[test]
-    fn a_collision_writes_none_of_the_batch() {
-        let (mut b, root) = rooted("collide-batch");
-        b.write("m1", "layers/eras", "layers/eras/fourth.md", "safe\n")
-            .unwrap();
-        b.write("m1", "layers/eras", "layers/eras/third.md", "contested\n")
-            .unwrap();
-        // Somebody else moves one of the two under it.
-        std::fs::write(root.join("layers/eras/third.md"), "theirs\n").unwrap();
-
-        assert!(b.commit("m1").is_err());
-        assert_eq!(
-            std::fs::read_to_string(root.join("layers/eras/fourth.md")).unwrap(),
-            "the fourth era\n",
-            "the uncontested half was written anyway"
-        );
-        assert_eq!(b.diff("m1").len(), 2, "the working set did not survive");
-    }
-
-    /// Two bodies on different documents are not each other's business.
-    #[test]
-    fn two_bodies_on_different_documents_both_commit() {
-        let (mut b, _) = rooted("parallel");
-        b.write("m1", "layers/eras", "layers/eras/third.md", "a\n")
-            .unwrap();
-        b.write("m2", "layers/eras", "layers/eras/fourth.md", "b\n")
-            .unwrap();
-        assert!(b.commit("m1").is_ok());
-        assert!(b.commit("m2").is_ok(), "an unrelated document collided");
-    }
-
-    /// A write that says exactly what the file already said is not a change,
-    /// and must not manufacture a collision for somebody else.
-    #[test]
-    fn writing_what_is_already_there_changes_nothing() {
-        let (mut b, _) = rooted("noop");
-        b.write(
-            "m1",
-            "layers/eras",
-            "layers/eras/fourth.md",
-            "the fourth era\n",
-        )
-        .unwrap();
-        assert!(b.diff("m1").is_empty());
-        assert!(b.commit("m1").unwrap().is_empty());
-    }
-
-    // ── the working loop ────────────────────────────────────────────────────
-
-    #[test]
-    fn setting_aside_keeps_the_work_and_picking_it_up_restores_it() {
-        let (mut b, _) = rooted("stash");
-        b.write("m1", "the third era", "layers/eras/third.md", "half done\n")
-            .unwrap();
-        assert!(b.stash("m1"));
-        assert!(b.diff("m1").is_empty(), "set-aside work is still open");
-        assert!(b
-            .read("m1", "layers/eras/third.md")
-            .unwrap()
-            .starts_with("the third era"));
-
-        assert_eq!(b.pop("m1").unwrap(), "the third era");
-        assert_eq!(b.read("m1", "layers/eras/third.md").unwrap(), "half done\n");
-    }
-
-    #[test]
-    fn picking_up_set_aside_work_over_live_changes_is_refused() {
-        let (mut b, _) = rooted("stash-bury");
-        b.write("m1", "the third era", "layers/eras/third.md", "first\n")
-            .unwrap();
-        b.stash("m1");
-        b.write("m1", "the fourth era", "layers/eras/fourth.md", "second\n")
-            .unwrap();
-        let err = b.pop("m1").unwrap_err();
-        assert!(err.contains("bury"), "{err}");
-        assert_eq!(b.read("m1", "layers/eras/fourth.md").unwrap(), "second\n");
-    }
-
-    #[test]
-    fn throwing_the_work_away_puts_the_document_back() {
-        let (mut b, _) = rooted("discard");
-        b.write(
-            "m1",
-            "layers/eras",
-            "layers/eras/third.md",
-            "wrong from the start\n",
-        )
-        .unwrap();
-        assert!(b.discard("m1"));
-        assert!(!b.discard("m1"), "threw away twice");
-        assert!(b
-            .read("m1", "layers/eras/third.md")
-            .unwrap()
-            .starts_with("the third era"));
-    }
-
-    #[test]
-    fn opening_a_second_thing_while_one_is_open_is_refused() {
-        let (mut b, _) = rooted("open-twice");
-        assert!(b.open_on("m1", "the third era").unwrap());
-        assert!(
-            !b.open_on("m1", "the third era").unwrap(),
-            "opened it twice"
-        );
-        let err = b.open_on("m1", "the fourth era").unwrap_err();
-        assert!(err.contains("the third era"), "{err}");
-    }
-
-    #[test]
-    fn offering_and_withdrawing_only_work_on_something_open() {
-        let (mut b, _) = rooted("offer");
-        assert!(!b.set_offered("m1", true));
-        b.open_on("m1", "the third era").unwrap();
-        assert!(b.set_offered("m1", true));
-        assert!(b.opened("m1").unwrap().offered);
-        assert!(b.set_offered("m1", false));
-        assert!(!b.opened("m1").unwrap().offered);
-    }
-
-    #[test]
-    fn a_diff_names_what_kind_of_change_each_one_is() {
-        let (mut b, _) = rooted("diff");
-        b.write("m1", "layers/eras", "layers/eras/third.md", "changed\n")
-            .unwrap();
-        b.write("m1", "layers/eras", "layers/eras/new.md", "made\n")
-            .unwrap();
-        b.remove("m1", "layers/eras", "layers/eras/fourth.md")
-            .unwrap();
-        assert_eq!(
-            b.diff("m1"),
-            vec![
-                "layers/eras/fourth.md (gone)",
-                "layers/eras/new.md (new)",
-                "layers/eras/third.md (changed)",
-            ]
-        );
-    }
-
-    // ── listing ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn a_listing_shows_the_disk_plus_your_own_uncommitted_work() {
-        let (mut b, _) = rooted("list");
-        assert_eq!(
-            b.list("m1", "layers/eras").unwrap(),
-            vec!["fourth.md", "third.md"]
-        );
-        // The root lists the areas that can be worked in, not the mind's own
-        // configuration sitting beside them.
-        assert_eq!(
-            b.list("m1", "").unwrap(),
-            EDITABLE_AREAS
-                .iter()
-                .map(|a| format!("{a}/"))
-                .collect::<Vec<_>>()
-        );
-
-        b.write("m1", "layers/eras", "layers/eras/fifth.md", "new\n")
-            .unwrap();
-        b.remove("m1", "layers/eras", "layers/eras/fourth.md")
-            .unwrap();
-        assert_eq!(
-            b.list("m1", "layers/eras").unwrap(),
-            vec!["fifth.md", "third.md"]
-        );
-        // …and nobody else's view moved.
-        assert_eq!(
-            b.list("m2", "layers/eras").unwrap(),
-            vec!["fourth.md", "third.md"]
-        );
-    }
-
-    /// A listing of one directory does not leak the ones below it.
-    #[test]
-    fn a_listing_stops_at_its_own_directory() {
-        let (mut b, _) = rooted("list-depth");
-        b.write("m1", "x", "layers/eras/deep/buried.md", "…")
-            .unwrap();
-        assert!(!b
-            .list("m1", "layers/eras")
-            .unwrap()
-            .contains(&"buried.md".to_string()));
-        assert_eq!(b.list("m1", "layers/eras/deep").unwrap(), vec!["buried.md"]);
-    }
-
-    // ── the path guard ──────────────────────────────────────────────────────
-
-    /// The paths here are written by a language model, so every spelling of
-    /// "leave the directory" has to be refused on the way in.
-    #[test]
-    fn a_path_that_leaves_the_root_is_refused_by_every_act() {
-        let (mut b, root) = rooted("escape");
-        for bad in [
-            "../secrets.md",
-            "layers/eras/../../secrets.md",
-            "c:/windows/system.md",
-            r"..\..\secrets.md",
-            "layers/eras/a\0b.md",
-        ] {
-            assert!(b.read("m1", bad).is_err(), "read {bad}");
-            assert!(b.write("m1", "x", bad, "owned").is_err(), "write {bad}");
-            assert!(b.remove("m1", "x", bad).is_err(), "remove {bad}");
-        }
-        assert!(!root.parent().unwrap().join("secrets.md").exists());
-    }
-
-    /// The mind holds `.md` and `.yaml`. Anything else is not a document a
-    /// bench writes, and letting one through would put an executable into a
-    /// directory the daemon reads.
-    #[test]
-    fn only_text_documents_can_be_written() {
-        let (mut b, _) = rooted("ext");
-        for bad in ["layers/eras/x.exe", "layers/eras/x.png", "layers/eras/x"] {
-            assert!(b.write("m1", "x", bad, "…").is_err(), "{bad}");
-        }
-        assert!(b.write("m1", "x", "layers/eras/x.yaml", "a: 1\n").is_ok());
-    }
-
-    // ── links ───────────────────────────────────────────────────────────────
-
-    /// Make a symlink, or `false` where the OS will not allow one.
-    ///
-    /// Windows needs Developer Mode or an elevated process, so the tests below
-    /// say out loud when the link half did not run. A silent skip that reads as
-    /// a pass is worse than no test at all.
-    fn try_symlink(target: &Path, link: &Path) -> bool {
-        #[cfg(windows)]
-        {
-            std::os::windows::fs::symlink_file(target, link).is_ok()
-        }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(target, link).is_ok()
-        }
-    }
-
-    /// Make a directory link, by the one route Windows allows unprivileged.
-    ///
-    /// `mklink /J` makes a junction without Developer Mode, where every symlink
-    /// API needs it. Shelling out in a test is worth it here because this is
-    /// the *only* redirection reachable on the platform the daemon runs on, and
-    /// a guard whose reachable case is untested is a guard nobody has checked.
-    fn try_dir_link(target: &Path, link: &Path) -> bool {
-        #[cfg(windows)]
-        {
-            if std::os::windows::fs::symlink_dir(target, link).is_ok() {
-                return true;
-            }
-            std::process::Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
-                .arg(link)
-                .arg(target)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(target, link).is_ok()
-        }
-    }
-
-    /// **The case that actually runs on Windows.** A junction redirects a whole
-    /// directory, so a listing walked through one would report documents from
-    /// somewhere the character never named.
-    #[test]
-    fn a_directory_link_is_refused_rather_than_walked() {
-        let (b, root) = rooted("junction");
-        if !try_dir_link(&root.join("layers/eras"), &root.join("layers/alias")) {
-            eprintln!("SKIPPED: this OS would not create a directory link");
-            return;
-        }
-        let err = b.list("m1", "layers/alias").unwrap_err();
-        assert!(
-            err.contains("link"),
-            "a listing walked through a junction: {err}"
-        );
-        // The real directory is still readable — the guard is about the link,
-        // not about the documents behind it.
-        assert_eq!(
-            b.list("m1", "layers/eras").unwrap(),
-            vec!["fourth.md", "third.md"]
-        );
-    }
-
-    /// A link pointing **out** of the root is caught by containment — resolving
-    /// it lands outside and the path is refused.
-    #[test]
-    fn a_link_out_of_the_root_cannot_be_read_through() {
-        let (b, root) = rooted("link-out");
-        let outside = root
-            .parent()
-            .unwrap()
-            .join(format!("npcd-bench-outside-{}.md", std::process::id()));
-        std::fs::write(&outside, "not yours\n").unwrap();
-        if !try_symlink(&outside, &root.join("layers/eras/out.md")) {
-            eprintln!("SKIPPED the link half: this OS would not create a symlink");
-            return;
-        }
-        let got = b.read("m1", "layers/eras/out.md");
-        assert!(got.is_err(), "read straight through a link out of the root");
-        assert!(
-            !got.unwrap_or_default().contains("not yours"),
-            "content from outside the root came back"
-        );
-    }
-
-    /// A link pointing **inside** the root resolves cleanly, so containment
-    /// says nothing about it — and it would still redirect a read to a document
-    /// the character did not name. This is the case the leaf check is for.
-    #[test]
-    fn a_link_inside_the_root_is_refused_rather_than_followed() {
-        let (mut b, root) = rooted("link-in");
-        if !try_symlink(
-            &root.join("layers/eras/third.md"),
-            &root.join("layers/eras/alias.md"),
-        ) {
-            eprintln!("SKIPPED the link half: this OS would not create a symlink");
-            return;
-        }
-        let err = b.read("m1", "layers/eras/alias.md").unwrap_err();
-        assert!(err.contains("link"), "{err}");
-        assert!(b.write("m1", "x", "layers/eras/alias.md", "…").is_err());
-        assert!(b.remove("m1", "x", "layers/eras/alias.md").is_err());
-        // …and the document it pointed at is untouched.
-        assert!(b
-            .read("m1", "layers/eras/third.md")
-            .unwrap()
-            .starts_with("the third era"));
-    }
-
-    // ── the read cap ────────────────────────────────────────────────────────
-
-    /// A document of `n` numbered lines, for exercising the cap.
-    fn long_document(root: &Path, lines: usize) {
-        let body: String = (1..=lines).map(|i| format!("line {i}\n")).collect();
-        std::fs::write(root.join("layers/eras/long.md"), body).unwrap();
-    }
-
-    /// **An uncapped read is a context hazard.** A tool result lands in the
-    /// conversation verbatim, so one long document would fill a character's
-    /// whole window and push out the turns that gave it a reason to read.
-    #[test]
-    fn a_read_returns_at_most_the_capped_number_of_lines() {
-        let (b, root) = rooted("cap");
-        long_document(&root, 900);
-        let out = b.excerpt("m1", "layers/eras/long.md", 1).unwrap();
-        assert!(out.contains("(lines 1-200 of 900)"), "{out}");
-        assert!(out.contains("  line 1\n"), "{out}");
-        assert!(out.contains("line 200"), "{out}");
-        assert!(!out.contains("line 201"), "the cap did not hold");
-    }
-
-    /// The header names the absolute range, so the next read asks for the next
-    /// line directly rather than having to work it out.
-    #[test]
-    fn a_read_continues_from_the_line_it_is_given() {
-        let (b, root) = rooted("cap-continue");
-        long_document(&root, 900);
-        let out = b.excerpt("m1", "layers/eras/long.md", 201).unwrap();
-        assert!(out.contains("(lines 201-400 of 900)"), "{out}");
-        assert!(out.contains("line 201"), "{out}");
-        assert!(!out.contains("  line 200\n"), "{out}");
-    }
-
-    /// The last page drops the `of n`, which is how a reader knows it has the
-    /// end and not another 200 waiting.
-    #[test]
-    fn the_last_page_says_it_is_the_last() {
-        let (b, root) = rooted("cap-last");
-        long_document(&root, 250);
-        let out = b.excerpt("m1", "layers/eras/long.md", 201).unwrap();
-        assert!(out.contains("(lines 201-250)"), "{out}");
-        assert!(!out.contains(" of 250"), "{out}");
-    }
-
-    /// A start past the end reads the last line rather than coming back empty,
-    /// which a model reads as "the document is empty" and then acts on.
-    #[test]
-    fn a_start_past_the_end_reads_the_end() {
-        let (b, root) = rooted("cap-past");
-        long_document(&root, 10);
-        let out = b.excerpt("m1", "layers/eras/long.md", 9_999).unwrap();
-        assert!(out.contains("line 10"), "{out}");
-    }
-
-    #[test]
-    fn a_short_document_comes_back_whole_and_numbered() {
-        let (b, _) = rooted("excerpt");
-        let out = b.excerpt("m1", "layers/eras/third.md", 1).unwrap();
-        assert_eq!(
-            out,
-            "\nlayers/eras/third.md (lines 1-2):\n\n```markdown\n1  the third era\n2  burned in the spring\n```\n"
-        );
-    }
-
-    #[test]
-    fn an_empty_document_says_so_rather_than_naming_a_range() {
-        let (b, root) = rooted("excerpt-empty");
-        std::fs::write(root.join("layers/eras/blank.md"), "").unwrap();
-        let out = b.excerpt("m1", "layers/eras/blank.md", 1).unwrap();
-        assert!(out.contains("(empty)"), "{out}");
-        assert!(
-            !out.contains("lines 1-0"),
-            "a range that reads as a bug: {out}"
-        );
-    }
-
-    /// The excerpt shows the reader's own uncommitted work, like a plain read.
-    #[test]
-    fn an_excerpt_shows_your_own_changes() {
-        let (mut b, _) = rooted("excerpt-mine");
-        b.write("m1", "x", "layers/eras/third.md", "one\ntwo\nthree\n")
-            .unwrap();
-        let mine = b.excerpt("m1", "layers/eras/third.md", 1).unwrap();
-        assert!(mine.contains("3  three"), "{mine}");
-        let theirs = b.excerpt("m2", "layers/eras/third.md", 1).unwrap();
-        assert!(theirs.contains("burned in the spring"), "{theirs}");
-    }
-
-    /// The numbering is right-aligned to the widest number in the range, which
-    /// is what keeps the text column straight across a page boundary.
-    #[test]
-    fn line_numbers_are_aligned_to_the_widest_in_the_range() {
-        let (b, root) = rooted("align");
-        long_document(&root, 120);
-        let out = b.excerpt("m1", "layers/eras/long.md", 1).unwrap();
-        assert!(out.contains("\n  1  line 1\n"), "{out}");
-        assert!(out.contains("\n120  line 120\n"), "{out}");
-    }
-
-    /// An edit matches the document, not its rendering — numbering the text and
-    /// then searching it would never find anything.
-    #[test]
-    fn an_edit_matches_the_document_and_not_its_numbering() {
-        let (mut b, _) = rooted("raw");
-        b.edit(
-            "m1",
-            "x",
-            "layers/eras/third.md",
-            "the third era",
-            "the fourth era",
-        )
-        .unwrap();
-        assert!(b
-            .read("m1", "layers/eras/third.md")
-            .unwrap()
-            .starts_with("the fourth era"));
-    }
-
-    // ── isolation ───────────────────────────────────────────────────────────
-
-    /// **No uncommitted change is visible to anybody but the body that made
-    /// it.** Every mutating act, run by two bodies over the same documents at
-    /// once, with each one's view asserted after every step.
-    ///
-    /// The workspace is keyed by body and every entry point takes one, so this
-    /// holds by construction — but "by construction" is exactly the claim that
-    /// stops being true the first time somebody adds a method and forgets the
-    /// argument, and the failure would be one character reading another's
-    /// half-finished work as though it were canon.
-    #[test]
-    fn nothing_uncommitted_leaks_between_bodies() {
-        let (mut b, root) = rooted("isolation");
-        std::fs::write(root.join("layers/eras/shared.md"), "as it stands\n").unwrap();
-
-        // Both open work on the same thing, and both change the same document.
-        assert!(b.open_on("m1", "the third era").unwrap());
-        assert!(b.open_on("m2", "the third era").unwrap());
-        b.write(
-            "m1",
-            "the third era",
-            "layers/eras/shared.md",
-            "m1's version\n",
-        )
-        .unwrap();
-        b.write(
-            "m2",
-            "the third era",
-            "layers/eras/shared.md",
-            "m2's version\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            b.read("m1", "layers/eras/shared.md").unwrap(),
-            "m1's version\n"
-        );
-        assert_eq!(
-            b.read("m2", "layers/eras/shared.md").unwrap(),
-            "m2's version\n"
-        );
-        assert_eq!(
-            b.read("m3", "layers/eras/shared.md").unwrap(),
-            "as it stands\n",
-            "an uninvolved body saw somebody's draft"
-        );
-
-        // An edit compounds only on its own author's version.
-        b.edit(
-            "m1",
-            "x",
-            "layers/eras/shared.md",
-            "m1's",
-            "m1 has edited its",
-        )
-        .unwrap();
-        assert_eq!(
-            b.read("m2", "layers/eras/shared.md").unwrap(),
-            "m2's version\n"
-        );
-
-        // A creation is invisible, and so is a removal.
-        b.write("m1", "x", "layers/eras/mine.md", "only m1 has this\n")
-            .unwrap();
-        b.remove("m2", "x", "layers/eras/fourth.md").unwrap();
-        assert!(
-            b.read("m2", "layers/eras/mine.md").is_err(),
-            "a new document leaked"
-        );
-        assert!(
-            b.read("m1", "layers/eras/fourth.md").is_ok(),
-            "a removal leaked"
-        );
-        assert!(b
-            .list("m2", "layers/eras")
-            .unwrap()
-            .iter()
-            .all(|n| n != "mine.md"));
-        assert!(b
-            .list("m1", "layers/eras")
-            .unwrap()
-            .iter()
-            .any(|n| n == "fourth.md"));
-
-        // Diffs, excerpts and offers are each their own body's.
-        assert!(b.diff("m1").iter().any(|d| d.contains("mine.md")));
-        assert!(b.diff("m2").iter().all(|d| !d.contains("mine.md")));
-        assert!(b
-            .excerpt("m1", "layers/eras/shared.md", 1)
-            .unwrap()
-            .contains("m1 has edited"));
-        assert!(b
-            .excerpt("m2", "layers/eras/shared.md", 1)
-            .unwrap()
-            .contains("m2's version"));
-        b.set_offered("m1", true);
-        assert!(b.opened("m1").unwrap().offered);
-        assert!(!b.opened("m2").unwrap().offered, "an offer leaked");
-
-        // Setting aside empties only one bench, and picking it up fills only it.
-        b.stash("m1");
-        assert!(b.diff("m1").is_empty());
-        assert!(!b.diff("m2").is_empty(), "the other bench was cleared too");
-        b.pop("m1").unwrap();
-        assert!(b.diff("m1").iter().any(|d| d.contains("mine.md")));
-
-        // Throwing one away leaves the other standing.
-        b.discard("m2");
-        assert!(b.diff("m2").is_empty());
-        assert!(
-            !b.diff("m1").is_empty(),
-            "one body's discard took another's work"
-        );
-
-        // And a commit publishes exactly one body's changes.
-        b.commit("m1").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.join("layers/eras/shared.md")).unwrap(),
-            "m1 has edited its version\n"
-        );
-        assert!(root.join("layers/eras/mine.md").exists());
-        assert!(
-            root.join("layers/eras/fourth.md").exists(),
-            "a discarded removal reached the disk"
-        );
-    }
-
-    /// The same, for the YAML field acts — they go through the working set too,
-    /// so a mood somebody is part-way through changing is not what anybody else
-    /// reads.
-    #[test]
-    fn a_half_changed_field_is_not_what_anybody_else_reads() {
-        let (mut b, root) = rooted("isolation-field");
-        std::fs::create_dir_all(root.join("moods")).unwrap();
-        std::fs::write(
-            root.join("moods/undone.yaml"),
-            "id: undone\n# why it reads this way\ndescription: As it stands.\n",
-        )
-        .unwrap();
-
-        b.write_field(
-            "m1",
-            "x",
-            "moods/undone.yaml",
-            &["description"],
-            "m1's wording.",
-        )
-        .unwrap();
-        assert_eq!(
-            b.read_field("m1", "moods/undone.yaml", &["description"])
-                .unwrap(),
-            "m1's wording."
-        );
-        assert_eq!(
-            b.read_field("m2", "moods/undone.yaml", &["description"])
-                .unwrap(),
-            "As it stands.",
-            "an uncommitted field change leaked"
-        );
-        assert!(std::fs::read_to_string(root.join("moods/undone.yaml"))
-            .unwrap()
-            .contains("As it stands."));
-    }
-
-    // ── determinism ─────────────────────────────────────────────────────────
-
-    /// The property the tool tests rest on: the same acts leave the same state.
-    #[test]
-    fn the_same_acts_leave_byte_identical_state() {
-        let build = |name: &str| {
-            let (mut b, _) = rooted(name);
-            b.open_on("m1", "the third era").unwrap();
-            b.write("m1", "the third era", "layers/eras/third.md", "a\n")
-                .unwrap();
-            b.write("m1", "the third era", "layers/eras/new.md", "b\n")
-                .unwrap();
-            b.remove("m1", "the third era", "layers/eras/fourth.md")
-                .unwrap();
-            b.set_offered("m1", true);
-            b
-        };
-        let (one, two) = (build("det-a"), build("det-b"));
-        // The roots differ by design; everything the acts produced does not.
-        assert_eq!(one.open, two.open);
-        assert_eq!(one.diff("m1"), two.diff("m1"));
-        assert_eq!(
-            serde_json::to_string(&one.open).unwrap(),
-            serde_json::to_string(&two.open).unwrap()
-        );
-    }
-}
+mod tests;

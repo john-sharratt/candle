@@ -18,7 +18,7 @@ use std::path::Path;
 use super::copied::BRIEF_COPIED;
 use super::gates::CHECKS;
 use super::target::Kind;
-use crate::engine::workflow::{parse_missions, By, Workflow};
+use crate::engine::workflow::{parse_missions, By, Workflow, PUBLISHED};
 
 /// The file a mind configures its table in.
 pub const FILE: &str = "missions.yaml";
@@ -31,7 +31,8 @@ pub const READING: &str = "reading";
 
 /// The checks a step's result may be held to beyond the gate's own
 /// ([`CHECKS`]): its document committed, changed from what the step found,
-/// not its brief copied ([`BRIEF_COPIED`]), and a rejection's evidence.
+/// not its brief copied ([`BRIEF_COPIED`]), a rejection's evidence, and its
+/// operation's store landed on the record ([`PUBLISHED`]).
 pub const COMMITTED: &str = "committed";
 pub const CHANGED: &str = "changed";
 pub const REJECTION_QUOTES: &str = "rejection-quotes-the-draft";
@@ -80,8 +81,15 @@ pub const PROPOSAL_CONTEXT: &[&str] = &[
     "names-taken",
 ];
 
-/// The acts a step may add to a Maker's own.
-pub const TOOLS: &[&str] = &["report_rejected"];
+/// The acts a step may add to a Maker's own: a rejection, and the merge
+/// table's, which a publish step works with (`docs/replicated_substrate.md`
+/// §10.3).
+pub const TOOLS: &[&str] = &["report_rejected", MERGE_STATUS, MERGE_SYNC, MERGE_PUBLISH];
+
+/// The merge table's acts.
+pub const MERGE_STATUS: &str = "merge_status";
+pub const MERGE_SYNC: &str = "merge_sync";
+pub const MERGE_PUBLISH: &str = "merge_publish";
 
 /// When a workflow's work is done: the year its event falls in, or the year
 /// the era its story tells opens — both what `canon::set_in` works out.
@@ -255,6 +263,7 @@ fn check_workflow(w: &Workflow) -> Result<(), String> {
             BRIEF_COPIED,
             REJECTION_QUOTES,
             REJECTION_NAMES_AN_ERA,
+            PUBLISHED,
         ])
         .collect();
     for s in &w.steps {

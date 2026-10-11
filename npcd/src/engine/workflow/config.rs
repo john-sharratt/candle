@@ -85,16 +85,16 @@ impl Edits {
     }
 }
 
-/// What becomes of an operation's document when the operation fails.
+/// What becomes of a failed operation's store (`docs/replicated_substrate.md`
+/// §10.3). A failed operation never reached the record — only its publish step
+/// puts anything there — so there is nothing to set aside or put back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnFailed {
-    /// It is moved out of the record and retired from memory.
-    SetAside,
-    /// It is put back as it was before the operation opened.
-    Restore,
-    /// It stays as it is.
+    /// The store is dropped.
     #[default]
+    Discard,
+    /// The store stays, unpublished, for an operator to reopen.
     Keep,
 }
 
@@ -102,13 +102,16 @@ impl OnFailed {
     /// The `on-failed:` value as written.
     pub fn parse(text: &str) -> Option<OnFailed> {
         match text {
-            "set-aside" => Some(OnFailed::SetAside),
-            "restore" => Some(OnFailed::Restore),
+            "discard" => Some(OnFailed::Discard),
             "keep" => Some(OnFailed::Keep),
             _ => None,
         }
     }
 }
+
+/// The check a publish step carries: it stands once its operation's store has
+/// landed on the record. Only a step with it leads to [`DONE`].
+pub const PUBLISHED: &str = "published";
 
 /// A step setting that is one value, or varies with the outcome that led into
 /// the step.
@@ -186,9 +189,15 @@ pub struct Step {
     pub stuck: String,
     /// How many stuck reports the step takes in one round before it routes.
     pub stuck_limit: u32,
+    /// Where this step is taken, when not at its workflow's desk.
+    pub desk: Option<String>,
 }
 
 impl Step {
+    /// Whether this is a publish step: it carries [`PUBLISHED`].
+    pub fn publishes(&self) -> bool {
+        self.checks.iter().any(|c| c == PUBLISHED)
+    }
     /// Where reporting `outcome` on this step leads, [`STUCK`] aside.
     ///
     /// A step with a single next step takes a plain completion (`None`); a
@@ -322,6 +331,7 @@ mod tests {
             context: Vec::new(),
             stuck: FAILED.to_string(),
             stuck_limit: STUCK_LIMIT,
+            desk: None,
         }
     }
 
@@ -406,10 +416,18 @@ mod tests {
         assert_eq!(Edits::parse("optional"), Some(Edits::Optional));
         assert_eq!(Edits::parse("maybe"), None);
         assert_eq!(Edits::default(), Edits::Optional);
-        assert_eq!(OnFailed::parse("set-aside"), Some(OnFailed::SetAside));
-        assert_eq!(OnFailed::parse("restore"), Some(OnFailed::Restore));
+        assert_eq!(OnFailed::parse("discard"), Some(OnFailed::Discard));
         assert_eq!(OnFailed::parse("keep"), Some(OnFailed::Keep));
-        assert_eq!(OnFailed::parse("set_aside"), None);
-        assert_eq!(OnFailed::default(), OnFailed::Keep);
+        assert_eq!(OnFailed::parse("set-aside"), None);
+        assert_eq!(OnFailed::parse("restore"), None);
+        assert_eq!(OnFailed::default(), OnFailed::Discard);
+    }
+
+    #[test]
+    fn a_step_publishes_when_it_carries_the_published_check() {
+        let mut s = step(By::Maker, Next::Single(DONE.to_string()));
+        assert!(!s.publishes());
+        s.checks.push(PUBLISHED.to_string());
+        assert!(s.publishes());
     }
 }
