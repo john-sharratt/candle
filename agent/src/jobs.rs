@@ -30,8 +30,8 @@ use tokio::sync::watch;
 use tokio::task::{spawn_blocking, AbortHandle};
 use tokio::time::timeout;
 use zend_vfs::{
-    BranchName, DiskWriteGrant, FetchSpec, JobId, JobRequest, JobStatus, Oid, Priority, RemoteName,
-    Rev, RunOutcome, SandboxCommand, VfsStore, ORIGIN,
+    BranchName, DiskWriteGrant, FetchBundle, FetchSpec, JobId, JobRequest, JobStatus, Oid,
+    Priority, RemoteName, Rev, RunOutcome, SandboxCommand, VfsStore, ORIGIN,
 };
 
 use crate::checkouts::{Checkout, Checkouts};
@@ -148,6 +148,12 @@ fn fetch_command(fetch: &FetchJob) -> Vec<String> {
     command
 }
 
+/// Whether a fetch's answer `found` gives a member holding `have` nothing:
+/// no objects to take, and every branch's commit one it already holds.
+fn brought_nothing(found: &FetchBundle, have: &[Oid]) -> bool {
+    found.bundle.is_none() && found.tips.values().all(|o| have.contains(o))
+}
+
 /// Up to `max` bytes of the file at `path` from byte `from`, and the file's
 /// length.
 fn read_from(path: &Path, from: u64, max: u64) -> io::Result<(Vec<u8>, u64)> {
@@ -235,6 +241,13 @@ impl Jobs {
     /// every branch — and a bundle of the objects the member lacks. The
     /// answer is kept as the job's status alone: its bundle goes back once,
     /// with the submit.
+    ///
+    /// **A fetch that brings the member nothing is not kept.** A member
+    /// following origin asks every minute (§10.3), and almost every answer is
+    /// "as you were": kept, they filled the job table — what an admin reads
+    /// of the agent, and the [`KEPT`] jobs it holds — with polls, pushing the
+    /// runs that did something out of it. One that brought commits, or that
+    /// failed, is kept like any job.
     async fn fetch_for(self: &Arc<Self>, fetch: FetchJob) -> Result<JobView, JobError> {
         self.checkout(&fetch.repo)?;
         let started_ms = now_ms();
@@ -253,19 +266,32 @@ impl Jobs {
         self.fetch(&fetch.repo).await?;
         let jobs = Arc::clone(self);
         let repo = fetch.repo.clone();
+        let held = have.clone();
         let found = spawn_blocking(move || {
             let c = jobs.checkout(&repo)?;
             c.repo()
-                .bundle_for_fetch(&origin(), &spec, &have)
+                .bundle_for_fetch(&origin(), &spec, &held)
                 .map_err(|e| JobError::Bad(format!("bundling `{repo}`: {e}")))
         })
         .await
         .map_err(|e| JobError::Bad(e.to_string()))?;
+        let id = JobId::random().to_string();
         let (status, fetched) = match found {
+            Ok(f) if brought_nothing(&f, &have) => {
+                return Ok(JobView {
+                    id,
+                    repo: fetch.repo,
+                    status: JobStatus::Exited { code: Some(0) },
+                    lines: 0,
+                    bytes: 0,
+                    outcome: None,
+                    pushed: Vec::new(),
+                    fetched: Some(Fetched::of(&f)),
+                })
+            }
             Ok(f) => (JobStatus::Exited { code: Some(0) }, Some(Fetched::of(&f))),
             Err(e) => (JobStatus::Failed { why: e.to_string() }, None),
         };
-        let id = JobId::random().to_string();
         let (ended, _) = watch::channel(true);
         self.keep(
             id.clone(),
@@ -657,6 +683,27 @@ mod tests {
             ..one
         };
         assert_eq!(fetch_command(&all), ["git", "fetch", "origin"]);
+    }
+
+    /// **A fetch brings nothing only when it has no objects to give and every
+    /// branch it names is at a commit the member holds** — a new commit, or
+    /// objects to take, make it worth keeping.
+    #[test]
+    fn a_fetch_brings_nothing_only_when_the_member_has_it_all() {
+        let a = Oid::parse("1111111111111111111111111111111111111111").unwrap();
+        let b = Oid::parse("2222222222222222222222222222222222222222").unwrap();
+        let main = BranchName::parse("main").unwrap();
+        let at = |o: &Oid, bundle: Option<Vec<u8>>| FetchBundle {
+            tips: [(main.clone(), o.clone())].into(),
+            bundle,
+        };
+        assert!(brought_nothing(&at(&a, None), std::slice::from_ref(&a)));
+        assert!(!brought_nothing(&at(&b, None), std::slice::from_ref(&a)));
+        assert!(!brought_nothing(
+            &at(&a, Some(b"PACK".to_vec())),
+            std::slice::from_ref(&a)
+        ));
+        assert!(!brought_nothing(&at(&a, None), &[]));
     }
 
     /// A log is read from any byte, at most `max` of it, with its length; a

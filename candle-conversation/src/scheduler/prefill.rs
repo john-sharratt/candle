@@ -395,8 +395,11 @@ impl Scheduler {
             self.model.compact_recurrent(MAX_STATE_MOVES)
         };
         match recurrent {
+            // Each compaction pass is routine housekeeping between forwards —
+            // every few seconds under pressure — so its report is debug; a
+            // failure stays an error.
             Ok(r) if r.planned > 0 => {
-                tracing::info!(
+                tracing::debug!(
                     target: "candle_conversation::scheduler::vram_relief",
                     planned = r.planned,
                     moved = r.moved,
@@ -430,7 +433,7 @@ impl Scheduler {
             };
             match gallery {
                 Ok(r) if r.planned > 0 => {
-                    tracing::info!(
+                    tracing::debug!(
                         target: "candle_conversation::scheduler::vram_relief",
                         planned = r.planned,
                         moved = r.moved,
@@ -616,7 +619,7 @@ impl Scheduler {
                 // The weight side, immediately, while no wave generation is live.
                 let _g = super::profile::span("compact:reclaim_weights");
                 self.model.reclaim_spare_ground();
-                tracing::info!(
+                tracing::debug!(
                     target: "candle_conversation::scheduler::vram_relief",
                     moves = report.moves,
                     allocations = report.allocations_rewritten,
@@ -4383,7 +4386,8 @@ impl Scheduler {
             // identified by what is IN it, and the pages that do not belong
             // to any turn are consistently 5 and 7 tokens wide — small
             // enough to name outright rather than infer from their width.
-            Ok(closed) => tracing::info!(
+            // Debug: every prefilled turn closes one.
+            Ok(closed) => tracing::debug!(
                 target: "candle_conversation::scheduler::unit_boundary",
                 seq_id = sequence_id.0,
                 site = "prefill-break-token",

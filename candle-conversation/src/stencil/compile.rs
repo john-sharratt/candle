@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use super::encode_cache::EncodeCache;
 use super::error::BuildError;
 use super::spec::{NodeSpec, SpecId, TreeSpec};
+use super::terminator::Terminator;
 use super::tree::{FreeTextSpan, NodeId, StencilNode, StencilTree};
 use super::trie::TokenTrie;
 use super::vocab::{TokenId, Vocab};
@@ -169,14 +170,78 @@ fn lower_uncached(
         _ => {
             let term = lower_terminal(spec, vocab, node, arena)?;
             if run.is_empty() {
-                Ok(term)
+                return Ok(term);
+            }
+            let tokens = tokenize_in_context(vocab, prefix, &run, node.0)?;
+            // A run that opens a string — an array's only first element, whose
+            // `"` the grammar writes — holds its last token back as a choice
+            // beside the tokens that spill past it, as an arm does.
+            let spills = match tokens.last() {
+                Some(&last) => spills_into(vocab, last, &arena.nodes[term.0 as usize]),
+                None => Vec::new(),
+            };
+            let Some((&last, head)) = tokens.split_last().filter(|_| !spills.is_empty()) else {
+                return Ok(push(arena, StencilNode::Static { tokens, next: term }));
+            };
+            let trie = TokenTrie::build(&[(vec![last], term)])?.spill_from(&[last], spills);
+            let branch = push(arena, StencilNode::Branch { trie });
+            if head.is_empty() {
+                Ok(branch)
             } else {
-                let tokens = tokenize_in_context(vocab, prefix, &run, node.0)?;
-                Ok(push(arena, StencilNode::Static { tokens, next: term }))
+                Ok(push(
+                    arena,
+                    StencilNode::Static {
+                        tokens: head.to_vec(),
+                        next: branch,
+                    },
+                ))
             }
         }
     }
 }
+
+/// The tokens that finish `last` and spill into `successor` (see the `trie`
+/// module): those extending `last`'s bytes whose bytes past it are plain
+/// string content, when `successor` reads a JSON string's content. None
+/// otherwise — a key, a number or structure reads what follows differently.
+fn spills_into(
+    vocab: &dyn Vocab,
+    last: TokenId,
+    successor: &StencilNode,
+) -> Vec<(TokenId, Vec<u8>)> {
+    let StencilNode::FreeText(span) = successor else {
+        return Vec::new();
+    };
+    if span.term != Terminator::JsonString {
+        return Vec::new();
+    }
+    let head = vocab.token_bytes(last);
+    if head.is_empty() {
+        return Vec::new();
+    }
+    vocab
+        .extensions(&head)
+        .into_iter()
+        .filter_map(|(t, bytes)| {
+            let rest = bytes[head.len()..].to_vec();
+            plain_string_content(&rest).then_some((t, rest))
+        })
+        .collect()
+}
+
+/// Bytes a JSON string takes as written: no closing quote, no escape, no
+/// control character — and not a character the tokenizer could only decode as
+/// a replacement mark.
+fn plain_string_content(rest: &[u8]) -> bool {
+    !rest.is_empty()
+        && rest.iter().all(|&b| b >= 0x20 && b != b'"' && b != b'\\')
+        && !rest
+            .windows(REPLACEMENT.len())
+            .any(|w| w == REPLACEMENT.as_bytes())
+}
+
+/// U+FFFD: what a token holding part of a character decodes to.
+const REPLACEMENT: &str = "\u{FFFD}";
 
 /// Lower a multi-arm branch reached after a static `run`, healing the
 /// boundary: tokenize each arm in the full left context, take the longest
@@ -227,7 +292,18 @@ fn lower_branch(
         let next_id = lower(spec, vocab, *arm_next, "", arena)?;
         trie_arms.push((arm_toks, next_id));
     }
-    let trie = TokenTrie::build(&trie_arms)?;
+    let mut trie = TokenTrie::build(&trie_arms)?;
+    // An arm that opens a string — an array element's `, "` — also takes the
+    // tokens that run on into it (see the `trie` module).
+    for (arm, next) in &trie_arms {
+        let Some(&last) = arm.last() else {
+            continue;
+        };
+        let spills = spills_into(vocab, last, &arena.nodes[next.0 as usize]);
+        if !spills.is_empty() {
+            trie = trie.spill_from(arm, spills);
+        }
+    }
     let branch = push(arena, StencilNode::Branch { trie });
     if static_toks.is_empty() {
         Ok(branch)
@@ -351,8 +427,13 @@ fn verify_invariants(arena: &[StencilNode]) -> Result<(), BuildError> {
                     });
                 }
             }
+            // Two ways on: two arms, or one arm and a token that spills past it
+            // (a run's last token held back for its spills).
             StencilNode::Branch { trie } => {
-                debug_assert!(trie.arm_count() >= 2, "branch must have >=2 arms");
+                debug_assert!(
+                    trie.arm_count() + trie.spill_count() >= 2,
+                    "branch must offer >=2 ways on"
+                );
             }
             StencilNode::FreeText(span) => {
                 if span.limits.forced_after == 0 {

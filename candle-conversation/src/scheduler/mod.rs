@@ -1826,7 +1826,9 @@ fn flush_page_cut(
     }
     let after = state.pending_page_cut_after.take();
     match model.close_positional_page(slot.0) {
-        Ok(closed) => tracing::info!(
+        // Every reasoning block closes a page: debug, read when a page's
+        // bounds are in question.
+        Ok(closed) => tracing::debug!(
             target: "candle_conversation::scheduler::unit_boundary",
             seq_id = slot.0,
             closed,

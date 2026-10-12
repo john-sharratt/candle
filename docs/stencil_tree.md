@@ -483,6 +483,32 @@ dropped rather than pushed back, so the successor writes the right one. Healing 
 (models emit the quote as its own token) but must be correct; §12 turns
 "healing impossible" into a clean abort, never corruption.
 
+### 7.4 The guided→free boundary: spills
+
+The opposite seam is the **start** of a free span, where the grammar's last
+token meets the model's first. A tokenizer merges across it too: Qwen3.8 writes
+an array element `"-p"` as ` "-` then `p"` — the separator's opening quote and
+the flag's dash in one token. A branch arm that ends on ` "` offers only ` "`,
+so that token was masked out, and the model continued from a boundary its
+encoding never produces. Measured live: asked for `cargo tree -p agent --depth
+1`, every `run_command` came out `["tree", "depth"]` — the dashes, and the words
+they led, gone — and after five tries the array decoded as `"p"` forty times.
+
+So an arm's last token is offered beside its **spills**
+(`stencil::trie`): every token that starts with that token's bytes and runs on
+past it, when the arm's successor is a `JsonString` span and the bytes past the
+arm are plain string content — no `"`, no `\`, no control byte, no partial
+character. Taking one completes the arm and feeds the bytes past it to the
+span's lexer as its first (`StencilSession::observe`). A static run that ends
+right before such a span (an array's required first element, whose `"` is the
+grammar's alone) holds its last token back as a one-arm branch with its spills,
+for the same reason.
+
+The candidates come from `Vocab::extensions`, which for the live tokenizer is an
+index of every token's bytes, sorted (`TokenBytes`), built once per engine and
+shared by every compile. A plain string *parameter* needs none of this: its
+opening quote is already the model's (`Terminator::JsonStringValue`, §6.1).
+
 ---
 
 ## 8. Construction — three front-ends, one backend

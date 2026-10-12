@@ -56,6 +56,10 @@ impl Vocab for EncodeCache<'_> {
     fn fingerprint(&self) -> u64 {
         self.inner.fingerprint()
     }
+
+    fn extensions(&self, prefix: &[u8]) -> Vec<(TokenId, Vec<u8>)> {
+        self.inner.extensions(prefix)
+    }
 }
 
 #[cfg(test)]
@@ -87,6 +91,9 @@ mod tests {
         }
         fn fingerprint(&self) -> u64 {
             self.inner.fingerprint()
+        }
+        fn extensions(&self, prefix: &[u8]) -> Vec<(TokenId, Vec<u8>)> {
+            self.inner.extensions(prefix)
         }
     }
 

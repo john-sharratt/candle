@@ -749,8 +749,10 @@ impl PipelineState {
             let was = self.link_time.on();
             let on = self.link_time.observe(us);
             self.read_ahead.set(on);
+            // It flips with the link's measured time, several times a minute
+            // under load: debug, not a daemon's info log.
             if on != was {
-                tracing::info!(
+                tracing::debug!(
                     link_us_per_invocation = self.link_time.us(),
                     "expert cache: read-ahead {}",
                     if on { "on" } else { "off" }

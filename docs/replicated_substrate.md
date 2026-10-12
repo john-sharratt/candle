@@ -3314,7 +3314,10 @@ absent when the member lacks none (`Repo::bundle_for_fetch`). The member takes t
 bundle's objects and sets its tracking refs to the commits, removing those of branches
 `origin` no longer has (`Repo::take_fetch`): the same refs, and the same report, as a
 fetch from `origin` itself. The answer goes back with the submit only; the job keeps its
-status. A repository opened `fetching_through` an agent makes every fetch this way, as
+status. A fetch that brings the member nothing — no objects, every branch at a commit it
+already holds — is answered and not kept: a member following origin asks every minute,
+and kept, those polls filled the agent's job table and pushed the runs that did something
+out of it (§11.7). A repository opened `fetching_through` an agent makes every fetch this way, as
 one opened `pushing_through` one makes every push (`zend_vfs::Fetch`, `zend_vfs::Push`).
 
 ### 11.5 How zend calls it

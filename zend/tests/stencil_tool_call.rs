@@ -1570,6 +1570,45 @@ fn natural_calls_drive_the_live_grammar() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
+/// **A command's flags are written in the live tokenizer's own tokens.** Qwen
+/// writes ` "-` and ` "--` as one token each, so an element whose separator
+/// arm ended on a bare ` "` had them masked out: live, asked for
+/// `cargo tree -p agent --depth 1`, the model wrote `["tree", "depth"]` call
+/// after call. Each element must open on its natural token — strict — and the
+/// first, on whatever the encoding puts after `[`.
+#[test]
+#[ignore = "requires the cached Qwen3.8 tokenizer.json"]
+fn a_commands_flags_are_written_in_their_natural_tokens() {
+    let (tree, tok) = live_tree();
+    // The premise: the live encoding merges each flag's dashes onto its
+    // element's quote, which a separator arm ending on ` "` cannot offer.
+    let pieces: Vec<String> = tok
+        .encode(r#"["tree", "-p", "--depth"]"#, false)
+        .unwrap()
+        .get_ids()
+        .iter()
+        .map(|&id| tok.decode(&[id], false).unwrap())
+        .collect();
+    assert!(
+        pieces.iter().any(|p| p == " \"-") && pieces.iter().any(|p| p == " \"--"),
+        "{pieces:?}"
+    );
+    let mut failures = Vec::new();
+    for call in [
+        r#"{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["tree", "-p", "agent", "--depth", "1"]}}"#,
+        r#"{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["--version"]}}"#,
+        r#"{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": ["test", "-p", "agent", "--lib", "--", "--nocapture"]}}"#,
+        r#"{"name": "run_command", "arguments": {"repo": "candle", "program": "node", "args": ["./scripts/report.js", "-v"]}}"#,
+        r#"{"name": "run_command", "arguments": {"repo": "candle", "program": "cargo", "args": []}}"#,
+    ] {
+        let target = format!("{MARKER}\n{call}\n</tool_call>{TURN_CLOSE}");
+        if let Err(e) = drive_natural_strict(Arc::clone(&tree), &tok, &target) {
+            failures.push(format!("{call}\n    {e}"));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 /// **The natural drive rejects both shapes that failed live.** A harness that
 /// passes the fixed grammar proves nothing unless it fails the broken one, so
 /// both old shapes are rebuilt here and must be refused — for the right reason.

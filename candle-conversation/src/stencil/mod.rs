@@ -57,6 +57,8 @@ mod invoke_body_tests;
 #[cfg(test)]
 mod shaped_params_tests;
 #[cfg(test)]
+mod spill_tests;
+#[cfg(test)]
 mod sub_stencil_tests;
 #[cfg(test)]
 mod tests;
@@ -87,6 +89,6 @@ pub use candle_transformers::models::dialect::CallStyle;
 pub use tree::{
     FreeTextLimits, FreeTextSpan, NodeId, StencilNode, StencilTree, MAX_STRING_VALUE_TOKENS,
 };
-pub use trie::{Step, TokenTrie, TrieNodeId};
+pub use trie::{Spill, SpillId, Step, TokenTrie, TrieNodeId};
 pub use trigger::TriggerRegistry;
-pub use vocab::{HfVocab, TestVocab, TokenId, Vocab};
+pub use vocab::{HfVocab, TestVocab, TokenBytes, TokenId, Vocab};

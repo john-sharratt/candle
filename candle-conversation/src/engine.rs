@@ -24,7 +24,7 @@ use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
 use crate::stencil::{
     compile, compile_think_tree, compile_tool_call_loop, HfVocab, StencilTree, ThinkMode,
-    ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
+    ThinkSteerEnvelope, TokenBytes, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
     MAX_TOOL_CALLS_PER_TURN,
 };
 use crate::tenant_rank::TenantRank;
@@ -45,7 +45,7 @@ use candle_transformers::models::delta_net::release_seal_readback;
 use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -283,6 +283,11 @@ struct EngineCore {
     eos_tokens: TokenBuffer,
     vocab_size: usize,
     dialect: Dialect,
+
+    /// Every token's bytes, sorted — what a stencil compile reads to find the
+    /// tokens that run on past an arm (`stencil::trie`). Built on the first
+    /// compile, from the whole vocabulary, and shared by every compile after.
+    token_bytes: OnceLock<Arc<TokenBytes>>,
 
     /// Async summariser thread — **always the disabled handle.** It would drain
     /// the per-turn pending queue, run §6 probes and build the per-timeline AVL
@@ -549,6 +554,7 @@ impl ConversationEngine {
             eos_tokens: config.eos_tokens.clone(),
             vocab_size: config.vocab_size,
             dialect: config.dialect.clone(),
+            token_bytes: OnceLock::new(),
             summariser_thread,
             guests,
             model_core,
@@ -1812,6 +1818,23 @@ impl ConversationEngine {
     /// to several pieces), an **empty** registry is returned — constrained
     /// decoding is simply inactive and the model free-decodes tool calls as
     /// before.  This never fails startup over a tokenizer mismatch.
+    /// This engine's vocabulary for a stencil compile: its tokenizer, its end
+    /// tokens and its size, reading token bytes from the index the engine
+    /// builds once.
+    fn vocab(&self) -> HfVocab {
+        let tok = &self.core.tokenizer;
+        let bytes = self
+            .core
+            .token_bytes
+            .get_or_init(|| Arc::new(HfVocab::token_bytes_of(tok)));
+        HfVocab::new(
+            (**tok).clone(),
+            &self.core.eos_tokens,
+            self.core.vocab_size as u64,
+        )
+        .with_bytes(Arc::clone(bytes))
+    }
+
     /// Compile a stencil spec against **this engine's** vocabulary.
     ///
     /// The vocabulary is the tokenizer, the EOS id and the vocab size together,
@@ -1821,11 +1844,7 @@ impl ConversationEngine {
     /// loop rather than the single-call assistant shape
     /// [`Self::compile_tool_stencil`] builds.
     pub fn compile_stencil(&self, spec: &crate::stencil::TreeSpec) -> crate::Result<StencilTree> {
-        let vocab = HfVocab::new(
-            (*self.core.tokenizer).clone(),
-            &self.core.eos_tokens,
-            self.core.vocab_size as u64,
-        );
+        let vocab = self.vocab();
         compile(spec, &vocab)
             .map_err(|e| ConversationError::from(candle::Error::Msg(format!("stencil: {e}"))))
     }
@@ -1872,11 +1891,7 @@ impl ConversationEngine {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
         })?;
         let spec_ms = started.elapsed().as_millis() as u64;
-        let vocab = HfVocab::new(
-            (*self.core.tokenizer).clone(),
-            &self.core.eos_tokens,
-            self.core.vocab_size as u64,
-        );
+        let vocab = self.vocab();
         let vocab_ms = started.elapsed().as_millis() as u64 - spec_ms;
         let tree = compile(&spec, &vocab).map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
@@ -1936,11 +1951,7 @@ impl ConversationEngine {
         };
         // Every end token, so a think span intercepts whichever one the model
         // samples — the canonical `eos` above is only what the tree writes.
-        let vocab = HfVocab::new(
-            (*self.core.tokenizer).clone(),
-            &self.core.eos_tokens,
-            self.core.vocab_size as u64,
-        );
+        let vocab = self.vocab();
         let compile_mode = |mode: ThinkMode| -> crate::Result<Arc<StencilTree>> {
             let spec = compile_think_tree(mode, &env);
             let tree = compile(&spec, &vocab).map_err(|e| {

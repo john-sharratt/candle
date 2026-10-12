@@ -572,8 +572,10 @@ impl CaptureHub {
             }
         };
         let fold_us = started.elapsed().as_micros() as u64;
+        // Both are routine — a wave's shape changes every few waves — so they
+        // are debug: at info they were four lines in five of a daemon's log.
         if let Some(d) = departs {
-            tracing::info!(
+            tracing::debug!(
                 target: "candle_core::graph",
                 wave = serial,
                 segment,
@@ -585,7 +587,7 @@ impl CaptureHub {
             );
         }
         if let Some(r) = refusal {
-            tracing::info!(
+            tracing::debug!(
                 target: "candle_core::graph",
                 wave = serial,
                 segment,

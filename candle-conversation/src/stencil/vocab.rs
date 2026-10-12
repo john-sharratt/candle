@@ -9,6 +9,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock};
 
 /// A token id, as produced by the tokenizer.
 pub type TokenId = u32;
@@ -39,6 +40,43 @@ pub trait Vocab {
     /// Decode a token run to bytes (default: concatenate `token_bytes`).
     fn decode(&self, tokens: &[TokenId]) -> Vec<u8> {
         tokens.iter().flat_map(|&t| self.token_bytes(t)).collect()
+    }
+
+    /// Every token whose bytes start with `prefix` and run past it — the
+    /// tokens a tokenizer writes when the text after `prefix` merges into it,
+    /// as Qwen's ` "-` merges a string's opening quote with its first byte.
+    /// Each with its bytes.
+    fn extensions(&self, prefix: &[u8]) -> Vec<(TokenId, Vec<u8>)>;
+}
+
+/// Every token's bytes, sorted, so the tokens extending a prefix are one
+/// contiguous run ([`Vocab::extensions`]). Built once per tokenizer: it decodes
+/// the whole vocabulary.
+pub struct TokenBytes {
+    sorted: Vec<(Vec<u8>, TokenId)>,
+}
+
+impl TokenBytes {
+    /// The bytes of each token `0..size` that has any, as `token_bytes` gives
+    /// them.
+    pub fn of(size: TokenId, token_bytes: impl Fn(TokenId) -> Vec<u8>) -> TokenBytes {
+        let mut sorted: Vec<(Vec<u8>, TokenId)> = (0..size)
+            .map(|t| (token_bytes(t), t))
+            .filter(|(b, _)| !b.is_empty())
+            .collect();
+        sorted.sort_unstable();
+        TokenBytes { sorted }
+    }
+
+    /// The tokens whose bytes start with `prefix` and are longer than it, each
+    /// with its bytes.
+    pub fn extensions(&self, prefix: &[u8]) -> Vec<(TokenId, Vec<u8>)> {
+        let start = self.sorted.partition_point(|(b, _)| b.as_slice() <= prefix);
+        self.sorted[start..]
+            .iter()
+            .take_while(|(b, _)| b.starts_with(prefix))
+            .map(|(b, t)| (*t, b.clone()))
+            .collect()
     }
 }
 
@@ -149,6 +187,22 @@ impl Vocab for TestVocab {
         }
         h.finish()
     }
+
+    /// Only a registered special can extend a prefix: a single byte is no
+    /// longer than any non-empty one.
+    fn extensions(&self, prefix: &[u8]) -> Vec<(TokenId, Vec<u8>)> {
+        let mut out: Vec<(TokenId, Vec<u8>)> = self
+            .specials
+            .iter()
+            .filter(|(s, _)| s.len() > prefix.len() && s.starts_with(prefix))
+            .map(|(s, id)| (*id, s.clone()))
+            .collect();
+        if prefix.is_empty() {
+            out.extend((0..=255u8).map(|b| (TokenId::from(b), vec![b])));
+        }
+        out.sort_unstable();
+        out
+    }
 }
 
 // ── Real tokenizer wrapper ──────────────────────────────────────────────────
@@ -161,6 +215,10 @@ pub struct HfVocab {
     /// End-of-turn ids, the canonical one first.
     ends: Vec<TokenId>,
     fingerprint: u64,
+    /// The vocabulary's bytes, for [`Vocab::extensions`]: given by the engine,
+    /// which builds them once and shares them across every compile, or built
+    /// here on first use.
+    bytes: OnceLock<Arc<TokenBytes>>,
 }
 
 impl HfVocab {
@@ -171,8 +229,29 @@ impl HfVocab {
             tok,
             ends: ends.to_vec(),
             fingerprint,
+            bytes: OnceLock::new(),
         }
     }
+
+    /// This vocabulary reading its token bytes from `bytes`, built once for
+    /// the same tokenizer ([`Self::token_bytes_of`]).
+    pub fn with_bytes(self, bytes: Arc<TokenBytes>) -> Self {
+        let _ = self.bytes.set(bytes);
+        self
+    }
+
+    /// Every token's bytes in `tok`, as [`Vocab::token_bytes`] reads them.
+    pub fn token_bytes_of(tok: &tokenizers::Tokenizer) -> TokenBytes {
+        let size = tok.get_vocab_size(true) as TokenId;
+        TokenBytes::of(size, |t| decoded(tok, t))
+    }
+}
+
+/// The bytes `tok` decodes `token` to; none for a token with no text.
+fn decoded(tok: &tokenizers::Tokenizer, token: TokenId) -> Vec<u8> {
+    tok.decode(&[token], false)
+        .map(|s| s.into_bytes())
+        .unwrap_or_default()
 }
 
 impl Vocab for HfVocab {
@@ -184,10 +263,7 @@ impl Vocab for HfVocab {
     }
 
     fn token_bytes(&self, token: TokenId) -> Vec<u8> {
-        self.tok
-            .decode(&[token], false)
-            .map(|s| s.into_bytes())
-            .unwrap_or_default()
+        decoded(&self.tok, token)
     }
 
     fn eos(&self) -> TokenId {
@@ -200,6 +276,12 @@ impl Vocab for HfVocab {
 
     fn fingerprint(&self) -> u64 {
         self.fingerprint
+    }
+
+    fn extensions(&self, prefix: &[u8]) -> Vec<(TokenId, Vec<u8>)> {
+        self.bytes
+            .get_or_init(|| Arc::new(Self::token_bytes_of(&self.tok)))
+            .extensions(prefix)
     }
 }
 
@@ -242,6 +324,40 @@ mod tests {
         assert_eq!(v.eos(), 256);
         assert_eq!(v.end_tokens(), vec![256, 300]);
         assert!(v.token_bytes(300).is_empty(), "an end token has no text");
+    }
+
+    /// **The tokens extending a prefix are exactly those that start with it
+    /// and run past it** — not the prefix's own token, not a neighbour that
+    /// sorts beside it.
+    #[test]
+    fn token_bytes_name_the_tokens_extending_a_prefix() {
+        let words: [&[u8]; 6] = [b" \"", b" \"-", b" \"--", b" \"./", b" #", b"\""];
+        let index = TokenBytes::of(words.len() as TokenId + 1, |t| {
+            words.get(t as usize).map_or(Vec::new(), |w| w.to_vec())
+        });
+        let ids = |p: &[u8]| -> Vec<TokenId> {
+            index.extensions(p).into_iter().map(|(t, _)| t).collect()
+        };
+        assert_eq!(ids(b" \""), vec![1, 2, 3]);
+        assert_eq!(ids(b" \"-"), vec![2]);
+        assert_eq!(ids(b" \"--"), Vec::<TokenId>::new());
+        assert_eq!(ids(b"\""), Vec::<TokenId>::new());
+        assert_eq!(index.extensions(b" \"-"), vec![(2, b" \"--".to_vec())]);
+    }
+
+    /// A test vocabulary extends a prefix only with its registered specials.
+    #[test]
+    fn a_test_vocab_extends_a_prefix_with_its_specials() {
+        let v = TestVocab::new()
+            .with_special(" \"", 300)
+            .with_special(" \"-", 301)
+            .with_special(" \"--", 302)
+            .with_special("{\"", 303);
+        assert_eq!(
+            v.extensions(b" \""),
+            vec![(301, b" \"-".to_vec()), (302, b" \"--".to_vec())]
+        );
+        assert!(v.extensions(b" \"--").is_empty());
     }
 
     #[test]

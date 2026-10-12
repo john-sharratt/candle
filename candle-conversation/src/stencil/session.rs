@@ -11,7 +11,7 @@ use super::error::WalkError;
 use super::mask::AllowedSet;
 use super::terminator::{Feed, Terminator, TerminatorState};
 use super::tree::{FreeTextSpan, NodeId, StencilNode, StencilTree};
-use super::trie::{Step, TokenTrie, TrieNodeId};
+use super::trie::{Spill, Step, TokenTrie, TrieNodeId};
 use super::vocab::TokenId;
 
 /// What the scheduler should do next for a sequence in a session.
@@ -310,6 +310,7 @@ impl StencilSession {
                 frontier: Vec<TokenId>,
             },
             BranchAccept(NodeId),
+            BranchSpill(Spill),
             Bad,
         }
         let out = match self.tree.node(node) {
@@ -328,6 +329,7 @@ impl StencilSession {
                     frontier: trie.frontier(p),
                 },
                 Some(Step::Accept(n)) => Out::BranchAccept(n),
+                Some(Step::Spill(id)) => Out::BranchSpill(trie.spill(id).clone()),
                 None => Out::Bad,
             },
             // Static with a non-matching first token, or a free-text/end node:
@@ -355,6 +357,21 @@ impl StencilSession {
                 self.cursor = Cursor::At(n);
                 self.next_action()
             }
+            // The token is already committed, so its part past the arm must be
+            // taken as written; anything the span would have rewritten is out
+            // of reach, and bails like any token the grammar cannot take.
+            Out::BranchSpill(spill) => {
+                let span = self.free_span(spill.next).clone();
+                let term = span.term.start();
+                match self.feed_span(spill.next, &span, term, 1, tok, &spill.rest) {
+                    Observe::Continue => self.next_action(),
+                    _ => {
+                        self.rewrite = None;
+                        self.bail(tok, "pushback spill");
+                        self.next_action()
+                    }
+                }
+            }
             // The pushed-back delimiter isn't legal here — bail gracefully.
             Out::Bad => {
                 self.bail(tok, "pushback");
@@ -379,6 +396,10 @@ impl StencilSession {
                         self.cursor = Cursor::At(next);
                         Ok(Observe::ArmComplete)
                     }
+                    Some(Step::Spill(id)) => {
+                        let spill = self.branch_trie(node).spill(id).clone();
+                        Ok(self.spill_into(spill, token, bytes))
+                    }
                     None => {
                         // The decoded token isn't a legal branch edge — it
                         // escaped the mask.  Bail instead of erroring.
@@ -389,7 +410,7 @@ impl StencilSession {
             }
             Cursor::InFreeText {
                 node,
-                mut term,
+                term,
                 emitted,
             } => {
                 let span = self.free_span(node).clone();
@@ -453,49 +474,80 @@ impl StencilSession {
                         });
                     }
                 }
-                match term.feed(bytes) {
-                    Feed::Close { consumed } => {
-                        self.cursor = Cursor::At(span.next);
-                        // A lookahead terminator's delimiter belongs to the next
-                        // node.  When it is its own token (consumed == 0, the
-                        // byte-level / clean case), push it back so the next node
-                        // consumes it instead of re-emitting it — if the next
-                        // node continues with it. If not, drop it and let the
-                        // next node write what belongs there.
-                        if span.term.is_lookahead() && consumed == 0 {
-                            if !self.continues_with(span.next, token) {
-                                return Ok(Observe::DelimiterDropped);
-                            }
-                            self.pushback = Some(token);
-                        }
-                        Ok(Observe::SpanClosed {
-                            leftover: bytes.len() - consumed,
-                        })
-                    }
-                    // The value ended at a byte that could not continue it, and
-                    // was completed as written.
-                    Feed::Rewrite {
-                        bytes: out,
-                        closed: true,
-                    } => {
-                        self.cursor = Cursor::At(span.next);
-                        self.rewrite = Some(out);
-                        Ok(Observe::Repaired { closed: true })
-                    }
-                    Feed::Rewrite {
-                        bytes: out,
-                        closed: false,
-                    } => Ok(self.continue_span(node, &span, term, emitted, bytes, Some(out))),
-                    Feed::Continue => {
-                        Ok(self.continue_span(node, &span, term, emitted, bytes, None))
-                    }
-                }
+                Ok(self.feed_span(node, &span, term, emitted, token, bytes))
             }
             other => {
                 self.cursor = other;
                 Err(WalkError::NotDecoding)
             }
         }
+    }
+
+    /// Feed `bytes` — `token`'s, or the part of it inside the span — to the
+    /// free-text span `node`, whose terminator stands at `term` and which has
+    /// now taken `emitted` tokens.
+    fn feed_span(
+        &mut self,
+        node: NodeId,
+        span: &FreeTextSpan,
+        mut term: TerminatorState,
+        emitted: u32,
+        token: TokenId,
+        bytes: &[u8],
+    ) -> Observe {
+        match term.feed(bytes) {
+            Feed::Close { consumed } => {
+                self.cursor = Cursor::At(span.next);
+                // A lookahead terminator's delimiter belongs to the next node.
+                // When it is its own token (consumed == 0, the byte-level /
+                // clean case), push it back so the next node consumes it
+                // instead of re-emitting it — if the next node continues with
+                // it. If not, drop it and let the next node write what belongs
+                // there.
+                if span.term.is_lookahead() && consumed == 0 {
+                    if !self.continues_with(span.next, token) {
+                        return Observe::DelimiterDropped;
+                    }
+                    self.pushback = Some(token);
+                }
+                Observe::SpanClosed {
+                    leftover: bytes.len() - consumed,
+                }
+            }
+            // The value ended at a byte that could not continue it, and was
+            // completed as written.
+            Feed::Rewrite {
+                bytes: out,
+                closed: true,
+            } => {
+                self.cursor = Cursor::At(span.next);
+                self.rewrite = Some(out);
+                Observe::Repaired { closed: true }
+            }
+            Feed::Rewrite {
+                bytes: out,
+                closed: false,
+            } => self.continue_span(node, span, term, emitted, bytes, Some(out)),
+            Feed::Continue => self.continue_span(node, span, term, emitted, bytes, None),
+        }
+    }
+
+    /// A token that completed a branch arm and ran on into the free-text span
+    /// after it (the `trie` module's spills): the arm is committed, and the
+    /// token's bytes past it are the span's first. `bytes` are the whole
+    /// token's; a rewrite the span makes is of its own part, so the arm's part
+    /// is put back in front of it.
+    fn spill_into(&mut self, spill: Spill, token: TokenId, bytes: &[u8]) -> Observe {
+        let span = self.free_span(spill.next).clone();
+        let term = span.term.start();
+        let observe = self.feed_span(spill.next, &span, term, 1, token, &spill.rest);
+        if let Some(rest) = self.rewrite.take() {
+            let arm = bytes.len().saturating_sub(spill.rest.len());
+            let mut whole = bytes[..arm].to_vec();
+            whole.extend(rest);
+            self.rewrite = Some(whole);
+        }
+        observe
     }
 
     /// A span token that did not close the span: stay in it, unless this token
