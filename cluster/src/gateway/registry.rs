@@ -184,6 +184,19 @@ impl Registry {
         })
     }
 
+    /// A member of the app admitted here and not ready — loading, catching up,
+    /// upgrading — the lowest node first. While the app is dumb and its
+    /// configured upstream does not answer, this member's own loading page
+    /// stands in for it (§5.7).
+    pub fn standing_by(&self, app: &str) -> Option<u64> {
+        self.apps
+            .get(app)?
+            .members
+            .values()
+            .find(|m| !m.ready())
+            .map(|m| m.node)
+    }
+
     /// Whether the app is clustered here: it has a ready member.
     pub fn clustered(&self, app: &str) -> bool {
         self.apps

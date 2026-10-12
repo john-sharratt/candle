@@ -59,6 +59,9 @@ pub struct Auth {
     /// Derived from the redirect URI's scheme — see [`cookie::set`].
     secure: bool,
     http: reqwest::Client,
+    /// The gateway's roles, so `/auth/me` can say what the caller may do — a
+    /// page offers an admin's links only to an admin.
+    roles: Roles,
 }
 
 impl Auth {
@@ -68,7 +71,7 @@ impl Auth {
     /// block — sign-in is opt-in precisely so that a public site is never held
     /// hostage to a key it does not need. Once opted in, a gateway that starts
     /// with silently broken sign-in is the worse outcome, so this is fatal.
-    pub fn new(cfg: AuthConfig) -> anyhow::Result<Self> {
+    pub fn new(cfg: AuthConfig, roles: Roles) -> anyhow::Result<Self> {
         let raw = std::fs::read(&cfg.session_secret_file).map_err(|e| {
             anyhow::anyhow!(
                 "reading {}: {e}\n\
@@ -106,6 +109,7 @@ impl Auth {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()?,
+            roles,
         })
     }
 
@@ -359,6 +363,7 @@ async fn me(State(auth): State<Arc<Auth>>, headers: HeaderMap) -> Response {
             "name": id.name,
             "picture": id.picture,
             "expires_at": id.exp,
+            "role": auth.roles.of(Some(&id)),
         }))
         .into_response(),
         None => Json(json!({ "authenticated": false })).into_response(),
@@ -387,7 +392,68 @@ pub fn unconfigured_router() -> Router {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use axum::body::to_bytes;
+    use axum::http::HeaderValue;
+    use serde_json::Value;
+
     use super::*;
+
+    /// An `Auth` over secrets in `dir`, with `roles`.
+    fn auth(dir: &Path, roles: &str) -> Auth {
+        fs::write(dir.join("session.key"), [7u8; 48]).unwrap();
+        fs::write(dir.join("client.secret"), "s3cret\n").unwrap();
+        let cfg: AuthConfig = serde_yaml::from_str(&format!(
+            "cookie_domain: .tokera.com\n\
+             session_secret_file: '{}'\n\
+             google:\n  client_id: c\n  client_secret_file: '{}'\n  \
+             redirect_uri: https://tokera.com/auth/callback\n",
+            dir.join("session.key").display(),
+            dir.join("client.secret").display()
+        ))
+        .unwrap();
+        Auth::new(cfg, serde_yaml::from_str(roles).unwrap()).unwrap()
+    }
+
+    /// `/auth/me` for a browser signed in as `email`.
+    async fn me_as(auth: Arc<Auth>, email: &str) -> Value {
+        let id = Identity {
+            provider: "google".into(),
+            sub: format!("sub-{email}"),
+            email: email.into(),
+            name: "N".into(),
+            picture: String::new(),
+            exp: session::now_secs() + 600,
+        };
+        let token = session::sign(&auth.key, &id);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{}={token}", cookie::SESSION)).unwrap(),
+        );
+        let res = me(State(auth), headers).await;
+        serde_json::from_slice(&to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap()
+    }
+
+    /// **`/auth/me` names the caller's role**, so a page offers an admin's
+    /// links — the gateway's cluster page — to an admin and to nobody else.
+    #[tokio::test]
+    async fn me_names_the_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Arc::new(auth(
+            dir.path(),
+            "admins: [{ email: a@x.com }]\ncreators: [{ email: c@x.com }]\n",
+        ));
+        assert_eq!(me_as(auth.clone(), "a@x.com").await["role"], "admin");
+        assert_eq!(me_as(auth.clone(), "c@x.com").await["role"], "creator");
+        assert_eq!(me_as(auth.clone(), "u@x.com").await["role"], "user");
+        let anon = me(State(auth), HeaderMap::new()).await;
+        let anon: Value =
+            serde_json::from_slice(&to_bytes(anon.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(anon, json!({ "authenticated": false }));
+    }
 
     #[test]
     fn a_trailing_newline_in_a_secret_file_is_not_part_of_the_secret() {

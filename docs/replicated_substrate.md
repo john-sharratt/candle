@@ -1442,6 +1442,14 @@ its sockets close, it is closed 4410, or it falls behind and stops being ready. 
 requests go to the configured upstream again. In-flight requests on the lost sockets
 fail as §5.6 says.
 
+**A loading member stands in for a down upstream.** While the app is dumb and its
+configured upstream is in its backoff window — its last attempt failed and none has
+succeeded since — a request goes to a member admitted and not yet ready, the lowest
+node first (`Registry::standing_by`), instead of the outage page. That member serves
+its own loading page and `/v1/status`, so a member replacing a retired upstream shows
+its load from the moment it joins. The upstream's first failure is still answered with
+the outage page: that failure is how the gateway learns it is down.
+
 **The configured upstream gets nothing special in clustered mode.** It is often the
 same daemon as one of the members, for example zend on `.5`. While the app is
 clustered, the gateway sends it traffic only through its socket, if it has one. Its
@@ -3346,7 +3354,10 @@ The push credentials live on the agent, never on a GPU member.
 ## 12. The gateway status page
 
 `GET /gateway` serves the page and `GET /gateway/status.json` its data. Both are on
-every host, merged ahead of site routing, and admin only. The gateway resolves roles
+every host, merged ahead of site routing, and admin only. tokera.com's top bar links to
+it as **Cluster** beside the signed-in name, for an admin or a creator only:
+`/auth/me` carries the caller's `role`, and `common/lib/auth.js` offers the link where
+the page would not be refused. The gateway resolves roles
 from `Config.roles` (`web/src/config.rs:53-61`), which it finally reads, against the same
 table as `host/roles.yaml`. The page polls once a second.
 

@@ -36,8 +36,16 @@ function signedOut() {
   );
 }
 
+/* The roles that may see the gateway's status page, `/gateway` — an admin's,
+ * and the creator's above it. The gateway refuses everyone else; the link is
+ * only not offered where it would be refused. */
+const CLUSTER_ROLES = ['admin', 'creator'];
+
 function signedIn(me) {
   const bits = [];
+  if (CLUSTER_ROLES.includes(me.role)) {
+    bits.push(el('a', { href: '/gateway', class: 'cluster' }, 'Cluster'));
+  }
   if (me.picture) {
     // referrerpolicy so the provider's CDN is not told which page is being read.
     bits.push(el('img', { src: me.picture, alt: '', referrerpolicy: 'no-referrer' }));

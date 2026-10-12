@@ -144,7 +144,7 @@ impl Builder {
     /// poor way to find out.
     pub fn with_auth(mut self) -> anyhow::Result<Self> {
         if let Some(cfg) = self.cfg.auth.clone() {
-            self.auth = Some(Arc::new(Auth::new(cfg)?));
+            self.auth = Some(Arc::new(Auth::new(cfg, self.cfg.roles.clone())?));
         }
         Ok(self)
     }
@@ -636,19 +636,26 @@ async fn handle(
             Upstream::Url(url) => {
                 let peer_ip = peer.as_ref().map(|ConnectInfo(a)| a.ip());
                 if let (Some(cluster_app), Some(gw)) = (&route.cluster, &app.cluster) {
+                    let ctx = || route::Context {
+                        want_html,
+                        peer: peer_ip,
+                        identity: identity.as_ref(),
+                        secure,
+                        cache: app.cfg.server.cache,
+                        roles: &app.cfg.roles,
+                        from_member: origin.as_ref().map(|o| o.node),
+                    };
                     if gw.hub.clustered(cluster_app) {
-                        let ctx = route::Context {
-                            want_html,
-                            peer: peer_ip,
-                            identity: identity.as_ref(),
-                            secure,
-                            cache: app.cfg.server.cache,
-                            roles: &app.cfg.roles,
-                            from_member: origin.as_ref().map(|o| o.node),
-                        };
-                        match route::route(gw, cluster_app, ctx, req).await {
+                        match route::route(gw, cluster_app, ctx(), req).await {
                             Routed::Answered(res) => return res,
                             Routed::Dumb(back) => req = back,
+                        }
+                    } else if app.health.is_down(url) {
+                        // Dumb, and the configured upstream is not answering: a
+                        // member still loading serves its own loading page in
+                        // place of the outage page (§5.7).
+                        if let Some(node) = gw.hub.standing_by(cluster_app) {
+                            return route::forward(gw, cluster_app, node, &ctx(), req).await;
                         }
                     }
                     gw.hub.traffic.request(Class::Configured);

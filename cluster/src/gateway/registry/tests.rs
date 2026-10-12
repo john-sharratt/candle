@@ -160,6 +160,27 @@ fn the_mode_follows_ready_members() {
     assert!(!r.clustered("npcd"), "another app is untouched");
 }
 
+/// A member admitted and not ready stands by for its app's loading page, the
+/// lowest node first; once one is ready the app is clustered and the others
+/// still stand by; with every member ready, or none, nobody does.
+#[test]
+fn a_loading_member_stands_by() {
+    let mut r = Registry::new();
+    assert_eq!(r.standing_by("npcd"), None);
+    r.join(member(7, 1));
+    r.join(member(3, 1));
+    assert_eq!(r.standing_by("zend"), Some(3));
+    assert_eq!(
+        r.standing_by("npcd"),
+        None,
+        "another app's member is not this one's"
+    );
+    r.capacity("zend", 3, capacity(MemberState::Ready, 1, true, 1));
+    assert_eq!(r.standing_by("zend"), Some(7));
+    r.capacity("zend", 7, capacity(MemberState::Ready, 1, true, 1));
+    assert_eq!(r.standing_by("zend"), None);
+}
+
 #[test]
 fn best_takes_the_highest_idle_power_else_the_most_free_slots() {
     let mut r = three();

@@ -132,6 +132,13 @@ impl Health {
         }
     }
 
+    /// Whether `key`'s last attempt failed and none has succeeded since. A read
+    /// only: unlike [`Self::gate`] it never releases the probe.
+    pub fn is_down(&self, key: &str) -> bool {
+        let map = self.inner.lock().unwrap();
+        map.get(key).is_some_and(|up| up.open_until.is_some())
+    }
+
     pub fn on_success(&self, key: &str) {
         let mut map = self.inner.lock().unwrap();
         if let Some(up) = map.get_mut(key) {
@@ -245,6 +252,27 @@ mod tests {
         assert_eq!(h.gate("a"), Gate::Go);
         // …and the next failure starts from the base delay again.
         assert_eq!(h.on_failure("a", "x").as_millis(), 100);
+    }
+
+    /// `is_down` reads the window without releasing the probe: down from the
+    /// first failure until a success, and asking never lets a request through.
+    #[test]
+    fn is_down_reads_without_releasing_the_probe() {
+        let h = Health::new(Backoff {
+            initial_ms: 1,
+            max_ms: 10,
+        });
+        assert!(!h.is_down("a"), "never tried");
+        h.on_failure("a", "x");
+        std::thread::sleep(Duration::from_millis(6));
+        assert!(
+            h.is_down("a"),
+            "the window expired, but nothing has answered"
+        );
+        assert_eq!(h.gate("a"), Gate::Go, "asking left the probe in place");
+        h.on_success("a");
+        assert!(!h.is_down("a"));
+        assert!(!h.is_down("b"), "another upstream");
     }
 
     #[test]

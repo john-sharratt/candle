@@ -1055,6 +1055,12 @@ impl Hub {
         self.state().registry.member(app, node).cloned()
     }
 
+    /// A member of `app` admitted and not ready, whose loading page stands in
+    /// while the app's configured upstream does not answer (§5.7).
+    pub fn standing_by(&self, app: &str) -> Option<u64> {
+        self.state().registry.standing_by(app)
+    }
+
     /// A ready member of `app`: where a command the group records is sent.
     pub fn any_ready(&self, app: &str) -> Option<u64> {
         self.state()

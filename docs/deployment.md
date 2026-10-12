@@ -38,9 +38,9 @@ repository is readable by the model.
                                      │                   cluster `tokera.com` on :9443)
                      ┌───────────────┴────────────────┐
                      ▼                                ▼
-          192.168.0.5:8081  tokerad            192.168.0.6:8081  npcd
-          zend + npcd members, joined          standalone — bot.tokera.com's
-          to the gateway's cluster             upstream while no npcd member is up
+          192.168.0.5:8081  tokerad            192.168.0.6:8081  (stopped)
+          zend + npcd members, joined          bot.tokera.com's configured
+          to the gateway's cluster             upstream; rebuilt later as a member
           (code.tokera.com, bot.tokera.com)
 ```
 
@@ -53,8 +53,10 @@ repository is readable by the model.
 - **The cluster.** tokerad's zend and npcd tenants join the gateway's cluster
   (`docs/replicated_substrate.md`): the gateway routes each name to a joined, ready
   member of its app over the member's socket, and to the route's `upstream` only while
-  the app has no member (dumb mode). So `bot.tokera.com` is tokerad's npcd while it is
-  up and `.6`'s when it is not, until `.6` is rebuilt onto this framework and joins.
+  the app has no member (dumb mode). While that upstream is down, a member still loading
+  stands in for it, so the name shows the member's loading page rather than an outage.
+  npcd on `.6` was stopped on 2026-10-12: `bot.tokera.com` is tokerad's npcd alone until
+  `.6` is rebuilt onto this framework and joins.
 - **cf-ddns** keeps the Cloudflare A records at the public IP, so a router reboot that
   changes the address heals on its own within one 30 s interval.
 
@@ -67,7 +69,7 @@ not identities.
 | Address | Hostname | Runs | Repo |
 |---|---|---|---|
 | `192.168.0.5` | BlackWorld | web, tokerad, cf-ddns | `D:\prog\candle` |
-| `192.168.0.6` | — | npcd (standalone) | the checkout `/up` is run from; its mind is `D:\prog\mind` |
+| `192.168.0.6` | — | nothing — its standalone npcd was stopped on 2026-10-12, to be rebuilt as a member | the checkout `/up` is run from; its mind is `D:\prog\mind` |
 
 ## Services
 
@@ -283,8 +285,8 @@ Reading a failure:
   2026-09-16 on a freshly built `web.exe`. A `200` there means the running gateway predates
   the redirect and wants a rebuild and restart.
 - **`bot.tokera.com` `503`** while the gateway is healthy means no npcd is serving: tokerad's
-  npcd member is not joined and ready, and npcd on `.6` — the fallback, started by `/up` on
-  that machine, not on `.5` — is down.
+  npcd member is not joined at all (a member joined and loading shows its loading page from
+  the second request on), and the configured upstream on `.6` is down.
 - **`code.tokera.com` slow or `504` right after tokerad starts**, with zend answering
   directly on `:8081`: the member is still sending its own history to the gateway after
   the restart, and forwarded requests queue behind it on the socket (about 8 minutes for

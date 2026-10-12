@@ -5,7 +5,7 @@
 //! aggregate and socket-drop tables run here.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -241,7 +241,12 @@ impl Member {
 }
 
 fn member(gateway: SocketAddr, node: u64, power: u32) -> Member {
-    let ready = Arc::new(AtomicBool::new(true));
+    joined(gateway, node, power, true)
+}
+
+/// A member that reports `Ready` when `ready`, and `Loading` otherwise.
+fn joined(gateway: SocketAddr, node: u64, power: u32, ready: bool) -> Member {
+    let ready = Arc::new(AtomicBool::new(ready));
     let app = AppMember::new(
         Identity {
             app: "zend".into(),
@@ -403,6 +408,46 @@ async fn the_mode_follows_the_ready_members() {
     m.leave();
     until("dumb again", || !hub.clustered("zend")).await;
     assert_eq!(fetch(gw, "/v1/where").await.json()["by"], "dumb");
+}
+
+/// **A loading member stands in for a configured upstream that is down**
+/// (§5.7): with no member ready the app is dumb, and its first request finds
+/// the upstream refusing; from then on, while the upstream stays down, the
+/// member that is still loading answers — its loading page in place of the
+/// outage page. A route without `cluster:` has nobody to stand in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_loading_member_stands_in_for_a_down_upstream() {
+    // An address nothing listens on: the configured upstream, down.
+    let down = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let (gw, hub) = gateway(down).await;
+    let m = joined(gw, 1, 100, false);
+    until("admitted", || hub.standing_by("zend") == Some(1)).await;
+    assert!(!hub.clustered("zend"), "loading, so dumb");
+
+    assert_eq!(
+        fetch(gw, "/v1/where").await.status,
+        503,
+        "the upstream refused"
+    );
+    let r = fetch(gw, "/v1/where").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["by"], "member-1", "the loading member stood in");
+    assert_eq!(
+        fetch(gw, "/plain/x").await.status,
+        503,
+        "no cluster on this route"
+    );
+
+    m.leave();
+    until("gone", || hub.standing_by("zend").is_none()).await;
+    assert_eq!(
+        fetch(gw, "/v1/where").await.status,
+        503,
+        "nobody left to stand in"
+    );
 }
 
 /// **Dispatch, claims and pinning** (§5.2–§5.4): `Best` takes the most

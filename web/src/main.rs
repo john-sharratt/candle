@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         let auth = cfg
             .auth
             .clone()
-            .map(|a| web::auth::Auth::new(a).map(|_| ()));
+            .map(|a| web::auth::Auth::new(a, cfg.roles.clone()).map(|_| ()));
         print_table(&cfg, cli.authoritative, auth.as_ref().map(|r| r.is_ok()));
         // The same for the TLS entrance: what it would ask the CA for, and
         // whether the store it would serve from loads.
