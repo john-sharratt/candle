@@ -14,8 +14,9 @@
 //! is, and said so, rather than overwritten.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use zend_vfs::{GitError, Oid, Repo, StatusCode, StatusEntry};
+use zend_vfs::{Fetch, GitError, Oid, Repo, StatusCode, StatusEntry};
 
 /// What following the record did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,10 +31,11 @@ pub enum Followed {
     Diverged,
 }
 
-/// Fetch the record of the branch checked out at `dir` and check it out, when
-/// the checkout is clean. `None` when `dir` is on no branch.
-pub fn follow(dir: &Path) -> Result<Option<Followed>, GitError> {
-    let repo = Repo::open(dir)?;
+/// Fetch the record of the branch checked out at `dir` through `fetcher` and
+/// check it out, when the checkout is clean. `None` when `dir` is on no
+/// branch.
+pub fn follow(dir: &Path, fetcher: Arc<dyn Fetch>) -> Result<Option<Followed>, GitError> {
+    let repo = Repo::open(dir)?.fetching_through(fetcher);
     let Some(branch) = repo.head()?.branch().cloned() else {
         return Ok(None);
     };

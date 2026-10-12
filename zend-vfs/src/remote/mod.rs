@@ -3,6 +3,8 @@
 
 pub mod bundle;
 pub mod fetch;
+pub mod fetch_bundle;
+pub mod fetcher;
 pub mod ls_remote;
 pub mod manage;
 pub mod probe;

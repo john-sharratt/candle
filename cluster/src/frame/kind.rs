@@ -83,6 +83,16 @@ kinds! {
     Fetch = 65,
     Done = 66,
     Have = 67,
+    PeerHello = 70,
+    AcmeChallenge = 71,
+    AcmeAck = 72,
+    AcmeClear = 73,
+    AcmeCert = 74,
+    AcmeLedger = 75,
+    AcmeInventory = 76,
+    AcmeOrdering = 77,
+    AcmeDone = 78,
+    AcmeAccount = 79,
 }
 
 impl Kind {

@@ -9,9 +9,10 @@
 //! - A push of commits the member built is made by the agent, under its
 //!   lease; an agent without push rights refuses it.
 //! - Through an in-process gateway, a member's job reaches an agent over
-//!   `group:agent`, and a repository opened pushing through the agents pushes
-//!   from there. Cut off, a member reaches only an agent in its own process,
-//!   and without one the job is `no_agent`.
+//!   `group:agent`, a repository opened pushing through the agents pushes from
+//!   there, and one opened fetching through them — a mirror with no way to
+//!   origin — follows origin's branch. Cut off, a member reaches only an agent
+//!   in its own process, and without one the job is `no_agent`.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -22,10 +23,11 @@ use std::time::{Duration, Instant};
 use agent::checkouts::Checkouts;
 use agent::client::{AgentError, Agents, At};
 use agent::config::{AgentConfig, CheckoutConfig};
+use agent::fetcher::AgentFetch;
 use agent::jobs::{JobError, Jobs};
 use agent::member::{Agent, APP};
 use agent::pusher::AgentPush;
-use agent::wire::{encode_bundle, JobView, PushJob, PushLine, RunJob, Submit};
+use agent::wire::{encode_bundle, FetchJob, JobView, PushJob, PushLine, RunJob, Submit};
 use cluster::dial::Connect;
 use cluster::dispatch::RouteTable;
 use cluster::frame::{BuildId, Capacity, MemberState, ModelId};
@@ -380,6 +382,25 @@ async fn a_members_jobs_reach_an_agent_through_the_gateway() {
         git(&r.origin, &["rev-parse", "main"]).trim(),
         tip.to_string()
     );
+
+    // A mirror that cannot reach origin — its `origin` names the agent, not a
+    // URL — follows origin through the agent (§10.3).
+    let mirror = r.jobs.parent().unwrap().join("mirror");
+    std::fs::create_dir(&mirror).unwrap();
+    git(&mirror, &["init", "-q", "-b", "main"]);
+    git(&mirror, &["remote", "add", "origin", "agent:r"]);
+    let fetcher = AgentFetch::shared(agents.clone(), Handle::current(), "r");
+    let pulled = spawn_blocking(move || {
+        Repo::open(&mirror)
+            .unwrap()
+            .fetching_through(fetcher)
+            .pull_branch(&main())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(pulled.on_origin, Some(tip.clone()));
+    assert_eq!(pulled.tip, Some(tip));
 }
 
 /// Cut off, a member's job goes to the agent in its own process, and with
@@ -393,10 +414,26 @@ async fn a_cut_off_member_reaches_only_its_own_agent() {
         .run("conv-2", run_job(&store))
         .await;
     assert!(matches!(none, Err(AgentError::NoAgent(_))), "{none:?}");
-    let own = Agents::new(member, Some(jobs_over(&r, false)))
+    let own = Agents::new(member.clone(), Some(jobs_over(&r, false)))
         .run("conv-2", run_job(&store))
         .await
         .unwrap();
     assert_eq!(own.at, At::InProcess);
     assert_eq!(own.view.status, JobStatus::Exited { code: Some(0) });
+
+    // A fetch goes the same way: to its own agent, else `no_agent`.
+    let job = FetchJob {
+        repo: "r".into(),
+        branch: Some("main".into()),
+        have: Vec::new(),
+    };
+    let none = Agents::new(member.clone(), None).fetch(job.clone()).await;
+    assert!(matches!(none, Err(AgentError::NoAgent(_))), "{none:?}");
+    let fetched = Agents::new(member, Some(jobs_over(&r, false)))
+        .fetch(job)
+        .await
+        .unwrap();
+    let origin_main = Oid::parse(git(&r.origin, &["rev-parse", "main"]).trim()).unwrap();
+    assert_eq!(fetched.tips.get(&main()), Some(&origin_main));
+    assert!(fetched.bundle.is_some(), "the member held nothing");
 }

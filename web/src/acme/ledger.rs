@@ -32,9 +32,16 @@
 
 use std::io::ErrorKind;
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use super::store::write_atomic;
+
+/// Held across every load-merge-save of a ledger file, so the renewal pass
+/// and a peer's merge never interleave one.
+static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 pub const HOUR: u64 = 3600;
 pub const DAY: u64 = 24 * HOUR;
@@ -99,7 +106,35 @@ impl Ledger {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        super::store::write_atomic(path, &serde_json::to_vec_pretty(self)?)
+        write_atomic(path, &serde_json::to_vec_pretty(self)?)
+    }
+
+    /// Take in `other`'s history: every attempt and every account either
+    /// holds, once each, in time order. Each is a fact that happened, so the
+    /// merge is their union, and two gateways that merge each other's ledgers
+    /// hold the same one in any order (§13.4).
+    pub fn merge(&mut self, other: &Ledger) {
+        for a in &other.attempts {
+            if !self.attempts.contains(a) {
+                self.attempts.push(a.clone());
+            }
+        }
+        self.attempts.sort_by_key(|a| a.at);
+        self.accounts.extend(other.accounts.iter().copied());
+        self.accounts.sort_unstable();
+        self.accounts.dedup();
+    }
+
+    /// Merge this ledger into the file at `path`, and take what the file then
+    /// holds: what a peer merged in since this ledger was read is kept, not
+    /// written over.
+    pub fn save_merged(&mut self, path: &Path) -> Result<()> {
+        let _held = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut on_disk = Ledger::load(path)?;
+        on_disk.merge(self);
+        on_disk.save(path)?;
+        *self = on_disk;
+        Ok(())
     }
 
     /// Record an order's end, and drop history older than any rule reads.
@@ -423,6 +458,66 @@ mod tests {
         l.record_account(T0);
         l.save(&path).unwrap();
         assert_eq!(Ledger::load(&path).unwrap(), l);
+    }
+
+    /// Two gateways' ledgers merged either way round are the same ledger:
+    /// every attempt once, in time order, and every account.
+    #[test]
+    fn ledgers_merge_to_the_union_in_any_order() {
+        let mut a = Ledger::default();
+        a.record(attempt("tokera", T0, Outcome::Issued));
+        a.record(attempt("npcd", T0 + 20, Outcome::Failed));
+        a.record_account(T0);
+        let mut b = Ledger::default();
+        b.record(attempt("zend", T0 + 10, Outcome::RateLimited));
+        b.record(attempt("tokera", T0, Outcome::Issued));
+        b.record_account(T0 + 5);
+
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        assert_eq!(ab, ba);
+        let order: Vec<(&str, u64)> = ab
+            .attempts
+            .iter()
+            .map(|x| (x.site.as_str(), x.at))
+            .collect();
+        assert_eq!(
+            order,
+            [("tokera", T0), ("zend", T0 + 10), ("npcd", T0 + 20)]
+        );
+        assert_eq!(ab.accounts, [T0, T0 + 5]);
+        // A peer's failed order now holds this gateway's site back too.
+        assert_eq!(
+            ab.may_order("npcd", T0 + 30).unwrap_err(),
+            Wait {
+                until: T0 + 20 + HOUR,
+                why: "this site's last order failed"
+            }
+        );
+    }
+
+    /// A save merges into what the file holds: a peer's merge made between
+    /// this ledger's read and its save survives.
+    #[test]
+    fn a_save_keeps_what_a_peer_merged_in_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut mine = Ledger::load(&path).unwrap();
+        let mut peer = Ledger::default();
+        peer.record(attempt("npcd", T0, Outcome::Issued));
+        peer.save_merged(&path).unwrap();
+        mine.record(attempt("tokera", T0 + 1, Outcome::Issued));
+        mine.save_merged(&path).unwrap();
+        let sites: Vec<String> = Ledger::load(&path)
+            .unwrap()
+            .attempts
+            .into_iter()
+            .map(|a| a.site)
+            .collect();
+        assert_eq!(sites, ["npcd", "tokera"]);
+        assert_eq!(mine.attempts.len(), 2);
     }
 
     /// A ledger that cannot be read refuses to load rather than reading as

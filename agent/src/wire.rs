@@ -11,16 +11,23 @@
 //!   atomic push, each under its lease. The member builds commits and merges
 //!   in its own repository; only the write to origin needs the credentials an
 //!   agent holds.
+//! - **`fetch`** — `{ repo, branch, have }`: fetch origin, and answer with
+//!   what it holds for `branch` — every branch when `branch` is absent — and a
+//!   bundle of their objects the member's `have` does not reach. A member
+//!   whose repository lives with an agent reads origin through it
+//!   (`docs/replicated_substrate.md` §10.3).
 //!
 //! Every answer is a [`JobView`]: where the job stands, and once it has
 //! ended, what it came to.
+
+use std::collections::BTreeMap;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use zend_vfs::{
-    JobStatus, Lease, Oid, PushAction, PushOutcome, PushResult, PushSpec, PushTarget, RefName,
-    RunOutcome, Snapshot,
+    BranchName, FetchBundle, JobStatus, Lease, Oid, PushAction, PushOutcome, PushResult, PushSpec,
+    PushTarget, RefName, RunOutcome, Snapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -28,6 +35,7 @@ use zend_vfs::{
 pub enum Submit {
     Run(RunJob),
     Push(PushJob),
+    Fetch(FetchJob),
 }
 
 impl Submit {
@@ -35,7 +43,54 @@ impl Submit {
         match self {
             Submit::Run(r) => &r.repo,
             Submit::Push(p) => &p.repo,
+            Submit::Fetch(f) => &f.repo,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchJob {
+    pub repo: String,
+    /// The branch asked for; `None`: every branch.
+    pub branch: Option<String>,
+    /// Commits the member holds: what the bundle leaves out.
+    pub have: Vec<String>,
+}
+
+/// What origin holds for a fetch, and the objects the member lacks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fetched {
+    /// Each branch's commit on origin.
+    pub tips: BTreeMap<String, String>,
+    /// A git bundle in base64; `None` when the member lacks nothing.
+    pub bundle: Option<String>,
+}
+
+impl Fetched {
+    pub fn of(f: &FetchBundle) -> Fetched {
+        Fetched {
+            tips: f
+                .tips
+                .iter()
+                .map(|(b, o)| (b.as_str().to_string(), o.to_string()))
+                .collect(),
+            bundle: f.bundle.as_deref().map(encode_bundle),
+        }
+    }
+
+    pub fn bundle(&self) -> Result<FetchBundle, BadWire> {
+        let tips = self
+            .tips
+            .iter()
+            .map(|(b, o)| {
+                let branch = BranchName::parse(b).map_err(|e| BadWire(format!("`{b}`: {e}")))?;
+                Ok((branch, oid(o)?))
+            })
+            .collect::<Result<_, BadWire>>()?;
+        Ok(FetchBundle {
+            tips,
+            bundle: self.bundle.as_deref().map(decode_bundle).transpose()?,
+        })
     }
 }
 
@@ -90,22 +145,24 @@ pub struct JobView {
     pub outcome: Option<RunOutcome>,
     /// A push's refs, once it has been made.
     pub pushed: Vec<Pushed>,
+    /// A fetch's answer, on the answer to its submit only.
+    pub fetched: Option<Fetched>,
 }
 
-/// Why a [`PushLine`] or [`Pushed`] does not name a push.
+/// Why a [`PushLine`], [`Pushed`] or [`Fetched`] does not read as one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub struct BadPush(pub String);
+pub struct BadWire(pub String);
 
-fn target_of(name: &str) -> Result<PushTarget, BadPush> {
+fn target_of(name: &str) -> Result<PushTarget, BadWire> {
     RefName::parse(name)
         .ok()
         .and_then(|r| PushTarget::from_ref(&r))
-        .ok_or_else(|| BadPush(format!("`{name}` is not a branch or a tag")))
+        .ok_or_else(|| BadWire(format!("`{name}` is not a branch or a tag")))
 }
 
-fn oid(text: &str) -> Result<Oid, BadPush> {
-    Oid::parse(text).map_err(|e| BadPush(format!("`{text}`: {e}")))
+fn oid(text: &str) -> Result<Oid, BadWire> {
+    Oid::parse(text).map_err(|e| BadWire(format!("`{text}`: {e}")))
 }
 
 impl PushLine {
@@ -123,7 +180,7 @@ impl PushLine {
         }
     }
 
-    pub fn spec(&self) -> Result<PushSpec, BadPush> {
+    pub fn spec(&self) -> Result<PushSpec, BadWire> {
         Ok(PushSpec {
             target: target_of(&self.target)?,
             action: match &self.to {
@@ -146,7 +203,7 @@ impl Pushed {
         }
     }
 
-    pub fn result(&self) -> Result<PushResult, BadPush> {
+    pub fn result(&self) -> Result<PushResult, BadWire> {
         Ok(PushResult {
             target: target_of(&self.target)?,
             outcome: self.outcome.clone(),
@@ -159,10 +216,10 @@ pub fn encode_bundle(bytes: &[u8]) -> String {
     STANDARD.encode(bytes)
 }
 
-pub fn decode_bundle(text: &str) -> Result<Vec<u8>, BadPush> {
+pub fn decode_bundle(text: &str) -> Result<Vec<u8>, BadWire> {
     STANDARD
         .decode(text)
-        .map_err(|e| BadPush(format!("the bundle is not base64: {e}")))
+        .map_err(|e| BadWire(format!("the bundle is not base64: {e}")))
 }
 
 #[cfg(test)]
@@ -252,15 +309,52 @@ mod tests {
             bytes: 40,
             outcome: None,
             pushed: Vec::new(),
+            fetched: None,
         };
         let wire = serde_json::to_value(&view).unwrap();
         assert_eq!(
             wire,
             json!({
                 "id": "AAAAAAAAAAA", "repo": "candle", "status": "exited", "code": 0,
-                "lines": 3, "bytes": 40, "outcome": null, "pushed": []
+                "lines": 3, "bytes": 40, "outcome": null, "pushed": [], "fetched": null
             })
         );
         assert_eq!(serde_json::from_value::<JobView>(wire).unwrap(), view);
+    }
+
+    /// A fetch asks for a branch past what the member holds; its answer
+    /// names each branch's commit and carries the bundle — exactly these
+    /// bytes — and reads back as the bundle the member takes.
+    #[test]
+    fn a_fetch_and_its_answer_are_their_json() {
+        let fetch = Submit::Fetch(FetchJob {
+            repo: "mind".into(),
+            branch: Some("main".into()),
+            have: vec![A.into()],
+        });
+        assert_eq!(
+            serde_json::to_value(&fetch).unwrap(),
+            json!({ "job": "fetch", "repo": "mind", "branch": "main", "have": [A] })
+        );
+        let answer = Fetched {
+            tips: BTreeMap::from([("main".to_string(), B.to_string())]),
+            bundle: Some(encode_bundle(b"PACK")),
+        };
+        assert_eq!(
+            serde_json::to_value(&answer).unwrap(),
+            json!({ "tips": { "main": B }, "bundle": "UEFDSw==" })
+        );
+        let taken = answer.bundle().unwrap();
+        assert_eq!(
+            taken.tips,
+            BTreeMap::from([(BranchName::parse("main").unwrap(), Oid::parse(B).unwrap())])
+        );
+        assert_eq!(taken.bundle.as_deref(), Some(&b"PACK"[..]));
+        assert_eq!(Fetched::of(&taken), answer);
+        let bad = Fetched {
+            tips: BTreeMap::from([("main".to_string(), "zz".to_string())]),
+            bundle: None,
+        };
+        assert!(bad.bundle().is_err());
     }
 }

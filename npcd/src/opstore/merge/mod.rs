@@ -8,8 +8,10 @@
 //! there the way a conversation's work does in zend: one commit on the store's
 //! base, published under a lease on what the record held when the commit
 //! began, so a record that moves in between refuses it and nothing changes.
-//! Its push goes through the [`Push`] it is opened with: this checkout, or an
-//! agent holding the repository with push rights (§11.5).
+//! Its push goes through the [`Push`] it is opened with — this checkout, or an
+//! agent holding the repository with push rights (§11.5) — and its reads of
+//! the record through the [`Fetch`]: an agent when the mind is a mirror of the
+//! repository the agents hold (§10.3).
 //!
 //! | Module | |
 //! |---|---|
@@ -28,7 +30,7 @@ use std::sync::Arc;
 
 use zend_vfs::work::held;
 use zend_vfs::{
-    merge_into, BranchName, GitError, Merged, Oid, Push, Repo, Rev, Snapshot, VfsStore,
+    merge_into, BranchName, Fetch, GitError, Merged, Oid, Push, Repo, Rev, Snapshot, VfsStore,
 };
 
 /// What the merge marks the record's side of an overlap with.
@@ -42,20 +44,23 @@ pub struct Merge<'a> {
 }
 
 impl<'a> Merge<'a> {
-    /// The store over the repository at `dir`, its pushes made by `pusher`.
-    /// Refused when the store is not read through a branch: a mind folder that
-    /// is not a git repository has no record to land anything on.
+    /// The store over the repository at `dir`, its pushes made by `pusher`
+    /// and its fetches of the record by `fetcher`. Refused when the store is
+    /// not read through a branch: a mind folder that is not a git repository
+    /// has no record to land anything on.
     pub fn open(
         dir: &Path,
         store: &'a VfsStore,
         pusher: Arc<dyn Push>,
+        fetcher: Arc<dyn Fetch>,
     ) -> Result<Merge<'a>, String> {
         let Some(Rev::Branch(branch)) = store.rev() else {
             return Err(NOT_UNDER_GIT.to_string());
         };
         let repo = Repo::open(dir)
             .map_err(|e| format!("the mind repository cannot be opened: {e}"))?
-            .pushing_through(pusher);
+            .pushing_through(pusher)
+            .fetching_through(fetcher);
         Ok(Merge {
             repo,
             store,

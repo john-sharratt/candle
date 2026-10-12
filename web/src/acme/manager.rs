@@ -14,17 +14,29 @@
 //! Sites are ordered one at a time. Every order's outcome is written to the
 //! ledger before the next step can fail, so no path through here — an error, a
 //! crash, a restart — can place an order the ledger does not know about.
+//!
+//! With peers (§13.4), a due site is ordered only by its orderer among the
+//! gateways linked now, and not while a peer announces an order for it; the
+//! ledger is merged with the peers' and sent to them on every change, and a
+//! new account is shared. A peer leaving, or finishing an order, wakes the
+//! loop early — after at least [`MIN_SLEEP`] — since this gateway may now be
+//! the orderer of a site that is due.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use instant_acme::{Account, CertificateIdentifier, NewAccount};
+use tokio::time::sleep;
 
+use super::ca::LetsEncrypt;
+use super::certs::Certs;
 use super::challenges::Challenges;
-use super::issue::{issue, IssueError};
+use super::issue::IssueError;
 use super::ledger::{Attempt, Ledger, Outcome, HOUR};
 use super::names::Group;
+use super::order::order_site;
+use super::peers::AcmePeers;
 use super::preflight::reachable;
 use super::store::{Store, Stored};
 use super::LETS_ENCRYPT;
@@ -55,9 +67,8 @@ enum Due {
 
 pub struct Manager {
     groups: Vec<Group>,
-    store: Store,
-    challenges: Challenges,
-    resolver: Arc<Resolver>,
+    certs: Arc<Certs>,
+    peers: Option<Arc<AcmePeers>>,
 }
 
 impl Manager {
@@ -72,23 +83,36 @@ impl Manager {
         // every configuration this crate builds itself. Already installed is
         // fine: it can only have been installed as the same one.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let store = Store::new(&acme.store);
         Self {
             groups,
-            store,
-            challenges,
-            resolver,
+            certs: Arc::new(Certs {
+                store: Store::new(&acme.store),
+                resolver,
+                challenges,
+            }),
+            peers: None,
         }
+    }
+
+    /// What this gateway serves, for its peers to install into too.
+    pub fn certs(&self) -> Arc<Certs> {
+        self.certs.clone()
+    }
+
+    /// Order with `peers` (§13.4).
+    pub fn with_peers(mut self, peers: Arc<AcmePeers>) -> Self {
+        self.peers = Some(peers);
+        self
     }
 
     /// Put what the store holds in front of the entrance. Called before the
     /// entrance binds, so a restart serves the certificates it already has
     /// without waiting on the CA.
     pub fn install_stored(&self) -> Result<()> {
-        let certs = self.store.load_certs()?;
-        self.resolver.install(&certs);
+        let certs = self.certs.held()?;
+        self.certs.resolver.install(&certs);
         tracing::info!(
-            names = ?self.resolver.names(),
+            names = ?self.certs.resolver.names(),
             "acme: certificates installed from the store"
         );
         Ok(())
@@ -105,18 +129,41 @@ impl Manager {
                     now + HOUR
                 }
             };
-            let sleep = next.saturating_sub(unix_now()).max(MIN_SLEEP);
-            tracing::info!(in_secs = sleep, "acme: next certificate check");
-            tokio::time::sleep(Duration::from_secs(sleep)).await;
+            let secs = next.saturating_sub(unix_now()).max(MIN_SLEEP);
+            tracing::info!(in_secs = secs, "acme: next certificate check");
+            match &self.peers {
+                Some(peers) => {
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(secs)) => {}
+                        _ = peers.woken() => {
+                            let rested = unix_now().saturating_sub(now);
+                            let wait = MIN_SLEEP.saturating_sub(rested);
+                            tracing::info!(in_secs = wait, "acme: a peer left or finished an order — checking again");
+                            sleep(Duration::from_secs(wait)).await;
+                        }
+                    }
+                }
+                None => sleep(Duration::from_secs(secs)).await,
+            }
         }
+    }
+
+    /// Write `ledger`, merged with what the file holds, and send it to the
+    /// peers.
+    fn save(&self, ledger: &mut Ledger) -> Result<()> {
+        ledger.save_merged(&self.certs.store.ledger_path())?;
+        if let Some(p) = &self.peers {
+            p.ledger_changed()?;
+        }
+        Ok(())
     }
 
     /// One look at every site. Returns when the next look is wanted.
     async fn pass(&self, now: u64) -> Result<u64> {
-        let ledger_path = self.store.ledger_path();
-        let mut ledger = Ledger::load(&ledger_path)?;
-        let stored = self.store.load_certs()?;
-        let mut account = match self.store.load_account()? {
+        let store = &self.certs.store;
+        let mut ledger = Ledger::load(&store.ledger_path())?;
+        let stored = self.certs.held()?;
+        let mut account = match store.load_account()? {
             Some(creds) => Some(
                 Account::builder()?
                     .from_credentials(creds)
@@ -134,7 +181,7 @@ impl Manager {
         // not involved.
         let mut reach: Vec<Vec<String>> = Vec::with_capacity(self.groups.len());
         for group in &self.groups {
-            let ok = reachable(&self.challenges, &group.names).await;
+            let ok = reachable(&self.certs.challenges, &group.names).await;
             let unreachable: Vec<&String> =
                 group.names.iter().filter(|n| !ok.contains(n)).collect();
             if unreachable.is_empty() {
@@ -157,6 +204,13 @@ impl Manager {
                 Some(d) => d,
                 None => continue,
             };
+
+            if let Some(p) = &self.peers {
+                if let Err(why) = p.orders(&group.site) {
+                    tracing::info!(site = %group.site, ?due, %why, "acme: due, ordered by a peer");
+                    continue;
+                }
+            }
 
             if let Err(wait) = ledger.may_order(&group.site, now) {
                 tracing::info!(
@@ -195,7 +249,7 @@ impl Manager {
                 // Recorded before the request: a creation that fails after the
                 // CA counted it must still count here.
                 ledger.record_account(now);
-                ledger.save(&ledger_path)?;
+                self.save(&mut ledger)?;
                 let (acct, creds) = Account::builder()?
                     .create(
                         &NewAccount {
@@ -208,16 +262,24 @@ impl Manager {
                     )
                     .await
                     .context("acme: creating the account")?;
-                self.store.save_account(&creds)?;
+                store.save_account(&creds)?;
                 tracing::info!("acme: account created");
+                if let Some(p) = &self.peers {
+                    p.account_created()?;
+                }
                 account = Some(acct);
             }
             let acct = account.as_ref().expect("set above");
 
             tracing::info!(site = %group.site, ?due, ?names, "acme: ordering");
-            let result = issue(acct, &self.challenges, &names, replaces).await;
-            let outcome = match &result {
-                Ok(_) => Outcome::Issued,
+            let ca = LetsEncrypt {
+                account: acct,
+                replaces,
+            };
+            let ordered =
+                order_site(&ca, &self.certs, self.peers.as_deref(), &group.site, &names).await;
+            let outcome = match &ordered.outcome {
+                Ok(()) => Outcome::Issued,
                 Err(IssueError::RateLimited(_)) => Outcome::RateLimited,
                 Err(IssueError::Failed(_)) => Outcome::Failed,
             };
@@ -227,13 +289,11 @@ impl Manager {
                 at: unix_now(),
                 outcome,
             });
-            ledger.save(&ledger_path)?;
+            self.save(&mut ledger)?;
+            ordered.installed?;
 
-            match result {
-                Ok(issued) => {
-                    self.store
-                        .save_cert(&group.site, &issued.chain_pem, &issued.key_pem)?;
-                    self.resolver.install(&self.store.load_certs()?);
+            match ordered.outcome {
+                Ok(()) => {
                     tracing::info!(site = %group.site, ?names, "acme: certificate issued and installed");
                 }
                 Err(IssueError::RateLimited(m)) => {

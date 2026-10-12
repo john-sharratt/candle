@@ -291,6 +291,7 @@ async fn serve_tenants(
             cluster: cluster
                 .as_ref()
                 .and_then(|c| Join::new(Arc::clone(c), name)),
+            stopping: Arc::clone(&stopping),
         };
         match tenant.start(ctx).await {
             Ok(started) => {

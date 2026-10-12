@@ -579,6 +579,99 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u8(0)
                 .0,
         ),
+        (
+            Frame::PeerHello(PeerHello {
+                node: 0x51,
+                build: build(),
+                session_key: [0x11; 32],
+                oauth_client: [0x22; 32],
+            }),
+            B::header(70, 0, 0)
+                .u64(0x51)
+                .build(&build())
+                .raw(&[0x11; 32])
+                .raw(&[0x22; 32])
+                .0,
+        ),
+        (
+            Frame::AcmeChallenge(AcmeChallenge {
+                site: "tokera".into(),
+                token: "tok".into(),
+                answer: "tok.thumb".into(),
+                expires_ms: 1_700_000_600_000,
+            }),
+            B::header(71, 0, 0)
+                .s("tokera")
+                .s("tok")
+                .s("tok.thumb")
+                .u64(1_700_000_600_000)
+                .0,
+        ),
+        (
+            Frame::AcmeAck {
+                token: "tok".into(),
+            },
+            B::header(72, 0, 0).s("tok").0,
+        ),
+        (
+            Frame::AcmeClear {
+                token: "tok".into(),
+            },
+            B::header(73, 0, 0).s("tok").0,
+        ),
+        (
+            Frame::AcmeCert(AcmeCert {
+                site: "tokera".into(),
+                chain_pem: "CHAIN".into(),
+                key_pem: "KEY".into(),
+                not_after: 1_800_000_000,
+            }),
+            B::header(74, 0, 0)
+                .s("tokera")
+                .s("CHAIN")
+                .s("KEY")
+                .u64(1_800_000_000)
+                .0,
+        ),
+        (
+            Frame::AcmeLedger {
+                ledger: b"{}".to_vec(),
+            },
+            B::header(75, 0, 0).u32(2).raw(b"{}").0,
+        ),
+        (
+            Frame::AcmeInventory {
+                certs: vec![CertLine {
+                    site: "tokera".into(),
+                    not_after: 1_800_000_000,
+                    digest: [0x33; 32],
+                }],
+            },
+            B::header(76, 0, 0)
+                .u32(1)
+                .s("tokera")
+                .u64(1_800_000_000)
+                .raw(&[0x33; 32])
+                .0,
+        ),
+        (
+            Frame::AcmeOrdering {
+                site: "tokera".into(),
+            },
+            B::header(77, 0, 0).s("tokera").0,
+        ),
+        (
+            Frame::AcmeDone {
+                site: "tokera".into(),
+            },
+            B::header(78, 0, 0).s("tokera").0,
+        ),
+        (
+            Frame::AcmeAccount {
+                account: b"{\"id\":1}".to_vec(),
+            },
+            B::header(79, 0, 0).u32(8).raw(b"{\"id\":1}").0,
+        ),
     ]
 }
 
@@ -706,4 +799,5 @@ fn lanes_follow_the_table() {
     assert_eq!(lane(Kind::Headers), vec![Lane::CatchUp]);
     assert_eq!(lane(Kind::BuildChunk), vec![Lane::CatchUp]);
     assert_eq!(lane(Kind::Fetch), vec![Lane::Control]);
+    assert_eq!(lane(Kind::AcmeCert), vec![Lane::Control]);
 }

@@ -31,7 +31,7 @@ impl FetchSpec {
 
     /// The refs this fetch may change: one tracking ref, or the remote's
     /// whole tracking namespace.
-    fn scope(&self, remote: &RemoteName) -> String {
+    pub(crate) fn scope(&self, remote: &RemoteName) -> String {
         match self {
             Self::Branch(branch) => remote.tracking(branch).to_string(),
             Self::AllBranches => format!("refs/remotes/{remote}/"),
@@ -77,7 +77,7 @@ fn parse_snapshot(out: &str) -> Result<BTreeMap<RefName, Oid>, GitError> {
 
 impl Repo {
     /// The refs under `scope` — a ref name or a namespace ending in `/`.
-    fn snapshot(&self, scope: &str) -> Result<BTreeMap<RefName, Oid>, GitError> {
+    pub(crate) fn snapshot(&self, scope: &str) -> Result<BTreeMap<RefName, Oid>, GitError> {
         if let Some(lib) = self.library() {
             return refs::snapshot(&lib, scope);
         }
@@ -90,12 +90,23 @@ impl Repo {
         parse_snapshot(&utf8("for-each-ref", out)?)
     }
 
-    /// Fetch `spec` from `remote` and report what changed.
+    /// Fetch `spec` from `remote` through this repository's [`Fetch`]: from
+    /// the remote itself, or from an agent when the repository was opened
+    /// [`fetching through`](Repo::fetching_through) one (§10.3).
+    pub fn fetch(&self, remote: &RemoteName, spec: &FetchSpec) -> Result<Vec<RefUpdate>, GitError> {
+        self.fetcher.clone().fetch(self, remote, spec)
+    }
+
+    /// Fetch `spec` from `remote` itself and report what changed.
     ///
     /// The changes are read from the tracking refs themselves — snapshotted
     /// before and after — rather than from git's report of them, which only
     /// newer releases print in a machine-readable form.
-    pub fn fetch(&self, remote: &RemoteName, spec: &FetchSpec) -> Result<Vec<RefUpdate>, GitError> {
+    pub fn fetch_here(
+        &self,
+        remote: &RemoteName,
+        spec: &FetchSpec,
+    ) -> Result<Vec<RefUpdate>, GitError> {
         self.require_remote(remote)?;
         let _write = self.write_lock();
         let scope = spec.scope(remote);
@@ -114,9 +125,17 @@ impl Repo {
             .transfer(remote)
             .run_ok()?;
         let after = self.snapshot(&scope)?;
+        self.changed(&before, &after)
+    }
 
+    /// How the refs went from `before` to `after`: each new, moved or gone.
+    pub(crate) fn changed(
+        &self,
+        before: &BTreeMap<RefName, Oid>,
+        after: &BTreeMap<RefName, Oid>,
+    ) -> Result<Vec<RefUpdate>, GitError> {
         let mut updates = Vec::new();
-        for (name, new) in &after {
+        for (name, new) in after {
             let flag = match before.get(name) {
                 None => FetchFlag::New,
                 Some(old) if old == new => continue,
@@ -135,7 +154,7 @@ impl Repo {
                 local: name.clone(),
             });
         }
-        for (name, old) in &before {
+        for (name, old) in before {
             if !after.contains_key(name) {
                 updates.push(RefUpdate {
                     flag: FetchFlag::Pruned,

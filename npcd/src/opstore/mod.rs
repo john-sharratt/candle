@@ -41,7 +41,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use candle_conversation::persistence::SharedSubstrate;
 use store_events::Mirror;
 use tokio::sync::watch;
-use zend_vfs::{here, GitError, Push, RepoFiles, RepoSpec, Rev, VfsStore, Workspace};
+use zend_vfs::{
+    fetch_here, here, Fetch, GitError, Push, RepoFiles, RepoSpec, Rev, VfsStore, Workspace,
+};
 
 use self::log::Substrate;
 use self::merge::follow::{follow, Followed};
@@ -65,6 +67,9 @@ pub struct MindStores {
     /// What makes a publish's push: an agent under `--cluster` (§11.5), this
     /// checkout otherwise.
     pusher: OnceLock<Arc<dyn Push>>,
+    /// What makes the record's fetches: an agent under `--cluster`, the mind
+    /// a mirror of the repository it holds (§10.3); this checkout otherwise.
+    fetcher: OnceLock<Arc<dyn Fetch>>,
     /// How many times the mind folder has been moved to a newer record, for
     /// whatever reads the folder to read it again.
     moved: watch::Sender<u64>,
@@ -90,6 +95,7 @@ impl MindStores {
             quiet: OnceLock::new(),
             held: Mutex::new(HashMap::new()),
             pusher: OnceLock::new(),
+            fetcher: OnceLock::new(),
             moved: watch::channel(0).0,
         })
     }
@@ -97,7 +103,7 @@ impl MindStores {
     /// Bring the mind folder up to the record ([`follow`]), telling whatever
     /// watches [`Self::moves`] when it moved. `None` for a daemon with no mind.
     pub fn follow(&self) -> Option<Result<Option<Followed>, GitError>> {
-        let followed = follow(self.mind_dir()?);
+        let followed = follow(self.mind_dir()?, self.fetcher());
         if let Ok(Some(Followed::Moved { .. })) = &followed {
             self.moved.send_modify(|n| *n += 1);
         }
@@ -118,6 +124,15 @@ impl MindStores {
         self.pusher.get().cloned().unwrap_or_else(here)
     }
 
+    /// Make every fetch of the record through `fetcher`.
+    pub fn set_fetcher(&self, fetcher: Arc<dyn Fetch>) {
+        let _ = self.fetcher.set(fetcher);
+    }
+
+    fn fetcher(&self) -> Arc<dyn Fetch> {
+        self.fetcher.get().cloned().unwrap_or_else(fetch_here)
+    }
+
     /// Run `merge` over `owner`'s store as it lands on the record, and keep
     /// what it changed. `None` when this daemon has no mind; `Err` when the
     /// store cannot be merged at all.
@@ -127,9 +142,9 @@ impl MindStores {
         merge: impl FnOnce(&Merge<'_>) -> T,
     ) -> Option<Result<T, String>> {
         let dir = self.mind_dir()?.to_path_buf();
-        let pusher = self.pusher();
+        let (pusher, fetcher) = (self.pusher(), self.fetcher());
         self.change(owner, |store| {
-            Merge::open(&dir, store, pusher).map(|m| merge(&m))
+            Merge::open(&dir, store, pusher, fetcher).map(|m| merge(&m))
         })
     }
 

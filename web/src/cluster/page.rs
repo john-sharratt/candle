@@ -15,7 +15,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::route::{forward, Context};
 use super::{upgrades, Gateway};
@@ -96,11 +96,18 @@ async fn status(
     if let Err(refused) = admin(&s, &headers) {
         return *refused;
     }
-    (
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(s.gateway.hub.status(q.log.unwrap_or(LOG_LIMIT))),
-    )
-        .into_response()
+    let mut status = match serde_json::to_value(s.gateway.hub.status(q.log.unwrap_or(LOG_LIMIT))) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the status did not serialize: {e}"),
+            )
+                .into_response()
+        }
+    };
+    status["peers"] = s.gateway.peers_view().unwrap_or(Value::Null);
+    ([(header::CACHE_CONTROL, "no-store")], Json(status)).into_response()
 }
 
 /// Stop admitting member sockets, close the ones there with `1001`, and

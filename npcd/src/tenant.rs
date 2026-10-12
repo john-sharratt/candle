@@ -48,6 +48,7 @@ use crate::engine::watcher::{spawn as watch_mind, ReloadReport};
 use crate::identity::log_identity;
 use crate::images::Images;
 use crate::mind::Mind;
+use crate::mind_repo::MindRepo;
 use crate::npcs::{Casting, Npcs};
 use crate::personality_portrait;
 use crate::projection;
@@ -92,6 +93,18 @@ pub struct NpcdArgs {
     /// and its authored registries read from.
     #[arg(long, value_name = "DIR")]
     pub mind: Option<PathBuf>,
+
+    /// The mind as a repository the cluster's agents hold, by its name there —
+    /// how a member with `--cluster` has a mind, in place of `--mind`
+    /// (`docs/replicated_substrate.md` §10.3). It is mirrored under `--data`,
+    /// at `mind/<name>`, and fetched and pushed through agents only, so this
+    /// machine needs neither the repository nor a way to its origin.
+    #[arg(long, value_name = "NAME")]
+    pub mind_repo: Option<String>,
+
+    /// The branch of `--mind-repo` that is the record.
+    #[arg(long, value_name = "BRANCH", default_value = DEFAULT_MIND_BRANCH)]
+    pub mind_branch: String,
 
     /// The directory the console is served from, read per request — saving a
     /// file there is the deployment. By default `web/content/npcd` in the
@@ -140,6 +153,9 @@ pub struct NpcdArgs {
     pub tombstone_retention: u64,
 }
 
+/// `--mind-branch`'s default.
+const DEFAULT_MIND_BRANCH: &str = "main";
+
 /// `--tombstone-retention`'s default, in days: the substrate's own.
 const DEFAULT_TOMBSTONE_RETENTION_DAYS: u64 =
     DEFAULT_TOMBSTONE_RETENTION.as_secs() / SECONDS_PER_DAY;
@@ -176,6 +192,8 @@ impl Default for NpcdArgs {
         Self {
             data: None,
             mind: None,
+            mind_repo: None,
+            mind_branch: DEFAULT_MIND_BRANCH.to_string(),
             ui: PathBuf::from(DEFAULT_UI),
             log_identity: false,
             forget_conversations: false,
@@ -206,7 +224,30 @@ impl NpcdArgs {
     /// up. Fatal rather than a fallback: a daemon that quietly reverted to the
     /// bundled placeholder would run with none of the named mind's content.
     pub fn resolve(self) -> anyhow::Result<NpcdTenant> {
-        let schema = projection::Source::resolve(self.mind.as_deref())?;
+        // A mind repository is read through its mirror under `--data`; until
+        // the mirror holds the record, the daemon starts with no mind and
+        // fetches it once joined (§10.3).
+        let repo = match &self.mind_repo {
+            Some(name) => {
+                if self.mind.is_some() {
+                    anyhow::bail!(
+                        "--mind and --mind-repo both name the mind: a folder here, or a \
+                         repository the agents hold — give one"
+                    );
+                }
+                let data = self.data.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--mind-repo keeps its mirror under --data: name one")
+                })?;
+                Some(MindRepo::new(data, name, &self.mind_branch)?)
+            }
+            None => None,
+        };
+        let mind = match &repo {
+            Some(r) if r.ready() => Some(r.dir.clone()),
+            Some(_) => None,
+            None => self.mind.clone(),
+        };
+        let schema = projection::Source::resolve(mind.as_deref())?;
         // **The compiled-in default is a path on the machine that built
         // this.** Used when it is really there; the working directory stands in
         // when it is not, and the choice is logged at start.
@@ -226,6 +267,7 @@ impl NpcdArgs {
             schema,
             data,
             fell_back,
+            repo,
         })
     }
 }
@@ -238,6 +280,8 @@ pub struct NpcdTenant {
     /// The compiled-in data directory was not on this machine, and the working
     /// directory stands in.
     fell_back: bool,
+    /// The mind repository the agents hold, with `--mind-repo`.
+    repo: Option<MindRepo>,
 }
 
 impl Tenant for NpcdTenant {
@@ -272,7 +316,29 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         schema,
         data,
         fell_back,
+        repo,
     } = t;
+    // With `--cluster` the mind is a repository the agents hold; without it
+    // there are no agents to hold one (§10.3).
+    match (&repo, ctx.cluster.is_some(), args.mind.is_some()) {
+        (Some(_), false, _) => anyhow::bail!(
+            "--mind-repo reaches the mind through the cluster's agents, and there is no \
+             --cluster"
+        ),
+        (None, true, true) => anyhow::bail!(
+            "with --cluster the mind is a repository the agents hold: name it with \
+             --mind-repo, not a folder with --mind"
+        ),
+        _ => {}
+    }
+    if let Some(r) = repo.as_ref().filter(|r| !r.ready()) {
+        tracing::warn!(
+            "the mind repository `{}` is not mirrored at {} yet: starting with no mind; once \
+             joined it is fetched through an agent and the process restarts onto it",
+            r.name,
+            r.dir.display()
+        );
+    }
     match &schema.dir {
         Some(dir) => tracing::info!(
             "projection schema: {} (collections resolve under {})",
@@ -458,6 +524,8 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
             cast,
             characters,
             authored: identities,
+            mind_repo: repo,
+            stopping: ctx.stopping.clone(),
         },
     );
 
@@ -896,6 +964,51 @@ mod tests {
                 "{key} must not be settable from tokerad.yaml"
             );
         }
+    }
+
+    /// **A mind repository is mirrored under `--data`**, one or the other of
+    /// a folder and a repository, never both, and a mirror not yet holding the
+    /// record starts on no mind; `mind_repo:` reads the same from
+    /// `tokerad.yaml`.
+    #[test]
+    fn a_mind_repository_is_mirrored_under_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().to_str().unwrap();
+        let t = parse(&["--mind-repo", "mind", "--data", data])
+            .resolve()
+            .unwrap();
+        let repo = t.repo.clone().unwrap();
+        assert_eq!(repo.dir, dir.path().join("mind").join("mind"));
+        assert_eq!(repo.branch.as_str(), "main");
+        assert_eq!(t.schema.dir, None, "not mirrored yet: no mind");
+        assert_eq!(t.data, dir.path());
+
+        std::fs::create_dir_all(&repo.dir).unwrap();
+        std::fs::write(repo.dir.join(projection::SCHEMA_FILE), projection::BUNDLED).unwrap();
+        let ready = parse(&[
+            "--mind-repo",
+            "mind",
+            "--data",
+            data,
+            "--mind-branch",
+            "record",
+        ])
+        .resolve()
+        .unwrap();
+        assert_eq!(ready.schema.dir.as_deref(), Some(repo.dir.as_path()));
+        assert_eq!(ready.repo.unwrap().branch.as_str(), "record");
+
+        let both = parse(&["--mind-repo", "mind", "--data", data, "--mind", "../mind"]).resolve();
+        assert!(both.is_err());
+        let no_data = parse(&["--mind-repo", "mind"]).resolve();
+        assert!(no_data
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("--mind-repo keeps its mirror under --data"));
+        let yaml: NpcdArgs =
+            serde_yaml::from_str(&format!("mind_repo: mind\ndata: '{data}'\n")).unwrap();
+        assert_eq!(yaml, parse(&["--mind-repo", "mind", "--data", data]));
     }
 
     /// npcd needs what zend needs of the model, and the prescribed one has it.

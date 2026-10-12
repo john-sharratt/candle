@@ -15,6 +15,7 @@ mod handshake;
 mod kind;
 mod membership;
 mod packing;
+mod peering;
 mod pulse;
 mod streams;
 mod substrate;
@@ -26,6 +27,7 @@ pub use handshake::{Admit, Challenge, Hello, Prove};
 pub use kind::{Kind, Lane, FLAG_ADDRESSED, FLAG_CATCHUP};
 pub use membership::{Capacity, Claim, Coord, Members, Routes, Unclaim};
 pub use packing::{read_applied, write_applied};
+pub use peering::{AcmeCert, AcmeChallenge, CertLine, PeerHello};
 pub use pulse::Pulse;
 pub use streams::{Data, Open, Window, MAX_DATA};
 pub use substrate::{
@@ -90,6 +92,34 @@ pub enum Frame {
     Fetch(Fetch),
     Done(Done),
     Have(Have),
+    PeerHello(PeerHello),
+    AcmeChallenge(AcmeChallenge),
+    /// A peer holds the challenge `token` and answers it.
+    AcmeAck {
+        token: String,
+    },
+    AcmeClear {
+        token: String,
+    },
+    AcmeCert(AcmeCert),
+    /// The sender's order ledger, as its JSON.
+    AcmeLedger {
+        ledger: Vec<u8>,
+    },
+    /// On connect: each site's certificate the sender holds.
+    AcmeInventory {
+        certs: Vec<CertLine>,
+    },
+    AcmeOrdering {
+        site: String,
+    },
+    AcmeDone {
+        site: String,
+    },
+    /// The shared ACME account's credentials, as their JSON.
+    AcmeAccount {
+        account: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -132,6 +162,16 @@ impl Frame {
             Frame::Fetch(_) => Kind::Fetch,
             Frame::Done(_) => Kind::Done,
             Frame::Have(_) => Kind::Have,
+            Frame::PeerHello(_) => Kind::PeerHello,
+            Frame::AcmeChallenge(_) => Kind::AcmeChallenge,
+            Frame::AcmeAck { .. } => Kind::AcmeAck,
+            Frame::AcmeClear { .. } => Kind::AcmeClear,
+            Frame::AcmeCert(_) => Kind::AcmeCert,
+            Frame::AcmeLedger { .. } => Kind::AcmeLedger,
+            Frame::AcmeInventory { .. } => Kind::AcmeInventory,
+            Frame::AcmeOrdering { .. } => Kind::AcmeOrdering,
+            Frame::AcmeDone { .. } => Kind::AcmeDone,
+            Frame::AcmeAccount { .. } => Kind::AcmeAccount,
         }
     }
 
@@ -241,6 +281,21 @@ impl Frame {
             Frame::Fetch(b) => b.write(&mut w),
             Frame::Done(b) => b.write(&mut w),
             Frame::Have(b) => b.write(&mut w),
+            Frame::PeerHello(b) => b.write(&mut w),
+            Frame::AcmeChallenge(b) => b.write(&mut w),
+            Frame::AcmeAck { token } | Frame::AcmeClear { token } => {
+                w.str(token);
+            }
+            Frame::AcmeCert(b) => b.write(&mut w),
+            Frame::AcmeLedger { ledger: bytes } | Frame::AcmeAccount { account: bytes } => {
+                w.blob(bytes);
+            }
+            Frame::AcmeInventory { certs } => {
+                w.list(certs, |w, c| c.write(w));
+            }
+            Frame::AcmeOrdering { site } | Frame::AcmeDone { site } => {
+                w.str(site);
+            }
         }
         w.into_bytes()
     }
@@ -314,6 +369,22 @@ impl Frame {
             Kind::Fetch => Frame::Fetch(Fetch::read(&mut r)?),
             Kind::Done => Frame::Done(Done::read(&mut r)?),
             Kind::Have => Frame::Have(Have::read(&mut r)?),
+            Kind::PeerHello => Frame::PeerHello(PeerHello::read(&mut r)?),
+            Kind::AcmeChallenge => Frame::AcmeChallenge(AcmeChallenge::read(&mut r)?),
+            Kind::AcmeAck => Frame::AcmeAck { token: r.str()? },
+            Kind::AcmeClear => Frame::AcmeClear { token: r.str()? },
+            Kind::AcmeCert => Frame::AcmeCert(AcmeCert::read(&mut r)?),
+            Kind::AcmeLedger => Frame::AcmeLedger {
+                ledger: r.blob_vec()?,
+            },
+            Kind::AcmeInventory => Frame::AcmeInventory {
+                certs: r.list(CertLine::read)?,
+            },
+            Kind::AcmeOrdering => Frame::AcmeOrdering { site: r.str()? },
+            Kind::AcmeDone => Frame::AcmeDone { site: r.str()? },
+            Kind::AcmeAccount => Frame::AcmeAccount {
+                account: r.blob_vec()?,
+            },
         };
         r.finish()?;
         Ok(frame)
@@ -360,6 +431,16 @@ pub fn name(kind: Kind) -> &'static str {
         Kind::Fetch => "FETCH",
         Kind::Done => "DONE",
         Kind::Have => "HAVE",
+        Kind::PeerHello => "PEER_HELLO",
+        Kind::AcmeChallenge => "ACME_CHALLENGE",
+        Kind::AcmeAck => "ACME_ACK",
+        Kind::AcmeClear => "ACME_CLEAR",
+        Kind::AcmeCert => "ACME_CERT",
+        Kind::AcmeLedger => "ACME_LEDGER",
+        Kind::AcmeInventory => "ACME_INVENTORY",
+        Kind::AcmeOrdering => "ACME_ORDERING",
+        Kind::AcmeDone => "ACME_DONE",
+        Kind::AcmeAccount => "ACME_ACCOUNT",
     }
 }
 

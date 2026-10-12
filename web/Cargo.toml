@@ -34,6 +34,9 @@ bytes          = "1"
 # The cluster's members (`docs/replicated_substrate.md`): the socket each one
 # dials in on, admission, and which member a request goes to. No CUDA.
 cluster        = { path = "../cluster" }
+# Peer gateways (§13.4) are dialled as a member dials a gateway: wss, the
+# peer's certificate verified.
+cluster-dial   = { path = "../cluster-dial" }
 # A merged aggregate (`/ws/logs`) opens a WebSocket to each member over its
 # stream; the handshake is the only feature it needs.
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }

@@ -122,6 +122,19 @@ impl Store {
         write_atomic(&dir.join(format!("{site}.crt.pem")), chain_pem.as_bytes())
     }
 
+    /// A site's chain and key as stored, both PEM.
+    pub fn read_pair(&self, site: &str) -> Result<(String, String)> {
+        let dir = self.certs();
+        let read = |name: String| {
+            let path = dir.join(name);
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+        };
+        Ok((
+            read(format!("{site}.crt.pem"))?,
+            read(format!("{site}.key.pem"))?,
+        ))
+    }
+
     /// Every certificate in the store whose key belongs to it.
     ///
     /// A file that does not parse is an error: each file is written atomically

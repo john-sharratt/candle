@@ -78,6 +78,11 @@ impl Repo {
     /// fetch from origin first makes sure of.
     pub fn take_bundle(&self, bundle: &[u8]) -> Result<(), GitError> {
         let _write = self.write_lock();
+        self.take_bundle_locked(bundle)
+    }
+
+    /// [`Self::take_bundle`], the write lock held by the caller.
+    pub(crate) fn take_bundle_locked(&self, bundle: &[u8]) -> Result<(), GitError> {
         let path = self.git_dir().join("zend-push.bundle");
         fs::write(&path, bundle).map_err(GitError::Io)?;
         let taken = self

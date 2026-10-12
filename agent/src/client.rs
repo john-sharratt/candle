@@ -10,7 +10,9 @@
 //! checkout.
 //!
 //! [`Agents::run`] waits for the job and fetches its log; [`Agents::push`]
-//! carries a push's bundle and answers how each ref came out.
+//! carries a push's bundle and answers how each ref came out;
+//! [`Agents::fetch`] brings back what origin holds and the objects the member
+//! lacks.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,11 +24,11 @@ use cluster::member::AppMember;
 use http_body_util::BodyExt;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
-use zend_vfs::{JobStatus, PushResult, RunOutcome};
+use zend_vfs::{FetchBundle, JobStatus, PushResult, RunOutcome};
 
 use crate::jobs::{JobError, Jobs};
 use crate::member::APP;
-use crate::wire::{JobView, PushJob, RunJob, Submit};
+use crate::wire::{FetchJob, JobView, PushJob, RunJob, Submit};
 
 /// How long each wait on a running job is held open.
 const WAIT: Duration = Duration::from_secs(25);
@@ -295,6 +297,39 @@ impl Agents {
             .iter()
             .map(|p| p.result().map_err(|e| AgentError::Transport(e.0)))
             .collect()
+    }
+
+    /// Fetch `job` from an agent holding its repository: what origin holds,
+    /// and the objects this member lacks.
+    pub async fn fetch(&self, job: FetchJob) -> Result<FetchBundle, AgentError> {
+        let view = if let Some(jobs) = self.local() {
+            jobs.submit(Submit::Fetch(job)).await.map_err(refused)?
+        } else {
+            let body = serde_json::to_vec(&Submit::Fetch(job.clone())).expect("a job serialises");
+            let (_, body) = self
+                .call(Call {
+                    method: Method::POST,
+                    path: "/v1/jobs".into(),
+                    body,
+                    to: None,
+                    lineage: None,
+                    repo: Some(&job.repo),
+                    toolchain: None,
+                    push: false,
+                })
+                .await?;
+            Self::view_of(&body)?
+        };
+        if let JobStatus::Failed { why } = &view.status {
+            return Err(AgentError::Refused {
+                status: 500,
+                why: why.clone(),
+            });
+        }
+        view.fetched
+            .ok_or_else(|| AgentError::Transport("the fetch's answer carried nothing".into()))?
+            .bundle()
+            .map_err(|e| AgentError::Transport(e.0))
     }
 }
 

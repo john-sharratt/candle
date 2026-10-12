@@ -111,14 +111,17 @@ use crate::engine::watcher::{self, Ledger, Reconcile};
 use crate::engine::witnessed;
 use crate::engine::work;
 use crate::mind::Mind;
+use crate::mind_repo::MindRepo;
 use crate::model;
 use crate::npcs::{Casting, Npcs};
 use crate::opstore::MindStores;
+use crate::projection::SCHEMA_FILE;
 use crate::sim::Sim;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
 use crate::world_state::place_of;
 use agent::client::Agents;
+use agent::fetcher::AgentFetch;
 use agent::pusher::AgentPush;
 use candle_conversation::EngineSource;
 use cluster::member::{ClusterView, Link};
@@ -129,11 +132,13 @@ use host::cluster::view::{
 use host::cluster::Join;
 use host::download::ensure_model_pack;
 use host::process::fatal;
+use host::stopping::{Ending, Stopping};
 use host::MODEL;
 use npc_map::schema::NodeKind;
 use npc_map::world::Where;
 use npc_map::{describe, perceive, route};
 use tokio::sync::watch;
+use zend_vfs::Fetch;
 
 /// Tokens one prefill forward carries when the model can take them — the
 /// scheduler's per-forward *target*.
@@ -3676,6 +3681,69 @@ pub struct LoadPlan {
     /// before the layers load — `--wipe-conversations`. See
     /// [`wipe_conversations`].
     pub wipe_conversations: bool,
+    /// The mind repository the agents hold, with `--mind-repo`: its fetches
+    /// and pushes go through them once joined, and a mirror not yet ready is
+    /// brought up and the process restarted onto it (§10.3).
+    pub mind_repo: Option<MindRepo>,
+    /// The process's stop, asked for that restart.
+    pub stopping: Arc<Stopping>,
+}
+
+/// How long a mind fetch that found no agent, or no branch, waits before the
+/// next try.
+const MIND_RETRY: Duration = Duration::from_secs(30);
+
+/// Bring the mirror of `repo` up to the record through `fetcher`, trying
+/// again every [`MIND_RETRY`] while no agent holding it answers or its origin
+/// has no such branch yet. A record that holds no schema is not a mind, and
+/// fails the load.
+fn bring_up_mind(
+    rt: &Arc<Runtime>,
+    repo: &MindRepo,
+    fetcher: Arc<dyn Fetch>,
+) -> anyhow::Result<()> {
+    let p = &rt.progress;
+    loop {
+        if rt.stopping() {
+            anyhow::bail!("the process stopped while fetching the mind");
+        }
+        p.set_detail(format!(
+            "fetching the mind repository `{}` through an agent",
+            repo.name
+        ));
+        match repo.bring_up(Arc::clone(&fetcher)) {
+            Ok(Some(tip)) if repo.ready() => {
+                tracing::warn!(
+                    %tip,
+                    "mind: `{}` mirrored at {} — restarting onto it",
+                    repo.name,
+                    repo.dir.display()
+                );
+                return Ok(());
+            }
+            Ok(Some(tip)) => anyhow::bail!(
+                "the mind repository `{}` holds no {SCHEMA_FILE} at {tip} on `{}`: it is not a \
+                 mind",
+                repo.name,
+                repo.branch
+            ),
+            Ok(None) => tracing::warn!(
+                "mind: `{}`'s origin has no branch `{}` yet — trying again in {} s",
+                repo.name,
+                repo.branch,
+                MIND_RETRY.as_secs()
+            ),
+            Err(e) => tracing::warn!(
+                "mind: `{}` could not be fetched through an agent: {e} — trying again in {} s",
+                repo.name,
+                MIND_RETRY.as_secs()
+            ),
+        }
+        let until = Instant::now() + MIND_RETRY;
+        while Instant::now() < until && !rt.stopping() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
 }
 
 /// Begin loading, on its own thread. Returns immediately, so the host's
@@ -3948,13 +4016,21 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         // followed from now on (§9.2–§9.4).
         if let Some(member) = join.link().member() {
             rt.join_cluster(Arc::clone(member));
-            // A publish's push goes through an agent holding the mind
-            // repository with push rights — this process's own while it is
-            // cut off (§10.3, §11.5).
-            if let (Some(name), Some(handle)) = (rt.ops.repo_name(), &rt_handle) {
+            // The mind repository's fetches and pushes go through an agent
+            // holding it — this process's own while it is cut off (§10.3,
+            // §11.5). A mirror not yet holding the record is brought up now,
+            // and the process restarts onto it.
+            if let (Some(repo), Some(handle)) = (&plan.mind_repo, &rt_handle) {
                 let agents = Agents::new(Arc::clone(member), join.in_process_agent());
+                let fetcher = AgentFetch::shared(agents.clone(), handle.clone(), &repo.name);
                 rt.ops
-                    .set_pusher(AgentPush::shared(agents, handle.clone(), name));
+                    .set_pusher(AgentPush::shared(agents, handle.clone(), &repo.name));
+                rt.ops.set_fetcher(Arc::clone(&fetcher));
+                if !repo.ready() {
+                    bring_up_mind(rt, repo, fetcher)?;
+                    plan.stopping.ask(Ending::Relaunch);
+                    return Ok(());
+                }
             }
         }
     }

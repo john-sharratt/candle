@@ -997,6 +997,7 @@ u8 kind | u8 flags | u32 stream (LE) | body…        (WebSocket supplies the le
 | `EVENT` with `flags & ADDRESSED` | a fetched record, carrying `reply_to` | catch-up |
 | `DONE` | `{ request, reply_to }` — the last `HEADERS` of an answer, or the last record of a `FETCH` | catch-up |
 | `HAVE` | `{ request, reply_to, applied set }` — a restarted member's offer (§7.5) | catch-up |
+| `PEER_HELLO`, `ACME_CHALLENGE`, `ACME_ACK`, `ACME_CLEAR`, `ACME_CERT`, `ACME_LEDGER`, `ACME_INVENTORY`, `ACME_ORDERING`, `ACME_DONE`, `ACME_ACCOUNT` | between peer gateways only, never on a member's socket (§13.4) | control |
 
 Bodies are little-endian binary with `u32`-length blobs, in the style of the persistence
 codec (`record.rs:777-914`); a record inside `EVENT` is carried as the record's own
@@ -1047,6 +1048,14 @@ misread, and on an admitted socket closes it 4400.
 | `FETCH` | 65 | `u64 request` · `u64 reply_to` · `u64 from_node` · `u64 origin` · `list<u64> oseqs` |
 | `DONE` | 66 | `u64 request` · `u64 reply_to` |
 | `HAVE` | 67 | `u64 request` · `u64 reply_to` · `applied` |
+| `PEER_HELLO` | 70 | `u64 node` · `build` · `[32] session_key` · `[32] oauth_client` |
+| `ACME_CHALLENGE` | 71 | `str site` · `str token` · `str answer` · `u64 expires_ms` |
+| `ACME_ACK` / `ACME_CLEAR` | 72 / 73 | `str token` |
+| `ACME_CERT` | 74 | `str site` · `str chain_pem` · `str key_pem` · `u64 not_after` |
+| `ACME_LEDGER` | 75 | `blob ledger` (JSON) |
+| `ACME_INVENTORY` | 76 | `list<str site · u64 not_after · [32] digest>` |
+| `ACME_ORDERING` / `ACME_DONE` | 77 / 78 | `str site` |
+| `ACME_ACCOUNT` | 79 | `blob account` (JSON) |
 
 where `build` = `u32 count · str hash · str local`; `model` = `str arch · [32] weights ·
 [32] tokenizer · str rope · str describe`; `member` = `u64 node · str host · str app ·
@@ -2932,6 +2941,35 @@ refused with the cap named.
 The mind folder is a git repository (`docs/the_effector.md`). npcd gains the `zend-vfs`
 store over it.
 
+**With `--cluster`, the mind is a repository the agents hold** (`npcd/src/mind_repo.rs`),
+named the way zend names a repository in its workspace: `--mind-repo <name>`
+(`mind_repo:` in `tokerad.yaml`), its record the branch `--mind-branch` (default
+`main`). So the machine that runs inference needs neither the repository nor a way to
+its origin; an agent anywhere in the cluster holds the checkout and the credentials
+(§11). `--mind <dir>` remains for a daemon without `--cluster`, and the two are refused
+together, and `--mind` is refused beside `--cluster`.
+
+- **A mirror.** The member keeps its own working tree of the repository under `--data`,
+  at `mind/<name>`, whose `origin` is `agent:<name>` — a name, never a URL, so nothing
+  fetches or pushes it but through an agent. Every read the npcd code makes of the mind
+  folder — the schema, the libraries, the registries, the layers, the corpus, the
+  watcher — reads the mirror, and the stores' lower layer is its branch.
+- **Through agents.** Its fetches go through an agent holding `<name>`
+  (`agent::fetcher::AgentFetch`: the fetch job of §11.4), its pushes through one with
+  push rights (`AgentPush`), both set when the member joins. Following the record — every
+  60 s, and after a publish — fetches through the agent and checks the record out in the
+  mirror, so the watcher and the registries take the change in. While no agent answers,
+  the follow says so once and tries again; a publish waits as §10.3 already describes.
+- **First start.** A mirror is ready once it holds the record's `projection.yaml`. A
+  member whose mirror is not ready starts with no mind, saying so. Once it has joined,
+  it makes the mirror — `git init` on the record's branch, `origin` the agents' — brings
+  it up to the record through an agent, retrying every 30 s while no agent holding it
+  answers or origin has no such branch, and then restarts the process onto it
+  (`TenantContext::stopping`): the schema, the libraries and the grammar built from them
+  are read once, at start. A record holding no `projection.yaml` is not a mind, and
+  fails the load. A start with the mirror in place uses it at once and follows the
+  record through an agent once joined.
+
 **The work belongs to the operation, not to the mission.** An operation is one piece of
 work carried through a workflow (`docs/npcd_workflows.md`): a story written, read,
 reviewed, fixed and checked. The table offers its steps one at a time, and each step on
@@ -3219,7 +3257,7 @@ member:
 
 | Route | |
 |---|---|
-| `POST /v1/jobs` | A run, `{ "job": "run", repo, branch, overlay, program, args, timeout_secs }`, or a push, `{ "job": "push", repo, bundle, specs: [{ target, to, expect }] }` (`agent/src/wire.rs`). Answers the job's view: its id, its status, its log's size, and once it has ended a run's outcome or a push's refs. |
+| `POST /v1/jobs` | A run, `{ "job": "run", repo, branch, overlay, program, args, timeout_secs }`, a push, `{ "job": "push", repo, bundle, specs: [{ target, to, expect }] }`, or a fetch, `{ "job": "fetch", repo, branch, have }` (`agent/src/wire.rs`). Answers the job's view: its id, its status, its log's size, and once it has ended a run's outcome, a push's refs, or a fetch's `fetched: { tips, bundle }`. |
 | `GET /v1/jobs/:id` | Status: queued, running, exited, timed out, cancelled, refused or failed. `?wait=<s>` holds the answer until the job ends, up to 30 s. |
 | `GET /v1/jobs/:id/log` | The log from its first byte. |
 | `DELETE /v1/jobs/:id` | Cancel, killing the process tree. |
@@ -3243,6 +3281,17 @@ with the lease it holds on what `origin` has, and the agent pushes them in one a
 (`agent/src/pusher.rs`). A lease `origin` no longer matches is refused exactly as it would
 be from the member's own clone.
 
+**A fetch** brings what `origin` holds to a member that cannot reach it — npcd's mirror of
+the mind (§10.3). The member names the commits its tracking refs hold as `have`, and the
+branch it wants, or none for every branch. The agent fetches `origin` and answers with
+each branch's commit and a git bundle of their objects that `have` does not reach —
+absent when the member lacks none (`Repo::bundle_for_fetch`). The member takes the
+bundle's objects and sets its tracking refs to the commits, removing those of branches
+`origin` no longer has (`Repo::take_fetch`): the same refs, and the same report, as a
+fetch from `origin` itself. The answer goes back with the submit only; the job keeps its
+status. A repository opened `fetching_through` an agent makes every fetch this way, as
+one opened `pushing_through` one makes every push (`zend_vfs::Fetch`, `zend_vfs::Push`).
+
 ### 11.5 How zend calls it
 
 With `--cluster`, `run_command`, `run_output` and the git writers dispatch to agents
@@ -3265,7 +3314,11 @@ dial out and have no listener, so a member cut off from the gateways reaches no 
 agent. When it is cut off, a `tokerad --agent` sends jobs straight to the agent in its
 own process. That is how a disconnected npcd world publishes (§9.4, §10.3). A member with
 no in-process agent fails the job with `no_agent`. A zend tool reports that to the
-model; a publish waits 30 minutes and tries again.
+model; a publish waits 30 minutes and tries again; the mind's follow tries again in a
+minute.
+
+**npcd** reaches its mind repository the same way: its fetches and pushes go to an agent
+holding it (§10.3), chosen by the repository's name as any job is.
 
 ### 11.6 Safety
 
@@ -3347,7 +3400,7 @@ replication, still sends `COORD`, every 2 s, so its `upgrade` view reaches the p
 | **Traffic** | Open streams, requests per second, and the share of each dispatch class (§5.2); aggregates answered and members past their deadline (§5.5) |
 | **Failures** | HTTP exchanges failed by a dropped socket in the last hour, split into failed before the response head and aborted mid-body (§5.6) |
 | **Agents** (§11; chunk 8) | Cores, load, jobs queued and running, toolchains and repositories |
-| **Peers** (§13.4; chunk 10) | Peer gateways and their link state and build; session key and OAuth digests agreeing or not; certificates per site and gateway (`not_after`, digest, any gateway behind); each site's orderer and orders in progress, with any duplicate order a partition caused; challenges outstanding with peer acknowledgements; the shared ledger |
+| **Peers** (§13.4) | This gateway's node; each peer linked, with its build, which end dialled, and whether the link is over verified TLS; each configured peer's dial state and last close; peerings refused and why (a disagreeing session key or OAuth client among them); certificates per site and gateway (`not_after`, digest, any gateway behind); each site's orderer and the gateway ordering it now; challenges outstanding with peer acknowledgements; the shared ledger |
 | **Refusals** | The last 100 handshakes refused, with code, node, host and reason. That covers 4401 proof, 4410 build, 4412 model, 4417 clock, and the others (§3.4); members admitted to upgrade below the floor are listed in Upgrades, not here |
 
 ### 12.3 The coordination log
@@ -3606,44 +3659,70 @@ So the gateways **peer**: every gateway holds one WebSocket to every other gatew
 
 **Setting it up.**
 
-- `cluster.peers` in `web.yaml` lists the other gateways' URLs. It is the one place the
-  gateways are named to each other.
-- Each gateway dials every peer at `GET /v1/cluster/gateway`. When two dials cross, the
-  one from the lower node id is kept.
-- The handshake is §3.3's, with the group key and `app = gateway`. Reconnect backs off
-  as §3.2 does.
-- Each gateway's node id lives in its ACME store directory, beside `account.json`.
+- `cluster.peers` in `web.yaml` lists the other gateways, each `{ url, name }`: `url` is
+  the peer's TLS entrance, `https://<host>[:port]`, and `name` the name its certificate
+  is verified against when `url` names an address. It is the one place the gateways
+  are named to each other. A gateway without a TLS entrance has no certificates to
+  share, and its config is refused with `cluster.peers` set.
+- Each gateway dials every peer at `GET /v1/cluster/gateway` through `cluster-dial`, as
+  a member dials a gateway: `wss`, the peer's certificate verified against the Mozilla
+  roots. When two dials cross, both ends keep the link the lower node dialled and close
+  the other 4409, which ends that dial loop: the lower node's dial is the one kept, and
+  it redials when its link drops (`cluster/src/peer/crossing.rs`).
+- The handshake is §3.3's, with the group key and `app = gateway`; `ADMIT` carries
+  nothing but the session. Reconnect backs off as §3.2 does.
+- Each gateway's node id lives in its ACME store directory, `<store>/node`, beside
+  `account.json`, minted at its first start.
+- **A link is secure** when it runs over a TLS connection whose certificate was
+  verified: the dialler's `url` is `https`, and the dial arrived on the peer's TLS
+  entrance. Certificate keys and the account cross secure links only; challenges, the
+  ledger, the inventory and the order announcements cross any link.
+- The transport is the `cluster` crate's (`cluster/src/peer/`): frames, the link, the
+  dial loop, the orderer. What arrives goes to the gateway's ACME
+  (`web/src/acme/peers/`).
 
 **What crosses a peer link.**
 
 | Frame | Carries | Applied |
 |---|---|---|
-| `PEER_HELLO` | the gateway's node, build, and digests of its `session.key` and its Google OAuth client id | **Mismatched digests refuse the peering**, with the reason shown on both status pages, because a cookie signed by one would not verify on the other. The secrets themselves never cross. |
-| `ACME_CHALLENGE { site, token, answer, expires }` / `ACME_CLEAR { token }` | the HTTP-01 answer a gateway is about to ask the CA to check | added to or removed from each peer's `Challenges` table (`web/src/acme/challenges.rs:22-53`), which `/.well-known/acme-challenge/:token` already serves on every host (`server.rs:205,222`) |
-| `ACME_CERT { site, chain_pem, key_pem, not_after }` | a certificate the gateway was issued, with its key | installed in the peer's resolver and written to its ACME store, `certs/<site>.{crt,key}.pem`. The later `not_after` wins, so the outcome is the same in any order. |
-| `ACME_LEDGER` | the gateway's order ledger (`acme/mod.rs:13-19`) | merged per entry by maximum, so every gateway counts every order against the CA's rate limits |
-| `ACME_INVENTORY` | on connect, each site's `not_after` and certificate digest | a peer holding an older or missing certificate is sent the newer one |
-| `ACME_ORDERING { site }` / `ACME_DONE { site }` | the orderer starting and finishing an order | a peer that sees `ACME_ORDERING` does not order that site until `ACME_DONE`, or until the link drops |
+| `PEER_HELLO` | the gateway's node, build, and SHA-256 digests of its session key file and its Google OAuth client id (of nothing, without sign-in) | **Mismatched digests refuse the peering**, closed 4401 with the reason recorded on both status pages, because a cookie signed by one would not verify on the other. The secrets themselves never cross. A node other than the handshake's, or the gateway's own, is refused 4400. |
+| `ACME_CHALLENGE { site, token, answer, expires_ms }` / `ACME_CLEAR { token }` | the HTTP-01 answer a gateway is about to ask the CA to check | added to or removed from each peer's `Challenges` table (`web/src/acme/challenges.rs`), which `/.well-known/acme-challenge/:token` serves on every host. A peer drops one its orderer never cleared once `expires_ms` (10 minutes on) has passed. |
+| `ACME_ACK { token }` | a peer holds the challenge and answers it | the orderer validates once every peer it sent the challenge to has acknowledged, or has dropped its link, or 30 s have passed |
+| `ACME_CERT { site, chain_pem, key_pem, not_after }` | a certificate the gateway was issued, with its key; secure links only | installed in the peer's resolver and written to its ACME store, `certs/<site>.{crt,key}.pem`, when it is later than the one held. The later `not_after` wins, so the outcome is the same in any order. One arriving on a link that is not secure is refused and logged. |
+| `ACME_LEDGER` | the gateway's order ledger, as its JSON (`web/src/acme/ledger.rs`), on connect and after every change | merged: every attempt and every account either holds, once each, in time order, under one lock with the gateway's own saves. Every gateway counts every order against the CA's rate limits. |
+| `ACME_INVENTORY` | on connect, each site's `not_after` and the digest of its chain | a peer holding an older or missing certificate is sent the newer one, over a secure link |
+| `ACME_ORDERING { site }` / `ACME_DONE { site }` | the orderer starting and finishing an order, and on connect an order running | a peer that sees `ACME_ORDERING` does not order that site until `ACME_DONE`, or until the link drops |
+| `ACME_ACCOUNT` | the shared account's credentials, as their JSON, on connect and when created; secure links only | taken by a peer that holds none |
 
 **Who orders: rendezvous over the connected gateways.**
 
 - A site's **orderer** is the gateway that rendezvous (§9.5, with equal weights) names
   for the site among itself and the peers it is connected to. Every connected gateway
   computes the same answer, so exactly one of them orders. No consensus is run.
-- The orderer runs the order as `acme/manager.rs` does today: at start, then every 12 h,
-  renewing 30 days before expiry. It announces the order with `ACME_ORDERING`.
+- The orderer runs the order in `acme/manager.rs`'s renewal loop: at start, then every
+  12 h, renewing 30 days before expiry. It announces the order with `ACME_ORDERING`
+  (`web/src/acme/order.rs`).
+- A due site whose orderer is a peer, or that a peer announced, is skipped. A peer
+  leaving, or finishing an order, wakes the loop, after at least 5 minutes from its
+  last pass, since this gateway may now be a due site's orderer.
 - Gateways share one ACME account. `account.json` is created by the first gateway and
-  sent to peers once over the same link, so the ledger counts against one account.
+  sent to peers that hold none, over a secure link, so the ledger counts against one
+  account.
 
 **One order, start to finish:**
 
 1. The orderer sends `ACME_ORDERING`, creates the order, and gets its HTTP-01 tokens.
 2. It sends `ACME_CHALLENGE` for each token to every peer, and waits until every
-   connected peer has acknowledged.
+   connected peer has answered `ACME_ACK`, bounded at 30 s.
 3. Only then does it tell the CA to validate. Wherever the CA's request lands, that
    gateway has the answer.
-4. On issue it installs the certificate, sends `ACME_CERT` to every peer, sends
-   `ACME_CLEAR` for the tokens, and then `ACME_DONE`.
+4. It sends `ACME_CLEAR` for the tokens. On issue it installs the certificate and sends
+   `ACME_CERT` to every peer, and then `ACME_DONE`. The renewal loop then records the
+   outcome in the ledger and sends that.
+
+Whoever signs, the steps around it are the same: the CA is a trait (`acme/ca.rs`), and
+the answers are published through another (`acme/publish.rs`) — on this gateway
+alone, or on it and every peer.
 
 A peer that was disconnected through all of this gets the certificate from the inventory
 exchange when it reconnects.
@@ -3665,16 +3744,20 @@ same permissions as today's.
 
 **On the status page** (§12.2), a **Peers** block shows:
 
-- every peer gateway, with its link state and build;
-- whether the session key and OAuth digests agree;
+- this gateway's node, and every peer linked, with its build, which end dialled it,
+  whether the link is over verified TLS, and since when;
+- each configured peer as this gateway dials it: its state, attempts and last close;
+- peerings refused, with why: a disagreeing session key or OAuth client, a failed
+  handshake;
 - the certificate inventory per site and gateway: `not_after`, digest, and which gateway
   is serving an older one;
-- each site's orderer, and orders in progress with their step;
+- each site's orderer, and the gateway ordering it now;
 - challenges outstanding and the peers that have acknowledged them;
 - the shared ledger.
 
-Every peering change, order step, certificate push and mismatch goes in the coordination
-log (§12.3).
+Every link and unlink, refusal, certificate installed from a peer, account taken and key
+withheld from an unverified link goes in the coordination log (§12.3), under app
+`gateway`.
 
 ---
 
@@ -3723,7 +3806,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | generations | a cut-off member's events carry ⊤ and sort after everything it holds; on rejoin it catches up before sending anything detached; it takes `gen/<k>` by Paxos for *k* one above the greatest decided it knows, and moves to *k + 1* when *k* is already decided; decided generations have no gaps; a joined member's event written before the decision, including one the rejoining member never caught up on, sorts before its detached events on every member; the generation is persisted as a local `Rebase` that is never replicated, and applied on reading its own records back; without a quorum the member stays cut off, serving locally and sending nothing detached, and takes its generation once a quorum is reachable; two members cut off together sort in the order their generations were decided; offline keyed writes win over the group's from the same period; a tombstone still kills offline writes to its timeline; a turn arriving ranked below one held makes the member drain, reload and come back |
 | consensus (`cluster` crate, Paxos among members) | a proposer `NACK`ed waits a random time within the key's `ttl` before trying a higher ballot, and two duelling proposers end with one decision; an acceptor promises only above its highest promised ballot and `NACK`s the rest with that ballot; a promise and an acceptance are durable in the substrate before they are sent, and survive a restart; a proposer proposes the highest-ballot accepted value it was shown; under every interleaving of two and three proposers against three and five member-acceptors, with dropped and duplicated frames and frames arriving through two clusters, a decision never changes and two lease holders never overlap; a decided value is written as a replicated record |
 | leases | `PROMISE` carries an accepted lease only while its `ttl` runs; another member's unexpired lease stops a proposer, its own does not (renewal); under `start_paused`, the holder's term, counted from `PREPARE`, ends before every acceptor's; a lease accepted before an acceptor restarts counts for a full `ttl` after; `RELEASE` drops it and the next proposer waits for `through`; a partitioned authority stops persisting before its lease runs out; a member alone in a group of three can never hold one |
-| gateway peering | two and three in-process gateways peer; mismatched `session.key` or OAuth digests refuse the peering and both sides report it; an order's challenges reach every connected peer before validation is requested, and a CA request landing on any gateway is answered; every connected gateway names the same orderer for a site and only it orders; a peer seeing `ACME_ORDERING` does not order that site; two partitioned gateways each order once and the later `not_after` wins when they meet; an issued certificate reaches every peer and the later `not_after` wins in any arrival order; a reconnecting peer pulls newer certificates from the inventory exchange; ledgers merge by maximum; a key never crosses a link that did not pass the handshake (the ACME CA is a local test double, as `instant-acme` allows) |
+| gateway peering (`cluster/src/peer/`, `cluster/src/frame/tests.rs`, `web/src/acme/{ledger,certs}.rs`, `web/src/acme/peers/inventory.rs`, `web/src/cluster/peers.rs`, `web/src/config.rs`, `web/tests/peering.rs`) | every peer frame encodes to exact bytes; two gateways link and carry frames; three in a mesh name the same orderer for every site, and a gateway alone orders everything; crossed dials keep the lower node's link on both ends, and it stays; a differing session key or OAuth client refuses the peering on both ends, each recording why, and a node other than the handshake's or the gateway's own is refused; a closed link is redialled; ledgers merge to the union in either order, and a save keeps what a peer merged meanwhile; a peer is sent the certificates it lacks or holds older, and the later `not_after` wins; the node id is minted once and kept; peers need the TLS entrance. Against a local stand-in for the CA, at the `Ca` trait — it publishes through the gateways' own path and asks every gateway it could reach for each answer: three linked gateways name one orderer and only it may order, its challenges are answered on all three before the CA validates, and its certificate is installed on all three with every challenge withdrawn; a peer's `ACME_ORDERING` holds the site until `ACME_DONE`; two gateways partitioned each order, and once linked both serve the later certificate; over a link that is not verified TLS the challenges cross but no certificate key and no account do; the account is given to a peer that has none, and the ledgers merge on connect and on change |
 | commands | each command of §12.4 runs on an in-process member and its effect is asserted; `drain` hands back every claim and lease and the gateway routes nothing new; `restart` waits for in-flight work and the outbox, then builds a relaunch with the original arguments, one-shot flags dropped (the process spawn is asserted on, not run); `compact` is refused in fault mode and when free space is below the live size; a destructive command without the matching `confirm` is refused; a second command while one runs is refused; every command lands in the coordination log; `drain-gateway` closes members with `1001` and they carry on through their other cluster; a delivered Ctrl-C on a joined member drains, waits for the outbox, flushes, closes `1001` and then runs the tenant shutdown, with another member taking its world at once rather than after a term; a second Ctrl-C mid-drain exits at once; without `--cluster`, Ctrl-C is unchanged |
 | fault mode | a simulated `ENOSPC` on append, and free space under the floor, each enter fault mode; the member stays connected and keeps sending `COORD`; it releases every claim and world lease, stops its characters, and proposes nothing; **with the volume completely full it still promises and accepts, durably, through the vote journal, and counts toward the quorum**; it keeps sending its unsent events and answering `FETCH`es; the gateway routes no request to it and relays no live events to it, but relays Paxos frames to it; only `Drop` maintenance runs; leaving needs twice the floor and a test append, then catches up before taking work; free space hovering at the floor does not flap the mode; the status page and the log show both transitions |
 | quorum | `cluster/max_members` rises when more members are seen together, never falls by itself; a *set* lowers it, and raises after the set raise it again, in any arrival order; `--cluster-quorum-max` and the admin call write a set; the quorum is `⌊max_members / 2⌋ + 1`; a freshly restarted member alone reads its quorum from its substrate |
@@ -3737,6 +3820,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | identity | the `TimelineId` layout and monotonicity; `hlc` is monotonic and passes every `hlc` seen; `(origin, oseq)`, stamp and `digest` preserved through relocation, re-emission and `compact()`; the applied set and the location index rebuild from the last `Replica` plus the walk; a substrate copied to another directory or machine re-mints its node; passthrough timelines are `hash(conversation_key, n)`, `n` the first opening whose timeline is free; VFS events are named `(origin, seq)`, two writers' of one number are two events, and a tombstone of another member's event outlives compaction |
 | VFS scoping | the writer's, reviewer's and checker's missions of one operation see one store, and a draft written in one step is read in the next, on another in-process member too; two operations over one base see different files; a character with no mission reads the tip; the table's reading and checks read the store; nothing an operation writes reaches the mind folder before its publish step; a failed run's store is discarded under `discard` and kept under `keep`, and `reopen` resumes a kept one; a workflow with a route to `done` from anything but a publish step is a load error; a clean publish lands the store and settles the run `done`; a conflict refuses the publish with the paths named, `merge_sync` marks the overlapping hunks in the store, and once the Maker has resolved and committed them at the bench the publish lands and the run settles `done` without going back through verification; the `published` check holds the step open until then; a Maker that reports `stuck` hands the step to another; publishing the same text twice merges as a no-op; in disconnected mode a step's edits write no `VfsEvent`; with `origin` or every agent unreachable, a publish settles nothing, counts toward neither send-backs nor stuck, and under paused time is offered again exactly 30 minutes later with the store intact |
 | agent selection | stickiness, the spill after the wait, and the idle-core ranking with repository and toolchain filters |
+| fetch through an agent (`zend-vfs/src/remote/fetch_bundle.rs`, `agent/src/wire.rs`, `agent/tests/agents.rs`, `npcd/src/mind_repo.rs`, `npcd/src/tenant.rs`) | a member that cannot reach origin gets a branch through an agent's checkout — the commit and its objects under its own tracking ref, reported as a fetch from origin reports it — then only what it lacks, and nothing when it lacks nothing; every branch is carried and a deleted one pruned; a branch asked for alone that origin lacks is an unknown revision; a `have` the agent does not hold is passed over; a fetch job and its answer are their exact JSON; through an in-process gateway a mirror whose `origin` is `agent:r` pulls origin's branch through the agent, and cut off a member's fetch reaches only its own agent, else `no_agent`; npcd's mirror is made under `--data` named `agent:<name>`, brought up to the record and checked out — ready — and follows later commits; a branch origin lacks leaves it not ready; `--mind-repo` needs `--data`, is refused beside `--mind`, and reads the same from `tokerad.yaml`; an unready mirror starts on no mind |
 | status page | `COORD` encodes to exact bytes; every coordination decision of §12.3 — admission, refusal, mode switch, floor, lock, claim, grant, majority, NPC lease, cut-off, rejoin step, generation fixed, disconnected mode, catch-up, resync, tombstone expiry — driven through an in-process gateway lands in the log with its gateway and subject; `status.json` carries every block of §12.2, and a member reporting a gateway this one cannot see shows in both the `clusters` column and the grant counts |
 
 ### 14.2 Burst micro harnesses

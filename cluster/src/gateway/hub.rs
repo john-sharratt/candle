@@ -192,6 +192,17 @@ impl Hub {
         });
     }
 
+    /// A coordination decision made beside the hub — a peer gateway linked or
+    /// refused, a certificate order's step (§13.4) — for the log.
+    pub fn record(&self, app: &str, subject: String, text: String) {
+        self.note(app, subject, text);
+    }
+
+    /// This gateway's name in the log.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     fn refused(&self, app: &str, ip: IpAddr, who: Option<(u64, String)>, close: &Close) {
         let (node, host) = who.map_or((String::new(), String::new()), |(n, h)| (hex(n), h));
         self.note(

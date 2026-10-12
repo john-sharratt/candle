@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use zend_vfs::{GitError, Oid, Push, PushResult, PushSpec, RemoteName, Repo};
+use zend_vfs::{fetch_here, GitError, Oid, Push, PushResult, PushSpec, RemoteName, Repo};
 
 use super::follow::{follow, Followed};
 use super::publish::Publish;
@@ -187,7 +187,7 @@ fn a_store_lands_on_the_record_and_the_mind_follows() {
     );
 
     assert_eq!(
-        follow(&r.mind).unwrap(),
+        follow(&r.mind, fetch_here()).unwrap(),
         Some(Followed::Moved {
             to: Oid::parse(&commit).unwrap()
         })
@@ -196,7 +196,10 @@ fn a_store_lands_on_the_record_and_the_mind_follows() {
         std::fs::read_to_string(r.mind.join(story)).unwrap(),
         "# The Gate\n\nA night at the gate.\n"
     );
-    assert_eq!(follow(&r.mind).unwrap(), Some(Followed::Level));
+    assert_eq!(
+        follow(&r.mind, fetch_here()).unwrap(),
+        Some(Followed::Level)
+    );
 }
 
 /// **A record that moved only at other lines is taken in as the work lands**:
@@ -340,7 +343,7 @@ fn the_mind_follows_the_record_unless_it_has_changes_of_its_own() {
     let r = record();
     r.publish_other("layers/stories/elsewhere.md", "Somebody else's story.\n");
     assert!(matches!(
-        follow(&r.mind).unwrap(),
+        follow(&r.mind, fetch_here()).unwrap(),
         Some(Followed::Moved { .. })
     ));
     assert_eq!(
@@ -351,7 +354,7 @@ fn the_mind_follows_the_record_unless_it_has_changes_of_its_own() {
     std::fs::write(r.mind.join(ERA), "edited by hand\n").unwrap();
     r.publish_other("layers/stories/more.md", "More.\n");
     assert_eq!(
-        follow(&r.mind).unwrap(),
+        follow(&r.mind, fetch_here()).unwrap(),
         Some(Followed::Dirty(vec![ERA.to_string()]))
     );
     assert_eq!(

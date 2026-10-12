@@ -22,6 +22,7 @@ use crate::cluster::Join;
 use crate::guard::Routes;
 use crate::loading::LoadingView;
 use crate::logs::LogBus;
+use crate::stopping::Stopping;
 use crate::telemetry::Telemetry;
 
 /// A daemon the host runs.
@@ -63,6 +64,10 @@ pub struct TenantContext {
     /// once its substrate is open, the tenant connects through it in its
     /// `connecting` loading step. `None` for a standalone daemon.
     pub cluster: Option<Join>,
+    /// The process's stop: what a tenant asks to restart the process onto
+    /// something it read once, at start, and now holds anew — npcd's mind
+    /// fetched through an agent (`docs/replicated_substrate.md` §10.3).
+    pub stopping: Arc<Stopping>,
 }
 
 /// How a started tenant is drained: stop its background work, flush and detach

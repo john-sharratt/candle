@@ -21,6 +21,8 @@
 //! - [`upgrade`]: a member's side of A/B upgrades — artifacts, fetching,
 //!   compatibility, the swap, kept builds and the watchdog.
 //! - [`launch`]: how this process was launched, to start an identical one.
+//! - [`peer`]: gateways linked to each other, for the state active-active
+//!   gateways share.
 //!
 //! No candle and no CUDA: the gateway links this crate, and a record inside an
 //! `EVENT` stays opaque bytes here.
@@ -40,6 +42,7 @@ pub mod handshake;
 pub mod launch;
 pub mod machine;
 pub mod member;
+pub mod peer;
 pub mod pipe;
 pub mod replicate;
 pub mod session;

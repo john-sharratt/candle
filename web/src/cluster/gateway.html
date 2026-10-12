@@ -232,6 +232,18 @@ h3.sub { font-size: 12px; color: var(--muted); margin: 14px 0 6px; font-weight: 
   <div class="scroll"><table id="refusals"></table></div>
 </section>
 
+<section aria-labelledby="h-peers">
+  <h2 id="h-peers">Peers</h2>
+  <p class="dim" id="peers-node"></p>
+  <div class="scroll"><table id="peer-links"></table></div>
+  <div class="scroll"><table id="peer-dials"></table></div>
+  <div class="scroll"><table id="peer-sites"></table></div>
+  <div class="scroll"><table id="peer-certs"></table></div>
+  <div class="scroll"><table id="peer-challenges"></table></div>
+  <div class="scroll"><table id="peer-refusals"></table></div>
+  <details><summary>Shared order ledger</summary><pre class="mono" id="peer-ledger"></pre></details>
+</section>
+
 <section aria-labelledby="h-log">
   <h2 id="h-log">Coordination log</h2>
   <div class="filters">
@@ -296,6 +308,51 @@ const ratio = (x) => x == null ? "—" : x.toFixed(2) + "×";
 const pct = (x) => x == null ? "—" : (x * 100).toFixed(2) + "%";
 const outcomeClass = (o) => ({pass: "ok", fail: "bad", gap: "warn"}[o] || "dim");
 const buildName = (b) => `${b.count}-${b.hash}`;
+
+// The Peers block (§13.4, §12.2): the peer gateways and their links, each
+// site's orderer and orders running, every gateway's certificate per site,
+// challenges outstanding and who acknowledged them, and the shared ledger.
+function renderPeers(s) {
+  const p = s.peers;
+  $("peers-node").textContent = p ? `this gateway is node ${p.node}` : "no cluster.peers: this gateway peers with no one";
+  table($("peer-links"), ["Peer", "Build", "Dialled by", "Link", "Since"],
+    p ? p.links.map((l) => [
+      node(l.node), `<td class="mono">${esc(l.build)}</td>`, `<td class="mono">${esc(l.dialled_by)}</td>`,
+      `<td><span class="pill ${l.secure ? "ok" : "warn"}">${l.secure ? "verified TLS" : "not verified: no keys cross"}</span></td>`,
+      `<td class="mono">${ago(l.since_ms, s.now_ms)}</td>`,
+    ]) : [], "no peer linked");
+  table($("peer-dials"), ["Dialling", "State", "Attempts", "Last close"],
+    p ? p.dials.map((d) => [
+      `<td class="mono">${esc(d.url)}</td>`,
+      `<td><span class="pill ${d.state === "linked" ? "ok" : "warn"}">${esc(d.state)}</span></td>`,
+      `<td class="mono">${d.attempts}</td>`, `<td class="wrap">${esc(d.last_close || "—")}</td>`,
+    ]) : [], "no peer is dialled from here");
+  const acme = p && p.acme;
+  table($("peer-sites"), ["Site", "Orderer", "Ordering now"],
+    acme ? acme.sites.map((x) => [
+      `<td>${esc(x.site)}</td>`, `<td class="mono">${esc(x.orderer)}</td>`,
+      `<td class="mono">${x.ordering ? `<span class="warn">${esc(x.ordering)}</span>` : "—"}</td>`,
+    ]) : [], "no certificates ordered");
+  const latest = {};
+  if (acme) for (const c of acme.certs) latest[c.site] = Math.max(latest[c.site] || 0, c.not_after);
+  table($("peer-certs"), ["Gateway", "Site", "Valid to", "Digest", ""],
+    acme ? acme.certs.map((c) => [
+      `<td class="mono">${esc(c.gateway)}</td>`, `<td>${esc(c.site)}</td>`,
+      `<td class="mono">${new Date(c.not_after * 1000).toISOString().slice(0, 10)}</td>`,
+      `<td class="mono">${esc(c.digest.slice(0, 16))}</td>`,
+      `<td>${c.not_after < latest[c.site] ? `<span class="pill warn">older</span>` : ""}</td>`,
+    ]) : [], "no certificate held");
+  table($("peer-challenges"), ["Challenge", "Acknowledged by"],
+    acme ? acme.challenges.map((c) => [
+      `<td class="mono">${esc(c.token)}</td>`, `<td class="mono">${esc(c.acked_by.join(", ") || "—")}</td>`,
+    ]) : [], "no challenge outstanding");
+  table($("peer-refusals"), ["At", "Peer", "Why"],
+    p ? p.refusals.map((r) => [
+      `<td class="mono">${when(r.at_ms)}</td>`, `<td class="mono">${esc(r.node || "—")}</td>`,
+      `<td class="wrap bad">${esc(r.reason)}</td>`,
+    ]) : [], "no peering refused");
+  $("peer-ledger").textContent = acme ? JSON.stringify(acme.ledger, null, 2) : "";
+}
 
 // The Upgrades block (§3.8–§3.11, §12.2): candidates and certification,
 // each member's place in distribution and rollout, every build held.
@@ -543,6 +600,7 @@ function render(s, earlier) {
       `<td>${esc(c.app)}</td>`, `<td class="mono">${esc(c.key)}</td>`,
       `<td class="mono">${esc(c.node)}</td>`, `<td class="mono">${when(c.epoch_ms)}</td>`,
     ]), "no claims");
+  renderPeers(s);
   table($("refusals"), ["At", "App", "Code", "Node", "Host", "From", "Reason"],
     s.refusals.map((r) => [
       `<td class="mono">${when(r.at_ms)}</td>`, `<td>${esc(r.app)}</td>`,

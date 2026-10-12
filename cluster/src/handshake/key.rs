@@ -2,6 +2,8 @@
 //! keys an HMAC; it is never sent and never logged.
 
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 
 use thiserror::Error;
@@ -17,6 +19,11 @@ pub enum KeyError {
     Format { path: String },
     #[error("group key {path}: readable by group or other (mode {mode:o}); chmod 600 it")]
     Exposed { path: String, mode: u32 },
+    #[error("group key {path}: not written: {source}")]
+    Write {
+        path: String,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -55,6 +62,45 @@ impl GroupKey {
 
     pub(crate) fn bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// 32 bytes from the OS-seeded generator.
+    pub fn generate() -> Self {
+        let mut bytes = [0u8; 32];
+        rand::fill(&mut bytes);
+        Self(bytes)
+    }
+
+    /// The file's form: 64 hex digits and a newline.
+    fn to_file(&self) -> String {
+        let mut s: String = self.0.iter().map(|b| format!("{b:02x}")).collect();
+        s.push('\n');
+        s
+    }
+
+    /// Write a fresh key to `path`, which must not exist yet — an estate's
+    /// key is replaced deliberately, never by a second run of this. The file
+    /// is private to its owner on Unix. The key is not shown anywhere: the
+    /// file is what is copied to every gateway and member.
+    pub fn create(path: &Path) -> Result<Self, KeyError> {
+        let shown = path.display().to_string();
+        let key = Self::generate();
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let written = options.open(path).and_then(|mut f| {
+            f.write_all(key.to_file().as_bytes())
+                .and_then(|()| f.sync_all())
+        });
+        written.map_err(|source| KeyError::Write {
+            path: shown,
+            source,
+        })?;
+        Ok(key)
     }
 }
 
@@ -119,5 +165,23 @@ mod tests {
         }
         assert_eq!(GroupKey::load(&path).unwrap().bytes(), &[0xab; 32]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A created key is 64 hex digits and a newline, loads back as itself,
+    /// and is never written over.
+    #[test]
+    fn a_created_key_loads_back_and_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group.key");
+        let key = GroupKey::create(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!((text.len(), text.ends_with('\n')), (65, true));
+        assert_eq!(GroupKey::load(&path).unwrap(), key);
+        assert!(matches!(
+            GroupKey::create(&path),
+            Err(KeyError::Write { .. })
+        ));
+        assert_eq!(GroupKey::load(&path).unwrap(), key, "unchanged");
+        assert_ne!(GroupKey::generate(), GroupKey::generate());
     }
 }

@@ -14,7 +14,7 @@ use instant_acme::{
     Identifier, NewOrder, OrderStatus, RetryPolicy,
 };
 
-use super::challenges::Challenges;
+use super::publish::Publish;
 
 /// The problem type the CA answers with when a limit has been reached.
 const RATE_LIMITED: &str = "urn:ietf:params:acme:error:rateLimited";
@@ -59,11 +59,12 @@ pub fn classify(e: AcmeError) -> IssueError {
     }
 }
 
-/// Order a certificate for `names`. `replaces` names the certificate this one
-/// renews, when the CA's renewal window asked for it.
-pub async fn issue(
+/// Order a certificate for `names`, its answers published through `publish`.
+/// `replaces` names the certificate this one renews, when the CA's renewal
+/// window asked for it.
+pub async fn issue<P: Publish>(
     account: &Account,
-    challenges: &Challenges,
+    publish: &P,
     names: &[String],
     replaces: Option<CertificateIdentifier<'_>>,
 ) -> Result<Issued, IssueError> {
@@ -93,7 +94,9 @@ pub async fn issue(
             let mut challenge = authz
                 .challenge(ChallengeType::Http01)
                 .ok_or_else(|| IssueError::Failed("the CA offered no http-01 challenge".into()))?;
-            challenges.set(&challenge.token, challenge.key_authorization().as_str());
+            publish
+                .publish(&challenge.token, challenge.key_authorization().as_str())
+                .await;
             published.push(challenge.token.clone());
             challenge.set_ready().await.map_err(classify)?;
         }
@@ -109,7 +112,7 @@ pub async fn issue(
     .await;
 
     for token in &published {
-        challenges.clear(token);
+        publish.withdraw(token);
     }
     result
 }

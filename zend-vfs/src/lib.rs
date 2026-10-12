@@ -97,6 +97,8 @@ pub use read::status::{StatusCode, StatusEntry, Xy};
 pub use read::tags::Tag;
 pub use read::tree::{ObjectKind, SizedEntry, TreeEntry};
 pub use remote::fetch::{FetchFlag, FetchSpec, RefUpdate};
+pub use remote::fetch_bundle::FetchBundle;
+pub use remote::fetcher::{fetch_here, Fetch, FetchHere};
 pub use remote::ls_remote::RemoteRefs;
 pub use remote::manage::UrlKind;
 pub use remote::probe;
@@ -148,6 +150,8 @@ pub struct Repo {
     library: Option<Mutex<git2::Repository>>,
     /// What makes its pushes: this checkout, or an agent (§11.5).
     pusher: Arc<dyn Push>,
+    /// What makes its fetches: this checkout's remote, or an agent (§10.3).
+    fetcher: Arc<dyn Fetch>,
 }
 
 impl fmt::Debug for Repo {
@@ -230,12 +234,19 @@ impl Repo {
             write: Mutex::new(()),
             library: None,
             pusher: here(),
+            fetcher: fetch_here(),
         })
     }
 
     /// This repository with its pushes made by `pusher`.
     pub fn pushing_through(mut self, pusher: Arc<dyn Push>) -> Self {
         self.pusher = pusher;
+        self
+    }
+
+    /// This repository with its fetches made by `fetcher`.
+    pub fn fetching_through(mut self, fetcher: Arc<dyn Fetch>) -> Self {
+        self.fetcher = fetcher;
         self
     }
 

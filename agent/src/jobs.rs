@@ -10,6 +10,9 @@
 //! - **A push** fetches origin, takes the bundle's objects into the checkout,
 //!   and pushes the specs from here, each under its lease, with the agent's
 //!   own credentials. It is answered when it has been made.
+//! - **A fetch** fetches origin and answers with what it holds for the
+//!   branch asked — or every branch — and a bundle of the objects the member
+//!   lacks, for a member whose repository lives with an agent (§10.3).
 //!
 //! The last [`KEPT`] jobs are kept; asking after an older one is not found.
 
@@ -23,12 +26,12 @@ use tokio::sync::watch;
 use tokio::task::{spawn_blocking, AbortHandle};
 use tokio::time::timeout;
 use zend_vfs::{
-    BranchName, DiskWriteGrant, FetchSpec, JobId, JobRequest, JobStatus, Priority, RemoteName, Rev,
-    RunOutcome, SandboxCommand, VfsStore, ORIGIN,
+    BranchName, DiskWriteGrant, FetchSpec, JobId, JobRequest, JobStatus, Oid, Priority, RemoteName,
+    Rev, RunOutcome, SandboxCommand, VfsStore, ORIGIN,
 };
 
 use crate::checkouts::{Checkout, Checkouts};
-use crate::wire::{decode_bundle, JobView, PushJob, Pushed, RunJob, Submit};
+use crate::wire::{decode_bundle, FetchJob, Fetched, JobView, PushJob, Pushed, RunJob, Submit};
 
 /// Jobs kept after they end.
 pub const KEPT: usize = 256;
@@ -59,6 +62,9 @@ enum Kind {
     Push {
         status: JobStatus,
         pushed: Vec<Pushed>,
+    },
+    Fetch {
+        status: JobStatus,
     },
 }
 
@@ -135,12 +141,63 @@ impl Jobs {
             .ok_or_else(|| JobError::UnknownRepo(repo.to_string()))
     }
 
-    /// Start `submit`: a run answers once started, a push once made.
+    /// Start `submit`: a run answers once started, a push once made, a fetch
+    /// with what it found.
     pub async fn submit(self: &Arc<Self>, submit: Submit) -> Result<JobView, JobError> {
         match submit {
             Submit::Run(run) => self.run(run).await,
             Submit::Push(push) => self.push(push).await,
+            Submit::Fetch(fetch) => self.fetch_for(fetch).await,
         }
+    }
+
+    /// Fetch origin, and answer with what it holds for the job's branch — or
+    /// every branch — and a bundle of the objects the member lacks. The
+    /// answer is kept as the job's status alone: its bundle goes back once,
+    /// with the submit.
+    async fn fetch_for(self: &Arc<Self>, fetch: FetchJob) -> Result<JobView, JobError> {
+        self.checkout(&fetch.repo)?;
+        let spec = match &fetch.branch {
+            Some(b) => {
+                FetchSpec::Branch(BranchName::parse(b).map_err(|e| JobError::Bad(e.to_string()))?)
+            }
+            None => FetchSpec::AllBranches,
+        };
+        let have = fetch
+            .have
+            .iter()
+            .map(|o| Oid::parse(o).map_err(|e| JobError::Bad(format!("`{o}`: {e}"))))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.fetch(&fetch.repo).await?;
+        let jobs = Arc::clone(self);
+        let repo = fetch.repo.clone();
+        let found = spawn_blocking(move || {
+            let c = jobs.checkout(&repo)?;
+            c.repo()
+                .bundle_for_fetch(&origin(), &spec, &have)
+                .map_err(|e| JobError::Bad(format!("bundling `{repo}`: {e}")))
+        })
+        .await
+        .map_err(|e| JobError::Bad(e.to_string()))?;
+        let (status, fetched) = match found {
+            Ok(f) => (JobStatus::Exited { code: Some(0) }, Some(Fetched::of(&f))),
+            Err(e) => (JobStatus::Failed { why: e.to_string() }, None),
+        };
+        let id = JobId::random().to_string();
+        let (ended, _) = watch::channel(true);
+        self.keep(
+            id.clone(),
+            Entry {
+                repo: fetch.repo,
+                kind: Kind::Fetch {
+                    status: status.clone(),
+                },
+                ended,
+            },
+        );
+        let mut view = self.view(&id)?;
+        view.fetched = fetched;
+        Ok(view)
     }
 
     /// Fetch origin into `repo`'s checkout, so a base or a bundle's
@@ -301,6 +358,17 @@ impl Jobs {
                 bytes: 0,
                 outcome: None,
                 pushed: pushed.clone(),
+                fetched: None,
+            },
+            Kind::Fetch { status } => JobView {
+                id: id.to_string(),
+                repo: e.repo.clone(),
+                status: status.clone(),
+                lines: 0,
+                bytes: 0,
+                outcome: None,
+                pushed: Vec::new(),
+                fetched: None,
             },
             Kind::Run { outcome, .. } => {
                 let info = JobId::parse(id)
@@ -314,6 +382,7 @@ impl Jobs {
                     bytes: info.bytes,
                     outcome: outcome.clone(),
                     pushed: Vec::new(),
+                    fetched: None,
                 }
             }
         })
@@ -359,7 +428,7 @@ impl Jobs {
                     task.abort();
                     true
                 }
-                Kind::Push { .. } => false,
+                Kind::Push { .. } | Kind::Fetch { .. } => false,
             }
         };
         if aborted {

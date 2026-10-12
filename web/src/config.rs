@@ -89,6 +89,22 @@ pub struct Cluster {
     /// (§3.8).
     #[serde(default = "canary_share")]
     pub canary_share: u64,
+    /// The other gateways answering the same public names, each dialled and
+    /// kept linked (§13.4).
+    #[serde(default)]
+    pub peers: Vec<Peer>,
+}
+
+/// One peer gateway in `cluster.peers`.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Peer {
+    /// Its TLS entrance, `https://<host>[:port]`.
+    pub url: String,
+    /// The name its certificate is verified against, when `url` names an
+    /// address rather than a name the certificate covers.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 fn floor_grace_minutes() -> u64 {
@@ -603,6 +619,14 @@ impl Config {
             if cluster.group_key_file.is_relative() {
                 cluster.group_key_file = base.join(&cluster.group_key_file);
             }
+            // Peers share certificates through the ACME store, which only a
+            // gateway with a TLS entrance has; its node id lives there too.
+            if !cluster.peers.is_empty() && self.server.tls.is_none() {
+                bail!(
+                    "`cluster.peers` is set and there is no TLS entrance: peer gateways share \
+                     the TLS entrance's certificates, so set `server.tls` or `tls_file`"
+                );
+            }
         }
 
         for site in &mut self.sites {
@@ -878,6 +902,34 @@ sites:
         ] {
             assert!(Config::from_yaml(bad, Path::new(".")).is_err(), "{bad}");
         }
+    }
+
+    /// Peers are listed by URL, with the name a LAN address is verified
+    /// against; a gateway without a TLS entrance has no certificates to share
+    /// and is refused them.
+    #[test]
+    fn peers_need_the_tls_entrance() {
+        let site = "sites:\n  - {name: a, roots: ['.'], default: true}\n";
+        let peers = "cluster: {group_key_file: k, peers: [{url: \"https://192.168.0.6:9443\", name: tokera.com}, {url: \"https://gw2.tokera.com\"}]}\n";
+        let tls = "server:\n  tls: {bind: \"0.0.0.0:9443\", acme: {store: acme}}\n";
+        let c = Config::from_yaml(&format!("{tls}{peers}{site}"), Path::new(".")).unwrap();
+        assert_eq!(
+            c.cluster.unwrap().peers,
+            [
+                Peer {
+                    url: "https://192.168.0.6:9443".into(),
+                    name: Some("tokera.com".into()),
+                },
+                Peer {
+                    url: "https://gw2.tokera.com".into(),
+                    name: None,
+                },
+            ]
+        );
+        let err = Config::from_yaml(&format!("{peers}{site}"), Path::new("."))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("there is no TLS entrance"), "{err}");
     }
 
     #[test]

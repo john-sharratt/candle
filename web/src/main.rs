@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use cluster::handshake::GroupKey;
 use web::{Builder, Config};
 
 #[derive(Parser, Debug)]
@@ -36,6 +37,12 @@ struct Cli {
     #[arg(long)]
     check: bool,
 
+    /// Write a fresh cluster group key to this file, which must not exist,
+    /// then exit (`docs/replicated_substrate.md` §13.1). The key is shown
+    /// nowhere: copy the file to every gateway and member.
+    #[arg(long, value_name = "PATH")]
+    new_group_key: Option<PathBuf>,
+
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 }
@@ -54,6 +61,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_target(false)
         .init();
+
+    if let Some(path) = &cli.new_group_key {
+        GroupKey::create(path)?;
+        println!(
+            "wrote a new group key to {}: copy it to every gateway and member",
+            path.display()
+        );
+        return Ok(());
+    }
 
     let mut cfg = Config::load(&cli.config)?;
     if let Some(bind) = cli.bind {

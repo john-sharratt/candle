@@ -33,10 +33,13 @@ use tower::Service;
 use axum::middleware;
 use cluster::gateway::Class;
 
+use crate::acme::names::groups;
+use crate::acme::peers::AcmePeers;
 use crate::acme::{Challenges, Manager};
 use crate::asset;
 use crate::auth::forwarded::identify;
 use crate::auth::{Auth, Gateways};
+use crate::cluster::peers::dial_all;
 use crate::cluster::route::{self, Routed};
 use crate::cluster::{endpoint, page, ClusterPeer, Gateway, MemberOrigin};
 use crate::compress;
@@ -152,8 +155,8 @@ impl Builder {
     /// [`with_auth`](Self::with_auth): a key file that does not load stops the
     /// start rather than leaving a gateway no member can join.
     pub fn with_cluster(mut self) -> anyhow::Result<Self> {
-        if let Some(cfg) = self.cfg.cluster.clone() {
-            self.cluster = Some(Gateway::new(&cfg, self.cfg.server.bind)?);
+        if self.cfg.cluster.is_some() {
+            self.cluster = Some(Gateway::new(&self.cfg)?);
         }
         Ok(self)
     }
@@ -294,8 +297,15 @@ impl Builder {
     /// certificates from Let's Encrypt. The gateway's way to run.
     pub async fn serve(self) -> anyhow::Result<()> {
         let tls = self.cfg.server.tls.clone();
-        let groups = crate::acme::names::groups(&self.cfg);
+        let groups = groups(&self.cfg);
         let challenges = self.challenges();
+        let peers = self
+            .cfg
+            .cluster
+            .as_ref()
+            .map(|c| c.peers.clone())
+            .unwrap_or_default();
+        let cluster = self.cluster.clone();
         // The plain entrance first: it answers the CA's HTTP-01 challenges, so
         // it is listening before the manager can ask for a certificate.
         let bound = self.bind().await?;
@@ -306,8 +316,20 @@ impl Builder {
         let entrance = match tls {
             Some(tls) => {
                 let resolver = Resolver::new();
-                let manager = Manager::new(tls.acme.clone(), groups, challenges, resolver.clone());
+                let mut manager =
+                    Manager::new(tls.acme.clone(), groups, challenges, resolver.clone());
                 manager.install_stored()?;
+                // With peers, the ACME they share is ready before any link is
+                // taken or dialled (§13.4).
+                if let Some((gw, peering)) = cluster
+                    .as_ref()
+                    .and_then(|gw| gw.peering.clone().map(|p| (gw, p)))
+                {
+                    let acme = AcmePeers::new(peering.clone(), manager.certs());
+                    gw.set_acme(acme.clone());
+                    manager = manager.with_peers(acme);
+                    dial_all(&peering, &peers)?;
+                }
                 let entrance = Entrance::bind(tls.bind, resolver).await?;
                 tokio::spawn(manager.run());
                 Some(entrance)
@@ -399,6 +421,9 @@ impl Bound {
             // clusters rather than finding the socket gone.
             if let Some(gw) = &cluster {
                 gw.hub.close_all("the gateway is shutting down");
+                if let Some(p) = &gw.peering {
+                    p.close_all("the gateway is shutting down");
+                }
             }
             let _ = stopping_tx.send(true);
         })

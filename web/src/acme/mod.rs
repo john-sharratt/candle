@@ -18,14 +18,26 @@
 //! 3. **Renewal by the CA's own schedule** ([`manager`]), sent with `replaces`,
 //!    which Let's Encrypt exempts from its limits.
 //!
-//! The [`store`] holds the account, the certificates and the ledger on disk.
+//! The [`store`] holds the account, the certificates and the ledger on disk,
+//! and [`certs`] installs into it and into the TLS resolver at once.
+//!
+//! Gateways that answer the same names peer ([`peers`],
+//! `docs/replicated_substrate.md` §13.4): one orders each site, its challenges
+//! are answered by all of them, and what it is issued is served by all of
+//! them. [`order`] is one order's steps, with or without peers, against the
+//! [`ca`]; [`publish`] is where its answers go.
 
+pub mod ca;
+pub mod certs;
 pub mod challenges;
 pub mod issue;
 pub mod ledger;
 pub mod manager;
 pub mod names;
+pub mod order;
+pub mod peers;
 pub mod preflight;
+pub mod publish;
 pub mod store;
 
 pub use challenges::Challenges;
