@@ -31,6 +31,9 @@
 //! [`MAX_FAST_RELAUNCHES`] of them gives up and stays down instead of
 //! relaunching again. A poisoning after a long, healthy uptime resets the
 //! count: it is treated as a fresh, unrelated occurrence, not a continuation.
+//! So does any start that is not the watchdog's own relaunch — by hand, an
+//! install, a clean restart: only a process this module started carries the
+//! count of the one it replaced ([`carried_attempts`]).
 
 use std::path::{Path, PathBuf};
 use std::thread::Builder as ThreadBuilder;
@@ -75,9 +78,10 @@ const MAX_FAST_RELAUNCHES: u32 = 5;
 /// File beside the process's log recording how many *consecutive*
 /// fast (within [`FAST_POISON_WINDOW`]) relaunches have happened — plain
 /// decimal text, no format to version. Absent or unparseable reads as 0, the
-/// same as a fresh burst; [`relaunch_decision`] is what actually resets it
-/// (a long uptime before poisoning ignores whatever this holds), so this file
-/// is never explicitly cleared, only ever overwritten with a fresh count.
+/// same as a fresh burst. It is read only by a process the watchdog
+/// relaunched ([`carried_attempts`]), and a long uptime before poisoning
+/// ignores it ([`relaunch_decision`]), so it is never explicitly cleared, only
+/// ever overwritten with a fresh count.
 const ATTEMPTS_FILE_NAME: &str = ".self_heal_attempts";
 
 /// What [`relaunch_decision`] says to do about a poisoning.
@@ -123,6 +127,19 @@ fn read_attempts(state_dir: &Path) -> u32 {
         .unwrap_or(0)
 }
 
+/// The consecutive-fast-relaunch count this process starts from: the stored
+/// one when it is the watchdog's relaunch (`resumed`, the restart marker it
+/// found at start), and 0 for any other start. A count left by a crash loop
+/// days ago is not this process's history: read regardless, it gave up on a
+/// hand-started process's first poisoning without one relaunch.
+fn carried_attempts(resumed: bool, state_dir: &Path) -> u32 {
+    if resumed {
+        read_attempts(state_dir)
+    } else {
+        0
+    }
+}
+
 /// Persist the consecutive-fast-relaunch count. Best-effort, like
 /// [`mark_resume`]: a failed write just means the next poisoning under-counts
 /// from 0 rather than from where this run left off, which only delays
@@ -154,9 +171,11 @@ fn mark_resume(state_dir: &Path) {
 /// Spawn the background thread that polls `candle::gpu_poison::is_gpu_poisoned`
 /// and, on the transition, relaunches an identical process before exiting
 /// this one. `state_dir` is where the log lives, and with it the restart
-/// marker and the attempt count.
-pub fn spawn_watchdog(spec: LaunchSpec, state_dir: PathBuf) {
+/// marker and the attempt count; `resumed` is whether this start is the
+/// watchdog's own relaunch.
+pub fn spawn_watchdog(spec: LaunchSpec, state_dir: PathBuf, resumed: bool) {
     let started = Instant::now();
+    let carried = carried_attempts(resumed, &state_dir);
     ThreadBuilder::new()
         .name("gpu-poison-watchdog".into())
         .spawn(move || loop {
@@ -172,7 +191,7 @@ pub fn spawn_watchdog(spec: LaunchSpec, state_dir: PathBuf) {
             );
             eprintln!("{}", relief_trace::dump());
 
-            let decision = relaunch_decision(started.elapsed(), read_attempts(&state_dir));
+            let decision = relaunch_decision(started.elapsed(), carried);
             let RelaunchDecision::Relaunch { attempts } = decision else {
                 tracing::error!(
                     max = MAX_FAST_RELAUNCHES,
@@ -284,6 +303,27 @@ mod tests {
 
         std::fs::write(dir.join(ATTEMPTS_FILE_NAME), b"not a number").unwrap();
         assert_eq!(read_attempts(&dir), 0, "unparseable reads as fresh");
+    }
+
+    /// **Only the watchdog's own relaunch carries the count.** A start by hand
+    /// over a count of 5 left by an old crash loop begins a fresh burst — it
+    /// had given up on its first poisoning, with no relaunch at all — while a
+    /// relaunched process continues the burst it belongs to.
+    #[test]
+    fn only_a_relaunch_carries_the_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("state");
+        write_attempts(&dir, MAX_FAST_RELAUNCHES);
+        assert_eq!(carried_attempts(false, &dir), 0);
+        assert_eq!(
+            relaunch_decision(Duration::from_secs(120), carried_attempts(false, &dir)),
+            RelaunchDecision::Relaunch { attempts: 1 }
+        );
+        assert_eq!(carried_attempts(true, &dir), MAX_FAST_RELAUNCHES);
+        assert_eq!(
+            relaunch_decision(Duration::from_secs(120), carried_attempts(true, &dir)),
+            RelaunchDecision::GiveUp
+        );
     }
 
     /// `mark_resume` creates the directory if needed and drops an empty

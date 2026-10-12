@@ -2,8 +2,28 @@
  * push streams under /ws. */
 
 import { subscribe } from '/common/lib/ws.js';
+import { isEnvelope, memberStatus, memberWith, pick } from '/common/lib/aggregate.js';
+
+/* Through a clustered gateway, an instrument every member answers comes back
+ * as an envelope of their answers (`common/lib/aggregate.js`). npcd's group
+ * has one member until another machine joins it, and that member's answer is
+ * the cast's. An envelope no member answered is a gateway timeout. */
+function oneMember(body) {
+  if (!isEnvelope(body)) return body;
+  const one = pick(body, null).body;
+  if (one === null) {
+    throw Object.assign(new Error('no npcd member answered'), { error: 'deadline', status: 504 });
+  }
+  return one;
+}
 
 async function j(path, opts) {
+  return raw(path, opts).then(oneMember);
+}
+
+/* `j` without the unwrap, for the answers that choose among members by what
+ * they hold. */
+async function raw(path, opts) {
   const r = await fetch(path, {
     headers: { 'content-type': 'application/json' },
     ...opts,
@@ -97,7 +117,7 @@ const qs = (o) => {
 };
 
 export const LiveAPI = {
-  getStatus:    () => j('/v1/status'),
+  getStatus:    () => raw('/v1/status').then((b) => memberStatus(b, 'npcd')),
   getTelemetry: () => j('/v1/telemetry'),
   /* Full memory accounting. Separate from telemetry because it is a fresh OS
    * read rather than a slice of the retained series, and the performance page
@@ -110,7 +130,8 @@ export const LiveAPI = {
   /* The redo log on disk. Daemon-scoped, not per-character: it is the storage
    * every character's memory is written into. npcd's line in the host's
    * overview of every attached substrate. */
-  getSubstrateStorage: () => j('/v1/substrate').then((o) => ((o && o.tenants) || {}).npcd || null),
+  getSubstrateStorage: () => raw('/v1/substrate')
+    .then((b) => ((memberWith(b, 'npcd') || {}).tenants || {}).npcd || null),
 
   /* No sign-in or sign-out here. The gateway owns both — its `/auth/*` is
    * served ahead of site routing on every hostname, and the cookie it issues is

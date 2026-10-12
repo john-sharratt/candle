@@ -159,6 +159,24 @@ auth_file: "secrets/auth.yaml"
 #     redirect_uri: "https://tokera.com/auth/callback"
 #   YAML
 
+# ── the cluster (docs/replicated_substrate.md) ──────────────────────────────
+# Members — tokerad's zend and npcd tenants, and its agent — dial this gateway at
+# `/v1/cluster/<app>` on the TLS entrance and prove they hold the group key. A
+# route with `cluster: <app>` goes to that app's ready members, and to its
+# `upstream` while there are none (§5.7): code.tokera.com and bot.tokera.com
+# below keep working when no member is up.
+#
+# The key is a file beside the other secrets, made once with
+#
+#   target\release\web.exe --new-group-key web/secrets/group.key
+#
+# and copied to every member (`--group-key`, `group_key:` in tokerad.yaml).
+# `floor_grace_minutes` and `canary_share` tune certification (§3.8); `peers`
+# names the other gateways answering these names (§13.4) — none yet.
+cluster:
+  group_key_file: "secrets/group.key"
+  name: "blackworld"
+
 sites:
   # ── tokera.com ──────────────────────────────────────────────────────────
   # The default site: any Host matching nothing else lands here. It has no
@@ -234,11 +252,15 @@ sites:
   # the console from, and the mock answers `/v1`, not `/app.js`. Run `npcd`
   # itself instead; it embeds the same mock behind the same console, which is
   # what `--authoritative` was standing in for.
+  #
+  # While an npcd member is joined — tokerad's tenant on this box — the site is
+  # its; with none, it falls back to the standalone npcd on .6.
   - name: npcd
     hosts: ["bot.tokera.com", "npcd.localhost", "npcd.test", "*.npcd.dev"]
     api:
       - prefix: /
         upstream: "http://192.168.0.6:8081"
+        cluster: npcd
 
   # ── code.tokera.com — Zend ──────────────────────────────────────────────
   # zend still embeds and serves its own assets, so this site is a pure
@@ -259,6 +281,7 @@ sites:
       - prefix: /
         upstream: "https://192.168.0.5:8444"
         self_signed: true
+        cluster: zend
 
   # ── the other Tokera names ──────────────────────────────────────────────
   # Every alternate domain for the brand, sent to the one that is the brand.

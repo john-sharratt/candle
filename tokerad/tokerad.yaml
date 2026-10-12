@@ -9,14 +9,26 @@
 #
 #   target\release\tokerad.exe --config tokerad\tokerad.yaml
 
-# The process: where it listens and whom it believes. One plain entrance and,
-# beside it, HTTPS with a certificate made at startup, for the gateway's hop.
-# zend's UI answers a bare IP and code.tokera.com; npcd's console answers
-# bot.tokera.com and npcd.localhost.
+# The process: where it listens and whom it believes, and the cluster it joins
+# (docs/replicated_substrate.md §3). One plain entrance and, beside it, HTTPS
+# with a certificate made at startup, for the gateway's hop. zend's UI answers a
+# bare IP and code.tokera.com; npcd's console answers bot.tokera.com and
+# npcd.localhost.
+#
+# Both tenants join the gateway on this machine, through its TLS entrance —
+# verified as tokera.com, since the URL names an address — with the group key
+# the gateway holds. While they are joined the gateway routes code.tokera.com
+# and bot.tokera.com to them; while they are not, each route falls back to its
+# configured upstream (§5.7). The agent file runs build, git and mind jobs in
+# this process at low priority (§11.5).
 host:
   host: 192.168.0.5
   port: 8081
   tls_port: 8444
+  clusters: ["https://192.168.0.5:9443"]
+  cluster_name: tokera.com
+  group_key: web/secrets/group.key
+  agent: tokerad/agent.yaml
 
 # zend: the workspace folder holding `workspace.yaml`, and its `substrate/`. A
 # substrate is bound to the model that wrote it, so one written under another
@@ -24,6 +36,9 @@ host:
 zend:
   working_dir: ..
 
-# npcd: the mind it runs, whose folder also holds its substrate and accounts.
+# npcd: its mind is the repository the agents hold as `battle-mind`, mirrored
+# under its data folder and reached through them only (§10.3); the substrate
+# and accounts live beside the mirror.
 npcd:
-  mind: ../mind
+  mind_repo: battle-mind
+  data: ../npcd-data

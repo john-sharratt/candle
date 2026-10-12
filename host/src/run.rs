@@ -142,7 +142,7 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     // A sticky CUDA fault or an unbroken out-of-memory streak kills the
     // context for good; nothing supervises this process, so it relaunches
     // itself (`self_heal.rs`).
-    spawn_watchdog(launch.clone(), state_dir.clone());
+    spawn_watchdog(launch.clone(), state_dir.clone(), resumed);
     // A no-op without the `profile` feature.
     set_gpu_span_period(GPU_SPAN_PERIOD);
 

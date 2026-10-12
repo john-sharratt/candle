@@ -34,20 +34,27 @@ repository is readable by the model.
  Internet ──TLS──► Cloudflare (proxied names; terminates TLS)
                       │  HTTP :80 to the public IP
                       ▼
-                router ── DMZ ──► 192.168.0.5:80   web  (the gateway, by Host header)
-                                     │
+                router ── DMZ ──► 192.168.0.5:80   web  (the gateway, by Host header;
+                                     │                   cluster `tokera.com` on :9443)
                      ┌───────────────┴────────────────┐
                      ▼                                ▼
-          192.168.0.5:8081  zend               192.168.0.6:8081  npcd
-          (code.tokera.com)                    (bot.tokera.com)
+          192.168.0.5:8081  tokerad            192.168.0.6:8081  npcd
+          zend + npcd members, joined          standalone — bot.tokera.com's
+          to the gateway's cluster             upstream while no npcd member is up
+          (code.tokera.com, bot.tokera.com)
 ```
 
 - **Cloudflare** proxies every public name and connects to the origin on port 80. The
   router puts `192.168.0.5` in its DMZ, so port 80 on the public IP is the gateway.
 - **web** is the only process reachable from outside. It owns sign-in and forwards to the
-  two daemons over the LAN, so neither daemon may bind `127.0.0.1` — loopback takes its site
-  down. zend shares the DMZ box with the gateway, so it binds the LAN address only, never
-  `0.0.0.0`. npcd's box is not in the DMZ and binds `0.0.0.0`.
+  daemons over the LAN, so no daemon may bind `127.0.0.1` — loopback takes its site
+  down. tokerad shares the DMZ box with the gateway, so it binds the LAN address only,
+  never `0.0.0.0`. npcd's box is not in the DMZ and binds `0.0.0.0`.
+- **The cluster.** tokerad's zend and npcd tenants join the gateway's cluster
+  (`docs/replicated_substrate.md`): the gateway routes each name to a joined, ready
+  member of its app over the member's socket, and to the route's `upstream` only while
+  the app has no member (dumb mode). So `bot.tokera.com` is tokerad's npcd while it is
+  up and `.6`'s when it is not, until `.6` is rebuilt onto this framework and joins.
 - **cf-ddns** keeps the Cloudflare A records at the public IP, so a router reboot that
   changes the address heals on its own within one 30 s interval.
 
@@ -59,8 +66,8 @@ not identities.
 
 | Address | Hostname | Runs | Repo |
 |---|---|---|---|
-| `192.168.0.5` | BlackWorld | web, zend, cf-ddns | `D:\prog\candle` |
-| `192.168.0.6` | — | npcd | the checkout `/up` is run from; its mind is `D:\prog\mind` |
+| `192.168.0.5` | BlackWorld | web, tokerad, cf-ddns | `D:\prog\candle` |
+| `192.168.0.6` | — | npcd (standalone) | the checkout `/up` is run from; its mind is `D:\prog\mind` |
 
 ## Services
 
@@ -71,7 +78,7 @@ as its working directory. cf-ddns is the exception — see below.
 | Service | Machine | Listens | Build | Stop by default in `/down` |
 |---|---|---|---|---|
 | web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:9443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml` — `rdp-tunnel-server` holds 443 and 8443) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
-| zend | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the gateway's upstream | `cargo build --release -p zend` | yes |
+| tokerad | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the zend route's upstream in dumb mode; outbound to the gateway's cluster on `:9443` | `cargo build --release -p tokerad` | yes |
 | npcd | .6 | `0.0.0.0:8081` (`--host 0.0.0.0 --port 8081`) | `cargo build --release -p npcd` | yes |
 | cf-ddns | .5 | — (outbound only) | scheduled task, see below | **never** |
 
@@ -84,7 +91,7 @@ Paths are relative to the repo root.
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
-| .5 | zend | `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --tls-port 8444 --max-depth 2 -v` | 2026-10-11, first run on this build, under the prescribed Flash-Next `Q4_KO` — the workspace is `D:\prog`, whose `workspace.yaml` lists the repositories (`candle`, `battle-cities`); its substrate is `D:\prog\substrate`, the Flash-Next store it ran on before, admitted by the one-time model check (`docs/shared_model_host.md` §4.2) and adopted at that first open (`docs/replicated_substrate.md` §6.2). `repo_map` and `code_reading` ingest to two path components below each repository's root; what was ingested deeper is retained while a branch holds it; `--tls-port 8444` is the gateway's upstream (`self_signed: true` in `web/web.yaml`); `-v` (DEBUG) |
+| .5 | tokerad | `target\release\tokerad.exe --config tokerad\tokerad.yaml` | 2026-10-12, replacing zend — every setting is in `tokerad/tokerad.yaml` (below). The zend it replaced ran `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --tls-port 8444 --max-depth 2 -v`; that line is the rollback |
 | .6 | npcd | `target\release\npcd.exe --host 0.0.0.0 --port 8081 --gateway 192.168.0.5 --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`). Rewritten 2026-10-10 for the host's flags (not yet run): `--bind` became `--host`/`--port`, `--content` is gone, and `--gateway 192.168.0.5` is new — without it every signed-in visitor is anonymous. Its store was written by the AntiLoop + StyleTune fine-tune; since 2026-10-11 the host prescribes Flash-Next, so that store is refused at open, before anything in it is rewritten, and npcd's first run on this build needs a new `--data` |
 
 Notes on the arguments:
@@ -127,15 +134,53 @@ Notes on the arguments:
 - **Every flag must exist in the binary.** `/up` checks each recorded flag against `<exe> --help` and asks rather than
   dropping one silently, because clap refuses to start on an unknown flag.
 
-### tokerad (not deployed)
+### tokerad
 
 `tokerad` runs zend and npcd in one process on one model
-(`docs/shared_model_host.md`): `cargo build --release -p tokerad`, then
-`target\release\tokerad.exe --config tokerad\tokerad.yaml` from the repo root. The
-config holds the process's settings under `host:` and each daemon's under its name, in
-the same shape as that daemon's own flags. It serves both on zend's ports; the gateway
-then points `bot.tokera.com` at `https://192.168.0.5:8444` beside `code.tokera.com`,
-and the host picks each UI by name. Its log is `tokerad.log` beside zend's substrate.
+(`docs/shared_model_host.md`), and on `.5` it is what runs in zend's place. The config,
+`tokerad/tokerad.yaml`, holds the process's settings under `host:` and each daemon's
+under its name, in the same shape as that daemon's own flags:
+
+- **`host:`** — `192.168.0.5`, ports `8081` and `8444` (zend's, unchanged), and the
+  cluster: `clusters: ["https://192.168.0.5:9443"]`, verified as `cluster_name:
+  tokera.com`, with `group_key: web/secrets/group.key` and `agent: tokerad/agent.yaml`.
+- **`zend:`** — `working_dir: ..`, so the workspace is `D:\prog` and the substrate
+  `D:\prog\substrate`, the one zend ran on before (adopted as the group's first member,
+  `docs/replicated_substrate.md` §15.1).
+- **`npcd:`** — `mind_repo: battle-mind`, `data: ../npcd-data`. Its substrate and
+  accounts are under `D:\prog\npcd-data`, and its mind is a mirror at
+  `D:\prog\npcd-data\mind\battle-mind`, whose `origin` is `agent:battle-mind`: it is
+  fetched and pushed through an agent, never from GitHub directly. A start with no
+  mirror runs with no mind, fetches it once joined, and relaunches onto it.
+
+**The agent** runs in process (`tokerad/agent.yaml`): `D:\agent\jobs` for jobs, 4
+slots, and its own checkouts, cloned over SSH — `D:\agent\candle`,
+`D:\agent\battle-cities`, `D:\agent\battle-mind` — each allowed to push. They are
+apart from the working trees zend reads in `D:\prog`.
+
+Its log is `tokerad.log` beside zend's substrate, `D:\prog\substrate\tokerad.log`; `/up`'s
+redirected output is in `target\services\` as for the other services.
+
+**Rolling back to the standalone zend**: stop tokerad (Ctrl-C), then start zend with
+the line the launch table records for it. The gateway needs no change — with no member
+of an app it routes to the configured upstream.
+
+### The cluster
+
+The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` block):
+
+- **The group key** is `web/secrets/group.key`, written once by
+  `target\release\web.exe --new-group-key web/secrets/group.key` (it refuses to
+  overwrite one). The gateway and every member on every machine hold the same file;
+  it is a secret, gitignored with the rest of `web/secrets`, and never printed.
+- **Members join over the TLS entrance**, `https://192.168.0.5:9443`, checked against
+  the gateway's `tokera.com` certificate.
+- **The zend and npcd routes** carry `cluster: zend` and `cluster: npcd` and keep their
+  `upstream:`. The gateway serves a name from the app's ready members while it has any,
+  and from the upstream while it has none.
+- **The status page** is `/gateway` on the gateway, its data `/gateway/status.json`
+  (both an admin's): each app's mode,
+  members, lag and claims, the build floor, and the gateway's peers.
 
 ### cf-ddns
 
@@ -201,7 +246,9 @@ persisted in `.self_heal_attempts` beside the log. Past the cap it stays down an
 instead of relaunching again: a genuinely broken card or driver poisons every fresh process
 within moments, and an uncapped watchdog would crash-loop on that forever rather than
 surfacing "a human needs to look at this machine." A poisoning after a healthy multi-minute
-uptime resets the count — it's a fresh occurrence, not a continuation of the same fault.
+uptime resets the count — it's a fresh occurrence, not a continuation of the same fault —
+and so does any start that is not the watchdog's own relaunch: a process started by hand,
+by an install or by a clean restart begins at zero whatever the file holds.
 
 A binary built before the host (the npcd running on `.6` until it is rebuilt) has no
 watchdog of its own, so the same class of stuck device still needs a human there.
@@ -213,7 +260,7 @@ Expected results, as measured 2026-09-13:
 
 | Check | How | Healthy |
 |---|---|---|
-| zend on the LAN | `curl http://192.168.0.5:8081/v1/status` | `"state":"ready"` — it answers `200` with `"state":"loading"` throughout startup; a host-built zend also carries `"tenants":{"zend":{"state":"ready",…}}` |
+| tokerad on the LAN | `curl http://192.168.0.5:8081/v1/status` | `"tenants":{"zend":{"state":"ready",…},"npcd":{"state":"ready",…}}` and `"cluster":{…"apps":{"zend":{"link":"joined",…},"npcd":{"link":"joined",…}}}` — it answers `200` with `"loading"` throughout startup, and npcd's first start on a fresh substrate ingests its mind for a while after zend is ready |
 | npcd on the LAN | `curl http://192.168.0.6:8081/v1/status` | `200`; a host-built npcd answers with `"tenants":{"npcd":…}` |
 | gateway config | `target\release\web.exe --config web/web.yaml --check` | exit 0 |
 | gateway routing | `curl -H "Host: <name>" http://127.0.0.1/` for `tokera.com`, `code.tokera.com`, `bot.tokera.com` | `200` / `30x` / `401`; `503` = that upstream is down |
@@ -235,5 +282,11 @@ Reading a failure:
 - **`www.tokera.com` answers `301`** (to `tokera.com`, per `web.yaml`) — confirmed
   2026-09-16 on a freshly built `web.exe`. A `200` there means the running gateway predates
   the redirect and wants a rebuild and restart.
-- **`bot.tokera.com` `503`** while the gateway is healthy means npcd on `.6` is down — it is
-  started by `/up` on that machine, not on `.5`.
+- **`bot.tokera.com` `503`** while the gateway is healthy means no npcd is serving: tokerad's
+  npcd member is not joined and ready, and npcd on `.6` — the fallback, started by `/up` on
+  that machine, not on `.5` — is down.
+- **`code.tokera.com` slow or `504` right after tokerad starts**, with zend answering
+  directly on `:8081`: the member is still sending its own history to the gateway after
+  the restart, and forwarded requests queue behind it on the socket (about 8 minutes for
+  2.5M records — `docs/replicated_substrate.md` §16, item 19). `"in_flight"` in the
+  member's `/v1/status` counts down to 0.

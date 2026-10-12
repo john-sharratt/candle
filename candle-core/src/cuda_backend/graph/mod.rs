@@ -32,6 +32,7 @@ mod staging;
 mod stream;
 #[cfg(test)]
 mod tests;
+mod thread_wave;
 
 pub use error::GraphError;
 pub use exec::GraphExec;
@@ -43,3 +44,5 @@ use session::CaptureSession;
 #[cfg(test)]
 use stream::CaptureStream;
 pub use stream::ComputeStream;
+pub(crate) use thread_wave::enter as enter_wave;
+pub use thread_wave::outside_capture;

@@ -91,6 +91,7 @@
 import { h, mount, fmtNum } from './common/lib/dom.js';
 import { makeChart, makeStackChart } from './common/lib/chart.js';
 import { estateSwitcher } from './common/lib/estate.js';
+import { pick } from './common/lib/aggregate.js';
 
 const POLL_MS = 4000;
 const MiB = 1024;
@@ -121,6 +122,9 @@ let W = [], FM = [], MG = [], PTS = [], PROM = [], HOST = {}, MEM = null;
 let lastAt = 0;          // when the newest sample landed, for the age readout
 let paused = false;
 let failures = 0;
+/* Through a clustered gateway every endpoint answers for each member
+ * (`common/lib/aggregate.js`); the page shows one, picked here. */
+let member = null;
 
 /* ── page ───────────────────────────────────────────────────────────────── */
 
@@ -129,6 +133,20 @@ const verdict = h('div', { class: 'panel verdict' }, 'waiting for the first samp
 const age = h('span', { class: 'tiny dim' });
 const live = h('span', { class: 'chip' }, 'connecting…');
 const pauseBtn = h('button', { class: 'btn sm' }, '⏸ pause');
+const memberPick = h('select', { id: 'member', class: 'btn sm', 'aria-label': 'Member', hidden: true });
+
+memberPick.addEventListener('change', () => { member = memberPick.value; refresh(); });
+
+/* One option per member that answered, shown only when there is a choice. */
+function paintMembers(members) {
+  memberPick.hidden = members.length < 2;
+  const want = members.map((m) => m.node).join(',');
+  if (memberPick.dataset.nodes !== want) {
+    memberPick.dataset.nodes = want;
+    mount(memberPick, ...members.map((m) => h('option', { value: m.node }, `${m.host || m.node.slice(0, 8)}`)));
+  }
+  if (member) memberPick.value = member;
+}
 
 pauseBtn.addEventListener('click', () => {
   paused = !paused;
@@ -156,7 +174,7 @@ mount(document.getElementById('page'),
   h('div', { class: 'hd' },
     h('div', {}, h('h1', {}, 'Telemetry'),
       h('div', { class: 'sub' }, 'Where the scheduler’s wall-clock goes, and how close the card is to its wall.')),
-    h('div', { class: 'row' }, live, age, pauseBtn)),
+    h('div', { class: 'row' }, memberPick, live, age, pauseBtn)),
   kpis,
   verdict,
   h('div', { class: 'panel' },
@@ -427,12 +445,20 @@ async function refresh() {
   try {
     // Only the first is required. The rest degrade to `null` so a daemon that
     // has not instrumented one greys a panel rather than blanking the page.
-    const [tel, ph, pr, mem] = await Promise.all([
+    const [telAll, ph, pr, mem] = await Promise.all([
       fetch('/v1/telemetry', { cache: 'no-store' }).then((r) => r.json()),
       fetch('/v1/phases', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
       fetch('/v1/promotes', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
       fetch('/v1/memory', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
-    ]);
+    ]).then(([t, p, r, m]) => {
+      // The telemetry answer names the member; the rest are that member's.
+      const first = pick(t, member);
+      member = first.node;
+      paintMembers(first.members);
+      const of = (x) => (x === null ? null : pick(x, member).body);
+      return [first.body, of(p), of(r), of(m)];
+    });
+    const tel = telAll || {};
     W = tel.waves || []; FM = tel.fmt || []; MG = tel.migrate || []; HOST = tel.host || {};
     PTS = (ph && ph.points) || [];
     PROM = (pr && pr.items) || [];

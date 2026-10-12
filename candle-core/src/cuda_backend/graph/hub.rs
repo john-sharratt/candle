@@ -30,6 +30,7 @@
 use super::record_gate;
 use super::slot::{ExecSlot, Folded};
 use super::staging::StagingRing;
+use super::thread_wave;
 use super::GraphError;
 use crate::cuda_backend::{set_kernel_breadcrumb, CudaDevice, WrapErr};
 use crate::Result;
@@ -223,6 +224,8 @@ impl Drop for WaveCapture {
                 .capture_hub()
                 .abandon_wave(&self.device.compute_stream());
         }
+        // Finished or abandoned, the wave no longer records on this thread.
+        thread_wave::leave(&self.device);
     }
 }
 

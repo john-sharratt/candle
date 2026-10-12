@@ -288,7 +288,8 @@ async function pollBuild(){
   if(MOCK) return;
   try{
     const r=await fetch('/v1/status',{cache:'no-store'}); if(!r.ok) return;
-    const st=await r.json();
+    const { memberStatus } = await import('/common/lib/aggregate.js');
+    const st=memberStatus(await r.json(),'zend');
     if(st && st.build){ if(!BUILD) BUILD=st.build; else if(st.build!==BUILD) location.reload(); }
   }catch(_){}
 }

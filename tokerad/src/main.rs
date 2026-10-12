@@ -120,14 +120,22 @@ mod tests {
     }
 
     /// The shipped example parses, and every section holds the same settings
-    /// the daemons' own flags do.
+    /// the daemons' own flags do: the process joins its gateway's cluster with
+    /// an agent in process, and npcd's mind is the repository the agents hold.
     #[test]
     fn the_example_configuration_parses() {
         let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("tokerad.yaml");
         let c = Config::load(&example).unwrap();
         assert_eq!(c.host.port, 8081);
         assert_eq!(c.host.tls_port, Some(8444));
-        assert!(c.npcd.mind.is_some());
+        assert_eq!(c.host.clusters, ["https://192.168.0.5:9443"]);
+        assert_eq!(c.host.cluster_name.as_deref(), Some("tokera.com"));
+        assert!(c.host.group_key.is_some() && c.host.agent.is_some());
+        assert_eq!(
+            (c.npcd.mind_repo.as_deref(), c.npcd.mind.as_deref()),
+            (Some("battle-mind"), None)
+        );
+        assert!(c.npcd.data.is_some());
     }
 
     /// A key no section knows is refused, naming the file — a misspelt

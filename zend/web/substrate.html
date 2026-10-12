@@ -622,8 +622,11 @@ async function refresh(){
     // poll stays cheap and never loads the whole substrate up front. It is
     // zend's line in the host's overview of every attached substrate — `null`
     // until zend's engine holds it open, which reads as the model loading.
-    const d = MOCK ? mockOverview() : await getJSON('/v1/substrate').then((o)=>{
-      const z = (o.tenants||{}).zend;
+    // Through a clustered gateway, a member's that holds it.
+    const d = MOCK ? mockOverview() : await Promise.all([
+      getJSON('/v1/substrate'), import('/common/lib/aggregate.js'),
+    ]).then(([body, aggregate])=>{
+      const z = (aggregate.memberWith(body,'zend').tenants||{}).zend;
       if(!z) throw new Error('503');
       return z;
     });
@@ -655,7 +658,8 @@ async function refresh(){
 async function pollBuild(){
   if(MOCK) return;
   try{
-    const st=await getJSON('/v1/status');
+    const { memberStatus } = await import('/common/lib/aggregate.js');
+    const st=memberStatus(await getJSON('/v1/status'),'zend');
     if(st && st.build){
       if(!S.build) S.build=st.build;
       else if(st.build!==S.build) location.reload();

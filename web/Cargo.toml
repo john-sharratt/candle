@@ -104,3 +104,7 @@ image             = { workspace = true, features = ["webp"] }
 # sleeping past the filesystem's timestamp granularity.
 filetime          = "0.2"
 tempfile          = { workspace = true }
+# The consoles' shared modules under `content/common/lib`, run as written by an
+# ECMAScript engine in a test (`tests/aggregate_js.rs`) — no Node on the machines
+# these are built on. The version zend-tools already resolves.
+boa_engine        = "0.21.1"

@@ -9,6 +9,7 @@ use super::{GgmlDType, Int8Mode, QStorage, SumScale};
 use crate::backend::{BackendDevice, BackendStorage};
 
 use crate::cuda_backend::alloc_inheriting;
+use crate::cuda_backend::graph::outside_capture;
 use crate::cuda_backend::wave_provenance::{wave_alloc_attributed, LeaseOrigin};
 use crate::cuda_backend::Backing;
 use crate::cuda_backend::INHERIT_ALIGN;
@@ -186,8 +187,11 @@ unsafe impl Sync for HostMappedAlloc {}
 
 impl Drop for HostMappedAlloc {
     fn drop(&mut self) {
-        unsafe {
-            let _ = cudarc::driver::sys::cuMemFreeHost(self.host_ptr).result();
+        // Refused on a recording thread, ending its capture: freed with this
+        // thread's wave paused, or directly when a wave cannot be paused.
+        let free = || unsafe { cudarc::driver::sys::cuMemFreeHost(self.host_ptr) };
+        if outside_capture(free).is_err() {
+            let _ = free();
         }
         crate::vram::note_host_pinned_free(crate::vram::PinnedUse::HostMapped, self.size as u64);
     }
@@ -256,8 +260,9 @@ pub fn alloc_host_mapped(size: usize) -> Result<(*mut u8, u64, HostMappedAlloc)>
         // out-of-memory without them is unactionable: pinned allocations fail
         // against what every *other* pinned claim in the process has already
         // taken, and the amount asked for is the only clue to which caller this
-        // was.
-        sys::cuMemHostAlloc(&mut host_ptr, size, 0x02)
+        // was. Pinning is refused on a recording thread, ending its capture,
+        // so it runs with this thread's wave paused.
+        outside_capture(|| sys::cuMemHostAlloc(&mut host_ptr, size, 0x02))?
             .result()
             .map_err(|e| {
                 crate::Error::Msg(format!(
@@ -270,7 +275,7 @@ pub fn alloc_host_mapped(size: usize) -> Result<(*mut u8, u64, HostMappedAlloc)>
         let mut dev_ptr: sys::CUdeviceptr = 0;
         let res = sys::cuMemHostGetDevicePointer_v2(&mut dev_ptr, host_ptr, 0);
         if let Err(e) = res.result() {
-            let _ = sys::cuMemFreeHost(host_ptr).result();
+            let _ = outside_capture(|| sys::cuMemFreeHost(host_ptr));
             crate::bail!("cuMemHostGetDevicePointer failed: {:?}", e);
         }
         // Non-pageable by construction, so the host-RAM budget must count it as

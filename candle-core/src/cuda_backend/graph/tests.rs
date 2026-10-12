@@ -7,6 +7,7 @@
 use super::{CaptureSession, CaptureStream, ComputeStream};
 use crate::backend::BackendDevice;
 use crate::cuda_backend::{CudaDevice, WrapErr};
+use crate::quantized::pinned_staging::PinnedBuf;
 use crate::Result;
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1321,6 +1322,49 @@ fn a_retired_item_may_retire_from_its_own_drop() -> Result<()> {
     dev.retire(Nested(dev.clone(), freed.clone()));
     capture.finish()?;
     assert!(freed.load(Ordering::SeqCst), "the nested release ran");
+    Ok(())
+}
+
+/// **Pinned staging taken and freed mid-segment pauses the wave around it.**
+/// The driver refuses to pin or unpin host pages on a recording thread, and the
+/// refusal ends the capture — measured in tokerad, a prefill wave that took a
+/// staging buffer mid-segment lost the segment and faulted the next wave step.
+/// The staging calls hold no device, so they pause through the wave this
+/// thread has open: the segment recorded before each runs first, recording
+/// resumes, and every launch lands in issue order.
+#[test]
+fn pinned_staging_inside_a_recording_pauses_the_wave() -> Result<()> {
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 2.0, 0.0)?;
+    let (wave, first) = dev.recording_segment().expect("recording");
+    assert_eq!(first, 0);
+    let staging = PinnedBuf::alloc_owned(4096)?;
+    assert_eq!(
+        dev.recording_segment(),
+        Some((wave, 1)),
+        "the allocation launched segment 0 and recording resumed"
+    );
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 1.0, 1.0)?;
+    drop(staging);
+    assert_eq!(
+        dev.recording_segment(),
+        Some((wave, 2)),
+        "the free launched segment 1 and recording resumed"
+    );
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 1.0, 3.0)?;
+    capture.finish()?;
+    dev.synchronize()?;
+    let want: Vec<f32> = ramp(1.0).iter().map(|v| v + 3.0).collect();
+    assert_eq!(dev.memcpy_dtov(&y)?, want);
+    // With no wave open the staging calls go straight to the driver.
+    assert_eq!(PinnedBuf::alloc_owned(4096)?.len(), 4096);
+    assert_eq!(dev.recording_segment(), None);
     Ok(())
 }
 

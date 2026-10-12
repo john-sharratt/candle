@@ -1,0 +1,20 @@
+# The agent `tokerad --agent` runs in process on .5 (docs/replicated_substrate.md
+# §11.5): build and git jobs for zend's conversations, and the npcd mind's
+# fetches and pushes (§10.3). Its checkouts are its own, apart from the working
+# trees zend reads, and are cloned and pushed with this machine's SSH keys. A
+# job's commands run below normal priority, beside the model.
+#
+# The names are what the jobs ask for: zend's workspace repositories as
+# `workspace.yaml` names them, and the mind as tokerad.yaml's `mind_repo:`.
+jobs_dir: D:/agent/jobs
+slots: 4
+checkouts:
+  - name: candle
+    dir: D:/agent/candle
+    push: true
+  - name: battle-cities
+    dir: D:/agent/battle-cities
+    push: true
+  - name: battle-mind
+    dir: D:/agent/battle-mind
+    push: true

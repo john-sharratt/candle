@@ -304,8 +304,12 @@ impl Store for ConversationStore {
     }
 
     fn disk(&self) -> Disk {
-        let (free, total) = volume_of(&self.conversation.substrate_dir()).unwrap_or_else(|| {
-            tracing::error!("the substrate's volume is on no measured mount");
+        let dir = self.conversation.substrate_dir();
+        let (free, total) = volume_of(&dir).unwrap_or_else(|| {
+            tracing::error!(
+                "the substrate's volume is on no measured mount dir={}",
+                dir.display()
+            );
             (0, 0)
         });
         Disk {

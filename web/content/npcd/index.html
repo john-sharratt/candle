@@ -191,6 +191,12 @@
         fetch('/v1/status', { credentials: 'same-origin' })
           .then(function (r) { return r && r.ok ? r.json() : null; })
           .then(function (s) {
+            // Through a clustered gateway, the ready member's status.
+            return s && import('/common/lib/aggregate.js').then(function (a) {
+              return a.memberStatus(s, 'npcd');
+            });
+          })
+          .then(function (s) {
             if (s && s.state === 'ready') {
               var b = document.getElementById('boot');
               if (b) b.remove();

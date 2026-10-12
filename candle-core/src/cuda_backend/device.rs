@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::graph::{CaptureHub, CaptureStats, Paused, WaveCapture};
+use super::graph::{enter_wave, CaptureHub, CaptureStats, Paused, WaveCapture};
 use super::info_ring::InfoRing;
 use super::staged::pack_segments;
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
@@ -805,6 +805,7 @@ impl CudaDevice {
     /// eagerly as it always has.
     pub fn begin_wave_capture(&self) -> Result<WaveCapture> {
         self.capture.begin_wave(&self.stream)?;
+        enter_wave(self.clone());
         Ok(WaveCapture {
             device: self.clone(),
             finished: false,

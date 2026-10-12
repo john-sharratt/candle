@@ -47,6 +47,7 @@
 //! drop(gen); // records a fence; the arena resets on the next generation
 //! ```
 
+use crate::cuda_backend::graph::outside_capture;
 use crate::cuda_backend::WrapErr;
 use crate::{CudaDevice, Result};
 use cudarc::driver::sys;
@@ -364,11 +365,11 @@ impl PinnedBuf {
             });
         }
         let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        unsafe {
-            sys::cuMemHostAlloc(&mut host_ptr, len, flags)
-                .result()
-                .map_err(|e| crate::Error::Msg(format!("cuMemHostAlloc failed: {:?}", e)))?;
-        }
+        // Pinning is refused on a recording thread, and the refusal ends its
+        // capture: a staging buffer taken mid-wave pauses the wave around it.
+        outside_capture(|| unsafe { sys::cuMemHostAlloc(&mut host_ptr, len, flags) })?
+            .result()
+            .map_err(|e| crate::Error::Msg(format!("cuMemHostAlloc failed: {:?}", e)))?;
         crate::vram::note_host_pinned_alloc(crate::vram::PinnedUse::Staging, len as u64);
         Ok(Self::Owned {
             ptr: host_ptr as *mut u8,
@@ -539,9 +540,7 @@ impl Drop for PinnedBuf {
     fn drop(&mut self) {
         if let Self::Owned { ptr, len } = self {
             if *len > 0 {
-                unsafe {
-                    let _ = sys::cuMemFreeHost(*ptr as *mut std::ffi::c_void).result();
-                }
+                free_host(*ptr);
                 crate::vram::note_host_pinned_free(crate::vram::PinnedUse::Staging, *len as u64);
             }
         }
@@ -581,19 +580,19 @@ unsafe impl Send for PinnedArena {}
 impl PinnedArena {
     fn new(capacity: usize) -> Result<Self> {
         let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        unsafe {
-            // CU_MEMHOSTALLOC_DEVICEMAP = 0x02
-            // CU_MEMHOSTALLOC_WRITECOMBINED = 0x04
-            sys::cuMemHostAlloc(&mut host_ptr, capacity, 0x02 | 0x04)
-                .result()
-                .map_err(|e| {
-                    crate::Error::Msg(format!(
-                        "cuMemHostAlloc for arena ({} MB) failed: {:?}",
-                        capacity / (1024 * 1024),
-                        e
-                    ))
-                })?;
-        }
+        // CU_MEMHOSTALLOC_DEVICEMAP = 0x02
+        // CU_MEMHOSTALLOC_WRITECOMBINED = 0x04
+        // An overflow arena is added mid-generation, so possibly mid-wave: the
+        // pinning runs with this thread's wave paused around it.
+        outside_capture(|| unsafe { sys::cuMemHostAlloc(&mut host_ptr, capacity, 0x02 | 0x04) })?
+            .result()
+            .map_err(|e| {
+                crate::Error::Msg(format!(
+                    "cuMemHostAlloc for arena ({} MB) failed: {:?}",
+                    capacity / (1024 * 1024),
+                    e
+                ))
+            })?;
         // Get the device-visible pointer for this mapped allocation.
         let mut dev_ptr: sys::CUdeviceptr = 0;
         unsafe {
@@ -641,14 +640,23 @@ impl PinnedArena {
 impl Drop for PinnedArena {
     fn drop(&mut self) {
         if self.capacity > 0 {
-            unsafe {
-                let _ = sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void).result();
-                crate::vram::note_host_pinned_free(
-                    crate::vram::PinnedUse::Staging,
-                    self.capacity as u64,
-                );
-            }
+            free_host(self.ptr);
+            crate::vram::note_host_pinned_free(
+                crate::vram::PinnedUse::Staging,
+                self.capacity as u64,
+            );
         }
+    }
+}
+
+/// Unpin and free `ptr`, from `cuMemHostAlloc`, with this thread's wave paused
+/// around it: the driver refuses the free on a recording thread, and the
+/// refusal ends the capture. A wave that cannot be paused is already broken,
+/// and the free goes ahead rather than leak the pages.
+fn free_host(ptr: *mut u8) {
+    let free = || unsafe { sys::cuMemFreeHost(ptr as *mut std::ffi::c_void) };
+    if outside_capture(free).is_err() {
+        let _ = free();
     }
 }
 

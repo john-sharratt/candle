@@ -9,10 +9,11 @@
 
 use std::env::current_dir;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{absolute, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::{self, Next};
 use axum::Router;
@@ -224,6 +225,15 @@ impl NpcdArgs {
     /// up. Fatal rather than a fallback: a daemon that quietly reverted to the
     /// bundled placeholder would run with none of the named mind's content.
     pub fn resolve(self) -> anyhow::Result<NpcdTenant> {
+        // Absolute from here on: the substrate's volume is measured from its
+        // path, and a mirror's repository is opened by its path, so neither
+        // may depend on where it is read from.
+        let explicit = self
+            .data
+            .as_deref()
+            .map(absolute)
+            .transpose()
+            .context("--data")?;
         // A mind repository is read through its mirror under `--data`; until
         // the mirror holds the record, the daemon starts with no mind and
         // fetches it once joined (§10.3).
@@ -235,7 +245,7 @@ impl NpcdArgs {
                          repository the agents hold — give one"
                     );
                 }
-                let data = self.data.as_deref().ok_or_else(|| {
+                let data = explicit.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("--mind-repo keeps its mirror under --data: name one")
                 })?;
                 Some(MindRepo::new(data, name, &self.mind_branch)?)
@@ -251,8 +261,8 @@ impl NpcdArgs {
         // **The compiled-in default is a path on the machine that built
         // this.** Used when it is really there; the working directory stands in
         // when it is not, and the choice is logged at start.
-        let (data, fell_back) = match data_dir(self.data.clone(), schema.dir.as_deref()) {
-            Some(dir) => (dir, false),
+        let (data, fell_back) = match data_dir(explicit, schema.dir.as_deref()) {
+            Some(dir) => (absolute(&dir).context("the data directory")?, false),
             None => {
                 let built_at = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
                 if built_at.is_dir() {
@@ -331,24 +341,24 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         ),
         _ => {}
     }
-    if let Some(r) = repo.as_ref().filter(|r| !r.ready()) {
-        tracing::warn!(
-            "the mind repository `{}` is not mirrored at {} yet: starting with no mind; once \
-             joined it is fetched through an agent and the process restarts onto it",
-            r.name,
-            r.dir.display()
-        );
-    }
-    match &schema.dir {
-        Some(dir) => tracing::info!(
+    match (&schema.dir, &repo) {
+        (Some(dir), _) => tracing::info!(
             "projection schema: {} (collections resolve under {})",
             schema.label,
             dir.display()
         ),
+        // A repository the agents hold that is not mirrored yet: the schema
+        // falls back to the bundled one until the fetch after joining.
+        (None, Some(r)) => tracing::warn!(
+            "the mind repository `{}` is not mirrored at {} yet: starting with no mind; once \
+             joined it is fetched through an agent and the process restarts onto it",
+            r.name,
+            r.dir.display()
+        ),
         // A warning, not a note: a daemon with no mind starts, serves the
         // console and looks healthy, while every character in it has no world,
         // no personality and no libraries to think with.
-        None => tracing::warn!(
+        (None, None) => tracing::warn!(
             "no --mind given: running on the {} schema's layers with no content libraries, \
              no worlds and no personalities, and the substrate goes to the data directory's \
              default rather than beside a mind. Pass --mind <dir> to run a real one",
@@ -1009,6 +1019,26 @@ mod tests {
         let yaml: NpcdArgs =
             serde_yaml::from_str(&format!("mind_repo: mind\ndata: '{data}'\n")).unwrap();
         assert_eq!(yaml, parse(&["--mind-repo", "mind", "--data", data]));
+    }
+
+    /// **A relative `--data` is made absolute at resolve**, as `tokerad.yaml`'s
+    /// `data: ../npcd-data` is: a mirror is a repository opened by its path,
+    /// which must be absolute, and the substrate's volume is measured from its
+    /// path. Resolving touches nothing on disk.
+    #[test]
+    fn a_relative_data_directory_resolves_absolute() {
+        let here = current_dir().unwrap();
+        let t = parse(&["--mind-repo", "mind", "--data", "unmade-npcd-data"])
+            .resolve()
+            .unwrap();
+        assert_eq!(t.data, here.join("unmade-npcd-data"));
+        assert_eq!(
+            t.repo.unwrap().dir,
+            here.join("unmade-npcd-data").join("mind").join("mind")
+        );
+        let plain = parse(&["--data", "unmade-npcd-data"]).resolve().unwrap();
+        assert_eq!(plain.data, here.join("unmade-npcd-data"));
+        assert!(!here.join("unmade-npcd-data").exists());
     }
 
     /// npcd needs what zend needs of the model, and the prescribed one has it.

@@ -1365,11 +1365,21 @@ each and answers:
                { "node": "a0…", "host": ".6", "build": 4815, "status": 504, "error": "deadline" } ] }
 ```
 
-with `x-tokera-aggregate: 1`. The perf tabs (`zend/web/perf.html`,
-`web/content/npcd/pages/system.js`) and the loading screens read the envelope: a member
-picker plus totals. `/v1/status` aggregated also carries a `group` block — floor, model
-lock, member count — that the gateway adds. `FirstFound` returns the first `2xx` body
-unwrapped.
+with `x-tokera-aggregate: 1`. The consoles read it through
+`web/content/common/lib/aggregate.js`, which takes a process's own answer as it is:
+
+- **the loading screens and build checks** (`memberStatus`) — the status of a member
+  ready for the tenant, since the gateway sends the console's requests to ready members;
+  until one is, the first member that answered; with none, "connecting";
+- **zend's telemetry page** (`pick`) — one member at a time, chosen from a member picker
+  shown when more than one answered;
+- **the substrate overview** (`memberWith`) — the first member that holds the tenant's
+  line;
+- **the npcd console's instruments** — the one member's answer, as npcd's group has one
+  member (§16, item 20).
+
+`/v1/status` aggregated also carries a `group` block — floor, model lock, member count —
+that the gateway adds. `FirstFound` returns the first `2xx` body unwrapped.
 
 An aggregate covers the members connected to the gateway that took the request. With
 every member joined to every cluster, that is all of them. The envelope lists the
@@ -4153,25 +4163,33 @@ process spawn is asserted on, never run.
 installs itself one member at a time. A bad install restores itself, and a rollback swaps
 from each member's own disk.
 
-### Chunk 10: the second gateway and the migration
+### Chunk 10: gateway peering, the mind through agents, and the migration
 
 **Builds on everything.**
 
-- Gateway peering: challenge sharing, certificate push, the shared ledger and the
-  rendezvous orderer with `ACME_ORDERING` (§13.4).
-- `docs/deployment.md`: the group key on each machine, `--cluster` for every gateway on
-  every daemon and agent, the `cluster:` keys on `web.yaml`'s routes, and a second
-  gateway behind the public names with the same `session.key` and OAuth client.
+- Gateway peering (§13.4): the `gateway` app's links (`cluster::peer`), challenge
+  sharing, certificate push over secure links only, the merged ledger, the inventory
+  exchange and the rendezvous orderer with `ACME_ORDERING` (`web/src/acme/peers/`).
+  `web --new-group-key <path>` writes a group key.
+- npcd's mind as a repository the agents hold (§10.3): `--mind-repo`, its mirror under
+  `--data`, and the fetch job (`Submit::Fetch`, `agent::fetcher::AgentFetch`,
+  `zend_vfs::Fetch`) a member with no way to origin fetches through.
+- The consoles reading the gateway's aggregates (§5.5, `common/lib/aggregate.js`).
+- `docs/deployment.md`: the group key, the `cluster:` block and route keys in
+  `web.yaml`, `tokerad` with `clusters`, `group_key` and an in-process agent.
 - The migration of today's deployment (§15.1).
 
-**Tests.** The gateway-peering table (§14.1), against a local test double of the ACME CA.
+**Tests.** The gateway-peering table (§14.1), against a local test double of the ACME
+CA (`web/tests/peering.rs`); the mirror brought up and followed through an agent
+(`npcd/src/mind_repo.rs`, `agent/tests/agents.rs`).
 
-**Exit.** Two gateways serve the same names, either one's loss costs only its requests
-in flight, and today's zend and npcd run as members with their histories intact.
+**Exit.** Two gateways can serve the same names with one certificate store between
+them, and today's zend runs as a member of the gateway's cluster with its history
+intact. A second gateway behind the public names waits on a second gateway machine.
 
 ### 15.1 Migrating today's deployment
 
-**Where things stand** (`docs/deployment.md`):
+**Where things stood** (`docs/deployment.md`, before 2026-10-12):
 
 - the gateway, `web`, on `.5`;
 - zend on `.5`, launched `D:\prog --host 192.168.0.5 --port 8081 --tls-port 8444`, with
@@ -4180,15 +4198,35 @@ in flight, and today's zend and npcd run as members with their histories intact.
   substrate under its data directory;
 - `tokerad` not deployed.
 
-The migration below moves this to clustered operation without losing either substrate,
-and every step can be undone.
+**As run, 2026-10-12.** `.5` moved first; `.6` stays as it is until it is rebuilt on
+this framework.
+
+- **The gateway** took the `cluster:` block (`group_key_file: secrets/group.key`,
+  written by `web --new-group-key`) and `cluster:` keys on the zend and npcd routes, each
+  keeping its upstream.
+- **`tokerad` on `.5` replaced zend.** It joins `https://192.168.0.5:9443` as
+  `tokera.com` with an agent in process, whose checkouts — `candle`, `battle-cities`,
+  `battle-mind` — are under `D:\agent` (`tokerad/agent.yaml`). Its zend tenant adopted
+  `D:\prog\substrate` as the group's first member. No copy was taken aside: the estate
+  accepts rebuilding a substrate over keeping a way back.
+- **npcd started fresh under `tokerad`'s model key** — the second way on in step 3
+  below. Its tenant has `mind_repo: battle-mind` and `data: ../npcd-data`: the first
+  start found no mirror, ran with no mind, fetched the record through the in-process
+  agent once joined, and relaunched onto it.
+- **`bot.tokera.com` falls back to `.6`.** While `tokerad`'s npcd member is joined and
+  ready the gateway routes the name to it; with no npcd member it is back in dumb mode,
+  on the `.6` upstream.
+
+The steps below are the general plan, for the machines still to move.
 
 **0. Prepare.**
 
 - Build every machine at one commit, so the build floor sees one count (§3.5).
-- Generate the group key and copy it to every machine (§13.1).
-- **Copy each existing substrate directory aside.** The adoption in steps 2 and 3
-  rewrites it, and this design has no backup (D17), so this copy is the only way back.
+- Generate the group key (`web --new-group-key <path>`) and copy it to every machine
+  (§13.1).
+- **Copy aside each substrate directory whose history is to be kept.** The adoption in
+  steps 2 and 3 rewrites it, and this design has no backup (D17), so this copy is the
+  only way back.
 
 **1. Gateway, in dumb mode.**
 
@@ -4228,10 +4266,10 @@ and every step can be undone.
   model key whose RoPE minimum differs from the one `tokerad`'s engine runs (the refusal
   `docs/shared_model_host.md` §4.2 records). The group's model lock is set by `.6`, so a
   `tokerad` npcd tenant would be closed 4412 (§3.6). There are two ways on:
-  - **keep npcd members as standalone npcd processes**, which is what this plan does;
-  - **start the npcd group fresh** under `tokerad`'s model key, giving up `.6`'s history.
-
-  Which to take is the estate's call. Neither needs anything this design does not have.
+  - **keep npcd members as standalone npcd processes**;
+  - **start the npcd group fresh** under `tokerad`'s model key, giving up `.6`'s history
+    — the way the estate took: `.6` is rebuilt onto this framework and joins the group
+    `tokerad` started, empty.
 - Further npcd machines join with empty substrates and catch up.
 - Set `--cluster-quorum-max` if the npcd group should keep electing with only two
   machines (§16, item 10).
@@ -4256,7 +4294,8 @@ and every step can be undone.
 **Rolling back**, at any step:
 
 1. Stop the members.
-2. Restore the substrate copies from step 0.
+2. Restore the substrate copies from step 0, where one was taken. On `.5` none was: the
+   standalone zend of the same build opens the adopted substrate as it stands.
 3. Restart each daemon with its old launch line, without `--cluster`.
 
 The gateway needs no change: with no members it is back in dumb mode, routing to the
@@ -4364,6 +4403,23 @@ same configured upstreams as before.
     production, the design needs a staged run across two or three real machines, one of
     them over the internet through Cloudflare, exercising a cut-off, a gateway restart
     and a full disk.
+19. **A member alone in its group sends its whole history at every start.** A restart
+    owes every own event above the highest any *other member* acknowledged
+    (`Outbox::restart`, §7.5), and with no other member that is all of them. Measured on
+    `.5` (2026-10-12): zend's adopted 2.49M records went onto the gateway socket's
+    ordered lane at ~4,900 events/s, and every request the gateway forwarded to zend
+    queued behind them for the ~8 minutes the drain took. The gateway relays them to no
+    one, and a member that joins later fetches history by catch-up (§7.3), not from the
+    live stream. The likely answer is that a gateway's `RECEIPT` with no other member of
+    the app to relay to counts as held, persisted as the `received` a restart starts
+    from; a stream frame must also never wait behind a resend of history on the ordered
+    lane.
+20. **The npcd console shows one member's cast.** Its pulse, census, world, guardian and
+    guest instruments are aggregated per member (§5.5), and the console reads the first
+    member's answer (`web/content/npcd/lib/api.live.js`). With one npcd member that is
+    the whole cast. With a second — `.6` rebuilt and joined — each payload needs its own
+    union (characters by `nid`, census counts summed, a world from its authority), and
+    the telemetry tab a member picker like zend's.
 
 ---
 

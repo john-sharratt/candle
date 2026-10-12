@@ -93,10 +93,14 @@
     },
 
     // GET /v1/status — the host's status: the process's, with zend's own line
-    // under `tenants.zend` (drives the startup overlay). If the daemon isn't
-    // reachable yet, report a synthetic "connecting" loading state.
+    // under `tenants.zend` (drives the startup overlay). Through a clustered
+    // gateway it is every member's, and the ready member's speaks for zend
+    // (`common/lib/aggregate.js`). If the daemon isn't reachable yet, report a
+    // synthetic "connecting" loading state.
     getStatus() {
-      return getJSON('/v1/status').catch(() => ({
+      return Promise.all([getJSON('/v1/status'), import('/common/lib/aggregate.js')])
+        .then(([body, aggregate]) => aggregate.memberStatus(body, 'zend'))
+        .catch(() => ({
         state: 'loading',
         started_at_ms: 0,
         tenants: { zend: { state: 'loading', loading: { label: 'Connecting', detail: 'connecting to daemon…', progress: 0, completed: [] } } },
