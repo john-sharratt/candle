@@ -137,6 +137,11 @@ server:
 # without binding anything.
 auth_file: "secrets/auth.yaml"
 
+# Who is an admin: the estate's one role table, the file every daemon compiles
+# in, so the gateway and the daemons behind it agree. An admin sees the
+# gateway's status page (/gateway) and its "Cluster" link on tokera.com.
+roles_file: "../host/roles.yaml"
+
 # Paths inside it resolve against THIS FILE, like `roots` and `papers`, so keep
 # them relative and one table works on a laptop and on the DMZ box. Both
 # secrets are files rather than inline values, so even `auth.yaml` carries none.

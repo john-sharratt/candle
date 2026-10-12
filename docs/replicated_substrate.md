@@ -3357,9 +3357,10 @@ The push credentials live on the agent, never on a GPU member.
 every host, merged ahead of site routing, and admin only. tokera.com's top bar links to
 it as **Cluster** beside the signed-in name, for an admin or a creator only:
 `/auth/me` carries the caller's `role`, and `common/lib/auth.js` offers the link where
-the page would not be refused. The gateway resolves roles
-from `Config.roles` (`web/src/config.rs:53-61`), which it finally reads, against the same
-table as `host/roles.yaml`. The page polls once a second.
+the page would not be refused. The gateway resolves roles from `host/roles.yaml` itself
+— the table every daemon compiles in — named by `web.yaml`'s `roles_file:` and read into
+`Config.roles`, so the gateway and the daemons cannot disagree about who is an admin. The
+page polls once a second.
 
 **Every coordination decision in this design is visible here**: membership, floors and
 locks, modes, claims, world and NPC leases, generations, catch-up, retransmit and

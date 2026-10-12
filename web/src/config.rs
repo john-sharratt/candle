@@ -52,14 +52,18 @@ pub struct Config {
     /// it wants sign-in and a gateway that quietly has none is worse.
     #[serde(default)]
     pub auth_file: Option<PathBuf>,
-    /// Who is an admin. Estate-wide, like [`auth`](Self::auth), because a role
-    /// that meant something different on each hostname would be a role nobody
-    /// could reason about.
-    ///
-    /// Empty by default: no admins, and every write to authored content is
-    /// refused. See [`crate::auth::role`] for why this is configuration rather
-    /// than a user record, and why an entry names `sub` or `email` explicitly.
+    /// The estate's role table, `host/roles.yaml` — the one file every daemon
+    /// compiles in (`host::access::ROLES`), so the gateway and the daemons it
+    /// fronts can never disagree about who is an admin. Resolved against this
+    /// config's directory and read into [`roles`](Self::roles); named but
+    /// missing or unparseable is fatal, since a gateway that quietly had no
+    /// admins would refuse its own status page to them.
     #[serde(default)]
+    pub roles_file: Option<PathBuf>,
+    /// Who is an admin, from [`roles_file`](Self::roles_file). Estate-wide,
+    /// because a role that meant something different on each hostname would be
+    /// a role nobody could reason about. Empty with no file: no admins.
+    #[serde(skip)]
     pub roles: Roles,
     /// The cluster this gateway runs (`docs/replicated_substrate.md` §3): the
     /// group key members prove they hold. Absent, no member can join and every
@@ -505,6 +509,24 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Read `roles_file` into [`roles`](Self::roles).
+    fn load_roles_file(&mut self, base: &Path) -> Result<()> {
+        let Some(rel) = self.roles_file.clone() else {
+            return Ok(());
+        };
+        let path = if rel.is_absolute() {
+            rel
+        } else {
+            base.join(rel)
+        };
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading the role table {}", path.display()))?;
+        self.roles = serde_yaml::from_str(&text)
+            .with_context(|| format!("parsing the role table {}", path.display()))?;
+        self.roles_file = Some(path);
+        Ok(())
+    }
+
     /// Fold `auth_file` into [`auth`](Self::auth).
     ///
     /// Absent file, sign-in off. Present and broken, hard failure — the two
@@ -598,6 +620,7 @@ impl Config {
         let base = self.base.clone();
 
         self.load_auth_file(&base)?;
+        self.load_roles_file(&base)?;
         self.resolve_tls(&base)?;
 
         // Secret paths resolve against the config file, exactly like `roots`
@@ -1131,5 +1154,44 @@ google:
                 "web.yaml carries an inline `auth:` block"
             );
         }
+    }
+
+    /// **The gateway reads the estate's role table**, the one every daemon
+    /// compiles in: with none, it took its own admin for a user and offered
+    /// neither the status page nor the Cluster link.
+    #[test]
+    fn the_shipped_table_reads_the_estates_roles() {
+        let text = include_str!("../web.yaml");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("roles_file:"))
+            .expect("web.yaml names a role table");
+        let rel = line["roles_file:".len()..].trim().trim_matches('"');
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let shipped = std::fs::read_to_string(base.join(rel)).unwrap();
+        assert_eq!(shipped, include_str!("../../host/roles.yaml"));
+
+        let dir = tmpdir();
+        std::fs::write(dir.join("roles.yaml"), "admins:\n  - email: a@x.com\n").unwrap();
+        let y = format!(
+            "roles_file: \"roles.yaml\"\n{}",
+            YAML.trim_start_matches('\n')
+        );
+        let c = Config::from_yaml(&y, &dir).unwrap();
+        assert_eq!(c.roles.admins.len(), 1);
+        assert_eq!(c.roles_file.unwrap(), dir.join("roles.yaml"));
+
+        let missing = format!(
+            "roles_file: \"absent.yaml\"\n{}",
+            YAML.trim_start_matches('\n')
+        );
+        assert!(
+            Config::from_yaml(&missing, &dir).is_err(),
+            "a named table must exist"
+        );
+        assert!(
+            Config::from_yaml(&format!("roles:\n  admins: []\n{YAML}"), &dir).is_err(),
+            "an inline table is not read"
+        );
     }
 }
