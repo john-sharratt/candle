@@ -13,6 +13,9 @@
 //!   there, and one opened fetching through them — a mirror with no way to
 //!   origin — follows origin's branch. Cut off, a member reaches only an agent
 //!   in its own process, and without one the job is `no_agent`.
+//! - An admin's member lists the agents, reads each one's jobs and logs, and
+//!   switches one off and on (§11.7) — through the gateway, or directly to
+//!   its own agent while cut off.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -27,7 +30,7 @@ use agent::fetcher::AgentFetch;
 use agent::jobs::{JobError, Jobs};
 use agent::member::{Agent, APP};
 use agent::pusher::AgentPush;
-use agent::wire::{encode_bundle, FetchJob, JobView, PushJob, PushLine, RunJob, Submit};
+use agent::wire::{encode_bundle, FetchJob, JobKind, JobView, PushJob, PushLine, RunJob, Submit};
 use cluster::dial::Connect;
 use cluster::dispatch::RouteTable;
 use cluster::frame::{BuildId, Capacity, MemberState, ModelId};
@@ -401,6 +404,146 @@ async fn a_members_jobs_reach_an_agent_through_the_gateway() {
     .unwrap();
     assert_eq!(pulled.on_origin, Some(tip.clone()));
     assert_eq!(pulled.tip, Some(tip));
+}
+
+/// **An admin's member lists the agents, reads what one ran and its log, and
+/// switches it off and on through the gateway** (§11.7). Off, the gateway
+/// routes it no job and the job is `no_agent`; back on, it takes jobs again.
+#[tokio::test]
+async fn an_agent_is_watched_and_switched_through_the_gateway() {
+    let r = repos();
+    let gateway = Gateway::with_hub(Hub::new(key(), "gw"));
+    let agent = Agent::new(
+        0xa1,
+        "build-1".into(),
+        key(),
+        vec!["https://gw".into()],
+        jobs_over(&r, false),
+    );
+    agent.dial(
+        0,
+        ToGateway {
+            gateway: gateway.clone(),
+            app: APP,
+        },
+    );
+    let member = zend_member(0x3);
+    let run = member.clone();
+    let to = ToGateway {
+        gateway: gateway.clone(),
+        app: "zend",
+    };
+    tokio::spawn(async move { run.run(0, to, |conn| conn.reset()).await });
+    let hub = gateway.hub.clone();
+    until("the agent ready and the member admitted", || {
+        member.admitted() && hub.member(APP, 0xa1).is_some_and(|m| m.ready())
+    })
+    .await;
+
+    let agents = Agents::new(member.clone(), None);
+    let listed = agents.listing().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (
+            listed[0].node.as_str(),
+            listed[0].host.as_str(),
+            listed[0].state.as_str()
+        ),
+        ("00000000000000a1", "build-1", "ready")
+    );
+    assert_eq!(listed[0].repos[0].name, "r");
+    assert!(listed[0].connected_ms > 0);
+
+    let store = changed_store(&r);
+    let job = run_job(&store);
+    let ran = agents.run("conv-3", job.clone()).await.unwrap();
+    let at = agents.at(0xa1);
+    assert_eq!(at, At::Agent(0xa1));
+    let listing = agents.jobs_of(at, 10).await.unwrap();
+    assert!(listing.enabled);
+    assert_eq!((listing.slots, listing.running), (2, 0));
+    let line = &listing.jobs[0];
+    assert_eq!(line.id, ran.view.id);
+    assert_eq!(line.kind, JobKind::Run);
+    assert_eq!(line.branch.as_deref(), Some("main"));
+    let want: Vec<String> = [job.program.clone()].into_iter().chain(job.args).collect();
+    assert_eq!(line.command, want);
+    assert_eq!(line.status, JobStatus::Exited { code: Some(0) });
+    assert_eq!(line.changed, 1);
+    assert!(line.ended_ms.is_some_and(|e| e >= line.started_ms));
+
+    // The tail of an ended job is the whole log, and nothing past its end.
+    let tail = agents.tail(at, &ran.view.id, 0).await.unwrap();
+    assert!(tail.ended);
+    assert_eq!(tail.bytes().unwrap(), ran.log);
+    assert_eq!(tail.size, ran.log.len() as u64);
+    let past = agents.tail(at, &ran.view.id, tail.size).await.unwrap();
+    assert!(past.bytes().unwrap().is_empty() && past.ended);
+
+    // Off: the gateway hears it at once, routes it nothing, and lists it so.
+    assert!(!agents.switch(at, false).await.unwrap());
+    until("the agent disabled on the gateway", || {
+        hub.member(APP, 0xa1)
+            .is_some_and(|m| m.state() == MemberState::Disabled)
+    })
+    .await;
+    assert_eq!(agents.listing().await.unwrap()[0].state, "disabled");
+    let refused = agents.run("conv-3", run_job(&store)).await;
+    assert!(
+        matches!(refused, Err(AgentError::NoAgent(_))),
+        "{refused:?}"
+    );
+    // What it ran can still be read.
+    assert!(!agents.jobs_of(at, 10).await.unwrap().enabled);
+
+    assert!(agents.switch(at, true).await.unwrap());
+    until("the agent ready again", || {
+        hub.member(APP, 0xa1).is_some_and(|m| m.ready())
+    })
+    .await;
+    let again = agents.run("conv-3", run_job(&store)).await.unwrap();
+    assert_eq!(again.view.status, JobStatus::Exited { code: Some(0) });
+}
+
+/// Cut off, a member lists the agent in its own process and switches it
+/// directly; switched off, that agent refuses a job as `no_agent`.
+#[tokio::test]
+async fn a_cut_off_member_watches_and_switches_its_own_agent() {
+    let r = repos();
+    let jobs = jobs_over(&r, false);
+    let agents = Agents::new(zend_member(0x4), Some(Arc::clone(&jobs)));
+    let listed = agents.listing().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (listed[0].host.as_str(), listed[0].state.as_str()),
+        ("m", "ready")
+    );
+    let node = u64::from_str_radix(&listed[0].node, 16).unwrap();
+    assert_eq!(agents.at(node), At::InProcess);
+
+    let store = changed_store(&r);
+    let ran = agents.run("conv-4", run_job(&store)).await.unwrap();
+    let listing = agents.jobs_of(At::InProcess, 10).await.unwrap();
+    assert_eq!(listing.jobs[0].id, ran.view.id);
+    assert_eq!(
+        agents
+            .tail(At::InProcess, &ran.view.id, 0)
+            .await
+            .unwrap()
+            .bytes()
+            .unwrap(),
+        ran.log
+    );
+
+    assert!(!agents.switch(At::InProcess, false).await.unwrap());
+    assert_eq!(agents.listing().await.unwrap()[0].state, "disabled");
+    let refused = agents.run("conv-4", run_job(&store)).await;
+    assert!(
+        matches!(refused, Err(AgentError::NoAgent(_))),
+        "{refused:?}"
+    );
+    assert!(agents.switch(At::InProcess, true).await.unwrap());
+    assert!(jobs.enabled());
 }
 
 /// Cut off, a member's job goes to the agent in its own process, and with

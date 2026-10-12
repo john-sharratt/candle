@@ -3,6 +3,7 @@
 //! job's store reads the repository's branches through, and its origin.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cluster::frame::RepoAd;
@@ -34,6 +35,9 @@ pub struct Checkouts {
     by_name: BTreeMap<String, Checkout>,
     /// The programs the sandboxes start that are on this machine's `PATH`.
     toolchains: Vec<String>,
+    /// The folder the job logs are written to, which also keeps the agent's
+    /// node and its switch.
+    jobs_dir: PathBuf,
 }
 
 impl Checkouts {
@@ -74,7 +78,13 @@ impl Checkouts {
         Ok(Checkouts {
             by_name,
             toolchains,
+            jobs_dir: cfg.jobs_dir.clone(),
         })
+    }
+
+    /// The folder the job logs are written to.
+    pub fn jobs_dir(&self) -> &Path {
+        &self.jobs_dir
     }
 
     /// What `CAPACITY` advertises as its toolchains (§11.2).

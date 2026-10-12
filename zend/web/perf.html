@@ -76,6 +76,7 @@
     <a class="navlink" href="/">Chat</a>
     <a class="navlink" href="perf.html" aria-current="page">Telemetry</a>
     <a class="navlink" href="logs.html">Logs</a>
+    <a class="navlink" href="agents.html" data-admin hidden>Agents</a>
   </nav>
   <span class="spacer"></span>
   <div class="row" id="chrome"></div>
@@ -107,6 +108,9 @@ import { h, mount, fmtNum } from './common/lib/dom.js';
 import { makeChart, makeStackChart } from './common/lib/chart.js';
 import { estateSwitcher } from './common/lib/estate.js';
 import { pick } from './common/lib/aggregate.js';
+import { revealAdminLinks } from './admin-nav.js';
+
+revealAdminLinks();
 
 const POLL_MS = 4000;
 const MiB = 1024;

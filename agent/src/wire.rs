@@ -149,6 +149,86 @@ pub struct JobView {
     pub fetched: Option<Fetched>,
 }
 
+/// What a job does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    Run,
+    Push,
+    Fetch,
+}
+
+/// One job as `GET /v1/jobs` lists it: what it runs, and where it stands —
+/// without a run's outcome, which only the member that sent it reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobLine {
+    pub id: String,
+    pub repo: String,
+    pub kind: JobKind,
+    /// The branch a run's store is on; `None` for a push or a fetch.
+    pub branch: Option<String>,
+    /// Its command line: a run's program and arguments, or the git command a
+    /// push or a fetch makes.
+    pub command: Vec<String>,
+    #[serde(flatten)]
+    pub status: JobStatus,
+    /// Lines and bytes written to its log so far.
+    pub lines: u64,
+    pub bytes: u64,
+    /// When it started and ended, in Unix milliseconds.
+    pub started_ms: u64,
+    pub ended_ms: Option<u64>,
+    /// The files a run changed, once it has ended.
+    pub changed: usize,
+}
+
+/// `GET /v1/jobs`: whether the agent takes jobs, its slots, and the jobs it
+/// keeps, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentJobs {
+    pub enabled: bool,
+    pub slots: u32,
+    pub running: u32,
+    pub jobs: Vec<JobLine>,
+}
+
+/// `GET /v1/jobs/:id/tail?from=<byte>`: a job's log from byte `from`, up to
+/// [`TAIL_MAX`](crate::jobs::TAIL_MAX) of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogChunk {
+    pub from: u64,
+    /// The bytes read, in base64: a command's output need not be UTF-8, and a
+    /// chunk can end inside a character.
+    pub data: String,
+    /// The log's length when it was read.
+    pub size: u64,
+    /// The job had ended before the log was read, so `size` is all of it.
+    pub ended: bool,
+}
+
+impl LogChunk {
+    pub fn of(from: u64, bytes: &[u8], size: u64, ended: bool) -> LogChunk {
+        LogChunk {
+            from,
+            data: STANDARD.encode(bytes),
+            size,
+            ended,
+        }
+    }
+
+    pub fn bytes(&self) -> Result<Vec<u8>, BadWire> {
+        STANDARD
+            .decode(&self.data)
+            .map_err(|e| BadWire(format!("the log chunk is not base64: {e}")))
+    }
+}
+
+/// `PUT /v1/agent`: switch the agent on or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Switching {
+    pub enabled: bool,
+}
+
 /// Why a [`PushLine`], [`Pushed`] or [`Fetched`] does not read as one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
@@ -356,5 +436,56 @@ mod tests {
             bundle: None,
         };
         assert!(bad.bundle().is_err());
+    }
+
+    /// **A listed job is its JSON**: its kind, its command line and its times
+    /// beside the flattened status.
+    #[test]
+    fn a_listed_job_is_its_json() {
+        let jobs = AgentJobs {
+            enabled: false,
+            slots: 4,
+            running: 1,
+            jobs: vec![JobLine {
+                id: "AAAAAAAAAAA".into(),
+                repo: "candle".into(),
+                kind: JobKind::Run,
+                branch: Some("zen/x".into()),
+                command: vec!["cargo".into(), "test".into()],
+                status: JobStatus::Running,
+                lines: 2,
+                bytes: 17,
+                started_ms: 1_700_000_000_000,
+                ended_ms: None,
+                changed: 0,
+            }],
+        };
+        let wire = serde_json::to_value(&jobs).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "enabled": false, "slots": 4, "running": 1,
+                "jobs": [{
+                    "id": "AAAAAAAAAAA", "repo": "candle", "kind": "run", "branch": "zen/x",
+                    "command": ["cargo", "test"], "status": "running",
+                    "lines": 2, "bytes": 17, "started_ms": 1_700_000_000_000u64,
+                    "ended_ms": null, "changed": 0
+                }]
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentJobs>(wire).unwrap(), jobs);
+    }
+
+    /// A log chunk carries its bytes in base64 — exactly these — and reads
+    /// them back, a split character and all.
+    #[test]
+    fn a_log_chunk_carries_its_bytes() {
+        let bytes = [b'o', b'k', b'\n', 0xE2, 0x80];
+        let chunk = LogChunk::of(9, &bytes, 14, false);
+        assert_eq!(
+            serde_json::to_value(&chunk).unwrap(),
+            json!({ "from": 9, "data": "b2sK4oA=", "size": 14, "ended": false })
+        );
+        assert_eq!(chunk.bytes().unwrap(), bytes);
     }
 }

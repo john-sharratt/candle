@@ -13,22 +13,32 @@
 //! carries a push's bundle and answers how each ref came out;
 //! [`Agents::fetch`] brings back what origin holds and the objects the member
 //! lacks.
+//!
+//! An admin watches the agents through the same streams (§11.7):
+//! [`Agents::listing`] names every agent the gateway admitted, and
+//! [`Agents::jobs_of`], [`Agents::tail`], [`Agents::cancel`] and
+//! [`Agents::switch`] address one of them by its node.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::http::{header, Method, Request, StatusCode};
-use cluster::gateway::{LINEAGE_HEADER, NODE_HEADER, PUSH_HEADER, REPO_HEADER, TOOLCHAIN_HEADER};
+use cluster::gateway::{
+    state_name, AgentRepo, AgentRow, AGENTS_PATH, LINEAGE_HEADER, NODE_HEADER, PUSH_HEADER,
+    REPO_HEADER, TOOLCHAIN_HEADER,
+};
 use cluster::member::AppMember;
+use cluster::version::this_build;
 use http_body_util::BodyExt;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use serde::de::DeserializeOwned;
 use zend_vfs::{FetchBundle, JobStatus, PushResult, RunOutcome};
 
 use crate::jobs::{JobError, Jobs};
-use crate::member::APP;
-use crate::wire::{FetchJob, JobView, PushJob, RunJob, Submit};
+use crate::member::{capacity, node_in, APP};
+use crate::wire::{AgentJobs, FetchJob, JobView, LogChunk, PushJob, RunJob, Submit, Switching};
 
 /// How long each wait on a running job is held open.
 const WAIT: Duration = Duration::from_secs(25);
@@ -267,6 +277,168 @@ impl Agents {
         }
     }
 
+    /// Whether any of the member's sockets is admitted, so the gateway's
+    /// agents are in reach.
+    pub fn admitted(&self) -> bool {
+        self.member.admitted()
+    }
+
+    /// Where requests for agent `node` go: this process's own agent while it
+    /// is cut off and `node` is that agent's, and through a gateway
+    /// otherwise.
+    pub fn at(&self, node: u64) -> At {
+        match self.local() {
+            Some(jobs) if node_in(jobs.checkouts().jobs_dir()).ok() == Some(node) => At::InProcess,
+            _ => At::Agent(node),
+        }
+    }
+
+    /// A request to agent `node` for `path`, answered as `T`.
+    async fn ask<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        node: u64,
+        path: String,
+        body: Vec<u8>,
+    ) -> Result<T, AgentError> {
+        let (_, body) = self
+            .call(Call {
+                method,
+                path,
+                body,
+                to: Some(node),
+                lineage: None,
+                repo: None,
+                toolchain: None,
+                push: false,
+            })
+            .await?;
+        serde_json::from_slice(&body).map_err(|e| AgentError::Transport(e.to_string()))
+    }
+
+    fn own(&self) -> Result<&Arc<Jobs>, AgentError> {
+        self.in_process
+            .as_ref()
+            .ok_or_else(|| AgentError::NoAgent("no agent runs in this process".into()))
+    }
+
+    /// Every agent this member can reach: those its gateway admitted, or,
+    /// cut off from every cluster, the agent in its own process.
+    pub async fn listing(&self) -> Result<Vec<AgentRow>, AgentError> {
+        if let Some(jobs) = self.local() {
+            return Ok(vec![self.own_row(jobs)]);
+        }
+        if !self.member.admitted() {
+            return Ok(Vec::new());
+        }
+        let (_, body) = self
+            .call(Call {
+                method: Method::GET,
+                path: AGENTS_PATH.into(),
+                body: Vec::new(),
+                to: None,
+                lineage: None,
+                repo: None,
+                toolchain: None,
+                push: false,
+            })
+            .await?;
+        serde_json::from_slice(&body).map_err(|e| AgentError::Transport(e.to_string()))
+    }
+
+    /// The agent in this process, as a gateway would list it.
+    fn own_row(&self, jobs: &Jobs) -> AgentRow {
+        let cap = capacity(jobs, jobs.checkouts().toolchains());
+        AgentRow {
+            node: node_in(jobs.checkouts().jobs_dir())
+                .map_or_else(|_| String::new(), |n| format!("{n:016x}")),
+            host: self.member.host().to_string(),
+            build: this_build(),
+            state: state_name(cap.state).to_string(),
+            os: cap.os,
+            cores: cap.cores,
+            load_milli: cap.load_milli,
+            mem_free_mib: cap.mem_free_mib,
+            slots_free: cap.slots_free,
+            jobs: cap.jobs,
+            toolchains: cap.toolchains,
+            low_priority: cap.low_priority,
+            repos: jobs
+                .checkouts()
+                .ads()
+                .into_iter()
+                .map(|r| AgentRepo {
+                    name: r.name,
+                    origin: r.origin,
+                    push: r.push,
+                })
+                .collect(),
+            connected_ms: 0,
+        }
+    }
+
+    /// What agent `at` is running and has run, newest first, up to `limit`.
+    pub async fn jobs_of(&self, at: At, limit: usize) -> Result<AgentJobs, AgentError> {
+        match at {
+            At::InProcess => Ok(self.own()?.list(limit)),
+            At::Agent(node) => {
+                self.ask(
+                    Method::GET,
+                    node,
+                    format!("/v1/jobs?limit={limit}"),
+                    Vec::new(),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Job `id`'s log on agent `at`, from byte `from`.
+    pub async fn tail(&self, at: At, id: &str, from: u64) -> Result<LogChunk, AgentError> {
+        match at {
+            At::InProcess => self.own()?.tail(id, from).await.map_err(refused),
+            At::Agent(node) => {
+                self.ask(
+                    Method::GET,
+                    node,
+                    format!("/v1/jobs/{id}/tail?from={from}"),
+                    Vec::new(),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Cancel job `id` on agent `at`, killing its process tree.
+    pub async fn cancel(&self, at: At, id: &str) -> Result<JobView, AgentError> {
+        match at {
+            At::InProcess => self.own()?.cancel(id).map_err(refused),
+            At::Agent(node) => {
+                self.ask(Method::DELETE, node, format!("/v1/jobs/{id}"), Vec::new())
+                    .await
+            }
+        }
+    }
+
+    /// Switch agent `at` on or off; answers how it now stands.
+    pub async fn switch(&self, at: At, on: bool) -> Result<bool, AgentError> {
+        match at {
+            At::InProcess => {
+                let jobs = self.own()?;
+                jobs.set_enabled(on).map_err(refused)?;
+                Ok(jobs.enabled())
+            }
+            At::Agent(node) => {
+                let body =
+                    serde_json::to_vec(&Switching { enabled: on }).expect("a switch serialises");
+                let now: Switching = self
+                    .ask(Method::PUT, node, "/v1/agent".into(), body)
+                    .await?;
+                Ok(now.enabled)
+            }
+        }
+    }
+
     /// Push `job` from an agent holding its repository with push rights.
     pub async fn push(&self, job: PushJob) -> Result<Vec<PushResult>, AgentError> {
         let view = if let Some(jobs) = self.local() {
@@ -335,7 +507,9 @@ impl Agents {
 
 fn refused(e: JobError) -> AgentError {
     match e {
-        JobError::UnknownRepo(_) | JobError::NoPush(_) => AgentError::NoAgent(e.to_string()),
+        JobError::UnknownRepo(_) | JobError::NoPush(_) | JobError::Disabled => {
+            AgentError::NoAgent(e.to_string())
+        }
         other => AgentError::Refused {
             status: 400,
             why: other.to_string(),

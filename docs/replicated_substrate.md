@@ -3252,6 +3252,7 @@ A new binary, `tokera-agent` (crate `agent/`). It is CPU-only and links `cluster
 - job slots in use
 - toolchains: which of the programs on the allow-list (`zend/src/sandbox_programs.rs`)
   are found on its `PATH`
+- its state: `ready`, or `disabled` while an admin has switched it off (§11.7)
 
 ### 11.3 Selection
 
@@ -3279,9 +3280,12 @@ member:
 | Route | |
 |---|---|
 | `POST /v1/jobs` | A run, `{ "job": "run", repo, branch, overlay, program, args, timeout_secs }`, a push, `{ "job": "push", repo, bundle, specs: [{ target, to, expect }] }`, or a fetch, `{ "job": "fetch", repo, branch, have }` (`agent/src/wire.rs`). Answers the job's view: its id, its status, its log's size, and once it has ended a run's outcome, a push's refs, or a fetch's `fetched: { tips, bundle }`. |
+| `GET /v1/jobs` | Whether the agent takes jobs, its slots, and its newest jobs (`?limit=<n>`, 40 by default), each with its kind, its command line, its branch, its status, its log's size, when it started and ended, and the files a run changed (§11.7). |
 | `GET /v1/jobs/:id` | Status: queued, running, exited, timed out, cancelled, refused or failed. `?wait=<s>` holds the answer until the job ends, up to 30 s. |
 | `GET /v1/jobs/:id/log` | The log from its first byte. |
+| `GET /v1/jobs/:id/tail?from=<byte>` | Up to 256 KiB of the log from byte `from`, base64 — a chunk can end inside a character — with the log's length, and whether the job had ended before the read (§11.7). |
 | `DELETE /v1/jobs/:id` | Cancel, killing the process tree. |
+| `PUT /v1/agent` | `{ enabled }`: switch the agent on or off (§11.7). |
 
 `overlay` is the conversation's or operation's store `Snapshot` (`zend-vfs/src/vfs/mod.rs:380`),
 its base included, which the 10 MiB store cap keeps small. That answers the open question
@@ -3351,6 +3355,42 @@ The rules of `docs/zend_workspace_execution.md` §7.3 apply unchanged:
 - Output is rewritten to repository-relative paths.
 
 The push credentials live on the agent, never on a GPU member.
+
+### 11.7 Watching and switching agents
+
+An admin sees every agent a daemon's commands run on, what each is running, and its
+output as it is written, and can take an agent out of service — zend's **Agents** page
+(`zend/web/agents.html`, `docs/zend_ui_redesign.md` §2.8). Everything goes through the
+member's own streams to `group:agent`, as its jobs do; nothing new listens anywhere.
+
+- **The listing is the gateway's.** `GET /v1/agents` on a stream towards `group:agent`
+  is answered by the gateway itself from its registry
+  (`cluster/src/gateway/agent_row.rs`): each admitted agent's node, host, build, state,
+  last `CAPACITY` and repositories, and when its socket connected. A member cut off from
+  every cluster lists the agent in its own process instead (`Agents::listing`).
+- **Each agent is then asked, by its node.** `GET /v1/jobs` gives its newest jobs, and
+  `GET /v1/jobs/:id/tail?from=<byte>` its log from a byte, addressed with
+  `x-tokera-node` like any read-back (§11.4). The command line a job shows is a run's
+  program and arguments, or the git command a push or a fetch makes.
+- **Output is read only while someone watches.** zend follows a log with its tail —
+  straight on while a read comes back full, every 300 ms once caught up — and only while
+  a browser holds the stream open (`zend/src/api/agents/tail.rs`). The page opens it when
+  an agent is expanded and closes it when it is collapsed, so an agent nobody is looking
+  at is asked for its jobs every few seconds and never for its output.
+- **The switch.** `PUT /v1/agent { enabled }` switches an agent off or on, kept as a
+  `DISABLED` file beside its job logs so it survives a restart (`agent/src/switch.rs`).
+  Off, its `CAPACITY` reports `MemberState::Disabled`: it is not ready, so the gateway
+  routes it no job (§11.3) — a job no other agent can take is `no_agent` — and the new
+  `CAPACITY` goes out at once rather than at the next second. A job sent to it anyway, by
+  a member cut off and reaching its own agent, is refused as `no_agent` too. The jobs it
+  is running carry on to their end, and every job it kept can still be read and
+  cancelled.
+
+zend serves this at `GET /v1/agents`, `PUT /v1/agents/:node`,
+`DELETE /v1/agents/:node/jobs/:id` and the SSE `GET /v1/agents/:node/jobs/:id/stream`
+(`zend/src/api/agents/`) — an admin's only, since they show every conversation's commands
+and switch the machines that run them. A daemon without `--cluster` lists no agents and
+says why.
 
 ---
 

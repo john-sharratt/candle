@@ -4,8 +4,9 @@
 //! zend's own REST surface to per-resource submodules — `chat`,
 //! `conversations`, `projections` (one projection point in full, for the
 //! projection panel), `files` (conversation-attached uploads), `models`,
-//! `repo_map`, and `substrate` (zend's layer/timeline inspection and projection
-//! debug, under `/v1/substrate/zend/`).
+//! `repo_map`, `substrate` (zend's layer/timeline inspection and projection
+//! debug, under `/v1/substrate/zend/`), and `agents` (the machines its
+//! commands run on, watched and switched by an admin).
 //!
 //! What both daemons serve — status, identity, telemetry, memory, the log
 //! stream, the tool catalog, the substrate overview — is the host's, served
@@ -15,11 +16,12 @@
 use std::sync::Arc;
 
 use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror};
-use host::guard::{delete, get, post, Api, Guarded, Routes};
+use host::guard::{delete, get, post, put, Api, Guarded, Routes};
 use web::auth::{Role, Roles};
 
 use crate::session::ZendSession;
 
+pub mod agents;
 pub mod chat;
 mod chat_frames;
 mod compressed;
@@ -51,7 +53,8 @@ pub const CONVERSATION_HEADER: &str = "x-tokera-conversation";
 /// The chat and conversation routes are open: an OpenAI client (Continue)
 /// sends no identity, and the tools dial resolves the caller's role itself
 /// ([`crate::access`]). The substrate views are an admin's: they read every
-/// conversation and name paths on this host.
+/// conversation and name paths on this host. So are the agents: they show
+/// every conversation's commands, and switch the machines that run them.
 ///
 /// Under a cluster a conversation is served by the member holding its claim;
 /// the substrate's replicated state is read from any member, and what lives in
@@ -132,6 +135,27 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Role::Admin,
             Dispatch::Best,
             post(substrate::project),
+        )
+        // Every member reaches every agent through its gateway, so any one
+        // answers for them.
+        .route("/v1/agents", Role::Admin, Dispatch::Any, get(agents::list))
+        .route(
+            "/v1/agents/:node",
+            Role::Admin,
+            Dispatch::Any,
+            put(agents::switch),
+        )
+        .route(
+            "/v1/agents/:node/jobs/:id",
+            Role::Admin,
+            Dispatch::Any,
+            delete(agents::cancel),
+        )
+        .route(
+            "/v1/agents/:node/jobs/:id/stream",
+            Role::Admin,
+            Dispatch::Any,
+            get(agents::stream),
         )
         .route(
             "/v1/conversations",
@@ -216,6 +240,10 @@ mod tests {
                 ("/v1/substrate/zend/timeline/:tl", "admin"),
                 ("/v1/substrate/zend/timeline/:tl/selection", "admin"),
                 ("/v1/substrate/zend/project", "admin"),
+                ("/v1/agents", "admin"),
+                ("/v1/agents/:node", "admin"),
+                ("/v1/agents/:node/jobs/:id", "admin"),
+                ("/v1/agents/:node/jobs/:id/stream", "admin"),
                 ("/v1/conversations", "unauthenticated"),
                 ("/v1/conversations/:id", "unauthenticated"),
                 ("/v1/conversations/:id/files", "unauthenticated"),
@@ -269,6 +297,18 @@ mod tests {
             ("GET", "/v1/conversations", Dispatch::Any),
             ("GET", "/v1/models", Dispatch::Any),
             ("GET", "/v1/repo_map", Dispatch::Any),
+            ("GET", "/v1/agents", Dispatch::Any),
+            ("PUT", "/v1/agents/00000000000000a1", Dispatch::Any),
+            (
+                "DELETE",
+                "/v1/agents/00000000000000a1/jobs/j",
+                Dispatch::Any,
+            ),
+            (
+                "GET",
+                "/v1/agents/00000000000000a1/jobs/j/stream",
+                Dispatch::Any,
+            ),
             ("GET", "/v1/substrate/zend/timeline/7", Dispatch::Any),
             ("DELETE", "/v1/substrate/zend/timeline/7", Dispatch::Best),
             ("GET", "/v1/substrate/zend/system-prompt", Dispatch::Any),

@@ -85,6 +85,9 @@ pub enum MemberState {
     Fault = 3,
     /// Handing its work back before it stops (§12.4).
     Draining = 4,
+    /// An agent an admin has switched off: routed no job, its running jobs
+    /// finishing (§11.7).
+    Disabled = 5,
 }
 
 impl MemberState {
@@ -99,6 +102,7 @@ impl MemberState {
             2 => Self::Upgrading,
             3 => Self::Fault,
             4 => Self::Draining,
+            5 => Self::Disabled,
             v => {
                 return Err(WireError::Invalid {
                     what: r.what(),

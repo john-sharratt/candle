@@ -587,6 +587,45 @@ the "not implemented" guards. Confirm the old UI is fully gone (single
 **Gate:** full suite green on live; `cargo test -p zend` green; manual smoke on
 a real model session.
 
+### 2.8 Agents page
+*The machines zend's commands run on* (`docs/replicated_substrate.md` §11.7),
+for an admin. The right-hand pill column gains **Agents** once `GET /v1/me` names
+an admin or a creator; the Telemetry and Logs pages show the same link in their
+top bar on the same condition (`zend/web/admin-nav.js`). Hiding it is courtesy:
+the routes are `Role::Admin`, and the page says so to anyone else who reaches it.
+
+`zend/web/agents.html`, on the shared design system like the other tool pages:
+
+- **Summary tiles** — agents taking jobs (with how many are switched off or
+  unreachable), jobs running against slots, idle cores across the agents taking
+  jobs, repositories held and how many with push rights.
+- **One row per agent, scanned at a glance** — a severity stripe and dot (ready,
+  busy, switched off, unreachable), its host and short node, `beside model` for
+  an agent at low priority; the command line it is running now (or idle, and its
+  last command); gauges for slots, load against cores, and free memory; the
+  switch.
+- **Expanded** — the machine (OS, cores, load, memory, slots, connected since,
+  build, node), its toolchains, its repositories with push or read; its newest
+  jobs as a table (state, command, repository @ branch, started, took, output
+  size, files changed, Cancel while running); and a terminal following one job:
+  the command line as its prompt, then the output as it is written. It follows
+  the running job unless the reader picked another, and stops following when the
+  reader scrolls up.
+
+Two kinds of traffic, kept apart: `GET /v1/agents`, every agent and its newest
+jobs, polled every 3 s while the tab is visible; and the SSE
+`GET /v1/agents/:node/jobs/:id/stream` — `skipped` (the head of a log past
+512 KiB), `chunk` (`{text}`, decoded across chunk boundaries), `end`, `error` —
+opened **only while that agent is expanded** and closed when it is collapsed.
+Rows are keyed by node and patched in place, so a poll never rebuilds an open
+terminal. Switching (`PUT /v1/agents/:node {enabled}`) and cancelling
+(`DELETE /v1/agents/:node/jobs/:id`, confirmed first) refresh the listing.
+**Rust tests:** the route table names the four routes admin-only and dispatched
+to any member; a node is sixteen hex digits; each agent failure keeps its
+status; a character cut between two log chunks is held until whole; a long log
+is joined near its end. The agent crate's own tests cover the listing, the tail
+and the switch end to end through an in-process gateway.
+
 ---
 
 ## 8. Cross-cutting concerns

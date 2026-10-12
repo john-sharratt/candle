@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agents · Zend</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="favicon.svg">
+<link rel="stylesheet" href="common/base.css">
+<link rel="stylesheet" href="common/lib/estate.css">
+<style>
+  /* Only what the design system does not already say. Same page shape as
+     `perf.html`: the body is the flex column and the wrapper scrolls, because
+     `base.css` gives the document no scroller of its own. */
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; }
+  .scroller { flex: 1; min-height: 0; overflow-y: auto; }
+  .hd .row { flex-wrap: wrap; justify-content: flex-end; }
+
+  /* Summary tiles — the perf page's, so the two read as one product. */
+  .kpis { display: grid; gap: 12px; margin-bottom: 18px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+  .kpis > .panel + .panel { margin-top: 0; }
+  .kpi { position: relative; overflow: hidden; padding-left: 16px; }
+  .kpi .rail { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
+  .kpi .val { font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em; line-height: 1.2; font-variant-numeric: tabular-nums; }
+  .kpi .val small { font-size: .72rem; font-weight: 600; opacity: .7; }
+  .kpi .lab { font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-faint); font-weight: 700; margin-bottom: 4px; }
+  .kpi .note { font-size: .72rem; color: var(--ink-faint); margin-top: 2px; }
+
+  /* One agent: a severity stripe, a head you can scan, a body you open. */
+  .agent { background: var(--panel); border-radius: var(--radius); border-left: 3px solid var(--line-2); overflow: hidden; }
+  .agent + .agent { margin-top: 10px; }
+  .agent[data-sev="ok"] { border-left-color: var(--ok); }
+  .agent[data-sev="warn"] { border-left-color: var(--warn); }
+  .agent[data-sev="crit"] { border-left-color: var(--crit); }
+  .agent[data-sev="info"] { border-left-color: var(--info); }
+  .agent[data-off] .ahead .who, .agent[data-off] .ahead .now { opacity: .55; }
+
+  .ahead {
+    display: grid; align-items: center; gap: 6px 18px; padding: 13px 16px; cursor: pointer;
+    grid-template-columns: minmax(180px, 1.1fr) minmax(0, 2fr) auto auto;
+    transition: background var(--t);
+  }
+  .ahead:hover { background: var(--panel-2); }
+  .who { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .who .name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .who .host { font-weight: 700; font-size: .93rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .who .tags { display: flex; gap: 5px; flex-wrap: wrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--ink-ghost); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
+  .dot.busy { background: var(--info); animation: pulse 1.6s ease-in-out infinite; }
+  .dot.warn { background: var(--warn); } .dot.crit { background: var(--crit); }
+  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--info) 45%, transparent); } 50% { box-shadow: 0 0 0 5px transparent; } }
+
+  .now { min-width: 0; font-family: var(--mono); font-size: .79rem; color: var(--ink-soft); }
+  .now .cmd { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .now .cmd b { color: var(--accent); font-weight: 600; }
+  .now .sub { font-family: var(--font); font-size: .7rem; color: var(--ink-faint); }
+  .now.idle .cmd { color: var(--ink-faint); font-family: var(--font); }
+
+  .gauges { display: flex; gap: 16px; font-size: .72rem; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+  .gauge { display: flex; flex-direction: column; gap: 4px; width: 74px; }
+  .gauge b { color: var(--ink-dim); font-weight: 650; }
+  .gauge .bar { height: 3px; }
+
+  .ctl { display: flex; align-items: center; gap: 12px; }
+  .chev { color: var(--ink-faint); font-size: 10px; transition: transform .15s ease; width: 10px; }
+  .agent[data-open] .chev { transform: rotate(90deg); }
+
+  /* The switch: an agent takes jobs or it does not. */
+  .switch {
+    position: relative; width: 36px; height: 20px; border-radius: 11px; flex: none; padding: 0;
+    border: 1px solid var(--line-2); background: var(--panel-3); transition: background var(--t), border-color var(--t);
+  }
+  .switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--ink-faint); transition: transform var(--t), background var(--t);
+  }
+  .switch[aria-checked="true"] { background: color-mix(in srgb, var(--ok) 30%, var(--panel-3)); border-color: color-mix(in srgb, var(--ok) 55%, transparent); }
+  .switch[aria-checked="true"]::after { transform: translateX(16px); background: var(--ok); }
+  .switch[disabled] { opacity: .45; cursor: progress; }
+
+  .abody { border-top: 1px solid var(--line); padding: 16px; display: grid; gap: 18px; }
+  .facts { display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); }
+  .facts h3, .jobs h3, .term-wrap h3 { font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-faint); margin: 0 0 9px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .repo { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: .82rem; }
+  .repo:last-child { border-bottom: none; }
+  .repo .origin { font-family: var(--mono); font-size: .74rem; color: var(--ink-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Jobs: a table on a wide page, stacked lines on a phone. */
+  .jtable { width: 100%; border-collapse: collapse; font-size: .8rem; }
+  .jtable th { text-align: left; font-size: .66rem; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-faint); font-weight: 700; padding: 0 10px 7px 0; }
+  .jtable td { padding: 7px 10px 7px 0; border-top: 1px solid var(--line); vertical-align: middle; font-variant-numeric: tabular-nums; }
+  .jtable tbody tr { cursor: pointer; transition: background var(--t); }
+  .jtable tbody tr:hover { background: var(--panel-2); }
+  .jtable tbody tr[aria-selected="true"] { background: var(--accent-soft); }
+  .jtable td.cmd { font-family: var(--mono); font-size: .76rem; max-width: 0; width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .jtable td.num, .jtable th.num { text-align: right; }
+  .jtable td.dim { color: var(--ink-faint); }
+  .jscroll { overflow-x: auto; }
+
+  /* The terminal: the selected job's command line, and its output as it comes. */
+  .term { background: var(--bg-deep); border: 1px solid var(--line); border-radius: var(--radius-sm); display: flex; flex-direction: column; overflow: hidden; }
+  .term-bar { display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  .term-bar .grow { flex: 1; }
+  .term-out {
+    margin: 0; padding: 10px 12px; height: 340px; overflow: auto; resize: vertical;
+    font-family: var(--mono); font-size: .76rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--ink-mid);
+  }
+  .term-out .prompt { color: var(--accent); }
+  .term-out .prompt::before { content: "$ "; color: var(--ink-faint); }
+  .term-out .note { color: var(--ink-faint); font-style: italic; }
+  .term-out .bad { color: var(--crit); }
+  .term-empty { padding: 26px 12px; text-align: center; color: var(--ink-faint); font-size: .82rem; }
+
+  .notice { border-left: 3px solid var(--warn); margin-bottom: 16px; line-height: 1.6; }
+  .notice.crit { border-left-color: var(--crit); }
+  .stale { opacity: .55; transition: opacity .2s; }
+
+  @media (max-width: 980px) {
+    .ahead { grid-template-columns: minmax(0, 1fr) auto; }
+    .ahead .now { grid-column: 1 / -1; grid-row: 2; }
+    .ahead .gauges { grid-column: 1 / -1; grid-row: 3; }
+    .facts { grid-template-columns: minmax(0, 1fr); }
+  }
+  @media (max-width: 640px) {
+    :root { --gutter: 16px; }
+    .jtable .wide { display: none; }
+    .term-out { height: 260px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dot.busy { animation: none; }
+  }
+</style>
+<!-- Cloudflare Web Analytics, loaded only on the public host so a local or LAN zend reports nothing. -->
+<script>(function(){if(location.hostname!=="code.tokera.com")return;var s=document.createElement("script");s.defer=true;s.src="https://static.cloudflareinsights.com/beacon.min.js";s.setAttribute("data-cf-beacon",'{"token": "c3851f95a92346c4918e0e2ba7227859"}');document.head.appendChild(s);})();</script>
+</head>
+<body>
+<header class="topbar">
+  <div id="estate"></div>
+  <nav class="nav">
+    <a class="navlink" href="/">Chat</a>
+    <a class="navlink" href="perf.html">Telemetry</a>
+    <a class="navlink" href="logs.html">Logs</a>
+    <a class="navlink" href="agents.html" aria-current="page">Agents</a>
+  </nav>
+  <span class="spacer"></span>
+  <div class="row" id="chrome"></div>
+</header>
+
+<div class="scroller">
+  <main class="page wide" id="page"></main>
+</div>
+<div id="toasts"></div>
+
+<script type="module">
+/* The machines zend's commands run on (`docs/replicated_substrate.md` §11.7).
+ *
+ * Two kinds of traffic, deliberately kept apart:
+ *   GET /v1/agents          every agent and its newest jobs, polled every few
+ *                           seconds while the tab is visible — small, and the
+ *                           same answer for every reader.
+ *   GET …/jobs/{id}/stream  one job's output, live. Opened ONLY while that
+ *                           agent is expanded, and closed the moment it is
+ *                           collapsed: following a log costs the agent a read
+ *                           every few hundred milliseconds, and nobody should
+ *                           pay that for a row they are not looking at.
+ *
+ * Rows are keyed by node and patched in place, so a poll never rebuilds an
+ * open terminal or steals the reader's scroll position.
+ */
+import { h, mount, fmtNum, ago } from './common/lib/dom.js';
+import { estateSwitcher } from './common/lib/estate.js';
+import { bar, kv, toast, confirmDialog } from './common/lib/ui-base.js';
+
+const POLL_MS = 3000;
+/* What the terminal keeps: a build's whole output can run to megabytes, and a
+ * pre that size makes the page crawl. The head goes first. */
+const TERM_MAX_CHARS = 400_000;
+
+mount(document.getElementById('estate'), estateSwitcher('zend', { homeHref: '/' }));
+
+/* ── state ──────────────────────────────────────────────────────────────── */
+
+let body = null;            // the last GET /v1/agents
+let lastAt = 0;
+let paused = false;
+let denied = false;
+let failures = 0;
+const rows = new Map();     // node → { el, parts…, open, term }
+
+/* ── formatting ─────────────────────────────────────────────────────────── */
+
+const short = (node) => (node || '').replace(/^0+(?=.)/, '').slice(-8);
+const gib = (mib) => (mib / 1024).toFixed(mib >= 10240 ? 0 : 1) + ' GiB';
+const quote = (a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : "'" + a.replace(/'/g, "'\\''") + "'");
+const cmdline = (j) => (j.command || []).map(quote).join(' ');
+const running = (j) => j.status === 'running' || j.status === 'queued';
+
+function took(j) {
+  const end = j.ended_ms || Date.now();
+  const s = Math.max(0, Math.round((end - j.started_ms) / 1000));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's';
+  return Math.floor(s / 3600) + 'h ' + String(Math.floor(s / 60) % 60).padStart(2, '0') + 'm';
+}
+
+function bytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1 << 20) return (n / 1024).toFixed(1) + ' KiB';
+  return (n / (1 << 20)).toFixed(1) + ' MiB';
+}
+
+/* A job's state as a chip: class and words. */
+function jobChip(j) {
+  switch (j.status) {
+    case 'running': return ['chip accent', 'running'];
+    case 'queued': return ['chip', 'queued'];
+    case 'exited': return j.code === 0 ? ['chip ok', 'exit 0'] : ['chip crit', j.code == null ? 'signalled' : 'exit ' + j.code];
+    case 'timed_out': return ['chip warn', 'timed out'];
+    case 'cancelled': return ['chip', 'cancelled'];
+    case 'refused': return ['chip crit', 'refused'];
+    case 'failed': return ['chip crit', 'failed'];
+    default: return ['chip', j.status || '—'];
+  }
+}
+
+/* An agent's standing: the stripe, the dot and the state chip agree. */
+function standing(a) {
+  if (a.error) return { sev: 'crit', dot: 'crit', chip: ['chip crit', 'unreachable'] };
+  if (!a.enabled || a.state === 'disabled') return { sev: '', dot: '', chip: ['chip warn', 'switched off'] };
+  if (a.state === 'ready') {
+    const busy = a.recent.some(running);
+    return { sev: busy ? 'info' : 'ok', dot: busy ? 'busy' : 'ok', chip: busy ? ['chip accent', 'busy'] : ['chip ok', 'ready'] };
+  }
+  if (a.state === 'fault') return { sev: 'crit', dot: 'crit', chip: ['chip crit', 'fault'] };
+  return { sev: 'warn', dot: 'warn', chip: ['chip warn', a.state] };
+}
+
+/* ── page frame ─────────────────────────────────────────────────────────── */
+
+const live = h('span', { class: 'chip' }, 'connecting…');
+const age = h('span', { class: 'tiny dim' });
+const pauseBtn = h('button', { class: 'btn sm', id: 'pause' }, '⏸ pause');
+const notice = h('div');
+const kpis = h('div', { class: 'kpis' });
+const list = h('div', { id: 'agents' });
+
+pauseBtn.addEventListener('click', () => {
+  paused = !paused;
+  pauseBtn.textContent = paused ? '▶ resume' : '⏸ pause';
+  pauseBtn.classList.toggle('primary', paused);
+  list.classList.toggle('stale', paused);
+  if (!paused) refresh();
+});
+
+mount(document.getElementById('page'),
+  h('div', { class: 'hd' },
+    h('div', {},
+      h('h1', {}, 'Agents'),
+      h('p', { class: 'sub' }, 'The machines this daemon’s commands run on — every conversation’s builds, tests and git pushes. Open an agent to follow what it is running.')),
+    h('div', { class: 'row' }, live, age, pauseBtn)),
+  notice, kpis, list);
+
+/* ── summary ────────────────────────────────────────────────────────────── */
+
+function tile(label, value, unit, note, color) {
+  return h('div', { class: 'panel kpi' },
+    h('i', { class: 'rail', style: 'background:' + color }),
+    h('div', { class: 'lab' }, label),
+    h('div', { class: 'val' }, value, unit ? h('small', {}, ' ' + unit) : null),
+    note ? h('div', { class: 'note' }, note) : null);
+}
+
+function paintSummary(agents) {
+  const on = agents.filter((a) => a.enabled && !a.error && a.state === 'ready');
+  const off = agents.filter((a) => !a.enabled || a.state === 'disabled').length;
+  const down = agents.filter((a) => a.error).length;
+  const jobs = agents.reduce((n, a) => n + (a.jobs || 0), 0);
+  const slots = agents.reduce((n, a) => n + (a.slots ?? (a.slots_free + a.jobs)), 0);
+  const idle = on.reduce((n, a) => n + Math.max(0, a.cores - a.load_milli / 1000), 0);
+  const cores = on.reduce((n, a) => n + a.cores, 0);
+  const repos = new Set(agents.flatMap((a) => a.repos.map((r) => r.name)));
+  const pushable = new Set(agents.flatMap((a) => a.repos.filter((r) => r.push).map((r) => r.name)));
+  mount(kpis,
+    tile('Taking jobs', on.length, 'of ' + agents.length,
+      [off && off + ' switched off', down && down + ' unreachable'].filter(Boolean).join(' · ') || 'every agent is up',
+      down ? 'var(--crit)' : off ? 'var(--warn)' : 'var(--ok)'),
+    tile('Running', jobs, 'of ' + slots + ' slots', jobs ? 'jobs in flight now' : 'nothing running', 'var(--info)'),
+    tile('Idle cores', idle.toFixed(idle < 10 ? 1 : 0), 'of ' + cores, 'across the agents taking jobs', 'var(--violet)'),
+    tile('Repositories', repos.size, '', pushable.size + ' with push rights', 'var(--accent)'));
+}
+
+/* ── one agent ──────────────────────────────────────────────────────────── */
+
+function gauge(label, value, frac, color) {
+  return h('div', { class: 'gauge' }, h('span', {}, label + ' ', h('b', {}, value)), bar(frac, color));
+}
+
+function makeRow(a) {
+  const r = { node: a.node, open: false, pinned: null, job: null, es: null, follow: true };
+  r.dot = h('span', { class: 'dot' });
+  r.host = h('span', { class: 'host' });
+  r.tags = h('span', { class: 'tags' });
+  r.now = h('div', { class: 'now' });
+  r.gauges = h('div', { class: 'gauges' });
+  r.sw = h('button', { class: 'switch', role: 'switch', title: 'Take jobs', 'aria-label': 'Take jobs' });
+  r.sw.addEventListener('click', (e) => { e.stopPropagation(); flip(r); });
+  r.head = h('div', { class: 'ahead', role: 'button', tabindex: '0', 'aria-expanded': 'false' },
+    h('div', { class: 'who' }, h('div', { class: 'name' }, r.dot, r.host), r.tags),
+    r.now, r.gauges,
+    h('div', { class: 'ctl' }, r.sw, h('span', { class: 'chev', 'aria-hidden': 'true' }, '▶')));
+  r.head.addEventListener('click', () => toggle(r));
+  r.head.addEventListener('keydown', (e) => {
+    if (e.target === r.head && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggle(r); }
+  });
+  r.facts = h('div', { class: 'facts' });
+  r.jobs = h('div', { class: 'jobs' });
+  r.termHost = h('div', { class: 'term-wrap' });
+  r.body = h('div', { class: 'abody', hidden: true }, r.facts, r.jobs, r.termHost);
+  r.el = h('section', { class: 'agent' }, r.head, r.body);
+  return r;
+}
+
+function paintRow(r, a) {
+  r.a = a;
+  const s = standing(a);
+  r.el.dataset.sev = s.sev;
+  if (!a.enabled) r.el.dataset.off = ''; else delete r.el.dataset.off;
+  r.dot.className = 'dot ' + s.dot;
+  r.host.textContent = a.host || '(unnamed)';
+  r.host.title = 'node ' + a.node;
+  mount(r.tags,
+    h('span', { class: s.chip[0] }, s.chip[1]),
+    a.low_priority ? h('span', { class: 'chip', title: 'Shares its machine with a model: its jobs run below normal priority, and it is chosen only when no dedicated agent can take one.' }, 'beside model') : null,
+    h('span', { class: 'chip mono', title: a.node }, short(a.node)));
+
+  const busy = a.recent.find(running);
+  if (busy) {
+    r.now.className = 'now';
+    mount(r.now,
+      h('span', { class: 'cmd', title: cmdline(busy) }, h('b', {}, busy.command[0] || ''), ' ' + busy.command.slice(1).map(quote).join(' ')),
+      h('span', { class: 'sub' }, busy.repo + (busy.branch ? ' @ ' + busy.branch : '') + ' · ' + took(busy) + ' · ' + fmtNum(busy.lines) + ' lines'));
+  } else {
+    r.now.className = 'now idle';
+    const last = a.recent[0];
+    mount(r.now,
+      h('span', { class: 'cmd' }, a.error ? a.error : a.enabled ? 'idle' : 'switched off — running jobs finish, no new ones start'),
+      last ? h('span', { class: 'sub' }, 'last: ', h('span', { class: 'mono' }, cmdline(last)), ' · ' + ago(last.ended_ms || last.started_ms)) : null);
+  }
+
+  const slots = a.slots ?? a.slots_free + a.jobs;
+  const load = a.load_milli / 1000;
+  mount(r.gauges,
+    gauge('slots', a.jobs + '/' + slots, slots ? a.jobs / slots : 0, 'var(--info)'),
+    gauge('load', load.toFixed(1) + '/' + a.cores, a.cores ? load / a.cores : 0, load > a.cores * 0.9 ? 'var(--warn)' : 'var(--ok)'),
+    gauge('free', gib(a.mem_free_mib), Math.min(1, a.mem_free_mib / 65536), 'var(--violet)'));
+
+  r.sw.setAttribute('aria-checked', a.enabled ? 'true' : 'false');
+  r.sw.title = a.enabled ? 'Taking jobs — click to switch off' : 'Switched off — click to take jobs again';
+  if (a.error && !a.enabled) r.sw.setAttribute('disabled', ''); else if (!r.busy) r.sw.removeAttribute('disabled');
+
+  if (r.open) paintBody(r);
+}
+
+/* ── an open agent ──────────────────────────────────────────────────────── */
+
+function paintBody(r) {
+  const a = r.a;
+  const connected = a.connected_ms ? ago(a.connected_ms).replace(' ago', '') : 'this process';
+  mount(r.facts,
+    h('div', {},
+      h('h3', {}, 'Machine'),
+      kv([
+        ['System', `${a.os || '—'} · ${a.cores} cores`],
+        ['Load', `${(a.load_milli / 1000).toFixed(2)} (1-min average)`],
+        ['Free memory', gib(a.mem_free_mib)],
+        ['Job slots', `${a.slots ?? a.slots_free + a.jobs} · ${a.jobs} running`],
+        ['Connected', a.connected_ms ? `${connected} (since ${new Date(a.connected_ms).toLocaleString()})` : connected],
+        ['Build', `${a.build.count}·${a.build.hash.slice(0, 10)}${a.build.local ? ' +local' : ''}`],
+        ['Node', a.node],
+      ]),
+      h('h3', { style: 'margin-top:14px' }, 'Toolchains'),
+      a.toolchains.length
+        ? h('div', { class: 'chips' }, ...a.toolchains.map((t) => h('span', { class: 'chip mono' }, t)))
+        : h('div', { class: 'tiny dim' }, 'No allow-listed program on its PATH: it runs git jobs only.')),
+    h('div', {},
+      h('h3', {}, 'Repositories'),
+      a.repos.length
+        ? h('div', {}, ...a.repos.map((p) => h('div', { class: 'repo' },
+          h('b', {}, p.name),
+          h('span', { class: 'origin', title: p.origin }, p.origin || 'no origin'),
+          h('span', { class: p.push ? 'chip ok' : 'chip' }, p.push ? 'push' : 'read'))))
+        : h('div', { class: 'tiny dim' }, 'It holds no checkout.')));
+
+  paintJobs(r);
+  /* Follow what it is running, unless the reader chose a job themselves. */
+  const want = r.pinned && a.recent.some((j) => j.id === r.pinned)
+    ? r.pinned
+    : (a.recent.find(running) || a.recent[0] || {}).id || null;
+  if (want !== r.job) select(r, want, false);
+}
+
+function paintJobs(r) {
+  const a = r.a;
+  if (a.error) {
+    mount(r.jobs, h('h3', {}, 'Jobs'), h('div', { class: 'panel notice crit' }, 'Its jobs could not be read: ', a.error));
+    return;
+  }
+  if (!a.recent.length) {
+    mount(r.jobs, h('h3', {}, 'Jobs'), h('div', { class: 'tiny dim' }, 'It has run nothing since it started.'));
+    return;
+  }
+  const tr = (j) => {
+    const [cls, word] = jobChip(j);
+    const row = h('tr', { 'aria-selected': j.id === r.job ? 'true' : 'false', onClick: () => select(r, j.id, true) },
+      h('td', {}, h('span', { class: cls }, word)),
+      h('td', { class: 'cmd', title: cmdline(j) }, cmdline(j)),
+      h('td', { class: 'wide dim' }, j.repo + (j.branch ? ' @ ' + j.branch : '')),
+      h('td', { class: 'wide dim' }, ago(j.started_ms)),
+      h('td', { class: 'num' }, took(j)),
+      h('td', { class: 'num wide dim' }, j.kind === 'run' ? bytes(j.bytes) : '—'),
+      h('td', { class: 'num wide dim' }, j.changed ? j.changed + ' changed' : ''),
+      h('td', { class: 'num' }, running(j)
+        ? h('button', { class: 'btn sm danger', onClick: (e) => { e.stopPropagation(); cancel(r, j); } }, 'Cancel')
+        : null));
+    return row;
+  };
+  mount(r.jobs,
+    h('h3', {}, 'Jobs · newest first'),
+    h('div', { class: 'jscroll' },
+      h('table', { class: 'jtable' },
+        h('thead', {}, h('tr', {},
+          h('th', {}, 'State'), h('th', {}, 'Command'), h('th', { class: 'wide' }, 'Repository'),
+          h('th', { class: 'wide' }, 'Started'), h('th', { class: 'num' }, 'Took'),
+          h('th', { class: 'num wide' }, 'Output'), h('th', { class: 'num wide' }, 'Files'), h('th', {}))),
+        h('tbody', {}, ...a.recent.map(tr)))));
+}
+
+/* ── the terminal ───────────────────────────────────────────────────────── */
+
+/* Terminal text as plain text: colour and cursor codes dropped, and a carriage
+ * return that redraws a progress line read as a new line. */
+const clean = (s) => s
+  .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+  .replace(/\x1b\][^\x07]*\x07/g, '')
+  .replace(/\r\n/g, '\n')
+  .replace(/\r/g, '\n');
+
+function closeStream(r) {
+  if (r.es) { r.es.close(); r.es = null; }
+}
+
+function select(r, id, byReader) {
+  if (byReader) r.pinned = id;
+  r.job = id;
+  closeStream(r);
+  r.jobs.querySelectorAll('tbody tr').forEach((tr, i) => {
+    tr.setAttribute('aria-selected', r.a.recent[i] && r.a.recent[i].id === id ? 'true' : 'false');
+  });
+  const j = r.a.recent.find((x) => x.id === id);
+  if (!j) {
+    mount(r.termHost, h('h3', {}, 'Output'), h('div', { class: 'term' }, h('div', { class: 'term-empty' }, 'Nothing to show yet: the next job it runs will appear here as it runs.')));
+    return;
+  }
+  const state = h('span', { class: 'chip' }, 'connecting…');
+  const followBtn = h('button', { class: 'btn sm ' + (r.follow ? 'primary' : 'ghost'), title: 'Keep the newest output in view' }, 'Follow');
+  const copyBtn = h('button', { class: 'btn sm ghost' }, 'Copy');
+  const out = h('pre', { class: 'term-out', tabindex: '0', 'aria-label': 'Output of ' + cmdline(j), 'aria-live': 'off' },
+    h('div', { class: 'prompt' }, cmdline(j)));
+  r.out = out;
+  r.state = state;
+  followBtn.addEventListener('click', () => {
+    r.follow = !r.follow;
+    followBtn.className = 'btn sm ' + (r.follow ? 'primary' : 'ghost');
+    if (r.follow) out.scrollTop = out.scrollHeight;
+  });
+  copyBtn.addEventListener('click', () => {
+    navigator.clipboard?.writeText(out.textContent.replace(/^/, '$ ')).then(() => toast('Output copied', 'ok'));
+  });
+  /* Scrolling up to read stops following; reaching the bottom resumes it. */
+  out.addEventListener('scroll', () => {
+    const atEnd = out.scrollHeight - out.scrollTop - out.clientHeight < 24;
+    if (atEnd !== r.follow) {
+      r.follow = atEnd;
+      followBtn.className = 'btn sm ' + (r.follow ? 'primary' : 'ghost');
+    }
+  });
+  mount(r.termHost,
+    h('h3', {}, 'Output'),
+    h('div', { class: 'term' },
+      h('div', { class: 'term-bar' },
+        state,
+        h('span', { class: 'tiny dim mono' }, j.repo + (j.branch ? ' @ ' + j.branch : '') + ' · job ' + j.id),
+        h('span', { class: 'grow' }),
+        followBtn, copyBtn),
+      out));
+
+  if (j.kind !== 'run') {
+    append(r, j.kind === 'push' ? 'A push writes no output; its refs are in the job’s answer.' : 'A fetch writes no output.', 'note');
+    paintState(r, j);
+    return;
+  }
+  openStream(r, j);
+}
+
+function append(r, text, cls) {
+  const out = r.out;
+  if (!out) return;
+  if (cls) out.appendChild(h('div', { class: cls }, text));
+  else {
+    const last = out.lastChild;
+    if (last && last.nodeType === Node.TEXT_NODE) last.appendData(text);
+    else out.appendChild(document.createTextNode(text));
+  }
+  let size = out.textContent.length;
+  while (size > TERM_MAX_CHARS && out.childNodes.length > 2) {
+    const drop = out.childNodes[1];
+    if (drop.nodeType === Node.TEXT_NODE && drop.length > size - TERM_MAX_CHARS) {
+      drop.deleteData(0, size - TERM_MAX_CHARS);
+      break;
+    }
+    size -= drop.textContent.length;
+    drop.remove();
+  }
+  if (r.follow) out.scrollTop = out.scrollHeight;
+}
+
+function paintState(r, j, ended) {
+  if (!r.state) return;
+  if (j && !ended && running(j)) { r.state.className = 'chip accent'; r.state.textContent = '● live'; return; }
+  const [cls, word] = j ? jobChip(j) : ['chip', 'ended'];
+  r.state.className = cls;
+  r.state.textContent = word;
+}
+
+function openStream(r, j) {
+  const url = `/v1/agents/${encodeURIComponent(r.node)}/jobs/${encodeURIComponent(j.id)}/stream`;
+  const es = new EventSource(url);
+  r.es = es;
+  es.addEventListener('open', () => paintState(r, j));
+  es.addEventListener('skipped', (e) => {
+    const { bytes: n } = JSON.parse(e.data);
+    append(r, `… ${bytes(n)} of earlier output not shown`, 'note');
+  });
+  es.addEventListener('chunk', (e) => append(r, clean(JSON.parse(e.data).text)));
+  es.addEventListener('end', () => {
+    closeStream(r);
+    const now = (r.a.recent.find((x) => x.id === j.id)) || j;
+    paintState(r, now, true);
+  });
+  es.addEventListener('error', (e) => {
+    /* The daemon's own `error` event carries a message; a dropped connection
+     * does not. Either way the stream stops here — EventSource would otherwise
+     * reconnect and replay the log from its first byte. */
+    const msg = e.data ? JSON.parse(e.data).message : 'the stream was lost';
+    closeStream(r);
+    if (r.out) {
+      append(r, msg, 'bad');
+      r.out.appendChild(h('div', {}, h('button', { class: 'btn sm', onClick: () => select(r, j.id, true) }, 'Reconnect')));
+    }
+    if (r.state) { r.state.className = 'chip crit'; r.state.textContent = 'disconnected'; }
+  });
+}
+
+/* ── actions ────────────────────────────────────────────────────────────── */
+
+function toggle(r) {
+  r.open = !r.open;
+  r.body.hidden = !r.open;
+  if (r.open) r.el.dataset.open = ''; else delete r.el.dataset.open;
+  r.head.setAttribute('aria-expanded', r.open ? 'true' : 'false');
+  if (r.open) {
+    paintBody(r);
+  } else {
+    closeStream(r);
+    r.job = null;
+    r.out = null;
+    r.state = null;
+  }
+}
+
+async function flip(r) {
+  const to = !r.a.enabled;
+  r.busy = true;
+  r.sw.setAttribute('disabled', '');
+  try {
+    const res = await fetch(`/v1/agents/${encodeURIComponent(r.node)}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: to }),
+    });
+    const ans = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(ans.message || ans.error || res.statusText);
+    r.a.enabled = ans.enabled;
+    paintRow(r, r.a);
+    const n = r.a.jobs;
+    toast(ans.enabled
+      ? `${r.a.host} is taking jobs again`
+      : `${r.a.host} is switched off` + (n ? ` — its ${n} running job${n === 1 ? '' : 's'} will finish` : ''), 'ok');
+  } catch (e) {
+    toast(`${r.a.host} could not be switched: ${e.message}`, 'err');
+  } finally {
+    r.busy = false;
+    r.sw.removeAttribute('disabled');
+    refresh();
+  }
+}
+
+function cancel(r, j) {
+  confirmDialog({
+    title: 'Cancel this job?',
+    message: `${cmdline(j)} — on ${r.a.host}. Its command and every process it started are killed; the conversation that ran it is told the job was cancelled.`,
+    confirmText: 'Cancel job',
+    danger: true,
+    onConfirm: async () => {
+      const res = await fetch(`/v1/agents/${encodeURIComponent(r.node)}/jobs/${encodeURIComponent(j.id)}`, { method: 'DELETE' });
+      const ans = await res.json().catch(() => ({}));
+      if (res.ok) toast('Job cancelled', 'ok');
+      else toast('The job could not be cancelled: ' + (ans.message || res.statusText), 'err');
+      refresh();
+    },
+  });
+}
+
+/* ── the listing ────────────────────────────────────────────────────────── */
+
+function paintNotice(b) {
+  if (!b.clustered) {
+    mount(notice, h('div', { class: 'panel notice' },
+      h('b', {}, 'This daemon has no agents. '),
+      'It runs commands on its own sandboxes, one per repository in its workspace. Agents come with a cluster: start it with ',
+      h('code', {}, '--cluster'), ' and its gateway’s agents run the jobs instead.'));
+  } else if (!b.admitted && b.agents.length) {
+    mount(notice, h('div', { class: 'panel notice' },
+      h('b', {}, 'Cut off from every cluster. '),
+      'Commands run on the agent in this process until a gateway admits the daemon again.'));
+  } else {
+    mount(notice);
+  }
+}
+
+function paint(b) {
+  paintNotice(b);
+  const agents = b.agents || [];
+  paintSummary(agents);
+  if (!agents.length) {
+    for (const r of rows.values()) closeStream(r);
+    rows.clear();
+    mount(list, b.clustered
+      ? h('div', { class: 'empty' },
+        h('div', { class: 'big' }, '◇'),
+        h('div', { style: 'font-weight:700;color:var(--ink-dim);margin-bottom:6px' }, 'No agent is connected'),
+        h('div', { class: 'tiny' }, b.admitted
+          ? 'Commands from conversations will fail with no_agent until one joins. Start tokera-agent with this cluster’s group key.'
+          : 'The daemon is not admitted to its cluster yet, and no agent runs in this process.'))
+      : null);
+    return;
+  }
+  const seen = new Set();
+  agents.forEach((a, i) => {
+    seen.add(a.node);
+    let r = rows.get(a.node);
+    if (!r) { r = makeRow(a); rows.set(a.node, r); }
+    paintRow(r, a);
+    if (list.children[i] !== r.el) list.insertBefore(r.el, list.children[i] || null);
+  });
+  for (const [node, r] of rows) {
+    if (!seen.has(node)) { closeStream(r); r.el.remove(); rows.delete(node); }
+  }
+  [...list.children].forEach((el) => { if (![...rows.values()].some((r) => r.el === el)) el.remove(); });
+}
+
+async function refresh() {
+  if (denied) return;
+  try {
+    const res = await fetch('/v1/agents', { headers: { accept: 'application/json' } });
+    if (res.status === 401 || res.status === 403) {
+      denied = true;
+      for (const r of rows.values()) closeStream(r);
+      mount(kpis);
+      mount(list);
+      mount(notice, h('div', { class: 'page-error' },
+        h('h3', {}, 'Agents are an admin’s'),
+        h('p', { class: 'dim', style: 'margin:0' }, 'They show every conversation’s commands and switch the machines that run them. Sign in with an admin account to see them.')));
+      live.className = 'chip crit';
+      live.textContent = 'admins only';
+      return;
+    }
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    body = await res.json();
+    lastAt = Date.now();
+    failures = 0;
+    live.className = 'chip ok';
+    live.textContent = '● live';
+    paint(body);
+  } catch (e) {
+    failures++;
+    live.className = 'chip' + (failures > 2 ? ' crit' : ' warn');
+    live.textContent = failures > 2 ? '○ unreachable' : '◌ retrying…';
+  }
+}
+
+function tick() {
+  age.textContent = lastAt ? 'updated ' + ago(lastAt) : '';
+}
+
+setInterval(() => {
+  tick();
+  if (!paused && !document.hidden) refresh();
+}, POLL_MS);
+setInterval(tick, 1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !paused) refresh(); });
+refresh();
+</script>
+</body>
+</html>

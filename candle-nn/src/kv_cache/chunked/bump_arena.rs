@@ -1266,10 +1266,20 @@ pub fn enter_arena_window(stream: &Arc<CudaStream>, tenant: &'static str) -> Res
         // a span. A tier still standing belongs to a forward that has finished
         // with it, and the ground under it is the ground this arena is about to
         // be carved from.
+        //
+        // **Its plan goes with it.** The plan is what `begin_wave` re-places
+        // when it finds no tier, so a plan left behind is a finished forward's
+        // width waiting to be bought again by whoever opens the next guard. A
+        // draft walk that priced itself into a prefill's standing tier and then
+        // claimed its KV — an arena, so this — found no tier and re-placed the
+        // prefill's 8 GB plan against KV that had grown since: refused by one
+        // region, every walk, and the decodes on it failed. With the plan gone,
+        // the next caller prices itself.
         let had_tier = domain.placed_at.take().is_some();
         domain.placed_bytes = None;
         if had_tier {
             domain.reserved_by_forward = false;
+            domain.planned = None;
         }
         // Counted before the lock drops, so a forward cannot begin placing a
         // tier in the gap between here and the release below.
@@ -2469,6 +2479,46 @@ mod wave_tests {
              is about to carve an arena from is still spoken for"
         );
         drop(window);
+        Ok(())
+    }
+
+    /// **A tier handed back for an arena takes its plan with it.** Left behind,
+    /// the plan is re-placed by the next guard that finds no tier: a draft walk
+    /// that priced itself into a prefill's standing tier, then claimed its KV
+    /// through an arena window, re-bought the prefill's whole plan and was
+    /// refused against the KV that had grown since.
+    #[test]
+    fn a_tier_handed_back_for_an_arena_takes_its_plan_with_it() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let ordinal = s.context().ordinal();
+        let fallback: usize = super::fallback_plan().iter().sum();
+        // A forward wider than anything the fallback plans for.
+        let wide = super::fallback_plan().map(|b| b + (16 << 20));
+        {
+            let _open = begin_forward(&s);
+            plan_wave_transient(&s, wide)?;
+        }
+        drop(enter_arena_window(&s, "a test tenant")?);
+        let tier = |ordinal| {
+            super::super::region_pool::region_stats(ordinal)
+                .map(|r| r.transient_bytes)
+                .unwrap_or(0)
+        };
+        assert_eq!(tier(ordinal), 0, "the window handed the tier back");
+        // A guard with no forward behind it now prices itself, and places the
+        // fallback rather than the finished forward's plan.
+        // The pool places whole regions, so the fallback reads rounded up — and
+        // still regions short of the wide plan, which is 48 MiB wider.
+        let guard = begin_wave(&s, LayerPhase::Attention)?;
+        let placed = tier(ordinal);
+        let wide_bytes: usize = wide.iter().sum();
+        assert!(
+            placed >= fallback && placed < wide_bytes,
+            "the guard placed {placed} B: the fallback is {fallback} B, the finished \
+             forward's plan {wide_bytes} B"
+        );
+        drop(guard);
         Ok(())
     }
 

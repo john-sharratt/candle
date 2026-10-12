@@ -252,6 +252,11 @@ impl AppMember {
         self.id.node
     }
 
+    /// The machine's name its `HELLO` gives.
+    pub fn host(&self) -> &str {
+        &self.id.host
+    }
+
     fn bump(&self) {
         self.changed.send_modify(|n| *n += 1);
     }

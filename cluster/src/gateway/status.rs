@@ -218,6 +218,7 @@ pub fn state_name(s: MemberState) -> &'static str {
         MemberState::Upgrading => "upgrading",
         MemberState::Fault => "fault",
         MemberState::Draining => "draining",
+        MemberState::Disabled => "disabled",
     }
 }
 

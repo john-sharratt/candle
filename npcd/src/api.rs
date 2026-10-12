@@ -1648,30 +1648,10 @@ async fn delete_npc(
             // the persona source returns `None`, so it thinks about nothing for
             // ever, and its conversation is never retired.
             if let Some(rt) = s.runtime.as_ref() {
-                // The task first: aborting it drops whatever turn it was
-                // awaiting, which stops that decode, and `retire` wakes a task
-                // that was parked so it finds its inbox gone and exits.
-                rt.stop_character(npc_id);
-                rt.scheduler.retire(npc_id);
-                // And what its body was waiting on, or a world running for a
-                // week keeps a row per act for every character it ever had.
-                rt.cooldowns.forget(npc_id);
-                // **And the questions it was part of, in both directions.**
-                //
-                // A question is an obligation the percept repeats every turn
-                // until the two of them speak — so one left behind by somebody
-                // who no longer exists is one the other character is told about
-                // for ever and can never discharge, because there is nobody in
-                // the room answering to that name. That is the exact shape of
-                // defect the obligation was added to remove.
-                // The world's to forget, so its authority does: here when this
-                // member runs the world, and on the authority as it takes the
-                // deletion in (`Runtime::follow_cast`) when it does not.
-                if let Some((hosted, body)) = rt.body_of(npc_id) {
-                    if rt.standing.writes(hosted.id()) {
-                        hosted.with_sim(|s| s.ledger.forget_questions(&body));
-                    }
-                }
+                // Its mind, its body and everything waiting on either — the
+                // same step every other member takes as the deletion reaches
+                // it (`Runtime::follow_cast`).
+                rt.forget_character(npc_id);
                 let minds = rt.minds.read().unwrap().clone();
                 if let Some(minds) = minds {
                     minds.retire_npc(npc_id).await;

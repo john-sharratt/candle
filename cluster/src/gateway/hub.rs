@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, MissedTickBehavior};
 
 use super::admission::{Admission, Admitted};
+use super::agent_row::AgentRow;
 use super::agents::{Choice, Need};
 use super::coord_log::changes;
 use super::log::{CoordLog, Entry};
@@ -1041,6 +1042,25 @@ impl Hub {
 
     pub fn member(&self, app: &str, node: u64) -> Option<MemberView> {
         self.state().registry.member(app, node).cloned()
+    }
+
+    /// Every agent of `app` admitted here, by host and then node (§11.7).
+    pub fn agents(&self, app: &str) -> Vec<AgentRow> {
+        let s = self.state();
+        let mut rows: Vec<AgentRow> = s
+            .registry
+            .members(app)
+            .into_iter()
+            .map(|m| {
+                let connected = s
+                    .sockets
+                    .get(&(app.to_string(), m.node))
+                    .map_or(0, |x| x.connected_ms);
+                AgentRow::of(m, connected)
+            })
+            .collect();
+        rows.sort_by(|a, b| (&a.host, &a.node).cmp(&(&b.host, &b.node)));
+        rows
     }
 
     /// A member of `app` admitted and not ready, whose loading page stands in

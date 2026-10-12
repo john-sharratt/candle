@@ -2,7 +2,8 @@
 //! `/v1/cluster/agent`, with the same handshake and group key as any member,
 //! no model and no substrate. Its `HELLO` advertises its checkouts; its
 //! `CAPACITY`, every second, its job slots, the host's cores, load and free
-//! memory, and the allow-listed toolchains on its `PATH` (§11.2). The streams
+//! memory, and the allow-listed toolchains on its `PATH` (§11.2) — and its
+//! state, `disabled` while an admin has switched it off (§11.7). The streams
 //! its gateways open are served the job API.
 //!
 //! An agent has no substrate to keep its node in, so the node is kept in a
@@ -75,7 +76,11 @@ pub fn capacity(jobs: &Jobs, found: &[String]) -> Capacity {
     let machine = measure();
     let (slots, running) = jobs.slots();
     Capacity {
-        state: MemberState::Ready,
+        state: if jobs.enabled() {
+            MemberState::Ready
+        } else {
+            MemberState::Disabled
+        },
         power: u32::from(machine.cores),
         idle: running == 0,
         slots_free: slots.saturating_sub(running),
@@ -159,11 +164,17 @@ impl Agent {
             Instant::now(),
         );
         let claimer = Arc::downgrade(&member);
+        let switcher = Arc::downgrade(&member);
         let router = routes::router(
             jobs,
             Arc::new(move |lineage: &str| {
                 if let Some(m) = claimer.upgrade() {
                     m.claim(lineage.as_bytes());
+                    m.capacity_changed();
+                }
+            }),
+            Arc::new(move || {
+                if let Some(m) = switcher.upgrade() {
                     m.capacity_changed();
                 }
             }),
@@ -247,6 +258,28 @@ mod tests {
         assert!(capacity(&beside, &[]).low_priority);
         assert!(!capacity(&dedicated, &[]).low_priority);
         assert_eq!(capacity(&dedicated, &[]).slots_free, 2);
+    }
+
+    /// **An agent switched off reports itself `disabled`**, so no gateway
+    /// routes it a job, and `ready` again once switched back on.
+    #[test]
+    fn capacity_reports_an_agent_switched_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig {
+            jobs_dir: dir.path().join("jobs"),
+            slots: Some(1),
+            checkouts: Vec::new(),
+        };
+        let jobs = Jobs::new(
+            Checkouts::open(&cfg, &CommandPolicy::allowing(["cargo"])).unwrap(),
+            1,
+            Priority::Normal,
+        );
+        assert_eq!(capacity(&jobs, &[]).state, MemberState::Ready);
+        jobs.set_enabled(false).unwrap();
+        assert_eq!(capacity(&jobs, &[]).state, MemberState::Disabled);
+        jobs.set_enabled(true).unwrap();
+        assert_eq!(capacity(&jobs, &[]).state, MemberState::Ready);
     }
 
     /// A node is drawn once and read back the same after.

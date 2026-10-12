@@ -15,12 +15,16 @@
 //!   lacks, for a member whose repository lives with an agent (§10.3).
 //!
 //! The last [`KEPT`] jobs are kept; asking after an older one is not found.
+//! Each is kept with its command line and its times, which is what an admin
+//! watching the agent reads ([`Jobs::list`], [`Jobs::tail`]).
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 use tokio::task::{spawn_blocking, AbortHandle};
@@ -31,13 +35,20 @@ use zend_vfs::{
 };
 
 use crate::checkouts::{Checkout, Checkouts};
-use crate::wire::{decode_bundle, FetchJob, Fetched, JobView, PushJob, Pushed, RunJob, Submit};
+use crate::switch::Switch;
+use crate::wire::{
+    decode_bundle, AgentJobs, FetchJob, Fetched, JobKind, JobLine, JobView, LogChunk, PushJob,
+    Pushed, RunJob, Submit,
+};
 
 /// Jobs kept after they end.
 pub const KEPT: usize = 256;
 
 /// The longest a member's wait on one job is held open.
 pub const MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// The most of a log one [`Jobs::tail`] reads.
+pub const TAIL_MAX: u64 = 256 * 1024;
 
 /// Why a job was not started, or cannot be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -48,8 +59,16 @@ pub enum JobError {
     NoPush(String),
     #[error("no job {0} on this agent")]
     NotFound(String),
+    #[error("this agent is switched off")]
+    Disabled,
     #[error("{0}")]
     Bad(String),
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 enum Kind {
@@ -68,9 +87,18 @@ enum Kind {
     },
 }
 
+/// What a job runs and when, as [`Jobs::list`] shows it.
+struct Line {
+    branch: Option<String>,
+    command: Vec<String>,
+    started_ms: u64,
+    ended_ms: Option<u64>,
+}
+
 struct Entry {
     repo: String,
     kind: Kind,
+    line: Line,
     ended: watch::Sender<bool>,
 }
 
@@ -80,6 +108,8 @@ pub struct Jobs {
     /// What its commands run at: below normal on a host that also runs a
     /// model member (§11.5).
     priority: Priority,
+    /// Whether it takes jobs (§11.7).
+    switch: Switch,
     running: AtomicU32,
     table: Mutex<Table>,
 }
@@ -100,17 +130,64 @@ fn origin() -> RemoteName {
     RemoteName::parse(ORIGIN).expect("`origin` is a remote name")
 }
 
+/// The git command a push makes: one atomic push of every ref, each named
+/// `<object>:<ref>`, or `:<ref>` for a delete.
+fn push_command(push: &PushJob) -> Vec<String> {
+    let mut command: Vec<String> = ["git", "push", "--atomic", ORIGIN].map(String::from).into();
+    command.extend(push.specs.iter().map(|l| match &l.to {
+        Some(to) => format!("{}:{}", &to[..to.len().min(12)], l.target),
+        None => format!(":{}", l.target),
+    }));
+    command
+}
+
+/// The git command a fetch makes: origin's one branch, or all of them.
+fn fetch_command(fetch: &FetchJob) -> Vec<String> {
+    let mut command: Vec<String> = ["git", "fetch", ORIGIN].map(String::from).into();
+    command.extend(fetch.branch.clone());
+    command
+}
+
+/// Up to `max` bytes of the file at `path` from byte `from`, and the file's
+/// length.
+fn read_from(path: &Path, from: u64, max: u64) -> io::Result<(Vec<u8>, u64)> {
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+    if from >= size {
+        return Ok((Vec::new(), size));
+    }
+    file.seek(SeekFrom::Start(from))?;
+    let mut bytes = Vec::with_capacity((size - from).min(max) as usize);
+    file.take(max).read_to_end(&mut bytes)?;
+    Ok((bytes, size))
+}
+
 impl Jobs {
     /// The jobs of `checkouts`, `slots` at a time, their commands run at
-    /// `priority`.
+    /// `priority`; switched on or off as its jobs folder keeps it.
     pub fn new(checkouts: Checkouts, slots: u32, priority: Priority) -> Arc<Jobs> {
+        let switch = Switch::open(checkouts.jobs_dir());
         Arc::new(Jobs {
             checkouts,
             slots,
             priority,
+            switch,
             running: AtomicU32::new(0),
             table: Mutex::new((HashMap::new(), VecDeque::new())),
         })
+    }
+
+    /// Whether it takes jobs.
+    pub fn enabled(&self) -> bool {
+        self.switch.on()
+    }
+
+    /// Switch it on or off, and keep it so across a restart. The jobs it is
+    /// running carry on.
+    pub fn set_enabled(&self, on: bool) -> Result<(), JobError> {
+        self.switch
+            .set(on)
+            .map_err(|e| JobError::Bad(format!("keeping the agent's switch: {e}")))
     }
 
     pub fn checkouts(&self) -> &Checkouts {
@@ -144,6 +221,9 @@ impl Jobs {
     /// Start `submit`: a run answers once started, a push once made, a fetch
     /// with what it found.
     pub async fn submit(self: &Arc<Self>, submit: Submit) -> Result<JobView, JobError> {
+        if !self.enabled() {
+            return Err(JobError::Disabled);
+        }
         match submit {
             Submit::Run(run) => self.run(run).await,
             Submit::Push(push) => self.push(push).await,
@@ -157,6 +237,8 @@ impl Jobs {
     /// with the submit.
     async fn fetch_for(self: &Arc<Self>, fetch: FetchJob) -> Result<JobView, JobError> {
         self.checkout(&fetch.repo)?;
+        let started_ms = now_ms();
+        let command = fetch_command(&fetch);
         let spec = match &fetch.branch {
             Some(b) => {
                 FetchSpec::Branch(BranchName::parse(b).map_err(|e| JobError::Bad(e.to_string()))?)
@@ -192,6 +274,12 @@ impl Jobs {
                 kind: Kind::Fetch {
                     status: status.clone(),
                 },
+                line: Line {
+                    branch: None,
+                    command,
+                    started_ms,
+                    ended_ms: Some(now_ms()),
+                },
                 ended,
             },
         );
@@ -222,6 +310,16 @@ impl Jobs {
     async fn run(self: &Arc<Self>, run: RunJob) -> Result<JobView, JobError> {
         let c = self.checkout(&run.repo)?;
         let branch = BranchName::parse(&run.branch).map_err(|e| JobError::Bad(e.to_string()))?;
+        let started_ms = now_ms();
+        let line = Line {
+            branch: Some(run.branch.clone()),
+            command: [run.program.clone()]
+                .into_iter()
+                .chain(run.args.iter().cloned())
+                .collect(),
+            started_ms,
+            ended_ms: None,
+        };
         self.fetch(&run.repo).await?;
         let store = VfsStore::on_branch(Arc::clone(&c.source), Rev::Branch(branch.clone()));
         store
@@ -265,6 +363,7 @@ impl Jobs {
                         task: task.abort_handle(),
                         outcome: None,
                     },
+                    line,
                     ended,
                 },
             );
@@ -286,6 +385,7 @@ impl Jobs {
         if let Kind::Run { outcome: o, .. } = &mut e.kind {
             *o = outcome;
         }
+        e.line.ended_ms = Some(now_ms());
         let _ = e.ended.send(true);
         self.running.fetch_sub(1, Ordering::Relaxed);
     }
@@ -295,6 +395,8 @@ impl Jobs {
         if !c.push {
             return Err(JobError::NoPush(push.repo));
         }
+        let started_ms = now_ms();
+        let command = push_command(&push);
         let specs = push
             .specs
             .iter()
@@ -337,6 +439,12 @@ impl Jobs {
             Entry {
                 repo: push.repo,
                 kind: Kind::Push { status, pushed },
+                line: Line {
+                    branch: None,
+                    command,
+                    started_ms,
+                    ended_ms: Some(now_ms()),
+                },
                 ended,
             },
         );
@@ -435,5 +543,135 @@ impl Jobs {
             self.finished(id, None);
         }
         self.view(id)
+    }
+
+    /// Whether it takes jobs, its slots, and up to `limit` of the jobs it
+    /// keeps, newest first.
+    pub fn list(&self, limit: usize) -> AgentJobs {
+        let ids: Vec<String> = self.table().1.iter().rev().take(limit).cloned().collect();
+        let (slots, running) = self.slots();
+        AgentJobs {
+            enabled: self.enabled(),
+            slots,
+            running,
+            jobs: ids.iter().filter_map(|id| self.line(id).ok()).collect(),
+        }
+    }
+
+    /// Job `id` as [`Self::list`] shows it.
+    fn line(&self, id: &str) -> Result<JobLine, JobError> {
+        let view = self.view(id)?;
+        let t = self.table();
+        let e =
+            t.0.get(id)
+                .ok_or_else(|| JobError::NotFound(id.to_string()))?;
+        let kind = match &e.kind {
+            Kind::Run { .. } => JobKind::Run,
+            Kind::Push { .. } => JobKind::Push,
+            Kind::Fetch { .. } => JobKind::Fetch,
+        };
+        Ok(JobLine {
+            id: view.id,
+            repo: view.repo,
+            kind,
+            branch: e.line.branch.clone(),
+            command: e.line.command.clone(),
+            status: view.status,
+            lines: view.lines,
+            bytes: view.bytes,
+            started_ms: e.line.started_ms,
+            ended_ms: e.line.ended_ms,
+            changed: view.outcome.map_or(0, |o| o.changed.len()),
+        })
+    }
+
+    /// Job `id`'s log from byte `from`, up to [`TAIL_MAX`] of it. A push or
+    /// a fetch writes no log: its tail is empty, and ended.
+    pub async fn tail(&self, id: &str, from: u64) -> Result<LogChunk, JobError> {
+        let is_run = {
+            let t = self.table();
+            let e =
+                t.0.get(id)
+                    .ok_or_else(|| JobError::NotFound(id.to_string()))?;
+            matches!(e.kind, Kind::Run { .. })
+        };
+        if !is_run {
+            return Ok(LogChunk::of(from, &[], 0, true));
+        }
+        // Whether it had ended is read before the log is: an ended job's log
+        // is then all there, and a reader that has caught up with it is done.
+        let ended = self.view(id)?.status.is_finished();
+        let path = self.log(id)?;
+        let (bytes, size) = spawn_blocking(move || read_from(&path, from, TAIL_MAX))
+            .await
+            .map_err(|e| JobError::Bad(e.to_string()))?
+            .map_err(|e| JobError::Bad(format!("job {id}'s log: {e}")))?;
+        Ok(LogChunk::of(from, &bytes, size, ended))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::PushLine;
+
+    /// **A push and a fetch are listed as the git command they make**: every
+    /// ref of one atomic push, a delete as `:<ref>`.
+    #[test]
+    fn a_push_and_a_fetch_name_their_git_command() {
+        let push = PushJob {
+            repo: "candle".into(),
+            bundle: None,
+            specs: vec![
+                PushLine {
+                    target: "refs/heads/main".into(),
+                    to: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                    expect: None,
+                },
+                PushLine {
+                    target: "refs/tags/v1".into(),
+                    to: None,
+                    expect: Some("1111111111111111111111111111111111111111".into()),
+                },
+            ],
+        };
+        assert_eq!(
+            push_command(&push),
+            [
+                "git",
+                "push",
+                "--atomic",
+                "origin",
+                "0123456789ab:refs/heads/main",
+                ":refs/tags/v1"
+            ]
+        );
+        let one = FetchJob {
+            repo: "mind".into(),
+            branch: Some("main".into()),
+            have: Vec::new(),
+        };
+        assert_eq!(fetch_command(&one), ["git", "fetch", "origin", "main"]);
+        let all = FetchJob {
+            branch: None,
+            ..one
+        };
+        assert_eq!(fetch_command(&all), ["git", "fetch", "origin"]);
+    }
+
+    /// A log is read from any byte, at most `max` of it, with its length; a
+    /// read at or past its end is empty.
+    #[test]
+    fn a_log_is_read_from_a_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.log");
+        std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+        assert_eq!(
+            read_from(&path, 0, 1024).unwrap(),
+            (b"one\ntwo\nthree\n".to_vec(), 14)
+        );
+        assert_eq!(read_from(&path, 4, 3).unwrap(), (b"two".to_vec(), 14));
+        assert_eq!(read_from(&path, 14, 1024).unwrap(), (Vec::new(), 14));
+        assert_eq!(read_from(&path, 99, 1024).unwrap(), (Vec::new(), 14));
     }
 }

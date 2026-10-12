@@ -10,6 +10,7 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use agent::client::Agents;
 use cluster::member::{ClusterView, Link};
 use futures::executor::block_on;
 use futures::future::select_all;
@@ -5222,6 +5223,15 @@ impl ZendSession {
         if let Some(state) = self.inference.read().unwrap().as_ref() {
             state.engine.lock().unwrap().trigger_summariser();
         }
+    }
+
+    /// The agents this daemon's commands run on (`docs/replicated_substrate.md`
+    /// §11.5) — `None` without `--cluster`, where they run on this host's own
+    /// sandboxes, and until the cluster's member has started.
+    pub fn agents(&self) -> Option<Agents> {
+        let join = self.config.cluster.as_ref()?;
+        let member = join.link().member()?;
+        Some(Agents::new(Arc::clone(member), join.in_process_agent()))
     }
 
     /// Snapshot for `GET /v1/status`. `loading=None` once every startup

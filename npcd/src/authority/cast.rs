@@ -54,16 +54,7 @@ impl Runtime {
             let living = npcs.read().await.is_living(npc);
             if !living {
                 if self.bodies.bound(npc).is_some() {
-                    if self.scheduler.pace_of(npc).is_some() {
-                        self.put_down(npc);
-                    }
-                    self.cooldowns.forget(npc);
-                    if let Some((hosted, body)) = self.body_of(npc) {
-                        if self.standing.writes(hosted.id()) {
-                            hosted.with_sim(|s| s.ledger.forget_questions(&body));
-                        }
-                    }
-                    self.disembody(npc, 0);
+                    self.forget_character(npc);
                 }
                 continue;
             }

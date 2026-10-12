@@ -3,19 +3,23 @@
 //! [`Hub::pick_agent`](cluster::gateway::Hub::pick_agent) chooses — the
 //! lineage's holder, or after [`SPILL_AFTER`] the best idle agent holding the
 //! job's repository and toolchain — or to the agent `x-tokera-node` names,
-//! which is how a member reads back a job it started. With no agent fit for
-//! the job it is answered `503` with the code `no_agent`.
+//! which is how a member reads back a job it started — and how an admin's
+//! member reads what an agent is running, or switches it (§11.7). With no
+//! agent fit for the job it is answered `503` with the code `no_agent`.
+//!
+//! `GET` [`AGENTS_PATH`] is the gateway's own to answer: the agents admitted
+//! here, from its registry.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::Request;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use cluster::gateway::{
-    Choice, Need, LINEAGE_HEADER, NODE_HEADER, PUSH_HEADER, REPO_HEADER, SPILL_AFTER,
+    Choice, Need, AGENTS_PATH, LINEAGE_HEADER, NODE_HEADER, PUSH_HEADER, REPO_HEADER, SPILL_AFTER,
     TOOLCHAIN_HEADER,
 };
 use serde_json::json;
@@ -59,6 +63,9 @@ pub fn no_agent(why: String) -> Response {
 /// Send one request from member `from` (at `peer`) to an agent.
 pub async fn answer(gateway: &Arc<Gateway>, from: u64, peer: IpAddr, req: Request) -> Response {
     let hub = &gateway.hub;
+    if req.method() == Method::GET && req.uri().path() == AGENTS_PATH {
+        return Json(hub.agents(AGENT_APP)).into_response();
+    }
     let addressed =
         header(req.headers(), NODE_HEADER).and_then(|n| u64::from_str_radix(n, 16).ok());
     let node = if let Some(node) = addressed {

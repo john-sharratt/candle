@@ -659,6 +659,16 @@ impl Qwen4ExpBatched {
             rows
         };
 
+        // **The walk's KV first, then its tier.** Reserving can create an arena,
+        // and an arena is ground taken out from under a standing tier — so the
+        // tier is priced against the partition the reservation leaves, as every
+        // forward prices after its admit. Reserved after, an arena handed back
+        // the tier just covered and the walk's first phase found none.
+        //
+        // The walk reserves these itself, but the rope depth below has to be
+        // read after the reservation — it can grow the backing's block count.
+        draft_reserve(session, seqs, kv_layer, max_len)?;
+
         // **The walk runs on the previous forward's tier, priced for that
         // forward's width rather than this cohort's.** Each step is one decode
         // row per sequence through the head's assembly, its attention, its FFN
@@ -698,9 +708,6 @@ impl Qwen4ExpBatched {
             })?;
         }
 
-        // The walk reserves these itself, but the rope depth below has to be
-        // read after the reservation — it can grow the backing's block count.
-        draft_reserve(session, seqs, kv_layer, max_len)?;
         let theta = m.cfg.rope_theta;
         let q_lens = vec![1usize; n];
         let mut idx_map = self

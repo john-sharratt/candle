@@ -1661,6 +1661,34 @@ impl Runtime {
             .count()
     }
 
+    /// Take a deleted character out of everything still holding it here: its
+    /// running mind, what its body was waiting on, the questions it was part of,
+    /// and its body, which leaves this member's copy of the world.
+    ///
+    /// One step, for both ways a deletion arrives — the member it was deleted
+    /// on, and every other taking it in from the cast (`follow_cast`). Each
+    /// member holds every body in its own copy of the world, so each takes its
+    /// own copy's out; a body left behind stood in its room for ever, on the
+    /// pulse page and in every percept of the characters around it.
+    ///
+    /// The questions are the world's to forget, so only its authority does.
+    pub fn forget_character(&self, npc_id: u64) {
+        // The task first: stopping it drops whatever turn it was awaiting, and
+        // retiring wakes a task that was parked so it finds its inbox gone.
+        self.stop_character(npc_id);
+        self.scheduler.retire(npc_id);
+        self.cooldowns.forget(npc_id);
+        if let Some((hosted, body)) = self.body_of(npc_id) {
+            if self.standing.writes(hosted.id()) {
+                hosted.with_sim(|s| s.ledger.forget_questions(&body));
+            }
+            hosted.with(|w| {
+                let _ = w.leave(&body);
+            });
+        }
+        self.bodies.unbind(npc_id);
+    }
+
     /// Take a character's body away, and let it settle back to reacting.
     pub fn disembody(&self, npc_id: u64, now_ms: u64) -> bool {
         if !self.bodies.unbind(npc_id) {
@@ -6465,6 +6493,30 @@ mod tests {
         assert_eq!(rt.scheduler.pace_of(1), Some(Pace::AMBIENT));
         assert!(rt.body_of(1).is_none());
         assert!(!rt.disembody(1, 0), "disembodied twice");
+    }
+
+    /// **A deleted character leaves the world.** Its mind stopped and its
+    /// conversation retired, but its body stayed in the room — on the pulse
+    /// page, and in the company every neighbour was told about.
+    #[tokio::test]
+    async fn a_forgotten_character_leaves_the_world_and_its_body() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "band-one");
+        embody(&rt, 2, "m2", "band-one");
+        rt.forget_character(1);
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        assert!(
+            hosted.read(|w| w.actor("m1").is_none()),
+            "the body is still in the world"
+        );
+        assert!(!rt.bodies.is_bound(1), "the binding outlived the character");
+        assert_eq!(rt.scheduler.pace_of(1), None, "its mind is still scheduled");
+        assert!(
+            !rt.within(2).company.iter().any(|n| n == "Maker-01"),
+            "a neighbour is still told it is here"
+        );
+        // Forgetting twice is not an error: the second has nothing to take.
+        rt.forget_character(1);
     }
 
     #[tokio::test]

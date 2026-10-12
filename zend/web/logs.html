@@ -39,6 +39,7 @@
     <a class="navlink" href="/">Chat</a>
     <a class="navlink" href="perf.html">Telemetry</a>
     <a class="navlink" href="logs.html" aria-current="page">Logs</a>
+    <a class="navlink" href="agents.html" data-admin hidden>Agents</a>
   </nav>
   <span class="spacer"></span>
   <div class="row" id="chrome"></div>
@@ -70,6 +71,9 @@ import { h, mount } from './common/lib/dom.js';
 import { ringView } from './common/lib/live.js';
 import { subscribe } from './common/lib/ws.js';
 import { estateSwitcher } from './common/lib/estate.js';
+import { revealAdminLinks } from './admin-nav.js';
+
+revealAdminLinks();
 
 const MAX = 2000;
 const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'];

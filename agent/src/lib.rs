@@ -11,6 +11,7 @@
 //! | [`checkouts`] | each checkout: its repository, sandbox and origin |
 //! | [`wire`] | the job API's bodies |
 //! | [`jobs`] | running jobs, pushes and fetches, and what each came to |
+//! | [`switch`] | whether the agent takes jobs: an admin's, kept across restarts |
 //! | [`routes`] | the job API's routes |
 //! | [`member`] | joining the clusters as an `agent` member |
 //! | [`client`] | a member's side: sending its jobs to an agent |
@@ -27,4 +28,5 @@ pub mod jobs;
 pub mod member;
 pub mod pusher;
 pub mod routes;
+pub mod switch;
 pub mod wire;

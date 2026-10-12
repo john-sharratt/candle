@@ -252,7 +252,7 @@ const buildName = (b) => b ? `${b.count}-${b.hash}` : "—";
 const short = (hex) => String(hex || "").slice(0, 8);
 const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + "s")}`;
 const chip = (cls, text) => `<span class="chip ${cls}">${esc(text)}</span>`;
-const STATE_CLS = {ready: "ok", loading: "warn", upgrading: "warn", draining: "warn", fault: "crit"};
+const STATE_CLS = {ready: "ok", loading: "warn", upgrading: "warn", draining: "warn", disabled: "warn", fault: "crit"};
 const MODE_CLS = {joined: "ok", fault: "crit", cut_off: "warn", rejoining: "warn", reloading: "warn", draining: "warn"};
 const APP_NAME = {zend: "Zend", npcd: "NPCs", agent: "Agents"};
 const appName = (a) => APP_NAME[a] || a;
