@@ -1,13 +1,15 @@
 //! The gateway status page (§12): `GET /gateway` serves it and
 //! `GET /gateway/status.json` its data, on every host, merged ahead of site
-//! routing, and an admin's only — roles resolved from this gateway's own
-//! `roles:` table. The page polls once a second. The gateway's own commands,
+//! routing, and an admin's only — roles resolved from the estate's role table
+//! (`roles_file:`). The page wears tokera.com's own top bar and stylesheets, so
+//! it reads as part of the site it is linked from. It polls once a second. The
+//! gateway's own commands,
 //! `drain-gateway` and `undrain-gateway` (§12.4), are `POST`s beside them, and
 //! a member's maintenance commands go down its socket from
 //! `/gateway/member/<app>/<node>/…`.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
@@ -21,9 +23,14 @@ use super::route::{forward, Context};
 use super::{upgrades, Gateway};
 use crate::auth::{Auth, Role, Roles};
 use crate::config::Cache;
+use crate::site::tokera::page::{nav_bar, Nav};
 
-/// The page itself: static, reading `status.json`.
-const PAGE: &str = include_str!("gateway.html");
+/// Where the page's template takes tokera.com's top bar.
+const TOP_BAR: &str = "{{TOP_BAR}}";
+
+/// The page itself: static, reading `status.json`, under the site's top bar.
+static PAGE: LazyLock<String> =
+    LazyLock::new(|| include_str!("gateway.html").replace(TOP_BAR, &nav_bar(Nav::Admin)));
 
 /// How many coordination-log entries `status.json` carries by default.
 const LOG_LIMIT: usize = 500;
@@ -79,7 +86,22 @@ async fn page(State(s): State<PageState>, headers: HeaderMap) -> Response {
     if let Err(refused) = admin(&s, &headers) {
         return *refused;
     }
-    ([(header::CACHE_CONTROL, "no-store")], Html(PAGE)).into_response()
+    ([(header::CACHE_CONTROL, "no-store")], Html(PAGE.as_str())).into_response()
+}
+
+/// **The page wears tokera.com's bar and stylesheets**, so it reads as part of
+/// the site it is linked from; its template has no placeholder left over.
+#[cfg(test)]
+#[test]
+fn the_page_wears_the_sites_bar() {
+    assert!(!PAGE.contains(TOP_BAR));
+    assert!(PAGE.contains(r#"<header class="site-top">"#));
+    assert!(PAGE.contains(r#"<body class="tokera">"#));
+    for sheet in ["/base.css", "/lib/estate.css", "/site.css"] {
+        assert!(PAGE.contains(&format!(r#"href="{sheet}""#)), "{sheet}");
+    }
+    // No link in the public nav is marked as this page.
+    assert!(!PAGE.contains(r#"aria-current="page""#));
 }
 
 #[derive(Deserialize)]

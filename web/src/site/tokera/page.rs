@@ -109,6 +109,9 @@ pub enum Nav {
     Home,
     Blog,
     Papers,
+    /// A page outside the public nav — the gateway's cluster page, an admin's:
+    /// the bar is the site's, with no link marked current.
+    Admin,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -523,7 +526,7 @@ fn fold_label(nav: Nav) -> &'static str {
     match nav {
         Nav::Blog => "All posts",
         Nav::Papers => "All papers",
-        Nav::Home => "Index",
+        Nav::Home | Nav::Admin => "Index",
     }
 }
 

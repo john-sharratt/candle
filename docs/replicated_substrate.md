@@ -3405,6 +3405,14 @@ replication, still sends `COORD`, every 2 s, so its `upgrade` view reaches the p
 
 ### 12.2 The page
 
+The page is laid out for operating, top to bottom: a one-line summary and a **Needs
+attention** list naming each problem in a sentence (faults, lagging or stranded members,
+a failed candidate, an app still loading, recent refusals), the headline figures, one
+card per **app** with its members and their actions, **Builds and upgrades**, the
+**Activity** of the commands run from this page, and the blocks below under
+**Diagnostics**, each a section closed until opened. It wears tokera.com's own bar and
+stylesheets.
+
 | Block | Shows |
 |---|---|
 | **Apps** | For zend, npcd and agent: the **mode** (dumb or clustered) and when it last switched (§5.7); the build floor (count, hash, the node that set it) (§3.5); the model lock (§3.6); the member count and how many are ready; **`max_members` and the quorum**, the greatest any member reports while they converge (§5.9). Whether it was raised or set lower, and by whom, is in the log. The pending floor and its grace countdown, or *loading* while the candidate loads (§3.5) |
@@ -3477,8 +3485,12 @@ therefore shows on both pages, together with the member reports that explain it.
 
 ### 12.4 Maintenance commands
 
-The page runs maintenance from its **Commands** panel, which each member's row opens on
-that member and the Apps block opens on the app's `set-quorum`.
+The page runs maintenance from each member's **Actions** sheet: the commands below in
+groups (traffic, process, data, storage, checks, builds), each with what it does in a
+sentence and only the inputs it takes, run on that member or on every member of its app.
+A destructive one is armed only once the member's host name is typed in the sheet, and
+runs on one member at a time. An app card opens its `set-quorum`; a rollout is chosen,
+shown as a plan in sentences, and confirmed by typing the build.
 
 **Every command is a route on the member.** It is `POST /v1/cluster/command/:name`, in
 the host crate (`host/src/commands/`), admin only, its body an optional
