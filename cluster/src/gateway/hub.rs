@@ -52,7 +52,7 @@ use super::log::{CoordLog, Entry};
 use super::paxos_log::paxos_step;
 use super::registry::{MemberView, Pick, Registry};
 use super::status::{
-    AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
+    mode_name, AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
 };
 use super::traffic::Traffic;
 use super::upgrades::held::HeldBuilds;
@@ -1154,7 +1154,7 @@ fn app_view(s: &State, app: &str) -> AppView {
         max_members: quorum.map(|(m, _)| m),
         quorum: quorum.map(|(_, q)| q),
         app: app.to_string(),
-        mode: if mode.clustered { "clustered" } else { "dumb" },
+        mode: mode_name(mode.clustered, s.registry.standing_by(app).is_some()),
         since_ms: mode.since_ms,
         floor: s.admission.floor(app).cloned(),
         floor_set_by: s

@@ -1447,7 +1447,8 @@ configured upstream is in its backoff window — its last attempt failed and non
 succeeded since — a request goes to a member admitted and not yet ready, the lowest
 node first (`Registry::standing_by`), instead of the outage page. That member serves
 its own loading page and `/v1/status`, so a member replacing a retired upstream shows
-its load from the moment it joins. The upstream's first failure is still answered with
+its load from the moment it joins. The status page names that state **loading** rather
+than dumb (`status::mode_name`): the app has a member, just none ready. The upstream's first failure is still answered with
 the outage page: that failure is how the gateway learns it is down.
 
 **The configured upstream gets nothing special in clustered mode.** It is often the

@@ -74,11 +74,24 @@ impl FaultRow {
     }
 }
 
+/// What an app's mode reads as on the page (§5.7). The routing knows two —
+/// clustered once a member is ready, dumb before — but "dumb" said the app had
+/// no member, when one joined and still loading serves its loading page in place
+/// of a down upstream. That is `loading`.
+pub fn mode_name(clustered: bool, standing_by: bool) -> &'static str {
+    match (clustered, standing_by) {
+        (true, _) => "clustered",
+        (false, true) => "loading",
+        (false, false) => "dumb",
+    }
+}
+
 /// One app on this gateway.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AppView {
     pub app: String,
-    /// `dumb` or `clustered` (§5.7), and since when.
+    /// `clustered`, `loading` or `dumb` ([`mode_name`]), and since when the
+    /// routing's mode last changed.
     pub mode: &'static str,
     pub since_ms: u64,
     #[serde(serialize_with = "build_opt")]
@@ -240,6 +253,17 @@ mod tests {
     use crate::coord::{DiskView, OutboxView};
 
     const GIB: u64 = 1 << 30;
+
+    /// A ready member makes the app clustered whatever else is joined; a
+    /// joined member still loading reads as `loading`, not as an app with no
+    /// member; only an app with nobody joined is `dumb`.
+    #[test]
+    fn an_app_with_a_loading_member_reads_as_loading() {
+        assert_eq!(mode_name(true, false), "clustered");
+        assert_eq!(mode_name(true, true), "clustered");
+        assert_eq!(mode_name(false, true), "loading");
+        assert_eq!(mode_name(false, false), "dumb");
+    }
 
     fn row(coord: Option<CoordState>) -> MemberRow {
         MemberRow {

@@ -156,6 +156,35 @@ fn duelling_proposers_end_with_one_decision() {
     }
 }
 
+/// **Two members asking for a long lease together settle it in seconds.** The
+/// backoff after a duel was drawn over the lease's whole term, so two members
+/// asking for `upgrade/<app>` — a term of minutes — could both sit out for
+/// minutes, and no member installed. The window is a decision's at most.
+#[test]
+fn a_duel_over_a_long_lease_settles_within_seconds() {
+    let term = Duration::from_secs(10 * 60);
+    for seed in 0..20u64 {
+        let mut net = Net::new(3, 2);
+        for (i, m) in net.members.iter_mut().enumerate() {
+            m.rng = StdRng::seed_from_u64(seed * 7 + i as u64);
+        }
+        net.act(0, |p, now| p.acquire(b"upgrade/zend", term, now));
+        net.act(1, |p, now| p.acquire(b"upgrade/zend", term, now));
+        net.settle();
+        net.run_for(Duration::from_secs(10));
+        let held: Vec<usize> = net
+            .events
+            .iter()
+            .filter_map(|(i, e)| matches!(e, Out::LeaseHeld { .. }).then_some(*i))
+            .collect();
+        assert!(!held.is_empty(), "seed {seed}: nobody holds the lease");
+        assert!(
+            held.iter().all(|i| *i == held[0]),
+            "seed {seed}: two holders {held:?}"
+        );
+    }
+}
+
 /// A proposer proposes the highest-ballot accepted value it is shown.
 #[test]
 fn a_proposer_adopts_the_highest_accepted_value() {

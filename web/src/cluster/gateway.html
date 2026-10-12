@@ -442,7 +442,7 @@ function render(s, earlier) {
   table($("apps"), ["App", "Mode", "Since", "Floor", "Set by", "Pending floor", "Grace", "Model lock", "Members", "Ready", "max_members", "Quorum", ""],
     s.apps.map((a) => [
       `<td>${esc(a.app)}</td>`,
-      `<td><span class="pill ${a.mode === "clustered" ? "ok" : "dim"}">${esc(a.mode)}</span></td>`,
+      `<td><span class="pill ${{clustered: "ok", loading: "warn"}[a.mode] || "dim"}">${esc(a.mode)}</span></td>`,
       `<td class="mono">${a.since_ms ? ago(a.since_ms, s.now_ms) : "—"}</td>`,
       `<td class="mono">${build(a.floor)}</td>`,
       `<td class="mono">${esc(a.floor_set_by || "—")}</td>`,

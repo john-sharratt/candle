@@ -16,8 +16,8 @@
 //!
 //! **Duelling proposers back off.** A `NACK`, or a phase that does not finish
 //! within its timeout, waits a random time drawn uniformly from zero to the
-//! key's `ttl` (2 s for a decision), then prepares again above every ballot
-//! seen. One proposer then completes a round while the other waits, and the
+//! key's `ttl`, capped at a decision's 2 s, then prepares again above every
+//! ballot seen. One proposer then completes a round while the other waits, and the
 //! other learns the result from its next promises.
 
 use std::io;
@@ -274,8 +274,12 @@ impl<S: VoteStore> Paxos<S> {
         let Some(round) = self.rounds.get(key) else {
             return;
         };
-        let ttl = self.goal_ttl(&round.goal).as_millis() as u64;
-        let wait = Duration::from_millis(self.rng.random_range(0..=ttl));
+        // At most a decision's window, however long the lease: a duel is over
+        // in a round or two, and the next prepare learns of any winner. Drawn
+        // over an upgrade lease's term — minutes — two members asking for
+        // `upgrade/<app>` together could both sit out for minutes.
+        let window = self.goal_ttl(&round.goal).min(self.cfg.decision_ttl);
+        let wait = Duration::from_millis(self.rng.random_range(0..=window.as_millis() as u64));
         let round = self.rounds.get_mut(key).expect("checked");
         round.phase = Phase::Waiting { until: now + wait };
     }
