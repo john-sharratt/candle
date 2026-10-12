@@ -5,8 +5,7 @@
 //!
 //! | Module | |
 //! |---|---|
-//! | [`artifacts`] | the sibling binaries reporting the same build, and the UI archive |
-//! | [`ui_archive`] | the UI directories as one archive |
+//! | [`artifacts`] | the sibling binaries reporting the same build — each with its UI compiled in |
 //! | [`parts`] | downloads as resumable part files, verified by SHA-256 |
 //! | [`compat`] | whether a build can open a substrate: log format, record types, model |
 //! | [`decisions`] | verdicts, forced rollouts and pauses as Paxos decisions |
@@ -31,5 +30,4 @@ pub mod parts;
 pub mod runtime;
 pub mod sum;
 pub mod swap;
-pub mod ui_archive;
 pub mod watchdog;

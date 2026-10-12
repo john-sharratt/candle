@@ -516,10 +516,23 @@ function paintLoading(loading, detail) {
   }
 
   const done = new Set(loading.completed || []);
-  for (const li of document.querySelectorAll('#boot-steps li')) {
+  /* The substrate is opened before npcd's own load begins — the host reports
+   * it, as `opening`, while npcd's start runs — so it is behind every step
+   * npcd's load names. */
+  if (loading.current !== 'opening' && loading.current !== 'starting') done.add('opening');
+  for (const li of document.querySelectorAll('#boot-steps li[data-step]')) {
     const step = li.getAttribute('data-step');
     li.classList.toggle('done', done.has(step));
     li.classList.toggle('now', step === loading.current);
+  }
+
+  /* The shared engine is built once every tenant of the process has arrived;
+   * until then the list ends on whom this load is waiting for. */
+  const wait = document.getElementById('boot-wait');
+  if (wait) {
+    const who = loading.waiting_for || [];
+    wait.hidden = who.length === 0;
+    wait.textContent = who.length ? 'Waiting for ' + who.join(', ') : '';
   }
 }
 

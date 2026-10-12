@@ -159,6 +159,7 @@ fn a_copy_of_the_live_substrate_adopts_and_keeps_its_state() {
                 unstamped.push(h.record_type);
             }
         },
+        &|_, _, _| {},
     )
     .unwrap();
     assert!(

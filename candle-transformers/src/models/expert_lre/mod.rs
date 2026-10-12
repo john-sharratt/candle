@@ -156,6 +156,8 @@ mod flush_schedule;
 /// `pub(crate)` so the layer warm tier can size itself through the same three
 /// host-RAM ceilings this one does — see `handle::warm_slots_for`.
 pub(crate) mod handle;
+/// The last forward's walk through the routed layers, for the telemetry page.
+pub mod layer_trace;
 /// The host→device link's rate, measured at startup for read-ahead.
 #[cfg(feature = "cuda")]
 mod link_rate;

@@ -19,30 +19,85 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-// ── Promote tracker ──────────────────────────────────────────────────────────
-// Cumulative count, keyed by symbolic name, of how many times each unit (system
-// section / tool / turn bucket) was handed to `elevate_projection_working_set`.
-// Fixed always-hot units (system prompt, tools) re-elevated every turn float to
-// the top — the live "what's being churned" leaderboard on `perf.html`.
+pub use super::vram_bands::VramBands;
 
-static PROMOTES: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+// ── Projection tracker ───────────────────────────────────────────────────────
+// What projection lifted into VRAM for a working set, by name: each unit
+// `elevate_projection_working_set` had to bring back because it was not hot.
+// A unit lifted on every turn is churn — the live "what keeps coming back"
+// board on `perf.html` — and an empty board is the healthy state.
 
-/// Record one promote of `name` (increment its cumulative count).
-pub fn record_promote(name: &str) {
-    let m = PROMOTES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut g = m.lock().unwrap();
-    *g.entry(name.to_string()).or_insert(0) += 1;
+/// What a lifted unit is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProjectedKind {
+    /// A prompt section: the system prompt's parts, a tool, an ingested file.
+    Section,
+    /// A conversation's turns.
+    Turns,
 }
 
-/// Snapshot the promote counts as `(name, count)`, unsorted.
-pub fn snapshot_promotes() -> Vec<(String, u64)> {
-    let Some(m) = PROMOTES.get() else {
+impl ProjectedKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectedKind::Section => "section",
+            ProjectedKind::Turns => "turns",
+        }
+    }
+}
+
+/// One unit's lifts.
+#[derive(Clone, Copy, Debug)]
+struct Lifts {
+    /// Working sets that lifted it.
+    lifts: u64,
+    /// Turns lifted across those — 1 per lift for a section.
+    units: u64,
+    last: Instant,
+}
+
+static PROJECTED: OnceLock<Mutex<HashMap<(ProjectedKind, String), Lifts>>> = OnceLock::new();
+
+/// Record one lift of `name`, which brought back `units` turns (1 for a
+/// section).
+pub fn record_projected(kind: ProjectedKind, name: &str, units: u64) {
+    let m = PROJECTED.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let e = g.entry((kind, name.to_string())).or_insert(Lifts {
+        lifts: 0,
+        units: 0,
+        last: now,
+    });
+    e.lifts += 1;
+    e.units += units;
+    e.last = now;
+}
+
+/// One unit's lifts, flattened for JSON with `age_s` since its last.
+pub struct ProjectedSnapshot {
+    pub kind: ProjectedKind,
+    pub name: String,
+    pub lifts: u64,
+    pub units: u64,
+    pub age_s: f64,
+}
+
+/// Every unit lifted so far, unsorted.
+pub fn snapshot_projected() -> Vec<ProjectedSnapshot> {
+    let Some(m) = PROJECTED.get() else {
         return Vec::new();
     };
+    let now = Instant::now();
     m.lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .map(|(k, v)| (k.clone(), *v))
+        .map(|((kind, name), l)| ProjectedSnapshot {
+            kind: *kind,
+            name: name.clone(),
+            lifts: l.lifts,
+            units: l.units,
+            age_s: now.saturating_duration_since(l.last).as_secs_f64(),
+        })
         .collect()
 }
 
@@ -209,8 +264,8 @@ pub fn snapshot() -> Vec<PhaseSnapshot> {
 // log and no `-v`.
 
 /// One wave's headline numbers: VRAM budget/used, prefill backlog, tokens fed,
-/// mean forward time, the wall-clock window, the resident-arena format split, and
-/// the whole-card VRAM decomposition (pool reserved + driver total/free). All MiB.
+/// mean forward time, the wall-clock window, and the whole-card VRAM
+/// decomposition. All MiB.
 #[derive(Clone, Copy)]
 pub struct WaveSample {
     at: Instant,
@@ -220,21 +275,9 @@ pub struct WaveSample {
     pub budget_mib: u64,
     pub used_mib: u64,
     pub backlog: u64,
-    pub float_arenas: u32,
-    pub float_mib: u64,
-    pub float_live_mib: u64,
-    pub quant_arenas: u32,
-    pub quant_mib: u64,
-    pub quant_live_mib: u64,
-    /// KV pool reserved footprint (MiB) — quant + float + slack/fragmentation.
-    pub reserved_mib: u64,
-    /// Driver total / free VRAM (MiB, `cuMemGetInfo`) for the whole-card decomp.
-    pub total_mib: u64,
-    pub free_mib: u64,
-    /// Resident model-weight VRAM (MiB) this wave — fixed base weights plus the
-    /// live resident-expert footprint (MoE experts page VRAM↔RAM), sampled from
-    /// the model each wave. The whole-card decomp carves this out as its own band.
-    pub weights_mib: u64,
+    /// The whole card at this wave, cut by what holds each byte — bands that add
+    /// up to the driver's total (see [`VramBands`]).
+    pub vram: VramBands,
     /// Projection decomposition (ms). `pdrain` = submission drain MINUS the prefill
     /// re-attributed to the Prefill phase, decomposed into `drain_elevate`
     /// (sealed-prefix inject / warm→hot) + `drain_glue` (submit gap-fill) + drain
@@ -254,6 +297,12 @@ pub struct WaveSample {
     pub decodes: u32,
     pub prefills: u32,
     pub sections: u32,
+    /// The window's waves — run-loop passes that ran a forward — their summed
+    /// wall-clock and the part of it outside the quanta, in microseconds
+    /// (`scheduler::wave_timing`).
+    pub waves: u64,
+    pub wave_wall_us: u64,
+    pub wave_overhead_us: u64,
 }
 
 /// One hot→warm migration pass's timing + volume (persistence thread).
@@ -268,12 +317,24 @@ pub struct MigrateSample {
     pub total_ms: u64,
 }
 
+/// The resident KV by storage format at one moment: `(format, tokens)`, most
+/// tokens first (`candle_nn::kv_cache::FormatCensus`).
+#[derive(Clone)]
+pub struct MixSample {
+    at: Instant,
+    pub rows: Vec<(String, f64)>,
+}
+
+/// How often the persistence thread takes the census — the page's poll.
+const MIX_EVERY: Duration = Duration::from_secs(4);
+
 /// Wave/migration history horizon — matches the generic panels' 240-min cap.
 const WAVE_MAX_AGE: Duration = Duration::from_secs(240 * 60);
 const WAVE_MAX_LEN: usize = 16384;
 
 static WAVES: OnceLock<Mutex<VecDeque<WaveSample>>> = OnceLock::new();
 static MIGRATES: OnceLock<Mutex<VecDeque<MigrateSample>>> = OnceLock::new();
+static MIXES: OnceLock<Mutex<VecDeque<MixSample>>> = OnceLock::new();
 
 fn trim<T>(q: &mut VecDeque<T>, at: Instant, age_of: impl Fn(&T) -> Instant) {
     let cutoff = at.checked_sub(WAVE_MAX_AGE);
@@ -306,6 +367,92 @@ pub fn push_migrate(mut s: MigrateSample) {
     let mut q = ring.lock().unwrap();
     q.push_back(s);
     trim(&mut q, at, |m| m.at);
+}
+
+/// Record a pass that had nothing to move — at most one every [`MIX_EVERY`],
+/// so the panel tells a drain that is running and idle from one that stopped
+/// without a row for every empty pass.
+pub fn push_idle_migrate(total_ms: u64) {
+    let quiet = MIGRATES.get().is_none_or(|ring| {
+        ring.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .back()
+            .is_none_or(|m| m.at.elapsed() >= MIX_EVERY)
+    });
+    if quiet {
+        push_migrate(migrate_sample(0, 0, 0, 0, 0, total_ms));
+    }
+}
+
+/// Each substrate's latest census and when it was taken, by its tenant's rank.
+/// Every tenant's persistence thread takes its own, and the card holds
+/// them all: a sample is their sum, not whichever thread published last —
+/// which drew the larger tenant's KV dropping to the smaller's every other
+/// sample.
+static MIX_PARTS: OnceLock<Mutex<HashMap<usize, (Instant, Vec<(String, f64)>)>>> = OnceLock::new();
+
+/// Whether substrate `key` owes a census: it has taken none, or its last is
+/// [`MIX_EVERY`] old. Read before taking one, so the walk runs only on the
+/// passes that publish.
+pub fn mix_due(key: usize) -> bool {
+    let Some(parts) = MIX_PARTS.get() else {
+        return true;
+    };
+    let parts = parts.lock().unwrap_or_else(|e| e.into_inner());
+    parts
+        .get(&key)
+        .is_none_or(|(at, _)| at.elapsed() >= MIX_EVERY)
+}
+
+/// Record substrate `key`'s census (its persistence thread), and a sample of
+/// every substrate's latest, summed.
+pub fn push_mix(key: usize, rows: Vec<(String, f64)>) {
+    let at = Instant::now();
+    let parts = MIX_PARTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let summed = {
+        let mut parts = parts.lock().unwrap_or_else(|e| e.into_inner());
+        parts.insert(key, (at, rows));
+        sum_mixes(parts.values().map(|(_, r)| r.as_slice()))
+    };
+    let ring = MIXES.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut q = ring.lock().unwrap_or_else(|e| e.into_inner());
+    q.push_back(MixSample { at, rows: summed });
+    trim(&mut q, at, |m| m.at);
+}
+
+/// Censuses added format by format, most tokens first.
+fn sum_mixes<'a>(parts: impl Iterator<Item = &'a [(String, f64)]>) -> Vec<(String, f64)> {
+    let mut sum: Vec<(String, f64)> = Vec::new();
+    for rows in parts {
+        for (name, tokens) in rows {
+            match sum.iter_mut().find(|(n, _)| n == name) {
+                Some((_, t)) => *t += tokens,
+                None => sum.push((name.clone(), *tokens)),
+            }
+        }
+    }
+    sum.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    sum
+}
+
+/// A census flattened for JSON with `age_s` before now.
+pub struct MixSnapshot {
+    pub age_s: f64,
+    pub rows: Vec<(String, f64)>,
+}
+
+pub fn snapshot_mixes() -> Vec<MixSnapshot> {
+    let Some(ring) = MIXES.get() else {
+        return Vec::new();
+    };
+    let q = ring.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    q.iter()
+        .map(|m| MixSnapshot {
+            age_s: now.saturating_duration_since(m.at).as_secs_f64(),
+            rows: m.rows.clone(),
+        })
+        .collect()
 }
 
 /// A wave sample flattened for JSON with `age_s` before now.
@@ -358,10 +505,10 @@ pub fn snapshot_migrates() -> Vec<MigrateSnapshot> {
         .collect()
 }
 
-/// Constructor used by the scheduler — `at` is stamped in [`push_wave`]. `vram` is
-/// `(reserved, total, free)` MiB, `proj` is `(pdrain, drain_elevate, drain_glue,
-/// reproj, scan, reproj_glue, layout)` ms, `slots` is `(slots, decodes, prefills,
-/// sections)`.
+/// Constructor used by the scheduler — `at` is stamped in [`push_wave`]. `vram`
+/// is the card's bands, `proj` is `(pdrain, drain_elevate, drain_glue, reproj,
+/// scan, reproj_glue, layout)` ms, `slots` is `(slots, decodes, prefills,
+/// sections)`, `waves` is `(waves, wall_us, overhead_us)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wave_sample(
     ws_ms: u32,
@@ -370,13 +517,11 @@ pub(crate) fn wave_sample(
     budget_mib: u64,
     used_mib: u64,
     backlog: u64,
-    fmt: Option<(u32, u64, u64, u32, u64, u64)>,
-    vram: (u64, u64, u64, u64),
+    vram: VramBands,
     proj: (u64, u64, u64, u64, u64, u64, u64),
     slots: (u32, u32, u32, u32),
+    waves: (u64, u64, u64),
 ) -> WaveSample {
-    let (fa, fm, fl, qa, qm, ql) = fmt.unwrap_or((0, 0, 0, 0, 0, 0));
-    let (reserved_mib, total_mib, free_mib, weights_mib) = vram;
     let (
         pdrain_ms,
         drain_elevate_ms,
@@ -387,6 +532,7 @@ pub(crate) fn wave_sample(
         reproj_layout_ms,
     ) = proj;
     let (slots, decodes, prefills, sections) = slots;
+    let (waves, wave_wall_us, wave_overhead_us) = waves;
     WaveSample {
         at: Instant::now(),
         ws_ms,
@@ -395,16 +541,7 @@ pub(crate) fn wave_sample(
         budget_mib,
         used_mib,
         backlog,
-        float_arenas: fa,
-        float_mib: fm,
-        float_live_mib: fl,
-        quant_arenas: qa,
-        quant_mib: qm,
-        quant_live_mib: ql,
-        reserved_mib,
-        total_mib,
-        free_mib,
-        weights_mib,
+        vram,
         pdrain_ms,
         drain_elevate_ms,
         drain_glue_ms,
@@ -416,6 +553,9 @@ pub(crate) fn wave_sample(
         decodes,
         prefills,
         sections,
+        waves,
+        wave_wall_us,
+        wave_overhead_us,
     }
 }
 
@@ -521,19 +661,27 @@ mod tests {
             14000,
             58000,
             123,
-            Some((70, 1120, 1001, 467, 7472, 3360)),
-            (9000, 65536, 20000, 18500),
+            VramBands {
+                total: 65_536.0,
+                free: 20_000.0,
+                kv: 9_000.0,
+                ..VramBands::default()
+            },
             (12, 3, 4, 34, 5, 6, 7),
             (48, 8, 2, 40),
+            (9, 180_000, 27_000),
         ));
         let w = snapshot_waves();
         let s = &w.last().unwrap().sample;
+        assert_eq!(
+            (s.waves, s.wave_wall_us, s.wave_overhead_us),
+            (9, 180_000, 27_000)
+        );
         assert_eq!((s.ws_ms, s.fwd_ms, s.tok), (2000, 74, 96));
         assert_eq!((s.budget_mib, s.used_mib, s.backlog), (14000, 58000, 123));
-        assert_eq!((s.quant_arenas, s.quant_live_mib), (467, 3360));
         assert_eq!(
-            (s.reserved_mib, s.total_mib, s.free_mib),
-            (9000, 65536, 20000)
+            (s.vram.kv, s.vram.total, s.vram.free),
+            (9_000.0, 65_536.0, 20_000.0)
         );
         assert_eq!(
             (s.pdrain_ms, s.drain_elevate_ms, s.drain_glue_ms),
@@ -547,5 +695,31 @@ mod tests {
         let m = snapshot_migrates();
         let ms = &m.last().unwrap().sample;
         assert_eq!((ms.residences, ms.mib, ms.total_ms), (308, 2314, 77782));
+    }
+
+    /// A census just taken is not owed again by its substrate, and a sample is
+    /// every substrate's latest, summed — not the last one published.
+    #[test]
+    fn a_sample_sums_every_substrates_latest_census() {
+        let _ring = ring_guard();
+        push_mix(901, vec![("Q4_0".into(), 12.5), ("BF16".into(), 3.0)]);
+        assert!(!mix_due(901));
+        assert!(mix_due(902), "another substrate owes its own");
+        push_mix(902, vec![("BF16".into(), 4.0)]);
+        assert_eq!(
+            snapshot_mixes().last().unwrap().rows,
+            vec![("Q4_0".to_string(), 12.5), ("BF16".to_string(), 7.0)]
+        );
+    }
+
+    /// A pass with nothing to move is recorded only once the panel has been
+    /// quiet a while: straight after a recorded pass, it adds no row.
+    #[test]
+    fn an_empty_pass_right_after_a_recorded_one_adds_no_row() {
+        let _ring = ring_guard();
+        push_migrate(migrate_sample(1, 2, 3, 4, 5, 6));
+        let before = snapshot_migrates().len();
+        push_idle_migrate(7);
+        assert_eq!(snapshot_migrates().len(), before);
     }
 }

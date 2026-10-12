@@ -1,21 +1,17 @@
 //! What a build offers (§3.9): every binary built beside it that reports the
-//! same build — found by running each with `--build-info` — and its tenants'
-//! UI as one archive. Each is an [`Artifact`]: kind, platform, size and
-//! SHA-256, and the path it is served from.
+//! same build — found by running each with `--build-info`. Each binary carries
+//! its tenants' UI compiled in, so the binaries are the whole build. Each is an
+//! [`Artifact`]: kind, platform, size and SHA-256, and the path it is served
+//! from.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::sum::{file_sha256, sha256};
-use super::ui_archive::{pack, read};
+use super::sum::file_sha256;
 use crate::frame::{Artifact, BuildId};
 use crate::version::info::{BuildInfo, AGENT, BUILD_INFO_FLAG, NPCD, TOKERAD, ZEND};
-
-/// The UI archive's kind, and its platform: it runs anywhere.
-pub const UI_KIND: &str = "ui";
-pub const ANY_PLATFORM: &str = "any";
 
 /// Every binary a build produces, by kind.
 pub const KINDS: [&str; 4] = [ZEND, NPCD, TOKERAD, AGENT];
@@ -89,26 +85,6 @@ pub fn siblings(dir: &Path, build: &BuildId, probe: &dyn Probe) -> io::Result<Ve
     Ok(out)
 }
 
-/// Pack the UI directories `ui` — each `(name, path)` — into the archive at
-/// `to`, and its artifact.
-pub fn ui_artifact(ui: &[(String, PathBuf)], to: &Path) -> io::Result<Offered> {
-    let archive = pack(read(ui)?);
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(to, &archive)?;
-    Ok(Offered {
-        artifact: Artifact {
-            kind: UI_KIND.into(),
-            platform: ANY_PLATFORM.into(),
-            size: archive.len() as u64,
-            sha256: sha256(&archive),
-        },
-        path: to.to_path_buf(),
-        info: None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +93,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::upgrade::sum::sha256;
     use crate::version::info::Opens;
 
     /// Answers by file name, as a built directory's binaries would.
@@ -166,19 +143,5 @@ mod tests {
                 sha256: sha256(b"zend"),
             }
         );
-    }
-
-    #[test]
-    fn the_ui_is_one_archive_for_any_platform() {
-        let t = TempDir::new().unwrap();
-        fs::create_dir_all(t.path().join("zend/web")).unwrap();
-        fs::write(t.path().join("zend/web/i.html"), b"x").unwrap();
-        let to = t.path().join("up/ui.archive");
-        let o = ui_artifact(&[("zend/web".into(), t.path().join("zend/web"))], &to).unwrap();
-        assert_eq!(
-            (o.artifact.kind.as_str(), o.artifact.platform.as_str()),
-            (UI_KIND, ANY_PLATFORM)
-        );
-        assert_eq!(o.artifact.sha256, sha256(&fs::read(&to).unwrap()));
     }
 }

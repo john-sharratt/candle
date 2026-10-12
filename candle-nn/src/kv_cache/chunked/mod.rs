@@ -51,6 +51,7 @@ mod compress;
 mod compression_policy;
 pub(super) mod cpu_selection;
 pub mod fletcher_golden;
+mod format_census;
 mod fresh_arenas;
 mod gid_pool;
 #[cfg(feature = "cuda")]
@@ -93,6 +94,7 @@ mod release_watch;
 pub(crate) mod reservation;
 pub mod sampled_selection;
 pub mod seal_gather;
+mod selection_batches;
 mod sequence_ops;
 mod size_class;
 #[cfg(feature = "cuda")]
@@ -129,8 +131,8 @@ mod tests;
 // Re-export public types
 pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use backing::{
-    is_device_oom, is_tier_refusal, tier_refusal_shortfall, KV_DEVICE_OOM_MARKER,
-    TIER_REFUSED_MARKER, TIER_SHORT_BY,
+    is_device_oom, is_tier_refusal, is_tier_standing_over_free, tier_refusal_shortfall,
+    KV_DEVICE_OOM_MARKER, TIER_REFUSED_MARKER, TIER_SHORT_BY, TIER_STANDS_OVER_FREE,
 };
 pub use backing::{ChunkedKvBacking, DecodeGpuChunkSyncStats};
 pub use chunk_ops::BlockAllocSpec;
@@ -157,6 +159,7 @@ pub use compression_policy::{
     QWEN35_MOE_KV_FACTORS, QWEN36_MOE_KV_FACTORS, QWEN38_KV_FACTORS, QWEN3_8B_KV_FACTORS,
     QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS, QWEN4EXP_Q2KO_KV_FACTORS,
 };
+pub use format_census::FormatCensus;
 pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
 pub use gpu_chunks::ChunkPin;
 pub use head_gids::HeadGids;
@@ -204,9 +207,9 @@ pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
     forget_last_tier, freeze_dense, held_ground_sites, held_ground_stats, initial_weight_bytes,
     kv_spare_regions, reclaim_empty_arenas, reclaim_load_headroom, region_stats, set_ground_broker,
-    set_kv_free_target, set_weight_floor, span_end, span_layout, span_region_refusal, spare_tally,
-    weight_capacity_bytes, weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanRegion,
-    REGION_BYTES,
+    set_kv_free_target, set_weight_floor, span_end, span_layout, span_partition,
+    span_region_refusal, spare_tally, weight_capacity_bytes, weight_floor_after, RegionStats,
+    SpanClaims, SpanLayout, SpanPartition, SpanRegion, REGION_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;

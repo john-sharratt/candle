@@ -30,6 +30,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use candle::Device;
+use candle_transformers::models::load_phase::LoadProgress;
 
 use crate::engine::{ConversationEngine, EngineAttacher};
 use crate::error::ConversationError;
@@ -43,8 +44,8 @@ pub struct EngineSlot {
 }
 
 impl EngineSlot {
-    /// A slot for `expected` tenants.
-    pub fn new(expected: usize) -> Arc<Self> {
+    /// A slot for the tenants named `expected`.
+    pub fn new(expected: &[&'static str]) -> Arc<Self> {
         Arc::new(Self {
             rendezvous: Rendezvous::new(expected),
         })
@@ -91,7 +92,7 @@ impl EngineSource {
     /// A source of its own, for a tenant run alone — a daemon's own binary,
     /// or a test.
     pub fn solo(name: &'static str, requires: Capabilities) -> Self {
-        EngineSlot::new(1).source(TenantRank::FIRST, name, requires)
+        EngineSlot::new(&[name]).source(TenantRank::FIRST, name, requires)
     }
 
     /// The rank this tenant runs at.
@@ -132,11 +133,16 @@ impl EngineTicket {
     /// substrate, bound and attached to the engine that one built. Blocks until
     /// the engine exists. Refused, naming the tenant, when the model lacks a
     /// capability the tenant needs.
+    ///
+    /// `waiting` is told the other tenants this one waits for before the
+    /// engine can be built, and told none once it can — what its loading
+    /// screen shows meanwhile.
     pub fn engine_with_progress(
         mut self,
         builder: &mut ModelBuilder,
         device: &Device,
-        progress: Option<&dyn Fn(usize, usize)>,
+        progress: Option<LoadProgress<'_>>,
+        waiting: &dyn Fn(&[&'static str]),
     ) -> crate::Result<ConversationEngine> {
         self.used = true;
         let source = self.source.clone();
@@ -148,6 +154,7 @@ impl EngineTicket {
             source.rank,
             source.name,
             requests,
+            waiting,
             |merged| {
                 let mut b = builder_cell.borrow_mut();
                 b.apply_core_requests(merged);
@@ -177,7 +184,7 @@ impl Drop for EngineTicket {
         if self.used {
             return;
         }
-        self.source.slot.rendezvous.withdraw();
+        self.source.slot.rendezvous.withdraw(self.source.name);
         tracing::warn!(
             tenant = self.source.name,
             "withdrew from the shared engine before arriving; the others build without it"

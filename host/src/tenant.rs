@@ -13,6 +13,7 @@ use std::sync::Arc;
 use candle_conversation::projection::Conversation;
 use candle_conversation::{Capabilities, EngineSource};
 use futures::future::BoxFuture;
+use include_dir::Dir;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use web::auth::session::Identity;
@@ -22,6 +23,7 @@ use crate::cluster::Join;
 use crate::guard::Routes;
 use crate::loading::LoadingView;
 use crate::logs::LogBus;
+use crate::starting::StartLine;
 use crate::stopping::Stopping;
 use crate::telemetry::Telemetry;
 
@@ -68,6 +70,9 @@ pub struct TenantContext {
     /// something it read once, at start, and now holds anew — npcd's mind
     /// fetched through an agent (`docs/replicated_substrate.md` §10.3).
     pub stopping: Arc<Stopping>,
+    /// Where the tenant says what it is doing until [`Tenant::start`]
+    /// returns — what the loading page shows of it meanwhile (`crate::boot`).
+    pub starting: Arc<StartLine>,
 }
 
 /// How a started tenant is drained: stop its background work, flush and detach
@@ -86,13 +91,12 @@ pub struct Running {
 }
 
 /// A tenant's web UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TenantUi {
     /// The names that reach it: `code.tokera.com`, `zend.localhost`.
     pub hosts: Vec<String>,
-    /// Its directory on disk, read per request — saving a file is the
-    /// deployment.
-    pub content: PathBuf,
+    /// Its pages, compiled into the tenant's crate (`ui`).
+    pub content: &'static Dir<'static>,
     /// Whether it serves a request whose `Host` names no tenant — a bare IP.
     pub default: bool,
 }

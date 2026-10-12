@@ -109,6 +109,8 @@ pub mod llama;
 pub mod llama2_c;
 pub mod llama2_c_weights;
 pub mod llava;
+/// What a model load reports while it runs: its phase, and how far through.
+pub mod load_phase;
 pub mod lora;
 pub mod mamba;
 pub mod marian;

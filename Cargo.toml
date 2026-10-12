@@ -6,6 +6,7 @@ members = [
     "cluster",
     "cluster-dial",
     "candle-core",
+    "embed-watch",
     "zend",
     "candle-datasets",
     "candle-examples",

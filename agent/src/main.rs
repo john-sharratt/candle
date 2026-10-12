@@ -75,8 +75,6 @@ async fn main() -> anyhow::Result<()> {
     let setup = Setup {
         info: BuildInfo::of(AGENT, Opens::default()),
         exe: launch.exe.clone(),
-        root: launch.cwd.clone(),
-        ui: Vec::new(),
         upgrade_dir: cfg.jobs_dir.join(UPGRADE_DIR),
         keep_builds: args.keep_builds,
         failed_from: args.upgrade_failed.clone(),

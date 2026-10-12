@@ -103,7 +103,8 @@ pub use chunked::{
 #[cfg(feature = "cuda")]
 pub use chunked::{
     empty_sweep_stats, forget_last_tier, held_ground_sites, held_ground_stats,
-    reclaim_empty_arenas, region_stats, spare_tally, RegionStats, REGION_BYTES,
+    reclaim_empty_arenas, region_stats, span_partition, spare_tally, RegionStats, SpanPartition,
+    REGION_BYTES,
 };
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]
@@ -159,8 +160,8 @@ pub use chunked::{
 };
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{
-    is_device_oom, is_tier_refusal, tier_refusal_shortfall, KV_DEVICE_OOM_MARKER,
-    TIER_REFUSED_MARKER, TIER_SHORT_BY,
+    is_device_oom, is_tier_refusal, is_tier_standing_over_free, tier_refusal_shortfall,
+    KV_DEVICE_OOM_MARKER, TIER_REFUSED_MARKER, TIER_SHORT_BY, TIER_STANDS_OVER_FREE,
 };
 pub use chunked::{
     production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta, ChunkPin,
@@ -172,7 +173,7 @@ pub use chunked::{
     QWEN3_8B_KV_FACTORS, QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS, QWEN4EXP_Q2KO_KV_FACTORS,
 };
 pub use chunked::{rewrite_sealed, CompactionMap, Sweep};
-pub use chunked::{ArenaKey, StoragePolicy};
+pub use chunked::{ArenaKey, FormatCensus, StoragePolicy};
 pub use chunked::{
     DetachedChunks, LiveChunkRef, MetaGid, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE,
 };

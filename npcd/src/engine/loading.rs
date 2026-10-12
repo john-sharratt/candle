@@ -155,12 +155,19 @@ pub struct LoadingSnapshot {
     /// tokens have been counted, so the console shows nothing rather than a
     /// zero that reads as a stalled engine.
     pub prefill_tps: Option<f64>,
+    /// The other tenants of the process this load is waiting for before the
+    /// shared engine can be built — the last line of the overlay while any
+    /// remain.
+    pub waiting_for: Vec<&'static str>,
 }
 
 /// Shared, mutable load progress. A `None` snapshot means ready — the console
 /// drops the overlay and shows the app.
 pub struct LoadProgress {
     inner: Mutex<Inner>,
+    /// See [`LoadingSnapshot::waiting_for`]. Apart from the step state: the
+    /// wait sits inside the model step and does not reset with a step.
+    waiting_for: Mutex<Vec<&'static str>>,
 }
 
 enum Inner {
@@ -196,7 +203,13 @@ impl LoadProgress {
                 started: Instant::now(),
                 prefill_tokens: 0,
             }),
+            waiting_for: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The tenants this load is waiting for now; empty once it is not.
+    pub fn set_waiting_for(&self, tenants: &[&'static str]) {
+        *self.waiting_for.lock().unwrap() = tenants.to_vec();
     }
 
     /// Enter a phase. Resets the counter and the detail line, because a count
@@ -315,6 +328,7 @@ impl LoadProgress {
             // is "the engine has stalled" against "nothing has reported yet".
             prefill_tps: (*prefill_tokens > 0 && elapsed > 0.0)
                 .then(|| *prefill_tokens as f64 / elapsed),
+            waiting_for: self.waiting_for.lock().unwrap().clone(),
         })
     }
 }

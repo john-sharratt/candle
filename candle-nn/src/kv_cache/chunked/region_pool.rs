@@ -508,6 +508,10 @@ struct RegionPool {
     /// prefill chunk is the next chunk, a little deeper, and its tier stands on the
     /// same ground (see [`Occupancy::last_tier_bytes`]).
     last_tier_bytes: usize,
+    /// The largest tier placed since [`span_partition`] last read it — the
+    /// wave's activation ground, which a reading taken between forwards would
+    /// otherwise always see as zero.
+    tier_peak: usize,
     /// Bytes of the fixed left block carved so far: the held ground, then the
     /// persistence staging.
     persist_carved: usize,
@@ -1068,6 +1072,7 @@ impl RegionPool {
             transient_bytes: 0,
             transient_high_water: 0,
             last_tier_bytes: 0,
+            tier_peak: 0,
             persist_carved: HELD_GROUND_BYTES,
             fresh_claims_during_wave: 0,
             refusals_during_wave: 0,
@@ -2038,6 +2043,7 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
         // Survives the release, so the between-forwards demand reading still
         // knows a tier of this size is about to want its ground back.
         pool.transient_high_water = pool.transient_high_water.max(len);
+        pool.tier_peak = pool.tier_peak.max(len);
         pool.last_tier_bytes = len;
         Ok(Placed::At(base))
     })
@@ -3051,6 +3057,146 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
         granularity: pool.reservation.granularity(),
         pre_reservation_in_use_bytes: pool.pre_reservation_in_use,
     })
+}
+
+/// The span cut by what holds each byte, at one moment — every band in bytes,
+/// summing to the span exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpanPartition {
+    /// The held ground: launch tables, resident headers and partials that
+    /// outlive every forward. Fixed at reservation.
+    pub held_ground: usize,
+    /// The persistence staging block beside it. Fixed at reservation.
+    pub persist_staging: usize,
+    /// The model's dense weights.
+    pub dense: usize,
+    /// The dense block's rounding up to a whole region.
+    pub dense_padding: usize,
+    /// Regions held by KV arenas.
+    pub kv: usize,
+    /// Regions held by span tenants — recurrent state, the provenance
+    /// gallery, index caches, rewind stashes.
+    pub tenants: usize,
+    /// The largest wave transient tier placed since the last reading: the
+    /// activations of the widest forward. It stands on regions nobody holds, so
+    /// it is carved out of them rather than added beside them.
+    pub transient: usize,
+    /// Regions nobody holds, less the tier's peak.
+    pub regions_free: usize,
+    /// The tail of the region range too short for a region.
+    pub slack: usize,
+    /// The weight side's ground, `[weight_floor, span_end)`.
+    pub weight_zone: usize,
+}
+
+impl SpanPartition {
+    /// Every band added up — the span, by construction.
+    pub fn sum(&self) -> usize {
+        self.held_ground
+            + self.persist_staging
+            + self.dense
+            + self.dense_padding
+            + self.kv
+            + self.tenants
+            + self.transient
+            + self.regions_free
+            + self.slack
+            + self.weight_zone
+    }
+}
+
+/// [`SpanPartition`] of a span of `span_bytes` holding `dense_bytes` of dense
+/// weights, its weight side from `weight_floor_offset` bytes into it, `live`
+/// of whose regions are held — `span_live` of them by span tenants — and whose
+/// widest tier since the last reading was `tier_peak` bytes.
+fn partition(
+    span_bytes: usize,
+    dense_bytes: usize,
+    weight_floor_offset: usize,
+    live: usize,
+    span_live: usize,
+    tier_peak: usize,
+) -> SpanPartition {
+    let l = layout_span(0, span_bytes, dense_bytes, weight_floor_offset as u64);
+    let regions = l.total * REGION_BYTES;
+    let held = live.min(l.total) * REGION_BYTES;
+    let kv = live.saturating_sub(span_live).min(l.total) * REGION_BYTES;
+    let unheld = regions - held;
+    let transient = tier_peak.min(unheld);
+    SpanPartition {
+        held_ground: HELD_GROUND_BYTES,
+        persist_staging: PERSIST_SPAN_BYTES - HELD_GROUND_BYTES,
+        dense: dense_bytes,
+        dense_padding: (l.region_base - l.dense_base) as usize - dense_bytes,
+        kv,
+        tenants: held - kv,
+        transient,
+        regions_free: unheld - transient,
+        slack: l.slack,
+        weight_zone: span_bytes - l.weight_floor as usize,
+    }
+}
+
+/// The span on device `ordinal`, cut by what holds each byte — see
+/// [`SpanPartition`]. Reading it restarts the tier's peak, so each reading
+/// covers the forwards since the one before.
+pub fn span_partition(ordinal: usize) -> Option<SpanPartition> {
+    let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    let pool = map.get_mut(&ordinal)?;
+    let peak = std::mem::replace(&mut pool.tier_peak, pool.transient_bytes);
+    Some(partition(
+        pool.span_bytes,
+        pool.dense_bytes,
+        (pool.weight_floor - pool.span_base) as usize,
+        pool.live,
+        pool.span_live,
+        peak.max(pool.transient_bytes),
+    ))
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::{partition, SpanPartition, HELD_GROUND_BYTES, PERSIST_SPAN_BYTES, REGION_BYTES};
+
+    const R: usize = REGION_BYTES;
+
+    /// **Every byte of the span is in exactly one band.** A span of the fixed
+    /// block, a dense block of two and a half regions, forty regions and a
+    /// half-region tail, then eight regions of weight zone: ten regions held by
+    /// KV, three by span tenants, a tier of four and a half regions at its peak.
+    #[test]
+    fn the_bands_sum_to_the_span() {
+        let dense = 2 * R + R / 2;
+        let span = PERSIST_SPAN_BYTES + 3 * R + 40 * R + R / 2 + 8 * R;
+        let floor = span - 8 * R;
+        let p = partition(span, dense, floor, 13, 3, 4 * R + R / 2);
+        assert_eq!(
+            p,
+            SpanPartition {
+                held_ground: HELD_GROUND_BYTES,
+                persist_staging: PERSIST_SPAN_BYTES - HELD_GROUND_BYTES,
+                dense,
+                dense_padding: R / 2,
+                kv: 10 * R,
+                tenants: 3 * R,
+                transient: 4 * R + R / 2,
+                regions_free: 27 * R - (4 * R + R / 2),
+                slack: R / 2,
+                weight_zone: 8 * R,
+            }
+        );
+        assert_eq!(p.sum(), span);
+    }
+
+    /// A tier can only stand on unheld ground, so a peak larger than that is
+    /// read as all of it, and the bands still close.
+    #[test]
+    fn a_tier_never_reads_wider_than_the_free_ground() {
+        let span = PERSIST_SPAN_BYTES + 6 * R;
+        let p = partition(span, 0, span, 4, 0, 10 * R);
+        assert_eq!((p.kv, p.transient, p.regions_free), (4 * R, 2 * R, 0));
+        assert_eq!(p.sum(), span);
+    }
 }
 
 #[cfg(test)]

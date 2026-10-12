@@ -2,8 +2,12 @@
 //!
 //! The daemon's startup walks through a fixed sequence of phases:
 //!
-//! 1. **Model** — fetch and load the GGUF weights.
-//! 2. **Substrate** — replay the redo log into the in-RAM substrate.
+//! 1. **Pack** — find the model pack, downloading or preparing it if absent,
+//!    then wait for the process's other tenants to arrive at the shared engine.
+//! 2. **Opening** — open the substrate; a store written before identities is
+//!    stamped here, once, and that is minutes on a large one.
+//! 3. **Model** — load the weights onto the card.
+//! 4. **Substrate** — replay the redo log into the in-RAM substrate.
 //! 3. **Connecting** — with `--cluster`, join the gateways.
 //! 4. **Catch-up** — with a cluster reached, fetch what the group wrote while
 //!    this member was away.
@@ -28,6 +32,13 @@ use std::time::Instant;
 /// Phases of daemon startup, in the order they execute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadStep {
+    /// The model pack found — downloaded or prepared if absent — and the other
+    /// tenants of the process arrived at the shared engine.
+    Pack,
+    /// The substrate opened, and stamped with identities if it was written
+    /// before them. Separate from the model so a minutes-long stamping reads
+    /// as itself, with its records counted, and not as a model stuck at 0%.
+    Opening,
     Model,
     Substrate,
     /// Forced whole-store redo-log compaction (`--compact-substrate`). Skipped
@@ -70,6 +81,8 @@ impl LoadStep {
     /// Canonical ordering of all steps — used to derive the "completed"
     /// list from the current step (everything before it is done).
     pub const ALL: &'static [LoadStep] = &[
+        LoadStep::Pack,
+        LoadStep::Opening,
         LoadStep::Model,
         LoadStep::Substrate,
         LoadStep::Compacting,
@@ -86,6 +99,8 @@ impl LoadStep {
     /// The step's id on the wire — what a page keys on.
     pub fn id(self) -> &'static str {
         match self {
+            LoadStep::Pack => "pack",
+            LoadStep::Opening => "opening",
             LoadStep::Model => "model",
             LoadStep::Substrate => "substrate",
             LoadStep::Compacting => "compacting",
@@ -103,6 +118,8 @@ impl LoadStep {
     /// Human-readable label rendered in the loading overlay.
     pub fn label(self) -> &'static str {
         match self {
+            LoadStep::Pack => "Finding the model pack",
+            LoadStep::Opening => "Opening the substrate",
             LoadStep::Model => "Loading model",
             LoadStep::Substrate => "Loading substrate",
             LoadStep::Compacting => "Compacting substrate",
@@ -130,6 +147,10 @@ impl LoadStep {
             // load's wall time), a dense one reports transformer blocks mounted.
             // One static noun cannot name both, so only the bar shows.
             LoadStep::Model => "",
+            LoadStep::Pack => "",
+            // Records rewritten while a store is stamped; nothing counts while
+            // it is only read, and the bar then shows nothing.
+            LoadStep::Opening => "records",
             LoadStep::Substrate => "turns",
             LoadStep::Compacting => "",
             LoadStep::Connecting => "clusters",
@@ -163,6 +184,10 @@ pub struct LoadingSnapshot {
     pub elapsed_ms: u64,
     /// Tokens prefilled during the current step.
     pub prefill_tokens: u64,
+    /// The other tenants of the process this load is waiting for before the
+    /// shared engine can be built — the last line of the overlay while any
+    /// remain.
+    pub waiting_for: Vec<&'static str>,
 }
 
 /// Shared, mutable load-progress state. `None`-snapshot means the daemon
@@ -171,6 +196,9 @@ pub struct LoadProgress {
     inner: Mutex<Inner>,
     /// When the load began.
     began: Instant,
+    /// See [`LoadingSnapshot::waiting_for`]. Apart from the step state: the
+    /// wait sits inside the model step and does not reset with a step.
+    waiting_for: Mutex<Vec<&'static str>>,
 }
 
 enum Inner {
@@ -208,7 +236,7 @@ impl LoadProgress {
     /// model-load lifecycle. Use [`Self::silent`] for throwaway progress sinks
     /// that report sub-progress but are not that lifecycle.
     pub fn new() -> Self {
-        tracing::info!(step = LoadStep::Model.label(), "load step started");
+        tracing::info!(step = LoadStep::Pack.label(), "load step started");
         Self::silent()
     }
 
@@ -220,15 +248,24 @@ impl LoadProgress {
     pub fn silent() -> Self {
         Self {
             inner: Mutex::new(Inner::Loading {
-                current: LoadStep::Model,
+                current: LoadStep::Pack,
                 progressed: 0,
                 total: 0,
-                unit: LoadStep::Model.unit().to_string(),
+                unit: LoadStep::Pack.unit().to_string(),
                 prefill_tokens: 0,
                 started: Instant::now(),
             }),
             began: Instant::now(),
+            waiting_for: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The tenants this load is waiting for now; empty once it is not.
+    pub fn set_waiting_for(&self, tenants: &[&'static str]) {
+        if !tenants.is_empty() {
+            tracing::info!(tenants = ?tenants, "waiting for the other tenants to arrive");
+        }
+        *self.waiting_for.lock().unwrap() = tenants.to_vec();
     }
 
     /// Take a snapshot. `None` once [`Self::mark_ready`] has been called.
@@ -261,8 +298,17 @@ impl LoadProgress {
                     unit: unit.clone(),
                     elapsed_ms: self.began.elapsed().as_millis() as u64,
                     prefill_tokens: *prefill_tokens,
+                    waiting_for: self.waiting_for.lock().unwrap().clone(),
                 })
             }
+            Inner::Ready => None,
+        }
+    }
+
+    /// The step in progress, or `None` once ready.
+    pub fn current_step(&self) -> Option<LoadStep> {
+        match &*self.inner.lock().unwrap() {
+            Inner::Loading { current, .. } => Some(*current),
             Inner::Ready => None,
         }
     }
@@ -327,6 +373,18 @@ impl LoadProgress {
         {
             *progressed = current.min(total);
             *t = total;
+        }
+    }
+
+    /// Name what the current step's counters count, where it changes within
+    /// the step — the substrate open counts MiB while it reads and records
+    /// while it rewrites. [`Self::set_step`] resets it to the step's own unit.
+    pub fn set_step_unit(&self, unit: &str) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Inner::Loading { unit: u, .. } = &mut *guard {
+            if u != unit {
+                *u = unit.to_string();
+            }
         }
     }
 
@@ -397,22 +455,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_starts_at_model_step_with_zero_progress() {
+    fn new_starts_at_the_pack_step_with_zero_progress() {
         let p = LoadProgress::new();
         let snap = p.snapshot().unwrap();
-        assert_eq!(snap.current, LoadStep::Model);
+        assert_eq!(snap.current, LoadStep::Pack);
         assert_eq!(snap.progress, 0.0);
         assert!(snap.completed.is_empty());
     }
 
     /// `silent()` has the same initial state as `new()` (it only differs by not
     /// emitting the "load step started" log — the property that keeps an
-    /// ingest refresh from spuriously logging "Loading model").
+    /// ingest refresh from spuriously logging a load step).
     #[test]
-    fn silent_starts_at_model_step_like_new() {
+    fn silent_starts_at_the_pack_step_like_new() {
         let p = LoadProgress::silent();
         let snap = p.snapshot().unwrap();
-        assert_eq!(snap.current, LoadStep::Model);
+        assert_eq!(snap.current, LoadStep::Pack);
         assert_eq!(snap.progress, 0.0);
         assert!(snap.completed.is_empty());
     }
@@ -426,6 +484,8 @@ mod tests {
         assert_eq!(
             snap.completed,
             vec![
+                LoadStep::Pack,
+                LoadStep::Opening,
                 LoadStep::Model,
                 LoadStep::Substrate,
                 LoadStep::Compacting,
@@ -472,6 +532,7 @@ mod tests {
     #[test]
     fn snapshot_exposes_absolute_counts_and_the_model_step_has_no_unit() {
         let p = LoadProgress::new();
+        p.set_step(LoadStep::Model);
         p.set_step_progress(3, 12);
         let snap = p.snapshot().unwrap();
         assert_eq!(snap.progressed, 3);
@@ -501,6 +562,49 @@ mod tests {
         assert_eq!(p.snapshot().unwrap().prefill_tokens, 0);
     }
 
+    /// Whom the load waits for is reported until it is told nobody, and a
+    /// step change does not clear it — the wait is inside the model step.
+    #[test]
+    fn the_wait_for_another_tenant_is_reported_until_it_ends() {
+        let p = LoadProgress::silent();
+        assert!(p.snapshot().unwrap().waiting_for.is_empty());
+        p.set_waiting_for(&["npcd"]);
+        assert_eq!(p.snapshot().unwrap().waiting_for, vec!["npcd"]);
+        p.set_step(LoadStep::Substrate);
+        assert_eq!(p.snapshot().unwrap().waiting_for, vec!["npcd"]);
+        p.set_waiting_for(&[]);
+        assert!(p.snapshot().unwrap().waiting_for.is_empty());
+    }
+
+    /// **The substrate's stamping is its own step, with its records counted**,
+    /// between the pack and the weights — the order they run in. A store
+    /// stamped on open reads as that, not as a model sitting at 0%.
+    #[test]
+    fn opening_the_substrate_is_a_counted_step_before_the_weights() {
+        let pos = |s: LoadStep| LoadStep::ALL.iter().position(|x| *x == s).unwrap();
+        assert!(pos(LoadStep::Pack) < pos(LoadStep::Opening));
+        assert!(pos(LoadStep::Opening) < pos(LoadStep::Model));
+        let p = LoadProgress::silent();
+        p.set_step(LoadStep::Opening);
+        p.set_step_progress(250, 1_000);
+        let snap = p.snapshot().unwrap();
+        assert_eq!((snap.progressed, snap.total), (250, 1_000));
+        assert_eq!(snap.unit, "records");
+        assert_eq!(snap.completed, vec![LoadStep::Pack]);
+    }
+
+    /// A step's unit can change within it, and a new step brings its own.
+    #[test]
+    fn a_step_unit_changes_within_the_step_and_resets_with_the_next() {
+        let p = LoadProgress::silent();
+        p.set_step(LoadStep::Opening);
+        p.set_step_unit("MiB");
+        p.set_step_progress(40, 900);
+        assert_eq!(p.snapshot().unwrap().unit, "MiB");
+        p.set_step(LoadStep::Substrate);
+        assert_eq!(p.snapshot().unwrap().unit, "turns");
+    }
+
     /// Every step has its own id, in the snake case a page keys on.
     #[test]
     fn every_step_has_a_distinct_id() {
@@ -508,6 +612,8 @@ mod tests {
         assert_eq!(
             ids,
             [
+                "pack",
+                "opening",
                 "model",
                 "substrate",
                 "compacting",

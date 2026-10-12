@@ -64,6 +64,10 @@ use super::meta_pool::ChunkRecordSrc;
 #[cfg(feature = "cuda")]
 use super::sampled_selection::{PagedSelectionGpuInputs, SampleFormat};
 #[cfg(feature = "cuda")]
+use super::selection_batches::{
+    selection_batches, selection_bytes, slice_layers, SELECTION_BUDGET_BYTES,
+};
+#[cfg(feature = "cuda")]
 use super::types::{SealedChunk, SealedSequence, CHUNK_SIZE};
 #[cfg(feature = "cuda")]
 use crate::kv_cache::arena_table::{ArenaFormatTag, ArenaLocation, N_PALETTE};
@@ -275,6 +279,37 @@ pub fn quantize_layers_deferred(
     select_ms: &mut u64,
     alloc_ms: &mut u64,
 ) -> Result<Vec<Vec<SealedSequence>>> {
+    quantize_layers_deferred_within(
+        backings,
+        per_layer_seqs,
+        policy,
+        device,
+        copy_stream,
+        pinned_scratch,
+        descs_acc,
+        select_ms,
+        alloc_ms,
+        SELECTION_BUDGET_BYTES,
+    )
+}
+
+/// [`quantize_layers_deferred`], each selection run cut to carve at most
+/// `selection_budget` bytes — the persistence domain's room in production, and
+/// whatever a test wants to force many runs.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantize_layers_deferred_within(
+    backings: &[&ChunkedKvBacking],
+    per_layer_seqs: &[Vec<&SealedSequence>],
+    policy: &CompressionPolicy,
+    device: &Device,
+    copy_stream: &Arc<CudaStream>,
+    pinned_scratch: &mut Option<PinnedBuf>,
+    descs_acc: &mut Vec<PalHeadDesc>,
+    select_ms: &mut u64,
+    alloc_ms: &mut u64,
+    selection_budget: usize,
+) -> Result<Vec<Vec<SealedSequence>>> {
     if backings.len() != per_layer_seqs.len() {
         candle::bail!("quantize_layers_deferred: backings/seqs length mismatch");
     }
@@ -345,27 +380,51 @@ pub fn quantize_layers_deferred(
     let v_hi = PRODUCTION_V_QREL_HIGH_THRESHOLDS[ti] * policy.v_hi_error_threshold_factor;
     let v_lo = PRODUCTION_V_QREL_LOW_THRESHOLDS[ti] * policy.v_low_error_threshold_factor;
 
-    // ── ONE selection across every layer's chunks ──────────────────────
+    // ── One fused selection per batch of chunks, across every layer ─────
+    //
+    // The selection carves its tables and its result block from the
+    // persistence domain, which is `MIGRATION_STAGING_CAP_BYTES` wide. A group
+    // of ingest documents is tens of thousands of chunks across the layers —
+    // a quarter of a gigabyte of block — so one selection over all of it is
+    // refused, every pass, and nothing ever leaves the GPU. So the flat
+    // layer-major chunk list is cut into the longest runs that fit, each run
+    // selected on its own. Chunks never interact across the selection, so the
+    // concatenated results are the ones a single selection would return.
     let t_sel = std::time::Instant::now();
+    let chunk_counts: Vec<usize> = chunk_gids_per_layer.iter().map(Vec::len).collect();
+    let (n_k, n_v) = (k_candidates.len(), v_candidates.len());
+    let batches = selection_batches(total_jobs, selection_budget, |c| {
+        selection_bytes(c, n_kv_head, head_dim, n_k, n_v)
+    })?;
+    let (mut k_rows, mut v_rows) = (Vec::new(), Vec::new());
+    let (mut k_scale_rows, mut v_scale_rows) = (Vec::new(), Vec::new());
+    let (mut k_assign, mut v_assign) = (Vec::new(), Vec::new());
     let stager = backings[0].begin_stager_generation_required();
-    let (gpu_inputs, chunk_counts) = PagedSelectionGpuInputs::from_head_gids_multi(
-        &backings_inner,
-        &chunk_gids_per_layer,
-        Some(&stager),
-        cuda_dev,
-    )?;
-    let (k_rows, v_rows, k_scale_rows, v_scale_rows, k_assign, v_assign, _ka, _va) = gpu_inputs
-        .select_palette4_formats_fused(
+    for (start, len) in batches {
+        let batch_gids = slice_layers(&chunk_gids_per_layer, start, len);
+        let (gpu_inputs, _) = PagedSelectionGpuInputs::from_head_gids_multi(
+            &backings_inner,
+            &batch_gids,
+            Some(&stager),
+            cuda_dev,
+        )?;
+        let (kr, vr, ks, vs, ka, va, _, _) = gpu_inputs.select_palette4_formats_fused(
             &k_candidates,
             &v_candidates,
             k_hi,
             k_lo,
             v_hi,
             v_lo,
-            Some(&unified_valid_ranges),
+            Some(&unified_valid_ranges[start..start + len]),
             Some(&stager),
         )?;
-    drop(gpu_inputs);
+        k_rows.extend(kr);
+        v_rows.extend(vr);
+        k_scale_rows.extend(ks);
+        v_scale_rows.extend(vs);
+        k_assign.extend(ka);
+        v_assign.extend(va);
+    }
     drop(stager);
     *select_ms += t_sel.elapsed().as_millis() as u64;
 

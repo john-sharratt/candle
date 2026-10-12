@@ -61,6 +61,7 @@
      and every module the shell imports must be here. -->
 <link rel="modulepreload" href="/lib/api.js">
 <link rel="modulepreload" href="/lib/api.live.js">
+<link rel="modulepreload" href="/common/lib/aggregate.js">
 <link rel="modulepreload" href="/common/lib/ws.js">
 <link rel="modulepreload" href="/common/lib/router.js">
 <link rel="modulepreload" href="/common/lib/dom.js">
@@ -101,6 +102,9 @@
       <div class="boot-bar"><div class="boot-bar-fill" id="boot-bar"></div></div>
       <div class="tiny dim" id="boot-count"></div>
       <ol class="boot-steps" id="boot-steps">
+        <!-- Before npcd's own load: the host reports it while npcd starts. A
+             store written before identities is rewritten here, once. -->
+        <li data-step="opening">Opening the substrate</li>
         <li data-step="model">Loading model</li>
         <li data-step="substrate">Replaying substrate</li>
         <!-- A cluster member's; a standalone daemon passes it at once. -->
@@ -111,6 +115,7 @@
         <li data-step="tools">Installing tools</li>
         <li data-step="layers">Ingesting mind layers</li>
         <li data-step="waking">Waking the cast</li>
+        <li id="boot-wait" class="wait" hidden></li>
       </ol>
     </div>
   </div>

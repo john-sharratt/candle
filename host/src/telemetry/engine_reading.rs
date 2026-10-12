@@ -67,8 +67,8 @@ pub fn engine_now(window_s: f64) -> Option<Engine> {
         .into_iter()
         .min_by(|a, b| a.age_s.total_cmp(&b.age_s))
         .map(|w| WaveMemory {
-            kv_mib: w.sample.quant_mib + w.sample.float_mib,
-            weights_mib: w.sample.weights_mib,
+            kv_mib: w.sample.vram.kv as u64,
+            weights_mib: (w.sample.vram.dense + w.sample.vram.experts) as u64,
         });
     engine_reading(&phases, newest, window_s)
 }

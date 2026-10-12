@@ -24,6 +24,8 @@ futures    = { workspace = true }
 axum       = { version = "0.7", features = ["macros", "ws"] }
 tokio      = { version = "1", features = ["full"] }
 sha2       = "0.10"
+# The shared front-end, compiled in (`ui::COMMON`).
+include_dir = { version = "0.7" }
 # The model download (`download`).
 reqwest    = { version = "0.12", features = ["stream"] }
 # `disk`: the substrate's volume, for fault mode (`docs/replicated_substrate.md` §7.7).
@@ -56,6 +58,9 @@ tower               = { version = "0.5" }
 http-body-util      = "0.1"
 candle              = { workspace = true, features = ["cuda"] }
 candle-conversation = { path = "../candle-conversation", features = ["hub"] }
+
+[build-dependencies]
+embed-watch = { path = "../embed-watch" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

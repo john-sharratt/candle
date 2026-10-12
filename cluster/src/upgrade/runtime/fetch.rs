@@ -1,17 +1,17 @@
 //! Fetching a build, and serving one (§3.9).
 //!
-//! **Fetching.** A member fetches the artifacts of the build it would install
-//! — or of the newest build offered above its own — that it needs: its own
-//! binary, by kind and platform, and the UI archive when it serves a UI. One
-//! artifact at a time, one chunk at a time: `BUILD_FETCH` asks for the next
-//! up to 1 MiB at the part file's length, and the gateway picks a holder for it
-//! (`from_node` 0), so later fetches spread across every holder. A chunk that
-//! does not come within [`CHUNK_WAIT`] is asked for again — a resume from the
-//! part file, from whichever holder the gateway picks now. A finished artifact
-//! verifies or starts over.
+//! **Fetching.** A member fetches the one artifact of the build it would
+//! install — or of the newest build offered above its own — that it needs: its
+//! own binary, by kind and platform, which carries its UI compiled in. One
+//! chunk at a time: `BUILD_FETCH` asks for the next up to 1 MiB at the part
+//! file's length, and the gateway picks a holder for it (`from_node` 0), so
+//! later fetches spread across every holder. A chunk that does not come within
+//! [`CHUNK_WAIT`] is asked for again — a resume from the part file, from
+//! whichever holder the gateway picks now. A finished artifact verifies or
+//! starts over.
 //!
-//! **Stranded.** A build with no artifact for this member's kind and platform,
-//! or no UI where it serves one, cannot be installed here: the member says so.
+//! **Stranded.** A build with no artifact for this member's kind and platform
+//! cannot be installed here: the member says so.
 //!
 //! **Serving.** A `BUILD_FETCH` for an artifact this member serves is answered
 //! with a `BUILD_CHUNK` on the catch-up lane, to the requester alone.
@@ -28,7 +28,6 @@ use super::Upgrader;
 use crate::frame::{
     Artifact, BuildArtifacts, BuildChunk, BuildFetch, BuildId, Frame, MAX_BUILD_CHUNK,
 };
-use crate::upgrade::artifacts::UI_KIND;
 use crate::upgrade::decisions::build_name;
 use crate::upgrade::parts::{Finished, Standing, Wrote};
 
@@ -49,30 +48,20 @@ pub struct Fetching {
     pub app: String,
 }
 
-/// The artifacts of `offer` a member of `kind` on `platform` needs, its UI's
-/// among them when it serves one; or why it cannot install the build.
-pub fn needed(
-    offer: &BuildArtifacts,
-    kind: &str,
-    platform: &str,
-    serves_ui: bool,
-) -> Result<Vec<Artifact>, String> {
-    let name = build_name(&offer.build);
-    let exe = offer
+/// The artifact of `offer` a member of `kind` on `platform` needs, or why it
+/// cannot install the build.
+pub fn needed(offer: &BuildArtifacts, kind: &str, platform: &str) -> Result<Artifact, String> {
+    offer
         .artifacts
         .iter()
         .find(|a| a.kind == kind && a.platform == platform)
-        .ok_or_else(|| format!("build {name} has no {kind} for {platform}"))?;
-    let mut need = vec![exe.clone()];
-    if serves_ui {
-        let ui = offer
-            .artifacts
-            .iter()
-            .find(|a| a.kind == UI_KIND)
-            .ok_or_else(|| format!("build {name} offers no UI"))?;
-        need.push(ui.clone());
-    }
-    Ok(need)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "build {} has no {kind} for {platform}",
+                build_name(&offer.build)
+            )
+        })
 }
 
 /// Up to [`MAX_BUILD_CHUNK`] bytes of the file at `path` from `offset`.
@@ -109,33 +98,21 @@ impl Upgrader {
         let Some(offer) = offer else {
             return;
         };
-        let need = match needed(
-            &offer,
-            &self.setup.info.kind,
-            &self.setup.info.platform,
-            !self.setup.ui.is_empty(),
-        ) {
-            Ok(n) => n,
+        let artifact = match needed(&offer, &self.setup.info.kind, &self.setup.info.platform) {
+            Ok(a) => a,
             Err(reason) => {
                 self.state().stranded = Some(reason);
                 return;
             }
         };
         self.state().stranded = None;
-        // The first artifact not yet verified.
-        let mut next = None;
-        for a in &need {
-            match self.parts.standing(&offer.build, a) {
-                Standing::Verified(path) => self.verified(&offer.build, a, &path).await,
-                Standing::Resume(offset) => {
-                    next = Some((a.clone(), offset));
-                    break;
-                }
+        let offset = match self.parts.standing(&offer.build, &artifact) {
+            Standing::Verified(path) => {
+                self.verified(&offer.build, &artifact, &path).await;
+                self.state().fetch = None;
+                return;
             }
-        }
-        let Some((artifact, offset)) = next else {
-            self.state().fetch = None;
-            return;
+            Standing::Resume(offset) => offset,
         };
         let ask = {
             let mut s = self.state();
@@ -207,16 +184,12 @@ impl Upgrader {
         {
             return;
         }
-        let info = if a.kind == UI_KIND {
-            None
-        } else {
-            let probe = self.probe.clone();
-            let p = path.to_path_buf();
-            tokio::task::spawn_blocking(move || probe.build_info(&p))
-                .await
-                .ok()
-                .flatten()
-        };
+        let probe = self.probe.clone();
+        let p = path.to_path_buf();
+        let info = tokio::task::spawn_blocking(move || probe.build_info(&p))
+            .await
+            .ok()
+            .flatten();
         self.state().served.push(Item {
             build: build.clone(),
             artifact: a.clone(),
@@ -359,30 +332,22 @@ mod tests {
         }
     }
 
-    /// A member takes its own kind and platform, and the UI when it serves
-    /// one; with no match it is stranded, with the reason.
+    /// A member takes its own kind and platform; with no match it is
+    /// stranded, with the reason.
     #[test]
     fn a_member_fetches_only_its_own_kind_and_platform() {
         let o = offer(vec![
             a("zend", "windows-x86_64", 1),
             a("zend", "linux-x86_64", 2),
             a("tokerad", "linux-x86_64", 3),
-            a(UI_KIND, "any", 4),
         ]);
-        let got = needed(&o, "zend", "linux-x86_64", true).unwrap();
-        assert_eq!(got, [a("zend", "linux-x86_64", 2), a(UI_KIND, "any", 4)]);
         assert_eq!(
-            needed(&o, "tokera-agent", "linux-x86_64", false).unwrap_err(),
+            needed(&o, "zend", "linux-x86_64").unwrap(),
+            a("zend", "linux-x86_64", 2)
+        );
+        assert_eq!(
+            needed(&o, "tokera-agent", "linux-x86_64").unwrap_err(),
             "build 12-h12 has no tokera-agent for linux-x86_64"
-        );
-        let no_ui = offer(vec![a("npcd", "linux-x86_64", 5)]);
-        assert_eq!(
-            needed(&no_ui, "npcd", "linux-x86_64", false).unwrap(),
-            [a("npcd", "linux-x86_64", 5)]
-        );
-        assert_eq!(
-            needed(&no_ui, "npcd", "linux-x86_64", true).unwrap_err(),
-            "build 12-h12 offers no UI"
         );
     }
 

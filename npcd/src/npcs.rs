@@ -40,7 +40,7 @@ use candle_conversation::persistence::record::{
     AuthoredBelief, AuthoredRelationship, AuthoredStrategy, Modulation, NpcPayload, RecordType,
 };
 use candle_conversation::persistence::{
-    Admit, SharedSubstrate, SubstratePersistence, SUBSTRATE_DIR,
+    Admit, OpenProgress, SharedSubstrate, SubstratePersistence, SUBSTRATE_DIR,
 };
 use candle_conversation::substrate::Substrate;
 use host::MODEL;
@@ -200,6 +200,13 @@ impl Npcs {
     /// the same handle through [`Self::substrate`] instead of opening its own —
     /// see that method for what the second handle destroyed.
     pub fn load(dir: &Path) -> Result<Self, NpcError> {
+        Self::load_reporting(dir, &|_, _, _| {})
+    }
+
+    /// [`Self::load`], telling `progress` how the open goes — a store written
+    /// before identities is rewritten whole before it returns, which on a large
+    /// one takes minutes.
+    pub fn load_reporting(dir: &Path, progress: OpenProgress<'_>) -> Result<Self, NpcError> {
         let mut substrate = Substrate::new();
         let mut by_id: BTreeMap<u64, NpcPayload> = BTreeMap::new();
 
@@ -226,6 +233,7 @@ impl Npcs {
                     Err(e) => tracing::warn!("skipping undecodable NPC record: {e}"),
                 }
             },
+            progress,
         )
         .map_err(|e| NpcError::Persist(e.to_string()))?;
 

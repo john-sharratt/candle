@@ -25,7 +25,8 @@ axum         = { version = "0.7", features = ["macros", "ws", "multipart"] }
 tokio        = { version = "1",   features = ["full"] }
 futures      = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
-# The built-in tool catalog's definitions, compiled in (`tool_def`).
+# The built-in tool catalog's definitions and the web UI, compiled in
+# (`tool_def`, `tenant::WEB`).
 include_dir  = { version = "0.7" }
 # The process zend runs in: logging, the model, the HTTP server, the shared
 # endpoints (`docs/shared_model_host.md`). zend is one of its tenants.
@@ -81,6 +82,9 @@ tree-sitter-php         = "0.24"
 tree-sitter-bash        = "0.25"
 tree-sitter-html        = "0.23"
 tree-sitter-css         = "0.25"
+
+[build-dependencies]
+embed-watch = { path = "../embed-watch" }
 
 [dev-dependencies]
 # `test-helpers` on top of the runtime features: the behavioural test catalogue

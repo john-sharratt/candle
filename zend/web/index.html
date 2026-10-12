@@ -206,7 +206,10 @@
   .z-uptile:hover { border-color: #4a453f; background: #2c2926; }
   /* ── Ring spinner + loading card (startup overlay + in-chat waiting) ───── */
   @keyframes zspin { to { transform: rotate(360deg); } }
-  .z-spin { width: 15px; height: 15px; border-radius: 50%; border: 2px solid #c98a3e; border-top-color: transparent; animation: zspin .9s linear infinite; flex-shrink: 0; box-sizing: border-box; }
+  /* Phased from the clock (`--zspin`, set as it is drawn — see `spinner()`):
+     the screens that hold it are redrawn on every status poll, and a spinner
+     restarting from 0° each second stutters instead of turning. */
+  .z-spin { width: 15px; height: 15px; border-radius: 50%; border: 2px solid #c98a3e; border-top-color: transparent; animation: zspin .9s linear infinite; animation-delay: var(--zspin, 0ms); flex-shrink: 0; box-sizing: border-box; }
   /* The first paint, before the daemon has answered. Invisible for its first
      moments — most loads are done by then — then a quiet "Getting ready". */
   @keyframes zfadein { to { opacity: 1; } }
@@ -222,6 +225,8 @@
   .z-load-list { list-style: none; padding: 0; margin: 0 0 .4rem; }
   .z-load-list li { font-size: .88rem; color: #7c736a; padding: .2rem 0; display: flex; align-items: center; gap: .6rem; }
   .z-load-list li::before { content: '✓'; color: #34d399; font-weight: 700; }
+  .z-load-list li.z-load-wait { color: #c9a26a; }
+  .z-load-list li.z-load-wait::before { content: '…'; color: #c9a26a; }
   .z-load-detail { font-size: .82rem; color: #5e554c; margin-top: .6rem; min-height: 1.2em; font-variant-numeric: tabular-nums; }
   @media (max-width: 1024px) { .z-logs { width: 280px !important; } }
   /* Mobile overrides fire at the same 820px the JS uses for its narrow layout
@@ -2044,7 +2049,13 @@ import { estateSwitcher } from './common/lib/estate.js';
   // header, and this holds the pane until the history lands.
   function buildConvLoading() {
     return h('div', { class: 'z-convload', role: 'status', 'aria-live': 'polite' },
-      h('div', { class: 'z-spin' }), 'Loading conversation…');
+      spinner(), 'Loading conversation…');
+  }
+  // A spinner already part-way round, by the clock: a negative delay puts the
+  // turn where the one it replaces had got to, so a redraw continues the
+  // motion rather than starting it over.
+  function spinner() {
+    return h('div', { class: 'z-spin', style: '--zspin:-' + (Math.round(_now()) % 900) + 'ms;' });
   }
   function buildConvLoadError(conv) {
     return h('div', { class: 'z-convload', role: 'alert' },
@@ -3589,6 +3600,9 @@ import { estateSwitcher } from './common/lib/estate.js';
     // (`completed_labels`, one for one), which is what the list prints.
     const labels = ld.completed_labels || [];
     const completed = (ld.completed || []).map((step, i) => h('li', {}, labels[i] || step));
+    // The shared engine is built once every tenant of the process has arrived;
+    // until then the list ends on whom this load is waiting for.
+    for (const t of (ld.waiting_for || [])) completed.push(h('li', { class: 'z-load-wait' }, 'Waiting for ' + t));
     // Absolute readout beside the bar: "137 / 1,000 files · 14%". Only shown when
     // the step reports a discrete count (a unit + a known total); otherwise just
     // the percent, since a scaled-fraction counter has no meaningful "N / M".
@@ -3599,7 +3613,7 @@ import { estateSwitcher } from './common/lib/estate.js';
     const card = h('div', { class: 'z-load-card' },
       h('div', { class: 'z-load-eyebrow' }, 'Starting up'),
       h('div', { class: 'z-load-row' },
-        h('div', { class: 'z-spin' }),
+        spinner(),
         // Show the specific current action prominently (e.g. "Scanning
         // repository", "Reading code") — the phase-level detail when the step
         // reports one, falling back to the step label otherwise.

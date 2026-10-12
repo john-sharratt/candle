@@ -73,11 +73,13 @@ mod deferred_arena_tests {
             err.contains(KV_ARENA_MID_WAVE),
             "the refusal must be marked retryable: {err}"
         );
+        assert!(backing.arenas_owed(), "a refusal leaves the arena owed");
         assert_eq!(
             backing.create_deferred_arenas()?,
             0,
             "the demand must not be satisfied while the wave is still running"
         );
+        assert!(backing.arenas_owed(), "a refusal in the wave keeps it owed");
         drop(guard);
 
         // In the gap it is created — from the record, with nothing having to
@@ -86,6 +88,10 @@ mod deferred_arena_tests {
             backing.create_deferred_arenas()?,
             1,
             "the refusal recorded the class it wanted; the gap must act on it"
+        );
+        assert!(
+            !backing.arenas_owed(),
+            "the gap made it, so a pass waiting on it may run again"
         );
         assert_eq!(
             backing.create_deferred_arenas()?,

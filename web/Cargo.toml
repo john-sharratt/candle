@@ -67,6 +67,9 @@ rcgen            = { version = "0.14", default-features = false, features = ["cr
 # and none can fail to load.
 hyper-rustls     = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "logging", "webpki-roots"] }
 mime_guess     = { version = "2" }
+# A daemon's UI compiled into it (`content::Source::Embedded`), so a shipped
+# binary serves its own pages with no checkout beside it.
+include_dir    = { version = "0.7" }
 # Gzip for everything this server sends. Static files are compressed once in
 # `asset.rs`; everything else on the way out in `compress.rs`, which streams and
 # flushes per chunk so a proxied SSE stream is never held back.

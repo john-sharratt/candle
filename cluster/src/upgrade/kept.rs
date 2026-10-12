@@ -1,8 +1,7 @@
 //! The builds a member keeps for rollback (§3.9): `<exe dir>/builds/`, one
-//! directory per build, named `<count>-<hash>`, holding the executable, the UI
-//! it served under `ui/<dir>`, and `build.json` — its `--build-info` answer,
-//! each file's SHA-256, the SHA-256 of its UI as an archive, and when it was
-//! installed and retired.
+//! directory per build, named `<count>-<hash>`, holding the executable — its UI
+//! compiled in — and `build.json`: its `--build-info` answer, the executable's
+//! SHA-256, and when it was installed and retired.
 //!
 //! The running build is never in `builds/`, so it is never pruned. Pruning
 //! keeps the newest *N* by retirement and never deletes a build a rollout in
@@ -20,8 +19,6 @@ use crate::version::info::BuildInfo;
 /// The kept builds' directory, beside the executable.
 pub const BUILDS: &str = "builds";
 pub const BUILD_JSON: &str = "build.json";
-/// A kept build's UI, under its directory.
-pub const UI: &str = "ui";
 
 /// The default of `--keep-builds`.
 pub const KEEP_DEFAULT: usize = 5;
@@ -37,12 +34,8 @@ pub struct FileSum {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildJson {
     pub info: BuildInfo,
-    /// The executable, then every UI file, in path order.
+    /// The executable.
     pub files: Vec<FileSum>,
-    /// The UI directories it served, as its tenants name them.
-    pub ui: Vec<String>,
-    /// The SHA-256 of its UI packed as an archive: what it is offered under.
-    pub ui_archive: String,
     pub installed_ms: u64,
     pub retired_ms: u64,
 }
@@ -181,8 +174,6 @@ mod tests {
                 path: "zend.exe".into(),
                 sha256: "00".repeat(32),
             }],
-            ui: vec!["zend/web".into()],
-            ui_archive: "11".repeat(32),
             installed_ms: retired_ms - 10,
             retired_ms,
         }

@@ -6,7 +6,7 @@ use super::admit;
 use super::admit_ground::AdmitPass;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
 use super::first_sample::{contiguous_runs, FirstSample, FirstSampled, PrefillEnd};
-use super::phase_split::cobatched_decode_rows;
+use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
 use super::priority_pause::rank;
 use super::section_pack;
 use super::wave_logits::WaveLogits;
@@ -3200,11 +3200,16 @@ impl Scheduler {
                     }
                 }
             }
+            // The creep rode layers `[cursor, win_end)` only: what it prefilled
+            // this wave is that window's share of its tokens, so a sweep split
+            // over several waves counts its tokens once.
+            let pf_swept = window_tokens(pf_tok, cursor, win_end, n);
+            let sc_swept = window_tokens(sc_tok, cursor, win_end, n);
             if pf_seqs > 0 {
-                self.wave_stats.record(true, pf_seqs, pf_tok, pf_kv, ms);
+                self.wave_stats.record(true, pf_seqs, pf_swept, pf_kv, ms);
             }
             if sc_seqs > 0 {
-                self.wave_stats.record_section(sc_seqs, sc_tok, sc_kv, ms);
+                self.wave_stats.record_section(sc_seqs, sc_swept, sc_kv, ms);
             }
             // The phase timeline's share of this sweep: one forward, split by rows
             // between the decode rows that rode it and the members above.
@@ -3225,16 +3230,20 @@ impl Scheduler {
             // refuses to judge on it until it has samples.
             //
             // Prefill and section rows are both prefill rows to the model — the
-            // copy is per forward, and they rode the same one.
-            self.observe_prefill_forward(pf_tok + sc_tok, t_seg2.elapsed().as_micros() as u64);
+            // copy is per forward, and they rode the same one. The model prices a
+            // whole sweep, so a window's time is taken to the sweep it is part of.
+            self.observe_prefill_forward(
+                pf_tok + sc_tok,
+                full_sweep_us(t_seg2.elapsed().as_micros() as u64, cursor, win_end, n),
+            );
             // Every completed wave forward is OOM-free prefill throughput —
             // the progress signal the stall-grace gate and evidence reopen
             // read. Without this, pump-driven phases (scope ingest, section
             // creep) look stalled to the admission regulator even at full
             // throughput, because only the drain-path prefills tick it.
-            if pf_tok + sc_tok > 0 {
+            if pf_swept + sc_swept > 0 {
                 super::PREFILL_OK_TOKENS.fetch_add(
-                    (pf_tok + sc_tok) as u64,
+                    (pf_swept + sc_swept) as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }

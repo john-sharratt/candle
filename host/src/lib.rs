@@ -24,6 +24,7 @@
 //! | [`process`], [`ctrl_c`], [`self_heal`], [`log_file`] | process-wide concerns |
 
 pub mod access;
+pub mod boot;
 pub mod build_info;
 pub mod cli;
 pub mod cluster;
@@ -40,6 +41,7 @@ pub mod process;
 pub mod run;
 pub mod self_heal;
 pub mod server;
+pub mod starting;
 pub mod stopping;
 pub mod telemetry;
 pub mod tenant;

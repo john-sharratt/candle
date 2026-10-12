@@ -683,14 +683,19 @@ impl Qwen4ExpBatched {
                 )?,
                 ..WaveWidth::decode(n)
             };
-            cover_wave_transient(
-                &d.cuda_stream(),
-                [
-                    plan.phase_bytes(LayerPhase::Attention, width),
-                    plan.phase_bytes(LayerPhase::Ffn, width),
-                    plan.phase_bytes(LayerPhase::Forward, width),
-                ],
-            )?;
+            let per_phase = [
+                plan.phase_bytes(LayerPhase::Attention, width),
+                plan.phase_bytes(LayerPhase::Ffn, width),
+                plan.phase_bytes(LayerPhase::Forward, width),
+            ];
+            // The refusal names the partition; what this walk priced, and from
+            // which width, is what says which term of the price is wrong.
+            cover_wave_transient(&d.cuda_stream(), per_phase).map_err(|e| {
+                candle::Error::Msg(format!(
+                    "{e} — for a draft walk of {n} sequences, {max_len} deep, at {width:?}, \
+                     {per_phase:?} B"
+                ))
+            })?;
         }
 
         // The walk reserves these itself, but the rope depth below has to be

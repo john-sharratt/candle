@@ -21,7 +21,7 @@ use candle::{DType, Device, Result, Tensor};
 use super::arena::{ArenaKey, ArenaKind};
 use super::backing::ChunkedKvBacking;
 #[cfg(feature = "cuda")]
-use super::backing::KV_DEVICE_OOM_MARKER;
+use super::backing::{KV_DEVICE_OOM_MARKER, TIER_STANDS_OVER_FREE};
 #[cfg(feature = "cuda")]
 use super::bump_arena::{enter_arena_window, ArenaWindow, KV_ARENA_MID_WAVE};
 use super::gid_pool::ChunkGid;
@@ -502,7 +502,7 @@ impl BackingInner {
                     "{KV_DEVICE_OOM_MARKER}: no region is claimable for class {} B — the wave's \
                      {} MiB transient tier caps the pool at {ceiling} of {total} regions, all \
                      {live} of which are live. {blocked} regions above the tier are unowned but \
-                     out of reach until the wave ends. This is a wave too wide for the ground \
+                     {TIER_STANDS_OVER_FREE}. This is a wave too wide for the ground \
                      below the tier, not an exhausted reservation.",
                     key.class.bytes(),
                     tier / (1 << 20),
@@ -868,6 +868,16 @@ impl ChunkedKvBacking {
     #[cfg(feature = "cuda")]
     pub fn create_deferred_arenas(&self) -> Result<usize> {
         self.inner.create_deferred_arenas()
+    }
+
+    /// Whether a refused pass is still owed an arena here — `false` once the
+    /// gap between forwards has created every one asked for. What a pass that
+    /// was turned away waits on before it tries again.
+    pub fn arenas_owed(&self) -> bool {
+        self.inner
+            .deferred_arenas
+            .lock()
+            .is_ok_and(|p| !p.is_empty())
     }
 
     /// See [`BackingInner::alloc_chunk_run_for_key`].

@@ -92,7 +92,7 @@ fn no_ready_member_shows_the_first_answer_or_connecting() {
             "state": "loading",
             "started_at_ms": 0,
             "tenants": { "npcd": { "state": "loading", "loading": {
-                "label": "Connecting", "detail": "no npcd member answered",
+                "label": "Connecting", "detail": "Waiting for npcd to start",
                 "progress": 0, "completed": [] } } },
         })
     );

@@ -22,10 +22,12 @@ use candle::{DType, Device, Tensor};
 use half::f16;
 
 use crate::kv_cache::arena_table::ArenaLocation;
+use crate::kv_cache::chunked::compress::quantize_layers_deferred_within;
+use crate::kv_cache::chunked::selection_batches::selection_bytes;
 use crate::kv_cache::chunked::{ChunkedKvBacking, CompressionPolicy};
 use crate::kv_cache::{
-    convert_deferred_descs, quantize_layers_deferred, quantize_sealed_in_place,
-    quantize_sealed_in_place_deferred, KvFormat, SealedSequence,
+    convert_deferred_descs, quantize_sealed_in_place, quantize_sealed_in_place_deferred, KvFormat,
+    SealedSequence,
 };
 
 const N_KV_HEAD: usize = 2;
@@ -303,6 +305,11 @@ fn quantize_layers_deferred_matches_immediate_bytes() {
 /// and run the *same* batched convert, so only the selection differs: a bug in
 /// the unified-table arena offset or the per-layer row split would pick
 /// different formats/scales/maps and diverge the bytes here.
+///
+/// And cut into runs: with a budget that fits two chunks a run, the twelve
+/// chunks go through six selections, most of them straddling two layers — the
+/// shape the persistence thread takes when a group outgrows its domain. The
+/// bytes must still match.
 #[test]
 fn quantize_layers_selection_batched_matches_per_layer_bytes() {
     let Some((device, _gpu)) = cuda_device_or_skip() else {
@@ -312,8 +319,14 @@ fn quantize_layers_selection_batched_matches_per_layer_bytes() {
     let copy_stream = cuda_stream(&device);
     let n_layers = 4usize;
     let n_tokens = 96usize; // 3 full 32-token chunks per layer
+                            // Two chunks a run: the candidate lists sit inside one aligned section
+                            // whatever their length, so one candidate each sizes them exactly.
+    let two_chunks = selection_bytes(2, N_KV_HEAD, HEAD_DIM, 1, 1);
+    assert!(selection_bytes(3, N_KV_HEAD, HEAD_DIM, 1, 1) > two_chunks);
 
-    let run = |cross_layer: bool| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+    // `None` selects each layer on its own; `Some(budget)` selects across the
+    // layers in runs that fit `budget`.
+    let run = |cross_layer: Option<usize>| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut descs: Vec<candle::quantized::cuda::PalHeadDesc> = Vec::new();
         let mut backings: Vec<ChunkedKvBacking> = Vec::new();
         let mut srcs: Vec<SealedSequence> = Vec::new();
@@ -324,10 +337,10 @@ fn quantize_layers_selection_batched_matches_per_layer_bytes() {
             srcs.push(src);
         }
         let mut pinned: Option<PinnedBuf> = None;
-        let warms: Vec<SealedSequence> = if cross_layer {
+        let warms: Vec<SealedSequence> = if let Some(budget) = cross_layer {
             let backing_refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
             let per_layer: Vec<Vec<&SealedSequence>> = srcs.iter().map(|s| vec![s]).collect();
-            quantize_layers_deferred(
+            quantize_layers_deferred_within(
                 &backing_refs,
                 &per_layer,
                 &policy,
@@ -337,6 +350,7 @@ fn quantize_layers_selection_batched_matches_per_layer_bytes() {
                 &mut descs,
                 &mut 0u64,
                 &mut 0u64,
+                budget,
             )
             .expect("cross-layer quantize")
             .into_iter()
@@ -384,11 +398,16 @@ fn quantize_layers_selection_batched_matches_per_layer_bytes() {
         out
     };
 
-    let per_layer = run(false);
-    let cross_layer = run(true);
+    let per_layer = run(None);
+    let cross_layer = run(Some(usize::MAX));
+    let in_runs = run(Some(two_chunks));
     assert_eq!(
         per_layer, cross_layer,
         "cross-layer batched selection produced different quant bytes than per-layer selection"
+    );
+    assert_eq!(
+        per_layer, in_runs,
+        "a selection cut into runs produced different quant bytes than per-layer selection"
     );
 }
 

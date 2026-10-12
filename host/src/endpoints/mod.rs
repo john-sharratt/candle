@@ -7,14 +7,14 @@
 //! `/v1/tools`, which are open on purpose (see each route).
 
 mod catalog;
+mod format_mix;
 mod logs;
 mod me;
 mod profile;
-mod status;
+pub(crate) mod status;
 mod telemetry;
 mod waves;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use cluster::dispatch::{Dispatch, Merge, Mirror};
@@ -36,11 +36,8 @@ pub struct Shared {
     /// When this process started, wall clock — what a page prints as uptime and
     /// how it notices a restart.
     pub started_at_ms: u64,
-    /// The binary's version, part of `build`.
-    pub version: &'static str,
-    /// Every UI's content directory, and the shared library's — what `build`
-    /// hashes.
-    pub content_dirs: Vec<PathBuf>,
+    /// The UI build id (`ui::build_id`), taken once at startup.
+    pub build: String,
     /// The model every tenant runs.
     pub model: ModelView,
     /// Every tenant, in rank order.
@@ -127,7 +124,13 @@ fn shared_table(roles: Roles) -> Api<Arc<Shared>> {
         .mirror(Mirror::Shape)
         .route("/v1/memory", Role::User, each(), get(telemetry::memory))
         .route("/v1/phases", Role::User, each(), get(waves::phases))
-        .route("/v1/promotes", Role::User, each(), get(waves::promotes))
+        .route(
+            "/v1/projections",
+            Role::User,
+            each(),
+            get(waves::projections),
+        )
+        .route("/v1/layers", Role::User, each(), get(waves::layers))
         // Reading resets the counters, so two calls bracket a window — an
         // operator's, which a reader passing by must not be able to wipe.
         .route("/v1/profile", Role::Admin, each(), get(profile::profile))
@@ -272,6 +275,7 @@ pub(crate) mod test_support {
             elapsed_ms: 10,
             prefill_tokens: 0,
             prefill_tps: None,
+            waiting_for: Vec::new(),
         }
     }
 
@@ -290,8 +294,7 @@ pub(crate) mod test_support {
         Arc::new(Shared {
             roles: serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap(),
             started_at_ms: 1_700_000_000_000,
-            version: "9.9.9",
-            content_dirs: vec![],
+            build: "0123456789abcdef".into(),
             model: ModelView::of_prescribed(),
             tenants: tenants
                 .into_iter()
@@ -401,7 +404,8 @@ mod tests {
                 ("/v1/telemetry", "user"),
                 ("/v1/memory", "user"),
                 ("/v1/phases", "user"),
-                ("/v1/promotes", "user"),
+                ("/v1/projections", "user"),
+                ("/v1/layers", "user"),
                 ("/v1/profile", "admin"),
                 ("/v1/tools", "unauthenticated"),
                 ("/v1/tools/calibrate", "admin"),

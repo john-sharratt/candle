@@ -11,7 +11,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use super::artifacts::UI_KIND;
 use super::sum::{file_sha256, hex};
 use crate::frame::{Artifact, BuildId};
 
@@ -65,12 +64,12 @@ impl Parts {
         self.dir(build).join(format!("{}.part", hex(&a.sha256)))
     }
 
-    /// A verified artifact's file: a binary is named as this platform names an
-    /// executable, so it runs — `--build-info` asks it what it opens before
-    /// it is installed.
+    /// A verified artifact's file, named as this platform names an executable,
+    /// so it runs — `--build-info` asks it what it opens before it is
+    /// installed.
     pub fn verified(&self, build: &BuildId, a: &Artifact) -> PathBuf {
-        let suffix = if a.kind == UI_KIND { "" } else { EXE_SUFFIX };
-        self.dir(build).join(format!("{}{suffix}", hex(&a.sha256)))
+        self.dir(build)
+            .join(format!("{}{EXE_SUFFIX}", hex(&a.sha256)))
     }
 
     pub fn standing(&self, build: &BuildId, a: &Artifact) -> Standing {
@@ -108,7 +107,7 @@ impl Parts {
             let done = self.verified(build, a);
             fs::rename(&part, &done)?;
             #[cfg(unix)]
-            if a.kind != UI_KIND {
+            {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&done, fs::Permissions::from_mode(0o755))?;
             }

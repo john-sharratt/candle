@@ -23,13 +23,15 @@
 //! whole console works over real sockets with no daemon anywhere.
 //!
 //! ```no_run
-//! # use std::path::{Path, PathBuf};
-//! // Inside a daemon: serve the console from disk and answer /v1 in-process.
+//! # use std::path::Path;
+//! // Inside a daemon: serve the console it was built with and answer /v1
+//! // in-process.
+//! static SITE: include_dir::Dir<'static> =
+//!     include_dir::include_dir!("$CARGO_MANIFEST_DIR/content/npcd");
 //! # async fn run(api: axum::Router) -> anyhow::Result<()> {
 //! let cfg = web::Config::from_yaml(include_str!("../web.yaml"), Path::new("."))?;
-//! let roots = [PathBuf::from("web/content/npcd"), PathBuf::from("web/content/common")];
 //! web::Builder::new(cfg)
-//!     .content("npcd", web::Roots::disk(&roots))
+//!     .content("npcd", web::Roots::embedded(&[&SITE]))
 //!     .local_api("npcd", api)
 //!     .serve()
 //!     .await
@@ -54,6 +56,6 @@ pub mod tls;
 pub mod upstream_tls;
 
 pub use config::{Backoff, Config, Route, Site, Tls, Upstream};
-pub use content::Roots;
+pub use content::{Roots, Source};
 pub use health::Health;
 pub use server::{Bound, Builder};

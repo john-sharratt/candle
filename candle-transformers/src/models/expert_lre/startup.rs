@@ -12,6 +12,7 @@ use super::pinned::{ExpertResidency, LayerGeometry};
 use super::slot_image::build_slot_from_record_on_stream;
 use super::types::ExpertSlot;
 use super::warm_tier::WarmTier;
+use crate::models::load_phase::{LoadPhase, LoadProgress};
 use candle::vram::{available_physical_ram, host_pinned_bytes};
 use candle::Result;
 use cudarc::driver::CudaEvent;
@@ -33,6 +34,11 @@ pub(crate) struct StartupTargets<'a> {
 /// through the work that follows the fill: seeding the residency gauge, whose
 /// caller reports it as it finishes.
 pub(crate) const PACK_TAIL_STEPS: usize = 1;
+
+/// Warm-tier records read per batch, between progress reports: enough that
+/// each batch keeps the pack's queue full (a few GiB of 2.5 MiB records), few
+/// enough that a large tier reports a couple of dozen times.
+const WARM_READ_BATCH: usize = 1024;
 
 /// The pad's slots as a ring of landing buffers for the startup fill.
 ///
@@ -138,7 +144,7 @@ pub(crate) fn startup_from_pack(
     num_moe_layers: usize,
     num_experts: usize,
     cuda_dev: &candle::CudaDevice,
-    progress: Option<&dyn Fn(usize, usize)>,
+    progress: Option<LoadProgress<'_>>,
 ) -> Result<()> {
     if num_moe_layers == 0 || num_experts == 0 {
         return Ok(());
@@ -146,14 +152,14 @@ pub(crate) fn startup_from_pack(
     let total_experts = num_moe_layers * num_experts;
     let t0 = std::time::Instant::now();
 
-    // ── Warm tier: every membership record at once, at full queue depth ──
+    // ── Warm tier: the membership records, a batch at a time ──
     //
     // The tier's slots — pinned and pageable alike — are cut to the pack's
     // stride and sector-aligned, so each read lands in its final home with
-    // nothing in between.
+    // nothing in between. Each batch is read at full queue depth.
     if !t.membership.is_empty() {
         let stride = t.stride;
-        let reads: Vec<PackRead<'_>> = t
+        let mut reads: Vec<PackRead<'_>> = t
             .membership
             .iter()
             .zip(t.warm.slots_mut(t.membership.len(), stride))
@@ -163,7 +169,20 @@ pub(crate) fn startup_from_pack(
                 dest,
             })
             .collect();
-        pack.read_many(reads)?;
+        let total = reads.len();
+        let mut done = 0;
+        if let Some(report) = progress {
+            report(LoadPhase::ReadWarm, 0, total);
+        }
+        while !reads.is_empty() {
+            let rest = reads.split_off(reads.len().min(WARM_READ_BATCH));
+            done += reads.len();
+            pack.read_many(reads)?;
+            reads = rest;
+            if let Some(report) = progress {
+                report(LoadPhase::ReadWarm, done, total);
+            }
+        }
         for (slot, &(layer, expert)) in t.membership.iter().enumerate() {
             t.residency[layer][expert].ram = Some(slot);
         }
@@ -237,8 +256,9 @@ pub(crate) fn startup_from_pack(
             t.inner.install(slot_idx, moe_idx, expert_idx, slot);
             t.residency[moe_idx][expert_idx].vram = Some(slot_idx);
             vram_count += 1;
-            if let Some(cb) = progress {
-                cb(
+            if let Some(report) = progress {
+                report(
+                    LoadPhase::FillVram,
                     moe_idx * num_experts + expert_idx + 1,
                     total_experts + PACK_TAIL_STEPS,
                 );
@@ -250,8 +270,12 @@ pub(crate) fn startup_from_pack(
     stream.synchronize().map_err(candle::Error::wrap)?;
     // The fill stops as soon as VRAM is full, so the remaining experts never
     // reach the progress callback. Land it on the experts, leaving the tail.
-    if let Some(cb) = progress {
-        cb(total_experts, total_experts + PACK_TAIL_STEPS);
+    if let Some(report) = progress {
+        report(
+            LoadPhase::FillVram,
+            total_experts,
+            total_experts + PACK_TAIL_STEPS,
+        );
     }
 
     tracing::info!(

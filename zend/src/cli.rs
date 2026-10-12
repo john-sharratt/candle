@@ -21,11 +21,8 @@ use serde::{Deserialize, Deserializer};
 
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::secrets;
-use crate::tenant::{default_ui, ZendTenant};
+use crate::tenant::ZendTenant;
 use crate::workspace;
-
-/// zend's web UI: `zend/web` in the source tree this binary was built from.
-pub const DEFAULT_UI: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/web");
 
 /// zend's flags.
 #[derive(Args, Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -45,13 +42,6 @@ pub struct ZendArgs {
     /// substrate + tuned projection schema, e.g. `--working-dir ../mind`.
     #[arg(long)]
     pub working_dir: Option<PathBuf>,
-
-    /// The directory zend's web UI is served from, read per request — saving a
-    /// file there is the deployment. By default `zend/web` in the source tree
-    /// this binary was built from; a relative path given here resolves against
-    /// the working directory.
-    #[arg(long, default_value = DEFAULT_UI)]
-    pub ui: PathBuf,
 
     /// Take a projection sink OUT of service — a turn-sink **layer** (e.g.
     /// `repo_map`, `code_reading`) or a section **collection** (e.g. `response`,
@@ -181,7 +171,6 @@ impl Default for ZendArgs {
         Self {
             workspace: PathBuf::from("."),
             working_dir: None,
-            ui: PathBuf::from(DEFAULT_UI),
             disable_layer: Vec::new(),
             wipe_layer: Vec::new(),
             ingest_dir: Vec::new(),
@@ -327,9 +316,7 @@ impl ZendArgs {
         config.summarize = self.summarize;
         config.tombstone_retention =
             Duration::from_secs(self.tombstone_retention.saturating_mul(SECONDS_PER_DAY));
-        let mut ui = default_ui();
-        ui.content = self.ui;
-        Ok(ZendTenant::new(config, ui))
+        Ok(ZendTenant::new(config))
     }
 }
 

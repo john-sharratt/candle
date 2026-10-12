@@ -39,6 +39,10 @@ pub struct LoadingView {
     /// reads as a stalled engine.
     pub prefill_tokens: u64,
     pub prefill_tps: Option<f64>,
+    /// The other tenants of the process this load waits for before the shared
+    /// engine can be built, by name — the last line of the loading page while
+    /// any remain.
+    pub waiting_for: Vec<&'static str>,
 }
 
 /// The rate `tokens` over `elapsed_ms` make, or `None` when there is nothing
@@ -74,10 +78,11 @@ mod tests {
             elapsed_ms: 1500,
             prefill_tokens: 0,
             prefill_tps: None,
+            waiting_for: vec!["npcd"],
         };
         assert_eq!(
             serde_json::to_string(&v).unwrap(),
-            r#"{"current":"substrate","label":"Loading substrate","progress":0.5,"completed":["model"],"completed_labels":["Loading model"],"progressed":10,"total":20,"unit":"turns","detail":"","elapsed_ms":1500,"prefill_tokens":0,"prefill_tps":null}"#
+            r#"{"current":"substrate","label":"Loading substrate","progress":0.5,"completed":["model"],"completed_labels":["Loading model"],"progressed":10,"total":20,"unit":"turns","detail":"","elapsed_ms":1500,"prefill_tokens":0,"prefill_tps":null,"waiting_for":["npcd"]}"#
         );
     }
 }

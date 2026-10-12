@@ -13,7 +13,8 @@
  * soon as one member is ready for it — the gateway sends the console's requests
  * to ready members — so that member's status speaks for the app; until one is,
  * the first member that answered shows its load. An envelope no member answered
- * reads as connecting.
+ * reads as connecting, waiting for the app to start — which is what a gateway
+ * sees while its members' processes come up.
  */
 
 /** Whether `body` is a gateway's aggregate rather than one process's answer. */
@@ -43,7 +44,7 @@ export function memberStatus(body, tenant) {
         state: 'loading',
         loading: {
           label: 'Connecting',
-          detail: `no ${tenant} member answered`,
+          detail: `Waiting for ${tenant} to start`,
           progress: 0,
           completed: [],
         },

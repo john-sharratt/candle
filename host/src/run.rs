@@ -19,11 +19,14 @@ use cluster::launch::{LaunchSpec, OneShot};
 use cluster::upgrade::artifacts::RunProbe;
 use cluster::upgrade::handoff::hand_off;
 use cluster::upgrade::runtime::{Setup, Upgrader};
+use include_dir::Dir;
 use sysinfo::System;
 use tokio::runtime::{Builder as RuntimeBuilder, Handle};
+use tokio::sync::oneshot;
 use web::Roots;
 
 use crate::access::{roles, LocalSignin};
+use crate::boot::{router as boot_router, Boot, BootLine};
 use crate::cli::HostArgs;
 use crate::cluster::leave::drain_and_send;
 use crate::cluster::upgrade::{setup as upgrade_setup, HostInstaller};
@@ -36,10 +39,11 @@ use crate::model::{ModelView, MODEL};
 use crate::process::{abort_on_ctrl_c, init_logging, install_panic_hook, stop_signal};
 use crate::self_heal::spawn_watchdog;
 use crate::server::serve;
+use crate::starting::StartLine;
 use crate::stopping::{Ending, Stopping};
 use crate::telemetry::Telemetry;
 use crate::tenant::{Stop, Tenant, TenantContext, TenantUi};
-use crate::ui::{require_dir, COMMON_DIR};
+use crate::ui::{build_id, COMMON};
 
 /// One forward in this many records its GPU spans in a profiling build (see
 /// `set_gpu_span_period`). At a decode step of ~35 ms that is a sampled forward
@@ -149,9 +153,7 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     // What this member upgrades from, and how it installs a build (§3.9).
     let stopping = Arc::new(Stopping::new());
     let installer = HostInstaller::new(Arc::clone(&stopping));
-    let mut ui_dirs: Vec<PathBuf> = tenants.iter().map(|t| t.ui().content).collect();
-    ui_dirs.push(PathBuf::from(COMMON_DIR));
-    let upgrade = upgrade_setup(cfg.binary, &launch, &ui_dirs, &state_dir, &cfg.args);
+    let upgrade = upgrade_setup(cfg.binary, &launch, &state_dir, &cfg.args);
 
     let runtime = match RuntimeBuilder::new_multi_thread().enable_all().build() {
         Ok(r) => r,
@@ -217,15 +219,8 @@ async fn serve_tenants(
         .collect();
     check_substrates(&substrates)?;
     let listen = cfg.args.listen()?;
-    let uis: Vec<(&'static str, TenantUi)> = tenants
-        .iter()
-        .map(|t| {
-            let mut ui = t.ui();
-            ui.content = require_dir(t.name(), &ui.content)?;
-            Ok((t.name(), ui))
-        })
-        .collect::<anyhow::Result<_>>()?;
-    let common = require_dir("the shared front-end", &PathBuf::from(COMMON_DIR))?;
+    let uis: Vec<(&'static str, TenantUi)> = tenants.iter().map(|t| (t.name(), t.ui())).collect();
+    let common = Roots::embedded(&[&COMMON]);
     let local_signin = LocalSignin::new(cfg.args.local_signin.as_deref())?;
     if let Some(email) = &cfg.args.local_signin {
         tracing::warn!(
@@ -268,13 +263,46 @@ async fn serve_tenants(
         None => None,
     };
 
+    let started_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let mut content: Vec<&'static Dir<'static>> = uis.iter().map(|(_, ui)| ui.content).collect();
+    content.push(&COMMON);
+    let build = build_id(&content, cfg.version);
+
+    // Served while the tenants start: a start can be long, and a page reaching
+    // a process that answers nothing shows nothing (`crate::boot`).
+    let start_lines: Vec<Arc<StartLine>> = names.iter().map(|_| StartLine::new()).collect();
+    let boot = Boot::new(
+        started_at_ms,
+        build.clone(),
+        model.clone(),
+        cluster.clone(),
+        names
+            .iter()
+            .zip(&start_lines)
+            .map(|(n, s)| (*n, BootLine::Starting(Arc::clone(s))))
+            .collect(),
+    );
+    let (end_boot, boot_ended) = oneshot::channel::<()>();
+    let boot_server = {
+        let (listen, uis, signin) = (listen.clone(), uis.clone(), local_signin.clone());
+        let app = boot_router(Arc::clone(&boot), common.clone());
+        tokio::spawn(async move {
+            serve(&listen, &uis, app, signin, None, async {
+                let _ = boot_ended.await;
+            })
+            .await
+        })
+    };
+
     // Every tenant takes its engine from one slot: the highest-ranked builds it
     // with every tenant's requests merged, the rest attach their substrates.
-    let slot = EngineSlot::new(tenants.len());
+    let slot = EngineSlot::new(&names);
     let mut reports = Vec::new();
     let mut tenant_routes = Vec::new();
     let mut stops: Vec<(&'static str, Stop)> = Vec::new();
-    for (i, tenant) in tenants.into_iter().enumerate() {
+    for ((i, tenant), starting) in tenants.into_iter().enumerate().zip(start_lines) {
         let name = tenant.name();
         let Some(rank) = TenantRank::nth(i) else {
             stop_all(stops).await;
@@ -292,9 +320,11 @@ async fn serve_tenants(
                 .as_ref()
                 .and_then(|c| Join::new(Arc::clone(c), name)),
             stopping: Arc::clone(&stopping),
+            starting,
         };
         match tenant.start(ctx).await {
             Ok(started) => {
+                boot.started(name, Arc::clone(&started.reports));
                 reports.push((name, started.reports));
                 tenant_routes.push((name, started.routes));
                 stops.push((name, started.stop));
@@ -307,6 +337,12 @@ async fn serve_tenants(
             }
         }
     }
+    // The boot server hands the ports over: it finishes what it is answering
+    // and lets go of them before the real server binds.
+    let _ = end_boot.send(());
+    boot_server
+        .await
+        .map_err(|e| anyhow::anyhow!("the boot server panicked: {e}"))??;
 
     if let Some(c) = &cluster {
         // Each app's dispatch table: the host's routes and its tenant's (§5.2).
@@ -328,14 +364,9 @@ async fn serve_tenants(
         watch_readiness(watched);
     }
 
-    let mut content_dirs: Vec<PathBuf> = uis.iter().map(|(_, ui)| ui.content.clone()).collect();
-    content_dirs.push(common.clone());
     let shared = Arc::new(Shared {
-        started_at_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64),
-        version: cfg.version,
-        content_dirs,
+        started_at_ms,
+        build,
         model,
         tenants: reports,
         log: bus,
@@ -345,7 +376,7 @@ async fn serve_tenants(
         stopping: Arc::clone(&stopping),
         host: machine,
     });
-    let all = match merge_routes(routes(shared, Roots::disk(&[common])), tenant_routes) {
+    let all = match merge_routes(routes(shared, common), tenant_routes) {
         Ok(all) => all,
         Err(e) => {
             stop_all(stops).await;

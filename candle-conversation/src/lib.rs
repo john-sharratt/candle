@@ -174,6 +174,12 @@ pub use candle_transformers::generation::Sampling;
 pub use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
 };
+/// The last forward's walk through the routed layers, for a daemon's telemetry
+/// page — recorded by the expert pipeline thread, read here with no engine lock.
+pub use candle_transformers::models::expert_lre::layer_trace;
+/// What a model load reports while it runs — the phase and how far through —
+/// for a daemon's loading screen.
+pub use candle_transformers::models::load_phase::{LoadPhase, LoadProgress};
 
 /// Convenience type alias for Results in this crate.
 pub type Result<T> = std::result::Result<T, ConversationError>;

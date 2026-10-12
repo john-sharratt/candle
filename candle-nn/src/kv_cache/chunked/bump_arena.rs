@@ -1638,188 +1638,201 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
     //
     // So the tier is re-placed whenever it cannot hold the plan. Re-placing is
     // safe here for the same reason the rebase is: no generation is live.
-    let replan = {
-        // Same reason as [`plan_wave_transient`]: a placement reads the arena
-        // frontier, so no arena may be half-created when it does.
-        let mut map = await_arena_windows(lock_domains(), &stream);
-        let (_, domain) = domain_entry(&mut map, &stream);
-        if domain.live_generations > 0 {
-            None
-        } else {
-            let plan = domain.planned.unwrap_or_else(fallback_plan);
-            let wanted: usize = plan.iter().sum();
-            // A tier whose top already crosses the weight floor must be
-            // re-placed however large it is, so the `bytes >= wanted` arm below
-            // cannot keep it. `plan_wave_transient` leaves exactly this state
-            // behind when a forward arrives while the previous one is still
-            // live: the wider plan is recorded, the narrower tier stays put, and
-            // the two are only reconciled here.
-            let crosses_floor = domain.placed_at.is_some_and(|b| {
-                super::region_pool::span_layout(stream.context().ordinal())
-                    .is_some_and(|l| b.saturating_add(wanted as u64) > l.weight_floor)
-            });
-            // **The reservation this domain holds, not what the pool happens to
-            // be occupying.**
-            //
-            // This read `region_stats(..).transient_bytes`, which is a different
-            // quantity in two ways that both matter: it is *live occupancy* —
-            // its own docs call it "a snapshot taken mid-wave, not a
-            // reservation" — and it is a property of the POOL rather than of
-            // this domain's tier. So it could report a figure at least as large
-            // as the plan while this domain's own tier was narrower than the
-            // plan; the replan was then skipped, and the layout below wrote the
-            // new plan's widths onto the old tier's base and ran off its top
-            // into the expert weight zone. The comment above this block
-            // describes that failure exactly — the check simply was not asking
-            // the question the comment assumed.
-            let standing = domain.placed_at.and(domain.placed_bytes);
-            match standing {
-                Some(bytes) if bytes >= wanted && !crosses_floor => None,
-                _ => Some(plan),
+    //
+    // **And the decision is taken again if it went stale.** It is made under
+    // one lock and acted on under another, with the placement between them, so
+    // a generation live at the decision — the previous forward's logits rows,
+    // still held — can drop before the layout. The layout then finds no
+    // generation, no tier, and no placement of its own: a plan with no ground.
+    // Measured in zend's ingest as draft walks refused and their files failed,
+    // a few times a minute. That state is the decision being out of date, not a
+    // fault, so it goes round again; only if it keeps recurring is it refused.
+    const MAX_REDECIDE: usize = 4;
+    for _ in 0..MAX_REDECIDE {
+        let replan = {
+            // Same reason as [`plan_wave_transient`]: a placement reads the arena
+            // frontier, so no arena may be half-created when it does.
+            let mut map = await_arena_windows(lock_domains(), &stream);
+            let (_, domain) = domain_entry(&mut map, &stream);
+            if domain.live_generations > 0 {
+                None
+            } else {
+                let plan = domain.planned.unwrap_or_else(fallback_plan);
+                let wanted: usize = plan.iter().sum();
+                // A tier whose top already crosses the weight floor must be
+                // re-placed however large it is, so the `bytes >= wanted` arm below
+                // cannot keep it. `plan_wave_transient` leaves exactly this state
+                // behind when a forward arrives while the previous one is still
+                // live: the wider plan is recorded, the narrower tier stays put, and
+                // the two are only reconciled here.
+                let crosses_floor = domain.placed_at.is_some_and(|b| {
+                    super::region_pool::span_layout(stream.context().ordinal())
+                        .is_some_and(|l| b.saturating_add(wanted as u64) > l.weight_floor)
+                });
+                // **The reservation this domain holds, not what the pool happens to
+                // be occupying.**
+                //
+                // This read `region_stats(..).transient_bytes`, which is a different
+                // quantity in two ways that both matter: it is *live occupancy* —
+                // its own docs call it "a snapshot taken mid-wave, not a
+                // reservation" — and it is a property of the POOL rather than of
+                // this domain's tier. So it could report a figure at least as large
+                // as the plan while this domain's own tier was narrower than the
+                // plan; the replan was then skipped, and the layout below wrote the
+                // new plan's widths onto the old tier's base and ran off its top
+                // into the expert weight zone. The comment above this block
+                // describes that failure exactly — the check simply was not asking
+                // the question the comment assumed.
+                let standing = domain.placed_at.and(domain.placed_bytes);
+                match standing {
+                    Some(bytes) if bytes >= wanted && !crosses_floor => None,
+                    _ => Some(plan),
+                }
             }
-        }
-    };
-    wave_gate().notify_all();
-    let unplanned_base = match replan {
-        Some(plan) => {
-            // Hand the old one back first when there is one, so its ground is
-            // marked dirty and the next tenant cleans it.
-            release_transient(&stream);
-            let bought: usize = plan.iter().sum();
-            Some((place_transient(&stream, bought)?, bought))
-        }
-        None => None,
-    };
-    with_wave_domain(&stream, |domain| {
-        let arena = &domain.arenas[phase_index(phase)];
-        if arena.is_live() {
-            candle::bail!(
-                "wave domain: the {phase:?} span already has a live generation. A \
+        };
+        wave_gate().notify_all();
+        let unplanned_base = match replan {
+            Some(plan) => {
+                // Hand the old one back first when there is one, so its ground is
+                // marked dirty and the next tenant cleans it.
+                release_transient(&stream);
+                let bought: usize = plan.iter().sum();
+                Some((place_transient(&stream, bought)?, bought))
+            }
+            None => None,
+        };
+        let opened = with_wave_domain(&stream, |domain| {
+            let arena = &domain.arenas[phase_index(phase)];
+            if arena.is_live() {
+                candle::bail!(
+                    "wave domain: the {phase:?} span already has a live generation. A \
                  layer leaves one phase before entering the next, so this is a \
                  phase re-entered while still open — the inner guard's drop would \
                  reset the span the outer one is still handing out."
-            )
-        }
-        // **The arenas come into existence here; the ground they sit on does
-        // not.** [`plan_wave_transient`] reserved that once for the whole
-        // forward, so this only lays the three spans out inside it — at an
-        // address this function does not choose and cannot change. That is what
-        // keeps every phase of a sweep at the same offsets.
-        //
-        // **The plan is the size.** `WavePlan` prices this wave's buffers from
-        // the model's geometry, and every variant in it was read off
-        // `super::wave_census` on a real run rather than inferred, so a
-        // twenty-session decode reserves the few megabytes it needs where the
-        // fixed constants reserved 912 MiB — and a wide prefill reserves more
-        // than 912 MiB rather than silently spilling the tail of its expert
-        // chain onto the pool, which is what the constants were doing.
-        //
-        // The fallback covers callers that never priced themselves — tests, the
-        // migration helpers — and it is deliberately the old worst case rather
-        // than a guess. Those callers never reached `plan_wave_transient`
-        // either, so this is also where their reservation is taken.
-        if domain.live_generations == 0 {
-            let plan = domain.planned.unwrap_or_else(fallback_plan);
-            // **A re-placement supersedes the recorded base.** The replan path
-            // above released the standing tier and placed a new one at the
-            // CURRENT frontier, but `placed_at` still holds where the OLD tier
-            // stood — using it would lay the spans at the old base with the new
-            // plan's widths, writing wave intermediates over whatever now owns
-            // the ground between the two addresses (live KV chunks when the
-            // frontier moved up, expert slots when the plan overruns the old
-            // extent). Silent corruption both ways, found independently by
-            // three reviewers. The freshly returned address is authoritative
-            // whenever it exists.
-            if let Some((base, bought)) = unplanned_base {
-                domain.placed_at = Some(base);
-                domain.placed_bytes = Some(bought);
-                // A replan belongs to the forward whose plan outgrew the tier;
-                // an unplanned guard's placement is its own. Preserve whichever
-                // ownership was already recorded when a tier stood, and default
-                // a fresh placement to guard-owned exactly as before.
-                if domain.planned.is_none() {
-                    domain.reserved_by_forward = false;
-                }
+                )
             }
-            let base = match domain.placed_at {
-                Some(base) => base,
-                None => {
-                    // No tier recorded and none was just placed: the domain
-                    // gained a generation or lost its tier between the pricing
-                    // above and this line, which would mean laying these spans
-                    // out on ground priced for a different occupant. Refuse
-                    // rather than corrupt (principle 7).
-                    return Err(candle::Error::Msg(
-                        "wave domain: the tier's ground was priced with no \
-                         generation live and one appeared before it could be \
-                         laid out. The spans this guard would hand out are not \
-                         the ones that were reserved."
-                            .into(),
-                    ));
-                }
-            };
-            // **Refuse a layout that does not fit the ground it was sold.**
+            // **The arenas come into existence here; the ground they sit on does
+            // not.** [`plan_wave_transient`] reserved that once for the whole
+            // forward, so this only lays the three spans out inside it — at an
+            // address this function does not choose and cannot change. That is what
+            // keeps every phase of a sweep at the same offsets.
             //
-            // The replan above is what keeps these in step, so reaching this
-            // with a plan too large means that logic failed. Laying it out
-            // anyway is the corruption: the last span runs off the tier's top
-            // into whatever is above it, which on this span is the expert weight
-            // zone. Refusing costs one wave; the alternative cost a model.
-            let need: usize = plan.iter().sum();
-            match domain.placed_bytes {
-                Some(bytes) if need > bytes => {
-                    return Err(candle::Error::Msg(format!(
-                        "wave domain: the plan needs {need} B but the tier standing at \
+            // **The plan is the size.** `WavePlan` prices this wave's buffers from
+            // the model's geometry, and every variant in it was read off
+            // `super::wave_census` on a real run rather than inferred, so a
+            // twenty-session decode reserves the few megabytes it needs where the
+            // fixed constants reserved 912 MiB — and a wide prefill reserves more
+            // than 912 MiB rather than silently spilling the tail of its expert
+            // chain onto the pool, which is what the constants were doing.
+            //
+            // The fallback covers callers that never priced themselves — tests, the
+            // migration helpers — and it is deliberately the old worst case rather
+            // than a guess. Those callers never reached `plan_wave_transient`
+            // either, so this is also where their reservation is taken.
+            if domain.live_generations == 0 {
+                let plan = domain.planned.unwrap_or_else(fallback_plan);
+                // **A re-placement supersedes the recorded base.** The replan path
+                // above released the standing tier and placed a new one at the
+                // CURRENT frontier, but `placed_at` still holds where the OLD tier
+                // stood — using it would lay the spans at the old base with the new
+                // plan's widths, writing wave intermediates over whatever now owns
+                // the ground between the two addresses (live KV chunks when the
+                // frontier moved up, expert slots when the plan overruns the old
+                // extent). Silent corruption both ways, found independently by
+                // three reviewers. The freshly returned address is authoritative
+                // whenever it exists.
+                if let Some((base, bought)) = unplanned_base {
+                    domain.placed_at = Some(base);
+                    domain.placed_bytes = Some(bought);
+                    // A replan belongs to the forward whose plan outgrew the tier;
+                    // an unplanned guard's placement is its own. Preserve whichever
+                    // ownership was already recorded when a tier stood, and default
+                    // a fresh placement to guard-owned exactly as before.
+                    if domain.planned.is_none() {
+                        domain.reserved_by_forward = false;
+                    }
+                }
+                let base = match domain.placed_at {
+                    Some(base) => base,
+                    // No tier recorded and none was just placed: the decision above
+                    // was taken while a generation was live, and it has dropped
+                    // since. Decide again — see the loop.
+                    None => return Ok(None),
+                };
+                // **Refuse a layout that does not fit the ground it was sold.**
+                //
+                // The replan above is what keeps these in step, so reaching this
+                // with a plan too large means that logic failed. Laying it out
+                // anyway is the corruption: the last span runs off the tier's top
+                // into whatever is above it, which on this span is the expert weight
+                // zone. Refusing costs one wave; the alternative cost a model.
+                let need: usize = plan.iter().sum();
+                match domain.placed_bytes {
+                    Some(bytes) if need > bytes => {
+                        return Err(candle::Error::Msg(format!(
+                            "wave domain: the plan needs {need} B but the tier standing at \
                          {base:#x} bought only {bytes} B. Laying the spans out would run \
                          {} B past its top — into the expert weight zone.",
-                        need - bytes,
-                    )));
+                            need - bytes,
+                        )));
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            // **The floor is the invariant; the tier is only a proxy for it.**
-            //
-            // Comparing the plan against the bytes the tier bought cannot catch
-            // the case this guard exists for, because both figures are derived
-            // from the same `planned` array — they agree by construction and the
-            // comparison always passes. What actually went wrong is one step
-            // further out: `plan_wave_transient` records a forward's plan even
-            // when it cannot place a tier for it (`live_generations > 0`), so a
-            // wider forward arriving behind a live one leaves its plan standing
-            // over the previous, narrower tier. The layout below then walks
-            // `plan` widths from a base chosen for a smaller purchase, and the
-            // last span runs past the tier's top into the expert weight zone.
-            //
-            // So the layout is checked against the thing it must never cross,
-            // read live rather than inferred. `weight_floor` moves only through
-            // `set_weight_floor`, which refuses to cut live KV, so it is a
-            // sound bound at any instant.
-            if let Some(l) = super::region_pool::span_layout(stream.context().ordinal()) {
-                let top = base.saturating_add(need as u64);
-                if top > l.weight_floor {
-                    return Err(candle::Error::Msg(format!(
-                        "wave domain: laying {need} B of spans from {base:#x} reaches \
+                // **The floor is the invariant; the tier is only a proxy for it.**
+                //
+                // Comparing the plan against the bytes the tier bought cannot catch
+                // the case this guard exists for, because both figures are derived
+                // from the same `planned` array — they agree by construction and the
+                // comparison always passes. What actually went wrong is one step
+                // further out: `plan_wave_transient` records a forward's plan even
+                // when it cannot place a tier for it (`live_generations > 0`), so a
+                // wider forward arriving behind a live one leaves its plan standing
+                // over the previous, narrower tier. The layout below then walks
+                // `plan` widths from a base chosen for a smaller purchase, and the
+                // last span runs past the tier's top into the expert weight zone.
+                //
+                // So the layout is checked against the thing it must never cross,
+                // read live rather than inferred. `weight_floor` moves only through
+                // `set_weight_floor`, which refuses to cut live KV, so it is a
+                // sound bound at any instant.
+                if let Some(l) = super::region_pool::span_layout(stream.context().ordinal()) {
+                    let top = base.saturating_add(need as u64);
+                    if top > l.weight_floor {
+                        return Err(candle::Error::Msg(format!(
+                            "wave domain: laying {need} B of spans from {base:#x} reaches \
                          {top:#x}, past the weight floor {:#x} — that is expert-slot \
                          ground, and the FFN span would write activations over resident \
                          weights. Refusing the wave; the plan needs a tier of its own.",
-                        l.weight_floor,
-                    )));
+                            l.weight_floor,
+                        )));
+                    }
+                }
+                let mut at = base;
+                for (i, arena) in domain.arenas.iter().enumerate() {
+                    arena.rebase(at, plan[i])?;
+                    at += plan[i] as u64;
                 }
             }
-            let mut at = base;
-            for (i, arena) in domain.arenas.iter().enumerate() {
-                arena.rebase(at, plan[i])?;
-                at += plan[i] as u64;
-            }
+            // Count only once the guard exists. The count is what `release_if_last`
+            // decrements on drop, so incrementing before a fallible call would strand
+            // the tier permanently if that call ever failed — there would be no guard
+            // to drop and nothing to bring the count back down.
+            let generation = arena.generation(ordinal, arena_idx)?;
+            domain.live_generations += 1;
+            Ok(Some(generation))
+        })?;
+        if let Some(generation) = opened {
+            return Ok(generation);
         }
-        // Count only once the guard exists. The count is what `release_if_last`
-        // decrements on drop, so incrementing before a fallible call would strand
-        // the tier permanently if that call ever failed — there would be no guard
-        // to drop and nothing to bring the count back down.
-        let generation = arena.generation(ordinal, arena_idx)?;
-        domain.live_generations += 1;
-        Ok(generation)
-    })
+    }
+    // Laying these spans out now would put them on ground priced for a
+    // different occupant. Refuse rather than corrupt (principle 7).
+    Err(candle::Error::Msg(format!(
+        "wave domain: the tier's ground was priced with no generation live, and \
+         {MAX_REDECIDE} times running a generation had come or gone before it could \
+         be laid out. The spans this guard would hand out are not the ones that were \
+         reserved."
+    )))
 }
 
 /// Release the tier if `ordinal`'s last wave generation has just dropped.

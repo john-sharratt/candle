@@ -212,9 +212,9 @@ Nothing measures CPU for scheduling.
 
 ### 1.6 Build identity has no order
 
-`/v1/status.build` is a 16-hex SHA-256 over the version string, the running
-executable's length and mtime, and every UI file (`host/src/ui.rs:63-85`). It changes on
-every UI edit and cannot say which of two builds is newer. No crate embeds git.
+`/v1/status.build` is a 16-hex SHA-256 over the version string and every compiled-in UI
+file (`host::ui::build_id`). It changes with the UI a binary carries and cannot say which
+of two builds is newer. No crate embeds git.
 
 ### 1.7 The model a substrate is bound to is known but not surfaced
 
@@ -625,10 +625,10 @@ artifacts are:
   `null`. Every main answers `--build-info` before it parses its arguments
   (`host::build_info::first`, `cluster::version::info::answer_if_asked`), so the probe
   never opens a model or a substrate.
-- **The UI directories** its tenants serve (`zend/web`, `web/content/common`,
-  `web/content/npcd`), as one archive. Members read their UI from disk, not from the
-  binary.
 - For each artifact: its kind, platform (OS and CPU architecture), size and SHA-256.
+
+There is no UI artifact. Each binary carries its tenants' UI compiled in
+(`docs/shared_model_host.md` §3.4), so the executable is the whole build.
 
 **Which members fetch which artifact.**
 
@@ -707,9 +707,7 @@ build is certified (§3.8):
    - **swaps the binary in place.** It moves the running executable into its kept-build
      directory, `<exe dir>/builds/<old count>-<old hash>/`, which Windows allows for a
      running image because it is a rename on the same volume. It then moves the verified
-     artifact to the executable's own path. The UI is swapped the same way: the old UI
-     directory moves into the same kept-build directory, and the archive is unpacked in
-     its place;
+     artifact to the executable's own path. The UI comes with it, compiled in;
    - **relaunches with the same arguments in the same working directory**, through
      `LaunchSpec` (`cluster/src/launch.rs`), which `self_heal` uses too. It records the
      executable path, the original arguments exactly as given (one-shot flags dropped),
@@ -736,8 +734,7 @@ build is certified (§3.8):
      joined, caught up and ready. The watchdog prunes the kept builds beyond *N* and
      exits, and the new process hands the leases back (step 2).
    - **Failure:** the new process exits, or is not ready within 15 minutes. The watchdog
-     stops it if it is still running, and puts the old executable and UI back at their
-     paths. It writes `<data>/upgrade/failed.json` (the build, the reason, and the new
+     stops it if it is still running, and puts the old executable back at its path. It writes `<data>/upgrade/failed.json` (the build, the reason, and the new
      process's last 40 log lines), and relaunches the old build the same way, with
      `--upgrade-failed <count>-<hash>`. The restored member adds the build to
      `<data>/upgrade/refused.json` and never tries it again unless a forced rollout
@@ -756,10 +753,9 @@ build is certified (§3.8):
 **Old builds are kept, the last *N* of them.** Each member keeps the builds it has run
 in `<exe dir>/builds/`, one directory per build, named `<count>-<hash>`. A directory holds:
 
-- the executable;
-- the UI directory it served;
-- `build.json`: the `--build-info` answer, each file's SHA-256, and when the build was
-  installed and when it was retired.
+- the executable, its UI compiled in;
+- `build.json`: the `--build-info` answer, the executable's SHA-256, and when the build
+  was installed and when it was retired.
 
 The rules for keeping them:
 
@@ -940,8 +936,8 @@ of `certify/<app>/<count>-<hash>/<i>` (§3.8, §5.9). It follows that:
   is the same as an automatic rollout.
 - **Never pruned.** The rollout's build is protected in the watchdog's plan, so the
   prune after a successful swap never removes it (§3.9).
-- **The swap from a kept build** moves that directory's executable and UI back into
-  place, and the running build into `builds/` (§3.9). The watchdog and the restore are
+- **The swap from a kept build** moves that directory's executable back into place,
+  and the running build into `builds/` (§3.9). The watchdog and the restore are
   unchanged.
 
 **When it ends:**
@@ -1228,10 +1224,13 @@ matches request paths against it with the same matcher axum uses (`matchit`).
 - `Derived(name)`, a named key function in the `cluster` crate, computed from the
   buffered body.
 
-**UI files come from one member per page load.** Members read their UI from disk on
-every request (`web/src/content.rs:8-9`), so two members at the same build count can
-still hold different page files. A page whose HTML came from one member and whose script
-came from another could break. So:
+**UI files come from one member per page load** — for a site that forwards its pages to
+its members. The consoles' sites do not: the gateway serves their pages from its own
+disk and forwards only `/v1` and `/ws` (`web/web.yaml`), so this rule never fires for
+them. It governs a site whose `/` route is clustered. Members at the same build count
+serve the same compiled-in pages, but two members of different builds do not, and a
+page whose HTML came from one member and whose script came from another could break.
+So:
 
 - The member that serves a page's HTML is chosen round robin among ready members. The
   gateway answers with a cookie, `tokera_ui_<app> = <node>`, scoped to the site and to
@@ -1266,7 +1265,7 @@ Routes by group (the full table is in each crate's `declared`):
 | npcd `/v1/simulate`, `/v1/generate/*`, `/v1/image/*`, `/v1/guest/image`, the effector mount `/v1/local/*` | `Best` |
 | npcd authored reads (`/v1/world`, `/v1/personality`, `/v1/mind/*`, `/v1/npc` list, `/v1/me/profile*`, `/v1/life/catalog`) | `Any` |
 | npcd authored writes | `Best` — they become VFS events (§10.3) |
-| `/v1/status`, `/v1/telemetry`, `/v1/memory`, `/v1/phases`, `/v1/promotes`, `/v1/profile`, `/v1/substrate`, `/v1/tools/calibrate`, npcd `/v1/pulse`, `/v1/pulse/census`, `/v1/pulse/world`, `/v1/pulse/broadcast`, `/v1/pulse/announce`, `/v1/pulse/command-table`, `/v1/pulse/guardian`, `/v1/guest` | `Aggregate(Envelope)` — what each member holds or does for the characters it runs |
+| `/v1/status`, `/v1/telemetry`, `/v1/memory`, `/v1/phases`, `/v1/projections`, `/v1/layers`, `/v1/profile`, `/v1/substrate`, `/v1/tools/calibrate`, npcd `/v1/pulse`, `/v1/pulse/census`, `/v1/pulse/world`, `/v1/pulse/broadcast`, `/v1/pulse/announce`, `/v1/pulse/command-table`, `/v1/pulse/guardian`, `/v1/guest` | `Aggregate(Envelope)` — what each member holds or does for the characters it runs |
 | `/ws/logs` | `Aggregate(Lines)` — one browser socket, every member's lines interleaved, each tagged with its node and host |
 | `POST /v1/cluster/command/:name`, `GET /v1/cluster/command/job/:id`, `PUT /v1/cluster/quorum` | admin only; sent with `x-tokera-node` to one member, or once per member for "all" (§12.4) |
 | npcd `/ws/events`, `/v1/commands` | `Any` |

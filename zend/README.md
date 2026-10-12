@@ -7,7 +7,7 @@ The Zen Code daemon: a persistent AI coding assistant server built on `candle-co
 `zend` is a single long-running binary that owns one `candle_conversation::ConversationEngine` (model weights, KV arenas, scheduler thread, persistence thread, summariser thread) and serves it over HTTP. Two kinds of client talk to it over the same `POST /v1/chat/completions` endpoint:
 
 - **`zen-vscode`** — a Continue fork VS Code extension. It passes its own `tools` array; `zend` treats those as client-executed (emits `tool_calls` in the response and returns immediately, letting Continue post results back as `role: "tool"` messages).
-- **The web chat** (`web/`, served from disk by the host process — no Node, no build step; saving a file is the deployment) — passes no tools, so `zend` injects its own server-registered tool catalog (`zend-tools`), executes any tool calls itself in a loop, and streams only the final assistant text.
+- **The web chat** (`web/`, compiled into the binary and served by the host process — no Node, no build step; through the gateway the same files are served from disk, so a saved page is live on the next refresh) — passes no tools, so `zend` injects its own server-registered tool catalog (`zend-tools`), executes any tool calls itself in a loop, and streams only the final assistant text.
 
 `zend` runs as the one tenant of a **host process** (the `host` crate, `docs/shared_model_host.md`): the host owns logging, the self-heal watchdog, the model download, the HTTP server and the endpoints every tenant shares; zend brings its session and its own routes. `tokerad` is the same host with npcd beside zend, on one model.
 
@@ -42,7 +42,7 @@ Every layer the projection schema declares is filled by convention rather than a
 | `src/stencil` (in `candle-conversation`) | Constrained decoding backing the tool-call/think steering `zend` compiles at load |
 | `src/config.rs` | `DaemonConfig` — workspace, disabled layers, ingest-dir overrides, the model (`host::MODEL`) and where the engine comes from |
 | `src/conv_file_store.rs`, `conv_files.rs` | Per-conversation uploaded-file storage, independent of the inference engine |
-| `web/` | The single-page frontend (chat UI, `substrate.html`, `perf.html`, `project.html`), served from disk by the host |
+| `web/` | The single-page frontend (chat UI, `substrate.html`, `perf.html`, `project.html`), compiled in (`tenant::WEB`) and served by the host; the gateway serves it from disk |
 | `src/prompts/projection.yaml` | The bundled default projection schema |
 | `src/prompts/tools/*.yaml` | Declarative tool definitions (schema, description, calibration examples) |
 
@@ -79,7 +79,7 @@ GET    /v1/conversations/:id/projections/:turn/:event  One projection point in f
 POST   /v1/conversations/:id/projection-context      The context a projection assembled
 ```
 
-The host serves the endpoints every tenant shares, once (`host::endpoints`): `GET /v1/status` (zend's line under `tenants.zend`), `GET /v1/me` (zend's tools modes under `tenants.zend`), `GET /v1/telemetry`, `/v1/memory`, `/v1/phases`, `/v1/promotes`, `/v1/profile`, `GET /v1/tools` (every catalog, each tool naming its tenant), `GET /v1/schema/layers`, `GET /v1/substrate`, `WS /ws/logs`, and the maintenance commands — `POST /v1/cluster/command/:name` (`maintain`, `compact`, `audit`, `self-check`, …) with their job stream at `GET /v1/cluster/command/job/:id` (`docs/replicated_substrate.md` §12.4). It serves the web UI from `web/` for every path no route claims (`GET /`, `/perf`, `/substrate`, `/project`, resolved to their `.html` files), and the shared front-end at `/common/` and `/brand/`.
+The host serves the endpoints every tenant shares, once (`host::endpoints`): `GET /v1/status` (zend's line under `tenants.zend`), `GET /v1/me` (zend's tools modes under `tenants.zend`), `GET /v1/telemetry`, `/v1/memory`, `/v1/phases`, `/v1/projections`, `/v1/layers`, `/v1/profile`, `GET /v1/tools` (every catalog, each tool naming its tenant), `GET /v1/schema/layers`, `GET /v1/substrate`, `WS /ws/logs`, and the maintenance commands — `POST /v1/cluster/command/:name` (`maintain`, `compact`, `audit`, `self-check`, …) with their job stream at `GET /v1/cluster/command/job/:id` (`docs/replicated_substrate.md` §12.4). It serves the web UI from `web/` for every path no route claims (`GET /`, `/perf`, `/substrate`, `/project`, resolved to their `.html` files), and the shared front-end at `/common/` and `/brand/`.
 
 `POST /v1/chat/completions` accepts the standard OpenAI `messages`/`stream`/`max_tokens` fields plus `zend` extensions: **`conv_id` (required)**, `tools` (a `ToolMode` dial — `none`/`restricted`/`comprehensive`), `identity`, `effort`, `verbosity`, `think`, `assistant_prefill`, `force_high_resolution`, `lossless_kv`.
 
@@ -140,7 +140,6 @@ zend's own flags (`src/cli.rs`, `ZendArgs`; the same settings are `tokerad.yaml`
 |---|---|
 | `workspace` (positional, default `.`) | The workspace folder — it must hold a `workspace.yaml` |
 | `--working-dir <path>` | Overrides the workspace: where `substrate/` and an optional `projection.yaml` live, without `chdir`-ing the process. Takes precedence over the positional path. Use it to run a separate "mind" (its own substrate + tuned schema) alongside a normal coding workspace |
-| `--ui <dir>` | Where the web UI is served from; by default `zend/web` in the source tree this binary was built from |
 | `--disable-layer <NAME>` (repeatable) | Take a projection layer (or section collection) **out of service** by schema name: not ingested from the branches, excluded from the provenance gather, not normalization-warmed, not swept for crashed partials. Its turns stay in the substrate untouched — dropping the flag restores them — but while it is set they cannot be selected into any projection. An explicit upload into a disabled per-file layer is the one exception and still reads |
 | `--ingest-dir <layer>=<path>` (repeatable) | Narrow a derived ingest layer to one workspace-relative folder (for the code layers, a folder inside one repository, e.g. `code_reading=candle/zend/src`) |
 | `--max-depth <N>` | Bound how deep the `repo_map` and `code_reading` layers read, in path components below each repository's root or `--ingest-dir` folder (`1` = the root's own files, `2` = one folder down, like `find -maxdepth`), on every branch. Content ingested from deeper is not found by the walk, and is retired like anything else no branch holds |

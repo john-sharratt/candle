@@ -27,7 +27,7 @@ use tokio::task::JoinHandle as TaskHandle;
 use candle::{vram, Device};
 use candle_conversation::models::{Dialect, Model, StrataTokens};
 use candle_conversation::persistence::record::DistillMode;
-use candle_conversation::persistence::{content_hash, SUBSTRATE_DIR};
+use candle_conversation::persistence::{content_hash, OpenProgressHook, OpenStage, SUBSTRATE_DIR};
 use candle_conversation::projection::{
     self, Builder, Conversation, GroupSchema, LayerId, Reserved, SectionId, SectionLoads,
     SelectionRule, SystemItem, SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex,
@@ -39,6 +39,7 @@ use candle_conversation::summary_tree::TurnKind;
 use candle_conversation::working_set::marks::RELEASE_TAG;
 use candle_conversation::working_set::WorkingSetConfig;
 use candle_conversation::FinishReason;
+use candle_conversation::LoadPhase;
 use candle_conversation::RecoveredMessage;
 use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
@@ -996,11 +997,12 @@ impl InferenceState {
         // `workspace` itself.
         let root = workspace.root().to_path_buf();
 
-        // Step 1: model. Engine ctor also reloads the substrate
-        // internally, so the visible boundary between Model and
-        // Substrate steps below is best-effort — the substrate has
-        // actually already loaded by the time we announce its step.
-        progress.set_step(LoadStep::Model);
+        // The pack is found; the steps from here move as the work does — the
+        // substrate open's hook enters `Opening`, the first weight block
+        // mounted enters `Model` (see the builder below). The engine ctor
+        // also reloads the substrate internally, so the visible boundary
+        // between Model and Substrate below is best-effort — the substrate
+        // has already loaded by the time its step is announced.
 
         // The card's headroom at startup, beside the file-ingest pool width
         // that will spend it, so a CUDA OOM during code_read is traceable to
@@ -1199,13 +1201,44 @@ impl InferenceState {
                     .iter()
                     .map(|l| (l.id, l.on_corrupt_turn))
                     .collect(),
-            );
-        // Per-layer progress callback — the library reports
-        // `(layers_loaded, total_layers)` after each transformer block
-        // is mounted. We translate that into the LoadProgress fraction
-        // without coupling the library to our state machine.
+            )
+            // The substrate open is its own step: a store written before
+            // identities is stamped here, record by record, and that ran for a
+            // minute and a half under "Loading model" at 0%. The stage names
+            // the line under the bar; the records fill it.
+            .on_substrate_open({
+                let progress = Arc::clone(&progress);
+                let status = status_tx.clone();
+                let shown: Arc<Mutex<Option<OpenStage>>> = Arc::new(Mutex::new(None));
+                OpenProgressHook(Arc::new(
+                    move |stage: OpenStage, done: usize, total: usize| {
+                        progress.set_step(LoadStep::Opening);
+                        progress.set_step_unit(stage.unit());
+                        progress.set_step_progress(done as u64, total as u64);
+                        let mut last = shown.lock().unwrap_or_else(|e| e.into_inner());
+                        if *last != Some(stage) {
+                            *last = Some(stage);
+                            status.send(stage.label().to_string()).ok();
+                        }
+                    },
+                ))
+            });
+        // The model load, phase by phase: the builder says when it begins —
+        // as soon as the substrate is open — and each phase names the line
+        // under the bar and what its counts are.
         let model_progress = Arc::clone(&progress);
-        let model_hook = move |done: usize, total: usize| {
+        let model_status = status_tx.clone();
+        let model_phase: Mutex<Option<LoadPhase>> = Mutex::new(None);
+        let model_hook = move |phase: LoadPhase, done: usize, total: usize| {
+            if model_progress.current_step() != Some(LoadStep::Model) {
+                model_progress.set_step(LoadStep::Model);
+            }
+            let mut shown = model_phase.lock().unwrap_or_else(|e| e.into_inner());
+            if *shown != Some(phase) {
+                *shown = Some(phase);
+                model_status.send(phase.label().to_string()).ok();
+                model_progress.set_step_unit(phase.unit());
+            }
             model_progress.set_step_progress(done as u64, total as u64);
         };
         // The engine comes from the process's slot: built here, with every
@@ -1218,9 +1251,12 @@ impl InferenceState {
         // shows up as the `LoadStep::Substrate` wait below (its overhang past the
         // weight load) — the two together are the opaque "Loading model" span.
         let t_engine = Instant::now();
+        let waiting_progress = Arc::clone(&progress);
         let engine = engine_source
             .ticket()
-            .engine_with_progress(&mut builder, &device, Some(&model_hook))
+            .engine_with_progress(&mut builder, &device, Some(&model_hook), &|tenants| {
+                waiting_progress.set_waiting_for(tenants)
+            })
             .map_err(|e| anyhow::anyhow!("engine build: {e}"))?;
         tracing::info!(
             elapsed_ms = t_engine.elapsed().as_millis() as u64,
@@ -4858,6 +4894,12 @@ pub struct ZendSession {
     /// (e.g. `"Downloading shard 3/8"`). Surfaced as the loading
     /// section's `detail` field in `GET /v1/status`.
     pub(crate) status_tx: tokio::sync::watch::Sender<String>,
+    /// The detail's own reader, held for the session's life. A `watch` channel
+    /// stores nothing a `send` hands it while no receiver is open, and the
+    /// status snapshot only subscribes for the instant it reads — so without
+    /// this every detail sent between two snapshots was dropped, and the
+    /// loading screen never named the phase it was in.
+    status_rx: tokio::sync::watch::Receiver<String>,
     /// Structured load-state machine — drives the frontend's loading
     /// overlay (current step + progress + completed list).
     load_progress: Arc<LoadProgress>,
@@ -5022,7 +5064,7 @@ impl ZendSession {
             "session initialised",
         );
         let (ready_tx, _) = tokio::sync::watch::channel(false);
-        let (status_tx, _) = tokio::sync::watch::channel(String::new());
+        let (status_tx, status_rx) = tokio::sync::watch::channel(String::new());
         let started_at_ms = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -5033,6 +5075,7 @@ impl ZendSession {
             projection_builder,
             ready_tx,
             status_tx,
+            status_rx,
             load_progress: Arc::new(LoadProgress::new()),
             live_turns: Arc::new(LiveTurns::default()),
             started_at_ms,
@@ -5190,7 +5233,7 @@ impl ZendSession {
     pub fn status_snapshot(&self) -> StatusSnapshot {
         StatusSnapshot {
             loading: self.load_progress.snapshot(),
-            detail: self.status_tx.subscribe().borrow().clone(),
+            detail: self.status_rx.borrow().clone(),
             started_at_ms: self.started_at_ms,
             ingest_backlog: crate::ingest_backlog::snapshot(),
         }
@@ -7408,6 +7451,34 @@ mod projection_schema_tests {
     fn projection_yaml_sets_the_min_yarn_factor() {
         let builder = build_projection_builder(Path::new("demo-project"));
         assert_eq!(builder.schema().min_yarn_factor, Some(2.0));
+    }
+}
+
+#[cfg(test)]
+mod status_detail_tests {
+    use super::ZendSession;
+    use crate::config::DaemonConfig;
+    use crate::workspace::single_repo;
+    use tempfile::TempDir;
+
+    /// **A detail sent while nobody is reading is the next snapshot's.** The
+    /// load sends each phase's name once, as the phase begins; when the
+    /// channel had no reader open, the send was refused and dropped, and every
+    /// snapshot read an empty detail.
+    #[test]
+    fn a_detail_sent_between_snapshots_is_the_next_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let session = ZendSession::new(DaemonConfig::new(
+            single_repo(tmp.path(), "project").unwrap(),
+        ));
+        session
+            .status_tx
+            .send("Reading experts into host memory".into())
+            .unwrap();
+        assert_eq!(
+            session.status_snapshot().detail,
+            "Reading experts into host memory"
+        );
     }
 }
 

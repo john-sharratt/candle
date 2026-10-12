@@ -36,6 +36,7 @@ use super::blend::{cell_axes, gather, CellTable, MARKOV_MIN_CONF};
 use super::cache::{ExpertCacheInner, DECODE_RECENCY_DECAY};
 use super::dispatch::{AbortWord, PassState, SummaryRing};
 use super::fault::FaultWord;
+use super::layer_trace::{publish as publish_layer_trace, RowRouting, TraceBuilder};
 use super::pinned::LayerGeometry;
 use super::promo::{ticket_from_word, PromotionRing, Victim, AHEAD_CAP};
 use super::read_ahead::{listing_readable, median, read_ahead_window, READ_AHEAD_DEPTH};
@@ -348,6 +349,8 @@ pub(crate) struct PipelineState {
     layer_intervals: Vec<f64>,
     last_summary: Option<(Instant, usize)>,
     window: u32,
+    /// The pass being walked, for the telemetry page's layer view.
+    layer_trace: TraceBuilder,
     /// The pad pins read-ahead's listings hold (`ahead_pins`).
     ahead_pins: AheadPins,
     /// Per row, its latest prediction, best first — what the row's listing is
@@ -452,6 +455,7 @@ impl PipelineState {
             layer_intervals: Vec::new(),
             last_summary: None,
             window: 0,
+            layer_trace: TraceBuilder::default(),
             ahead_pins: AheadPins::new(num_moe_layers),
             predicted: vec![Vec::new(); num_moe_layers],
             landed_ahead,
@@ -500,6 +504,9 @@ impl PipelineState {
         // read the listing.
         self.list_landed()?;
         let ring = self.ring.clone();
+        // Already written when the wait begins: the summary sat waiting for
+        // this thread, so its arrival times the thread, not the device.
+        let late = ring.ready(msg.slot, msg.summary_word);
         ring.wait(msg.slot, msg.summary_word, || {
             self.land_device_promotions(false)?;
             self.list_landed()
@@ -541,6 +548,19 @@ impl PipelineState {
             }
             pinned += usize::from(w & SUMMARY_PINNED != 0);
             cold += usize::from(w & SUMMARY_COLD != 0);
+        }
+        let routing = RowRouting {
+            pass: msg.pass,
+            row,
+            arrived,
+            prefill: msg.prefill_width,
+            routed: expert_ids.len(),
+            pinned,
+            cold,
+            late,
+        };
+        if let Some(trace) = self.layer_trace.visit(routing, self.num_moe_layers) {
+            publish_layer_trace(trace);
         }
         if let Ok(mut t) = self.trace.lock() {
             let routed: Vec<(usize, u32, bool)> = expert_ids

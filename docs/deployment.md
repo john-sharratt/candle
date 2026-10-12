@@ -112,11 +112,11 @@ Notes on the arguments:
   npcd refuses to start on a directory without `projection.yaml`, and without `--mind` it
   runs the bundled placeholder with no content. Its startup log names the directory it
   resolved: `projection schema: … (collections resolve under <dir>)`.
-- **The consoles are served from disk, always** (`docs/shared_model_host.md` §3.4): a
-  saved file is served on the next request and an open page reloads itself on its next
-  status poll. npcd's `--content` is gone with its compiled-in copy — a recorded npcd
-  line carrying it must drop it — and the directory is `--ui` (default
-  `web/content/npcd`; zend's, `zend/web`).
+- **The consoles are compiled into the binaries, and the gateway serves them from disk**
+  (`docs/shared_model_host.md` §3.4). Through the gateway (code.tokera.com,
+  bot.tokera.com) a saved page is live on the next refresh with nothing rebuilt; a daemon
+  reached directly serves the pages it was built with. There is no `--ui` and no
+  `--content`: a recorded line carrying either must drop it.
 - **`--gateway <ip>`** (zend and npcd) names a gateway whose identity headers are
   believed; loopback and the bound address always are. npcd believed them from anyone
   before; it now clears them from any other peer, so an npcd behind the gateway on

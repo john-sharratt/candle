@@ -58,7 +58,7 @@ use std::sync::{Mutex, OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ahash::{AHashMap, AHashSet};
 use candle_nn::kv_cache::{
-    rewrite_sealed, try_hold_chunk_locations, QuantFormat, SealedSequence, Sweep,
+    rewrite_sealed, try_hold_chunk_locations, FormatCensus, QuantFormat, SealedSequence, Sweep,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
@@ -2407,6 +2407,17 @@ impl Substrate {
             .count()
     }
 
+    /// The VRAM-resident KV by storage format: every residence holding a hot
+    /// copy — turns and sections alike — counted in token-equivalents
+    /// ([`FormatCensus`]).
+    pub fn hot_format_census(&self) -> FormatCensus {
+        let mut census = FormatCensus::default();
+        for hot in self.residence.iter().filter_map(|r| r.hot.as_deref()) {
+            census.add_layers(hot);
+        }
+        census
+    }
+
     /// Diagnostic split of the hot-without-warm set into (drainable, pinned-skip):
     /// `(drainable_count, drainable_bytes, pinned_count, pinned_bytes)`. The
     /// persistence thread logs it each pass so the tier-migration livelock is
@@ -4277,13 +4288,23 @@ impl Substrate {
             .collect()
     }
 
-    /// Emit one `TreeMetadataPayload` per live tree node across every
-    /// timeline, with the record behind it. Used by compaction to re-emit live
-    /// `TreeMetadata` records.
+    /// Emit one `TreeMetadataPayload` per tree node a `TreeMetadata` record
+    /// set, with that record's identity. Used by compaction and maintenance to
+    /// re-emit live `TreeMetadata` records.
+    ///
+    /// **Only those.** Every turn carries a default `Normal` node from the moment
+    /// it is appended, implied by the turn and rebuilt with it on every load; no
+    /// record ever stated it, so it has no identity. Emitting it anyway wrote one
+    /// unstamped record per plain turn on every rewrite, and the next open read
+    /// those as a store written before identities and rewrote the whole of it —
+    /// 98 s of a restart on zend's store, three and a half minutes on npcd's.
     pub fn live_tree_metadata_payloads(&self) -> Vec<(TreeMetadataPayload, RecordIdentity)> {
         let mut out = Vec::new();
         for (tid, tl) in &self.timelines {
             for (idx, meta) in &tl.tree_meta {
+                let Some(&id) = tl.ids.tree_meta.get(idx) else {
+                    continue;
+                };
                 let kind = match meta.kind {
                     TurnKind::Normal => 0,
                     TurnKind::SummaryOfTurns => 1,
@@ -4297,7 +4318,7 @@ impl Substrate {
                         tree_height: meta.tree_height,
                         children: meta.children.iter().map(|c| c.0).collect(),
                     },
-                    tl.ids.tree_meta.get(idx).copied().unwrap_or_default(),
+                    id,
                 ));
             }
         }
@@ -8388,6 +8409,42 @@ mod tests {
         assert_eq!(sub.tree_meta_of(timeline, idx), Some(&meta));
         let leaves = sub.summary_leaves_chrono(timeline);
         assert_eq!(leaves, vec![idx]);
+    }
+
+    /// **A rewrite carries the tree nodes a record set, and only those.** A
+    /// freshly appended turn's default node is implied by the turn, so it is not
+    /// re-emitted — written out, it would be a record with no identity, and the
+    /// store would read as predating identities at its next open. A node the
+    /// summariser set goes out with the identity it was set under.
+    #[test]
+    fn only_recorded_tree_nodes_are_re_emitted() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let plain = sub.append_with_blocks(timeline, 10, 0, 1);
+        let leaf = sub.append_with_blocks(timeline, 10, 1, 2);
+        assert!(
+            sub.tree_meta_of(timeline, plain).is_some(),
+            "every turn has a node"
+        );
+        assert!(sub.live_tree_metadata_payloads().is_empty());
+
+        let id = RecordIdentity {
+            origin: 7,
+            oseq: 3,
+            gen: 0,
+            epoch: 0,
+            hlc: 3 << 16,
+        };
+        let meta = TreeNodeMeta {
+            kind: TurnKind::SummaryOfTurns,
+            children: vec![plain],
+            tree_height: 1,
+        };
+        sub.set_tree_meta(timeline, leaf, meta, id);
+        let emitted = sub.live_tree_metadata_payloads();
+        assert_eq!(emitted.len(), 1);
+        let (payload, got) = &emitted[0];
+        assert_eq!((payload.turn_index, payload.kind, got), (leaf.0, 1, &id));
+        assert_eq!(payload.children, vec![plain.0]);
     }
 
     /// Three SoT leaves carry into one ternary SoS; the SoS is the sole peak.

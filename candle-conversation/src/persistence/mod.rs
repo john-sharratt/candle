@@ -56,6 +56,7 @@ pub mod log_file;
 pub mod maintenance;
 pub mod manifest;
 mod model_binding;
+pub mod open_progress;
 pub mod payload_parts;
 pub mod pipeline;
 pub mod priority_lock;
@@ -114,6 +115,8 @@ use inherit::InheritedSubstrate;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 pub use model_binding::{Admit, BoundSubstrate, ModelBinding};
+use open_progress::MibMeter;
+pub use open_progress::{OpenProgress, OpenProgressHook, OpenStage};
 pub use priority_lock::PersistenceLock;
 use rebase::{RebaseEntry, RebaseMap};
 use record::verify_record_crc;
@@ -127,7 +130,7 @@ use relocation_watch::RelocationWatch;
 use replica::{AppliedSet, DeferredRecord, Located, LocationIndex, OriginApplied, ReplicaPayload};
 use sealed_reader::SealedReader;
 use segment::SegmentId;
-use segmented_log::SegmentedLog;
+use segmented_log::{store_mib, SegmentedLog};
 use stamped_locs::StampedLocs;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use survival::RecordCensus;
@@ -323,12 +326,23 @@ impl SharedSubstrate {
     /// Open the substrate under `dir` for `admit`'s model and share it. The
     /// one-liner for a host with no records of its own to collect on the walk.
     pub fn open_in(dir: &Path, admit: Admit<'_>) -> Result<Self> {
+        Self::open_in_reporting(dir, admit, &|_, _, _| {})
+    }
+
+    /// [`Self::open_in`], telling `progress` how the open goes — a store written
+    /// before identities is rewritten whole before it returns.
+    pub fn open_in_reporting(
+        dir: &Path,
+        admit: Admit<'_>,
+        progress: OpenProgress<'_>,
+    ) -> Result<Self> {
         let mut substrate = Substrate::new();
         let persistence = SubstratePersistence::open_adopting(
             &dir.join(SUBSTRATE_DIR),
             &mut substrate,
             admit,
             |_| {},
+            progress,
         )?;
         Ok(Self::new(substrate, persistence))
     }
@@ -617,9 +631,9 @@ pub struct SubstratePersistence {
     /// The generations fixed for what this node wrote cut off (§6.7), applied
     /// to its own records wherever it reads them back.
     rebases: RebaseMap,
-    /// The open met a record written before identities: the store is to be
-    /// adopted ([`adoption`]).
-    predates_identities: bool,
+    /// The records the open met that were written before identities, by type:
+    /// any at all, and the store is to be adopted ([`adoption`]).
+    unstamped: RecordCensus,
     /// Told the `oseq` of every record this node writes that may be sent, once
     /// each, as it is appended — the replication tap (§6.3).
     tap: Option<Tap>,
@@ -923,7 +937,13 @@ impl SubstratePersistence {
         dir: &Path,
         substrate: &mut Substrate,
     ) -> Result<SubstratePersistence> {
-        Self::open_adopting(&dir.join(SUBSTRATE_DIR), substrate, Admit::Unbound, |_| {})
+        Self::open_adopting(
+            &dir.join(SUBSTRATE_DIR),
+            substrate,
+            Admit::Unbound,
+            |_| {},
+            &|_, _, _| {},
+        )
     }
 
     /// The writable open with a substrate: walk the store into `substrate`
@@ -933,27 +953,56 @@ impl SubstratePersistence {
     /// left as it was found. `sink` sees the walk once: the adoption changes
     /// record headers and the payloads that name a writer — turn tombstones and
     /// file events — and leaves every other payload as it was.
+    ///
+    /// `progress` is told the stage it is in and how far through it the open
+    /// is: MiB of log walked against the store's size for a walk, records
+    /// rewritten of the live set for the adoption ([`OpenStage::unit`]).
     fn open_adopting<F>(
         dir: &Path,
         substrate: &mut Substrate,
         admit: Admit<'_>,
         mut sink: F,
+        progress: OpenProgress<'_>,
     ) -> Result<Self>
     where
         F: FnMut(&WalkEntry),
     {
+        let total = store_mib(dir);
+        progress(OpenStage::Reading, 0, total);
+        let mut meter = MibMeter::default();
         let mut sp = Self::from_dir_with_sink(dir, &[], false, |entry| {
             substrate.apply_walker_entry(entry);
             sink(entry);
+            if let Some(mib) = meter.add(entry.size) {
+                progress(OpenStage::Reading, mib.min(total), total);
+            }
         })?;
+        progress(OpenStage::Reading, total, total);
         sp.admit(admit)?;
-        if !sp.predates_identities {
+        if !sp.predates_identities() {
             return Ok(sp);
         }
-        sp.adopt(substrate)?;
+        sp.adopt(substrate, &|done, total| {
+            progress(OpenStage::Stamping, done, total)
+        })?;
         drop(sp);
         *substrate = Substrate::new();
-        Self::from_dir_with_sink(dir, &[], false, |entry| substrate.apply_walker_entry(entry))
+        let total = store_mib(dir);
+        progress(OpenStage::Rereading, 0, total);
+        let mut meter = MibMeter::default();
+        let sp = Self::from_dir_with_sink(dir, &[], false, |entry| {
+            substrate.apply_walker_entry(entry);
+            if let Some(mib) = meter.add(entry.size) {
+                progress(OpenStage::Rereading, mib.min(total), total);
+            }
+        })?;
+        progress(OpenStage::Rereading, total, total);
+        Ok(sp)
+    }
+
+    /// Whether the open met records written before identities.
+    fn predates_identities(&self) -> bool {
+        self.unstamped.total() > 0
     }
 
     /// As [`Self::open_in_with_substrate`], but **read-only**: the segment set
@@ -995,11 +1044,12 @@ impl SubstratePersistence {
         substrate: &mut Substrate,
         admit: Admit<'_>,
         sink: F,
+        progress: OpenProgress<'_>,
     ) -> Result<SubstratePersistence>
     where
         F: FnMut(&WalkEntry),
     {
-        Self::open_adopting(&dir.join(SUBSTRATE_DIR), substrate, admit, sink)
+        Self::open_adopting(&dir.join(SUBSTRATE_DIR), substrate, admit, sink, progress)
     }
 
     /// Open over an ordered list of paths. The last entry is the active,
@@ -1085,10 +1135,12 @@ impl SubstratePersistence {
         let rebases = RefCell::new(RebaseMap::default());
         let held: RefCell<Vec<WalkEntry>> = RefCell::new(Vec::new());
         let draining = Cell::new(false);
-        let mut predates = false;
+        let mut unstamped = RecordCensus::new();
         let mut walk = |entry: &WalkEntry| {
             let h = &entry.record.header;
-            predates |= adoption::predates_identities(h);
+            if adoption::predates_identities(h) {
+                unstamped.record(h.record_type);
+            }
             if h.record_type == RecordType::Rebase {
                 if let Ok(map) = RebaseMap::decode(&entry.record.payload) {
                     rebases.borrow_mut().merge(&map);
@@ -1219,7 +1271,7 @@ impl SubstratePersistence {
             replica,
             locations,
             rebases,
-            predates_identities: predates,
+            unstamped,
             tap: None,
             own_written,
             out_of_space: false,
@@ -3026,6 +3078,9 @@ impl SubstratePersistence {
     /// Inherited logs are untouched — a child never compacts a base it only
     /// reads (§13.5). A read-only handle refuses with
     /// [`PersistenceError::ReadOnly`].
+    ///
+    /// `progress` is told the records written of the live set — `(0, 0)` while
+    /// that set is still being collected.
     pub fn compact(
         &mut self,
         substrate: &mut Substrate,
@@ -3037,21 +3092,23 @@ impl SubstratePersistence {
     /// Adopt a store written before identities (§6.2, [`adoption`]): one
     /// compaction stamps every record that carries none as this node's own.
     /// Run by the first writable open of such a store, which then opens it
-    /// again; a no-op on a store that needs none.
-    fn adopt(&mut self, substrate: &mut Substrate) -> Result<()> {
-        if !self.predates_identities {
+    /// again; a no-op on a store that needs none. `progress` counts the
+    /// records rewritten, as [`Self::compact`]'s does.
+    fn adopt(&mut self, substrate: &mut Substrate, progress: &dyn Fn(usize, usize)) -> Result<()> {
+        if !self.predates_identities() {
             return Ok(());
         }
         tracing::info!(
             target: "candle_conversation::persistence::identity",
             node = format!("{:016x}", self.node()),
             dir = %self.dir().display(),
+            unstamped = %self.unstamped.summary(),
             "this store was written before records carried an identity — rewriting it once, \
              with every record stamped as this node's own"
         );
         let mut adoption = Adoption::new(self.minter.clone());
-        self.rewrite(substrate, None, Some(&mut adoption))?;
-        self.predates_identities = false;
+        self.rewrite(substrate, Some(progress), Some(&mut adoption))?;
+        self.unstamped = RecordCensus::new();
         Ok(())
     }
 
@@ -3065,17 +3122,17 @@ impl SubstratePersistence {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
-        // Coarse phase progress (5 phases) for the loading screen.
-        let report = |phase: usize| {
+        // Records written of the live set, for the loading screen: `(0, 0)`
+        // until the set is collected.
+        let report = |done: usize, total: usize| {
             if let Some(p) = progress {
-                p(phase, 5);
+                p(done, total);
             }
         };
-        report(0);
+        report(0, 0);
 
         // 1. Quiesce — every staged write is now durable on disk.
         self.segments.commit()?;
-        report(1);
 
         // 2. Collect the live winners, in dependency order — sourced from
         //    substrate state (per-entity) + manifest singletons. Each record
@@ -3136,7 +3193,8 @@ impl SubstratePersistence {
                 );
             }
         }
-        report(2);
+        let total = live.len();
+        report(0, total);
 
         // 3. Write the live set into a compacted scratch file (a fresh index
         //    chain interleaved), reading read-back records off the source
@@ -3150,11 +3208,10 @@ impl SubstratePersistence {
                 &live,
                 &mut |seg, off, dest| segments.read_into(seg, off, dest),
                 adoption,
+                &mut |done| report(done, total),
             )?
         };
-        report(3);
         self.segments.adopt_compacted(new_log, &scratch)?;
-        report(4);
 
         // 4. Adopt the compacted manifest and refresh the metadata caches.
         //    `write_compacted_log` stamped every singleton with `FIRST_SEGMENT`,
@@ -3269,7 +3326,7 @@ impl SubstratePersistence {
         //    Re-point them at the rebuilt stream index so a mid-session
         //    cold→hot elevation reads the right bytes.
         substrate.refresh_cold_refs();
-        report(5);
+        report(total, total);
         Ok(())
     }
 }
@@ -3536,6 +3593,7 @@ mod tests {
                     seen.push(entry.record.header.stream_id);
                 }
             },
+            &|_, _, _| {},
         )
         .unwrap();
         seen.sort_unstable();

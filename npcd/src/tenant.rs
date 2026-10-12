@@ -7,6 +7,7 @@
 //! cast on its substrate, the runtime and its sinks, the hosted worlds, the
 //! routes — and starts the engine load on the host's engine slot.
 
+use std::cell::Cell;
 use std::env::current_dir;
 use std::net::SocketAddr;
 use std::path::{absolute, Path, PathBuf};
@@ -19,13 +20,14 @@ use axum::middleware::{self, Next};
 use axum::Router;
 use candle_conversation::models::DialectType;
 use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
-use candle_conversation::persistence::SUBSTRATE_DIR;
+use candle_conversation::persistence::{OpenStage, SUBSTRATE_DIR};
 use candle_conversation::Capabilities;
 use clap::Args;
 use cluster::dispatch::Dispatch;
 use futures::future::BoxFuture;
 use host::guard::{Api, Guarded, Routes};
 use host::{OneShot, Running, Tenant, TenantContext, TenantUi};
+use include_dir::{include_dir, Dir};
 use notify::RecommendedWatcher;
 use serde::Deserialize;
 use serde_json::Value;
@@ -70,9 +72,8 @@ pub fn requires() -> Capabilities {
     }
 }
 
-/// npcd's console: `web/content/npcd` in the source tree this binary was built
-/// from.
-pub const DEFAULT_UI: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/content/npcd");
+/// npcd's console, `web/content/npcd`, compiled in.
+pub static CONSOLE: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../web/content/npcd");
 
 /// npcd's flags.
 #[derive(Args, Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -106,13 +107,6 @@ pub struct NpcdArgs {
     /// The branch of `--mind-repo` that is the record.
     #[arg(long, value_name = "BRANCH", default_value = DEFAULT_MIND_BRANCH)]
     pub mind_branch: String,
-
-    /// The directory the console is served from, read per request — saving a
-    /// file there is the deployment. By default `web/content/npcd` in the
-    /// source tree this binary was built from; a relative path given here
-    /// resolves against the working directory.
-    #[arg(long, default_value = DEFAULT_UI)]
-    pub ui: PathBuf,
 
     /// Log the identity each request to npcd's own routes arrived with, the
     /// peer it came from, and the role it resolved to. Header **values are
@@ -195,7 +189,6 @@ impl Default for NpcdArgs {
             mind: None,
             mind_repo: None,
             mind_branch: DEFAULT_MIND_BRANCH.to_string(),
-            ui: PathBuf::from(DEFAULT_UI),
             log_identity: false,
             forget_conversations: false,
             forget_dreams: false,
@@ -310,7 +303,7 @@ impl Tenant for NpcdTenant {
     fn ui(&self) -> TenantUi {
         TenantUi {
             hosts: vec!["bot.tokera.com".into(), "npcd.localhost".into()],
-            content: self.args.ui.clone(),
+            content: &CONSOLE,
             default: false,
         }
     }
@@ -389,9 +382,21 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     );
 
     // The cast, rebuilt from the substrate's redo log. The one read of that
-    // log — every request after this is answered from memory.
-    let mut npcs = Npcs::load(&data)
-        .map_err(|e| anyhow::anyhow!("opening the substrate at {}: {e:?}", data.display()))?;
+    // log — every request after this is answered from memory. Shown on the
+    // loading page as it runs: a store written before identities is rewritten
+    // whole here, once, and on a large one that is minutes.
+    let starting = Arc::clone(&ctx.starting);
+    starting.set_step("opening", "Opening the substrate");
+    let stage_shown: Cell<Option<OpenStage>> = Cell::new(None);
+    let mut npcs = Npcs::load_reporting(&data, &|stage, done, total| {
+        if stage_shown.get() != Some(stage) {
+            stage_shown.set(Some(stage));
+            starting.set_detail(stage.label());
+        }
+        starting.set_progress(done as u64, total as u64, stage.unit());
+    })
+    .map_err(|e| anyhow::anyhow!("opening the substrate at {}: {e:?}", data.display()))?;
+    starting.set_step("starting", "Starting");
     npcs.substrate()
         .persistence
         .lock()

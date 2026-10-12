@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use super::config::Qwen35Config;
 use crate::models::expert_lre::{minimum_resident_slots, ExpertCache, ExpertCacheSetup};
+#[cfg(feature = "cuda")]
+use crate::models::load_phase::LoadProgress;
 use crate::models::model_pack::ModelPack;
 
 /// Build the expert cache for a routed pack, against the span the dense
@@ -72,7 +74,7 @@ pub fn build_expert_cache_for(
     n_expert_used: usize,
     n_layers_total: usize,
     device: &Device,
-    progress: Option<&dyn Fn(usize, usize)>,
+    progress: Option<LoadProgress<'_>>,
     offloaded_bytes: u64,
 ) -> Result<Option<Arc<ExpertCache>>> {
     use crate::models::expert_lre::section::{geometries_of, open_section};

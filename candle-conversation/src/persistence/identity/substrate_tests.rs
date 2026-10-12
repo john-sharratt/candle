@@ -72,6 +72,7 @@ fn on_disk(dir: &Path) -> Vec<Seen> {
             let h = &entry.record.header;
             seen.push((h.record_type, h.stream_id, h.chunk_index, h.identity()));
         },
+        &|_, _, _| {},
     )
     .unwrap();
     seen

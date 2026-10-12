@@ -48,6 +48,7 @@ use crate::models::device_embedding::DeviceEmbedding;
 use crate::models::expert_lre::section::open_section;
 use crate::models::expert_lre::ExpertCache;
 use crate::models::latent_moe::GgufModel;
+use crate::models::load_phase::{LoadPhase, LoadProgress};
 use crate::models::model_pack::ModelPack;
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::quantized_mlp::QuantizedMlp;
@@ -127,12 +128,12 @@ impl Qwen4ExpGpu {
         Self::load_with_progress(pack, device, None)
     }
 
-    /// [`Self::load`] reporting `(experts_filled, total_experts)` as the expert
-    /// cache fills from the pack.
+    /// [`Self::load`] reporting each phase of the load as it runs: the dense
+    /// blocks mounted, then the expert cache's fill.
     pub fn load_with_progress(
         pack_path: &Path,
         device: &Device,
-        progress: Option<&dyn Fn(usize, usize)>,
+        progress: Option<LoadProgress<'_>>,
     ) -> Result<Self> {
         // The KV span is sized from the governor's balloon-measured capacity;
         // without one it falls back to the small test constant and the expert
@@ -254,6 +255,9 @@ impl Qwen4ExpGpu {
         // did before.
         let n_blocks = cfg.num_layers + cfg.num_mtp_layers;
         for li in 0..n_blocks {
+            if let Some(report) = progress {
+                report(LoadPhase::Weights, li, n_blocks);
+            }
             let p = format!("blk.{li}");
             let g = &mut gguf;
             let hc_attn = hc(g, &format!("{p}.hc_attn"), true)?;
@@ -448,6 +452,9 @@ impl Qwen4ExpGpu {
         // `build_expert_cache_for` refuses one that does not: a missing block
         // would have every block above the gap compute with the previous MoE
         // layer's experts while the last fell off the end of the list.
+        if let Some(report) = progress {
+            report(LoadPhase::Weights, n_blocks, n_blocks);
+        }
         let experts = build_expert_cache_for(
             &pack,
             cfg.moe.n_experts,

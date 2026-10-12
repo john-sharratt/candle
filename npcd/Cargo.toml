@@ -48,6 +48,8 @@ serde      = { workspace = true }
 # together at startup, so they must be the same version or the `Router` types
 # do not unify.
 axum       = { version = "0.7", features = ["macros", "ws"] }
+# The console, compiled in (`tenant::CONSOLE`).
+include_dir = { version = "0.7" }
 # The process npcd runs in: logging, the model, the HTTP server, the shared
 # endpoints (`docs/shared_model_host.md`). npcd is one of its tenants.
 host       = { path = "../host" }
@@ -123,6 +125,9 @@ candle-conversation = { path = "../candle-conversation", features = ["hub"] }
 # stand up an engine that runs at a rate nobody would call inference, and would
 # do it silently.
 candle = { workspace = true, features = ["cuda"] }
+
+[build-dependencies]
+embed-watch = { path = "../embed-watch" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

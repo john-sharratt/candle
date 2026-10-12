@@ -17,7 +17,7 @@ use crate::error::ConversationError;
 use crate::guest::checkpoint::gguf_header;
 use crate::models::identity::{rope_key, ModelIdentity, WeightFiles};
 use crate::models::DialectType;
-use crate::persistence::{Admit, BoundSubstrate, SharedSubstrate};
+use crate::persistence::{Admit, BoundSubstrate, OpenProgressHook, OpenStage, SharedSubstrate};
 use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::tenant_rank::TenantRank;
 use crate::tree::ConversationTreeConfig;
@@ -28,6 +28,7 @@ use candle::{DType, Device};
 use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_model::{BatchedInference, BatchedModelCore};
+use candle_transformers::models::load_phase::{LoadPhase, LoadProgress};
 use candle_transformers::models::model_pack::keys::TOKENIZER_JSON;
 #[cfg(feature = "hub")]
 use candle_transformers::models::model_pack::HubFetch;
@@ -181,6 +182,11 @@ pub struct ModelBuilder {
     /// substrate's own — its default, or what the host that handed it over
     /// set.
     tombstone_retention: Option<Duration>,
+    /// Told how the substrate open goes when this builder opens it — the
+    /// stage, and the records rewritten when a store written before
+    /// identities is stamped (minutes on a large one). `None` when nobody is
+    /// watching. See [`ModelBuilder::on_substrate_open`].
+    open_progress: Option<OpenProgressHook>,
     /// The substrate's ingest-cancel latch, forwarded to
     /// [`EngineConfig::cancel`]. See [`ModelBuilder::cancel_token`].
     cancel: CancelToken,
@@ -243,6 +249,7 @@ impl ModelBuilder {
             substrate: None,
             read_only_substrate: false,
             tombstone_retention: None,
+            open_progress: None,
             cancel: CancelToken::new(),
             tenant_rank: TenantRank::FIRST,
             layer_corrupt_turn: HashMap::new(),
@@ -376,6 +383,15 @@ impl ModelBuilder {
     /// to a handed-over substrate as to one this builder opens.
     pub fn tombstone_retention(mut self, retention: Duration) -> Self {
         self.tombstone_retention = Some(retention);
+        self
+    }
+
+    /// Report the substrate open this builder makes — its stage, and the
+    /// records rewritten when the store is stamped with identities — to
+    /// `hook`, for a loading screen. Has no effect once [`Self::substrate`] has
+    /// handed over an open one.
+    pub fn on_substrate_open(mut self, hook: OpenProgressHook) -> Self {
+        self.open_progress = Some(hook);
         self
     }
 
@@ -1038,7 +1054,12 @@ impl ModelBuilder {
                 let opened = if self.read_only_substrate {
                     SharedSubstrate::open_in_read_only(&dir)
                 } else {
-                    SharedSubstrate::open_in(&dir, Admit::Key(identity.key()))
+                    let report = |stage: OpenStage, done: usize, total: usize| {
+                        if let Some(hook) = &self.open_progress {
+                            hook.report(stage, done, total);
+                        }
+                    };
+                    SharedSubstrate::open_in_reporting(&dir, Admit::Key(identity.key()), &report)
                 };
                 opened
                     .map_err(|e| ConversationError::Other(format!("substrate persistence: {e}")))?
@@ -1099,7 +1120,7 @@ impl ModelBuilder {
         &self,
         weights: &WeightFiles,
         device: &Device,
-        progress: Option<&dyn Fn(usize, usize)>,
+        progress: Option<LoadProgress<'_>>,
     ) -> crate::Result<LoadedModel> {
         self.refuse_unsupported_settings()?;
         let int8_mode = ModelPack::open(&weights.pack)
@@ -1181,7 +1202,7 @@ impl ModelBuilder {
         weights: &WeightFiles,
         device: &Device,
         int8mode: Int8Mode,
-        progress: Option<&dyn Fn(usize, usize)>,
+        progress: Option<LoadProgress<'_>>,
     ) -> crate::Result<Box<dyn ManagedBatchedModel + Send>> {
         let max_seq = self.max_seq_len;
         let model_path = weights.pack.as_path();
@@ -1313,15 +1334,14 @@ impl ModelBuilder {
         self.engine_with_progress(device, None)
     }
 
-    /// Same as [`Self::engine`] but accepts an optional per-layer
-    /// progress callback. The callback is invoked as
-    /// `(layers_loaded, total_layers)` after each transformer block's
-    /// weights are mounted — enables a UI progress bar without
-    /// coupling this builder to the daemon's progress type.
+    /// Same as [`Self::engine`] but told how the model load goes: each
+    /// [`LoadPhase`] as it begins — the first as soon as the substrate is open —
+    /// and how far through it is. A loader that counts nothing within a phase
+    /// still says when it begins.
     pub fn engine_with_progress(
         &mut self,
         device: &Device,
-        progress: Option<&dyn Fn(usize, usize)>,
+        progress: Option<LoadProgress<'_>>,
     ) -> crate::Result<ConversationEngine> {
         let prepared = self.prepare(device)?;
         self.engine_from_prepared(prepared, device, progress)
@@ -1527,7 +1547,7 @@ impl ModelBuilder {
         &mut self,
         prepared: Prepared,
         device: &Device,
-        progress: Option<&dyn Fn(usize, usize)>,
+        progress: Option<LoadProgress<'_>>,
     ) -> crate::Result<ConversationEngine> {
         let Prepared {
             pack,
@@ -1542,6 +1562,12 @@ impl ModelBuilder {
         let weights = self.weight_files(&pack)?;
         let identity = self.model_identity(&weights)?;
         let substrate = self.bind_substrate(&identity)?;
+        // The substrate is open, and everything from here is the model: say
+        // so now, before the setup below and the load, rather than at the
+        // loader's first count.
+        if let Some(report) = progress {
+            report(LoadPhase::Weights, 0, 0);
+        }
 
         let mut config = self.engine_config(&tokenizer, device, substrate);
 

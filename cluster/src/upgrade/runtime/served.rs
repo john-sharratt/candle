@@ -1,26 +1,21 @@
-//! The artifacts a member can serve (§3.9): its running build's executable and
-//! UI, each build it keeps, each it verified, and — as a candidate — every
-//! sibling binary of its build. Each is announced with `BUILD_HAVE` (or
-//! `BUILD_OFFER`), and a `BUILD_FETCH` for its SHA-256 is answered from the
-//! file it names.
-//!
-//! A UI is served as an archive: the running build's and each kept build's
-//! are packed into `<data>/upgrade/` when the member starts, so every one is a
-//! file of known size before it is announced.
+//! The artifacts a member can serve (§3.9): its running build's executable,
+//! each build it keeps, each it verified, and — as a candidate — every sibling
+//! binary of its build. Each is announced with `BUILD_HAVE` (or `BUILD_OFFER`),
+//! and a `BUILD_FETCH` for its SHA-256 is answered from the file it names. A
+//! build is its executables alone: the UI each serves is compiled in.
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use super::setup::Setup;
 use crate::frame::{Artifact, BuildArtifacts, BuildId};
-use crate::upgrade::artifacts::{artifact_of, Offered, ANY_PLATFORM, UI_KIND};
-use crate::upgrade::kept::{builds_dir, list, UI};
+use crate::upgrade::artifacts::{artifact_of, Offered};
+use crate::upgrade::kept::{builds_dir, list};
 use crate::upgrade::parts::Parts;
-use crate::upgrade::sum::{hex, sha256, unhex};
-use crate::upgrade::ui_archive::{pack, read};
+use crate::upgrade::sum::{hex, unhex};
 use crate::version::info::BuildInfo;
 
 /// Where a served artifact comes from.
@@ -115,83 +110,33 @@ impl OfferFile {
     }
 }
 
-/// Pack the UI directories `ui` under `root` into `to`, as an artifact.
-fn ui_item(
-    build: &BuildId,
-    from: HeldAs,
-    root: &Path,
-    ui: &[String],
-    to: &Path,
-) -> io::Result<Item> {
-    let dirs: Vec<(String, PathBuf)> = ui.iter().map(|n| (n.clone(), root.join(n))).collect();
-    let archive = pack(read(&dirs)?);
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(to, &archive)?;
-    Ok(Item {
-        build: build.clone(),
-        artifact: Artifact {
-            kind: UI_KIND.into(),
-            platform: ANY_PLATFORM.into(),
-            size: archive.len() as u64,
-            sha256: sha256(&archive),
-        },
-        from,
-        path: to.to_path_buf(),
-        info: None,
-    })
-}
-
-/// The running build's executable and UI.
+/// The running build's executable.
 pub fn running(setup: &Setup) -> io::Result<Vec<Item>> {
-    let build = setup.info.build();
-    let mut items = vec![Item {
-        build: build.clone(),
+    Ok(vec![Item {
+        build: setup.info.build(),
         artifact: artifact_of(&setup.exe, &setup.info.kind, &setup.info.platform)?,
         from: HeldAs::Running,
         path: setup.exe.clone(),
         info: Some(setup.info.clone()),
-    }];
-    if !setup.ui.is_empty() {
-        items.push(ui_item(
-            &build,
-            HeldAs::Running,
-            &setup.root,
-            &setup.ui,
-            &setup.upgrade_dir.join("running.ui"),
-        )?);
-    }
-    Ok(items)
+    }])
 }
 
-/// Every kept build's executable and UI.
+/// Every kept build's executable.
 pub fn kept(setup: &Setup) -> Vec<Item> {
     let mut items = Vec::new();
     for k in list(&builds_dir(&setup.exe)) {
-        let build = k.json.info.build();
         let Some(exe) = k.json.files.first() else {
             continue;
         };
         let path = k.dir.join(&exe.path);
         if let Ok(artifact) = artifact_of(&path, &k.json.info.kind, &k.json.info.platform) {
             items.push(Item {
-                build: build.clone(),
+                build: k.json.info.build(),
                 artifact,
                 from: HeldAs::Kept,
                 path,
                 info: Some(k.json.info.clone()),
             });
-        }
-        if !k.json.ui.is_empty() {
-            let packed = setup
-                .upgrade_dir
-                .join("kept")
-                .join(format!("{}.ui", k.name));
-            match ui_item(&build, HeldAs::Kept, &k.dir.join(UI), &k.json.ui, &packed) {
-                Ok(item) => items.push(item),
-                Err(e) => tracing::warn!(build = %k.name, "a kept build's UI is unreadable: {e}"),
-            }
         }
     }
     items
@@ -272,6 +217,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::upgrade::kept::{write_json, BuildJson, FileSum};
+    use crate::upgrade::sum::sha256;
     use crate::version::info::{Opens, ZEND};
 
     fn info(count: u32) -> BuildInfo {
@@ -287,48 +233,39 @@ mod tests {
 
     fn setup(t: &TempDir) -> Setup {
         fs::create_dir_all(t.path().join("bin")).unwrap();
-        fs::create_dir_all(t.path().join("zend/web")).unwrap();
         fs::write(t.path().join("bin/zend"), b"exe 12").unwrap();
-        fs::write(t.path().join("zend/web/i.html"), b"page 12").unwrap();
         Setup {
             info: info(12),
             exe: t.path().join("bin/zend"),
-            root: t.path().to_path_buf(),
-            ui: vec!["zend/web".into()],
             upgrade_dir: t.path().join("data/upgrade"),
             keep_builds: 5,
             failed_from: None,
         }
     }
 
-    /// The running build serves its executable and its UI as an archive.
+    /// The running build serves its executable, and nothing else: its UI is
+    /// inside it.
     #[test]
     fn the_running_build_is_served() {
         let t = TempDir::new().unwrap();
         let s = setup(&t);
         let items = running(&s).unwrap();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 1);
         assert_eq!(items[0].artifact.sha256, sha256(b"exe 12"));
         assert_eq!(items[0].from, HeldAs::Running);
-        assert_eq!(items[1].artifact.kind, UI_KIND);
-        assert_eq!(
-            items[1].artifact.sha256,
-            sha256(&fs::read(&items[1].path).unwrap())
-        );
         let groups = grouped(&items);
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].artifacts.len(), 2);
+        assert_eq!(groups[0].artifacts.len(), 1);
     }
 
-    /// A kept build serves its executable and its UI packed from `ui/`.
+    /// A kept build serves its executable.
     #[test]
     fn a_kept_build_is_served() {
         let t = TempDir::new().unwrap();
         let s = setup(&t);
         let dir = t.path().join("bin/builds/10-h10");
-        fs::create_dir_all(dir.join("ui/zend/web")).unwrap();
+        fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("zend"), b"exe 10").unwrap();
-        fs::write(dir.join("ui/zend/web/i.html"), b"page 10").unwrap();
         write_json(
             &dir,
             &BuildJson {
@@ -337,18 +274,16 @@ mod tests {
                     path: "zend".into(),
                     sha256: hex(&sha256(b"exe 10")),
                 }],
-                ui: vec!["zend/web".into()],
-                ui_archive: String::new(),
                 installed_ms: 1,
                 retired_ms: 2,
             },
         )
         .unwrap();
         let items = kept(&s);
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 1);
         assert_eq!(items[0].build, info(10).build());
         assert_eq!(items[0].artifact.sha256, sha256(b"exe 10"));
-        assert_eq!(items[1].from, HeldAs::Kept);
+        assert_eq!(items[0].from, HeldAs::Kept);
     }
 
     /// A verified download is known again after a restart, by its offer.

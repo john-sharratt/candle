@@ -161,8 +161,9 @@ zend's `tool_def::DEFS`, `SCAN_*`, `ingest_backlog`, `ingest_report`; npcd's
    superset of the two (§3.5) — the shared engine reported once, each tenant's own
    data under its name. What only one daemon serves stays that daemon's. The API is
    then one namespace with no collisions; only the two web UIs, which are different
-   apps at the same `/`, are told apart by host name. **The UIs are served from disk**,
-   so editing one needs no rebuild and no restart.
+   apps at the same `/`, are told apart by host name. **Each binary carries its UIs
+   compiled in**, so one downloaded file serves its own pages; **the gateway serves the
+   same directories from disk**, so editing a page needs no rebuild and no restart.
 9. **zend and npcd are equal.** Priority is the band alone, whichever tenant the work
    belongs to: either daemon's live conversation outranks either daemon's ingest, and
    the two daemons' ingests run side by side.
@@ -340,6 +341,11 @@ one (§3.3) that will rotate every key it writes — not its own builder's
 behaves as it did before. Each tenant's `Capabilities` are checked against the
 engine's model when it gets its engine.
 
+The slot knows its tenants by name, so a loader waiting there is told whom it waits
+for (`EngineTicket::engine_with_progress`'s `waiting`), and told nobody once it can go
+on. Each tenant's load reports that as `waiting_for` in its `/v1/status` line, and its
+loading page ends its step list on "Waiting for npcd" while npcd is still on its way.
+
 ### 3.3 Core settings two tenants both set
 
 Some builder settings are per-model or per-scheduler, and the two daemons set them
@@ -386,14 +392,26 @@ serves everything, in three layers resolved in this order:
    the same `/` (and both ship a `/favicon.svg` and `/robots.txt` with different
    content), so the static layer picks by `Host`:
 
-| UI | Hosts | Content (on disk) | Default |
+| UI | Hosts | Content (compiled in) | Default |
 |---|---|---|---|
-| zend | `code.tokera.com`, `zend.localhost` | `zend/web/` (`--ui`) | **yes** |
-| npcd | `bot.tokera.com`, `npcd.localhost` | `web/content/npcd/` (`--ui`) | no |
+| zend | `code.tokera.com`, `zend.localhost` | `zend/web/` (`zend::tenant::WEB`) | **yes** |
+| npcd | `bot.tokera.com`, `npcd.localhost` | `web/content/npcd/` (`npcd::tenant::CONSOLE`) | no |
 
 Run alone, a daemon's UI is the default whatever its row says. The host answers `/v1`,
 `/ws`, `/common` and `/brand` from its one router on every name; everything else is
 the UI the name picks (`host::server::site_table`).
+
+**Served while the tenants start** (`host::boot`). That router is the tenants' routes
+merged with the host's, so it exists only once every tenant's `start` has returned —
+and a start can be long: npcd opens its substrate in it, and a store written before
+identities is rewritten whole there, once. So the host binds first, on the same ports,
+with the UIs, the shared front-end and a `/v1/status` built from each tenant's
+`StartLine` (`host::starting`, handed over in `TenantContext::starting`) until its
+start returns and from its own reports after. npcd reports its substrate open there as
+the `opening` step, counting records through a stamping rewrite
+(`SubstratePersistence::open_in_with_substrate_and_sink`'s `OpenProgress`). Once every
+tenant has started, the boot server finishes what it is answering and lets the ports
+go, and the real server binds them.
 
 The shared front-end library, `web/content/common/`, is served once, at `/common/`,
 for both, and its estate marks at `/brand/` — where the estate switcher addresses them
@@ -406,34 +424,32 @@ spellings. The two tests that kept the copies in step went with zend's copy;
 and `web/src/site/tokera/page.rs` checks that every asset zend's pages name exists in
 `zend/web/` or the shared library.
 
-**Served from disk, never embedded.** Every UI file — HTML, JavaScript, CSS, images —
-is read from its directory when it is requested, the way the gateway already serves
-tokera.com (`Roots::disk`). Saving a file is the deployment: the next request serves
-it, with no rebuild and no restart.
+**Compiled into the binary; served from disk by the gateway.** Two places serve the
+same files, for two different jobs.
 
-- zend's `include_dir!` copy (`zend/src/api/mod.rs:43`) and npcd's embedded roots
-  (`npcd/src/main.rs:48-49`) are deleted, and with them npcd's `--content` switch
-  (`:252-266`), which production already passes (`docs/deployment.md:88`) — there is
-  one way to serve a UI, not an embedded way and a disk way.
-- Each content directory is a path in the tenant's config, resolved against the
-  working directory (the repository root, which every daemon already runs from,
-  `docs/deployment.md:67-69`). A directory that does not exist is a startup error
-  naming it.
-- Files go through `web::asset::respond`, as both daemons' do today: a strong ETag
-  over the content, `If-None-Match` answered `304`, gzip, and `max-age` from
-  `cache.short_secs` (60 s) for HTML, JS and CSS. `Roots::read` reads the file on
-  every request (`web/src/content.rs:119-154`) and caches nothing, so an edit is
-  served on the next request and a browser refresh revalidates.
+- **The daemon embeds its UIs** (`include_dir!`, as `web::Roots::embedded`): zend's
+  `zend/web`, npcd's `web/content/npcd`, and the host's shared library
+  `web/content/common` (`host::ui::COMMON`). A shipped binary therefore serves its own
+  pages with no checkout beside it — download `zend`, run it, open it. Each crate's
+  build script reruns when a file under its embedded directory changes
+  (`embed-watch`), since `include_dir!` tells cargo nothing about the files it reads.
+  There is no switch to point a daemon at a directory instead: one way to serve a UI
+  from a binary.
+- **The gateway serves the same directories from disk** (`web/web.yaml`'s `npcd` and
+  `zend` sites, `Roots::disk`), read per request, and forwards only `/v1` and `/ws`.
+  Saving a page is live on the next refresh with nothing rebuilt; the daemons catch up
+  when they are next built.
+- Files go through `web::asset::respond` either way: a strong ETag over the content,
+  `If-None-Match` answered `304`, gzip, and `max-age` from `cache.short_secs` (60 s)
+  for HTML, JS and CSS.
 - **Reload on change.** Both UIs reload themselves when `/v1/status`'s `build`
   changes (zend `index.html`; npcd `common/lib/build.js`, polled every 5 s). `build`
-  is a hash over every file under the content directories and the shared library —
-  each file's path, size and modification time, skipping hidden entries (an editor's
-  swap file, `.git`) — the binary's version, and the running executable's own size
-  and modification time, computed when asked (`host::ui::build_id`). Saving a file
-  moves its modification time, so an open page picks up an edit on its next status
-  poll; a rebuilt binary moves the executable's, so a restart onto a new build is
-  picked up the same way even when the version string did not change. The walk reads
-  metadata only, a few hundred `stat`s per poll.
+  is a hash over every compiled-in UI file — its path and its bytes — and the
+  binary's version, taken once at startup (`host::ui::build_id`): the content cannot
+  change while the process runs, so a new id is a new binary with a different UI.
+- **Cluster upgrades carry no UI.** A build is its executables
+  (`cluster::upgrade::artifacts`); the UI each serves is inside it, so a member
+  fetches, keeps and swaps one file (`docs/replicated_substrate.md` §3.9).
 
 **Ports.** The host serves the one router on `192.168.0.5:8081` (plain) and
 `192.168.0.5:8444` (TLS, a certificate made at startup — `web::tls::self_signed`), the
@@ -511,7 +527,7 @@ keeps doing so.
 | `GET /v1/me` | zend `/v1/me`; npcd `/v1/me` | `role`, `email`, `display`, `avatar_url`, npcd's account fields (`user_id`, `unique_name`, `profile`, …) at the top level, and `tenants.zend{tool_modes, default_tools}`. A signed-out caller gets **200** with `role: "unauthenticated"` and no account — zend's behaviour; npcd's console reads the role instead of a 401 |
 | `GET /v1/memory` | zend `/v1/memory`; npcd `/v1/memory` | the shape both already share; `report` is the shared engine's — populated for both, where npcd's is hard-coded null today (`npcd/src/telemetry/memory.rs:72-73`) |
 | `GET /v1/telemetry` | zend `/v1/telemetry`; npcd `/v1/telemetry` | zend's per-wave rows (`waves`, `fmt`, `migrate`, `has_pressure`) and npcd's sampled hour (`gpu`, `model`, `series`, `sample_period_s`, `uptime_s`, and `engine_measured` — whether a wave has run, so a page shows *not measured* rather than zeroes; whether the model is loaded is `/v1/status`'s `engine_connected`), side by side — they are different data, not the same data twice. The engine columns (`decode_tps`, `prefill_tps`, `kv_mib`, `weights_mib`) are read off the shared scheduler's phase rings (`host::telemetry::engine_reading`) — before, npcd's `Telemetry::record` had no caller, so only `prefill_tps` was filled, from the load progress. One `host{total_mib, free_mib, rss_mib}` (npcd's units). A tenant's own columns (npcd's `npcs_active`, `ticks_per_sec`, inbox depths, image queue) stay in `series`, on the one time axis, filled by a source the tenant installs (`Telemetry::add_source`); npcd has no producer for them yet, so they read absent |
-| `GET /v1/phases`, `/v1/promotes`, `/v1/profile` | zend's | process-wide already — the scheduler's phase rings, and the pipeline profiler (`candle-transformers/src/models/profile/pipeline.rs`), which `/v1/profile` resets on read; now visible to npcd's console too |
+| `GET /v1/phases`, `/v1/projections`, `/v1/layers`, `/v1/profile` | zend's | process-wide already — the scheduler's phase rings, the projection tracker, the expert pipeline's layer trace, and the pipeline profiler (`candle-transformers/src/models/profile/pipeline.rs`), which `/v1/profile` resets on read; now visible to npcd's console too |
 | `WS /ws/logs` | zend `/ws/logs`; npcd `/ws/logs` | the frame both already use, `{ts, level, target, msg}`, plus `tenant` and a `seq`. The host's one bus, with zend's broader filter (npcd's drops most `candle_conversation` output). Subscribe first, then replay the ring, skipping by `seq` what the subscription already delivered — zend can lose a line today and npcd can repeat one |
 | `GET /v1/substrate`, `/v1/substrate/zend/…` | zend `/v1/substrate/*`, `/v1/debug/maintenance`; npcd `/v1/substrate/storage` | the overview lists every attached substrate under `tenants.<name>`: zend's storage, counts and layers; npcd's storage (`open`, `path`, `segment_count`, with `live_chunks` and `dead_ratio`, which npcd carried as always null and now reads from its engine — real for both). The views over one substrate are its tenant's, under its own path: zend's layer, timeline, selection, system-prompt, project and maintenance views under `/v1/substrate/zend/`, npcd's per-character views where they were (`/v1/npc/:nid/substrate/*`, with npcd's ownership check) — they read state only their own daemon holds (zend's projection schema and session, npcd's cast), so a host handler "over any attachment" would be each daemon's code again behind a second interface. One field meaning each: `timeline` is a **string** (a u64 does not survive a JavaScript number — npcd now sends it as one), `turns` is an array with `turn_count` beside it, and a count is always `*_count` (`conversation_count`, `turn_count`, zend's `timeline_count`, `section_count`, `token_count`); a size in tokens beside a thing (a layer's, a conversation's, a section's) is `tokens` |
 | `GET /v1/tools`, `POST /v1/tools/calibrate?tenant=<name>` | zend `/v1/substrate/tools`; npcd `/v1/tools`, `/v1/tools/calibrate` | every catalog: `tools[]` carries `tenant` and the union of fields (both: `name`, `description`, `parameters`; zend's `high_risk`; npcd's `category`, `plane`, `modes`, `needs`, `at_named`, `source`, `calibrated`, `examples` as a count), with npcd's top-level `uncalibrated` and `acts_per_turn` under `tenants.npcd`. Calibration names its tenant, and each answers what calibration is for it: zend's runs as it loads, regenerating each case whose definition changed (`409 calibrated_at_load`); an npcd act is calibrated by the examples authored for it (`409 calibrated_by_examples`) |

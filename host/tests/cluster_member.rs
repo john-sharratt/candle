@@ -38,6 +38,7 @@ use host::telemetry::Telemetry;
 use host::TenantUi;
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
+use include_dir::{include_dir, Dir};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::runtime::Handle;
@@ -73,8 +74,6 @@ fn upgrader(dir: &Path) -> Arc<Upgrader> {
                 opens: Opens::default(),
             },
             exe: std::env::current_exe().unwrap(),
-            root: dir.to_path_buf(),
-            ui: vec![],
             upgrade_dir: dir.join("upgrade"),
             keep_builds: 5,
             failed_from: None,
@@ -174,7 +173,11 @@ struct Member {
     store: Arc<MemoryStore>,
 }
 
-async fn member(gateway: SocketAddr, node: u64, ui: &Path) -> Member {
+/// The UI every member here serves.
+static UI: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/tests/ui/zend");
+
+/// A member whose upgrade state lives under `dir`, serving [`UI`].
+async fn member(gateway: SocketAddr, node: u64, dir: &Path) -> Member {
     let settings = ClusterSettings {
         targets: vec![Target::parse(&format!("http://{gateway}"), None).unwrap()],
         key: key(),
@@ -193,7 +196,7 @@ async fn member(gateway: SocketAddr, node: u64, ui: &Path) -> Member {
         &["zend"],
         Telemetry::new(ModelView::of_prescribed()),
         Handle::current(),
-        upgrader(ui),
+        upgrader(dir),
     )
     .unwrap();
     let store = Arc::new(MemoryStore::new(node));
@@ -204,7 +207,7 @@ async fn member(gateway: SocketAddr, node: u64, ui: &Path) -> Member {
         "zend",
         TenantUi {
             hosts: vec![],
-            content: ui.to_path_buf(),
+            content: &UI,
             default: true,
         },
     )];
@@ -324,11 +327,10 @@ async fn until(what: &str, mut ok: impl FnMut() -> bool) {
 /// member that serves it, and the gateway learns the claim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joined_member_forwards_its_listeners_requests_up() {
-    let ui = tempfile::TempDir::new().unwrap();
-    std::fs::write(ui.path().join("index.html"), "<p>zend</p>").unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
     let dumb = closed_port().await;
     let (gw, hub) = gateway(&format!("http://{dumb}")).await;
-    let m = member(gw, 1, ui.path()).await;
+    let m = member(gw, 1, dir.path()).await;
     assert_eq!(m.connect(1).await, Link::Joined);
     until("clustered", || hub.clustered("zend")).await;
 
@@ -368,12 +370,11 @@ async fn a_joined_member_forwards_its_listeners_requests_up() {
 /// and finds the write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_write_is_seen_by_the_next_request_on_any_member() {
-    let ui = tempfile::TempDir::new().unwrap();
-    std::fs::write(ui.path().join("index.html"), "<p>zend</p>").unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
     let dumb = closed_port().await;
     let (gw, hub) = gateway(&format!("http://{dumb}")).await;
-    let a = member(gw, 1, ui.path()).await;
-    let b = member(gw, 2, ui.path()).await;
+    let a = member(gw, 1, dir.path()).await;
+    let b = member(gw, 2, dir.path()).await;
     assert_eq!(a.connect(1).await, Link::Joined);
     assert_eq!(b.connect(2).await, Link::Joined);
     until("both routable", || {
@@ -427,12 +428,11 @@ async fn ended(job: &Job) -> Value {
 /// it, and how it ended. `set-quorum` writes `max_members` lower.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commands_run_on_a_member_and_reach_the_log() {
-    let ui = tempfile::TempDir::new().unwrap();
-    std::fs::write(ui.path().join("index.html"), "<p>zend</p>").unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
     let dumb = closed_port().await;
     let (gw, hub) = gateway(&format!("http://{dumb}")).await;
-    let a = member(gw, 1, ui.path()).await;
-    let b = member(gw, 2, ui.path()).await;
+    let a = member(gw, 1, dir.path()).await;
+    let b = member(gw, 2, dir.path()).await;
     assert_eq!(a.connect(1).await, Link::Joined);
     assert_eq!(b.connect(2).await, Link::Joined);
     let routable = |n| hub.member("zend", n).is_some_and(|m| m.routable());
@@ -507,12 +507,11 @@ async fn commands_run_on_a_member_and_reach_the_log() {
 /// sends what it wrote; the stop's steps are what its loading page shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopping_member_drains_and_sends_first() {
-    let ui = tempfile::TempDir::new().unwrap();
-    std::fs::write(ui.path().join("index.html"), "<p>zend</p>").unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
     let dumb = closed_port().await;
     let (gw, hub) = gateway(&format!("http://{dumb}")).await;
-    let a = member(gw, 1, ui.path()).await;
-    let b = member(gw, 2, ui.path()).await;
+    let a = member(gw, 1, dir.path()).await;
+    let b = member(gw, 2, dir.path()).await;
     assert_eq!(a.connect(1).await, Link::Joined);
     assert_eq!(b.connect(2).await, Link::Joined);
     for k in 0..50 {
@@ -541,10 +540,9 @@ async fn a_stopping_member_drains_and_sends_first() {
 /// listener's requests itself, at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_member_that_reaches_no_cluster_serves_locally() {
-    let ui = tempfile::TempDir::new().unwrap();
-    std::fs::write(ui.path().join("index.html"), "<p>zend</p>").unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
     let nowhere = closed_port().await;
-    let m = member(nowhere, 2, ui.path()).await;
+    let m = member(nowhere, 2, dir.path()).await;
     let started = Instant::now();
     assert_eq!(m.connect(2).await, Link::CutOff);
     assert!(

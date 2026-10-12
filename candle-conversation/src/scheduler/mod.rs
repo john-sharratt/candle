@@ -64,14 +64,19 @@ mod spec_chooser;
 #[cfg(test)]
 mod test_substrate;
 mod turn_group;
+pub mod vram_bands;
 mod wave_logits;
 mod wave_retry;
+mod wave_timing;
 
 use detached::Detached;
 use graph_window::graph_window;
 use phase_split::cobatched_shares;
 use section_pages::SectionPages;
 
+use self::phase_ring::ProjectedKind;
+use self::vram_bands::VramBands;
+use self::wave_timing::WaveTiming;
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
 use crate::conversation::slice_per_layer_sealed;
@@ -2368,6 +2373,8 @@ struct WaveStats {
     /// The device's wave-capture counters at the previous flush, so the wave
     /// line reports this window's own — `None` off CUDA.
     graphs_prev: Option<CaptureStats>,
+    /// This window's waves: how many, their wall-clock and its overhead.
+    timing: WaveTiming,
 }
 
 impl WaveStats {
@@ -2404,7 +2411,13 @@ impl WaveStats {
             in_decode_quantum: false,
             experts_prev: None,
             graphs_prev: None,
+            timing: WaveTiming::default(),
         }
+    }
+
+    /// Count one wave of the run loop — see [`WaveTiming`].
+    fn add_wave(&mut self, wall_us: u64, overhead_us: u64) {
+        self.timing.add(wall_us, overhead_us);
     }
 
     /// Split one co-batched forward's wall-clock between the classes that rode
@@ -2543,17 +2556,13 @@ impl WaveStats {
     /// `docs/unified_wave_inference_engine.md` §4.5); the line reports
     /// *executed* forwards, so this is the only view of pending *work*.
     /// Call only when [`Self::due`] — windows with NO forwards still flush so
-    /// stalls surface their phase split. `fmt` is the resident-arena format split
-    /// `(float_arenas, float_reserved_mib, float_live_mib, quant_arenas,
-    /// quant_reserved_mib, quant_live_mib)` for the arena panel. `vram` is the
-    /// whole-card decomposition `(pool_reserved_mib, driver_total_mib,
-    /// driver_free_mib)` for the VRAM-decomposition panel.
+    /// stalls surface their phase split. `bands` is the whole card, cut by what
+    /// holds each byte, for the VRAM panel.
     fn flush(
         &mut self,
         kv_vram: Option<(usize, usize)>,
         backlog: u64,
-        fmt: Option<(u32, u64, u64, u32, u64, u64)>,
-        vram_decomp: (u64, u64, u64, u64),
+        bands: VramBands,
         slots: (u32, u32, u32, u32),
         experts: Option<(usize, usize, usize, usize)>,
         graphs: Option<CaptureStats>,
@@ -2727,6 +2736,7 @@ impl WaveStats {
             use_ms(&REPROJ_GLUE_US),
             use_ms(&REPROJ_LAYOUT_US),
         );
+        let timing = self.timing.take();
         phase_ring::push_wave(phase_ring::wave_sample(
             elapsed.as_millis() as u32,
             fwd_ms as u32,
@@ -2734,10 +2744,10 @@ impl WaveStats {
             budget_mib,
             used_mib,
             backlog,
-            fmt,
-            vram_decomp,
+            bands,
             proj,
             slots,
+            (timing.waves, timing.wall_us, timing.overhead_us),
         ));
         self.window_start = std::time::Instant::now();
         self.prefill = WaveChannel::default();
@@ -10617,8 +10627,8 @@ impl Scheduler {
         // that never leaves hot. Cheap O(1) tier check per unit builds the actual
         // lift-list. `evict_to_fit_incoming` still gets the FULL working set as its
         // keep-list (it must protect the already-hot units from eviction), but only
-        // budgets for the non-hot bytes. The promote tracker records only ACTUAL
-        // lifts, so its leaderboard is a waste monitor — empty is good.
+        // budgets for the non-hot bytes. The projection tracker records only
+        // ACTUAL lifts, so its board is a waste monitor — empty is good.
         let (secs_lift, turns_lift) = {
             let read = conversation.read();
             let mut sl: Vec<SectionId> = Vec::new();
@@ -10627,13 +10637,11 @@ impl Scheduler {
                 if read.section_tier_state(sid).is_some_and(|t| t.hot) {
                     continue;
                 }
-                // Generic auto-names (`section_<n>`) are the content / probe
-                // sections with no schema name — meaningless per-id on a churn
-                // leaderboard, so bucket them together and let the named
-                // always-hot units (system prompt, tools) stand out.
+                // A section with no schema name (`section_<n>`) is still a unit
+                // of its own, so it is named by its id rather than pooled.
                 let name_of = || match read.section_debug_name(sid) {
                     Some(n) if !is_generic_section_name(&n) => n,
-                    _ => "(content §)".to_string(),
+                    _ => format!("section {}", sid.raw()),
                 };
                 let name = match read.section_stream(sid) {
                     Some(stream) => self
@@ -10643,7 +10651,7 @@ impl Scheduler {
                         .clone(),
                     None => name_of(),
                 };
-                phase_ring::record_promote(&name);
+                phase_ring::record_projected(ProjectedKind::Section, &name, 1);
                 sl.push(sid);
             }
             for &t in turns {
@@ -10654,8 +10662,25 @@ impl Scheduler {
                     tl.push(t);
                 }
             }
-            if !tl.is_empty() {
-                phase_ring::record_promote("(turns)");
+            // Turns by their conversation, named as the sidebar names it — for
+            // an ingest layer that is the file or directory the conversation
+            // reads — and counted per conversation, not per turn.
+            let mut by_conversation: Vec<(TimelineId, u64)> = Vec::new();
+            for t in &tl {
+                match by_conversation
+                    .iter_mut()
+                    .find(|(tid, _)| *tid == t.timeline)
+                {
+                    Some((_, n)) => *n += 1,
+                    None => by_conversation.push((t.timeline, 1)),
+                }
+            }
+            for (timeline, n) in by_conversation {
+                let name = match read.label_of(timeline) {
+                    Some(label) => label.to_string(),
+                    None => format!("conversation {}", timeline.raw()),
+                };
+                phase_ring::record_projected(ProjectedKind::Turns, &name, n);
             }
             (sl, tl)
         };

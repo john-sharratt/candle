@@ -301,12 +301,9 @@ mod tests {
     fn swapped(t: &TempDir) -> WatchPlan {
         let exe = t.path().join("bin/zend");
         let kept = t.path().join("bin/builds/10-h10");
-        fs::create_dir_all(kept.join("ui/zend/web")).unwrap();
-        fs::create_dir_all(t.path().join("zend/web")).unwrap();
+        fs::create_dir_all(&kept).unwrap();
         fs::write(&exe, "new").unwrap();
-        fs::write(t.path().join("zend/web/i.html"), "new page").unwrap();
         fs::write(kept.join("zend"), "old").unwrap();
-        fs::write(kept.join("ui/zend/web/i.html"), "old page").unwrap();
         write_json(
             &kept,
             &BuildJson {
@@ -319,8 +316,6 @@ mod tests {
                     opens: Opens::default(),
                 },
                 files: vec![],
-                ui: vec!["zend/web".into()],
-                ui_archive: String::new(),
                 installed_ms: 1,
                 retired_ms: 2,
             },
@@ -341,8 +336,6 @@ mod tests {
             },
             swapped: Swapped {
                 exe,
-                root: t.path().to_path_buf(),
-                ui: vec!["zend/web".into()],
                 kept,
                 from_kept: None,
             },
@@ -413,10 +406,6 @@ mod tests {
             ]
         );
         assert_eq!(fs::read_to_string(&plan.swapped.exe).unwrap(), "old");
-        assert_eq!(
-            fs::read_to_string(t.path().join("zend/web/i.html")).unwrap(),
-            "old page"
-        );
         assert!(!plan.swapped.kept.exists());
         let failure: Failure =
             serde_json::from_slice(&fs::read(plan.upgrade_dir.join(FAILED)).unwrap()).unwrap();

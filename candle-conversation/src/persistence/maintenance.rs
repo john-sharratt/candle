@@ -2668,6 +2668,7 @@ mod tests {
                     cast.push(entry.record.header.stream_id);
                 }
             },
+            &|_, _, _| {},
         )
         .unwrap();
         assert_eq!(
@@ -3716,6 +3717,7 @@ mod tests {
                 let h = &entry.record.header;
                 seen.push((h.record_type, h.stream_id, h.chunk_index, h.identity()));
             },
+            &|_, _, _| {},
         )
         .unwrap();
         seen

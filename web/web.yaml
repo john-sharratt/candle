@@ -236,54 +236,53 @@ sites:
     hosts: ["www.battlecities.net"]
     redirect: "https://battlecities.net"
 
-  # ── bot.tokera.com — the NPC console ────────────────────────────────────
-  # A pure gateway, like zend below: no roots, everything forwarded, navigation
-  # included. The daemon on 192.168.0.6 owns its console — it serves those files
-  # from disk already, with its own `fallback: index.html` for deep links.
+  # ── bot.tokera.com and code.tokera.com — the consoles ───────────────────
+  # The pages come from THIS box's checkout, read per request, so an edit is
+  # live on a refresh with nothing rebuilt; only the API is forwarded, to the
+  # members while one is joined and to the standalone daemon when none is.
   #
-  # It used to serve the console from THIS box's checkout while forwarding only
-  # `/v1` and `/ws`, which made the console and the daemon two deployments of
-  # one program. Every console edit then needed a commit here and a pull there
-  # before it could be seen, and the two could disagree silently — the console
-  # was twice found running against an API it did not match, each time reading
-  # as a bug in the daemon. One source, one deploy, and an edit on the daemon
-  # box is live on a refresh.
+  # Each daemon also carries its pages compiled in, which is what it serves to
+  # anyone reaching it directly — a downloaded `zend` run on a laptop, a member
+  # cut off from its gateway. The two copies are the same files: these
+  # directories are what the binaries embed. A page edited here is ahead of the
+  # daemons until they are rebuilt, which is the point of serving it here.
   #
-  # `/auth/*` is unaffected: those routes are registered ahead of site routing
-  # precisely so a site proxying `/` cannot swallow them. Sign-in stays here.
+  # The roots are searched in order, and the three together assemble the URL
+  # tree the daemons serve: the console's own files, then `/common/…` from the
+  # `content/` root (the pages load the shared library by that path), then the
+  # estate's marks at `/brand/…`, which live in the shared library's `brand/`.
   #
-  # The cost is that `web --authoritative` can no longer stand in for this site,
-  # for the same reason it cannot for zend — there are no roots left to serve
-  # the console from, and the mock answers `/v1`, not `/app.js`. Run `npcd`
-  # itself instead; it embeds the same mock behind the same console, which is
-  # what `--authoritative` was standing in for.
+  # `/auth/*` is unaffected: those routes are registered ahead of site routing,
+  # so sign-in stays here.
   #
-  # While an npcd member is joined — tokerad's tenant on this box — the site is
-  # its; with none, it falls back to the standalone npcd on .6.
+  # `web --authoritative` answers `/v1` from the built-in mock for npcd; zend
+  # has no mock, which is reported at startup rather than discovered from an
+  # empty page.
+  #
+  # zend's daemon is reached over TLS: it serves `--tls-port 8444` with a
+  # certificate it makes at startup, a new key each time, so `self_signed` tells
+  # the proxy to accept it without a CA. The handshake still proves zend holds
+  # that key; this is the private network, and only this route says so.
   - name: npcd
     hosts: ["bot.tokera.com", "npcd.localhost", "npcd.test", "*.npcd.dev"]
+    roots: ["content/npcd", "content", "content/common"]
     api:
-      - prefix: /
+      - prefix: /v1
+        upstream: "http://192.168.0.6:8081"
+        cluster: npcd
+      - prefix: /ws
         upstream: "http://192.168.0.6:8081"
         cluster: npcd
 
-  # ── code.tokera.com — Zend ──────────────────────────────────────────────
-  # zend still embeds and serves its own assets, so this site is a pure
-  # gateway: no roots, everything forwarded, navigation included. When zend is
-  # split the same way as npcd, give it `roots: ["content/zend",
-  # "content/common"]` and drop its embedded copy.
-  #
-  # It has no mock, so `--authoritative` cannot stand in for it — that is
-  # reported at startup rather than discovered from an empty page.
-  #
-  # Over TLS: zend runs with `--tls-port 8444` and serves it with a certificate
-  # it makes at startup, a new key each time, so `self_signed` tells the proxy
-  # to accept it without a CA. The handshake still proves zend holds that key;
-  # this is the private network, and only this route says so.
   - name: zend
     hosts: ["code.tokera.com", "zend.localhost", "zend.test"]
+    roots: ["../zend/web", "content", "content/common"]
     api:
-      - prefix: /
+      - prefix: /v1
+        upstream: "https://192.168.0.5:8444"
+        self_signed: true
+        cluster: zend
+      - prefix: /ws
         upstream: "https://192.168.0.5:8444"
         self_signed: true
         cluster: zend

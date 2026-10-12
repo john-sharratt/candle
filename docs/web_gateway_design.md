@@ -15,7 +15,7 @@ a flag picks the third.
 | | Embedded | Gateway | `--authoritative` |
 |---|---|---|---|
 | Who runs it | `npcd`, `zend` — as a library | the DMZ box — the `web` binary | the `web` binary, one flag |
-| Content | compiled in (`include_dir!`), or `--content <dir>` | read from disk | read from disk |
+| Content | compiled in (`include_dir!`, `Roots::embedded`) | read from disk — the folders each site's `roots:` names in `web/web.yaml` | read from disk |
 | `/v1`, `/ws` | `upstream: local` → the `Router` this process supplied | `upstream: <url>` → forwarded | every upstream forced local → `web::mock` |
 | For | one binary that serves its console *and* its API, testable alone | top-level domains land here; daemons live elsewhere | the whole estate on a laptop, no daemons |
 

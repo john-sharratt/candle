@@ -864,6 +864,10 @@ canvas { width: 100%; display: block; }
 .boot-steps li.done::before { content: '✓'; color: var(--ok); }
 .boot-steps li.now { color: var(--ink); font-weight: 600; }
 .boot-steps li.now::before { content: '◆'; color: var(--accent); }
+/* Whom the load waits for before the shared engine is built. */
+.boot-steps li.wait { color: var(--ink-soft); font-style: italic; }
+.boot-steps li.wait::before { content: '…'; color: var(--accent); }
+.boot-steps li[hidden] { display: none; }
 
 /* ── Pulse ───────────────────────────────────────────────────────────────────
 

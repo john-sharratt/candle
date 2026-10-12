@@ -355,6 +355,18 @@ fn scan_segment_files(dir: &Path) -> Result<Vec<(SegmentId, PathBuf)>> {
     Ok(files.into_iter().collect())
 }
 
+/// The store in `dir` on disk, in MiB rounded up: every segment file an open
+/// would walk. 0 for a store with none — a fresh directory, or none at all.
+pub(crate) fn store_mib(dir: &Path) -> usize {
+    let bytes: u64 = scan_segment_files(dir)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|(_, path)| fs::metadata(path).ok())
+        .map(|m| m.len())
+        .sum();
+    bytes.div_ceil(1 << 20) as usize
+}
+
 impl SegmentedLog {
     /// Open the segment set in `dir` **read-only**, recovering every segment's
     /// records through `sink` in ascending id order (active last), as

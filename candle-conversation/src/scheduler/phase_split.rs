@@ -43,10 +43,61 @@ pub(super) fn cobatched_shares(
     (share(prefill_rows), share(section_rows))
 }
 
+/// The share of `tokens` a creep forward over layers `[start, end)` of `n`
+/// prefilled, in whole-sweep tokens.
+///
+/// A creep rides a window of the layers per wave and is counted once per
+/// window, so counting its whole token block each time multiplied it by the
+/// number of windows while the time stayed one window's: a 1,885-token creep
+/// read 54,000 tok/s off a 35 ms slice of a sweep the card takes ~2 s over.
+/// Taken as the difference of two floors, the windows of a sweep sum to
+/// exactly `tokens`.
+pub(super) fn window_tokens(tokens: usize, start: usize, end: usize, n: usize) -> usize {
+    if n == 0 || end <= start {
+        return 0;
+    }
+    let upto = |layer: usize| (tokens as u128 * layer.min(n) as u128 / n as u128) as usize;
+    upto(end) - upto(start)
+}
+
+/// What a forward over layers `[start, end)` of `n` that took `us` would take
+/// over all `n` — the unit the planner's forward model is written in.
+pub(super) fn full_sweep_us(us: u64, start: usize, end: usize, n: usize) -> u64 {
+    let span = end.min(n).saturating_sub(start);
+    if span == 0 {
+        return 0;
+    }
+    (us as u128 * n as u128 / span as u128) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle::{DType, Device};
+
+    /// The measured creep: 1,885 tokens over a 48-layer model in windows of 3.
+    /// Each window is a sixteenth of the tokens, and the sweep sums to exactly
+    /// the block — never once per window.
+    #[test]
+    fn a_creeps_windows_sum_to_its_tokens_once() {
+        assert_eq!(window_tokens(1_885, 0, 3, 48), 117);
+        assert_eq!(window_tokens(1_885, 3, 6, 48), 118);
+        let swept: usize = (0..16)
+            .map(|w| window_tokens(1_885, w * 3, w * 3 + 3, 48))
+            .sum();
+        assert_eq!(swept, 1_885);
+        assert_eq!(window_tokens(1_885, 0, 48, 48), 1_885);
+        assert_eq!(window_tokens(1_885, 5, 5, 48), 0);
+        assert_eq!(window_tokens(7, 0, 1, 0), 0);
+    }
+
+    /// A 35 ms window of 3 layers of 48 is a 560 ms sweep.
+    #[test]
+    fn a_windows_time_scales_to_the_whole_sweep() {
+        assert_eq!(full_sweep_us(35_000, 0, 3, 48), 560_000);
+        assert_eq!(full_sweep_us(35_000, 0, 48, 48), 35_000);
+        assert_eq!(full_sweep_us(35_000, 12, 12, 48), 0);
+    }
 
     /// The measured case: 3 decode rows beside an 8,192-token prefill in a
     /// 4,645 ms sweep. Prefill takes all but ~1.7 ms of it.

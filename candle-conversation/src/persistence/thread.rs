@@ -41,7 +41,8 @@ use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::Device;
 use candle_nn::kv_cache::{
-    try_hold_chunk_locations, ChunkedKvBacking, CompressionPolicy, SealedSequence,
+    is_tier_standing_over_free, try_hold_chunk_locations, ChunkedKvBacking, CompressionPolicy,
+    SealedSequence,
 };
 use crossbeam::channel::{self, Receiver, Sender};
 
@@ -52,6 +53,9 @@ use super::resume::TurnChunkGrid;
 use super::streams::StreamId;
 use super::transfer::seal_to_chunk_images;
 use crate::projection::Conversation;
+use crate::scheduler::phase_ring::{
+    migrate_sample, mix_due, push_idle_migrate, push_migrate, push_mix,
+};
 use crate::scheduler::relief_trace;
 use crate::substrate::{ConvCompression, ResidenceIndex, StoredSequence};
 use sysinfo::System;
@@ -601,9 +605,17 @@ pub(crate) fn effective_turn_policy(
 /// the same `break 'work false` a genuine fault does, so the only thing that has
 /// to differ is what gets said about it — a warning with a CUDA breadcrumb reads
 /// as a fault, and this is the engine doing what it was built to do.
+///
+/// **Both refusals a forward causes.** One is the arena window, refused while
+/// a forward is open. The other is a claim refused because the free regions sit
+/// above the tier the last forward placed, which stands until the scheduler's
+/// next gap takes it down — the same wait, said by the region pool instead.
+/// Read as a fault, it was logged as one fifty times in ten minutes, and as a
+/// device out-of-memory it would have told the governor the card was starving.
 fn is_wave_deferral(err: &candle::Error) -> bool {
     err.to_string()
         .contains(candle_nn::kv_cache::KV_ARENA_MID_WAVE)
+        || is_tier_standing_over_free(err)
 }
 
 fn signal_vram_starvation(device: &Device, err: &candle::Error) {
@@ -617,12 +629,22 @@ fn signal_vram_starvation(device: &Device, err: &candle::Error) {
     }
 }
 
-/// Migrate one policy-group's residences hot→warm: per layer, quantize the
-/// group's hot sequences in place (or pass them through when `policy` is
-/// `None`) and DtoH-copy the result to a format-preserving CPU warm copy.
-/// Successful residences (every layer migrated) are appended to `installs`
-/// as `(idx, new_hot, new_warm)`. Queues all work on the primary stream;
-/// the caller fences the group before [`install_hot_to_warm`].
+/// Wait, up to `within`, for the scheduler's next gap between forwards to make
+/// every arena a turned-away pass asked these backings for. `true` once none is
+/// owed; `false` if the wait ran out with some still owed.
+fn await_owed_arenas(backings: &[ChunkedKvBacking], within: Duration) -> bool {
+    let until = Instant::now() + within;
+    loop {
+        if !backings.iter().any(ChunkedKvBacking::arenas_owed) {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// Install one fenced group's `(idx, new_hot, new_warm)` triples under a single
 /// substrate write lock. Returns the warm bytes and the residence count.
 fn install_hot_to_warm(
@@ -670,6 +692,16 @@ fn install_hot_to_warm(
     (total_bytes, count)
 }
 
+/// Migrate one policy-group's residences hot→warm: per layer, quantize the
+/// group's hot sequences in place (or pass them through when `policy` is
+/// `None`) and DtoH-copy the result to a format-preserving CPU warm copy.
+/// Successful residences (every layer migrated) are appended to `installs`
+/// as `(idx, new_hot, new_warm)`. Queues all work on the primary stream;
+/// the caller fences the group before [`install_hot_to_warm`].
+///
+/// Returns whether a forward turned the group away — an arena it needed could
+/// not be created mid-wave — rather than anything failing. The group is intact
+/// and hot; the caller runs it again once the next gap has made those arenas.
 #[allow(clippy::too_many_arguments)]
 fn migrate_group_hot_to_warm(
     backings: &[ChunkedKvBacking],
@@ -685,9 +717,9 @@ fn migrate_group_hot_to_warm(
     select_ms: &mut u64,
     alloc_ms: &mut u64,
     convert_ms: &mut u64,
-) {
+) -> bool {
     if group.is_empty() {
-        return;
+        return false;
     }
     // Per-residence (new_hot, new_warm) accumulators, one slot per layer.
     let mut hot_per: Vec<Vec<SealedSequence>> = (0..group.len())
@@ -707,6 +739,9 @@ fn migrate_group_hot_to_warm(
     // order, one Vec-per-residence entry each.
     let mut gpu_hot_per_layer: Vec<Vec<SealedSequence>> = Vec::with_capacity(n_layers);
 
+    // Set where a forward turned the group away rather than something failing:
+    // the caller waits for the next gap between forwards and runs it again.
+    let mut wave_deferred = false;
     let success = 'work: {
         // ── Phase 1: quantize EVERY layer with ONE cross-layer selection,
         //    deferring the convert ─────────────────────────────────────────
@@ -741,9 +776,10 @@ fn migrate_group_hot_to_warm(
                     Err(e) if is_wave_deferral(&e) => {
                         tracing::debug!(
                             "cache: hot→warm quantize deferred — a wave holds the partition \
-                             and the destinations need a new arena; retrying next pass"
+                             and the destinations need a new arena; retrying at the next gap"
                         );
                         *quantize_ms += t_q.elapsed().as_millis() as u64;
+                        wave_deferred = true;
                         break 'work false;
                     }
                     Err(e) => {
@@ -793,8 +829,9 @@ fn migrate_group_hot_to_warm(
                 if is_wave_deferral(&e) {
                     tracing::debug!(
                         "cache: hot→warm convert deferred — a wave holds the partition; \
-                         retrying next pass"
+                         retrying at the next gap"
                     );
+                    wave_deferred = true;
                 } else {
                     tracing::warn!(
                         "cache: hot→warm batched convert failed: {e} (last CUDA kernel on this thread: {})",
@@ -830,8 +867,9 @@ fn migrate_group_hot_to_warm(
             Err(e) if is_wave_deferral(&e) => {
                 tracing::debug!(
                     "cache: hot→warm DtoH deferred — a wave holds the partition and the CPU \
-                     warm copy needs a new arena; retrying next pass"
+                     warm copy needs a new arena; retrying at the next gap"
                 );
+                wave_deferred = true;
                 break 'work false;
             }
             // **A failure here is a fault, not a batch too big for the staging
@@ -886,6 +924,7 @@ fn migrate_group_hot_to_warm(
             installs.push((*idx, hot, warm));
         }
     }
+    wave_deferred
 }
 
 fn run_pass(
@@ -1093,6 +1132,12 @@ fn run_pass(
     // the bursts. `MAX_GROUP_RESIDENCES` per hold, and a refused pass — which sets
     // `COMPACTION_WAITING` — gets in before the next one.
     const MAX_GROUP_RESIDENCES: usize = 8;
+    // How often one pass waits for a gap and runs a turned-away group again,
+    // and how long it waits for each: a gap is milliseconds under load, so the
+    // bound is for a scheduler that has stopped looping, not a slow one.
+    const MAX_GAP_RETRIES: usize = 16;
+    const GAP_WAIT: Duration = Duration::from_millis(500);
+    let mut gap_retries = 0usize;
     let mut deferred_groups = 0usize;
     let mut hot_to_warm_bytes: u64 = 0;
     let mut hot_to_warm_count: usize = 0;
@@ -1125,7 +1170,7 @@ fn run_pass(
                 effective_turn_policy(compression_policy, cc)
             };
             let mut installs = Vec::new();
-            migrate_group_hot_to_warm(
+            let wave_deferred = migrate_group_hot_to_warm(
                 backings,
                 device,
                 copy_stream,
@@ -1173,6 +1218,20 @@ fn run_pass(
             // one sent while this pass was already running — and the rest of the
             // backlog moves on without a caller waiting on it.
             flush.at_group(hot_to_warm_bytes);
+            // **A group a forward turned away runs again at the next gap, in
+            // this pass.** It needed an arena that could only be made between
+            // forwards; the scheduler makes every owed arena in its next gap,
+            // which under a steady ingest is milliseconds away. Leaving it for
+            // the next trigger instead cost about fifteen seconds a time — a
+            // drain of a few MB/s against an ingest producing KV far faster,
+            // with the backlog standing on the GPU and taking the expert zone's
+            // ground until a lull let the passes through.
+            if wave_deferred && count == 0 && gap_retries < MAX_GAP_RETRIES {
+                gap_retries += 1;
+                if await_owed_arenas(backings, GAP_WAIT) {
+                    continue;
+                }
+            }
             // Nothing installed means the group could not move this pass, and
             // re-snapshotting would hand back the same residences.
             if !more || count == 0 {
@@ -1235,9 +1294,11 @@ fn run_pass(
             hot_to_warm_bytes,
         );
     }
-    // Feed the instrumented migration panel straight from the pass (no log tail).
+    // Feed the instrumented migration panel straight from the pass (no log
+    // tail): a pass that moved something, and now and then one that found
+    // nothing to move, so a quiet drain does not read as a stopped one.
     if hot_to_warm_count > 0 {
-        crate::scheduler::phase_ring::push_migrate(crate::scheduler::phase_ring::migrate_sample(
+        push_migrate(migrate_sample(
             hot_to_warm_count as u64,
             hot_to_warm_bytes / (1 << 20),
             migrate_ms,
@@ -1245,11 +1306,27 @@ fn run_pass(
             copy_ms,
             total_ms,
         ));
+    } else {
+        push_idle_migrate(total_ms);
     }
     // Backlog split: how much of the hot-without-warm set was DEFERRED because it
     // is the in-flight decode's pinned working set (the tier-livelock fix) vs. a
     // genuine drain the migrate must still catch up on. Fires only when something
     // was pin-deferred, so a healthy idle pass stays quiet.
+    // The resident KV by format, for the arena panel — on the pass the panel
+    // is owed one, under its own short read. Keyed by this substrate's tenant,
+    // since every tenant's thread takes its own and the panel shows their sum.
+    let mix_key = conversation.tenant_rank().index();
+    if mix_due(mix_key) {
+        let rows = conversation
+            .read()
+            .hot_format_census()
+            .rows()
+            .into_iter()
+            .map(|(tag, tokens)| (format!("{tag:?}"), tokens))
+            .collect();
+        push_mix(mix_key, rows);
+    }
     {
         let (dc, db, pc, pb) = conversation.read().warm_backlog_split();
         // Stamp unconditionally so the scheduler's admission ceiling sees the
@@ -1581,4 +1658,31 @@ pub(crate) fn build_grid(
         layers.push(seal_to_chunk_images(backing, device, seq)?);
     }
     Ok(TurnChunkGrid::new(layers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use candle_nn::kv_cache::{KV_ARENA_MID_WAVE, KV_DEVICE_OOM_MARKER, TIER_STANDS_OVER_FREE};
+
+    /// **Both refusals a forward causes are waits, and nothing else is.** The
+    /// region pool's "free ground stands above the tier" is the same wait the
+    /// arena window's refusal is; a genuine exhaustion is not, and must still
+    /// read as one.
+    #[test]
+    fn a_forwards_refusals_are_deferrals_and_exhaustion_is_not() {
+        let window = candle::Error::Msg(format!("{KV_ARENA_MID_WAVE}: class 4096 B"));
+        let tier = candle::Error::Msg(format!(
+            "{KV_DEVICE_OOM_MARKER}: no region is claimable for class 1152 B — 166 regions \
+             above the tier are unowned but {TIER_STANDS_OVER_FREE}."
+        ));
+        let full = candle::Error::Msg(format!(
+            "{KV_DEVICE_OOM_MARKER}: no region is claimable for class 1152 B — every one of \
+             1264 regions is live"
+        ));
+        assert!(is_wave_deferral(&window));
+        assert!(is_wave_deferral(&tier));
+        assert!(!is_wave_deferral(&full));
+    }
 }

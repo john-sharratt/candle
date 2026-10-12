@@ -21,7 +21,7 @@ use axum::Router;
 use serde_json::{json, Value};
 use web::auth::Gateways;
 use web::tls::{self_signed, Entrance};
-use web::{Builder, Config};
+use web::{Builder, Config, Roots};
 
 use crate::access::LocalSignin;
 use crate::cluster::listener::{self, Listener};
@@ -47,7 +47,8 @@ pub struct Listen {
 
 /// The site table for `uis`: one site per tenant UI, every one answering the
 /// API prefixes from this process. With one tenant its UI is the default
-/// whatever it says; with several, exactly one must say so.
+/// whatever it says; with several, exactly one must say so. The table names no
+/// roots: each site's pages are compiled in, and [`builder`] hands them over.
 pub fn site_table(
     uis: &[(&str, TenantUi)],
     bind: SocketAddr,
@@ -70,7 +71,6 @@ pub fn site_table(
             json!({
                 "name": name,
                 "hosts": ui.hosts,
-                "roots": [ui.content],
                 "default": uis.len() == 1 || ui.default,
                 "fallback": "index.html",
                 "api": api,
@@ -112,8 +112,10 @@ pub fn builder(
         signin.clone().layer(req, next)
     }));
     let mut builder = Builder::new(cfg).trust(gateways.clone());
-    for (name, _) in uis {
-        builder = builder.local_api(name, router.clone());
+    for (name, ui) in uis {
+        builder = builder
+            .content(name, Roots::embedded(&[ui.content]))
+            .local_api(name, router.clone());
     }
     if let Some(cluster) = cluster {
         let listener = Arc::new(Listener {
@@ -170,53 +172,47 @@ pub async fn serve(
 mod tests {
     use super::*;
 
-    use std::fs;
-
     use axum::body::{to_bytes, Body};
     use axum::extract::ConnectInfo;
     use axum::http::{HeaderMap, Request};
     use axum::routing::get;
-    use tempfile::TempDir;
+    use include_dir::{include_dir, Dir};
     use tower::ServiceExt;
     use web::auth::forwarded::{identify, EMAIL, PROVIDER, USER};
 
-    struct Uis {
-        _tmp: TempDir,
-        uis: Vec<(&'static str, TenantUi)>,
-    }
+    static ZEND: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/tests/ui/zend");
+    static NPCD: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/tests/ui/npcd");
 
-    fn uis() -> Uis {
-        let tmp = TempDir::new().unwrap();
-        for name in ["zend", "npcd"] {
-            let dir = tmp.path().join(name);
-            fs::create_dir_all(&dir).unwrap();
-            fs::write(dir.join("index.html"), format!("<p>{name}</p>")).unwrap();
-            fs::write(dir.join("favicon.svg"), format!("<svg>{name}</svg>")).unwrap();
-        }
-        let ui = |name: &str, hosts: &[&str], default: bool| TenantUi {
+    fn uis() -> Vec<(&'static str, TenantUi)> {
+        let ui = |content: &'static Dir<'static>, hosts: &[&str], default: bool| TenantUi {
             hosts: hosts.iter().map(|h| h.to_string()).collect(),
-            content: tmp.path().join(name),
+            content,
             default,
         };
-        let uis = vec![
+        vec![
             (
                 "zend",
-                ui("zend", &["code.tokera.com", "zend.localhost"], true),
+                ui(&ZEND, &["code.tokera.com", "zend.localhost"], true),
             ),
             (
                 "npcd",
-                ui("npcd", &["bot.tokera.com", "npcd.localhost"], false),
+                ui(&NPCD, &["bot.tokera.com", "npcd.localhost"], false),
             ),
-        ];
-        Uis { _tmp: tmp, uis }
+        ]
     }
 
-    fn app(uis: &[(&str, TenantUi)], base: &Path) -> Router {
-        let cfg = site_table(uis, "127.0.0.1:0".parse().unwrap(), base).unwrap();
+    fn base() -> &'static Path {
+        Path::new(".")
+    }
+
+    fn app(uis: &[(&str, TenantUi)]) -> Router {
+        let cfg = site_table(uis, "127.0.0.1:0".parse().unwrap(), base()).unwrap();
         let api = Router::new().route("/v1/status", get(|| async { "status" }));
         let mut b = Builder::new(cfg);
-        for (name, _) in uis {
-            b = b.local_api(name, api.clone());
+        for (name, ui) in uis {
+            b = b
+                .content(name, Roots::embedded(&[ui.content]))
+                .local_api(name, api.clone());
         }
         b.router()
     }
@@ -244,8 +240,7 @@ mod tests {
     /// on every name.
     #[tokio::test]
     async fn the_host_name_picks_the_ui_and_the_api_is_everywhere() {
-        let u = uis();
-        let app = app(&u.uis, u._tmp.path());
+        let app = app(&uis());
         for host in ["code.tokera.com", "zend.localhost", "192.168.0.5:8081"] {
             assert_eq!(
                 ask(&app, host, "/").await,
@@ -279,17 +274,14 @@ mod tests {
         }
     }
 
-    /// **A UI file rewritten on disk is served changed on the next request**,
-    /// with nothing rebuilt or restarted.
+    /// A deep link no file answers is the UI's `index.html` — the compiled-in
+    /// pages take the site's fallback as the disk ones did.
     #[tokio::test]
-    async fn an_edit_is_served_on_the_next_request() {
-        let u = uis();
-        let app = app(&u.uis, u._tmp.path());
-        assert_eq!(ask(&app, "code.tokera.com", "/").await.1, "<p>zend</p>");
-        fs::write(u.uis[0].1.content.join("index.html"), "<p>zend, edited</p>").unwrap();
+    async fn a_deep_link_falls_back_to_the_ui() {
+        let app = app(&uis());
         assert_eq!(
-            ask(&app, "code.tokera.com", "/").await.1,
-            "<p>zend, edited</p>"
+            ask(&app, "bot.tokera.com", "/npc/42").await,
+            (200, "<p>npcd</p>".into())
         );
     }
 
@@ -311,7 +303,11 @@ mod tests {
         String::from_utf8_lossy(&body).into_owned()
     }
 
-    fn assembled(u: &Uis, gateways: Vec<IpAddr>, local_signin: Option<&str>) -> Router {
+    fn assembled(
+        u: &[(&'static str, TenantUi)],
+        gateways: Vec<IpAddr>,
+        local_signin: Option<&str>,
+    ) -> Router {
         let listen = Listen {
             bind: IpAddr::from([192, 168, 0, 5]),
             port: 0,
@@ -326,7 +322,7 @@ mod tests {
         );
         builder(
             &listen,
-            &u.uis,
+            u,
             api,
             LocalSignin::new(local_signin).unwrap(),
             None,
@@ -374,35 +370,19 @@ mod tests {
     #[test]
     fn exactly_one_default_site() {
         let u = uis();
-        let mut alone = vec![u.uis[1].clone()];
-        assert!(site_table(&alone, "127.0.0.1:0".parse().unwrap(), u._tmp.path()).is_ok());
+        let mut alone = vec![u[1].clone()];
+        assert!(site_table(&alone, "127.0.0.1:0".parse().unwrap(), base()).is_ok());
         alone[0].1.default = false;
-        let cfg = site_table(&alone, "127.0.0.1:0".parse().unwrap(), u._tmp.path()).unwrap();
+        let cfg = site_table(&alone, "127.0.0.1:0".parse().unwrap(), base()).unwrap();
         assert_eq!(cfg.site_for(Some("anything")).name, "npcd");
 
-        let mut both = u.uis.clone();
+        let mut both = u.clone();
         both[1].1.default = true;
-        let err = site_table(&both, "127.0.0.1:0".parse().unwrap(), u._tmp.path())
+        let err = site_table(&both, "127.0.0.1:0".parse().unwrap(), base())
             .unwrap_err()
             .to_string();
         assert!(
             err.contains("2 tenant UIs claim to be the default"),
-            "{err}"
-        );
-    }
-
-    /// A content directory that does not exist refuses the start, naming it.
-    #[test]
-    fn a_missing_content_directory_refuses() {
-        let u = uis();
-        let mut gone = u.uis.clone();
-        gone[1].1.content = u._tmp.path().join("nowhere");
-        let err = format!(
-            "{:#}",
-            site_table(&gone, "127.0.0.1:0".parse().unwrap(), u._tmp.path()).unwrap_err()
-        );
-        assert!(
-            err.contains("nowhere") && err.contains("does not exist"),
             "{err}"
         );
     }

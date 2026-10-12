@@ -47,6 +47,18 @@ use crate::{CHUNK_SIZE, GID_STRIDE};
 /// WDDM silently collapses throughput rather than failing).
 pub const KV_DEVICE_OOM_MARKER: &str = "kv-cache GPU VRAM budget exceeded";
 
+/// Carried by a region claim refused because the free regions stand above a
+/// placed transient tier. Not a full reservation: the ground comes back the
+/// moment the scheduler's next gap between forwards takes the tier down, so a
+/// caller off the scheduler thread (the persistence pass) waits for that gap
+/// rather than treating it as a failure.
+pub const TIER_STANDS_OVER_FREE: &str = "out of reach until the wave ends";
+
+/// Recognize a claim refused by a standing tier — see [`TIER_STANDS_OVER_FREE`].
+pub fn is_tier_standing_over_free(err: &candle::Error) -> bool {
+    err.to_string().contains(TIER_STANDS_OVER_FREE)
+}
+
 /// Recognize a device-out-of-memory error — either our own budget rejection
 /// ([`KV_DEVICE_OOM_MARKER`]) or a driver-reported CUDA OOM (when sysmem
 /// fallback is disabled, `cuMemAlloc` returns `CUDA_ERROR_OUT_OF_MEMORY`).

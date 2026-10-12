@@ -37,7 +37,7 @@ use candle_conversation::projection::{
     Builder, GroupId, LayerId, ProjectionEvent, SelectionState, TimelineId,
 };
 use candle_conversation::{
-    ConversationEngine, Sequence, SequenceConfig, TurnEvent, TurnHandle, TurnResponse,
+    ConversationEngine, LoadPhase, Sequence, SequenceConfig, TurnEvent, TurnHandle, TurnResponse,
 };
 
 /// The marker a prefilled turn's projection is recorded against.
@@ -3921,9 +3921,15 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     let engine = plan.engine.ticket().engine_with_progress(
         &mut builder,
         &device,
-        // Per transformer block, which is what makes the bar move during the
-        // part of startup that actually takes the time.
-        Some(&|loaded, total| p.set_progress(loaded as u64, total as u64)),
+        // Each phase of the load names the line under the bar and what its
+        // counts are, so the part of startup that takes the time says which
+        // part it is.
+        Some(&|phase: LoadPhase, done, total| {
+            p.set_detail(phase.label());
+            p.set_unit(phase.unit());
+            p.set_progress(done as u64, total as u64);
+        }),
+        &|tenants| p.set_waiting_for(tenants),
     )?;
 
     // ── the substrate ──────────────────────────────────────────────────────

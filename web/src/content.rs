@@ -1,21 +1,44 @@
-//! Content roots — directories on disk, read per request.
+//! Content roots — directories on disk, or compiled into the binary.
 //!
 //! A site's roots are searched in order, so one URL tree can be assembled from
 //! several directories: `[content/npcd, content/common]` means `/lib/dom.js`
 //! falls through to the shared copy while `/pages/roster.js` does not. Sites
 //! share the framework without either of them owning it.
 //!
-//! Every file is read when it is asked for, so saving one is the deployment:
-//! the next request serves it, with no rebuild and no restart.
+//! The two sources answer the same lookups. The gateway reads its sites from
+//! disk, each file when it is asked for, so saving one is the deployment: the
+//! next request serves it, with no rebuild and no restart. A daemon serves the
+//! UI it was built with, compiled in, so it ships as one file that needs no
+//! checkout beside it.
 
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use include_dir::Dir;
 use tokio::fs;
 
-/// The ordered roots for one site: canonical directories, searched in order.
+/// Where one root's files come from.
+#[derive(Clone)]
+pub enum Source {
+    /// A canonical directory, read per request.
+    Disk(PathBuf),
+    /// Compiled in.
+    Embedded(&'static Dir<'static>),
+}
+
+impl Debug for Source {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Source::Disk(p) => write!(f, "disk:{}", p.display()),
+            Source::Embedded(d) => write!(f, "embedded:{}", d.path().display()),
+        }
+    }
+}
+
+/// The ordered roots for one site, searched in order.
 #[derive(Clone, Debug, Default)]
-pub struct Roots(pub Arc<Vec<PathBuf>>);
+pub struct Roots(pub Arc<Vec<Source>>);
 
 impl Roots {
     /// Roots are canonicalised here rather than being trusted as given.
@@ -31,10 +54,18 @@ impl Roots {
         Roots(Arc::new(
             paths
                 .iter()
-                .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+                .map(|p| Source::Disk(p.canonicalize().unwrap_or_else(|_| p.clone())))
                 .collect(),
         ))
     }
+
+    /// Directories compiled in with `include_dir!`, searched in order.
+    pub fn embedded(dirs: &[&'static Dir<'static>]) -> Self {
+        Roots(Arc::new(
+            dirs.iter().copied().map(Source::Embedded).collect(),
+        ))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -48,13 +79,31 @@ impl Roots {
     /// subfolder appear as a published post.
     pub async fn list(&self, rel: &str) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        for root in self.0.iter() {
-            let Ok(mut entries) = fs::read_dir(root.join(rel)).await else {
-                continue;
-            };
-            while let Ok(Some(e)) = entries.next_entry().await {
-                if e.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
-                    names.push(e.file_name().to_string_lossy().into_owned());
+        for src in self.0.iter() {
+            match src {
+                Source::Disk(root) => {
+                    let Ok(mut entries) = fs::read_dir(root.join(rel)).await else {
+                        continue;
+                    };
+                    while let Ok(Some(e)) = entries.next_entry().await {
+                        if e.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
+                            names.push(e.file_name().to_string_lossy().into_owned());
+                        }
+                    }
+                }
+                Source::Embedded(root) => {
+                    let dir = if rel.is_empty() {
+                        Some(*root)
+                    } else {
+                        root.get_dir(rel)
+                    };
+                    if let Some(dir) = dir {
+                        names.extend(dir.files().filter_map(|f| {
+                            f.path()
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                        }));
+                    }
                 }
             }
         }
@@ -63,36 +112,49 @@ impl Roots {
         names
     }
 
-    /// The on-disk path of `rel` in the first root that has it — what a
-    /// caller keys a cache by. `None` when no root holds it.
+    /// The on-disk path of `rel` in the first disk root that has it — what a
+    /// caller keys a cache by. `None` when no disk root holds it: compiled-in
+    /// content has no path, and cannot change while the process runs.
     pub fn disk_path(&self, rel: &str) -> Option<PathBuf> {
-        self.0.iter().find_map(|root| {
-            let p = root.join(rel);
-            p.is_file().then_some(p)
+        self.0.iter().find_map(|src| match src {
+            Source::Disk(root) => {
+                let p = root.join(rel);
+                p.is_file().then_some(p)
+            }
+            Source::Embedded(_) => None,
         })
     }
 
     /// First root that has `rel`, as bytes. `rel` must already be validated by
     /// [`safe_rel`].
     pub async fn read(&self, rel: &str) -> Option<Vec<u8>> {
-        for root in self.0.iter() {
-            // Re-check after canonicalisation: this is what closes the symlink
-            // route out of the site, which the component check in `safe_rel`
-            // cannot see.
-            let Ok(real) = root.join(rel).canonicalize() else {
-                continue;
-            };
-            if !real.starts_with(root) {
-                continue;
-            }
-            let Ok(meta) = fs::metadata(&real).await else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            if let Ok(b) = fs::read(&real).await {
-                return Some(b);
+        for src in self.0.iter() {
+            match src {
+                Source::Disk(root) => {
+                    // Re-check after canonicalisation: this is what closes the
+                    // symlink route out of the site, which the component check
+                    // in `safe_rel` cannot see.
+                    let Ok(real) = root.join(rel).canonicalize() else {
+                        continue;
+                    };
+                    if !real.starts_with(root) {
+                        continue;
+                    }
+                    let Ok(meta) = fs::metadata(&real).await else {
+                        continue;
+                    };
+                    if !meta.is_file() {
+                        continue;
+                    }
+                    if let Ok(b) = fs::read(&real).await {
+                        return Some(b);
+                    }
+                }
+                Source::Embedded(dir) => {
+                    if let Some(f) = dir.get_file(rel) {
+                        return Some(f.contents().to_vec());
+                    }
+                }
             }
         }
         None
@@ -176,6 +238,26 @@ mod tests {
             dotted.read("base.css").await.is_some(),
             "a dotted root did not read"
         );
+    }
+
+    static COMMON: Dir<'static> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/content/common");
+
+    /// A compiled-in directory answers as the same directory on disk does:
+    /// the same bytes, the same listing — and no disk path, since it has none.
+    #[tokio::test]
+    async fn an_embedded_root_answers_as_its_directory_on_disk() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("content")
+            .join("common");
+        let disk = Roots::disk(&[dir]);
+        let embedded = Roots::embedded(&[&COMMON]);
+        for rel in ["base.css", "lib/aggregate.js"] {
+            let want = disk.read(rel).await.expect("on disk");
+            assert_eq!(embedded.read(rel).await, Some(want), "{rel}");
+        }
+        assert_eq!(embedded.list("lib").await, disk.list("lib").await);
+        assert_eq!(embedded.read("lib/none.js").await, None);
+        assert_eq!(embedded.disk_path("base.css"), None);
     }
 
     #[tokio::test]

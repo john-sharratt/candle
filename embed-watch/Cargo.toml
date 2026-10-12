@@ -1,0 +1,11 @@
+[package]
+name = "embed-watch"
+version = "0.1.0"
+edition = "2021"
+description = "Build-script helper: rerun the build when anything under a directory a crate embeds with include_dir! changes"
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }

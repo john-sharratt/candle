@@ -4,6 +4,7 @@
 //! indices, the same labels and file events, its tombstones still naming what
 //! they named, and its sections' records still admitted.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use tempfile::TempDir;
@@ -14,7 +15,7 @@ use super::manifest::encode_label_payload;
 use super::record::{ChunkPayload, RecordType, TombstonePayload};
 use super::resume::encode_token_ids;
 use super::streams::{ContentAddress, SectionDecl, StreamDecl, TurnDecl};
-use super::{Admit, PersistenceError, SharedSubstrate, SubstratePersistence};
+use super::{Admit, OpenStage, PersistenceError, SharedSubstrate, SubstratePersistence};
 use crate::models::identity::LegacySpec;
 use crate::projection::{Conversation, TimelineId, TurnIndex};
 use crate::substrate::{StreamKey, Substrate};
@@ -148,9 +149,82 @@ fn walked(dir: &TempDir) -> Vec<(RecordType, RecordIdentity)> {
         |e| {
             seen.push((e.record.header.record_type, e.record.header.identity()));
         },
+        &|_, _, _| {},
     )
     .unwrap();
     seen
+}
+
+/// **An adopting open says what it is doing, and counts the rewrite.** It
+/// reads, stamps — counting records written up to the whole live set — and
+/// reads again, each walk counting MiB of the store; a store that needs no
+/// adoption only reads.
+#[test]
+fn an_adopting_open_reports_its_stages_and_counts_the_rewrite() {
+    let dir = TempDir::new().unwrap();
+    write_legacy_store(&dir);
+
+    let told: RefCell<Vec<(OpenStage, usize, usize)>> = RefCell::new(Vec::new());
+    let mut substrate = Substrate::new();
+    drop(
+        SubstratePersistence::open_in_with_substrate_and_sink(
+            dir.path(),
+            &mut substrate,
+            Admit::Unbound,
+            |_| {},
+            &|stage, done, total| told.borrow_mut().push((stage, done, total)),
+        )
+        .unwrap(),
+    );
+    let told = told.into_inner();
+    let stages: Vec<OpenStage> = told.iter().map(|(s, ..)| *s).collect();
+    assert_eq!(stages.first(), Some(&OpenStage::Reading));
+    assert_eq!(stages.last(), Some(&OpenStage::Rereading));
+    let stamping: Vec<(usize, usize)> = told
+        .iter()
+        .filter(|(s, ..)| *s == OpenStage::Stamping)
+        .map(|(_, d, t)| (*d, *t))
+        .collect();
+    let (_, total) = *stamping.last().expect("the rewrite was counted");
+    assert!(total > 0);
+    assert_eq!(stamping.last(), Some(&(total, total)));
+    let counted: Vec<usize> = stamping
+        .iter()
+        .filter(|(_, t)| *t == total)
+        .map(|(d, _)| *d)
+        .collect();
+    assert!(counted.windows(2).all(|w| w[0] <= w[1]), "{counted:?}");
+    // Each walk counts MiB of the store on disk, from nothing to all of it.
+    for walk in [OpenStage::Reading, OpenStage::Rereading] {
+        let counts: Vec<(usize, usize)> = told
+            .iter()
+            .filter(|(s, ..)| *s == walk)
+            .map(|(_, d, t)| (*d, *t))
+            .collect();
+        let (_, total) = *counts.last().expect("the walk was counted");
+        assert!(total > 0, "{walk:?}");
+        assert_eq!(counts.first(), Some(&(0, total)), "{walk:?}");
+        assert_eq!(counts.last(), Some(&(total, total)), "{walk:?}");
+    }
+
+    let again: RefCell<Vec<OpenStage>> = RefCell::new(Vec::new());
+    let mut substrate = Substrate::new();
+    drop(
+        SubstratePersistence::open_in_with_substrate_and_sink(
+            dir.path(),
+            &mut substrate,
+            Admit::Unbound,
+            |_| {},
+            &|stage, _, _| again.borrow_mut().push(stage),
+        )
+        .unwrap(),
+    );
+    let again = again.into_inner();
+    assert!(!again.is_empty());
+    assert!(
+        again.iter().all(|s| *s == OpenStage::Reading),
+        "a store needing no adoption only reads: {again:?}"
+    );
 }
 
 /// The spec text a build before model keys recorded of its model.
@@ -311,6 +385,45 @@ fn a_stamped_store_is_not_adopted() {
     assert!(before
         .iter()
         .all(|(rt, id)| *rt == RecordType::HeaderIndex || !id.is_none()));
+}
+
+/// **A compaction of a stamped store writes nothing unstamped**, so its next
+/// open adopts nothing. Every loaded turn carries a default summary-tree node
+/// that no record ever stated; a rewrite that wrote those out wrote records with
+/// no identity — one per plain turn — and the open after it read the store as
+/// predating identities and rewrote all of it. Measured on zend's store, fresh
+/// that day: 238 such nodes and a 98 s rewrite on a restart.
+#[test]
+fn a_compacted_store_with_plain_turns_stays_stamped() {
+    let dir = TempDir::new().unwrap();
+    {
+        let (_, mut sp) = open(&dir);
+        for i in 0..3 {
+            let d = turn(i);
+            sp.declare_stream(&d).unwrap();
+            sp.append_tokens(d.stream_id(), &encode_token_ids(&[20 + i]))
+                .unwrap();
+        }
+        sp.commit().unwrap();
+    }
+    {
+        let (substrate, sp) = open(&dir);
+        let conv = Conversation::from_parts(substrate, sp);
+        conv.reconstruct_from_log(1, None).unwrap();
+        let tl = TimelineId::from_raw(TL).unwrap();
+        assert!(
+            conv.read().tree_meta_of(tl, TurnIndex(0)).is_some(),
+            "the loaded turns carry their default tree nodes"
+        );
+        conv.compact_substrate(None).unwrap();
+        conv.flush_writer();
+    }
+    let unstamped: Vec<RecordType> = walked(&dir)
+        .into_iter()
+        .filter(|(rt, id)| *rt != RecordType::HeaderIndex && id.is_none())
+        .map(|(rt, _)| rt)
+        .collect();
+    assert_eq!(unstamped, Vec::<RecordType>::new());
 }
 
 /// The adopted turns reload with their tokens at their indices.

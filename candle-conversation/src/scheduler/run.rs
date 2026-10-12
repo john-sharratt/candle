@@ -1,10 +1,11 @@
 use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, ThrottleReason};
 use super::prefill::{VramPhase, LOAD_TARGET};
+use super::vram_bands::vram_bands;
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
 use candle::DeviceLocation;
-use candle_nn::kv_cache::{is_tier_refusal, set_kv_free_target};
+use candle_nn::kv_cache::{is_tier_refusal, region_stats, set_kv_free_target, span_partition};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
@@ -499,6 +500,8 @@ impl Scheduler {
             if self.shutdown_requested {
                 break;
             }
+            // The top of the pass: a wave's wall-clock runs from here.
+            let t_pass = Instant::now();
             // 1. Drain pending submissions (non-blocking). This synchronously
             // handles SubmitTurn (projection + elevate + apply_segments gap-fill
             // + view create) on the scheduler thread — a prime suspect for the
@@ -924,6 +927,8 @@ impl Scheduler {
             // whole housekeeping as one forward's overhead would teach the model that a
             // forward costs an idle loop iteration.
             if self.wave_forwards > 0 {
+                self.wave_stats
+                    .add_wave(t_pass.elapsed().as_micros() as u64, self.wave_overhead_us);
                 let per_forward = self.wave_overhead_us as f64 / 1e6 / self.wave_forwards as f64;
                 if let Some(rate) = self.wave_rate.as_mut() {
                     rate.observe_overhead(per_forward);
@@ -1026,58 +1031,28 @@ impl Scheduler {
                     .zip(self.session.vram_pool_stats())
                     .map(|(budget, (used, _reserved))| (budget, used));
                 let backlog = self.pending_prefill_tokens();
-                // Resident-arena occupancy for the arena panel, split small vs
-                // large half of the size-class ladder. `mem_get_info` returns
-                // bytes → convert to MiB here so the ring fields match their
-                // `_mib` names (and the dashboard's GiB scale).
-                //
-                // The panel used to split float vs quant, which is not a
-                // question an arena can answer any more — it holds whatever
-                // fits its slots. The ladder split carries the same signal:
-                // compression moves occupancy DOWN the ladder, so a working
-                // compress-to-free rung shows the large half falling.
-                let mib = |b: usize| (b >> 20) as u64;
-                let fmt = self.session.kv_gpu_class_stats().map(|cs| {
-                    let half = cs.classes.len() / 2;
-                    let sum = |rows: &[candle_nn::kv_cache::ClassOccupancy]| {
-                        rows.iter().fold((0usize, 0usize, 0usize), |acc, c| {
-                            (
-                                acc.0 + c.arenas,
-                                acc.1 + c.reserved_bytes,
-                                acc.2 + c.live_bytes,
-                            )
-                        })
-                    };
-                    let (l_arenas, l_res, l_live) = sum(&cs.classes[half..]);
-                    let (s_arenas, s_res, s_live) = sum(&cs.classes[..half]);
-                    (
-                        l_arenas as u32,
-                        mib(l_res),
-                        mib(l_live),
-                        s_arenas as u32,
-                        mib(s_res),
-                        mib(s_live),
-                    )
-                });
-                // Whole-card VRAM decomposition: KV-pool reserved footprint +
-                // driver total/free (`cuMemGetInfo`). `0` when unavailable
-                // (non-CUDA) — the panel then shows an empty decomposition.
-                let reserved_mib = self
-                    .session
-                    .vram_pool_stats()
-                    .map(|(_, r)| mib(r))
-                    .unwrap_or(0);
-                let (total_mib, free_mib) = self
+                // The whole card, cut by what holds each byte: the driver's total
+                // and free, what was on the card before the span, the CUDA pool
+                // outside it, the span's own partition and the resident experts
+                // in its weight zone. The bands add up to the card's total, so
+                // the panel stacking them can show where every byte went.
+                let pool_reserved = self.session.vram_pool_stats().map_or(0, |(_, r)| r as u64);
+                let (free, total) = self
                     .session
                     .vram_free_total()
-                    .map(|(f, t)| (mib(t), mib(f)))
-                    .unwrap_or((0, 0));
-                // Live resident model-weight VRAM: fixed base weights + the
-                // resident-expert footprint, which rises/falls as MoE experts page
-                // VRAM↔pinned RAM. Sampled from the model each wave so the weights
-                // band tracks the real (time-varying) footprint rather than a
-                // static startup snapshot. `0` when the model can't report it.
-                let weights_mib = self.model.resident_weight_bytes().map(mib).unwrap_or(0);
+                    .map_or((0, 0), |(f, t)| (f as u64, t as u64));
+                let (context, span) = match self.device.location() {
+                    DeviceLocation::Cuda { gpu_id } => (
+                        region_stats(gpu_id).and_then(|s| s.pre_reservation_in_use_bytes),
+                        span_partition(gpu_id),
+                    ),
+                    _ => (None, None),
+                };
+                let resident_experts = self
+                    .model
+                    .expert_stats()
+                    .map_or(0, |s| s.resident_vram_bytes as u64);
+                let vram = vram_bands(total, free, context, pool_reserved, span, resident_experts);
                 // Active-work counts at this wave for the slots panel.
                 let slots = (
                     self.slot_conversations.len() as u32,
@@ -1088,8 +1063,7 @@ impl Scheduler {
                 self.wave_stats.flush(
                     kv_vram,
                     backlog,
-                    fmt,
-                    (reserved_mib, total_mib, free_mib, weights_mib),
+                    vram,
                     slots,
                     self.model.expert_stats().map(|s| {
                         (

@@ -50,6 +50,7 @@ use super::types::LookAhead;
 use super::types::{BoundaryAsk, PipelineMessage, PipelineStats};
 #[cfg(feature = "cuda")]
 use super::warm_tier::WarmTier;
+use crate::models::load_phase::{LoadPhase, LoadProgress};
 use crate::models::profile::ProfileSnapshot;
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::CudaDevice;
@@ -494,7 +495,9 @@ pub struct ExpertCacheSetup<'a> {
     /// Experts each token routes to (top-k) — sizes the bucketize workspace and
     /// is checked against the router's bound.
     pub experts_used: usize,
-    pub progress: Option<&'a dyn Fn(usize, usize)>,
+    /// Told each phase of the fill — pinning the host tier, reading it, filling
+    /// VRAM — and how far through it is.
+    pub progress: Option<LoadProgress<'a>>,
     pub int8mode: Int8Mode,
     /// Bytes the loader mapped of the model pack — its GGUF part, which holds
     /// every tensor but the experts.
@@ -695,6 +698,9 @@ impl ExpertCache {
                 // Pinned as far as the driver grants and the device can address
                 // while keeping both margins, pageable for the rest — see
                 // `warm_tier`. Read after the pad, which is charged against it.
+                if let Some(report) = progress {
+                    report(LoadPhase::PinWarm, 0, 0);
+                }
                 let mut warm = WarmTier::new(
                     membership.len(),
                     stride,
@@ -774,9 +780,13 @@ impl ExpertCache {
             );
             // The last of the tail: the cache is built and reporting itself, so
             // the bar lands on its total here rather than at the last expert.
-            if let Some(cb) = progress {
+            if let Some(report) = progress {
                 let total = num_moe_layers * experts_per_layer;
-                cb(total + PACK_TAIL_STEPS, total + PACK_TAIL_STEPS);
+                report(
+                    LoadPhase::FillVram,
+                    total + PACK_TAIL_STEPS,
+                    total + PACK_TAIL_STEPS,
+                );
             }
             if let Ok(mut s) = stats.lock() {
                 s.resident_vram_bytes = seeded;

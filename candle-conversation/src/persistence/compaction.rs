@@ -1069,11 +1069,15 @@ pub fn collect_live_records(
 /// With `adoption`, a record with no identity is stamped as it is written
 /// ([`Adoption::restamp`]) — a read-back one decoded and encoded again under
 /// its new header — and every other record is written as without.
+///
+/// `written` is told how many of `items` are staged, after each record or
+/// stripe: a whole-store rewrite runs for minutes, and this is its counter.
 pub fn write_compacted_log(
     path: &Path,
     items: &[CompactItem],
     read_into: &mut dyn FnMut(SegmentId, u64, &mut [u8]) -> Result<()>,
     mut adoption: Option<&mut Adoption>,
+    written: &mut dyn FnMut(usize),
 ) -> Result<(LogFile, Manifest)> {
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -1121,17 +1125,18 @@ pub fn write_compacted_log(
                     Some(a) => a.restamp(&h, payload)?,
                     None => None,
                 };
-                let (written, bytes) = match &stamped {
+                let (written_header, bytes) = match &stamped {
                     Some((h, payload)) => encode_record_written(h, payload),
                     None => encode_record_written(&h, payload),
                 };
                 let offset = log.stage(&bytes);
                 pending.push(IndexEntry::from_header(
-                    &written,
+                    &written_header,
                     offset,
                     bytes.len() as u64,
                 ));
                 i += 1;
+                written(i);
             }
             CompactItem::Raw {
                 segment,
@@ -1226,6 +1231,7 @@ pub fn write_compacted_log(
                     if log.pending_len() >= COMPACT_FLUSH_BYTES {
                         log.flush()?;
                     }
+                    written(i + b);
                 }
                 i = j;
             }
@@ -1566,13 +1572,18 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let mut counted = Vec::new();
         let (mut new_log, _after_manifest) = write_compacted_log(
             &path,
             &live,
             &mut |_s, off, dest| mem.read_into(off, dest),
             None,
+            &mut |n| counted.push(n),
         )
         .unwrap();
+        // The counter only rises, and ends on the whole live set.
+        assert!(counted.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(counted.last().copied(), Some(live.len()));
 
         // The compacted log re-walked into a substrate has the same
         // live streams + chunks as the source.

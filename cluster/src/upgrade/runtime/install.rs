@@ -27,7 +27,6 @@ use super::Upgrader;
 use crate::frame::BuildId;
 use crate::member::Link;
 use crate::replicate::Phase;
-use crate::upgrade::artifacts::UI_KIND;
 use crate::upgrade::compat::{check, Needs};
 use crate::upgrade::decisions::build_name;
 use crate::upgrade::kept::name as kept_name;
@@ -199,25 +198,8 @@ impl Upgrader {
         let exe = s.served.iter().find(|i| {
             i.build == *build && i.from == HeldAs::Verified && i.artifact.kind == *kind
         })?;
-        let ui = if self.setup.ui.is_empty() {
-            exe.path.clone()
-        } else {
-            s.served
-                .iter()
-                .find(|i| {
-                    i.build == *build && i.from == HeldAs::Verified && i.artifact.kind == UI_KIND
-                })?
-                .path
-                .clone()
-        };
         let opens = exe.info.as_ref()?.opens.clone();
-        Some((
-            Source::Fetched {
-                exe: exe.path.clone(),
-                ui,
-            },
-            opens,
-        ))
+        Some((Source::Fetched(exe.path.clone()), opens))
     }
 
     /// What a build must open to replace this one: the log format and model

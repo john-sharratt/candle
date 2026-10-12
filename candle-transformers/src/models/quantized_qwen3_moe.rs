@@ -39,6 +39,7 @@ use crate::models::batch_test::utils::{TestConfig, TestMode};
 #[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
 use crate::models::batched_inference::InferenceMode;
 use crate::models::batched_layer::WaveRef;
+use crate::models::load_phase::{LoadPhase, LoadProgress};
 use crate::models::routing_capture;
 use crate::models::wave_buffers::wave_root;
 use crate::quantized_nn::RmsNorm;
@@ -820,13 +821,12 @@ impl ModelWeights {
     /// gate/up/down, lm_head) to its KO twin so forward runs the q8a128 int8
     /// tensor-core matmul; the experts are already KO twins in the pack.
     ///
-    /// `progress`, when supplied, is called with `(units_done, units_total)`
-    /// as layers mount and the expert cache fills — drives a UI progress bar
-    /// without coupling this loader to the daemon's progress type.
+    /// `progress`, when supplied, is told each phase of the load and how far
+    /// through it is — the dense layers mounted, then the expert cache's fill.
     pub fn from_pack(
         path: &std::path::Path,
         device: &Device,
-        progress: Option<&dyn Fn(usize, usize)>,
+        progress: Option<LoadProgress<'_>>,
     ) -> Result<Self> {
         let pack = ModelPack::open(path)?;
         let int8mode = pack.int8_mode;
@@ -1115,19 +1115,11 @@ impl ModelWeights {
             candle::bail!("the expert cache is a CUDA-only path — build with the `cuda` feature");
         }
 
-        // Combined progress denominator for the `from_pack`
-        // outer callback: the per-layer dense loop (`num_layers`) followed by
-        // the expert cache uploads (`num_moe_layers × n_expert`). The bar then
-        // advances continuously through both phases.
-        //
-        // The two phases swapped order. The dense weights must be **resident**
-        // before the span is reserved, because the span is sized from
-        // `usable()` — a live measurement — and that is what subtracts them
-        // exactly once. Sizing the expert cache first meant forecasting the
-        // dense footprint from the GGUF tensor table and hoping the forecast
-        // matched (`pending_dense_bytes`, now deleted).
-        let total_expert_ticks = num_moe_layers * n_expert;
-        let total_units = total_expert_ticks + num_layers;
+        // The dense weights load first and the expert cache after them, each
+        // reporting its own phase. The order is fixed: the dense weights must
+        // be **resident** before the span is reserved, because the span is
+        // sized from `usable()` — a live measurement — and that is what
+        // subtracts them exactly once.
 
         // The expert cache is built **after** the dense weights, further down.
         // Only the "is there one at all" question is answered here, because a
@@ -1232,11 +1224,8 @@ impl ModelWeights {
             if (i + 1) % 8 == 0 || i == num_layers - 1 {
                 tracing::debug!("Layer {}/{} loaded", i + 1, num_layers);
             }
-            // The dense loop runs first now, so it holds the first `num_layers`
-            // ticks of the combined denominator and the expert fill continues
-            // from there.
-            if let Some(cb) = progress {
-                cb(i + 1, total_units);
+            if let Some(report) = progress {
+                report(LoadPhase::Weights, i + 1, num_layers);
             }
         }
 
@@ -1354,20 +1343,13 @@ impl ModelWeights {
             let capacity = zone.capacity();
             let slot_bytes = zone.slot_bytes();
 
-            // Wrap the outer callback so the cache's per-expert
-            // `(done, total_experts)` ticks land on the combined denominator,
-            // after the `num_layers` ticks the dense loop already spent.
-            let cache_wrapper = progress
-                .map(|cb| move |done: usize, _total: usize| cb(num_layers + done, total_units));
-            let cache_progress: Option<&dyn Fn(usize, usize)> =
-                cache_wrapper.as_ref().map(|f| f as &dyn Fn(usize, usize));
             let cache = ExpertCache::new(ExpertCacheSetup {
                 pack: section,
                 zone,
                 device,
                 experts_per_layer: n_expert,
                 experts_used: n_expert_used,
-                progress: cache_progress,
+                progress,
                 int8mode,
                 mapped_bytes: pack.gguf_len(),
                 // The embedding is copied into pinned host memory and every

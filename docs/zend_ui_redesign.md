@@ -29,9 +29,10 @@ switcher.
 > its behavior is specified in §2.5 + Phase-1 step 1.8.
 
 ### Chosen approach (decided)
-- **Frontend stack:** vanilla, single file. The rebuilt UI lives in `zend/web/`
-  and the host serves it from disk, read per request — saving a file is the
-  deployment (`docs/shared_model_host.md` §3.4). **No build step, no node, no
+- **Frontend stack:** vanilla, single file. The rebuilt UI lives in `zend/web/`,
+  compiled into the binary; the gateway serves the same folder from disk, read per
+  request, so a saved file is live on the next refresh (`docs/shared_model_host.md`
+  §3.4). **No build step, no node, no
   framework** — the repo has zero JS
   build tooling and we are not introducing any. The design's `renderVals()` /
   `<sc-for>` / `<sc-if>` structure maps directly onto the existing render loop
@@ -59,7 +60,7 @@ switcher.
 
 ### 2.1 Backend (`zend/src/api/`, axum)
 zend runs as a tenant of the host process (`docs/shared_model_host.md`): the host serves
-`web/` from disk — an edit is served on the next request — and the endpoints every tenant
+`web/` compiled in — and the gateway the same folder from disk — and the endpoints every tenant
 shares (`/v1/status`, `/v1/me`, `/v1/telemetry`, `/v1/tools`, `/v1/substrate`, `/ws/logs`)
 once, with zend's part under `tenants.zend`. zend's own routes are in
 `zend/src/api/mod.rs`:

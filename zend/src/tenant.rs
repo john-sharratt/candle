@@ -18,6 +18,7 @@ use host::{
     CheckProgress, Maintenance, MeShare, Reports, Running, Tenant, TenantContext, TenantStatus,
     TenantUi,
 };
+use include_dir::{include_dir, Dir};
 use serde_json::{json, Map, Value};
 use tokio::task::spawn_blocking;
 use web::auth::session::Identity;
@@ -25,7 +26,6 @@ use web::auth::Role;
 
 use crate::access::{allowed_modes, default_mode};
 use crate::api::routes;
-use crate::cli::DEFAULT_UI;
 use crate::config::DaemonConfig;
 use crate::ingest_backlog::BacklogSnapshot;
 use crate::loading::LoadingSnapshot;
@@ -45,12 +45,15 @@ pub fn requires() -> Capabilities {
     }
 }
 
-/// zend's UI by default: `zend/web/` in the source tree, on its own names, and
-/// the default site — what a request by IP shows.
-pub fn default_ui() -> TenantUi {
+/// zend's web UI, `zend/web`, compiled in.
+pub static WEB: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/web");
+
+/// zend's UI: its pages, on its own names, and the default site — what a
+/// request by IP shows.
+pub fn zend_ui() -> TenantUi {
     TenantUi {
         hosts: vec!["code.tokera.com".into(), "zend.localhost".into()],
-        content: PathBuf::from(DEFAULT_UI),
+        content: &WEB,
         default: true,
     }
 }
@@ -58,12 +61,11 @@ pub fn default_ui() -> TenantUi {
 /// zend, configured and not yet started.
 pub struct ZendTenant {
     config: DaemonConfig,
-    ui: TenantUi,
 }
 
 impl ZendTenant {
-    pub fn new(config: DaemonConfig, ui: TenantUi) -> Self {
-        Self { config, ui }
+    pub fn new(config: DaemonConfig) -> Self {
+        Self { config }
     }
 }
 
@@ -81,7 +83,7 @@ impl Tenant for ZendTenant {
     }
 
     fn ui(&self) -> TenantUi {
-        self.ui.clone()
+        zend_ui()
     }
 
     fn start(self: Box<Self>, ctx: TenantContext) -> BoxFuture<'static, anyhow::Result<Running>> {
@@ -255,6 +257,7 @@ fn loading_view(l: LoadingSnapshot, detail: String) -> LoadingView {
         elapsed_ms: l.elapsed_ms,
         prefill_tokens: l.prefill_tokens,
         prefill_tps: tokens_per_second(l.prefill_tokens, l.elapsed_ms),
+        waiting_for: l.waiting_for,
     }
 }
 
@@ -294,6 +297,7 @@ mod tests {
             unit: "turns".into(),
             elapsed_ms: 2000,
             prefill_tokens: 4000,
+            waiting_for: vec!["npcd"],
         };
         let v = loading_view(snap, "Loading model…".into());
         assert_eq!(v.current, "substrate");
@@ -301,6 +305,7 @@ mod tests {
         assert_eq!(v.completed, ["model"]);
         assert_eq!(v.detail, "Loading model…");
         assert_eq!(v.prefill_tps, Some(2000.0));
+        assert_eq!(v.waiting_for, ["npcd"]);
     }
 
     /// The backlog keeps its wire shape; maintenance's is the host's

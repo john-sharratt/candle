@@ -51,6 +51,7 @@ fn loading_view(l: LoadingSnapshot) -> LoadingView {
         prefill_tps: l
             .prefill_tps
             .or_else(|| tokens_per_second(l.prefill_tokens, l.elapsed_ms)),
+        waiting_for: l.waiting_for,
     }
 }
 
@@ -246,6 +247,7 @@ mod tests {
             elapsed_ms: 2_000,
             prefill_tokens: 8_000,
             prefill_tps: None,
+            waiting_for: vec!["zend"],
         });
         assert_eq!(
             serde_json::to_value(&view).unwrap(),
@@ -262,6 +264,7 @@ mod tests {
                 "elapsed_ms": 2_000,
                 "prefill_tokens": 8_000,
                 "prefill_tps": 4_000.0,
+                "waiting_for": ["zend"],
             })
         );
     }

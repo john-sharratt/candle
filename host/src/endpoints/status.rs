@@ -7,9 +7,8 @@
 //! - `engine_connected` is whether the model is loaded: some tenant is past its
 //!   `model` step.
 //! - `detail` is that load as one line: its label, and the item in hand.
-//! - `build` hashes every UI file on disk, the binary's version and the
-//!   running executable's stamp (see [`crate::ui`]); a page reloads itself
-//!   when it changes.
+//! - `build` hashes every compiled-in UI file and the binary's version (see
+//!   [`crate::ui`]); a page reloads itself when it changes.
 //! - `tenants.<name>` is each tenant's own line: its state, its load, its
 //!   substrate maintenance, and its extras.
 
@@ -19,14 +18,14 @@ use axum::extract::State;
 use axum::Json;
 use futures::future::join_all;
 use serde_json::{json, Map, Value};
-use tokio::task::spawn_blocking;
 
 use super::Shared;
 use crate::cluster::view::status_block;
+use crate::cluster::Cluster;
 use crate::loading::LoadingView;
+use crate::model::ModelView;
 use crate::stopping::StopStep;
 use crate::tenant::TenantStatus;
-use crate::ui::build_id;
 
 pub async fn status(State(s): State<Arc<Shared>>) -> Json<Value> {
     let lines = join_all(s.tenants.iter().map(|(_, r)| r.status())).await;
@@ -41,14 +40,22 @@ pub async fn status(State(s): State<Arc<Shared>>) -> Json<Value> {
             None => (n, line),
         })
         .collect();
-    let dirs = s.content_dirs.clone();
-    let version = s.version;
-    // A failed walk is a bug, not an empty build: an open page reads a changed
-    // `build` as a new UI and reloads itself.
-    let build = spawn_blocking(move || build_id(&dirs, version))
-        .await
-        .expect("the build id walk panicked");
-    Json(assemble(&s, &build, named))
+    Json(assemble(&head_of(&s), &s.build, named))
+}
+
+/// What the body says of the process, apart from its tenants.
+pub struct Head<'a> {
+    pub started_at_ms: u64,
+    pub model: &'a ModelView,
+    pub cluster: Option<&'a Cluster>,
+}
+
+fn head_of(s: &Shared) -> Head<'_> {
+    Head {
+        started_at_ms: s.started_at_ms,
+        model: &s.model,
+        cluster: s.cluster.as_deref(),
+    }
 }
 
 /// A tenant's line while the process stops (§12.4): loading again, the step
@@ -68,16 +75,22 @@ fn draining(mut line: TenantStatus, step: &StopStep) -> TenantStatus {
         elapsed_ms: 0,
         prefill_tokens: 0,
         prefill_tps: None,
+        waiting_for: Vec::new(),
     });
     line
 }
 
 /// The body, from each tenant's line.
-fn assemble(s: &Shared, build: &str, tenants: Vec<(&str, TenantStatus)>) -> Value {
+pub fn assemble(head: &Head<'_>, build: &str, tenants: Vec<(&str, TenantStatus)>) -> Value {
     let loading = tenants.iter().find_map(|(_, t)| t.loading.clone());
-    let engine_connected = tenants
-        .iter()
-        .any(|(_, t)| t.loading.as_ref().is_none_or(|l| l.current != "model"));
+    // Some tenant is ready or has finished its `model` step. Not "is past it":
+    // a tenant's steps before the model (finding the pack, opening the
+    // substrate) are not the model loaded.
+    let engine_connected = tenants.iter().any(|(_, t)| {
+        t.loading
+            .as_ref()
+            .is_none_or(|l| l.completed.contains(&"model"))
+    });
     let detail = loading
         .as_ref()
         .map(|l| {
@@ -97,14 +110,14 @@ fn assemble(s: &Shared, build: &str, tenants: Vec<(&str, TenantStatus)>) -> Valu
     }
     json!({
         "state": if loading.is_some() { "loading" } else { "ready" },
-        "started_at_ms": s.started_at_ms,
+        "started_at_ms": head.started_at_ms,
         "build": build,
-        "model": s.model,
+        "model": head.model,
         "engine_connected": engine_connected,
         "detail": detail,
         "loading": loading,
         "tenants": lines,
-        "cluster": s.cluster.as_deref().map(status_block),
+        "cluster": head.cluster.map(status_block),
     })
 }
 
@@ -118,12 +131,11 @@ mod tests {
     /// is not connected; npcd's line is its own.
     #[tokio::test]
     async fn the_top_level_is_the_first_load_in_rank_order() {
+        let mut npcd = loading("substrate");
+        npcd.completed = vec!["model"];
         let s = shared(vec![
             ("zend", scripted(TenantStatus::of(Some(loading("model"))))),
-            (
-                "npcd",
-                scripted(TenantStatus::of(Some(loading("substrate")))),
-            ),
+            ("npcd", scripted(TenantStatus::of(Some(npcd)))),
         ]);
         let (code, body) = get_json(&app(s), "/v1/status").await;
         assert_eq!(code, 200);
@@ -144,7 +156,7 @@ mod tests {
     fn all_ready_is_ready() {
         let s = shared(vec![]);
         let body = assemble(
-            &s,
+            &head_of(&s),
             "0123456789abcdef",
             vec![
                 ("zend", TenantStatus::of(None)),
@@ -192,9 +204,25 @@ mod tests {
     fn the_engine_is_not_connected_while_every_tenant_waits_on_the_model() {
         let s = shared(vec![]);
         let body = assemble(
-            &s,
+            &head_of(&s),
             "",
             vec![("zend", TenantStatus::of(Some(loading("model"))))],
+        );
+        assert_eq!(body["engine_connected"], false);
+    }
+
+    /// **A step before the model is not the model loaded.** zend opening its
+    /// substrate — a step that comes before the weights — read as connected
+    /// when "connected" meant "on any step but `model`".
+    #[test]
+    fn a_step_before_the_model_is_not_connected() {
+        let s = shared(vec![]);
+        let mut opening = loading("opening");
+        opening.completed = vec!["pack"];
+        let body = assemble(
+            &head_of(&s),
+            "",
+            vec![("zend", TenantStatus::of(Some(opening)))],
         );
         assert_eq!(body["engine_connected"], false);
     }

@@ -19,7 +19,6 @@
 
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,22 +30,19 @@ use host::run::merge_routes;
 use host::server::{builder, Listen};
 use host::stopping::Stopping;
 use host::telemetry::Telemetry;
-use host::{Reports, TenantUi};
+use host::ui::{build_id, COMMON};
+use host::Reports;
 use web::auth::Roles;
 use web::Roots;
 use zend::api;
 use zend::config::DaemonConfig;
 use zend::session::ZendSession;
-use zend::tenant::{default_ui, ZendReports};
+use zend::tenant::{zend_ui, ZendReports, WEB};
 
 struct Harness {
     addr: SocketAddr,
     log: Arc<LogBus>,
     _tmp: tempfile::TempDir,
-}
-
-fn manifest() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 /// Boot the assembled server on `127.0.0.1:0` and return the bound address.
@@ -60,18 +56,12 @@ async fn boot() -> Harness {
     // `boss` is the admin, so a test can say which caller it means by which
     // subject it sends.
     let roles: Roles = serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap();
-    let common = manifest()
-        .join("..")
-        .join("web")
-        .join("content")
-        .join("common");
     let shared = Arc::new(Shared {
         started_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64,
-        version: "harness",
-        content_dirs: vec![manifest().join("web"), common.clone()],
+        build: build_id(&[&WEB, &COMMON], "harness"),
         model: ModelView::of_prescribed(),
         tenants: vec![(
             "zend",
@@ -85,14 +75,10 @@ async fn boot() -> Harness {
         host: "harness".into(),
     });
     let all = merge_routes(
-        routes(shared, Roots::disk(&[common])),
+        routes(shared, Roots::embedded(&[&COMMON])),
         vec![("zend", api::routes(session, roles))],
     )
     .expect("zend's routes do not overlap the host's");
-    let ui = TenantUi {
-        content: manifest().join("web"),
-        ..default_ui()
-    };
     let listen = Listen {
         bind: "127.0.0.1".parse().unwrap(),
         port: 0,
@@ -101,7 +87,7 @@ async fn boot() -> Harness {
     };
     let app = builder(
         &listen,
-        &[("zend", ui)],
+        &[("zend", zend_ui())],
         all.router,
         LocalSignin::default(),
         None,

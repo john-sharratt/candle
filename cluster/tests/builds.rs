@@ -106,8 +106,6 @@ fn machine(count: u32, kept: &[u32]) -> Machine {
                     sha256: hex(&file_sha256(&at.join(&name)).unwrap()),
                     path: name,
                 }],
-                ui: vec![],
-                ui_archive: String::new(),
                 installed_ms: 1,
                 retired_ms: 2,
             },
@@ -119,8 +117,6 @@ fn machine(count: u32, kept: &[u32]) -> Machine {
         Setup {
             info: info(count),
             exe,
-            root: dir.path().to_path_buf(),
-            ui: vec![],
             upgrade_dir: dir.path().join("data").join("upgrade"),
             keep_builds: 5,
             failed_from: None,
@@ -220,7 +216,7 @@ async fn a_certified_build_reaches_the_others_and_installs_one_at_a_time() {
         .unwrap();
     assert_eq!(job.build, b(12));
     assert_eq!(job.leases, ["upgrade/zend"]);
-    let Source::Fetched { exe, .. } = &job.source else {
+    let Source::Fetched(exe) = &job.source else {
         panic!("a fetched build: {:?}", job.source);
     };
     assert_eq!(

@@ -51,8 +51,6 @@ pub fn hand_off(
 ) -> io::Result<()> {
     let running = Running {
         exe: &launch.exe,
-        root: &launch.cwd,
-        ui: &setup.ui,
         info: &setup.info,
         installed_ms: installed_ms(launch),
     };
