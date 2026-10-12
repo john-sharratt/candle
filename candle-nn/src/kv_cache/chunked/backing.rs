@@ -58,6 +58,35 @@ pub fn is_device_oom(err: &candle::Error) -> bool {
         || s.contains("CUDA_ERROR_OUT_OF_MEMORY")
 }
 
+/// Substring of the error the region pool's tier placement returns when a
+/// wave's transient tier cannot be placed at all: the wave is too wide for the
+/// ground below the weight floor, and a retry at the same width fails the same
+/// way. The scheduler matches on it ([`is_tier_refusal`]) to narrow the next
+/// wave rather than repeat this one.
+pub const TIER_REFUSED_MARKER: &str = "wave too wide for the partition";
+
+/// Recognize a refused tier placement — see [`TIER_REFUSED_MARKER`].
+pub fn is_tier_refusal(err: &candle::Error) -> bool {
+    err.to_string().contains(TIER_REFUSED_MARKER)
+}
+
+/// Follows [`TIER_REFUSED_MARKER`] in a refusal: the bytes the tier was short
+/// of the ground it could be placed in, as `short by {bytes} B`.
+pub const TIER_SHORT_BY: &str = "short by ";
+
+/// How far short a refused tier placement fell, in bytes — `None` for any
+/// error that is not one. What a caller narrowing its next wave waits to see
+/// the ground grow by before it tries the refused width again.
+pub fn tier_refusal_shortfall(err: &candle::Error) -> Option<usize> {
+    let msg = err.to_string();
+    let after_marker = &msg[msg.find(TIER_REFUSED_MARKER)? + TIER_REFUSED_MARKER.len()..];
+    let digits = &after_marker[after_marker.find(TIER_SHORT_BY)? + TIER_SHORT_BY.len()..];
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end].parse().ok()
+}
+
 /// Global registry of all ChunkedKvBacking instances for cooperative compaction.
 /// When one backing needs to grow arenas but fails (OOM), it can ask others to compact.
 static BACKING_REGISTRY: Mutex<Vec<Weak<BackingInner>>> = Mutex::new(Vec::new());

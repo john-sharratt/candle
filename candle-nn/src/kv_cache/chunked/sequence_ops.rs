@@ -939,13 +939,14 @@ impl ChunkedKvBacking {
         }
 
         // Free target's existing blocks in the prefix region (if solely owned)
-        {
+        let drain_count = {
             let target_slot = state.sequences[target_batch].as_mut().unwrap();
             // Remove committed chunks in 0..num_blocks (drain from front)
             let drain_count = num_blocks.min(target_slot.block_count());
             // Drained GIDs are dropped here via RAII, returning to pool
             target_slot.drain_front_chunks(drain_count);
-        }
+            drain_count
+        };
 
         // Share source's chunks with target (clone increments Gid refcount)
         // We need to insert the shared chunks at the front
@@ -973,6 +974,14 @@ impl ChunkedKvBacking {
             let target_slot = state.sequences[target_batch].as_mut().unwrap();
             // Prepend shared chunks before any remaining target chunks
             target_slot.prepend_chunks(source_chunks);
+            // The shared prefix is the source's sealed history: never the
+            // target's to write. The target's own writer region keeps its place
+            // behind it, moved by the prefix in and the front drained out.
+            let own_writer = target_slot
+                .writer_start_idx()
+                .saturating_sub(drain_count)
+                .saturating_add(num_blocks);
+            target_slot.set_writer_start_idx(own_writer.max(num_blocks));
         }
 
         drop(state);
@@ -1105,6 +1114,9 @@ impl ChunkedKvBacking {
                 .collect();
             let target_slot = state.sequences[target_batch].as_mut().unwrap();
             target_slot.replace_chunks(source_chunks);
+            // The shared full blocks are the source's sealed history; the fork
+            // writes only from the copied remainder chunk (or a fresh one) on.
+            target_slot.set_writer_start_idx(full_blocks);
         }
 
         // Handle the last block with remainder -- copy per-head data from
@@ -1690,10 +1702,16 @@ impl ChunkedKvBacking {
                 },
             )
             .collect();
-        state.sequences[view_batch]
-            .as_mut()
-            .unwrap()
-            .replace_chunks(chunks);
+        let view = state.sequences[view_batch].as_mut().unwrap();
+        view.replace_chunks(chunks);
+        // **The borrow is immutable the moment it lands**, not once a writer
+        // opens behind it. A slot whose write boundary still reads 0 claims
+        // every borrowed block — sealed, record-bearing history it shares with
+        // its parent — as its own writable region, which is exactly what
+        // compaction must refuse to move. Set here, nothing between this borrow
+        // and `open_view_writer` (which keeps the same boundary) can see it as
+        // anything else.
+        view.set_writer_start_idx(borrowed_count);
         drop(state);
 
         Ok((borrowed_count, borrowed_token_count))

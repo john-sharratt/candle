@@ -152,7 +152,10 @@ pub use chunked::{
     fragmentation, plan_pool, ArenaSlots, ChunkMove, CompactPlan, Fragmentation, GroundLost,
 };
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
-pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
+pub use chunked::{
+    is_device_oom, is_tier_refusal, tier_refusal_shortfall, KV_DEVICE_OOM_MARKER,
+    TIER_REFUSED_MARKER, TIER_SHORT_BY,
+};
 pub use chunked::{
     production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta, ChunkPin,
     ChunkedKvBacking, ClassOccupancy, CompressionPolicy, GpuArenaClassStats, HeadGids,

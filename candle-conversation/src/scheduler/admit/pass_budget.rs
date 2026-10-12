@@ -124,10 +124,116 @@ impl RateWidth {
     }
 }
 
+/// The widest forward the partition will take after refusing one: the rows of
+/// the refused wave, cut by a quarter, and the ground a tier could be placed in
+/// when it was refused.
+///
+/// **A refused width is retried narrower, never as it was.** The width cap is
+/// priced from a plain wave, so a real one — more spans, scored rows,
+/// look-ahead logits — can come out a few regions over the ground it was sized
+/// for. Nothing about the partition changes between two attempts at the same
+/// width, so repeating it failed the same way every loop: measured on
+/// Qwen3.8-Flash-Next on a 16 GB card, a 1,468-row wave asked for a 1,308.6 MB
+/// tier against 1,293.0 MB of ground, about 1,500 times a second, and nothing
+/// in it ever finished to free the ground it needed.
+///
+/// A quarter at a time because the overshoot is a few regions, not half the
+/// wave; each step is one refused placement, which fails before any compute.
+///
+/// **It lapses when the ground has grown by what the refused tier was short**,
+/// not by any amount. Ground moves by a region whenever a decode or a seal frees
+/// a chunk, so a narrowing dropped at the first byte back would send the next
+/// wave out at the refused width to be refused again — cycling between the two
+/// under ordinary churn instead of settling at one that fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefusedWidth {
+    pub rows: usize,
+    pub ground: usize,
+    /// Bytes the refused tier was short of `ground`.
+    pub short: usize,
+}
+
+impl RefusedWidth {
+    /// The width after `refused_rows` was refused `short` bytes over the
+    /// `ground` it had to place a tier in — or `None` when the refused wave was
+    /// already the least chunk, below which narrowing makes no progress.
+    pub(crate) fn after(
+        refused_rows: usize,
+        ground: usize,
+        short: usize,
+        least: usize,
+    ) -> Option<Self> {
+        if refused_rows <= least {
+            return None;
+        }
+        Some(Self {
+            rows: (refused_rows - refused_rows / 4).max(least),
+            ground,
+            short,
+        })
+    }
+
+    /// Whether the ground a tier can be placed in has grown by at least what
+    /// the refused tier was short — something finished and gave enough back for
+    /// the refused width to fit.
+    pub(crate) fn lapsed(&self, ground: usize) -> bool {
+        ground >= self.ground.saturating_add(self.short)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{kv_token_cap, prefill_group_budget, prefill_pass_budget, RateWidth};
+    use super::{kv_token_cap, prefill_group_budget, prefill_pass_budget, RateWidth, RefusedWidth};
     use candle_nn::kv_cache::CHUNK_SIZE;
+
+    /// The measured refusal: 1,468 rows against 1,293.0 MB of ground. The next
+    /// wave is a quarter narrower, and the one after that narrower again.
+    #[test]
+    fn a_refused_width_is_retried_a_quarter_narrower() {
+        let ground = 1_292_994_560;
+        let short = 16_777_216;
+        let first = RefusedWidth::after(1_468, ground, short, CHUNK_SIZE).expect("narrowable");
+        assert_eq!(
+            first,
+            RefusedWidth {
+                rows: 1_101,
+                ground,
+                short
+            }
+        );
+        let second =
+            RefusedWidth::after(first.rows, ground, short, CHUNK_SIZE).expect("narrowable");
+        assert_eq!(second.rows, 826);
+        assert_eq!(
+            RefusedWidth::after(40, ground, short, CHUNK_SIZE).map(|w| w.rows),
+            Some(CHUNK_SIZE),
+            "never below the least chunk"
+        );
+    }
+
+    /// The least chunk refused is a wave that cannot be narrowed: no width.
+    #[test]
+    fn the_least_chunk_refused_cannot_be_narrowed() {
+        assert_eq!(RefusedWidth::after(CHUNK_SIZE, 1, 1, CHUNK_SIZE), None);
+        assert_eq!(RefusedWidth::after(1, 1, 1, CHUNK_SIZE), None);
+    }
+
+    /// The narrowing holds until the ground has grown by the refused tier's
+    /// shortfall — not while it stands or shrinks, and not when a region or two
+    /// comes back short of it.
+    #[test]
+    fn a_refused_width_lapses_only_once_the_shortfall_is_given_back() {
+        let w = RefusedWidth {
+            rows: 1_101,
+            ground: 1_000,
+            short: 300,
+        };
+        assert!(!w.lapsed(1_000));
+        assert!(!w.lapsed(900));
+        assert!(!w.lapsed(1_001), "one byte back is not the shortfall");
+        assert!(!w.lapsed(1_299));
+        assert!(w.lapsed(1_300));
+    }
 
     /// A verdict lapses when the cohort shrinks, and holds while it stands or
     /// grows: turns that joined after the judgement were admitted under it.

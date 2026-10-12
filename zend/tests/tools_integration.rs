@@ -505,6 +505,10 @@ mod tool_scenarios {
     }
 
     #[test]
+    #[ignore = "boots the daemon twice (~11 s each, model load and normalization warm-up), \
+                past the quick suite's 20 s budget. Run with: cargo test -p zend --features cuda \
+                --test tools_integration -- --ignored --exact \
+                tool_scenarios::a_boot_after_a_boot_restores_every_prompt_section"]
     fn a_boot_after_a_boot_restores_every_prompt_section() {
         init_tracing();
         // Both boots under one scenario lock, so no other scenario runs on the

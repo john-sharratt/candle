@@ -83,6 +83,7 @@ use candle::cuda_backend::graph::try_without_recording;
 use candle::vram::AllocClass;
 use candle::Result;
 
+use super::backing::{TIER_REFUSED_MARKER, TIER_SHORT_BY};
 use super::bump_arena::KV_ARENA_MID_WAVE;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::growth_policy::{kv_grow_step, FreeRegionTarget, GrowthPolicy, Occupancy, Refusal};
@@ -1928,13 +1929,14 @@ pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize)
                     pool.live,
                 ))
             })?;
+            let short_bytes = still_short * REGION_BYTES;
             candle::bail!(
-                "wave transient tier needs {len} B below the weight floor and is \
-                 {still_short} regions into ground live KV arenas hold, which cannot \
-                 move. The weight side conceded {conceded} B to this placement and \
-                 would give no more — at its own floor, or refusing to move while a \
-                 wave or an expert invocation is in flight — so this wave is too wide \
-                 for the partition. (span {span_bytes} B, weight floor at \
+                "{TIER_REFUSED_MARKER}: {TIER_SHORT_BY}{short_bytes} B — its transient \
+                 tier needs {len} B below the weight floor and is {still_short} regions \
+                 into ground live KV arenas hold, which cannot move. The weight side conceded {conceded} B to this \
+                 placement and would give no more — at its own floor, or refusing to \
+                 move while a wave or an expert invocation is in flight. (span \
+                 {span_bytes} B, weight floor at \
                  +{floor_off} B, arena frontier at +{live_off} B, {live}/{total} \
                  regions live)"
             )

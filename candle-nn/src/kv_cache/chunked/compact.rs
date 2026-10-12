@@ -85,6 +85,7 @@ use super::compact_map::{CompactionMap, Sweep};
 use super::compact_plan::{by_source_rank, plan_pool, ArenaSlots, ChunkMove, CompactPlan};
 use super::fresh_arenas::FreshArenas;
 use super::size_class::SizeClass;
+use super::types::StrandedRecords;
 use crate::kv_cache::ArenaLocation;
 
 /// What one pass did, for the caller's log line and for the tests.
@@ -1779,18 +1780,43 @@ impl super::backing::ChunkedKvBacking {
     /// away — see the note on `invalidate_decode_slot` in [`Self::compact`].
     fn rewrite_own_holders(&self, sweep: &mut Sweep<'_>) -> Result<usize> {
         let mut touched = 0usize;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-        for entry in state.sequences.iter_mut() {
-            let Some(seq) = entry.as_mut() else { continue };
-            // `rewrite_for_compaction` invalidates the slot's cached decode buffer
-            // itself when it moves anything, so there is no separate invalidation
-            // step for this pass to forget.
-            if seq.rewrite_for_compaction(sweep)? {
-                touched += 1;
+        let mut stranded: Vec<(usize, StrandedRecords)> = Vec::new();
+        {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            for (slot, entry) in state.sequences.iter_mut().enumerate() {
+                let Some(seq) = entry.as_mut() else { continue };
+                // `rewrite_for_compaction` invalidates the slot's cached decode
+                // buffer itself when it moves anything, so there is no separate
+                // invalidation step for this pass to forget.
+                let rewrite = seq.rewrite_for_compaction(sweep)?;
+                if rewrite.moved {
+                    touched += 1;
+                }
+                if let Some(s) = rewrite.stranded {
+                    stranded.push((slot, s));
+                }
             }
+        }
+        // **One line per slot, named, after the lock is released.** Logged per
+        // chunk inside the pass it was hundreds of lines a pass — 66,471 in a
+        // minute — that named no slot, the one fact a reader needs, and that
+        // lengthened the quiesced pass it was logged from.
+        for (slot, s) in stranded {
+            tracing::error!(
+                target: "candle_nn::kv_cache::compact",
+                slot,
+                first_block = s.first,
+                last_block = s.last,
+                chunks = s.count,
+                writer_start = s.writer_start,
+                "writer-owned chunks carry KvHead records: they are written through their \
+                 gids and read through those records, so relocating them would let the two \
+                 diverge on the next token. Left where they are — some path handed this \
+                 slot records at or above its write boundary",
+            );
         }
         Ok(touched)
     }

@@ -15,7 +15,9 @@ use crate::recorded_reply::replayed_step;
 use crate::stats::streams_committed;
 use crate::tenant_rank::TenantRank;
 use crate::token_buffer::TokenBuffer;
-use candle_nn::kv_cache::{end_wave_transient, is_device_oom, FreeRegionTarget};
+use candle_nn::kv_cache::{
+    end_wave_transient, is_device_oom, tier_refusal_shortfall, FreeRegionTarget,
+};
 use candle_transformers::models::batched_inference::PendingGlue;
 use candle_transformers::models::window_residuals::WindowResiduals;
 use std::collections::{HashMap, HashSet};
@@ -1083,14 +1085,14 @@ impl Scheduler {
     /// regardless, so an oversized lone turn still runs and is bounded by the
     /// per-arena VRAM gate rather than by a refusal it can never clear.
     pub(super) fn promote_new_prefills(&mut self) {
-        if self.prefill_queue.is_empty() {
+        if self.prefill_queue.is_empty() && self.section_queue.is_empty() {
             return;
         }
         // Every gate below reads the priority pause; judge against the present.
-        // `in_flight` counts only prefills that can advance — see
-        // `running_prefills`.
+        // `in_flight` counts only work that can advance — prefills and section
+        // ingests alike, see `running_members`.
         self.observe_priorities();
-        let in_flight = self.running_prefills();
+        let in_flight = self.running_members();
         if in_flight >= Self::MAX_PREFILL_WIDTH {
             return;
         }
@@ -1200,7 +1202,17 @@ impl Scheduler {
                      run without the expert cache's gauges, so the wave stays as narrow as \
                      this path makes it",
                 );
-                self.begin_prefill(work);
+                self.begin_forced(work);
+            }
+            // Sections have no rate question either, and nothing to wait on: the
+            // width backstop is their only bound here, as it is a prefill's.
+            while self.running_members() < Self::MAX_PREFILL_WIDTH {
+                let Some(s) = self.section_queue.pop_front() else {
+                    break;
+                };
+                if !self.begin_section_forced(s) {
+                    break;
+                }
             }
             return;
         };
@@ -1232,22 +1244,26 @@ impl Scheduler {
         // FIFO, not the cheapest that fits: under a budget stuck at its floor,
         // cheapest-first starves the expensive work permanently, and the
         // expensive work is never the cheapest.
-        if filled.prefills == 0 && self.running_prefills() == 0 {
+        if filled.prefills == 0 && filled.sections == 0 && self.running_members() == 0 {
             self.force_queue_head("admission refused every offer");
         }
         // The pass acted on the completions that opened it; the next one waits
         // for its own.
         self.settled_since_admit = false;
         if filled.prefills > 0
+            || filled.sections > 0
             || filled.stopped_on_weights
             || filled.stopped_on_rate
             || !self.prefill_queue.is_empty()
+            || !self.section_queue.is_empty()
         {
             tracing::debug!(
                 target: "candle_conversation::scheduler::throttle",
                 admitted = filled.prefills,
+                sections = filled.sections,
                 in_flight,
                 queued = self.prefill_queue.len(),
+                queued_sections = self.section_queue.len(),
                 // **The one field that distinguishes "refused" from "never
                 // asked".** A pass that skips admits nothing and refuses
                 // nothing, which reads identically to a pass that judged every
@@ -1299,7 +1315,15 @@ impl Scheduler {
                 why,
                 "nothing in flight; forcing the queue head so the engine makes progress",
             );
-            self.begin_prefill(work);
+            self.begin_forced(work);
+        } else if let Some(s) = self.section_queue.pop_front() {
+            tracing::debug!(
+                target: "candle_conversation::scheduler::throttle",
+                queued_sections = self.section_queue.len() + 1,
+                why,
+                "nothing in flight; forcing the section queue's head so the engine makes progress",
+            );
+            self.begin_section_forced(s);
         }
     }
 
@@ -1404,6 +1428,116 @@ impl Scheduler {
             self.wave_rate = Some(rate);
         }
         self.wave_rate.take()
+    }
+
+    /// Start a turn admission has taken: carve a queued turn-group case its view
+    /// ([`Self::carve_group_case`]), fork a submitted turn's view its parent's
+    /// state ([`Self::fork_view_state`]), claim the sequence's carried state
+    /// (`claim_carried_state`), then put it in flight. `Err` hands the work back
+    /// unstarted with why it could not be — the caller decides whether it waits
+    /// or fails.
+    ///
+    /// **Everything a turn claims up front is claimed here**, between forwards,
+    /// where the weight side can sell for it and a refusal costs the turn a wait.
+    /// Claimed at the turn's first wave instead, the recurrent store would come
+    /// after that wave's own K/V and after the weight side had just taken spare
+    /// ground back, so a refusal would fail every member of the cohort — on
+    /// Qwen3.8-Flash-Next's calibration, `no region for recurrent state after 34
+    /// of 72 slots` with admission having priced the store a moment before.
+    pub(super) fn begin_admitted(
+        &mut self,
+        mut work: PrefillWork,
+    ) -> Result<(), Box<(PrefillWork, ConversationError)>> {
+        if let Some(case) = self.uncarved_case(&work) {
+            if let Err(e) = self.carve_group_case(&mut work, case) {
+                return Err(Box::new((work, e)));
+            }
+        }
+        let view = work.sequence_id;
+        if let Some(parent) = self
+            .turn_views
+            .get(&view)
+            .filter(|v| !v.state_forked)
+            .map(|v| v.parent_id)
+        {
+            if let Err(e) = self.fork_view_state(parent, view) {
+                return Err(Box::new((work, e)));
+            }
+            if let Some(v) = self.turn_views.get_mut(&view) {
+                v.state_forked = true;
+            }
+        }
+        if let Err(e) = self.model.claim_carried_state(work.sequence_id.0) {
+            return Err(Box::new((work, ConversationError::Model(e))));
+        }
+        self.begin_prefill(work);
+        Ok(())
+    }
+
+    /// Put a turn that cannot start into flight already failed, so it leaves
+    /// the way any failed prefill does — its caller answered, its view and its
+    /// group case settled — rather than being dropped unanswered.
+    fn begin_failed(&mut self, work: PrefillWork, why: ConversationError) {
+        self.active_prefills.push(ActivePrefill {
+            work,
+            offset: 0,
+            next_projection: 0,
+            finished: None,
+            error: Some(why),
+            prefill_start: None,
+        });
+    }
+
+    /// Start a turn taken outside the rate judgement — the keep-one-alive head,
+    /// or the one a stack with no planner admits.
+    ///
+    /// A turn that cannot be started — its view not carved, its state not
+    /// claimed — goes back to the head of the queue while something else is in
+    /// flight to free ground for it. With nothing in flight nothing will: relief
+    /// gets one attempt, and a turn still refused fails rather than being
+    /// retried forever — a queued group case lost, any other turn answered with
+    /// the refusal.
+    fn begin_forced(&mut self, work: PrefillWork) {
+        let Err(refused) = self.begin_admitted(work) else {
+            return;
+        };
+        let (work, _) = *refused;
+        if self.running_members() > 0 {
+            self.prefill_queue.push_front(work);
+            return;
+        }
+        self.relieve_vram_pressure("claim", VramPhase::Load);
+        let Err(refused) = self.begin_admitted(work) else {
+            return;
+        };
+        let (work, why) = *refused;
+        match self.uncarved_case(&work) {
+            Some(case) => self.lose_queued_case(case, &why),
+            None => self.begin_failed(work, why),
+        }
+    }
+
+    /// Start a section taken outside the rate judgement, by
+    /// [`Self::begin_forced`]'s rule: one whose state cannot be claimed goes
+    /// back to the head of its queue while something is in flight, and with
+    /// nothing in flight gets one relief attempt before it is answered with the
+    /// refusal. `false` when it went back to the queue.
+    pub(super) fn begin_section_forced(&mut self, s: QueuedSection) -> bool {
+        let Err(refused) = self.begin_section(s) else {
+            return true;
+        };
+        let (s, _) = *refused;
+        if self.running_members() > 0 {
+            self.section_queue.push_front(s);
+            return false;
+        }
+        self.relieve_vram_pressure("claim", VramPhase::Load);
+        let Err(refused) = self.begin_section(s) else {
+            return true;
+        };
+        let (s, why) = *refused;
+        let _ = s.response_tx.send(Err(why));
+        true
     }
 
     /// Put one admitted turn into flight.
@@ -1918,6 +2052,13 @@ impl Scheduler {
             .count()
     }
 
+    /// Admitted work that can still advance a row: running prefills and section
+    /// ingests together — what [`Self::MAX_PREFILL_WIDTH`] bounds and what the
+    /// keep-one-alive rule asks about, since both are prefill rows in one wave.
+    pub(super) fn running_members(&self) -> usize {
+        self.running_prefills() + self.section_ingest_width()
+    }
+
     /// Number of in-flight section ingests with tokens remaining (not errored).
     pub(super) fn section_ingest_width(&self) -> usize {
         self.active_section_ingests
@@ -2429,18 +2570,62 @@ impl Scheduler {
         self.reset_wave_prefill();
     }
 
+    /// Route the failure of a forward that carried a section batch outside any
+    /// wave group (`build_section_batch`).
+    ///
+    /// **Its sections are narrowed or failed, never left to repeat.** The batch
+    /// is rebuilt from the same sections every loop, so an error left on no
+    /// member rebuilt the same batch and failed it the same way, forever: the
+    /// stuck Qwen3.8-Flash-Next calibration was this, about 1,500 refused
+    /// placements a second. A refused tier narrows the next batch while there
+    /// is anything left to narrow ([`Self::note_refused_width`]). A device OOM
+    /// leaves the sections as they are, to be retried on the next wave exactly
+    /// as [`Self::fail_wave_group`] retries its section members — the two paths
+    /// carry the same sections, so they answer the same error the same way, and
+    /// a one-off OOM costs a retry rather than every section in the batch. Any
+    /// other error, or a refusal of the least chunk, fails the batch's sections
+    /// so they answer their callers and give their slots back.
+    pub(super) fn fail_section_batch(
+        &mut self,
+        group_idxs: &[usize],
+        advances: &[usize],
+        err: &candle::Error,
+    ) {
+        if group_idxs.is_empty() || is_device_oom(err) {
+            return;
+        }
+        let rows: usize = advances.iter().sum();
+        if tier_refusal_shortfall(err).is_some_and(|short| self.note_refused_width(rows, short)) {
+            return;
+        }
+        let msg = format!("section batch forward failed: {err}");
+        for &i in group_idxs {
+            self.active_section_ingests[i].error = Some(ConversationError::Channel(msg.clone()));
+        }
+    }
+
     /// Route a wave-group forward failure. On device-OOM, requeue the prefill
     /// members' scope prefills ([`Self::handle_prefill_oom`]) — section members and
-    /// dialogue turns just retry next wave once the group is dropped. On any other
-    /// error, surface it on each member's backing entry. Always resets the group.
+    /// dialogue turns just retry next wave once the group is dropped. On a refused
+    /// tier, every member retries in a group composed narrower than the
+    /// `creep_rows` refused ([`Self::note_refused_width`]) — the same members at
+    /// the same width would be refused again. On any other error, or a refusal
+    /// of a group already at the least chunk, surface it on each member's backing
+    /// entry. Always resets the group.
     fn fail_wave_group(
         &mut self,
         members: &[WaveMember],
         prefill_gidxs: &[usize],
+        creep_rows: usize,
         err: &candle::Error,
     ) {
         if is_device_oom(err) {
             self.handle_prefill_oom(prefill_gidxs, err);
+        } else if tier_refusal_shortfall(err)
+            .is_some_and(|short| self.note_refused_width(creep_rows, short))
+        {
+            // Every member keeps its place and its progress; the group re-forms
+            // narrower on the next wave.
         } else {
             let msg = format!("wave group forward failed: {err}");
             for m in members {
@@ -2794,7 +2979,7 @@ impl Scheduler {
             // waiting on the device or the assembly on either side of it.
             let out = {
                 let _g = super::profile::span("loop:wave:forward");
-                self.model.forward_wave(
+                match self.model.forward_wave(
                     &mut self.session,
                     decode_seqs,
                     decode_inputs,
@@ -2805,7 +2990,13 @@ impl Scheduler {
                     0,
                     n,
                     None,
-                )?
+                ) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        self.fail_section_batch(&sec_gidx, &sec_adv, &e);
+                        return Err(e);
+                    }
+                }
             };
             if has_glue {
                 let _g = super::profile::span("loop:wave:reconcile_offsets");
@@ -2980,7 +3171,7 @@ impl Scheduler {
             Err(e) => {
                 // Drop the creep group cleanly (requeue scope prefills on OOM) so a
                 // fresh one forms next wave, then surface the error.
-                self.fail_wave_group(&members, &prefill_gidxs, &e);
+                self.fail_wave_group(&members, &prefill_gidxs, creep_tok, &e);
                 return Err(e);
             }
         };

@@ -531,24 +531,26 @@ fn write_kv_cold(
     stream_id: StreamId,
     grid: &TurnChunkGrid,
 ) -> Result<()> {
-    let (stored, locs) = {
+    let (stored, locs, through) = {
         let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-        let out = resume::persist_turn_chunks_capture(&mut p, stream_id, grid)?;
-        if !out.0.is_empty() {
-            // Mark durable through the last-written chunk BEFORE the hot-drop, so a
-            // crash after the drop still knows the turn's chunks landed.
-            let through = (out.0.iter().map(|s| s.chunks.len()).sum::<usize>().max(1) - 1) as u64;
-            p.commit_stream(stream_id, through)?;
+        let (stored, locs) = resume::persist_turn_chunks_capture(&mut p, stream_id, grid)?;
+        if stored.is_empty() {
+            return Ok(());
         }
-        out
+        // Mark durable through the last-written chunk BEFORE the hot-drop, so a
+        // crash after the drop still knows the turn's chunks landed.
+        let through = (stored.iter().map(|s| s.chunks.len()).sum::<usize>().max(1) - 1) as u64;
+        p.commit_stream(stream_id, through)?;
+        (stored, locs, through)
     };
-    if stored.is_empty() {
-        return Ok(());
-    }
     let mut view = substrate.write().unwrap_or_else(|e| e.into_inner());
     for (flat, loc) in locs {
         view.apply_chunk_loc(stream_id, flat, loc);
     }
+    // The index holds the commit as well as the log: maintenance rewrites a
+    // `Commit` from `committed_through`, so one only the log knows is lost
+    // with the first rewrite of its segment.
+    view.apply_commit_through(stream_id, through);
     view.install_cold(residence, stored);
     Ok(())
 }

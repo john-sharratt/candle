@@ -7,20 +7,19 @@
 //!
 //! # What this pass offers, and what it does not
 //!
-//! **Prefills only.** The other two bands have nothing to offer and say so:
+//! **Prefills and sections.** A section waits in `Scheduler::section_queue`
+//! and is offered in its band, priced as a prefill is — its K/V, its recurrent
+//! store, its rows in the tier — except that it never decodes. It is a first
+//! admission exactly as a prefill is. Sections put into flight as their requests
+//! drain take a minute to push the weight zone from 10,398 MiB to its hold, and
+//! on Qwen3.8-Flash-Next on a 16 GB card fill the ground below the weight floor
+//! until no wave's tier can be placed.
 //!
-//! * A **decode** is never admitted here because nothing queues one — a decode
-//!   exists because a prefill finished and promoted, which is one slot changing
-//!   phase rather than a new claim. [`admit::fill`] already charges every active
-//!   decode to the wave before the first offer, so they are priced into every
-//!   judgement without being offered.
-//! * A **section** is pushed straight into flight when its request is drained,
-//!   so by the time a pass runs it is already resident and there is nothing left
-//!   to decide. Giving sections a queue of their own is a real improvement —
-//!   they are first admissions exactly as prefills are, and the module header
-//!   records a minute of them taking the weight zone from 10,398 MiB to its hold
-//!   — but it is a change to how `IngestSection` is handled, not to admission,
-//!   and it is not made here.
+//! A **decode** is never admitted here because nothing queues one — a decode
+//! exists because a prefill finished and promoted, which is one slot changing
+//! phase rather than a new claim. [`admit::fill`] already charges every active
+//! decode to the wave before the first offer, so they are priced into every
+//! judgement without being offered.
 //!
 //! # Why a pass object rather than `impl Ground for Scheduler`
 //!
@@ -269,21 +268,131 @@ impl Ground for AdmitPass<'_> {
     }
 
     fn peek(&mut self, kind: Kind, prio: DecodePriority) -> Option<Cost> {
-        // See the module header: neither band has anything to offer.
-        if kind != Kind::Prefill {
-            return None;
-        }
         // **The width backstop bounds the pass, not just its entry.** It is the
         // dumb ceiling beneath the rate model — there so an error in the cost
         // model costs throughput rather than the daemon — and checking it only
         // before the pass leaves it useless: one fill starting empty could take
         // as many prefills as the row budget allows, which is the case the
         // ceiling exists for.
-        // Counted as prefills that can advance: a paused one moves no row
-        // (`Scheduler::running_prefills`).
-        if self.sched.running_prefills() >= Scheduler::MAX_PREFILL_WIDTH {
+        // Counted as work that can advance — prefills and sections alike, since
+        // both are prefill rows in the same forwards — and a paused prefill
+        // moves no row (`Scheduler::running_members`).
+        if self.sched.running_members() >= Scheduler::MAX_PREFILL_WIDTH {
             return None;
         }
+        match kind {
+            Kind::Prefill => self.peek_prefill(prio),
+            Kind::Section => self.peek_section(),
+            // See the module header: nothing queues a decode.
+            Kind::Decode => None,
+        }
+    }
+
+    /// The forward's rows end at what this pass has admitted: every later
+    /// offer has no room and comes back as a join, and the forwards the cohort
+    /// shares are composed at this width (`Scheduler::rate_width`).
+    fn close_rows(&mut self) -> bool {
+        let width = self.sched.standing_rows().saturating_add(self.rows_taken);
+        self.chunk_rows = width.max(CHUNK_SIZE);
+        self.sched.set_rate_width(width);
+        self.closed = true;
+        true
+    }
+
+    fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
+        match kind {
+            Kind::Prefill => self.admit_prefill(prio, cost),
+            Kind::Section => self.admit_section(cost),
+            Kind::Decode => false,
+        }
+    }
+}
+
+impl AdmitPass<'_> {
+    /// Rows of this wave's forward still free for an offer — see `peek_prefill`
+    /// — or `None` when the forward is full and one more member could not
+    /// advance a chunk beside the rest.
+    fn room(&self) -> Option<usize> {
+        let room = self
+            .chunk_rows
+            .saturating_sub(self.sched.standing_rows().saturating_add(self.rows_taken));
+        let members = self.sched.prefill_width() + self.sched.section_ingest_width();
+        if room == 0 && (members + 1).saturating_mul(CHUNK_SIZE) > self.chunk_rows {
+            return None;
+        }
+        Some(room)
+    }
+
+    /// The tier an offer of `turn` tokens from `seq` adds to the forward,
+    /// given `room` rows free in it.
+    fn offer_tier(&self, room: usize, turn: usize, seq: SequenceId) -> (usize, u64) {
+        let rows = turn.min(room);
+        // A join widens the forward by a sequence rather than by rows, and pays
+        // for that; an offer with rows pays for its rows.
+        let rows_in_forward = self.chunk_rows.saturating_sub(room);
+        let activations = if rows == 0 {
+            self.join_tier(rows_in_forward)
+        } else {
+            self.tier_for(rows, turn, seq)
+        };
+        (rows, activations)
+    }
+
+    /// The section band's next candidate: the head of the section queue,
+    /// priced as a prefill is — its whole K/V, a recurrent store on a hybrid,
+    /// and its rows in the forward's tier. It never decodes. Strictly FIFO and
+    /// never paused: a section has no priority of its own.
+    fn peek_section(&mut self) -> Option<Cost> {
+        let s = self.sched.section_queue.front()?;
+        let (turn, seq) = (s.tokens.len(), s.sequence_id);
+        // A reused slot already holds a store, whose regions the residency
+        // already counts: its restart zeroes that store where it stands.
+        let recurrent = if self.sched.model.has_recurrent_state(seq.0) {
+            0
+        } else {
+            self.recurrent
+        };
+        let room = self.room()?;
+        let (rows, activations) = self.offer_tier(room, turn, seq);
+        Some(Cost {
+            kv: prefill_cost_bytes(turn, self.per_block),
+            recurrent,
+            activations,
+            rows,
+            decodes_after: false,
+        })
+    }
+
+    /// Admit the section queue's head, priced at `cost`, and start it — its
+    /// carried state claimed now, as a turn's is (`begin_admitted`). A claim the
+    /// allocators refuse puts it back at the head and ends the band.
+    fn admit_section(&mut self, cost: Cost) -> bool {
+        let Some(section) = self.sched.section_queue.pop_front() else {
+            return false;
+        };
+        let before = residency_now(self.standing_tier);
+        if let Err(refused) = self.sched.begin_section(section) {
+            let (section, why) = *refused;
+            tracing::debug!(
+                target: "candle_conversation::scheduler::throttle",
+                "admitted section could not claim its state — it waits: {why}",
+            );
+            self.sched.section_queue.push_front(section);
+            return false;
+        }
+        self.rows_taken = self.rows_taken.saturating_add(cost.rows);
+        self.widened |= cost.rows > 0;
+        // See `admit_prefill`: what the section dislodges as it runs is carried
+        // so the offers behind it face the wave as it now stands, less what the
+        // claim has already taken.
+        let claimed = before.saturating_sub(residency_now(self.standing_tier));
+        self.committed = self
+            .committed
+            .saturating_add(cost.dislodged_bytes().saturating_sub(claimed));
+        true
+    }
+
+    fn peek_prefill(&mut self, prio: DecodePriority) -> Option<Cost> {
         // **Walk past what this band is not being offered.** A band is asked for
         // its own priority's next candidate, and the queue interleaves them: on
         // the shipped configuration only the dialogue layer sets `High` and every
@@ -331,9 +440,7 @@ impl Ground for AdmitPass<'_> {
         // Standing rows count: they are in the forward this fill is composing, and
         // the rate model's own cap check counts them, so a clip that ignored them
         // would offer ground that is already spoken for.
-        let room = self
-            .chunk_rows
-            .saturating_sub(self.sched.standing_rows().saturating_add(self.rows_taken));
+        //
         // **A full forward still takes turns, as members of a shared cohort.**
         //
         // Once the rows are spent, a further turn adds none to this forward, but
@@ -346,29 +453,27 @@ impl Ground for AdmitPass<'_> {
         //
         // It joins while every member can still advance at least one chunk a
         // forward — the rule `share_within` carries members by — so admission and
-        // the wave that forms from it agree on who rides. Every prefill in flight
-        // is counted, paused ones included: a pause lifts, and its turn then
-        // shares the same forwards.
-        if room == 0
-            && (self.sched.prefill_width() + 1).saturating_mul(CHUNK_SIZE) > self.chunk_rows
-        {
-            return None;
-        }
-        let rows = w.tokens.len().min(room);
-        // A join widens the forward by a sequence rather than by rows, and pays
-        // for that; an offer with rows pays for its rows.
-        let rows_in_forward = self.chunk_rows.saturating_sub(room);
-        let activations = if rows == 0 {
-            self.join_tier(rows_in_forward)
-        } else {
-            self.tier_for(rows, w.tokens.len(), w.sequence_id)
-        };
+        // the wave that forms from it agree on who rides. Every member in flight
+        // is counted, sections and paused prefills included: a pause lifts, and
+        // its turn then shares the same forwards. See [`Self::room`].
+        let (turn, seq) = (w.tokens.len(), w.sequence_id);
+        // **A store is charged once.** A turn whose sequence already holds a
+        // store has that store's regions in the residency this offer is read
+        // against — charging it again prices the same ground twice. A submitted
+        // turn's view is forked its parent's store at admission, and a
+        // turn-group case is carved its view there, so neither holds one yet
+        // and both are charged.
+        let holds_store =
+            self.sched.uncarved_case(w).is_none() && self.sched.model.has_recurrent_state(seq.0);
+        let recurrent = if holds_store { 0 } else { self.recurrent };
+        let room = self.room()?;
+        let (rows, activations) = self.offer_tier(room, turn, seq);
         Some(Cost {
             // The whole turn's K/V, not this chunk's: admitting the turn commits
             // the engine to feeding all of it, and a cost that priced only the
             // first chunk would admit a queue of turns whose tails cannot fit.
-            kv: prefill_cost_bytes(w.tokens.len(), self.per_block),
-            recurrent: self.recurrent,
+            kv: prefill_cost_bytes(turn, self.per_block),
+            recurrent,
             activations,
             rows,
             // The turn decodes when this prefill finishes, which is what puts
@@ -377,26 +482,31 @@ impl Ground for AdmitPass<'_> {
         })
     }
 
-    /// The forward's rows end at what this pass has admitted: every later
-    /// offer has no room and comes back as a join, and the forwards the cohort
-    /// shares are composed at this width (`Scheduler::rate_width`).
-    fn close_rows(&mut self) -> bool {
-        let width = self.sched.standing_rows().saturating_add(self.rows_taken);
-        self.chunk_rows = width.max(CHUNK_SIZE);
-        self.sched.set_rate_width(width);
-        self.closed = true;
-        true
-    }
-
-    fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
-        if kind != Kind::Prefill {
+    fn admit_prefill(&mut self, prio: DecodePriority, cost: Cost) -> bool {
+        let band = band_index(prio);
+        let at = self.prefill_cursor[band];
+        let Some(work) = self.sched.prefill_queue.remove(at) else {
+            return false;
+        };
+        // **A turn-group case is carved here, the moment it is admitted** —
+        // its writer chunks and its forked store are the ground this offer was
+        // just priced for. A carve the allocators refuse puts the case back where
+        // it stood and ends the band, as any refusal after the model's yes does:
+        // the ground is genuinely gone, and the case waits for the next pass.
+        let before = residency_now(self.standing_tier);
+        if let Err(refused) = self.sched.begin_admitted(work) {
+            let (work, why) = *refused;
+            tracing::debug!(
+                target: "candle_conversation::scheduler::throttle",
+                "admitted case could not be carved its view — it waits: {why}",
+            );
+            self.sched.prefill_queue.insert(at, work);
             return false;
         }
         // Spend the rows this offer took, so the next offer in this pass is sized
         // to what is left — see `peek`.
         self.rows_taken = self.rows_taken.saturating_add(cost.rows);
         self.widened |= cost.rows > 0;
-        let band = band_index(prio);
         // **Nothing is purchased here, and that is not an omission.**
         //
         // A turn's K/V is claimed incrementally, chunk by chunk, by the admit
@@ -417,19 +527,19 @@ impl Ground for AdmitPass<'_> {
         // *other* bands' cursors, if they sit past this index, now point one
         // place too far. Walk them back rather than leaving them to skip a
         // candidate each time another band takes one.
-        let at = self.prefill_cursor[band];
         for (i, c) in self.prefill_cursor.iter_mut().enumerate() {
             if i != band && *c > at {
                 *c -= 1;
             }
         }
-        let Some(work) = self.sched.prefill_queue.remove(at) else {
-            return false;
-        };
         // What the weight side loses to this admission, carried so the offers
         // behind it face the wave as it now stands — see [`Self::committed`].
-        self.committed = self.committed.saturating_add(cost.dislodged_bytes());
-        self.sched.begin_prefill(work);
+        // Less what a carve has already taken: those regions are live now, so
+        // the residency the next offer reads has already fallen by them.
+        let carved = before.saturating_sub(residency_now(self.standing_tier));
+        self.committed = self
+            .committed
+            .saturating_add(cost.dislodged_bytes().saturating_sub(carved));
         true
     }
 }

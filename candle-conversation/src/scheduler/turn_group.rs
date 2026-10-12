@@ -26,12 +26,27 @@
 //! a turn's substrate index is assigned as it is written, and the caller maps
 //! cases to turns by that order.
 //!
-//! # A window of views
+//! # Carved at admission
 //!
 //! Each view holds a forked copy of the parent's recurrent state for as long as
-//! it lives — on Qwen3.6-35B-A3B about 126 MiB — so a group does not carve
-//! every case at once. At most [`Scheduler::turn_group_window`] views are live;
-//! each seal frees a place for the next case.
+//! it lives — on Qwen3.6-35B-A3B about 126 MiB, on Qwen3.8-Flash-Next about
+//! 226 MB — and a writer chunk on every attention layer. So a case's view is
+//! carved only when admission takes its prefill ([`Scheduler::begin_admitted`]),
+//! priced like any other first admission: its store, its K/V, its rows in the
+//! tier.
+//!
+//! The group queues its cases in order, at most [`Scheduler::MAX_PREFILL_WIDTH`]
+//! at a time — a bookkeeping bound, not the throttle — and each seal makes room
+//! for the next. Carving the views as the group queues them would claim them
+//! against no judgement of the card — up to 24 a group, sixteen groups in
+//! flight, on a 16 GB card — and the carves that failed would lose their cases
+//! and leave half-built views pinning the parent's prefix.
+//!
+//! The parent's state does not move while its group runs, so a case carved late
+//! forks the same state one carved early would have. And a group's cases share
+//! one parent and so one band, which admission takes FIFO: the case that must
+//! seal next is never admitted behind one after it, so carving late cannot
+//! stall the seal order.
 
 use super::*;
 
@@ -48,8 +63,11 @@ pub(crate) struct GroupCaseId {
 /// Where one case stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaseState {
-    /// No view carved yet.
+    /// Not yet offered: no prefill queued, no view.
     Waiting,
+    /// Its prefill is queued for admission; its view is carved when admission
+    /// takes it.
+    Queued,
     /// Prefilling on this view.
     Prefilling(SequenceId),
     /// Prefilled on this view, waiting for the cases before it to seal.
@@ -80,16 +98,22 @@ impl CaseLedger {
         }
     }
 
-    /// Views the group holds now.
+    /// Cases the group has in play: queued for admission or holding a view.
     fn live(&self) -> usize {
         self.states
             .iter()
-            .filter(|s| matches!(s, CaseState::Prefilling(_) | CaseState::Finished(_)))
+            .filter(|s| {
+                matches!(
+                    s,
+                    CaseState::Queued | CaseState::Prefilling(_) | CaseState::Finished(_)
+                )
+            })
             .count()
     }
 
-    /// The next case to carve a view for, while the window has room. Cases open
-    /// in order, so the case that must seal next always holds a view.
+    /// The next case to queue, while the window has room. Cases queue in
+    /// order, and admission takes one band FIFO, so the case that must seal
+    /// next is never admitted behind a case after it.
     fn to_open(&self) -> Option<usize> {
         if self.live() >= self.window {
             return None;
@@ -97,6 +121,17 @@ impl CaseLedger {
         self.states.iter().position(|s| *s == CaseState::Waiting)
     }
 
+    /// The case's prefill went into the queue.
+    fn queued(&mut self, index: usize) {
+        self.states[index] = CaseState::Queued;
+    }
+
+    /// Whether the case is queued and still waiting for its view.
+    fn is_queued(&self, index: usize) -> bool {
+        self.states.get(index) == Some(&CaseState::Queued)
+    }
+
+    /// Admission took the case and carved it `view`.
     fn opened(&mut self, index: usize, view: SequenceId) {
         self.states[index] = CaseState::Prefilling(view);
     }
@@ -136,7 +171,7 @@ impl CaseLedger {
                     self.next_to_seal += 1;
                     return Some((index, view));
                 }
-                CaseState::Waiting | CaseState::Prefilling(_) => return None,
+                CaseState::Waiting | CaseState::Queued | CaseState::Prefilling(_) => return None,
             }
         }
         None
@@ -183,28 +218,16 @@ pub(super) struct TurnGroup {
     /// The latest case's seal, which rides the `Done`.
     last_seal: Option<SealResult>,
     sealed: usize,
+    /// Cases that will never seal — their view could not be carved, their
+    /// prefill failed, or their seal wrote nothing. The caller is told how
+    /// many, so a group that lost cases is not taken for a complete one.
+    lost: usize,
     prefill_ms: f64,
     prefill_tokens: usize,
     started: Instant,
 }
 
 impl Scheduler {
-    /// Views a turn group holds at once.
-    ///
-    /// Each holds a forked recurrent store for as long as it lives, so the
-    /// window is what the admission setpoint funds in stores — the same budget
-    /// that decides how much prefill may be in flight — capped by
-    /// [`Self::MAX_PREFILL_WIDTH`], past which no wave could carry more of them
-    /// anyway. A model with no recurrent state has nothing to bound it but the
-    /// cap.
-    fn turn_group_window(&self) -> usize {
-        let per_view = self.model.recurrent_store_bytes() as u64;
-        if per_view == 0 {
-            return Self::MAX_PREFILL_WIDTH;
-        }
-        ((self.admit_budget / per_view) as usize).clamp(1, Self::MAX_PREFILL_WIDTH)
-    }
-
     /// Start a turn group on `parent_id`, which the submit has just projected.
     ///
     /// The cases are carved over `ranges` — the same ranges a lone turn's view
@@ -221,7 +244,7 @@ impl Scheduler {
         let group = self.next_turn_group;
         self.next_turn_group += 1;
         let (case_tx, case_rx) = flume::unbounded();
-        let ledger = CaseLedger::new(cases.len(), self.turn_group_window());
+        let ledger = CaseLedger::new(cases.len(), Self::MAX_PREFILL_WIDTH);
         tracing::debug!(
             target: "candle_conversation::scheduler",
             group,
@@ -244,6 +267,7 @@ impl Scheduler {
                 case_rx,
                 last_seal: None,
                 sealed: 0,
+                lost: 0,
                 prefill_ms: 0.0,
                 prefill_tokens: 0,
                 started: Instant::now(),
@@ -281,7 +305,8 @@ impl Scheduler {
         else {
             return;
         };
-        let group = &self.turn_groups[&id];
+        let group = self.turn_groups.get_mut(&id).expect("found above");
+        group.lost += 1;
         for event in group.case_rx.try_iter() {
             if let TurnEvent::Error(e) = event {
                 tracing::warn!(group = id, case = index, "turn group case failed: {e}");
@@ -293,6 +318,73 @@ impl Scheduler {
             "turn group case lost before it sealed — the group goes on without it",
         );
         self.advance_turn_group(id);
+    }
+
+    /// The turn-group case `work` is, while it is still queued without a view.
+    pub(super) fn uncarved_case(&self, work: &PrefillWork) -> Option<GroupCaseId> {
+        let SealAction::GroupCase(case) = &work.seal_action else {
+            return None;
+        };
+        self.turn_groups
+            .get(&case.group)
+            .filter(|g| g.ledger.is_queued(case.index))
+            .map(|_| *case)
+    }
+
+    /// Carve the view of a queued case admission has just taken, and point its
+    /// prefill at it.
+    ///
+    /// The whole of what a case claims happens here: the parent's prefix
+    /// borrowed, a writer chunk per attention layer, the parent's recurrent
+    /// state forked. A failure leaves nothing behind (`create_view` frees a view
+    /// that fails part way) and the case still queued, so the caller decides
+    /// whether it waits or is lost.
+    pub(super) fn carve_group_case(
+        &mut self,
+        work: &mut PrefillWork,
+        case: GroupCaseId,
+    ) -> Result<(), ConversationError> {
+        let group = self.turn_groups.get(&case.group).ok_or_else(|| {
+            ConversationError::Channel(format!("turn group {} is gone", case.group))
+        })?;
+        let (parent, ranges) = (group.parent_id, group.ranges.clone());
+        let (view, borrowed) = self.create_view(parent, &ranges)?;
+        self.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: borrowed,
+                turn_start_parent_blocks: borrowed.0,
+                question_tokens: 0,
+                applied_identity: None,
+                state_forked: true,
+            },
+        );
+        self.turn_groups
+            .get_mut(&case.group)
+            .expect("held across the carve")
+            .ledger
+            .opened(case.index, view);
+        work.sequence_id = view;
+        Ok(())
+    }
+
+    /// A queued case that could not be started — its view not carved, or its
+    /// state not claimed — with nothing else in flight to free the ground it
+    /// needs: it will not seal, and the group goes on without it.
+    pub(super) fn lose_queued_case(&mut self, case: GroupCaseId, why: &ConversationError) {
+        let Some(group) = self.turn_groups.get_mut(&case.group) else {
+            return;
+        };
+        group.ledger.lost_at(case.index);
+        group.lost += 1;
+        tracing::warn!(
+            group = case.group,
+            case = case.index,
+            "turn group case could not be started with nothing in flight — this case \
+             is lost: {why}",
+        );
+        self.advance_turn_group(case.group);
     }
 
     /// End every group carved from `parent_id`, which is going away. Each
@@ -309,6 +401,12 @@ impl Scheduler {
             let Some(group) = self.turn_groups.remove(&id) else {
                 continue;
             };
+            // Its queued cases sit on the parent's own slot until admission
+            // carves them a view. Left queued with the group gone, nothing would
+            // carve one, and a case's tokens would be prefilled straight into
+            // whatever the parent holds next.
+            self.prefill_queue
+                .retain(|w| !matches!(&w.seal_action, SealAction::GroupCase(c) if c.group == id));
             for view in group.ledger.finished_views() {
                 self.release_case_view(view, None);
             }
@@ -344,17 +442,23 @@ impl Scheduler {
                         group.sealed += 1;
                         group.last_seal = Some(result);
                     }
-                    None => tracing::warn!(
-                        group = id,
-                        case = index,
-                        "turn group case sealed nothing — this case is lost",
-                    ),
+                    None => {
+                        group.lost += 1;
+                        tracing::warn!(
+                            group = id,
+                            case = index,
+                            "turn group case sealed nothing — this case is lost",
+                        );
+                    }
                 }
                 continue;
             }
             if let Some(index) = group.ledger.to_open() {
+                // Queued on the PARENT's slot, with no view: admission carves
+                // the view when it takes the case (`begin_admitted`). Until then
+                // the case holds nothing, and its priority and depth are the
+                // parent's, which is what its view would read.
                 let parent = group.parent_id;
-                let ranges = group.ranges.clone();
                 let content = &group.cases[index];
                 let tokens = content.token_ids.clone();
                 let tags = content.tags.clone();
@@ -362,68 +466,39 @@ impl Scheduler {
                 let belief = group.belief.clone();
                 let case_tx = group.case_tx.clone();
                 group.prefill_tokens += tokens.len();
-                match self.create_view(parent, &ranges) {
-                    Ok((view, borrowed)) => {
-                        self.turn_views.insert(
-                            view,
-                            ViewState {
-                                parent_id: parent,
-                                original_borrowed: borrowed,
-                                turn_start_parent_blocks: borrowed.0,
-                                question_tokens: 0,
-                                applied_identity: None,
-                            },
-                        );
-                        self.prefill_queue.push_back(PrefillWork {
-                            sequence_id: view,
-                            tokens,
-                            prefill_text: String::new(),
-                            user_text: String::new(),
-                            tags,
-                            // The case's own bounds ride its `TurnContent`, which
-                            // the seal uses whole; nothing reads these for a
-                            // prefill that decodes nothing.
-                            user_content_start: 0,
-                            user_content_end: 0,
-                            assistant_content_start: 0,
-                            no_think: false,
-                            prefill_assistant_text: String::new(),
-                            event_tx: case_tx,
-                            max_decode_tokens: 0,
-                            sampling,
-                            submitted_at: Instant::now(),
-                            reprojection: None,
-                            belief,
-                            seal_action: SealAction::GroupCase(GroupCaseId { group: id, index }),
-                            // Every case closed its own bracket in its tokens.
-                            post_decode_tokens: TokenBuffer::new(),
-                            projection_offsets: Vec::new(),
-                            staged_composition: None,
-                            triggers: Arc::new(TriggerRegistry::new()),
-                            turn_grammar: None,
-                            free_tool_calls_from_penalties: false,
-                            recorded_reply: None,
-                        });
-                        self.settled_since_admit = true;
-                        self.turn_groups
-                            .get_mut(&id)
-                            .expect("held across the carve")
-                            .ledger
-                            .opened(index, view);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            group = id,
-                            case = index,
-                            "turn group case could not be carved a view: {e}",
-                        );
-                        self.turn_groups
-                            .get_mut(&id)
-                            .expect("held across the carve")
-                            .ledger
-                            .lost_at(index);
-                    }
-                }
+                group.ledger.queued(index);
+                self.prefill_queue.push_back(PrefillWork {
+                    sequence_id: parent,
+                    tokens,
+                    prefill_text: String::new(),
+                    user_text: String::new(),
+                    tags,
+                    // The case's own bounds ride its `TurnContent`, which the
+                    // seal uses whole; nothing reads these for a prefill that
+                    // decodes nothing.
+                    user_content_start: 0,
+                    user_content_end: 0,
+                    assistant_content_start: 0,
+                    no_think: false,
+                    prefill_assistant_text: String::new(),
+                    event_tx: case_tx,
+                    max_decode_tokens: 0,
+                    sampling,
+                    submitted_at: Instant::now(),
+                    reprojection: None,
+                    belief,
+                    seal_action: SealAction::GroupCase(GroupCaseId { group: id, index }),
+                    // Every case closed its own bracket in its tokens.
+                    post_decode_tokens: TokenBuffer::new(),
+                    projection_offsets: Vec::new(),
+                    staged_composition: None,
+                    triggers: Arc::new(TriggerRegistry::new()),
+                    turn_grammar: None,
+                    free_tool_calls_from_penalties: false,
+                    recorded_reply: None,
+                });
+                // An arrival is an admission opportunity.
+                self.settled_since_admit = true;
                 continue;
             }
             if group.ledger.complete() {
@@ -505,11 +580,16 @@ impl Scheduler {
             target: "sched",
             group = id,
             sealed = group.sealed,
+            lost = group.lost,
             of = group.cases.len(),
             tokens = group.prefill_tokens,
             total_ms = total_ms as u64,
             "turn group complete",
         );
+        if let Some(e) = turn_group_verdict(id, group.sealed, group.cases.len(), group.lost) {
+            let _ = group.event_tx.send(TurnEvent::Error(e));
+            return;
+        }
         let _ = group.event_tx.send(TurnEvent::Done(TurnResponse {
             text: String::new(),
             answer: TurnText::default(),
@@ -531,12 +611,44 @@ impl Scheduler {
     }
 }
 
+/// How a closed group is answered: `None` for done, or the error naming what it
+/// lost.
+///
+/// **A group that lost cases is not answered as complete.** Its caller keeps a
+/// complete group and redoes an incomplete one — zend archives a calibration
+/// group it is told is done and never regenerates it, so a lost case's
+/// exemplars would be missing for good.
+pub(super) fn turn_group_verdict(
+    id: u64,
+    sealed: usize,
+    cases: usize,
+    lost: usize,
+) -> Option<ConversationError> {
+    (lost > 0).then(|| {
+        ConversationError::Channel(format!(
+            "turn group {id}: {sealed} of {cases} cases sealed, {lost} lost"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn v(n: usize) -> SequenceId {
         SequenceId(n)
+    }
+
+    /// A group whose every case sealed is done; one that lost any says how
+    /// many of how many sealed, in the words the caller logs.
+    #[test]
+    fn a_group_is_done_only_when_it_lost_nothing() {
+        assert!(turn_group_verdict(3, 24, 24, 0).is_none());
+        let partial = turn_group_verdict(14, 23, 24, 1).expect("a lost case is not done");
+        assert_eq!(
+            partial.to_string(),
+            "internal channel error: turn group 14: 23 of 24 cases sealed, 1 lost"
+        );
     }
 
     /// Cases open in order and no more than the window at once.
@@ -549,6 +661,30 @@ mod tests {
         ledger.opened(1, v(11));
         assert_eq!(ledger.to_open(), None, "the window is full");
         assert_eq!(ledger.live(), 2);
+    }
+
+    /// **A queued case holds its place and blocks the seal behind it** until
+    /// admission carves it a view, and a queued case lost is stepped over.
+    #[test]
+    fn a_queued_case_holds_its_place_until_carved_or_lost() {
+        let mut ledger = CaseLedger::new(3, 2);
+        ledger.queued(0);
+        ledger.queued(1);
+        assert!(ledger.is_queued(0));
+        assert_eq!(ledger.live(), 2, "a queued case counts against the window");
+        assert_eq!(ledger.to_open(), None);
+
+        ledger.opened(1, v(11));
+        ledger.finished(1, v(11));
+        assert_eq!(
+            ledger.take_sealable(),
+            None,
+            "case 0 is still queued, so case 1 waits behind it",
+        );
+        ledger.lost_at(0);
+        assert!(!ledger.is_queued(0));
+        assert_eq!(ledger.take_sealable(), Some((1, v(11))));
+        assert_eq!(ledger.to_open(), Some(2), "the window has room again");
     }
 
     /// **Cases seal in submission order, whatever order they finish in.** A

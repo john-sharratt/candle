@@ -29,6 +29,7 @@
 //!   wrong mask.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
@@ -51,6 +52,7 @@ use super::wave::delta_net_mix_wave;
 #[cfg(feature = "cuda")]
 use crate::models::delta_net::cuda::build_wave_table;
 use crate::models::delta_net::seq_spans;
+use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::{RecurrentCompaction, RecurrentStateStore, StashSlot};
 use crate::models::profile::pipeline_record_duration;
@@ -549,6 +551,10 @@ impl ManagedBatchedModel for HybridBatched {
         true
     }
 
+    fn has_recurrent_state(&self, seq: usize) -> bool {
+        self.has_recurrent(seq).unwrap_or(false)
+    }
+
     /// **The hybrid can rewind a verified block**, which is why it does not take
     /// the default `!carries_recurrent_state()`.
     ///
@@ -585,9 +591,11 @@ impl ManagedBatchedModel for HybridBatched {
     /// parent has ever run a wave (a brand-new conversation's first turn), and
     /// there the child correctly starts from the sequence-start value — a fresh
     /// store holds exactly that, so the child's own `ensure_recurrent` does the
-    /// right thing and there is nothing to copy.
+    /// right thing and there is nothing to copy. A parent holding a snapshot
+    /// it has not built a store from yet has state, and its child is built
+    /// from that.
     fn fork_recurrent(&self, parent: usize, child: usize) -> Result<()> {
-        if !self.has_recurrent(parent)? {
+        if !self.holds_recurrent(parent)? {
             return Ok(());
         }
         HybridBatched::fork_recurrent(self, parent, child)
@@ -605,10 +613,7 @@ impl ManagedBatchedModel for HybridBatched {
         HybridBatched::move_recurrent(self, child, parent)
     }
 
-    fn export_recurrent(
-        &self,
-        seq: usize,
-    ) -> Result<Option<(u64, Vec<crate::models::delta_net::ExportedLayerState>)>> {
+    fn export_recurrent(&self, seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
         HybridBatched::export_recurrent(self, seq)
     }
 
@@ -616,9 +621,19 @@ impl ManagedBatchedModel for HybridBatched {
         &self,
         seq: usize,
         schedule_hash: u64,
-        layers: &[crate::models::delta_net::ExportedLayerState],
+        layers: &[ExportedLayerState],
     ) -> Result<bool> {
         HybridBatched::restore_recurrent(self, seq, schedule_hash, layers)?;
+        Ok(true)
+    }
+
+    fn stage_recurrent(
+        &self,
+        seq: usize,
+        schedule_hash: u64,
+        layers: Arc<[ExportedLayerState]>,
+    ) -> Result<bool> {
+        HybridBatched::stage_recurrent(self, seq, schedule_hash, layers)?;
         Ok(true)
     }
 

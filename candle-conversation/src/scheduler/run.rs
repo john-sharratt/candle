@@ -3,7 +3,7 @@ use super::prefill::{VramPhase, LOAD_TARGET};
 use super::*;
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
 use candle::DeviceLocation;
-use candle_nn::kv_cache::set_kv_free_target;
+use candle_nn::kv_cache::{is_tier_refusal, set_kv_free_target};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
@@ -381,7 +381,14 @@ impl Scheduler {
             return;
         }
         if let Err(e) = self.decode_forward_cobatched(&[], &[], &[], &[]) {
-            tracing::error!("decode-less wave step failed: {e}");
+            // A refused tier is answered where it was refused — the next wave is
+            // composed narrower, or a wave already at the least chunk fails its
+            // members — so it is a warning here, not a fault.
+            if is_tier_refusal(&e) {
+                tracing::warn!("decode-less wave step refused its tier: {e}");
+            } else {
+                tracing::error!("decode-less wave step failed: {e}");
+            }
         }
     }
 
@@ -584,6 +591,7 @@ impl Scheduler {
             if self.active_decodes.is_empty()
                 && self.active_prefills.is_empty()
                 && self.prefill_queue.is_empty()
+                && self.section_queue.is_empty()
                 && self.active_section_ingests.is_empty()
                 && self.deferred_glue_fires.is_empty()
             {
@@ -648,6 +656,8 @@ impl Scheduler {
             // of the width-ordered dispatch below.
             self.wave_cohort_advanced = false;
             self.wave_section_advanced = false;
+            // A width the partition refused holds only until ground frees.
+            self.settle_refused_width();
             // Watch this wave's quanta for allocations that reach the driver
             // instead of the bump arena. Every one is memory the reservation was
             // never sized for, and it is what grows the CUDA pool's reserved

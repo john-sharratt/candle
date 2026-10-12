@@ -11,8 +11,9 @@
 //! has none. One [`RecurrentStateStore`] per sequence, keyed by sequence id,
 //! mirroring how `deepseek4` keeps its per-sequence streaming state.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
@@ -33,6 +34,7 @@ use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::KvLayerMap;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::RecurrentStateStore;
+use crate::models::delta_net::StagedSnapshot;
 use crate::models::delta_net::{compact_stores, RecurrentCompaction};
 use crate::models::draft_ladder::DraftLadder;
 use crate::models::lora::Adapter;
@@ -85,6 +87,13 @@ pub struct HybridBatched {
     /// Behind a lock because the scheduler holds the model behind a shared
     /// reference while a wave mutates the state of the sequences in it.
     recurrent: Mutex<HashMap<usize, RecurrentStateStore>>,
+    /// Snapshots held for sequences that have no store yet
+    /// ([`Self::stage_recurrent`]), the layers shared by every slot opened on one
+    /// prompt branch. Built into a store when the sequence's state is first
+    /// wanted — a fork from it, or a wave on it — so a slot that has not run a
+    /// turn holds shared host bytes rather than a store of its own. Locked after
+    /// `recurrent` wherever both are held.
+    staged: Mutex<HashMap<usize, StagedSnapshot>>,
     /// Sequences whose prefill rows this wave must score **every** one of.
     ///
     /// An ordinary wave wants one logits row per prefill span (the last token's
@@ -161,6 +170,7 @@ impl HybridBatched {
             rope,
             provenance,
             recurrent: Mutex::new(HashMap::new()),
+            staged: Mutex::new(HashMap::new()),
             verify_rows: Mutex::new(Vec::new()),
             verify_stash: Mutex::new(None),
             hidden_seqs: Mutex::new(Vec::new()),
@@ -477,18 +487,22 @@ impl HybridBatched {
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
         for (&seq, &offset) in seqs.iter().zip(offsets) {
-            let fresh = || {
-                RecurrentStateStore::new(
-                    &self.model.cfg.layer_kinds,
-                    &self.model.cfg.delta_net,
-                    &self.model.device,
-                )
-            };
-            match map.entry(seq) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(fresh()?);
+            // A snapshot held for this sequence becomes its store before the
+            // wave reads it. Built seeded, so the offset-0 rule below keeps it.
+            if let Entry::Vacant(slot) = map.entry(seq) {
+                if let Some(store) = self.build_staged(seq)? {
+                    slot.insert(store);
                 }
-                std::collections::hash_map::Entry::Occupied(mut slot) => {
+            }
+            match map.entry(seq) {
+                Entry::Vacant(slot) => {
+                    slot.insert(RecurrentStateStore::new(
+                        &self.model.cfg.layer_kinds,
+                        &self.model.cfg.delta_net,
+                        &self.model.device,
+                    )?);
+                }
+                Entry::Occupied(mut slot) => {
                     // The seeded flag is consumed on the FIRST wave either
                     // way. It protects the one wave that follows a fork or a
                     // restore — the wave whose slot legitimately stands at
@@ -497,8 +511,12 @@ impl HybridBatched {
                     // suppress a later, genuine reset, which is the recycled
                     // slot defect wearing the fix's own clothes.
                     let seeded = slot.get_mut().take_seeded();
+                    // Zeroed on the slots the store holds, never rebuilt: a
+                    // dropped store's slots return only once nothing views
+                    // them, so a rebuild claims a second store's worth while
+                    // the first is still held.
                     if offset == 0 && !seeded {
-                        slot.insert(fresh()?);
+                        slot.get_mut().reset()?;
                     }
                 }
             }
@@ -517,6 +535,7 @@ impl HybridBatched {
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
         map.remove(&seq);
+        self.staged_map()?.remove(&seq);
         // A stash names a rewind point inside the state that just went away,
         // and the draft head's history belongs to the same sequence.
         self.drop_verify_stashes(&[seq]);
@@ -579,6 +598,11 @@ impl HybridBatched {
     /// ([`RecurrentStateStore::fork_from`]), and the copy is seeded so the
     /// child's first wave does not reset it back to zero.
     ///
+    /// A parent whose snapshot is still held has no store to copy: the child
+    /// is built straight from the snapshot, and the parent keeps holding it for
+    /// its next view — one store per turn in flight, never one idling on the
+    /// parent beside it.
+    ///
     /// Errors when the parent carries no state: a fork of nothing is a caller
     /// bug, and returning quietly would hand the child zeros — which is the
     /// defect this whole path exists to remove, reintroduced as an error path.
@@ -587,16 +611,23 @@ impl HybridBatched {
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
-        let forked = map
-            .get(&parent)
-            .ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "qwen35: fork_recurrent from sequence {parent}, which carries no \
-                     recurrent state — handing {child} zeros here is the amnesia this \
-                     path exists to prevent"
-                ))
-            })?
-            .fork_from()?;
+        let forked = match map.get(&parent) {
+            Some(store) => store.fork_from()?,
+            None => {
+                let staged = self.staged_map()?.get(&parent).cloned().ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "qwen35: fork_recurrent from sequence {parent}, which carries no \
+                         recurrent state — handing {child} zeros here is the amnesia this \
+                         path exists to prevent"
+                    ))
+                })?;
+                staged.build(
+                    &self.model.cfg.layer_kinds,
+                    &self.model.cfg.delta_net,
+                    &self.model.device,
+                )?
+            }
+        };
         map.insert(child, forked);
         Ok(())
     }
@@ -624,6 +655,9 @@ impl HybridBatched {
             ))
         })?;
         map.insert(parent, store);
+        // The parent's state is the view's continuation now, so a snapshot it
+        // was still holding describes a point it has moved past.
+        self.staged_map()?.remove(&parent);
         Ok(())
     }
 
@@ -638,7 +672,12 @@ impl HybridBatched {
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
         let Some(store) = map.get(&seq) else {
-            return Ok(None);
+            // A held snapshot is this sequence's state as surely as a store
+            // would be: read it back as it stands, without building one.
+            return Ok(self
+                .staged_map()?
+                .get(&seq)
+                .map(|s| (s.schedule_hash, s.layers.to_vec())));
         };
         // `export` refuses mid-wave itself; the seal runs outside the wave, so
         // reaching that error means the ordering broke, not that the caller
@@ -663,28 +702,90 @@ impl HybridBatched {
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        // A restored state supersedes any snapshot held back for this sequence.
+        self.staged_map()?.remove(&seq);
         let store = match map.entry(seq) {
-            std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(RecurrentStateStore::new(
-                    &self.model.cfg.layer_kinds,
-                    &self.model.cfg.delta_net,
-                    &self.model.device,
-                )?)
-            }
+            Entry::Occupied(slot) => slot.into_mut(),
+            Entry::Vacant(slot) => slot.insert(RecurrentStateStore::new(
+                &self.model.cfg.layer_kinds,
+                &self.model.cfg.delta_net,
+                &self.model.device,
+            )?),
         };
         store.import(schedule_hash, layers)
+    }
+
+    /// Hold a snapshot for `seq` until its state is first wanted — see the
+    /// `staged` field. Checked against this model's geometry now, so a foreign
+    /// layout is refused here exactly as [`Self::restore_recurrent`] refuses it.
+    ///
+    /// A sequence that already holds a store takes the snapshot at once: held
+    /// back, the store's older state would be what its next wave read.
+    pub fn stage_recurrent(
+        &self,
+        seq: usize,
+        schedule_hash: u64,
+        layers: Arc<[ExportedLayerState]>,
+    ) -> Result<()> {
+        RecurrentStateStore::check_snapshot(
+            &self.model.cfg.layer_kinds,
+            &self.model.cfg.delta_net,
+            schedule_hash,
+            &layers,
+        )?;
+        if self.has_recurrent(seq)? {
+            return self.restore_recurrent(seq, schedule_hash, &layers);
+        }
+        self.staged_map()?.insert(
+            seq,
+            StagedSnapshot {
+                schedule_hash,
+                layers,
+            },
+        );
+        Ok(())
+    }
+
+    /// The held-snapshot map, locked.
+    fn staged_map(&self) -> Result<MutexGuard<'_, HashMap<usize, StagedSnapshot>>> {
+        self.staged
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: staged snapshot lock poisoned".into()))
+    }
+
+    /// A store built from the snapshot held for `seq`, if one is held; the
+    /// snapshot is consumed only when the build succeeds, so a build the span
+    /// refuses can be retried.
+    fn build_staged(&self, seq: usize) -> Result<Option<RecurrentStateStore>> {
+        let mut staged = self.staged_map()?;
+        let Some(snap) = staged.get(&seq) else {
+            return Ok(None);
+        };
+        let store = snap.build(
+            &self.model.cfg.layer_kinds,
+            &self.model.cfg.delta_net,
+            &self.model.device,
+        )?;
+        staged.remove(&seq);
+        Ok(Some(store))
     }
 
     /// Whether a sequence currently carries recurrent state — for the
     /// scheduler's fork/move wiring, which must not call either on a slot the
     /// model has never seen (a view carved before the parent's first wave).
+    /// A held snapshot is not a store: see [`Self::holds_recurrent`].
     pub fn has_recurrent(&self, seq: usize) -> Result<bool> {
         Ok(self
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?
             .contains_key(&seq))
+    }
+
+    /// Whether a sequence has recurrent state to fork — a store, or a snapshot
+    /// held until one is wanted.
+    pub fn holds_recurrent(&self, seq: usize) -> Result<bool> {
+        Ok(self.has_recurrent(seq)? || self.staged_map()?.contains_key(&seq))
     }
 
     /// How many sequences currently carry recurrent state.
