@@ -10,9 +10,11 @@
 //! | [`jobs`] | a member's jobs, each sent to the agent §11.3 chooses |
 //! | [`route`] | where a request for a clustered app goes: dispatch, keys, pins |
 //! | [`transport`] | one request to one member, over a stream on its socket |
+//! | [`mirror`] | certification's samples, and a mirrored call compared |
 //! | [`aggregate`], [`merge_ws`] | a request every ready member answers |
 //! | [`tunnel`] | a WebSocket to a member, closed `1011` when its socket drops |
 //! | [`page`] | the status page |
+//! | [`upgrades`] | the gateway's upgrade commands, the forced rollout's plan |
 //!
 //! The state itself — admission, members, claims, the log — is the `cluster`
 //! crate's [`Hub`]; this module is its HTTP.
@@ -22,21 +24,29 @@ pub mod codec;
 pub mod endpoint;
 pub mod jobs;
 pub mod merge_ws;
+pub mod mirror;
 pub mod page;
 pub mod route;
 pub mod streams;
 pub mod transport;
 pub mod tunnel;
+pub mod upgrades;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
+use cluster::gateway::upgrades::UpgradeConfig;
 use cluster::gateway::Hub;
 use cluster::handshake::GroupKey;
+use tokio::time::{interval, MissedTickBehavior};
 
 use crate::config::Cluster as ClusterConfig;
+
+/// How often the upgrades are judged: verdicts due, members left behind.
+const UPGRADE_TICK: Duration = Duration::from_secs(1);
 
 /// A request a gateway sent this member over its socket (§5.1): set by the
 /// member's host on every request it serves off a cluster stream. Its
@@ -62,6 +72,8 @@ pub struct Gateway {
     /// This gateway's own router, which serves the streams members open.
     /// Set once the router exists, which holds this gateway in its state.
     router: OnceLock<Router>,
+    /// Set once the upgrades' ticker runs.
+    ticking: OnceLock<()>,
 }
 
 impl Gateway {
@@ -71,10 +83,33 @@ impl Gateway {
         let key = GroupKey::load(&cfg.group_key_file)
             .with_context(|| "the cluster's group key".to_string())?;
         let name = cfg.name.clone().unwrap_or_else(|| bind.to_string());
+        let hub = Hub::new(key, name);
+        hub.set_upgrade_config(UpgradeConfig {
+            grace: Duration::from_secs(cfg.floor_grace_minutes * 60),
+            canary_pct: cfg.canary_share.min(100),
+        });
         Ok(Arc::new(Gateway {
-            hub: Hub::new(key, name),
+            hub,
             router: OnceLock::new(),
+            ticking: OnceLock::new(),
         }))
+    }
+
+    /// Judge upgrades once a second from now on (§3.8): started by the first
+    /// member socket, on the runtime that serves it.
+    pub fn tick_upgrades(&self) {
+        if self.ticking.set(()).is_err() {
+            return;
+        }
+        let hub = self.hub.clone();
+        tokio::spawn(async move {
+            let mut tick = interval(UPGRADE_TICK);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                hub.upgrade_tick();
+            }
+        });
     }
 
     /// A gateway around `hub`, for tests that build the hub themselves.
@@ -82,6 +117,7 @@ impl Gateway {
         Arc::new(Gateway {
             hub,
             router: OnceLock::new(),
+            ticking: OnceLock::new(),
         })
     }
 

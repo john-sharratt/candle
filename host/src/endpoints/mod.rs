@@ -17,7 +17,7 @@ mod waves;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cluster::dispatch::{Dispatch, Merge};
+use cluster::dispatch::{Dispatch, Merge, Mirror};
 use web::auth::{Role, Roles};
 use web::Roots;
 
@@ -111,6 +111,8 @@ fn shared_table(roles: Roles) -> Api<Arc<Shared>> {
             each(),
             get(status::status),
         )
+        // Mirrored by shape: every member's figures are its own (§3.8).
+        .mirror(Mirror::Shape)
         // Signed out is an answer (`role: "unauthenticated"`), not an error: a
         // page reads the role and decides what to offer.
         .route("/v1/me", Role::Unauthenticated, Dispatch::Any, get(me::me))
@@ -122,6 +124,7 @@ fn shared_table(roles: Roles) -> Api<Arc<Shared>> {
             each(),
             get(telemetry::telemetry),
         )
+        .mirror(Mirror::Shape)
         .route("/v1/memory", Role::User, each(), get(telemetry::memory))
         .route("/v1/phases", Role::User, each(), get(waves::phases))
         .route("/v1/promotes", Role::User, each(), get(waves::promotes))
@@ -137,6 +140,9 @@ fn shared_table(roles: Roles) -> Api<Arc<Shared>> {
             Dispatch::Any,
             get(catalog::tools),
         )
+        // By shape: the catalog is the build's own, so a newer build may
+        // rightly describe a tool differently.
+        .mirror(Mirror::Shape)
         // Each member calibrates its own catalog.
         .route(
             "/v1/tools/calibrate",
@@ -150,6 +156,8 @@ fn shared_table(roles: Roles) -> Api<Arc<Shared>> {
             Dispatch::Any,
             get(catalog::layers),
         )
+        // By shape: each member reads its own checkout of the mind.
+        .mirror(Mirror::Shape)
         // Both of these hand a reader absolute filesystem paths — the redo log's
         // directory, and every write the log reports.
         .route(

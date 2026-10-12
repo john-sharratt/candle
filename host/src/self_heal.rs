@@ -12,8 +12,8 @@
 //! noticed and restarted it by hand — for a device stuck in an out-of-memory
 //! retry storm, measured at 40+ minutes of serving nothing.
 //!
-//! This module captures how the process was launched, and on poison,
-//! relaunches an identical process before exiting — self-healing rather than
+//! On poison this module relaunches an identical process — from the
+//! [`LaunchSpec`] captured at startup — before exiting: self-healing rather than
 //! self-terminating. The substrate redo log is crash-safe, so the abrupt exit
 //! loses nothing durable; `log_file::RESTART_MARKER_NAME` (dropped here,
 //! consumed by `log_file::RotatingFileLog::new`) makes the relaunch append to
@@ -32,16 +32,13 @@
 //! relaunching again. A poisoning after a long, healthy uptime resets the
 //! count: it is treated as a fresh, unrelated occurrence, not a continuation.
 
-use std::env;
-use std::ffi::OsString;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::thread::Builder as ThreadBuilder;
 use std::time::{Duration, Instant};
 
 use candle::gpu_poison::{is_gpu_poisoned, root_fault};
 use candle_conversation::relief_trace;
+use cluster::launch::LaunchSpec;
 
 #[cfg(test)]
 use crate::log_file::is_resuming;
@@ -139,88 +136,6 @@ fn write_attempts(state_dir: &Path, attempts: u32) {
     }
 }
 
-/// How this process was launched — captured once at startup, before anything
-/// can consume argv or change the working directory.
-#[derive(Debug, Clone)]
-pub struct LaunchSpec {
-    exe: PathBuf,
-    args: Vec<OsString>,
-    cwd: PathBuf,
-}
-
-/// A flag that acts once, at the start it was given to — a wipe, a forget —
-/// and must not act again when the watchdog relaunches the process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OneShot {
-    /// The long form, with its dashes: `--wipe-substrate`.
-    pub flag: &'static str,
-    /// Whether it takes a value (`--wipe-layer NAME`), which goes with it.
-    pub takes_value: bool,
-}
-
-impl LaunchSpec {
-    /// Capture the current process's executable path, arguments (excluding
-    /// `argv[0]`, exactly as the shell passed them — not reconstructed from
-    /// parsed CLI flags, so nothing about the original invocation is lost or
-    /// normalised away) less every `one_shot` flag, and working directory.
-    ///
-    /// The one-shot flags go because a relaunch is the same daemon carrying
-    /// on, not a fresh start: a `--wipe-substrate` replayed would delete the
-    /// substrate — and with it this module's attempt count — on every
-    /// relaunch, so the cap would never trip.
-    pub fn capture(one_shot: &[OneShot]) -> io::Result<Self> {
-        Ok(Self {
-            exe: env::current_exe()?,
-            args: without_one_shots(env::args_os().skip(1), one_shot),
-            cwd: env::current_dir()?,
-        })
-    }
-
-    /// Start an identical process — the `restart` command's last step, once
-    /// this one has stopped. Its process id.
-    pub fn relaunch(&self) -> io::Result<u32> {
-        self.relaunch_command().spawn().map(|child| child.id())
-    }
-
-    /// Build (without spawning) the command that relaunches an identical
-    /// process. A fresh stdin: the child must not inherit a handle whose
-    /// other end goes away when this process exits.
-    fn relaunch_command(&self) -> Command {
-        let mut cmd = Command::new(&self.exe);
-        cmd.args(&self.args)
-            .current_dir(&self.cwd)
-            .stdin(Stdio::null());
-        cmd
-    }
-}
-
-/// `args` without any of `one_shot`: `--flag`, `--flag=value`, and — for one
-/// that takes a value — `--flag value`.
-fn without_one_shots(
-    args: impl IntoIterator<Item = OsString>,
-    one_shot: &[OneShot],
-) -> Vec<OsString> {
-    let mut out = Vec::new();
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        let text = arg.to_string_lossy();
-        let named = one_shot.iter().find(|o| {
-            text == o.flag
-                || text
-                    .strip_prefix(o.flag)
-                    .is_some_and(|rest| rest.starts_with('='))
-        });
-        match named {
-            Some(o) if o.takes_value && text == o.flag => {
-                args.next();
-            }
-            Some(_) => {}
-            None => out.push(arg),
-        }
-    }
-    out
-}
-
 /// Drop the restart marker next to the log so the relaunched process appends
 /// instead of truncating. Best-effort: a failure here means the relaunch's
 /// log starts fresh (loses the "why", not the daemon), so it is logged and
@@ -280,7 +195,7 @@ pub fn spawn_watchdog(spec: LaunchSpec, state_dir: PathBuf) {
             // Brief pause so the root log line reaches the file/console sinks
             // before the hard exit.
             std::thread::sleep(Duration::from_millis(80));
-            match spec.relaunch_command().spawn() {
+            match spec.command().spawn() {
                 Ok(child) => tracing::error!(pid = child.id(), "relaunched — exiting"),
                 Err(e) => {
                     // Nothing else can bring the daemon back. Exit anyway:
@@ -298,8 +213,6 @@ pub fn spawn_watchdog(spec: LaunchSpec, state_dir: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::ffi::OsStr;
 
     /// A fast poisoning (well inside the window) accumulates toward the cap.
     #[test]
@@ -371,65 +284,6 @@ mod tests {
 
         std::fs::write(dir.join(ATTEMPTS_FILE_NAME), b"not a number").unwrap();
         assert_eq!(read_attempts(&dir), 0, "unparseable reads as fresh");
-    }
-
-    /// A relaunch drops every one-shot flag in each spelling — and the value a
-    /// valued one carries — and keeps everything else in order, including a
-    /// flag that merely starts with a one-shot's name.
-    #[test]
-    fn a_relaunch_drops_the_one_shot_flags() {
-        let one_shot = [
-            OneShot {
-                flag: "--wipe-substrate",
-                takes_value: false,
-            },
-            OneShot {
-                flag: "--wipe-layer",
-                takes_value: true,
-            },
-        ];
-        let args = [
-            "D:\\prog",
-            "--wipe-substrate",
-            "--host",
-            "192.168.0.5",
-            "--wipe-layer",
-            "repo_map",
-            "--wipe-layer=code_reading",
-            "--wipe-substrate-later",
-            "-v",
-        ]
-        .map(OsString::from);
-        let kept: Vec<String> = without_one_shots(args, &one_shot)
-            .into_iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            kept,
-            [
-                "D:\\prog",
-                "--host",
-                "192.168.0.5",
-                "--wipe-substrate-later",
-                "-v"
-            ]
-        );
-    }
-
-    /// `capture` reflects the real process, and the command it builds carries
-    /// the captured exe/args/cwd through untouched.
-    #[test]
-    fn capture_round_trips_into_the_relaunch_command() {
-        let spec = LaunchSpec::capture(&[]).unwrap();
-        assert_eq!(spec.exe, env::current_exe().unwrap());
-        assert_eq!(spec.cwd, env::current_dir().unwrap());
-
-        let cmd = spec.relaunch_command();
-        assert_eq!(cmd.get_program(), spec.exe.as_os_str());
-        let got_args: Vec<&OsStr> = cmd.get_args().collect();
-        let want_args: Vec<&OsStr> = spec.args.iter().map(OsString::as_os_str).collect();
-        assert_eq!(got_args, want_args);
-        assert_eq!(cmd.get_current_dir(), Some(spec.cwd.as_path()));
     }
 
     /// `mark_resume` creates the directory if needed and drops an empty

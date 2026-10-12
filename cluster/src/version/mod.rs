@@ -1,6 +1,8 @@
-//! This binary's build version (§3.5), stamped at compile time by `build.rs`.
+//! This binary's build version (§3.5), stamped at compile time by `build.rs`,
+//! and what it says of itself to `--build-info` (§3.9).
 
 pub mod compute;
+pub mod info;
 
 use crate::frame::BuildId;
 

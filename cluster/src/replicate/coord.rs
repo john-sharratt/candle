@@ -90,6 +90,7 @@ impl Replicator {
                     .collect()
             })
             .unwrap_or_default();
+        let upgrade = member.as_ref().and_then(|m| m.upgrade_view());
         let app = self.app_coord();
         let s = self.state();
         let mut high: BTreeMap<u64, u64> = BTreeMap::new();
@@ -100,6 +101,7 @@ impl Replicator {
         let (unsent, in_flight) = s.outbox.counts();
         Some(CoordState {
             mode: CoordState::mode_of(s.phase, s.drained, s.fault.is_some()).into(),
+            upgrade,
             detached,
             fault: s.fault.as_ref().map(|f| FaultView {
                 reason: f.reason.clone(),

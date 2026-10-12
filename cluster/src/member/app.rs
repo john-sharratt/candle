@@ -1,13 +1,16 @@
 //! One app of a member (§3.2, §5.4, §5.8): a socket to each of its clusters,
 //! dialled and redialled on its own; what each gateway said — `MEMBERS`, the
-//! claims — and the requests the gateways route here, handed to the host's
-//! HTTP server as streams. The host asks it whether the app is joined, for a
-//! stream up to a gateway, and whether a sticky key may be served here.
+//! claims, the floor it was admitted under — and the requests the gateways
+//! route here, handed to the host's HTTP server as streams. The host asks it
+//! whether the app is joined, for a stream up to a gateway, and whether a
+//! sticky key may be served here. Build traffic goes to the process's
+//! [`Upgrader`]; a socket that admitted the member below the floor carries
+//! nothing else (§3.5).
 
 use std::collections::BTreeMap;
 use std::future::pending;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -18,18 +21,24 @@ use super::claims::{Check, MemberClaims};
 use super::link::{Link, Links};
 use crate::clock::now_ms;
 use crate::close::{Close, CloseCode};
+use crate::coord::{CoordState, UpgradeView};
 use crate::dial::{dial, Attempt, Connect, Stopped};
 use crate::dispatch::RouteTable;
 use crate::frame::{
-    Admit, BuildId, Capacity, Claim, Epoch, Frame, Hello, MemberInfo, MemberState, Members,
+    Admit, BuildId, Capacity, Claim, Coord, Epoch, Frame, Hello, MemberInfo, MemberState, Members,
     ModelId, RepoAd, Routes, Unclaim,
 };
 use crate::handshake::{GroupKey, HandshakeError, PROTO};
 use crate::replicate::{Phase, Replication, Replicator};
 use crate::session::{Ended, Incoming, Session, SessionHandle, VirtualConn};
+use crate::upgrade::decisions::{certify_prefix, latest, Settled, Verdict};
+use crate::upgrade::runtime::Upgrader;
 
 /// How often `CAPACITY` is sent when nothing prompts it sooner (§4.1).
 pub const CAPACITY_EVERY: Duration = Duration::from_secs(1);
+
+/// A member with no substrate sends `COORD` every this many `CAPACITY`s.
+const COORD_TICKS: u64 = 2;
 
 /// The prefix of a stream's target that names another app's group (§5.1).
 pub const GROUP: &str = "group:";
@@ -88,6 +97,12 @@ pub struct AppMember {
     changed: watch::Sender<u64>,
     /// Set when a 4410 stops the app on every cluster.
     stop: watch::Sender<Option<Close>>,
+    /// The floor each socket was admitted under (§3.5).
+    floors: Mutex<Vec<Option<BuildId>>>,
+    /// The process's upgrades, which take the build traffic (§3.9).
+    upgrader: OnceLock<Weak<Upgrader>>,
+    /// The group rejected this member's build: its `HELLO` says so (§3.11).
+    rejected: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -146,7 +161,87 @@ impl AppMember {
             rr: AtomicUsize::new(0),
             changed: watch::channel(0).0,
             stop: watch::channel(None).0,
+            floors: Mutex::new(vec![None; n]),
+            upgrader: OnceLock::new(),
+            rejected: AtomicBool::new(false),
         })
+    }
+
+    /// Whether the group rejected this member's build, as its substrate's
+    /// certification verdicts last said.
+    pub fn set_rejected(&self, rejected: bool) {
+        self.rejected.store(rejected, Ordering::Relaxed);
+    }
+
+    /// Read the verdicts on this member's build from its substrate, before
+    /// its first `HELLO`.
+    async fn read_rejected(&self) {
+        let Some(r) = &self.replicator else {
+            return;
+        };
+        let prefix = certify_prefix(self.app(), &self.id.build);
+        let verdict = latest::<Verdict>(&r.decisions(&prefix).await, &prefix);
+        self.set_rejected(verdict.is_some_and(|(_, v)| v.result == Settled::Fail));
+    }
+
+    /// Hand the build traffic to `upgrader` (§3.9).
+    pub fn set_upgrader(&self, upgrader: Weak<Upgrader>) {
+        let _ = self.upgrader.set(upgrader);
+    }
+
+    fn upgrader(&self) -> Option<Arc<Upgrader>> {
+        self.upgrader.get()?.upgrade()
+    }
+
+    /// What `COORD` reports of upgrades, once the process has its upgrades.
+    pub fn upgrade_view(&self) -> Option<UpgradeView> {
+        Some(self.upgrader()?.view(self.app()))
+    }
+
+    /// The build this member runs.
+    pub fn build(&self) -> &BuildId {
+        &self.id.build
+    }
+
+    /// Whether a socket admitted under `floor` admitted this member below it,
+    /// to upgrade (§3.5). A local build is never below the floor (§3.10).
+    fn below(&self, floor: &BuildId) -> bool {
+        !self.id.build.is_local() && floor.count > self.id.build.count
+    }
+
+    /// The floor's build, while some socket admitted this member below it.
+    pub fn upgrading(&self) -> Option<BuildId> {
+        lock(&self.floors)
+            .iter()
+            .flatten()
+            .find(|f| self.below(f))
+            .cloned()
+    }
+
+    /// The floor socket `c` was admitted under.
+    pub fn floor(&self, c: usize) -> Option<BuildId> {
+        lock(&self.floors).get(c).cloned().flatten()
+    }
+
+    /// The admitted sockets, by cluster.
+    pub fn admitted_sockets(&self) -> Vec<usize> {
+        lock(&self.sockets)
+            .iter()
+            .enumerate()
+            .filter_map(|(c, h)| h.as_ref().map(|_| c))
+            .collect()
+    }
+
+    /// Send `frame` on socket `c`'s control lane.
+    pub fn send_on(&self, c: usize, frame: Frame) -> bool {
+        let handle = lock(&self.sockets).get(c).cloned().flatten();
+        handle.is_some_and(|h| h.control(frame).is_ok())
+    }
+
+    /// Send `frame` on socket `c`'s catch-up lane: spare capacity only (§7.4).
+    pub fn send_catchup_on(&self, c: usize, frame: Frame) -> bool {
+        let handle = lock(&self.sockets).get(c).cloned().flatten();
+        handle.is_some_and(|h| h.catchup(frame).is_ok())
     }
 
     pub fn app(&self) -> &str {
@@ -172,6 +267,7 @@ impl AppMember {
         if let Some(r) = &self.replicator {
             r.start();
         }
+        self.read_rejected().await;
         let mut stop = self.stop.subscribe();
         let this = &self;
         let streams = &Arc::new(streams);
@@ -224,6 +320,7 @@ impl AppMember {
             node: self.id.node,
             host: self.id.host.clone(),
             build: self.id.build.clone(),
+            rejected: self.rejected.load(Ordering::Relaxed),
             model: self.id.model.clone(),
             power: (self.capacity)().power,
             repos: self.id.repos.clone(),
@@ -275,14 +372,29 @@ impl AppMember {
                 table: self.routes.encode(),
             }));
         }
-        for (key, epoch) in lock(&self.claims).own() {
-            let _ = handle.control(Frame::Claim(Claim { key, epoch }));
+        // Admitted below the floor, the member upgrades: it takes no traffic,
+        // applies and sends no events, holds no claim and does not vote
+        // (§3.5). Its replication waits for the build that replaces it.
+        let floor = BuildId {
+            count: admit.floor_count,
+            hash: admit.floor_hash.clone(),
+            local: String::new(),
+        };
+        let upgrading = self.below(&floor);
+        lock(&self.floors)[c] = Some(floor);
+        if !upgrading {
+            for (key, epoch) in lock(&self.claims).own() {
+                let _ = handle.control(Frame::Claim(Claim { key, epoch }));
+            }
         }
         lock(&self.sockets)[c] = Some(handle.clone());
-        if let Some(r) = &self.replicator {
+        if let Some(r) = self.replicator.as_ref().filter(|_| !upgrading) {
             r.admitted(c, &admit, handle.clone());
         }
         let _ = handle.control(Frame::Capacity(self.capacity_for(c)));
+        if let Some(u) = self.upgrader() {
+            u.admitted(self.app(), c);
+        }
         {
             let mut d = lock(&self.dialling);
             d[c].view.state = "admitted";
@@ -296,10 +408,14 @@ impl AppMember {
         let mut ended = session.ended;
         let mut tick = interval(CAPACITY_EVERY);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut ticks: u64 = 0;
         let how = loop {
             tokio::select! {
                 arrived = incoming.recv() => match arrived {
-                    Some(Incoming::Frame(frame)) => self.on_frame(c, frame),
+                    Some(Incoming::Frame(frame)) => self.on_frame(c, frame, upgrading),
+                    // Nothing is routed to an upgrading member; a stream that
+                    // raced the admission is refused.
+                    Some(Incoming::Stream(conn)) if upgrading => conn.reset(),
                     Some(Incoming::Stream(conn)) => match &self.replicator {
                         // Served behind the records the gateway relayed
                         // ahead of it, so it sees what they wrote.
@@ -320,7 +436,7 @@ impl AppMember {
                         None => streams(conn),
                     },
                     Some(Incoming::Event { whole, .. }) => {
-                        if let Some(r) = &self.replicator {
+                        if let Some(r) = self.replicator.as_ref().filter(|_| !upgrading) {
                             r.event(c, whole);
                         }
                     }
@@ -328,18 +444,34 @@ impl AppMember {
                 },
                 _ = tick.tick() => {
                     let _ = handle.control(Frame::Capacity(self.capacity_for(c)));
+                    ticks += 1;
+                    // A member with no substrate has no replication to send
+                    // its COORD: it reports its upgrade itself (§12.1).
+                    if self.replicator.is_none() && ticks.is_multiple_of(COORD_TICKS) {
+                        if let Some(u) = self.upgrader() {
+                            let state = CoordState {
+                                mode: "joined".into(),
+                                upgrade: Some(u.view(self.app())),
+                                ..CoordState::default()
+                            };
+                            let _ = handle.control(Frame::Coord(Coord {
+                                state: state.encode(),
+                            }));
+                        }
+                    }
                 }
             }
         };
         lock(&self.sockets)[c] = None;
         lock(&self.members)[c] = None;
+        lock(&self.floors)[c] = None;
         if let Some(r) = &self.replicator {
             r.closed(c);
         }
         how
     }
 
-    fn on_frame(&self, c: usize, frame: Frame) {
+    fn on_frame(&self, c: usize, frame: Frame, upgrading: bool) {
         match frame {
             Frame::Members(m) => {
                 if let Some(r) = &self.replicator {
@@ -351,21 +483,37 @@ impl AppMember {
                 lock(&self.claims).heard(&claim.key, claim.epoch);
             }
             Frame::Unclaim(u) => lock(&self.claims).heard_release(&u.key, u.epoch),
-            // Substrate and consensus traffic is the replicator's; build
-            // traffic is not taken part in by a member of this build.
+            // Build traffic is the process's upgrades' (§3.9).
+            f @ (Frame::BuildOffer(_)
+            | Frame::BuildHave(_)
+            | Frame::BuildFetch(_)
+            | Frame::BuildChunk(_)
+            | Frame::Verdict(_)) => {
+                if let Some(u) = self.upgrader() {
+                    u.frame(self.app(), c, f);
+                }
+            }
+            // Substrate and consensus traffic is the replicator's, but for a
+            // member upgrading, which takes part in neither.
             other => {
-                if let Some(r) = &self.replicator {
+                if let Some(r) = self.replicator.as_ref().filter(|_| !upgrading) {
                     r.frame(c, other);
                 }
             }
         }
     }
 
-    /// What `CAPACITY` reports on socket `c`: `fault` with a full disk (§7.7),
-    /// `draining` while drained (§12.4), and ready only once the member is in
-    /// the group and that socket's admission catch-up has finished (§7.2).
+    /// What `CAPACITY` reports on socket `c`: `upgrading` when that socket
+    /// admitted it below the floor (§3.5), `fault` with a full disk or a failed
+    /// certification (§7.7, §3.8), `draining` while drained (§12.4), and ready
+    /// only once the member is in the group and that socket's admission
+    /// catch-up has finished (§7.2).
     fn capacity_for(&self, c: usize) -> Capacity {
         let mut cap = (self.capacity)();
+        if self.floor(c).is_some_and(|f| self.below(&f)) {
+            cap.state = MemberState::Upgrading;
+            return cap;
+        }
         if let Some(r) = &self.replicator {
             if r.faulted() {
                 cap.state = MemberState::Fault;

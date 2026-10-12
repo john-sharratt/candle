@@ -85,6 +85,10 @@ select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .job h3 { font-size: 13px; margin: 0 0 4px; }
 .job ol { margin: 0; padding-left: 20px; font-family: var(--mono); font-size: 12px; }
 .job li.error { color: var(--bad); } .job li.done { color: var(--good); }
+h3.sub { font-size: 12px; color: var(--muted); margin: 14px 0 6px; font-weight: 600; }
+#plan { background: var(--ground); border: 1px solid var(--rule); border-radius: 4px; padding: 8px 10px; white-space: pre-wrap; max-height: 24em; overflow: auto; }
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; margin: 6px 0; }
+.pair pre { margin: 0; font-family: var(--mono); font-size: 12px; background: var(--ground); border: 1px solid var(--rule); border-radius: 4px; padding: 6px 8px; white-space: pre-wrap; overflow: auto; max-height: 12em; }
 </style>
 </head>
 <body>
@@ -110,6 +114,34 @@ select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   <div class="scroll"><table id="apps"></table></div>
 </section>
 
+<section id="upgrades-block" aria-labelledby="h-upgrades">
+  <h2 id="h-upgrades">Upgrades</h2>
+  <div class="scroll"><table id="upgrades"></table></div>
+  <h3 class="sub">Certification</h3>
+  <div class="scroll"><table id="certification"></table></div>
+  <div id="mismatches"></div>
+  <h3 class="sub">Distribution and rollout</h3>
+  <div class="scroll"><table id="distribution"></table></div>
+  <h3 class="sub">Builds held</h3>
+  <div class="scroll"><table id="builds"></table></div>
+  <form id="up-form" class="cmd-form">
+    <label>App <select id="up-app"><option>zend</option><option>npcd</option></select></label>
+    <button type="button" data-up="raise-floor">Raise floor</button>
+    <button type="button" data-up="cancel-floor">Cancel floor</button>
+    <button type="button" data-up="pause-rollout">Pause rollout</button>
+    <button type="button" data-up="resume-rollout">Resume rollout</button>
+    <label>Build <input id="up-build" placeholder="count-hash" size="16"></label>
+    <button type="button" data-up="certify-anyway">Certify anyway</button>
+    <button type="button" data-up="reject-build">Reject build</button>
+    <label>From <input id="up-from" placeholder="any holder" size="18"></label>
+    <label>Targets <input id="up-targets" placeholder="the default" size="24"></label>
+    <label>Parallel <input id="up-parallel" type="number" min="1" value="1" size="3"></label>
+    <button type="button" id="up-plan">Plan rollout…</button>
+  </form>
+  <pre id="plan" class="mono" hidden></pre>
+  <button type="button" id="up-confirm" hidden>Confirm rollout</button>
+</section>
+
 <section aria-labelledby="h-members">
   <h2 id="h-members">Members</h2>
   <div class="scroll"><table id="members"></table></div>
@@ -125,9 +157,13 @@ select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
       <option>compact</option><option>maintain</option><option>expire-tombstones</option><option>audit</option>
       <option>self-check</option><option>catch-up</option><option>resync</option><option>rejoin</option>
       <option>check-disk</option><option>release-leases</option><option>set-quorum</option>
+      <option>rollback</option><option>prune-builds</option><option>upgrade-now</option>
     </select></label>
     <label id="cmd-from-l" hidden>From node <input id="cmd-from" placeholder="any member" size="18"></label>
     <label id="cmd-max-l" hidden>max_members <input id="cmd-max" type="number" min="1" size="4"></label>
+    <label id="cmd-build-l" hidden>Build <input id="cmd-build" placeholder="the previous" size="16"></label>
+    <label id="cmd-builds-l" hidden>Builds <input id="cmd-builds" placeholder="count-hash, …" size="24"></label>
+    <label id="cmd-keep-l" hidden>Keep newest <input id="cmd-keep" type="number" min="0" size="3"></label>
     <button type="submit">Run</button>
   </form>
   <p class="dim" id="cmd-hint"></p>
@@ -218,6 +254,14 @@ const ago = (ms, now) => {
   return Math.round(s / 3600) + " h";
 };
 const build = (b) => b ? `${b.count} (${esc(b.hash)})${b.local ? ` <span class="warn">local ${esc(b.local)}</span>` : ""}` : "—";
+// A member's build; a local build the floor has passed stays joined, and says
+// so (§3.10).
+const memberBuild = (m, s) => {
+  const app = s.apps.find((a) => a.app === m.app);
+  const floor = app && app.floor;
+  const behind = m.build.local && floor && m.build.count < floor.count;
+  return build(m.build) + (behind ? ` <span class="warn">behind floor ${floor.count}</span>` : "");
+};
 const stateClass = (s) => ({ready: "ok", loading: "warn", upgrading: "warn", draining: "warn", fault: "bad"}[s] || "dim");
 const modeClass = (m) => ({joined: "ok", fault: "bad", cut_off: "warn", rejoining: "warn", reloading: "warn", draining: "warn"}[m] || "dim");
 const bytes = (n) => {
@@ -242,6 +286,82 @@ function figures(el, items) {
   el.innerHTML = items.map(([v, label]) => `<div class="figure"><b>${esc(v)}</b><span>${esc(label)}</span></div>`).join("");
 }
 
+// Time left until `ms`, or that it has passed.
+const countdown = (ms, now) => {
+  const s = Math.round((ms - now) / 1000);
+  if (s <= 0) return "passed";
+  return s < 90 ? s + " s left" : Math.round(s / 60) + " min left";
+};
+const ratio = (x) => x == null ? "—" : x.toFixed(2) + "×";
+const pct = (x) => x == null ? "—" : (x * 100).toFixed(2) + "%";
+const outcomeClass = (o) => ({pass: "ok", fail: "bad", gap: "warn"}[o] || "dim");
+const buildName = (b) => `${b.count}-${b.hash}`;
+
+// The Upgrades block (§3.8–§3.11, §12.2): candidates and certification,
+// each member's place in distribution and rollout, every build held.
+function renderUpgrades(s) {
+  table($("upgrades"), ["App", "Candidate", "Node", "State", "Grace", "Rollout since", "Certified", "Rejected"],
+    s.upgrades.filter((u) => u.candidate || u.rejected.length || u.certified.length || u.rollout_since_ms).map((u) => {
+      const c = u.candidate;
+      const state = c ? c.state.replaceAll("_", " ") : "";
+      const cls = !c ? "dim" : c.state === "failed" ? "bad" : c.state === "certifying" || c.state === "loading" ? "warn" : "ok";
+      return [
+        `<td>${esc(u.app)}</td>`,
+        `<td class="mono">${c ? esc(c.build) : "—"}</td>`,
+        c ? node(c.node) : `<td>—</td>`,
+        `<td>${c ? `<span class="pill ${cls}">${esc(state)}</span>` : "—"}</td>`,
+        `<td class="mono">${u.deadline_ms ? countdown(u.deadline_ms, s.now_ms) : "—"}</td>`,
+        `<td class="mono">${u.rollout_since_ms ? ago(u.rollout_since_ms, s.now_ms) : "—"}</td>`,
+        `<td class="mono">${esc(u.certified.join(", ") || "—")}</td>`,
+        `<td class="mono ${u.rejected.length ? "bad" : ""}">${esc(u.rejected.join(", ") || "—")}</td>`,
+      ];
+    }), "no candidate, no rollout");
+  const routes = s.upgrades.flatMap((u) => u.candidate ? u.candidate.figures.routes.map((r) => [u.app, r]) : []);
+  table($("certification"), ["App", "Route", "Live", "Baseline", "Mirrored", "Errors", "Baseline errors", "p50", "p95", "Mismatches", "Outcome", "Why"],
+    routes.map(([app, r]) => [
+      `<td>${esc(app)}</td>`, `<td class="mono">${esc(r.route)}</td>`,
+      `<td class="mono">${r.live}</td>`, `<td class="mono">${r.baseline_live}</td>`,
+      `<td class="mono">${r.mirrored}</td>`,
+      `<td class="mono">${pct(r.error_rate)}</td>`, `<td class="mono">${pct(r.baseline_error_rate)}</td>`,
+      `<td class="mono">${ratio(r.p50_ratio)}</td>`, `<td class="mono">${ratio(r.p95_ratio)}</td>`,
+      `<td class="mono">${pct(r.mismatch_rate)}</td>`,
+      `<td><span class="pill ${outcomeClass(r.outcome)}">${esc(r.outcome)}</span></td>`,
+      `<td class="wrap">${esc(r.why || "—")}</td>`,
+    ]), "no candidate is certifying");
+  $("mismatches").innerHTML = s.upgrades.flatMap((u) => u.candidate ? u.candidate.mismatches.map((m) =>
+    `<div><span class="mono">${esc(u.app)} ${esc(m.route)}</span>: ${esc(m.why)}<div class="pair"><pre>${esc(m.baseline)}</pre><pre>${esc(m.candidate)}</pre></div></div>`) : []).join("");
+  table($("distribution"), ["App", "Node", "Host", "Build", "Step", "Fetching", "Kept", "Stranded or failed", "Refuses", ""],
+    reporting(s).filter((m) => m.coord.upgrade).map((m) => {
+      const u = m.coord.upgrade;
+      const f = u.fetching;
+      const kept = u.kept.reduce((n, k) => n + k.bytes, 0);
+      const trouble = u.stranded ? `stranded: ${u.stranded}`
+        : u.failure ? `${u.failure.build} failed: ${u.failure.reason}` : "";
+      const lines = u.failure && u.failure.last_lines.length ? `<details><summary>last log lines</summary><pre class="mono">${esc(u.failure.last_lines.join("\n"))}</pre></details>` : "";
+      return [
+        `<td>${esc(m.app)}</td>`, node(m.node), `<td>${esc(m.host)}</td>`,
+        `<td class="mono">${memberBuild(m, s)}</td>`,
+        `<td>${u.step ? `<span class="pill ${u.step === "stranded" ? "bad" : "warn"}">${esc(u.step)}</span>` : "—"}</td>`,
+        `<td class="mono">${f ? `${esc(f.build)} ${esc(f.kind)}: ${bytes(f.bytes)} of ${bytes(f.size)}${f.resumes ? `, ${f.resumes} resumes` : ""}` : "—"}</td>`,
+        `<td class="mono">${u.kept.length ? `${u.kept.length}, ${bytes(kept)}` : "none"}</td>`,
+        `<td class="wrap ${trouble ? "bad" : ""}">${esc(trouble || "—")}${lines}</td>`,
+        `<td class="mono">${esc(u.refused.join(", ") || "—")}</td>`,
+        `<td>${m.build.local ? "" : `<button type="button" class="rollout-pick" data-app="${esc(m.app)}" data-build="${esc(buildName(m.build))}" data-from="${esc(m.node)}">Roll out this build…</button>`}</td>`,
+      ];
+    }), "no member has reported its builds");
+  const rejected = new Set(s.upgrades.flatMap((u) => u.rejected));
+  table($("builds"), ["Build", "Offered by", "Artifacts", ""],
+    s.builds.map((b) => {
+      const name = `${b.count}-${b.hash}`;
+      return [
+        `<td class="mono">${esc(name)}${rejected.has(name) ? ` <span class="pill bad">rejected</span>` : ""}</td>`,
+        `<td class="mono">${esc(b.offered_by || "—")}</td>`,
+        `<td class="wrap mono">${b.artifacts.map((a) => `${esc(a.kind)} ${esc(a.platform)} ${bytes(a.size)} · ${a.holders.length} holders`).join("<br>")}</td>`,
+        `<td><button type="button" class="rollout-pick" data-build="${esc(name)}">Roll back to…</button></td>`,
+      ];
+    }), "no build is held");
+}
+
 // The last reading, and the one before it: request rates are their difference.
 let last = null, before = null;
 
@@ -262,13 +382,15 @@ function render(s, earlier) {
       `<td class="mono">${f.unsent}</td>`,
       `<td class="mono">${f.fault ? bytes(f.fault.freed) : "—"}</td>`,
     ]), "no member is in fault mode or near its floor");
-  table($("apps"), ["App", "Mode", "Since", "Floor", "Set by", "Model lock", "Members", "Ready", "max_members", "Quorum", ""],
+  table($("apps"), ["App", "Mode", "Since", "Floor", "Set by", "Pending floor", "Grace", "Model lock", "Members", "Ready", "max_members", "Quorum", ""],
     s.apps.map((a) => [
       `<td>${esc(a.app)}</td>`,
       `<td><span class="pill ${a.mode === "clustered" ? "ok" : "dim"}">${esc(a.mode)}</span></td>`,
       `<td class="mono">${a.since_ms ? ago(a.since_ms, s.now_ms) : "—"}</td>`,
       `<td class="mono">${build(a.floor)}</td>`,
       `<td class="mono">${esc(a.floor_set_by || "—")}</td>`,
+      `<td class="mono">${a.pending_floor ? `<span class="warn">${build(a.pending_floor)}</span>` : "—"}</td>`,
+      `<td class="mono">${a.pending_floor ? (a.grace_ends_ms ? countdown(a.grace_ends_ms, s.now_ms) : "loading") : "—"}</td>`,
       `<td class="wrap">${esc(a.model_lock || "—")}</td>`,
       `<td class="mono">${a.members}</td>`,
       `<td class="mono">${a.ready}</td>`,
@@ -276,6 +398,7 @@ function render(s, earlier) {
       `<td class="mono">${a.quorum ?? "—"}</td>`,
       `<td>${a.members ? `<button type="button" class="quorum" data-app="${esc(a.app)}">Set quorum…</button>` : ""}</td>`,
     ]), "no apps");
+  renderUpgrades(s);
   table($("members"), ["App", "Node", "Host", "Build", "State", "Mode", "Gen", "Free disk", "Power", "Weight", "Idle", "Free slots", "Session", "Connected", "Clock", "Clusters", "Last close", ""],
     s.members.map((m) => {
       const c = m.coord;
@@ -283,7 +406,7 @@ function render(s, earlier) {
         `<td>${esc(m.app)}</td>`,
         node(m.node),
         `<td>${esc(m.host)}</td>`,
-        `<td class="mono">${build(m.build)}</td>`,
+        `<td class="mono">${memberBuild(m, s)}</td>`,
         `<td><span class="pill ${stateClass(m.state)}">${esc(m.state)}</span>${m.lagging ? ` <span class="pill warn">lagging</span>` : ""}</td>`,
         `<td>${c ? `<span class="pill ${modeClass(c.mode)}">${esc(c.mode)}</span>` : "—"}</td>`,
         `<td class="mono">${c ? c.gen.current : "—"}</td>`,
@@ -467,12 +590,15 @@ function fillCommandTargets(s) {
   if (keepNode === "all" || members.some((m) => m.node === keepNode)) node.value = keepNode;
 }
 
-const DESTRUCTIVE = ["shutdown", "set-quorum"];
+const DESTRUCTIVE = ["shutdown", "set-quorum", "prune-builds"];
 
 function showArgs() {
   const name = $("cmd-name").value;
   $("cmd-from-l").hidden = name !== "catch-up";
   $("cmd-max-l").hidden = name !== "set-quorum";
+  $("cmd-build-l").hidden = name !== "rollback";
+  $("cmd-builds-l").hidden = name !== "prune-builds";
+  $("cmd-keep-l").hidden = name !== "prune-builds";
   $("cmd-hint").textContent = DESTRUCTIVE.includes(name)
     ? `${name} asks for each member's host name, typed out, before it runs.` : "";
 }
@@ -533,6 +659,12 @@ $("cmd-form").addEventListener("submit", async (e) => {
     const body = {app};
     if (name === "catch-up" && $("cmd-from").value.trim()) body.from = $("cmd-from").value.trim();
     if (name === "set-quorum") body.max_members = Number($("cmd-max").value);
+    if (name === "rollback" && $("cmd-build").value.trim()) body.build = $("cmd-build").value.trim();
+    if (name === "prune-builds") {
+      const named = $("cmd-builds").value.split(",").map((b) => b.trim()).filter(Boolean);
+      if (named.length) body.builds = named;
+      if ($("cmd-keep").value !== "") body.keep = Number($("cmd-keep").value);
+    }
     if (DESTRUCTIVE.includes(name)) {
       const typed = prompt(`${name} on ${m.host}: type its host name to confirm`);
       if (typed === null) continue;
@@ -564,6 +696,78 @@ async function command(name) {
     $("error").textContent = String(e.message || e);
   }
 }
+// The Upgrades block's commands (§12.4): the gateway's own, and those a member
+// of the app records for the group.
+async function upgradeCommand(name, extra) {
+  const app = $("up-app").value;
+  const r = await fetch(`/gateway/upgrade/${name}`, {
+    method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({app, ...extra}),
+  });
+  const answer = await r.json();
+  if (!r.ok) throw new Error(answer.detail || r.status);
+  if (answer.job != null && answer.node) follow(app, {host: answer.node, node: answer.node}, name, answer);
+  return answer;
+}
+for (const b of document.querySelectorAll("[data-up]")) {
+  b.addEventListener("click", async () => {
+    const name = b.dataset.up;
+    const extra = {};
+    if (name === "certify-anyway" || name === "reject-build") extra.build = $("up-build").value.trim();
+    try {
+      await upgradeCommand(name, extra);
+      $("error").textContent = "";
+    } catch (e) {
+      $("error").textContent = String(e.message || e);
+    }
+  });
+}
+let planned = null;
+function rolloutArgs() {
+  const args = {build: $("up-build").value.trim(), parallel: Number($("up-parallel").value || 1)};
+  if ($("up-from").value.trim()) args.from = $("up-from").value.trim();
+  const targets = $("up-targets").value.split(",").map((t) => t.trim()).filter(Boolean);
+  if (targets.length) args.targets = targets;
+  return args;
+}
+$("up-plan").addEventListener("click", async () => {
+  try {
+    const args = rolloutArgs();
+    const answer = await upgradeCommand("rollout", args);
+    $("plan").textContent = JSON.stringify(answer.plan, null, 2);
+    $("plan").hidden = false;
+    $("up-confirm").hidden = false;
+    planned = args;
+    $("error").textContent = "";
+  } catch (e) {
+    $("error").textContent = String(e.message || e);
+  }
+});
+$("up-confirm").addEventListener("click", async () => {
+  if (!planned) return;
+  const typed = prompt(`A rollout restarts every target. Type the build, ${planned.build}, to roll it out`);
+  if (typed === null) return;
+  try {
+    await upgradeCommand("rollout", {...planned, confirm: typed});
+    $("plan").hidden = true;
+    $("up-confirm").hidden = true;
+    planned = null;
+    $("error").textContent = "";
+  } catch (e) {
+    $("error").textContent = String(e.message || e);
+  }
+});
+document.addEventListener("click", (e) => {
+  const pick = e.target.closest("button.rollout-pick");
+  if (!pick) return;
+  if (pick.dataset.app) $("up-app").value = pick.dataset.app;
+  $("up-build").value = pick.dataset.build;
+  $("up-from").value = pick.dataset.from || "";
+  $("up-plan").click();
+  $("upgrades-block").scrollIntoView({behavior: "smooth", block: "start"});
+});
+
 $("drain").addEventListener("click", () => {
   if (confirm("Drain this gateway? It admits no member sockets and closes the ones it has; members carry on through their other clusters.")) command("drain-gateway");
 });

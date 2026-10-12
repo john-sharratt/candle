@@ -14,10 +14,12 @@
 //! | [`member`] | joining the clusters as an `agent` member |
 //! | [`client`] | a member's side: sending its jobs to an agent |
 //! | [`pusher`] | a member's pushes, made by an agent |
+//! | [`install`] | installing a new build of the agent (§3.9) |
 
 pub mod checkouts;
 pub mod client;
 pub mod config;
+pub mod install;
 pub mod jobs;
 pub mod member;
 pub mod pusher;

@@ -21,6 +21,7 @@ mod send;
 mod serve;
 mod store;
 mod tick;
+mod upgrade;
 mod watch;
 
 pub use answer::{answer_ranges, complete_ranges, HEADERS_PER_FRAME};
@@ -28,7 +29,7 @@ pub use catchup::{Progress, Purpose, Requester, FETCH_TRIES, FETCH_WINDOW};
 pub use consensus::{REJOIN_RETRY, REJOIN_WAIT};
 pub use coord::{COMMANDS_KEPT, COORD_EVERY};
 pub use drain::HandedBack;
-pub use fault::{floor, judge, Fault, Verdict, FLOOR_MIN};
+pub use fault::{floor, judge, Cause, Fault, Verdict, FLOOR_MIN};
 pub use lease::{LeaseEvent, LEASE_TTL, RENEW_EVERY};
 pub use memory::{digest, MemoryRecord, MemoryStore, Stamp};
 pub use replicator::{
@@ -37,4 +38,5 @@ pub use replicator::{
 pub use send::{FLUSH_WAIT, GRACE};
 pub use store::{Applied, Disk, Listing, Store, Tap, Tombstones, GEN_DETACHED};
 pub use tick::QUIET;
+pub use upgrade::UPGRADE_PREFIX;
 pub use watch::{periodic_due, GapWatch, GAP_WAIT, PERIODIC};

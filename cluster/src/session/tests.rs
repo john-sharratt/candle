@@ -241,6 +241,7 @@ async fn a_handshake_frame_after_admission_is_closed_4400() {
             hash: String::new(),
             local: String::new(),
         },
+        rejected: false,
         model: None,
         power: 0,
         repos: vec![],

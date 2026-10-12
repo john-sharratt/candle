@@ -26,6 +26,7 @@ fn hello(node: u64) -> Hello {
             hash: "abc".into(),
             local: String::new(),
         },
+        rejected: false,
         model: None,
         power: 1,
         repos: vec![],

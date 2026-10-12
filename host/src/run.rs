@@ -15,6 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_conversation::profile::set_gpu_span_period;
 use candle_conversation::{EngineSlot, TenantRank};
+use cluster::launch::{LaunchSpec, OneShot};
+use cluster::upgrade::artifacts::RunProbe;
+use cluster::upgrade::handoff::hand_off;
+use cluster::upgrade::runtime::{Setup, Upgrader};
 use sysinfo::System;
 use tokio::runtime::{Builder as RuntimeBuilder, Handle};
 use web::Roots;
@@ -22,6 +26,7 @@ use web::Roots;
 use crate::access::{roles, LocalSignin};
 use crate::cli::HostArgs;
 use crate::cluster::leave::drain_and_send;
+use crate::cluster::upgrade::{setup as upgrade_setup, HostInstaller};
 use crate::cluster::{watch_readiness, Cluster, Join};
 use crate::ctrl_c::accept_ctrl_c;
 use crate::endpoints::{declared, routes, Shared};
@@ -29,7 +34,7 @@ use crate::guard::{dispatch_table, Routes};
 use crate::logs::LogBus;
 use crate::model::{ModelView, MODEL};
 use crate::process::{abort_on_ctrl_c, init_logging, install_panic_hook, stop_signal};
-use crate::self_heal::{spawn_watchdog, LaunchSpec, OneShot};
+use crate::self_heal::spawn_watchdog;
 use crate::server::serve;
 use crate::stopping::{Ending, Stopping};
 use crate::telemetry::Telemetry;
@@ -137,22 +142,55 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     // A sticky CUDA fault or an unbroken out-of-memory streak kills the
     // context for good; nothing supervises this process, so it relaunches
     // itself (`self_heal.rs`).
-    spawn_watchdog(launch.clone(), state_dir);
+    spawn_watchdog(launch.clone(), state_dir.clone());
     // A no-op without the `profile` feature.
     set_gpu_span_period(GPU_SPAN_PERIOD);
+
+    // What this member upgrades from, and how it installs a build (§3.9).
+    let stopping = Arc::new(Stopping::new());
+    let installer = HostInstaller::new(Arc::clone(&stopping));
+    let mut ui_dirs: Vec<PathBuf> = tenants.iter().map(|t| t.ui().content).collect();
+    ui_dirs.push(PathBuf::from(COMMON_DIR));
+    let upgrade = upgrade_setup(cfg.binary, &launch, &ui_dirs, &state_dir, &cfg.args);
 
     let runtime = match RuntimeBuilder::new_multi_thread().enable_all().build() {
         Ok(r) => r,
         Err(e) => fail(&format!("could not start the runtime: {e}")),
     };
-    match runtime.block_on(serve_tenants(cfg, tenants, bus)) {
+    let served = runtime.block_on(serve_tenants(
+        cfg,
+        tenants,
+        bus,
+        stopping,
+        Arc::clone(&installer),
+        upgrade.clone(),
+    ));
+    match served {
         Ok(ending) => {
             tracing::info!("stopped");
-            if ending == Ending::Relaunch {
-                match launch.relaunch() {
-                    Ok(pid) => tracing::warn!(pid, "restart: started again — exiting"),
-                    Err(e) => tracing::error!("restart: the new process did not start: {e}"),
-                }
+            let relaunch = |why: &str| match launch.relaunch() {
+                Ok(pid) => tracing::warn!(pid, "{why}: started again — exiting"),
+                Err(e) => tracing::error!("{why}: the new process did not start: {e}"),
+            };
+            match ending {
+                Ending::Relaunch => relaunch("restart"),
+                Ending::Install => match installer.take() {
+                    Some(job) => {
+                        let log = state_dir.join(&log_name);
+                        match hand_off(&launch, &upgrade, &job, Some(log)) {
+                            Ok(()) => tracing::warn!(
+                                "install handed to the watchdog, which starts the new build \
+                                 once this process is gone — exiting"
+                            ),
+                            Err(e) => {
+                                tracing::error!("the install failed: {e}");
+                                relaunch("the install failed")
+                            }
+                        }
+                    }
+                    None => relaunch("an install with nothing to install"),
+                },
+                Ending::Exit => {}
             }
             // Exit rather than fall out of `main`: every tenant drained and
             // flushed its substrate above, and the detached engine threads
@@ -169,6 +207,9 @@ async fn serve_tenants(
     cfg: HostConfig,
     tenants: Vec<Box<dyn Tenant>>,
     bus: Arc<LogBus>,
+    stopping: Arc<Stopping>,
+    installer: Arc<HostInstaller>,
+    upgrade: Setup,
 ) -> anyhow::Result<Ending> {
     let substrates: Vec<(&str, PathBuf)> = tenants
         .iter()
@@ -213,11 +254,15 @@ async fn serve_tenants(
                 clusters = %settings.targets.iter().map(|t| t.url.as_str()).collect::<Vec<_>>().join(", "),
                 "joining the cluster as a member",
             );
+            // A member upgrades with its group (§3.8–§3.11).
+            let upgrader = Upgrader::new(upgrade, installer, Arc::new(RunProbe));
+            upgrader.start();
             Some(Cluster::new(
                 settings,
                 &names,
                 Arc::clone(&telemetry),
                 Handle::current(),
+                upgrader,
             )?)
         }
         None => None,
@@ -284,7 +329,6 @@ async fn serve_tenants(
 
     let mut content_dirs: Vec<PathBuf> = uis.iter().map(|(_, ui)| ui.content.clone()).collect();
     content_dirs.push(common.clone());
-    let stopping = Arc::new(Stopping::new());
     let shared = Arc::new(Shared {
         started_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)

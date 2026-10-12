@@ -203,9 +203,19 @@ impl Registry {
 
     /// The members a request may go to: ready, and not lagging.
     fn ready(&self, app: &str) -> Vec<&MemberView> {
+        self.ready_but(app, None)
+    }
+
+    /// The members a request may go to, but `except`.
+    fn ready_but(&self, app: &str, except: Option<u64>) -> Vec<&MemberView> {
         self.apps
             .get(app)
-            .map(|a| a.members.values().filter(|m| m.routable()).collect())
+            .map(|a| {
+                a.members
+                    .values()
+                    .filter(|m| m.routable() && Some(m.node) != except)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -230,7 +240,11 @@ impl Registry {
     /// The highest-power idle ready member; with none idle, the one with the
     /// most free slots (§5.3).
     fn best(&self, app: &str) -> Option<u64> {
-        let ready = self.ready(app);
+        self.best_but(app, None)
+    }
+
+    fn best_but(&self, app: &str, except: Option<u64>) -> Option<u64> {
+        let ready = self.ready_but(app, except);
         let cap = |m: &&MemberView| m.capacity.clone().expect("a ready member sent capacity");
         ready
             .iter()
@@ -245,7 +259,11 @@ impl Registry {
     }
 
     fn round_robin(&mut self, app: &str) -> Option<u64> {
-        let nodes: Vec<u64> = self.ready(app).iter().map(|m| m.node).collect();
+        self.round_robin_but(app, None)
+    }
+
+    fn round_robin_but(&mut self, app: &str, except: Option<u64>) -> Option<u64> {
+        let nodes: Vec<u64> = self.ready_but(app, except).iter().map(|m| m.node).collect();
         if nodes.is_empty() {
             return None;
         }
@@ -314,6 +332,49 @@ impl Registry {
             }
         };
         node.map_or(Pick::Configured, Pick::Member)
+    }
+
+    /// Where a request goes while `canary` certifies (§3.8). A `Best` or
+    /// `Any` request, or a sticky one whose key no member here holds, is the
+    /// candidate's when `take` says this one is its share, and otherwise goes
+    /// to the baseline — the candidate left out, unless it is the only member
+    /// ready. Every other request is picked as ever.
+    pub fn pick_canary(
+        &mut self,
+        app: &str,
+        dispatch: &Dispatch,
+        key: Option<&str>,
+        pinned: Option<u64>,
+        canary: u64,
+        take: &mut dyn FnMut() -> bool,
+    ) -> Pick {
+        if !self.clustered(app) {
+            return Pick::Configured;
+        }
+        let routable =
+            |r: &Registry, node: u64| r.member(app, node).is_some_and(MemberView::routable);
+        let shared = match dispatch {
+            Dispatch::Best | Dispatch::Any => true,
+            Dispatch::Sticky(_) => key
+                .and_then(|k| {
+                    self.apps
+                        .get(app)
+                        .and_then(|a| a.claims.holder(k.as_bytes()))
+                })
+                .is_none_or(|h| !routable(self, h)),
+            _ => false,
+        };
+        if !shared || !routable(self, canary) {
+            return self.pick(app, dispatch, key, pinned);
+        }
+        if take() {
+            return Pick::Member(canary);
+        }
+        let baseline = match dispatch {
+            Dispatch::Any => self.round_robin_but(app, Some(canary)),
+            _ => self.best_but(app, Some(canary)),
+        };
+        Pick::Member(baseline.unwrap_or(canary))
     }
 }
 

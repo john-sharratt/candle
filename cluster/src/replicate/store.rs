@@ -144,6 +144,13 @@ pub trait Store: Send + Sync + 'static {
     /// type and origin, how many.
     fn deferred(&self) -> Vec<(String, u64, usize)>;
 
+    /// Every record type it holds, by tag, ascending: what a build replacing
+    /// this one must decode (§3.9).
+    fn census(&self) -> Vec<u8>;
+
+    /// Every decision recorded under `prefix`, as `(key, value)` (§3.8).
+    fn decisions(&self, prefix: &str) -> Vec<(String, Vec<u8>)>;
+
     /// Its timeline tombstones.
     fn tombstones(&self) -> Tombstones;
 }

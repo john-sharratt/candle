@@ -14,10 +14,21 @@
 //!   none; a `FETCH` to the member it names; a `HAVE` to every other member;
 //! - `CLAIM` and `UNCLAIM`, kept for routing and sent to the app's other
 //!   members; `PREPARE`, `PROPOSE` and `RELEASE` to the app's other members;
-//!   `PROMISE`, `NACK` and `ACCEPTED` to the member their `reply_to` names.
+//!   `PROMISE`, `NACK` and `ACCEPTED` to the member their `reply_to` names;
+//! - `BUILD_OFFER` and `BUILD_HAVE`, kept as the builds held and sent to every
+//!   other member of every app; a `BUILD_FETCH` to the member it names, or
+//!   naming none to the next holder round robin; a `BUILD_CHUNK` to its
+//!   `reply_to`, on the catch-up lane (§3.9).
 //!
 //! It keeps `CAPACITY`, `ROUTES`, `ACK` and `COORD`, and sends `MEMBERS` on
 //! every change and every 5 s.
+//!
+//! **Upgrades** (§3.5, §3.8–§3.11). A member admitted above the floor is the
+//! app's candidate: it gets its share of the live traffic once ready, and its
+//! certification is judged once a second ([`Hub::upgrade_tick`]), the verdict
+//! sent to it. The floor rises when a member's `COORD` reports the group
+//! certified the build, or a forced rollout; members a rollout leaves behind
+//! are closed 4410, and agents follow their app's build.
 //!
 //! **Queues** (§4.4). A member whose ordered lane holds more than
 //! [`LAG_CAP`] of live events unsent becomes **lagging**: no further live
@@ -44,16 +55,23 @@ use super::status::{
     AppView, ClaimView, FaultRow, HubStatus, MemberRow, Queues, Refusal, SocketReport,
 };
 use super::traffic::Traffic;
+use super::upgrades::held::HeldBuilds;
+use super::upgrades::mirror::Compared;
+use super::upgrades::plan::{plan, Ask, Member as PlanMember, Plan};
+use super::upgrades::stats::Sample;
+use super::upgrades::{Action, Below, UpgradeConfig, Upgrades};
 use super::worlds_view::{disconnected, worlds};
 use crate::clock::now_ms;
 use crate::close::{Close, CloseCode};
-use crate::coord::CoordState;
+use crate::coord::{CoordState, UpgradeView};
 use crate::delivery::ReceiptPacer;
-use crate::dispatch::{Dispatch, RouteTable};
-use crate::frame::{name, Admit, Frame, Hello, Members};
+use crate::dispatch::{Dispatch, Mirror, RouteTable};
+use crate::frame::{name, Admit, BuildFetch, BuildId, Frame, Hello, MemberState, Members};
 use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter};
 use crate::pipe::{Message, PipeRx, PipeTx};
 use crate::session::{start, Ended, Incoming, Role, SessionHandle, VirtualConn};
+use crate::upgrade::decisions::build_name;
+use crate::version::info::AGENT;
 
 /// How often every member is sent `MEMBERS` whether or not anything changed.
 pub const MEMBERS_EVERY: Duration = Duration::from_secs(5);
@@ -62,7 +80,10 @@ pub const MEMBERS_EVERY: Duration = Duration::from_secs(5);
 pub const REFUSALS_KEPT: usize = 100;
 
 /// The apps a member may join (§3.1).
-pub const APPS: [&str; 3] = ["zend", "npcd", "agent"];
+pub const APPS: [&str; 3] = ["zend", "npcd", AGENT_APP];
+
+/// The agents' app (§11).
+const AGENT_APP: &str = "agent";
 
 /// Live events unsent on a member's ordered lane past which it is lagging.
 pub const LAG_CAP: usize = 256 << 20;
@@ -124,6 +145,13 @@ pub(super) struct State {
     reported: HashMap<(String, u64), CoordState>,
     /// Admitting no sockets (§12.4 `drain-gateway`).
     pub draining: bool,
+    /// Pending floors, candidates and their certification, rollouts (§3.5,
+    /// §3.8–§3.11).
+    upgrades: Upgrades,
+    /// The builds members hold, from their `BUILD_OFFER`s and `BUILD_HAVE`s.
+    held: HeldBuilds,
+    /// Spreads `BUILD_FETCH`es naming no member across the holders.
+    fetch_rr: usize,
 }
 
 pub struct Hub {
@@ -196,7 +224,10 @@ impl Hub {
         }
         let mut s = self.state();
         let locked_before = s.admission.lock(app).is_some();
-        let admitted = s.admission.decide(hello, now_ms())?;
+        let State {
+            admission, held, ..
+        } = &mut *s;
+        let admitted = admission.decide(hello, now_ms(), |b| held.holds(b))?;
         let lock = (!locked_before)
             .then(|| s.admission.lock(app).map(|m| m.describe.clone()))
             .flatten();
@@ -222,8 +253,12 @@ impl Hub {
                 session: admitted.session,
                 members,
                 claims,
-                floor_count: admitted.floor.count,
-                floor_hash: admitted.floor.hash.clone(),
+                // No floor yet — only local builds have joined — is floor 0.
+                floor_count: admitted.floor.as_ref().map_or(0, |f| f.count),
+                floor_hash: admitted
+                    .floor
+                    .as_ref()
+                    .map_or(String::new(), |f| f.hash.clone()),
                 // A new session has sent no table on this gateway yet.
                 routes_wanted: true,
                 own_applied_through,
@@ -381,6 +416,7 @@ impl Hub {
             ),
         );
         self.members_changed(app);
+        self.on_admitted(app, node, &hello, &admitted, &handle);
 
         let mut incoming = session.incoming;
         let mut ended = session.ended;
@@ -416,21 +452,31 @@ impl Hub {
             }
         };
 
-        let left = {
+        let (left, gone) = {
             let mut s = self.state();
             let key = (app.to_string(), node);
+            // A replaced session leaving takes nothing of the node's with it.
+            let mut gone = Vec::new();
             if s.sockets
                 .get(&key)
                 .is_some_and(|x| x.session == admitted.session)
             {
                 s.sockets.remove(&key);
+                if !s.sockets.keys().any(|(_, n)| *n == node) {
+                    s.held.forget(node);
+                }
+                gone = s.upgrades.left(app, node);
             }
             let locked = s.admission.lock(app).is_some();
             s.admission.left(app, node, admitted.session);
             let cleared = locked && s.admission.lock(app).is_none();
             s.last_close.insert(key, describe(&how));
-            (s.registry.leave(app, node, admitted.session), cleared)
+            (
+                (s.registry.leave(app, node, admitted.session), cleared),
+                gone,
+            )
         };
+        self.act(gone);
         self.note(app, hex(node), format!("socket closed: {}", describe(&how)));
         if left.1 {
             self.note(
@@ -451,9 +497,12 @@ impl Hub {
         }
         match frame {
             Frame::Capacity(c) => {
+                let state = c.state;
                 if self.state().registry.capacity(app, node, c) {
                     self.members_changed(app);
                 }
+                let ready = self.state().upgrades.capacity(app, node, state, now_ms());
+                self.act(ready);
             }
             Frame::Routes(r) => {
                 let table = RouteTable::decode(&r.table)
@@ -499,7 +548,7 @@ impl Hub {
                         "a COORD that is not a coordination state",
                     )
                 })?;
-                let lines = {
+                let (lines, actions) = {
                     let mut s = self.state();
                     let key = (app.to_string(), node);
                     let Some(socket) = s.sockets.get_mut(&key) else {
@@ -507,11 +556,33 @@ impl Hub {
                     };
                     socket.coord = Some(state.clone());
                     let lines = changes(s.reported.get(&key), &state);
+                    let actions = match &state.upgrade {
+                        Some(view) => {
+                            let floor = s.admission.floor(app).cloned();
+                            s.upgrades.coord(app, view, floor.as_ref(), now_ms())
+                        }
+                        None => Vec::new(),
+                    };
                     s.reported.insert(key, state);
-                    lines
+                    (lines, actions)
                 };
                 for line in lines {
                     self.note(app, hex(node), line);
+                }
+                self.act(actions);
+            }
+            Frame::BuildOffer(b) => {
+                self.state().held.announce(node, &b, true);
+                self.to_every_other(node, Frame::BuildOffer(b));
+            }
+            Frame::BuildHave(b) => {
+                self.state().held.announce(node, &b, false);
+                self.to_every_other(node, Frame::BuildHave(b));
+            }
+            Frame::BuildFetch(f) => self.route_fetch(f),
+            Frame::BuildChunk(c) => {
+                if let Some(h) = self.handle_of(c.reply_to) {
+                    let _ = h.catchup(Frame::BuildChunk(c));
                 }
             }
             f @ (Frame::Prepare(_) | Frame::Propose(_) | Frame::Release(_)) => {
@@ -542,10 +613,317 @@ impl Hub {
             | Frame::Done(_)
             | Frame::Have(_)) => self.relay_substrate(app, node, f),
             f @ Frame::Pulse(_) => self.relay_pulse(app, node, f),
-            // What this gateway neither keeps nor relays: build traffic.
             _ => {}
         }
         Ok(())
+    }
+
+    /// Every other admitted member, of every app: build traffic reaches the
+    /// agents too, which take their binary from a model member's build
+    /// (§3.9, §4.3).
+    fn to_every_other(&self, from: u64, frame: Frame) {
+        let s = self.state();
+        let mut sent = Vec::new();
+        for ((_, n), socket) in &s.sockets {
+            if *n != from && !sent.contains(n) {
+                sent.push(*n);
+                let _ = socket.handle.control(frame.clone());
+            }
+        }
+    }
+
+    /// A socket of `node`, in whichever app it has one.
+    fn handle_of(&self, node: u64) -> Option<SessionHandle> {
+        self.state()
+            .sockets
+            .iter()
+            .find(|((_, n), _)| *n == node)
+            .map(|(_, s)| s.handle.clone())
+    }
+
+    /// A `BUILD_FETCH` goes to the member it names; naming none, to the next
+    /// holder of the artifact but the requester, round robin — so fetches
+    /// spread across every member holding it (§3.9).
+    fn route_fetch(&self, mut f: BuildFetch) {
+        if f.from_node == 0 {
+            let mut s = self.state();
+            let holders: Vec<u64> = s
+                .held
+                .holders_any(&f.artifact)
+                .into_iter()
+                .filter(|n| *n != f.reply_to)
+                .collect();
+            if holders.is_empty() {
+                return;
+            }
+            f.from_node = holders[s.fetch_rr % holders.len()];
+            s.fetch_rr = s.fetch_rr.wrapping_add(1);
+        }
+        if let Some(h) = self.handle_of(f.from_node) {
+            let _ = h.control(Frame::BuildFetch(f));
+        }
+    }
+
+    /// What admission decided for the upgrades: a member below the floor is
+    /// offered the floor's build at once; one above it is the candidate,
+    /// unless its build is one the group rejected.
+    fn on_admitted(
+        &self,
+        app: &str,
+        node: u64,
+        hello: &Hello,
+        admitted: &Admitted,
+        handle: &SessionHandle,
+    ) {
+        let build = &hello.build;
+        if admitted.upgrading {
+            let floor = admitted.floor.clone().expect("upgrading is below a floor");
+            let offer = self.state().held.offer(&floor);
+            self.note(
+                app,
+                hex(node),
+                format!(
+                    "admitted to upgrade: build {} is below the floor {}",
+                    build.count, floor.count
+                ),
+            );
+            if let Some(offer) = offer {
+                let _ = handle.control(Frame::BuildOffer(offer));
+            }
+            return;
+        }
+        if hello.rejected {
+            self.note(
+                app,
+                hex(node),
+                format!(
+                    "admitted on {}, a build the group rejected",
+                    build_name(build)
+                ),
+            );
+            return;
+        }
+        let actions =
+            self.state()
+                .upgrades
+                .admitted(app, node, build, admitted.floor.as_ref(), now_ms());
+        self.act(actions);
+    }
+
+    /// Carry out what the upgrades decided.
+    fn act(&self, actions: Vec<Action>) {
+        for a in actions {
+            match a {
+                Action::Verdict { app, node, verdict } => {
+                    self.to_member(&app, node, Frame::Verdict(verdict))
+                }
+                Action::Floor { app, build, by } => self.set_floor(&app, &build, &by),
+                Action::Close { app, node, close } => {
+                    if let Some(s) = self.state().sockets.get(&(app.clone(), node)) {
+                        s.handle.close(close.clone());
+                    }
+                    self.note(
+                        &app,
+                        hex(node),
+                        format!("closed {}: {}", close.code, close.reason),
+                    );
+                }
+                Action::Note { app, subject, text } => self.note(&app, subject, text),
+            }
+        }
+    }
+
+    /// `app`'s floor is `build` now. An app's agents follow its build when
+    /// the build carries a `tokera-agent`: those below it are closed `1001`
+    /// and come back to take it (§3.9).
+    fn set_floor(&self, app: &str, build: &BuildId, by: &str) {
+        let agents_follow = {
+            let mut s = self.state();
+            s.admission.set_floor(app, build, 0, by);
+            app != AGENT_APP && s.held.has_kind(build, AGENT)
+        };
+        self.note(
+            app,
+            String::new(),
+            format!("floor {} ({}) by {by}", build.count, build.hash),
+        );
+        if !agents_follow {
+            return;
+        }
+        let below: Vec<SessionHandle> = {
+            let mut s = self.state();
+            s.admission
+                .set_floor(AGENT_APP, build, 0, &format!("following {app}"));
+            s.registry
+                .members(AGENT_APP)
+                .iter()
+                .filter(|m| !m.build.is_local() && m.build.count < build.count)
+                .filter_map(|m| s.sockets.get(&(AGENT_APP.to_string(), m.node)))
+                .map(|x| x.handle.clone())
+                .collect()
+        };
+        for h in below {
+            h.close(Close::new(
+                CloseCode::GoingAway,
+                format!(
+                    "the floor rose to {} ({}): reconnect to take it",
+                    build.count, build.hash
+                ),
+            ));
+        }
+    }
+
+    /// Once a second: certification's verdicts, and the members a rollout
+    /// leaves behind (§3.8, §3.9).
+    pub fn upgrade_tick(&self) {
+        let now = now_ms();
+        let mut actions = self.state().upgrades.tick(now);
+        for app in APPS {
+            let mut s = self.state();
+            let Some(floor) = s.admission.floor(app).cloned() else {
+                continue;
+            };
+            let members: Vec<(u64, BuildId, MemberState, Option<UpgradeView>)> = s
+                .registry
+                .members(app)
+                .iter()
+                .map(|m| {
+                    let view = s
+                        .sockets
+                        .get(&(app.to_string(), m.node))
+                        .and_then(|x| x.coord.as_ref())
+                        .and_then(|c| c.upgrade.clone());
+                    (m.node, m.build.clone(), m.state(), view)
+                })
+                .collect();
+            let below: Vec<Below<'_>> = members
+                .iter()
+                .map(|(node, build, state, view)| Below {
+                    node: *node,
+                    build,
+                    state: *state,
+                    upgrade: view.as_ref(),
+                })
+                .collect();
+            actions.extend(s.upgrades.left_behind(app, &floor, &below, now));
+        }
+        self.act(actions);
+    }
+
+    /// Set how this gateway certifies: the grace period and the live share.
+    pub fn set_upgrade_config(&self, cfg: UpgradeConfig) {
+        self.state().upgrades = Upgrades::new(cfg);
+    }
+
+    /// `raise-floor` (§12.4): end `app`'s grace period now.
+    pub fn raise_floor(&self, app: &str) -> Result<(), String> {
+        let actions = self.state().upgrades.raise_floor(app, now_ms())?;
+        self.note(
+            app,
+            String::new(),
+            "raise-floor: the grace period ends now".into(),
+        );
+        self.act(actions);
+        Ok(())
+    }
+
+    /// A forced rollout's plan (§3.11), from what this gateway sees of the
+    /// app's members; or why it is refused.
+    pub fn plan_rollout(&self, ask: &Ask) -> Result<Plan, String> {
+        let app = ask.app.as_str();
+        let (owned, floor, quorum, mut seen) = {
+            let s = self.state();
+            let owned: Vec<(u64, String, BuildId, bool, Option<UpgradeView>)> = s
+                .registry
+                .members(app)
+                .iter()
+                .map(|m| {
+                    let view = s
+                        .sockets
+                        .get(&(app.to_string(), m.node))
+                        .and_then(|x| x.coord.as_ref())
+                        .and_then(|c| c.upgrade.clone());
+                    (m.node, m.host.clone(), m.build.clone(), m.ready(), view)
+                })
+                .collect();
+            let quorum = app_view(&s, app).quorum.unwrap_or(1);
+            let seen: Vec<BuildId> = s
+                .upgrades
+                .pending()
+                .get(app)
+                .map(|(b, _)| b.clone())
+                .into_iter()
+                .collect();
+            (owned, s.admission.floor(app).cloned(), quorum, seen)
+        };
+        seen.extend(owned.iter().map(|(_, _, b, _, _)| b.clone()));
+        let members: Vec<PlanMember<'_>> = owned
+            .iter()
+            .map(|(node, host, build, ready, view)| PlanMember {
+                node: *node,
+                host,
+                build,
+                ready: *ready,
+                upgrade: view.as_ref(),
+            })
+            .collect();
+        plan(ask, &members, floor.as_ref(), quorum, &seen, now_ms())
+    }
+
+    /// `cancel-floor` (§12.4): discard `app`'s pending floor.
+    pub fn cancel_floor(&self, app: &str) -> Result<(), String> {
+        let actions = self.state().upgrades.cancel_floor(app)?;
+        self.act(actions);
+        Ok(())
+    }
+
+    /// A request `node` answered for `app` on `route`, for certification.
+    pub fn certify_sample(
+        &self,
+        app: &str,
+        route: &str,
+        mirror: &Mirror,
+        node: u64,
+        failed: bool,
+        latency_ms: u32,
+    ) {
+        let mut s = self.state();
+        let Some(candidate) = s.upgrades.canary(app) else {
+            return;
+        };
+        s.upgrades.record(
+            app,
+            Sample {
+                route: route.to_string(),
+                mirror: mirror.clone(),
+                candidate: node == candidate,
+                failed,
+                latency_ms,
+            },
+        );
+    }
+
+    /// Whether a request the baseline `node` serves on a mirrored route is
+    /// mirrored to the candidate, and to which.
+    pub fn mirror_to(&self, app: &str, node: u64) -> Option<u64> {
+        let mut s = self.state();
+        let candidate = s.upgrades.canary(app).filter(|c| *c != node)?;
+        s.upgrades.should_mirror(app).then_some(candidate)
+    }
+
+    /// A mirrored call compared.
+    pub fn mirrored(
+        &self,
+        app: &str,
+        route: &str,
+        mode: &Mirror,
+        compared: &Compared,
+        baseline: &[u8],
+        candidate: &[u8],
+    ) {
+        self.state()
+            .upgrades
+            .mirrored(app, route, mode, compared, baseline, candidate);
     }
 
     pub(super) fn to_others(&self, app: &str, from: u64, frame: Frame) {
@@ -608,7 +986,8 @@ impl Hub {
         }
     }
 
-    /// Where a request goes (§5.2).
+    /// Where a request goes (§5.2): while a candidate certifies, its share
+    /// of the live traffic goes to it (§3.8).
     pub fn pick(
         &self,
         app: &str,
@@ -616,7 +995,18 @@ impl Hub {
         key: Option<&str>,
         pinned: Option<u64>,
     ) -> Pick {
-        self.state().registry.pick(app, dispatch, key, pinned)
+        let mut s = self.state();
+        let State {
+            registry, upgrades, ..
+        } = &mut *s;
+        match upgrades.canary(app) {
+            Some(candidate) => {
+                registry.pick_canary(app, dispatch, key, pinned, candidate, &mut || {
+                    upgrades.take_share(app)
+                })
+            }
+            None => registry.pick(app, dispatch, key, pinned),
+        }
     }
 
     /// Which agent of `app` runs a job (§11.3).
@@ -652,6 +1042,16 @@ impl Hub {
 
     pub fn member(&self, app: &str, node: u64) -> Option<MemberView> {
         self.state().registry.member(app, node).cloned()
+    }
+
+    /// A ready member of `app`: where a command the group records is sent.
+    pub fn any_ready(&self, app: &str) -> Option<u64> {
+        self.state()
+            .registry
+            .members(app)
+            .iter()
+            .find(|m| m.ready())
+            .map(|m| m.node)
     }
 
     /// `app`'s floor, model lock and member count, for an aggregated
@@ -714,6 +1114,8 @@ impl Hub {
             claims,
             refusals: s.refusals.iter().cloned().collect(),
             traffic: self.traffic.view(now),
+            upgrades: APPS.iter().map(|a| s.upgrades.view(a)).collect(),
+            builds: s.held.view(),
             log: self.log.read(None, None, log_limit),
         }
     }
@@ -728,7 +1130,10 @@ fn app_view(s: &State, app: &str) -> AppView {
         .filter_map(|(_, x)| x.coord.as_ref())
         .map(|c| (c.paxos.max_members, c.paxos.quorum))
         .max();
+    let pending = s.upgrades.pending().remove(app);
     AppView {
+        pending_floor: pending.as_ref().map(|(b, _)| b.clone()),
+        grace_ends_ms: pending.and_then(|(_, d)| d),
         max_members: quorum.map(|(m, _)| m),
         quorum: quorum.map(|(_, q)| q),
         app: app.to_string(),

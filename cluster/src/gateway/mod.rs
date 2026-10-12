@@ -15,6 +15,7 @@ mod registry;
 mod relay;
 mod status;
 mod traffic;
+pub mod upgrades;
 mod world_log;
 mod worlds_view;
 

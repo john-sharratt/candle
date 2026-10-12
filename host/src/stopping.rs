@@ -1,5 +1,6 @@
 //! How the process comes to stop (`docs/replicated_substrate.md` §12.4): a
-//! Ctrl-C, or a `shutdown` or `restart` command. Each asks once — the first
+//! Ctrl-C, a `shutdown` or `restart` command, or an install (§3.9). Each asks
+//! once — the first
 //! wins — and the stop then runs the same sequence, its step shown on every
 //! tenant's loading page as it goes.
 
@@ -14,6 +15,9 @@ pub enum Ending {
     Exit,
     /// Start the same binary again with the same arguments: `restart`.
     Relaunch,
+    /// Install a build: swap it in, and hand off to the watchdog that starts
+    /// it (§3.9).
+    Install,
 }
 
 /// The step a stop is on, for the loading page.

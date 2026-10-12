@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use cluster::dispatch::{Derived, Dispatch, KeySource, Merge};
+use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror};
 use host::guard::{delete, get, post, Api, Guarded, Routes};
 use web::auth::{Role, Roles};
 
@@ -83,6 +83,8 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Dispatch::Any,
             get(repo_map::completeness),
         )
+        // By shape: each member maps its own checkouts (§3.8).
+        .mirror(Mirror::Shape)
         .route(
             "/v1/substrate/zend/system-prompt",
             Role::Admin,
@@ -137,6 +139,12 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Dispatch::Any,
             get(conversations::list),
         )
+        // Exactly: the list is replicated state, the same on every member —
+        // but for a turn landing between the two calls.
+        .mirror(Mirror::Exact(vec![
+            "updated_ms".into(),
+            "turn_count".into(),
+        ]))
         .route(
             "/v1/conversations/:id",
             Role::Unauthenticated,

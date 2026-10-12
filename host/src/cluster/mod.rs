@@ -14,6 +14,7 @@
 //! | [`disk`] | the volume a substrate is on, for fault mode (§7.7) |
 //! | [`leave`] | draining and sending before the process stops (§12.4) |
 //! | [`up`] | requests between members, and the stamp naming the sender (§9.3) |
+//! | [`upgrade`] | what the upgrades start from, and installing a build (§3.9) |
 //! | [`view`] | the `cluster` block of `/v1/status`, and the `connecting` and `catchup` steps |
 //!
 //! The protocol — handshake, sessions, claims, reconnects, replication — is
@@ -30,6 +31,7 @@ pub mod serve;
 pub mod sticky;
 pub mod store;
 pub mod up;
+pub mod upgrade;
 pub mod view;
 
 use std::collections::BTreeMap;
@@ -52,6 +54,7 @@ use cluster::handshake::GroupKey;
 use cluster::machine::measure;
 use cluster::member::{AppMember, ClusterView, Identity, Link};
 use cluster::replicate::{CatchupView, Phase, Replication, ReplicationView};
+use cluster::upgrade::runtime::Upgrader;
 use cluster::version::this_build;
 use cluster_dial::{tls_connector, Dial, Target};
 use tokio::runtime::Handle;
@@ -150,6 +153,8 @@ pub struct Cluster {
     links: BTreeMap<&'static str, Arc<AppLink>>,
     /// The agent in this process, with `--agent` (§11.5).
     agent: Option<Arc<Jobs>>,
+    /// The process's upgrades, across every app it serves (§3.8–§3.11).
+    upgrader: Arc<Upgrader>,
 }
 
 /// One tenant's app: unjoined until the tenant opens its substrate and
@@ -169,12 +174,14 @@ pub struct AppLink {
 }
 
 impl Cluster {
-    /// The membership of the tenants named `apps`, on `runtime`.
+    /// The membership of the tenants named `apps`, on `runtime`, upgrading
+    /// through `upgrader`.
     pub fn new(
         settings: ClusterSettings,
         apps: &[&'static str],
         telemetry: Arc<Telemetry>,
         runtime: Handle,
+        upgrader: Arc<Upgrader>,
     ) -> anyhow::Result<Arc<Cluster>> {
         let targets: Vec<Arc<Target>> = settings.targets.iter().cloned().map(Arc::new).collect();
         let tls = tls_connector()?;
@@ -185,6 +192,7 @@ impl Cluster {
         Ok(Arc::new(Cluster {
             targets,
             agent,
+            upgrader,
             tls,
             build: settings.build.clone(),
             runtime,
@@ -217,6 +225,11 @@ impl Cluster {
     /// The agent in this process, with `--agent`.
     pub fn agent(&self) -> Option<&Arc<Jobs>> {
         self.agent.as_ref()
+    }
+
+    /// The process's upgrades.
+    pub fn upgrader(&self) -> &Arc<Upgrader> {
+        &self.upgrader
     }
 
     pub fn links(&self) -> impl Iterator<Item = &Arc<AppLink>> {
@@ -291,6 +304,7 @@ impl Cluster {
         if link.member.set(member.clone()).is_err() {
             return;
         }
+        self.upgrader.register(&member);
         for (c, target) in self.targets.iter().enumerate() {
             let dial = Dial {
                 target: target.clone(),

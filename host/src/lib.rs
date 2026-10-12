@@ -19,10 +19,12 @@
 //! | [`access`] | the estate's role table and `--local-signin` |
 //! | [`ui`] | UIs from disk, `/common/`, the on-disk build id |
 //! | [`model`] | the one model every tenant runs |
+//! | [`build_info`] | `--build-info`, and what every binary does first |
 //! | [`logs`], [`telemetry`], [`loading`] | what the process says about itself |
 //! | [`process`], [`ctrl_c`], [`self_heal`], [`log_file`] | process-wide concerns |
 
 pub mod access;
+pub mod build_info;
 pub mod cli;
 pub mod cluster;
 pub mod commands;
@@ -43,10 +45,10 @@ pub mod telemetry;
 pub mod tenant;
 pub mod ui;
 
+pub use ::cluster::launch::OneShot;
 pub use cli::HostArgs;
 pub use model::MODEL;
 pub use run::{run, HostConfig};
-pub use self_heal::OneShot;
 pub use server::Listen;
 pub use tenant::{
     CheckProgress, Maintenance, MeShare, Reports, Running, Stop, Tenant, TenantContext,

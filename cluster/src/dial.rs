@@ -128,6 +128,7 @@ mod tests {
                 hash: String::new(),
                 local: String::new(),
             },
+            rejected: false,
             model: None,
             power: 0,
             repos: vec![],

@@ -31,6 +31,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use cluster::version::info::TOKERAD;
+use host::build_info::first;
 use host::{run, HostArgs, HostConfig, Tenant};
 use npcd::tenant::NpcdArgs;
 use serde::Deserialize;
@@ -42,6 +44,10 @@ struct Cli {
     /// The configuration file.
     #[arg(long, default_value = "tokerad.yaml")]
     config: PathBuf,
+    /// The build an install restored this process from (`host::HostArgs`):
+    /// set by the upgrade's watchdog, never by the file.
+    #[arg(long, value_name = "COUNT-HASH")]
+    upgrade_failed: Option<String>,
 }
 
 /// `tokerad.yaml`.
@@ -62,8 +68,10 @@ impl Config {
 }
 
 fn main() -> anyhow::Result<()> {
+    first(TOKERAD);
     let cli = Cli::parse();
-    let config = Config::load(&cli.config)?;
+    let mut config = Config::load(&cli.config)?;
+    config.host.upgrade_failed = cli.upgrade_failed;
     // zend first: it outranks npcd.
     let tenants: Vec<Box<dyn Tenant>> = vec![
         Box::new(config.zend.resolve()?),

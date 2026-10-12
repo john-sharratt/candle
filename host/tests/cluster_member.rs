@@ -20,6 +20,9 @@ use cluster::gateway::{state_name, Hub};
 use cluster::handshake::GroupKey;
 use cluster::member::{Check, Link};
 use cluster::replicate::{MemoryStore, Replication, Store};
+use cluster::upgrade::artifacts::RunProbe;
+use cluster::upgrade::runtime::{InstallJob, Installer, Setup, Upgrader};
+use cluster::version::info::{platform, BuildInfo, Opens, ZEND};
 use cluster_dial::Target;
 use host::access::LocalSignin;
 use host::cluster::leave::drain_and_send;
@@ -46,6 +49,41 @@ use web::{Builder, Config};
 
 fn key() -> GroupKey {
     GroupKey::from_bytes([9; 32])
+}
+
+/// An installer for members that are never asked to install.
+struct NoInstall;
+
+impl Installer for NoInstall {
+    fn install(&self, _: InstallJob) -> Result<(), String> {
+        Err("this test installs nothing".into())
+    }
+}
+
+/// A member's upgrades at build 7, keeping its state under `dir`.
+fn upgrader(dir: &Path) -> Arc<Upgrader> {
+    let up = Upgrader::new(
+        Setup {
+            info: BuildInfo {
+                kind: ZEND.into(),
+                count: 7,
+                hash: "h7".into(),
+                local: String::new(),
+                platform: platform(),
+                opens: Opens::default(),
+            },
+            exe: std::env::current_exe().unwrap(),
+            root: dir.to_path_buf(),
+            ui: vec![],
+            upgrade_dir: dir.join("upgrade"),
+            keep_builds: 5,
+            failed_from: None,
+        },
+        Arc::new(NoInstall),
+        Arc::new(RunProbe),
+    );
+    up.start();
+    up
 }
 
 async fn spawn(router: Router) -> SocketAddr {
@@ -155,6 +193,7 @@ async fn member(gateway: SocketAddr, node: u64, ui: &Path) -> Member {
         &["zend"],
         Telemetry::new(ModelView::of_prescribed()),
         Handle::current(),
+        upgrader(ui),
     )
     .unwrap();
     let store = Arc::new(MemoryStore::new(node));

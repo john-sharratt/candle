@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::route::{forward, Context};
-use super::Gateway;
+use super::{upgrades, Gateway};
 use crate::auth::{Auth, Role, Roles};
 use crate::config::Cache;
 
@@ -43,10 +43,11 @@ pub fn router(gateway: Arc<Gateway>, auth: Option<Arc<Auth>>, roles: Roles) -> R
         .route("/gateway/command/undrain-gateway", post(undrain))
         .route("/gateway/member/:app/:node/*rest", any(member))
         .with_state(PageState {
-            gateway,
-            auth,
-            roles,
+            gateway: gateway.clone(),
+            auth: auth.clone(),
+            roles: roles.clone(),
         })
+        .merge(upgrades::router(gateway, auth, roles))
 }
 
 /// The refusal for a caller who is not an admin. Boxed because a `Response`

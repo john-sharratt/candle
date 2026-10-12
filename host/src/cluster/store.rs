@@ -340,6 +340,18 @@ impl Store for ConversationStore {
             .collect()
     }
 
+    fn census(&self) -> Vec<u8> {
+        self.conversation.held_record_tags()
+    }
+
+    fn decisions(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        self.objects()
+            .into_iter()
+            .filter(|(k, _, _)| k.starts_with(prefix))
+            .filter_map(|(k, v, _)| Some((k, serde_json::from_value(v).ok()?)))
+            .collect()
+    }
+
     fn tombstones(&self) -> Tombstones {
         let t = self.conversation.tombstone_counts();
         Tombstones {

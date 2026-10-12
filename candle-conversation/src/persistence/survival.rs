@@ -227,6 +227,15 @@ impl RecordCensus {
         self.counts.iter().sum()
     }
 
+    /// Every type it counted any of, as bit `tag`.
+    pub fn held_mask(&self) -> u32 {
+        self.counts
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .fold(0, |mask, (tag, _)| mask | 1 << tag)
+    }
+
     /// `"chunk=1024 tokens=64 turn_coupling=12"` — non-zero types only, in tag
     /// order, so a line stays short and two lines diff by eye. Built on demand,
     /// never in the walk.

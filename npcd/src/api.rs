@@ -25,7 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use cluster::dispatch::{Dispatch, Merge};
+use cluster::dispatch::{Dispatch, Merge, Mirror};
 use host::guard::{delete, get, post, put};
 // Only the test-only `router` builds one directly; the tenant goes through `api`.
 #[cfg(test)]
@@ -276,19 +276,23 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
     let life = || Dispatch::sticky_path("who");
     Api::new(roles)
         // Authored content. Anyone may read it; only an admin may change it, as
-        // a draft of their own until they publish it (§10.3).
+        // a draft of their own until they publish it (§10.3). Its reads are
+        // mirrored by shape when a new build certifies: each member reads its
+        // own checkout of the mind, which may stand at another commit.
         .route(
             "/v1/world",
             Role::Unauthenticated,
             Dispatch::Any,
             get(list_worlds),
         )
+        .mirror(Mirror::Shape)
         .route(
             "/v1/world/:wid",
             Role::Unauthenticated,
             Dispatch::Any,
             get(get_world),
         )
+        .mirror(Mirror::Shape)
         // The response and mood libraries, read from the mind. This used to
         // fall through to the fixture, which answered with six invented
         // templates where the mind holds 596 — see [`crate::collections`].
@@ -318,12 +322,14 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Dispatch::Any,
             get(list_personalities),
         )
+        .mirror(Mirror::Shape)
         .route(
             "/v1/personality/:aid",
             Role::Unauthenticated,
             Dispatch::Any,
             get(get_personality),
         )
+        .mirror(Mirror::Shape)
         .route(
             "/v1/personality/:aid",
             Role::Admin,

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use cluster::gateway::upgrades::{CANARY_DEFAULT, GRACE_DEFAULT};
 use cluster::gateway::APPS;
 use serde::Deserialize;
 
@@ -80,6 +81,22 @@ pub struct Cluster {
     /// This gateway's name in the coordination log; default its bind address.
     #[serde(default)]
     pub name: Option<String>,
+    /// How long, in minutes, a newer build is certified before the floor may
+    /// rise to it (`docs/replicated_substrate.md` §3.5).
+    #[serde(default = "floor_grace_minutes")]
+    pub floor_grace_minutes: u64,
+    /// The candidate's share of live traffic while it certifies, in percent
+    /// (§3.8).
+    #[serde(default = "canary_share")]
+    pub canary_share: u64,
+}
+
+fn floor_grace_minutes() -> u64 {
+    GRACE_DEFAULT.as_secs() / 60
+}
+
+fn canary_share() -> u64 {
+    CANARY_DEFAULT
 }
 
 /// OpenID Connect sign-in, owned by the gateway.
@@ -826,10 +843,27 @@ sites:
         let ok = "cluster: {group_key_file: \"secrets/group.key\"}\nsites:\n  - name: a\n    default: true\n    api:\n      - {prefix: /, upstream: \"http://10.0.0.5:8081\", cluster: zend}\n";
         let c = Config::from_yaml(ok, Path::new("/srv/web")).expect("valid");
         assert_eq!(c.sites[0].api[0].cluster.as_deref(), Some("zend"));
+        let cluster = c.cluster.clone().unwrap();
         assert_eq!(
-            c.cluster.unwrap().group_key_file,
+            cluster.group_key_file,
             Path::new("/srv/web").join("secrets/group.key")
         );
+        // Certification's defaults: a 30-minute grace, a 10% live share.
+        assert_eq!(
+            (cluster.floor_grace_minutes, cluster.canary_share),
+            (30, 10)
+        );
+        let tuned = Config::from_yaml(
+            &ok.replace(
+                "{group_key_file:",
+                "{floor_grace_minutes: 5, canary_share: 25, group_key_file:",
+            ),
+            Path::new("."),
+        )
+        .unwrap()
+        .cluster
+        .unwrap();
+        assert_eq!((tuned.floor_grace_minutes, tuned.canary_share), (5, 25));
         assert_eq!(
             c.sites[0].route_for("/x").unwrap().cluster.as_deref(),
             Some("zend")

@@ -58,6 +58,7 @@ fn hello(node: u64, proto: u16) -> Hello {
             hash: "abc1234".into(),
             local: String::new(),
         },
+        rejected: false,
         model: None,
         power: 100,
         repos: vec![RepoAd {

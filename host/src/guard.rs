@@ -38,6 +38,9 @@
 //! methods it answers. The table a member sends its gateways ([`Guarded::route`])
 //! is the declared table with both, so a read and a write of one path can be
 //! dispatched differently, each by its own registration.
+//!
+//! A read may also say how it is mirrored to certify a new build
+//! ([`Api::mirror`], §3.8); a registration that says nothing is never mirrored.
 
 use std::fmt;
 
@@ -67,6 +70,9 @@ pub struct Guarded {
     /// every method.
     pub methods: Vec<&'static str>,
     pub dispatch: Dispatch,
+    /// How a candidate build is checked against it (§3.8); `None` unless the
+    /// registration says otherwise, so nothing that writes is ever mirrored.
+    pub mirror: Mirror,
 }
 
 impl fmt::Display for Guarded {
@@ -134,7 +140,7 @@ impl Guarded {
             methods: self.methods.iter().map(|m| m.to_string()).collect(),
             path,
             dispatch: self.dispatch.clone(),
-            mirror: Mirror::None,
+            mirror: self.mirror.clone(),
         };
         if self.nested {
             vec![
@@ -272,8 +278,19 @@ where
             nested: false,
             methods: methods.names,
             dispatch,
+            mirror: Mirror::None,
         });
         self.router = self.router.route(path, guarded);
+        self
+    }
+
+    /// Mirror the route just registered as `mirror` to certify a new build
+    /// (§3.8): `Exact` for a read of replicated state every member answers
+    /// the same, `Shape` for one whose values legitimately differ.
+    pub fn mirror(mut self, mirror: Mirror) -> Self {
+        if let Some(last) = self.declared.last_mut() {
+            last.mirror = mirror;
+        }
         self
     }
 
@@ -294,6 +311,7 @@ where
             nested: true,
             methods: Vec::new(),
             dispatch,
+            mirror: Mirror::None,
         });
         self.router = self.router.nest(path, router);
         self
@@ -450,6 +468,7 @@ mod tests {
                     nested: false,
                     methods: vec!["GET", "HEAD"],
                     dispatch: Dispatch::Any,
+                    mirror: Mirror::None,
                 },
                 Guarded {
                     path: "/b",
@@ -457,6 +476,7 @@ mod tests {
                     nested: false,
                     methods: vec!["POST", "DELETE"],
                     dispatch: Dispatch::sticky_path("id"),
+                    mirror: Mirror::None,
                 },
                 Guarded {
                     path: "/c",
@@ -464,6 +484,7 @@ mod tests {
                     nested: true,
                     methods: vec![],
                     dispatch: Dispatch::Best,
+                    mirror: Mirror::None,
                 },
             ]
         );
@@ -515,7 +536,33 @@ mod tests {
             nested,
             methods: vec![],
             dispatch: Dispatch::Any,
+            mirror: Mirror::None,
         }
+    }
+
+    /// A read declares its mirror mode beside its dispatch; a route that
+    /// declares none — every write — is never mirrored (§3.8).
+    #[test]
+    fn a_route_is_mirrored_only_as_it_declares() {
+        let api = Api::<()>::new(roles())
+            .route(
+                "/v1/things",
+                Role::Unauthenticated,
+                Dispatch::Any,
+                get(|| async { "" }),
+            )
+            .mirror(Mirror::Exact(vec!["at_ms".into()]))
+            .route(
+                "/v1/things",
+                Role::Admin,
+                Dispatch::Best,
+                post(|| async { "" }),
+            );
+        let table = dispatch_table(api.declared()).unwrap();
+        let read = table.lookup("GET", "/v1/things").unwrap();
+        assert_eq!(read.route.mirror, Mirror::Exact(vec!["at_ms".into()]));
+        let write = table.lookup("POST", "/v1/things").unwrap();
+        assert_eq!(write.route.mirror, Mirror::None);
     }
 
     /// A request can reach both routes when they are one path whatever their

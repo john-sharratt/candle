@@ -57,6 +57,7 @@ async fn dial_in(
     ws.max_message_size(MAX_MESSAGE)
         .max_frame_size(MAX_MESSAGE)
         .on_upgrade(move |socket| async move {
+            gateway.tick_upgrades();
             let (tx, rx) = split::<AxumWs, _, _>(socket);
             let hub = gateway.hub.clone();
             hub.serve(app, ip, tx, rx, |s| streams::serve(&gateway, ip, s))

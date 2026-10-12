@@ -2,6 +2,8 @@
 //! its name from the path, its arguments from the JSON body, and a destructive
 //! one's `confirm` checked against this machine's name.
 
+use cluster::upgrade::decisions::Rollout;
+use cluster::upgrade::runtime::commands::build_of;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -38,6 +40,31 @@ pub enum Command {
     SetQuorum {
         max_members: u32,
     },
+    /// Accept a build whose certification failed or passed with gaps (§3.8).
+    CertifyAnyway {
+        build: String,
+    },
+    /// Keep a build rejected, and drain the member running it (§3.8).
+    RejectBuild {
+        build: String,
+    },
+    PauseRollout,
+    ResumeRollout,
+    /// Decide a forced rollout's confirmed plan (§3.11).
+    Rollout {
+        plan: Rollout,
+    },
+    /// Put this member on a build it keeps: the previous by default (§3.9).
+    Rollback {
+        build: Option<String>,
+    },
+    /// Delete kept builds: those named, or all but the newest `keep`.
+    PruneBuilds {
+        builds: Vec<String>,
+        keep: Option<usize>,
+    },
+    /// Install a verified build now (§12.4).
+    UpgradeNow,
 }
 
 impl Command {
@@ -58,6 +85,14 @@ impl Command {
             Command::CheckDisk => "check-disk",
             Command::ReleaseLeases => "release-leases",
             Command::SetQuorum { .. } => "set-quorum",
+            Command::CertifyAnyway { .. } => "certify-anyway",
+            Command::RejectBuild { .. } => "reject-build",
+            Command::PauseRollout => "pause-rollout",
+            Command::ResumeRollout => "resume-rollout",
+            Command::Rollout { .. } => "rollout",
+            Command::Rollback { .. } => "rollback",
+            Command::PruneBuilds { .. } => "prune-builds",
+            Command::UpgradeNow => "upgrade-now",
         }
     }
 
@@ -68,6 +103,20 @@ impl Command {
         match self {
             Command::CatchUp { from: Some(n) } => args["from"] = json!(format!("{n:016x}")),
             Command::SetQuorum { max_members } => args["max_members"] = json!(max_members),
+            Command::CertifyAnyway { build } | Command::RejectBuild { build } => {
+                args["build"] = json!(build)
+            }
+            Command::Rollout { plan } => {
+                args["build"] = json!(plan.build);
+                args["from"] = json!(plan.from);
+                args["targets"] = json!(plan.targets);
+                args["parallel"] = json!(plan.parallel);
+            }
+            Command::Rollback { build } => args["build"] = json!(build),
+            Command::PruneBuilds { builds, keep } => {
+                args["builds"] = json!(builds);
+                args["keep"] = json!(keep);
+            }
             _ => {}
         }
         args
@@ -96,7 +145,16 @@ pub struct Body {
     pub from: Option<String>,
     /// `set-quorum`: the new `max_members`.
     pub max_members: Option<u32>,
-    /// A destructive command's target, typed out: this machine's name.
+    /// A build, `count-hash`: `certify-anyway`, `reject-build`, `rollback`.
+    pub build: Option<String>,
+    /// `prune-builds`: the kept builds to delete.
+    pub builds: Option<Vec<String>>,
+    /// `prune-builds`: keep only the newest this many.
+    pub keep: Option<usize>,
+    /// `rollout`: the plan the gateway worked out.
+    pub plan: Option<Rollout>,
+    /// A destructive command's target, typed out: this machine's name, or for
+    /// `rollout` the build's `count-hash`.
     pub confirm: Option<String>,
 }
 
@@ -130,12 +188,55 @@ pub fn parse(name: &str, body: &Body, host: &str) -> Result<Command, String> {
             Some(n) => Command::SetQuorum { max_members: n },
             None => return Err("set-quorum needs `max_members`".into()),
         },
+        "certify-anyway" => Command::CertifyAnyway {
+            build: needs_build(body, name)?,
+        },
+        "reject-build" => Command::RejectBuild {
+            build: needs_build(body, name)?,
+        },
+        "pause-rollout" => Command::PauseRollout,
+        "resume-rollout" => Command::ResumeRollout,
+        "rollout" => {
+            let plan = body
+                .plan
+                .clone()
+                .ok_or("rollout needs the gateway's `plan`")?;
+            if body.app.is_none() {
+                return Err("rollout needs the `app` it rolls out".into());
+            }
+            // A rollout restarts every target: the build is typed to confirm.
+            if body.confirm.as_deref() != Some(plan.build.as_str()) {
+                return Err(format!(
+                    "rollout is destructive: send the build, {:?}, as `confirm`",
+                    plan.build
+                ));
+            }
+            Command::Rollout { plan }
+        }
+        "rollback" => Command::Rollback {
+            build: body.build.clone(),
+        },
+        "prune-builds" => {
+            let builds = body.builds.clone().unwrap_or_default();
+            if builds.is_empty() && body.keep.is_none() {
+                return Err(
+                    "prune-builds needs the `builds` to delete or how many to `keep`".into(),
+                );
+            }
+            Command::PruneBuilds {
+                builds,
+                keep: body.keep,
+            }
+        }
+        "upgrade-now" => Command::UpgradeNow,
         other => return Err(format!("there is no command {other:?}")),
     };
     // Typed out, the target is named twice: once by where the request went,
     // once by the hand that sent it.
-    if matches!(command, Command::Shutdown | Command::SetQuorum { .. })
-        && body.confirm.as_deref() != Some(host)
+    if matches!(
+        command,
+        Command::Shutdown | Command::SetQuorum { .. } | Command::PruneBuilds { .. }
+    ) && body.confirm.as_deref() != Some(host)
     {
         return Err(format!(
             "{} is destructive: send this machine's name, {host:?}, as `confirm`",
@@ -143,6 +244,16 @@ pub fn parse(name: &str, body: &Body, host: &str) -> Result<Command, String> {
         ));
     }
     Ok(command)
+}
+
+/// The build a command names, `count-hash`.
+fn needs_build(body: &Body, name: &str) -> Result<String, String> {
+    let build = body
+        .build
+        .clone()
+        .ok_or_else(|| format!("{name} needs the `build`, `count-hash`"))?;
+    build_of(&build)?;
+    Ok(build)
 }
 
 #[cfg(test)]
@@ -170,6 +281,10 @@ mod tests {
             "rejoin",
             "check-disk",
             "release-leases",
+            "pause-rollout",
+            "resume-rollout",
+            "rollback",
+            "upgrade-now",
         ] {
             assert_eq!(parse(name, &none, "m1").unwrap().name(), name);
         }
@@ -221,6 +336,58 @@ mod tests {
                 "m1"
             ),
             Err("`max_members` is at least 1".into())
+        );
+    }
+
+    /// The upgrade commands: a verdict names its build; `prune-builds` needs
+    /// what to delete and the host typed; `rollout` needs the gateway's plan,
+    /// its app, and the build typed.
+    #[test]
+    fn the_upgrade_commands_name_what_they_act_on() {
+        assert_eq!(
+            parse("certify-anyway", &body(r#"{"build":"12-h12"}"#), "m1"),
+            Ok(Command::CertifyAnyway {
+                build: "12-h12".into()
+            })
+        );
+        assert_eq!(
+            parse("reject-build", &Body::default(), "m1").unwrap_err(),
+            "reject-build needs the `build`, `count-hash`"
+        );
+        assert!(parse("reject-build", &body(r#"{"build":"twelve"}"#), "m1").is_err());
+        assert_eq!(
+            parse("prune-builds", &body(r#"{"confirm":"m1"}"#), "m1").unwrap_err(),
+            "prune-builds needs the `builds` to delete or how many to `keep`"
+        );
+        assert_eq!(
+            parse("prune-builds", &body(r#"{"keep":2}"#), "m1").unwrap_err(),
+            "prune-builds is destructive: send this machine's name, \"m1\", as `confirm`"
+        );
+        assert_eq!(
+            parse("prune-builds", &body(r#"{"keep":2,"confirm":"m1"}"#), "m1"),
+            Ok(Command::PruneBuilds {
+                builds: vec![],
+                keep: Some(2)
+            })
+        );
+        let plan = r#"{"build":"10-h10","from":"01","targets":["02"],"parallel":1,"artifacts":[],"rejects":["12-h12"],"by":"ops","at_ms":5}"#;
+        let unconfirmed = format!(r#"{{"app":"zend","plan":{plan}}}"#);
+        assert_eq!(
+            parse("rollout", &body(&unconfirmed), "m1").unwrap_err(),
+            "rollout is destructive: send the build, \"10-h10\", as `confirm`"
+        );
+        let confirmed = format!(r#"{{"app":"zend","plan":{plan},"confirm":"10-h10"}}"#);
+        let Command::Rollout { plan } = parse("rollout", &body(&confirmed), "m1").unwrap() else {
+            panic!("a rollout");
+        };
+        assert_eq!((plan.build.as_str(), plan.parallel), ("10-h10", 1));
+        let appless = format!(
+            r#"{{"plan":{plan_text},"confirm":"10-h10"}}"#,
+            plan_text = r#"{"build":"10-h10","from":"01","targets":[],"parallel":1,"artifacts":[],"rejects":[],"by":"o","at_ms":0}"#
+        );
+        assert_eq!(
+            parse("rollout", &body(&appless), "m1").unwrap_err(),
+            "rollout needs the `app` it rolls out"
         );
     }
 

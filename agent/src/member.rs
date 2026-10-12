@@ -23,6 +23,7 @@ use cluster::handshake::GroupKey;
 use cluster::machine::measure;
 use cluster::member::{AppMember, Identity};
 use cluster::session::VirtualConn;
+use cluster::upgrade::runtime::Upgrader;
 use cluster::version::this_build;
 use cluster_dial::{tls_connector, Dial, Target};
 use hyper::body::Incoming;
@@ -196,10 +197,18 @@ impl Agent {
 }
 
 /// Join every cluster in `joining` as an agent serving `jobs`, on the
-/// current runtime. The member is returned at once; its sockets dial on.
-pub fn join(joining: Joining, jobs: Arc<Jobs>) -> anyhow::Result<Arc<AppMember>> {
+/// current runtime, upgrading through `upgrader` (§3.9). The member is
+/// returned at once; its sockets dial on.
+pub fn join(
+    joining: Joining,
+    jobs: Arc<Jobs>,
+    upgrader: &Arc<Upgrader>,
+) -> anyhow::Result<Arc<AppMember>> {
     let urls = joining.targets.iter().map(|t| t.url.clone()).collect();
     let agent = Agent::new(joining.node, joining.host, joining.key, urls, jobs);
+    // Before any socket dials: a member admitted below the floor is offered
+    // the floor's build at once.
+    upgrader.register(&agent.member);
     let tls = tls_connector()?;
     for (c, target) in joining.targets.into_iter().enumerate() {
         agent.dial(

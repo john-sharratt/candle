@@ -384,18 +384,25 @@ rebuild` — which the member shows on its loading page and in `/v1/status`.
 - **The floor is per app.** Other apps are untouched (D1).
 - **A member below the floor upgrades on admission, if it can.** That is a member that
   was off or cut off while a rollout ran, or one started from an old binary.
-  - The gateway admits it in the **upgrading** state when some member of the app holds
-    the floor's build for its kind and platform (running it, keeping it, or holding a
-    verified download), and the build passes the member's checks (§3.9). Otherwise it is
-    closed 4410.
-  - An upgrading member takes no traffic, applies and sends no events, holds no claim or
-    lease, and does not vote. Its unsent events stay in its log, where the new build
-    reads them after the swap.
+  - The gateway admits it in the **upgrading** state (`ADMIT` then carries the floor)
+    when some member connected to that gateway holds an artifact of the floor's build:
+    running it, keeping it, or holding a verified download, as its `BUILD_OFFER`s and
+    `BUILD_HAVE`s told the gateway (`gateway/upgrades/held.rs`). Otherwise it is closed
+    4410. The gateway does not know the member's kind or platform, so the member makes
+    §3.9's checks itself once admitted. One with no matching artifact, or whose checks
+    fail, reports itself **stranded** in `COORD`, and the gateway closes it 4410 at once,
+    with that reason.
+  - An upgrading member reports `upgrading` in `CAPACITY`, takes no traffic, applies and
+    sends no events, holds no claim or lease, makes no catch-up, sends no Paxos frame and
+    does not vote. Its unsent events stay in its log, where the new build reads them
+    after the swap.
   - It is sent `BUILD_OFFER` for the floor's build at once. It fetches it, or takes it
     from its own `builds/`, and installs it by the swap of §3.9 straight away. It takes
     no `upgrade/<app>` lease, since it serves nothing the app would lose.
   - The new process is admitted as an ordinary member and catches up (§7.1). An install
-    that fails and is restored by the watchdog is closed 4410, with the reason.
+    that fails and is restored by the watchdog comes back refusing that build
+    (`--upgrade-failed`); it installs nothing more, and the gateway closes it 4410 at
+    once, with the reason.
   - A local build is never below the floor in this sense (§3.10).
 - **A newer build starts a 30-minute grace period, then the floor rises.**
   - When a member above the floor is admitted, the gateway sets the app's **pending
@@ -407,21 +414,33 @@ rebuild` — which the member shows on its loading page and in `/v1/status`.
     distributed to them (§3.9).
   - An even newer member admitted inside the window raises the pending floor, but not
     the deadline.
-  - At the deadline, if the build is certified, the floor becomes the pending floor and
-    the rollout of §3.9 upgrades the older members one at a time. Those that cannot
-    upgrade are closed 4410 when it ends. If certification failed, nothing rises and
-    nothing is closed.
+  - At the deadline each gateway sends its verdict, and the candidate has the group
+    decide (§3.8). The floor rises when a member's `COORD` reports the group's `Pass` on
+    the pending build, and the rollout of §3.9 then upgrades the older members one at a
+    time. Those that cannot upgrade are closed 4410 as it settles. If certification
+    failed, nothing rises and nothing is closed.
   - A member admitted during the window must meet the *current* floor, not the pending
     one.
-  - The status page shows the countdown. An admin can raise the floor at once with the
-    `raise-floor` command (§12.4), or cancel a pending raise with `cancel-floor` if the
-    newer build was a mistake.
-  - `--cluster-floor-grace <minutes>` on the gateway sets the period; the default is 30.
+  - The status page shows the countdown. An admin can end the grace period at once with
+    the `raise-floor` command (§12.4): the gateway sends its verdict now, and the floor
+    rises as soon as the group certifies the build. `cancel-floor` discards a pending
+    raise if the newer build was a mistake.
+  - `floor_grace_minutes` in the gateway's `cluster:` block (`web.yaml`) sets the period;
+    the default is 30. It is configuration, not a flag, like the rest of that block.
 - **Held in memory only, by each gateway.** A gateway restart forgets every floor and
-  every pending raise. The first member of each app to reconnect sets the floor again. Active-active gateways keep
-  their floors independently. Members join every cluster they are given, so the floors
-  agree in practice. Where they do not, a member superseded on one cluster leaves all of
-  them, because the 4410 rule above holds across clusters.
+  every pending raise. The first member of each app to reconnect sets the floor again,
+  unless it is a local build or a build the group rejected; neither ever sets a floor.
+  The group's verdicts and its latest forced rollout come back with the members'
+  `COORD`, and a rollout's decision sets the floor whichever member reconnects first
+  (§3.11). Active-active gateways keep their floors independently. Members join every
+  cluster they are given, so the floors agree in practice. Where they do not, a member
+  superseded on one cluster leaves all of them, because the 4410 rule above holds across
+  clusters.
+- **Agents follow the daemons' floor.** An agent is never a candidate and never takes
+  part in Paxos (§11). When zend's or npcd's floor rises to a build whose artifacts
+  include a `tokera-agent`, the gateway raises the `agent` floor with it and closes each
+  agent below it 1001 (*going away*). The agent reconnects, is admitted upgrading, and
+  installs the build as above.
 - **Equal counts** come from one commit on `origin/main`, so they share a `hash`. Only a
   rewritten `origin/main` could give one count two hashes. The gateway then flags the
   app as running mixed builds and admits both. Different code at one count is otherwise
@@ -493,8 +512,9 @@ baseline in two ways.
 **Live share.**
 
 - The candidate takes a share of the live traffic of the routes it can serve: 10% of
-  `Best` and `Any` requests, and of new sticky keys (`--cluster-canary-share` on the
-  gateway). The rest goes to the baseline as before.
+  `Best` and `Any` requests, and of new sticky keys (`canary_share` in the gateway's
+  `cluster:` block). The rest goes to the baseline as before, and the baseline's picks
+  never land on the candidate (`Registry::pick_canary`).
 - For each route, the gateway records per member:
   - status classes (2xx, 4xx, 5xx);
   - transport failures and timeouts;
@@ -509,11 +529,14 @@ baseline, and compares the two answers.
 
   | Mirror mode | Compared | Routes |
   |---|---|---|
-  | `Exact` | the JSON bodies, after dropping the fields the route names as volatile (timestamps, ids, timings) | deterministic reads of replicated state: `/v1/conversations`, `/v1/tools`, `/v1/schema/layers`, `/v1/repo_map`, npcd's authored reads, `/v1/world/:wid` |
-  | `Shape` | status, and the response's JSON structure and types, not its values | reads whose values legitimately differ between members: `/v1/status`, `/v1/telemetry`, generation previews |
+  | `Exact` | the JSON bodies, after dropping the fields the route names as volatile | `/v1/conversations`, with `updated_ms` and `turn_count` volatile: the one read whose every other value is replicated state, the same on every member |
+  | `Shape` | status, and the response's JSON structure and types, not its values | reads whose values legitimately differ between members or builds: `/v1/tools` and `/v1/schema/layers` (the catalog and layer table are the build's own, so a new build changes them by design); `/v1/repo_map` (each machine's checkout); npcd's `/v1/world`, `/v1/world/:wid`, `/v1/personality` and `/v1/personality/:aid` (minds are per-machine checkouts, and a world's live state moves between the two calls); `/v1/status`, `/v1/telemetry` |
   | `None` | never mirrored | everything that writes or has side effects: chat turns, uploads, acts, commands, any `POST`/`PUT`/`DELETE` not declared otherwise |
 
 - Mirroring is capped at 20% of eligible requests, so the candidate is not loaded twice.
+- The client is always answered from the baseline. The copy to the candidate runs in
+  the background, and only responses that declare a `content-length` of at most 8 MiB
+  are buffered for comparison (`web/src/cluster/mirror.rs`).
 
 **The verdict.** Certification passes when, by the end of the grace period, every route
 with enough samples (at least 200 live or 100 mirrored) meets all of these, and no route
@@ -530,8 +553,10 @@ fails any of them:
 A route without enough samples neither passes nor fails. The gateway then reports
 certification as **passed with gaps**, listing them.
 
-**It is evaluated continuously.** A significant failure ends certification at once; it
-does not wait for the deadline.
+**It is evaluated continuously**, once a second (`gateway/upgrades/verdict.rs`). A
+significant failure ends certification at once; it does not wait for the deadline. A
+pass, a pass with gaps, or *no opinion* is sent at the deadline, or when `raise-floor`
+ends the grace period by hand.
 
 **A failure aborts the upgrade:**
 
@@ -553,12 +578,22 @@ failure on another is a failure.
 **The group records the verdict.** Gateways hold no Paxos state (§5.9), so:
 
 1. Each gateway sends its verdict, with its figures, to the candidate in a `VERDICT`
-   frame.
-2. The candidate proposes the decision `certify/<app>/<build>` (§5.9) once every gateway
-   it is joined to has sent one. A gateway that carried too little traffic sends
-   *no opinion*. A failure from any gateway is proposed at once.
+   frame, and sends it again every 10 s until a member's `COORD` reports the group's
+   verdict on the build. A candidate whose socket dropped, or whose process restarted,
+   still hears it.
+2. The candidate proposes the decision `certify/<app>/<count>-<hash>/<i>` (§5.9) once
+   every socket it is admitted on has sent a verdict. A gateway that carried too little
+   traffic sends *no opinion*. A failure from any gateway is proposed at once. The value
+   is `{ result: pass | fail, by, at_ms, reason, figures }`, with every gateway's figures
+   and, for a failure, the failing routes as the reason. `i` is one above the latest
+   verdict the candidate holds on the build; a proposal that loses its number is made
+   again under the next, every 5 s, until the group holds a verdict. The latest `i` is
+   the group's verdict, which is how `certify-anyway`, `reject-build` and a forced
+   rollout overrule one (§3.11, §12.4).
 3. Every member and gateway then reads the same verdict, from the decision record and
-   from `COORD`.
+   from `COORD`. The members read their decisions once a second
+   (`upgrade/runtime/facts.rs`): the candidate enters fault mode on a failure, a member
+   on a rejected build drains itself, and an accepted one takes work again.
 
 A candidate that stops before proposing leaves its build uncertified, and the next
 candidate at that build starts again.
@@ -583,7 +618,13 @@ artifacts are:
   The last three say what the build can open:
   - `log_format` is the build's `FILE_FORMAT_VERSION` (`log_file.rs:41`, 3 today);
   - `record_tags` is the set of `RecordType` tags it decodes;
-  - `model` is the `ModelKey` of `host::MODEL`, the one model it runs (§3.6).
+  - `model` is the preset name of `host::MODEL` (`override_key`), the one model it runs
+    (§3.6). A `ModelKey` hashes the weights, which `--build-info` does not load.
+
+  An agent opens no substrate and runs no model, so its three are `null`, `[]` and
+  `null`. Every main answers `--build-info` before it parses its arguments
+  (`host::build_info::first`, `cluster::version::info::answer_if_asked`), so the probe
+  never opens a model or a substrate.
 - **The UI directories** its tenants serve (`zend/web`, `web/content/common`,
   `web/content/npcd`), as one archive. Members read their UI from disk, not from the
   binary.
@@ -610,24 +651,36 @@ artifacts are:
     (`compaction::collect_live_records`, `persistence/mod.rs:2195`), so it would delete
     the data. An upgrade meets this only when the newer build dropped a record type. A
     downgrade across a newly added type always does (§3.11);
-  - **model:** the artifact's `model` is not the app's model lock (§3.6). The new process
-    would be refused 4412.
+  - **model:** the artifact's `model` is not the model the member runs, which the app's
+    model lock admitted (§3.6). The new process would be refused 4412.
+
+  The checks are the member's own (`upgrade/compat.rs`), made against its running
+  build's `--build-info` and the census of every record type its substrates hold
+  (`Store::census`: the types found at open, and every type appended since).
 
 **Fetching is resumable and spreads.**
 
 - **Chunks.** `BUILD_FETCH { artifact, offset }` asks for the next chunk, of up to
   1 MiB, sent as `BUILD_CHUNK` on the catch-up lane. It takes spare capacity only
   (§7.4), so distributing a build never slows live traffic.
-- **On disk.** Chunks are written to `<data>/upgrade/<hash>/<artifact>.part`. The
-  `.part` file *is* the resume point: a dropped socket, a restarted member or a vanished
-  source picks up at the file's length.
-- **Verifying.** A finished artifact is checked against its SHA-256. On a mismatch the
-  part file is discarded and fetched again from the start.
-- **Peers become sources.** A member that holds a verified artifact announces it with
-  `BUILD_HAVE`, and other members fetch from whichever holders are reachable, spread
-  across them. A slow or lost source costs one member one resume, not the upgrade.
-- **Only while certifying.** Distribution runs while the candidate is certifying. It
-  stops at once if the build is rejected, and the part files are removed.
+- **On disk.** `<data>` is the member's state directory, or an agent's jobs directory.
+  Chunks are written to `<data>/upgrade/<hash>/<sha256>.part`. The `.part` file *is*
+  the resume point: a dropped socket, a restarted member or a vanished source picks up
+  at the file's length (`upgrade/parts.rs`).
+- **Verifying.** A finished artifact is checked against its SHA-256, and renamed to
+  `<data>/upgrade/<hash>/<sha256>` (with the platform's executable suffix for a
+  binary). A binary is then asked for its `--build-info`, which must name the build
+  offered. On a mismatch the part file is discarded and fetched again from the start.
+- **Peers become sources.** Every member announces with `BUILD_HAVE`, every 30 s and on
+  admission, the build it runs, each one it keeps (§3.9) and each it verified. A member
+  fetches with `from_node` 0, and the gateway sends each request to the next member
+  holding that artifact, round robin, so fetches spread across the holders. A holder
+  that lacks the artifact answers with an empty chunk, and a fetch that hears nothing for
+  30 s asks again. A slow or lost source costs one member one resume, not the upgrade.
+- **Ahead of certification.** A member fetches the build it is to install, or else the
+  newest build offered above its own that is neither rejected nor one it refused. So the
+  artifact is there by the deadline. Once the build is rejected, its downloads and part
+  files are removed; a build a member runs or keeps stays, the way back to it.
 
 **Installing: one member at a time, after certification.** At the grace deadline, if the
 build is certified (§3.8):
@@ -637,7 +690,16 @@ build is certified (§3.8):
 2. **Members upgrade one at a time per app.** A member may upgrade only while it holds
    the Paxos lease `upgrade/<app>` (§5.9). The app therefore never loses more than one
    member at once, and its capacity and quorum hold. For a `tokerad`, which is a member
-   of both apps, upgrading takes both leases.
+   of both apps, upgrading takes both leases, and it installs a build only once both
+   apps certified it.
+   - **The lease outlives the process.** It is taken for 20 minutes, the watchdog's
+     15 plus room, and is never renewed, so it is held through the restart and no other
+     member installs while this one is down. A drain hands back every other lease, but
+     not `upgrade/` ones.
+   - **The process that starts takes it back.** Once ready, the new build, or the old one
+     restored, acquires each lease for 5 s as the same node, which for Paxos is a renewal,
+     and releases it for the next member. The leases it held are in the watchdog's plan,
+     `<data>/upgrade/watch.json`.
 3. **Each member that holds the lease and a verified artifact:**
    - **drains** (§12.4): hands back claims, worlds and characters, and waits for its
      outbox;
@@ -649,34 +711,47 @@ build is certified (§3.8):
      directory moves into the same kept-build directory, and the archive is unpacked in
      its place;
    - **relaunches with the same arguments in the same working directory**, through
-     `self_heal`'s `LaunchSpec` (`host/src/self_heal.rs:161-188`). It records the
+     `LaunchSpec` (`cluster/src/launch.rs`), which `self_heal` uses too. It records the
      executable path, the original arguments exactly as given (one-shot flags dropped),
-     and the working directory, and `relaunch_command` restores all three. Because the
-     new binary sits at the old path, nothing about the invocation changes.
+     and the working directory, and `relaunch` restores all three. Because the new binary
+     sits at the old path, nothing about the invocation changes.
 4. **A watchdog process, not the old daemon, watches the new one.** The old daemon
    must exit before the new one loads, because it holds the model in VRAM, and two
    copies do not fit on the 16 GB card. Process exit is the one sure way to release a
    CUDA context. So, after the swap:
-   - the old daemon starts the **watchdog**: the old executable, now in
-     `builds/<old count>-<old hash>/`, run with `--upgrade-watchdog`. It loads no model,
-     opens no substrate and dials no cluster;
-   - the old daemon exits. The watchdog waits for it to be gone, then launches the new
-     binary through `LaunchSpec`.
+   - the old daemon writes the watchdog's plan, `<data>/upgrade/watch.json` (its pid,
+     the `LaunchSpec`, the swap, the build being installed, the log, the leases, how many
+     builds to keep), and starts the **watchdog**: the old executable, now in
+     `builds/<old count>-<old hash>/`, run with `--upgrade-watchdog <plan>`. Every main
+     answers that before it parses its arguments, so the watchdog loads no model, opens
+     no substrate and dials no cluster (`upgrade/watchdog.rs`, `upgrade/os.rs`);
+   - the old daemon exits. The watchdog waits up to 120 s for it to be gone, killing it
+     after that, then launches the new binary through `LaunchSpec`.
+
+   A swap that cannot complete, or a watchdog that cannot start, is undone at once by
+   the old daemon, which then relaunches itself (`upgrade/handoff.rs`).
 
    The watchdog watches the new process:
-   - **Success:** the new process writes `<data>/upgrade/ok` once it is admitted and
-     ready. The watchdog exits, and the member releases `upgrade/<app>` for the next one.
+   - **Success:** the new process writes `<data>/upgrade/ok` once every app it serves is
+     joined, caught up and ready. The watchdog prunes the kept builds beyond *N* and
+     exits, and the new process hands the leases back (step 2).
    - **Failure:** the new process exits, or is not ready within 15 minutes. The watchdog
      stops it if it is still running, and puts the old executable and UI back at their
-     paths. It relaunches the old build the same way, with `--upgrade-failed <count>`,
-     and that member does not try that build again. The failure, with the new process's
-     last log lines, goes to the gateway when the restored member reconnects.
+     paths. It writes `<data>/upgrade/failed.json` (the build, the reason, and the new
+     process's last 40 log lines), and relaunches the old build the same way, with
+     `--upgrade-failed <count>-<hash>`. The restored member adds the build to
+     `<data>/upgrade/refused.json` and never tries it again unless a forced rollout
+     names it (§3.11). It reports the failure in `COORD`, which the gateway logs, and
+     hands the leases back like a new build would.
 
    `--upgrade-watchdog` and `--upgrade-failed` are one-shot flags: `LaunchSpec::capture`
    drops them, so no later relaunch repeats them.
-5. **Members that cannot upgrade** are closed 4410 when the rollout ends: stranded ones,
-   failed ones, and ones whose fetch never verified. This is the §3.5 floor finally
-   applying to them, with the reason each one is stuck.
+5. **Members that cannot upgrade** are closed 4410 once the rollout settles, 120 s after
+   the floor rose: stranded ones, failed ones, and ones that hold no verified artifact
+   of the build and fetch none. A member still waiting for the lease, fetching or
+   installing is left to finish. This is the §3.5 floor finally applying to them, with
+   the reason each one is stuck. The rollout ends when no member is left below the
+   floor, and the coordination log says so.
 
 **Old builds are kept, the last *N* of them.** Each member keeps the builds it has run
 in `<exe dir>/builds/`, one directory per build, named `<count>-<hash>`. A directory holds:
@@ -836,12 +911,19 @@ value, and it reads that decision and proposes again at `n + 1`. Once it is deci
 **A downgrade rejects the builds it rolls back from.** When `build` is below the floor,
 each build above it that the app has run or was certifying is marked rejected, as
 `reject-build` does. Each rejection is written as a rejecting verdict under the next key
-of `certify/<app>/<build>` (§3.8, §5.9). It follows that:
+of `certify/<app>/<count>-<hash>/<i>` (§3.8, §5.9). It follows that:
 
 - **A member that comes back on a rejected build is admitted drained.** That covers one
   restarted by hand, and one whose downgrade failed and was restored. It replicates and
   votes, takes no traffic, and is never a candidate.
-- **A rejected build never sets the floor** when a gateway restarts.
+- **A rejected build never sets the floor** when a gateway restarts. A member reads the
+  verdicts on its own build from its substrate before it dials, and keeps them current
+  once a second, and its `HELLO` carries `rejected` (§4.1). A gateway that has not yet
+  heard the verdict therefore neither takes that member's build for the floor nor makes
+  it a candidate.
+- **A member the rollout names does not drain itself** for being on a rejected build:
+  it is about to install the rollout's build, under a lease a drained member could not
+  take.
 - **`certify-anyway` lifts a rejection.** A build above the floor that the app never
   ran, such as the fix once it is pushed, is not rejected, and becomes a candidate as
   usual.
@@ -853,8 +935,11 @@ of `certify/<app>/<build>` (§3.8, §5.9). It follows that:
   source machine is not the only one carrying the transfer. A target that keeps the build
   itself fetches nothing.
 - **Leases.** Members take one of `parallel` leases, `upgrade/<app>/<i>`, instead of the
-  single `upgrade/<app>`. With the default of 1, this is the same as an automatic
-  rollout.
+  single `upgrade/<app>`, asking for a slot at random so members waiting together spread
+  across them. A `tokerad` also takes `upgrade/<other app>`. With the default of 1, this
+  is the same as an automatic rollout.
+- **Never pruned.** The rollout's build is protected in the watchdog's plan, so the
+  prune after a successful swap never removes it (§3.9).
 - **The swap from a kept build** moves that directory's executable and UI back into
   place, and the running build into `builds/` (§3.9). The watchdog and the restore are
   unchanged.
@@ -894,9 +979,9 @@ u8 kind | u8 flags | u32 stream (LE) | body…        (WebSocket supplies the le
 | `PREPARE` / `PROMISE` / `NACK` | `{ key, ballot }` / `{ key, ballot, accepted, from, reply_to }` / `{ key, promised, from, reply_to }` — Paxos phase 1 between members: a proposer asking, each member answering as an acceptor (§5.9). A request's sender is its ballot's node; a reply names its acceptor in `from`, so a quorum counts distinct acceptors however many clusters a reply came through | control |
 | `PROPOSE` / `ACCEPTED` | `{ key, ballot, value }` / `{ key, ballot, from, reply_to }` — Paxos phase 2 | control |
 | `RELEASE` | `{ key, ballot, through }` — a lease holder handing the lease back (§5.9, §9.6) | control |
-| `BUILD_OFFER` / `BUILD_HAVE` | `{ build, artifacts: [{ kind, platform, size, sha256 }] }` — a candidate offering its build, and a member that has verified an artifact offering it in turn (§3.9) | control |
-| `BUILD_FETCH` / `BUILD_CHUNK` | `{ artifact, offset, from_node, reply_to }` / `{ artifact, offset, reply_to, bytes ≤ 1 MiB }` — resumable artifact transfer from the member `from_node` names | control / catch-up |
-| `VERDICT` | `{ build, result: pass \| fail \| no_opinion, figures }` — gateway → candidate: this gateway's certification verdict (§3.8) | control |
+| `BUILD_OFFER` / `BUILD_HAVE` | `{ build, artifacts: [{ kind, platform, size, sha256 }] }` — a candidate offering its build, and a member announcing what it runs, keeps or has verified (§3.9); the gateway also sends a member admitted below the floor the floor's `BUILD_OFFER` (§3.5) | control |
+| `BUILD_FETCH` / `BUILD_CHUNK` | `{ artifact, offset, from_node, reply_to }` / `{ artifact, offset, reply_to, bytes ≤ 1 MiB }` — resumable artifact transfer from the member `from_node` names, or with `from_node` 0 from a holder the gateway picks; an empty `bytes` says the holder lacks it | control / catch-up |
+| `VERDICT` | `{ build, result: pass \| fail \| no_opinion, figures }` — gateway → candidate: this gateway's certification verdict, sent again every 10 s until the group decides (§3.8) | control |
 | `PULSE` | `{ world, kind, body }` — a transient world event: never persisted, no `oseq`, no retransmit (§9.1) | ordered, dropped first under pressure |
 | `COORD` | the member's coordination state, for the status page: mode, generation, grants, leases, claims, catch-up, outbox, tombstones, clock (§12.1) | control |
 | `OPEN` | `{ stream, target }` — open a virtual connection (§5.1) | ordered |
@@ -928,7 +1013,7 @@ misread, and on an admitted socket closes it 4400.
 
 | Kind | Tag | Body |
 |---|---|---|
-| `HELLO` | 1 | `u16 proto` · `str app` · `u64 node` · `str host` · `build` · `opt<model>` · `u32 power` · `list<str> repos` · `u64 now_ms` · `[32] nonce` |
+| `HELLO` | 1 | `u16 proto` · `str app` · `u64 node` · `str host` · `build` · `bool rejected` (the group rejected this build, §3.11) · `opt<model>` · `u32 power` · `list<str> repos` · `u64 now_ms` · `[32] nonce` |
 | `CHALLENGE` | 2 | `[32] nonce` · `[32] proof` |
 | `PROVE` | 3 | `[32] proof` |
 | `ADMIT` | 4 | `u64 session` · `list<member>` · `list<claim>` · `u32 floor_count` · `str floor_hash` · `bool routes_wanted` · `u64 own_applied_through` |
@@ -999,14 +1084,14 @@ stream.
 | `CATCHUP` | the member `to` names; without `to`, one other ready member of the app, picked round robin (§7.2) |
 | `FETCH` | the member `from_node` names |
 | `HAVE` | every other admitted member of the same app (§7.5) |
-| `BUILD_OFFER`, `BUILD_HAVE` | every other admitted member of every app the sender serves (§3.9) |
-| `BUILD_FETCH` | the member it names; its `BUILD_CHUNK`s go only to `reply_to` |
+| `BUILD_OFFER`, `BUILD_HAVE` | every other admitted member of every app, agents included, once per member: a `tokerad` build carries the `tokera-agent` an agent takes (§3.9). The gateway keeps who holds what, for admitting members below the floor and for the Builds held list |
+| `BUILD_FETCH` | the member `from_node` names; with `from_node` 0, the next member holding the artifact, round robin, never the requester. Its `BUILD_CHUNK`s go only to `reply_to`, on the catch-up lane |
 | `PULSE` | every other admitted member of the same app; dropped, never queued, when a member's ordered lane is past half its cap (§4.4) |
 | `PREPARE`, `PROPOSE`, `RELEASE` | every other admitted member of the same app, members in fault mode included, since they still vote (§7.7), and upgrading members excluded, since they do not (§3.5); the gateway only carries them and holds no Paxos state (§5.9) |
 | `PROMISE`, `NACK`, `ACCEPTED` | only the member `reply_to` names |
 | `OPEN`/`DATA`/`FIN`/`RESET` | the other leg of that virtual connection (§5.1) |
 | `CLAIM`, `UNCLAIM` | kept by the gateway for routing, and relayed to every other admitted member of the app (§5.4) |
-| `CAPACITY`, `ROUTES`, `ACK`, `COORD` | kept by the gateway for routing and the status page |
+| `CAPACITY`, `ROUTES`, `ACK`, `COORD` | kept by the gateway for routing and the status page; a candidate's `CAPACITY` turning ready starts its grace (§3.8), and the upgrade view in `COORD` carries the group's verdicts and rollouts the gateway follows (§3.5, §3.11) |
 
 A WebSocket delivers in order, so frames need no sequence field: both ends count the
 frames a member sends on a session, 1, 2, 3 and on. The gateway sends `RECEIPT` for the
@@ -1490,8 +1575,8 @@ among the members of the app.
 
 | Primitive | Decides | Used for |
 |---|---|---|
-| **Lease** `(key, ttl)` | who holds `key` for a term, renewable and releasable | world authority (§9.2); any role exactly one member must play at a time |
-| **Decide** `(key, value)` | one value for `key`, once; a later decision needs a new key, such as `key/2` | values the group must agree on: the generations minted at rejoins, `gen/<k>` (§6.7); certification verdicts, `certify/<app>/<build>` (§3.8); forced rollouts, `rollout/<app>/<n>` (§3.11) |
+| **Lease** `(key, ttl)` | who holds `key` for a term, renewable and releasable | world authority (§9.2); installing a build, `upgrade/<app>` or a forced rollout's `upgrade/<app>/<i>` (§3.9, §3.11); any role exactly one member must play at a time |
+| **Decide** `(key, value)` | one value for `key`, once; a later decision needs a new key, such as `key/2` | values the group must agree on: the generations minted at rejoins, `gen/<k>` (§6.7); certification verdicts, `certify/<app>/<count>-<hash>/<i>`, the latest `i` holding (§3.8); forced rollouts, `rollout/<app>/<n>` (§3.11); an app's rollout paused or resumed, `pause/<app>/<n>` (§12.4) |
 
 Claims (§5.4) are *not* decided by Paxos. A sticky key is served by whoever routing sends
 it to, and its races already resolve by stamp (§6.6), so it never pays a consensus
@@ -3221,7 +3306,7 @@ writes the differences to the coordination log (`gateway/coord_log.rs`).
 | Field | |
 |---|---|
 | `mode` | joined, cut off for this app, rejoining (catching up, taking its generation or waiting for a quorum to), reloading after a turn ranked below one it held (§6.6), draining (§12.4), upgrading below the floor (§3.5), in disconnected mode for which npcd worlds (§9.4), or **in fault mode** (§7.7). Fault outranks draining, and draining the rest. Whether it holds writes from while cut off is `detached` beside it. A member *lagging* (§4.4) is the gateway's own judgement, shown from its queues |
-| `upgrade` | its build; as a candidate, its certification state; the artifacts it is fetching or holds (bytes, resumes, verified); its place in a rollout (waiting, draining, swapping, starting, joined, failed and restored); its kept builds with their bytes; its substrate's log format and record census, against which a build is checked (§3.9); the latest `rollout/<app>` decision it holds (§3.11) |
+| `upgrade` | `cluster::coord::UpgradeView` (`upgrade/runtime/view.rs`): its kind and platform; what its build opens — log format, the record census of its substrates, model — against which a build is checked (§3.9); every artifact it holds (`holds`: build, kind, platform, size, SHA-256, and whether it runs, keeps, verified or offers it); its kept builds with their bytes; the fetch in progress (build, kind, bytes against size, resumes); as a candidate, its build, the verdicts each gateway sent and what it proposed; its `step` in an install (waiting, upgrading, installing, stranded); why it is stranded; the failure its last install was restored from, with the new process's last log lines; the builds it refuses; the group's latest verdict on each build (`verdicts`: build, number, verdict); the latest `rollout/<app>` decision it holds (`rollout`: number and decision); and whether the app's rollout is paused |
 | `fault` | in fault mode: the reason (disk full, or certification failed), the volume's free space against the floor, since when, what it gave up (claims, worlds, characters), that it is still voting and the vote journal's slots in use, and space freed since |
 | `gen` | its current generation, the generation it took at its last rejoin, and the greatest `gen/<k>` decision it knows (§6.7) |
 | `deferred` | records it holds back because its build does not decode their type, by type and origin (§6.5) |
@@ -3239,16 +3324,15 @@ writes the differences to the coordination log (`gateway/coord_log.rs`).
 
 Two of these are not the member's to report: the gateway measures a member's **clock
 offset** itself, from the `now_ms` of its `HELLO` against its own clock at admission
-(§3.4), and shows it on the member's row. And `upgrade`, `npc_leases` and the
-certification cause of `fault` arrive with the chunks that build what they describe —
-NPC leases with chunk 7, builds with chunk 9 (§15).
+(§3.4), and shows it on the member's row. An agent, with no substrate and so no
+replication, still sends `COORD`, every 2 s, so its `upgrade` view reaches the page.
 
 ### 12.2 The page
 
 | Block | Shows |
 |---|---|
-| **Apps** | For zend, npcd and agent: the **mode** (dumb or clustered) and when it last switched (§5.7); the build floor (count, hash, the node that set it) (§3.5); the model lock (§3.6); the member count and how many are ready; **`max_members` and the quorum**, the greatest any member reports while they converge (§5.9). Whether it was raised or set lower, and by whom, is in the log. Pending floors and their grace come with chunk 9 |
-| **Upgrades** (§3.8, §3.9; chunk 9) | Per app, the candidate build with its state (loading, certifying, passed, passed with gaps, rejected) and the grace countdown from when it became ready. **Certification, per route:** samples live and mirrored; error rate for candidate and baseline, with the test's result; p50 and p95 ratios; mirror mismatch rate, with the last few mismatching pairs shown side by side. **Distribution:** each member's artifact with bytes fetched, resumes, sources and verification; stranded members and why. **Rollout:** automatic or forced, and for a forced one who ran it, its direction and its source (§3.11); order, which members hold `upgrade/<app>` or its `parallel` leases, each member's step, any that failed and were restored, with the new process's last log lines. **Builds held:** every build any member of the app runs or keeps, newest first, with its holders and bytes, rejected builds marked, and a *Roll back to…* action on each. The commands for this block, `rollout`, `certify-anyway`, `reject-build`, `raise-floor`, `cancel-floor` and `pause-rollout`, sit here. |
+| **Apps** | For zend, npcd and agent: the **mode** (dumb or clustered) and when it last switched (§5.7); the build floor (count, hash, the node that set it) (§3.5); the model lock (§3.6); the member count and how many are ready; **`max_members` and the quorum**, the greatest any member reports while they converge (§5.9). Whether it was raised or set lower, and by whom, is in the log. The pending floor and its grace countdown, or *loading* while the candidate loads (§3.5) |
+| **Upgrades** (§3.8, §3.9, §3.11) | Per app, the candidate build with its node and state (loading, certifying, passed, passed with gaps, no opinion, failed), the grace countdown from when it became ready, how long since the floor last rose while that rollout lasts, and the builds the group certified and rejected. **Certification, per route:** samples live, baseline and mirrored; error rate for candidate and baseline; p50 and p95 ratios; mirror mismatch rate; the route's outcome and why; and the last mismatching pairs shown side by side. **Distribution:** each member's build (a local build the floor has passed marked *behind floor N*, §3.10), its install step, the fetch in progress with bytes and resumes, its kept builds and their bytes, why it is stranded or which install failed (with the new process's last log lines), and the builds it refuses; and *Roll out this build…* on each. Which members hold `upgrade/<app>` or a rollout's `parallel` leases is in the Consensus block. **Builds held:** every build any member runs, keeps, verified or offers, newest first, with each artifact's kind, platform, size and holders, rejected builds marked, and a *Roll back to…* action on each. The gateway commands for this block sit here (§12.4), with the plan a `rollout` answers shown for confirmation. |
 | **Faults** (§7.7) | Members in fault mode, at the top of the page and in red: reason, free space against the floor, since when, what each gave up, its unsent events, space freed; and members within 2× of the floor, as a warning before they fault |
 | **Members** | For each one: node, host, build (`count`, `hash`, and for a local build its `local` digest, flagged *local*), power and weight, idle, free slots, state (loading — connecting or catching up — / ready / upgrading / draining / **fault**, and *lagging* beside it), its `mode` and `gen`, free disk on its substrate's volume, session, time connected, clock offset, the last close; and its `clusters` column, the socket state to every gateway it was given, which is what explains a member this gateway sees and another does not |
 | **Generations** (§6.7) | Per member: its mode, the generation it writes under, the one its last rejoin took, the greatest decided, whether it holds writes from while cut off, and the records it defers for a type its build does not decode (§6.5). Each rejoin, the generation it took, and each reload are in the log |
@@ -3322,7 +3406,7 @@ that member and the Apps block opens on the app's `set-quorum`.
 
 **Every command is a route on the member.** It is `POST /v1/cluster/command/:name`, in
 the host crate (`host/src/commands/`), admin only, its body an optional
-`{ app, from, max_members, confirm }`. The page sends it through
+`{ app, from, max_members, confirm, build, builds, keep, plan }`. The page sends it through
 `/gateway/member/<app>/<node>/v1/cluster/command/…` (`web/src/cluster/page.rs`), which
 forwards only `/v1/cluster/…` down that member's socket — the page is served on every
 host, so the member is named by app rather than by the host it was reached on. An
@@ -3336,7 +3420,7 @@ the reason.
 |---|---|---|
 | `drain` | Stop taking work but stay connected. Releases every claim, world lease and NPC lease, the way fault mode does (§7.7). The gateways route nothing new to it. It keeps sending its own events and answering fetches. | fault mode's hand-back |
 | `undrain` | Take work again, after a catch-up. | |
-| `restart` | `drain`, wait for in-flight requests and the outbox to empty (bounded at 60 s), flush and commit the log, close its sockets with `1001`, then relaunch the same binary with the same arguments. | `self_heal::LaunchSpec::capture` / `relaunch_command` (`host/src/self_heal.rs:171-183`), which already relaunch a daemon with its launch arguments, one-shot flags dropped |
+| `restart` | `drain`, wait for in-flight requests and the outbox to empty (bounded at 60 s), flush and commit the log, close its sockets with `1001`, then relaunch the same binary with the same arguments. | `LaunchSpec::capture` / `relaunch` (`cluster/src/launch.rs`), which `self_heal` and the upgrade's swap use too, one-shot flags dropped |
 | `shutdown` | `drain`, flush, close with `1001`, exit. Nothing restarts it. | |
 | `compact` | A full `compact()` of its substrate (`persistence/mod.rs:2169-2344`), run drained: a member not already drained drains for it and undrains after. Refused in fault mode, and refused when free space is below the substrate's live size, because the scratch copy needs it. | zend's `--compact-substrate` (`zend/src/loading.rs:30`) as a command |
 | `maintain` | One incremental maintenance pass: Drop, Compact or Combine, as the planner picks (`persistence/maintenance.rs`). Allowed in fault mode only as Drop. | zend's `POST /v1/substrate/zend/maintenance`, which it replaces, in the host so npcd has it too |
@@ -3402,36 +3486,60 @@ process stops, every tenant's `/v1/status` line is loading again, its load the s
 step. So a Ctrl-C at the console is visible to anyone watching the member's own page or
 the gateway's.
 
-**Gateway commands**, for maintaining a gateway itself, on the Apps block:
+**Upgrade commands on the gateway**, in the Upgrades block: `POST
+/gateway/upgrade/<name>`, admin only, beside the page (`web/src/cluster/upgrades.rs`),
+its body `{ app, build, from, targets, parallel, confirm }`:
 
-- **`raise-floor` / `cancel-floor`** end an app's upgrade grace period now: they apply
-  or discard the pending floor (§3.5). `raise-floor` starts the rollout only if the build
-  is certified, or if `certify-anyway` was given.
-- **`certify-anyway` / `reject-build`** settle a candidate whose certification failed or
-  passed with gaps (§3.8). The first accepts the build and resumes distribution and
-  rollout. The second keeps the build rejected, drains the candidate, and removes its
-  part files everywhere.
-- **`pause-rollout` / `resume-rollout`** hold the one-at-a-time install between members
-  (§3.9).
+- **`raise-floor` / `cancel-floor`** are this gateway's own. `raise-floor` ends an app's
+  grace period now: the gateway sends its verdict at once, and the floor rises when the
+  group certifies the build, or when `certify-anyway` accepts it (§3.5). It is refused
+  while the candidate still loads, or once its verdict is sent. `cancel-floor` discards
+  the pending floor; the candidate stays on its build.
+- **`certify-anyway` / `reject-build`** settle a build by hand (§3.8). Gateways hold no
+  Paxos state, so the gateway sends each to a ready member of the app as that member's
+  own command, and the member proposes a verdict under the next
+  `certify/<app>/<count>-<hash>/<i>`, which overrules the certification's. The first
+  accepts the build: it resumes distribution and rollout, and a candidate in fault mode
+  for it leaves fault mode. The second keeps the build rejected: the candidate is put in
+  fault mode, any other member on it drains, and its downloads and part files are
+  removed everywhere.
+- **`pause-rollout` / `resume-rollout`** hold or release the automatic one-at-a-time
+  install (§3.9), sent to a member the same way, which proposes `pause/<app>/<n>`.
 - **`rollout`** forces a chosen build onto the app, from a chosen member: `{ build,
   from, targets, parallel }` (§3.11). It is the command behind both *Roll out this
   build…* on a member's row and *Roll back to…* in the Builds held list. It answers with
-  the plan first, and runs only when the build's `count-hash` is typed to confirm it.
-  The plan names every member it would restart, skip or strand.
+  the plan first (`gateway/upgrades/plan.rs`), and runs only when the build's
+  `count-hash` comes back as `confirm`: the gateway then sends the plan's decision to the
+  plan's source member as its `rollout` command, which proposes `rollout/<app>/<n>`. The
+  plan names every member it would restart, skip or strand.
 
-**Member commands for upgrades**, added to the member menu:
+A command sent to a member answers with that member's job and node, and the page
+follows its stream like any other member command.
 
-- **`rollback`** puts this one member on another build by the same in-place swap. It
-  takes the previous build by default, or any build it keeps in `builds/`, chosen from
-  the menu (§3.9). It takes `upgrade/<app>` like a rollout step. To roll back every
-  member, use `rollout`, which also moves the floor. A single member rolled below the
-  floor would be admitted to upgrade and put straight back on the floor's build
+**Member commands for upgrades**, in the member menu, each one also the route the gateway
+sends the commands above to:
+
+- **`certify-anyway` / `reject-build`** `{ app, build }`, **`pause-rollout` /
+  `resume-rollout`** `{ app }`: propose the decision, and finish once the group holds it
+  (bounded at 10 s, refused without a quorum).
+- **`rollout`** `{ app, plan, confirm }`: decide a confirmed plan as `rollout/<app>/<n>`,
+  then, for a downgrade, a rejecting verdict on each build it rolls back from, and an
+  accepting one on the rolled-out build if the group had rejected it.
+- **`rollback`** `{ build? }` puts this one member on another build by the same in-place
+  swap. It takes the previous build by default, or any build it keeps in `builds/`,
+  chosen from the menu (§3.9). It takes `upgrade/<app>` like a rollout step. To roll
+  back every member, use `rollout`, which also moves the floor. A single member rolled
+  below the floor would be admitted to upgrade and put straight back on the floor's build
   (§3.5), so `rollback` refuses a build below the floor and says to use `rollout`.
-- **`prune-builds`** deletes kept builds from `builds/`: those named, or all but the
-  newest *k*. It never deletes a build that a rollout in progress targets. It is
-  destructive, because it removes the way back, so the host name is typed to confirm it.
-- **`upgrade-now`** installs a verified artifact at once, taking `upgrade/<app>` like
-  the rollout does.
+- **`prune-builds`** `{ builds | keep, confirm }` deletes kept builds from `builds/`:
+  those named, or all but the newest *k*. It never deletes a build that a rollout
+  targets. It is destructive, because it removes the way back, so the host name is typed
+  to confirm it.
+- **`upgrade-now`** installs the newest verified build above its own at once, taking
+  `upgrade/<app>` like the rollout does.
+
+**Gateway commands**, for maintaining a gateway itself:
+
 - **`drain-gateway`** stops admitting sockets and tells its members, by closing them with
   `1001`, to carry on through their other clusters. It then waits for its in-flight
   requests (bounded at 60 s) so it can be restarted without failing a request.
@@ -3587,17 +3695,17 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | handshake | the proofs for a fixed key and fixed nonces equal recorded HMAC bytes; a swapped direction label fails; nothing but handshake frames is accepted before `ADMIT`; constant-time compare |
 | close codes | each refusal yields its code and its reason text; 4410 and 4426 stop the dial loop, the rest back off; a second authenticated `HELLO` for a node replaces its session at once and closes the old one 4409, and an unauthenticated one replaces nothing |
 | backoff | under `start_paused`, delays run 250, 500, 1000, 2000, 4000, 8000, 8000 ms, each drawn within `[d/2, d]`, and reset on admission |
-| build floor | equal admits; lower than the floor is admitted *upgrading* when a member holds a floor build that fits it and passes its checks, and closed 4410 otherwise; an upgrading member gets no request, no live event, no Paxos frame, installs without a lease, and is closed 4410 if its install is restored; under `start_paused`, a higher build sets a pending floor and the older members keep serving until the 30-minute deadline, then only the older members of that app are closed 4410; an even newer build inside the window raises the pending floor but not the deadline; `raise-floor` applies it at once and `cancel-floor` discards it; another app is untouched; a restart forgets floor and pending raise |
+| build floor (`gateway/admission.rs`, `gateway/upgrades/tests.rs`, `upgrade/runtime/decide.rs`, `tests/builds.rs`) | the first member sets the floor, equal and higher builds are admitted, and a lower one is closed 4410 naming both builds and the setter, unless a member holds the floor's build, when it is admitted *upgrading*; neither a local build nor one whose `HELLO` says it is rejected sets the floor; a floor set by a rollout moves either way; another app is untouched. A newer build is the candidate and its grace starts only once it is ready; an even newer one replaces it and keeps the deadline. The group's `Pass` raises the floor and its `Fail` rejects the build and drops the pending floor; `raise-floor` sends the verdict at once and `cancel-floor` discards the pending floor. An upgrading member installs the floor's build with no lease, installs nothing once that build failed it, is never ready for work, and is closed 4410 at once when stranded or restored; members below a risen floor are closed 4410 with their reason once it settles, and the rollout ends when none is left below. In process: a member below the floor is admitted upgrading, offered the build, and installs it; a gateway restarted after a rejection takes the next member's build for the floor, not the rejected one |
 | model lock | the first member sets it, a mismatch gets 4412, and the lock clears when the group empties |
 | applied set | `CATCHUP.since` and `HAVE` pack to exact bytes; an event that overtook a lower one is recorded exactly and the lower one is still taken; comparing a `HAVE` with an applied set gives exactly the origins to catch up on |
 | build identity | `count` is the merge base's count with `origin/main`, so a local commit leaves it unchanged; `local` is empty only at the merge base, and changes with a local commit, an edit or an untracked file; the build script reruns on a source edit and not on a `target/` change |
-| local builds | a local build's own listener serves locally whether joined or not; it is never a candidate, never certified, never offers its binaries, is skipped by a rollout, and is not closed 4410 when the floor passes its `count`; otherwise it is routed to, takes leases, replicates its writes and votes; pushed and rebuilt, it is an ordinary member, or a candidate if above the floor |
-| certification | a loading member receives no traffic and its grace period has not started; the window opens when it is ready; the live share and the mirror cap hold to their percentages; `Exact` mirrors ignore declared volatile fields and catch any other difference; `Shape` catches a changed structure, not a changed value; a `None` route is never mirrored, and a route declaring nothing is `None`; on generated samples, the error test passes equal rates and fails a worse candidate at 99% confidence, and the latency ratios pass and fail at their bounds; a route under its sample minimum reports a gap; a failure puts the candidate in fault mode, cancels the pending floor and stops distribution; two gateways disagreeing is a failure; each gateway's `VERDICT` reaches the candidate, which proposes `certify/<app>/<build>` once every gateway it is joined to has sent one, and at once on a failure; a candidate faulted by certification keeps applying events; a `tokerad` candidate is judged per app |
-| distribution | `BUILD_OFFER` lists every sibling binary reporting the same build, plus the UI archive; a member fetches only its own kind and platform, and with no match it is stranded with the reason; a transfer killed at random offsets resumes from the `.part` length; a hash mismatch discards and restarts; a member that verified becomes a source and later fetches spread across sources; chunks travel on the catch-up lane only; a rejected build's part files are removed everywhere |
-| install | members upgrade strictly one at a time under `upgrade/<app>`, and a `tokerad` takes both apps' leases; each drains, moves the running executable and UI into `builds/<count>-<hash>/`, places the artifact at the same path, and relaunches through `LaunchSpec`, with the same arguments, one-shot flags dropped, and the same working directory (the spawn is asserted on, not run); the old daemon starts the watchdog from the kept build with `--upgrade-watchdog` and exits before the new binary is launched, so the two never run at once; the watchdog loads no model, exits on `upgrade/ok`, and restores the old executable and UI and relaunches them with `--upgrade-failed` when the child exits or is not ready in time; a member never retries a build that failed it; members left behind are closed 4410 when the rollout ends; `rollback` swaps back from the kept build |
-| kept builds | a successful swap keeps the old build in `builds/<count>-<hash>/` with its UI and `build.json`, and prunes the oldest beyond `--keep-builds`; a restored swap prunes nothing; a rollback moves the running build into `builds/`; a build a rollout targets is never pruned; fault mode deletes none; a kept build is announced with `BUILD_HAVE` and served like a verified artifact; `prune-builds` without the host name is refused |
-| build compatibility | `--build-info` reports `log_format`, `record_tags` and `model`; a target whose substrate has another log format, holds a record type the build lacks (from the open census), or is locked to another model is stranded with that reason, and its install is never attempted |
-| forced rollout | the plan lists direction, floors, each target's artifact source (own kept copy matched on count, hash and SHA-256, or a fetch with its bytes), skipped and stranded members, and the builds a downgrade rejects; a local build, a source lacking the build, no reachable quorum, and `parallel` beyond ready members minus the quorum are each refused; without the typed `count-hash` nothing runs; once `rollout/<app>/<n>` is decided, both of two in-process gateways apply it, and a gateway restarted mid-rollout continues it with the decided floor; the floor moves at once in either direction; a pending floor and another candidate's certification are cancelled; a rejected build rolled out is accepted and its candidate leaves fault mode; a downgrade rejects the builds above it, a member returning on one is admitted drained, and a build never run stays eligible; a target holding the build fetches nothing; at most `parallel` members install at once; a second rollout supersedes the first after the current swap; a downgrade across a new record type strands every member |
+| local builds | a local build's own listener serves locally whether joined or not (`member/listener.rs`); it never sets the floor, is never a candidate, never installs or fetches automatically, and is skipped by a rollout's default targets and never closed 4410 for being behind (`decide.rs`, `upgrades/tests.rs`, `plan/tests.rs`); otherwise it is routed to, takes leases, replicates its writes and votes like any member |
+| certification (`gateway/upgrades/{tests,stats,mirror,verdict}.rs`, `upgrade/runtime/candidate.rs`, `web/src/cluster/mirror.rs`, `host/src/guard.rs`, `tests/builds.rs`) | a loading candidate takes no share and its grace has not started; the window opens when it is ready; the live share (every tenth pick) and the mirror cap (a fifth) hold to their percentages; samples and mismatches are kept per route; `Exact` ignores the declared volatile fields only, `Shape` catches a changed structure and not a changed value, and a different status differs in every mode; a route declares its mirror mode beside its dispatch and a write's is `None`; only an answer whose length is declared and within the cap is buffered, and a 5xx or the gateway's own failure counts as an error; on generated samples the error test passes equal rates and fails a worse candidate, the latency ratios hold at their bounds, a route under its minimum is a gap, and the build fails on any failing route and otherwise passes with gaps; quantiles are nearest-rank; the verdict goes at the deadline, at once on a failure, and again every 10 s until the group decides; the candidate proposes once every socket has answered, at once on a failure, naming the failing routes. In process: a certified build's verdict is decided as `certify/zend/12-h12` with `Pass` by `certification`, and a failing one puts the candidate in fault mode with the failing route as the reason and raises nothing |
+| distribution (`upgrade/{artifacts,parts,ui_archive}.rs`, `upgrade/runtime/{fetch,served}.rs`, `gateway/upgrades/held.rs`, `tests/builds.rs`) | only sibling binaries reporting the same build are offered, with the UI as one archive for any platform; the UI tree packs to exact bytes, unpacks to the tree it came from, and refuses a path out of its directory; a member fetches only its own kind and platform; a chunk is at most 1 MiB from its offset; a download resumes from its `.part` and verifies, a mismatch discards and restarts, and a rejected build's downloads are removed; the running build, a kept build and a verified download are each served; the gateway tracks holders per artifact and forgets a member that leaves. In process: the older members fetch the candidate's binary while it certifies, and the verified file is the candidate's |
+| install (`upgrade/{swap,watchdog,handoff,os}.rs`, `cluster/src/launch.rs`, `upgrade/runtime/{install,decide,refused}.rs`, `host/src/cluster/upgrade.rs`, `agent/src/install.rs`, `tests/builds.rs`) | a fetched build takes the executable's and UI's paths and the old one is kept, a restore puts the old build back, a rollback swaps with a kept build, and a source missing the served UI moves nothing; the watchdog is the old executable run with its plan, and the plan round-trips through its file; under a fake process table, a ready build stands, launched only once the old process is gone; a build that exits is restored, its failure written with its last 40 log lines, and the old build relaunched with `--upgrade-failed <count>-<hash>`; one not ready in time is stopped and restored; and an old daemon that hangs is stopped first; `LaunchSpec` captures into the same command, drops the one-shot flags, and takes extra arguments and another executable; a refused build is remembered; an install names its leases by app. In process: older members install one at a time under `upgrade/zend`, the second waiting while the lease is held through the first one's restart |
+| kept builds (`upgrade/kept.rs`) | kept builds list newest retired first; pruning keeps the newest *N* and every protected build; removing named builds refuses one not kept and one a rollout targets, naming it; the builds directory is beside the executable |
+| build compatibility (`upgrade/compat.rs`, `version/info.rs`, `host/src/build_info.rs`, `persistence/held_types.rs`) | a build that opens everything fits, and each mismatch — log format, a record type outside its tags, another model — says why in its own words; the `--build-info` answer is exact JSON, an agent's opens nothing, output that is not an answer is none, and only the flag alone asks; the host's answer carries its log format, every record tag it writes and the preset; the substrate's census holds every type found at open and every type appended since |
+| forced rollout (`gateway/upgrades/plan/tests.rs`, `gateway/upgrades/tests.rs`, `upgrade/runtime/{decide,commands}.rs`, `tests/builds.rs`) | a downgrade is planned member by member, each target's source its own kept copy or a fetch with its bytes, with skipped and stranded members and the builds it rejects; a downgrade across a new record type is stranded everywhere; a local build, a source lacking the build, no reachable quorum and `parallel` beyond ready members minus the quorum are each refused; a decided rollout moves the floor once, either way, cancels another candidate and marks what it rejects; a rollout naming a member installs its build down as well as up, over a local build and a refused one, under one of its leases, the latest rollout winning. In process: a downgrade's plan fetches nothing, the floor falls at once, a member installs from its own `builds/` under `upgrade/zend/0` with the build protected, the others wait, and the gateway learns the build above rejected |
 | UI pinning | a page's HTML sets `tokera_ui_<app>`; every UI request with it reaches the same member; a pinned member that leaves or faults is replaced and the cookie rewritten; API requests ignore it |
 | dispatch | the route table and requests yield the expected member for each class; the `x-tokera-node` override is admin-only; the `Body` key reads ≤ 8 MiB |
 | modes | a route with `cluster:` and no ready member goes to its configured URL; the first ready member switches it; requests in flight to the URL finish there; the last member leaving reverts it; a route without `cluster:` never switches |
@@ -3928,22 +4036,34 @@ an agent.
 **Builds on chunks 3 and 4.** Chunk 2 already stamps every binary with its version, and
 chunk 4 already enforces the floor. This chunk is the machinery on top:
 
-- `--build-info` with its compatibility fields (§3.9).
+- `--build-info` with its compatibility fields (§3.9): `cluster::version::info`,
+  answered first by every main (`host::build_info::first`), and the substrate's census
+  of the record types it holds (`persistence/held_types.rs`, `Store::census`).
 - The loading gate on the grace period.
 - Certification at the gateway: the live share, the mirror modes on every route, the
-  statistics, and `VERDICT` with the candidate's `certify/<app>/<build>` decision (§3.8).
-- Distribution with resumable part files.
+  statistics, and `VERDICT` with the candidate's
+  `certify/<app>/<count>-<hash>/<i>` decision (§3.8) — `cluster::gateway::upgrades`,
+  `web/src/cluster/mirror.rs` and `upgrade/runtime/candidate.rs`; the gateway's
+  `floor_grace_minutes` and `canary_share`.
+- Distribution with resumable part files (`upgrade/parts.rs`, `upgrade/runtime/fetch.rs`)
+  and the gateway's table of held builds.
 - The one-at-a-time install under `upgrade/<app>`, the in-place swap, the
-  `--upgrade-watchdog` process, and the restore.
-- Kept builds in `builds/` (§3.9).
-- The upgrading state for members admitted below the floor (§3.5).
-- Forced rollouts and rollback as `rollout/<app>/<n>` decisions (§3.11).
+  `--upgrade-watchdog` process, and the restore (`upgrade/{swap,watchdog,handoff,os}.rs`;
+  the installers in `host/src/cluster/upgrade.rs` and `agent/src/install.rs`).
+  `LaunchSpec` moves from `self_heal` to `cluster::launch`, which both use.
+- Kept builds in `builds/` (§3.9, `upgrade/kept.rs`).
+- The upgrading state for members admitted below the floor (§3.5), and agents following
+  the daemons' floor.
+- Forced rollouts and rollback as `rollout/<app>/<n>` decisions (§3.11), the plan
+  (`gateway/upgrades/plan.rs`), and `rejected` in `HELLO`.
 - Local builds (§3.10).
-- The Upgrades block and its commands.
+- The Upgrades block, `POST /gateway/upgrade/<name>`, and the member commands of §12.4.
 
 **Tests.** The build-floor, build-identity, local-build, certification, distribution,
-install, kept-build, compatibility and forced-rollout tables (§14.1). The process spawn
-is asserted on, never run.
+install, kept-build, compatibility and forced-rollout tables (§14.1), and
+`cluster/tests/builds.rs`: members of one process, each a machine of its own in a
+temporary directory whose executable is a file holding its `--build-info` answer. The
+process spawn is asserted on, never run.
 
 **Exit.** A pushed build rebuilt on one machine certifies, reaches the others, and
 installs itself one member at a time. A bad install restores itself, and a rollback swaps

@@ -16,7 +16,11 @@
 //! - [`replicate`]: a member's substrate replication — events out and in,
 //!   catch-ups, and the rejoin after a cut-off.
 //! - [`machine`]: the host as `CAPACITY` reports it.
-//! - [`version`]: this build's `count`, `hash` and `local`.
+//! - [`version`]: this build's `count`, `hash` and `local`, and
+//!   `--build-info`.
+//! - [`upgrade`]: a member's side of A/B upgrades — artifacts, fetching,
+//!   compatibility, the swap, kept builds and the watchdog.
+//! - [`launch`]: how this process was launched, to start an identical one.
 //!
 //! No candle and no CUDA: the gateway links this crate, and a record inside an
 //! `EVENT` stays opaque bytes here.
@@ -33,10 +37,12 @@ pub mod fragment;
 pub mod frame;
 pub mod gateway;
 pub mod handshake;
+pub mod launch;
 pub mod machine;
 pub mod member;
 pub mod pipe;
 pub mod replicate;
 pub mod session;
+pub mod upgrade;
 pub mod version;
 pub mod wire;

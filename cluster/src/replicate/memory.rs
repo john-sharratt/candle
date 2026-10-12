@@ -172,6 +172,8 @@ pub struct MemoryStore {
     disk: Mutex<Disk>,
     /// Whether a test write fails: the volume is full.
     full: AtomicBool,
+    /// The record types it reports holding, set by the tests.
+    census: Mutex<Vec<u8>>,
 }
 
 impl MemoryStore {
@@ -190,7 +192,13 @@ impl MemoryStore {
                 write_failed: false,
             }),
             full: AtomicBool::new(false),
+            census: Mutex::new(Vec::new()),
         }
+    }
+
+    /// It holds record types `tags` (§3.9).
+    pub fn set_census(&self, tags: Vec<u8>) {
+        *self.census.lock().unwrap_or_else(|e| e.into_inner()) = tags;
     }
 
     /// The volume now has `free` of `total` bytes free; `full` says whether a
@@ -531,6 +539,28 @@ impl Store for MemoryStore {
         Vec::new()
     }
 
+    fn census(&self) -> Vec<u8> {
+        self.census
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn decisions(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        let mut full = DECISION.to_vec();
+        full.extend_from_slice(prefix.as_bytes());
+        self.inner()
+            .latest(self.node, |k| k.starts_with(&full))
+            .into_iter()
+            .map(|(k, (_, v))| {
+                (
+                    String::from_utf8_lossy(&k[DECISION.len()..]).into_owned(),
+                    v,
+                )
+            })
+            .collect()
+    }
+
     fn tombstones(&self) -> Tombstones {
         Tombstones::default()
     }
@@ -660,6 +690,23 @@ mod tests {
         s.record_decision(b"gen/3", &1u64.to_le_bytes());
         assert_eq!(s.generation(), 3);
         assert_eq!(s.decision(b"gen/3"), Some(1u64.to_le_bytes().to_vec()));
+    }
+
+    /// The decisions under a prefix are listed by their keys, nothing else.
+    #[test]
+    fn decisions_are_listed_by_prefix() {
+        let s = MemoryStore::new(1);
+        s.record_decision(b"certify/zend/7-abc/1", b"one");
+        s.record_decision(b"certify/zend/7-abc/2", b"two");
+        s.record_decision(b"certify/npcd/7-abc/1", b"other");
+        assert_eq!(
+            s.decisions("certify/zend/7-abc/"),
+            [
+                ("certify/zend/7-abc/1".to_string(), b"one".to_vec()),
+                ("certify/zend/7-abc/2".to_string(), b"two".to_vec()),
+            ]
+        );
+        assert!(s.decisions("rollout/").is_empty());
     }
 
     /// A turn ranked below a turn held asks for a reload; one above does not.

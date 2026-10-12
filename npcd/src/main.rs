@@ -10,6 +10,8 @@
 //! names its address: `--host 0.0.0.0 --port 8081`.
 
 use clap::Parser;
+use cluster::version::info::NPCD;
+use host::build_info::first;
 use host::{run, HostArgs, HostConfig, Tenant};
 use npcd::tenant::NpcdArgs;
 
@@ -26,6 +28,7 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    first(NPCD);
     let cli = Cli::parse();
     let tenant: Box<dyn Tenant> = Box::new(cli.npcd.resolve()?);
     run(

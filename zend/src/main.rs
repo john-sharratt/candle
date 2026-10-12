@@ -19,6 +19,8 @@
 //! beside it.
 
 use clap::Parser;
+use cluster::version::info::ZEND;
+use host::build_info::first;
 use host::{run, HostArgs, HostConfig, Tenant};
 use zend::cli::ZendArgs;
 
@@ -36,6 +38,7 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    first(ZEND);
     let cli = Cli::parse();
     let tenant: Box<dyn Tenant> = Box::new(cli.zend.resolve()?);
     run(

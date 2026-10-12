@@ -11,6 +11,10 @@ pub struct Hello {
     pub node: u64,
     pub host: String,
     pub build: BuildId,
+    /// The group rejected this build, by the certification verdicts in the
+    /// member's own substrate: it never sets a floor and is never a candidate,
+    /// even at a gateway that has not yet heard the verdict (§3.11).
+    pub rejected: bool,
     /// The model its substrate is bound to; an agent sends none.
     pub model: Option<ModelId>,
     pub power: u32,
@@ -28,7 +32,8 @@ impl Hello {
             .u64(self.node)
             .str(&self.host);
         self.build.write(w);
-        w.option(self.model.as_ref(), |w, m| m.write(w))
+        w.bool(self.rejected)
+            .option(self.model.as_ref(), |w, m| m.write(w))
             .u32(self.power)
             .list(&self.repos, |w, r| r.write(w))
             .u64(self.now_ms)
@@ -42,6 +47,7 @@ impl Hello {
             node: r.u64()?,
             host: r.str()?,
             build: BuildId::read(r)?,
+            rejected: r.bool()?,
             model: r.option(ModelId::read)?,
             power: r.u32()?,
             repos: r.list(RepoAd::read)?,

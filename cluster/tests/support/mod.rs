@@ -25,6 +25,7 @@ use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
 use cluster::pipe::{Message, PipeRx};
 use cluster::replicate::{Applied, Disk, Listing, MemoryStore, Replication, Store, Tombstones};
 use cluster::session::VirtualConn;
+use cluster::upgrade::runtime::Upgrader;
 
 pub const APP: &str = "zend";
 
@@ -138,14 +139,55 @@ pub fn member(
     open: bool,
 ) -> Node {
     let slots: Vec<HubSlot> = hubs.iter().map(|h| slot(h)).collect();
-    build(&slots, node, store.clone(), store, votes, open)
+    build(&slots, node, store.clone(), store, votes, open, one(), None)
 }
 
 /// Member `node` on the gateways wherever `slots` say they are.
 pub fn member_on(slots: &[HubSlot], node: u64, store: Arc<MemoryStore>) -> Node {
-    build(slots, node, store.clone(), store, MemoryVotes::new(), true)
+    build(
+        slots,
+        node,
+        store.clone(),
+        store,
+        MemoryVotes::new(),
+        true,
+        one(),
+        None,
+    )
 }
 
+/// The build every member runs unless a test says otherwise.
+pub fn one() -> BuildId {
+    BuildId {
+        count: 1,
+        hash: "h1".into(),
+        local: String::new(),
+    }
+}
+
+/// Member `node` at `build_id`, upgrading through `upgrader`, which it is
+/// registered with before it dials.
+pub fn member_upgrading(
+    hubs: &[&Arc<Hub>],
+    node: u64,
+    store: Arc<MemoryStore>,
+    build_id: BuildId,
+    upgrader: &Arc<Upgrader>,
+) -> Node {
+    let slots: Vec<HubSlot> = hubs.iter().map(|h| slot(h)).collect();
+    build(
+        &slots,
+        node,
+        store.clone(),
+        store,
+        MemoryVotes::new(),
+        true,
+        build_id,
+        Some(upgrader),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build(
     hubs: &[HubSlot],
     node: u64,
@@ -153,6 +195,8 @@ fn build(
     store: Arc<MemoryStore>,
     votes: MemoryVotes,
     open: bool,
+    build_id: BuildId,
+    upgrader: Option<&Arc<Upgrader>>,
 ) -> Node {
     let replication = Replication::open(replicated, Box::new(votes.clone())).unwrap();
     let app = AppMember::new(
@@ -160,11 +204,7 @@ fn build(
             app: APP.into(),
             node,
             host: format!("m{node}"),
-            build: BuildId {
-                count: 1,
-                hash: "h1".into(),
-                local: String::new(),
-            },
+            build: build_id,
             model: Some(ModelId {
                 arch: "Qwen4Exp".into(),
                 weights: [1; 32],
@@ -196,6 +236,9 @@ fn build(
         Some(replication),
         Instant::now(),
     );
+    if let Some(u) = upgrader {
+        u.register(&app);
+    }
     let mut opens = Vec::new();
     let mut pauses = Vec::new();
     let mut tasks = Vec::new();
@@ -355,6 +398,12 @@ impl Store for Recording {
     fn deferred(&self) -> Vec<(String, u64, usize)> {
         self.inner.deferred()
     }
+    fn census(&self) -> Vec<u8> {
+        self.inner.census()
+    }
+    fn decisions(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        self.inner.decisions(prefix)
+    }
     fn tombstones(&self) -> Tombstones {
         self.inner.tombstones()
     }
@@ -369,7 +418,7 @@ pub fn member_over(
     votes: MemoryVotes,
 ) -> Node {
     let slots: Vec<HubSlot> = hubs.iter().map(|h| slot(h)).collect();
-    build(&slots, node, store, inner, votes, true)
+    build(&slots, node, store, inner, votes, true, one(), None)
 }
 
 /// Whether every store holds the same records.

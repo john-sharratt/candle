@@ -9,11 +9,13 @@ use serde::{Serialize, Serializer};
 use super::log::Entry;
 use super::registry::MemberView;
 use super::traffic::TrafficView;
+use super::upgrades::held::HeldBuild;
+use super::upgrades::UpgradesView;
 use super::worlds_view::{DisconnectedRow, WorldView};
 use crate::coord::{CoordState, FaultView};
 use crate::frame::{BuildId, MemberState};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HubStatus {
     pub gateway: String,
     pub now_ms: u64,
@@ -30,6 +32,11 @@ pub struct HubStatus {
     pub disconnected: Vec<DisconnectedRow>,
     pub refusals: Vec<Refusal>,
     pub traffic: TrafficView,
+    /// The Upgrades block: per app, its candidate and certification, and its
+    /// rollout (§3.8–§3.11).
+    pub upgrades: Vec<UpgradesView>,
+    /// Every build any member holds, newest first.
+    pub builds: Vec<HeldBuild>,
     pub log: Vec<Entry>,
 }
 
@@ -77,6 +84,11 @@ pub struct AppView {
     #[serde(serialize_with = "build_opt")]
     pub floor: Option<BuildId>,
     pub floor_set_by: Option<String>,
+    /// A newer build's pending floor, and when its grace period ends — `None`
+    /// while its candidate loads (§3.5).
+    #[serde(serialize_with = "build_opt")]
+    pub pending_floor: Option<BuildId>,
+    pub grace_ends_ms: Option<u64>,
     pub model_lock: Option<String>,
     pub members: usize,
     pub ready: usize,

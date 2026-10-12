@@ -117,6 +117,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 node: 0x1122,
                 host: ".5".into(),
                 build: build(),
+                rejected: true,
                 model: Some(model.clone()),
                 power: 170,
                 repos: vec![RepoAd {
@@ -133,6 +134,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u64(0x1122)
                 .s(".5")
                 .build(&build())
+                .u8(1)
                 .u8(1)
                 .s("Qwen4Exp")
                 .raw(&[1; 32])

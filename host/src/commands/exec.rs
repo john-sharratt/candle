@@ -1,10 +1,13 @@
 //! What each maintenance command does (`docs/replicated_substrate.md` §12.4),
-//! run as its job. A command that cannot run says why and changes nothing.
+//! run as its job. A command that cannot run says why and changes nothing. The
+//! upgrade commands go to the process's upgrades (§3.8–§3.11).
 
 use std::sync::Arc;
 
 use candle_conversation::projection::Conversation;
 use cluster::replicate::Replicator;
+use cluster::upgrade::decisions::Settled;
+use cluster::upgrade::runtime::Upgrader;
 use serde_json::{json, Map, Value};
 use tokio::task::spawn_blocking;
 
@@ -73,14 +76,91 @@ impl Commands {
         Ok(targets)
     }
 
-    /// Run `command` on `app` as `job`.
+    /// The process's upgrades, with `--cluster`.
+    fn upgrader(&self) -> Result<Arc<Upgrader>, String> {
+        self.cluster
+            .as_ref()
+            .map(|c| c.upgrader().clone())
+            .ok_or_else(|| "this daemon runs without --cluster: it upgrades with no group".into())
+    }
+
+    /// Run `command` on `app` as `job`, for `by`.
     pub async fn exec(
         &self,
         job: &Arc<Job>,
         command: &Command,
         app: Option<&str>,
+        by: &str,
     ) -> Result<Value, String> {
         match command {
+            Command::CertifyAnyway { build } | Command::RejectBuild { build } => {
+                let up = self.upgrader()?;
+                let (result, reason) = match command {
+                    Command::CertifyAnyway { .. } => (Settled::Pass, "certify-anyway"),
+                    _ => (Settled::Fail, "reject-build"),
+                };
+                let mut out = Map::new();
+                for (name, _) in self.replicators(app)? {
+                    let n = up.settle(name, build, result, by, reason).await?;
+                    job.step(name, format!("certify/{name}/{build}/{n}: {reason}"));
+                    out.insert(name.into(), json!({ "n": n }));
+                }
+                Ok(Value::Object(out))
+            }
+            Command::PauseRollout | Command::ResumeRollout => {
+                let up = self.upgrader()?;
+                let paused = *command == Command::PauseRollout;
+                let mut out = Map::new();
+                for (name, _) in self.replicators(app)? {
+                    let n = up.pause(name, paused, by).await?;
+                    job.step(
+                        name,
+                        if paused {
+                            "the rollout holds between members"
+                        } else {
+                            "the rollout goes on"
+                        },
+                    );
+                    out.insert(name.into(), json!({ "n": n, "paused": paused }));
+                }
+                Ok(Value::Object(out))
+            }
+            Command::Rollout { plan } => {
+                let up = self.upgrader()?;
+                let app = app.ok_or("rollout needs the `app` it rolls out")?;
+                let n = up.rollout(app, plan).await?;
+                job.step(
+                    app,
+                    format!(
+                        "rollout/{app}/{n}: {} onto {} members, {} at a time",
+                        plan.build,
+                        plan.targets.len(),
+                        plan.parallel
+                    ),
+                );
+                Ok(json!({ "n": n }))
+            }
+            Command::Rollback { build } => {
+                let name = self.upgrader()?.rollback(build.as_deref())?;
+                job.step(
+                    "rollback",
+                    format!("{name}, from builds/, once upgrade/<app> is this member's"),
+                );
+                Ok(json!({ "build": name }))
+            }
+            Command::UpgradeNow => {
+                let name = self.upgrader()?.upgrade_now()?;
+                job.step(
+                    "upgrade",
+                    format!("{name}, once upgrade/<app> is this member's"),
+                );
+                Ok(json!({ "build": name }))
+            }
+            Command::PruneBuilds { builds, keep } => {
+                let gone = self.upgrader()?.prune_builds(builds, *keep)?;
+                job.step("prune", format!("deleted {} kept builds", gone.len()));
+                Ok(json!({ "deleted": gone }))
+            }
             Command::Drain => {
                 let mut out = Map::new();
                 for (name, r) in self.replicators(app)? {
@@ -117,12 +197,11 @@ impl Commands {
                 }
                 job.step(
                     "stopping",
-                    match ending {
-                        Ending::Relaunch => {
-                            "draining, sending what it wrote, then starting again with the same \
-                             arguments"
-                        }
-                        Ending::Exit => "draining, sending what it wrote, then exiting",
+                    if ending == Ending::Relaunch {
+                        "draining, sending what it wrote, then starting again with the same \
+                         arguments"
+                    } else {
+                        "draining, sending what it wrote, then exiting"
                     },
                 );
                 Ok(json!({"ending": command.name()}))

@@ -1,5 +1,6 @@
-//! Fault mode for a full disk (§7.7). A member whose volume falls below the
-//! floor, or whose write failed for lack of space, stays connected and says so:
+//! Fault mode for a full disk (§7.7), and for a build that failed
+//! certification (§3.8). A member whose volume falls below the floor, or whose
+//! write failed for lack of space, stays connected and says so:
 //! it hands back its claims and leases, proposes nothing, stops applying
 //! remote events and sending `ACK`s — but keeps voting through its vote
 //! journal, keeps sending its own events and answering fetches, and frees what
@@ -26,9 +27,20 @@ pub fn floor(total: u64) -> u64 {
     FLOOR_MIN.max(total / 100)
 }
 
+/// Why a member is in fault mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// Its disk is full: it leaves once space is back (§7.7).
+    Disk,
+    /// Its build failed certification (§3.8): it leaves when the build is
+    /// accepted after all, never by itself.
+    Certification,
+}
+
 /// A member in fault mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fault {
+    pub cause: Cause,
     pub reason: String,
     pub since_ms: u64,
     pub claims_released: usize,
@@ -89,9 +101,17 @@ impl Replicator {
         let disk = tokio::task::spawn_blocking(move || store.disk())
             .await
             .ok()?;
+        // A build that failed certification stays faulted whatever the disk
+        // says: space coming back is no reason to take work.
+        if self
+            .fault()
+            .is_some_and(|f| f.cause == Cause::Certification)
+        {
+            return Some(disk);
+        }
         let faulted = self.faulted();
         match judge(disk, faulted) {
-            Verdict::Enter(reason) => self.enter_fault(reason, disk).await,
+            Verdict::Enter(reason) => self.enter_fault(Cause::Disk, reason, disk).await,
             Verdict::Stay if faulted => self.free_space(disk).await,
             Verdict::TryLeave => {
                 self.free_space(disk).await;
@@ -108,11 +128,12 @@ impl Replicator {
         Some(disk)
     }
 
-    async fn enter_fault(self: &Arc<Self>, reason: String, disk: Disk) {
+    async fn enter_fault(self: &Arc<Self>, cause: Cause, reason: String, disk: Disk) {
         let released = self.hand_back().await;
         {
             let mut s = self.state();
             s.fault = Some(Fault {
+                cause,
                 reason: reason.clone(),
                 since_ms: now_ms(),
                 claims_released: released,
@@ -145,8 +166,41 @@ impl Replicator {
         }
     }
 
-    /// Space is back and a test write succeeded: catch up on what was relayed
-    /// meanwhile, then take work again.
+    /// Its build failed certification (§3.8): fault mode, with the failing
+    /// routes as the reason. It still votes and sends what it wrote; the
+    /// gateways route nothing to it.
+    pub async fn certification_failed(self: &Arc<Self>, reason: String) {
+        if self
+            .fault()
+            .is_some_and(|f| f.cause == Cause::Certification)
+        {
+            return;
+        }
+        let store = self.store.clone();
+        let disk = tokio::task::spawn_blocking(move || store.disk())
+            .await
+            .unwrap_or_default();
+        self.enter_fault(
+            Cause::Certification,
+            format!("certification failed: {reason}"),
+            disk,
+        )
+        .await;
+    }
+
+    /// Its build was accepted after all (`certify-anyway`, or rolled out):
+    /// leave a certification fault, catching up first.
+    pub fn certification_accepted(self: &Arc<Self>) {
+        if self
+            .fault()
+            .is_some_and(|f| f.cause == Cause::Certification)
+        {
+            self.leave_fault();
+        }
+    }
+
+    /// Space is back and a test write succeeded, or a failed build was
+    /// accepted: catch up on what was relayed meanwhile, then take work again.
     fn leave_fault(self: &Arc<Self>) {
         let sockets: Vec<usize> = {
             let mut s = self.state();

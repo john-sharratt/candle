@@ -1,11 +1,13 @@
 //! Field types more than one frame carries.
 
+use serde::{Deserialize, Serialize};
+
 use crate::wire::{Reader, WireError, Writer};
 
 /// A build's version (§3.5): `count` of `origin/main` commits HEAD contains,
 /// `hash` of that merge base, and `local`, a digest of anything beyond it —
 /// empty for a build exactly at the merge base.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BuildId {
     pub count: u32,
     pub hash: String,

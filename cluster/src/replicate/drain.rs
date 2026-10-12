@@ -10,6 +10,7 @@ use std::sync::Arc;
 use super::catchup::Purpose;
 use super::lease::LeaseEvent;
 use super::replicator::Replicator;
+use super::upgrade::is_upgrade_lease;
 
 /// What a drain handed back.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -29,13 +30,19 @@ impl Replicator {
         self.member().map_or(0, |m| m.release_all(through))
     }
 
-    /// Hand back every lease this member holds; how many. `through` is its own
-    /// `oseq`, which the next holder waits for (§9.6).
+    /// Hand back every lease this member holds but an upgrade's; how many.
+    /// `through` is its own `oseq`, which the next holder waits for (§9.6).
+    /// An `upgrade/<app>` lease stays: the member holding it is draining to
+    /// install, and the next member waits for it to be back (§3.9).
     pub fn release_leases(self: &Arc<Self>, through: u64) -> usize {
         let now = self.now();
         let (outs, keys) = {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
-            let held = p.held(now);
+            let held: Vec<Vec<u8>> = p
+                .held(now)
+                .into_iter()
+                .filter(|k| !is_upgrade_lease(k))
+                .collect();
             let mut outs = Vec::new();
             for key in &held {
                 match p.release(key, through, now) {
@@ -61,7 +68,9 @@ impl Replicator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .held(now)
-                .len()
+                .iter()
+                .filter(|k| !is_upgrade_lease(k))
+                .count()
         };
         let claims = self.hand_back().await;
         if let Some(m) = self.member() {

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{ArgAction, Args};
+use cluster::upgrade::kept::KEEP_DEFAULT;
 use serde::Deserialize;
 
 use crate::cluster::ClusterSettings;
@@ -89,6 +90,18 @@ pub struct HostArgs {
     #[arg(long, value_name = "FILE")]
     pub agent: Option<PathBuf>,
 
+    /// How many previous builds to keep beside the executable, in `builds/`,
+    /// for rollback (§3.9).
+    #[arg(long, value_name = "N", default_value_t = KEEP_DEFAULT)]
+    pub keep_builds: usize,
+
+    /// The build an install restored this process from, `count-hash`: it is
+    /// never tried again (§3.9). The upgrade's watchdog sets it; a relaunch
+    /// drops it, and `tokerad.yaml` cannot set it.
+    #[arg(long, value_name = "COUNT-HASH")]
+    #[serde(skip)]
+    pub upgrade_failed: Option<String>,
+
     /// Increase log verbosity. -v = DEBUG, -vv = TRACE.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -108,6 +121,8 @@ impl Default for HostArgs {
             cluster_affinity_idle: 10,
             cluster_quorum_max: None,
             agent: None,
+            keep_builds: KEEP_DEFAULT,
+            upgrade_failed: None,
             verbose: 0,
         }
     }
@@ -268,6 +283,28 @@ mod tests {
             ..HostArgs::default()
         };
         assert!(clusterless.cluster("m".into()).is_err());
+    }
+
+    /// `--keep-builds` reads the same from the flag and the YAML, and
+    /// defaults to 5; `--upgrade-failed` is a flag only — a file read at every
+    /// start cannot name a build that failed once.
+    #[test]
+    fn the_upgrade_flags_parse() {
+        let flags = Cli::try_parse_from([
+            "x",
+            "--keep-builds",
+            "3",
+            "--upgrade-failed",
+            "4815-9f8e7d6",
+        ])
+        .unwrap()
+        .host;
+        assert_eq!(flags.keep_builds, 3);
+        assert_eq!(flags.upgrade_failed.as_deref(), Some("4815-9f8e7d6"));
+        let yaml: HostArgs = serde_yaml::from_str("keep_builds: 3\n").unwrap();
+        assert_eq!(yaml.keep_builds, 3);
+        assert_eq!(HostArgs::default().keep_builds, 5);
+        assert!(serde_yaml::from_str::<HostArgs>("upgrade_failed: 1-a\n").is_err());
     }
 
     /// `--local-signin` is for a daemon with no gateway; beside one it is

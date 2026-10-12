@@ -1,8 +1,8 @@
 //! What operating a cluster member asks of its substrate
 //! (`docs/replicated_substrate.md` §7.7, §12): whether a write has failed for
 //! lack of space and whether one succeeds now, how large the live log is, the
-//! records held back for a type this build does not read, the tombstones
-//! waiting to expire, and the read-only liveness audit.
+//! record types it holds, the records held back for a type this build does not
+//! read, the tombstones waiting to expire, and the read-only liveness audit.
 
 use std::collections::BTreeMap;
 
@@ -40,6 +40,12 @@ impl Conversation {
         let p = self.persistence.lock().unwrap();
         let view = self.read();
         p.segment_liveness(&view).values().sum()
+    }
+
+    /// Every record type the substrate holds, by tag: what a build replacing
+    /// this one must decode (§3.9).
+    pub fn held_record_tags(&self) -> Vec<u8> {
+        self.persistence.lock().unwrap().held_record_tags()
     }
 
     /// Records held back because this build does not decode their type, by

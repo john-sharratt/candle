@@ -45,6 +45,7 @@ mod expiry_tests;
 pub mod flush;
 pub mod header_index;
 mod held_groups;
+mod held_types;
 pub mod identity;
 pub mod inherit;
 pub mod integrity;
@@ -577,6 +578,11 @@ pub struct SubstratePersistence {
     /// updated: it is a *baseline*, and re-basing it after a rewrite would erase
     /// the very comparison it exists for.
     open_census: RecordCensus,
+    /// Every record type the substrate has held since it opened, as bit `tag`:
+    /// the open walk's census, and each type appended since — written here or
+    /// applied from another member. What a build replacing this one must
+    /// decode, or it would not see them (`docs/replicated_substrate.md` §3.9).
+    held_types: u32,
     /// The exclusive lock a writable handle holds on its directory
     /// ([`WriterLock`]) until it drops or [`Self::release_writer`] hands the
     /// directory on; `None` on a read-only handle.
@@ -1196,6 +1202,7 @@ impl SubstratePersistence {
             npc_locs,
             vfs_index,
             blob_index,
+            held_types: census.held_mask(),
             open_census: census,
             writer_lock,
             minter: Minter::with_sections(origination, own_sections.live()),
@@ -1534,6 +1541,9 @@ impl SubstratePersistence {
         if let Some(watch) = self.relocation_watch.as_mut() {
             watch.record(&header, payload);
         }
+        self.held_types |= 1u32
+            .checked_shl(header.record_type.tag() as u32)
+            .unwrap_or(0);
         self.track_identity(&header, segment, offset);
         self.accounting.record(&header, payload, size);
         self.track_metadata_loc(&header, segment, offset, size);

@@ -9,11 +9,16 @@
 use serde::{Deserialize, Serialize};
 
 use crate::replicate::{CatchupView, Phase, Stats};
+use crate::upgrade::decisions::{Rollout, Settled, Verdict};
+use crate::upgrade::watchdog::Failure;
+use crate::version::info::Opens;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordState {
     /// `joined`, `cut_off`, `rejoining`, `reloading`, `draining` or `fault`.
     pub mode: String,
+    /// Its builds, as upgrades see them (§3.8–§3.11).
+    pub upgrade: Option<UpgradeView>,
     /// It holds records it wrote cut off, not yet placed by a generation.
     pub detached: bool,
     pub fault: Option<FaultView>,
@@ -38,6 +43,100 @@ pub struct CoordState {
     pub stats: Stats,
     /// The maintenance commands run on it lately, newest last (§12.4).
     pub commands: Vec<CommandLine>,
+}
+
+/// What a member reports of upgrades (§3.9, §12.1): what a build must open to
+/// replace its own, what it holds and fetches, and where it stands in a
+/// rollout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradeView {
+    /// Its binary: `zend`, `npcd`, `tokerad`, `tokera-agent`.
+    pub kind: String,
+    pub platform: String,
+    /// What a build must open to replace this one: the log format, every
+    /// record type its substrate holds, the model it runs.
+    pub log_format: Option<u32>,
+    pub census: Vec<u8>,
+    pub model: Option<String>,
+    /// Every artifact it can serve.
+    pub holds: Vec<HoldLine>,
+    /// The builds it keeps in `builds/`.
+    pub kept: Vec<KeptLine>,
+    pub fetching: Option<FetchLine>,
+    /// As a candidate: each cluster's verdict.
+    pub candidate: Option<CandidateLine>,
+    /// Its place in a rollout: empty when idle, `waiting` for its lease,
+    /// `installing` once it holds it, `upgrading` when admitted below the
+    /// floor, `stranded` or `failed`.
+    pub step: String,
+    /// Why no build can be installed here.
+    pub stranded: Option<String>,
+    /// The last install that failed and was restored.
+    pub failure: Option<Failure>,
+    /// The builds it never tries again: `count-hash`.
+    pub refused: Vec<String>,
+    /// The latest verdict on each build the app has settled.
+    pub verdicts: Vec<VerdictLine>,
+    /// The app's latest forced rollout.
+    pub rollout: Option<RolloutLine>,
+    /// Whether the app's automatic rollout is paused.
+    pub paused: bool,
+}
+
+/// One artifact a member can serve.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldLine {
+    /// `count-hash`.
+    pub build: String,
+    pub kind: String,
+    pub platform: String,
+    pub size: u64,
+    pub sha256: String,
+    /// `running`, `kept`, `verified` or `offered`.
+    pub source: String,
+    /// What the build opens, for a binary whose answer is known.
+    pub opens: Option<Opens>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptLine {
+    pub build: String,
+    pub bytes: u64,
+    pub retired_ms: u64,
+}
+
+/// An artifact being fetched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchLine {
+    pub build: String,
+    pub kind: String,
+    pub bytes: u64,
+    pub size: u64,
+    /// How often it picked up again from its part file.
+    pub resumes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateLine {
+    pub build: String,
+    /// Per cluster: `pass`, `fail`, `no_opinion`, or empty until it sends one.
+    pub verdicts: Vec<String>,
+    /// The verdict it proposed, once it has.
+    pub proposed: Option<Settled>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerdictLine {
+    pub build: String,
+    /// The verdict's number under `certify/<app>/<build>/`.
+    pub n: u64,
+    pub verdict: Verdict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutLine {
+    pub n: u64,
+    pub decision: Rollout,
 }
 
 /// One maintenance command run on the member: who ran it, with what, and how
@@ -248,7 +347,7 @@ mod tests {
             ..CoordState::default()
         };
         let want = concat!(
-            r#"{"mode":"joined","detached":false,"fault":null,"#,
+            r#"{"mode":"joined","upgrade":null,"detached":false,"fault":null,"#,
             r#""gen":{"current":2,"last_rejoin":null,"decided":2},"deferred":[],"clusters":[],"#,
             r#""paxos":{"max_members":3,"quorum":2,"keys":[]},"worlds":[],"npc_leases":[],"#,
             r#""claims":[],"applied":[],"#,

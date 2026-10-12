@@ -3,6 +3,11 @@
 //! answer — forwarded to one member, combined from all, or handed back to go to
 //! the configured upstream when no member is ready.
 //!
+//! Every request a member answers is a sample for certifying a candidate
+//! (§3.8): while one certifies it takes its share of the traffic, and a share
+//! of the baseline's requests on a mirrored route are mirrored to it
+//! ([`super::mirror`]).
+//!
 //! Three things beside the dispatch:
 //!
 //! - **UI pinning.** A page's files come from one member: the first UI request
@@ -23,9 +28,10 @@ use axum::body::{to_bytes, Body};
 use axum::extract::Request;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
-use cluster::dispatch::{extract, Dispatch, Extracted, KeySource, Merge, BODY_LIMIT};
+use cluster::dispatch::{extract, Dispatch, Extracted, KeySource, Merge, Mirror, BODY_LIMIT};
 use cluster::gateway::{Class, Pick, NODE_HEADER};
 
+use super::mirror::{mirrored, sampled, Route};
 use super::{aggregate, merge_ws, Gateway};
 use crate::auth::{cookie, Identity, Role, Roles};
 use crate::config::Cache;
@@ -123,9 +129,23 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
 
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    let (dispatch, params) = match table.lookup(&method, &path) {
-        Some(m) => (m.route.dispatch.clone(), m.params),
-        None => (Dispatch::Ui, Vec::new()),
+    let (dispatch, params, route_key, mirror) = match table.lookup(&method, &path) {
+        Some(m) => (
+            m.route.dispatch.clone(),
+            m.params,
+            format!("{method} {}", m.route.path),
+            m.route.mirror.clone(),
+        ),
+        None => (
+            Dispatch::Ui,
+            Vec::new(),
+            format!("{method} UI"),
+            Mirror::None,
+        ),
+    };
+    let sample = Route {
+        key: &route_key,
+        mirror: &mirror,
     };
     let sources: Vec<KeySource> = match &dispatch {
         Dispatch::Sticky(keys) => keys.clone(),
@@ -167,11 +187,18 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
         Pick::Configured => Routed::Dumb(req),
         Pick::Member(node) => {
             hub.traffic.request(Class::of(&dispatch));
-            Routed::Answered(forward(gateway, app, node, &ctx, req).await)
+            let to_candidate = match mirror {
+                Mirror::None => None,
+                _ => hub.mirror_to(app, node),
+            };
+            Routed::Answered(match to_candidate {
+                Some(candidate) => mirrored(gateway, app, node, candidate, sample, &ctx, req).await,
+                None => sampled(gateway, app, node, sample, &ctx, req).await,
+            })
         }
         Pick::Pinned(node) => {
             hub.traffic.request(Class::Ui);
-            let mut res = forward(gateway, app, node, &ctx, req).await;
+            let mut res = sampled(gateway, app, node, sample, &ctx, req).await;
             set_pin(&mut res, app, node, ctx.secure);
             Routed::Answered(res)
         }

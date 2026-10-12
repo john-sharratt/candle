@@ -57,6 +57,61 @@ fn a_lagging_member_is_routed_nothing() {
     assert!(picks.contains(&Pick::Member(2)));
 }
 
+/// While a candidate certifies, a `Best`, `Any` or new sticky request is its
+/// when the share says so, and otherwise goes to the baseline with the
+/// candidate left out; a held key and an aggregate are picked as ever; alone,
+/// the candidate takes everything (§3.8).
+#[test]
+fn a_candidate_takes_its_share_and_no_more() {
+    let mut r = three();
+    // Node 3 is the candidate: idle, power 200; node 1 is the idle baseline.
+    let mut yes = || true;
+    let mut no = || false;
+    assert_eq!(
+        r.pick_canary("zend", &Dispatch::Best, None, None, 3, &mut yes),
+        Pick::Member(3)
+    );
+    assert_eq!(
+        r.pick_canary("zend", &Dispatch::Best, None, None, 3, &mut no),
+        Pick::Member(1)
+    );
+    for _ in 0..4 {
+        assert_ne!(
+            r.pick_canary("zend", &Dispatch::Any, None, None, 3, &mut no),
+            Pick::Member(3)
+        );
+    }
+    let sticky = Dispatch::sticky_path("id");
+    assert_eq!(
+        r.pick_canary("zend", &sticky, Some("new"), None, 3, &mut yes),
+        Pick::Member(3)
+    );
+    r.claims("zend").claim(b"held", Epoch { ms: 1, node: 2 });
+    assert_eq!(
+        r.pick_canary("zend", &sticky, Some("held"), None, 3, &mut yes),
+        Pick::Member(2),
+        "a held key stays with its holder"
+    );
+    assert_eq!(
+        r.pick_canary(
+            "zend",
+            &Dispatch::Aggregate(Merge::Envelope),
+            None,
+            None,
+            3,
+            &mut yes
+        ),
+        Pick::All(vec![1, 2, 3])
+    );
+    let mut alone = Registry::new();
+    alone.join(member(3, 3));
+    alone.capacity("zend", 3, capacity(MemberState::Ready, 1, true, 1));
+    assert_eq!(
+        alone.pick_canary("zend", &Dispatch::Best, None, None, 3, &mut no),
+        Pick::Member(3)
+    );
+}
+
 /// A catch-up's answerer is picked round robin among the other ready members,
 /// never the requester; alone, there is none.
 #[test]

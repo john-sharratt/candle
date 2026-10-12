@@ -101,7 +101,7 @@ impl Commands {
             job: job.id,
             command: command.name().into(),
             args: args.to_string(),
-            by,
+            by: by.clone(),
             started_ms: job.started_ms,
             outcome: None,
         };
@@ -110,7 +110,7 @@ impl Commands {
         let running = job.clone();
         let app = body.app.clone();
         tokio::spawn(async move {
-            let outcome = me.exec(&running, &command, app.as_deref()).await;
+            let outcome = me.exec(&running, &command, app.as_deref(), &by).await;
             line.outcome = Some(match &outcome {
                 Ok(_) => "ok".into(),
                 Err(e) => format!("failed: {e}"),
