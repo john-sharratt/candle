@@ -14,9 +14,9 @@
 //! # Across tenants
 //!
 //! Several tenants can share the scheduler (`docs/shared_model_host.md` §3.6),
-//! so a sequence's [`Priority`] is its tenant's rank and its layer's band,
-//! ordered **tenant first**: while the first tenant has any work, a second
-//! tenant's sequences wait, and within each tenant the bands work as above.
+//! and they are **equal**: priority is the band alone, whichever tenant the
+//! work belongs to. Any tenant's live conversation pauses every tenant's
+//! ingest, and two tenants' ingests run side by side.
 //!
 //! # Why it exists
 //!
@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 
 use super::{Scheduler, SequenceId};
 use crate::projection::DecodePriority;
-use crate::tenant_rank::TenantRank;
 
 /// How long lower-priority work stays paused after the last higher-priority
 /// activity. Long enough to span a tool round — the dialogue is idle while its
@@ -45,37 +44,11 @@ pub const COOLDOWN: Duration = Duration::from_secs(15);
 /// resumes within this of its release; a request ends the wait at once.
 pub const PAUSED_POLL: Duration = Duration::from_millis(250);
 
-/// Where a sequence stands on the scheduler: its tenant's rank, then its
-/// layer's band.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Priority {
-    pub tenant: TenantRank,
-    pub band: DecodePriority,
-}
-
-impl Priority {
-    /// Below every tenant's every band — what background work with no
-    /// sequence of its own (glue, section chunks) runs at.
-    pub const LOWEST: Priority = Priority {
-        tenant: TenantRank::LAST,
-        band: DecodePriority::Low,
-    };
-
-    /// A sequence of the first tenant — every engine with one tenant — at `band`.
-    #[cfg(test)]
-    pub fn first_tenant(band: DecodePriority) -> Self {
-        Self {
-            tenant: TenantRank::FIRST,
-            band,
-        }
-    }
-}
-
-/// How many bands a tenant has.
+/// How many bands there are.
 const BANDS: usize = 3;
 
-/// A band's rank within its tenant: higher outranks lower.
-fn band_rank(p: DecodePriority) -> usize {
+/// A band's rank: higher outranks lower.
+pub(super) fn rank(p: DecodePriority) -> usize {
     match p {
         DecodePriority::Low => 0,
         DecodePriority::Normal => 1,
@@ -83,31 +56,25 @@ fn band_rank(p: DecodePriority) -> usize {
     }
 }
 
-/// A priority's rank across every tenant: higher outranks lower. Every band of
-/// a higher tenant ranks above every band of a lower one.
-pub(super) fn rank(p: Priority) -> usize {
-    (TenantRank::MAX - 1 - p.tenant.index()) * BANDS + band_rank(p.band)
-}
-
-/// When each priority was last seen with work, by [`rank`].
+/// When each band was last seen with work, by [`rank`].
 #[derive(Debug, Default, Clone)]
 pub struct PriorityPause {
-    last_active: [Option<Instant>; TenantRank::MAX * BANDS],
+    last_active: [Option<Instant>; BANDS],
 }
 
 impl PriorityPause {
-    /// Record that a sequence of priority `p` has work at `now` — queued,
+    /// Record that a sequence of band `p` has work at `now` — queued,
     /// prefilling or decoding.
-    pub fn observe(&mut self, p: Priority, now: Instant) {
+    pub fn observe(&mut self, p: DecodePriority, now: Instant) {
         let slot = &mut self.last_active[rank(p)];
         if slot.is_none_or(|t| t < now) {
             *slot = Some(now);
         }
     }
 
-    /// Whether work of priority `p` is paused at `now`: some strictly higher
-    /// priority had work within [`COOLDOWN`].
-    pub fn paused(&self, p: Priority, now: Instant) -> bool {
+    /// Whether work of band `p` is paused at `now`: some strictly higher band
+    /// had work within [`COOLDOWN`].
+    pub fn paused(&self, p: DecodePriority, now: Instant) -> bool {
         self.last_active[rank(p) + 1..]
             .iter()
             .flatten()
@@ -116,13 +83,13 @@ impl PriorityPause {
 }
 
 impl Scheduler {
-    /// Record the priority of every sequence with work right now — queued,
+    /// Record the band of every sequence with work right now — queued,
     /// prefilling, or decoding. Called where each gate decides, so a gate
     /// always judges against the present. A queued dialogue turn counts, so
     /// ingest stops the moment a question arrives rather than once it is
     /// admitted.
     ///
-    /// Only a priority that resolves is recorded. A slot with no resolvable
+    /// Only a band that resolves is recorded. A slot with no resolvable
     /// target (a summary probe, a slot reloaded without its projection) is not
     /// paused — it counts as `High` for its own gating — but it is not evidence
     /// that a conversation is running either, so it must not hold ingest and
@@ -143,7 +110,7 @@ impl Scheduler {
             .chain(self.prefill_queue.iter().map(|w| w.sequence_id))
             .collect();
         for id in ids {
-            if let Some(p) = self.slot_priority(id) {
+            if let Some(p) = self.decode_layer_priority(id) {
                 self.priority_pause.observe(p, now);
             }
         }
@@ -166,7 +133,7 @@ impl Scheduler {
     /// Whether sequence `id` is paused behind higher-priority work.
     pub(super) fn priority_paused(&self, id: SequenceId) -> bool {
         self.priority_pause
-            .paused(self.priority_or_high(id), Instant::now())
+            .paused(self.decode_priority_or_high(id), Instant::now())
     }
 
     /// Whether there is sequence work and all of it is paused — the loop then
@@ -199,69 +166,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The first tenant's bands, named as the bands are — every single-tenant
-    // case below reads exactly as it did before tenants.
-    #[allow(non_upper_case_globals)]
-    const High: Priority = Priority {
-        tenant: TenantRank::FIRST,
-        band: DecodePriority::High,
-    };
-    #[allow(non_upper_case_globals)]
-    const Normal: Priority = Priority {
-        tenant: TenantRank::FIRST,
-        band: DecodePriority::Normal,
-    };
-    #[allow(non_upper_case_globals)]
-    const Low: Priority = Priority {
-        tenant: TenantRank::FIRST,
-        band: DecodePriority::Low,
-    };
-
-    fn second(band: DecodePriority) -> Priority {
-        Priority {
-            tenant: TenantRank::nth(1).unwrap(),
-            band,
-        }
-    }
-
-    /// Tenant first, band second: the first tenant's `Low` outranks the second
-    /// tenant's `High`.
-    #[test]
-    fn every_band_of_the_first_tenant_outranks_every_band_of_the_second() {
-        assert!(rank(Low) > rank(second(DecodePriority::High)));
-        assert!(rank(High) > rank(Normal) && rank(Normal) > rank(Low));
-        assert!(rank(second(DecodePriority::High)) > rank(second(DecodePriority::Low)));
-    }
-
-    /// While the first tenant has work at any band — its ingest included — the
-    /// second tenant's sequences wait, its `High` too; and they resume at the
-    /// cooldown.
-    #[test]
-    fn the_first_tenants_low_work_pauses_the_second_tenants_high() {
-        let t0 = Instant::now();
-        let mut p = PriorityPause::default();
-        p.observe(Low, t0);
-        p.observe(second(DecodePriority::High), t0);
-        assert!(p.paused(second(DecodePriority::High), t0));
-        assert!(
-            !p.paused(Low, t0),
-            "nothing ranks above the first tenant's work here"
-        );
-        assert!(!p.paused(second(DecodePriority::High), t0 + COOLDOWN));
-    }
-
-    /// The second tenant's work never pauses the first tenant's, at any band.
-    #[test]
-    fn the_second_tenant_never_pauses_the_first() {
-        let now = Instant::now();
-        let mut p = PriorityPause::default();
-        p.observe(second(DecodePriority::High), now);
-        assert!(!p.paused(Low, now));
-        assert!(!p.paused(Normal, now));
-        // Within the second tenant, its bands work as one tenant's always have.
-        assert!(p.paused(second(DecodePriority::Low), now));
-    }
+    use DecodePriority::{High, Low, Normal};
 
     #[test]
     fn nothing_is_paused_when_nothing_higher_has_run() {
@@ -283,6 +188,23 @@ mod tests {
         assert!(p.paused(Low, now));
         assert!(p.paused(Normal, now));
         assert!(!p.paused(High, now));
+    }
+
+    /// **Tenants are equal; the band decides.** Ingest of one app does not
+    /// pause another app's ingest — both are `Low` — so zend and npcd ingest
+    /// at once; and either app's live conversation pauses both ingests.
+    #[test]
+    fn two_apps_ingest_together_and_either_conversation_pauses_both() {
+        let t0 = Instant::now();
+        let mut p = PriorityPause::default();
+        p.observe(Low, t0);
+        assert!(
+            !p.paused(Low, t0),
+            "one app's ingest never pauses another's"
+        );
+        p.observe(High, t0);
+        assert!(p.paused(Low, t0), "a live conversation pauses every ingest");
+        assert!(!p.paused(High, t0 + Duration::from_millis(1)));
     }
 
     /// The cooldown: still paused just inside it, released exactly at it.

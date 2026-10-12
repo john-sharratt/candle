@@ -41,7 +41,6 @@ use std::time::Instant;
 use super::admission::prefill_cost_bytes;
 use super::admit::{Budget, Cost, Ground, Headroom, Kind};
 use super::interleave;
-use super::priority_pause::Priority;
 use super::{Scheduler, SequenceId, WaveMember};
 use crate::projection::DecodePriority;
 use candle_nn::kv_cache::CHUNK_SIZE;
@@ -300,14 +299,13 @@ impl Ground for AdmitPass<'_> {
         // **A turn paused behind higher-priority work is walked past too** — it
         // waits in the queue, in order, until the work that outranks it has
         // been idle for the cooldown (see `priority_pause`). Checked per turn,
-        // not per band: priority is tenant first, so one band holds turns of a
-        // tenant that is running and of one that is waiting behind it, and the
-        // first must still be offered.
+        // because the cursor walks the whole queue and only this band's turns
+        // are offered here.
         let band = band_index(prio);
         let now = Instant::now();
         while let Some(w) = self.sched.prefill_queue.get(self.prefill_cursor[band]) {
-            let p = self.sched.priority_or_high(w.sequence_id);
-            if p.band == prio && !self.sched.priority_pause.paused(p, now) {
+            let p = self.sched.decode_priority_or_high(w.sequence_id);
+            if p == prio && !self.sched.priority_pause.paused(p, now) {
                 break;
             }
             self.prefill_cursor[band] += 1;
@@ -670,15 +668,6 @@ impl Scheduler {
     pub(super) fn decode_priority_or_high(&self, id: SequenceId) -> DecodePriority {
         self.decode_layer_priority(id)
             .unwrap_or(DecodePriority::High)
-    }
-
-    /// A slot's [`Priority`]: its tenant's rank, and its layer's band — `High`
-    /// where that does not resolve.
-    pub(super) fn priority_or_high(&self, id: SequenceId) -> Priority {
-        Priority {
-            tenant: self.slot_tenant(id),
-            band: self.decode_priority_or_high(id),
-        }
     }
 }
 

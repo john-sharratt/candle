@@ -1,8 +1,9 @@
 //! `tokerad` — zend and npcd in one process, on one model.
 //!
 //! The same startup path as `zend` and `npcd` — `host::run` — with both tenants,
-//! zend ranked first (`docs/shared_model_host.md` §3.6): while zend has work,
-//! npcd waits. One model loads, one engine runs, each daemon keeps its own
+//! equal on the scheduler (`docs/shared_model_host.md` §3.6): either daemon's
+//! live conversation outranks both daemons' ingest, and their ingests run side
+//! by side. One model loads, one engine runs, each daemon keeps its own
 //! substrate, and one HTTP server serves both — the API on every name, each UI
 //! on its own (`code.tokera.com` and a bare IP: zend's; `bot.tokera.com`:
 //! npcd's).
@@ -72,7 +73,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mut config = Config::load(&cli.config)?;
     config.host.upgrade_failed = cli.upgrade_failed;
-    // zend first: it outranks npcd.
+    // zend first: it builds the shared engine, and stops last.
     let tenants: Vec<Box<dyn Tenant>> = vec![
         Box::new(config.zend.resolve()?),
         Box::new(config.npcd.resolve()?),

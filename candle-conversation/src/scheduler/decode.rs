@@ -613,11 +613,12 @@ impl Scheduler {
         // gap between its tool rounds. A paused decode stays active and resumes
         // where it stopped — pure scheduling. Among what remains, the highest
         // priority leads, so the adapter rule below keeps the dialogue's.
-        // `priority_or_high` treats an unresolvable slot as `High`, so a real
-        // decode is never wrongly paused. Priority is tenant first, band second.
+        // `decode_priority_or_high` treats an unresolvable slot as `High`, so a
+        // real decode is never wrongly paused. Tenants are equal: the band alone
+        // ranks.
         self.observe_priorities();
         seq_ids.retain(|&id| !self.priority_paused(id));
-        seq_ids.sort_by_key(|&id| std::cmp::Reverse(rank(self.priority_or_high(id))));
+        seq_ids.sort_by_key(|&id| std::cmp::Reverse(rank(self.decode_priority_or_high(id))));
 
         // ── One adapter per wave ─────────────────────────────────────────────
         //

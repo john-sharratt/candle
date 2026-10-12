@@ -1,12 +1,13 @@
-//! Where a tenant stands against the others sharing one engine.
+//! Where a tenant stands in line against the others sharing one engine.
 //!
-//! One scheduler serves every substrate attached to an engine, so its priority
-//! bands need an order across tenants. The order is **tenant first, band
-//! second** (`docs/shared_model_host.md` §3.6): every band of a higher tenant
-//! outranks every band of a lower one, and within a tenant the bands work as
-//! they always have. The host assigns ranks in the order it is given tenants.
+//! Not scheduling priority: the scheduler ranks work by its band alone, and
+//! tenants are equal there (`docs/shared_model_host.md` §3.6). The rank orders
+//! the tenants where an order is needed and nothing is being prioritised —
+//! which of them builds the shared engine with every tenant's merged requests,
+//! the order those requests merge in, and the order they stop in. The host
+//! assigns ranks in the order it is given tenants.
 
-/// A tenant's rank: [`TenantRank::FIRST`] outranks every other.
+/// A tenant's place in line: [`TenantRank::FIRST`] comes first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct TenantRank(u8);
 

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use flume::Sender;
 
-use super::priority_pause::{Priority, PAUSED_POLL};
+use super::priority_pause::PAUSED_POLL;
 use super::Scheduler;
 use crate::projection::{
     Builder, Conversation, DecodePriority, GroupId, LayerId, ProjectionTarget, Schema, TimelineId,
@@ -71,20 +71,15 @@ impl Scheduler {
     /// zero when a turn can run now, and [`PAUSED_POLL`] while ingest-priority
     /// work is paused — so a paused replay neither spins nor delays a request.
     ///
-    /// The next job runs at ingest priority within its own tenant — `Low`, at
-    /// the rank of the tenant whose substrate it warms.
+    /// The next job runs at ingest priority, `Low`, whichever tenant's
+    /// substrate it warms.
     pub(super) fn norm_warm_wait(&self) -> Option<Duration> {
-        let tenant = match self.norm_warm.backlog.front() {
-            Some(job) => job.substrate.tenant_rank(),
-            None => self.norm_warm.ingest.front()?.conversation.tenant_rank(),
-        };
-        let paused = self.priority_pause.paused(
-            Priority {
-                tenant,
-                band: DecodePriority::Low,
-            },
-            Instant::now(),
-        );
+        if self.norm_warm.backlog.is_empty() && self.norm_warm.ingest.is_empty() {
+            return None;
+        }
+        let paused = self
+            .priority_pause
+            .paused(DecodePriority::Low, Instant::now());
         Some(if paused { PAUSED_POLL } else { Duration::ZERO })
     }
 
@@ -189,7 +184,7 @@ impl Scheduler {
 mod tests {
     use super::super::test_substrate::{open, record_turns, YAML};
     use super::super::tests::make_test_scheduler;
-    use super::{IngestSliceJob, Priority, PAUSED_POLL};
+    use super::{IngestSliceJob, PAUSED_POLL};
     use crate::projection::{Builder, DecodePriority};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -232,7 +227,7 @@ mod tests {
 
         sched
             .priority_pause
-            .observe(Priority::first_tenant(DecodePriority::High), Instant::now());
+            .observe(DecodePriority::High, Instant::now());
         assert_eq!(sched.norm_warm_wait(), Some(PAUSED_POLL));
         assert!(!sched.step_norm_warm(), "a dialogue holds the device");
         assert_eq!(sched.norm_warm.backlog.len(), 2);
@@ -275,7 +270,7 @@ mod tests {
 
         sched
             .priority_pause
-            .observe(Priority::first_tenant(DecodePriority::High), Instant::now());
+            .observe(DecodePriority::High, Instant::now());
         assert_eq!(sched.norm_warm_wait(), Some(PAUSED_POLL));
         assert!(!sched.step_norm_warm(), "a dialogue holds the device");
         assert!(reply_rx.try_recv().is_err(), "the warmer is still waiting");

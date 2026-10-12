@@ -7,13 +7,12 @@ use super::admit_ground::AdmitPass;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
 use super::first_sample::{contiguous_runs, FirstSample, FirstSampled, PrefillEnd};
 use super::phase_split::cobatched_decode_rows;
-use super::priority_pause::{rank, Priority};
+use super::priority_pause::rank;
 use super::wave_logits::WaveLogits;
 use super::*;
-use crate::projection::{Conversation, DecodePriority};
+use crate::projection::DecodePriority;
 use crate::recorded_reply::replayed_step;
 use crate::stats::streams_committed;
-use crate::tenant_rank::TenantRank;
 use crate::token_buffer::TokenBuffer;
 use candle_nn::kv_cache::{end_wave_transient, is_device_oom, FreeRegionTarget};
 use candle_transformers::models::batched_inference::PendingGlue;
@@ -71,14 +70,14 @@ fn phase_target(phase: VramPhase) -> FreeRegionTarget {
 /// `High` decode kept a 26-token prompt waiting 57 s for another conversation's
 /// whole tool round to finish.
 ///
-/// Outranking is tenant first, band second ([`rank`]): a decode of a higher
-/// tenant holds back a lower tenant's work at its band's ratio, and a lower
-/// tenant's decode never holds back a higher tenant's prompt.
-fn throttle_ratio(work: Priority, decodes: impl IntoIterator<Item = Priority>) -> u32 {
+/// Outranking is by band alone ([`rank`]), whichever tenant the work belongs
+/// to: any tenant's dialogue decode holds back every tenant's ingest at its
+/// band's ratio, and two tenants' work in one band never holds back the other.
+fn throttle_ratio(work: DecodePriority, decodes: impl IntoIterator<Item = DecodePriority>) -> u32 {
     decodes
         .into_iter()
         .filter(|&d| rank(d) > rank(work))
-        .map(|d| d.band.ratio())
+        .map(|d| d.ratio())
         .max()
         .unwrap_or(1)
         .max(1)
@@ -1836,51 +1835,31 @@ impl Scheduler {
     /// layers a wave, and the decode quantum owes decode that share of a
     /// co-batched step.
     ///
-    /// Each decode counts at its tenant's rank and its target layer's
-    /// `decode_priority`, `High` where that does not resolve — the band
-    /// [`Self::priority_paused`] gates it in.
-    pub(super) fn airtime_ratio_over(&self, work: Priority) -> u32 {
+    /// Each decode counts at its target layer's `decode_priority`, `High`
+    /// where that does not resolve — the band [`Self::priority_paused`] gates
+    /// it in.
+    pub(super) fn airtime_ratio_over(&self, work: DecodePriority) -> u32 {
         throttle_ratio(
             work,
             self.foreground_decodes()
-                .map(|sid| self.priority_or_high(sid)),
+                .map(|sid| self.decode_priority_or_high(sid)),
         )
     }
 
-    /// The priority a creep group runs at: its highest-ranked member. A
-    /// dialogue prefill runs at its slot's own priority; a section chunk is
-    /// background ingest, so it runs at `Low` — within its own tenant, so one
-    /// tenant's section ingest yields to its own decodes and to a higher
-    /// tenant's, never to a lower tenant's.
-    fn creep_priority(&self, members: &[WaveMember]) -> Priority {
+    /// The band a creep group runs at: its highest-ranked member's. A dialogue
+    /// prefill runs at its slot's own band; a section chunk is background
+    /// ingest, so it runs at `Low`.
+    fn creep_priority(&self, members: &[WaveMember]) -> DecodePriority {
         members
             .iter()
             .map(|m| match m {
-                WaveMember::Prefill { seq_id, .. } => self.priority_or_high(SequenceId(*seq_id)),
-                WaveMember::Section { seq_id, .. } => Priority {
-                    tenant: self.slot_tenant(SequenceId(*seq_id)),
-                    band: DecodePriority::Low,
-                },
+                WaveMember::Prefill { seq_id, .. } => {
+                    self.decode_priority_or_high(SequenceId(*seq_id))
+                }
+                WaveMember::Section { .. } => DecodePriority::Low,
             })
             .max_by_key(|&p| rank(p))
-            .unwrap_or(Priority::LOWEST)
-    }
-
-    /// A slot's [`Priority`] — its tenant's rank and its target layer's band —
-    /// or `None` when the band isn't resolvable.
-    pub(super) fn slot_priority(&self, sid: SequenceId) -> Option<Priority> {
-        Some(Priority {
-            tenant: self.slot_tenant(sid),
-            band: self.decode_layer_priority(sid)?,
-        })
-    }
-
-    /// The rank of the tenant whose substrate `sid` is bound to — the first
-    /// tenant for a slot bound to none.
-    pub(super) fn slot_tenant(&self, sid: SequenceId) -> TenantRank {
-        self.slot_conversations
-            .get(&self.owning_slot(sid))
-            .map_or(TenantRank::FIRST, Conversation::tenant_rank)
+            .unwrap_or(DecodePriority::Low)
     }
 
     /// The slot that owns `sid`'s projection state: a decode runs on a VIEW
@@ -2743,7 +2722,7 @@ impl Scheduler {
         // The creep yields only to the decodes that outrank it. Without a creep
         // the step co-batches glue and section chunks, which are background.
         let work = if seq_ids.is_empty() {
-            Priority::LOWEST
+            DecodePriority::Low
         } else {
             self.creep_priority(&members)
         };
@@ -4771,48 +4750,8 @@ mod turn_view_release_tests {
 
 #[cfg(test)]
 mod creep_throttle_tests {
-    use super::{creep_layer_budget, throttle_ratio, Priority};
-    use crate::projection::DecodePriority;
-    use crate::tenant_rank::TenantRank;
-
-    // The first tenant's bands, named as the bands are.
-    #[allow(non_upper_case_globals)]
-    const High: Priority = Priority {
-        tenant: TenantRank::FIRST,
-        band: DecodePriority::High,
-    };
-    #[allow(non_upper_case_globals)]
-    const Normal: Priority = Priority {
-        tenant: TenantRank::FIRST,
-        band: DecodePriority::Normal,
-    };
-    #[allow(non_upper_case_globals)]
-    const Low: Priority = Priority {
-        tenant: TenantRank::FIRST,
-        band: DecodePriority::Low,
-    };
-
-    fn second(band: DecodePriority) -> Priority {
-        Priority {
-            tenant: TenantRank::nth(1).unwrap(),
-            band,
-        }
-    }
-
-    /// Across tenants: a first-tenant decode throttles a second tenant's
-    /// prompt by its band's ratio, and a second-tenant decode — even `High` —
-    /// never throttles a first-tenant prompt, even a `Low` one.
-    #[test]
-    fn the_first_tenants_decode_throttles_the_second_tenant_and_never_the_reverse() {
-        assert_eq!(throttle_ratio(second(DecodePriority::High), [Low]), 1);
-        assert_eq!(throttle_ratio(second(DecodePriority::High), [High]), 64);
-        assert_eq!(throttle_ratio(Low, [second(DecodePriority::High)]), 1);
-        assert_eq!(
-            throttle_ratio(second(DecodePriority::Low), [second(DecodePriority::High)]),
-            64,
-            "within the second tenant the bands work as one tenant's do"
-        );
-    }
+    use super::{creep_layer_budget, throttle_ratio};
+    use crate::projection::DecodePriority::{High, Low, Normal};
 
     /// Work yields only to a decode that outranks it, at that decode's ratio.
     #[test]
@@ -4856,7 +4795,6 @@ mod creep_throttle_tests {
 mod priority_admission_tests {
     use std::sync::Arc;
 
-    use super::super::priority_pause::Priority;
     use super::super::tests::{boundary_state, make_test_scheduler};
     use super::super::*;
     use super::wave_chunk_tests::dialogue_prefill;
@@ -5004,7 +4942,7 @@ layers:
             advance: 26,
         }];
         let work = sched.creep_priority(&creep);
-        assert_eq!(work, Priority::first_tenant(DecodePriority::High));
+        assert_eq!(work, DecodePriority::High);
         assert_eq!(sched.airtime_ratio_over(work), 1);
 
         let creep = [WaveMember::Prefill {
@@ -5012,26 +4950,42 @@ layers:
             advance: 26,
         }];
         let work = sched.creep_priority(&creep);
-        assert_eq!(work, Priority::first_tenant(DecodePriority::Low));
+        assert_eq!(work, DecodePriority::Low);
         assert_eq!(sched.airtime_ratio_over(work), 64);
     }
 
-    /// **The first tenant outranks the second.** A second-tenant `High`
-    /// dialogue decode does not throttle a first-tenant ingest prompt, and a
-    /// first-tenant ingest prefill pauses the second tenant's dialogue.
+    /// **Tenants are equal; the band decides.** npcd's live conversation
+    /// throttles and pauses zend's ingest exactly as zend's own would, and
+    /// zend's ingest never holds npcd's conversation back. Two tenants' ingests
+    /// run side by side.
     #[test]
-    fn a_first_tenant_ingest_outranks_a_second_tenant_dialogue() {
+    fn a_second_tenants_dialogue_outranks_a_first_tenants_ingest() {
         let (mut sched, _tx) = make_test_scheduler();
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
         let zend = Conversation::new();
-        let npcd = Conversation::new().with_tenant_rank(TenantRank::nth(1).unwrap());
+        let npcd = || Conversation::new().with_tenant_rank(TenantRank::nth(1).unwrap());
         let zend_ingest = SequenceId(sched.session.create_sequence().expect("create"));
         let npcd_dialogue = SequenceId(sched.session.create_sequence().expect("create"));
+        let npcd_ingest = SequenceId(sched.session.create_sequence().expect("create"));
         bind(&mut sched, &builder, zend_ingest, "ingest", 1);
         bind(&mut sched, &builder, npcd_dialogue, "dialogue", 2);
+        bind(&mut sched, &builder, npcd_ingest, "ingest", 3);
         sched.slot_conversations.insert(zend_ingest, zend);
-        sched.slot_conversations.insert(npcd_dialogue, npcd);
+        sched.slot_conversations.insert(npcd_dialogue, npcd());
+        sched.slot_conversations.insert(npcd_ingest, npcd());
 
+        // Both tenants ingesting, nobody talking: neither pauses the other.
+        sched
+            .active_prefills
+            .push(dialogue_prefill(zend_ingest, vec![1; 8]));
+        sched
+            .active_prefills
+            .push(dialogue_prefill(npcd_ingest, vec![1; 8]));
+        sched.observe_priorities();
+        assert!(!sched.priority_paused(zend_ingest));
+        assert!(!sched.priority_paused(npcd_ingest));
+
+        // npcd's conversation decodes: zend's ingest yields to it.
         let (state, _rx) = boundary_state();
         sched.active_decodes.insert(npcd_dialogue, state);
         let creep = [WaveMember::Prefill {
@@ -5039,24 +4993,16 @@ layers:
             advance: 26,
         }];
         let work = sched.creep_priority(&creep);
-        assert_eq!(work, Priority::first_tenant(DecodePriority::Low));
-        assert_eq!(
-            sched.airtime_ratio_over(work),
-            1,
-            "the second tenant's decode does not hold the first tenant's prompt back"
-        );
-
-        sched
-            .active_prefills
-            .push(dialogue_prefill(zend_ingest, vec![1; 8]));
+        assert_eq!(work, DecodePriority::Low);
+        assert_eq!(sched.airtime_ratio_over(work), 64);
         sched.observe_priorities();
-        assert!(sched.priority_paused(npcd_dialogue));
-        assert!(!sched.priority_paused(zend_ingest));
+        assert!(sched.priority_paused(zend_ingest));
+        assert!(sched.priority_paused(npcd_ingest));
+        assert!(!sched.priority_paused(npcd_dialogue));
     }
 
     /// A section chunk is background whatever slot carries it: alone it runs
-    /// at its tenant's `Low`, and beside a dialogue prompt it rides at the
-    /// prompt's band.
+    /// at `Low`, and beside a dialogue prompt it rides at the prompt's band.
     #[test]
     fn a_creep_runs_at_its_highest_prompt_and_sections_alone_are_low() {
         let (mut sched, _tx) = make_test_scheduler();
@@ -5071,10 +5017,7 @@ layers:
             seq_id: section.0,
             advance: 32,
         }];
-        assert_eq!(
-            sched.creep_priority(&alone),
-            Priority::first_tenant(DecodePriority::Low)
-        );
+        assert_eq!(sched.creep_priority(&alone), DecodePriority::Low);
 
         let mixed = [
             WaveMember::Prefill {
@@ -5090,17 +5033,14 @@ layers:
                 advance: 32,
             },
         ];
-        assert_eq!(
-            sched.creep_priority(&mixed),
-            Priority::first_tenant(DecodePriority::High)
-        );
+        assert_eq!(sched.creep_priority(&mixed), DecodePriority::High);
     }
 
-    /// **The first tenant's section ingest is not held back by the second
-    /// tenant's dialogue.** Its chunks run at the first tenant's `Low`, which
-    /// outranks every second-tenant band.
+    /// **A section chunk yields to any tenant's conversation.** zend's
+    /// section ingest runs at `Low`, so npcd's dialogue decode holds it to the
+    /// dialogue's ratio.
     #[test]
-    fn a_first_tenant_section_chunk_outranks_a_second_tenant_dialogue() {
+    fn a_section_chunk_yields_to_another_tenants_dialogue() {
         let (mut sched, _tx) = make_test_scheduler();
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
         let zend = Conversation::new();
@@ -5118,8 +5058,8 @@ layers:
             advance: 32,
         }];
         let work = sched.creep_priority(&creep);
-        assert_eq!(work, Priority::first_tenant(DecodePriority::Low));
-        assert_eq!(sched.airtime_ratio_over(work), 1);
+        assert_eq!(work, DecodePriority::Low);
+        assert_eq!(sched.airtime_ratio_over(work), 64);
     }
 
     /// A decode whose priority does not resolve (the titler, a summary probe)
@@ -5132,14 +5072,8 @@ layers:
         let (state, _rx) = boundary_state();
         sched.active_decodes.insert(probe, state);
 
-        assert_eq!(
-            sched.airtime_ratio_over(Priority::first_tenant(DecodePriority::Low)),
-            64
-        );
-        assert_eq!(
-            sched.airtime_ratio_over(Priority::first_tenant(DecodePriority::High)),
-            1
-        );
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::Low), 64);
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::High), 1);
     }
 
     /// A finished decode and a compression pass protect nothing: only a
@@ -5154,10 +5088,7 @@ layers:
         state.finished = true;
         sched.active_decodes.insert(done, state);
 
-        assert_eq!(
-            sched.airtime_ratio_over(Priority::first_tenant(DecodePriority::Low)),
-            1
-        );
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::Low), 1);
     }
 }
 

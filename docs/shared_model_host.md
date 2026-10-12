@@ -163,8 +163,9 @@ zend's `tool_def::DEFS`, `SCAN_*`, `ingest_backlog`, `ingest_report`; npcd's
    then one namespace with no collisions; only the two web UIs, which are different
    apps at the same `/`, are told apart by host name. **The UIs are served from disk**,
    so editing one needs no rebuild and no restart.
-9. **zend outranks npcd.** Priority is ordered by tenant first, band second: while
-   zend has work, npcd waits; within each tenant the bands work as today.
+9. **zend and npcd are equal.** Priority is the band alone, whichever tenant the work
+   belongs to: either daemon's live conversation outranks either daemon's ingest, and
+   the two daemons' ingests run side by side.
 
 ---
 
@@ -525,37 +526,39 @@ naming zend's model ids), `/v1/chat/completions`, `/v1/conversations/*`,
 its substrate page uses `/v1/substrate/zend/…` and `/v1/tools`; npcd's console reads
 the 200 sign-out, `/common/`, the string `timeline` and `tenants.npcd.*`.
 
-### 3.6 zend outranks npcd
+### 3.6 zend and npcd are equal
 
-One scheduler now carries both daemons' work, so the priority bands need an order
-across tenants. The order is **tenant first, band second**:
+One scheduler carries both daemons' work. The tenants are **equal**: a sequence's
+priority is its layer's band alone, whichever daemon it belongs to:
 
 ```
-zend High > zend Normal > zend Low > npcd High > npcd Normal > npcd Low
+High (either daemon's live conversation) > Normal > Low (either daemon's ingest)
 ```
 
-- **Priority pause** (`scheduler/priority_pause.rs`) pauses every sequence ranked
+- **Priority pause** (`scheduler/priority_pause.rs`) pauses every sequence in a band
   below one that has work, and keeps it paused for `COOLDOWN` (15 s) after. So while
-  zend has anything to do — a chat turn, a tool round, the titler, an ingest pass —
-  npcd's characters wait, and they resume within `PAUSED_POLL` (250 ms) of zend
-  falling idle for the cooldown. Within npcd, its bands work exactly as today. Section
-  ingests and deferred glue stay outside the pause in both tenants, as they are today
-  (`priority_pause.rs:138-143`).
+  either daemon has a conversation running — a chat turn, a tool round, a character's
+  turn — both daemons' ingest waits, and resumes within `PAUSED_POLL` (250 ms) of the
+  conversations falling idle for the cooldown. Section ingests and deferred glue stay
+  outside the pause.
 - **The prefill throttle** (`prefill.rs` `throttle_ratio`) uses the same order: work
-  yields to the decodes that outrank it. A zend decode holds npcd's prompts back; an
-  npcd decode never holds back a zend prompt; two conversations in the same tenant
-  and band share the wave as they do today.
-- **What it costs npcd:** a zend ingest pass — at startup, or when the watcher sees
-  source change — pauses the characters for its duration. zend's chat is short
-  bursts; its ingest is the long one. If the characters' stalls during ingest matter,
-  the lever is zend's ingest pacing, not the order.
+  yields to the decodes in a higher band, at that band's ratio, whichever daemon
+  either belongs to. Two daemons' work in one band shares the wave as one daemon's
+  always has.
+- **What it means:** zend's and npcd's ingests run side by side, so a long ingest of
+  one — zend's at startup, npcd's mind on a fresh substrate — no longer holds the
+  other's back for its whole length. Neither daemon's conversations wait on the
+  other's ingest.
 
-The change in code is one type: the priority a slot resolves to becomes
-`(TenantRank, DecodePriority)` instead of `DecodePriority` (`decode_priority_or_high`,
-`admit_ground.rs:667`), `rank` (`priority_pause.rs:41`) ranks the pair, and
-`PriorityPause::last_active` grows from one slot per band to one per tenant and band
-(`:52`). The host
-assigns `TenantRank` from the order tenants are given to `host::run` — zend first.
+This was first built tenant first (`zend High > … > npcd Low`), so that while zend had
+anything to do — its ingest included — npcd's characters waited. On `.5` that held
+npcd's first mind ingest behind zend's hours-long background ingest, and the rule was
+dropped: background work of one app is no more urgent than another's, and live
+conversations already outrank ingest by band.
+
+`TenantRank` still orders the tenants for one thing that is not priority: which of
+them builds the shared engine at start (`engine_slot/rendezvous.rs`) — the host
+assigns it from the order tenants are given to `host::run`, zend first.
 
 ### 3.7 Where code lives, and the three binaries
 
@@ -855,7 +858,7 @@ Each phase lands green on its own and is useful on its own.
 | 3 | **Host + tenants, one server** (§3.1, §3.3, §3.4, §3.7) | the `host` crate; the common code of §3.7 moved into it; `zend`, `npcd` and `tokerad` built from the workspace, the first two running through `host::run([tenant])` on the host's `web::Builder` — tenant APIs merged, UIs by host name, `/common/` once | every existing zend and npcd test; the GUI harness; `cargo build -p zend`, `-p npcd`, `-p tokerad` each green alone; unit: a path two tenants register refuses to start; `/` serves zend's UI for `code.tokera.com` and a bare IP and npcd's for `bot.tokera.com`; a file rewritten in a content directory is served changed on the next request and changes `build`, with the process untouched; a missing content directory refuses to start; an npcd turn's thinking mode is the one npcd chose, under the core's `thinking(true)`; a live restart of each |
 | 4 | **Shared endpoints** (§3.5) | the overlaps served once as their superset; one identity rule, one role table, host accounts; both UIs on the chosen field meanings | unit per endpoint with raw expected bodies — both tenants' sections present, shared parts once, `timeline` a string, signed-out `/v1/me` a 200; `/ws/logs` neither drops nor repeats a line across replay; a header from a non-gateway peer is not believed. GUI: zend's status overlay, substrate page and perf page; npcd's console sign-in, substrate, tools and system pages |
 | 5 | **The prescribed model** (§5) | `host::MODEL` for every tenant; zend's ladder and `--model` removed; the fine-tune in `PRESETS` | unit: `MODEL` passes both tenants' capabilities; a capability `MODEL` lacks is refused with the tenant's name. Live: zend on a new substrate under the prescribed model — ingest rebuilds, chat works |
-| 6 | **zend outranks npcd** (§3.6) | priority ordered tenant first, band second | unit: a zend `Low` sequence with work pauses an npcd `High` one, and the pause lifts at `COOLDOWN`; an npcd `High` decode does not pause or throttle a zend `Low` prompt; a zend decode throttles an npcd prompt by its band's ratio |
+| 6 | **zend and npcd equal** (§3.6) | priority by band alone, whichever tenant | unit: two tenants' `Low` sequences do not pause each other; either tenant's `High` pauses both tenants' `Low`, and the pause lifts at `COOLDOWN`; an npcd decode throttles a zend ingest prompt by its band's ratio, and a zend section chunk yields to an npcd dialogue |
 | 7 | **`tokerad` on `.5`** | `tokerad` deployed: both daemons in one process on `:8081` / `:8444`; npcd's mind and data on `.5`; the gateway points `bot.tokera.com` at `:8444` beside `code.tokera.com`. npcd's substrate was written by the AntiLoop + StyleTune fine-tune, which the host no longer prescribes (§5.1), so it refuses at open, before anything in it is rewritten (§4.2), and npcd starts `tokerad` on a new `--data`. The new one must also be written under the engine's minimum YaRN factor — zend's `rope: min_yarn_factor: 2` — or it refuses the first time npcd runs beside zend (§4.1) | live: both GUIs through the gateway, both on the LAN, a refused start when a substrate's model is swapped |
 
 Phase 1 is worth doing first and on its own: it closes a live corruption path in both
@@ -870,5 +873,5 @@ daemons regardless of whether the host is built.
 | 3 | yes — `host/`, `tokerad/`, `zend::tenant`, `npcd::tenant` | `host` unit tests (site table, edit-on-disk, missing directory, path overlap including catch-alls and nests, build id, one-shot flags dropped on relaunch); the core's `thinking(true)` changes nothing for a tenant that set none (`models::builder::thinking_tests`, `engine_slot::core_requests`); `zend/tests/gui_api_harness.rs` over the assembled server; `cargo build -p zend`, `-p npcd`, `-p tokerad`; zend restarted live through `host::run` |
 | 4 | yes — `host::endpoints`, `web::Builder::trust`, `host::access`, both UIs on the chosen fields | unit per endpoint with exact bodies; `/ws/logs` neither drops nor repeats across replay (`endpoints::logs`); a header from a non-gateway peer cleared, in the server and in the assembled host (`web/tests/roles.rs`, `host::server`); `--local-signin` refused beside `--gateway` |
 | 5 | yes — `host::MODEL` (Flash-Next `Q4_KO` since 2026-10-11, §5.1); zend's ladder and `--model` gone | both tenants' `requires()` against `MODEL`; `Capabilities::check` naming every lack. Live: zend under Flash-Next, 2026-10-11, on the substrate it had run on — written before keys, admitted by §4.2's check, then adopted (`docs/replicated_substrate.md` §6.2) |
-| 6 | yes — `Priority { tenant, band }` | `scheduler::priority_pause` and `scheduler::prefill` unit tests, including a first tenant's section chunk outranking a second's dialogue |
-| 7 | no | deployment, done with the operator |
+| 6 | yes — the band (`DecodePriority`) alone; first built tenant first, changed 2026-10-12 | `scheduler::priority_pause` and `scheduler::prefill` unit tests: two tenants' ingests together, a second tenant's dialogue pausing and throttling a first tenant's ingest, a section chunk yielding to another tenant's dialogue |
+| 7 | yes — 2026-10-12, as a member of the gateway's cluster (`docs/replicated_substrate.md` §15.1) | deployment, done with the operator |
