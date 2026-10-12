@@ -17,6 +17,7 @@
 use candle::cuda_backend::CudaStorageSlice;
 use candle::{DType, Device, Layout, Result, Storage, Tensor};
 use candle_kernels::sampling::run_stamp_counts;
+use candle_transformers::models::held_tensor::{held_empty, held_zeros};
 use cudarc::driver::{CudaStream, DevicePtr, SyncOnDrop};
 use std::ffi::c_void;
 
@@ -150,8 +151,9 @@ impl DeviceCountTable {
                 .as_ref()
                 .map_or(0, |e| e.elem_count() * 2)
                 .max(words);
-            // Fully written by the upload before any launch reads it.
-            self.entries = Some(Tensor::empty(grown, DType::U32, device)?);
+            // Fully written by the upload before any launch reads it; on held
+            // ground, since it lives as long as the sampler.
+            self.entries = Some(held_empty(grown, DType::U32, device)?);
         }
         self.entries
             .as_ref()
@@ -197,8 +199,9 @@ impl DeviceCountTable {
             }
             self.narrow_run = 0;
             // Zeroed, not uninitialised: the zero is what every unstamped entry
-            // reads, and the table is kept zero from here on by `clear`.
-            self.table = Some(Tensor::zeros(fit, DType::U32, device)?);
+            // reads, and the table is kept zero from here on by `clear`. On held
+            // ground, since it lives as long as the sampler.
+            self.table = Some(held_zeros(fit, DType::U32, device)?);
         }
         Ok(self.table.clone().expect("table sized above"))
     }

@@ -1,4 +1,4 @@
-//! The PLE block on the device: one GEMM and three fused launches in place of
+//! The PLE block on the device: one int8 GEMM and three fused launches in place of
 //! [`super::ple::ple_apply_spans`]'s eager chain, every transient on the wave's
 //! arena, and the residual updated in place.
 //!
@@ -24,6 +24,8 @@ use std::mem;
 
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
+use candle::quantized::cuda::to_dynamic;
+use candle::quantized::{GgmlDType, Int8Mode, QTensor, SumScale};
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, LiveTensor, Result, Storage, Tensor};
 use candle_kernels::simple::ple_fused::{run_ple_conv, run_ple_gate, PLE_SPAN_WORDS};
@@ -32,14 +34,30 @@ use super::config::PleConfig;
 use super::device_operand::{with_operand, Operand};
 use super::model::PleSource;
 use super::ple::{ple_row_ids, PleSpan, PleWeights};
+use crate::models::quantized_matmul::QMatMul;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
+
+/// The int8 matmul's K tile: the projection's input width must be a multiple.
+const K_TILE: usize = 128;
+/// The int8 matmul's N tile: the projection's output rows must be a multiple.
+const ROW_GROUP: usize = 32;
 
 /// The PLE weights in the shapes the fused launches read, built once at load.
 #[derive(Debug, Clone)]
 pub struct PleFusedWeights {
     /// `[hc·d + d, hidden]`: the key projection's rows, then the value's — one
     /// GEMM for both, its output the `kv` the gate kernel reads.
-    pub key_value: Tensor,
+    ///
+    /// Held Q8 KO and run on the int8 tensor cores, as every other dense
+    /// projection in this engine is. Held F32 it ran as a cuBLAS SGEMM over
+    /// every row of the wave — 60–190 ms a prefill wave on an RTX 3090 — and
+    /// cuBLAS picks that SGEMM's tile by the row count, so the recorded
+    /// segment holding it changed topology with the wave's width and was
+    /// instantiated afresh (`docs/decode_graphs.md` §2.2).
+    pub key_value: QMatMul,
+    /// The session's int8 mode, which the projection's activations are
+    /// quantized for.
+    pub mode: Int8Mode,
     /// `[hc·d]` each, as in [`PleWeights`].
     pub norm_key: Tensor,
     pub norm_query: Tensor,
@@ -50,11 +68,29 @@ pub struct PleFusedWeights {
 }
 
 impl PleFusedWeights {
-    /// Stack and transpose `w` for the fused launches — load-time copies, made
-    /// once.
-    pub fn from_weights(w: &PleWeights) -> Result<Self> {
+    /// Stack, quantize and transpose `w` for the fused launches under `mode` —
+    /// load-time copies, made once. An int8 session holds the projection Q8
+    /// KO; a float one keeps it F32, exactly as the eager chain computes it.
+    pub fn from_weights(w: &PleWeights, mode: Int8Mode) -> Result<Self> {
+        let key_value = Tensor::cat(&[&w.key, &w.value], 0)?;
+        let (rows, k) = key_value.dims2()?;
+        let dtype = if mode.is_int8() {
+            if k % K_TILE != 0 || rows % ROW_GROUP != 0 {
+                candle::bail!(
+                    "ple: a [{rows}, {k}] key|value projection does not tile the int8 matmul \
+                     (K a multiple of {K_TILE}, rows of {ROW_GROUP})"
+                );
+            }
+            GgmlDType::Q8_0
+        } else {
+            GgmlDType::F32
+        };
         Ok(Self {
-            key_value: Tensor::cat(&[&w.key, &w.value], 0)?,
+            key_value: QMatMul::from_qtensor_with_mode(
+                QTensor::quantize(&key_value, dtype)?,
+                mode,
+            )?,
+            mode,
             norm_key: w.norm_key.clone(),
             norm_query: w.norm_query.clone(),
             norm_conv: w.norm_conv.clone(),
@@ -107,10 +143,16 @@ pub fn ple_apply_spans_fused(
             flat.extend(token_rows);
         }
     }
-    let hidden = w.key_value.dim(1)?;
-    let emb = table.rows(&flat, root)?.reshape((total, hidden))?;
-    // Key and value together; the projection inherits the rows' arena.
-    let kv = emb.matmul(&w.key_value.t()?)?;
+    let rows = table.rows(&flat, root)?;
+    let hidden = rows.elem_count() / total.max(1);
+    let emb = rows.reshape((total, hidden))?;
+    // Key and value together on the int8 path; the operand and the projection
+    // are carved beside the rows, on their arena.
+    let Device::Cuda(cuda) = &dev else {
+        candle::bail!("ple: the fused block runs on CUDA");
+    };
+    let acts = to_dynamic(&emb, w.mode, cuda, SumScale::Raw)?;
+    let kv = w.key_value.forward_dynamic(acts.as_dynamic(), DType::F32)?;
     let normalized = wave_empty_ticketed((total, hcd), DType::F32, &dev, root)?;
     launch_gate(&kv, res, w, &normalized, eps)?;
 
@@ -341,12 +383,18 @@ fn table_ptr(t: &LiveTensor<'_>) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use candle::quantized::Int8Mode;
     use candle::Device;
 
-    use super::super::ple_bench::{gate_once, gate_waves};
+    use super::super::ple_bench::{gate_once, gate_waves, gate_waves_in};
 
     /// The bench's admissible gap: reassociation of the norms' reductions.
     const GATE: f32 = 2e-5;
+
+    /// The admissible gap with the projection on the int8 path: Q8 weights and
+    /// q8a128 activations over a 128-wide reduction, carried through the gate
+    /// and the conv into a residual they add to.
+    const INT8_GATE: f32 = 1e-2;
 
     /// Fused against the eager chain on the device — the residual, every
     /// sequence's next history and the captured rows — across decode rows, a
@@ -382,5 +430,35 @@ mod tests {
         };
         let gap = gate_waves(&dev, 4, 128, 16, &[4, 1, 11], 3, 0x52).unwrap();
         assert!(gap <= GATE, "gap {gap}");
+    }
+
+    /// An int8 session runs the key|value projection on the int8 path, and the
+    /// block stays within that projection's quantization of the eager F32
+    /// chain — decode rows, a short segment and a long one, over three waves.
+    #[test]
+    fn the_int8_projection_stays_within_its_quantization() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return;
+        };
+        let mode = Int8Mode::auto(&dev);
+        assert!(mode.is_int8(), "a CUDA card runs an int8 session");
+        let gap = gate_waves_in(&dev, mode, 4, 128, 16, &[1, 3, 20, 6], 3, 0x53).unwrap();
+        assert!(gap <= INT8_GATE, "gap {gap}");
+    }
+
+    /// An int8 session refuses a projection the int8 matmul cannot tile, by
+    /// name; a float session takes the same projection.
+    #[test]
+    fn an_int8_projection_must_tile() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return;
+        };
+        let mode = Int8Mode::auto(&dev);
+        let err = gate_waves_in(&dev, mode, 4, 66, 2, &[5], 1, 0x54).unwrap_err();
+        assert!(
+            err.to_string().contains("does not tile the int8 matmul"),
+            "{err}"
+        );
+        gate_waves_in(&dev, Int8Mode::Off, 4, 66, 2, &[5], 1, 0x54).unwrap();
     }
 }

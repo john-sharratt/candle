@@ -60,6 +60,17 @@ impl PleCacheStats {
 pub trait PleRowFetch: Send + Sync {
     /// Read row `id`'s record into `dst` (exactly `record_bytes` long).
     fn fetch(&self, id: u32, dst: &mut [u8]) -> Result<()>;
+
+    /// Read every `ids[i]`'s record into the `i`th `record_bytes` of `dst` —
+    /// one gather's misses, as one batch. Reads them one at a time unless the
+    /// source can do better; the disk source reads them together.
+    fn fetch_many(&self, ids: &[u32], dst: &mut [u8]) -> Result<()> {
+        let rb = dst.len() / ids.len().max(1);
+        for (i, &id) in ids.iter().enumerate() {
+            self.fetch(id, &mut dst[i * rb..(i + 1) * rb])?;
+        }
+        Ok(())
+    }
 }
 
 struct CacheState {
@@ -78,10 +89,10 @@ struct CacheState {
     stats: PleCacheStats,
 }
 
-/// The bounded row cache. Interior-mutable behind one mutex: gathers are
-/// 16 rows per token on the session thread, microseconds against the forward
-/// they precede, and a sharded map would buy contention headroom no measured
-/// caller has asked for.
+/// The bounded row cache. Interior-mutable behind one mutex: gathers come
+/// from the forward's thread alone, 16 rows per token, so a sharded map would
+/// buy contention headroom no caller has asked for. What a gather costs is its
+/// misses' disk reads, which [`Self::gather`] batches.
 pub struct PleRowCache<F: PleRowFetch> {
     fetch: F,
     record_bytes: usize,
@@ -120,52 +131,82 @@ impl<F: PleRowFetch> PleRowCache<F> {
     /// Gather `ids`' records into one contiguous buffer (`ids.len() ×
     /// record_bytes`), reading through the cache. This is the buffer the
     /// engine uploads verbatim; the oracle dequantizes it host-side.
+    ///
+    /// **Every miss is read in one batch.** The table is hashed n-grams over
+    /// 320M rows, so a prompt's rows are mostly misses, and read one at a time
+    /// each waited its own NVMe round trip on the forward's thread: about 90k
+    /// rows for a 5.7k-token wave, ~4 s with the GPU idle behind it (npcd's
+    /// mind ingest, Flash-Next on an RTX 3090 — three such gaps in 30 s of
+    /// Nsight). So hits are copied out first, each distinct miss is listed
+    /// once and fetched together ([`PleRowFetch::fetch_many`]), and only then
+    /// are the misses cached — so an eviction they cause cannot touch a row
+    /// this gather has already copied.
     pub fn gather(&self, ids: &[u32], out: &mut Vec<u8>) -> Result<()> {
+        let rb = self.record_bytes;
         out.clear();
-        out.reserve(ids.len() * self.record_bytes);
+        out.resize(ids.len() * rb, 0);
         let mut st = self.state.lock().expect("ple cache poisoned");
         let st = &mut *st;
-        for &id in ids {
-            let slot = match st.map.get(&id) {
-                Some(&s) => {
+        let mut missing: Vec<u32> = Vec::new();
+        let mut listed: ahash::HashMap<u32, usize> = ahash::HashMap::default();
+        // (output position, index into `missing`) for every position a miss fills.
+        let mut wants: Vec<(usize, usize)> = Vec::new();
+        for (pos, &id) in ids.iter().enumerate() {
+            if let Some(&s) = st.map.get(&id) {
+                st.stats.hits += 1;
+                let s = s as usize;
+                st.referenced[s] = 1;
+                out[pos * rb..(pos + 1) * rb].copy_from_slice(&st.arena[s * rb..(s + 1) * rb]);
+                continue;
+            }
+            let at = match listed.get(&id) {
+                // A repeat of a row this gather already reads: served by that read.
+                Some(&at) => {
                     st.stats.hits += 1;
-                    st.referenced[s as usize] = 1;
-                    s as usize
+                    at
                 }
                 None => {
                     st.stats.misses += 1;
-                    let slot = if st.frontier < st.owner.len() {
-                        let s = st.frontier;
-                        st.frontier += 1;
-                        s
-                    } else {
-                        // CLOCK: sweep until an unreferenced slot turns up,
-                        // clearing reference bits as the hand passes.
-                        loop {
-                            let s = st.hand;
-                            st.hand = (st.hand + 1) % st.owner.len();
-                            if st.referenced[s] == 0 {
-                                break s;
-                            }
-                            st.referenced[s] = 0;
-                        }
-                    };
-                    if st.owner[slot] != u32::MAX {
-                        st.map.remove(&st.owner[slot]);
-                        st.stats.evictions += 1;
-                    }
-                    let dst =
-                        &mut st.arena[slot * self.record_bytes..(slot + 1) * self.record_bytes];
-                    self.fetch.fetch(id, dst)?;
-                    st.owner[slot] = id;
-                    st.referenced[slot] = 1;
-                    st.map.insert(id, slot as u32);
-                    slot
+                    missing.push(id);
+                    listed.insert(id, missing.len() - 1);
+                    missing.len() - 1
                 }
             };
-            out.extend_from_slice(
-                &st.arena[slot * self.record_bytes..(slot + 1) * self.record_bytes],
-            );
+            wants.push((pos, at));
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut fetched = vec![0u8; missing.len() * rb];
+        self.fetch.fetch_many(&missing, &mut fetched)?;
+        for &(pos, at) in &wants {
+            out[pos * rb..(pos + 1) * rb].copy_from_slice(&fetched[at * rb..(at + 1) * rb]);
+        }
+        for (at, &id) in missing.iter().enumerate() {
+            let slot = if st.frontier < st.owner.len() {
+                let s = st.frontier;
+                st.frontier += 1;
+                s
+            } else {
+                // CLOCK: sweep until an unreferenced slot turns up, clearing
+                // reference bits as the hand passes.
+                loop {
+                    let s = st.hand;
+                    st.hand = (st.hand + 1) % st.owner.len();
+                    if st.referenced[s] == 0 {
+                        break s;
+                    }
+                    st.referenced[s] = 0;
+                }
+            };
+            if st.owner[slot] != u32::MAX {
+                st.map.remove(&st.owner[slot]);
+                st.stats.evictions += 1;
+            }
+            st.arena[slot * rb..(slot + 1) * rb].copy_from_slice(&fetched[at * rb..(at + 1) * rb]);
+            st.owner[slot] = id;
+            st.referenced[slot] = 1;
+            st.map.insert(id, slot as u32);
         }
         Ok(())
     }
@@ -253,11 +294,14 @@ pub fn gpu_dequant_rows_to_host(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     /// A synthetic table whose row `id`'s record is a recognisable pattern,
-    /// counting fetches so tests can see the disk traffic the cache saved.
+    /// counting fetches so tests can see the disk traffic the cache saved, and
+    /// recording each batch it was asked for.
     struct MemTable {
         fetches: AtomicU64,
+        batches: Mutex<Vec<Vec<u32>>>,
     }
 
     impl PleRowFetch for MemTable {
@@ -268,6 +312,15 @@ mod tests {
             }
             Ok(())
         }
+
+        fn fetch_many(&self, ids: &[u32], dst: &mut [u8]) -> Result<()> {
+            self.batches.lock().unwrap().push(ids.to_vec());
+            let rb = dst.len() / ids.len();
+            for (i, &id) in ids.iter().enumerate() {
+                self.fetch(id, &mut dst[i * rb..(i + 1) * rb])?;
+            }
+            Ok(())
+        }
     }
 
     fn cache(slots: usize) -> PleRowCache<MemTable> {
@@ -275,11 +328,47 @@ mod tests {
         PleRowCache::new(
             MemTable {
                 fetches: AtomicU64::new(0),
+                batches: Mutex::new(Vec::new()),
             },
             rb,
             slots * rb,
         )
         .unwrap()
+    }
+
+    /// A gather reads its misses as one batch, each distinct row once, and the
+    /// next gather asks only for what is not cached.
+    #[test]
+    fn a_gather_reads_its_misses_in_one_batch() {
+        let c = cache(8);
+        let mut out = Vec::new();
+        c.gather(&[3, 5, 3, 9, 5], &mut out).unwrap();
+        c.gather(&[3, 7, 9], &mut out).unwrap();
+        assert_eq!(
+            *c.fetch.batches.lock().unwrap(),
+            vec![vec![3, 5, 9], vec![7]]
+        );
+        let rb = c.record_bytes();
+        for (i, &id) in [3u32, 7, 9].iter().enumerate() {
+            assert_eq!(&out[i * rb..(i + 1) * rb], record(id, rb), "row {id}");
+        }
+    }
+
+    /// Misses that evict one another — more distinct rows than slots — still
+    /// come back right, repeats included: the output is filled before any of
+    /// them is cached.
+    #[test]
+    fn a_gather_wider_than_the_cache_returns_every_row() {
+        let c = cache(2);
+        let mut out = Vec::new();
+        let ids = [1u32, 2, 3, 1, 4];
+        c.gather(&ids, &mut out).unwrap();
+        let rb = c.record_bytes();
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(&out[i * rb..(i + 1) * rb], record(id, rb), "position {i}");
+        }
+        let s = c.stats();
+        assert_eq!((s.misses, s.hits, s.evictions), (4, 1, 2));
     }
 
     fn record(id: u32, rb: usize) -> Vec<u8> {

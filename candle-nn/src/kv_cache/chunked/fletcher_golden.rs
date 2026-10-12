@@ -10,9 +10,6 @@
 //! golden is the ground truth a later CPU recompute ([`candle::fletcher::fletcher32`])
 //! checks the warm/cold copy against.
 
-#[cfg(feature = "cuda")]
-use candle::cuda_backend::cudarc::driver::CudaStream;
-
 /// One record in a golden-checksum plan: `byte_len` bytes at `src_ptr` (a
 /// resolved device address) to be checksummed in place on the GPU.
 #[cfg(feature = "cuda")]
@@ -23,25 +20,24 @@ pub struct GoldenRecord {
 }
 
 /// Compute a Fletcher-32 golden for each record's device byte span in one
-/// kernel launch, one checksum per record with input order preserved. Uses the
-/// default decode stream; see [`fletcher32_golden_on`] to pick a stream.
+/// kernel launch on the device's stream, one checksum per record with input
+/// order preserved.
+///
+/// The plan and the results share the device's held launch-table scratch
+/// ([`candle::CudaDevice::with_synced_upload`]): one upload carries both plan
+/// arrays, the kernel writes its checksums beside them, and one copy reads
+/// them back before the scratch is let go. Nothing is allocated — this runs on
+/// the persistence thread for every sealed sequence, and it used to take three
+/// buffers from the driver each time.
 #[cfg(feature = "cuda")]
 pub fn fletcher32_golden(
     device: &candle::Device,
     records: &[GoldenRecord],
 ) -> candle::Result<Vec<u32>> {
-    fletcher32_golden_on(device, records, None)
-}
-
-/// [`fletcher32_golden`] on a caller-chosen stream.
-#[cfg(feature = "cuda")]
-pub fn fletcher32_golden_on(
-    device: &candle::Device,
-    records: &[GoldenRecord],
-    stream: Option<&CudaStream>,
-) -> candle::Result<Vec<u32>> {
-    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async;
     use candle::cuda_backend::kernels;
+    use candle::cuda_backend::staged::segment;
+    use candle::cuda_backend::WrapErr;
 
     let dev = match device {
         candle::Device::Cuda(d) => d,
@@ -57,46 +53,32 @@ pub fn fletcher32_golden_on(
 
     let src: Vec<i64> = records.iter().map(|r| r.src_ptr).collect();
     let lens: Vec<i64> = records.iter().map(|r| r.byte_len).collect();
-
-    let src_gpu = dev
-        .memcpy_stod(&src)
-        .map_err(|e| candle::Error::Msg(format!("fletcher32_golden: src plan HtoD: {e}")))?;
-    let len_gpu = dev
-        .memcpy_stod(&lens)
-        .map_err(|e| candle::Error::Msg(format!("fletcher32_golden: len plan HtoD: {e}")))?;
-    let out_gpu = unsafe { dev.alloc::<u32>(records.len()) }
-        .map_err(|e| candle::Error::Msg(format!("fletcher32_golden: out alloc: {e}")))?;
-
-    let default_stream = dev.cuda_stream();
-    let used_stream = stream.unwrap_or(&default_stream);
-    // Same cross-stream ordering hazard as kv_migrate: on a dedicated stream the
-    // plan uploads and the freshly-quantized source bytes retire in PRIMARY-stream
-    // order, so drain the device once before the cross-stream launch. The
-    // default-stream path is same-stream FIFO and needs no fence.
-    if stream.is_some() {
-        device
-            .synchronize()
-            .map_err(|e| candle::Error::Msg(format!("fletcher32_golden: pre-launch fence: {e}")))?;
-    }
-    let (sp, _sg) = src_gpu.device_ptr(used_stream);
-    let (lp, _lg) = len_gpu.device_ptr(used_stream);
-    let (op, _og) = out_gpu.device_ptr(used_stream);
-    unsafe {
-        candle::set_kernel_breadcrumb("run_fletcher32", file!(), line!());
-        kernels::simple::fletcher32::run_fletcher32(
-            sp as *const i64,
-            lp as *const i64,
-            op as *mut u32,
-            records.len() as i32,
-            used_stream.cu_stream() as *mut std::ffi::c_void,
-        );
-    }
-    used_stream
-        .synchronize()
-        .map_err(|e| candle::Error::Msg(format!("fletcher32_golden: stream sync: {e}")))?;
-
-    dev.memcpy_dtov(&out_gpu)
-        .map_err(|e| candle::Error::Msg(format!("fletcher32_golden: out DtoH: {e}")))
+    let stream = dev.cuda_stream();
+    let mut out = vec![0u32; records.len()];
+    dev.with_synced_upload(
+        &stream,
+        &[segment(&src), segment(&lens)],
+        records.len() * std::mem::size_of::<u32>(),
+        |at, room| {
+            // SAFETY: `at` names the uploaded plan arrays and `room` the
+            // checksums' space, all held until this closure returns; the kernel
+            // writes every checksum, and the readback is ordered behind the
+            // launch and waited for before the scratch is released.
+            unsafe {
+                candle::set_kernel_breadcrumb("run_fletcher32", file!(), line!());
+                kernels::simple::fletcher32::run_fletcher32(
+                    at[0] as *const i64,
+                    at[1] as *const i64,
+                    room as *mut u32,
+                    records.len() as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                );
+                memcpy_dtoh_async(&mut out, room, stream.cu_stream()).w()?;
+            }
+            stream.synchronize().w()
+        },
+    )?;
+    Ok(out)
 }
 
 #[cfg(all(test, feature = "cuda"))]

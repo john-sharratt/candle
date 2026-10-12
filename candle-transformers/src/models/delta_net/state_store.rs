@@ -1356,14 +1356,7 @@ impl RecurrentStateStore {
             // Written into the slot's buffers rather than replacing them: the
             // slot's tensors keep their identity for the store's whole life, and
             // the fused decode kernels rely on that.
-            slot.live.copy_from(&DeltaNetState {
-                s: Tensor::from_vec(state_f, (d.n_v_heads, d.head_dim, d.head_dim), &self.device)?,
-                conv_tail: Tensor::from_vec(
-                    tail_f,
-                    (d.conv_dim(), d.conv_kernel - 1),
-                    &self.device,
-                )?,
-            })?;
+            slot.live.write_host(&state_f, &tail_f)?;
         }
         // Restored state is state someone put here on purpose. Without this the
         // first wave on a resumed slot standing at offset 0 would reset it, and

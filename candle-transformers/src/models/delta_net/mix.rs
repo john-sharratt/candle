@@ -62,6 +62,8 @@ use candle_nn::kv_cache::{relocate_tensor, ArenaSlot};
 
 #[cfg(feature = "cuda")]
 use crate::models::latent_moe::scatter::{rows_scatter_inline, RowRun};
+#[cfg(feature = "cuda")]
+use crate::models::wave_buffers::upload_into;
 
 #[cfg(feature = "cuda")]
 use super::replay_stack::{delta_net_replay_stack, ReplaySpan, ReplayStates, StackedLayer};
@@ -117,6 +119,33 @@ impl DeltaNetState {
     pub fn copy_from(&mut self, src: &Self) -> Result<()> {
         self.s.slice_set(&src.s, 0, 0)?;
         self.conv_tail.slice_set(&src.conv_tail, 0, 0)
+    }
+
+    /// Overwrite both buffers from host values, in place — a restore's write.
+    ///
+    /// On CUDA the bytes go straight into the slot's own storage, one upload per
+    /// buffer, and nothing else is touched on the device. Restoring through
+    /// [`Self::copy_from`] built a device-side source first, so every resume
+    /// allocated a whole layer state from the driver to copy it once and drop
+    /// it: 3.2 MiB per layer on Flash-Next, outside the reservation.
+    pub fn write_host(&mut self, s: &[f32], conv_tail: &[f32]) -> Result<()> {
+        match self.s.device() {
+            #[cfg(feature = "cuda")]
+            Device::Cuda(_) => {
+                upload_into(&self.s, s)?;
+                upload_into(&self.conv_tail, conv_tail)
+            }
+            dev => {
+                let dev = dev.clone();
+                self.s
+                    .slice_set(&Tensor::from_vec(s.to_vec(), self.s.shape(), &dev)?, 0, 0)?;
+                self.conv_tail.slice_set(
+                    &Tensor::from_vec(conv_tail.to_vec(), self.conv_tail.shape(), &dev)?,
+                    0,
+                    0,
+                )
+            }
+        }
     }
 
     pub fn zeros(dims: &DeltaNetDims, dev: &Device) -> Result<Self> {

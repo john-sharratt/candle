@@ -159,4 +159,24 @@ extern "C" {
         table: *mut u32,
         stream: *mut c_void,
     );
+
+    /// The device half of `rows` allow-list rows, one block each, queued on
+    /// `stream`. Row `r` gathers `allow[allow_off[r]..][..allow_len[r]]` from
+    /// the logits row at device address `logits[r]` (`dtype`: 0 F32, 1 F16,
+    /// 2 BF16; an `allow` entry of `u32::MAX` is a banned position, read as
+    /// −∞) and writes, from word `out_off[r]` of `out`: with `temp[r] <= 0`
+    /// the local index of the first maximum, otherwise `allow_len[r]` F32
+    /// probabilities — the softmax of the logits divided by `temp[r]`.
+    pub fn run_allow_list_rows(
+        logits: *const u64,
+        allow: *const u32,
+        allow_off: *const u32,
+        allow_len: *const u32,
+        temp: *const f32,
+        out_off: *const u32,
+        rows: u32,
+        dtype: i32,
+        out: *mut u32,
+        stream: *mut c_void,
+    );
 }

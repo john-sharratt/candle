@@ -8,18 +8,18 @@ use crate::kv_cache::chunked::backing::BackingInner;
 use crate::kv_cache::chunked::head_gids::{ChunkBands, GIDS_PER_HEAD};
 use crate::kv_cache::QuantFormat;
 use crate::kv_cache::{ChunkedKvBacking, KvFormat, GID_STRIDE, N_PALETTE};
-use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaSlice, CudaStream};
+use candle::cuda_backend::cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DevicePtr};
 use candle::quantized::{
     cuda::{
         reduce_head_format_stats, sample_quant_errors_kv_paged_staged, sample_quant_errors_paged,
-        select_and_summarize_kv_winners_paged_staged,
-        select_kv_format_palette4_paged_batched_raw_from_device_ptrs,
+        select_and_summarize_kv_winners_paged_staged, select_palette4_in, Palette4Layout,
+        Palette4Result,
     },
     pinned_staging::{Generation, GpuBuf, PinnedBuf},
     GgmlDType,
 };
 use candle::Result;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Stage `bytes` where a kernel can read them.
 ///
@@ -701,9 +701,80 @@ pub struct PagedSelectionGpuInputs {
     /// or a plain allocation — in both cases they own or borrow memory this
     /// struct does not have to pin.
     _bump_gen: Option<super::super::bump_arena::Generation>,
+    /// The palette-4 selection's block — inputs, outputs and readback source —
+    /// carved from `_bump_gen` on first use and reused by every selection over
+    /// these inputs: each one synchronises before it returns, so the block is
+    /// idle between them. `(address, bytes)`.
+    palette_block: Mutex<Option<(u64, usize)>>,
+    /// A block taken from the driver, for inputs staged without a span.
+    palette_owned: Mutex<Option<CudaSlice<u8>>>,
 }
 
 impl PagedSelectionGpuInputs {
+    /// A device block of at least `bytes` for one palette-4 selection.
+    fn palette_block(&self, bytes: usize) -> Result<u64> {
+        let bytes = bytes.max(256);
+        let mut held = self.palette_block.lock().unwrap();
+        if let Some((at, len)) = *held {
+            if len >= bytes {
+                return Ok(at);
+            }
+        }
+        if let Some(bump) = self._bump_gen.as_ref() {
+            let at = bump.alloc(bytes, 256)?.ptr;
+            *held = Some((at, bytes));
+            return Ok(at);
+        }
+        // No span to carve from — CPU-staged test inputs. The block is this
+        // struct's to hold and is recorded as a driver allocation.
+        let mut owned = self.palette_owned.lock().unwrap();
+        // SAFETY: the selection writes its inputs and clears its outputs
+        // before the kernel reads either.
+        let slice = unsafe { self.dev.alloc::<u8>(bytes)? };
+        let at = slice.device_ptr(&self.dev.cuda_stream()).0;
+        *owned = Some(slice);
+        *held = Some((at, bytes));
+        Ok(at)
+    }
+
+    /// One fused palette-4 selection over these inputs, read back.
+    fn run_palette4(
+        &self,
+        k_ggml: &[GgmlDType],
+        v_ggml: &[GgmlDType],
+        thresholds: [f32; 4],
+        valid_ranges: &[i32],
+    ) -> Result<Palette4Result> {
+        let blocks_per_head = self.checked_blocks_per_head()?;
+        let n_chunks = self.chunk_gids_keepalive.len();
+        let layout = Palette4Layout::new(
+            n_chunks,
+            self.n_kv_head,
+            blocks_per_head,
+            k_ggml.len(),
+            v_ggml.len(),
+        );
+        let block = self.palette_block(layout.bytes())?;
+        // SAFETY: both tables are staged for these inputs and live as long as
+        // `self`; `block` holds `layout.bytes()` and nothing else touches it.
+        unsafe {
+            select_palette4_in(
+                self.per_head_table_buf.dev_ptr(),
+                self.head_gids_buf.dev_ptr(),
+                n_chunks,
+                k_ggml,
+                v_ggml,
+                thresholds,
+                blocks_per_head,
+                self.n_kv_head,
+                self.arena_chunks,
+                valid_ranges,
+                block,
+                &self.dev.cuda_stream(),
+            )
+        }
+    }
+
     /// Stage `k_chunks` / `v_chunks` as F32 float arenas. Each chunk is
     /// `[H][P][T][D']` flat f32 of length `n_kv_head * head_dim * chunk_size` —
     /// palette bands in order, each token-major — the layout the float arenas
@@ -1005,6 +1076,8 @@ impl PagedSelectionGpuInputs {
             // Staged through `bump_gen` above, so the buffers borrow the span
             // it holds open.
             _bump_gen: bump_gen,
+            palette_block: Mutex::new(None),
+            palette_owned: Mutex::new(None),
         })
     }
 
@@ -1080,9 +1153,13 @@ impl PagedSelectionGpuInputs {
             bytes = unified_table.len() * std::mem::size_of::<i64>(),
             "fused selection table"
         );
-        let bump_gen = bump_generation(generation, dev);
-        let per_head_table_buf = stage_table(&unified_table, bump_gen.as_ref(), dev)?;
+        // The span, whatever the caller passed: neither table is staged through
+        // the pinned generation (see `from_head_gids`), so a pinned caller that
+        // skipped the bump guard sent both uploads to the driver — the
+        // persistence thread's most frequent allocation, once per drain.
         let _ = generation;
+        let bump_gen = bump_generation(None, dev);
+        let per_head_table_buf = stage_table(&unified_table, bump_gen.as_ref(), dev)?;
         let head_gids_buf = stage_i64_slice(&unified_head_gids, None, bump_gen.as_ref(), dev)?;
 
         Ok((
@@ -1097,6 +1174,8 @@ impl PagedSelectionGpuInputs {
                 arena_chunks: GID_STRIDE,
                 dev: dev.clone(),
                 _bump_gen: bump_gen,
+                palette_block: Mutex::new(None),
+                palette_owned: Mutex::new(None),
             },
             chunk_counts,
         ))
@@ -1135,6 +1214,8 @@ impl PagedSelectionGpuInputs {
             // Re-uploaded through `bump_gen` above, so these borrow the span
             // it holds open.
             _bump_gen: bump_gen,
+            palette_block: Mutex::new(None),
+            palette_owned: Mutex::new(None),
             chunk_gids_keepalive,
             per_head_table,
             per_head_table_buf,
@@ -1221,55 +1302,32 @@ impl PagedSelectionGpuInputs {
             .map(|f| f.to_ggml_dtype())
             .collect();
 
-        let pht_ptr = self.per_head_table_buf.dev_ptr();
-        let gids_ptr = self.head_gids_buf.dev_ptr();
         let n_chunks = self.chunk_gids_keepalive.len();
         let total_heads = n_chunks * self.n_kv_head;
         // Per-block selection is only used on full chunks.
         let valid_ranges_arg = vec![32i32; n_chunks];
 
-        let (
-            k_pal_tags_gpu,
-            v_pal_tags_gpu,
-            k_pal_scale_gpu,
-            v_pal_scale_gpu,
-            k_pal_map_gpu,
-            v_pal_map_gpu,
-            k_head_amax_gpu,
-            v_head_amax_gpu,
-            _k_eff_gpu,
-            _v_eff_gpu,
-            _k_htags_gpu,
-            _v_htags_gpu,
-            _q_rel_gpu,
-        ) = unsafe {
-            select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
-                pht_ptr,
-                gids_ptr,
-                n_chunks,
-                &k_ggml,
-                &v_ggml,
+        let Palette4Result {
+            k_palette_tags: k_pal_tags_cpu,
+            v_palette_tags: v_pal_tags_cpu,
+            k_pal_scale: k_pal_scale_cpu,
+            v_pal_scale: v_pal_scale_cpu,
+            k_palette_map: k_map_cpu,
+            v_palette_map: v_map_cpu,
+            k_head_amax,
+            v_head_amax,
+            ..
+        } = self.run_palette4(
+            &k_ggml,
+            &v_ggml,
+            [
                 k_threshold_hi,
                 k_threshold_lo,
                 v_threshold_hi,
                 v_threshold_lo,
-                blocks_per_head,
-                self.n_kv_head,
-                self.arena_chunks,
-                &valid_ranges_arg,
-                &self.dev,
-                &self.dev.cuda_stream(),
-            )?
-        };
-
-        let k_pal_tags_cpu: Vec<i32> = self.dev.memcpy_dtov(&k_pal_tags_gpu)?;
-        let v_pal_tags_cpu: Vec<i32> = self.dev.memcpy_dtov(&v_pal_tags_gpu)?;
-        let k_pal_scale_cpu: Vec<f32> = self.dev.memcpy_dtov(&k_pal_scale_gpu)?;
-        let v_pal_scale_cpu: Vec<f32> = self.dev.memcpy_dtov(&v_pal_scale_gpu)?;
-        let k_map_cpu: Vec<i32> = self.dev.memcpy_dtov(&k_pal_map_gpu)?;
-        let v_map_cpu: Vec<i32> = self.dev.memcpy_dtov(&v_pal_map_gpu)?;
-        let k_head_amax: Vec<f32> = self.dev.memcpy_dtov(&k_head_amax_gpu)?;
-        let v_head_amax: Vec<f32> = self.dev.memcpy_dtov(&v_head_amax_gpu)?;
+            ],
+            &valid_ranges_arg,
+        )?;
 
         let total_blocks = total_heads * blocks_per_head;
 
@@ -1419,7 +1477,6 @@ impl PagedSelectionGpuInputs {
         Vec<f32>,
         Vec<f32>,
     )> {
-        let blocks_per_head = self.checked_blocks_per_head()?;
         let n_chunks = self.chunk_gids_keepalive.len();
         let k_ggml: Vec<candle::quantized::GgmlDType> = k_candidates
             .iter()
@@ -1432,8 +1489,6 @@ impl PagedSelectionGpuInputs {
             .map(|f| f.to_ggml_dtype())
             .collect();
 
-        let pht_ptr = self.per_head_table_buf.dev_ptr();
-        let gids_ptr = self.head_gids_buf.dev_ptr();
         let valid_ranges_arg: Vec<i32> = match valid_ranges {
             Some(r) => {
                 if r.len() != n_chunks {
@@ -1444,48 +1499,27 @@ impl PagedSelectionGpuInputs {
             None => vec![32i32; n_chunks],
         };
 
-        let (
-            k_pal_tags_gpu,
-            v_pal_tags_gpu,
-            k_pal_scale_gpu,
-            v_pal_scale_gpu,
-            k_pal_map_gpu,
-            v_pal_map_gpu,
-            k_head_amax_gpu,
-            v_head_amax_gpu,
-            _k_eff_gpu,
-            _v_eff_gpu,
-            _k_htags_gpu,
-            _v_htags_gpu,
-            _q_rel_gpu,
-        ) = unsafe {
-            select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
-                pht_ptr,
-                gids_ptr,
-                n_chunks,
-                &k_ggml,
-                &v_ggml,
+        let Palette4Result {
+            k_palette_tags: k_pal_tags_cpu,
+            v_palette_tags: v_pal_tags_cpu,
+            k_pal_scale: k_pal_scale_cpu,
+            v_pal_scale: v_pal_scale_cpu,
+            k_palette_map: k_map_cpu,
+            v_palette_map: v_map_cpu,
+            k_head_amax,
+            v_head_amax,
+            ..
+        } = self.run_palette4(
+            &k_ggml,
+            &v_ggml,
+            [
                 k_threshold_hi,
                 k_threshold_lo,
                 v_threshold_hi,
                 v_threshold_lo,
-                blocks_per_head,
-                self.n_kv_head,
-                self.arena_chunks,
-                &valid_ranges_arg,
-                &self.dev,
-                &self.dev.cuda_stream(),
-            )?
-        };
-
-        let k_pal_tags_cpu: Vec<i32> = self.dev.memcpy_dtov(&k_pal_tags_gpu)?;
-        let v_pal_tags_cpu: Vec<i32> = self.dev.memcpy_dtov(&v_pal_tags_gpu)?;
-        let k_pal_scale_cpu: Vec<f32> = self.dev.memcpy_dtov(&k_pal_scale_gpu)?;
-        let v_pal_scale_cpu: Vec<f32> = self.dev.memcpy_dtov(&v_pal_scale_gpu)?;
-        let k_map_cpu: Vec<i32> = self.dev.memcpy_dtov(&k_pal_map_gpu)?;
-        let v_map_cpu: Vec<i32> = self.dev.memcpy_dtov(&v_pal_map_gpu)?;
-        let k_head_amax: Vec<f32> = self.dev.memcpy_dtov(&k_head_amax_gpu)?;
-        let v_head_amax: Vec<f32> = self.dev.memcpy_dtov(&v_head_amax_gpu)?;
+            ],
+            &valid_ranges_arg,
+        )?;
 
         let to_palette = |flat: &[i32]| -> Result<Vec<[SampleFormat; 4]>> {
             flat.as_chunks::<4>()

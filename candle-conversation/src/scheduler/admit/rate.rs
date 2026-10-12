@@ -89,6 +89,7 @@
 //!   from the expert cache's hit and miss counters
 //!   ([`WaveRate::observe_hit_rate`]).
 
+use candle::cuda_backend::link_probe;
 use candle::Device;
 
 /// The bytes a MoE model's experts occupy in total, from the figures the expert
@@ -589,32 +590,31 @@ impl WaveRate {
     /// and few enough that the window costs a handful of waves rather than a
     /// phase.
     pub const MIN_DECODE_SAMPLES: u64 = 8;
-    /// Bytes the load-time link probe copies. Large enough that launch latency
-    /// is noise against the transfer; small enough to be a moment at load.
-    pub const PROBE_BYTES: usize = 256 << 20;
-    /// Timed copies the link probe takes, keeping the fastest — see
-    /// [`measure_link_bytes_per_s`] for why one is not enough.
-    pub const PROBE_RUNS: usize = 3;
+    /// Bytes each run of the link probe copies (`candle::cuda_backend::link_probe`).
+    pub const PROBE_BYTES: usize = link_probe::PROBE_BYTES;
     /// The estimator never believes a copy rate under this fraction of the
     /// link: below it the observation is measuring something other than the
     /// copy (a stall, a sync, a wave that carried a park), and it is refused.
     const MIN_LINK_FRACTION: f64 = 0.02;
 
-    /// Build the planner against a device, measuring the host→device copy
-    /// rate with one pinned transfer of [`Self::PROBE_BYTES`] and seeding the
-    /// estimate at [`Self::SEED_FRACTION`] of it.
+    /// Build the planner against a device, seeding the estimate at
+    /// [`Self::SEED_FRACTION`] of the device's host→device link rate.
     ///
-    /// The probe is the same path the expert cache streams through — pinned
-    /// host memory onto the device's stream — so the figure is this machine's
-    /// own, not a datasheet's: the 4090 Mobile, the 3090 box behind PCIe 3.0 and
-    /// the Blackwell workstation each seed correctly without a per-machine row.
+    /// The rate is `link_probe`'s: pinned host memory onto the device's stream,
+    /// the path the expert cache streams through, measured before the model
+    /// loaded (the builder asks for it then) and cached — so the figure is this
+    /// machine's own idle bus, not a datasheet's and not one contended by the
+    /// expert cache's startup staging.
     pub fn measure(
         device: &Device,
         geometry: ExpertGeometry,
         model: RateModel,
         decode: DecodeModel,
     ) -> candle::Result<Self> {
-        let link = measure_link_bytes_per_s(device)?;
+        let Device::Cuda(d) = device else {
+            candle::bail!("wave rate: the link rate needs a CUDA device");
+        };
+        let link = link_probe::host_to_device_bytes_per_s(d)?;
         Ok(Self::with_link_rate(link, geometry, model, decode))
     }
 
@@ -1360,13 +1360,12 @@ impl WaveRate {
     /// is refused as a stall, not a rate.
     ///
     /// **A forward that beats the link raises the link, if it moved more bytes
-    /// than the probe did.** The probe is one transfer taken at scheduler start,
-    /// while the expert cache is still staging its resident set across the same
-    /// bus, so it reads a *contended* figure and under-reports: measured at
-    /// 12.03 GB/s on a PCIe 4.0 ×16 link whose forwards then sustained 15.0.
-    /// Clamping to that would have pinned the estimate a quarter below the bus
-    /// the engine actually has, permanently, on the strength of the worse
-    /// measurement. A forward copying at least [`Self::PROBE_BYTES`] is better
+    /// than the probe did.** The probe is a few transfers of one size, and a
+    /// reading can still land low: taken at scheduler start, while the expert
+    /// cache staged its resident set across the same bus, it read 12.03 GB/s on
+    /// a PCIe 4.0 ×16 link whose forwards then sustained 15.0. Clamping to such a
+    /// reading would pin the estimate below the bus the engine actually has,
+    /// permanently, on the strength of the worse measurement. A forward copying at least [`Self::PROBE_BYTES`] is better
     /// evidence about the link than the probe is — it is the same transfer, at
     /// size, under the real workload — so it replaces it; anything smaller is
     /// still clamped, because a rate divided out of a short copy is mostly the
@@ -1532,46 +1531,6 @@ impl WaveRate {
         self.decode_samples += 1;
         Some(per_layer)
     }
-}
-
-/// Pinned host→device copies of [`WaveRate::PROBE_BYTES`] on the device's
-/// stream, timed to completion. Bytes a second, **the fastest** of the runs.
-///
-/// **The fastest, not the mean, and that is the whole reason there is more than
-/// one.** The probe runs at scheduler start, which is while the expert cache is
-/// still staging its resident set across the same bus — so a single reading
-/// measures whatever contention it happened to land in rather than the link. On
-/// the 4090 Mobile that read 2.61 GB/s against a ~25 GB/s PCIe 4.0 ×16 link, an
-/// order of magnitude low, and the planner then seeded a copy rate that made a
-/// prefill forward look ten seconds long. Contention can only ever make a
-/// transfer slower, so the quickest of a few is the closest to the truth, and
-/// the estimator learns from forwards afterwards regardless.
-fn measure_link_bytes_per_s(device: &Device) -> candle::Result<f64> {
-    use candle::cuda_backend::WrapErr;
-    use candle::quantized::pinned_staging::PinnedBuf;
-    let Device::Cuda(d) = device else {
-        candle::bail!("wave rate: the link probe needs a CUDA device");
-    };
-    let stream = d.cuda_stream();
-    let host = PinnedBuf::alloc_owned(WaveRate::PROBE_BYTES)?;
-    let mut gpu = unsafe { stream.alloc::<u8>(WaveRate::PROBE_BYTES).w()? };
-    // Once untimed, so the first-touch page mapping is not in the measurement.
-    stream.memcpy_htod(host.as_slice(), &mut gpu).w()?;
-    stream.synchronize().w()?;
-    let mut best = 0.0f64;
-    for _ in 0..WaveRate::PROBE_RUNS {
-        let start = std::time::Instant::now();
-        stream.memcpy_htod(host.as_slice(), &mut gpu).w()?;
-        stream.synchronize().w()?;
-        let secs = start.elapsed().as_secs_f64();
-        if secs > 0.0 && !secs.is_nan() {
-            best = best.max(WaveRate::PROBE_BYTES as f64 / secs);
-        }
-    }
-    if best <= 0.0 {
-        candle::bail!("wave rate: the link probe took no time");
-    }
-    Ok(best)
 }
 
 #[cfg(test)]

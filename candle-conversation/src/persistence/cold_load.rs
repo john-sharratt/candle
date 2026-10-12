@@ -42,7 +42,7 @@
 //! step and the HtoD step — without changing the cold-load caller.
 
 use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
-use candle::cuda_backend::WrapErr;
+use candle::cuda_backend::{stream_alloc, WrapErr};
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::CudaDevice;
 use candle::Result;
@@ -211,14 +211,14 @@ impl ColdLoadStager {
     ) -> Result<UploadedScratch> {
         let _ = dev;
         if len == 0 {
-            let gpu = unsafe { stream.alloc::<u8>(0).w()? };
+            let gpu = unsafe { stream_alloc::<u8>(stream, 0)? };
             return Ok(UploadedScratch {
                 slice: gpu,
                 base_ptr: 0,
             });
         }
         let src = self.buffer(len);
-        let mut gpu: CudaSlice<u8> = unsafe { stream.alloc::<u8>(len).w()? };
+        let mut gpu: CudaSlice<u8> = unsafe { stream_alloc::<u8>(stream, len)? };
         stream.memcpy_htod(src, &mut gpu).w()?;
         let base = {
             let (ptr, _g) = gpu.device_ptr(stream);

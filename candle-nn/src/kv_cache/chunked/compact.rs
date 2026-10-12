@@ -1559,16 +1559,10 @@ impl super::backing::ChunkedKvBacking {
         let candle::Device::Cuda(cuda) = self.device() else {
             return Ok(());
         };
-        use candle::cuda_backend::cudarc::driver::DevicePtr;
         use candle::cuda_backend::kernels;
+        use candle::cuda_backend::staged::segment;
 
-        let d_src = cuda.memcpy_stod(&records.srcs)?;
-        let d_dst = cuda.memcpy_stod(&records.dsts)?;
-        let d_len = cuda.memcpy_stod(&records.lens)?;
         let stream = cuda.cuda_stream();
-        let (sp, _sg) = d_src.device_ptr(&stream);
-        let (dp, _dg) = d_dst.device_ptr(&stream);
-        let (lp, _lg) = d_len.device_ptr(&stream);
         // Every destination this launch will write, against ground declared
         // immutable after load. The kernel is plan-driven and has no bound of its
         // own, and the weight zone shares the reservation with the arenas — so a
@@ -1583,25 +1577,37 @@ impl super::backing::ChunkedKvBacking {
                 (*l).max(0) as usize,
             );
         }
-        // SAFETY: each record names one slot of the reservation, `lens[r]` bytes
-        // long, in arenas of the same class and the same memory (the plan is per
-        // `ArenaKey`, so location cannot differ). Each destination is held by this
-        // pass's own claim; each source is read-only here and stays live until the
-        // holders that name it are rewritten below.
-        unsafe {
-            candle::set_kernel_breadcrumb("run_kv_migrate_copy", file!(), line!());
-            kernels::simple::kv_migrate::run_kv_migrate_copy(
-                sp as *const i64,
-                dp as *const i64,
-                lp as *const i64,
-                std::ptr::null::<i64>(),
-                std::ptr::null::<i64>(),
-                std::ptr::null::<i64>(),
-                records.srcs.len() as i32,
-                stream.cu_stream() as *mut std::ffi::c_void,
-            );
-        }
-        Ok(())
+        // The three arrays go up in one copy into the device's held staging
+        // scratch, read by this launch and reused behind it on the same stream.
+        cuda.with_staged_segments(
+            &[
+                segment(&records.srcs),
+                segment(&records.dsts),
+                segment(&records.lens),
+            ],
+            |at| {
+                // SAFETY: each record names one slot of the reservation, `lens[r]`
+                // bytes long, in arenas of the same class and the same memory (the
+                // plan is per `ArenaKey`, so location cannot differ). Each
+                // destination is held by this pass's own claim; each source is
+                // read-only here and stays live until the holders that name it are
+                // rewritten below. `at` names the three uploaded arrays.
+                unsafe {
+                    candle::set_kernel_breadcrumb("run_kv_migrate_copy", file!(), line!());
+                    kernels::simple::kv_migrate::run_kv_migrate_copy(
+                        at[0] as *const i64,
+                        at[1] as *const i64,
+                        at[2] as *const i64,
+                        std::ptr::null::<i64>(),
+                        std::ptr::null::<i64>(),
+                        std::ptr::null::<i64>(),
+                        records.srcs.len() as i32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                    );
+                }
+                Ok(())
+            },
+        )
     }
 
     /// One resident `KvHead` record, as the device holds it.

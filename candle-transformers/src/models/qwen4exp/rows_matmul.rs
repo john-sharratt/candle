@@ -28,7 +28,18 @@ pub fn rows_matmul_t(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     let Device::Cuda(dev) = x.device() else {
         return x.matmul(&w.t()?);
     };
-    if rows == 0 || rows > F32_ROWS_MATMUL_MAX_ROWS {
+    if rows == 0 {
+        return x.matmul(&w.t()?);
+    }
+    if rows > F32_ROWS_MATMUL_MAX_ROWS {
+        // **Eagerly, outside the wave's recorded segments.** The library picks
+        // its tile and its split-K memsets by the row count, so recorded, a
+        // prompt's segment changed node count with the prompt and was
+        // instantiated afresh — up to 3 s a segment on npcd's ingest
+        // (`docs/decode_graphs.md` §2.2). A wave this wide spends far longer
+        // in the GEMM than in launching it, so nothing is lost by running it
+        // between segments instead.
+        let _eager = x.device().eager()?;
         return x.matmul(&w.t()?);
     }
     if x.dtype() != DType::F32 || w.dtype() != DType::F32 {

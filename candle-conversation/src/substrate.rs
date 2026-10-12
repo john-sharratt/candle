@@ -1517,11 +1517,18 @@ pub struct StreamRuntime {
     /// projection layer decodes). Eager bytes rather than a `RecordLoc`: the
     /// per-turn timeline is tiny, so we keep it resident and re-emit it on
     /// compaction like the other synthesised per-entity records.
-    pub projection_events: Option<Vec<u8>>,
+    ///
+    /// Shared rather than owned, like `index_page`: maintenance re-emits every
+    /// live blob, and an owned one is copied into the op's plan and held there
+    /// for the whole op.
+    pub projection_events: Option<Arc<[u8]>>,
     /// Opaque encoded wide-Q signature window (`provenance::wide_sig`) for this turn's most
     /// recent (re)projection — the decode→decode (`Q·Q`) consensus substrate. Last-writer-wins;
     /// rebuilt from the redo log on replay. `None` until the first projection writes it.
-    pub wide_q_sigs: Option<Vec<u8>>,
+    ///
+    /// Per-token × heads × words, so hundreds of KB a turn — shared for the
+    /// same reason as `projection_events`.
+    pub wide_q_sigs: Option<Arc<[u8]>>,
     /// The QSA index page of a turn or a prompt section — the compressed index
     /// rows covering exactly its tokens, as sealed. Last-writer-wins, rebuilt
     /// from the redo log on replay, `None` for a piece sealed by a model that
@@ -5181,7 +5188,7 @@ impl Substrate {
                 // Opaque JSON bytes — the projection layer decodes them on read.
                 // Last-writer-wins per turn stream id.
                 self.streams.entry(stream_id).or_default().projection_events =
-                    Some(entry.record.payload.clone());
+                    Some(entry.record.payload.as_slice().into());
                 self.gallery_epoch += 1;
                 // Mirror the `WideQSig` arm: drop this stream's memoized seams so a
                 // replay/apply after the seam cache warmed can't serve stale seams.
@@ -5194,7 +5201,7 @@ impl Substrate {
                 // Opaque wide-Q window bytes (provenance::wide_sig), last-writer-wins
                 // per turn stream id — each (re)projection overwrites the window.
                 self.streams.entry(stream_id).or_default().wide_q_sigs =
-                    Some(entry.record.payload.clone());
+                    Some(entry.record.payload.as_slice().into());
                 self.gallery_epoch += 1;
                 self.evict_decoded_wide_sig(stream_id);
             }
@@ -6351,7 +6358,7 @@ impl Substrate {
     /// stream runtime, keyed by the turn's `stream_id`. Called at write time
     /// and on redo-log replay.
     pub fn set_projection_events_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
-        self.streams.entry(stream_id).or_default().projection_events = Some(payload);
+        self.streams.entry(stream_id).or_default().projection_events = Some(payload.into());
         self.gallery_epoch += 1;
         // Incremental invalidation: evict only this stream's decoded seams so a
         // single seal doesn't force a full-gallery JSON re-parse on the next scan.
@@ -6370,7 +6377,7 @@ impl Substrate {
 
     /// Cache a turn's encoded wide-Q signature window, last-writer-wins.
     pub fn set_wide_q_sigs_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
-        self.streams.entry(stream_id).or_default().wide_q_sigs = Some(payload);
+        self.streams.entry(stream_id).or_default().wide_q_sigs = Some(payload.into());
         self.gallery_epoch += 1;
         // Incremental invalidation: evict only this stream's decoded window so a
         // single seal doesn't force a full-gallery re-decode on the next scan.

@@ -34,7 +34,7 @@
 //! as a backstop) which is exactly what makes the omission invisible, so the
 //! call is worth having one definition of.
 
-use candle::quantized::gguf_file;
+use candle::quantized::{gguf_file, QTensor};
 use candle::{Device, Result};
 
 /// Claim the device reservation before a checkpoint's tensors are read.
@@ -79,6 +79,62 @@ pub fn open_for_load_sized(device: &Device, headroom: usize) -> Result<bool> {
     let _ = headroom;
     let _ = device;
     Ok(false)
+}
+
+/// Move a weight that is used as stored — not repacked — into the dense block.
+///
+/// A repacked weight's twin is born in the dense block ([`QMatMul`] asks
+/// `claim_dense` for it), but a weight read as it was loaded stayed where
+/// loading put it: the CUDA pool. The token embedding is one, and on
+/// Flash-Next it is 644 MiB of Q8_0 — most of what the pool still held after
+/// load, outside the reservation for the life of the process.
+///
+/// The copy is claimed with the matmul kernels' row padding included and the
+/// block's tail is zero (the dense block is never reused), so the placed tensor
+/// reads exactly as the loaded one did. When the block declines — no
+/// reservation, a second model in the process — the weight stays where it was.
+///
+/// [`QMatMul`]: crate::models::quantized_matmul::QMatMul
+pub fn place_in_dense(device: &Device, weight: QTensor) -> Result<QTensor> {
+    #[cfg(feature = "cuda")]
+    {
+        use candle::cuda_backend::cudarc::driver::result::memcpy_dtod_async;
+        use candle::cuda_backend::WrapErr;
+        use candle::quantized::cuda::{padded_storage_bytes, view_repacked};
+        use candle::quantized::QStorage;
+
+        let (Device::Cuda(cuda), QStorage::Cuda(src)) = (device, weight.storage()) else {
+            return Ok(weight);
+        };
+        let dtype = weight.dtype();
+        let payload = src.storage_size_in_bytes();
+        let extent = padded_storage_bytes(weight.shape().elem_count(), dtype);
+        let stream = cuda.cuda_stream();
+        let at = match candle_nn::kv_cache::claim_dense(&stream, extent) {
+            Ok(at) => at,
+            Err(e) => {
+                tracing::debug!(
+                    target: "candle_transformers::dense_span",
+                    extent,
+                    "dense block declined a stored weight ({e}); it stays in the CUDA pool"
+                );
+                return Ok(weight);
+            }
+        };
+        // SAFETY: `at` names `extent` ≥ `payload` bytes of the dense block, claimed
+        // for this weight alone; the source is the loaded weight's own payload,
+        // alive until the copy below has been queued ahead of its free.
+        unsafe { memcpy_dtod_async(at, src.data_ptr(), payload, stream.cu_stream()) }.w()?;
+        // SAFETY: as above — the dense block is never released, so the view's
+        // memory outlives every user of it.
+        let storage = unsafe { view_repacked(cuda, at, payload, extent, dtype)? };
+        QTensor::new(storage, weight.shape().clone())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = device;
+        Ok(weight)
+    }
 }
 
 /// End the load phase: lock the dense block and hand the rest of the span to the

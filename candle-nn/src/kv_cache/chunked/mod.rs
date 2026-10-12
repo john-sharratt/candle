@@ -68,6 +68,9 @@ pub mod guard;
 #[cfg(not(feature = "cuda"))]
 mod guest_stage_cpu;
 mod head_gids;
+pub(crate) mod held_extents;
+pub mod held_ground;
+pub mod held_ledger;
 mod io;
 /// Whether a slot's K/V is still the K/V it was, and whether everything that
 /// references it still legitimately does. Part of the `tensor-assert` harness — it
@@ -89,6 +92,7 @@ mod release_watch;
 #[cfg(feature = "cuda")]
 pub(crate) mod reservation;
 pub mod sampled_selection;
+pub mod seal_gather;
 mod sequence_ops;
 mod size_class;
 #[cfg(feature = "cuda")]
@@ -198,10 +202,11 @@ pub use guest_stage_cpu::guest_stage;
 #[cfg(feature = "cuda")]
 pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
-    forget_last_tier, freeze_dense, initial_weight_bytes, kv_spare_regions, reclaim_empty_arenas,
-    reclaim_load_headroom, region_stats, set_ground_broker, set_kv_free_target, set_weight_floor,
-    span_end, span_layout, span_region_refusal, spare_tally, weight_capacity_bytes,
-    weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanRegion, REGION_BYTES,
+    forget_last_tier, freeze_dense, held_ground_sites, held_ground_stats, initial_weight_bytes,
+    kv_spare_regions, reclaim_empty_arenas, reclaim_load_headroom, region_stats, set_ground_broker,
+    set_kv_free_target, set_weight_floor, span_end, span_layout, span_region_refusal, spare_tally,
+    weight_capacity_bytes, weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanRegion,
+    REGION_BYTES,
 };
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;

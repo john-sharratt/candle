@@ -42,7 +42,7 @@ pub use arena_table::{
 pub use cache::{Cache, CacheIntegrityResult, KvCache};
 pub use chunked::class_promotion_count;
 #[cfg(feature = "cuda")]
-pub use chunked::fletcher_golden::{fletcher32_golden, fletcher32_golden_on, GoldenRecord};
+pub use chunked::fletcher_golden::{fletcher32_golden, GoldenRecord};
 /// Whether the weight side may take KV ground. Pure arithmetic for the same
 /// reason as the zone above, and public for a further one: the partition's
 /// defects are trajectory defects, so the decision has to be runnable over a
@@ -56,6 +56,10 @@ pub use chunked::growth_policy::{
 /// model code that marks its stages is built in both.
 pub use chunked::guest_stage;
 #[cfg(feature = "cuda")]
+pub use chunked::held_ground::HeldStats;
+#[cfg(feature = "cuda")]
+pub use chunked::held_ledger::HeldSite;
+#[cfg(feature = "cuda")]
 pub use chunked::persistence_domain_stats;
 /// The carve of a bulk prefill attention launch and the cut that bounds it —
 /// the one definition the launcher sizes from and the wave plan prices by.
@@ -64,6 +68,8 @@ pub use chunked::prefill_kv_stage::{
     PrefillKvStageLayout, PrefillLaunchBounds, PREFILL_ATTN_ROW_GROUP_TOKENS,
     PREFILL_KV_STAGE_CHUNK_POSITIONS, PREFILL_KV_STAGE_MIN_Q_LEN,
 };
+#[cfg(feature = "cuda")]
+pub use chunked::seal_gather::{gather_sealed_chunks, GatheredChunk};
 #[cfg(feature = "cuda")]
 pub use chunked::slot_state_stats;
 /// Where the tier may stand and what the KV side may reach — the span's
@@ -96,8 +102,8 @@ pub use chunked::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    empty_sweep_stats, forget_last_tier, reclaim_empty_arenas, region_stats, spare_tally,
-    RegionStats, REGION_BYTES,
+    empty_sweep_stats, forget_last_tier, held_ground_sites, held_ground_stats,
+    reclaim_empty_arenas, region_stats, spare_tally, RegionStats, REGION_BYTES,
 };
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]

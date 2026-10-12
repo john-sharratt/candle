@@ -19,9 +19,9 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 use candle_kernels::sampling::run_argmax_rows_f32;
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::DevicePtr;
 
-use super::{CudaDevice, DeviceId};
+use super::{CudaDevice, DeviceId, Held, WrapErr};
 use crate::Result;
 
 /// The most rows one launch picks over: the grid's y-extent.
@@ -29,8 +29,8 @@ pub const MAX_ROWS: usize = 65_535;
 
 /// One stream's slots and arrival counters.
 struct Scratch {
-    slots: CudaSlice<u64>,
-    arrived: CudaSlice<u32>,
+    slots: Held<u64>,
+    arrived: Held<u32>,
 }
 
 /// Keyed by device and by the stream's handle: a pair is only ever reused by
@@ -58,11 +58,19 @@ pub fn argmax_rows_f32(
     let mut map = scratch().lock().unwrap_or_else(|e| e.into_inner());
     let s = match map.entry((device.id(), stream.cu_stream() as usize)) {
         Entry::Occupied(e) => e.into_mut(),
-        // Zeroed once: every launch leaves the slots and counters it used at zero.
-        Entry::Vacant(e) => e.insert(Scratch {
-            slots: device.alloc_zeros::<u64>(MAX_ROWS)?,
-            arrived: device.alloc_zeros::<u32>(MAX_ROWS)?,
-        }),
+        // Zeroed once: every launch leaves the slots and counters it used at
+        // zero. Eagerly, on the compute stream every launch queues behind, and
+        // on held ground, since the pair lives as long as the stream.
+        Entry::Vacant(e) => {
+            let _eager = device.pause_capture()?;
+            let compute = device.compute_stream();
+            // SAFETY: both are zeroed just below, before any launch reads them.
+            let mut slots = unsafe { Held::<u64>::alloc(device, MAX_ROWS)? };
+            let mut arrived = unsafe { Held::<u32>::alloc(device, MAX_ROWS)? };
+            compute.memset_zeros(&mut *slots).w()?;
+            compute.memset_zeros(&mut *arrived).w()?;
+            e.insert(Scratch { slots, arrived })
+        }
     };
     let (slots, _g1) = s.slots.device_ptr(&stream);
     let (arrived, _g2) = s.arrived.device_ptr(&stream);

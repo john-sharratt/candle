@@ -179,6 +179,10 @@ impl Qwen4ExpBatched {
             return Ok(slot.take().expect("checked above"));
         }
         drop(slot.take());
+        // At least one row: a stash of none would be zero-width tensors, which
+        // the arena slots cannot hold and the driver was asked for instead —
+        // a round trip per buffer for memory that holds nothing.
+        let rows = rows.max(1);
         let cfg = &self.model.cfg;
         let widths = CaptureWidths {
             hc: cfg.hc.count,

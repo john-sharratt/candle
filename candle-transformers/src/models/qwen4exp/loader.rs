@@ -15,7 +15,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use candle::direct_io::{round_up_sector, AlignedScratch, DirectFile, DIRECT_IO_SECTOR};
+use candle::direct_io::{
+    round_up_sector, AlignedScratch, DirectFile, StripeRead, DIRECT_IO_SECTOR,
+};
 use candle::quantized::ggml_file::qtensor_from_ggml;
 use candle::quantized::gguf_file::{Content, TensorInfo, Value};
 use candle::quantized::ko_quant::dequant_ko;
@@ -31,6 +33,7 @@ use super::ple::PleWeights;
 use super::ple_cache::dequant_rows_on_device;
 use super::ple_cache::{PleCacheStats, PleRowCache, PleRowFetch, RECORD_BYTES, RECORD_ELEMS};
 use super::qsa::IndexerWeights;
+use super::record_windows;
 use crate::models::delta_net::{DeltaNetWeights, LayerKind};
 use crate::models::dense_span::peak_load_pool_bytes;
 use crate::models::latent_moe::GgufModel;
@@ -184,7 +187,60 @@ impl PleRowFetch for DiskPleFetch {
         dst.copy_from_slice(&window.as_slice(span)[from..from + dst.len()]);
         Ok(())
     }
+
+    /// A gather's misses together: sorted into sector windows, records that
+    /// share a sector read through one ([`record_windows`]), every window in
+    /// flight at once across the file's handles
+    /// ([`DirectFile::read_stripes_concurrent`]) — the drive's queue kept full
+    /// rather than one round trip per row.
+    fn fetch_many(&self, ids: &[u32], dst: &mut [u8]) -> Result<()> {
+        let rec = self.slab.outer_bytes;
+        if dst.len() != ids.len() * rec {
+            candle::bail!("ple: {} bytes for {} rows of {rec}", dst.len(), ids.len());
+        }
+        let mut offsets = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if id as usize >= self.slab.dims[0] {
+                candle::bail!("ple: row {id} past the {}-row table", self.slab.dims[0]);
+            }
+            offsets.push(self.slab.offset + id as u64 * rec as u64);
+        }
+        let w = record_windows::plan(&offsets, rec, DIRECT_IO_SECTOR as u64, PLE_READ_WINDOW);
+        let total: usize = w.spans.iter().map(|&(_, len)| len).sum();
+        let mut scratch = AlignedScratch::new();
+        scratch.ensure(total).map_err(candle::Error::wrap)?;
+        {
+            let mut rest = scratch.as_mut_slice(total);
+            let mut stripes = Vec::with_capacity(w.spans.len());
+            for &(file_offset, len) in &w.spans {
+                let (dest, tail) = rest.split_at_mut(len);
+                stripes.push(StripeRead { file_offset, dest });
+                rest = tail;
+            }
+            self.file
+                .read_stripes_concurrent(&mut stripes)
+                .map_err(|e| candle::Error::Msg(format!("ple: batched row read: {e}")))?;
+        }
+        let read = scratch.as_slice(total);
+        let mut base = Vec::with_capacity(w.spans.len());
+        let mut at = 0usize;
+        for &(_, len) in &w.spans {
+            base.push(at);
+            at += len;
+        }
+        for (i, &(window, offset)) in w.at.iter().enumerate() {
+            let from = base[window] + offset;
+            dst[i * rec..(i + 1) * rec].copy_from_slice(&read[from..from + rec]);
+        }
+        Ok(())
+    }
 }
+
+/// The longest read [`DiskPleFetch::fetch_many`] merges neighbouring records
+/// into. Records cluster only where hashed rows happen to fall near each other,
+/// so most windows are a sector or two; the cap keeps a dense run from
+/// becoming one long read that leaves the other handles idle.
+const PLE_READ_WINDOW: usize = 64 * 1024;
 
 /// The PLE table behind the §0.1 cache: NVMe records, a bounded non-pinned
 /// RAM row cache, rows held and gathered **quantized** (the engine uploads

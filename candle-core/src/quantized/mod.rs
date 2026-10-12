@@ -32,6 +32,8 @@ mod dummy_pinned_staging;
 #[cfg(feature = "cuda")]
 pub mod pinned_staging;
 #[cfg(feature = "cuda")]
+mod resident_ring;
+#[cfg(feature = "cuda")]
 pub mod table_ring;
 #[cfg(not(feature = "cuda"))]
 pub mod pinned_staging {

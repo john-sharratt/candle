@@ -29,6 +29,7 @@
 #include <cuda_runtime.h>
 
 #include "bdp_vote.cuh"
+#include "../grow_scratch.cuh"
 
 // m16n8k32.s8 requires sm_80+ and — the point of this backend — has no upper
 // arch bound: the sm_120 (Blackwell) compilation emits the real kernel.
@@ -437,16 +438,21 @@ extern "C" int run_imma_bdp_scan(
     (void)cudaGetLastError();
     const size_t nc = (size_t)n_probe_tokens * n_groups * n_cases;
 
+    // The three accumulators, carved from one grow-only scratch the launcher
+    // keeps (`grow_scratch.cuh`) — see `run_bmma_bdp_scan`, which does the same.
+    static void *s_block = nullptr;
+    static size_t s_cap = 0;
+    const size_t max_bytes = (nc * sizeof(unsigned int) + 255) & ~(size_t)255;
+    const size_t acc_bytes = (nc * sizeof(unsigned long long) + 255) & ~(size_t)255;
     unsigned int *d_max = nullptr;
     unsigned long long *d_sum = nullptr;
     unsigned long long *d_sq = nullptr;
     int stage = IMMA_STAGE_ALLOC;
-    cudaError_t err = cudaMallocAsync((void **)&d_max, nc * sizeof(unsigned int), s);
+    cudaError_t err = grow_scratch(&s_block, &s_cap, max_bytes + 2 * acc_bytes);
     if (err == cudaSuccess) {
-        err = cudaMallocAsync((void **)&d_sum, nc * sizeof(unsigned long long), s);
-    }
-    if (err == cudaSuccess) {
-        err = cudaMallocAsync((void **)&d_sq, nc * sizeof(unsigned long long), s);
+        d_max = (unsigned int *)s_block;
+        d_sum = (unsigned long long *)((char *)s_block + max_bytes);
+        d_sq = (unsigned long long *)((char *)s_block + max_bytes + acc_bytes);
     }
     if (err == cudaSuccess) {
         stage = IMMA_STAGE_MEMSET;
@@ -474,15 +480,6 @@ extern "C" int run_imma_bdp_scan(
             d_max, d_sum, d_sq, seg_tok_start, seg_case_start, n_probe_tokens,
             n_groups, n_segments, n_cases, out_case, out_vote);
         err = cudaGetLastError();
-    }
-    if (d_max != nullptr) {
-        cudaFreeAsync(d_max, s);
-    }
-    if (d_sum != nullptr) {
-        cudaFreeAsync(d_sum, s);
-    }
-    if (d_sq != nullptr) {
-        cudaFreeAsync(d_sq, s);
     }
     return (err == cudaSuccess) ? 0 : -(stage * 1000 + (int)err);
 }

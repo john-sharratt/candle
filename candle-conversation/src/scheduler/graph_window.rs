@@ -11,7 +11,12 @@ use candle::cuda_backend::graph::CaptureStats;
 /// host time the window spent recording segments, and `nodes/seg` how many
 /// launches each segment carried — the two together say whether a slow recording
 /// is more work recorded or the same work recorded slower, which is the question
-/// set against the forward bench's own `launches/segment`.
+/// set against the forward bench's own `launches/segment`. `held` is what the
+/// executable library keeps now — executables, their nodes, and the device
+/// bytes they are charged against its budget, all outside the reservation —
+/// `evicted` how many the window evicted to stay within it, `cooling` how many
+/// evicted keys may not be kept yet, and `unkept` the window's segments run
+/// unrecorded on a cooling key plus those instantiated for one launch.
 pub(super) fn graph_window(before: &CaptureStats, after: &CaptureStats) -> String {
     let waves = after.waves.saturating_sub(before.waves);
     if waves == 0 {
@@ -21,7 +26,7 @@ pub(super) fn graph_window(before: &CaptureStats, after: &CaptureStats) -> Strin
     let segs = d(after.segments, before.segments);
     format!(
         " | graphs waves={waves} segs={} fold={}/{}ms reshape={}/{}ms inst={}/{}ms rec={}ms \
-         nodes/seg={}",
+         nodes/seg={} held={}x/{}n/{}MiB evicted={} cooling={} unkept={}+{}",
         segs,
         d(after.updated, before.updated).saturating_sub(d(after.reshaped, before.reshaped)),
         d(after.in_place_us, before.in_place_us) / 1000,
@@ -31,6 +36,13 @@ pub(super) fn graph_window(before: &CaptureStats, after: &CaptureStats) -> Strin
         d(after.instantiated_us, before.instantiated_us) / 1000,
         d(after.recording_us, before.recording_us) / 1000,
         d(after.nodes, before.nodes) / segs.max(1),
+        after.execs_held,
+        after.nodes_held,
+        after.bytes_held >> 20,
+        d(after.evicted, before.evicted),
+        after.cooling,
+        d(after.eager_segments, before.eager_segments),
+        d(after.transient, before.transient),
     )
 }
 
@@ -66,14 +78,28 @@ mod tests {
             reshaped_us: 5_100,
             instantiated_us: 36_250,
             nodes: 199_600,
+            execs_held: 212,
+            nodes_held: 61_480,
+            bytes_held: 600 << 20,
+            evicted: 9,
+            cooling: 4,
+            eager_segments: 3,
+            transient: 1,
             ..stats(160, 1_380, 43, 81_500)
         };
+        let before = CaptureStats {
+            evicted: 2,
+            eager_segments: 1,
+            ..before
+        };
         // 477 updates in the window, 2 of them reshapes: 475 plain folds; 69,600
-        // nodes over 480 segments.
+        // nodes over 480 segments. What the library holds and how many keys
+        // cool are gauges, read off the later snapshot alone; evictions and
+        // unkept segments are the window's.
         assert_eq!(
             graph_window(&before, &after),
             " | graphs waves=60 segs=480 fold=475/9ms reshape=2/1ms inst=3/6ms rec=31ms \
-             nodes/seg=145"
+             nodes/seg=145 held=212x/61480n/600MiB evicted=7 cooling=4 unkept=2+1"
         );
     }
 

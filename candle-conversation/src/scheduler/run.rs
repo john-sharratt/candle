@@ -1,5 +1,6 @@
 use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, ThrottleReason};
 use super::prefill::{VramPhase, LOAD_TARGET};
+use super::wave_retry::{Next, WaveRetry};
 use super::*;
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
 use candle::DeviceLocation;
@@ -380,16 +381,57 @@ impl Scheduler {
         {
             return;
         }
-        if let Err(e) = self.decode_forward_cobatched(&[], &[], &[], &[]) {
+        match self.decode_forward_cobatched(&[], &[], &[], &[]) {
+            Ok(_) => {
+                if let Some(failures) = self.wave_retry.succeeded() {
+                    tracing::info!(failures, "decode-less wave step ran after failing");
+                }
+            }
             // A refused tier is answered where it was refused — the next wave is
             // composed narrower, or a wave already at the least chunk fails its
-            // members — so it is a warning here, not a fault.
-            if is_tier_refusal(&e) {
+            // members — so it is a warning here, not a fault, and not a failure
+            // the retry counts toward giving up.
+            Err(e) if is_tier_refusal(&e) => {
                 tracing::warn!("decode-less wave step refused its tier: {e}");
-            } else {
-                tracing::error!("decode-less wave step failed: {e}");
+            }
+            Err(e) => match self.wave_retry.failed() {
+                Next::Retry { wait, attempt } => {
+                    if WaveRetry::logs(attempt) {
+                        tracing::error!(
+                            attempt,
+                            wait_us = wait.as_micros() as u64,
+                            "decode-less wave step failed: {e}"
+                        );
+                    }
+                }
+                Next::GiveUp { attempts } => {
+                    tracing::error!(
+                        attempts,
+                        "decode-less wave step failed on every attempt; failing its members: {e}"
+                    );
+                    self.fail_decode_less_wave(&format!(
+                        "the wave carrying this could not run in {attempts} attempts: {e}"
+                    ));
+                }
+            },
+        }
+    }
+
+    /// Fail everything a decode-less wave carries — every prefill and section
+    /// ingest still owing tokens — so each caller hears the error and its
+    /// ground is handed back. See `wave_retry` for when this is the right call.
+    pub(super) fn fail_decode_less_wave(&mut self, why: &str) {
+        for p in &mut self.active_prefills {
+            if p.error.is_none() && p.finished.is_none() && p.offset < p.work.tokens.len() {
+                p.error = Some(ConversationError::Other(why.to_string()));
             }
         }
+        for s in &mut self.active_section_ingests {
+            if s.error.is_none() && s.offset < s.tokens.len() {
+                s.error = Some(ConversationError::Other(why.to_string()));
+            }
+        }
+        self.reset_wave_prefill();
     }
 
     /// Seal completed section ingests. Section chunks are advanced ONLY by the
@@ -440,6 +482,15 @@ impl Scheduler {
         if let Some(gov) = self.session.vram_governor() {
             gov.log_budget("startup");
         }
+        // Watch every allocation that reaches the driver instead of one of the
+        // reservation's allocators, for as long as the engine serves. Armed once
+        // and never dropped inside the loop: a window around the quanta alone
+        // missed the housekeeping between them, request handling, and every
+        // thread whose work did not happen to overlap it — the persistence
+        // thread's sealing, above all. Each wave drains what accumulated since
+        // the last into one report. A ZST guard without the feature.
+        #[cfg(feature = "forbidden_allocations")]
+        let _alloc_watch = candle::forbidden_alloc::armed();
 
         loop {
             // A mid-wave admission drain inside the decode quantum can consume the
@@ -646,6 +697,36 @@ impl Scheduler {
                 continue;
             }
 
+            // 3b. **A decode-less wave that just failed is not rebuilt at once.**
+            // Nothing it stands on has changed yet, so the same wave would fail
+            // the same way. Wait out the backoff — a request ends it early and is
+            // handled — then try again (`wave_retry`). With decodes running the
+            // decode-less path is not taken, so there is nothing to wait for.
+            if let Some(wait) = self.wave_retry.take_wait() {
+                if self.decode_width() == 0 {
+                    let t_wait = Instant::now();
+                    match self.rx.recv_timeout(wait) {
+                        Ok(req) => {
+                            self.wave_stats
+                                .add_idle(t_wait.elapsed().as_millis() as u64);
+                            let t_req = Instant::now();
+                            let keep_going = self.handle_request(req);
+                            self.wave_stats
+                                .add_requests(t_req.elapsed().as_micros() as u64);
+                            if !keep_going {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(flume::RecvTimeoutError::Timeout) => {
+                            self.wave_stats
+                                .add_idle(t_wait.elapsed().as_millis() as u64);
+                        }
+                        Err(flume::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            }
+
             // 4. Always run all quanta each iteration; order by current width.
             // Summary decodes are excluded from the flip count so they never
             // hold the loop in decode-first mode at the expense of prefills.
@@ -658,13 +739,6 @@ impl Scheduler {
             self.wave_section_advanced = false;
             // A width the partition refused holds only until ground frees.
             self.settle_refused_width();
-            // Watch this wave's quanta for allocations that reach the driver
-            // instead of the bump arena. Every one is memory the reservation was
-            // never sized for, and it is what grows the CUDA pool's reserved
-            // footprint by ~2 GiB under load — the exact bytes WDDM demotes
-            // first. A ZST guard without the feature.
-            #[cfg(feature = "forbidden_allocations")]
-            let alloc_watch = candle::forbidden_alloc::armed();
             // Why the pool was reached, scoped to THIS wave — always on, unlike
             // the site-naming report above. The lifetime totals cannot answer it:
             // they are dominated by declines that are correct (the residual
@@ -701,16 +775,20 @@ impl Scheduler {
             let house_span = super::profile::span("loop:housekeeping");
             let (no_ticket, closed) = declines.bytes_since();
             publish_wave_declines(no_ticket, closed);
+            // Everything that reached the driver since the previous wave's
+            // report, on any thread. Each allocation is memory the reservation
+            // was never sized for, and together they are what grows the CUDA
+            // pool's reserved footprint under load — the bytes WDDM demotes
+            // first.
             #[cfg(feature = "forbidden_allocations")]
             {
-                drop(alloc_watch);
                 let report = candle::forbidden_alloc::take_report();
                 if report.total_calls > 0 {
                     tracing::warn!(
                         target: "candle_conversation::scheduler::forbidden_alloc",
                         calls = report.total_calls,
                         mib = report.total_bytes >> 20,
-                        "wave allocated outside the bump arena\n{report}"
+                        "allocated outside the reservation since the last wave\n{report}"
                     );
                 }
             }

@@ -56,6 +56,7 @@ pub mod relief_trace;
 mod run;
 mod sample;
 mod seal_scan;
+mod section_pack;
 mod section_pages;
 mod segment_rearm;
 mod settle;
@@ -64,6 +65,7 @@ mod spec_chooser;
 mod test_substrate;
 mod turn_group;
 mod wave_logits;
+mod wave_retry;
 
 use detached::Detached;
 use graph_window::graph_window;
@@ -3563,6 +3565,9 @@ pub(crate) struct Scheduler {
     /// prefill cohort, so only the FIRST decode step of the quantum folds the
     /// cohort in (one budget-sized layer advance per wave, not per decode step).
     wave_cohort_advanced: bool,
+    /// Consecutive failures of the decode-less wave step and the wait owed
+    /// before the next — see `wave_retry`.
+    wave_retry: wave_retry::WaveRetry,
     /// The last wave step carried rows other than decode and verify — a prefill
     /// creep, a section chunk or glue — so the profile can tell an 8-session
     /// decode step from one that also paid for ingest.
@@ -3863,6 +3868,7 @@ impl Scheduler {
             wave_prefill_cursor: 0,
             wave_prefill_members: Vec::new(),
             wave_cohort_advanced: false,
+            wave_retry: wave_retry::WaveRetry::default(),
             wave_cobatched: false,
             wave_step_ratio: 1,
             wave_section_advanced: false,

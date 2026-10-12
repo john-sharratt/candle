@@ -22,6 +22,7 @@ use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::tenant_rank::TenantRank;
 use crate::tree::ConversationTreeConfig;
 use crate::ManagedBatchedModel;
+use candle::cuda_backend::link_probe;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device};
 use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
@@ -1558,7 +1559,34 @@ impl ModelBuilder {
             tracing::info!("  Max response tokens: {}", self.max_response_tokens);
         }
 
+        // The host→device link, measured now — the card empty and the bus idle
+        // — and cached for the wave planner (`link_probe`). Later, the reading
+        // would be contended by the expert cache's staging and its landing
+        // buffer would compete with a full reservation.
+        if let Device::Cuda(cuda) = device {
+            match link_probe::host_to_device_bytes_per_s(cuda) {
+                Ok(bps) => tracing::info!(link_gbps = bps / 1e9, "host→device link measured"),
+                Err(e) => tracing::warn!("host→device link probe failed: {e}"),
+            }
+        }
+
+        // Every driver allocation the load makes, by site: most are scratch the
+        // load frees again, and the ones it keeps are what the CUDA pool still
+        // holds outside the reservation once serving starts.
+        #[cfg(feature = "forbidden_allocations")]
+        let load_watch = candle::forbidden_alloc::armed();
         let model = self.load_model(&weights, device, progress)?.model;
+        #[cfg(feature = "forbidden_allocations")]
+        {
+            drop(load_watch);
+            let report = candle::forbidden_alloc::take_report();
+            tracing::warn!(
+                target: "candle_conversation::scheduler::forbidden_alloc",
+                calls = report.total_calls,
+                mib = report.total_bytes >> 20,
+                "the load allocated outside the reservation\n{report}"
+            );
+        }
 
         // Hand the load's pool high-water back before serving starts — it is
         // several GiB held outside the KV reservation and never used again.

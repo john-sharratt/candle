@@ -244,7 +244,8 @@ pub fn kv_migrate_on(
             segment(&ss),
             segment(&ds),
         ],
-        |p| {
+        0,
+        |p, _| {
             let strided = |a: u64| {
                 if plan.strided {
                     a as *const i64

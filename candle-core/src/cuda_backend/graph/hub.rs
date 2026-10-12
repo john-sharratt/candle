@@ -27,8 +27,10 @@
 //! does not. A wave whose shape, tier placement or launch scalars differ from
 //! the last one therefore replays correctly with no key and no epoch to check.
 
+use super::exec::{audit, divergence, NodeKey, Template};
+use super::library::ExecLibrary;
 use super::record_gate;
-use super::slot::{ExecSlot, Folded};
+use super::slot::Folded;
 use super::staging::StagingRing;
 use super::GraphError;
 use crate::cuda_backend::{set_kernel_breadcrumb, CudaDevice, WrapErr};
@@ -70,6 +72,24 @@ pub struct CaptureStats {
     /// Graph nodes launched — kernels, memsets, device copies and event
     /// records alike.
     pub nodes: u64,
+    /// Executables evicted to keep the library within its budget, and the
+    /// bytes they were charged.
+    pub evicted: u64,
+    pub evicted_bytes: u64,
+    /// Segments instantiated for one launch and not kept — their key was
+    /// cooling and nothing of their topology would take the fold.
+    pub transient: u64,
+    /// Segments run unrecorded because their predicted key was cooling.
+    pub eager_segments: u64,
+    /// Executables the library holds now — a gauge, not a count since start.
+    pub execs_held: u64,
+    /// Nodes across those executables, now.
+    pub nodes_held: u64,
+    /// Device bytes those executables are charged, now: driver memory outside
+    /// the reservation, kept within `budget::GRAPH_BUDGET_BYTES`.
+    pub bytes_held: u64,
+    /// Evicted keys still cooling, now.
+    pub cooling: u64,
 }
 
 /// One device's wave-capture state, shared by every clone of its handle.
@@ -121,8 +141,14 @@ struct HubState {
     wave: Option<Wave>,
     /// The non-blocking stream launches are recorded on, made on first use.
     capture: Option<Arc<CudaStream>>,
-    /// The executables of each segment ordinal, kept across waves.
-    slots: Vec<ExecSlot>,
+    /// The executables kept across waves, by segment topology.
+    library: ExecLibrary,
+    /// The topology each segment ordinal held in the last wave that reached
+    /// it — what a new topology is compared against when it is logged.
+    last_topology: Vec<Vec<NodeKey>>,
+    /// The `(topology, shape)` key each ordinal held in the last wave that
+    /// recorded it — the prediction `start_segment` checks for a cooldown.
+    last_key: Vec<Option<(u64, u64)>>,
     /// Device memory released while recording, freed once the segment that
     /// may still read it has been launched — see [`CaptureHub::retire`].
     graveyard: Graveyard,
@@ -189,6 +215,9 @@ struct Wave {
     error: Option<String>,
     /// When the recording segment began, for [`CaptureStats::recording_us`].
     recording_since: Option<Instant>,
+    /// The current segment runs unrecorded: its predicted key is cooling
+    /// (`CaptureHub::start_segment`).
+    eager: bool,
 }
 
 /// One forward's wave capture on the thread that opened it — see
@@ -244,18 +273,14 @@ impl Drop for Paused<'_> {
             return;
         };
         wave.paused -= 1;
-        if wave.paused > 0 || wave.recording {
+        if wave.paused > 0 || wave.recording || wave.eager {
             return;
         }
-        let capture = st.capture.clone().expect("a wave has a capture stream");
-        let resumed = st.hand_to_compute().and_then(|()| begin(&capture));
-        let wave = st.wave.as_mut().expect("checked above");
-        match resumed {
-            Ok(()) => {
-                wave.recording = true;
-                wave.recording_since = Some(Instant::now());
-            }
-            Err(e) => wave.error = Some(e.to_string()),
+        let resumed = st
+            .hand_to_compute()
+            .and_then(|()| CaptureHub::start_segment(&mut st));
+        if let Err(e) = resumed {
+            st.wave.as_mut().expect("checked above").error = Some(e.to_string());
         }
     }
 }
@@ -390,6 +415,14 @@ impl CaptureHub {
         // Opened held: the forward's setup runs eagerly until the model marks
         // where its recorded launches begin (`record`).
         st.stats.waves += 1;
+        let now = st.stats.waves;
+        if !st.library.budget_known() {
+            // The same figure the reservation left outside its span for this.
+            if let Ok(budget) = super::budget::graph_budget_bytes() {
+                st.library.set_budget(budget);
+            }
+        }
+        st.library.wave_passed(now);
         st.wave = Some(Wave {
             owner: std::thread::current().id(),
             serial: st.stats.waves,
@@ -399,6 +432,7 @@ impl CaptureHub {
             segment: 0,
             error: None,
             recording_since: None,
+            eager: false,
         });
         // The tag before the flag: a thread that sees the wave active reads
         // its owner's tag.
@@ -414,7 +448,6 @@ impl CaptureHub {
             return Ok(());
         }
         let mut st = self.lock();
-        let capture = st.capture.clone();
         let Some(wave) = st.wave.as_mut() else {
             return Ok(());
         };
@@ -427,10 +460,7 @@ impl CaptureHub {
             // Launches issued on the capture stream while the wave was held
             // run before anything recorded from here.
             st.hand_to_compute()?;
-            begin(&capture.expect("a wave has a capture stream"))?;
-            let wave = st.wave.as_mut().expect("checked above");
-            wave.recording = true;
-            wave.recording_since = Some(Instant::now());
+            Self::start_segment(&mut st)?;
         }
         Ok(())
     }
@@ -446,6 +476,13 @@ impl CaptureHub {
         // to end — only the failure to report.
         if let Some(e) = wave.error.take() {
             crate::bail!("wave capture failed to resume: {e}");
+        }
+        if wave.eager {
+            // A segment left unrecorded because its key is cooling: its launches
+            // went to the device as issued, so it ends with nothing to launch.
+            wave.eager = false;
+            wave.segment += 1;
+            return Ok(());
         }
         if !wave.recording {
             return Ok(());
@@ -476,18 +513,100 @@ impl CaptureHub {
         }
         let segment = wave.segment;
         wave.segment += 1;
-        if st.slots.len() <= segment {
-            st.slots.resize_with(segment + 1, ExecSlot::default);
-        }
+        let serial = wave.serial;
         let on = super::ComputeStream::from_stream(compute.clone());
         let started = Instant::now();
-        // SAFETY: the capture's own graph; `fold` takes ownership.
-        let (exec, folded) = unsafe { st.slots[segment].fold(graph, &on, nodes)? };
+        // The capture's own graph, destroyed on every path from here.
+        let template = Template(graph);
+        let audited = audit(template.0, nodes)?;
+        // **A topology seen for the first time, against what this ordinal held
+        // last wave.** Instantiating a new topology is the cost that remains
+        // once segments are found by topology, so where it departs from its
+        // predecessor at the same place in the wave names what made it new —
+        // a kernel chosen by width, a launch count that follows the wave.
+        let first_sight = !st.library.holds(audited.key);
+        let departs = match st.last_topology.get(segment) {
+            Some(prev) if first_sight => divergence(&audited.topology, prev),
+            _ => None,
+        };
+        if st.last_topology.len() <= segment {
+            st.last_topology.resize_with(segment + 1, Vec::new);
+        }
+        st.last_topology[segment].clone_from(&audited.topology);
+        if st.last_key.len() <= segment {
+            st.last_key.resize(segment + 1, None);
+        }
+        let (key, shape) = (audited.key, audited.shape);
+        st.last_key[segment] = Some((key, shape));
+        let topologies = st.library.len() + usize::from(first_sight);
+        // A key evicted within its cooldown may fold into what its topology
+        // keeps, but is not kept again yet.
+        let admit = !st.library.cooling(key, shape, serial);
+        let (transient, folded, refusal) = match st
+            .library
+            .slot(key)
+            .fold(template, audited, &on, nodes, admit)
+        {
+            Ok(done) => done,
+            Err(e) => {
+                st.library.drop_if_empty(key);
+                // Every executable is device memory taken from the driver,
+                // outside the reservation, so a full card refuses the
+                // instantiation here — named, with what the library holds.
+                let (execs_held, nodes_held, bytes_held) = st.library.held();
+                tracing::warn!(
+                    target: "candle_core::graph",
+                    wave = serial,
+                    segment,
+                    nodes,
+                    topologies,
+                    execs_held,
+                    nodes_held,
+                    bytes_held,
+                    "segment could not be folded or instantiated: {e}"
+                );
+                return Err(e);
+            }
+        };
         let fold_us = started.elapsed().as_micros() as u64;
+        if let Some(d) = departs {
+            tracing::info!(
+                target: "candle_core::graph",
+                wave = serial,
+                segment,
+                nodes,
+                topologies,
+                instantiate_ms = fold_us / 1000,
+                diverges = d.as_str(),
+                "segment of a new topology, against this ordinal's last"
+            );
+        }
+        if let Some(r) = refusal {
+            tracing::info!(
+                target: "candle_core::graph",
+                wave = serial,
+                segment,
+                nodes,
+                kept = ?r.kept_nodes,
+                instantiate_ms = fold_us / 1000,
+                diverges = r.divergence.as_deref().unwrap_or("nowhere: same kernels in order"),
+                "segment instantiated beside its topology's executables"
+            );
+        }
         // The recorded launches' own breadcrumbs were left at record time; this
         // one marks where they were actually issued.
         set_kernel_breadcrumb("graph segment launch", file!(), line!());
-        exec.launch(&on)?;
+        match &transient {
+            // Launched once and dropped: destroying an executable in flight is
+            // legal, and the driver frees it when its launch completes.
+            Some(exec) => exec.launch(&on)?,
+            None => st
+                .library
+                .front(key)
+                .expect("a kept fold leaves its executable in front")
+                .launch(&on)?,
+        }
+        drop(transient);
         st.stats.segments += 1;
         st.stats.nodes += nodes as u64;
         match folded {
@@ -503,8 +622,45 @@ impl CaptureHub {
             Folded::Instantiated => {
                 st.stats.instantiated += 1;
                 st.stats.instantiated_us += fold_us;
+                let evicted = st.library.admitted(key, serial);
+                st.stats.evicted += evicted.execs as u64;
+                st.stats.evicted_bytes += evicted.bytes;
+            }
+            Folded::Transient => {
+                st.stats.transient += 1;
+                st.stats.instantiated_us += fold_us;
+                st.library.drop_if_empty(key);
             }
         }
+        Ok(())
+    }
+
+    /// Begin the wave's next segment: recording, unless the key this ordinal
+    /// held last wave is cooling and nothing of its topology is kept — then the
+    /// segment runs as issued, unrecorded, because instantiating it would buy
+    /// one launch and an executable the library may not keep.
+    ///
+    /// The key is a prediction: a segment's real key is known only once it has
+    /// been recorded. A miss either way is harmless — an unrecorded segment
+    /// that could have been kept is recorded next wave, and a recorded one
+    /// whose key turns out to be cooling folds into its topology or runs once
+    /// ([`Folded::Transient`]).
+    fn start_segment(st: &mut HubState) -> Result<()> {
+        let wave = st.wave.as_ref().expect("called inside a wave");
+        let serial = wave.serial;
+        let predicted = st.last_key.get(wave.segment).copied().flatten();
+        let skip = predicted
+            .is_some_and(|(k, s)| st.library.cooling(k, s, serial) && !st.library.holds(k));
+        if skip {
+            st.stats.eager_segments += 1;
+            st.wave.as_mut().expect("checked above").eager = true;
+            return Ok(());
+        }
+        let capture = st.capture.clone().expect("a wave has a capture stream");
+        begin(&capture)?;
+        let wave = st.wave.as_mut().expect("checked above");
+        wave.recording = true;
+        wave.recording_since = Some(Instant::now());
         Ok(())
     }
 
@@ -572,7 +728,7 @@ impl CaptureHub {
         }
         let (ended, dead) = {
             let mut st = self.lock();
-            if !st.wave.as_ref().is_some_and(|w| w.recording) {
+            if !st.wave.as_ref().is_some_and(|w| w.recording || w.eager) {
                 // Held, or paused by an outer guard: nothing records on this
                 // thread and there is nothing to end; resuming is the guard's.
                 drop(st);
@@ -587,23 +743,14 @@ impl CaptureHub {
         ended?;
         query_submits(compute)?;
         let mut st = self.lock();
-        let capture = st.capture.clone().expect("a wave has a capture stream");
-        let resumed = begin(&capture);
-        let wave = st
-            .wave
-            .as_mut()
-            .expect("this thread's wave stays open across its flush");
-        match resumed {
-            Ok(()) => {
-                wave.recording = true;
-                wave.recording_since = Some(Instant::now());
-                Ok(())
-            }
-            Err(e) => {
-                wave.error = Some(e.to_string());
-                Err(e)
-            }
+        let resumed = Self::start_segment(&mut st);
+        if let Err(e) = &resumed {
+            st.wave
+                .as_mut()
+                .expect("this thread's wave stays open across its flush")
+                .error = Some(e.to_string());
         }
+        resumed
     }
 
     /// Close this thread's wave: launch the last segment and stop recording.
@@ -684,6 +831,15 @@ impl CaptureHub {
         self.lock().graveyard.len()
     }
 
+    /// Replace the executable library with an empty one of `budget` bytes, and
+    /// forget every ordinal's last key.
+    #[cfg(test)]
+    pub(crate) fn reset_library(&self, budget: u64) {
+        let mut st = self.lock();
+        st.library = ExecLibrary::with_budget(budget);
+        st.last_key.clear();
+    }
+
     /// Close the wave of a forward that failed, **launching what is recording**.
     ///
     /// The forward has failed, but the work it recorded before the failure was
@@ -718,6 +874,14 @@ impl CaptureHub {
     }
 
     pub(crate) fn stats(&self) -> CaptureStats {
-        self.lock().stats
+        let st = self.lock();
+        let (execs_held, nodes_held, bytes_held) = st.library.held();
+        CaptureStats {
+            execs_held: execs_held as u64,
+            nodes_held: nodes_held as u64,
+            bytes_held,
+            cooling: st.library.cooling_len() as u64,
+            ..st.stats
+        }
     }
 }

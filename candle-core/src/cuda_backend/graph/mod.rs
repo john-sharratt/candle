@@ -9,8 +9,14 @@
 //!   `ThreadLocal` mode, so other threads' work neither breaks the capture nor
 //!   is recorded into it. The wave is cut into segments wherever the host has
 //!   to meet the device; each is launched into the compute stream as it ends.
-//! * `ExecSlot` (`slot`) — the executables one segment ordinal keeps, one per
-//!   wave shape, each wave's recapture folded into them in place.
+//! * `ExecLibrary` (`library`) — the executables kept across waves, found by
+//!   a segment's topology (its node kinds in order) rather than its ordinal,
+//!   so a run of layers folds into its own executables wherever the wave's
+//!   cuts put it, whichever kernel variants its width chose. Kept within a
+//!   device-memory budget (`budget`): least-invoked eviction, and a cooldown
+//!   before an evicted key may be kept again.
+//! * `ExecSlot` (`slot`) — one topology's executables, one per shape in steady
+//!   use, each recapture folded into them in place.
 //! * [`GraphExec`] — an instantiated graph, launched only into a
 //!   [`ComputeStream`]. A graph launched into the null stream orders against
 //!   everything else on it exactly as the eager launches it replaces did.
@@ -21,9 +27,11 @@
 //! is executed immediately instead of being recorded, so only launchers that
 //! take their stream from the caller can sit inside a recorded segment.
 
+mod budget;
 mod error;
 mod exec;
 mod hub;
+mod library;
 mod record_gate;
 #[cfg(test)]
 mod session;
@@ -33,6 +41,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+pub use budget::{budget_for as graph_budget_for, graph_budget_bytes};
 pub use error::GraphError;
 pub use exec::GraphExec;
 pub(crate) use hub::CaptureHub;

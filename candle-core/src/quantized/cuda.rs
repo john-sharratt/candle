@@ -9,6 +9,7 @@ use super::{GgmlDType, Int8Mode, QStorage, SumScale};
 use crate::backend::{BackendDevice, BackendStorage};
 
 use crate::cuda_backend::alloc_inheriting;
+use crate::cuda_backend::stream_alloc;
 use crate::cuda_backend::wave_provenance::{wave_alloc_attributed, LeaseOrigin};
 use crate::cuda_backend::Backing;
 use crate::cuda_backend::INHERIT_ALIGN;
@@ -58,11 +59,14 @@ use super::table_ring::table_ring;
 #[cfg(test)]
 mod graph_bench;
 mod narrow;
+mod palette4_block;
 #[cfg(test)]
 mod prefill_tile_tests;
 mod silu_matmul;
 mod split_k;
 use narrow::q8a128_dense_matmul_narrow_segmented;
+use palette4_block::select_palette4_owned;
+pub use palette4_block::{select_palette4_in, Palette4Layout, Palette4Result};
 pub(crate) use silu_matmul::q8a128_dense_matmul_silu;
 pub use split_k::ensure_split_k_scratch;
 use split_k::q8a128_dense_matmul_split_k_segmented;
@@ -1490,239 +1494,33 @@ pub fn select_kv_format_paged_batched_raw(
     // Test-oriented wrapper: full chunks only (offset 0, all 32 tokens).
     let full_ranges = vec![32i32; n_chunks];
 
-    let (_kpt, _vpt, _ksi, _vsi, _kpm, _vpm, _ka, _va, k_eff, v_eff, _kht, _vht, _qr) = unsafe {
+    let selected = unsafe {
         let stream = dev.cuda_stream();
         let (pht_ptr, _pht_guard) = per_head_table_gpu.device_ptr(&stream);
         let (gids_ptr, _gids_guard) = gids_gpu.device_ptr(&stream);
-        select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
+        select_palette4_owned(
             pht_ptr,
             gids_ptr,
             n_chunks,
             k_candidates,
             v_candidates,
-            k_threshold_hi,
-            k_threshold_lo,
-            v_threshold_hi,
-            v_threshold_lo,
+            [
+                k_threshold_hi,
+                k_threshold_lo,
+                v_threshold_hi,
+                v_threshold_lo,
+            ],
             blocks_per_head,
             n_kv_head,
             arena_chunks,
             &full_ranges,
             dev,
-            &stream,
         )?
     };
 
-    Ok((k_eff, v_eff))
-}
-
-/// Fused per-head palette-4 selection from pre-uploaded device pointers.
-///
-/// Calls the fused `run_select_kv_format_palette4_paged` kernel (one block per head)
-/// which performs format selection and palette-4 grouping in a single pass.
-///
-/// Returns a 13-tuple:
-/// `(k_palette_tags, v_palette_tags, k_pal_scale, v_pal_scale,
-///   k_palette_map, v_palette_map, k_head_amax, v_head_amax,
-///   k_eff_block_tags, v_eff_block_tags, k_head_tags, v_head_tags, q_rel_out)`
-///
-/// # Safety
-///
-/// `per_head_table_ptr` and `head_gids_ptr` are raw DEVICE addresses, passed
-/// straight to the kernel without validation. The caller guarantees that both:
-///
-/// * point into live allocations on the same device and stream this call uses,
-///   and stay live for the duration of the launch;
-/// * are laid out as the kernel expects — `PerHeadEntry[n_chunks]` and the
-///   matching `HeadGids` block — since a wrong stride reads neighbouring memory
-///   rather than faulting;
-/// * are correctly aligned for those element types.
-///
-/// Passing a host pointer, a freed allocation, or a buffer from another device
-/// is undefined behaviour and will not necessarily fault.
-#[allow(clippy::type_complexity)]
-pub unsafe fn select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
-    per_head_table_ptr: u64,
-    head_gids_ptr: u64,
-    n_chunks: usize,
-    k_candidates: &[GgmlDType],
-    v_candidates: &[GgmlDType],
-    k_threshold_hi: f32,
-    k_threshold_lo: f32,
-    v_threshold_hi: f32,
-    v_threshold_lo: f32,
-    blocks_per_head: usize,
-    n_kv_head: usize,
-    arena_chunks: usize,
-    // Per-chunk valid token range, packed (offset << 8) | len, len in
-    // [1, 32]. The kernels read every slot outside it as zero, whatever the
-    // slot holds, and correct the count-normalized error metrics and sink
-    // statistics for the missing lanes.
-    valid_ranges: &[i32],
-    dev: &CudaDevice,
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-) -> Result<(
-    CudaSlice<i32>, // k_palette_tags          [total_heads * 4]
-    CudaSlice<i32>, // v_palette_tags          [total_heads * 4]
-    CudaSlice<f32>, // k_pal_scale             [total_heads * 4] outer scale per slot
-    CudaSlice<f32>, // v_pal_scale             [total_heads * 4] outer scale per slot
-    CudaSlice<i32>, // k_palette_map           [total_heads * blocks_per_head]
-    CudaSlice<i32>, // v_palette_map           [total_heads * blocks_per_head]
-    CudaSlice<f32>, // k_head_amax             [total_heads]
-    CudaSlice<f32>, // v_head_amax             [total_heads]
-    CudaSlice<i32>, // k_eff_block_tags        [total_heads * blocks_per_head]
-    CudaSlice<i32>, // v_eff_block_tags        [total_heads * blocks_per_head]
-    CudaSlice<i32>, // k_head_tags             [total_heads]
-    CudaSlice<i32>, // v_head_tags             [total_heads]
-    CudaSlice<f32>, // q_rel_out               [total_heads * blocks_per_head]
-)> {
-    let total_heads = n_chunks * n_kv_head;
-    let total_blocks = total_heads * blocks_per_head;
-    if total_heads == 0 {
-        return Ok((
-            dev.alloc_zeros::<i32>(0)?,
-            dev.alloc_zeros::<i32>(0)?,
-            dev.alloc_zeros::<f32>(0)?,
-            dev.alloc_zeros::<f32>(0)?,
-            dev.alloc_zeros::<i32>(0)?,
-            dev.alloc_zeros::<i32>(0)?,
-            dev.alloc_zeros::<f32>(0)?,
-            dev.alloc_zeros::<f32>(0)?,
-            dev.alloc_zeros::<i32>(0)?,
-            dev.alloc_zeros::<i32>(0)?,
-            dev.alloc_zeros::<i32>(0)?,
-            dev.alloc_zeros::<i32>(0)?,
-            dev.alloc_zeros::<f32>(0)?,
-        ));
-    }
-
-    let mut k_codes: Vec<i32> = k_candidates
-        .iter()
-        .map(|d| ggml_to_select_qtype(*d))
-        .collect::<Result<Vec<_>>>()?;
-    let mut v_codes: Vec<i32> = v_candidates
-        .iter()
-        .map(|d| ggml_to_select_qtype(*d))
-        .collect::<Result<Vec<_>>>()?;
-    // Sort candidates ascending by BPE so the kernel sees the lowest-BPE
-    // (most aggressive) format first — that's the kernel's expected
-    // contract (`select_kv_format.cuh` walks `cands[ci]` in ascending-BPE
-    // order and stops at the first format hitting the 32-block quota).
-    //
-    // `sort_by_key` is a STABLE sort: when two formats have equal BPE,
-    // their relative order from the caller's input is preserved. This is
-    // load-bearing — it lets the caller express priority within an
-    // equal-BPE tier by ordering the input list. E.g. passing
-    // [Q0_V, Q0_X] vs [Q0_X, Q0_V] (both 0.5 BPE) keeps the user's
-    // chosen first-tried format first; the kernel's lowest-aerr tiebreak
-    // can still override at the winner-pick stage.
-    k_codes.sort_by_key(|c| select_qtype_bpe_x4(*c));
-    v_codes.sort_by_key(|c| select_qtype_bpe_x4(*c));
-
-    let k_cand_gpu = stream.memcpy_stod(&k_codes).w()?;
-    let v_cand_gpu = stream.memcpy_stod(&v_codes).w()?;
-    if valid_ranges.len() != n_chunks {
-        crate::bail!(
-            "valid_ranges length {} != n_chunks {}",
-            valid_ranges.len(),
-            n_chunks
-        );
-    }
-    let valid_ranges_gpu = stream.memcpy_stod(valid_ranges).w()?;
-
-    let mut q_rel_median_out = stream.alloc_zeros::<f32>(total_heads).w()?;
-    let mut q_rel_spread_out = stream.alloc_zeros::<f32>(total_heads).w()?;
-    let mut k_head_amax_out = stream.alloc_zeros::<f32>(total_heads).w()?;
-    let mut v_head_amax_out = stream.alloc_zeros::<f32>(total_heads).w()?;
-    let mut k_head_p95_out = stream.alloc_zeros::<f32>(total_heads).w()?;
-    let mut v_head_p95_out = stream.alloc_zeros::<f32>(total_heads).w()?;
-    let mut k_palette_tags = stream.alloc_zeros::<i32>(total_heads * 4).w()?;
-    let mut v_palette_tags = stream.alloc_zeros::<i32>(total_heads * 4).w()?;
-    let mut k_pal_scale = stream.alloc_zeros::<f32>(total_heads * 4).w()?;
-    let mut v_pal_scale = stream.alloc_zeros::<f32>(total_heads * 4).w()?;
-    let mut k_palette_map = stream.alloc_zeros::<i32>(total_blocks).w()?;
-    let mut v_palette_map = stream.alloc_zeros::<i32>(total_blocks).w()?;
-    let mut k_eff_block_tags = stream.alloc_zeros::<i32>(total_blocks).w()?;
-    let mut v_eff_block_tags = stream.alloc_zeros::<i32>(total_blocks).w()?;
-    let mut k_head_tags_out = stream.alloc_zeros::<i32>(total_heads).w()?;
-    let mut v_head_tags_out = stream.alloc_zeros::<i32>(total_heads).w()?;
-    let mut q_rel_out = stream.alloc_zeros::<f32>(total_blocks).w()?;
-    // Source outer scales: 1.0 when source is R16/float (no outer scale).
-    // For re-compression from already-quantized data these must be supplied by
-    // the caller; passing 1.0 here is correct for the initial R16→quant path.
-    {
-        let (q_med_ptr, _qm_guard) = q_rel_median_out.device_ptr_mut(stream);
-        let (q_spd_ptr, _qs_guard) = q_rel_spread_out.device_ptr_mut(stream);
-        let (k_amax_ptr, _ka_guard) = k_head_amax_out.device_ptr_mut(stream);
-        let (v_amax_ptr, _va_guard) = v_head_amax_out.device_ptr_mut(stream);
-        let (k_p95_ptr, _kp_guard) = k_head_p95_out.device_ptr_mut(stream);
-        let (v_p95_ptr, _vp_guard) = v_head_p95_out.device_ptr_mut(stream);
-        let (k_cand_ptr, _kc_guard) = k_cand_gpu.device_ptr(stream);
-        let (v_cand_ptr, _vc_guard) = v_cand_gpu.device_ptr(stream);
-        let (k_pal_tag_ptr, _kpt) = k_palette_tags.device_ptr_mut(stream);
-        let (v_pal_tag_ptr, _vpt) = v_palette_tags.device_ptr_mut(stream);
-        let (k_pal_scale_ptr, _kpsi) = k_pal_scale.device_ptr_mut(stream);
-        let (v_pal_scale_ptr, _vpsi) = v_pal_scale.device_ptr_mut(stream);
-        let (k_pal_map_ptr, _kpm) = k_palette_map.device_ptr_mut(stream);
-        let (v_pal_map_ptr, _vpm) = v_palette_map.device_ptr_mut(stream);
-        let (k_eff_ptr, _keff) = k_eff_block_tags.device_ptr_mut(stream);
-        let (v_eff_ptr, _veff) = v_eff_block_tags.device_ptr_mut(stream);
-        let (k_htag_ptr, _kht) = k_head_tags_out.device_ptr_mut(stream);
-        let (v_htag_ptr, _vht) = v_head_tags_out.device_ptr_mut(stream);
-        let (q_rel_ptr, _qrel) = q_rel_out.device_ptr_mut(stream);
-        let (valid_ranges_ptr, _vr_guard) = valid_ranges_gpu.device_ptr(stream);
-
-        select_kv_format_palette4_paged(
-            per_head_table_ptr,
-            head_gids_ptr,
-            q_med_ptr,
-            q_spd_ptr,
-            k_amax_ptr,
-            v_amax_ptr,
-            k_p95_ptr,
-            v_p95_ptr,
-            k_cand_ptr,
-            v_cand_ptr,
-            k_codes.len() as i32,
-            v_codes.len() as i32,
-            k_threshold_hi,
-            k_threshold_lo,
-            v_threshold_hi,
-            v_threshold_lo,
-            total_heads as i32,
-            blocks_per_head as i32,
-            n_kv_head as i32,
-            arena_chunks as i32,
-            valid_ranges_ptr,
-            k_pal_tag_ptr,
-            v_pal_tag_ptr,
-            k_pal_scale_ptr,
-            v_pal_scale_ptr,
-            k_pal_map_ptr,
-            v_pal_map_ptr,
-            k_eff_ptr,
-            v_eff_ptr,
-            k_htag_ptr,
-            v_htag_ptr,
-            q_rel_ptr,
-            stream.cu_stream() as *mut _,
-        );
-    }
-
     Ok((
-        k_palette_tags,
-        v_palette_tags,
-        k_pal_scale,
-        v_pal_scale,
-        k_palette_map,
-        v_palette_map,
-        k_head_amax_out,
-        v_head_amax_out,
-        k_eff_block_tags,
-        v_eff_block_tags,
-        k_head_tags_out,
-        v_head_tags_out,
-        q_rel_out,
+        dev.memcpy_stod(&selected.k_eff_block_tags)?,
+        dev.memcpy_stod(&selected.v_eff_block_tags)?,
     ))
 }
 
@@ -1804,30 +1602,34 @@ pub fn select_kv_format_paged_per_head(
     // Test-oriented wrapper: full chunks only (offset 0, all 32 tokens).
     let full_ranges = vec![32i32; n_chunks];
 
-    let (_kpt, _vpt, _ksi, _vsi, _kpm, _vpm, _ka, _va, _keff, _veff, k_head_tags, v_head_tags, _qr) = unsafe {
+    let selected = unsafe {
         let stream = dev.cuda_stream();
         let (pht_ptr, _pht_guard) = per_head_table_gpu.device_ptr(&stream);
         let (gids_ptr, _gids_guard) = gids_gpu.device_ptr(&stream);
-        select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
+        select_palette4_owned(
             pht_ptr,
             gids_ptr,
             n_chunks,
             k_candidates,
             v_candidates,
-            k_threshold_hi,
-            k_threshold_lo,
-            v_threshold_hi,
-            v_threshold_lo,
+            [
+                k_threshold_hi,
+                k_threshold_lo,
+                v_threshold_hi,
+                v_threshold_lo,
+            ],
             blocks_per_head,
             n_kv_head,
             arena_chunks,
             &full_ranges,
             dev,
-            &stream,
         )?
     };
 
-    Ok((k_head_tags, v_head_tags))
+    Ok((
+        dev.memcpy_stod(&selected.k_head_tags)?,
+        dev.memcpy_stod(&selected.v_head_tags)?,
+    ))
 }
 
 /// Run the new paged-batched sampled-error kernel.
@@ -4852,7 +4654,7 @@ pub fn load_quantized_on_stream<T: super::GgmlType + Send + Sync + 'static>(
     };
     let dtype = T::DTYPE;
     let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
-    let mut inner = unsafe { stream.alloc::<u8>(padded_len).map_err(crate::Error::wrap)? };
+    let mut inner = unsafe { stream_alloc::<u8>(stream, padded_len)? };
     stream
         .memcpy_htod(data, &mut inner.slice_mut(..data.len()))
         .map_err(crate::Error::wrap)?;
@@ -4886,7 +4688,7 @@ pub fn load_repacked_on_stream(
     dtype: GgmlDType,
 ) -> Result<super::QStorage> {
     let len = repacked_data.len();
-    let mut inner = unsafe { stream.alloc::<u8>(len).map_err(crate::Error::wrap)? };
+    let mut inner = unsafe { stream_alloc::<u8>(stream, len)? };
     stream
         .memcpy_htod(repacked_data, &mut inner.slice_mut(..len))
         .map_err(crate::Error::wrap)?;

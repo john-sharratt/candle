@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use super::content_hash::snapshot_stream_id;
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
@@ -51,7 +52,12 @@ const COMPACT_FLUSH_BYTES: usize = 256 * 1024 * 1024;
 /// decode, no CRC re-verify, no re-encode — via coalesced stripe reads; their
 /// header is synthesized from the substrate/manifest index (never read from
 /// disk) for the header-index digest + singleton manifest. `Synth` records are
-/// the small resident metadata, encoded fresh from in-RAM state.
+/// the resident metadata, encoded fresh from in-RAM state — or, for the blobs
+/// the substrate already holds shared (index pages, wide-Q signatures,
+/// projection events), the substrate's own bytes. Those run to a megabyte a
+/// turn and the whole live list exists before the first byte is written, so a
+/// copy here is a second image of every live turn's metadata held for the
+/// length of the rewrite.
 pub enum CompactItem {
     Raw {
         header: RecordHeader,
@@ -61,7 +67,7 @@ pub enum CompactItem {
     },
     Synth {
         header: RecordHeader,
-        payload: Vec<u8>,
+        payload: Arc<[u8]>,
     },
 }
 
@@ -75,8 +81,11 @@ impl CompactItem {
         }
     }
 
-    fn synth(header: RecordHeader, payload: Vec<u8>) -> CompactItem {
-        CompactItem::Synth { header, payload }
+    fn synth(header: RecordHeader, payload: impl Into<Arc<[u8]>>) -> CompactItem {
+        CompactItem::Synth {
+            header,
+            payload: payload.into(),
+        }
     }
 
     /// The record's header — synthesized for `Raw`, authored for `Synth`.
@@ -90,7 +99,7 @@ impl CompactItem {
     #[cfg(test)]
     pub fn synth_payload(&self) -> Option<&[u8]> {
         match self {
-            CompactItem::Synth { payload, .. } => Some(payload),
+            CompactItem::Synth { payload, .. } => Some(&payload[..]),
             CompactItem::Raw { .. } => None,
         }
     }
@@ -520,7 +529,7 @@ pub fn collect_live_records(
                     chunk_index: 0,
                     token_count: 0,
                 },
-                payload.bytes().to_vec(),
+                payload.shared_bytes(),
             ));
         }
         if let Some(through) = entry.committed_through {
@@ -946,6 +955,71 @@ mod tests {
     /// True iff any record of type `rt` is present (by header, `Raw` or `Synth`).
     fn has_type(live: &[CompactItem], rt: RecordType) -> bool {
         live.iter().any(|it| it.header().record_type == rt)
+    }
+
+    /// **The live list shares a turn's metadata blobs; it does not copy them.**
+    /// The whole list exists before the first byte is written, so a copy is a
+    /// second image of every live turn's index page and wide-Q signature held
+    /// for the length of the rewrite.
+    #[test]
+    fn the_live_list_shares_the_substrates_blobs() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 6,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = decl.stream_id();
+        let mut mem =
+            MemLog::with_records(&record(RecordType::StreamDecl, sid.0, 0, &decl.encode()));
+        let (manifest, mut substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        substrate.set_projection_events_blob(sid, vec![1, 2, 3]);
+        substrate.set_wide_q_sigs_blob(sid, vec![4, 5, 6, 7]);
+        substrate.set_index_page_blob(sid, vec![8, 9]);
+
+        let live = collect_live_records(&manifest, &substrate, &HashMap::new(), &VfsIndex::new());
+        let entry = substrate.stream_of(sid).unwrap();
+        let payload_of = |rt: RecordType| {
+            live.iter()
+                .find_map(|it| match it {
+                    CompactItem::Synth { header, payload }
+                        if header.record_type == rt && header.stream_id == sid.0 =>
+                    {
+                        Some(payload)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{rt:?} is missing from the live list"))
+        };
+
+        let events = payload_of(RecordType::ProjectionEvents);
+        assert_eq!(&events[..], &[1, 2, 3]);
+        assert!(Arc::ptr_eq(
+            events,
+            entry.projection_events.as_ref().unwrap()
+        ));
+
+        let sigs = payload_of(RecordType::WideQSig);
+        assert_eq!(&sigs[..], &[4, 5, 6, 7]);
+        assert!(Arc::ptr_eq(sigs, entry.wide_q_sigs.as_ref().unwrap()));
+
+        let page = payload_of(RecordType::TurnIndexPage);
+        assert_eq!(&page[..], &[8, 9]);
+        assert!(Arc::ptr_eq(
+            page,
+            &entry.index_page.as_ref().unwrap().shared_bytes()
+        ));
     }
 
     fn record(rt: RecordType, stream_id: u64, chunk_index: u64, payload: &[u8]) -> Vec<u8> {

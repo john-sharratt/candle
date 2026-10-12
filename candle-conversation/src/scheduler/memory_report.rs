@@ -46,6 +46,44 @@ pub struct MemoryReport {
     pub weights: WeightSection,
     pub gallery: GallerySection,
     pub accounting: AccountingSection,
+    /// The held ground, holder by holder. `None` before the reservation exists.
+    pub held: Option<HeldSection>,
+}
+
+/// The reservation's held ground: its totals, and who holds it.
+///
+/// [`AccountingSection::inside_held_bytes`] says how full the ground is; this
+/// says by whom. A buffer the ground refuses goes to the CUDA pool and, on a
+/// full card, to the driver — so when a forward dies of
+/// `CUDA_ERROR_OUT_OF_MEMORY`, the holders listed here are what filled it and
+/// the `declines` are who was turned away.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeldSection {
+    /// Bytes taken and not yet reusable, padding and fenced releases included.
+    pub used_bytes: u64,
+    /// The part of `used_bytes` given back but still behind its fence.
+    pub pending_bytes: u64,
+    pub peak_bytes: u64,
+    pub capacity_bytes: u64,
+    /// The widest buffer the ground could hand out now.
+    pub largest_free_bytes: u64,
+    /// Every holder that has taken or been refused anything, largest first.
+    pub sites: Vec<HeldSiteRow>,
+}
+
+/// One holder of held ground, named by the code that asked for it.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeldSiteRow {
+    /// `file:line:column`.
+    pub site: String,
+    pub live_bytes: u64,
+    pub live_count: usize,
+    pub peak_bytes: u64,
+    pub takes: u64,
+    /// Requests the ground could not hold — each one went to the CUDA pool.
+    pub declines: u64,
+    pub declined_bytes: u64,
+    pub largest_decline_bytes: u64,
 }
 
 /// Model weights resident in VRAM, split into the two parts that behave
@@ -208,6 +246,11 @@ pub struct AccountingSection {
     /// wide wave) and it moves with wave width, so a run that grows it and a run
     /// that leaks it look identical in the span total alone.
     pub inside_recurrent_bytes: u64,
+    /// The held ground's buffers, **inside** the span: the launch tables,
+    /// resident headers, sampler packs and attention partials that outlive
+    /// every forward. What the pool used to hold of them now shows up here, and
+    /// a buffer the ground could not hold shows up in `outside_pool_bytes`.
+    pub inside_held_bytes: u64,
     /// Bytes that went to the pool because their origin carried no wave ticket,
     /// **over the last wave**.
     ///
@@ -715,6 +758,12 @@ impl Scheduler {
         // and deliberately NOT added to the outside set.
         let inside_gallery_bytes = gallery.resident_bytes;
         let inside_recurrent_bytes = self.model.recurrent_reserved_bytes() as u64;
+        let inside_held_bytes = match self.device.location() {
+            candle::DeviceLocation::Cuda { gpu_id } => {
+                candle_nn::kv_cache::held_ground_stats(gpu_id).map_or(0, |s| s.used as u64)
+            }
+            _ => 0,
+        };
         // Why the pool was reached at all, split by its two causes — over the
         // last wave, not the run. See the field docs for why the lifetime
         // totals answer nothing.
@@ -756,6 +805,7 @@ impl Scheduler {
             inside_dense_bytes,
             inside_gallery_bytes,
             inside_recurrent_bytes,
+            inside_held_bytes,
             expert_zone_bytes,
             inside_transient_bytes,
             decline_no_ticket_bytes,
@@ -766,6 +816,34 @@ impl Scheduler {
                 - span_bytes.unwrap_or(0) as i64
                 - outside_span_bytes as i64
                 - driver_baseline_bytes.unwrap_or(0) as i64,
+        };
+
+        // ── Held ground, by holder ──────────────────────────────────────────
+        let held = match self.device.location() {
+            candle::DeviceLocation::Cuda { gpu_id } => {
+                candle_nn::kv_cache::held_ground_stats(gpu_id).map(|s| HeldSection {
+                    used_bytes: s.used as u64,
+                    pending_bytes: s.pending as u64,
+                    peak_bytes: s.peak as u64,
+                    capacity_bytes: s.capacity as u64,
+                    largest_free_bytes: s.largest_free as u64,
+                    sites: candle_nn::kv_cache::held_ground_sites(gpu_id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|h| HeldSiteRow {
+                            site: h.site,
+                            live_bytes: h.live_bytes as u64,
+                            live_count: h.live_count,
+                            peak_bytes: h.peak_bytes as u64,
+                            takes: h.takes,
+                            declines: h.declines,
+                            declined_bytes: h.declined_bytes,
+                            largest_decline_bytes: h.largest_decline as u64,
+                        })
+                        .collect(),
+                })
+            }
+            _ => None,
         };
 
         MemoryReport {
@@ -779,6 +857,7 @@ impl Scheduler {
             weights,
             gallery,
             accounting,
+            held,
         }
     }
 }
@@ -903,6 +982,8 @@ mod tests {
                 inside_gallery_bytes: 268_435_456,
                 // 16 sequences of hybrid recurrent state.
                 inside_recurrent_bytes: 2_113_929_216,
+                // Launch tables, resident headers and attention partials.
+                inside_held_bytes: 48_234_496,
                 // The elastic weight zone — the largest span tenant on a MoE
                 // model, and the one that shrinks as the boundary concedes.
                 // The zone's EXTENT — deliberately larger than
@@ -925,7 +1006,50 @@ mod tests {
                     - 234_881_024i64
                     - 1_900_000_000i64,
             },
+            // The same 48,234,496 B as `inside_held_bytes`, split between its
+            // holders, with one holder already turned away once.
+            held: Some(HeldSection {
+                used_bytes: 48_234_496,
+                pending_bytes: 1_048_576,
+                peak_bytes: 50_331_648,
+                capacity_bytes: 402_653_184,
+                largest_free_bytes: 354_418_688,
+                sites: vec![
+                    HeldSiteRow {
+                        site: "candle-core/src/cuda_backend/kernel_scratch.rs:38:24".into(),
+                        live_bytes: 33_554_432,
+                        live_count: 3,
+                        peak_bytes: 33_554_432,
+                        takes: 3,
+                        declines: 1,
+                        declined_bytes: 67_108_864,
+                        largest_decline_bytes: 67_108_864,
+                    },
+                    HeldSiteRow {
+                        site: "candle-conversation/src/scheduler/decode.rs:500:66".into(),
+                        live_bytes: 13_631_488,
+                        live_count: 13,
+                        peak_bytes: 16_777_216,
+                        takes: 2_048,
+                        declines: 0,
+                        declined_bytes: 0,
+                        largest_decline_bytes: 0,
+                    },
+                ],
+            }),
         }
+    }
+
+    /// The held section's holders and fenced bytes account for exactly what the
+    /// ground reports in use — the ledger and the extents are two books over
+    /// the same ranges, and a holder missing from one is a range nobody owns.
+    #[test]
+    fn the_held_holders_and_fences_sum_to_the_ground_in_use() {
+        let r = sample();
+        let h = r.held.as_ref().expect("the fixture has a held section");
+        let holders: u64 = h.sites.iter().map(|s| s.live_bytes).sum();
+        assert_eq!(holders + h.pending_bytes, h.used_bytes);
+        assert_eq!(h.used_bytes, r.accounting.inside_held_bytes);
     }
 
     /// The JSON shape is the API contract — every section and the fields other
@@ -966,10 +1090,15 @@ mod tests {
             "inside_dense_bytes",
             "inside_gallery_bytes",
             "inside_recurrent_bytes",
+            "inside_held_bytes",
             "decline_no_ticket_bytes",
             "decline_closed_bytes",
             "unaccounted_bytes",
             "span_bytes",
+            // Who holds the held ground, and who it turned away.
+            "largest_free_bytes",
+            "\"sites\"",
+            "declined_bytes",
         ] {
             assert!(json.contains(key), "missing {key} in {json}");
         }
@@ -1023,6 +1152,7 @@ mod tests {
         // a component with the total that already includes it.
         let named_in_span = a.inside_gallery_bytes
             + a.inside_recurrent_bytes
+            + a.inside_held_bytes
             + a.inside_dense_bytes
             + a.expert_zone_bytes
             + a.inside_transient_bytes;
@@ -1049,6 +1179,7 @@ mod tests {
             ("dense", a.inside_dense_bytes),
             ("gallery", a.inside_gallery_bytes),
             ("recurrent", a.inside_recurrent_bytes),
+            ("held", a.inside_held_bytes),
             ("expert zone", a.expert_zone_bytes),
             ("transient", a.inside_transient_bytes),
         ] {

@@ -75,7 +75,7 @@ impl Drop for Armed {
 #[cfg(feature = "forbidden_allocations")]
 mod imp {
     use std::collections::hash_map::Entry;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fmt;
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -135,7 +135,7 @@ mod imp {
                     s.calls,
                     s.bytes,
                     s.site,
-                    first_user_frame(&s.backtrace)
+                    site_label(&s.backtrace)
                 )?;
             }
             Ok(())
@@ -144,8 +144,15 @@ mod imp {
 
     struct Registry {
         /// Keyed by stack hash so a site repeated in a hot loop aggregates
-        /// instead of reprinting.
+        /// instead of reprinting. Drained by every [`take_report`].
         sites: HashMap<u64, SiteReport>,
+        /// The stacks already printed in full, for the life of the process.
+        ///
+        /// Separate from `sites` because a report drains `sites`, and a daemon
+        /// drains it every wave: keyed off `sites`, one hot site reprinted its
+        /// whole stack after each drain, and ten minutes of serving buried the
+        /// two dozen distinct sites under 922 copies of themselves.
+        printed: HashSet<u64>,
     }
 
     fn registry() -> MutexGuard<'static, Registry> {
@@ -154,6 +161,7 @@ mod imp {
             .get_or_init(|| {
                 Mutex::new(Registry {
                     sites: HashMap::new(),
+                    printed: HashSet::new(),
                 })
             })
             .lock()
@@ -211,6 +219,7 @@ mod imp {
         let key = hasher.finish();
 
         let mut reg = registry();
+        let reg = &mut *reg;
         match reg.sites.entry(key) {
             Entry::Occupied(mut o) => {
                 let s = o.get_mut();
@@ -222,10 +231,12 @@ mod imp {
                 // lock keeps two threads discovering different sites from
                 // interleaving their stacks into one unreadable block.
                 let backtrace = format!("{:?}", backtrace::Backtrace::new());
-                eprintln!(
-                    "forbidden allocation detected: {site} requested {bytes} B of device memory \
-                     outside the bump allocator\n{backtrace}"
-                );
+                if reg.printed.insert(key) {
+                    eprintln!(
+                        "forbidden allocation detected: {site} requested {bytes} B of device \
+                         memory outside the reservation\n{backtrace}"
+                    );
+                }
                 v.insert(SiteReport {
                     site,
                     calls: 1,
@@ -264,6 +275,7 @@ mod imp {
         let key = hasher.finish();
 
         let mut reg = registry();
+        let reg = &mut *reg;
         match reg.sites.entry(key) {
             Entry::Occupied(mut o) => {
                 let s = o.get_mut();
@@ -272,7 +284,9 @@ mod imp {
             }
             Entry::Vacant(v) => {
                 let at = format!("{}:{}", loc.file(), loc.line());
-                eprintln!("forbidden allocation: {what} {bytes} B at {at}");
+                if reg.printed.insert(key) {
+                    eprintln!("forbidden allocation: {what} {bytes} B at {at}");
+                }
                 v.insert(SiteReport {
                     site: what,
                     calls: 1,
@@ -324,6 +338,17 @@ mod imp {
     /// (`resolve_u8_out <- … <- Storage::apply_op1`) before the first frame of
     /// the model code that asked, so a six-frame label named only the dispatch.
     const LABEL_FRAMES: usize = 12;
+
+    /// What names a site in the summary: a [`record_at`] site's `file:line` as
+    /// it is — it holds no frames to parse, and parsing it found none, so every
+    /// such site printed as `<unknown>` — and a walked stack's user frames.
+    fn site_label(backtrace: &str) -> String {
+        if backtrace.contains('\n') {
+            first_user_frame(backtrace)
+        } else {
+            backtrace.to_string()
+        }
+    }
 
     /// The innermost few frames that belong to this codebase rather than to the
     /// allocator plumbing, innermost first, joined by ` <- `.
@@ -477,12 +502,16 @@ mod imp {
    2: candle_core::quantized::cuda::grouped_matmul_gemx
    3: candle_core::quantized::QMatMul::qkv_segmented
    4: candle_transformers::models::quantized_qwen3_moe::project_qkv";
-            let label = first_user_frame(bt);
-            assert!(
-                label.contains("qkv_segmented"),
-                "the caller chain must place the site even when frame 0 is wrong: {label}"
+            // Every user frame, innermost first: the caller chain places the
+            // site even though frame 0 names the wrong function.
+            assert_eq!(
+                first_user_frame(bt),
+                concat!(
+                    "candle_core::quantized::cuda::grouped_matmul_gemx",
+                    " <- candle_core::quantized::QMatMul::qkv_segmented",
+                    " <- candle_transformers::models::quantized_qwen3_moe::project_qkv"
+                )
             );
-            assert_eq!(label.matches(" <- ").count(), LABEL_FRAMES - 1);
         }
 
         /// A build without debug info symbolises to bare addresses. Passing one
@@ -492,6 +521,20 @@ mod imp {
         #[test]
         fn summary_frame_passes_through_an_unsymbolised_address() {
             assert_eq!(first_user_frame("   0: 0x7ff6a1b2c3d4"), "0x7ff6a1b2c3d4");
+        }
+
+        /// A `record_at` site is named by the location it carries; a walked
+        /// stack by its user frames.
+        #[test]
+        fn a_located_site_is_labelled_by_its_location() {
+            assert_eq!(
+                site_label("candle-conversation\\src\\penalty_counts.rs:201"),
+                "candle-conversation\\src\\penalty_counts.rs:201"
+            );
+            assert_eq!(
+                site_label("   0: candle_core::forbidden_alloc::imp::record\n   1: npcd::main"),
+                "npcd::main"
+            );
         }
 
         #[test]

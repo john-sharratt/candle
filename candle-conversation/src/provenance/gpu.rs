@@ -15,6 +15,7 @@
 use core::ffi::c_void;
 
 use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
+use candle::cuda_backend::{stream_alloc, stream_memcpy_stod};
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, Result};
 use candle_kernels::provenance::run_batched_bdp_scan;
@@ -306,29 +307,17 @@ impl BatchedGpuGallery {
         }
 
         // ── Upload: pinned gallery + segment tables → VRAM (freed on return) ─
-        let d_words = stream
-            .memcpy_stod(self.words_pin.as_slice())
-            .map_err(|e| candle::Error::Msg(format!("BDP GPU scan: HtoD gallery words: {e}")))?;
-        let d_case = stream
-            .memcpy_stod(self.case_pin.as_slice())
-            .map_err(|e| candle::Error::Msg(format!("BDP GPU scan: HtoD gallery case: {e}")))?;
-        let d_seg_tok = stream
-            .memcpy_stod(self.seg_tok_pin.as_slice())
-            .map_err(|e| candle::Error::Msg(format!("BDP GPU scan: HtoD seg_tok: {e}")))?;
-        let d_seg_case = stream
-            .memcpy_stod(self.seg_case_pin.as_slice())
-            .map_err(|e| candle::Error::Msg(format!("BDP GPU scan: HtoD seg_case: {e}")))?;
-        let d_probe = stream
-            .memcpy_stod(&probe_words)
-            .map_err(|e| candle::Error::Msg(format!("BDP GPU scan: HtoD probes: {e}")))?;
+        let d_words = stream_memcpy_stod(&stream, self.words_pin.as_slice())?;
+        let d_case = stream_memcpy_stod(&stream, self.case_pin.as_slice())?;
+        let d_seg_tok = stream_memcpy_stod(&stream, self.seg_tok_pin.as_slice())?;
+        let d_seg_case = stream_memcpy_stod(&stream, self.seg_case_pin.as_slice())?;
+        let d_probe = stream_memcpy_stod(&stream, &probe_words)?;
 
         // Outputs are per (query token, group, SEGMENT). The kernel writes every
         // entry (one block per tile × group × segment), so no zero-init needed.
         let n_out = n_probe_tokens * n_groups * n_segments;
-        let mut d_out_case = unsafe { stream.alloc::<i32>(n_out) }
-            .map_err(|e| candle::Error::Msg(format!("BDP GPU scan: alloc out_case: {e}")))?;
-        let mut d_out_vote = unsafe { stream.alloc::<f32>(n_out) }
-            .map_err(|e| candle::Error::Msg(format!("BDP GPU scan: alloc out_vote: {e}")))?;
+        let mut d_out_case = unsafe { stream_alloc::<i32>(&stream, n_out) }?;
+        let mut d_out_vote = unsafe { stream_alloc::<f32>(&stream, n_out) }?;
 
         // ── Launch (guards drop after synchronize, before the D2H reads) ────
         {

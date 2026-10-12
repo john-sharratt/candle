@@ -35,10 +35,9 @@ use candle_kernels::simple::qsa_page_place::{run_qsa_page_place, PLACE_JOB_WORDS
 use candle_nn::kv_cache::{relocate_tensor, ArenaSlot};
 
 use super::index_keys::{alloc_buffers, PAGE_BLOCKS};
-use super::indexer::{i64_ptr, tensor_ptr};
+use super::indexer::tensor_ptr;
 use super::place::PLACE_TILE_R;
 use crate::models::piece_key::PieceKey;
-use crate::models::wave_buffers::wave_from_vec_ticketed;
 
 /// How a resident page's rows sit in each of its chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,9 +86,9 @@ impl ResidentPage {
     /// `pages`, each `[rows, d]` row-major F32 — placed in ONE launch.
     ///
     /// The rows are uploaded into staging slots of the same tenant and placed from
-    /// there into the page's own slots, so nothing is taken from the CUDA pool but
-    /// the few words of the job table; the staging goes back when this returns,
-    /// behind the launch on the same stream.
+    /// there into the page's own slots, and the job table rides the device's held
+    /// staging scratch, so nothing is taken from the CUDA pool; the staging goes
+    /// back when this returns, behind the launch on the same stream.
     ///
     /// **Between forwards.** A slot claim that needs a new arena takes the arena
     /// window.
@@ -152,20 +151,27 @@ impl ResidentPage {
         }
         let n_jobs = jobs.len() / PLACE_JOB_WORDS;
         if n_jobs > 0 && max_rows > 0 {
-            let table = wave_from_vec_ticketed(jobs, (n_jobs * PLACE_JOB_WORDS,), device, None)?;
-            candle::set_kernel_breadcrumb("run_qsa_page_place", file!(), line!());
-            // SAFETY: every job names a live staging slot and a live chunk slot of
-            // `used` rows, both held until after this launch is queued.
-            unsafe {
-                run_qsa_page_place(
-                    i64_ptr(&table)? as *const i64,
-                    d as i32,
-                    n_jobs as i32,
-                    max_rows as i32,
-                    PLACE_TILE_R as i32,
-                    stream.cu_stream() as *mut c_void,
-                );
-            }
+            // The job table rides the device's held staging scratch: a few words
+            // that live from this upload to the launch's read, which a fresh
+            // tensor per placement took from the driver every time a page was
+            // pushed.
+            cuda.with_staged_upload(&jobs, |table| {
+                candle::set_kernel_breadcrumb("run_qsa_page_place", file!(), line!());
+                // SAFETY: every job names a live staging slot and a live chunk
+                // slot of `used` rows, both held until after this launch is
+                // queued; `table` holds the jobs until the launch has read them.
+                unsafe {
+                    run_qsa_page_place(
+                        table as *const i64,
+                        d as i32,
+                        n_jobs as i32,
+                        max_rows as i32,
+                        PLACE_TILE_R as i32,
+                        stream.cu_stream() as *mut c_void,
+                    );
+                }
+                Ok(())
+            })?;
         }
         // The staging slots go back here, behind the launch that reads them: a
         // slot's next holder works on the same stream.

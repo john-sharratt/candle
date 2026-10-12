@@ -15,8 +15,10 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::graph::{CaptureHub, CaptureStats, Paused, WaveCapture};
+use super::held::Held;
 use super::info_ring::InfoRing;
-use super::staged::pack_segments;
+use super::kernel_scratch;
+use super::staged::{pack_segments, SEGMENT_ALIGN};
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
 use crate::cuda_backend::{alloc_inheriting, Backing};
 use crate::forbidden_alloc;
@@ -66,7 +68,7 @@ pub struct CudaDevice {
     pub(crate) blas: Arc<CudaBlas>,
     /// The fixed workspace `blas` runs in — see [`new_blas`]. Held beside the
     /// handle for as long as the handle exists.
-    blas_workspace: Arc<CudaSlice<u8>>,
+    blas_workspace: Arc<Held<u8>>,
     curand: Arc<Mutex<CudaRng>>,
     /// Memoized device copies of small layout/info tables (dims+strides blobs the
     /// strided kernels read), carved from one ring. See [`Self::info_table`].
@@ -103,10 +105,10 @@ const BLAS_WORKSPACE_BYTES: usize = 4 << 20;
 /// Without one, cuBLAS allocates its workspace on the stream per call, which
 /// a wave capture records as a graph allocation and refuses; with one, a GEMM
 /// is kernels only, recorded or not.
-fn new_blas(stream: &Arc<CudaStream>) -> Result<(Arc<CudaBlas>, Arc<CudaSlice<u8>>)> {
+fn new_blas(stream: &Arc<CudaStream>) -> Result<(Arc<CudaBlas>, Arc<Held<u8>>)> {
     let blas = CudaBlas::new(stream.clone()).w()?;
     // SAFETY: cuBLAS writes its workspace before reading it.
-    let mut workspace = unsafe { stream.alloc::<u8>(BLAS_WORKSPACE_BYTES) }.w()?;
+    let mut workspace = unsafe { Held::<u8>::alloc_on(stream, BLAS_WORKSPACE_BYTES) }?;
     let (ptr, _g) = workspace.device_ptr_mut(stream);
     // SAFETY: a live handle and a device buffer of the stated size that the
     // returned pair keeps alive beside it.
@@ -124,8 +126,9 @@ fn new_blas(stream: &Arc<CudaStream>) -> Result<(Arc<CudaBlas>, Arc<CudaSlice<u8
     Ok((Arc::new(blas), Arc::new(workspace)))
 }
 
-/// One grow-only byte buffer, reused by every call that stages through it.
-type Staging = Arc<Mutex<Option<CudaSlice<u8>>>>;
+/// One grow-only byte buffer, reused by every call that stages through it —
+/// held, so it stands on the reservation's held ground once there is one.
+type Staging = Arc<Mutex<Option<Held<u8>>>>;
 
 /// Memoized layout-table uploads, keyed by the table's contents.
 type InfoTables = Arc<Mutex<InfoRing>>;
@@ -260,14 +263,20 @@ impl CudaDevice {
     ) -> Result<CudaSlice<T>> {
         // Allocates as well as copying: the destination slice is fresh device
         // memory, so this is a driver allocation like the two above.
-        forbidden_alloc::record("CudaDevice::memcpy_stod", std::mem::size_of_val(src));
+        //
+        // The payload is `len` elements, not `size_of_val(src)`: `Src` is a
+        // container as often as a slice, and the size of a `Vec<T>` is its
+        // three words — every upload from a `Vec` was reported as 24 B, a
+        // 3 MiB recurrent-state restore among them.
+        let bytes = src.len() * std::mem::size_of::<T>();
+        forbidden_alloc::record("CudaDevice::memcpy_stod", bytes);
         let _eager = self.pause_capture()?;
         let s = self.stream.memcpy_stod(src).w()?;
         // Allocates as well as copying, so it is an allocation path like the
         // two above and needs the same guard — and unlike them it writes to the
         // range immediately, so a collision here corrupts before anything else
         // gets a chance to notice.
-        Self::guard_fresh_allocation("CudaDevice::memcpy_stod", &s, std::mem::size_of_val(src));
+        Self::guard_fresh_allocation("CudaDevice::memcpy_stod", &s, bytes);
         Ok(s)
     }
 
@@ -433,7 +442,7 @@ impl CudaDevice {
             }
             // SAFETY: staging is written by the quantize the caller launches
             // before its kernel reads it.
-            *slot = Some(unsafe { self.alloc::<u8>(grown)? });
+            *slot = Some(unsafe { Held::alloc(self, grown)? });
         }
         f(slot.as_mut().expect("sized above"))
     }
@@ -511,10 +520,15 @@ impl CudaDevice {
     }
 
     /// Upload `segments` on `stream` into a held scratch, run `f` with each
-    /// segment's device address, then synchronise `stream` — for a launch
-    /// table on a stream other than this handle's (the persistence thread's
-    /// copy stream), where the stream-ordered reuse
-    /// [`Self::with_staged_segments`] relies on does not hold.
+    /// segment's device address and the address of `room` further bytes left
+    /// for the launch to write, then synchronise `stream` — for work that
+    /// reads its results back before it returns, and for a launch table on a
+    /// stream other than this handle's (the persistence thread's copy stream),
+    /// where the stream-ordered reuse [`Self::with_staged_segments`] relies on
+    /// does not hold.
+    ///
+    /// The room is uninitialised and is not uploaded: a launch writing its
+    /// results there costs no transfer for space it is about to fill.
     ///
     /// **Reuse rests on the synchronise, not on stream order.** The scratch is
     /// locked from the upload until `stream` has drained, so the next caller —
@@ -526,20 +540,19 @@ impl CudaDevice {
         &self,
         stream: &Arc<CudaStream>,
         segments: &[&[u8]],
-        f: impl FnOnce(&[u64]) -> Result<R>,
+        room: usize,
+        f: impl FnOnce(&[u64], u64) -> Result<R>,
     ) -> Result<R> {
         let (bytes, offsets) = pack_segments(segments);
+        let room_at = bytes.len().next_multiple_of(SEGMENT_ALIGN);
+        let need = room_at + room;
         let _eager = self.pause_capture()?;
         let mut slot = self.synced_staging.lock().unwrap();
-        if !slot.as_ref().is_some_and(|s| s.len() >= bytes.len()) {
-            let grown = slot
-                .as_ref()
-                .map_or(0, |s| s.len() * 2)
-                .max(bytes.len())
-                .max(1);
+        if !slot.as_ref().is_some_and(|s| s.len() >= need) {
+            let grown = slot.as_ref().map_or(0, |s| s.len() * 2).max(need).max(1);
             *slot = None;
             // SAFETY: every byte a launch reads is written by the upload below.
-            *slot = Some(unsafe { self.alloc::<u8>(grown)? });
+            *slot = Some(unsafe { Held::alloc(self, grown)? });
             // The pool hands the bytes out in this handle's stream order, and
             // `stream` may be another one: wait for the allocation to retire
             // before a copy on `stream` writes it. Growth only.
@@ -553,7 +566,7 @@ impl CudaDevice {
         }
         let base = buf.device_ptr(stream).0;
         let addrs: Vec<u64> = offsets.iter().map(|&o| base + o as u64).collect();
-        let out = f(&addrs);
+        let out = f(&addrs, base + room_at as u64);
         stream.synchronize().w()?;
         out
     }
@@ -582,10 +595,10 @@ impl CudaDevice {
     /// same WDDM submission storm [`Self::info_table`] exists to prevent, except worse: it also
     /// spent `O(rows·groups)` of host time per layer per wave.
     ///
-    /// Entries are pool-owned (`Backing::Owned`) and outlive any single wave; kernels only read
-    /// them. Cleared wholesale past a bound, like the info-table cache — in-flight users hold
-    /// their own `Arc`, and the cleared entries are retired to the capture hub rather than
-    /// dropped, so a launch another thread recorded against one is issued before it is freed.
+    /// Entries are held ([`Held`]) and outlive any single wave; kernels only read them. Cleared
+    /// wholesale past a bound, like the info-table cache — in-flight users hold their own `Arc`,
+    /// and the cleared entries are retired to the capture hub rather than dropped, so a launch
+    /// another thread recorded against one is issued before its bytes go back.
     pub fn group_major_ids(&self, rows: usize, groups: usize) -> Result<Arc<Uploaded<u32>>> {
         let key = (rows, groups);
         let mut cache = self.perm_tables.lock().unwrap();
@@ -605,12 +618,12 @@ impl CudaDevice {
                 ids.push((t * groups + g) as u32);
             }
         }
-        let slice = self.memcpy_stod(&ids)?;
-        let t = Arc::new(Uploaded {
-            slice: std::mem::ManuallyDrop::new(slice),
-            backing: Backing::Owned,
-            _anchor: None,
-        });
+        let held = Arc::new(Held::from_host(self, &ids)?);
+        let base = held.device_ptr(&self.stream).0;
+        // SAFETY: a view of `held`'s `ids.len()` elements, which the anchor
+        // keeps alive for as long as the view.
+        let view = unsafe { self.stream.upgrade_device_ptr::<u32>(base, ids.len()) };
+        let t = Arc::new(Uploaded::leased(view, Some(held as Arc<_>)));
         cache.insert(key, t.clone());
         Ok(t)
     }
@@ -691,12 +704,15 @@ pub struct Uploaded<T> {
     /// not owned by an arena that outlives it — an info-ring entry keeps its
     /// ring buffer alive this way after the ring has moved on to a fresh one.
     /// Dropped after `slice` is disposed of, so the view never outlives it.
-    _anchor: Option<Arc<CudaSlice<usize>>>,
+    _anchor: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl<T> Uploaded<T> {
     /// A leased view over memory `anchor` (when given) keeps alive.
-    pub(crate) fn leased(slice: CudaSlice<T>, anchor: Option<Arc<CudaSlice<usize>>>) -> Self {
+    pub(crate) fn leased(
+        slice: CudaSlice<T>,
+        anchor: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Self {
         Self {
             slice: std::mem::ManuallyDrop::new(slice),
             backing: Backing::Lease(LeaseOrigin::Foreign),
@@ -1398,6 +1414,9 @@ impl BackendDevice for CudaDevice {
         Self::validate_compute_capability(&context)?;
         Self::disable_per_arg_event_tracking(&context);
         let stream = context.default_stream();
+        // Before anything can launch: the launchers' own grow-only scratch is
+        // taken from the held allocator from the first launch on.
+        kernel_scratch::install(ordinal, &stream);
         let (blas, blas_workspace) = new_blas(&stream)?;
         let curand = cudarc::curand::CudaRng::new(DEFAULT_SEED, stream.clone()).w()?;
         let dev = Self {

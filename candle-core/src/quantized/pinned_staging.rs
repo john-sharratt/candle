@@ -47,7 +47,8 @@
 //! drop(gen); // records a fence; the arena resets on the next generation
 //! ```
 
-use crate::cuda_backend::WrapErr;
+use super::resident_ring::{Carve, RingPlan};
+use crate::cuda_backend::{stream_alloc, Held, WrapErr};
 use crate::{CudaDevice, Result};
 use cudarc::driver::sys;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
@@ -714,6 +715,11 @@ struct PinnedStagerInner {
     /// arena's current fill. Consumers that cache a device pointer handed out by
     /// one generation compare epochs to detect a reset before reusing it.
     epoch: u64,
+    /// Where [`PinnedStager::submit_resident`] copies land: carved from
+    /// `resident_slabs` and rewound with the arenas, since a resident copy is
+    /// read by the same kernels as the pinned bytes it came from.
+    resident: RingPlan,
+    resident_slabs: Vec<Held<u8>>,
 }
 
 impl PinnedStagerInner {
@@ -728,6 +734,66 @@ impl PinnedStagerInner {
         self.pending_owned.clear();
         self.pending_owned_bytes = 0;
         self.pending_reset = None;
+        if self.resident.reset() {
+            // Retired rather than dropped: a reset can run on a thread that is
+            // recording a wave, where a free is refused until its segment has
+            // launched.
+            for slab in self.resident_slabs.drain(..) {
+                match &self.dev {
+                    Some(dev) => dev.retire(slab),
+                    None => drop(slab),
+                }
+            }
+        }
+    }
+
+    /// Carve `buf.len()` device bytes from the resident slabs and enqueue the
+    /// pinned → device copy into them. The copy is asynchronous (pinned
+    /// source), stream-ordered ahead of every launch that follows; the bytes
+    /// stay valid until the arenas next reset.
+    fn copy_to_device(&mut self, buf: &PinnedBuf) -> Result<u64> {
+        let dev = self.dev.clone().expect("cuda stager missing device");
+        // A host copy, and possibly a slab allocation: eager, behind whatever
+        // this thread has recorded.
+        let _eager = dev.pause_capture()?;
+        let stream = self
+            .explicit_stream
+            .clone()
+            .unwrap_or_else(|| dev.compute_stream());
+        let at = match self.resident.carve(buf.len()) {
+            Carve::At(offset) => {
+                let slab = self
+                    .resident_slabs
+                    .last()
+                    .expect("a carve At names a held slab");
+                slab.device_ptr(&stream).0 + offset as u64
+            }
+            Carve::NewSlab(width) => {
+                // SAFETY: every byte a launch reads is written by the copy
+                // below, into the range carved for it.
+                let slab = unsafe { Held::<u8>::alloc_on(&stream, width)? };
+                let base = slab.device_ptr(&stream).0;
+                self.resident_slabs.push(slab);
+                base
+            }
+        };
+        let src = buf.as_slice();
+        if !src.is_empty() {
+            // SAFETY: `at` names `src.len()` bytes of a held slab, carved for
+            // this copy alone until the arenas reset; `src` is pinned and stays
+            // untouched until the same reset.
+            unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    at,
+                    src.as_ptr() as *const std::ffi::c_void,
+                    src.len(),
+                    stream.cu_stream(),
+                )
+            }
+            .result()
+            .w()?;
+        }
+        Ok(at)
     }
 
     /// Reset the arenas if a deferred reset is pending AND its fence has fired.
@@ -801,6 +867,8 @@ impl PinnedStager {
                 live_generations: 0,
                 pending_reset: None,
                 epoch: 0,
+                resident: RingPlan::default(),
+                resident_slabs: Vec::new(),
             })),
         }
     }
@@ -826,6 +894,8 @@ impl PinnedStager {
                 live_generations: 0,
                 pending_reset: None,
                 epoch: 0,
+                resident: RingPlan::default(),
+                resident_slabs: Vec::new(),
             })),
         }
     }
@@ -849,6 +919,8 @@ impl PinnedStager {
                 live_generations: 0,
                 pending_reset: None,
                 epoch: 0,
+                resident: RingPlan::default(),
+                resident_slabs: Vec::new(),
             })),
         }
     }
@@ -1021,15 +1093,26 @@ impl PinnedStager {
                 })
             }
             PinnedBuf::Owned { .. } => {
-                let (dev_ptr, gpu) = Self::copy_to_device(&inner, &buf)?;
+                // Wider than the bump arena takes, so not device-mapped: the
+                // kernel reads a device copy, owned by the handle because a
+                // transfer this wide is rare and holding a slab its width for
+                // every later generation would cost more than the allocation.
+                let dev = inner.dev.clone().expect("checked above");
+                let stream = inner
+                    .explicit_stream
+                    .clone()
+                    .unwrap_or_else(|| dev.compute_stream());
+                let _eager = dev.pause_capture()?;
+                let mut gpu = unsafe { stream_alloc::<u8>(&stream, buf.len())? };
+                stream.memcpy_htod(buf.as_slice(), &mut gpu).w()?;
+                let dev_ptr = gpu.device_ptr(&stream).0;
                 let len = buf.len();
                 inner.pending_owned_bytes += len;
                 inner.pending_owned.push(buf);
-                let dev = inner.dev.clone().expect("checked above");
                 Ok(GpuBuf {
                     dev_ptr,
                     len,
-                    _owned: Some(OwnedDeviceBytes::new(gpu, dev)),
+                    _owned: Some(OwnedDeviceBytes::new(gpu, dev.clone())),
                 })
             }
             PinnedBuf::Host { .. } => Ok(GpuBuf {
@@ -1042,14 +1125,14 @@ impl PinnedStager {
 
     /// Return a handle to a **device-resident** copy of the staging buffer.
     ///
-    /// One stream-ordered pinned → device copy into a fresh device
-    /// allocation the returned [`GpuBuf`] owns. This is the right submit
-    /// for data every block of a kernel reads on its critical path — a
-    /// slot header, a per-row table — where the zero-copy mapping's PCIe
-    /// round trip per read is the cost, not the bytes. The bump arena
-    /// bookkeeping is the same as [`Self::submit`]: the pinned source stays
-    /// untouched until the generation's fence fires, so the copy needs no
-    /// wait of its own.
+    /// One stream-ordered pinned → device copy into the stager's resident
+    /// slabs ([`super::resident_ring`]). This is the right submit for data
+    /// every block of a kernel reads on its critical path — a slot header, a
+    /// per-row table — where the zero-copy mapping's PCIe round trip per read
+    /// is the cost, not the bytes. The bookkeeping is the same as
+    /// [`Self::submit`], and so is the lifetime: the copy is valid while the
+    /// generation that made it is, and its bytes are reused once the
+    /// generation's fence has fired — exactly when the pinned source's are.
     pub fn submit_resident(&self, buf: PinnedBuf) -> Result<GpuBuf> {
         let mut inner = self.inner.lock().unwrap();
 
@@ -1061,11 +1144,13 @@ impl PinnedStager {
             });
         }
 
-        let (dev_ptr, gpu) = Self::copy_to_device(&inner, &buf)?;
+        let dev_ptr = inner.copy_to_device(&buf)?;
         let len = buf.len();
+        // The resident copy rewinds with the arenas, so a generation that made
+        // one must fence and reset like one that bumped.
+        inner.arena_dirty = true;
         match &buf {
             PinnedBuf::Bump { .. } => {
-                inner.arena_dirty = true;
                 debug_assert!(inner.bump_outstanding > 0);
                 inner.bump_outstanding -= 1;
             }
@@ -1075,33 +1160,11 @@ impl PinnedStager {
             }
             PinnedBuf::Host { .. } => unreachable!("handled above"),
         }
-        let dev = inner.dev.clone().expect("checked above");
         Ok(GpuBuf {
             dev_ptr,
             len,
-            _owned: Some(OwnedDeviceBytes::new(gpu, dev)),
+            _owned: None,
         })
-    }
-
-    /// Allocate `buf.len()` device bytes on the stager's stream and enqueue
-    /// the pinned → device copy. The copy is asynchronous (pinned source),
-    /// stream-ordered ahead of every launch that follows.
-    fn copy_to_device(inner: &PinnedStagerInner, buf: &PinnedBuf) -> Result<(u64, CudaSlice<u8>)> {
-        let dev = inner.dev.as_ref().expect("cuda stager missing device");
-        // An allocation and a host copy: eager, behind whatever this thread
-        // has recorded.
-        let _eager = dev.pause_capture()?;
-        let stream = inner
-            .explicit_stream
-            .clone()
-            .unwrap_or_else(|| dev.compute_stream());
-        let mut gpu = unsafe { stream.alloc::<u8>(buf.len()).w()? };
-        stream.memcpy_htod(buf.as_slice(), &mut gpu).w()?;
-        let dev_ptr = {
-            let (ptr, _guard) = gpu.device_ptr(&stream);
-            ptr
-        };
-        Ok((dev_ptr, gpu))
     }
 
     /// Synchronise the stream and free all pending resources.

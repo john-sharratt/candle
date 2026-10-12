@@ -12,6 +12,8 @@
 
 use candle::{DType, Device, Result, Tensor};
 
+use crate::models::held_tensor::held_empty;
+
 /// One cohort's kept rows. Uninitialised outside the rows a wave wrote: a
 /// rewind reads a sequence's own rows and nothing else.
 pub struct CaptureRows {
@@ -33,14 +35,15 @@ pub struct CaptureWidths {
 }
 
 impl CaptureRows {
-    /// Buffers for `cap` verify rows. **Allocate outside a forward**, as the
-    /// rewind stash is: the copies into them run inside the sweep.
+    /// Buffers for `cap` verify rows, on held ground. **Allocate outside a
+    /// forward**, as the rewind stash is: the copies into them run inside the
+    /// sweep.
     pub fn new(cap: usize, w: CaptureWidths, device: &Device) -> Result<Self> {
         Ok(Self {
-            head: Tensor::empty((cap, w.hc, w.n_embd), DType::F32, device)?,
-            ple: Tensor::empty((cap, w.hc * w.n_embd), DType::F32, device)?,
+            head: held_empty((cap, w.hc, w.n_embd), DType::F32, device)?,
+            ple: held_empty((cap, w.hc * w.n_embd), DType::F32, device)?,
             qsa: (0..w.kv_layers)
-                .map(|_| Tensor::empty((cap, w.index_dim), DType::F32, device))
+                .map(|_| held_empty((cap, w.index_dim), DType::F32, device))
                 .collect::<Result<_>>()?,
         })
     }

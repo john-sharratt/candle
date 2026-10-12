@@ -55,6 +55,7 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use super::batched_layer::GlueMeta;
 use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePhase};
+use super::held_tensor::held_empty;
 #[cfg(feature = "cuda")]
 use super::wave_buffers::wave_from_vec_ticketed;
 use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
@@ -893,9 +894,10 @@ impl BatchedInferenceSession {
         let want = rows * n;
         let held = self.walk_tokens.as_ref().map_or(0, Tensor::elem_count);
         if held < want {
-            // By doubling, so a cohort ramping up settles in a few steps.
+            // By doubling, so a cohort ramping up settles in a few steps; on
+            // held ground, since it lives as long as the session.
             let grown = (held * 2).max(want);
-            self.walk_tokens = Some(Tensor::empty(grown, DType::U32, &self.device)?);
+            self.walk_tokens = Some(held_empty(grown, DType::U32, &self.device)?);
         }
         let buf = self.walk_tokens.as_ref().expect("sized above");
         buf.narrow(0, 0, want)?.reshape((rows, n))

@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use candle::cuda_backend::cudarc::driver::DevicePtr;
-use candle::cuda_backend::WrapErr;
+use candle::cuda_backend::{stream_memcpy_stod, WrapErr};
 use candle::quantized::gguf_file::Content;
 use candle::quantized::ko_quant::{pack_q4_ko, unpack_q4_ko};
 use candle::quantized::GgmlDType;
@@ -265,9 +265,9 @@ pub fn gpu_repack_tensor(
     }
     let out_bytes = n_experts * (nrows / 8) * (ncols / 128) * 544;
     let stream = dev.cuda_stream();
-    let words_gpu = stream.memcpy_stod(words).w()?;
-    let scales_gpu = stream.memcpy_stod(scales).w()?;
-    let violations_gpu = stream.memcpy_stod(&[0i32]).w()?;
+    let words_gpu = stream_memcpy_stod(&stream, words)?;
+    let scales_gpu = stream_memcpy_stod(&stream, scales)?;
+    let violations_gpu = stream_memcpy_stod(&stream, &[0i32])?;
     // Fully overwritten by the kernel — allocate uninitialised.
     let out_gpu = unsafe { dev.alloc::<u8>(out_bytes)? };
     {

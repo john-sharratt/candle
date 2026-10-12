@@ -8,6 +8,7 @@ use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
 use super::first_sample::{contiguous_runs, FirstSample, FirstSampled, PrefillEnd};
 use super::phase_split::cobatched_decode_rows;
 use super::priority_pause::{rank, Priority};
+use super::section_pack;
 use super::wave_logits::WaveLogits;
 use super::*;
 use crate::projection::{Conversation, DecodePriority};
@@ -19,6 +20,7 @@ use candle_nn::kv_cache::{
     end_wave_transient, is_device_oom, tier_refusal_shortfall, FreeRegionTarget,
 };
 use candle_transformers::models::batched_inference::PendingGlue;
+use candle_transformers::models::held_tensor::hold_row;
 use candle_transformers::models::window_residuals::WindowResiduals;
 use std::collections::{HashMap, HashSet};
 
@@ -2086,6 +2088,9 @@ impl Scheduler {
     /// (each forward still fills to the expert-amortization target) while the peak
     /// stays bounded. At least one section is always admitted so the wave makes
     /// progress.
+    ///
+    /// Bound the sections that have not started, too: each claims a recurrent
+    /// store as it enters, which tokens do not measure (`section_pack`).
     #[allow(clippy::type_complexity)]
     pub(super) fn build_section_batch(
         &mut self,
@@ -2106,20 +2111,30 @@ impl Scheduler {
             return None;
         }
         let cap = self.prefill_pass_budget();
-        let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
-        let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
-        let mut group_idxs: Vec<usize> = Vec::with_capacity(active.len());
-        let mut advances: Vec<usize> = Vec::with_capacity(active.len());
-        let mut batch_tokens = 0usize;
-        for &i in &active {
+        // A section not yet under way claims its recurrent store as it enters
+        // the forward, so the forward takes only as many as the ground above
+        // the weight floor pays for — see `section_pack`.
+        let candidates: Vec<section_pack::Candidate> = active
+            .iter()
+            .map(|&i| {
+                let s = &self.active_section_ingests[i];
+                section_pack::Candidate {
+                    remaining: s.tokens.len() - s.offset,
+                    fresh: s.offset == 0,
+                }
+            })
+            .collect();
+        let room = self.admit_headroom(self.standing_tier_bytes()).free_kv;
+        let fresh_allowed = section_pack::fresh_allowance(room, self.recurrent_cost());
+        let packed = section_pack::pack(&candidates, cap, fresh_allowed);
+        let mut seq_ids: Vec<usize> = Vec::with_capacity(packed.len());
+        let mut inputs: Vec<Tensor> = Vec::with_capacity(packed.len());
+        let mut group_idxs: Vec<usize> = Vec::with_capacity(packed.len());
+        let mut advances: Vec<usize> = Vec::with_capacity(packed.len());
+        for (k, advance) in packed {
+            let i = active[k];
             let s = &mut self.active_section_ingests[i];
             let off = s.offset;
-            let advance = (s.tokens.len() - off).min(cap);
-            // Stop packing once this forward has reached the per-forward budget
-            // (but never emit an empty forward).
-            if !seq_ids.is_empty() && batch_tokens + advance > cap {
-                break;
-            }
             let tokens = &s.tokens[off..off + advance];
             // On the host: the forward lays every row's id on its own span in
             // one upload (`wave_token_ids`).
@@ -2129,7 +2144,6 @@ impl Scheduler {
                     inputs.push(t);
                     group_idxs.push(i);
                     advances.push(advance);
-                    batch_tokens += advance;
                 }
                 Err(e) => {
                     s.error = Some(ConversationError::Model(e));
@@ -4337,7 +4351,7 @@ impl Scheduler {
                 })?;
                 last_rows.insert(
                     sequence_id,
-                    row.to_owned_tensor().map_err(ConversationError::Model)?,
+                    hold_row(row).map_err(ConversationError::Model)?,
                 );
             }
         }
@@ -4453,7 +4467,7 @@ impl Scheduler {
                     Continuation::KeepRow => {
                         let row = first_row()?;
                         continued = Some(Continued::Row(
-                            row.to_owned_tensor().map_err(ConversationError::Model)?,
+                            hold_row(&row).map_err(ConversationError::Model)?,
                         ));
                     }
                 }
@@ -4956,6 +4970,55 @@ mod turn_view_release_tests {
         assert!(
             scheduler.session.sequence_offset(parent.0).is_some(),
             "the parent is untouched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wave_give_up_tests {
+    use super::super::tests::make_test_scheduler;
+    use super::super::*;
+    use super::wave_chunk_tests::dialogue_prefill;
+
+    /// **A wave given up on fails what it carries, and nothing else.** A
+    /// prefill still owing tokens hears the error; one that finished, or that
+    /// already failed for its own reason, keeps what it had; and the held group
+    /// is dropped so the next wave forms afresh.
+    #[test]
+    fn giving_up_fails_only_the_prefills_still_owing_tokens() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let owing = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let done = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let failed = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(owing, vec![1; 64]));
+        let mut finished = dialogue_prefill(done, vec![1; 8]);
+        finished.offset = 8;
+        scheduler.active_prefills.push(finished);
+        let mut own = dialogue_prefill(failed, vec![1; 8]);
+        own.error = Some(ConversationError::Other("its own".into()));
+        scheduler.active_prefills.push(own);
+        scheduler.form_wave_group(false);
+        assert!(!scheduler.wave_prefill_members.is_empty());
+
+        scheduler.fail_decode_less_wave("no ground");
+
+        assert!(matches!(
+            &scheduler.active_prefills[0].error,
+            Some(ConversationError::Other(m)) if m == "no ground"
+        ));
+        assert!(
+            scheduler.active_prefills[1].error.is_none(),
+            "finished keeps no error"
+        );
+        assert!(matches!(
+            &scheduler.active_prefills[2].error,
+            Some(ConversationError::Other(m)) if m == "its own"
+        ));
+        assert!(
+            scheduler.wave_prefill_members.is_empty(),
+            "the group is dropped"
         );
     }
 }
