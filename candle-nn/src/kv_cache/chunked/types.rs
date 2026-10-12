@@ -567,6 +567,29 @@ impl DetachedChunks {
     }
 }
 
+/// What one slot's compaction rewrite did.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactionRewrite {
+    /// A chunk's gids or record moved, so the slot's decode buffer was thrown
+    /// away.
+    pub moved: bool,
+    /// Writer-owned chunks that carry a record, left where they are — see
+    /// [`SequenceState::rewrite_for_compaction`].
+    pub stranded: Option<StrandedRecords>,
+}
+
+/// The writer-owned chunks of one slot that carry a record: the first and last
+/// such block, how many, and the boundary they sit at or above.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StrandedRecords {
+    pub first: usize,
+    pub last: usize,
+    pub count: usize,
+    pub writer_start: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SequenceState {
     /// All blocks in token order.  Shared (prefix) and owned chunks
@@ -973,28 +996,29 @@ impl SequenceState {
     /// gid mutation — so this combination should not arise. It is skipped rather than
     /// asserted because skipping is safe under every circumstance: the chunk keeps naming
     /// its source, which its record also names, and the pass simply reclaims nothing for
-    /// it. The `error` beside it is how a new path that breaks the invariant announces
-    /// itself.
+    /// it. The chunks it skipped come back in [`CompactionRewrite::stranded`], which the
+    /// caller reports once per slot — that report is how a new path that breaks the
+    /// invariant announces itself.
     ///
     /// Only the compaction pass sweeps, and there is no host compaction.
     #[cfg(feature = "cuda")]
     pub(super) fn rewrite_for_compaction(
         &mut self,
         sweep: &mut super::compact_map::Sweep<'_>,
-    ) -> candle::Result<bool> {
+    ) -> candle::Result<CompactionRewrite> {
         let mut moved = false;
+        let mut stranded: Option<StrandedRecords> = None;
         let writer_start = self.writer_start_idx;
         for (idx, cw) in self.chunks.iter_mut().enumerate() {
             if idx >= writer_start && cw.meta.is_some() {
-                tracing::error!(
-                    target: "candle_nn::kv_cache::compact",
-                    block = idx,
+                let s = stranded.get_or_insert(StrandedRecords {
+                    first: idx,
+                    last: idx,
+                    count: 0,
                     writer_start,
-                    "a writer-owned chunk carries a KvHead record: it is written through \
-                     its gids and read through that record, so relocating it would let \
-                     the two diverge on the next token. Left where it is — some path is \
-                     handing a record to a writable chunk",
-                );
+                });
+                s.last = idx;
+                s.count += 1;
                 continue;
             }
             if let Some(next) = sweep.rewrite_gids(&cw.gids)? {
@@ -1029,7 +1053,7 @@ impl SequenceState {
         if moved {
             self.invalidate_gpu_chunks();
         }
-        Ok(moved)
+        Ok(CompactionRewrite { moved, stranded })
     }
 
     /// Whether a decode slot buffer is cached for this sequence. A sequence
@@ -1742,7 +1766,18 @@ mod writer_region_tests {
         map.insert(raw(6, 3), ChunkGid::detached(raw(0, 2)), 0x2000);
 
         let mut sweep = Sweep::new(&map);
-        assert!(s.rewrite_for_compaction(&mut sweep).unwrap());
+        let rewrite = s.rewrite_for_compaction(&mut sweep).unwrap();
+        assert!(rewrite.moved);
+        assert_eq!(
+            rewrite.stranded,
+            Some(StrandedRecords {
+                first: 1,
+                last: 1,
+                count: 1,
+                writer_start: 1,
+            }),
+            "the skipped chunk is reported, so the caller can name its slot",
+        );
 
         assert_eq!(
             s.chunk_at(0).unwrap().gids.as_slice()[0].raw(),
@@ -1786,7 +1821,7 @@ mod writer_region_tests {
         map.insert_record(raw(9, 9), ChunkGid::detached(raw(1, 4)), 0xBEEF);
         let mut sweep = Sweep::new(&map);
         assert!(
-            s.rewrite_for_compaction(&mut sweep).unwrap(),
+            s.rewrite_for_compaction(&mut sweep).unwrap().moved,
             "a followed record is a move, or the slot's decode buffer keeps the old address",
         );
 

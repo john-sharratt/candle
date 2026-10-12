@@ -34,8 +34,8 @@ span_base                                                              span_end
     |                                                                      |
     v                                                                      v
     +----------+--------------+---------------------+----------+------------+
-    | persist  | dense weights|     KV regions      | transient|  expert    |
-    |  staging |   (if any)   |   (size-class       |   tier   |  weights   |
+    | held +   | dense weights|     KV regions      | transient|  expert    |
+    | persist  |   (if any)   |   (size-class       |   tier   |  weights   |
     |  (fixed) |   (fixed)    |    arenas)          | (per fwd)|  (slots)   |
     +----------+--------------+---------------------+----------+------------+
                ^              ^                     ^          ^
@@ -47,13 +47,27 @@ span_base                                                              span_end
 
 Reading it left to right:
 
-- **`persist` staging** — the persistence thread's hot→warm copy buffer.
-  `PERSIST_SPAN_BYTES`, four regions' worth, at the far **left** and fixed for the
-  process lifetime. It is left rather than floating precisely so the elastic
-  boundary can move without anyone reasoning about a copy stream that is not
-  synchronised to the wave.
-- **dense weights** — on a streamed-dense model, the non-expert weights. Also
-  fixed, also below `region_base`.
+- **the fixed block** — `PERSIST_SPAN_BYTES`, at the far **left** and fixed for
+  the process lifetime, holding two tenants:
+  - **held ground** (`HELD_GROUND_BYTES`, `held_ground.rs`) — the device buffers
+    that outlive every forward and may be taken inside one: launch-table staging,
+    resident slot headers, the sampler's argument pack and count tables, decode
+    slot-state slabs, cold-load staging, the attention launchers' split partials
+    (`candle-kernels`' `grow_scratch.cuh` calls back into it). A
+    `candle::cuda_backend::Held` buffer takes a first-fit range here and gives it
+    back fenced on its stream; a request the ground cannot hold goes to the CUDA
+    pool and is reported by `forbidden_alloc`.
+  - **persist staging** — the persistence thread's hot→warm copy buffer and its
+    seal gathers, four regions' worth.
+
+  Both are left rather than floating so the elastic boundary can move without
+  anyone reasoning about a copy stream that is not synchronised to the wave, and
+  so a held buffer can be taken mid-forward, where a region claim is refused.
+- **dense weights** — the non-expert weights: repacked twins, which `QMatMul`
+  claims here as it builds them, and weights used as stored, which the loader
+  moves here with `dense_span::place_in_dense` (the token embedding — 644 MiB on
+  Flash-Next that otherwise stayed in the CUDA pool for the process lifetime).
+  Also fixed, also below `region_base`.
 - **KV regions** — the paged KV cache. `REGION_BYTES` each (`= TARGET_ARENA_BYTES`,
   16 MiB), indexed `[0, total)`, handed out one region per arena. **Fills from the
   left.** Two *kinds* of arena draw from this pool: the band arenas holding K/V

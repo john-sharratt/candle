@@ -58,6 +58,35 @@ pub fn is_device_oom(err: &candle::Error) -> bool {
         || s.contains("CUDA_ERROR_OUT_OF_MEMORY")
 }
 
+/// Substring of the error the region pool's tier placement returns when a
+/// wave's transient tier cannot be placed at all: the wave is too wide for the
+/// ground below the weight floor, and a retry at the same width fails the same
+/// way. The scheduler matches on it ([`is_tier_refusal`]) to narrow the next
+/// wave rather than repeat this one.
+pub const TIER_REFUSED_MARKER: &str = "wave too wide for the partition";
+
+/// Recognize a refused tier placement — see [`TIER_REFUSED_MARKER`].
+pub fn is_tier_refusal(err: &candle::Error) -> bool {
+    err.to_string().contains(TIER_REFUSED_MARKER)
+}
+
+/// Follows [`TIER_REFUSED_MARKER`] in a refusal: the bytes the tier was short
+/// of the ground it could be placed in, as `short by {bytes} B`.
+pub const TIER_SHORT_BY: &str = "short by ";
+
+/// How far short a refused tier placement fell, in bytes — `None` for any
+/// error that is not one. What a caller narrowing its next wave waits to see
+/// the ground grow by before it tries the refused width again.
+pub fn tier_refusal_shortfall(err: &candle::Error) -> Option<usize> {
+    let msg = err.to_string();
+    let after_marker = &msg[msg.find(TIER_REFUSED_MARKER)? + TIER_REFUSED_MARKER.len()..];
+    let digits = &after_marker[after_marker.find(TIER_SHORT_BY)? + TIER_SHORT_BY.len()..];
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end].parse().ok()
+}
+
 /// Global registry of all ChunkedKvBacking instances for cooperative compaction.
 /// When one backing needs to grow arenas but fails (OOM), it can ask others to compact.
 static BACKING_REGISTRY: Mutex<Vec<Weak<BackingInner>>> = Mutex::new(Vec::new());
@@ -169,14 +198,6 @@ pub(crate) struct BackingInner {
     /// slice's `kvheads_ptr`. Shared across all layers of this group.
     pub(crate) meta_pool: super::meta_pool::MetaPool,
 
-    /// Reused device scratch for the provenance sign-pack kernel — grows to the
-    /// largest batch seen and is reused thereafter, so the per-scope seal pays no
-    /// device `alloc`/pointer-`memcpy_stod` (the WDDM-expensive part). Held in a
-    /// `Mutex` for interior mutability behind the shared `Arc<BackingInner>`; the
-    /// seal runs single-threaded so it's uncontended. Mirrors `KvSamplerGpu`.
-    #[cfg(feature = "cuda")]
-    pub(crate) prov_sign_scratch: Mutex<Option<ProvSignScratch>>,
-
     /// Single-latent (K≡V) mode: one latent vector serves as both key and
     /// value (DeepSeek MLA-style attention). Chunk allocation aliases each V
     /// band GID to its K band GID (the refcounted `ChunkGid` handles make the
@@ -207,26 +228,6 @@ pub(crate) struct BackingInner {
     // are device arenas to create.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) deferred_arenas: Mutex<Vec<super::arena::ArenaKey>>,
-}
-
-/// Grow-only device scratch for [`ChunkedKvBacking::run_prov_sign_pack`].
-#[cfg(feature = "cuda")]
-pub(crate) struct ProvSignScratch {
-    /// Concatenated Q-chunk pointers (capacity ≥ the batch's `n_warps`).
-    ptrs: candle::cuda_backend::cudarc::driver::CudaSlice<i64>,
-    /// Packed sign bits (capacity ≥ `n_warps × CHUNK_SIZE`), one u64 per
-    /// (sub-band, token) — wide enough for a 64-dim physical band.
-    out: candle::cuda_backend::cudarc::driver::CudaSlice<u64>,
-}
-
-#[cfg(feature = "cuda")]
-impl std::fmt::Debug for ProvSignScratch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProvSignScratch")
-            .field("ptrs_cap", &self.ptrs.len())
-            .field("out_cap", &self.out.len())
-            .finish()
-    }
 }
 
 impl BackingInner {
@@ -722,8 +723,6 @@ impl ChunkedKvBacking {
             },
             pinned_stager,
             meta_pool: super::meta_pool::MetaPool::new(device.clone()),
-            #[cfg(feature = "cuda")]
-            prov_sign_scratch: Mutex::new(None),
             single_latent: std::sync::atomic::AtomicBool::new(false),
             mapped_sealed: std::sync::atomic::AtomicBool::new(false),
             deferred_arenas: Mutex::new(Vec::new()),
@@ -3353,8 +3352,9 @@ impl ChunkedKvBacking {
     /// replaces the per-layer f16 K/Q/V round-trips. CUDA only.
     #[cfg(feature = "cuda")]
     pub fn run_prov_sign_pack(&self, all_q_ptrs: &[i64], sub_head_dim: usize) -> Result<Vec<u64>> {
-        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async;
         use candle::cuda_backend::kernels;
+        use candle::cuda_backend::staged::segment;
 
         let Device::Cuda(cuda_dev) = &self.inner.device else {
             return Ok(Vec::new());
@@ -3371,54 +3371,36 @@ impl ChunkedKvBacking {
         let n_warps = all_q_ptrs.len();
         let out_len = n_warps * CHUNK_SIZE;
 
-        // Reuse the grow-only device scratch: realloc only when this batch is
-        // bigger than any prior one, so the steady-state seal pays no device
-        // alloc / pointer memcpy_stod — only one HtoD into the existing buffer.
-        // The batch is the whole scope's chunk count, which rises with every
-        // admission, so growth doubles: sized to the batch exactly, every
-        // admission past the last high-water mark reallocated.
-        let mut guard = self
-            .inner
-            .prov_sign_scratch
-            .lock()
-            .map_err(|_| candle::Error::Msg("prov_sign_scratch mutex poisoned".into()))?;
-        let held = guard.as_ref().map_or(0, |s| s.ptrs.len());
-        if held < n_warps {
-            let ptrs_cap = (held * 2).max(n_warps);
-            let ptrs = unsafe { cuda_dev.alloc::<i64>(ptrs_cap)? };
-            let out = unsafe { cuda_dev.alloc::<u64>(ptrs_cap * CHUNK_SIZE)? };
-            *guard = Some(ProvSignScratch { ptrs, out });
-        }
-        let scratch = guard.as_mut().unwrap();
+        // The pointers go up and the packed bits come back through the
+        // device's held synced scratch: one HtoD, one launch, one DtoH, and
+        // nothing allocated — a per-backing grow-only pair used to hold the
+        // largest batch each layer had seen, outside the reservation.
         let stream = cuda_dev.cuda_stream();
-
-        // One HtoD of the pointers into the reused buffer.
-        cuda_dev.memcpy_htod(all_q_ptrs, &mut scratch.ptrs.slice_mut(..n_warps))?;
-
-        let ptrs_view = scratch.ptrs.slice(..n_warps);
-        let out_view = scratch.out.slice(..out_len);
-        {
-            let (pp, _pg) = ptrs_view.device_ptr(&stream);
-            let (op, _og) = out_view.device_ptr(&stream);
-            candle::set_kernel_breadcrumb("run_prov_sign_pack", file!(), line!());
-            unsafe {
-                kernels::simple::prov_sign_pack::run_prov_sign_pack(
-                    pp as *const i64,
-                    op as *mut std::ffi::c_void,
-                    n_warps as i32,
-                    sub_head_dim as i32,
-                    stream.cu_stream() as *mut _,
-                );
-            }
-        }
-
-        // DtoH only the packed bits into a fresh host Vec — host allocation is
-        // cheap; the reused device buffers are what mattered.
         let mut out = vec![0u64; out_len];
-        stream
-            .memcpy_dtoh(&out_view, &mut out)
-            .map_err(candle::Error::wrap)?;
-        stream.synchronize().map_err(candle::Error::wrap)?;
+        cuda_dev.with_synced_upload(
+            &stream,
+            &[segment(all_q_ptrs)],
+            out_len * std::mem::size_of::<u64>(),
+            |at, room| {
+                candle::set_kernel_breadcrumb("run_prov_sign_pack", file!(), line!());
+                // SAFETY: `at[0]` holds the `n_warps` uploaded pointers and
+                // `room` the packed bits' space, both held until this returns;
+                // the kernel writes every word of the output, and the readback
+                // is ordered behind it and waited for before the scratch goes.
+                unsafe {
+                    kernels::simple::prov_sign_pack::run_prov_sign_pack(
+                        at[0] as *const i64,
+                        room as *mut std::ffi::c_void,
+                        n_warps as i32,
+                        sub_head_dim as i32,
+                        stream.cu_stream() as *mut _,
+                    );
+                    memcpy_dtoh_async(&mut out, room, stream.cu_stream())
+                        .map_err(candle::Error::wrap)?;
+                }
+                stream.synchronize().map_err(candle::Error::wrap)
+            },
+        )?;
         Ok(out)
     }
 

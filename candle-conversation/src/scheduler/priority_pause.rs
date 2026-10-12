@@ -148,7 +148,10 @@ impl Scheduler {
     /// ingests and deferred glue are not paused by priority, so either one
     /// keeps the loop running.
     pub(super) fn all_work_paused(&mut self) -> bool {
-        if !self.active_section_ingests.is_empty() || !self.deferred_glue_fires.is_empty() {
+        if !self.active_section_ingests.is_empty()
+            || !self.section_queue.is_empty()
+            || !self.deferred_glue_fires.is_empty()
+        {
             return false;
         }
         self.observe_priorities();

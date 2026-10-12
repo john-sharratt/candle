@@ -32,19 +32,49 @@ extern "C" __global__ void scale_add(const float* x, float* y, float mul, float 
 }
 "#;
 
+/// `scale_add`'s signature with another body: `y = x * mul - sub`.
+const SCALE_SUB: &str = r#"
+extern "C" __global__ void scale_sub(const float* x, float* y, float mul, float sub, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = x[i] * mul - sub;
+}
+"#;
+
 fn scale_add(dev: &CudaDevice) -> Result<CudaFunction> {
+    compile(dev, "scale_add", SCALE_ADD)
+}
+
+fn scale_sub(dev: &CudaDevice) -> Result<CudaFunction> {
+    compile(dev, "scale_sub", SCALE_SUB)
+}
+
+/// `name` compiled once for the process and kept loaded, as every kernel the
+/// engine launches is.
+///
+/// **Kept, not reloaded per test.** The capture hub is the device's, so its
+/// executables outlive any one test, and a later test's segment of the same
+/// node kinds folds into them, rewriting their function — the old one must
+/// still be loaded for that. A test that unloaded its module at its end left
+/// executables naming a function that no longer existed, and the next fold
+/// into one of them crashed the driver.
+fn compile(dev: &CudaDevice, name: &'static str, src: &str) -> Result<CudaFunction> {
     // One compile at a time: the toolkit-side assembly writes its files under
     // the kernel's name, so tests compiling it at once overwrite each other's.
-    static COMPILE: Mutex<()> = Mutex::new(());
-    let _one = COMPILE.lock().unwrap_or_else(|p| p.into_inner());
-    let ptx = cudarc::nvrtc::compile_ptx(SCALE_ADD).map_err(crate::Error::wrap)?;
+    static LOADED: Mutex<Vec<(&'static str, CudaFunction)>> = Mutex::new(Vec::new());
+    let mut loaded = LOADED.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, f)) = loaded.iter().find(|(n, _)| *n == name) {
+        return Ok(f.clone());
+    }
+    let ptx = cudarc::nvrtc::compile_ptx(src).map_err(crate::Error::wrap)?;
     // Assembled toolkit-side: a driver older than the toolkit refuses to JIT
     // its PTX, and these tests are about streams, not about that.
     let module = match dev.cuda_context().load_module(ptx.clone()) {
         Ok(m) => m,
-        Err(_) => dev.load_module_via_ptxas("scale_add", &ptx)?,
+        Err(_) => dev.load_module_via_ptxas(name, &ptx)?,
     };
-    module.load_function("scale_add").w()
+    let f = module.load_function(name).w()?;
+    loaded.push((name, f.clone()));
+    Ok(f)
 }
 
 /// `y = x * mul + add` over `N` elements, launched on `stream`.
@@ -405,6 +435,37 @@ fn a_recapture_with_new_scalars_and_addresses_updates_in_place() -> Result<()> {
     exec.launch(&compute)?;
     let want2: Vec<f32> = ramp(1.0).iter().map(|v| v + 5.0).collect();
     assert_eq!(dev.memcpy_dtov(&y1)?, want2);
+    Ok(())
+}
+
+/// A recapture with another kernel at a node — what a kernel variant chosen by
+/// the wave's width does to a segment — folds into the existing executable,
+/// and the replay runs the new kernel. This is why the library finds a segment
+/// by its node kinds and not by its kernels (`library`).
+#[test]
+fn a_recapture_with_another_kernel_at_a_node_folds_in_place() -> Result<()> {
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let (add, sub) = (scale_add(&dev)?, scale_sub(&dev)?);
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let compute = ComputeStream::of(&dev);
+    let mut cap = CaptureStream::new(&dev)?;
+    let mut slot = None;
+
+    let s = CaptureSession::begin(&mut cap)?;
+    launch(&add, s.stream(), &x, &mut y, 2.0, 1.0)?;
+    assert!(!s.finish_into(&mut slot, &compute, 1)?, "first capture");
+
+    let s = CaptureSession::begin(&mut cap)?;
+    launch(&sub, s.stream(), &x, &mut y, 2.0, 1.0)?;
+    assert!(
+        s.finish_into(&mut slot, &compute, 1)?,
+        "another kernel at the node must fold in place"
+    );
+    slot.as_ref().expect("folded").launch(&compute)?;
+    let want: Vec<f32> = ramp(1.0).iter().map(|v| v * 2.0 - 1.0).collect();
+    assert_eq!(dev.memcpy_dtov(&y)?, want);
     Ok(())
 }
 
@@ -1440,5 +1501,153 @@ fn two_shapes_of_one_node_count_each_keep_their_executable() -> Result<()> {
     let after = dev.capture_stats();
     assert_eq!(after.instantiated - before.instantiated, 0, "{after:?}");
     assert_eq!(after.updated - before.updated, 4, "{after:?}");
+    Ok(())
+}
+
+/// **The library keeps executables within a byte budget, evicts the least
+/// invoked, and cools what it evicted.** With a budget of one byte every
+/// admission evicts everything else: topology B's executable evicts A's, and A
+/// then cools. A recorded again during its cooldown runs once and is not kept
+/// (`transient`); recorded once more, its ordinal's last key is known to be
+/// cooling and the segment is not recorded at all (`eager_segments`). Every
+/// wave's result is what the eager forward would have produced.
+#[test]
+fn the_library_evicts_to_its_budget_and_cools_what_it_evicts() -> Result<()> {
+    use super::budget::graph_budget_bytes;
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    dev.capture_hub().reset_library(1);
+    // One wave of `launches` launches of `y = x + add`: its topology is the
+    // launch count, so A (3) and B (4) are different topologies.
+    let wave = |launches: usize, add: f32, y: &mut CudaSlice<f32>| -> Result<Vec<f32>> {
+        let capture = dev.begin_wave_capture()?;
+        dev.record_launches()?;
+        for _ in 0..launches {
+            launch(&f, &dev.cuda_stream(), &x, y, 1.0, add)?;
+        }
+        capture.finish()?;
+        dev.memcpy_dtov(y)
+    };
+    let want = |add: f32| -> Vec<f32> { ramp(1.0).iter().map(|v| v + add).collect() };
+
+    let s0 = dev.capture_stats();
+    assert_eq!(wave(3, 1.0, &mut y)?, want(1.0));
+    let s1 = dev.capture_stats();
+    assert_eq!(
+        (
+            s1.instantiated - s0.instantiated,
+            s1.evicted - s0.evicted,
+            s1.execs_held
+        ),
+        (1, 0, 1),
+        "A is kept: there is nothing else to evict"
+    );
+
+    assert_eq!(wave(4, 2.0, &mut y)?, want(2.0));
+    let s2 = dev.capture_stats();
+    assert_eq!(
+        (
+            s2.instantiated - s1.instantiated,
+            s2.evicted - s1.evicted,
+            s2.execs_held,
+            s2.cooling
+        ),
+        (1, 1, 1, 1),
+        "B evicts A, and A cools"
+    );
+
+    assert_eq!(wave(3, 3.0, &mut y)?, want(3.0));
+    let s3 = dev.capture_stats();
+    assert_eq!(
+        (
+            s3.instantiated - s2.instantiated,
+            s3.transient - s2.transient,
+            s3.execs_held
+        ),
+        (0, 1, 1),
+        "A, recorded while cooling, runs once and is not kept"
+    );
+
+    assert_eq!(wave(3, 4.0, &mut y)?, want(4.0));
+    let s4 = dev.capture_stats();
+    assert_eq!(
+        (
+            s4.eager_segments - s3.eager_segments,
+            s4.transient - s3.transient,
+            s4.instantiated - s3.instantiated,
+            s4.segments - s3.segments,
+        ),
+        (1, 0, 0, 0),
+        "A's ordinal is known to be cooling: the segment is not recorded"
+    );
+
+    dev.capture_hub().reset_library(graph_budget_bytes()?);
+    Ok(())
+}
+
+/// What one instantiated executable costs the device, by node count: the
+/// driver's free memory read across `EXECS` instantiations of one captured
+/// graph, at each size. Every byte of it is outside the reservation, and the
+/// library keeps up to `MAX_TOPOLOGIES × EXECS_PER_SLOT` of them.
+#[test]
+#[ignore = "probe: cargo test -p candle-core --features cuda --lib graph::tests::device_bytes_per_executable -- --ignored --nocapture --test-threads=1"]
+fn device_bytes_per_executable() -> Result<()> {
+    use cudarc::driver::{result, sys};
+    const EXECS: usize = 64;
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let stream = dev.cuda_context().new_stream().w()?;
+    let free_now = || -> Result<u64> {
+        dev.cuda_stream().synchronize().w()?;
+        let (free, _total) = result::mem_get_info().w()?;
+        Ok(free as u64)
+    };
+    for nodes in [1usize, 100, 400, 800] {
+        // SAFETY: a stream this test owns, not capturing.
+        unsafe {
+            result::stream::begin_capture(
+                stream.cu_stream(),
+                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .w()?;
+        }
+        for i in 0..nodes {
+            launch(&f, &stream, &x, &mut y, 1.0, i as f32)?;
+        }
+        // SAFETY: the capture begun above.
+        let template = unsafe { result::stream::end_capture(stream.cu_stream()).w()? };
+        let before = free_now()?;
+        let mut execs = Vec::with_capacity(EXECS);
+        for _ in 0..EXECS {
+            let mut exec: sys::CUgraphExec = std::ptr::null_mut();
+            // SAFETY: a valid graph; default flags.
+            unsafe { sys::cuGraphInstantiateWithFlags(&mut exec, template, 0).result() }.w()?;
+            // One launch, as the hub's executables have all been launched.
+            // SAFETY: an executable instantiated above, on a stream this test owns.
+            unsafe { sys::cuGraphLaunch(exec, stream.cu_stream()).result() }.w()?;
+            execs.push(exec);
+        }
+        stream.synchronize().w()?;
+        let after = free_now()?;
+        let per_exec = before.saturating_sub(after) / EXECS as u64;
+        println!(
+            "{nodes:>4} nodes: {per_exec:>9} B per executable ({:.0} B per node), \
+             {EXECS} took {} KiB",
+            per_exec as f64 / nodes as f64,
+            before.saturating_sub(after) >> 10
+        );
+        for exec in execs {
+            // SAFETY: each executable instantiated above, destroyed once.
+            unsafe { sys::cuGraphExecDestroy(exec).result() }.w()?;
+        }
+        // SAFETY: the template captured above, destroyed once.
+        unsafe { result::graph::destroy(template) }.w()?;
+    }
     Ok(())
 }

@@ -2527,7 +2527,9 @@ impl Sequence {
     /// tokens on either half is not submitted, so the two are not 1:1.
     ///
     /// The handle hears the opening projection and one `Done` for the whole
-    /// group, whose seal is the last case's.
+    /// group, whose seal is the last case's — or, when any case failed to seal,
+    /// one `Error` naming how many did, so a partial group is never taken for a
+    /// complete one.
     pub fn submit_prefilled_turn_group(
         &mut self,
         cases: &[(String, String, Vec<String>)],

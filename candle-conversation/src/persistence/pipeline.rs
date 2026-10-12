@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
-use candle::cuda_backend::WrapErr;
+use candle::cuda_backend::{Held, WrapErr};
 use candle::Device;
 use candle_nn::kv_cache::{kv_migrate, BlockAllocSpec, ChunkedKvBacking, KvFormat, MigrationPlan};
 use crossbeam::channel::{unbounded, Receiver, Sender};
@@ -243,7 +243,10 @@ pub fn run_pipeline(
     // One big GPU staging buffer mirroring the pinned scratch layout.
     // Per-unit memcpy_htod fills sub-ranges; the migrate plan sources
     // contiguous record ranges from staging_base + record.src_offset.
-    let mut staging: CudaSlice<u8> = unsafe { stream.alloc::<u8>(chunk_batch.total_bytes).w()? };
+    // Held ground, given back once the batch's last migrate has synchronised:
+    // a batch is at most the 64 MiB pinned scratch it mirrors, and taking it
+    // from the pool put up to that much outside the reservation per batch.
+    let mut staging: Held<u8> = unsafe { Held::alloc_on(&stream, chunk_batch.total_bytes)? };
     let staging_base: i64 = {
         let (p, _g) = staging.device_ptr(&stream);
         p as i64
@@ -381,9 +384,10 @@ pub fn run_pipeline(
             }
         })?;
 
-    // Drop staging here — drop syncs the stream so all GPU work has
-    // completed before the pinned scratch is reused by the next
-    // chunk batch.
+    // The staging goes back to the held ground fenced on the stream, so the
+    // next holder of its range waits for this batch's copies and migrate;
+    // the migrate has already synchronised, so the pinned scratch the copies
+    // read from is free for the next batch too.
     drop(staging);
 
     let total_ms = t_total.elapsed().as_millis() as u64;

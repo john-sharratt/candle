@@ -60,7 +60,13 @@ pub fn filter_directives(tenants: &[&str], verbose: u8) -> Vec<String> {
         _ => "debug",
     };
     let mut d: Vec<String> = tenants.iter().map(|t| format!("{t}={level}")).collect();
-    for krate in ["host", "web", "candle_conversation", "candle_transformers"] {
+    for krate in [
+        "host",
+        "web",
+        "candle_conversation",
+        "candle_transformers",
+        "candle_core",
+    ] {
         d.push(format!("{krate}={level}"));
     }
     d.push(format!("candle_nn={kv_level}"));
@@ -180,6 +186,7 @@ mod tests {
                 "web=info",
                 "candle_conversation=info",
                 "candle_transformers=info",
+                "candle_core=info",
                 "candle_nn=warn",
             ]
         );

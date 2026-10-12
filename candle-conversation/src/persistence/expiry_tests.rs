@@ -129,7 +129,7 @@ fn compact(store: &Store, now_ms: u64) -> Vec<(RecordType, u64, Vec<u8>, RecordI
         CompactItem::Synth { header, payload } => (
             header.record_type,
             header.stream_id,
-            payload,
+            payload.to_vec(),
             header.identity(),
         ),
         CompactItem::Raw { .. } => panic!("this store holds no read-back records"),
@@ -301,7 +301,7 @@ fn a_deleted_timeline_stays_dead_whatever_arrives() {
         assert!(
             !resident
                 .iter()
-                .any(|r| r.rt == RecordType::Tombstone && r.payload == tombstone(DEAD)),
+                .any(|r| r.rt == RecordType::Tombstone && *r.payload == *tombstone(DEAD)),
             "an expired tombstone is not carried as itself"
         );
     }

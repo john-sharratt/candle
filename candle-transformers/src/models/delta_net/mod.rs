@@ -41,6 +41,6 @@ pub use quantized::{
 };
 pub use state_store::{
     compact_stores, release_seal_readback, ExportedLayerState, RecurrentCompaction,
-    RecurrentStateStore,
+    RecurrentStateStore, StagedSnapshot,
 };
 pub use types::{DeltaNetDims, LayerKind, ZGate};

@@ -24,7 +24,7 @@ use candle_nn::ops::sigmoid;
 use super::config::PleConfig;
 use super::hyper::hc_grouped_norm;
 use super::model::PleSource;
-use super::state_slots::state_buffer;
+use super::state_slots::{state_buffer, state_buffer_from};
 
 /// One sequence's carried PLE state: the conv history tail and the hash
 /// window's preceding token ids.
@@ -152,7 +152,8 @@ impl PleState {
             prev.push(u32_at(after + 4 + i * 4)?);
         }
         Ok(Self {
-            conv_hist: Tensor::from_vec(vals, (r, c), dev)?,
+            // In a recurrent-state slot, as a fresh state's history is.
+            conv_hist: state_buffer_from(dev, (r, c), &vals)?,
             spare_hist: None,
             prev,
         })

@@ -36,6 +36,7 @@ use super::batched_inference::{
     WaveStep,
 };
 use super::batched_model::{WaveGuard, WavePhase};
+use super::held_tensor::hold_rows;
 use super::kv_cache_utils::SequenceContext;
 use super::profile::{begin_gpu_span_forward, gpu_span};
 use super::residual_order::{caller_runs, reorder, Run};
@@ -450,11 +451,15 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
                 // generation, so slice two would fail to open one while slice
                 // one still held it.)
                 //
-                // This is the sanctioned escape and it really copies. It is
-                // confined to the slicing path, which is already paying for N
-                // forwards, and it is why the value returned below is owned.
-                for t in lg {
-                    all_logits.push(t.to_owned_tensor()?);
+                // This is the sanctioned escape and it really copies — into
+                // held ground, one block per slice. It is confined to the
+                // slicing path, which is already paying for N forwards, and it
+                // is why the value returned below is owned.
+                if !lg.is_empty() {
+                    let block = hold_rows(lg)?;
+                    for (i, row) in lg.iter().enumerate() {
+                        all_logits.push(block.narrow(0, i, 1)?.reshape(row.shape())?);
+                    }
                 }
             }
             return Ok(WaveResult::owned(WaveStep {

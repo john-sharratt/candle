@@ -22,6 +22,7 @@ use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::tenant_rank::TenantRank;
 use crate::tree::ConversationTreeConfig;
 use crate::ManagedBatchedModel;
+use candle::cuda_backend::link_probe;
 use candle::quantized::Int8Mode;
 use candle::{DType, Device};
 use candle_nn::kv_cache::{class_for_format, elems_per_chunk, KvFormat, SizeClass, N_PALETTE};
@@ -31,6 +32,7 @@ use candle_transformers::models::model_pack::keys::TOKENIZER_JSON;
 #[cfg(feature = "hub")]
 use candle_transformers::models::model_pack::HubFetch;
 use candle_transformers::models::model_pack::{ModelPack, SourceFetch};
+use candle_transformers::models::quantized_qwen38_moe::engine_model_digest;
 use candle_transformers::models::selection_strata::StrataTokens;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -994,12 +996,18 @@ impl ModelBuilder {
                     weights.pack.display()
                 ))
             })?;
-        let digest = weights.digest().map_err(|e| {
-            ConversationError::Other(format!(
-                "identify the weights at {}: {e}",
-                weights.pack.display()
-            ))
-        })?;
+        // A prepared model is the release its artifact is built from, at
+        // whichever rung this card built it: every rung of it is one model.
+        let digest = if self.spec.prepared_from_source {
+            engine_model_digest()
+        } else {
+            weights.digest().map_err(|e| {
+                ConversationError::Other(format!(
+                    "identify the weights at {}: {e}",
+                    weights.pack.display()
+                ))
+            })?
+        };
         ModelIdentity::new(
             format!("{:?}", self.spec.arch),
             self.spec.model_repo.clone(),
@@ -1576,7 +1584,34 @@ impl ModelBuilder {
             tracing::info!("  Max response tokens: {}", self.max_response_tokens);
         }
 
+        // The host→device link, measured now — the card empty and the bus idle
+        // — and cached for the wave planner (`link_probe`). Later, the reading
+        // would be contended by the expert cache's staging and its landing
+        // buffer would compete with a full reservation.
+        if let Device::Cuda(cuda) = device {
+            match link_probe::host_to_device_bytes_per_s(cuda) {
+                Ok(bps) => tracing::info!(link_gbps = bps / 1e9, "host→device link measured"),
+                Err(e) => tracing::warn!("host→device link probe failed: {e}"),
+            }
+        }
+
+        // Every driver allocation the load makes, by site: most are scratch the
+        // load frees again, and the ones it keeps are what the CUDA pool still
+        // holds outside the reservation once serving starts.
+        #[cfg(feature = "forbidden_allocations")]
+        let load_watch = candle::forbidden_alloc::armed();
         let model = self.load_model(&weights, device, progress)?.model;
+        #[cfg(feature = "forbidden_allocations")]
+        {
+            drop(load_watch);
+            let report = candle::forbidden_alloc::take_report();
+            tracing::warn!(
+                target: "candle_conversation::scheduler::forbidden_alloc",
+                calls = report.total_calls,
+                mib = report.total_bytes >> 20,
+                "the load allocated outside the reservation\n{report}"
+            );
+        }
 
         // Hand the load's pool high-water back before serving starts — it is
         // several GiB held outside the KV reservation and never used again.
@@ -2029,6 +2064,7 @@ mod identity_tests {
     use candle::quantized::gguf_file::Value;
     use candle_transformers::models::model_pack::keys::TOKENIZER_JSON;
     use candle_transformers::models::model_pack::SourceRecord;
+    use candle_transformers::models::quantized_qwen38_moe::engine_model_digest;
 
     use crate::error::ConversationError;
     use crate::models::identity::{write_pack_header, WeightFiles};
@@ -2123,6 +2159,35 @@ mod identity_tests {
             .bind_substrate(&first)
             .expect("the model that wrote the substrate still opens it");
         assert_eq!(reopened.model_key(), first.key());
+    }
+
+    /// **Flash-Next is one model at every rung.** Two cards build packs from
+    /// different artifacts — another expert width, another file — and each names
+    /// the release, so a substrate written on one opens on the other.
+    #[test]
+    fn every_flash_next_rung_opens_the_same_substrate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let q3 = dir.path().join("q3.pack.gguf");
+        let q4 = dir.path().join("q4.pack.gguf");
+        pack(&q3, 'a', Some(TOKENIZER));
+        pack(&q4, 'b', Some(TOKENIZER));
+        let workspace = dir.path().join("workspace");
+        let builder = Model::Qwen38_FlashNext.builder().workspace_path(&workspace);
+
+        let small = builder.model_identity(&WeightFiles::single(&q3)).unwrap();
+        let large = builder.model_identity(&WeightFiles::single(&q4)).unwrap();
+        assert_eq!(small.key(), large.key());
+        assert_eq!(small.key().weights, engine_model_digest());
+
+        drop(
+            builder
+                .bind_substrate(&small)
+                .expect("a new substrate binds"),
+        );
+        let reopened = builder
+            .bind_substrate(&large)
+            .expect("the other rung opens the substrate");
+        assert_eq!(reopened.model_key(), small.key());
     }
 }
 

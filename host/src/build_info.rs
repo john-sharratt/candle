@@ -42,6 +42,6 @@ mod tests {
         assert_eq!(o.log_format, Some(FILE_FORMAT_VERSION));
         assert_eq!(o.record_tags.len(), WRITTEN_RECORD_TYPES.len());
         assert!(o.record_tags.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(o.model.as_deref(), Some("Qwen38_FlashNext_Q4KO"));
+        assert_eq!(o.model.as_deref(), Some("Qwen38_FlashNext"));
     }
 }

@@ -763,30 +763,32 @@ identity it would need.
 // host/src/model.rs
 /// The model every tenant runs. Changing it is a code change, and every substrate
 /// written under the previous one refuses to open (§4) until it is moved aside.
-pub const MODEL: Model = Model::Qwen38_FlashNext_Q4KO;
+pub const MODEL: Model = Model::Qwen38_FlashNext;
 ```
 
-Qwen3.8-Flash-Next with `Q4_KO` experts over a `Q8_0` trunk
-(`models/qwen38_flash_next.rs`), arch `Qwen4Exp`: 250 B total, ~13 B active, its engine
-artifact prepared locally from the pinned upstream releases rather than downloaded. It
-runs on every machine in the fleet at this one quant — the expert cache streams what
-VRAM cannot hold, so a smaller card streams more experts rather than taking the
-`Q3_KO` rung — and needs no ladder.
+It is Qwen3.8-Flash-Next (`models/qwen38_flash_next.rs`), arch `Qwen4Exp`: a `Q8_0`
+trunk prepared on each machine, with the routed experts at the card's rung — `Q3_KO`
+under 64 GiB, `Q4_KO` above. It runs on every machine in the fleet — the expert cache
+streams what VRAM cannot hold.
 
-The host first prescribed the AntiLoop + StyleTune fine-tune of Qwen3.6-35B-A3B,
-npcd's model before there was a host. It moved to Flash-Next on 2026-10-11, when zend —
-which had run Flash-Next on the 72 GB card all along — first came up on this build, so
-that its substrate carried over: §4.2's one-time check admitted the Flash-Next spec it
-recorded, and zend kept every conversation.
+**A rung is not another model.** Every rung is built from the same release, so the
+preset names the release and loads whichever rung's pack the card calls for, and the
+key's weights digest is the release's — its trunk and draft-head sources
+(`quantized_qwen38_moe::engine_model_digest`) — rather than the pack's. A substrate
+written on the 16 GB laptop opens on the 72 GB card. A new release, a new pin, is a
+new model.
+
+It replaced the AntiLoop + StyleTune fine-tune of Qwen3.6-35B-A3B, which a substrate
+written before the change still records, and refuses to open under (§4).
 
 What goes:
 
 - zend's `model_choice` ladder (`zend/src/model_choice.rs`) and its `--model` flag.
-  zend runs the prescribed model on every machine.
+  The only choice a card makes is its Flash-Next rung, and that is not a model choice.
 - npcd's own `model()`; it reads the host's.
-- `Model::PRESETS` gains `Qwen36_35B_A3B_AntiLoop_StyleTune`, which it lacks today
-  (`models/mod.rs:547-564`), so the model is addressable by name everywhere a preset
-  is — `substrate_inspect`, error messages, `models.override.yaml`.
+- One Flash-Next preset in `Model::PRESETS` in place of one per rung, so the model is
+  addressable by one name everywhere a preset is — `substrate_inspect`, error messages,
+  `models.override.yaml`.
 
 `models.override.yaml` stays what it is: a repoint of the one model's repo, file,
 revision, size or adapters (`candle-transformers/src/model_overrides.rs`), baked in at

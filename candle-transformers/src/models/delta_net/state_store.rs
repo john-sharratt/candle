@@ -63,7 +63,6 @@
 
 #[cfg(feature = "cuda")]
 use std::collections::HashMap;
-#[cfg(feature = "cuda")]
 use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
@@ -130,6 +129,30 @@ pub struct ExportedLayerState {
     pub conv_channels: u32,
     pub conv_tail_cols: u32,
     pub conv_tail: Vec<u8>,
+}
+
+/// A checked snapshot held for a sequence that has no store yet — installed
+/// into one when the sequence's state is first wanted. The layers are shared:
+/// every slot opened on one prompt branch holds the same rows.
+#[derive(Debug, Clone)]
+pub struct StagedSnapshot {
+    pub schedule_hash: u64,
+    pub layers: Arc<[ExportedLayerState]>,
+}
+
+impl StagedSnapshot {
+    /// A store of `layer_kinds`/`dims` holding this snapshot, marked seeded so
+    /// its first wave keeps it.
+    pub fn build(
+        &self,
+        layer_kinds: &[LayerKind],
+        dims: &DeltaNetDims,
+        device: &Device,
+    ) -> Result<RecurrentStateStore> {
+        let mut store = RecurrentStateStore::new(layer_kinds, dims, device)?;
+        store.import(self.schedule_hash, &self.layers)?;
+        Ok(store)
+    }
 }
 
 /// Fingerprint of a model's recurrent layout: the layer schedule plus the
@@ -493,6 +516,39 @@ impl RecurrentStateStore {
             seeded: false,
             device: device.clone(),
         })
+    }
+
+    /// Back to the sequence-start state, on the slots this store already holds.
+    ///
+    /// Each layer's `live` half is zeroed where it stands; `backup` is left as it
+    /// is, being fully stamped by the next wave before anything reads it
+    /// (invariant 6). This is how a sequence starting over gets its zeros — not
+    /// by dropping the store and building another. A store's slots go back to
+    /// their arena only once every tensor viewing them has gone, so a rebuild
+    /// can ask for a second store's worth of slots while the first is still
+    /// held; on a span with no room to spare that claim fails part-way, and
+    /// the turn that was only restarting fails with it.
+    ///
+    /// Called before a wave opens, so a store still marked open here is one
+    /// whose last wave was never closed — a failure that skipped its rollback.
+    /// That wave is rolled back first: its writes went only to the halves a
+    /// commit would have swapped in, so declining them loses nothing, and the
+    /// restart goes ahead on a store that was otherwise left unusable.
+    pub fn reset(&mut self) -> Result<()> {
+        if self.open {
+            self.rollback_wave()?;
+        }
+        for slot in &mut self.slots {
+            slot.advanced = false;
+            #[cfg(feature = "cuda")]
+            if let Some(held) = slot.held.as_ref() {
+                zero_state(&self.dims, &self.device, &held[0])?;
+                continue;
+            }
+            slot.live = DeltaNetState::zeros(&self.dims, &self.device)?;
+        }
+        self.seeded = false;
+        Ok(())
     }
 
     pub fn schedule_hash(&self) -> u64 {
@@ -1188,10 +1244,66 @@ impl RecurrentStateStore {
             .collect())
     }
 
+    /// Whether a snapshot fits a store of this geometry — its schedule hash, and
+    /// every layer's index and dims — without building one. What [`Self::import`]
+    /// checks before it touches a tensor, available to a caller that holds the
+    /// snapshot back until a store is wanted, so a foreign layout is refused when
+    /// it arrives rather than when it is first used.
+    pub fn check_snapshot(
+        layer_kinds: &[LayerKind],
+        dims: &DeltaNetDims,
+        snapshot_hash: u64,
+        layers: &[ExportedLayerState],
+    ) -> Result<()> {
+        let hash = schedule_hash(layer_kinds, dims);
+        if snapshot_hash != hash {
+            candle::bail!(
+                "recurrent store: snapshot schedule hash {snapshot_hash:#x} does not match \
+                 this model's {hash:#x} — recompute the state instead of scattering a foreign \
+                 layout"
+            );
+        }
+        let recurrent: Vec<usize> = layer_kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| **k == LayerKind::DeltaNet)
+            .map(|(i, _)| i)
+            .collect();
+        if layers.len() != recurrent.len() {
+            candle::bail!(
+                "recurrent store: snapshot has {} layers, store has {}",
+                layers.len(),
+                recurrent.len()
+            );
+        }
+        for (&layer_index, l) in recurrent.iter().zip(layers) {
+            if l.layer_index as usize != layer_index
+                || l.n_v_heads as usize != dims.n_v_heads
+                || l.d_v as usize != dims.head_dim
+                || l.d_k as usize != dims.head_dim
+                || l.conv_channels as usize != dims.conv_dim()
+                || l.conv_tail_cols as usize != dims.conv_kernel - 1
+                || l.state.len() != dims.state_elems() * 4
+                || l.conv_tail.len() != dims.conv_state_elems() * 4
+            {
+                candle::bail!(
+                    "recurrent store: snapshot layer {} does not match the store's \
+                     geometry",
+                    l.layer_index
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Scatter a snapshot back into the store — the resume path. Validates
-    /// the schedule hash and every layer's dims before touching any tensor;
-    /// on any mismatch the store is left untouched and the caller recomputes.
+    /// the schedule hash and every layer's dims before touching any tensor
+    /// ([`Self::check_snapshot`]); on any mismatch the store is left untouched
+    /// and the caller recomputes.
     pub fn import(&mut self, snapshot_hash: u64, layers: &[ExportedLayerState]) -> Result<()> {
+        if self.open {
+            candle::bail!("recurrent store: import mid-wave");
+        }
         if snapshot_hash != self.hash {
             candle::bail!(
                 "recurrent store: snapshot schedule hash {snapshot_hash:#x} does not match \
@@ -1199,9 +1311,6 @@ impl RecurrentStateStore {
                  layout",
                 self.hash
             );
-        }
-        if self.open {
-            candle::bail!("recurrent store: import mid-wave");
         }
         let d = &self.dims;
         if layers.len() != self.slots.len() {
@@ -1247,14 +1356,7 @@ impl RecurrentStateStore {
             // Written into the slot's buffers rather than replacing them: the
             // slot's tensors keep their identity for the store's whole life, and
             // the fused decode kernels rely on that.
-            slot.live.copy_from(&DeltaNetState {
-                s: Tensor::from_vec(state_f, (d.n_v_heads, d.head_dim, d.head_dim), &self.device)?,
-                conv_tail: Tensor::from_vec(
-                    tail_f,
-                    (d.conv_dim(), d.conv_kernel - 1),
-                    &self.device,
-                )?,
-            })?;
+            slot.live.write_host(&state_f, &tail_f)?;
         }
         // Restored state is state someone put here on purpose. Without this the
         // first wave on a resumed slot standing at offset 0 would reset it, and
@@ -1383,6 +1485,55 @@ mod tests {
         assert_eq!(fresh.export().unwrap(), before);
     }
 
+    /// A snapshot is checked against the geometry with no store built: the
+    /// store's own export passes, and a wrong hash, a wrong layer count and a
+    /// wrong layer geometry are each refused — the same answers `import` gives.
+    #[test]
+    fn check_snapshot_agrees_with_import_without_a_store() {
+        let store = filled_store();
+        let hash = store.schedule_hash();
+        let exported = store.export().unwrap();
+        let check = |h: u64, l: &[ExportedLayerState]| {
+            RecurrentStateStore::check_snapshot(&kinds(), &dims(), h, l)
+        };
+        check(hash, &exported).unwrap();
+        assert!(check(hash ^ 1, &exported)
+            .unwrap_err()
+            .to_string()
+            .contains("schedule hash"));
+        assert!(check(hash, &exported[..2])
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot has 2 layers"));
+        let mut bad = exported.clone();
+        bad[1].layer_index = 2;
+        assert!(check(hash, &bad)
+            .unwrap_err()
+            .to_string()
+            .contains("geometry"));
+    }
+
+    /// A held snapshot builds a store holding exactly it — byte for byte through
+    /// `export` — marked seeded so its first wave keeps it; and a snapshot that
+    /// does not fit the geometry builds nothing.
+    #[test]
+    fn a_staged_snapshot_builds_a_seeded_store_holding_it() {
+        let source = filled_store();
+        let staged = StagedSnapshot {
+            schedule_hash: source.schedule_hash(),
+            layers: source.export().unwrap().into(),
+        };
+        let built = staged.build(&kinds(), &dims(), &Device::Cpu).unwrap();
+        assert_eq!(built.export().unwrap(), source.export().unwrap());
+        assert!(built.is_seeded());
+
+        let foreign = StagedSnapshot {
+            schedule_hash: staged.schedule_hash ^ 1,
+            layers: staged.layers.clone(),
+        };
+        assert!(foreign.build(&kinds(), &dims(), &Device::Cpu).is_err());
+    }
+
     #[test]
     fn wave_rollback_restores_entry_state_and_commit_keeps_writes() {
         let mut store = filled_store();
@@ -1479,6 +1630,49 @@ mod tests {
             .to_vec1()
             .unwrap();
         assert_ne!(committed, entry, "commit must install the wave's output");
+    }
+
+    /// A reset store reads exactly as a fresh one — every layer's `s` and conv
+    /// tail back to zero, and no longer seeded — even when a wave was left
+    /// open on it: that wave is rolled back, and the store opens the next.
+    #[test]
+    fn reset_returns_the_store_to_the_sequence_start_state() {
+        let mut store = filled_store();
+        store.mark_seeded();
+        let fresh = RecurrentStateStore::new(&kinds(), &dims(), &Device::Cpu).unwrap();
+        assert_ne!(store.export().unwrap(), fresh.export().unwrap());
+
+        // A wave left open, its write half advanced, never closed.
+        store.begin_wave().unwrap();
+        {
+            let (live, out) = store.layer_state_pair_mut(0).unwrap();
+            bump_into(live, &out);
+        }
+
+        store.reset().unwrap();
+        assert_eq!(
+            store.export().unwrap(),
+            fresh.export().unwrap(),
+            "a reset store must hold the sequence-start state byte for byte"
+        );
+        assert!(!store.is_seeded());
+
+        // A wave on the reset store starts from zero: one bump reads as ones.
+        store.begin_wave().unwrap();
+        {
+            let (live, out) = store.layer_state_pair_mut(0).unwrap();
+            bump_into(live, &out);
+        }
+        store.commit_wave();
+        let s: Vec<f32> = store
+            .layer_state(0)
+            .unwrap()
+            .s
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(s.iter().all(|v| *v == 1.0));
     }
 
     #[test]
@@ -1807,6 +2001,23 @@ mod tests {
         let child = resumed.fork_from().unwrap();
         assert_eq!(child.export().unwrap(), sealed.1);
         assert!(child.is_seeded());
+    }
+
+    /// **A reset zeroes the state on the slots it already holds.** Same decode
+    /// addresses before and after — no claim, no release — and the export reads
+    /// as a fresh store's.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_cuda_reset_zeroes_in_place_without_a_new_claim() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let mut store = filled_store_on(&dev);
+        let before: Vec<[u64; 4]> = store.decode_table_addresses()?.collect();
+        store.reset()?;
+        let after: Vec<[u64; 4]> = store.decode_table_addresses()?.collect();
+        assert_eq!(after, before, "a reset must keep the store's slots");
+        let fresh = RecurrentStateStore::new(&kinds(), &dims(), &dev)?;
+        assert_eq!(store.export()?, fresh.export()?);
+        Ok(())
     }
 
     /// **The pinned readback is the same bytes the per-tensor one was.** A CUDA

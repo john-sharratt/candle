@@ -53,6 +53,7 @@ mod tests {
             reshaped_us: 9_000,
             instantiated_us: 5_000,
             recording_us: 10_000,
+            ..CaptureStats::default()
         };
         let after = CaptureStats {
             waves: 7,
@@ -65,6 +66,7 @@ mod tests {
             reshaped_us: 12_500,
             instantiated_us: 6_000,
             recording_us: 26_400,
+            ..CaptureStats::default()
         };
         assert_eq!(
             graph_line(&before, &after),

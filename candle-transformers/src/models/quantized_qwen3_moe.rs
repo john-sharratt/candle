@@ -556,8 +556,6 @@ pub struct ModelWeights {
     lm_head: QMatMul,
     #[allow(dead_code)]
     expert_cache: Option<Arc<ExpertCache>>,
-    #[allow(dead_code)]
-    _mmap: Option<Arc<memmap2::Mmap>>,
     device: Device,
     /// Inference numeric mode for the dense (non-expert) projections. Baked into each dense
     /// `QMatMul` at load; retained here for introspection. Experts are unaffected (always FP16).
@@ -845,11 +843,14 @@ impl ModelWeights {
         // pack's GGUF part — the sections are read with direct I/O.
         candle::vram::set_weights_mmap(mmap.len() as u64);
 
-        // **The mapping is deliberately not host-registered.** What lives in it
-        // is the dense tensors and the embedding table, gathered a few tokens at
-        // a time; registering would lock it non-pageable for the process
-        // lifetime, competing directly with the warm expert tier, which is the
-        // thing that keeps expert loads off the disk.
+        // **The mapping is deliberately not host-registered, and it does not
+        // outlive the load.** Every tensor is copied out of it — the dense ones to
+        // the device, the embedding into its own pinned table — so nothing reads
+        // it after this function returns. Holding it would cost the expert reads
+        // their overlap: on Windows a file with any cached view open has its
+        // unbuffered reads served one at a time (6.5 → 4.1 GB/s on the 16 GB
+        // laptop, `direct_io::tests::read_method_sweep`), and the expert section
+        // is in the same file.
         let ct = &pack.content;
 
         // Before any tensor, so the weights are carved from the reservation
@@ -1468,7 +1469,6 @@ impl ModelWeights {
             norm,
             lm_head,
             expert_cache,
-            _mmap: Some(mmap),
             wave_shapes: WaveShapes {
                 hidden: hidden_size,
                 intermediate: expert_ffn_size,

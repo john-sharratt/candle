@@ -55,6 +55,7 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use super::batched_layer::GlueMeta;
 use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePhase};
+use super::held_tensor::held_empty;
 #[cfg(feature = "cuda")]
 use super::wave_buffers::wave_from_vec_ticketed;
 use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
@@ -893,9 +894,10 @@ impl BatchedInferenceSession {
         let want = rows * n;
         let held = self.walk_tokens.as_ref().map_or(0, Tensor::elem_count);
         if held < want {
-            // By doubling, so a cohort ramping up settles in a few steps.
+            // By doubling, so a cohort ramping up settles in a few steps; on
+            // held ground, since it lives as long as the session.
             let grown = (held * 2).max(want);
-            self.walk_tokens = Some(Tensor::empty(grown, DType::U32, &self.device)?);
+            self.walk_tokens = Some(held_empty(grown, DType::U32, &self.device)?);
         }
         let buf = self.walk_tokens.as_ref().expect("sized above");
         buf.narrow(0, 0, want)?.reshape((rows, n))
@@ -2406,6 +2408,32 @@ impl BatchedInferenceSession {
             );
         }
         let view_idx = self.create_sequence()?;
+        // **All or nothing.** A view that fails part way holds the parent's
+        // borrowed blocks on the layers it reached, with no writer opened on the
+        // rest — a slot nobody will forward or free, pinning the parent's prefix
+        // after the parent itself lets go of it, and claiming that sealed history
+        // as its own writable region (compaction refuses to move it and says so
+        // every pass). So a failure frees the slot before it is reported.
+        match self.fill_view(view_idx, parent_idx, visible_block_ranges) {
+            Ok(view) => Ok(view),
+            Err(e) => match self.free_sequence(view_idx) {
+                Ok(()) => Err(e),
+                Err(free) => candle::bail!(
+                    "{e} — and the half-built view {view_idx} could not be freed: {free}"
+                ),
+            },
+        }
+    }
+
+    /// Borrow `parent_idx`'s `visible_block_ranges` into the fresh slot
+    /// `view_idx` on every layer and open its writer — the fallible half of
+    /// [`Self::create_view_sequence`], which frees the slot when this fails.
+    fn fill_view(
+        &mut self,
+        view_idx: usize,
+        parent_idx: usize,
+        visible_block_ranges: &[(usize, usize)],
+    ) -> Result<ViewSequence> {
         // Every layer borrows its prefix at once — host bookkeeping only — and
         // then each opens its writer chunk here, where the allocation runs.
         let borrowed = layer_parallel::map(&self.backings, |backing| {
@@ -4579,6 +4607,29 @@ pub trait ManagedBatchedModel {
         false
     }
 
+    /// Whether `seq` holds its recurrent store right now — forked from a
+    /// parent, restored, or built by a wave it already rode.
+    ///
+    /// What admission reads to charge a turn's store once: a view carved before
+    /// its prefill was admitted already holds one, and its regions are in the
+    /// residency admission measures, so charging the store again prices the same
+    /// ground twice. `false` on a stack with no recurrent layers, which holds
+    /// none.
+    fn has_recurrent_state(&self, _seq: usize) -> bool {
+        false
+    }
+
+    /// Claim `seq`'s carried per-sequence state now — whatever of it the
+    /// sequence does not already hold — rather than at its first wave.
+    ///
+    /// Admission calls this the moment it takes a turn, so ground the turn was
+    /// priced for is claimed between forwards, where the weight side can sell
+    /// for it, and a refusal leaves the turn queued instead of failing a wave's
+    /// whole cohort at entry. Nothing to claim on a stack with no carried state.
+    fn claim_carried_state(&self, _seq: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether a speculative block's rejected tail can be rolled back on this model.
     ///
     /// **Distinct from [`Self::carries_recurrent_state`], which used to answer both.**
@@ -4757,6 +4808,28 @@ pub trait ManagedBatchedModel {
         _layers: &[ExportedLayerState],
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Hold a snapshot for `seq` and install it when the sequence's state is
+    /// first wanted — a view forked from it, its admission's claim, or a wave
+    /// run on it — rather than now.
+    ///
+    /// The branch-checkpoint install lands on a slot that has not run a turn,
+    /// and may wait a long time before it does. Restored there, every new
+    /// conversation would hold a whole recurrent store outside admission, and a
+    /// window of them would take the span from under the turns admission had
+    /// already priced. Held back, the store is claimed where admission prices it.
+    ///
+    /// Checked now, as [`Self::restore_recurrent`] checks: a hash or geometry
+    /// mismatch errors here, not at first use. The default installs at once,
+    /// which is what a model that keeps no store of its own does anyway.
+    fn stage_recurrent(
+        &self,
+        seq: usize,
+        schedule_hash: u64,
+        layers: Arc<[ExportedLayerState]>,
+    ) -> Result<bool> {
+        self.restore_recurrent(seq, schedule_hash, &layers)
     }
 
     /// Carried per-sequence state that is **not** a DeltaNet layer stack, as an

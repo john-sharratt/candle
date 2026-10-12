@@ -46,7 +46,7 @@ pub fn engine_reading(
     };
     Some(Engine {
         decode_tps: Some(rate(&["decode"])),
-        prefill_tps: Some(rate(&["prefill", "section"])),
+        prefill_tps: Some(rate(&["prefill"])),
         kv_mib: Some(wave.kv_mib as f64),
         weights_mib: Some(wave.weights_mib as f64),
         ..Engine::default()
@@ -90,8 +90,8 @@ mod tests {
         assert!(engine_reading(&[p("decode", 0.5, 10)], None, 2.0).is_none());
     }
 
-    /// Decode counts decode phases; prefill counts prompt and section prefill;
-    /// anything older than the window is out of it.
+    /// Decode counts decode phases; prefill counts prefill phases, section
+    /// ingest included; anything older than the window is out of it.
     #[test]
     fn rates_count_the_window_and_memory_is_the_newest_wave() {
         let phases = [
@@ -99,7 +99,7 @@ mod tests {
             p("decode", 1.5, 50),
             p("decode", 3.0, 1_000),
             p("prefill", 1.0, 4_000),
-            p("section", 1.9, 2_000),
+            p("prefill", 1.9, 2_000),
             p("sealing", 1.0, 99),
         ];
         let e = engine_reading(

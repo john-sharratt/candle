@@ -46,8 +46,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use candle::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr};
-use candle::cuda_backend::WrapErr;
+use candle::cuda_backend::cudarc::driver::DevicePtr;
+use candle::cuda_backend::Held;
 use candle::{CudaDevice, Result};
 
 use super::types::TARGET_ARENA_BYTES;
@@ -142,7 +142,7 @@ pub(crate) fn class_bytes_for(bytes: usize) -> Result<usize> {
 
 struct ClassPool {
     /// One entry per slab: the whole device allocation, held so it stays live.
-    slabs: Vec<CudaSlice<u8>>,
+    slabs: Vec<Held<u8>>,
     /// Base device address of each slab, resolved once at creation.
     bases: Vec<u64>,
     /// Free `(slab, index)` pairs, most recently released first.
@@ -183,10 +183,11 @@ fn arenas() -> &'static Mutex<HashMap<usize, Inner>> {
 /// rung, which at 16 MiB and 688 B per entry means a single sequence's
 /// slot-state in one layer has passed ~781 K tokens.
 ///
-/// A slab is a driver allocation, which a thread recording a wave may not
-/// make, so it is made inside [`CudaDevice::pause_capture`], behind the
-/// launches recorded so far. Only then: a claim from a class with a free slot
-/// — every claim once the slabs have settled — touches no device at all.
+/// A slab is held ([`Held`]) — a range of the reservation's held ground, or a
+/// pool allocation when the ground has no room — and is taken inside
+/// [`CudaDevice::pause_capture`], behind the launches recorded so far. Only
+/// then: a claim from a class with a free slot — every claim once the slabs
+/// have settled — touches no device at all.
 pub(crate) fn claim(device: &CudaDevice, bytes: usize) -> Result<SlotStateSlot> {
     let class = class_for(bytes).ok_or_else(|| {
         candle::Error::Msg(format!(
@@ -238,7 +239,7 @@ pub(crate) fn claim(device: &CudaDevice, bytes: usize) -> Result<SlotStateSlot> 
         // is read (`rebuild_decode` fills it, `update_chunk` overwrites in
         // place) and the kernel only reads through a pointer we hand it.
         let slab_bytes = per_slab * slot_bytes;
-        let slab = unsafe { stream.alloc::<u8>(slab_bytes).w()? };
+        let slab = unsafe { Held::<u8>::alloc_on(&stream, slab_bytes)? };
         let base = {
             let (base, _guard) = slab.device_ptr(&stream);
             base

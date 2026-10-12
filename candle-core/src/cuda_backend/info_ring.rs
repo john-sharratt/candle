@@ -31,9 +31,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::DevicePtr;
 
-use super::{CudaDevice, Uploaded, WrapErr};
+use super::{CudaDevice, Held, Uploaded, WrapErr};
 use crate::Result;
 
 /// Words in one ring buffer (512 KiB). A table is `dims ++ strides` for one
@@ -66,7 +66,7 @@ pub(crate) fn place(used: usize, len: usize, capacity: Option<usize>, held: bool
 /// The memo and the ring it is carved from. One per stream handle.
 #[derive(Default)]
 pub(crate) struct InfoRing {
-    buf: Option<Arc<CudaSlice<usize>>>,
+    buf: Option<Arc<Held<usize>>>,
     used: usize,
     tables: HashMap<Vec<usize>, Arc<Uploaded<usize>>>,
 }
@@ -110,7 +110,8 @@ impl InfoRing {
                 }
                 // SAFETY: a word is read only through a table, and each table's
                 // words are written by its own upload below before any launch.
-                self.buf = Some(Arc::new(unsafe { dev.alloc::<usize>(words)? }));
+                // Held: the ring lives as long as the handle.
+                self.buf = Some(Arc::new(unsafe { Held::<usize>::alloc(dev, words)? }));
                 0
             }
         };
@@ -123,7 +124,7 @@ impl InfoRing {
         let mut view = unsafe { stream.upgrade_device_ptr::<usize>(addr, info.len()) };
         stream.memcpy_htod(info, &mut view).w()?;
         self.used = at + info.len();
-        let t = Arc::new(Uploaded::leased(view, Some(buf.clone())));
+        let t = Arc::new(Uploaded::leased(view, Some(buf.clone() as Arc<_>)));
         self.tables.insert(info.to_vec(), t.clone());
         Ok(t)
     }

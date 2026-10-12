@@ -1029,10 +1029,18 @@ impl ChunkedKvBacking {
                 .write()
                 .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
             if let Some(slot) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) {
+                let mut sealed_end = 0;
                 for ((blk, ..), meta) in record_srcs.iter().zip(metas) {
                     if let Some(cw) = slot.chunk_at_mut(*blk) {
                         cw.meta = meta;
+                        sealed_end = sealed_end.max(blk + 1);
                     }
+                }
+                // A block that carries a record is sealed history, read through
+                // that record — never the slot's to write. The write boundary
+                // moves past it, so nothing reads it as a writer chunk.
+                if slot.writer_start_idx() < sealed_end {
+                    slot.set_writer_start_idx(sealed_end);
                 }
             }
         }

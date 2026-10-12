@@ -2,28 +2,26 @@
 //!
 //! The model itself is the host's to name — one prescribed model for every
 //! tenant of the process ([`host::MODEL`], `docs/shared_model_host.md` §5):
-//! **Qwen3.8-Flash-Next**, 250 B total with about 13 B active per token. 48
-//! layers at 3:1 — gated-DeltaNet layers carrying a recurrent state to attention
-//! layers carrying paged K/V — with its routed experts behind the three-tier
-//! expert cache. Its engine artifact is prepared locally from the pinned
-//! upstream releases rather than downloaded; see
-//! `candle_conversation::models::qwen38_flash_next`.
+//! **Qwen3.8-Flash-Next**, 250 B total with about 13 B active per token —
+//! gated-DeltaNet layers carrying a recurrent state, attention layers carrying
+//! paged K/V, and routed experts behind the three-tier expert cache. See
+//! `Model::Qwen38_FlashNext`.
 //!
 //! # What a routed model costs this daemon
 //!
 //! A routed model amortises expert loads across a wave of sessions stepping
 //! through layers together, and a cast on different concerns reaching different
-//! experts is where that amortisation is weakest. The price on a small card is
-//! KV room: the dense weights and the resident expert working set take most of
-//! it, with the expert cache paging the rest from host RAM and disk, and a
-//! resident cast's histories are what fill the KV regions left over.
+//! experts is where that amortisation is weakest. The price is KV room: the
+//! expert working set takes most of a small card, with the expert cache paging
+//! the rest from host RAM and the model pack, and a resident cast's histories
+//! are what fill what is left. [`Model::Qwen35_9B_Q6`] stays in the registry for
+//! a cast large enough that the room matters more than the model.
 //!
-//! # One quant on every card
+//! # The card's rung
 //!
-//! Q4_KO experts over a Q8_0 trunk, whatever the card: one artifact everywhere
-//! keeps the KV threshold row and the C-ladder calibration the same on every
-//! machine. A smaller card streams more of the experts; it does not take a
-//! smaller quant.
+//! The trunk is `Q8_0` on every card; the routed experts are at the card's rung
+//! — `Q3_KO` under 64 GiB, `Q4_KO` above. Every rung is the same release, so a
+//! substrate written on one card opens on another.
 
 use host::MODEL;
 
@@ -109,32 +107,25 @@ mod tests {
     use super::*;
     use candle_conversation::models::ModelArch;
 
-    /// **Flash-Next's arch.**
-    ///
-    /// Each loader refuses a checkpoint of another arch — a routed file loaded
-    /// through a dense path has no expert cache to stand up, and a dense one
-    /// through a routed path stands one up over weights that have none. The
-    /// arch is what routes the load, so it is asserted rather than assumed.
+    /// **Flash-Next's arch.** The arch is what routes the load — each loader
+    /// refuses the others' checkpoints — so it is asserted rather than assumed.
     #[test]
     fn npcd_runs_flash_next() {
         assert!(
             matches!(MODEL.spec().arch, ModelArch::Qwen4Exp),
-            "arch {:?} routes to a loader that refuses Flash-Next's checkpoint",
+            "arch {:?} routes to a loader that refuses Flash-Next's pack",
             MODEL.spec().arch
         );
     }
 
-    /// **Flash-Next, locked on Q4_KO experts, prepared locally.** The preset
-    /// rather than the resolved spec, because an override is entitled to change
-    /// the file — what is asserted is what the repository ships.
+    /// **Prepared on this machine, at the card's rung.** The preset names the
+    /// release, not a rung, so its file name carries no quant the console could
+    /// claim.
     #[test]
-    fn the_preset_is_flash_next_at_q4_ko() {
+    fn the_preset_is_prepared_and_names_no_rung() {
         let s = MODEL.preset_spec();
-        assert_eq!(quant_of(&s.model_filename), "Q4_KO");
-        assert!(
-            s.prepared_from_source,
-            "nothing publishes the engine artifact"
-        );
+        assert!(s.prepared_from_source);
+        assert_eq!(quant_of(&s.model_filename), "?");
         assert!(s.tensor_overrides.is_empty());
     }
 
@@ -224,7 +215,7 @@ mod tests {
     /// architecture would let a local edit route npcd into a loader that refuses
     /// its checkpoint, with nothing in the repository changed to explain it.
     #[test]
-    fn an_override_cannot_move_npcd_off_its_arch() {
+    fn an_override_cannot_move_npcd_off_the_arch() {
         assert!(matches!(MODEL.spec().arch, ModelArch::Qwen4Exp));
         assert_eq!(MODEL.spec().arch, MODEL.preset_spec().arch);
     }

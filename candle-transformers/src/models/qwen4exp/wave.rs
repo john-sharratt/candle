@@ -75,11 +75,12 @@ use crate::models::delta_net::cuda::build_wave_table;
 use crate::models::delta_net::StashSlot;
 use crate::models::delta_net::{
     compact_stores, quantized_delta_net_layer_forward_spans, seq_spans, DeltaNetSeq,
-    ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore, SeqSpan, ZGate,
+    ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore, SeqSpan,
+    StagedSnapshot, ZGate,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
 use crate::models::expert_lre::{
-    WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS,
+    WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS, STAGED_HOPS,
 };
 use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
@@ -198,6 +199,21 @@ pub struct Qwen4ExpBatched {
     /// [`RecurrentStateStore::take_seeded`]; this model needs it to cover the
     /// PLE and index caches as well, so the flag lives beside them.
     pub(super) seeded: RwLock<HashSet<usize>>,
+    /// Sequences whose carried state was claimed at admission
+    /// ([`Self::claim_carried_state`]) and has not yet ridden a wave.
+    ///
+    /// That state is already sequence-start — a zeroed store, zeroed PLE
+    /// history, zeroed seeds — so the first wave keeps it rather than building
+    /// a second set beside it. Consumed by that wave; cleared by anything that
+    /// writes the state from elsewhere.
+    pub(super) pristine: RwLock<HashSet<usize>>,
+    /// GDN snapshots held for sequences that have no store yet
+    /// ([`Self::stage_recurrent`]): `(schedule hash, layers)`, the layers shared
+    /// by every slot opened on one prompt branch. Installed when the sequence's
+    /// state is first wanted — a fork from it gets its own store built from the
+    /// snapshot, a claim or a wave on it builds its store — so a slot that has
+    /// not run a turn holds host bytes it shares, not a store of its own.
+    pub(super) staged: RwLock<HashMap<usize, StagedSnapshot>>,
     /// Armed only while a speculative block is in flight: what the verify wave
     /// must capture so a partial accept can be rewound ([`super::spec`]).
     /// `None` on every plain decode, which is what keeps the capture sites a
@@ -401,6 +417,8 @@ impl Qwen4ExpBatched {
     /// one holding the index but a zero PLE would inject an n-gram embedding
     /// computed from a window it never saw. Both read as a plausible answer.
     pub fn fork_recurrent(&self, parent: usize, child: usize) -> Result<()> {
+        // The child's state is the parent's from here, not sequence-start.
+        self.clear_pristine(child);
         // **Each carried class is forked on its own terms.** They are populated
         // by different things and a parent can hold one without the others:
         // the recurrent store comes from running a wave, the PLE state from the
@@ -417,14 +435,30 @@ impl Qwen4ExpBatched {
         // the QSA identity threshold, at which point every first turn failed
         // with `a query at position N needs M blocks but the index cache holds
         // 0 in injected pages`.
+        // A parent whose snapshot is still held has no store to copy: the child
+        // is built straight from the snapshot, and the parent keeps holding it
+        // for its next view. That is the whole point of holding it — one store
+        // per turn in flight, never a second one idling on the parent.
         let forked = {
             let map = self
                 .recurrent
                 .read()
                 .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
-            map.get(&parent)
-                .map(|store| store.fork_from())
-                .transpose()?
+            match map.get(&parent) {
+                Some(store) => Some(store.fork_from()?),
+                None => {
+                    let staged = self
+                        .staged
+                        .read()
+                        .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
+                        .get(&parent)
+                        .cloned();
+                    let cfg = &self.model.cfg;
+                    staged
+                        .map(|s| s.build(&cfg.layer_kinds, &cfg.delta_net, &self.model.device))
+                        .transpose()?
+                }
+            }
         };
         let ple = {
             let map = self
@@ -1036,6 +1070,84 @@ impl Qwen4ExpBatched {
         Ok(())
     }
 
+    /// Claim `seq`'s carried state now — the recurrent store, the PLE history
+    /// and its spare, the draft head's seeds — whatever of it the sequence does
+    /// not already hold.
+    ///
+    /// **What admission calls, so a refusal is an admission refusal.** Claimed
+    /// lazily at wave entry instead, the store came after the weight side had
+    /// taken spare ground back and after the wave's own K/V, and a refusal there
+    /// failed every member of the cohort; claimed here, between forwards, the
+    /// weight side can sell for it, and a refusal leaves the turn queued. What
+    /// this creates is sequence-start state, so it is marked [`Self::pristine`]
+    /// and the first wave keeps it. A store a fork already copied is left alone,
+    /// and a snapshot held for the sequence becomes its store here.
+    pub fn claim_carried_state(&self, seq: usize) -> Result<()> {
+        self.install_staged(seq)?;
+        let cfg = &self.model.cfg;
+        let hc_dim = cfg.hc.count * cfg.hidden_size;
+        let dev = &self.model.device;
+        let mut created = false;
+        {
+            let mut rec = self
+                .recurrent
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
+            if let Entry::Vacant(e) = rec.entry(seq) {
+                e.insert(RecurrentStateStore::new(
+                    &cfg.layer_kinds,
+                    &cfg.delta_net,
+                    dev,
+                )?);
+                created = true;
+            }
+        }
+        {
+            let mut ple = self
+                .ple
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: ple lock poisoned".into()))?;
+            if let Entry::Vacant(e) = ple.entry(seq) {
+                e.insert(PleState::zeros(&cfg.ple, hc_dim, dev)?);
+            }
+            ple.get_mut(&seq).expect("inserted above").ensure_spare()?;
+        }
+        if self.model.mtp.is_some() {
+            let dims = (1, cfg.hc.count, cfg.hidden_size);
+            let mut seeds = self
+                .seeds
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: seed lock poisoned".into()))?;
+            if let Entry::Vacant(e) = seeds.entry(seq) {
+                e.insert(state_buffer(dev, dims, true)?);
+            }
+            let mut spares = self
+                .seed_spares
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: seed lock poisoned".into()))?;
+            if let Entry::Vacant(e) = spares.entry(seq) {
+                // Written by the carry before it is read (invariant 6).
+                e.insert(state_buffer(dev, dims, false)?);
+            }
+        }
+        if created {
+            self.pristine
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: pristine lock poisoned".into()))?
+                .insert(seq);
+        }
+        Ok(())
+    }
+
+    /// Forget that `seq`'s carried state is pristine: something wrote it, or
+    /// it is going away.
+    fn clear_pristine(&self, seq: usize) -> bool {
+        self.pristine
+            .write()
+            .map(|mut p| p.remove(&seq))
+            .unwrap_or(false)
+    }
+
     /// Declare `seq`'s carried state deliberately installed, so the next wave
     /// does not reset it out from under the caller. See the `seeded` field.
     pub(super) fn mark_seeded(&self, seq: usize) -> Result<()> {
@@ -1052,6 +1164,29 @@ impl Qwen4ExpBatched {
     /// what it holds now is what the parent's state becomes. The child's
     /// entries are gone afterwards and the parent's previous ones are dropped.
     pub fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
+        // A view claimed its state at admission and never ran a wave: what it
+        // holds is sequence-start zeros, not a continuation, and moving it would
+        // wipe the parent's. It goes; the parent keeps what it had — the same
+        // answer as a view that never claimed any.
+        if self.clear_pristine(child) {
+            self.recurrent
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
+                .remove(&child);
+            self.ple
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: ple lock poisoned".into()))?
+                .remove(&child);
+            self.seeds
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: seeds lock poisoned".into()))?
+                .remove(&child);
+            self.seed_spares
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: seeds lock poisoned".into()))?
+                .remove(&child);
+            return Ok(());
+        }
         let store = {
             let mut map = self
                 .recurrent
@@ -1067,6 +1202,12 @@ impl Qwen4ExpBatched {
             .write()
             .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
             .insert(parent, store);
+        // The parent's state is the view's continuation now, so a snapshot it
+        // was still holding describes a point it has moved past.
+        self.staged
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
+            .remove(&parent);
         {
             let mut map = self
                 .ple
@@ -1125,7 +1266,15 @@ impl Qwen4ExpBatched {
             .read()
             .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
         let Some(store) = map.get(&seq) else {
-            return Ok(None);
+            // A held snapshot is this sequence's state as surely as a store
+            // would be: read it back as it stands, without building one.
+            let staged = self
+                .staged
+                .read()
+                .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?;
+            return Ok(staged
+                .get(&seq)
+                .map(|s| (s.schedule_hash, s.layers.to_vec())));
         };
         // `export` refuses mid-wave itself; the seal runs outside the wave, so
         // reaching that error means the ordering broke.
@@ -1144,6 +1293,13 @@ impl Qwen4ExpBatched {
         schedule_hash: u64,
         layers: &[ExportedLayerState],
     ) -> Result<()> {
+        // A restored state is the record's, not sequence-start, and it
+        // supersedes any snapshot held back for this sequence.
+        self.clear_pristine(seq);
+        self.staged
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
+            .remove(&seq);
         let cfg = &self.model.cfg;
         let mut map = self
             .recurrent
@@ -1158,6 +1314,73 @@ impl Qwen4ExpBatched {
         store.import(schedule_hash, layers)?;
         drop(map);
         self.mark_seeded(seq)
+    }
+
+    /// Hold a snapshot for `seq` until its state is first wanted — see the
+    /// `staged` field. Checked against this model's geometry now, so a foreign
+    /// layout is refused here exactly as [`Self::restore_recurrent`] refuses it.
+    ///
+    /// A sequence that already holds a store takes the snapshot at once: held
+    /// back, the store's older state would be what its next wave read.
+    pub fn stage_recurrent(
+        &self,
+        seq: usize,
+        schedule_hash: u64,
+        layers: Arc<[ExportedLayerState]>,
+    ) -> Result<()> {
+        let cfg = &self.model.cfg;
+        RecurrentStateStore::check_snapshot(
+            &cfg.layer_kinds,
+            &cfg.delta_net,
+            schedule_hash,
+            &layers,
+        )?;
+        if self.has_recurrent(seq)? {
+            return self.restore_recurrent(seq, schedule_hash, &layers);
+        }
+        self.clear_pristine(seq);
+        self.staged
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
+            .insert(
+                seq,
+                StagedSnapshot {
+                    schedule_hash,
+                    layers,
+                },
+            );
+        self.mark_seeded(seq)
+    }
+
+    /// Build `seq`'s store from the snapshot held for it, if one is held. A
+    /// build the span refuses keeps the snapshot held, so the claim that asked
+    /// can be retried.
+    fn install_staged(&self, seq: usize) -> Result<()> {
+        let Some(snap) = self
+            .staged
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
+            .remove(&seq)
+        else {
+            return Ok(());
+        };
+        let cfg = &self.model.cfg;
+        match snap.build(&cfg.layer_kinds, &cfg.delta_net, &self.model.device) {
+            Ok(store) => {
+                self.recurrent
+                    .write()
+                    .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
+                    .insert(seq, store);
+                Ok(())
+            }
+            Err(e) => {
+                self.staged
+                    .write()
+                    .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
+                    .insert(seq, snap);
+                Err(e)
+            }
+        }
     }
 
     /// The carried state that is not a DeltaNet layer stack — the PLE window
@@ -1379,6 +1602,8 @@ impl Qwen4ExpBatched {
             draft_carry: Mutex::new(None),
             verify_stash: Mutex::new(None),
             seeded: RwLock::new(HashSet::new()),
+            pristine: RwLock::new(HashSet::new()),
+            staged: RwLock::new(HashMap::new()),
             verify: RwLock::new(None),
             ple: RwLock::new(HashMap::new()),
             index: RwLock::new(HashMap::new()),
@@ -1424,6 +1649,10 @@ impl Qwen4ExpBatched {
         tokens: usize,
         layer_start: usize,
     ) -> Result<()> {
+        // A wave run on a sequence whose snapshot is still held — one no claim
+        // reached, such as a projection's own prefill on its slot — builds the
+        // store from the snapshot before anything reads it.
+        self.install_staged(seq)?;
         let cfg = &self.model.cfg;
         let hc_dim = cfg.hc.count * cfg.hidden_size;
         // Consumed here, once, whether or not it fires — see `seeded`. Taken
@@ -1551,16 +1780,34 @@ impl Qwen4ExpBatched {
                 );
             }
         }
+        // State claimed at admission is already sequence-start, so a sequence
+        // starting over on it keeps it; any other start-over rebuilds. Consumed
+        // on the window that enters the wave, as `seeded` is.
+        let pristine = layer_start == 0 && self.clear_pristine(seq);
+        let rebuild = starting_over && !pristine;
         {
             let mut rec = self
                 .recurrent
                 .write()
                 .map_err(|_| candle::Error::Msg("recurrent lock poisoned".into()))?;
-            if starting_over || !rec.contains_key(&seq) {
-                rec.insert(
-                    seq,
-                    RecurrentStateStore::new(&cfg.layer_kinds, &cfg.delta_net, &self.model.device)?,
-                );
+            // **A restart zeroes the store it has; it never builds another.** A
+            // dropped store's slots return only once nothing views them, so a
+            // rebuild asked the span for a second 224 MiB while the first was
+            // still held — and on a full span that claim failed part-way and
+            // failed a turn that was only starting over.
+            match rec.entry(seq) {
+                Entry::Occupied(mut e) => {
+                    if rebuild {
+                        e.get_mut().reset()?;
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert(RecurrentStateStore::new(
+                        &cfg.layer_kinds,
+                        &cfg.delta_net,
+                        &self.model.device,
+                    )?);
+                }
             }
         }
         {
@@ -1568,8 +1815,11 @@ impl Qwen4ExpBatched {
                 .ple
                 .write()
                 .map_err(|_| candle::Error::Msg("ple lock poisoned".into()))?;
-            if starting_over || !ple.contains_key(&seq) {
-                ple.insert(seq, PleState::zeros(&cfg.ple, hc_dim, &self.model.device)?);
+            if rebuild {
+                ple.remove(&seq);
+            }
+            if let Entry::Vacant(e) = ple.entry(seq) {
+                e.insert(PleState::zeros(&cfg.ple, hc_dim, &self.model.device)?);
             }
             // The fused block's second history buffer, made here rather than in
             // the forward: a new state has none, and a rewind drops it.
@@ -1578,8 +1828,9 @@ impl Qwen4ExpBatched {
         // A sequence starting over has no previous row for the head to read,
         // and a stale seed here is the previous conversation's state feeding
         // this one's first proposal. Dropped rather than zeroed: the head pass
-        // reads a missing seed as position 0 and takes zeros itself.
-        if starting_over {
+        // reads a missing seed as position 0 and takes zeros itself. A pristine
+        // seed was claimed zero for this sequence and is kept.
+        if rebuild {
             self.seeds
                 .write()
                 .map_err(|_| candle::Error::Msg("seed lock poisoned".into()))?
@@ -1790,10 +2041,25 @@ impl Qwen4ExpBatched {
     }
 }
 
+/// Later rows a MoE layer's router look-ahead votes on, for a wave of
+/// `total_rows`: [`LOOK_AHEAD_HOPS`] at decode width, for the device's
+/// read-ahead, and [`STAGED_HOPS`] at prefill width, whose voted sets the
+/// expert stager reads off the drive (`PipelineState::stage_voted`). One answer
+/// for the forward that builds the routers and the plan that prices their
+/// columns ([`WaveWidth::look_ahead_hops`]).
+fn look_ahead_hops(total_rows: usize) -> usize {
+    if total_rows <= LOOK_AHEAD_MAX_TOKENS {
+        LOOK_AHEAD_HOPS
+    } else {
+        STAGED_HOPS
+    }
+}
+
 impl ManagedBatchedModel for Qwen4ExpBatched {
-    fn wave_geometry(&self, _act_dtype: DType) -> ModelGeometry {
+    fn wave_geometry(&self, wave_dtype: DType) -> ModelGeometry {
         // The Gated Residual carries F32 throughout, so the wave's own dtype is
-        // not what the spans are priced in.
+        // not what the spans are priced in — except the attention mixer's own
+        // carves, which run in it (`HyperWidths::mixer_dtype`).
         let act_dtype = DType::F32;
         let cfg = &self.model.cfg;
         let int8 = self.model.lm_head.int8mode().is_int8();
@@ -1856,6 +2122,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
                 low_rank: cfg.hc.low_rank,
                 draft_head: self.model.mtp.is_some(),
                 ple: true,
+                mixer_dtype: wave_dtype,
             }),
             // The multi-stream head is the one `HyperWidths` states.
             mtp_head: false,
@@ -1906,6 +2173,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
                 PrefillLaunchBounds::PRODUCTION,
             ),
             qsa_bytes,
+            look_ahead_hops: look_ahead_hops(rows),
             ..WaveWidth::prefill(rows, sequences.max(1))
         };
         Some(WavePlan::new(geometry).tier_bytes(width) as u64)
@@ -1989,6 +2257,14 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         // The GDN state is an accumulated sum with no per-token decomposition,
         // and the PLE conv history is likewise irrecoverable from the KV.
         true
+    }
+
+    fn has_recurrent_state(&self, seq: usize) -> bool {
+        self.has_recurrent(seq).unwrap_or(false)
+    }
+
+    fn claim_carried_state(&self, seq: usize) -> Result<()> {
+        Qwen4ExpBatched::claim_carried_state(self, seq)
     }
 
     fn recurrent_memory_count(&self) -> usize {
@@ -2126,6 +2402,16 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         layers: &[ExportedLayerState],
     ) -> Result<bool> {
         Qwen4ExpBatched::restore_recurrent(self, seq, schedule_hash, layers)?;
+        Ok(true)
+    }
+
+    fn stage_recurrent(
+        &self,
+        seq: usize,
+        schedule_hash: u64,
+        layers: Arc<[ExportedLayerState]>,
+    ) -> Result<bool> {
+        Qwen4ExpBatched::stage_recurrent(self, seq, schedule_hash, layers)?;
         Ok(true)
     }
 
@@ -2400,6 +2686,12 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         if let Ok(mut m) = self.recurrent.write() {
             m.clear();
         }
+        if let Ok(mut m) = self.pristine.write() {
+            m.clear();
+        }
+        if let Ok(mut m) = self.staged.write() {
+            m.clear();
+        }
         if let Ok(mut m) = self.ple.write() {
             m.clear();
         }
@@ -2424,6 +2716,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     /// regions for the life of the process while every KV-side diagnostic
     /// reads healthy.
     fn release_sequence(&self, seq: usize) -> Result<()> {
+        self.clear_pristine(seq);
+        if let Ok(mut m) = self.staged.write() {
+            m.remove(&seq);
+        }
         if let Ok(mut m) = self.recurrent.write() {
             m.remove(&seq);
             // **The parked rewind stash goes with the last sequence.** It is
@@ -2854,6 +3150,7 @@ impl WaveSweep for Qwen4ExpBatched {
                         geometry.head_dim,
                         PrefillLaunchBounds::PRODUCTION,
                     ),
+                    look_ahead_hops: look_ahead_hops(total_rows),
                 };
                 let per_phase = [
                     plan.phase_bytes(LayerPhase::Attention, width),
@@ -3934,19 +4231,21 @@ impl Qwen4ExpBatched {
             let g_moe = crate::models::profile::gpu_span(moe_span, dev);
             // The next rows' routers, applied to this layer's input in its own
             // stacked projection: their votes predict those rows' experts for the
-            // expert cache's read-ahead and staging. Decode-width launches only —
-            // a prompt routes most of every row, which leaves nothing to predict —
-            // and only while the cache copies experts often enough to repay them
-            // (`ExpertCache::reads_ahead`).
-            let look_ahead: Vec<&QMatMul> =
-                if total_rows <= LOOK_AHEAD_MAX_TOKENS && layer.moe.routed.cache.reads_ahead() {
-                    m.layers[li + 1..(li + 1 + LOOK_AHEAD_HOPS).min(num_layers)]
-                        .iter()
-                        .map(|l| &l.moe.routed.gate)
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+            // expert cache's read-ahead and staging, while the cache copies
+            // experts often enough to repay them (`ExpertCache::reads_ahead`).
+            // A decode-width launch votes [`LOOK_AHEAD_HOPS`] rows ahead for the
+            // device's read-ahead; a prefill-width one votes on the next row
+            // only, whose voted set the stager reads off the drive while this
+            // layer computes — a prompt routes about half of every row, not all
+            // of it, so the next row's own router is what says which half.
+            let look_ahead: Vec<&QMatMul> = if layer.moe.routed.cache.reads_ahead() {
+                m.layers[li + 1..(li + 1 + look_ahead_hops(total_rows)).min(num_layers)]
+                    .iter()
+                    .map(|l| &l.moe.routed.gate)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // The layer's output in its three parts: the shared expert's gate is
             // applied by the combine below, which reads the block output anyway,
             // rather than by three launches of its own.

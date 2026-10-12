@@ -13,7 +13,16 @@ use core::ffi::c_void;
 
 use crate::rope::RopeRungsFfi;
 
+/// The allocator every launcher's grow-only scratch is taken from: `bytes` of
+/// device memory on device `device`, kept for the life of the process, or null
+/// when none can be had (`grow_scratch.cuh`).
+pub type KernelScratchFn = unsafe extern "C" fn(device: i32, bytes: usize) -> *mut c_void;
+
 extern "C" {
+    /// Install the allocator the launchers' grow-only scratch comes from. Called
+    /// once, before any launch that grows a scratch.
+    pub fn candle_set_kernel_scratch(take: KernelScratchFn);
+
     // ========================================================================
     // Per-dtype dispatchers — persistent slot buffer API
     // Takes a single `headers_ptr` pointing to SlotHeader[num_active_slots] on GPU.

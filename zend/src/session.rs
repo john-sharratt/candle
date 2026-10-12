@@ -43,8 +43,9 @@ use candle_conversation::RecoveredMessage;
 use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
-    ConversationEngine, EngineSource, GlueMarkers, OptionalState, ProjectionEvent, SamplingConfig,
-    SelectionState, Sequence, ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse,
+    ConversationEngine, ConversationError, EngineSource, GlueMarkers, OptionalState,
+    ProjectionEvent, SamplingConfig, SelectionState, Sequence, ThinkSteering, TokenDecoder,
+    TurnEvent, TurnHandle, TurnResponse,
 };
 use host::download::ensure_model_pack;
 use host::process::fatal;
@@ -748,8 +749,8 @@ struct InFlightCase<'a> {
     /// A terminal event the idle wait absorbed: the wait parks on every
     /// in-flight handle and consumes exactly one event from whichever speaks
     /// first, so a `Done`/`Error` it takes has to be carried to the retire
-    /// sweep rather than lost. `Some(Some(_))` completed, `Some(None)` failed.
-    finished: Option<Option<TurnResponse>>,
+    /// sweep rather than lost, and so does the error a failed turn carries.
+    finished: Option<Result<TurnResponse, ConversationError>>,
     /// A prefilled trajectory is complete by construction (it is the validated
     /// exported `.md`) and its `Done` carries no decoded text, so it must NOT be
     /// gated on `resp.text` the way a live decode is.
@@ -903,52 +904,19 @@ const CALIBRATION_BATCH: usize = 16;
 /// window amortises that boundary over eight cases rather than paying it for
 /// one. See the refill site for the measurement.
 const CALIBRATION_REFILL: usize = CALIBRATION_BATCH / 2;
-/// Below this much free host RAM, the window stops refilling regardless of how
-/// many slots are free, and the phase gives up on the remainder rather than
-/// pressing on — see the refill site.
-///
-/// **The concurrency window is the lever here, not the model-load-time expert
-/// warm tier.** A from-empty full calibration (thousands of `kv_lossless`
-/// cases, each pinned so its Q survives to the wide-sig capture) crashed a
-/// 31.5 GiB Windows box with a raw host allocator abort three times running —
-/// `memory allocation of 16777216 bytes failed`, 15–51 % through the corpus,
-/// `vram::available_low_water` reading single-digit MiB in the run that got
-/// furthest. Widening `WARM_TIER_HEADROOM` to cover it was tried and reverted:
-/// that headroom is paid on every boot, and the crate's own regression test for
-/// the everyday case (this same 31.5 GiB machine profile, 20 GiB free at
-/// launch) measured the expert tier dropping to exactly the new shortfall —
-/// "too tight to be worth the pack-file misses it avoids". Calibration's much
-/// larger transient is the rare, one-time-until-the-substrate-exists case, and
-/// backing off ITS OWN concurrency under real memory pressure is what actually
-/// targets it, without taxing steady-state serving at all.
-///
-/// 1 GiB, not tuned to a measured floor the way [`CALIBRATION_BATCH`] was: it
-/// only needs to be comfortably above the ~16 MiB allocation that failed at the
-/// single-digit-MiB troughs measured so far, with headroom for one case's
-/// prefill on top. Revisit once a run this floor actually governed has logged
-/// its own low-water mark.
-const CALIBRATION_HOST_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
-
 /// How many new calibration cases to submit this iteration. Split out of the
 /// refill site so the decision is testable without a live engine — mirrors
 /// `warm_sizing_from` being split out of `warm_slots_for` for the same reason.
 ///
 /// The warm-up case (`!warmed`) always goes in alone, before anything else is
-/// asked of the window, regardless of host pressure: skipping it would leave
-/// the shared tool sections unpinned and break every case after it. Past that,
-/// host pressure overrides the ordinary window-refill cadence outright — no
-/// point amortising a wave boundary over cases that would run the machine out
-/// of memory.
-fn calibration_window_want(
-    free: usize,
-    warmed: bool,
-    inflight_empty: bool,
-    host_tight: bool,
-) -> usize {
+/// asked of the window: skipping it would leave the shared tool sections
+/// unpinned and break every case after it.
+///
+/// Free host RAM is not an input. The phase runs the whole corpus; a host
+/// that runs low is the OS's to page, not a reason to leave cases unrun.
+fn calibration_window_want(free: usize, warmed: bool, inflight_empty: bool) -> usize {
     if !warmed {
         1
-    } else if host_tight {
-        0
     } else if free >= CALIBRATION_REFILL || inflight_empty {
         free
     } else {
@@ -956,65 +924,24 @@ fn calibration_window_want(
     }
 }
 
-/// Whether the calibration phase should stop early rather than wait: nothing
-/// in flight can retire to free room, free RAM is already under
-/// [`CALIBRATION_HOST_FLOOR_BYTES`], and cases remain that would otherwise be
-/// asked for. `warmed` guards the same edge as [`calibration_window_want`] —
-/// the one required case still goes in even under pressure, so this can never
-/// fire before it has.
-fn calibration_should_stop_for_host_pressure(
-    warmed: bool,
-    host_tight: bool,
-    inflight_empty: bool,
-    cases_remain: bool,
-) -> bool {
-    warmed && host_tight && inflight_empty && cases_remain
-}
-
 #[cfg(test)]
 mod calibration_window_tests {
-    use super::{calibration_should_stop_for_host_pressure, calibration_window_want};
+    use super::calibration_window_want;
 
     #[test]
-    fn the_warm_up_case_goes_in_alone_even_under_pressure() {
-        assert_eq!(calibration_window_want(16, false, true, true), 1);
-        assert_eq!(calibration_window_want(16, false, true, false), 1);
+    fn the_warm_up_case_goes_in_alone() {
+        assert_eq!(calibration_window_want(16, false, true), 1);
+        assert_eq!(calibration_window_want(16, false, false), 1);
     }
 
     #[test]
-    fn host_pressure_closes_the_window_regardless_of_free_slots() {
-        assert_eq!(calibration_window_want(16, true, true, true), 0);
-        assert_eq!(calibration_window_want(1, true, false, true), 0);
-    }
-
-    #[test]
-    fn without_pressure_the_ordinary_refill_cadence_holds() {
+    fn the_ordinary_refill_cadence_holds() {
         // Half the window free: refills.
-        assert_eq!(calibration_window_want(8, true, false, false), 8);
+        assert_eq!(calibration_window_want(8, true, false), 8);
         // Fewer than half free, something still running: waits.
-        assert_eq!(calibration_window_want(3, true, false, false), 0);
+        assert_eq!(calibration_window_want(3, true, false), 0);
         // Nothing in flight regardless of the count: the tail case.
-        assert_eq!(calibration_window_want(3, true, true, false), 3);
-    }
-
-    #[test]
-    fn stopping_needs_pressure_nothing_in_flight_and_work_left() {
-        assert!(calibration_should_stop_for_host_pressure(
-            true, true, true, true
-        ));
-        // Any one condition missing and it must not stop.
-        assert!(!calibration_should_stop_for_host_pressure(
-            false, true, true, true
-        )); // not warmed yet
-        assert!(!calibration_should_stop_for_host_pressure(
-            true, false, true, true
-        )); // no pressure
-        assert!(!calibration_should_stop_for_host_pressure(
-            true, true, false, true
-        )); // still work in flight to retire
-        assert!(!calibration_should_stop_for_host_pressure(
-            true, true, true, false
-        )); // nothing left to submit anyway
+        assert_eq!(calibration_window_want(3, true, true), 3);
     }
 }
 
@@ -1840,6 +1767,7 @@ impl InferenceState {
             let mut inflight: Vec<InFlightCase<'_>> = Vec::new();
             let retire_completed = |inflight: &mut Vec<InFlightCase<'_>>,
                                     done: &mut usize,
+                                    sealed: &mut usize,
                                     reclaim: &mut Vec<TimelineId>,
                                     timing: &mut CalibTiming|
              -> bool {
@@ -1853,8 +1781,8 @@ impl InferenceState {
                         Some(t) => Some(t),
                         None => loop {
                             match inflight[i].handle.try_recv() {
-                                Some(TurnEvent::Done(resp)) => break Some(Some(resp)),
-                                Some(TurnEvent::Error(_)) => break Some(None),
+                                Some(TurnEvent::Done(resp)) => break Some(Ok(resp)),
+                                Some(TurnEvent::Error(e)) => break Some(Err(e)),
                                 Some(TurnEvent::Projection(ev)) => collected.push(ev),
                                 Some(_) => {}
                                 None => break None,
@@ -1874,7 +1802,7 @@ impl InferenceState {
                                 exemplars,
                             } = inflight.remove(i);
                             match result {
-                                Some(resp) if is_prefill || resp.text.contains("</tool_call>") => {
+                                Ok(resp) if is_prefill || resp.text.contains("</tool_call>") => {
                                     seal_calibration_turn(
                                         &mut conv, handle, &resp, name, events, timing,
                                     );
@@ -1899,18 +1827,23 @@ impl InferenceState {
                                         name,
                                         timing,
                                     );
-                                    // Retired: its sealed K/V is never attended
-                                    // again (only the persisted wide-Q sig is),
-                                    // so queue its timeline for hot→warm demotion
-                                    // to keep calibration's VRAM footprint flat.
-                                    reclaim.push(conv.timeline_id());
+                                    *sealed += 1;
                                 }
-                                Some(_) => tracing::warn!(
+                                Ok(_) => tracing::warn!(
                                     tool = name,
                                     "calibration trajectory incomplete — left un-archived for retry"
                                 ),
-                                None => tracing::warn!(tool = name, "calibration case failed"),
+                                Err(e) => {
+                                    tracing::warn!(tool = name, "calibration case failed: {e}")
+                                }
                             }
+                            // Retired either way, and its sealed K/V is never
+                            // attended again — only a persisted wide-Q sig is,
+                            // and an un-archived case is regenerated whole next
+                            // boot. A turn group that lost one case still sealed
+                            // the rest, so its timeline is demoted hot→warm like
+                            // any other to keep calibration's VRAM footprint flat.
+                            reclaim.push(conv.timeline_id());
                             *done += exemplars;
                             progress.set_step_progress(*done as u64, total as u64);
                             retired = true;
@@ -1926,14 +1859,23 @@ impl InferenceState {
             // prompt is what precedes it, minus the trailing `user_end`.
             let assistant_start = conv_config.dialect.assistant_start;
             let user_end = conv_config.dialect.user_end;
+            // What the completion line reports, counted rather than derived:
+            // exemplars the resume filter found sealed, and submissions — a
+            // question group is one submission carrying many exemplars, so the
+            // two units are kept apart.
+            let resumed_exemplars = done;
+            let submissions = to_run.len();
             let mut to_run_iter = to_run.into_iter();
             let mut warmed = false;
-            // Timelines of archived (retired) calibration cases, awaiting hot→warm
-            // demotion. Their sealed K/V is never attended again — only the
-            // persisted wide-Q sig is — so dropping the hot copy as they retire
+            // Timelines of retired calibration cases, sealed or not, awaiting
+            // hot→warm demotion. Their sealed K/V is never attended again — only
+            // the persisted wide-Q sig is — so dropping the hot copy as they retire
             // keeps the phase's VRAM footprint flat instead of letting 700+ cases'
             // lossless K/V pile up hot and OOM the next phase's first prefill.
             let mut calib_timelines: Vec<TimelineId> = Vec::new();
+            // Submissions sealed and archived — counted as they retire, never
+            // read off `calib_timelines`, which holds failed ones too.
+            let mut sealed = 0usize;
             // Index into `calib_timelines` up to which we've already demoted, so
             // each incremental sweep only re-demotes the fresh tail.
             let mut reclaimed_up_to = 0usize;
@@ -1959,34 +1901,7 @@ impl InferenceState {
                 // than the threshold, so nothing is running to wait behind and
                 // the block must be issued at whatever size is left.
                 let free = CALIBRATION_BATCH.saturating_sub(inflight.len());
-                // Host-RAM backpressure — see `CALIBRATION_HOST_FLOOR_BYTES`.
-                // Checked live (not from the low-water mark, which only ever
-                // falls) so the window reopens once retiring cases free room.
-                let host_tight = vram::available_physical_ram()
-                    .is_some_and(|free_bytes| free_bytes < CALIBRATION_HOST_FLOOR_BYTES);
-                let inflight_empty = inflight.is_empty();
-                let cases_remain = !to_run_iter.as_slice().is_empty();
-                if calibration_should_stop_for_host_pressure(
-                    warmed,
-                    host_tight,
-                    inflight_empty,
-                    cases_remain,
-                ) {
-                    // Nothing left in flight to retire and free room, and free
-                    // RAM is already under the floor: waiting here cannot help.
-                    // Stop cleanly rather than press on into the allocator abort
-                    // this floor exists to avoid — a case is individually
-                    // archived and resumed on the next boot, so nothing sealed
-                    // so far is lost.
-                    tracing::warn!(
-                        free_low_water_mib = vram::available_low_water().map(|b| b / (1024 * 1024)),
-                        remaining = to_run_iter.as_slice().len(),
-                        "calibrating sections: host RAM too tight to continue safely; \
-                         stopping early, remaining cases resume on the next boot"
-                    );
-                    break;
-                }
-                let want = calibration_window_want(free, warmed, inflight_empty, host_tight);
+                let want = calibration_window_want(free, warmed, inflight.is_empty());
                 let batch: Vec<&CalibCase<'_>> =
                     (0..want).map_while(|_| to_run_iter.next()).collect();
                 let created_any = !batch.is_empty();
@@ -2013,7 +1928,9 @@ impl InferenceState {
                         Ok(conv) => conv,
                         Err(e) => {
                             tracing::warn!(tool = name, "calibration create failed: {e}");
-                            done += 1;
+                            // The whole case's exemplars, as a failed submit
+                            // forfeits — a group is one creation carrying many.
+                            done += case.exemplars();
                             progress.set_step_progress(done as u64, total as u64);
                             continue;
                         }
@@ -2173,10 +2090,7 @@ impl InferenceState {
                                         // Sig captured — mark for distillation so
                                         // compaction sheds the trajectory content.
                                         mark_calibration_distill(&engine, conv.timeline_id(), name, &mut timing);
-                                        // Queue for hot→warm demotion (see the retire
-                                        // path) so the warm-up case's K/V is reclaimed
-                                        // like every other case's.
-                                        calib_timelines.push(conv.timeline_id());
+                                        sealed += 1;
                                     }
                                     Some(_) => tracing::warn!(
                                         tool = name,
@@ -2184,6 +2098,10 @@ impl InferenceState {
                                     ),
                                     None => {}
                                 }
+                                // Queued for hot→warm demotion whatever its outcome
+                                // (see the retire path), so the warm-up case's K/V
+                                // is reclaimed like every other case's.
+                                calib_timelines.push(conv.timeline_id());
                                 done += case.exemplars();
                                 progress.set_step_progress(done as u64, total as u64);
                             } else {
@@ -2223,8 +2141,13 @@ impl InferenceState {
                 // is lost. Driven by `block_on` because this is the loader
                 // thread: the futures wake on the engine's own channels, so no
                 // timer or I/O driver is needed.
-                if !retire_completed(&mut inflight, &mut done, &mut calib_timelines, &mut timing)
-                    && !inflight.is_empty()
+                if !retire_completed(
+                    &mut inflight,
+                    &mut done,
+                    &mut sealed,
+                    &mut calib_timelines,
+                    &mut timing,
+                ) && !inflight.is_empty()
                 {
                     timing.time(
                         |t| &mut t.idle,
@@ -2240,8 +2163,13 @@ impl InferenceState {
                             };
                             let case = &mut inflight[which];
                             match event {
-                                Some(TurnEvent::Done(resp)) => case.finished = Some(Some(resp)),
-                                Some(TurnEvent::Error(_)) | None => case.finished = Some(None),
+                                Some(TurnEvent::Done(resp)) => case.finished = Some(Ok(resp)),
+                                Some(TurnEvent::Error(e)) => case.finished = Some(Err(e)),
+                                None => {
+                                    case.finished = Some(Err(ConversationError::Channel(
+                                        "the turn's event channel closed before it finished".into(),
+                                    )))
+                                }
                                 Some(TurnEvent::Projection(ev)) => case.events.push(ev),
                                 Some(_) => {}
                             }
@@ -2292,12 +2220,18 @@ impl InferenceState {
                 tracing::warn!("calibration boundary hot→warm demote failed: {e}");
             }
             timing.log(calib_start.elapsed());
+            // `resumed_exemplars` is counted by the resume filter and `sealed` as
+            // each submission seals, never one unit less another. `failed` is the
+            // rest of the submissions — every one submitted either sealed or did
+            // not, each failure logged with its cause as it retired.
+            let failed = submissions.saturating_sub(sealed);
             progress.set_step_progress(total as u64, total as u64);
             tracing::info!(
-                cases = total,
-                resumed = total.saturating_sub(calib_timelines.len()),
-                ran = calib_timelines.len(),
-                demoted_timelines = calib_timelines.len(),
+                exemplars = total,
+                resumed_exemplars,
+                submissions,
+                sealed,
+                failed,
                 free_low_water_mib = vram::available_low_water().map(|b| b / (1024 * 1024)),
                 "calibrating sections complete"
             );

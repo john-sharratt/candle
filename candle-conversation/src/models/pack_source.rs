@@ -214,23 +214,9 @@ pub(crate) fn resolve_spec(
     let root = cache_root();
     if spec.prepared_from_source {
         let tokenizer = |repo: &str, rev: &str| fetch.tokenizer_json(repo, rev);
+        // The card's rung: the preset names the model, and every rung holds it.
         let pack = prepared_engine_pack(device, pack_mode(spec.arch, device), &tokenizer)
             .map_err(ConversationError::Model)?;
-        // The engine pack is this card's rung; a preset naming another rung's
-        // artifact would otherwise be served this one under its name.
-        let built_from = ModelPack::open(&pack)
-            .map_err(ConversationError::Model)?
-            .sources
-            .first()
-            .map(|s| s.file.clone())
-            .unwrap_or_default();
-        if built_from != spec.model_filename {
-            return Err(ConversationError::Other(format!(
-                "this card's engine rung is {built_from}, and the preset names {} — pick the \
-                 preset for this card's rung",
-                spec.model_filename
-            )));
-        }
         return ResolvedModel::open(pack);
     }
     let base = spec_request(spec, device);

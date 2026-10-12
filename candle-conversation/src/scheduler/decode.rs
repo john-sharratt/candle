@@ -7,6 +7,7 @@ use super::*;
 use crate::recorded_reply::{departure, replayed_step};
 use crate::stats::streams_committed;
 use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
+use candle_transformers::models::held_tensor::hold_rows;
 use candle_transformers::models::speculative_choice::AcceptWalk;
 
 /// The leading tokens of a healed token, waiting to be forwarded.
@@ -496,7 +497,7 @@ impl Scheduler {
                     .and_then(|r| r.unsqueeze(0))
             })
             .collect();
-        let (row_list, stacked) = match shaped.and_then(|r| Tensor::cat(&r, 0).map(|s| (r, s))) {
+        let (row_list, stacked) = match shaped.and_then(|r| hold_rows(&r).map(|s| (r, s))) {
             Ok(pair) => pair,
             Err(e) => {
                 self.fail_all_decodes(&ids, &format!("stencil continuation rows: {e}"));

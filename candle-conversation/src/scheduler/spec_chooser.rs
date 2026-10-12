@@ -48,6 +48,7 @@ use candle_transformers::models::speculative_choice::{SpecRow, TypicalAcceptance
 
 use crate::batched_sampler::{BatchedSampler, RowSpec, Scored, SequenceSamplingState};
 use crate::config::SamplingConfig;
+use candle_transformers::models::held_tensor::hold_rows;
 
 /// The scheduler's chooser for one speculative step.
 ///
@@ -242,7 +243,7 @@ pub(super) fn locate_rows(
             .flatten()
             .map(|t| t.flatten_all()?.unsqueeze(0))
             .collect::<Result<_>>()?;
-        let joined = Tensor::cat(&rows, 0)?;
+        let joined = hold_rows(&rows)?;
         let mut next = 0;
         let positions = per_seq
             .iter()

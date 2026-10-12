@@ -63,6 +63,7 @@ use super::reclaim::ReclaimClock;
 use super::residency::Residency;
 use super::types::PipelineStats;
 use super::warm_tier::WarmTier;
+use candle::direct_io::AlignedScratch;
 use candle::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -84,6 +85,15 @@ pub(crate) const NVME_QD: usize = 8;
 /// pack misses rose 25–54% (×1–×8) and its pack-miss time with them (×8:
 /// ~15.9 → 20.5 s per interval).
 const SPEC_IN_FLIGHT: usize = NVME_QD / 2;
+
+/// Adjacent pack records a reader serves in one request (≈ 15 MiB at the
+/// Q3_KO rung's 1.9 MiB stride): a wide prefill's cold set, queued in expert
+/// order, reads its neighbouring experts together, paying the drive's
+/// per-request cost once. (Measured at first while the pack's reads were
+/// serialised by a cached view of the file — `direct_io::open_direct` — where
+/// it was worth 12%; with the reads overlapped the drive is full at eight
+/// single-record requests, and runs only trim the request count.)
+const RUN_RECORDS: usize = 8;
 
 /// Rows ahead of the one just begun that the stager's lookahead stages for.
 const LOOKAHEAD_ROWS: usize = 2;
@@ -115,12 +125,14 @@ pub(crate) enum StagerMsg {
     /// The predictor expects `row` to route to `experts`: stage the cold ones
     /// ahead of it.
     Stage { row: usize, experts: Vec<usize> },
-    /// A reader finished pad slot `slot`.
+    /// A reader finished pad slot `slot`. `opens_request` on the first record
+    /// of each request a reader made, so the requests can be counted.
     Landed {
         slot: usize,
         result: Result<()>,
         read_ns: u64,
         source: ReadSource,
+        opens_request: bool,
     },
 }
 
@@ -205,8 +217,27 @@ struct Stager {
     /// next message (a landing, a routed row, a prediction) before looking
     /// again, instead of spinning on the same answer.
     spec_stalled: bool,
+    /// The row last begun was wide ([`wide_row`]): a prefill's, whose next row
+    /// is read ahead whole and whose speculative reads may use every reader.
+    wide: bool,
     last_row: Option<usize>,
     disconnected: bool,
+}
+
+/// The share of a layer's experts a row must route to count as wide
+/// (`1 / WIDE_ROW_SHARE`).
+const WIDE_ROW_SHARE: usize = 4;
+
+/// Whether a row routing `routed` of a layer's `n_experts` is a wide one — a
+/// prefill wave's, whose successor's voted set is staged ahead and whose
+/// speculative reads may use every reader.
+///
+/// A decode row routes a few experts per token; a prefill row of a few hundred
+/// tokens or more routes about half its layer. The second's staging keeps the
+/// drive busy through the layer; the first keeps half the readers free for its
+/// demand.
+fn wide_row(routed: usize, n_experts: usize) -> bool {
+    n_experts > 0 && routed * WIDE_ROW_SHARE >= n_experts
 }
 
 /// Whether an evicted pad slot of `row`, whose entry is already emptied, may be
@@ -276,6 +307,7 @@ pub(crate) fn spawn_stager(
         spec_loads: HashMap::new(),
         predicted_ahead: HashSet::new(),
         spec_stalled: false,
+        wide: false,
         last_row: None,
         disconnected: false,
     };
@@ -298,7 +330,20 @@ pub(crate) fn spawn_stager(
     Ok(tx)
 }
 
-/// A reader: one pack handle, one job at a time, demand jobs first.
+impl Source {
+    /// Whether `next`'s record follows this one's in the pack: the same row,
+    /// the next expert — so one read serves both.
+    fn continued_by(&self, next: &Source) -> bool {
+        matches!(
+            (self, next),
+            (Source::Pack { row, expert }, Source::Pack { row: r, expert: e })
+                if r == row && *e == expert + 1
+        )
+    }
+}
+
+/// A reader: one pack handle, demand jobs first, and a queued run of adjacent
+/// pack records — up to [`RUN_RECORDS`] — in one request.
 fn reader(
     handle: usize,
     jobs: &ReadQueue<ReadJob>,
@@ -307,29 +352,76 @@ fn reader(
     warm: &WarmTier,
     pad: &Pad,
 ) {
-    while let Some(job) = jobs.pop() {
+    let stride = pad.stride();
+    let mut bounce = AlignedScratch::new();
+    while let Some(run) = jobs.pop_run(RUN_RECORDS, |a, b| a.source.continued_by(&b.source)) {
         let t = Instant::now();
-        // SAFETY: the stager hands slot `job.slot` to exactly one reader and
-        // neither publishes nor reuses it until this job reports back.
-        let dest = unsafe { pad.slot_mut(job.slot) };
-        let (result, source) = match job.source {
-            Source::Pack { row, expert } => (
-                pack.read_into_with_handle(handle, row, expert, dest),
-                ReadSource::Pack,
-            ),
-            Source::Warm(slot) => {
-                dest.copy_from_slice(warm.slot_ref(slot, pad.stride()));
-                (Ok(()), ReadSource::Paged)
+        let landed: Vec<(usize, Result<()>, ReadSource)> = match (run.len(), &run[0].source) {
+            (1, source) => {
+                let job = &run[0];
+                // SAFETY: the stager hands slot `job.slot` to exactly one reader
+                // and neither publishes nor reuses it until this job reports back.
+                let dest = unsafe { pad.slot_mut(job.slot) };
+                let (result, from) = match *source {
+                    Source::Pack { row, expert } => (
+                        pack.read_run_with_handle(handle, row, expert, dest),
+                        ReadSource::Pack,
+                    ),
+                    Source::Warm(slot) => {
+                        dest.copy_from_slice(warm.slot_ref(slot, stride));
+                        (Ok(()), ReadSource::Paged)
+                    }
+                };
+                vec![(job.slot, result, from)]
             }
+            (n, &Source::Pack { row, expert }) => {
+                let read = bounce
+                    .ensure(n * stride)
+                    .map_err(|e| candle::Error::Msg(format!("expert reader: bounce buffer: {e}")))
+                    .and_then(|()| {
+                        pack.read_run_with_handle(
+                            handle,
+                            row,
+                            expert,
+                            bounce.as_mut_slice(n * stride),
+                        )
+                    });
+                let read = read.map_err(|e| e.to_string());
+                run.iter()
+                    .enumerate()
+                    .map(|(i, job)| {
+                        let result = match &read {
+                            Ok(()) => {
+                                // SAFETY: as above — the stager handed this
+                                // reader each slot of the run.
+                                let dest = unsafe { pad.slot_mut(job.slot) };
+                                dest.copy_from_slice(
+                                    &bounce.as_slice(n * stride)[i * stride..(i + 1) * stride],
+                                );
+                                Ok(())
+                            }
+                            Err(e) => Err(candle::Error::Msg(e.clone())),
+                        };
+                        (job.slot, result, ReadSource::Pack)
+                    })
+                    .collect()
+            }
+            (_, Source::Warm(_)) => unreachable!("a run extends only over pack records"),
         };
-        let msg = StagerMsg::Landed {
-            slot: job.slot,
-            result,
-            read_ns: t.elapsed().as_nanos() as u64,
-            source,
-        };
-        if done.send(msg).is_err() {
-            return;
+        // Each record's share of the request, so the read-latency figures and
+        // the miss-cost model stay per record.
+        let read_ns = t.elapsed().as_nanos() as u64 / landed.len() as u64;
+        for (i, (slot, result, source)) in landed.into_iter().enumerate() {
+            let msg = StagerMsg::Landed {
+                slot,
+                result,
+                read_ns,
+                source,
+                opens_request: i == 0,
+            };
+            if done.send(msg).is_err() {
+                return;
+            }
         }
     }
 }
@@ -401,6 +493,7 @@ impl Stager {
                 result,
                 read_ns,
                 source,
+                opens_request,
             } => {
                 result?;
                 self.in_flight -= 1;
@@ -419,6 +512,9 @@ impl Stager {
                 let slow = self.ctx.stats.lock().is_ok_and(|mut s| {
                     s.staged_bytes += self.ctx.pad.stride();
                     s.stage_read_ns += read_ns;
+                    if opens_request && source == ReadSource::Pack {
+                        s.pack_requests += 1;
+                    }
                     match source {
                         ReadSource::Pack => s.pack_reads.record(read_ns),
                         ReadSource::Paged => s.paged_reads.record(read_ns),
@@ -492,6 +588,11 @@ impl Stager {
             .count();
         self.predicted_ahead.retain(|&(r, _)| r != row);
         self.spec.retain(|s| s.row != row);
+        // By what the row routes, not by what is still cold: staged ahead, a
+        // prefill row's cold set shrinks below the mark at ×2, which took its
+        // speculative reads back to half the readers and left ~3,300 of its
+        // successor's stagings unstarted a config (Flash-Next, 16 GB laptop).
+        self.wide = wide_row(routed.iter().filter(|&&r| r).count(), self.ctx.n_experts);
         self.look_ahead(row);
         if let Ok(mut s) = self.ctx.stats.lock() {
             s.staged_ahead_routed += hit.len();
@@ -618,6 +719,19 @@ impl Stager {
             d.unassigned.clear();
             return Ok(abandoned);
         }
+        // Queued together once the loop ends, in expert order, so the readers
+        // find the row's adjacent records side by side and read them as runs.
+        let mut batch = Vec::new();
+        let assigned = self.assign_slots(d, &mut batch);
+        if !batch.is_empty() && !self.jobs.push_all(batch, Priority::Demand) {
+            candle::bail!("expert stager: readers gone");
+        }
+        assigned
+    }
+
+    /// The slot-assigning loop of [`Self::assign_into`], each started read's
+    /// job added to `batch`.
+    fn assign_slots(&mut self, d: &mut Demand, batch: &mut Vec<ReadJob>) -> Result<bool> {
         let mut progressed = false;
         while let Some(&e) = d.unassigned.front() {
             let slot = match self.book.take_free() {
@@ -653,7 +767,7 @@ impl Stager {
                 }
             };
             d.unassigned.pop_front();
-            self.issue(slot, d.row, e, Priority::Demand)?;
+            batch.push(self.start(slot, d.row, e, Priority::Demand)?);
             d.pending.insert(e);
             progressed = true;
         }
@@ -687,6 +801,22 @@ impl Stager {
 
     /// Start `(row, expert)`'s read into `slot`.
     fn issue(&mut self, slot: usize, row: usize, expert: usize, priority: Priority) -> Result<()> {
+        let job = self.start(slot, row, expert, priority)?;
+        if !self.jobs.push(job, priority) {
+            candle::bail!("expert stager: readers gone");
+        }
+        Ok(())
+    }
+
+    /// Book `(row, expert)`'s read into `slot` as started, and return the job
+    /// for the readers — for [`Self::issue`], or for a batch queued at once.
+    fn start(
+        &mut self,
+        slot: usize,
+        row: usize,
+        expert: usize,
+        priority: Priority,
+    ) -> Result<ReadJob> {
         let source = self.source(row, expert)?;
         let ahead = priority == Priority::Speculative;
         self.book.start_load(slot, row, expert, ahead);
@@ -695,10 +825,7 @@ impl Stager {
             self.spec_loads.insert((row, expert), slot);
         }
         self.in_flight += 1;
-        if !self.jobs.push(ReadJob { slot, source }, priority) {
-            candle::bail!("expert stager: readers gone");
-        }
-        Ok(())
+        Ok(ReadJob { slot, source })
     }
 
     /// Where `(row, expert)`'s record comes from: its pageable warm slot, or
@@ -728,7 +855,11 @@ impl Stager {
             return Ok(false);
         }
         let mut progressed = false;
-        while self.spec_loads.len() < SPEC_IN_FLIGHT {
+        // A wide row's read-ahead is the next layer whole, and the readers
+        // still take demand jobs first, so it may use every reader; decode's
+        // scored lookahead keeps half of them free for demand.
+        let cap = if self.wide { NVME_QD } else { SPEC_IN_FLIGHT };
+        while self.spec_loads.len() < cap {
             let Some(&SpecRead {
                 row,
                 expert: e,
@@ -772,6 +903,9 @@ impl Stager {
                             self.spec.pop_front();
                             continue;
                         }
+                        if let Ok(mut s) = self.ctx.stats.lock() {
+                            s.spec_stalls_no_slot += 1;
+                        }
                         self.spec_stalled = true;
                         break;
                     };
@@ -779,6 +913,9 @@ impl Stager {
                         // Its row began an invocation between the choice and
                         // the store: look again once something has moved.
                         drop(r);
+                        if let Ok(mut s) = self.ctx.stats.lock() {
+                            s.spec_stalls_in_use += 1;
+                        }
                         self.spec_stalled = true;
                         break;
                     }
@@ -806,7 +943,18 @@ impl Stager {
 
 #[cfg(test)]
 mod tests {
-    use super::{demand_left_behind, overwritable};
+    use super::{demand_left_behind, overwritable, wide_row};
+
+    /// A quarter of the layer routed is wide; less is not, and an empty layer
+    /// never is.
+    #[test]
+    fn a_row_is_wide_from_a_quarter_of_its_layer_routed() {
+        assert!(wide_row(128, 512));
+        assert!(wide_row(512, 512));
+        assert!(!wide_row(127, 512));
+        assert!(!wide_row(10, 512));
+        assert!(!wide_row(0, 0));
+    }
 
     /// The demand stands while the GPU is inside its invocation or behind it
     /// (the stager can be ahead of the device), and is left behind only once a

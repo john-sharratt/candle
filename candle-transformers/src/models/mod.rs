@@ -259,6 +259,8 @@ pub mod voxtral;
 // Admits/rolls back a wave's KV across the batched forward — both callers are
 // the CUDA batched path.
 #[cfg(feature = "cuda")]
+pub mod held_tensor;
+#[cfg(feature = "cuda")]
 mod wave_admit;
 #[cfg(feature = "cuda")]
 pub mod wave_buffers;

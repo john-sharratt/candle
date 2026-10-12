@@ -1,5 +1,4 @@
-//! Qwen3.8-Flash-Next (sparse-attention MoE) model presets — one per KO expert
-//! rung.
+//! Qwen3.8-Flash-Next (sparse-attention MoE) model preset.
 //!
 //! 250 B total, ~13 B active, 48 layers at 3:1 — 36 gated-DeltaNet layers
 //! carrying a recurrent state to 12 attention layers carrying paged K/V — plus
@@ -23,52 +22,41 @@
 //! table of `unsloth/Qwen3.8-Flash-Next-GGUF` verbatim, the MTP draft head
 //! (`MTP/` of the same repo) folded in as `blk.{num_layers}`, and the routed
 //! experts at the width of the card's rung — `Q4_KO` imported bit-exactly from
-//! `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`, or `Q3_KO` requantized from the
-//! `Q8_0` split (`candle_transformers::models::quant_ladder`). The artifact is
-//! named by its recipe's digest (`qwen4exp::prepare`), and the engine loads the
-//! model pack built from it — which releases the artifact once it holds it.
+//! `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` on a card of 64 GiB and up, `Q3_KO`
+//! requantized from the `Q8_0` split below that
+//! (`candle_transformers::models::quant_ladder`). The artifact is named by its
+//! recipe's digest (`qwen4exp::prepare`), and the engine loads the model pack
+//! built from it — which releases the artifact once it holds it.
 //!
-//! Each rung is its own preset because each is its own artifact: the file a
-//! preset names is the one its recipe builds, so a machine loads exactly what
-//! its rung's recipe produced and nothing older.
+//! # One model on every card
 //!
-//! [`ModelSpec::prepared_from_source`] marks that, so resolution builds the
-//! pack only from an artifact already prepared on this machine
-//! (`quantized_qwen38_moe::prepared_engine_pack`) instead of asking the hub for
-//! a filename nobody published.
+//! The rung is the card's, not the preset's: the one preset loads whichever
+//! rung's pack this card's VRAM calls for. Every rung holds the same release,
+//! so the model is named by the release's trunk and draft-head sources
+//! (`quantized_qwen38_moe::engine_model_digest`) rather than by the artifact a
+//! card built, and a substrate written on one card opens on another.
+//!
+//! [`ModelSpec::prepared_from_source`] marks that the artifact is prepared, so
+//! resolution builds the pack only from an artifact already prepared on this
+//! machine (`quantized_qwen38_moe::prepared_engine_pack`) instead of asking the
+//! hub for a filename nobody published.
 
 use super::{ModelArch, ModelSpec, RopePreset};
 use crate::{config::SamplingConfig, models::DialectType};
-use candle::quantized::GgmlDType;
 use candle_transformers::models::quantized_qwen38_moe;
 
 const PROMPT: &str = "You are a helpful, accurate, and concise assistant.";
 
-/// The engine artifact of the rung whose routed experts are `experts`, named by
-/// its recipe (`quantized_qwen38_moe::engine_recipe_at`), so a change to what
-/// the build would produce names a different file and the old one is not loaded.
-pub fn engine_gguf(experts: GgmlDType) -> String {
-    quantized_qwen38_moe::engine_recipe_at(Some(experts)).artifact_name()
-}
+/// The name the model goes by: the release's, with no rung in it, since the
+/// rung a card loads is that card's.
+pub const MODEL_NAME: &str = "Qwen3.8-Flash-Next.gguf";
 
-/// Qwen3.8-Flash-Next, `Q4_KO` experts over a `Q8_0` trunk — the rung for cards
-/// of 64 GiB and up.
+/// Qwen3.8-Flash-Next at this card's rung.
 ///
 /// Resident footprint is the dense weights plus whatever expert working set
 /// fits — ~54 GB on a 72 GB card, with the three-tier expert cache paging the
 /// rest. As with every MoE here, parameter count does not decide feasibility.
-pub(super) fn qwen38_flash_next_q4ko() -> ModelSpec {
-    flash_next(GgmlDType::Q4_KO)
-}
-
-/// Qwen3.8-Flash-Next, `Q3_KO` experts — the rung for every card under 64 GiB,
-/// the 16 GB laptop and the 24 GB RTX 3090 among them.
-pub(super) fn qwen38_flash_next_q3ko() -> ModelSpec {
-    flash_next(GgmlDType::Q3_KO)
-}
-
-/// The preset whose artifact carries `experts`.
-fn flash_next(experts: GgmlDType) -> ModelSpec {
+pub(super) fn qwen38_flash_next() -> ModelSpec {
     // Qwen3.5/3.8 share ChatML's markers but suppress thinking by opening the
     // assistant turn with an already-closed think block — Qwen3's `/no_think`
     // marker does nothing on this lineage.
@@ -80,12 +68,12 @@ fn flash_next(experts: GgmlDType) -> ModelSpec {
         // The repo the engine artifact is BUILT FROM. Nothing here publishes
         // `model_filename`; see the module docs.
         model_repo: quantized_qwen38_moe::QWEN4EXP_REPO.into(),
-        model_filename: engine_gguf(experts),
+        model_filename: MODEL_NAME.into(),
         prepared_from_source: true,
         // Nothing to pin: the engine GGUF is built locally from
         // `model_repo`'s published files, so there is no upstream commit that
         // names these bytes. The recipe pins the build's inputs, and its digest
-        // is in the filename above.
+        // is in the artifact's filename.
         model_rev: String::new(),
         // Used as prepared — no override displaced a preset here, so there is no
         // base checkpoint to fall back to for tensors this one got wrong.
@@ -122,15 +110,13 @@ mod tests {
     use super::*;
     use candle_transformers::models::model_pack::cache_root;
 
-    /// **Each rung names the artifact its own recipe builds**, and the two are
-    /// distinct files — a card never loads another rung's experts.
+    /// **The preset names the release, not a rung**: no expert width in its
+    /// name, so the same preset is the model on every card.
     #[test]
-    fn each_rung_names_its_recipes_artifact() {
-        let q3 = qwen38_flash_next_q3ko().model_filename;
-        let q4 = qwen38_flash_next_q4ko().model_filename;
-        assert_eq!(q3, "Qwen3.8-Flash-Next-Q3_KOEXP-503c2f2d6ead.gguf");
-        assert!(q4.starts_with("Qwen3.8-Flash-Next-Q4_KOEXP-"), "{q4}");
-        assert!(q3 != q4);
+    fn the_preset_names_the_release() {
+        let spec = qwen38_flash_next();
+        assert_eq!(spec.model_filename, "Qwen3.8-Flash-Next.gguf");
+        assert!(spec.prepared_from_source);
     }
 
     /// **The gate prepares where the loader looks**: the artifact lands in the
@@ -140,7 +126,7 @@ mod tests {
     /// missing by the probe beside it.
     #[test]
     fn the_gates_artifact_dir_is_the_loaders() {
-        let spec = qwen38_flash_next_q3ko();
+        let spec = qwen38_flash_next();
         assert_eq!(
             quantized_qwen38_moe::engine_artifact_dir(),
             cache_root().join(spec.model_repo.replace('/', "--"))

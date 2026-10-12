@@ -1580,11 +1580,18 @@ pub struct StreamRuntime {
     /// projection layer decodes). Eager bytes rather than a `RecordLoc`: the
     /// per-turn timeline is tiny, so we keep it resident and re-emit it on
     /// compaction like the other synthesised per-entity records.
-    pub projection_events: Option<Vec<u8>>,
+    ///
+    /// Shared rather than owned, like `index_page`: maintenance re-emits every
+    /// live blob, and an owned one is copied into the op's plan and held there
+    /// for the whole op.
+    pub projection_events: Option<Arc<[u8]>>,
     /// Opaque encoded wide-Q signature window (`provenance::wide_sig`) for this turn's most
     /// recent (re)projection — the decode→decode (`Q·Q`) consensus substrate. Last-writer-wins;
     /// rebuilt from the redo log on replay. `None` until the first projection writes it.
-    pub wide_q_sigs: Option<Vec<u8>>,
+    ///
+    /// Per-token × heads × words, so hundreds of KB a turn — shared for the
+    /// same reason as `projection_events`.
+    pub wide_q_sigs: Option<Arc<[u8]>>,
     /// The QSA index page of a turn or a prompt section — the compressed index
     /// rows covering exactly its tokens, as sealed. Last-writer-wins, rebuilt
     /// from the redo log on replay, `None` for a piece sealed by a model that
@@ -4664,7 +4671,7 @@ impl Substrate {
         if !take(&mut entry.ids.projection_events, id) {
             return;
         }
-        entry.projection_events = Some(payload);
+        entry.projection_events = Some(payload.into());
         self.gallery_epoch += 1;
         // Drop this stream's memoized seams so an apply after the seam cache
         // warmed cannot serve stale ones.
@@ -4686,7 +4693,7 @@ impl Substrate {
         if !take(&mut entry.ids.wide_q_sigs, id) {
             return;
         }
-        entry.wide_q_sigs = Some(payload);
+        entry.wide_q_sigs = Some(payload.into());
         self.gallery_epoch += 1;
         let logical = self.streams.logical_id(key);
         self.evict_decoded_wide_sig(logical);

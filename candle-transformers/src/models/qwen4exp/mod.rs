@@ -61,6 +61,7 @@ pub mod ple_fused;
 pub mod prepare;
 pub mod qsa;
 pub mod qsa_select;
+pub mod record_windows;
 #[cfg(feature = "cuda")]
 pub mod resident_page;
 pub mod rope;

@@ -13,10 +13,13 @@
 //!      └────────┴───────┴────────┴────────┘            └────────┴──────┴────────┘
 //! ```
 //!
-//! **The persistence staging block** is the one span with a fixed address. The
-//! persistence thread stages on its own copy stream, on a schedule that has
-//! nothing to do with a wave's, so its ranges can be live at any moment a
-//! forward begins — it therefore sits at the far left, where nothing reaches it.
+//! **The fixed block** (`persist` above) is the one span with a fixed address,
+//! and it holds two tenants. The persistence thread stages on its own copy
+//! stream, on a schedule that has nothing to do with a wave's, so its ranges can
+//! be live at any moment a forward begins; and the held ground
+//! ([`super::held_ground`]) serves the buffers that outlive every forward and
+//! may be taken inside one. Both therefore sit at the far left, where nothing
+//! reaches them.
 //!
 //! **The KV side** hands out whole regions, lowest-index-first, so live arenas
 //! stay left-packed and `W` can move. `create_arena` takes one, `release_arena`
@@ -79,13 +82,17 @@ use std::time::Instant;
 
 use candle::cuda_backend::cudarc::driver::result::memset_d8_sync;
 use candle::cuda_backend::cudarc::driver::CudaStream;
-use candle::cuda_backend::graph::try_without_recording;
+use candle::cuda_backend::graph::{graph_budget_bytes, try_without_recording};
+use candle::cuda_backend::install_held_ground;
 use candle::vram::AllocClass;
 use candle::Result;
 
+use super::backing::{TIER_REFUSED_MARKER, TIER_SHORT_BY};
 use super::bump_arena::KV_ARENA_MID_WAVE;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::growth_policy::{kv_grow_step, FreeRegionTarget, GrowthPolicy, Occupancy, Refusal};
+use super::held_ground::{HeldStats, SpanHeldGround, HELD_GROUND_BYTES};
+use super::held_ledger::HeldSite;
 use super::reservation::Reservation;
 use super::span_geometry::{blocked, ceiling_regions, claimable, tier_fits};
 use super::types::TARGET_ARENA_BYTES;
@@ -107,13 +114,15 @@ const MAX_WAVE_TRANSIENT_BYTES: usize = super::wave_spans::WAVE_ATTN_BYTES
     + super::wave_spans::WAVE_FFN_BYTES
     + super::wave_spans::WAVE_FORWARD_BYTES;
 
-/// The persistence thread's staging block, at the far **left** of the span.
+/// The fixed block at the far **left** of the span: the held ground
+/// ([`HELD_GROUND_BYTES`]) first, then the persistence thread's staging.
 ///
-/// Fixed for the process lifetime and out of both frontiers' way. It is 4
-/// regions' worth; putting it left rather than letting it float is what lets the
-/// weight boundary move without ever having to reason about a copy stream that
-/// is not synchronised to the wave.
-const PERSIST_SPAN_BYTES: usize = MIGRATION_STAGING_CAP_BYTES;
+/// Fixed for the process lifetime and out of both frontiers' way. Putting it
+/// left rather than letting it float is what lets the weight boundary move
+/// without ever having to reason about a copy stream that is not synchronised
+/// to the wave — and what lets a held buffer be taken mid-forward, where a
+/// region claim would be refused.
+const PERSIST_SPAN_BYTES: usize = HELD_GROUND_BYTES + MIGRATION_STAGING_CAP_BYTES;
 
 /// The smallest span that can run a forward: the fixed staging block plus one
 /// wave's transient tier, with nothing left for KV.
@@ -138,8 +147,11 @@ const _: () = assert!(
     "every fixed block must be region-aligned so region carving stays exact"
 );
 
+// The floor is measured over the tradeable ground, `[region_base, span_end)`,
+// which begins after the fixed block and the dense weights — so the fixed block
+// is never drawn from it, and only the tier has to fit inside it.
 const _: () = assert!(
-    MIN_ELASTIC_RESERVE > MAX_WAVE_TRANSIENT_BYTES + PERSIST_SPAN_BYTES,
+    MIN_ELASTIC_RESERVE > MAX_WAVE_TRANSIENT_BYTES,
     "the floor must leave room for the widest wave's tier, or a forward cannot run"
 );
 
@@ -355,6 +367,8 @@ struct RegionPool {
     /// Bytes of the span actually backed by physical memory. May be less than
     /// what was reserved, when the driver refused part-way.
     span_bytes: usize,
+    /// The held ground at the span's base, for the memory report.
+    held: Arc<SpanHeldGround>,
     /// First byte available to regions — past the persistence block and the
     /// dense weights. **Moves while the model loads, never after**: see
     /// [`claim_dense`].
@@ -494,7 +508,8 @@ struct RegionPool {
     /// prefill chunk is the next chunk, a little deeper, and its tier stands on the
     /// same ground (see [`Occupancy::last_tier_bytes`]).
     last_tier_bytes: usize,
-    /// Persistence-staging bytes carved from the fixed left block.
+    /// Bytes of the fixed left block carved so far: the held ground, then the
+    /// persistence staging.
     persist_carved: usize,
     /// Fresh regions claimed while a wave's transient tier was placed.
     ///
@@ -664,7 +679,16 @@ fn buy_ground(stream: &std::sync::Arc<CudaStream>, regions: usize) -> Result<u64
     Ok(conceded)
 }
 
-/// The span's target size: everything left, less the cushion the CUDA pool keeps.
+/// The span's target size: everything left, less the cushion the CUDA pool keeps
+/// and the graph executables' budget (`graph_reserve`).
+///
+/// **The graph budget is planned here because it cannot be placed here.** The
+/// driver allocates an executable's memory itself, so it comes from outside the
+/// span whatever the span's size; left unplanned, the executables took whatever
+/// headroom the reservation happened to leave, until an instantiation found none
+/// and failed mid-forward. Leaving exactly `graph_reserve` outside the span —
+/// the figure the executable library is held to (`graph_budget_bytes`) — makes
+/// it a tenant of the card's plan beside the pool's cushion.
 ///
 /// With a governor — every production load installs one — `usable` is what
 /// remains of the balloon-measured capacity `C` right now. The dense weights are
@@ -680,7 +704,7 @@ fn buy_ground(stream: &std::sync::Arc<CudaStream>, regions: usize) -> Result<u64
 /// nothing — the reservation would come up a quarter of its intended size and
 /// every downstream number would be quietly wrong. Absence of a governor is a
 /// test binary; a governor that errors is a fault.
-fn span_target(ordinal: usize) -> Result<usize> {
+fn span_target(ordinal: usize, graph_reserve: usize) -> Result<usize> {
     let Some(gov) = candle::vram::get(ordinal) else {
         return Ok(TEST_SPAN_BYTES);
     };
@@ -692,10 +716,14 @@ fn span_target(ordinal: usize) -> Result<usize> {
              of the intended reservation."
         ))
     })?;
-    Ok(span_from(usable as usize, gov.pool_cushion() as usize))
+    Ok(span_from(
+        usable as usize,
+        gov.pool_cushion() as usize + graph_reserve,
+    ))
 }
 
-/// The span, given what is left of `C` and the cushion to leave on the pool.
+/// The span, given what is left of `C` and what to leave outside it — the
+/// pool's cushion and the graph budget.
 ///
 /// **The dense weights are subtracted exactly once, and not here.** `usable()`
 /// is `headroom.min(C − spent_by_us)` where `spent_by_us` is the drop in
@@ -858,7 +886,14 @@ impl RegionPool {
         // is genuinely close to the floor must keep its floor rather than
         // concede into it. The headroom prevents a *possible* pool OOM during
         // load and is never worth a *certain* refusal at startup.
-        let target = span_target(ordinal)?;
+        // What the executable library may hold outside the span — read on this
+        // card, so the library and the span agree (`graph_budget_bytes`).
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| candle::Error::Msg(format!("reservation: bind: {e}")))?;
+        let graph_reserve = graph_budget_bytes()? as usize;
+        let target = span_target(ordinal, graph_reserve)?;
         let measured = candle::vram::get(ordinal).is_some();
         let concedable = target.saturating_sub(SPAN_MINIMUM_BYTES);
         let for_span = if measured {
@@ -897,11 +932,6 @@ impl RegionPool {
         // governor's own docs forbid subtracting for exactly this reason.
         // Mixing the two drove `unaccounted_bytes` persistently negative, the
         // opposite of what the field exists to show.
-        // Bound to this thread first, exactly as `CudaDevice::mem_get_info` does.
-        // The driver call reads the CURRENT context, so without the bind it either
-        // answers for whichever context the thread last touched or fails — and
-        // either way it leaves the thread in a state the reservation below then
-        // has to work from.
         // Bound to this thread first, exactly as `CudaDevice::mem_get_info` does.
         // The driver call reads the CURRENT context, so without the bind it either
         // answers for whichever context the thread last touched or fails — and
@@ -961,12 +991,13 @@ impl RegionPool {
             let mib = |b: usize| b / (1024 * 1024);
             eprintln!(
                 "[reservation] capacity_c={}MiB usable={}MiB pool_cushion={}MiB \
-                 weights={}MiB residual={}MiB | asked={}MiB span={}MiB \
+                 graph_reserve={}MiB weights={}MiB residual={}MiB | asked={}MiB span={}MiB \
                  (shortfall {}MiB) = persist {}MiB + {total} regions ({}MiB) \
                  + transient {}MiB + weights-side {}MiB, slack {}B",
                 mib(capacity),
                 mib(usable_before),
                 gov.as_ref().map_or(0, |g| mib(g.pool_cushion() as usize)),
+                mib(graph_reserve),
                 mib(weights),
                 mib(residual),
                 mib(want),
@@ -991,20 +1022,28 @@ impl RegionPool {
         } else {
             log::info!(
                 "reservation: {} MiB span = {} MiB persist + {total} regions \
-                 ({} MiB), transient placed per forward (≤{} MiB), in {} KiB granules",
+                 ({} MiB), transient placed per forward (≤{} MiB), in {} KiB granules; \
+                 {} MiB left outside it for graph executables",
                 span_bytes / (1024 * 1024),
                 PERSIST_SPAN_BYTES / (1024 * 1024),
                 (total * REGION_BYTES) / (1024 * 1024),
                 MAX_WAVE_TRANSIENT_BYTES / (1024 * 1024),
                 reservation.granularity() / 1024,
+                graph_reserve / (1024 * 1024),
             );
         }
+
+        // The held ground stands at the very base of the span, before the
+        // persistence staging is carved after it, and is live from here on.
+        let held = SpanHeldGround::new(span_base, HELD_GROUND_BYTES);
+        install_held_ground(ordinal, held.clone());
 
         Ok(Self {
             reservation,
             pre_reservation_in_use,
             span_base,
             span_bytes,
+            held,
             region_base: layout.region_base,
             dense_base: layout.dense_base,
             dense_bytes: 0,
@@ -1029,7 +1068,7 @@ impl RegionPool {
             transient_bytes: 0,
             transient_high_water: 0,
             last_tier_bytes: 0,
-            persist_carved: 0,
+            persist_carved: HELD_GROUND_BYTES,
             fresh_claims_during_wave: 0,
             refusals_during_wave: 0,
             // Empty because nothing has been observed yet. The weight side must
@@ -1928,13 +1967,14 @@ pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize)
                     pool.live,
                 ))
             })?;
+            let short_bytes = still_short * REGION_BYTES;
             candle::bail!(
-                "wave transient tier needs {len} B below the weight floor and is \
-                 {still_short} regions into ground live KV arenas hold, which cannot \
-                 move. The weight side conceded {conceded} B to this placement and \
-                 would give no more — at its own floor, or refusing to move while a \
-                 wave or an expert invocation is in flight — so this wave is too wide \
-                 for the partition. (span {span_bytes} B, weight floor at \
+                "{TIER_REFUSED_MARKER}: {TIER_SHORT_BY}{short_bytes} B — its transient \
+                 tier needs {len} B below the weight floor and is {still_short} regions \
+                 into ground live KV arenas hold, which cannot move. The weight side conceded {conceded} B to this \
+                 placement and would give no more — at its own floor, or refusing to \
+                 move while a wave or an expert invocation is in flight. (span \
+                 {span_bytes} B, weight floor at \
                  +{floor_off} B, arena frontier at +{live_off} B, {live}/{total} \
                  regions live)"
             )
@@ -2969,6 +3009,19 @@ pub fn regions_to_relocate(
         |i| free.contains(&i),
         |i| held.contains(&i),
     ))
+}
+
+/// What a device's held ground holds, or `None` if it has no reservation yet.
+pub fn held_ground_stats(ordinal: usize) -> Option<HeldStats> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&ordinal).map(|pool| pool.held.stats())
+}
+
+/// Who holds a device's held ground, by call site and largest first, or `None`
+/// if it has no reservation yet.
+pub fn held_ground_sites(ordinal: usize) -> Option<Vec<HeldSite>> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&ordinal).map(|pool| pool.held.sites())
 }
 
 /// Occupancy of a device's KV side, or `None` if it has no reservation yet.

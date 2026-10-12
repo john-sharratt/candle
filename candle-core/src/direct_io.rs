@@ -41,11 +41,12 @@
 //!
 //! - **Linux**: `O_DIRECT` on open, `pread64` for positioned reads (via
 //!   `std::os::unix::fs::FileExt::read_exact_at`, which is thread-safe).
-//! - **Windows**: `FILE_FLAG_NO_BUFFERING` on open, `ReadFile` with the
-//!   per-call `OVERLAPPED.Offset/OffsetHigh` (thread-safe positioned
-//!   read; the handle is *not* opened with `FILE_FLAG_OVERLAPPED`, so
-//!   the call is synchronous but the offset is per-call rather than
-//!   shared file-pointer state).
+//! - **Windows**: `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED` on open,
+//!   `ReadFile` with the per-call `OVERLAPPED.Offset/OffsetHigh` and an
+//!   event the caller then waits on. The caller blocks as before, but the
+//!   request is queued at the drive beside every other thread's — on a
+//!   synchronous handle the same reads completed one at a time (see
+//!   `open_direct`).
 
 use std::fs::File;
 use std::io;
@@ -66,14 +67,11 @@ pub const DIRECT_IO_SECTOR: usize = 4096;
 /// the dev-box Mobile Gen4 (~3 GB/s, QD8 saturates, QD16 has no
 /// downside).
 ///
-/// On Windows, getting actual QD16 at the device requires **N
-/// independent file handles**, not just N threads sharing one handle —
-/// `ReadFile` on a handle opened *without* `FILE_FLAG_OVERLAPPED` is
-/// synchronous, and the storage stack funnels concurrent reads on a
-/// single handle through a serialised IRP queue. So [`DirectFile`]
-/// opens this many handles up front and each worker thread reads
-/// through its own. Per-handle cost on open is ~5–50 µs; one-time at
-/// open.
+/// [`DirectFile`] opens this many handles up front and each worker thread
+/// reads through its own. On Windows the handles are overlapped, which is
+/// what puts the reads in flight together at all (`open_direct`); one
+/// handle per worker keeps their requests independent. Per-handle cost on
+/// open is ~5–50 µs; one-time at open.
 pub const MAX_CONCURRENT_READS: usize = 16;
 
 /// A sector-aligned host scratch buffer — the destination for direct-I/O
@@ -188,11 +186,9 @@ pub struct StripeRead<'a> {
 ///
 /// Holds [`MAX_CONCURRENT_READS`] independent file descriptors on the
 /// same path so the concurrent read pass can dispatch one positioned
-/// `ReadFile` / `pread` per handle. Per-handle dispatch is the only
-/// way to reach true QD>1 on Windows when the handle is opened in
-/// synchronous mode (no `FILE_FLAG_OVERLAPPED`); a single handle
-/// serialises concurrent reads through one IRP queue regardless of
-/// how many threads call `ReadFile` on it.
+/// `ReadFile` / `pread` per handle. On Windows they are overlapped
+/// handles, each read waiting on its own event — see `open_direct` for
+/// the measurement that made them so.
 ///
 /// `Send + Sync`: positioned reads via `pread64` /
 /// `ReadFile`+`OVERLAPPED` are thread-safe, and the inner `Vec<File>`
@@ -363,24 +359,64 @@ fn pread_exact(file: &File, offset: u64, dest: &mut [u8]) -> io::Result<()> {
     file.read_exact_at(dest, offset)
 }
 
+/// Windows opens every handle **overlapped**. Measured on the 16 GB laptop's
+/// SN810 (`tests::read_method_sweep`): random 1.9 MiB reads issued as blocking
+/// `ReadFile`s — one thread and one synchronous handle each, eight at once —
+/// completed one at a time, at 3.9 GB/s whatever the depth, while the same
+/// reads as overlapped requests ran 6.3 GB/s at eight outstanding and 6.5 at
+/// thirty-two. The synchronous path serialises them; an overlapped handle
+/// queues them at the drive.
 #[cfg(windows)]
 fn open_direct(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED};
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(FILE_FLAG_NO_BUFFERING)
+        .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)
         .open(path)
 }
 
+/// A manual-reset event, closed on drop — the completion signal one
+/// overlapped read waits on. Per call rather than per handle, because nothing
+/// stops two threads reading through the same handle at once, and two reads
+/// sharing an event would each take the other's completion as their own.
+#[cfg(windows)]
+struct ReadEvent(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl ReadEvent {
+    fn new() -> io::Result<Self> {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        // SAFETY: no security attributes, manual reset, initially unsignalled,
+        // unnamed — every argument is a plain value or null.
+        let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if h.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(h))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ReadEvent {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from CreateEventW and is closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// A positioned read on an overlapped handle, waited for: the request goes to
+/// the drive's queue beside every other thread's, and this thread blocks on
+/// its own completion only.
 #[cfg(windows)]
 fn pread_exact(file: &File, offset: u64, dest: &mut [u8]) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::TRUE;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_IO_PENDING};
     use windows_sys::Win32::Storage::FileSystem::ReadFile;
-    use windows_sys::Win32::System::IO::OVERLAPPED;
+    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
     let handle = file.as_raw_handle();
+    let event = ReadEvent::new()?;
     let mut total_read: usize = 0;
     while total_read < dest.len() {
         let chunk = &mut dest[total_read..];
@@ -388,10 +424,8 @@ fn pread_exact(file: &File, offset: u64, dest: &mut [u8]) -> io::Result<()> {
         let to_read = chunk.len().min(u32::MAX as usize) as u32;
         let pos = offset + total_read as u64;
 
-        // OVERLAPPED carries the per-call file offset. Since the handle
-        // is *not* FILE_FLAG_OVERLAPPED, ReadFile blocks until the I/O
-        // completes; the OVERLAPPED struct is only used for its
-        // offset fields (thread-safe positioned read).
+        // OVERLAPPED carries the per-call file offset and the event the
+        // completion signals.
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
         // SAFETY: writing to the anonymous union's Offset/OffsetHigh
         // fields is the documented way to set the per-call offset.
@@ -400,18 +434,29 @@ fn pread_exact(file: &File, offset: u64, dest: &mut [u8]) -> io::Result<()> {
             anon.Offset = pos as u32;
             anon.OffsetHigh = (pos >> 32) as u32;
         }
+        ov.hEvent = event.0;
 
-        let mut bytes_read: u32 = 0;
+        // SAFETY: `chunk` and `ov` outlive the request — GetOverlappedResult
+        // below waits for it to complete before either is touched again.
         let ok = unsafe {
             ReadFile(
                 handle as _,
                 chunk.as_mut_ptr(),
                 to_read,
-                &mut bytes_read,
+                std::ptr::null_mut(),
                 &mut ov,
             )
         };
-        if ok != TRUE {
+        if ok == 0 {
+            let e = unsafe { GetLastError() };
+            if e != ERROR_IO_PENDING {
+                return Err(io::Error::from_raw_os_error(e as i32));
+            }
+        }
+        let mut bytes_read: u32 = 0;
+        // SAFETY: waits for the request issued above on its own event.
+        let ok = unsafe { GetOverlappedResult(handle as _, &ov, &mut bytes_read, 1) };
+        if ok == 0 {
             return Err(io::Error::last_os_error());
         }
         if bytes_read == 0 {
@@ -524,13 +569,18 @@ mod tests {
         ))
     }
 
-    /// The largest expert section under the zend model cache, if one exists — a
-    /// multi-GB span of the drive the expert cache reads in production.
-    fn largest_pack() -> Option<ExpertSection> {
-        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-        let root = Path::new(&home).join(".cache/zend/models");
-        let mut stack = vec![root];
-        let mut best: Option<ExpertSection> = None;
+    /// Every expert section under the zend model cache, largest first — the
+    /// multi-GB spans of the drive the expert cache reads in production. More
+    /// than one, because a drive's read ceiling is a property of where a file's
+    /// data landed as well as of the drive: a pack written onto a nearly full
+    /// drive can read slower than an older one beside it.
+    fn expert_packs() -> Vec<ExpertSection> {
+        let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+        else {
+            return Vec::new();
+        };
+        let mut stack = vec![Path::new(&home).join(".cache/zend/models")];
+        let mut found = Vec::new();
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -540,15 +590,12 @@ mod tests {
                 if p.is_dir() {
                     stack.push(p);
                 } else if p.to_string_lossy().ends_with(".pack.gguf") {
-                    if let Some(s) = expert_section(&p) {
-                        if best.as_ref().is_none_or(|b| s.2 > b.2) {
-                            best = Some(s);
-                        }
-                    }
+                    found.extend(expert_section(&p));
                 }
             }
         }
-        best
+        found.sort_by_key(|s| std::cmp::Reverse(s.2));
+        found
     }
 
     /// **The drive's ceiling for the expert cache's read shape.** Random
@@ -562,20 +609,27 @@ mod tests {
     #[test]
     #[ignore = "reads a multi-GB expert pack off the real drive for ~30 s"]
     fn queue_depth_sweep() {
+        let packs = expert_packs();
+        if packs.is_empty() {
+            eprintln!("no model pack with an expert section under ~/.cache/zend/models");
+        }
+        for (path, base, len) in packs {
+            sweep_pack(&path, base, len);
+        }
+    }
+
+    /// [`queue_depth_sweep`] over one pack's expert section.
+    fn sweep_pack(path: &Path, base: u64, len: u64) {
         use std::io::Read;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{Duration, Instant};
-        let Some((path, base, len)) = largest_pack() else {
-            eprintln!("no model pack with an expert section under ~/.cache/zend/models");
-            return;
-        };
-        let df = DirectFile::open(&path).unwrap();
+        let df = DirectFile::open(path).unwrap();
         // The section's own record stride (its header's bytes 24..32, already a
         // whole number of sectors), so the sweep reads the shape this rung's
         // experts actually have. The section starts sector-aligned, so every
         // `base + k × stride` is a legal direct-I/O offset.
         let mut head = [0u8; 32];
-        let mut f = File::open(&path).unwrap();
+        let mut f = File::open(path).unwrap();
         f.seek(SeekFrom::Start(base)).unwrap();
         f.read_exact(&mut head).unwrap();
         assert_eq!(
@@ -596,6 +650,9 @@ mod tests {
             "the section is sector-aligned"
         );
         let records = (len / record as u64).saturating_sub(1);
+        if records == 0 {
+            return;
+        }
         eprintln!(
             "{} — {:.1} GiB section, {records} records of {record} B",
             path.display(),
@@ -662,6 +719,304 @@ mod tests {
                 bytes.load(Ordering::Relaxed) as f64 / secs / 1e9,
                 busy_ns.load(Ordering::Relaxed) as f64 / n as f64 / 1e6,
             );
+        }
+        // **Read shape against placement**, at the stager's queue depth: reads
+        // of `size` bytes at offsets that are multiples of `stride` from the
+        // section base — the pack's own stride, then the same length on 64 KiB
+        // and 2 MiB boundaries, then other lengths on their own boundaries. Says
+        // whether the record's size or its alignment sets the ceiling.
+        const KIB: usize = 1024;
+        let span = len - record as u64;
+        for &(size, stride) in &[
+            (record, record),
+            (record, 64 * KIB * record.div_ceil(64 * KIB)),
+            (record, 2048 * KIB),
+            (1024 * KIB, 1024 * KIB),
+            (2048 * KIB, 2048 * KIB),
+            (4096 * KIB, 4096 * KIB),
+        ] {
+            let slots = span / stride as u64;
+            if slots == 0 {
+                continue;
+            }
+            let bytes = AtomicU64::new(0);
+            let t0 = Instant::now();
+            std::thread::scope(|s| {
+                for w in 0..8usize {
+                    let (df, bytes) = (&df, &bytes);
+                    s.spawn(move || {
+                        let mut scratch = AlignedScratch::new();
+                        scratch.ensure(size).unwrap();
+                        let mut x = 0xD1B5_4A32_D192_ED03u64 ^ (w as u64 + 1);
+                        while t0.elapsed() < window {
+                            x = x
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add(1442695040888963407);
+                            let at = base + (x >> 16) % slots * stride as u64;
+                            df.read_at_with_handle(w, at, scratch.as_mut_slice(size))
+                                .unwrap();
+                            bytes.fetch_add(size as u64, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            eprintln!(
+                "  shape {:>5} KiB every {:>5} KiB, 8 in flight: {:>6.2} GB/s",
+                size / KIB,
+                stride / KIB,
+                bytes.load(Ordering::Relaxed) as f64 / t0.elapsed().as_secs_f64() / 1e9,
+            );
+        }
+    }
+
+    /// One configuration of [`read_method_sweep`]: overlapped reads of `size`
+    /// bytes at random `size`-aligned offsets of each section in `files`, with
+    /// `depth` outstanding per file spread over `handles` overlapped handles of
+    /// that file, completed through one I/O completion port. Returns GB/s over
+    /// every file together.
+    #[cfg(windows)]
+    fn overlapped_rate(
+        files: &[(PathBuf, u64, u64)],
+        size: usize,
+        depth: usize,
+        handles: usize,
+        window: std::time::Duration,
+    ) -> f64 {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use std::time::Instant;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GetLastError, ERROR_IO_PENDING, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            ReadFile, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
+        };
+        use windows_sys::Win32::System::IO::{
+            CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
+        };
+
+        let mut opened: Vec<Vec<File>> = Vec::new();
+        let port =
+            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
+        assert!(!port.is_null(), "completion port");
+        for (path, _, _) in files {
+            let hs: Vec<File> = (0..handles)
+                .map(|_| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED)
+                        .open(path)
+                        .unwrap()
+                })
+                .collect();
+            for h in &hs {
+                let p = unsafe { CreateIoCompletionPort(h.as_raw_handle() as _, port, 0, 0) };
+                assert_eq!(p, port, "associate a handle with the port");
+            }
+            opened.push(hs);
+        }
+        // One request slot per outstanding read: its OVERLAPPED (boxed, so its
+        // address is stable for the kernel), its buffer, and which file it reads.
+        struct Slot {
+            ov: Box<OVERLAPPED>,
+            buf: AlignedScratch,
+            file: usize,
+        }
+        let mut slots: Vec<Slot> = (0..files.len() * depth)
+            .map(|i| {
+                let mut buf = AlignedScratch::new();
+                buf.ensure(size).unwrap();
+                Slot {
+                    ov: Box::new(unsafe { std::mem::zeroed() }),
+                    buf,
+                    file: i % files.len(),
+                }
+            })
+            .collect();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut submit = |s: &mut Slot, n: usize| {
+            let (_, base, len) = &files[s.file];
+            let places = (len - size as u64) / size as u64;
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let at = base + (x >> 16) % places * size as u64;
+            *s.ov = unsafe { std::mem::zeroed() };
+            s.ov.Anonymous.Anonymous.Offset = at as u32;
+            s.ov.Anonymous.Anonymous.OffsetHigh = (at >> 32) as u32;
+            let h = opened[s.file][n % handles].as_raw_handle();
+            let ok = unsafe {
+                ReadFile(
+                    h as _,
+                    s.buf.as_mut_slice(size).as_mut_ptr(),
+                    size as u32,
+                    std::ptr::null_mut(),
+                    &mut *s.ov,
+                )
+            };
+            if ok == 0 {
+                let e = unsafe { GetLastError() };
+                assert_eq!(e, ERROR_IO_PENDING, "overlapped ReadFile failed: {e}");
+            }
+        };
+        let t0 = Instant::now();
+        for (n, s) in slots.iter_mut().enumerate() {
+            submit(s, n);
+        }
+        let mut outstanding = slots.len();
+        let mut bytes = 0u64;
+        let mut issued = slots.len();
+        while outstanding > 0 {
+            let mut got = 0u32;
+            let mut key = 0usize;
+            let mut done: *mut OVERLAPPED = std::ptr::null_mut();
+            let ok =
+                unsafe { GetQueuedCompletionStatus(port, &mut got, &mut key, &mut done, u32::MAX) };
+            assert!(ok != 0, "a read failed: {}", unsafe { GetLastError() });
+            bytes += got as u64;
+            outstanding -= 1;
+            if t0.elapsed() < window {
+                let i = slots
+                    .iter()
+                    .position(|s| std::ptr::eq(&*s.ov, done))
+                    .expect("a completion names one of our requests");
+                submit(&mut slots[i], issued);
+                issued += 1;
+                outstanding += 1;
+            }
+        }
+        let rate = bytes as f64 / t0.elapsed().as_secs_f64() / 1e9;
+        unsafe { CloseHandle(port) };
+        rate
+    }
+
+    /// **How we read, not what we read.** Random reads of the Q3 pack's record
+    /// size, and smaller pieces, through overlapped I/O on a completion port —
+    /// the mechanism fio and winsat drive NVMe with on Windows — against the
+    /// reader threads' blocking reads ([`queue_depth_sweep`]): one handle or
+    /// several, one file or two at once. Says whether requests completing one at
+    /// a time is the drive or the blocking-read path.
+    ///
+    /// `cargo test --release -p candle-core --lib direct_io::tests::read_method_sweep -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "reads a multi-GB expert pack off the real drive for ~60 s"]
+    fn read_method_sweep() {
+        use std::time::Duration;
+        let packs = expert_packs();
+        let Some(first) = packs.first().cloned() else {
+            eprintln!("no model pack with an expert section under ~/.cache/zend/models");
+            return;
+        };
+        let window = Duration::from_secs(3);
+        const KIB: usize = 1024;
+        let record = 1952 * KIB;
+        eprintln!("{}", first.0.display());
+        for &(size, depth, handles) in &[
+            (record, 1, 1),
+            (record, 8, 1),
+            (record, 8, 8),
+            (record, 32, 1),
+            (record, 32, 8),
+            (256 * KIB, 64, 1),
+            (512 * KIB, 32, 1),
+            (1024 * KIB, 32, 1),
+            (4096 * KIB, 16, 1),
+        ] {
+            let rate = overlapped_rate(std::slice::from_ref(&first), size, depth, handles, window);
+            eprintln!(
+                "  overlapped {:>5} KiB, {depth:>2} outstanding over {handles} handle(s): {rate:>6.2} GB/s",
+                size / KIB
+            );
+        }
+        // The reader threads' shape on the overlapped mechanism: N threads,
+        // each its own handle and port with one request outstanding — against
+        // one thread holding N.
+        for threads in [8usize, 16] {
+            let rates: Vec<f64> = std::thread::scope(|s| {
+                let hs: Vec<_> = (0..threads)
+                    .map(|_| {
+                        let f = first.clone();
+                        s.spawn(move || overlapped_rate(&[f], record, 1, 1, window))
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            eprintln!(
+                "  overlapped {:>5} KiB, {threads} threads × 1 outstanding: {:>6.2} GB/s",
+                record / KIB,
+                rates.iter().sum::<f64>()
+            );
+        }
+        // And the shipped path itself: DirectFile's blocking read on its own
+        // handle per thread — alone, beside a buffered handle that has read
+        // the header, and beside a memory map of the file, as the model's
+        // loader holds one over the same pack for its dense weights.
+        let df = DirectFile::open(&first.0).unwrap();
+        let buffered = || {
+            let mut f = File::open(&first.0).unwrap();
+            let mut head = [0u8; 4096];
+            std::io::Read::read_exact(&mut f, &mut head).unwrap();
+            f
+        };
+        // SAFETY: the map is only held, never read, and the pack is not
+        // written while the test runs.
+        let mapped = || unsafe { memmap2::Mmap::map(&File::open(&first.0).unwrap()).unwrap() };
+        for (beside, threads) in [
+            ("alone", 8usize),
+            ("alone", 16),
+            ("buffered", 8),
+            ("mapped", 8),
+            ("mapped, then dropped", 8),
+            ("alone", 8),
+        ] {
+            let _held_file = (beside == "buffered").then(buffered);
+            let _held_map = (beside == "mapped").then(mapped);
+            if beside == "mapped, then dropped" {
+                let m = mapped();
+                // Touch a page, as a loader reading a tensor would.
+                std::hint::black_box(m[0]);
+                drop(m);
+            }
+            let bytes = std::sync::atomic::AtomicU64::new(0);
+            let t0 = std::time::Instant::now();
+            let places = (first.2 - record as u64) / record as u64;
+            std::thread::scope(|s| {
+                for w in 0..threads {
+                    let (df, bytes, base) = (&df, &bytes, first.1);
+                    s.spawn(move || {
+                        let mut buf = AlignedScratch::new();
+                        buf.ensure(record).unwrap();
+                        let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (w as u64 + 1);
+                        while t0.elapsed() < window {
+                            x = x
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add(1442695040888963407);
+                            let at = base + (x >> 16) % places * record as u64;
+                            df.read_at_with_handle(w, at, buf.as_mut_slice(record))
+                                .unwrap();
+                            bytes.fetch_add(record as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            eprintln!(
+                "  DirectFile {:>5} KiB, {threads} threads, {beside}: {:>6.2} GB/s",
+                record / KIB,
+                bytes.load(std::sync::atomic::Ordering::Relaxed) as f64
+                    / t0.elapsed().as_secs_f64()
+                    / 1e9
+            );
+        }
+        if let Some(second) = packs.get(1).cloned() {
+            eprintln!("  + {}", second.0.display());
+            for depth in [8, 16] {
+                let rate =
+                    overlapped_rate(&[first.clone(), second.clone()], record, depth, 1, window);
+                eprintln!(
+                    "  overlapped two files at once, {depth} outstanding each: {rate:>6.2} GB/s"
+                );
+            }
         }
     }
 

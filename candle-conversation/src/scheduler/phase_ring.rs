@@ -2,7 +2,7 @@
 //! performance GUI's phase graphs (`/v1/phases` → `perf.html`).
 //!
 //! The scheduler flips between distinct phases each wave — small-batch **decode**
-//! inference, large-batch **prefill** / **section**-ingest inference, **projection**
+//! inference, large-batch **prefill** inference (dialogue and section ingest alike), **projection**
 //! (submission drain + reprojection), **sealing** (per-scope KV snapshot/sig/flush),
 //! **eviction** (cold-tail / ingest demote), and **allocation** (slot promote + KV
 //! pool trim). [`WaveStats`](super::WaveStats) already aggregates every one of these
@@ -51,10 +51,9 @@ pub fn snapshot_promotes() -> Vec<(String, u64)> {
 pub enum PhaseKind {
     /// Small-batch decode inference (foreground token generation).
     Decode,
-    /// Large-batch dialogue prefill inference.
+    /// Large-batch prefill inference: dialogue prefills and section ingest,
+    /// which is prefill of a section's tokens through the same forward.
     Prefill,
-    /// Large-batch section-ingest prefill (code-read / repo-map).
-    Section,
     /// Submission drain + reprojection (projection wall-clock, no tokens).
     Projection,
     /// Per-scope KV seal (snapshot + provenance sig + record/flush).
@@ -93,7 +92,6 @@ impl PhaseKind {
         match self {
             PhaseKind::Decode => "decode",
             PhaseKind::Prefill => "prefill",
-            PhaseKind::Section => "section",
             PhaseKind::Projection => "projection",
             PhaseKind::Sealing => "sealing",
             PhaseKind::Eviction => "eviction",
@@ -108,7 +106,7 @@ impl PhaseKind {
 }
 
 /// One phase's contribution within a wave window. `tokens`/`seqs` are meaningful
-/// for the inference phases (Decode/Prefill/Section); `bytes` for the memory
+/// for the inference phases (Decode/Prefill); `bytes` for the memory
 /// phases (Eviction/Allocation); `count` is the operation count (forwards, seals,
 /// evicted residences); `dur_ms` is the wall-clock the phase held this window.
 #[derive(Clone, Copy)]

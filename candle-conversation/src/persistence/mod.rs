@@ -644,14 +644,20 @@ pub(crate) type MetadataKey = (RecordType, u64, u64);
 
 /// The [`MetadataKey`] of a record with header `h`.
 fn metadata_key(h: &RecordHeader) -> MetadataKey {
-    let writer = match h.record_type {
+    metadata_key_parts(h.record_type, h.stream_id, h.origin)
+}
+
+/// The [`MetadataKey`] of a record of type `rt` on `stream_id`, written by
+/// `origin`.
+fn metadata_key_parts(rt: RecordType, stream_id: u64, origin: u64) -> MetadataKey {
+    let writer = match rt {
         RecordType::CustomObject
         | RecordType::Deleted
         | RecordType::Replica
         | RecordType::Rebase => 0,
-        _ => h.origin,
+        _ => origin,
     };
-    (h.record_type, h.stream_id, writer)
+    (rt, stream_id, writer)
 }
 
 /// Whether a record type is a per-stream metadata record whose current-copy

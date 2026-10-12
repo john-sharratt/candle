@@ -575,6 +575,43 @@ mod tests {
             assert_eq!(row0[1], row1[1]);
         }
 
+        /// The write boundary of `slot`.
+        fn writer_start(backing: &ChunkedKvBacking, slot: usize) -> usize {
+            backing.state.read().unwrap().sequences[slot]
+                .as_ref()
+                .unwrap()
+                .writer_start_idx()
+        }
+
+        /// **A fork never owns the blocks it shares.** The full blocks are the
+        /// source's sealed history, Arc-shared with their records; only the copied
+        /// remainder is the fork's to write.
+        #[test]
+        fn a_fork_cannot_write_the_blocks_it_shares() {
+            let backing = create_test_backing();
+            setup_source_with_data(&backing, 48); // 1 complete + 16 tokens partial
+            backing.alloc_sequence().unwrap();
+            backing.fork_sequence(0, 1, 48).unwrap();
+            assert_eq!(writer_start(&backing, 1), 1, "past the one shared block");
+
+            let backing = create_test_backing();
+            setup_source_with_data(&backing, 64); // 2 complete chunks
+            backing.alloc_sequence().unwrap();
+            backing.fork_sequence(0, 1, 64).unwrap();
+            assert_eq!(writer_start(&backing, 1), 2, "past both shared blocks");
+        }
+
+        /// **A shared prefix is never the target's to write**, and the target's
+        /// own writer region keeps its place behind it.
+        #[test]
+        fn a_shared_prefix_moves_the_targets_boundary_past_it() {
+            let backing = create_test_backing();
+            setup_source_with_data(&backing, 64);
+            backing.alloc_sequence().unwrap();
+            backing.share_prefix(0, 1, 64).unwrap();
+            assert_eq!(writer_start(&backing, 1), 2);
+        }
+
         #[test]
         fn test_fork_sequence_copies_partial_block() {
             let backing = create_test_backing();
@@ -2022,9 +2059,11 @@ mod tests {
             assert_eq!(borrowed, whole_counts);
             assert_eq!(borrowed, (2, parent_tokens));
             assert_eq!(
-                shape(halves).0,
-                [CHUNK_SIZE as u32, 8],
-                "the borrow alone holds the parent's blocks and no writer",
+                shape(halves),
+                (vec![CHUNK_SIZE as u32, 8], 2),
+                "the borrow alone holds the parent's blocks and no writer — and its \
+                 boundary already sits past them: a view that fails before its writer \
+                 opens must not claim the parent's sealed history as writable",
             );
             backing.open_view_writer(halves).unwrap();
             assert_eq!(shape(halves), shape(whole));

@@ -80,7 +80,6 @@ pub use pack_source::ResolvedModel;
 
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
-use candle::quantized::GgmlDType;
 use candle::DType;
 pub use candle_transformers::models::rope_schedule::RopePreset;
 pub use candle_transformers::models::selection_strata::{Recent, StrataTokens};
@@ -219,6 +218,7 @@ impl ModelArch {
 /// | `Qwen3_30B_A3B_Q6` | 30 B (3B active) | Q6_K | Qwen3Moe | ChatML | ~25 GB (LRU) |
 /// | `Qwen36_35B_A3B_Q4` | 35 B (3B active) | UD-Q4_K_M | Qwen35Hybrid | Qwen35 | ~22 GB (tiered) |
 /// | `Qwen36_35B_A3B_AntiLoop_StyleTune` | 35 B (3B active) | Q4_K_M | Qwen35Hybrid | Qwen35 | ~22 GB (tiered) |
+/// | `Qwen38_FlashNext` | 250 B (13B active) | Q8_0 trunk, card's KO experts | Qwen4Exp | Qwen35 | tiered |
 /// | `Custom(_)` | — | — | any | any | — |
 #[derive(Debug, Clone)]
 #[allow(non_camel_case_types)]
@@ -260,21 +260,19 @@ pub enum Model {
     /// recurrent-gate donor.
     Qwen36_35B_A3B_AntiLoop_StyleTune,
 
-    /// Qwen3.8-Flash-Next Q4_KO — 250 B total, ~13 B active, 48 layers at 3:1
+    /// Qwen3.8-Flash-Next — 250 B total, ~13 B active, 48 layers at 3:1
     /// (36 gated-DeltaNet, 12 attention). Native 262,144-token context.
     ///
     /// Carries two classes of state no other preset does — a PLE window and a
     /// QSA index — neither of which is a delta-rule matrix, so both ride the
     /// turn record's model-opaque blob (`docs/qwen38_index_persistence.md`).
     ///
-    /// **Its engine GGUF is prepared locally, not downloaded** — see
-    /// [`qwen38_flash_next`] and [`ModelSpec::prepared_from_source`].
-    Qwen38_FlashNext_Q4KO,
-
-    /// Qwen3.8-Flash-Next with `Q3_KO` experts — the same model on the floor rung
-    /// of `quant_ladder`, every card under 64 GiB (the 16 GB laptop and the 24 GB
-    /// RTX 3090 among them), from its own prepared artifact.
-    Qwen38_FlashNext_Q3KO,
+    /// **Its engine GGUF is prepared locally, not downloaded**, with the routed
+    /// experts at the card's rung — `Q4_KO` at 64 GiB and up, `Q3_KO` below.
+    /// One model on every card: a substrate written under one rung opens under
+    /// the other. See [`qwen38_flash_next`] and
+    /// [`ModelSpec::prepared_from_source`].
+    Qwen38_FlashNext,
 
     /// Qwen3.5-9B Q6_K — the lineage's **dense** member (~7.5 GB), same hybrid
     /// attention/DeltaNet stack with the mixture taken out.
@@ -567,26 +565,13 @@ impl Model {
         Model::Qwen3_30B_A3B_Q6,
         Model::Qwen36_35B_A3B_Q4,
         Model::Qwen36_35B_A3B_AntiLoop_StyleTune,
-        Model::Qwen38_FlashNext_Q4KO,
-        Model::Qwen38_FlashNext_Q3KO,
+        Model::Qwen38_FlashNext,
         Model::Qwen35_9B_Q6,
         Model::Qwen35_0_8B_Q8,
         Model::Qwen2_0_5B,
         Model::Hermes3_3B_Q6,
         Model::Hermes3_70B_Q4,
     ];
-
-    /// The Flash-Next preset for a card whose rung puts the routed experts at
-    /// `experts` (`quant_ladder::expert_format`), or `None` when no preset carries
-    /// that width — the rung above every KO format, where the split's own `Q8_0`
-    /// stands, has no preset.
-    pub fn qwen38_flash_next_for(experts: Option<GgmlDType>) -> Option<Model> {
-        match experts? {
-            GgmlDType::Q4_KO => Some(Model::Qwen38_FlashNext_Q4KO),
-            GgmlDType::Q3_KO => Some(Model::Qwen38_FlashNext_Q3KO),
-            _ => None,
-        }
-    }
 
     /// The preset whose [`Self::override_key`] is `key` — the variant's own
     /// identifier, the same name `models.override.yaml` addresses it by.
@@ -612,8 +597,7 @@ impl Model {
             Model::Qwen36_35B_A3B_AntiLoop_StyleTune => {
                 qwen36_moe::qwen36_35b_a3b_antiloop_styletune()
             }
-            Model::Qwen38_FlashNext_Q4KO => qwen38_flash_next::qwen38_flash_next_q4ko(),
-            Model::Qwen38_FlashNext_Q3KO => qwen38_flash_next::qwen38_flash_next_q3ko(),
+            Model::Qwen38_FlashNext => qwen38_flash_next::qwen38_flash_next(),
             Model::Qwen35_9B_Q6 => qwen35_dense::qwen35_9b_q6(),
             Model::Qwen35_0_8B_Q8 => qwen35_dense::qwen35_0_8b_q8(),
             Model::Qwen3_30B_A3B_Q4 => qwen3_moe::qwen3_30b_a3b_q4(),

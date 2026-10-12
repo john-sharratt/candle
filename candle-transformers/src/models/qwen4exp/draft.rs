@@ -64,6 +64,7 @@ use crate::models::batched_inference::ManagedBatchedModel;
 use crate::models::batched_layer::{forward_attn_batched, BatchedAttentionParams, DecodeHeaders};
 use crate::models::delta_net::SeqSpan;
 use crate::models::draft_walk::{draft_reserve, draft_walk};
+use crate::models::held_tensor::held_empty;
 use crate::models::kv_cache_utils::SequenceContext;
 use crate::models::latent_moe::scatter::{rows_scatter, RowRun};
 use crate::models::lazy_rope::LazyRope;
@@ -426,9 +427,9 @@ impl Qwen4ExpBatched {
             candle::bail!("qwen4exp draft: the head's block is not full-attention");
         };
 
-        // The forward phase holds the step's embeddings — and with them the
-        // embedding half of the head's input, which a norm keeps beside the rows
-        // it reads — and, at the end, the shared head's logits.
+        // The forward phase holds the step's embeddings and, at the end, the
+        // shared head's logits; the head's input assembly carves on the
+        // attention phase below.
         let fwd_wave = begin_wave(&stream, LayerPhase::Forward)?;
         let fwd_ticket = Some(fwd_wave.ticket());
         // Fully written by the lookup (invariant 6), in the head's F32.
@@ -600,10 +601,11 @@ impl Qwen4ExpBatched {
             // Fully written before it is read: the seeds go into the first, and
             // each step writes the buffer it then hands on (invariant 6). Grown
             // by doubling, so a cohort ramping up settles in a few steps.
+            // On held ground: the pair lives as long as the engine.
             let dims = ((held * 2).max(n), hc, n_embd);
             *pair = Some((
-                Tensor::empty(dims, DType::F32, &self.model.device)?,
-                Tensor::empty(dims, DType::F32, &self.model.device)?,
+                held_empty(dims, DType::F32, &self.model.device)?,
+                held_empty(dims, DType::F32, &self.model.device)?,
             ));
         }
         let (a, b) = pair.as_ref().expect("sized above");

@@ -1,6 +1,6 @@
 //! An instantiated graph.
 
-use super::{ComputeStream, GraphError};
+use super::{budget, ComputeStream, GraphError};
 use crate::cuda_backend::WrapErr;
 use crate::Result;
 use cudarc::driver::{result, sys, CudaContext};
@@ -20,7 +20,15 @@ pub struct GraphExec {
     nodes: usize,
     /// The [shape](audit) it was last instantiated or folded at.
     shape: u64,
+    /// Its nodes' kinds and kernels, which a fold never changes — for naming
+    /// where a recapture that cannot be folded departs from it.
+    topology: Vec<NodeKey>,
     ctx: Arc<CudaContext>,
+    /// Device memory it is charged against the library's budget
+    /// ([`budget::charge`]).
+    bytes: u64,
+    /// Launches, decayed each wave — what least-invoked eviction ranks by.
+    invocations: f64,
 }
 
 // SAFETY: a `CUgraphExec` is a driver handle usable from any thread once the
@@ -52,8 +60,10 @@ impl Drop for Template {
 /// rewrites arguments and nothing else. Folding a capture into an executable
 /// last shaped differently also succeeds, at several times the cost: measured
 /// on Flash-Next's adaptive-depth verify, 200–500 µs a segment against 2–60.
-pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<u64> {
+pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<Audited> {
     let mut shape = ShapeFold::default();
+    let mut key = ShapeFold::default();
+    let mut topology = Vec::with_capacity(expected);
     let mut recorded = 0usize;
     // SAFETY: a null node array asks only for the count.
     unsafe { sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut recorded).result() }.w()?;
@@ -74,6 +84,10 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<u64> {
         // SAFETY: a node of `graph`.
         unsafe { sys::cuGraphNodeGetType(node, &mut kind).result() }.w()?;
         shape.word(kind as u64);
+        let mut node_key = NodeKey {
+            kind: kind as u32,
+            func: 0,
+        };
         match kind {
             sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL => {
                 let mut p = MaybeUninit::<sys::CUDA_KERNEL_NODE_PARAMS>::uninit();
@@ -85,6 +99,7 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<u64> {
                     p.assume_init()
                 };
                 shape.word(p.func as u64);
+                node_key.func = p.func as u64;
                 shape.word(u64::from(p.gridDimX) | (u64::from(p.gridDimY) << 32));
                 shape.word(u64::from(p.gridDimZ) | (u64::from(p.blockDimX) << 32));
                 shape.word(u64::from(p.blockDimY) | (u64::from(p.blockDimZ) << 32));
@@ -123,6 +138,8 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<u64> {
                     shape.word(p.WidthInBytes as u64);
                     shape.word(p.Height as u64);
                     shape.word(p.Depth as u64);
+                    key.word(u64::from(node_key.kind));
+                    topology.push(node_key);
                     continue;
                 }
                 let after = all[..index]
@@ -148,8 +165,74 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<u64> {
                 }))
             }
         }
+        key.word(u64::from(node_key.kind));
+        topology.push(node_key);
     }
-    Ok(shape.finish())
+    Ok(Audited {
+        shape: shape.finish(),
+        key: key.finish(),
+        topology,
+    })
+}
+
+/// What [`audit`] learns of a recapture.
+pub(super) struct Audited {
+    /// Everything but its arguments — see [`audit`].
+    pub(super) shape: u64,
+    /// Its topology folded to one word: each node's kind, in order — not its
+    /// kernel, grid or arguments, which the driver rewrites on a fold
+    /// (`tests::a_recapture_with_another_kernel_at_a_node_folds_in_place`).
+    /// Recaptures sharing it can be folded into each other's executables, so
+    /// it is what an executable is found by (`library`).
+    pub(super) key: u64,
+    /// The topology itself, for naming where a refused fold departs.
+    pub(super) topology: Vec<NodeKey>,
+}
+
+/// One node of a graph's topology: its kind and, for a kernel, its function.
+/// Two graphs whose keys agree node for node can be folded into each other;
+/// where they first disagree is why one could not be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NodeKey {
+    kind: u32,
+    /// The kernel's `CUfunction`, or 0 for a node that is not a kernel.
+    func: u64,
+}
+
+impl NodeKey {
+    /// The node as a reader would name it: a kernel by its function's name,
+    /// anything else by its kind.
+    fn describe(&self) -> String {
+        if self.func == 0 {
+            return format!("node kind {}", self.kind);
+        }
+        func_name(self.func as sys::CUfunction)
+            .unwrap_or_else(|| format!("kernel {:#x}", self.func))
+    }
+}
+
+/// Where a recapture's topology first departs from an executable's, for the
+/// log line that explains an instantiation: the node index, and what each
+/// graph holds there (`end` past the shorter one).
+pub(super) fn divergence(recaptured: &[NodeKey], kept: &[NodeKey]) -> Option<String> {
+    let at = recaptured
+        .iter()
+        .zip(kept)
+        .position(|(a, b)| a != b)
+        .or_else(|| (recaptured.len() != kept.len()).then(|| recaptured.len().min(kept.len())))?;
+    let name = |keys: &[NodeKey]| {
+        keys.get(at)
+            .map_or_else(|| "end".to_string(), NodeKey::describe)
+    };
+    let before = at
+        .checked_sub(1)
+        .and_then(|i| recaptured.get(i))
+        .map_or_else(|| "start".to_string(), NodeKey::describe);
+    Some(format!(
+        "node {at} (after {before}): recaptured {} / kept {}",
+        name(recaptured),
+        name(kept)
+    ))
 }
 
 /// The shape of a graph folded one word at a time (FNV-1a over the words). A
@@ -196,9 +279,14 @@ fn kernel_name(node: sys::CUgraphNode) -> Option<String> {
             .ok()?;
         p.assume_init()
     };
+    func_name(p.func)
+}
+
+/// A kernel function's name.
+fn func_name(func: sys::CUfunction) -> Option<String> {
     let mut name: *const c_char = std::ptr::null();
-    // SAFETY: the node's own function; the name is a driver-owned C string.
-    unsafe { sys::cuFuncGetName(&mut name, p.func) }
+    // SAFETY: a function of a loaded module; the name is a driver-owned C string.
+    unsafe { sys::cuFuncGetName(&mut name, func) }
         .result()
         .ok()?;
     // SAFETY: a NUL-terminated string the driver keeps for the module's life.
@@ -240,33 +328,47 @@ impl GraphExec {
         expected_nodes: usize,
     ) -> Result<Self> {
         let template = Template(graph);
-        let shape = audit(template.0, expected_nodes)?;
-        Self::instantiate_audited(template, on, expected_nodes, shape)
+        let a = audit(template.0, expected_nodes)?;
+        Self::instantiate_audited(template, on, expected_nodes, a.shape, a.topology)
     }
 
     /// Instantiate and upload a template [`audit`] has already passed as
-    /// `shape`.
+    /// `shape` and `topology`.
     pub(super) fn instantiate_audited(
         template: Template,
         on: &ComputeStream,
         expected_nodes: usize,
         shape: u64,
+        topology: Vec<NodeKey>,
     ) -> Result<Self> {
+        on.bind()?;
+        // What the driver has free on either side of the instantiation and its
+        // upload is what this executable is charged, when the reading is
+        // believable (`budget::charge`).
+        let free_before = result::mem_get_info().ok().map(|(free, _)| free as u64);
         let mut exec: sys::CUgraphExec = std::ptr::null_mut();
         // SAFETY: `graph` is valid; flags 0 is the default instantiation.
         unsafe { sys::cuGraphInstantiateWithFlags(&mut exec, template.0, 0).result() }.w()?;
         drop(template);
         on.bind()?;
-        let me = Self {
+        let mut me = Self {
             exec,
             nodes: expected_nodes,
             shape,
+            topology,
             ctx: on.context(),
+            bytes: 0,
+            invocations: 0.0,
         };
         // Uploading ahead of the first launch keeps the one-time setup off the
         // launch that the wave is waiting on.
         // SAFETY: a valid executable and the compute stream.
         unsafe { sys::cuGraphUpload(me.exec, on.cu()).result().w()? };
+        let free_after = result::mem_get_info().ok().map(|(free, _)| free as u64);
+        let measured = free_before
+            .zip(free_after)
+            .map(|(before, after)| before.saturating_sub(after));
+        me.bytes = budget::charge(measured, expected_nodes);
         Ok(me)
     }
 
@@ -287,11 +389,11 @@ impl GraphExec {
         expected_nodes: usize,
     ) -> Result<bool> {
         let template = Template(graph);
-        let shape = audit(template.0, expected_nodes)?;
-        if self.try_fold(&template, on, expected_nodes, shape)? {
+        let a = audit(template.0, expected_nodes)?;
+        if self.try_fold(&template, on, expected_nodes, a.shape)? {
             return Ok(true);
         }
-        *self = Self::instantiate_audited(template, on, expected_nodes, shape)?;
+        *self = Self::instantiate_audited(template, on, expected_nodes, a.shape, a.topology)?;
         Ok(false)
     }
 
@@ -329,6 +431,11 @@ impl GraphExec {
         self.shape
     }
 
+    /// Its nodes' kinds and kernels, in order.
+    pub(super) fn topology(&self) -> &[NodeKey] {
+        &self.topology
+    }
+
     /// Replay into `on`.
     pub fn launch(&self, on: &ComputeStream) -> Result<()> {
         on.bind()?;
@@ -340,6 +447,26 @@ impl GraphExec {
     pub fn node_count(&self) -> usize {
         self.nodes
     }
+
+    /// Device memory it is charged.
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Its decayed launch count.
+    pub(super) fn invocations(&self) -> f64 {
+        self.invocations
+    }
+
+    /// One more launch.
+    pub(super) fn credit(&mut self) {
+        self.invocations += 1.0;
+    }
+
+    /// A wave has passed.
+    pub(super) fn decay(&mut self) {
+        self.invocations *= budget::INVOCATION_DECAY;
+    }
 }
 
 impl Drop for GraphExec {
@@ -348,5 +475,39 @@ impl Drop for GraphExec {
             // SAFETY: an executable this value owns, destroyed once.
             let _ = unsafe { result::graph::exec_destroy(self.exec) };
         }
+    }
+}
+
+#[cfg(test)]
+mod divergence_tests {
+    use super::*;
+
+    fn node(kind: u32) -> NodeKey {
+        NodeKey { kind, func: 0 }
+    }
+
+    /// Two topologies that agree node for node have nowhere to diverge.
+    #[test]
+    fn matching_topologies_do_not_diverge() {
+        assert_eq!(divergence(&[node(0), node(2)], &[node(0), node(2)]), None);
+    }
+
+    /// The first node that differs is named, with the one before it.
+    #[test]
+    fn the_first_differing_node_is_named() {
+        assert_eq!(
+            divergence(&[node(0), node(0), node(2)], &[node(0), node(2), node(2)]).as_deref(),
+            Some("node 1 (after node kind 0): recaptured node kind 0 / kept node kind 2")
+        );
+    }
+
+    /// A recapture that runs on past the kept graph diverges where the kept
+    /// one ends.
+    #[test]
+    fn a_longer_recapture_diverges_at_the_kept_end() {
+        assert_eq!(
+            divergence(&[node(0), node(0), node(2)], &[node(0), node(0)]).as_deref(),
+            Some("node 2 (after node kind 0): recaptured node kind 2 / kept end")
+        );
     }
 }

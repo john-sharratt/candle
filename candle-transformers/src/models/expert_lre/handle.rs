@@ -101,7 +101,18 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// immediately after a warm pool sized against *total* RAM took every free page
 /// on a machine with 12 GB already in use by other processes.
 ///
-/// **4 GiB, and that figure is measured rather than reasoned.** The run's
+/// **3 GiB, sized by the hungriest gate, measured on the 16 GB box** (31.5 GiB
+/// host). With the wave's transients on the span's bump tiers, Flash-Next's own
+/// transient after pinning is ~1.06 GiB (free RAM low-water 2.94 GiB under a
+/// 4 GiB headroom), and its Q3_KO rung — the tier under a third of the experts,
+/// prefill bound by the bytes read off the drive — gains from every slot: 3 GiB
+/// took the tier to 8,932 experts and BF16×8 prefill to 570.5 t/s (528.4 at
+/// 4 GiB), low-water 2.17 GiB. Qwen3.6-35B-A3B's transient is ~2 GiB larger: at
+/// 2 GiB its free RAM bottomed at **0.03 GiB**, at 3 GiB at 0.88 GiB. The history
+/// below is what the figure was before, when the tier was past its knee and the
+/// transient was larger.
+///
+/// **4 GiB, and that figure was measured rather than reasoned.** The run's
 /// non-pinned transient — everything the process takes after the tier is
 /// pinned — is **3.30 GiB** on the 3.6-35B gate: launch 16.45 GiB, tier 12.14,
 /// other pinned 0.62, and a free-RAM low-water of 0.39 GiB
@@ -123,7 +134,7 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// 14,283 experts and pack reads fell ~9%, but free RAM bottomed at 2.05 GiB and
 /// the run paid for it: decode 13.8 / 67.6 / 26.8 → 13.5 / 64.7 / 22.8 t/s
 /// (BF16×1 / BF16×8 / C5×2), prefill 269.5 → 256.0 on C5. At 4 GiB the low
-/// point is 3.57 GiB. Warm KV does not come out of this: it has a pageable
+/// point was 3.57 GiB. Warm KV does not come out of this: it has a pageable
 /// floor of its own (`vram::KV_WARM_FLOOR`) that the OS pages rather than
 /// refusing.
 ///
@@ -141,9 +152,26 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// not the common case, and belongs in the exception's own code —
 /// `zend::session`'s calibration loop backs its concurrency window off directly
 /// against live free RAM instead. See `zend_run_iteration_traps.md` §4.
-pub const WARM_TIER_HEADROOM: u64 = 4 * 1024 * 1024 * 1024;
+pub const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
 
 use candle::vram::PAGEABLE_RESERVE;
+
+/// Layers of pad slots the stager owns: the layer a wave is computing, and the
+/// [`STAGED_HOPS`] after it, which a prefill launch's router votes stage into
+/// while the current one computes (`PipelineState::stage_voted`). With one
+/// layer the next layer's reads could not start until every slot of the
+/// current one was released — a prefill row routes about half its layer, and
+/// Rule R′ protects all of it — so the drive idled through each layer's up and
+/// down projections.
+pub(crate) const PAD_LAYERS: usize = 1 + STAGED_HOPS;
+
+/// Rows ahead a prefill launch votes on and stages: the next row's router,
+/// applied to this layer's input. Two hops — and a third pad layer — measured
+/// no faster on Flash-Next (16 GB laptop: C0×2 341.5 → 329.2, BF16×8 1108.8 →
+/// 1113.3 t/s): the stagings issued barely moved (9,701 → 10,192 a ×2 config)
+/// though twice as many were requested, so what holds them back is not how
+/// early they are asked for.
+pub(crate) const STAGED_HOPS: usize = 1;
 
 /// How many warm slots to ask for: **every expert the machine will actually
 /// give room for.**
@@ -622,16 +650,17 @@ impl ExpertCache {
                 // any warm size, including zero.
                 let stride = candle::direct_io::round_up_sector(slot_bytes);
                 // **The pad before the warm tier, not after.** It is mandatory —
-                // it is what makes a cold expert computable — and one layer of
-                // slots; the warm tier is elastic and pins up to the driver's
-                // page-lock ceiling, so anything pinned after it lands on an
-                // exhausted budget. The startup fill borrows the pad as its
-                // landing ring before the stager takes it over.
+                // it is what makes a cold expert computable — and
+                // [`PAD_LAYERS`] layers of slots; the warm tier is elastic and
+                // pins up to the driver's page-lock ceiling, so anything pinned
+                // after it lands on an exhausted budget. The startup fill
+                // borrows the pad as its landing ring before the stager takes it
+                // over.
                 let pad = Pad::new(
                     if all_resident {
                         STARTUP_RING_SLOTS
                     } else {
-                        experts_per_layer.max(STARTUP_RING_SLOTS)
+                        (PAD_LAYERS * experts_per_layer).max(STARTUP_RING_SLOTS)
                     },
                     stride,
                 )?;
@@ -1632,22 +1661,23 @@ mod warm_sizing_tests {
         let s = warm_sizing_from(SLOT, EVICTABLE, 64 * GIB, 6 * GIB, 6 * GIB, 0, LOOSE_BUDGET);
         assert_eq!(s.bound_by, CEILING_AVAILABLE);
 
-        // Pinnable half lowest — and it leaves the headroom like the others, so
-        // an 8 GiB machine offers a 4 GiB pinnable region of which the tier may
-        // take 1 GiB.
+        // Pinnable region lowest — and it leaves the headroom like the others, so
+        // a 16 GiB machine offers what is left after the pageable reserve, less
+        // the headroom.
         let s = warm_sizing_from(
             SLOT,
             EVICTABLE,
-            8 * GIB,
+            16 * GIB,
             60 * GIB,
             60 * GIB,
             0,
             LOOSE_BUDGET,
         );
         assert_eq!(s.bound_by, CEILING_PINNABLE);
+        assert!(s.slots > 0, "a 16 GiB machine leaves the tier some room");
         assert_eq!(
             s.slots,
-            ((4 * GIB - WARM_TIER_HEADROOM) / SLOT as u64) as usize
+            ((16 * GIB - PAGEABLE_RESERVE - WARM_TIER_HEADROOM) / SLOT as u64) as usize
         );
 
         // Nothing binds: the tier covers every evictable expert.

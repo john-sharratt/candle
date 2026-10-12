@@ -49,6 +49,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use candle_conversation::persistence::accounting::RecordAccounting;
 use candle_conversation::persistence::content_hash::{turn_stream_id, ContentHash};
@@ -450,7 +451,7 @@ fn export_replay(
     let mut targets: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
     let mut sig_bytes_written = 0usize;
 
-    let mut dump_sig = |tl: u64, idx: u32, blob: Option<&Vec<u8>>| -> Option<String> {
+    let mut dump_sig = |tl: u64, idx: u32, blob: Option<&[u8]>| -> Option<String> {
         let blob = blob?;
         let name = format!("{tl}_{idx}.wqs");
         std::fs::write(sig_dir.join(&name), blob).ok()?;
@@ -491,7 +492,7 @@ fn export_replay(
         turn_meta.insert((tl, idx), meta.clone());
 
         if wanted.contains(&tl) {
-            let sig = dump_sig(tl, idx, s.wide_q_sigs.as_ref());
+            let sig = dump_sig(tl, idx, s.wide_q_sigs.as_deref());
             let mut n_events = 0usize;
             let ev_file = s.projection_events.as_ref().map(|bytes| {
                 let events = decode_events(bytes);
@@ -518,7 +519,7 @@ fn export_replay(
 
         for tag_filter in tags {
             if decl.tags.iter().any(|t| t.contains(tag_filter.as_str())) {
-                dump_sig(tl, idx, s.wide_q_sigs.as_ref());
+                dump_sig(tl, idx, s.wide_q_sigs.as_deref());
                 targets.entry(tag_filter.clone()).or_default().push(meta);
                 break;
             }
@@ -531,7 +532,7 @@ fn export_replay(
         let stream_id = turn_stream_id(*tl, *idx);
         let blob = substrate
             .stream_of(stream_id)
-            .and_then(|s| s.wide_q_sigs.as_ref());
+            .and_then(|s| s.wide_q_sigs.as_deref());
         dump_sig(*tl, *idx, blob);
         match turn_meta.get(&(*tl, *idx)) {
             Some(meta) => candidates.push(meta.clone()),
@@ -2417,7 +2418,7 @@ fn belief_eval(
         .transpose()?
         .flatten();
 
-    let mut tagged: Vec<(StreamId, &str, &Vec<u8>, &[TurnSegment])> = substrate
+    let mut tagged: Vec<(StreamId, &str, &[u8], &[TurnSegment])> = substrate
         .all_streams()
         .filter_map(|(sid, e)| {
             let Some(StreamDecl::Turn(t)) = &e.decl else {
@@ -2430,7 +2431,7 @@ fn belief_eval(
             Some((
                 sid,
                 name.as_str(),
-                e.wide_q_sigs.as_ref()?,
+                e.wide_q_sigs.as_deref()?,
                 t.segments.as_slice(),
             ))
         })
@@ -4177,7 +4178,7 @@ fn calib_baseline(log: &mut LogFile, tag: &str, out: Option<String>) -> Result<(
     struct Src {
         tool: String,
         loc: candle_conversation::persistence::manifest::RecordLoc,
-        wq: Option<Vec<u8>>,
+        wq: Option<Arc<[u8]>>,
     }
     let mut srcs: Vec<Src> = Vec::new();
     for (_sid, e) in substrate.all_streams() {

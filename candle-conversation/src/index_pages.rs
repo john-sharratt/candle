@@ -283,6 +283,11 @@ impl StoredPages {
         &self.bytes
     }
 
+    /// The same bytes as [`Self::bytes`], as a second owner rather than a copy.
+    pub fn shared_bytes(&self) -> Arc<[u8]> {
+        Arc::clone(&self.bytes)
+    }
+
     /// Each framed page's key, in page order — empty for a payload that does
     /// not decode, which [`push_in_order`] refuses before it reads a key.
     pub fn page_keys(&self) -> &[PieceKey] {

@@ -3,7 +3,25 @@
 use candle::{DType, Device};
 
 use crate::kv_cache::chunked::ChunkedKvBacking;
-use crate::kv_cache::KvFormat;
+use crate::kv_cache::{tier_refusal_shortfall, KvFormat, TIER_REFUSED_MARKER, TIER_SHORT_BY};
+
+/// A refusal's shortfall reads back as the bytes the placement wrote, from the
+/// message shaped as `place_transient` shapes it; anything else reads `None`.
+#[test]
+fn a_tier_refusal_carries_its_shortfall() {
+    let refusal = candle::Error::Msg(format!(
+        "{TIER_REFUSED_MARKER}: {TIER_SHORT_BY}100663296 B — its transient tier needs \
+         771751936 B below the weight floor and is 3 regions into ground live KV arenas hold"
+    ));
+    assert_eq!(tier_refusal_shortfall(&refusal), Some(100_663_296));
+    // Wrapped as a caller wraps it, the shortfall still reads.
+    let wrapped = candle::Error::Msg(format!("decode forward failed: {refusal}"));
+    assert_eq!(tier_refusal_shortfall(&wrapped), Some(100_663_296));
+    assert_eq!(
+        tier_refusal_shortfall(&candle::Error::Msg("out of memory".into())),
+        None
+    );
+}
 
 /// Test helper: snapshot K-side GIDs as `[batch][block]` with -1 for unallocated.
 fn k_gid_snapshot(backing: &ChunkedKvBacking) -> Vec<Vec<i64>> {

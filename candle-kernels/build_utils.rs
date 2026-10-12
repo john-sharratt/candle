@@ -150,9 +150,9 @@ const QUANTIZED_KERNELS: [&str; 46] = [
 ];
 
 // Flash-attention kernels: 12 total
-const FLASH_KERNELS: [&str; 23] = [
-    // Batched sampling (1 api + 4 variants), its count-table stamp, and the
-    // many-blocks-a-row greedy pick
+const FLASH_KERNELS: [&str; 25] = [
+    // Batched sampling (1 api + 4 variants), its count-table stamp, the
+    // many-blocks-a-row greedy pick, and the allow-list rows
     "src/sampling/batched_sampling_api.cu",
     "src/sampling/batched_sampling_f32.cu",
     "src/sampling/batched_sampling_f16.cu",
@@ -160,12 +160,15 @@ const FLASH_KERNELS: [&str; 23] = [
     "src/sampling/batched_sampling_fp8_e4m3.cu",
     "src/sampling/count_table.cu",
     "src/sampling/argmax_rows.cu",
+    "src/sampling/allow_list.cu",
     // Paged decode: a thin per-dtype dispatcher, plus one TU per head dim.
     //
     // Separate files because nvcc compiles a translation unit serially and each
     // head dim expands to a whole dispatch tree — naming them all from one file
     // made it a ten-minute job by itself while the parallel slots below sat
     // idle. See `paged_decode_hd_bf16.cuh`.
+    // The host-installed allocator every launcher's grow-only scratch uses.
+    "src/paged-decode/kernel_scratch.cu",
     "src/paged-decode/paged_decode_api_fp16.cu",
     "src/paged-decode/paged_decode_api_bf16.cu",
     "src/paged-decode/paged_decode_bf16_hd64.cu",

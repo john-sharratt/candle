@@ -220,7 +220,10 @@ impl Qwen4ExpGpu {
         // F32 intermediate on the device to keep a 1.2 GiB BF16 table, for a
         // lookup that reads one row per token; the gather kernel widens only
         // those rows, into the residual's F32.
-        let embed = DeviceEmbedding::new(gguf.qtensor("token_embd.weight", device)?)?;
+        let embed = DeviceEmbedding::new(dense_span::place_in_dense(
+            device,
+            gguf.qtensor("token_embd.weight", device)?,
+        )?)?;
         // Tied embeddings, as the oracle loader handles them: a checkpoint
         // without `output.weight` projects through the embedding table. Reading
         // it unconditionally made the engine refuse artifacts the oracle
@@ -381,12 +384,15 @@ impl Qwen4ExpGpu {
 
             trunk.push((hc_attn, hc_ffn, mix));
         }
-        let ple_w = PleFusedWeights::from_weights(&ple_w.ok_or_else(|| {
-            candle::Error::Msg(format!(
-                "qwen4exp engine: PLE layer {} produced no weights",
-                cfg.ple.layer
-            ))
-        })?)?;
+        let ple_w = PleFusedWeights::from_weights(
+            &ple_w.ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "qwen4exp engine: PLE layer {} produced no weights",
+                    cfg.ple.layer
+                ))
+            })?,
+            int8mode,
+        )?;
 
         let rotary = RotaryLayout::new(cfg.attn_head_dim, cfg.rope_dim, device)?;
         // The TRUNK's layers only. The draft head holds its keys in this same
@@ -502,8 +508,11 @@ impl Qwen4ExpGpu {
             }
         };
 
-        let gguf = Arc::new(gguf);
-        let ple_table = open_cached_ple(gguf, &cfg, device)?;
+        // The PLE table reads through direct-I/O handles of its own; the GGUF
+        // reader — a buffered handle on the pack — closes here, so nothing holds
+        // a cached view of the file the expert stager reads (`DiskPleFetch`).
+        let ple_table = open_cached_ple(&gguf, &cfg, device)?;
+        drop(gguf);
 
         Ok(Self {
             cfg,

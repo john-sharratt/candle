@@ -4162,6 +4162,12 @@ impl Conversation {
     /// post-chunks re-commit used by the async seal/persist chain to upgrade
     /// the manifest's `committed_through` once the heavy `Chunks` records
     /// have been written.
+    ///
+    /// The index learns the commit too, not only the log. A `Commit` is a
+    /// resident record: maintenance and compaction rewrite it from the
+    /// index's `committed_through`, never copy it, so a commit the index does
+    /// not hold is dropped by the first rewrite of its segment — and a
+    /// section without one is prefilled again on every later boot.
     pub fn commit_stream_through(
         &self,
         stream_id: StreamId,
@@ -4170,10 +4176,14 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.commit_stream(stream_id, through_index)
-            .map(|_| ())
-            .map_err(|e| candle::Error::Msg(format!("commit stream: {e}")))
+        let commit = {
+            let mut p = self.persistence.lock().unwrap();
+            p.commit_stream(stream_id, through_index)
+                .map_err(|e| candle::Error::Msg(format!("commit stream: {e}")))?
+        };
+        self.write()
+            .apply_commit_through(stream_id, through_index, commit);
+        Ok(())
     }
 
     /// Enqueue a warm→cold KV migration onto the off-thread writer (phase 2). The
@@ -5243,7 +5253,7 @@ mod tests {
     use crate::persistence::content_hash::turn_stream_id;
     use crate::persistence::manifest::ConvState;
     use crate::persistence::vfs::{VfsAppend, VfsWrite};
-    use crate::persistence::{dir_fingerprint, SharedSubstrate, SubstratePersistence};
+    use crate::persistence::{dir_fingerprint, Admit, SharedSubstrate, SubstratePersistence};
     use crate::projection::{GroupId, LayerId, TimelineId};
     use crate::substrate::{Substrate, TurnPartWrite};
     use crate::token_buffer::TokenBuffer;
@@ -5608,6 +5618,86 @@ mod tests {
         conv.flush_writer();
         drop(conv);
         assert_eq!(dir_fingerprint(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A stream's commit survives the compaction that runs in the process
+    /// that wrote it.** A prompt section's chunks reach the log first and its
+    /// `Commit` afterwards, through `commit_stream_through`. Compaction rewrites
+    /// a `Commit` from the index's `committed_through`, never from the log, so
+    /// a commit only the log knew vanished with the first rewrite — the next
+    /// boot found the section's chunks with no commit, refused to restore it,
+    /// and prefilled the whole tool catalog again, on every boot.
+    #[test]
+    fn a_section_commit_survives_compaction_in_the_writing_process() {
+        use crate::persistence::content_hash::ContentHash;
+        use crate::persistence::record::ChunkPayload;
+        use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl};
+
+        let dir = std::env::temp_dir().join(format!(
+            "candle-conv-section-commit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let decl = StreamDecl::PromptSection(SectionDecl {
+            address: ContentAddress {
+                prefix_hash: ContentHash { lo: 0x11, hi: 0x12 },
+                section_hash: ContentHash { lo: 0x13, hi: 0x14 },
+            },
+            debug_name: "tool_catalog_member".to_string(),
+        });
+        let stream = decl.stream_id();
+        let payload = |seed: u8| ChunkPayload {
+            offset: 0,
+            k_formats: vec![4, 4, 4, 4],
+            v_formats: vec![5, 5, 5, 5],
+            k_pal: vec![seed; 4],
+            v_pal: vec![seed; 2],
+            k_scale: vec![1.0, 0.5],
+            v_scale: vec![0.25],
+            kv_bytes: vec![seed; 512],
+        };
+        // The chunks and tokens are durable; the commit is not yet written.
+        {
+            let mut substrate = Substrate::new();
+            let mut p = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            p.declare_stream(&decl).unwrap();
+            p.write_chunk(stream, 0, 32, 4, None, &payload(1)).unwrap();
+            p.write_chunk(stream, 1, 32, 4, None, &payload(2)).unwrap();
+            p.append_tokens(stream, &[7, 0, 0, 0, 8, 0, 0, 0]).unwrap();
+            p.commit().unwrap();
+        }
+
+        {
+            let conv =
+                Conversation::from_shared(SharedSubstrate::open_in(&dir, Admit::Unbound).unwrap());
+            assert!(!conv.section_stream_is_persisted(stream));
+            conv.commit_stream_through(stream, 1).unwrap();
+            assert!(
+                conv.section_stream_is_persisted(stream),
+                "the writing process must see its own commit"
+            );
+            conv.compact_substrate(None).unwrap();
+            assert!(conv.section_stream_is_persisted(stream));
+            conv.flush_writer();
+        }
+
+        let reopened =
+            Conversation::from_shared(SharedSubstrate::open_in(&dir, Admit::Unbound).unwrap());
+        assert_eq!(
+            reopened
+                .read()
+                .stream_of(stream)
+                .and_then(|s| s.committed_through),
+            Some(1),
+            "the commit must survive the compaction that rewrote its segment"
+        );
+        assert!(reopened.section_stream_is_persisted(stream));
+        drop(reopened);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

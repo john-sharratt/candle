@@ -63,6 +63,7 @@ use crate::models::qsa_selection::QsaSelection;
 use crate::models::selection_strata::Recent;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 use candle::wave_provenance::WaveTicket;
+use candle_kernels::simple::f32_rows_matmul::F32_ROWS_MATMUL_MAX_ROWS;
 #[cfg(feature = "cuda")]
 use candle_kernels::simple::qsa_topk::{qsa_topk_split_parts, SPLIT_KEYS};
 use candle_kernels::simple::qsa_topk::{MAX_ENTRIES, MAX_KEEP};
@@ -1188,6 +1189,18 @@ impl IndexCache {
         };
         let keys_t = rotated.t()?;
         let rows_per_tile = (SCORE_TILE_BYTES / (h * live_cols * 4)).clamp(1, t);
+        // **A prompt's scan runs eagerly, between the wave's recorded segments.**
+        // It is one library GEMM per row tile, so its launch count follows the
+        // prompt's length and the GEMM's own tile and split-K follow its rows:
+        // recorded, every prompt gave its segment a node count no executable
+        // held, and the segment was instantiated afresh
+        // (`docs/decode_graphs.md` §2.2). A decode or verify wave is a tile or
+        // two of a shape that recurs, and stays recorded.
+        let _eager = if t > F32_ROWS_MATMUL_MAX_ROWS {
+            Some(q.device().eager()?)
+        } else {
+            None
+        };
         let mut row = 0usize;
         while row < t {
             let rows = rows_per_tile.min(t - row);

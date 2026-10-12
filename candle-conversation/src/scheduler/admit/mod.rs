@@ -8,10 +8,9 @@
 //! [`Ground`]. The byte-fit planner it replaced is gone rather than kept
 //! alongside: there is one admission path in this crate at any time.
 //!
-//! What it offers is prefills. Decodes reach a wave as continuations, charged
-//! to it before the first offer and never re-judged; sections are still pushed
-//! straight into flight when their request is drained, which is the next thing
-//! to bring inside the gate. See `super::admit_ground` for both.
+//! What it offers is prefills and sections. Decodes reach a wave as
+//! continuations, charged to it before the first offer and never re-judged. See
+//! `super::admit_ground` for all three.
 //!
 //! ## Two things checked and NOT defects, so they are not re-raised
 //!

@@ -56,6 +56,7 @@ pub mod relief_trace;
 mod run;
 mod sample;
 mod seal_scan;
+mod section_pack;
 mod section_pages;
 mod segment_rearm;
 mod settle;
@@ -64,6 +65,7 @@ mod spec_chooser;
 mod test_substrate;
 mod turn_group;
 mod wave_logits;
+mod wave_retry;
 
 use detached::Detached;
 use graph_window::graph_window;
@@ -77,6 +79,7 @@ use crate::decode_health::DecodeHealthState;
 use crate::decoded_text::{decode_turn_text, TagIds};
 use crate::dry_reference::reference_flags;
 use crate::error::ConversationError;
+use crate::guest::Guests;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
 use crate::index_pages::{self, StoredPages};
 use crate::persistence::cold_load::{
@@ -119,7 +122,7 @@ use crate::turn::Role;
 use crate::turn_layout::{GlueKind, KvSpan, TurnLayout, TurnSegment};
 use crate::turn_text::TurnText;
 use crate::{FinishReason, SubstrateReloadStatus, TurnStats};
-use admit::pass_budget::RateWidth;
+use admit::pass_budget::{RateWidth, RefusedWidth};
 use first_sample::PrefillEnd;
 
 use candle::cuda_backend::graph::CaptureStats;
@@ -460,7 +463,8 @@ pub(crate) enum SchedulerRequest {
     },
 
     /// Install a recurrent state onto an existing slot — the branch-checkpoint
-    /// restore.
+    /// restore. The model stages it (`stage_recurrent`): the store is built
+    /// when the slot's state is first wanted, not here.
     ///
     /// The conversation-resume path installs from a timeline snapshot inside
     /// `create_sequence`, before any wave. A branch checkpoint cannot: the slot
@@ -1870,6 +1874,13 @@ struct ViewState {
     /// that arrives at the same identity would rebuild the parent it already
     /// has, so it leaves the parent and the view as they are.
     applied_identity: Option<u64>,
+    /// Whether the view holds its own copy of the parent's per-sequence model
+    /// state yet. A submitted turn's view is carved at submit but forked at
+    /// admission ([`Scheduler::begin_admitted`]): the fork is a whole recurrent
+    /// store on a hybrid, ground admission prices and can make the turn wait
+    /// for. Forked at submit, a window of turns would claim their stores at once
+    /// and fail the ones the span had no room for.
+    state_forked: bool,
 }
 
 /// A model-decode compression node in flight — the [`Content::Decode`]
@@ -2139,6 +2150,28 @@ pub(super) struct ActivePrefill {
 fn resolve_seal_range(from: usize, block_count: usize, chunk_len: usize) -> Option<(usize, usize)> {
     let to = block_count.min(chunk_len);
     (to > from).then_some((from, to))
+}
+
+/// A section ingest waiting for admission.
+///
+/// **A section is a first admission exactly as a prefill is**: fresh K/V on its
+/// slot, a recurrent store on a hybrid, and rows in the wave's tier. So it waits
+/// here until an admission pass prices it and finds the wave better off
+/// carrying it (`AdmitPass`, the `Low` section band), and only then has its slot
+/// prepared and joins the forwards. Sections put into flight as their requests
+/// drain take a minute to push Qwen3.6's weight zone from 10,398 MiB to its
+/// hold, and on Qwen3.8-Flash-Next on a 16 GB card a calibration's sections
+/// and cases fill the ground below the weight floor until no wave's tier can be
+/// placed and nothing in flight can finish.
+pub(super) struct QueuedSection {
+    pub(super) sequence_id: SequenceId,
+    pub(super) section_id: SectionId,
+    pub(super) prefix_section_ids: Vec<SectionId>,
+    pub(super) tokens: TokenBuffer,
+    pub(super) address: ContentAddress,
+    pub(super) debug_name: String,
+    pub(super) in_collection: bool,
+    pub(super) response_tx: Sender<Result<SealResult, ConversationError>>,
 }
 
 /// An in-flight section ingest — CPU setup is done, awaiting the batched
@@ -2862,23 +2895,28 @@ impl WaveStats {
             });
         };
         inference(PhaseKind::Decode, &self.decode, decode_dur);
-        inference(PhaseKind::Section, &self.section, section_dur);
-        // Prefill emitted directly (not via `inference`) so the drain-path ingest
-        // prefill's tokens are folded in with the async-queue prefill's — matching
-        // the `drain_prefill` time already folded into `prefill_dur`.
-        let prefill_tok = self.prefill.tok_sum + self.drain_prefill_tokens;
+        // One prefill band for every prefill the window ran: the async-queue
+        // dialogue prefill, the drain-path ingest prefill, and section ingest —
+        // which is prefill of a section's tokens, run by the same wave step from
+        // the prefill quantum. Charted apart, a section sweep's time sat in
+        // prefill while its tokens went to section: a 2.1 s, 93-token sweep drew
+        // a 3 ms section band at 31,000 tok/s beside a token-less prefill band.
+        let prefill_dur = prefill_dur + section_dur;
+        let prefill_tok = self.prefill.tok_sum + self.drain_prefill_tokens + self.section.tok_sum;
         let prefill_seqs = self
             .prefill
             .seq_max
+            .max(self.section.seq_max)
             .max(if drain_prefill > 0 { 1 } else { 0 });
-        if self.prefill.fwds > 0 || prefill_dur > 0 || prefill_tok > 0 {
+        let prefill_fwds = self.prefill.fwds + self.section.fwds;
+        if prefill_fwds > 0 || prefill_dur > 0 || prefill_tok > 0 {
             phases.push(PhaseMeasure {
                 kind: PhaseKind::Prefill,
                 dur_ms: prefill_dur as u32,
                 tokens: prefill_tok,
                 bytes: 0,
                 seqs: prefill_seqs as u32,
-                count: self.prefill.fwds as u32,
+                count: prefill_fwds as u32,
             });
         }
         let push = |phases: &mut Vec<PhaseMeasure>, kind, dur: u64, bytes, count| {
@@ -3172,11 +3210,14 @@ pub(crate) struct Scheduler {
     /// by `promote_finished_prefills_to_decodes` once their offset reaches
     /// `work.tokens.len()`.
     pub(super) active_prefills: Vec<ActivePrefill>,
+    /// Section ingests waiting for admission, in arrival order — see
+    /// [`QueuedSection`].
+    pub(super) section_queue: VecDeque<QueuedSection>,
     /// In-flight section ingests (batched prefill-only, no decode).
-    /// Populated from [`SchedulerRequest::IngestSection`] after the cheap
-    /// CPU setup (truncate, prefix inject, push writer chunk, pin tokens)
-    /// completes.  Drained by [`Self::run_one_section_ingest_chunk`] once
-    /// each entry's offset reaches its token count, then finalised by
+    /// Populated by [`Self::begin_section`] once admission takes a
+    /// [`QueuedSection`] and its slot is prepared (truncate, prefix inject,
+    /// push writer chunk). Advanced by the wave step once each entry's offset
+    /// reaches its token count, then finalised by
     /// [`Self::finalize_done_section_ingests`].
     pub(super) active_section_ingests: Vec<ActiveSectionIngest>,
     /// Each sealed section's per-position model state, by the section's
@@ -3224,6 +3265,10 @@ pub(crate) struct Scheduler {
     /// otherwise compose every later forward at a width judged for a cohort
     /// long gone.
     rate_width: Option<RateWidth>,
+    /// The widest forward the partition will take since it refused one — see
+    /// [`RefusedWidth`]. [`Self::prefill_pass_budget`] is bounded by it until
+    /// the ground a tier can be placed in grows ([`Self::settle_refused_width`]).
+    refused_width: Option<RefusedWidth>,
     /// Per-turn view ownership: `view_id → ViewState`.
     ///
     /// Populated when [`SchedulerRequest::SubmitTurn`] creates a view
@@ -3256,7 +3301,7 @@ pub(crate) struct Scheduler {
     /// Shared with the engine, which is what the API submits through. A
     /// deployment with no guests configured carries an empty registry and a
     /// queue nothing ever pushes to; see [`crate::guest`].
-    guests: Arc<crate::guest::Guests>,
+    guests: Arc<Guests>,
 
     /// Pending mid-decode view swaps, queued during `batch_decode_step`
     /// (which holds shared/exclusive borrows on `active_decodes`) and
@@ -3520,6 +3565,9 @@ pub(crate) struct Scheduler {
     /// prefill cohort, so only the FIRST decode step of the quantum folds the
     /// cohort in (one budget-sized layer advance per wave, not per decode step).
     wave_cohort_advanced: bool,
+    /// Consecutive failures of the decode-less wave step and the wait owed
+    /// before the next — see `wave_retry`.
+    wave_retry: wave_retry::WaveRetry,
     /// The last wave step carried rows other than decode and verify — a prefill
     /// creep, a section chunk or glue — so the profile can tell an 8-session
     /// decode step from one that also paid for ingest.
@@ -3590,7 +3638,7 @@ impl Scheduler {
         persist_trigger: PersistenceTrigger,
         summariser_trigger: SummariserTrigger,
         boundary_markers: projection_assembler::BoundaryMarkers,
-        guests: Arc<crate::guest::Guests>,
+        guests: Arc<Guests>,
     ) -> Self {
         let device = model.device().clone();
 
@@ -3765,6 +3813,7 @@ impl Scheduler {
             expert_hits_seen: 0,
             expert_misses_seen: 0,
             active_prefills: Vec::new(),
+            section_queue: VecDeque::new(),
             active_section_ingests: Vec::new(),
             section_positional: SectionPages::default(),
             turn_positional: HashMap::new(),
@@ -3774,6 +3823,7 @@ impl Scheduler {
             chunk_size,
             max_prefill_pass_tokens,
             rate_width: None,
+            refused_width: None,
             slot_conversations: HashMap::new(),
             detached: Detached::default(),
             slot_targets: HashMap::new(),
@@ -3818,6 +3868,7 @@ impl Scheduler {
             wave_prefill_cursor: 0,
             wave_prefill_members: Vec::new(),
             wave_cohort_advanced: false,
+            wave_retry: wave_retry::WaveRetry::default(),
             wave_cobatched: false,
             wave_step_ratio: 1,
             wave_section_advanced: false,
@@ -3875,7 +3926,11 @@ impl Scheduler {
             .active_section_ingests
             .iter()
             .map(|s| (s.tokens.token_count(), s.offset));
-        sum_pending_prefill_tokens(queued.chain(active).chain(sections))
+        let queued_sections = self
+            .section_queue
+            .iter()
+            .map(|s| (s.tokens.token_count(), 0));
+        sum_pending_prefill_tokens(queued.chain(active).chain(sections).chain(queued_sections))
     }
 
     fn drain_submissions(&mut self) -> bool {
@@ -4514,8 +4569,10 @@ impl Scheduler {
                     return true;
                 }
 
-                // Step 3: carve the view sequence.
-                let (view_id, borrowed) = match self.create_view(parent_id, &effective_ranges) {
+                // Step 3: carve the view sequence. Its per-sequence state is
+                // forked when admission takes the turn, not here — see
+                // `ViewState::state_forked`.
+                let (view_id, borrowed) = match self.carve_view(parent_id, &effective_ranges) {
                     Ok(t) => t,
                     Err(e) => {
                         let _ = event_tx.send(TurnEvent::Error(e));
@@ -4551,6 +4608,7 @@ impl Scheduler {
                         turn_start_parent_blocks,
                         question_tokens: user_content_end as usize,
                         applied_identity: turn_start_identity(parent_block_count),
+                        state_forked: false,
                     },
                 );
 
@@ -4730,55 +4788,26 @@ impl Scheduler {
                 in_collection,
                 response_tx,
             } => {
-                match self.prepare_section_ingest(
+                let section = QueuedSection {
                     sequence_id,
                     section_id,
-                    &prefix_section_ids,
-                    &tokens,
-                ) {
-                    Ok(seal_block_from) => {
-                        if tokens.is_empty() {
-                            // No forward pass needed — seal immediately.
-                            let result = self
-                                .perform_seal_and_write(
-                                    sequence_id,
-                                    sequence_id,
-                                    seal_block_from,
-                                    &SealAction::Section {
-                                        section_id,
-                                        tokens: Arc::new(tokens.to_vec()),
-                                        address,
-                                        debug_name: debug_name.clone(),
-                                        in_collection,
-                                    },
-                                    None,
-                                )
-                                .and_then(|opt| {
-                                    opt.ok_or_else(|| {
-                                        ConversationError::Channel(
-                                            "ingest_section: seal returned None".into(),
-                                        )
-                                    })
-                                });
-                            let _ = response_tx.send(result);
-                        } else {
-                            self.active_section_ingests.push(ActiveSectionIngest {
-                                sequence_id,
-                                section_id,
-                                tokens,
-                                offset: 0,
-                                seal_block_from,
-                                address,
-                                debug_name,
-                                in_collection,
-                                response_tx,
-                                error: None,
-                            });
-                        }
+                    prefix_section_ids,
+                    tokens,
+                    address,
+                    debug_name,
+                    in_collection,
+                    response_tx,
+                };
+                if section.tokens.is_empty() {
+                    // No forward pass, so nothing to admit or claim: seal now.
+                    if let Err(refused) = self.begin_section(section) {
+                        let (s, why) = *refused;
+                        let _ = s.response_tx.send(Err(why));
                     }
-                    Err(e) => {
-                        let _ = response_tx.send(Err(e));
-                    }
+                } else {
+                    // A first admission like a prefill's — see `QueuedSection`.
+                    self.section_queue.push_back(section);
+                    self.settled_since_admit = true;
                 }
                 true
             }
@@ -5023,13 +5052,25 @@ impl Scheduler {
                 // zero with no error of their own. There is no rollback here, so
                 // best-effort plus a reported error is the honest contract. The
                 // first error is kept and returned.
+                //
+                // **Staged, not restored.** These slots have not run a turn and
+                // may not for a while; restored now, each held a whole recurrent
+                // store outside admission, and a window of new conversations took
+                // the span from under turns admission had already priced. The
+                // model holds the shared rows and builds a store when the slot's
+                // state is first wanted — its view forked at admission, or a wave
+                // on the slot itself.
                 let mut installed = false;
                 let mut first_err = None;
                 for sequence_id in sequence_ids {
                     if !state.layers.is_empty() {
                         match self
                             .model
-                            .restore_recurrent(sequence_id.0, state.schedule_hash, &state.layers)
+                            .stage_recurrent(
+                                sequence_id.0,
+                                state.schedule_hash,
+                                Arc::clone(&state.layers),
+                            )
                             .map_err(ConversationError::Model)
                         {
                             Ok(did) => installed |= did,
@@ -6706,6 +6747,18 @@ impl Scheduler {
     /// frees-and-rebinds its own view state inline and does not route here.
     fn purge_freed_slot_scheduling_state(&mut self, id: SequenceId) {
         self.prefill_queue.retain(|w| w.sequence_id != id);
+        // A section still waiting for admission would otherwise be prepared on
+        // whatever reuses this slot's id. Answered, so its caller is not left
+        // waiting on a seal that will never come.
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.section_queue)
+            .into_iter()
+            .partition(|s| s.sequence_id == id);
+        self.section_queue = kept.into();
+        for s in gone {
+            let _ = s.response_tx.send(Err(ConversationError::Channel(format!(
+                "section ingest on slot {id} dropped: the slot was freed before it was admitted"
+            ))));
+        }
         self.active_prefills.retain(|p| p.work.sequence_id != id);
         self.active_decodes.remove(&id);
         // A terminal free is a completion as far as admission is concerned: the
@@ -8216,6 +8269,73 @@ impl Scheduler {
     /// Returns `seal_block_from` (the chunk index lower bound for the seal).
     /// No forward pass — the caller queues an [`ActiveSectionIngest`] entry
     /// so the batched prefill loop can interleave multiple sections.
+    /// Start an admitted section: claim its slot's carried state, prepare the
+    /// slot, then seal it at once when it has no tokens to prefill, or put it in
+    /// flight for the wave step.
+    ///
+    /// `Err` hands the section back unstarted when its state cannot be claimed —
+    /// see [`Self::begin_admitted`], which claims a turn's the same way and for
+    /// the same reason. Any later failure is the section's own answer, sent to
+    /// its caller here.
+    pub(super) fn begin_section(
+        &mut self,
+        s: QueuedSection,
+    ) -> Result<(), Box<(QueuedSection, ConversationError)>> {
+        if !s.tokens.is_empty() {
+            if let Err(e) = self.model.claim_carried_state(s.sequence_id.0) {
+                return Err(Box::new((s, ConversationError::Model(e))));
+            }
+        }
+        let seal_block_from = match self.prepare_section_ingest(
+            s.sequence_id,
+            s.section_id,
+            &s.prefix_section_ids,
+            &s.tokens,
+        ) {
+            Ok(from) => from,
+            Err(e) => {
+                let _ = s.response_tx.send(Err(e));
+                return Ok(());
+            }
+        };
+        if s.tokens.is_empty() {
+            let result = self
+                .perform_seal_and_write(
+                    s.sequence_id,
+                    s.sequence_id,
+                    seal_block_from,
+                    &SealAction::Section {
+                        section_id: s.section_id,
+                        tokens: Arc::new(s.tokens.to_vec()),
+                        address: s.address,
+                        debug_name: s.debug_name.clone(),
+                        in_collection: s.in_collection,
+                    },
+                    None,
+                )
+                .and_then(|opt| {
+                    opt.ok_or_else(|| {
+                        ConversationError::Channel("ingest_section: seal returned None".into())
+                    })
+                });
+            let _ = s.response_tx.send(result);
+            return Ok(());
+        }
+        self.active_section_ingests.push(ActiveSectionIngest {
+            sequence_id: s.sequence_id,
+            section_id: s.section_id,
+            tokens: s.tokens,
+            offset: 0,
+            seal_block_from,
+            address: s.address,
+            debug_name: s.debug_name,
+            in_collection: s.in_collection,
+            response_tx: s.response_tx,
+            error: None,
+        });
+        Ok(())
+    }
+
     pub(super) fn prepare_section_ingest(
         &mut self,
         sequence_id: SequenceId,
@@ -9685,11 +9805,49 @@ impl Scheduler {
     }
 
     /// The target the forwards are composed against: the deployment's, or the
-    /// rate model's narrower choice for the cohort in flight.
+    /// rate model's narrower choice for the cohort in flight, and never wider
+    /// than a width the partition has refused since ground last freed.
     fn composition_target(&self) -> usize {
-        self.rate_width.map_or(self.max_prefill_pass_tokens, |w| {
+        let target = self.rate_width.map_or(self.max_prefill_pass_tokens, |w| {
             w.rows.min(self.max_prefill_pass_tokens)
-        })
+        });
+        self.refused_width.map_or(target, |w| target.min(w.rows))
+    }
+
+    /// A wave of `rows` prefill rows was refused its tier, `short` bytes over
+    /// the ground it had: compose the next narrower until that ground comes back. `false` when `rows` was already the least chunk, so a narrower
+    /// wave would make no progress and the wave's members must be failed
+    /// instead of retried.
+    pub(super) fn note_refused_width(&mut self, rows: usize, short: usize) -> bool {
+        let ground = self.model.prefill_ground_bytes().unwrap_or(0);
+        match RefusedWidth::after(rows, ground, short, CHUNK_SIZE) {
+            Some(w) => {
+                tracing::warn!(
+                    refused_rows = rows,
+                    next_rows = w.rows,
+                    ground_mib = ground / (1024 * 1024),
+                    short_mib = short / (1024 * 1024),
+                    "the partition refused a wave's tier — composing the next one narrower",
+                );
+                self.refused_width = Some(w);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forget a refused width once the ground a tier can be placed in has grown
+    /// by what the refused tier was short — see [`RefusedWidth::lapsed`].
+    pub(super) fn settle_refused_width(&mut self) {
+        if let Some(w) = self.refused_width {
+            if self
+                .model
+                .prefill_ground_bytes()
+                .is_none_or(|g| w.lapsed(g))
+            {
+                self.refused_width = None;
+            }
+        }
     }
 
     fn pass_budget_under(&self, target: usize) -> usize {
@@ -10124,17 +10282,38 @@ impl Scheduler {
         out
     }
 
+    /// Carve a view of `parent_id` and fork the parent's per-sequence model
+    /// state into it — [`Self::carve_view`] then [`Self::fork_view_state`].
+    /// A fork that fails leaves nothing behind: the view is freed.
+    fn create_view(
+        &mut self,
+        parent_id: SequenceId,
+        visible_block_ranges: &[BlockRange],
+    ) -> Result<(SequenceId, BlockCount), ConversationError> {
+        let (view_id, borrowed) = self.carve_view(parent_id, visible_block_ranges)?;
+        if let Err(e) = self.fork_view_state(parent_id, view_id) {
+            if let Err(free) = self.session.free_sequence(view_id.0) {
+                return Err(ConversationError::Model(candle::Error::Msg(format!(
+                    "{e} — and the view {} could not be freed: {free}",
+                    view_id.0
+                ))));
+            }
+            self.sampling_states.remove(&view_id);
+            return Err(e);
+        }
+        Ok((view_id, borrowed))
+    }
+
     /// Carve a view sequence borrowing the requested ranges from
     /// `parent_id` (or every block if `visible_block_ranges` is
-    /// empty).  Returns `(view_id, original_borrowed_block_count,
-    /// borrowed_partial_usage)` — the partial usage is forwarded
-    /// from the underlying `create_view_sequence` so callers can
-    /// store it on the view's [`ViewState`] for zero-copy reproject.
+    /// empty), without the parent's per-sequence model state — that is
+    /// [`Self::fork_view_state`]'s. Returns `(view_id,
+    /// original_borrowed_block_count)`.
     ///
     /// Called from the [`SchedulerRequest::SubmitTurn`] handler
     /// after [`apply_projection`] has populated the
     /// parent with the projected turns' sealed chunks.
-    fn create_view(
+    fn carve_view(
         &mut self,
         parent_id: SequenceId,
         visible_block_ranges: &[BlockRange],
@@ -10159,8 +10338,8 @@ impl Scheduler {
         // The turn's own tokens start where the parent's prefix ends, so the
         // index is closed there — on the PARENT, and before the carve.
         //
-        // Both halves of that are load-bearing. `fork_recurrent` below copies
-        // the parent's index cache wholesale, live tail included, so a tail left
+        // Both halves of that are load-bearing. The view's fork
+        // (`fork_view_state`) copies the parent's index cache wholesale, live tail included, so a tail left
         // open here arrives in the view as rows the turn's own tokens then
         // extend. And closing it on the parent is what makes the cut idempotent:
         // the parent keeps the page, so a slot that accumulates across turns
@@ -10175,18 +10354,46 @@ impl Scheduler {
         let view_id = SequenceId(vs.view_idx);
         let borrowed = BlockCount(vs.borrowed_block_count);
 
-        // The view borrows the parent's KV blocks zero-copy; per-sequence model
-        // state cannot be borrowed the same way, because the view is about to
-        // advance it. Copy it instead.
-        //
-        // Without this a hybrid's recurrent layers carry nothing across a turn
-        // boundary: the view is a distinct sequence id, so it would start from
-        // the sequence-start value while its KV holds the parent's entire
-        // history — three quarters of the stack contributing nothing but a
-        // function of the current turn, fluently and without an error.
-        self.model
-            .fork_recurrent(parent_id.0, view_id.0)
-            .map_err(ConversationError::Model)?;
+        // Seed sampling state for the view (clone parent's state so
+        // the DRY window survives the carve).
+        if let Some(parent_state) = self.sampling_states.get(&parent_id).cloned() {
+            self.sampling_states.insert(view_id, parent_state);
+        } else {
+            self.sampling_states.insert(
+                view_id,
+                SequenceSamplingState::new(
+                    self.sampler.vocab_size(),
+                    self.sampler.max_recent_len(),
+                ),
+            );
+        }
+
+        Ok((view_id, borrowed))
+    }
+
+    /// Fork `parent_id`'s per-sequence model state into its view `view_id`.
+    ///
+    /// The view borrows the parent's KV blocks zero-copy; per-sequence model
+    /// state cannot be borrowed the same way, because the view is about to
+    /// advance it. Copy it instead.
+    ///
+    /// Without this a hybrid's recurrent layers carry nothing across a turn
+    /// boundary: the view is a distinct sequence id, so it would start from
+    /// the sequence-start value while its KV holds the parent's entire
+    /// history — three quarters of the stack contributing nothing but a
+    /// function of the current turn, fluently and without an error.
+    ///
+    /// A fork that fails leaves the view with no state and the view itself in
+    /// place — the caller decides whether it is freed or waits to fork again.
+    fn fork_view_state(
+        &mut self,
+        parent_id: SequenceId,
+        view_id: SequenceId,
+    ) -> Result<(), ConversationError> {
+        if let Err(e) = self.model.fork_recurrent(parent_id.0, view_id.0) {
+            let _ = self.model.release_sequence(view_id.0);
+            return Err(ConversationError::Model(e));
+        }
         FORK_RECURRENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The view borrows the parent's K/V blocks but copies its per-position
         // state, so the two have to agree at the moment of the carve. A view
@@ -10210,27 +10417,12 @@ impl Scheduler {
                     parent_tokens,
                     parent_coverage = ?parent_cov,
                     view_coverage = cov,
-                    "create_view: carved a view over {} token(s) its index does not cover",
+                    "fork_view_state: forked a view over {} token(s) its index does not cover",
                     parent_tokens - cov
                 );
             }
         }
-
-        // Seed sampling state for the view (clone parent's state so
-        // the DRY window survives the carve).
-        if let Some(parent_state) = self.sampling_states.get(&parent_id).cloned() {
-            self.sampling_states.insert(view_id, parent_state);
-        } else {
-            self.sampling_states.insert(
-                view_id,
-                SequenceSamplingState::new(
-                    self.sampler.vocab_size(),
-                    self.sampler.max_recent_len(),
-                ),
-            );
-        }
-
-        Ok((view_id, borrowed))
+        Ok(())
     }
 
     /// Budget-aware pre-elevate eviction (replaces the unconditional
@@ -11424,6 +11616,7 @@ impl Scheduler {
                 turn_start_parent_blocks: new_prefix_block_count,
                 question_tokens,
                 applied_identity,
+                state_forked: true,
             },
         );
 
@@ -11489,6 +11682,7 @@ mod tests {
 
     use super::*;
     use candle::{DType, Tensor};
+    use candle_nn::kv_cache::KV_DEVICE_OOM_MARKER;
     use candle_transformers::models::speculative_choice::GreedyChooser;
     use std::sync::Mutex;
 
@@ -12419,7 +12613,7 @@ mod tests {
             projection_assembler::BoundaryMarkers::default(),
             // No guests: these exercise the wave loop, and an empty registry is
             // what every deployment that has not configured one carries.
-            Arc::new(crate::guest::Guests::new()),
+            Arc::new(Guests::new()),
         );
         (scheduler, tx)
     }
@@ -12450,7 +12644,7 @@ mod tests {
             projection_assembler::BoundaryMarkers::default(),
             // No guests: these exercise the wave loop, and an empty registry is
             // what every deployment that has not configured one carries.
-            Arc::new(crate::guest::Guests::new()),
+            Arc::new(Guests::new()),
         );
         (scheduler, tx, probe)
     }
@@ -12497,6 +12691,371 @@ mod tests {
         fn prune(&self) -> candle::Result<()> {
             Ok(())
         }
+    }
+
+    /// A model whose every carried-state claim is refused — what admission meets
+    /// when the ground below the weight floor is gone.
+    #[derive(Clone)]
+    struct RefusingClaim(DummyModel);
+
+    impl ManagedBatchedModel for RefusingClaim {
+        fn maybe_change_dtype(&self, dtype: DType) -> candle::Result<()> {
+            self.0.maybe_change_dtype(dtype)
+        }
+        fn num_layers(&self) -> usize {
+            self.0.num_layers()
+        }
+        fn n_kv_head(&self) -> usize {
+            self.0.n_kv_head()
+        }
+        fn head_dim(&self) -> usize {
+            self.0.head_dim()
+        }
+        fn wave_geometry(&self, act_dtype: DType) -> candle_nn::kv_cache::ModelGeometry {
+            self.0.wave_geometry(act_dtype)
+        }
+        fn device(&self) -> &candle::Device {
+            self.0.device()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn forward_wave(
+            &self,
+            session: &mut BatchedInferenceSession,
+            decode_seqs: &[usize],
+            decode_inputs: &[Tensor],
+            prefill_seqs: &[usize],
+            prefill_inputs: &[Tensor],
+            glue_seqs: &[usize],
+            glue_inputs: &[Tensor],
+            layer_start: usize,
+            layer_end: usize,
+            residual_in: Option<Tensor>,
+        ) -> candle::Result<WaveResult> {
+            self.0.forward_wave(
+                session,
+                decode_seqs,
+                decode_inputs,
+                prefill_seqs,
+                prefill_inputs,
+                glue_seqs,
+                glue_inputs,
+                layer_start,
+                layer_end,
+                residual_in,
+            )
+        }
+        fn prune(&self) -> candle::Result<()> {
+            Ok(())
+        }
+        fn claim_carried_state(&self, _seq: usize) -> candle::Result<()> {
+            candle::bail!("slot arena: no region for recurrent state")
+        }
+    }
+
+    /// A scheduler over [`RefusingClaim`], sized as `admission_scheduler` is.
+    fn refusing_claim_scheduler() -> Scheduler {
+        let (_tx, rx) = flume::bounded(16);
+        Scheduler::new(
+            rx,
+            Box::new(RefusingClaim(DummyModel::new())) as Box<dyn ManagedBatchedModel + Send>,
+            make_test_session(),
+            make_dummy_tokenizer(),
+            vec![0u32].into(),
+            64,
+            8,
+            false,
+            None,
+            DecodeHealthConfig::default(),
+            512,
+            PersistenceTrigger::noop(),
+            SummariserTrigger::noop(),
+            projection_assembler::BoundaryMarkers::default(),
+            Arc::new(Guests::new()),
+        )
+    }
+
+    /// **A refused claim waits while something is in flight to free ground.**
+    /// The turn goes back to the head of the queue, unstarted.
+    #[test]
+    fn a_refused_claim_waits_while_something_is_in_flight() {
+        let mut sched = refusing_claim_scheduler();
+        let running = SequenceId(sched.session.create_sequence().unwrap());
+        sched.begin_prefill(test_prefill_work(running));
+        let waiting = SequenceId(sched.session.create_sequence().unwrap());
+        sched.prefill_queue.push_back(test_prefill_work(waiting));
+
+        sched.promote_new_prefills();
+
+        assert_eq!(sched.prefill_queue.len(), 1, "back in the queue");
+        assert_eq!(sched.prefill_queue[0].sequence_id, waiting);
+        assert_eq!(
+            sched.active_prefills.len(),
+            1,
+            "only the one already running"
+        );
+    }
+
+    /// **With nothing in flight a refused claim fails the turn** — answered and
+    /// cleaned up the way any failed prefill is, never dropped unanswered and
+    /// never retried forever.
+    #[test]
+    fn a_refused_claim_with_nothing_in_flight_fails_the_turn() {
+        let mut sched = refusing_claim_scheduler();
+        let slot = SequenceId(sched.session.create_sequence().unwrap());
+        sched.prefill_queue.push_back(test_prefill_work(slot));
+
+        sched.promote_new_prefills();
+
+        assert!(sched.prefill_queue.is_empty(), "not retried forever");
+        assert_eq!(sched.active_prefills.len(), 1);
+        assert!(
+            sched.active_prefills[0].error.is_some(),
+            "in flight already failed, so it leaves as a failed prefill does",
+        );
+    }
+
+    /// A section whose claim is refused with nothing in flight is answered with
+    /// the refusal, not left queued.
+    #[test]
+    fn a_refused_section_claim_with_nothing_in_flight_is_answered() {
+        let mut sched = refusing_claim_scheduler();
+        let (_, rx) = ingest_section(&mut sched, 64);
+
+        sched.promote_new_prefills();
+
+        assert!(sched.section_queue.is_empty());
+        assert!(sched.active_section_ingests.is_empty());
+        assert!(rx.try_recv().expect("answered").is_err());
+    }
+
+    /// A model that records every view fork and every staged snapshot, refuses
+    /// every fork when `refuse` is set — a recurrent store the span has no room
+    /// for — and refuses an eager restore outright, so a request that should
+    /// stage and restores instead fails its test.
+    #[derive(Clone)]
+    struct ForkLog {
+        inner: DummyModel,
+        forks: Arc<Mutex<Vec<(usize, usize)>>>,
+        staged: Arc<Mutex<Vec<usize>>>,
+        refuse: bool,
+    }
+
+    impl ManagedBatchedModel for ForkLog {
+        fn maybe_change_dtype(&self, dtype: DType) -> candle::Result<()> {
+            self.inner.maybe_change_dtype(dtype)
+        }
+        fn num_layers(&self) -> usize {
+            self.inner.num_layers()
+        }
+        fn n_kv_head(&self) -> usize {
+            self.inner.n_kv_head()
+        }
+        fn head_dim(&self) -> usize {
+            self.inner.head_dim()
+        }
+        fn wave_geometry(&self, act_dtype: DType) -> candle_nn::kv_cache::ModelGeometry {
+            self.inner.wave_geometry(act_dtype)
+        }
+        fn device(&self) -> &candle::Device {
+            self.inner.device()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn forward_wave(
+            &self,
+            session: &mut BatchedInferenceSession,
+            decode_seqs: &[usize],
+            decode_inputs: &[Tensor],
+            prefill_seqs: &[usize],
+            prefill_inputs: &[Tensor],
+            glue_seqs: &[usize],
+            glue_inputs: &[Tensor],
+            layer_start: usize,
+            layer_end: usize,
+            residual_in: Option<Tensor>,
+        ) -> candle::Result<WaveResult> {
+            self.inner.forward_wave(
+                session,
+                decode_seqs,
+                decode_inputs,
+                prefill_seqs,
+                prefill_inputs,
+                glue_seqs,
+                glue_inputs,
+                layer_start,
+                layer_end,
+                residual_in,
+            )
+        }
+        fn prune(&self) -> candle::Result<()> {
+            Ok(())
+        }
+        fn fork_recurrent(&self, parent: usize, child: usize) -> candle::Result<()> {
+            if self.refuse {
+                candle::bail!("slot arena: no region for recurrent state")
+            }
+            self.forks.lock().unwrap().push((parent, child));
+            Ok(())
+        }
+        fn restore_recurrent(
+            &self,
+            seq: usize,
+            _schedule_hash: u64,
+            _layers: &[ExportedLayerState],
+        ) -> candle::Result<bool> {
+            candle::bail!("sequence {seq} was restored eagerly instead of staged")
+        }
+        fn stage_recurrent(
+            &self,
+            seq: usize,
+            _schedule_hash: u64,
+            _layers: Arc<[ExportedLayerState]>,
+        ) -> candle::Result<bool> {
+            self.staged.lock().unwrap().push(seq);
+            Ok(true)
+        }
+    }
+
+    /// A scheduler over [`ForkLog`], and a handle on the logs it writes.
+    fn fork_log_scheduler(refuse: bool) -> (Scheduler, ForkLog) {
+        let model = ForkLog {
+            inner: DummyModel::new(),
+            forks: Arc::new(Mutex::new(Vec::new())),
+            staged: Arc::new(Mutex::new(Vec::new())),
+            refuse,
+        };
+        let log = model.clone();
+        let (_tx, rx) = flume::bounded(16);
+        let sched = Scheduler::new(
+            rx,
+            Box::new(model) as Box<dyn ManagedBatchedModel + Send>,
+            make_test_session(),
+            make_dummy_tokenizer(),
+            vec![0u32].into(),
+            64,
+            8,
+            false,
+            None,
+            DecodeHealthConfig::default(),
+            512,
+            PersistenceTrigger::noop(),
+            SummariserTrigger::noop(),
+            projection_assembler::BoundaryMarkers::default(),
+            Arc::new(Guests::new()),
+        );
+        (sched, log)
+    }
+
+    /// Queue a turn the way `SubmitTurn` does: its view carved at submit, its
+    /// state not yet forked.
+    fn submit_unforked_turn(sched: &mut Scheduler) -> (SequenceId, SequenceId) {
+        let parent = SequenceId(sched.session.create_sequence().unwrap());
+        let (view, borrowed) = sched.carve_view(parent, &[]).unwrap();
+        sched.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: borrowed,
+                turn_start_parent_blocks: borrowed.0,
+                question_tokens: 0,
+                applied_identity: None,
+                state_forked: false,
+            },
+        );
+        sched.prefill_queue.push_back(test_prefill_work(view));
+        (parent, view)
+    }
+
+    /// **A submitted turn's view is forked its parent's state when admission
+    /// takes it, not when it is submitted.** A window of submissions forking at
+    /// submit claimed a recurrent store for every turn at once, outside
+    /// admission, and failed the ones the span had no room for.
+    #[test]
+    fn a_submitted_turns_state_is_forked_at_admission() {
+        let (mut sched, log) = fork_log_scheduler(false);
+        let (parent, view) = submit_unforked_turn(&mut sched);
+        assert!(
+            log.forks.lock().unwrap().is_empty(),
+            "nothing forked at submit"
+        );
+
+        sched.promote_new_prefills();
+
+        assert_eq!(*log.forks.lock().unwrap(), vec![(parent.0, view.0)]);
+        assert!(sched.turn_views[&view].state_forked);
+        assert_eq!(sched.active_prefills.len(), 1);
+        assert!(sched.active_prefills[0].error.is_none());
+    }
+
+    /// **A refused fork waits while something is in flight**, its view kept and
+    /// still unforked, so the next pass forks it once there is room.
+    #[test]
+    fn a_refused_fork_waits_while_something_is_in_flight() {
+        let (mut sched, _) = fork_log_scheduler(true);
+        let running = SequenceId(sched.session.create_sequence().unwrap());
+        sched.begin_prefill(test_prefill_work(running));
+        let (_, view) = submit_unforked_turn(&mut sched);
+
+        sched.promote_new_prefills();
+
+        assert_eq!(sched.prefill_queue.len(), 1, "back in the queue");
+        assert_eq!(sched.prefill_queue[0].sequence_id, view);
+        assert!(!sched.turn_views[&view].state_forked);
+        assert_eq!(
+            sched.active_prefills.len(),
+            1,
+            "only the one already running"
+        );
+    }
+
+    /// With nothing in flight a refused fork fails the turn rather than
+    /// waiting on ground nothing will free.
+    #[test]
+    fn a_refused_fork_with_nothing_in_flight_fails_the_turn() {
+        let (mut sched, _) = fork_log_scheduler(true);
+        submit_unforked_turn(&mut sched);
+
+        sched.promote_new_prefills();
+
+        assert!(sched.prefill_queue.is_empty(), "not retried forever");
+        assert_eq!(sched.active_prefills.len(), 1);
+        assert!(sched.active_prefills[0].error.is_some());
+    }
+
+    /// **A branch checkpoint is staged on its slots, not restored into them.**
+    /// Restored at install, every new conversation held a whole recurrent store
+    /// before its turn was admitted, and a window of them took the span from
+    /// under a turn admission had already priced — the lost calibration cases.
+    #[test]
+    fn a_branch_checkpoint_install_stages_and_claims_nothing() {
+        let (mut sched, log) = fork_log_scheduler(false);
+        let slots: Vec<SequenceId> = (0..3)
+            .map(|_| SequenceId(sched.session.create_sequence().unwrap()))
+            .collect();
+        let layer = ExportedLayerState {
+            layer_index: 0,
+            n_v_heads: 1,
+            d_v: 1,
+            d_k: 4,
+            state: vec![0; 16],
+            conv_channels: 0,
+            conv_tail_cols: 0,
+            conv_tail: Vec::new(),
+        };
+        let (tx, rx) = flume::bounded(1);
+        sched.handle_request(SchedulerRequest::InstallRecurrentState {
+            sequence_ids: slots.clone(),
+            state: SharedState {
+                schedule_hash: 1,
+                layers: vec![layer].into(),
+                aux: Vec::new().into(),
+            },
+            response_tx: tx,
+        });
+
+        assert!(rx.recv().unwrap().expect("staged, not restored"));
+        let staged: Vec<usize> = log.staged.lock().unwrap().clone();
+        assert_eq!(staged, slots.iter().map(|s| s.0).collect::<Vec<_>>());
+        assert!(!slots.iter().any(|s| sched.model.has_recurrent_state(s.0)));
     }
 
     /// A model that refuses a wave mixing adapters — as the real session does —
@@ -12582,7 +13141,7 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
-            Arc::new(crate::guest::Guests::new()),
+            Arc::new(Guests::new()),
         )
     }
 
@@ -12686,7 +13245,7 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
-            Arc::new(crate::guest::Guests::new()),
+            Arc::new(Guests::new()),
         );
         let slot = SequenceId(3);
         sched
@@ -14071,6 +14630,7 @@ mod tests {
                 turn_start_parent_blocks: 0,
                 question_tokens: 0,
                 applied_identity: None,
+                state_forked: true,
             },
         );
 
@@ -14329,18 +14889,16 @@ mod tests {
     /// The toy recurrence is affine and absorbs every token (`s ← 2s + t·k`),
     /// so a case that had run on from its predecessors would carry their tokens
     /// in its state and could not match the lone run. Driven through the whole
-    /// loop — carve, batched prefill, in-order seal, release — with a window
-    /// narrower than the group, so cases also open as earlier ones seal.
+    /// loop — queue, carve at admission, batched prefill, in-order seal,
+    /// release — so a case carved late must still fork the prefix's state.
     #[test]
     fn a_turn_groups_cases_each_start_from_the_prefix() {
-        let run_group = |cases: &[&[u32]], window: u64| {
+        let run_group = |cases: &[&[u32]]| {
             let (mut scheduler, tx, probe) = make_test_scheduler_recurrent();
             let conversation = crate::projection::Conversation::new();
             let parent = create_scratch_slot(&mut scheduler, &conversation);
             forward_on(&mut scheduler, parent.0, &[5, 6, 7, 8]);
             let prefix = probe.get(parent.0).expect("the prefix left a state");
-            // The window is what the admission setpoint funds in stores.
-            scheduler.admit_budget = window * scheduler.model.recurrent_store_bytes() as u64;
             let blocks = scheduler.session.sequence_block_count(parent.0).unwrap();
             let (event_tx, event_rx) = flume::unbounded();
             scheduler.start_turn_group(
@@ -14358,37 +14916,43 @@ mod tests {
                 event_tx,
             );
             let loop_thread = std::thread::spawn(move || scheduler.run());
-            let done = loop {
+            // **This CPU session cannot snapshot its K/V** (the stub model writes
+            // none, so a seal finds an empty range), so no case seals and the
+            // group answers that it lost them all — what a group that lost every
+            // case must say. Every case still ran its prefill and released its
+            // state in order, which is what this test reads; a group answering
+            // `Done` is [`turn_group_verdict`]'s test.
+            let answer = loop {
                 match event_rx
                     .recv_timeout(Duration::from_secs(60))
                     .expect("the group ends within a minute")
                 {
-                    TurnEvent::Done(resp) => break resp,
-                    TurnEvent::Error(e) => panic!("the group failed: {e}"),
+                    TurnEvent::Done(_) => panic!("a group whose cases sealed nothing is not done"),
+                    TurnEvent::Error(e) => break e.to_string(),
                     _ => {}
                 }
             };
+            assert!(
+                answer.ends_with(&format!("0 of {n} cases sealed, {n} lost", n = cases.len())),
+                "the group names every case it could not seal: {answer}",
+            );
             tx.send(SchedulerRequest::Shutdown)
                 .expect("scheduler running");
             loop_thread.join().expect("the loop exits cleanly");
             let after = probe
                 .get(parent.0)
                 .expect("the last case's state moved onto the parent");
-            (prefix, after, done)
+            (prefix, after)
         };
 
         let last: &[u32] = &[21, 22, 23];
-        let (prefix, alone, _) = run_group(&[last], 1);
+        let (prefix, alone) = run_group(&[last]);
         assert_ne!(alone, prefix, "the lone case advanced the prefix's state");
-        let (_, grouped, done) = run_group(&[&[11, 12, 13, 14, 15], &[31, 32], last], 2);
+        let (_, grouped) = run_group(&[&[11, 12, 13, 14, 15], &[31, 32], last]);
         assert_eq!(
             grouped, alone,
             "the group's last case must leave exactly what a lone prefill of it leaves — \
              a different state means it ran on from the cases before it",
-        );
-        assert_eq!(
-            done.stats.turn_prefill_tokens, 10,
-            "every case's tokens were prefilled once"
         );
     }
 
@@ -14410,6 +14974,7 @@ mod tests {
                 turn_start_parent_blocks: 0,
                 question_tokens: 0,
                 applied_identity: None,
+                state_forked: true,
             },
         );
 
@@ -14455,6 +15020,7 @@ mod tests {
                 turn_start_parent_blocks: 0,
                 question_tokens: 0,
                 applied_identity: None,
+                state_forked: true,
             },
         );
         scheduler.discard_turn_view(view);
@@ -14774,7 +15340,7 @@ mod tests {
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
-            Arc::new(crate::guest::Guests::new()),
+            Arc::new(Guests::new()),
         )
     }
 
@@ -14991,7 +15557,210 @@ mod tests {
         );
     }
 
+    /// A section request on a fresh slot, with a receiver for its answer.
+    fn ingest_section(
+        sched: &mut Scheduler,
+        tokens: usize,
+    ) -> (
+        SequenceId,
+        flume::Receiver<Result<SealResult, ConversationError>>,
+    ) {
+        let slot = SequenceId(sched.session.create_sequence().unwrap());
+        let (response_tx, response_rx) = flume::bounded(1);
+        assert!(sched.handle_request(SchedulerRequest::IngestSection {
+            sequence_id: slot,
+            section_id: SectionId::new(1),
+            prefix_section_ids: Vec::new(),
+            tokens: TokenBuffer::from(vec![1u32; tokens]),
+            address: ContentAddress::default(),
+            debug_name: "s".into(),
+            in_collection: false,
+            response_tx,
+        }));
+        (slot, response_rx)
+    }
+
+    /// **A section waits for admission; it does not go straight into flight.**
+    ///
+    /// It used to: the request handler put it in flight as it drained, so no
+    /// admission pass ever priced one, and a calibration's sections and cases
+    /// filled the ground below the weight floor until no wave could be placed.
+    #[test]
+    fn an_ingested_section_waits_in_the_queue_until_admitted() {
+        let mut sched = admission_scheduler();
+        ingest_section(&mut sched, 64);
+        assert_eq!(sched.section_queue.len(), 1, "queued on arrival");
+        assert!(
+            sched.active_section_ingests.is_empty(),
+            "nothing in flight before admission",
+        );
+        assert!(sched.settled_since_admit, "an arrival opens admission");
+
+        sched.promote_new_prefills();
+
+        assert!(sched.section_queue.is_empty(), "admission took it");
+        assert_eq!(sched.active_section_ingests.len(), 1, "and it is in flight");
+    }
+
+    /// **A section batch's device OOM is retried, any other error fails it.**
+    /// The wave-group path retries an OOM's section members; the standalone
+    /// batch carries the same sections and answers the same error the same way.
+    #[test]
+    fn a_section_batch_oom_is_retried_and_other_errors_fail_it() {
+        let mut sched = admission_scheduler();
+        ingest_section(&mut sched, 64);
+        sched.promote_new_prefills();
+        assert_eq!(sched.active_section_ingests.len(), 1);
+
+        let oom = candle::Error::Msg(format!("{KV_DEVICE_OOM_MARKER}: no room"));
+        sched.fail_section_batch(&[0], &[64], &oom);
+        assert!(
+            sched.active_section_ingests[0].error.is_none(),
+            "an OOM failed the section instead of leaving it to retry"
+        );
+
+        let other = candle::Error::Msg("bad operand".into());
+        sched.fail_section_batch(&[0], &[64], &other);
+        assert!(sched.active_section_ingests[0].error.is_some());
+    }
+
+    /// **The width backstop bounds sections**, which it never did while they
+    /// skipped admission: 88 were in flight on Qwen3.8-Flash-Next's calibration.
+    /// A stack with no planner takes them up to the backstop and leaves the
+    /// rest queued.
+    #[test]
+    fn sections_are_bounded_by_the_width_backstop() {
+        let mut sched = admission_scheduler();
+        for _ in 0..Scheduler::MAX_PREFILL_WIDTH + 3 {
+            ingest_section(&mut sched, 64);
+        }
+        sched.promote_new_prefills();
+        assert_eq!(
+            sched.active_section_ingests.len(),
+            Scheduler::MAX_PREFILL_WIDTH
+        );
+        assert_eq!(sched.section_queue.len(), 3);
+    }
+
+    /// An empty section has no forward to admit and seals on arrival.
+    #[test]
+    fn an_empty_section_is_never_queued() {
+        let mut sched = admission_scheduler();
+        ingest_section(&mut sched, 0);
+        assert!(sched.section_queue.is_empty());
+        assert!(sched.active_section_ingests.is_empty());
+    }
+
+    /// A queued section whose slot is freed is answered and dropped, not
+    /// prepared later on whatever reuses the slot's id.
+    #[test]
+    fn a_freed_slot_drops_its_queued_section_with_an_answer() {
+        let mut sched = admission_scheduler();
+        let (slot, rx) = ingest_section(&mut sched, 64);
+        sched.purge_freed_slot_scheduling_state(slot);
+        assert!(sched.section_queue.is_empty());
+        let answer = rx.try_recv().expect("the caller is answered");
+        assert!(answer.is_err(), "with an error, not a seal");
+    }
+
     // —— view-creation tests —————————————————————————————————————————————————
+
+    /// **A view that fails part way leaves no slot behind.**
+    ///
+    /// A slot kept would hold whatever it had borrowed with nothing to free it:
+    /// on Qwen3.8-Flash-Next's calibration every refused carve would pin its
+    /// parent's prefix, and compaction would report the borrowed history as
+    /// writable — 66,471 times in a minute.
+    #[test]
+    fn a_view_that_fails_part_way_frees_its_slot() {
+        let mut session = make_test_session();
+        let parent = session.create_sequence().unwrap();
+        let next_free = session.create_sequence().unwrap();
+        session.free_sequence(next_free).unwrap();
+        // The parent holds no blocks, so the borrow refuses a range past them.
+        assert!(session.create_view_sequence(parent, &[(0, 3)]).is_err());
+        assert_eq!(
+            session.create_sequence().unwrap(),
+            next_free,
+            "the failed view's slot is free again",
+        );
+    }
+
+    /// **A turn-group case queues without a view, and is carved one when
+    /// admission takes it** — not before, so nothing is claimed for a case the
+    /// engine has not judged it can carry.
+    #[test]
+    fn a_group_case_is_carved_its_view_only_when_admitted() {
+        let mut sched = admission_scheduler();
+        let parent = SequenceId(sched.session.create_sequence().unwrap());
+        let (event_tx, _event_rx) = flume::unbounded();
+        let case = || TurnContent {
+            token_ids: TokenBuffer::from(vec![1u32; 64]),
+            ..TurnContent::default()
+        };
+        sched.start_turn_group(
+            parent,
+            Vec::new(),
+            vec![case(), case()],
+            SamplingConfig::default(),
+            PriorBelief::default(),
+            event_tx,
+        );
+        assert_eq!(sched.prefill_queue.len(), 2, "both cases queued");
+        assert!(
+            sched.prefill_queue.iter().all(|w| w.sequence_id == parent),
+            "on the parent's slot: no view carved yet",
+        );
+        assert!(
+            sched.turn_views.is_empty(),
+            "nothing claimed before admission"
+        );
+
+        sched.promote_new_prefills();
+
+        let started = &sched.active_prefills[0].work;
+        assert_ne!(
+            started.sequence_id, parent,
+            "admission carved the case its own view"
+        );
+        assert!(sched.turn_views.contains_key(&started.sequence_id));
+    }
+
+    /// **Resetting a parent takes its group's queued cases with it.** They wait
+    /// on the parent's own slot for a view; left behind with the group gone,
+    /// one would be prefilled straight into whatever the reset slot holds next.
+    #[test]
+    fn resetting_a_parent_drops_its_groups_queued_cases() {
+        let mut sched = admission_scheduler();
+        let parent = SequenceId(sched.session.create_sequence().unwrap());
+        let (event_tx, event_rx) = flume::unbounded();
+        let case = || TurnContent {
+            token_ids: TokenBuffer::from(vec![1u32; 64]),
+            ..TurnContent::default()
+        };
+        sched.start_turn_group(
+            parent,
+            Vec::new(),
+            vec![case(), case(), case()],
+            SamplingConfig::default(),
+            PriorBelief::default(),
+            event_tx,
+        );
+        assert_eq!(sched.prefill_queue.len(), 3);
+
+        let (tx, rx) = flume::bounded(1);
+        sched.handle_request(SchedulerRequest::ResetSequence {
+            sequence_id: parent,
+            response_tx: tx,
+        });
+        rx.recv().unwrap().expect("reset");
+
+        assert!(
+            sched.prefill_queue.is_empty(),
+            "a queued case outlived its group"
+        );
+        assert!(matches!(event_rx.try_recv(), Ok(TurnEvent::Error(_))));
+    }
 
     /// Explicit `visible_block_ranges` over a populated parent must create a valid view.
     #[test]
@@ -15018,7 +15787,7 @@ mod tests {
             projection_assembler::BoundaryMarkers::default(),
             // No guests: these exercise the wave loop, and an empty registry is
             // what every deployment that has not configured one carries.
-            Arc::new(crate::guest::Guests::new()),
+            Arc::new(Guests::new()),
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();
@@ -15084,7 +15853,7 @@ mod tests {
             projection_assembler::BoundaryMarkers::default(),
             // No guests: these exercise the wave loop, and an empty registry is
             // what every deployment that has not configured one carries.
-            Arc::new(crate::guest::Guests::new()),
+            Arc::new(Guests::new()),
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();
@@ -15233,6 +16002,7 @@ mod tests {
                 turn_start_parent_blocks: borrowed.0,
                 question_tokens: 0,
                 applied_identity: None,
+                state_forked: true,
             },
         );
         view
@@ -15558,6 +16328,7 @@ mod tests {
                 turn_start_parent_blocks: 0,
                 question_tokens: 0,
                 applied_identity: None,
+                state_forked: true,
             },
         );
         view

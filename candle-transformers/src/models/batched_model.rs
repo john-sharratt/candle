@@ -921,6 +921,8 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                         accept_rows: if accept_in_place { scored_rows } else { 0 },
                         // This stack's attention is dense: no sparse selection.
                         qsa_bytes: 0,
+                        // No look-ahead routers on this path.
+                        look_ahead_hops: 0,
                         // The prefill launch's carve: up to one key chunk of
                         // each bulk chunk's sequence, and the carry beside it.
                         // Glue rows take their own kernel, which stages nothing.

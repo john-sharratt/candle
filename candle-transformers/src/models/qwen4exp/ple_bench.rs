@@ -21,6 +21,7 @@
 //! kernel this shape, the whole verdict: at the card's achievable bandwidth
 //! there is nothing left to win.
 
+use candle::quantized::Int8Mode;
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
 
@@ -206,8 +207,27 @@ pub fn gate_once(
 /// From the second wave on it also checks the double buffer: a wave reads the
 /// history the wave before it wrote, and leaves the buffer it read as the
 /// sequence's spare — never the one it wrote.
+///
+/// A float session's projection, so the gap is the fused kernels' against the
+/// eager chain and nothing else — see [`gate_waves_in`] for an int8 one.
 pub fn gate_waves(
     dev: &Device,
+    hc: usize,
+    d: usize,
+    heads: usize,
+    lens: &[usize],
+    waves: usize,
+    seed: u64,
+) -> Result<f32> {
+    gate_waves_in(dev, Int8Mode::Off, hc, d, heads, lens, waves, seed)
+}
+
+/// [`gate_waves`] with the fused block's projection built for `mode`. Under an
+/// int8 mode the gap includes the projection's quantization.
+#[allow(clippy::too_many_arguments)]
+pub fn gate_waves_in(
+    dev: &Device,
+    mode: Int8Mode,
     hc: usize,
     d: usize,
     heads: usize,
@@ -221,7 +241,7 @@ pub fn gate_waves(
     }
     let hcd = hc * d;
     let w = weights(hc, d, cfg.conv_kernel, seed, dev)?;
-    let fw = PleFusedWeights::from_weights(&w)?;
+    let fw = PleFusedWeights::from_weights(&w, mode)?;
     let rows = cfg.head_offsets.last().copied().unwrap_or(0) as usize + 64;
     let table = DeviceTable(lcg(&[rows, cfg.head_dim], seed ^ 9, dev)?);
     let total: usize = lens.iter().sum();
@@ -321,7 +341,10 @@ pub fn run_ple_kernels(dev: &Device, cfg: PleBenchCfg) -> Result<()> {
     let (t, hc, d) = (cfg.tokens, cfg.hc, cfg.n_embd);
     let hcd = cfg.hcd();
     let pc = ple_cfg(d, 16);
-    let w = PleFusedWeights::from_weights(&weights(hc, d, pc.conv_kernel, cfg.seed, dev)?)?;
+    let w = PleFusedWeights::from_weights(
+        &weights(hc, d, pc.conv_kernel, cfg.seed, dev)?,
+        Int8Mode::Off,
+    )?;
     let kv = lcg(&[t, hcd + d], cfg.seed ^ 0x31, dev)?;
     let res = lcg(&[t, hc, d], cfg.seed ^ 0x32, dev)?;
     let normalized = lcg(&[t, hcd], cfg.seed ^ 0x33, dev)?;

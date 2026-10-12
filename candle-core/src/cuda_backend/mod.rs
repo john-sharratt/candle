@@ -174,11 +174,17 @@ pub mod cudnn;
 mod device;
 mod error;
 pub mod graph;
+mod held;
 mod info_ring;
+mod kernel_scratch;
+pub mod link_probe;
 pub mod staged;
+mod stream_alloc;
 mod utils;
 pub use device::{CudaDevice, DeviceId, Uploaded};
 pub use error::{CudaError, WrapErr};
+pub use held::{install_held_ground, Held, HeldGround};
+pub use stream_alloc::{stream_alloc, stream_alloc_zeros, stream_memcpy_stod};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Out, OutS, S};
 
 pub enum SlicePtrOrNull<T> {

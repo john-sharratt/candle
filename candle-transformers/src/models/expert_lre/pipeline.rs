@@ -48,7 +48,7 @@ use super::slot_image::{build_slot_view, slot_offsets};
 use super::stager::StagerMsg;
 use super::transition::{TransitionMatrix, HOPS};
 use super::types::{PipelineMessage, PipelineStats, RoutedLayer};
-use super::votes::{ranked, VoteRing, Votes};
+use super::votes::{ranked, voted_set, VoteRing, Votes};
 use crate::models::profile::{profile_now, ProfileAccumulator};
 use candle::{Device, Result};
 use candle_kernels::simple::moe_bucketize::AHEAD_MAX;
@@ -807,6 +807,10 @@ impl PipelineState {
                 // Invocations the device has begun past this one, as of now.
                 let begun_past = self.clock.latest_started().saturating_sub(msg.ticket);
                 self.predict_rows(row, &expert_ids, votes.as_ref(), wide, begun_past)?;
+            } else if msg.prefill_width {
+                if let Some(v) = votes.as_ref() {
+                    self.stage_voted(row, v)?;
+                }
             }
             self.profile.record("pipe_prefetch", t);
         }
@@ -1313,6 +1317,51 @@ impl PipelineState {
             });
         }
         Ok(listed)
+    }
+
+    /// A prefill-width launch at `row` voted on the rows after it: stage every
+    /// expert each of those rows' routers put in some token's top `k`
+    /// (`voted_set`) and that the device cannot read yet, in expert order, so
+    /// the drive reads the coming layers while this one computes.
+    ///
+    /// **The drive, not the link.** A prefill launch's own misses saturate the
+    /// link, which is why it lists nothing for the device's read-ahead (above);
+    /// staging moves a pack record into the pad, which only the drive pays for,
+    /// and a prefill pass is bound by the drive. Ranking by the pad's scores
+    /// instead measured ~1,000 unrouted reads a pass on Flash-Next's ×8 prefill
+    /// and covered ~40% of the next row's cold set — those scores are decode's.
+    fn stage_voted(&mut self, row: usize, votes: &Votes) -> Result<()> {
+        let width = self.inner.experts_per_layer;
+        // Nearest row first: the stager serves its speculative queue in order.
+        for hop in 1..=votes.hops(width) {
+            let target = row + hop;
+            if target >= self.num_moe_layers {
+                break;
+            }
+            let voted = voted_set(votes.hop(hop, width).0);
+            let cold: Vec<usize> = {
+                let places = self.residency.lock().map_err(|_| {
+                    candle::Error::Msg("expert pipeline: residency poisoned".into())
+                })?;
+                voted
+                    .into_iter()
+                    .filter(|&e| places.place(target, e).entry() == 0)
+                    .collect()
+            };
+            if cold.is_empty() {
+                continue;
+            }
+            if let Ok(mut s) = self.stats.lock() {
+                s.stage_requests += cold.len();
+            }
+            // A closed channel means the stager is gone; its guard has raised
+            // the abort word, which the next routed layer reports.
+            let _ = self.stager.send(StagerMsg::Stage {
+                row: target,
+                experts: cold,
+            });
+        }
+        Ok(())
     }
 
     /// The experts the stager has staged ahead since this was last called,

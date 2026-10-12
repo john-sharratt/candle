@@ -81,7 +81,8 @@ it needs neither the key nor the combination.
 | Piece | Where | Does |
 |---|---|---|
 | `CaptureHub` | `cuda_backend/graph/hub.rs` | One per device, shared by every clone of the handle. Holds the capture stream (created, non-blocking), the open wave, the executables of each segment ordinal kept across waves, the graveyard, the two staging rings and the two hand-off events between the capture and compute streams (§2.3). |
-| `ExecSlot` | `cuda_backend/graph/slot.rs` | One segment ordinal's executables — up to four, one per wave shape, most recently used first. A recapture is folded into the first executable of its node count that accepts it, and instantiated only when none does. |
+| `ExecLibrary` | `cuda_backend/graph/library.rs` | The executables kept across waves, by segment topology (node kinds in order); up to 512 topologies, least recently used dropped. |
+| `ExecSlot` | `cuda_backend/graph/slot.rs` | One topology's executables — up to sixteen, one per shape in steady use, most recently used first. A recapture is folded into the executable holding its shape, else the first that accepts it, and instantiated only when none does. |
 | `WaveCapture` | `cuda_backend/graph/hub.rs` | RAII for one forward. `CudaDevice::begin_wave_capture` opens it **held**; `finish` launches the last segment; dropping it unfinished discards what is recording (the forward has already failed). Not `Send`, like the `Paused` guard: the driver ends a thread-local capture only on the thread that began it. |
 | `Device::record_launches` | `eager.rs` | The model's mark: recording starts here. |
 | `CudaDevice::cuda_stream` | `device.rs` | The **launch stream**: the capture stream on the thread that is recording, the compute stream otherwise. Every launcher takes it. |
@@ -120,17 +121,31 @@ drive_wave
   logits readback                 the wave's one host wait, after the chain
 ```
 
-A **segment** is everything recorded between two host interactions. Segment `i` of a wave
-folds into the executable ordinal `i` keeps for that node count: the parameters a wave
-changes — tier addresses, row counts, the dispatch sequence number, grid sizes — are
-rewritten in place, and a segment whose topology differs is instantiated afresh. An ordinal
-keeps one executable per wave shape (a prompt prefill, a verify step and a draft step are
-different graphs at the same ordinal): with one per ordinal, Flash-Next's first decode wave
-after every prefill re-instantiated ~50 segments. The node count is a cheap filter, not a
-correctness key: two shapes can share a count, so each executable of that count is offered
-the recapture, most recently used first, and the driver accepts only the one of the same
-topology; when none does, it is instantiated beside them. Nothing is replayed stale, and
-there is no epoch to check.
+A **segment** is everything recorded between two host interactions. It folds into the
+executables kept for its **topology** — every node's kind, in order (`library`): the
+parameters a wave changes — tier addresses, row counts, the dispatch sequence number, grid
+sizes, and which kernel variant its width chose (an int8 projection's `_m4`/`_nw`/`_sk`, a
+GEMM tile) — are rewritten in place; the driver folds a changed function as it folds a
+changed grid (`a_recapture_with_another_kernel_at_a_node_folds_in_place`). Within a topology each shape
+in steady use keeps an executable of its own (a verify block of each length, a draft step),
+and only a one-off shape is folded over another's (`slot`). Each executable of the topology
+is offered the recapture, most recently used first, and the driver accepts only one it can
+update; when none does, it is instantiated beside them. Nothing is replayed stale, and there
+is no epoch to check.
+
+**Why topology and not the segment's ordinal.** Segments end where the forward meets the
+device eagerly, and where those cuts fall moves with the wave: the MoE host protocol's
+flushes, an upload, a readback. Keyed by ordinal, segment `i` held a different run of layers
+from one wave to the next. On npcd's mind ingest (Flash-Next, Q3_KO, RTX 3090) ordinal 6 was
+offered executables of 1,304, 665, 652, 1,395, 792 and 1,256 nodes, starting at a combine
+kernel in one wave and a copy in the next, and folded into none of them. That was 10.8 s of
+`cuGraphInstantiate` in 30 s of prefill, up to 3.4 s a segment, with the GPU idle behind it.
+Keyed by topology, a run of layers finds its executables wherever the cuts put it. Kernels
+are left out of the key on purpose: keyed by kernel as well, each combination of width-chosen
+variants was a topology of its own, and the ingest met a new one in most waves. On
+`candle_core::graph`, an instantiation beside a topology's executables is logged with where the
+recapture departs from them, and a topology seen for the first time with where it departs from
+what its ordinal held last wave.
 
 **Order is the invariant.** Recording changes when launches reach the driver — a segment at a
 time instead of one at a time — never their order: every eager call runs after everything

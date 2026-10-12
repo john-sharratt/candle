@@ -14,7 +14,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use candle::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DriverError};
+use candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async;
+use candle::cuda_backend::cudarc::driver::DevicePtr;
+use candle::cuda_backend::staged::segment;
+use candle::cuda_backend::Held;
 use candle::{CudaDevice, Device, Result};
 use candle_kernels::provenance::{
     bdp_bmma_supported, bdp_imma_supported, bdp_take_pending_error, run_batched_bdp_scan,
@@ -57,11 +60,11 @@ pub struct PagedSegment<'a> {
 /// token, so a 7.4M-token `code_reading` scan moved ~60 MB host-to-device on
 /// every launch — twice per reprojection (tail and question probes).
 struct DeviceIndex {
-    page_ptr: CudaSlice<u64>,
-    pos_map: CudaSlice<u32>,
-    case: CudaSlice<u32>,
-    seg_tok: CudaSlice<i32>,
-    seg_case: CudaSlice<i32>,
+    page_ptr: Held<u64>,
+    pos_map: Held<u32>,
+    case: Held<u32>,
+    seg_tok: Held<i32>,
+    seg_case: Held<i32>,
 }
 
 /// The assembled per-scan index, built from the resident arena. `page_ptr`
@@ -286,20 +289,13 @@ impl GalleryArena {
         let Device::Cuda(dev) = &self.device else {
             return Err(candle::Error::Msg("paged scan requires CUDA".into()));
         };
-        let stream = dev.cuda_stream();
-        let up = |what: &str, e: DriverError| {
-            candle::Error::Msg(format!("paged scan: HtoD {what}: {e}"))
-        };
+        // Held: the index is reused by every scan until the segments change.
         Ok(DeviceIndex {
-            page_ptr: stream
-                .memcpy_stod(page_ptr)
-                .map_err(|e| up("page_ptr", e))?,
-            pos_map: stream.memcpy_stod(pos_map).map_err(|e| up("pos_map", e))?,
-            case: stream.memcpy_stod(case).map_err(|e| up("case", e))?,
-            seg_tok: stream.memcpy_stod(seg_tok).map_err(|e| up("seg_tok", e))?,
-            seg_case: stream
-                .memcpy_stod(seg_case)
-                .map_err(|e| up("seg_case", e))?,
+            page_ptr: Held::from_host(dev, page_ptr)?,
+            pos_map: Held::from_host(dev, pos_map)?,
+            case: Held::from_host(dev, case)?,
+            seg_tok: Held::from_host(dev, seg_tok)?,
+            seg_case: Held::from_host(dev, seg_case)?,
         })
     }
 
@@ -600,11 +596,10 @@ impl GalleryArena {
         let stream = dev.cuda_stream();
 
         // Only the probe is uploaded per launch: the index arrays are already
-        // on the device (`DeviceIndex`), and the records stay resident.
+        // on the device (`DeviceIndex`), and the records stay resident. The
+        // probe and the two outputs ride the device's synced scratch, which
+        // this launch drains before it returns.
         let t_upload = Instant::now();
-        let d_probe = stream
-            .memcpy_stod(probe_words)
-            .map_err(|e| candle::Error::Msg(format!("paged scan: HtoD probes: {e}")))?;
 
         // An error already pending on this thread is an EARLIER launch's that
         // nothing checked. Taken and named here, before any backend runs: a
@@ -622,22 +617,22 @@ impl GalleryArena {
         }
 
         let n_out = n_probe_tokens * n_groups * n_segments;
-        let mut d_out_case = unsafe { stream.alloc::<i32>(n_out) }
-            .map_err(|e| candle::Error::Msg(format!("paged scan: alloc out_case: {e}")))?;
-        let mut d_out_vote = unsafe { stream.alloc::<f32>(n_out) }
-            .map_err(|e| candle::Error::Msg(format!("paged scan: alloc out_vote: {e}")))?;
-
         let upload_us = t_upload.elapsed().as_micros() as u64;
         let t_kernel = Instant::now();
-        {
+        let mut out_case = vec![0i32; n_out];
+        let mut out_vote = vec![0f32; n_out];
+        let mut readback_us = 0u64;
+        // The outputs are written in full by the kernel (one block per tile ×
+        // group × segment), so their room is neither zeroed nor uploaded.
+        let launch = |at: &[u64], room: u64| -> candle::Result<()> {
             let (p_case, _g1) = d_idx.case.device_ptr(&stream);
-            let (p_probe, _g2) = d_probe.device_ptr(&stream);
+            let p_probe = at[0];
             let (p_seg_tok, _g3) = d_idx.seg_tok.device_ptr(&stream);
             let (p_seg_case, _g4) = d_idx.seg_case.device_ptr(&stream);
             let (p_page_ptr, _g5) = d_idx.page_ptr.device_ptr(&stream);
             let (p_pos_map, _g6) = d_idx.pos_map.device_ptr(&stream);
-            let (p_out_case, _g7) = d_out_case.device_ptr_mut(&stream);
-            let (p_out_vote, _g8) = d_out_vote.device_ptr_mut(&stream);
+            let p_out_case = room;
+            let p_out_vote = room + (n_out * std::mem::size_of::<i32>()) as u64;
             let mut launched = false;
             for &backend in &candidates {
                 match backend {
@@ -753,17 +748,29 @@ impl GalleryArena {
                 .synchronize()
                 .map_err(|e| candle::Error::Msg(format!("paged scan: synchronize: {e}")))?;
             profile::record("arena:launch_sync", t_sync.elapsed());
-        }
-        let kernel_us = t_kernel.elapsed().as_micros() as u64;
 
-        let t_readback = Instant::now();
-        let out_case = stream
-            .memcpy_dtov(&d_out_case)
-            .map_err(|e| candle::Error::Msg(format!("paged scan: DtoH out_case: {e}")))?;
-        let out_vote = stream
-            .memcpy_dtov(&d_out_vote)
-            .map_err(|e| candle::Error::Msg(format!("paged scan: DtoH out_vote: {e}")))?;
-        let readback_us = t_readback.elapsed().as_micros() as u64;
+            let t_readback = Instant::now();
+            // SAFETY: both ranges are this launch's outputs inside the scratch,
+            // held until the closure returns; the copies are waited for below.
+            unsafe {
+                memcpy_dtoh_async(&mut out_case, p_out_case, stream.cu_stream())
+                    .map_err(|e| candle::Error::Msg(format!("paged scan: DtoH out_case: {e}")))?;
+                memcpy_dtoh_async(&mut out_vote, p_out_vote, stream.cu_stream())
+                    .map_err(|e| candle::Error::Msg(format!("paged scan: DtoH out_vote: {e}")))?;
+            }
+            stream
+                .synchronize()
+                .map_err(|e| candle::Error::Msg(format!("paged scan: readback: {e}")))?;
+            readback_us = t_readback.elapsed().as_micros() as u64;
+            Ok(())
+        };
+        dev.with_synced_upload(
+            &stream,
+            &[segment(probe_words)],
+            n_out * (std::mem::size_of::<i32>() + std::mem::size_of::<f32>()),
+            launch,
+        )?;
+        let kernel_us = (t_kernel.elapsed().as_micros() as u64).saturating_sub(readback_us);
         Ok((out_case, out_vote, (upload_us, kernel_us, readback_us)))
     }
 }

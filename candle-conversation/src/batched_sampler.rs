@@ -14,12 +14,12 @@ use crate::sampler_args::{split_rng_and_outputs, ArgPack};
 use crate::scheduler::profile;
 use crate::stencil::ban;
 use crate::token_buffer::TokenBuffer;
-use candle::cuda_backend::CudaStorageSlice;
+use candle::cuda_backend::{CudaStorageSlice, Held};
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_kernels::sampling::{run_batched_sampling, DType as KernelDType};
 use candle_transformers::generation::{LogitsProcessor, PendingSample};
 use candle_transformers::models::speculative_choice::TypicalAcceptance;
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{DevicePtr, DevicePtrMut};
 use std::sync::Mutex;
 
 /// A stencil-constrained row's sample with its device work enqueued
@@ -30,6 +30,64 @@ struct PendingAllowList {
     allow: Vec<u32>,
     processor: LogitsProcessor,
     pending: PendingSample,
+}
+
+/// A stencil-constrained row waiting for the dispatch that runs every such row
+/// of a step in one launch ([`BatchedSampler::run_allow_rows`]).
+struct AllowRow {
+    /// Row of the logits block it is drawn from.
+    logits_row: usize,
+    /// The allowed tokens, in the order the result indexes them.
+    allow: Vec<u32>,
+    /// Allowed positions the row may not produce.
+    banned: Vec<bool>,
+    /// ≤ 0 asks for the argmax.
+    temperature: f32,
+    /// Holds the RNG the host half draws from.
+    processor: LogitsProcessor,
+}
+
+/// What the device half of an allow-list row read back.
+#[derive(Debug, Clone, PartialEq)]
+enum AllowResult {
+    /// The local index of the first maximum (temperature ≤ 0).
+    Index(usize),
+    /// The softmax at the row's temperature, one per allowed token.
+    Probs(Vec<f32>),
+}
+
+/// Result words the dispatch writes for `row`.
+fn allow_result_words(row: &AllowRow) -> usize {
+    if row.temperature <= 0.0 {
+        1
+    } else {
+        row.allow.len()
+    }
+}
+
+/// The host half: the allowed token the row's result picks — the argmax's, or
+/// the one the row's processor draws from the probabilities, exactly as it
+/// draws from any probability vector.
+fn finish_allow_row(row: AllowRow, result: AllowResult) -> candle::Result<u32> {
+    let AllowRow {
+        allow,
+        mut processor,
+        ..
+    } = row;
+    let local = match result {
+        AllowResult::Index(i) => i,
+        AllowResult::Probs(p) => {
+            let n = p.len();
+            processor.sample_finish(PendingSample::Probs(Tensor::from_vec(p, n, &Device::Cpu)?))?
+                as usize
+        }
+    };
+    allow.get(local).copied().ok_or_else(|| {
+        candle::Error::Msg(format!(
+            "allow-list row: picked position {local} of a {}-token list",
+            allow.len()
+        ))
+    })
 }
 
 /// What [`SequenceSamplingState::mark`] saves: every field an advance changes
@@ -883,7 +941,7 @@ pub struct BatchedSampler {
     /// one copy. Held and grown to the widest dispatch seen, so a dispatch
     /// allocates nothing; the readback that ends each dispatch is what lets the
     /// next one overwrite it.
-    args: Mutex<Option<CudaSlice<u32>>>,
+    args: Mutex<Option<Held<u32>>>,
 
     /// One byte per token naming what DRY leaves alone — see
     /// [`crate::dry_reference`]. Empty when no tokenizer was given, and then
@@ -892,7 +950,7 @@ pub struct BatchedSampler {
 
     /// [`Self::reference_flags`] on the device, uploaded at the first dispatch
     /// and read by every one after.
-    reference_flags_dev: Mutex<Option<CudaSlice<u8>>>,
+    reference_flags_dev: Mutex<Option<Held<u8>>>,
 }
 
 impl BatchedSampler {
@@ -1051,6 +1109,7 @@ impl BatchedSampler {
         let mut out: Vec<Option<Scored>> = vec![None; rows.len()];
         let mut kernel = KernelRows::new(self.vocab_size, self.max_recent_len, cross_turn);
         let mut allow: Vec<(usize, PendingAllowList, RowKey)> = Vec::new();
+        let mut allow_rows: Vec<(usize, AllowRow, RowKey)> = Vec::new();
 
         let gathered = (|| -> candle::Result<()> {
             for (r, row) in rows.iter().enumerate() {
@@ -1091,7 +1150,11 @@ impl BatchedSampler {
                         });
                     }
                     // Small allow-list: a tiny gather + sample over just the
-                    // allowed logits.
+                    // allowed logits — on CUDA every such row of the step in
+                    // one dispatch after the kernel's.
+                    [_, _, ..] if on_cuda => {
+                        allow_rows.push((r, self.allow_row(row.logits_row, config, state), key));
+                    }
                     [_, _, ..] => {
                         let pending =
                             self.issue_allow_list(logits2d, row.logits_row, config, state)?;
@@ -1137,7 +1200,160 @@ impl BatchedSampler {
                 key,
             });
         }
+        if !allow_rows.is_empty() {
+            let specs: Vec<&AllowRow> = allow_rows.iter().map(|(_, a, _)| a).collect();
+            let results = self.run_allow_rows(logits2d, &specs)?;
+            for ((r, row, key), result) in allow_rows.into_iter().zip(results) {
+                out[r] = Some(Scored {
+                    raw: finish_allow_row(row, result)?,
+                    kind: RowKind::Constrained,
+                    rng_after: key.rng_offset.wrapping_add(1),
+                    key,
+                });
+            }
+        }
         Ok(out)
+    }
+
+    /// An allow-list row for [`Self::run_allow_rows`], with the processor its
+    /// host half draws from — seeded from `state` as it stands now, as
+    /// [`Self::issue_allow_list`] seeds one.
+    fn allow_row(
+        &self,
+        logits_row: usize,
+        config: &SamplingConfig,
+        state: &SequenceSamplingState,
+    ) -> AllowRow {
+        let allow: Vec<u32> = config.stencil.iter().map(|&t| t as u32).collect();
+        let banned_set: std::collections::HashSet<u32> =
+            config.banned_tokens.iter().map(|&b| b as u32).collect();
+        let banned = allow.iter().map(|t| banned_set.contains(t)).collect();
+        let seed = config.seed.wrapping_add(state.rng_offset);
+        AllowRow {
+            logits_row,
+            allow,
+            banned,
+            temperature: config.temperature,
+            processor: LogitsProcessor::from_sampling(seed, config_to_sampling(config)),
+        }
+    }
+
+    /// The device half of every allow-list row of a step, in one launch: each
+    /// row's allowed logits gathered, and their argmax or their softmax at the
+    /// row's temperature read back — the same device work
+    /// [`Self::issue_allow_list`] does per row with tensor ops, without a
+    /// buffer of its own. The device's held launch-table scratch carries the
+    /// inputs and the results, and is read back in one copy.
+    fn run_allow_rows(
+        &self,
+        logits2d: &Tensor,
+        rows: &[&AllowRow],
+    ) -> candle::Result<Vec<AllowResult>> {
+        use candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async;
+        use candle::cuda_backend::staged::segment;
+        use candle::cuda_backend::WrapErr;
+        use candle_kernels::sampling::run_allow_list_rows;
+
+        let Device::Cuda(dev) = &self.device else {
+            candle::bail!("allow-list rows: the batched dispatch runs on CUDA");
+        };
+        let (dtype_code, elem) = match logits2d.dtype() {
+            DType::F32 => (0i32, 4usize),
+            DType::F16 => (1, 2),
+            DType::BF16 => (2, 2),
+            other => candle::bail!("allow-list rows: logits of {other:?} are not gathered"),
+        };
+        let layout = logits2d.layout();
+        let stride = layout.stride();
+        if stride.len() != 2 || stride[1] != 1 {
+            candle::bail!(
+                "allow-list rows: a logits block of stride {stride:?} — each row must be dense"
+            );
+        }
+        let stream = dev.cuda_stream();
+        let base = {
+            let (storage, _) = logits2d.storage_and_layout();
+            let candle::Storage::Cuda(c) = &*storage else {
+                candle::bail!("allow-list rows: logits must be on CUDA");
+            };
+            c.slice.device_ptr(&stream)
+        };
+        let row_addr = |r: usize| base + ((layout.start_offset() + r * stride[0]) * elem) as u64;
+
+        let mut logits = Vec::with_capacity(rows.len());
+        let mut allow = Vec::new();
+        let mut allow_off = Vec::with_capacity(rows.len());
+        let mut allow_len = Vec::with_capacity(rows.len());
+        let mut temp = Vec::with_capacity(rows.len());
+        let mut out_off = Vec::with_capacity(rows.len());
+        let mut out_words = 0usize;
+        for row in rows {
+            logits.push(row_addr(row.logits_row));
+            allow_off.push(allow.len() as u32);
+            allow_len.push(row.allow.len() as u32);
+            allow.extend(
+                row.allow
+                    .iter()
+                    .zip(&row.banned)
+                    .map(|(&t, &banned)| if banned { u32::MAX } else { t }),
+            );
+            temp.push(row.temperature);
+            out_off.push(out_words as u32);
+            out_words += allow_result_words(row);
+        }
+        let mut words = vec![0u32; out_words];
+        dev.with_synced_upload(
+            &stream,
+            &[
+                segment(&logits),
+                segment(&allow),
+                segment(&allow_off),
+                segment(&allow_len),
+                segment(&temp),
+                segment(&out_off),
+            ],
+            out_words * std::mem::size_of::<u32>(),
+            |at, room| {
+                // SAFETY: every address names an uploaded table, and `room` the
+                // results' space, held until this closure returns; each logits
+                // address is a dense row of the live block; the kernel writes
+                // every result word, and the readback is ordered behind the
+                // launch and waited for before the scratch is let go.
+                unsafe {
+                    run_allow_list_rows(
+                        at[0] as *const u64,
+                        at[1] as *const u32,
+                        at[2] as *const u32,
+                        at[3] as *const u32,
+                        at[4] as *const f32,
+                        at[5] as *const u32,
+                        rows.len() as u32,
+                        dtype_code,
+                        room as *mut u32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                    );
+                    memcpy_dtoh_async(&mut words, room, stream.cu_stream()).w()?;
+                }
+                stream.synchronize().w()
+            },
+        )?;
+        Ok(rows
+            .iter()
+            .zip(&out_off)
+            .map(|(row, &at)| {
+                let at = at as usize;
+                if row.temperature <= 0.0 {
+                    AllowResult::Index(words[at] as usize)
+                } else {
+                    AllowResult::Probs(
+                        words[at..at + row.allow.len()]
+                            .iter()
+                            .map(|&w| f32::from_bits(w))
+                            .collect(),
+                    )
+                }
+            })
+            .collect())
     }
 
     /// Commit a scored row onto `state`: resolve a free row's pick (segment
@@ -1925,10 +2141,7 @@ impl BatchedSampler {
             *args = None;
             // SAFETY: every word a dispatch reads is uploaded below before the
             // kernel is queued, and the tail it reads back is written by it.
-            *args = Some(
-                unsafe { stream.alloc::<u32>(grown) }
-                    .map_err(|e| candle::Error::Msg(format!("sampling args buffer: {e}")))?,
-            );
+            *args = Some(unsafe { Held::<u32>::alloc(cuda_device, grown) }?);
         }
         let packed = args.as_mut().expect("sized above");
         stream
@@ -1939,11 +2152,12 @@ impl BatchedSampler {
             .lock()
             .map_err(|_| candle::Error::Msg("sampler reference flags poisoned".into()))?;
         if reference.is_none() && !self.reference_flags.is_empty() {
-            *reference = Some(
-                stream
-                    .memcpy_stod(&self.reference_flags)
-                    .map_err(|e| candle::Error::Msg(format!("DRY reference flags: {e}")))?,
-            );
+            // SAFETY: every byte is written by the upload just below.
+            let mut flags = unsafe { Held::<u8>::alloc(cuda_device, self.reference_flags.len()) }?;
+            stream
+                .memcpy_htod(&self.reference_flags, &mut *flags)
+                .map_err(|e| candle::Error::Msg(format!("DRY reference flags: {e}")))?;
+            *reference = Some(flags);
         }
 
         // Get device pointers and call kernel in a scoped block
@@ -4287,5 +4501,76 @@ mod tests {
             )
             .expect("sample_batch");
         assert_eq!(tokens, vec![43, 42]);
+    }
+
+    fn allow_row(allow: Vec<u32>, temperature: f32) -> AllowRow {
+        AllowRow {
+            logits_row: 0,
+            banned: vec![false; allow.len()],
+            allow,
+            temperature,
+            processor: LogitsProcessor::from_sampling(
+                7,
+                candle_transformers::generation::Sampling::All {
+                    temperature: temperature as f64,
+                },
+            ),
+        }
+    }
+
+    /// An argmax row reads back one word; a sampled row one per allowed token.
+    #[test]
+    fn an_allow_row_reads_back_its_index_or_its_probabilities() {
+        assert_eq!(allow_result_words(&allow_row(vec![3, 4, 5], 0.0)), 1);
+        assert_eq!(allow_result_words(&allow_row(vec![3, 4, 5], 0.8)), 3);
+    }
+
+    /// The host half maps the result back to the allowed token: the argmax's
+    /// position, or the only position holding probability.
+    #[test]
+    fn an_allow_row_finishes_on_its_allowed_token() {
+        assert_eq!(
+            finish_allow_row(allow_row(vec![3, 4, 5], 0.0), AllowResult::Index(2)).unwrap(),
+            5
+        );
+        assert_eq!(
+            finish_allow_row(
+                allow_row(vec![3, 4, 5], 1.0),
+                AllowResult::Probs(vec![0.0, 1.0, 0.0])
+            )
+            .unwrap(),
+            4
+        );
+        assert!(
+            finish_allow_row(allow_row(vec![3, 4], 0.0), AllowResult::Index(2)).is_err(),
+            "a position past the list is refused, not wrapped"
+        );
+    }
+
+    /// On CUDA a sampled allow-list row draws inside its list, a banned
+    /// position is never drawn however high its logit, and a row whose mass is
+    /// nearly all on one token draws it.
+    #[test]
+    fn a_sampled_allow_list_row_draws_inside_its_list_on_cuda() {
+        let Ok(device) = candle::Device::new_cuda(0) else {
+            return;
+        };
+        let sampler = make_sampler_on(&device, VOCAB_SIZE);
+        let mut data = vec![0.0f32; VOCAB_SIZE];
+        data[10] = 9.0;
+        data[20] = 0.0;
+        data[30] = 50.0;
+        let logits = Tensor::from_vec(data, (1, VOCAB_SIZE), &device).expect("logits");
+        let mut config = SamplingConfig::argmax().with_stencil(vec![10, 20, 30]);
+        config.temperature = 1.0;
+        config.banned_tokens = vec![30];
+        for seed in 0..8u64 {
+            config.seed = seed;
+            let mut state = make_state();
+            let tokens = sampler
+                .sample_batch(&logits, &mut [&mut state], &[&config])
+                .expect("sample");
+            assert_eq!(tokens[0], 10, "seed {seed}");
+        }
     }
 }

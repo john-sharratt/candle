@@ -42,13 +42,11 @@ use candle_conversation::fragmentation_probe::{
     names, profile, run, run_attached, run_baseline, run_on_model, run_strata, ModelProfile, Probe,
     ProbeOutcome,
 };
-use candle_conversation::models::Model;
 use candle_conversation::ManagedBatchedModel;
 use candle_transformers::models::batch_test::utils::{TestConfig, TestMode, TestParams};
 use candle_transformers::models::batched_inference::InferenceMode;
 use candle_transformers::models::dialect::Dialect;
 use candle_transformers::models::profile::pipeline_snapshot_and_reset;
-use candle_transformers::models::quant_ladder;
 use candle_transformers::models::{
     quantized_qwen36_moe, quantized_qwen38_moe, quantized_qwen3_moe,
 };
@@ -63,21 +61,11 @@ fn resolved(name: &str) -> ModelProfile {
     })
 }
 
-/// The Flash-Next row, running the preset this card's rung loads.
-///
-/// Every machine holds only its own rung's engine artifact, so the probe takes the
-/// same `quant_ladder::expert_format` choice the forward gate does — the 16 GB
-/// laptop and the 24 GB RTX 3090 run `Q3_KO` experts, the 72 GB card `Q4_KO`, from
-/// one row of thresholds.
+/// The Flash-Next row. The preset loads this card's rung — the 16 GB laptop and
+/// the 24 GB RTX 3090 run `Q3_KO` experts, the 72 GB card `Q4_KO` — from one row of
+/// thresholds.
 fn flash_next_row() -> ModelProfile {
-    let mut row = resolved("qwen38-flash-next");
-    let device = Device::new_cuda(0).expect("CUDA device");
-    let gib = quant_ladder::device_vram_gib(&device).expect("the card's VRAM");
-    let experts = quant_ladder::expert_format(gib);
-    row.model = Model::qwen38_flash_next_for(experts).unwrap_or_else(|| {
-        panic!("a {gib} GiB card's rung ({experts:?}) has no Flash-Next preset")
-    });
-    row
+    resolved("qwen38-flash-next")
 }
 
 /// Install the log subscriber every probe in this file needs.

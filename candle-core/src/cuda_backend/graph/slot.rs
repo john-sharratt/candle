@@ -1,31 +1,26 @@
-//! The executables kept for one segment ordinal.
+//! The executables kept for one segment topology (`library`).
 //!
-//! A segment's ordinal is its place in its wave, and the engine runs waves of
-//! more than one shape — a prompt prefill, a decode step, a draft step, a verify
-//! block of each length an adaptive draft depth produces — whose segment `i` is
-//! a different graph each. An ordinal therefore keeps one executable per shape
-//! in steady use, so a recapture folds into the executable already holding its
-//! shape and the driver rewrites only addresses and scalars.
+//! Every recapture offered here has the same node kinds in the same order; they
+//! differ in kernel variants, grids, addresses and scalars. Each shape in steady use — a decode
+//! step, a verify block of each length an adaptive draft depth produces —
+//! keeps an executable of its own, so a recapture folds into the executable
+//! already holding its shape and the driver rewrites only addresses and
+//! scalars.
 //!
-//! Folding into an executable of another shape also succeeds when the topology
-//! matches, but it rewrites grids and functions too and costs several times as
-//! much (see [`audit`]). So a shape that recurs is given an executable of its
-//! own while the ordinal has room, and only a shape seen once — a prompt's own
-//! length — is folded over another's.
+//! Folding into an executable of another shape also succeeds, since the
+//! topology matches, but it rewrites grids too and costs several times as much
+//! (see [`audit`](super::exec::audit)). So a shape that recurs is given an
+//! executable of its own when the library will keep one, and only a shape seen
+//! once — a prompt's own length — is folded over another's. How many the slot
+//! holds is the library's budget to decide, not a count here.
 
 use std::collections::VecDeque;
 
-use super::exec::{audit, GraphExec, Template};
+use super::exec::{divergence, Audited, GraphExec, Template};
 use super::ComputeStream;
 use crate::Result;
-use cudarc::driver::sys;
 
-/// How many executables an ordinal keeps — one per shape in steady use. A
-/// single sequence's adaptive draft alone runs a draft step and verify blocks
-/// of up to nine rows.
-const EXECS_PER_SLOT: usize = 16;
-
-/// How many recent shapes an ordinal remembers, to tell a recurring shape from
+/// How many recent shapes a topology remembers, to tell a recurring shape from
 /// a one-off.
 const SHAPES_REMEMBERED: usize = 32;
 
@@ -36,8 +31,12 @@ pub(super) enum Folded {
     InPlace,
     /// Into an executable of another shape: grids and functions rewritten too.
     Reshaped,
-    /// Instantiated afresh.
+    /// Instantiated afresh and kept.
     Instantiated,
+    /// Instantiated for this launch alone: its key is cooling after an
+    /// eviction, so the library may not keep it, and no executable of its
+    /// topology would take the fold.
+    Transient,
 }
 
 #[derive(Default)]
@@ -49,24 +48,27 @@ pub(super) struct ExecSlot {
 }
 
 impl ExecSlot {
-    /// Fold `graph` into the executable holding its shape; failing that, give
-    /// a recurring shape a new executable while there is room; failing that,
-    /// fold it into the first executable that accepts it, most recently used
-    /// first, or instantiate it, dropping the least recently used beyond
-    /// [`EXECS_PER_SLOT`]. Returns the executable to launch and how it got
-    /// there.
+    /// Fold `template` into the executable holding its shape; failing that,
+    /// give a recurring shape a new executable if `admit`; failing that, fold
+    /// it into the first executable that accepts it, most recently used first,
+    /// or instantiate it — kept if `admit`, for this launch alone if not.
     ///
-    /// # Safety
-    ///
-    /// `graph` must be a valid graph owned by the caller; it is consumed.
-    pub(super) unsafe fn fold(
+    /// Returns the executable to launch when it is not kept (`Some`, the
+    /// [`Folded::Transient`] case) — otherwise it is [`Self::front`], credited
+    /// with this launch — how it got there, and, for an instantiation beside
+    /// executables the slot already holds, why none of them would take it
+    /// ([`Refusal`]).
+    pub(super) fn fold(
         &mut self,
-        graph: sys::CUgraph,
+        template: Template,
+        audited: Audited,
         on: &ComputeStream,
         nodes: usize,
-    ) -> Result<(&GraphExec, Folded)> {
-        let template = Template(graph);
-        let shape = audit(template.0, nodes)?;
+        admit: bool,
+    ) -> Result<(Option<GraphExec>, Folded, Option<Refusal>)> {
+        let Audited {
+            shape, topology, ..
+        } = audited;
         let recurring = self.seen.contains(&shape);
         self.seen.push_back(shape);
         if self.seen.len() > SHAPES_REMEMBERED {
@@ -79,7 +81,7 @@ impl ExecSlot {
                 outcome = Some((i, Folded::InPlace));
             }
         }
-        if outcome.is_none() && !(recurring && self.execs.len() < EXECS_PER_SLOT) {
+        if outcome.is_none() && !(recurring && admit) {
             for i in 0..self.execs.len() {
                 if self.execs[i].try_fold(&template, on, nodes, shape)? {
                     outcome = Some((i, Folded::Reshaped));
@@ -87,6 +89,7 @@ impl ExecSlot {
                 }
             }
         }
+        let mut refusal = None;
         let folded = match outcome {
             Some((i, how)) => {
                 let exec = self.execs.remove(i);
@@ -94,12 +97,64 @@ impl ExecSlot {
                 how
             }
             None => {
-                let exec = GraphExec::instantiate_audited(template, on, nodes, shape)?;
+                refusal = self.execs.first().map(|last| Refusal {
+                    kept_nodes: self.execs.iter().map(GraphExec::node_count).collect(),
+                    divergence: divergence(&topology, last.topology()),
+                });
+                let exec = GraphExec::instantiate_audited(template, on, nodes, shape, topology)?;
+                if !admit {
+                    return Ok((Some(exec), Folded::Transient, refusal));
+                }
                 self.execs.insert(0, exec);
-                self.execs.truncate(EXECS_PER_SLOT);
                 Folded::Instantiated
             }
         };
-        Ok((&self.execs[0], folded))
+        self.execs[0].credit();
+        Ok((None, folded, refusal))
     }
+
+    /// The executable the last kept fold put first.
+    pub(super) fn front(&self) -> Option<&GraphExec> {
+        self.execs.first()
+    }
+
+    /// Its executables, most recently used first.
+    pub(super) fn execs(&self) -> &[GraphExec] {
+        &self.execs
+    }
+
+    /// Evict the executable at `index`.
+    pub(super) fn evict(&mut self, index: usize) -> GraphExec {
+        self.execs.remove(index)
+    }
+
+    /// A wave has passed: every executable's invocations decay.
+    pub(super) fn decay(&mut self) {
+        for e in &mut self.execs {
+            e.decay();
+        }
+    }
+
+    /// Executables kept, and their nodes.
+    pub(super) fn held(&self) -> (usize, usize) {
+        (
+            self.execs.len(),
+            self.execs.iter().map(GraphExec::node_count).sum(),
+        )
+    }
+}
+
+/// Why a recapture was instantiated beside the executables its topology held.
+///
+/// Every executable here has the recapture's node kinds in its order, so the
+/// driver refusing all of them says something it will not rewrite differs — a
+/// dependency edge, a node attribute, a function's context — or that the
+/// topology key collided.
+pub(super) struct Refusal {
+    /// The node counts of the executables offered the fold, most recent first.
+    pub(super) kept_nodes: Vec<usize>,
+    /// Where the recapture first departs from the most recently used of them,
+    /// or `None` when every node agrees — the driver refused the dependency
+    /// edges or a node's attributes rather than the kernels.
+    pub(super) divergence: Option<String>,
 }

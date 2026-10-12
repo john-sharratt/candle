@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::quantized::decode_rows::DecodeRows;
-use candle::quantized::{get_vram_info, Int8Mode, MmapRegistration, SumScale};
+use candle::quantized::{get_vram_info, Int8Mode, SumScale};
 use candle::{DType, Device, Result, Tensor, D};
 
 use crate::models::expert_lre::section::{geometries_of, open_section};
@@ -71,8 +71,6 @@ pub struct Engine {
     rope_swa: RotaryCache,
     /// Resident-expert pool: streams the routed MXFP4 experts pinned↔VRAM per wave.
     experts: Arc<ExpertCache>,
-    _mmap: Arc<memmap2::Mmap>,
-    _reg: Option<MmapRegistration>,
     device: Device,
 }
 
@@ -123,11 +121,13 @@ impl Engine {
         // the four declarations that have to agree.
         paged::assert_geometry(&cfg)?;
 
-        // The pack's GGUF part, mapped, held for the life of the engine. Deliberately NOT
-        // `register_mmap_cuda`: that would page-lock the whole part non-pageable, competing with
-        // the page-locked expert tiers, while nothing on the forward DMAs out of it.
-        let mmap = pack.mmap.clone();
-        let reg: Option<MmapRegistration> = None;
+        // **No view of the pack outlives the load.** The resident tensors are read
+        // through the loader's handle and the pack's mapping, both dropped when this
+        // returns; the experts are read with direct I/O. On Windows a file with any
+        // cached view open has its unbuffered reads served one at a time — on the 16 GB
+        // laptop 6.5 GB/s alone, 4.1 GB/s beside a mapping
+        // (`direct_io::tests::read_method_sweep`) — and the expert section is in the
+        // same file.
 
         // ── The expert section: every routed layer's records, in block order ──
         let n_expert = cfg.n_routed_experts;
@@ -436,8 +436,6 @@ impl Engine {
                 rope_compress,
                 rope_swa,
                 experts,
-                _mmap: mmap,
-                _reg: reg,
                 device: device.clone(),
             },
             drafter,
