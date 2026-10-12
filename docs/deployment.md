@@ -287,8 +287,9 @@ Reading a failure:
 - **`bot.tokera.com` `503`** while the gateway is healthy means no npcd is serving: tokerad's
   npcd member is not joined at all (a member joined and loading shows its loading page from
   the second request on), and the configured upstream on `.6` is down.
-- **`code.tokera.com` slow or `504` right after tokerad starts**, with zend answering
-  directly on `:8081`: the member is still sending its own history to the gateway after
-  the restart, and forwarded requests queue behind it on the socket (about 8 minutes for
-  2.5M records — `docs/replicated_substrate.md` §16, item 19). `"in_flight"` in the
-  member's `/v1/status` counts down to 0.
+- **A console says "no zend member answered"** (or npcd) while the status page shows the
+  member joined: the gateway asked the member and it did not answer within 3 s. Its
+  forwarded requests are queued behind something on its socket — `"in_flight"` and
+  `"unsent"` in the member's own `/v1/status` on `:8081` say how much. A restart no
+  longer resends the member's history (`docs/replicated_substrate.md` §7.5), so a large
+  figure there is new events, such as a heavy ingest.

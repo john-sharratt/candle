@@ -79,7 +79,6 @@ fn admission(node: u64) -> Result<Admit, Close> {
         floor_count: 100,
         floor_hash: "abc1234".into(),
         routes_wanted: true,
-        own_applied_through: 0,
     })
 }
 

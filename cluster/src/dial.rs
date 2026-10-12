@@ -145,7 +145,6 @@ mod tests {
             floor_count: 1,
             floor_hash: String::new(),
             routes_wanted: false,
-            own_applied_through: 0,
         }
     }
 

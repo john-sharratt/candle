@@ -93,8 +93,8 @@ impl Prove {
     }
 }
 
-/// The gateway's admission: the session, what a new member needs to route and
-/// to resume (§3.3, §5.4, §7.5).
+/// The gateway's admission: the session, and what a new member needs to route
+/// (§3.3, §5.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admit {
     pub session: u64,
@@ -105,9 +105,6 @@ pub struct Admit {
     pub floor_hash: String,
     /// The gateway holds no dispatch table for this member and wants `ROUTES`.
     pub routes_wanted: bool,
-    /// The highest `applied_through` any other member acknowledged for this
-    /// member's own origin (§7.5).
-    pub own_applied_through: u64,
 }
 
 impl Admit {
@@ -117,8 +114,7 @@ impl Admit {
             .list(&self.claims, |w, c| c.write(w))
             .u32(self.floor_count)
             .str(&self.floor_hash)
-            .bool(self.routes_wanted)
-            .u64(self.own_applied_through);
+            .bool(self.routes_wanted);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
@@ -129,7 +125,6 @@ impl Admit {
             floor_count: r.u32()?,
             floor_hash: r.str()?,
             routes_wanted: r.bool()?,
-            own_applied_through: r.u64()?,
         })
     }
 }

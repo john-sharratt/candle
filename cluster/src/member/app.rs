@@ -389,7 +389,7 @@ impl AppMember {
         }
         lock(&self.sockets)[c] = Some(handle.clone());
         if let Some(r) = self.replicator.as_ref().filter(|_| !upgrading) {
-            r.admitted(c, &admit, handle.clone());
+            r.admitted(c, handle.clone());
         }
         let _ = handle.control(Frame::Capacity(self.capacity_for(c)));
         if let Some(u) = self.upgrader() {

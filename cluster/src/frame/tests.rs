@@ -172,7 +172,6 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 floor_count: 4800,
                 floor_hash: "ffee".into(),
                 routes_wanted: true,
-                own_applied_through: 12,
             }),
             member_bytes(B::header(4, 0, 0).u64(77).u32(1))
                 .u32(1)
@@ -183,7 +182,6 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u32(4800)
                 .s("ffee")
                 .u8(1)
-                .u64(12)
                 .0,
         ),
         (

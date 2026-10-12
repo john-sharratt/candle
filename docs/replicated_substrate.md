@@ -1376,7 +1376,7 @@ with `x-tokera-aggregate: 1`. The consoles read it through
 - **the substrate overview** (`memberWith`) — the first member that holds the tenant's
   line;
 - **the npcd console's instruments** — the one member's answer, as npcd's group has one
-  member (§16, item 20).
+  member (§16, item 19).
 
 `/v1/status` aggregated also carries a `group` block — floor, model lock, member count —
 that the gateway adds. `FirstFound` returns the first `2xx` body unwrapped.
@@ -1692,10 +1692,12 @@ out.
 
 **Duelling proposers back off.** Two members whose views of the membership differ can
 both think rendezvous names them, and out-ballot each other in turn. So a proposer that
-receives a `NACK` waits a random time, drawn uniformly from 0 to the key's `ttl` (2 s
-for a decision), before preparing again with a ballot above the one that beat it. One of
-them then completes a round while the other waits, and the other learns the result
-from its next `PROMISE`.
+receives a `NACK` waits a random time, drawn uniformly from 0 to the key's `ttl` capped
+at a decision's 2 s, before preparing again with a ballot above the one that beat it.
+One of them then completes a round while the other waits, and the other learns the
+result from its next `PROMISE`. The cap matters for long leases: drawn over an
+`upgrade/<app>` lease's term — minutes — two members asking for it together could both
+sit out for minutes, and a duel is over in a round or two however long the lease.
 
 - Only a promise *above* the round's ballot beats it. A `NACK` naming the round's own
   ballot answers one of the proposer's earlier rounds, delayed, from an acceptor that
@@ -2511,13 +2513,14 @@ directions, and does so **only on the first admission after the process starts**
    it runs §7.2's exchange against the restarted member directly: a `CATCHUP` with
    `reply_to` itself, then headers, compare, fetch. Each of those members gets back
    only what it lacked, addressed to it.
-4. **Its own events** stop being unknown. `ADMIT` carries, for the member's own origin,
-   the **highest** `applied_through` the gateway holds from the other members' `ACK`s.
-   Every own event at or below it is held by at least one member, so it counts as
-   received. A member that has less fetches it from that member by its own catch-up
-   (§7.2), as for any lag. Every own event above it is *unsent* (§6.3) and goes out
-   again. Taking the lowest instead would make one lagging member force a re-broadcast
-   of everything it lacks to every member.
+4. **Its own events are not sent again.** Every own event the previous process wrote
+   counts as received (`Outbox::restart`): step 3 already delivers each one a member
+   lacks, pulled by that member on the catch-up lane, and a member that joins later
+   catches up at its admission (§7.2). Pushing them as well put a member alone in its
+   group — no `ACK` to say any event was held — through its whole history on the
+   ordered lane at every start, ahead of every request: 2.5M records on `.5`, and every
+   request the gateway forwarded to it waited the ~8 minutes it took. Only events
+   written since the start go out as §6.3 says.
 
 From then on, until the process stops, the member relies on §6.3's retransmit and
 §7.2's catch-up alone.
@@ -4428,18 +4431,7 @@ same configured upstreams as before.
     production, the design needs a staged run across two or three real machines, one of
     them over the internet through Cloudflare, exercising a cut-off, a gateway restart
     and a full disk.
-19. **A member alone in its group sends its whole history at every start.** A restart
-    owes every own event above the highest any *other member* acknowledged
-    (`Outbox::restart`, §7.5), and with no other member that is all of them. Measured on
-    `.5` (2026-10-12): zend's adopted 2.49M records went onto the gateway socket's
-    ordered lane at ~4,900 events/s, and every request the gateway forwarded to zend
-    queued behind them for the ~8 minutes the drain took. The gateway relays them to no
-    one, and a member that joins later fetches history by catch-up (§7.3), not from the
-    live stream. The likely answer is that a gateway's `RECEIPT` with no other member of
-    the app to relay to counts as held, persisted as the `received` a restart starts
-    from; a stream frame must also never wait behind a resend of history on the ordered
-    lane.
-20. **The npcd console shows one member's cast.** Its pulse, census, world, guardian and
+19. **The npcd console shows one member's cast.** Its pulse, census, world, guardian and
     guest instruments are aggregated per member (§5.5), and the console reads the first
     member's answer (`web/content/npcd/lib/api.live.js`). With one npcd member that is
     the whole cast. With a second — `.6` rebuilt and joined — each payload needs its own

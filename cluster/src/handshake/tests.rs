@@ -43,7 +43,6 @@ fn admission(session: u64) -> Admit {
         floor_count: 10,
         floor_hash: "abc".into(),
         routes_wanted: true,
-        own_applied_through: 0,
     }
 }
 

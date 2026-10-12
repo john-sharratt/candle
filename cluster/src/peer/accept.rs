@@ -19,7 +19,6 @@ fn peer_admit(session: u64) -> Admit {
         floor_count: 0,
         floor_hash: String::new(),
         routes_wanted: false,
-        own_applied_through: 0,
     }
 }
 

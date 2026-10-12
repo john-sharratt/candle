@@ -50,10 +50,13 @@ impl Outbox {
         }
     }
 
-    /// After a process start (§7.5): every own event at or below `received` is
-    /// held by some member, and every one above it through `written` is owed.
-    /// Events written since the start and above `written` stay as they are.
-    pub fn restart(&mut self, received: u64, written: u64) {
+    /// After a process start (§7.5): every own event through `written` — all
+    /// the previous process wrote — is owed to no socket. The resync's `HAVE`
+    /// offers them, and each member lacking any pulls exactly those by
+    /// catch-up; pushing them again would send a member alone in its group its
+    /// whole history, ahead of every request on the ordered lane. Events
+    /// written since the start, above `written`, stay as they are.
+    pub fn restart(&mut self, written: u64) {
         self.unsent.retain(|o| *o > written);
         self.queued.retain(|o, _| *o > written);
         self.in_flight.retain(|o, _| *o > written);
@@ -64,7 +67,6 @@ impl Outbox {
             frames.retain(|_, oseqs| !oseqs.is_empty());
         }
         self.written = self.written.max(written);
-        self.unsent.extend(received + 1..=written);
     }
 
     /// The unsent events, in `oseq` order: the order they are sent again in.
@@ -238,15 +240,18 @@ mod tests {
         assert_eq!(o.counts(), (2, 0));
     }
 
-    /// A restart owes exactly the events above the highest any member
-    /// acknowledged.
+    /// **A restart pushes none of the previous process's events.** The
+    /// resync's `HAVE` offers them and a member lacking any pulls it; owing
+    /// them here re-sent a lone member's whole history — 2.5M records on `.5` —
+    /// ahead of every request.
     #[test]
-    fn a_restart_owes_what_no_member_acknowledged() {
+    fn a_restart_owes_nothing_the_last_process_wrote() {
         let mut o = Outbox::new();
-        o.restart(7, 10);
-        assert_eq!(o.unsent().collect::<Vec<_>>(), vec![8, 9, 10]);
-        assert_eq!(o.state(7), EventState::Received);
-        assert_eq!(o.state(9), EventState::Unsent);
+        o.restart(10);
+        assert_eq!(o.unsent().count(), 0);
+        assert_eq!(o.state(1), EventState::Received);
+        assert_eq!(o.state(10), EventState::Received);
+        assert_eq!(o.state(11), EventState::Unsent, "not written yet");
     }
 
     /// A queued event is no longer unsent, goes back if its socket drops or its
@@ -274,15 +279,16 @@ mod tests {
         assert_eq!(o.counts(), (2, 1));
     }
 
-    /// A restart owes what no member acknowledged and leaves alone what was
-    /// written since the start.
+    /// A restart leaves alone what was written since the start, and forgets
+    /// anything at or below `written` it was holding.
     #[test]
     fn a_restart_leaves_events_written_since_alone() {
         let mut o = Outbox::new();
+        o.written(9);
         o.written(12);
         o.sent(12, 0, 1);
-        o.restart(7, 10);
-        assert_eq!(o.unsent().collect::<Vec<_>>(), vec![8, 9, 10]);
+        o.restart(10);
+        assert_eq!(o.unsent().count(), 0, "9 belongs to the last process");
         assert_eq!(
             o.state(12),
             EventState::InFlight {

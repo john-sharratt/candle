@@ -33,7 +33,7 @@ use crate::consensus::{Config, Millis, Paxos};
 use crate::coord::{AppCoord, CommandLine};
 use crate::delivery::Outbox;
 use crate::fragment::Whole;
-use crate::frame::{Admit, Catchup, Done, Frame, Headers, Members, Pulse};
+use crate::frame::{Catchup, Done, Frame, Headers, Members, Pulse};
 use crate::member::AppMember;
 use crate::session::SessionHandle;
 
@@ -368,8 +368,8 @@ impl Replicator {
         }
     }
 
-    /// Socket `c` was admitted with `admit`.
-    pub fn admitted(self: &Arc<Self>, c: usize, admit: &Admit, handle: SessionHandle) {
+    /// Socket `c` was admitted.
+    pub fn admitted(self: &Arc<Self>, c: usize, handle: SessionHandle) {
         let first = {
             let mut s = self.state();
             s.sockets[c] = Some(handle);
@@ -383,15 +383,14 @@ impl Replicator {
             first
         };
         if first {
-            // Every own event at or below what some member acknowledged is
-            // held by one; every one above it is owed again (§7.5).
-            let received = admit.own_applied_through;
+            // What the last process wrote is the resync's to offer, not the
+            // outbox's to push (§7.5).
             let me = self.clone();
             tokio::spawn(async move {
                 let store = me.store.clone();
                 if let Ok(written) = tokio::task::spawn_blocking(move || store.own_through()).await
                 {
-                    me.state().outbox.restart(received, written);
+                    me.state().outbox.restart(written);
                     me.send_wake.notify_one();
                 }
             });

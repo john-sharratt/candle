@@ -244,17 +244,6 @@ impl Hub {
             .flatten();
         let (_, members) = s.registry.listing(app);
         let claims = s.registry.claims(app).table();
-        // The most any other member has acknowledged of this node's own
-        // events: every one at or below it is held somewhere (§7.5).
-        let own_applied_through = s
-            .sockets
-            .iter()
-            .filter(|((a, n), _)| a == app && *n != hello.node)
-            .flat_map(|(_, x)| x.acks.iter())
-            .filter(|(origin, _)| *origin == hello.node)
-            .map(|(_, through)| *through)
-            .max()
-            .unwrap_or(0);
         drop(s);
         if let Some(model) = lock {
             self.note(app, hex(hello.node), format!("model lock set: {model}"));
@@ -272,7 +261,6 @@ impl Hub {
                     .map_or(String::new(), |f| f.hash.clone()),
                 // A new session has sent no table on this gateway yet.
                 routes_wanted: true,
-                own_applied_through,
             },
             admitted,
         ))
