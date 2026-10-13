@@ -247,7 +247,7 @@ daemon code reports it outside logs.
 | D9b | **The authority lends NPC leases, spread across the npcd members by weighted rendezvous from the start; a character runs where its lease is, until the lease expires *and* its holder reconnects** (§9.3). | A character's memory has one writer, and a partitioned machine's characters are never run a second time elsewhere. Losing one machine removes only its share of the cast. |
 | D9c | **A cut-off machine runs its characters in a local, unpersisted world, scrapped on reconnect** (§9.4). **It may still publish an operation's verified work to git**, through its in-process agent. An unreachable `origin` or agent makes the publish wait 30 minutes and try again. If both sides of a partition publish one operation, git merges them, and a conflict is solved by the publishing NPC at the merge table (§10.3). | Characters keep living through a partition, and each side's world never corrupts the authoritative one. git sits outside the cluster, so a partition from the gateways is no reason to hold finished work back from the record. |
 | D9d | **Consensus is a general service: Paxos among each app's members. The gateways carry the vote, and the lowest-id gateway is the tie-break acceptor for a group of two** (§5.9). It offers leases and one-time decisions. The quorum is a majority of `max_members`, the largest group the app has had, persisted in the substrate and raised automatically; it can be lowered by flag or admin call. | No configuration file sizes the group. A restarted or cut-off member knows the quorum from its own substrate. One member of two can still decide while the voting gateway is up, and a larger group is unchanged. |
-| D10 | **Every zend ingests its own workspace and replicates it**; a unit already ingested by any member is not ingested again (§10.4). | Machines with different checkouts contribute their repositories to the shared memory. |
+| D10 | **Every zend ingests its own workspace and replicates it**; a unit already ingested by any member is not ingested again, and a unit two members find still unread is read by the one that holds its lease (§10.4). | Machines with different checkouts contribute their repositories to the shared memory, and a startup where several of them plan the same tree does the reading once. |
 | D11 | **File-backed state becomes VFS records**: zend uploads into the conversation's store, npcd's authored content into an operation-scoped store over the mind repository, which every step of the operation works in. Publishing is an explicit git merge run by an agent, and for npcd it is the workflow's last step, taken at the archive floor's merge table after verification has passed; only a publish step may lead to `done` (§10). | One replication mechanism; git stays the record of published work, and nothing reaches it unverified. |
 | D12 | **Agents are members of app `agent`**; command-line work and git writes run on the best idle agent (§11). | Realises `docs/zend_workspace_execution.md` §7–§8 on the same socket. |
 | D13 | **Build version = the count of `origin/main` commits HEAD contains**, plus a `local` digest of anything beyond it (§3.5); per-app floor on the count, held in gateway memory. A newer build raises the floor after a 30-minute grace period, during which older builds keep serving (§3.5). | A total order across checkouts, and rolling upgrades one machine at a time. |
@@ -3223,14 +3223,25 @@ is its ingested units, which are substrate records and replicate. So a member sk
 unit another member has already ingested, with no ledger of its own: the replicated
 units are the ledger.
 
-Two members can still ingest the same unit before either sees the other's. Both units'
-conversations arrive everywhere. **The conversation whose first turn has the lower
-version stamp (§6.2) holds the unit**, the timeline breaking a tie, and the planner
-tombstones the other (`zend/src/branch_ingest/plan.rs`) — the same choice on every
-member in any arrival order, since the stamps and timelines are the records' own.
-Compaction then drops the tombstoned conversation's records, as it drops any record
-§6.5 makes dead. Unlike two turns at one index (§6.6), two ingests of one unit are the
-same content twice, so keeping one loses nothing.
+A unit nobody has finished is leased before it is read (`zend/src/ingest_lease.rs`),
+under the key `ingest/<content key>`. The member the vote names reads it. Every other
+member that found the same unit leaves it, and the conversation arrives with
+replication, so the reading is done once however many members planned it together.
+The holder renews the lease until the reading finishes or is abandoned, then hands
+it back with how far its own writes reach. The next member to take the unit waits
+for those writes and reads it only when the content key is still absent — a holder
+that died mid-reading leaves the unit for someone else, and a holder that finished
+leaves nothing to read. A member that is not joined cannot propose, so it reads the
+unit itself.
+
+Two members can still both finish a reading: one was not joined, or both passed the
+grant. Both units' conversations arrive everywhere. **The conversation whose first
+turn has the lower version stamp (§6.2) holds the unit**, the timeline breaking a
+tie, and the planner tombstones the other (`zend/src/branch_ingest/plan.rs`) — the
+same choice on every member in any arrival order, since the stamps and timelines
+are the records' own. Compaction then drops the tombstoned conversation's records,
+as it drops any record §6.5 makes dead. Unlike two turns at one index (§6.6), two
+ingests of one unit are the same content twice, so keeping one loses nothing.
 
 npcd's mind ingest is done only by the authority of the world that reads the mind, by
 the same rule.

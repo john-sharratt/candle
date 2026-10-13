@@ -77,6 +77,7 @@ use crate::conv_overlay::{self, Mirror};
 use crate::fast_path::coverage::Coverage;
 use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
+use crate::ingest_lease;
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::origin_watch::OriginWatch;
@@ -1433,6 +1434,15 @@ impl InferenceState {
                     tracing::error!("shutdown-while-connecting drain failed: {e}");
                 }
                 return Ok(None);
+            }
+            if let Some(replicator) = join
+                .link()
+                .member()
+                .and_then(|member| member.replicator().cloned())
+            {
+                // Readings lease a unit before minting its conversation, so a
+                // second member that planned the same tree does not read it too.
+                ingest_lease::install(replicator);
             }
             status_tx.send(String::new()).ok();
         }

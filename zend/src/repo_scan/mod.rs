@@ -35,6 +35,7 @@ use zend_vfs::Oid;
 use crate::branch_ingest::keys::{branches_value, BRANCHES_KEY, CONTENT_KEY};
 use crate::branch_ingest::plan::Committed;
 use crate::branch_ingest::units::FolderUnit;
+use crate::ingest_lease::{self, Share};
 use crate::ingest_report::{Failures, IngestReport};
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
@@ -879,13 +880,36 @@ fn run_dir_pool(
                         );
                         Ok(())
                     } else {
-                        // Bound open conversations by the card, not by the
-                        // thread count — see `scan_width`. The guard holds the
-                        // slot for the whole ingest, so no other worker can
-                        // decide against this state, and an unwind cannot leak
-                        // it from the process-global gauge.
-                        let _slot = ScanSlot::reserve(&live_convs);
-                        process_one_dir(ctx, base, plan, job, live, &failures)
+                        match ingest_lease::share(&job.unit.key) {
+                            Share::Theirs => {
+                                tracing::info!(
+                                    target: "zend::repo_scan",
+                                    dir = %job.unit.dir,
+                                    "left to the member holding its ingest lease",
+                                );
+                                Ok(())
+                            }
+                            Share::Mine(hold) => {
+                                let already = hold.recheck()
+                                    && engine
+                                        .lock()
+                                        .unwrap()
+                                        .conversation_metadata_values(CONTENT_KEY)
+                                        .contains(&job.unit.key);
+                                if already {
+                                    Ok(())
+                                } else {
+                                    // Bound open conversations by the card, not by the
+                                    // thread count — see `scan_width`. The guard holds the
+                                    // slot for the whole ingest, so no other worker can
+                                    // decide against this state, and an unwind cannot leak
+                                    // it from the process-global gauge. `hold` stays
+                                    // across that reading and hands the lease back after.
+                                    let _slot = ScanSlot::reserve(&live_convs);
+                                    process_one_dir(ctx, base, plan, job, live, &failures)
+                                }
+                            }
+                        }
                     };
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     progress.set_step_progress(d as u64, total as u64);
