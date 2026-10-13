@@ -23,17 +23,25 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use decide::{action, Action, Look};
 
 mod decide;
+mod presence;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shipped_config_joins_the_cluster_as_keep() {
+        let cfg: Config = serde_yaml::from_str(include_str!("../keep.yaml")).unwrap();
+        let cluster = cfg.cluster.expect("keep.yaml names its gateway");
+        assert_eq!(cluster.url, "https://192.168.0.5:9443");
+        assert_eq!(cluster.name, "tokera.com");
+        assert_eq!(cluster.host, "blackworld");
+    }
+}
 
 /// How long after a start `keep` waits before starting again, so one death
 /// does not become two processes.
 const START_GAP: Duration = Duration::from_secs(10);
-
-#[derive(Debug, Deserialize)]
-struct Config {
-    state: PathBuf,
-    poll_ms: u64,
-    services: Vec<Service>,
-}
 
 #[derive(Debug, Deserialize)]
 struct Service {
@@ -54,6 +62,17 @@ struct Service {
     upgrade_dir: Option<PathBuf>,
 }
 
+/// The gateway this process lists itself on. Absent, it stays a local
+/// failsafe and the cluster page does not show it.
+#[derive(Debug, Deserialize)]
+struct Config {
+    state: PathBuf,
+    poll_ms: u64,
+    services: Vec<Service>,
+    #[serde(default)]
+    cluster: Option<presence::ClusterJoin>,
+}
+
 /// The launch that last became ready. Paths only.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Ready {
@@ -70,6 +89,9 @@ fn main() -> anyhow::Result<()> {
     let cfg: Config =
         serde_yaml::from_str(&text).map_err(|e| anyhow::anyhow!("in {config}: {e}"))?;
     fs::create_dir_all(&cfg.state)?;
+    if let Some(cluster) = cfg.cluster.clone() {
+        presence::start(cluster, &cfg.state);
+    }
     let poll = Duration::from_millis(cfg.poll_ms);
     let mut since_start: Vec<Option<Instant>> = vec![None; cfg.services.len()];
     let mut not_ready_since: Vec<Option<Instant>> = vec![None; cfg.services.len()];

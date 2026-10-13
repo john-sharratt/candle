@@ -75,7 +75,8 @@ fn settled(build: &str, result: Settled) -> VerdictLine {
 
 /// A higher build is the candidate, loading; ready, its grace starts. An even
 /// newer one takes over the pending floor and keeps the deadline. A local
-/// build, an agent and a build at or below the floor are never candidates.
+/// build, an agent, the failsafe and a build at or below the floor are never
+/// candidates.
 #[test]
 fn a_newer_build_is_a_candidate_whose_grace_starts_when_ready() {
     let mut u = upgrades();
@@ -83,6 +84,7 @@ fn a_newer_build_is_a_candidate_whose_grace_starts_when_ready() {
     assert_eq!(u.admitted("zend", 1, &b(10), Some(&floor), 0).len(), 0);
     assert_eq!(u.admitted("zend", 2, &local(12), Some(&floor), 0).len(), 0);
     assert_eq!(u.admitted("agent", 3, &b(12), Some(&floor), 0).len(), 0);
+    assert_eq!(u.admitted("keep", 6, &b(12), Some(&floor), 0).len(), 0);
     assert_eq!(u.admitted("zend", 4, &b(12), Some(&floor), 0).len(), 1);
     assert_eq!(u.canary("zend"), None, "loading: no traffic, no grace");
     assert_eq!(u.view("zend").deadline_ms, None);

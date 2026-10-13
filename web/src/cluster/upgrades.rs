@@ -23,6 +23,7 @@ use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use cluster::gateway::rolls_out;
 use cluster::gateway::upgrades::plan::Ask;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -109,6 +110,12 @@ async fn command(
     let Some(app) = body.app.clone() else {
         return refuse(StatusCode::BAD_REQUEST, format!("{name} needs the `app`"));
     };
+    if !rolls_out(&app) {
+        return refuse(
+            StatusCode::CONFLICT,
+            format!("{app} is listed, not rolled out"),
+        );
+    }
     let hub = &s.gateway.hub;
     let ctx = Context {
         want_html: false,

@@ -192,7 +192,7 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
 `motherd` (`192.168.0.5:8081`). When one of them is gone, it starts the executable path
 it recorded the last time that process answered. When a replacement was swapped into
 place and does not become ready, it restores the previous executable and starts that.
-It does not certify, roll out, or store binary bytes. Its state is `keep/state/`.
+It does not certify, roll out, or store binary bytes. It also joins the gateway as the app `keep`, so `/gateway` lists it beside zend and npcd; that socket declares no routes and takes no rollout. Its state is `keep/state/`.
 
 Its supervisor is `C:\Users\johna\AppData\Local\keep\supervise.ps1`, the same loop shape
 as cf-ddns: it starts `target\release\keep.exe keep/keep.yaml` and starts it again 10 s

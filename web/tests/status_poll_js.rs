@@ -50,15 +50,24 @@ fn poll(extra: Value) -> Value {
 /// count toward the reconnect streak.
 #[test]
 fn a_hidden_or_aborted_poll_is_ignored() {
-    assert_eq!(poll(json!({ "hidden": true, "zendState": "" })), json!("ignore"));
-    assert_eq!(poll(json!({ "aborted": true, "zendState": "" })), json!("ignore"));
+    assert_eq!(
+        poll(json!({ "hidden": true, "zendState": "" })),
+        json!("ignore")
+    );
+    assert_eq!(
+        poll(json!({ "aborted": true, "zendState": "" })),
+        json!("ignore")
+    );
 }
 
 /// One unanswered poll keeps the chat. The next one, still visible, is
 /// when the console may say it is reconnecting.
 #[test]
 fn one_miss_keeps_the_chat_and_the_next_says_reconnecting() {
-    assert_eq!(poll(json!({ "zendState": "", "startedAt": 0 })), json!("miss"));
+    assert_eq!(
+        poll(json!({ "zendState": "", "startedAt": 0 })),
+        json!("miss")
+    );
     assert_eq!(
         poll(json!({ "zendState": "", "startedAt": 0, "misses": 1 })),
         json!("reconnect")

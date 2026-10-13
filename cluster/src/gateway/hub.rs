@@ -84,11 +84,22 @@ pub const MEMBERS_EVERY: Duration = Duration::from_secs(5);
 /// How many refused handshakes the status page lists.
 pub const REFUSALS_KEPT: usize = 100;
 
-/// The apps a member may join (§3.1).
-pub const APPS: [&str; 3] = ["zend", "npcd", AGENT_APP];
+/// The apps a member may join (§3.1). `keep` is the failsafe: it is listed
+/// on the status page and is not a replication group.
+pub const APPS: [&str; 4] = ["zend", "npcd", AGENT_APP, KEEP];
 
 /// The agents' app (§11).
 const AGENT_APP: &str = "agent";
+
+/// The failsafe's app. It joins so the status page can list it. It is never
+/// certified, never given a share of live traffic, and never rolled out.
+pub const KEEP: &str = "keep";
+
+/// Whether `app` takes a candidate, a canary share, or a rollout. `agent`
+/// follows the daemons' floor; `keep` does none of it.
+pub fn rolls_out(app: &str) -> bool {
+    app != AGENT_APP && app != KEEP
+}
 
 /// Live events unsent on a member's ordered lane past which it is lagging.
 pub const LAG_CAP: usize = 256 << 20;
@@ -804,7 +815,7 @@ impl Hub {
         let agents_follow = {
             let mut s = self.state();
             s.admission.set_floor(app, build, 0, by);
-            app != AGENT_APP && s.held.has_kind(build, AGENT)
+            rolls_out(app) && s.held.has_kind(build, AGENT)
         };
         self.note(
             app,
@@ -843,6 +854,9 @@ impl Hub {
         let now = now_ms();
         let mut actions = self.state().upgrades.tick(now);
         for app in APPS {
+            if !rolls_out(app) {
+                continue;
+            }
             let mut s = self.state();
             let Some(floor) = s.admission.floor(app).cloned() else {
                 continue;
@@ -881,6 +895,9 @@ impl Hub {
 
     /// `raise-floor` (§12.4): end `app`'s grace period now.
     pub fn raise_floor(&self, app: &str) -> Result<(), String> {
+        if !rolls_out(app) {
+            return Err(format!("{app} is listed, not rolled out"));
+        }
         let actions = self.state().upgrades.raise_floor(app, now_ms())?;
         self.note(
             app,
@@ -895,6 +912,9 @@ impl Hub {
     /// app's members; or why it is refused.
     pub fn plan_rollout(&self, ask: &Ask) -> Result<Plan, String> {
         let app = ask.app.as_str();
+        if !rolls_out(app) {
+            return Err(format!("{app} is listed, not rolled out"));
+        }
         let (owned, floor, quorum, mut seen) = {
             let s = self.state();
             let owned: Vec<(u64, String, BuildId, bool, Option<UpgradeView>)> = s
@@ -936,6 +956,9 @@ impl Hub {
 
     /// `cancel-floor` (§12.4): discard `app`'s pending floor.
     pub fn cancel_floor(&self, app: &str) -> Result<(), String> {
+        if !rolls_out(app) {
+            return Err(format!("{app} is listed, not rolled out"));
+        }
         let actions = self.state().upgrades.cancel_floor(app)?;
         self.act(actions);
         Ok(())

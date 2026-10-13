@@ -165,8 +165,9 @@ roles_file: "../host/roles.yaml"
 #   YAML
 
 # ── the cluster (docs/replicated_substrate.md) ──────────────────────────────
-# Members — motherd's zend and npcd tenants, and its agent — dial this gateway at
-# `/v1/cluster/<app>` on the TLS entrance and prove they hold the group key. A
+# Members — motherd's zend and npcd tenants, its agent, and keep — dial this
+# gateway at `/v1/cluster/<app>` on the TLS entrance and prove they hold the
+# group key. keep is listed on `/gateway` and is not a route target. A
 # route with `cluster: <app>` goes to that app's ready members, and to its
 # `upstream` while there are none (§5.7): code.tokera.com and bot.tokera.com
 # below keep working when no member is up.

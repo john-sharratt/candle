@@ -254,7 +254,7 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + "s")}`;
 const chip = (cls, text) => `<span class="chip ${cls}">${esc(text)}</span>`;
 const STATE_CLS = {ready: "ok", loading: "warn", upgrading: "warn", draining: "warn", disabled: "warn", fault: "crit"};
 const MODE_CLS = {joined: "ok", fault: "crit", cut_off: "warn", rejoining: "warn", reloading: "warn", draining: "warn"};
-const APP_NAME = {zend: "Zend", npcd: "NPCs", agent: "Agents"};
+const APP_NAME = {zend: "Zend", npcd: "NPCs", agent: "Agents", keep: "keep"};
 const appName = (a) => APP_NAME[a] || a;
 
 /* ── reading ─────────────────────────────────────────────────────────────── */
@@ -365,13 +365,18 @@ function renderOverview(s, earlier) {
 }
 
 function sayApp(a, s) {
+  if (a.app === "keep") {
+    return a.members
+      ? "The failsafe is up. It watches web and motherd, and it is not rolled out."
+      : "The failsafe has not joined.";
+  }
   if (!a.members) return "No member has joined. Its routes go to the configured upstream.";
   if (a.mode === "clustered") return `${plural(a.ready, "member")} of ${a.members} ready and serving.`;
   if (a.mode === "loading") return `${plural(a.members, "member")} joined, still loading — its loading page answers until it is ready.`;
   return "Members are joined but none is ready.";
 }
 
-function memberLine(m, s) {
+function memberLine(m, s, operate) {
   const c = m.coord;
   const u = c && c.upgrade;
   const floor = (appOf(s, m.app) || {}).floor;
@@ -386,32 +391,35 @@ function memberLine(m, s) {
   return `<div class="gw-member">
     <div class="who"><span class="host">${esc(m.host)}</span>${chip(STATE_CLS[m.state] || "", m.state)}${m.lagging ? chip("warn", "lagging") : ""}${c && c.mode !== "joined" ? chip(MODE_CLS[c.mode] || "", c.mode.replace("_", " ")) : ""}${u && u.step ? chip(u.step === "stranded" ? "crit" : "accent", u.step) : ""}${behind ? chip("warn", `behind floor ${floor.count}`) : ""}</div>
     <div class="meta">${bits.map((b) => `<span>${b}</span>`).join("")}</div>
-    <div class="act"><button class="btn sm" type="button" data-actions="${esc(m.app)}" data-node="${esc(m.node)}">Actions…</button></div>
+    <div class="act">${operate ? `<button class="btn sm" type="button" data-actions="${esc(m.app)}" data-node="${esc(m.node)}">Actions…</button>` : ""}</div>
   </div>`;
 }
 
 function renderApps(s) {
   $("apps").innerHTML = s.apps.map((a) => {
     const members = membersOf(s, a.app);
-    const facts = [
+    const operate = a.app !== "keep";
+    const facts = (operate ? [
       ["Floor", a.floor ? buildName(a.floor) : "none yet"],
       a.pending_floor ? ["Rising to", `${buildName(a.pending_floor)} ${a.grace_ends_ms ? countdown(a.grace_ends_ms, s.now_ms) : "once it loads"}`] : null,
       a.model_lock ? ["Model", a.model_lock] : null,
       a.max_members != null ? ["Quorum", `${a.quorum} of ${a.max_members}`] : null,
       a.since_ms ? ["Mode since", ago(a.since_ms, s.now_ms) + " ago"] : null,
-    ].filter(Boolean);
+    ] : [
+      a.since_ms ? ["Up since", ago(a.since_ms, s.now_ms) + " ago"] : null,
+    ]).filter(Boolean);
     return `<article class="gw-app">
       <div class="gw-app-hd"><h3>${esc(appName(a.app))}</h3>${chip({clustered: "ok", loading: "warn"}[a.mode] || "", a.mode)}<p class="gw-app-say">${esc(sayApp(a, s))}</p></div>
       ${members.length ? `<dl class="gw-facts">${facts.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
-      <div class="gw-members">${members.map((m) => memberLine(m, s)).join("")}</div>
-      <div class="gw-app-ft"><button class="btn sm" type="button" data-quorum="${esc(a.app)}">Set quorum…</button><button class="btn sm ghost" type="button" data-rollout="${esc(a.app)}">Roll out a build…</button></div>`
+      <div class="gw-members">${members.map((m) => memberLine(m, s, operate)).join("")}</div>
+      ${operate ? `<div class="gw-app-ft"><button class="btn sm" type="button" data-quorum="${esc(a.app)}">Set quorum…</button><button class="btn sm ghost" type="button" data-rollout="${esc(a.app)}">Roll out a build…</button></div>` : ""}`
       : `<p class="gw-none">Nobody has joined.</p>`}
     </article>`;
   }).join("");
 }
 
 function renderUpgrades(s) {
-  const blocks = s.upgrades.filter((u) => membersOf(s, u.app).length).map((u) => {
+  const blocks = s.upgrades.filter((u) => u.app !== "keep" && membersOf(s, u.app).length).map((u) => {
     const a = appOf(s, u.app) || {};
     const c = u.candidate;
     let say;

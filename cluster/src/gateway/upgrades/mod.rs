@@ -30,6 +30,7 @@ use serde::Serialize;
 use self::mirror::Compared;
 use self::stats::{Mismatch, Sample, Share, Stats};
 use self::verdict::{verdict, Figures, Overall};
+use super::rolls_out;
 use crate::close::{Close, CloseCode};
 use crate::coord::UpgradeView;
 use crate::dispatch::Mirror;
@@ -227,7 +228,7 @@ impl Upgrades {
         floor: Option<&BuildId>,
         now_ms: u64,
     ) -> Vec<Action> {
-        if build.is_local() || app == "agent" || floor.is_none_or(|f| build.count <= f.count) {
+        if build.is_local() || !rolls_out(app) || floor.is_none_or(|f| build.count <= f.count) {
             return Vec::new();
         }
         let a = self.app(app);

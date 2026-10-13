@@ -30,7 +30,9 @@ pub use agents::{
 pub use claims::Claims;
 pub use coord_log::changes;
 pub use drain::DRAIN_WAIT;
-pub use hub::{Hub, MemberStream, APPS, CATCHUP_CAP, LAG_CAP, MEMBERS_EVERY, REFUSALS_KEPT};
+pub use hub::{
+    rolls_out, Hub, MemberStream, APPS, CATCHUP_CAP, KEEP, LAG_CAP, MEMBERS_EVERY, REFUSALS_KEPT,
+};
 pub use log::{CoordLog, Entry};
 pub use paxos_log::paxos_step;
 pub use registry::{MemberView, Pick, Registry};

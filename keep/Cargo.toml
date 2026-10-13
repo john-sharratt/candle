@@ -9,9 +9,12 @@ name = "keep"
 path = "src/main.rs"
 
 [dependencies]
-anyhow     = { workspace = true }
-cluster    = { path = "../cluster" }
-serde      = { workspace = true }
-serde_json = { workspace = true }
-serde_yaml = "0.9"
-sysinfo    = { version = "0.31", default-features = false, features = ["system"] }
+anyhow       = { workspace = true }
+cluster      = { path = "../cluster" }
+cluster-dial = { path = "../cluster-dial" }
+rand         = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+serde_yaml   = "0.9"
+sysinfo      = { version = "0.31", default-features = false, features = ["system"] }
+tokio        = { version = "1", features = ["rt-multi-thread"] }

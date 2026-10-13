@@ -16,9 +16,9 @@ use crate::frame::{BuildId, Hello, ModelId};
 /// How far a member's clock may be from the gateway's (§3.4, 4417).
 pub const MAX_SKEW_MS: u64 = 60_000;
 
-/// The apps that carry a model lock; agents run none (§3.6).
+/// The apps that carry a model lock. Agents and the failsafe run none (§3.6).
 fn locked(app: &str) -> bool {
-    app != "agent"
+    app != "agent" && app != "keep"
 }
 
 #[derive(Debug, Default)]
@@ -309,6 +309,7 @@ mod tests {
         assert!(a.lock("zend").is_none());
         assert!(admit(&mut a, hello("zend", 2, build(1, ""), Some(model(2)), NOW)).is_ok());
         assert!(admit(&mut a, hello("agent", 9, build(1, ""), None, NOW)).is_ok());
+        assert!(admit(&mut a, hello("keep", 8, build(1, ""), None, NOW)).is_ok());
         assert_eq!(
             admit(&mut a, hello("npcd", 3, build(1, ""), None, NOW))
                 .unwrap_err()
