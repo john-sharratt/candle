@@ -31,7 +31,7 @@ use crate::version::info::BuildInfo;
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
     pub own: Option<BuildInfo>,
-    /// Its node in each app it serves, in hex as rollouts name it: a tokerad
+    /// Its node in each app it serves, in hex as rollouts name it: a motherd
     /// is a node of each substrate.
     pub nodes: BTreeMap<String, String>,
     /// The apps it serves.
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(prefetch(&f), None, "a rejected build is not fetched");
     }
 
-    /// A tokerad installs only what both of its apps certified.
+    /// A motherd installs only what both of its apps certified.
     #[test]
     fn every_app_served_must_certify() {
         let mut f = facts(10, "");

@@ -1,4 +1,4 @@
-# tokerad — zend and npcd in one process, on one model.
+# motherd — zend and npcd in one process, on one model.
 #
 # Each section holds the same settings as that daemon's own flags, spelled as
 # the flag is without its dashes (`--working-dir` is `working_dir:`). A key no
@@ -7,7 +7,7 @@
 #
 # Run from the repository root:
 #
-#   target\release\tokerad.exe --config tokerad\tokerad.yaml
+#   target\release\motherd.exe --config motherd\motherd.yaml
 
 # The process: where it listens and whom it believes, and the cluster it joins
 # (docs/replicated_substrate.md §3). One plain entrance and, beside it, HTTPS
@@ -28,7 +28,7 @@ host:
   clusters: ["https://192.168.0.5:9443"]
   cluster_name: tokera.com
   group_key: web/secrets/group.key
-  agent: tokerad/agent.yaml
+  agent: motherd/agent.yaml
 
 # zend: the workspace folder holding `workspace.yaml`, and its `substrate/`. A
 # substrate is bound to the model that wrote it, so one written under another

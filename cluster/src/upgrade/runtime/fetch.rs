@@ -339,7 +339,7 @@ mod tests {
         let o = offer(vec![
             a("zend", "windows-x86_64", 1),
             a("zend", "linux-x86_64", 2),
-            a("tokerad", "linux-x86_64", 3),
+            a("motherd", "linux-x86_64", 3),
         ]);
         assert_eq!(
             needed(&o, "zend", "linux-x86_64").unwrap(),

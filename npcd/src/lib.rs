@@ -1,6 +1,6 @@
 //! `npcd` — the NPC engine, as a library.
 //!
-//! The `npcd` binary (and `tokerad`, which hosts npcd beside zend) is one
+//! The `npcd` binary (and `motherd`, which hosts npcd beside zend) is one
 //! consumer of this crate and deliberately not a privileged one. The design names four entry points over a single core — the
 //! HTTP API, the console, a test harness, and direct crate embedding with no
 //! socket at all — and holds that no capability may exist at only one of them.
@@ -14,7 +14,7 @@
 //!
 //! | Module | What it owns |
 //! |---|---|
-//! | [`tenant`] | npcd as a tenant of the `host` process — alone in `npcd`, beside zend in `tokerad` |
+//! | [`tenant`] | npcd as a tenant of the `host` process — alone in `npcd`, beside zend in `motherd` |
 //! | [`reports`] | npcd's share of the host's shared endpoints |
 //! | [`engine`] | the cast's loop: perception, the act vocabulary, the tick |
 //! | [`api`] | the authored corpus, the mind, the cast, the authoring plane |

@@ -3,7 +3,7 @@
 //! It parses npcd's flags and the process's, and runs npcd as the one tenant of
 //! a host process (`host::run`): the host serves the console from disk and
 //! answers `/v1` — npcd's own routes beside the shared endpoints — from the
-//! same process. `tokerad` is the same call with zend beside it.
+//! same process. `motherd` is the same call with zend beside it.
 //!
 //! The process's flags are the host's (`host::HostArgs`), the same in every
 //! binary. npcd is reached from other machines on the estate, so a launch

@@ -223,9 +223,9 @@ mod tests {
     #[test]
     fn the_file_takes_the_name_it_is_given() {
         let tmp = TempDir::new().unwrap();
-        let mut log = RotatingFileLog::new(tmp.path(), "tokerad.log").unwrap();
+        let mut log = RotatingFileLog::new(tmp.path(), "motherd.log").unwrap();
         log.write_all(b"up\n").unwrap();
-        assert_eq!(read(&tmp.path().join("tokerad.log")), "up\n");
+        assert_eq!(read(&tmp.path().join("motherd.log")), "up\n");
     }
 
     /// The self-heal restart path: the marker means append and keep the

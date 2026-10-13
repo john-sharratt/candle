@@ -1388,7 +1388,7 @@ fn a_retired_item_may_retire_from_its_own_drop() -> Result<()> {
 
 /// **Pinned staging taken and freed mid-segment pauses the wave around it.**
 /// The driver refuses to pin or unpin host pages on a recording thread, and the
-/// refusal ends the capture — measured in tokerad, a prefill wave that took a
+/// refusal ends the capture — measured in motherd, a prefill wave that took a
 /// staging buffer mid-segment lost the segment and faulted the next wave step.
 /// The staging calls hold no device, so they pause through the wave this
 /// thread has open: the segment recorded before each runs first, recording

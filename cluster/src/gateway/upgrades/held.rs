@@ -181,7 +181,7 @@ mod tests {
         let mut h = HeldBuilds::default();
         let b = BuildArtifacts {
             build: build(12),
-            artifacts: vec![artifact("zend", 1), artifact("tokerad", 2)],
+            artifacts: vec![artifact("zend", 1), artifact("motherd", 2)],
         };
         h.announce(7, &b, true);
         h.announce(

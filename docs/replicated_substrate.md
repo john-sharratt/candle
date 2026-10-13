@@ -229,7 +229,7 @@ daemon code reports it outside logs.
 
 | # | Decision | Why |
 |---|---|---|
-| D1 | **One WebSocket per app** — `zend`, `npcd`, `agent`. Each app is its own replication group with its own build floor and model lock. `tokerad` opens two. | A newer npcd raises only npcd's floor: a combined binary loses its npcd socket and keeps serving zend until rebuilt. Substrates never mix across apps. |
+| D1 | **One WebSocket per app** — `zend`, `npcd`, `agent`. Each app is its own replication group with its own build floor and model lock. `motherd` opens two. | A newer npcd raises only npcd's floor: a combined binary loses its npcd socket and keeps serving zend until rebuilt. Substrates never mix across apps. |
 | D2 | **Members dial out, only when given `--cluster`; the gateways are the only listeners a group needs.** The daemons' own listeners stay up. While a member has a ready socket for an app, its listener forwards that app's requests **up** to a gateway. With none, it serves them itself. Without `--cluster` a daemon runs standalone, as today (§5.8). | Machines anywhere — LAN or internet — can join without inbound ports. A member cut off from every cluster keeps working on its own, then rejoins and catches up. |
 | D2a | **Several clusters, active-active.** A member joins every `--cluster` it is given. It spreads its own events round robin across them, except a request's events, which go out on the socket the request arrived on (§6.4). | Load is shared across gateways, and losing one costs the requests in flight on it and nothing else. |
 | D2b | **The gateway keeps its configured upstreams and falls back to them.** An app runs in *dumb mode* — today's fixed-URL routing — until a member of that app is ready on the gateway. It then switches to *clustered mode* and ignores the configured URL, and it reverts when the app's last member leaves (§5.7). | Clustering is opt-in by connecting. A deployment that never runs `--cluster` behaves as today, and a cluster that collapses degrades to the old routing instead of to an error page. |
@@ -255,7 +255,7 @@ daemon code reports it outside logs.
 | D15 | **Maintenance runs as admin commands on members, from the gateway page**: drain, restart, shutdown, compact, maintain, audit, catch-up, resync and others (§12.4). **Ctrl-C runs `shutdown`**: drain, wait for the outbox, flush, close; a second Ctrl-C aborts. They are routes on the member, so they work through the cluster and on a member's own listener alike. | Maintenance without SSH or launch-line juggling; every command is logged with who ran it. |
 | D16 | **Gateways peer with each other** over group-key-authenticated sockets. They share ACME challenges, issued certificates and keys, and the order ledger. Rendezvous over the connected gateways names who orders each site, with no consensus; a gateway partition can cost one duplicate certificate. They refuse to peer when their session keys or OAuth clients differ (§13.4). Peer links carry nothing else: no requests, members or claims (§4.3). | Active-active gateways answer the same names: any of them must answer a challenge and serve the certificate, and a cookie from one must work on the other. A duplicate order is harmless within the CA's limits, so it is not worth a Paxos group among gateways. |
 | D17 | **Every member holds a full copy, with no encryption at rest beyond what the disk provides; this design includes no backup and no key rotation** (§16). | Kept simple by decision. Replication is not backup: a mistake replicates. |
-| D18 | **A/B upgrades.** A higher build loads untouched. Once ready, it is certified against the older members, on a share of live traffic and on mirrored calls to read-only routes, compared statistically. Its binaries and UI are distributed to the older members, resumably and peer to peer. At the grace deadline, if certified, the members upgrade themselves one at a time: drain, swap the binary at the same path, relaunch with the same arguments in the same working directory, watched by a separate watchdog process that loads no model, so the old daemon has exited and released its VRAM before the new one loads. A failed certification faults the candidate and aborts the upgrade (§3.8, §3.9). | Upgrading the estate is building one machine. A bad build is caught on a sliver of traffic before it replaces anything, and a bad install puts itself back. |
+| D18 | **A/B upgrades.** A higher build loads untouched. Once ready, it is certified against the older members, on a share of live traffic and on mirrored calls to read-only routes, compared statistically. Its binaries are distributed to the older members, resumably and peer to peer. At the grace deadline, if certified, the members upgrade themselves one at a time: drain, swap the binary at the same path, start the new process, exit. `keep`, a separate process, restores and starts the last known-good executable when the new one does not become ready. A failed certification faults the candidate and aborts the upgrade (§3.8, §3.9). | Upgrading the estate is building one machine. A bad build is caught on a sliver of traffic before it replaces anything, and a bad install puts itself back. |
 | D19 | **A local build** — commits not on `origin/main`, or uncommitted edits, measured exactly by the build's `local` digest — **serves its own listener locally and never takes part in upgrades**: never a candidate, never auto-installed, never closed for being behind. Otherwise it is a full member: its writes replicate, the gateway routes to it, it holds leases and votes (§3.10). | Work-in-progress can be tested on a cluster machine through its own port, while the gateway and the upgrade machinery carry on untouched. |
 | D20 | **Every member keeps its last *N* builds** (`--keep-builds`, default 5), **and an admin can force any build onto an app from any member that holds it** (`rollout`, §3.11). A forced rollout skips grace and certification, moves the floor in either direction, and is a Paxos decision, so every gateway applies it. A downgrade rejects the builds it leaves. A build is installed only where it can open the member's substrate: same log format, every record type known, same model (§3.9). | Rolling back is a swap from each member's own disk, with no transfer, so it is as fast as a restart. Deciding by Paxos keeps active-active gateways and a restarted gateway on the same rollout. The checks keep a downgrade from hiding, and then compacting away, data an older build cannot read. |
 
@@ -274,7 +274,7 @@ with `426`.
 
 ### 3.2 Dialling
 
-New host flags (`host/src/cli.rs`), also accepted in `tokerad.yaml`'s `host:` section:
+New host flags (`host/src/cli.rs`), also accepted in `motherd.yaml`'s `host:` section:
 
 | Flag | Meaning |
 |---|---|
@@ -289,7 +289,7 @@ The member upgrades an `https` request to the WebSocket (`wss` on the wire). The
 client verifies the gateway's Let's Encrypt certificate against webpki roots — never
 `self_signed`. An `http://` cluster is refused unless its host is loopback.
 
-**One socket per app per cluster.** A `tokerad` given two clusters holds four sockets:
+**One socket per app per cluster.** A `motherd` given two clusters holds four sockets:
 zend and npcd to each. Every socket runs its own handshake, keep-alive and reconnect
 loop. A member is *joined* to an app while at least one of that app's sockets is
 admitted. It is *ready* (§7.2) once caught up through any of them.
@@ -477,7 +477,7 @@ app back.
 
 A member's `node` is 64 random bits created at first open and stored beside its data:
 `substrate/NODE` for zend and npcd (so it is the substrate's identity and survives
-restarts, and the two substrates of a `tokerad` are two nodes), `<agent dir>/NODE` for
+restarts, and the two substrates of a `motherd` are two nodes), `<agent dir>/NODE` for
 an agent. It is the `origin` of every record that substrate writes (§6.2).
 
 **A copied substrate must not keep its node.** Two directories with one `NODE` would
@@ -598,7 +598,7 @@ failure on another is a failure.
 A candidate that stops before proposing leaves its build uncertified, and the next
 candidate at that build starts again.
 
-**What is certified is a build, per app.** A `tokerad` candidate is certified for zend
+**What is certified is a build, per app.** A `motherd` candidate is certified for zend
 and for npcd separately, on each app's traffic, and an app whose certification fails is
 not upgraded even if the other passes.
 
@@ -609,11 +609,11 @@ below its build. It sends `BUILD_OFFER { build, artifacts }` on every socket. Th
 artifacts are:
 
 - **Every binary built beside it at the same build.** A `cargo build --release` writes
-  `zend`, `npcd`, `tokerad` and `tokera-agent` into one directory, all stamped with one
+  `zend`, `npcd`, `motherd` and `tokera-agent` into one directory, all stamped with one
   `count` and `hash` by the `cluster` crate's `build.rs` (§3.5). The candidate offers
   each binary in its executable's directory that reports the same build. Every binary
   answers `--build-info` with `{ kind, count, hash, local, platform, log_format,
-  record_tags, model }`, which is how the candidate checks. So a `tokerad` candidate can
+  record_tags, model }`, which is how the candidate checks. So a `motherd` candidate can
   also upgrade standalone zend and npcd members, if those binaries were built with it.
   The last three say what the build can open:
   - `log_format` is the build's `FILE_FORMAT_VERSION` (`log_file.rs:41`, 3 today);
@@ -633,7 +633,7 @@ There is no UI artifact. Each binary carries its tenants' UI compiled in
 **Which members fetch which artifact.**
 
 - A member fetches only the artifact of **its own kind and platform**. A zend member
-  takes `zend`, a `tokerad` member `tokerad`, an agent `tokera-agent`.
+  takes `zend`, a `motherd` member `motherd`, an agent `tokera-agent`.
 - **GPU architecture is not a concern.** Kernel archives are built for every
   architecture into every binary.
 - A member for which no artifact matches is **stranded**: shown on the status page with
@@ -689,7 +689,7 @@ build is certified (§3.8):
    members are *not* closed while they are waiting to upgrade.
 2. **Members upgrade one at a time per app.** A member may upgrade only while it holds
    the Paxos lease `upgrade/<app>` (§5.9). The app therefore never loses more than one
-   member at once, and its capacity and quorum hold. For a `tokerad`, which is a member
+   member at once, and its capacity and quorum hold. For a `motherd`, which is a member
    of both apps, upgrading takes both leases, and it installs a build only once both
    apps certified it.
    - **The lease outlives the process.** It is taken for 20 minutes, the watchdog's
@@ -708,40 +708,31 @@ build is certified (§3.8):
      directory, `<exe dir>/builds/<old count>-<old hash>/`, which Windows allows for a
      running image because it is a rename on the same volume. It then moves the verified
      artifact to the executable's own path. The UI comes with it, compiled in;
-   - **relaunches with the same arguments in the same working directory**, through
-     `LaunchSpec` (`cluster/src/launch.rs`), which `self_heal` uses too. It records the
-     executable path, the original arguments exactly as given (one-shot flags dropped),
-     and the working directory, and `relaunch` restores all three. Because the new binary
-     sits at the old path, nothing about the invocation changes.
-4. **A watchdog process, not the old daemon, watches the new one.** The old daemon
-   must exit before the new one loads, because it holds the model in VRAM, and two
-   copies do not fit on the 16 GB card. Process exit is the one sure way to release a
-   CUDA context. So, after the swap:
-   - the old daemon writes the watchdog's plan, `<data>/upgrade/watch.json` (its pid,
-     the `LaunchSpec`, the swap, the build being installed, the log, the leases, how many
-     builds to keep), and starts the **watchdog**: the old executable, now in
-     `builds/<old count>-<old hash>/`, run with `--upgrade-watchdog <plan>`. Every main
-     answers that before it parses its arguments, so the watchdog loads no model, opens
-     no substrate and dials no cluster (`upgrade/watchdog.rs`, `upgrade/os.rs`);
-   - the old daemon exits. The watchdog waits up to 120 s for it to be gone, killing it
-     after that, then launches the new binary through `LaunchSpec`.
+   - **starts the new process** with the same arguments in the same working directory,
+     through `LaunchSpec` (`cluster/src/launch.rs`), plus `--after-pid` of itself, and
+     exits. `self_heal` uses the same `LaunchSpec` without that flag. The new process
+     waits until this pid is gone, up to 120 s, then loads, so the two never hold the
+     model at once (`upgrade/os.rs`). Because the new binary sits at the old path,
+     nothing else about the invocation changes. The plan is `<data>/upgrade/watch.json`.
+4. **`keep` is the failsafe, and it is already running.** It is its own process. It
+   does not certify, roll out, or carry bytes. It reads the last executable path that
+   became ready from its own state directory. For `web` and `motherd`:
+   - **A process that is gone** is started again from that path, with the arguments and
+     working directory recorded when it was last ready.
+   - **A replacement that does not become ready** within 15 minutes, with a plan on
+     disk, is the failure path (`upgrade/watchdog.rs` `recover`, `upgrade/swap.rs`
+     `restore`): `keep` puts the previous executable back, writes
+     `<data>/upgrade/failed.json`, and starts it with `--upgrade-failed <count>-<hash>`.
+     The restored process records that build in `refused.json` and does not try it
+     again unless a forced rollout names it.
+   - **Success** is the new process itself. Once it is ready it writes
+     `<data>/upgrade/ok`, prunes kept builds beyond *N*, and hands the leases back.
+     `keep` then records that executable as the last ready one.
 
-   A swap that cannot complete, or a watchdog that cannot start, is undone at once by
-   the old daemon, which then relaunches itself (`upgrade/handoff.rs`).
+   A swap that cannot be written, or a new process that cannot be spawned, is undone
+   at once by the old process, which then relaunches itself (`upgrade/handoff.rs`).
 
-   The watchdog watches the new process:
-   - **Success:** the new process writes `<data>/upgrade/ok` once every app it serves is
-     joined, caught up and ready. The watchdog prunes the kept builds beyond *N* and
-     exits, and the new process hands the leases back (step 2).
-   - **Failure:** the new process exits, or is not ready within 15 minutes. The watchdog
-     stops it if it is still running, and puts the old executable back at its path. It writes `<data>/upgrade/failed.json` (the build, the reason, and the new
-     process's last 40 log lines), and relaunches the old build the same way, with
-     `--upgrade-failed <count>-<hash>`. The restored member adds the build to
-     `<data>/upgrade/refused.json` and never tries it again unless a forced rollout
-     names it (§3.11). It reports the failure in `COORD`, which the gateway logs, and
-     hands the leases back like a new build would.
-
-   `--upgrade-watchdog` and `--upgrade-failed` are one-shot flags: `LaunchSpec::capture`
+   `--after-pid` and `--upgrade-failed` are one-shot flags: `LaunchSpec::capture`
    drops them, so no later relaunch repeats them.
 5. **Members that cannot upgrade** are closed 4410 once the rollout settles, 120 s after
    the floor rose: stranded ones, failed ones, and ones that hold no verified artifact
@@ -932,7 +923,7 @@ of `certify/<app>/<count>-<hash>/<i>` (§3.8, §5.9). It follows that:
   itself fetches nothing.
 - **Leases.** Members take one of `parallel` leases, `upgrade/<app>/<i>`, instead of the
   single `upgrade/<app>`, asking for a slot at random so members waiting together spread
-  across them. A `tokerad` also takes `upgrade/<other app>`. With the default of 1, this
+  across them. A `motherd` also takes `upgrade/<other app>`. With the default of 1, this
   is the same as an automatic rollout.
 - **Never pruned.** The rollout's build is protected in the watchdog's plan, so the
   prune after a successful swap never removes it (§3.9).
@@ -1089,7 +1080,7 @@ stream.
 | `CATCHUP` | the member `to` names; without `to`, one other ready member of the app, picked round robin (§7.2) |
 | `FETCH` | the member `from_node` names |
 | `HAVE` | every other admitted member of the same app (§7.5) |
-| `BUILD_OFFER`, `BUILD_HAVE` | every other admitted member of every app, agents included, once per member: a `tokerad` build carries the `tokera-agent` an agent takes (§3.9). The gateway keeps who holds what, for admitting members below the floor and for the Builds held list |
+| `BUILD_OFFER`, `BUILD_HAVE` | every other admitted member of every app, agents included, once per member: a `motherd` build carries the `tokera-agent` an agent takes (§3.9). The gateway keeps who holds what, for admitting members below the floor and for the Builds held list |
 | `BUILD_FETCH` | the member `from_node` names; with `from_node` 0, the next member holding the artifact, round robin, never the requester. Its `BUILD_CHUNK`s go only to `reply_to`, on the catch-up lane |
 | `PULSE` | every other admitted member of the same app; dropped, never queued, when a member's ordered lane is past half its cap (§4.4) |
 | `PREPARE`, `PROPOSE`, `RELEASE` | every other admitted member of the same app, members in fault mode included, since they still vote (§7.7), and upgrading members excluded, since they do not (§3.5); the gateway only carries them and holds no Paxos state (§5.9) |
@@ -2861,7 +2852,7 @@ follows, and stops writing):
   gateways says nothing about whether `origin` is reachable. An operation finished in
   the local world takes its `publish` step at the merge table as it would anywhere, and
   its verified work reaches the record (§10.3). The push needs an agent the member can
-  reach without a gateway, which is its own in-process one (`tokerad --agent`, §11.5).
+  reach without a gateway, which is its own in-process one (`motherd --agent`, §11.5).
   With none, or with `origin` down, the step waits and is tried again 30 minutes later.
 - **What was published stays published.** On reconnect the local world is scrapped as
   below, but git is not. The authoritative world's copy of the operation carries on. If
@@ -2980,7 +2971,7 @@ store over it.
 
 **With `--cluster`, the mind is a repository the agents hold** (`npcd/src/mind_repo.rs`),
 named the way zend names a repository in its workspace: `--mind-repo <name>`
-(`mind_repo:` in `tokerad.yaml`), its record the branch `--mind-branch` (default
+(`mind_repo:` in `motherd.yaml`), its record the branch `--mind-branch` (default
 `main`). So the machine that runs inference needs neither the repository nor a way to
 its origin; an agent anywhere in the cluster holds the checkout and the credentials
 (§11). `--mind <dir>` remains for a daemon without `--cluster`, and the two are refused
@@ -3357,7 +3348,7 @@ through a stream the member opens to `group:agent` (§5.1). The in-process `Sand
 deployment configuration, not a fallback: with `--cluster`, an unreachable agent is the
 tool error `no_agent`, never a quiet local run.
 
-A machine with a GPU can also be an agent. `tokerad --agent <agent file>` — the file
+A machine with a GPU can also be an agent. `motherd --agent <agent file>` — the file
 naming its checkouts, job slots and jobs folder (`agent/src/config.rs`) — opens a third
 socket that serves the job API in-process at low priority, which is §8.1's "GPU nodes may
 register as low-priority build agents". Low priority is two things: its commands, and
@@ -3368,7 +3359,7 @@ so a build never takes the processor the decode needs; and the gateways choose i
 
 **A member cut off from every cluster can still reach its own in-process agent.** Agents
 dial out and have no listener, so a member cut off from the gateways reaches no other
-agent. When it is cut off, a `tokerad --agent` sends jobs straight to the agent in its
+agent. When it is cut off, a `motherd --agent` sends jobs straight to the agent in its
 own process. That is how a disconnected npcd world publishes (§9.4, §10.3). A member with
 no in-process agent fails the job with `no_agent`. A zend tool reports that to the
 model; a publish waits 30 minutes and tries again; the mind's follow tries again in a
@@ -3929,7 +3920,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | identity | the `TimelineId` layout and monotonicity; `hlc` is monotonic and passes every `hlc` seen; `(origin, oseq)`, stamp and `digest` preserved through relocation, re-emission and `compact()`; the applied set and the location index rebuild from the last `Replica` plus the walk; a substrate copied to another directory or machine re-mints its node; passthrough timelines are `hash(conversation_key, n)`, `n` the first opening whose timeline is free; VFS events are named `(origin, seq)`, two writers' of one number are two events, and a tombstone of another member's event outlives compaction |
 | VFS scoping | the writer's, reviewer's and checker's missions of one operation see one store, and a draft written in one step is read in the next, on another in-process member too; two operations over one base see different files; a character with no mission reads the tip; the table's reading and checks read the store; nothing an operation writes reaches the mind folder before its publish step; a failed run's store is discarded under `discard` and kept under `keep`, and `reopen` resumes a kept one; a workflow with a route to `done` from anything but a publish step is a load error; a clean publish lands the store and settles the run `done`; a conflict refuses the publish with the paths named, `merge_sync` marks the overlapping hunks in the store, and once the Maker has resolved and committed them at the bench the publish lands and the run settles `done` without going back through verification; the `published` check holds the step open until then; a Maker that reports `stuck` hands the step to another; publishing the same text twice merges as a no-op; in disconnected mode a step's edits write no `VfsEvent`; with `origin` or every agent unreachable, a publish settles nothing, counts toward neither send-backs nor stuck, and under paused time is offered again exactly 30 minutes later with the store intact |
 | agent selection | stickiness, the spill after the wait, and the idle-core ranking with repository and toolchain filters |
-| fetch through an agent (`zend-vfs/src/remote/fetch_bundle.rs`, `agent/src/wire.rs`, `agent/tests/agents.rs`, `npcd/src/mind_repo.rs`, `npcd/src/tenant.rs`) | a member that cannot reach origin gets a branch through an agent's checkout — the commit and its objects under its own tracking ref, reported as a fetch from origin reports it — then only what it lacks, and nothing when it lacks nothing; every branch is carried and a deleted one pruned; a branch asked for alone that origin lacks is an unknown revision; a `have` the agent does not hold is passed over; a fetch job and its answer are their exact JSON; through an in-process gateway a mirror whose `origin` is `agent:r` pulls origin's branch through the agent, and cut off a member's fetch reaches only its own agent, else `no_agent`; npcd's mirror is made under `--data` named `agent:<name>`, brought up to the record and checked out — ready — and follows later commits; a branch origin lacks leaves it not ready; `--mind-repo` needs `--data`, is refused beside `--mind`, and reads the same from `tokerad.yaml`; an unready mirror starts on no mind |
+| fetch through an agent (`zend-vfs/src/remote/fetch_bundle.rs`, `agent/src/wire.rs`, `agent/tests/agents.rs`, `npcd/src/mind_repo.rs`, `npcd/src/tenant.rs`) | a member that cannot reach origin gets a branch through an agent's checkout — the commit and its objects under its own tracking ref, reported as a fetch from origin reports it — then only what it lacks, and nothing when it lacks nothing; every branch is carried and a deleted one pruned; a branch asked for alone that origin lacks is an unknown revision; a `have` the agent does not hold is passed over; a fetch job and its answer are their exact JSON; through an in-process gateway a mirror whose `origin` is `agent:r` pulls origin's branch through the agent, and cut off a member's fetch reaches only its own agent, else `no_agent`; npcd's mirror is made under `--data` named `agent:<name>`, brought up to the record and checked out — ready — and follows later commits; a branch origin lacks leaves it not ready; `--mind-repo` needs `--data`, is refused beside `--mind`, and reads the same from `motherd.yaml`; an unready mirror starts on no mind |
 | status page | `COORD` encodes to exact bytes; every coordination decision of §12.3 — admission, refusal, mode switch, floor, lock, claim, grant, majority, NPC lease, cut-off, rejoin step, generation fixed, disconnected mode, catch-up, resync, tombstone expiry — driven through an in-process gateway lands in the log with its gateway and subject; `status.json` carries every block of §12.2, and a member reporting a gateway this one cannot see shows in both the `clusters` column and the grant counts |
 
 ### 14.2 Burst micro harnesses
@@ -4200,7 +4191,7 @@ npcd work wants them sooner.
 
 - **Agents (§11).**
   - `tokera-agent` and the job API.
-  - `tokerad --agent`, and the in-process agent a cut-off member reaches.
+  - `motherd --agent`, and the in-process agent a cut-off member reaches.
   - zend's executor and git writers going through agents under `--cluster`.
 - **zend (§10.1, §10.2).** Uploads as VFS events.
 - **npcd (§10.3).**
@@ -4240,9 +4231,11 @@ chunk 4 already enforces the floor. This chunk is the machinery on top:
   `floor_grace_minutes` and `canary_share`.
 - Distribution with resumable part files (`upgrade/parts.rs`, `upgrade/runtime/fetch.rs`)
   and the gateway's table of held builds.
-- The one-at-a-time install under `upgrade/<app>`, the in-place swap, the
-  `--upgrade-watchdog` process, and the restore (`upgrade/{swap,watchdog,handoff,os}.rs`;
-  the installers in `host/src/cluster/upgrade.rs` and `agent/src/install.rs`).
+- The one-at-a-time install under `upgrade/<app>`, the in-place swap, and the
+  restore (`upgrade/{swap,watchdog,handoff,os}.rs`; the installers in
+  `host/src/cluster/upgrade.rs` and `agent/src/install.rs`). The member starts the
+  new executable and exits. `keep` restores the last ready executable when that
+  process does not become ready.
   `LaunchSpec` moves from `self_heal` to `cluster::launch`, which both use.
 - Kept builds in `builds/` (§3.9, `upgrade/kept.rs`).
 - The upgrading state for members admitted below the floor (§3.5), and agents following
@@ -4275,7 +4268,7 @@ from each member's own disk.
   `zend_vfs::Fetch`) a member with no way to origin fetches through.
 - The consoles reading the gateway's aggregates (§5.5, `common/lib/aggregate.js`).
 - `docs/deployment.md`: the group key, the `cluster:` block and route keys in
-  `web.yaml`, `tokerad` with `clusters`, `group_key` and an in-process agent.
+  `web.yaml`, `motherd` with `clusters`, `group_key` and an in-process agent.
 - The migration of today's deployment (§15.1).
 
 **Tests.** The gateway-peering table (§14.1), against a local test double of the ACME
@@ -4295,7 +4288,7 @@ intact. A second gateway behind the public names waits on a second gateway machi
   its substrate at `D:\prog\substrate`;
 - npcd on `.6`, launched `--host 0.0.0.0 --port 8081 --gateway 192.168.0.5`, with its
   substrate under its data directory;
-- `tokerad` not deployed.
+- `motherd` not deployed.
 
 **As run, 2026-10-12.** `.5` moved first; `.6` stays as it is until it is rebuilt on
 this framework.
@@ -4303,16 +4296,16 @@ this framework.
 - **The gateway** took the `cluster:` block (`group_key_file: secrets/group.key`,
   written by `web --new-group-key`) and `cluster:` keys on the zend and npcd routes, each
   keeping its upstream.
-- **`tokerad` on `.5` replaced zend.** It joins `https://192.168.0.5:9443` as
+- **`motherd` on `.5` replaced zend.** It joins `https://192.168.0.5:9443` as
   `tokera.com` with an agent in process, whose checkouts — `candle`, `battle-cities`,
-  `battle-mind` — are under `D:\agent` (`tokerad/agent.yaml`). Its zend tenant adopted
+  `battle-mind` — are under `D:\agent` (`motherd/agent.yaml`). Its zend tenant adopted
   `D:\prog\substrate` as the group's first member. No copy was taken aside: the estate
   accepts rebuilding a substrate over keeping a way back.
-- **npcd started fresh under `tokerad`'s model key** — the second way on in step 3
+- **npcd started fresh under `motherd`'s model key** — the second way on in step 3
   below. Its tenant has `mind_repo: battle-mind` and `data: ../npcd-data`: the first
   start found no mirror, ran with no mind, fetched the record through the in-process
   agent once joined, and relaunched onto it.
-- **`bot.tokera.com` falls back to `.6`.** While `tokerad`'s npcd member is joined and
+- **`bot.tokera.com` falls back to `.6`.** While `motherd`'s npcd member is joined and
   ready the gateway routes the name to it; with no npcd member it is back in dumb mode,
   on the `.6` upstream.
 
@@ -4361,14 +4354,14 @@ The steps below are the general plan, for the machines still to move.
 - `.6` then wins each world's lease (§9.2) as the only member, and lends itself every NPC
   lease. As further npcd members join, rendezvous spreads the characters across them
   (§9.3).
-- **`tokerad` cannot join this group as it stands.** The `.6` substrate is bound to a
-  model key whose RoPE minimum differs from the one `tokerad`'s engine runs (the refusal
+- **`motherd` cannot join this group as it stands.** The `.6` substrate is bound to a
+  model key whose RoPE minimum differs from the one `motherd`'s engine runs (the refusal
   `docs/shared_model_host.md` §4.2 records). The group's model lock is set by `.6`, so a
-  `tokerad` npcd tenant would be closed 4412 (§3.6). There are two ways on:
+  `motherd` npcd tenant would be closed 4412 (§3.6). There are two ways on:
   - **keep npcd members as standalone npcd processes**;
-  - **start the npcd group fresh** under `tokerad`'s model key, giving up `.6`'s history
+  - **start the npcd group fresh** under `motherd`'s model key, giving up `.6`'s history
     — the way the estate took: `.6` is rebuilt onto this framework and joins the group
-    `tokerad` started, empty.
+    `motherd` started, empty.
 - Further npcd machines join with empty substrates and catch up.
 - Set `--cluster-quorum-max` if the npcd group should keep electing with only two
   machines (§16, item 10).

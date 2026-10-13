@@ -2,7 +2,7 @@
 //! (`docs/shared_model_host.md` §3.2), driven through the real engine.
 //!
 //! One model loads and one scheduler runs; a first substrate is the engine's
-//! own, and a second is attached to it, as `tokerad` attaches npcd's beside
+//! own, and a second is attached to it, as `motherd` attaches npcd's beside
 //! zend's. Each runs the forward gate's story batch at the same moment, so
 //! their sequences share every wave, and each substrate's persistence thread
 //! drains its own.

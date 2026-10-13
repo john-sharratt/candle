@@ -165,7 +165,7 @@ roles_file: "../host/roles.yaml"
 #   YAML
 
 # ── the cluster (docs/replicated_substrate.md) ──────────────────────────────
-# Members — tokerad's zend and npcd tenants, and its agent — dial this gateway at
+# Members — motherd's zend and npcd tenants, and its agent — dial this gateway at
 # `/v1/cluster/<app>` on the TLS entrance and prove they hold the group key. A
 # route with `cluster: <app>` goes to that app's ready members, and to its
 # `upstream` while there are none (§5.7): code.tokera.com and bot.tokera.com
@@ -175,7 +175,7 @@ roles_file: "../host/roles.yaml"
 #
 #   target\release\web.exe --new-group-key web/secrets/group.key
 #
-# and copied to every member (`--group-key`, `group_key:` in tokerad.yaml).
+# and copied to every member (`--group-key`, `group_key:` in motherd.yaml).
 # `floor_grace_minutes` and `canary_share` tune certification (§3.8); `peers`
 # names the other gateways answering these names (§13.4) — none yet.
 cluster:

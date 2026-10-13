@@ -9,7 +9,7 @@ The Zen Code daemon: a persistent AI coding assistant server built on `candle-co
 - **`zen-vscode`** — a Continue fork VS Code extension. It passes its own `tools` array; `zend` treats those as client-executed (emits `tool_calls` in the response and returns immediately, letting Continue post results back as `role: "tool"` messages).
 - **The web chat** (`web/`, compiled into the binary and served by the host process — no Node, no build step; through the gateway the same files are served from disk, so a saved page is live on the next refresh) — passes no tools, so `zend` injects its own server-registered tool catalog (`zend-tools`), executes any tool calls itself in a loop, and streams only the final assistant text.
 
-`zend` runs as the one tenant of a **host process** (the `host` crate, `docs/shared_model_host.md`): the host owns logging, the self-heal watchdog, the model download, the HTTP server and the endpoints every tenant shares; zend brings its session and its own routes. `tokerad` is the same host with npcd beside zend, on one model.
+`zend` runs as the one tenant of a **host process** (the `host` crate, `docs/shared_model_host.md`): the host owns logging, the self-heal watchdog, the model download, the HTTP server and the endpoints every tenant shares; zend brings its session and its own routes. `motherd` is the same host with npcd beside zend, on one model.
 
 On startup `zend` resolves a **workspace** directory (see `--working-dir` below), opens (or creates) `<workspace>/substrate/` — the mandatory redo-log persistence layer `candle-conversation` requires — replays it into a `Substrate`, loads the model, installs the tool catalog and any calibrated system-prompt sections, then starts **ingest** in the background: every branch origin holds, read from git rather than from any folder, populates the projection schema's turn-sink layers (`src/branch_ingest/`, design in `docs/zend_branch_ingest.md`). Origin watchers (`src/origin_watch/`) ask each repository's origin for its branch tips every couple of seconds and fetch when one moved, which wakes the next pass. Only once loading finishes does the daemon accept `/v1/chat/completions` traffic (`GET /v1/status` reports the loading-state machine's progress to the frontend in the meantime).
 
@@ -27,9 +27,9 @@ Every layer the projection schema declares is filled by convention rather than a
 | Path | Role |
 |---|---|
 | `src/main.rs` | The binary: the host's flags beside zend's, then `host::run` with zend as its tenant |
-| `src/cli.rs` | `ZendArgs` — zend's flags (and `tokerad.yaml`'s `zend:` section), resolved into a tenant |
+| `src/cli.rs` | `ZendArgs` — zend's flags (and `motherd.yaml`'s `zend:` section), resolved into a tenant |
 | `src/tenant.rs` | `ZendTenant` / `ZendReports` — zend's start and its share of the host's shared endpoints |
-| `src/lib.rs` | Crate module list (also built as a library for the test harnesses and `tokerad`) |
+| `src/lib.rs` | Crate module list (also built as a library for the test harnesses and `motherd`) |
 | `src/session.rs` | `ZendSession` / `InferenceState` — the daemon's central state: model load sequence, per-conversation state, tool/think-steering compilation, `submit`/`submit_with_sampling` streaming entry points |
 | `src/api/` | zend's own routes: `chat.rs` (`/v1/chat/completions`), `models.rs`, `substrate.rs` (the viewer under `/v1/substrate/zend/`), `maintenance.rs`, `conversations.rs`, `files.rs`, `projections.rs` |
 | `src/ingest.rs` | Structure-derived load-plan resolution — decides *how* each schema layer/collection gets populated |
@@ -51,7 +51,7 @@ Every layer the projection schema declares is filled by convention rather than a
 - `main()` (`src/main.rs`) — parses the host's flags and zend's, resolves `ZendArgs` into a `ZendTenant`, and hands it to `host::run`, which starts it, serves, and drains it on Ctrl-C.
 - `ZendSession::new` / `start_loading` / `submit` / `submit_with_sampling` — the daemon's façade over the engine; `submit` yields a `StreamItem` stream (`Status`, `Token`, `Projection`, `Tool`) consumed by the SSE handler.
 - `api::routes(session, roles)` — zend's own routes, graded; the full table is in `src/api/mod.rs`. Status, identity, telemetry, the log stream, the tool catalog and the substrate overview are the host's shared endpoints (`host::endpoints`).
-- `tenant::ZendTenant` — zend as a tenant of the `host` process: `zend` runs it alone, `tokerad` beside npcd.
+- `tenant::ZendTenant` — zend as a tenant of the `host` process: `zend` runs it alone, `motherd` beside npcd.
 - `ingest::{ingest_layers, section_sinks}` — derive the turn-sink / section-collection load plan from the active `Schema`.
 - `tools::{install_tool_catalog, extract_tool_calls, run_tool_calls}` — bridge `zend_tools::registry` into the conversation's projected system prompt and the post-decode tool loop.
 
@@ -134,7 +134,7 @@ The process's flags are the host's, the same in every binary (`host::HostArgs`, 
 | `--local-signin <email>` | Sign a loopback caller that sends no identity in as this email. Off by default; refused beside `--gateway` |
 | `-v` / `-vv` | DEBUG / TRACE logging |
 
-zend's own flags (`src/cli.rs`, `ZendArgs`; the same settings are `tokerad.yaml`'s `zend:` section, less the one-shot ones):
+zend's own flags (`src/cli.rs`, `ZendArgs`; the same settings are `motherd.yaml`'s `zend:` section, less the one-shot ones):
 
 | Flag | Effect |
 |---|---|
@@ -152,7 +152,7 @@ zend's own flags (`src/cli.rs`, `ZendArgs`; the same settings are `tokerad.yaml`
 | `--wipe-layer <NAME>` (repeatable) | **Destructive** — tombstone every conversation in a turn-sink layer before the first ingest pass, which rebuilds it from the branches (one-shot) |
 | `--wipe-substrate` | **Destructive** — delete `<workspace>/substrate` before loading (one-shot) |
 
-A one-shot flag acts once, at the start it is given to: a self-heal relaunch drops it, and `tokerad.yaml` cannot set it (`ZendArgs::ONE_SHOT`). There is no model flag: every daemon runs the prescribed model (`host::MODEL`), and a substrate written under another model refuses to open, naming both.
+A one-shot flag acts once, at the start it is given to: a self-heal relaunch drops it, and `motherd.yaml` cannot set it (`ZendArgs::ONE_SHOT`). There is no model flag: every daemon runs the prescribed model (`host::MODEL`), and a substrate written under another model refuses to open, naming both.
 
 Continue (`zen-vscode`) configuration points at the daemon as an OpenAI provider:
 

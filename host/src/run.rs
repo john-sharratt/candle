@@ -1,7 +1,7 @@
 //! The one startup path: `host::run([tenant, …])` (`docs/shared_model_host.md`
 //! §2, decision 2).
 //!
-//! `zend`, `npcd` and `tokerad` are the same call with different tenants. The
+//! `zend`, `npcd` and `motherd` are the same call with different tenants. The
 //! host owns, once for the process: the panic hook, the tracing subscriber, the
 //! self-heal watchdog, the runtime, the telemetry sampler, the engine slot every
 //! tenant takes its engine from, the HTTP server, and the exit.
@@ -123,6 +123,9 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
         Ok(l) => l,
         Err(e) => fail_early(&format!("could not capture the launch: {e}")),
     };
+    if let Some(pid) = cfg.args.after_pid {
+        cluster::upgrade::os::wait_until_gone(pid);
+    }
     let Some(first) = tenants.first() else {
         fail_early("no tenants to run");
     };

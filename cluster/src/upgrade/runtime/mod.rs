@@ -1,5 +1,5 @@
 //! A process's upgrades (`docs/replicated_substrate.md` §3.5, §3.8–§3.11): one
-//! [`Upgrader`] per process, across every app it serves — a `tokerad` installs
+//! [`Upgrader`] per process, across every app it serves — a `motherd` installs
 //! one binary for both. Each app's member hands it the build traffic its
 //! sockets carry, and once a second it looks at what it knows and acts.
 //!

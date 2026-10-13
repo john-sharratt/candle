@@ -5,7 +5,7 @@
 //! directory is a second append cursor and a second record index — its
 //! compaction carries forward only what its own walk saw, and every record the
 //! other handle appended after it opened is lost (see [`super::SharedSubstrate`]).
-//! With three binaries able to serve the same workspace — `zend`, and `tokerad`
+//! With three binaries able to serve the same workspace — `zend`, and `motherd`
 //! hosting zend — that second handle can be another process.
 //!
 //! So a writable open takes an exclusive lock on `substrate/LOCK` until the

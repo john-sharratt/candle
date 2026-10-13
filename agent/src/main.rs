@@ -18,7 +18,7 @@ use cluster::machine::measure;
 use cluster::upgrade::artifacts::RunProbe;
 use cluster::upgrade::handoff::hand_off;
 use cluster::upgrade::kept::KEEP_DEFAULT;
-use cluster::upgrade::os::run_if_asked;
+use cluster::upgrade::os::wait_until_gone;
 use cluster::upgrade::runtime::{Setup, Upgrader};
 use cluster::version::info::{answer_if_asked, BuildInfo, Opens, AGENT};
 use cluster_dial::Target;
@@ -55,21 +55,27 @@ struct Args {
     #[arg(long, default_value_t = KEEP_DEFAULT)]
     keep_builds: usize,
     /// The build an install restored this agent from, `count-hash`: never
-    /// tried again. The upgrade's watchdog sets it.
+    /// tried again. `keep` sets it when it restores this process.
     #[arg(long, value_name = "COUNT-HASH")]
     upgrade_failed: Option<String>,
+    /// Wait until this pid has exited before taking jobs. The predecessor sets
+    /// it when it starts the successor.
+    #[arg(long, value_name = "PID")]
+    after_pid: Option<u32>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // An agent opens no substrate and runs no model.
     answer_if_asked(AGENT, Opens::default);
-    run_if_asked();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let launch = LaunchSpec::capture(&[])?;
     let args = Args::parse();
+    if let Some(pid) = args.after_pid {
+        wait_until_gone(pid);
+    }
     let cfg = AgentConfig::load(&args.config)?;
     // The agent upgrades with its app's build (§3.9).
     let setup = Setup {

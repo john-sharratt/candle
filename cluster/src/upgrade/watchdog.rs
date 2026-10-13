@@ -1,20 +1,7 @@
-//! The upgrade's watchdog (§3.9 step 4): a process apart from the daemon, so the
-//! old daemon can exit — releasing its VRAM, which only process exit does —
-//! before the new one loads. It is the old executable, from its kept-build
-//! directory, run as `--upgrade-watchdog <plan>`; it loads no model, opens no
-//! substrate and dials no cluster.
-//!
-//! It waits for the old daemon to be gone, starts the new build with the same
-//! launch, and watches it:
-//!
-//! - **ready** — the new process writes `<data>/upgrade/ok` once admitted and
-//!   ready: the swap stands, the kept builds beyond `--keep-builds` are pruned,
-//!   and the watchdog exits;
-//! - **failed** — the new process exits, or is not ready within
-//!   [`READY_WITHIN`]: it is stopped, the old build is put back at its paths,
-//!   the failure is written to `<data>/upgrade/failed.json` with the new
-//!   process's last log lines, and the old build is started again with
-//!   `--upgrade-failed <build>`, so it never tries that build again.
+//! What `keep` runs when a new build does not become ready (§3.9): [`recover`]
+//! puts the previous executable back and returns the launch that starts it.
+//! [`watch`] is the same transitions under a scripted process table, so the
+//! tests name every spawn. No daemon enters this module at startup.
 //!
 //! The process operations are behind [`Processes`], so the state machine is
 //! tested by asserting what it spawns, never by spawning.
@@ -36,7 +23,7 @@ use crate::launch::{value_of, LaunchSpec, UPGRADE_FAILED, UPGRADE_WATCHDOG};
 /// How long the new build has to become ready.
 pub const READY_WITHIN: Duration = Duration::from_secs(15 * 60);
 
-/// How long the old daemon has to exit after starting the watchdog.
+/// How long the predecessor has to exit before the successor kills it.
 pub const OLD_EXIT_WITHIN: Duration = Duration::from_secs(120);
 
 /// How often the watchdog looks.
@@ -169,8 +156,11 @@ fn spell(d: Duration) -> String {
     }
 }
 
-/// Put the old build back, say why, and start it again.
-fn fail<P: Processes>(plan: &WatchPlan, p: &P, reason: String) -> Outcome {
+/// Put the previous executable back and return the launch `keep` starts.
+/// The failure, with the new process's last log lines, is written beside the
+/// plan. The launch carries `--upgrade-failed` so the restored process does
+/// not try `plan.installing` again.
+pub fn recover(plan: &WatchPlan, reason: String) -> (LaunchSpec, String) {
     let last = plan
         .log
         .as_deref()
@@ -195,6 +185,12 @@ fn fail<P: Processes>(plan: &WatchPlan, p: &P, reason: String) -> Outcome {
     let again = plan
         .launch
         .with_args(&[UPGRADE_FAILED.flag, &plan.installing]);
+    (again, reason)
+}
+
+/// Put the old build back, say why, and start it again.
+fn fail<P: Processes>(plan: &WatchPlan, p: &P, reason: String) -> Outcome {
+    let (again, reason) = recover(plan, reason);
     if let Err(e) = p.spawn(&again) {
         tracing::error!("the old build did not start again: {e}");
     }

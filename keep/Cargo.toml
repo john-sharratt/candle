@@ -1,0 +1,17 @@
+[package]
+name = "keep"
+version = "0.1.0"
+edition = "2021"
+description = "Failsafe for web and motherd. Starts the last known-good executable."
+
+[[bin]]
+name = "keep"
+path = "src/main.rs"
+
+[dependencies]
+anyhow     = { workspace = true }
+cluster    = { path = "../cluster" }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+sysinfo    = { version = "0.31", default-features = false, features = ["system"] }

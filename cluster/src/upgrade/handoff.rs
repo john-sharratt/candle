@@ -1,21 +1,20 @@
 //! The old process's last act (§3.9 steps 3–4): once it has drained, flushed,
 //! released its substrate and closed its sockets, it swaps the new build into
-//! its executable's and UI's paths, writes the watchdog's plan, and starts the
-//! watchdog — itself, from its kept-build directory — then exits. The watchdog
-//! waits for it to be gone before it starts the new build, so the two daemons
-//! never run at once.
+//! its executable's path, writes the plan `keep` reads if that build does not
+//! become ready, and starts the new process. The new process waits until this
+//! one has exited before it loads. This process does not stay up to watch it.
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 use super::decisions::build_name;
 use super::runtime::{InstallJob, Setup};
 use super::swap::{restore, swap, Running};
-use super::watchdog::{write_plan, WatchPlan, READY_WITHIN};
+use super::watchdog::{write_plan, WatchPlan, PLAN, READY_WITHIN};
 use crate::clock::now_ms;
-use crate::launch::{LaunchSpec, UPGRADE_WATCHDOG};
+use crate::launch::{LaunchSpec, AFTER_PID};
 
 /// When the running build was installed: its executable's modification time.
 fn installed_ms(launch: &LaunchSpec) -> u64 {
@@ -26,23 +25,17 @@ fn installed_ms(launch: &LaunchSpec) -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// The watchdog's launch: the old executable, now in `kept`, run with the plan.
-pub fn watchdog_launch(launch: &LaunchSpec, kept: &Path, plan: &Path) -> io::Result<LaunchSpec> {
-    let name = launch
-        .exe
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the executable has no name"))?;
-    Ok(LaunchSpec {
-        exe: kept.join(name),
-        args: vec![UPGRADE_WATCHDOG.flag.into(), plan.as_os_str().to_owned()],
-        cwd: launch.cwd.clone(),
-    })
+/// The launch of the new build: the same command, plus `--after-pid` so it
+/// waits until `pid` has exited.
+pub fn successor(launch: &LaunchSpec, pid: u32) -> LaunchSpec {
+    let pid = pid.to_string();
+    launch.with_args(&[AFTER_PID.flag, &pid])
 }
 
 /// Swap `job` in for the build `setup` describes, launched as `launch`, write
-/// the plan, and start the watchdog. `log` is the file the new process logs
-/// to, whose last lines a failure reports. On an error after the swap, the old
-/// build is put back.
+/// the plan, and start the new process. `log` is the file the new process logs
+/// to, whose last lines a failure reports. When the new process cannot be
+/// started, the old build is put back and the plan is removed.
 pub fn hand_off(
     launch: &LaunchSpec,
     setup: &Setup,
@@ -67,18 +60,18 @@ pub fn hand_off(
         protect: job.protect.clone(),
         leases: job.leases.clone(),
     };
-    let started = write_plan(&plan).and_then(|path| {
-        watchdog_launch(launch, &swapped.kept, &path)?
-            .command()
-            .spawn()
-            .map(|_| ())
-    });
+    if let Err(e) = write_plan(&plan) {
+        restore(&swapped)?;
+        return Err(e);
+    }
+    let started = successor(launch, plan.old_pid).command().spawn();
     if let Err(e) = started {
         tracing::error!(
             build = build_name(&job.build),
-            "the watchdog did not start: putting the old build back: {e}"
+            "the new build did not start: putting the old build back: {e}"
         );
         restore(&swapped)?;
+        let _ = fs::remove_file(setup.upgrade_dir.join(PLAN));
         return Err(e);
     }
     Ok(())
@@ -90,27 +83,24 @@ mod tests {
 
     use std::ffi::OsString;
 
-    /// The watchdog is the old executable from its kept directory, given only
-    /// its plan, in the same working directory.
+    /// The new process is this executable, with the same arguments plus the
+    /// predecessor's pid, in the same working directory.
     #[test]
-    fn the_watchdog_is_the_old_executable_with_its_plan() {
+    fn the_successor_is_the_new_executable_after_this_process() {
         let launch = LaunchSpec {
             exe: PathBuf::from("/opt/t/zend"),
             args: vec!["--port".into(), "8080".into()],
             cwd: PathBuf::from("/srv"),
         };
-        let w = watchdog_launch(
-            &launch,
-            Path::new("/opt/t/builds/10-h10"),
-            Path::new("/d/upgrade/watch.json"),
-        )
-        .unwrap();
-        assert_eq!(w.exe, PathBuf::from("/opt/t/builds/10-h10/zend"));
+        let w = successor(&launch, 4242);
+        assert_eq!(w.exe, PathBuf::from("/opt/t/zend"));
         assert_eq!(
             w.args,
             [
-                OsString::from("--upgrade-watchdog"),
-                OsString::from("/d/upgrade/watch.json")
+                OsString::from("--port"),
+                OsString::from("8080"),
+                OsString::from("--after-pid"),
+                OsString::from("4242")
             ]
         );
         assert_eq!(w.cwd, PathBuf::from("/srv"));

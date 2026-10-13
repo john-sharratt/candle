@@ -2,7 +2,7 @@
 //! front of a persistent `candle_conversation` substrate, plus everything that
 //! turns a workspace into that substrate's content. It runs as a tenant of the
 //! `host` process (`tenant`), alone in the `zend` binary or beside npcd in
-//! `tokerad`.
+//! `motherd`.
 //!
 //! Grouped by concern: HTTP surface (`api`, `chatml`, `session`,
 //! `projection_event`); the host contract (`tenant`); model bring-up

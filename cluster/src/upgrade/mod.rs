@@ -1,7 +1,7 @@
 //! A member's side of A/B upgrades (`docs/replicated_substrate.md` §3.8–§3.11):
 //! what a build offers, fetching it, whether it can open this member's
-//! substrate, the in-place swap, the builds kept for rollback, and the watchdog
-//! that starts the new build and puts the old one back when it fails.
+//! substrate, the in-place swap, the builds kept for rollback, and `keep`'s
+//! restore of a build that does not become ready.
 //!
 //! | Module | |
 //! |---|---|
@@ -11,9 +11,9 @@
 //! | [`decisions`] | verdicts, forced rollouts and pauses as Paxos decisions |
 //! | [`kept`] | `builds/<count>-<hash>/` and pruning |
 //! | [`swap`] | the in-place swap and its restore |
-//! | [`handoff`] | the old process's last act: swap, plan, start the watchdog |
-//! | [`watchdog`] | the process that watches the new build |
-//! | [`os`] | the watchdog's processes on the machine, and its entry |
+//! | [`handoff`] | the old process's last act: swap, write the plan, start the new build |
+//! | [`watchdog`] | `recover`: put the previous executable back for `keep` to start |
+//! | [`os`] | process liveness, and the successor's wait for the predecessor |
 //! | [`sum`] | SHA-256 and its hex spelling |
 //! | [`runtime`] | a process's upgrades: announcing, fetching, certifying, installing |
 //!

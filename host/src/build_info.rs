@@ -1,12 +1,11 @@
 //! What a daemon's build says of itself (`docs/replicated_substrate.md` §3.9):
 //! the substrate format it opens, every record type it decodes, and the model
 //! it is prescribed — what a member checks an artifact against before it
-//! installs it. And the two things every binary does before it parses a flag:
-//! answer `--build-info`, or run as an upgrade's watchdog.
+//! installs it. And the one thing every binary does before it parses a flag:
+//! answer `--build-info`.
 
 use candle_conversation::persistence::log_file::FILE_FORMAT_VERSION;
 use candle_conversation::persistence::survival::WRITTEN_RECORD_TYPES;
-use cluster::upgrade::os::run_if_asked;
 use cluster::version::info::{answer_if_asked, Opens};
 
 use crate::model::MODEL;
@@ -22,12 +21,10 @@ pub fn opens() -> Opens {
     }
 }
 
-/// Before anything else: `--build-info` answers and exits, and
-/// `--upgrade-watchdog <plan>` watches an install and exits. `kind` is the
-/// binary's: `zend`, `npcd`, `tokerad`.
+/// Before anything else: `--build-info` answers and exits. `kind` is the
+/// binary's: `zend`, `npcd`, `motherd`.
 pub fn first(kind: &str) {
     answer_if_asked(kind, opens);
-    run_if_asked();
 }
 
 #[cfg(test)]

@@ -11,10 +11,10 @@ use std::process::{Command, Stdio};
 
 use super::sum::file_sha256;
 use crate::frame::{Artifact, BuildId};
-use crate::version::info::{BuildInfo, AGENT, BUILD_INFO_FLAG, NPCD, TOKERAD, ZEND};
+use crate::version::info::{BuildInfo, AGENT, BUILD_INFO_FLAG, MOTHERD, NPCD, ZEND};
 
 /// Every binary a build produces, by kind.
-pub const KINDS: [&str; 4] = [ZEND, NPCD, TOKERAD, AGENT];
+pub const KINDS: [&str; 4] = [ZEND, NPCD, MOTHERD, AGENT];
 
 /// Asks a binary for its build.
 pub trait Probe {
@@ -127,13 +127,13 @@ mod tests {
         }
         let answers = Answers(HashMap::from([
             (ZEND.to_string(), info(ZEND, 12)),
-            (TOKERAD.to_string(), info(TOKERAD, 12)),
+            (MOTHERD.to_string(), info(MOTHERD, 12)),
             (NPCD.to_string(), info(NPCD, 11)),
         ]));
         let build = info(ZEND, 12).build();
         let offered = siblings(t.path(), &build, &answers).unwrap();
         let kinds: Vec<&str> = offered.iter().map(|o| o.artifact.kind.as_str()).collect();
-        assert_eq!(kinds, [ZEND, TOKERAD]);
+        assert_eq!(kinds, [ZEND, MOTHERD]);
         assert_eq!(
             offered[0].artifact,
             Artifact {

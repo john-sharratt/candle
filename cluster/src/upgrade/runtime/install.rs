@@ -5,7 +5,7 @@
 //! ([`check`]), the member takes the install's leases — `upgrade/<app>` for each
 //! app it serves, or one of a forced rollout's `upgrade/<app>/<i>` — and hands
 //! the install to its [`Installer`]: the process drains, flushes, releases its
-//! substrate, closes its sockets, swaps, starts the watchdog and exits. An
+//! substrate, closes its sockets, swaps, starts the new process and exits. An
 //! upgrading member takes no lease. A build that cannot open the substrate
 //! strands the member, and its install is never attempted.
 //!
@@ -14,8 +14,9 @@
 //! installs while this one is down. The process that starts — the new build, or
 //! the old one restored — takes each lease back once it is ready, as the same
 //! node, which for Paxos is a renewal, and releases it for the next member. The
-//! new build writes `<data>/upgrade/ok` first, which is what the watchdog waits
-//! for.
+//! new build writes `<data>/upgrade/ok` once it is ready, and prunes the kept
+//! builds then. `keep` reads the plan and restores the previous executable
+//! when that file does not appear in time.
 
 use std::fs;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use crate::member::Link;
 use crate::replicate::Phase;
 use crate::upgrade::compat::{check, Needs};
 use crate::upgrade::decisions::build_name;
-use crate::upgrade::kept::name as kept_name;
+use crate::upgrade::kept::{builds_dir, name as kept_name, prune};
 use crate::upgrade::swap::Source;
 use crate::upgrade::watchdog::{read_plan, FAILED, OK, PLAN, READY_WITHIN};
 use crate::version::info::Opens;
@@ -129,12 +130,19 @@ impl Upgrader {
             match wrote {
                 Ok(()) => {
                     let _ = fs::remove_file(dir.join(FAILED));
+                    if let Ok(p) = read_plan(&dir.join(PLAN)) {
+                        if let Err(e) =
+                            prune(&builds_dir(&self.setup.exe), p.keep_builds, &p.protect)
+                        {
+                            tracing::warn!("the kept builds were not pruned: {e}");
+                        }
+                    }
                     let mut s = self.state();
                     s.handback.ok_written = true;
                     s.failure = None;
                     tracing::warn!(
                         build = build_name(&self.setup.info.build()),
-                        "the new build is ready: told the watchdog"
+                        "the new build is ready"
                     );
                 }
                 Err(e) => tracing::error!("the upgrade's ok was not written: {e}"),

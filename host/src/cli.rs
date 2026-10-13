@@ -1,5 +1,5 @@
 //! The process's own settings — where it listens and whom it believes — as
-//! command-line flags (`zend`) and as the `host:` section of `tokerad.yaml`. One
+//! command-line flags (`zend`) and as the `host:` section of `motherd.yaml`. One
 //! struct for both, so a setting means the same thing whichever binary reads
 //! it.
 
@@ -96,11 +96,18 @@ pub struct HostArgs {
     pub keep_builds: usize,
 
     /// The build an install restored this process from, `count-hash`: it is
-    /// never tried again (§3.9). The upgrade's watchdog sets it; a relaunch
-    /// drops it, and `tokerad.yaml` cannot set it.
+    /// never tried again (§3.9). `keep` sets it when it restores this
+    /// process; a relaunch drops it, and the config file cannot set it.
     #[arg(long, value_name = "COUNT-HASH")]
     #[serde(skip)]
     pub upgrade_failed: Option<String>,
+
+    /// Wait until this pid has exited before loading. The predecessor sets it
+    /// when it starts the successor (§3.9). A relaunch drops it, and the
+    /// config file cannot set it.
+    #[arg(long, value_name = "PID")]
+    #[serde(skip)]
+    pub after_pid: Option<u32>,
 
     /// Increase log verbosity. -v = DEBUG, -vv = TRACE.
     #[arg(short, long, action = ArgAction::Count)]
@@ -123,6 +130,7 @@ impl Default for HostArgs {
             agent: None,
             keep_builds: KEEP_DEFAULT,
             upgrade_failed: None,
+            after_pid: None,
             verbose: 0,
         }
     }

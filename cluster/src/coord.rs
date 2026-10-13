@@ -50,7 +50,7 @@ pub struct CoordState {
 /// rollout.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpgradeView {
-    /// Its binary: `zend`, `npcd`, `tokerad`, `tokera-agent`.
+    /// Its binary: `zend`, `npcd`, `motherd`, `tokera-agent`.
     pub kind: String,
     pub platform: String,
     /// What a build must open to replace this one: the log format, every

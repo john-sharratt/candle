@@ -26,6 +26,11 @@ pub const UPGRADE_FAILED: OneShot = OneShot {
     flag: "--upgrade-failed",
     takes_value: true,
 };
+/// The successor waits for this pid to exit before it loads (§3.9).
+pub const AFTER_PID: OneShot = OneShot {
+    flag: "--after-pid",
+    takes_value: true,
+};
 
 /// How a process was launched: its executable, its arguments exactly as given,
 /// and its working directory.
@@ -54,7 +59,7 @@ impl LaunchSpec {
     /// The upgrade's own one-shots are always dropped.
     pub fn capture(one_shot: &[OneShot]) -> io::Result<Self> {
         let mut dropped = one_shot.to_vec();
-        dropped.extend([UPGRADE_WATCHDOG, UPGRADE_FAILED]);
+        dropped.extend([UPGRADE_WATCHDOG, UPGRADE_FAILED, AFTER_PID]);
         Ok(Self {
             exe: env::current_exe()?,
             args: without_one_shots(env::args_os().skip(1), &dropped),

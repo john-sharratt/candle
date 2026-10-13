@@ -6,11 +6,11 @@ BlackWorld is up and serving. WhiteWorld never accepted a session, so everything
 
 | Process | Pid | Role |
 |---|---|---|
-| tokerad | 55384 | zend and npcd, `tokerad\tokerad.yaml`, listening on 192.168.0.5:8081 and 192.168.0.5:8444 |
+| motherd | 55384 | zend and npcd, `motherd\motherd.yaml`, listening on 192.168.0.5:8081 and 192.168.0.5:8444 |
 | web | 64924 | gateway, ports 80 and 9443 |
 | cf-ddns | 12556 | left running the whole night |
 
-tokerad was ready at 14:06 UTC after a restart. Both apps are joined to `https://192.168.0.5:9443`. zend is node `db422f70bc91e081`, npcd is node `63dabd7b1f381ee2`. The in-process agent is node `76c3a0f4d39bd9db` on BlackWorld, low priority, with checkouts for candle, battle-cities, and battle-mind. Build count 3280, hash `d4c5ecd2`. The console build id is `93f561377cce627e`.
+motherd was ready at 14:06 UTC after a restart. Both apps are joined to `https://192.168.0.5:9443`. zend is node `db422f70bc91e081`, npcd is node `63dabd7b1f381ee2`. The in-process agent is node `76c3a0f4d39bd9db` on BlackWorld, low priority, with checkouts for candle, battle-cities, and battle-mind. Build count 3280, hash `d4c5ecd2`. The console build id is `93f561377cce627e`.
 
 The branch is `cursor/gateway-tiebreak-voter-f2d0`, pull request https://github.com/john-sharratt/candle/pull/1. The last commit on it is `3fb6b0c1` (status reads no longer wait out the writer). Nothing new was committed overnight after that. The working tree's only leftover is `.claude/scheduled_tasks.lock`, which was already dirty and was not touched.
 
@@ -31,7 +31,7 @@ The worker is connected and idle (`0474bb94-291b-4d49-b648-a7fd93d03b20`, machin
 So these items were not done, and they cannot be done until a session is actually on that machine:
 
 - Free 300 GB for a substrate. Disk was never inspected.
-- Build and start tokerad there.
+- Build and start motherd there.
 - Split the ingest backlog across two members, and watch the substrate replicate.
 - Take one side down and confirm the other still serves a conversation (the tie-break voter is in the binary and in the design, and it is deployed on BlackWorld, but with one member there is no second side to lose).
 - Move NPC leases onto the other node when a user conversation lands on BlackWorld.
@@ -73,7 +73,7 @@ The first cancel attempt (`overnight-cancel-1`) prefilled a very large prompt (a
 
 That string is cuBLAS rejecting a matrix multiply (a dimension or leading dimension it will not accept). Both NPCs immediately started failing the same way and retrying every 5 seconds. Prefill waves kept being logged; decode did not recover. Expert hit rate had fallen from the mid-90s to about 40% during that prompt, and the weight zone had just conceded a large slice to KV. The error is not one of the sticky CUDA faults the daemon exits on, so the process stayed up and kept retrying.
 
-tokerad was stopped and started again with the same config. It does not have a console, and the shutdown route wants the host name confirmed from an admin call; the stop was `Stop-Process`, not a drained shutdown. web and cf-ddns were not touched. Load took about three minutes. After ready, both NPCs were decoding again (expert hit back around 97–98%) and taking missions. The later cancel conversation and the README edit did not bring the fault back. Those later prompts were smaller (about 66,000 and 63,000 tokens) because thinking was off.
+motherd was stopped and started again with the same config. It does not have a console, and the shutdown route wants the host name confirmed from an admin call; the stop was `Stop-Process`, not a drained shutdown. web and cf-ddns were not touched. Load took about three minutes. After ready, both NPCs were decoding again (expert hit back around 97–98%) and taking missions. The later cancel conversation and the README edit did not bring the fault back. Those later prompts were smaller (about 66,000 and 63,000 tokens) because thinking was off.
 
 ## What was deliberately not done
 
@@ -84,7 +84,7 @@ tokerad was stopped and started again with the same config. It does not have a c
 ## When WhiteWorld is reachable
 
 1. Confirm at least 300 GB free for a fresh substrate. Clear the Hugging Face cache or move it if it is not.
-2. Build this branch there and start tokerad against a new substrate, same cluster URL, same cluster name, same group key. Do not copy BlackWorld's substrate.
+2. Build this branch there and start motherd against a new substrate, same cluster URL, same cluster name, same group key. Do not copy BlackWorld's substrate.
 3. Watch the unread backlog split by content key, and watch records replicate.
 4. Stop one member and send a conversation through the gateway. The other member plus the gateway vote should still serve it.
 5. Then, and only on a build both sides already share, add the NPC-lending signal and check that a conversation on BlackWorld hands characters to WhiteWorld at their next turn boundary.

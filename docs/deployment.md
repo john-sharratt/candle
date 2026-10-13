@@ -38,7 +38,7 @@ repository is readable by the model.
                                      │                   cluster `tokera.com` on :9443)
                      ┌───────────────┴────────────────┐
                      ▼                                ▼
-          192.168.0.5:8081  tokerad            192.168.0.6:8081  (stopped)
+          192.168.0.5:8081  motherd            192.168.0.6:8081  (stopped)
           zend + npcd members, joined          bot.tokera.com's configured
           to the gateway's cluster             upstream; rebuilt later as a member
           (code.tokera.com, bot.tokera.com)
@@ -48,14 +48,14 @@ repository is readable by the model.
   router puts `192.168.0.5` in its DMZ, so port 80 on the public IP is the gateway.
 - **web** is the only process reachable from outside. It owns sign-in and forwards to the
   daemons over the LAN, so no daemon may bind `127.0.0.1` — loopback takes its site
-  down. tokerad shares the DMZ box with the gateway, so it binds the LAN address only,
+  down. motherd shares the DMZ box with the gateway, so it binds the LAN address only,
   never `0.0.0.0`. npcd's box is not in the DMZ and binds `0.0.0.0`.
-- **The cluster.** tokerad's zend and npcd tenants join the gateway's cluster
+- **The cluster.** motherd's zend and npcd tenants join the gateway's cluster
   (`docs/replicated_substrate.md`): the gateway routes each name to a joined, ready
   member of its app over the member's socket, and to the route's `upstream` only while
   the app has no member (dumb mode). While that upstream is down, a member still loading
   stands in for it, so the name shows the member's loading page rather than an outage.
-  npcd on `.6` was stopped on 2026-10-12: `bot.tokera.com` is tokerad's npcd alone until
+  npcd on `.6` was stopped on 2026-10-12: `bot.tokera.com` is motherd's npcd alone until
   `.6` is rebuilt onto this framework and joins.
 - **cf-ddns** keeps the Cloudflare A records at the public IP, so a router reboot that
   changes the address heals on its own within one 30 s interval.
@@ -68,7 +68,7 @@ not identities.
 
 | Address | Hostname | Runs | Repo |
 |---|---|---|---|
-| `192.168.0.5` | BlackWorld | web, tokerad, cf-ddns | `D:\prog\candle` |
+| `192.168.0.5` | BlackWorld | web, motherd, keep, cf-ddns | `D:\prog\candle` |
 | `192.168.0.6` | — | nothing — its standalone npcd was stopped on 2026-10-12, to be rebuilt as a member | the checkout `/up` is run from; its mind is `D:\prog\mind` |
 
 ## Services
@@ -80,7 +80,8 @@ as its working directory. cf-ddns is the exception — see below.
 | Service | Machine | Listens | Build | Stop by default in `/down` |
 |---|---|---|---|---|
 | web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:9443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml` — `rdp-tunnel-server` holds 443 and 8443) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
-| tokerad | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the zend route's upstream in dumb mode; outbound to the gateway's cluster on `:9443` | `cargo build --release -p tokerad` | yes |
+| motherd | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the zend route's upstream in dumb mode; outbound to the gateway's cluster on `:9443` | `cargo build --release -p motherd` | yes |
+| keep | .5 | — (watches web on `:80` and motherd on `:8081`) | `cargo build --release -p keep` | **never** |
 | npcd | .6 | `0.0.0.0:8081` (`--host 0.0.0.0 --port 8081`) | `cargo build --release -p npcd` | yes |
 | cf-ddns | .5 | — (outbound only) | scheduled task, see below | **never** |
 
@@ -93,7 +94,8 @@ Paths are relative to the repo root.
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
 | .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
-| .5 | tokerad | `target\release\tokerad.exe --config tokerad\tokerad.yaml` | 2026-10-12, replacing zend — every setting is in `tokerad/tokerad.yaml` (below). The zend it replaced ran `target\release\zend.exe D:\prog --host 192.168.0.5 --port 8081 --tls-port 8444 --max-depth 2 -v`; that line is the rollback |
+| .5 | motherd | `target\release\motherd.exe --config motherd\motherd.yaml` | 2026-10-14, renamed from tokerad — every setting is in `motherd/motherd.yaml` (below) |
+| .5 | keep | `target\release\keep.exe keep/keep.yaml` | 2026-10-14. Supervisor `C:\Users\johna\AppData\Local\keep\supervise.ps1` (restart 10 s after exit). Registering scheduled task `\keep` was denied from a non-elevated session, so the supervisor runs in the interactive session. keep is not swapped by a rollout |
 | .6 | npcd | `target\release\npcd.exe --host 0.0.0.0 --port 8081 --gateway 192.168.0.5 --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`). Rewritten 2026-10-10 for the host's flags (not yet run): `--bind` became `--host`/`--port`, `--content` is gone, and `--gateway 192.168.0.5` is new — without it every signed-in visitor is anonymous. Its store was written by the AntiLoop + StyleTune fine-tune; since 2026-10-11 the host prescribes Flash-Next, so that store is refused at open, before anything in it is rewritten, and npcd's first run on this build needs a new `--data` |
 
 Notes on the arguments:
@@ -128,7 +130,7 @@ Notes on the arguments:
   state. `/up` replays one only when the recorded line has it (the last run wiped) or the
   user asks for a wipe in that run, and says so before launching. It never adds one on its
   own. A self-heal relaunch never replays one (`ZendArgs::ONE_SHOT`,
-  `NpcdArgs::ONE_SHOT`), and `tokerad.yaml` cannot hold one: run the single binary with
+  `NpcdArgs::ONE_SHOT`), and `motherd.yaml` cannot hold one: run the single binary with
   the flag once.
 - **The process's flags are the same in every binary** (`host::HostArgs`): `--host`,
   `--port`, `--tls-port`, `--gateway`, `--local-signin`, `-v`. `--local-signin` is
@@ -136,16 +138,16 @@ Notes on the arguments:
 - **Every flag must exist in the binary.** `/up` checks each recorded flag against `<exe> --help` and asks rather than
   dropping one silently, because clap refuses to start on an unknown flag.
 
-### tokerad
+### motherd
 
-`tokerad` runs zend and npcd in one process on one model
+`motherd` runs zend and npcd in one process on one model
 (`docs/shared_model_host.md`), and on `.5` it is what runs in zend's place. The config,
-`tokerad/tokerad.yaml`, holds the process's settings under `host:` and each daemon's
+`motherd/motherd.yaml`, holds the process's settings under `host:` and each daemon's
 under its name, in the same shape as that daemon's own flags:
 
 - **`host:`** — `192.168.0.5`, ports `8081` and `8444` (zend's, unchanged), and the
   cluster: `clusters: ["https://192.168.0.5:9443"]`, verified as `cluster_name:
-  tokera.com`, with `group_key: web/secrets/group.key` and `agent: tokerad/agent.yaml`.
+  tokera.com`, with `group_key: web/secrets/group.key` and `agent: motherd/agent.yaml`.
 - **`zend:`** — `working_dir: ..`, so the workspace is `D:\prog` and the substrate
   `D:\prog\substrate`, the one zend ran on before (adopted as the group's first member,
   `docs/replicated_substrate.md` §15.1).
@@ -155,15 +157,15 @@ under its name, in the same shape as that daemon's own flags:
   fetched and pushed through an agent, never from GitHub directly. A start with no
   mirror runs with no mind, fetches it once joined, and relaunches onto it.
 
-**The agent** runs in process (`tokerad/agent.yaml`): `D:\agent\jobs` for jobs, 4
+**The agent** runs in process (`motherd/agent.yaml`): `D:\agent\jobs` for jobs, 4
 slots, and its own checkouts, cloned over SSH — `D:\agent\candle`,
 `D:\agent\battle-cities`, `D:\agent\battle-mind` — each allowed to push. They are
 apart from the working trees zend reads in `D:\prog`.
 
-Its log is `tokerad.log` beside zend's substrate, `D:\prog\substrate\tokerad.log`; `/up`'s
+Its log is `motherd.log` beside zend's substrate, `D:\prog\substrate\motherd.log`; `/up`'s
 redirected output is in `target\services\` as for the other services.
 
-**Rolling back to the standalone zend**: stop tokerad (Ctrl-C), then start zend with
+**Rolling back to the standalone zend**: stop motherd (Ctrl-C), then start zend with
 the line the launch table records for it. The gateway needs no change — with no member
 of an app it routes to the configured upstream.
 
@@ -183,6 +185,20 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
 - **The status page** is `/gateway` on the gateway, its data `/gateway/status.json`
   (both an admin's): each app's mode,
   members, lag and claims, the build floor, and the gateway's peers.
+
+### keep
+
+`keep` is a separate process and a failsafe only. It watches `web` (`127.0.0.1:80`) and
+`motherd` (`192.168.0.5:8081`). When one of them is gone, it starts the executable path
+it recorded the last time that process answered. When a replacement was swapped into
+place and does not become ready, it restores the previous executable and starts that.
+It does not certify, roll out, or store binary bytes. Its state is `keep/state/`.
+
+Its supervisor is `C:\Users\johna\AppData\Local\keep\supervise.ps1`, the same loop shape
+as cf-ddns: it starts `target\release\keep.exe keep/keep.yaml` and starts it again 10 s
+after any exit. Registering the scheduled task `\keep` was denied from a non-elevated
+session, so that supervisor runs in the interactive session. A rollout does not swap
+`keep`.
 
 ### cf-ddns
 
@@ -215,14 +231,16 @@ a forced kill only if it does not exit in time. A forced kill of zend skips the 
 ## Self-healing
 
 None of these daemons runs under a service manager or a restart-on-exit wrapper — see
-"Services" above — with the single exception of cf-ddns's scheduled-task supervisor. That
+"Services" above — with the exception of cf-ddns's and keep's scheduled-task supervisors. That
 was a real gap for zend: a device stuck in an out-of-memory retry storm (KV migration
 failing forever) served nothing for 40+ minutes before anyone noticed, because nothing was
 watching, and the old GPU-poison watchdog only exited cleanly "for a supervisor to relaunch"
 — a supervisor that does not exist here.
 
-Every daemon now relaunches itself instead — the watchdog is the host's (`host::self_heal`),
-so zend, npcd and tokerad all carry it. `candle::gpu_poison` flags the CUDA context poisoned
+Every daemon still relaunches itself on a poisoned GPU — that watchdog is the host's
+(`host::self_heal`), so zend, npcd and motherd all carry it. `keep` is the outer failsafe
+for `web` and `motherd`: if the process dies and what comes back does not become ready,
+`keep` starts the last known-good executable. `candle::gpu_poison` flags the CUDA context poisoned
 on a sticky fault (illegal address, launch failure, device assert, ECC) **or** on an
 out-of-memory streak that has run for 60 s straight with no successful device operation in
 between (`candle_core::gpu_poison::OOM_STICKY_AFTER`) — a single large-request OOM is not
@@ -262,7 +280,7 @@ Expected results, as measured 2026-09-13:
 
 | Check | How | Healthy |
 |---|---|---|
-| tokerad on the LAN | `curl http://192.168.0.5:8081/v1/status` | `"tenants":{"zend":{"state":"ready",…},"npcd":{"state":"ready",…}}` and `"cluster":{…"apps":{"zend":{"link":"joined",…},"npcd":{"link":"joined",…}}}` — it answers `200` with `"loading"` throughout startup, and npcd's first start on a fresh substrate ingests its mind for a while after zend is ready |
+| motherd on the LAN | `curl http://192.168.0.5:8081/v1/status` | `"tenants":{"zend":{"state":"ready",…},"npcd":{"state":"ready",…}}` and `"cluster":{…"apps":{"zend":{"link":"joined",…},"npcd":{"link":"joined",…}}}` — it answers `200` with `"loading"` throughout startup, and npcd's first start on a fresh substrate ingests its mind for a while after zend is ready |
 | npcd on the LAN | `curl http://192.168.0.6:8081/v1/status` | `200`; a host-built npcd answers with `"tenants":{"npcd":…}` |
 | gateway config | `target\release\web.exe --config web/web.yaml --check` | exit 0 |
 | gateway routing | `curl -H "Host: <name>" http://127.0.0.1/` for `tokera.com`, `code.tokera.com`, `bot.tokera.com` | `200` / `30x` / `401`; `503` = that upstream is down |
@@ -284,7 +302,7 @@ Reading a failure:
 - **`www.tokera.com` answers `301`** (to `tokera.com`, per `web.yaml`) — confirmed
   2026-09-16 on a freshly built `web.exe`. A `200` there means the running gateway predates
   the redirect and wants a rebuild and restart.
-- **`bot.tokera.com` `503`** while the gateway is healthy means no npcd is serving: tokerad's
+- **`bot.tokera.com` `503`** while the gateway is healthy means no npcd is serving: motherd's
   npcd member is not joined at all (a member joined and loading shows its loading page from
   the second request on), and the configured upstream on `.6` is down.
 - **A console says "no zend member answered"** (or npcd) while the status page shows the

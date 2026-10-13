@@ -1,7 +1,7 @@
 //! `host` — the process a daemon runs in.
 //!
 //! One model, one engine, one HTTP server, and the daemons beside each other as
-//! tenants (`docs/shared_model_host.md`). `zend`, `npcd` and `tokerad` are each
+//! tenants (`docs/shared_model_host.md`). `zend`, `npcd` and `motherd` are each
 //! `host::run([tenant, …])`: the host owns what is the process's — the runtime,
 //! logging, the panic hook, signals, the prescribed model, the shared
 //! endpoints, the web UIs, shutdown — and each tenant keeps its own work.

@@ -1,8 +1,7 @@
-//! The watchdog on the machine: [`Processes`] over the OS, and the entry every
-//! binary calls first so `--upgrade-watchdog <plan>` runs the watchdog and
-//! nothing else (§3.9).
+//! Process liveness for an upgrade (§3.9). The successor waits here until the
+//! predecessor has exited, so the two never load a model at once. Recovery of
+//! a build that does not become ready is `keep`'s, not a mode of this binary.
 
-use std::ffi::OsString;
 use std::io;
 use std::process::Child;
 use std::thread::sleep;
@@ -10,7 +9,7 @@ use std::time::Duration;
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-use super::watchdog::{asks_for_watchdog, read_plan, watch, Outcome, Processes};
+use super::watchdog::{Processes, LOOK, OLD_EXIT_WITHIN};
 use crate::launch::LaunchSpec;
 
 /// The OS's processes.
@@ -54,35 +53,18 @@ impl Processes for OsProcesses {
     }
 }
 
-/// When this process was started as `--upgrade-watchdog <plan>`: watch the
-/// install the plan describes, and exit. Every binary calls this first.
-pub fn run_if_asked() {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let Some(path) = asks_for_watchdog(&args) else {
-        return;
-    };
-    let plan = match read_plan(&path) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "upgrade watchdog: the plan at {} is unreadable: {e}",
-                path.display()
-            );
-            std::process::exit(1);
+/// Block until `pid` is gone. After [`OLD_EXIT_WITHIN`] it is killed, which is
+/// as long as the successor waits before loading.
+pub fn wait_until_gone(pid: u32) {
+    let os = OsProcesses;
+    let mut waited = Duration::ZERO;
+    while os.alive(pid) {
+        if waited >= OLD_EXIT_WITHIN {
+            os.kill_pid(pid);
+            break;
         }
-    };
-    match watch(&plan, &OsProcesses) {
-        Outcome::Ready => {
-            eprintln!("upgrade watchdog: {} is ready", plan.installing);
-            std::process::exit(0)
-        }
-        Outcome::Restored(reason) => {
-            eprintln!(
-                "upgrade watchdog: {} failed — {reason}; the old build is restored",
-                plan.installing
-            );
-            std::process::exit(1)
-        }
+        os.sleep(LOOK);
+        waited += LOOK;
     }
 }
 

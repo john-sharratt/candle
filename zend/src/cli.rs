@@ -1,5 +1,5 @@
 //! zend's own settings — the `zend` binary's flags, and the `zend:` section of
-//! `tokerad.yaml`. One struct for both, so a setting means the same thing
+//! `motherd.yaml`. One struct for both, so a setting means the same thing
 //! whichever binary reads it. The process's settings (where it listens, whom it
 //! believes, how much it logs) are the host's: `host::HostArgs`.
 //!
@@ -216,7 +216,7 @@ fn recent_mode<'de, D: Deserializer<'de>>(d: D) -> Result<Recent, D::Error> {
 impl ZendArgs {
     /// The flags that act once, at the start they are given to: a wipe, a
     /// whole-store compaction, a self-check. A self-heal relaunch drops them
-    /// (`host::OneShot`), and `tokerad.yaml` cannot set them — a config file
+    /// (`host::OneShot`), and `motherd.yaml` cannot set them — a config file
     /// is read at every start, so one there would act at every start. Run the
     /// `zend` binary with the flag once instead.
     pub const ONE_SHOT: &'static [OneShot] = &[
@@ -424,7 +424,7 @@ mod tests {
         assert!(Cli::try_parse_from(["zend", "--qsa-recent-mode", "sometimes"]).is_err());
     }
 
-    /// The flags and `tokerad.yaml`'s `zend:` section read the same settings,
+    /// The flags and `motherd.yaml`'s `zend:` section read the same settings,
     /// with the same defaults.
     #[test]
     fn flags_and_yaml_agree() {
@@ -455,7 +455,7 @@ mod tests {
     }
 
     /// Every one-shot flag is a real flag of the binary — a relaunch strips
-    /// what the shell passed — and none can be set from `tokerad.yaml`.
+    /// what the shell passed — and none can be set from `motherd.yaml`.
     #[test]
     fn the_one_shot_flags_are_flags_and_never_yaml() {
         for o in ZendArgs::ONE_SHOT {
@@ -471,7 +471,7 @@ mod tests {
             let yaml = format!("{key}: true");
             assert!(
                 serde_yaml::from_str::<ZendArgs>(&yaml).is_err(),
-                "{key} must not be settable from tokerad.yaml"
+                "{key} must not be settable from motherd.yaml"
             );
         }
     }

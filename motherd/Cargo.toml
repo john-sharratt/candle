@@ -1,11 +1,11 @@
 [package]
-name = "tokerad"
+name = "motherd"
 version = "0.1.0"
 edition = "2021"
 description = "zend and npcd in one process, on one model"
 
 [[bin]]
-name = "tokerad"
+name = "motherd"
 path = "src/main.rs"
 
 # The one crate that links both daemons (`docs/shared_model_host.md` §3.7):

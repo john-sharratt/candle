@@ -1,7 +1,7 @@
 //! npcd as a tenant of the host (`docs/shared_model_host.md` §3.1).
 //!
 //! [`NpcdArgs`] is npcd's own settings — the `npcd` binary's flags and the
-//! `npcd:` section of `tokerad.yaml` — and [`NpcdArgs::resolve`] turns them into
+//! `npcd:` section of `motherd.yaml` — and [`NpcdArgs::resolve`] turns them into
 //! an [`NpcdTenant`], refusing a mistyped `--mind` on the spot. [`NpcdTenant`]
 //! stands the daemon up on the host's runtime: the authored registries, the
 //! cast on its substrate, the runtime and its sinks, the hosted worlds, the
@@ -159,7 +159,7 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 impl NpcdArgs {
     /// The flags that act once, at the start they are given to. A self-heal
-    /// relaunch drops them (`host::OneShot`), and `tokerad.yaml` cannot set
+    /// relaunch drops them (`host::OneShot`), and `motherd.yaml` cannot set
     /// them — a config file is read at every start, so one there would forget
     /// at every start. Run the `npcd` binary with the flag once instead.
     pub const ONE_SHOT: &'static [OneShot] = &[
@@ -951,7 +951,7 @@ mod tests {
         assert!(parse(&["--wipe-conversations"]).wipe_conversations);
     }
 
-    /// The flags and `tokerad.yaml`'s `npcd:` section read the same settings,
+    /// The flags and `motherd.yaml`'s `npcd:` section read the same settings,
     /// with the same defaults; there is no `--content` and no embedded console.
     #[test]
     fn flags_and_yaml_agree() {
@@ -968,7 +968,7 @@ mod tests {
     }
 
     /// Every one-shot flag is a real flag of the binary — a relaunch strips
-    /// what the shell passed — and none can be set from `tokerad.yaml`.
+    /// what the shell passed — and none can be set from `motherd.yaml`.
     #[test]
     fn the_one_shot_flags_are_flags_and_never_yaml() {
         for o in NpcdArgs::ONE_SHOT {
@@ -976,7 +976,7 @@ mod tests {
             let key = o.flag.trim_start_matches("--").replace('-', "_");
             assert!(
                 serde_yaml::from_str::<NpcdArgs>(&format!("{key}: true")).is_err(),
-                "{key} must not be settable from tokerad.yaml"
+                "{key} must not be settable from motherd.yaml"
             );
         }
     }
@@ -984,7 +984,7 @@ mod tests {
     /// **A mind repository is mirrored under `--data`**, one or the other of
     /// a folder and a repository, never both, and a mirror not yet holding the
     /// record starts on no mind; `mind_repo:` reads the same from
-    /// `tokerad.yaml`.
+    /// `motherd.yaml`.
     #[test]
     fn a_mind_repository_is_mirrored_under_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -1026,7 +1026,7 @@ mod tests {
         assert_eq!(yaml, parse(&["--mind-repo", "mind", "--data", data]));
     }
 
-    /// **A relative `--data` is made absolute at resolve**, as `tokerad.yaml`'s
+    /// **A relative `--data` is made absolute at resolve**, as `motherd.yaml`'s
     /// `data: ../npcd-data` is: a mirror is a repository opened by its path,
     /// which must be absolute, and the substrate's volume is measured from its
     /// path. Resolving touches nothing on disk.

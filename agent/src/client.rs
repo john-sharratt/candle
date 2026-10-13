@@ -3,7 +3,7 @@
 //! While any of the member's sockets is admitted, a job goes up a stream to
 //! `group:agent` and the gateway picks the agent (§11.3). Cut off from every
 //! cluster, the member reaches no agent but one in its own process —
-//! `tokerad --agent` — and sends the job straight to it. With neither, the
+//! `motherd --agent` — and sends the job straight to it. With neither, the
 //! job fails with [`AgentError::NoAgent`]: a zend tool reports `no_agent` to
 //! the model, and a publish waits and tries again. That is the deployment, not
 //! a fallback: a member given `--cluster` never runs a job on its own

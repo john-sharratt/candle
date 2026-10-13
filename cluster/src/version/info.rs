@@ -19,12 +19,12 @@ pub const BUILD_INFO_FLAG: &str = "--build-info";
 /// The binaries a build produces, as `kind` names them.
 pub const ZEND: &str = "zend";
 pub const NPCD: &str = "npcd";
-pub const TOKERAD: &str = "tokerad";
+pub const MOTHERD: &str = "motherd";
 pub const AGENT: &str = "tokera-agent";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildInfo {
-    /// Which binary: [`ZEND`], [`NPCD`], [`TOKERAD`] or [`AGENT`].
+    /// Which binary: [`ZEND`], [`NPCD`], [`MOTHERD`] or [`AGENT`].
     pub kind: String,
     pub count: u32,
     pub hash: String,

@@ -1,0 +1,23 @@
+# keep — failsafe for the binaries on this machine. It stores paths, not bytes.
+# Run from the repository root:
+#
+#   target\release\keep.exe -- config is the default keep/keep.yaml
+
+state: keep/state
+poll_ms: 1000
+services:
+  - name: web
+    exe: web.exe
+    host: 127.0.0.1
+    port: 80
+    path: /
+    args: ["--config", "web/web.yaml"]
+    cwd: D:/prog/candle
+  - name: motherd
+    exe: motherd.exe
+    host: 192.168.0.5
+    port: 8081
+    path: /v1/status
+    args: ["--config", "motherd/motherd.yaml"]
+    cwd: D:/prog/candle
+    upgrade_dir: D:/prog/substrate/upgrade

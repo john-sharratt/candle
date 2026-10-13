@@ -1,6 +1,6 @@
 //! One engine for every tenant in a process.
 //!
-//! A host running several tenants — zend and npcd in `tokerad` — loads one
+//! A host running several tenants — zend and npcd in `motherd` — loads one
 //! model and runs one scheduler, and gives each tenant its own substrate on
 //! them (`docs/shared_model_host.md` §3.2). Each tenant's loader reaches this
 //! slot where it would otherwise build an engine of its own:

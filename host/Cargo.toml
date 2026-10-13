@@ -9,7 +9,7 @@ name = "host"
 path = "src/lib.rs"
 
 # Depends on neither daemon: `zend` and `npcd` each depend on this, and only
-# `tokerad` links both (`docs/shared_model_host.md` §3.7).
+# `motherd` links both (`docs/shared_model_host.md` §3.7).
 [dependencies]
 anyhow     = { workspace = true }
 clap       = { workspace = true }

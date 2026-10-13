@@ -15,7 +15,7 @@
 //! ```
 //!
 //! The binary parses zend's flags and the process's, and runs zend as the one
-//! tenant of a host process (`host::run`). `tokerad` is the same call with npcd
+//! tenant of a host process (`host::run`). `motherd` is the same call with npcd
 //! beside it.
 
 use clap::Parser;
