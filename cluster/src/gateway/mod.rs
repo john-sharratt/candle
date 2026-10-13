@@ -15,6 +15,7 @@ mod paxos_log;
 mod registry;
 mod relay;
 mod status;
+mod tiebreak;
 mod traffic;
 pub mod upgrades;
 mod world_log;

@@ -57,6 +57,9 @@ pub struct Promise {
     pub accepted: Option<AcceptedValue>,
     pub from: u64,
     pub reply_to: u64,
+    /// Set on a gateway's vote (§5.9). Not on the body: the frame flag carries
+    /// it, so a member's promise is the same bytes it always was.
+    pub tiebreak: bool,
 }
 
 impl Promise {
@@ -75,6 +78,7 @@ impl Promise {
             accepted: r.option(AcceptedValue::read)?,
             from: r.u64()?,
             reply_to: r.u64()?,
+            tiebreak: false,
         })
     }
 }
@@ -86,6 +90,8 @@ pub struct Nack {
     pub promised: Ballot,
     pub from: u64,
     pub reply_to: u64,
+    /// A gateway's refusal (§5.9). Carried in the frame flag, like [`Promise`].
+    pub tiebreak: bool,
 }
 
 impl Nack {
@@ -101,6 +107,7 @@ impl Nack {
             promised: Ballot::read(r)?,
             from: r.u64()?,
             reply_to: r.u64()?,
+            tiebreak: false,
         })
     }
 }
@@ -136,6 +143,8 @@ pub struct Accepted {
     pub ballot: Ballot,
     pub from: u64,
     pub reply_to: u64,
+    /// A gateway's acceptance (§5.9). Carried in the frame flag, like [`Promise`].
+    pub tiebreak: bool,
 }
 
 impl Accepted {
@@ -151,6 +160,7 @@ impl Accepted {
             ballot: Ballot::read(r)?,
             from: r.u64()?,
             reply_to: r.u64()?,
+            tiebreak: false,
         })
     }
 }

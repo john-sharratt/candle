@@ -263,12 +263,88 @@ fn a_rounds_voters_and_the_ballot_that_beat_it_are_reported() {
         promised: higher,
         from: 2,
         reply_to: 1,
+        tiebreak: false,
     });
     let now = net.now;
     net.members[0].handle(&nack, now).unwrap();
     let s = net.members[0].status(b"k", net.now);
     assert_eq!(s.round.map(|(_, phase)| phase), Some("waiting"));
     assert_eq!(s.beaten_by, Some(higher));
+}
+
+/// One member of a group of two decides once the gateway has promised and
+/// accepted. The same promise does not complete a quorum of three, and it
+/// does not count at all unless the group is two.
+#[test]
+fn one_member_of_two_decides_with_the_gateway_tiebreak() {
+    let mut net = Net::new(2, 2);
+    for member in &mut net.members {
+        member.allow_tiebreak(true);
+    }
+    net.cut[1] = true;
+    net.act(0, |p, now| p.decide(b"gen/1", b"v".to_vec(), now));
+    net.settle();
+    assert!(
+        net.decided(b"gen/1").is_empty(),
+        "one member is not a quorum"
+    );
+
+    let ballot = net.members[0].status(b"gen/1", net.now).round.unwrap().0;
+    let now = net.now;
+    let promise = Frame::Promise(Promise {
+        key: b"gen/1".to_vec(),
+        ballot,
+        accepted: None,
+        from: 99,
+        reply_to: 1,
+        tiebreak: true,
+    });
+    let outs = net.members[0].handle(&promise, now).unwrap();
+    assert!(
+        outs.iter()
+            .any(|o| matches!(o, Out::Broadcast(Frame::Propose(_)))),
+        "the gateway's promise is the second vote: {outs:?}"
+    );
+    let accepted = Frame::Accepted(Accepted {
+        key: b"gen/1".to_vec(),
+        ballot,
+        from: 99,
+        reply_to: 1,
+        tiebreak: true,
+    });
+    let outs = net.members[0].handle(&accepted, now).unwrap();
+    assert!(
+        outs.iter().any(|o| matches!(
+            o,
+            Out::Decided { value, .. } if value == b"v"
+        )),
+        "the gateway's acceptance decides: {outs:?}"
+    );
+
+    // A group of three ignores the same vote: quorum two there is two members.
+    let mut net = Net::new(1, 3);
+    net.members[0].allow_tiebreak(true);
+    net.act(0, |p, now| p.decide(b"gen/1", b"v".to_vec(), now));
+    net.settle();
+    let ballot = net.members[0].status(b"gen/1", net.now).round.unwrap().0;
+    let now = net.now;
+    let outs = net.members[0]
+        .handle(
+            &Frame::Promise(Promise {
+                key: b"gen/1".to_vec(),
+                ballot,
+                accepted: None,
+                from: 99,
+                reply_to: 1,
+                tiebreak: true,
+            }),
+            now,
+        )
+        .unwrap();
+    assert!(
+        outs.is_empty(),
+        "a tie-break does not shrink a larger quorum: {outs:?}"
+    );
 }
 
 #[test]

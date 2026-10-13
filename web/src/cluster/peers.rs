@@ -22,6 +22,36 @@ use crate::config::{Config, Peer};
 /// The node id's file in the ACME store.
 pub const NODE_FILE: &str = "node";
 
+/// This gateway's node id when it has no peers, kept beside the group key.
+/// A peered gateway uses the ACME store's id instead, the one its `PEER_HELLO`
+/// carries, so the tie-break voter is the same id on every side (§5.9).
+pub fn local_node(group_key: &Path) -> Result<u64> {
+    read_or_mint(&group_key.with_file_name("gateway.node"))
+}
+
+fn read_or_mint(path: &Path) -> Result<u64> {
+    match fs::read_to_string(path) {
+        Ok(text) => u64::from_str_radix(text.trim(), 16)
+            .ok()
+            .filter(|n| *n != 0)
+            .ok_or_else(|| anyhow!("{} holds no node id: {text:?}", path.display())),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let node = loop {
+                let n: u64 = rand::random();
+                if n != 0 {
+                    break n;
+                }
+            };
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            }
+            write_atomic(path, format!("{node:016x}\n").as_bytes())?;
+            Ok(node)
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 /// This gateway's node id: read from `<store>/node`, or minted there once.
 pub fn node_id(store: &Path) -> Result<u64> {
     let path = store.join(NODE_FILE);

@@ -25,9 +25,11 @@ impl Replicator {
         }
         let now = self.now();
         let quorum = self.quorum();
+        let tiebreak = self.tiebreak_allowed();
         let outs = {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
             p.set_quorum(quorum);
+            p.allow_tiebreak(tiebreak);
             p.decide(key, value, now)
         };
         match outs {

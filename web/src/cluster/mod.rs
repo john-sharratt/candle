@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use axum::Router;
+use cluster::consensus::votes::{FileJournal, DEFAULT_SIZE};
 use cluster::gateway::upgrades::UpgradeConfig;
 use cluster::gateway::Hub;
 use cluster::handshake::GroupKey;
@@ -110,6 +111,19 @@ impl Gateway {
             canary_pct: cluster.canary_share.min(100),
         });
         let peering = peers::peering(cfg, &key, &hub)?;
+        let (voter, peer_n) = match &peering {
+            Some(p) => (p.node(), cluster.peers.len()),
+            None => (peers::local_node(&cluster.group_key_file)?, 0),
+        };
+        let journal = cluster.group_key_file.with_file_name("gateway-votes");
+        hub.enable_tiebreak(
+            voter,
+            peer_n,
+            Box::new(
+                FileJournal::open(&journal, DEFAULT_SIZE)
+                    .with_context(|| format!("opening {}", journal.display()))?,
+            ),
+        )?;
         Ok(Arc::new(Gateway {
             hub,
             peering,

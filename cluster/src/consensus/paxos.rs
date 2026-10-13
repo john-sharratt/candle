@@ -6,7 +6,8 @@
 //! **One round**, for one key: `PREPARE` to every member; with promises from a
 //! quorum of distinct acceptors, `PROPOSE` the highest-ballot accepted value
 //! among them, or its own; with `ACCEPTED` from a quorum, it is decided. The
-//! member is an acceptor of its own rounds too.
+//! member is an acceptor of its own rounds too. In a group of two, one
+//! gateway promise flagged as the tie-break fills the empty seat (§5.9).
 //!
 //! **Leases add a term.** A promise carrying another member's unexpired lease
 //! stops the proposer (`LeaseBusy`); one carrying its own does not, and that is
@@ -106,15 +107,29 @@ enum Goal {
 #[derive(Debug)]
 enum Phase {
     Preparing {
+        /// Promises from members.
         promises: Map<u64, Option<AcceptedValue>>,
+        /// Promises from gateways voting as the tie-break (§5.9). At most one
+        /// of them counts, and only in a group of two.
+        tiebreak: Map<u64, Option<AcceptedValue>>,
     },
     Proposing {
         value: Vec<u8>,
         accepted: Set<u64>,
+        tiebreak: Set<u64>,
     },
     Waiting {
         until: Millis,
     },
+}
+
+/// How many votes count toward `quorum`. A gateway's vote fills the one empty
+/// seat of a group of two, and no other group: a quorum of two is also three
+/// members' majority, and one member plus a gateway must not decide there
+/// while the other two decide on their own.
+fn seats(quorum: usize, tiebreak_counts: bool, members: usize, tiebreaks: usize) -> usize {
+    let extra = usize::from(tiebreak_counts && quorum == 2 && members >= 1 && tiebreaks >= 1);
+    members + extra
 }
 
 #[derive(Debug)]
@@ -133,6 +148,8 @@ pub struct Paxos<S: VoteStore> {
     cfg: Config,
     acceptor: Acceptor<S>,
     quorum: usize,
+    /// Count a gateway tie-break vote. Set only while the group size is two.
+    tiebreak: bool,
     rounds: Map<Vec<u8>, Round>,
     /// The highest ballot round seen per key, so the next ballot goes above.
     highest: Map<Vec<u8>, u64>,
@@ -152,6 +169,7 @@ impl<S: VoteStore> Paxos<S> {
             acceptor: Acceptor::open(store, now)?,
             cfg,
             quorum: 1,
+            tiebreak: false,
             rounds: Map::default(),
             highest: Map::default(),
             held: Map::default(),
@@ -169,6 +187,13 @@ impl<S: VoteStore> Paxos<S> {
     /// The quorum, from `max_members` (§5.9).
     pub fn set_quorum(&mut self, quorum: usize) {
         self.quorum = quorum.max(1);
+    }
+
+    /// Whether a gateway's tie-break vote counts. A caller sets this from the
+    /// group size: only a group of two, whose quorum is two, may be completed
+    /// by the gateway (§5.9).
+    pub fn allow_tiebreak(&mut self, allow: bool) {
+        self.tiebreak = allow;
     }
 
     /// Decide one value for `key`: `value` if no other was accepted first.
@@ -251,6 +276,7 @@ impl<S: VoteStore> Paxos<S> {
                 ballot,
                 phase: Phase::Preparing {
                     promises: Map::default(),
+                    tiebreak: Map::default(),
                 },
                 started: now,
                 deadline: now + self.cfg.round_timeout,
@@ -263,7 +289,7 @@ impl<S: VoteStore> Paxos<S> {
         })));
         match self.acceptor.prepare(key, ballot, now)? {
             PrepareReply::Promise(accepted) => {
-                self.on_promise(key, self.cfg.node, ballot, accepted, now, out)?
+                self.on_promise(key, self.cfg.node, ballot, accepted, false, now, out)?
             }
             PrepareReply::Nack(promised) => self.on_nack(key, promised, now),
         }
@@ -318,10 +344,12 @@ impl<S: VoteStore> Paxos<S> {
         from: u64,
         ballot: Ballot,
         accepted: Option<AcceptedValue>,
+        tiebreak: bool,
         now: Millis,
         out: &mut Vec<Out>,
     ) -> io::Result<()> {
         let quorum = self.quorum;
+        let tiebreak_counts = self.tiebreak;
         let node = self.cfg.node;
         let Some(round) = self.rounds.get_mut(key) else {
             return Ok(());
@@ -329,14 +357,31 @@ impl<S: VoteStore> Paxos<S> {
         if round.ballot != ballot {
             return Ok(());
         }
-        let Phase::Preparing { promises } = &mut round.phase else {
+        let Phase::Preparing {
+            promises,
+            tiebreak: ties,
+        } = &mut round.phase
+        else {
             return Ok(());
         };
-        promises.insert(from, accepted);
-        if promises.len() < quorum {
+        if tiebreak {
+            if !(tiebreak_counts && quorum == 2) {
+                return Ok(());
+            }
+            ties.insert(from, accepted);
+        } else {
+            promises.insert(from, accepted);
+        }
+        if seats(quorum, tiebreak_counts, promises.len(), ties.len()) < quorum {
             return Ok(());
         }
-        let promises = std::mem::take(promises);
+        let mut promises = std::mem::take(promises);
+        // One tie-break seat. The lowest gateway node is the voter (§5.9); if
+        // another also answered, its accepted value still competes, so a
+        // higher ballot already accepted is not dropped.
+        for (from, accepted) in std::mem::take(ties) {
+            promises.insert(from, accepted);
+        }
 
         // Another member's unexpired lease stops a lease round.
         if let Goal::Lease(_) = round.goal {
@@ -373,6 +418,7 @@ impl<S: VoteStore> Paxos<S> {
         round.phase = Phase::Proposing {
             value: value.clone(),
             accepted: Set::default(),
+            tiebreak: Set::default(),
         };
         round.deadline = now + self.cfg.round_timeout;
         out.push(Out::Broadcast(Frame::Propose(Propose {
@@ -381,25 +427,45 @@ impl<S: VoteStore> Paxos<S> {
             value: value.clone(),
         })));
         match self.acceptor.propose(key, ballot, &value, now)? {
-            ProposeReply::Accepted => self.on_accepted(key, node, ballot, out),
+            ProposeReply::Accepted => self.on_accepted(key, node, ballot, false, out),
             ProposeReply::Nack(promised) => self.on_nack(key, promised, now),
         }
         Ok(())
     }
 
-    fn on_accepted(&mut self, key: &[u8], from: u64, ballot: Ballot, out: &mut Vec<Out>) {
+    fn on_accepted(
+        &mut self,
+        key: &[u8],
+        from: u64,
+        ballot: Ballot,
+        tiebreak: bool,
+        out: &mut Vec<Out>,
+    ) {
         let quorum = self.quorum;
+        let tiebreak_counts = self.tiebreak;
         let Some(round) = self.rounds.get_mut(key) else {
             return;
         };
         if round.ballot != ballot {
             return;
         }
-        let Phase::Proposing { value, accepted } = &mut round.phase else {
+        let Phase::Proposing {
+            value,
+            accepted,
+            tiebreak: ties,
+        } = &mut round.phase
+        else {
             return;
         };
-        accepted.insert(from);
-        if accepted.len() < quorum {
+        if tiebreak {
+            if !(tiebreak_counts && quorum == 2) {
+                return;
+            }
+            ties.insert(from);
+        } else {
+            accepted.insert(from);
+        }
+        if seats(quorum, tiebreak_counts, accepted.len(), ties.len()) < quorum {
             return;
         }
         let value = std::mem::take(value);
@@ -448,12 +514,14 @@ impl<S: VoteStore> Paxos<S> {
                         accepted,
                         from: node,
                         reply_to: p.ballot.node,
+                        tiebreak: false,
                     }),
                     PrepareReply::Nack(promised) => Frame::Nack(Nack {
                         key: p.key.clone(),
                         promised,
                         from: node,
                         reply_to: p.ballot.node,
+                        tiebreak: false,
                     }),
                 };
                 out.push(Out::Reply {
@@ -476,12 +544,14 @@ impl<S: VoteStore> Paxos<S> {
                         ballot: p.ballot,
                         from: node,
                         reply_to: p.ballot.node,
+                        tiebreak: false,
                     }),
                     ProposeReply::Nack(promised) => Frame::Nack(Nack {
                         key: p.key.clone(),
                         promised,
                         from: node,
                         reply_to: p.ballot.node,
+                        tiebreak: false,
                     }),
                 };
                 out.push(Out::Reply {
@@ -502,19 +572,23 @@ impl<S: VoteStore> Paxos<S> {
                     && self.dedup.first(Kind::Promise, &p.key, p.ballot, p.from) =>
             {
                 let accepted = p.accepted.clone();
-                self.on_promise(&p.key, p.from, p.ballot, accepted, now, &mut out)?;
+                self.on_promise(
+                    &p.key, p.from, p.ballot, accepted, p.tiebreak, now, &mut out,
+                )?;
             }
             Frame::Nack(n)
                 if n.reply_to == node
                     && self.dedup.first(Kind::Nack, &n.key, n.promised, n.from) =>
             {
-                self.on_nack(&n.key, n.promised, now);
+                if !(n.tiebreak && !(self.tiebreak && self.quorum == 2)) {
+                    self.on_nack(&n.key, n.promised, now);
+                }
             }
             Frame::Accepted(a)
                 if a.reply_to == node
                     && self.dedup.first(Kind::Accepted, &a.key, a.ballot, a.from) =>
             {
-                self.on_accepted(&a.key, a.from, a.ballot, &mut out);
+                self.on_accepted(&a.key, a.from, a.ballot, a.tiebreak, &mut out);
             }
             _ => {}
         }
@@ -582,8 +656,20 @@ impl<S: VoteStore> Paxos<S> {
                 (r.ballot, phase)
             }),
             voters: match round.map(|r| &r.phase) {
-                Some(Phase::Preparing { promises }) => promises.keys().copied().collect(),
-                Some(Phase::Proposing { accepted, .. }) => accepted.iter().copied().collect(),
+                Some(Phase::Preparing { promises, tiebreak }) => {
+                    let mut voters: Vec<u64> = promises.keys().copied().collect();
+                    voters.extend(tiebreak.keys().copied());
+                    voters.sort_unstable();
+                    voters
+                }
+                Some(Phase::Proposing {
+                    accepted, tiebreak, ..
+                }) => {
+                    let mut voters: Vec<u64> = accepted.iter().copied().collect();
+                    voters.extend(tiebreak.iter().copied());
+                    voters.sort_unstable();
+                    voters
+                }
                 _ => Vec::new(),
             },
             beaten_by: round.and_then(|r| r.beaten_by),

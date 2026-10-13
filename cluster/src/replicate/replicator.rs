@@ -253,6 +253,7 @@ impl Replicator {
         let max_members = store.max_members();
         let generation = store.generation();
         paxos.set_quorum(max_members as usize / 2 + 1);
+        paxos.allow_tiebreak(max_members == 2);
         let node = store.node();
         let epoch = Instant::now();
         let phase = if store.detached() {
