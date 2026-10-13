@@ -6,6 +6,9 @@ use crate::wire::WireError;
 pub const FLAG_CATCHUP: u8 = 0x01;
 /// `flags & ADDRESSED`: an `EVENT` answering a `FETCH`, carrying `reply_to`.
 pub const FLAG_ADDRESSED: u8 = 0x02;
+/// `flags & TIEBREAK`: a `PROMISE`, `NACK` or `ACCEPTED` from a gateway voting
+/// as the tie-break acceptor (§5.9). A member's vote carries no flag.
+pub const FLAG_TIEBREAK: u8 = 0x01;
 
 /// Which of the writer's three lanes a frame waits in (§4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,6 +111,7 @@ impl Kind {
     pub fn allowed_flags(self) -> u8 {
         match self {
             Kind::Event => FLAG_CATCHUP | FLAG_ADDRESSED,
+            Kind::Promise | Kind::Nack | Kind::Accepted => FLAG_TIEBREAK,
             _ => 0,
         }
     }

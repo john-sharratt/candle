@@ -155,6 +155,7 @@ pub(crate) async fn run(
             return finish(ended).await;
         }
     };
+    peering.saw_peer(peer);
     peering.note(
         peer,
         format!(

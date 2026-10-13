@@ -5,9 +5,10 @@
 //! ```
 //!
 //! The stream field names a virtual connection on `OPEN`, `DATA`, `WINDOW`,
-//! `FIN` and `RESET` and is zero on every other kind; only `EVENT` carries
-//! flags. A frame that is short, long, of an unknown kind, or carries a stream
-//! or a flag its kind does not is refused, never misread.
+//! `FIN` and `RESET` and is zero on every other kind. `EVENT` carries its lane
+//! flags; a gateway's `PROMISE`, `NACK` and `ACCEPTED` carry the tie-break
+//! flag (§5.9). A frame that is short, long, of an unknown kind, or carries a
+//! stream or a flag its kind does not is refused, never misread.
 
 mod builds;
 mod consensus;
@@ -24,7 +25,7 @@ mod types;
 pub use builds::{BuildArtifacts, BuildChunk, BuildFetch, Verdict, VerdictResult, MAX_BUILD_CHUNK};
 pub use consensus::{Accepted, AcceptedValue, Nack, Prepare, Promise, Propose, Release};
 pub use handshake::{Admit, Challenge, Hello, Prove};
-pub use kind::{Kind, Lane, FLAG_ADDRESSED, FLAG_CATCHUP};
+pub use kind::{Kind, Lane, FLAG_ADDRESSED, FLAG_CATCHUP, FLAG_TIEBREAK};
 pub use membership::{Capacity, Claim, Coord, Members, Routes, Unclaim};
 pub use packing::{read_applied, write_applied};
 pub use peering::{AcmeCert, AcmeChallenge, CertLine, PeerHello};
@@ -219,6 +220,9 @@ impl Frame {
                 }
                 flags
             }
+            Frame::Promise(p) if p.tiebreak => FLAG_TIEBREAK,
+            Frame::Nack(n) if n.tiebreak => FLAG_TIEBREAK,
+            Frame::Accepted(a) if a.tiebreak => FLAG_TIEBREAK,
             _ => 0,
         }
     }
@@ -342,10 +346,22 @@ impl Frame {
                 state: r.blob_vec()?,
             }),
             Kind::Prepare => Frame::Prepare(Prepare::read(&mut r)?),
-            Kind::Promise => Frame::Promise(Promise::read(&mut r)?),
-            Kind::Nack => Frame::Nack(Nack::read(&mut r)?),
+            Kind::Promise => {
+                let mut body = Promise::read(&mut r)?;
+                body.tiebreak = flags & FLAG_TIEBREAK != 0;
+                Frame::Promise(body)
+            }
+            Kind::Nack => {
+                let mut body = Nack::read(&mut r)?;
+                body.tiebreak = flags & FLAG_TIEBREAK != 0;
+                Frame::Nack(body)
+            }
             Kind::Propose => Frame::Propose(Propose::read(&mut r)?),
-            Kind::Accepted => Frame::Accepted(Accepted::read(&mut r)?),
+            Kind::Accepted => {
+                let mut body = Accepted::read(&mut r)?;
+                body.tiebreak = flags & FLAG_TIEBREAK != 0;
+                Frame::Accepted(body)
+            }
             Kind::Release => Frame::Release(Release::read(&mut r)?),
             Kind::BuildOffer => Frame::BuildOffer(BuildArtifacts::read(&mut r)?),
             Kind::BuildHave => Frame::BuildHave(BuildArtifacts::read(&mut r)?),

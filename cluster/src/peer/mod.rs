@@ -141,6 +141,12 @@ impl Peering {
         self.me.node
     }
 
+    /// A peer's node id reached this gateway: the tie-break voter is the
+    /// lowest id among the gateways that have been seen (§5.9).
+    pub(crate) fn saw_peer(&self, node: u64) {
+        self.hub.note_peer(node);
+    }
+
     pub fn identity(&self) -> &PeerIdentity {
         &self.me
     }

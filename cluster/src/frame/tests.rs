@@ -274,6 +274,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 }),
                 from: 4,
                 reply_to: 6,
+                tiebreak: false,
             }),
             B::header(21, 0, 0)
                 .u32(1)
@@ -290,11 +291,31 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .0,
         ),
         (
+            Frame::Promise(Promise {
+                key: b"w".to_vec(),
+                ballot: ballot(),
+                accepted: None,
+                from: 4,
+                reply_to: 6,
+                tiebreak: true,
+            }),
+            B::header(21, 1, 0)
+                .u32(1)
+                .raw(b"w")
+                .u64(3)
+                .u64(9)
+                .u8(0)
+                .u64(4)
+                .u64(6)
+                .0,
+        ),
+        (
             Frame::Nack(Nack {
                 key: b"w".to_vec(),
                 promised: ballot(),
                 from: 4,
                 reply_to: 6,
+                tiebreak: false,
             }),
             B::header(22, 0, 0)
                 .u32(1)
@@ -326,6 +347,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 ballot: ballot(),
                 from: 4,
                 reply_to: 6,
+                tiebreak: false,
             }),
             B::header(24, 0, 0)
                 .u32(1)

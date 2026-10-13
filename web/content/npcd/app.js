@@ -542,6 +542,12 @@ function paintLoading(loading, detail) {
  * until npcd is. */
 const mine = (status) => (status && status.tenants && status.tenants.npcd) || {};
 
+/* The card is hidden until something has actually said npcd is loading. */
+function revealBoot() {
+  const b = document.getElementById('boot');
+  if (b) b.classList.add('boot-show');
+}
+
 /* The caller, or `null` when nobody is signed in: `/v1/me` answers a signed-out
  * caller with its role rather than a refusal, and that role is not an account. */
 const signedIn = (me) => (me && me.role && me.role !== 'unauthenticated' ? me : null);
@@ -565,6 +571,7 @@ async function boot() {
    * on that first poll, and is asked again otherwise. */
   const earlyMe = API.getMe().then((m) => m, () => null);
   let waited = false;
+  let misses = 0;
   /* Long enough to cover a real cold start. The old bound was 40 × 400 ms —
    * sixteen seconds — which was ample when nothing was loaded and is nowhere
    * near a multi-gigabyte checkpoint coming off disk onto the card. Giving up
@@ -575,7 +582,16 @@ async function boot() {
       status = await API.getStatus();
       if (mine(status).state === 'ready') break;
       waited = true;
-      paintLoading(mine(status).loading, detail);
+      // A real load names itself. One missed answer — a tab waking up — does
+      // not, and the card stays hidden until a second miss.
+      if (status && status.started_at_ms) {
+        misses = 0;
+        revealBoot();
+        paintLoading(mine(status).loading, detail);
+      } else if (++misses >= 2) {
+        revealBoot();
+        if (detail) detail.textContent = 'waiting for daemon…';
+      }
     } catch (e) {
       waited = true;
       if (e && (e.status === 401 || e.status === 403)) {
@@ -584,7 +600,10 @@ async function boot() {
         status = null;
         break;
       }
-      if (detail) detail.textContent = 'waiting for daemon…';
+      if (++misses >= 2) {
+        revealBoot();
+        if (detail) detail.textContent = 'waiting for daemon…';
+      }
     }
     await new Promise((r) => setTimeout(r, 400));
   }
@@ -687,12 +706,17 @@ async function boot() {
   // and reload, carrying the route across.
   const restored = takeReloadState();
   if (restored && restored.hash) location.replace(restored.hash);
-  setInterval(async () => {
+  // A hidden tab's status fetch fails when the browser wakes it. The build
+  // check stays idle until the page is visible, then runs once.
+  async function watchBuild() {
+    if (document.hidden) return;
     try { checkBuild(await API.getStatus(), { hash: location.hash }); } catch (_) {}
     // The count follows every save an admin makes, wherever on the console it
     // was made, without each page having to announce it.
     if (!draftsOpen && !draftsBusy) refreshDrafts();
-  }, 5000);
+  }
+  setInterval(watchBuild, 5000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) watchBuild(); });
 
   // Keyboard: g-then-key jumps, "/" focuses search unless a composer has it.
   let g = false;

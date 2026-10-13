@@ -8,8 +8,9 @@
 //! - [`MaxMembers`]: the quorum's base, raised and set in any order.
 //! - [`rendezvous`]: who proposes for a lease, and where a character is lent.
 //!
-//! The gateways only carry the vote: they hold no Paxos state and are never
-//! asked to vote.
+//! The gateways carry the vote. The one with the lowest node id is also the
+//! tie-break acceptor for a group of two (§5.9): its promise completes that
+//! quorum when one member is down, and it counts in no larger group.
 
 mod acceptor;
 mod clock;

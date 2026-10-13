@@ -84,6 +84,7 @@ impl Replicator {
         }
         let now = self.now();
         let quorum = self.quorum();
+        let tiebreak = self.tiebreak_allowed();
         self.terms
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -91,6 +92,7 @@ impl Replicator {
         let outs = {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
             p.set_quorum(quorum);
+            p.allow_tiebreak(tiebreak);
             p.acquire(key, ttl, now)
         };
         match outs {

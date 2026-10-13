@@ -86,12 +86,14 @@ mod tests {
                 }),
                 from: 2,
                 reply_to: 1,
+                tiebreak: false,
             }),
             Frame::Nack(Nack {
                 key: k.clone(),
                 promised: Ballot { round: 5, node: 3 },
                 from: 3,
                 reply_to: 1,
+                tiebreak: false,
             }),
             Frame::Propose(Propose {
                 key: k.clone(),
@@ -103,6 +105,7 @@ mod tests {
                 ballot: b,
                 from: 2,
                 reply_to: 1,
+                tiebreak: false,
             }),
             Frame::Release(Release {
                 key: k,

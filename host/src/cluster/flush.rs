@@ -3,7 +3,8 @@
 //! §6.4). A request the gateway routes afterwards, to any member, then lands
 //! behind those events on that member's ordered lane.
 //!
-//! The end is what the gateway reads as the response being complete:
+//! A `GET` or a `HEAD` writes nothing, so its response is not held for this.
+//! The end of a request that can append is what the gateway reads as complete:
 //!
 //! - **a body of unknown length** (chunked — a stream of server-sent events) ends
 //!   at its terminating chunk, written once the body says it is done. Its
@@ -22,6 +23,17 @@ use axum::body::Body;
 use bytes::Bytes;
 use cluster::replicate::Replicator;
 use http_body::{Frame, SizeHint};
+use hyper::http::Method;
+
+/// Whether a request can append substrate records, so its response waits
+/// until those records are on the socket (§6.4).
+///
+/// A `GET` or a `HEAD` reads. Waiting out the writer's queue for one held
+/// the console's status poll behind the cast's seals until the gateway's
+/// deadline, and the page read that deadline as the daemon going away.
+pub fn writes_records(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD)
+}
 
 type Flushing = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -102,5 +114,20 @@ impl http_body::Body for Flushed {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_does_not_wait_out_the_writer() {
+        assert!(!writes_records(&Method::GET));
+        assert!(!writes_records(&Method::HEAD));
+        assert!(writes_records(&Method::POST));
+        assert!(writes_records(&Method::PUT));
+        assert!(writes_records(&Method::PATCH));
+        assert!(writes_records(&Method::DELETE));
     }
 }

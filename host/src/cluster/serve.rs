@@ -21,7 +21,7 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use tower::Service;
 use web::cluster::ClusterPeer;
 
-use super::flush::{flush_first, Flushed};
+use super::flush::{self, flush_first, Flushed};
 
 /// The address a request off a socket appears to come from: no address at
 /// all, so nothing that trusts a peer by address — `--local-signin`, the
@@ -42,6 +42,7 @@ pub fn serve(
             let mut router = router.clone();
             let replicator = replicator.clone();
             async move {
+                let writes = flush::writes_records(req.method());
                 let mut req = req.map(Body::new);
                 req.extensions_mut().insert(ConnectInfo(SOCKET_PEER));
                 req.extensions_mut().insert(ClusterPeer { cluster });
@@ -52,6 +53,12 @@ pub fn serve(
                 let Some(r) = replicator else {
                     return Ok::<_, Infallible>(res);
                 };
+                // A read appends nothing. Ending it after the writer's queue
+                // would hold the console's status poll behind every seal the
+                // cast has in flight.
+                if !writes {
+                    return Ok(res);
+                }
                 if flush_first(res.body()) {
                     r.flush(cluster).await;
                     return Ok(res);

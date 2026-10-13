@@ -50,6 +50,7 @@ use crate::branch_ingest::keys::{
     branches_value, file_key, BLOB_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY, LINES_KEY,
 };
 use crate::branch_ingest::plan::Committed;
+use crate::ingest_lease::{self, Share};
 use crate::ingest_report::Failures;
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
@@ -702,6 +703,24 @@ fn process_one_file(
         return Ok(());
     }
     if job.binary.lock().unwrap().contains(job.key) {
+        return Ok(());
+    }
+    // Another member that planned this same unread file holds its lease and is
+    // the one that reads it. The conversation replicates, so this pass leaves
+    // the file. A lease just handed back is read here only when that member's
+    // writes have arrived and the key is still absent.
+    let hold = match ingest_lease::share(job.key) {
+        Share::Theirs => {
+            tracing::info!(
+                target: "zend::code_read::ingest",
+                file = %file.path,
+                "left to the member holding its ingest lease",
+            );
+            return Ok(());
+        }
+        Share::Mine(hold) => hold,
+    };
+    if hold.recheck() && finished_content_keys(ctx.engine).contains(job.key) {
         return Ok(());
     }
     let Some(tools) = file_tools(&ctx.tool_ctx, file) else {

@@ -38,6 +38,20 @@
   }
   const enc = (id) => encodeURIComponent(id);
 
+  // The aggregate module is the same for the life of the page. Importing it
+  // on every status poll is another request, and a tab waking up already has
+  // its streams to reopen.
+  let aggregateMod = null;
+  function loadAggregate() {
+    if (!aggregateMod) {
+      aggregateMod = import('/common/lib/aggregate.js').catch((e) => {
+        aggregateMod = null;
+        throw e;
+      });
+    }
+    return aggregateMod;
+  }
+
   const ZendLiveAPI = {
     // ── conversations ──────────────────────────────────────────────────────
     async seedConversations() {
@@ -95,16 +109,25 @@
     // GET /v1/status — the host's status: the process's, with zend's own line
     // under `tenants.zend` (drives the startup overlay). Through a clustered
     // gateway it is every member's, and the ready member's speaks for zend
-    // (`common/lib/aggregate.js`). If the daemon isn't reachable yet, report a
-    // synthetic "connecting" loading state.
-    getStatus() {
-      return Promise.all([getJSON('/v1/status'), import('/common/lib/aggregate.js')])
-        .then(([body, aggregate]) => aggregate.memberStatus(body, 'zend'))
-        .catch(() => ({
-        state: 'loading',
-        started_at_ms: 0,
-        tenants: { zend: { state: 'loading', loading: { label: 'Connecting', detail: 'connecting to daemon…', progress: 0, completed: [] } } },
-      }));
+    // (`common/lib/aggregate.js`). A failed fetch rejects. So does a gateway
+    // envelope nobody answered: that used to come back as a synthetic
+    // "connecting" line, and the page treated it as zend reloading.
+    getStatus(signal) {
+      const opts = { headers: { accept: 'application/json' } };
+      if (signal) opts.signal = signal;
+      return Promise.all([
+        fetch('/v1/status', opts).then((r) => {
+          if (!r.ok) throw new Error('GET /v1/status -> ' + r.status);
+          return r.json();
+        }),
+        loadAggregate(),
+      ]).then(([body, aggregate]) => {
+        const st = aggregate.memberStatus(body, 'zend');
+        if (aggregate.isEnvelope(body) && !(st && st.started_at_ms)) {
+          throw new Error('no member answered /v1/status');
+        }
+        return st;
+      });
     },
 
     // GET /v1/me — the caller's role, and zend's share for it: the tools modes

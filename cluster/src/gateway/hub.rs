@@ -13,8 +13,10 @@
 //!   other ready member round robin, or answered `DONE` here when there is
 //!   none; a `FETCH` to the member it names; a `HAVE` to every other member;
 //! - `CLAIM` and `UNCLAIM`, kept for routing and sent to the app's other
-//!   members; `PREPARE`, `PROPOSE` and `RELEASE` to the app's other members;
-//!   `PROMISE`, `NACK` and `ACCEPTED` to the member their `reply_to` names;
+//!   members; `PREPARE`, `PROPOSE` and `RELEASE` to the app's other members,
+//!   and, when this gateway is the tie-break voter, answered on the socket
+//!   they arrived on (§5.9); `PROMISE`, `NACK` and `ACCEPTED` to the member
+//!   their `reply_to` names;
 //! - `BUILD_OFFER` and `BUILD_HAVE`, kept as the builds held and sent to every
 //!   other member of every app; a `BUILD_FETCH` to the member it names, or
 //!   naming none to the next holder round robin; a `BUILD_CHUNK` to its
@@ -71,6 +73,8 @@ use crate::frame::{name, Admit, BuildFetch, BuildId, Frame, Hello, MemberState, 
 use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter};
 use crate::pipe::{Message, PipeRx, PipeTx};
 use crate::session::{start, Ended, Incoming, Role, SessionHandle, VirtualConn};
+
+use super::tiebreak::TieBreak;
 use crate::upgrade::decisions::build_name;
 use crate::version::info::AGENT;
 
@@ -160,6 +164,8 @@ pub struct Hub {
     /// This gateway's name in the coordination log.
     name: String,
     state: Mutex<State>,
+    /// The tie-break acceptor (§5.9), once [`Self::enable_tiebreak`] opened it.
+    tiebreak: Mutex<Option<TieBreak>>,
     pub log: CoordLog,
     pub traffic: Traffic,
 }
@@ -174,9 +180,37 @@ impl Hub {
             key,
             name: name.into(),
             state: Mutex::new(State::default()),
+            tiebreak: Mutex::new(None),
             log: CoordLog::new(),
             traffic: Traffic::new(),
         })
+    }
+
+    /// Vote as the tie-break acceptor (§5.9). `peers` is how many other
+    /// gateways are configured; zero means this gateway is the only one.
+    /// `store` is its vote journal.
+    pub fn enable_tiebreak(
+        &self,
+        node: u64,
+        peers: usize,
+        store: Box<dyn crate::consensus::votes::VoteStore>,
+    ) -> std::io::Result<()> {
+        let opened = TieBreak::open(node, peers, store)?;
+        *self.tiebreak.lock().unwrap_or_else(|e| e.into_inner()) = Some(opened);
+        Ok(())
+    }
+
+    /// A peered gateway's node id, from its `PEER_HELLO`. Remembered after the
+    /// link drops, so the lowest id stays the only voter.
+    pub fn note_peer(&self, node: u64) {
+        if let Some(tb) = self
+            .tiebreak
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            tb.note_peer(node);
+        }
     }
 
     pub(super) fn state(&self) -> MutexGuard<'_, State> {
@@ -428,7 +462,7 @@ impl Hub {
             tokio::select! {
                 arrived = incoming.recv() => match arrived {
                     Some(Incoming::Frame(frame)) => {
-                        if let Err(close) = self.on_frame(app, node, frame) {
+                        if let Err(close) = self.on_frame(app, node, frame, &handle) {
                             handle.close(close.clone());
                             break Ended::Refused(close);
                         }
@@ -490,8 +524,15 @@ impl Hub {
         }
     }
 
-    /// A frame from `node`: kept, relayed, or a protocol violation.
-    fn on_frame(&self, app: &str, node: u64, frame: Frame) -> Result<(), Close> {
+    /// A frame from `node`: kept, relayed, or a protocol violation. A vote is
+    /// also answered on `reply_on`, the socket it arrived on.
+    fn on_frame(
+        &self,
+        app: &str,
+        node: u64,
+        frame: Frame,
+        reply_on: &SessionHandle,
+    ) -> Result<(), Close> {
         if let Some((key, text)) = paxos_step(node, &frame) {
             self.note(app, key, text);
         }
@@ -586,6 +627,7 @@ impl Hub {
                 }
             }
             f @ (Frame::Prepare(_) | Frame::Propose(_) | Frame::Release(_)) => {
+                self.tiebreak(app, &f, reply_on);
                 self.to_others(app, node, f)
             }
             Frame::Promise(p) => {
@@ -616,6 +658,28 @@ impl Hub {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Answer a vote on the socket it arrived on, when this gateway is the
+    /// tie-break voter (§5.9). A journal error is logged and the frame is
+    /// still relayed: the members' own votes are the round.
+    fn tiebreak(&self, app: &str, frame: &Frame, reply_on: &SessionHandle) {
+        let reply = {
+            let mut guard = self.tiebreak.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(tb) = guard.as_mut() else {
+                return;
+            };
+            match tb.consider(app, frame) {
+                Ok(reply) => reply,
+                Err(e) => {
+                    tracing::error!(app, "tie-break vote failed: {e}");
+                    None
+                }
+            }
+        };
+        if let Some(reply) = reply {
+            let _ = reply_on.control(reply);
+        }
     }
 
     /// Every other admitted member, of every app: build traffic reaches the

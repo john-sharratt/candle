@@ -159,11 +159,13 @@ impl Replicator {
         });
         let now = self.now();
         let quorum = self.quorum();
+        let tiebreak = self.tiebreak_allowed();
         let outs = {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
             // The quorum as the substrate holds it now: a proposal never runs
             // on a stale one.
             p.set_quorum(quorum);
+            p.allow_tiebreak(tiebreak);
             p.decide(&generation_key(k), self.node.to_le_bytes().to_vec(), now)
         };
         match outs {
@@ -201,15 +203,23 @@ impl Replicator {
         self.send_wake.notify_one();
     }
 
-    /// A majority of `max_members` (§5.9), as last read from the substrate —
-    /// or of the ready members seen now, when more are seen than that. A
-    /// member arriving in a group still counted as smaller would otherwise
-    /// make a majority of one with itself in the second before `max_members`
-    /// rises, and take a lease another member holds.
-    pub(super) fn quorum(&self) -> usize {
+    /// `max_members`, or the ready members seen now when more are seen than
+    /// that (§5.9). A member arriving in a group still counted as smaller
+    /// would otherwise make a majority of one with itself in the second before
+    /// `max_members` rises, and take a lease another member holds.
+    fn group_size(&self) -> u32 {
         let held = self.state().max_members;
-        let seen = self.ready_members();
-        held.max(seen) as usize / 2 + 1
+        held.max(self.ready_members())
+    }
+
+    /// A majority of [`Self::group_size`].
+    pub(super) fn quorum(&self) -> usize {
+        self.group_size() as usize / 2 + 1
+    }
+
+    /// A gateway's vote completes a round only in a group of two (§5.9).
+    pub(super) fn tiebreak_allowed(&self) -> bool {
+        self.group_size() == 2
     }
 
     /// The once-a-tick consensus work: the engine's timers, the quorum, and a
@@ -217,9 +227,11 @@ impl Replicator {
     pub(super) fn consensus_tick(self: &Arc<Self>) {
         let now = self.now();
         let quorum = self.quorum();
+        let tiebreak = self.tiebreak_allowed();
         let outs = {
             let mut p = self.paxos.lock().unwrap_or_else(|e| e.into_inner());
             p.set_quorum(quorum);
+            p.allow_tiebreak(tiebreak);
             p.tick(now)
         };
         match outs {

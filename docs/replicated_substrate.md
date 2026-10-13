@@ -246,8 +246,8 @@ daemon code reports it outside logs.
 | D9a | **Each world has one authority, decided by a Paxos lease among the npcd members** (§5.9, §9.2). Only the authority persists world state. | Paxos's safety means two members never hold one world, so world state has one writer even across a partition, and a minority side holds no world at all. |
 | D9b | **The authority lends NPC leases, spread across the npcd members by weighted rendezvous from the start; a character runs where its lease is, until the lease expires *and* its holder reconnects** (§9.3). | A character's memory has one writer, and a partitioned machine's characters are never run a second time elsewhere. Losing one machine removes only its share of the cast. |
 | D9c | **A cut-off machine runs its characters in a local, unpersisted world, scrapped on reconnect** (§9.4). **It may still publish an operation's verified work to git**, through its in-process agent. An unreachable `origin` or agent makes the publish wait 30 minutes and try again. If both sides of a partition publish one operation, git merges them, and a conflict is solved by the publishing NPC at the merge table (§10.3). | Characters keep living through a partition, and each side's world never corrupts the authoritative one. git sits outside the cluster, so a partition from the gateways is no reason to hold finished work back from the record. |
-| D9d | **Consensus is a general service: Paxos among each app's members, with the gateways only carrying the vote.** It offers leases and one-time decisions. The quorum is a majority of `max_members`, the largest group the app has had, persisted in the substrate and raised automatically; it can be lowered by flag or admin call (§5.9). | No configuration file sizes the group. A restarted or cut-off member knows the quorum from its own substrate, and gateways stay stateless. |
-| D10 | **Every zend ingests its own workspace and replicates it**; a unit already ingested by any member is not ingested again (§10.4). | Machines with different checkouts contribute their repositories to the shared memory. |
+| D9d | **Consensus is a general service: Paxos among each app's members. The gateways carry the vote, and the lowest-id gateway is the tie-break acceptor for a group of two** (§5.9). It offers leases and one-time decisions. The quorum is a majority of `max_members`, the largest group the app has had, persisted in the substrate and raised automatically; it can be lowered by flag or admin call. | No configuration file sizes the group. A restarted or cut-off member knows the quorum from its own substrate. One member of two can still decide while the voting gateway is up, and a larger group is unchanged. |
+| D10 | **Every zend ingests its own workspace and replicates it**; a unit already ingested by any member is not ingested again, and a unit two members find still unread is read by the one that holds its lease (§10.4). | Machines with different checkouts contribute their repositories to the shared memory, and a startup where several of them plan the same tree does the reading once. |
 | D11 | **File-backed state becomes VFS records**: zend uploads into the conversation's store, npcd's authored content into an operation-scoped store over the mind repository, which every step of the operation works in. Publishing is an explicit git merge run by an agent, and for npcd it is the workflow's last step, taken at the archive floor's merge table after verification has passed; only a publish step may lead to `done` (§10). | One replication mechanism; git stays the record of published work, and nothing reaches it unverified. |
 | D12 | **Agents are members of app `agent`**; command-line work and git writes run on the best idle agent (§11). | Realises `docs/zend_workspace_execution.md` §7–§8 on the same socket. |
 | D13 | **Build version = the count of `origin/main` commits HEAD contains**, plus a `local` digest of anything beyond it (§3.5); per-app floor on the count, held in gateway memory. A newer build raises the floor after a 30-minute grace period, during which older builds keep serving (§3.5). | A total order across checkouts, and rolling upgrades one machine at a time. |
@@ -1564,9 +1564,19 @@ among the members of the app.
 
 - **The members are the acceptors and the proposers.** Each keeps its acceptor state in
   its own substrate, so these are durable acceptors in the classic sense.
-- **The gateways only carry the vote.** They relay Paxos frames between the members of
-  the app, as they relay events. They hold no Paxos state, are never asked to vote, and
-  a gateway restart touches no decision.
+- **The gateways carry the vote, and one of them breaks a tie.** They relay Paxos
+  frames between the members of the app, as they relay events. The gateway with the
+  lowest node id is also an acceptor: a `PREPARE` or `PROPOSE` that arrives on a
+  member's socket is answered on that socket, with the tie-break flag. Its journal is
+  `gateway-votes` beside the group key, the same layout as a member's `substrate/VOTES`,
+  and a restart resumes it. A promise so flagged counts as one vote, and only when the
+  group size is two — one member plus the gateway is a quorum of two, so zend and npcd
+  keep deciding with one of two members down. It does not count in a larger group: a
+  quorum of two is also three members' majority, and one member plus a gateway must not
+  decide while the other two can. A gateway with peers does not vote until it has seen
+  every configured peer's node id, and it remembers a peer after the link drops, so a
+  higher id never votes while a lower one exists. A gateway with no peers is the voter
+  at once. The gateway writes no decision record; the members do.
 
 **The quorum is a majority of the largest group the app has had: `max_members`.**
 
@@ -1882,7 +1892,11 @@ clusters and reach a receiver out of order. They are applied in the order they a
 ### 6.4 Events before the response
 
 A request's response ends only after the events it caused are on the socket ahead of
-it (`host/src/cluster/flush.rs`). When the handler's body is done, the member takes a
+it (`host/src/cluster/flush.rs`). A `GET` or a `HEAD` writes nothing, so its response
+ends with its body: waiting out the writer's queue for one held every console status
+poll behind the cast's seals until the gateway's 3 s deadline, and the page read that
+deadline as the daemon going away. When the handler's body is done, a request that
+can append takes a
 `WriteTicket` — the substrate writer's enqueue counter (`persistence/writer.rs` queues
 jobs FIFO) — and waits until every job at or below it is in the log, which taps its
 records. Every own event still unsent then goes on the request's socket, and one that
@@ -2206,7 +2220,9 @@ rejoin. The invariant rests on one number, and on one Paxos decision per rejoin.
    decision or applies a detached event, so the group's later events carry *k* or more.
 
 **A rejoin needs a quorum.** A member that rejoins into a partition without a majority
-of `max_members` (§5.9) cannot take a generation. It stays as it was while cut off:
+of `max_members` (§5.9) cannot take a generation. In a group of two the voting
+gateway's promise is that other vote, so one member still rejoins while the other is
+down. Without a quorum it stays as it was while cut off:
 - it keeps serving its own listener locally, and writes more detached events;
 - it keeps applying what its catch-up brings, all of which ranks below its ⊤ events;
 - the gateways route nothing to it, and it sends nothing it wrote while cut off.
@@ -3211,14 +3227,27 @@ is its ingested units, which are substrate records and replicate. So a member sk
 unit another member has already ingested, with no ledger of its own: the replicated
 units are the ledger.
 
-Two members can still ingest the same unit before either sees the other's. Both units'
-conversations arrive everywhere. **The conversation whose first turn has the lower
-version stamp (§6.2) holds the unit**, the timeline breaking a tie, and the planner
-tombstones the other (`zend/src/branch_ingest/plan.rs`) — the same choice on every
-member in any arrival order, since the stamps and timelines are the records' own.
-Compaction then drops the tombstoned conversation's records, as it drops any record
-§6.5 makes dead. Unlike two turns at one index (§6.6), two ingests of one unit are the
-same content twice, so keeping one loses nothing.
+A unit nobody has finished is leased before it is read (`zend/src/ingest_lease.rs`),
+under the key `ingest/<content key>`. The member the vote names reads it. Every other
+member that found the same unit leaves it and takes the next unread one, and the
+conversation arrives with replication. Each lease is only that one file or folder, so
+the members that are up read different units at the same time: a startup splits the
+unread backlog across them, and each unit is still read once.
+The holder renews the lease until the reading finishes or is abandoned, then hands
+it back with how far its own writes reach. The next member to take the unit waits
+for those writes and reads it only when the content key is still absent — a holder
+that died mid-reading leaves the unit for someone else, and a holder that finished
+leaves nothing to read. A member that is not joined cannot propose, so it reads the
+unit itself.
+
+Two members can still both finish a reading: one was not joined, or both passed the
+grant. Both units' conversations arrive everywhere. **The conversation whose first
+turn has the lower version stamp (§6.2) holds the unit**, the timeline breaking a
+tie, and the planner tombstones the other (`zend/src/branch_ingest/plan.rs`) — the
+same choice on every member in any arrival order, since the stamps and timelines
+are the records' own. Compaction then drops the tombstoned conversation's records,
+as it drops any record §6.5 makes dead. Unlike two turns at one index (§6.6), two
+ingests of one unit are the same content twice, so keeping one loses nothing.
 
 npcd's mind ingest is done only by the authority of the world that reads the mind, by
 the same rule.
@@ -3889,7 +3918,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | gateway peering (`cluster/src/peer/`, `cluster/src/frame/tests.rs`, `web/src/acme/{ledger,certs}.rs`, `web/src/acme/peers/inventory.rs`, `web/src/cluster/peers.rs`, `web/src/config.rs`, `web/tests/peering.rs`) | every peer frame encodes to exact bytes; two gateways link and carry frames; three in a mesh name the same orderer for every site, and a gateway alone orders everything; crossed dials keep the lower node's link on both ends, and it stays; a differing session key or OAuth client refuses the peering on both ends, each recording why, and a node other than the handshake's or the gateway's own is refused; a closed link is redialled; ledgers merge to the union in either order, and a save keeps what a peer merged meanwhile; a peer is sent the certificates it lacks or holds older, and the later `not_after` wins; the node id is minted once and kept; peers need the TLS entrance. Against a local stand-in for the CA, at the `Ca` trait — it publishes through the gateways' own path and asks every gateway it could reach for each answer: three linked gateways name one orderer and only it may order, its challenges are answered on all three before the CA validates, and its certificate is installed on all three with every challenge withdrawn; a peer's `ACME_ORDERING` holds the site until `ACME_DONE`; two gateways partitioned each order, and once linked both serve the later certificate; over a link that is not verified TLS the challenges cross but no certificate key and no account do; the account is given to a peer that has none, and the ledgers merge on connect and on change |
 | commands | each command of §12.4 runs on an in-process member and its effect is asserted; `drain` hands back every claim and lease and the gateway routes nothing new; `restart` waits for in-flight work and the outbox, then builds a relaunch with the original arguments, one-shot flags dropped (the process spawn is asserted on, not run); `compact` is refused in fault mode and when free space is below the live size; a destructive command without the matching `confirm` is refused; a second command while one runs is refused; every command lands in the coordination log; `drain-gateway` closes members with `1001` and they carry on through their other cluster; a delivered Ctrl-C on a joined member drains, waits for the outbox, flushes, closes `1001` and then runs the tenant shutdown, with another member taking its world at once rather than after a term; a second Ctrl-C mid-drain exits at once; without `--cluster`, Ctrl-C is unchanged |
 | fault mode | a simulated `ENOSPC` on append, and free space under the floor, each enter fault mode; the member stays connected and keeps sending `COORD`; it releases every claim and world lease, stops its characters, and proposes nothing; **with the volume completely full it still promises and accepts, durably, through the vote journal, and counts toward the quorum**; it keeps sending its unsent events and answering `FETCH`es; the gateway routes no request to it and relays no live events to it, but relays Paxos frames to it; only `Drop` maintenance runs; leaving needs twice the floor and a test append, then catches up before taking work; free space hovering at the floor does not flap the mode; the status page and the log show both transitions |
-| quorum | `cluster/max_members` rises when more members are seen together, never falls by itself; a *set* lowers it, and raises after the set raise it again, in any arrival order; `--cluster-quorum-max` and the admin call write a set; the quorum is `⌊max_members / 2⌋ + 1`; a freshly restarted member alone reads its quorum from its substrate |
+| quorum | `cluster/max_members` rises when more members are seen together, never falls by itself; a *set* lowers it, and raises after the set raise it again, in any arrival order; `--cluster-quorum-max` and the admin call write a set; the quorum is `⌊max_members / 2⌋ + 1`; a freshly restarted member alone reads its quorum from its substrate; in a group of two, one member plus the voting gateway's tie-break promise and acceptance decides, and the same vote does not complete a larger quorum |
 | NPC lease | the authority lends and renews `world/<wid>/npclease/<nid>`, spread by weighted rendezvous across members from the first lending; a membership change moves a character only at its turn boundary, after its holder hands it back; a holder that drops out keeps its characters, which are never lent again until it rejoins; the admin release stamps above the holder |
 | world state | only the authority writes `world/<wid>/…` records, at most once per entity per beat; a ceased entity is tombstoned; `PULSE` is never persisted, never retransmitted, and dropped under pressure; a replica that loses every pulse still ends on the same state records |
 | disconnected mode | a cut-off member's characters keep acting on each other in a local world; no world-state record is written while cut off; the characters' turns are written as detached events; on reconnect the local world is scrapped and reloaded from state records; an operation finished in the local world publishes through the member's in-process agent, and without one waits 30 minutes and tries again; a publish landed while disconnected is kept on reconnect, and the authoritative world's copy of the operation carries on |
@@ -4418,15 +4447,13 @@ same configured upstreams as before.
 9. **Characters whose holder never returns stay absent** until an admin releases their
    NPC leases (§9.3). Nothing frees them automatically, by design. Whether the status
    page should flag them with their holder's last-seen time is open.
-10. **Two members have no majority to spare** (§5.9). With `max_members = 2`, the quorum is
-   two, so either member going away stops every consensus round:
-   - npcd: worlds keep their authority until its term runs out, then run in
-     disconnected mode on each side;
-   - zend and npcd: a member coming back from being cut off cannot take its generation
-     (§6.7), so it stays cut off, serving locally, until the other returns;
-   - upgrades and forced rollouts wait, since they take a lease or a decision.
-
-   The choices are:
+10. **The tie-break voter can itself be absent** (§5.9). A group of two decides with
+   one member plus the voting gateway, so one member down no longer stops zend or npcd.
+   What still stops a round is the voting gateway being down, or not yet eligible
+   because a configured peer has never sent its node id since this gateway started.
+   Until then the quorum is two members again. A larger group never counts the gateway.
+   The remaining choices, if the estate wants a quorum that does not depend on a
+   gateway, are unchanged:
    - run three members of the app; the third can be a small machine that only votes;
    - lower the quorum knowingly with `--cluster-quorum-max 1`, and accept that a
      partition of two can then elect a world on both sides, and two members can mint
@@ -4434,8 +4461,7 @@ same configured upstreams as before.
      everywhere, by the rest of the stamp, so nothing diverges. The invariant of §6.7
      then holds only within each side.
 
-   Which the estate runs is a deployment decision. The number of gateways does not
-   enter into it.
+   Which the estate runs beyond the tie-break is a deployment decision.
 11. **A cut-off character remembers a world the cluster forgot.** Its turns persist, but
    the world it lived them in is scrapped (§9.4). A character can recall walking to the
    lift and find itself back in the command room. Whether the character should be told,
