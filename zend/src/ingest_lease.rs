@@ -3,9 +3,11 @@
 //! Branch ingest already skips a unit whose conversation has replicated
 //! (`docs/replicated_substrate.md` §10.4). That misses the startup window,
 //! where every member plans the same unread tree before any of them has
-//! written a content key. Each unit is leased under `ingest/<content key>`
-//! before its conversation is minted. The member that holds the lease reads
-//! it; the others leave it, and the conversation arrives with replication.
+//! written a content key. Each file and each folder is leased under
+//! `ingest/<content key>` before its conversation is minted. The member that
+//! holds the lease reads it; the others leave that unit and take the next, so
+//! the machines that are up read different units at the same time. The
+//! conversation arrives with replication.
 //!
 //! A member that cannot propose — it is not joined — reads the unit itself.
 //! Two such members can still both read it, and the lower version stamp

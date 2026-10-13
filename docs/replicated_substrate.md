@@ -3225,8 +3225,10 @@ units are the ledger.
 
 A unit nobody has finished is leased before it is read (`zend/src/ingest_lease.rs`),
 under the key `ingest/<content key>`. The member the vote names reads it. Every other
-member that found the same unit leaves it, and the conversation arrives with
-replication, so the reading is done once however many members planned it together.
+member that found the same unit leaves it and takes the next unread one, and the
+conversation arrives with replication. Each lease is only that one file or folder, so
+the members that are up read different units at the same time: a startup splits the
+unread backlog across them, and each unit is still read once.
 The holder renews the lease until the reading finishes or is abandoned, then hands
 it back with how far its own writes reach. The next member to take the unit waits
 for those writes and reads it only when the content key is still absent — a holder
