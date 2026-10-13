@@ -180,18 +180,14 @@
 
   <div id="toasts"></div>
 
-  <!-- Skip the startup overlay when the daemon is already up.
-       #boot is shown from first paint so a genuine cold start — weights onto the
-       card, redo log replayed — has something to look at. But that meant a plain
-       refresh on a *running* daemon still showed the "starting…" card for as long
-       as app.js and its whole module graph took to load and run: the loader
-       flashing on a page that was never starting, which is exactly what reads as
-       "why is it starting up, it's already loaded". This runs BEFORE that graph —
-       it asks /v1/status once and, if the daemon is ready, drops the overlay in a
-       millisecond, so a refresh lands straight in the shell. Not ready, or no
-       answer, leaves the overlay exactly as it was for app.js to drive. -->
+  <!-- The card is hidden until a status says npcd is loading. This runs before
+       the module graph and asks /v1/status once: ready, and the shell comes up
+       without the card; actually loading, and the card is shown for app.js to
+       drive. No answer leaves the card hidden — a discarded tab's first fetch
+       fails when the browser wakes, and that is not a cold start. -->
   <script>
     (function () {
+      var lineOf = function (s) { return (s && s.tenants && s.tenants.npcd) || {}; };
       try {
         fetch('/v1/status', { credentials: 'same-origin' })
           .then(function (r) { return r && r.ok ? r.json() : null; })
@@ -202,10 +198,18 @@
             });
           })
           .then(function (s) {
-            if (s && s.state === 'ready') {
-              var b = document.getElementById('boot');
-              if (b) b.remove();
+            if (!s) return;
+            var boot = document.getElementById('boot');
+            var line = lineOf(s);
+            if (line.state === 'ready') {
+              if (boot) boot.remove();
+              var shell = document.getElementById('shell');
+              if (shell) shell.hidden = false;
+              return;
             }
+            // A real load carries the process start. An unanswered gateway
+            // invents a loading line with no start, and that stays hidden.
+            if (boot && s.started_at_ms && line.state) boot.classList.add('boot-show');
           })
           .catch(function () {});
       } catch (_) {}

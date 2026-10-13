@@ -837,6 +837,12 @@ canvas { width: 100%; display: block; }
    A restart takes tens of seconds — weights onto the card, a redo log replayed,
    the mind's layers diffed. The phase list is what turns "npcd is hanging" into
    "npcd is on Replaying substrate, 40 000 of 250 000 turns". */
+/* Off the first paint. A refresh of a daemon that is already up, or a tab the
+   browser discarded and rebuilt on the way back, otherwise sits on
+   "starting…" for as long as /v1/status takes to answer. Shown only once a
+   status says npcd is actually loading. */
+#boot { visibility: hidden; }
+#boot.boot-show { visibility: visible; }
 .boot-card { display: grid; gap: 10px; justify-items: center; min-width: 260px; }
 .boot-title { font-weight: 700; letter-spacing: .01em; }
 .boot-bar {
