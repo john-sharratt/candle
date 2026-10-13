@@ -329,6 +329,7 @@
  * than a re-indent of two thousand lines.
  * ========================================================================== */
 import { estateSwitcher } from './common/lib/estate.js';
+import { decideStatus } from './status-poll.js';
 
 (function () {
   'use strict';
@@ -3801,8 +3802,16 @@ import { estateSwitcher } from './common/lib/estate.js';
   // Boot/reload state. `reloadPolling` is true while pollStatus owns the screen
   // (initial load OR a detected daemon reload), so periodicSync stays out of the
   // way. `lastStartedAt` tracks the daemon's start stamp to detect restarts.
+  // `resumeDirty` is set when a real answer said zend was not ready, so coming
+  // back reloads the conversations even if the process start did not change.
+  // A fetch that merely failed does not: the chat is still the one on screen.
   let lastStartedAt = null;
   let reloadPolling = false;
+  let resumeDirty = false;
+  let statusMisses = 0;
+  let statusGen = 0;
+  let statusAbort = null;
+  let syncTimer = null;
   // The sidebar's own refresh floor: `refreshConversationList` stays on a
   // 5s cadence even when the status poll itself speeds up for the ingest
   // bar below — the conversation list hasn't started changing any faster
@@ -3814,28 +3823,61 @@ import { estateSwitcher } from './common/lib/estate.js';
   // five-second steps — the cadence `pollStatus` already uses on this same
   // endpoint during boot.
   const SYNC_IDLE_MS = 5000, SYNC_BUSY_MS = 1000;
+  const isAbort = (e) => !!(e && e.name === 'AbortError');
+  // One status fetch at a time. Hiding the page aborts the one in flight:
+  // the browser would fail it on the way back, and that failure is not zend
+  // going away.
+  function trackStatus() {
+    if (statusAbort) statusAbort.abort();
+    statusAbort = new AbortController();
+    return statusAbort.signal;
+  }
 
   // `prefetchedList`: see `initConversations`. Only the first poll has one — a
   // list fetched while the daemon was still loading would be empty.
   function pollStatus(prefetchedList) {
-    Promise.resolve(API.getStatus()).then((st) => {
+    if (document.hidden) return;
+    const gen = ++statusGen;
+    const signal = trackStatus();
+    Promise.resolve(API.getStatus(signal)).then((st) => {
+      if (gen !== statusGen) return;
       checkBuild(st);   // capture the build id on first sighting
       if (zendLine(st).state === 'ready') {
-        reloadPolling = false;
+        statusMisses = 0;
+        const first = lastStartedAt == null;
+        const restarted = !first && st.started_at_ms && st.started_at_ms !== lastStartedAt;
         if (st.started_at_ms != null) lastStartedAt = st.started_at_ms;
+        reloadPolling = false;
         S.boot = null;
         // A backlog is most likely right after startup: take it from the
         // poll that unlocked the chat, so the bar is there on the first real
         // paint instead of up to a cadence later.
         S.ingestBacklog = zendLine(st).ingest_backlog || null;
-        initConversations(prefetchedList);
-        loadToolSchemas();
-      } else {
-        S.boot = st || S.boot || LOADING_BOOT('Loading model');
+        // The chat is already on screen and this is the same process: put it
+        // back. Re-fetching every conversation here is the freeze after a
+        // status blip.
+        if (first || restarted || resumeDirty) {
+          if (!first) S.loaded = {};
+          resumeDirty = false;
+          initConversations(prefetchedList);
+          loadToolSchemas();
+        } else {
+          render();
+        }
+      } else if (st && st.started_at_ms) {
+        resumeDirty = true;
+        S.boot = st;
         render();
         setTimeout(pollStatus, 1000);
+      } else {
+        setTimeout(pollStatus, 1000);
       }
-    }).catch(() => { S.boot = S.boot || LOADING_BOOT('Reconnecting'); render(); setTimeout(pollStatus, 1000); });
+    }).catch((e) => {
+      if (gen !== statusGen || isAbort(e)) return;
+      // The splash, or the load card already showing, stays up. A missed
+      // fetch does not replace it with "Reconnecting".
+      setTimeout(pollStatus, 1000);
+    });
   }
 
   // Server-authoritative sidebar sync (live only): pick up the titler's label,
@@ -3876,16 +3918,37 @@ import { estateSwitcher } from './common/lib/estate.js';
   }
 
   // Continuous status poll after ready: detect daemon restarts / model reloads
-  // and keep the sidebar in sync.
+  // and keep the sidebar in sync. A poll that does not get an answer is not
+  // a reload — see `decideStatus`.
   function periodicSync() {
-    if (reloadPolling) return;   // a reload poll already owns the loading screen
-    return Promise.resolve(API.getStatus()).then((st) => {
+    if (reloadPolling || document.hidden) return;
+    const gen = ++statusGen;
+    const signal = trackStatus();
+    return Promise.resolve(API.getStatus(signal)).then((st) => {
+      if (gen !== statusGen || document.hidden) return;
       if (checkBuild(st)) return;   // build changed -> reloading
-      if (zendLine(st).state !== 'ready') {
+      const decision = decideStatus({
+        hidden: false,
+        aborted: false,
+        misses: statusMisses,
+        zendState: zendLine(st).state || '',
+        startedAt: Number(st.started_at_ms) || 0,
+        lastStartedAt,
+      });
+      if (decision === 'miss') { statusMisses++; return; }
+      if (decision === 'reconnect') {
+        statusMisses = 0;
+        reloadPolling = true;
+        S.boot = LOADING_BOOT('Reconnecting');
+        render();
+        pollStatus();
+        return;
+      }
+      if (decision === 'reload') {
         // Daemon is mid-reload (restart / model reload). Drop back to the
-        // loading overlay and hand off to pollStatus until it's ready again,
-        // then re-init — previously this just returned and left the stale UI up
-        // until the user pressed F5.
+        // loading overlay and hand off to pollStatus until it's ready again.
+        statusMisses = 0;
+        resumeDirty = true;
         reloadPolling = true;
         S.boot = st || LOADING_BOOT('Reloading model');
         S.loaded = {};
@@ -3893,6 +3956,15 @@ import { estateSwitcher } from './common/lib/estate.js';
         pollStatus();
         return;
       }
+      if (decision === 'restart') {
+        statusMisses = 0;
+        lastStartedAt = st.started_at_ms;
+        S.loaded = {};
+        initConversations();   // daemon restarted — reload from scratch
+        return;
+      }
+      statusMisses = 0;
+      if (st.started_at_ms != null) lastStartedAt = st.started_at_ms;
       // Segmented redo-log maintenance indicator (sidebar footer).
       const m = zendLine(st).maintenance || null;
       const prevM = JSON.stringify(S.maintenance || null);
@@ -3904,25 +3976,26 @@ import { estateSwitcher } from './common/lib/estate.js';
       const hadBacklog = !!S.ingestBacklog;
       S.ingestBacklog = zendLine(st).ingest_backlog || null;
       const backlogToggled = hadBacklog !== !!S.ingestBacklog;
-      if (lastStartedAt !== null && st.started_at_ms && st.started_at_ms !== lastStartedAt) {
-        lastStartedAt = st.started_at_ms;
-        S.loaded = {};
-        initConversations();   // daemon restarted — reload from scratch
-      } else {
-        if (st.started_at_ms) lastStartedAt = st.started_at_ms;
-        // The sidebar keeps its own 5s cadence even when the status poll runs
-        // at 1s for the backlog bar: it is a second endpoint per tick, and
-        // the conversation list has not started changing any faster.
-        if (Date.now() - lastListSync >= SYNC_IDLE_MS) { lastListSync = Date.now(); refreshConversationList(); }
-        if (backlogToggled || JSON.stringify(m) !== prevM) render();
-        else if (S.ingestBacklog) patchIngestBar();
-      }
-    }).catch(() => {
-      // Unreachable — daemon almost certainly restarting. Show the loading
-      // overlay and poll until it returns.
+      // The sidebar keeps its own 5s cadence even when the status poll runs
+      // at 1s for the backlog bar: it is a second endpoint per tick, and
+      // the conversation list has not started changing any faster.
+      if (Date.now() - lastListSync >= SYNC_IDLE_MS) { lastListSync = Date.now(); refreshConversationList(); }
+      if (backlogToggled || JSON.stringify(m) !== prevM) render();
+      else if (S.ingestBacklog) patchIngestBar();
+    }).catch((e) => {
+      if (gen !== statusGen || document.hidden || isAbort(e)) return;
+      const decision = decideStatus({
+        hidden: false,
+        aborted: false,
+        misses: statusMisses,
+        zendState: '',
+        startedAt: 0,
+        lastStartedAt,
+      });
+      if (decision === 'miss') { statusMisses++; return; }
+      statusMisses = 0;
       reloadPolling = true;
       S.boot = LOADING_BOOT('Reconnecting');
-      S.loaded = {};
       render();
       pollStatus();
     });
@@ -3946,10 +4019,32 @@ import { estateSwitcher } from './common/lib/estate.js';
   // exists. Forcing the first tick to the busy cadence costs one redundant
   // early poll at rest, and correctly picks up a real backlog within 1s
   // instead of stalling on it for up to `SYNC_IDLE_MS`.
+  // While the page is hidden the chain stops. A background tab's timers are
+  // held for seconds to minutes and its fetches fail on the way back; polling
+  // through that is what painted the loading card over a live chat.
   function scheduleSync(delay) {
+    clearTimeout(syncTimer);
+    if (document.hidden) return;
     const wait = delay != null ? delay : (S.ingestBacklog ? SYNC_BUSY_MS : SYNC_IDLE_MS);
-    setTimeout(() => { Promise.resolve(periodicSync()).then(scheduleSync, scheduleSync); }, wait);
+    syncTimer = setTimeout(() => { Promise.resolve(periodicSync()).then(scheduleSync, scheduleSync); }, wait);
   }
+  function onPageHidden() {
+    clearTimeout(syncTimer);
+    statusGen++;
+    if (statusAbort) statusAbort.abort();
+  }
+  function onPageShown() {
+    statusMisses = 0;
+    if (reloadPolling) pollStatus();
+    scheduleSync(0);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) onPageHidden();
+    else onPageShown();
+  });
+  // `pageshow` also fires on the first load. Only a back-forward cache
+  // restore is a return to a page whose timers were discarded.
+  window.addEventListener('pageshow', (ev) => { if (ev.persisted && !document.hidden) onPageShown(); });
   scheduleSync(SYNC_BUSY_MS);
 })();
 </script>
