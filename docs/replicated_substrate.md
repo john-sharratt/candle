@@ -1892,7 +1892,11 @@ clusters and reach a receiver out of order. They are applied in the order they a
 ### 6.4 Events before the response
 
 A request's response ends only after the events it caused are on the socket ahead of
-it (`host/src/cluster/flush.rs`). When the handler's body is done, the member takes a
+it (`host/src/cluster/flush.rs`). A `GET` or a `HEAD` writes nothing, so its response
+ends with its body: waiting out the writer's queue for one held every console status
+poll behind the cast's seals until the gateway's 3 s deadline, and the page read that
+deadline as the daemon going away. When the handler's body is done, a request that
+can append takes a
 `WriteTicket` — the substrate writer's enqueue counter (`persistence/writer.rs` queues
 jobs FIFO) — and waits until every job at or below it is in the log, which taps its
 records. Every own event still unsent then goes on the request's socket, and one that
