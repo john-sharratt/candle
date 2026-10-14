@@ -4830,7 +4830,7 @@ impl Conversation {
         //    background thread's — can arrive mid-op. It plans nothing and
         //    leaves the status alone: the op in flight owns `running`.
         let t_plan = Instant::now();
-        let plan = {
+        let (plan, dir) = {
             let mut p = self.persistence.lock_behind_waiters().unwrap();
             if p.relocation_in_flight() {
                 tracing::debug!(
@@ -4849,7 +4849,7 @@ impl Conversation {
             if plan.is_some() {
                 p.watch_relocation();
             }
-            plan
+            (plan, p.dir().to_path_buf())
         };
         let plan_ms = t_plan.elapsed().as_millis() as u64;
         let outcome = if let Some(plan) = plan {
@@ -4927,8 +4927,12 @@ impl Conversation {
                 // holds the substrate write lock; the finish holds the persistence
                 // lock across the unlinks. Any of them stalls a seal behind it, and
                 // `longest_hold_ms` covers only the relocation batches.
-                tracing::debug!(
+                // At `info`, once per op beside the plan's own line: an op that
+                // stalls the tenants behind it is named by its slow phase here,
+                // and a process hosting several substrates says whose it was.
+                tracing::info!(
                     target: "candle_conversation::persistence::maintenance",
+                    dir = %dir.display(),
                     plan_ms,
                     exec_ms,
                     held_ms = held.as_millis() as u64,
