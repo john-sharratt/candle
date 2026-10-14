@@ -37,6 +37,9 @@
     if (!r.ok && r.status !== 204) throw new Error('POST ' + path + ' -> ' + r.status);
   }
   const enc = (id) => encodeURIComponent(id);
+  // How long one `/v1/status` poll may wait for an answer (see `getStatus`).
+  // A live daemon answers it without the engine lock, in milliseconds.
+  const STATUS_TIMEOUT_MS = 8000;
 
   // The aggregate module is the same for the life of the page. Importing it
   // on every status poll is another request, and a tab waking up already has
@@ -112,11 +115,29 @@
     // (`common/lib/aggregate.js`). A failed fetch rejects. So does a gateway
     // envelope nobody answered: that used to come back as a synthetic
     // "connecting" line, and the page treated it as zend reloading.
+    //
+    // So does a fetch still unanswered after `STATUS_TIMEOUT_MS`. A gateway
+    // whose route drops packets never refuses the connection, and the
+    // browser's own limit is minutes — every poll waits on the one before
+    // it, so without this the page sits on whatever it last drew. The
+    // caller's `signal` (the page being hidden) still rejects as an
+    // `AbortError`; the timeout rejects as an ordinary error, a miss.
     getStatus(signal) {
-      const opts = { headers: { accept: 'application/json' } };
-      if (signal) opts.signal = signal;
-      return Promise.all([
-        fetch('/v1/status', opts).then((r) => {
+      const ctl = new AbortController();
+      const forward = () => ctl.abort();
+      if (signal) {
+        if (signal.aborted) ctl.abort();
+        else signal.addEventListener('abort', forward, { once: true });
+      }
+      let timer = null;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error('/v1/status did not answer within ' + (STATUS_TIMEOUT_MS / 1000) + 's.'));
+          ctl.abort();
+        }, STATUS_TIMEOUT_MS);
+      });
+      const answer = Promise.all([
+        fetch('/v1/status', { headers: { accept: 'application/json' }, signal: ctl.signal }).then((r) => {
           if (!r.ok) throw new Error('GET /v1/status -> ' + r.status);
           return r.json();
         }),
@@ -124,9 +145,13 @@
       ]).then(([body, aggregate]) => {
         const st = aggregate.memberStatus(body, 'zend');
         if (aggregate.isEnvelope(body) && !(st && st.started_at_ms)) {
-          throw new Error('no member answered /v1/status');
+          throw new Error('No zend daemon answered behind the gateway.');
         }
         return st;
+      });
+      return Promise.race([answer, timeout]).finally(() => {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', forward);
       });
     },
 

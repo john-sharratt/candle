@@ -4,13 +4,18 @@
 
 use boa_engine::builtins::promise::PromiseState;
 use boa_engine::module::Module;
-use boa_engine::{Context, JsString, JsValue, Source};
+use boa_engine::{Context, JsString, JsValue, Script, Source};
 use serde_json::{json, Value};
 
 const POLL: &str = include_str!("../../zend/web/status-poll.js");
 const PAGE: &str = include_str!("../../zend/web/index.html");
+const LIVE: &str = include_str!("../../zend/web/zend-api.live.js");
 
 fn call(args: Value) -> Value {
+    call_export("decideStatus", &[args])
+}
+
+fn call_export(name: &str, args: &[Value]) -> Value {
     let mut ctx = Context::default();
     let module = Module::parse(Source::from_bytes(POLL), None, &mut ctx).unwrap();
     let evaluated = module.load_link_evaluate(&mut ctx);
@@ -21,12 +26,29 @@ fn call(args: Value) -> Value {
     );
     let export = module
         .namespace(&mut ctx)
-        .get(JsString::from("decideStatus"), &mut ctx)
+        .get(JsString::from(name), &mut ctx)
         .unwrap();
-    let f = export.as_callable().expect("decideStatus");
-    let arg = JsValue::from_json(&args, &mut ctx).unwrap();
-    let out = f.call(&JsValue::undefined(), &[arg], &mut ctx).unwrap();
+    let f = export.as_callable().expect(name);
+    let args: Vec<JsValue> = args
+        .iter()
+        .map(|a| JsValue::from_json(a, &mut ctx).unwrap())
+        .collect();
+    let out = f.call(&JsValue::undefined(), &args, &mut ctx).unwrap();
     out.to_json(&mut ctx).unwrap().unwrap_or(Value::Null)
+}
+
+/// `(unreachable, delay ms)`. A JS number has no integer kind, so the delay
+/// is read as the number it is.
+fn boot_retry(failures: u32) -> (bool, f64) {
+    let out = call_export("bootRetry", &[json!(failures)]);
+    (
+        out["unreachable"].as_bool().expect("unreachable"),
+        out["delay"].as_f64().expect("delay"),
+    )
+}
+
+fn reason(name: Value, message: Value) -> Value {
+    call_export("unreachableReason", &[name, message])
 }
 
 fn poll(extra: Value) -> Value {
@@ -101,6 +123,48 @@ fn a_real_answer_reloads_restarts_or_stays() {
     );
 }
 
+/// A gateway that is down never answers the boot poll. The first two misses
+/// keep the splash; the third says the server cannot be reached. The retry
+/// doubles from a second and stops at ten, however long the tab sits there.
+#[test]
+fn an_unanswered_boot_poll_says_so_and_backs_off() {
+    assert_eq!(boot_retry(1), (false, 1000.0));
+    assert_eq!(boot_retry(2), (false, 2000.0));
+    assert_eq!(boot_retry(3), (true, 4000.0));
+    assert_eq!(boot_retry(4), (true, 8000.0));
+    assert_eq!(boot_retry(5), (true, 10000.0));
+    assert_eq!(boot_retry(10_000), (true, 10000.0));
+    // A count that never went up is still one attempt, not zero.
+    assert_eq!(boot_retry(0), (false, 1000.0));
+}
+
+/// The card names what failed in words a reader can use: the browser's own
+/// network-error text is replaced, a gateway status is named, and the
+/// adapter's own messages (a timeout, no daemon behind the gateway) pass
+/// through.
+#[test]
+fn the_unreachable_reason_is_readable() {
+    assert_eq!(
+        reason(json!("TypeError"), json!("Failed to fetch")),
+        json!("The server could not be reached.")
+    );
+    assert_eq!(
+        reason(json!("Error"), json!("GET /v1/status -> 502")),
+        json!("The gateway answered 502.")
+    );
+    assert_eq!(
+        reason(
+            json!("Error"),
+            json!("/v1/status did not answer within 8s.")
+        ),
+        json!("/v1/status did not answer within 8s.")
+    );
+    assert_eq!(
+        reason(Value::Null, Value::Null),
+        json!("The server did not answer.")
+    );
+}
+
 /// The console module still parses. A syntax slip there is a blank page.
 #[test]
 fn the_console_module_parses() {
@@ -110,5 +174,15 @@ fn the_console_module_parses() {
     let mut ctx = Context::default();
     if let Err(e) = Module::parse(Source::from_bytes(&PAGE[open..close]), None, &mut ctx) {
         panic!("the console module does not parse: {e}");
+    }
+}
+
+/// The live adapter still parses. It is a classic script loaded before the
+/// console module, which reads `window.ZendAPI` from it on its first line.
+#[test]
+fn the_live_adapter_parses() {
+    let mut ctx = Context::default();
+    if let Err(e) = Script::parse(Source::from_bytes(LIVE), None, &mut ctx) {
+        panic!("zend-api.live.js does not parse: {e}");
     }
 }

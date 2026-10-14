@@ -329,7 +329,7 @@
  * than a re-indent of two thousand lines.
  * ========================================================================== */
 import { estateSwitcher } from './common/lib/estate.js';
-import { decideStatus } from './status-poll.js';
+import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
 
 (function () {
   'use strict';
@@ -520,6 +520,10 @@ import { decideStatus } from './status-poll.js';
     // `connecting` until the daemon first answers (a quiet splash); the startup
     // card only when it reports that it is actually loading.
     boot: { state: 'connecting' },
+    // Set while the boot poll has gone unanswered long enough to say so
+    // (`unanswered`): `{ reason, since }`. Drawn over the splash or the load
+    // card; cleared by the first answer.
+    unreachable: null,
   };
 
   let chatEl = null, logEl = null, promptEl = null, filesListEl = null, substrateEl = null;
@@ -1810,6 +1814,12 @@ import { decideStatus } from './status-poll.js';
     // A re-render rebuilds the dots, so drop any open hover popover — it would
     // otherwise dangle, anchored to a destroyed dot.
     hideProjPopover();
+    if (S.unreachable) {
+      promptEl = chatEl = logEl = filesListEl = null;
+      root.innerHTML = '';
+      root.appendChild(buildUnreachable());
+      return;
+    }
     // Startup: while the daemon loads the model / builds the substrate, show the
     // loading overlay — plus Logs + Perf so the build can be watched in realtime.
     if (S.boot && S.boot.state === 'connecting') {
@@ -3597,6 +3607,31 @@ import { decideStatus } from './status-poll.js';
       h('div', { class: 'z-splash-mark', html: starLogo(40, '#26231f', 8) }),
       h('div', {}, 'Getting ready…'));
   }
+  // The boot poll has gone unanswered (`unanswered`): the gateway is down, or
+  // the route to it is. The poll keeps retrying behind this card, and the
+  // first answer takes it down; "Try now" is that retry without the wait.
+  function buildUnreachable() {
+    const u = S.unreachable;
+    const card = h('div', { class: 'z-load-card', role: 'alert' },
+      h('div', { class: 'z-load-eyebrow' }, 'Can’t reach Zend'),
+      h('div', { class: 'z-load-row' },
+        spinner(),
+        h('span', { class: 'z-load-cur' }, 'Trying again…')),
+      h('div', { class: 'z-load-detail', 'data-unreachable': '' }, unreachableDetail(u)),
+      h('button', { onClick: () => pollStatus(), style: 'margin-top:1.1rem; height:32px; padding:0 0.9rem; border-radius:8px; border:none; background:' + ACCENT + '; color:#fff; font:inherit; font-size:0.8rem; font-weight:600; cursor:pointer;' }, 'Try now'));
+    return h('div', { style: 'position:fixed; inset:0; background:#1c1917; display:flex; align-items:center; justify-content:center; z-index:500;' }, card);
+  }
+  function unreachableDetail(u) {
+    const mins = Math.floor((Date.now() - u.since) / 60000);
+    return u.reason + (mins >= 1 ? ' Unanswered for ' + mins + ' min.' : '');
+  }
+  // A further miss updates the line in place: a full redraw would restart the
+  // card under a pointer that is on its way to the button.
+  function patchUnreachable() {
+    const el = document.querySelector('[data-unreachable]');
+    if (el) el.textContent = unreachableDetail(S.unreachable);
+    else render();
+  }
   function buildLoadingScreen(boot) {
     const ld = zendLine(boot).loading || { label: 'Loading model', progress: 0, completed: [] };
     const pct = Math.round((ld.progress || 0) * 100);
@@ -3812,6 +3847,11 @@ import { decideStatus } from './status-poll.js';
   let statusGen = 0;
   let statusAbort = null;
   let syncTimer = null;
+  // The boot poll's own retry, and how many boot polls in a row went
+  // unanswered (`unanswered`). One timer, so "Try now" and a tab coming back
+  // replace the pending retry rather than adding a second chain.
+  let bootTimer = null;
+  let bootFailures = 0;
   // The sidebar's own refresh floor: `refreshConversationList` stays on a
   // 5s cadence even when the status poll itself speeds up for the ingest
   // bar below — the conversation list hasn't started changing any faster
@@ -3836,12 +3876,14 @@ import { decideStatus } from './status-poll.js';
   // `prefetchedList`: see `initConversations`. Only the first poll has one — a
   // list fetched while the daemon was still loading would be empty.
   function pollStatus(prefetchedList) {
+    clearTimeout(bootTimer);
     if (document.hidden) return;
     const gen = ++statusGen;
     const signal = trackStatus();
     Promise.resolve(API.getStatus(signal)).then((st) => {
       if (gen !== statusGen) return;
       checkBuild(st);   // capture the build id on first sighting
+      if (st && st.started_at_ms) answered();
       if (zendLine(st).state === 'ready') {
         statusMisses = 0;
         const first = lastStartedAt == null;
@@ -3868,16 +3910,37 @@ import { decideStatus } from './status-poll.js';
         resumeDirty = true;
         S.boot = st;
         render();
-        setTimeout(pollStatus, 1000);
+        bootTimer = setTimeout(pollStatus, 1000);
       } else {
-        setTimeout(pollStatus, 1000);
+        unanswered(null, null);
       }
     }).catch((e) => {
       if (gen !== statusGen || isAbort(e)) return;
-      // The splash, or the load card already showing, stays up. A missed
-      // fetch does not replace it with "Reconnecting".
-      setTimeout(pollStatus, 1000);
+      unanswered(e && e.name, e && e.message);
     });
+  }
+  // A boot poll nobody answered. The splash, or the load card already
+  // showing, stays up through the first few (`bootRetry`) — a missed fetch
+  // does not replace it with "Reconnecting". Past those, the page says it
+  // cannot reach the server instead of waiting on an answer that a gateway
+  // which is down will never send.
+  function unanswered(name, message) {
+    bootFailures++;
+    const next = bootRetry(bootFailures);
+    if (next.unreachable) {
+      const reason = unreachableReason(name, message);
+      const first = !S.unreachable;
+      S.unreachable = { reason, since: (S.unreachable && S.unreachable.since) || Date.now() };
+      if (first) render();
+      else patchUnreachable();
+    }
+    bootTimer = setTimeout(pollStatus, next.delay);
+  }
+  // A daemon answered: whatever the boot poll goes on to draw, it is not the
+  // unreachable card.
+  function answered() {
+    bootFailures = 0;
+    S.unreachable = null;
   }
 
   // Server-authoritative sidebar sync (live only): pick up the titler's label,
