@@ -95,7 +95,7 @@ Paths are relative to the repo root.
 |---|---|---|---|
 | .5 | web | `keep\stable\web.exe --config web/web.yaml` | 2026-10-14, keep restarts a proven trial from this path |
 | .5 | motherd | `keep\stable\motherd.exe --config motherd\motherd.yaml` | 2026-10-14, keep restarts a proven trial from this path — every setting is in `motherd/motherd.yaml` |
-| .5 | keep | `target\release\keep.exe keep/keep.yaml` | 2026-10-14. Supervisor `C:\Users\johna\AppData\Local\keep\supervise.ps1` (restart 10 s after exit). Registering scheduled task `\keep` was denied from a non-elevated session, so the supervisor runs in the interactive session. keep is not swapped by a rollout |
+| .5 | keep | `target\release\keep.exe keep/keep.yaml` | 2026-10-14. Supervisor `C:\Users\johna\AppData\Local\keep\supervise.ps1` (restart 10 s after exit), run by the scheduled task `\keep` at boot since 2026-10-15. keep is not swapped by a rollout |
 | .6 | npcd | `target\release\npcd.exe --host 0.0.0.0 --port 8081 --gateway 192.168.0.5 --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`). Rewritten 2026-10-10 for the host's flags (not yet run): `--bind` became `--host`/`--port`, `--content` is gone, and `--gateway 192.168.0.5` is new — without it every signed-in visitor is anonymous. Its store was written by the AntiLoop + StyleTune fine-tune; since 2026-10-11 the host prescribes Flash-Next, so that store is refused at open, before anything in it is rewritten, and npcd's first run on this build needs a new `--data` |
 
 Notes on the arguments:
@@ -211,9 +211,13 @@ is `keep/state/`.
 
 Its supervisor is `C:\Users\johna\AppData\Local\keep\supervise.ps1`, the same loop shape
 as cf-ddns: it starts `target\release\keep.exe keep/keep.yaml` and starts it again 10 s
-after any exit. Registering the scheduled task `\keep` was denied from a non-elevated
-session, so that supervisor runs in the interactive session. A rollout does not swap
-`keep`.
+after any exit. The scheduled task **`\keep`** runs that supervisor — boot trigger, S4U
+as `johna`, restart count 999, no time limit, normal priority (cf-ddns's below-normal
+priority class would be inherited by `motherd`). So a reboot brings `keep` back, and
+`keep` brings back `web` and `motherd`, with nobody logged on. Registering the task
+needs an elevated session. Log: `C:\Users\johna\AppData\Local\keep\keep.log`. Its
+processes run in the task's logon session, so their start time and path read empty from
+an interactive session; match them by name. A rollout does not swap `keep`.
 
 ### cf-ddns
 
@@ -246,7 +250,8 @@ a forced kill only if it does not exit in time. A forced kill of zend skips the 
 ## Self-healing
 
 None of these daemons runs under a service manager or a restart-on-exit wrapper — see
-"Services" above — with the exception of cf-ddns's and keep's scheduled-task supervisors. That
+"Services" above — with the exception of cf-ddns's and keep's scheduled-task supervisors (and
+`web` and `motherd`, which keep restarts). That
 was a real gap for zend: a device stuck in an out-of-memory retry storm (KV migration
 failing forever) served nothing for 40+ minutes before anyone noticed, because nothing was
 watching, and the old GPU-poison watchdog only exited cleanly "for a supervisor to relaunch"
