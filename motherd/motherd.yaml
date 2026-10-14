@@ -15,8 +15,9 @@
 # bare IP and code.tokera.com; npcd's console answers bot.tokera.com and
 # npcd.localhost.
 #
-# Both tenants join the gateway on this machine, through its TLS entrance —
-# verified as tokera.com, since the URL names an address — with the group key
+# Both tenants join the gateway through its TLS entrance at gateway.tokera.com —
+# a DNS-only name, not behind Cloudflare's proxy, which does not carry :9443 —
+# verified as tokera.com, the name on the gateway's certificate, with the group key
 # the gateway holds. While they are joined the gateway routes code.tokera.com
 # and bot.tokera.com to them; while they are not, each route falls back to its
 # configured upstream (§5.7). The agent file runs build, git and mind jobs in
@@ -25,7 +26,7 @@ host:
   host: 192.168.0.5
   port: 8081
   tls_port: 8444
-  clusters: ["https://192.168.0.5:9443"]
+  clusters: ["https://gateway.tokera.com:9443"]
   cluster_name: tokera.com
   group_key: web/secrets/group.key
   agent: motherd/agent.yaml

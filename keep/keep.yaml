@@ -8,7 +8,7 @@
 state: keep/state
 # Listed on the gateway's cluster page as the app keep. No routes, no rollout.
 cluster:
-  url: https://192.168.0.5:9443
+  url: https://gateway.tokera.com:9443
   name: tokera.com
   group_key: web/secrets/group.key
   host: blackworld

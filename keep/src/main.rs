@@ -523,7 +523,7 @@ mod tests {
     fn the_shipped_config_joins_the_cluster_as_keep() {
         let cfg: Config = serde_yaml::from_str(include_str!("../keep.yaml")).unwrap();
         let cluster = cfg.cluster.expect("keep.yaml names its gateway");
-        assert_eq!(cluster.url, "https://192.168.0.5:9443");
+        assert_eq!(cluster.url, "https://gateway.tokera.com:9443");
         assert_eq!(cluster.name, "tokera.com");
         assert_eq!(cluster.host, "blackworld");
         assert_eq!(cfg.services.len(), 2);

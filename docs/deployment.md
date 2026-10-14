@@ -146,7 +146,7 @@ Notes on the arguments:
 under its name, in the same shape as that daemon's own flags:
 
 - **`host:`** — `192.168.0.5`, ports `8081` and `8444` (zend's, unchanged), and the
-  cluster: `clusters: ["https://192.168.0.5:9443"]`, verified as `cluster_name:
+  cluster: `clusters: ["https://gateway.tokera.com:9443"]`, verified as `cluster_name:
   tokera.com`, with `group_key: web/secrets/group.key` and `agent: motherd/agent.yaml`.
 - **`zend:`** — `working_dir: ..`, so the workspace is `D:\prog` and the substrate
   `D:\prog\substrate`, the one zend ran on before (adopted as the group's first member,
@@ -177,8 +177,11 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
   `target\release\web.exe --new-group-key web/secrets/group.key` (it refuses to
   overwrite one). The gateway and every member on every machine hold the same file;
   it is a secret, gitignored with the rest of `web/secrets`, and never printed.
-- **Members join over the TLS entrance**, `https://192.168.0.5:9443`, checked against
-  the gateway's `tokera.com` certificate.
+- **Members join over the TLS entrance**, `https://gateway.tokera.com:9443`, checked
+  against the gateway's `tokera.com` certificate (`cluster_name: tokera.com`).
+  `gateway.tokera.com` is a DNS-only record (not proxied) for the public IP, with
+  9443 tcp + udp forwarded to `.5`; `tokera.com` itself is behind Cloudflare's proxy,
+  which does not carry :9443.
 - **The zend and npcd routes** carry `cluster: zend` and `cluster: npcd` and keep their
   `upstream:`. The gateway serves a name from the app's ready members while it has any,
   and from the upstream while it has none.

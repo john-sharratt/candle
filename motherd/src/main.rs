@@ -134,7 +134,7 @@ mod tests {
         let c = Config::load(&example).unwrap();
         assert_eq!(c.host.port, 8081);
         assert_eq!(c.host.tls_port, Some(8444));
-        assert_eq!(c.host.clusters, ["https://192.168.0.5:9443"]);
+        assert_eq!(c.host.clusters, ["https://gateway.tokera.com:9443"]);
         assert_eq!(c.host.cluster_name.as_deref(), Some("tokera.com"));
         assert!(c.host.group_key.is_some() && c.host.agent.is_some());
         assert_eq!(
