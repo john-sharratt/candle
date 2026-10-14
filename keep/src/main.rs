@@ -1,84 +1,86 @@
 //! `keep` — the failsafe for `web` and `motherd`.
 //!
-//! It reads, from its state directory, the executable path that last became
-//! ready. When that process is gone it starts that executable again. When a
-//! replacement was swapped in and does not become ready, it restores the
-//! previous executable (`cluster::upgrade::watchdog::recover`) and starts that.
-//! It does not certify, roll out, route chunks, or open a substrate, and it
-//! does not keep a copy of either binary.
+//! On startup it runs the executable at each service's stable path, with the
+//! arguments from its config. A switch is one request to `127.0.0.1:8092`
+//! whose body is the path of a new executable. That file is started with the
+//! same arguments. Its stderr must contain the line `INFO serving` within ten
+//! minutes, which those processes print only once they are serving. The file
+//! is then renamed onto the stable path, or copied there when a running
+//! executable cannot be renamed. No line, or the process dying, stops the
+//! trial and starts the stable file again.
+//!
+//! It does not certify, roll out, or choose a canary. It joins the gateway as
+//! the app `keep` so the cluster page lists it.
 
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::Duration;
 
-use cluster::launch::LaunchSpec;
-use cluster::upgrade::watchdog::{read_plan, recover, WatchPlan, PLAN, READY_WITHIN};
+use cluster::upgrade::switch::SWITCH_ADDR;
+use place::{pending_copy, record, same_file, How};
 use serde::Deserialize;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use trial::{spawn, switch_to, Ended, Running};
 
-use decide::{action, Action, Look};
-
-mod decide;
+mod place;
 mod presence;
+mod trial;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_shipped_config_joins_the_cluster_as_keep() {
-        let cfg: Config = serde_yaml::from_str(include_str!("../keep.yaml")).unwrap();
-        let cluster = cfg.cluster.expect("keep.yaml names its gateway");
-        assert_eq!(cluster.url, "https://192.168.0.5:9443");
-        assert_eq!(cluster.name, "tokera.com");
-        assert_eq!(cluster.host, "blackworld");
-    }
-}
-
-/// How long after a start `keep` waits before starting again, so one death
-/// does not become two processes.
-const START_GAP: Duration = Duration::from_secs(10);
+/// How long a trial may run before it is stopped and the stable file is
+/// started. Not a config value.
+const TRIAL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Deserialize)]
-struct Service {
+struct ServiceCfg {
     name: String,
-    /// The executable's file name, `web.exe` or `motherd.exe`.
-    exe: String,
-    host: String,
-    port: u16,
-    path: String,
-    /// Used when the running process's command line cannot be read.
+    stable: PathBuf,
     #[serde(default)]
     args: Vec<String>,
-    #[serde(default)]
-    cwd: Option<PathBuf>,
-    /// `<data>/upgrade`, when this service writes an upgrade plan. Absent for
-    /// `web`, which has no swap.
-    #[serde(default)]
-    upgrade_dir: Option<PathBuf>,
+    cwd: PathBuf,
 }
 
-/// The gateway this process lists itself on. Absent, it stays a local
-/// failsafe and the cluster page does not show it.
 #[derive(Debug, Deserialize)]
 struct Config {
     state: PathBuf,
-    poll_ms: u64,
-    services: Vec<Service>,
+    services: Vec<ServiceCfg>,
     #[serde(default)]
     cluster: Option<presence::ClusterJoin>,
 }
 
-/// The launch that last became ready. Paths only.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct Ready {
-    exe: PathBuf,
-    args: Vec<String>,
+struct Service {
+    name: String,
+    /// `web.exe`, taken from the stable path.
+    file: String,
+    stable: PathBuf,
+    args: Vec<std::ffi::OsString>,
     cwd: PathBuf,
+    place: PathBuf,
+}
+
+struct Slot {
+    file: String,
+    stable: PathBuf,
+    tx: Sender<Req>,
+}
+
+struct Req {
+    path: PathBuf,
+    reply: Sender<Answer>,
+}
+
+struct Answer {
+    status: u16,
+    reason: &'static str,
+    body: String,
+}
+
+enum Live {
+    Child(std::process::Child),
+    Adopted(u32),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -92,139 +94,253 @@ fn main() -> anyhow::Result<()> {
     if let Some(cluster) = cfg.cluster.clone() {
         presence::start(cluster, &cfg.state);
     }
-    let poll = Duration::from_millis(cfg.poll_ms);
-    let mut since_start: Vec<Option<Instant>> = vec![None; cfg.services.len()];
-    let mut not_ready_since: Vec<Option<Instant>> = vec![None; cfg.services.len()];
-    loop {
-        for (i, service) in cfg.services.iter().enumerate() {
-            if let Err(e) = look(
-                &cfg.state,
-                service,
-                &mut since_start[i],
-                &mut not_ready_since[i],
-            ) {
-                eprintln!("keep: {}: {e}", service.name);
-            }
-        }
-        sleep(poll);
+    let mut slots = Vec::new();
+    for svc in cfg.services {
+        let svc = prepare(&cfg.state, svc)?;
+        let (tx, rx) = mpsc::channel();
+        slots.push(Slot {
+            file: svc.file.clone(),
+            stable: svc.stable.clone(),
+            tx,
+        });
+        let name = svc.name.clone();
+        thread::Builder::new()
+            .name(format!("keep-{name}"))
+            .spawn(move || supervise(svc, rx))
+            .map_err(|e| anyhow::anyhow!("starting {name}: {e}"))?;
     }
-}
-
-fn look(
-    state: &Path,
-    service: &Service,
-    since_start: &mut Option<Instant>,
-    not_ready_since: &mut Option<Instant>,
-) -> anyhow::Result<()> {
-    let found = find(&service.exe);
-    let ready = found.is_some() && http_ok(&service.host, service.port, &service.path);
-    let last = read_ready(&state.join(format!("{}.json", service.name)))?;
-    let plan_path = service.upgrade_dir.as_ref().map(|d| d.join(PLAN));
-    let pending = plan_path.as_ref().and_then(|p| read_plan(p).ok());
-    if ready {
-        *not_ready_since = None;
-        *since_start = None;
-    } else if not_ready_since.is_none() {
-        *not_ready_since = Some(Instant::now());
-    }
-    let waited = not_ready_since
-        .map(|t| t.elapsed())
-        .unwrap_or(Duration::ZERO);
-    let limit = pending
-        .as_ref()
-        .map(|p| Duration::from_millis(p.ready_within_ms))
-        .unwrap_or(READY_WITHIN);
-    let just_started = since_start.is_some_and(|t| t.elapsed() < START_GAP);
-    let act = action(Look {
-        alive: found.is_some(),
-        ready,
-        has_last: last.is_some(),
-        pending: pending.is_some(),
-        waited,
-        limit,
-        just_started,
-    });
-    match act {
-        Action::Hold => {}
-        Action::Remember => {
-            if let Some(mut live) = found {
-                if live.args.is_empty() {
-                    live.args = service.args.clone();
-                }
-                if live.cwd.as_os_str().is_empty() || live.cwd == PathBuf::from(".") {
-                    if let Some(cwd) = &service.cwd {
-                        live.cwd = cwd.clone();
-                    }
-                }
-                write_ready(&state.join(format!("{}.json", service.name)), &live)?;
-            }
-            if let Some(path) = &plan_path {
-                let _ = fs::remove_file(path);
-            }
-        }
-        Action::Start => {
-            let last = last.expect("Start is only chosen when a last-ready path is recorded");
-            spawn(&last)?;
-            *since_start = Some(Instant::now());
-            *not_ready_since = Some(Instant::now());
-            eprintln!(
-                "keep: {} is down: started {}",
-                service.name,
-                last.exe.display()
-            );
-        }
-        Action::Recover => {
-            let plan = pending.expect("Recover is only chosen when a plan is on disk");
-            restore_and_start(service, &plan)?;
-            if let Some(path) = &plan_path {
-                let _ = fs::remove_file(path);
-            }
-            *since_start = Some(Instant::now());
-            *not_ready_since = Some(Instant::now());
-        }
+    let listener = bind_switch()?;
+    let addr = listener.local_addr()?;
+    eprintln!("keep: listening on {addr}");
+    for conn in listener.incoming() {
+        let Ok(stream) = conn else { continue };
+        let slots = slots.clone();
+        thread::spawn(move || handle(stream, &slots));
     }
     Ok(())
 }
 
-fn restore_and_start(service: &Service, plan: &WatchPlan) -> anyhow::Result<()> {
-    for live in processes_named(&service.exe) {
-        live.kill();
+impl Clone for Slot {
+    fn clone(&self) -> Self {
+        Slot {
+            file: self.file.clone(),
+            stable: self.stable.clone(),
+            tx: self.tx.clone(),
+        }
     }
-    let (spec, reason) = recover(plan, format!("{} did not become ready", service.name));
-    spawn_spec(&spec)?;
-    eprintln!(
-        "keep: {} did not become ready: restored {} ({reason})",
-        service.name,
-        spec.exe.display()
-    );
-    Ok(())
 }
 
-fn find(exe_name: &str) -> Option<Ready> {
-    processes_named(exe_name).into_iter().next().map(|p| Ready {
-        exe: p.exe.clone(),
-        args: p.args,
-        cwd: p.cwd,
+fn prepare(state: &Path, cfg: ServiceCfg) -> anyhow::Result<Service> {
+    let file = cfg
+        .stable
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("{}: the stable path has no file name", cfg.name))?
+        .to_string();
+    let stable = if cfg.stable.is_absolute() {
+        cfg.stable
+    } else {
+        std::env::current_dir()?.join(cfg.stable)
+    };
+    let cwd = if cfg.cwd.is_absolute() {
+        cfg.cwd
+    } else {
+        std::env::current_dir()?.join(cfg.cwd)
+    };
+    Ok(Service {
+        place: state.join(format!("{}.place", cfg.name)),
+        name: cfg.name,
+        file,
+        stable,
+        args: cfg.args.into_iter().map(std::ffi::OsString::from).collect(),
+        cwd,
     })
 }
 
-struct Live {
-    exe: PathBuf,
-    args: Vec<String>,
-    cwd: PathBuf,
-    kill: Box<dyn Fn()>,
+fn bind_switch() -> io::Result<TcpListener> {
+    let addr: std::net::SocketAddr = SWITCH_ADDR
+        .parse()
+        .expect("the switch address is 127.0.0.1:8092");
+    if !addr.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "keep listens on loopback only",
+        ));
+    }
+    TcpListener::bind(addr)
 }
 
-fn processes_named(exe_name: &str) -> Vec<Live> {
+fn supervise(svc: Service, rx: Receiver<Req>) {
+    let mut leftover = startup_leftover(&svc);
+    let mut live = ensure(&svc);
+    loop {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(req) => {
+                let (next, held) = apply(&svc, live, req);
+                live = next;
+                if let Some(path) = held {
+                    leftover = Some(path);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                live = restart_if_gone(&svc, live, &mut leftover);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// A copy promotion leaves the trial file until the process exits. A keep
+/// that starts again deletes it once the running image is the stable file.
+fn startup_leftover(svc: &Service) -> Option<PathBuf> {
+    let path = pending_copy(&svc.place)?;
+    if let Some(found) = find(&svc.file) {
+        if same_file(&found.exe, &path) {
+            return Some(path);
+        }
+    }
+    let _ = fs::remove_file(&path);
+    None
+}
+
+fn apply(svc: &Service, live: Option<Live>, req: Req) -> (Option<Live>, Option<PathBuf>) {
+    if let Some(mut live) = live {
+        stop(&mut live);
+    }
+    let result = switch_to(&req.path, &svc.stable, &svc.args, &svc.cwd, TRIAL);
+    let (answer, held) = match &result {
+        Ok(Running {
+            ended: Ended::Proven(how),
+            ..
+        }) => {
+            if let Err(e) = record(&svc.place, *how, &req.path) {
+                eprintln!("keep: {}: the promotion was not recorded: {e}", svc.name);
+            }
+            let held = (*how == How::Copy).then(|| req.path.clone());
+            (
+                Answer {
+                    status: 200,
+                    reason: "OK",
+                    body: format!("proven {how}\n"),
+                },
+                held,
+            )
+        }
+        Ok(Running {
+            ended: Ended::RolledBack(why),
+            ..
+        }) => (
+            Answer {
+                status: 409,
+                reason: "Conflict",
+                body: format!("rolled back\n{why}\n"),
+            },
+            None,
+        ),
+        Err(e) => (
+            Answer {
+                status: 409,
+                reason: "Conflict",
+                body: format!("rolled back\n{e}\n"),
+            },
+            None,
+        ),
+    };
+    eprintln!("keep: {} {}", svc.name, answer.body.trim());
+    let _ = req.reply.send(answer);
+    let live = match result {
+        Ok(running) => Some(Live::Child(running.child)),
+        Err(_) => ensure(svc),
+    };
+    (live, held)
+}
+
+fn restart_if_gone(
+    svc: &Service,
+    live: Option<Live>,
+    leftover: &mut Option<PathBuf>,
+) -> Option<Live> {
+    match live {
+        Some(Live::Adopted(pid)) if alive(pid) => Some(Live::Adopted(pid)),
+        Some(Live::Child(mut child)) => match child.try_wait() {
+            Ok(None) | Err(_) => Some(Live::Child(child)),
+            Ok(Some(_)) => {
+                let _ = child.wait();
+                clear_leftover(leftover);
+                eprintln!(
+                    "keep: {} is down: starting {}",
+                    svc.name,
+                    svc.stable.display()
+                );
+                ensure(svc)
+            }
+        },
+        gone => {
+            if gone.is_some() {
+                clear_leftover(leftover);
+                eprintln!(
+                    "keep: {} is down: starting {}",
+                    svc.name,
+                    svc.stable.display()
+                );
+            }
+            ensure(svc)
+        }
+    }
+}
+
+fn clear_leftover(leftover: &mut Option<PathBuf>) {
+    if let Some(path) = leftover.take() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn ensure(svc: &Service) -> Option<Live> {
+    if let Some(found) = find(&svc.file) {
+        eprintln!("keep: {} is already running as pid {}", svc.name, found.pid);
+        return Some(Live::Adopted(found.pid));
+    }
+    match spawn(&svc.stable, &svc.args, &svc.cwd) {
+        Ok(child) => {
+            eprintln!("keep: {} started {}", svc.name, svc.stable.display());
+            Some(Live::Child(child))
+        }
+        Err(e) => {
+            eprintln!("keep: {} did not start: {e}", svc.name);
+            None
+        }
+    }
+}
+
+fn stop(live: &mut Live) {
+    match live {
+        Live::Child(child) => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Live::Adopted(pid) => {
+            kill_pid(*pid);
+            let start = std::time::Instant::now();
+            while alive(*pid) && start.elapsed() < Duration::from_secs(30) {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    // The listener is released with the process. A moment, so the trial can bind.
+    thread::sleep(Duration::from_secs(1));
+}
+
+struct Found {
+    pid: u32,
+    exe: PathBuf,
+}
+
+fn find(exe_name: &str) -> Option<Found> {
     let mut sys = System::new();
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
-        ProcessRefreshKind::new()
-            .with_exe(UpdateKind::Always)
-            .with_cwd(UpdateKind::Always)
-            .with_cmd(UpdateKind::Always),
+        ProcessRefreshKind::new().with_exe(UpdateKind::Always),
     );
-    let mut out = Vec::new();
     for proc in sys.processes().values() {
         let Some(exe) = proc.exe().map(PathBuf::from) else {
             continue;
@@ -232,105 +348,205 @@ fn processes_named(exe_name: &str) -> Vec<Live> {
         let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !name.eq_ignore_ascii_case(exe_name) {
-            continue;
+        if name.eq_ignore_ascii_case(exe_name) {
+            return Some(Found {
+                pid: proc.pid().as_u32(),
+                exe,
+            });
         }
-        let cmd: Vec<String> = proc
-            .cmd()
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let args = cmd.into_iter().skip(1).collect();
-        let cwd = proc
-            .cwd()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let pid = proc.pid();
-        out.push(Live {
-            exe,
-            args,
-            cwd,
-            kill: Box::new(move || {
-                let mut sys = System::new();
-                sys.refresh_processes_specifics(
-                    ProcessesToUpdate::Some(&[pid]),
-                    ProcessRefreshKind::new(),
-                );
-                if let Some(p) = sys.process(pid) {
-                    p.kill();
-                }
-            }),
-        });
     }
-    out
+    None
 }
 
-impl Live {
-    fn kill(&self) {
-        (self.kill)();
+fn alive(pid: u32) -> bool {
+    let mut sys = System::new();
+    let pid = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), ProcessRefreshKind::new());
+    sys.process(pid).is_some()
+}
+
+fn kill_pid(pid: u32) {
+    let mut sys = System::new();
+    let pid = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), ProcessRefreshKind::new());
+    if let Some(proc) = sys.process(pid) {
+        proc.kill();
     }
 }
 
-fn http_ok(host: &str, port: u16, path: &str) -> bool {
-    let Ok(addr) = format!("{host}:{port}").parse::<SocketAddr>() else {
-        return false;
+fn handle(mut stream: TcpStream, slots: &[Slot]) {
+    let answer = match read_body(&mut stream) {
+        Ok(body) => dispatch(body.trim(), slots),
+        Err(e) => Answer {
+            status: 400,
+            reason: "Bad Request",
+            body: format!("bad request: {e}\n"),
+        },
     };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(req.as_bytes()).is_err() {
-        return false;
+    let _ = write_answer(&mut stream, &answer);
+}
+
+fn dispatch(body: &str, slots: &[Slot]) -> Answer {
+    if body.is_empty() {
+        return Answer {
+            status: 400,
+            reason: "Bad Request",
+            body: "the body is the path of the new executable\n".into(),
+        };
     }
-    let mut buf = [0u8; 64];
-    match stream.read(&mut buf) {
-        Ok(n) if n > 0 => {
-            let text = String::from_utf8_lossy(&buf[..n]);
-            text.starts_with("HTTP/1.") && !text.contains(" 000")
+    let path = PathBuf::from(body);
+    if !path.is_file() {
+        return Answer {
+            status: 400,
+            reason: "Bad Request",
+            body: format!("not a file: {}\n", path.display()),
+        };
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Answer {
+            status: 400,
+            reason: "Bad Request",
+            body: "the path has no file name\n".into(),
+        };
+    };
+    let Some(slot) = slots.iter().find(|s| s.file.eq_ignore_ascii_case(name)) else {
+        return Answer {
+            status: 404,
+            reason: "Not Found",
+            body: "no such service\n".into(),
+        };
+    };
+    if same_file(&path, &slot.stable) {
+        return Answer {
+            status: 400,
+            reason: "Bad Request",
+            body: "the stable file is not a trial\n".into(),
+        };
+    }
+    let (tx, rx) = mpsc::channel();
+    if slot.tx.send(Req { path, reply: tx }).is_err() {
+        return Answer {
+            status: 409,
+            reason: "Conflict",
+            body: "rolled back\nthe service is not running\n".into(),
+        };
+    }
+    rx.recv().unwrap_or(Answer {
+        status: 409,
+        reason: "Conflict",
+        body: "rolled back\nno answer\n".into(),
+    })
+}
+
+fn read_body(stream: &mut TcpStream) -> io::Result<String> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    let header_end = loop {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the request ended before its headers",
+            ));
         }
-        _ => false,
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i;
+        }
+        if buf.len() > 64 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the headers are too long",
+            ));
+        }
+    };
+    let header = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let mut request = header.lines();
+    let start = request.next().unwrap_or("");
+    if !start.starts_with("POST ") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the request is a POST",
+        ));
     }
+    let len = request
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "content-length is required"))?;
+    if len > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the path is too long",
+        ));
+    }
+    let mut body = buf[header_end + 4..].to_vec();
+    while body.len() < len {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&tmp[..n]);
+    }
+    body.truncate(len);
+    String::from_utf8(body)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the path is not utf-8"))
 }
 
-fn read_ready(path: &Path) -> anyhow::Result<Option<Ready>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(path)?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
-}
-
-fn write_ready(path: &Path, ready: &Ready) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(ready)?)?;
-    fs::rename(tmp, path)?;
+fn write_answer(stream: &mut TcpStream, answer: &Answer) -> io::Result<()> {
+    let bytes = answer.body.as_bytes();
+    let head = format!(
+        "HTTP/1.0 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        answer.status,
+        answer.reason,
+        bytes.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(bytes)?;
     Ok(())
 }
 
-fn spawn(ready: &Ready) -> anyhow::Result<()> {
-    let spec = LaunchSpec {
-        exe: ready.exe.clone(),
-        args: ready.args.iter().map(std::ffi::OsString::from).collect(),
-        cwd: ready.cwd.clone(),
-    };
-    spawn_spec(&spec)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn spawn_spec(spec: &LaunchSpec) -> anyhow::Result<()> {
-    let mut cmd = Command::new(&spec.exe);
-    cmd.args(&spec.args).current_dir(&spec.cwd);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // Detach from keep so a restart of keep does not take the service with it.
-        const DETACHED: u32 = 0x0000_0008;
-        const NEW_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED | NEW_GROUP);
+    use cluster::upgrade::switch::STABLE_DIR;
+
+    #[test]
+    fn the_shipped_config_joins_the_cluster_as_keep() {
+        let cfg: Config = serde_yaml::from_str(include_str!("../keep.yaml")).unwrap();
+        let cluster = cfg.cluster.expect("keep.yaml names its gateway");
+        assert_eq!(cluster.url, "https://192.168.0.5:9443");
+        assert_eq!(cluster.name, "tokera.com");
+        assert_eq!(cluster.host, "blackworld");
+        assert_eq!(cfg.services.len(), 2);
+        assert_eq!(
+            cfg.services[0].stable,
+            PathBuf::from(STABLE_DIR).join("web.exe")
+        );
+        assert_eq!(
+            cfg.services[1].stable,
+            PathBuf::from(STABLE_DIR).join("motherd.exe")
+        );
+        assert_eq!(cfg.services[0].args, ["--config", "web/web.yaml"]);
+        assert_eq!(cfg.services[1].args, ["--config", "motherd/motherd.yaml"]);
     }
-    cmd.spawn()?;
-    Ok(())
+
+    #[test]
+    fn the_switch_address_is_loopback() {
+        let addr: std::net::SocketAddr = SWITCH_ADDR.parse().unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.to_string(), "127.0.0.1:8092");
+        let listener = TcpListener::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert_eq!(bound.ip().to_string(), "127.0.0.1");
+    }
 }

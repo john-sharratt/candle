@@ -5,9 +5,10 @@
 //! ([`check`]), the member takes the install's leases — `upgrade/<app>` for each
 //! app it serves, or one of a forced rollout's `upgrade/<app>/<i>` — and hands
 //! the install to its [`Installer`]: the process drains, flushes, releases its
-//! substrate, closes its sockets, swaps, starts the new process and exits. An
-//! upgrading member takes no lease. A build that cannot open the substrate
-//! strands the member, and its install is never attempted.
+//! substrate, closes its sockets, stages the new executable and asks `keep`
+//! to start it, then exits. An upgrading member takes no lease. A build that
+//! cannot open the substrate strands the member, and its install is never
+//! attempted.
 //!
 //! **The leases outlive the process.** An upgrade lease runs for [`LEASE_TTL`]
 //! and is not renewed: it is held through the restart, so no other member
@@ -15,8 +16,9 @@
 //! the old one restored — takes each lease back once it is ready, as the same
 //! node, which for Paxos is a renewal, and releases it for the next member. The
 //! new build writes `<data>/upgrade/ok` once it is ready, and prunes the kept
-//! builds then. `keep` reads the plan and restores the previous executable
-//! when that file does not appear in time.
+//! builds then. `keep` stops a trial that does not print its proof line and
+//! starts the stable file again. The plan is the lease list the next process
+//! reads.
 
 use std::fs;
 use std::sync::Arc;
@@ -48,7 +50,7 @@ pub const LEASE_RETRY: Duration = Duration::from_secs(5);
 /// The process side of an install.
 pub trait Installer: Send + Sync {
     /// Stop serving — drain, flush, release the substrate, close every
-    /// socket — then swap in `job.source`, start the watchdog, and exit. `Err`
+    /// socket — then stage `job.source` and ask `keep` to start it, and exit. `Err`
     /// when it cannot begin: the process is already stopping.
     fn install(&self, job: InstallJob) -> Result<(), String>;
 }
@@ -313,7 +315,7 @@ impl Upgrader {
         tracing::warn!(
             build = build_name(&t.build),
             ?leases,
-            "installing: draining, then swapping in the new build"
+            "installing: draining, then staging the new build for keep"
         );
         let job = InstallJob {
             build: t.build,

@@ -1,8 +1,9 @@
 //! A member's upgrades in the host (`docs/replicated_substrate.md` §3.9): what
 //! they start from — this binary's build and its executable, its tenants' UI
 //! compiled in — and how the process installs a build: it stops the way
-//! `shutdown` does, drained, flushed and closed, and its last act hands off to
-//! the watchdog ([`hand_off`](cluster::upgrade::handoff::hand_off)).
+//! `shutdown` does, drained, flushed and closed, and its last act stages the
+//! new executable and asks `keep` to start it
+//! ([`hand_off`](cluster::upgrade::handoff::hand_off)).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

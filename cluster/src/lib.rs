@@ -19,7 +19,7 @@
 //! - [`version`]: this build's `count`, `hash` and `local`, and
 //!   `--build-info`.
 //! - [`upgrade`]: a member's side of A/B upgrades — artifacts, fetching,
-//!   compatibility, the swap, kept builds and the watchdog.
+//!   compatibility, staging a build for `keep`, and kept builds.
 //! - [`launch`]: how this process was launched, to start an identical one.
 //! - [`peer`]: gateways linked to each other, for the state active-active
 //!   gateways share.

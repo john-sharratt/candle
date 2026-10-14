@@ -1,7 +1,8 @@
-//! What `keep` runs when a new build does not become ready (§3.9): [`recover`]
-//! puts the previous executable back and returns the launch that starts it.
-//! [`watch`] is the same transitions under a scripted process table, so the
-//! tests name every spawn. No daemon enters this module at startup.
+//! The install plan (§3.9) and the scripted transitions that put a previous
+//! executable back. `keep` does not run them: a trial that does not print its
+//! proof line is stopped, and the stable file is started again. [`watch`] is
+//! the same transitions under a scripted process table, so the tests name
+//! every spawn. No daemon enters this module at startup.
 //!
 //! The process operations are behind [`Processes`], so the state machine is
 //! tested by asserting what it spawns, never by spawning.

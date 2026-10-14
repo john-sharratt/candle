@@ -255,7 +255,7 @@ daemon code reports it outside logs.
 | D15 | **Maintenance runs as admin commands on members, from the gateway page**: drain, restart, shutdown, compact, maintain, audit, catch-up, resync and others (§12.4). **Ctrl-C runs `shutdown`**: drain, wait for the outbox, flush, close; a second Ctrl-C aborts. They are routes on the member, so they work through the cluster and on a member's own listener alike. | Maintenance without SSH or launch-line juggling; every command is logged with who ran it. |
 | D16 | **Gateways peer with each other** over group-key-authenticated sockets. They share ACME challenges, issued certificates and keys, and the order ledger. Rendezvous over the connected gateways names who orders each site, with no consensus; a gateway partition can cost one duplicate certificate. They refuse to peer when their session keys or OAuth clients differ (§13.4). Peer links carry nothing else: no requests, members or claims (§4.3). | Active-active gateways answer the same names: any of them must answer a challenge and serve the certificate, and a cookie from one must work on the other. A duplicate order is harmless within the CA's limits, so it is not worth a Paxos group among gateways. |
 | D17 | **Every member holds a full copy, with no encryption at rest beyond what the disk provides; this design includes no backup and no key rotation** (§16). | Kept simple by decision. Replication is not backup: a mistake replicates. |
-| D18 | **A/B upgrades.** A higher build loads untouched. Once ready, it is certified against the older members, on a share of live traffic and on mirrored calls to read-only routes, compared statistically. Its binaries are distributed to the older members, resumably and peer to peer. At the grace deadline, if certified, the members upgrade themselves one at a time: drain, swap the binary at the same path, start the new process, exit. `keep`, a separate process, restores and starts the last known-good executable when the new one does not become ready. A failed certification faults the candidate and aborts the upgrade (§3.8, §3.9). | Upgrading the estate is building one machine. A bad build is caught on a sliver of traffic before it replaces anything, and a bad install puts itself back. |
+| D18 | **A/B upgrades.** A higher build loads untouched. Once ready, it is certified against the older members, on a share of live traffic and on mirrored calls to read-only routes, compared statistically. Its binaries are distributed to the older members, resumably and peer to peer. At the grace deadline, if certified, the members upgrade themselves one at a time: drain, stage the new binary, and ask `keep` to start it. `keep`, a separate process, keeps that file only after it is serving; otherwise it starts the last known-good file again. A failed certification faults the candidate and aborts the upgrade (§3.8, §3.9). | Upgrading the estate is building one machine. A bad build is caught on a sliver of traffic before it replaces anything, and a bad install puts itself back. |
 | D19 | **A local build** — commits not on `origin/main`, or uncommitted edits, measured exactly by the build's `local` digest — **serves its own listener locally and never takes part in upgrades**: never a candidate, never auto-installed, never closed for being behind. Otherwise it is a full member: its writes replicate, the gateway routes to it, it holds leases and votes (§3.10). | Work-in-progress can be tested on a cluster machine through its own port, while the gateway and the upgrade machinery carry on untouched. |
 | D20 | **Every member keeps its last *N* builds** (`--keep-builds`, default 5), **and an admin can force any build onto an app from any member that holds it** (`rollout`, §3.11). A forced rollout skips grace and certification, moves the floor in either direction, and is a Paxos decision, so every gateway applies it. A downgrade rejects the builds it leaves. A build is installed only where it can open the member's substrate: same log format, every record type known, same model (§3.9). | Rolling back is a swap from each member's own disk, with no transfer, so it is as fast as a restart. Deciding by Paxos keeps active-active gateways and a restarted gateway on the same rollout. The checks keep a downgrade from hiding, and then compacting away, data an older build cannot read. |
 
@@ -692,45 +692,47 @@ build is certified (§3.8):
    member at once, and its capacity and quorum hold. For a `motherd`, which is a member
    of both apps, upgrading takes both leases, and it installs a build only once both
    apps certified it.
-   - **The lease outlives the process.** It is taken for 20 minutes, the watchdog's
-     15 plus room, and is never renewed, so it is held through the restart and no other
-     member installs while this one is down. A drain hands back every other lease, but
-     not `upgrade/` ones.
-   - **The process that starts takes it back.** Once ready, the new build, or the old one
-     restored, acquires each lease for 5 s as the same node, which for Paxos is a renewal,
-     and releases it for the next member. The leases it held are in the watchdog's plan,
-     `<data>/upgrade/watch.json`.
+   - **The lease outlives the process.** It is taken for 20 minutes and is never
+     renewed, so it is held through the restart and no other member installs while
+     this one is down. A drain hands back every other lease, but not `upgrade/` ones.
+   - **The process that starts takes it back.** Once ready, the new build, or the
+     stable file `keep` started again, acquires each lease for 5 s as the same node,
+     which for Paxos is a renewal, and releases it for the next member. The leases
+     it held are in `<data>/upgrade/watch.json`.
 3. **Each member that holds the lease and a verified artifact:**
    - **drains** (§12.4): hands back claims, worlds and characters, and waits for its
      outbox;
    - **flushes and releases** its substrate writer lock, and closes its sockets;
-   - **swaps the binary in place.** It moves the running executable into its kept-build
-     directory, `<exe dir>/builds/<old count>-<old hash>/`, which Windows allows for a
-     running image because it is a rename on the same volume. It then moves the verified
-     artifact to the executable's own path. The UI comes with it, compiled in;
-   - **starts the new process** with the same arguments in the same working directory,
-     through `LaunchSpec` (`cluster/src/launch.rs`), plus `--after-pid` of itself, and
-     exits. `self_heal` uses the same `LaunchSpec` without that flag. The new process
-     waits until this pid is gone, up to 120 s, then loads, so the two never hold the
-     model at once (`upgrade/os.rs`). Because the new binary sits at the old path,
-     nothing else about the invocation changes. The plan is `<data>/upgrade/watch.json`.
+   - **stages the binary.** It copies the verified artifact to `keep/stage/<exe name>`
+     under its working directory. That path is not the stable file, and it is not the
+     executable the process is running from. The UI comes with the executable,
+     compiled in. The running file is not moved;
+   - **asks `keep` to start it.** One POST to `127.0.0.1:8092`, the body the staged
+     path, then this process exits. `keep` is already running. It stops the process
+     it had been supervising and starts the staged file with the same arguments in
+     the same working directory. The plan at `<data>/upgrade/watch.json` is the lease
+     list the next process reads. `self_heal` relaunches the executable it is running
+     from, which is the stable file once `keep` has kept a trial.
 4. **`keep` is the failsafe, and it is already running.** It is its own process. It
-   does not certify, roll out, or carry bytes. It reads the last executable path that
-   became ready from its own state directory. For `web` and `motherd`:
-   - **A process that is gone** is started again from that path, with the arguments and
-     working directory recorded when it was last ready.
-   - **A replacement that does not become ready** within 15 minutes, with a plan on
-     disk, is the failure path (`upgrade/watchdog.rs` `recover`, `upgrade/swap.rs`
-     `restore`): `keep` puts the previous executable back, writes
-     `<data>/upgrade/failed.json`, and starts it with `--upgrade-failed <count>-<hash>`.
-     The restored process records that build in `refused.json` and does not try it
-     again unless a forced rollout names it.
-   - **Success** is the new process itself. Once it is ready it writes
+   does not certify, roll out, carry bytes, or choose a canary share. For `web` and
+   `motherd` the last known-good executable is `keep/stable/<name>.exe`, started with
+   the arguments in `keep`'s config:
+   - **A process that is gone** is started again from that stable file.
+   - **A trial** is the staged path. `keep` reads its stderr for the line
+     `INFO serving`, which the process prints only after it is serving, not while it
+     is booting. The wait is at most 10 minutes.
+   - **No line in that time, or the process dying,** kills the trial and starts the
+     stable file again.
+   - **The line** makes the trial file the stable file. `keep` renames the running
+     executable onto the stable path when the platform allows it, and otherwise
+     copies the bytes and deletes the trial file once it is no longer locked. Which
+     of the two worked is recorded under `keep/state/`.
+   - **Success for the member** is the new process. Once it is ready it writes
      `<data>/upgrade/ok`, prunes kept builds beyond *N*, and hands the leases back.
-     `keep` then records that executable as the last ready one.
 
-   A swap that cannot be written, or a new process that cannot be spawned, is undone
-   at once by the old process, which then relaunches itself (`upgrade/handoff.rs`).
+   A stage that cannot be written, or a `keep` that does not accept the path, is
+   not an exit: the old process relaunches itself (`upgrade/handoff.rs`). The
+   executable it was running stays in place the whole time.
 
    `--after-pid` and `--upgrade-failed` are one-shot flags: `LaunchSpec::capture`
    drops them, so no later relaunch repeats them.
@@ -751,8 +753,8 @@ in `<exe dir>/builds/`, one directory per build, named `<count>-<hash>`. A direc
 The rules for keeping them:
 
 - **How many.** `--keep-builds <n>` on the member sets *N*; the default is 5. Once
-  a swap has succeeded, the oldest directories beyond *N* are deleted. A swap that is
-  restored deletes nothing.
+  the new build is ready, the oldest directories beyond *N* are deleted. A trial
+  that `keep` does not keep deletes nothing.
 - **What is never pruned.** The build running now is not in `builds/`, so it is never
   pruned. A kept build is never pruned while it is the target of a forced rollout in
   progress (§3.11).
@@ -766,7 +768,7 @@ The rules for keeping them:
   Fault mode never deletes them by itself, because they are the way back.
 
 A kept build is what makes rolling back fast. Every member that ran a build still holds
-it, so a forced rollout to it (§3.11) swaps each member from its own disk, with no fetch,
+it, so a forced rollout to it (§3.11) stages that executable and asks `keep` to start it, with no fetch,
 no certification and no grace period.
 
 **Manual upgrades still work.** A member rebuilt and restarted by hand is a candidate,

@@ -5,8 +5,10 @@ data/
 dist/
 target/
 
-# keep records last-ready executable paths here at runtime
+# keep records which promotion worked, and holds the stable and staged executables
 keep/state/
+keep/stable/
+keep/stage/
 
 # Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
 # More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html

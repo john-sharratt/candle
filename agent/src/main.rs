@@ -124,9 +124,20 @@ async fn main() -> anyhow::Result<()> {
             if left > 0 {
                 tracing::warn!(left, "jobs still running: they end with this process");
             }
-            hand_off(&launch, &setup, &job, None)?;
-            tracing::warn!("install handed to the watchdog — exiting");
-            std::process::exit(0)
+            match hand_off(&launch, &setup, &job, None) {
+                Ok(()) => {
+                    tracing::warn!("keep is starting the staged build — exiting");
+                    std::process::exit(0)
+                }
+                Err(e) => {
+                    tracing::error!("the install failed: {e}");
+                    match launch.relaunch() {
+                        Ok(pid) => tracing::warn!(pid, "started again — exiting"),
+                        Err(err) => tracing::error!("the new process did not start: {err}"),
+                    }
+                    std::process::exit(0)
+                }
+            }
         }
     }
 }

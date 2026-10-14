@@ -15,8 +15,7 @@ pub enum Ending {
     Exit,
     /// Start the same binary again with the same arguments: `restart`.
     Relaunch,
-    /// Install a build: swap it in, and hand off to the watchdog that starts
-    /// it (§3.9).
+    /// Install a build: stage it and ask `keep` to start it (§3.9).
     Install,
 }
 

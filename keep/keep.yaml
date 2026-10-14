@@ -1,10 +1,11 @@
-# keep — failsafe for the binaries on this machine. It stores paths, not bytes.
+# keep — failsafe for the binaries on this machine.
+# The last known-good executable is keep/stable/<name>. A switch is one
+# request to 127.0.0.1:8092 whose body is the path of a staged executable.
 # Run from the repository root:
 #
-#   target\release\keep.exe -- config is the default keep/keep.yaml
+#   target\release\keep.exe keep/keep.yaml
 
 state: keep/state
-poll_ms: 1000
 # Listed on the gateway's cluster page as the app keep. No routes, no rollout.
 cluster:
   url: https://192.168.0.5:9443
@@ -13,17 +14,10 @@ cluster:
   host: blackworld
 services:
   - name: web
-    exe: web.exe
-    host: 127.0.0.1
-    port: 80
-    path: /
+    stable: keep/stable/web.exe
     args: ["--config", "web/web.yaml"]
     cwd: D:/prog/candle
   - name: motherd
-    exe: motherd.exe
-    host: 192.168.0.5
-    port: 8081
-    path: /v1/status
+    stable: keep/stable/motherd.exe
     args: ["--config", "motherd/motherd.yaml"]
     cwd: D:/prog/candle
-    upgrade_dir: D:/prog/substrate/upgrade

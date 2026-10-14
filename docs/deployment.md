@@ -188,11 +188,18 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
 
 ### keep
 
-`keep` is a separate process and a failsafe only. It watches `web` (`127.0.0.1:80`) and
-`motherd` (`192.168.0.5:8081`). When one of them is gone, it starts the executable path
-it recorded the last time that process answered. When a replacement was swapped into
-place and does not become ready, it restores the previous executable and starts that.
-It does not certify, roll out, or store binary bytes. It also joins the gateway as the app `keep`, so `/gateway` lists it beside zend and npcd; that socket declares no routes and takes no rollout. Its state is `keep/state/`.
+`keep` is a separate process and a failsafe only. The last known-good `web` and
+`motherd` are the files `keep/stable/web.exe` and `keep/stable/motherd.exe`. On startup
+`keep` runs those files with the arguments in `keep/keep.yaml`. A switch is one POST to
+`127.0.0.1:8092` whose body is the path of a staged executable (`keep/stage/`). `keep`
+starts that file and reads stderr. The process is kept only when it prints `INFO serving`,
+which `web` and `motherd` print once they are serving and not during boot. No such line
+within 10 minutes, or the process dying, stops the trial and starts the stable file
+again. A kept trial is renamed onto the stable path, or copied there when a running
+executable cannot be renamed. It does not certify, roll out, or store binary bytes, and
+it does no canary math. It also joins the gateway as the app `keep`, so `/gateway` lists
+it beside zend and npcd; that socket declares no routes and takes no rollout. Its state
+is `keep/state/`.
 
 Its supervisor is `C:\Users\johna\AppData\Local\keep\supervise.ps1`, the same loop shape
 as cf-ddns: it starts `target\release\keep.exe keep/keep.yaml` and starts it again 10 s
@@ -239,8 +246,8 @@ watching, and the old GPU-poison watchdog only exited cleanly "for a supervisor 
 
 Every daemon still relaunches itself on a poisoned GPU — that watchdog is the host's
 (`host::self_heal`), so zend, npcd and motherd all carry it. `keep` is the outer failsafe
-for `web` and `motherd`: if the process dies and what comes back does not become ready,
-`keep` starts the last known-good executable. `candle::gpu_poison` flags the CUDA context poisoned
+for `web` and `motherd`: if the process dies, `keep` starts the stable file again.
+`candle::gpu_poison` flags the CUDA context poisoned
 on a sticky fault (illegal address, launch failure, device assert, ECC) **or** on an
 out-of-memory streak that has run for 60 s straight with no successful device operation in
 between (`candle_core::gpu_poison::OOM_STICKY_AFTER`) — a single large-request OOM is not

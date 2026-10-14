@@ -1,7 +1,6 @@
 //! A member's side of A/B upgrades (`docs/replicated_substrate.md` §3.8–§3.11):
 //! what a build offers, fetching it, whether it can open this member's
-//! substrate, the in-place swap, the builds kept for rollback, and `keep`'s
-//! restore of a build that does not become ready.
+//! substrate, staging a build for `keep`, and the builds kept for rollback.
 //!
 //! | Module | |
 //! |---|---|
@@ -10,9 +9,10 @@
 //! | [`compat`] | whether a build can open a substrate: log format, record types, model |
 //! | [`decisions`] | verdicts, forced rollouts and pauses as Paxos decisions |
 //! | [`kept`] | `builds/<count>-<hash>/` and pruning |
-//! | [`swap`] | the in-place swap and its restore |
-//! | [`handoff`] | the old process's last act: swap, write the plan, start the new build |
-//! | [`watchdog`] | `recover`: put the previous executable back for `keep` to start |
+//! | [`swap`] | moving an executable aside and back |
+//! | [`switch`] | the loopback address `keep` answers, and the stderr line that proves a process is serving |
+//! | [`handoff`] | the old process's last act: stage the new build and ask `keep` to start it |
+//! | [`watchdog`] | the plan file the next process reads for its leases |
 //! | [`os`] | process liveness, and the successor's wait for the predecessor |
 //! | [`sum`] | SHA-256 and its hex spelling |
 //! | [`runtime`] | a process's upgrades: announcing, fetching, certifying, installing |
@@ -30,4 +30,5 @@ pub mod parts;
 pub mod runtime;
 pub mod sum;
 pub mod swap;
+pub mod switch;
 pub mod watchdog;

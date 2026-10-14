@@ -1,8 +1,8 @@
 //! An agent's install (`docs/replicated_substrate.md` §3.9): asked by the
 //! process's upgrades, it stops the agent the way Ctrl-C does — its sockets
 //! close, so no gateway sends it another job — waits, at most
-//! [`JOBS_WAIT`], for the jobs it is running to end, and hands off to the
-//! watchdog, which starts the new build once this process is gone.
+//! [`JOBS_WAIT`], for the jobs it is running to end, and asks `keep` to start
+//! the staged build.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

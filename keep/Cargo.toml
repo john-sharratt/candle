@@ -2,7 +2,7 @@
 name = "keep"
 version = "0.1.0"
 edition = "2021"
-description = "Failsafe for web and motherd. Starts the last known-good executable."
+description = "Failsafe for web and motherd. Starts the stable executable and switches it on a loopback request."
 
 [[bin]]
 name = "keep"

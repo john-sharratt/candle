@@ -32,6 +32,7 @@ use tower::Service;
 
 use axum::middleware;
 use cluster::gateway::Class;
+use cluster::upgrade::switch::PROOF;
 
 use crate::acme::names::groups;
 use crate::acme::peers::AcmePeers;
@@ -336,6 +337,10 @@ impl Builder {
             }
             None => None,
         };
+        // Both entrances are bound, and this is the call that accepts. The
+        // line is the whole of stderr: `keep` treats the process as serving
+        // only once it has read it.
+        eprintln!("{PROOF}");
         bound
             .serve_until(entrance, async {
                 let _ = tokio::signal::ctrl_c().await;

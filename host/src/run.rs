@@ -183,10 +183,7 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
                     Some(job) => {
                         let log = state_dir.join(&log_name);
                         match hand_off(&launch, &upgrade, &job, Some(log)) {
-                            Ok(()) => tracing::warn!(
-                                "install handed to the watchdog, which starts the new build \
-                                 once this process is gone — exiting"
-                            ),
+                            Ok(()) => tracing::warn!("keep is starting the staged build — exiting"),
                             Err(e) => {
                                 tracing::error!("the install failed: {e}");
                                 relaunch("the install failed")
@@ -292,9 +289,17 @@ async fn serve_tenants(
         let (listen, uis, signin) = (listen.clone(), uis.clone(), local_signin.clone());
         let app = boot_router(Arc::clone(&boot), common.clone());
         tokio::spawn(async move {
-            serve(&listen, &uis, app, signin, None, async {
-                let _ = boot_ended.await;
-            })
+            serve(
+                &listen,
+                &uis,
+                app,
+                signin,
+                None,
+                async {
+                    let _ = boot_ended.await;
+                },
+                false,
+            )
             .await
         })
     };
@@ -392,6 +397,8 @@ async fn serve_tenants(
     }
 
     accept_ctrl_c();
+    // The tenants are started and the boot server has released the ports.
+    // This is the server that is actually serving.
     let served = serve(
         &listen,
         &uis,
@@ -399,6 +406,7 @@ async fn serve_tenants(
         local_signin,
         cluster.clone(),
         leave(Arc::clone(&stopping), cluster.clone()),
+        true,
     )
     .await;
     if let Some(c) = &cluster {
