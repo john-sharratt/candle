@@ -2,9 +2,12 @@
 //!
 //! The limit is the caller's. Production passes ten minutes. A process that
 //! exits without the line, or that stays up without printing it, is stopped
-//! and the stable file is started with the same arguments.
+//! and the stable file is started with the same arguments. A stable child is
+//! detached: this process holds no handle on its stdout or stderr. The trial
+//! is the only child whose stderr is read.
 
-use std::io::{self, BufRead, BufReader, Read};
+use std::ffi::OsString;
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -40,59 +43,55 @@ pub enum Ended {
     RolledBack(String),
 }
 
-/// Start `exe` with `args` in `cwd`. Both streams are pipes. Stdout is drained
-/// and discarded: the parent's own stdout is the supervisor's log redirect,
-/// and a daemon that logs every wave blocks on that redirect once the pipe
-/// fills — long enough for `/v1/status` to miss the gateway's deadline. The
-/// daemon's own log file is the record. Stderr is left for the caller, which
-/// reads it for the proof line or drains it once the process is kept.
-pub fn spawn(exe: &Path, args: &[std::ffi::OsString], cwd: &Path) -> io::Result<Child> {
+/// Start `exe` from a stable path. Stdout and stderr are detached: this
+/// process holds no handles on them, does not read or write them, and they
+/// are not appended to the supervisor log.
+pub fn spawn_detached(exe: &Path, args: &[OsString], cwd: &Path) -> io::Result<Child> {
+    launch(exe, args, cwd, Stdio::null(), Stdio::null(), true)
+}
+
+/// Start a trial. Stdout is detached. Stderr is the only hooked stream.
+fn spawn_trial(exe: &Path, args: &[OsString], cwd: &Path) -> io::Result<Child> {
+    launch(exe, args, cwd, Stdio::null(), Stdio::piped(), false)
+}
+
+fn launch(
+    exe: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    stdout: Stdio,
+    stderr: Stdio,
+    detach: bool,
+) -> io::Result<Child> {
     let mut cmd = Command::new(exe);
     cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(stdout)
+        .stderr(stderr);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    }
-    let mut child = cmd.spawn()?;
-    if let Some(stdout) = child.stdout.take() {
-        drain(stdout);
-    }
-    Ok(child)
-}
-
-/// Discard `pipe` until it closes, so the writer never blocks on a full buffer.
-fn drain(pipe: impl Read + Send + 'static) {
-    thread::spawn(move || {
-        let mut pipe = pipe;
-        let mut buf = [0u8; 8192];
-        loop {
-            match pipe.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
+        /// The new process does not inherit this process's console, so a
+        /// stable child's standard streams are not the supervisor redirect.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        let mut flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+        if detach {
+            flags |= DETACHED_PROCESS;
         }
-    });
-}
-
-/// Discard stderr. A kept process has nothing reading the proof pipe, and a
-/// full stderr buffer blocks it the same way stdout did.
-pub fn drain_stderr(child: &mut Child) {
-    if let Some(stderr) = child.stderr.take() {
-        drain(stderr);
+        cmd.creation_flags(flags);
     }
+    #[cfg(not(windows))]
+    let _ = detach;
+    cmd.spawn()
 }
 
 /// Read `child`'s stderr until [`PROOF`], the limit, or the pipe closing.
 ///
-/// The reader thread keeps the pipe after a proof line, so a process that
-/// stays up does not block when stderr fills.
+/// Lines read before that are logged. The reader stops when the proof line
+/// arrives or the limit passes; it does not keep the pipe open afterwards.
 pub fn watch_proof(child: &mut Child, limit: Duration) -> Verdict {
     let Some(stderr) = child.stderr.take() else {
         return Verdict::Died;
@@ -127,8 +126,14 @@ fn wait_for_line(rx: Receiver<String>, limit: Duration) -> Verdict {
             return Verdict::TimedOut;
         }
         match rx.recv_timeout(left) {
-            Ok(line) if line == PROOF => return Verdict::Proven,
-            Ok(_) => {}
+            Ok(line) => {
+                if !line.is_empty() {
+                    eprintln!("keep: trial: {line}");
+                }
+                if line == PROOF {
+                    return Verdict::Proven;
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => return Verdict::TimedOut,
             Err(mpsc::RecvTimeoutError::Disconnected) => return Verdict::Died,
         }
@@ -152,7 +157,7 @@ pub fn switch_to(
     cwd: &Path,
     limit: Duration,
 ) -> io::Result<Running> {
-    let mut child = match spawn(trial, args, cwd) {
+    let mut child = match spawn_trial(trial, args, cwd) {
         Ok(child) => child,
         Err(e) => {
             let child = spawn_ready(stable, args, cwd)?;
@@ -200,15 +205,12 @@ pub fn switch_to(
 }
 
 /// Start `exe`, retrying while the previous image still has the file open.
-/// Stderr is drained so the process does not block when the pipe fills.
-fn spawn_ready(exe: &Path, args: &[std::ffi::OsString], cwd: &Path) -> io::Result<Child> {
+/// The child is detached: no stdout or stderr handle, and no reader.
+fn spawn_ready(exe: &Path, args: &[OsString], cwd: &Path) -> io::Result<Child> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match spawn(exe, args, cwd) {
-            Ok(mut child) => {
-                detach_stderr(&mut child);
-                return Ok(child);
-            }
+        match spawn_detached(exe, args, cwd) {
+            Ok(child) => return Ok(child),
             Err(e) => {
                 if Instant::now() >= deadline {
                     return Err(e);
@@ -217,10 +219,6 @@ fn spawn_ready(exe: &Path, args: &[std::ffi::OsString], cwd: &Path) -> io::Resul
             }
         }
     }
-}
-
-fn detach_stderr(child: &mut Child) {
-    drain_stderr(child);
 }
 
 #[cfg(test)]
@@ -336,17 +334,19 @@ mod tests {
             Ended::RolledBack("no proof line within the limit".into())
         );
         assert!(running.child.try_wait().unwrap().is_none());
+        assert!(running.child.stdout.is_none());
+        assert!(running.child.stderr.is_none());
         reap(&mut running.child);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]
     #[test]
-    fn a_child_writing_more_than_the_pipe_holds_still_reaches_the_proof_line() {
-        // The pipe buffer is far under a megabyte. Without a reader the write
-        // blocks and the proof line never arrives.
+    fn a_trial_with_a_large_stdout_write_still_reaches_the_proof_line() {
+        // Stdout is the NUL device. A megabyte written there cannot fill a
+        // pipe this process is reading, and the proof line on stderr arrives.
         let dir = scratch();
-        let mut child = spawn(
+        let mut child = spawn_trial(
             Path::new("powershell"),
             &[
                 OsString::from("-NoProfile"),
@@ -358,6 +358,8 @@ mod tests {
             &dir,
         )
         .unwrap();
+        assert!(child.stdout.is_none());
+        assert!(child.stderr.is_some());
         let started = Instant::now();
         let verdict = watch_proof(&mut child, Duration::from_secs(10));
         let elapsed = started.elapsed();
@@ -368,6 +370,32 @@ mod tests {
             elapsed < Duration::from_secs(8),
             "stdout write blocked the proof line"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_stable_child_is_started_with_both_streams_detached() {
+        let ping = std::path::Path::new(r"C:\Windows\System32\ping.exe");
+        if !ping.is_file() {
+            return;
+        }
+        let dir = scratch();
+        let mut child = spawn_detached(
+            ping,
+            &[
+                OsString::from("-n"),
+                OsString::from("30"),
+                OsString::from("127.0.0.1"),
+            ],
+            &dir,
+        )
+        .unwrap();
+        let stdout = child.stdout.is_none();
+        let stderr = child.stderr.is_none();
+        reap(&mut child);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(stdout);
+        assert!(stderr);
     }
 
     #[cfg(windows)]
@@ -383,12 +411,14 @@ mod tests {
         let child = &mut running.child;
         let ended = running.ended.clone();
         let alive = child.try_wait().unwrap().is_none();
+        let detached = child.stdout.is_none() && child.stderr.is_none();
         let image = std::fs::canonicalize(image_of(child.id())).unwrap();
         let stable_path = std::fs::canonicalize(&stable).unwrap();
         reap(child);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(ended, Ended::Proven(_)));
         assert!(alive, "the stable process exited");
+        assert!(detached, "the stable process still has a hooked stream");
         assert_eq!(image, stable_path);
     }
 

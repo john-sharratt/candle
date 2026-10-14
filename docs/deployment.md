@@ -192,14 +192,16 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
 `motherd` are the files `keep/stable/web.exe` and `keep/stable/motherd.exe`. On startup
 `keep` runs those files with the arguments in `keep/keep.yaml`. A switch is one POST to
 `127.0.0.1:8092` whose body is the path of a staged executable (`keep/stage/`). `keep`
-starts that file and reads stderr. Stdout is drained and discarded: it is a copy of
-the daemon's own log, and leaving it on the supervisor's redirect blocks the
-daemon once that pipe fills. The process is kept only when it prints `INFO serving`,
+starts that trial and reads its stderr until the line `INFO serving` or the 10 minute
+limit. Those trial lines are logged. A process started from the stable path — at
+startup, after the proof line, and on rollback — has stdout and stderr detached:
+`keep` holds no handles on them, does not read or write them, and does not append
+them to the supervisor log. The process is kept only when it prints `INFO serving`,
 which `web` and `motherd` print once they are serving and not during boot. No such line
 within 10 minutes, or the process dying, stops the trial and starts the stable file
 again. A kept trial is renamed onto the stable path, or copied there when a running
 executable cannot be renamed, and that child is then stopped and started again from
-the stable path. Windows firewall allows a program by the path it was started from,
+the stable path, detached. Windows firewall allows a program by the path it was started from,
 and a rename does not change that path, so the process left running has to be
 `keep/stable/web.exe` or `keep/stable/motherd.exe`. The restart is the stable file
 with the same arguments, not another trial. It does not certify, roll out, or store binary bytes, and

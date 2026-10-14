@@ -1,15 +1,16 @@
 //! `keep` — the failsafe for `web` and `motherd`.
 //!
 //! On startup it runs the executable at each service's stable path, with the
-//! arguments from its config. A switch is one request to `127.0.0.1:8092`
-//! whose body is the path of a new executable. That file is started with the
-//! same arguments. Its stderr must contain the line `INFO serving` within ten
-//! minutes, which those processes print only once they are serving. The file
-//! is then renamed onto the stable path, or copied there when a running
-//! executable cannot be renamed, and that child is stopped and started again
-//! from the stable path. The process that stays up was started from the
-//! stable file. No line, or the process dying, stops the trial and starts
-//! the stable file again.
+//! arguments from its config. That child is detached: stdout and stderr are
+//! not inherited, and this process does not read or write them. A switch is
+//! one request to `127.0.0.1:8092` whose body is the path of a new executable.
+//! That file is the trial. Its stderr is the only hooked stream, and it must
+//! contain the line `INFO serving` within ten minutes, which those processes
+//! print only once they are serving. The file is then renamed onto the stable
+//! path, or copied there when a running executable cannot be renamed, and
+//! that child is stopped and started again from the stable path, detached.
+//! The process that stays up was started from the stable file. No line, or
+//! the process dying, stops the trial and starts the stable file again.
 //!
 //! It does not certify, roll out, or choose a canary. It joins the gateway as
 //! the app `keep` so the cluster page lists it.
@@ -26,7 +27,7 @@ use cluster::upgrade::switch::SWITCH_ADDR;
 use place::{pending_copy, record, same_file, How};
 use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-use trial::{drain_stderr, spawn, switch_to, Ended, Running};
+use trial::{spawn_detached, switch_to, Ended, Running};
 
 mod place;
 mod presence;
@@ -302,9 +303,8 @@ fn ensure(svc: &Service) -> Option<Live> {
         eprintln!("keep: {} is already running as pid {}", svc.name, found.pid);
         return Some(Live::Adopted(found.pid));
     }
-    match spawn(&svc.stable, &svc.args, &svc.cwd) {
-        Ok(mut child) => {
-            drain_stderr(&mut child);
+    match spawn_detached(&svc.stable, &svc.args, &svc.cwd) {
+        Ok(child) => {
             eprintln!("keep: {} started {}", svc.name, svc.stable.display());
             Some(Live::Child(child))
         }
