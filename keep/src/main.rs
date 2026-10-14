@@ -26,7 +26,7 @@ use cluster::upgrade::switch::SWITCH_ADDR;
 use place::{pending_copy, record, same_file, How};
 use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-use trial::{spawn, switch_to, Ended, Running};
+use trial::{drain_stderr, spawn, switch_to, Ended, Running};
 
 mod place;
 mod presence;
@@ -303,7 +303,8 @@ fn ensure(svc: &Service) -> Option<Live> {
         return Some(Live::Adopted(found.pid));
     }
     match spawn(&svc.stable, &svc.args, &svc.cwd) {
-        Ok(child) => {
+        Ok(mut child) => {
+            drain_stderr(&mut child);
             eprintln!("keep: {} started {}", svc.name, svc.stable.display());
             Some(Live::Child(child))
         }

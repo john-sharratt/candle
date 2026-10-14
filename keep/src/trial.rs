@@ -4,7 +4,7 @@
 //! exits without the line, or that stays up without printing it, is stopped
 //! and the stable file is started with the same arguments.
 
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -40,13 +40,18 @@ pub enum Ended {
     RolledBack(String),
 }
 
-/// Start `exe` with `args` in `cwd`. Stderr is a pipe. Stdout is the parent's.
+/// Start `exe` with `args` in `cwd`. Both streams are pipes. Stdout is drained
+/// and discarded: the parent's own stdout is the supervisor's log redirect,
+/// and a daemon that logs every wave blocks on that redirect once the pipe
+/// fills — long enough for `/v1/status` to miss the gateway's deadline. The
+/// daemon's own log file is the record. Stderr is left for the caller, which
+/// reads it for the proof line or drains it once the process is kept.
 pub fn spawn(exe: &Path, args: &[std::ffi::OsString], cwd: &Path) -> io::Result<Child> {
     let mut cmd = Command::new(exe);
     cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(windows)]
     {
@@ -55,7 +60,33 @@ pub fn spawn(exe: &Path, args: &[std::ffi::OsString], cwd: &Path) -> io::Result<
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
-    cmd.spawn()
+    let mut child = cmd.spawn()?;
+    if let Some(stdout) = child.stdout.take() {
+        drain(stdout);
+    }
+    Ok(child)
+}
+
+/// Discard `pipe` until it closes, so the writer never blocks on a full buffer.
+fn drain(pipe: impl Read + Send + 'static) {
+    thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut buf = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+}
+
+/// Discard stderr. A kept process has nothing reading the proof pipe, and a
+/// full stderr buffer blocks it the same way stdout did.
+pub fn drain_stderr(child: &mut Child) {
+    if let Some(stderr) = child.stderr.take() {
+        drain(stderr);
+    }
 }
 
 /// Read `child`'s stderr until [`PROOF`], the limit, or the pipe closing.
@@ -189,20 +220,7 @@ fn spawn_ready(exe: &Path, args: &[std::ffi::OsString], cwd: &Path) -> io::Resul
 }
 
 fn detach_stderr(child: &mut Child) {
-    let Some(stderr) = child.stderr.take() else {
-        return;
-    };
-    thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    });
+    drain_stderr(child);
 }
 
 #[cfg(test)]
@@ -320,6 +338,36 @@ mod tests {
         assert!(running.child.try_wait().unwrap().is_none());
         reap(&mut running.child);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_child_writing_more_than_the_pipe_holds_still_reaches_the_proof_line() {
+        // The pipe buffer is far under a megabyte. Without a reader the write
+        // blocks and the proof line never arrives.
+        let dir = scratch();
+        let mut child = spawn(
+            Path::new("powershell"),
+            &[
+                OsString::from("-NoProfile"),
+                OsString::from("-Command"),
+                OsString::from(
+                    "$s = 'x' * 1000000; [Console]::Out.WriteLine($s); [Console]::Error.WriteLine('INFO serving')",
+                ),
+            ],
+            &dir,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let verdict = watch_proof(&mut child, Duration::from_secs(10));
+        let elapsed = started.elapsed();
+        reap(&mut child);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(verdict, Verdict::Proven);
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "stdout write blocked the proof line"
+        );
     }
 
     #[cfg(windows)]

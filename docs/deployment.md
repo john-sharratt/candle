@@ -192,7 +192,9 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
 `motherd` are the files `keep/stable/web.exe` and `keep/stable/motherd.exe`. On startup
 `keep` runs those files with the arguments in `keep/keep.yaml`. A switch is one POST to
 `127.0.0.1:8092` whose body is the path of a staged executable (`keep/stage/`). `keep`
-starts that file and reads stderr. The process is kept only when it prints `INFO serving`,
+starts that file and reads stderr. Stdout is drained and discarded: it is a copy of
+the daemon's own log, and leaving it on the supervisor's redirect blocks the
+daemon once that pipe fills. The process is kept only when it prints `INFO serving`,
 which `web` and `motherd` print once they are serving and not during boot. No such line
 within 10 minutes, or the process dying, stops the trial and starts the stable file
 again. A kept trial is renamed onto the stable path, or copied there when a running
