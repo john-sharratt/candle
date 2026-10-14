@@ -723,10 +723,14 @@ build is certified (§3.8):
      is booting. The wait is at most 10 minutes.
    - **No line in that time, or the process dying,** kills the trial and starts the
      stable file again.
-   - **The line** makes the trial file the stable file. `keep` renames the running
-     executable onto the stable path when the platform allows it, and otherwise
-     copies the bytes and deletes the trial file once it is no longer locked. Which
-     of the two worked is recorded under `keep/state/`.
+   - **The line** makes the trial file the stable file. `keep` renames the trial
+     file onto the stable path when the platform allows it, and otherwise copies
+     the bytes and deletes the trial file once it is no longer locked. Which of
+     the two worked is recorded under `keep/state/`. The trial process is then
+     stopped and the stable file is started with the same arguments. That start
+     is not another trial. The process that stays up was started from the stable
+     path; a rename leaves a process on the path it was started from, and that
+     path is not the one the firewall allows.
    - **Success for the member** is the new process. Once it is ready it writes
      `<data>/upgrade/ok`, prunes kept builds beyond *N*, and hands the leases back.
 

@@ -93,8 +93,8 @@ Paths are relative to the repo root.
 
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
-| .5 | web | `target\release\web.exe --config web/web.yaml` | 2026-09-13, from the running process |
-| .5 | motherd | `target\release\motherd.exe --config motherd\motherd.yaml` | 2026-10-14, renamed from tokerad — every setting is in `motherd/motherd.yaml` (below) |
+| .5 | web | `keep\stable\web.exe --config web/web.yaml` | 2026-10-14, keep restarts a proven trial from this path |
+| .5 | motherd | `keep\stable\motherd.exe --config motherd\motherd.yaml` | 2026-10-14, keep restarts a proven trial from this path — every setting is in `motherd/motherd.yaml` |
 | .5 | keep | `target\release\keep.exe keep/keep.yaml` | 2026-10-14. Supervisor `C:\Users\johna\AppData\Local\keep\supervise.ps1` (restart 10 s after exit). Registering scheduled task `\keep` was denied from a non-elevated session, so the supervisor runs in the interactive session. keep is not swapped by a rollout |
 | .6 | npcd | `target\release\npcd.exe --host 0.0.0.0 --port 8081 --gateway 192.168.0.5 --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`). Rewritten 2026-10-10 for the host's flags (not yet run): `--bind` became `--host`/`--port`, `--content` is gone, and `--gateway 192.168.0.5` is new — without it every signed-in visitor is anonymous. Its store was written by the AntiLoop + StyleTune fine-tune; since 2026-10-11 the host prescribes Flash-Next, so that store is refused at open, before anything in it is rewritten, and npcd's first run on this build needs a new `--data` |
 
@@ -196,7 +196,11 @@ starts that file and reads stderr. The process is kept only when it prints `INFO
 which `web` and `motherd` print once they are serving and not during boot. No such line
 within 10 minutes, or the process dying, stops the trial and starts the stable file
 again. A kept trial is renamed onto the stable path, or copied there when a running
-executable cannot be renamed. It does not certify, roll out, or store binary bytes, and
+executable cannot be renamed, and that child is then stopped and started again from
+the stable path. Windows firewall allows a program by the path it was started from,
+and a rename does not change that path, so the process left running has to be
+`keep/stable/web.exe` or `keep/stable/motherd.exe`. The restart is the stable file
+with the same arguments, not another trial. It does not certify, roll out, or store binary bytes, and
 it does no canary math. It also joins the gateway as the app `keep`, so `/gateway` lists
 it beside zend and npcd; that socket declares no routes and takes no rollout. Its state
 is `keep/state/`.

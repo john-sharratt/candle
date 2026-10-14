@@ -1,7 +1,8 @@
-//! The trial file becomes the stable file. A rename is preferred: the running
-//! image moves onto the stable path and nothing is left behind. When that
-//! rename fails, the bytes are copied onto the stable path and the trial file
-//! is deleted once it is no longer locked.
+//! The trial file becomes the stable file. A rename is preferred: the file
+//! moves onto the stable path and nothing is left behind. A running process
+//! keeps the path it was started from; the caller starts the stable path
+//! after that process exits. When the rename fails, the bytes are copied onto
+//! the stable path and the trial file is deleted once it is no longer locked.
 
 use std::fs;
 use std::io;

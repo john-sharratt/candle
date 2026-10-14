@@ -109,8 +109,11 @@ fn reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Start `trial`. On the proof line, make it the stable file and leave it
-/// running. Otherwise stop it and start `stable` with the same arguments.
+/// Start `trial`. On the proof line, make it the stable file, stop the trial,
+/// and start `stable` with the same arguments. The process that stays up is
+/// the one started from the stable path: a rename does not change the path a
+/// running image was started from. Otherwise stop the trial and start
+/// `stable` the same way. This start is not another trial.
 pub fn switch_to(
     trial: &Path,
     stable: &Path,
@@ -121,7 +124,7 @@ pub fn switch_to(
     let mut child = match spawn(trial, args, cwd) {
         Ok(child) => child,
         Err(e) => {
-            let child = spawn(stable, args, cwd)?;
+            let child = spawn_ready(stable, args, cwd)?;
             return Ok(Running {
                 ended: Ended::RolledBack(format!("the trial did not start: {e}")),
                 child,
@@ -132,6 +135,11 @@ pub fn switch_to(
     if verdict == Verdict::Proven {
         match promote(trial, stable) {
             Ok(how) => {
+                // The trial holds the file it was started from. After a rename
+                // that file is `stable`, so it has to exit before the stable
+                // path can be started.
+                reap(&mut child);
+                let child = spawn_ready(stable, args, cwd)?;
                 return Ok(Running {
                     ended: Ended::Proven(how),
                     child,
@@ -139,7 +147,7 @@ pub fn switch_to(
             }
             Err(e) => {
                 reap(&mut child);
-                let child = spawn(stable, args, cwd)?;
+                let child = spawn_ready(stable, args, cwd)?;
                 return Ok(Running {
                     ended: Ended::RolledBack(format!("the trial was not kept: {e}")),
                     child,
@@ -153,11 +161,48 @@ pub fn switch_to(
         Verdict::Proven => unreachable!("the proof line returned above"),
     };
     reap(&mut child);
-    let child = spawn(stable, args, cwd)?;
+    let child = spawn_ready(stable, args, cwd)?;
     Ok(Running {
         ended: Ended::RolledBack(why),
         child,
     })
+}
+
+/// Start `exe`, retrying while the previous image still has the file open.
+/// Stderr is drained so the process does not block when the pipe fills.
+fn spawn_ready(exe: &Path, args: &[std::ffi::OsString], cwd: &Path) -> io::Result<Child> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match spawn(exe, args, cwd) {
+            Ok(mut child) => {
+                detach_stderr(&mut child);
+                return Ok(child);
+            }
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn detach_stderr(child: &mut Child) {
+    let Some(stderr) = child.stderr.take() else {
+        return;
+    };
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -275,5 +320,65 @@ mod tests {
         assert!(running.child.try_wait().unwrap().is_none());
         reap(&mut running.child);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_proven_trial_is_restarted_from_the_stable_path() {
+        let dir = scratch();
+        let built = compile_proof(&dir);
+        let trial = dir.join("trial.exe");
+        let stable = dir.join("stable.exe");
+        std::fs::copy(&built, &trial).unwrap();
+        std::fs::copy(&built, &stable).unwrap();
+        let mut running = switch_to(&trial, &stable, &[], &dir, Duration::from_secs(15)).unwrap();
+        let child = &mut running.child;
+        let ended = running.ended.clone();
+        let alive = child.try_wait().unwrap().is_none();
+        let image = std::fs::canonicalize(image_of(child.id())).unwrap();
+        let stable_path = std::fs::canonicalize(&stable).unwrap();
+        reap(child);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(ended, Ended::Proven(_)));
+        assert!(alive, "the stable process exited");
+        assert_eq!(image, stable_path);
+    }
+
+    fn compile_proof(dir: &std::path::Path) -> std::path::PathBuf {
+        let src = dir.join("proof.rs");
+        std::fs::write(
+            &src,
+            "fn main() {\n    eprintln!(\"INFO serving\");\n    loop { std::thread::sleep(std::time::Duration::from_secs(60)); }\n}\n",
+        )
+        .unwrap();
+        let exe = dir.join("proof.exe");
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+        let status = Command::new(rustc)
+            .arg(&src)
+            .arg("-o")
+            .arg(&exe)
+            .status()
+            .unwrap();
+        assert!(status.success(), "rustc did not build the proof executable");
+        exe
+    }
+
+    fn image_of(pid: u32) -> std::path::PathBuf {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let mut sys = System::new();
+        let pid = Pid::from_u32(pid);
+        for _ in 0..40 {
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                ProcessRefreshKind::new().with_exe(UpdateKind::Always),
+            );
+            if let Some(proc) = sys.process(pid) {
+                if let Some(exe) = proc.exe() {
+                    return exe.to_path_buf();
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("process {pid} has no image path");
     }
 }

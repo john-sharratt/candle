@@ -6,8 +6,10 @@
 //! same arguments. Its stderr must contain the line `INFO serving` within ten
 //! minutes, which those processes print only once they are serving. The file
 //! is then renamed onto the stable path, or copied there when a running
-//! executable cannot be renamed. No line, or the process dying, stops the
-//! trial and starts the stable file again.
+//! executable cannot be renamed, and that child is stopped and started again
+//! from the stable path. The process that stays up was started from the
+//! stable file. No line, or the process dying, stops the trial and starts
+//! the stable file again.
 //!
 //! It does not certify, roll out, or choose a canary. It joins the gateway as
 //! the app `keep` so the cluster page lists it.
